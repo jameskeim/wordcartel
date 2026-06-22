@@ -5,6 +5,7 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
+pulldown-cmark = "0.13"
 ropey = "=1.6.1"
 smartstring = "1"
 smallvec = "1"
