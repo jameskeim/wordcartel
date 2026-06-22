@@ -794,9 +794,85 @@ disposition = "filter"
 
 ---
 
-## 13. Status / Open Threads (still to design)
+## 13. Markdown Constructs — v1 Conceal/Style Set
+
+Defines which constructs `md_parse` + `layout` recognize and how each renders on an
+**inactive** line (the active line always shows raw markdown, §3.2). Base = CommonMark
++ a GFM subset. Calls flagged **[?]** are debatable scope decisions, easily revised.
+
+### 13.1 Parser configuration
+`pulldown-cmark` with GFM extensions enabled: **strikethrough, tables, task lists,
+autolinks**. Footnotes off in v1 (see backlog). The parser is fed one block at a
+time for incremental reparse (§9.2).
+
+### 13.2 Terminal rendering primitives
+Terminals have **no font sizes**, so the heading hierarchy is conveyed by **weight +
+color**, not size. Available styling: bold (SGR 1), italic (SGR 3), strikethrough
+(SGR 9), underline (SGR 4), dim (SGR 2), plus theme colors (truecolor→256→16, §4).
+Each has a graceful fallback (e.g., italic→color if a terminal lacks SGR 3).
+
+### 13.3 Inline constructs (v1)
+
+| Construct | Syntax | Inactive-line rendering | Notes |
+|---|---|---|---|
+| Emphasis / italic | `*x*` `_x_` | italic; markers concealed | |
+| Strong / bold | `**x**` `__x__` | bold | |
+| Bold-italic | `***x***` | bold + italic | |
+| Inline code | `` `x` `` | code style (distinct color/bg); backticks concealed | |
+| Strikethrough (GFM) | `~~x~~` | strikethrough | |
+| Link | `[t](url)` | `t` shown underlined/colored; `[](url)` concealed; full URL revealed on active line | handle pulldown-cmark URL-offset quirk (#441) by scanning the link span |
+| Autolink / bare URL (GFM) | `<url>`, `http://…` | styled as link | basic in v1 |
+| Image | `![alt](url)` | placeholder: styled `alt` + image glyph; syntax concealed | **[?]** inline image *display* (kitty/iTerm/sixel) = backlog |
+| Escape | `\*` | literal char; backslash concealed | correctness |
+| Hard line break | trailing `  ` or `\` | line break in layout | |
+| Inline HTML | `<span>` | rendered literally, dimmed | passthrough, no conceal |
+
+### 13.4 Block constructs (v1)
+
+| Construct | Syntax | Inactive-line rendering | Notes |
+|---|---|---|---|
+| Paragraph | text | base styling | the common case |
+| ATX heading | `#`..`######` | hierarchy by weight+color (all 6 levels); `#`s concealed | |
+| Setext heading | line over `===`/`---` | styled as heading; underline concealed | **[?]** the two-line-context hazard (§9.2); supported but flagged as the trickiest reparse case |
+| Blockquote | `>` (nestable) | gutter bar + styled text; `>` concealed | |
+| Unordered list | `-` `*` `+` | bullet glyph `•`; marker concealed; nested by indent | |
+| Ordered list | `1.` | number kept; nested | |
+| Task list (GFM) | `- [ ]` / `- [x]` | checkbox glyph `☐` / `☑` | |
+| Fenced code block | ```` ``` ```` + info | distinct block style; fences dimmed/concealed | **no in-code syntax highlighting in v1** (backlog) |
+| Indented code block | 4-space indent | code style | |
+| Thematic break | `---` `***` `___` | horizontal rule line | parser disambiguates from setext |
+| Table (GFM) | `\| … \|` | **[?]** v1: styled raw (pipes dimmed); **full aligned grid = backlog** | secondary for prose |
+| YAML front matter | `---`…`---` at top | dimmed metadata block; edited raw | relevant to pandoc export (title/author) |
+| HTML block | `<div>…` | rendered literally, dimmed | passthrough |
+
+### 13.5 Deferred to backlog (with reason)
+- **Footnotes** (def + ref) — extra inline/block complexity; uncommon in drafting.
+- **Pretty aligned table rendering** — real layout work (column widths, alignment);
+  v1 ships readable raw tables.
+- **Inline image display** — terminal image protocols (kitty/iTerm2/sixel) are a
+  separate capability-detection feature.
+- **In-code-block syntax highlighting** — per-language highlighting is a code-editor
+  feature, out of scope for a prose tool.
+- **Math** (`$…$`, `$$`), **definition lists** (pandoc extensions) — niche for v1;
+  pandoc still handles them on export since the source text is preserved verbatim.
+- **Obsidian-isms** (wiki-links `[[…]]`, callouts) — we target CommonMark + GFM +
+  pandoc, not a specific app's dialect.
+
+Note: deferring a construct's *rendering* never blocks its *content* — unsupported
+syntax stays as plain text in the `.md` and still round-trips through pandoc on
+export. "Deferred" means "not specially concealed/styled yet," not "unusable."
+
+### 13.6 The two context-sensitive hazards (reminder)
+**Setext headings** and **list continuation** are the constructs that violate
+block-locality (§9.2): they depend on adjacent lines. The incremental-reparse cache
+must use two-line context for setext and re-scan list boundaries on edit — and the
+**incremental == full reparse oracle test** (§11.2) exists precisely to catch
+regressions here.
+
+---
+
+## 14. Status / Open Threads (still to design)
 
 - **§ Error handling** — pandoc/filter failures, missing binaries, subprocess
-  cancellation, save errors.
-- **§ md_parse details** — which CommonMark/GFM constructs are concealed/styled
-  in v1.
+  cancellation, save errors. (Partly covered already in §3.1, §9.5, §10.3 — this
+  would consolidate into one section.)
