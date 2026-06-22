@@ -12,7 +12,7 @@
 
 - Same crate `wordcartel-core`; `#![forbid(unsafe_code)]`; pure/headless (no `std::io`, threads, terminal).
 - Canonical position = **byte offset** into the logical line (`usize`), matching §16.1.
-- New dep: **`pulldown-cmark = "0.12"`** with GFM strikethrough enabled (`Options::ENABLE_STRIKETHROUGH`).
+- New dep: **`pulldown-cmark = "0.13"`** (the version the spike was validated against) with GFM strikethrough enabled (`Options::ENABLE_STRIKETHROUGH`). The APIs used (`into_offset_iter`, `Options::ENABLE_STRIKETHROUGH`, `Tag::Link { .. }`, `TagEnd::*`) are stable across 0.12/0.13.
 - The `layout`/`ColMap`/`Cursor`/navigation code is **ported from the validated spike** at `~/projects/wordcartel-layout-spike/src/lib.rs` (the implementer reads that file — it is real, property-tested reference code). Port verbatim except where a step says to adapt the signature to consume `md_parse` output. Preserve the spike's documented policies (grapheme atom; concealed bytes absent from `placed`; wide-cell owns `[col,col+w)`; zero-width shares cell with positive-width winning; tab = fixed `TAB_WIDTH`; wrap-boundary resolves toward next row; cursor carries `{offset,row,desired_col}` affinity).
 - v1 **inline** construct set (§13.3): emphasis, strong, bold-italic, inline code, strikethrough (GFM), link, escape. **Block-role rendering (headings/lists/quotes) and block-role *determination* are out of scope here** (Plan 3); `BlockRole` is carried as data but only `Paragraph` behavior is exercised.
 - TDD; pristine output; `proptest` for the round-trip laws; commit `proptest-regressions/` seeds.
@@ -42,7 +42,7 @@ Layout/ColMap/cursor is **ported from our own validated spike** (the hard, spike
 
 **Interfaces:** Produces a compiling crate with the new modules declared and `pulldown-cmark` available.
 
-- [ ] **Step 1:** Add to `wordcartel-core/Cargo.toml` under `[dependencies]`: `pulldown-cmark = "0.12"`.
+- [ ] **Step 1:** Add to `wordcartel-core/Cargo.toml` under `[dependencies]`: `pulldown-cmark = "0.13"`.
 - [ ] **Step 2:** In `src/lib.rs`, add module declarations after the existing ones:
 ```rust
 pub mod layout;
@@ -67,7 +67,10 @@ pub mod style;
 - `struct LineAnalysis { runs: Vec<Run>, styles: Vec<StyleSpan>, role: BlockRole }`
 - all `#[derive(Clone, Debug, PartialEq, Eq)]`.
 
-- [ ] **Step 1: Write the failing test** in `src/style.rs`:
+> Note: this task defines plain data types — there is no behavior to red-test, so it
+> is a definition + build-check task (no separate failing phase). Steps 1+3 are one block.
+
+- [ ] **Step 1: Write the types + a construction test** in `src/style.rs`:
 ```rust
 //! Inline style + block-role types shared by md_parse and layout.
 use std::ops::Range;
@@ -103,9 +106,7 @@ mod tests {
     }
 }
 ```
-- [ ] **Step 2:** Run `cargo test --manifest-path wordcartel-core/Cargo.toml style` → FAIL (module empty).
-- [ ] **Step 3:** The code above IS the implementation (types + test together). Confirm it compiles.
-- [ ] **Step 4:** Run `cargo test --manifest-path wordcartel-core/Cargo.toml style` → PASS.
+- [ ] **Step 2:** Run `cargo test --manifest-path wordcartel-core/Cargo.toml style` → PASS (the block above defines the types and the test that constructs them; pure data, no red phase).
 - [ ] **Step 5:** Commit: `feat(core): style/block-role/span types for render core`
 
 ---
@@ -156,10 +157,20 @@ mod tests {
 
     #[test]
     fn strong_conceals_markers_keeps_text_with_style() {
-        let line = "a **bold** c"; // 'b' of bold is at byte 5
+        // bytes: a=0 ' '=1 *=2 *=3 b=4 o=5 l=6 d=7 *=8 *=9 ' '=10 c=11
+        let line = "a **bold** c";
         let a = analyze(line, BlockRole::Paragraph, false);
         assert_eq!(visible(&a, line), "a bold c"); // ** hidden
-        assert_eq!(style_at(&a, 5), Some(Style::Strong));
+        assert_eq!(style_at(&a, 4), Some(Style::Strong)); // 'b' of bold at byte 4
+        assert_eq!(style_at(&a, 7), Some(Style::Strong)); // 'd' of bold, still Strong
+    }
+
+    #[test]
+    fn escaped_marker_shows_literal() {
+        // backslash escapes the asterisk: the '*' is literal text, the '\' is hidden.
+        let line = r"a \* b"; // bytes: a=0 ' '=1 \=2 *=3 ' '=4 b=5
+        let a = analyze(line, BlockRole::Paragraph, false);
+        assert_eq!(visible(&a, line), "a * b"); // backslash concealed, * literal
     }
 
     #[test]
@@ -205,7 +216,9 @@ mod tests {
   - On `End(...)`: decrement the counter.
   - On `Event::Text(_)` with `range`: push to `reveal`; and push a `StyleSpan { src: range, style }` where `style` is derived from the current counters: `strong>0 && em>0 → StrongEmphasis; strong>0 → Strong; em>0 → Emphasis; strike>0 → Strikethrough; link>0 → Link; else → Plain` (skip pushing for `Plain`).
   - On `Event::Code(_)` with `range`: conceal the leading/trailing backtick fences (as the spike does), reveal the inner content, and push a `StyleSpan` for the inner content with `Style::Code`.
-  - Apply `conceal` (set false) then `reveal` (set true) onto the `visible` grid (reveal wins), exactly as the spike does, then collapse to `Run`s.
+  - Apply `conceal` (set false) then `reveal` (set true) onto the `visible` grid (reveal wins), exactly as the spike does.
+  - **Escapes (do this independently of pulldown, AFTER the conceal/reveal grid is built):** scan `line.as_bytes()` for a backslash (`b'\\'`) immediately followed by an ASCII-punctuation byte; set `visible[backslash_index] = false` (hide only the `\`; the escaped char stays visible as `Plain`). This conceals the backslash of `\*`, `\_`, `` \` ``, etc. without treating the escaped marker as a delimiter.
+  - Collapse the final `visible` grid to `Run`s (as the spike does).
   - Return `LineAnalysis { runs, styles, role }`.
 - [ ] **Step 4:** Run `cargo test --manifest-path wordcartel-core/Cargo.toml md_parse` → PASS (5 tests).
 - [ ] **Step 5:** Commit: `feat(core): md_parse inline conceal + style analysis`
@@ -220,7 +233,13 @@ mod tests {
 - Consumes: `crate::md_parse::analyze`, `crate::style::{LineAnalysis, Run, Style, StyleSpan, BlockRole}`, `unicode-segmentation`, `unicode-width`.
 - Produces: `pub const TAB_WIDTH: usize = 4;`, `pub struct Placed { src, row, col, width, text, style }`, `pub struct VisualRow { display, width, src_span }`, `pub struct ColMap { placed, rows, eol, row_end_col, is_active }`, and `pub fn layout(line: &str, role: BlockRole, is_active: bool, viewport_width: usize) -> (Vec<VisualRow>, ColMap)`.
 
-**Port source:** `~/projects/wordcartel-layout-spike/src/lib.rs` lines 33–354. **Adaptations:** (a) `layout` calls `crate::md_parse::analyze(line, role, is_active)` and uses its `runs` instead of the spike's inline `analyze`; (b) add a `style: Style` field to `Placed`, looked up per grapheme from the `LineAnalysis.styles` (the style whose `src` contains the grapheme's start byte, else `Style::Plain`); (c) carry `role` through the signature. Keep all soft-wrap and width logic verbatim.
+**Port source (this task):** from `~/projects/wordcartel-layout-spike/src/lib.rs` port **only**: `TAB_WIDTH` (line 33), `Placed` (36–48), `VisualRow` (51–59), the **`ColMap` struct definition** (65–77, the fields only — *not* its `impl`), `grapheme_width` (252–259), and the `layout` function (262–354). **Do NOT port** the spike's `impl ColMap` methods (79–162) — those are Task 4 — and **do NOT port** the spike's private `analyze` (172–250) — `md_parse` replaces it.
+
+**Wiring / adaptations:**
+- `layout` calls `crate::md_parse::analyze(line, role, is_active)` and iterates its `LineAnalysis.runs` (type `crate::style::Run`) exactly where the spike iterated its private `analyze` result. The `Run` shape (`{ src, visible }`) matches, so the visible-grapheme collection loop is unchanged.
+- Add a `pub style: crate::style::Style` field to `Placed`; per grapheme, set it to the `StyleSpan` in `analysis.styles` whose `src` contains the grapheme's start byte, else `Style::Plain`.
+- Add a `role: BlockRole` parameter to `layout`'s signature (passed straight to `md_parse::analyze`; not otherwise used in v1).
+- Keep all soft-wrap, width, `row_end_col`, and `src_span` logic verbatim.
 
 - [ ] **Step 1: Write failing tests** in `src/layout.rs`:
 ```rust
@@ -283,7 +302,7 @@ mod tests {
 
 **Interfaces — Produces** (on `impl ColMap`): `source_to_visual(offset) -> (usize,usize)`, `visual_to_source(row,col) -> usize`, `is_cursor_stop(offset) -> bool`, `cursor_stops() -> Vec<usize>`, `col_on_row(offset,row) -> usize`.
 
-**Port source:** spike lines 79–162 and 398–411 — **verbatim** (these are the property-validated mapping methods).
+**Port source:** spike lines 79–162 and 398–411 — **verbatim** (these are the property-validated mapping methods). The `ColMap` *struct* was added in Task 3; this task adds its `impl ColMap { source_to_visual, visual_to_source, is_cursor_stop, cursor_stops, col_on_row }`, so the failing tests below genuinely fail until it lands.
 
 - [ ] **Step 1: Write failing tests** in the `tests` module:
 ```rust
@@ -385,7 +404,7 @@ mod tests {
 
 **Files:** Modify `src/layout.rs`.
 
-**Interfaces — Produces:** `pub struct StyledSeg { text: String, style: Style, width: usize }` and `VisualRow` gains `pub segs: Vec<StyledSeg>` — contiguous runs of same-style cells on that row (so a terminal renderer in Effort 3 can emit one SGR span per seg). The plain `display` string is retained (concatenation of seg texts).
+**Interfaces — Produces:** `#[derive(Clone, Debug, PartialEq, Eq)] pub struct StyledSeg { pub text: String, pub style: Style, pub width: usize }` and `VisualRow` gains `pub segs: Vec<StyledSeg>` — contiguous runs of same-style cells on that row (so a terminal renderer in Effort 3 can emit one SGR span per seg). The plain `display` string is retained (concatenation of seg texts). **The derive is required:** `VisualRow` derives `Clone/Debug/PartialEq/Eq`, so its new `Vec<StyledSeg>` field forces `StyledSeg` to derive the same.
 
 - [ ] **Step 1: Write failing test:**
 ```rust
@@ -433,13 +452,14 @@ fn cursor_crosses_logical_lines_at_desired_col() {
     let (_r0, map0) = layout(lines[0], BlockRole::Paragraph, true, 80);
     let (_r1, map1) = layout(lines[1], BlockRole::Paragraph, false, 80);
 
-    // Cursor on line 0 at col 7 ("w" of world). Move down off the end of line 0
-    // (single visual row) -> enter line 1 from the top at desired_col 7.
-    let on0 = Cursor { offset: 6, row: 0, desired_col: 7 };
+    // Cursor on line 0 at byte 6 = 'w' of "hello world", visual col 6. Move down
+    // off the end of line 0 (single visual row) -> enter line 1 from the top,
+    // preserving desired_col 6.
+    let on0 = Cursor { offset: 6, row: 0, desired_col: 6 };
     assert!(move_down_within(&map0, on0).is_none()); // line 0 is one visual row
     let on1 = enter_from_top(&map1, on0.desired_col);
-    // col 7 of "goodbye" is 'e' (byte 7 == EOL since "goodbye" is 7 bytes) -> clamps to EOL
-    assert_eq!(on1.offset, map1.eol.min(7));
+    // "goodbye": g0 o1 o2 d3 b4 y5 e6 (len 7). col 6 -> 'e' at byte 6.
+    assert_eq!(on1.offset, 6);
     assert_eq!(on1.row, 0);
 }
 
