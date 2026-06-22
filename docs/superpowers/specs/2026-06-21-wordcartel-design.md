@@ -785,6 +785,14 @@ disposition = "filter"     # filter | insert | export
 [filters.reflow]
 command     = "fmt -w 80"
 disposition = "filter"
+
+[filters.table-align]      # tidy GFM table source so styled-raw reads cleanly (§13.6)
+command     = "prettier --parser markdown"
+disposition = "filter"
+
+[filters.normalize-headings]  # setext -> ATX, de-risks the reparse hazard (§13.6)
+command     = "pandoc -f gfm -t gfm"
+disposition = "filter"
 ```
 
 - **Theme** keys color the concealed-markdown styling (heading/emphasis/code/link/
@@ -822,7 +830,7 @@ Each has a graceful fallback (e.g., italic→color if a terminal lacks SGR 3).
 | Strikethrough (GFM) | `~~x~~` | strikethrough | |
 | Link | `[t](url)` | `t` shown underlined/colored; `[](url)` concealed; full URL revealed on active line | handle pulldown-cmark URL-offset quirk (#441) by scanning the link span |
 | Autolink / bare URL (GFM) | `<url>`, `http://…` | styled as link | basic in v1 |
-| Image | `![alt](url)` | placeholder: styled `alt` + image glyph; syntax concealed | **[?]** inline image *display* (kitty/iTerm/sixel) = backlog |
+| Image | `![alt](url)` | placeholder: styled `alt` + image glyph; syntax concealed | inline image *display* (kitty/iTerm/sixel) = backlog; **not filter-addressable** (§13.6); external "open image" command is the realistic path |
 | Escape | `\*` | literal char; backslash concealed | correctness |
 | Hard line break | trailing `  ` or `\` | line break in layout | |
 | Inline HTML | `<span>` | rendered literally, dimmed | passthrough, no conceal |
@@ -833,7 +841,7 @@ Each has a graceful fallback (e.g., italic→color if a terminal lacks SGR 3).
 |---|---|---|---|
 | Paragraph | text | base styling | the common case |
 | ATX heading | `#`..`######` | hierarchy by weight+color (all 6 levels); `#`s concealed | |
-| Setext heading | line over `===`/`---` | styled as heading; underline concealed | **[?]** the two-line-context hazard (§9.2); supported but flagged as the trickiest reparse case |
+| Setext heading | line over `===`/`---` | styled as heading; underline concealed | parsed correctly; two-line-context hazard (§9.2). De-risked by a **setext→ATX normalize filter** (§13.6) that makes it rare in practice |
 | Blockquote | `>` (nestable) | gutter bar + styled text; `>` concealed | |
 | Unordered list | `-` `*` `+` | bullet glyph `•`; marker concealed; nested by indent | |
 | Ordered list | `1.` | number kept; nested | |
@@ -841,7 +849,7 @@ Each has a graceful fallback (e.g., italic→color if a terminal lacks SGR 3).
 | Fenced code block | ```` ``` ```` + info | distinct block style; fences dimmed/concealed | **no in-code syntax highlighting in v1** (backlog) |
 | Indented code block | 4-space indent | code style | |
 | Thematic break | `---` `***` `___` | horizontal rule line | parser disambiguates from setext |
-| Table (GFM) | `\| … \|` | **[?]** v1: styled raw (pipes dimmed); **full aligned grid = backlog** | secondary for prose |
+| Table (GFM) | `\| … \|` | v1: styled raw (pipes dimmed) | a **table-align filter** (§13.6) tidies the source so styled-raw reads cleanly; full live grid render = backlog |
 | YAML front matter | `---`…`---` at top | dimmed metadata block; edited raw | relevant to pandoc export (title/author) |
 | HTML block | `<div>…` | rendered literally, dimmed | passthrough |
 
@@ -851,8 +859,10 @@ Each has a graceful fallback (e.g., italic→color if a terminal lacks SGR 3).
   v1 ships readable raw tables.
 - **Inline image display** — terminal image protocols (kitty/iTerm2/sixel) are a
   separate capability-detection feature.
-- **In-code-block syntax highlighting** — per-language highlighting is a code-editor
-  feature, out of scope for a prose tool.
+- **In-code-block syntax highlighting** (live, in-editor) — a code-editor feature,
+  out of scope for a prose tool. Note: **pandoc already highlights code in exported
+  output** (`--highlight-style`), so highlighted code in the produced docx/PDF/HTML
+  is free; only the live view lacks it (§13.6).
 - **Math** (`$…$`, `$$`), **definition lists** (pandoc extensions) — niche for v1;
   pandoc still handles them on export since the source text is preserved verbatim.
 - **Obsidian-isms** (wiki-links `[[…]]`, callouts) — we target CommonMark + GFM +
@@ -862,7 +872,25 @@ Note: deferring a construct's *rendering* never blocks its *content* — unsuppo
 syntax stays as plain text in the `.md` and still round-trips through pandoc on
 export. "Deferred" means "not specially concealed/styled yet," not "unusable."
 
-### 13.6 The two context-sensitive hazards (reminder)
+### 13.6 What the `filter` layer + pandoc absorb (vs. in-core rendering)
+**Principle:** filters transform the markdown *source text* (text→text, into the
+buffer or to export); rendering changes the *live view*. A scope item is
+filter-addressable only if it can be reframed as a source transformation. Applying
+this to the items above keeps in-core rendering thin:
+
+| Item | Filter/pandoc-addressable? | How |
+|---|---|---|
+| GFM tables | **Mostly** | A **table-align filter** (`prettier --parser markdown` / `pandoc -t gfm`) pads columns so the styled-raw rendering already reads as a clean table; live box-grid render stays backlog but matters less. |
+| Setext headings | **Partly (de-risk)** | A **setext→ATX normalize filter** (`pandoc -t gfm`) rewrites `Foo`/`===` to `# Foo`, making the two-line-context reparse case rare. Parsing stays correct when present. |
+| Inline image display | **No** | Text→text can't emit pixels (ASCII-art would corrupt source). A separate **"open image externally" command** is the path; inline display stays backlog. |
+| In-code highlighting | **No (live) / free (export)** | A filter can't color the live view without corrupting source; but **pandoc highlights code on export**, covering the output-document need. |
+
+These two presets (`table-align`, `normalize-headings`) ship as built-in filter
+presets (§3.5/§12.5), discoverable in the palette and menu. This is the §3.1/§3.5
+"delegate to the Unix-pipe layer" thesis in action: two of four flagged rendering
+gaps become filter presets, a third is covered by pandoc on export.
+
+### 13.7 The two context-sensitive hazards (reminder)
 **Setext headings** and **list continuation** are the constructs that violate
 block-locality (§9.2): they depend on adjacent lines. The incremental-reparse cache
 must use two-line context for setext and re-scan list boundaries on edit — and the
