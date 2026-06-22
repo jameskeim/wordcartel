@@ -913,7 +913,13 @@ Each has a graceful fallback (e.g., italic→color if a terminal lacks SGR 3).
 **Accessibility (v1):** a **no-color / high-contrast mode**, and every distinction
 must also carry a **non-color cue** (weight/underline/glyph) so links, headings,
 emphasis, and errors are distinguishable without color — color is never the sole
-signal.
+signal. This applies in the *rendered* modes (so a colorblind user need not abandon
+live-preview) **and** to chrome with no markdown at all — status/errors, spellcheck
+underlines, search highlights, selection, menu/palette. Note: terminal
+bold/italic/underline are non-color attributes, so structure survives without hue.
+The **source render modes (§3.11)** are a complementary color-free affordance (the
+raw markup is self-describing), but §13.2 ensures color-independence *without*
+forcing a user out of the styled view.
 
 ### 13.3 Inline constructs (v1)
 
