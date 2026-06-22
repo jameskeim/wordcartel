@@ -432,10 +432,143 @@ CodeMirror 6 (MIT) — patterns, not copied source.
 
 ---
 
-## 10. Status / Open Threads (still to design)
+## 10. Data Flow & Control-Flow Architecture
 
-- **§ Data flow** — trace a keystroke buffer → `md_parse` → `layout` → `screen`;
-  worked example of the column map for a concealed, soft-wrapped line.
+The load-bearing skeleton, synthesized from a focused prior-art spike (CodeMirror 6,
+Helix, the xi-editor retrospective, Zed/GPUI, ratatui). Principle: **functional
+core, imperative shell** — a pure, synchronous editing core with one mutation
+channel, wrapped by a thin IO/render shell.
+
+### 10.1 The unidirectional cycle
+
+```
+crossterm event
+   │
+   ▼
+[input]     KeyEvent → resolve against mode-aware keymap (KeyTrie)
+   │
+   ▼
+[command]   Command fn: (&Context) → Transaction | Effect   (describes, never mutates)
+   │
+   ▼
+[apply]     ONE function: editor.apply(Transaction)
+   │          • Transaction = ChangeSet (+ optional new Selection)
+   │          • mutate rope · map selection THROUGH the ChangeSet · push undo
+   │          • version += 1 · mark derived caches dirty
+   ▼
+[derive]    recompute O(visible-screen) derived state synchronously
+   │         (block reparse, soft-wrap for viewport); kick slow work to a
+   │         worker with (snapshot, version)
+   ▼
+[render]    terminal.draw(): PURE read of state → ratatui frame (cell-diff minimizes writes)
+```
+
+This keeps MVU's **discipline** (one state location; all mutations named and
+funneled through `apply`; render mutates nothing) without an MVU framework. Because
+ratatui diffs cells internally, we rebuild the frame unconditionally each draw — no
+dirty-flag render plumbing needed.
+
+### 10.2 State: source of truth vs derived
+
+A flat, owned `Editor` struct (no ECS, no entity/handle framework — confirmed
+overkill for single-window). `Document` = logical/persistent state; `View` =
+display state. We keep the split **even with one window** because soft-wrap is
+view-derived and conflating it with logical lines is what broke xi.
+
+```
+Editor { document, view, mode, pending_keys, count, register, status, keymap, jobs, quit }
+Document { text: Rope, selection, history, version: u64, path, dirty,
+           blocks (cache), syntax/styling (cache) }
+View     { scroll, area, wrap (cache) }
+```
+
+| State | Role | Lives in | Updates on edit via |
+|---|---|---|---|
+| Rope text | **truth** (content) | Document | `apply` mutates in place (sole writer) |
+| Selection (anchor/head) | **truth** (cursor) | Document | `selection.map(&changeset)` — same atomic step as the text edit |
+| Undo history | **truth** (time) | Document | `apply` pushes inverted Transaction (text+selection) |
+| `version: u64` | **truth** (revision) | Document | `+= 1` per apply; staleness token for async |
+| Block map | derived | Document | dirty → reparse edited block only (pulldown-cmark) |
+| Concealed styling | derived | Document | async-filled from (snapshot, version); merge if current |
+| Soft-wrap map | derived | View | rebuilt for visible range on edit/resize (width-dependent) |
+| Scroll / area | display | View | clamped to keep cursor visible; reset on resize |
+| mode / pending keys / count / register | ephemeral | Editor | set by input; cleared when a command resolves |
+| status / feedback | ephemeral | Editor | set the instant an action starts; cleared on done |
+
+**Load-bearing rule:** derived rows are reconstructible from truth rows and are
+never authoritative. The #1 editor bug — "cursor jumps after an edit earlier in the
+buffer" — comes from treating a bare `usize` offset as durable; every surviving
+position must be mapped through the ChangeSet on the same step as the mutation.
+
+### 10.3 Concurrency: sync core, async edges, no tokio
+
+Core (rope/cursor/edit/undo/render) is synchronous on the foreground thread. Slow
+work runs on `std::thread` workers over `mpsc`, on **immutable rope snapshots**
+(ropey clone is O(1), `Send + Sync`):
+
+```
+apply(): … ; version += 1 ; snapshot = rope.clone() ; job_tx.send(Job{snapshot, version, kind})
+          … keep handling input, never block …
+before each draw: while let Ok(r) = result_rx.try_recv() {        // non-blocking drain
+                      if r.version == document.version { merge r.payload }   // else discard (stale)
+                  }
+                  terminal.draw(|f| render(f, &editor))
+```
+
+- **Reconcile = discard, not rebase.** Drop stale results (version moved). No OT/CRDT
+  rebasing — xi's documented over-engineering for a single-user editor.
+- **Block reparse stays synchronous** (O(edited block), fits the keystroke budget).
+  Reserve workers for spellcheck, full-document search, file load/**save** (set
+  `status="Saving…"` immediately), and subprocess **filters**.
+- **Debounce typing bursts**: latest-wins single-slot handoff so only the most
+  recent snapshot is worked.
+- Render loop never blocks: `try_recv()` only; write `status` *before* dispatching a
+  job (instant feedback, per §3.9).
+
+### 10.4 Command dispatch
+
+Three decoupled layers: **bindings** (data: key→action, mode→`KeyTrie`, user-config)
+→ **commands** (code: `fn(&mut Context) -> CommandResult`, produce a Transaction/
+Effect, never mutate directly) → **apply** (sole writer). Keymap lookup returns
+`Matched(cmd)` / `Pending` (partial sequence — stash, redraw, show hint) /
+`NotFound` (in insert mode, unmapped printable → literal text-insert Transaction).
+The boolean/NoOp result allows ordered fallthrough.
+
+### 10.5 Worked keystroke trace (typing a character mid-paragraph)
+
+1. crossterm `KeyEvent('x')` → keymap (insert mode) → `NotFound` → literal insert.
+2. Build `Transaction` = insert "x" at cursor; `editor.apply(tr)`:
+   `rope.insert` (O(log n)); `selection.map(&changeset)` advances the cursor;
+   push undo; `version += 1`; mark the cursor's **block** dirty.
+3. Derive (sync, O(visible screen)): reparse only the dirty block with
+   pulldown-cmark `into_offset_iter()`; rebuild the affected visual rows in `View.wrap`
+   via `layout` (conceal + soft-wrap + `col_map`). The **active line shows raw
+   markdown so it isn't concealed**, and inactive lines didn't change — so the work
+   is tiny.
+4. `terminal.draw()` reads state → ratatui frame; cell-diff emits only changed cells.
+
+Per-keystroke cost = O(visible screen) + O(edited block). No document-sized work on
+the hot path — §3.9 satisfied by construction.
+
+### 10.6 Anti-patterns to avoid (from xi & others)
+
+- Async as the core glue (xi's headline mistake) — async only at IO/CPU edges.
+- Bare offsets as durable state — always map through the ChangeSet.
+- Conflating logical and visual (wrapped) lines — logical in Document, visual in View.
+- Eager full re-derivation per keystroke — mark dirty, recompute incrementally.
+- Frontend/backend process split, JSON-RPC plugins, CRDT, full ECS — all confirmed
+  unjustified for single-user/single-window/offline.
+- Scattered mutations / mutating inside `draw()` — one `apply` channel; render is pure.
+
+### 10.7 License note
+All adopted patterns are clean: CodeMirror 6 (MIT), ropey/ratatui/crossterm
+(MIT/Apache), std threads. Helix (MPL) and Zed/GPUI + xi-rope (GPL) are **pattern
+references only**, not copied code.
+
+---
+
+## 11. Status / Open Threads (still to design)
+
 - **§ Error handling** — pandoc/filter failures, missing binaries, subprocess
   cancellation, save errors.
 - **§ Testing strategy** — `layout` unit tests, golden-render tests, undo/redo
