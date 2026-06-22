@@ -589,12 +589,105 @@ references only**, not copied code.
 
 ---
 
-## 11. Status / Open Threads (still to design)
+## 11. Testing Strategy
+
+The §10 "functional core, imperative shell" design is what makes this tractable:
+the core (buffer ops, `apply`/ChangeSet, `selection.map`, `md_parse`, `layout`/
+`col_map`, undo) is **pure and synchronous**, so it is unit- and property-testable
+with no terminal, no threads, and no real clock. The thin shell (crossterm input,
+ratatui render, clipboard, subprocess) is tested with fakes and snapshots. We drive
+core modules **test-first** (the project's TDD discipline) — the purity makes that
+natural rather than aspirational.
+
+### 11.1 Test layers
+
+| Layer | Scope | Tooling |
+|---|---|---|
+| **Unit** (the bulk) | One pure core function: buffer edit, changeset apply/invert, selection map, single-line `layout`, block parse | std `#[test]` |
+| **Property** | Algebraic laws & invariants over *generated* inputs (see §11.2) | `proptest` |
+| **Golden / snapshot** | Rendered frame for a given (text, cursor, width): the concealed, soft-wrapped cell grid | `insta` + ratatui `TestBackend` |
+| **Integration** | Scripted `KeyEvent` sequence → assert resulting document text **and** rendered frame | fake input iterator + `TestBackend` |
+| **Subprocess** | The `filter` primitive against real small tools (`tr`, `sort`, `cat`) and a fake that errors / writes stderr / hangs | std `#[test]`, gated on binary presence |
+| **Fuzz** | Parser, `layout`, `col_map` fed arbitrary UTF-8 / markdown — assert no panic, invariants hold | `cargo-fuzz` (nightly CI) |
+| **Bench / perf guard** | Per-keystroke cost stays ~flat as document grows (operationalizes §3.9) | `criterion`, tracked in CI |
+
+### 11.2 Invariants to encode (each targets a §10.6 bug class)
+
+These properties are the heart of the strategy — they pin the subtle, high-risk
+behavior:
+
+- **Undo round-trip:** for any edit `e`, `apply(invert(e)) ∘ apply(e)` restores the
+  **exact** original rope *and* selection. `redo` restores the post-edit state.
+- **ChangeSet algebra:** `compose` is associative; `invert(invert(e)) == e`;
+  `apply(compose(a,b)) == apply(b) ∘ apply(a)`.
+- **Position mapping (the "cursor jumped" class):** after any ChangeSet, every
+  mapped selection offset is a valid char boundary and matches the hand-computed
+  expected position — including edits *before* the cursor. Insertion-bias (`Assoc`)
+  is respected at edges.
+- **`col_map` bijection (the atomicRanges guarantee):** moving the cursor one
+  visual cell never lands inside a concealed marker; `col_map[c]` is always a valid
+  source char boundary; visual→byte→visual round-trips are stable. On the **active
+  (raw) line**, `col_map` is the identity.
+- **Soft-wrap fidelity:** concatenating a logical line's visual rows reconstructs
+  the source; wrapping never splits a grapheme; visual widths obey `unicode-width`.
+- **Incremental == full reparse (oracle test):** reparsing only the dirty block
+  yields the **same** styled spans as parsing the whole document. This is the key
+  guard for markdown's context-sensitivity — it must catch the setext-heading
+  (`Foo` / `===`) and list-continuation edge cases (§9.2).
+- **Undo coalescing:** a burst of typed chars collapses to one undo unit; a paste,
+  a programmatic edit, or a deliberate cursor move starts a new unit (§9.2).
+- **Selection/clipboard:** copy→paste round-trips text exactly; cut then undo
+  restores; bracketed-paste arrives as one atomic edit (one undo unit), not N.
+
+### 11.3 Determinism (no flaky tests)
+
+The shell's non-determinism is injected so tests stay reproducible — adopting
+kiro's trait-abstracted I/O:
+
+- **Input** is an `Iterator<Item = KeyEvent>`; tests feed a scripted vector.
+- **Output** is ratatui's `TestBackend` (renders to an in-memory cell buffer we can
+  assert/snapshot).
+- **Clock** is a `TimeSource` trait, not `Instant::now()` — so undo-coalescing
+  time thresholds (§9.2) are tested with a fake clock, not wall-clock.
+- **Background jobs** run through an injectable runner: tests use a **synchronous**
+  runner (work runs inline) or assert on the job/result *messages*, so the
+  sync-core/async-edges concurrency (§10.3) is verified without real thread races.
+  The version-stamp **stale-discard** path gets an explicit test (submit job →
+  advance version → assert result dropped).
+
+### 11.4 Module → test focus
+
+| Module | Primary technique | Must-cover |
+|---|---|---|
+| `text_buffer` (ropey wrapper) | unit + property | edit ops, byte↔char↔line conversions on multibyte/emoji |
+| `edit_diff` / `history` | property | the changeset algebra + undo round-trips above |
+| `selection` | property | `.map(changeset)` correctness; clipboard round-trip |
+| `md_parse` | unit + fuzz | byte ranges for markers vs content; GFM constructs |
+| `layout` / `col_map` | property + golden + fuzz | bijection, soft-wrap fidelity, active-line identity |
+| `filter` | subprocess + unit | stdin/stdout/stderr, non-zero exit, cancellation, no deadlock |
+| `editor` (loop/dispatch) | integration | keymap resolution, pending-sequence, mode behavior |
+| `render` | golden | concealed + wrapped frames; status-line feedback |
+
+### 11.5 Tooling & CI
+`proptest`, `insta`, `criterion`, `cargo-fuzz`, ratatui `TestBackend`. CI runs
+unit + property + golden + integration on every push; fuzz targets nightly; the
+per-keystroke bench is tracked for regressions (a hard threshold would be flaky, so
+trend it and alert on step-changes). Mirror kiro/kibi precedent (both ship fuzzing
++ CI).
+
+### 11.6 Non-goals
+Do **not** test dependency internals (ropey, ratatui, crossterm, pulldown-cmark —
+trust them) or pandoc itself (only our *invocation* and error handling, via a
+fake/gated real binary). Cross-terminal clipboard/OSC-52 behavior and true
+terminal-emulator rendering are **manual smoke checks**, not automated — the
+matrix is too large and environment-bound to pin in CI.
+
+---
+
+## 12. Status / Open Threads (still to design)
 
 - **§ Error handling** — pandoc/filter failures, missing binaries, subprocess
   cancellation, save errors.
-- **§ Testing strategy** — `layout` unit tests, golden-render tests, undo/redo
-  property tests, filter integration tests.
 - **§ Config format** — keybindings, theme, pandoc path, filter presets.
 - **§ Keybinding scheme** — default bindings; modal vs modeless.
 - **§ md_parse details** — which CommonMark/GFM constructs are concealed/styled
