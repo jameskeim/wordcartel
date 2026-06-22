@@ -27,20 +27,23 @@ impl TextBuffer {
     }
 
     pub fn insert(&mut self, at: BytePos, text: &str) {
-        debug_assert!(self.is_char_boundary(at), "insert at non-char-boundary byte {at}");
+        assert!(
+            self.is_char_boundary(at),
+            "insert at non-char-boundary byte {at}: would corrupt the buffer"
+        );
         let char_idx = self.rope.byte_to_char(at);
         self.rope.insert(char_idx, text);
     }
 
     pub fn delete(&mut self, range: Range<BytePos>) {
-        debug_assert!(
+        assert!(
             self.is_char_boundary(range.start),
-            "delete range.start ({}) is not a char boundary",
+            "delete range.start ({}) is not a char-boundary: would corrupt the buffer",
             range.start
         );
-        debug_assert!(
+        assert!(
             self.is_char_boundary(range.end),
-            "delete range.end ({}) is not a char boundary",
+            "delete range.end ({}) is not a char-boundary: would corrupt the buffer",
             range.end
         );
         let start = self.rope.byte_to_char(range.start);
@@ -49,14 +52,14 @@ impl TextBuffer {
     }
 
     pub fn slice(&self, range: Range<BytePos>) -> String {
-        debug_assert!(
+        assert!(
             self.is_char_boundary(range.start),
-            "slice range.start ({}) is not a char boundary",
+            "slice range.start ({}) is not a char-boundary: would corrupt the buffer",
             range.start
         );
-        debug_assert!(
+        assert!(
             self.is_char_boundary(range.end),
-            "slice range.end ({}) is not a char boundary",
+            "slice range.end ({}) is not a char-boundary: would corrupt the buffer",
             range.end
         );
         self.rope.byte_slice(range).to_string()
@@ -133,5 +136,15 @@ mod tests {
         assert!(!b.is_char_boundary(2), "byte 2 (inside é) must NOT be a boundary");
         assert!(b.is_char_boundary(3), "byte 3 (start of l) must be a boundary");
         assert!(b.is_char_boundary(b.len()), "len() must be a boundary");
+    }
+
+    /// Inserting at a mid-char byte offset must panic in all build profiles
+    /// (release-enforced char-boundary guard).  "héllo": byte 2 is the second
+    /// byte of 'é' (U+00E9 = [0xC3, 0xA9]) — not a char boundary.
+    #[test]
+    #[should_panic(expected = "char-boundary")]
+    fn insert_at_mid_char_byte_panics() {
+        let mut b = TextBuffer::from_str("héllo");
+        b.insert(2, "X"); // byte 2 is inside 'é' — must panic
     }
 }
