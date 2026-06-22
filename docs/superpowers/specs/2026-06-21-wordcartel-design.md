@@ -1,6 +1,6 @@
 # Wordcartel — Design Document
 
-**Status:** Design-complete; red-teamed (Codex) — hardening in progress (see §16)
+**Status:** Design-complete; red-teamed (Codex) + layout-spike-validated — hardened (see §16/§17)
 **Last updated:** 2026-06-22
 
 > A terminal-native, markdown-first word processor written in Rust, with live
@@ -81,6 +81,9 @@ antirez's `kilo`.
 - **Rationale:** Best writing feel of the options considered, while
   whole-line reveal keeps conceal state to a single boolean per row
   ("is this the cursor's line?"), dramatically simplifying the trickiest module.
+- **Reveal churn** (a line gets taller when revealed) is **accepted and mitigated
+  by scroll-anchoring the active line** (§16.4); the spike measured it at only +1
+  row at normal widths. Element-under-cursor reveal (backlog) would eliminate it.
 - **Alternatives rejected:**
   - *Source view* (always raw, like a code editor): simplest, but loses the
     word-processor feel that motivates the project.
@@ -281,8 +284,11 @@ wordcartel/
 │   ├── selection     anchor+cursor range, clipboard ops       🔴 new
 │   ├── md_parse      pulldown-cmark → styled/marker spans
 │   │                 with source byte ranges                  🔴 new
+│   ├── block_tree    container/block tree; incremental parse
+│   │                 invalidation (§9.2 — highest bug surface) 🔴 new
 │   ├── layout        logical line + conceal + soft-wrap → visual
-│   │                 rows + column-map (screen col ↔ source)  🔴 new
+│   │                 rows + ColMap; Cursor{offset,row,desired_col}
+│   │                 (the §16 spike-validated contract)        🔴 new
 │   └── filter        spawn subprocess, stdin/stdout, 3 modes  🔴 new
 │
 ├── io / shell (side-effecting, thin — on ratatui/crossterm)
@@ -465,21 +471,22 @@ sources (GPL/MPL) are *pattern-only*.
   byte offsets for delimiters) and over `tree-sitter-md` (maintainers warn it is
   inaccurate for inline markdown). tree-sitter, if used at all, only for finding
   block boundaries.
-- **Incremental reparse:** reparse only the dirty block and cache the rest by
-  content hash; the active line shows raw markdown (no parse), so per-keystroke
-  parse cost is small. **⚠ KNOWN DESIGN RISK (Codex red-team #4) — to be resolved
-  in the hardening pass:** a naive blank-line (`\n\n`) scan is *not* safe for full
-  CommonMark/GFM — fenced code spanning blanks, HTML blocks, lazy blockquote
-  continuation, multi-paragraph list items, and link-reference definitions are
-  context-sensitive across blanks. The resolution is either (a) parser-state /
-  container-derived invalidation ranges (a real block tree), or (b) narrow v1
-  markdown to locally-parseable constructs and render ambiguous cases as raw
-  source. The incremental==full-reparse oracle test (§11.2) must cover **every**
-  container construct, not just setext/lists. The layout spike will inform the choice.
-- **`col_map` = atomicRanges analog:** during the grapheme render pass, every
-  visible grapheme pushes its source byte offset (once per visual column);
-  concealed marker bytes push nothing. Cursor at visual column C → source byte
-  `col_map[C]`, which makes arrow keys skip hidden markers for free.
+- **Incremental reparse (DECIDED — block-tree invalidation):** maintain a real
+  **container/block tree** and invalidate only the affected subtree on edit, with
+  invalidation ranges derived from parser/container state — **not** a naive
+  blank-line (`\n\n`) scan, which the Codex red-team (#4) correctly showed is unsafe
+  for full CommonMark/GFM (fenced code spanning blanks, HTML blocks, lazy blockquote
+  continuation, multi-paragraph list items, link-reference definitions are all
+  context-sensitive across blanks). This is the most scalable choice (O(edit) parse)
+  and the one the responsiveness goal (§3.9) wants — but it is also the
+  **highest-bug-surface module**, so it is gated by a strict
+  **incremental==full-reparse oracle test (§11.2) covering *every* container
+  construct**, and warrants its own focused spike before/at implementation. A new
+  `block_tree` core module owns this (§4).
+- **`col_map` = atomicRanges analog:** concealed bytes are simply absent from the
+  visible-grapheme list, so arrow keys skip hidden markers for free. **The full,
+  spike-validated `ColMap` + cursor-affinity + navigation contract is §16** (the
+  cursor is `{offset, row, desired_col}`, not a bare offset).
 
 ### 9.3 Runtime note: no async runtime required
 The filter/subprocess work does **not** require tokio. The synchronous
@@ -1116,7 +1123,74 @@ Consolidates the error behavior referenced throughout the spec into one contract
 
 ---
 
-## 16. Spec Status — Design-Complete; Hardening In Progress
+## 16. Layout, Cursor & ColMap Contract (spike-validated)
+
+A throwaway headless spike (`~/projects/wordcartel-layout-spike`; ropey +
+unicode-segmentation + unicode-width + pulldown-cmark + proptest) validated this
+model — all five invariants below held at 4096 proptest cases each. The conceal
+mechanism validated first-try; the genuine difficulty was the soft-wrap-boundary ×
+cursor interaction (orthogonal to markdown), which forced the cursor model in §16.2.
+
+### 16.1 ColMap contract
+- **Coordinate spaces:** *source* = byte offset into the logical line (canonical;
+  matches `ropey`). *visual* = `(row, col)` — `row` = soft-wrap row within the
+  logical line, `col` = `unicode-width` display column.
+- **Atom:** the grapheme cluster (`unicode-segmentation`). `ColMap.placed:
+  Vec<Placed>` holds one record per **visible** grapheme in visual order:
+  `{ src: Range<usize>, row, col, width }`.
+- **Concealment = absence:** concealed marker bytes appear in **no** `placed`
+  record — so "cursor skips hidden markers" falls out for free.
+- **EOL sentinel:** `eol = line.len()` is a valid cursor stop; `row_end_col[row]`
+  gives the after-last column per row (cursor can sit at end-of-row).
+- **Wide-cell policy:** a width-`w` grapheme owns columns `[col, col+w)`; any maps
+  back to its start.
+- **Zero-width policy:** a zero-width grapheme shares its base's column; at a shared
+  cell `visual_to_source` returns the **positive-width** occupant; a lone zero-width
+  grapheme is not an independent cursor stop.
+- **Tab policy:** **tab-stop alignment** (advance to next multiple of N), not fixed
+  width — borrow `repar::width` (§14.3), which already does tab-stop math.
+- **Wrap-boundary rule:** the offset after a row's last grapheme equals the next
+  row's first-grapheme offset; `source_to_visual` resolves it toward the next row's
+  start. This ambiguity is exactly why the cursor carries explicit row affinity.
+- **Round-trip laws (validated):** (1) bijection on visible cells —
+  `source_to_visual(visual_to_source(cell))` returns the owning grapheme's cell;
+  (3) soft-wrap fidelity — visible row spans reconstruct the line, no grapheme split,
+  widths obey `unicode-width`; (4) active-line identity — `is_active ⇒ placed` covers
+  `[0,len)` gaplessly.
+
+### 16.2 Cursor model (forced by the spike)
+- **`Cursor { offset: usize, row: usize, desired_col: usize }`** — the cursor
+  carries explicit **visual-row affinity**. A bare byte offset is ambiguous at every
+  soft-wrap boundary; affinity is **non-negotiable** (it broke vertical movement and
+  end-of-row semantics until added).
+- **Snapping:** any externally-supplied offset passes through `cursor_at()` (snapped
+  up to the nearest valid stop — lines starting with a concealed span make offset 0
+  invalid); `move_end` snaps off any concealed trailing marker.
+
+### 16.3 Navigation semantics
+| Op | Unit | Desired-col rule | Across active-line reveal |
+|---|---|---|---|
+| left / right | one visible grapheme (skips concealed bytes) | reset `desired_col` to landing col | offset stable; visual col may jump |
+| up / down | one visual row (uses cursor `row`, not raw offset) | preserve `desired_col`; clamp to row end if short, restore on return | row count changes (§16.4); affinity keeps motion sane |
+| home / end | visual row | home → col 0; end → `row_end_col` (snapped) | acts on current wrapping; end keeps row affinity |
+
+### 16.4 Reveal churn — resolution
+Revealing a line's raw markdown adds visual rows (measured: **+1 at normal widths**,
+up to +5 at width 20). **Decision: accept the churn and scroll-anchor the cursor's
+logical line** so it holds its screen position; the reflow happens below the fold.
+Cheapest correct option; keeps the concealed view clean. The horizontal column jump
+on reveal (same offset, different col) is accepted. **`View.scroll` anchors on the
+cursor's logical line, not a fixed top row.** *Element-under-cursor reveal (§3.2
+backlog) remains the eventual churn-eliminator.*
+
+### 16.5 Spike status
+Model validated and implementable; the spike crate is preserved at
+`~/projects/wordcartel-layout-spike` for reference. The production module is rebuilt
+**test-first** (§11) from this contract, not ported from the spike.
+
+---
+
+## 17. Spec Status — Design-Complete; Red-Teamed & Hardened
 
 The **design** (decisions, rationale, architecture) is complete and was
 **red-teamed by an independent reviewer (Codex)**. §§1–15 cover: vision & non-goals
@@ -1126,32 +1200,34 @@ kiro reuse map (7), paths not taken (8), prior art & component stack (9), data-f
 construct set (13), repar integration & line-structure model (14), and error
 handling & recovery (15).
 
-**Post-red-team status.** The load-bearing choices were validated; this pass fixed
-the contradictions and one bug the review found (buffer-reuse tables, undo wording,
-sync/async styling, clipboard semantics, export disposition, the `aspell`-as-filter
-bug → spellcheck is now a diagnostic). Two items are not yet fully specified and are
-being addressed before/at the start of implementation:
+**Post-red-team status.** The load-bearing choices were validated. This pass (a)
+fixed the contradictions + the one bug the review found (buffer-reuse tables, undo
+wording, sync/async styling, clipboard semantics, export disposition, `aspell`-as-
+filter → spellcheck is now a diagnostic); (b) ran a **layout spike** that validated
+the riskiest subsystem empirically; (c) resolved both design risks:
 
-1. **Design risk — incremental markdown reparse** (§9.2 ⚠): blank-line scoping is
-   unsafe for full CommonMark; resolution (block-tree invalidation vs narrowed v1
-   scope) pending.
-2. **Design risk — `layout`/`col_map` × conceal × soft-wrap × cursor** (§3.2/§4/
-   §10.5): the formal `ColMap` + navigation contract is being validated by a
-   throwaway **layout spike** before the hardening pass.
+1. **Design risk — `layout`/`col_map` × conceal × soft-wrap × cursor: RESOLVED.**
+   Spike-validated (all 5 invariants at 4096 cases); the concrete `ColMap` + cursor-
+   affinity + navigation contract is **§16**. Reveal churn accepted + mitigated by
+   active-line scroll-anchoring (§16.4).
+2. **Design risk — incremental markdown reparse: RESOLVED (direction).** Decided on
+   **block-tree invalidation** (§9.2), with a strict incremental==full oracle (§11.2)
+   and its own focused spike at implementation time (it is the highest-bug-surface
+   module).
 
-**Open items deferred to the implementation spec** (tracked, not done): formal
-`ColMap` type & navigation-semantics table; conceal/span model; soft-wrap algorithm
-details; canonical position type; undo-granularity specifics; IME/paste/grapheme
-handling; performance budgets (numeric); large-document limits; full config schema;
-filter security model (argv/shell, caps, timeouts); pandoc export contract;
-version-control/encoding/newline policy; accessibility baseline; autosave/swap
-decision. (See the Codex red-team for the full enumeration.)
+**Open items deferred to the implementation spec** (tracked, not done): conceal/span
+model details; soft-wrap algorithm corners (hanging indents, long URLs, CJK in
+lists); undo-granularity specifics; IME/paste/grapheme handling; **performance
+budgets (numeric)**; large-document limits; full config schema; filter security
+model details (argv/shell, caps, timeouts — direction set in §3.5); pandoc export
+contract; version-control/encoding/newline policy; accessibility baseline;
+autosave/swap decision. (See the Codex red-team for the full enumeration.)
 
-**Next steps:** (1) build the **layout spike** to validate the riskiest model
-empirically; (2) a **hardening pass** that resolves the two design risks, pulls the
-cheap specifics forward, records the product decisions, and turns the open-items
-list into concrete contracts; (3) the implementation plan (`writing-plans`). The
-natural build order is the **pure core first**: `ropey`-backed buffer →
-`edit_diff`/`history` (undo) → `selection` → `md_parse` → `layout`/`col_map`, then
-io/shell (crossterm input, ratatui render, `repar` transforms, `filter`, clipboard,
-atomic save), then app wiring (editor loop, commands, config, palette/menu).
+**Next steps:** (1) a short **specifics pull-forward** (perf budgets, navigation
+already in §16, canonical position type = byte offset per §16.1) and the remaining
+**product decisions**; (2) the implementation plan (`writing-plans`). Build order is
+**pure core first**: `ropey`-backed buffer → `edit_diff`/`history` (undo) →
+`selection` → `md_parse` → **`block_tree`** → `layout`/`ColMap` (§16), then io/shell
+(crossterm input, ratatui render, `repar` transforms, `filter`, clipboard, atomic
+save), then app wiring (editor loop, commands, config, palette/menu). The `block_tree`
+and `layout` modules get focused spikes + oracle/property tests first.
