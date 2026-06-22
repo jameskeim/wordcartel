@@ -46,6 +46,17 @@ Legend: ✅ done · 🔨 in this effort · ⏳ later effort · 📋 deferred to 
 | 15 | Error handling & recovery; swap-file; panic dump | 3 (save/panic) / 4 (surface) | ⏳ |
 | 5 | Incremental search (`regex-cursor`); writing aids (word count, focus) | 4 | ⏳ |
 
+## Reuse posture (decided 2026-06-22)
+"Source as much as possible" resolves, for the edit kernel, as: **reuse the hard
+parts via standalone crates** (`ropey` — MIT/Apache, independent of helix-core —
+plus smartstring/smallvec/unicode-*), **reuse the Helix/CodeMirror designs**, and
+**hand-write the ~300-line ChangeSet/selection/undo glue** because no
+ropey-based, library-friendly, permissive crate provides it (helix-core: MPL,
+not-for-external-use, heavy; floem_editor_core: Apache but xi-rope, conflicts with
+the locked ropey + §16). See Effort-1 plan "Reuse Posture". Also recorded v1
+simplifications: **linear undo** (branching §9.1 deferred); **no `ChangeSet::compose`**
+(edit-list-per-revision coalescing instead).
+
 ## Per-effort task ledgers
 Each plan file ends with its own task checklist; mark tasks `- [x]` as completed and
 flip this ledger's **Status** when an effort's plan is fully green.

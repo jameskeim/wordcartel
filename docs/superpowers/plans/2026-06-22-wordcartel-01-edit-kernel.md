@@ -19,6 +19,31 @@
 
 ---
 
+## Reuse Posture (decided 2026-06-22)
+
+Wordcartel's standing goal is to **source as much as possible from existing code.**
+For this kernel that resolves as:
+
+- **Reuse the hard, high-risk parts via standalone crates:** `ropey` (the rope — a
+  standalone crate, **MIT OR Apache-2.0**, independent of helix-core; Helix merely
+  depends on it too), plus `smartstring`, `smallvec`, `unicode-segmentation`,
+  `unicode-width`. The genuinely difficult, valuable component (the rope) is reused
+  outright with **zero** copyleft/entanglement.
+- **Reuse the proven *designs*** for ChangeSet / selection / undo — the Helix and
+  CodeMirror transaction patterns.
+- **Hand-write only the ~300-line glue** (`ChangeSet` apply/invert, `Selection::map`,
+  `History`). This is *not* a rejection of reuse: there is no well-maintained,
+  **ropey-based**, library-friendly, permissively-licensed crate that provides these
+  primitives. The two candidates both fail our constraints: **helix-core** (MPL —
+  fine to *depend on*, also ropey-based) is explicitly **not intended for external
+  use**, has no API-stability guarantee, and is heavy (pulls tree-sitter);
+  **floem_editor_core** (Apache, library-shaped) uses **xi-rope**, which would
+  reverse the locked ropey decision (§3.10) and break the regex-cursor and §16
+  ColMap work. Owning a small, fully-property-tested coordination layer (clean MIT,
+  exact API fit, no dependency churn) is the pragmatic reuse-respecting choice.
+
+---
+
 ## File Structure
 
 - `wordcartel-core/Cargo.toml` — crate manifest + pinned deps.
