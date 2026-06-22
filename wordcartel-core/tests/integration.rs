@@ -26,6 +26,9 @@ proptest! {
         let mut buf = TextBuffer::from_str(&start);
         let mut hist = History::default();
         let mut sel = Selection::single(0);
+        // Record the before-selection prior to each commit so we can verify
+        // that undo returns the correct selection for every revision.
+        let mut before_sels: Vec<Selection> = Vec::new();
 
         for (pos, ins, is_insert) in ops {
             let len = buf.len();
@@ -36,13 +39,19 @@ proptest! {
                 let end = snap(&buf.to_string(), (at + 1).min(len));
                 ChangeSet::delete(at..end, len)
             };
+            before_sels.push(sel.clone());
             sel = hist.commit(Transaction::new(cs), &mut buf, sel.clone());
             // selection stays in bounds after every commit
             prop_assert!(sel.primary().head <= buf.len());
         }
 
-        // undo everything
-        while hist.undo(&mut buf).is_some() {}
+        // undo everything; each returned selection must equal the before-selection
+        // that was recorded before the corresponding commit (LIFO order).
+        while let Some(returned_sel) = hist.undo(&mut buf) {
+            let expected = before_sels.pop().unwrap();
+            prop_assert_eq!(returned_sel, expected,
+                "undo returned wrong selection");
+        }
         prop_assert_eq!(buf.to_string(), original);
     }
 }

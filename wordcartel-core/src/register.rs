@@ -65,4 +65,22 @@ mod tests {
         let reg = Register::default();
         assert!(paste(0, 0, &reg).is_none());
     }
+
+    /// A REVERSE selection (anchor > head) should copy the same text as the
+    /// forward equivalent. Range::from()/to() normalise the order.
+    #[test]
+    fn copy_reverse_selection_matches_forward() {
+        let buf = TextBuffer::from_str("hello world");
+        let mut reg_fwd = Register::default();
+        let mut reg_rev = Register::default();
+
+        // Forward: anchor=0, head=5 → "hello"
+        copy(&buf, Range { anchor: 0, head: 5 }, &mut reg_fwd);
+        // Reverse: anchor=5, head=0 → should also be "hello"
+        copy(&buf, Range { anchor: 5, head: 0 }, &mut reg_rev);
+
+        assert_eq!(reg_fwd.get(), Some("hello"));
+        assert_eq!(reg_rev.get(), reg_fwd.get(),
+            "reverse selection should copy identical text to forward selection");
+    }
 }

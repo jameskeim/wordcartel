@@ -257,4 +257,34 @@ mod tests {
         assert_eq!(buf.to_string(), "z");
         assert!(hist.redo(&mut buf).is_none());
     }
+
+    /// A coalesced burst of 3 Type chars forms one revision. After undo, a single
+    /// redo must return the burst's *after* selection exactly (the position left by
+    /// the last coalesced keystroke).
+    #[test]
+    fn redo_after_coalesced_burst_returns_after_selection() {
+        let mut buf = TextBuffer::from_str("");
+        let mut hist = History::default();
+        let clock = FakeClock::new();
+        let mut sel = Selection::single(0);
+
+        clock.set(0);
+        sel = hist.commit_coalescing(type_char(&buf, 0, "a"), &mut buf, sel, &clock, EditKind::Type);
+        clock.set(100);
+        sel = hist.commit_coalescing(type_char(&buf, 1, "b"), &mut buf, sel, &clock, EditKind::Type);
+        clock.set(200);
+        let after_burst = hist.commit_coalescing(type_char(&buf, 2, "c"), &mut buf, sel, &clock, EditKind::Type);
+        assert_eq!(buf.to_string(), "abc");
+        // after_burst is the selection after the last 'c' was typed (head = 3)
+        assert_eq!(after_burst, Selection::single(3));
+
+        // undo the whole burst in one step
+        hist.undo(&mut buf).unwrap();
+        assert_eq!(buf.to_string(), "");
+
+        // redo must return exactly the after-selection of the burst
+        let redone_sel = hist.redo(&mut buf).unwrap();
+        assert_eq!(buf.to_string(), "abc");
+        assert_eq!(redone_sel, after_burst, "redo should return the burst's after selection");
+    }
 }
