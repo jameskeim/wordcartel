@@ -1,0 +1,15 @@
+[package]
+name = "wordcartel-core"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+ropey = "=1.6.1"
+smartstring = "1"
+smallvec = "1"
+unicode-segmentation = "1"
+unicode-width = "0.1"
+
+[dev-dependencies]
+proptest = "1"
