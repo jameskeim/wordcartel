@@ -22,7 +22,12 @@ pub struct ChangeSet {
 
 impl ChangeSet {
     /// Insert `text` at byte offset `at` in a document of length `doc_len`.
+    ///
+    /// If `at > doc_len` the position is clamped to `doc_len` (safe in release;
+    /// the `debug_assert` fires in debug builds to catch caller bugs early).
     pub fn insert(at: BytePos, text: &str, doc_len: usize) -> ChangeSet {
+        debug_assert!(at <= doc_len, "insert at {} past doc_len {}", at, doc_len);
+        let at = at.min(doc_len);
         let mut ops = Vec::new();
         if at > 0 {
             ops.push(Op::Retain(at));
@@ -35,16 +40,33 @@ impl ChangeSet {
     }
 
     /// Delete `range` (bytes) in a document of length `doc_len`.
+    ///
+    /// A reversed range (`range.start > range.end`) is normalized to the
+    /// equivalent forward range.  Either endpoint beyond `doc_len` is clamped.
+    /// The `debug_assert` fires in debug builds to catch caller bugs early;
+    /// release builds clamp silently.
     pub fn delete(range: Range<BytePos>, doc_len: usize) -> ChangeSet {
+        debug_assert!(
+            range.start <= range.end && range.end <= doc_len,
+            "delete range {:?} invalid for doc_len {}",
+            range,
+            doc_len
+        );
+        // Normalize: handle reversed range, then clamp both endpoints.
+        let start = range.start.min(range.end);
+        let end = range.start.max(range.end);
+        let end = end.min(doc_len);
+        let start = start.min(end);
+        let del_len = end - start;
         let mut ops = Vec::new();
-        if range.start > 0 {
-            ops.push(Op::Retain(range.start));
+        if start > 0 {
+            ops.push(Op::Retain(start));
         }
-        ops.push(Op::Delete(range.end - range.start));
-        if range.end < doc_len {
-            ops.push(Op::Retain(doc_len - range.end));
+        ops.push(Op::Delete(del_len));
+        if end < doc_len {
+            ops.push(Op::Retain(doc_len - end));
         }
-        ChangeSet { ops, len_before: doc_len, len_after: doc_len - (range.end - range.start) }
+        ChangeSet { ops, len_before: doc_len, len_after: doc_len - del_len }
     }
 
     /// Apply in place. O(edit size + #ops·log n): Retain only advances a cursor,
@@ -129,6 +151,52 @@ mod tests {
         assert_eq!(b.to_string(), "hello");
         inv.apply(&mut b);
         assert_eq!(b.to_string(), "hello world"); // round-trip
+    }
+
+    // ── Fix A: ChangeSet constructor clamping / normalization ──────────────────
+
+    /// A reversed range must produce the same changeset + result as the forward range.
+    /// Only runs in release mode; in debug mode the debug_assert tripwire fires first.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn delete_reversed_range_equals_forward() {
+        let mut fwd = TextBuffer::from_str("hello world");
+        let cs_fwd = ChangeSet::delete(5..7, fwd.len());
+
+        let mut rev = TextBuffer::from_str("hello world");
+        let cs_rev = ChangeSet::delete(7..5, rev.len()); // reversed
+
+        // Both changesets must be structurally identical.
+        assert_eq!(cs_fwd, cs_rev);
+        cs_fwd.apply(&mut fwd);
+        cs_rev.apply(&mut rev);
+        assert_eq!(fwd.to_string(), rev.to_string());
+    }
+
+    /// `range.end` beyond `doc_len` clamps to `doc_len`.
+    /// Only runs in release mode; in debug mode the debug_assert tripwire fires first.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn delete_range_end_beyond_doc_len_clamps() {
+        let mut b = TextBuffer::from_str("hello");
+        let len = b.len(); // 5
+        let cs = ChangeSet::delete(2..99, len); // end way past the end
+        cs.apply(&mut b);
+        assert_eq!(b.to_string(), "he"); // deleted bytes 2..5
+        assert_eq!(cs.len_after, 2);
+    }
+
+    /// `at` beyond `doc_len` clamps to `doc_len` (appends).
+    /// Only runs in release mode; in debug mode the debug_assert tripwire fires first.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn insert_at_beyond_doc_len_clamps() {
+        let mut b = TextBuffer::from_str("hello");
+        let len = b.len(); // 5
+        let cs = ChangeSet::insert(99, "!", len); // at way past the end
+        cs.apply(&mut b);
+        assert_eq!(b.to_string(), "hello!"); // appended
+        assert_eq!(cs.len_after, len + 1);
     }
 
     use proptest::prelude::*;
