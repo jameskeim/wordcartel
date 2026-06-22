@@ -196,7 +196,7 @@ mod tests {
             // If snap pushed cut to 0 or len, skip — can't form a proper multi-op.
             if cut == 0 || cut == len { return Ok(()); }
 
-            // Build a 4+-op ChangeSet manually:
+            // Build a 3-op ChangeSet manually (Retain + Delete + Insert):
             //   Retain(cut)  Delete(len - cut)  Insert(ins)
             // len_before = len
             // len_after  = cut + ins.len()
