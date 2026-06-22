@@ -205,6 +205,15 @@ decide it — *our* architecture does. These principles are non-negotiable:
    not that an action takes a moment, but that it gives *no feedback* while it
    does — you wait in silence. Every action acknowledges immediately.
 
+**Performance budget (v1 targets — the bar §11.5 guards):**
+- **p95 keystroke→render < 16 ms** (one 60 Hz frame; feels instant); p50 well under.
+- **Per-edit `block_tree` reparse < ~5 ms**; per-keystroke foreground work stays
+  O(visible screen) + O(edited container).
+- **Smooth editing up to ~5 MB / ~2,000 pages**; logical line length unbounded
+  (rope). Beyond that, degrade gracefully, not crash.
+- A **benchmark corpus** in CI trends these and alerts on step-changes (hard gates
+  stay off to avoid flakiness, §11.5).
+
 ### 3.10 Buffer = `ropey` (LOCKED — affirmed after re-examination)
 - **Decision:** Use the **`ropey`** rope crate (MIT/Apache-2.0) as the editable
   buffer, **replacing** kiro's `Vec<Row>` line-vector. Pin `ropey = "1.6.1"`
@@ -345,17 +354,31 @@ close to what pandoc ingests, so what you see maps to what exports.
   movement, insert/delete, **undo/redo**.
 - **Selection + clipboard** (copy/cut/paste).
 - **Incremental search** (find; find/replace).
-- **`filter` primitive** with **pandoc export** and **spellcheck** as presets.
+- **`filter` primitive** with **pandoc export** as a preset (spellcheck is a
+  *diagnostic*, not a filter — see below).
+- **Basic spellcheck** (diagnostic, §3.5): underline misspellings, suggestions list,
+  ignore / add-to-dictionary; runs off the hot path.
 - **Writing aids:** word/char count, distraction-free / focus mode.
 - **repar transforms** (in-process): reflow / unwrap / ventilate commands; explicit
   **unwrap-on-import**; **reflow/ventilate export**; **wrap-guide ruler** (§14).
 - **Render-mode toggle** (§3.11): live-preview / source-highlighted / source-plain.
+- **Basic mouse:** click to position cursor, wheel scroll, drag to select
+  (crossterm mouse events; composes with the selection model). Keyboard remains
+  fully sufficient.
+- **Data safety:** atomic save (§14.3), emergency-dump-on-panic (§15.7), and a
+  **periodic swap/recovery file** (vim-`.swp`-style; never overwrites the real
+  `.md`), offered on next open.
+- **Accessibility:** a **no-color / high-contrast mode**; never rely on color alone
+  (links/headings/errors also carry a non-color cue — underline/weight/glyph).
+- **Performance budget** met (§3.9): p95 keystroke→render < 16 ms; smooth to ~5 MB.
+- **Input:** bracketed paste as one atomic edit; composed keys best-effort.
 
 ### Backlog (post-v1)
 - Element-under-cursor reveal (tighter conceal granularity).
-- Bundled spellcheck UX beyond the `aspell` filter preset.
+- **Advanced spellcheck:** multi-language, custom-dictionary UX, live re-check.
+- **Full IME / preedit** composition (terminal IME support is weak/variable).
 - Multiple buffers / windows.
-- Richer block styling (tables, footnotes, task lists rendering).
+- Richer block styling (full table grid, footnotes); inline image display.
 - Configurable themes beyond the default.
 
 ---
@@ -738,9 +761,11 @@ kiro's trait-abstracted I/O:
 ### 11.5 Tooling & CI
 `proptest`, `insta`, `criterion`, `cargo-fuzz`, ratatui `TestBackend`. CI runs
 unit + property + golden + integration on every push; fuzz targets nightly; the
-per-keystroke bench is tracked for regressions (a hard threshold would be flaky, so
-trend it and alert on step-changes). Mirror kiro/kibi precedent (both ship fuzzing
-+ CI), and adopt **repar's discipline** (§14.4): a committed golden corpus, checked-in
+per-keystroke bench is tracked against the **§3.9 performance budget** (p95
+keystroke→render < 16 ms; per-edit reparse < ~5 ms; smooth to ~5 MB) over a
+committed **benchmark corpus**; a hard threshold would be flaky, so trend it and
+alert on step-changes. Mirror kiro/kibi precedent (both ship fuzzing + CI), and
+adopt **repar's discipline** (§14.4): a committed golden corpus, checked-in
 `proptest-regressions` seeds, and round-trip-law invariants.
 
 ### 11.6 Non-goals
@@ -885,6 +910,10 @@ Terminals have **no font sizes**, so the heading hierarchy is conveyed by **weig
 color**, not size. Available styling: bold (SGR 1), italic (SGR 3), strikethrough
 (SGR 9), underline (SGR 4), dim (SGR 2), plus theme colors (truecolor→256→16, §4).
 Each has a graceful fallback (e.g., italic→color if a terminal lacks SGR 3).
+**Accessibility (v1):** a **no-color / high-contrast mode**, and every distinction
+must also carry a **non-color cue** (weight/underline/glyph) so links, headings,
+emphasis, and errors are distinguishable without color — color is never the sole
+signal.
 
 ### 13.3 Inline constructs (v1)
 
@@ -1117,9 +1146,11 @@ Consolidates the error behavior referenced throughout the spec into one contract
   <pid>.md`) before exiting with the panic report for a bug filing. This is the
   last line of the "never lose work" guarantee.
 - **Hard kill / power loss** (no unwind possible) is mitigated by (a) atomic save —
-  the on-disk file is never half-written — and (b) an **optional autosave / swap
-  file** safety net (vim-`.swp`-style), offered on next open. *(Autosave/swap is
-  v1-light or backlog; the atomic guarantee + emergency dump cover the common cases.)*
+  the on-disk file is never half-written — and (b) a **periodic swap/recovery file**
+  (vim-`.swp`-style) that **never overwrites the real `.md`**, offered for recovery
+  on next open. **This is in v1** (decided): swap-file recovery + emergency dump +
+  atomic save together cover crash, panic, and half-write. Opt-in autosave-*to-file*
+  was rejected for v1 (auto-overwriting a writer's file on a timer is contentious).
 
 ---
 
@@ -1215,13 +1246,17 @@ the riskiest subsystem empirically; (c) resolved both design risks:
    and its own focused spike at implementation time (it is the highest-bug-surface
    module).
 
-**Open items deferred to the implementation spec** (tracked, not done): conceal/span
-model details; soft-wrap algorithm corners (hanging indents, long URLs, CJK in
-lists); undo-granularity specifics; IME/paste/grapheme handling; **performance
-budgets (numeric)**; large-document limits; full config schema; filter security
-model details (argv/shell, caps, timeouts — direction set in §3.5); pandoc export
-contract; version-control/encoding/newline policy; accessibility baseline;
-autosave/swap decision. (See the Codex red-team for the full enumeration.)
+**Product decisions resolved (v1):** performance budget (§3.9: p95 < 16 ms, ~5 MB);
+swap-file recovery (§15.7); basic spellcheck diagnostic (§5); basic mouse (§5);
+no-color/high-contrast accessibility (§13.2); bracketed-paste + best-effort composed
+input (full IME backlog).
+
+**Open items still deferred to the implementation spec** (tracked, not done):
+conceal/span model details; soft-wrap algorithm corners (hanging indents, long URLs,
+CJK in lists); undo-granularity specifics; full config schema; filter security model
+details (argv/shell, caps, timeouts — direction set in §3.5); pandoc export contract;
+version-control/encoding/newline policy. These resolve during `writing-plans` per
+task (several via TDD).
 
 **Next steps:** (1) a short **specifics pull-forward** (perf budgets, navigation
 already in §16, canonical position type = byte offset per §16.1) and the remaining
