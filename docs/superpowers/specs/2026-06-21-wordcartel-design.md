@@ -1,6 +1,6 @@
 # Wordcartel — Design Document
 
-**Status:** Design complete — ready for implementation planning
+**Status:** Design-complete; red-teamed (Codex) — hardening in progress (see §16)
 **Last updated:** 2026-06-22
 
 > A terminal-native, markdown-first word processor written in Rust, with live
@@ -93,8 +93,9 @@ antirez's `kilo`.
 ### 3.3 Source of truth is text, not an AST
 - **Decision:** The buffer is plain Markdown text. The parse tree is a *derived
   view* recomputed for rendering — we never edit an AST and re-serialize.
-- **Rationale:** Keeps editing, undo, and save trivially simple (it is all text).
-  Lets kiro's text-buffer + diff-based undo port over intact. Avoids
+- **Rationale:** Keeps editing, undo, and save trivially simple (it is all text) —
+  edits are plain text edits over the `ropey` buffer (§3.10), and undo is a
+  reimplemented ChangeSet/history (§9.1), not tied to any AST. Avoids
   round-trip/serialization loss.
 
 ### 3.4 Soft word-wrap is mandatory
@@ -111,23 +112,33 @@ antirez's `kilo`.
 
 ### 3.5 The `filter` primitive: pipe buffer/selection through external tools
 - **Decision:** A single mechanism spawns a subprocess, feeds it text on stdin,
-  and routes stdout one of three ways. Pandoc export and spellcheck are presets.
+  and routes stdout one of three ways. Pandoc export and the repar transforms (§14)
+  are presets. **Spellcheck is NOT a filter** — `aspell list` etc. emit a *word
+  list*, not corrected text; spellcheck is a **diagnostic command/Effect** (§10.4)
+  that produces markers/diagnostics, never a buffer replacement.
 
   | Disposition | stdin | stdout → | Undoable | Examples |
   |---|---|---|---|---|
-  | **Filter** | selection (else whole buffer) | replaces that range | yes | `fmt -w 80`, `sort`, `aspell`, an LLM CLI |
+  | **Filter** | selection (else whole buffer) | replaces that range | yes | `fmt -w 80`, `sort`, `prettier --parser markdown`, an LLM CLI |
   | **Insert** | (none) | inserted at cursor | yes | `date`, `cat snippet.md` |
-  | **Export** | whole buffer | a file on disk | no (read-only) | `pandoc -o out.docx` |
+  | **Export** | whole buffer | see note | no (read-only) | `pandoc -o out.docx` |
 
+  *Export note:* a preset declares **either** `capture` (we read the child's stdout
+  and write it to a chosen path) **or** `writes_output` (the child writes its own
+  file, e.g. pandoc `-o`; we pass the path as an arg and capture only stderr/exit).
+  The export contract (input flags, output-path selection, front-matter, resource
+  paths) is an implementation-spec item.
 - **Rationale:** Unix-editor tradition (vim `!`, Acme pipe, Kakoune `|`).
   Pandoc export and "pipe through a tool" are the *same* operation, so they share
-  one well-tested module. Turns Wordcartel into a platform: spellcheck, reflow,
-  table formatting, grammar/translation/AI — all without in-core features.
-  Architecturally cheap because the subprocess plumbing was needed for pandoc
-  regardless.
-- **Open considerations:** runs arbitrary shell (acceptable for a personal tool;
-  note it); capture stderr to surface errors; guard against very large output;
-  make long-running filters cancellable.
+  one well-tested module. Turns Wordcartel into a platform: reflow, table
+  formatting, grammar/translation/AI — all without in-core features. Architecturally
+  cheap because the subprocess plumbing was needed for pandoc regardless.
+- **Security/robustness model** (to be fully specified in the hardening pass —
+  Codex red-team #8): default to **argv arrays** (no implicit shell); an explicit
+  `shell = true` opt-in per preset for pipelines; validate stdout is UTF-8 (reject
+  binary); cap output size (stream to temp beyond a threshold); default timeout +
+  Esc cancellation (`kill`); deadlock-safe concurrent stdin/stdout (§9.2). The
+  buffer is replaced **only** after a successful, fully-collected, valid result.
 
 ### 3.6 Selection + system clipboard
 - **Decision:** Range selection (anchor + cursor); copy/cut/paste via the
@@ -258,14 +269,15 @@ decide it — *our* architecture does. These principles are non-negotiable:
 Three layers: a pure, terminal-free **core** (unit-testable in isolation); a thin
 side-effecting **io/shell** layer (now built on **ratatui**/**crossterm**); and the
 **app** wiring. Provenance is marked: ✅ ported from kiro · 🟡 adapted from kiro ·
-🟢 provided by ratatui/crossterm · 🔴 net-new.
+🟢 provided by a crate dependency (ratatui/crossterm/ropey) · 🔴 net-new (incl.
+reimplemented-from-pattern). *(kiro's role is structural reference only — §7/§9.)*
 
 ```
 wordcartel/
 ├── core (no terminal/IO deps — pure, unit-testable)
-│   ├── text_buffer   logical lines, edit ops, UTF-8           ✅ kiro
-│   ├── edit_diff     edits as reversible diffs                ✅ kiro
-│   ├── history       undo/redo stack over edit_diff           ✅ kiro
+│   ├── rope_buffer   ropey wrapper: edit ops, byte↔char↔line  🟢 ropey + 🔴 wrapper
+│   ├── edit_diff     ChangeSet (retain/delete/insert)         🔴 reimpl (Helix/CM)
+│   ├── history       undo/redo over ChangeSet                 🔴 reimpl (Helix/CM)
 │   ├── selection     anchor+cursor range, clipboard ops       🔴 new
 │   ├── md_parse      pulldown-cmark → styled/marker spans
 │   │                 with source byte ranges                  🔴 new
@@ -360,9 +372,9 @@ afterthought.
 
 | kiro module | Verdict | Notes |
 |---|---|---|
-| `text_buffer.rs` | ✅ Port ~as-is | Text storage + UTF-8 metadata = our core of truth. |
-| `edit_diff.rs` | ✅ Port wholesale | Reversible-diff edits — undo backbone. |
-| `history.rs` | ✅ Port wholesale | Undo/redo stack over edit_diff. |
+| `text_buffer.rs` | 🔴 Replace → `ropey` | Superseded by the `ropey` rope (§3.10); kiro's `Vec<Row>` is structural reference only. |
+| `edit_diff.rs` | 🔴 Reimplement | ChangeSet (retain/delete/insert) reimplemented from Helix/CM patterns (§9.1); kiro's enum is a reference, not ported. |
+| `history.rs` | 🔴 Reimplement | Branching undo/redo over ChangeSet (§9.1), prose-tuned coalescing; kiro's stack is a reference. |
 | `editor.rs` | 🟡 Port loop shape | Our own loop; structure follows kiro; state struct grows. |
 | `row.rs` | 🟡 Salvage UTF-8 logic | Keep width/byte-index caching; rendering moves to `layout`. |
 | `input.rs` | 🟢→ crossterm | Replaced by crossterm events; we keep only key→action mapping. |
@@ -453,11 +465,17 @@ sources (GPL/MPL) are *pattern-only*.
   byte offsets for delimiters) and over `tree-sitter-md` (maintainers warn it is
   inaccurate for inline markdown). tree-sitter, if used at all, only for finding
   block boundaries.
-- **Incremental reparse:** find the dirty block via blank-line (`\n\n`) scan up/down
-  from the edit, reparse only that block, cache inactive blocks by content hash.
-  The active line shows raw markdown (no parse), and inactive lines don't change
-  while typing the active line — so per-keystroke parse cost is tiny. **Edge case:**
-  setext headings (`Foo` over `===`) need two-line context.
+- **Incremental reparse:** reparse only the dirty block and cache the rest by
+  content hash; the active line shows raw markdown (no parse), so per-keystroke
+  parse cost is small. **⚠ KNOWN DESIGN RISK (Codex red-team #4) — to be resolved
+  in the hardening pass:** a naive blank-line (`\n\n`) scan is *not* safe for full
+  CommonMark/GFM — fenced code spanning blanks, HTML blocks, lazy blockquote
+  continuation, multi-paragraph list items, and link-reference definitions are
+  context-sensitive across blanks. The resolution is either (a) parser-state /
+  container-derived invalidation ranges (a real block tree), or (b) narrow v1
+  markdown to locally-parseable constructs and render ambiguous cases as raw
+  source. The incremental==full-reparse oracle test (§11.2) must cover **every**
+  container construct, not just setext/lists. The layout spike will inform the choice.
 - **`col_map` = atomicRanges analog:** during the grapheme render pass, every
   visible grapheme pushes its source byte offset (once per visual column);
   concealed marker bytes push nothing. Cursor at visual column C → source byte
@@ -479,8 +497,11 @@ which Wordcartel should do well from v1:
   family runs synchronously and blocks its UI.
 
 ### 9.5 Clipboard / terminal gotchas to honor (implementation-time)
-- Treat the system clipboard as **optional** — never `unwrap`; fall back
-  arboard → OSC 52 → silent no-op (covers SSH, headless, GNOME-Wayland).
+- Treat the **system** clipboard as optional — never `unwrap`; fall back
+  arboard → OSC 52 → (system sync unavailable). Copy/cut/paste **always** work via
+  an **internal register**; only *syncing to the OS clipboard* degrades. So an
+  unavailable system clipboard is a no-op *for OS sync*, not for editing — this is
+  the precise meaning reconciled with §15.6.
 - Handle **bracketed paste** as a single `Event::Paste(String)` (crossterm), not
   N keystrokes; spawn large pastes off the loop with a "pasting…" indicator.
 - Offer both CLIPBOARD and PRIMARY (X11 middle-click) selections on Linux.
@@ -550,7 +571,7 @@ View     { scroll, area, wrap (cache) }
 | Undo history | **truth** (time) | Document | `apply` pushes inverted Transaction (text+selection) |
 | `version: u64` | **truth** (revision) | Document | `+= 1` per apply; staleness token for async |
 | Block map | derived | Document | dirty → reparse edited block only (pulldown-cmark) |
-| Concealed styling | derived | Document | async-filled from (snapshot, version); merge if current |
+| Concealed styling | derived | Document | **viewport: synchronous** (block reparse in `derive`, §10.3/§10.5) so the immediate frame is correct; only off-screen / heavy whole-doc passes are async-filled from (snapshot, version), merged if current |
 | Soft-wrap map | derived | View | rebuilt for visible range on edit/resize (width-dependent) |
 | Scroll / area | display | View | clamped to keep cursor visible; reset on resize |
 | mode / pending keys / count / register | ephemeral | Editor | set by input; cleared when a command resolves |
@@ -813,21 +834,24 @@ theme        = "default"
 [pandoc]
 path = "pandoc"            # autodetected; degrade gracefully if absent (§3.1)
 
-[filters.spellcheck]       # a `filter` preset (§3.5) — appears in palette + menu
-command     = "aspell --mode=markdown list"
+# Filters run argv ARRAYS by default (no implicit shell); set shell = true for pipelines.
+# (reflow / unwrap / ventilate are IN-PROCESS repar commands, §14 — not subprocess presets.)
+[filters.table-align]      # tidy GFM table source so styled-raw reads cleanly (§13.6)
+argv        = ["prettier", "--parser", "markdown"]
 disposition = "filter"     # filter | insert | export
 
-[filters.reflow]
-command     = "fmt -w 80"
-disposition = "filter"
-
-[filters.table-align]      # tidy GFM table source so styled-raw reads cleanly (§13.6)
-command     = "prettier --parser markdown"
-disposition = "filter"
-
 [filters.normalize-headings]  # setext -> ATX, de-risks the reparse hazard (§13.6)
-command     = "pandoc -f gfm -t gfm"
+argv        = ["pandoc", "-f", "gfm", "-t", "gfm"]
 disposition = "filter"
+
+[export.docx]              # pandoc writes its own -o file ({out} = chosen path)
+argv   = ["pandoc", "-o", "{out}"]
+output = "writes_output"   # vs "capture" = read child stdout → path (§3.5 Export note)
+
+# Spellcheck is a DIAGNOSTIC command (§3.5), NOT a filter — it marks misspellings;
+# it never replaces buffer text.
+[diagnostics.spellcheck]
+argv = ["aspell", "--mode=markdown", "list"]
 ```
 
 - **Theme** keys color the concealed-markdown styling (heading/emphasis/code/link/
@@ -1069,9 +1093,10 @@ Consolidates the error behavior referenced throughout the spec into one contract
 - `--no-config` bypasses all config-file lookup for a clean-room session.
 
 ### 15.6 Clipboard & terminal capabilities
-- **Clipboard** is optional (§9.5): `arboard → OSC 52 → silent no-op`; never
-  `unwrap`. If unavailable, a one-time status notice; copy/cut/paste degrade to
-  in-process register behavior so editing is unaffected.
+- **Clipboard** is optional (§9.5): the *system* clipboard syncs via
+  `arboard → OSC 52`, and if unavailable that *sync* is a no-op (one-time notice) —
+  but copy/cut/paste **always** work via the in-process register, so editing is
+  never affected. Never `unwrap`.
 - **Terminal capabilities** (truecolor, Kitty keyboard protocol, OSC 52) are
   detected and **degrade gracefully** (§4, §12.4) — never an error.
 - **Terminal too small** (width below a usable minimum) → render a clamped
@@ -1091,18 +1116,42 @@ Consolidates the error behavior referenced throughout the spec into one contract
 
 ---
 
-## 16. Spec Status — Complete
+## 16. Spec Status — Design-Complete; Hardening In Progress
 
-All design threads are closed. §§1–15 cover: vision & non-goals (1–2), key decisions
-& rationale (3), architecture (4), scope (5), licensing (6), the kiro reuse map (7),
-paths not taken (8), prior art & the borrowed component stack (9), data-flow &
-control-flow (10), testing strategy (11), config & keybindings (12), the v1 markdown
-construct set (13), repar integration & the line-structure model (14), and error
+The **design** (decisions, rationale, architecture) is complete and was
+**red-teamed by an independent reviewer (Codex)**. §§1–15 cover: vision & non-goals
+(1–2), key decisions & rationale (3), architecture (4), scope (5), licensing (6),
+kiro reuse map (7), paths not taken (8), prior art & component stack (9), data-flow
+& control-flow (10), testing (11), config & keybindings (12), the v1 markdown
+construct set (13), repar integration & line-structure model (14), and error
 handling & recovery (15).
 
-**Next step:** an implementation plan (the `writing-plans` step). The natural build
-order is the **pure core first** (it is the most-tested, terminal-free foundation):
-`ropey` buffer → `edit_diff`/`history` (undo) → `selection` → `md_parse` →
-`layout`/`col_map`, then the io/shell (crossterm input, ratatui render, `repar`
-transforms, `filter`, clipboard, atomic save), then app wiring (editor loop,
-commands, config, palette/menu).
+**Post-red-team status.** The load-bearing choices were validated; this pass fixed
+the contradictions and one bug the review found (buffer-reuse tables, undo wording,
+sync/async styling, clipboard semantics, export disposition, the `aspell`-as-filter
+bug → spellcheck is now a diagnostic). Two items are not yet fully specified and are
+being addressed before/at the start of implementation:
+
+1. **Design risk — incremental markdown reparse** (§9.2 ⚠): blank-line scoping is
+   unsafe for full CommonMark; resolution (block-tree invalidation vs narrowed v1
+   scope) pending.
+2. **Design risk — `layout`/`col_map` × conceal × soft-wrap × cursor** (§3.2/§4/
+   §10.5): the formal `ColMap` + navigation contract is being validated by a
+   throwaway **layout spike** before the hardening pass.
+
+**Open items deferred to the implementation spec** (tracked, not done): formal
+`ColMap` type & navigation-semantics table; conceal/span model; soft-wrap algorithm
+details; canonical position type; undo-granularity specifics; IME/paste/grapheme
+handling; performance budgets (numeric); large-document limits; full config schema;
+filter security model (argv/shell, caps, timeouts); pandoc export contract;
+version-control/encoding/newline policy; accessibility baseline; autosave/swap
+decision. (See the Codex red-team for the full enumeration.)
+
+**Next steps:** (1) build the **layout spike** to validate the riskiest model
+empirically; (2) a **hardening pass** that resolves the two design risks, pulls the
+cheap specifics forward, records the product decisions, and turns the open-items
+list into concrete contracts; (3) the implementation plan (`writing-plans`). The
+natural build order is the **pure core first**: `ropey`-backed buffer →
+`edit_diff`/`history` (undo) → `selection` → `md_parse` → `layout`/`col_map`, then
+io/shell (crossterm input, ratatui render, `repar` transforms, `filter`, clipboard,
+atomic save), then app wiring (editor loop, commands, config, palette/menu).
