@@ -20,18 +20,45 @@ impl TextBuffer {
         self.rope.len_bytes() == 0
     }
 
+    /// Returns `true` iff `b` is a valid UTF-8 char boundary in the rope.
+    /// 0 and `self.len()` are always boundaries (empty or at the seam).
+    fn is_char_boundary(&self, b: BytePos) -> bool {
+        b == 0 || b == self.len() || self.rope.char_to_byte(self.rope.byte_to_char(b)) == b
+    }
+
     pub fn insert(&mut self, at: BytePos, text: &str) {
+        debug_assert!(self.is_char_boundary(at), "insert at non-char-boundary byte {at}");
         let char_idx = self.rope.byte_to_char(at);
         self.rope.insert(char_idx, text);
     }
 
     pub fn delete(&mut self, range: Range<BytePos>) {
+        debug_assert!(
+            self.is_char_boundary(range.start),
+            "delete range.start ({}) is not a char boundary",
+            range.start
+        );
+        debug_assert!(
+            self.is_char_boundary(range.end),
+            "delete range.end ({}) is not a char boundary",
+            range.end
+        );
         let start = self.rope.byte_to_char(range.start);
         let end = self.rope.byte_to_char(range.end);
         self.rope.remove(start..end);
     }
 
     pub fn slice(&self, range: Range<BytePos>) -> String {
+        debug_assert!(
+            self.is_char_boundary(range.start),
+            "slice range.start ({}) is not a char boundary",
+            range.start
+        );
+        debug_assert!(
+            self.is_char_boundary(range.end),
+            "slice range.end ({}) is not a char boundary",
+            range.end
+        );
         self.rope.byte_slice(range).to_string()
     }
 
@@ -93,5 +120,18 @@ mod tests {
         b.insert(3, "d");
         assert_eq!(b.to_string(), "abcd");
         assert_eq!(snap.to_string(), "abc"); // snapshot unaffected
+    }
+
+    #[test]
+    fn is_char_boundary_rejects_mid_char_byte() {
+        // "é" is U+00E9, encoded as [0xC3, 0xA9] — 2 bytes.
+        // byte 0: 'h' boundary ✓, byte 1: first byte of é (boundary), byte 2: second
+        // byte of é (NOT a boundary), byte 3: 'l' boundary ✓
+        let b = TextBuffer::from_str("héllo");
+        assert!(b.is_char_boundary(0), "byte 0 must be a boundary");
+        assert!(b.is_char_boundary(1), "byte 1 (start of é) must be a boundary");
+        assert!(!b.is_char_boundary(2), "byte 2 (inside é) must NOT be a boundary");
+        assert!(b.is_char_boundary(3), "byte 3 (start of l) must be a boundary");
+        assert!(b.is_char_boundary(b.len()), "len() must be a boundary");
     }
 }
