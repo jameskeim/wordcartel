@@ -290,7 +290,7 @@ mod tests {
 }
 ```
 - [ ] **Step 2:** Run `cargo test --manifest-path wordcartel-core/Cargo.toml layout` → FAIL.
-- [ ] **Step 3: Implement** by reading the spike file and porting lines 33–354 with the three adaptations above. `Placed` gains `pub style: Style`. In the grapheme loop, set `style` by finding the `StyleSpan` in `analysis.styles` whose `src` contains the grapheme's start byte (default `Style::Plain`). `VisualRow` and the soft-wrap loop are unchanged from the spike.
+- [ ] **Step 3: Implement** by reading the spike file and porting **only the ranges named in "Port source" above** (TAB_WIDTH, `Placed`, `VisualRow`, the `ColMap` struct fields, `grapheme_width`, `layout`) — **not** `impl ColMap` (Task 4) and **not** the spike's private `analyze`. Apply the Wiring/adaptations above: `layout` calls `crate::md_parse::analyze(line, role, is_active)` and iterates `LineAnalysis.runs`; `Placed` gains `pub style: crate::style::Style` set per grapheme from `analysis.styles` (default `Style::Plain`); `layout` takes a `role: BlockRole` param. `VisualRow` and the soft-wrap loop are unchanged from the spike.
 - [ ] **Step 4:** Run `cargo test --manifest-path wordcartel-core/Cargo.toml layout` → PASS (4 tests).
 - [ ] **Step 5:** Commit: `feat(core): layout soft-wrap + Placed/ColMap (ported from spike)`
 
