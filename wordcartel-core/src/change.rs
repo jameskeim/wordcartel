@@ -62,6 +62,31 @@ impl ChangeSet {
             }
         }
     }
+
+    /// Produce the inverse changeset. Needs the *original* buffer to recover the
+    /// bytes a Delete removed (re-emitted as an Insert).
+    pub fn invert(&self, original: &TextBuffer) -> ChangeSet {
+        let mut inv = Vec::with_capacity(self.ops.len());
+        let mut pos: BytePos = 0; // position in the ORIGINAL text
+        for op in &self.ops {
+            match op {
+                Op::Retain(n) => {
+                    inv.push(Op::Retain(*n));
+                    pos += n;
+                }
+                Op::Delete(n) => {
+                    let removed = original.slice(pos..pos + n);
+                    inv.push(Op::Insert(Tendril::from(removed.as_str())));
+                    pos += n;
+                }
+                Op::Insert(s) => {
+                    // inserted text is not present in the original; pos unchanged
+                    inv.push(Op::Delete(s.len()));
+                }
+            }
+        }
+        ChangeSet { ops: inv, len_before: self.len_after, len_after: self.len_before }
+    }
 }
 
 #[cfg(test)]
@@ -91,5 +116,58 @@ mod tests {
         assert_eq!((ins.len_before, ins.len_after), (3, 5));
         let del = ChangeSet::delete(0..2, b.len());
         assert_eq!((del.len_before, del.len_after), (3, 1));
+    }
+
+    #[test]
+    fn invert_restores_original() {
+        let original = TextBuffer::from_str("hello world");
+        let cs = ChangeSet::delete(5..11, original.len()); // delete " world"
+        let inv = cs.invert(&original);
+
+        let mut b = original.clone();
+        cs.apply(&mut b);
+        assert_eq!(b.to_string(), "hello");
+        inv.apply(&mut b);
+        assert_eq!(b.to_string(), "hello world"); // round-trip
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        // LAW (spec §11.2): apply(invert(cs)) ∘ apply(cs) == identity.
+        #[test]
+        fn prop_apply_then_invert_is_identity(
+            text in ".{0,40}",
+            at in 0usize..40,
+            ins in ".{0,8}",
+            del_len in 0usize..40,
+        ) {
+            let original = TextBuffer::from_str(&text);
+            let len = original.len();
+            // clamp to valid byte boundaries by snapping onto char starts
+            let at = snap(&text, at.min(len));
+            // build either an insert or a bounded delete
+            let cs = if del_len == 0 || at >= len {
+                ChangeSet::insert(at, &ins, len)
+            } else {
+                let end = snap(&text, (at + del_len).min(len));
+                ChangeSet::delete(at..end, len)
+            };
+            let inv = cs.invert(&original);
+            let mut b = original.clone();
+            cs.apply(&mut b);
+            inv.apply(&mut b);
+            prop_assert_eq!(b.to_string(), text);
+        }
+    }
+
+    // test helper: snap a byte index down to the nearest char boundary
+    fn snap(s: &str, mut i: usize) -> usize {
+        while i < s.len() && !s.is_char_boundary(i) {
+            i -= 1;
+        }
+        i.min(s.len())
     }
 }
