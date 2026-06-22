@@ -180,6 +180,24 @@ decide it — *our* architecture does. These principles are non-negotiable:
    not that an action takes a moment, but that it gives *no feedback* while it
    does — you wait in silence. Every action acknowledges immediately.
 
+### 3.10 Buffer = `ropey` (revises the earlier "port kiro's line buffer" plan)
+- **Decision:** Use the **`ropey`** rope crate (MIT/Apache-2.0) as the editable
+  buffer, **replacing** kiro's `Vec<Row>` line-vector. Pin `ropey = "1.6.1"`
+  (mirroring Helix) until 2.0 stabilizes. Compose with `unicode-segmentation`
+  (graphemes) and `unicode-width` (display width).
+- **Rationale:** kiro's line-vector is tuned for *code* (short lines); a prose
+  paragraph is one very long logical line, where mid-paragraph edits cost
+  O(line-length) — a direct violation of §3.9. A rope is O(log n) for edits
+  anywhere in the document regardless of line length. `ropey` specifically wins
+  over faster ropes (`crop`, `jumprope`) because it provides the
+  `byte↔char↔line` conversion API the cursor/column-map work depends on; the
+  others omit it. It's the de-facto standard (used by Helix) and permissively
+  licensed.
+- **Consequence:** This is the one place prior-art research overturned an earlier
+  decision. It *strengthens* the "reuse well-written code" goal (a purpose-built,
+  widely-used crate instead of a hand-maintained line buffer), but it shrinks
+  kiro's role — see §7 and the prior-art section §9.
+
 ---
 
 ## 4. Architecture
@@ -297,12 +315,15 @@ afterthought.
 | `highlight.rs` | 🔴 Replace → `md_parse` | Different job: markdown spans + source ranges. |
 | `language.rs` | ⚪ Drop | Markdown-only; no filetype detection. |
 
-**Net effect of the ratatui decision:** the borrowed-from-kiro set narrows to the
-**pure core** (`text_buffer`, `edit_diff`, `history`, `row`'s UTF-8 logic, and the
-`editor` loop shape) — the genuinely valuable, hard-to-find code. The entire
-io/shell layer is now provided by maintained dependencies (ratatui/crossterm)
-rather than hand-ported, which is *more* "well-written code we didn't write," not
-less.
+**Net effect of the ratatui + prior-art decisions:** kiro's role shrinks further,
+from "port the core" to **structural reference**. The io/shell layer is provided
+by ratatui/crossterm; the buffer is now `ropey` (§3.10); undo and selection are
+reimplemented from the Helix/CodeMirror patterns (§9). What remains genuinely
+kiro-derived is the **editor loop shape** and the *idea* of diff-based undo. This
+is not a retreat from "reuse well-written code" — it is the opposite: research
+found better-maintained, better-fit components (ropey, regex-cursor, arboard,
+pulldown-cmark, floem_editor_core) than a solely-owned port of kiro would be. See
+§9 for the full component stack and licensing.
 
 ---
 
@@ -331,7 +352,87 @@ active-but-constrained one.
 
 ---
 
-## 9. Status / Open Threads (still to design)
+## 9. Prior Art & Borrowed Components
+
+Findings from a deep prior-art scan (Rust and non-Rust editors), filtered through
+a license lens: **depend** = add as a crate dependency; **copy** = paste
+permissively-licensed source (with attribution); **reimplement** = study a
+copyleft/other-language design and write our own. groundwords is MIT, so copyleft
+sources (GPL/MPL) are *pattern-only*.
+
+### 9.1 Component stack
+
+| Need | Choice | License | How |
+|---|---|---|---|
+| Text buffer | `ropey` 1.6.1 | MIT/Apache | depend (§3.10) |
+| Grapheme / width | `unicode-segmentation`, `unicode-width` | MIT | depend |
+| Undo/redo | ChangeSet (Retain/Delete/Insert) + branching history; `smartstring` for inserts | reimpl (from Helix MPL + CodeMirror MIT patterns) | reimplement |
+| Selection | single user-facing selection; `SmallVec<[Range;1]>`; anchor+head over byte offsets | Apache (floem) / MPL (helix) | copy `floem_editor_core` **or** reimplement |
+| Clipboard | `arboard` (+`wayland-data-control`) | MIT/Apache | depend |
+| Clipboard fallback | OSC 52 via crossterm `osc52` feature | MIT | depend (already have crossterm) |
+| In-document search | `regex-cursor` (+`regex-automata`) | MIT/Apache | depend |
+| Filter subprocess | `subprocess` crate, or `std::thread`+`mpsc` | MIT/Apache | depend / hand |
+| Markdown parse | `pulldown-cmark` (`into_offset_iter()`) | MIT | depend |
+| Live-preview model | CodeMirror 6 decoration + atomicRanges | MIT (JS) | reimplement |
+| Cursor-line reveal | render-markdown.nvim / Vim conceal `concealcursor` | MIT / Apache | reimplement (confirms model) |
+| Soft-wrap + column map | Helix `DocumentFormatter` design | MPL | reimplement |
+
+### 9.2 Key technical decisions from the research
+- **Undo coalescing is prose-tuned:** group keystrokes into undo units by a time
+  threshold (~500 ms burst), and break groups on paste / programmatic edits /
+  explicit cursor moves. Do **not** break per word (annoying in prose). Store the
+  inverse changeset at commit time (no need to keep old buffer copies).
+- **Selection stored in buffer coordinates, not visual:** ranges are byte/char
+  offsets over the rope; visual-row spans are computed at render time, so
+  selection survives viewport/width changes.
+- **Search without whole-doc allocation:** `regex-cursor` runs the regex engine
+  directly over rope chunks; `find_next`/`prev` resume from the cursor offset
+  rather than rescanning from 0; highlight-all is **viewport-gated**.
+- **Markdown parser:** `pulldown-cmark` over `comrak` (which gives line:col, not
+  byte offsets for delimiters) and over `tree-sitter-md` (maintainers warn it is
+  inaccurate for inline markdown). tree-sitter, if used at all, only for finding
+  block boundaries.
+- **Incremental reparse:** find the dirty block via blank-line (`\n\n`) scan up/down
+  from the edit, reparse only that block, cache inactive blocks by content hash.
+  The active line shows raw markdown (no parse), and inactive lines don't change
+  while typing the active line — so per-keystroke parse cost is tiny. **Edge case:**
+  setext headings (`Foo` over `===`) need two-line context.
+- **`col_map` = atomicRanges analog:** during the grapheme render pass, every
+  visible grapheme pushes its source byte offset (once per visual column);
+  concealed marker bytes push nothing. Cursor at visual column C → source byte
+  `col_map[C]`, which makes arrow keys skip hidden markers for free.
+
+### 9.3 Runtime note: no async runtime required
+The filter/subprocess work does **not** require tokio. The synchronous
+draw-on-event loop (§3.8/§3.9) plus `std::thread` + `mpsc` (or the `subprocess`
+crate's deadlock-safe `Communicator`) runs filters off the hot path while keeping
+the loop free. This preserves the lean, low-latency design and avoids the async
+dependency weight that counted against bubbletea-rs (§8.1).
+
+### 9.4 Differentiators surfaced by the research
+Two responsiveness wins where even Helix (the leading Rust editor) falls short, and
+which groundwords should do well from v1:
+- **Highlight *all* search matches while typing** (viewport-gated). Helix only
+  jumps to the first match (long-standing open request).
+- **Always-async filters** with instant "running `…` ⏳" feedback. Helix's pipe
+  family runs synchronously and blocks its UI.
+
+### 9.5 Clipboard / terminal gotchas to honor (implementation-time)
+- Treat the system clipboard as **optional** — never `unwrap`; fall back
+  arboard → OSC 52 → silent no-op (covers SSH, headless, GNOME-Wayland).
+- Handle **bracketed paste** as a single `Event::Paste(String)` (crossterm), not
+  N keystrokes; spawn large pastes off the loop with a "pasting…" indicator.
+- Offer both CLIPBOARD and PRIMARY (X11 middle-click) selections on Linux.
+
+### 9.6 Provenance / attribution to carry
+Beyond kiro's MIT notice (§6): preserve attribution for any **copied** code (e.g.
+`floem_editor_core`, Apache-2.0) and record that undo/selection/soft-wrap/live-
+preview designs are **reimplementations** inspired by Helix (MPL-2.0) and
+CodeMirror 6 (MIT) — patterns, not copied source.
+
+---
+
+## 10. Status / Open Threads (still to design)
 
 - **§ Data flow** — trace a keystroke buffer → `md_parse` → `layout` → `screen`;
   worked example of the column map for a concealed, soft-wrapped line.
