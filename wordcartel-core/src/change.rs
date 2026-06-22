@@ -170,4 +170,57 @@ mod tests {
         }
         i.min(s.len())
     }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// LAW (spec §11.2): apply(invert(cs)) ∘ apply(cs) == identity for a
+        /// genuine multi-op ChangeSet (≥ 3 ops: Retain + Delete + Insert + Retain).
+        /// Builds the ChangeSet by walking real char-boundary-aligned segments so
+        /// all ops land correctly, guaranteeing at least one Delete AND one Insert.
+        #[test]
+        fn prop_multi_op_invert_is_identity(
+            text in ".{4,40}",
+            // fraction in [0,100) → position of the cut point (scaled to [1, len-2])
+            cut_frac in 1usize..99,
+            ins in "[a-z]{1,6}",
+        ) {
+            let doc = text.as_str();
+            let len = doc.len();
+            // Need at least one char before AND after the cut so Delete/Retain can span them.
+            if len < 2 { return Ok(()); }
+
+            // Pick a cut point somewhere in the middle, snapped to a char boundary.
+            let raw_cut = 1 + (cut_frac * (len - 1)) / 100;
+            let cut = snap(doc, raw_cut.min(len - 1));
+            // If snap pushed cut to 0 or len, skip — can't form a proper multi-op.
+            if cut == 0 || cut == len { return Ok(()); }
+
+            // Build a 4+-op ChangeSet manually:
+            //   Retain(cut)  Delete(len - cut)  Insert(ins)
+            // len_before = len
+            // len_after  = cut + ins.len()
+            let mut ops = Vec::new();
+            ops.push(Op::Retain(cut));
+            ops.push(Op::Delete(len - cut));
+            ops.push(Op::Insert(Tendril::from(ins.as_str())));
+            let cs = ChangeSet {
+                ops,
+                len_before: len,
+                len_after: cut + ins.len(),
+            };
+
+            // Sanity: at least 3 ops (Retain + Delete + Insert).
+            prop_assert!(cs.ops.len() >= 3, "changeset must have ≥ 3 ops");
+
+            let original = TextBuffer::from_str(doc);
+            let inv = cs.invert(&original);
+
+            let mut b = original.clone();
+            cs.apply(&mut b);
+            inv.apply(&mut b);
+            prop_assert_eq!(b.to_string(), text,
+                "round-trip failed: cut={} ins={:?}", cut, ins);
+        }
+    }
 }
