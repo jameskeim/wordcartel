@@ -106,6 +106,8 @@ antirez's `kilo`.
 - **Consequence:** The rendering layer must map logical-line → multiple visual
   rows, and this composes with conceal (both transform a line before it reaches
   the screen).
+- **Hard-wrap is an I/O concern, not a second editing mode** — see §14.2 (soft-only
+  editing + a wrap-guide ruler; reflow/unwrap/ventilate at the edges via repar).
 
 ### 3.5 The `filter` primitive: pipe buffer/selection through external tools
 - **Decision:** A single mechanism spawns a subprocess, feeds it text on stdin,
@@ -305,6 +307,8 @@ close to what pandoc ingests, so what you see maps to what exports.
 - **Incremental search** (find; find/replace).
 - **`filter` primitive** with **pandoc export** and **spellcheck** as presets.
 - **Writing aids:** word/char count, distraction-free / focus mode.
+- **repar transforms** (in-process): reflow / unwrap / ventilate commands; explicit
+  **unwrap-on-import**; **reflow/ventilate export**; **wrap-guide ruler** (§14).
 
 ### Backlog (post-v1)
 - Element-under-cursor reveal (tighter conceal granularity).
@@ -407,6 +411,9 @@ sources (GPL/MPL) are *pattern-only*.
 | Live-preview model | CodeMirror 6 decoration + atomicRanges | MIT (JS) | reimplement |
 | Cursor-line reveal | render-markdown.nvim / Vim conceal `concealcursor` | MIT / Apache | reimplement (confirms model) |
 | Soft-wrap + column map | Helix `DocumentFormatter` design | MPL | reimplement |
+| Reflow / unwrap / ventilate | `repar` (in-process) | MIT (authored by user) | depend (§14) |
+| Atomic save | `repar::atomic` pattern | MIT (authored by user) | copy (§14.3) |
+| Display width | `repar::width` (`unicode-width`) | MIT (authored by user) | copy/adapt (§14.3) |
 
 ### 9.2 Key technical decisions from the research
 - **Undo coalescing is prose-tuned:** group keystrokes into undo units by a time
@@ -682,7 +689,8 @@ kiro's trait-abstracted I/O:
 unit + property + golden + integration on every push; fuzz targets nightly; the
 per-keystroke bench is tracked for regressions (a hard threshold would be flaky, so
 trend it and alert on step-changes). Mirror kiro/kibi precedent (both ship fuzzing
-+ CI).
++ CI), and adopt **repar's discipline** (§14.4): a committed golden corpus, checked-in
+`proptest-regressions` seeds, and round-trip-law invariants.
 
 ### 11.6 Non-goals
 Do **not** test dependency internals (ropey, ratatui, crossterm, pulldown-cmark —
@@ -752,10 +760,14 @@ them**: `Ctrl+I`≡Tab, `Ctrl+M`≡Enter, `Ctrl+H`≡Backspace, `Ctrl+[`≡Esc; 
   terminal supporting a particular key combo.
 
 ### 12.5 Config file
-- **Format:** TOML (Rust-idiomatic; matches Helix). **Location:** XDG
-  `~/.config/wordcartel/config.toml` (resolved via the `etcetera`/`dirs` crate for
-  cross-platform config dirs); overridable with `$WORDCARTEL_CONFIG`. Missing
-  config → built-in defaults.
+- **Format:** TOML (Rust-idiomatic; matches Helix). We keep the `toml` crate
+  (Wordcartel is not binary-size-constrained the way repar deliberately is).
+- **Location & precedence** (adopting repar's chain + project-local discovery):
+  built-in defaults < global XDG `~/.config/wordcartel/config.toml` (via
+  `etcetera`/`dirs`) < **project-local `.wordcartel.toml`** (found by walking up from
+  the file's directory) < env (`$WORDCARTEL_*`) < command-line args. `$WORDCARTEL_CONFIG`
+  overrides the global path; `--no-config` disables file lookup. Missing config →
+  built-in defaults.
 - **Keymap is data; commands are code** (§10.4). The `[keys]` table maps key
   strings → command names, *overriding/extending* defaults. An unknown command
   name is a **surfaced error**, never a silent no-op.
@@ -899,7 +911,70 @@ regressions here.
 
 ---
 
-## 14. Status / Open Threads (still to design)
+## 14. repar Integration & Line-Structure Model
+
+[repar](../../par-command/repar) is the author's own MIT prose/markdown reformatter
+(I/O-free library core, `#![forbid(unsafe_code)]`, `Options::new()…format(input) ->
+Result<String>`). It is both a dependency and a design sibling: **Wordcartel is the
+interactive editor to repar's batch reflow engine.** Because it is the author's
+code, there is no licensing friction (depend, copy, or relicense freely).
+
+### 14.1 Dependency: in-process transforms
+Depend on `repar` as a **library**; Reflow / Unwrap / Ventilate are **in-process**
+`repar::Options` calls — no subprocess, markdown-aware, no "is the binary
+installed?" concern. Exposed as first-class commands **and** as bundled presets of
+the §3.5 `filter` mechanism (which still covers arbitrary external CLIs). One
+transform per invocation:
+- **Reflow** → hard-wrap to a width (the *publish* format).
+- **Unwrap** → one logical line per paragraph (the *soft-wrap-ready* form).
+- **Ventilate** → one sentence per line (semantic line breaks; git-diff-friendly).
+
+### 14.2 Line-structure model: soft-wrap editing, hard-wrap as I/O
+**Decision (confirms §3.4): one editing model — soft-wrap.** Hard-wrap is never a
+second editing mode (a true dual mode was considered and rejected: it would need
+two cursor models and undo across a representation switch, straining the
+"source = text as-is" invariant). Hard-wrap is handled at the edges:
+- **Wrap-guide ruler:** a dim vertical guide at the configured target column
+  (default 72/80) gives hard-wrap *awareness* while editing soft. Pure display.
+- **Import:** the file's existing on-disk wrapping is **respected by default** — we
+  do not silently rewrap. "Unwrap on import" is an **explicit action** (or opt-in
+  per file); auto-unwrap+reflow-on-save would rewrap a whole hard-wrapped file and
+  bury the user's real change in diff noise.
+- **Export / save-as:** optional **reflow** (hard-wrap at width) or **ventilate**
+  (semantic breaks) output filters; the default save preserves the buffer text as-is.
+- **Ventilate as a storage option:** a config/export option to keep the on-disk
+  `.md` ventilated (one sentence per line) for clean VCS diffs; the editor still
+  soft-wraps it at view time. repar's round-trip law `reflow(unwrap(p)) ==
+  reflow(p)` makes this lossless.
+
+### 14.3 Direct code borrows (repar is MIT, authored by the user)
+- **Atomic save (`atomic.rs`)** → Wordcartel's save path (§10.3): same-dir O_EXCL
+  temp (owner-only `0o600`) → write → `fsync` → `rename` → dir-`fsync`;
+  skip-unchanged; refuse symlink / binary / non-UTF-8; `TempGuard` cleanup on
+  unwind; preserves mode. Its documented caveats (symlink refusal, sudo re-own,
+  last-writer-wins, mode-only preservation, trailing-newline-once, Unix-only) are
+  adopted as Wordcartel's save-error spec (feeds §15). The background-thread save
+  (§10.3) wraps this over a rope snapshot.
+- **Display width (`width.rs`)** → the `layout`/soft-wrap width math: a tested
+  `unicode-width` wrapper with tab-stop handling. We use its **real zero-width**
+  behavior (combining marks = 0), not par's `wcwidth<=0 → 1` fidelity punt.
+
+### 14.4 Patterns adopted from repar
+- **Testing methodology** (extends §11): golden corpus + property invariants as
+  **round-trip laws** + **differential fuzzing against an oracle** + committed
+  `proptest-regressions` seeds. repar's `reflow(unwrap(p)) == reflow(p)` is the same
+  shape as our incremental==full reparse oracle (§11.2).
+- **Markdown structural passthrough:** reflow only prose; pass code/tables/headings
+  verbatim; strip-and-reapply list/quote prefixes with a hanging indent. Informs a
+  future "rewrap this paragraph/list item" command and our block handling.
+- **I/O-free library core + `#![forbid(unsafe_code)]`** independently mirrors our
+  functional-core/imperative-shell split (§10) — hold the same line.
+- **Not adopted:** repar's `panic="abort"` size profile — Wordcartel is interactive
+  and wants unwinding + panic recovery.
+
+---
+
+## 15. Status / Open Threads (still to design)
 
 - **§ Error handling** — pandoc/filter failures, missing binaries, subprocess
   cancellation, save errors. (Partly covered already in §3.1, §9.5, §10.3 — this
