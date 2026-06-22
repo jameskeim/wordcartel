@@ -9,7 +9,7 @@ Spec: `docs/superpowers/specs/2026-06-21-wordcartel-design.md`
 
 | # | Effort | Plan file | Produces | Status |
 |---|---|---|---|---|
-| 1 | **Edit Kernel** | `2026-06-22-wordcartel-01-edit-kernel.md` | pure buffer + ChangeSet undo + selection (headless lib) | IN PROGRESS |
+| 1 | **Edit Kernel** | `2026-06-22-wordcartel-01-edit-kernel.md` | pure buffer + ChangeSet undo + selection (headless lib) | ✅ COMPLETE (branch `effort-1-edit-kernel`, 28 tests green, final review READY-TO-MERGE + I-1/I-2/I-3 hardening) |
 | 2 | Render Kernel | _(next)_ | md_parse + block_tree + layout/ColMap (+ spikes) | PLANNED |
 | 3 | IO / Shell | _(later)_ | crossterm input, ratatui render, clipboard, atomic save, filter, repar | PLANNED |
 | 4 | App | _(later)_ | editor loop, commands, config, palette/menu, spellcheck, mouse | PLANNED |
@@ -21,10 +21,10 @@ Legend: ✅ done · 🔨 in this effort · ⏳ later effort · 📋 deferred to 
 | Spec § | Item | Effort | Status |
 |---|---|---|---|
 | 3.1 | Markdown-as-source-of-truth (`.md`, text not AST) | 1 (buffer holds text) / 3 (save) | 🔨/⏳ |
-| 3.3 | Text not AST; plain-text edits | 1 | 🔨 |
-| 3.10, 16.1 | `ropey` buffer; **byte offset = canonical position** | 1 | 🔨 |
-| 9.1 | Undo = ChangeSet (retain/delete/insert) + branching history; `smartstring`; prose-tuned coalescing (~500 ms; break on paste / programmatic / cursor-move) | 1 | 🔨 |
-| 9.1, 3.6 | Selection = anchor/head over byte offsets; `SmallVec<[Range;1]>`; `.map(&ChangeSet)` | 1 | 🔨 |
+| 3.3 | Text not AST; plain-text edits | 1 | ✅ |
+| 3.10, 16.1 | `ropey` buffer; **byte offset = canonical position** | 1 | ✅ |
+| 9.1 | Undo = ChangeSet (retain/delete/insert) + branching history; `smartstring`; prose-tuned coalescing (~500 ms; break on paste / programmatic / cursor-move) | 1 | ✅ |
+| 9.1, 3.6 | Selection = anchor/head over byte offsets; `SmallVec<[Range;1]>`; `.map(&ChangeSet)` | 1 | ✅ |
 | 10.1 | Single mutation channel `apply(Transaction)`; selection mapped on the same atomic step | 1 (kernel `apply`) / 4 (wired loop) | 🔨/⏳ |
 | 10.2 | `version: u64` revision token | 1 | 🔨 |
 | 10.3 | O(1) rope snapshots for async workers | 1 (snapshot API) / 3 (workers) | 🔨/⏳ |
