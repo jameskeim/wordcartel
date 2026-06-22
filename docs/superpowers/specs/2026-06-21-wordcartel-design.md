@@ -1,4 +1,4 @@
-# groundwords — Design Document
+# Wordcartel — Design Document
 
 **Status:** Living document — design in progress
 **Last updated:** 2026-06-22
@@ -6,11 +6,20 @@
 > A terminal-native, markdown-first word processor written in Rust, with live
 > (Obsidian-style) preview, Unix-pipe extensibility, and pandoc-powered export.
 
+**The name** (renamed from "groundwords"): *Wordcartel* — chosen because it
+doesn't take itself too seriously and because it winks at how much this project
+*borrows* from other great editors and word processors. We run a small cartel over
+our word "supply chain" (ropey, pulldown-cmark, regex-cursor, arboard, and the
+design patterns of Helix, CodeMirror 6, Kakoune, and kiro). See §9.
+**Binary/command name:** `wc` is unavailable (it is the Unix word-count tool —
+ironic for a word processor), so the CLI command is **`wcartel`** (default
+recommendation; `cartel` is a candidate alias). Crate/package name: `wordcartel`.
+
 ---
 
 ## 1. Overview
 
-**groundwords** is a distraction-free terminal word processor for writing prose.
+**Wordcartel** is a distraction-free terminal word processor for writing prose.
 Its native document format is Markdown, it renders that Markdown *live* while you
 edit (styled text with concealed markers), and it leans on existing Unix tooling
 — pandoc for format conversion, and arbitrary CLI filters — instead of building
@@ -19,7 +28,7 @@ those capabilities in-core.
 It is inspired by [WordGrinder](https://github.com/davidgiven/wordgrinder) (the
 distraction-free terminal-word-processor feel) but takes a fundamentally
 different, simpler path: where WordGrinder invents a bespoke document model and a
-suite of in-house exporters, groundwords makes **plain Markdown text** the source
+suite of in-house exporters, Wordcartel makes **plain Markdown text** the source
 of truth and delegates conversion to **pandoc**.
 
 The implementation borrows heavily from
@@ -110,7 +119,7 @@ antirez's `kilo`.
 
 - **Rationale:** Unix-editor tradition (vim `!`, Acme pipe, Kakoune `|`).
   Pandoc export and "pipe through a tool" are the *same* operation, so they share
-  one well-tested module. Turns groundwords into a platform: spellcheck, reflow,
+  one well-tested module. Turns Wordcartel into a platform: spellcheck, reflow,
   table formatting, grammar/translation/AI — all without in-core features.
   Architecturally cheap because the subprocess plumbing was needed for pandoc
   regardless.
@@ -230,7 +239,7 @@ side-effecting **io/shell** layer (now built on **ratatui**/**crossterm**); and 
 🟢 provided by ratatui/crossterm · 🔴 net-new.
 
 ```
-groundwords/
+wordcartel/
 ├── core (no terminal/IO deps — pure, unit-testable)
 │   ├── text_buffer   logical lines, edit ops, UTF-8           ✅ kiro
 │   ├── edit_diff     edits as reversible diffs                ✅ kiro
@@ -308,7 +317,7 @@ close to what pandoc ingests, so what you see maps to what exports.
 
 ## 6. Licensing
 
-groundwords is **MIT**, compatible with kiro's MIT.
+Wordcartel is **MIT**, compatible with kiro's MIT.
 
 **Obligation:** every file ported from or derived from kiro must retain rhysd's
 copyright and the MIT permission notice. Practically:
@@ -379,7 +388,7 @@ active-but-constrained one.
 Findings from a deep prior-art scan (Rust and non-Rust editors), filtered through
 a license lens: **depend** = add as a crate dependency; **copy** = paste
 permissively-licensed source (with attribution); **reimplement** = study a
-copyleft/other-language design and write our own. groundwords is MIT, so copyleft
+copyleft/other-language design and write our own. Wordcartel is MIT, so copyleft
 sources (GPL/MPL) are *pattern-only*.
 
 ### 9.1 Component stack
@@ -433,7 +442,7 @@ dependency weight that counted against bubbletea-rs (§8.1).
 
 ### 9.4 Differentiators surfaced by the research
 Two responsiveness wins where even Helix (the leading Rust editor) falls short, and
-which groundwords should do well from v1:
+which Wordcartel should do well from v1:
 - **Highlight *all* search matches while typing** (viewport-gated). Helix only
   jumps to the first match (long-standing open request).
 - **Always-async filters** with instant "running `…` ⏳" feedback. Helix's pipe
