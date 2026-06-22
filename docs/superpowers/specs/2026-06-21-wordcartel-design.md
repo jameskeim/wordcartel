@@ -231,6 +231,26 @@ decide it — *our* architecture does. These principles are non-negotiable:
   widely-used crate instead of a hand-maintained line buffer), but it shrinks
   kiro's role — see §7 and the prior-art section §9.
 
+### 3.11 Render modes: a pure view toggle (live-preview / source-highlighted / source-plain)
+- **Decision:** Three *rendering* modes over the single buffer, cycled by a toggle:
+  1. **Live preview** (default) — concealed markdown (§3.2).
+  2. **Source (highlighted)** — raw markdown, markers visible + light syntax color,
+     conceal off (the classic "markdown source" look).
+  3. **Source (plain)** — literal raw text, zero styling; the fastest render.
+- **A pure rendering toggle — not a change to the text, cursor, or input mode.**
+  Buffer, selection, and undo are identical across modes; only `layout` output
+  changes. This is the *safe* kind of dual view — contrast the rejected hard/soft
+  dual *editing* mode (§14.2), which would mutate text and need two cursor models.
+- **Nearly free in our architecture:** the active line already renders raw with an
+  identity `col_map` (§10.5); source modes simply render *every* line that way.
+  `layout` takes a `render_mode` (held in `View`); in source modes conceal is
+  skipped and `col_map` is identity throughout — strictly *cheaper* than live
+  preview (the "fast view").
+- **Value:** precise markup surgery (links, tables, front matter, escapes);
+  transparency for markdown-first users; **a robust fallback that de-risks the
+  conceal engine** — source view always shows ground truth if `layout` mis-renders;
+  and the fastest possible render on huge documents or weak terminals.
+
 ---
 
 ## 4. Architecture
@@ -285,11 +305,13 @@ subtle bugs and therefore gets the most test attention.
 
 ### Rendering depends on the cursor
 A row's rendering is **not** a pure function of the buffer alone — it depends on
-cursor position (the active line reveals raw markup). Moving the cursor
-invalidates **two** logical lines: the one left (re-conceal) and the one entered
-(reveal). With ratatui we rebuild the frame and let its cell-diff emit only the
-cells that actually changed, so cursor-move redraws stay cheap without us
-hand-managing a dirty-row list.
+cursor position (the active line reveals raw markup) and on the `View`'s
+**`render_mode`** (§3.11): in the two source modes, conceal is skipped for *all*
+lines and `col_map` is identity (the active-line path generalized to the whole
+document). Moving the cursor invalidates **two** logical lines: the one left
+(re-conceal) and the one entered (reveal). With ratatui we rebuild the frame and
+let its cell-diff emit only the cells that actually changed, so cursor-move redraws
+stay cheap without us hand-managing a dirty-row list.
 
 ### Parser choice
 `pulldown-cmark` (pull parser, CommonMark/GFM, events carry **source offsets**) —
@@ -309,6 +331,7 @@ close to what pandoc ingests, so what you see maps to what exports.
 - **Writing aids:** word/char count, distraction-free / focus mode.
 - **repar transforms** (in-process): reflow / unwrap / ventilate commands; explicit
   **unwrap-on-import**; **reflow/ventilate export**; **wrap-guide ruler** (§14).
+- **Render-mode toggle** (§3.11): live-preview / source-highlighted / source-plain.
 
 ### Backlog (post-v1)
 - Element-under-cursor reveal (tighter conceal granularity).
@@ -743,7 +766,7 @@ Representative defaults (fully overridable via config, §12.4). Grouped by area:
 | Headings/lists | Alt+1..6 / Alt+L / Alt+Q | heading level / toggle bullet list / blockquote |
 | Navigate | arrows, Ctrl+←/→, Home/End, Ctrl+Home/End, PgUp/Dn | char/word/line/document movement |
 | Search | Ctrl+F / Ctrl+R / F3 | find / replace / find-next |
-| View | Ctrl+P / F10 / Ctrl+G / (toggle) | command palette / menu / word-count / focus mode |
+| View | Ctrl+P / F10 / Ctrl+G / F2 / (toggle) | command palette / menu / word-count / cycle render mode (§3.11) / focus mode |
 | Pipe/Export | Ctrl+\| / palette | run filter on selection / pandoc export presets |
 
 ### 12.4 Terminal key constraints (important, shapes the defaults)
