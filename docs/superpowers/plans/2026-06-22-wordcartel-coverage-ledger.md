@@ -10,9 +10,16 @@ Spec: `docs/superpowers/specs/2026-06-21-wordcartel-design.md`
 | # | Effort | Plan file | Produces | Status |
 |---|---|---|---|---|
 | 1 | **Edit Kernel** | `2026-06-22-wordcartel-01-edit-kernel.md` | pure buffer + ChangeSet undo + selection (headless lib) | ✅ COMPLETE (branch `effort-1-edit-kernel`, 28 tests green, final review READY-TO-MERGE + I-1/I-2/I-3 hardening) |
-| 2 | Render Kernel | _(next)_ | md_parse + block_tree + layout/ColMap (+ spikes) | PLANNED |
-| 3 | IO / Shell | _(later)_ | crossterm input, ratatui render, clipboard, atomic save, filter, repar | PLANNED |
-| 4 | App | _(later)_ | editor loop, commands, config, palette/menu, spellcheck, mouse | PLANNED |
+| 2 | **Render Core** | `2026-06-22-wordcartel-02-render-core.md` | md_parse (inline conceal+style) + layout/ColMap/cursor-nav (port spike) | IN PROGRESS |
+| 3 | Incremental block_tree + block roles | _(next; needs block_tree spike)_ | CommonMark block invalidation (incremental==full oracle) + heading/list/quote rendering | PLANNED |
+| 4 | IO / Shell | _(later)_ | crossterm input, ratatui render, clipboard, atomic save, filter, repar | PLANNED |
+| 5 | App | _(later)_ | editor loop, commands, config, palette/menu, spellcheck, mouse | PLANNED |
+
+> Effort 2 (Render Kernel, §16/§13/§9.2) split into Plan 2 (render core — inline
+> conceal/style + the spike-validated layout/ColMap/cursor) and Plan 3 (incremental
+> block_tree + block-role rendering). Seam: md_parse/layout take a line's **block
+> role as input**; block_tree computes roles in Plan 3. Layout ports the validated
+> spike at `~/projects/wordcartel-layout-spike`.
 
 ## Spec → effort map
 
