@@ -180,11 +180,11 @@ decide it — *our* architecture does. These principles are non-negotiable:
    not that an action takes a moment, but that it gives *no feedback* while it
    does — you wait in silence. Every action acknowledges immediately.
 
-### 3.10 Buffer = `ropey` (revises the earlier "port kiro's line buffer" plan)
+### 3.10 Buffer = `ropey` (LOCKED — affirmed after re-examination)
 - **Decision:** Use the **`ropey`** rope crate (MIT/Apache-2.0) as the editable
   buffer, **replacing** kiro's `Vec<Row>` line-vector. Pin `ropey = "1.6.1"`
   (mirroring Helix) until 2.0 stabilizes. Compose with `unicode-segmentation`
-  (graphemes) and `unicode-width` (display width).
+  (graphemes) and `unicode-width` (display width). **Decision status: locked.**
 - **Rationale:** kiro's line-vector is tuned for *code* (short lines); a prose
   paragraph is one very long logical line, where mid-paragraph edits cost
   O(line-length) — a direct violation of §3.9. A rope is O(log n) for edits
@@ -193,6 +193,28 @@ decide it — *our* architecture does. These principles are non-negotiable:
   `byte↔char↔line` conversion API the cursor/column-map work depends on; the
   others omit it. It's the de-facto standard (used by Helix) and permissively
   licensed.
+- **Re-examined against gap buffers and piece tables** (the Apple Writer / Emacs
+  lineage) and affirmed. Findings:
+  - *Gap buffer:* superb O(1) localized typing and proven for prose, but provides
+    no cheap immutable snapshot — handing the buffer to a worker means an O(N)
+    copy or locking, which fights our sync-core/async-edges concurrency model
+    (§10.3: background spellcheck, full-doc search, non-blocking save). Its
+    historical necessity came from 1979 hardware limits (1 MHz / 64 KB) that no
+    longer bind.
+  - *Piece table/tree:* a conceptual middle ground, but to match ropey's O(1)
+    snapshot + O(log n) line indexing it must be built as a persistent augmented
+    balanced tree — i.e. it converges to a rope's complexity while losing ropey's
+    maturity, `regex-cursor` integration, and memory reclamation (its append-only
+    add-buffer retains deleted text). No battle-tested Rust crate exists.
+  - *The article's "ropes stutter while typing" claim* describes a naive
+    per-character rope, not `ropey` (a B-tree of ~1 KB string chunks: in-chunk
+    `memcpy` per keystroke, rare splits, ~10–17% overhead). **Empirically refuted
+    by Helix** — the leading ropey-based editor, specifically celebrated for
+    responsive typing. Its rare slowdowns trace to tree-sitter highlighting and
+    long-line *rendering*, not the rope — confirming §10.5's point that latency
+    lives in the parse/render path, not the buffer.
+  - *Undo is decoupled* (§9/§10 ChangeSet+history), so the gap-buffer/piece-table
+    "undo" tradeoffs the popular comparisons emphasize do not apply to us.
 - **Consequence:** This is the one place prior-art research overturned an earlier
   decision. It *strengthens* the "reuse well-written code" goal (a purpose-built,
   widely-used crate instead of a hand-maintained line buffer), but it shrinks
