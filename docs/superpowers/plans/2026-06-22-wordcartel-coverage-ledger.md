@@ -1,0 +1,51 @@
+# Wordcartel — Implementation Coverage Ledger
+
+**Purpose:** trace every spec requirement to the effort (plan) that implements it,
+so nothing falls through the cracks. Update the **Status** as efforts complete.
+
+Spec: `docs/superpowers/specs/2026-06-21-wordcartel-design.md`
+
+## Efforts (plans)
+
+| # | Effort | Plan file | Produces | Status |
+|---|---|---|---|---|
+| 1 | **Edit Kernel** | `2026-06-22-wordcartel-01-edit-kernel.md` | pure buffer + ChangeSet undo + selection (headless lib) | IN PROGRESS |
+| 2 | Render Kernel | _(next)_ | md_parse + block_tree + layout/ColMap (+ spikes) | PLANNED |
+| 3 | IO / Shell | _(later)_ | crossterm input, ratatui render, clipboard, atomic save, filter, repar | PLANNED |
+| 4 | App | _(later)_ | editor loop, commands, config, palette/menu, spellcheck, mouse | PLANNED |
+
+## Spec → effort map
+
+Legend: ✅ done · 🔨 in this effort · ⏳ later effort · 📋 deferred to impl-spec detail.
+
+| Spec § | Item | Effort | Status |
+|---|---|---|---|
+| 3.1 | Markdown-as-source-of-truth (`.md`, text not AST) | 1 (buffer holds text) / 3 (save) | 🔨/⏳ |
+| 3.3 | Text not AST; plain-text edits | 1 | 🔨 |
+| 3.10, 16.1 | `ropey` buffer; **byte offset = canonical position** | 1 | 🔨 |
+| 9.1 | Undo = ChangeSet (retain/delete/insert) + branching history; `smartstring`; prose-tuned coalescing (~500 ms; break on paste / programmatic / cursor-move) | 1 | 🔨 |
+| 9.1, 3.6 | Selection = anchor/head over byte offsets; `SmallVec<[Range;1]>`; `.map(&ChangeSet)` | 1 | 🔨 |
+| 10.1 | Single mutation channel `apply(Transaction)`; selection mapped on the same atomic step | 1 (kernel `apply`) / 4 (wired loop) | 🔨/⏳ |
+| 10.2 | `version: u64` revision token | 1 | 🔨 |
+| 10.3 | O(1) rope snapshots for async workers | 1 (snapshot API) / 3 (workers) | 🔨/⏳ |
+| 3.6, 9.5, 15.6 | In-process clipboard **register** (system sync is effort 3) | 1 (register) / 3 (system) | 🔨/⏳ |
+| 11 | Test strategy: proptest invariants, round-trip laws, committed regressions, golden | 1 (kernel laws) + all | 🔨 |
+| 3.9 | Perf budget (p95 < 16 ms; reparse < 5 ms; ~5 MB) | 2–4 (render/loop) | ⏳ |
+| 4, 9.2 | `md_parse` (pulldown-cmark, byte ranges) | 2 | ⏳ |
+| 9.2 | `block_tree` incremental invalidation (+ spike, oracle) | 2 | ⏳ |
+| 16 | `layout`/`ColMap`; `Cursor{offset,row,desired_col}`; navigation; reveal churn | 2 | ⏳ |
+| 3.2, 3.11, 13 | Live-conceal render modes; markdown construct set | 2 (model) / 3 (paint) | ⏳ |
+| 3.4, 14.2 | Soft-wrap; wrap ruler; line-structure (unwrap/reflow/ventilate) | 2 (wrap) / 3 (repar) | ⏳ |
+| 3.5 | `filter` primitive (argv default, caps, timeout, cancel) | 3 | ⏳ |
+| 3.1, 14 | pandoc export; repar in-process transforms | 3 | ⏳ |
+| 14.3 | Atomic save (`repar::atomic`); width helper | 3 | ⏳ |
+| 3.8, 10 | ratatui+crossterm; sync loop; functional-core/imperative-shell | 3 (shell) / 4 (loop) | ⏳ |
+| 12 | Config (TOML, precedence, project-local); keymap-as-data; command palette + menu | 4 | ⏳ |
+| 5, 3.5 | Basic spellcheck (diagnostic); basic mouse | 4 | ⏳ |
+| 13.2 | No-color / high-contrast accessibility | 3 (paint) / 4 (chrome) | ⏳ |
+| 15 | Error handling & recovery; swap-file; panic dump | 3 (save/panic) / 4 (surface) | ⏳ |
+| 5 | Incremental search (`regex-cursor`); writing aids (word count, focus) | 4 | ⏳ |
+
+## Per-effort task ledgers
+Each plan file ends with its own task checklist; mark tasks `- [x]` as completed and
+flip this ledger's **Status** when an effort's plan is fully green.
