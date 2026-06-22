@@ -1,7 +1,7 @@
 # groundwords — Design Document
 
 **Status:** Living document — design in progress
-**Last updated:** 2026-06-21
+**Last updated:** 2026-06-22
 
 > A terminal-native, markdown-first word processor written in Rust, with live
 > (Obsidian-style) preview, Unix-pipe extensibility, and pandoc-powered export.
@@ -35,6 +35,9 @@ antirez's `kilo`.
   format, no migration story, fully git- and tool-friendly.
 - **Live preview while editing.** Styled rendering with concealed markup, in the
   terminal, for a true word-processor feel rather than a code-editor feel.
+- **Responsiveness is a first-class goal.** Typing must feel instant; no
+  perceptible lag on keystrokes, and no silent waits on UI actions. Lag is a
+  drag on thinking. (See §3.9 for the latency principles this implies.)
 - **Distraction-free.** Word count, focus mode; minimal chrome.
 - **Unix-native extensibility.** Pipe the buffer (or a selection) through any CLI
   tool and bring the result back. Pandoc export and spellcheck are *presets* of
@@ -125,16 +128,66 @@ antirez's `kilo`.
 ### 3.7 Borrow kiro; rewrite only the rendering path
 - **Decision:** Port kiro modules wholesale where they carry over; rewrite only
   what the live-preview + soft-wrap model forces. See §7 reuse map.
-- **Rationale:** De-risks the build. ~7 of 12 modules port with light edits; the
-  genuinely new code concentrates in the 4 areas already identified as novel.
+- **Rationale:** De-risks the build. The genuinely new code concentrates in the
+  areas already identified as novel.
+
+### 3.8 Rendering foundation: ratatui (rendering) + kiro core (editing)
+- **Decision:** Depend on **ratatui** for the rendering/terminal layer and chrome
+  widgets; **borrow kiro's core** (text buffer, diff-based undo, input parsing) by
+  copying it in; drive **our own** kiro-style input loop. **crossterm** (which
+  ratatui builds on) handles raw mode + key events.
+- **Why these are not the same kind of thing:** kiro is an *application* whose
+  source we copy and own; ratatui is a *maintained library* we depend on. They
+  overlap only at the rendering layer. Borrowing kiro's core and depending on
+  ratatui for rendering maximizes "well-written code we didn't write" across
+  *both* layers.
+- **Rationale:**
+  - ratatui is the most mature, battle-tested TUI renderer in Rust — better-tested
+    than a `screen.rs` we would solely maintain — and its **cell-diffing** emits
+    escape sequences only for *changed cells*, so its "redraw the whole frame"
+    model is full-frame in code but minimal in bytes. Plenty of very snappy TUIs
+    are ratatui apps; it is not a latency risk (see §3.9).
+  - Crucially, **ratatui does not own the event loop** (unlike bubbletea-rs's Elm
+    runtime). We keep our own loop, so it composes cleanly with kiro's
+    architecture and the custom editing surface.
+  - kiro still supplies what ratatui cannot: the text buffer and the diff-based
+    undo/redo.
+  - ratatui's widgets make instant UI feedback (highlights, spinners, status)
+    trivial to render — directly serving §3.9.
+- **Alternative rejected — bubbletea-rs (+ lipgloss/glamour):** an Elm/MVU
+  framework that *owns the loop*, requires Tokio, redraws full frames without the
+  cell-diff guarantee, and was v0.0.9 (immature). It would supersede the kiro
+  skeleton and put responsiveness at risk; lipgloss's strength (rich chrome) is
+  largely wasted on a deliberately chromeless tool, and glamour cannot drive the
+  editing surface (no source↔cursor mapping). Useful only as a styling *reference*.
+- **Alternative rejected — fully hand-rolled screen (kiro `screen.rs`):** maximal
+  byte-level control and leaner deps, but we would solely maintain the renderer
+  and build all chrome from scratch, duplicating what ratatui's cell-diffing
+  already does well.
+
+### 3.9 Responsiveness / latency principles
+Responsiveness is a first-class goal (§2). The rendering foundation does not
+decide it — *our* architecture does. These principles are non-negotiable:
+1. **Per-keystroke work is O(visible screen), not O(document).** Parsing is
+   **incremental and region-scoped**: a keystroke re-parses only the current
+   block/paragraph and re-renders only the visible viewport. A 200-page document
+   must type as fast as a 1-page one. (Constrains `md_parse` and `layout`.)
+2. **Never block the input loop.** Filters, pandoc, spellcheck, and any file I/O
+   run off the hot path as subprocesses; the loop stays free to accept input.
+3. **Draw synchronously on every input event** — never on a timer/debounce.
+4. **Paint feedback the instant an action starts**, before doing the work
+   (highlight/spinner/status). The WordGrinder frustration being designed out is
+   not that an action takes a moment, but that it gives *no feedback* while it
+   does — you wait in silence. Every action acknowledges immediately.
 
 ---
 
 ## 4. Architecture
 
 Three layers: a pure, terminal-free **core** (unit-testable in isolation); a thin
-side-effecting **io/shell** layer; and the **app** wiring. Provenance is marked:
-✅ ported from kiro · 🟡 adapted from kiro · 🔴 net-new.
+side-effecting **io/shell** layer (now built on **ratatui**/**crossterm**); and the
+**app** wiring. Provenance is marked: ✅ ported from kiro · 🟡 adapted from kiro ·
+🟢 provided by ratatui/crossterm · 🔴 net-new.
 
 ```
 groundwords/
@@ -149,17 +202,26 @@ groundwords/
 │   │                 rows + column-map (screen col ↔ source)  🔴 new
 │   └── filter        spawn subprocess, stdin/stdout, 3 modes  🔴 new
 │
-├── io / shell (side-effecting, thin)
-│   ├── input         raw mode, key/escape parsing             ✅ kiro
-│   ├── screen        cursor-aware dirty-row rendering         🟡 kiro
+├── io / shell (side-effecting, thin — on ratatui/crossterm)
+│   ├── input         raw mode, key events                     🟢 crossterm
+│   │                 (key→action mapping is ours)             🔴 new
+│   ├── render        build ratatui frame from layout's visual
+│   │                 rows + styled spans; set cursor pos      🔴 new (thin)
+│   │                 (cell-diff + terminal writes)            🟢 ratatui
 │   ├── clipboard     arboard + OSC 52 fallback                🔴 new
-│   └── term_color    truecolor → 256 → 16 detection           ✅ kiro
+│   └── color/style   styling + truecolor handling             🟢 ratatui
 │
 └── app
-    ├── editor        lifecycle + input loop, owns state       🟡 kiro
-    ├── commands      keybinds → actions (incl. filter presets) 🔴 new
-    └── config        keybinds, theme, pandoc path, presets    🔴 new
+    ├── editor        lifecycle + our own input loop, owns state 🟡 kiro shape
+    ├── commands      keybinds → actions (incl. filter presets)  🔴 new
+    └── config        keybinds, theme, pandoc path, presets      🔴 new
 ```
+
+**Loop ownership:** ratatui is immediate-mode and does **not** own the loop. Our
+`editor` runs a kiro-style loop: read crossterm event → update buffer (kiro) →
+incremental re-parse of the edited block (`md_parse`) → recompute affected visual
+rows (`layout`) → `terminal.draw()` (ratatui cell-diffs and emits only changed
+cells). This is the path that must stay O(visible screen) per keystroke (§3.9).
 
 ### The hard module: `layout`
 `layout` is where conceal, soft-wrap, and the **screen↔source column map**
@@ -171,11 +233,12 @@ cursor over the hidden `**`. This module is expected to host most of the editor'
 subtle bugs and therefore gets the most test attention.
 
 ### Rendering depends on the cursor
-Unlike kiro, a row's rendering is **not** a pure function of the buffer alone — it
-depends on cursor position (the active line reveals raw markup). Moving the cursor
-marks **two** logical lines dirty: the one left (re-conceal) and the one entered
-(reveal). kiro's dirty-row tracking is the foundation; we extend its invalidation
-to be cursor-aware.
+A row's rendering is **not** a pure function of the buffer alone — it depends on
+cursor position (the active line reveals raw markup). Moving the cursor
+invalidates **two** logical lines: the one left (re-conceal) and the one entered
+(reveal). With ratatui we rebuild the frame and let its cell-diff emit only the
+cells that actually changed, so cursor-move redraws stay cheap without us
+hand-managing a dirty-row list.
 
 ### Parser choice
 `pulldown-cmark` (pull parser, CommonMark/GFM, events carry **source offsets**) —
@@ -224,19 +287,38 @@ afterthought.
 | `text_buffer.rs` | ✅ Port ~as-is | Text storage + UTF-8 metadata = our core of truth. |
 | `edit_diff.rs` | ✅ Port wholesale | Reversible-diff edits — undo backbone. |
 | `history.rs` | ✅ Port wholesale | Undo/redo stack over edit_diff. |
-| `input.rs` | ✅ Port, extend | Raw mode + key parsing; add keybinds. |
-| `prompt.rs` | ✅ Port, reuse | Bottom-line dialogs: search, save-as, filter prompt. |
-| `term_color.rs` | ✅ Port wholesale | Truecolor→256→16 detection. |
-| `signal.rs` | ✅ Port wholesale | SIGWINCH resize handling. |
-| `editor.rs` | 🟡 Port skeleton | Loop survives; state struct grows. |
+| `editor.rs` | 🟡 Port loop shape | Our own loop; structure follows kiro; state struct grows. |
 | `row.rs` | 🟡 Salvage UTF-8 logic | Keep width/byte-index caching; rendering moves to `layout`. |
-| `screen.rs` | 🟡 Keep dirty skeleton | Made cursor-aware + soft-wrap-aware. |
-| `highlight.rs` | 🔴 Replace → `md_parse` | Different job; reuse its dirty-invalidation pattern. |
+| `input.rs` | 🟢→ crossterm | Replaced by crossterm events; we keep only key→action mapping. |
+| `prompt.rs` | 🟢→ ratatui | Bottom-line dialogs become ratatui widgets (search, save-as, filter prompt). |
+| `term_color.rs` | 🟢→ ratatui | Styling/color handled by ratatui. |
+| `screen.rs` | 🟢→ ratatui | Rendering + cell-diff handled by ratatui; we build the frame. |
+| `signal.rs` | 🟢→ crossterm | Resize via crossterm's resize events. |
+| `highlight.rs` | 🔴 Replace → `md_parse` | Different job: markdown spans + source ranges. |
 | `language.rs` | ⚪ Drop | Markdown-only; no filetype detection. |
+
+**Net effect of the ratatui decision:** the borrowed-from-kiro set narrows to the
+**pure core** (`text_buffer`, `edit_diff`, `history`, `row`'s UTF-8 logic, and the
+`editor` loop shape) — the genuinely valuable, hard-to-find code. The entire
+io/shell layer is now provided by maintained dependencies (ratatui/crossterm)
+rather than hand-ported, which is *more* "well-written code we didn't write," not
+less.
 
 ---
 
-## 8. Path Not Taken: why not kibi?
+## 8. Paths Not Taken
+
+### 8.1 Why not bubbletea-rs (for rendering)?
+[bubbletea-rs](https://github.com/whit3rabbit/bubbletea-rs) is a Rust port of Go's
+Bubble Tea — Elm/MVU, Tokio-async, with excellent styling (lipgloss-extras) and
+markdown rendering (glamour). Rejected as a *foundation* (kept as a styling
+*reference*) because: it **owns the event loop** (replacing the kiro skeleton),
+pulls in Tokio, redraws full frames without ratatui's cell-diff guarantee, and was
+v0.0.9/immature — all at odds with the responsiveness goal (§3.9). Its strongest
+asset (rich chrome) is largely wasted on a deliberately chromeless tool, and
+glamour cannot drive the editing surface (no source↔cursor mapping). See §3.8.
+
+### 8.2 Why not kibi?
 
 [kibi](https://github.com/ilai-deutel/kibi) is the more polished, better-maintained,
 more feature-complete *editor* — but its defining <1024-line constraint makes it a
