@@ -693,11 +693,110 @@ matrix is too large and environment-bound to pin in CI.
 
 ---
 
-## 12. Status / Open Threads (still to design)
+## 12. Configuration & Keybindings
+
+### 12.1 Interaction model: modeless/CUA in v1, mode-capable layer underneath
+- **Decision:** v1 is **modeless / CUA** — you are always typing; commands are
+  Ctrl/Alt chords (Ctrl+S save, Ctrl+F find, Ctrl+B bold). This is the WordGrinder
+  / nano / Apple Writer lineage and the lowest-friction model for prose, where you
+  are writing ~99% of the time.
+- **Reconciles §10.4:** v1 has effectively a single mode, so keymap resolution
+  simplifies — there is no normal/insert dance. But the dispatch layer stays
+  **mode-capable internally** (`mode` is a field that is constant `Insert` in v1),
+  so a future **vim/modal mode** can be added post-v1 as a pure config toggle, not
+  a rewrite. §10.4's "unmapped printable key → literal text insert" is the v1 default
+  path for every printable key.
+
+### 12.2 Command discovery: command palette + hideable menu (cross-linked)
+Distraction-free means minimal persistent chrome, but commands must be
+discoverable. Two complementary surfaces, each reachable from the other (the
+VS Code model):
+- **Command palette** (primary power path): invoked by a chord (default
+  `Ctrl+P`); fuzzy-searches **every** command + filter presets + export targets,
+  including obscure ones. Hidden until invoked; reuses our fuzzy-search stack
+  (`nucleo`). This is how power users reach everything without memorizing chords.
+- **Menu** (browsable common actions): a hideable bar (File / Edit / Format /
+  Insert / View / Export) surfacing *typical* needs. **Toggleable; hidden by
+  default** to stay distraction-free. The menu contains an entry that opens the
+  command palette (so new users discover the palette through the menu), and any
+  command shown in the menu displays its chord (so users learn shortcuts in place).
+- Both render **instantly with feedback** (§3.9): the surface opens immediately;
+  any slow action it triggers shows a spinner/status rather than freezing — the
+  direct fix for the WordGrinder menu-lag frustration.
+
+### 12.3 Default keybindings (CUA)
+Representative defaults (fully overridable via config, §12.4). Grouped by area:
+
+| Area | Binding | Command |
+|---|---|---|
+| File | Ctrl+S / Ctrl+O / Ctrl+N / Ctrl+Q | save / open / new / quit (prompt if dirty) |
+| Edit | Ctrl+Z / Ctrl+Y / Ctrl+C / Ctrl+X / Ctrl+V / Ctrl+A | undo / redo / copy / cut / paste / select-all |
+| Format | Ctrl+B / Alt+I / Ctrl+K | bold / italic / insert-link |
+| Headings/lists | Alt+1..6 / Alt+L / Alt+Q | heading level / toggle bullet list / blockquote |
+| Navigate | arrows, Ctrl+←/→, Home/End, Ctrl+Home/End, PgUp/Dn | char/word/line/document movement |
+| Search | Ctrl+F / Ctrl+R / F3 | find / replace / find-next |
+| View | Ctrl+P / F10 / Ctrl+G / (toggle) | command palette / menu / word-count / focus mode |
+| Pipe/Export | Ctrl+\| / palette | run filter on selection / pandoc export presets |
+
+### 12.4 Terminal key constraints (important, shapes the defaults)
+Legacy terminals collapse some chords onto control codes and **cannot distinguish
+them**: `Ctrl+I`≡Tab, `Ctrl+M`≡Enter, `Ctrl+H`≡Backspace, `Ctrl+[`≡Esc; many
+`Ctrl+Shift+*` combos are also indistinguishable. Consequences for our defaults:
+- **Never bind italic to `Ctrl+I`** (it is Tab) — hence `Alt+I` above. Likewise
+  avoid `Ctrl+M/H/[`.
+- **Enhance when available:** crossterm can enable the **Kitty keyboard protocol**
+  (`PushKeyboardEnhancementFlags`) on supporting terminals (kitty, foot, WezTerm,
+  Ghostty…) to disambiguate richer chords; **degrade gracefully** elsewhere.
+- **Safety net:** because the **command palette reaches every command**, no command
+  is ever locked behind an unavailable chord — discoverability never depends on a
+  terminal supporting a particular key combo.
+
+### 12.5 Config file
+- **Format:** TOML (Rust-idiomatic; matches Helix). **Location:** XDG
+  `~/.config/wordcartel/config.toml` (resolved via the `etcetera`/`dirs` crate for
+  cross-platform config dirs); overridable with `$WORDCARTEL_CONFIG`. Missing
+  config → built-in defaults.
+- **Keymap is data; commands are code** (§10.4). The `[keys]` table maps key
+  strings → command names, *overriding/extending* defaults. An unknown command
+  name is a **surfaced error**, never a silent no-op.
+- Sketch:
+
+```toml
+[editor]
+focus_mode = false         # distraction-free toggle
+autosave   = false
+wrap_width = 0             # 0 = wrap to viewport; >0 = fixed prose column
+
+[ui]
+menu_visible = false       # menu hidden by default (§12.2)
+theme        = "default"
+
+[keys]                     # overrides/additions to the CUA defaults
+"Ctrl-e" = "export_menu"
+"Alt-z"  = "toggle_focus_mode"
+
+[pandoc]
+path = "pandoc"            # autodetected; degrade gracefully if absent (§3.1)
+
+[filters.spellcheck]       # a `filter` preset (§3.5) — appears in palette + menu
+command     = "aspell --mode=markdown list"
+disposition = "filter"     # filter | insert | export
+
+[filters.reflow]
+command     = "fmt -w 80"
+disposition = "filter"
+```
+
+- **Theme** keys color the concealed-markdown styling (heading/emphasis/code/link/
+  blockquote) and chrome (status line, palette, menu), via `term_color`/ratatui
+  with truecolor→256→16 fallback (§4).
+- Config is loaded at startup; **live-reload is backlog** (§5).
+
+---
+
+## 13. Status / Open Threads (still to design)
 
 - **§ Error handling** — pandoc/filter failures, missing binaries, subprocess
   cancellation, save errors.
-- **§ Config format** — keybindings, theme, pandoc path, filter presets.
-- **§ Keybinding scheme** — default bindings; modal vs modeless.
 - **§ md_parse details** — which CommonMark/GFM constructs are concealed/styled
   in v1.
