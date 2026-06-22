@@ -1,6 +1,6 @@
 # Wordcartel — Design Document
 
-**Status:** Living document — design in progress
+**Status:** Design complete — ready for implementation planning
 **Last updated:** 2026-06-22
 
 > A terminal-native, markdown-first word processor written in Rust, with live
@@ -818,7 +818,8 @@ disposition = "filter"
 
 Defines which constructs `md_parse` + `layout` recognize and how each renders on an
 **inactive** line (the active line always shows raw markdown, §3.2). Base = CommonMark
-+ a GFM subset. Calls flagged **[?]** are debatable scope decisions, easily revised.
++ a GFM subset. (The earlier debatable scope calls — tables, setext — were resolved
+by reframing them as filter operations; see §13.6.)
 
 ### 13.1 Parser configuration
 `pulldown-cmark` with GFM extensions enabled: **strikethrough, tables, task lists,
@@ -974,8 +975,111 @@ two cursor models and undo across a representation switch, straining the
 
 ---
 
-## 15. Status / Open Threads (still to design)
+## 15. Error Handling & Recovery
 
-- **§ Error handling** — pandoc/filter failures, missing binaries, subprocess
-  cancellation, save errors. (Partly covered already in §3.1, §9.5, §10.3 — this
-  would consolidate into one section.)
+Consolidates the error behavior referenced throughout the spec into one contract.
+
+### 15.1 Principles
+1. **Never lose the user's work.** The on-disk file is never left half-written
+   (atomic save, §14.3); an internal panic attempts an emergency buffer dump
+   (§15.7) before exit.
+2. **Never crash silently.** Every failure is surfaced with immediate feedback
+   (§3.9) — the same "no silent waits" rule applied to errors: an error must be
+   *visible*, never a frozen or unexplained UI.
+3. **Errors are values at the edges; panics are bugs.** All IO/subprocess/parse
+   boundaries return `Result` (a `thiserror` enum). The pure core (§10) does not
+   fail — its invariants are property-tested (§11). A reached panic means a bug,
+   handled by §15.7, not by normal control flow.
+4. **Degrade, don't abort.** A missing optional dependency (pandoc, a filter
+   binary, a system clipboard) disables *that* feature with a message; core
+   editing always continues.
+
+### 15.2 Presentation model
+- **Transient status-line message** for the overwhelming majority — info /
+  warning / error severity, color-coded, non-blocking, auto-dismissed. This is the
+  default; it never interrupts typing.
+- **Modal confirmation** only for genuinely destructive decisions: quit with
+  unsaved changes, overwrite a file changed on disk (§15.3), overwrite on a failed
+  save retry. Reserved and rare — distraction-free means almost nothing is modal.
+
+### 15.3 File I/O
+- **Open failures** (not found, permission denied, is-a-directory) → status-line
+  error; the editor stays usable (prior/empty buffer). 
+- **Binary / non-UTF-8 file** → **refused**, not opened (we are a UTF-8 markdown
+  editor; silent lossy replacement would corrupt). Uses repar's `is_binary` test
+  (NUL byte or invalid UTF-8). Clear message.
+- **Save failures** (dir not writable, disk full, temp create/rename error) → the
+  atomic strategy (§14.3) guarantees the **original file is untouched**; the buffer
+  **stays dirty**; status-line error invites retry or save-as. Save runs on a
+  worker (§10.3): `status="Saving…"` → `"Saved"` or the error.
+- **Skip-unchanged:** if formatted bytes equal the on-disk bytes, no write occurs
+  (no inode churn) — a no-op, reported quietly.
+- **Symlinks:** refused by default (write the realpath) — adopted from `atomic.rs`.
+- **External modification:** if the file's mtime/size changed on disk since load,
+  a save prompts (reload / overwrite / save-as) rather than silently clobbering
+  (mitigates `atomic.rs`'s last-writer-wins). *(Detection v1; richer 3-way merge is
+  backlog.)*
+
+### 15.4 Subprocess: filters, pandoc, export
+- **Missing binary** (`pandoc`/filter command not found — spawn `ENOENT`) →
+  message ("`pandoc` not found — install it to export"); core editing unaffected
+  (§3.1). Pandoc presence is probed at startup and the export commands disable
+  gracefully when absent.
+- **Non-zero exit** → the buffer is **not modified** (the filter aborts, selection
+  preserved); the child's **stderr is shown** in the status line with the exit
+  code. stderr is never inserted into the buffer.
+- **Long-running / hung filter** → runs off the hot path (§10.3); shows
+  `running <cmd> ⏳`; **cancellable via Esc**, which `kill`s the child. An optional
+  per-filter timeout is configurable.
+- **Deadlock-safe I/O:** concurrent stdin-write / stdout-read (two threads or the
+  `subprocess` crate), per §9.2/§10.3 — never a single-pipe stall.
+- **Export-target write failure** (e.g. read-only output path) → message; the
+  buffer and source file are untouched.
+
+### 15.5 Configuration
+- **Parse error** (malformed TOML) → fall back to **built-in defaults** and surface
+  a message with the file + line; the editor always starts.
+- **Unknown command name** in a `[keys]` binding → that binding is ignored and the
+  error surfaced (§12.5); startup continues.
+- **Unknown/invalid filter preset** (bad disposition, empty command) → that preset
+  is skipped with a message; others load.
+- `--no-config` bypasses all config-file lookup for a clean-room session.
+
+### 15.6 Clipboard & terminal capabilities
+- **Clipboard** is optional (§9.5): `arboard → OSC 52 → silent no-op`; never
+  `unwrap`. If unavailable, a one-time status notice; copy/cut/paste degrade to
+  in-process register behavior so editing is unaffected.
+- **Terminal capabilities** (truecolor, Kitty keyboard protocol, OSC 52) are
+  detected and **degrade gracefully** (§4, §12.4) — never an error.
+- **Terminal too small** (width below a usable minimum) → render a clamped
+  "window too small" notice rather than panicking or mis-wrapping.
+
+### 15.7 Panic safety & crash recovery
+- Wordcartel **does not** use `panic="abort"` (§14.4) precisely so a panic can
+  **unwind cleanly**: a guard around the main loop restores the terminal (leave raw
+  mode, show cursor, disable enhancements), then attempts an **emergency dump** of
+  the buffer to a recovery path (e.g. `~/.local/state/wordcartel/recovered-<name>-
+  <pid>.md`) before exiting with the panic report for a bug filing. This is the
+  last line of the "never lose work" guarantee.
+- **Hard kill / power loss** (no unwind possible) is mitigated by (a) atomic save —
+  the on-disk file is never half-written — and (b) an **optional autosave / swap
+  file** safety net (vim-`.swp`-style), offered on next open. *(Autosave/swap is
+  v1-light or backlog; the atomic guarantee + emergency dump cover the common cases.)*
+
+---
+
+## 16. Spec Status — Complete
+
+All design threads are closed. §§1–15 cover: vision & non-goals (1–2), key decisions
+& rationale (3), architecture (4), scope (5), licensing (6), the kiro reuse map (7),
+paths not taken (8), prior art & the borrowed component stack (9), data-flow &
+control-flow (10), testing strategy (11), config & keybindings (12), the v1 markdown
+construct set (13), repar integration & the line-structure model (14), and error
+handling & recovery (15).
+
+**Next step:** an implementation plan (the `writing-plans` step). The natural build
+order is the **pure core first** (it is the most-tested, terminal-free foundation):
+`ropey` buffer → `edit_diff`/`history` (undo) → `selection` → `md_parse` →
+`layout`/`col_map`, then the io/shell (crossterm input, ratatui render, `repar`
+transforms, `filter`, clipboard, atomic save), then app wiring (editor loop,
+commands, config, palette/menu).
