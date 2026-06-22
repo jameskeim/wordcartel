@@ -14,13 +14,27 @@ fn snap(s: &str, mut i: usize) -> usize {
     i.min(s.len())
 }
 
+/// Multi-byte alphabet: ASCII letters plus accented, CJK, and emoji characters.
+fn multibyte_string(max_chars: usize) -> impl Strategy<Value = String> {
+    let chars = prop::collection::vec(
+        prop::sample::select(vec![
+            'a', 'b', 'c', 'd', 'e', 'f', 'g',
+            'é',   // U+00E9  (2 bytes)
+            '中',  // U+4E2D  (3 bytes)
+            '🙂',  // U+1F642 (4 bytes)
+        ]),
+        0..=max_chars,
+    );
+    chars.prop_map(|v| v.into_iter().collect::<String>())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
     #[test]
     fn undo_all_restores_original(
-        start in ".{0,20}",
-        ops in proptest::collection::vec((0usize..30, ".{0,4}", any::<bool>()), 0..12),
+        start in multibyte_string(20),
+        ops in proptest::collection::vec((0usize..30, multibyte_string(4), any::<bool>()), 0..12),
     ) {
         let original = start.clone();
         let mut buf = TextBuffer::from_str(&start);

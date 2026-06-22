@@ -239,47 +239,86 @@ mod tests {
         i.min(s.len())
     }
 
+    /// Alphabet that includes multi-byte graphemes: ASCII letters, accented chars,
+    /// CJK, emoji, and a combining sequence.
+    fn multibyte_alphabet() -> impl Strategy<Value = String> {
+        let chars = prop::collection::vec(
+            prop::sample::select(vec![
+                'a', 'b', 'c', 'd', 'e',
+                'é',            // U+00E9  (2 bytes)
+                '中',           // U+4E2D  (3 bytes)
+                '🙂',           // U+1F642 (4 bytes)
+            ]),
+            0..=20,
+        );
+        chars.prop_map(|v| v.into_iter().collect::<String>())
+    }
+
+    /// Short multibyte string for inserted text (always char-aligned by construction).
+    fn multibyte_ins() -> impl Strategy<Value = String> {
+        let chars = prop::collection::vec(
+            prop::sample::select(vec![
+                'x', 'y', 'z',
+                'é',
+                '中',
+                '🙂',
+            ]),
+            1..=6,
+        );
+        chars.prop_map(|v| v.into_iter().collect::<String>())
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
 
         /// LAW (spec §11.2): apply(invert(cs)) ∘ apply(cs) == identity for a
-        /// genuine multi-op ChangeSet (≥ 3 ops: Retain + Delete + Insert + Retain).
-        /// Builds the ChangeSet by walking real char-boundary-aligned segments so
-        /// all ops land correctly, guaranteeing at least one Delete AND one Insert.
+        /// genuine 4-op ChangeSet: Retain(c1) Delete(d) Insert(ins) Retain(c2).
+        /// Uses a multi-byte alphabet (ASCII + é + 中 + 🙂) so all segments can
+        /// include CJK, emoji, and accented characters.  Two cut points divide the
+        /// document: the first starts the Delete span, the second ends it (leaving
+        /// a trailing Retain), exercising the full 4-op shape.
         #[test]
         fn prop_multi_op_invert_is_identity(
-            text in ".{4,40}",
-            // fraction in [0,100) → position of the cut point (scaled to [1, len-2])
-            cut_frac in 1usize..99,
-            ins in "[a-z]{1,6}",
+            text in multibyte_alphabet().prop_filter("need ≥2 chars", |s| s.chars().count() >= 2),
+            // Two fractions select c1 and c1+d boundaries inside the document.
+            c1_frac in 1usize..50,
+            d_frac  in 51usize..99,
+            ins in multibyte_ins(),
         ) {
             let doc = text.as_str();
             let len = doc.len();
-            // Need at least one char before AND after the cut so Delete/Retain can span them.
             if len < 2 { return Ok(()); }
 
-            // Pick a cut point somewhere in the middle, snapped to a char boundary.
-            let raw_cut = 1 + (cut_frac * (len - 1)) / 100;
-            let cut = snap(doc, raw_cut.min(len - 1));
-            // If snap pushed cut to 0 or len, skip — can't form a proper multi-op.
-            if cut == 0 || cut == len { return Ok(()); }
+            // Derive c1 (start of Delete) and c2_start (end of Delete) as char-boundary
+            // byte offsets, guaranteed c1 < c2_start < len.
+            let raw_c1 = 1 + (c1_frac * (len - 1)) / 100;
+            let c1 = snap(doc, raw_c1.min(len - 1));
 
-            // Build a 3-op ChangeSet manually (Retain + Delete + Insert):
-            //   Retain(cut)  Delete(len - cut)  Insert(ins)
-            // len_before = len
-            // len_after  = cut + ins.len()
+            let raw_c2_start = 1 + (d_frac * (len - 1)) / 100;
+            let c2_start = snap(doc, raw_c2_start.min(len - 1));
+
+            // Need c1 < c2_start with at least one char retained at the tail.
+            if c1 == 0 || c2_start <= c1 || c2_start == len { return Ok(()); }
+
+            let d = c2_start - c1;    // bytes deleted
+            let c2 = len - c2_start;  // bytes in trailing Retain
+
+            // Shape: Retain(c1)  Delete(d)  Insert(ins)  Retain(c2)
+            // len_before = c1 + d + c2 = len
+            // len_after  = c1 + ins.len() + c2
             let mut ops = Vec::new();
-            ops.push(Op::Retain(cut));
-            ops.push(Op::Delete(len - cut));
+            ops.push(Op::Retain(c1));
+            ops.push(Op::Delete(d));
             ops.push(Op::Insert(Tendril::from(ins.as_str())));
+            ops.push(Op::Retain(c2));
             let cs = ChangeSet {
                 ops,
                 len_before: len,
-                len_after: cut + ins.len(),
+                len_after: c1 + ins.len() + c2,
             };
 
-            // Sanity: at least 3 ops (Retain + Delete + Insert).
-            prop_assert!(cs.ops.len() >= 3, "changeset must have ≥ 3 ops");
+            // Sanity: 4-op shape.
+            prop_assert_eq!(cs.ops.len(), 4, "expected 4 ops; got {:?}", cs.ops);
 
             let original = TextBuffer::from_str(doc);
             let inv = cs.invert(&original);
@@ -288,7 +327,7 @@ mod tests {
             cs.apply(&mut b);
             inv.apply(&mut b);
             prop_assert_eq!(b.to_string(), text,
-                "round-trip failed: cut={} ins={:?}", cut, ins);
+                "round-trip failed: c1={} d={} ins={:?} c2={}", c1, d, ins, c2);
         }
     }
 }
