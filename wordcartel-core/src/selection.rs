@@ -73,6 +73,12 @@ impl Selection {
         Selection { ranges: smallvec![Range::point(pos)], primary: 0 }
     }
     pub fn primary(&self) -> Range {
+        debug_assert!(
+            self.primary < self.ranges.len(),
+            "primary index {} out of bounds for {} range(s)",
+            self.primary,
+            self.ranges.len()
+        );
         self.ranges[self.primary]
     }
     pub fn map(&self, cs: &ChangeSet) -> Selection {

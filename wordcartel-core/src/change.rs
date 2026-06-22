@@ -20,6 +20,15 @@ pub struct ChangeSet {
     pub len_after: usize,
 }
 
+// INVARIANT: all positions and lengths here are byte offsets into a single
+// in-memory document, so they are bounded by the document's byte length and fit a
+// `usize`. On the 64-bit targets Wordcartel supports, the length/position
+// arithmetic below (`doc_len + text.len()`, `pos + n`, etc.) cannot overflow for
+// any real document — the perf budget caps editing at ~5 MB (spec §3.9), ~12 orders
+// of magnitude below `usize::MAX`. Malformed *positions* (e.g. past end-of-doc) do
+// not corrupt silently: they hit `TextBuffer`'s release-enforced char-boundary
+// `assert!` (buffer.rs) during `apply`. We therefore deliberately keep plain
+// arithmetic on the per-keystroke hot path rather than `checked_add`.
 impl ChangeSet {
     /// Insert `text` at byte offset `at` in a document of length `doc_len`.
     ///
