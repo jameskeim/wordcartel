@@ -58,7 +58,8 @@ This module ports our OWN spike — the validated reference for the project's ri
 mod tests {
     use super::*;
     fn kinds(t: &BlockTree) -> Vec<BlockKind> {
-        t.top_level().iter().map(|b| b.kind).collect()
+        // BlockKind is Clone (not Copy) in the spike — clone, don't move out of &Block.
+        t.top_level().iter().map(|b| b.kind.clone()).collect()
     }
     #[test]
     fn parses_heading_and_paragraph() {
@@ -92,7 +93,7 @@ mod tests {
 
 **Port source:** the spike `src/lib.rs` — port **verbatim** (imports adjusted): `Edit { range: Range<usize>, new_len: usize }` (+ `delta()`), `WidenReason` enum, `UpdateOutcome`, `incremental_update(old_tree, old_text, edit, new_text) -> BlockTree`, `incremental_update_instrumented(...) -> UpdateOutcome`, the `apply_edit` test helper, and ALL the private region-computation + splice helpers they call (lines ~156-560). **Do not alter the invalidation logic** — every clause (line-group pull-back, code-block clamp, full-reparse-on-HTML, widen-to-end on ref-def/fence-line/container-overlap, invariant-repair loop, span-shift, splice) was validated by the oracle. Reproduce them exactly.
 
-**Interfaces — Produces:** `pub struct Edit {...}`, `pub enum WidenReason { Local, WidenToEnd, NoOverlapFull }`, `pub struct UpdateOutcome { tree, reason, reparsed_bytes }`, `pub fn incremental_update(...)`, `pub fn incremental_update_instrumented(...)`, `pub fn apply_edit(old_text, range, replacement) -> (String, Edit)`.
+**Interfaces — Produces:** `pub struct Edit {...}`, `pub enum WidenReason { Local, NoOverlapFull, WidenToEnd }` (variant order verbatim from the spike), `pub struct UpdateOutcome { tree, reason, reparsed_bytes }`, `pub fn incremental_update(...)`, `pub fn incremental_update_instrumented(...)`, `pub fn apply_edit(old_text, range, replacement) -> (String, Edit)`.
 
 - [ ] **Step 1: Write failing tests** — port 4–5 of the spike's deterministic hazard regressions from `tests/oracle.rs` as in-module tests that compare `incremental_update` to `full_parse(new_text)` for specific edits (e.g. typing in a paragraph → Local; toggling a fence marker → tree still equals full; editing near HTML → still equals full). Each asserts `incremental_update(&old_tree, &old, &edit, &new) == full_parse(&new)`.
 - [ ] **Step 2:** Run `cargo test ... block_tree` → FAIL (no `incremental_update`).
