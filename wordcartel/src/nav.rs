@@ -103,6 +103,136 @@ pub fn screen_pos(editor: &Editor) -> Option<(u16, u16)> {
     Some((vcol as u16, final_row as u16))
 }
 
+// ---------------------------------------------------------------------------
+// Horizontal navigation
+// ---------------------------------------------------------------------------
+
+/// Helper: lay out line `l` for the ColMap, treating it as the active caret
+/// line (is_active=true). Used during line transitions where the target line
+/// will become the new caret line.
+fn layout_line_active(editor: &Editor, l: usize) -> wordcartel_core::layout::ColMap {
+    let buf = &editor.document.buffer;
+    let text = derive::line_text(buf, l);
+    let role = editor.document.blocks.role_at(derive::line_start(buf, l));
+    let vp_width = (editor.view.area.0 as usize).max(1);
+    let (_rows, map) = layout::layout(&text, role, true, vp_width);
+    map
+}
+
+/// Get the ColMap for line `l` from the cache if available, else lay it out
+/// with the appropriate `is_active` flag.
+fn get_or_layout(editor: &Editor, l: usize) -> wordcartel_core::layout::ColMap {
+    if let Some((_, map)) = editor.view.line_layouts.get(&l) {
+        map.clone()
+    } else {
+        layout_line_on_demand(editor, l)
+    }
+}
+
+/// Move the caret one grapheme to the right.
+///
+/// Returns the new global byte offset. Sets `editor.desired_col = None` to
+/// re-anchor vertical motion.
+///
+/// At the end of line L (and L is not the last line), crosses to line L+1.
+pub fn move_right(editor: &mut Editor) -> usize {
+    let buf = &editor.document.buffer;
+    let h = head(editor);
+    let l = caret_line(editor);
+    let ls = derive::line_start(buf, l);
+    let in_off = h.saturating_sub(ls);
+    let total = derive::total_logical_lines(buf);
+
+    // Get the ColMap for the caret line (from cache, using the already-computed
+    // is_active flag, or on-demand).
+    let map = get_or_layout(editor, l);
+
+    let cur = layout::cursor_at(&map, in_off);
+    let nxt = layout::move_right(&map, cur);
+
+    let new_offset = if nxt.offset == cur.offset && cur.offset == map.eol && l + 1 < total {
+        // At line end and not the last line → transition to next line.
+        // The target line becomes the new caret line, so lay it out as active.
+        let next_map = layout_line_active(editor, l + 1);
+        let next_ls = derive::line_start(&editor.document.buffer, l + 1);
+        // Snap to the first valid cursor stop on the next line.
+        let first_stop = layout::cursor_at(&next_map, 0);
+        next_ls + first_stop.offset
+    } else {
+        ls + nxt.offset
+    };
+
+    editor.desired_col = None;
+    new_offset
+}
+
+/// Move the caret one grapheme to the left.
+///
+/// Returns the new global byte offset. Sets `editor.desired_col = None`.
+///
+/// At the start of line L (and L > 0), crosses to the end of line L-1.
+pub fn move_left(editor: &mut Editor) -> usize {
+    let buf = &editor.document.buffer;
+    let h = head(editor);
+    let l = caret_line(editor);
+    let ls = derive::line_start(buf, l);
+    let in_off = h.saturating_sub(ls);
+
+    let map = get_or_layout(editor, l);
+
+    let cur = layout::cursor_at(&map, in_off);
+    let nxt = layout::move_left(&map, cur);
+
+    let new_offset = if nxt.offset == cur.offset && in_off == 0 && l > 0 {
+        // At line start and not the first line → transition to end of line L-1.
+        let prev_map = layout_line_active(editor, l - 1);
+        let prev_ls = derive::line_start(&editor.document.buffer, l - 1);
+        let eol_cur = layout::cursor_at(&prev_map, prev_map.eol);
+        prev_ls + eol_cur.offset
+    } else {
+        ls + nxt.offset
+    };
+
+    editor.desired_col = None;
+    new_offset
+}
+
+/// Move the caret to the start of the current visual row (does not cross lines).
+///
+/// Returns the new global byte offset. Sets `editor.desired_col = None`.
+pub fn move_home(editor: &mut Editor) -> usize {
+    let buf = &editor.document.buffer;
+    let h = head(editor);
+    let l = caret_line(editor);
+    let ls = derive::line_start(buf, l);
+    let in_off = h.saturating_sub(ls);
+
+    let map = get_or_layout(editor, l);
+    let cur = layout::cursor_at(&map, in_off);
+    let result = layout::move_home(&map, cur);
+
+    editor.desired_col = None;
+    ls + result.offset
+}
+
+/// Move the caret to the end of the current visual row (does not cross lines).
+///
+/// Returns the new global byte offset. Sets `editor.desired_col = None`.
+pub fn move_end(editor: &mut Editor) -> usize {
+    let buf = &editor.document.buffer;
+    let h = head(editor);
+    let l = caret_line(editor);
+    let ls = derive::line_start(buf, l);
+    let in_off = h.saturating_sub(ls);
+
+    let map = get_or_layout(editor, l);
+    let cur = layout::cursor_at(&map, in_off);
+    let result = layout::move_end(&map, cur);
+
+    editor.desired_col = None;
+    ls + result.offset
+}
+
 /// Adjust `view.scroll` so the caret line's visual rows fall within the
 /// visible area height.
 ///
@@ -188,7 +318,7 @@ fn count_visual_rows(editor: &Editor, from_line: usize, to_line: usize) -> usize
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_visible, screen_pos};
+    use super::{ensure_visible, move_home, move_end, move_left, move_right, screen_pos};
     use crate::derive;
     use crate::editor::Editor;
     use wordcartel_core::selection::Selection;
@@ -196,6 +326,68 @@ mod tests {
     /// Test helper: set the caret to a raw byte offset.
     fn set_caret(e: &mut Editor, off: usize) {
         e.document.selection = Selection::single(off);
+    }
+
+    // ------------------------------------------------------------------
+    // Task 6: Horizontal nav (RED → GREEN)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn right_crosses_line_boundary() {
+        let mut e = Editor::new_from_text("ab\ncd\n", None, (80, 24));
+        set_caret(&mut e, 2); // end of "ab" (before '\n')
+        derive::rebuild(&mut e);
+        let n = move_right(&mut e); // should land at start of "cd" (offset 3)
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn left_crosses_line_boundary() {
+        let mut e = Editor::new_from_text("ab\ncd\n", None, (80, 24));
+        set_caret(&mut e, 3); // start of "cd"
+        derive::rebuild(&mut e);
+        let n = move_left(&mut e); // -> end of "ab" (offset 2)
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn right_crosses_line_boundary_multibyte() {
+        // "é" is 2 bytes (0..2), so end of line 0 is offset 2 (before '\n' at 2).
+        // After crossing: start of "z" at offset 3 (byte after '\n').
+        let mut e = Editor::new_from_text("é\nz\n", None, (80, 24));
+        set_caret(&mut e, 2); // EOL of "é" line (byte 2 = 'é'.len())
+        derive::rebuild(&mut e);
+        let n = move_right(&mut e); // should land at start of "z" (offset 3)
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn left_crosses_line_boundary_multibyte() {
+        // Start of "z" line is offset 3 (after "é\n" = 3 bytes).
+        // move_left should land at end of "é" = offset 2.
+        let mut e = Editor::new_from_text("é\nz\n", None, (80, 24));
+        set_caret(&mut e, 3); // start of "z"
+        derive::rebuild(&mut e);
+        let n = move_left(&mut e); // -> EOL of "é" line (offset 2)
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn move_home_within_line() {
+        let mut e = Editor::new_from_text("ab\ncd\n", None, (80, 24));
+        set_caret(&mut e, 4); // 'd' in "cd"
+        derive::rebuild(&mut e);
+        let n = move_home(&mut e);
+        assert_eq!(n, 3); // start of "cd"
+    }
+
+    #[test]
+    fn move_end_within_line() {
+        let mut e = Editor::new_from_text("ab\ncd\n", None, (80, 24));
+        set_caret(&mut e, 3); // 'c' in "cd"
+        derive::rebuild(&mut e);
+        let n = move_end(&mut e);
+        assert_eq!(n, 5); // EOL of "cd" = line_start(1) + eol(2) = 3 + 2 = 5
     }
 
     // ------------------------------------------------------------------
