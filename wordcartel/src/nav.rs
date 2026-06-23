@@ -233,6 +233,107 @@ pub fn move_end(editor: &mut Editor) -> usize {
     ls + result.offset
 }
 
+// ---------------------------------------------------------------------------
+// Vertical navigation
+// ---------------------------------------------------------------------------
+
+/// Move the caret down one visual row.
+///
+/// - If the caret is on a wrapped logical line with more rows below, stays
+///   within that logical line (the wrapped lower row).
+/// - Otherwise, if there is a next logical line, crosses into it landing at
+///   the desired visual column in the top row.
+/// - If already on the last line's last visual row, no-op.
+///
+/// Returns the new global byte offset. Preserves `editor.desired_col` across
+/// the motion (computes it from the current visual column on the first vertical
+/// move when it is `None`).
+pub fn move_down(editor: &mut Editor) -> usize {
+    let buf = &editor.document.buffer;
+    let h = head(editor);
+    let l = caret_line(editor);
+    let ls = derive::line_start(buf, l);
+    let in_off = h.saturating_sub(ls);
+    let total = derive::total_logical_lines(buf);
+
+    let map = get_or_layout(editor, l);
+    let cur0 = layout::cursor_at(&map, in_off);
+
+    // Anchor desired_col on the first vertical move.
+    let desired = editor.desired_col.unwrap_or_else(|| map.col_on_row(in_off, cur0.row));
+    editor.desired_col = Some(desired);
+
+    // Build the cursor with the STORED desired_col so move_down_within reads it.
+    let mut cur = cur0;
+    cur.desired_col = desired;
+
+    match layout::move_down_within(&map, cur) {
+        Some(c) => {
+            // Stayed within the same (wrapped) logical line.
+            ls + c.offset
+        }
+        None => {
+            // At the bottom visual row of this logical line.
+            if l + 1 >= total {
+                // Already on the last line — no-op.
+                h
+            } else {
+                // Cross into the next logical line.
+                let next_map = layout_line_active(editor, l + 1);
+                let next_ls = derive::line_start(&editor.document.buffer, l + 1);
+                let c = layout::enter_from_top(&next_map, desired);
+                next_ls + c.offset
+            }
+        }
+    }
+}
+
+/// Move the caret up one visual row.
+///
+/// Symmetric with `move_down`: moves within a wrapped line if possible,
+/// otherwise crosses to the bottom row of the previous logical line.
+/// No-op if already on line 0's first visual row.
+///
+/// Returns the new global byte offset. Preserves `editor.desired_col`.
+pub fn move_up(editor: &mut Editor) -> usize {
+    let buf = &editor.document.buffer;
+    let h = head(editor);
+    let l = caret_line(editor);
+    let ls = derive::line_start(buf, l);
+    let in_off = h.saturating_sub(ls);
+
+    let map = get_or_layout(editor, l);
+    let cur0 = layout::cursor_at(&map, in_off);
+
+    // Anchor desired_col on the first vertical move.
+    let desired = editor.desired_col.unwrap_or_else(|| map.col_on_row(in_off, cur0.row));
+    editor.desired_col = Some(desired);
+
+    // Build the cursor with the STORED desired_col so move_up_within reads it.
+    let mut cur = cur0;
+    cur.desired_col = desired;
+
+    match layout::move_up_within(&map, cur) {
+        Some(c) => {
+            // Stayed within the same (wrapped) logical line.
+            ls + c.offset
+        }
+        None => {
+            // At the top visual row of this logical line.
+            if l == 0 {
+                // Already on line 0 — no-op.
+                h
+            } else {
+                // Cross into the previous logical line.
+                let prev_map = layout_line_active(editor, l - 1);
+                let prev_ls = derive::line_start(&editor.document.buffer, l - 1);
+                let c = layout::enter_from_bottom(&prev_map, desired);
+                prev_ls + c.offset
+            }
+        }
+    }
+}
+
 /// Adjust `view.scroll` so the caret line's visual rows fall within the
 /// visible area height.
 ///
@@ -318,7 +419,7 @@ fn count_visual_rows(editor: &Editor, from_line: usize, to_line: usize) -> usize
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_visible, move_home, move_end, move_left, move_right, screen_pos};
+    use super::{ensure_visible, move_down, move_up, move_home, move_end, move_left, move_right, screen_pos};
     use crate::derive;
     use crate::editor::Editor;
     use wordcartel_core::selection::Selection;
@@ -450,5 +551,44 @@ mod tests {
         set_caret(&mut e, 0); // caret at very top
         ensure_visible(&mut e);
         assert_eq!(e.view.scroll, 0, "scroll should have gone back to 0");
+    }
+
+    // ------------------------------------------------------------------
+    // Task 7: Vertical navigation (RED → GREEN)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn down_preserves_column_across_lines() {
+        let mut e = Editor::new_from_text("hello\nworld\n", None, (80, 24));
+        set_caret(&mut e, 3); // col 3 on "hello" ('l'); desired_col starts None
+        derive::rebuild(&mut e);
+        let n = move_down(&mut e); // first vertical move computes desired_col=3 -> "world" col 3 -> offset 9
+        assert_eq!(n, 9);
+        assert_eq!(e.desired_col, Some(3));
+    }
+
+    #[test]
+    fn down_within_wrapped_line_stays_in_line() {
+        // narrow width forces "aaaaaa" to wrap; down moves to the 2nd visual row, same logical line
+        let mut e = Editor::new_from_text("aaaaaa\nz\n", None, (3, 24));
+        set_caret(&mut e, 0); // desired_col None
+        derive::rebuild(&mut e);
+        let n = move_down(&mut e);
+        assert!(n > 0 && n < 6); // still inside the first logical line's wrapped rows
+    }
+
+    #[test]
+    fn up_then_down_round_trip() {
+        // Start on line 1, move up to line 0, then back down; desired_col preserved throughout.
+        let mut e = Editor::new_from_text("hello\nworld\n", None, (80, 24));
+        set_caret(&mut e, 8); // 'r' in "world", col 2
+        derive::rebuild(&mut e);
+        let up_pos = move_up(&mut e); // -> "hello" col 2 -> offset 2
+        assert_eq!(up_pos, 2);
+        assert_eq!(e.desired_col, Some(2));
+        set_caret(&mut e, up_pos); // apply the move so move_down starts from offset 2
+        let down_pos = move_down(&mut e); // -> back to "world" col 2 -> offset 8
+        assert_eq!(down_pos, 8);
+        assert_eq!(e.desired_col, Some(2)); // still preserved
     }
 }
