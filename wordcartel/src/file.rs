@@ -217,14 +217,21 @@ pub fn save_atomic(path: &Path, content: &str) -> Result<SaveOutcome, SaveError>
     // Atomic replace (same-dir temp → same filesystem → rename is atomic).
     fs::rename(&temp, path).map_err(|e| SaveError::Io(e.to_string()))?;
 
+    // Disarm the guard: the temp file has been renamed away, so there is nothing
+    // left to clean up regardless of what happens next.
+    guard.disarm();
+
     // fsync the parent directory so the rename entry is durable.
     // On macOS this is a no-op for platter durability (F_FULLFSYNC needed there),
     // but atomicity (rename) still holds.
+    // IMPORTANT: we propagate dir-fsync failures as SaveError::Io so the caller
+    // does NOT clear the dirty flag — the buffer remains dirty for a retry.
+    // The TempGuard is already disarmed above; the temp was renamed, so there
+    // is nothing to roll back here.
     if let Ok(dir_fh) = fs::File::open(&dir) {
-        let _ = dir_fh.sync_all();
+        dir_fh.sync_all().map_err(|e| SaveError::Io(e.to_string()))?;
     }
 
-    guard.disarm();
     Ok(SaveOutcome::Saved)
 }
 
@@ -392,6 +399,21 @@ mod tests {
         let got = open(&p).expect("open after update");
         assert_eq!(got, "second\n");
         let _ = fs::remove_file(&p);
+    }
+
+    /// Fix 2: save_atomic propagates a dir-fsync failure as SaveError::Io.
+    ///
+    /// A true dir-fsync EIO is not portably simulatable in a unit test, so this
+    /// test documents the code path via a comment and verifies the *happy path*
+    /// (successful dir-sync) still returns Ok(Saved).  The important semantic
+    /// change is that the `let _ = dir_fh.sync_all()` in production code has
+    /// been changed to propagate the error — see the implementation.
+    #[test]
+    fn save_atomic_dir_fsync_success_still_returns_saved() {
+        let p = scratch_path("dirsync");
+        let outcome = save_atomic(&p, "dir-fsync test\n").expect("save must succeed");
+        assert_eq!(outcome, SaveOutcome::Saved, "successful dir-fsync path must return Saved");
+        let _ = std::fs::remove_file(&p);
     }
 
     /// No temp litter left after a successful save.

@@ -23,12 +23,27 @@ pub struct TerminalGuard {
 impl TerminalGuard {
     /// Enable raw mode, enter the alternate screen, and return a `TerminalGuard`
     /// whose `Drop` impl will restore the terminal.
+    ///
+    /// If any step after `enable_raw_mode` fails, raw mode and the alternate
+    /// screen are rolled back before returning the error so the terminal is
+    /// always left in a usable state (no raw-mode leak).
     pub fn new() -> io::Result<Self> {
         enable_raw_mode()?;
+        // From this point forward any failure must roll back raw mode.
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        if let Err(e) = execute!(stdout, EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(e);
+        }
         let backend = CrosstermBackend::new(io::stdout());
-        let terminal = Terminal::new(backend)?;
+        let terminal = match Terminal::new(backend) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = disable_raw_mode();
+                let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+                return Err(e);
+            }
+        };
         Ok(Self { terminal })
     }
 

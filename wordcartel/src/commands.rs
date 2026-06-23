@@ -69,6 +69,37 @@ pub enum CommandResult {
     Quit,
 }
 
+/// Build a `ChangeSet` that replaces the byte range `from..to` with `text`.
+///
+/// The Edit passed to `editor.apply` must match this exactly:
+///   `Edit { range: from..to, new_len: text.len() }`.
+fn replace_changeset(
+    from: usize,
+    to: usize,
+    text: &str,
+    doc_len: usize,
+) -> wordcartel_core::change::ChangeSet {
+    use wordcartel_core::change::{ChangeSet, Op, Tendril};
+    let mut ops = Vec::new();
+    if from > 0 {
+        ops.push(Op::Retain(from));
+    }
+    if to > from {
+        ops.push(Op::Delete(to - from));
+    }
+    if !text.is_empty() {
+        ops.push(Op::Insert(Tendril::from(text)));
+    }
+    if doc_len > to {
+        ops.push(Op::Retain(doc_len - to));
+    }
+    ChangeSet {
+        ops,
+        len_before: doc_len,
+        len_after: doc_len - (to - from) + text.len(),
+    }
+}
+
 /// Execute `cmd` against `editor`, then re-derive + ensure visibility.
 pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     // Clear the pending-quit confirmation flag for every command except Quit itself.
@@ -77,6 +108,22 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
     }
     match cmd {
         Command::InsertChar(c) => {
+            let sel = editor.document.selection.primary();
+            if !sel.is_empty() {
+                // Non-empty selection: replace it with the typed character (CUA).
+                let (from, to) = (sel.from(), sel.to());
+                let text = c.to_string();
+                let doc_len = editor.document.buffer.len();
+                let cs = replace_changeset(from, to, &text, doc_len);
+                let edit = Edit { range: from..to, new_len: text.len() };
+                let txn = Transaction::new(cs).with_selection(Selection::single(from + text.len()));
+                editor.apply(txn, edit, EditKind::Other, clock);
+                derive::rebuild(editor);
+                nav::ensure_visible(editor);
+                editor.desired_col = None;
+                return CommandResult::Handled;
+            }
+            // Collapsed selection: normal insert-at-caret path.
             let at = nav::head(editor);
             let s = c.to_string();
             let doc_len = editor.document.buffer.len();
@@ -92,6 +139,22 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         }
 
         Command::InsertNewline => {
+            let sel = editor.document.selection.primary();
+            if !sel.is_empty() {
+                // Non-empty selection: replace it with a newline (CUA).
+                let (from, to) = (sel.from(), sel.to());
+                let text = "\n";
+                let doc_len = editor.document.buffer.len();
+                let cs = replace_changeset(from, to, text, doc_len);
+                let edit = Edit { range: from..to, new_len: text.len() };
+                let txn = Transaction::new(cs).with_selection(Selection::single(from + text.len()));
+                editor.apply(txn, edit, EditKind::Other, clock);
+                derive::rebuild(editor);
+                nav::ensure_visible(editor);
+                editor.desired_col = None;
+                return CommandResult::Handled;
+            }
+            // Collapsed selection: normal insert-newline path.
             let at = nav::head(editor);
             let s = "\n";
             let doc_len = editor.document.buffer.len();
@@ -145,6 +208,21 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         }
 
         Command::DeleteForward => {
+            let sel = editor.document.selection.primary();
+            if !sel.is_empty() {
+                // Non-empty selection: delete the selection range (CUA, mirrors Backspace).
+                let (from, to) = (sel.from(), sel.to());
+                let doc_len = editor.document.buffer.len();
+                let cs = ChangeSet::delete(from..to, doc_len);
+                let edit = Edit { range: from..to, new_len: 0 };
+                let txn = Transaction::new(cs).with_selection(Selection::single(from));
+                editor.apply(txn, edit, EditKind::Other, clock);
+                derive::rebuild(editor);
+                nav::ensure_visible(editor);
+                editor.desired_col = None;
+                return CommandResult::Handled;
+            }
+            // Collapsed selection: delete one grapheme forward.
             let head = nav::head(editor);
             // Compute the grapheme-correct next stop by reusing move_right.
             // move_right sets desired_col=None as a side-effect but does NOT change
@@ -222,6 +300,26 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         }
 
         Command::Paste => {
+            let sel = editor.document.selection.primary();
+            if !sel.is_empty() {
+                // Non-empty selection: replace it with the register contents (CUA).
+                if let Some(text) = editor.register.get().map(str::to_owned) {
+                    let (from, to) = (sel.from(), sel.to());
+                    let doc_len = editor.document.buffer.len();
+                    let cs = replace_changeset(from, to, &text, doc_len);
+                    let edit = Edit { range: from..to, new_len: text.len() };
+                    let txn =
+                        Transaction::new(cs).with_selection(Selection::single(from + text.len()));
+                    editor.apply(txn, edit, EditKind::Other, clock);
+                    derive::rebuild(editor);
+                    nav::ensure_visible(editor);
+                    editor.desired_col = None;
+                    return CommandResult::Handled;
+                }
+                // Register is empty → fall through to Noop below.
+                return CommandResult::Noop;
+            }
+            // Collapsed selection: normal paste-at-caret path.
             let at = nav::head(editor);
             let doc_len = editor.document.buffer.len();
             if let Some(cs) = register::paste(at, doc_len, &editor.register) {
@@ -733,6 +831,124 @@ mod tests {
 
         run(Command::CycleRenderMode, &mut e, &clk);
         assert_eq!(e.view.mode, RenderMode::LivePreview);
+    }
+
+    // -------------------------------------------------------------------------
+    // Fix 1 (CUA): type/paste/Enter over a selection REPLACE it; DeleteForward
+    // over a selection DELETES it.
+    // -------------------------------------------------------------------------
+
+    /// Typing a character over a non-empty selection replaces the selection.
+    /// "abcd\n", select anchor=1 head=3 ("bc"), InsertChar('X') → "aXd\n", caret 2.
+    #[test]
+    fn type_over_selection_replaces() {
+        let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
+        e.document.selection = Selection {
+            ranges: [wordcartel_core::selection::Range { anchor: 1, head: 3 }]
+                .into_iter()
+                .collect(),
+            primary: 0,
+        };
+        derive::rebuild(&mut e);
+        let clk = TestClock(0);
+        let result = run(Command::InsertChar('X'), &mut e, &clk);
+        assert_eq!(result, CommandResult::Handled);
+        assert_eq!(e.document.buffer.to_string(), "aXd\n", "InsertChar must replace the selection");
+        assert_eq!(nav::head(&e), 2, "caret must be after the inserted char");
+    }
+
+    /// InsertChar over a collapsed selection (normal caret) still inserts at the caret.
+    #[test]
+    fn type_over_collapsed_selection_inserts_normally() {
+        let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
+        e.document.selection = Selection::single(2);
+        derive::rebuild(&mut e);
+        let clk = TestClock(0);
+        run(Command::InsertChar('X'), &mut e, &clk);
+        assert_eq!(e.document.buffer.to_string(), "abXcd\n");
+        assert_eq!(nav::head(&e), 3);
+    }
+
+    /// InsertNewline over a non-empty selection replaces the selection with a newline.
+    #[test]
+    fn enter_over_selection_replaces() {
+        let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
+        e.document.selection = Selection {
+            ranges: [wordcartel_core::selection::Range { anchor: 1, head: 3 }]
+                .into_iter()
+                .collect(),
+            primary: 0,
+        };
+        derive::rebuild(&mut e);
+        let clk = TestClock(0);
+        let result = run(Command::InsertNewline, &mut e, &clk);
+        assert_eq!(result, CommandResult::Handled);
+        assert_eq!(e.document.buffer.to_string(), "a\nd\n", "InsertNewline must replace the selection");
+        assert_eq!(nav::head(&e), 2, "caret must be after the newline");
+    }
+
+    /// Paste over a non-empty selection replaces the selection with the register contents.
+    #[test]
+    fn paste_over_selection_replaces() {
+        let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
+        // Pre-load register with "XY" via copy from another editor.
+        let mut src = Editor::new_from_text("XY\n", None, (80, 24));
+        src.document.selection = Selection {
+            ranges: [wordcartel_core::selection::Range { anchor: 0, head: 2 }]
+                .into_iter()
+                .collect(),
+            primary: 0,
+        };
+        derive::rebuild(&mut src);
+        run(Command::Copy, &mut src, &TestClock(0));
+        // Copy the register reference into `e`.
+        e.register = src.register;
+
+        // Set non-empty selection anchor=1 head=3 (selects "bc")
+        e.document.selection = Selection {
+            ranges: [wordcartel_core::selection::Range { anchor: 1, head: 3 }]
+                .into_iter()
+                .collect(),
+            primary: 0,
+        };
+        derive::rebuild(&mut e);
+        let clk = TestClock(0);
+        let result = run(Command::Paste, &mut e, &clk);
+        assert_eq!(result, CommandResult::Handled);
+        assert_eq!(e.document.buffer.to_string(), "aXYd\n", "Paste must replace the selection");
+        assert_eq!(nav::head(&e), 3, "caret must be after the pasted text");
+    }
+
+    /// DeleteForward with a non-empty selection deletes the selection range,
+    /// caret lands at selection.from().
+    #[test]
+    fn delete_forward_deletes_selection() {
+        let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
+        e.document.selection = Selection {
+            ranges: [wordcartel_core::selection::Range { anchor: 1, head: 3 }]
+                .into_iter()
+                .collect(),
+            primary: 0,
+        };
+        derive::rebuild(&mut e);
+        let clk = TestClock(0);
+        let result = run(Command::DeleteForward, &mut e, &clk);
+        assert_eq!(result, CommandResult::Handled);
+        assert_eq!(e.document.buffer.to_string(), "ad\n", "DeleteForward must delete the selection");
+        assert_eq!(nav::head(&e), 1, "caret must be at selection.from()");
+    }
+
+    /// DeleteForward with a collapsed selection still deletes one grapheme forward.
+    #[test]
+    fn delete_forward_collapsed_still_deletes_one_char() {
+        let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
+        e.document.selection = Selection::single(1);
+        derive::rebuild(&mut e);
+        let clk = TestClock(0);
+        let result = run(Command::DeleteForward, &mut e, &clk);
+        assert_eq!(result, CommandResult::Handled);
+        assert_eq!(e.document.buffer.to_string(), "acd\n");
+        assert_eq!(nav::head(&e), 1);
     }
 
     /// In SourceHighlighted mode, an INACTIVE heading line shows raw "# Title"
