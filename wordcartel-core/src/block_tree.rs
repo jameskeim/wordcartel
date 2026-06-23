@@ -1089,6 +1089,15 @@ mod tests {
         check_textsource_agree("a\u{0085}b"); // NEL: not a line break
         check_textsource_agree("a\u{2028}b"); // LS: not a line break
         check_textsource_agree("a\u{2029}b"); // PS: not a line break
+
+        // Multi-chunk: ropey chunks are ~1 KiB, so this >1 KiB string forces the
+        // rope line_start/line_end chunk-crossing loops to execute (the small
+        // cases above all fit in one chunk and never exercise that path).
+        let multi_chunk = format!("{}\n{}", "a".repeat(600), "b".repeat(600)); // 1201 bytes, '\n' at byte 600
+        check_textsource_agree(&multi_chunk);
+        // Pin the exact boundary the chunk-crossing scan must find:
+        for p in 0..=600 { assert_eq!((&multi_chunk.as_str()).line_end(p), 601, "line_end({p})"); }
+        for p in 601..=1201 { assert_eq!((&ropey::Rope::from_str(&multi_chunk)).line_start(p), 601, "line_start({p})"); }
     }
 
     /// Extra assertions for the non-LF separator cases: prove that line_start
