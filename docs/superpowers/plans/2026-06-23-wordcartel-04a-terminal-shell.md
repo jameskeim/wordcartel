@@ -8,6 +8,20 @@
 
 **Tech Stack:** Rust 2021; `ratatui` + `crossterm` (rendering/terminal, §3.8); `wordcartel-core` (path dep); `thiserror` (error enums, §15.3). Headless-testable via ratatui `TestBackend` + pure state-transition tests.
 
+> **PENDING REVISIONS — apply before executing 4a (from the Codex red-team 2026-06-23).**
+> This plan was written before **Effort 3c (block_tree rope integration)** was inserted ahead of it. When revising 4a to execute, fold in ALL of these:
+> 1. **(C2/C3 — decided: rope-aware first)** Task 3 `derive::rebuild` must NOT `full_parse(&buffer.to_string())` per keystroke. After 3c lands, `apply` takes an **O(1) rope snapshot** (`buffer.snapshot()`) BEFORE mutating; `derive` calls `block_tree::incremental_update_rope(&old_blocks, &old_rope, &edit, &new_rope)` (materializes only the edited region → O(visible)+O(edited), §3.9). Thread the `block_tree::Edit` + pre-edit rope through `apply`. Initial load uses `full_parse_rope(&rope)` once.
+> 2. **(C1)** `History::new()` does not exist → use `History::default()`.
+> 3. **(C4)** Caret offset = `selection.primary().head` (the moving end), NOT `.to()/.from()` (those are normalized bounds — reversed selections break). Use `from()/to()` only for copy/delete range bounds. `Range { anchor, head }` fields are public → in Task 9 construct directly; drop the "add `Range::new`" hedge.
+> 4. **(C5)** Task 11/12 open: distinguish *new-file* (not found / no path) from **Binary/non-UTF-8 refusal** (don't open; show error; start an UNNAMED empty buffer — never attach the rejected path), permission, and is-a-directory errors.
+> 5. **(I7)** `desired_col: Option<usize>`; compute it from the current `ColMap` column on the FIRST vertical move (don't seed it in tests).
+> 6. **(I8)** Specify + test logical-line edge cases: clamp `line_start(L)` for `L == total_lines`; tests for `""`, `"a"`, `"a\n"`, `"\n"`, `"é\nz\n"`; pin whether `eol`/`line_to_byte` include the `\n`.
+> 7. **(I9/I10)** Task 11: `atomic.rs` only does temp/write/fsync/rename/dir-fsync — Task 11 must ADD preflight `symlink_metadata` refusal, skip-unchanged read+compare, and mode preservation around it; return `SaveOutcome::{Saved, Unchanged}` and assert on that (not mtime).
+> 8. **(I11 — §15.6)** Terminal-too-small handling IS in 4a: render/derive clamp width/height + a "window too small" notice; `TestBackend` cases at `1x1`, `2x1`, 0-height area.
+> 9. **(I13/§13.2)** Don't over-claim render accessibility: 4a uses modifier styling (BOLD/ITALIC/UNDERLINE/CROSSED_OUT — non-color for most distinctions); a full no-color/high-contrast toggle is Effort 5. Code/Link still lean on color — note it.
+> 10. **(§15.7 wording)** Self-Review should say §15 is split across 4a (terminal restore, atomic save, open/save errors) + 4b (swap file, emergency dump) — both v1 — not "§15 ✅ in 4a".
+> 11. **(MINOR)** Reuse table: `incremental_update` signature is `(&BlockTree, &str, &Edit, &str) -> BlockTree` (will become the rope-typed variant after 3c).
+
 ## Global Constraints
 
 - New crate `wordcartel` (binary name `wcartel`); cargo **workspace** with `wordcartel-core`. `#![forbid(unsafe_code)]` in the new crate too.
