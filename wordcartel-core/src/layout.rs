@@ -25,6 +25,18 @@ pub struct Placed {
     pub style: crate::style::Style,
 }
 
+/// A contiguous run of same-style cells on a visual row.
+///
+/// A terminal renderer can emit one SGR span per `StyledSeg`.
+/// `text` is the display text (tabs expanded to spaces, matching `VisualRow::display`).
+/// `width` is the sum of display widths of the graphemes in this segment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StyledSeg {
+    pub text: String,
+    pub style: crate::style::Style,
+    pub width: usize,
+}
+
 /// A single visual (soft-wrapped) row, ready to be drawn.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VisualRow {
@@ -34,6 +46,8 @@ pub struct VisualRow {
     pub width: usize,
     /// Source byte range covered by the *visible* content of this row.
     pub src_span: Range<usize>,
+    /// Contiguous runs of same-style cells (concatenation of seg texts == display).
+    pub segs: Vec<StyledSeg>,
 }
 
 /// Maps between source byte offsets and visual `(row, col)` positions.
@@ -238,11 +252,16 @@ pub fn layout(
     let rows = row + 1;
 
     let mut visual_rows: Vec<VisualRow> =
-        vec![VisualRow { display: String::new(), width: 0, src_span: 0..0 }; rows];
+        vec![VisualRow { display: String::new(), width: 0, src_span: 0..0, segs: Vec::new() }; rows];
     let mut row_min: Vec<Option<usize>> = vec![None; rows];
     let mut row_max: Vec<Option<usize>> = vec![None; rows];
     for p in &placed {
         let vr = &mut visual_rows[p.row];
+        let seg_text = if p.text == "\t" {
+            " ".repeat(TAB_WIDTH)
+        } else {
+            p.text.clone()
+        };
         if p.text == "\t" {
             vr.display.push_str(&" ".repeat(TAB_WIDTH));
         } else {
@@ -251,6 +270,16 @@ pub fn layout(
         vr.width += p.width;
         row_min[p.row] = Some(row_min[p.row].map_or(p.src.start, |m: usize| m.min(p.src.start)));
         row_max[p.row] = Some(row_max[p.row].map_or(p.src.end, |m: usize| m.max(p.src.end)));
+        // Accumulate styled segments: extend the last seg if same style, else start a new one.
+        match vr.segs.last_mut() {
+            Some(seg) if seg.style == p.style => {
+                seg.text.push_str(&seg_text);
+                seg.width += p.width;
+            }
+            _ => {
+                vr.segs.push(StyledSeg { text: seg_text, style: p.style, width: p.width });
+            }
+        }
     }
     for r in 0..rows {
         if let (Some(a), Some(b)) = (row_min[r], row_max[r]) {
@@ -509,6 +538,18 @@ mod tests {
         let e = move_end(&map, cur);
         assert!(map.is_cursor_stop(e.offset));
     }
+    #[test]
+    fn styled_segments_split_by_style() {
+        // "a **b**" inactive -> visible "a b": 'a',' ' Plain then 'b' Strong.
+        let (rows, _map) = layout("a **b**", BlockRole::Paragraph, false, 80);
+        let segs = &rows[0].segs;
+        assert_eq!(segs.last().unwrap().style, Style::Strong);
+        assert_eq!(segs.last().unwrap().text, "b");
+        // concatenated segs equal display
+        let joined: String = segs.iter().map(|s| s.text.clone()).collect();
+        assert_eq!(joined, rows[0].display);
+    }
+
     #[test]
     fn down_then_up_preserves_desired_col() {
         // "aaaaa" width 3 -> rows ["aaa","aa"]. start at col 2 row 0, down then up.
