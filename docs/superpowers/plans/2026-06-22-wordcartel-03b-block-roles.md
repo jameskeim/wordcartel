@@ -62,7 +62,11 @@ fn full_parse_captures_heading_level() {
 
 **Interfaces — Produces:** `pub fn role_at(&self, byte: usize) -> crate::style::BlockRole` on `BlockTree`.
 
-**Semantics:** Walk the tree; among all blocks whose `span` contains `byte`, pick the role by this precedence (most specific block-level construct on that line wins): `FencedCode|IndentedCode → CodeBlock`; `Heading(n) → Heading(n)`; `ThematicBreak → ThematicBreak`; `ListItem → ListItem`; `BlockQuote → BlockQuote`; else `Paragraph`. (HtmlBlock/Table/Other/FrontMatter → `Paragraph` for v1 — their text renders as-is.) Bytes past document end → `Paragraph`.
+**Semantics:** Walk the tree; among all blocks whose `span` **contains** `byte`, pick the role by this precedence (most specific block-level construct wins): `FencedCode|IndentedCode → CodeBlock`; `Heading(n) → Heading(n)`; `ThematicBreak → ThematicBreak`; `ListItem → ListItem`; `BlockQuote → BlockQuote`; else `Paragraph`. (HtmlBlock/Table/Other/FrontMatter → `Paragraph` for v1 — their text renders as-is.)
+
+**Important clarifications (Codex review):**
+- **Gaps don't tile the document.** Block spans are sparse — blank lines, trailing whitespace, and link-ref-def lines belong to NO block. A `byte` in a gap (or past EOF) is contained by no block → return **`Paragraph`** (the safe default; such lines have no prefix to conceal). Test the gap/boundary bytes explicitly.
+- **Line-start query is the editor's usage, and it resolves to the OUTERMOST containing block for nested constructs.** The editor calls `role_at(line_start_byte)`. For a **top-level** construct (the v1 scope), the line-start byte is inside that block's span, so this is correct. For a **nested** construct queried at the line's first byte (e.g. `> # H` at byte 0), only the *container's* span (BlockQuote) contains byte 0 — the nested Heading span starts after `> ` — so `role_at` returns `BlockQuote`. **This is the accepted v1 behavior** (deep-nested prefix stacking is deferred): such a line renders with the outer container's role. The precedence above only changes the result when the queried byte is genuinely inside *both* spans (i.e. at the heading's content bytes).
 
 - [ ] **Step 1: Write failing tests:**
 ```rust
@@ -80,6 +84,17 @@ fn role_at_classifies_blocks() {
     assert_eq!(role("---"), ThematicBreak);
     assert_eq!(role("para"), Paragraph);
 }
+
+#[test]
+fn role_at_gaps_and_boundaries_are_paragraph() {
+    let doc = "# H\n\npara\n";
+    let t = full_parse(doc);
+    use crate::style::BlockRole::*;
+    // the blank line (byte 4, the second '\n') is in a gap -> Paragraph
+    assert_eq!(t.role_at(4), Paragraph);
+    // a byte past document end -> Paragraph
+    assert_eq!(t.role_at(doc.len() + 5), Paragraph);
+}
 ```
 - [ ] **Step 2:** Run → FAIL (no `role_at`).
 - [ ] **Step 3: Implement** `role_at`: collect blocks containing `byte` (recursive walk over `top_level()` and `children`), reduce by the precedence above, map `BlockKind` → `BlockRole` (Heading(n)→Heading(n), etc.), default `Paragraph`.
@@ -92,17 +107,19 @@ fn role_at_classifies_blocks() {
 
 **Files:** `src/md_parse.rs`.
 
-**Interfaces:** `analyze(line, role, is_active)` — when `!is_active`, after the existing inline conceal/style, additionally conceal the **block prefix** the `role` implies, and (for lists) emit a bullet glyph. `LineAnalysis` gains nothing new here (conceal via the existing `runs`); a list bullet is represented by a new optional field `pub prefix_glyph: Option<String>` on `LineAnalysis` (e.g. `Some("• ".into())`) that the renderer prepends. Heading/quote/code-fence just conceal their prefix bytes.
+**Interfaces:** `analyze(line, role, is_active)` — when `!is_active`, additionally conceal the **block prefix** the `role` implies, and (for lists) emit a bullet glyph. `LineAnalysis` gains a new field `pub prefix_glyph: Option<String>` (e.g. `Some("• ".into())`) that the renderer prepends; the prefix concealment itself uses the existing per-byte `visible` grid.
+
+**CONCEAL ORDERING (important — Codex review):** the block-prefix concealment must run **AFTER** the existing inline conceal + reveal + escape passes (so a heading's `#` cannot be re-revealed by the inline reveal pass), i.e. set the block-prefix bytes `visible = false` as the LAST mutation of the grid, immediately **before** `collapse_runs`. This composes with inline styling: `## **bold**` → the `## ` prefix is hidden AND the `**` is hidden, leaving `bold` with `Style::Strong`.
 
 **Prefix rules (apply only when `!is_active`):**
-- `Heading(_)`: conceal leading optional indent + `#{1,6}` + the single following space (the ATX marker). Visible content = the heading text.
+- `Heading(_)`: if the line starts (after optional indent) with `#{1,6}` followed by a space → conceal that ATX marker (visible = the heading text). **Setext support:** else if the line is a setext **underline** (matches `^\s*[=-]+\s*$`) → conceal the whole line (it's the `===`/`---` under a setext heading; `role_at` returns `Heading` for it because it is inside the heading block). Else (a setext heading *text* line — no `#`, not an underline) → conceal nothing; the text shows, styled as a heading via the row role (Task 4).
 - `BlockQuote`: conceal one leading `>` and an optional following space (v1: one level only — see scope note).
 - `ListItem`: conceal the leading marker — `[-*+] ` (unordered) or `\d+[.)] ` (ordered) — and set `prefix_glyph = Some("• ".to_string())` for unordered, or the ordinal text (e.g. `"1. "`) for ordered. (Hanging indent deferred.)
 - `CodeBlock`: if the line is a fence (`^\s*(```|~~~)`), conceal the whole fence line; otherwise leave content visible (the renderer styles it via the row role).
 - `ThematicBreak`: conceal the whole line (the renderer draws a rule from the row role — Task 4); set `prefix_glyph = None`.
 - `Paragraph` / others: no prefix conceal.
 
-Implement by scanning the line's leading bytes for the role's prefix (regex-free byte scanning) and marking those bytes `visible = false` in the same grid the inline pass uses, BEFORE collapsing to runs. The block prefix bytes are ASCII, so concealment is char-boundary-safe.
+Implement by scanning the line's leading bytes for the role's prefix (regex-free byte scanning; the matches above are simple byte patterns). The block-prefix bytes are ASCII, so concealment is char-boundary-safe.
 
 - [ ] **Step 1: Write failing tests** (add `prefix_glyph` to the analysis type usage):
 ```rust
@@ -133,10 +150,32 @@ fn active_line_keeps_block_prefix_raw() {
     assert_eq!(visible(&a, "## Title"), "## Title"); // raw on cursor line
     assert!(a.prefix_glyph.is_none());
 }
+#[test]
+fn heading_prefix_composes_with_inline_style() {
+    // "## **bold**" -> "## " AND "**" hidden, leaving "bold" as Strong.
+    let line = "## **bold**";
+    let a = analyze(line, BlockRole::Heading(2), false);
+    assert_eq!(visible(&a, line), "bold");
+    // 'b' is at byte 5 in "## **bold**"
+    assert_eq!(style_at(&a, 5), Some(Style::Strong));
+}
+#[test]
+fn list_marker_composes_with_inline_style() {
+    let line = "- **item**";
+    let a = analyze(line, BlockRole::ListItem, false);
+    assert_eq!(visible(&a, line), "item");
+    assert_eq!(a.prefix_glyph.as_deref(), Some("• "));
+}
+#[test]
+fn setext_underline_concealed() {
+    // role_at returns Heading for the underline line; conceal the whole "---".
+    let a = analyze("---", BlockRole::Heading(1), false);
+    assert_eq!(visible(&a, "---"), "");
+}
 ```
-(`visible` is the existing test helper.)
+(`visible` and `style_at` are the existing test helpers in `md_parse`'s test module.)
 - [ ] **Step 2:** Run `cargo test ... md_parse` → FAIL.
-- [ ] **Step 3:** Add `pub prefix_glyph: Option<String>` to `LineAnalysis` (default `None`; update its constructors and the existing `LineAnalysis { .. }` literals). Implement the role-driven prefix conceal + glyph per the rules above. The active-line early return sets `prefix_glyph: None` and conceals nothing.
+- [ ] **Step 3:** Add `pub prefix_glyph: Option<String>` to `LineAnalysis` in `style.rs`, then update **every** `LineAnalysis { .. }` construction site so it compiles: md_parse's active-line early return (set `prefix_glyph: None`), md_parse's normal return (set the computed glyph), and the `style.rs` `types_construct` test literal. Implement the role-driven prefix conceal + glyph per the rules above (apply the prefix conceal as the LAST grid mutation before `collapse_runs`, per CONCEAL ORDERING). The active-line early return conceals nothing and sets `prefix_glyph: None`.
 - [ ] **Step 4:** Run → PASS. Re-run the full `md_parse` + `layout` suites (the new field must not break existing tests / the 6 layout property laws — `layout` reads `analysis.runs`/`styles`, unaffected by `prefix_glyph`).
 - [ ] **Step 5:** Commit: `feat(core): md_parse role-driven block-prefix conceal + bullet glyph`
 
@@ -163,7 +202,7 @@ fn heading_rows_carry_heading_role() {
 }
 ```
 - [ ] **Step 2:** Run `cargo test ... layout` → FAIL.
-- [ ] **Step 3:** Add `role: BlockRole` (default by deriving from the `layout` arg) and `prefix_glyph: Option<String>` fields to `VisualRow` (derive Clone/Debug/PartialEq/Eq). In `layout`, set every produced row's `role = role`; set `rows[0].prefix_glyph = analysis.prefix_glyph` (first row only), the rest `None`. Keep all soft-wrap/ColMap/segs logic unchanged.
+- [ ] **Step 3:** Add `role: BlockRole` and `prefix_glyph: Option<String>` fields to `VisualRow` (keep its `#[derive(Clone, Debug, PartialEq, Eq)]`). There is a single `VisualRow` construction site — the `vec![VisualRow { … }; rows]` initializer in `layout` — update it to initialize both fields (`role`, `prefix_glyph: None`). After the rows are assembled, set every row's `role = role` and `rows[0].prefix_glyph = analysis.prefix_glyph` (first row only). Keep all soft-wrap/ColMap/segs logic unchanged. (Existing layout tests inspect `display`/`width`/`segs`, not full `VisualRow` equality, so they keep compiling; the 6 property laws use `BlockRole::Paragraph` and don't read the new fields.)
 - [ ] **Step 4:** Run → PASS; re-run the full `layout` suite incl. the 6 property laws (they don't inspect `role`/`prefix_glyph`, so they remain green; the `VisualRow` `PartialEq` change just adds fields).
 - [ ] **Step 5:** Commit: `feat(core): VisualRow carries block role + prefix glyph`
 
@@ -201,7 +240,7 @@ fn multi_block_doc_renders_with_roles() {
         }
         offset += line.len();
     }
-    // Title heading: "## " concealed -> "Title", role Heading(1)
+    // Title heading: "# " concealed -> "Title", role Heading(1)
     assert_eq!(got[0], (BlockRole::Heading(1), "Title".into(), None));
     // quote: "> " concealed
     assert_eq!(got[1], (BlockRole::BlockQuote, "a quote".into(), None));
