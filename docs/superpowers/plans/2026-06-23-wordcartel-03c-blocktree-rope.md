@@ -2,7 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make `block_tree` reparse from a **text source that can be a `ropey::Rope`**, materializing only the **edited region** per incremental update, so the terminal shell's per-keystroke derive is O(visible)+O(edited) — not O(document) — honoring §3.9. The pure-string API stays for the oracle and existing callers.
+**Goal:** Make `block_tree` reparse from a **text source that can be a `ropey::Rope`**, materializing only the **edited region** per incremental update — eliminating the per-keystroke O(byte-count) full reparse and full `to_string()` that an `&str`-only API forces on a rope buffer — so the terminal shell's per-keystroke derive is dominated by O(region) work instead of O(document), honoring §3.9. The pure-string API stays for the oracle and existing callers.
+
+> **Scope note (performance, per Codex red-team):** this effort removes the O(*byte-count*) costs (full reparse + whole-doc `to_string`). The incremental algorithm's **structural** work — walking the top-level block list for overlap search / context-repair / slack lookup / splice — remains **O(block-count)** (the pre-existing absolute-span design; relative-span O(1) shift is explicitly deferred, see Effort 3a). Block-count ≪ byte-count (thousands of blocks at 5 MB → sub-millisecond), so this is within the §3.9 budget and is NOT widened here. The claim is "O(region) **text materialization** + O(block-count) structural," not "O(region) total."
 
 **Architecture:** Introduce a `TextSource` trait (random byte access + region slice + `\n`-line boundaries), implement it for `&str` (today's behavior, zero-cost) and `&ropey::Rope` (region slices via `byte_slice(..).to_string()`, O(region); line boundaries via the rope's line index). Thread `TextSource` through `full_parse`, `incremental_update`, and every text-indexing helper. The existing **incremental == full oracle is the merge gate**, extended to run the entire corpus through BOTH a `&str` source and a `&Rope` source and to assert the two paths agree.
 
@@ -13,8 +15,8 @@
 - Crate `wordcartel-core`; `#![forbid(unsafe_code)]`; pure/headless.
 - Canonical position = **byte offset** (`usize`); spans absolute.
 - **Behavior-preserving:** the `&str` path must produce byte-identical `BlockTree`s to today (all current block_tree unit tests + the oracle stay green unchanged). The `&Rope` path must produce identical trees to the `&str` path for the same content.
-- **Line-boundary semantics must match exactly.** Today's `line_start`/`line_end` split on `\n` only (scanning bytes). The `Rope` impl MUST reproduce the same `\n`-only boundaries — do NOT silently adopt ropey's default multi-line-break set (LF/CR/CRLF/VT/FF/NEL/LS/PS), which would diverge from the `&str` path and break the oracle. (If you use ropey line APIs, verify they were built with `\n`-only semantics for our text; otherwise scan for `\n`.) The oracle's multibyte/multiline corpus is the gate that catches a mismatch.
-- **Performance intent:** a *local* edit (no widen-to-end) must materialize only O(region) bytes of the new text, and read only O(region + edited-line-length) bytes of old/new via the source — never O(document). The full-fallback paths (HTML, widen-to-end) MAY slice large regions; that's their existing nature and is acceptable (rare).
+- **Line-boundary semantics must match exactly — `\n` ONLY.** Today's `line_start`/`line_end` split on `\n` only. **FORBIDDEN:** ropey's line-index APIs (`byte_to_line`, `line_to_byte`, `Rope::lines`, `len_lines`, …). ropey 1.6.1 ships with the **`unicode_lines` feature ON by default**, so those APIs treat CR, VT (`\x0b`), FF (`\x0c`), NEL (`\u{0085}`), LS (`\u{2028}`), PS (`\u{2029}`) as line breaks — which would diverge from the `&str` path on any such byte and silently break correctness. The `&Rope` `line_start`/`line_end` MUST find the nearest **`\n`** boundary by scanning the rope's bytes/chunks directly (see Task 1). This is a CORRECTNESS gate, not a perf nicety.
+- **Performance intent (text materialization only — see Goal scope note):** a *local* edit (no widen-to-end) must **materialize** only O(region) bytes of the new text and scan only O(region + edited-line-length) bytes via the source — never `to_string()` the whole document and never `full_parse` it. Structural block-list work stays O(block-count) (accepted). The full-fallback paths (HTML, widen-to-end) MAY slice large regions; that's their existing nature and is acceptable (rare).
 - The oracle MUST NOT be weakened. If a counterexample appears, the refactor diverged from the validated algorithm — fix the refactor.
 - TDD; pristine output; commit `proptest-regressions/` seeds.
 
@@ -53,11 +55,12 @@ pub trait TextSource {
     fn line_end(&self, pos: usize) -> usize;
 }
 impl TextSource for &str { /* slice = Cow::Borrowed(&self[range]); line_start/end scan bytes for '\n' (PORT today's free fns verbatim) */ }
-impl TextSource for &ropey::Rope { /* slice = Cow::Owned(self.byte_slice(range).to_string()); line_start/end find the nearest '\n' boundaries */ }
+impl TextSource for &ropey::Rope { /* slice = Cow::Owned(self.byte_slice(range).to_string()); line_start/end = LF-only chunk scan (below) */ }
 ```
-The `&str` `line_start`/`line_end` bodies are EXACTLY today's free `line_start`/`line_end` functions (UTF-8-safe byte scan — preserve the 3a fix). The `&Rope` impl must yield identical results (same `\n`-only boundaries) — implement by scanning for `\n` via the rope (e.g. `rope.bytes_at(pos)` forward / a reverse scan), or via the rope line index ONLY if verified `\n`-equivalent for the test corpus.
+- The `&str` `line_start`/`line_end` bodies are EXACTLY today's free `line_start`/`line_end` functions (UTF-8-safe byte scan — preserve the 3a fix).
+- The `&Rope` `line_start(pos)`: starting from `pos` (clamped to `len`), walk the rope **backward by chunk** using `Rope::chunk_at_byte` (returns `(chunk: &str, chunk_byte_idx, ..)`); within each chunk search the bytes for the last `\n` at/below the current position (manual reverse byte scan or `memchr`-style; a manual `rposition` over `chunk.as_bytes()` is fine — no new dep). Return one past that `\n`, or `0` if none. `line_end(pos)`: walk forward by chunk searching for the first `\n` at/after `pos`; return its index, or `len` if none. This is O(line-chunk-traversal) — bounded by the logical line length, NOT the document. **Do NOT call ropey's `byte_to_line`/`line_to_byte`/`lines`** (Unicode-line-break default — see Global Constraints).
 
-- [ ] **Step 1: Write failing tests** — for a set of strings (ASCII, multibyte `中`/`🙂`, multiple lines, no trailing newline, empty), build both `s: &str` and `Rope::from_str(s)`, and assert: `src.len()` equal; `src.slice(a..b)` equal for several ranges incl. line-aligned and multibyte-content ranges; `src.line_start(p)` and `src.line_end(p)` equal across many `p` (including line starts, mid-line, on a `\n`, at `len()`).
+- [ ] **Step 1: Write failing tests** — for a set of strings, build both `s: &str` and `Rope::from_str(s)`, and assert: `src.len()` equal; `src.slice(a..b)` equal for several ranges incl. line-aligned and multibyte-content ranges; `src.line_start(p)` and `src.line_end(p)` equal across ALL `p in 0..=s.len()`. The corpus MUST include the **non-LF separator hazard cases** (these are exactly where ropey's Unicode-line default would diverge): `"a\rb"`, `"a\r\nb"`, `"a\x0bb"`, `"a\x0cb"`, `"a\u{0085}b"`, `"a\u{2028}b"`, `"a\u{2029}b"`, alongside ASCII (`"ab\ncd\n"`), multibyte (`"# 中\n\n🙂 x\nyy"`), no-trailing-newline, and empty (`""`). For each, the `&str` and `&Rope` `line_start`/`line_end` MUST agree at every `p` (proving the rope impl treats only `\n` as a break — a CR/FF/LS inside `"a\rb"` must NOT start a new line).
 ```rust
 #[test]
 fn textsource_str_and_rope_agree() {
@@ -84,7 +87,7 @@ fn textsource_str_and_rope_agree() {
 
 - [ ] **Step 1: Write failing test:** `full_parse_src(&Rope::from_str(s)) == full_parse(s)` for a handful of representative docs (heading+para, fenced code w/ blanks, nested list, blockquote, table, ref-def, multibyte).
 - [ ] **Step 2:** Run → FAIL (no `full_parse_src`).
-- [ ] **Step 3:** Refactor. `full_parse` slices the whole `src` once (O(doc), as today, on load). Keep span math identical.
+- [ ] **Step 3:** Refactor. `full_parse` slices the whole `src` once (O(doc), as today, on load). Keep span math identical. **Cow lifetime pattern** (to avoid temporaries — bind the slice before parsing): `let text = src.slice(region); let parser = pulldown_cmark::Parser::new_ext(text.as_ref(), options());` — `text` (a `Cow<str>`) outlives the parser borrow.
 - [ ] **Step 4:** Run → PASS; confirm ALL existing block_tree unit tests + the oracle still pass unchanged (the `&str` path is behavior-identical).
 - [ ] **Step 5:** Commit: `refactor(block_tree): full_parse over TextSource (str path unchanged)`
 
@@ -94,12 +97,16 @@ fn textsource_str_and_rope_agree() {
 
 **Files:** `wordcartel-core/src/block_tree.rs`.
 
-**Interfaces — Produces:** the text-indexing private helpers take `&S: TextSource` and replace every `&text[a..b]` with `src.slice(a..b)` and every `line_start(text, p)`/`line_end(text, p)` call with `src.line_start(p)`/`src.line_end(p)`: `needs_widen_to_end`, `html_in_play`, `edit_touches_fence_line`, `contains_ref_def`/`is_ref_def_line` (these take a line `&str` — feed them `&src.slice(line_range)`), `blank_delimited_group_start`, and the absorptive-branch gap slice (`&old_text[gap_lo..gap_hi]` → `old_src.slice(gap_lo..gap_hi)`). The free `line_start`/`line_end` functions are removed (their logic now lives in the `&str` `TextSource` impl from Task 1).
+**Interfaces — Produces:** the text-indexing private helpers take `&S: TextSource` and replace every `&text[a..b]` with `src.slice(a..b)` and every `line_start(text, p)`/`line_end(text, p)` call with `src.line_start(p)`/`src.line_end(p)`: `needs_widen_to_end`, `html_in_play`, `edit_touches_fence_line`, `blank_delimited_group_start`, and the absorptive-branch gap slice (`&old_text[gap_lo..gap_hi]` → `old_src.slice(gap_lo..gap_hi)`).
 
-- [ ] **Step 1: Write failing tests** — none new yet; this task is covered by re-running the existing oracle after the refactor (Step 3). (If the crate won't compile mid-refactor, that's expected until all helpers are converted.)
-- [ ] **Step 2:** (skip — compile-driven)
-- [ ] **Step 3:** Convert each helper. Keep each function's logic byte-identical; only the text-access changes. Build clean.
-- [ ] **Step 4:** Run the FULL block_tree oracle (`cargo test -p wordcartel-core --test block_tree_oracle`) and unit tests → all PASS unchanged (the `&str` path is still exercised via `incremental_update(&str)`, which Task 4 rewires; until then, keep `incremental_update` calling the helpers with `&old_text`/`&new_text` as `&str` sources so the suite stays green at each commit).
+**Two classes of helper — do NOT over-convert:**
+- **Region-slice-only helpers stay `&str`** (they already receive a small materialized line/region, not the whole doc): `contains_ref_def`/`is_ref_def_line`, `fence_marker_count`, `html_opener_count`. Leave their signatures as `&str`; the converted callers feed them `src.slice(line_range).as_ref()` (a `&str` of a small slice). These never touch the whole document, so converting them to `TextSource` adds nothing.
+- **Compile-boundary rule (Codex):** do NOT remove the free `line_start(&str, p)` / `line_end(&str, p)` functions in this task — `incremental_update_instrumented` still calls them and is not converted until Task 4. Keep them as thin `&str` wrappers (`fn line_start(t: &str, p: usize) -> usize { TextSource::line_start(&t, p) }`) so the crate compiles and the suite stays green at THIS task's commit. **Task 4 removes the free wrappers** once `incremental_update_instrumented` is converted.
+
+- [ ] **Step 1: Write failing tests** — none new; covered by re-running the existing oracle after the refactor (Step 3).
+- [ ] **Step 2:** (skip — compile-driven; the crate MUST still compile at this commit, per the compile-boundary rule above.)
+- [ ] **Step 3:** Convert each `TextSource`-class helper; keep region-slice-only helpers `&str`; keep the free `line_start`/`line_end` `&str` wrappers. Keep every function's logic byte-identical; only text-access changes. Build clean.
+- [ ] **Step 4:** Run the FULL block_tree oracle (`cargo test -p wordcartel-core --test block_tree_oracle`) and unit tests → all PASS unchanged (the `&str` path is still exercised; `incremental_update` is rewired in Task 4).
 - [ ] **Step 5:** Commit: `refactor(block_tree): incremental helpers over TextSource`
 
 ---
@@ -120,7 +127,7 @@ pub fn full_parse_rope(rope: &ropey::Rope) -> BlockTree { full_parse_src(&rope) 
 pub fn incremental_update_rope(old_tree: &BlockTree, old_rope: &ropey::Rope, edit: &Edit, new_rope: &ropey::Rope) -> BlockTree
     { incremental_update_src(old_tree, &old_rope, edit, &new_rope) }
 ```
-The body of `incremental_update_instrumented_src` is today's `incremental_update_instrumented` with every `old_text`/`new_text` index/slice/`.len()` routed through `old_src`/`new_src` (`.len()` → `src.len()`, `&new_text[region]` → `new_src.slice(region)`, etc.). The final `Block { kind: Document, span: 0..new_src.len(), .. }`.
+The body of `incremental_update_instrumented_src` is today's `incremental_update_instrumented` with every `old_text`/`new_text` index/slice/`.len()`/`line_start`/`line_end` routed through `old_src`/`new_src`. Codex-flagged whole-doc sites that THIS task must convert (they live in this function, not Task 3): the HTML full-fallback `full_parse(new_text)` → `full_parse_src(new_src)`; the region slice `&new_text[region_new_start..region_new_end]` → `new_src.slice(region_new_start..region_new_end)`; the root `Block { kind: Document, span: 0..new_text.len(), .. }` → `0..new_src.len()`; and all `old_text.len()`/`new_text.len()` → `old_src.len()`/`new_src.len()`. **Now remove the free `line_start`/`line_end` `&str` wrappers** kept in Task 3 (this function was their last caller) — or keep them only if still referenced by a region-slice-only helper; confirm by compiling.
 
 - [ ] **Step 1: Write failing test:** `incremental_update_rope` equals `full_parse_rope(new)` on a representative local edit, and equals the `&str` path:
 ```rust
@@ -158,9 +165,28 @@ fn assert_all_paths_agree(old: &str, edit: &Edit, new: &str) {
     prop_assert_eq!(&rope_inc, &str_inc); // and identical to str path
 }
 ```
-Route the existing oracle proptests (and ~3 named hazard regressions, incl. the CE1 table + CE2 list cases and a multibyte case) through `assert_all_paths_agree`.
+For the **multi-edit-chain** proptests (`oracle_multi_edit_chain`, `oracle_mb_multi_edit_chain`), `assert_all_paths_agree` (single-edit, rebuilds `old_tree` each call) is NOT sufficient — it drops the invariant that a *spliced* tree is valid input to the next edit. Add a chain helper that carries BOTH spliced trees forward:
+```rust
+fn assert_chain_paths_agree(initial: &str, edits: &[(Edit, String)]) { // (edit, new_text) per step
+    let mut text = initial.to_string();
+    let mut str_tree = full_parse(initial);
+    let mut rope_tree = full_parse_rope(&Rope::from_str(initial));
+    for (edit, new_text) in edits {
+        let new_str_tree  = incremental_update(&str_tree, &text, edit, new_text);
+        let new_rope_tree = incremental_update_rope(&rope_tree, &Rope::from_str(&text), edit, &Rope::from_str(new_text));
+        let full = full_parse(new_text);
+        prop_assert_eq!(&new_str_tree, &full);
+        prop_assert_eq!(&new_rope_tree, &full);
+        prop_assert_eq!(&new_rope_tree, &new_str_tree);
+        str_tree = new_str_tree; rope_tree = new_rope_tree; text = new_text.clone();
+    }
+}
+```
+Route single-edit proptests + hazard regressions (incl. CE1 table, CE2 list, a multibyte case) through `assert_all_paths_agree`, and the chain proptests through `assert_chain_paths_agree`.
 
-- [ ] **Step 1:** Add the helper + route the proptests/regressions through it. Run `cargo test -p wordcartel-core --test block_tree_oracle` at the existing case count → must PASS.
+**Separator-byte deterministic regressions (Codex must-fix):** add explicit `#[test]`s that edit around non-LF separators — for `"a\rb\nc"`, `"a\r\nb\nc"`, `"x\x0cy\nz"`, `"p\u{2028}q\nr"`, `"p\u{2029}q\nr"` — applying an edit near the separator and asserting `incremental_update_rope == full_parse_rope == incremental_update(&str) == full_parse(&str)`. These pin that the rope path treats ONLY `\n` as a line break (the existing random corpus does not emit these bytes, so without these the `str==rope` assertion is untested for the exact divergence case).
+
+- [ ] **Step 1:** Add `assert_all_paths_agree` + `assert_chain_paths_agree` + the separator regressions; route the proptests/regressions through them. Run `cargo test -p wordcartel-core --test block_tree_oracle` at the existing case count → must PASS.
 - [ ] **Step 2:** Shake out: run at high counts and multiple seeds: `for i in 1 2 3 4 5 6; do PROPTEST_CASES=2500 cargo test -p wordcartel-core --test block_tree_oracle || break; done` → all green. If the rope path diverges, the `&Rope` `line_start`/`line_end` or `slice` doesn't match the `&str` semantics (likely the `\n`-only line-break issue) — fix the impl; do NOT weaken the oracle. Commit any new `proptest-regressions/` seeds.
 - [ ] **Step 3:** Full suite green (`cargo test -p wordcartel-core`), no warnings. Commit: `test(block_tree): oracle covers str==rope==full across the corpus`
 
