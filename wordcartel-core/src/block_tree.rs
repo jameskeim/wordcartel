@@ -422,6 +422,16 @@ pub fn incremental_update_instrumented(
         region_old_end = old_text.len();
     }
 
+    // Gap 3: machine-check the trailing-gap bound. `region_old_end` is now
+    // final; verify it never exceeds the document length before we use it to
+    // compute region_new_end and drive the splice.
+    debug_assert!(
+        region_old_end <= old_text.len(),
+        "region_old_end {} past doc len {}",
+        region_old_end,
+        old_text.len()
+    );
+
     debug_assert!(region_old_start <= edit_lo);
     debug_assert!(region_old_end >= edit_hi);
 

@@ -402,4 +402,100 @@ proptest! {
         prop_assert_eq!(inc, full,
             "\nmultibyte oracle mismatch\nold={:?}\nnew={:?}", doc, new_text);
     }
+
+}
+
+// ---------------------------------------------------------------------------
+// Gap 1: multibyte × multi-edit chain
+// Separate proptest block so we can use a distinct case count (~256).
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 256,
+        max_shrink_iters: 4000,
+        .. ProptestConfig::default()
+    })]
+
+    /// Test C — multibyte multi-edit chain (Gap 1).
+    ///
+    /// Combines the multibyte corpus with a chain of 1..8 edits. Proves that
+    /// spliced BlockTrees produced by incremental_update remain correct across
+    /// multiple edits when both the initial document AND each replacement
+    /// contain multibyte graphemes (é/中/🙂). Positions are snapped to char
+    /// boundaries. The result tree of edit N is fed as old_tree of edit N+1,
+    /// and we assert incremental == full_parse at each step.
+    #[test]
+    fn oracle_mb_multi_edit_chain(
+        initial in mb_doc_strategy(),
+        edits in prop::collection::vec(
+            (0u32..1000, 0u32..1000, mb_replacement_strategy()),
+            1..=8,
+        ),
+    ) {
+        let mut text = initial;
+        let mut tree = full_parse(&text);
+
+        for (pa, pb, rep) in edits {
+            let pa = pa as usize;
+            let pb = pb as usize;
+            let lo = snap(&text, pa.min(pb));
+            let hi = snap(&text, pa.max(pb));
+            let (new_text, edit) = apply_edit(&text, lo..hi, &rep);
+            tree = incremental_update(&tree, &text, &edit, &new_text);
+            let full = full_parse(&new_text);
+            prop_assert_eq!(
+                tree.clone(), full,
+                "\nmb multi-edit chain mismatch after applying edit ({}..{}, rep={:?})\ntext_before={:?}\ntext_after={:?}",
+                lo, hi, rep, text, new_text
+            );
+            text = new_text;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gap 2: delete-to-empty hazard regression
+// ---------------------------------------------------------------------------
+
+/// Helper: builds a non-trivial multi-block doc and returns it.
+fn make_multiblock_doc() -> String {
+    // Heading + paragraph + fenced code + another paragraph.
+    "# Title\n\nFirst paragraph with some text.\n\n```\ncode block\n```\n\nSecond paragraph.\n".to_string()
+}
+
+#[test]
+fn hazard_delete_entire_document_to_empty() {
+    let doc = make_multiblock_doc();
+    let len = doc.len();
+    let old_tree = full_parse(&doc);
+    let (new_text, edit) = apply_edit(&doc, 0..len, "");
+    assert_eq!(
+        new_text, "",
+        "replacement should produce empty string"
+    );
+    let inc = incremental_update(&old_tree, &doc, &edit, &new_text);
+    let full = full_parse("");
+    assert_eq!(
+        inc, full,
+        "\ndelete-to-empty: incremental != full\ndoc={:?}\nincremental={:#?}\nfull={:#?}",
+        doc, inc, full
+    );
+}
+
+#[test]
+fn hazard_delete_to_single_char() {
+    let doc = make_multiblock_doc();
+    let len = doc.len();
+    // Keep only the very first byte (ASCII 'h' from "# Title").
+    let old_tree = full_parse(&doc);
+    let (new_text, edit) = apply_edit(&doc, 1..len, "");
+    assert_eq!(new_text.len(), 1, "should be left with one character");
+    let inc = incremental_update(&old_tree, &doc, &edit, &new_text);
+    let full = full_parse(&new_text);
+    assert_eq!(
+        inc, full,
+        "\ndelete-to-single-char: incremental != full\ndoc={:?}\nnew_text={:?}\nincremental={:#?}\nfull={:#?}",
+        doc, new_text, inc, full
+    );
 }
