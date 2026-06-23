@@ -5,7 +5,7 @@
 //! are for copy/delete range bounds (Task 9), not for caret placement.
 
 use crate::derive;
-use crate::editor::Editor;
+use crate::editor::{Editor, RenderMode};
 use wordcartel_core::layout;
 
 /// The raw caret byte-offset: `selection.primary().head`.
@@ -28,13 +28,15 @@ pub fn caret_line(editor: &Editor) -> usize {
 ///
 /// Used when `screen_pos` needs the caret line but it isn't in `line_layouts`
 /// (e.g. before `ensure_visible` + `derive::rebuild` have run).
+/// Honors `view.mode`: in source modes, all lines render raw (is_active=true).
 fn layout_line_on_demand(editor: &Editor, l: usize) -> wordcartel_core::layout::ColMap {
     let buf = &editor.document.buffer;
     let text = derive::line_text(buf, l);
     let role = editor.document.blocks.role_at(derive::line_start(buf, l));
-    let is_active = l == caret_line(editor);
+    let source_mode = editor.view.mode != RenderMode::LivePreview;
+    let is_active_effective = (l == caret_line(editor)) || source_mode;
     let vp_width = (editor.view.area.0 as usize).max(1);
-    let (_rows, map) = layout::layout(&text, role, is_active, vp_width);
+    let (_rows, map) = layout::layout(&text, role, is_active_effective, vp_width);
     map
 }
 

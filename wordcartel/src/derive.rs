@@ -1,4 +1,4 @@
-use crate::editor::Editor;
+use crate::editor::{Editor, RenderMode};
 use wordcartel_core::block_tree;
 use wordcartel_core::buffer::TextBuffer;
 use wordcartel_core::layout;
@@ -130,12 +130,18 @@ pub fn rebuild(editor: &mut Editor) {
     // Clear the old cache and fill for the visible range.
     editor.view.line_layouts.clear();
 
+    // In source modes (SourceHighlighted, SourcePlain), ALL lines render raw
+    // (markers visible, conceal off). Laying out with is_active=true achieves
+    // this because active-line layout uses the raw/identity-ish col_map.
+    // §3.11: source modes are cheaper — pass is_active_effective = true for all lines.
+    let source_mode = editor.view.mode != RenderMode::LivePreview;
+
     let mut l = first_line;
     while l < total_lines && visual_rows_accumulated < overscan_budget {
         let text = line_text(buf, l);
         let role = editor.document.blocks.role_at(line_start(buf, l));
-        let is_active = l == active_line;
-        let (rows, map) = layout::layout(&text, role, is_active, vp_width);
+        let is_active_effective = (l == active_line) || source_mode;
+        let (rows, map) = layout::layout(&text, role, is_active_effective, vp_width);
         visual_rows_accumulated += rows.len();
         editor.view.line_layouts.insert(l, (rows, map));
         l += 1;

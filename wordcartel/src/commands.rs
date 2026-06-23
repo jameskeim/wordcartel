@@ -11,7 +11,7 @@
 //!   6. Sets `editor.desired_col = None` (an edit re-anchors vertical motion).
 
 use crate::derive;
-use crate::editor::Editor;
+use crate::editor::{Editor, RenderMode};
 use crate::nav;
 use wordcartel_core::block_tree::Edit;
 use wordcartel_core::change::ChangeSet;
@@ -45,6 +45,12 @@ pub enum Command {
     Cut,
     /// Paste register contents at the caret position.
     Paste,
+    /// Undo the last committed revision.
+    Undo,
+    /// Redo the next revision (after an undo).
+    Redo,
+    /// Rotate the render mode: LivePreview → SourceHighlighted → SourcePlain → LivePreview.
+    CycleRenderMode,
 }
 
 /// Result returned by `run`.
@@ -206,6 +212,30 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             } else {
                 CommandResult::Noop
             }
+        }
+
+        Command::Undo => {
+            editor.undo();
+            derive::rebuild(editor);
+            nav::ensure_visible(editor);
+            CommandResult::Handled
+        }
+
+        Command::Redo => {
+            editor.redo();
+            derive::rebuild(editor);
+            nav::ensure_visible(editor);
+            CommandResult::Handled
+        }
+
+        Command::CycleRenderMode => {
+            editor.view.mode = match editor.view.mode {
+                RenderMode::LivePreview      => RenderMode::SourceHighlighted,
+                RenderMode::SourceHighlighted => RenderMode::SourcePlain,
+                RenderMode::SourcePlain      => RenderMode::LivePreview,
+            };
+            derive::rebuild(editor);
+            CommandResult::Handled
         }
     }
 }
@@ -505,5 +535,126 @@ mod tests {
         let result = run(Command::Paste, &mut e, &clk);
         assert_eq!(result, CommandResult::Noop);
         assert_eq!(e.document.buffer.to_string(), "abcd\n");
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 10: Undo/redo commands + render-mode toggle
+    // -------------------------------------------------------------------------
+
+    /// Command::Undo restores the buffer to the state before the edit.
+    #[test]
+    fn undo_command_restores_buffer() {
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        derive::rebuild(&mut e);
+        let clk = TestClock(0);
+
+        // Type 'X' at offset 5 (end of "hello") → "helloX\n"
+        set_caret(&mut e, 5);
+        run(Command::InsertChar('X'), &mut e, &clk);
+        assert_eq!(e.document.buffer.to_string(), "helloX\n");
+
+        // Undo → "hello\n"
+        let result = run(Command::Undo, &mut e, &clk);
+        assert_eq!(result, CommandResult::Handled);
+        assert_eq!(e.document.buffer.to_string(), "hello\n");
+    }
+
+    /// Command::Redo reapplies the change after an undo.
+    #[test]
+    fn redo_command_reapplies_change() {
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        derive::rebuild(&mut e);
+        let clk = TestClock(0);
+
+        set_caret(&mut e, 5);
+        run(Command::InsertChar('X'), &mut e, &clk);
+        assert_eq!(e.document.buffer.to_string(), "helloX\n");
+
+        run(Command::Undo, &mut e, &clk);
+        assert_eq!(e.document.buffer.to_string(), "hello\n");
+
+        // Redo → "helloX\n"
+        let result = run(Command::Redo, &mut e, &clk);
+        assert_eq!(result, CommandResult::Handled);
+        assert_eq!(e.document.buffer.to_string(), "helloX\n");
+    }
+
+    /// Undo/Redo via commands round-trips: type something, Undo restores, Redo reapplies.
+    /// Uses distinct timestamps to break coalescing so each char is its own undo entry.
+    #[test]
+    fn undo_redo_roundtrip_via_commands() {
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        derive::rebuild(&mut e);
+
+        // Type 'a' at t=0, 'b' at t=9999 (breaks coalescing)
+        set_caret(&mut e, 0);
+        run(Command::InsertChar('a'), &mut e, &TestClock(0));
+        set_caret(&mut e, 1);
+        run(Command::InsertChar('b'), &mut e, &TestClock(9_999_999));
+        assert_eq!(e.document.buffer.to_string(), "ab\n");
+
+        // Undo once: removes 'b'
+        run(Command::Undo, &mut e, &TestClock(0));
+        assert_eq!(e.document.buffer.to_string(), "a\n");
+
+        // Undo again: removes 'a'
+        run(Command::Undo, &mut e, &TestClock(0));
+        assert_eq!(e.document.buffer.to_string(), "\n");
+
+        // Redo: reapplies 'a'
+        run(Command::Redo, &mut e, &TestClock(0));
+        assert_eq!(e.document.buffer.to_string(), "a\n");
+
+        // Redo again: reapplies 'b'
+        run(Command::Redo, &mut e, &TestClock(0));
+        assert_eq!(e.document.buffer.to_string(), "ab\n");
+    }
+
+    /// CycleRenderMode rotates LivePreview → SourceHighlighted → SourcePlain → LivePreview.
+    #[test]
+    fn cycle_render_mode_rotates_through_modes() {
+        use crate::editor::RenderMode;
+        let mut e = Editor::new_from_text("# Title\n", None, (80, 24));
+        derive::rebuild(&mut e);
+        let clk = TestClock(0);
+
+        assert_eq!(e.view.mode, RenderMode::LivePreview);
+
+        let r1 = run(Command::CycleRenderMode, &mut e, &clk);
+        assert_eq!(r1, CommandResult::Handled);
+        assert_eq!(e.view.mode, RenderMode::SourceHighlighted);
+
+        run(Command::CycleRenderMode, &mut e, &clk);
+        assert_eq!(e.view.mode, RenderMode::SourcePlain);
+
+        run(Command::CycleRenderMode, &mut e, &clk);
+        assert_eq!(e.view.mode, RenderMode::LivePreview);
+    }
+
+    /// In SourceHighlighted mode, an INACTIVE heading line shows raw "# Title"
+    /// (markers visible), whereas in LivePreview it shows concealed "Title".
+    #[test]
+    fn source_highlighted_makes_inactive_heading_show_raw() {
+        use crate::editor::RenderMode;
+
+        // Start in LivePreview; cursor on line 1 (blank) so line 0 (heading) is inactive.
+        // "# Title\n" = 8 bytes; blank line starts at offset 8.
+        let mut e = Editor::new_from_text("# Title\n\nplain\n", None, (80, 24));
+        e.document.selection = wordcartel_core::selection::Selection::single(8); // on blank line
+        derive::rebuild(&mut e);
+
+        // In LivePreview, inactive heading line 0 must show concealed "Title"
+        let (rows_lp, _) = &e.view.line_layouts[&0];
+        assert_eq!(rows_lp[0].display, "Title", "LivePreview inactive heading should be concealed");
+
+        // Switch to SourceHighlighted
+        let clk = TestClock(0);
+        run(Command::CycleRenderMode, &mut e, &clk);
+        assert_eq!(e.view.mode, RenderMode::SourceHighlighted);
+
+        // After CycleRenderMode, derive::rebuild is called inside the command.
+        // Line 0 should now show raw "# Title"
+        let (rows_sh, _) = &e.view.line_layouts[&0];
+        assert_eq!(rows_sh[0].display, "# Title", "SourceHighlighted must show raw markers on inactive heading");
     }
 }
