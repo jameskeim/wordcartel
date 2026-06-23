@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use wordcartel_core::block_tree::{self, BlockTree};
 use wordcartel_core::buffer::TextBuffer;
-use wordcartel_core::history::History;
+use wordcartel_core::history::{Clock, EditKind, History, Transaction};
 use wordcartel_core::selection::Selection;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -70,11 +70,66 @@ impl Editor {
             last_edit: None,
         }
     }
+
+    /// The single mutation channel (spec §10.1). Caller passes the `Edit`
+    /// describing the same `(range, replacement)` used to build the `ChangeSet`.
+    pub fn apply(
+        &mut self,
+        txn: Transaction,
+        edit: wordcartel_core::block_tree::Edit,
+        kind: EditKind,
+        clock: &dyn Clock,
+    ) {
+        let old_rope = self.document.buffer.snapshot(); // O(1) ropey clone
+        let before = self.document.selection.clone();
+        self.document.selection = self.document.history.commit_coalescing(
+            txn,
+            &mut self.document.buffer,
+            before,
+            clock,
+            kind,
+        );
+        self.document.version += 1;
+        self.document.dirty = true;
+        self.pre_edit_rope = Some(old_rope);
+        self.last_edit = Some(edit);
+    }
+
+    /// Undo the last revision. Sets `last_edit`/`pre_edit_rope` to `None` so
+    /// Task 3's derive falls back to a full reparse.
+    pub fn undo(&mut self) {
+        if let Some(sel) = self.document.history.undo(&mut self.document.buffer) {
+            self.document.selection = sel;
+        }
+        self.document.version += 1;
+        self.document.dirty = true;
+        self.last_edit = None;
+        self.pre_edit_rope = None;
+    }
+
+    /// Redo the next revision. Sets `last_edit`/`pre_edit_rope` to `None` so
+    /// Task 3's derive falls back to a full reparse.
+    pub fn redo(&mut self) {
+        if let Some(sel) = self.document.history.redo(&mut self.document.buffer) {
+            self.document.selection = sel;
+        }
+        self.document.version += 1;
+        self.document.dirty = true;
+        self.last_edit = None;
+        self.pre_edit_rope = None;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wordcartel_core::block_tree::Edit;
+    use wordcartel_core::change::ChangeSet;
+
+    struct TestClock(std::cell::Cell<u64>);
+    impl wordcartel_core::history::Clock for TestClock {
+        fn now_ms(&self) -> u64 { self.0.get() }
+    }
 
     #[test]
     fn new_editor_holds_text_and_clean_state() {
@@ -84,5 +139,35 @@ mod tests {
         assert_eq!(e.document.version, 0);
         assert!(!e.document.dirty);
         assert!(!e.document.blocks.top_level().is_empty());
+    }
+
+    #[test]
+    fn apply_insert_mutates_text_selection_version() {
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        let clk = TestClock(std::cell::Cell::new(0));
+        // insert "X" at offset 1 -> "aXb\n"
+        let cs = ChangeSet::insert(1, "X", e.document.buffer.len());
+        let txn = Transaction::new(cs).with_selection(Selection::single(2));
+        e.apply(txn, Edit { range: 1..1, new_len: 1 }, EditKind::Type, &clk);
+        assert_eq!(e.document.buffer.to_string(), "aXb\n");
+        assert_eq!(e.document.selection.primary().head, 2);
+        assert_eq!(e.document.version, 1);
+        assert!(e.document.dirty);
+        assert!(e.pre_edit_rope.is_some());
+        // Edit has no PartialEq — compare fields:
+        assert_eq!(e.last_edit.as_ref().map(|x| (x.range.clone(), x.new_len)), Some((1..1, 1)));
+    }
+
+    #[test]
+    fn undo_redo_round_trip() {
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        let clk = TestClock(std::cell::Cell::new(0));
+        let cs = ChangeSet::insert(1, "X", e.document.buffer.len());
+        e.apply(Transaction::new(cs).with_selection(Selection::single(2)), Edit { range: 1..1, new_len: 1 }, EditKind::Type, &clk);
+        e.undo();
+        assert_eq!(e.document.buffer.to_string(), "ab\n");
+        assert!(e.last_edit.is_none()); // undo forces a full reparse in derive
+        e.redo();
+        assert_eq!(e.document.buffer.to_string(), "aXb\n");
     }
 }
