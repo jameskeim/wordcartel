@@ -1,1 +1,66 @@
-// filled in by later tasks
+// wordcartel/src/term.rs — terminal lifecycle: raw mode, alt screen, panic restore.
+//
+// §15.7: the panic hook restores the terminal BEFORE chaining to the previous
+// hook, so the user always gets their shell back even on a crash.
+
+use std::io::{self, Stdout};
+
+use crossterm::{
+    cursor::Show,
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{backend::CrosstermBackend, Terminal};
+
+// ---------------------------------------------------------------------------
+// TerminalGuard — RAII wrapper: enable on new(), restore on drop()
+// ---------------------------------------------------------------------------
+
+pub struct TerminalGuard {
+    terminal: Terminal<CrosstermBackend<Stdout>>,
+}
+
+impl TerminalGuard {
+    /// Enable raw mode, enter the alternate screen, and return a `TerminalGuard`
+    /// whose `Drop` impl will restore the terminal.
+    pub fn new() -> io::Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen)?;
+        let backend = CrosstermBackend::new(io::stdout());
+        let terminal = Terminal::new(backend)?;
+        Ok(Self { terminal })
+    }
+
+    /// Borrow the inner `Terminal` for drawing.
+    pub fn terminal(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
+        &mut self.terminal
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// install_panic_hook — call once from `app::run` before entering the loop
+// ---------------------------------------------------------------------------
+
+/// Install a panic hook that restores the terminal before chaining to the
+/// previous hook. Safe to call multiple times (uses `std::sync::Once`).
+pub fn install_panic_hook() {
+    use std::sync::Once;
+    static HOOK_INSTALLED: Once = Once::new();
+    HOOK_INSTALLED.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Best-effort restore — ignore errors (we're already panicking).
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+            prev(info);
+        }));
+    });
+}
