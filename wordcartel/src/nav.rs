@@ -591,4 +591,21 @@ mod tests {
         assert_eq!(down_pos, 8);
         assert_eq!(e.desired_col, Some(2)); // still preserved
     }
+
+    #[test]
+    fn desired_col_survives_ragged_short_line() {
+        // Classic ragged-column case: descending through a SHORT middle line must
+        // snap to its end but NOT lose the column — the next descent restores it.
+        let mut e = Editor::new_from_text("hello\nhi\nworld\n", None, (80, 24));
+        set_caret(&mut e, 4); // 'o' in "hello", col 4; desired_col None
+        derive::rebuild(&mut e);
+        let p1 = move_down(&mut e); // first vertical: desired=4; "hi" max col 2 -> offset 8
+        assert_eq!(p1, 8);
+        assert_eq!(e.desired_col, Some(4));
+        set_caret(&mut e, p1);
+        derive::rebuild(&mut e);
+        let p2 = move_down(&mut e); // desired still 4 -> "world" col 4 -> offset 13 (NOT col 2)
+        assert_eq!(p2, 13);
+        assert_eq!(e.desired_col, Some(4));
+    }
 }
