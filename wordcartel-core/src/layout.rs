@@ -902,7 +902,8 @@ mod props {
                 assert_stop!(e.offset, "move_end");
             }
 
-            // move_down_within and move_up_within: walk down from first stop, then up.
+            // move_down_within and move_up_within: walk down from first stop, then up
+            // (single-column baseline, preserved from original law).
             let mut dc = cursor_at(&map, 0);
             for _ in 0..map.rows {
                 match move_down_within(&map, dc) {
@@ -922,6 +923,50 @@ mod props {
                         uc = n;
                     }
                     None => break,
+                }
+            }
+
+            // Extended vertical coverage: drive move_down_within / move_up_within
+            // from MULTIPLE starting desired columns on each row.
+            // This closes the vertical-overshoot gap (concealed-trailing-marker
+            // path) that the single-column walk above does not exercise.
+            // For each row × desired_col pair we build a starting Cursor and
+            // repeatedly step down (from top rows) or up (from bottom rows),
+            // asserting every produced offset is a valid cursor stop.
+            let max_steps = map.rows + 2;
+            let overshoot_col = line.len() + 8;
+            for r in 0..map.rows {
+                let row_end = *map.row_end_col.get(r).unwrap_or(&0);
+                let mid_col = row_end / 2;
+                // Columns to probe: 0, mid, row_end, row_end+1, large overshoot.
+                let probe_cols = [0usize, mid_col, row_end,
+                                  row_end.saturating_add(1), overshoot_col];
+                for col in probe_cols {
+                    // --- walk DOWN from (r, col) ---
+                    let start_off = map.visual_to_source(r, col);
+                    let mut cur_d = Cursor { offset: start_off, row: r, desired_col: col };
+                    for _ in 0..max_steps {
+                        match move_down_within(&map, cur_d) {
+                            Some(n) => {
+                                assert_stop!(n.offset,
+                                    "move_down_within(multi-col)");
+                                cur_d = n;
+                            }
+                            None => break,
+                        }
+                    }
+                    // --- walk UP from (r, col) ---
+                    let mut cur_u = Cursor { offset: start_off, row: r, desired_col: col };
+                    for _ in 0..max_steps {
+                        match move_up_within(&map, cur_u) {
+                            Some(n) => {
+                                assert_stop!(n.offset,
+                                    "move_up_within(multi-col)");
+                                cur_u = n;
+                            }
+                            None => break,
+                        }
+                    }
                 }
             }
 
