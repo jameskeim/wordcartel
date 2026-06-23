@@ -4,6 +4,7 @@ use wordcartel_core::block_tree::{self, BlockTree};
 use wordcartel_core::buffer::TextBuffer;
 use wordcartel_core::history::{Clock, EditKind, History, Transaction};
 use wordcartel_core::layout::{ColMap, VisualRow};
+use wordcartel_core::register::Register;
 use wordcartel_core::selection::Selection;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -41,6 +42,7 @@ pub struct Editor {
     pub status: String, // ephemeral feedback line
     pub quit: bool,
     pub desired_col: Option<usize>, // preserved visual column for vertical motion; None until the first vertical move
+    pub register: Register, // in-process clipboard register (Task 9)
     // Threaded from `apply` → `derive` for the O(region) incremental reparse (Effort 3c):
     pub pre_edit_rope: Option<ropey::Rope>, // O(1) snapshot taken BEFORE the edit
     pub last_edit: Option<wordcartel_core::block_tree::Edit>, // the block_tree edit (range, new_len); None ⇒ full reparse
@@ -71,6 +73,7 @@ impl Editor {
             status: String::new(),
             quit: false,
             desired_col: None,
+            register: Register::default(),
             pre_edit_rope: None,
             last_edit: None,
         }

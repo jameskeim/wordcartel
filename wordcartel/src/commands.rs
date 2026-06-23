@@ -16,17 +16,35 @@ use crate::nav;
 use wordcartel_core::block_tree::Edit;
 use wordcartel_core::change::ChangeSet;
 use wordcartel_core::history::{Clock, EditKind, Transaction};
-use wordcartel_core::selection::Selection;
+use wordcartel_core::register;
+use wordcartel_core::selection::{Range, Selection};
+
+/// Direction of caret movement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dir {
+    Left,
+    Right,
+    Up,
+    Down,
+    LineStart,
+    LineEnd,
+}
 
 /// Commands that can be dispatched to the editor.
-///
-/// Navigation, clipboard, undo, and file commands will be added in later tasks.
 #[derive(Debug, Clone)]
 pub enum Command {
     InsertChar(char),
     InsertNewline,
     Backspace,
     DeleteForward,
+    /// Navigate the caret. `extend=false` collapses the selection; `extend=true` keeps the anchor.
+    Move { dir: Dir, extend: bool },
+    /// Copy the primary selection into the register (no mutation).
+    Copy,
+    /// Cut the primary selection into the register and delete it.
+    Cut,
+    /// Paste register contents at the caret position.
+    Paste,
 }
 
 /// Result returned by `run`.
@@ -118,6 +136,76 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             nav::ensure_visible(editor);
             editor.desired_col = None;
             CommandResult::Handled
+        }
+
+        Command::Move { dir, extend } => {
+            // Compute the new head offset using the appropriate nav function.
+            let new_head = match dir {
+                Dir::Left     => nav::move_left(editor),
+                Dir::Right    => nav::move_right(editor),
+                Dir::Up       => nav::move_up(editor),
+                Dir::Down     => nav::move_down(editor),
+                Dir::LineStart => nav::move_home(editor),
+                Dir::LineEnd   => nav::move_end(editor),
+            };
+            // Up/Down preserve desired_col (handled inside move_up/move_down).
+            // Horizontal moves reset desired_col to None (handled inside move_left/right/home/end).
+
+            if extend {
+                // Keep the current anchor; move the head to `new_head`.
+                let anchor = editor.document.selection.primary().anchor;
+                editor.document.selection = Selection {
+                    ranges: [Range { anchor, head: new_head }].into_iter().collect(),
+                    primary: 0,
+                };
+            } else {
+                // Collapse to a point at the new head.
+                editor.document.selection = Selection::single(new_head);
+            }
+
+            derive::rebuild(editor);
+            nav::ensure_visible(editor);
+            CommandResult::Handled
+        }
+
+        Command::Copy => {
+            let r = editor.document.selection.primary();
+            register::copy(&editor.document.buffer, r, &mut editor.register);
+            editor.status = "Copied".to_string();
+            CommandResult::Handled
+        }
+
+        Command::Cut => {
+            let r = editor.document.selection.primary();
+            if r.is_empty() {
+                return CommandResult::Noop;
+            }
+            let doc_len = editor.document.buffer.len();
+            let cs = register::cut(r, doc_len, &mut editor.register, &editor.document.buffer);
+            let edit = Edit { range: r.from()..r.to(), new_len: 0 };
+            let txn = Transaction::new(cs).with_selection(Selection::single(r.from()));
+            editor.apply(txn, edit, EditKind::Other, clock);
+            derive::rebuild(editor);
+            nav::ensure_visible(editor);
+            editor.desired_col = None;
+            CommandResult::Handled
+        }
+
+        Command::Paste => {
+            let at = nav::head(editor);
+            let doc_len = editor.document.buffer.len();
+            if let Some(cs) = register::paste(at, doc_len, &editor.register) {
+                let n = editor.register.get().map(str::len).unwrap_or(0);
+                let edit = Edit { range: at..at, new_len: n };
+                let txn = Transaction::new(cs).with_selection(Selection::single(at + n));
+                editor.apply(txn, edit, EditKind::Other, clock);
+                derive::rebuild(editor);
+                nav::ensure_visible(editor);
+                editor.desired_col = None;
+                CommandResult::Handled
+            } else {
+                CommandResult::Noop
+            }
         }
     }
 }
@@ -298,5 +386,124 @@ mod tests {
         // After apply+rebuild, last_edit is None (rebuild consumed it).
         // Verify the result: caret should be at 1 + 2 = 3.
         assert_eq!(nav::head(&e), 3);
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 9: Selection-extending navigation + clipboard (copy/cut/paste)
+    // -------------------------------------------------------------------------
+
+    /// Moving right twice with extend=true selects the first two chars.
+    /// Then Copy puts those 2 chars in the register.
+    #[test]
+    fn select_right_twice_then_copy_fills_register() {
+        let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
+        set_caret(&mut e, 0);
+        derive::rebuild(&mut e);
+        let clk = TestClock(0);
+
+        // First extend-right: anchor=0, head=1 → selects 'a'
+        run(Command::Move { dir: Dir::Right, extend: true }, &mut e, &clk);
+        // Second extend-right: anchor=0, head=2 → selects 'ab'
+        run(Command::Move { dir: Dir::Right, extend: true }, &mut e, &clk);
+
+        // The selection should be non-collapsed: anchor=0, head=2
+        let sel = e.document.selection.primary();
+        assert_eq!(sel.anchor, 0, "anchor must stay at 0");
+        assert_eq!(sel.head, 2, "head must be at 2");
+        assert!(!sel.is_empty(), "selection must be non-empty");
+
+        // Copy should place "ab" in the register
+        run(Command::Copy, &mut e, &clk);
+        assert_eq!(e.register.get(), Some("ab"), "register must contain the selected text");
+    }
+
+    /// Cut removes the selected 2-char region, leaves caret at range start,
+    /// and places the text in the register.
+    #[test]
+    fn select_right_twice_then_cut_removes_selection() {
+        let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
+        set_caret(&mut e, 0);
+        derive::rebuild(&mut e);
+        let clk = TestClock(0);
+
+        run(Command::Move { dir: Dir::Right, extend: true }, &mut e, &clk);
+        run(Command::Move { dir: Dir::Right, extend: true }, &mut e, &clk);
+
+        // Cut: removes "ab", buffer becomes "cd\n"
+        run(Command::Cut, &mut e, &clk);
+        assert_eq!(e.document.buffer.to_string(), "cd\n", "Cut must remove the selected text");
+        assert_eq!(nav::head(&e), 0, "caret must be at selection start after Cut");
+        assert_eq!(e.register.get(), Some("ab"), "register must contain the cut text");
+    }
+
+    /// Paste inserts register contents at the current caret position.
+    #[test]
+    fn paste_inserts_register_at_caret() {
+        let mut e = Editor::new_from_text("cd\n", None, (80, 24));
+        set_caret(&mut e, 0);
+        derive::rebuild(&mut e);
+        let clk = TestClock(0);
+
+        // Pre-load the register by typing "ab" and cutting it, or directly using
+        // a Copy. Simpler: Copy a range, then Paste somewhere.
+        // Use "abcd\n", select "ab", Copy, then move to offset 2 and Paste.
+        let mut e2 = Editor::new_from_text("abcd\n", None, (80, 24));
+        set_caret(&mut e2, 0);
+        derive::rebuild(&mut e2);
+        run(Command::Move { dir: Dir::Right, extend: true }, &mut e2, &clk);
+        run(Command::Move { dir: Dir::Right, extend: true }, &mut e2, &clk);
+        run(Command::Copy, &mut e2, &clk);
+
+        // Now move head to offset 4 (before '\n') and paste
+        set_caret(&mut e2, 4);
+        e2.document.selection = wordcartel_core::selection::Selection::single(4);
+        run(Command::Paste, &mut e2, &clk);
+        // "abcd\n" with "ab" pasted at offset 4 → "abcdab\n"
+        assert_eq!(e2.document.buffer.to_string(), "abcdab\n", "Paste must insert register text at caret");
+        assert_eq!(nav::head(&e2), 6, "caret must be after the pasted text");
+    }
+
+    /// Move with extend=false collapses the selection to a point.
+    #[test]
+    fn move_without_extend_collapses_selection() {
+        let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
+        set_caret(&mut e, 0);
+        derive::rebuild(&mut e);
+        let clk = TestClock(0);
+
+        // Extend selection first
+        run(Command::Move { dir: Dir::Right, extend: true }, &mut e, &clk);
+        run(Command::Move { dir: Dir::Right, extend: true }, &mut e, &clk);
+        assert!(!e.document.selection.primary().is_empty());
+
+        // Move without extend collapses to point at new head
+        run(Command::Move { dir: Dir::Right, extend: false }, &mut e, &clk);
+        let sel = e.document.selection.primary();
+        assert!(sel.is_empty(), "selection must be collapsed after Move with extend=false");
+        assert_eq!(sel.head, 3, "head must be at 3 after moving right from 2");
+    }
+
+    /// Cut on empty selection (point cursor) is a Noop.
+    #[test]
+    fn cut_on_empty_selection_is_noop() {
+        let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
+        set_caret(&mut e, 0);
+        derive::rebuild(&mut e);
+        let clk = TestClock(0);
+        let result = run(Command::Cut, &mut e, &clk);
+        assert_eq!(result, CommandResult::Noop);
+        assert_eq!(e.document.buffer.to_string(), "abcd\n");
+    }
+
+    /// Paste on an empty register is a Noop.
+    #[test]
+    fn paste_on_empty_register_is_noop() {
+        let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
+        set_caret(&mut e, 0);
+        derive::rebuild(&mut e);
+        let clk = TestClock(0);
+        let result = run(Command::Paste, &mut e, &clk);
+        assert_eq!(result, CommandResult::Noop);
+        assert_eq!(e.document.buffer.to_string(), "abcd\n");
     }
 }
