@@ -11,7 +11,7 @@ Spec: `docs/superpowers/specs/2026-06-21-wordcartel-design.md`
 |---|---|---|---|---|
 | 1 | **Edit Kernel** | `2026-06-22-wordcartel-01-edit-kernel.md` | pure buffer + ChangeSet undo + selection (headless lib) | ✅ COMPLETE (branch `effort-1-edit-kernel`, 28 tests green, final review READY-TO-MERGE + I-1/I-2/I-3 hardening) |
 | 2 | **Render Core** | `2026-06-22-wordcartel-02-render-core.md` | md_parse (inline conceal+style) + layout/ColMap/cursor-nav (port spike) | ✅ COMPLETE (merged a40f465; 58 tests incl 6 laws@512; Codex gate caught 2 cursor bugs) |
-| 3a | **block_tree** | `2026-06-22-wordcartel-03a-block-tree.md` | full_parse + incremental_update (spike-validated; oracle gate) | IN PROGRESS |
+| 3a | **block_tree** | `2026-06-22-wordcartel-03a-block-tree.md` | full_parse + incremental_update (spike-validated; oracle gate) | ✅ COMPLETE (merged 1beb09b; 90 tests; strengthened oracle found+fixed 4 real bugs; Codex MERGE-READY) |
 | 3b | block-role rendering | _(after 3a)_ | role query over BlockTree + md_parse block-prefix conceal + heading/list/quote rendering | PLANNED |
 | 4 | IO / Shell | _(later)_ | crossterm input, ratatui render, clipboard, atomic save, filter, repar | PLANNED |
 | 5 | App | _(later)_ | editor loop, commands, config, palette/menu, spellcheck, mouse | PLANNED |
@@ -40,7 +40,7 @@ Legend: ✅ done · 🔨 in this effort · ⏳ later effort · 📋 deferred to 
 | 11 | Test strategy: proptest invariants, round-trip laws, committed regressions, golden | 1 (kernel laws) + all | 🔨 |
 | 3.9 | Perf budget (p95 < 16 ms; reparse < 5 ms; ~5 MB) | 2–4 (render/loop) | ⏳ |
 | 4, 9.2 | `md_parse` (pulldown-cmark, byte ranges) | 2 | ✅ (inline; images/CommonMark-exact escapes -> Plan 3) |
-| 9.2 | `block_tree` incremental invalidation (+ spike, oracle) | 3a | 🔨 (spike DONE & validated @~800k; v1 = safe-region reparse + full fallback, absolute spans; relative-span O(1) shift deferred) |
+| 9.2 | `block_tree` incremental invalidation (+ spike, oracle) | 3a | ✅ (merged; oracle: single/multi-edit × ASCII/multibyte + delete-to-empty; 4 latent bugs caught & fixed) |
 | 16 | `layout`/`ColMap`; `Cursor{offset,row,desired_col}`; navigation; reveal churn | 2 | ✅ (layout/ColMap/cursor done; reveal-churn scroll-anchor -> app) |
 | 3.2, 3.11, 13 | Live-conceal render modes; markdown construct set | 2 (model) / 3 (paint) | ⏳ |
 | 3.4, 14.2 | Soft-wrap; wrap ruler; line-structure (unwrap/reflow/ventilate) | 2 (wrap) / 3 (repar) | ⏳ |
