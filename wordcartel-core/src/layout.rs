@@ -268,6 +268,134 @@ pub fn layout(
     (visual_rows, map)
 }
 
+// ---------------------------------------------------------------------------
+// Cursor navigation
+// ---------------------------------------------------------------------------
+
+/// A cursor.
+///
+/// FINDING: a byte offset alone is NOT enough. At a soft-wrap boundary the same
+/// offset is both "end of row N" and "start of row N+1"; `source_to_visual`
+/// must pick one, so vertical motion derived purely from the offset drifts.
+/// The cursor therefore carries an explicit visual `row` (its *affinity*) plus
+/// the source `offset` and the remembered `desired_col`. Horizontal motion
+/// recomputes `row` from the offset; vertical motion sets `row` directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cursor {
+    pub offset: usize,
+    /// Visual row affinity (resolves the soft-wrap boundary ambiguity).
+    pub row: usize,
+    /// Desired visual column, preserved across vertical motion.
+    pub desired_col: usize,
+}
+
+impl Cursor {
+    pub fn new(offset: usize) -> Self {
+        Cursor { offset, row: 0, desired_col: 0 }
+    }
+}
+
+/// Construct a cursor, snapping `offset` to the nearest valid cursor stop on
+/// or after it (or EOL). REQUIRED whenever a raw byte offset enters the cursor
+/// system, because a line may *begin* with a concealed span (e.g. `**a**`),
+/// making offset 0 itself invalid. Empirically surfaced by Law 2.
+pub fn cursor_at(map: &ColMap, offset: usize) -> Cursor {
+    let stops = map.cursor_stops();
+    let snapped = stops
+        .iter()
+        .copied()
+        .find(|&s| s >= offset)
+        .unwrap_or(map.eol);
+    let (row, col) = map.source_to_visual(snapped);
+    Cursor { offset: snapped, row, desired_col: col }
+}
+
+/// Move right by one grapheme, skipping concealed bytes. Recomputes row
+/// affinity from the new offset (horizontal motion resolves boundary toward the
+/// start of the row the grapheme begins on).
+pub fn move_right(map: &ColMap, cur: Cursor) -> Cursor {
+    let stops = map.cursor_stops();
+    let next = stops.iter().copied().find(|&s| s > cur.offset).unwrap_or(map.eol);
+    let (row, col) = map.source_to_visual(next);
+    Cursor { offset: next, row, desired_col: col }
+}
+
+/// Move left by one grapheme, skipping concealed bytes.
+pub fn move_left(map: &ColMap, cur: Cursor) -> Cursor {
+    let stops = map.cursor_stops();
+    let prev = stops.iter().copied().rev().find(|&s| s < cur.offset).unwrap_or(0);
+    let (row, col) = map.source_to_visual(prev);
+    Cursor { offset: prev, row, desired_col: col }
+}
+
+/// Home: start of the cursor's *visual row* (using its row affinity).
+pub fn move_home(map: &ColMap, cur: Cursor) -> Cursor {
+    let row = cur.row.min(map.rows.saturating_sub(1));
+    let off = map.visual_to_source(row, 0);
+    Cursor { offset: off, row, desired_col: 0 }
+}
+
+/// End: end of the cursor's *visual row* (using its row affinity). The cursor
+/// keeps row affinity `row` even though `offset` is the boundary offset that
+/// `source_to_visual` would otherwise read as the next row.
+///
+/// FINDING: the raw end-of-row byte position can be a *concealed* trailing
+/// marker (e.g. `**a**` at width 1: visible cell "a" ends at byte 3, which is a
+/// `*`). We snap the result UP to the nearest valid cursor stop so the cursor
+/// never rests on a concealed byte.
+pub fn move_end(map: &ColMap, cur: Cursor) -> Cursor {
+    let row = cur.row.min(map.rows.saturating_sub(1));
+    let end_col = *map.row_end_col.get(row).unwrap_or(&0);
+    let raw = map.visual_to_source(row, end_col);
+    // snap up to the nearest cursor stop (>= raw)
+    let off = map
+        .cursor_stops()
+        .into_iter()
+        .find(|&s| s >= raw)
+        .unwrap_or(map.eol);
+    Cursor { offset: off, row, desired_col: end_col }
+}
+
+/// Move down one visual row within this logical line, preserving desired_col.
+/// Uses the cursor's explicit row affinity (not the offset) so soft-wrap
+/// boundaries don't cause drift.
+pub fn move_down_within(map: &ColMap, cur: Cursor) -> Option<Cursor> {
+    let row = cur.row;
+    if row + 1 >= map.rows {
+        return None;
+    }
+    let target = row + 1;
+    let want = cur.desired_col;
+    let off = map.visual_to_source(target, want);
+    let col = map.col_on_row(off, target);
+    let _ = col;
+    Some(Cursor { offset: off, row: target, desired_col: want })
+}
+
+/// Move up one visual row, preserving desired_col.
+pub fn move_up_within(map: &ColMap, cur: Cursor) -> Option<Cursor> {
+    if cur.row == 0 {
+        return None;
+    }
+    let target = cur.row - 1;
+    let want = cur.desired_col;
+    let off = map.visual_to_source(target, want);
+    Some(Cursor { offset: off, row: target, desired_col: want })
+}
+
+/// Enter a logical line from above at `desired_col` (first row).
+pub fn enter_from_top(map: &ColMap, desired_col: usize) -> Cursor {
+    let off = map.visual_to_source(0, desired_col);
+    Cursor { offset: off, row: 0, desired_col }
+}
+
+/// Enter a logical line from below at `desired_col` (last row).
+pub fn enter_from_bottom(map: &ColMap, desired_col: usize) -> Cursor {
+    let last = map.rows.saturating_sub(1);
+    let off = map.visual_to_source(last, desired_col);
+    Cursor { offset: off, row: last, desired_col }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,5 +456,36 @@ mod tests {
         // width 2: "abcd" -> rows ["ab","cd"]. col 9 on row 0 clamps to end of row 0 (byte 2).
         let (_rows, map) = layout("abcd", BlockRole::Paragraph, true, 2);
         assert_eq!(map.visual_to_source(0, 9), 2);
+    }
+
+    #[test]
+    fn right_skips_concealed_link_url() {
+        // "ab[cd](http://x.io)ef": visible "abcdef"; moving right from start
+        // visits only visible grapheme starts, never inside the hidden URL.
+        let line = "ab[cd](http://x.io)ef";
+        let (_r, map) = layout(line, BlockRole::Paragraph, false, 80);
+        let mut cur = cursor_at(&map, 0);
+        let mut visited = vec![cur.offset];
+        for _ in 0..6 { cur = move_right(&map, cur); visited.push(cur.offset); }
+        // none of the visited offsets fall inside the URL byte range [7,18)
+        assert!(visited.iter().all(|&o| !(7..18).contains(&o)));
+    }
+    #[test]
+    fn move_end_snaps_off_concealed_trailing_marker() {
+        // "**a**" width 1: end-of-row raw position is a concealed '*'; move_end
+        // must snap to a real stop (the 'a' start or EOL), never a '*'.
+        let (_r, map) = layout("**a**", BlockRole::Paragraph, false, 1);
+        let cur = cursor_at(&map, 2); // on 'a'
+        let e = move_end(&map, cur);
+        assert!(map.is_cursor_stop(e.offset));
+    }
+    #[test]
+    fn down_then_up_preserves_desired_col() {
+        // "aaaaa" width 3 -> rows ["aaa","aa"]. start at col 2 row 0, down then up.
+        let (_r, map) = layout("aaaaa", BlockRole::Paragraph, true, 3);
+        let start = Cursor { offset: 2, row: 0, desired_col: 2 };
+        let down = move_down_within(&map, start).unwrap();
+        let up = move_up_within(&map, down).unwrap();
+        assert_eq!(up.offset, start.offset);
     }
 }
