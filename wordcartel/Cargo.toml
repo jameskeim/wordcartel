@@ -1,0 +1,19 @@
+[package]
+name = "wordcartel"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "wcartel"
+path = "src/main.rs"
+
+[dependencies]
+wordcartel-core = { path = "../wordcartel-core" }
+ropey = "=1.6.1"
+ratatui = "0.29"
+crossterm = "0.28"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
