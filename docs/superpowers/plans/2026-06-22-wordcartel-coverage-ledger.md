@@ -13,8 +13,15 @@ Spec: `docs/superpowers/specs/2026-06-21-wordcartel-design.md`
 | 2 | **Render Core** | `2026-06-22-wordcartel-02-render-core.md` | md_parse (inline conceal+style) + layout/ColMap/cursor-nav (port spike) | ✅ COMPLETE (merged a40f465; 58 tests incl 6 laws@512; Codex gate caught 2 cursor bugs) |
 | 3a | **block_tree** | `2026-06-22-wordcartel-03a-block-tree.md` | full_parse + incremental_update (spike-validated; oracle gate) | ✅ COMPLETE (merged 1beb09b; 90 tests; strengthened oracle found+fixed 4 real bugs; Codex MERGE-READY) |
 | 3b | **block-role rendering** | `2026-06-22-wordcartel-03b-block-roles.md` | BlockKind heading-level + role_at query + md_parse block-prefix conceal + VisualRow role/glyph | ✅ COMPLETE (merged 4e88368; 95 lib + 27 oracle green; final opus review + Codex gate; oracle found+fixed 2 pre-existing 3a container-merge bugs; Codex found+fixed 3 conceal-fidelity gaps) |
-| 4 | IO / Shell | _(later)_ | crossterm input, ratatui render, clipboard, atomic save, filter, repar | PLANNED |
-| 5 | App | _(later)_ | editor loop, commands, config, palette/menu, spellcheck, mouse | PLANNED |
+| 4a | **Terminal shell (sync)** | `2026-06-23-wordcartel-04a-terminal-shell.md` | runnable `wcartel` editor: Editor/Document/View + apply + derive + ratatui live-preview render + crossterm loop + cursor nav + edit/select/clipboard/undo + atomic save | PLANNED (written; worker/async + filters/repar/recovery → 4b) |
+| 4b | IO async edges | _(later)_ | std::thread+mpsc worker (version-stamped discard), background save + swap/recovery + panic dump, filter primitive, repar transforms, system-clipboard sync, external-mod detection, incremental_update in derive | PLANNED |
+| 5 | App | _(later)_ | data-driven keymap/config, command palette + hideable menu, spellcheck, mouse, word/page nav, wrap-guide | PLANNED |
+
+> Effort 4 (IO/Shell, §10/§3.8/§14/§15) split into **Plan 4a** (the synchronous
+> runnable editor — open/render/edit/navigate/save) and **Plan 4b** (async edges,
+> slow IO, filters, repar, crash recovery). 4a ships a usable editor; 4b hardens
+> the edges & adds power features. Rationale in the 4a plan's Reuse Posture /
+> Self-Review. Data-driven keymap + palette + menu remain Effort 5.
 
 > Effort 2 (Render Kernel, §16/§13/§9.2) split into Plan 2 (render core — inline
 > conceal/style + the spike-validated layout/ColMap/cursor) and Plan 3 (incremental
