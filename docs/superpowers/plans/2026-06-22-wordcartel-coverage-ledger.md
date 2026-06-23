@@ -12,7 +12,7 @@ Spec: `docs/superpowers/specs/2026-06-21-wordcartel-design.md`
 | 1 | **Edit Kernel** | `2026-06-22-wordcartel-01-edit-kernel.md` | pure buffer + ChangeSet undo + selection (headless lib) | ✅ COMPLETE (branch `effort-1-edit-kernel`, 28 tests green, final review READY-TO-MERGE + I-1/I-2/I-3 hardening) |
 | 2 | **Render Core** | `2026-06-22-wordcartel-02-render-core.md` | md_parse (inline conceal+style) + layout/ColMap/cursor-nav (port spike) | ✅ COMPLETE (merged a40f465; 58 tests incl 6 laws@512; Codex gate caught 2 cursor bugs) |
 | 3a | **block_tree** | `2026-06-22-wordcartel-03a-block-tree.md` | full_parse + incremental_update (spike-validated; oracle gate) | ✅ COMPLETE (merged 1beb09b; 90 tests; strengthened oracle found+fixed 4 real bugs; Codex MERGE-READY) |
-| 3b | **block-role rendering** | `2026-06-22-wordcartel-03b-block-roles.md` | BlockKind heading-level + role_at query + md_parse block-prefix conceal + VisualRow role/glyph | PLANNED (written; deep-nest/hanging-indent deferred) |
+| 3b | **block-role rendering** | `2026-06-22-wordcartel-03b-block-roles.md` | BlockKind heading-level + role_at query + md_parse block-prefix conceal + VisualRow role/glyph | ✅ COMPLETE (merged 4e88368; 95 lib + 27 oracle green; final opus review + Codex gate; oracle found+fixed 2 pre-existing 3a container-merge bugs; Codex found+fixed 3 conceal-fidelity gaps) |
 | 4 | IO / Shell | _(later)_ | crossterm input, ratatui render, clipboard, atomic save, filter, repar | PLANNED |
 | 5 | App | _(later)_ | editor loop, commands, config, palette/menu, spellcheck, mouse | PLANNED |
 
@@ -42,7 +42,7 @@ Legend: ✅ done · 🔨 in this effort · ⏳ later effort · 📋 deferred to 
 | 4, 9.2 | `md_parse` (pulldown-cmark, byte ranges) | 2 | ✅ (inline; images/CommonMark-exact escapes -> Plan 3) |
 | 9.2 | `block_tree` incremental invalidation (+ spike, oracle) | 3a | ✅ (merged; oracle: single/multi-edit × ASCII/multibyte + delete-to-empty; 4 latent bugs caught & fixed) |
 | 16 | `layout`/`ColMap`; `Cursor{offset,row,desired_col}`; navigation; reveal churn | 2 | ✅ (layout/ColMap/cursor done; reveal-churn scroll-anchor -> app) |
-| 3.2, 3.11, 13 | Live-conceal render modes; markdown construct set | 2 (model) / 3 (paint) | ⏳ |
+| 3.2, 3.11, 13 | Live-conceal render modes; markdown construct set | 2 (inline) / 3b (block-prefix conceal) / 4 (paint) | ✅ conceal model (inline §2 + block-prefix/role §3b incl. ATX tabs/empty/closing, list→bullet, quote, fence, setext, thematic break); terminal paint → 4 |
 | 3.4, 14.2 | Soft-wrap; wrap ruler; line-structure (unwrap/reflow/ventilate) | 2 (wrap) / 3 (repar) | ⏳ |
 | 3.5 | `filter` primitive (argv default, caps, timeout, cancel) | 3 | ⏳ |
 | 3.1, 14 | pandoc export; repar in-process transforms | 3 | ⏳ |
