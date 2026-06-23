@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use wordcartel_core::block_tree::{self, BlockTree};
 use wordcartel_core::buffer::TextBuffer;
 use wordcartel_core::history::{Clock, EditKind, History, Transaction};
+use wordcartel_core::layout::{ColMap, VisualRow};
 use wordcartel_core::selection::Selection;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -27,7 +29,9 @@ pub struct View {
     pub scroll: usize,    // first visible LOGICAL line index
     pub area: (u16, u16), // (width, height) cells of the editing area
     pub mode: RenderMode,
-    // line_layouts cache added in Task 3
+    /// Per-visible-logical-line layout cache (Task 3).
+    /// Key = logical line index; value = (visual rows, source↔visual ColMap).
+    pub line_layouts: BTreeMap<usize, (Vec<VisualRow>, ColMap)>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +66,7 @@ impl Editor {
                 scroll: 0,
                 area,
                 mode: RenderMode::LivePreview,
+                line_layouts: BTreeMap::new(),
             },
             status: String::new(),
             quit: false,
