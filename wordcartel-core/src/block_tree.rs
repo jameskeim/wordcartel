@@ -11,6 +11,9 @@ use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 /// (borrowed for &str sources, owned/materialized for ropes — O(slice len)).
 pub trait TextSource {
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn slice(&self, range: Range<usize>) -> Cow<'_, str>;
     /// Byte offset of the start of the line containing `pos` (just after the
     /// previous `\n`, or 0). `\n`-only semantics. `pos` is clamped to `len()`.
@@ -319,7 +322,7 @@ pub fn full_parse_src<S: TextSource>(src: &S) -> BlockTree {
 /// `base`.  The `Cow<str>` returned by `src.slice(region)` is bound to a
 /// local variable so it outlives the pulldown-cmark parser borrow.
 fn parse_region<S: TextSource>(src: &S, region: Range<usize>, base: usize) -> BlockTree {
-    let text = src.slice(region.clone());
+    let text = src.slice(region);
     let parser = Parser::new_ext(text.as_ref(), options());
 
     let mut root = Block {
@@ -543,19 +546,26 @@ pub fn incremental_update_instrumented_src<S: TextSource>(
                 b.kind,
                 BlockKind::List | BlockKind::BlockQuote | BlockKind::IndentedCode
             );
-            // gap between block end and region start must be only blank /
-            // ref-def lines (no other block intervenes by construction, since
-            // this is the nearest preceding block).
-            let gap_lo = b.span.end.min(old_src.len());
-            let gap_hi = region_old_start.min(old_src.len());
-            let gap = old_src.slice(gap_lo.min(gap_hi)..gap_hi);
-            let gap_is_soft = gap
-                .as_ref()
-                .lines()
-                .all(|l| l.trim().is_empty() || is_ref_def_line(l));
-            if absorptive && b.span.end <= region_old_start && gap_is_soft {
-                region_old_start = old_src.line_start(b.span.start);
-                continue;
+            // Only materialize/scan the gap when absorption is actually in play.
+            // Hoisting this behind the `absorptive` guard keeps the local hot
+            // path O(region): a non-absorptive preceding block (the common case)
+            // never reads the gap, which can otherwise be O(document) when a
+            // large blank span sits upstream of the edit.
+            if absorptive && b.span.end <= region_old_start {
+                // gap between block end and region start must be only blank /
+                // ref-def lines (no other block intervenes by construction,
+                // since this is the nearest preceding block).
+                let gap_lo = b.span.end.min(old_src.len());
+                let gap_hi = region_old_start.min(old_src.len());
+                let gap = old_src.slice(gap_lo.min(gap_hi)..gap_hi);
+                let gap_is_soft = gap
+                    .as_ref()
+                    .lines()
+                    .all(|l| l.trim().is_empty() || is_ref_def_line(l));
+                if gap_is_soft {
+                    region_old_start = old_src.line_start(b.span.start);
+                    continue;
+                }
             }
         }
         break;
@@ -881,7 +891,6 @@ fn blank_delimited_group_start<S: TextSource>(src: &S, pos: usize) -> usize {
     }
     ls
 }
-
 
 fn shift_block(b: &Block, delta: isize) -> Block {
     Block {

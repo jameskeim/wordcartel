@@ -723,6 +723,36 @@ fn separator_ff_is_not_a_line_break() {
     );
 }
 
+/// Pin: \x0b (vertical tab / VT) — ropey unicode_lines treats this as a break;
+/// our impl must NOT.
+#[test]
+fn separator_vt_is_not_a_line_break() {
+    let old = "x\x0by\nz";
+    // Insert adjacent to the VT (byte offset 1).
+    let (new, edit) = apply_edit(old, 1..1, "X");
+    assert_all_paths_agree_det(old, &edit, &new);
+    assert_eq!(
+        full_parse_rope(&Rope::from_str(&new)),
+        full_parse(&new),
+        "full_parse_rope != full_parse for {:?}", new
+    );
+}
+
+/// Pin: U+0085 (NEL / next line) — ropey unicode_lines treats this as a break;
+/// our impl must NOT.
+#[test]
+fn separator_nel_is_not_a_line_break() {
+    let old = "p\u{0085}q\nr";
+    // Insert adjacent to the NEL (byte offset 1, before the 2-byte U+0085).
+    let (new, edit) = apply_edit(old, 1..1, "X");
+    assert_all_paths_agree_det(old, &edit, &new);
+    assert_eq!(
+        full_parse_rope(&Rope::from_str(&new)),
+        full_parse(&new),
+        "full_parse_rope != full_parse for {:?}", new
+    );
+}
+
 /// Pin: U+2028 (LINE SEPARATOR) — ropey unicode_lines treats this as a break;
 /// our impl must NOT.
 #[test]
