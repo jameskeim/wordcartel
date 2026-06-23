@@ -592,6 +592,31 @@ mod tests {
         assert_eq!(visible(&a, line), "Title#");
     }
 
+    #[test]
+    fn heading_closing_not_sequence_mid_content_hash() {
+        // "# a #b" — the "#b" run is interrupted by 'b', so not a closing sequence.
+        let line = "# a #b";
+        let a = analyze(line, BlockRole::Heading(1), false);
+        assert_eq!(visible(&a, line), "a #b");
+    }
+
+    #[test]
+    fn heading_closing_sequence_multibyte_content() {
+        // "# 中 #" — closing # stripped, multibyte content survives intact
+        // (the right-to-left # scan must not split or misfire on UTF-8 bytes).
+        let line = "# 中 #";
+        let a = analyze(line, BlockRole::Heading(1), false);
+        assert_eq!(visible(&a, line), "中");
+    }
+
+    #[test]
+    fn heading_empty_atx_trailing_tab() {
+        // "#\t" — hash followed by a tab then nothing → empty heading, whole line hidden.
+        let line = "#\t";
+        let a = analyze(line, BlockRole::Heading(1), false);
+        assert_eq!(visible(&a, line), "");
+    }
+
     // --- Regressions ---
 
     #[test]
