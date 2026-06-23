@@ -6,10 +6,78 @@
 //! `wordcartel_core::block_tree::*`.
 
 use proptest::prelude::*;
+use ropey::Rope;
 use wordcartel_core::block_tree::{
-    apply_edit, full_parse, incremental_update, incremental_update_instrumented, UpdateOutcome,
-    WidenReason,
+    apply_edit, full_parse, full_parse_rope, incremental_update, incremental_update_instrumented,
+    incremental_update_rope, UpdateOutcome, WidenReason,
 };
+
+// ---------------------------------------------------------------------------
+// Task-5 helpers: assert str path == rope path == full_parse
+// ---------------------------------------------------------------------------
+
+/// Assert that str-incremental, rope-incremental, and full_parse all agree for
+/// a single edit. For use inside proptests (uses prop_assert_eq!).
+///
+/// NOTE: this function contains `prop_assert_eq!` — it must only be called
+/// from within a `proptest!` closure.
+macro_rules! assert_all_paths_agree {
+    ($old:expr, $edit:expr, $new:expr) => {{
+        let old: &str = $old;
+        let edit = $edit;
+        let new: &str = $new;
+        let ot = full_parse(old);
+        let full = full_parse(new);
+        let str_inc = incremental_update(&ot, old, edit, new);
+        let rope_inc = incremental_update_rope(
+            &ot,
+            &Rope::from_str(old),
+            edit,
+            &Rope::from_str(new),
+        );
+        prop_assert_eq!(&str_inc, &full,
+            "\nstr path != full_parse\nold={:?}\nnew={:?}", old, new);
+        prop_assert_eq!(&rope_inc, &full,
+            "\nrope path != full_parse\nold={:?}\nnew={:?}", old, new);
+        prop_assert_eq!(&rope_inc, &str_inc,
+            "\nrope path != str path\nold={:?}\nnew={:?}", old, new);
+    }};
+}
+
+/// Assert str-incremental == rope-incremental == full_parse at every step of a
+/// multi-edit chain. Carries BOTH spliced trees forward — str_tree feeds the
+/// next str update, rope_tree feeds the next rope update — so we prove that a
+/// spliced rope tree is valid input to the next incremental_update_rope call.
+///
+/// NOTE: contains `prop_assert_eq!` — must be called from a `proptest!` closure.
+macro_rules! assert_chain_paths_agree {
+    ($initial:expr, $edits:expr) => {{
+        let initial: &str = $initial;
+        let edits: &[(wordcartel_core::block_tree::Edit, String)] = $edits;
+        let mut text = initial.to_string();
+        let mut str_tree = full_parse(initial);
+        let mut rope_tree = full_parse_rope(&Rope::from_str(initial));
+        for (edit, new_text) in edits {
+            let new_str_tree = incremental_update(&str_tree, &text, edit, new_text);
+            let new_rope_tree = incremental_update_rope(
+                &rope_tree,
+                &Rope::from_str(&text),
+                edit,
+                &Rope::from_str(new_text),
+            );
+            let full = full_parse(new_text);
+            prop_assert_eq!(&new_str_tree, &full,
+                "\nchain: str path != full_parse\nbefore={:?}\nafter={:?}", text, new_text);
+            prop_assert_eq!(&new_rope_tree, &full,
+                "\nchain: rope path != full_parse\nbefore={:?}\nafter={:?}", text, new_text);
+            prop_assert_eq!(&new_rope_tree, &new_str_tree,
+                "\nchain: rope path != str path\nbefore={:?}\nafter={:?}", text, new_text);
+            str_tree = new_str_tree;
+            rope_tree = new_rope_tree;
+            text = new_text.clone();
+        }
+    }};
+}
 
 // ---------------------------------------------------------------------------
 // Targeted regression cases (deterministic). Each exercises one named hazard.
@@ -351,56 +419,48 @@ proptest! {
         let hi0 = snap(&doc, pa.max(pb));
         let range = lo0..hi0;
 
-        let old_tree = full_parse(&doc);
         let (new_text, edit) = apply_edit(&doc, range, &rep);
-        let inc = incremental_update(&old_tree, &doc, &edit, &new_text);
-        let full = full_parse(&new_text);
-        prop_assert_eq!(inc, full,
-            "\noracle mismatch\nold={:?}\nnew={:?}", doc, new_text);
+        // Assert str path == rope path == full_parse (the Task-5 gate).
+        assert_all_paths_agree!(&doc, &edit, &new_text);
     }
 
     /// Test A — multi-edit chain.
     ///
     /// Proves that the spliced BlockTree produced by `incremental_update` is a
     /// valid input to a subsequent `incremental_update` call: at each step in
-    /// the chain we assert `incremental == full_parse`.
+    /// the chain we assert `incremental == full_parse`. Both the str tree and
+    /// the rope tree are carried forward so the rope path is also gated.
     #[test]
     fn oracle_multi_edit_chain(
         initial in doc_strategy(),
         edits in edit_seq_strategy(),
     ) {
-        let mut text = initial;
-        let mut tree = full_parse(&text);
-
-        for (pa, pb, rep) in edits {
-            let lo = snap(&text, pa.min(pb));
-            let hi = snap(&text, pa.max(pb));
-            let (new_text, edit) = apply_edit(&text, lo..hi, &rep);
-            tree = incremental_update(&tree, &text, &edit, &new_text);
-            let full = full_parse(&new_text);
-            prop_assert_eq!(
-                tree.clone(), full,
-                "\nmulti-edit chain mismatch after applying edit ({}..{}, rep={:?})\ntext_before={:?}\ntext_after={:?}",
-                lo, hi, rep, text, new_text
-            );
-            text = new_text;
-        }
+        let edits: Vec<(wordcartel_core::block_tree::Edit, String)> = {
+            let mut text = initial.clone();
+            let mut out = Vec::new();
+            for (pa, pb, rep) in edits {
+                let lo = snap(&text, pa.min(pb));
+                let hi = snap(&text, pa.max(pb));
+                let (new_text, edit) = apply_edit(&text, lo..hi, &rep);
+                out.push((edit, new_text.clone()));
+                text = new_text;
+            }
+            out
+        };
+        assert_chain_paths_agree!(&initial, &edits);
     }
 
     /// Test B — multibyte corpus.
     ///
     /// Proves the byte-offset / line_start / line_end arithmetic is UTF-8-safe
     /// when documents and replacements contain multibyte graphemes (é/中/🙂).
+    /// Also asserts the rope path agrees with the str path and full_parse.
     #[test]
     fn oracle_multibyte_corpus((doc, (pa, pb), rep) in mb_doc_and_edit_strategy()) {
         let lo = snap(&doc, pa.min(pb));
         let hi = snap(&doc, pa.max(pb));
         let (new_text, edit) = apply_edit(&doc, lo..hi, &rep);
-        let old_tree = full_parse(&doc);
-        let inc = incremental_update(&old_tree, &doc, &edit, &new_text);
-        let full = full_parse(&new_text);
-        prop_assert_eq!(inc, full,
-            "\nmultibyte oracle mismatch\nold={:?}\nnew={:?}", doc, new_text);
+        assert_all_paths_agree!(&doc, &edit, &new_text);
     }
 
 }
@@ -423,8 +483,8 @@ proptest! {
     /// spliced BlockTrees produced by incremental_update remain correct across
     /// multiple edits when both the initial document AND each replacement
     /// contain multibyte graphemes (é/中/🙂). Positions are snapped to char
-    /// boundaries. The result tree of edit N is fed as old_tree of edit N+1,
-    /// and we assert incremental == full_parse at each step.
+    /// boundaries. Both the str tree and the rope tree are carried forward so
+    /// the rope path is also gated at every step.
     #[test]
     fn oracle_mb_multi_edit_chain(
         initial in mb_doc_strategy(),
@@ -433,24 +493,21 @@ proptest! {
             1..=8,
         ),
     ) {
-        let mut text = initial;
-        let mut tree = full_parse(&text);
-
-        for (pa, pb, rep) in edits {
-            let pa = pa as usize;
-            let pb = pb as usize;
-            let lo = snap(&text, pa.min(pb));
-            let hi = snap(&text, pa.max(pb));
-            let (new_text, edit) = apply_edit(&text, lo..hi, &rep);
-            tree = incremental_update(&tree, &text, &edit, &new_text);
-            let full = full_parse(&new_text);
-            prop_assert_eq!(
-                tree.clone(), full,
-                "\nmb multi-edit chain mismatch after applying edit ({}..{}, rep={:?})\ntext_before={:?}\ntext_after={:?}",
-                lo, hi, rep, text, new_text
-            );
-            text = new_text;
-        }
+        let edits: Vec<(wordcartel_core::block_tree::Edit, String)> = {
+            let mut text = initial.clone();
+            let mut out = Vec::new();
+            for (pa, pb, rep) in edits {
+                let pa = pa as usize;
+                let pb = pb as usize;
+                let lo = snap(&text, pa.min(pb));
+                let hi = snap(&text, pa.max(pb));
+                let (new_text, edit) = apply_edit(&text, lo..hi, &rep);
+                out.push((edit, new_text.clone()));
+                text = new_text;
+            }
+            out
+        };
+        assert_chain_paths_agree!(&initial, &edits);
     }
 }
 
@@ -531,19 +588,15 @@ fn regression_inline_link_end_corrupts_list_nesting() {
     let (text2, edit2) = apply_edit(text1, 78..78, "[r]: http://y.test\n");
 
     // Single-edit form (simpler): feed full_parse(text1) as old_tree.
-    let t1_full = full_parse(text1);
-    let inc_single = incremental_update(&t1_full, text1, &edit2, &text2);
-    let full2 = full_parse(&text2);
-    assert_eq!(
-        inc_single, full2,
-        "\nregression: single-edit incremental != full_parse\ntext1={text1:?}\ntext2={text2:?}\nincremental={inc_single:#?}\nfull={full2:#?}"
-    );
+    // Also asserts the rope path agrees (Task-5 gate).
+    assert_all_paths_agree_det(text1, &edit2, &text2);
 
     // Chained form: replay edit1 first, then edit2.
     // edit1: replace initial[36..38] ("on") with "[r]: http://y.test\n"
     let initial = "    indented code\n    more\n\n- a\n\n  cont\n- b\n  - nested\n\n---\n\n[ref]: http://x.test\n\nuse [ref] here\n\naaaa\naaaaaa\n";
     let (text1_check, edit1) = apply_edit(initial, 36..38, "[r]: http://y.test\n");
     assert_eq!(text1_check, text1, "edit1 must reconstruct text1");
+    let full2 = full_parse(&text2);
     let t0 = full_parse(initial);
     let t1_inc = incremental_update(&t0, initial, &edit1, text1);
     let inc_chain = incremental_update(&t1_inc, text1, &edit2, &text2);
@@ -551,11 +604,45 @@ fn regression_inline_link_end_corrupts_list_nesting() {
         inc_chain, full2,
         "\nregression: chained incremental != full_parse\ntext2={text2:?}\nincremental={inc_chain:#?}\nfull={full2:#?}"
     );
+    // Also assert the rope chain agrees.
+    let rope_t0 = full_parse_rope(&Rope::from_str(initial));
+    let rope_t1 = incremental_update_rope(&rope_t0, &Rope::from_str(initial), &edit1, &Rope::from_str(text1));
+    let rope_chain = incremental_update_rope(&rope_t1, &Rope::from_str(text1), &edit2, &Rope::from_str(&text2));
+    assert_eq!(
+        rope_chain, full2,
+        "\nregression: rope chained incremental != full_parse\ntext2={text2:?}\nrope={rope_chain:#?}\nfull={full2:#?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
 // CE1 / CE2 — forward/downstream container merge (pinned regressions)
 // ---------------------------------------------------------------------------
+
+/// Deterministic (non-proptest) version of the three-way assertion:
+/// str-incremental == rope-incremental == full_parse.
+fn assert_all_paths_agree_det(old_text: &str, edit: &wordcartel_core::block_tree::Edit, new_text: &str) {
+    let ot = full_parse(old_text);
+    let full = full_parse(new_text);
+    let str_inc = incremental_update(&ot, old_text, edit, new_text);
+    let rope_inc = incremental_update_rope(
+        &ot,
+        &Rope::from_str(old_text),
+        edit,
+        &Rope::from_str(new_text),
+    );
+    assert_eq!(
+        str_inc, full,
+        "\nstr path != full_parse\nold={old_text:?}\nnew={new_text:?}\nstr={str_inc:#?}\nfull={full:#?}"
+    );
+    assert_eq!(
+        rope_inc, full,
+        "\nrope path != full_parse\nold={old_text:?}\nnew={new_text:?}\nrope={rope_inc:#?}\nfull={full:#?}"
+    );
+    assert_eq!(
+        rope_inc, str_inc,
+        "\nrope path != str path\nold={old_text:?}\nnew={new_text:?}"
+    );
+}
 
 /// CE1: editing the first table (bytes 21..30 -> "> ") produces a new region
 /// that ends exactly at the start of the second table. The second table would
@@ -567,13 +654,7 @@ fn regression_inline_link_end_corrupts_list_nesting() {
 fn regression_ce1_downstream_table_merge() {
     let old_text = "| a | b |\n|---|---|\n| 1 | 2 |\n\n| a | b |\n|[r]: http://y.test\n---|\n| 1 | 2 |\n\naa\n---\n";
     let (new_text, edit) = apply_edit(old_text, 21..30, "> ");
-    let old_tree = full_parse(old_text);
-    let inc = incremental_update(&old_tree, old_text, &edit, &new_text);
-    let full = full_parse(&new_text);
-    assert_eq!(
-        inc, full,
-        "\nCE1: incremental != full_parse\nold={old_text:?}\nnew={new_text:?}\nincremental={inc:#?}\nfull={full:#?}"
-    );
+    assert_all_paths_agree_det(old_text, &edit, &new_text);
 }
 
 /// CE2: deleting "# 中- " (bytes 0..5) turns the heading line into "- a",
@@ -584,11 +665,120 @@ fn regression_ce1_downstream_table_merge() {
 fn regression_ce2_downstream_list_merge() {
     let old_text = "# 中- a\n\n  cont\n- b\n  - nested\n";
     let (new_text, edit) = apply_edit(old_text, 0..5, "");
-    let old_tree = full_parse(old_text);
-    let inc = incremental_update(&old_tree, old_text, &edit, &new_text);
-    let full = full_parse(&new_text);
+    assert_all_paths_agree_det(old_text, &edit, &new_text);
+}
+
+// ---------------------------------------------------------------------------
+// Separator-byte deterministic regressions (Task-5 must-fix)
+//
+// The random corpus never emits CR, FF, LS, or PS, so without these explicit
+// tests the str==rope assertion is untested for the exact bytes where ropey's
+// Unicode-line APIs would diverge from \n-only semantics. Each test applies
+// an edit near a non-LF separator and asserts:
+//   incremental_update_rope == full_parse_rope == incremental_update == full_parse
+// This PINS that the rope TextSource impl treats ONLY \n as a line break.
+// ---------------------------------------------------------------------------
+
+/// Pin: \r (carriage return) — NOT a line separator in our semantics.
+#[test]
+fn separator_cr_is_not_a_line_break() {
+    let old = "a\rb\nc";
+    // Insert a char adjacent to the \r (byte offset 1).
+    let (new, edit) = apply_edit(old, 1..1, "X");
+    assert_all_paths_agree_det(old, &edit, &new);
+    // Also verify the rope full_parse agrees.
     assert_eq!(
-        inc, full,
-        "\nCE2: incremental != full_parse\nold={old_text:?}\nnew={new_text:?}\nincremental={inc:#?}\nfull={full:#?}"
+        full_parse_rope(&Rope::from_str(&new)),
+        full_parse(&new),
+        "full_parse_rope != full_parse for {:?}", new
+    );
+}
+
+/// Pin: \r\n (CRLF) — the \r must NOT be treated as a line break.
+#[test]
+fn separator_crlf_only_lf_is_line_break() {
+    let old = "a\r\nb\nc";
+    // Insert adjacent to the \r (byte offset 1).
+    let (new, edit) = apply_edit(old, 1..1, "X");
+    assert_all_paths_agree_det(old, &edit, &new);
+    assert_eq!(
+        full_parse_rope(&Rope::from_str(&new)),
+        full_parse(&new),
+        "full_parse_rope != full_parse for {:?}", new
+    );
+}
+
+/// Pin: \x0c (form feed / FF) — ropey unicode_lines treats this as a break;
+/// our impl must NOT.
+#[test]
+fn separator_ff_is_not_a_line_break() {
+    let old = "x\x0cy\nz";
+    // Insert adjacent to the FF (byte offset 1).
+    let (new, edit) = apply_edit(old, 1..1, "X");
+    assert_all_paths_agree_det(old, &edit, &new);
+    assert_eq!(
+        full_parse_rope(&Rope::from_str(&new)),
+        full_parse(&new),
+        "full_parse_rope != full_parse for {:?}", new
+    );
+}
+
+/// Pin: \x0b (vertical tab / VT) — ropey unicode_lines treats this as a break;
+/// our impl must NOT.
+#[test]
+fn separator_vt_is_not_a_line_break() {
+    let old = "x\x0by\nz";
+    // Insert adjacent to the VT (byte offset 1).
+    let (new, edit) = apply_edit(old, 1..1, "X");
+    assert_all_paths_agree_det(old, &edit, &new);
+    assert_eq!(
+        full_parse_rope(&Rope::from_str(&new)),
+        full_parse(&new),
+        "full_parse_rope != full_parse for {:?}", new
+    );
+}
+
+/// Pin: U+0085 (NEL / next line) — ropey unicode_lines treats this as a break;
+/// our impl must NOT.
+#[test]
+fn separator_nel_is_not_a_line_break() {
+    let old = "p\u{0085}q\nr";
+    // Insert adjacent to the NEL (byte offset 1, before the 2-byte U+0085).
+    let (new, edit) = apply_edit(old, 1..1, "X");
+    assert_all_paths_agree_det(old, &edit, &new);
+    assert_eq!(
+        full_parse_rope(&Rope::from_str(&new)),
+        full_parse(&new),
+        "full_parse_rope != full_parse for {:?}", new
+    );
+}
+
+/// Pin: U+2028 (LINE SEPARATOR) — ropey unicode_lines treats this as a break;
+/// our impl must NOT.
+#[test]
+fn separator_ls_is_not_a_line_break() {
+    let old = "p\u{2028}q\nr";
+    // Insert adjacent to the LS (byte offset 1, before the 3-byte U+2028).
+    let (new, edit) = apply_edit(old, 1..1, "X");
+    assert_all_paths_agree_det(old, &edit, &new);
+    assert_eq!(
+        full_parse_rope(&Rope::from_str(&new)),
+        full_parse(&new),
+        "full_parse_rope != full_parse for {:?}", new
+    );
+}
+
+/// Pin: U+2029 (PARAGRAPH SEPARATOR) — ropey unicode_lines treats this as a
+/// break; our impl must NOT.
+#[test]
+fn separator_ps_is_not_a_line_break() {
+    let old = "p\u{2029}q\nr";
+    // Insert adjacent to the PS (byte offset 1, before the 3-byte U+2029).
+    let (new, edit) = apply_edit(old, 1..1, "X");
+    assert_all_paths_agree_det(old, &edit, &new);
+    assert_eq!(
+        full_parse_rope(&Rope::from_str(&new)),
+        full_parse(&new),
+        "full_parse_rope != full_parse for {:?}", new
     );
 }

@@ -1,5 +1,132 @@
+use std::borrow::Cow;
 use std::ops::Range;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+
+// ---------------------------------------------------------------------------
+// TextSource trait
+// ---------------------------------------------------------------------------
+
+/// Random-access view over the document text for block parsing.
+/// Byte offsets are into the whole document. `slice` returns a CONTIGUOUS &str
+/// (borrowed for &str sources, owned/materialized for ropes — O(slice len)).
+pub trait TextSource {
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn slice(&self, range: Range<usize>) -> Cow<'_, str>;
+    /// Byte offset of the start of the line containing `pos` (just after the
+    /// previous `\n`, or 0). `\n`-only semantics. `pos` is clamped to `len()`.
+    fn line_start(&self, pos: usize) -> usize;
+    /// Byte offset of the end of the line containing `pos` (the next `\n` + 1,
+    /// or `len()`). `\n`-only semantics. `pos` is clamped to `len()`.
+    fn line_end(&self, pos: usize) -> usize;
+}
+
+impl TextSource for &str {
+    fn len(&self) -> usize {
+        str::len(self)
+    }
+
+    fn slice(&self, range: Range<usize>) -> Cow<'_, str> {
+        Cow::Borrowed(&self[range])
+    }
+
+    fn line_start(&self, pos: usize) -> usize {
+        let pos = pos.min(self.len());
+        match self.as_bytes()[..pos].iter().rposition(|&b| b == b'\n') {
+            Some(nl) => nl + 1,
+            None => 0,
+        }
+    }
+
+    fn line_end(&self, pos: usize) -> usize {
+        let pos = pos.min(self.len());
+        match self.as_bytes()[pos..].iter().position(|&b| b == b'\n') {
+            Some(off) => pos + off + 1,
+            None => self.len(),
+        }
+    }
+}
+
+impl TextSource for &ropey::Rope {
+    fn len(&self) -> usize {
+        self.len_bytes()
+    }
+
+    fn slice(&self, range: Range<usize>) -> Cow<'_, str> {
+        Cow::Owned(self.byte_slice(range).to_string())
+    }
+
+    /// Walk backward through rope chunks looking for the last `\n` before
+    /// `pos`. Returns one past that `\n`, or 0 if none. LF-only semantics
+    /// (does NOT use ropey's line APIs which treat many Unicode separators
+    /// as line breaks).
+    fn line_start(&self, pos: usize) -> usize {
+        let pos = pos.min(self.len_bytes());
+        // Special case: pos == 0 means we're at the very beginning.
+        if pos == 0 {
+            return 0;
+        }
+        // We scan backward from pos-1 through the rope's chunks.
+        // chunk_at_byte(byte_idx) returns (chunk_str, chunk_byte_start, ..)
+        // The chunk containing byte_idx is chunk[byte_idx - chunk_byte_start].
+        let mut remaining = pos; // how many bytes from the start we still need to cover
+        loop {
+            // Get the chunk that contains byte index `remaining - 1`.
+            let (chunk, chunk_start, _, _) = self.chunk_at_byte(remaining - 1);
+            // How many bytes of this chunk are relevant? Only up to `remaining`
+            // bytes from document start, so up to (remaining - chunk_start) bytes
+            // into the chunk.
+            let chunk_bytes = chunk.as_bytes();
+            let within_chunk_end = remaining - chunk_start; // exclusive end within chunk
+            // Search backward in chunk_bytes[..within_chunk_end] for '\n'.
+            if let Some(local_nl) = chunk_bytes[..within_chunk_end]
+                .iter()
+                .rposition(|&b| b == b'\n')
+            {
+                // Found a '\n' at global byte offset chunk_start + local_nl.
+                return chunk_start + local_nl + 1;
+            }
+            // No '\n' in this chunk's relevant portion. Continue to the chunk before.
+            if chunk_start == 0 {
+                // We've scanned back to the start of the rope — no '\n' found.
+                return 0;
+            }
+            remaining = chunk_start;
+        }
+    }
+
+    /// Walk forward through rope chunks looking for the first `\n` at or
+    /// after `pos`. Returns that byte's index + 1, or `len_bytes()` if none.
+    /// LF-only semantics (does NOT use ropey's line APIs).
+    fn line_end(&self, pos: usize) -> usize {
+        let total = self.len_bytes();
+        let pos = pos.min(total);
+        if pos == total {
+            return total;
+        }
+        let mut offset = pos; // current search position in the rope
+        loop {
+            let (chunk, chunk_start, _, _) = self.chunk_at_byte(offset);
+            let chunk_bytes = chunk.as_bytes();
+            // Relevant portion of this chunk starts at (offset - chunk_start).
+            let within_chunk_start = offset - chunk_start;
+            if let Some(local_nl) = chunk_bytes[within_chunk_start..]
+                .iter()
+                .position(|&b| b == b'\n')
+            {
+                return chunk_start + within_chunk_start + local_nl + 1;
+            }
+            // No '\n' in this chunk. Advance to the next chunk.
+            let next = chunk_start + chunk.len();
+            if next >= total {
+                return total;
+            }
+            offset = next;
+        }
+    }
+}
 
 /// Kinds of block we track. Inline-level tags are ignored; we only keep the
 /// block skeleton, which is what the renderer's layout depends on.
@@ -182,13 +309,21 @@ fn is_rule(event: &Event) -> bool {
 
 /// THE ORACLE. Walk block-level events, building a nested tree with byte spans.
 pub fn full_parse(text: &str) -> BlockTree {
-    parse_region(text, 0)
+    full_parse_src(&text)
 }
 
-/// Parse `text`, treating it as living at byte offset `base` in some larger
-/// document. All spans are shifted by `base`.
-fn parse_region(text: &str, base: usize) -> BlockTree {
-    let parser = Parser::new_ext(text, options());
+/// Generic version of `full_parse` over any `TextSource`.
+pub fn full_parse_src<S: TextSource>(src: &S) -> BlockTree {
+    parse_region(src, 0..src.len(), 0)
+}
+
+/// Parse the byte range `region` of `src`, treating the region as living at
+/// byte offset `base` in some larger document.  All spans are shifted by
+/// `base`.  The `Cow<str>` returned by `src.slice(region)` is bound to a
+/// local variable so it outlives the pulldown-cmark parser borrow.
+fn parse_region<S: TextSource>(src: &S, region: Range<usize>, base: usize) -> BlockTree {
+    let text = src.slice(region);
+    let parser = Parser::new_ext(text.as_ref(), options());
 
     let mut root = Block {
         kind: BlockKind::Document,
@@ -281,21 +416,60 @@ pub struct UpdateOutcome {
 }
 
 /// Incrementally update `old_tree` for `edit`, producing the new tree.
+/// `&str` wrapper — unchanged public signature; existing callers and the oracle
+/// rely on this.
 pub fn incremental_update(
     old_tree: &BlockTree,
     old_text: &str,
     edit: &Edit,
     new_text: &str,
 ) -> BlockTree {
-    incremental_update_instrumented(old_tree, old_text, edit, new_text).tree
+    incremental_update_src(old_tree, &old_text, edit, &new_text)
 }
 
 /// As `incremental_update` but returns instrumentation about how wide we went.
+/// `&str` wrapper — unchanged public signature; existing callers and the oracle
+/// rely on this.
 pub fn incremental_update_instrumented(
     old_tree: &BlockTree,
     old_text: &str,
     edit: &Edit,
     new_text: &str,
+) -> UpdateOutcome {
+    incremental_update_instrumented_src(old_tree, &old_text, edit, &new_text)
+}
+
+/// Rope entry point: full parse from a `ropey::Rope`.
+pub fn full_parse_rope(rope: &ropey::Rope) -> BlockTree {
+    full_parse_src(&rope)
+}
+
+/// Rope entry point: incremental update from `ropey::Rope` snapshots.
+pub fn incremental_update_rope(
+    old_tree: &BlockTree,
+    old_rope: &ropey::Rope,
+    edit: &Edit,
+    new_rope: &ropey::Rope,
+) -> BlockTree {
+    incremental_update_src(old_tree, &old_rope, edit, &new_rope)
+}
+
+/// Generic `incremental_update` over any `TextSource`.
+pub fn incremental_update_src<S: TextSource>(
+    old_tree: &BlockTree,
+    old_src: &S,
+    edit: &Edit,
+    new_src: &S,
+) -> BlockTree {
+    incremental_update_instrumented_src(old_tree, old_src, edit, new_src).tree
+}
+
+/// Generic `incremental_update_instrumented` over any `TextSource`.
+pub fn incremental_update_instrumented_src<S: TextSource>(
+    old_tree: &BlockTree,
+    old_src: &S,
+    edit: &Edit,
+    new_src: &S,
 ) -> UpdateOutcome {
     let delta = edit.delta();
     let tops = old_tree.top_level();
@@ -330,8 +504,8 @@ pub fn incremental_update_instrumented(
     region_old_start = region_old_start.min(edit_lo);
     region_old_end = region_old_end.max(edit_hi);
     // Snap to line boundaries so we never cut a construct mid-line.
-    region_old_start = line_start(old_text, region_old_start);
-    region_old_end = line_end(old_text, region_old_end);
+    region_old_start = old_src.line_start(region_old_start);
+    region_old_end = old_src.line_end(region_old_end);
 
     // UPSTREAM LINE-GROUP CONTEXT: how a line parses depends on the lines
     // immediately above it within the same blank-line-delimited group: a ref
@@ -340,13 +514,13 @@ pub fn incremental_update_instrumented(
     // underline, but after a blank line is a list bullet. So pull the region
     // start back to the most recent BLANK line (start of the current line
     // group). This guarantees the reparse sees the whole group.
-    region_old_start = blank_delimited_group_start(old_text, region_old_start);
+    region_old_start = blank_delimited_group_start(old_src, region_old_start);
     // The group walk can cross a blank line that lives *inside* a fenced or
     // indented code block (where blanks are content, not delimiters), landing
     // mid-block. Snap back to the start of any top-level block it landed inside.
     for b in tops.iter() {
         if b.span.start < region_old_start && b.span.end > region_old_start {
-            region_old_start = line_start(old_text, b.span.start);
+            region_old_start = old_src.line_start(b.span.start);
         }
     }
 
@@ -372,18 +546,26 @@ pub fn incremental_update_instrumented(
                 b.kind,
                 BlockKind::List | BlockKind::BlockQuote | BlockKind::IndentedCode
             );
-            // gap between block end and region start must be only blank /
-            // ref-def lines (no other block intervenes by construction, since
-            // this is the nearest preceding block).
-            let gap_lo = b.span.end.min(old_text.len());
-            let gap_hi = region_old_start.min(old_text.len());
-            let gap = &old_text[gap_lo.min(gap_hi)..gap_hi];
-            let gap_is_soft = gap
-                .lines()
-                .all(|l| l.trim().is_empty() || is_ref_def_line(l));
-            if absorptive && b.span.end <= region_old_start && gap_is_soft {
-                region_old_start = line_start(old_text, b.span.start);
-                continue;
+            // Only materialize/scan the gap when absorption is actually in play.
+            // Hoisting this behind the `absorptive` guard keeps the local hot
+            // path O(region): a non-absorptive preceding block (the common case)
+            // never reads the gap, which can otherwise be O(document) when a
+            // large blank span sits upstream of the edit.
+            if absorptive && b.span.end <= region_old_start {
+                // gap between block end and region start must be only blank /
+                // ref-def lines (no other block intervenes by construction,
+                // since this is the nearest preceding block).
+                let gap_lo = b.span.end.min(old_src.len());
+                let gap_hi = region_old_start.min(old_src.len());
+                let gap = old_src.slice(gap_lo.min(gap_hi)..gap_hi);
+                let gap_is_soft = gap
+                    .as_ref()
+                    .lines()
+                    .all(|l| l.trim().is_empty() || is_ref_def_line(l));
+                if gap_is_soft {
+                    region_old_start = old_src.line_start(b.span.start);
+                    continue;
+                }
             }
         }
         break;
@@ -392,9 +574,9 @@ pub fn incremental_update_instrumented(
     // HTML blocks can change where a *preceding* block ends, so a downstream-
     // only widen is not enough — fall back to a full reparse. This is cheap to
     // detect and HTML in prose is rare (see report).
-    if html_in_play(old_text, new_text, edit, region_old_start, region_old_end) {
-        let tree = full_parse(new_text);
-        return UpdateOutcome { tree, reason: WidenReason::NoOverlapFull, reparsed_bytes: new_text.len() };
+    if html_in_play(old_src, new_src, edit, region_old_start, region_old_end) {
+        let tree = full_parse_src(new_src);
+        return UpdateOutcome { tree, reason: WidenReason::NoOverlapFull, reparsed_bytes: new_src.len() };
     }
 
     // DOWNSTREAM ABSORPTION: editing inside / abutting a List, BlockQuote or
@@ -455,10 +637,10 @@ pub fn incremental_update_instrumented(
     let widen = absorptive_in_region
         || slack_is_absorptive
         || downstream_container_merge
-        || needs_widen_to_end(old_text, new_text, edit, region_old_start, region_old_end);
+        || needs_widen_to_end(old_src, new_src, edit, region_old_start, region_old_end);
     let reason;
     if widen {
-        region_old_end = old_text.len();
+        region_old_end = old_src.len();
         reason = WidenReason::WidenToEnd;
     } else {
         // +1 top-level block of slack: extend region_old_end to cover the
@@ -476,7 +658,7 @@ pub fn incremental_update_instrumented(
         // Fix: set region_old_end to the span.start of the block AFTER the
         // slack block (the first true "after" block), so all gap bytes between
         // the slack block and the next "after" block are inside the region.
-        // If there's no block after the slack, extend to old_text.len().
+        // If there's no block after the slack, extend to old_src.len().
         //
         // This is needed in two cases:
         // (a) The edit overlapped at least one block (have_overlap=true): the
@@ -495,7 +677,7 @@ pub fn incremental_update_instrumented(
                 region_old_end = tops[slack_idx + 1].span.start;
             } else {
                 // No block after the slack block — include all trailing bytes.
-                region_old_end = old_text.len();
+                region_old_end = old_src.len();
             }
         }
         // When editing in a gap, also include the last block before the region
@@ -503,7 +685,7 @@ pub fn incremental_update_instrumented(
         // may change how the gap and following content parse.
         if !have_overlap {
             if let Some(b) = tops.iter().rev().find(|b| b.span.end <= region_old_start) {
-                region_old_start = line_start(old_text, b.span.start);
+                region_old_start = old_src.line_start(b.span.start);
             }
         }
         reason = WidenReason::Local;
@@ -520,12 +702,12 @@ pub fn incremental_update_instrumented(
         for b in tops.iter() {
             // straddles start?
             if b.span.start < region_old_start && b.span.end > region_old_start {
-                region_old_start = line_start(old_text, b.span.start);
+                region_old_start = old_src.line_start(b.span.start);
                 grew = true;
             }
             // straddles end?
             if b.span.start < region_old_end && b.span.end > region_old_end {
-                region_old_end = line_end(old_text, b.span.end);
+                region_old_end = old_src.line_end(b.span.end);
                 grew = true;
             }
         }
@@ -539,21 +721,21 @@ pub fn incremental_update_instrumented(
     // neither included in the reparse region nor captured by a shifted "after"
     // block. If there are no "after" blocks (no block with span.start >=
     // region_old_end), those trailing bytes disappear from the splice result.
-    // Extend region_old_end to old_text.len() so they are included in the
+    // Extend region_old_end to old_src.len() so they are included in the
     // reparse when necessary.
     let has_after_block = tops.iter().any(|b| b.span.start >= region_old_end);
-    if !has_after_block && region_old_end < old_text.len() {
-        region_old_end = old_text.len();
+    if !has_after_block && region_old_end < old_src.len() {
+        region_old_end = old_src.len();
     }
 
     // Gap 3: machine-check the trailing-gap bound. `region_old_end` is now
     // final; verify it never exceeds the document length before we use it to
     // compute region_new_end and drive the splice.
     debug_assert!(
-        region_old_end <= old_text.len(),
+        region_old_end <= old_src.len(),
         "region_old_end {} past doc len {}",
         region_old_end,
-        old_text.len()
+        old_src.len()
     );
 
     debug_assert!(region_old_start <= edit_lo);
@@ -562,9 +744,10 @@ pub fn incremental_update_instrumented(
     let region_new_start = region_old_start;
     let region_new_end = (region_old_end as isize + delta) as usize;
 
-    let new_slice = &new_text[region_new_start..region_new_end];
-    let reparsed = parse_region(new_slice, region_new_start);
-    let reparsed_bytes = new_slice.len();
+    // Materialize only the edited region from new_src (O(region), not O(doc)).
+    let new_region = new_src.slice(region_new_start..region_new_end);
+    let reparsed = parse_region(&new_region.as_ref(), 0..new_region.len(), region_new_start);
+    let reparsed_bytes = new_region.len();
 
     // Splice driven purely by the final region bounds, so it stays consistent
     // regardless of how the region was widened/snapped.
@@ -584,27 +767,27 @@ pub fn incremental_update_instrumented(
         }
     }
 
-    let root = Block { kind: BlockKind::Document, span: 0..new_text.len(), children: result_children };
+    let root = Block { kind: BlockKind::Document, span: 0..new_src.len(), children: result_children };
     UpdateOutcome { tree: BlockTree { root }, reason, reparsed_bytes }
 }
 
 /// Conservative triggers that force reparsing to end-of-document.
-fn needs_widen_to_end(
-    old_text: &str,
-    new_text: &str,
+fn needs_widen_to_end<S: TextSource>(
+    old_src: &S,
+    new_src: &S,
     edit: &Edit,
     region_old_start: usize,
     region_old_end: usize,
 ) -> bool {
-    let os = region_old_start.min(old_text.len());
-    let oe = region_old_end.min(old_text.len());
-    let old_region = &old_text[os.min(oe)..oe];
-    let new_start = region_old_start.min(new_text.len());
-    let new_region_end = ((region_old_end as isize + edit.delta()) as usize).min(new_text.len());
-    let new_region = &new_text[new_start.min(new_region_end)..new_region_end];
+    let os = region_old_start.min(old_src.len());
+    let oe = region_old_end.min(old_src.len());
+    let old_region = old_src.slice(os.min(oe)..oe);
+    let new_start = region_old_start.min(new_src.len());
+    let new_region_end = ((region_old_end as isize + edit.delta()) as usize).min(new_src.len());
+    let new_region = new_src.slice(new_start.min(new_region_end)..new_region_end);
 
     // (a) Link reference definitions are resolved document-wide.
-    if contains_ref_def(old_region) || contains_ref_def(new_region) {
+    if contains_ref_def(old_region.as_ref()) || contains_ref_def(new_region.as_ref()) {
         return true;
     }
     // (b) Fence structure is fragile: editing ANY fence-marker line can flip a
@@ -613,13 +796,13 @@ fn needs_widen_to_end(
     //     marker-COUNT is not enough (the line still *starts* with backticks),
     //     so we widen whenever the edit intersects a fence-marker line in
     //     either the old or new text, or the marker count changes.
-    if fence_marker_count(old_region) != fence_marker_count(new_region) {
+    if fence_marker_count(old_region.as_ref()) != fence_marker_count(new_region.as_ref()) {
         return true;
     }
     let new_edit_start = edit.range.start;
     let new_edit_end = edit.range.start + edit.new_len;
-    if edit_touches_fence_line(old_text, edit.range.start, edit.range.end)
-        || edit_touches_fence_line(new_text, new_edit_start, new_edit_end)
+    if edit_touches_fence_line(old_src, edit.range.start, edit.range.end)
+        || edit_touches_fence_line(new_src, new_edit_start, new_edit_end)
     {
         return true;
     }
@@ -631,20 +814,20 @@ fn needs_widen_to_end(
 /// across the HTML boundary). Localizing this cheaply proved intractable in the
 /// spike (see report). Conservative, provably-safe rule: if either the old or
 /// new region contains any line starting with '<', fall back to a full reparse.
-fn html_in_play(
-    old_text: &str,
-    new_text: &str,
+fn html_in_play<S: TextSource>(
+    old_src: &S,
+    new_src: &S,
     edit: &Edit,
     region_old_start: usize,
     region_old_end: usize,
 ) -> bool {
-    let os = region_old_start.min(old_text.len());
-    let oe = region_old_end.min(old_text.len());
-    let old_region = &old_text[os.min(oe)..oe];
-    let new_start = region_old_start.min(new_text.len());
-    let new_region_end = ((region_old_end as isize + edit.delta()) as usize).min(new_text.len());
-    let new_region = &new_text[new_start.min(new_region_end)..new_region_end];
-    html_opener_count(old_region) > 0 || html_opener_count(new_region) > 0
+    let os = region_old_start.min(old_src.len());
+    let oe = region_old_end.min(old_src.len());
+    let old_region = old_src.slice(os.min(oe)..oe);
+    let new_start = region_old_start.min(new_src.len());
+    let new_region_end = ((region_old_end as isize + edit.delta()) as usize).min(new_src.len());
+    let new_region = new_src.slice(new_start.min(new_region_end)..new_region_end);
+    html_opener_count(old_region.as_ref()) > 0 || html_opener_count(new_region.as_ref()) > 0
 }
 
 fn is_ref_def_line(line: &str) -> bool {
@@ -661,15 +844,16 @@ fn contains_ref_def(s: &str) -> bool {
     s.lines().any(is_ref_def_line)
 }
 
-/// Does the byte range [lo,hi) in `text` intersect any line that begins
+/// Does the byte range [lo,hi) in `src` intersect any line that begins
 /// (after optional indentation) with a fence marker (``` or ~~~)?
-fn edit_touches_fence_line(text: &str, lo: usize, hi: usize) -> bool {
-    let lo = lo.min(text.len());
-    let hi = hi.min(text.len());
+fn edit_touches_fence_line<S: TextSource>(src: &S, lo: usize, hi: usize) -> bool {
+    let lo = lo.min(src.len());
+    let hi = hi.min(src.len());
     // Expand to whole lines covering [lo, hi].
-    let ls = line_start(text, lo);
-    let le = if hi <= lo { line_end(text, lo) } else { line_end(text, hi.saturating_sub(1).max(lo)) };
-    text[ls..le].lines().any(|l| {
+    let ls = src.line_start(lo);
+    let le = if hi <= lo { src.line_end(lo) } else { src.line_end(hi.saturating_sub(1).max(lo)) };
+    let region = src.slice(ls..le);
+    region.as_ref().lines().any(|l| {
         let t = l.trim_start();
         t.starts_with("```") || t.starts_with("~~~")
     })
@@ -694,48 +878,18 @@ fn html_opener_count(s: &str) -> usize {
 /// line group: i.e. just after the most recent blank (whitespace-only) line
 /// at-or-above `pos`, or 0. This captures the upstream context that affects how
 /// a line parses (ref-def adjacency, setext underline, lazy paragraph lines).
-fn blank_delimited_group_start(text: &str, pos: usize) -> usize {
-    let mut ls = line_start(text, pos);
+fn blank_delimited_group_start<S: TextSource>(src: &S, pos: usize) -> usize {
+    let mut ls = src.line_start(pos);
     while ls > 0 {
-        // line above ls is text[prev_ls..ls-? ]; find its start.
-        let prev_ls = line_start(text, ls - 1);
-        let prev_line = &text[prev_ls..ls]; // includes the trailing '\n'
-        if prev_line.trim().is_empty() {
+        // line above ls is src[prev_ls..ls]; find its start.
+        let prev_ls = src.line_start(ls - 1);
+        let prev_line = src.slice(prev_ls..ls); // includes the trailing '\n'
+        if prev_line.as_ref().trim().is_empty() {
             break; // blank line above -> ls is the group start
         }
         ls = prev_ls;
     }
     ls
-}
-
-/// Byte index of the start of the line containing `pos` (i.e. just after the
-/// previous '\n', or 0).
-///
-/// `pos` need not be on a char boundary — we search through the raw bytes for
-/// the ASCII newline (0x0A), which is never a continuation byte of a multibyte
-/// sequence, so byte-level search is always correct.
-fn line_start(text: &str, pos: usize) -> usize {
-    let pos = pos.min(text.len());
-    let bytes = text.as_bytes();
-    // Search backwards through bytes for '\n'.
-    match bytes[..pos].iter().rposition(|&b| b == b'\n') {
-        Some(nl) => nl + 1,
-        None => 0,
-    }
-}
-
-/// Byte index just past the '\n' terminating the line containing `pos` (or
-/// text end). This keeps the region on whole lines.
-///
-/// `pos` need not be on a char boundary — we search through raw bytes for the
-/// ASCII newline (0x0A).
-fn line_end(text: &str, pos: usize) -> usize {
-    let pos = pos.min(text.len());
-    let bytes = text.as_bytes();
-    match bytes[pos..].iter().position(|&b| b == b'\n') {
-        Some(off) => pos + off + 1,
-        None => text.len(),
-    }
 }
 
 fn shift_block(b: &Block, delta: isize) -> Block {
@@ -879,5 +1033,212 @@ mod tests {
         assert_eq!(t.role_at(4), Paragraph);
         // a byte past document end -> Paragraph
         assert_eq!(t.role_at(doc.len() + 5), Paragraph);
+    }
+
+    // -----------------------------------------------------------------------
+    // TextSource trait tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: for a string `s`, verify that the &str and &Rope impls of
+    /// TextSource agree on len, slice over a set of ranges, and
+    /// line_start/line_end at every byte position p in 0..=s.len().
+    fn check_textsource_agree(s: &str) {
+        let r = ropey::Rope::from_str(s);
+        let str_src: &dyn TextSource = &s;
+        let rope_src: &dyn TextSource = &&r;
+
+        // len
+        assert_eq!(
+            str_src.len(), rope_src.len(),
+            "len mismatch for {:?}", s
+        );
+
+        // slice over several representative ranges (all char-boundary-safe)
+        let len = s.len();
+        let slice_ranges: Vec<std::ops::Range<usize>> = {
+            // Collect all char boundaries (valid UTF-8 slice endpoints)
+            let boundaries: Vec<usize> = s.char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(len))
+                .collect();
+            let mut v = Vec::new();
+            for i in 0..boundaries.len() {
+                for j in i..boundaries.len() {
+                    v.push(boundaries[i]..boundaries[j]);
+                }
+            }
+            v.sort_by_key(|r| (r.start, r.end));
+            v.dedup();
+            v
+        };
+        for range in &slice_ranges {
+            let str_slice = str_src.slice(range.clone());
+            let rope_slice = rope_src.slice(range.clone());
+            assert_eq!(
+                str_slice.as_ref(), rope_slice.as_ref(),
+                "slice({:?}) mismatch for {:?}: str={:?} rope={:?}",
+                range, s, str_slice, rope_slice
+            );
+        }
+
+        // line_start and line_end at every position 0..=len
+        for p in 0..=len {
+            let str_ls = str_src.line_start(p);
+            let rope_ls = rope_src.line_start(p);
+            assert_eq!(
+                str_ls, rope_ls,
+                "line_start({}) mismatch for {:?}: str={} rope={}",
+                p, s, str_ls, rope_ls
+            );
+
+            let str_le = str_src.line_end(p);
+            let rope_le = rope_src.line_end(p);
+            assert_eq!(
+                str_le, rope_le,
+                "line_end({}) mismatch for {:?}: str={} rope={}",
+                p, s, str_le, rope_le
+            );
+        }
+    }
+
+    #[test]
+    fn textsource_str_and_rope_agree() {
+        // ASCII basics
+        for s in ["", "a", "a\n", "\n", "ab\ncd\n", "ab\ncd", "no newline"] {
+            check_textsource_agree(s);
+        }
+        // Multibyte content
+        check_textsource_agree("# 中\n\n🙂 x\nyy");
+        // Non-LF separator hazard cases: rope's unicode_lines would diverge
+        // on these if we used ropey's line APIs. Our impl must treat ONLY '\n'
+        // as a line break.
+        check_textsource_agree("a\rb");        // CR: not a line break
+        check_textsource_agree("a\r\nb");      // CRLF: only the \n breaks (if any)
+        check_textsource_agree("a\x0bb");      // VT: not a line break
+        check_textsource_agree("a\x0cb");      // FF: not a line break
+        check_textsource_agree("a\u{0085}b"); // NEL: not a line break
+        check_textsource_agree("a\u{2028}b"); // LS: not a line break
+        check_textsource_agree("a\u{2029}b"); // PS: not a line break
+
+        // Multi-chunk: ropey chunks are ~1 KiB, so this >1 KiB string forces the
+        // rope line_start/line_end chunk-crossing loops to execute (the small
+        // cases above all fit in one chunk and never exercise that path).
+        let multi_chunk = format!("{}\n{}", "a".repeat(600), "b".repeat(600)); // 1201 bytes, '\n' at byte 600
+        check_textsource_agree(&multi_chunk);
+        // Pin the exact boundary the chunk-crossing scan must find:
+        for p in 0..=600 { assert_eq!((&multi_chunk.as_str()).line_end(p), 601, "line_end({p})"); }
+        for p in 601..=1201 { assert_eq!((&ropey::Rope::from_str(&multi_chunk)).line_start(p), 601, "line_start({p})"); }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 2: full_parse_src over TextSource
+    // -----------------------------------------------------------------------
+
+    /// Verify that `full_parse_src` over a `&Rope` produces the same `BlockTree`
+    /// as `full_parse` over the same text as `&str`.  Tests cover the
+    /// representative document shapes listed in the task brief.
+    fn check_rope_eq_str(s: &str) {
+        let rope = ropey::Rope::from_str(s);
+        let from_rope = full_parse_src(&&rope);
+        let from_str  = full_parse(s);
+        assert_eq!(
+            from_rope, from_str,
+            "full_parse_src(&Rope) != full_parse(&str) for {:?}\nrope={:#?}\nstr={:#?}",
+            s, from_rope, from_str,
+        );
+    }
+
+    #[test]
+    fn full_parse_src_heading_and_para() {
+        check_rope_eq_str("# Title\n\nbody text\n");
+    }
+
+    #[test]
+    fn full_parse_src_fenced_code_with_internal_blank() {
+        check_rope_eq_str("```\na\n\nb\n```\n");
+    }
+
+    #[test]
+    fn full_parse_src_nested_list() {
+        check_rope_eq_str("- item 1\n  - sub A\n  - sub B\n- item 2\n");
+    }
+
+    #[test]
+    fn full_parse_src_blockquote() {
+        check_rope_eq_str("> first line\n> second line\n\nafter\n");
+    }
+
+    #[test]
+    fn full_parse_src_gfm_table() {
+        check_rope_eq_str("| A | B |\n|---|---|\n| 1 | 2 |\n");
+    }
+
+    #[test]
+    fn full_parse_src_link_ref_def() {
+        check_rope_eq_str("[foo]: http://example.com\n\nsee [foo] here\n");
+    }
+
+    #[test]
+    fn full_parse_src_multibyte() {
+        check_rope_eq_str("# 中\n\n- 🙂\n");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 4: rope entry point tests
+    // -----------------------------------------------------------------------
+
+    /// Step 1 (TDD): write this test FIRST so it fails before the rope entry
+    /// points exist.  After the refactor it must pass.
+    #[test]
+    fn rope_incremental_matches_full_and_str() {
+        let old = "para one\n\n- a\n- b\n\n[r]: http://x\n";
+        // edit: insert "X" at position 9 (inside the blank line between para and list)
+        let (new, edit) = apply_edit(old, 9..9, "X");
+        let ot = full_parse(old);
+        let str_tree = incremental_update(&ot, old, &edit, &new);
+        let rope_tree = incremental_update_rope(
+            &ot,
+            &ropey::Rope::from_str(old),
+            &edit,
+            &ropey::Rope::from_str(&new),
+        );
+        assert_eq!(
+            str_tree,
+            full_parse(&new),
+            "str incremental != full_parse"
+        );
+        assert_eq!(rope_tree, str_tree, "rope incremental != str incremental");
+    }
+
+    /// Extra assertions for the non-LF separator cases: prove that line_start
+    /// and line_end never split at the non-LF separators — i.e. for "a\rb" the
+    /// whole string is ONE line.
+    #[test]
+    fn textsource_non_lf_separators_are_single_line() {
+        let cases = [
+            "a\rb",
+            "a\x0bb",
+            "a\x0cb",
+            "a\u{0085}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+        ];
+        for s in cases {
+            let r = ropey::Rope::from_str(s);
+            let rope_src: &dyn TextSource = &&r;
+            let len = s.len();
+            // Every position should have line_start==0 and line_end==len
+            // (there's no '\n', so the entire string is one line).
+            for p in 0..=len {
+                assert_eq!(
+                    rope_src.line_start(p), 0,
+                    "rope line_start({p}) != 0 for {:?} — rope split on non-LF separator", s
+                );
+                assert_eq!(
+                    rope_src.line_end(p), len,
+                    "rope line_end({p}) != len({len}) for {:?} — rope split on non-LF separator", s
+                );
+            }
+        }
     }
 }
