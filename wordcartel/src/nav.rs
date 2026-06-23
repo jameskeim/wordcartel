@@ -52,7 +52,10 @@ fn layout_line_on_demand(editor: &Editor, l: usize) -> wordcartel_core::layout::
 pub fn screen_pos(editor: &Editor) -> Option<(u16, u16)> {
     let buf = &editor.document.buffer;
     let scroll = editor.view.scroll;
-    let area_height = editor.view.area.1 as usize;
+    // Editing area excludes the bottom status row (render reserves frame_h - 1),
+    // so nav must reserve it too — else a caret on the last row is deemed visible
+    // but never painted/cursor-placed. view.area is the FULL terminal size.
+    let area_height = (editor.view.area.1 as usize).saturating_sub(1);
     let h = head(editor);
     let l = caret_line(editor);
 
@@ -111,7 +114,10 @@ pub fn screen_pos(editor: &Editor) -> Option<(u16, u16)> {
 pub fn ensure_visible(editor: &mut Editor) {
     let l = caret_line(editor);
     let total = derive::total_logical_lines(&editor.document.buffer);
-    let area_height = editor.view.area.1 as usize;
+    // Editing area excludes the bottom status row (render reserves frame_h - 1),
+    // so nav must reserve it too — else a caret on the last row is deemed visible
+    // but never painted/cursor-placed. view.area is the FULL terminal size.
+    let area_height = (editor.view.area.1 as usize).saturating_sub(1);
 
     // Clamp scroll to valid range first
     let max_scroll = total.saturating_sub(1);
