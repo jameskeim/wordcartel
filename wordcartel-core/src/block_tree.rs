@@ -7,7 +7,7 @@ use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
 pub enum BlockKind {
     Document,
     Paragraph,
-    Heading,
+    Heading(u8),
     FencedCode,
     IndentedCode,
     BlockQuote,
@@ -56,7 +56,7 @@ fn options() -> Options {
 fn tag_to_kind(tag: &Tag) -> Option<BlockKind> {
     Some(match tag {
         Tag::Paragraph => BlockKind::Paragraph,
-        Tag::Heading { .. } => BlockKind::Heading,
+        Tag::Heading { level, .. } => BlockKind::Heading(*level as usize as u8),
         Tag::CodeBlock(CodeBlockKind::Fenced(_)) => BlockKind::FencedCode,
         Tag::CodeBlock(CodeBlockKind::Indented) => BlockKind::IndentedCode,
         Tag::BlockQuote(_) => BlockKind::BlockQuote,
@@ -653,7 +653,13 @@ mod tests {
     #[test]
     fn parses_heading_and_paragraph() {
         let t = full_parse("# Title\n\nbody text\n");
-        assert_eq!(kinds(&t), vec![BlockKind::Heading, BlockKind::Paragraph]);
+        assert_eq!(kinds(&t), vec![BlockKind::Heading(1), BlockKind::Paragraph]);
+    }
+
+    #[test]
+    fn full_parse_captures_heading_level() {
+        let t = full_parse("# H1\n\n### H3\n");
+        assert_eq!(kinds(&t), vec![BlockKind::Heading(1), BlockKind::Heading(3)]);
     }
 
     #[test]
