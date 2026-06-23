@@ -110,8 +110,12 @@ pub fn run(path: Option<PathBuf>) -> std::io::Result<()> {
                 if !keep_running {
                     break;
                 }
-                // Rebuild derived state after every keypress.
-                derive::rebuild(&mut editor);
+                // NOTE: do NOT rebuild here. `commands::run` (called by `step`)
+                // already runs `derive::rebuild` for every layout-affecting
+                // command — that rebuild uses the O(1) pre-edit snapshot + Edit
+                // for an O(region) incremental reparse (§3.9). A second rebuild
+                // here would fire with `pre_edit_rope`/`last_edit` already taken,
+                // forcing a full O(document) reparse on every keystroke.
             }
             Event::Resize(w, h) => {
                 editor.view.area = (w, h);
