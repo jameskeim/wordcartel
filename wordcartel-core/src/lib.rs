@@ -2,6 +2,7 @@
 //! Canonical position = byte offset (usize) into the buffer.
 #![forbid(unsafe_code)]
 
+pub mod block_tree;
 pub mod buffer;
 pub mod change;
 pub mod history;
