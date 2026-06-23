@@ -41,6 +41,70 @@ impl BlockTree {
     pub fn top_level(&self) -> &[Block] {
         &self.root.children
     }
+
+    /// Return the `BlockRole` for the block at `byte`.
+    ///
+    /// Walks the tree recursively, collecting all blocks whose span contains
+    /// `byte`, then reduces them by precedence (most-specific wins):
+    ///   FencedCode | IndentedCode → CodeBlock
+    ///   Heading(n)               → Heading(n)
+    ///   ThematicBreak            → ThematicBreak
+    ///   ListItem                 → ListItem
+    ///   BlockQuote               → BlockQuote
+    ///   anything else            → Paragraph
+    ///
+    /// Blocks are sparse — blank lines / gaps / bytes past EOF belong to no
+    /// block, so `byte` in a gap returns `Paragraph` (the safe default).
+    pub fn role_at(&self, byte: usize) -> crate::style::BlockRole {
+        let mut best = crate::style::BlockRole::Paragraph;
+        collect_role(&self.root, byte, &mut best);
+        best
+    }
+}
+
+/// Assign a numeric precedence to a `BlockRole` (lower = higher priority).
+fn role_precedence(r: &crate::style::BlockRole) -> u8 {
+    use crate::style::BlockRole::*;
+    match r {
+        CodeBlock      => 0,
+        Heading(_)     => 1,
+        ThematicBreak  => 2,
+        ListItem       => 3,
+        BlockQuote     => 4,
+        Paragraph      => 5,
+        FrontMatter    => 5,
+    }
+}
+
+/// Map a `BlockKind` to its `BlockRole` contribution (None = no upgrade).
+fn kind_to_role(kind: &BlockKind) -> Option<crate::style::BlockRole> {
+    use crate::style::BlockRole;
+    match kind {
+        BlockKind::FencedCode | BlockKind::IndentedCode => Some(BlockRole::CodeBlock),
+        BlockKind::Heading(n) => Some(BlockRole::Heading(*n)),
+        BlockKind::ThematicBreak => Some(BlockRole::ThematicBreak),
+        BlockKind::ListItem => Some(BlockRole::ListItem),
+        BlockKind::BlockQuote => Some(BlockRole::BlockQuote),
+        _ => None,
+    }
+}
+
+/// Recursively walk `block` and its children; if `byte` is inside the block's
+/// span, update `best` with the highest-precedence role found.
+fn collect_role(block: &Block, byte: usize, best: &mut crate::style::BlockRole) {
+    if !block.span.contains(&byte) {
+        return;
+    }
+    // This block contains `byte` — consider its role.
+    if let Some(role) = kind_to_role(&block.kind) {
+        if role_precedence(&role) < role_precedence(best) {
+            *best = role;
+        }
+    }
+    // Recurse into children.
+    for child in &block.children {
+        collect_role(child, byte, best);
+    }
 }
 
 /// GFM-ish options. Tables on; strikethrough is inline so it doesn't affect
@@ -729,5 +793,31 @@ mod tests {
         let doc = "para text\n---\n\nbody\n";
         let end = doc.find("\n---").unwrap() + 1;
         check(doc, 0..end, "");
+    }
+
+    #[test]
+    fn role_at_classifies_blocks() {
+        // doc: "# H\n\n> q\n\n- a\n\n```\nc\n```\n\n---\n\npara\n"
+        let doc = "# H\n\n> q\n\n- a\n\n```\nc\n```\n\n---\n\npara\n";
+        let t = full_parse(doc);
+        use crate::style::BlockRole::*;
+        let role = |needle: &str| t.role_at(doc.find(needle).unwrap());
+        assert_eq!(role("H"), Heading(1));
+        assert_eq!(role("q"), BlockQuote);     // line is inside a blockquote
+        assert_eq!(role("a"), ListItem);       // line is a list item
+        assert_eq!(role("c"), CodeBlock);      // inside a fenced code block
+        assert_eq!(role("---"), ThematicBreak);
+        assert_eq!(role("para"), Paragraph);
+    }
+
+    #[test]
+    fn role_at_gaps_and_boundaries_are_paragraph() {
+        let doc = "# H\n\npara\n";
+        let t = full_parse(doc);
+        use crate::style::BlockRole::*;
+        // the blank line (byte 4, the second '\n') is in a gap -> Paragraph
+        assert_eq!(t.role_at(4), Paragraph);
+        // a byte past document end -> Paragraph
+        assert_eq!(t.role_at(doc.len() + 5), Paragraph);
     }
 }
