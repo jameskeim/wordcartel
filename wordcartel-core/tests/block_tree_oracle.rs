@@ -499,3 +499,56 @@ fn hazard_delete_to_single_char() {
         doc, new_text, inc, full
     );
 }
+
+/// Regression test: proptest oracle_multi_edit_chain found a real bug where
+/// inserting a link-reference-definition AFTER a list caused full_parse to
+/// return a different tree structure than incremental_update.
+///
+/// Root cause: parse_region's Event::End handler was popping the block stack
+/// unconditionally for ALL End events, including inline tags (Link, Image,
+/// Emphasis, etc.) that never pushed anything onto the stack.  When a list
+/// item's paragraph contained an inline link (e.g. "[r]" resolved via a
+/// ref-def added by this edit), End(Link) would spuriously pop the enclosing
+/// Paragraph, shifting all subsequent End events one slot too early and
+/// causing the second ListItem to end up as a sibling of the List instead of
+/// a child.
+///
+/// The fix: check `tag_end_is_block()` before popping; ignore End events for
+/// inline/table-internal tags.
+///
+/// The bug was first reproducible as a single-edit oracle failure:
+///   incremental_update(&full_parse(text1), text1, &edit2, text2)
+///     != full_parse(text2)
+/// even without the chained edit1.  We test both forms.
+#[test]
+fn regression_inline_link_end_corrupts_list_nesting() {
+    // text1: a nested-list doc where "[r]" appears in a list item but "[r]:"
+    // is not yet a ref-def, so "[r]" is plain text.
+    let text1 = "    indented code\n    more\n\n- a\n\n  c[r]: http://y.test\nt\n- b\n  - nested\n\n---\n\n[ref]: http://x.test\n\nuse [ref] here\n\naaaa\naaaaaa\n";
+    // text2: insert "[r]: http://y.test\n" at byte 78 of text1, making "[r]"
+    // inside the list item resolve as a link.  full_parse must yield the same
+    // tree whether we call it directly or via incremental_update.
+    let (text2, edit2) = apply_edit(text1, 78..78, "[r]: http://y.test\n");
+
+    // Single-edit form (simpler): feed full_parse(text1) as old_tree.
+    let t1_full = full_parse(text1);
+    let inc_single = incremental_update(&t1_full, text1, &edit2, &text2);
+    let full2 = full_parse(&text2);
+    assert_eq!(
+        inc_single, full2,
+        "\nregression: single-edit incremental != full_parse\ntext1={text1:?}\ntext2={text2:?}\nincremental={inc_single:#?}\nfull={full2:#?}"
+    );
+
+    // Chained form: replay edit1 first, then edit2.
+    // edit1: replace initial[36..38] ("on") with "[r]: http://y.test\n"
+    let initial = "    indented code\n    more\n\n- a\n\n  cont\n- b\n  - nested\n\n---\n\n[ref]: http://x.test\n\nuse [ref] here\n\naaaa\naaaaaa\n";
+    let (text1_check, edit1) = apply_edit(initial, 36..38, "[r]: http://y.test\n");
+    assert_eq!(text1_check, text1, "edit1 must reconstruct text1");
+    let t0 = full_parse(initial);
+    let t1_inc = incremental_update(&t0, initial, &edit1, text1);
+    let inc_chain = incremental_update(&t1_inc, text1, &edit2, &text2);
+    assert_eq!(
+        inc_chain, full2,
+        "\nregression: chained incremental != full_parse\ntext2={text2:?}\nincremental={inc_chain:#?}\nfull={full2:#?}"
+    );
+}

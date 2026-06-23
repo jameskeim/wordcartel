@@ -1,5 +1,5 @@
 use std::ops::Range;
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 /// Kinds of block we track. Inline-level tags are ignored; we only keep the
 /// block skeleton, which is what the renderer's layout depends on.
@@ -147,6 +147,33 @@ fn tag_to_kind(tag: &Tag) -> Option<BlockKind> {
     })
 }
 
+/// Returns true if the `TagEnd` corresponds to a block-level tag that was
+/// pushed onto the stack by `tag_to_kind`.  Inline `TagEnd` variants (Link,
+/// Image, Emphasis, Strong, Strikethrough, Superscript, Subscript, and the
+/// table-internal TableHead/TableRow/TableCell variants) must return `false`
+/// here so that `Event::End` does not spuriously pop a block off the stack.
+///
+/// Invariant: `tag_end_is_block(tag_end)` iff `tag_to_kind(start_tag)` returned
+/// `Some(_)` for the matching `Event::Start`.
+fn tag_end_is_block(tag_end: &TagEnd) -> bool {
+    matches!(
+        tag_end,
+        TagEnd::Paragraph
+            | TagEnd::Heading(_)
+            | TagEnd::CodeBlock
+            | TagEnd::BlockQuote(_)
+            | TagEnd::HtmlBlock
+            | TagEnd::List(_)
+            | TagEnd::Item
+            | TagEnd::Table
+            | TagEnd::FootnoteDefinition
+            | TagEnd::DefinitionList
+            | TagEnd::DefinitionListTitle
+            | TagEnd::DefinitionListDefinition
+            | TagEnd::MetadataBlock(_)
+    )
+}
+
 /// pulldown-cmark does not emit Start/End for thematic breaks; it emits a
 /// standalone `Event::Rule`. We synthesize a leaf block for it.
 fn is_rule(event: &Event) -> bool {
@@ -178,9 +205,17 @@ fn parse_region(text: &str, base: usize) -> BlockTree {
                     stack.push(Block { kind, span, children: Vec::new() });
                 }
             }
-            Event::End(_) => {
-                if let Some(done) = stack.pop() {
-                    push_child(&mut root, &mut stack, done);
+            Event::End(ref tag_end) => {
+                // Only pop when the matching Start actually pushed a block.
+                // Inline tags (Link, Image, Emphasis, etc.) return None from
+                // tag_to_kind and never push onto the stack, so their End
+                // events must be ignored here.  Without this guard, an
+                // End(Link) inside a Paragraph would spuriously pop the
+                // Paragraph off the stack, corrupting the tree structure.
+                if tag_end_is_block(tag_end) {
+                    if let Some(done) = stack.pop() {
+                        push_child(&mut root, &mut stack, done);
+                    }
                 }
             }
             _ if is_rule(&event) => {

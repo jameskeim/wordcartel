@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f638d6c5919ce63cccd7b379e566d74ac024865e5c76abff411415e42e0e80aa # shrinks to initial = "    indented code\n    more\n\n- a\n\n  cont\n- b\n  - nested\n\n---\n\n[ref]: http://x.test\n\nuse [ref] here\n\naaaa\naaaaaa\n", edits = [(325, 343, "[r]: http://y.test\n"), (610, 610, "[r]: http://y.test\n")]
