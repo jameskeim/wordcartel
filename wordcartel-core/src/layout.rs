@@ -546,6 +546,11 @@ mod props {
             Just("🙂".to_string()),         // U+1F642, 4 bytes, width 2
             // tab (exercises tab-width policy)
             Just("\t".to_string()),
+            // zero-width / multi-codepoint graphemes — exercise the
+            // "zero-width shares cell, positive-width wins" policy.
+            Just("e\u{0301}".to_string()),           // e + combining acute: one grapheme, width 1
+            Just("\u{200b}".to_string()),             // zero-width space: width 0
+            Just("🤦🏼\u{200d}♂\u{fe0f}".to_string()), // ZWJ emoji: one grapheme, width 2
             // concealed markdown constructs (well-formed)
             "[a-z]{1,5}".prop_map(|s| format!("**{}**", s)),
             "[a-z]{1,5}".prop_map(|s| format!("*{}*", s)),
