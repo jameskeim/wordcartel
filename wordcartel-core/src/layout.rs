@@ -352,7 +352,12 @@ pub fn move_right(map: &ColMap, cur: Cursor) -> Cursor {
 /// Move left by one grapheme, skipping concealed bytes.
 pub fn move_left(map: &ColMap, cur: Cursor) -> Cursor {
     let stops = map.cursor_stops();
-    let prev = stops.iter().copied().rev().find(|&s| s < cur.offset).unwrap_or(0);
+    let prev = stops
+        .iter()
+        .copied()
+        .rev()
+        .find(|&s| s < cur.offset)
+        .unwrap_or_else(|| stops.first().copied().unwrap_or(map.eol));
     let (row, col) = map.source_to_visual(prev);
     Cursor { offset: prev, row, desired_col: col }
 }
@@ -389,11 +394,10 @@ pub fn move_end(map: &ColMap, cur: Cursor) -> Cursor {
 /// Uses the cursor's explicit row affinity (not the offset) so soft-wrap
 /// boundaries don't cause drift.
 pub fn move_down_within(map: &ColMap, cur: Cursor) -> Option<Cursor> {
-    let row = cur.row;
-    if row + 1 >= map.rows {
+    if cur.row.saturating_add(1) >= map.rows {
         return None;
     }
-    let target = row + 1;
+    let target = cur.row.saturating_add(1);
     let want = cur.desired_col;
     let off = map.visual_to_source(target, want);
     let col = map.col_on_row(off, target);
@@ -551,6 +555,17 @@ mod tests {
     }
 
     #[test]
+    fn move_left_from_leftmost_stays_on_visible_stop() {
+        // "**a**": only visible stop besides EOL is byte 2 ('a'). move_left from there
+        // must NOT land on a concealed '*' (byte 0/1); it stays on byte 2.
+        let (_r, map) = layout("**a**", BlockRole::Paragraph, false, 80);
+        let cur = cursor_at(&map, 2);
+        let left = move_left(&map, cur);
+        assert!(map.is_cursor_stop(left.offset), "cursor must rest on a visible stop, not a concealed byte");
+        assert_eq!(left.offset, 2); // no-op at the leftmost visible stop
+    }
+
+    #[test]
     fn down_then_up_preserves_desired_col() {
         // "aaaaa" width 3 -> rows ["aaa","aa"]. start at col 2 row 0, down then up.
         let (_r, map) = layout("aaaaa", BlockRole::Paragraph, true, 3);
@@ -675,6 +690,15 @@ mod props {
             for &o in &seen {
                 prop_assert!(valid.contains(&o),
                     "cursor offset {} not a visible grapheme start (visible={:?})", o, vis);
+            }
+            // Also walk LEFT from EOL, asserting every visited offset is valid.
+            let mut cur_left = cursor_at(&map, map.eol);
+            for _ in 0..(line.len() + 4) {
+                let n = move_left(&map, cur_left);
+                prop_assert!(valid.contains(&n.offset),
+                    "move_left produced invalid offset {} (visible={:?})", n.offset, vis);
+                if n.offset == cur_left.offset { break; }
+                cur_left = n;
             }
             // move_end from every row must land on a valid stop.
             for r in 0..map.rows {
