@@ -152,6 +152,14 @@ impl ColMap {
         v
     }
 
+    /// Snap a raw offset up to the nearest valid cursor stop (>= offset), else EOL.
+    ///
+    /// Used after `visual_to_source` to guard against landing inside a concealed
+    /// trailing marker (e.g. the closing `**` of `**a**`).
+    pub fn snap_to_stop(&self, raw: usize) -> usize {
+        self.cursor_stops().into_iter().find(|&s| s >= raw).unwrap_or(self.eol)
+    }
+
     /// Visual column of `offset` *on a specified row*. Used when the cursor's
     /// row affinity is known, to avoid the boundary ambiguity. Returns the
     /// end-of-row column if the offset is the row's end sentinel.
@@ -381,12 +389,7 @@ pub fn move_end(map: &ColMap, cur: Cursor) -> Cursor {
     let row = cur.row.min(map.rows.saturating_sub(1));
     let end_col = *map.row_end_col.get(row).unwrap_or(&0);
     let raw = map.visual_to_source(row, end_col);
-    // snap up to the nearest cursor stop (>= raw)
-    let off = map
-        .cursor_stops()
-        .into_iter()
-        .find(|&s| s >= raw)
-        .unwrap_or(map.eol);
+    let off = map.snap_to_stop(raw);
     Cursor { offset: off, row, desired_col: end_col }
 }
 
@@ -399,9 +402,8 @@ pub fn move_down_within(map: &ColMap, cur: Cursor) -> Option<Cursor> {
     }
     let target = cur.row.saturating_add(1);
     let want = cur.desired_col;
-    let off = map.visual_to_source(target, want);
-    let col = map.col_on_row(off, target);
-    let _ = col;
+    let raw = map.visual_to_source(target, want);
+    let off = map.snap_to_stop(raw);
     Some(Cursor { offset: off, row: target, desired_col: want })
 }
 
@@ -412,20 +414,23 @@ pub fn move_up_within(map: &ColMap, cur: Cursor) -> Option<Cursor> {
     }
     let target = cur.row - 1;
     let want = cur.desired_col;
-    let off = map.visual_to_source(target, want);
+    let raw = map.visual_to_source(target, want);
+    let off = map.snap_to_stop(raw);
     Some(Cursor { offset: off, row: target, desired_col: want })
 }
 
 /// Enter a logical line from above at `desired_col` (first row).
 pub fn enter_from_top(map: &ColMap, desired_col: usize) -> Cursor {
-    let off = map.visual_to_source(0, desired_col);
+    let raw = map.visual_to_source(0, desired_col);
+    let off = map.snap_to_stop(raw);
     Cursor { offset: off, row: 0, desired_col }
 }
 
 /// Enter a logical line from below at `desired_col` (last row).
 pub fn enter_from_bottom(map: &ColMap, desired_col: usize) -> Cursor {
     let last = map.rows.saturating_sub(1);
-    let off = map.visual_to_source(last, desired_col);
+    let raw = map.visual_to_source(last, desired_col);
+    let off = map.snap_to_stop(raw);
     Cursor { offset: off, row: last, desired_col }
 }
 
@@ -563,6 +568,23 @@ mod tests {
         let left = move_left(&map, cur);
         assert!(map.is_cursor_stop(left.offset), "cursor must rest on a visible stop, not a concealed byte");
         assert_eq!(left.offset, 2); // no-op at the leftmost visible stop
+    }
+
+    #[test]
+    fn enter_from_top_overshoot_concealed_lands_on_stop() {
+        // "**a**": entering at an overshooting col must not land on a concealed '*'.
+        let (_r, map) = layout("**a**", BlockRole::Paragraph, false, 80);
+        for col in [3usize, 5, 9] {
+            let c = enter_from_top(&map, col);
+            assert!(map.is_cursor_stop(c.offset), "enter_from_top col {col} landed on concealed byte {}", c.offset);
+        }
+    }
+
+    #[test]
+    fn enter_from_bottom_overshoot_concealed_lands_on_stop() {
+        let (_r, map) = layout("**a**", BlockRole::Paragraph, false, 80);
+        let c = enter_from_bottom(&map, 9);
+        assert!(map.is_cursor_stop(c.offset));
     }
 
     #[test]
@@ -817,6 +839,100 @@ mod props {
                             p.col, up.offset);
                     }
                 }
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // LAW 6: All cursor-nav ops on CONCEALED layouts produce valid stops.
+        // Comprehensively exercises move_right/left/home/end/down/up/enter_from_top
+        // /enter_from_bottom on inactive (is_active=false) layouts with concealed
+        // markers and asserts every produced offset is a valid cursor stop.
+        // This law MUST fail before the fix and pass after.
+        // -------------------------------------------------------------------
+        #[test]
+        fn law6_all_nav_ops_land_on_stop_concealed(
+            line in logical_line(),
+            w in widths(),
+        ) {
+            let (_rows, map) = layout(&line, BlockRole::Paragraph, false, w);
+            let valid: std::collections::HashSet<usize> =
+                map.placed.iter().map(|p| p.src.start)
+                    .chain(std::iter::once(map.eol))
+                    .collect();
+
+            // Helper: assert offset is a cursor stop.
+            macro_rules! assert_stop {
+                ($off:expr, $label:expr) => {
+                    prop_assert!(
+                        valid.contains(&$off),
+                        "{} produced invalid offset {} (line={:?}, w={})",
+                        $label, $off, line, w
+                    );
+                };
+            }
+
+            // Walk right from start.
+            let mut cur = cursor_at(&map, 0);
+            assert_stop!(cur.offset, "cursor_at(0)");
+            let max_steps = line.len() + 8;
+            for _ in 0..max_steps {
+                let n = move_right(&map, cur);
+                assert_stop!(n.offset, "move_right");
+                if n.offset == cur.offset { break; }
+                cur = n;
+                if cur.offset >= map.eol { break; }
+            }
+
+            // Walk left from EOL.
+            let mut cur_l = cursor_at(&map, map.eol);
+            assert_stop!(cur_l.offset, "cursor_at(eol)");
+            for _ in 0..max_steps {
+                let n = move_left(&map, cur_l);
+                assert_stop!(n.offset, "move_left");
+                if n.offset == cur_l.offset { break; }
+                cur_l = n;
+            }
+
+            // move_home and move_end on every row.
+            for r in 0..map.rows {
+                let probe = Cursor { offset: map.visual_to_source(r, 0), row: r, desired_col: 0 };
+                let h = move_home(&map, probe);
+                assert_stop!(h.offset, "move_home");
+                let e = move_end(&map, probe);
+                assert_stop!(e.offset, "move_end");
+            }
+
+            // move_down_within and move_up_within: walk down from first stop, then up.
+            let mut dc = cursor_at(&map, 0);
+            for _ in 0..map.rows {
+                match move_down_within(&map, dc) {
+                    Some(n) => {
+                        assert_stop!(n.offset, "move_down_within");
+                        dc = n;
+                    }
+                    None => break,
+                }
+            }
+            // Walk back up.
+            let mut uc = dc;
+            for _ in 0..map.rows {
+                match move_up_within(&map, uc) {
+                    Some(n) => {
+                        assert_stop!(n.offset, "move_up_within");
+                        uc = n;
+                    }
+                    None => break,
+                }
+            }
+
+            // enter_from_top and enter_from_bottom at several desired_cols.
+            let mid_col = map.row_end_col.first().copied().unwrap_or(0) / 2;
+            let overshoot = line.len() + 8;
+            for col in [0, mid_col, overshoot] {
+                let t = enter_from_top(&map, col);
+                assert_stop!(t.offset, "enter_from_top");
+                let b = enter_from_bottom(&map, col);
+                assert_stop!(b.offset, "enter_from_bottom");
             }
         }
     }
