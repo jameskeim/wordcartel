@@ -109,6 +109,21 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         }
 
         Command::Backspace => {
+            let sel = editor.document.selection.primary();
+            if !sel.is_empty() {
+                // Non-empty selection: delete the selection range (like Cut, minus clipboard).
+                let (from, to) = (sel.from(), sel.to());
+                let doc_len = editor.document.buffer.len();
+                let cs = ChangeSet::delete(from..to, doc_len);
+                let edit = Edit { range: from..to, new_len: 0 };
+                let txn = Transaction::new(cs).with_selection(Selection::single(from));
+                editor.apply(txn, edit, EditKind::Other, clock);
+                derive::rebuild(editor);
+                nav::ensure_visible(editor);
+                editor.desired_col = None;
+                return CommandResult::Handled;
+            }
+            // Collapsed selection: delete one grapheme left of the caret.
             let head = nav::head(editor);
             if head == 0 {
                 return CommandResult::Noop;
@@ -561,6 +576,45 @@ mod tests {
         let sel = e.document.selection.primary();
         assert!(sel.is_empty(), "selection must be collapsed after Move with extend=false");
         assert_eq!(sel.head, 3, "head must be at 3 after moving right from 2");
+    }
+
+    // -------------------------------------------------------------------------
+    // Fix 1: Backspace must delete a non-empty selection
+    // -------------------------------------------------------------------------
+
+    /// Backspace with an active (non-empty) selection deletes the selection range,
+    /// leaving the caret at the selection's `from` offset.
+    #[test]
+    fn backspace_deletes_active_selection() {
+        let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
+        // Set a non-collapsed selection: anchor=1, head=3 (selects "bc")
+        e.document.selection = Selection {
+            ranges: [wordcartel_core::selection::Range { anchor: 1, head: 3 }]
+                .into_iter()
+                .collect(),
+            primary: 0,
+        };
+        derive::rebuild(&mut e);
+        let clk = TestClock(0);
+        let result = run(Command::Backspace, &mut e, &clk);
+        assert_eq!(result, CommandResult::Handled);
+        assert_eq!(e.document.buffer.to_string(), "ad\n", "Backspace must delete the selection");
+        assert_eq!(nav::head(&e), 1, "caret must be at selection.from() after Backspace");
+    }
+
+    /// Backspace with a collapsed selection (no active selection) still deletes
+    /// one grapheme left of the caret, as before.
+    #[test]
+    fn backspace_collapsed_still_deletes_one_char() {
+        let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
+        // Collapsed selection at offset 2 (between 'b' and 'c')
+        e.document.selection = Selection::single(2);
+        derive::rebuild(&mut e);
+        let clk = TestClock(0);
+        let result = run(Command::Backspace, &mut e, &clk);
+        assert_eq!(result, CommandResult::Handled);
+        assert_eq!(e.document.buffer.to_string(), "acd\n", "plain Backspace must delete prev char");
+        assert_eq!(nav::head(&e), 1, "caret must be one step left after plain Backspace");
     }
 
     /// Cut on empty selection (point cursor) is a Noop.

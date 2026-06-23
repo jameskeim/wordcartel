@@ -395,27 +395,38 @@ mod tests {
     }
 
     /// No temp litter left after a successful save.
+    ///
+    /// Uses a private subdirectory so concurrent test runs cannot produce
+    /// `.wcartel-*.tmp` files that the glob picks up and makes this test flaky.
     #[test]
     fn no_temp_litter_after_save() {
-        let dir = std::env::temp_dir();
-        let p = dir.join(format!(
-            "wcartel-litter-{}-{}.txt",
+        // Create a unique private subdir for this test run so we only see our
+        // own temp files, not those of other concurrent saves in the shared
+        // system temp dir.
+        let private_dir = std::env::temp_dir().join(format!(
+            "wcartel-littertest-{}-{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
+        fs::create_dir_all(&private_dir).expect("create private temp subdir");
+
+        let p = private_dir.join("litter-target.txt");
         save_atomic(&p, "clean\n").expect("save");
-        // Check there are no .wcartel-*.tmp files in temp_dir matching our pid.
-        let pid = std::process::id().to_string();
-        let litter: Vec<_> = fs::read_dir(&dir)
+
+        // Check there are no .wcartel-*.tmp files left in our private subdir.
+        let litter: Vec<_> = fs::read_dir(&private_dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| {
                 let name = e.file_name();
                 let s = name.to_string_lossy();
-                s.contains("wcartel-") && s.contains(&pid) && s.ends_with(".tmp")
+                s.ends_with(".tmp")
             })
             .collect();
         assert!(litter.is_empty(), "temp litter remains: {litter:?}");
+
+        // Clean up.
         let _ = fs::remove_file(&p);
+        let _ = fs::remove_dir(&private_dir);
     }
 }
