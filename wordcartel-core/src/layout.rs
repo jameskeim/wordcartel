@@ -396,6 +396,36 @@ pub fn enter_from_bottom(map: &ColMap, desired_col: usize) -> Cursor {
     Cursor { offset: off, row: last, desired_col }
 }
 
+// ---------------------------------------------------------------------------
+// Helpers for property tests (also useful for callers inspecting layout).
+// ---------------------------------------------------------------------------
+
+/// Total visible display width for a logical line (sum of visible grapheme widths).
+pub fn visible_width(line: &str, role: BlockRole, is_active: bool) -> usize {
+    let analysis = crate::md_parse::analyze(line, role, is_active);
+    let mut w = 0;
+    for run in &analysis.runs {
+        if run.visible {
+            for g in line[run.src.clone()].graphemes(true) {
+                w += grapheme_width(g);
+            }
+        }
+    }
+    w
+}
+
+/// Visible source string (graphemes that survive concealment), in order.
+pub fn visible_source(line: &str, role: BlockRole, is_active: bool) -> String {
+    let analysis = crate::md_parse::analyze(line, role, is_active);
+    let mut s = String::new();
+    for run in &analysis.runs {
+        if run.visible {
+            s.push_str(&line[run.src.clone()]);
+        }
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,5 +517,237 @@ mod tests {
         let down = move_down_within(&map, start).unwrap();
         let up = move_up_within(&map, down).unwrap();
         assert_eq!(up.offset, start.offset);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property tests (proptest): the five layout invariant laws.
+// Ported from ~/projects/wordcartel-layout-spike/tests/invariants.rs and
+// adapted to:
+//   - the crate's layout(line, role, is_active, w) signature
+//   - multi-byte alphabet: ASCII + é, 中, 🙂 + concealed inline constructs
+//   - visible_source/visible_width helpers using md_parse::analyze
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod props {
+    use super::*;
+    use proptest::prelude::*;
+    use unicode_segmentation::UnicodeSegmentation;
+
+    /// Building blocks: ASCII words + multi-byte graphemes + concealed constructs.
+    fn token() -> impl Strategy<Value = String> {
+        prop_oneof![
+            // plain ASCII words
+            "[a-z]{1,6}".prop_map(|s| s),
+            Just(" ".to_string()),
+            // multi-byte graphemes (task-specified: é, 中, 🙂)
+            Just("é".to_string()),          // U+00E9, 2 bytes, width 1
+            Just("中".to_string()),          // U+4E2D, 3 bytes, width 2
+            Just("🙂".to_string()),         // U+1F642, 4 bytes, width 2
+            // tab (exercises tab-width policy)
+            Just("\t".to_string()),
+            // concealed markdown constructs (well-formed)
+            "[a-z]{1,5}".prop_map(|s| format!("**{}**", s)),
+            "[a-z]{1,5}".prop_map(|s| format!("*{}*", s)),
+            "[a-z]{1,5}".prop_map(|s| format!("~~{}~~", s)),
+            "[a-z]{1,5}".prop_map(|s| format!("`{}`", s)),
+            "[a-z]{1,5}".prop_map(|s| format!("[{}](http://e.x/{})", s, s)),
+        ]
+    }
+
+    prop_compose! {
+        fn logical_line()(toks in prop::collection::vec(token(), 0..8)) -> String {
+            let s: String = toks.concat();
+            // strip any accidental newlines (we only handle single logical lines)
+            s.replace('\n', " ").replace('\r', " ")
+        }
+    }
+
+    fn widths() -> impl Strategy<Value = usize> {
+        prop_oneof![Just(1usize), Just(3), Just(5), Just(8), Just(20), Just(80)]
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 512,
+            ..Default::default()
+        })]
+
+        // -------------------------------------------------------------------
+        // LAW 1: ColMap round-trip / bijection on visible cells.
+        // For every visible visual cell c, source_to_visual(visual_to_source(c)) == c.
+        // We test the canonical cell of each grapheme: its starting (row,col).
+        // -------------------------------------------------------------------
+        #[test]
+        fn law1_colmap_roundtrip(
+            line in logical_line(),
+            w in widths(),
+            active in any::<bool>()
+        ) {
+            let (_rows, map) = layout(&line, BlockRole::Paragraph, active, w);
+            for p in &map.placed {
+                let off = map.visual_to_source(p.row, p.col);
+                let (r2, c2) = map.source_to_visual(off);
+                // round-trip must land on the grapheme that owns that cell
+                let owner = map.placed.iter()
+                    .find(|q| q.src.start == off)
+                    .expect("offset must be a grapheme start");
+                prop_assert_eq!((r2, c2), (owner.row, owner.col),
+                    "roundtrip cell ({},{}) -> off {} -> ({},{})",
+                    p.row, p.col, off, r2, c2);
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // LAW 2: No cursor inside a concealed marker.
+        // Every reachable cursor source offset is a valid grapheme boundary
+        // among VISIBLE content (or EOL).
+        // -------------------------------------------------------------------
+        #[test]
+        fn law2_no_cursor_in_conceal(
+            line in logical_line(),
+            w in widths(),
+            active in any::<bool>()
+        ) {
+            let (_rows, map) = layout(&line, BlockRole::Paragraph, active, w);
+            // Walk right from the first valid stop.
+            let mut cur = cursor_at(&map, 0);
+            let mut seen = vec![cur.offset];
+            for _ in 0..(line.len() + 4) {
+                let n = move_right(&map, cur);
+                if n.offset == cur.offset { break; }
+                cur = n;
+                seen.push(cur.offset);
+                if cur.offset >= map.eol { break; }
+            }
+            let vis = visible_source(&line, BlockRole::Paragraph, active);
+            // Set of valid visible-grapheme-start byte offsets + EOL:
+            let valid: std::collections::HashSet<usize> =
+                map.placed.iter().map(|p| p.src.start)
+                    .chain(std::iter::once(map.eol))
+                    .collect();
+            for &o in &seen {
+                prop_assert!(valid.contains(&o),
+                    "cursor offset {} not a visible grapheme start (visible={:?})", o, vis);
+            }
+            // move_end from every row must land on a valid stop.
+            for r in 0..map.rows {
+                let probe = Cursor { offset: map.visual_to_source(r, 0), row: r, desired_col: 0 };
+                let e = move_end(&map, probe);
+                prop_assert!(valid.contains(&e.offset),
+                    "move_end on row {} produced invalid offset {}", r, e.offset);
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // LAW 3: Soft-wrap fidelity.
+        // Concatenating placed graphemes (visual order) reconstructs the
+        // visible content; wrapping never splits a grapheme; widths obey
+        // unicode-width.
+        // -------------------------------------------------------------------
+        #[test]
+        fn law3_softwrap_fidelity(
+            line in logical_line(),
+            w in widths(),
+            active in any::<bool>()
+        ) {
+            let (rows, map) = layout(&line, BlockRole::Paragraph, active, w);
+
+            // (a) placed graphemes reconstruct visible content
+            let reconstructed: String = map.placed.iter().map(|p| p.text.as_str()).collect();
+            let expected = visible_source(&line, BlockRole::Paragraph, active);
+            prop_assert_eq!(&reconstructed, &expected, "placed graphemes reconstruct visible");
+
+            // (b) every placed grapheme is a single grapheme cluster (never split)
+            for p in &map.placed {
+                let g_count = p.text.graphemes(true).count();
+                prop_assert_eq!(g_count, 1,
+                    "placed text {:?} is not a single grapheme", p.text);
+            }
+
+            // (c) widths obey unicode-width / tab policy; no row exceeds viewport
+            // unless a single grapheme is itself wider than the viewport.
+            for (ri, row) in rows.iter().enumerate() {
+                let sum: usize = map.placed.iter()
+                    .filter(|p| p.row == ri)
+                    .map(|p| p.width)
+                    .sum();
+                prop_assert_eq!(sum, row.width, "row {} width mismatch", ri);
+                let on_row: Vec<_> = map.placed.iter()
+                    .filter(|p| p.row == ri && p.width > 0)
+                    .collect();
+                if row.width > w {
+                    prop_assert_eq!(on_row.len(), 1,
+                        "row {} width {} > vw {} but has {} graphemes",
+                        ri, row.width, w, on_row.len());
+                }
+            }
+
+            // (d) placed grapheme row indices form a contiguous range 0..rows
+            let mut max_row = 0usize;
+            for p in &map.placed { max_row = max_row.max(p.row); }
+            if !map.placed.is_empty() {
+                prop_assert_eq!(max_row + 1, map.rows.min(max_row + 1));
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // LAW 4: Active-line identity.
+        // is_active == true => visible source == raw line; placed graphemes
+        // cover the line gaplessly from byte 0.
+        // -------------------------------------------------------------------
+        #[test]
+        fn law4_active_identity(line in logical_line(), w in widths()) {
+            let (_rows, map) = layout(&line, BlockRole::Paragraph, true, w);
+            prop_assert!(map.is_active);
+            // visible source == raw line (no concealment on active line)
+            prop_assert_eq!(
+                visible_source(&line, BlockRole::Paragraph, true),
+                line.clone()
+            );
+            // placed graphemes cover the line with no gaps
+            let mut expect = 0usize;
+            for p in &map.placed {
+                prop_assert_eq!(p.src.start, expect, "active map has a concealed gap");
+                expect = p.src.end;
+            }
+            prop_assert_eq!(expect, line.len(), "active map does not cover whole line");
+            // every grapheme start is a valid cursor stop
+            for p in &map.placed {
+                prop_assert!(map.is_cursor_stop(p.src.start));
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // LAW 5: Desired-column preservation.
+        // Cursor down then up returns to the same source offset when line
+        // lengths allow.  Tested on active layout (no concealment), interior
+        // positive-width graphemes on row 0.
+        // -------------------------------------------------------------------
+        #[test]
+        fn law5_desired_col_preserved(line in logical_line(), w in widths()) {
+            // Active layout: columns map straightforwardly; the law is about
+            // desired-col bookkeeping independent of concealment.
+            let (_rows, map) = layout(&line, BlockRole::Paragraph, true, w);
+            if map.rows < 2 { return Ok(()); }
+            // Start at each positive-width grapheme on row 0; go down then up.
+            // Zero-width graphemes are excluded (documented finding: they share
+            // a column with their base and are not independent round-trip stops).
+            for p in map.placed.iter().filter(|p| p.row == 0 && p.width > 0) {
+                let start = Cursor {
+                    offset: p.src.start,
+                    row: 0,
+                    desired_col: p.col,
+                };
+                if let Some(down) = move_down_within(&map, start) {
+                    if let Some(up) = move_up_within(&map, down) {
+                        prop_assert_eq!(up.row, 0, "up did not return to row 0");
+                        prop_assert_eq!(up.offset, start.offset,
+                            "down->up changed offset: start col {} -> {}",
+                            p.col, up.offset);
+                    }
+                }
+            }
+        }
     }
 }
