@@ -1,5 +1,129 @@
+use std::borrow::Cow;
 use std::ops::Range;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+
+// ---------------------------------------------------------------------------
+// TextSource trait
+// ---------------------------------------------------------------------------
+
+/// Random-access view over the document text for block parsing.
+/// Byte offsets are into the whole document. `slice` returns a CONTIGUOUS &str
+/// (borrowed for &str sources, owned/materialized for ropes — O(slice len)).
+pub trait TextSource {
+    fn len(&self) -> usize;
+    fn slice(&self, range: Range<usize>) -> Cow<'_, str>;
+    /// Byte offset of the start of the line containing `pos` (just after the
+    /// previous `\n`, or 0). `\n`-only semantics. `pos` is clamped to `len()`.
+    fn line_start(&self, pos: usize) -> usize;
+    /// Byte offset of the end of the line containing `pos` (the next `\n` + 1,
+    /// or `len()`). `\n`-only semantics. `pos` is clamped to `len()`.
+    fn line_end(&self, pos: usize) -> usize;
+}
+
+impl TextSource for &str {
+    fn len(&self) -> usize {
+        str::len(self)
+    }
+
+    fn slice(&self, range: Range<usize>) -> Cow<'_, str> {
+        Cow::Borrowed(&self[range])
+    }
+
+    fn line_start(&self, pos: usize) -> usize {
+        let pos = pos.min(self.len());
+        match self.as_bytes()[..pos].iter().rposition(|&b| b == b'\n') {
+            Some(nl) => nl + 1,
+            None => 0,
+        }
+    }
+
+    fn line_end(&self, pos: usize) -> usize {
+        let pos = pos.min(self.len());
+        match self.as_bytes()[pos..].iter().position(|&b| b == b'\n') {
+            Some(off) => pos + off + 1,
+            None => self.len(),
+        }
+    }
+}
+
+impl TextSource for &ropey::Rope {
+    fn len(&self) -> usize {
+        self.len_bytes()
+    }
+
+    fn slice(&self, range: Range<usize>) -> Cow<'_, str> {
+        Cow::Owned(self.byte_slice(range).to_string())
+    }
+
+    /// Walk backward through rope chunks looking for the last `\n` before
+    /// `pos`. Returns one past that `\n`, or 0 if none. LF-only semantics
+    /// (does NOT use ropey's line APIs which treat many Unicode separators
+    /// as line breaks).
+    fn line_start(&self, pos: usize) -> usize {
+        let pos = pos.min(self.len_bytes());
+        // Special case: pos == 0 means we're at the very beginning.
+        if pos == 0 {
+            return 0;
+        }
+        // We scan backward from pos-1 through the rope's chunks.
+        // chunk_at_byte(byte_idx) returns (chunk_str, chunk_byte_start, ..)
+        // The chunk containing byte_idx is chunk[byte_idx - chunk_byte_start].
+        let mut remaining = pos; // how many bytes from the start we still need to cover
+        loop {
+            // Get the chunk that contains byte index `remaining - 1`.
+            let (chunk, chunk_start, _, _) = self.chunk_at_byte(remaining - 1);
+            // How many bytes of this chunk are relevant? Only up to `remaining`
+            // bytes from document start, so up to (remaining - chunk_start) bytes
+            // into the chunk.
+            let chunk_bytes = chunk.as_bytes();
+            let within_chunk_end = remaining - chunk_start; // exclusive end within chunk
+            // Search backward in chunk_bytes[..within_chunk_end] for '\n'.
+            if let Some(local_nl) = chunk_bytes[..within_chunk_end]
+                .iter()
+                .rposition(|&b| b == b'\n')
+            {
+                // Found a '\n' at global byte offset chunk_start + local_nl.
+                return chunk_start + local_nl + 1;
+            }
+            // No '\n' in this chunk's relevant portion. Continue to the chunk before.
+            if chunk_start == 0 {
+                // We've scanned back to the start of the rope — no '\n' found.
+                return 0;
+            }
+            remaining = chunk_start;
+        }
+    }
+
+    /// Walk forward through rope chunks looking for the first `\n` at or
+    /// after `pos`. Returns that byte's index + 1, or `len_bytes()` if none.
+    /// LF-only semantics (does NOT use ropey's line APIs).
+    fn line_end(&self, pos: usize) -> usize {
+        let total = self.len_bytes();
+        let pos = pos.min(total);
+        if pos == total {
+            return total;
+        }
+        let mut offset = pos; // current search position in the rope
+        loop {
+            let (chunk, chunk_start, _, _) = self.chunk_at_byte(offset);
+            let chunk_bytes = chunk.as_bytes();
+            // Relevant portion of this chunk starts at (offset - chunk_start).
+            let within_chunk_start = offset - chunk_start;
+            if let Some(local_nl) = chunk_bytes[within_chunk_start..]
+                .iter()
+                .position(|&b| b == b'\n')
+            {
+                return chunk_start + within_chunk_start + local_nl + 1;
+            }
+            // No '\n' in this chunk. Advance to the next chunk.
+            let next = chunk_start + chunk.len();
+            if next >= total {
+                return total;
+            }
+            offset = next;
+        }
+    }
+}
 
 /// Kinds of block we track. Inline-level tags are ignored; we only keep the
 /// block skeleton, which is what the renderer's layout depends on.
@@ -879,5 +1003,123 @@ mod tests {
         assert_eq!(t.role_at(4), Paragraph);
         // a byte past document end -> Paragraph
         assert_eq!(t.role_at(doc.len() + 5), Paragraph);
+    }
+
+    // -----------------------------------------------------------------------
+    // TextSource trait tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: for a string `s`, verify that the &str and &Rope impls of
+    /// TextSource agree on len, slice over a set of ranges, and
+    /// line_start/line_end at every byte position p in 0..=s.len().
+    fn check_textsource_agree(s: &str) {
+        let r = ropey::Rope::from_str(s);
+        let str_src: &dyn TextSource = &s;
+        let rope_src: &dyn TextSource = &&r;
+
+        // len
+        assert_eq!(
+            str_src.len(), rope_src.len(),
+            "len mismatch for {:?}", s
+        );
+
+        // slice over several representative ranges (all char-boundary-safe)
+        let len = s.len();
+        let slice_ranges: Vec<std::ops::Range<usize>> = {
+            // Collect all char boundaries (valid UTF-8 slice endpoints)
+            let boundaries: Vec<usize> = s.char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(len))
+                .collect();
+            let mut v = Vec::new();
+            for i in 0..boundaries.len() {
+                for j in i..boundaries.len() {
+                    v.push(boundaries[i]..boundaries[j]);
+                }
+            }
+            v.sort_by_key(|r| (r.start, r.end));
+            v.dedup();
+            v
+        };
+        for range in &slice_ranges {
+            let str_slice = str_src.slice(range.clone());
+            let rope_slice = rope_src.slice(range.clone());
+            assert_eq!(
+                str_slice.as_ref(), rope_slice.as_ref(),
+                "slice({:?}) mismatch for {:?}: str={:?} rope={:?}",
+                range, s, str_slice, rope_slice
+            );
+        }
+
+        // line_start and line_end at every position 0..=len
+        for p in 0..=len {
+            let str_ls = str_src.line_start(p);
+            let rope_ls = rope_src.line_start(p);
+            assert_eq!(
+                str_ls, rope_ls,
+                "line_start({}) mismatch for {:?}: str={} rope={}",
+                p, s, str_ls, rope_ls
+            );
+
+            let str_le = str_src.line_end(p);
+            let rope_le = rope_src.line_end(p);
+            assert_eq!(
+                str_le, rope_le,
+                "line_end({}) mismatch for {:?}: str={} rope={}",
+                p, s, str_le, rope_le
+            );
+        }
+    }
+
+    #[test]
+    fn textsource_str_and_rope_agree() {
+        // ASCII basics
+        for s in ["", "a", "a\n", "\n", "ab\ncd\n", "ab\ncd", "no newline"] {
+            check_textsource_agree(s);
+        }
+        // Multibyte content
+        check_textsource_agree("# 中\n\n🙂 x\nyy");
+        // Non-LF separator hazard cases: rope's unicode_lines would diverge
+        // on these if we used ropey's line APIs. Our impl must treat ONLY '\n'
+        // as a line break.
+        check_textsource_agree("a\rb");        // CR: not a line break
+        check_textsource_agree("a\r\nb");      // CRLF: only the \n breaks (if any)
+        check_textsource_agree("a\x0bb");      // VT: not a line break
+        check_textsource_agree("a\x0cb");      // FF: not a line break
+        check_textsource_agree("a\u{0085}b"); // NEL: not a line break
+        check_textsource_agree("a\u{2028}b"); // LS: not a line break
+        check_textsource_agree("a\u{2029}b"); // PS: not a line break
+    }
+
+    /// Extra assertions for the non-LF separator cases: prove that line_start
+    /// and line_end never split at the non-LF separators — i.e. for "a\rb" the
+    /// whole string is ONE line.
+    #[test]
+    fn textsource_non_lf_separators_are_single_line() {
+        let cases = [
+            "a\rb",
+            "a\x0bb",
+            "a\x0cb",
+            "a\u{0085}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+        ];
+        for s in cases {
+            let r = ropey::Rope::from_str(s);
+            let rope_src: &dyn TextSource = &&r;
+            let len = s.len();
+            // Every position should have line_start==0 and line_end==len
+            // (there's no '\n', so the entire string is one line).
+            for p in 0..=len {
+                assert_eq!(
+                    rope_src.line_start(p), 0,
+                    "rope line_start({p}) != 0 for {:?} — rope split on non-LF separator", s
+                );
+                assert_eq!(
+                    rope_src.line_end(p), len,
+                    "rope line_end({p}) != len({len}) for {:?} — rope split on non-LF separator", s
+                );
+            }
+        }
     }
 }
