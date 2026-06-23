@@ -28,6 +28,7 @@ pub struct Document {
 #[derive(Debug, Clone)]
 pub struct View {
     pub scroll: usize,    // first visible LOGICAL line index
+    pub scroll_row: usize, // visual rows to skip within the first visible logical line
     pub area: (u16, u16), // (width, height) cells of the editing area
     pub mode: RenderMode,
     /// Per-visible-logical-line layout cache (Task 3).
@@ -67,6 +68,7 @@ impl Editor {
             },
             view: View {
                 scroll: 0,
+                scroll_row: 0,
                 area,
                 mode: RenderMode::LivePreview,
                 line_layouts: BTreeMap::new(),

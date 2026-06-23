@@ -75,7 +75,12 @@ pub fn render(frame: &mut Frame, editor: &Editor) {
             continue;
         }
         let (visual_rows, _map) = &editor.view.line_layouts[&l];
-        for vr in visual_rows {
+        let skip_rows = if l == scroll {
+            editor.view.scroll_row
+        } else {
+            0
+        };
+        for vr in visual_rows.iter().skip(skip_rows) {
             if screen_row >= edit_height {
                 break 'outer;
             }
@@ -198,5 +203,26 @@ mod tests {
             let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
             term.draw(|f| render(f, &e)).unwrap(); // must not panic at any tiny size
         }
+    }
+
+    #[test]
+    fn render_skips_scroll_row_for_top_logical_line() {
+        let mut e = Editor::new_from_text("abcdefghijklmnopqrstuvwxyz123456", None, (4, 5));
+        set_caret(&mut e, 25);
+        crate::nav::ensure_visible(&mut e);
+        derive::rebuild(&mut e);
+
+        assert_eq!(e.view.scroll, 0);
+        assert_eq!(e.view.scroll_row, 3);
+
+        let mut term = Terminal::new(TestBackend::new(4, 5)).unwrap();
+        term.draw(|f| render(f, &e)).unwrap();
+        let buf = term.backend().buffer();
+        let row0: String = (0u16..4)
+            .map(|x| buf[(x, 0u16)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+
+        assert_eq!(row0, "mnop");
+        assert!(crate::nav::screen_pos(&e).is_some());
     }
 }

@@ -45,15 +45,17 @@ fn layout_line_on_demand(editor: &Editor, l: usize) -> wordcartel_core::layout::
 ///
 /// Algorithm:
 /// 1. Find the caret logical line `L`.
-/// 2. Bail if `L < scroll` (caret above visible range).
+/// 2. Bail if `L < scroll` (caret above visible range), or if `L == scroll`
+///    and the caret's visual row is above `scroll_row`.
 /// 3. Compute `in_off = head - line_start(L)` and look up (or derive on demand)
 ///    the `ColMap` for line `L`.
 /// 4. `let (vrow, vcol) = map.source_to_visual(snapped_in_off)`.
-/// 5. Screen row = sum of `ColMap.rows` for visible lines `[scroll..L)` + vrow.
+/// 5. Screen row = visible visual rows from `(scroll, scroll_row)` to `(L, vrow)`.
 /// 6. Return `None` if screen row >= area height.
 pub fn screen_pos(editor: &Editor) -> Option<(u16, u16)> {
     let buf = &editor.document.buffer;
     let scroll = editor.view.scroll;
+    let scroll_row = editor.view.scroll_row;
     // Editing area excludes the bottom status row (render reserves frame_h - 1),
     // so nav must reserve it too — else a caret on the last row is deemed visible
     // but never painted/cursor-placed. view.area is the FULL terminal size.
@@ -63,22 +65,6 @@ pub fn screen_pos(editor: &Editor) -> Option<(u16, u16)> {
 
     if l < scroll {
         return None;
-    }
-
-    // Accumulate visual rows for lines [scroll..L)
-    let mut screen_row: usize = 0;
-    for line_idx in scroll..l {
-        let rows = if let Some((_, map)) = editor.view.line_layouts.get(&line_idx) {
-            map.rows
-        } else {
-            // lay out on demand
-            layout_line_on_demand(editor, line_idx).rows
-        };
-        screen_row += rows;
-        if screen_row >= area_height {
-            // caret is below visible area before we even reach L
-            return None;
-        }
     }
 
     // Get ColMap for the caret line
@@ -97,7 +83,11 @@ pub fn screen_pos(editor: &Editor) -> Option<(u16, u16)> {
     let snapped = map.snap_to_stop(in_off);
     let (vrow, vcol) = map.source_to_visual(snapped);
 
-    let final_row = screen_row + vrow;
+    if l == scroll && vrow < scroll_row {
+        return None;
+    }
+
+    let final_row = rows_before_caret(editor, l, vrow)?;
     if final_row >= area_height {
         return None;
     }
@@ -357,62 +347,80 @@ pub fn ensure_visible(editor: &mut Editor) {
     if editor.view.scroll > max_scroll {
         editor.view.scroll = max_scroll;
     }
+    let scroll_rows = rows_of_line(editor, editor.view.scroll);
+    if editor.view.scroll_row >= scroll_rows {
+        editor.view.scroll_row = scroll_rows.saturating_sub(1);
+    }
+
+    let cvr = caret_visual_row(editor, l);
 
     // If caret is above the scroll, scroll up to caret line
-    if l < editor.view.scroll {
+    if l < editor.view.scroll || (l == editor.view.scroll && cvr < editor.view.scroll_row) {
         editor.view.scroll = l;
+        editor.view.scroll_row = cvr;
         return;
     }
 
-    // Check if caret line is below the visible area.
-    // Count how many visual rows the lines [scroll..=l] occupy.
-    let visual_rows_up_to_caret = count_visual_rows(editor, editor.view.scroll, l + 1);
-    if visual_rows_up_to_caret <= area_height {
-        // caret is visible already
+    if area_height == 0 {
         return;
     }
 
-    // Caret is below: we need to increase scroll so that the caret line
-    // fits within the viewport. Find the largest scroll s such that:
-    //   sum of visual rows for lines [s..=l] <= area_height
-    //
-    // Walk from l downward (increasing scroll) until we fit.
-    let caret_rows = count_visual_rows(editor, l, l + 1);
-    if caret_rows >= area_height {
-        // Even the caret line alone overflows; just show it from its start
-        editor.view.scroll = l.min(max_scroll);
+    let Some(mut rows_before) = rows_before_caret(editor, l, cvr) else {
+        editor.view.scroll = l;
+        editor.view.scroll_row = cvr;
         return;
-    }
+    };
 
-    // Try to include as many lines before caret as possible.
-    // Start from l going back.
-    let mut accumulated = caret_rows;
-    let mut new_scroll = l;
-    for s in (0..l).rev() {
-        let rows = count_visual_rows(editor, s, s + 1);
-        if accumulated + rows > area_height {
-            break;
-        }
-        accumulated += rows;
-        new_scroll = s;
+    while rows_before >= area_height {
+        advance_view_top_one_row(editor, max_scroll);
+        rows_before = rows_before.saturating_sub(1);
     }
-
-    editor.view.scroll = new_scroll.min(max_scroll);
 }
 
-/// Count the total visual rows for logical lines in `[from_line, to_line)`.
-/// Uses `line_layouts` cache when available; falls back to on-demand layout.
-fn count_visual_rows(editor: &Editor, from_line: usize, to_line: usize) -> usize {
-    let mut total = 0;
-    for idx in from_line..to_line {
-        let rows = if let Some((_, map)) = editor.view.line_layouts.get(&idx) {
-            map.rows
-        } else {
-            layout_line_on_demand(editor, idx).rows
-        };
-        total += rows;
+fn rows_of_line(editor: &Editor, line_idx: usize) -> usize {
+    if let Some((_, map)) = editor.view.line_layouts.get(&line_idx) {
+        map.rows.max(1)
+    } else {
+        layout_line_on_demand(editor, line_idx).rows.max(1)
     }
-    total
+}
+
+fn caret_visual_row(editor: &Editor, line_idx: usize) -> usize {
+    let buf = &editor.document.buffer;
+    let map = get_or_layout(editor, line_idx);
+    let line_off = derive::line_start(buf, line_idx);
+    let in_off = head(editor).saturating_sub(line_off);
+    let snapped = map.snap_to_stop(in_off);
+    map.source_to_visual(snapped).0
+}
+
+fn rows_before_caret(editor: &Editor, caret_line: usize, caret_vrow: usize) -> Option<usize> {
+    let scroll = editor.view.scroll;
+    let scroll_row = editor.view.scroll_row;
+
+    if caret_line < scroll {
+        return None;
+    }
+    if caret_line == scroll {
+        return caret_vrow.checked_sub(scroll_row);
+    }
+
+    let mut rows_before = rows_of_line(editor, scroll).saturating_sub(scroll_row);
+    for line_idx in (scroll + 1)..caret_line {
+        rows_before += rows_of_line(editor, line_idx);
+    }
+    Some(rows_before + caret_vrow)
+}
+
+fn advance_view_top_one_row(editor: &mut Editor, max_scroll: usize) {
+    let rows = rows_of_line(editor, editor.view.scroll);
+    editor.view.scroll_row += 1;
+    if editor.view.scroll_row >= rows && editor.view.scroll < max_scroll {
+        editor.view.scroll += 1;
+        editor.view.scroll_row = 0;
+    } else if editor.view.scroll_row >= rows {
+        editor.view.scroll_row = rows.saturating_sub(1);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -534,6 +542,30 @@ mod tests {
         let (col, row) = pos.unwrap();
         assert_eq!(row, 1, "expected visual row 1 (second wrap), got {row}");
         assert_eq!(col, 0, "expected col 0, got {col}");
+    }
+
+    #[test]
+    fn caret_in_tall_wrapped_line_stays_visible() {
+        let mut e = Editor::new_from_text(&"a".repeat(30), None, (3, 5));
+        set_caret(&mut e, 25);
+        ensure_visible(&mut e);
+        derive::rebuild(&mut e);
+
+        let pos = screen_pos(&e);
+        assert!(pos.is_some(), "expected visible caret, got None");
+        let (_col, row) = pos.unwrap();
+        assert!(row < 4, "caret row {row} should fit in editing height 4");
+    }
+
+    #[test]
+    fn short_doc_keeps_scroll_row_zero() {
+        let mut e = Editor::new_from_text("one\ntwo\n", None, (80, 10));
+        set_caret(&mut e, 5);
+        ensure_visible(&mut e);
+        derive::rebuild(&mut e);
+
+        assert_eq!(e.view.scroll_row, 0);
+        assert!(screen_pos(&e).is_some());
     }
 
     #[test]
