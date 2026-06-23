@@ -12,6 +12,7 @@
 
 use crate::derive;
 use crate::editor::{Editor, RenderMode};
+use crate::file;
 use crate::nav;
 use wordcartel_core::block_tree::Edit;
 use wordcartel_core::change::ChangeSet;
@@ -51,6 +52,10 @@ pub enum Command {
     Redo,
     /// Rotate the render mode: LivePreview → SourceHighlighted → SourcePlain → LivePreview.
     CycleRenderMode,
+    /// Save the current document to its path (atomic write).
+    Save,
+    /// Request to quit; a second Quit while dirty force-quits.
+    Quit,
 }
 
 /// Result returned by `run`.
@@ -66,6 +71,10 @@ pub enum CommandResult {
 
 /// Execute `cmd` against `editor`, then re-derive + ensure visibility.
 pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
+    // Clear the pending-quit confirmation flag for every command except Quit itself.
+    if !matches!(cmd, Command::Quit) {
+        editor.pending_quit = false;
+    }
     match cmd {
         Command::InsertChar(c) => {
             let at = nav::head(editor);
@@ -236,6 +245,47 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             };
             derive::rebuild(editor);
             CommandResult::Handled
+        }
+
+        Command::Save => {
+            match &editor.document.path {
+                None => {
+                    editor.status = "No file name (save-as is Effort 5)".to_string();
+                }
+                Some(p) => {
+                    let path = p.clone();
+                    editor.status = "Saving\u{2026}".to_string();
+                    let content = editor.document.buffer.to_string();
+                    match file::save_atomic(&path, &content) {
+                        Ok(file::SaveOutcome::Saved) => {
+                            editor.document.dirty = false;
+                            editor.status = "Saved".to_string();
+                        }
+                        Ok(file::SaveOutcome::Unchanged) => {
+                            editor.document.dirty = false;
+                            editor.status = "(unchanged)".to_string();
+                        }
+                        Err(e) => {
+                            // Buffer stays dirty; show error in status.
+                            editor.status = e.to_string();
+                        }
+                    }
+                }
+            }
+            CommandResult::Handled
+        }
+
+        Command::Quit => {
+            if editor.document.dirty && !editor.pending_quit {
+                editor.pending_quit = true;
+                editor.status =
+                    "Unsaved changes \u{2014} Ctrl+Q again to quit, Ctrl+S to save".to_string();
+                CommandResult::Handled
+            } else {
+                // Either not dirty, or this is the second Quit.
+                editor.quit = true;
+                CommandResult::Quit
+            }
         }
     }
 }

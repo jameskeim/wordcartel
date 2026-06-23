@@ -43,6 +43,7 @@ pub struct Editor {
     pub quit: bool,
     pub desired_col: Option<usize>, // preserved visual column for vertical motion; None until the first vertical move
     pub register: Register, // in-process clipboard register (Task 9)
+    pub pending_quit: bool, // true after first Quit with dirty buffer (double-Quit to confirm)
     // Threaded from `apply` → `derive` for the O(region) incremental reparse (Effort 3c):
     pub pre_edit_rope: Option<ropey::Rope>, // O(1) snapshot taken BEFORE the edit
     pub last_edit: Option<wordcartel_core::block_tree::Edit>, // the block_tree edit (range, new_len); None ⇒ full reparse
@@ -74,6 +75,7 @@ impl Editor {
             quit: false,
             desired_col: None,
             register: Register::default(),
+            pending_quit: false,
             pre_edit_rope: None,
             last_edit: None,
         }
