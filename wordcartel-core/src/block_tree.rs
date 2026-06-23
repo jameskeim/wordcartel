@@ -306,13 +306,21 @@ fn is_rule(event: &Event) -> bool {
 
 /// THE ORACLE. Walk block-level events, building a nested tree with byte spans.
 pub fn full_parse(text: &str) -> BlockTree {
-    parse_region(text, 0)
+    full_parse_src(&text)
 }
 
-/// Parse `text`, treating it as living at byte offset `base` in some larger
-/// document. All spans are shifted by `base`.
-fn parse_region(text: &str, base: usize) -> BlockTree {
-    let parser = Parser::new_ext(text, options());
+/// Generic version of `full_parse` over any `TextSource`.
+pub fn full_parse_src<S: TextSource>(src: &S) -> BlockTree {
+    parse_region(src, 0..src.len(), 0)
+}
+
+/// Parse the byte range `region` of `src`, treating the region as living at
+/// byte offset `base` in some larger document.  All spans are shifted by
+/// `base`.  The `Cow<str>` returned by `src.slice(region)` is bound to a
+/// local variable so it outlives the pulldown-cmark parser borrow.
+fn parse_region<S: TextSource>(src: &S, region: Range<usize>, base: usize) -> BlockTree {
+    let text = src.slice(region.clone());
+    let parser = Parser::new_ext(text.as_ref(), options());
 
     let mut root = Block {
         kind: BlockKind::Document,
@@ -687,7 +695,7 @@ pub fn incremental_update_instrumented(
     let region_new_end = (region_old_end as isize + delta) as usize;
 
     let new_slice = &new_text[region_new_start..region_new_end];
-    let reparsed = parse_region(new_slice, region_new_start);
+    let reparsed = parse_region(&new_slice, 0..new_slice.len(), region_new_start);
     let reparsed_bytes = new_slice.len();
 
     // Splice driven purely by the final region bounds, so it stays consistent
@@ -1098,6 +1106,59 @@ mod tests {
         // Pin the exact boundary the chunk-crossing scan must find:
         for p in 0..=600 { assert_eq!((&multi_chunk.as_str()).line_end(p), 601, "line_end({p})"); }
         for p in 601..=1201 { assert_eq!((&ropey::Rope::from_str(&multi_chunk)).line_start(p), 601, "line_start({p})"); }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 2: full_parse_src over TextSource
+    // -----------------------------------------------------------------------
+
+    /// Verify that `full_parse_src` over a `&Rope` produces the same `BlockTree`
+    /// as `full_parse` over the same text as `&str`.  Tests cover the
+    /// representative document shapes listed in the task brief.
+    fn check_rope_eq_str(s: &str) {
+        let rope = ropey::Rope::from_str(s);
+        let from_rope = full_parse_src(&&rope);
+        let from_str  = full_parse(s);
+        assert_eq!(
+            from_rope, from_str,
+            "full_parse_src(&Rope) != full_parse(&str) for {:?}\nrope={:#?}\nstr={:#?}",
+            s, from_rope, from_str,
+        );
+    }
+
+    #[test]
+    fn full_parse_src_heading_and_para() {
+        check_rope_eq_str("# Title\n\nbody text\n");
+    }
+
+    #[test]
+    fn full_parse_src_fenced_code_with_internal_blank() {
+        check_rope_eq_str("```\na\n\nb\n```\n");
+    }
+
+    #[test]
+    fn full_parse_src_nested_list() {
+        check_rope_eq_str("- item 1\n  - sub A\n  - sub B\n- item 2\n");
+    }
+
+    #[test]
+    fn full_parse_src_blockquote() {
+        check_rope_eq_str("> first line\n> second line\n\nafter\n");
+    }
+
+    #[test]
+    fn full_parse_src_gfm_table() {
+        check_rope_eq_str("| A | B |\n|---|---|\n| 1 | 2 |\n");
+    }
+
+    #[test]
+    fn full_parse_src_link_ref_def() {
+        check_rope_eq_str("[foo]: http://example.com\n\nsee [foo] here\n");
+    }
+
+    #[test]
+    fn full_parse_src_multibyte() {
+        check_rope_eq_str("# 中\n\n- 🙂\n");
     }
 
     /// Extra assertions for the non-LF separator cases: prove that line_start
