@@ -472,7 +472,7 @@ pub fn incremental_update_instrumented(
     // underline, but after a blank line is a list bullet. So pull the region
     // start back to the most recent BLANK line (start of the current line
     // group). This guarantees the reparse sees the whole group.
-    region_old_start = blank_delimited_group_start(old_text, region_old_start);
+    region_old_start = blank_delimited_group_start(&old_text, region_old_start);
     // The group walk can cross a blank line that lives *inside* a fenced or
     // indented code block (where blanks are content, not delimiters), landing
     // mid-block. Snap back to the start of any top-level block it landed inside.
@@ -509,8 +509,9 @@ pub fn incremental_update_instrumented(
             // this is the nearest preceding block).
             let gap_lo = b.span.end.min(old_text.len());
             let gap_hi = region_old_start.min(old_text.len());
-            let gap = &old_text[gap_lo.min(gap_hi)..gap_hi];
+            let gap = (&old_text).slice(gap_lo.min(gap_hi)..gap_hi);
             let gap_is_soft = gap
+                .as_ref()
                 .lines()
                 .all(|l| l.trim().is_empty() || is_ref_def_line(l));
             if absorptive && b.span.end <= region_old_start && gap_is_soft {
@@ -524,7 +525,7 @@ pub fn incremental_update_instrumented(
     // HTML blocks can change where a *preceding* block ends, so a downstream-
     // only widen is not enough — fall back to a full reparse. This is cheap to
     // detect and HTML in prose is rare (see report).
-    if html_in_play(old_text, new_text, edit, region_old_start, region_old_end) {
+    if html_in_play(&old_text, &new_text, edit, region_old_start, region_old_end) {
         let tree = full_parse(new_text);
         return UpdateOutcome { tree, reason: WidenReason::NoOverlapFull, reparsed_bytes: new_text.len() };
     }
@@ -587,7 +588,7 @@ pub fn incremental_update_instrumented(
     let widen = absorptive_in_region
         || slack_is_absorptive
         || downstream_container_merge
-        || needs_widen_to_end(old_text, new_text, edit, region_old_start, region_old_end);
+        || needs_widen_to_end(&old_text, &new_text, edit, region_old_start, region_old_end);
     let reason;
     if widen {
         region_old_end = old_text.len();
@@ -721,22 +722,22 @@ pub fn incremental_update_instrumented(
 }
 
 /// Conservative triggers that force reparsing to end-of-document.
-fn needs_widen_to_end(
-    old_text: &str,
-    new_text: &str,
+fn needs_widen_to_end<S: TextSource>(
+    old_src: &S,
+    new_src: &S,
     edit: &Edit,
     region_old_start: usize,
     region_old_end: usize,
 ) -> bool {
-    let os = region_old_start.min(old_text.len());
-    let oe = region_old_end.min(old_text.len());
-    let old_region = &old_text[os.min(oe)..oe];
-    let new_start = region_old_start.min(new_text.len());
-    let new_region_end = ((region_old_end as isize + edit.delta()) as usize).min(new_text.len());
-    let new_region = &new_text[new_start.min(new_region_end)..new_region_end];
+    let os = region_old_start.min(old_src.len());
+    let oe = region_old_end.min(old_src.len());
+    let old_region = old_src.slice(os.min(oe)..oe);
+    let new_start = region_old_start.min(new_src.len());
+    let new_region_end = ((region_old_end as isize + edit.delta()) as usize).min(new_src.len());
+    let new_region = new_src.slice(new_start.min(new_region_end)..new_region_end);
 
     // (a) Link reference definitions are resolved document-wide.
-    if contains_ref_def(old_region) || contains_ref_def(new_region) {
+    if contains_ref_def(old_region.as_ref()) || contains_ref_def(new_region.as_ref()) {
         return true;
     }
     // (b) Fence structure is fragile: editing ANY fence-marker line can flip a
@@ -745,13 +746,13 @@ fn needs_widen_to_end(
     //     marker-COUNT is not enough (the line still *starts* with backticks),
     //     so we widen whenever the edit intersects a fence-marker line in
     //     either the old or new text, or the marker count changes.
-    if fence_marker_count(old_region) != fence_marker_count(new_region) {
+    if fence_marker_count(old_region.as_ref()) != fence_marker_count(new_region.as_ref()) {
         return true;
     }
     let new_edit_start = edit.range.start;
     let new_edit_end = edit.range.start + edit.new_len;
-    if edit_touches_fence_line(old_text, edit.range.start, edit.range.end)
-        || edit_touches_fence_line(new_text, new_edit_start, new_edit_end)
+    if edit_touches_fence_line(old_src, edit.range.start, edit.range.end)
+        || edit_touches_fence_line(new_src, new_edit_start, new_edit_end)
     {
         return true;
     }
@@ -763,20 +764,20 @@ fn needs_widen_to_end(
 /// across the HTML boundary). Localizing this cheaply proved intractable in the
 /// spike (see report). Conservative, provably-safe rule: if either the old or
 /// new region contains any line starting with '<', fall back to a full reparse.
-fn html_in_play(
-    old_text: &str,
-    new_text: &str,
+fn html_in_play<S: TextSource>(
+    old_src: &S,
+    new_src: &S,
     edit: &Edit,
     region_old_start: usize,
     region_old_end: usize,
 ) -> bool {
-    let os = region_old_start.min(old_text.len());
-    let oe = region_old_end.min(old_text.len());
-    let old_region = &old_text[os.min(oe)..oe];
-    let new_start = region_old_start.min(new_text.len());
-    let new_region_end = ((region_old_end as isize + edit.delta()) as usize).min(new_text.len());
-    let new_region = &new_text[new_start.min(new_region_end)..new_region_end];
-    html_opener_count(old_region) > 0 || html_opener_count(new_region) > 0
+    let os = region_old_start.min(old_src.len());
+    let oe = region_old_end.min(old_src.len());
+    let old_region = old_src.slice(os.min(oe)..oe);
+    let new_start = region_old_start.min(new_src.len());
+    let new_region_end = ((region_old_end as isize + edit.delta()) as usize).min(new_src.len());
+    let new_region = new_src.slice(new_start.min(new_region_end)..new_region_end);
+    html_opener_count(old_region.as_ref()) > 0 || html_opener_count(new_region.as_ref()) > 0
 }
 
 fn is_ref_def_line(line: &str) -> bool {
@@ -793,15 +794,16 @@ fn contains_ref_def(s: &str) -> bool {
     s.lines().any(is_ref_def_line)
 }
 
-/// Does the byte range [lo,hi) in `text` intersect any line that begins
+/// Does the byte range [lo,hi) in `src` intersect any line that begins
 /// (after optional indentation) with a fence marker (``` or ~~~)?
-fn edit_touches_fence_line(text: &str, lo: usize, hi: usize) -> bool {
-    let lo = lo.min(text.len());
-    let hi = hi.min(text.len());
+fn edit_touches_fence_line<S: TextSource>(src: &S, lo: usize, hi: usize) -> bool {
+    let lo = lo.min(src.len());
+    let hi = hi.min(src.len());
     // Expand to whole lines covering [lo, hi].
-    let ls = line_start(text, lo);
-    let le = if hi <= lo { line_end(text, lo) } else { line_end(text, hi.saturating_sub(1).max(lo)) };
-    text[ls..le].lines().any(|l| {
+    let ls = src.line_start(lo);
+    let le = if hi <= lo { src.line_end(lo) } else { src.line_end(hi.saturating_sub(1).max(lo)) };
+    let region = src.slice(ls..le);
+    region.as_ref().lines().any(|l| {
         let t = l.trim_start();
         t.starts_with("```") || t.starts_with("~~~")
     })
@@ -826,13 +828,13 @@ fn html_opener_count(s: &str) -> usize {
 /// line group: i.e. just after the most recent blank (whitespace-only) line
 /// at-or-above `pos`, or 0. This captures the upstream context that affects how
 /// a line parses (ref-def adjacency, setext underline, lazy paragraph lines).
-fn blank_delimited_group_start(text: &str, pos: usize) -> usize {
-    let mut ls = line_start(text, pos);
+fn blank_delimited_group_start<S: TextSource>(src: &S, pos: usize) -> usize {
+    let mut ls = src.line_start(pos);
     while ls > 0 {
-        // line above ls is text[prev_ls..ls-? ]; find its start.
-        let prev_ls = line_start(text, ls - 1);
-        let prev_line = &text[prev_ls..ls]; // includes the trailing '\n'
-        if prev_line.trim().is_empty() {
+        // line above ls is src[prev_ls..ls]; find its start.
+        let prev_ls = src.line_start(ls - 1);
+        let prev_line = src.slice(prev_ls..ls); // includes the trailing '\n'
+        if prev_line.as_ref().trim().is_empty() {
             break; // blank line above -> ls is the group start
         }
         ls = prev_ls;
@@ -843,31 +845,19 @@ fn blank_delimited_group_start(text: &str, pos: usize) -> usize {
 /// Byte index of the start of the line containing `pos` (i.e. just after the
 /// previous '\n', or 0).
 ///
-/// `pos` need not be on a char boundary — we search through the raw bytes for
-/// the ASCII newline (0x0A), which is never a continuation byte of a multibyte
-/// sequence, so byte-level search is always correct.
+/// Thin wrapper around the `&str` `TextSource` impl. Kept for
+/// `incremental_update_instrumented`, which is not yet converted (Task 4).
 fn line_start(text: &str, pos: usize) -> usize {
-    let pos = pos.min(text.len());
-    let bytes = text.as_bytes();
-    // Search backwards through bytes for '\n'.
-    match bytes[..pos].iter().rposition(|&b| b == b'\n') {
-        Some(nl) => nl + 1,
-        None => 0,
-    }
+    TextSource::line_start(&text, pos)
 }
 
 /// Byte index just past the '\n' terminating the line containing `pos` (or
 /// text end). This keeps the region on whole lines.
 ///
-/// `pos` need not be on a char boundary — we search through raw bytes for the
-/// ASCII newline (0x0A).
+/// Thin wrapper around the `&str` `TextSource` impl. Kept for
+/// `incremental_update_instrumented`, which is not yet converted (Task 4).
 fn line_end(text: &str, pos: usize) -> usize {
-    let pos = pos.min(text.len());
-    let bytes = text.as_bytes();
-    match bytes[pos..].iter().position(|&b| b == b'\n') {
-        Some(off) => pos + off + 1,
-        None => text.len(),
-    }
+    TextSource::line_end(&text, pos)
 }
 
 fn shift_block(b: &Block, delta: isize) -> Block {
