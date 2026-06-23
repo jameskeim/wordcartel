@@ -380,6 +380,12 @@ close to what pandoc ingests, so what you see maps to what exports.
 - Multiple buffers / windows.
 - Richer block styling (full table grid, footnotes); inline image display.
 - Configurable themes beyond the default.
+- **Plugin system (in-process Lua) — post-1.0, a *defined* effort (§18).** Programmatic
+  extensibility via an embedded Lua runtime: plugins register named commands, bind keys,
+  subscribe to event hooks, and drive edits through the single `apply` channel. Distinct
+  from the out-of-process RPC plugin model rejected in §10.6. Carries **substrate
+  requirements on earlier efforts** (Effort 5 command registry; Effort 4b job API) so it
+  can land later without a core refactor.
 
 ---
 
@@ -669,6 +675,14 @@ Effect, never mutate directly) → **apply** (sole writer). Keymap lookup return
 `NotFound` (in insert mode, unmapped printable → literal text-insert Transaction).
 The boolean/NoOp result allows ordered fallthrough.
 
+**Commands are a name-keyed registry, not a closed enum (plugin substrate).** Bindings
+resolve a key to a **string command ID**; a registry maps that ID → handler. Built-in
+commands register at startup; the command palette (§12.2) enumerates the registry; user
+config and (post-1.0) **Lua plugins (§18)** register additional commands and bind keys
+the same way — no core change. *(Effort 5 builds this registry; a v1-first plan MAY back
+it with an internal enum, but the dispatch boundary it exposes — key→ID→handler — must be
+the registry, so the closed enum never becomes the extensibility boundary.)*
+
 ### 10.5 Worked keystroke trace (typing a character mid-paragraph)
 
 1. crossterm `KeyEvent('x')` → keymap (insert mode) → `NotFound` → literal insert.
@@ -692,7 +706,10 @@ the hot path — §3.9 satisfied by construction.
 - Conflating logical and visual (wrapped) lines — logical in Document, visual in View.
 - Eager full re-derivation per keystroke — mark dirty, recompute incrementally.
 - Frontend/backend process split, JSON-RPC plugins, CRDT, full ECS — all confirmed
-  unjustified for single-user/single-window/offline.
+  unjustified for single-user/single-window/offline. *(This rejects the **out-of-process
+  RPC** plugin model. The planned post-1.0 plugin system (§18) is **in-process embedded
+  Lua** — a different model, consistent with this anti-pattern: no process split, no RPC;
+  plugins run in-process and drive edits through the one `apply` channel.)*
 - Scattered mutations / mutating inside `draw()` — one `apply` channel; render is pure.
 
 ### 10.7 License note
@@ -1280,6 +1297,12 @@ swap-file recovery (§15.7); basic spellcheck diagnostic (§5); basic mouse (§5
 no-color/high-contrast accessibility (§13.2); bracketed-paste + best-effort composed
 input (full IME backlog).
 
+**Roadmap addition (2026-06-23):** an **in-process Lua plugin system** is now a *defined
+post-1.0 effort* (§18), with substrate requirements wired into Efforts 5 (name-keyed
+command registry + event-hook seam, §10.4) and 4b (general job API). It is the in-process
+embedded model — explicitly consistent with §10.6's rejection of out-of-process RPC
+plugins — and rides the existing single-`apply`-channel safety boundary (§10.1/§18.2).
+
 **Open items still deferred to the implementation spec** (tracked, not done):
 conceal/span model details; soft-wrap algorithm corners (hanging indents, long URLs,
 CJK in lists); undo-granularity specifics; full config schema; filter security model
@@ -1295,3 +1318,78 @@ already in §16, canonical position type = byte offset per §16.1) and the remai
 (crossterm input, ratatui render, `repar` transforms, `filter`, clipboard, atomic
 save), then app wiring (editor loop, commands, config, palette/menu). The `block_tree`
 and `layout` modules get focused spikes + oracle/property tests first.
+
+---
+
+## 18. Plugin System Roadmap — In-Process Lua (post-1.0)
+
+A **defined post-1.0 effort** (not v1). Captured now because it imposes **substrate
+requirements** on earlier efforts: getting those seams right during v1 lets the plugin
+system land later without a core refactor. This section is roadmap-level — the full
+plugin API is specced when the effort is approached; what is *fixed* here is the model,
+the safety boundary, and the substrate the earlier efforts must provide.
+
+### 18.1 Model: in-process embedded Lua (NOT out-of-process RPC)
+Extensibility via an **embedded Lua runtime** (`mlua` → Lua 5.4 / LuaJIT, MIT — no
+license friction, §6). Plugins are **in-process**: they run inside the editor and call a
+curated Rust↔Lua API. This is deliberately the *opposite* of the out-of-process
+JSON-RPC/process-split plugin model rejected in §10.6 — that rejection stands; for a
+single-user, single-window, offline editor, in-process scripting is simpler, faster, and
+avoids the xi mistake. Lua chosen for being small, fast, embeddable, and proven for
+editor scripting (Neovim).
+
+### 18.2 The safety boundary (load-bearing, inviolable)
+Plugins **never mutate editor state directly.** The only mutation path is the **single
+`apply(Transaction)` channel (§10.1)**: a plugin produces a Transaction/Effect that the
+editor applies. This is exactly what the functional-core / imperative-shell split already
+guarantees, so the architecture is plugin-ready by construction. A plugin therefore cannot
+corrupt the rope, desync the selection, or bypass undo — it can only *describe* edits.
+
+### 18.3 Plugin API surface (curated)
+Plugins interact ONLY through a stable, sandboxed API:
+- **Read** document/derived state: buffer slices, selection/cursor, current block role,
+  file path, view/mode — read-only snapshots.
+- **Edit** only by submitting Transactions/Effects to `apply` (§18.2).
+- **Register named commands** into the command registry (§10.4) — `register_command(id, fn)`;
+  these are first-class (appear in the palette §12.2, bindable by key) exactly like built-ins.
+- **Bind keys** to command IDs via the keymap (§12), or let users bind them.
+- **Subscribe to event hooks** — `on_open`, `on_save`, `on_edit`, `on_mode_change`,
+  `on_selection`, etc. (an event-dispatch seam).
+- **Schedule async work** on the job system (§10.3 / Effort 4b) so slow plugin work runs
+  off the hot path (the `filter` primitive §3.5 generalizes to a plugin-invoked transform).
+- **Surface feedback** to the status line (§3.9/§15) — no silent UI.
+
+### 18.4 Substrate requirements on earlier efforts (the "plan for it now" part)
+- **Effort 5 — command registry:** dispatch MUST be a **name-keyed registry** (string
+  command ID → handler), with the keymap and command palette resolving through it (§10.4).
+  Built-ins register the same way plugins will. (A v1 plan may back it with an internal
+  enum, but the exposed boundary is the registry.)
+- **Effort 5 — event-hook seam:** a thin hook-dispatch point (built-ins emit/observe a few
+  events) that the plugin effort fills out. Keep it minimal in v1; just don't preclude it.
+- **Effort 4b — general job API:** the worker/`mpsc` job system (§10.3) and `filter`
+  primitive must be general enough that a plugin-supplied transform is "just another job."
+- **Effort 4a/5 — keymap as data:** keys bind to command **IDs** (strings), not enum
+  variants (already the §12 direction) — so plugin and user bindings compose.
+
+### 18.5 Security & sandbox (extends §3.5 / §15)
+- Lua runs in a **restricted environment**: no ambient `os`/`io`/`require`/network by
+  default; a curated stdlib subset.
+- **Resource bounds:** an instruction/time budget so a plugin cannot hang the input loop;
+  heavy work is pushed to the job path (§18.3). A runaway plugin is killed, not tolerated.
+- **Capability/permission model:** filesystem / subprocess / network access is **opt-in**
+  and surfaced (mirrors the §3.5 filter security posture — no implicit ambient authority).
+- **Degrade, don't abort (§15.1):** a plugin error is a value surfaced to the status line;
+  the offending plugin disables itself; **core editing always continues**. A bad plugin
+  never crashes the editor.
+
+### 18.6 Config & loading (extends §12.5)
+- Plugin discovery/load path under XDG; enable/disable + per-plugin config in the TOML
+  config (precedence per §12.5); a **`--no-plugins`** clean-room flag (mirrors `--no-config`).
+
+### 18.7 Non-goals (even post-1.0)
+- NOT an out-of-process / RPC plugin host (§10.6). NOT arbitrary native/compiled plugins
+  (Lua only — the sandbox depends on it). NOT a full IDE-grade extension API. Keep the
+  surface small and the §18.2 `apply`-only safety boundary inviolable.
+
+### 18.8 Licensing
+`mlua` and Lua are MIT — clean against Wordcartel's MIT (§6). No new license constraints.

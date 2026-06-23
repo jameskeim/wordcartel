@@ -15,8 +15,9 @@ Spec: `docs/superpowers/specs/2026-06-21-wordcartel-design.md`
 | 3b | **block-role rendering** | `2026-06-22-wordcartel-03b-block-roles.md` | BlockKind heading-level + role_at query + md_parse block-prefix conceal + VisualRow role/glyph | ✅ COMPLETE (merged 4e88368; 95 lib + 27 oracle green; final opus review + Codex gate; oracle found+fixed 2 pre-existing 3a container-merge bugs; Codex found+fixed 3 conceal-fidelity gaps) |
 | 3c | **block_tree rope integration** | `2026-06-23-wordcartel-03c-blocktree-rope.md` | TextSource trait (&str + &Rope); incremental reparse materializes only the edited region (O(region)) so shell derive is O(visible)+O(edited), §3.9; oracle extended to str==rope==full | ✅ COMPLETE (merged 9f3f38d; 105 lib + 34 oracle green; opus READY-TO-MERGE + Codex pre-merge gate fixed an O(doc) gap-scan; perf probe: 78KB doc → 81-byte reparse; LF-only rope scan, str==rope==full @15k cases) |
 | 4a | **Terminal shell (sync)** | `2026-06-23-wordcartel-04a-terminal-shell.md` | runnable `wcartel` editor: Editor/Document/View + apply + derive + ratatui live-preview render + crossterm loop + cursor nav + edit/select/clipboard/undo + atomic save | PLANNED (written; worker/async + filters/repar/recovery → 4b) |
-| 4b | IO async edges | _(later)_ | std::thread+mpsc worker (version-stamped discard), background save + swap/recovery + panic dump, filter primitive, repar transforms, system-clipboard sync, external-mod detection, incremental_update in derive | PLANNED |
-| 5 | App | _(later)_ | data-driven keymap/config, command palette + hideable menu, spellcheck, mouse, word/page nav, wrap-guide | PLANNED |
+| 4b | IO async edges | _(later)_ | std::thread+mpsc worker (version-stamped discard), background save + swap/recovery + panic dump, filter primitive, repar transforms, system-clipboard sync, external-mod detection, targeted undo/redo reparse. **Plugin substrate (§18.4): keep the job/filter API general enough to host a plugin-invoked transform.** | PLANNED |
+| 5 | App | _(later)_ | data-driven keymap/config, command palette + hideable menu, spellcheck, mouse, word/page nav, wrap-guide. **Plugin substrate (§18.4): command dispatch MUST be a name-keyed registry (key→ID→handler); keymap + palette resolve through it; thin event-hook dispatch seam. Built-ins register the same way future plugins will.** | PLANNED |
+| P | **Plugin System (in-process Lua)** | _(post-1.0)_ | mlua runtime; sandboxed editor API (read state, edit via the single `apply` channel, register commands, bind keys, event hooks, jobs); security/permission model; plugin config + `--no-plugins` | PLANNED — **post-1.0** (§18); substrate built into Efforts 5 + 4b |
 
 > Effort 4 (IO/Shell, §10/§3.8/§14/§15) split into **Plan 4a** (the synchronous
 > runnable editor — open/render/edit/navigate/save) and **Plan 4b** (async edges,
@@ -56,11 +57,12 @@ Legend: ✅ done · 🔨 in this effort · ⏳ later effort · 📋 deferred to 
 | 3.1, 14 | pandoc export; repar in-process transforms | 3 | ⏳ |
 | 14.3 | Atomic save (`repar::atomic`); width helper | 3 | ⏳ |
 | 3.8, 10 | ratatui+crossterm; sync loop; functional-core/imperative-shell | 3 (shell) / 4 (loop) | ⏳ |
-| 12 | Config (TOML, precedence, project-local); keymap-as-data; command palette + menu | 4 | ⏳ |
+| 12, 10.4 | Config (TOML, precedence, project-local); keymap-as-data; command palette + menu; **name-keyed command registry (plugin substrate)** | 5 | ⏳ |
 | 5, 3.5 | Basic spellcheck (diagnostic); basic mouse | 4 | ⏳ |
 | 13.2 | No-color / high-contrast accessibility | 3 (paint) / 4 (chrome) | ⏳ |
 | 15 | Error handling & recovery; swap-file; panic dump | 3 (save/panic) / 4 (surface) | ⏳ |
 | 5 | Incremental search (`regex-cursor`); writing aids (word count, focus) | 4 | ⏳ |
+| 18 | Plugin system (in-process Lua): registry/hook substrate; sandboxed `apply`-channel API; security; config | P (post-1.0); substrate in 5/4b | 📋 |
 
 ## Reuse posture (decided 2026-06-22)
 "Source as much as possible" resolves, for the edit kernel, as: **reuse the hard
