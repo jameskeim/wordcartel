@@ -412,7 +412,8 @@ pub fn incremental_update_instrumented(
     // span.start, and cannot be reliably included in the reparse region
     // without also including the following block's content. Widening to end
     // is the only correct treatment.
-    let slack_block = tops.iter().find(|b| b.span.start >= region_old_end);
+    let slack_pos = tops.iter().position(|b| b.span.start >= region_old_end);
+    let slack_block = slack_pos.map(|i| &tops[i]);
     let slack_is_absorptive = slack_block.map_or(false, |b| {
         matches!(
             b.kind,
@@ -426,9 +427,34 @@ pub fn incremental_update_instrumented(
         ) && b.span.start < region_old_end
             && b.span.end > region_old_start
     });
+    // FORWARD/DOWNSTREAM CONTAINER MERGE: the safe region's downstream end can
+    // land exactly at the span.start of a top-level container (Table, List,
+    // BlockQuote) that the edit causes to merge backward into the reparsed
+    // region.  That container is then shifted verbatim (stale structure) instead
+    // of reparsed.  The existing absorptive gate only inspects the in-region
+    // blocks and the slack block, missing:
+    //   (a) Table — not in the absorptive set at all (CE1).
+    //   (b) The block immediately AFTER the slack block when the slack block
+    //       itself is non-absorptive (e.g. a Paragraph) but the block past it
+    //       is a List or Table (CE2 / CE1 combined).
+    // Fix: also widen-to-full when the slack block OR the block immediately
+    // following the slack block is a container (List | ListItem | Table |
+    // BlockQuote).  Full reparse is trivially correct (ground truth), so there
+    // are no false-negatives.  Plain-prose edits far from any container are
+    // unaffected (they still take the Local fast path).
+    let post_slack_block = slack_pos.and_then(|i| tops.get(i + 1));
+    let is_downstream_container = |b: &Block| {
+        matches!(
+            b.kind,
+            BlockKind::List | BlockKind::ListItem | BlockKind::Table | BlockKind::BlockQuote
+        )
+    };
+    let downstream_container_merge = slack_block.map_or(false, is_downstream_container)
+        || post_slack_block.map_or(false, is_downstream_container);
 
     let widen = absorptive_in_region
         || slack_is_absorptive
+        || downstream_container_merge
         || needs_widen_to_end(old_text, new_text, edit, region_old_start, region_old_end);
     let reason;
     if widen {
@@ -461,7 +487,6 @@ pub fn incremental_update_instrumented(
         //     inserting content into the gap can collapse it so that the
         //     following block merges with the new content — it must be reparsed
         //     rather than merely shifted.
-        let slack_pos = tops.iter().position(|b| b.span.start >= region_old_end);
         if let Some(slack_idx) = slack_pos {
             // Extend to the start of the block after the slack block, so that
             // all gap bytes between the slack block and the next "after" block

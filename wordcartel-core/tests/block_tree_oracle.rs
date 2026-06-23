@@ -552,3 +552,43 @@ fn regression_inline_link_end_corrupts_list_nesting() {
         "\nregression: chained incremental != full_parse\ntext2={text2:?}\nincremental={inc_chain:#?}\nfull={full2:#?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// CE1 / CE2 — forward/downstream container merge (pinned regressions)
+// ---------------------------------------------------------------------------
+
+/// CE1: editing the first table (bytes 21..30 -> "> ") produces a new region
+/// that ends exactly at the start of the second table. The second table would
+/// merge with the reparsed content under full_parse (GFM table greedily absorbs
+/// following pipe-rows with no blank line separator), but the incremental path
+/// shifts it verbatim → stale split. Fix: widen-to-full when the block
+/// immediately following the region (or the slack block) is a container.
+#[test]
+fn regression_ce1_downstream_table_merge() {
+    let old_text = "| a | b |\n|---|---|\n| 1 | 2 |\n\n| a | b |\n|[r]: http://y.test\n---|\n| 1 | 2 |\n\naa\n---\n";
+    let (new_text, edit) = apply_edit(old_text, 21..30, "> ");
+    let old_tree = full_parse(old_text);
+    let inc = incremental_update(&old_tree, old_text, &edit, &new_text);
+    let full = full_parse(&new_text);
+    assert_eq!(
+        inc, full,
+        "\nCE1: incremental != full_parse\nold={old_text:?}\nnew={new_text:?}\nincremental={inc:#?}\nfull={full:#?}"
+    );
+}
+
+/// CE2: deleting "# 中- " (bytes 0..5) turns the heading line into "- a",
+/// a list bullet that should merge with the following List block. The
+/// incremental path places region_old_end exactly at the following list's
+/// span.start and shifts it verbatim → two separate lists instead of one.
+#[test]
+fn regression_ce2_downstream_list_merge() {
+    let old_text = "# 中- a\n\n  cont\n- b\n  - nested\n";
+    let (new_text, edit) = apply_edit(old_text, 0..5, "");
+    let old_tree = full_parse(old_text);
+    let inc = incremental_update(&old_tree, old_text, &edit, &new_text);
+    let full = full_parse(&new_text);
+    assert_eq!(
+        inc, full,
+        "\nCE2: incremental != full_parse\nold={old_text:?}\nnew={new_text:?}\nincremental={inc:#?}\nfull={full:#?}"
+    );
+}
