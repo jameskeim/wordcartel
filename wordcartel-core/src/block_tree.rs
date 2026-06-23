@@ -1,5 +1,5 @@
 use std::ops::Range;
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 /// Kinds of block we track. Inline-level tags are ignored; we only keep the
 /// block skeleton, which is what the renderer's layout depends on.
@@ -7,7 +7,7 @@ use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
 pub enum BlockKind {
     Document,
     Paragraph,
-    Heading,
+    Heading(u8),
     FencedCode,
     IndentedCode,
     BlockQuote,
@@ -41,6 +41,70 @@ impl BlockTree {
     pub fn top_level(&self) -> &[Block] {
         &self.root.children
     }
+
+    /// Return the `BlockRole` for the block at `byte`.
+    ///
+    /// Walks the tree recursively, collecting all blocks whose span contains
+    /// `byte`, then reduces them by precedence (most-specific wins):
+    ///   FencedCode | IndentedCode → CodeBlock
+    ///   Heading(n)               → Heading(n)
+    ///   ThematicBreak            → ThematicBreak
+    ///   ListItem                 → ListItem
+    ///   BlockQuote               → BlockQuote
+    ///   anything else            → Paragraph
+    ///
+    /// Blocks are sparse — blank lines / gaps / bytes past EOF belong to no
+    /// block, so `byte` in a gap returns `Paragraph` (the safe default).
+    pub fn role_at(&self, byte: usize) -> crate::style::BlockRole {
+        let mut best = crate::style::BlockRole::Paragraph;
+        collect_role(&self.root, byte, &mut best);
+        best
+    }
+}
+
+/// Assign a numeric precedence to a `BlockRole` (lower = higher priority).
+fn role_precedence(r: &crate::style::BlockRole) -> u8 {
+    use crate::style::BlockRole::*;
+    match r {
+        CodeBlock      => 0,
+        Heading(_)     => 1,
+        ThematicBreak  => 2,
+        ListItem       => 3,
+        BlockQuote     => 4,
+        Paragraph      => 5,
+        FrontMatter    => 5,
+    }
+}
+
+/// Map a `BlockKind` to its `BlockRole` contribution (None = no upgrade).
+fn kind_to_role(kind: &BlockKind) -> Option<crate::style::BlockRole> {
+    use crate::style::BlockRole;
+    match kind {
+        BlockKind::FencedCode | BlockKind::IndentedCode => Some(BlockRole::CodeBlock),
+        BlockKind::Heading(n) => Some(BlockRole::Heading(*n)),
+        BlockKind::ThematicBreak => Some(BlockRole::ThematicBreak),
+        BlockKind::ListItem => Some(BlockRole::ListItem),
+        BlockKind::BlockQuote => Some(BlockRole::BlockQuote),
+        _ => None,
+    }
+}
+
+/// Recursively walk `block` and its children; if `byte` is inside the block's
+/// span, update `best` with the highest-precedence role found.
+fn collect_role(block: &Block, byte: usize, best: &mut crate::style::BlockRole) {
+    if !block.span.contains(&byte) {
+        return;
+    }
+    // This block contains `byte` — consider its role.
+    if let Some(role) = kind_to_role(&block.kind) {
+        if role_precedence(&role) < role_precedence(best) {
+            *best = role;
+        }
+    }
+    // Recurse into children.
+    for child in &block.children {
+        collect_role(child, byte, best);
+    }
 }
 
 /// GFM-ish options. Tables on; strikethrough is inline so it doesn't affect
@@ -56,7 +120,7 @@ fn options() -> Options {
 fn tag_to_kind(tag: &Tag) -> Option<BlockKind> {
     Some(match tag {
         Tag::Paragraph => BlockKind::Paragraph,
-        Tag::Heading { .. } => BlockKind::Heading,
+        Tag::Heading { level, .. } => BlockKind::Heading(*level as usize as u8),
         Tag::CodeBlock(CodeBlockKind::Fenced(_)) => BlockKind::FencedCode,
         Tag::CodeBlock(CodeBlockKind::Indented) => BlockKind::IndentedCode,
         Tag::BlockQuote(_) => BlockKind::BlockQuote,
@@ -81,6 +145,33 @@ fn tag_to_kind(tag: &Tag) -> Option<BlockKind> {
         | Tag::Link { .. }
         | Tag::Image { .. } => return None,
     })
+}
+
+/// Returns true if the `TagEnd` corresponds to a block-level tag that was
+/// pushed onto the stack by `tag_to_kind`.  Inline `TagEnd` variants (Link,
+/// Image, Emphasis, Strong, Strikethrough, Superscript, Subscript, and the
+/// table-internal TableHead/TableRow/TableCell variants) must return `false`
+/// here so that `Event::End` does not spuriously pop a block off the stack.
+///
+/// Invariant: `tag_end_is_block(tag_end)` iff `tag_to_kind(start_tag)` returned
+/// `Some(_)` for the matching `Event::Start`.
+fn tag_end_is_block(tag_end: &TagEnd) -> bool {
+    matches!(
+        tag_end,
+        TagEnd::Paragraph
+            | TagEnd::Heading(_)
+            | TagEnd::CodeBlock
+            | TagEnd::BlockQuote(_)
+            | TagEnd::HtmlBlock
+            | TagEnd::List(_)
+            | TagEnd::Item
+            | TagEnd::Table
+            | TagEnd::FootnoteDefinition
+            | TagEnd::DefinitionList
+            | TagEnd::DefinitionListTitle
+            | TagEnd::DefinitionListDefinition
+            | TagEnd::MetadataBlock(_)
+    )
 }
 
 /// pulldown-cmark does not emit Start/End for thematic breaks; it emits a
@@ -114,9 +205,17 @@ fn parse_region(text: &str, base: usize) -> BlockTree {
                     stack.push(Block { kind, span, children: Vec::new() });
                 }
             }
-            Event::End(_) => {
-                if let Some(done) = stack.pop() {
-                    push_child(&mut root, &mut stack, done);
+            Event::End(ref tag_end) => {
+                // Only pop when the matching Start actually pushed a block.
+                // Inline tags (Link, Image, Emphasis, etc.) return None from
+                // tag_to_kind and never push onto the stack, so their End
+                // events must be ignored here.  Without this guard, an
+                // End(Link) inside a Paragraph would spuriously pop the
+                // Paragraph off the stack, corrupting the tree structure.
+                if tag_end_is_block(tag_end) {
+                    if let Some(done) = stack.pop() {
+                        push_child(&mut root, &mut stack, done);
+                    }
                 }
             }
             _ if is_rule(&event) => {
@@ -313,7 +412,8 @@ pub fn incremental_update_instrumented(
     // span.start, and cannot be reliably included in the reparse region
     // without also including the following block's content. Widening to end
     // is the only correct treatment.
-    let slack_block = tops.iter().find(|b| b.span.start >= region_old_end);
+    let slack_pos = tops.iter().position(|b| b.span.start >= region_old_end);
+    let slack_block = slack_pos.map(|i| &tops[i]);
     let slack_is_absorptive = slack_block.map_or(false, |b| {
         matches!(
             b.kind,
@@ -327,9 +427,34 @@ pub fn incremental_update_instrumented(
         ) && b.span.start < region_old_end
             && b.span.end > region_old_start
     });
+    // FORWARD/DOWNSTREAM CONTAINER MERGE: the safe region's downstream end can
+    // land exactly at the span.start of a top-level container (Table, List,
+    // BlockQuote) that the edit causes to merge backward into the reparsed
+    // region.  That container is then shifted verbatim (stale structure) instead
+    // of reparsed.  The existing absorptive gate only inspects the in-region
+    // blocks and the slack block, missing:
+    //   (a) Table — not in the absorptive set at all (CE1).
+    //   (b) The block immediately AFTER the slack block when the slack block
+    //       itself is non-absorptive (e.g. a Paragraph) but the block past it
+    //       is a List or Table (CE2 / CE1 combined).
+    // Fix: also widen-to-full when the slack block OR the block immediately
+    // following the slack block is a container (List | ListItem | Table |
+    // BlockQuote).  Full reparse is trivially correct (ground truth), so there
+    // are no false-negatives.  Plain-prose edits far from any container are
+    // unaffected (they still take the Local fast path).
+    let post_slack_block = slack_pos.and_then(|i| tops.get(i + 1));
+    let is_downstream_container = |b: &Block| {
+        matches!(
+            b.kind,
+            BlockKind::List | BlockKind::ListItem | BlockKind::Table | BlockKind::BlockQuote
+        )
+    };
+    let downstream_container_merge = slack_block.map_or(false, is_downstream_container)
+        || post_slack_block.map_or(false, is_downstream_container);
 
     let widen = absorptive_in_region
         || slack_is_absorptive
+        || downstream_container_merge
         || needs_widen_to_end(old_text, new_text, edit, region_old_start, region_old_end);
     let reason;
     if widen {
@@ -362,7 +487,6 @@ pub fn incremental_update_instrumented(
         //     inserting content into the gap can collapse it so that the
         //     following block merges with the new content — it must be reparsed
         //     rather than merely shifted.
-        let slack_pos = tops.iter().position(|b| b.span.start >= region_old_end);
         if let Some(slack_idx) = slack_pos {
             // Extend to the start of the block after the slack block, so that
             // all gap bytes between the slack block and the next "after" block
@@ -653,7 +777,13 @@ mod tests {
     #[test]
     fn parses_heading_and_paragraph() {
         let t = full_parse("# Title\n\nbody text\n");
-        assert_eq!(kinds(&t), vec![BlockKind::Heading, BlockKind::Paragraph]);
+        assert_eq!(kinds(&t), vec![BlockKind::Heading(1), BlockKind::Paragraph]);
+    }
+
+    #[test]
+    fn full_parse_captures_heading_level() {
+        let t = full_parse("# H1\n\n### H3\n");
+        assert_eq!(kinds(&t), vec![BlockKind::Heading(1), BlockKind::Heading(3)]);
     }
 
     #[test]
@@ -723,5 +853,31 @@ mod tests {
         let doc = "para text\n---\n\nbody\n";
         let end = doc.find("\n---").unwrap() + 1;
         check(doc, 0..end, "");
+    }
+
+    #[test]
+    fn role_at_classifies_blocks() {
+        // doc: "# H\n\n> q\n\n- a\n\n```\nc\n```\n\n---\n\npara\n"
+        let doc = "# H\n\n> q\n\n- a\n\n```\nc\n```\n\n---\n\npara\n";
+        let t = full_parse(doc);
+        use crate::style::BlockRole::*;
+        let role = |needle: &str| t.role_at(doc.find(needle).unwrap());
+        assert_eq!(role("H"), Heading(1));
+        assert_eq!(role("q"), BlockQuote);     // line is inside a blockquote
+        assert_eq!(role("a"), ListItem);       // line is a list item
+        assert_eq!(role("c"), CodeBlock);      // inside a fenced code block
+        assert_eq!(role("---"), ThematicBreak);
+        assert_eq!(role("para"), Paragraph);
+    }
+
+    #[test]
+    fn role_at_gaps_and_boundaries_are_paragraph() {
+        let doc = "# H\n\npara\n";
+        let t = full_parse(doc);
+        use crate::style::BlockRole::*;
+        // the blank line (byte 4, the second '\n') is in a gap -> Paragraph
+        assert_eq!(t.role_at(4), Paragraph);
+        // a byte past document end -> Paragraph
+        assert_eq!(t.role_at(doc.len() + 5), Paragraph);
     }
 }

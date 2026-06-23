@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f638d6c5919ce63cccd7b379e566d74ac024865e5c76abff411415e42e0e80aa # shrinks to initial = "    indented code\n    more\n\n- a\n\n  cont\n- b\n  - nested\n\n---\n\n[ref]: http://x.test\n\nuse [ref] here\n\naaaa\naaaaaa\n", edits = [(325, 343, "[r]: http://y.test\n"), (610, 610, "[r]: http://y.test\n")]
+cc a23906ee01264c80f78f09abeb89b2c0996893805558aa3743611c1f004fd0ce # shrinks to initial = "| a | b |\n|---|---|\n| 1 | 2 |\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n---\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\naa\n---\n", edits = [(400, 781, "[r]: http://y.test\n"), (358, 250, "> ")]
+cc 9aba4a5139afa5cd5f38cc824841dea84cf1d5ff904fb9a94c908190edccec44 # shrinks to initial = "# 中\n\naaa中 🙂 中\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n- a\n\n  cont\n- b\n  - nested\n", edits = [(98, 647, "中"), (75, 325, ""), (94, 0, "")]

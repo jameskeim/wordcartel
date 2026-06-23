@@ -15,6 +15,7 @@ pub fn analyze(line: &str, role: BlockRole, is_active: bool) -> LineAnalysis {
             runs: vec![Run { src: 0..line.len(), visible: true }],
             styles: vec![],
             role,
+            prefix_glyph: None,
         };
     }
 
@@ -120,10 +121,210 @@ pub fn analyze(line: &str, role: BlockRole, is_active: bool) -> LineAnalysis {
         i += 1;
     }
 
+    // Block-prefix conceal: LAST grid mutation before collapse_runs.
+    // This runs AFTER inline conceal/reveal/escape so # markers cannot be
+    // re-revealed by the inline reveal pass (e.g. "## **bold**" hides both
+    // "## " and "**", leaving "bold" styled Strong).
+    let prefix_glyph = apply_block_prefix_conceal(&mut visible, line, &role);
+
     // Collapse the visible grid to Run slices.
     let runs = collapse_runs(&visible, n);
 
-    LineAnalysis { runs, styles, role }
+    LineAnalysis { runs, styles, role, prefix_glyph }
+}
+
+/// True iff `b` is a space or tab (CommonMark marker whitespace).
+#[inline]
+fn is_ws(b: u8) -> bool {
+    b == b' ' || b == b'\t'
+}
+
+/// Apply block-prefix concealment based on the block role.
+/// Mutates the per-byte `visible` grid (sets matching prefix bytes to false).
+/// Returns the prefix glyph string for list items, None otherwise.
+fn apply_block_prefix_conceal(
+    visible: &mut Vec<bool>,
+    line: &str,
+    role: &BlockRole,
+) -> Option<String> {
+    let bytes = line.as_bytes();
+    let n = bytes.len();
+
+    match role {
+        BlockRole::Heading(_) => {
+            // Skip optional leading spaces.
+            let start = bytes.iter().take_while(|&&b| b == b' ').count();
+
+            // Check for ATX heading: `#{1,6}` followed by space/tab or EOL.
+            if start < n && bytes[start] == b'#' {
+                let hash_end = bytes[start..]
+                    .iter()
+                    .take_while(|&&b| b == b'#')
+                    .count()
+                    + start;
+                let level = hash_end - start;
+                // Valid level: 1..=6
+                if level >= 1 && level <= 6 {
+                    // Valid opener: EOL or followed by space/tab
+                    let valid_opener =
+                        hash_end == n || is_ws(bytes[hash_end]);
+                    if valid_opener {
+                        // content_start: first non-ws byte after hash_end
+                        let mut content_start = hash_end;
+                        while content_start < n && is_ws(bytes[content_start]) {
+                            content_start += 1;
+                        }
+                        // Conceal opening: indent + hashes + following ws
+                        for b in 0..content_start {
+                            visible[b] = false;
+                        }
+                        // Empty heading: whole line concealed
+                        if content_start >= n {
+                            return None;
+                        }
+                        // Detect optional closing sequence.
+                        // te = index after last non-ws char (trim trailing ws)
+                        let mut te = n;
+                        while te > content_start && is_ws(bytes[te - 1]) {
+                            te -= 1;
+                        }
+                        // cs = start of trailing '#' run
+                        let mut cs = te;
+                        while cs > content_start && bytes[cs - 1] == b'#' {
+                            cs -= 1;
+                        }
+                        let hashes = te - cs;
+                        // Valid closing sequence: at least one '#', preceded by
+                        // ws or the '#' run starts at content_start (entire
+                        // visible content is hashes).
+                        if hashes > 0
+                            && (cs == content_start || is_ws(bytes[cs - 1]))
+                        {
+                            // Back cs over the preceding ws
+                            while cs > content_start && is_ws(bytes[cs - 1]) {
+                                cs -= 1;
+                            }
+                            // Conceal cs..n (trailing ws + closing hashes + any
+                            // trailing ws already captured in te..n)
+                            for b in cs..n {
+                                visible[b] = false;
+                            }
+                        }
+                        return None;
+                    }
+                }
+            }
+
+            // Check for setext underline: whole line is `[=-]+` with optional spaces.
+            // If so, conceal the whole line.
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                let first = trimmed.as_bytes()[0];
+                if (first == b'=' || first == b'-')
+                    && trimmed.bytes().all(|b| b == first)
+                {
+                    for b in 0..n {
+                        visible[b] = false;
+                    }
+                    return None;
+                }
+            }
+
+            // Setext text line: show as-is (role provides heading style via Task 4).
+            None
+        }
+
+        BlockRole::BlockQuote => {
+            // Conceal one leading `>` and optional following space or tab.
+            let start = bytes.iter().take_while(|&&b| b == b' ').count();
+            if start < n && bytes[start] == b'>' {
+                visible[start] = false;
+                // Also hide the space/tab after `>` if present.
+                if start + 1 < n && is_ws(bytes[start + 1]) {
+                    visible[start + 1] = false;
+                }
+            }
+            None
+        }
+
+        BlockRole::ListItem => {
+            // Skip optional leading spaces.
+            let start = bytes.iter().take_while(|&&b| b == b' ').count();
+            if start >= n {
+                return None;
+            }
+            let b0 = bytes[start];
+
+            // Unordered marker: `[-*+]` followed by space or tab
+            if (b0 == b'-' || b0 == b'*' || b0 == b'+')
+                && start + 1 < n
+                && is_ws(bytes[start + 1])
+            {
+                visible[start] = false;
+                visible[start + 1] = false;
+                return Some("• ".to_string());
+            }
+
+            // Ordered marker: `<digits>[.)]` followed by space or tab
+            if b0.is_ascii_digit() {
+                let digit_end = bytes[start..]
+                    .iter()
+                    .take_while(|&&b| b.is_ascii_digit())
+                    .count()
+                    + start;
+                if digit_end < n
+                    && (bytes[digit_end] == b'.' || bytes[digit_end] == b')')
+                    && digit_end + 1 < n
+                    && is_ws(bytes[digit_end + 1])
+                {
+                    // Parse the ordinal number.
+                    let ordinal: &str = &line[start..digit_end];
+                    let glyph = format!("{}. ", ordinal);
+                    // Conceal start..=digit_end+1 (digits + punctuation + space/tab).
+                    for i in start..=digit_end + 1 {
+                        visible[i] = false;
+                    }
+                    return Some(glyph);
+                }
+            }
+
+            None
+        }
+
+        BlockRole::CodeBlock => {
+            // If the line (after optional spaces) starts with ``` or ~~~,
+            // it's a fence line — conceal the whole line.
+            let start = bytes.iter().take_while(|&&b| b == b' ').count();
+            if start < n {
+                let b0 = bytes[start];
+                if b0 == b'`' || b0 == b'~' {
+                    let fence_end = bytes[start..]
+                        .iter()
+                        .take_while(|&&b| b == b0)
+                        .count()
+                        + start;
+                    if fence_end - start >= 3 {
+                        // It's a valid fence opener/closer.
+                        for b in 0..n {
+                            visible[b] = false;
+                        }
+                    }
+                }
+            }
+            None
+        }
+
+        BlockRole::ThematicBreak => {
+            // Conceal the whole line.
+            for b in 0..n {
+                visible[b] = false;
+            }
+            None
+        }
+
+        // Paragraph and others: no prefix conceal.
+        _ => None,
+    }
 }
 
 /// Derive the current style from active nesting counters.
@@ -228,5 +429,217 @@ mod tests {
         let a = analyze(line, BlockRole::Paragraph, false);
         assert_eq!(visible(&a, line), "x");
         assert_eq!(style_at(&a, 3), Some(Style::StrongEmphasis));
+    }
+
+    // --- Task 3: block-prefix conceal tests ---
+
+    #[test]
+    fn heading_prefix_concealed() {
+        let a = analyze("## Title", BlockRole::Heading(2), false);
+        assert_eq!(visible(&a, "## Title"), "Title"); // "## " hidden
+    }
+
+    #[test]
+    fn blockquote_prefix_concealed() {
+        let a = analyze("> quoted", BlockRole::BlockQuote, false);
+        assert_eq!(visible(&a, "> quoted"), "quoted");
+    }
+
+    #[test]
+    fn list_marker_becomes_bullet_glyph() {
+        let a = analyze("- item", BlockRole::ListItem, false);
+        assert_eq!(visible(&a, "- item"), "item");
+        assert_eq!(a.prefix_glyph.as_deref(), Some("• "));
+    }
+
+    #[test]
+    fn fence_line_concealed() {
+        let a = analyze("```rust", BlockRole::CodeBlock, false);
+        assert_eq!(visible(&a, "```rust"), ""); // fence line hidden
+    }
+
+    #[test]
+    fn active_line_keeps_block_prefix_raw() {
+        let a = analyze("## Title", BlockRole::Heading(2), true);
+        assert_eq!(visible(&a, "## Title"), "## Title"); // raw on cursor line
+        assert!(a.prefix_glyph.is_none());
+    }
+
+    #[test]
+    fn heading_prefix_composes_with_inline_style() {
+        // "## **bold**" -> "## " AND "**" hidden, leaving "bold" as Strong.
+        let line = "## **bold**";
+        let a = analyze(line, BlockRole::Heading(2), false);
+        assert_eq!(visible(&a, line), "bold");
+        // 'b' is at byte 5 in "## **bold**"
+        assert_eq!(style_at(&a, 5), Some(Style::Strong));
+    }
+
+    #[test]
+    fn list_marker_composes_with_inline_style() {
+        let line = "- **item**";
+        let a = analyze(line, BlockRole::ListItem, false);
+        assert_eq!(visible(&a, line), "item");
+        assert_eq!(a.prefix_glyph.as_deref(), Some("• "));
+    }
+
+    #[test]
+    fn setext_underline_concealed() {
+        // role_at returns Heading for the underline line; conceal the whole "---".
+        let a = analyze("---", BlockRole::Heading(1), false);
+        assert_eq!(visible(&a, "---"), "");
+    }
+
+    #[test]
+    fn setext_underline_rejects_embedded_spaces() {
+        // "- - -" is NOT a setext underline (embedded spaces); with role Heading it
+        // must NOT be concealed as an underline — its content stays visible.
+        let a = analyze("- - -", BlockRole::Heading(1), false);
+        assert_eq!(visible(&a, "- - -"), "- - -");
+    }
+
+    // --- Fix 1: TAB as marker whitespace ---
+
+    #[test]
+    fn heading_tab_after_hash() {
+        let line = "#\tTitle";
+        let a = analyze(line, BlockRole::Heading(1), false);
+        assert_eq!(visible(&a, line), "Title");
+    }
+
+    #[test]
+    fn list_unordered_tab_after_marker() {
+        let line = "-\titem";
+        let a = analyze(line, BlockRole::ListItem, false);
+        assert_eq!(visible(&a, line), "item");
+        assert_eq!(a.prefix_glyph.as_deref(), Some("• "));
+    }
+
+    #[test]
+    fn list_ordered_tab_after_marker() {
+        let line = "1.\titem";
+        let a = analyze(line, BlockRole::ListItem, false);
+        assert_eq!(visible(&a, line), "item");
+        assert_eq!(a.prefix_glyph.as_deref(), Some("1. "));
+    }
+
+    #[test]
+    fn blockquote_tab_after_angle() {
+        let line = ">\tq";
+        let a = analyze(line, BlockRole::BlockQuote, false);
+        assert_eq!(visible(&a, line), "q");
+    }
+
+    // --- Fix 2: empty ATX heading ---
+
+    #[test]
+    fn heading_empty_atx_single_hash() {
+        let line = "#";
+        let a = analyze(line, BlockRole::Heading(1), false);
+        assert_eq!(visible(&a, line), "");
+    }
+
+    #[test]
+    fn heading_empty_atx_triple_hash() {
+        let line = "###";
+        let a = analyze(line, BlockRole::Heading(3), false);
+        assert_eq!(visible(&a, line), "");
+    }
+
+    #[test]
+    fn heading_empty_atx_trailing_spaces() {
+        let line = "#  ";
+        let a = analyze(line, BlockRole::Heading(1), false);
+        assert_eq!(visible(&a, line), "");
+    }
+
+    // --- Fix 3: closing ATX sequence ---
+
+    #[test]
+    fn heading_closing_atx_single_hash() {
+        let line = "# Title #";
+        let a = analyze(line, BlockRole::Heading(1), false);
+        assert_eq!(visible(&a, line), "Title");
+    }
+
+    #[test]
+    fn heading_closing_atx_multiple_hashes() {
+        let line = "## Title ###";
+        let a = analyze(line, BlockRole::Heading(2), false);
+        assert_eq!(visible(&a, line), "Title");
+    }
+
+    #[test]
+    fn heading_closing_atx_trailing_spaces() {
+        let line = "# Title #  ";
+        let a = analyze(line, BlockRole::Heading(1), false);
+        assert_eq!(visible(&a, line), "Title");
+    }
+
+    #[test]
+    fn heading_closing_atx_content_is_just_hashes() {
+        // "## #" -> content is empty after the closing hash is stripped
+        let line = "## #";
+        let a = analyze(line, BlockRole::Heading(2), false);
+        assert_eq!(visible(&a, line), "");
+    }
+
+    #[test]
+    fn heading_closing_not_sequence_no_preceding_ws() {
+        // "# Title#" — trailing # not preceded by ws, so it's literal content
+        let line = "# Title#";
+        let a = analyze(line, BlockRole::Heading(1), false);
+        assert_eq!(visible(&a, line), "Title#");
+    }
+
+    #[test]
+    fn heading_closing_not_sequence_mid_content_hash() {
+        // "# a #b" — the "#b" run is interrupted by 'b', so not a closing sequence.
+        let line = "# a #b";
+        let a = analyze(line, BlockRole::Heading(1), false);
+        assert_eq!(visible(&a, line), "a #b");
+    }
+
+    #[test]
+    fn heading_closing_sequence_multibyte_content() {
+        // "# 中 #" — closing # stripped, multibyte content survives intact
+        // (the right-to-left # scan must not split or misfire on UTF-8 bytes).
+        let line = "# 中 #";
+        let a = analyze(line, BlockRole::Heading(1), false);
+        assert_eq!(visible(&a, line), "中");
+    }
+
+    #[test]
+    fn heading_empty_atx_trailing_tab() {
+        // "#\t" — hash followed by a tab then nothing → empty heading, whole line hidden.
+        let line = "#\t";
+        let a = analyze(line, BlockRole::Heading(1), false);
+        assert_eq!(visible(&a, line), "");
+    }
+
+    // --- Regressions ---
+
+    #[test]
+    fn heading_regression_no_closing() {
+        let line = "## Title";
+        let a = analyze(line, BlockRole::Heading(2), false);
+        assert_eq!(visible(&a, line), "Title");
+    }
+
+    #[test]
+    fn heading_regression_compose_bold() {
+        let line = "## **bold**";
+        let a = analyze(line, BlockRole::Heading(2), false);
+        assert_eq!(visible(&a, line), "bold");
+        // 'b' is at byte 5 in "## **bold**"
+        assert_eq!(style_at(&a, 5), Some(Style::Strong));
+    }
+
+    #[test]
+    fn heading_regression_active_line_raw() {
+        let line = "## Title";
+        let a = analyze(line, BlockRole::Heading(2), true);
+        assert_eq!(visible(&a, line), "## Title");
+        assert!(a.prefix_glyph.is_none());
     }
 }

@@ -499,3 +499,96 @@ fn hazard_delete_to_single_char() {
         doc, new_text, inc, full
     );
 }
+
+/// Regression test: proptest oracle_multi_edit_chain found a real bug where
+/// inserting a link-reference-definition AFTER a list caused full_parse to
+/// return a different tree structure than incremental_update.
+///
+/// Root cause: parse_region's Event::End handler was popping the block stack
+/// unconditionally for ALL End events, including inline tags (Link, Image,
+/// Emphasis, etc.) that never pushed anything onto the stack.  When a list
+/// item's paragraph contained an inline link (e.g. "[r]" resolved via a
+/// ref-def added by this edit), End(Link) would spuriously pop the enclosing
+/// Paragraph, shifting all subsequent End events one slot too early and
+/// causing the second ListItem to end up as a sibling of the List instead of
+/// a child.
+///
+/// The fix: check `tag_end_is_block()` before popping; ignore End events for
+/// inline/table-internal tags.
+///
+/// The bug was first reproducible as a single-edit oracle failure:
+///   incremental_update(&full_parse(text1), text1, &edit2, text2)
+///     != full_parse(text2)
+/// even without the chained edit1.  We test both forms.
+#[test]
+fn regression_inline_link_end_corrupts_list_nesting() {
+    // text1: a nested-list doc where "[r]" appears in a list item but "[r]:"
+    // is not yet a ref-def, so "[r]" is plain text.
+    let text1 = "    indented code\n    more\n\n- a\n\n  c[r]: http://y.test\nt\n- b\n  - nested\n\n---\n\n[ref]: http://x.test\n\nuse [ref] here\n\naaaa\naaaaaa\n";
+    // text2: insert "[r]: http://y.test\n" at byte 78 of text1, making "[r]"
+    // inside the list item resolve as a link.  full_parse must yield the same
+    // tree whether we call it directly or via incremental_update.
+    let (text2, edit2) = apply_edit(text1, 78..78, "[r]: http://y.test\n");
+
+    // Single-edit form (simpler): feed full_parse(text1) as old_tree.
+    let t1_full = full_parse(text1);
+    let inc_single = incremental_update(&t1_full, text1, &edit2, &text2);
+    let full2 = full_parse(&text2);
+    assert_eq!(
+        inc_single, full2,
+        "\nregression: single-edit incremental != full_parse\ntext1={text1:?}\ntext2={text2:?}\nincremental={inc_single:#?}\nfull={full2:#?}"
+    );
+
+    // Chained form: replay edit1 first, then edit2.
+    // edit1: replace initial[36..38] ("on") with "[r]: http://y.test\n"
+    let initial = "    indented code\n    more\n\n- a\n\n  cont\n- b\n  - nested\n\n---\n\n[ref]: http://x.test\n\nuse [ref] here\n\naaaa\naaaaaa\n";
+    let (text1_check, edit1) = apply_edit(initial, 36..38, "[r]: http://y.test\n");
+    assert_eq!(text1_check, text1, "edit1 must reconstruct text1");
+    let t0 = full_parse(initial);
+    let t1_inc = incremental_update(&t0, initial, &edit1, text1);
+    let inc_chain = incremental_update(&t1_inc, text1, &edit2, &text2);
+    assert_eq!(
+        inc_chain, full2,
+        "\nregression: chained incremental != full_parse\ntext2={text2:?}\nincremental={inc_chain:#?}\nfull={full2:#?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CE1 / CE2 — forward/downstream container merge (pinned regressions)
+// ---------------------------------------------------------------------------
+
+/// CE1: editing the first table (bytes 21..30 -> "> ") produces a new region
+/// that ends exactly at the start of the second table. The second table would
+/// merge with the reparsed content under full_parse (GFM table greedily absorbs
+/// following pipe-rows with no blank line separator), but the incremental path
+/// shifts it verbatim → stale split. Fix: widen-to-full when the block
+/// immediately following the region (or the slack block) is a container.
+#[test]
+fn regression_ce1_downstream_table_merge() {
+    let old_text = "| a | b |\n|---|---|\n| 1 | 2 |\n\n| a | b |\n|[r]: http://y.test\n---|\n| 1 | 2 |\n\naa\n---\n";
+    let (new_text, edit) = apply_edit(old_text, 21..30, "> ");
+    let old_tree = full_parse(old_text);
+    let inc = incremental_update(&old_tree, old_text, &edit, &new_text);
+    let full = full_parse(&new_text);
+    assert_eq!(
+        inc, full,
+        "\nCE1: incremental != full_parse\nold={old_text:?}\nnew={new_text:?}\nincremental={inc:#?}\nfull={full:#?}"
+    );
+}
+
+/// CE2: deleting "# 中- " (bytes 0..5) turns the heading line into "- a",
+/// a list bullet that should merge with the following List block. The
+/// incremental path places region_old_end exactly at the following list's
+/// span.start and shifts it verbatim → two separate lists instead of one.
+#[test]
+fn regression_ce2_downstream_list_merge() {
+    let old_text = "# 中- a\n\n  cont\n- b\n  - nested\n";
+    let (new_text, edit) = apply_edit(old_text, 0..5, "");
+    let old_tree = full_parse(old_text);
+    let inc = incremental_update(&old_tree, old_text, &edit, &new_text);
+    let full = full_parse(&new_text);
+    assert_eq!(
+        inc, full,
+        "\nCE2: incremental != full_parse\nold={old_text:?}\nnew={new_text:?}\nincremental={inc:#?}\nfull={full:#?}"
+    );
+}

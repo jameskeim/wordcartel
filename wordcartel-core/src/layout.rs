@@ -48,6 +48,10 @@ pub struct VisualRow {
     pub src_span: Range<usize>,
     /// Contiguous runs of same-style cells (concatenation of seg texts == display).
     pub segs: Vec<StyledSeg>,
+    /// Block role of the logical line this row belongs to.
+    pub role: crate::style::BlockRole,
+    /// Prefix glyph for the block style (first row only; others are `None`).
+    pub prefix_glyph: Option<String>,
 }
 
 /// Maps between source byte offsets and visual `(row, col)` positions.
@@ -260,7 +264,7 @@ pub fn layout(
     let rows = row + 1;
 
     let mut visual_rows: Vec<VisualRow> =
-        vec![VisualRow { display: String::new(), width: 0, src_span: 0..0, segs: Vec::new() }; rows];
+        vec![VisualRow { display: String::new(), width: 0, src_span: 0..0, segs: Vec::new(), role: BlockRole::Paragraph, prefix_glyph: None }; rows];
     let mut row_min: Vec<Option<usize>> = vec![None; rows];
     let mut row_max: Vec<Option<usize>> = vec![None; rows];
     for p in &placed {
@@ -294,6 +298,12 @@ pub fn layout(
             visual_rows[r].src_span = a..b;
         }
     }
+
+    // Propagate block role to every row and prefix glyph to the first row only.
+    for vr in visual_rows.iter_mut() {
+        vr.role = role;
+    }
+    visual_rows[0].prefix_glyph = analysis.prefix_glyph;
 
     let map = ColMap {
         placed,
@@ -585,6 +595,19 @@ mod tests {
         let (_r, map) = layout("**a**", BlockRole::Paragraph, false, 80);
         let c = enter_from_bottom(&map, 9);
         assert!(map.is_cursor_stop(c.offset));
+    }
+
+    #[test]
+    fn rows_carry_block_role_and_glyph() {
+        let (rows, _m) = layout("- item", BlockRole::ListItem, false, 80);
+        assert_eq!(rows[0].role, BlockRole::ListItem);
+        assert_eq!(rows[0].prefix_glyph.as_deref(), Some("• "));
+    }
+
+    #[test]
+    fn heading_rows_carry_heading_role() {
+        let (rows, _m) = layout("## Title", BlockRole::Heading(2), false, 80);
+        assert!(rows.iter().all(|r| r.role == BlockRole::Heading(2)));
     }
 
     #[test]

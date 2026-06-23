@@ -14,7 +14,12 @@ pub struct StyleSpan { pub src: Range<usize>, pub style: Style }
 pub struct Run { pub src: Range<usize>, pub visible: bool }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LineAnalysis { pub runs: Vec<Run>, pub styles: Vec<StyleSpan>, pub role: BlockRole }
+pub struct LineAnalysis {
+    pub runs: Vec<Run>,
+    pub styles: Vec<StyleSpan>,
+    pub role: BlockRole,
+    pub prefix_glyph: Option<String>,
+}
 
 #[cfg(test)]
 mod tests {
@@ -25,6 +30,7 @@ mod tests {
             runs: vec![Run { src: 0..3, visible: true }],
             styles: vec![StyleSpan { src: 0..3, style: Style::Strong }],
             role: BlockRole::Paragraph,
+            prefix_glyph: None,
         };
         assert_eq!(a.runs.len(), 1);
         assert_eq!(a.styles[0].style, Style::Strong);
