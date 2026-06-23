@@ -506,6 +506,29 @@ sources (GPL/MPL) are *pattern-only*.
   **incremental==full-reparse oracle test (§11.2) covering *every* container
   construct**, and warrants its own focused spike before/at implementation. A new
   `block_tree` core module owns this (§4).
+- **SPIKE OUTCOME (validated; `~/projects/wordcartel-blocktree-spike`):** the oracle
+  **held across ~800,000 randomized cases** after the spike found & fixed **8**
+  context-sensitivity hazards (fence-marker *toggling* — count is a trap; HTML-block
+  7-rule termination; lazy container re-extension up/down; indented-code merge across
+  blanks; link-reference-definitions; setext/line-group context; pulldown spans don't
+  tile the document). **Validated v1 algorithm:** *reparse the enclosing safe region,
+  fall back to full* — find the top-level block(s) overlapping the edit, snap to line
+  boundaries, pull the start back over the current line-group / a preceding
+  List·BlockQuote·IndentedCode (clamping so it never lands inside a code block);
+  **full-reparse trigger** = any `<`-led (HTML) line; **widen-to-end triggers** =
+  a link-ref-def, a fence-marker-line touch, or overlap with a List·BlockQuote·
+  IndentedCode; then splice + span-shift. **Perf (measured):** full reparse 5.3 ms
+  @1 MB, ~12–28 ms @5 MB; a common paragraph edit reparses **~250 bytes regardless of
+  doc size** → comfortably within the 16 ms budget (§3.9) to ~1–2 MB.
+- **Refinements from the spike (carry into the plan):** (a) **v1 does NOT need a
+  fine-grained sub-block dirty tree** — the safe-region + full-fallback above is
+  correct and responsive to ~1–2 MB; defer the fine-grained tree until smooth 2–5 MB+
+  editing is actually needed. (b) Store **relative spans** (offset from parent/prev
+  sibling) so a shift is O(1), not O(n) — the O(n) span-shift, *not* parsing,
+  dominates at scale. (c) Treat **HTML blocks as opaque raw spans** with explicit
+  blank-line boundaries (their termination rules resist localization). (d) Keep an
+  instrumented `WidenReason ∈ {Local, WidenToEnd, NoOverlapFull}` for telemetry — a
+  high widen rate flags a ref-def/HTML-heavy doc that has lost incrementality.
 - **`col_map` = atomicRanges analog:** concealed bytes are simply absent from the
   visible-grapheme list, so arrow keys skip hidden markers for free. **The full,
   spike-validated `ColMap` + cursor-affinity + navigation contract is §16** (the
