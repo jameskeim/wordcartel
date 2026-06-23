@@ -35,7 +35,7 @@ The shell is deliberately thin. It **consumes** the merged core API verbatim —
 | Selection | `Selection::single(pos) -> Selection`, `.primary() -> Range`, `.map(&ChangeSet) -> Selection`; `Range::point(pos)`, `.from() -> usize`, `.to() -> usize`, `.is_empty() -> bool`, `.map(&ChangeSet) -> Range` |
 | History | `History::default()` (no `new()`), `.commit_coalescing(txn: Transaction, buf: &mut TextBuffer, before: Selection, clock: &dyn Clock, kind: EditKind) -> Selection`, `.commit(txn, buf, before) -> Selection`, `.undo(&mut TextBuffer) -> Option<Selection>`, `.redo(&mut TextBuffer) -> Option<Selection>`; `Transaction::new(ChangeSet)`, `.with_selection(Selection)`; `EditKind::{Type, Other}`; `trait Clock { fn now_ms(&self) -> u64 }`; `COALESCE_MS` |
 | Clipboard | `Register`, `register::copy(&TextBuffer, Range, &mut Register)`, `register::cut(Range, doc_len, &mut Register, &TextBuffer) -> ChangeSet`, `register::paste(at, doc_len, &Register) -> Option<ChangeSet>` |
-| Block roles (rope, Effort 3c) | `block_tree::full_parse_rope(&ropey::Rope) -> BlockTree`, `block_tree::incremental_update_rope(&BlockTree, old_rope: &Rope, &Edit, new_rope: &Rope) -> BlockTree` (materializes only the edited region — O(region)), `BlockTree::role_at(byte) -> BlockRole`; `block_tree::Edit { range: Range<usize>, new_len: usize }` (derives `Clone/Debug/PartialEq`). The `&str` forms (`full_parse`, `incremental_update`) still exist but the shell uses the rope forms with `buffer.snapshot()`. |
+| Block roles (rope, Effort 3c) | `block_tree::full_parse_rope(&ropey::Rope) -> BlockTree`, `block_tree::incremental_update_rope(&BlockTree, old_rope: &Rope, &Edit, new_rope: &Rope) -> BlockTree` (materializes only the edited region — O(region)), `BlockTree::role_at(byte) -> BlockRole`; `block_tree::Edit { range: Range<usize>, new_len: usize }` (derives `Clone/Debug` **only — NOT `PartialEq`**, so compare its fields in tests, not `assert_eq!` on the whole `Edit`). The `&str` forms (`full_parse`, `incremental_update`) still exist but the shell uses the rope forms with `buffer.snapshot()`. |
 | Layout | `layout::layout(line: &str, role: BlockRole, is_active: bool, viewport_width: usize) -> (Vec<VisualRow>, ColMap)`; `VisualRow { display, width, src_span, segs: Vec<StyledSeg>, role, prefix_glyph }`; `StyledSeg { text, style, width }` |
 | Cursor (per logical line) | `Cursor { offset, row, desired_col }`, `cursor_at(&ColMap, offset) -> Cursor`, `move_right/move_left/move_home/move_end(&ColMap, Cursor) -> Cursor`, `move_down_within/move_up_within(&ColMap, Cursor) -> Option<Cursor>`, `enter_from_top/enter_from_bottom(&ColMap, desired_col) -> Cursor`; `ColMap { placed, rows, eol, row_end_col, is_active }`, `.source_to_visual(offset) -> (row,col)`, `.visual_to_source(row,col) -> usize`, `.snap_to_stop(raw) -> usize`, `.col_on_row(offset,row) -> usize` |
 | Style enum | `style::Style { Plain, Emphasis, Strong, StrongEmphasis, Code, Strikethrough, Link }`, `style::BlockRole { Paragraph, Heading(u8), BlockQuote, ListItem, CodeBlock, ThematicBreak, FrontMatter }` |
@@ -59,7 +59,7 @@ New crate at `wordcartel/` (workspace member). All modules in the lib target; `m
 - `wordcartel/src/input.rs` — `key_to_command(KeyEvent, mode) -> Option<Command>`: the static CUA keymap (§12.3) + printable→InsertChar fallback. (Pending multi-key sequences are a stub returning `None` extra state in 4a; full KeyTrie is Effort 5.)
 - `wordcartel/src/render.rs` — `render(frame: &mut Frame, editor: &Editor)`: pure paint of the viewport + status line + (optional) wrap-guide. ratatui widgets.
 - `wordcartel/src/term.rs` — `TerminalGuard`: enter raw mode + alt screen on construct, restore on Drop; install a panic hook that restores the terminal before the default hook prints (§15.7 terminal-restore half).
-- `wordcartel/src/file.rs` — `open(path) -> Result<String, OpenError>` (refuse binary/non-UTF-8 per §15.3, mirroring repar `is_binary`), `save_atomic(path, &str) -> Result<(), SaveError>` (same-dir O_EXCL temp `0o600` → write → fsync → rename → dir fsync → skip-unchanged → refuse symlink; ports repar `atomic.rs`, §14.3). Synchronous in 4a.
+- `wordcartel/src/file.rs` — `open(path) -> Result<String, OpenError>` (refuse binary/non-UTF-8 per §15.3, mirroring repar `is_binary`), `save_atomic(path, &str) -> Result<SaveOutcome, SaveError>` (same-dir O_EXCL temp `0o600` → write → fsync → rename → dir fsync → skip-unchanged → refuse symlink → preserve mode; ports repar `atomic.rs` + the extras it lacks, §14.3/Task 11). Synchronous in 4a.
 
 Each task ends with an independently testable deliverable.
 
@@ -121,6 +121,7 @@ pub mod input;
 pub mod render;
 pub mod term;
 pub mod file;
+pub mod app;   // App::run + the testable App::step (Task 12)
 ```
 Create each listed module file with a `// filled in by later tasks` placeholder so the crate compiles.
 - [ ] **Step 4:** Create `wordcartel/src/main.rs`:
@@ -230,7 +231,8 @@ fn apply_insert_mutates_text_selection_version() {
     assert_eq!(e.document.version, 1);
     assert!(e.document.dirty);
     assert!(e.pre_edit_rope.is_some());
-    assert_eq!(e.last_edit, Some(Edit { range: 1..1, new_len: 1 }));
+    // Edit has no PartialEq — compare fields:
+    assert_eq!(e.last_edit.as_ref().map(|x| (x.range.clone(), x.new_len)), Some((1..1, 1)));
 }
 #[test]
 fn undo_redo_round_trip() {
@@ -245,7 +247,7 @@ fn undo_redo_round_trip() {
     assert_eq!(e.document.buffer.to_string(), "aXb\n");
 }
 ```
-(Note: `block_tree::Edit` derives `PartialEq`/`Debug` — used in the assertion above.)
+(Note: `block_tree::Edit` derives only `Clone`/`Debug` — the test compares `range`/`new_len` fields, not the whole `Edit`.)
 - [ ] **Step 2:** Run → FAIL.
 - [ ] **Step 3:** Implement `apply` per the behavior list (snapshot → commit → version/dirty → stash `pre_edit_rope`+`last_edit`). The `Edit` is passed IN by the caller (commands build it from the same `(range, replacement)` they use for the `ChangeSet`), so no ChangeSet-walking is needed. `undo`/`redo` set `last_edit=None`/`pre_edit_rope=None`.
 - [ ] **Step 4:** Run → PASS.
@@ -422,7 +424,7 @@ fn left_crosses_line_boundary() {
 **Files:** `wordcartel/src/nav.rs`.
 
 **Interfaces — Produces:** `nav::move_up(editor) -> usize`, `nav::move_down(editor) -> usize`, preserving `editor.desired_col` across the motion (set on horizontal motion / first vertical motion, preserved while moving vertically — §16.2 desired_col).
-- `move_down`: `(_, map) = layout(L, active); cur = cursor_at(map, in_off);` try `core::move_down_within(&map, cur)`:
+- `move_down`: `(_, map) = layout(L, active);` compute `desired` first — `let desired = editor.desired_col.unwrap_or_else(|| map.col_on_row(in_off, cur.row)); editor.desired_col = Some(desired);` — then `let mut cur = cursor_at(&map, in_off); cur.desired_col = desired;` (the core motion fns read `cur.desired_col`, so it MUST be the stored value, not the freshly-snapped column). Then try `core::move_down_within(&map, cur)`:
   - `Some(c)` → caret stays in line `L`, new caret = `line_start(L) + c.offset` (wrapped multi-row line).
   - `None` → at the bottom visual row of line `L`. If `L` is the last line, no-op (return current head). Else lay out line `L+1` (active), `let c = core::enter_from_top(&next_map, editor.desired_col);` new caret = `line_start(L+1) + c.offset`.
 - `move_up` symmetric with `move_up_within` / `enter_from_bottom` into line `L-1`.
@@ -464,7 +466,7 @@ fn down_within_wrapped_line_stays_in_line() {
 - `InsertChar(c)`: `let at = nav::head(editor); let cs = ChangeSet::insert(at, &c.to_string(), buffer.len()); editor.apply(Transaction::new(cs).with_selection(Selection::single(at + c.len_utf8())), Edit { range: at..at, new_len: c.len_utf8() }, EditKind::Type, clock);` then rebuild/ensure_visible/`desired_col=None`.
 - `InsertNewline`: same with `"\n"` (`new_len: 1`, `range: at..at`), `EditKind::Other` (break coalescing on newline so undo chunks per line; document the choice).
 - `Backspace`: if caret `> 0` and selection empty, delete the grapheme before caret — get `prev` via `nav::move_left` (grapheme-correct, reuses the core cursor stops); `cs = ChangeSet::delete(prev..at, len)`; `Edit { range: prev..at, new_len: 0 }`; new caret = `prev`. If a selection is non-empty (Task 9), delete the selection range instead (`range = sel.primary().from()..sel.primary().to()`, `new_len: 0`). `EditKind::Other`.
-- `DeleteForward`: delete the grapheme at caret — `next` via `nav::move_right`; `cs = ChangeSet::delete(at..next, len)`; `Edit { range: at..next, new_len: 0 }`; caret stays at `at`. `EditKind::Other`.
+- `DeleteForward`: delete the grapheme at caret — `next` via `nav::move_right`; **if `next == at` (EOF / nothing to delete) return `CommandResult::Noop` — do NOT build a zero-width delete (it would dirty the buffer, bump version, and push a no-op undo)**; else `cs = ChangeSet::delete(at..next, len)`; `Edit { range: at..next, new_len: 0 }`; caret stays at `at`. `EditKind::Other`. (Backspace's `caret > 0` guard already covers its empty case.)
 After every edit: `derive::rebuild` + `nav::ensure_visible`.
 
 - [ ] **Step 1: Write failing tests**:
@@ -507,7 +509,7 @@ fn typing_coalesces_into_one_undo() {
 
 **Files:** `wordcartel/src/commands.rs`, `wordcartel/src/nav.rs`. Add `Register` to `Editor` (field `register: Register`).
 
-**Interfaces — Produces:** selection-extending nav (`Command::Move{dir, extend: bool}`) and clipboard commands (`Copy`, `Cut`, `Paste`). The caret model is a true anchor/head: `Selection` with `anchor != head` when extending. `Move{dir, extend:false}` collapses to a point (`Selection::single(new)`); `extend:true` keeps the anchor and moves the head to the new offset. `Range`'s `anchor` and `head` fields are **public** in `wordcartel-core/src/selection.rs` — construct directly: `Selection::from(Range { anchor: old_anchor, head: new })` (or the SmallVec equivalent the core uses). No core change needed (the earlier "add `Range::new`" note is dropped). `Cut`/`Backspace`-of-selection use the normalized bounds `sel.primary().from()..sel.primary().to()` for the delete range.
+**Interfaces — Produces:** selection-extending nav (`Command::Move{dir, extend: bool}`) and clipboard commands (`Copy`, `Cut`, `Paste`). The caret model is a true anchor/head: `Selection` with `anchor != head` when extending. `Move{dir, extend:false}` collapses to a point (`Selection::single(new)`); `extend:true` keeps the anchor and moves the head to the new offset. `Selection`'s fields (`ranges: SmallVec<[Range;1]>`, `primary: usize`) and `Range`'s (`anchor`, `head`) are **public** in `wordcartel-core/src/selection.rs` (verified). There is NO `Selection::from(Range)`/`Range::new` — construct the non-collapsed selection directly via `FromIterator` (no `smallvec` dep needed; `SmallVec: FromIterator`): `Selection { ranges: [Range { anchor: old_anchor, head: new }].into_iter().collect(), primary: 0 }`. No core change needed. `Cut`/`Backspace`-of-selection use the normalized bounds `sel.primary().from()..sel.primary().to()` for the delete range.
 - `Copy`: `register::copy(&buffer, sel.primary(), &mut register);` status "Copied".
 - `Cut`: `let r = sel.primary(); let cs = register::cut(r, buffer.len(), &mut register, &buffer); editor.apply(Transaction::new(cs).with_selection(Selection::single(r.from())), Edit { range: r.from()..r.to(), new_len: 0 }, EditKind::Other, clock);`
 - `Paste`: `if let Some(cs) = register::paste(head, buffer.len(), &register) { let n = register.get().map(str::len).unwrap_or(0); editor.apply(Transaction::new(cs).with_selection(Selection::single(head + n)), Edit { range: head..head, new_len: n }, EditKind::Other, clock); }` caret after inserted text.
@@ -569,7 +571,7 @@ Wire commands: `Command::Save` → if `path` is `Some`, set `status="Saving…"`
 
 ### Task 12: crossterm event loop + terminal lifecycle + panic restore
 
-**Files:** `wordcartel/src/term.rs`, `wordcartel/src/input.rs`, `wordcartel/src/main.rs`.
+**Files:** `wordcartel/src/app.rs` (the testable `App::step` + `App::run` loop), `wordcartel/src/term.rs`, `wordcartel/src/input.rs`, `wordcartel/src/main.rs` (thin — calls `app::App::run`).
 
 **Interfaces — Produces:**
 - `term::TerminalGuard`: on `new()` enables raw mode + enters alt screen (`crossterm::terminal::enable_raw_mode`, `EnterAlternateScreen`) and returns a `ratatui::Terminal<CrosstermBackend<Stdout>>`; on `Drop` disables raw mode + leaves alt screen + shows cursor. Install a panic hook (once) that calls the same restore before chaining to the previous hook (§15.7 terminal-restore).
