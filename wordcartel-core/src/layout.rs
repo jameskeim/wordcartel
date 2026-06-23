@@ -54,6 +54,104 @@ pub struct ColMap {
     pub is_active: bool,
 }
 
+impl ColMap {
+    /// Source byte offset -> visual `(row, col)`.
+    pub fn source_to_visual(&self, offset: usize) -> (usize, usize) {
+        if offset >= self.eol {
+            let row = self.rows.saturating_sub(1);
+            return (row, *self.row_end_col.get(row).unwrap_or(&0));
+        }
+        for p in &self.placed {
+            if p.src.start >= offset {
+                return (p.row, p.col);
+            }
+            if offset > p.src.start && offset < p.src.end {
+                return (p.row, p.col);
+            }
+        }
+        let row = self.rows.saturating_sub(1);
+        (row, *self.row_end_col.get(row).unwrap_or(&0))
+    }
+
+    /// Visual `(row, col)` -> source byte offset.
+    ///
+    /// Wide-cell policy: a grapheme of width w "owns" columns [col, col+w);
+    /// querying any of them returns the grapheme's start.
+    ///
+    /// Zero-width policy: a zero-width grapheme (combining mark, ZWSP, ZWJ
+    /// fragment) shares the column of the following base grapheme. When a
+    /// positive-width grapheme also covers that column, the POSITIVE-WIDTH one
+    /// wins — the cursor lands on the visible base, never on a stray zero-width
+    /// mark sharing the cell. (Empirically required by Law 5: otherwise
+    /// down->up collapses onto a leading zero-width grapheme.)
+    pub fn visual_to_source(&self, row: usize, col: usize) -> usize {
+        // First pass: a positive-width grapheme that covers the column.
+        for p in &self.placed {
+            if p.row == row && p.width > 0 && col >= p.col && col < p.col + p.width {
+                return p.src.start;
+            }
+        }
+        // Second pass: a zero-width grapheme exactly at the column, only if no
+        // positive-width grapheme claimed it above.
+        for p in &self.placed {
+            if p.row == row && p.width == 0 && col == p.col {
+                return p.src.start;
+            }
+        }
+        // The requested column is past this row's content. CLAMP to the end of
+        // THIS row, do not fall through to a later row. The end-of-row position
+        // is the source offset just after the last grapheme on this row — which
+        // is the start of the first grapheme on the next row, or EOL. This
+        // distinction matters for desired-column vertical motion (Law 5): a
+        // column that overshoots a short row must land at that row's end, not
+        // teleport to a later row.
+        let last_on_row = self
+            .placed
+            .iter()
+            .filter(|p| p.row == row)
+            .map(|p| p.src.end)
+            .max();
+        if let Some(end) = last_on_row {
+            return end;
+        }
+        // This row has no graphemes at all (empty row): fall to next row's
+        // first grapheme, else EOL.
+        for p in &self.placed {
+            if p.row > row {
+                return p.src.start;
+            }
+        }
+        self.eol
+    }
+
+    /// Is this offset a valid cursor stop (visible grapheme start, or EOL)?
+    pub fn is_cursor_stop(&self, offset: usize) -> bool {
+        offset == self.eol || self.placed.iter().any(|p| p.src.start == offset)
+    }
+
+    /// All cursor-stop source offsets in source order.
+    pub fn cursor_stops(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self.placed.iter().map(|p| p.src.start).collect();
+        v.push(self.eol);
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// Visual column of `offset` *on a specified row*. Used when the cursor's
+    /// row affinity is known, to avoid the boundary ambiguity. Returns the
+    /// end-of-row column if the offset is the row's end sentinel.
+    pub fn col_on_row(&self, offset: usize, row: usize) -> usize {
+        for p in &self.placed {
+            if p.row == row && p.src.start == offset {
+                return p.col;
+            }
+        }
+        // offset is the end-of-row position for `row`
+        *self.row_end_col.get(row).unwrap_or(&0)
+    }
+}
+
 /// Display width of a single grapheme, applying our tab policy.
 fn grapheme_width(g: &str) -> usize {
     if g == "\t" {
@@ -205,5 +303,30 @@ mod tests {
         let (_rows, map) = layout("**bold**", BlockRole::Paragraph, false, 80);
         let first = map.placed.iter().find(|p| p.text == "b").unwrap();
         assert_eq!(first.style, Style::Strong);
+    }
+
+    #[test]
+    fn roundtrip_bijection_on_visible_cells() {
+        let (_rows, map) = layout("a中b", BlockRole::Paragraph, true, 80);
+        for p in &map.placed {
+            let (r, c) = map.source_to_visual(p.src.start);
+            assert_eq!(map.visual_to_source(r, c), p.src.start);
+        }
+    }
+    #[test]
+    fn cursor_never_inside_concealed_marker() {
+        // "**a**": only 'a' (byte 2) and EOL(6) are stops; the * bytes are not.
+        let (_rows, map) = layout("**a**", BlockRole::Paragraph, false, 80);
+        let stops = map.cursor_stops();
+        assert!(stops.contains(&2));
+        assert!(stops.contains(&map.eol));
+        assert!(!stops.contains(&0)); // leading * concealed
+        assert!(!stops.contains(&1));
+    }
+    #[test]
+    fn end_of_row_clamps_not_teleports() {
+        // width 2: "abcd" -> rows ["ab","cd"]. col 9 on row 0 clamps to end of row 0 (byte 2).
+        let (_rows, map) = layout("abcd", BlockRole::Paragraph, true, 2);
+        assert_eq!(map.visual_to_source(0, 9), 2);
     }
 }
