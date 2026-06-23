@@ -173,7 +173,7 @@ fn apply_block_prefix_conceal(
             if !trimmed.is_empty() {
                 let first = trimmed.as_bytes()[0];
                 if (first == b'=' || first == b'-')
-                    && trimmed.bytes().all(|b| b == first || b == b' ')
+                    && trimmed.bytes().all(|b| b == first)
                 {
                     for b in 0..n {
                         visible[b] = false;
@@ -440,5 +440,13 @@ mod tests {
         // role_at returns Heading for the underline line; conceal the whole "---".
         let a = analyze("---", BlockRole::Heading(1), false);
         assert_eq!(visible(&a, "---"), "");
+    }
+
+    #[test]
+    fn setext_underline_rejects_embedded_spaces() {
+        // "- - -" is NOT a setext underline (embedded spaces); with role Heading it
+        // must NOT be concealed as an underline — its content stays visible.
+        let a = analyze("- - -", BlockRole::Heading(1), false);
+        assert_eq!(visible(&a, "- - -"), "- - -");
     }
 }
