@@ -133,6 +133,12 @@ pub fn analyze(line: &str, role: BlockRole, is_active: bool) -> LineAnalysis {
     LineAnalysis { runs, styles, role, prefix_glyph }
 }
 
+/// True iff `b` is a space or tab (CommonMark marker whitespace).
+#[inline]
+fn is_ws(b: u8) -> bool {
+    b == b' ' || b == b'\t'
+}
+
 /// Apply block-prefix concealment based on the block role.
 /// Mutates the per-byte `visible` grid (sets matching prefix bytes to false).
 /// Returns the prefix glyph string for list items, None otherwise.
@@ -149,21 +155,63 @@ fn apply_block_prefix_conceal(
             // Skip optional leading spaces.
             let start = bytes.iter().take_while(|&&b| b == b' ').count();
 
-            // Check for ATX heading: `#{1,6}` followed by a space.
+            // Check for ATX heading: `#{1,6}` followed by space/tab or EOL.
             if start < n && bytes[start] == b'#' {
                 let hash_end = bytes[start..]
                     .iter()
                     .take_while(|&&b| b == b'#')
                     .count()
                     + start;
-                if hash_end <= 6 + start && hash_end < n && bytes[hash_end] == b' ' {
-                    // Conceal "##...# " (the ATX marker + space).
-                    for b in 0..=hash_end {
-                        if b < n {
+                let level = hash_end - start;
+                // Valid level: 1..=6
+                if level >= 1 && level <= 6 {
+                    // Valid opener: EOL or followed by space/tab
+                    let valid_opener =
+                        hash_end == n || is_ws(bytes[hash_end]);
+                    if valid_opener {
+                        // content_start: first non-ws byte after hash_end
+                        let mut content_start = hash_end;
+                        while content_start < n && is_ws(bytes[content_start]) {
+                            content_start += 1;
+                        }
+                        // Conceal opening: indent + hashes + following ws
+                        for b in 0..content_start {
                             visible[b] = false;
                         }
+                        // Empty heading: whole line concealed
+                        if content_start >= n {
+                            return None;
+                        }
+                        // Detect optional closing sequence.
+                        // te = index after last non-ws char (trim trailing ws)
+                        let mut te = n;
+                        while te > content_start && is_ws(bytes[te - 1]) {
+                            te -= 1;
+                        }
+                        // cs = start of trailing '#' run
+                        let mut cs = te;
+                        while cs > content_start && bytes[cs - 1] == b'#' {
+                            cs -= 1;
+                        }
+                        let hashes = te - cs;
+                        // Valid closing sequence: at least one '#', preceded by
+                        // ws or the '#' run starts at content_start (entire
+                        // visible content is hashes).
+                        if hashes > 0
+                            && (cs == content_start || is_ws(bytes[cs - 1]))
+                        {
+                            // Back cs over the preceding ws
+                            while cs > content_start && is_ws(bytes[cs - 1]) {
+                                cs -= 1;
+                            }
+                            // Conceal cs..n (trailing ws + closing hashes + any
+                            // trailing ws already captured in te..n)
+                            for b in cs..n {
+                                visible[b] = false;
+                            }
+                        }
+                        return None;
                     }
-                    return None;
                 }
             }
 
@@ -187,12 +235,12 @@ fn apply_block_prefix_conceal(
         }
 
         BlockRole::BlockQuote => {
-            // Conceal one leading `>` and optional following space.
+            // Conceal one leading `>` and optional following space or tab.
             let start = bytes.iter().take_while(|&&b| b == b' ').count();
             if start < n && bytes[start] == b'>' {
                 visible[start] = false;
-                // Also hide the space after `>` if present.
-                if start + 1 < n && bytes[start + 1] == b' ' {
+                // Also hide the space/tab after `>` if present.
+                if start + 1 < n && is_ws(bytes[start + 1]) {
                     visible[start + 1] = false;
                 }
             }
@@ -207,17 +255,17 @@ fn apply_block_prefix_conceal(
             }
             let b0 = bytes[start];
 
-            // Unordered marker: `[-*+] `
+            // Unordered marker: `[-*+]` followed by space or tab
             if (b0 == b'-' || b0 == b'*' || b0 == b'+')
                 && start + 1 < n
-                && bytes[start + 1] == b' '
+                && is_ws(bytes[start + 1])
             {
                 visible[start] = false;
                 visible[start + 1] = false;
                 return Some("• ".to_string());
             }
 
-            // Ordered marker: `<digits>[.)] `
+            // Ordered marker: `<digits>[.)]` followed by space or tab
             if b0.is_ascii_digit() {
                 let digit_end = bytes[start..]
                     .iter()
@@ -227,12 +275,12 @@ fn apply_block_prefix_conceal(
                 if digit_end < n
                     && (bytes[digit_end] == b'.' || bytes[digit_end] == b')')
                     && digit_end + 1 < n
-                    && bytes[digit_end + 1] == b' '
+                    && is_ws(bytes[digit_end + 1])
                 {
                     // Parse the ordinal number.
                     let ordinal: &str = &line[start..digit_end];
                     let glyph = format!("{}. ", ordinal);
-                    // Conceal start..=digit_end+1 (digits + punctuation + space).
+                    // Conceal start..=digit_end+1 (digits + punctuation + space/tab).
                     for i in start..=digit_end + 1 {
                         visible[i] = false;
                     }
@@ -448,5 +496,125 @@ mod tests {
         // must NOT be concealed as an underline — its content stays visible.
         let a = analyze("- - -", BlockRole::Heading(1), false);
         assert_eq!(visible(&a, "- - -"), "- - -");
+    }
+
+    // --- Fix 1: TAB as marker whitespace ---
+
+    #[test]
+    fn heading_tab_after_hash() {
+        let line = "#\tTitle";
+        let a = analyze(line, BlockRole::Heading(1), false);
+        assert_eq!(visible(&a, line), "Title");
+    }
+
+    #[test]
+    fn list_unordered_tab_after_marker() {
+        let line = "-\titem";
+        let a = analyze(line, BlockRole::ListItem, false);
+        assert_eq!(visible(&a, line), "item");
+        assert_eq!(a.prefix_glyph.as_deref(), Some("• "));
+    }
+
+    #[test]
+    fn list_ordered_tab_after_marker() {
+        let line = "1.\titem";
+        let a = analyze(line, BlockRole::ListItem, false);
+        assert_eq!(visible(&a, line), "item");
+        assert_eq!(a.prefix_glyph.as_deref(), Some("1. "));
+    }
+
+    #[test]
+    fn blockquote_tab_after_angle() {
+        let line = ">\tq";
+        let a = analyze(line, BlockRole::BlockQuote, false);
+        assert_eq!(visible(&a, line), "q");
+    }
+
+    // --- Fix 2: empty ATX heading ---
+
+    #[test]
+    fn heading_empty_atx_single_hash() {
+        let line = "#";
+        let a = analyze(line, BlockRole::Heading(1), false);
+        assert_eq!(visible(&a, line), "");
+    }
+
+    #[test]
+    fn heading_empty_atx_triple_hash() {
+        let line = "###";
+        let a = analyze(line, BlockRole::Heading(3), false);
+        assert_eq!(visible(&a, line), "");
+    }
+
+    #[test]
+    fn heading_empty_atx_trailing_spaces() {
+        let line = "#  ";
+        let a = analyze(line, BlockRole::Heading(1), false);
+        assert_eq!(visible(&a, line), "");
+    }
+
+    // --- Fix 3: closing ATX sequence ---
+
+    #[test]
+    fn heading_closing_atx_single_hash() {
+        let line = "# Title #";
+        let a = analyze(line, BlockRole::Heading(1), false);
+        assert_eq!(visible(&a, line), "Title");
+    }
+
+    #[test]
+    fn heading_closing_atx_multiple_hashes() {
+        let line = "## Title ###";
+        let a = analyze(line, BlockRole::Heading(2), false);
+        assert_eq!(visible(&a, line), "Title");
+    }
+
+    #[test]
+    fn heading_closing_atx_trailing_spaces() {
+        let line = "# Title #  ";
+        let a = analyze(line, BlockRole::Heading(1), false);
+        assert_eq!(visible(&a, line), "Title");
+    }
+
+    #[test]
+    fn heading_closing_atx_content_is_just_hashes() {
+        // "## #" -> content is empty after the closing hash is stripped
+        let line = "## #";
+        let a = analyze(line, BlockRole::Heading(2), false);
+        assert_eq!(visible(&a, line), "");
+    }
+
+    #[test]
+    fn heading_closing_not_sequence_no_preceding_ws() {
+        // "# Title#" — trailing # not preceded by ws, so it's literal content
+        let line = "# Title#";
+        let a = analyze(line, BlockRole::Heading(1), false);
+        assert_eq!(visible(&a, line), "Title#");
+    }
+
+    // --- Regressions ---
+
+    #[test]
+    fn heading_regression_no_closing() {
+        let line = "## Title";
+        let a = analyze(line, BlockRole::Heading(2), false);
+        assert_eq!(visible(&a, line), "Title");
+    }
+
+    #[test]
+    fn heading_regression_compose_bold() {
+        let line = "## **bold**";
+        let a = analyze(line, BlockRole::Heading(2), false);
+        assert_eq!(visible(&a, line), "bold");
+        // 'b' is at byte 5 in "## **bold**"
+        assert_eq!(style_at(&a, 5), Some(Style::Strong));
+    }
+
+    #[test]
+    fn heading_regression_active_line_raw() {
+        let line = "## Title";
+        let a = analyze(line, BlockRole::Heading(2), true);
+        assert_eq!(visible(&a, line), "## Title");
+        assert!(a.prefix_glyph.is_none());
     }
 }
