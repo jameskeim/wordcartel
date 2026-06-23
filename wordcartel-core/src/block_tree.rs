@@ -413,21 +413,60 @@ pub struct UpdateOutcome {
 }
 
 /// Incrementally update `old_tree` for `edit`, producing the new tree.
+/// `&str` wrapper — unchanged public signature; existing callers and the oracle
+/// rely on this.
 pub fn incremental_update(
     old_tree: &BlockTree,
     old_text: &str,
     edit: &Edit,
     new_text: &str,
 ) -> BlockTree {
-    incremental_update_instrumented(old_tree, old_text, edit, new_text).tree
+    incremental_update_src(old_tree, &old_text, edit, &new_text)
 }
 
 /// As `incremental_update` but returns instrumentation about how wide we went.
+/// `&str` wrapper — unchanged public signature; existing callers and the oracle
+/// rely on this.
 pub fn incremental_update_instrumented(
     old_tree: &BlockTree,
     old_text: &str,
     edit: &Edit,
     new_text: &str,
+) -> UpdateOutcome {
+    incremental_update_instrumented_src(old_tree, &old_text, edit, &new_text)
+}
+
+/// Rope entry point: full parse from a `ropey::Rope`.
+pub fn full_parse_rope(rope: &ropey::Rope) -> BlockTree {
+    full_parse_src(&rope)
+}
+
+/// Rope entry point: incremental update from `ropey::Rope` snapshots.
+pub fn incremental_update_rope(
+    old_tree: &BlockTree,
+    old_rope: &ropey::Rope,
+    edit: &Edit,
+    new_rope: &ropey::Rope,
+) -> BlockTree {
+    incremental_update_src(old_tree, &old_rope, edit, &new_rope)
+}
+
+/// Generic `incremental_update` over any `TextSource`.
+pub fn incremental_update_src<S: TextSource>(
+    old_tree: &BlockTree,
+    old_src: &S,
+    edit: &Edit,
+    new_src: &S,
+) -> BlockTree {
+    incremental_update_instrumented_src(old_tree, old_src, edit, new_src).tree
+}
+
+/// Generic `incremental_update_instrumented` over any `TextSource`.
+pub fn incremental_update_instrumented_src<S: TextSource>(
+    old_tree: &BlockTree,
+    old_src: &S,
+    edit: &Edit,
+    new_src: &S,
 ) -> UpdateOutcome {
     let delta = edit.delta();
     let tops = old_tree.top_level();
@@ -462,8 +501,8 @@ pub fn incremental_update_instrumented(
     region_old_start = region_old_start.min(edit_lo);
     region_old_end = region_old_end.max(edit_hi);
     // Snap to line boundaries so we never cut a construct mid-line.
-    region_old_start = line_start(old_text, region_old_start);
-    region_old_end = line_end(old_text, region_old_end);
+    region_old_start = old_src.line_start(region_old_start);
+    region_old_end = old_src.line_end(region_old_end);
 
     // UPSTREAM LINE-GROUP CONTEXT: how a line parses depends on the lines
     // immediately above it within the same blank-line-delimited group: a ref
@@ -472,13 +511,13 @@ pub fn incremental_update_instrumented(
     // underline, but after a blank line is a list bullet. So pull the region
     // start back to the most recent BLANK line (start of the current line
     // group). This guarantees the reparse sees the whole group.
-    region_old_start = blank_delimited_group_start(&old_text, region_old_start);
+    region_old_start = blank_delimited_group_start(old_src, region_old_start);
     // The group walk can cross a blank line that lives *inside* a fenced or
     // indented code block (where blanks are content, not delimiters), landing
     // mid-block. Snap back to the start of any top-level block it landed inside.
     for b in tops.iter() {
         if b.span.start < region_old_start && b.span.end > region_old_start {
-            region_old_start = line_start(old_text, b.span.start);
+            region_old_start = old_src.line_start(b.span.start);
         }
     }
 
@@ -507,15 +546,15 @@ pub fn incremental_update_instrumented(
             // gap between block end and region start must be only blank /
             // ref-def lines (no other block intervenes by construction, since
             // this is the nearest preceding block).
-            let gap_lo = b.span.end.min(old_text.len());
-            let gap_hi = region_old_start.min(old_text.len());
-            let gap = (&old_text).slice(gap_lo.min(gap_hi)..gap_hi);
+            let gap_lo = b.span.end.min(old_src.len());
+            let gap_hi = region_old_start.min(old_src.len());
+            let gap = old_src.slice(gap_lo.min(gap_hi)..gap_hi);
             let gap_is_soft = gap
                 .as_ref()
                 .lines()
                 .all(|l| l.trim().is_empty() || is_ref_def_line(l));
             if absorptive && b.span.end <= region_old_start && gap_is_soft {
-                region_old_start = line_start(old_text, b.span.start);
+                region_old_start = old_src.line_start(b.span.start);
                 continue;
             }
         }
@@ -525,9 +564,9 @@ pub fn incremental_update_instrumented(
     // HTML blocks can change where a *preceding* block ends, so a downstream-
     // only widen is not enough — fall back to a full reparse. This is cheap to
     // detect and HTML in prose is rare (see report).
-    if html_in_play(&old_text, &new_text, edit, region_old_start, region_old_end) {
-        let tree = full_parse(new_text);
-        return UpdateOutcome { tree, reason: WidenReason::NoOverlapFull, reparsed_bytes: new_text.len() };
+    if html_in_play(old_src, new_src, edit, region_old_start, region_old_end) {
+        let tree = full_parse_src(new_src);
+        return UpdateOutcome { tree, reason: WidenReason::NoOverlapFull, reparsed_bytes: new_src.len() };
     }
 
     // DOWNSTREAM ABSORPTION: editing inside / abutting a List, BlockQuote or
@@ -588,10 +627,10 @@ pub fn incremental_update_instrumented(
     let widen = absorptive_in_region
         || slack_is_absorptive
         || downstream_container_merge
-        || needs_widen_to_end(&old_text, &new_text, edit, region_old_start, region_old_end);
+        || needs_widen_to_end(old_src, new_src, edit, region_old_start, region_old_end);
     let reason;
     if widen {
-        region_old_end = old_text.len();
+        region_old_end = old_src.len();
         reason = WidenReason::WidenToEnd;
     } else {
         // +1 top-level block of slack: extend region_old_end to cover the
@@ -609,7 +648,7 @@ pub fn incremental_update_instrumented(
         // Fix: set region_old_end to the span.start of the block AFTER the
         // slack block (the first true "after" block), so all gap bytes between
         // the slack block and the next "after" block are inside the region.
-        // If there's no block after the slack, extend to old_text.len().
+        // If there's no block after the slack, extend to old_src.len().
         //
         // This is needed in two cases:
         // (a) The edit overlapped at least one block (have_overlap=true): the
@@ -628,7 +667,7 @@ pub fn incremental_update_instrumented(
                 region_old_end = tops[slack_idx + 1].span.start;
             } else {
                 // No block after the slack block — include all trailing bytes.
-                region_old_end = old_text.len();
+                region_old_end = old_src.len();
             }
         }
         // When editing in a gap, also include the last block before the region
@@ -636,7 +675,7 @@ pub fn incremental_update_instrumented(
         // may change how the gap and following content parse.
         if !have_overlap {
             if let Some(b) = tops.iter().rev().find(|b| b.span.end <= region_old_start) {
-                region_old_start = line_start(old_text, b.span.start);
+                region_old_start = old_src.line_start(b.span.start);
             }
         }
         reason = WidenReason::Local;
@@ -653,12 +692,12 @@ pub fn incremental_update_instrumented(
         for b in tops.iter() {
             // straddles start?
             if b.span.start < region_old_start && b.span.end > region_old_start {
-                region_old_start = line_start(old_text, b.span.start);
+                region_old_start = old_src.line_start(b.span.start);
                 grew = true;
             }
             // straddles end?
             if b.span.start < region_old_end && b.span.end > region_old_end {
-                region_old_end = line_end(old_text, b.span.end);
+                region_old_end = old_src.line_end(b.span.end);
                 grew = true;
             }
         }
@@ -672,21 +711,21 @@ pub fn incremental_update_instrumented(
     // neither included in the reparse region nor captured by a shifted "after"
     // block. If there are no "after" blocks (no block with span.start >=
     // region_old_end), those trailing bytes disappear from the splice result.
-    // Extend region_old_end to old_text.len() so they are included in the
+    // Extend region_old_end to old_src.len() so they are included in the
     // reparse when necessary.
     let has_after_block = tops.iter().any(|b| b.span.start >= region_old_end);
-    if !has_after_block && region_old_end < old_text.len() {
-        region_old_end = old_text.len();
+    if !has_after_block && region_old_end < old_src.len() {
+        region_old_end = old_src.len();
     }
 
     // Gap 3: machine-check the trailing-gap bound. `region_old_end` is now
     // final; verify it never exceeds the document length before we use it to
     // compute region_new_end and drive the splice.
     debug_assert!(
-        region_old_end <= old_text.len(),
+        region_old_end <= old_src.len(),
         "region_old_end {} past doc len {}",
         region_old_end,
-        old_text.len()
+        old_src.len()
     );
 
     debug_assert!(region_old_start <= edit_lo);
@@ -695,9 +734,10 @@ pub fn incremental_update_instrumented(
     let region_new_start = region_old_start;
     let region_new_end = (region_old_end as isize + delta) as usize;
 
-    let new_slice = &new_text[region_new_start..region_new_end];
-    let reparsed = parse_region(&new_slice, 0..new_slice.len(), region_new_start);
-    let reparsed_bytes = new_slice.len();
+    // Materialize only the edited region from new_src (O(region), not O(doc)).
+    let new_region = new_src.slice(region_new_start..region_new_end);
+    let reparsed = parse_region(&new_region.as_ref(), 0..new_region.len(), region_new_start);
+    let reparsed_bytes = new_region.len();
 
     // Splice driven purely by the final region bounds, so it stays consistent
     // regardless of how the region was widened/snapped.
@@ -717,7 +757,7 @@ pub fn incremental_update_instrumented(
         }
     }
 
-    let root = Block { kind: BlockKind::Document, span: 0..new_text.len(), children: result_children };
+    let root = Block { kind: BlockKind::Document, span: 0..new_src.len(), children: result_children };
     UpdateOutcome { tree: BlockTree { root }, reason, reparsed_bytes }
 }
 
@@ -842,23 +882,6 @@ fn blank_delimited_group_start<S: TextSource>(src: &S, pos: usize) -> usize {
     ls
 }
 
-/// Byte index of the start of the line containing `pos` (i.e. just after the
-/// previous '\n', or 0).
-///
-/// Thin wrapper around the `&str` `TextSource` impl. Kept for
-/// `incremental_update_instrumented`, which is not yet converted (Task 4).
-fn line_start(text: &str, pos: usize) -> usize {
-    TextSource::line_start(&text, pos)
-}
-
-/// Byte index just past the '\n' terminating the line containing `pos` (or
-/// text end). This keeps the region on whole lines.
-///
-/// Thin wrapper around the `&str` `TextSource` impl. Kept for
-/// `incremental_update_instrumented`, which is not yet converted (Task 4).
-fn line_end(text: &str, pos: usize) -> usize {
-    TextSource::line_end(&text, pos)
-}
 
 fn shift_block(b: &Block, delta: isize) -> Block {
     Block {
@@ -1149,6 +1172,33 @@ mod tests {
     #[test]
     fn full_parse_src_multibyte() {
         check_rope_eq_str("# 中\n\n- 🙂\n");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 4: rope entry point tests
+    // -----------------------------------------------------------------------
+
+    /// Step 1 (TDD): write this test FIRST so it fails before the rope entry
+    /// points exist.  After the refactor it must pass.
+    #[test]
+    fn rope_incremental_matches_full_and_str() {
+        let old = "para one\n\n- a\n- b\n\n[r]: http://x\n";
+        // edit: insert "X" at position 9 (inside the blank line between para and list)
+        let (new, edit) = apply_edit(old, 9..9, "X");
+        let ot = full_parse(old);
+        let str_tree = incremental_update(&ot, old, &edit, &new);
+        let rope_tree = incremental_update_rope(
+            &ot,
+            &ropey::Rope::from_str(old),
+            &edit,
+            &ropey::Rope::from_str(&new),
+        );
+        assert_eq!(
+            str_tree,
+            full_parse(&new),
+            "str incremental != full_parse"
+        );
+        assert_eq!(rope_tree, str_tree, "rope incremental != str incremental");
     }
 
     /// Extra assertions for the non-LF separator cases: prove that line_start
