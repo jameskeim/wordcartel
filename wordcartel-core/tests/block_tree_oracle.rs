@@ -247,6 +247,97 @@ fn snap(text: &str, permille: usize) -> usize {
     pos
 }
 
+// ---------------------------------------------------------------------------
+// Generator: sequence of edits for the multi-edit chain test.
+// Each edit is represented as two permille positions + a replacement string.
+// ---------------------------------------------------------------------------
+
+fn edit_seq_strategy() -> impl Strategy<Value = Vec<(usize, usize, String)>> {
+    prop::collection::vec(
+        (0u32..1000, 0u32..1000, replacement_strategy()),
+        1..=8,
+    )
+    .prop_map(|v| {
+        v.into_iter()
+            .map(|(a, b, rep)| (a as usize, b as usize, rep))
+            .collect()
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Generator: multibyte corpus (ASCII + é/中/🙂 woven in)
+// ---------------------------------------------------------------------------
+
+fn mb_word_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        "[a-z]{2,6}".prop_map(|s| s),
+        Just("é".to_string()),
+        Just("中".to_string()),
+        Just("🙂".to_string()),
+        "[a-z]{1,3}".prop_map(|s| format!("{s}é")),
+        "[a-z]{1,3}".prop_map(|s| format!("{s}中")),
+        "[a-z]{1,3}".prop_map(|s| format!("{s}🙂{s}")),
+    ]
+}
+
+fn mb_block_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        // plain paragraph mixing ASCII and multibyte
+        prop::collection::vec(mb_word_strategy(), 1..5)
+            .prop_map(|ws| format!("{}\n", ws.join(" "))),
+        // multi-line paragraph
+        (mb_word_strategy(), mb_word_strategy())
+            .prop_map(|(a, b)| format!("{a}\n{b}\n")),
+        // ATX heading with multibyte
+        ("#{1,3}", mb_word_strategy())
+            .prop_map(|(h, t)| format!("{h} {t}\n")),
+        // setext heading
+        mb_word_strategy().prop_map(|t| format!("{t}\n===\n")),
+        mb_word_strategy().prop_map(|t| format!("{t}\n---\n")),
+        // fenced code with multibyte content
+        mb_word_strategy().prop_map(|c| format!("```\n{c}\n\ncode2\n```\n")),
+        // blockquote with multibyte
+        (mb_word_strategy(), mb_word_strategy())
+            .prop_map(|(a, b)| format!("> {a}\n{b}\n")),
+        // ASCII-only structural blocks (reuse from original)
+        Just("- a\n\n  cont\n- b\n  - nested\n".to_string()),
+        Just("---\n".to_string()),
+        Just("| a | b |\n|---|---|\n| 1 | 2 |\n".to_string()),
+    ]
+}
+
+fn mb_doc_strategy() -> impl Strategy<Value = String> {
+    prop::collection::vec(mb_block_strategy(), 1..5).prop_map(|blocks| blocks.join("\n"))
+}
+
+fn mb_replacement_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("".to_string()),
+        Just("é".to_string()),
+        Just("中".to_string()),
+        Just("🙂".to_string()),
+        Just("x".to_string()),
+        Just("\n".to_string()),
+        Just("\n\n".to_string()),
+        Just("```\n".to_string()),
+        Just("> ".to_string()),
+        Just("# ".to_string()),
+        Just("---\n".to_string()),
+        Just("éàü".to_string()),
+        Just("中文字".to_string()),
+        Just("a🙂b".to_string()),
+    ]
+}
+
+fn mb_doc_and_edit_strategy() -> impl Strategy<Value = (String, (usize, usize), String)> {
+    (mb_doc_strategy(), 0u32..1000, 0u32..1000, mb_replacement_strategy())
+        .prop_map(|(doc, a, b, rep)| (doc, (a as usize, b as usize), rep))
+}
+
+// ---------------------------------------------------------------------------
+// Property tests
+// ---------------------------------------------------------------------------
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 512,
@@ -266,5 +357,49 @@ proptest! {
         let full = full_parse(&new_text);
         prop_assert_eq!(inc, full,
             "\noracle mismatch\nold={:?}\nnew={:?}", doc, new_text);
+    }
+
+    /// Test A — multi-edit chain.
+    ///
+    /// Proves that the spliced BlockTree produced by `incremental_update` is a
+    /// valid input to a subsequent `incremental_update` call: at each step in
+    /// the chain we assert `incremental == full_parse`.
+    #[test]
+    fn oracle_multi_edit_chain(
+        initial in doc_strategy(),
+        edits in edit_seq_strategy(),
+    ) {
+        let mut text = initial;
+        let mut tree = full_parse(&text);
+
+        for (pa, pb, rep) in edits {
+            let lo = snap(&text, pa.min(pb));
+            let hi = snap(&text, pa.max(pb));
+            let (new_text, edit) = apply_edit(&text, lo..hi, &rep);
+            tree = incremental_update(&tree, &text, &edit, &new_text);
+            let full = full_parse(&new_text);
+            prop_assert_eq!(
+                tree.clone(), full,
+                "\nmulti-edit chain mismatch after applying edit ({}..{}, rep={:?})\ntext_before={:?}\ntext_after={:?}",
+                lo, hi, rep, text, new_text
+            );
+            text = new_text;
+        }
+    }
+
+    /// Test B — multibyte corpus.
+    ///
+    /// Proves the byte-offset / line_start / line_end arithmetic is UTF-8-safe
+    /// when documents and replacements contain multibyte graphemes (é/中/🙂).
+    #[test]
+    fn oracle_multibyte_corpus((doc, (pa, pb), rep) in mb_doc_and_edit_strategy()) {
+        let lo = snap(&doc, pa.min(pb));
+        let hi = snap(&doc, pa.max(pb));
+        let (new_text, edit) = apply_edit(&doc, lo..hi, &rep);
+        let old_tree = full_parse(&doc);
+        let inc = incremental_update(&old_tree, &doc, &edit, &new_text);
+        let full = full_parse(&new_text);
+        prop_assert_eq!(inc, full,
+            "\nmultibyte oracle mismatch\nold={:?}\nnew={:?}", doc, new_text);
     }
 }

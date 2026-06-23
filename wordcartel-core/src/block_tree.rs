@@ -305,6 +305,21 @@ pub fn incremental_update_instrumented(
     // the hard part of incremental Markdown. Conservative rule: if the region
     // overlaps such a block, widen to end of document. (Combined with the
     // upstream pull-back above, these edits are then always safe.)
+    //
+    // We also widen when the FIRST BLOCK AFTER the region (the "slack" block)
+    // is absorptive. The slack block's outer span can include trailing blank
+    // lines that are part of its structural context — those blank lines fall
+    // in the gap between the slack block's span.end and the next block's
+    // span.start, and cannot be reliably included in the reparse region
+    // without also including the following block's content. Widening to end
+    // is the only correct treatment.
+    let slack_block = tops.iter().find(|b| b.span.start >= region_old_end);
+    let slack_is_absorptive = slack_block.map_or(false, |b| {
+        matches!(
+            b.kind,
+            BlockKind::List | BlockKind::BlockQuote | BlockKind::IndentedCode
+        )
+    });
     let absorptive_in_region = tops.iter().any(|b| {
         matches!(
             b.kind,
@@ -314,16 +329,58 @@ pub fn incremental_update_instrumented(
     });
 
     let widen = absorptive_in_region
+        || slack_is_absorptive
         || needs_widen_to_end(old_text, new_text, edit, region_old_start, region_old_end);
     let reason;
     if widen {
         region_old_end = old_text.len();
         reason = WidenReason::WidenToEnd;
     } else {
-        // +1 top-level block of slack to absorb setext / lazy-continuation /
-        // ambiguity edge cases just past the block boundary.
-        if have_overlap && last + 1 < tops.len() {
-            region_old_end = line_end(old_text, tops[last + 1].span.end);
+        // +1 top-level block of slack: extend region_old_end to cover the
+        // first block at or after the current region end (the "slack" block),
+        // plus all gap bytes between that block and the NEXT block.
+        //
+        // Why include the gap bytes? A block's pulldown span can extend into
+        // trailing blank lines that logically "belong" to it (e.g. the blank
+        // lines terminating a loose list). Those blank lines are gap bytes
+        // between the slack block's span.end and the next block's span.start.
+        // If the region stops at line_end(slack_block.span.end), those blank
+        // lines end up neither in the reparse nor in any shifted "after" block,
+        // corrupting the splice.
+        //
+        // Fix: set region_old_end to the span.start of the block AFTER the
+        // slack block (the first true "after" block), so all gap bytes between
+        // the slack block and the next "after" block are inside the region.
+        // If there's no block after the slack, extend to old_text.len().
+        //
+        // This is needed in two cases:
+        // (a) The edit overlapped at least one block (have_overlap=true): the
+        //     block immediately after the region may be affected by context
+        //     changes at the region boundary (setext underlines, lazy
+        //     continuation, etc.).
+        // (b) The edit was entirely in a gap between blocks (have_overlap=false):
+        //     inserting content into the gap can collapse it so that the
+        //     following block merges with the new content — it must be reparsed
+        //     rather than merely shifted.
+        let slack_pos = tops.iter().position(|b| b.span.start >= region_old_end);
+        if let Some(slack_idx) = slack_pos {
+            // Extend to the start of the block after the slack block, so that
+            // all gap bytes between the slack block and the next "after" block
+            // are inside the region.
+            if slack_idx + 1 < tops.len() {
+                region_old_end = tops[slack_idx + 1].span.start;
+            } else {
+                // No block after the slack block — include all trailing bytes.
+                region_old_end = old_text.len();
+            }
+        }
+        // When editing in a gap, also include the last block before the region
+        // start: upstream context (e.g. a paragraph immediately before the gap)
+        // may change how the gap and following content parse.
+        if !have_overlap {
+            if let Some(b) = tops.iter().rev().find(|b| b.span.end <= region_old_start) {
+                region_old_start = line_start(old_text, b.span.start);
+            }
         }
         reason = WidenReason::Local;
     }
@@ -351,6 +408,18 @@ pub fn incremental_update_instrumented(
         if !grew {
             break;
         }
+    }
+
+    // GAP-BYTE COVERAGE: top-level block spans do not tile the document —
+    // trailing gap bytes (beyond the last block) belong to no block and are
+    // neither included in the reparse region nor captured by a shifted "after"
+    // block. If there are no "after" blocks (no block with span.start >=
+    // region_old_end), those trailing bytes disappear from the splice result.
+    // Extend region_old_end to old_text.len() so they are included in the
+    // reparse when necessary.
+    let has_after_block = tops.iter().any(|b| b.span.start >= region_old_end);
+    if !has_after_block && region_old_end < old_text.len() {
+        region_old_end = old_text.len();
     }
 
     debug_assert!(region_old_start <= edit_lo);
@@ -507,9 +576,15 @@ fn blank_delimited_group_start(text: &str, pos: usize) -> usize {
 
 /// Byte index of the start of the line containing `pos` (i.e. just after the
 /// previous '\n', or 0).
+///
+/// `pos` need not be on a char boundary — we search through the raw bytes for
+/// the ASCII newline (0x0A), which is never a continuation byte of a multibyte
+/// sequence, so byte-level search is always correct.
 fn line_start(text: &str, pos: usize) -> usize {
     let pos = pos.min(text.len());
-    match text[..pos].rfind('\n') {
+    let bytes = text.as_bytes();
+    // Search backwards through bytes for '\n'.
+    match bytes[..pos].iter().rposition(|&b| b == b'\n') {
         Some(nl) => nl + 1,
         None => 0,
     }
@@ -517,9 +592,13 @@ fn line_start(text: &str, pos: usize) -> usize {
 
 /// Byte index just past the '\n' terminating the line containing `pos` (or
 /// text end). This keeps the region on whole lines.
+///
+/// `pos` need not be on a char boundary — we search through raw bytes for the
+/// ASCII newline (0x0A).
 fn line_end(text: &str, pos: usize) -> usize {
     let pos = pos.min(text.len());
-    match text[pos..].find('\n') {
+    let bytes = text.as_bytes();
+    match bytes[pos..].iter().position(|&b| b == b'\n') {
         Some(off) => pos + off + 1,
         None => text.len(),
     }
