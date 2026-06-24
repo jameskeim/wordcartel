@@ -33,8 +33,17 @@ new code (region selection, dispatch, threading, the undoable merge) lives in th
   `wordcartel-core`.
 - **Reused from 4c-1 (no changes to their contracts):** `commands::build_range_replace`,
   `Buffer::apply` with `EditKind::Other`, `editor::by_id_mut`, the version-discard merge shape,
-  the modal `Prompt` / `PromptAction` / `action_for` infrastructure, and the three-site reducer
-  dispatch (normal arm + `prompt` block + `minibuffer` block).
+  the modal `Prompt` / `PromptAction` / `action_for` infrastructure, and the async-result reducer
+  dispatch. **Accurate reducer model (per the real 4c-1 code):** `FilterDone`/`ExportDone` have
+  **explicit arms in two places** — the normal match arm and the `editor.prompt.is_some()`
+  interception block — while the `editor.minibuffer.is_some()` block intercepts **only key
+  events** and lets non-key messages fall through to the normal arm. `Msg::TransformDone` follows
+  the same shape (explicit arms in the normal match + the prompt block; minibuffer fall-through),
+  NOT a literal third "minibuffer arm."
+- **Reused from Effort 3 (block tree):** every buffer already maintains an incrementally-updated
+  `document.blocks: BlockTree` (`wordcartel-core::block_tree`); each `Block` has
+  `kind: BlockKind` and `span: Range<usize>`, with `BlockTree::top_level()`. 4c-2 reads this for
+  markdown-structural region snapping (§3.1) — no new parsing.
 
 ## 3. The transform engine (typed `repar` wrapper)
 
@@ -79,19 +88,30 @@ pub fn run_transform(kind: TransformKind, input: &str, width: u32)
 - `TransformError` is a `thiserror` enum wrapping `repar::ParError`'s message (errors are values
   at the boundary; the core does not panic).
 
-### 3.1 Region selection & paragraph snapping
+### 3.1 Region selection & markdown-structural snapping
+
+> **Codex spec-review fix (CRITICAL):** blank-line snapping is **not** markdown-structural. A
+> fenced code block can legally contain a blank line, and loose list items / blockquotes span
+> blank lines; snapping to blank lines could hand repar a fragment that splits a construct (e.g.
+> the closing ```` ``` ```` of a fenced block without its opener), which repar — classifying purely
+> on the supplied slice — would mis-handle and corrupt. The region unit is therefore the **block
+> tree**, not blank lines.
 
 - **No selection** → the transform runs on the **whole buffer** (repar's native batch mode).
-- **A selection** → the selected range is **snapped outward to enclosing blank lines** before
-  running repar, so repar always receives complete paragraphs (it reflows by
-  blank-line-separated paragraph; a mid-paragraph fragment would be mangled). The **snapped**
-  region is what gets replaced:
-  - start → scan backward to the byte after the previous blank line (or buffer start);
-  - end → scan forward to the byte before the next blank line (or buffer end).
-  - "Blank line" = a line that is empty or all-whitespace. Snapping is a cheap byte/line scan;
-    it does **not** require the block_tree.
-- The transform replaces exactly the resolved region (whole buffer, or the snapped selection)
-  with `run_transform`'s output, as a single undoable edit.
+- **A selection** → the range is **snapped outward to whole top-level blocks** using the buffer's
+  already-maintained `document.blocks` (§2): take every `top_level()` `Block` whose `span`
+  intersects the selection and expand the region to `[min(span.start) … max(span.end)]`. Because
+  the unit is a complete block, a selection landing inside a fenced code block, list, blockquote,
+  or table pulls in the **whole** construct — repar (in markdown mode) then passes those
+  constructs through verbatim and reflows only the prose blocks, with no possibility of splitting
+  a construct. The snapped region is what gets replaced.
+  - Trailing inter-block whitespace/newlines between the chosen first and last block are included
+    by virtue of the contiguous `[start..end]` span; the replaced text is the exact bytes
+    repar reformatted, so block separation is preserved.
+  - The block tree is already incrementally maintained per keystroke (Effort 3) — snapping is a
+    bounded scan over `top_level()`, not a fresh parse.
+- The transform replaces exactly the resolved region (whole buffer, or the block-snapped
+  selection) with `run_transform`'s output, as a single undoable edit.
 
 ## 4. Invocation (UI)
 
@@ -111,6 +131,14 @@ No command palette exists yet, so (as with 4c-1's filter) the feature is bound t
   filter path (running the `repar` binary as a subprocess would defeat the in-process design and
   re-introduce the "is it installed?" problem).
 
+**Precedence while a modal is open (Codex spec-review fix, IMPORTANT):** `Ctrl+T` maps to the
+`transform` command **only in normal mode**. While `editor.prompt.is_some()` or
+`editor.minibuffer.is_some()`, the reducer's interception blocks consume the keypress **before**
+command dispatch, so `Ctrl+T` is naturally swallowed by the open modal and the chooser does not
+open (a filter minibuffer, export-overwrite prompt, or quit prompt keeps focus). This is the
+intended behavior — one modal at a time. No special-casing is added; the spec states it so the
+implementer does not "fix" the swallow.
+
 ## 5. Data flow & the undoable merge
 
 Two paths, chosen by the resolved region's byte length; both end in one undoable
@@ -121,10 +149,11 @@ repar reflows ~1 MiB in ~5 ms — comfortably sub-frame — so the common case (
 normal-sized buffer) runs **inline** in `resolve_prompt`'s `Transform` arm:
 1. resolve the region (whole buffer or snapped selection);
 2. `run_transform(kind, region_text, width)`;
-3. on `Ok(out)`: if `out == region_text`, **no edit** (no inode/undo churn, quiet status);
-   else `build_range_replace(from, to, &out, doc_len)` → `Buffer::apply(.., EditKind::Other, ..)`
-   on the active buffer; then `derive::rebuild` + `nav::ensure_visible`; status `"reflowed"` etc.
-4. on `Err(e)`: status line with the error; **buffer untouched**.
+3. on `Ok(out)`: if `out == region_text`, **no edit** (no inode/undo churn; "already …" status
+   per §6.2); else `build_range_replace(from, to, &out, doc_len)` →
+   `Buffer::apply(.., EditKind::Other, ..)` on the active buffer; then `derive::rebuild` +
+   `nav::ensure_visible`; success status per §6.2.
+4. on `Err(e)`: error status per §6.2; **buffer untouched**.
    (Borrow-split discipline as in 4c-1: assemble status in a local; end the `by_id_mut` borrow
    before `derive::rebuild(editor)` / setting `editor.status`.)
 
@@ -141,8 +170,10 @@ typing responsive by running off-thread, mirroring 4c-1's `FilterDone` exactly:
    "transform discarded — buffer changed" status (buffer untouched); else apply exactly as the
    sync path (build_range_replace → one `EditKind::Other` edit → rebuild + ensure_visible), or
    surface the error. Merge targets the originating buffer via `by_id_mut(buffer_id)`.
-4. `Msg::TransformDone` is handled in **all three reducer sites** (normal arm, `prompt` block,
-   `minibuffer` block) so a result is never starved by an open modal — same rule as `FilterDone`.
+4. `Msg::TransformDone` gets **explicit arms in the normal match and the `prompt` interception
+   block**; the `minibuffer` block intercepts only key events, so a `TransformDone` arriving while
+   the minibuffer is open **falls through** to the normal arm — never starved by an open modal,
+   exactly as `FilterDone`/`ExportDone` are wired today.
 
 The sync and async paths share the same region-resolve + merge helper, so they produce
 **identical** results; the only difference is where `run_transform` runs.
@@ -151,20 +182,50 @@ The sync and async paths share the same region-resolve + merge helper, so they p
 
 (Per main design §15: degrade, don't abort; errors are values at the edges; never lose work.)
 
-- **repar error** (`PResult::Err`) → status-line message, buffer untouched.
-- **Empty buffer / empty selection / region that is all code or all blank** → repar returns the
-  input unchanged → no edit committed (quiet "nothing to reflow" / unchanged status).
-- **Output identical to input** → no edit (no undo/inode churn).
+- **repar error** (`PResult::Err`) → status-line message (§6.2), buffer untouched.
+- **Empty buffer / empty selection that snaps to no block** → `nothing to transform` (§6.2), no
+  edit.
+- **Region that is all code / all-verbatim constructs** → repar returns the input unchanged → no
+  edit; `already …` status (§6.2).
+- **Output identical to input** → no edit (no undo/inode churn); `already …` status.
 - **Stale async result** → version-discarded (never applied to a moved buffer).
-- **One transform in flight at a time** (`transform_in_flight`); a second `Ctrl+T` while one is
-  running reports a busy status (the async path only; sync completes before returning).
+- **One transform in flight at a time** (`transform_in_flight`); a second transform dispatched
+  while one is running reports a busy status (the async path only; sync completes before
+  returning). `transform_in_flight` is cleared on **every** `TransformDone` path (applied,
+  discarded, error).
+
+### 6.1 Filter/transform concurrency policy (Codex spec-review fix, IMPORTANT)
+
+A transform and a 4c-1 **filter** (or export) may both be in flight on the same buffer — their
+guards (`transform_in_flight` vs `filter_in_flight`) are independent and **we do not proactively
+cross-block** (that would require modifying 4c-1's already-merged `dispatch_filter`). Correctness
+is guaranteed **reactively by version-discard**: whichever result lands first applies and bumps
+`document.version` via `Buffer::apply`; the second result then sees a changed version and is
+**discarded** with the "buffer changed" status. No corruption, no lost-but-silent edit — the user
+sees exactly one transform/filter applied and a discard notice for the other. (A future unified
+"one background mutation at a time" policy is possible but is **not** required for 4c-2.)
+
+### 6.2 Status-message contract
+
+Exact, specific status strings (matching 4c-1's concrete style — no vague "done"):
+
+| Event | Status |
+|-------|--------|
+| Chooser open | `transform: [r]eflow  [u]nwrap  [v]entilate` (prompt line) |
+| Sync success | `reflowed` / `unwrapped` / `ventilated` |
+| Async start | `reflowing…` / `unwrapping…` / `ventilating…` |
+| Output unchanged | `already reflowed` / `already unwrapped` / `already ventilated` (no edit) |
+| Empty / no prose region | `nothing to transform` |
+| repar error | `transform failed: <repar message>` |
+| Stale async discard | `transform discarded — buffer changed` |
+| Busy (transform in flight) | `a transform is already running` |
 
 ## 7. Components / module boundaries
 
 | Unit | Responsibility | Depends on |
 |------|----------------|------------|
 | `transform.rs::run_transform` | typed, pure repar wrapper (the only repar-API site) | `repar` |
-| `transform.rs::resolve_region` | whole-buffer vs snapped-selection range | buffer text/selection |
+| `transform.rs::resolve_region` | whole-buffer vs block-snapped selection range | selection + `document.blocks` (block tree) |
 | `transform.rs::dispatch_transform` | sync-vs-async decision; thread spawn; in-flight guard | core merge, `Msg` |
 | `app.rs::apply_transform_done` | foreground version-discard merge (async) | `build_range_replace`, `by_id_mut` |
 | `prompt.rs::transform_chooser` + `PromptAction::Transform` | the modal chooser | existing Prompt infra |
@@ -181,9 +242,13 @@ The sync and async paths share the same region-resolve + merge helper, so they p
   to a freshly-constructed `repar::Options` in-process would be tautological — we *are* that call;
   the fixtures must come from an independent source.) Cases cover: prose reflow, a fenced code
   block passed through verbatim, a heading + table untouched, a list item rewrapped.
-- **Round-trip law:** `reflow(unwrap(p)) == reflow(p)` as a `proptest` property over generated
-  prose, with checked-in `proptest-regressions` seeds (repar's own invariant; also guards our
-  wrapper composition across the two verbs).
+- **Round-trip law (a 4c-2 obligation to VERIFY, not a pre-confirmed repar invariant — Codex
+  spec-review, MINOR):** `reflow(unwrap(p)) == reflow(p)` as a `proptest` property over generated
+  prose, with checked-in `proptest-regressions` seeds. repar advertises this round-trip in its CLI
+  help, but its committed markdown-mode property tests do not cover `unwrap` composition, so 4c-2
+  treats it as a property to **prove for our markdown-mode wiring**. If it does not hold in
+  markdown mode for some input class, that is a finding to resolve (narrow the law's domain or
+  fix the wiring) — not a silent skip.
 - **Paragraph-snap unit tests:** a mid-paragraph selection snaps out to the enclosing blank
   lines; selection at buffer start/end; selection already on blank-line boundaries (no-op snap);
   multi-paragraph selection.
