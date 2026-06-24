@@ -190,11 +190,19 @@ pub fn run_subprocess(
         // Remaining budget for this iteration (cap to POLL).
         let iter_time = POLL.min(deadline.saturating_duration_since(std::time::Instant::now()));
 
-        // Ask for at most (max_output - out_buf.len() + 1) bytes so limit_size
-        // will trip at the right threshold.  The +1 ensures we see one byte past
-        // the cap so we can distinguish "exactly max_output bytes of output" from
-        // "limit hit with more pending".  We treat > max_output as TooLarge.
-        let remaining_cap = max_output.saturating_sub(out_buf.len()) + 1;
+        // Ask for at most (max_output - captured + 1) bytes so limit_size will
+        // trip at the right threshold.  CRITICAL: the subprocess crate's
+        // `limit_size` counts the COMBINED stdout+stderr bytes of a read()
+        // (communicate.rs: `total = outvec.len() + errvec.len()`), so we must
+        // budget against the combined captured total — NOT stdout alone.  If we
+        // budgeted on stdout only, a child that floods stderr would never trip
+        // the cap here, `read()` would return Ok via the size_limit break with a
+        // small stdout, and we would break to `child.wait()` while the child is
+        // still blocked writing stderr to a full pipe we stopped draining —
+        // deadlocking forever.  The +1 lets us see one byte past the cap so we
+        // can distinguish "exactly max_output captured" from "more pending".
+        let captured = out_buf.len() + err_buf.len();
+        let remaining_cap = max_output.saturating_sub(captured) + 1;
 
         // Reassign comm with per-iteration limits; limit_time/limit_size take
         // self by value and return a new Communicator with the fields set, so
@@ -203,20 +211,26 @@ pub fn run_subprocess(
         comm = comm.limit_time(iter_time).limit_size(remaining_cap);
         match comm.read() {
             Ok((o, e)) => {
-                // EOF on both streams — child has closed stdout and stderr.
+                // Ok means EITHER both streams hit EOF, OR the combined
+                // size_limit was reached mid-stream (the crate breaks its read
+                // loop on `total >= size_limit` and returns Ok — it does NOT
+                // signal EOF).  The combined-overflow check below distinguishes
+                // them: if we are over the cap it was a size_limit break (kill +
+                // TooLarge — do NOT wait on a child that may still be writing),
+                // otherwise it is a genuine EOF and waiting is safe.
                 if let Some(o) = o {
                     out_buf.extend_from_slice(&o);
                 }
                 if let Some(e) = e {
                     err_buf.extend_from_slice(&e);
                 }
-                // Size check after accumulating this batch.
-                if out_buf.len() > max_output {
+                // Combined size check after accumulating this batch.
+                if out_buf.len() + err_buf.len() > max_output {
                     let _ = child.terminate();
                     let _ = child.kill();
                     return Err(FilterError::TooLarge);
                 }
-                // Streams are closed; fall through to wait.
+                // Genuine EOF (both streams closed, under cap) — safe to wait.
                 break;
             }
             Err(ce) => {
@@ -229,8 +243,8 @@ pub fn run_subprocess(
                     err_buf.extend_from_slice(&e);
                 }
 
-                // Size cap — limit_size hit, or we accumulated too much.
-                if out_buf.len() > max_output {
+                // Combined size cap — limit_size hit, or we accumulated too much.
+                if out_buf.len() + err_buf.len() > max_output {
                     let _ = child.terminate();
                     let _ = child.kill();
                     return Err(FilterError::TooLarge);
@@ -439,6 +453,47 @@ mod tests {
             run_filter(&spec, String::new(), &CancelFlag::new()),
             RunResult::Err(FilterError::TooLarge)
         ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_filter_large_stderr_does_not_deadlock() {
+        // Regression (Codex pre-merge gate): a child that floods STDERR (filling
+        // the OS pipe buffer, ~64 KiB) with little/no stdout used to hang the
+        // engine forever.  The crate's size_limit counts COMBINED stdout+stderr
+        // and `read()` returns Ok on the size_limit break (not EOF); the old
+        // code budgeted/checked the cap on stdout alone, so the stderr flood
+        // never tripped TooLarge — it broke to `child.wait()` while the child was
+        // still blocked writing stderr to a pipe we'd stopped draining.  The fix
+        // accounts for combined captured bytes, so the flood trips TooLarge and
+        // kills the child.  We run on a worker thread and assert it RETURNS
+        // (a regression would time out here rather than wedge the whole suite).
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let spec = FilterSpec {
+                // ~200 KiB to stderr, far past the 64 KiB pipe buffer, tiny stdout.
+                argv: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "head -c 200000 /dev/zero | tr '\\0' 'x' 1>&2".into(),
+                ],
+                shell: false,
+                disposition: Disposition::Filter,
+                input: Input::None,
+                timeout: std::time::Duration::from_secs(10),
+                max_output: 64,
+            };
+            let out = run_filter(&spec, String::new(), &CancelFlag::new());
+            let _ = tx.send(out);
+        });
+        let out = rx
+            .recv_timeout(std::time::Duration::from_secs(8))
+            .expect("run_filter must return promptly (no deadlock) on a large-stderr child");
+        assert!(
+            matches!(out, RunResult::Err(FilterError::TooLarge)),
+            "large stderr beyond the cap should be TooLarge, got {out:?}"
+        );
     }
 
     #[test]
