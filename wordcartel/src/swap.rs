@@ -148,6 +148,13 @@ pub fn swap_path(doc_path: Option<&Path>) -> io::Result<PathBuf> {
     Ok(dir.join(name))
 }
 
+/// Best-effort delete of a document's swap file.
+pub fn delete(doc_path: Option<&Path>) {
+    if let Ok(p) = swap_path(doc_path) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 /// Atomic 0600 write into our own state dir (no symlink/skip-unchanged logic).
 pub fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));

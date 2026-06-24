@@ -62,13 +62,13 @@ pub fn dispatch_save(ctx: &mut Ctx) -> CommandResult {
                 merge: Box::new(move |editor| {
                     match outcome {
                         Ok(SaveOutcome::Saved) | Ok(SaveOutcome::Unchanged) => {
-                            // Record what is now on disk at version v (always).
                             editor.document.saved_version = Some(v);
                             editor.document.stored_fp = new_fp;
-                            // Only "Saved" if the buffer is now clean; otherwise the
-                            // user edited on and the buffer is still dirty (§4.3).
                             if editor.document.version == v {
                                 editor.status = "Saved".to_string();
+                                // Buffer is clean at the saved version → swap is
+                                // no longer needed. (Stale-version saves skip this.)
+                                crate::swap::delete(editor.document.path.as_deref());
                             } else {
                                 editor.status = format!("Saved v{v} (still editing)");
                             }
@@ -162,6 +162,39 @@ mod tests {
         assert!(e.document.saved_version.is_none());
         assert!(e.status.to_lowercase().contains("symlink"));
         let _ = std::fs::remove_file(&link); let _ = std::fs::remove_file(&real);
+    }
+
+    #[test]
+    fn save_clean_deletes_swap_but_stale_save_keeps_it() {
+        use crate::jobs::{Executor, InlineExecutor};
+        use crate::registry::Ctx;
+        let p = scratch();
+        std::fs::write(&p, "old\n").unwrap();
+
+        // Pre-create a swap for this doc.
+        let sp = crate::swap::swap_path(Some(&p)).unwrap();
+        crate::swap::write_atomic(&sp, "stub").unwrap();
+        assert!(sp.exists());
+
+        let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
+        e.document.saved_version = None;
+        e.document.version = 1;
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex }; dispatch_save(&mut ctx); }
+        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        assert!(!e.document.dirty());
+        assert!(!sp.exists(), "a save that leaves the buffer clean deletes the swap");
+
+        // Now: dispatch a save at v2, but edit on to v3 before the merge → keep swap.
+        crate::swap::write_atomic(&sp, "stub2").unwrap();
+        e.document.version = 2;
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex }; dispatch_save(&mut ctx); }
+        e.document.version = 3; // edited on
+        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        assert!(e.document.dirty());
+        assert!(sp.exists(), "a stale-version save must NOT delete the swap");
+        let _ = std::fs::remove_file(&sp); let _ = std::fs::remove_file(&p);
     }
 
     #[test]
