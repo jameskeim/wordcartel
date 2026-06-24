@@ -21,6 +21,7 @@ pub struct Ctx<'a> {
     pub editor: &'a mut Editor,
     pub clock: &'a dyn Clock,
     pub executor: &'a dyn Executor,
+    /// Owned `Sender` (not a borrow) because `dispatch_filter` moves a clone into a `'static` spawned thread.
     pub msg_tx: std::sync::mpsc::Sender<Msg>,
 }
 

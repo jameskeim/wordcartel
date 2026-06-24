@@ -88,6 +88,9 @@ fn apply_filter_done(
     outcome: crate::filter::RunResult,
     clock: &dyn wordcartel_core::history::Clock,
 ) {
+    // Clears the single in-flight slot unconditionally. Correct under the current
+    // single-in-flight invariant (one filter at a time across the whole editor);
+    // would need per-buffer tracking if multi-buffer concurrent filters land (Effort 6).
     editor.filter_in_flight = None;
     let stale = editor.by_id(buffer_id).map(|b| b.document.version) != Some(version);
     match outcome {
@@ -227,6 +230,10 @@ pub fn reduce(
                 && key.code == crossterm::event::KeyCode::Esc
                 && editor.filter_in_flight.is_some()
             {
+                // Esc here cancels an in-flight filter. Safe only while no other handler claims
+                // bare Esc before this point — Task 4's minibuffer Esc must be ordered to run
+                // BEFORE this check (minibuffer-dismiss takes precedence over filter-cancel).
+                // Revisit if any new bare-Esc binding is added.
                 editor.filter_in_flight.take().unwrap().cancel();
                 editor.status = "cancelling...".into();
                 for r in ex.drain() {
