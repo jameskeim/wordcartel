@@ -74,6 +74,9 @@ pub fn reduce(
 // step — pure, testable; no terminal IO
 // ---------------------------------------------------------------------------
 
+/// Legacy synchronous dispatch path retained for its existing tests; production
+/// uses `reduce` + the registry.
+///
 /// Translate one key event, run the resulting command (if any), then return
 /// `true` while the app should keep running (`false` → caller should exit).
 ///

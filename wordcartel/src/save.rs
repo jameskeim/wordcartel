@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use crate::commands::CommandResult;
-use crate::file::{self, SaveOutcome, SaveError};
+use crate::file::{self, SaveOutcome};
 use crate::jobs::{Job, JobKind, JobResult};
 use crate::registry::Ctx;
 
@@ -76,10 +76,7 @@ pub fn dispatch_save(ctx: &mut Ctx) -> CommandResult {
                         Err(e) => {
                             // Failure: leave saved_version/stored_fp untouched
                             // (buffer stays dirty); surface the error.
-                            editor.status = match e {
-                                SaveError::Symlink => "refusing to write through symlink".into(),
-                                other => other.to_string(),
-                            };
+                            editor.status = e.to_string();
                         }
                     }
                 }),

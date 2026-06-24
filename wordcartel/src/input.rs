@@ -70,6 +70,7 @@ pub fn key_to_command(key: KeyEvent) -> Option<Command> {
 
 /// What a key resolves to: a named command, or a literal character insert
 /// (the §10.4 printable fallthrough — not a registered command).
+#[derive(Debug)]
 pub enum KeyAction {
     Id(CommandId),
     Insert(char),

@@ -371,6 +371,11 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             CommandResult::Handled
         }
 
+        // SUPERSEDED (Effort 4b-1): production save routes through the registry
+        // `"save"` handler → `save::dispatch_save` (background, version-aware,
+        // external-mod guarded). This synchronous arm is retained only for the
+        // legacy `commands::run(Command::Save, …)` test path and must NOT be
+        // wired to a key for production dispatch — it lacks the fingerprint guard.
         Command::Save => {
             match &editor.document.path {
                 None => {
