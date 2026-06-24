@@ -68,7 +68,7 @@ These cross-cut several tasks; the per-task steps below are written against them
 
 ## File Structure
 
-- `wordcartel/src/filter.rs` *(new)* — `FilterSpec`/`Disposition`/`Input`/`ExportSink`/`FilterOutcome`/`FilterError`; `run_filter` (sync engine); `dispatch_filter` (thread + Msg::FilterDone); `CancelFlag`.
+- `wordcartel/src/filter.rs` *(new)* — `FilterSpec`/`Disposition{Filter,Insert}`/`Input`/`FilterError`/`RunResult`/`CancelFlag`; `run_subprocess` (bytes engine core) + `run_filter` (text wrapper); `dispatch_filter` (thread + `Msg::FilterDone`).
 - `wordcartel/src/minibuffer.rs` *(new)* — `Minibuffer { prompt, text, cursor }` + editing methods.
 - `wordcartel/src/export.rs` *(new)* — pandoc probe, presets, derived path, temp-then-rename atomic output.
 - `wordcartel/src/editor.rs` *(modify)* — `minibuffer: Option<Minibuffer>`, `filter_in_flight: Option<CancelFlag>`.
@@ -652,7 +652,7 @@ Export presets reusing the engine: startup probe + graceful disable, derived out
 - Test: `wordcartel/src/file.rs`, `wordcartel/src/export.rs`, `wordcartel/src/app.rs`
 
 **Interfaces (revised per Codex review — bytes-capable export + explicit state):**
-- Consumes: `FilterSpec`/`Disposition::Export`/`ExportSink`, `prompt::{Prompt, PromptAction}`, `Ctx.msg_tx` (Plumbing #1).
+- Consumes: `filter::run_subprocess` (bytes core), `file::save_atomic_bytes`, `prompt::{Prompt, PromptAction}`, `Ctx.msg_tx` (Plumbing #1). (`ExportSink`/`ExportResult` are defined HERE in `export.rs`, not on the filter `FilterSpec`.)
 - Produces:
   - `file::save_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<(), SaveError>` — **byte-capable** atomic write (same-dir O_EXCL temp `0600`, write, fsync, rename, dir-fsync) for **binary** export output (`file::save_atomic` is UTF-8-text-only and cannot be reused).
   - `pub fn probe_pandoc() -> bool` (spawn `pandoc --version`; `ENOENT` → false; cached on the workspace, set at `run()` startup).
@@ -685,7 +685,7 @@ fn export_overwrite_action_is_distinct_from_save_overwrite() {
     assert_ne!(PromptAction::OverwriteExport, PromptAction::Overwrite);
 }
 ```
-(A full capture-write-rename test uses a stub pandoc: build a `FilterSpec` whose argv is `["cat"]` with `Disposition::Export(Capture{ext:"txt"})`, run the export against a named temp buffer, assert the output file exists beside the source with the buffer content, then clean up. Place it with unique temp paths.)
+(A full capture-write-rename test stubs pandoc with `cat`: drive `do_export` (or `run_export`) against a **named** temp buffer with `ExportSink::Capture { ext: "txt" }` and argv `["cat"]`, pump the resulting `Msg::ExportDone` through `reduce`, and assert the output file exists beside the source with the buffer content; then clean up. Unique temp paths. This goes through the **export path**, not a filter `Disposition`.)
 
 - [ ] **Step 2: Run to verify failure.** `cargo test -p wordcartel --lib export:: app::tests::export` → FAIL (module/action missing).
 
@@ -718,7 +718,7 @@ git commit -m "feat(export): pandoc presets (probe, derived path, save_atomic_by
 
 **Borrow-split reminders:** the FilterDone merge and `run_export` must assemble status/text in locals so the `by_id_mut(b)` borrow ends before `editor.status`/`derive::rebuild(editor)` (the 4r save-merge pattern). The plan's snippets are illustrative on this point — make them compile with that discipline.
 
-**Type consistency:** `FilterSpec`/`Disposition`/`Input`/`ExportSink`/`FilterOutcome`/`RunResult`/`FilterError`/`CancelFlag`, `Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome }`, `reduce(.., msg_tx)`, `dispatch_filter`, `build_range_replace`, `Minibuffer`, `open_minibuffer`, `PromptAction::OverwriteExport` — used consistently across tasks. `reduce`'s new `msg_tx` param ripples to `run()` + all reduce tests (called out in T3).
+**Type consistency:** filter side — `FilterSpec`/`Disposition{Filter,Insert}`/`Input`/`RunResult{Stdout,Err}`/`FilterError`/`CancelFlag`, `run_subprocess`(bytes) + `run_filter`(text), `Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome }`, `dispatch_filter`, `build_range_replace`; export side (separate) — `ExportSink`/`ExportResult{Bytes,TempReady}`/`PendingExport`, `Msg::ExportDone { buffer_id, target, result }`, `file::save_atomic_bytes`, `PromptAction::OverwriteExport`; UI — `Minibuffer`/`open_minibuffer`. `reduce`/`Ctx`/`resolve_prompt` all gain `msg_tx` (ripples to `run()` + all tests — called out in T3/T5). No filter `Disposition::Export` anywhere.
 
 ---
 
