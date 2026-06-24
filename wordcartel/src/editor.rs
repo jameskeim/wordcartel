@@ -183,10 +183,12 @@ mod tests {
         let clk = TestClock(std::cell::Cell::new(0));
         let cs = ChangeSet::insert(1, "X", e.document.buffer.len());
         e.apply(Transaction::new(cs).with_selection(Selection::single(2)), Edit { range: 1..1, new_len: 1 }, EditKind::Type, &clk);
-        e.undo();
+        let changed = e.undo();
+        assert!(changed, "undo of a real edit must report change");
         assert_eq!(e.document.buffer.to_string(), "ab\n");
         assert!(e.last_edit.is_none()); // undo forces a full reparse in derive
-        e.redo();
+        let changed = e.redo();
+        assert!(changed, "redo of a real edit must report change");
         assert_eq!(e.document.buffer.to_string(), "aXb\n");
     }
 
@@ -200,5 +202,17 @@ mod tests {
         assert_eq!(e.document.version, v0, "version must not move on a no-op undo");
         assert!(!e.document.dirty, "a no-op undo must not dirty the buffer");
         assert_eq!(e.desired_col, Some(3), "a no-op undo must not reset desired_col");
+    }
+
+    #[test]
+    fn redo_on_empty_history_is_true_noop() {
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        let v0 = e.document.version;
+        e.desired_col = Some(3);
+        let changed = e.redo();
+        assert!(!changed, "redo with empty history must report no change");
+        assert_eq!(e.document.version, v0, "version must not move on a no-op redo");
+        assert!(!e.document.dirty, "a no-op redo must not dirty the buffer");
+        assert_eq!(e.desired_col, Some(3), "a no-op redo must not reset desired_col");
     }
 }
