@@ -110,6 +110,7 @@ pub struct Editor {
     pub quit_after_save: Option<u64>,
     pub quit_after_save_at: Option<u64>,
     pub filter_in_flight: Option<crate::filter::CancelFlag>,
+    pub minibuffer: Option<crate::minibuffer::Minibuffer>,
 }
 
 impl Editor {
@@ -130,7 +131,7 @@ impl Editor {
             buffers: Vec::new(), active: 0, next_buffer_id: 0,
             register: Register::default(), status: String::new(), quit: false,
             prompt: None, quit_after_save: None, quit_after_save_at: None,
-            filter_in_flight: None,
+            filter_in_flight: None, minibuffer: None,
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer {
@@ -154,6 +155,19 @@ impl Editor {
     pub fn by_id_mut(&mut self, id: BufferId) -> Option<&mut Buffer> { self.buffers.iter_mut().find(|b| b.id == id) }
     /// Allocate a fresh, never-reused BufferId.
     pub fn alloc_id(&mut self) -> BufferId { let id = BufferId(self.next_buffer_id); self.next_buffer_id += 1; id }
+
+    /// Open the minibuffer with the given prompt string.
+    ///
+    /// Invariant: prompt XOR minibuffer — only one may be active at a time.
+    /// `debug_assert!`s that no modal prompt is currently open.
+    pub fn open_minibuffer(&mut self, prompt: &str) {
+        debug_assert!(self.prompt.is_none(), "prompt xor minibuffer: cannot open minibuffer while a modal prompt is active");
+        self.minibuffer = Some(crate::minibuffer::Minibuffer {
+            prompt: prompt.into(),
+            text: String::new(),
+            cursor: 0,
+        });
+    }
 
     // Thin delegators — external callers unchanged.
     pub fn apply(&mut self, txn: Transaction, edit: wordcartel_core::block_tree::Edit, kind: EditKind, clock: &dyn Clock) {

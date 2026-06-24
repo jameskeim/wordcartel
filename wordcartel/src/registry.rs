@@ -62,6 +62,11 @@ impl Registry {
         // Save / quit. (Task 9: save is now a background job dispatcher.)
         map.insert(CommandId("save"), |c| crate::save::dispatch_save(c));
         map.insert(CommandId("quit"), |c| run(c, Command::Quit));
+        // Filter / minibuffer.
+        map.insert(CommandId("filter"), |c| {
+            c.editor.open_minibuffer("> ");
+            CommandResult::Handled
+        });
         Registry { map }
     }
 
@@ -129,5 +134,20 @@ mod tests {
             kind: KeyEventKind::Press, state: KeyEventState::NONE };
         assert!(matches!(crate::input::key_to_command_id(shift_left),
             Some(crate::input::KeyAction::Id(CommandId("select_left")))));
+    }
+
+    #[test]
+    fn keymap_ctrl_e_is_filter() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let ctrl_e = KeyEvent {
+            code: KeyCode::Char('e'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        assert!(matches!(
+            crate::input::key_to_command_id(ctrl_e),
+            Some(crate::input::KeyAction::Id(CommandId("filter")))
+        ));
     }
 }

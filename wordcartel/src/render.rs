@@ -129,7 +129,13 @@ pub fn render(frame: &mut Frame, editor: &Editor) {
 
         // When a modal prompt is active, render its message instead of the normal
         // status text, using a distinct style so it stands out.
-        let (status_text, status_style) = if let Some(ref prompt) = editor.prompt {
+        // When the minibuffer is open, render <prompt><text> on the status row.
+        let (status_text, status_style) = if let Some(ref mb) = editor.minibuffer {
+            (
+                format!("{}{}", mb.prompt, mb.text),
+                RStyle::default().add_modifier(Modifier::REVERSED),
+            )
+        } else if let Some(ref prompt) = editor.prompt {
             (
                 prompt.message.clone(),
                 RStyle::default().add_modifier(Modifier::REVERSED),
@@ -153,7 +159,17 @@ pub fn render(frame: &mut Frame, editor: &Editor) {
     // -----------------------------------------------------------------------
     // Hardware cursor
     // -----------------------------------------------------------------------
-    if let Some((col, row)) = nav::screen_pos(editor) {
+    if let Some(ref mb) = editor.minibuffer {
+        // Minibuffer is open: place caret on the status row at prompt.len() + cursor.
+        // cursor is a byte offset; for display we want the char count so the terminal
+        // column is correct even for multi-byte prompts/text (small strings, safe).
+        let prompt_cols = mb.prompt.chars().count() as u16;
+        let text_cols = mb.text[..mb.cursor].chars().count() as u16;
+        let caret_col = prompt_cols + text_cols;
+        if caret_col < w {
+            frame.set_cursor_position(Position { x: area.x + caret_col, y: status_row });
+        }
+    } else if let Some((col, row)) = nav::screen_pos(editor) {
         // Guard: only set if within the editing area (not into the status line).
         if row < edit_height && col < w {
             frame.set_cursor_position(Position { x: area.x + col, y: area.y + row });
@@ -231,6 +247,30 @@ mod tests {
         assert!(
             status_row.contains("Unsaved changes") || status_row.contains("[S]ave"),
             "status row must show prompt message, got: {:?}",
+            status_row
+        );
+    }
+
+    /// When the minibuffer is open, the status row must show <prompt><text>.
+    #[test]
+    fn renders_active_minibuffer_on_status_row() {
+        let mut e = Editor::new_from_text("hello\n", None, (40, 6));
+        e.open_minibuffer("> ");
+        // Simulate typing "cat" into the minibuffer
+        e.minibuffer.as_mut().unwrap().insert('c');
+        e.minibuffer.as_mut().unwrap().insert('a');
+        e.minibuffer.as_mut().unwrap().insert('t');
+        derive::rebuild(&mut e);
+        let mut term = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        term.draw(|f| render(f, &e)).unwrap();
+        let buf = term.backend().buffer();
+        // Bottom row (row 5) must show "> cat"
+        let status_row: String = (0u16..40)
+            .map(|x| buf[(x, 5u16)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            status_row.starts_with("> cat"),
+            "status row must show minibuffer prompt+text, got: {:?}",
             status_row
         );
     }

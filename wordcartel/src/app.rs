@@ -186,6 +186,32 @@ pub fn resolve_prompt(
     editor.prompt = None;
 }
 
+/// Submit a minibuffer line as a filter command.
+///
+/// Splits the line on whitespace to build the argv (no shell, no quoting —
+/// `shell: false` is the security default; shell invocation is opt-in only).
+/// An empty line sets a status message and returns without dispatching.
+fn submit_filter_line(
+    editor: &mut Editor,
+    line: &str,
+    msg_tx: &std::sync::mpsc::Sender<Msg>,
+) {
+    let argv: Vec<String> = line.split_whitespace().map(String::from).collect();
+    if argv.is_empty() {
+        editor.status = "filter: no command given".into();
+        return;
+    }
+    let spec = crate::filter::FilterSpec {
+        argv,
+        shell: false,
+        disposition: crate::filter::Disposition::Filter,
+        input: crate::filter::Input::SelectionElseBuffer,
+        timeout: std::time::Duration::from_secs(10),
+        max_output: 1 << 20,
+    };
+    crate::filter::dispatch_filter(editor, spec, msg_tx.clone());
+}
+
 /// Process one message. Returns true while the app should keep running.
 pub fn reduce(
     msg: Msg,
@@ -221,6 +247,46 @@ pub fn reduce(
         // Always drain ready results (merges the awaited save&quit result).
         for r in ex.drain() { apply_result(r, editor); }
         return !editor.quit;
+    }
+
+    // Minibuffer intercepts KEY INPUT only; non-key messages (FilterDone/JobDone/Tick)
+    // fall through to the normal match arm below — a FilterDone must apply even while
+    // the minibuffer is open (see test `minibuffer_does_not_starve_filterdone`).
+    if editor.minibuffer.is_some() {
+        if let Msg::Input(Event::Key(k)) = &msg {
+            if k.kind == crossterm::event::KeyEventKind::Press {
+                match k.code {
+                    crossterm::event::KeyCode::Char(c)
+                        if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                    {
+                        editor.minibuffer.as_mut().unwrap().insert(c);
+                    }
+                    crossterm::event::KeyCode::Backspace => {
+                        editor.minibuffer.as_mut().unwrap().backspace();
+                    }
+                    crossterm::event::KeyCode::Left => {
+                        editor.minibuffer.as_mut().unwrap().left();
+                    }
+                    crossterm::event::KeyCode::Right => {
+                        editor.minibuffer.as_mut().unwrap().right();
+                    }
+                    crossterm::event::KeyCode::Esc => {
+                        // Dismiss the minibuffer (dismiss > cancel): this Esc is consumed
+                        // here and does NOT reach the filter-cancel Esc check below, so
+                        // any in-flight filter continues running.
+                        editor.minibuffer = None;
+                    }
+                    crossterm::event::KeyCode::Enter => {
+                        let line = editor.minibuffer.take().unwrap().text;
+                        submit_filter_line(editor, &line, msg_tx);
+                    }
+                    _ => {}
+                }
+            }
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
+        }
+        // non-key (FilterDone/JobDone/Tick/Resize) falls through to the normal match below
     }
 
     let before = editor.active().document.version;
@@ -840,6 +906,42 @@ mod tests {
             "recovered content loaded into the active buffer");
         assert!(!p.exists(), "orphan swap file must be deleted on Recover");
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn minibuffer_routing_and_submit_dispatches_filter() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        e.open_minibuffer("> ");
+        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let key = |c: char| Event::Key(KeyEvent { code: KeyCode::Char(c), modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        for c in "cat".chars() { crate::app::reduce(Msg::Input(key(c)), &mut e, &reg, &ex, &clk, &tx); }
+        assert_eq!(e.minibuffer.as_ref().unwrap().text, "cat");
+        // Enter submits -> dispatch_filter -> a FilterDone arrives, minibuffer cleared
+        let enter = Event::Key(KeyEvent { code: KeyCode::Enter, modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &ex, &clk, &tx);
+        assert!(e.minibuffer.is_none(), "submit clears the minibuffer");
+        match rx.recv().unwrap() { Msg::FilterDone { outcome: crate::filter::RunResult::Stdout(s), .. } => assert_eq!(s, "abc\n"),
+                                   o => panic!("expected FilterDone, got {o:?}") }
+    }
+
+    #[test]
+    fn minibuffer_does_not_starve_filterdone() {
+        use crate::editor::Editor;
+        use crate::filter::{Disposition, RunResult};
+        use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("abcde\n", None, (80, 24));
+        let id = e.active().id; let v = e.active().document.version;
+        e.open_minibuffer("> ");
+        let (tx, _rx) = std::sync::mpsc::channel(); let reg = Registry::builtins();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
+            disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) }, &mut e, &reg, &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "aXde\n", "FilterDone applies even under an open minibuffer");
     }
 
     #[test]
