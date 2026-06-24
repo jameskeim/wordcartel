@@ -119,7 +119,7 @@ pub fn render(frame: &mut Frame, editor: &Editor) {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "[no name]".to_string());
 
-        let dirty_marker = if editor.document.dirty { "*" } else { "" };
+        let dirty_marker = if editor.document.dirty() { "*" } else { "" };
         let mode_text = match editor.view.mode {
             crate::editor::RenderMode::LivePreview => "PREVIEW",
             crate::editor::RenderMode::SourceHighlighted => "SRC-HI",

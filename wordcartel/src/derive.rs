@@ -162,6 +162,17 @@ mod tests {
     // Brief's failing tests (write RED first, then implement GREEN)
     // ------------------------------------------------------------------
 
+    #[test]
+    fn unicode_line_breaks_do_not_split_logical_lines() {
+        use crate::editor::Editor;
+        // U+2028 (LINE SEPARATOR) and a bare CR must NOT create new logical lines.
+        let e = Editor::new_from_text("a\u{2028}b\rc\n", None, (80, 24));
+        // One real LF-terminated line of content + the empty trailing line = 2.
+        assert_eq!(crate::derive::total_logical_lines(&e.document.buffer), 2);
+        // The whole "a\u{2028}b\rc" is one logical line (its content, sans trailing \n).
+        assert_eq!(crate::derive::line_text(&e.document.buffer, 0), "a\u{2028}b\rc");
+    }
+
     /// Inactive heading line shows concealed display (e.g. "Title", not "# Title").
     #[test]
     fn derive_lays_out_visible_lines_with_roles() {

@@ -329,32 +329,26 @@ mod tests {
         let _ = fs::remove_file(&real);
     }
 
-    /// A Save command on a real path clears dirty.
+    /// A background save on a real path clears dirty.
     #[test]
-    fn save_command_clears_dirty() {
-        use crate::commands::{run, Command, CommandResult};
+    fn background_save_command_clears_dirty() {
         use crate::editor::Editor;
+        use crate::jobs::{Executor, InlineExecutor};
+        use crate::registry::Ctx;
         use wordcartel_core::history::Clock;
-
-        struct FixedClock;
-        impl Clock for FixedClock {
-            fn now_ms(&self) -> u64 {
-                0
-            }
-        }
+        struct Z; impl Clock for Z { fn now_ms(&self) -> u64 { 0 } }
 
         let p = scratch_path("cmd-save");
-        // Write an initial file so path exists.
         fs::write(&p, "initial\n").expect("pre-write");
-
         let mut e = Editor::new_from_text("hello\n", Some(p.clone()), (80, 24));
-        // Manually mark dirty so the Save command has something to do.
-        e.document.dirty = true;
-
-        let result = run(Command::Save, &mut e, &FixedClock);
-        assert_eq!(result, CommandResult::Handled);
-        assert!(!e.document.dirty, "dirty must be cleared after a successful Save");
-
+        e.document.saved_version = None; // unsaved edit
+        e.document.version = 1;
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex };
+          crate::save::dispatch_save(&mut ctx); }
+        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        assert!(!e.document.dirty(), "dirty must be cleared after a successful background save");
         let _ = fs::remove_file(&p);
     }
 

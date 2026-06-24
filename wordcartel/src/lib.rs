@@ -5,7 +5,10 @@ pub mod derive;
 pub mod nav;
 pub mod commands;
 pub mod input;
+pub mod registry;
 pub mod render;
 pub mod term;
 pub mod file;
+pub mod jobs;
+pub mod save;
 pub mod app;   // App::run + the testable App::step (Task 12)

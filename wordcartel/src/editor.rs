@@ -22,7 +22,24 @@ pub struct Document {
     pub blocks: BlockTree, // derived cache (Task 3 maintains)
     pub version: u64,
     pub path: Option<PathBuf>,
-    pub dirty: bool, // unsaved changes
+    /// The document version last written to disk. `None` = never saved
+    /// (new/scratch). `dirty()` is derived from this — no separate flag.
+    pub saved_version: Option<u64>,
+    /// Last-known on-disk fingerprint (captured at load, refreshed by the save
+    /// merge). Used by dispatch_save to detect external modifications (§4.3).
+    pub stored_fp: Option<crate::save::FileFingerprint>,
+}
+
+impl Document {
+    /// Unsaved-work predicate (spec §4.3): clean iff the on-disk version
+    /// equals the current version.
+    pub fn dirty(&self) -> bool {
+        Some(self.version) != self.saved_version
+    }
+    /// Record that version `v` is now on disk.
+    pub fn mark_saved(&mut self, v: u64) {
+        self.saved_version = Some(v);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -63,8 +80,9 @@ impl Editor {
                 history,
                 blocks,
                 version: 0,
+                stored_fp: path.as_deref().and_then(crate::save::fingerprint),
                 path,
-                dirty: false,
+                saved_version: Some(0),
             },
             view: View {
                 scroll: 0,
@@ -102,33 +120,37 @@ impl Editor {
             kind,
         );
         self.document.version += 1;
-        self.document.dirty = true;
         self.pre_edit_rope = Some(old_rope);
         self.last_edit = Some(edit);
     }
 
-    /// Undo the last revision. Sets `last_edit`/`pre_edit_rope` to `None` so
-    /// Task 3's derive falls back to a full reparse.
-    pub fn undo(&mut self) {
-        if let Some(sel) = self.document.history.undo(&mut self.document.buffer) {
-            self.document.selection = sel;
+    /// Undo the last revision. Returns `true` iff the buffer changed.
+    /// On a no-op (empty history) it leaves version/dirty/derive-hints untouched.
+    pub fn undo(&mut self) -> bool {
+        match self.document.history.undo(&mut self.document.buffer) {
+            Some(sel) => {
+                self.document.selection = sel;
+                self.document.version += 1;
+                self.last_edit = None;
+                self.pre_edit_rope = None;
+                true
+            }
+            None => false,
         }
-        self.document.version += 1;
-        self.document.dirty = true;
-        self.last_edit = None;
-        self.pre_edit_rope = None;
     }
 
-    /// Redo the next revision. Sets `last_edit`/`pre_edit_rope` to `None` so
-    /// Task 3's derive falls back to a full reparse.
-    pub fn redo(&mut self) {
-        if let Some(sel) = self.document.history.redo(&mut self.document.buffer) {
-            self.document.selection = sel;
+    /// Redo the next revision. Returns `true` iff the buffer changed.
+    pub fn redo(&mut self) -> bool {
+        match self.document.history.redo(&mut self.document.buffer) {
+            Some(sel) => {
+                self.document.selection = sel;
+                self.document.version += 1;
+                self.last_edit = None;
+                self.pre_edit_rope = None;
+                true
+            }
+            None => false,
         }
-        self.document.version += 1;
-        self.document.dirty = true;
-        self.last_edit = None;
-        self.pre_edit_rope = None;
     }
 }
 
@@ -149,7 +171,7 @@ mod tests {
         assert_eq!(e.document.buffer.to_string(), "# Hi\n\nbody\n");
         assert_eq!(e.document.selection.primary().from(), 0);
         assert_eq!(e.document.version, 0);
-        assert!(!e.document.dirty);
+        assert!(!e.document.dirty());
         assert!(!e.document.blocks.top_level().is_empty());
     }
 
@@ -164,7 +186,7 @@ mod tests {
         assert_eq!(e.document.buffer.to_string(), "aXb\n");
         assert_eq!(e.document.selection.primary().head, 2);
         assert_eq!(e.document.version, 1);
-        assert!(e.document.dirty);
+        assert!(e.document.dirty());
         assert!(e.pre_edit_rope.is_some());
         // Edit has no PartialEq — compare fields:
         assert_eq!(e.last_edit.as_ref().map(|x| (x.range.clone(), x.new_len)), Some((1..1, 1)));
@@ -176,10 +198,52 @@ mod tests {
         let clk = TestClock(std::cell::Cell::new(0));
         let cs = ChangeSet::insert(1, "X", e.document.buffer.len());
         e.apply(Transaction::new(cs).with_selection(Selection::single(2)), Edit { range: 1..1, new_len: 1 }, EditKind::Type, &clk);
-        e.undo();
+        let changed = e.undo();
+        assert!(changed, "undo of a real edit must report change");
         assert_eq!(e.document.buffer.to_string(), "ab\n");
         assert!(e.last_edit.is_none()); // undo forces a full reparse in derive
-        e.redo();
+        let changed = e.redo();
+        assert!(changed, "redo of a real edit must report change");
         assert_eq!(e.document.buffer.to_string(), "aXb\n");
+    }
+
+    #[test]
+    fn undo_on_empty_history_is_true_noop() {
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        let v0 = e.document.version;
+        e.desired_col = Some(3);
+        let changed = e.undo();
+        assert!(!changed, "undo with empty history must report no change");
+        assert_eq!(e.document.version, v0, "version must not move on a no-op undo");
+        assert!(!e.document.dirty(), "a no-op undo must not dirty the buffer");
+        assert_eq!(e.desired_col, Some(3), "a no-op undo must not reset desired_col");
+    }
+
+    #[test]
+    fn redo_on_empty_history_is_true_noop() {
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        let v0 = e.document.version;
+        e.desired_col = Some(3);
+        let changed = e.redo();
+        assert!(!changed, "redo with empty history must report no change");
+        assert_eq!(e.document.version, v0, "version must not move on a no-op redo");
+        assert!(!e.document.dirty(), "a no-op redo must not dirty the buffer");
+        assert_eq!(e.desired_col, Some(3), "a no-op redo must not reset desired_col");
+    }
+
+    #[test]
+    fn dirty_is_a_function_of_versions() {
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        assert!(!e.document.dirty(), "fresh buffer (saved_version=Some(0)) is clean");
+        let clk = TestClock(std::cell::Cell::new(0));
+        let cs = wordcartel_core::change::ChangeSet::insert(1, "X", e.document.buffer.len());
+        e.apply(
+            Transaction::new(cs).with_selection(Selection::single(2)),
+            wordcartel_core::block_tree::Edit { range: 1..1, new_len: 1 },
+            EditKind::Type, &clk,
+        );
+        assert!(e.document.dirty(), "after an edit, version != saved_version → dirty");
+        e.document.mark_saved(e.document.version);
+        assert!(!e.document.dirty(), "after mark_saved at current version → clean");
     }
 }
