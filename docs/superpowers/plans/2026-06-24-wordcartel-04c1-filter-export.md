@@ -53,6 +53,16 @@ These cross-cut several tasks; the per-task steps below are written against them
 4. **Export carries bytes + explicit paths** (binary formats): see Task 5 — a
    byte-capable export result, an `Editor.pending_export` state for the overwrite
    re-run, and a new `file::save_atomic_bytes`.
+5. **Filter is TEXT-ONLY; export is a fully separate path** (Codex re-review — resolve
+   the export split). `Disposition = { Filter, Insert }` only (NO `Export` variant on
+   the filter `FilterSpec`). The engine core **produces bytes**:
+   `run_subprocess(argv, shell, stdin, timeout, max_output, cancel) -> Result<Vec<u8>, FilterError>`
+   (the poll loop). `run_filter` (text) wraps it: `String::from_utf8` → `RunResult::{Stdout(String), Err}`
+   (no `Exported` variant). **Export** (Task 5) calls `run_subprocess` directly for
+   bytes and delivers a **dedicated** `Msg::ExportDone { buffer_id, target: PathBuf,
+   result: Result<ExportResult, FilterError> }` with `enum ExportResult { Bytes(Vec<u8>),
+   TempReady(PathBuf) }` (`Capture` → `Bytes`; `WritesOutput` → `TempReady`). The
+   `FilterDone` merge handles only `Filter`/`Insert`; there is **no export branch** in it.
 
 ---
 
@@ -83,7 +93,7 @@ Foundation: the data model (no execution) and the public helper the filter merge
 
 **Interfaces:**
 - Produces:
-  - In `filter.rs`: `pub struct FilterSpec { pub argv: Vec<String>, pub shell: bool, pub disposition: Disposition, pub input: Input, pub timeout: std::time::Duration, pub max_output: usize }`; `pub enum Disposition { Filter, Insert, Export(ExportSink) }`; `pub enum ExportSink { Capture { ext: String }, WritesOutput { ext: String } }`; `pub enum Input { SelectionElseBuffer, None, WholeBuffer }`; `pub enum FilterOutcome { Replaced(String), Inserted(String), Exported(std::path::PathBuf), Failed(FilterError) }`; `pub enum FilterError { Spawn(String), NonZero { code: String, stderr: String }, Timeout, Cancelled, TooLarge, NotUtf8, ExportWrite(String) }` (all derive `Clone, Debug`; `FilterError: PartialEq` for tests).
+  - In `filter.rs`: `pub struct FilterSpec { pub argv: Vec<String>, pub shell: bool, pub disposition: Disposition, pub input: Input, pub timeout: std::time::Duration, pub max_output: usize }`; **`pub enum Disposition { Filter, Insert }`** (TEXT-ONLY — no `Export`; export is a separate Task-5 path per Plumbing #5); `pub enum Input { SelectionElseBuffer, None, WholeBuffer }`; `pub enum FilterError { Spawn(String), NonZero { code: String, stderr: String }, Timeout, Cancelled, TooLarge, NotUtf8, ExportWrite(String) }` (derive `Clone, Debug`; `FilterError: PartialEq` for tests). (`ExportSink`/`ExportResult` live in `export.rs`, Task 5 — not here.)
   - In `commands.rs`: `pub fn build_range_replace(from: usize, to: usize, text: &str, doc_len: usize) -> (wordcartel_core::change::ChangeSet, wordcartel_core::block_tree::Edit)` — returns the `ChangeSet` AND the matching `Edit { range: from..to, new_len: text.len() }` for `Buffer::apply`. The existing private `replace_changeset` is reimplemented to call it (or `build_range_replace` wraps it).
 
 - [ ] **Step 1: Add the dependency.** In `wordcartel/Cargo.toml` `[dependencies]`, add:
@@ -173,7 +183,9 @@ The subprocess core, isolated and synchronous so its correctness is tested direc
 - Consumes: `FilterSpec`, `FilterError` (Task 1).
 - Produces:
   - `pub struct CancelFlag(pub std::sync::Arc<std::sync::atomic::AtomicBool>);` with `pub fn new() -> CancelFlag`, `pub fn cancel(&self)`, `pub fn is_cancelled(&self) -> bool`.
-  - `pub fn run_filter(spec: &FilterSpec, stdin: String, cancel: &CancelFlag) -> RunResult` where `pub enum RunResult { Stdout(String), Exported, Err(FilterError) }` — synchronous: runs the child, returns collected stdout (Filter/Insert), `Exported` (Export, after the engine wrote the output — but the export *path* logic lives in Task 5; for now `Export` dispositions return `Stdout` for `Capture` or are handled in Task 5), or a `FilterError`. (Disposition-specific output handling — what to DO with the stdout — is the merge's job, Task 3/5; `run_filter` only produces the validated stdout or the error.)
+  - **Bytes core (shared with export):** `pub fn run_subprocess(argv: &[String], shell: bool, stdin: String, timeout: std::time::Duration, max_output: usize, cancel: &CancelFlag) -> Result<Vec<u8>, FilterError>` — the poll loop; returns the child's raw stdout **bytes** (or `NonZero{code,stderr}`/`Timeout`/`Cancelled`/`TooLarge`/`Spawn`). Task 5's export uses this directly for binary output.
+  - **Text wrapper (filters):** `pub fn run_filter(spec: &FilterSpec, stdin: String, cancel: &CancelFlag) -> RunResult` where `pub enum RunResult { Stdout(String), Err(FilterError) }` (derive `Debug`) — calls `run_subprocess`, then `String::from_utf8` → `Stdout` or `Err(NotUtf8)`. **No `Exported` variant** (export is a separate path, Plumbing #5).
+  - **Size-cap is an implementation RISK, not "resolved":** the loop checks `out_buf.len() > max_output` after each read; confirm whether `subprocess`'s `limit_size` also enforces it and which error it raises — keep this on the task checklist.
 
 - [ ] **Step 1: Write failing tests** in `filter.rs` (real commands available on any POSIX test box):
 ```rust
@@ -317,7 +329,7 @@ pub fn run_filter(spec: &FilterSpec, stdin: String, cancel: &CancelFlag) -> RunR
 
 fn truncate(s: &str, n: usize) -> String { s.chars().take(n).collect() }
 ```
-**Notes for the implementer:** (a) confirm whether `limit_size` overflow returns an error or a flag on the `Communicator` — map the overflow case to `FilterError::TooLarge` precisely; the `yes`+tiny-cap test pins the behavior. (b) `read()` may be `read()` or `read_string()`; we want **bytes** (so we can reject non-UTF-8 ourselves), so use the byte form. (c) the `Cancelled` mid-wait check is best-effort; real Esc-kill is wired in Task 3 (the foreground kills via the held child) — for the sync engine the flag check is sufficient for the unit surface.
+**Notes for the implementer:** (a) **Structure as two functions** (Plumbing #5): the poll loop above — everything that produces the validated stdout **bytes** — is `run_subprocess(...) -> Result<Vec<u8>, FilterError>` (return `Ok(out_buf)` on a clean zero exit, `Err(NonZero{..})` on non-zero, the `Err` variants on timeout/cancel/size/spawn). `run_filter` is then a thin wrapper: `match run_subprocess(&spec.argv, spec.shell, stdin, spec.timeout, spec.max_output, cancel) { Ok(bytes) => match String::from_utf8(bytes) { Ok(s) => RunResult::Stdout(s), Err(_) => RunResult::Err(FilterError::NotUtf8) }, Err(e) => RunResult::Err(e) }`. Export (Task 5) calls `run_subprocess` for raw bytes. (b) confirm whether `limit_size` overflow returns an error or a flag — the `yes`+tiny-cap test pins `TooLarge`. (c) we collect **bytes** (so we reject non-UTF-8 ourselves). (d) the poll loop's per-iteration cancel check IS the real Esc-kill path (Plumbing #3) — the flag is checked every `POLL`, not after a full-timeout blocking read.
 
 - [ ] **Step 4: Run tests + full suite.**
 Run: `cargo test` — the 6 engine tests pass; all prior green. `cargo build --workspace` zero warnings. (If a CI box lacks `yes`/`printf`, gate those two tests `#[cfg(unix)]` and note it.)
@@ -436,10 +448,10 @@ Expected: FAIL — `Msg::FilterDone`, the new `reduce` arg, `dispatch_filter` mi
                 crate::filter::RunResult::Stdout(text) => {
                     if let Some(b) = editor.by_id_mut(buffer_id) {
                         let doc_len = b.document.buffer.len();
+                        // Disposition is TEXT-ONLY here (export is a separate path).
                         let (from, to, at) = match disposition {
                             crate::filter::Disposition::Filter => (range.start, range.end, range.start),
                             crate::filter::Disposition::Insert => (cursor, cursor, cursor),
-                            crate::filter::Disposition::Export(_) => { editor_status_export(&mut editor.status); return !editor.quit; }
                         };
                         let (cs, edit) = crate::commands::build_range_replace(from, to, &text, doc_len);
                         let txn = wordcartel_core::history::Transaction::new(cs)
@@ -450,7 +462,6 @@ Expected: FAIL — `Msg::FilterDone`, the new `reduce` arg, `dispatch_filter` mi
                         editor.status = "filter applied".into();
                     }
                 }
-                crate::filter::RunResult::Exported => { editor.status = "exported".into(); }
             }
         }
 ```
@@ -682,9 +693,9 @@ fn export_overwrite_action_is_distinct_from_save_overwrite() {
 
 - [ ] **Step 4: Add the overwrite action + state + resolver plumbing.** In `prompt.rs`: `PromptAction::OverwriteExport` + `Prompt::export_overwrite(path)` (`[O]verwrite · [C]ancel`, message names the path; distinct from save `Overwrite`). In `editor.rs`: `pub pending_export: Option<crate::export::PendingExport>` (init `None`). In `app.rs`: `resolve_prompt` gains `msg_tx` (Plumbing #1); its `OverwriteExport` arm reads `editor.pending_export.take()` and calls `export::do_export(editor, &pe.ext, &pe.target, msg_tx)`; `Cancel` on the export prompt clears `pending_export`.
 
-- [ ] **Step 5: Write `export.rs`** — `probe_pandoc` (spawn `pandoc --version`; `ENOENT` → false; cached on the workspace, set at `run()` startup); `derived_export_path` (`set_extension`); `run_export` (scratch refusal; pandoc-absent status; derive `target`; if exists → `editor.pending_export = Some(PendingExport{ext,target})` + raise `Prompt::export_overwrite(&target)`; else `do_export`); `do_export` (dispatch the pandoc run on the filter thread; the thread returns the child's stdout **bytes** for `Capture` or signals success for `WritesOutput`; on the foreground, `Capture` → `file::save_atomic_bytes(&target, &bytes)`, `WritesOutput` → pandoc wrote `<target>.tmp-<pid>` which the foreground `rename`s to `target`; either leaves an existing `target` untouched on failure). Confirm the exact pandoc argv/flags per `ext` in an impl note. Declare `pub mod export;` + the `PendingExport { ext: String, target: PathBuf }` struct. **The export result delivery uses a dedicated `Msg::ExportDone { buffer_id, target, result }`** (or the `RunResult::ExportBytes` variant per the Interfaces) — do NOT route binary through the `Stdout(String)` path.
+- [ ] **Step 5: Add the `Msg::ExportDone` variant (`app.rs`) + write `export.rs`.** Add `Msg::ExportDone { buffer_id: crate::editor::BufferId, target: std::path::PathBuf, result: Result<crate::export::ExportResult, crate::filter::FilterError> }` to the `Msg` enum. Then in `export.rs` define `pub enum ExportSink { Capture { ext: String }, WritesOutput { ext: String } }`, `pub enum ExportResult { Bytes(Vec<u8>), TempReady(std::path::PathBuf) }`, `pub struct PendingExport { pub ext: String, pub target: std::path::PathBuf }`. **`probe_pandoc() -> bool`** lazily caches internally via `static PANDOC: std::sync::OnceLock<bool>` (spawn `pandoc --version`; `ENOENT` → false) — NO `Editor`/`Registry` config field needed (Codex re-review). `derived_export_path` (`set_extension`). `run_export(editor, ext, msg_tx)`: scratch refusal; `!probe_pandoc()` → status; derive `target`; if `target` exists → `editor.pending_export = Some(PendingExport{ext,target})` + raise `Prompt::export_overwrite(&target)`; else `do_export`. `do_export(editor, ext, target, msg_tx)`: capture `buffer_id` + the whole-buffer snapshot; spawn the filter thread which calls `crate::filter::run_subprocess(...)` for **bytes** and sends `Msg::ExportDone { buffer_id, target, result }` where `result: Result<ExportResult, crate::filter::FilterError>` — `Capture` → `Ok(ExportResult::Bytes(stdout))`; `WritesOutput` passes pandoc `-o <target>.tmp-<pid>` and on success → `Ok(ExportResult::TempReady(tmp))`. Confirm pandoc argv/flags per `ext` in an impl note. Declare `pub mod export;`.
 
-- [ ] **Step 6: Register `export_html`/`export_docx`/`export_pdf` command-ids** (`registry.rs`) calling `export::run_export(c.editor, ext, c.msg_tx)` (Ctx now carries `msg_tx`). If `probe_pandoc()` was false at startup, the handler reports `pandoc not found — install it to export` (graceful disable; editing unaffected). Add a `Msg::ExportDone` arm in `reduce` (also inside the prompt block) writing/renaming + status, mirroring `FilterDone`.
+- [ ] **Step 6: Register `export_html`/`export_docx`/`export_pdf` command-ids** (`registry.rs`) calling `export::run_export(c.editor, ext, c.msg_tx)` (Ctx now carries `msg_tx`). If `probe_pandoc()` is false, the handler reports `pandoc not found — install it to export` (graceful disable; editing unaffected). **Add a `Msg::ExportDone` arm in `reduce`** — handled in **all three sites** (normal match + the `prompt` interception block + the `minibuffer` block, like `FilterDone`; Codex re-review). Its body: on `Ok(ExportResult::Bytes(b))` → `file::save_atomic_bytes(&target, &b)` + status `exported <target>`; on `Ok(ExportResult::TempReady(tmp))` → `std::fs::rename(&tmp, &target)` + status; on `Err(e)` → status `crate::filter::describe_error(&e)`, target untouched. (No buffer mutation — export is read-only; route by `buffer_id` only for the status/in-flight bookkeeping if any.)
 
 - [ ] **Step 7: Run tests + full suite + commit.**
 Run: `cargo test`; `cargo build --workspace` zero warnings.
@@ -701,7 +712,9 @@ git commit -m "feat(export): pandoc presets (probe, derived path, save_atomic_by
 
 **Codex plan-review fixes (applied):** (1) cancellation is a **poll loop** that terminates the child within ~one `POLL` interval on Esc/timeout (not a flag checked after a blocking read); (2) `Msg::FilterDone`/`ExportDone` are handled **inside** the prompt + minibuffer interception blocks (factored into one `apply_filter_done`), so a result never gets starved by an open modal; (3) `registry::Ctx` gains `msg_tx` (and `resolve_prompt` too) so the `export_*` handlers + the overwrite re-run can dispatch; (4) `Editor.pending_export` carries the overwrite re-run state (payload-free `PromptAction` can't); (5) export is **byte-capable** (a dedicated `Msg::ExportDone`/`ExportBytes`, not `String`) with `file::save_atomic_bytes` (temp→rename) since `save_atomic` is UTF-8-only; (6) the `filter` command is **bound to a real key** (Ctrl+E) since there's no palette yet.
 
-**Known external-API caveat:** Task 2's `subprocess` calls are written against the documented API but **must be verified** at implementation time (the crate isn't cached) — the ⚠️ note + the deterministic real-command tests are the safety net; the contract (timeout/size/UTF-8-reject/exit/kill) is fixed. Codex confirmed `ropey::Rope::byte_slice(range)` exists (the `dispatch_filter` snapshot slice is sound).
+**Codex re-review reconciliation (applied):** resolved the export-path split — **filter is text-only** (`Disposition::{Filter, Insert}`, `RunResult::{Stdout, Err}`, no export branch in the `FilterDone` merge); **export is a fully separate path** sharing the bytes-producing `run_subprocess` core and delivering a dedicated `Msg::ExportDone { buffer_id, target, result: Result<ExportResult, FilterError> }` with `ExportResult::{Bytes(Vec<u8>), TempReady(PathBuf)}`. `probe_pandoc` lazily caches via a `OnceLock` (no `Editor`/`Registry` config field). `Msg::ExportDone` is handled in all three reducer sites (normal + prompt block + minibuffer block). The size-cap is a flagged implementation risk, not "resolved." `Ctrl+E` confirmed free.
+
+**Known external-API caveat:** Task 2's `subprocess` calls are written against the documented API but **must be verified** at implementation time (the crate isn't cached) — the ⚠️ note + the deterministic real-command tests are the safety net; the contract (timeout/size/UTF-8-reject/exit/kill) is fixed, and the implementer should fall back to a two-thread reader + `wait_timeout` poll loop if repeated bounded `Communicator::read()` isn't supported. Codex confirmed `ropey::Rope::byte_slice(range)` exists (the `dispatch_filter` snapshot slice is sound).
 
 **Borrow-split reminders:** the FilterDone merge and `run_export` must assemble status/text in locals so the `by_id_mut(b)` borrow ends before `editor.status`/`derive::rebuild(editor)` (the 4r save-merge pattern). The plan's snippets are illustrative on this point — make them compile with that discipline.
 
