@@ -25,6 +25,9 @@ pub struct Document {
     /// The document version last written to disk. `None` = never saved
     /// (new/scratch). `dirty()` is derived from this — no separate flag.
     pub saved_version: Option<u64>,
+    /// Last-known on-disk fingerprint (captured at load, refreshed by the save
+    /// merge). Used by dispatch_save to detect external modifications (§4.3).
+    pub stored_fp: Option<crate::save::FileFingerprint>,
 }
 
 impl Document {
@@ -77,6 +80,7 @@ impl Editor {
                 history,
                 blocks,
                 version: 0,
+                stored_fp: path.as_deref().and_then(crate::save::fingerprint),
                 path,
                 saved_version: Some(0),
             },

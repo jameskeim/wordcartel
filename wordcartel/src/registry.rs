@@ -56,9 +56,8 @@ impl Registry {
         map.insert(CommandId("undo"),  |c| run(c, Command::Undo));
         map.insert(CommandId("redo"),  |c| run(c, Command::Redo));
         map.insert(CommandId("cycle_render_mode"), |c| run(c, Command::CycleRenderMode));
-        // Save / quit. (Save becomes a job-dispatcher in Task 9; for now it
-        // delegates to the synchronous Command::Save arm.)
-        map.insert(CommandId("save"), |c| run(c, Command::Save));
+        // Save / quit. (Task 9: save is now a background job dispatcher.)
+        map.insert(CommandId("save"), |c| crate::save::dispatch_save(c));
         map.insert(CommandId("quit"), |c| run(c, Command::Quit));
         Registry { map }
     }
