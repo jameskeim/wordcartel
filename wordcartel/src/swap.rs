@@ -155,6 +155,40 @@ pub fn delete(doc_path: Option<&Path>) {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn pid_is_live(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+#[cfg(not(target_os = "linux"))]
+fn pid_is_live(_pid: u32) -> bool {
+    false // best-effort elsewhere: treat as not-live → offer recovery
+}
+
+/// Find an orphaned scratch swap from a previous (non-live) process, if any.
+/// Scratch swaps are pid-keyed; after a crash the new session won't find its
+/// own. Skip our own pid and live pids; return the newest valid non-empty
+/// orphan as (file path, header, body).
+pub fn find_orphan_scratch_swap() -> Option<(std::path::PathBuf, SwapHeader, String)> {
+    let dir = state_dir().ok()?;
+    let me = std::process::id();
+    let mut best: Option<(std::path::PathBuf, SwapHeader, String)> = None;
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        let fname = entry.file_name();
+        let fname = fname.to_string_lossy();
+        let pid = fname.strip_prefix("scratch-")
+            .and_then(|s| s.strip_suffix(".swp"))
+            .and_then(|s| s.parse::<u32>().ok());
+        let Some(pid) = pid else { continue };
+        if pid == me || pid_is_live(pid) { continue; }
+        let raw = match std::fs::read_to_string(entry.path()) { Ok(s) => s, Err(_) => continue };
+        let Some((header, body)) = parse(&raw) else { continue };
+        if body.is_empty() { continue; }
+        let newer = match &best { Some((_, h, _)) => header.ts_ms > h.ts_ms, None => true };
+        if newer { best = Some((entry.path(), header, body)); }
+    }
+    best
+}
+
 /// Atomic 0600 write into our own state dir (no symlink/skip-unchanged logic).
 pub fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -250,11 +284,18 @@ pub fn dispatch_swap_write(ctx: &mut Ctx) {
             let body = snap.to_string();
             let mut h = header;
             h.content_hash = fnv1a64(body.as_bytes());
-            let _ = write_atomic(&path, &serialize(&h, &body)); // best-effort
+            let ok = write_atomic(&path, &serialize(&h, &body)).is_ok();
             JobResult {
                 version,
                 kind: JobKind::SwapWrite,
-                merge: Box::new(move |editor| { editor.last_swap_at = Some(ts); }),
+                merge: Box::new(move |editor| {
+                    editor.swap_in_flight = false;
+                    if ok {
+                        editor.last_swap_at = Some(ts);
+                    } else {
+                        editor.status = "swap write failed".to_string();
+                    }
+                }),
             }
         }),
     });
@@ -427,6 +468,48 @@ mod tests {
             other => panic!("expected Prompt, got {other:?}"),
         }
         let _ = std::fs::remove_file(swap_path(Some(&p)).unwrap());
+    }
+
+    #[test]
+    fn find_orphan_scratch_swap_finds_dead_pid_and_skips_self() {
+        // Write an orphan scratch swap with a fake dead pid (999999 is unreachable
+        // in practice; pid_is_live returns false for it on Linux since /proc/999999
+        // won't exist unless the system is truly overloaded — we also check).
+        let dir = state_dir().unwrap();
+        let fake_pid: u32 = 999_999;
+        // On Linux, verify the fake pid is indeed not live before depending on it.
+        #[cfg(target_os = "linux")]
+        assert!(!pid_is_live(fake_pid), "test invariant: pid 999999 must not be live");
+
+        let orphan_path = dir.join(format!("scratch-{fake_pid}.swp"));
+        let my_path = dir.join(format!("scratch-{}.swp", std::process::id()));
+
+        // Write the orphan with non-empty body.
+        let h = SwapHeader {
+            realpath: None, load_mtime_secs: None, load_size: None,
+            content_hash: fnv1a64(b"orphaned text\n"), version: 1, ts_ms: 42_000, pid: fake_pid,
+        };
+        write_atomic(&orphan_path, &serialize(&h, "orphaned text\n")).unwrap();
+
+        // Also write a swap for our own pid — finder must skip it.
+        let my_h = SwapHeader {
+            realpath: None, load_mtime_secs: None, load_size: None,
+            content_hash: fnv1a64(b"self text\n"), version: 1, ts_ms: 43_000,
+            pid: std::process::id(),
+        };
+        write_atomic(&my_path, &serialize(&my_h, "self text\n")).unwrap();
+
+        let result = find_orphan_scratch_swap();
+        assert!(result.is_some(), "finder must return the orphan");
+        let (found_path, found_header, found_body) = result.unwrap();
+        assert_eq!(found_path, orphan_path, "finder must return the dead-pid orphan");
+        assert_eq!(found_header.pid, fake_pid);
+        assert_eq!(found_body, "orphaned text\n");
+        // The self-pid swap must NOT have been returned.
+        assert_ne!(found_path, my_path, "finder must not return our own pid's swap");
+
+        let _ = std::fs::remove_file(&orphan_path);
+        let _ = std::fs::remove_file(&my_path);
     }
 
     #[test]

@@ -74,10 +74,25 @@ pub fn resolve_prompt(action: PromptAction, editor: &mut Editor, ex: &dyn Execut
                 // Load the swap content into the buffer, mark dirty (saved_version
                 // stays None), keep the original path.
                 crate::save::load_recovered(editor, &body);
+                // Delete the orphan swap so next launch doesn't re-prompt.
+                // (Recovered work is now in the live buffer and will be swapped
+                // under the new pid.)
+                if let Some(p) = editor.pending_swap_path.take() {
+                    let _ = std::fs::remove_file(p);
+                }
             }
         }
-        PromptAction::DiscardSwap => crate::swap::delete(editor.document.path.as_deref()),
-        PromptAction::OpenOriginal => { editor.pending_swap_body = None; }
+        PromptAction::DiscardSwap => {
+            if let Some(p) = editor.pending_swap_path.take() {
+                let _ = std::fs::remove_file(p);
+            } else {
+                crate::swap::delete(editor.document.path.as_deref());
+            }
+        }
+        PromptAction::OpenOriginal => {
+            editor.pending_swap_body = None;
+            editor.pending_swap_path = None;
+        }
     }
     editor.prompt = None;
 }
@@ -138,12 +153,12 @@ pub fn reduce(
         Msg::Tick => {
             let now = clock.now_ms();
             if editor.document.dirty()
+                && !editor.swap_in_flight
                 && crate::swap::due(now, editor.last_edit_at, editor.last_swap_at)
             {
+                editor.swap_in_flight = true;
                 let mut ctx = Ctx { editor, clock, executor: ex };
                 crate::swap::dispatch_swap_write(&mut ctx);
-                // Provisionally mark; the merge confirms with the same ts.
-                ctx.editor.last_swap_at = Some(now);
             }
         }
     }
@@ -241,18 +256,29 @@ pub fn run(path: Option<PathBuf>) -> std::io::Result<()> {
 
     let mut editor = editor;
 
-    // Recovery-on-open (§5.1). Read F's current bytes once for the predicate.
-    let file_bytes = editor.document.path.as_deref().and_then(|p| std::fs::read(p).ok());
-    match crate::swap::assess(editor.document.path.as_deref(), file_bytes.as_deref()) {
-        crate::swap::RecoveryDecision::OpenNormally => {}
-        crate::swap::RecoveryDecision::DiscardSilently => {
-            crate::swap::delete(editor.document.path.as_deref());
+    // Recovery-on-open (§5.1).
+    // Named files: use assess() with content-hash comparison.
+    // Scratch buffers: their swap is pid-keyed, so look for an orphan from a
+    // dead previous session (pre-merge blocker #1).
+    if editor.document.path.is_some() {
+        // Read F's current bytes once for the predicate.
+        let file_bytes = editor.document.path.as_deref().and_then(|p| std::fs::read(p).ok());
+        match crate::swap::assess(editor.document.path.as_deref(), file_bytes.as_deref()) {
+            crate::swap::RecoveryDecision::OpenNormally => {}
+            crate::swap::RecoveryDecision::DiscardSilently => {
+                crate::swap::delete(editor.document.path.as_deref());
+            }
+            crate::swap::RecoveryDecision::Prompt(_h, body) => {
+                editor.pending_swap_body = Some(body);
+                editor.prompt = Some(crate::prompt::Prompt::swap_recovery());
+                editor.status = "Recovery file found".into();
+            }
         }
-        crate::swap::RecoveryDecision::Prompt(_h, body) => {
-            editor.pending_swap_body = Some(body);
-            editor.prompt = Some(crate::prompt::Prompt::swap_recovery());
-            editor.status = "Recovery file found".into();
-        }
+    } else if let Some((sp, _header, body)) = crate::swap::find_orphan_scratch_swap() {
+        editor.pending_swap_body = Some(body);
+        editor.pending_swap_path = Some(sp);
+        editor.prompt = Some(crate::prompt::Prompt::swap_recovery());
+        editor.status = "Recovery file found".into();
     }
 
     // Install the terminal guard: enable raw mode + enter alternate screen.

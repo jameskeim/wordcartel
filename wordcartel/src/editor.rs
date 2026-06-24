@@ -71,6 +71,12 @@ pub struct Editor {
     pub last_swap_at: Option<u64>,
     /// Swap body stashed at open when recovery is needed; consumed by Task 8's resolver.
     pub pending_swap_body: Option<String>,
+    /// Actual swap file path for an orphan scratch swap (differs from swap_path(None)
+    /// which uses the current pid). Used by resolve_prompt to clean up the orphan.
+    pub pending_swap_path: Option<std::path::PathBuf>,
+    /// True while a SwapWrite job is in-flight. Prevents redundant dispatches and
+    /// prevents last_swap_at from advancing until the write result lands.
+    pub swap_in_flight: bool,
     /// Version to quit after once its Save result lands clean (§5.3 save&quit).
     /// Set by resolve_prompt(SaveAndQuit); cleared (via quit=true) by apply_result.
     /// None when no save&quit is pending.
@@ -115,6 +121,8 @@ impl Editor {
             last_edit_at: None,
             last_swap_at: None,
             pending_swap_body: None,
+            pending_swap_path: None,
+            swap_in_flight: false,
             quit_after_save: None,
             quit_after_save_at: None,
         }
