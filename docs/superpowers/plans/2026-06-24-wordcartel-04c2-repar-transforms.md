@@ -64,7 +64,9 @@ mod tests {
         let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega";
         let out = run_transform(TransformKind::Reflow, long, 72).unwrap();
         for line in out.lines() {
-            assert!(repar::display_width(line) <= 72, "line over width: {line:?}");
+            // repar::display_width(s, start_col, tab, compat) — 4 args (width.rs).
+            let cols = repar::display_width(line, 0, 8, repar::Compat::empty());
+            assert!(cols <= 72, "line over width ({cols}): {line:?}");
         }
         // Round-trip back to words: unwrapping the reflow yields one line with the same words.
         let unwrapped = run_transform(TransformKind::Unwrap, &out, 72).unwrap();
@@ -182,7 +184,7 @@ The Codex-CRITICAL correctness unit: a partial selection expands to the whole to
 - Test: `wordcartel/src/transform.rs`
 
 **Interfaces:**
-- Consumes: `wordcartel_core::block_tree::{BlockTree, Block}` (`Block.span: std::ops::Range<usize>`, `BlockTree::top_level() -> &[Block]`), `wordcartel_core::BytePos` (= `usize`).
+- Consumes: `wordcartel_core::block_tree::{BlockTree, Block}` (`Block.span: std::ops::Range<usize>`, `BlockTree::top_level() -> &[Block]`). Ranges are plain `usize`.
 - Produces:
   - `pub fn snap_to_blocks(blocks: &BlockTree, from: usize, to: usize) -> std::ops::Range<usize>` — expand `[from,to)` to cover every top-level block whose span intersects it; if none intersect, return `from..to` unchanged.
   - `pub fn region_for_transform(doc: &crate::editor::Document) -> std::ops::Range<usize>` — `0..buf_len` when the primary selection is empty (whole buffer), else `snap_to_blocks(&doc.blocks, sel.from(), sel.to())`.
@@ -196,45 +198,54 @@ The Codex-CRITICAL correctness unit: a partial selection expands to the whole to
         Editor::new_from_text(text, None, (80, 24)).active().document.blocks.clone()
     }
 
+    // Exact-span discipline (Codex plan review, I-3): assert the snapped range
+    // EQUALS the block tree's own span(s), so there is no off-by-one that
+    // build_range_replace would turn into a dropped/duplicated newline. We compare
+    // against `top_level()[i].span` (whatever the parser produced) rather than
+    // hand-counted byte offsets.
+
     #[test]
-    fn snap_expands_mid_paragraph_selection_to_whole_paragraph() {
+    fn snap_expands_mid_paragraph_selection_to_exactly_the_paragraph_block() {
         let text = "alpha beta gamma\ndelta epsilon zeta\n\nsecond para\n";
         let bt = blocks_of(text);
+        let para0 = bt.top_level()[0].span.clone(); // the first paragraph block
         // Selection lands inside the first paragraph (bytes 5..9 = "beta").
         let r = snap_to_blocks(&bt, 5, 9);
-        // Expanded to cover the whole first paragraph block (starts at 0).
-        assert_eq!(r.start, 0);
-        assert!(r.end >= "alpha beta gamma\ndelta epsilon zeta\n".len() - 1);
-        // It must NOT reach into the second paragraph.
-        assert!(r.end <= text.find("second").unwrap());
+        assert_eq!(r, para0, "snap must equal the first paragraph block's exact span");
+        // …and must not reach into the second paragraph block.
+        assert!(r.end <= bt.top_level()[1].span.start);
     }
 
     #[test]
     fn snap_inside_fenced_code_block_with_interior_blank_covers_whole_fence() {
-        // The CRITICAL case: a blank line INSIDE a fenced code block.
+        // The CRITICAL case: a blank line INSIDE a fenced code block. The parser
+        // emits ONE FencedCode block spanning the interior blank; snapping must
+        // return exactly that block's span (opener through closer), never a fragment.
         let text = "```\ncode line one\n\nstill code\n```\n\nprose after\n";
         let bt = blocks_of(text);
-        let fence_start = 0;
-        let fence_end = text.find("\n\nprose").unwrap() + 1; // through the closing ``` line's newline
-        // A selection on "still code" (after the interior blank) must snap to the WHOLE fence,
-        // not just the fragment after the blank line.
+        let fence = bt.top_level()[0].span.clone();
+        // Sanity: the fence block really spans the interior blank.
+        assert!(text[fence.clone()].starts_with("```"), "block 0 is the fence");
+        assert!(text[fence.clone()].contains("\n\nstill code"), "fence spans the interior blank");
+        // A selection on "still code" (after the interior blank) snaps to the WHOLE fence.
         let sel_from = text.find("still").unwrap();
         let r = snap_to_blocks(&bt, sel_from, sel_from + 5);
-        assert_eq!(r.start, fence_start, "must include the opening fence");
-        assert!(r.end >= fence_end - 1, "must include the closing fence");
+        assert_eq!(r, fence, "must snap to exactly the whole fenced block");
     }
 
     #[test]
-    fn snap_multi_block_selection_covers_all_touched_blocks() {
+    fn snap_multi_block_selection_covers_exactly_the_touched_blocks() {
         let text = "para one here\n\npara two here\n\npara three\n";
         let bt = blocks_of(text);
+        let p0 = bt.top_level()[0].span.clone();
+        let p1 = bt.top_level()[1].span.clone();
+        let p2 = bt.top_level()[2].span.clone();
         // Selection spans from inside para one to inside para two.
         let from = 5;
         let to = text.find("two").unwrap() + 1;
         let r = snap_to_blocks(&bt, from, to);
-        assert_eq!(r.start, 0);
-        assert!(r.end <= text.find("para three").unwrap());
-        assert!(r.end >= text.find("para two here").unwrap() + "para two here".len());
+        assert_eq!(r, p0.start..p1.end, "snap must be exactly the union of the two touched blocks");
+        assert!(r.end <= p2.start, "must not reach the untouched third block");
     }
 
     #[test]
@@ -281,7 +292,7 @@ pub fn snap_to_blocks(blocks: &BlockTree, from: usize, to: usize) -> std::ops::R
 /// selection is empty, else the selection snapped to whole blocks.
 pub fn region_for_transform(doc: &crate::editor::Document) -> std::ops::Range<usize> {
     let sel = doc.selection.primary();
-    let buf_len = doc.buffer.len_bytes(); // confirm: len_bytes() vs len() on the buffer type
+    let buf_len = doc.buffer.len(); // TextBuffer::len() is the byte length (buffer.rs)
     if sel.is_empty() {
         0..buf_len
     } else {
@@ -289,7 +300,7 @@ pub fn region_for_transform(doc: &crate::editor::Document) -> std::ops::Range<us
     }
 }
 ```
-(Confirm the buffer byte-length method name on `doc.buffer` — it may be `len_bytes()` or `len()`. Confirm `doc.selection.primary()` returns a `Range` with `from()/to()/is_empty()` — it does, per `wordcartel-core/src/selection.rs`. `Document` is `crate::editor::Document`; confirm `blocks`/`selection`/`buffer` field names match.)
+(`TextBuffer::len()` is the byte length — confirmed (`wordcartel-core/src/buffer.rs`). `doc.selection.primary()` returns a `Range` with `from()/to()/is_empty()` (`wordcartel-core/src/selection.rs`). `Document` is `crate::editor::Document`; confirm `blocks`/`selection`/`buffer` field names match.)
 
 - [ ] **Step 4: Run tests + full suite.** `cargo test -p wordcartel --lib transform::tests` → all pass; `cargo test --workspace` green; zero warnings. (`region_for_transform` unused until Task 3 → `#[allow(dead_code)]` `// wired in Task 3`.)
 
@@ -316,7 +327,7 @@ The first user-visible deliverable: `Ctrl+T` → `[r]eflow [u]nwrap [v]entilate`
   - `Prompt::transform_chooser() -> Prompt`.
   - registry command id `CommandId("transform")` → raises the chooser.
   - `Ctrl+T` → `id("transform")` in `key_to_command_id`.
-  - `pub fn dispatch_transform(editor: &mut crate::editor::Editor, kind: TransformKind, msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>)` in `transform.rs` — Task 3 implements the **sync branch only** (region < `TRANSFORM_ASYNC_THRESHOLD`); the async branch is a `todo`-free fallthrough that, for now, also runs sync (Task 4 adds the threshold split). To avoid rework, implement the size check now but route both branches to the same sync helper, leaving a `// Task 4: large regions go async` marker.
+  - `pub fn dispatch_transform(editor: &mut crate::editor::Editor, kind: TransformKind, clock: &dyn wordcartel_core::history::Clock, msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>)` in `transform.rs` — note the `clock` param (threaded from `resolve_prompt`). Task 3 implements the **sync branch only** (region < `TRANSFORM_ASYNC_THRESHOLD`); `msg_tx` is unused until Task 4 adds the off-thread branch (name it `_msg_tx` in Task 3). Implement the size check now but route both branches to the same sync helper, leaving a `// Task 4: large regions go async` marker.
   - `pub fn apply_transform_result(editor: &mut Editor, kind: TransformKind, range: Range<usize>, result: Result<String, TransformError>)` — the shared merge used by both sync and (Task 4) async, with the §6.2 status contract.
 
 - [ ] **Step 1: Write the failing tests** in `app.rs`:
@@ -439,7 +450,7 @@ pub fn dispatch_transform(
     }
     // Task 4: if range.len() >= TRANSFORM_ASYNC_THRESHOLD, snapshot + spawn + send
     //         Msg::TransformDone instead of running inline. For now, run sync.
-    let input = byte_slice_to_string(editor, range.clone()); // confirm slice helper (see notes)
+    let input = editor.active().document.buffer.slice(range.clone()).to_string(); // TextBuffer::slice
     let result = run_transform(kind, &input, DEFAULT_REFLOW_WIDTH);
     apply_transform_result(editor, kind, range, result, clock);
 }
@@ -457,12 +468,12 @@ pub fn apply_transform_result(
     match result {
         Err(e) => { editor.status = format!("transform failed: {e}"); }
         Ok(out) => {
-            let current = byte_slice_to_string(editor, range.clone());
+            let current = editor.active().document.buffer.slice(range.clone()).to_string();
             if out == current {
                 editor.status = format!("already {}", kind.past_tense());
                 return;
             }
-            let doc_len = editor.active().document.buffer.len_bytes(); // confirm method
+            let doc_len = editor.active().document.buffer.len(); // TextBuffer::len() = byte length
             let (cs, edit) = crate::commands::build_range_replace(range.start, range.end, &out, doc_len);
             let txn = wordcartel_core::history::Transaction::new(cs);
             // end any read borrow before the &mut apply; then rebuild/ensure_visible after.
@@ -475,7 +486,7 @@ pub fn apply_transform_result(
     }
 }
 ```
-**Implementer notes (resolve against real code):** (a) `byte_slice_to_string(editor, range)` is a stand-in for "read the active buffer's `range` to an owned `String`" — implement it by copying 4c-1's exact pattern from `dispatch_filter`/`apply_filter_done` (e.g. `editor.active().document.buffer.snapshot().byte_slice(range).to_string()`); do NOT invent a new buffer method. Likewise confirm the byte-length method (`len_bytes()` vs `len()`). (b) `clock` is threaded from `resolve_prompt` (which has `clock: &dyn Clock` in scope) — no `wall_clock()` is invented. Confirm the `Clock` trait path (`wordcartel_core::history::Clock` vs another module) against `Buffer::apply`'s signature. (c) Borrow-split discipline (4r/4c-1): compute `current`/`out`/status into locals; end the `active_mut()` borrow before `derive::rebuild(editor)`/`ensure_visible(editor)`/`editor.status`. Make it compile cleanly.
+**Implementer notes (resolved against real code — Codex plan review):** (a) **Buffer reads use real methods** (verified): `TextBuffer::len()` is the byte length; the synchronous range read is `editor.active().document.buffer.slice(range).to_string()` (`TextBuffer::slice`); the async-thread read (Task 4) is `snapshot.byte_slice(range).to_string()` on the `ropey::Rope` snapshot — the exact pattern `dispatch_filter` uses. Do NOT use `len_bytes()` or any `byte_slice_to_string` helper — they do not exist. (b) `clock` is threaded from `resolve_prompt` (which has `clock: &dyn Clock` in scope). The `Clock` trait is `wordcartel_core::history::Clock` — confirm against `Buffer::apply`'s signature. (c) Borrow-split discipline (4r/4c-1): compute `current`/`out`/status into locals; end the `active_mut()` borrow before `derive::rebuild(editor)`/`ensure_visible(editor)`/`editor.status`. Make it compile cleanly.
 
 - [ ] **Step 7: Wire the `resolve_prompt` arm** in `app.rs` (`resolve_prompt` at ~line 198). Add:
 ```rust
@@ -603,7 +614,7 @@ pub fn dispatch_transform(
         return;
     }
     // Sync branch (Task 3).
-    let input = editor.active().document.buffer.byte_slice_to_string(range.clone()); // same helper as Task 3
+    let input = editor.active().document.buffer.slice(range.clone()).to_string(); // TextBuffer::slice
     let result = run_transform(kind, &input, DEFAULT_REFLOW_WIDTH);
     apply_transform_result(editor, kind, range, result, clock);
 }
@@ -632,7 +643,9 @@ fn apply_transform_done(
 }
 ```
 **Implementer note (keep DRY):** the sync path (`apply_transform_result`) targets the active buffer; the async path must target `by_id_mut(buffer_id)`. Factor the shared body into one private helper that takes the buffer id, e.g.
-`fn merge_transform_into(editor, buffer_id, kind, range, result, clock)` which: on `Err` → `editor.status = format!("transform failed: {e}")`; on `Ok(out)` → read the current bytes of `range` from `by_id(buffer_id)`, if `out == current` set "already …" and return, else `build_range_replace` → `by_id_mut(buffer_id).apply(.., EditKind::Other, clock)`, then `derive::rebuild(editor)`+`ensure_visible(editor)` after the borrow ends, status = `kind.past_tense()`. Then make `apply_transform_result` (sync, Task 3) call `merge_transform_into(editor, editor.active().id, kind, range, result, clock)` so there is exactly ONE merge body. (This is a small refactor of the Task 3 function — do it here, do not duplicate the merge.)
+`fn merge_transform_into(editor, buffer_id, kind, range, result, clock)` which: on `Err` → `editor.status = format!("transform failed: {e}")`; on `Ok(out)` → read the current bytes of `range` from `by_id(buffer_id)`, if `out == current` set "already …" and return, else `build_range_replace` → `by_id_mut(buffer_id).apply(.., EditKind::Other, clock)`, then status = `kind.past_tense()`. Then make `apply_transform_result` (sync, Task 3) call `merge_transform_into(editor, editor.active().id, kind, range, result, clock)` so there is exactly ONE merge body. (This is a small refactor of the Task 3 function — do it here, do not duplicate the merge.)
+
+**Active-buffer guard for derive refresh (Codex plan review, IMPORTANT I-2):** `derive::rebuild(editor)` and `nav::ensure_visible(editor)` operate on `editor.active()` ONLY. The merge applies via `by_id_mut(buffer_id)`, which in a future multi-buffer world may not be the active buffer. So call `derive::rebuild(editor)` + `ensure_visible(editor)` **only when `buffer_id == editor.active().id`** (the merged buffer is the visible one — always true today, since a transform originates from the active buffer and there is no buffer-switch UI yet). When it is NOT active, apply the edit but skip the active-only refresh — that buffer re-derives when next focused. This makes the merge correct under Effort 6 multi-buffer without changing today's behavior. (The sync path always has `buffer_id == active.id`, so it always refreshes.)
 
 Wire `Msg::TransformDone` in BOTH the normal match arm and the `editor.prompt.is_some()` interception block (parallel to their `FilterDone` arms), each calling `apply_transform_done(editor, buffer_id, version, range, kind, result, clock)`. (The minibuffer block intercepts only keys, so `TransformDone` falls through to the normal arm — no third arm.)
 
@@ -650,11 +663,13 @@ git commit -m "feat(transform): async fallback over 1 MiB + Msg::TransformDone v
 
 **Spec coverage:** §1/§3 transforms + `run_transform` wrapper (Task 1); §3.1 markdown-structural block snapping (Task 2); §4 Ctrl+T modal chooser + registry command + precedence (Task 3; precedence is automatic — chooser only opens in normal mode); §5.1 sync apply as one undoable edit (Task 3); §5.2 async threshold + version-discard merge + two reducer arms (Task 4); §6 error handling / no-op / discard (Tasks 3+4); §6.1 concurrency (Task 4: `transform_in_flight` + version-discard, no cross-block); §6.2 status strings (Tasks 3+4); §8 tests — golden/property checks + round-trip + snap + merge (Tasks 1, 2, 3, 4). ✅
 
+**Codex plan-review fixes applied (2 critical + 3 important + 1 minor):** `repar::display_width` called with its real 4-arg signature `(s, start_col, tab, compat)`; buffer reads use real methods (`TextBuffer::len()`, sync `buffer.slice(range).to_string()`, async `snapshot.byte_slice(range).to_string()`) — `len_bytes()`/`byte_slice_to_string` were fictional; `clock: &dyn Clock` added to the `dispatch_transform`/`apply_transform_result` interface; the async merge's `derive::rebuild`/`ensure_visible` are guarded to run only when the merged buffer is active (they are active-only); Task 2 snap tests assert the **exact** block span (no fuzzy bounds) to catch newline off-by-ones; dropped the unused `BytePos` mention.
+
 **Codex spec-review fixes reflected:** region snapping is block-tree-structural, not blank-line (Task 2, with the fenced-block-with-interior-blank regression test); Ctrl+T precedence stated as automatic (Task 3); `TransformDone` wired in normal + prompt arm with minibuffer fall-through (Task 4, matching real `FilterDone`); filter/transform concurrency = independent guards + version-discard (Task 4); exact status strings (Tasks 3+4); round-trip law is a verified obligation (Task 1).
 
 **Type consistency:** `TransformKind`/`TransformError`/`run_transform`/`DEFAULT_REFLOW_WIDTH`/`TRANSFORM_ASYNC_THRESHOLD` (Task 1) → `snap_to_blocks`/`region_for_transform` (Task 2) → `PromptAction::Transform(TransformKind)`/`Prompt::transform_chooser`/`dispatch_transform(editor,kind,clock,msg_tx)`/`apply_transform_result` (Task 3) → `Msg::TransformDone{buffer_id,version,range,kind,result}`/`transform_in_flight`/`apply_transform_done` (Task 4). `dispatch_transform`'s signature gains `clock` in Task 3 and is unchanged in Task 4. The merge factoring is called out as DRY in Task 4.
 
-**Implementer-verify markers (not placeholders — real-code confirmations):** buffer byte-length method (`len_bytes()` vs `len()`); the `byte_slice(range).to_string()` / snapshot slice helper (copy 4c-1's `dispatch_filter`/`apply_filter_done` pattern verbatim); the `Clock` trait path used by `Buffer::apply`; `Document`/`Prompt`/`Choice` field names; the `repar` relative path and `repar::ParError` re-export. Each names exactly what to check and where the existing pattern lives.
+**Implementer-verify markers (not placeholders — confirmed by Codex plan review):** buffer byte length is `TextBuffer::len()`; sync read is `buffer.slice(range).to_string()`, async read is `snapshot.byte_slice(range).to_string()` (the `dispatch_filter` pattern); the `Clock` trait is `wordcartel_core::history::Clock`; `repar::display_width` takes `(s, start_col, tab, compat)`; `repar::ParError` is the re-exported error type; `repar` path `../../par-command/repar`. Field names (`Document`/`Prompt`/`Choice`) to confirm at the touch site.
 
 ---
 
