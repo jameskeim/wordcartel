@@ -281,6 +281,7 @@ mod tests {
         { let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex };
           dispatch_save(&mut ctx); }
         assert!(e.prompt.is_some(), "a file appearing where there was none is a conflict");
+        assert!(ex.drain().is_empty(), "no save job dispatched on new-file conflict");
         let _ = std::fs::remove_file(&p);
     }
 
@@ -299,6 +300,7 @@ mod tests {
         for r in ex.drain() { crate::app::apply_result(r, &mut e); }
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "mine\n", "overwrite wins");
         assert!(!e.document.dirty());
+        assert_eq!(e.document.stored_fp, crate::save::fingerprint(&p), "overwrite refreshes stored_fp");
         let _ = std::fs::remove_file(&p);
     }
 
@@ -311,6 +313,7 @@ mod tests {
         reload_from_disk(&mut e);
         assert_eq!(e.document.buffer.to_string(), "on disk\n");
         assert!(!e.document.dirty(), "reloaded buffer is clean");
+        assert_eq!(e.document.stored_fp, crate::save::fingerprint(&p), "reload refreshes stored_fp");
         let _ = std::fs::remove_file(&p);
     }
 
