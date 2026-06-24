@@ -378,15 +378,16 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                 }
                 Some(p) => {
                     let path = p.clone();
+                    let v = editor.document.version;
                     editor.status = "Saving\u{2026}".to_string();
                     let content = editor.document.buffer.to_string();
                     match file::save_atomic(&path, &content) {
                         Ok(file::SaveOutcome::Saved) => {
-                            editor.document.dirty = false;
+                            editor.document.mark_saved(v);
                             editor.status = "Saved".to_string();
                         }
                         Ok(file::SaveOutcome::Unchanged) => {
-                            editor.document.dirty = false;
+                            editor.document.mark_saved(v);
                             editor.status = "(unchanged)".to_string();
                         }
                         Err(e) => {
@@ -400,7 +401,7 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         }
 
         Command::Quit => {
-            if editor.document.dirty && !editor.pending_quit {
+            if editor.document.dirty() && !editor.pending_quit {
                 editor.pending_quit = true;
                 editor.status =
                     "Unsaved changes \u{2014} Ctrl+Q again to quit, Ctrl+S to save".to_string();
@@ -534,7 +535,7 @@ mod tests {
         let result = run(Command::DeleteForward, &mut e, &clk);
         assert_eq!(result, CommandResult::Noop);
         assert_eq!(e.document.buffer.to_string(), "ab\n");
-        assert!(!e.document.dirty, "DeleteForward at EOF must not dirty the buffer");
+        assert!(!e.document.dirty(), "DeleteForward at EOF must not dirty the buffer");
     }
 
     // -------------------------------------------------------------------------
@@ -550,7 +551,7 @@ mod tests {
         let result = run(Command::Backspace, &mut e, &clk);
         assert_eq!(result, CommandResult::Noop);
         assert_eq!(e.document.buffer.to_string(), "abc\n");
-        assert!(!e.document.dirty);
+        assert!(!e.document.dirty());
     }
 
     /// DeleteForward in the middle of a line removes the next character.

@@ -349,11 +349,11 @@ mod tests {
 
         let mut e = Editor::new_from_text("hello\n", Some(p.clone()), (80, 24));
         // Manually mark dirty so the Save command has something to do.
-        e.document.dirty = true;
+        e.document.saved_version = None;
 
         let result = run(Command::Save, &mut e, &FixedClock);
         assert_eq!(result, CommandResult::Handled);
-        assert!(!e.document.dirty, "dirty must be cleared after a successful Save");
+        assert!(!e.document.dirty(), "dirty must be cleared after a successful Save");
 
         let _ = fs::remove_file(&p);
     }
