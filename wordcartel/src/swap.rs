@@ -237,6 +237,8 @@ pub fn dispatch_swap_write(ctx: &mut Ctx) {
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
 
     #[test]
     fn fnv_is_stable_and_distinguishes() {
@@ -373,7 +375,12 @@ mod tests {
         use wordcartel_core::history::Clock;
         struct Z; impl Clock for Z { fn now_ms(&self) -> u64 { 123 } }
 
-        let mut e = Editor::new_from_text("swap me\n", None, (80, 24)); // scratch
+        let doc_path = std::env::temp_dir().join(format!(
+            "wc-dispatch-swap-{}-{}.md",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        let mut e = Editor::new_from_text("swap me\n", Some(doc_path.clone()), (80, 24));
         e.document.version = 3;
         let ex = InlineExecutor::default();
         let clk = Z;
@@ -381,10 +388,11 @@ mod tests {
           dispatch_swap_write(&mut ctx); }
         for r in ex.drain() { crate::app::apply_result(r, &mut e); }
         assert_eq!(e.last_swap_at, Some(123), "merge records last_swap_at");
-        let sp = swap_path(None).unwrap();
+        let sp = swap_path(Some(&doc_path)).unwrap();
         let (h, body) = parse(&std::fs::read_to_string(&sp).unwrap()).unwrap();
         assert_eq!(body, "swap me\n");
         assert_eq!(h.version, 3);
         let _ = std::fs::remove_file(&sp);
+        let _ = std::fs::remove_file(&doc_path);
     }
 }

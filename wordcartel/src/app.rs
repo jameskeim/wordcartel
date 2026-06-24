@@ -241,6 +241,8 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use crate::editor::Editor;
     use wordcartel_core::history::Clock;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
 
     struct TestClock(u64);
     impl Clock for TestClock {
@@ -376,7 +378,12 @@ mod tests {
         use crate::editor::Editor;
         use crate::jobs::InlineExecutor;
         use crate::registry::Registry;
-        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        let doc_path = std::env::temp_dir().join(format!(
+            "wc-tick-swap-{}-{}.md",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        let mut e = Editor::new_from_text("\n", Some(doc_path.clone()), (80, 24));
         e.document.version = 1;            // dirty (saved_version=Some(0))
         e.last_edit_at = Some(0);
         let reg = Registry::builtins();
@@ -386,9 +393,10 @@ mod tests {
         let clk = C(crate::swap::T_IDLE_MS + 5);
         crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &ex, &clk);
         assert!(e.last_swap_at.is_some(), "an idle Tick on a dirty buffer writes a swap");
-        let sp = crate::swap::swap_path(None).unwrap();
+        let sp = crate::swap::swap_path(Some(&doc_path)).unwrap();
         assert!(sp.exists());
         let _ = std::fs::remove_file(&sp);
+        let _ = std::fs::remove_file(&doc_path);
     }
 
     #[test]
