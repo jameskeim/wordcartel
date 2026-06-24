@@ -70,6 +70,8 @@ pub struct Editor {
     pub last_edit_at: Option<u64>,
     /// Wall-clock timestamp (ms) of the last swap-write merge; set by SwapWrite merge.
     pub last_swap_at: Option<u64>,
+    /// Swap body stashed at open when recovery is needed; consumed by Task 8's resolver.
+    pub pending_swap_body: Option<String>,
 }
 
 impl Editor {
@@ -106,6 +108,7 @@ impl Editor {
             prompt: None,
             last_edit_at: None,
             last_swap_at: None,
+            pending_swap_body: None,
         }
     }
 

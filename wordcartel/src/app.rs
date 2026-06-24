@@ -170,6 +170,20 @@ pub fn run(path: Option<PathBuf>) -> std::io::Result<()> {
 
     let mut editor = editor;
 
+    // Recovery-on-open (§5.1). Read F's current bytes once for the predicate.
+    let file_bytes = editor.document.path.as_deref().and_then(|p| std::fs::read(p).ok());
+    match crate::swap::assess(editor.document.path.as_deref(), file_bytes.as_deref()) {
+        crate::swap::RecoveryDecision::OpenNormally => {}
+        crate::swap::RecoveryDecision::DiscardSilently => {
+            crate::swap::delete(editor.document.path.as_deref());
+        }
+        crate::swap::RecoveryDecision::Prompt(_h, body) => {
+            editor.pending_swap_body = Some(body);
+            editor.prompt = Some(crate::prompt::Prompt::swap_recovery());
+            editor.status = "Recovery file found".into();
+        }
+    }
+
     // Install the terminal guard: enable raw mode + enter alternate screen.
     let mut guard = term::TerminalGuard::new()?;
 

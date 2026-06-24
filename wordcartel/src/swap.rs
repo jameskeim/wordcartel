@@ -205,6 +205,33 @@ pub fn build_header(editor: &Editor, body: &str, ts_ms: u64) -> SwapHeader {
     }
 }
 
+#[derive(Debug)]
+pub enum RecoveryDecision {
+    OpenNormally,
+    DiscardSilently,
+    Prompt(SwapHeader, String),
+}
+
+/// Recovery predicate (spec §5.1): content-hash first, stat as tiebreaker.
+/// `current_file_bytes` is `Some` when the doc path exists on disk, else `None`.
+pub fn assess(doc_path: Option<&Path>, current_file_bytes: Option<&[u8]>) -> RecoveryDecision {
+    let sp = match swap_path(doc_path) { Ok(p) => p, Err(_) => return RecoveryDecision::OpenNormally };
+    let raw = match std::fs::read_to_string(&sp) { Ok(s) => s, Err(_) => return RecoveryDecision::OpenNormally };
+    let (header, body) = match parse(&raw) {
+        Some(x) => x,
+        None => return RecoveryDecision::Prompt(
+            // Unparseable swap of unknown provenance → let the user decide.
+            SwapHeader { realpath: None, load_mtime_secs: None, load_size: None,
+                content_hash: 0, version: 0, ts_ms: 0, pid: 0 },
+            String::new(),
+        ),
+    };
+    match current_file_bytes {
+        Some(bytes) if header.content_hash == fnv1a64(bytes) => RecoveryDecision::DiscardSilently,
+        _ => RecoveryDecision::Prompt(header, body), // diverged, missing F, or scratch
+    }
+}
+
 /// Dispatch a SwapWrite job: capture an O(1) snapshot + header inputs now;
 /// materialize + write on the worker; the merge records last_swap_at.
 pub fn dispatch_swap_write(ctx: &mut Ctx) {
@@ -365,6 +392,41 @@ mod tests {
             assert_eq!(mode, 0o600, "swap file must be owner-only");
         }
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn recovery_no_swap_opens_normally() {
+        // A doc path whose swap file does not exist.
+        let p = std::env::temp_dir().join(format!("wc-norec-{}.md", std::process::id()));
+        let _ = std::fs::remove_file(swap_path(Some(&p)).unwrap());
+        assert!(matches!(assess(Some(&p), Some(b"abc\n")), RecoveryDecision::OpenNormally));
+    }
+
+    #[test]
+    fn recovery_hash_equal_discards_silently() {
+        let p = std::env::temp_dir().join(format!("wc-eq-{}.md", std::process::id()));
+        let body = "same\n";
+        let h = SwapHeader { realpath: None, load_mtime_secs: None, load_size: None,
+            content_hash: fnv1a64(body.as_bytes()), version: 1, ts_ms: 1, pid: 1 };
+        write_atomic(&swap_path(Some(&p)).unwrap(), &serialize(&h, body)).unwrap();
+        // F on disk == swap body → swap adds nothing.
+        assert!(matches!(assess(Some(&p), Some(body.as_bytes())), RecoveryDecision::DiscardSilently));
+        let _ = std::fs::remove_file(swap_path(Some(&p)).unwrap());
+    }
+
+    #[test]
+    fn recovery_diverged_prompts() {
+        let p = std::env::temp_dir().join(format!("wc-div-{}.md", std::process::id()));
+        let body = "swap version\n";
+        let h = SwapHeader { realpath: None, load_mtime_secs: None, load_size: None,
+            content_hash: fnv1a64(body.as_bytes()), version: 9, ts_ms: 1, pid: 1 };
+        write_atomic(&swap_path(Some(&p)).unwrap(), &serialize(&h, body)).unwrap();
+        // F differs from swap → prompt, carrying the swap body for Recover.
+        match assess(Some(&p), Some(b"file version\n")) {
+            RecoveryDecision::Prompt(hdr, b) => { assert_eq!(hdr.version, 9); assert_eq!(b, body); }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(swap_path(Some(&p)).unwrap());
     }
 
     #[test]
