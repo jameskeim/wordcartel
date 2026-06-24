@@ -76,14 +76,18 @@ pub fn resolve_prompt(action: PromptAction, editor: &mut Editor, ex: &dyn Execut
             crate::save::overwrite_save(&mut ctx);
         }
         PromptAction::Recover => {
-            if let Some(body) = editor.active_mut().pending_swap_body.take() {
-                // Load the swap content into the buffer, mark dirty (saved_version
-                // stays None), keep the original path.
+            // Capture body + orphan path BEFORE load_recovered, which replaces the
+            // whole active Buffer and would reset pending_swap_path to None (4r moved
+            // these fields onto Buffer). Then clean up the orphan after loading.
+            let staged = {
+                let b = editor.active_mut();
+                b.pending_swap_body
+                    .take()
+                    .map(|body| (body, b.pending_swap_path.take()))
+            };
+            if let Some((body, orphan)) = staged {
                 crate::save::load_recovered(editor, &body);
-                // Delete the orphan swap so next launch doesn't re-prompt.
-                // (Recovered work is now in the live buffer and will be swapped
-                // under the new pid.)
-                if let Some(p) = editor.active_mut().pending_swap_path.take() {
+                if let Some(p) = orphan {
                     let _ = std::fs::remove_file(p);
                 }
             }
@@ -639,6 +643,26 @@ mod tests {
             merge: Box::new(|ed: &mut Editor| ed.status = "merged".into()),
         }, &mut e);
         assert_eq!(e.status, "merged");
+    }
+
+    #[test]
+    fn recover_loads_body_and_deletes_orphan_swap_file() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::prompt::PromptAction;
+        // An orphan swap file on disk + a buffer staged for recovery.
+        let p = std::env::temp_dir().join(format!("wc-recover-orphan-{}.swp", std::process::id()));
+        std::fs::write(&p, "stub").unwrap();
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        e.active_mut().pending_swap_body = Some("recovered body\n".into());
+        e.active_mut().pending_swap_path = Some(p.clone());
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        crate::app::resolve_prompt(PromptAction::Recover, &mut e, &ex, &clk);
+        assert_eq!(e.active().document.buffer.to_string(), "recovered body\n",
+            "recovered content loaded into the active buffer");
+        assert!(!p.exists(), "orphan swap file must be deleted on Recover");
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
