@@ -61,10 +61,30 @@ pub struct Editor {
     pub quit: bool,
     pub desired_col: Option<usize>, // preserved visual column for vertical motion; None until the first vertical move
     pub register: Register, // in-process clipboard register (Task 9)
-    pub pending_quit: bool, // true after first Quit with dirty buffer (double-Quit to confirm)
     // Threaded from `apply` → `derive` for the O(region) incremental reparse (Effort 3c):
     pub pre_edit_rope: Option<ropey::Rope>, // O(1) snapshot taken BEFORE the edit
     pub last_edit: Option<wordcartel_core::block_tree::Edit>, // the block_tree edit (range, new_len); None ⇒ full reparse
+    pub prompt: Option<crate::prompt::Prompt>,
+    /// Wall-clock timestamp (ms) of the last buffer edit; set by the edit path.
+    pub last_edit_at: Option<u64>,
+    /// Wall-clock timestamp (ms) of the last swap-write merge; set by SwapWrite merge.
+    pub last_swap_at: Option<u64>,
+    /// Swap body stashed at open when recovery is needed; consumed by Task 8's resolver.
+    pub pending_swap_body: Option<String>,
+    /// Actual swap file path for an orphan scratch swap (differs from swap_path(None)
+    /// which uses the current pid). Used by resolve_prompt to clean up the orphan.
+    pub pending_swap_path: Option<std::path::PathBuf>,
+    /// True while a SwapWrite job is in-flight. Prevents redundant dispatches and
+    /// prevents last_swap_at from advancing until the write result lands.
+    pub swap_in_flight: bool,
+    /// Version to quit after once its Save result lands clean (§5.3 save&quit).
+    /// Set by resolve_prompt(SaveAndQuit); cleared (via quit=true) by apply_result.
+    /// None when no save&quit is pending.
+    pub quit_after_save: Option<u64>,
+    /// Wall-clock timestamp (ms) at which quit_after_save was armed.
+    /// Used to bound the 5s wait from arm-time, not from last-edit-time.
+    /// None when no save&quit is pending.
+    pub quit_after_save_at: Option<u64>,
 }
 
 impl Editor {
@@ -95,9 +115,16 @@ impl Editor {
             quit: false,
             desired_col: None,
             register: Register::default(),
-            pending_quit: false,
             pre_edit_rope: None,
             last_edit: None,
+            prompt: None,
+            last_edit_at: None,
+            last_swap_at: None,
+            pending_swap_body: None,
+            pending_swap_path: None,
+            swap_in_flight: false,
+            quit_after_save: None,
+            quit_after_save_at: None,
         }
     }
 
@@ -122,6 +149,7 @@ impl Editor {
         self.document.version += 1;
         self.pre_edit_rope = Some(old_rope);
         self.last_edit = Some(edit);
+        crate::recovery::record_snapshot(self.document.path.as_deref(), self.document.buffer.snapshot());
     }
 
     /// Undo the last revision. Returns `true` iff the buffer changed.

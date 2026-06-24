@@ -23,25 +23,10 @@ pub fn fingerprint(path: &Path) -> Option<FileFingerprint> {
     Some(FileFingerprint { mtime: meta.modified().ok(), size: meta.len() })
 }
 
-/// Registry `"save"` handler: dispatch a background save.
-pub fn dispatch_save(ctx: &mut Ctx) -> CommandResult {
-    let path = match &ctx.editor.document.path {
-        None => {
-            ctx.editor.status = "No file name (save-as is Effort 5)".to_string();
-            return CommandResult::Handled;
-        }
-        Some(p) => p.clone(),
-    };
-
-    // External-mod check (§4.3 step 2): cheap stat; if the on-disk fingerprint
-    // diverged from what we last wrote, refuse and surface a status. (4b-2 turns
-    // this into a modal R/O/S prompt.)
-    let current_fp = fingerprint(&path);
-    if current_fp != ctx.editor.document.stored_fp {
-        ctx.editor.status =
-            "File changed on disk \u{2014} not saved (reload or overwrite — Effort 4b-2)".to_string();
-        return CommandResult::Handled;
-    }
+/// Internal: dispatch the save job (no external-mod check). Called by
+/// `dispatch_save` (after the check) and `overwrite_save` (bypassing it).
+fn do_save(ctx: &mut Ctx) {
+    let path = ctx.editor.document.path.clone().expect("do_save called without a path");
 
     // §3.9: status BEFORE dispatch. O(1) snapshot; version captured now.
     ctx.editor.status = "Saving\u{2026}".to_string();
@@ -62,13 +47,13 @@ pub fn dispatch_save(ctx: &mut Ctx) -> CommandResult {
                 merge: Box::new(move |editor| {
                     match outcome {
                         Ok(SaveOutcome::Saved) | Ok(SaveOutcome::Unchanged) => {
-                            // Record what is now on disk at version v (always).
                             editor.document.saved_version = Some(v);
                             editor.document.stored_fp = new_fp;
-                            // Only "Saved" if the buffer is now clean; otherwise the
-                            // user edited on and the buffer is still dirty (§4.3).
                             if editor.document.version == v {
                                 editor.status = "Saved".to_string();
+                                // Buffer is clean at the saved version → swap is
+                                // no longer needed. (Stale-version saves skip this.)
+                                crate::swap::delete(editor.document.path.as_deref());
                             } else {
                                 editor.status = format!("Saved v{v} (still editing)");
                             }
@@ -83,7 +68,74 @@ pub fn dispatch_save(ctx: &mut Ctx) -> CommandResult {
             }
         }),
     });
+}
+
+/// Registry `"save"` handler: external-mod check then dispatch a background save.
+pub fn dispatch_save(ctx: &mut Ctx) -> CommandResult {
+    let path = match &ctx.editor.document.path {
+        None => {
+            ctx.editor.status = "No file name (save-as is Effort 5)".to_string();
+            return CommandResult::Handled;
+        }
+        Some(p) => p.clone(),
+    };
+
+    // External-mod check (§4.3 step 2): cheap stat; if the on-disk fingerprint
+    // diverged from what we last wrote, refuse and raise the external-mod modal.
+    let current_fp = fingerprint(&path);
+    if current_fp != ctx.editor.document.stored_fp {
+        ctx.editor.prompt = Some(crate::prompt::Prompt::external_mod());
+        ctx.editor.status =
+            "File changed on disk \u{2014} choose [R]eload or [O]verwrite".to_string();
+        return CommandResult::Handled;
+    }
+
+    do_save(ctx);
     CommandResult::Handled
+}
+
+/// Save bypassing the fingerprint conflict (the [O]verwrite modal action).
+pub fn overwrite_save(ctx: &mut Ctx) {
+    if ctx.editor.document.path.is_none() {
+        ctx.editor.status = "No file name (save-as is Effort 5)".to_string();
+        return;
+    }
+    do_save(ctx); // no stat check
+}
+
+/// [R]eload: discard in-memory edits, reload F from disk. Destructive — only
+/// reachable via the external-mod modal. Sanctioned whole-document replacement
+/// (fresh Document, not `apply`): there is no incremental delta and history is reset.
+pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
+    let Some(path) = editor.document.path.clone() else { return };
+    let text = match crate::file::open(&path) {
+        Ok(t) => t,
+        Err(e) => { editor.status = e.to_string(); return; }
+    };
+    let area = editor.view.area;
+    let fresh = crate::editor::Editor::new_from_text(&text, Some(path.clone()), area); // saved_version=Some(0) → clean
+    editor.document = fresh.document; // sanctioned whole-document replacement
+    editor.view.line_layouts.clear();
+    crate::derive::rebuild(editor);
+    crate::nav::ensure_visible(editor);
+    editor.document.stored_fp = fingerprint(&path);
+    editor.status = "Reloaded".into();
+    crate::swap::delete(editor.document.path.as_deref());
+}
+
+/// Load recovered swap content into the buffer; keep the path; mark dirty.
+/// Sanctioned whole-document replacement (fresh Document, history reset).
+pub fn load_recovered(editor: &mut crate::editor::Editor, body: &str) {
+    let path = editor.document.path.clone();
+    let area = editor.view.area;
+    let fresh = crate::editor::Editor::new_from_text(body, path.clone(), area);
+    editor.document = fresh.document; // sanctioned whole-document replacement
+    editor.document.saved_version = None; // recovered work is unsaved
+    editor.view.line_layouts.clear();
+    crate::derive::rebuild(editor);
+    crate::nav::ensure_visible(editor);
+    editor.document.stored_fp = path.as_deref().and_then(fingerprint);
+    editor.status = "Recovered unsaved changes".into();
 }
 
 #[cfg(test)]
@@ -162,6 +214,107 @@ mod tests {
         assert!(e.document.saved_version.is_none());
         assert!(e.status.to_lowercase().contains("symlink"));
         let _ = std::fs::remove_file(&link); let _ = std::fs::remove_file(&real);
+    }
+
+    #[test]
+    fn save_clean_deletes_swap_but_stale_save_keeps_it() {
+        use crate::jobs::{Executor, InlineExecutor};
+        use crate::registry::Ctx;
+        let p = scratch();
+        std::fs::write(&p, "old\n").unwrap();
+
+        // Pre-create a swap for this doc.
+        let sp = crate::swap::swap_path(Some(&p)).unwrap();
+        crate::swap::write_atomic(&sp, "stub").unwrap();
+        assert!(sp.exists());
+
+        let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
+        e.document.saved_version = None;
+        e.document.version = 1;
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex }; dispatch_save(&mut ctx); }
+        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        assert!(!e.document.dirty());
+        assert!(!sp.exists(), "a save that leaves the buffer clean deletes the swap");
+
+        // Now: dispatch a save at v2, but edit on to v3 before the merge → keep swap.
+        crate::swap::write_atomic(&sp, "stub2").unwrap();
+        e.document.version = 2;
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex }; dispatch_save(&mut ctx); }
+        e.document.version = 3; // edited on
+        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        assert!(e.document.dirty());
+        assert!(sp.exists(), "a stale-version save must NOT delete the swap");
+        let _ = std::fs::remove_file(&sp); let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn dispatch_save_raises_modal_on_external_change() {
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Ctx;
+        let p = scratch();
+        std::fs::write(&p, "v0\n").unwrap();
+        let mut e = Editor::new_from_text("mine\n", Some(p.clone()), (80, 24));
+        // stored_fp captured at load == v0's fp. Now an external process rewrites F.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&p, "external change\n").unwrap();
+        e.document.version = 1; e.document.saved_version = None;
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex }; dispatch_save(&mut ctx); }
+        assert!(e.prompt.is_some(), "external change must raise the modal, not clobber");
+        assert!(ex.drain().is_empty(), "no save job dispatched on conflict");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn fingerprint_matrix_new_and_deleted_are_conflicts() {
+        // New named buffer (stored_fp = None) but a file now exists → conflict.
+        let p = scratch();
+        std::fs::write(&p, "created externally\n").unwrap();
+        let mut e = Editor::new_from_text("x\n", Some(p.clone()), (80, 24));
+        e.document.stored_fp = None;        // "did not exist at load"
+        e.document.version = 1; e.document.saved_version = None;
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = Z;
+        { let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex };
+          dispatch_save(&mut ctx); }
+        assert!(e.prompt.is_some(), "a file appearing where there was none is a conflict");
+        assert!(ex.drain().is_empty(), "no save job dispatched on new-file conflict");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn overwrite_save_bypasses_the_stat_check() {
+        use crate::jobs::{Executor, InlineExecutor};
+        use crate::registry::Ctx;
+        let p = scratch();
+        std::fs::write(&p, "v0\n").unwrap();
+        let mut e = Editor::new_from_text("mine\n", Some(p.clone()), (80, 24));
+        std::fs::write(&p, "external\n").unwrap(); // diverged
+        e.document.version = 1; e.document.saved_version = None;
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex }; overwrite_save(&mut ctx); }
+        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "mine\n", "overwrite wins");
+        assert!(!e.document.dirty());
+        assert_eq!(e.document.stored_fp, crate::save::fingerprint(&p), "overwrite refreshes stored_fp");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn reload_from_disk_resets_to_file_and_marks_clean() {
+        let p = scratch();
+        std::fs::write(&p, "on disk\n").unwrap();
+        let mut e = Editor::new_from_text("in memory edits\n", Some(p.clone()), (80, 24));
+        e.document.version = 4; e.document.saved_version = None;
+        reload_from_disk(&mut e);
+        assert_eq!(e.document.buffer.to_string(), "on disk\n");
+        assert!(!e.document.dirty(), "reloaded buffer is clean");
+        assert_eq!(e.document.stored_fp, crate::save::fingerprint(&p), "reload refreshes stored_fp");
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

@@ -126,19 +126,25 @@ pub fn render(frame: &mut Frame, editor: &Editor) {
             crate::editor::RenderMode::SourcePlain => "SOURCE",
         };
 
-        let status_text = if editor.status.is_empty() {
-            format!("{}{} [{}]", path_str, dirty_marker, mode_text)
+        // When a modal prompt is active, render its message instead of the normal
+        // status text, using a distinct style so it stands out.
+        let (status_text, status_style) = if let Some(ref prompt) = editor.prompt {
+            (
+                prompt.message.clone(),
+                RStyle::default().add_modifier(Modifier::REVERSED),
+            )
         } else {
-            format!("{}{} [{}] {}", path_str, dirty_marker, mode_text, editor.status)
+            let text = if editor.status.is_empty() {
+                format!("{}{} [{}]", path_str, dirty_marker, mode_text)
+            } else {
+                format!("{}{} [{}] {}", path_str, dirty_marker, mode_text, editor.status)
+            };
+            (text, RStyle::default().add_modifier(Modifier::REVERSED))
         };
 
         // Truncate to fit the terminal width.
         let truncated: String = status_text.chars().take(w as usize).collect();
-        let status_line = Line::from(Span::styled(
-            truncated,
-            RStyle::default()
-                .add_modifier(Modifier::REVERSED),
-        ));
+        let status_line = Line::from(Span::styled(truncated, status_style));
         let status_area = Rect::new(area.x, status_row, w, 1);
         frame.render_widget(Paragraph::new(status_line), status_area);
     }
@@ -203,6 +209,29 @@ mod tests {
             let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
             term.draw(|f| render(f, &e)).unwrap(); // must not panic at any tiny size
         }
+    }
+
+    /// When a modal prompt is active, the status row must show the prompt message.
+    #[test]
+    fn renders_active_prompt_on_status_row() {
+        let mut e = Editor::new_from_text("hello\n", None, (40, 6));
+        e.document.version = 1; // dirty so quit_confirm is realistic
+        e.prompt = Some(crate::prompt::Prompt::quit_confirm());
+        derive::rebuild(&mut e);
+        let mut term = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        term.draw(|f| render(f, &e)).unwrap();
+        let buf = term.backend().buffer();
+        // Bottom row (row 5) must show the prompt message, not the normal status.
+        let status_row: String = (0u16..40)
+            .map(|x| buf[(x, 5u16)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        // The quit_confirm message starts with "Unsaved changes: [S]ave & quit …"
+        // At terminal width 40 the truncation leaves "Unsaved changes: [S]ave & quit · [Q]uit "
+        assert!(
+            status_row.contains("Unsaved changes") || status_row.contains("[S]ave"),
+            "status row must show prompt message, got: {:?}",
+            status_row
+        );
     }
 
     #[test]

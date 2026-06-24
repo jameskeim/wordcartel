@@ -12,6 +12,7 @@ use crate::{commands, derive, editor::Editor, file, input, render, term};
 use crate::jobs::{is_stale, Executor, JobResult};
 use crate::registry::{Ctx, Registry};
 use crate::input::KeyAction;
+use crate::prompt::PromptAction;
 use wordcartel_core::history::Clock;
 
 // ---------------------------------------------------------------------------
@@ -33,7 +34,67 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
     if is_stale(r.kind, r.version, editor.document.version) {
         return; // version moved on: discard, don't rebase
     }
+    let (kind, version) = (r.kind, r.version);
     (r.merge)(editor);
+    // Save & quit: exit once the awaited save version lands clean.
+    if kind == crate::jobs::JobKind::Save
+        && editor.quit_after_save == Some(version)
+        && editor.document.saved_version == Some(version)
+    {
+        editor.quit = true;
+    }
+}
+
+/// Execute the action chosen in a modal prompt, then clear the prompt.
+pub fn resolve_prompt(action: PromptAction, editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock) {
+    match action {
+        PromptAction::Cancel => {}
+        PromptAction::QuitAnyway => { editor.quit = true; }
+        PromptAction::SaveAndQuit => {
+            let v = editor.document.version;
+            editor.prompt = None; // dismiss the quit-confirm modal first
+            { let mut ctx = Ctx { editor, clock, executor: ex }; crate::save::dispatch_save(&mut ctx); }
+            // Arm quit-after-save ONLY if a save job was actually dispatched.
+            // dispatch_save dispatches nothing when there is no path (status set)
+            // or when it raised an external-mod modal (editor.prompt now Some) —
+            // in those cases abort the quit and let the user resolve (Codex #4).
+            if editor.document.path.is_some() && editor.prompt.is_none() {
+                editor.quit_after_save = Some(v);
+                editor.quit_after_save_at = Some(clock.now_ms());
+            }
+            return; // prompt handled above; must NOT clear an external-mod modal
+        }
+        PromptAction::Reload => crate::save::reload_from_disk(editor),
+        PromptAction::Overwrite => {
+            let mut ctx = Ctx { editor, clock, executor: ex };
+            crate::save::overwrite_save(&mut ctx);
+        }
+        PromptAction::Recover => {
+            if let Some(body) = editor.pending_swap_body.take() {
+                // Load the swap content into the buffer, mark dirty (saved_version
+                // stays None), keep the original path.
+                crate::save::load_recovered(editor, &body);
+                // Delete the orphan swap so next launch doesn't re-prompt.
+                // (Recovered work is now in the live buffer and will be swapped
+                // under the new pid.)
+                if let Some(p) = editor.pending_swap_path.take() {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+        PromptAction::DiscardSwap => {
+            if let Some(p) = editor.pending_swap_path.take() {
+                let _ = std::fs::remove_file(p);
+            } else {
+                crate::swap::delete(editor.document.path.as_deref());
+            }
+        }
+        PromptAction::OpenOriginal => {
+            editor.pending_swap_body = None;
+            editor.pending_swap_path = None;
+        }
+    }
+    editor.prompt = None;
 }
 
 /// Process one message. Returns true while the app should keep running.
@@ -44,6 +105,32 @@ pub fn reduce(
     ex: &dyn Executor,
     clock: &dyn Clock,
 ) -> bool {
+    // Active modal intercepts KEY INPUT only (§5.3). Background results and ticks
+    // must still be processed — a JobDone arriving while a modal is up (e.g. an
+    // in-flight save completing during the quit-confirm prompt) must not be
+    // dropped, or save&quit would hang waiting for a result it already discarded.
+    if editor.prompt.is_some() {
+        match msg {
+            Msg::Input(Event::Key(key)) if key.kind == crossterm::event::KeyEventKind::Press => {
+                if key.code == crossterm::event::KeyCode::Esc {
+                    editor.prompt = None; // Esc cancels any prompt
+                } else if let crossterm::event::KeyCode::Char(ch) = key.code {
+                    if let Some(action) = editor.prompt.as_ref().unwrap().action_for(ch) {
+                        resolve_prompt(action, editor, ex, clock);
+                    }
+                }
+            }
+            // Merge a directly-delivered background result even under a modal.
+            Msg::JobDone(r) => apply_result(r, editor),
+            // Resize/Tick/other input: ignored for the modal, but results still drain below.
+            _ => {}
+        }
+        // Always drain ready results (merges the awaited save&quit result).
+        for r in ex.drain() { apply_result(r, editor); }
+        return !editor.quit;
+    }
+
+    let before = editor.document.version;
     match msg {
         Msg::Input(Event::Key(key)) => {
             match input::key_to_command_id(key) {
@@ -63,7 +150,20 @@ pub fn reduce(
         }
         Msg::Input(_) => {}
         Msg::JobDone(r) => apply_result(r, editor),
-        Msg::Tick => { /* swap cadence wired in Effort 4b-2 */ }
+        Msg::Tick => {
+            let now = clock.now_ms();
+            if editor.document.dirty()
+                && !editor.swap_in_flight
+                && crate::swap::due(now, editor.last_edit_at, editor.last_swap_at)
+            {
+                editor.swap_in_flight = true;
+                let mut ctx = Ctx { editor, clock, executor: ex };
+                crate::swap::dispatch_swap_write(&mut ctx);
+            }
+        }
+    }
+    if editor.document.version != before {
+        editor.last_edit_at = Some(clock.now_ms());
     }
     // Fold any other results that became ready while handling this message.
     for r in ex.drain() {
@@ -156,6 +256,31 @@ pub fn run(path: Option<PathBuf>) -> std::io::Result<()> {
 
     let mut editor = editor;
 
+    // Recovery-on-open (§5.1).
+    // Named files: use assess() with content-hash comparison.
+    // Scratch buffers: their swap is pid-keyed, so look for an orphan from a
+    // dead previous session (pre-merge blocker #1).
+    if editor.document.path.is_some() {
+        // Read F's current bytes once for the predicate.
+        let file_bytes = editor.document.path.as_deref().and_then(|p| std::fs::read(p).ok());
+        match crate::swap::assess(editor.document.path.as_deref(), file_bytes.as_deref()) {
+            crate::swap::RecoveryDecision::OpenNormally => {}
+            crate::swap::RecoveryDecision::DiscardSilently => {
+                crate::swap::delete(editor.document.path.as_deref());
+            }
+            crate::swap::RecoveryDecision::Prompt(_h, body) => {
+                editor.pending_swap_body = Some(body);
+                editor.prompt = Some(crate::prompt::Prompt::swap_recovery());
+                editor.status = "Recovery file found".into();
+            }
+        }
+    } else if let Some((sp, _header, body)) = crate::swap::find_orphan_scratch_swap() {
+        editor.pending_swap_body = Some(body);
+        editor.pending_swap_path = Some(sp);
+        editor.prompt = Some(crate::prompt::Prompt::swap_recovery());
+        editor.status = "Recovery file found".into();
+    }
+
     // Install the terminal guard: enable raw mode + enter alternate screen.
     let mut guard = term::TerminalGuard::new()?;
 
@@ -193,8 +318,38 @@ pub fn run(path: Option<PathBuf>) -> std::io::Result<()> {
     }
 
     let clock = SystemClock;
+    const SAVE_QUIT_TIMEOUT_MS: u64 = 5_000;
+
     guard.terminal().draw(|f| render::render(f, &editor))?;
-    for msg in msg_rx {
+    loop {
+        let now = clock.now_ms();
+        // Bounded save&quit: if waiting for an in-flight save to complete and
+        // 5 s have elapsed since the last edit, re-raise the quit-confirm modal.
+        if let Some(_v) = editor.quit_after_save {
+            let waited = now.saturating_sub(editor.quit_after_save_at.unwrap_or(now));
+            if waited > SAVE_QUIT_TIMEOUT_MS {
+                editor.quit_after_save = None;
+                editor.quit_after_save_at = None;
+                editor.prompt = Some(crate::prompt::Prompt::quit_confirm());
+                editor.status = "Save still running — choose again".into();
+            }
+        }
+        let swap_deadline = crate::swap::next_deadline_ms(now, editor.last_edit_at, editor.last_swap_at);
+        let sq_deadline = editor.quit_after_save_at.map(|t| t.saturating_add(SAVE_QUIT_TIMEOUT_MS));
+        let deadline = match (swap_deadline, sq_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let timeout = deadline
+            .map(|d| std::time::Duration::from_millis(d.saturating_sub(now)))
+            .unwrap_or(std::time::Duration::from_secs(3600));
+        let msg = match msg_rx.recv_timeout(timeout) {
+            Ok(m) => m,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Msg::Tick,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         let keep = reduce(msg, &mut editor, &reg, &executor, &clock);
         guard.terminal().draw(|f| render::render(f, &editor))?;
         if !keep { break; }
@@ -204,7 +359,7 @@ pub fn run(path: Option<PathBuf>) -> std::io::Result<()> {
     // the worker, which may still be completing an in-flight save_atomic on a slow
     // filesystem. Dropping the guard first guarantees the user gets their terminal
     // back immediately; we still join (don't abandon an in-flight atomic save — that
-    // is the "never lose work" behavior). A BOUNDED save&quit wait lands in Effort 4b-2.
+    // is the "never lose work" behavior). The 5 s save&quit guard above bounds the wait.
     drop(guard);
     Ok(())
 }
@@ -218,6 +373,8 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use crate::editor::Editor;
     use wordcartel_core::history::Clock;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
 
     struct TestClock(u64);
     impl Clock for TestClock {
@@ -234,33 +391,33 @@ mod tests {
         }
     }
 
-    /// Build a KeyEvent for Ctrl+<char> (Press).
-    fn key_ctrl(c: char) -> KeyEvent {
-        KeyEvent {
-            code: KeyCode::Char(c),
-            modifiers: KeyModifiers::CONTROL,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        }
-    }
-
     // -------------------------------------------------------------------------
     // Brief's required failing test (Task 12 step 1)
     // -------------------------------------------------------------------------
 
-    /// Feed "hi" then double Ctrl+Q; confirm the buffer holds "hi\n" and quit.
+    /// Feed "hi" then Ctrl+Q (modal) then 'q' (QuitAnyway); confirm the buffer holds "hi\n" and quit.
     #[test]
     fn step_processes_typing_and_quit() {
+        use crate::registry::Registry;
+        use crate::jobs::InlineExecutor;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         let mut e = Editor::new_from_text("\n", None, (80, 24));
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
         let clk = TestClock(0);
         for c in "hi".chars() {
             crate::app::step(&mut e, key_char(c), &clk);
         }
-        // First Ctrl+Q: dirty → pending confirm, NOT quit yet
-        crate::app::step(&mut e, key_ctrl('q'), &clk);
+        // First Ctrl+Q: dirty → modal up, NOT quit yet
+        let ctrl_q = Event::Key(KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(crate::app::Msg::Input(ctrl_q), &mut e, &reg, &ex, &clk);
+        assert!(e.prompt.is_some(), "dirty quit must raise modal");
         assert!(!e.quit);
-        // Second Ctrl+Q: force quit
-        crate::app::step(&mut e, key_ctrl('q'), &clk);
+        // Press 'q' → routed to QuitAnyway via the modal.
+        let q = Event::Key(KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(crate::app::Msg::Input(q), &mut e, &reg, &ex, &clk);
         assert!(e.quit);
         assert_eq!(e.document.buffer.to_string(), "hi\n");
     }
@@ -346,6 +503,91 @@ mod tests {
             assert!(crate::app::reduce(crate::app::Msg::Input(ev), &mut e, &reg, &ex, &clk));
         }
         assert_eq!(e.document.buffer.to_string(), "hi\n");
+    }
+
+    #[test]
+    fn tick_writes_swap_when_idle_elapsed_and_dirty() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        let doc_path = std::env::temp_dir().join(format!(
+            "wc-tick-swap-{}-{}.md",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        let mut e = Editor::new_from_text("\n", Some(doc_path.clone()), (80, 24));
+        e.document.version = 1;            // dirty (saved_version=Some(0))
+        e.last_edit_at = Some(0);
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
+        // Clock past the idle threshold.
+        struct C(u64); impl wordcartel_core::history::Clock for C { fn now_ms(&self) -> u64 { self.0 } }
+        let clk = C(crate::swap::T_IDLE_MS + 5);
+        crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &ex, &clk);
+        assert!(e.last_swap_at.is_some(), "an idle Tick on a dirty buffer writes a swap");
+        let sp = crate::swap::swap_path(Some(&doc_path)).unwrap();
+        assert!(sp.exists());
+        let _ = std::fs::remove_file(&sp);
+        let _ = std::fs::remove_file(&doc_path);
+    }
+
+    #[test]
+    fn quit_with_unsaved_raises_modal_then_quit_anyway_exits() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.document.version = 1; // dirty
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let ctrl_q = Event::Key(KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        // First Ctrl+Q → modal up, not quit.
+        crate::app::reduce(crate::app::Msg::Input(ctrl_q.clone()), &mut e, &reg, &ex, &clk);
+        assert!(e.prompt.is_some() && !e.quit);
+        // Press 'q' → routed to QuitAnyway.
+        let q = Event::Key(KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(crate::app::Msg::Input(q), &mut e, &reg, &ex, &clk);
+        assert!(e.quit, "Quit anyway exits");
+        assert!(e.prompt.is_none(), "prompt cleared");
+    }
+
+    #[test]
+    fn save_and_quit_sets_quit_after_save_and_exits_on_matching_result() {
+        use crate::editor::Editor;
+        use crate::jobs::{Executor, InlineExecutor};
+        use crate::prompt::PromptAction;
+        let p = std::env::temp_dir().join(format!("wc-savequit-{}.md", std::process::id()));
+        std::fs::write(&p, "old\n").unwrap();
+        let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
+        e.document.saved_version = None; e.document.version = 1;
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        crate::app::resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk);
+        assert_eq!(e.quit_after_save, Some(1));
+        assert!(!e.quit, "not yet — waiting for the save result");
+        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        assert!(e.quit, "matching save result triggers quit");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn save_and_quit_on_unnamed_buffer_does_not_arm_quit_after_save() {
+        // No path → dispatch_save dispatches NO job. quit_after_save must stay None,
+        // or the app would wait forever for a result that never comes (Codex #4).
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::prompt::PromptAction;
+        let mut e = Editor::new_from_text("scratch\n", None, (80, 24));
+        e.document.version = 1;
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        crate::app::resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk);
+        assert_eq!(e.quit_after_save, None, "no job dispatched → do not arm quit-after-save");
+        assert!(!e.quit);
     }
 
     #[test]
