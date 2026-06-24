@@ -7,7 +7,68 @@ use crossterm::event::{Event, KeyEvent};
 use std::path::PathBuf;
 
 use crate::{commands, derive, editor::Editor, file, input, render, term};
+use crate::jobs::{is_stale, Executor, JobResult};
+use crate::registry::{Ctx, Registry};
+use crate::input::KeyAction;
 use wordcartel_core::history::Clock;
+
+// ---------------------------------------------------------------------------
+// step — pure, testable; no terminal IO
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Msg, apply_result, reduce — unified message type and reducer
+// ---------------------------------------------------------------------------
+
+pub enum Msg {
+    Input(Event),
+    JobDone(JobResult),
+    Tick,
+}
+
+/// Merge a finished job's effect on the foreground, honoring staleness (§10.3).
+pub fn apply_result(r: JobResult, editor: &mut Editor) {
+    if is_stale(r.kind, r.version, editor.document.version) {
+        return; // version moved on: discard, don't rebase
+    }
+    (r.merge)(editor);
+}
+
+/// Process one message. Returns true while the app should keep running.
+pub fn reduce(
+    msg: Msg,
+    editor: &mut Editor,
+    reg: &Registry,
+    ex: &dyn Executor,
+    clock: &dyn Clock,
+) -> bool {
+    match msg {
+        Msg::Input(Event::Key(key)) => {
+            match input::key_to_command_id(key) {
+                Some(KeyAction::Id(id)) => {
+                    let mut ctx = Ctx { editor, clock, executor: ex };
+                    reg.dispatch(id, &mut ctx);
+                }
+                Some(KeyAction::Insert(c)) => {
+                    commands::run(commands::Command::InsertChar(c), editor, clock);
+                }
+                None => {}
+            }
+        }
+        Msg::Input(Event::Resize(w, h)) => {
+            editor.view.area = (w, h);
+            derive::rebuild(editor);
+        }
+        Msg::Input(_) => {}
+        Msg::JobDone(r) => apply_result(r, editor),
+        Msg::Tick => { /* swap cadence wired in Effort 4b-2 */ }
+    }
+    // Fold any other results that became ready while handling this message.
+    for r in ex.drain() {
+        apply_result(r, editor);
+    }
+    !editor.quit
+}
 
 // ---------------------------------------------------------------------------
 // step — pure, testable; no terminal IO
@@ -95,34 +156,42 @@ pub fn run(path: Option<PathBuf>) -> std::io::Result<()> {
     // Initial derive so the first draw has up-to-date layouts.
     derive::rebuild(&mut editor);
 
-    let clock = SystemClock;
+    let reg = Registry::builtins();
+    let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Msg>();
+    let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
+    let executor = crate::jobs::ThreadExecutor::new(wake_tx);
 
-    loop {
-        // Draw
-        guard.terminal().draw(|f| render::render(f, &editor))?;
+    // Worker → loop wake relay: each result nudges the loop to drain. reduce()'s
+    // trailing ex.drain() does the actual merge, so Msg::Tick is the nudge.
+    {
+        let msg_tx = msg_tx.clone();
+        std::thread::spawn(move || {
+            while wake_rx.recv().is_ok() {
+                if msg_tx.send(Msg::Tick).is_err() { break; }
+            }
+        });
+    }
 
-        // Blocking read — synchronous 4a; no worker thread.
-        let ev = crossterm::event::read()?;
-
-        match ev {
-            Event::Key(key) => {
-                let keep_running = step(&mut editor, key, &clock);
-                if !keep_running {
-                    break;
+    // Input thread: blocks on read(); forwards every event. Detached — dies with
+    // the process on quit (read() can't be interrupted portably).
+    {
+        let msg_tx = msg_tx.clone();
+        std::thread::Builder::new()
+            .name("wcartel-input".into())
+            .spawn(move || {
+                while let Ok(ev) = crossterm::event::read() {
+                    if msg_tx.send(Msg::Input(ev)).is_err() { break; }
                 }
-                // NOTE: do NOT rebuild here. `commands::run` (called by `step`)
-                // already runs `derive::rebuild` for every layout-affecting
-                // command — that rebuild uses the O(1) pre-edit snapshot + Edit
-                // for an O(region) incremental reparse (§3.9). A second rebuild
-                // here would fire with `pre_edit_rope`/`last_edit` already taken,
-                // forcing a full O(document) reparse on every keystroke.
-            }
-            Event::Resize(w, h) => {
-                editor.view.area = (w, h);
-                derive::rebuild(&mut editor);
-            }
-            _ => {}
-        }
+            })
+            .expect("spawn input thread");
+    }
+
+    let clock = SystemClock;
+    guard.terminal().draw(|f| render::render(f, &editor))?;
+    for msg in msg_rx {
+        let keep = reduce(msg, &mut editor, &reg, &executor, &clock);
+        guard.terminal().draw(|f| render::render(f, &editor))?;
+        if !keep { break; }
     }
 
     // Terminal restored by TerminalGuard::drop.
@@ -248,5 +317,39 @@ mod tests {
             state: KeyEventState::NONE,
         };
         assert!(crate::input::key_to_command(k).is_none());
+    }
+
+    #[test]
+    fn reduce_handles_typing_via_registry() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        for c in "hi".chars() {
+            let ev = Event::Key(KeyEvent { code: KeyCode::Char(c), modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press, state: KeyEventState::NONE });
+            assert!(crate::app::reduce(crate::app::Msg::Input(ev), &mut e, &reg, &ex, &clk));
+        }
+        assert_eq!(e.document.buffer.to_string(), "hi\n");
+    }
+
+    #[test]
+    fn apply_result_merges_fresh_and_drops_stale() {
+        use crate::editor::Editor;
+        use crate::jobs::{JobResult, JobKind};
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        e.document.version = 5;
+        // Fresh one-shot (Save is never stale): merges.
+        crate::app::apply_result(JobResult { version: 3, kind: JobKind::Save,
+            merge: Box::new(|ed: &mut Editor| ed.status = "saved".into()) }, &mut e);
+        assert_eq!(e.status, "saved");
+        // Stale coalescible: dropped.
+        crate::app::apply_result(JobResult { version: 3, kind: JobKind::CoalesceProbe,
+            merge: Box::new(|ed: &mut Editor| ed.status = "STALE".into()) }, &mut e);
+        assert_eq!(e.status, "saved", "stale coalescible result must be dropped");
     }
 }
