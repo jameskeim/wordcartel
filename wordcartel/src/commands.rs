@@ -104,25 +104,25 @@ fn replace_changeset(
 pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     match cmd {
         Command::InsertChar(c) => {
-            let sel = editor.document.selection.primary();
+            let sel = editor.active().document.selection.primary();
             if !sel.is_empty() {
                 // Non-empty selection: replace it with the typed character (CUA).
                 let (from, to) = (sel.from(), sel.to());
                 let text = c.to_string();
-                let doc_len = editor.document.buffer.len();
+                let doc_len = editor.active().document.buffer.len();
                 let cs = replace_changeset(from, to, &text, doc_len);
                 let edit = Edit { range: from..to, new_len: text.len() };
                 let txn = Transaction::new(cs).with_selection(Selection::single(from + text.len()));
                 editor.apply(txn, edit, EditKind::Other, clock);
                 derive::rebuild(editor);
                 nav::ensure_visible(editor);
-                editor.desired_col = None;
+                editor.active_mut().desired_col = None;
                 return CommandResult::Handled;
             }
             // Collapsed selection: normal insert-at-caret path.
             let at = nav::head(editor);
             let s = c.to_string();
-            let doc_len = editor.document.buffer.len();
+            let doc_len = editor.active().document.buffer.len();
             let cs = ChangeSet::insert(at, &s, doc_len);
             let new_len = s.len(); // == c.len_utf8()
             let edit = Edit { range: at..at, new_len };
@@ -130,30 +130,30 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             editor.apply(txn, edit, EditKind::Type, clock);
             derive::rebuild(editor);
             nav::ensure_visible(editor);
-            editor.desired_col = None;
+            editor.active_mut().desired_col = None;
             CommandResult::Handled
         }
 
         Command::InsertNewline => {
-            let sel = editor.document.selection.primary();
+            let sel = editor.active().document.selection.primary();
             if !sel.is_empty() {
                 // Non-empty selection: replace it with a newline (CUA).
                 let (from, to) = (sel.from(), sel.to());
                 let text = "\n";
-                let doc_len = editor.document.buffer.len();
+                let doc_len = editor.active().document.buffer.len();
                 let cs = replace_changeset(from, to, text, doc_len);
                 let edit = Edit { range: from..to, new_len: text.len() };
                 let txn = Transaction::new(cs).with_selection(Selection::single(from + text.len()));
                 editor.apply(txn, edit, EditKind::Other, clock);
                 derive::rebuild(editor);
                 nav::ensure_visible(editor);
-                editor.desired_col = None;
+                editor.active_mut().desired_col = None;
                 return CommandResult::Handled;
             }
             // Collapsed selection: normal insert-newline path.
             let at = nav::head(editor);
             let s = "\n";
-            let doc_len = editor.document.buffer.len();
+            let doc_len = editor.active().document.buffer.len();
             let cs = ChangeSet::insert(at, s, doc_len);
             let new_len: usize = 1;
             let edit = Edit { range: at..at, new_len };
@@ -163,23 +163,23 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             editor.apply(txn, edit, EditKind::Other, clock);
             derive::rebuild(editor);
             nav::ensure_visible(editor);
-            editor.desired_col = None;
+            editor.active_mut().desired_col = None;
             CommandResult::Handled
         }
 
         Command::Backspace => {
-            let sel = editor.document.selection.primary();
+            let sel = editor.active().document.selection.primary();
             if !sel.is_empty() {
                 // Non-empty selection: delete the selection range (like Cut, minus clipboard).
                 let (from, to) = (sel.from(), sel.to());
-                let doc_len = editor.document.buffer.len();
+                let doc_len = editor.active().document.buffer.len();
                 let cs = ChangeSet::delete(from..to, doc_len);
                 let edit = Edit { range: from..to, new_len: 0 };
                 let txn = Transaction::new(cs).with_selection(Selection::single(from));
                 editor.apply(txn, edit, EditKind::Other, clock);
                 derive::rebuild(editor);
                 nav::ensure_visible(editor);
-                editor.desired_col = None;
+                editor.active_mut().desired_col = None;
                 return CommandResult::Handled;
             }
             // Collapsed selection: delete one grapheme left of the caret.
@@ -192,30 +192,30 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             // the selection; it purely returns the new offset. We capture `prev`
             // here and then use it for the delete range. `head` is unchanged.
             let prev = nav::move_left(editor);
-            let doc_len = editor.document.buffer.len();
+            let doc_len = editor.active().document.buffer.len();
             let cs = ChangeSet::delete(prev..head, doc_len);
             let edit = Edit { range: prev..head, new_len: 0 };
             let txn = Transaction::new(cs).with_selection(Selection::single(prev));
             editor.apply(txn, edit, EditKind::Other, clock);
             derive::rebuild(editor);
             nav::ensure_visible(editor);
-            editor.desired_col = None;
+            editor.active_mut().desired_col = None;
             CommandResult::Handled
         }
 
         Command::DeleteForward => {
-            let sel = editor.document.selection.primary();
+            let sel = editor.active().document.selection.primary();
             if !sel.is_empty() {
                 // Non-empty selection: delete the selection range (CUA, mirrors Backspace).
                 let (from, to) = (sel.from(), sel.to());
-                let doc_len = editor.document.buffer.len();
+                let doc_len = editor.active().document.buffer.len();
                 let cs = ChangeSet::delete(from..to, doc_len);
                 let edit = Edit { range: from..to, new_len: 0 };
                 let txn = Transaction::new(cs).with_selection(Selection::single(from));
                 editor.apply(txn, edit, EditKind::Other, clock);
                 derive::rebuild(editor);
                 nav::ensure_visible(editor);
-                editor.desired_col = None;
+                editor.active_mut().desired_col = None;
                 return CommandResult::Handled;
             }
             // Collapsed selection: delete one grapheme forward.
@@ -230,7 +230,7 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             if next == head {
                 return CommandResult::Noop;
             }
-            let doc_len = editor.document.buffer.len();
+            let doc_len = editor.active().document.buffer.len();
             let cs = ChangeSet::delete(head..next, doc_len);
             let edit = Edit { range: head..next, new_len: 0 };
             // Caret stays at `head` after a forward delete.
@@ -238,7 +238,7 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             editor.apply(txn, edit, EditKind::Other, clock);
             derive::rebuild(editor);
             nav::ensure_visible(editor);
-            editor.desired_col = None;
+            editor.active_mut().desired_col = None;
             CommandResult::Handled
         }
 
@@ -257,14 +257,14 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
 
             if extend {
                 // Keep the current anchor; move the head to `new_head`.
-                let anchor = editor.document.selection.primary().anchor;
-                editor.document.selection = Selection {
+                let anchor = editor.active().document.selection.primary().anchor;
+                editor.active_mut().document.selection = Selection {
                     ranges: [Range { anchor, head: new_head }].into_iter().collect(),
                     primary: 0,
                 };
             } else {
                 // Collapse to a point at the new head.
-                editor.document.selection = Selection::single(new_head);
+                editor.active_mut().document.selection = Selection::single(new_head);
             }
 
             derive::rebuild(editor);
@@ -273,39 +273,45 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         }
 
         Command::Copy => {
-            let r = editor.document.selection.primary();
+            let r = editor.active().document.selection.primary();
             if r.is_empty() {
                 // Copy-on-empty must NOT overwrite the register with "".
                 return CommandResult::Noop;
             }
-            register::copy(&editor.document.buffer, r, &mut editor.register);
+            // Clone the buffer before mutably borrowing editor.register (field-split no longer
+            // applies now that the buffer lives under editor.active() rather than directly on Editor).
+            let buf_snap = editor.active().document.buffer.clone();
+            register::copy(&buf_snap, r, &mut editor.register);
             editor.status = "Copied".to_string();
             CommandResult::Handled
         }
 
         Command::Cut => {
-            let r = editor.document.selection.primary();
+            let r = editor.active().document.selection.primary();
             if r.is_empty() {
                 return CommandResult::Noop;
             }
-            let doc_len = editor.document.buffer.len();
-            let cs = register::cut(r, doc_len, &mut editor.register, &editor.document.buffer);
+            let doc_len = editor.active().document.buffer.len();
+            // Borrow the buffer before mutably borrowing editor.register (field-split no longer
+            // applies now that both live under editor.active() rather than directly on Editor).
+            let buf_snap = editor.active().document.buffer.clone();
+            let cs = register::cut(r, doc_len, &mut editor.register, &buf_snap);
             let edit = Edit { range: r.from()..r.to(), new_len: 0 };
             let txn = Transaction::new(cs).with_selection(Selection::single(r.from()));
             editor.apply(txn, edit, EditKind::Other, clock);
             derive::rebuild(editor);
             nav::ensure_visible(editor);
-            editor.desired_col = None;
+            editor.active_mut().desired_col = None;
             CommandResult::Handled
         }
 
         Command::Paste => {
-            let sel = editor.document.selection.primary();
+            let sel = editor.active().document.selection.primary();
             if !sel.is_empty() {
                 // Non-empty selection: replace it with the register contents (CUA).
                 if let Some(text) = editor.register.get().map(str::to_owned) {
                     let (from, to) = (sel.from(), sel.to());
-                    let doc_len = editor.document.buffer.len();
+                    let doc_len = editor.active().document.buffer.len();
                     let cs = replace_changeset(from, to, &text, doc_len);
                     let edit = Edit { range: from..to, new_len: text.len() };
                     let txn =
@@ -313,7 +319,7 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                     editor.apply(txn, edit, EditKind::Other, clock);
                     derive::rebuild(editor);
                     nav::ensure_visible(editor);
-                    editor.desired_col = None;
+                    editor.active_mut().desired_col = None;
                     return CommandResult::Handled;
                 }
                 // Register is empty → fall through to Noop below.
@@ -321,7 +327,7 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             }
             // Collapsed selection: normal paste-at-caret path.
             let at = nav::head(editor);
-            let doc_len = editor.document.buffer.len();
+            let doc_len = editor.active().document.buffer.len();
             if let Some(cs) = register::paste(at, doc_len, &editor.register) {
                 let n = editor.register.get().map(str::len).unwrap_or(0);
                 let edit = Edit { range: at..at, new_len: n };
@@ -329,7 +335,7 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                 editor.apply(txn, edit, EditKind::Other, clock);
                 derive::rebuild(editor);
                 nav::ensure_visible(editor);
-                editor.desired_col = None;
+                editor.active_mut().desired_col = None;
                 CommandResult::Handled
             } else {
                 CommandResult::Noop
@@ -342,7 +348,7 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             }
             derive::rebuild(editor);
             nav::ensure_visible(editor);
-            editor.desired_col = None;
+            editor.active_mut().desired_col = None;
             CommandResult::Handled
         }
 
@@ -352,12 +358,12 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             }
             derive::rebuild(editor);
             nav::ensure_visible(editor);
-            editor.desired_col = None;
+            editor.active_mut().desired_col = None;
             CommandResult::Handled
         }
 
         Command::CycleRenderMode => {
-            editor.view.mode = match editor.view.mode {
+            editor.active_mut().view.mode = match editor.active().view.mode {
                 RenderMode::LivePreview      => RenderMode::SourceHighlighted,
                 RenderMode::SourceHighlighted => RenderMode::SourcePlain,
                 RenderMode::SourcePlain      => RenderMode::LivePreview,
@@ -373,22 +379,23 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         // legacy `commands::run(Command::Save, …)` test path and must NOT be
         // wired to a key for production dispatch — it lacks the fingerprint guard.
         Command::Save => {
-            match &editor.document.path {
+            // Snapshot the path and version before any mutable borrows.
+            let path_opt = editor.active().document.path.clone();
+            match path_opt {
                 None => {
                     editor.status = "No file name (save-as is Effort 5)".to_string();
                 }
-                Some(p) => {
-                    let path = p.clone();
-                    let v = editor.document.version;
+                Some(path) => {
+                    let v = editor.active().document.version;
                     editor.status = "Saving\u{2026}".to_string();
-                    let content = editor.document.buffer.to_string();
+                    let content = editor.active().document.buffer.to_string();
                     match file::save_atomic(&path, &content) {
                         Ok(file::SaveOutcome::Saved) => {
-                            editor.document.mark_saved(v);
+                            editor.active_mut().document.mark_saved(v);
                             editor.status = "Saved".to_string();
                         }
                         Ok(file::SaveOutcome::Unchanged) => {
-                            editor.document.mark_saved(v);
+                            editor.active_mut().document.mark_saved(v);
                             editor.status = "(unchanged)".to_string();
                         }
                         Err(e) => {
@@ -402,7 +409,7 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         }
 
         Command::Quit => {
-            if editor.document.dirty() {
+            if editor.active().document.dirty() {
                 editor.prompt = Some(crate::prompt::Prompt::quit_confirm());
                 CommandResult::Handled
             } else {
@@ -437,7 +444,7 @@ mod tests {
 
     /// Set the caret to a raw byte offset without touching history.
     fn set_caret(e: &mut Editor, off: usize) {
-        e.document.selection = Selection::single(off);
+        e.active_mut().document.selection = Selection::single(off);
     }
 
     /// Set the caret to the end of the current buffer content.
@@ -447,7 +454,7 @@ mod tests {
         // but for simplicity just move right until we can't anymore.
         // Actually: nav::head gives the current head. We want the last char before EOF.
         // Use the buffer length directly — head of last grapheme position.
-        let len = e.document.buffer.len();
+        let len = e.active().document.buffer.len();
         // Find the last grapheme stop before `len`. move_right from any position
         // will stop at EOF. Easier: set caret to `len` and then move_left once to
         // get before the trailing newline. But the brief test types "hi" at end-of-line
@@ -461,15 +468,15 @@ mod tests {
         // So we just need to keep calling move_right until it returns the same offset.
         let mut cur = end;
         loop {
-            e.document.selection = Selection::single(cur);
+            e.active_mut().document.selection = Selection::single(cur);
             let nxt = nav::move_right(e);
             if nxt == cur {
                 break;
             }
             cur = nxt;
         }
-        e.document.selection = Selection::single(cur);
-        e.desired_col = None;
+        e.active_mut().document.selection = Selection::single(cur);
+        e.active_mut().desired_col = None;
         let _ = len;
     }
 
@@ -484,7 +491,7 @@ mod tests {
         set_caret(&mut e, 1);
         let clk = TestClock(0);
         run(Command::InsertChar('b'), &mut e, &clk);
-        assert_eq!(e.document.buffer.to_string(), "abc\n");
+        assert_eq!(e.active().document.buffer.to_string(), "abc\n");
         assert_eq!(nav::head(&e), 2);
     }
 
@@ -495,7 +502,7 @@ mod tests {
         set_caret(&mut e, 2);
         let clk = TestClock(0);
         run(Command::Backspace, &mut e, &clk);
-        assert_eq!(e.document.buffer.to_string(), "ac\n");
+        assert_eq!(e.active().document.buffer.to_string(), "ac\n");
         assert_eq!(nav::head(&e), 1);
     }
 
@@ -511,7 +518,7 @@ mod tests {
             run(Command::InsertChar(c), &mut e, &clk);
         }
         e.undo();
-        assert_eq!(e.document.buffer.to_string(), "\n"); // both chars undone together
+        assert_eq!(e.active().document.buffer.to_string(), "\n"); // both chars undone together
     }
 
     // -------------------------------------------------------------------------
@@ -532,8 +539,8 @@ mod tests {
         let clk = TestClock(0);
         let result = run(Command::DeleteForward, &mut e, &clk);
         assert_eq!(result, CommandResult::Noop);
-        assert_eq!(e.document.buffer.to_string(), "ab\n");
-        assert!(!e.document.dirty(), "DeleteForward at EOF must not dirty the buffer");
+        assert_eq!(e.active().document.buffer.to_string(), "ab\n");
+        assert!(!e.active().document.dirty(), "DeleteForward at EOF must not dirty the buffer");
     }
 
     // -------------------------------------------------------------------------
@@ -548,8 +555,8 @@ mod tests {
         let clk = TestClock(0);
         let result = run(Command::Backspace, &mut e, &clk);
         assert_eq!(result, CommandResult::Noop);
-        assert_eq!(e.document.buffer.to_string(), "abc\n");
-        assert!(!e.document.dirty());
+        assert_eq!(e.active().document.buffer.to_string(), "abc\n");
+        assert!(!e.active().document.dirty());
     }
 
     /// DeleteForward in the middle of a line removes the next character.
@@ -561,7 +568,7 @@ mod tests {
         let clk = TestClock(0);
         let result = run(Command::DeleteForward, &mut e, &clk);
         assert_eq!(result, CommandResult::Handled);
-        assert_eq!(e.document.buffer.to_string(), "ac\n");
+        assert_eq!(e.active().document.buffer.to_string(), "ac\n");
         assert_eq!(nav::head(&e), 1); // caret stays at 1
     }
 
@@ -573,7 +580,7 @@ mod tests {
         let clk = TestClock(0);
         let result = run(Command::InsertNewline, &mut e, &clk);
         assert_eq!(result, CommandResult::Handled);
-        assert_eq!(e.document.buffer.to_string(), "a\nb\n");
+        assert_eq!(e.active().document.buffer.to_string(), "a\nb\n");
         assert_eq!(nav::head(&e), 2); // caret after the newline
     }
 
@@ -585,7 +592,7 @@ mod tests {
         set_caret(&mut e, 1);
         let clk = TestClock(0);
         run(Command::InsertChar('é'), &mut e, &clk); // 'é' is 2 bytes
-        assert_eq!(e.document.buffer.to_string(), "aé\n");
+        assert_eq!(e.active().document.buffer.to_string(), "aé\n");
         // After apply+rebuild, last_edit is None (rebuild consumed it).
         // Verify the result: caret should be at 1 + 2 = 3.
         assert_eq!(nav::head(&e), 3);
@@ -610,7 +617,7 @@ mod tests {
         run(Command::Move { dir: Dir::Right, extend: true }, &mut e, &clk);
 
         // The selection should be non-collapsed: anchor=0, head=2
-        let sel = e.document.selection.primary();
+        let sel = e.active().document.selection.primary();
         assert_eq!(sel.anchor, 0, "anchor must stay at 0");
         assert_eq!(sel.head, 2, "head must be at 2");
         assert!(!sel.is_empty(), "selection must be non-empty");
@@ -634,7 +641,7 @@ mod tests {
 
         // Cut: removes "ab", buffer becomes "cd\n"
         run(Command::Cut, &mut e, &clk);
-        assert_eq!(e.document.buffer.to_string(), "cd\n", "Cut must remove the selected text");
+        assert_eq!(e.active().document.buffer.to_string(), "cd\n", "Cut must remove the selected text");
         assert_eq!(nav::head(&e), 0, "caret must be at selection start after Cut");
         assert_eq!(e.register.get(), Some("ab"), "register must contain the cut text");
     }
@@ -659,10 +666,10 @@ mod tests {
 
         // Now move head to offset 4 (before '\n') and paste
         set_caret(&mut e2, 4);
-        e2.document.selection = wordcartel_core::selection::Selection::single(4);
+        e2.active_mut().document.selection = wordcartel_core::selection::Selection::single(4);
         run(Command::Paste, &mut e2, &clk);
         // "abcd\n" with "ab" pasted at offset 4 → "abcdab\n"
-        assert_eq!(e2.document.buffer.to_string(), "abcdab\n", "Paste must insert register text at caret");
+        assert_eq!(e2.active().document.buffer.to_string(), "abcdab\n", "Paste must insert register text at caret");
         assert_eq!(nav::head(&e2), 6, "caret must be after the pasted text");
     }
 
@@ -677,11 +684,11 @@ mod tests {
         // Extend selection first
         run(Command::Move { dir: Dir::Right, extend: true }, &mut e, &clk);
         run(Command::Move { dir: Dir::Right, extend: true }, &mut e, &clk);
-        assert!(!e.document.selection.primary().is_empty());
+        assert!(!e.active().document.selection.primary().is_empty());
 
         // Move without extend collapses to point at new head
         run(Command::Move { dir: Dir::Right, extend: false }, &mut e, &clk);
-        let sel = e.document.selection.primary();
+        let sel = e.active().document.selection.primary();
         assert!(sel.is_empty(), "selection must be collapsed after Move with extend=false");
         assert_eq!(sel.head, 3, "head must be at 3 after moving right from 2");
     }
@@ -696,7 +703,7 @@ mod tests {
     fn backspace_deletes_active_selection() {
         let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
         // Set a non-collapsed selection: anchor=1, head=3 (selects "bc")
-        e.document.selection = Selection {
+        e.active_mut().document.selection = Selection {
             ranges: [wordcartel_core::selection::Range { anchor: 1, head: 3 }]
                 .into_iter()
                 .collect(),
@@ -706,7 +713,7 @@ mod tests {
         let clk = TestClock(0);
         let result = run(Command::Backspace, &mut e, &clk);
         assert_eq!(result, CommandResult::Handled);
-        assert_eq!(e.document.buffer.to_string(), "ad\n", "Backspace must delete the selection");
+        assert_eq!(e.active().document.buffer.to_string(), "ad\n", "Backspace must delete the selection");
         assert_eq!(nav::head(&e), 1, "caret must be at selection.from() after Backspace");
     }
 
@@ -716,12 +723,12 @@ mod tests {
     fn backspace_collapsed_still_deletes_one_char() {
         let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
         // Collapsed selection at offset 2 (between 'b' and 'c')
-        e.document.selection = Selection::single(2);
+        e.active_mut().document.selection = Selection::single(2);
         derive::rebuild(&mut e);
         let clk = TestClock(0);
         let result = run(Command::Backspace, &mut e, &clk);
         assert_eq!(result, CommandResult::Handled);
-        assert_eq!(e.document.buffer.to_string(), "acd\n", "plain Backspace must delete prev char");
+        assert_eq!(e.active().document.buffer.to_string(), "acd\n", "plain Backspace must delete prev char");
         assert_eq!(nav::head(&e), 1, "caret must be one step left after plain Backspace");
     }
 
@@ -734,7 +741,7 @@ mod tests {
         let clk = TestClock(0);
         let result = run(Command::Cut, &mut e, &clk);
         assert_eq!(result, CommandResult::Noop);
-        assert_eq!(e.document.buffer.to_string(), "abcd\n");
+        assert_eq!(e.active().document.buffer.to_string(), "abcd\n");
     }
 
     /// Paste on an empty register is a Noop.
@@ -746,7 +753,7 @@ mod tests {
         let clk = TestClock(0);
         let result = run(Command::Paste, &mut e, &clk);
         assert_eq!(result, CommandResult::Noop);
-        assert_eq!(e.document.buffer.to_string(), "abcd\n");
+        assert_eq!(e.active().document.buffer.to_string(), "abcd\n");
     }
 
     // -------------------------------------------------------------------------
@@ -763,12 +770,12 @@ mod tests {
         // Type 'X' at offset 5 (end of "hello") → "helloX\n"
         set_caret(&mut e, 5);
         run(Command::InsertChar('X'), &mut e, &clk);
-        assert_eq!(e.document.buffer.to_string(), "helloX\n");
+        assert_eq!(e.active().document.buffer.to_string(), "helloX\n");
 
         // Undo → "hello\n"
         let result = run(Command::Undo, &mut e, &clk);
         assert_eq!(result, CommandResult::Handled);
-        assert_eq!(e.document.buffer.to_string(), "hello\n");
+        assert_eq!(e.active().document.buffer.to_string(), "hello\n");
     }
 
     /// Command::Redo reapplies the change after an undo.
@@ -780,15 +787,15 @@ mod tests {
 
         set_caret(&mut e, 5);
         run(Command::InsertChar('X'), &mut e, &clk);
-        assert_eq!(e.document.buffer.to_string(), "helloX\n");
+        assert_eq!(e.active().document.buffer.to_string(), "helloX\n");
 
         run(Command::Undo, &mut e, &clk);
-        assert_eq!(e.document.buffer.to_string(), "hello\n");
+        assert_eq!(e.active().document.buffer.to_string(), "hello\n");
 
         // Redo → "helloX\n"
         let result = run(Command::Redo, &mut e, &clk);
         assert_eq!(result, CommandResult::Handled);
-        assert_eq!(e.document.buffer.to_string(), "helloX\n");
+        assert_eq!(e.active().document.buffer.to_string(), "helloX\n");
     }
 
     /// Undo/Redo via commands round-trips: type something, Undo restores, Redo reapplies.
@@ -803,23 +810,23 @@ mod tests {
         run(Command::InsertChar('a'), &mut e, &TestClock(0));
         set_caret(&mut e, 1);
         run(Command::InsertChar('b'), &mut e, &TestClock(9_999_999));
-        assert_eq!(e.document.buffer.to_string(), "ab\n");
+        assert_eq!(e.active().document.buffer.to_string(), "ab\n");
 
         // Undo once: removes 'b'
         run(Command::Undo, &mut e, &TestClock(0));
-        assert_eq!(e.document.buffer.to_string(), "a\n");
+        assert_eq!(e.active().document.buffer.to_string(), "a\n");
 
         // Undo again: removes 'a'
         run(Command::Undo, &mut e, &TestClock(0));
-        assert_eq!(e.document.buffer.to_string(), "\n");
+        assert_eq!(e.active().document.buffer.to_string(), "\n");
 
         // Redo: reapplies 'a'
         run(Command::Redo, &mut e, &TestClock(0));
-        assert_eq!(e.document.buffer.to_string(), "a\n");
+        assert_eq!(e.active().document.buffer.to_string(), "a\n");
 
         // Redo again: reapplies 'b'
         run(Command::Redo, &mut e, &TestClock(0));
-        assert_eq!(e.document.buffer.to_string(), "ab\n");
+        assert_eq!(e.active().document.buffer.to_string(), "ab\n");
     }
 
     /// CycleRenderMode rotates LivePreview → SourceHighlighted → SourcePlain → LivePreview.
@@ -830,17 +837,17 @@ mod tests {
         derive::rebuild(&mut e);
         let clk = TestClock(0);
 
-        assert_eq!(e.view.mode, RenderMode::LivePreview);
+        assert_eq!(e.active().view.mode, RenderMode::LivePreview);
 
         let r1 = run(Command::CycleRenderMode, &mut e, &clk);
         assert_eq!(r1, CommandResult::Handled);
-        assert_eq!(e.view.mode, RenderMode::SourceHighlighted);
+        assert_eq!(e.active().view.mode, RenderMode::SourceHighlighted);
 
         run(Command::CycleRenderMode, &mut e, &clk);
-        assert_eq!(e.view.mode, RenderMode::SourcePlain);
+        assert_eq!(e.active().view.mode, RenderMode::SourcePlain);
 
         run(Command::CycleRenderMode, &mut e, &clk);
-        assert_eq!(e.view.mode, RenderMode::LivePreview);
+        assert_eq!(e.active().view.mode, RenderMode::LivePreview);
     }
 
     // -------------------------------------------------------------------------
@@ -853,7 +860,7 @@ mod tests {
     #[test]
     fn type_over_selection_replaces() {
         let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
-        e.document.selection = Selection {
+        e.active_mut().document.selection = Selection {
             ranges: [wordcartel_core::selection::Range { anchor: 1, head: 3 }]
                 .into_iter()
                 .collect(),
@@ -863,7 +870,7 @@ mod tests {
         let clk = TestClock(0);
         let result = run(Command::InsertChar('X'), &mut e, &clk);
         assert_eq!(result, CommandResult::Handled);
-        assert_eq!(e.document.buffer.to_string(), "aXd\n", "InsertChar must replace the selection");
+        assert_eq!(e.active().document.buffer.to_string(), "aXd\n", "InsertChar must replace the selection");
         assert_eq!(nav::head(&e), 2, "caret must be after the inserted char");
     }
 
@@ -871,11 +878,11 @@ mod tests {
     #[test]
     fn type_over_collapsed_selection_inserts_normally() {
         let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
-        e.document.selection = Selection::single(2);
+        e.active_mut().document.selection = Selection::single(2);
         derive::rebuild(&mut e);
         let clk = TestClock(0);
         run(Command::InsertChar('X'), &mut e, &clk);
-        assert_eq!(e.document.buffer.to_string(), "abXcd\n");
+        assert_eq!(e.active().document.buffer.to_string(), "abXcd\n");
         assert_eq!(nav::head(&e), 3);
     }
 
@@ -883,7 +890,7 @@ mod tests {
     #[test]
     fn enter_over_selection_replaces() {
         let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
-        e.document.selection = Selection {
+        e.active_mut().document.selection = Selection {
             ranges: [wordcartel_core::selection::Range { anchor: 1, head: 3 }]
                 .into_iter()
                 .collect(),
@@ -893,7 +900,7 @@ mod tests {
         let clk = TestClock(0);
         let result = run(Command::InsertNewline, &mut e, &clk);
         assert_eq!(result, CommandResult::Handled);
-        assert_eq!(e.document.buffer.to_string(), "a\nd\n", "InsertNewline must replace the selection");
+        assert_eq!(e.active().document.buffer.to_string(), "a\nd\n", "InsertNewline must replace the selection");
         assert_eq!(nav::head(&e), 2, "caret must be after the newline");
     }
 
@@ -903,7 +910,7 @@ mod tests {
         let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
         // Pre-load register with "XY" via copy from another editor.
         let mut src = Editor::new_from_text("XY\n", None, (80, 24));
-        src.document.selection = Selection {
+        src.active_mut().document.selection = Selection {
             ranges: [wordcartel_core::selection::Range { anchor: 0, head: 2 }]
                 .into_iter()
                 .collect(),
@@ -915,7 +922,7 @@ mod tests {
         e.register = src.register;
 
         // Set non-empty selection anchor=1 head=3 (selects "bc")
-        e.document.selection = Selection {
+        e.active_mut().document.selection = Selection {
             ranges: [wordcartel_core::selection::Range { anchor: 1, head: 3 }]
                 .into_iter()
                 .collect(),
@@ -925,7 +932,7 @@ mod tests {
         let clk = TestClock(0);
         let result = run(Command::Paste, &mut e, &clk);
         assert_eq!(result, CommandResult::Handled);
-        assert_eq!(e.document.buffer.to_string(), "aXYd\n", "Paste must replace the selection");
+        assert_eq!(e.active().document.buffer.to_string(), "aXYd\n", "Paste must replace the selection");
         assert_eq!(nav::head(&e), 3, "caret must be after the pasted text");
     }
 
@@ -934,7 +941,7 @@ mod tests {
     #[test]
     fn delete_forward_deletes_selection() {
         let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
-        e.document.selection = Selection {
+        e.active_mut().document.selection = Selection {
             ranges: [wordcartel_core::selection::Range { anchor: 1, head: 3 }]
                 .into_iter()
                 .collect(),
@@ -944,7 +951,7 @@ mod tests {
         let clk = TestClock(0);
         let result = run(Command::DeleteForward, &mut e, &clk);
         assert_eq!(result, CommandResult::Handled);
-        assert_eq!(e.document.buffer.to_string(), "ad\n", "DeleteForward must delete the selection");
+        assert_eq!(e.active().document.buffer.to_string(), "ad\n", "DeleteForward must delete the selection");
         assert_eq!(nav::head(&e), 1, "caret must be at selection.from()");
     }
 
@@ -952,12 +959,12 @@ mod tests {
     #[test]
     fn delete_forward_collapsed_still_deletes_one_char() {
         let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
-        e.document.selection = Selection::single(1);
+        e.active_mut().document.selection = Selection::single(1);
         derive::rebuild(&mut e);
         let clk = TestClock(0);
         let result = run(Command::DeleteForward, &mut e, &clk);
         assert_eq!(result, CommandResult::Handled);
-        assert_eq!(e.document.buffer.to_string(), "acd\n");
+        assert_eq!(e.active().document.buffer.to_string(), "acd\n");
         assert_eq!(nav::head(&e), 1);
     }
 
@@ -970,21 +977,21 @@ mod tests {
         // Start in LivePreview; cursor on line 1 (blank) so line 0 (heading) is inactive.
         // "# Title\n" = 8 bytes; blank line starts at offset 8.
         let mut e = Editor::new_from_text("# Title\n\nplain\n", None, (80, 24));
-        e.document.selection = wordcartel_core::selection::Selection::single(8); // on blank line
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(8); // on blank line
         derive::rebuild(&mut e);
 
         // In LivePreview, inactive heading line 0 must show concealed "Title"
-        let (rows_lp, _) = &e.view.line_layouts[&0];
+        let (rows_lp, _) = &e.active().view.line_layouts[&0];
         assert_eq!(rows_lp[0].display, "Title", "LivePreview inactive heading should be concealed");
 
         // Switch to SourceHighlighted
         let clk = TestClock(0);
         run(Command::CycleRenderMode, &mut e, &clk);
-        assert_eq!(e.view.mode, RenderMode::SourceHighlighted);
+        assert_eq!(e.active().view.mode, RenderMode::SourceHighlighted);
 
         // After CycleRenderMode, derive::rebuild is called inside the command.
         // Line 0 should now show raw "# Title"
-        let (rows_sh, _) = &e.view.line_layouts[&0];
+        let (rows_sh, _) = &e.active().view.line_layouts[&0];
         assert_eq!(rows_sh[0].display, "# Title", "SourceHighlighted must show raw markers on inactive heading");
     }
 
@@ -997,7 +1004,7 @@ mod tests {
         let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
         // Pre-load the register with "seed".
         let mut src = Editor::new_from_text("seed\n", None, (80, 24));
-        src.document.selection = Selection {
+        src.active_mut().document.selection = Selection {
             ranges: [wordcartel_core::selection::Range { anchor: 0, head: 4 }].into_iter().collect(),
             primary: 0,
         };
@@ -1022,8 +1029,8 @@ mod tests {
         nav::ensure_visible(&mut e);
         let r = run(Command::CycleRenderMode, &mut e, &TestClock(0));
         assert_eq!(r, CommandResult::Handled);
-        let caret_line = e.document.buffer.snapshot().byte_to_line(nav::head(&e));
-        assert!(e.view.line_layouts.contains_key(&caret_line),
+        let caret_line = e.active().document.buffer.snapshot().byte_to_line(nav::head(&e));
+        assert!(e.active().view.line_layouts.contains_key(&caret_line),
             "caret's logical line must be laid out (visible) after a mode change");
     }
 }

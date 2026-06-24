@@ -10,12 +10,12 @@ use wordcartel_core::layout;
 
 /// The raw caret byte-offset: `selection.primary().head`.
 pub fn head(editor: &Editor) -> usize {
-    editor.document.selection.primary().head
+    editor.active().document.selection.primary().head
 }
 
 /// Logical line index of the caret.
 pub fn caret_line(editor: &Editor) -> usize {
-    let buf = &editor.document.buffer;
+    let buf = &editor.active().document.buffer;
     let h = head(editor);
     if buf.len() == 0 {
         return 0;
@@ -30,12 +30,12 @@ pub fn caret_line(editor: &Editor) -> usize {
 /// (e.g. before `ensure_visible` + `derive::rebuild` have run).
 /// Honors `view.mode`: in source modes, all lines render raw (is_active=true).
 fn layout_line_on_demand(editor: &Editor, l: usize) -> wordcartel_core::layout::ColMap {
-    let buf = &editor.document.buffer;
+    let buf = &editor.active().document.buffer;
     let text = derive::line_text(buf, l);
-    let role = editor.document.blocks.role_at(derive::line_start(buf, l));
-    let source_mode = editor.view.mode != RenderMode::LivePreview;
+    let role = editor.active().document.blocks.role_at(derive::line_start(buf, l));
+    let source_mode = editor.active().view.mode != RenderMode::LivePreview;
     let is_active_effective = (l == caret_line(editor)) || source_mode;
-    let vp_width = (editor.view.area.0 as usize).max(1);
+    let vp_width = (editor.active().view.area.0 as usize).max(1);
     let (_rows, map) = layout::layout(&text, role, is_active_effective, vp_width);
     map
 }
@@ -53,13 +53,13 @@ fn layout_line_on_demand(editor: &Editor, l: usize) -> wordcartel_core::layout::
 /// 5. Screen row = visible visual rows from `(scroll, scroll_row)` to `(L, vrow)`.
 /// 6. Return `None` if screen row >= area height.
 pub fn screen_pos(editor: &Editor) -> Option<(u16, u16)> {
-    let buf = &editor.document.buffer;
-    let scroll = editor.view.scroll;
-    let scroll_row = editor.view.scroll_row;
+    let buf = &editor.active().document.buffer;
+    let scroll = editor.active().view.scroll;
+    let scroll_row = editor.active().view.scroll_row;
     // Editing area excludes the bottom status row (render reserves frame_h - 1),
     // so nav must reserve it too — else a caret on the last row is deemed visible
     // but never painted/cursor-placed. view.area is the FULL terminal size.
-    let area_height = (editor.view.area.1 as usize).saturating_sub(1);
+    let area_height = (editor.active().view.area.1 as usize).saturating_sub(1);
     let h = head(editor);
     let l = caret_line(editor);
 
@@ -70,7 +70,7 @@ pub fn screen_pos(editor: &Editor) -> Option<(u16, u16)> {
     // Get ColMap for the caret line
     let map_owned;
     let map: &wordcartel_core::layout::ColMap =
-        if let Some((_, map)) = editor.view.line_layouts.get(&l) {
+        if let Some((_, map)) = editor.active().view.line_layouts.get(&l) {
             map
         } else {
             map_owned = layout_line_on_demand(editor, l);
@@ -103,10 +103,10 @@ pub fn screen_pos(editor: &Editor) -> Option<(u16, u16)> {
 /// line (is_active=true). Used during line transitions where the target line
 /// will become the new caret line.
 fn layout_line_active(editor: &Editor, l: usize) -> wordcartel_core::layout::ColMap {
-    let buf = &editor.document.buffer;
+    let buf = &editor.active().document.buffer;
     let text = derive::line_text(buf, l);
-    let role = editor.document.blocks.role_at(derive::line_start(buf, l));
-    let vp_width = (editor.view.area.0 as usize).max(1);
+    let role = editor.active().document.blocks.role_at(derive::line_start(buf, l));
+    let vp_width = (editor.active().view.area.0 as usize).max(1);
     let (_rows, map) = layout::layout(&text, role, true, vp_width);
     map
 }
@@ -114,7 +114,7 @@ fn layout_line_active(editor: &Editor, l: usize) -> wordcartel_core::layout::Col
 /// Get the ColMap for line `l` from the cache if available, else lay it out
 /// with the appropriate `is_active` flag.
 fn get_or_layout(editor: &Editor, l: usize) -> wordcartel_core::layout::ColMap {
-    if let Some((_, map)) = editor.view.line_layouts.get(&l) {
+    if let Some((_, map)) = editor.active().view.line_layouts.get(&l) {
         map.clone()
     } else {
         layout_line_on_demand(editor, l)
@@ -128,7 +128,7 @@ fn get_or_layout(editor: &Editor, l: usize) -> wordcartel_core::layout::ColMap {
 ///
 /// At the end of line L (and L is not the last line), crosses to line L+1.
 pub fn move_right(editor: &mut Editor) -> usize {
-    let buf = &editor.document.buffer;
+    let buf = &editor.active().document.buffer;
     let h = head(editor);
     let l = caret_line(editor);
     let ls = derive::line_start(buf, l);
@@ -146,7 +146,7 @@ pub fn move_right(editor: &mut Editor) -> usize {
         // At line end and not the last line → transition to next line.
         // The target line becomes the new caret line, so lay it out as active.
         let next_map = layout_line_active(editor, l + 1);
-        let next_ls = derive::line_start(&editor.document.buffer, l + 1);
+        let next_ls = derive::line_start(&editor.active().document.buffer, l + 1);
         // Snap to the first valid cursor stop on the next line.
         let first_stop = layout::cursor_at(&next_map, 0);
         next_ls + first_stop.offset
@@ -154,7 +154,7 @@ pub fn move_right(editor: &mut Editor) -> usize {
         ls + nxt.offset
     };
 
-    editor.desired_col = None;
+    editor.active_mut().desired_col = None;
     new_offset
 }
 
@@ -164,7 +164,7 @@ pub fn move_right(editor: &mut Editor) -> usize {
 ///
 /// At the start of line L (and L > 0), crosses to the end of line L-1.
 pub fn move_left(editor: &mut Editor) -> usize {
-    let buf = &editor.document.buffer;
+    let buf = &editor.active().document.buffer;
     let h = head(editor);
     let l = caret_line(editor);
     let ls = derive::line_start(buf, l);
@@ -178,14 +178,14 @@ pub fn move_left(editor: &mut Editor) -> usize {
     let new_offset = if nxt.offset == cur.offset && in_off == 0 && l > 0 {
         // At line start and not the first line → transition to end of line L-1.
         let prev_map = layout_line_active(editor, l - 1);
-        let prev_ls = derive::line_start(&editor.document.buffer, l - 1);
+        let prev_ls = derive::line_start(&editor.active().document.buffer, l - 1);
         let eol_cur = layout::cursor_at(&prev_map, prev_map.eol);
         prev_ls + eol_cur.offset
     } else {
         ls + nxt.offset
     };
 
-    editor.desired_col = None;
+    editor.active_mut().desired_col = None;
     new_offset
 }
 
@@ -193,7 +193,7 @@ pub fn move_left(editor: &mut Editor) -> usize {
 ///
 /// Returns the new global byte offset. Sets `editor.desired_col = None`.
 pub fn move_home(editor: &mut Editor) -> usize {
-    let buf = &editor.document.buffer;
+    let buf = &editor.active().document.buffer;
     let h = head(editor);
     let l = caret_line(editor);
     let ls = derive::line_start(buf, l);
@@ -203,7 +203,7 @@ pub fn move_home(editor: &mut Editor) -> usize {
     let cur = layout::cursor_at(&map, in_off);
     let result = layout::move_home(&map, cur);
 
-    editor.desired_col = None;
+    editor.active_mut().desired_col = None;
     ls + result.offset
 }
 
@@ -211,7 +211,7 @@ pub fn move_home(editor: &mut Editor) -> usize {
 ///
 /// Returns the new global byte offset. Sets `editor.desired_col = None`.
 pub fn move_end(editor: &mut Editor) -> usize {
-    let buf = &editor.document.buffer;
+    let buf = &editor.active().document.buffer;
     let h = head(editor);
     let l = caret_line(editor);
     let ls = derive::line_start(buf, l);
@@ -221,7 +221,7 @@ pub fn move_end(editor: &mut Editor) -> usize {
     let cur = layout::cursor_at(&map, in_off);
     let result = layout::move_end(&map, cur);
 
-    editor.desired_col = None;
+    editor.active_mut().desired_col = None;
     ls + result.offset
 }
 
@@ -241,7 +241,7 @@ pub fn move_end(editor: &mut Editor) -> usize {
 /// the motion (computes it from the current visual column on the first vertical
 /// move when it is `None`).
 pub fn move_down(editor: &mut Editor) -> usize {
-    let buf = &editor.document.buffer;
+    let buf = &editor.active().document.buffer;
     let h = head(editor);
     let l = caret_line(editor);
     let ls = derive::line_start(buf, l);
@@ -252,8 +252,8 @@ pub fn move_down(editor: &mut Editor) -> usize {
     let cur0 = layout::cursor_at(&map, in_off);
 
     // Anchor desired_col on the first vertical move.
-    let desired = editor.desired_col.unwrap_or_else(|| map.col_on_row(in_off, cur0.row));
-    editor.desired_col = Some(desired);
+    let desired = editor.active().desired_col.unwrap_or_else(|| map.col_on_row(in_off, cur0.row));
+    editor.active_mut().desired_col = Some(desired);
 
     // Build the cursor with the STORED desired_col so move_down_within reads it.
     let mut cur = cur0;
@@ -272,7 +272,7 @@ pub fn move_down(editor: &mut Editor) -> usize {
             } else {
                 // Cross into the next logical line.
                 let next_map = layout_line_active(editor, l + 1);
-                let next_ls = derive::line_start(&editor.document.buffer, l + 1);
+                let next_ls = derive::line_start(&editor.active().document.buffer, l + 1);
                 let c = layout::enter_from_top(&next_map, desired);
                 next_ls + c.offset
             }
@@ -288,7 +288,7 @@ pub fn move_down(editor: &mut Editor) -> usize {
 ///
 /// Returns the new global byte offset. Preserves `editor.desired_col`.
 pub fn move_up(editor: &mut Editor) -> usize {
-    let buf = &editor.document.buffer;
+    let buf = &editor.active().document.buffer;
     let h = head(editor);
     let l = caret_line(editor);
     let ls = derive::line_start(buf, l);
@@ -298,8 +298,8 @@ pub fn move_up(editor: &mut Editor) -> usize {
     let cur0 = layout::cursor_at(&map, in_off);
 
     // Anchor desired_col on the first vertical move.
-    let desired = editor.desired_col.unwrap_or_else(|| map.col_on_row(in_off, cur0.row));
-    editor.desired_col = Some(desired);
+    let desired = editor.active().desired_col.unwrap_or_else(|| map.col_on_row(in_off, cur0.row));
+    editor.active_mut().desired_col = Some(desired);
 
     // Build the cursor with the STORED desired_col so move_up_within reads it.
     let mut cur = cur0;
@@ -318,7 +318,7 @@ pub fn move_up(editor: &mut Editor) -> usize {
             } else {
                 // Cross into the previous logical line.
                 let prev_map = layout_line_active(editor, l - 1);
-                let prev_ls = derive::line_start(&editor.document.buffer, l - 1);
+                let prev_ls = derive::line_start(&editor.active().document.buffer, l - 1);
                 let c = layout::enter_from_bottom(&prev_map, desired);
                 prev_ls + c.offset
             }
@@ -336,28 +336,28 @@ pub fn move_up(editor: &mut Editor) -> usize {
 /// - Clamp scroll to `[0, total_logical_lines - 1]`.
 pub fn ensure_visible(editor: &mut Editor) {
     let l = caret_line(editor);
-    let total = derive::total_logical_lines(&editor.document.buffer);
+    let total = derive::total_logical_lines(&editor.active().document.buffer);
     // Editing area excludes the bottom status row (render reserves frame_h - 1),
     // so nav must reserve it too — else a caret on the last row is deemed visible
     // but never painted/cursor-placed. view.area is the FULL terminal size.
-    let area_height = (editor.view.area.1 as usize).saturating_sub(1);
+    let area_height = (editor.active().view.area.1 as usize).saturating_sub(1);
 
     // Clamp scroll to valid range first
     let max_scroll = total.saturating_sub(1);
-    if editor.view.scroll > max_scroll {
-        editor.view.scroll = max_scroll;
+    if editor.active().view.scroll > max_scroll {
+        editor.active_mut().view.scroll = max_scroll;
     }
-    let scroll_rows = rows_of_line(editor, editor.view.scroll);
-    if editor.view.scroll_row >= scroll_rows {
-        editor.view.scroll_row = scroll_rows.saturating_sub(1);
+    let scroll_rows = rows_of_line(editor, editor.active().view.scroll);
+    if editor.active().view.scroll_row >= scroll_rows {
+        editor.active_mut().view.scroll_row = scroll_rows.saturating_sub(1);
     }
 
     let cvr = caret_visual_row(editor, l);
 
     // If caret is above the scroll, scroll up to caret line
-    if l < editor.view.scroll || (l == editor.view.scroll && cvr < editor.view.scroll_row) {
-        editor.view.scroll = l;
-        editor.view.scroll_row = cvr;
+    if l < editor.active().view.scroll || (l == editor.active().view.scroll && cvr < editor.active().view.scroll_row) {
+        editor.active_mut().view.scroll = l;
+        editor.active_mut().view.scroll_row = cvr;
         return;
     }
 
@@ -366,8 +366,8 @@ pub fn ensure_visible(editor: &mut Editor) {
     }
 
     let Some(mut rows_before) = rows_before_caret(editor, l, cvr) else {
-        editor.view.scroll = l;
-        editor.view.scroll_row = cvr;
+        editor.active_mut().view.scroll = l;
+        editor.active_mut().view.scroll_row = cvr;
         return;
     };
 
@@ -378,7 +378,7 @@ pub fn ensure_visible(editor: &mut Editor) {
 }
 
 fn rows_of_line(editor: &Editor, line_idx: usize) -> usize {
-    if let Some((_, map)) = editor.view.line_layouts.get(&line_idx) {
+    if let Some((_, map)) = editor.active().view.line_layouts.get(&line_idx) {
         map.rows.max(1)
     } else {
         layout_line_on_demand(editor, line_idx).rows.max(1)
@@ -386,7 +386,7 @@ fn rows_of_line(editor: &Editor, line_idx: usize) -> usize {
 }
 
 fn caret_visual_row(editor: &Editor, line_idx: usize) -> usize {
-    let buf = &editor.document.buffer;
+    let buf = &editor.active().document.buffer;
     let map = get_or_layout(editor, line_idx);
     let line_off = derive::line_start(buf, line_idx);
     let in_off = head(editor).saturating_sub(line_off);
@@ -395,8 +395,8 @@ fn caret_visual_row(editor: &Editor, line_idx: usize) -> usize {
 }
 
 fn rows_before_caret(editor: &Editor, caret_line: usize, caret_vrow: usize) -> Option<usize> {
-    let scroll = editor.view.scroll;
-    let scroll_row = editor.view.scroll_row;
+    let scroll = editor.active().view.scroll;
+    let scroll_row = editor.active().view.scroll_row;
 
     if caret_line < scroll {
         return None;
@@ -413,13 +413,13 @@ fn rows_before_caret(editor: &Editor, caret_line: usize, caret_vrow: usize) -> O
 }
 
 fn advance_view_top_one_row(editor: &mut Editor, max_scroll: usize) {
-    let rows = rows_of_line(editor, editor.view.scroll);
-    editor.view.scroll_row += 1;
-    if editor.view.scroll_row >= rows && editor.view.scroll < max_scroll {
-        editor.view.scroll += 1;
-        editor.view.scroll_row = 0;
-    } else if editor.view.scroll_row >= rows {
-        editor.view.scroll_row = rows.saturating_sub(1);
+    let rows = rows_of_line(editor, editor.active().view.scroll);
+    editor.active_mut().view.scroll_row += 1;
+    if editor.active().view.scroll_row >= rows && editor.active().view.scroll < max_scroll {
+        editor.active_mut().view.scroll += 1;
+        editor.active_mut().view.scroll_row = 0;
+    } else if editor.active().view.scroll_row >= rows {
+        editor.active_mut().view.scroll_row = rows.saturating_sub(1);
     }
 }
 
@@ -436,7 +436,7 @@ mod tests {
 
     /// Test helper: set the caret to a raw byte offset.
     fn set_caret(e: &mut Editor, off: usize) {
-        e.document.selection = Selection::single(off);
+        e.active_mut().document.selection = Selection::single(off);
     }
 
     // ------------------------------------------------------------------
@@ -517,12 +517,12 @@ mod tests {
     fn ensure_visible_scrolls_caret_into_view() {
         let text: String = (0..100).map(|i| format!("line {i}\n")).collect();
         let mut e = Editor::new_from_text(&text, None, (80, 10));
-        let line50_start = derive::line_start(&e.document.buffer, 50);
+        let line50_start = derive::line_start(&e.active().document.buffer, 50);
         set_caret(&mut e, line50_start);
         ensure_visible(&mut e);
         derive::rebuild(&mut e);
         assert!(screen_pos(&e).is_some());
-        assert!(e.view.scroll <= 50 && e.view.scroll + 10 > 50);
+        assert!(e.active().view.scroll <= 50 && e.active().view.scroll + 10 > 50);
     }
 
     // ------------------------------------------------------------------
@@ -564,7 +564,7 @@ mod tests {
         ensure_visible(&mut e);
         derive::rebuild(&mut e);
 
-        assert_eq!(e.view.scroll_row, 0);
+        assert_eq!(e.active().view.scroll_row, 0);
         assert!(screen_pos(&e).is_some());
     }
 
@@ -572,7 +572,7 @@ mod tests {
     fn caret_above_scroll_returns_none() {
         let mut e = Editor::new_from_text("line0\nline1\nline2\n", None, (80, 24));
         set_caret(&mut e, 0); // caret on line 0
-        e.view.scroll = 2;   // scroll past caret
+        e.active_mut().view.scroll = 2;   // scroll past caret
         derive::rebuild(&mut e);
         assert_eq!(screen_pos(&e), None);
     }
@@ -581,10 +581,10 @@ mod tests {
     fn ensure_visible_scrolls_up_when_caret_above() {
         let text: String = (0..20).map(|i| format!("line {i}\n")).collect();
         let mut e = Editor::new_from_text(&text, None, (80, 10));
-        e.view.scroll = 15;  // scroll to near end
+        e.active_mut().view.scroll = 15;  // scroll to near end
         set_caret(&mut e, 0); // caret at very top
         ensure_visible(&mut e);
-        assert_eq!(e.view.scroll, 0, "scroll should have gone back to 0");
+        assert_eq!(e.active().view.scroll, 0, "scroll should have gone back to 0");
     }
 
     // ------------------------------------------------------------------
@@ -598,7 +598,7 @@ mod tests {
         derive::rebuild(&mut e);
         let n = move_down(&mut e); // first vertical move computes desired_col=3 -> "world" col 3 -> offset 9
         assert_eq!(n, 9);
-        assert_eq!(e.desired_col, Some(3));
+        assert_eq!(e.active().desired_col, Some(3));
     }
 
     #[test]
@@ -619,11 +619,11 @@ mod tests {
         derive::rebuild(&mut e);
         let up_pos = move_up(&mut e); // -> "hello" col 2 -> offset 2
         assert_eq!(up_pos, 2);
-        assert_eq!(e.desired_col, Some(2));
+        assert_eq!(e.active().desired_col, Some(2));
         set_caret(&mut e, up_pos); // apply the move so move_down starts from offset 2
         let down_pos = move_down(&mut e); // -> back to "world" col 2 -> offset 8
         assert_eq!(down_pos, 8);
-        assert_eq!(e.desired_col, Some(2)); // still preserved
+        assert_eq!(e.active().desired_col, Some(2)); // still preserved
     }
 
     #[test]
@@ -635,11 +635,11 @@ mod tests {
         derive::rebuild(&mut e);
         let p1 = move_down(&mut e); // first vertical: desired=4; "hi" max col 2 -> offset 8
         assert_eq!(p1, 8);
-        assert_eq!(e.desired_col, Some(4));
+        assert_eq!(e.active().desired_col, Some(4));
         set_caret(&mut e, p1);
         derive::rebuild(&mut e);
         let p2 = move_down(&mut e); // desired still 4 -> "world" col 4 -> offset 13 (NOT col 2)
         assert_eq!(p2, 13);
-        assert_eq!(e.desired_col, Some(4));
+        assert_eq!(e.active().desired_col, Some(4));
     }
 }

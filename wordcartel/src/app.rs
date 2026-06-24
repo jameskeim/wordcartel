@@ -31,15 +31,21 @@ pub enum Msg {
 
 /// Merge a finished job's effect on the foreground, honoring staleness (§10.3).
 pub fn apply_result(r: JobResult, editor: &mut Editor) {
-    if is_stale(r.kind, r.version, editor.document.version) {
-        return; // version moved on: discard, don't rebase
+    if is_stale(&r, editor) {
+        return; // buffer-local merge for a closed buffer, or a stale coalescible
     }
-    let (kind, version) = (r.kind, r.version);
+    let (kind, version, buffer_id, class) = (r.kind, r.version, r.buffer_id, r.class);
+    // Mechanical-routing assertion (spec §3.4): a buffer-local merge must resolve
+    // to a live buffer here; durability merges may target a now-missing buffer.
+    debug_assert!(
+        class == crate::jobs::ResultClass::Durability || editor.by_id(buffer_id).is_some(),
+        "buffer-local result for a missing buffer slipped past is_stale"
+    );
     (r.merge)(editor);
-    // Save & quit: exit once the awaited save version lands clean.
+    // Save & quit: exit once the awaited save version lands clean for that buffer.
     if kind == crate::jobs::JobKind::Save
         && editor.quit_after_save == Some(version)
-        && editor.document.saved_version == Some(version)
+        && editor.by_id(buffer_id).map(|b| b.document.saved_version) == Some(Some(version))
     {
         editor.quit = true;
     }
@@ -51,14 +57,14 @@ pub fn resolve_prompt(action: PromptAction, editor: &mut Editor, ex: &dyn Execut
         PromptAction::Cancel => {}
         PromptAction::QuitAnyway => { editor.quit = true; }
         PromptAction::SaveAndQuit => {
-            let v = editor.document.version;
+            let v = editor.active().document.version;
             editor.prompt = None; // dismiss the quit-confirm modal first
             { let mut ctx = Ctx { editor, clock, executor: ex }; crate::save::dispatch_save(&mut ctx); }
             // Arm quit-after-save ONLY if a save job was actually dispatched.
             // dispatch_save dispatches nothing when there is no path (status set)
             // or when it raised an external-mod modal (editor.prompt now Some) —
             // in those cases abort the quit and let the user resolve (Codex #4).
-            if editor.document.path.is_some() && editor.prompt.is_none() {
+            if editor.active().document.path.is_some() && editor.prompt.is_none() {
                 editor.quit_after_save = Some(v);
                 editor.quit_after_save_at = Some(clock.now_ms());
             }
@@ -70,28 +76,32 @@ pub fn resolve_prompt(action: PromptAction, editor: &mut Editor, ex: &dyn Execut
             crate::save::overwrite_save(&mut ctx);
         }
         PromptAction::Recover => {
-            if let Some(body) = editor.pending_swap_body.take() {
-                // Load the swap content into the buffer, mark dirty (saved_version
-                // stays None), keep the original path.
+            // Capture body + orphan path BEFORE load_recovered, which replaces the
+            // whole active Buffer and would reset pending_swap_path to None (4r moved
+            // these fields onto Buffer). Then clean up the orphan after loading.
+            let staged = {
+                let b = editor.active_mut();
+                b.pending_swap_body
+                    .take()
+                    .map(|body| (body, b.pending_swap_path.take()))
+            };
+            if let Some((body, orphan)) = staged {
                 crate::save::load_recovered(editor, &body);
-                // Delete the orphan swap so next launch doesn't re-prompt.
-                // (Recovered work is now in the live buffer and will be swapped
-                // under the new pid.)
-                if let Some(p) = editor.pending_swap_path.take() {
+                if let Some(p) = orphan {
                     let _ = std::fs::remove_file(p);
                 }
             }
         }
         PromptAction::DiscardSwap => {
-            if let Some(p) = editor.pending_swap_path.take() {
+            if let Some(p) = editor.active_mut().pending_swap_path.take() {
                 let _ = std::fs::remove_file(p);
             } else {
-                crate::swap::delete(editor.document.path.as_deref());
+                crate::swap::delete(editor.active().document.path.as_deref());
             }
         }
         PromptAction::OpenOriginal => {
-            editor.pending_swap_body = None;
-            editor.pending_swap_path = None;
+            editor.active_mut().pending_swap_body = None;
+            editor.active_mut().pending_swap_path = None;
         }
     }
     editor.prompt = None;
@@ -130,7 +140,7 @@ pub fn reduce(
         return !editor.quit;
     }
 
-    let before = editor.document.version;
+    let before = editor.active().document.version;
     match msg {
         Msg::Input(Event::Key(key)) => {
             match input::key_to_command_id(key) {
@@ -145,25 +155,25 @@ pub fn reduce(
             }
         }
         Msg::Input(Event::Resize(w, h)) => {
-            editor.view.area = (w, h);
+            editor.active_mut().view.area = (w, h);
             derive::rebuild(editor);
         }
         Msg::Input(_) => {}
         Msg::JobDone(r) => apply_result(r, editor),
         Msg::Tick => {
             let now = clock.now_ms();
-            if editor.document.dirty()
-                && !editor.swap_in_flight
-                && crate::swap::due(now, editor.last_edit_at, editor.last_swap_at)
+            if editor.active().document.dirty()
+                && !editor.active().swap_in_flight
+                && crate::swap::due(now, editor.active().last_edit_at, editor.active().last_swap_at)
             {
-                editor.swap_in_flight = true;
+                editor.active_mut().swap_in_flight = true;
                 let mut ctx = Ctx { editor, clock, executor: ex };
                 crate::swap::dispatch_swap_write(&mut ctx);
             }
         }
     }
-    if editor.document.version != before {
-        editor.last_edit_at = Some(clock.now_ms());
+    if editor.active().document.version != before {
+        editor.active_mut().last_edit_at = Some(clock.now_ms());
     }
     // Fold any other results that became ready while handling this message.
     for r in ex.drain() {
@@ -260,23 +270,23 @@ pub fn run(path: Option<PathBuf>) -> std::io::Result<()> {
     // Named files: use assess() with content-hash comparison.
     // Scratch buffers: their swap is pid-keyed, so look for an orphan from a
     // dead previous session (pre-merge blocker #1).
-    if editor.document.path.is_some() {
+    if editor.active().document.path.is_some() {
         // Read F's current bytes once for the predicate.
-        let file_bytes = editor.document.path.as_deref().and_then(|p| std::fs::read(p).ok());
-        match crate::swap::assess(editor.document.path.as_deref(), file_bytes.as_deref()) {
+        let file_bytes = editor.active().document.path.as_deref().and_then(|p| std::fs::read(p).ok());
+        match crate::swap::assess(editor.active().document.path.as_deref(), file_bytes.as_deref()) {
             crate::swap::RecoveryDecision::OpenNormally => {}
             crate::swap::RecoveryDecision::DiscardSilently => {
-                crate::swap::delete(editor.document.path.as_deref());
+                crate::swap::delete(editor.active().document.path.as_deref());
             }
             crate::swap::RecoveryDecision::Prompt(_h, body) => {
-                editor.pending_swap_body = Some(body);
+                editor.active_mut().pending_swap_body = Some(body);
                 editor.prompt = Some(crate::prompt::Prompt::swap_recovery());
                 editor.status = "Recovery file found".into();
             }
         }
     } else if let Some((sp, _header, body)) = crate::swap::find_orphan_scratch_swap() {
-        editor.pending_swap_body = Some(body);
-        editor.pending_swap_path = Some(sp);
+        editor.active_mut().pending_swap_body = Some(body);
+        editor.active_mut().pending_swap_path = Some(sp);
         editor.prompt = Some(crate::prompt::Prompt::swap_recovery());
         editor.status = "Recovery file found".into();
     }
@@ -334,7 +344,7 @@ pub fn run(path: Option<PathBuf>) -> std::io::Result<()> {
                 editor.status = "Save still running — choose again".into();
             }
         }
-        let swap_deadline = crate::swap::next_deadline_ms(now, editor.last_edit_at, editor.last_swap_at);
+        let swap_deadline = crate::swap::next_deadline_ms(now, editor.active().last_edit_at, editor.active().last_swap_at);
         let sq_deadline = editor.quit_after_save_at.map(|t| t.saturating_add(SAVE_QUIT_TIMEOUT_MS));
         let deadline = match (swap_deadline, sq_deadline) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -419,7 +429,7 @@ mod tests {
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
         crate::app::reduce(crate::app::Msg::Input(q), &mut e, &reg, &ex, &clk);
         assert!(e.quit);
-        assert_eq!(e.document.buffer.to_string(), "hi\n");
+        assert_eq!(e.active().document.buffer.to_string(), "hi\n");
     }
 
     // -------------------------------------------------------------------------
@@ -502,7 +512,7 @@ mod tests {
                 kind: KeyEventKind::Press, state: KeyEventState::NONE });
             assert!(crate::app::reduce(crate::app::Msg::Input(ev), &mut e, &reg, &ex, &clk));
         }
-        assert_eq!(e.document.buffer.to_string(), "hi\n");
+        assert_eq!(e.active().document.buffer.to_string(), "hi\n");
     }
 
     #[test]
@@ -516,15 +526,15 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed),
         ));
         let mut e = Editor::new_from_text("\n", Some(doc_path.clone()), (80, 24));
-        e.document.version = 1;            // dirty (saved_version=Some(0))
-        e.last_edit_at = Some(0);
+        e.active_mut().document.version = 1;            // dirty (saved_version=Some(0))
+        e.active_mut().last_edit_at = Some(0);
         let reg = Registry::builtins();
         let ex = InlineExecutor::default();
         // Clock past the idle threshold.
         struct C(u64); impl wordcartel_core::history::Clock for C { fn now_ms(&self) -> u64 { self.0 } }
         let clk = C(crate::swap::T_IDLE_MS + 5);
         crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &ex, &clk);
-        assert!(e.last_swap_at.is_some(), "an idle Tick on a dirty buffer writes a swap");
+        assert!(e.active().last_swap_at.is_some(), "an idle Tick on a dirty buffer writes a swap");
         let sp = crate::swap::swap_path(Some(&doc_path)).unwrap();
         assert!(sp.exists());
         let _ = std::fs::remove_file(&sp);
@@ -538,7 +548,7 @@ mod tests {
         use crate::registry::Registry;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
-        e.document.version = 1; // dirty
+        e.active_mut().document.version = 1; // dirty
         let reg = Registry::builtins();
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
@@ -563,7 +573,7 @@ mod tests {
         let p = std::env::temp_dir().join(format!("wc-savequit-{}.md", std::process::id()));
         std::fs::write(&p, "old\n").unwrap();
         let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
-        e.document.saved_version = None; e.document.version = 1;
+        e.active_mut().document.saved_version = None; e.active_mut().document.version = 1;
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         crate::app::resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk);
@@ -582,7 +592,7 @@ mod tests {
         use crate::jobs::InlineExecutor;
         use crate::prompt::PromptAction;
         let mut e = Editor::new_from_text("scratch\n", None, (80, 24));
-        e.document.version = 1;
+        e.active_mut().document.version = 1;
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         crate::app::resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk);
@@ -593,16 +603,79 @@ mod tests {
     #[test]
     fn apply_result_merges_fresh_and_drops_stale() {
         use crate::editor::Editor;
-        use crate::jobs::{JobResult, JobKind};
+        use crate::jobs::{JobResult, JobKind, ResultClass};
         let mut e = Editor::new_from_text("\n", None, (80, 24));
-        e.document.version = 5;
+        let id = e.active().id;
+        e.active_mut().document.version = 5;
         // Fresh one-shot (Save is never stale): merges.
-        crate::app::apply_result(JobResult { version: 3, kind: JobKind::Save,
+        crate::app::apply_result(JobResult { buffer_id: id, class: ResultClass::Durability, version: 3, kind: JobKind::Save,
             merge: Box::new(|ed: &mut Editor| ed.status = "saved".into()) }, &mut e);
         assert_eq!(e.status, "saved");
         // Stale coalescible: dropped.
-        crate::app::apply_result(JobResult { version: 3, kind: JobKind::CoalesceProbe,
+        crate::app::apply_result(JobResult { buffer_id: id, class: ResultClass::BufferLocal, version: 3, kind: JobKind::CoalesceProbe,
             merge: Box::new(|ed: &mut Editor| ed.status = "STALE".into()) }, &mut e);
         assert_eq!(e.status, "saved", "stale coalescible result must be dropped");
+    }
+
+    #[test]
+    fn buffer_local_result_for_missing_buffer_is_dropped() {
+        use crate::editor::{Editor, BufferId};
+        use crate::jobs::{JobResult, JobKind, ResultClass};
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        // A buffer-local merge for a non-existent buffer must NOT run.
+        crate::app::apply_result(JobResult {
+            buffer_id: BufferId(999), class: ResultClass::BufferLocal,
+            version: 1, kind: JobKind::Save,
+            merge: Box::new(|ed: &mut Editor| ed.status = "SHOULD NOT RUN".into()),
+        }, &mut e);
+        assert_ne!(e.status, "SHOULD NOT RUN", "buffer-local merge for a missing buffer is dropped");
+    }
+
+    #[test]
+    fn buffer_local_result_for_live_buffer_merges() {
+        use crate::editor::Editor;
+        use crate::jobs::{JobResult, JobKind, ResultClass};
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        let id = e.active().id;
+        crate::app::apply_result(JobResult {
+            buffer_id: id, class: ResultClass::BufferLocal,
+            version: 1, kind: JobKind::Save,
+            merge: Box::new(|ed: &mut Editor| ed.status = "merged".into()),
+        }, &mut e);
+        assert_eq!(e.status, "merged");
+    }
+
+    #[test]
+    fn recover_loads_body_and_deletes_orphan_swap_file() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::prompt::PromptAction;
+        // An orphan swap file on disk + a buffer staged for recovery.
+        let p = std::env::temp_dir().join(format!("wc-recover-orphan-{}.swp", std::process::id()));
+        std::fs::write(&p, "stub").unwrap();
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        e.active_mut().pending_swap_body = Some("recovered body\n".into());
+        e.active_mut().pending_swap_path = Some(p.clone());
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        crate::app::resolve_prompt(PromptAction::Recover, &mut e, &ex, &clk);
+        assert_eq!(e.active().document.buffer.to_string(), "recovered body\n",
+            "recovered content loaded into the active buffer");
+        assert!(!p.exists(), "orphan swap file must be deleted on Recover");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn durability_result_for_missing_buffer_still_runs() {
+        use crate::editor::{Editor, BufferId};
+        use crate::jobs::{JobResult, JobKind, ResultClass};
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        // A durability completion runs even though its buffer is gone (e.g. closed).
+        crate::app::apply_result(JobResult {
+            buffer_id: BufferId(999), class: ResultClass::Durability,
+            version: 1, kind: JobKind::SwapWrite,
+            merge: Box::new(|ed: &mut Editor| ed.status = "durability ran".into()),
+        }, &mut e);
+        assert_eq!(e.status, "durability ran");
     }
 }

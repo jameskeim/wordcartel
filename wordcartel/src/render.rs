@@ -63,20 +63,20 @@ pub fn render(frame: &mut Frame, editor: &Editor) {
     // -----------------------------------------------------------------------
     // Editing area: walk visible logical lines from view.scroll
     // -----------------------------------------------------------------------
-    let scroll = editor.view.scroll;
+    let scroll = editor.active().view.scroll;
     let mut screen_row: u16 = 0;
 
     // Collect sorted logical line indices from the layout cache.
-    let mut sorted_lines: Vec<usize> = editor.view.line_layouts.keys().copied().collect();
+    let mut sorted_lines: Vec<usize> = editor.active().view.line_layouts.keys().copied().collect();
     sorted_lines.sort_unstable();
 
     'outer: for &l in &sorted_lines {
         if l < scroll {
             continue;
         }
-        let (visual_rows, _map) = &editor.view.line_layouts[&l];
+        let (visual_rows, _map) = &editor.active().view.line_layouts[&l];
         let skip_rows = if l == scroll {
-            editor.view.scroll_row
+            editor.active().view.scroll_row
         } else {
             0
         };
@@ -113,14 +113,15 @@ pub fn render(frame: &mut Frame, editor: &Editor) {
     // -----------------------------------------------------------------------
     {
         let path_str = editor
+            .active()
             .document
             .path
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "[no name]".to_string());
 
-        let dirty_marker = if editor.document.dirty() { "*" } else { "" };
-        let mode_text = match editor.view.mode {
+        let dirty_marker = if editor.active().document.dirty() { "*" } else { "" };
+        let mode_text = match editor.active().view.mode {
             crate::editor::RenderMode::LivePreview => "PREVIEW",
             crate::editor::RenderMode::SourceHighlighted => "SRC-HI",
             crate::editor::RenderMode::SourcePlain => "SOURCE",
@@ -172,7 +173,7 @@ mod tests {
     use wordcartel_core::selection::Selection;
 
     fn set_caret(e: &mut Editor, off: usize) {
-        e.document.selection = Selection::single(off);
+        e.active_mut().document.selection = Selection::single(off);
     }
 
     /// Row 0 of a heading with caret on a later line must show "Title" (concealed "# ").
@@ -215,7 +216,7 @@ mod tests {
     #[test]
     fn renders_active_prompt_on_status_row() {
         let mut e = Editor::new_from_text("hello\n", None, (40, 6));
-        e.document.version = 1; // dirty so quit_confirm is realistic
+        e.active_mut().document.version = 1; // dirty so quit_confirm is realistic
         e.prompt = Some(crate::prompt::Prompt::quit_confirm());
         derive::rebuild(&mut e);
         let mut term = Terminal::new(TestBackend::new(40, 6)).unwrap();
@@ -241,8 +242,8 @@ mod tests {
         crate::nav::ensure_visible(&mut e);
         derive::rebuild(&mut e);
 
-        assert_eq!(e.view.scroll, 0);
-        assert_eq!(e.view.scroll_row, 3);
+        assert_eq!(e.active().view.scroll, 0);
+        assert_eq!(e.active().view.scroll_row, 3);
 
         let mut term = Terminal::new(TestBackend::new(4, 5)).unwrap();
         term.draw(|f| render(f, &e)).unwrap();

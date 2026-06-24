@@ -341,14 +341,14 @@ mod tests {
         let p = scratch_path("cmd-save");
         fs::write(&p, "initial\n").expect("pre-write");
         let mut e = Editor::new_from_text("hello\n", Some(p.clone()), (80, 24));
-        e.document.saved_version = None; // unsaved edit
-        e.document.version = 1;
+        e.active_mut().document.saved_version = None; // unsaved edit
+        e.active_mut().document.version = 1;
         let ex = InlineExecutor::default();
         let clk = Z;
         { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex };
           crate::save::dispatch_save(&mut ctx); }
         for r in ex.drain() { crate::app::apply_result(r, &mut e); }
-        assert!(!e.document.dirty(), "dirty must be cleared after a successful background save");
+        assert!(!e.active().document.dirty(), "dirty must be cleared after a successful background save");
         let _ = fs::remove_file(&p);
     }
 

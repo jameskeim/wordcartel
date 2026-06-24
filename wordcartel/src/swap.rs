@@ -2,7 +2,7 @@
 //! 0700 XDG state dir. Never writes the user's .md.
 
 use crate::editor::Editor;
-use crate::jobs::{Job, JobKind, JobResult};
+use crate::jobs::{Job, JobKind, JobResult, ResultClass};
 use crate::registry::Ctx;
 use std::io;
 use std::io::Write as _;
@@ -223,10 +223,10 @@ fn open_excl_0600(p: &Path) -> io::Result<std::fs::File> {
 }
 
 pub fn build_header(editor: &Editor, body: &str, ts_ms: u64) -> SwapHeader {
-    let realpath = editor.document.path.as_ref().map(|p| {
+    let realpath = editor.active().document.path.as_ref().map(|p| {
         std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()).to_string_lossy().into_owned()
     });
-    let (load_mtime_secs, load_size) = match editor.document.stored_fp {
+    let (load_mtime_secs, load_size) = match editor.active().document.stored_fp {
         Some(fp) => (
             fp.mtime.and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()),
             Some(fp.size),
@@ -238,7 +238,7 @@ pub fn build_header(editor: &Editor, body: &str, ts_ms: u64) -> SwapHeader {
         load_mtime_secs,
         load_size,
         content_hash: fnv1a64(body.as_bytes()),
-        version: editor.document.version,
+        version: editor.active().document.version,
         ts_ms,
         pid: std::process::id(),
     }
@@ -274,15 +274,18 @@ pub fn assess(doc_path: Option<&Path>, current_file_bytes: Option<&[u8]>) -> Rec
 /// Dispatch a SwapWrite job: capture an O(1) snapshot + header inputs now;
 /// materialize + write on the worker; the merge records last_swap_at.
 pub fn dispatch_swap_write(ctx: &mut Ctx) {
-    let path = match swap_path(ctx.editor.document.path.as_deref()) {
+    let path = match swap_path(ctx.editor.active().document.path.as_deref()) {
         Ok(p) => p,
         Err(_) => return, // no state dir → best-effort; skip silently
     };
-    let snap = ctx.editor.document.buffer.snapshot();
+    let snap = ctx.editor.active().document.buffer.snapshot();
     let ts = ctx.clock.now_ms();
     let header = build_header(ctx.editor, "", ts); // body filled on worker
-    let version = ctx.editor.document.version;
+    let version = ctx.editor.active().document.version;
+    let buffer_id = ctx.editor.active().id;
     ctx.executor.dispatch(Job {
+        buffer_id,
+        class: ResultClass::Durability,
         version,
         kind: JobKind::SwapWrite,
         run: Box::new(move || {
@@ -291,15 +294,18 @@ pub fn dispatch_swap_write(ctx: &mut Ctx) {
             h.content_hash = fnv1a64(body.as_bytes());
             let ok = write_atomic(&path, &serialize(&h, &body)).is_ok();
             JobResult {
+                buffer_id,
+                class: ResultClass::Durability,
                 version,
                 kind: JobKind::SwapWrite,
                 merge: Box::new(move |editor| {
-                    editor.swap_in_flight = false;
-                    if ok {
-                        editor.last_swap_at = Some(ts);
-                    } else {
-                        editor.status = "swap write failed".to_string();
+                    // INVARIANT: route via by_id_mut(buffer_id) — NEVER active(); the merge must
+                    // target the originating buffer even after a buffer switch (multi-buffer, Effort 6).
+                    if let Some(b) = editor.by_id_mut(buffer_id) {
+                        b.swap_in_flight = false;
+                        if ok { b.last_swap_at = Some(ts); }
                     }
+                    if !ok { editor.status = "swap write failed".to_string(); } // status global
                 }),
             }
         }),
@@ -540,13 +546,13 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed),
         ));
         let mut e = Editor::new_from_text("swap me\n", Some(doc_path.clone()), (80, 24));
-        e.document.version = 3;
+        e.active_mut().document.version = 3;
         let ex = InlineExecutor::default();
         let clk = Z;
         { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex };
           dispatch_swap_write(&mut ctx); }
         for r in ex.drain() { crate::app::apply_result(r, &mut e); }
-        assert_eq!(e.last_swap_at, Some(123), "merge records last_swap_at");
+        assert_eq!(e.active().last_swap_at, Some(123), "merge records last_swap_at");
         let sp = swap_path(Some(&doc_path)).unwrap();
         let (h, body) = parse(&std::fs::read_to_string(&sp).unwrap()).unwrap();
         assert_eq!(body, "swap me\n");

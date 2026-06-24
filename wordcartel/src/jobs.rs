@@ -15,9 +15,19 @@ pub enum JobKind {
     CoalesceProbe, // test-only stand-in for a future coalescible kind
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResultClass {
+    /// Mutates buffer-local state (status/saved_version/cadence); dropped if the buffer is gone.
+    BufferLocal,
+    /// External filesystem side effect that must complete even if the buffer was closed.
+    Durability,
+}
+
 /// A unit of background work, dispatched for a document version, run on a
 /// worker, merged back on the foreground.
 pub struct Job {
+    pub buffer_id: crate::editor::BufferId,
+    pub class: ResultClass,
     pub version: u64,
     pub kind: JobKind,
     /// Runs on the worker thread; must not touch the Editor directly.
@@ -26,6 +36,8 @@ pub struct Job {
 
 /// What a worker hands back: its own foreground merge effect.
 pub struct JobResult {
+    pub buffer_id: crate::editor::BufferId,
+    pub class: ResultClass,
     pub version: u64,
     pub kind: JobKind,
     /// Applied on the foreground before the next draw. By contract this touches
@@ -34,16 +46,22 @@ pub struct JobResult {
     pub merge: Box<dyn FnOnce(&mut Editor) + Send>,
 }
 
-/// The single staleness predicate (spec §4.1 staleness policy).
-pub fn is_stale(
-    kind: JobKind,
-    #[allow(unused_variables)] result_version: u64,
-    #[allow(unused_variables)] current_version: u64,
-) -> bool {
-    match kind {
-        JobKind::Save | JobKind::SwapWrite => false, // one-shot: always applies
-        #[cfg(test)]
-        JobKind::CoalesceProbe => result_version != current_version,
+/// Staleness now consults the result class + whether the buffer still exists.
+pub fn is_stale(r: &JobResult, editor: &Editor) -> bool {
+    match r.class {
+        ResultClass::Durability => false, // must always complete
+        ResultClass::BufferLocal => match editor.by_id(r.buffer_id) {
+            None => true, // buffer closed -> drop the buffer-local merge
+            Some(b) => {
+                #[cfg(not(test))]
+                let _ = b;
+                match r.kind {
+                    JobKind::Save | JobKind::SwapWrite => false, // one-shot: never stale
+                    #[cfg(test)]
+                    JobKind::CoalesceProbe => r.version != b.document.version,
+                }
+            }
+        },
     }
 }
 
@@ -129,7 +147,7 @@ impl Drop for ThreadExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::editor::Editor;
+    use crate::editor::{Editor, BufferId};
 
     #[test]
     fn thread_executor_runs_job_on_worker_and_drains_result() {
@@ -138,12 +156,18 @@ mod tests {
         let (wake_tx, _wake_rx) = mpsc::channel::<()>();
         let ex = ThreadExecutor::new(wake_tx);
         ex.dispatch(Job {
+            buffer_id: BufferId(0),
+            class: ResultClass::Durability,
             version: 7,
             kind: JobKind::Save,
             run: Box::new(move || {
                 done_tx.send(7).unwrap();
-                JobResult { version: 7, kind: JobKind::Save,
-                    merge: Box::new(|e: &mut crate::editor::Editor| e.status = "worker".into()) }
+                JobResult {
+                    buffer_id: BufferId(0),
+                    class: ResultClass::Durability,
+                    version: 7, kind: JobKind::Save,
+                    merge: Box::new(|e: &mut crate::editor::Editor| e.status = "worker".into()),
+                }
             }),
         });
         assert_eq!(done_rx.recv().unwrap(), 7, "worker must run the job");
@@ -156,9 +180,13 @@ mod tests {
     fn inline_executor_runs_on_dispatch_and_buffers_for_drain() {
         let ex = InlineExecutor::default();
         ex.dispatch(Job {
+            buffer_id: BufferId(0),
+            class: ResultClass::Durability,
             version: 1,
             kind: JobKind::Save,
             run: Box::new(|| JobResult {
+                buffer_id: BufferId(0),
+                class: ResultClass::Durability,
                 version: 1,
                 kind: JobKind::Save,
                 merge: Box::new(|e: &mut Editor| e.status = "merged".into()),
@@ -176,13 +204,37 @@ mod tests {
     // for an edited-on buffer comes from the version-aware MERGE in save.rs, not here.
     #[test]
     fn one_shot_kinds_are_never_stale() {
-        assert!(!is_stale(JobKind::Save, 1, 99));
-        assert!(!is_stale(JobKind::SwapWrite, 1, 99));
+        let e = Editor::new_from_text("\n", None, (80, 24));
+        let id = e.active().id;
+        // Durability: never stale regardless of version or buffer existence.
+        let r_save = JobResult { buffer_id: id, class: ResultClass::Durability,
+            version: 1, kind: JobKind::Save, merge: Box::new(|_| {}) };
+        assert!(!is_stale(&r_save, &e));
+        let r_swap = JobResult { buffer_id: id, class: ResultClass::Durability,
+            version: 1, kind: JobKind::SwapWrite, merge: Box::new(|_| {}) };
+        assert!(!is_stale(&r_swap, &e));
+        // Durability for a missing buffer is also never stale.
+        let r_missing = JobResult { buffer_id: BufferId(999), class: ResultClass::Durability,
+            version: 1, kind: JobKind::Save, merge: Box::new(|_| {}) };
+        assert!(!is_stale(&r_missing, &e));
     }
 
     #[test]
     fn coalescible_kind_is_stale_when_version_moved() {
-        assert!(is_stale(JobKind::CoalesceProbe, 1, 2));
-        assert!(!is_stale(JobKind::CoalesceProbe, 2, 2));
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        let id = e.active().id;
+        e.active_mut().document.version = 2;
+        // version 1 result against a buffer at version 2 → stale
+        let r_old = JobResult { buffer_id: id, class: ResultClass::BufferLocal,
+            version: 1, kind: JobKind::CoalesceProbe, merge: Box::new(|_| {}) };
+        assert!(is_stale(&r_old, &e));
+        // version 2 result matches → not stale
+        let r_cur = JobResult { buffer_id: id, class: ResultClass::BufferLocal,
+            version: 2, kind: JobKind::CoalesceProbe, merge: Box::new(|_| {}) };
+        assert!(!is_stale(&r_cur, &e));
+        // BufferLocal for a missing buffer → always stale
+        let r_gone = JobResult { buffer_id: BufferId(999), class: ResultClass::BufferLocal,
+            version: 2, kind: JobKind::CoalesceProbe, merge: Box::new(|_| {}) };
+        assert!(is_stale(&r_gone, &e));
     }
 }
