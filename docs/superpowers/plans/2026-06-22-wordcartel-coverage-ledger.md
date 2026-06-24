@@ -63,7 +63,7 @@ Legend: ✅ done · 🔨 in this effort · ⏳ later effort · 📋 deferred to 
 
 | Spec § | Item | Effort | Status |
 |---|---|---|---|
-| 3.1 | Markdown-as-source-of-truth (`.md`, text not AST) | 1 (buffer holds text) / 3 (save) | 🔨/⏳ |
+| 3.1 | Markdown-as-source-of-truth (`.md`, text not AST) | 1 (buffer holds text) / 4a (save) | ✅ |
 | 3.3 | Text not AST; plain-text edits | 1 | ✅ |
 | 3.10, 16.1 | `ropey` buffer; **byte offset = canonical position** | 1 | ✅ |
 | 9.1 | Undo = ChangeSet (retain/delete/insert) + branching history; `smartstring`; prose-tuned coalescing (~500 ms; break on paste / programmatic / cursor-move) | 1 | ✅ |
@@ -71,24 +71,24 @@ Legend: ✅ done · 🔨 in this effort · ⏳ later effort · 📋 deferred to 
 | 10.1 | Single mutation channel `apply(Transaction)`; selection mapped on the same atomic step | 1 (kernel `apply`) / 4a (wired loop) / 4b (job `merge` routes doc edits through `apply`) | 🔨/⏳ |
 | 10.2 | `version: u64` revision token | 1 | 🔨 |
 | 10.3 | O(1) rope snapshots for async workers; reconcile = version-discard | 1 (snapshot API) / 4b (`2026-06-23-wordcartel-04b-async-crash-safety.md`: job substrate + workers) | 🔨/⏳ |
-| 3.6, 9.5, 15.6 | In-process clipboard **register** (system sync is effort 3) | 1 (register) / 3 (system) | 🔨/⏳ |
+| 3.6, 9.5, 15.6 | In-process clipboard **register** (system sync is effort 4c) | 1 (register) / 4a (wired) / 4c (system sync: `arboard`/OSC 52) | 🔨/⏳ |
 | 11 | Test strategy: proptest invariants, round-trip laws, committed regressions, golden | 1 (kernel laws) + all | 🔨 |
 | 3.9 | Perf budget (p95 < 16 ms; reparse < 5 ms; ~5 MB) | 2–4 (render/loop) | ⏳ |
 | 4, 9.2 | `md_parse` (pulldown-cmark, byte ranges) | 2 | ✅ (inline; images/CommonMark-exact escapes -> Plan 3) |
 | 9.2 | `block_tree` incremental invalidation (+ spike, oracle) | 3a | ✅ (merged; oracle: single/multi-edit × ASCII/multibyte + delete-to-empty; 4 latent bugs caught & fixed) |
 | 16 | `layout`/`ColMap`; `Cursor{offset,row,desired_col}`; navigation; reveal churn | 2 | ✅ (layout/ColMap/cursor done; reveal-churn scroll-anchor -> app) |
-| 3.2, 3.11, 13 | Live-conceal render modes; markdown construct set | 2 (inline) / 3b (block-prefix conceal) / 4 (paint) | ✅ conceal model (inline §2 + block-prefix/role §3b incl. ATX tabs/empty/closing, list→bullet, quote, fence, setext, thematic break); terminal paint → 4 |
-| 3.4, 14.2 | Soft-wrap; wrap ruler; line-structure (unwrap/reflow/ventilate) | 2 (wrap) / 3 (repar) | ⏳ |
-| 3.5 | `filter` primitive (argv default, caps, timeout, cancel) | 3 | ⏳ |
-| 3.1, 14 | pandoc export; repar in-process transforms | 3 | ⏳ |
-| 14.3 | Atomic save (`repar::atomic`); width helper | 3 | ⏳ |
+| 3.2, 3.11, 13 | Live-conceal render modes; markdown construct set | 2 (inline) / 3b (block-prefix conceal) / 4a (paint) | ✅ conceal model (inline §2 + block-prefix/role §3b incl. ATX tabs/empty/closing, list→bullet, quote, fence, setext, thematic break); terminal paint shipped in 4a |
+| 3.4, 14.2 | Soft-wrap; wrap ruler; line-structure (unwrap/reflow/ventilate) | 2 (wrap) / 4c (repar transforms) / 5 (wrap ruler) | ⏳ |
+| 3.5 | `filter` primitive (argv default, caps, timeout, cancel) | 4c | ⏳ |
+| 3.1, 14 | pandoc export; repar in-process transforms | 4c | ⏳ |
+| 14.3 | Atomic save (4a hand-rolled `save_atomic`, no `repar` dep) | 4a | ✅ (merged d94fc39: same-dir O_EXCL temp, fsync, rename, dir-fsync, symlink refusal, mode preserve, skip-unchanged) |
 | 3.8, 10 | ratatui+crossterm; sync loop; functional-core/imperative-shell | 4a (sync shell+loop) / 4b (unified-channel loop, wake on job completion) | 🔨/⏳ |
 | 10.4 | **name-keyed command registry (key→ID→handler; plugin substrate)** | 4b (`2026-06-23-wordcartel-04b-async-crash-safety.md` §4.4: mechanism + migrate 4a commands) | 🔨 |
 | 12 | Config (TOML, precedence, project-local); keymap-as-data; command palette + menu (resolve through the 4b registry) | 5 | ⏳ |
-| 5, 3.5 | Basic spellcheck (diagnostic); basic mouse | 4 | ⏳ |
-| 13.2 | No-color / high-contrast accessibility | 3 (paint) / 4 (chrome) | ⏳ |
+| 5, 3.5 | Basic spellcheck (diagnostic); basic mouse | 5 | ⏳ |
+| 13.2 | No-color / high-contrast accessibility | 4a (paint) / 5 (chrome) | ⏳ |
 | 15 | Error handling & recovery; swap-file; panic dump; external-mod detection; background-save failure keeps file+dirty | 4a (atomic save) / 4b (`2026-06-23-wordcartel-04b-async-crash-safety.md` §4.3,§5: bg save, swap/recovery, panic dump, external-mod, modal surface) | 🔨/⏳ |
-| 5 | Incremental search (`regex-cursor`); writing aids (word count, focus) | 4 | ⏳ |
+| 5 | Incremental search (`regex-cursor`); writing aids (word count, focus) | 5 | ⏳ |
 | 18 | Plugin system (in-process Lua): registry/hook substrate; sandboxed `apply`-channel API; security; config | P (post-1.0); substrate in 5/4b | 📋 |
 
 ## Reuse posture (decided 2026-06-22)
