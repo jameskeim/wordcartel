@@ -250,6 +250,71 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_save_raises_modal_on_external_change() {
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Ctx;
+        let p = scratch();
+        std::fs::write(&p, "v0\n").unwrap();
+        let mut e = Editor::new_from_text("mine\n", Some(p.clone()), (80, 24));
+        // stored_fp captured at load == v0's fp. Now an external process rewrites F.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&p, "external change\n").unwrap();
+        e.document.version = 1; e.document.saved_version = None;
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex }; dispatch_save(&mut ctx); }
+        assert!(e.prompt.is_some(), "external change must raise the modal, not clobber");
+        assert!(ex.drain().is_empty(), "no save job dispatched on conflict");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn fingerprint_matrix_new_and_deleted_are_conflicts() {
+        // New named buffer (stored_fp = None) but a file now exists → conflict.
+        let p = scratch();
+        std::fs::write(&p, "created externally\n").unwrap();
+        let mut e = Editor::new_from_text("x\n", Some(p.clone()), (80, 24));
+        e.document.stored_fp = None;        // "did not exist at load"
+        e.document.version = 1; e.document.saved_version = None;
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = Z;
+        { let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex };
+          dispatch_save(&mut ctx); }
+        assert!(e.prompt.is_some(), "a file appearing where there was none is a conflict");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn overwrite_save_bypasses_the_stat_check() {
+        use crate::jobs::{Executor, InlineExecutor};
+        use crate::registry::Ctx;
+        let p = scratch();
+        std::fs::write(&p, "v0\n").unwrap();
+        let mut e = Editor::new_from_text("mine\n", Some(p.clone()), (80, 24));
+        std::fs::write(&p, "external\n").unwrap(); // diverged
+        e.document.version = 1; e.document.saved_version = None;
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex }; overwrite_save(&mut ctx); }
+        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "mine\n", "overwrite wins");
+        assert!(!e.document.dirty());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn reload_from_disk_resets_to_file_and_marks_clean() {
+        let p = scratch();
+        std::fs::write(&p, "on disk\n").unwrap();
+        let mut e = Editor::new_from_text("in memory edits\n", Some(p.clone()), (80, 24));
+        e.document.version = 4; e.document.saved_version = None;
+        reload_from_disk(&mut e);
+        assert_eq!(e.document.buffer.to_string(), "on disk\n");
+        assert!(!e.document.dirty(), "reloaded buffer is clean");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
     fn dispatch_save_refuses_when_file_changed_on_disk() {
         let p = scratch();
         std::fs::write(&p, "original\n").unwrap();
