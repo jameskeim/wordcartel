@@ -203,7 +203,7 @@ pub fn run_subprocess(
         // Ask for at most (max_output - out_buf.len() + 1) bytes so limit_size
         // will trip at the right threshold.  The +1 ensures we see one byte past
         // the cap so we can distinguish "exactly max_output bytes of output" from
-        // "limit hit with more pending".  We treat >= max_output as TooLarge.
+        // "limit hit with more pending".  We treat > max_output as TooLarge.
         let remaining_cap = max_output.saturating_sub(out_buf.len()) + 1;
 
         // Reassign comm with per-iteration limits; limit_time/limit_size take
@@ -252,6 +252,7 @@ pub fn run_subprocess(
                 } else {
                     // Unexpected I/O error.
                     let _ = child.terminate();
+                    let _ = child.kill();
                     return Err(FilterError::Spawn(ce.error.to_string()));
                 }
             }
