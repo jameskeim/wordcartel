@@ -15,21 +15,47 @@ Spec: `docs/superpowers/specs/2026-06-21-wordcartel-design.md`
 | 3b | **block-role rendering** | `2026-06-22-wordcartel-03b-block-roles.md` | BlockKind heading-level + role_at query + md_parse block-prefix conceal + VisualRow role/glyph | ✅ COMPLETE (merged 4e88368; 95 lib + 27 oracle green; final opus review + Codex gate; oracle found+fixed 2 pre-existing 3a container-merge bugs; Codex found+fixed 3 conceal-fidelity gaps) |
 | 3c | **block_tree rope integration** | `2026-06-23-wordcartel-03c-blocktree-rope.md` | TextSource trait (&str + &Rope); incremental reparse materializes only the edited region (O(region)) so shell derive is O(visible)+O(edited), §3.9; oracle extended to str==rope==full | ✅ COMPLETE (merged 9f3f38d; 105 lib + 34 oracle green; opus READY-TO-MERGE + Codex pre-merge gate fixed an O(doc) gap-scan; perf probe: 78KB doc → 81-byte reparse; LF-only rope scan, str==rope==full @15k cases) |
 | 4a | **Terminal shell (sync)** | `2026-06-23-wordcartel-04a-terminal-shell.md` | runnable `wcartel` editor: Editor/Document/View + apply + derive (O(region) rope-incremental) + ratatui live-preview render + crossterm loop + cursor nav (cross-line/wrapped/intra-line-scroll) + edit/select(+replace)/clipboard/undo + atomic save | ✅ COMPLETE (merged d94fc39; 84 shell + 105 core + 34 oracle green; Codex plan-review + opus whole-branch + Codex pre-merge gates each found+fixed real bugs: selection-replace on type/paste/delete, intra-line scroll for tall paragraphs, dir-fsync durability, raw-mode rollback, loop double-rebuild). **Deferred to 4b:** undo/redo no-op robustness (dirty on empty-history undo; desired_col reset); CycleRenderMode ensure_visible; Copy-on-empty stores ""; shell len_lines unicode-vs-\n on bare \r/U+2028. |
-| 4b | IO async edges | _(later)_ | std::thread+mpsc worker (version-stamped discard), background save + swap/recovery + panic dump, filter primitive, repar transforms, system-clipboard sync, external-mod detection, targeted undo/redo reparse. **+ deferred 4a polish:** undo/redo no-op robustness (no spurious dirty; reset desired_col); CycleRenderMode ensure_visible; Copy-on-empty guard; shell \n-only line model (vs ropey unicode len_lines). **Plugin substrate (§18.4): keep the job/filter API general enough to host a plugin-invoked transform.** | PLANNED |
+| 4b | **Async substrate + crash safety** | `2026-06-23-wordcartel-04b-async-crash-safety.md` | general std::thread+mpsc job substrate (version-stamped discard, `Executor` test-injection, plugin-ready per §18.4) + unified-channel main loop (wake on job completion) + background save (saved_version/dirty model, reuses 4a `save_atomic`) + name-keyed command registry (§10.4 boundary; migrate 4a commands) + swap/recovery file (idle-debounce+max-cap) + panic-dump + external-mod detection + shared modal-prompt infra. **+ deferred 4a polish:** undo/redo no-op robustness; CycleRenderMode ensure_visible; Copy-on-empty guard; shell \n-only line model. **No new `repar` dep** (deferred to 4c). | SPEC WRITTEN (design approved 2026-06-23) — plan pending |
+| 4c | IO platform layer | _(later)_ | filter primitive (§3.5: argv default, shell opt-in, UTF-8 validate, size cap, timeout, Esc-cancel, deadlock-safe pipes) + `repar` dependency & in-process transforms (Reflow/Unwrap/Ventilate, §14.1) + pandoc export presets + system-clipboard sync (`arboard`/OSC 52, §15.6). **Plugin substrate (§18.4): the filter/transform commands register through 4b's registry; the job API hosts a plugin-invoked transform.** | PLANNED (split out of 4b on 2026-06-23) |
 | 5 | App | _(later)_ | data-driven keymap/config, command palette + hideable menu, spellcheck, mouse, word/page nav, wrap-guide. **Plugin substrate (§18.4): command dispatch MUST be a name-keyed registry (key→ID→handler); keymap + palette resolve through it; thin event-hook dispatch seam. Built-ins register the same way future plugins will.** | PLANNED |
 | P | **Plugin System (in-process Lua)** | _(post-1.0)_ | mlua runtime; sandboxed editor API (read state, edit via the single `apply` channel, register commands, bind keys, event hooks, jobs); security/permission model; plugin config + `--no-plugins` | PLANNED — **post-1.0** (§18); substrate built into Efforts 5 + 4b |
 
-> Effort 4 (IO/Shell, §10/§3.8/§14/§15) split into **Plan 4a** (the synchronous
-> runnable editor — open/render/edit/navigate/save) and **Plan 4b** (async edges,
-> slow IO, filters, repar, crash recovery). 4a ships a usable editor; 4b hardens
-> the edges & adds power features. Rationale in the 4a plan's Reuse Posture /
-> Self-Review. Data-driven keymap + palette + menu remain Effort 5.
+> Effort 4 (IO/Shell, §10/§3.8/§14/§15) split into **4a** (the synchronous runnable
+> editor — open/render/edit/navigate/save), **4b** (async job substrate + crash
+> safety: background save, swap/recovery, panic dump, external-mod, command
+> registry), and **4c** (the IO *platform* layer: filter primitive, repar
+> transforms, pandoc export, system-clipboard sync). 4a ships a usable editor; 4b
+> makes "never lose work" real and moves slow IO off the keystroke path; 4c adds the
+> Unix-pipe power features. The 4b/4c split was made when 4b was specced
+> (2026-06-23) to keep the safety-critical substrate separable from the platform
+> features. Data-driven keymap + palette + menu remain Effort 5.
 
 > Effort 2 (Render Kernel, §16/§13/§9.2) split into Plan 2 (render core — inline
 > conceal/style + the spike-validated layout/ColMap/cursor) and Plan 3 (incremental
 > block_tree + block-role rendering). Seam: md_parse/layout take a line's **block
 > role as input**; block_tree computes roles in Plan 3. Layout ports the validated
 > spike at `~/projects/wordcartel-layout-spike`.
+
+### Effort 5 — candidate dependencies (to evaluate when the plan is written)
+
+Surveyed 2026-06-23. These are ratatui-ecosystem widgets that map onto the
+Effort 5 surfaces (command palette, hideable menu, dialogs). **Not committed** —
+verify current version + maintenance status at adoption time. The hard
+architectural guardrail (§12.2): the palette/menu are **view layers over the
+name-keyed command registry** (the plugin substrate) — a widget renders and
+routes through the registry, it never owns the command list.
+
+| Crate | Maps to | Verdict | Notes |
+|---|---|---|---|
+| [`tui-popup`](https://github.com/joshka/tui-popup) | dirty-quit confirm (replaces `pending_quit` ad-hoc flag), save-as / error dialogs | **Adopt candidate** | By a core ratatui maintainer (joshka); low-risk centered popup. |
+| [`tui-menu`](https://github.com/shuoli84/tui-menu) | §12.2 hideable menu bar (File/Edit/Format/Insert/View/Export) | **Evaluate** | Tree/dropdown widget; treat as the view layer fed by the command registry, and confirm it can display each entry's chord (§12.2). Brings its own selection state. |
+| [`tui-overlay`](https://crates.io/crates/tui-overlay) | generic overlay compositing (palette over menu, stacked dialogs) | **Fallback** | Overlaps `tui-popup`. Pick ONE overlay strategy; reach for this only if popup can't stack. |
+| [`ratatui-image`](https://crates.io/crates/ratatui-image) | inline image display (kitty/iTerm2/sixel + capability detection) | **Backlog only** | §13.3/§13.5 defer inline images; v1 path is "open image externally". The crate to use *if* images get promoted off the backlog — not a 1.0 dep. |
+| [`tui-shimmer`](https://github.com/vinhnx/tui-shimmer) | decorative animated text (splash/empty-state) | **Out of scope (1.0)** | Tension with §3.2 distraction-free + §3.9 responsiveness (repaint churn). Opt-in splash at most, never in the editing surface. |
+| [`tui-tabs`](https://crates.io/crates/tui-tabs) / [`ratatui-comfy-tabs`](https://crates.io/crates/ratatui-comfy-tabs) | tab bar | **Out of scope (1.0)** | v1 is single-document/single-pane; tabs imply an undesigned workspace model that cuts against minimal chrome. Reassess only if multi-document editing becomes a post-1.0 goal. |
+
+The palette's fuzzy-search stack is already chosen in-spec (`nucleo`, §12.2); the
+menu/popup widget is the open choice this table tracks.
 
 ## Spec → effort map
 
@@ -42,9 +68,9 @@ Legend: ✅ done · 🔨 in this effort · ⏳ later effort · 📋 deferred to 
 | 3.10, 16.1 | `ropey` buffer; **byte offset = canonical position** | 1 | ✅ |
 | 9.1 | Undo = ChangeSet (retain/delete/insert) + branching history; `smartstring`; prose-tuned coalescing (~500 ms; break on paste / programmatic / cursor-move) | 1 | ✅ |
 | 9.1, 3.6 | Selection = anchor/head over byte offsets; `SmallVec<[Range;1]>`; `.map(&ChangeSet)` | 1 | ✅ |
-| 10.1 | Single mutation channel `apply(Transaction)`; selection mapped on the same atomic step | 1 (kernel `apply`) / 4 (wired loop) | 🔨/⏳ |
+| 10.1 | Single mutation channel `apply(Transaction)`; selection mapped on the same atomic step | 1 (kernel `apply`) / 4a (wired loop) / 4b (job `merge` routes doc edits through `apply`) | 🔨/⏳ |
 | 10.2 | `version: u64` revision token | 1 | 🔨 |
-| 10.3 | O(1) rope snapshots for async workers | 1 (snapshot API) / 3 (workers) | 🔨/⏳ |
+| 10.3 | O(1) rope snapshots for async workers; reconcile = version-discard | 1 (snapshot API) / 4b (`2026-06-23-wordcartel-04b-async-crash-safety.md`: job substrate + workers) | 🔨/⏳ |
 | 3.6, 9.5, 15.6 | In-process clipboard **register** (system sync is effort 3) | 1 (register) / 3 (system) | 🔨/⏳ |
 | 11 | Test strategy: proptest invariants, round-trip laws, committed regressions, golden | 1 (kernel laws) + all | 🔨 |
 | 3.9 | Perf budget (p95 < 16 ms; reparse < 5 ms; ~5 MB) | 2–4 (render/loop) | ⏳ |
@@ -56,11 +82,12 @@ Legend: ✅ done · 🔨 in this effort · ⏳ later effort · 📋 deferred to 
 | 3.5 | `filter` primitive (argv default, caps, timeout, cancel) | 3 | ⏳ |
 | 3.1, 14 | pandoc export; repar in-process transforms | 3 | ⏳ |
 | 14.3 | Atomic save (`repar::atomic`); width helper | 3 | ⏳ |
-| 3.8, 10 | ratatui+crossterm; sync loop; functional-core/imperative-shell | 3 (shell) / 4 (loop) | ⏳ |
-| 12, 10.4 | Config (TOML, precedence, project-local); keymap-as-data; command palette + menu; **name-keyed command registry (plugin substrate)** | 5 | ⏳ |
+| 3.8, 10 | ratatui+crossterm; sync loop; functional-core/imperative-shell | 4a (sync shell+loop) / 4b (unified-channel loop, wake on job completion) | 🔨/⏳ |
+| 10.4 | **name-keyed command registry (key→ID→handler; plugin substrate)** | 4b (`2026-06-23-wordcartel-04b-async-crash-safety.md` §4.4: mechanism + migrate 4a commands) | 🔨 |
+| 12 | Config (TOML, precedence, project-local); keymap-as-data; command palette + menu (resolve through the 4b registry) | 5 | ⏳ |
 | 5, 3.5 | Basic spellcheck (diagnostic); basic mouse | 4 | ⏳ |
 | 13.2 | No-color / high-contrast accessibility | 3 (paint) / 4 (chrome) | ⏳ |
-| 15 | Error handling & recovery; swap-file; panic dump | 3 (save/panic) / 4 (surface) | ⏳ |
+| 15 | Error handling & recovery; swap-file; panic dump; external-mod detection; background-save failure keeps file+dirty | 4a (atomic save) / 4b (`2026-06-23-wordcartel-04b-async-crash-safety.md` §4.3,§5: bg save, swap/recovery, panic dump, external-mod, modal surface) | 🔨/⏳ |
 | 5 | Incremental search (`regex-cursor`); writing aids (word count, focus) | 4 | ⏳ |
 | 18 | Plugin system (in-process Lua): registry/hook substrate; sandboxed `apply`-channel API; security; config | P (post-1.0); substrate in 5/4b | 📋 |
 
