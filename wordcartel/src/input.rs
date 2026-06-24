@@ -98,6 +98,7 @@ pub fn key_to_command_id(key: KeyEvent) -> Option<KeyAction> {
         KeyCode::Char('s') if ctrl           => id("save"),
         KeyCode::Char('q') if ctrl           => id("quit"),
         KeyCode::Char('e') if ctrl           => id("filter"),
+        KeyCode::Char('t') if ctrl           => id("transform"),
         KeyCode::Char('\\') if ctrl          => id("cycle_render_mode"),
 
         KeyCode::Left  => id(if shift { "select_left" } else { "move_left" }),

@@ -260,6 +260,9 @@ pub fn resolve_prompt(
                 crate::export::do_export(editor, &pe.ext, &pe.target, msg_tx, true);
             }
         }
+        PromptAction::Transform(kind) => {
+            crate::transform::dispatch_transform(editor, kind, clock, msg_tx);
+        }
     }
     editor.prompt = None;
 }
@@ -1217,6 +1220,67 @@ mod tests {
         let _ = std::fs::remove_file(&output_path);
         let _ = std::fs::remove_file(&source);
         let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    #[test]
+    fn transform_chooser_maps_keys_to_kinds() {
+        use crate::prompt::{Prompt, PromptAction};
+        use crate::transform::TransformKind;
+        let p = Prompt::transform_chooser();
+        assert_eq!(p.action_for('r'), Some(PromptAction::Transform(TransformKind::Reflow)));
+        assert_eq!(p.action_for('u'), Some(PromptAction::Transform(TransformKind::Unwrap)));
+        assert_eq!(p.action_for('v'), Some(PromptAction::Transform(TransformKind::Ventilate)));
+        assert_eq!(p.action_for('x'), None);
+    }
+
+    #[test]
+    fn ctrl_t_opens_the_transform_chooser() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let key = Event::Key(KeyEvent { code: KeyCode::Char('t'), modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(key), &mut e, &reg, &ex, &clk, &tx);
+        assert!(e.prompt.is_some(), "Ctrl+T must open the transform chooser");
+        assert_eq!(
+            e.prompt.as_ref().unwrap().action_for('r'),
+            Some(crate::prompt::PromptAction::Transform(crate::transform::TransformKind::Reflow)),
+        );
+    }
+
+    #[test]
+    fn reflow_whole_buffer_applies_one_undoable_edit() {
+        use crate::editor::Editor;
+        use crate::transform::TransformKind;
+        let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau\n";
+        let mut e = Editor::new_from_text(long, None, (80, 24));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        // dispatch_transform takes (editor, kind, clock, msg_tx) — see Task 3 Step 6.
+        crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, &TestClock(0), &tx);
+        let after = e.active().document.buffer.to_string();
+        assert_ne!(after, long, "reflow should rewrap the long line");
+        // exactly one undo restores the original
+        e.active_mut().undo();
+        assert_eq!(e.active().document.buffer.to_string(), long);
+    }
+
+    #[test]
+    fn transform_with_identical_output_makes_no_edit() {
+        use crate::editor::Editor;
+        use crate::transform::TransformKind;
+        // Already one-sentence-per-line: ventilate is a no-op → no edit, "already" status.
+        let text = "Short.\n";
+        let mut e = Editor::new_from_text(text, None, (80, 24));
+        let v0 = e.active().document.version;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::transform::dispatch_transform(&mut e, TransformKind::Ventilate, &TestClock(0), &tx);
+        assert_eq!(e.active().document.buffer.to_string(), text);
+        assert_eq!(e.active().document.version, v0, "no-op transform must not bump version");
+        assert!(e.status.contains("already"));
     }
 
     #[test]

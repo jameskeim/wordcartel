@@ -13,6 +13,7 @@ pub enum PromptAction {
     Recover,
     DiscardSwap,
     OpenOriginal,
+    Transform(crate::transform::TransformKind),
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +68,18 @@ impl Prompt {
                 Choice { key: 'r', label: "Recover",       action: PromptAction::Recover },
                 Choice { key: 'd', label: "Discard swap",  action: PromptAction::DiscardSwap },
                 Choice { key: 'o', label: "Open original", action: PromptAction::OpenOriginal },
+            ],
+        }
+    }
+
+    pub fn transform_chooser() -> Prompt {
+        use crate::transform::TransformKind;
+        Prompt {
+            message: "transform: [r]eflow  [u]nwrap  [v]entilate".into(),
+            choices: vec![
+                Choice { key: 'r', label: "Reflow",    action: PromptAction::Transform(TransformKind::Reflow) },
+                Choice { key: 'u', label: "Unwrap",    action: PromptAction::Transform(TransformKind::Unwrap) },
+                Choice { key: 'v', label: "Ventilate", action: PromptAction::Transform(TransformKind::Ventilate) },
             ],
         }
     }

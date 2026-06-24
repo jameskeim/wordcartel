@@ -18,7 +18,6 @@ impl TransformKind {
         }
     }
     /// Past-tense success word: "reflowed" / "unwrapped" / "ventilated".
-    #[allow(dead_code)] // wired in Task 3/4
     pub fn past_tense(self) -> &'static str {
         match self { Self::Reflow => "reflowed", Self::Unwrap => "unwrapped", Self::Ventilate => "ventilated" }
     }
@@ -29,7 +28,6 @@ impl TransformKind {
     }
 }
 
-#[allow(dead_code)] // wired in Task 3/4
 #[derive(Debug)]
 pub enum TransformError { Repar(String) }
 
@@ -40,7 +38,6 @@ impl std::fmt::Display for TransformError {
 }
 
 impl TransformError {
-    #[allow(dead_code)] // wired in Task 3/4
     fn from_repar(e: repar::ParError) -> TransformError { TransformError::Repar(e.to_string()) }
 }
 
@@ -72,7 +69,6 @@ pub fn snap_to_blocks(blocks: &BlockTree, from: usize, to: usize) -> std::ops::R
 
 /// The byte range a transform should reformat: whole buffer when the primary
 /// selection is empty, else the selection snapped to whole blocks.
-#[allow(dead_code)] // wired in Task 3
 pub fn region_for_transform(doc: &crate::editor::Document) -> std::ops::Range<usize> {
     let sel = doc.selection.primary();
     let buf_len = doc.buffer.len(); // TextBuffer::len() is the byte length (buffer.rs)
@@ -80,6 +76,62 @@ pub fn region_for_transform(doc: &crate::editor::Document) -> std::ops::Range<us
         0..buf_len
     } else {
         snap_to_blocks(&doc.blocks, sel.from(), sel.to())
+    }
+}
+
+use std::ops::Range;
+
+/// Run a transform over the active buffer's resolved region. Task 3: synchronous
+/// (`_msg_tx` unused until Task 4 adds the >= TRANSFORM_ASYNC_THRESHOLD off-thread branch).
+/// `clock` is the same &dyn Clock that resolve_prompt receives.
+pub fn dispatch_transform(
+    editor: &mut crate::editor::Editor,
+    kind: TransformKind,
+    clock: &dyn wordcartel_core::history::Clock,
+    _msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+) {
+    let range = region_for_transform(&editor.active().document);
+    if range.is_empty() {
+        editor.status = "nothing to transform".into();
+        return;
+    }
+    // Task 4: if range.len() >= TRANSFORM_ASYNC_THRESHOLD, snapshot + spawn + send
+    //         Msg::TransformDone instead of running inline. For now, run sync.
+    let input = editor.active().document.buffer.slice(range.clone()).to_string();
+    let result = run_transform(kind, &input, DEFAULT_REFLOW_WIDTH);
+    apply_transform_result(editor, kind, range, result, clock);
+}
+
+/// Shared merge for sync (Task 3) and async (Task 4): apply the transform output
+/// as one undoable edit, with the §6.2 status contract. `range` is the byte range
+/// that was transformed; `result` is the repar output for that range.
+pub fn apply_transform_result(
+    editor: &mut crate::editor::Editor,
+    kind: TransformKind,
+    range: Range<usize>,
+    result: Result<String, TransformError>,
+    clock: &dyn wordcartel_core::history::Clock,
+) {
+    match result {
+        Err(e) => {
+            editor.status = format!("transform failed: {e}");
+        }
+        Ok(out) => {
+            let current = editor.active().document.buffer.slice(range.clone()).to_string();
+            if out == current {
+                editor.status = format!("already {}", kind.past_tense());
+                return;
+            }
+            let doc_len = editor.active().document.buffer.len();
+            let (cs, edit) = crate::commands::build_range_replace(range.start, range.end, &out, doc_len);
+            let txn = wordcartel_core::history::Transaction::new(cs);
+            // End the active() read borrow before active_mut() apply, then rebuild after.
+            editor.active_mut().apply(
+                txn, edit, wordcartel_core::history::EditKind::Other, clock);
+            crate::derive::rebuild(editor);
+            crate::nav::ensure_visible(editor);
+            editor.status = kind.past_tense().to_string();
+        }
     }
 }
 

@@ -80,6 +80,11 @@ impl Registry {
             crate::export::run_export(c.editor, "pdf", &c.msg_tx);
             CommandResult::Handled
         });
+        // Transform chooser.
+        map.insert(CommandId("transform"), |c| {
+            c.editor.prompt = Some(crate::prompt::Prompt::transform_chooser());
+            CommandResult::Handled
+        });
         Registry { map }
     }
 
@@ -161,6 +166,21 @@ mod tests {
         assert!(matches!(
             crate::input::key_to_command_id(ctrl_e),
             Some(crate::input::KeyAction::Id(CommandId("filter")))
+        ));
+    }
+
+    #[test]
+    fn keymap_ctrl_t_is_transform() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let ctrl_t = KeyEvent {
+            code: KeyCode::Char('t'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        assert!(matches!(
+            crate::input::key_to_command_id(ctrl_t),
+            Some(crate::input::KeyAction::Id(CommandId("transform")))
         ));
     }
 }
