@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 wordcartel-core = { path = "../wordcartel-core" }
-ropey = "=1.6.1"
+ropey = { version = "=1.6.1", default-features = false, features = ["simd"] }
 ratatui = "0.29"
 crossterm = "0.28"
 thiserror = "2"

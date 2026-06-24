@@ -6,7 +6,7 @@ license = "MIT"
 
 [dependencies]
 pulldown-cmark = "0.13"
-ropey = "=1.6.1"
+ropey = { version = "=1.6.1", default-features = false, features = ["simd"] }
 smartstring = "1"
 smallvec = "1"
 unicode-segmentation = "1"
