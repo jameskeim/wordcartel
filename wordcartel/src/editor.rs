@@ -136,6 +136,7 @@ impl Editor {
         self.document.version += 1;
         self.pre_edit_rope = Some(old_rope);
         self.last_edit = Some(edit);
+        crate::recovery::record_snapshot(self.document.path.as_deref(), self.document.buffer.snapshot());
     }
 
     /// Undo the last revision. Returns `true` iff the buffer changed.

@@ -72,7 +72,9 @@ pub fn install_panic_hook() {
     HOOK_INSTALLED.call_once(|| {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            // Best-effort restore — ignore errors (we're already panicking).
+            // Best-effort emergency dump (try_lock; never deadlock).
+            crate::recovery::dump_on_panic();
+            // Restore the terminal.
             let _ = disable_raw_mode();
             let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
             prev(info);

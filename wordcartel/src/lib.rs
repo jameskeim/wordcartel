@@ -14,3 +14,4 @@ pub mod jobs;
 pub mod save;
 pub mod app;   // App::run + the testable App::step (Task 12)
 pub mod swap;
+pub mod recovery;
