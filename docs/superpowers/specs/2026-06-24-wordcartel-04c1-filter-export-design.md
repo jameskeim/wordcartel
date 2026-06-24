@@ -138,10 +138,13 @@ pub enum Input { SelectionElseBuffer, None, WholeBuffer }
    (foreground-only). Spawn the **dedicated filter thread**, which owns the
    `subprocess::Popen` (the kill target). **One filter at a time** — a second
    invocation while `filter_in_flight.is_some()` is rejected with a status.
-3. **Run (filter thread).** Spawn the child in a **new process group**
-   (`PopenConfig { setpgid: true, .. }`) so cancel/timeout can kill the *group*
-   (a shell preset's grandchildren too — `terminate()`/SIGTERM to the child alone
-   leaves them running; use `send_signal`/group kill). Drive
+3. **Run (filter thread).** **Cancellation kill scope (plan-discovered):** the shell
+   crate is `#![forbid(unsafe_code)]`, so `libc::kill(-pgid, …)` (process-group kill)
+   is unavailable without a safe wrapper. **4c-1 kills the child only**
+   (`terminate()` then `kill()` if it lingers) — sufficient because 4c-1 ships only
+   **argv** filters + pandoc (no shell-pipeline grandchildren). Group-kill (via
+   `nix::killpg`, a safe wrapper, with `PopenConfig { setpgid: true }`) is **deferred
+   to when shell-pipeline presets ship** (4c-2/5). Drive
    `communicate_start(Some(stdin_bytes)).limit_time(timeout).limit_size(max_output).read()`
    — the `Communicator` form gives deadlock-safe concurrent stdin/stdout **plus**
    the timeout and size cap (the plain string `communicate()` lacks both and
