@@ -38,6 +38,12 @@ pub enum Msg {
         buffer_id: crate::editor::BufferId,
         target: std::path::PathBuf,
         result: Result<crate::export::ExportResult, crate::filter::FilterError>,
+        /// True when the user explicitly confirmed overwriting an existing
+        /// target via the OverwriteExport prompt.  False when export was
+        /// dispatched because the target did not exist at check time — in which
+        /// case finalization must refuse to clobber a target that appeared in
+        /// the meantime (TOCTOU guard; Codex pre-merge gate).
+        overwrite_confirmed: bool,
     },
     Tick,
 }
@@ -138,7 +144,26 @@ fn apply_export_done(
     editor: &mut crate::editor::Editor,
     target: std::path::PathBuf,
     result: Result<crate::export::ExportResult, crate::filter::FilterError>,
+    overwrite_confirmed: bool,
 ) {
+    // TOCTOU guard (Codex pre-merge gate): run_export only prompts for overwrite
+    // if the target existed at check time.  When it did not (overwrite_confirmed
+    // == false) but the target has since appeared, refuse to clobber it silently
+    // — the user never agreed to replace it.  (A pre-existing target always went
+    // through the OverwriteExport prompt, so overwrite_confirmed is true there.)
+    // The residual check-to-write window is microseconds vs. the whole pandoc
+    // run; an unsafe-free atomic no-replace rename is unavailable under
+    // #![forbid(unsafe_code)].
+    if !overwrite_confirmed && target.exists() {
+        if let Ok(crate::export::ExportResult::TempReady(tmp)) = &result {
+            let _ = std::fs::remove_file(tmp);
+        }
+        editor.status = format!(
+            "export target {} appeared — re-run export to overwrite",
+            target.display()
+        );
+        return;
+    }
     match result {
         Ok(crate::export::ExportResult::Bytes(bytes)) => {
             match file::save_atomic_bytes(&target, &bytes) {
@@ -231,7 +256,8 @@ pub fn resolve_prompt(
         }
         PromptAction::OverwriteExport => {
             if let Some(pe) = editor.pending_export.take() {
-                crate::export::do_export(editor, &pe.ext, &pe.target, msg_tx);
+                // User explicitly confirmed clobbering the existing target.
+                crate::export::do_export(editor, &pe.ext, &pe.target, msg_tx, true);
             }
         }
     }
@@ -294,8 +320,8 @@ pub fn reduce(
             Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {
                 apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, clock);
             }
-            Msg::ExportDone { target, result, .. } => {
-                apply_export_done(editor, target, result);
+            Msg::ExportDone { target, result, overwrite_confirmed, .. } => {
+                apply_export_done(editor, target, result, overwrite_confirmed);
             }
             // Resize/Tick/other input: ignored for the modal, but results still drain below.
             _ => {}
@@ -383,8 +409,8 @@ pub fn reduce(
         Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {
             apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, clock);
         }
-        Msg::ExportDone { target, result, .. } => {
-            apply_export_done(editor, target, result);
+        Msg::ExportDone { target, result, overwrite_confirmed, .. } => {
+            apply_export_done(editor, target, result, overwrite_confirmed);
         }
         Msg::Tick => {
             let now = clock.now_ms();
@@ -1038,6 +1064,7 @@ mod tests {
             buffer_id,
             target: output_path.clone(),
             result: Ok(ExportResult::Bytes(content_bytes.clone())),
+            overwrite_confirmed: false,
         };
         crate::app::reduce(msg, &mut e, &reg, &ex, &clk, &tx);
 
@@ -1048,6 +1075,100 @@ mod tests {
         assert!(e.status.contains("exported"), "status must say exported");
 
         // Clean up.
+        let _ = std::fs::remove_file(&output_path);
+        let _ = std::fs::remove_file(&source);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    #[test]
+    fn exportdone_unconfirmed_refuses_when_target_appeared() {
+        // TOCTOU guard (Codex pre-merge gate): export was dispatched because the
+        // target did not exist (overwrite_confirmed=false), but a target file has
+        // since appeared.  Finalization must NOT clobber it — the user never
+        // agreed to overwrite — and must leave the existing content intact.
+        use crate::editor::Editor;
+        use crate::export::ExportResult;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "wc-export-toctou-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+        let source = tmp_dir.join("notes.md");
+        std::fs::write(&source, "# Hello\n").expect("write source");
+        let output_path = tmp_dir.join("notes.html");
+        // Simulate the race: a file appeared at the target between the check and
+        // the completion.
+        std::fs::write(&output_path, b"PRE-EXISTING\n").expect("write racing target");
+
+        let mut e = Editor::new_from_text("# Hello\n", Some(source.clone()), (80, 24));
+        let buffer_id = e.active().id;
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        let msg = Msg::ExportDone {
+            buffer_id,
+            target: output_path.clone(),
+            result: Ok(ExportResult::Bytes(b"<h1>Hello</h1>\n".to_vec())),
+            overwrite_confirmed: false,
+        };
+        crate::app::reduce(msg, &mut e, &reg, &ex, &clk, &tx);
+
+        // The racing file is untouched; status tells the user to re-run.
+        let got = std::fs::read(&output_path).expect("read target");
+        assert_eq!(got, b"PRE-EXISTING\n", "unconfirmed export must not clobber an appeared target");
+        assert!(e.status.contains("re-run"), "status must prompt a re-run, got: {}", e.status);
+
+        let _ = std::fs::remove_file(&output_path);
+        let _ = std::fs::remove_file(&source);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    #[test]
+    fn exportdone_confirmed_overwrites_existing_target() {
+        // The complement: when the user confirmed the overwrite
+        // (overwrite_confirmed=true), an existing target IS replaced.
+        use crate::editor::Editor;
+        use crate::export::ExportResult;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "wc-export-confirmed-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+        let source = tmp_dir.join("notes.md");
+        std::fs::write(&source, "# Hello\n").expect("write source");
+        let output_path = tmp_dir.join("notes.html");
+        std::fs::write(&output_path, b"OLD\n").expect("write existing target");
+
+        let mut e = Editor::new_from_text("# Hello\n", Some(source.clone()), (80, 24));
+        let buffer_id = e.active().id;
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        let new_bytes = b"<h1>Hello</h1>\n".to_vec();
+        let msg = Msg::ExportDone {
+            buffer_id,
+            target: output_path.clone(),
+            result: Ok(ExportResult::Bytes(new_bytes.clone())),
+            overwrite_confirmed: true,
+        };
+        crate::app::reduce(msg, &mut e, &reg, &ex, &clk, &tx);
+
+        let got = std::fs::read(&output_path).expect("read target");
+        assert_eq!(got, new_bytes, "confirmed export must overwrite the existing target");
+        assert!(e.status.contains("exported"));
+
         let _ = std::fs::remove_file(&output_path);
         let _ = std::fs::remove_file(&source);
         let _ = std::fs::remove_dir(&tmp_dir);
@@ -1086,6 +1207,7 @@ mod tests {
             buffer_id,
             target: output_path.clone(),
             result: Ok(ExportResult::Bytes(content_bytes.clone())),
+            overwrite_confirmed: false,
         };
         crate::app::reduce(msg, &mut e, &reg, &ex, &clk, &tx);
 

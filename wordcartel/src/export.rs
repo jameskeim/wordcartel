@@ -92,6 +92,7 @@ pub(crate) fn do_export(
     ext: &str,
     target: &Path,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+    overwrite_confirmed: bool,
 ) {
     let sink = sink_for_ext(ext);
     let buffer_id = editor.active().id;
@@ -101,7 +102,12 @@ pub(crate) fn do_export(
 
     std::thread::spawn(move || {
         let result = run_pandoc(sink, &stdin, &target);
-        let _ = msg_tx.send(crate::app::Msg::ExportDone { buffer_id, target, result });
+        let _ = msg_tx.send(crate::app::Msg::ExportDone {
+            buffer_id,
+            target,
+            result,
+            overwrite_confirmed,
+        });
     });
 }
 
@@ -213,7 +219,9 @@ pub fn run_export(
         return;
     }
 
-    do_export(editor, ext, &target, msg_tx);
+    // Target did not exist: dispatch without overwrite confirmation.  If it
+    // appears before the write completes, finalization refuses to clobber it.
+    do_export(editor, ext, &target, msg_tx, false);
 }
 
 // ---------------------------------------------------------------------------
