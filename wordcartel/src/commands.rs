@@ -337,16 +337,22 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         }
 
         Command::Undo => {
-            editor.undo();
+            if !editor.undo() {
+                return CommandResult::Noop;
+            }
             derive::rebuild(editor);
             nav::ensure_visible(editor);
+            editor.desired_col = None;
             CommandResult::Handled
         }
 
         Command::Redo => {
-            editor.redo();
+            if !editor.redo() {
+                return CommandResult::Noop;
+            }
             derive::rebuild(editor);
             nav::ensure_visible(editor);
+            editor.desired_col = None;
             CommandResult::Handled
         }
 

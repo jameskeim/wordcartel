@@ -107,28 +107,35 @@ impl Editor {
         self.last_edit = Some(edit);
     }
 
-    /// Undo the last revision. Sets `last_edit`/`pre_edit_rope` to `None` so
-    /// Task 3's derive falls back to a full reparse.
-    pub fn undo(&mut self) {
-        if let Some(sel) = self.document.history.undo(&mut self.document.buffer) {
-            self.document.selection = sel;
+    /// Undo the last revision. Returns `true` iff the buffer changed.
+    /// On a no-op (empty history) it leaves version/dirty/derive-hints untouched.
+    pub fn undo(&mut self) -> bool {
+        match self.document.history.undo(&mut self.document.buffer) {
+            Some(sel) => {
+                self.document.selection = sel;
+                self.document.version += 1;
+                self.document.dirty = true;
+                self.last_edit = None;
+                self.pre_edit_rope = None;
+                true
+            }
+            None => false,
         }
-        self.document.version += 1;
-        self.document.dirty = true;
-        self.last_edit = None;
-        self.pre_edit_rope = None;
     }
 
-    /// Redo the next revision. Sets `last_edit`/`pre_edit_rope` to `None` so
-    /// Task 3's derive falls back to a full reparse.
-    pub fn redo(&mut self) {
-        if let Some(sel) = self.document.history.redo(&mut self.document.buffer) {
-            self.document.selection = sel;
+    /// Redo the next revision. Returns `true` iff the buffer changed.
+    pub fn redo(&mut self) -> bool {
+        match self.document.history.redo(&mut self.document.buffer) {
+            Some(sel) => {
+                self.document.selection = sel;
+                self.document.version += 1;
+                self.document.dirty = true;
+                self.last_edit = None;
+                self.pre_edit_rope = None;
+                true
+            }
+            None => false,
         }
-        self.document.version += 1;
-        self.document.dirty = true;
-        self.last_edit = None;
-        self.pre_edit_rope = None;
     }
 }
 
@@ -181,5 +188,17 @@ mod tests {
         assert!(e.last_edit.is_none()); // undo forces a full reparse in derive
         e.redo();
         assert_eq!(e.document.buffer.to_string(), "aXb\n");
+    }
+
+    #[test]
+    fn undo_on_empty_history_is_true_noop() {
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        let v0 = e.document.version;
+        e.desired_col = Some(3);
+        let changed = e.undo();
+        assert!(!changed, "undo with empty history must report no change");
+        assert_eq!(e.document.version, v0, "version must not move on a no-op undo");
+        assert!(!e.document.dirty, "a no-op undo must not dirty the buffer");
+        assert_eq!(e.desired_col, Some(3), "a no-op undo must not reset desired_col");
     }
 }
