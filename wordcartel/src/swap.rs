@@ -193,6 +193,21 @@ mod tests {
     }
 
     #[test]
+    fn body_containing_separator_round_trips() {
+        // A body that itself contains a "\n---\n" line must round-trip: split_once
+        // takes the FIRST match (the header boundary), leaving the body intact.
+        let h = SwapHeader {
+            realpath: None, load_mtime_secs: None, load_size: None,
+            content_hash: fnv1a64(b"first\n---\nsecond\n"),
+            version: 1, ts_ms: 1, pid: 1,
+        };
+        let body = "first\n---\nsecond\n";
+        let (h2, b2) = parse(&serialize(&h, body)).expect("must parse");
+        assert_eq!(h2, h);
+        assert_eq!(b2, body, "body containing the separator must survive round-trip");
+    }
+
+    #[test]
     fn parse_rejects_unknown_format() {
         assert!(parse("garbage\nwith no header\n").is_none());
     }
