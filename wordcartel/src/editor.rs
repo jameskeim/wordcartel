@@ -65,6 +65,7 @@ pub struct Editor {
     // Threaded from `apply` → `derive` for the O(region) incremental reparse (Effort 3c):
     pub pre_edit_rope: Option<ropey::Rope>, // O(1) snapshot taken BEFORE the edit
     pub last_edit: Option<wordcartel_core::block_tree::Edit>, // the block_tree edit (range, new_len); None ⇒ full reparse
+    pub prompt: Option<crate::prompt::Prompt>,
 }
 
 impl Editor {
@@ -98,6 +99,7 @@ impl Editor {
             pending_quit: false,
             pre_edit_rope: None,
             last_edit: None,
+            prompt: None,
         }
     }
 
