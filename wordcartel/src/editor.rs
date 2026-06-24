@@ -109,6 +109,7 @@ pub struct Editor {
     pub prompt: Option<crate::prompt::Prompt>,
     pub quit_after_save: Option<u64>,
     pub quit_after_save_at: Option<u64>,
+    pub filter_in_flight: Option<crate::filter::CancelFlag>,
 }
 
 impl Editor {
@@ -129,6 +130,7 @@ impl Editor {
             buffers: Vec::new(), active: 0, next_buffer_id: 0,
             register: Register::default(), status: String::new(), quit: false,
             prompt: None, quit_after_save: None, quit_after_save_at: None,
+            filter_in_flight: None,
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer {

@@ -1,10 +1,8 @@
-//! Filter primitive — data types only (no execution).
+//! Filter primitive — subprocess execution and async dispatch.
 //!
 //! Execution (spawning subprocesses, merging output) is wired in Task 2/3.
 //! Export types (`ExportSink`, `ExportResult`) live in `export.rs` (Task 5).
 
-// wired in Task 2/3/5
-#[allow(dead_code)]
 /// Specification for a text-filter command.
 pub struct FilterSpec {
     pub argv: Vec<String>,
@@ -15,8 +13,6 @@ pub struct FilterSpec {
     pub max_output: usize,
 }
 
-// wired in Task 2/3
-#[allow(dead_code)]
 /// How the filter's output is merged back into the document.
 ///
 /// TEXT-ONLY: `Export` is a separate path built in Task 5 — not here.
@@ -28,8 +24,6 @@ pub enum Disposition {
     Insert,
 }
 
-// wired in Task 2/3
-#[allow(dead_code)]
 /// What bytes are sent to the subprocess's stdin.
 #[derive(Clone, Debug)]
 pub enum Input {
@@ -41,8 +35,6 @@ pub enum Input {
     WholeBuffer,
 }
 
-// wired in Task 2/3
-#[allow(dead_code)]
 /// Errors that can occur when running a filter.
 #[derive(Clone, Debug, PartialEq)]
 pub enum FilterError {
@@ -73,8 +65,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 ///
 /// The poll loop in `run_subprocess` checks this every ~50 ms and kills the
 /// child immediately when it is set, so Esc-key cancellation latency is bounded.
-#[allow(dead_code)] // wired in Task 3/5
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CancelFlag(pub Arc<AtomicBool>);
 
 impl CancelFlag {
@@ -97,7 +88,6 @@ impl CancelFlag {
 ///
 /// No `Exported` variant: export is a separate path built in Task 5, which
 /// calls `run_subprocess` directly for raw bytes.
-#[allow(dead_code)] // wired in Task 3/5
 #[derive(Debug)]
 pub enum RunResult {
     /// The filter produced valid UTF-8 stdout.
@@ -286,7 +276,6 @@ pub fn run_subprocess(
 /// Thin wrapper around `run_subprocess` that converts the raw bytes to a
 /// `String`, returning `Err(NotUtf8)` for non-UTF-8 output.
 /// `Exported` is NOT a variant here — export is Task 5's separate path.
-#[allow(dead_code)] // wired in Task 3
 pub fn run_filter(spec: &FilterSpec, stdin: String, cancel: &CancelFlag) -> RunResult {
     match run_subprocess(
         &spec.argv,
@@ -302,6 +291,59 @@ pub fn run_filter(spec: &FilterSpec, stdin: String, cancel: &CancelFlag) -> RunR
         },
         Err(e) => RunResult::Err(e),
     }
+}
+
+pub fn describe_error(err: &FilterError) -> String {
+    match err {
+        FilterError::NonZero { code, stderr } => format!("{code}: {stderr}"),
+        FilterError::Timeout => "filter timed out".into(),
+        FilterError::Cancelled => "filter cancelled".into(),
+        FilterError::TooLarge => "filter output too large".into(),
+        FilterError::NotUtf8 => "filter produced non-text output".into(),
+        FilterError::Spawn(m) => format!("cannot run filter: {m}"),
+        FilterError::ExportWrite(m) => m.clone(),
+    }
+}
+
+pub fn dispatch_filter(
+    editor: &mut crate::editor::Editor,
+    spec: FilterSpec,
+    msg_tx: std::sync::mpsc::Sender<crate::app::Msg>,
+) {
+    if editor.filter_in_flight.is_some() {
+        editor.status = "a filter is already running".into();
+        return;
+    }
+    let b = editor.active();
+    let buffer_id = b.id;
+    let version = b.document.version;
+    let sel = b.document.selection.primary();
+    let (range, cursor) = match spec.input {
+        Input::SelectionElseBuffer if !sel.is_empty() => (sel.from()..sel.to(), sel.from()),
+        Input::SelectionElseBuffer | Input::WholeBuffer => (0..b.document.buffer.len(), sel.head),
+        Input::None => (sel.head..sel.head, sel.head),
+    };
+    let snapshot = b.document.buffer.snapshot();
+    let cancel = CancelFlag::new();
+    editor.filter_in_flight = Some(cancel.clone());
+    editor.status = format!("running {} ...", spec.argv.first().cloned().unwrap_or_default());
+    let disposition = spec.disposition.clone();
+    let range_c = range.clone();
+    std::thread::spawn(move || {
+        let stdin = match spec.input {
+            Input::None => String::new(),
+            _ => snapshot.byte_slice(range_c.clone()).to_string(),
+        };
+        let outcome = run_filter(&spec, stdin, &cancel);
+        let _ = msg_tx.send(crate::app::Msg::FilterDone {
+            buffer_id,
+            version,
+            range: range_c,
+            cursor,
+            disposition,
+            outcome,
+        });
+    });
 }
 
 fn truncate(s: &str, n: usize) -> String {

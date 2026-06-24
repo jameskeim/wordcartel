@@ -26,7 +26,34 @@ use wordcartel_core::history::Clock;
 pub enum Msg {
     Input(Event),
     JobDone(JobResult),
+    FilterDone {
+        buffer_id: crate::editor::BufferId,
+        version: u64,
+        range: std::ops::Range<usize>,
+        cursor: usize,
+        disposition: crate::filter::Disposition,
+        outcome: crate::filter::RunResult,
+    },
     Tick,
+}
+
+impl std::fmt::Debug for Msg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Msg::Input(_) => f.write_str("Input(..)"),
+            Msg::JobDone(_) => f.write_str("JobDone(..)"),
+            Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => f
+                .debug_struct("FilterDone")
+                .field("buffer_id", buffer_id)
+                .field("version", version)
+                .field("range", range)
+                .field("cursor", cursor)
+                .field("disposition", disposition)
+                .field("outcome", outcome)
+                .finish(),
+            Msg::Tick => f.write_str("Tick"),
+        }
+    }
 }
 
 /// Merge a finished job's effect on the foreground, honoring staleness (§10.3).
@@ -51,15 +78,64 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
     }
 }
 
+fn apply_filter_done(
+    editor: &mut crate::editor::Editor,
+    buffer_id: crate::editor::BufferId,
+    version: u64,
+    range: std::ops::Range<usize>,
+    cursor: usize,
+    disposition: crate::filter::Disposition,
+    outcome: crate::filter::RunResult,
+    clock: &dyn wordcartel_core::history::Clock,
+) {
+    editor.filter_in_flight = None;
+    let stale = editor.by_id(buffer_id).map(|b| b.document.version) != Some(version);
+    match outcome {
+        _ if stale => {
+            editor.status = "filter discarded - buffer changed".into();
+        }
+        crate::filter::RunResult::Err(err) => {
+            editor.status = crate::filter::describe_error(&err);
+        }
+        crate::filter::RunResult::Stdout(text) => {
+            let apply_result = if let Some(b) = editor.by_id_mut(buffer_id) {
+                let doc_len = b.document.buffer.len();
+                let (from, to, at) = match disposition {
+                    crate::filter::Disposition::Filter => (range.start, range.end, range.start),
+                    crate::filter::Disposition::Insert => (cursor, cursor, cursor),
+                };
+                let (cs, edit) = crate::commands::build_range_replace(from, to, &text, doc_len);
+                let txn = wordcartel_core::history::Transaction::new(cs)
+                    .with_selection(wordcartel_core::selection::Selection::single(at + text.len()));
+                b.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
+                true
+            } else {
+                false
+            };
+            if apply_result {
+                crate::derive::rebuild(editor);
+                crate::nav::ensure_visible(editor);
+                editor.status = "filter applied".into();
+            }
+        }
+    }
+}
+
 /// Execute the action chosen in a modal prompt, then clear the prompt.
-pub fn resolve_prompt(action: PromptAction, editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock) {
+pub fn resolve_prompt(
+    action: PromptAction,
+    editor: &mut Editor,
+    ex: &dyn Executor,
+    clock: &dyn Clock,
+    msg_tx: &std::sync::mpsc::Sender<Msg>,
+) {
     match action {
         PromptAction::Cancel => {}
         PromptAction::QuitAnyway => { editor.quit = true; }
         PromptAction::SaveAndQuit => {
             let v = editor.active().document.version;
             editor.prompt = None; // dismiss the quit-confirm modal first
-            { let mut ctx = Ctx { editor, clock, executor: ex }; crate::save::dispatch_save(&mut ctx); }
+            { let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() }; crate::save::dispatch_save(&mut ctx); }
             // Arm quit-after-save ONLY if a save job was actually dispatched.
             // dispatch_save dispatches nothing when there is no path (status set)
             // or when it raised an external-mod modal (editor.prompt now Some) —
@@ -72,7 +148,7 @@ pub fn resolve_prompt(action: PromptAction, editor: &mut Editor, ex: &dyn Execut
         }
         PromptAction::Reload => crate::save::reload_from_disk(editor),
         PromptAction::Overwrite => {
-            let mut ctx = Ctx { editor, clock, executor: ex };
+            let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
             crate::save::overwrite_save(&mut ctx);
         }
         PromptAction::Recover => {
@@ -114,6 +190,7 @@ pub fn reduce(
     reg: &Registry,
     ex: &dyn Executor,
     clock: &dyn Clock,
+    msg_tx: &std::sync::mpsc::Sender<Msg>,
 ) -> bool {
     // Active modal intercepts KEY INPUT only (§5.3). Background results and ticks
     // must still be processed — a JobDone arriving while a modal is up (e.g. an
@@ -126,12 +203,15 @@ pub fn reduce(
                     editor.prompt = None; // Esc cancels any prompt
                 } else if let crossterm::event::KeyCode::Char(ch) = key.code {
                     if let Some(action) = editor.prompt.as_ref().unwrap().action_for(ch) {
-                        resolve_prompt(action, editor, ex, clock);
+                        resolve_prompt(action, editor, ex, clock, msg_tx);
                     }
                 }
             }
             // Merge a directly-delivered background result even under a modal.
             Msg::JobDone(r) => apply_result(r, editor),
+            Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {
+                apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, clock);
+            }
             // Resize/Tick/other input: ignored for the modal, but results still drain below.
             _ => {}
         }
@@ -143,9 +223,20 @@ pub fn reduce(
     let before = editor.active().document.version;
     match msg {
         Msg::Input(Event::Key(key)) => {
+            if key.kind == crossterm::event::KeyEventKind::Press
+                && key.code == crossterm::event::KeyCode::Esc
+                && editor.filter_in_flight.is_some()
+            {
+                editor.filter_in_flight.take().unwrap().cancel();
+                editor.status = "cancelling...".into();
+                for r in ex.drain() {
+                    apply_result(r, editor);
+                }
+                return !editor.quit;
+            }
             match input::key_to_command_id(key) {
                 Some(KeyAction::Id(id)) => {
-                    let mut ctx = Ctx { editor, clock, executor: ex };
+                    let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
                     reg.dispatch(id, &mut ctx);
                 }
                 Some(KeyAction::Insert(c)) => {
@@ -160,6 +251,9 @@ pub fn reduce(
         }
         Msg::Input(_) => {}
         Msg::JobDone(r) => apply_result(r, editor),
+        Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {
+            apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, clock);
+        }
         Msg::Tick => {
             let now = clock.now_ms();
             if editor.active().document.dirty()
@@ -167,7 +261,7 @@ pub fn reduce(
                 && crate::swap::due(now, editor.active().last_edit_at, editor.active().last_swap_at)
             {
                 editor.active_mut().swap_in_flight = true;
-                let mut ctx = Ctx { editor, clock, executor: ex };
+                let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
                 crate::swap::dispatch_swap_write(&mut ctx);
             }
         }
@@ -360,7 +454,7 @@ pub fn run(path: Option<PathBuf>) -> std::io::Result<()> {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Msg::Tick,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        let keep = reduce(msg, &mut editor, &reg, &executor, &clock);
+        let keep = reduce(msg, &mut editor, &reg, &executor, &clock, &msg_tx);
         guard.terminal().draw(|f| render::render(f, &editor))?;
         if !keep { break; }
     }
@@ -382,6 +476,7 @@ pub fn run(path: Option<PathBuf>) -> std::io::Result<()> {
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use crate::editor::Editor;
+    use crate::app::Msg;
     use wordcartel_core::history::Clock;
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -415,19 +510,20 @@ mod tests {
         let reg = Registry::builtins();
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
         for c in "hi".chars() {
             crate::app::step(&mut e, key_char(c), &clk);
         }
         // First Ctrl+Q: dirty → modal up, NOT quit yet
         let ctrl_q = Event::Key(KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(crate::app::Msg::Input(ctrl_q), &mut e, &reg, &ex, &clk);
+        crate::app::reduce(crate::app::Msg::Input(ctrl_q), &mut e, &reg, &ex, &clk, &tx);
         assert!(e.prompt.is_some(), "dirty quit must raise modal");
         assert!(!e.quit);
         // Press 'q' → routed to QuitAnyway via the modal.
         let q = Event::Key(KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(crate::app::Msg::Input(q), &mut e, &reg, &ex, &clk);
+        crate::app::reduce(crate::app::Msg::Input(q), &mut e, &reg, &ex, &clk, &tx);
         assert!(e.quit);
         assert_eq!(e.active().document.buffer.to_string(), "hi\n");
     }
@@ -507,12 +603,81 @@ mod tests {
         let reg = Registry::builtins();
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
         for c in "hi".chars() {
             let ev = Event::Key(KeyEvent { code: KeyCode::Char(c), modifiers: KeyModifiers::NONE,
                 kind: KeyEventKind::Press, state: KeyEventState::NONE });
-            assert!(crate::app::reduce(crate::app::Msg::Input(ev), &mut e, &reg, &ex, &clk));
+            assert!(crate::app::reduce(crate::app::Msg::Input(ev), &mut e, &reg, &ex, &clk, &tx));
         }
         assert_eq!(e.active().document.buffer.to_string(), "hi\n");
+    }
+
+    #[test]
+    fn filterdone_replaces_range_when_fresh() {
+        use crate::editor::Editor;
+        use crate::filter::{Disposition, RunResult};
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        let mut e = Editor::new_from_text("abcde\n", None, (80, 24));
+        let id = e.active().id; let v = e.active().document.version;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let msg = Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
+            disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) };
+        crate::app::reduce(msg, &mut e, &reg, &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "aXde\n");
+        // one undo step restores the original
+        e.active_mut().undo();
+        assert_eq!(e.active().document.buffer.to_string(), "abcde\n");
+    }
+
+    #[test]
+    fn filterdone_discarded_when_version_moved() {
+        use crate::editor::Editor;
+        use crate::filter::{Disposition, RunResult};
+        use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("abcde\n", None, (80, 24));
+        let id = e.active().id; let stale_v = e.active().document.version;
+        e.active_mut().document.version += 1; // simulate an intervening edit
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::FilterDone { buffer_id: id, version: stale_v, range: 1..3, cursor: 2,
+            disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) }, &mut e, &reg, &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "abcde\n", "stale filter result discarded");
+        assert!(e.status.to_lowercase().contains("discarded"));
+    }
+
+    #[test]
+    fn filterdone_failure_shows_status_keeps_buffer() {
+        use crate::editor::Editor;
+        use crate::filter::{Disposition, RunResult, FilterError};
+        use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("abcde\n", None, (80, 24));
+        let id = e.active().id; let v = e.active().document.version;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
+            disposition: Disposition::Filter,
+            outcome: RunResult::Err(FilterError::NonZero { code: "Exited(3)".into(), stderr: "boom".into() }) },
+            &mut e, &reg, &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "abcde\n");
+        assert!(e.status.contains("boom") && e.status.contains('3'));
+    }
+
+    #[test]
+    fn dispatch_filter_runs_real_command_and_delivers_filterdone() {
+        // One live-thread integration test (deterministic: block on the channel).
+        use crate::editor::Editor;
+        use crate::filter::{dispatch_filter, FilterSpec, Disposition, Input};
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+        let spec = FilterSpec { argv: vec!["tr".into(),"a-z".into(),"A-Z".into()], shell: false,
+            disposition: Disposition::Filter, input: Input::SelectionElseBuffer,
+            timeout: std::time::Duration::from_secs(10), max_output: 1 << 20 };
+        dispatch_filter(&mut e, spec, tx);
+        let msg = rx.recv().expect("FilterDone must arrive"); // blocks; no timing assert
+        match msg { Msg::FilterDone { outcome: crate::filter::RunResult::Stdout(s), .. } => assert_eq!(s, "ABC\n"),
+                    other => panic!("expected FilterDone Stdout, got {other:?}") }
     }
 
     #[test]
@@ -530,10 +695,11 @@ mod tests {
         e.active_mut().last_edit_at = Some(0);
         let reg = Registry::builtins();
         let ex = InlineExecutor::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
         // Clock past the idle threshold.
         struct C(u64); impl wordcartel_core::history::Clock for C { fn now_ms(&self) -> u64 { self.0 } }
         let clk = C(crate::swap::T_IDLE_MS + 5);
-        crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &ex, &clk);
+        crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &ex, &clk, &tx);
         assert!(e.active().last_swap_at.is_some(), "an idle Tick on a dirty buffer writes a swap");
         let sp = crate::swap::swap_path(Some(&doc_path)).unwrap();
         assert!(sp.exists());
@@ -552,15 +718,16 @@ mod tests {
         let reg = Registry::builtins();
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
         let ctrl_q = Event::Key(KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
         // First Ctrl+Q → modal up, not quit.
-        crate::app::reduce(crate::app::Msg::Input(ctrl_q.clone()), &mut e, &reg, &ex, &clk);
+        crate::app::reduce(crate::app::Msg::Input(ctrl_q.clone()), &mut e, &reg, &ex, &clk, &tx);
         assert!(e.prompt.is_some() && !e.quit);
         // Press 'q' → routed to QuitAnyway.
         let q = Event::Key(KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(crate::app::Msg::Input(q), &mut e, &reg, &ex, &clk);
+        crate::app::reduce(crate::app::Msg::Input(q), &mut e, &reg, &ex, &clk, &tx);
         assert!(e.quit, "Quit anyway exits");
         assert!(e.prompt.is_none(), "prompt cleared");
     }
@@ -576,7 +743,8 @@ mod tests {
         e.active_mut().document.saved_version = None; e.active_mut().document.version = 1;
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
-        crate::app::resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::app::resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk, &tx);
         assert_eq!(e.quit_after_save, Some(1));
         assert!(!e.quit, "not yet — waiting for the save result");
         for r in ex.drain() { crate::app::apply_result(r, &mut e); }
@@ -595,7 +763,8 @@ mod tests {
         e.active_mut().document.version = 1;
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
-        crate::app::resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::app::resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk, &tx);
         assert_eq!(e.quit_after_save, None, "no job dispatched → do not arm quit-after-save");
         assert!(!e.quit);
     }
@@ -658,7 +827,8 @@ mod tests {
         e.active_mut().pending_swap_path = Some(p.clone());
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
-        crate::app::resolve_prompt(PromptAction::Recover, &mut e, &ex, &clk);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::app::resolve_prompt(PromptAction::Recover, &mut e, &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "recovered body\n",
             "recovered content loaded into the active buffer");
         assert!(!p.exists(), "orphan swap file must be deleted on Recover");

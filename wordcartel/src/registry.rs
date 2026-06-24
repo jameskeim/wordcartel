@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use crate::commands::{self, Command, CommandResult, Dir};
 use crate::editor::Editor;
 use crate::jobs::Executor;
+use crate::app::Msg;
 use wordcartel_core::history::Clock;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -20,6 +21,7 @@ pub struct Ctx<'a> {
     pub editor: &'a mut Editor,
     pub clock: &'a dyn Clock,
     pub executor: &'a dyn Executor,
+    pub msg_tx: std::sync::mpsc::Sender<Msg>,
 }
 
 pub type Handler = fn(&mut Ctx) -> CommandResult;
@@ -95,7 +97,8 @@ mod tests {
         let mut e = Editor::new_from_text("hi\n", None, (80, 24));
         let ex = InlineExecutor::default();
         let clk = Z;
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex };
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
         let r = reg.dispatch(CommandId("save"), &mut ctx);
         // No path → save handler reports the no-name status (delegates to run()).
         assert_eq!(r, crate::commands::CommandResult::Handled);
@@ -108,7 +111,8 @@ mod tests {
         let mut e = Editor::new_from_text("hi\n", None, (80, 24));
         let ex = InlineExecutor::default();
         let clk = Z;
-        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex };
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
         let r = reg.dispatch(CommandId("nope"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Noop);
         assert!(e.status.contains("unknown command"), "must surface, never silent (§12.5)");
