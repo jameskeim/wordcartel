@@ -62,8 +62,8 @@ pub fn due(now: u64, last_edit_at: Option<u64>, last_swap_at: Option<u64>) -> bo
 /// The next instant the loop should wake to consider a swap (for recv_timeout).
 pub fn next_deadline_ms(now: u64, last_edit_at: Option<u64>, last_swap_at: Option<u64>) -> Option<u64> {
     let edit = last_edit_at?;
-    let idle_at = edit + T_IDLE_MS;
-    let max_at = last_swap_at.unwrap_or(edit) + T_MAX_MS;
+    let idle_at = edit.saturating_add(T_IDLE_MS);
+    let max_at = last_swap_at.unwrap_or(edit).saturating_add(T_MAX_MS);
     Some(idle_at.min(max_at).max(now))
 }
 
