@@ -50,6 +50,8 @@ fn do_save(ctx: &mut Ctx) {
                 version: v,
                 kind: JobKind::Save,
                 merge: Box::new(move |editor| {
+                    // INVARIANT: route via by_id_mut(buffer_id) — NEVER active(); the merge must
+                    // target the originating buffer even after a buffer switch (multi-buffer, Effort 6).
                     // Assemble the (global) status in a local so the `b` mutable borrow ends
                     // before we touch editor.status.
                     let mut status = String::new();

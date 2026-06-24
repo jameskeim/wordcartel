@@ -299,6 +299,8 @@ pub fn dispatch_swap_write(ctx: &mut Ctx) {
                 version,
                 kind: JobKind::SwapWrite,
                 merge: Box::new(move |editor| {
+                    // INVARIANT: route via by_id_mut(buffer_id) — NEVER active(); the merge must
+                    // target the originating buffer even after a buffer switch (multi-buffer, Effort 6).
                     if let Some(b) = editor.by_id_mut(buffer_id) {
                         b.swap_in_flight = false;
                         if ok { b.last_swap_at = Some(ts); }
