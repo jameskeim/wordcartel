@@ -166,4 +166,26 @@ mod tests {
         assert!(e.status.to_lowercase().contains("symlink"));
         let _ = std::fs::remove_file(&link); let _ = std::fs::remove_file(&real);
     }
+
+    #[test]
+    fn dispatch_save_refuses_when_file_changed_on_disk() {
+        let p = scratch();
+        std::fs::write(&p, "original\n").unwrap();
+        // Editor loads the file → stored_fp captured at load.
+        let mut e = Editor::new_from_text("my edits\n", Some(p.clone()), (80, 24));
+        e.document.saved_version = None;
+        e.document.version = 1;
+        // External process rewrites the file after load (different size → fingerprint differs).
+        std::fs::write(&p, "changed externally, much longer line\n").unwrap();
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        {
+            let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex };
+            dispatch_save(&mut ctx);
+        }
+        assert!(ex.drain().is_empty(), "no save job dispatched on external-mod conflict");
+        assert!(e.status.to_lowercase().contains("changed on disk"), "status surfaces the refusal");
+        assert!(e.document.dirty(), "buffer stays dirty when a save is refused");
+        let _ = std::fs::remove_file(&p);
+    }
 }
