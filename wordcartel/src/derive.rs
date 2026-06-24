@@ -83,17 +83,17 @@ pub fn rebuild(editor: &mut Editor) {
     // ------------------------------------------------------------------
     // 1. Block tree (incremental or full)
     // ------------------------------------------------------------------
-    let new_rope = editor.document.buffer.snapshot(); // O(1) ropey clone
+    let new_rope = editor.active().document.buffer.snapshot(); // O(1) ropey clone
 
     // Take the option values out so we can clear them unconditionally after.
-    let maybe_old_rope = editor.pre_edit_rope.take();
-    let maybe_edit = editor.last_edit.take();
+    let maybe_old_rope = editor.active_mut().pre_edit_rope.take();
+    let maybe_edit = editor.active_mut().last_edit.take();
 
-    editor.document.blocks = match (maybe_old_rope, maybe_edit) {
+    let new_blocks = match (maybe_old_rope, maybe_edit) {
         (Some(old_rope), Some(edit)) => {
             // Normal edit path: O(region) incremental reparse.
             block_tree::incremental_update_rope(
-                &editor.document.blocks,
+                &editor.active().document.blocks,
                 &old_rope,
                 &edit,
                 &new_rope,
@@ -104,46 +104,50 @@ pub fn rebuild(editor: &mut Editor) {
             block_tree::full_parse_rope(&new_rope)
         }
     };
+    editor.active_mut().document.blocks = new_blocks;
     // last_edit and pre_edit_rope were already cleared by .take() above.
 
     // ------------------------------------------------------------------
     // 2. Visible range
     // ------------------------------------------------------------------
-    let buf = &editor.document.buffer;
-    let total_lines = total_logical_lines(buf);
-    let (area_width, area_height) = (editor.view.area.0 as usize, editor.view.area.1 as usize);
+    // Snapshot all read-only scalar values from the active buffer before any
+    // mutable borrow, so the borrow checker sees no overlap.
+    let (total_lines, active_line, area_width, area_height, first_line, source_mode) = {
+        let b = editor.active();
+        let buf = &b.document.buffer;
+        let total_lines = total_logical_lines(buf);
+        let (area_width, area_height) = (b.view.area.0 as usize, b.view.area.1 as usize);
+        let caret_byte = b.document.selection.primary().head;
+        let active_line = if buf.len() == 0 {
+            0
+        } else {
+            buf.byte_to_line(caret_byte.min(buf.len().saturating_sub(1)))
+        };
+        let first_line = b.view.scroll.min(total_lines.saturating_sub(1));
+        let source_mode = b.view.mode != RenderMode::LivePreview;
+        (total_lines, active_line, area_width, area_height, first_line, source_mode)
+    };
     let vp_width = area_width.max(1);
 
-    // Determine the active logical line from the caret position.
-    let caret_byte = editor.document.selection.primary().head;
-    let active_line = if buf.len() == 0 {
-        0
-    } else {
-        buf.byte_to_line(caret_byte.min(buf.len().saturating_sub(1)))
-    };
-
-    // Walk from scroll, accumulating visual rows until we fill area_height + 1 overscan.
-    let first_line = editor.view.scroll.min(total_lines.saturating_sub(1));
     let mut visual_rows_accumulated: usize = 0;
     let overscan_budget = area_height.saturating_add(1);
 
     // Clear the old cache and fill for the visible range.
-    editor.view.line_layouts.clear();
-
-    // In source modes (SourceHighlighted, SourcePlain), ALL lines render raw
-    // (markers visible, conceal off). Laying out with is_active=true achieves
-    // this because active-line layout uses the raw/identity-ish col_map.
-    // §3.11: source modes are cheaper — pass is_active_effective = true for all lines.
-    let source_mode = editor.view.mode != RenderMode::LivePreview;
+    editor.active_mut().view.line_layouts.clear();
 
     let mut l = first_line;
     while l < total_lines && visual_rows_accumulated < overscan_budget {
-        let text = line_text(buf, l);
-        let role = editor.document.blocks.role_at(line_start(buf, l));
-        let is_active_effective = (l == active_line) || source_mode;
+        let (text, role, is_active_effective) = {
+            let b = editor.active();
+            let buf = &b.document.buffer;
+            let text = line_text(buf, l);
+            let role = b.document.blocks.role_at(line_start(buf, l));
+            let is_active_effective = (l == active_line) || source_mode;
+            (text, role, is_active_effective)
+        };
         let (rows, map) = layout::layout(&text, role, is_active_effective, vp_width);
         visual_rows_accumulated += rows.len();
-        editor.view.line_layouts.insert(l, (rows, map));
+        editor.active_mut().view.line_layouts.insert(l, (rows, map));
         l += 1;
     }
 }
@@ -168,9 +172,9 @@ mod tests {
         // U+2028 (LINE SEPARATOR) and a bare CR must NOT create new logical lines.
         let e = Editor::new_from_text("a\u{2028}b\rc\n", None, (80, 24));
         // One real LF-terminated line of content + the empty trailing line = 2.
-        assert_eq!(crate::derive::total_logical_lines(&e.document.buffer), 2);
+        assert_eq!(crate::derive::total_logical_lines(&e.active().document.buffer), 2);
         // The whole "a\u{2028}b\rc" is one logical line (its content, sans trailing \n).
-        assert_eq!(crate::derive::line_text(&e.document.buffer, 0), "a\u{2028}b\rc");
+        assert_eq!(crate::derive::line_text(&e.active().document.buffer, 0), "a\u{2028}b\rc");
     }
 
     /// Inactive heading line shows concealed display (e.g. "Title", not "# Title").
@@ -180,9 +184,9 @@ mod tests {
         // Move cursor to the blank line (byte 8 = '\n' of blank line) so that
         // line 0 (the heading) is NOT the active line — it should show concealed.
         // "# Title\n" is 8 bytes; the blank line '\n' starts at byte 8.
-        e.document.selection = wordcartel_core::selection::Selection::single(8);
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(8);
         rebuild(&mut e);
-        let (rows0, _) = &e.view.line_layouts[&0];
+        let (rows0, _) = &e.active().view.line_layouts[&0];
         // inactive heading line -> "# " concealed -> "Title"
         assert_eq!(rows0[0].display, "Title");
         assert_eq!(rows0[0].role, BlockRole::Heading(1));
@@ -194,7 +198,7 @@ mod tests {
         let mut e = Editor::new_from_text("# Title\n", None, (80, 24));
         // cursor at 0 -> line 0 active -> raw "# Title"
         rebuild(&mut e);
-        let (rows0, _) = &e.view.line_layouts[&0];
+        let (rows0, _) = &e.active().view.line_layouts[&0];
         assert_eq!(rows0[0].display, "# Title");
     }
 
@@ -207,7 +211,7 @@ mod tests {
         // 20-char line, viewport width 5 -> at least 4 rows
         let mut e = Editor::new_from_text("abcdefghijklmnopqrst\n", None, (5, 24));
         rebuild(&mut e);
-        let (rows, _) = &e.view.line_layouts[&0];
+        let (rows, _) = &e.active().view.line_layouts[&0];
         assert!(rows.len() > 1, "expected wrapping, got {} row(s)", rows.len());
     }
 
@@ -302,15 +306,15 @@ mod tests {
         // On a fresh Editor (no prior apply), rebuild must not panic and the
         // block tree must reflect the document content.
         let mut e = Editor::new_from_text("# Hi\n\nbody\n", None, (80, 24));
-        assert!(e.last_edit.is_none());
-        assert!(e.pre_edit_rope.is_none());
+        assert!(e.active().last_edit.is_none());
+        assert!(e.active().pre_edit_rope.is_none());
         rebuild(&mut e);
         // After rebuild, the two option fields must be cleared (take() consumed them).
-        assert!(e.last_edit.is_none());
-        assert!(e.pre_edit_rope.is_none());
+        assert!(e.active().last_edit.is_none());
+        assert!(e.active().pre_edit_rope.is_none());
         // Block tree must reflect the heading.
         use wordcartel_core::style::BlockRole;
-        assert_eq!(e.document.blocks.role_at(0), BlockRole::Heading(1));
+        assert_eq!(e.active().document.blocks.role_at(0), BlockRole::Heading(1));
     }
 
     #[test]
@@ -318,10 +322,10 @@ mod tests {
         // After any rebuild call the two option fields must be None.
         let mut e = Editor::new_from_text("hello\n", None, (80, 24));
         // Manually set them to Some to simulate a post-apply state.
-        e.pre_edit_rope = Some(e.document.buffer.snapshot());
-        e.last_edit = Some(wordcartel_core::block_tree::Edit { range: 0..0, new_len: 0 });
+        e.active_mut().pre_edit_rope = Some(e.active().document.buffer.snapshot());
+        e.active_mut().last_edit = Some(wordcartel_core::block_tree::Edit { range: 0..0, new_len: 0 });
         rebuild(&mut e);
-        assert!(e.pre_edit_rope.is_none(), "pre_edit_rope should be cleared after rebuild");
-        assert!(e.last_edit.is_none(), "last_edit should be cleared after rebuild");
+        assert!(e.active().pre_edit_rope.is_none(), "pre_edit_rope should be cleared after rebuild");
+        assert!(e.active().last_edit.is_none(), "last_edit should be cleared after rebuild");
     }
 }
