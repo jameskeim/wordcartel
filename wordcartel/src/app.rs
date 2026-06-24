@@ -44,6 +44,7 @@ pub fn reduce(
     ex: &dyn Executor,
     clock: &dyn Clock,
 ) -> bool {
+    let before = editor.document.version;
     match msg {
         Msg::Input(Event::Key(key)) => {
             match input::key_to_command_id(key) {
@@ -63,7 +64,20 @@ pub fn reduce(
         }
         Msg::Input(_) => {}
         Msg::JobDone(r) => apply_result(r, editor),
-        Msg::Tick => { /* swap cadence wired in Effort 4b-2 */ }
+        Msg::Tick => {
+            let now = clock.now_ms();
+            if editor.document.dirty()
+                && crate::swap::due(now, editor.last_edit_at, editor.last_swap_at)
+            {
+                let mut ctx = Ctx { editor, clock, executor: ex };
+                crate::swap::dispatch_swap_write(&mut ctx);
+                // Provisionally mark; the merge confirms with the same ts.
+                ctx.editor.last_swap_at = Some(now);
+            }
+        }
+    }
+    if editor.document.version != before {
+        editor.last_edit_at = Some(clock.now_ms());
     }
     // Fold any other results that became ready while handling this message.
     for r in ex.drain() {
@@ -194,7 +208,16 @@ pub fn run(path: Option<PathBuf>) -> std::io::Result<()> {
 
     let clock = SystemClock;
     guard.terminal().draw(|f| render::render(f, &editor))?;
-    for msg in msg_rx {
+    loop {
+        let now = clock.now_ms();
+        let timeout = crate::swap::next_deadline_ms(now, editor.last_edit_at, editor.last_swap_at)
+            .map(|d| std::time::Duration::from_millis(d.saturating_sub(now)))
+            .unwrap_or(std::time::Duration::from_secs(3600)); // idle: effectively block
+        let msg = match msg_rx.recv_timeout(timeout) {
+            Ok(m) => m,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Msg::Tick,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         let keep = reduce(msg, &mut editor, &reg, &executor, &clock);
         guard.terminal().draw(|f| render::render(f, &editor))?;
         if !keep { break; }
@@ -346,6 +369,26 @@ mod tests {
             assert!(crate::app::reduce(crate::app::Msg::Input(ev), &mut e, &reg, &ex, &clk));
         }
         assert_eq!(e.document.buffer.to_string(), "hi\n");
+    }
+
+    #[test]
+    fn tick_writes_swap_when_idle_elapsed_and_dirty() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        e.document.version = 1;            // dirty (saved_version=Some(0))
+        e.last_edit_at = Some(0);
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
+        // Clock past the idle threshold.
+        struct C(u64); impl wordcartel_core::history::Clock for C { fn now_ms(&self) -> u64 { self.0 } }
+        let clk = C(crate::swap::T_IDLE_MS + 5);
+        crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &ex, &clk);
+        assert!(e.last_swap_at.is_some(), "an idle Tick on a dirty buffer writes a swap");
+        let sp = crate::swap::swap_path(None).unwrap();
+        assert!(sp.exists());
+        let _ = std::fs::remove_file(&sp);
     }
 
     #[test]

@@ -44,6 +44,29 @@ pub fn state_dir() -> io::Result<PathBuf> {
 
 pub const FORMAT: &str = "wcartel-swap 1";
 
+pub const T_IDLE_MS: u64 = 2_000;
+pub const T_MAX_MS: u64 = 30_000;
+
+/// Is a swap write due now? Requires a prior edit (the caller also gates on
+/// `editor.document.dirty()`); fires on idle-debounce OR max-cap.
+pub fn due(now: u64, last_edit_at: Option<u64>, last_swap_at: Option<u64>) -> bool {
+    let Some(edit) = last_edit_at else { return false };
+    let idle_due = now.saturating_sub(edit) >= T_IDLE_MS;
+    let max_due = match last_swap_at {
+        Some(swap) => now.saturating_sub(swap) >= T_MAX_MS,
+        None => now.saturating_sub(edit) >= T_MAX_MS, // never swapped since first edit
+    };
+    idle_due || max_due
+}
+
+/// The next instant the loop should wake to consider a swap (for recv_timeout).
+pub fn next_deadline_ms(now: u64, last_edit_at: Option<u64>, last_swap_at: Option<u64>) -> Option<u64> {
+    let edit = last_edit_at?;
+    let idle_at = edit + T_IDLE_MS;
+    let max_at = last_swap_at.unwrap_or(edit) + T_MAX_MS;
+    Some(idle_at.min(max_at).max(now))
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SwapHeader {
     pub realpath: Option<String>,
@@ -292,6 +315,27 @@ mod tests {
     #[test]
     fn parse_rejects_unknown_format() {
         assert!(parse("garbage\nwith no header\n").is_none());
+    }
+
+    #[test]
+    fn cadence_idle_debounce_fires_after_t_idle() {
+        // Edited at 1000, never swapped. At 1000+T_idle it is due.
+        assert!(!due(1000 + T_IDLE_MS - 1, Some(1000), None));
+        assert!(due(1000 + T_IDLE_MS, Some(1000), None));
+    }
+
+    #[test]
+    fn cadence_max_cap_fires_during_continuous_editing() {
+        // Continuous editing: last_edit keeps moving so idle never elapses, but
+        // last_swap is old → max-cap forces a write.
+        let now = 100_000;
+        assert!(due(now, Some(now), Some(now - T_MAX_MS)));      // max elapsed
+        assert!(!due(now, Some(now), Some(now - T_MAX_MS + 1))); // not yet
+    }
+
+    #[test]
+    fn cadence_not_due_when_never_edited() {
+        assert!(!due(99_999, None, None));
     }
 
     #[test]
