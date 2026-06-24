@@ -102,10 +102,6 @@ fn replace_changeset(
 
 /// Execute `cmd` against `editor`, then re-derive + ensure visibility.
 pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
-    // Clear the pending-quit confirmation flag for every command except Quit itself.
-    if !matches!(cmd, Command::Quit) {
-        editor.pending_quit = false;
-    }
     match cmd {
         Command::InsertChar(c) => {
             let sel = editor.document.selection.primary();
@@ -406,13 +402,10 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         }
 
         Command::Quit => {
-            if editor.document.dirty() && !editor.pending_quit {
-                editor.pending_quit = true;
-                editor.status =
-                    "Unsaved changes \u{2014} Ctrl+Q again to quit, Ctrl+S to save".to_string();
+            if editor.document.dirty() {
+                editor.prompt = Some(crate::prompt::Prompt::quit_confirm());
                 CommandResult::Handled
             } else {
-                // Either not dirty, or this is the second Quit.
                 editor.quit = true;
                 CommandResult::Quit
             }

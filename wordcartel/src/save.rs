@@ -23,25 +23,10 @@ pub fn fingerprint(path: &Path) -> Option<FileFingerprint> {
     Some(FileFingerprint { mtime: meta.modified().ok(), size: meta.len() })
 }
 
-/// Registry `"save"` handler: dispatch a background save.
-pub fn dispatch_save(ctx: &mut Ctx) -> CommandResult {
-    let path = match &ctx.editor.document.path {
-        None => {
-            ctx.editor.status = "No file name (save-as is Effort 5)".to_string();
-            return CommandResult::Handled;
-        }
-        Some(p) => p.clone(),
-    };
-
-    // External-mod check (§4.3 step 2): cheap stat; if the on-disk fingerprint
-    // diverged from what we last wrote, refuse and surface a status. (4b-2 turns
-    // this into a modal R/O/S prompt.)
-    let current_fp = fingerprint(&path);
-    if current_fp != ctx.editor.document.stored_fp {
-        ctx.editor.status =
-            "File changed on disk \u{2014} not saved (reload or overwrite — Effort 4b-2)".to_string();
-        return CommandResult::Handled;
-    }
+/// Internal: dispatch the save job (no external-mod check). Called by
+/// `dispatch_save` (after the check) and `overwrite_save` (bypassing it).
+fn do_save(ctx: &mut Ctx) {
+    let path = ctx.editor.document.path.clone().expect("do_save called without a path");
 
     // §3.9: status BEFORE dispatch. O(1) snapshot; version captured now.
     ctx.editor.status = "Saving\u{2026}".to_string();
@@ -83,7 +68,74 @@ pub fn dispatch_save(ctx: &mut Ctx) -> CommandResult {
             }
         }),
     });
+}
+
+/// Registry `"save"` handler: external-mod check then dispatch a background save.
+pub fn dispatch_save(ctx: &mut Ctx) -> CommandResult {
+    let path = match &ctx.editor.document.path {
+        None => {
+            ctx.editor.status = "No file name (save-as is Effort 5)".to_string();
+            return CommandResult::Handled;
+        }
+        Some(p) => p.clone(),
+    };
+
+    // External-mod check (§4.3 step 2): cheap stat; if the on-disk fingerprint
+    // diverged from what we last wrote, refuse and raise the external-mod modal.
+    let current_fp = fingerprint(&path);
+    if current_fp != ctx.editor.document.stored_fp {
+        ctx.editor.prompt = Some(crate::prompt::Prompt::external_mod());
+        ctx.editor.status =
+            "File changed on disk \u{2014} choose [R]eload or [O]verwrite".to_string();
+        return CommandResult::Handled;
+    }
+
+    do_save(ctx);
     CommandResult::Handled
+}
+
+/// Save bypassing the fingerprint conflict (the [O]verwrite modal action).
+pub fn overwrite_save(ctx: &mut Ctx) {
+    if ctx.editor.document.path.is_none() {
+        ctx.editor.status = "No file name (save-as is Effort 5)".to_string();
+        return;
+    }
+    do_save(ctx); // no stat check
+}
+
+/// [R]eload: discard in-memory edits, reload F from disk. Destructive — only
+/// reachable via the external-mod modal. Sanctioned whole-document replacement
+/// (fresh Document, not `apply`): there is no incremental delta and history is reset.
+pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
+    let Some(path) = editor.document.path.clone() else { return };
+    let text = match crate::file::open(&path) {
+        Ok(t) => t,
+        Err(e) => { editor.status = e.to_string(); return; }
+    };
+    let area = editor.view.area;
+    let fresh = crate::editor::Editor::new_from_text(&text, Some(path.clone()), area); // saved_version=Some(0) → clean
+    editor.document = fresh.document; // sanctioned whole-document replacement
+    editor.view.line_layouts.clear();
+    crate::derive::rebuild(editor);
+    crate::nav::ensure_visible(editor);
+    editor.document.stored_fp = fingerprint(&path);
+    editor.status = "Reloaded".into();
+    crate::swap::delete(editor.document.path.as_deref());
+}
+
+/// Load recovered swap content into the buffer; keep the path; mark dirty.
+/// Sanctioned whole-document replacement (fresh Document, history reset).
+pub fn load_recovered(editor: &mut crate::editor::Editor, body: &str) {
+    let path = editor.document.path.clone();
+    let area = editor.view.area;
+    let fresh = crate::editor::Editor::new_from_text(body, path.clone(), area);
+    editor.document = fresh.document; // sanctioned whole-document replacement
+    editor.document.saved_version = None; // recovered work is unsaved
+    editor.view.line_layouts.clear();
+    crate::derive::rebuild(editor);
+    crate::nav::ensure_visible(editor);
+    editor.document.stored_fp = path.as_deref().and_then(fingerprint);
+    editor.status = "Recovered unsaved changes".into();
 }
 
 #[cfg(test)]

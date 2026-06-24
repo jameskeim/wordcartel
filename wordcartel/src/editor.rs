@@ -61,7 +61,6 @@ pub struct Editor {
     pub quit: bool,
     pub desired_col: Option<usize>, // preserved visual column for vertical motion; None until the first vertical move
     pub register: Register, // in-process clipboard register (Task 9)
-    pub pending_quit: bool, // true after first Quit with dirty buffer (double-Quit to confirm)
     // Threaded from `apply` → `derive` for the O(region) incremental reparse (Effort 3c):
     pub pre_edit_rope: Option<ropey::Rope>, // O(1) snapshot taken BEFORE the edit
     pub last_edit: Option<wordcartel_core::block_tree::Edit>, // the block_tree edit (range, new_len); None ⇒ full reparse
@@ -72,6 +71,10 @@ pub struct Editor {
     pub last_swap_at: Option<u64>,
     /// Swap body stashed at open when recovery is needed; consumed by Task 8's resolver.
     pub pending_swap_body: Option<String>,
+    /// Version to quit after once its Save result lands clean (§5.3 save&quit).
+    /// Set by resolve_prompt(SaveAndQuit); cleared (via quit=true) by apply_result.
+    /// None when no save&quit is pending.
+    pub quit_after_save: Option<u64>,
 }
 
 impl Editor {
@@ -102,13 +105,13 @@ impl Editor {
             quit: false,
             desired_col: None,
             register: Register::default(),
-            pending_quit: false,
             pre_edit_rope: None,
             last_edit: None,
             prompt: None,
             last_edit_at: None,
             last_swap_at: None,
             pending_swap_body: None,
+            quit_after_save: None,
         }
     }
 
