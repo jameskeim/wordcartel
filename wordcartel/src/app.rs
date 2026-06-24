@@ -60,6 +60,7 @@ pub fn resolve_prompt(action: PromptAction, editor: &mut Editor, ex: &dyn Execut
             // in those cases abort the quit and let the user resolve (Codex #4).
             if editor.document.path.is_some() && editor.prompt.is_none() {
                 editor.quit_after_save = Some(v);
+                editor.quit_after_save_at = Some(clock.now_ms());
             }
             return; // prompt handled above; must NOT clear an external-mod modal
         }
@@ -299,16 +300,25 @@ pub fn run(path: Option<PathBuf>) -> std::io::Result<()> {
         // Bounded save&quit: if waiting for an in-flight save to complete and
         // 5 s have elapsed since the last edit, re-raise the quit-confirm modal.
         if let Some(_v) = editor.quit_after_save {
-            let waited = now.saturating_sub(editor.last_edit_at.unwrap_or(now));
+            let waited = now.saturating_sub(editor.quit_after_save_at.unwrap_or(now));
             if waited > SAVE_QUIT_TIMEOUT_MS {
                 editor.quit_after_save = None;
+                editor.quit_after_save_at = None;
                 editor.prompt = Some(crate::prompt::Prompt::quit_confirm());
                 editor.status = "Save still running — choose again".into();
             }
         }
-        let timeout = crate::swap::next_deadline_ms(now, editor.last_edit_at, editor.last_swap_at)
+        let swap_deadline = crate::swap::next_deadline_ms(now, editor.last_edit_at, editor.last_swap_at);
+        let sq_deadline = editor.quit_after_save_at.map(|t| t.saturating_add(SAVE_QUIT_TIMEOUT_MS));
+        let deadline = match (swap_deadline, sq_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let timeout = deadline
             .map(|d| std::time::Duration::from_millis(d.saturating_sub(now)))
-            .unwrap_or(std::time::Duration::from_secs(3600)); // idle: effectively block
+            .unwrap_or(std::time::Duration::from_secs(3600));
         let msg = match msg_rx.recv_timeout(timeout) {
             Ok(m) => m,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Msg::Tick,

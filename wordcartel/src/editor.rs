@@ -75,6 +75,10 @@ pub struct Editor {
     /// Set by resolve_prompt(SaveAndQuit); cleared (via quit=true) by apply_result.
     /// None when no save&quit is pending.
     pub quit_after_save: Option<u64>,
+    /// Wall-clock timestamp (ms) at which quit_after_save was armed.
+    /// Used to bound the 5s wait from arm-time, not from last-edit-time.
+    /// None when no save&quit is pending.
+    pub quit_after_save_at: Option<u64>,
 }
 
 impl Editor {
@@ -112,6 +116,7 @@ impl Editor {
             last_swap_at: None,
             pending_swap_body: None,
             quit_after_save: None,
+            quit_after_save_at: None,
         }
     }
 
