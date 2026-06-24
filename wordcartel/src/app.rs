@@ -178,7 +178,9 @@ pub fn resolve_prompt(
     msg_tx: &std::sync::mpsc::Sender<Msg>,
 ) {
     match action {
-        PromptAction::Cancel => {}
+        PromptAction::Cancel => {
+            editor.pending_export = None;
+        }
         PromptAction::QuitAnyway => { editor.quit = true; }
         PromptAction::SaveAndQuit => {
             let v = editor.active().document.version;
@@ -280,6 +282,7 @@ pub fn reduce(
             Msg::Input(Event::Key(key)) if key.kind == crossterm::event::KeyEventKind::Press => {
                 if key.code == crossterm::event::KeyCode::Esc {
                     editor.prompt = None; // Esc cancels any prompt
+                    editor.pending_export = None;
                 } else if let crossterm::event::KeyCode::Char(ch) = key.code {
                     if let Some(action) = editor.prompt.as_ref().unwrap().action_for(ch) {
                         resolve_prompt(action, editor, ex, clock, msg_tx);
@@ -519,6 +522,9 @@ pub fn run(path: Option<PathBuf>) -> std::io::Result<()> {
 
     // Initial derive so the first draw has up-to-date layouts.
     derive::rebuild(&mut editor);
+
+    // Warm the pandoc probe cache so the first export command doesn't pay latency.
+    let _ = crate::export::probe_pandoc();
 
     let reg = Registry::builtins();
     let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Msg>();
