@@ -278,6 +278,10 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
 
         Command::Copy => {
             let r = editor.document.selection.primary();
+            if r.is_empty() {
+                // Copy-on-empty must NOT overwrite the register with "".
+                return CommandResult::Noop;
+            }
             register::copy(&editor.document.buffer, r, &mut editor.register);
             editor.status = "Copied".to_string();
             CommandResult::Handled
@@ -363,6 +367,7 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                 RenderMode::SourcePlain      => RenderMode::LivePreview,
             };
             derive::rebuild(editor);
+            nav::ensure_visible(editor); // a mode change can alter layout/scroll (§4.5)
             CommandResult::Handled
         }
 
@@ -982,5 +987,44 @@ mod tests {
         // Line 0 should now show raw "# Title"
         let (rows_sh, _) = &e.view.line_layouts[&0];
         assert_eq!(rows_sh[0].display, "# Title", "SourceHighlighted must show raw markers on inactive heading");
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 3: CycleRenderMode + Copy-on-empty polish
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn copy_on_empty_selection_preserves_register() {
+        let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
+        // Pre-load the register with "seed".
+        let mut src = Editor::new_from_text("seed\n", None, (80, 24));
+        src.document.selection = Selection {
+            ranges: [wordcartel_core::selection::Range { anchor: 0, head: 4 }].into_iter().collect(),
+            primary: 0,
+        };
+        run(Command::Copy, &mut src, &TestClock(0));
+        e.register = src.register;
+        // Now Copy with a COLLAPSED selection must NOT clobber "seed" with "".
+        set_caret(&mut e, 1);
+        let r = run(Command::Copy, &mut e, &TestClock(0));
+        assert_eq!(r, CommandResult::Noop, "Copy on empty selection is a no-op");
+        assert_eq!(e.register.get(), Some("seed"), "register must be preserved");
+    }
+
+    #[test]
+    fn cycle_render_mode_keeps_caret_visible() {
+        // A tall document scrolled so the caret sits near the bottom; toggling mode
+        // must call ensure_visible so the caret stays on-screen. We assert the cheap
+        // observable: the command re-runs ensure_visible without panicking and the
+        // caret's logical line remains within the laid-out range.
+        let mut e = Editor::new_from_text(&"x\n".repeat(100), None, (20, 5));
+        set_caret(&mut e, 180); // deep into the doc
+        derive::rebuild(&mut e);
+        nav::ensure_visible(&mut e);
+        let r = run(Command::CycleRenderMode, &mut e, &TestClock(0));
+        assert_eq!(r, CommandResult::Handled);
+        let caret_line = e.document.buffer.snapshot().byte_to_line(nav::head(&e));
+        assert!(e.view.line_layouts.contains_key(&caret_line),
+            "caret's logical line must be laid out (visible) after a mode change");
     }
 }
