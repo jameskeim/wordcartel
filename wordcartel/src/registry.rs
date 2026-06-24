@@ -67,6 +67,19 @@ impl Registry {
             c.editor.open_minibuffer("> ");
             CommandResult::Handled
         });
+        // Export (pandoc presets).
+        map.insert(CommandId("export_html"), |c| {
+            crate::export::run_export(c.editor, "html", &c.msg_tx);
+            CommandResult::Handled
+        });
+        map.insert(CommandId("export_docx"), |c| {
+            crate::export::run_export(c.editor, "docx", &c.msg_tx);
+            CommandResult::Handled
+        });
+        map.insert(CommandId("export_pdf"), |c| {
+            crate::export::run_export(c.editor, "pdf", &c.msg_tx);
+            CommandResult::Handled
+        });
         Registry { map }
     }
 

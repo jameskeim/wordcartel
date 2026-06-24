@@ -9,6 +9,7 @@ pub enum PromptAction {
     SaveAndQuit,
     Reload,
     Overwrite,
+    OverwriteExport,
     Recover,
     DiscardSwap,
     OpenOriginal,
@@ -69,11 +70,29 @@ impl Prompt {
             ],
         }
     }
+
+    pub fn export_overwrite(target: &std::path::Path) -> Prompt {
+        Prompt {
+            message: format!("{} exists: [O]verwrite · [C]ancel", target.display()),
+            choices: vec![
+                Choice { key: 'o', label: "Overwrite", action: PromptAction::OverwriteExport },
+                Choice { key: 'c', label: "Cancel",    action: PromptAction::Cancel },
+            ],
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_overwrite_action_is_distinct_from_save_overwrite() {
+        let p = Prompt::export_overwrite(std::path::Path::new("/a/notes.html"));
+        assert_eq!(p.action_for('o'), Some(PromptAction::OverwriteExport));
+        assert_ne!(PromptAction::OverwriteExport, PromptAction::Overwrite);
+    }
+
     #[test]
     fn quit_confirm_routes_keys_case_insensitively() {
         let p = Prompt::quit_confirm();

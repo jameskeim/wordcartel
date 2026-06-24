@@ -17,3 +17,4 @@ pub mod swap;
 pub mod recovery;
 pub mod filter;
 pub mod minibuffer;
+pub mod export;

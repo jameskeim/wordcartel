@@ -34,6 +34,11 @@ pub enum Msg {
         disposition: crate::filter::Disposition,
         outcome: crate::filter::RunResult,
     },
+    ExportDone {
+        buffer_id: crate::editor::BufferId,
+        target: std::path::PathBuf,
+        result: Result<crate::export::ExportResult, crate::filter::FilterError>,
+    },
     Tick,
 }
 
@@ -50,6 +55,11 @@ impl std::fmt::Debug for Msg {
                 .field("cursor", cursor)
                 .field("disposition", disposition)
                 .field("outcome", outcome)
+                .finish(),
+            Msg::ExportDone { buffer_id, target, .. } => f
+                .debug_struct("ExportDone")
+                .field("buffer_id", buffer_id)
+                .field("target", target)
                 .finish(),
             Msg::Tick => f.write_str("Tick"),
         }
@@ -124,6 +134,41 @@ fn apply_filter_done(
     }
 }
 
+fn apply_export_done(
+    editor: &mut crate::editor::Editor,
+    target: std::path::PathBuf,
+    result: Result<crate::export::ExportResult, crate::filter::FilterError>,
+) {
+    match result {
+        Ok(crate::export::ExportResult::Bytes(bytes)) => {
+            match file::save_atomic_bytes(&target, &bytes) {
+                Ok(()) => {
+                    let status = format!("exported {}", target.display());
+                    editor.status = status;
+                }
+                Err(e) => {
+                    editor.status = format!("export write failed: {e}");
+                }
+            }
+        }
+        Ok(crate::export::ExportResult::TempReady(tmp)) => {
+            match std::fs::rename(&tmp, &target) {
+                Ok(()) => {
+                    let status = format!("exported {}", target.display());
+                    editor.status = status;
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    editor.status = format!("export rename failed: {e}");
+                }
+            }
+        }
+        Err(e) => {
+            editor.status = crate::filter::describe_error(&e);
+        }
+    }
+}
+
 /// Execute the action chosen in a modal prompt, then clear the prompt.
 pub fn resolve_prompt(
     action: PromptAction,
@@ -181,6 +226,11 @@ pub fn resolve_prompt(
         PromptAction::OpenOriginal => {
             editor.active_mut().pending_swap_body = None;
             editor.active_mut().pending_swap_path = None;
+        }
+        PromptAction::OverwriteExport => {
+            if let Some(pe) = editor.pending_export.take() {
+                crate::export::do_export(editor, &pe.ext, &pe.target, msg_tx);
+            }
         }
     }
     editor.prompt = None;
@@ -240,6 +290,9 @@ pub fn reduce(
             Msg::JobDone(r) => apply_result(r, editor),
             Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {
                 apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, clock);
+            }
+            Msg::ExportDone { target, result, .. } => {
+                apply_export_done(editor, target, result);
             }
             // Resize/Tick/other input: ignored for the modal, but results still drain below.
             _ => {}
@@ -326,6 +379,9 @@ pub fn reduce(
         Msg::JobDone(r) => apply_result(r, editor),
         Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {
             apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, clock);
+        }
+        Msg::ExportDone { target, result, .. } => {
+            apply_export_done(editor, target, result);
         }
         Msg::Tick => {
             let now = clock.now_ms();
@@ -942,6 +998,97 @@ mod tests {
         crate::app::reduce(Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
             disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) }, &mut e, &reg, &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "aXde\n", "FilterDone applies even under an open minibuffer");
+    }
+
+    #[test]
+    fn exportdone_bytes_writes_file_beside_source() {
+        use crate::editor::Editor;
+        use crate::export::ExportResult;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+
+        // Create a temp directory and source file path.
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "wc-exportdone-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+        let source = tmp_dir.join("notes.md");
+        std::fs::write(&source, "# Hello\n").expect("write source");
+
+        let output_path = tmp_dir.join("notes.html");
+
+        let mut e = Editor::new_from_text("# Hello\n", Some(source.clone()), (80, 24));
+        let buffer_id = e.active().id;
+
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        let content_bytes = b"<h1>Hello</h1>\n".to_vec();
+        let msg = Msg::ExportDone {
+            buffer_id,
+            target: output_path.clone(),
+            result: Ok(ExportResult::Bytes(content_bytes.clone())),
+        };
+        crate::app::reduce(msg, &mut e, &reg, &ex, &clk, &tx);
+
+        // The output file must exist beside the source.
+        assert!(output_path.exists(), "exported file must exist");
+        let got = std::fs::read(&output_path).expect("read exported file");
+        assert_eq!(got, content_bytes);
+        assert!(e.status.contains("exported"), "status must say exported");
+
+        // Clean up.
+        let _ = std::fs::remove_file(&output_path);
+        let _ = std::fs::remove_file(&source);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    #[test]
+    fn exportdone_under_prompt_still_applies() {
+        use crate::editor::Editor;
+        use crate::export::ExportResult;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "wc-exportdone-prompt-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+        let source = tmp_dir.join("doc.md");
+        std::fs::write(&source, "x\n").expect("write source");
+        let output_path = tmp_dir.join("doc.html");
+
+        let mut e = Editor::new_from_text("x\n", Some(source.clone()), (80, 24));
+        e.active_mut().document.version = 1; // dirty → prompt would normally be up
+        // Manually raise a prompt to simulate the overlay scenario.
+        e.prompt = Some(crate::prompt::Prompt::quit_confirm());
+
+        let buffer_id = e.active().id;
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        let content_bytes = b"<p>x</p>\n".to_vec();
+        let msg = Msg::ExportDone {
+            buffer_id,
+            target: output_path.clone(),
+            result: Ok(ExportResult::Bytes(content_bytes.clone())),
+        };
+        crate::app::reduce(msg, &mut e, &reg, &ex, &clk, &tx);
+
+        assert!(output_path.exists(), "ExportDone under prompt must still write the file");
+        assert!(e.status.contains("exported"));
+
+        let _ = std::fs::remove_file(&output_path);
+        let _ = std::fs::remove_file(&source);
+        let _ = std::fs::remove_dir(&tmp_dir);
     }
 
     #[test]

@@ -236,6 +236,49 @@ pub fn save_atomic(path: &Path, content: &str) -> Result<SaveOutcome, SaveError>
 }
 
 // ---------------------------------------------------------------------------
+// save_atomic_bytes — mirrors save_atomic but accepts raw bytes (no UTF-8 check,
+// no skip-unchanged).  Used by the export path (Task 5) for HTML/binary output.
+// ---------------------------------------------------------------------------
+
+pub fn save_atomic_bytes(path: &Path, content: &[u8]) -> Result<(), SaveError> {
+    // Resolve parent directory (fall back to "." for bare filenames).
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    // Create temp file (O_EXCL, owner-only on Unix).
+    let (mut file, temp) = create_temp(&dir, &name).map_err(|e| SaveError::Io(e.to_string()))?;
+    let mut guard = TempGuard(Some(temp.clone()));
+
+    // Write bytes.
+    file.write_all(content).map_err(|e| SaveError::Io(e.to_string()))?;
+
+    // fsync the file content+metadata BEFORE the rename.
+    file.flush().map_err(|e| SaveError::Io(e.to_string()))?;
+    file.sync_all().map_err(|e| SaveError::Io(e.to_string()))?;
+
+    // Atomic replace.
+    fs::rename(&temp, path).map_err(|e| SaveError::Io(e.to_string()))?;
+
+    // Disarm the guard: the temp file has been renamed away.
+    guard.disarm();
+
+    // fsync the parent directory so the rename entry is durable.
+    if let Ok(dir_fh) = fs::File::open(&dir) {
+        dir_fh.sync_all().map_err(|e| SaveError::Io(e.to_string()))?;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -409,6 +452,42 @@ mod tests {
         let outcome = save_atomic(&p, "dir-fsync test\n").expect("save must succeed");
         assert_eq!(outcome, SaveOutcome::Saved, "successful dir-fsync path must return Saved");
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// save_atomic_bytes: roundtrip with a non-UTF-8 byte (0xFF), no temp litter.
+    #[test]
+    fn save_atomic_bytes_roundtrip_no_litter() {
+        let private_dir = std::env::temp_dir().join(format!(
+            "wcartel-bytes-litter-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&private_dir).expect("create private temp subdir");
+
+        let p = private_dir.join("export-test.bin");
+        let content: Vec<u8> = vec![0x48, 0x65, 0xFF, 0x6C, 0x6F]; // He<0xFF>Lo
+
+        save_atomic_bytes(&p, &content).expect("save_atomic_bytes must succeed");
+
+        // Verify content was written correctly.
+        let got = fs::read(&p).expect("must read back");
+        assert_eq!(got, content, "bytes must round-trip exactly");
+
+        // No temp litter.
+        let litter: Vec<_> = fs::read_dir(&private_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name();
+                let s = name.to_string_lossy();
+                s.ends_with(".tmp")
+            })
+            .collect();
+        assert!(litter.is_empty(), "temp litter remains: {litter:?}");
+
+        // Clean up.
+        let _ = fs::remove_file(&p);
+        let _ = fs::remove_dir(&private_dir);
     }
 
     /// No temp litter left after a successful save.
