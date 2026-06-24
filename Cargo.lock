@@ -581,6 +581,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "repar"
+version = "0.9.10"
+dependencies = [
+ "bitflags",
+ "terminal_size",
+ "thiserror 1.0.69",
+ "unicode-width 0.1.13",
+]
+
+[[package]]
 name = "ropey"
 version = "1.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -769,6 +779,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "terminal_size"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
+dependencies = [
+ "rustix 1.1.4",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -840,14 +860,14 @@ checksum = "b3644627a5af5fa321c95b9b235a72fd24cd29c648c2c379431e6628655627bf"
 dependencies = [
  "itertools",
  "unicode-segmentation",
- "unicode-width 0.1.14",
+ "unicode-width 0.1.13",
 ]
 
 [[package]]
 name = "unicode-width"
-version = "0.1.14"
+version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
+checksum = "0336d538f7abc86d282a4189614dfaa90810dfc2c6f6427eaf88e16311dd225d"
 
 [[package]]
 name = "unicode-width"
@@ -1075,6 +1095,7 @@ dependencies = [
  "dirs",
  "proptest",
  "ratatui",
+ "repar",
  "ropey",
  "subprocess",
  "thiserror 2.0.18",
@@ -1091,7 +1112,7 @@ dependencies = [
  "smallvec",
  "smartstring",
  "unicode-segmentation",
- "unicode-width 0.1.14",
+ "unicode-width 0.1.13",
 ]
 
 [[package]]
