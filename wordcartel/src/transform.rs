@@ -44,6 +44,45 @@ impl TransformError {
     fn from_repar(e: repar::ParError) -> TransformError { TransformError::Repar(e.to_string()) }
 }
 
+use wordcartel_core::block_tree::BlockTree;
+
+/// Expand `[from,to)` to cover every top-level block whose span intersects it.
+/// If no block intersects, the range is returned unchanged. Half-open intervals;
+/// callers pass a non-empty selection (from < to). The block tree is already
+/// maintained per buffer (Effort 3) — this is a bounded scan, not a parse.
+pub fn snap_to_blocks(blocks: &BlockTree, from: usize, to: usize) -> std::ops::Range<usize> {
+    let mut start = from;
+    let mut end = to;
+    let mut found = false;
+    for b in blocks.top_level() {
+        // intersection of [from,to) and [span.start, span.end)
+        if b.span.start < to && from < b.span.end {
+            if !found {
+                start = b.span.start;
+                end = b.span.end;
+                found = true;
+            } else {
+                start = start.min(b.span.start);
+                end = end.max(b.span.end);
+            }
+        }
+    }
+    if found { start..end } else { from..to }
+}
+
+/// The byte range a transform should reformat: whole buffer when the primary
+/// selection is empty, else the selection snapped to whole blocks.
+#[allow(dead_code)] // wired in Task 3
+pub fn region_for_transform(doc: &crate::editor::Document) -> std::ops::Range<usize> {
+    let sel = doc.selection.primary();
+    let buf_len = doc.buffer.len(); // TextBuffer::len() is the byte length (buffer.rs)
+    if sel.is_empty() {
+        0..buf_len
+    } else {
+        snap_to_blocks(&doc.blocks, sel.from(), sel.to())
+    }
+}
+
 /// Run a repar transform over `input`, markdown-aware. Pure (no IO).
 pub fn run_transform(kind: TransformKind, input: &str, width: u32) -> Result<String, TransformError> {
     let mut opts = repar::Options::new().width(width);
@@ -56,6 +95,70 @@ pub fn run_transform(kind: TransformKind, input: &str, width: u32) -> Result<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::Editor;
+
+    fn blocks_of(text: &str) -> wordcartel_core::block_tree::BlockTree {
+        Editor::new_from_text(text, None, (80, 24)).active().document.blocks.clone()
+    }
+
+    // Exact-span discipline (Codex plan review, I-3): assert the snapped range
+    // EQUALS the block tree's own span(s), so there is no off-by-one that
+    // build_range_replace would turn into a dropped/duplicated newline. We compare
+    // against `top_level()[i].span` (whatever the parser produced) rather than
+    // hand-counted byte offsets.
+
+    #[test]
+    fn snap_expands_mid_paragraph_selection_to_exactly_the_paragraph_block() {
+        let text = "alpha beta gamma\ndelta epsilon zeta\n\nsecond para\n";
+        let bt = blocks_of(text);
+        let para0 = bt.top_level()[0].span.clone(); // the first paragraph block
+        // Selection lands inside the first paragraph (bytes 5..9 = "beta").
+        let r = snap_to_blocks(&bt, 5, 9);
+        assert_eq!(r, para0, "snap must equal the first paragraph block's exact span");
+        // …and must not reach into the second paragraph block.
+        assert!(r.end <= bt.top_level()[1].span.start);
+    }
+
+    #[test]
+    fn snap_inside_fenced_code_block_with_interior_blank_covers_whole_fence() {
+        // The CRITICAL case: a blank line INSIDE a fenced code block. The parser
+        // emits ONE FencedCode block spanning the interior blank; snapping must
+        // return exactly that block's span (opener through closer), never a fragment.
+        let text = "```\ncode line one\n\nstill code\n```\n\nprose after\n";
+        let bt = blocks_of(text);
+        let fence = bt.top_level()[0].span.clone();
+        // Sanity: the fence block really spans the interior blank.
+        assert!(text[fence.clone()].starts_with("```"), "block 0 is the fence");
+        assert!(text[fence.clone()].contains("\n\nstill code"), "fence spans the interior blank");
+        // A selection on "still code" (after the interior blank) snaps to the WHOLE fence.
+        let sel_from = text.find("still").unwrap();
+        let r = snap_to_blocks(&bt, sel_from, sel_from + 5);
+        assert_eq!(r, fence, "must snap to exactly the whole fenced block");
+    }
+
+    #[test]
+    fn snap_multi_block_selection_covers_exactly_the_touched_blocks() {
+        let text = "para one here\n\npara two here\n\npara three\n";
+        let bt = blocks_of(text);
+        let p0 = bt.top_level()[0].span.clone();
+        let p1 = bt.top_level()[1].span.clone();
+        let p2 = bt.top_level()[2].span.clone();
+        // Selection spans from inside para one to inside para two.
+        let from = 5;
+        let to = text.find("two").unwrap() + 1;
+        let r = snap_to_blocks(&bt, from, to);
+        assert_eq!(r, p0.start..p1.end, "snap must be exactly the union of the two touched blocks");
+        assert!(r.end <= p2.start, "must not reach the untouched third block");
+    }
+
+    #[test]
+    fn snap_with_no_intersecting_block_returns_input_range() {
+        let text = "only para\n";
+        let bt = blocks_of(text);
+        // A range past the end intersects nothing → unchanged.
+        let r = snap_to_blocks(&bt, 100, 105);
+        assert_eq!(r, 100..105);
+    }
 
     #[test]
     fn reflow_wraps_long_prose_within_width() {
