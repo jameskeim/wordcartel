@@ -62,11 +62,17 @@ pub struct Buffer {
     pub last_swap_at: Option<u64>,
     pub swap_in_flight: bool,
     // --- per-buffer recovery-on-open staging (was wrongly global; Codex review) ---
-    pub pending_recovery: Option<PendingRecovery>,
+    // PREP (Effort 4r) relocates today's two fields as-is (minimal, behavior-preserving):
+    pub pending_swap_body: Option<String>,
+    pub pending_swap_path: Option<PathBuf>,
+    // EFFORT 6 folds the two above into `pending_recovery: Option<PendingRecovery>`
+    // when it builds the multi-buffer recovery QUEUE (the struct only earns its keep
+    // with >1 buffer; see "Recovery staging form" note below).
 }
 
-/// A discovered swap awaiting the user's recover/discard/open-original decision
-/// for THIS buffer. Per-buffer because startup can discover several at once.
+/// EFFORT 6 form (not built in the 4r prep). A discovered swap awaiting the user's
+/// recover/discard/open-original decision for THIS buffer. Per-buffer because startup
+/// can discover several at once.
 pub struct PendingRecovery {
     pub swap_path: PathBuf,     // the actual swap file (orphan path differs from this buffer's own)
     pub body: String,           // swap contents, loaded on Recover
@@ -79,7 +85,9 @@ pub struct BufferId(pub u64);
 
 **`BufferId` allocation:** `Editor::alloc_id()` returns `BufferId(self.next_buffer_id)` and increments the counter. Ids are **never reused** for the process lifetime, so a stale in-flight job result can never collide with a newly-opened buffer (a recycled `Vec` index could).
 
-**The active modal carries its target.** `Prompt` gains a `target: Option<BufferId>` (None for app-global prompts like multi-dirty quit; `Some` for buffer-scoped prompts like recovery and close-confirm). Every `PromptAction` resolution acts on `target`, never on `active()` — see the cross-cutting rule in §3.4.
+**The active modal carries its target.** `Prompt` gains a `target: Option<BufferId>` (None for app-global prompts like multi-dirty quit; `Some` for buffer-scoped prompts like recovery and close-confirm). Every `PromptAction` resolution acts on `target`, never on `active()` — see the cross-cutting rule in §3.4. (The `Prompt.target` field is an **Effort 6** addition; the 4r prep keeps the existing single global modal as-is.)
+
+**Recovery staging form (prep vs. Effort 6).** The **4r prep** relocates today's `pending_swap_body`/`pending_swap_path` onto `Buffer` unchanged — a pure mechanical move (single-buffer behavior identical). **Effort 6** folds them into `pending_recovery: Option<PendingRecovery>` as part of the multi-buffer recovery *queue* (the struct earns its keep only with several simultaneous pending recoveries). So `pending_recovery` is an Effort-6 realization, not a 4r deliverable.
 
 Accessors: `editor.active() -> &Buffer`, `editor.active_mut() -> &mut Buffer`,
 `editor.by_id(id) -> Option<&Buffer>` / `by_id_mut`. The `active`/`active_mut`
@@ -105,9 +113,10 @@ is closed. Job results and (future) window panes reference buffers by `id`.
   `BufferId`**), the `quit` flag, and the `next_buffer_id` counter.
 - **Per-buffer (on `Buffer`):** everything tied to one document's text, history,
   caret/selection, layout/scroll, render mode, async/cadence/derive transients, **and
-  its `pending_recovery` staging** (a startup discovers swaps for several buffers at
-  once, so a single global recovery slot — the original draft — would let later
-  candidates overwrite earlier ones; Codex review).
+  its recovery-open staging** (`pending_swap_body`/`pending_swap_path` in the 4r prep;
+  `pending_recovery` in Effort 6) — a startup discovers swaps for several buffers at
+  once, so a single global recovery slot (the original draft) would let later
+  candidates overwrite earlier ones (Codex review).
 
 This boundary is the single most important design decision; getting it right is what
 keeps switching from cross-contaminating caret column, swap cadence, derive hints, or
@@ -207,11 +216,12 @@ the running binary behaves identically.
 1. **Introduce `Buffer` + `BufferId` + the new `Editor` shape** (vec-of-one,
    `active = 0`, `next_buffer_id` counter + `alloc_id()`); `active()`/`active_mut()`/
    `by_id`/`by_id_mut` accessors; `new_from_text` builds exactly one buffer via
-   `alloc_id()`. `Buffer` includes the relocated transients **and** `pending_recovery`
-   (the recovery-on-open staging that moves off the global `Editor`); the recovery-open
-   wiring in `app.rs` is updated to set/read the active buffer's `pending_recovery`
-   (inert single-buffer behavior preserved). The `Document`/`View` structs are
-   unchanged — only their ownership moves into `Buffer`.
+   `alloc_id()`. `Buffer` includes the relocated transients **and** the recovery-open
+   staging — the 4r prep moves today's `pending_swap_body`/`pending_swap_path` onto
+   `Buffer` **as-is** (the `PendingRecovery` struct is an Effort-6 fold; see §3.1
+   "Recovery staging form"); the recovery-open wiring in `app.rs` reads/writes the
+   active buffer's staging (inert single-buffer behavior preserved). The
+   `Document`/`View` structs are unchanged — only their ownership moves into `Buffer`.
 2. **Migrate shell call sites** `editor.document.*` / `editor.view.*` /
    `editor.<transient>` / `editor.pending_swap_*` → through `active()`/`active_mut()`.
    Split across files to keep each change reviewable: (a) `editor.rs` + `derive.rs` +

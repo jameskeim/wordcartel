@@ -130,21 +130,31 @@ impl Editor {
             path, saved_version: Some(0),
         };
         let view = View { scroll: 0, scroll_row: 0, area, mode: RenderMode::LivePreview, line_layouts: BTreeMap::new() };
-        let buf = Buffer {
-            id: BufferId(0), document, view,
+        // Build the workspace, then allocate the buffer's id through the single
+        // id source (alloc_id) so there is no second id-assignment path (Codex review).
+        let mut e = Editor {
+            buffers: Vec::new(), active: 0, next_buffer_id: 0,
+            register: Register::default(), status: String::new(), quit: false,
+            prompt: None, quit_after_save: None, quit_after_save_at: None,
+        };
+        let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
+        e.buffers.push(Buffer {
+            id, document, view,
             desired_col: None, pre_edit_rope: None, last_edit: None,
             last_edit_at: None, last_swap_at: None, swap_in_flight: false,
             pending_swap_body: None, pending_swap_path: None,
-        };
-        Editor {
-            buffers: vec![buf], active: 0, next_buffer_id: 1, // id 0 used above
-            register: Register::default(), status: String::new(), quit: false,
-            prompt: None, quit_after_save: None, quit_after_save_at: None,
-        }
+        });
+        e
     }
 
-    #[inline] pub fn active(&self) -> &Buffer { &self.buffers[self.active] }
-    #[inline] pub fn active_mut(&mut self) -> &mut Buffer { let i = self.active; &mut self.buffers[i] }
+    #[inline] pub fn active(&self) -> &Buffer {
+        debug_assert!(!self.buffers.is_empty() && self.active < self.buffers.len(), "len>=1 + active in range");
+        &self.buffers[self.active]
+    }
+    #[inline] pub fn active_mut(&mut self) -> &mut Buffer {
+        debug_assert!(!self.buffers.is_empty() && self.active < self.buffers.len(), "len>=1 + active in range");
+        let i = self.active; &mut self.buffers[i]
+    }
     pub fn by_id(&self, id: BufferId) -> Option<&Buffer> { self.buffers.iter().find(|b| b.id == id) }
     pub fn by_id_mut(&mut self, id: BufferId) -> Option<&mut Buffer> { self.buffers.iter_mut().find(|b| b.id == id) }
     /// Allocate a fresh, never-reused BufferId.
@@ -159,7 +169,7 @@ impl Editor {
 }
 ```
 
-(`new_from_text` uses `BufferId(0)` directly and sets `next_buffer_id: 1` to keep the first id deterministic at 0; `alloc_id` is used by Effort 6 for buffers 2..N. The existing `Document`/`View` structs and `Document::{dirty,mark_saved}` are unchanged.)
+(`new_from_text` routes the initial buffer's id through `alloc_id()` — the single id source — so the first buffer is deterministically `BufferId(0)` and `next_buffer_id` ends at 1; Effort 6 calls `alloc_id` for buffers 2..N. The transient empty `buffers: Vec::new()` exists only during construction; the returned `Editor` always satisfies `len >= 1`. The existing `Document`/`View` structs and `Document::{dirty,mark_saved}` are unchanged.)
 
 - [ ] **Step 2: Run the build to enumerate every broken call site.**
 
@@ -203,6 +213,23 @@ Concrete examples (verify against the real lines):
 ```
 
 **Save/swap merges** currently do `editor.last_swap_at = …` / `editor.document.saved_version = …` inside `Box<dyn FnOnce(&mut Editor)>`. For Task 1, rewrite them to `editor.active_mut().last_swap_at = …` etc. (single-buffer correct). **Task 2 replaces this with `by_id_mut(buffer_id)` routing** — leave a `// Task 2: route by buffer_id` comment at each merge site.
+
+**Two call sites the generic field-path recipe does NOT cover — handle explicitly (Codex review):**
+
+- **`save::reload_from_disk` / `save::load_recovered`** (`save.rs:~109-139`) currently build `let fresh = Editor::new_from_text(...)` then assign `editor.document = fresh.document; editor.view.line_layouts.clear(); …`. After the reshape, `fresh` is a whole workspace and `fresh.document` no longer exists. Migrate by **replacing the active buffer's contents from `fresh`'s single buffer while preserving the active buffer's `id`** (this is the spec's sanctioned whole-document replacement; keeping `id` stable keeps in-flight job routing valid):
+  ```rust
+  let fresh = Editor::new_from_text(&text, Some(path.clone()), area);
+  let new_buf = fresh.buffers.into_iter().next().expect("new_from_text yields one buffer");
+  let id = editor.active().id;                 // preserve THIS buffer's id
+  *editor.active_mut() = Buffer { id, ..new_buf };
+  // then the existing follow-ups, now on the active buffer:
+  editor.active_mut().view.line_layouts.clear();
+  derive::rebuild(editor);
+  nav::ensure_visible(editor);
+  editor.active_mut().document.stored_fp = fingerprint(&path); // (load_recovered: saved_version = None)
+  ```
+  (`Buffer { id, ..new_buf }` keeps the stable id and takes fresh document/view/reset-transients from `new_buf`. `load_recovered` then sets `saved_version = None` on the active buffer as today.)
+- **`swap::build_header(editor: &Editor, …)`** (`swap.rs:~220-239`) reads `editor.document.path` / `editor.document.version` / `editor.document.stored_fp`. The generic recipe applies (`editor.document` → `editor.active().document`); just confirm every read inside it is rewritten. (No signature change needed for the prep.)
 
 - [ ] **Step 4: Migrate the existing tests' field paths** in the same mechanical way. Tests across `editor.rs`, `commands.rs`, `app.rs`, `save.rs`, `swap.rs`, `render.rs`, `nav.rs` that read `e.document.*` / `e.view.*` / `e.desired_col` / `e.pending_swap_*` / `e.last_*` / `e.swap_in_flight` become `e.active().…` / `e.active_mut().…`. **This is the only permitted test change — the assertion values are identical.** Do NOT alter any asserted value, only the field path. (Tests that set `e.document.selection = …` use `active_mut()`; tests that read `e.document.buffer.to_string()` use `active()`.)
 
@@ -425,10 +452,12 @@ JobResult {
                     }
                 }
                 Err(e) => {
-                    status = match e {
-                        SaveError::Symlink => "refusing to write through symlink".into(),
-                        other => other.to_string(),
-                    };
+                    // Preserve the current DRY form (4b-2 final-review touch-up
+                    // collapsed the per-variant match to e.to_string()); do NOT
+                    // re-introduce a SaveError::Symlink arm (it would need an import
+                    // and regress that cleanup). `e.to_string()` for Symlink still
+                    // contains "symlink", satisfying the existing failure test.
+                    status = e.to_string();
                 }
             }
         }
