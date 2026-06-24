@@ -31,15 +31,21 @@ pub enum Msg {
 
 /// Merge a finished job's effect on the foreground, honoring staleness (§10.3).
 pub fn apply_result(r: JobResult, editor: &mut Editor) {
-    if is_stale(r.kind, r.version, editor.active().document.version) {
-        return; // version moved on: discard, don't rebase
+    if is_stale(&r, editor) {
+        return; // buffer-local merge for a closed buffer, or a stale coalescible
     }
-    let (kind, version) = (r.kind, r.version);
+    let (kind, version, buffer_id, class) = (r.kind, r.version, r.buffer_id, r.class);
+    // Mechanical-routing assertion (spec §3.4): a buffer-local merge must resolve
+    // to a live buffer here; durability merges may target a now-missing buffer.
+    debug_assert!(
+        class == crate::jobs::ResultClass::Durability || editor.by_id(buffer_id).is_some(),
+        "buffer-local result for a missing buffer slipped past is_stale"
+    );
     (r.merge)(editor);
-    // Save & quit: exit once the awaited save version lands clean.
+    // Save & quit: exit once the awaited save version lands clean for that buffer.
     if kind == crate::jobs::JobKind::Save
         && editor.quit_after_save == Some(version)
-        && editor.active().document.saved_version == Some(version)
+        && editor.by_id(buffer_id).map(|b| b.document.saved_version) == Some(Some(version))
     {
         editor.quit = true;
     }
@@ -593,16 +599,59 @@ mod tests {
     #[test]
     fn apply_result_merges_fresh_and_drops_stale() {
         use crate::editor::Editor;
-        use crate::jobs::{JobResult, JobKind};
+        use crate::jobs::{JobResult, JobKind, ResultClass};
         let mut e = Editor::new_from_text("\n", None, (80, 24));
+        let id = e.active().id;
         e.active_mut().document.version = 5;
         // Fresh one-shot (Save is never stale): merges.
-        crate::app::apply_result(JobResult { version: 3, kind: JobKind::Save,
+        crate::app::apply_result(JobResult { buffer_id: id, class: ResultClass::Durability, version: 3, kind: JobKind::Save,
             merge: Box::new(|ed: &mut Editor| ed.status = "saved".into()) }, &mut e);
         assert_eq!(e.status, "saved");
         // Stale coalescible: dropped.
-        crate::app::apply_result(JobResult { version: 3, kind: JobKind::CoalesceProbe,
+        crate::app::apply_result(JobResult { buffer_id: id, class: ResultClass::BufferLocal, version: 3, kind: JobKind::CoalesceProbe,
             merge: Box::new(|ed: &mut Editor| ed.status = "STALE".into()) }, &mut e);
         assert_eq!(e.status, "saved", "stale coalescible result must be dropped");
+    }
+
+    #[test]
+    fn buffer_local_result_for_missing_buffer_is_dropped() {
+        use crate::editor::{Editor, BufferId};
+        use crate::jobs::{JobResult, JobKind, ResultClass};
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        // A buffer-local merge for a non-existent buffer must NOT run.
+        crate::app::apply_result(JobResult {
+            buffer_id: BufferId(999), class: ResultClass::BufferLocal,
+            version: 1, kind: JobKind::Save,
+            merge: Box::new(|ed: &mut Editor| ed.status = "SHOULD NOT RUN".into()),
+        }, &mut e);
+        assert_ne!(e.status, "SHOULD NOT RUN", "buffer-local merge for a missing buffer is dropped");
+    }
+
+    #[test]
+    fn buffer_local_result_for_live_buffer_merges() {
+        use crate::editor::Editor;
+        use crate::jobs::{JobResult, JobKind, ResultClass};
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        let id = e.active().id;
+        crate::app::apply_result(JobResult {
+            buffer_id: id, class: ResultClass::BufferLocal,
+            version: 1, kind: JobKind::Save,
+            merge: Box::new(|ed: &mut Editor| ed.status = "merged".into()),
+        }, &mut e);
+        assert_eq!(e.status, "merged");
+    }
+
+    #[test]
+    fn durability_result_for_missing_buffer_still_runs() {
+        use crate::editor::{Editor, BufferId};
+        use crate::jobs::{JobResult, JobKind, ResultClass};
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        // A durability completion runs even though its buffer is gone (e.g. closed).
+        crate::app::apply_result(JobResult {
+            buffer_id: BufferId(999), class: ResultClass::Durability,
+            version: 1, kind: JobKind::SwapWrite,
+            merge: Box::new(|ed: &mut Editor| ed.status = "durability ran".into()),
+        }, &mut e);
+        assert_eq!(e.status, "durability ran");
     }
 }

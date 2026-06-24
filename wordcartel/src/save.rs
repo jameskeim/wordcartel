@@ -8,7 +8,7 @@ use std::time::SystemTime;
 
 use crate::commands::CommandResult;
 use crate::file::{self, SaveOutcome};
-use crate::jobs::{Job, JobKind, JobResult};
+use crate::jobs::{Job, JobKind, JobResult, ResultClass};
 use crate::registry::Ctx;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -32,8 +32,11 @@ fn do_save(ctx: &mut Ctx) {
     ctx.editor.status = "Saving\u{2026}".to_string();
     let snap = ctx.editor.active().document.buffer.snapshot(); // O(1) ropey clone
     let v = ctx.editor.active().document.version;
+    let buffer_id = ctx.editor.active().id;
 
     ctx.executor.dispatch(Job {
+        buffer_id,
+        class: ResultClass::Durability,
         version: v,
         kind: JobKind::Save,
         run: Box::new(move || {
@@ -42,29 +45,36 @@ fn do_save(ctx: &mut Ctx) {
             let outcome = file::save_atomic(&path, &content);
             let new_fp = fingerprint(&path);
             JobResult {
+                buffer_id,
+                class: ResultClass::Durability,
                 version: v,
                 kind: JobKind::Save,
                 merge: Box::new(move |editor| {
-                    match outcome {
-                        Ok(SaveOutcome::Saved) | Ok(SaveOutcome::Unchanged) => {
-                            // Task 2: route by buffer_id
-                            editor.active_mut().document.saved_version = Some(v);
-                            editor.active_mut().document.stored_fp = new_fp;
-                            if editor.active().document.version == v {
-                                editor.status = "Saved".to_string();
-                                // Buffer is clean at the saved version → swap is
-                                // no longer needed. (Stale-version saves skip this.)
-                                crate::swap::delete(editor.active().document.path.as_deref());
-                            } else {
-                                editor.status = format!("Saved v{v} (still editing)");
+                    // Assemble the (global) status in a local so the `b` mutable borrow ends
+                    // before we touch editor.status.
+                    let mut status = String::new();
+                    if let Some(b) = editor.by_id_mut(buffer_id) {
+                        match outcome {
+                            Ok(SaveOutcome::Saved) | Ok(SaveOutcome::Unchanged) => {
+                                b.document.saved_version = Some(v);
+                                b.document.stored_fp = new_fp;
+                                if b.document.version == v {
+                                    status = "Saved".to_string();
+                                    crate::swap::delete(b.document.path.as_deref());
+                                } else {
+                                    status = format!("Saved v{v} (still editing)");
+                                }
+                            }
+                            Err(e) => {
+                                // Failure: leave saved_version/stored_fp untouched
+                                // (buffer stays dirty); surface the error.
+                                // Do NOT re-introduce SaveError::Symlink match — e.to_string()
+                                // for Symlink still contains "symlink", satisfying the test.
+                                status = e.to_string();
                             }
                         }
-                        Err(e) => {
-                            // Failure: leave saved_version/stored_fp untouched
-                            // (buffer stays dirty); surface the error.
-                            editor.status = e.to_string();
-                        }
                     }
+                    editor.status = status;
                 }),
             }
         }),

@@ -2,7 +2,7 @@
 //! 0700 XDG state dir. Never writes the user's .md.
 
 use crate::editor::Editor;
-use crate::jobs::{Job, JobKind, JobResult};
+use crate::jobs::{Job, JobKind, JobResult, ResultClass};
 use crate::registry::Ctx;
 use std::io;
 use std::io::Write as _;
@@ -282,7 +282,10 @@ pub fn dispatch_swap_write(ctx: &mut Ctx) {
     let ts = ctx.clock.now_ms();
     let header = build_header(ctx.editor, "", ts); // body filled on worker
     let version = ctx.editor.active().document.version;
+    let buffer_id = ctx.editor.active().id;
     ctx.executor.dispatch(Job {
+        buffer_id,
+        class: ResultClass::Durability,
         version,
         kind: JobKind::SwapWrite,
         run: Box::new(move || {
@@ -291,16 +294,16 @@ pub fn dispatch_swap_write(ctx: &mut Ctx) {
             h.content_hash = fnv1a64(body.as_bytes());
             let ok = write_atomic(&path, &serialize(&h, &body)).is_ok();
             JobResult {
+                buffer_id,
+                class: ResultClass::Durability,
                 version,
                 kind: JobKind::SwapWrite,
                 merge: Box::new(move |editor| {
-                    // Task 2: route by buffer_id
-                    editor.active_mut().swap_in_flight = false;
-                    if ok {
-                        editor.active_mut().last_swap_at = Some(ts);
-                    } else {
-                        editor.status = "swap write failed".to_string();
+                    if let Some(b) = editor.by_id_mut(buffer_id) {
+                        b.swap_in_flight = false;
+                        if ok { b.last_swap_at = Some(ts); }
                     }
+                    if !ok { editor.status = "swap write failed".to_string(); } // status global
                 }),
             }
         }),
