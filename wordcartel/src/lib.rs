@@ -18,3 +18,4 @@ pub mod recovery;
 pub mod filter;
 pub mod minibuffer;
 pub mod export;
+pub mod transform;
