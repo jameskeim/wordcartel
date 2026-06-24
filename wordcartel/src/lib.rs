@@ -8,4 +8,5 @@ pub mod input;
 pub mod render;
 pub mod term;
 pub mod file;
+pub mod jobs;
 pub mod app;   // App::run + the testable App::step (Task 12)
