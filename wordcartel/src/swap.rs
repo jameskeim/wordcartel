@@ -169,10 +169,15 @@ fn pid_is_live(_pid: u32) -> bool {
 /// own. Skip our own pid and live pids; return the newest valid non-empty
 /// orphan as (file path, header, body).
 pub fn find_orphan_scratch_swap() -> Option<(std::path::PathBuf, SwapHeader, String)> {
-    let dir = state_dir().ok()?;
+    find_orphan_scratch_swap_in(&state_dir().ok()?)
+}
+
+/// Dir-injectable core of `find_orphan_scratch_swap` so tests can isolate from the
+/// shared real state dir (which accumulates orphan litter across runs).
+fn find_orphan_scratch_swap_in(dir: &std::path::Path) -> Option<(std::path::PathBuf, SwapHeader, String)> {
     let me = std::process::id();
     let mut best: Option<(std::path::PathBuf, SwapHeader, String)> = None;
-    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let fname = entry.file_name();
         let fname = fname.to_string_lossy();
         let pid = fname.strip_prefix("scratch-")
@@ -475,7 +480,15 @@ mod tests {
         // Write an orphan scratch swap with a fake dead pid (999999 is unreachable
         // in practice; pid_is_live returns false for it on Linux since /proc/999999
         // won't exist unless the system is truly overloaded — we also check).
-        let dir = state_dir().unwrap();
+        // Use a UNIQUE temp dir, not the shared real state dir: the finder returns
+        // the newest orphan across the whole dir, and the real state dir accumulates
+        // scratch-*.swp litter from other runs that would outrank our planted file.
+        let dir = std::env::temp_dir().join(format!(
+            "wc-orphan-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
         let fake_pid: u32 = 999_999;
         // On Linux, verify the fake pid is indeed not live before depending on it.
         #[cfg(target_os = "linux")]
@@ -499,7 +512,7 @@ mod tests {
         };
         write_atomic(&my_path, &serialize(&my_h, "self text\n")).unwrap();
 
-        let result = find_orphan_scratch_swap();
+        let result = find_orphan_scratch_swap_in(&dir);
         assert!(result.is_some(), "finder must return the orphan");
         let (found_path, found_header, found_body) = result.unwrap();
         assert_eq!(found_path, orphan_path, "finder must return the dead-pid orphan");
@@ -510,6 +523,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&orphan_path);
         let _ = std::fs::remove_file(&my_path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
