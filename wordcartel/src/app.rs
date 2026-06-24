@@ -3,7 +3,9 @@
 // Design: terminal IO lives ONLY in `run`; `step` is pure and unit-testable.
 // The real loop calls `step` then draws — `step` never touches the terminal.
 
-use crossterm::event::{Event, KeyEvent};
+use crossterm::event::Event;
+#[cfg(test)]
+use crossterm::event::KeyEvent;
 use std::path::PathBuf;
 
 use crate::{commands, derive, editor::Editor, file, input, render, term};
@@ -82,6 +84,7 @@ pub fn reduce(
 ///
 /// All editor mutation goes through `commands::run`; this function adds no
 /// logic of its own beyond the translation.
+#[cfg(test)]
 pub fn step(editor: &mut Editor, key: KeyEvent, clock: &dyn Clock) -> bool {
     if let Some(cmd) = input::key_to_command(key) {
         commands::run(cmd, editor, clock);
@@ -197,7 +200,12 @@ pub fn run(path: Option<PathBuf>) -> std::io::Result<()> {
         if !keep { break; }
     }
 
-    // Terminal restored by TerminalGuard::drop.
+    // Restore the terminal BEFORE the executor drops: ThreadExecutor::drop joins
+    // the worker, which may still be completing an in-flight save_atomic on a slow
+    // filesystem. Dropping the guard first guarantees the user gets their terminal
+    // back immediately; we still join (don't abandon an in-flight atomic save — that
+    // is the "never lose work" behavior). A BOUNDED save&quit wait lands in Effort 4b-2.
+    drop(guard);
     Ok(())
 }
 

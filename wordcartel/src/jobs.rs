@@ -172,6 +172,8 @@ mod tests {
         assert_eq!(e.status, "merged");
     }
 
+    // One-shot Save/SwapWrite results are never discarded by is_stale — correctness
+    // for an edited-on buffer comes from the version-aware MERGE in save.rs, not here.
     #[test]
     fn one_shot_kinds_are_never_stale() {
         assert!(!is_stale(JobKind::Save, 1, 99));

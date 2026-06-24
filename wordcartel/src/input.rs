@@ -5,10 +5,12 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+#[cfg(test)]
 use crate::commands::{Command, Dir};
 use crate::registry::CommandId;
 
 /// Translate a crossterm `KeyEvent` to a `Command`, or `None` for unmapped keys.
+#[cfg(test)]
 pub fn key_to_command(key: KeyEvent) -> Option<Command> {
     // Guard: only act on key-press events.
     if key.kind != KeyEventKind::Press {
