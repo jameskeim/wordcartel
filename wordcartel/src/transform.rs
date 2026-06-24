@@ -3,7 +3,6 @@
 
 pub const DEFAULT_REFLOW_WIDTH: u32 = 72;
 /// Regions at or above this byte length run off the keystroke thread (§5.2).
-#[allow(dead_code)] // wired in Task 3/4
 pub const TRANSFORM_ASYNC_THRESHOLD: usize = 1 << 20; // 1 MiB
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,7 +21,6 @@ impl TransformKind {
         match self { Self::Reflow => "reflowed", Self::Unwrap => "unwrapped", Self::Ventilate => "ventilated" }
     }
     /// Gerund for in-progress: "reflowing" / "unwrapping" / "ventilating".
-    #[allow(dead_code)] // wired in Task 3/4
     pub fn gerund(self) -> &'static str {
         match self { Self::Reflow => "reflowing", Self::Unwrap => "unwrapping", Self::Ventilate => "ventilating" }
     }
@@ -81,32 +79,58 @@ pub fn region_for_transform(doc: &crate::editor::Document) -> std::ops::Range<us
 
 use std::ops::Range;
 
-/// Run a transform over the active buffer's resolved region. Task 3: synchronous
-/// (`_msg_tx` unused until Task 4 adds the >= TRANSFORM_ASYNC_THRESHOLD off-thread branch).
+/// Run a transform over the active buffer's resolved region.
+/// For regions >= TRANSFORM_ASYNC_THRESHOLD bytes, runs off the keystroke thread
+/// and sends Msg::TransformDone; smaller regions run synchronously.
 /// `clock` is the same &dyn Clock that resolve_prompt receives.
 pub fn dispatch_transform(
     editor: &mut crate::editor::Editor,
     kind: TransformKind,
     clock: &dyn wordcartel_core::history::Clock,
-    _msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
 ) {
+    if editor.transform_in_flight {
+        editor.status = "a transform is already running".into();
+        return;
+    }
     let range = region_for_transform(&editor.active().document);
     if range.is_empty() {
         editor.status = "nothing to transform".into();
         return;
     }
-    // Task 4: if range.len() >= TRANSFORM_ASYNC_THRESHOLD, snapshot + spawn + send
-    //         Msg::TransformDone instead of running inline. For now, run sync.
+    if range.len() >= TRANSFORM_ASYNC_THRESHOLD {
+        let buffer_id = editor.active().id;
+        let version = editor.active().document.version;
+        let snapshot = editor.active().document.buffer.snapshot(); // O(1) rope snapshot
+        editor.transform_in_flight = true;
+        editor.status = format!("{}…", kind.gerund());
+        let range_c = range.clone();
+        let msg_tx = msg_tx.clone();
+        std::thread::spawn(move || {
+            let input = snapshot.byte_slice(range_c.clone()).to_string();
+            let result = run_transform(kind, &input, DEFAULT_REFLOW_WIDTH);
+            let _ = msg_tx.send(crate::app::Msg::TransformDone {
+                buffer_id, version, range: range_c, kind, result,
+            });
+        });
+        return;
+    }
+    // Sync branch: region is small enough to run on the keystroke thread.
     let input = editor.active().document.buffer.slice(range.clone()).to_string();
     let result = run_transform(kind, &input, DEFAULT_REFLOW_WIDTH);
     apply_transform_result(editor, kind, range, result, clock);
 }
 
-/// Shared merge for sync (Task 3) and async (Task 4): apply the transform output
-/// as one undoable edit, with the §6.2 status contract. `range` is the byte range
-/// that was transformed; `result` is the repar output for that range.
-pub fn apply_transform_result(
+/// Shared merge body used by BOTH the sync path and the async path (via
+/// `apply_transform_done` in app.rs). Targets `buffer_id` (not necessarily
+/// active) so both callers route correctly.
+///
+/// Active-buffer guard: `derive::rebuild` and `nav::ensure_visible` operate on
+/// `editor.active()` ONLY. We call them only when the merged buffer IS the
+/// active buffer, future-proofing for Effort 6 multi-buffer.
+pub fn merge_transform_into(
     editor: &mut crate::editor::Editor,
+    buffer_id: crate::editor::BufferId,
     kind: TransformKind,
     range: Range<usize>,
     result: Result<String, TransformError>,
@@ -117,22 +141,44 @@ pub fn apply_transform_result(
             editor.status = format!("transform failed: {e}");
         }
         Ok(out) => {
-            let current = editor.active().document.buffer.slice(range.clone()).to_string();
+            // Read the current bytes for the no-op check; borrow ends before apply.
+            let current = editor.by_id(buffer_id)
+                .map(|b| b.document.buffer.slice(range.clone()).to_string())
+                .unwrap_or_default();
             if out == current {
                 editor.status = format!("already {}", kind.past_tense());
                 return;
             }
-            let doc_len = editor.active().document.buffer.len();
+            let doc_len = editor.by_id(buffer_id).map(|b| b.document.buffer.len()).unwrap_or(0);
             let (cs, edit) = crate::commands::build_range_replace(range.start, range.end, &out, doc_len);
             let txn = wordcartel_core::history::Transaction::new(cs);
-            // End the active() read borrow before active_mut() apply, then rebuild after.
-            editor.active_mut().apply(
-                txn, edit, wordcartel_core::history::EditKind::Other, clock);
-            crate::derive::rebuild(editor);
-            crate::nav::ensure_visible(editor);
+            // Apply via by_id_mut — borrow ends before derive/nav calls below.
+            if let Some(b) = editor.by_id_mut(buffer_id) {
+                b.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
+            } else {
+                return; // buffer disappeared mid-flight
+            }
+            // derive::rebuild / ensure_visible are active-buffer-only.
+            if buffer_id == editor.active().id {
+                crate::derive::rebuild(editor);
+                crate::nav::ensure_visible(editor);
+            }
             editor.status = kind.past_tense().to_string();
         }
     }
+}
+
+/// Sync-path entry point (called by dispatch_transform for small regions).
+/// Delegates to merge_transform_into targeting the active buffer.
+pub fn apply_transform_result(
+    editor: &mut crate::editor::Editor,
+    kind: TransformKind,
+    range: Range<usize>,
+    result: Result<String, TransformError>,
+    clock: &dyn wordcartel_core::history::Clock,
+) {
+    let buffer_id = editor.active().id;
+    merge_transform_into(editor, buffer_id, kind, range, result, clock);
 }
 
 /// Run a repar transform over `input`, markdown-aware. Pure (no IO).

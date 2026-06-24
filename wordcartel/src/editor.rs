@@ -110,6 +110,7 @@ pub struct Editor {
     pub quit_after_save: Option<u64>,
     pub quit_after_save_at: Option<u64>,
     pub filter_in_flight: Option<crate::filter::CancelFlag>,
+    pub transform_in_flight: bool,
     pub minibuffer: Option<crate::minibuffer::Minibuffer>,
     pub pending_export: Option<crate::export::PendingExport>,
 }
@@ -132,7 +133,7 @@ impl Editor {
             buffers: Vec::new(), active: 0, next_buffer_id: 0,
             register: Register::default(), status: String::new(), quit: false,
             prompt: None, quit_after_save: None, quit_after_save_at: None,
-            filter_in_flight: None, minibuffer: None, pending_export: None,
+            filter_in_flight: None, transform_in_flight: false, minibuffer: None, pending_export: None,
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer {

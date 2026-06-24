@@ -45,6 +45,13 @@ pub enum Msg {
         /// the meantime (TOCTOU guard; Codex pre-merge gate).
         overwrite_confirmed: bool,
     },
+    TransformDone {
+        buffer_id: crate::editor::BufferId,
+        version: u64,
+        range: std::ops::Range<usize>,
+        kind: crate::transform::TransformKind,
+        result: Result<String, crate::transform::TransformError>,
+    },
     Tick,
 }
 
@@ -66,6 +73,13 @@ impl std::fmt::Debug for Msg {
                 .debug_struct("ExportDone")
                 .field("buffer_id", buffer_id)
                 .field("target", target)
+                .finish(),
+            Msg::TransformDone { buffer_id, version, range, kind, .. } => f
+                .debug_struct("TransformDone")
+                .field("buffer_id", buffer_id)
+                .field("version", version)
+                .field("range", range)
+                .field("kind", kind)
                 .finish(),
             Msg::Tick => f.write_str("Tick"),
         }
@@ -138,6 +152,24 @@ fn apply_filter_done(
             }
         }
     }
+}
+
+fn apply_transform_done(
+    editor: &mut crate::editor::Editor,
+    buffer_id: crate::editor::BufferId,
+    version: u64,
+    range: std::ops::Range<usize>,
+    kind: crate::transform::TransformKind,
+    result: Result<String, crate::transform::TransformError>,
+    clock: &dyn wordcartel_core::history::Clock,
+) {
+    editor.transform_in_flight = false;
+    let stale = editor.by_id(buffer_id).map(|b| b.document.version) != Some(version);
+    if stale {
+        editor.status = "transform discarded — buffer changed".into();
+        return;
+    }
+    crate::transform::merge_transform_into(editor, buffer_id, kind, range, result, clock);
 }
 
 fn apply_export_done(
@@ -326,6 +358,9 @@ pub fn reduce(
             Msg::ExportDone { target, result, overwrite_confirmed, .. } => {
                 apply_export_done(editor, target, result, overwrite_confirmed);
             }
+            Msg::TransformDone { buffer_id, version, range, kind, result } => {
+                apply_transform_done(editor, buffer_id, version, range, kind, result, clock);
+            }
             // Resize/Tick/other input: ignored for the modal, but results still drain below.
             _ => {}
         }
@@ -414,6 +449,9 @@ pub fn reduce(
         }
         Msg::ExportDone { target, result, overwrite_confirmed, .. } => {
             apply_export_done(editor, target, result, overwrite_confirmed);
+        }
+        Msg::TransformDone { buffer_id, version, range, kind, result } => {
+            apply_transform_done(editor, buffer_id, version, range, kind, result, clock);
         }
         Msg::Tick => {
             let now = clock.now_ms();
@@ -1281,6 +1319,58 @@ mod tests {
         assert_eq!(e.active().document.buffer.to_string(), text);
         assert_eq!(e.active().document.version, v0, "no-op transform must not bump version");
         assert!(e.status.contains("already"));
+    }
+
+    #[test]
+    fn transformdone_applies_when_fresh() {
+        use crate::editor::Editor;
+        use crate::transform::TransformKind;
+        use crate::registry::Registry;
+        use crate::jobs::InlineExecutor;
+        let mut e = Editor::new_from_text("one two three four five six seven\n", None, (80, 24));
+        let id = e.active().id; let v = e.active().document.version;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let range = 0..e.active().document.buffer.to_string().len();
+        let out = "one\ntwo\n".to_string(); // pretend ventilate output
+        crate::app::reduce(Msg::TransformDone { buffer_id: id, version: v, range,
+            kind: TransformKind::Ventilate, result: Ok(out.clone()) }, &mut e, &reg, &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), out);
+        e.active_mut().undo();
+        assert_eq!(e.active().document.buffer.to_string(), "one two three four five six seven\n");
+    }
+
+    #[test]
+    fn transformdone_discarded_when_version_moved() {
+        use crate::editor::Editor;
+        use crate::transform::TransformKind;
+        use crate::registry::Registry;
+        use crate::jobs::InlineExecutor;
+        let mut e = Editor::new_from_text("alpha beta\n", None, (80, 24));
+        let id = e.active().id; let stale = e.active().document.version;
+        e.active_mut().document.version += 1; // an intervening edit
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::TransformDone { buffer_id: id, version: stale, range: 0..10,
+            kind: TransformKind::Reflow, result: Ok("X".into()) }, &mut e, &reg, &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "alpha beta\n", "stale result discarded");
+        assert!(e.status.to_lowercase().contains("discarded"));
+        assert!(!e.transform_in_flight, "in-flight cleared even on discard");
+    }
+
+    #[test]
+    fn large_buffer_routes_async_and_delivers_transformdone() {
+        use crate::editor::Editor;
+        use crate::transform::TransformKind;
+        // > 1 MiB buffer forces the async branch; we block on the channel.
+        let big = "word ".repeat(300_000); // ~1.5 MB
+        let mut e = Editor::new_from_text(&big, None, (80, 24));
+        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+        crate::transform::dispatch_transform(&mut e, TransformKind::Unwrap, &TestClock(0), &tx);
+        assert!(e.transform_in_flight, "async dispatch sets the in-flight guard");
+        let msg = rx.recv().expect("TransformDone must arrive");
+        match msg { Msg::TransformDone { kind: TransformKind::Unwrap, result: Ok(_), .. } => {}
+                    other => panic!("expected TransformDone Ok, got {other:?}") }
     }
 
     #[test]
