@@ -100,6 +100,16 @@ fn replace_changeset(
     }
 }
 
+/// Build a `(ChangeSet, Edit)` replacing byte range `from..to` with `text`.
+/// Public so the filter merge (filter.rs) can produce one undoable edit.
+pub fn build_range_replace(
+    from: usize, to: usize, text: &str, doc_len: usize,
+) -> (wordcartel_core::change::ChangeSet, wordcartel_core::block_tree::Edit) {
+    let cs = replace_changeset(from, to, text, doc_len); // existing private builder
+    let edit = wordcartel_core::block_tree::Edit { range: from..to, new_len: text.len() };
+    (cs, edit)
+}
+
 /// Execute `cmd` against `editor`, then re-derive + ensure visibility.
 pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     match cmd {
@@ -1015,6 +1025,20 @@ mod tests {
         let r = run(Command::Copy, &mut e, &TestClock(0));
         assert_eq!(r, CommandResult::Noop, "Copy on empty selection is a no-op");
         assert_eq!(e.register.get(), Some("seed"), "register must be preserved");
+    }
+
+    #[test]
+    fn build_range_replace_yields_changeset_and_matching_edit() {
+        use crate::editor::Editor;
+        use wordcartel_core::history::{EditKind, Transaction};
+        let mut e = Editor::new_from_text("abcde\n", None, (80, 24));
+        let doc_len = e.active().document.buffer.len();
+        // Replace bytes 1..3 ("bc") with "X".
+        let (cs, edit) = build_range_replace(1, 3, "X", doc_len);
+        assert_eq!((edit.range.clone(), edit.new_len), (1..3, 1));
+        let txn = Transaction::new(cs).with_selection(wordcartel_core::selection::Selection::single(2));
+        e.active_mut().apply(txn, edit, EditKind::Other, &TestClock(0));
+        assert_eq!(e.active().document.buffer.to_string(), "aXde\n");
     }
 
     #[test]
