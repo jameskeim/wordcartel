@@ -5,6 +5,7 @@ pub mod derive;
 pub mod nav;
 pub mod commands;
 pub mod input;
+pub mod registry;
 pub mod render;
 pub mod term;
 pub mod file;
