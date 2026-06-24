@@ -17,7 +17,7 @@
 - **Responsiveness #1** (§3.9): foreground never blocks on IO; swap writes go through a job, never inline. `status` set before dispatch.
 - **Functional core / imperative shell** (§10): all IO/threads/OS calls in the `wordcartel` shell crate; `wordcartel-core` untouched.
 - **Never lose work / never crash silently** (§15.1–15.2): the `.md` is never written by the swap path; failures surface non-blocking; modal only for genuinely destructive/ambiguous decisions.
-- **Single mutation channel** (§10.1): document text changes only via `editor.apply`; the `SwapWrite` merge is status-only bookkeeping.
+- **Single mutation channel** (§10.1): *incremental* document text changes only via `editor.apply`; the `SwapWrite` merge is status-only bookkeeping. **Sanctioned exception — whole-document replacement** (matches 4b-1's Global Constraints): `reload_from_disk` and `load_recovered` (Task 8) replace the whole buffer *and* reset history, so they build a fresh `Document` and assign `editor.document` directly rather than routing through `apply` — there is no incremental delta to map. Each clears `view.line_layouts` and re-derives.
 - **LF-only line semantics** (from 4b-1).
 - **Permissions (Unix):** state dir `0700`; every swap/temp/final/panic-dump file `0600`, mode set at temp-create time before rename.
 - **Workspace facts:** `cargo test` from repo root; 4b-1 baseline green. No test weakened to pass.
@@ -1038,6 +1038,7 @@ git commit -m "feat(swap): hash-first recovery predicate + recovery prompt on op
 **Make active prompts intercept input and route a chosen key to a resolver.** Upgrade quit-with-unsaved from double-Ctrl+Q to the real modal. "Save & quit" dispatches the save and waits for **that save's version** with a 5 s timeout; on success delete the swap and exit; on error/timeout re-raise the prompt. Also resolve the recovery actions from Task 7.
 
 **Files:**
+- Modify: `wordcartel/src/save.rs` (extract `do_save`; add `overwrite_save`, `reload_from_disk`, `load_recovered` — the save-effect helpers the resolver calls; created **here** so Task 8's suite compiles)
 - Modify: `wordcartel/src/app.rs` (prompt interception in `reduce`; `resolve_prompt`; quit handler raises the modal; save&quit bounded wait in `run`)
 - Modify: `wordcartel/src/editor.rs` (add `pub quit_after_save: Option<u64>,` init `None`)
 - Modify: `wordcartel/src/commands.rs` (the `Command::Quit` arm raises the modal instead of the double-press flag)
@@ -1045,7 +1046,8 @@ git commit -m "feat(swap): hash-first recovery predicate + recovery prompt on op
 
 **Interfaces:**
 - Produces:
-  - `pub fn resolve_prompt(action: PromptAction, editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock)` — performs the effect and clears `editor.prompt`. `SaveAndQuit` dispatches the save and sets `editor.quit_after_save = Some(version)`; `QuitAnyway` sets `editor.quit = true`; `Cancel` clears; `Reload`/`Overwrite` (Task 9); `Recover`/`DiscardSwap`/`OpenOriginal` act on `pending_swap_body`.
+  - `pub fn overwrite_save(ctx: &mut Ctx)`, `pub fn reload_from_disk(editor: &mut Editor)`, `pub fn load_recovered(editor: &mut Editor, body: &str)` in `save.rs` (the resolver's effect helpers; `reload_from_disk`/`load_recovered` use the sanctioned whole-document-replacement exception — fresh `Document`, not `apply`). `dispatch_save`'s job-dispatch body is extracted into a private `fn do_save(ctx)` so `overwrite_save` reuses it without the stat check.
+  - `pub fn resolve_prompt(action: PromptAction, editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock)` — performs the effect and clears `editor.prompt`. `SaveAndQuit` dispatches the save and sets `editor.quit_after_save = Some(version)` **only if a job was actually dispatched** (a path exists and no external-mod modal was raised); `QuitAnyway` sets `editor.quit = true`; `Cancel` clears; `Reload`/`Overwrite`/`Recover`/`DiscardSwap`/`OpenOriginal` act via the helpers above / `pending_swap_body`.
   - `apply_result` extended: a successful `Save` whose `version == quit_after_save` sets `editor.quit = true`.
 
 - [ ] **Step 1: Write the failing tests** in `wordcartel/src/app.rs` tests:
@@ -1093,6 +1095,22 @@ fn save_and_quit_sets_quit_after_save_and_exits_on_matching_result() {
     assert!(e.quit, "matching save result triggers quit");
     let _ = std::fs::remove_file(&p);
 }
+
+#[test]
+fn save_and_quit_on_unnamed_buffer_does_not_arm_quit_after_save() {
+    // No path → dispatch_save dispatches NO job. quit_after_save must stay None,
+    // or the app would wait forever for a result that never comes (Codex #4).
+    use crate::editor::Editor;
+    use crate::jobs::InlineExecutor;
+    use crate::prompt::PromptAction;
+    let mut e = Editor::new_from_text("scratch\n", None, (80, 24));
+    e.document.version = 1;
+    let ex = InlineExecutor::default();
+    let clk = TestClock(0);
+    crate::app::resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk);
+    assert_eq!(e.quit_after_save, None, "no job dispatched → do not arm quit-after-save");
+    assert!(!e.quit);
+}
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1105,27 +1123,81 @@ Expected: FAIL — prompt routing / `resolve_prompt` / `quit_after_save` missing
 - [ ] **Step 4: Intercept prompts in `reduce`.** At the top of `reduce`, before the normal `match`, route input when a prompt is active:
 
 ```rust
-    // Active modal intercepts all key input (§5.3).
+    // Active modal intercepts KEY INPUT only (§5.3). Background results and ticks
+    // must still be processed — a JobDone arriving while a modal is up (e.g. an
+    // in-flight save completing during the quit-confirm prompt) must not be
+    // dropped, or save&quit would hang waiting for a result it already discarded.
     if editor.prompt.is_some() {
-        if let Msg::Input(Event::Key(key)) = &msg {
-            if key.kind == crossterm::event::KeyEventKind::Press {
-                if let crossterm::event::KeyCode::Char(ch) = key.code {
+        match msg {
+            Msg::Input(Event::Key(key)) if key.kind == crossterm::event::KeyEventKind::Press => {
+                if key.code == crossterm::event::KeyCode::Esc {
+                    editor.prompt = None; // Esc cancels any prompt
+                } else if let crossterm::event::KeyCode::Char(ch) = key.code {
                     if let Some(action) = editor.prompt.as_ref().unwrap().action_for(ch) {
                         resolve_prompt(action, editor, ex, clock);
                     }
                 }
             }
+            // Merge a directly-delivered background result even under a modal.
+            Msg::JobDone(r) => apply_result(r, editor),
+            // Resize/Tick/other input: ignored for the modal, but results still drain below.
+            _ => {}
         }
-        // Esc cancels any prompt.
-        if let Msg::Input(Event::Key(k)) = &msg {
-            if k.code == crossterm::event::KeyCode::Esc { editor.prompt = None; }
-        }
+        // Always drain ready results (merges the awaited save&quit result).
         for r in ex.drain() { apply_result(r, editor); }
         return !editor.quit;
     }
 ```
 
-- [ ] **Step 5: Implement `resolve_prompt`** in `wordcartel/src/app.rs`:
+- [ ] **Step 5: Create the save-effect helpers** in `wordcartel/src/save.rs` (the resolver calls these; they must exist before Step 6 so this task's suite compiles). First **extract `do_save`** from the existing `dispatch_save` — pull the "Saving…" status + O(1) snapshot capture + `executor.dispatch(JobKind::Save …)` (the version-aware merge from 4b-1 Task 9 / 4b-2 Task 6) into a private `fn do_save(ctx: &mut Ctx)`, leaving `dispatch_save` as "external-mod check, then `do_save`". Then add:
+
+```rust
+/// Save bypassing the fingerprint conflict (the [O]verwrite modal action).
+pub fn overwrite_save(ctx: &mut Ctx) {
+    if ctx.editor.document.path.is_none() {
+        ctx.editor.status = "No file name (save-as is Effort 5)".to_string();
+        return;
+    }
+    do_save(ctx); // no stat check
+}
+
+/// [R]eload: discard in-memory edits, reload F from disk. Destructive — only
+/// reachable via the external-mod modal. Sanctioned whole-document replacement
+/// (fresh Document, not `apply`): there is no incremental delta and history is reset.
+pub fn reload_from_disk(editor: &mut Editor) {
+    let Some(path) = editor.document.path.clone() else { return };
+    let text = match crate::file::open(&path) {
+        Ok(t) => t,
+        Err(e) => { editor.status = e.to_string(); return; }
+    };
+    let area = editor.view.area;
+    let fresh = Editor::new_from_text(&text, Some(path.clone()), area); // saved_version=Some(0) → clean
+    editor.document = fresh.document; // sanctioned whole-document replacement
+    editor.view.line_layouts.clear();
+    crate::derive::rebuild(editor);
+    crate::nav::ensure_visible(editor);
+    editor.document.stored_fp = fingerprint(&path);
+    editor.status = "Reloaded".into();
+    crate::swap::delete(editor.document.path.as_deref());
+}
+
+/// Load recovered swap content into the buffer; keep the path; mark dirty.
+/// Sanctioned whole-document replacement (fresh Document, history reset).
+pub fn load_recovered(editor: &mut Editor, body: &str) {
+    let path = editor.document.path.clone();
+    let area = editor.view.area;
+    let fresh = Editor::new_from_text(body, path.clone(), area);
+    editor.document = fresh.document; // sanctioned whole-document replacement
+    editor.document.saved_version = None; // recovered work is unsaved
+    editor.view.line_layouts.clear();
+    crate::derive::rebuild(editor);
+    crate::nav::ensure_visible(editor);
+    editor.document.stored_fp = path.as_deref().and_then(fingerprint);
+    editor.status = "Recovered unsaved changes".into();
+}
+```
+
+- [ ] **Step 6: Implement `resolve_prompt`** in `wordcartel/src/app.rs`:
 
 ```rust
 use crate::prompt::PromptAction;
@@ -1136,14 +1208,19 @@ pub fn resolve_prompt(action: PromptAction, editor: &mut Editor, ex: &dyn Execut
         PromptAction::QuitAnyway => { editor.quit = true; }
         PromptAction::SaveAndQuit => {
             let v = editor.document.version;
-            let mut ctx = Ctx { editor, clock, executor: ex };
-            crate::save::dispatch_save(&mut ctx);
-            editor.quit_after_save = Some(v);
-            editor.prompt = None;
-            return; // keep prompt cleared; do not fall through
+            editor.prompt = None; // dismiss the quit-confirm modal first
+            { let mut ctx = Ctx { editor, clock, executor: ex }; crate::save::dispatch_save(&mut ctx); }
+            // Arm quit-after-save ONLY if a save job was actually dispatched.
+            // dispatch_save dispatches nothing when there is no path (status set)
+            // or when it raised an external-mod modal (editor.prompt now Some) —
+            // in those cases abort the quit and let the user resolve (Codex #4).
+            if editor.document.path.is_some() && editor.prompt.is_none() {
+                editor.quit_after_save = Some(v);
+            }
+            return; // prompt handled above; must NOT clear an external-mod modal
         }
-        PromptAction::Reload => crate::save::reload_from_disk(editor),     // Task 9
-        PromptAction::Overwrite => {                                       // Task 9
+        PromptAction::Reload => crate::save::reload_from_disk(editor),
+        PromptAction::Overwrite => {
             let mut ctx = Ctx { editor, clock, executor: ex };
             crate::save::overwrite_save(&mut ctx);
         }
@@ -1161,7 +1238,7 @@ pub fn resolve_prompt(action: PromptAction, editor: &mut Editor, ex: &dyn Execut
 }
 ```
 
-- [ ] **Step 6: Extend `apply_result` for save&quit.** After merging a result, check the quit-after-save target:
+- [ ] **Step 7: Extend `apply_result` for save&quit.** After merging a result, check the quit-after-save target:
 
 ```rust
 pub fn apply_result(r: JobResult, editor: &mut Editor) {
@@ -1178,7 +1255,7 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
 }
 ```
 
-- [ ] **Step 7: Raise the modal from the quit command.** In `wordcartel/src/commands.rs`, change the `Command::Quit` arm to raise the modal on a dirty buffer (replacing the `pending_quit` double-press). A clean buffer still quits immediately:
+- [ ] **Step 8: Raise the modal from the quit command.** In `wordcartel/src/commands.rs`, change the `Command::Quit` arm to raise the modal on a dirty buffer (replacing the `pending_quit` double-press). A clean buffer still quits immediately:
 
 ```rust
         Command::Quit => {
@@ -1194,7 +1271,7 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
 
 (The `pending_quit` field and its `step`-test become dead; update `app::tests::step_processes_typing_and_quit` to drive the modal: after the first Ctrl+Q assert `e.prompt.is_some()`, then feed `'q'` through `reduce` and assert `e.quit`. This preserves the test's intent — dirty-quit needs confirmation — through the new mechanism. Remove the now-unused `pending_quit` field and its clearing in `commands::run`.)
 
-- [ ] **Step 8: Add the bounded save&quit wait to `run`.** In `wordcartel/src/app.rs` `run`, the `recv_timeout` already surfaces results promptly; add a deadline guard: when `editor.quit_after_save.is_some()`, bound the wait to 5 s and, on expiry, re-raise the prompt:
+- [ ] **Step 9: Add the bounded save&quit wait to `run`.** In `wordcartel/src/app.rs` `run`, the `recv_timeout` already surfaces results promptly; add a deadline guard: when `editor.quit_after_save.is_some()`, bound the wait to 5 s and, on expiry, re-raise the prompt:
 
 ```rust
     const SAVE_QUIT_TIMEOUT_MS: u64 = 5_000;
@@ -1211,37 +1288,35 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
 
 (The bounded-wait timeout is loop-level; the success path is covered by the `apply_result` unit test in Step 1.)
 
-- [ ] **Step 9: Run tests + full suite**
+- [ ] **Step 10: Run tests + full suite**
 
 Run: `cargo test`
-Expected: PASS — quit modal + save&quit tests; the updated `step_processes_typing_and_quit`; everything prior.
+Expected: PASS — quit modal + save&quit tests (incl. the no-named-buffer guard); the updated `step_processes_typing_and_quit`; everything prior.
 
-- [ ] **Step 10: Manual smoke.** Edit, Ctrl+Q → modal; `c` cancels; Ctrl+Q then `s` saves & exits; Ctrl+Q then `q` exits dirty:
+- [ ] **Step 11: Manual smoke.** Edit, Ctrl+Q → modal; `c` cancels; Ctrl+Q then `s` saves & exits; Ctrl+Q then `q` exits dirty:
 
 Run: `cargo run -p wordcartel -- /tmp/wcartel-smoke.md`
 
-- [ ] **Step 11: Commit**
+- [ ] **Step 12: Commit**
 
 ```bash
-git add wordcartel/src/app.rs wordcartel/src/editor.rs wordcartel/src/commands.rs
-git commit -m "feat(prompt): modal input routing; quit modal + bounded save&quit"
+git add wordcartel/src/save.rs wordcartel/src/app.rs wordcartel/src/editor.rs wordcartel/src/commands.rs
+git commit -m "feat(prompt): modal input routing; quit modal + bounded save&quit; save-effect helpers"
 ```
 
 ---
 
 ## Task 9: external-modification detection + prompt actions (spec §5.4)
 
-**Upgrade 4b-1's status-refusal to the real modal,** define the `Option<FileFingerprint>` matrix (existed / new / scratch / deleted), and implement the Reload/Overwrite/recover-load resolver effects.
+**Upgrade 4b-1's status-refusal to the real modal** and document the `Option<FileFingerprint>` matrix (existed / new / scratch / deleted). The Reload/Overwrite/recover-load resolver effects were created in Task 8 (`save.rs`); this task only changes `dispatch_save`'s external-mod branch from a status message to the modal, and adds the detection tests.
 
 **Files:**
-- Modify: `wordcartel/src/save.rs` (`dispatch_save` raises the modal; add `overwrite_save`, `reload_from_disk`, `load_recovered`)
+- Modify: `wordcartel/src/save.rs` (`dispatch_save`'s external-mod branch: status → modal)
 - Test: `wordcartel/src/save.rs`
 
 **Interfaces:**
-- Produces:
-  - `pub fn overwrite_save(ctx: &mut Ctx)` — re-runs the save flow **skipping** the fingerprint check.
-  - `pub fn reload_from_disk(editor: &mut Editor)` — replace buffer text from disk, clear history, clamp caret, refresh `stored_fp`, mark clean (`saved_version = Some(version)` after a version bump), delete the swap.
-  - `pub fn load_recovered(editor: &mut Editor, body: &str)` — replace buffer text with the swap body, mark dirty (`saved_version = None`), keep the path.
+- Consumes (created in Task 8): `save::{overwrite_save, reload_from_disk, load_recovered, do_save}`, `prompt::Prompt::external_mod`.
+- Produces: no new public functions — `dispatch_save` now raises `Prompt::external_mod()` on a fingerprint mismatch instead of setting a refusal status. The `!=` comparison against `Option<FileFingerprint>` collapses the whole matrix: existed-and-changed, new-file-appeared (`stored_fp == None`, on-disk `Some`), deleted (`stored_fp == Some`, on-disk `None`), scratch (no path → never reaches the check).
 
 - [ ] **Step 1: Write the failing tests** in `wordcartel/src/save.rs` tests:
 
@@ -1329,60 +1404,14 @@ Expected: FAIL — modal not raised; `overwrite_save`/`reload_from_disk` missing
     }
 ```
 
-Then factor the dispatch body (status "Saving…" → snapshot → dispatch job) into a private `fn do_save(ctx: &mut Ctx)` so `overwrite_save` can reuse it without the stat check.
+(`dispatch_save` was already split into "external-mod check → `do_save`" in Task 8 Step 5; this step only swaps the check's status-refusal for the modal. `overwrite_save`, `reload_from_disk`, and `load_recovered` already exist from Task 8 — the Step 1 tests exercise them here.)
 
-- [ ] **Step 4: Add `overwrite_save`, `reload_from_disk`, `load_recovered`** to `save.rs`:
-
-```rust
-/// Save bypassing the fingerprint conflict (the [O]verwrite modal action).
-pub fn overwrite_save(ctx: &mut Ctx) {
-    if ctx.editor.document.path.is_none() {
-        ctx.editor.status = "No file name (save-as is Effort 5)".to_string();
-        return;
-    }
-    do_save(ctx); // no stat check
-}
-
-/// [R]eload: discard in-memory edits, reload F from disk (destructive — only
-/// reachable via the external-mod modal).
-pub fn reload_from_disk(editor: &mut Editor) {
-    let Some(path) = editor.document.path.clone() else { return };
-    let text = match crate::file::open(&path) { Ok(t) => t, Err(e) => { editor.status = e.to_string(); return; } };
-    let area = editor.view.area;
-    let fresh = Editor::new_from_text(&text, Some(path.clone()), area);
-    // Preserve the path; reset text/history/selection; refresh fp; mark clean.
-    editor.document = fresh.document;
-    editor.view.line_layouts.clear();
-    crate::derive::rebuild(editor);
-    crate::nav::ensure_visible(editor);
-    editor.document.stored_fp = fingerprint(&path);
-    editor.status = "Reloaded".into();
-    crate::swap::delete(editor.document.path.as_deref());
-}
-
-/// Load recovered swap content into the buffer; keep the path; mark dirty.
-pub fn load_recovered(editor: &mut Editor, body: &str) {
-    let path = editor.document.path.clone();
-    let area = editor.view.area;
-    let fresh = Editor::new_from_text(body, path.clone(), area);
-    editor.document = fresh.document;
-    editor.document.saved_version = None; // recovered work is unsaved
-    editor.view.line_layouts.clear();
-    crate::derive::rebuild(editor);
-    crate::nav::ensure_visible(editor);
-    editor.document.stored_fp = path.as_deref().and_then(fingerprint);
-    editor.status = "Recovered unsaved changes".into();
-}
-```
-
-(`do_save` is the extracted body from Step 3 — the "Saving…" status, O(1) snapshot capture, and `executor.dispatch` of the `JobKind::Save` job with the version-aware merge from 4b-1 Task 9 / 4b-2 Task 6.)
-
-- [ ] **Step 5: Run tests + full suite**
+- [ ] **Step 4: Run tests + full suite**
 
 Run: `cargo test`
 Expected: PASS — external-mod modal + matrix + overwrite + reload; everything prior.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add wordcartel/src/save.rs
@@ -1541,7 +1570,9 @@ git commit -m "feat(recovery): panic-time buffer dump (global snapshot + try_loc
 
 **Spec §7 testing strategy mapping:** substrate/staleness (4b-1); version-aware save status + fingerprint matrix (Task 9, 4b-1 Task 9); save&quit waits/timeout (Task 8); swap header round-trip + cadence under fake clock + recovery matrix + delete-on-clean + `0600`/`0700` (Tasks 2–7); panic dump routine + try_lock-held skip (Task 10 — add a `dump_on_panic` no-deadlock test if desired); external-mod injected fingerprint (Task 9); determinism — every test uses `InlineExecutor`/injected `Clock`, no sleeps except the one `fingerprint`-mtime test (which uses a real 10 ms write gap; if that proves flaky on a coarse-mtime FS, swap it to set `stored_fp` directly).
 
-**Placeholder scan:** mid-plan inert states are explicitly called out and finalized in a later task (Task 7's recovery keys → resolved in Task 8; Task 9's `Reload`/`Overwrite` referenced in Task 8's resolver → implemented in Task 9). No "TBD"/"add error handling" placeholders; all code blocks are concrete.
+**Ordering (Codex cross-plan review, resolved):** the save-effect helpers (`do_save`/`overwrite_save`/`reload_from_disk`/`load_recovered`) are created in **Task 8 Step 5**, before the resolver (Step 6) that calls them — so every task's suite compiles and passes in order. Task 7's recovery-prompt keys are inert only between Task 7 and Task 8's resolver (one task), and Task 7's commit does not assert on key routing. Task 9 only flips `dispatch_save`'s external-mod branch to the modal; its Step 1 tests exercise the Task 8 helpers. No "TBD"/"add error handling" placeholders; all code blocks are concrete.
+
+**Seam fixes (Codex):** (3) the modal-interception branch in `reduce` still merges `Msg::JobDone` and drains the executor, so an in-flight save completing under the quit-confirm modal is not dropped. (4) `SaveAndQuit` arms `quit_after_save` only when a job was actually dispatched (path exists, no external-mod modal raised), so an unnamed buffer or a fresh conflict never leaves the app waiting on a result that will never arrive — covered by `save_and_quit_on_unnamed_buffer_does_not_arm_quit_after_save`.
 
 **Type consistency:** `Prompt`/`Choice`/`PromptAction`, `SwapHeader` fields, `swap::{fnv1a64, state_dir, swap_path, write_atomic, build_header, dispatch_swap_write, due, next_deadline_ms, delete, assess, RecoveryDecision}`, `recovery::{LAST_GOOD, record_snapshot, write_dump, dump_on_panic}`, `save::{overwrite_save, reload_from_disk, load_recovered, do_save}`, `Editor` new fields (`prompt`, `last_edit_at`, `last_swap_at`, `quit_after_save`, `pending_swap_body`) — used identically across tasks. The `pending_quit` field is removed in Task 8 (its test migrated to the modal).
 
