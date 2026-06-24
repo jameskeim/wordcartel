@@ -66,6 +66,10 @@ pub struct Editor {
     pub pre_edit_rope: Option<ropey::Rope>, // O(1) snapshot taken BEFORE the edit
     pub last_edit: Option<wordcartel_core::block_tree::Edit>, // the block_tree edit (range, new_len); None ⇒ full reparse
     pub prompt: Option<crate::prompt::Prompt>,
+    /// Wall-clock timestamp (ms) of the last buffer edit; set by the edit path.
+    pub last_edit_at: Option<u64>,
+    /// Wall-clock timestamp (ms) of the last swap-write merge; set by SwapWrite merge.
+    pub last_swap_at: Option<u64>,
 }
 
 impl Editor {
@@ -100,6 +104,8 @@ impl Editor {
             pre_edit_rope: None,
             last_edit: None,
             prompt: None,
+            last_edit_at: None,
+            last_swap_at: None,
         }
     }
 
