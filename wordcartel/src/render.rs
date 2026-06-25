@@ -61,6 +61,35 @@ pub(crate) fn menu_dropdown_row_at(area: Rect, groups: &[(crate::registry::MenuC
     } else { None }
 }
 
+/// Compute the palette overlay bounding rect for a given terminal area.
+/// Uses the maximum possible overlay dimensions (list_h capped at 15 rows).
+/// Both the render code and mouse hit-testing call this to share geometry.
+pub(crate) fn palette_overlay_rect(area: Rect) -> Rect {
+    let w = area.width;
+    let h = area.height;
+    let ov_w = (w * 3 / 5).max(30).min(80).min(w);
+    let list_h: u16 = 15u16.min(h.saturating_sub(4));
+    let ov_h = (list_h + 3).min(h);
+    let ov_x = area.x.saturating_add((w.saturating_sub(ov_w)) / 2);
+    let ov_y = area.y.saturating_add((h.saturating_sub(ov_h)) / 4);
+    Rect::new(ov_x, ov_y, ov_w, ov_h)
+}
+
+/// Return the zero-based list row index that `(col, row)` hits, or `None`.
+/// The list starts at `ov_y + 2` and has at most `palette.rows.len()` entries.
+pub(crate) fn palette_row_at(area: Rect, palette: &crate::palette::Palette, col: u16, row: u16) -> Option<usize> {
+    let r = palette_overlay_rect(area);
+    let list_top = r.y.saturating_add(2);
+    let list_h = (palette.rows.len() as u16).min(15).min(area.height.saturating_sub(4));
+    if col >= r.x.saturating_add(1) && col < r.x.saturating_add(r.width).saturating_sub(1)
+        && row >= list_top && row < list_top.saturating_add(list_h)
+    {
+        Some((row - list_top) as usize)
+    } else {
+        None
+    }
+}
+
 /// Paint the viewport + status line to `frame` using `editor` state.
 ///
 /// The editor is borrowed mutably so stateful overlay widgets can update their
@@ -229,17 +258,15 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     // Command palette overlay (drawn on top of everything else)
     // -----------------------------------------------------------------------
     if let Some(ref palette) = editor.palette {
-        // Overlay dimensions: width = 60% of terminal (min 30, max 80), height = up to 20 rows.
-        let ov_w = (w * 3 / 5).max(30).min(80).min(w);
+        // Overlay dimensions — shared with mouse hit-testing via palette_overlay_rect.
+        let ov_rect = palette_overlay_rect(area);
+        let ov_x = ov_rect.x;
+        let ov_y = ov_rect.y;
+        let ov_w = ov_rect.width;
+        let ov_h = ov_rect.height;
+        // Actual list height clamped to available rows in the current palette.
         let max_rows = palette.rows.len() as u16;
         let list_h = max_rows.min(15).min(h.saturating_sub(4));
-        let ov_h = (list_h + 3).min(h); // 1 border top + 1 query row + list_h list rows + 1 border bottom = list_h + 3; clamp to h
-
-        // Center the overlay.
-        let ov_x = area.x + (w.saturating_sub(ov_w)) / 2;
-        let ov_y = area.y + (h.saturating_sub(ov_h)) / 4; // slightly above center
-
-        let ov_rect = Rect::new(ov_x, ov_y, ov_w, ov_h);
 
         // Clear the overlay area.
         frame.render_widget(Clear, ov_rect);

@@ -59,13 +59,62 @@ fn seed_and_select(editor: &mut Editor, f: usize, t: usize) {
 pub fn handle(
     editor: &mut Editor,
     ev: MouseEvent,
-    _reg: &crate::registry::Registry,
-    _keymap: &crate::keymap::KeyTrie,
-    _ex: &dyn crate::jobs::Executor,
+    reg: &crate::registry::Registry,
+    keymap: &crate::keymap::KeyTrie,
+    ex: &dyn crate::jobs::Executor,
     clock: &dyn wordcartel_core::history::Clock,
-    _msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
 ) {
     if editor.pending_mark.is_some() || !editor.mouse_capture {
+        return;
+    }
+    let (w, h) = editor.active().view.area;
+    let area = ratatui::layout::Rect::new(0, 0, w, h);
+    if editor.palette.is_some() {
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            // scoped borrow → owned Option<CommandId>
+            let hit_id: Option<crate::registry::CommandId> = {
+                let p = editor.palette.as_ref().unwrap();
+                crate::render::palette_row_at(area, p, ev.column, ev.row)
+                    .and_then(|idx| p.rows.get(idx).map(|r| r.id))
+            };
+            // was the click inside the overlay rect at all?
+            let inside = {
+                let r = crate::render::palette_overlay_rect(area);
+                ev.column >= r.x && ev.column < r.x + r.width && ev.row >= r.y && ev.row < r.y + r.height
+            };
+            if let Some(id) = hit_id {
+                crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
+            } else if !inside {
+                editor.palette = None; // click outside closes
+            }
+        }
+        return;
+    }
+    if editor.menu.is_some() {
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            let open = editor.menu.as_ref().unwrap().open;
+            // scoped borrows → owned hit results
+            let bar_hit: Option<usize> = {
+                let groups = &editor.menu.as_ref().unwrap().groups;
+                crate::render::menu_bar_layout(area, groups).into_iter()
+                    .find(|(_, r)| ev.column >= r.x && ev.column < r.x + r.width && ev.row == r.y)
+                    .map(|(cat, _)| cat)
+            };
+            let row_id: Option<crate::registry::CommandId> = {
+                let groups = &editor.menu.as_ref().unwrap().groups;
+                crate::render::menu_dropdown_row_at(area, groups, open, ev.column, ev.row)
+                    .and_then(|row| groups.get(open).and_then(|g| g.1.get(row)).map(|(_, id)| *id))
+            };
+            // all borrows dropped — now mutate/dispatch/clear
+            if let Some(cat) = bar_hit {
+                let m = editor.menu.as_mut().unwrap(); m.open = cat; m.highlighted = 0;
+            } else if let Some(id) = row_id {
+                crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
+            } else {
+                editor.menu = None; // outside → close
+            }
+        }
         return;
     }
     match ev.kind {
@@ -306,6 +355,37 @@ mod tests {
         handle(&mut e, wheel, &reg, &km, &ex, &clk, &tx);
         assert!(e.active().view.scroll > 0, "view scrolled");
         assert_eq!(crate::nav::head(&e), before, "caret unchanged");
+    }
+
+    #[test]
+    fn click_palette_row_dispatches_and_closes() {
+        // "copy" is registered at index ~27, beyond the 15-row visible cap.
+        // We use "move_right" (index 1, always within the first 15 visible rows) to
+        // exercise the same dispatch path: click the row → palette closes + command runs.
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.palette = Some(crate::palette::Palette::default());
+        let (reg, ex, clk, tx, km) = ctx();
+        crate::app::hydrate_overlays(&mut e, &reg, &km); // fill rows (5b helper)
+        let rows = &e.palette.as_ref().unwrap().rows;
+        let idx = rows.iter().position(|r| r.id == crate::registry::CommandId("move_right")).unwrap();
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let rect = crate::render::palette_overlay_rect(area);
+        let click_row = rect.y + 2 + idx as u16; // list starts at ov_y+2
+        let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        assert!(e.palette.is_none(), "palette closed after click");
+        // move_right from offset 0 → caret at 1 proves the command was dispatched
+        assert_eq!(crate::nav::head(&e), 1, "clicked move_right dispatched");
+    }
+
+    #[test]
+    fn click_outside_palette_closes_it() {
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        e.palette = Some(crate::palette::Palette::default());
+        let (reg, ex, clk, tx, km) = ctx();
+        handle(&mut e, down(0, 0), &reg, &km, &ex, &clk, &tx); // top-left, outside the centered overlay
+        assert!(e.palette.is_none());
     }
 
     #[test]

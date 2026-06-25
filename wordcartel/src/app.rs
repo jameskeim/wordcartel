@@ -405,7 +405,7 @@ fn apply_clipboard_availability(editor: &mut Editor, ok: bool) {
 /// Fill rows for a freshly-opened palette (empty rows + empty query → rebuild).
 /// Called immediately after any command dispatch and after dispatch_overlay_command
 /// so a just-opened overlay has content before the first render.
-fn hydrate_overlays(editor: &mut Editor, reg: &crate::registry::Registry, keymap: &crate::keymap::KeyTrie) {
+pub(crate) fn hydrate_overlays(editor: &mut Editor, reg: &crate::registry::Registry, keymap: &crate::keymap::KeyTrie) {
     if let Some(ref mut p) = editor.palette {
         if p.rows.is_empty() && p.query.is_empty() {
             crate::palette::rebuild_rows(p, reg, keymap);
@@ -418,7 +418,7 @@ fn hydrate_overlays(editor: &mut Editor, reg: &crate::registry::Registry, keymap
 
 /// Close the active overlay, dispatch `id` via the registry, drain executor results,
 /// then hydrate any overlay opened by the dispatched command.
-fn dispatch_overlay_command(
+pub(crate) fn dispatch_overlay_command(
     editor: &mut Editor,
     reg: &crate::registry::Registry,
     keymap: &crate::keymap::KeyTrie,
