@@ -884,6 +884,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
 
     // Seed mouse_capture from config (default true; may be overridden by config layers).
     editor.mouse_capture = cfg.mouse.mouse_capture;
+    editor.view_opts = cfg.view.clone();
 
     // Recovery-on-open (§5.1).
     // Named files: use assess() with content-hash comparison.

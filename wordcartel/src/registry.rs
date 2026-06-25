@@ -202,6 +202,13 @@ impl Registry {
             CommandResult::Handled
         });
 
+        // View menu — writing-experience toggles (Task 2 / Effort 5d).
+        r.register("toggle_typewriter", "Toggle Typewriter", Some(MenuCategory::View), |c| { c.editor.view_opts.typewriter = !c.editor.view_opts.typewriter; CommandResult::Handled });
+        r.register("toggle_focus",      "Toggle Focus Mode", Some(MenuCategory::View), |c| { c.editor.view_opts.focus = !c.editor.view_opts.focus; CommandResult::Handled });
+        r.register("toggle_measure",    "Toggle Centered Measure", Some(MenuCategory::View), |c| { c.editor.view_opts.measure = !c.editor.view_opts.measure; crate::derive::rebuild(c.editor); CommandResult::Handled });
+        r.register("toggle_wrap_guide", "Toggle Wrap Guide", Some(MenuCategory::View), |c| { c.editor.view_opts.wrap_guide = !c.editor.view_opts.wrap_guide; CommandResult::Handled });
+        r.register("toggle_word_count", "Toggle Word Count", Some(MenuCategory::View), |c| { c.editor.view_opts.word_count = !c.editor.view_opts.word_count; CommandResult::Handled });
+
         r
     }
 
@@ -337,6 +344,15 @@ mod tests {
             crate::input::key_to_command_id(ctrl_e),
             Some(crate::input::KeyAction::Id(CommandId("filter")))
         ));
+    }
+
+    #[test]
+    fn builtin_command_ids_are_unique() {
+        let reg = Registry::builtins();
+        let mut seen = std::collections::HashSet::new();
+        for (id, _) in reg.commands() {
+            assert!(seen.insert(id.0), "duplicate command id: {}", id.0);
+        }
     }
 
     #[test]
