@@ -99,13 +99,13 @@ impl Buffer {
     }
     pub fn undo(&mut self) -> bool {
         match self.document.history.undo(&mut self.document.buffer) {
-            Some(sel) => { self.document.selection = sel; self.document.version += 1; self.last_edit = None; self.pre_edit_rope = None; true }
+            Some(sel) => { self.document.selection = sel; self.document.version += 1; self.last_edit = None; self.pre_edit_rope = None; self.sel_history.clear(); true }
             None => false,
         }
     }
     pub fn redo(&mut self) -> bool {
         match self.document.history.redo(&mut self.document.buffer) {
-            Some(sel) => { self.document.selection = sel; self.document.version += 1; self.last_edit = None; self.pre_edit_rope = None; true }
+            Some(sel) => { self.document.selection = sel; self.document.version += 1; self.last_edit = None; self.pre_edit_rope = None; self.sel_history.clear(); true }
             None => false,
         }
     }
@@ -389,6 +389,26 @@ mod tests {
         let cs = ChangeSet::insert(1, "X", e.active().document.buffer.len());
         e.apply(Transaction::new(cs), Edit { range: 1..1, new_len: 1 }, EditKind::Type, &clk);
         assert!(e.active().sel_history.is_empty(), "edit must reset the expand ladder");
+    }
+
+    #[test]
+    fn undo_clears_expand_ladder() {
+        use wordcartel_core::change::ChangeSet;
+        use wordcartel_core::history::Transaction;
+        use wordcartel_core::selection::Selection;
+        let clk = TestClock(std::cell::Cell::new(0));
+        let mut e = Editor::new_from_text("abcdef", None, (80, 24));
+        // Simulate an expand by pushing a selection onto sel_history.
+        e.active_mut().sel_history.push(Selection::single(0));
+        // Make an edit so there is history to undo.
+        let cs = ChangeSet::insert(1, "X", e.active().document.buffer.len());
+        e.apply(Transaction::new(cs), Edit { range: 1..1, new_len: 1 }, EditKind::Type, &clk);
+        // apply already clears sel_history; push again to simulate a post-edit expand.
+        e.active_mut().sel_history.push(Selection::single(3));
+        // undo must clear the stale ladder.
+        let changed = e.undo();
+        assert!(changed, "undo of a real edit must report change");
+        assert!(e.active().sel_history.is_empty(), "undo must clear the expand ladder (sel_history)");
     }
 
     #[test]

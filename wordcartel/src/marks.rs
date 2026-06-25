@@ -2,12 +2,13 @@
 use crate::editor::{Buffer, Editor, MarkPending};
 use crate::nav;
 
+const CAP: usize = 64;
+
 pub fn set_mark(editor: &mut Editor)  { editor.active_mut().sel_history.clear(); editor.pending_mark = Some(MarkPending::Set); editor.status = "set mark:".into(); }
 pub fn jump_to_mark(editor: &mut Editor) { editor.pending_mark = Some(MarkPending::Jump); editor.status = "jump to mark:".into(); }
 
 /// Push `pre` onto the ring as a deliberate jump origin.
 pub fn record_jump(buf: &mut Buffer, pre: usize) {
-    const CAP: usize = 64;
     if buf.ring_cursor < buf.jump_ring.len() {
         buf.jump_ring.truncate(buf.ring_cursor); // drop stale forward tail
     }
@@ -25,7 +26,13 @@ pub fn jump_back(editor: &mut Editor) {
         let buf = editor.active_mut();
         if buf.ring_cursor == buf.jump_ring.len() {
             // parked at the live caret — record it as the forward anchor
-            if buf.jump_ring.last() != Some(&here) { buf.jump_ring.push(here); }
+            if buf.jump_ring.last() != Some(&here) {
+                buf.jump_ring.push(here);
+                if buf.jump_ring.len() > CAP {
+                    buf.jump_ring.remove(0);
+                    if buf.ring_cursor > 0 { buf.ring_cursor -= 1; }
+                }
+            }
         }
         if buf.ring_cursor == 0 {
             None
