@@ -112,11 +112,11 @@ pub fn rebuild(editor: &mut Editor) {
     // ------------------------------------------------------------------
     // Snapshot all read-only scalar values from the active buffer before any
     // mutable borrow, so the borrow checker sees no overlap.
-    let (total_lines, active_line, area_width, area_height, first_line, source_mode) = {
+    let (total_lines, active_line, area_height, first_line, source_mode) = {
         let b = editor.active();
         let buf = &b.document.buffer;
         let total_lines = total_logical_lines(buf);
-        let (area_width, area_height) = (b.view.area.0 as usize, b.view.area.1 as usize);
+        let area_height = b.view.area.1 as usize;
         let caret_byte = b.document.selection.primary().head;
         let active_line = if buf.len() == 0 {
             0
@@ -125,9 +125,12 @@ pub fn rebuild(editor: &mut Editor) {
         };
         let first_line = b.view.scroll.min(total_lines.saturating_sub(1));
         let source_mode = b.view.mode != RenderMode::LivePreview;
-        (total_lines, active_line, area_width, area_height, first_line, source_mode)
+        (total_lines, active_line, area_height, first_line, source_mode)
     };
-    let vp_width = area_width.max(1);
+    // Use the shared geometry helper so rebuild, render, and nav all agree on width.
+    // text_geometry returns an owned value; the immutable borrow ends here, before
+    // the later active_mut() calls.
+    let vp_width = crate::nav::text_geometry(editor).text_width as usize;
 
     let mut visual_rows_accumulated: usize = 0;
     let overscan_budget = area_height.saturating_add(1);

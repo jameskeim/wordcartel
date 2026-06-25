@@ -10,6 +10,32 @@ use wordcartel_core::block_tree::{Block, BlockTree};
 use wordcartel_core::buffer::TextBuffer;
 use wordcartel_core::layout;
 
+// ---------------------------------------------------------------------------
+// Measure / centered-text geometry
+// ---------------------------------------------------------------------------
+
+/// The text column's left edge (relative to area.x) and width for this frame.
+pub struct TextGeometry {
+    pub text_left: u16,
+    pub text_width: u16,
+}
+
+/// Compute the text column geometry for the active editor view.
+///
+/// When `measure` is enabled and the viewport is wider than `wrap_column`,
+/// text is centered: `text_left = (vp - wrap_column) / 2`, `text_width = wrap_column`.
+/// Otherwise the full viewport is used: `text_left = 0`, `text_width = vp.max(1)`.
+pub fn text_geometry(editor: &Editor) -> TextGeometry {
+    let vp = editor.active().view.area.0;
+    let o = &editor.view_opts;
+    if o.measure && vp > o.wrap_column && o.wrap_column > 0 {
+        let text_width = o.wrap_column;
+        TextGeometry { text_left: (vp - text_width) / 2, text_width }
+    } else {
+        TextGeometry { text_left: 0, text_width: vp.max(1) }
+    }
+}
+
 /// The raw caret byte-offset: `selection.primary().head`.
 pub fn head(editor: &Editor) -> usize {
     editor.active().document.selection.primary().head
@@ -37,7 +63,7 @@ fn layout_line_on_demand(editor: &Editor, l: usize) -> wordcartel_core::layout::
     let role = editor.active().document.blocks.role_at(derive::line_start(buf, l));
     let source_mode = editor.active().view.mode != RenderMode::LivePreview;
     let is_active_effective = (l == caret_line(editor)) || source_mode;
-    let vp_width = (editor.active().view.area.0 as usize).max(1);
+    let vp_width = text_geometry(editor).text_width as usize;
     let (_rows, map) = layout::layout(&text, role, is_active_effective, vp_width);
     map
 }
@@ -108,7 +134,7 @@ fn layout_line_active(editor: &Editor, l: usize) -> wordcartel_core::layout::Col
     let buf = &editor.active().document.buffer;
     let text = derive::line_text(buf, l);
     let role = editor.active().document.blocks.role_at(derive::line_start(buf, l));
-    let vp_width = (editor.active().view.area.0 as usize).max(1);
+    let vp_width = text_geometry(editor).text_width as usize;
     let (_rows, map) = layout::layout(&text, role, true, vp_width);
     map
 }
@@ -670,6 +696,10 @@ pub fn move_word_left(editor: &mut Editor) -> usize {
 /// Inverse of `screen_pos`: the document byte offset under screen cell
 /// `(col, row)` in the editing area, or `None` if `row` is past content.
 pub fn offset_at_cell(editor: &Editor, col: u16, row: u16) -> Option<usize> {
+    // Subtract the measure margin so callers pass raw screen columns; a click
+    // left of the text column saturates to 0 (= line start of that row).
+    let text_left = text_geometry(editor).text_left;
+    let col = col.saturating_sub(text_left);
     let target = row as usize;
     let scroll = editor.active().view.scroll;
     let scroll_row = editor.active().view.scroll_row;
@@ -707,6 +737,39 @@ mod tests {
     /// Test helper: set the caret to a raw byte offset.
     fn set_caret(e: &mut Editor, off: usize) {
         e.active_mut().document.selection = Selection::single(off);
+    }
+
+    // ------------------------------------------------------------------
+    // Task 3: text_geometry + measure round-trip (RED → GREEN)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn text_geometry_centers_when_measure_on() {
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        let g = super::text_geometry(&e);
+        assert_eq!((g.text_left, g.text_width), (0, 80), "measure off → full width");
+        e.view_opts.measure = true; e.view_opts.wrap_column = 40;
+        let g = super::text_geometry(&e);
+        assert_eq!((g.text_left, g.text_width), (20, 40), "centered 40-wide column");
+        // narrow terminal: measure inert
+        e.active_mut().view.area = (30, 24);
+        let g = super::text_geometry(&e);
+        assert_eq!((g.text_left, g.text_width), (0, 30), "vp <= column → full width");
+    }
+
+    #[test]
+    fn screen_pos_and_offset_at_cell_round_trip_with_measure() {
+        let mut e = Editor::new_from_text("abc\ndef\n", None, (80, 24));
+        e.view_opts.measure = true; e.view_opts.wrap_column = 40; // text_left = 20
+        set_caret(&mut e, 5); // 'e' in "def" (line 1, text-col 1)
+        derive::rebuild(&mut e);
+        let (vcol, vrow) = screen_pos(&e).unwrap();
+        // the actual SCREEN cell is (text_left + vcol, vrow)
+        assert_eq!(super::offset_at_cell(&e, 20 + vcol, vrow), Some(5));
+        // a click in the LEFT margin clamps to line start of that row
+        // "abc\n" = 4 bytes, so "def" line starts at offset 4
+        let def_line_start = crate::derive::line_start(&e.active().document.buffer, 1);
+        assert_eq!(super::offset_at_cell(&e, 3, vrow), Some(def_line_start));
     }
 
     // ------------------------------------------------------------------

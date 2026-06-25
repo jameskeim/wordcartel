@@ -1048,6 +1048,10 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
         crate::clipboard::drain_clipboard_intents(&mut editor, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
         reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
         recompute_scrollbar_visible(&mut editor, clock.now_ms());
+        // Pre-draw rebuild: ensure the layout cache matches the final (scroll,
+        // text_width) before render consumes it.  render has no on-demand fallback
+        // (render.rs:132-140), so a stale cache blanks the editing rows.
+        derive::rebuild(&mut editor);
         guard.terminal().draw(|f| render::render(f, &mut editor))?;
         // Persist session state when a save just completed (saved_version advanced).
         let sv = editor.active().document.saved_version;

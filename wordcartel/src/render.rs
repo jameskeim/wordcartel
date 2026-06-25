@@ -129,6 +129,9 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     let scroll = editor.active().view.scroll;
     let mut screen_row: u16 = 0;
 
+    // Centered-measure geometry: ONE call here so paint + cursor never desync.
+    let tg = crate::nav::text_geometry(editor);
+
     // Collect sorted logical line indices from the layout cache.
     let mut sorted_lines: Vec<usize> = editor.active().view.line_layouts.keys().copied().collect();
     sorted_lines.sort_unstable();
@@ -164,7 +167,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             }
 
             let line_widget = Line::from(spans);
-            let row_area = Rect::new(area.x, edit_top + screen_row, w, 1);
+            let row_area = Rect::new(area.x + tg.text_left, edit_top + screen_row, tg.text_width, 1);
             frame.render_widget(Paragraph::new(line_widget), row_area);
 
             screen_row += 1;
@@ -249,8 +252,8 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         }
     } else if let Some((col, row)) = nav::screen_pos(editor) {
         // Guard: only set if within the editing area (not into the status line).
-        if row < edit_height && col < w {
-            frame.set_cursor_position(Position { x: area.x + col, y: edit_top + row });
+        if row < edit_height && col < tg.text_width {
+            frame.set_cursor_position(Position { x: area.x + tg.text_left + col, y: edit_top + row });
         }
     }
 
