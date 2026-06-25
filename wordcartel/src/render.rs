@@ -50,7 +50,7 @@ pub(crate) fn menu_dropdown_rect(area: Rect, groups: &[(crate::registry::MenuCat
     if leaves.is_empty() { return None; }
     let width = leaves.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0) as u16 + 2;
     let height = leaves.len() as u16;
-    Some(Rect::new(label_rect.x, area.y + 1, width.min(area.width.saturating_sub(label_rect.x - area.x)), height.min(area.height.saturating_sub(1))))
+    Some(Rect::new(label_rect.x, area.y + 1, width.min(area.width.saturating_sub(label_rect.x.saturating_sub(area.x))), height.min(area.height.saturating_sub(1))))
 }
 
 #[allow(dead_code)] // used by Task 7 (mouse hit-testing)
@@ -61,14 +61,14 @@ pub(crate) fn menu_dropdown_row_at(area: Rect, groups: &[(crate::registry::MenuC
     } else { None }
 }
 
-/// Compute the palette overlay bounding rect for a given terminal area.
-/// Uses the maximum possible overlay dimensions (list_h capped at 15 rows).
+/// Compute the palette overlay bounding rect for a given terminal area and row count.
+/// The overlay height is sized to the actual number of palette rows (capped at 15).
 /// Both the render code and mouse hit-testing call this to share geometry.
-pub(crate) fn palette_overlay_rect(area: Rect) -> Rect {
+pub(crate) fn palette_overlay_rect(area: Rect, row_count: usize) -> Rect {
     let w = area.width;
     let h = area.height;
     let ov_w = (w * 3 / 5).max(30).min(80).min(w);
-    let list_h: u16 = 15u16.min(h.saturating_sub(4));
+    let list_h: u16 = (row_count as u16).min(15).min(h.saturating_sub(4));
     let ov_h = (list_h + 3).min(h);
     let ov_x = area.x.saturating_add((w.saturating_sub(ov_w)) / 2);
     let ov_y = area.y.saturating_add((h.saturating_sub(ov_h)) / 4);
@@ -78,7 +78,7 @@ pub(crate) fn palette_overlay_rect(area: Rect) -> Rect {
 /// Return the zero-based list row index that `(col, row)` hits, or `None`.
 /// The list starts at `ov_y + 2` and has at most `palette.rows.len()` entries.
 pub(crate) fn palette_row_at(area: Rect, palette: &crate::palette::Palette, col: u16, row: u16) -> Option<usize> {
-    let r = palette_overlay_rect(area);
+    let r = palette_overlay_rect(area, palette.rows.len());
     let list_top = r.y.saturating_add(2);
     let list_h = (palette.rows.len() as u16).min(15).min(area.height.saturating_sub(4));
     if col >= r.x.saturating_add(1) && col < r.x.saturating_add(r.width).saturating_sub(1)
@@ -259,14 +259,13 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     // -----------------------------------------------------------------------
     if let Some(ref palette) = editor.palette {
         // Overlay dimensions — shared with mouse hit-testing via palette_overlay_rect.
-        let ov_rect = palette_overlay_rect(area);
+        let ov_rect = palette_overlay_rect(area, palette.rows.len());
         let ov_x = ov_rect.x;
         let ov_y = ov_rect.y;
         let ov_w = ov_rect.width;
         let ov_h = ov_rect.height;
-        // Actual list height clamped to available rows in the current palette.
-        let max_rows = palette.rows.len() as u16;
-        let list_h = max_rows.min(15).min(h.saturating_sub(4));
+        // list_h mirrors the computation inside palette_overlay_rect.
+        let list_h = (palette.rows.len() as u16).min(15).min(h.saturating_sub(4));
 
         // Clear the overlay area.
         frame.render_widget(Clear, ov_rect);
@@ -470,5 +469,17 @@ mod tests {
 
         assert_eq!(row0, "mnop");
         assert!(crate::nav::screen_pos(&e).is_some());
+    }
+
+    /// palette_overlay_rect sizes height to the actual row count, not fixed-15.
+    #[test]
+    fn palette_overlay_rect_sizes_to_row_count() {
+        let area = Rect::new(0, 0, 80, 40);
+        // 3 rows → list_h=3, ov_h=3+3=6
+        let r3 = palette_overlay_rect(area, 3);
+        assert_eq!(r3.height, 6, "3 rows: expected height 6 (3 list + 3 chrome)");
+        // 30 rows → list_h capped at 15, ov_h=15+3=18
+        let r30 = palette_overlay_rect(area, 30);
+        assert_eq!(r30.height, 18, "30 rows: expected height 18 (15 capped + 3 chrome)");
     }
 }
