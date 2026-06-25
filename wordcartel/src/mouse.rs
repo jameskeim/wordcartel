@@ -1,5 +1,5 @@
 //! Mouse coordinate translation and gesture dispatch.
-use crossterm::event::{MouseEvent, MouseEventKind, MouseButton};
+use crossterm::event::{MouseEvent, MouseEventKind, MouseButton, KeyModifiers};
 use crate::editor::Editor;
 
 /// Classification of a terminal cell hit relative to the editing layout.
@@ -41,8 +41,9 @@ pub fn editing_cell(editor: &Editor, col: u16, row: u16) -> CellHit {
 /// Dispatch a mouse event, updating editor state for the current gesture.
 ///
 /// Early-returns when `pending_mark` is Some (mark-capture in progress) or
-/// when `mouse_capture` is disabled.  Only left-click → caret placement is
-/// implemented here; drag/wheel/up are wired in Tasks 4-5.
+/// when `mouse_capture` is disabled.  Left-click → caret placement, Shift+click
+/// → extend selection, Drag → drag-select with edge auto-scroll, Up → clear
+/// dragging.
 pub fn handle(
     editor: &mut Editor,
     ev: MouseEvent,
@@ -59,19 +60,49 @@ pub fn handle(
         MouseEventKind::Down(MouseButton::Left) => {
             if let CellHit::Text { col, erow } = editing_cell(editor, ev.column, ev.row) {
                 let buf_len = editor.active().document.buffer.len();
-                let off = crate::nav::offset_at_cell(editor, col, erow)
-                    .unwrap_or(buf_len);
+                let off = match crate::nav::offset_at_cell(editor, col, erow) {
+                    Some(o) => crate::nav::clamp_snap(editor, o),
+                    None => buf_len,
+                };
                 editor.active_mut().sel_history.clear();
-                editor.active_mut().document.selection =
-                    wordcartel_core::selection::Selection::single(off);
-                editor.mouse.anchor = Some(off);
+                if ev.modifiers.contains(KeyModifiers::SHIFT) {
+                    let anchor = editor.active().document.selection.primary().anchor;
+                    editor.active_mut().document.selection =
+                        wordcartel_core::selection::Selection::range(anchor, off);
+                    editor.mouse.anchor = Some(anchor);
+                } else {
+                    editor.active_mut().document.selection =
+                        wordcartel_core::selection::Selection::single(off);
+                    editor.mouse.anchor = Some(off);
+                    // (multi-click in Task 5)
+                }
                 editor.mouse.dragging = true;
                 let _ = clock; // multi-click timing wired in Task 5
                 crate::derive::rebuild(editor);
                 crate::nav::ensure_visible(editor);
             }
         }
-        _ => {} // drag/wheel/up wired in Tasks 4-5
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if !editor.mouse.dragging { return; }
+            let (_w, h) = editor.active().view.area;
+            let menu_rows = u16::from(editor.menu.is_some());
+            let edit_top = menu_rows;
+            let edit_bottom = h.saturating_sub(1); // status row excluded
+            // edge auto-scroll
+            if ev.row < edit_top { crate::nav::scroll_up_one(editor); }
+            else if ev.row >= edit_bottom { crate::nav::scroll_down_one(editor); }
+            let erow = ev.row.clamp(edit_top, edit_bottom.saturating_sub(1)).saturating_sub(menu_rows);
+            let head = crate::nav::offset_at_cell(editor, ev.column, erow)
+                .unwrap_or_else(|| editor.active().document.buffer.len());
+            let head = crate::nav::clamp_snap(editor, head);
+            if let Some(anchor) = editor.mouse.anchor {
+                editor.active_mut().document.selection =
+                    wordcartel_core::selection::Selection::range(anchor, head);
+                crate::derive::rebuild(editor);
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => { editor.mouse.dragging = false; }
+        _ => {} // wheel/etc wired in Tasks 5+
     }
 }
 
@@ -142,5 +173,28 @@ mod tests {
         handle(&mut e, down(1, 0), &reg, &km, &ex, &clk, &tx);
         assert_eq!(crate::nav::head(&e), 0, "click ignored while mark capture pending");
         assert!(e.pending_mark.is_some());
+    }
+
+    #[test]
+    fn drag_selects_range_from_anchor() {
+        let mut e = Editor::new_from_text("abcdef\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        let (reg, ex, clk, tx, km) = ctx();
+        handle(&mut e, down(1, 0), &reg, &km, &ex, &clk, &tx); // anchor at offset 1
+        let drag = MouseEvent { kind: MouseEventKind::Drag(MouseButton::Left), column: 4, row: 0, modifiers: KeyModifiers::NONE };
+        handle(&mut e, drag, &reg, &km, &ex, &clk, &tx); // head at offset 4
+        let r = e.active().document.selection.primary();
+        assert_eq!((r.from(), r.to()), (1, 4));
+    }
+    #[test]
+    fn shift_click_extends_keeping_anchor() {
+        let mut e = Editor::new_from_text("abcdef\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);
+        let (reg, ex, clk, tx, km) = ctx();
+        let shift_down = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 4, row: 0, modifiers: KeyModifiers::SHIFT };
+        handle(&mut e, shift_down, &reg, &km, &ex, &clk, &tx);
+        let r = e.active().document.selection.primary();
+        assert_eq!((r.from(), r.to()), (1, 4), "extends from existing anchor to click");
     }
 }
