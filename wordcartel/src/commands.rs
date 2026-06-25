@@ -31,6 +31,12 @@ pub enum Dir {
     LineEnd,
     WordLeft,
     WordRight,
+    ParagraphUp,
+    ParagraphDown,
+    PageUp,
+    PageDown,
+    DocStart,
+    DocEnd,
 }
 
 /// Commands that can be dispatched to the editor.
@@ -267,8 +273,14 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                 Dir::Down     => nav::move_down(editor),
                 Dir::LineStart => nav::move_home(editor),
                 Dir::LineEnd   => nav::move_end(editor),
-                Dir::WordLeft  => nav::move_word_left(editor),
-                Dir::WordRight => nav::move_word_right(editor),
+                Dir::WordLeft      => nav::move_word_left(editor),
+                Dir::WordRight     => nav::move_word_right(editor),
+                Dir::ParagraphUp   => nav::move_paragraph_up(editor),
+                Dir::ParagraphDown => nav::move_paragraph_down(editor),
+                Dir::PageUp        => nav::move_page_up(editor),
+                Dir::PageDown      => nav::move_page_down(editor),
+                Dir::DocStart      => nav::move_doc_start(editor),
+                Dir::DocEnd        => nav::move_doc_end(editor),
             };
             // Up/Down preserve desired_col (handled inside move_up/move_down).
             // Horizontal moves reset desired_col to None (handled inside move_left/right/home/end).
@@ -1057,6 +1069,39 @@ mod tests {
         assert_eq!(e.active().document.buffer.to_string(), "alpha ");
         e.undo();
         assert_eq!(e.active().document.buffer.to_string(), "alpha beta");
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 6: Paragraph, page & document navigation
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn paragraph_down_jumps_to_next_block_start() {
+        let mut e = Editor::new_from_text("Para one.\n\nPara two.\n\nThree.\n", None, (80, 24));
+        set_caret(&mut e, 0); derive::rebuild(&mut e);
+        run(Command::Move { dir: Dir::ParagraphDown, extend: false }, &mut e, &TestClock(0));
+        let h = nav::head(&e);
+        assert_eq!(e.active().document.buffer.slice(h..h+8), "Para two");
+    }
+
+    #[test]
+    fn doc_start_and_end() {
+        let mut e = Editor::new_from_text("aaa\nbbb\nccc\n", None, (80, 24));
+        set_caret(&mut e, 5); derive::rebuild(&mut e);
+        run(Command::Move { dir: Dir::DocEnd, extend: false }, &mut e, &TestClock(0));
+        assert_eq!(nav::head(&e), e.active().document.buffer.len());
+        run(Command::Move { dir: Dir::DocStart, extend: false }, &mut e, &TestClock(0));
+        assert_eq!(nav::head(&e), 0);
+    }
+
+    #[test]
+    fn page_down_moves_down_about_a_page() {
+        let text: String = (0..40).map(|i| format!("line {i}\n")).collect();
+        let mut e = Editor::new_from_text(&text, None, (80, 10)); // ~9 content rows
+        set_caret(&mut e, 0); derive::rebuild(&mut e);
+        run(Command::Move { dir: Dir::PageDown, extend: false }, &mut e, &TestClock(0));
+        assert!(nav::caret_line(&e) >= 7 && nav::caret_line(&e) <= 9,
+            "page-down should advance ~one viewport, got line {}", nav::caret_line(&e));
     }
 
     #[test]

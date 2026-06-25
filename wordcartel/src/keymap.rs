@@ -253,6 +253,13 @@ static CUA: &[(&str, &str)] = &[
     ("shift-down",  "select_down"),
     ("shift-home",  "select_line_start"),
     ("shift-end",   "select_line_end"),
+    // Paragraph / page / document navigation
+    ("ctrl-up",   "move_paragraph_up"),
+    ("ctrl-down", "move_paragraph_down"),
+    ("pageup",    "move_page_up"),
+    ("pagedown",  "move_page_down"),
+    ("ctrl-home", "move_doc_start"),
+    ("ctrl-end",  "move_doc_end"),
     // Word navigation
     ("ctrl-left",       "move_word_left"),
     ("ctrl-right",      "move_word_right"),

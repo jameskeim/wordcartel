@@ -506,6 +506,72 @@ pub fn prev_paragraph_start(blocks: &BlockTree, _buf: &TextBuffer, pos: usize) -
     leaf_spans(blocks).into_iter().map(|(s, _)| s).filter(|&s| s < pos).next_back().unwrap_or(0)
 }
 
+// ---------------------------------------------------------------------------
+// Paragraph / page / document navigation (Task 6)
+// ---------------------------------------------------------------------------
+
+pub fn move_paragraph_down(editor: &mut Editor) -> usize {
+    let h = head(editor);
+    let result = {
+        let buf = &editor.active().document.buffer;
+        let blocks = &editor.active().document.blocks;
+        next_paragraph_start(blocks, buf, h) // next leaf-block start, else buf.len()
+    };
+    editor.active_mut().desired_col = None;
+    result
+}
+
+pub fn move_paragraph_up(editor: &mut Editor) -> usize {
+    let h = head(editor);
+    let result = {
+        let buf = &editor.active().document.buffer;
+        let blocks = &editor.active().document.blocks;
+        let (from, _to) = paragraph_range_at(blocks, buf, h);
+        if from < h { from } else { prev_paragraph_start(blocks, buf, from) }
+    };
+    editor.active_mut().desired_col = None;
+    result
+}
+
+pub fn move_doc_start(editor: &mut Editor) -> usize { editor.active_mut().desired_col = None; 0 }
+
+pub fn move_doc_end(editor: &mut Editor) -> usize {
+    let len = editor.active().document.buffer.len();
+    editor.active_mut().desired_col = None;
+    len
+}
+
+/// Page step: editing_height − 1 for one row of context overlap.
+/// `editing_height = area.1 - 1` (the status row is reserved — matches nav.rs:62).
+fn page_step(editor: &Editor) -> usize {
+    let editing_height = (editor.active().view.area.1 as usize).saturating_sub(1);
+    editing_height.saturating_sub(1).max(1)
+}
+
+pub fn move_page_down(editor: &mut Editor) -> usize {
+    let steps = page_step(editor);
+    let mut off = head(editor);
+    for _ in 0..steps {
+        let next = move_down(editor); // preserves desired_col across the run
+        if next == off { break; }
+        editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(next);
+        off = next;
+    }
+    off
+}
+
+pub fn move_page_up(editor: &mut Editor) -> usize {
+    let steps = page_step(editor);
+    let mut off = head(editor);
+    for _ in 0..steps {
+        let next = move_up(editor);
+        if next == off { break; }
+        editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(next);
+        off = next;
+    }
+    off
+}
+
 /// Move to the start of the next word, crossing block boundaries (skipping gaps).
 pub fn move_word_right(editor: &mut Editor) -> usize {
     let h = head(editor);
