@@ -32,6 +32,12 @@ pub struct SessionState {
 }
 
 impl SessionState {
+    /// One past the highest stored seq — so a newly recorded entry outranks all
+    /// loaded ones for LRU purposes (Codex pre-merge fix).
+    pub fn next_seq(&self) -> u64 {
+        self.entries.values().map(|e| e.seq).max().unwrap_or(0) + 1
+    }
+
     /// Insert `entry` for `path`, then evict the lowest-`seq` entries beyond
     /// `max_entries` (LRU by seq).
     pub fn record(&mut self, path: String, entry: StateEntry, max_entries: usize) {
@@ -143,6 +149,32 @@ mod tests {
         let back = load_in(&dir);
         assert_eq!(back.entries.len(), 3);
         assert_eq!(back.entries["/f4"].cursor, 4);
+    }
+
+    #[test]
+    fn next_seq_is_one_past_max() {
+        let mut s = SessionState::default();
+        assert_eq!(s.next_seq(), 1, "empty store → next_seq == 1");
+        s.entries.insert("/a".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 5 });
+        s.entries.insert("/b".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 9 });
+        assert_eq!(s.next_seq(), 10, "entries at seq {{5,9}} → next_seq == 10");
+    }
+
+    #[test]
+    fn fresh_entry_beats_old_entries_on_prune() {
+        // Simulate: loaded session has entries at seq 5 and 9 (from a prior run).
+        // A new entry recorded at seq 10 (from next_seq()) must survive; seq 5 is evicted.
+        let mut s = SessionState::default();
+        s.entries.insert("/old-a".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 5 });
+        s.entries.insert("/old-b".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 9 });
+        let new_seq = s.next_seq(); // == 10
+        assert_eq!(new_seq, 10);
+        s.record("/new".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: new_seq }, 2);
+        // Cap is 2: the freshest two must be /old-b (seq 9) and /new (seq 10); /old-a (seq 5) evicted.
+        assert_eq!(s.entries.len(), 2, "pruned to cap");
+        assert!(s.entries.contains_key("/new"), "newly-recorded entry must survive");
+        assert!(s.entries.contains_key("/old-b"), "second-highest seq must survive");
+        assert!(!s.entries.contains_key("/old-a"), "oldest entry (seq 5) must be evicted");
     }
 
     #[test]

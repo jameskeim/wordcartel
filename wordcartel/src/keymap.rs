@@ -338,6 +338,15 @@ pub fn build_keymap(km: &crate::config::KeymapConfig, reg: &Registry) -> (KeyTri
                     continue;
                 }
             };
+            // Esc is reserved for cancel/dismiss in v1: the reducer special-cases
+            // KeyCode::Esc before routing to the keymap, so any config binding whose
+            // first chord is Esc (any modifiers) would be a silent dead binding.
+            if seq.first().map(|c| c.code == KeyCode::Esc).unwrap_or(false) {
+                warns.push(format!(
+                    "config: '{chord_str}' cannot be bound — Esc is reserved for cancel/dismiss"
+                ));
+                continue;
+            }
             let id = match reg.resolve_name(id_str) {
                 Some(i) => i,
                 None => {
@@ -456,6 +465,28 @@ mod tests {
         let rel = KeyEvent { code: KeyCode::Char('a'), modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Release, state: KeyEventState::NONE };
         assert!(from_key_event(rel).is_none());
+    }
+
+    #[test]
+    fn esc_binding_in_config_is_warned_and_skipped() {
+        // Esc is reserved for cancel/dismiss; a config patch binding it must be
+        // warned and NOT inserted into the trie (would be a silent dead binding).
+        let (t, w) = km(&[("esc", "quit")], &[], Some("cua"));
+        assert_eq!(w.len(), 1, "expected exactly one warning for esc binding");
+        assert!(
+            w[0].contains("esc") || w[0].contains("Esc"),
+            "warning must mention esc: {}", w[0]
+        );
+        assert!(
+            w[0].contains("reserved"),
+            "warning must mention 'reserved': {}", w[0]
+        );
+        // The trie must NOT resolve a bare Esc to any command.
+        let esc = KeyChord { code: KeyCode::Esc, mods: KeyModifiers::NONE };
+        assert!(
+            matches!(t.resolve(&[esc]), Resolution::None),
+            "Esc must not be bound in the trie"
+        );
     }
 
     #[test]

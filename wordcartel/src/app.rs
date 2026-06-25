@@ -753,7 +753,9 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
 
     // Load the session store once at startup (corrupt/missing → empty, no abort).
     let mut session = crate::state::load();
-    let mut session_seq: u64 = 0;
+    // Initialize the seq counter one past the highest stored seq so that newly
+    // recorded entries always outrank loaded ones for LRU eviction (Codex pre-merge fix).
+    let mut session_seq: u64 = session.next_seq();
 
     // Resume-on-open: if cfg.state.resume is set, the buffer has a path, and the
     // stored mtime+size identity matches → restore cursor and scroll.
