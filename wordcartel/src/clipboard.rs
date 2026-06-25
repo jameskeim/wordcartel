@@ -32,7 +32,6 @@ pub fn next_paste_id() -> u64 {
 
 /// Called by run() after reduce, before the frame draw. `out` is the terminal
 /// backend writer (a Vec<u8> in tests). Never blocks: the channel is unbounded.
-#[allow(dead_code)] // wired in Task 4
 pub fn drain_clipboard_intents(
     editor: &mut crate::editor::Editor,
     out: &mut impl std::io::Write,
@@ -60,7 +59,6 @@ pub fn drain_clipboard_intents(
 
 /// Spawn the long-lived clipboard worker. arboard is initialized INSIDE the worker
 /// (off the startup path); availability is reported once via Msg::ClipboardAvailability.
-#[allow(dead_code)] // wired in Task 3/4
 pub fn spawn_worker(msg_tx: Sender<crate::app::Msg>) -> Sender<ClipReq> {
     let (tx, rx) = std::sync::mpsc::channel::<ClipReq>();
     std::thread::Builder::new()

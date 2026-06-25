@@ -492,6 +492,16 @@ pub fn reduce(
                 None => {}
             }
         }
+        Msg::Input(Event::Paste(text)) => {
+            if editor.minibuffer.is_some() {
+                for ch in text.chars() { editor.minibuffer.as_mut().unwrap().insert(ch); }
+            } else {
+                let bid = editor.active().id;
+                if insert_paste_text(editor, bid, &text, clock) {
+                    editor.register.set(text);
+                }
+            }
+        }
         Msg::Input(Event::Resize(w, h)) => {
             editor.active_mut().view.area = (w, h);
             derive::rebuild(editor);
@@ -653,6 +663,7 @@ pub fn run(path: Option<PathBuf>) -> std::io::Result<()> {
     let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Msg>();
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
     let executor = crate::jobs::ThreadExecutor::new(wake_tx);
+    let clip_tx = crate::clipboard::spawn_worker(msg_tx.clone());
 
     // Worker → loop wake relay: each result nudges the loop to drain. reduce()'s
     // trailing ex.drain() does the actual merge, so Msg::Tick is the nudge.
@@ -713,6 +724,7 @@ pub fn run(path: Option<PathBuf>) -> std::io::Result<()> {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
         let keep = reduce(msg, &mut editor, &reg, &executor, &clock, &msg_tx);
+        crate::clipboard::drain_clipboard_intents(&mut editor, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
         guard.terminal().draw(|f| render::render(f, &editor))?;
         if !keep { break; }
     }
@@ -1552,6 +1564,49 @@ mod tests {
         let msg = rx.recv().expect("TransformDone must arrive");
         match msg { Msg::TransformDone { kind: TransformKind::Unwrap, result: Ok(_), .. } => {}
                     other => panic!("expected TransformDone Ok, got {other:?}") }
+    }
+
+    #[test]
+    fn bracketed_paste_normal_inserts_into_document() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::Event;
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::Input(Event::Paste("XY".into())), &mut e, &reg, &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "aXYb\n");
+        assert_eq!(e.register.get(), Some("XY"));
+        e.active_mut().undo();
+        assert_eq!(e.active().document.buffer.to_string(), "ab\n");
+    }
+
+    #[test]
+    fn bracketed_paste_into_minibuffer_not_document() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::Event;
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        e.open_minibuffer("> ");
+        let doc_before = e.active().document.buffer.to_string();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::Input(Event::Paste("cat".into())), &mut e, &reg, &ex, &clk, &tx);
+        assert_eq!(e.minibuffer.as_ref().unwrap().text, "cat", "paste goes into the minibuffer");
+        assert_eq!(e.active().document.buffer.to_string(), doc_before, "document untouched");
+    }
+
+    #[test]
+    fn bracketed_paste_with_modal_prompt_is_ignored() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::Event;
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        e.prompt = Some(crate::prompt::Prompt::quit_confirm());
+        let doc_before = e.active().document.buffer.to_string();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::Input(Event::Paste("x".into())), &mut e, &reg, &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), doc_before, "paste ignored under a modal");
+        assert!(e.prompt.is_some());
     }
 
     #[test]

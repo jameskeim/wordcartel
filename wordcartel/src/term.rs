@@ -7,6 +7,7 @@ use std::io::{self, Stdout};
 
 use crossterm::{
     cursor::Show,
+    event::{DisableBracketedPaste, EnableBracketedPaste},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -35,6 +36,8 @@ impl TerminalGuard {
             let _ = disable_raw_mode();
             return Err(e);
         }
+        // Enable bracketed paste (best-effort: if the terminal doesn't support it, ignore).
+        let _ = execute!(stdout, EnableBracketedPaste);
         let backend = CrosstermBackend::new(io::stdout());
         let terminal = match Terminal::new(backend) {
             Ok(t) => t,
@@ -56,7 +59,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen, Show);
     }
 }
 
@@ -76,7 +79,7 @@ pub fn install_panic_hook() {
             crate::recovery::dump_on_panic();
             // Restore the terminal.
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+            let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen, Show);
             prev(info);
         }));
     });
