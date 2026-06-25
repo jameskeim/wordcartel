@@ -12,6 +12,7 @@ pub mod selection;
 pub mod layout;
 pub mod md_parse;
 pub mod style;
+pub mod textobj;
 
 /// A byte offset into a buffer's text. The kernel's canonical position type.
 pub type BytePos = usize;
