@@ -34,6 +34,17 @@ pub fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> Cli {
 pub struct Config {
     pub keymap: KeymapConfig,
     pub state: StateConfig,
+    pub mouse: MouseConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct MouseConfig {
+    pub mouse_capture: bool,
+}
+impl Default for MouseConfig {
+    fn default() -> Self {
+        MouseConfig { mouse_capture: true }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +88,7 @@ impl Default for StateConfig {
 struct RawConfig {
     keymap: RawKeymap,
     state: RawState,
+    mouse: RawMouse,
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -90,6 +102,11 @@ struct RawKeymap {
 struct RawState {
     resume: Option<bool>,
     max_entries: Option<usize>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawMouse {
+    capture: Option<bool>,
 }
 
 /// Ordered existing config files, lowest→highest precedence. Empty when --no-config.
@@ -163,6 +180,10 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
         }
         if let Some(m) = raw.state.max_entries {
             cfg.state.max_entries = m;
+        }
+        // mouse: per-field override (omitted field inherits the lower layer).
+        if let Some(c) = raw.mouse.capture {
+            cfg.mouse.mouse_capture = c;
         }
     }
     (cfg, warns)

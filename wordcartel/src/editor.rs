@@ -111,6 +111,35 @@ impl Buffer {
     }
 }
 
+/// Per-click tracking for double/triple-click detection.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct ClickRecord {
+    pub cell: (u16, u16),
+    pub at_ms: u64,
+    pub count: u8,
+}
+
+/// Transient mouse gesture state — reset on capture disable (reconcile clears drag).
+#[derive(Default, Debug, Clone)]
+pub struct MouseState {
+    /// Byte-offset anchor for drag selection; None when no drag is active.
+    #[allow(dead_code)] // wired in Task 3
+    pub anchor: Option<usize>,
+    /// Last recorded click (cell, timestamp, repeat count).
+    #[allow(dead_code)] // wired in Task 3
+    pub last_click: Option<ClickRecord>,
+    /// True while a text-area drag is in progress.
+    pub dragging: bool,
+    /// True while the scrollbar thumb is being dragged.
+    pub scrollbar_dragging: bool,
+    /// Timestamp until which the scrollbar overlay remains visible after hover.
+    #[allow(dead_code)] // wired in Task 3
+    pub scrollbar_until_ms: u64,
+    /// Whether the scrollbar overlay is currently visible.
+    #[allow(dead_code)] // wired in Task 3
+    pub scrollbar_visible: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkPending { Set, Jump }
 
@@ -139,6 +168,11 @@ pub struct Editor {
     pub keymap: crate::keymap::KeyTrie,
     pub palette: Option<crate::palette::Palette>,
     pub menu: Option<crate::menu::MenuView>,
+    /// Whether mouse capture is currently requested (toggled by `toggle_mouse_capture`).
+    /// Seeded from config at startup; defaults to `true` in test/scratch contexts.
+    pub mouse_capture: bool,
+    /// Transient mouse gesture state; cleared by `reconcile_mouse_capture` on disable.
+    pub mouse: MouseState,
 }
 
 impl Editor {
@@ -170,6 +204,8 @@ impl Editor {
             keymap,
             palette: None,
             menu: None,
+            mouse_capture: true,
+            mouse: MouseState::default(),
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer {

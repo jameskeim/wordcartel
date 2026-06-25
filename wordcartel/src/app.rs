@@ -879,6 +879,9 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
 
     let mut editor = editor;
 
+    // Seed mouse_capture from config (default true; may be overridden by config layers).
+    editor.mouse_capture = cfg.mouse.mouse_capture;
+
     // Recovery-on-open (§5.1).
     // Named files: use assess() with content-hash comparison.
     // Scratch buffers: their swap is pid-keyed, so look for an orphan from a
@@ -905,7 +908,9 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     }
 
     // Install the terminal guard: enable raw mode + enter alternate screen.
-    let mut guard = term::TerminalGuard::new()?;
+    // Mouse capture is gated on editor.mouse_capture (seeded from config above).
+    let mut guard = term::TerminalGuard::new(editor.mouse_capture)?;
+    let mut applied_mouse = editor.mouse_capture;
 
     // Initial derive so the first draw has up-to-date layouts.
     derive::rebuild(&mut editor);
@@ -988,6 +993,9 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     // Track saved_version to detect when a save completes in the loop.
     let mut last_persisted_saved = editor.active().document.saved_version;
 
+    // Reconcile mouse capture once before the first draw (post-guard invariant).
+    reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
+
     guard.terminal().draw(|f| render::render(f, &mut editor))?;
     loop {
         let now = clock.now_ms();
@@ -1020,6 +1028,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
         };
         let keep = reduce(msg, &mut editor, &reg, &keymap, &executor, &clock, &msg_tx);
         crate::clipboard::drain_clipboard_intents(&mut editor, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
+        reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
         guard.terminal().draw(|f| render::render(f, &mut editor))?;
         // Persist session state when a save just completed (saved_version advanced).
         let sv = editor.active().document.saved_version;
@@ -1042,6 +1051,26 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     // is the "never lose work" behavior). The 5 s save&quit guard above bounds the wait.
     drop(guard);
     Ok(())
+}
+
+/// Reconcile the terminal's mouse-capture state with `editor.mouse_capture`.
+///
+/// Enables or disables mouse capture on the backend when the desired state
+/// diverges from `applied`. On disable, clears drag state so no stale Up
+/// events are awaited for a capture that will never arrive.
+pub fn reconcile_mouse_capture<W: std::io::Write>(editor: &mut crate::editor::Editor, backend: &mut W, applied: &mut bool) {
+    if editor.mouse_capture != *applied {
+        if editor.mouse_capture {
+            let _ = crossterm::execute!(backend, crossterm::event::EnableMouseCapture);
+        } else {
+            let _ = crossterm::execute!(backend, crossterm::event::DisableMouseCapture);
+            // clear drag state so no Up is awaited that won't arrive
+            editor.mouse.dragging = false;
+            editor.mouse.scrollbar_dragging = false;
+            editor.mouse.anchor = None;
+        }
+        *applied = editor.mouse_capture;
+    }
 }
 
 /// Record the active buffer's position into the session store and flush to disk.
@@ -1106,6 +1135,9 @@ mod tests {
     static SEQ: AtomicU32 = AtomicU32::new(0);
 
     struct TestClock(u64);
+    impl TestClock {
+        fn new(ms: u64) -> Self { TestClock(ms) }
+    }
     impl Clock for TestClock {
         fn now_ms(&self) -> u64 { self.0 }
     }
@@ -2278,5 +2310,19 @@ mod tests {
         crate::app::load_marks_from_entry(&mut e, &entry);
         assert_eq!(e.active().marks.get(&'a'), Some(&6));
         assert_eq!(e.active().marks.get(&'b'), Some(&e.active().document.buffer.len()));
+    }
+
+    #[test]
+    fn toggle_mouse_capture_flips_flag() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        assert!(e.mouse_capture, "default on");
+        let (_km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &Registry::builtins());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock::new(0);
+        let id = reg.resolve_name("toggle_mouse_capture").expect("registered");
+        { let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
+          reg.dispatch(id, &mut ctx); }
+        assert!(!e.mouse_capture, "toggled off");
     }
 }
