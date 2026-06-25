@@ -318,7 +318,7 @@ pub fn spawn_worker(msg_tx: Sender<crate::app::Msg>) -> Sender<ClipReq> {
 ```
 (`spawn_worker`/`next_paste_id` are unused until Task 3/4 → scoped `#[allow(dead_code)]`. The new `Msg` variants are constructed in tests now, so no dead-code there. Note: the worker is detached — `spawn(...)` handle dropped.)
 
-- [ ] **Step 6: Update non-exhaustive matches.** The new `Msg` variants break any `match msg` without a wildcard. Add arms in `reduce`'s match sites — for THIS task add a temporary no-op arm `Msg::ClipboardPaste { .. } | Msg::ClipboardAvailability(_) => {}` in the normal match (Task 3 fills them in) so the workspace compiles. (If `reduce` already has a catch-all, none needed; confirm by building.)
+- [ ] **Step 6: Update non-exhaustive matches.** The new `Msg` variants break any `match msg` without a wildcard. For THIS task add a temporary no-op arm `Msg::ClipboardPaste { .. } | Msg::ClipboardAvailability(_) => {}` in the **normal match** (Task 3 fills it in). The `editor.prompt.is_some()` block and the minibuffer block already end with `_ => {}`, so they compile as-is now; Task 3 adds the real arms to the prompt block. (Confirm by building.)
 
 - [ ] **Step 7: Run tests + suite.** `cargo test -p wordcartel --lib clipboard::tests` → pass; `cargo test --workspace` green; zero warnings.
 
@@ -407,6 +407,33 @@ git commit -m "feat(clipboard): worker (off-startup arboard init) + ClipReq/Msg 
     }
 
     #[test]
+    fn clipboardpaste_none_empty_register_is_noop() {
+        // Preserves the old paste_on_empty_register_is_noop coverage at the reduce layer.
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        let bid = e.active().id;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: None }, &mut e, &reg, &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "ab\n", "empty register → no change");
+    }
+
+    #[test]
+    fn clipboardpaste_replaces_active_selection() {
+        // Preserves the old paste_over_selection_replaces coverage (CUA replace) at the reduce layer.
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::range(1, 3); // select "bc"
+        let bid = e.active().id;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("XY".into()) }, &mut e, &reg, &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "aXYd\n", "selection replaced by pasted text");
+        e.active_mut().undo();
+        assert_eq!(e.active().document.buffer.to_string(), "abcd\n");
+    }
+
+    #[test]
     fn clipboardpaste_for_missing_buffer_is_noop() {
         use crate::editor::{Editor, BufferId}; use crate::jobs::InlineExecutor; use crate::registry::Registry;
         let mut e = Editor::new_from_text("ab\n", None, (80, 24));
@@ -430,9 +457,17 @@ git commit -m "feat(clipboard): worker (off-startup arboard init) + ClipReq/Msg 
         assert_eq!(e.status, "typing", "notice shown only once");
     }
 ```
-(Confirm the `Selection` constructors `range(from,to)`/`single(pos)` against `wordcartel-core/src/selection.rs`; adjust to the real API if named differently.)
+(`Selection::single(pos)` exists; `Selection::range(anchor, head)` is ADDED in Step 2b — these tests depend on it, so they will not compile until Step 2b lands. That is the expected RED.)
 
 - [ ] **Step 2: Run to verify failure.** `cargo test -p wordcartel --lib copy_sets_register paste_keypress clipboardpaste availability_false` → FAIL.
+
+- [ ] **Step 2b: Add a `Selection::range` constructor** (`wordcartel-core/src/selection.rs`) — the tests need a range (anchor≠head) selection and only `Selection::single` exists (Codex plan review). Add next to `single`:
+```rust
+    pub fn range(anchor: BytePos, head: BytePos) -> Selection {
+        Selection { ranges: smallvec::smallvec![Range { anchor, head }], primary: 0 }
+    }
+```
+(Confirm the `smallvec` macro path / import already used in `selection.rs`; `Range`/`Selection` field names are `{anchor, head}` and `{ranges, primary}`.) This is a small IO-free core addition. Add a one-line core test: `assert_eq!(Selection::range(0,5).primary().from(), 0);`.
 
 - [ ] **Step 3: Set intent in Copy/Cut** (`commands.rs`). In `Command::Copy`, after `register::copy(...)`, before returning, add:
 ```rust
@@ -452,7 +487,7 @@ In `Command::Cut`, after the register cut + apply, add the same `clipboard_sync_
             CommandResult::Handled
         }
 ```
-The previous synchronous register-paste logic moves into `insert_paste_text` (Step 5), reached via `Msg::ClipboardPaste`. **Update any existing test that pressed Ctrl+V and asserted an inline paste** to instead drive `Msg::ClipboardPaste { text: None, .. }` (register fallback) — same assertion, now through the async path. (Search `commands`/`app` tests for `Command::Paste`/Ctrl+V paste assertions.)
+The previous synchronous register-paste logic moves into `insert_paste_text` (Step 5), reached via `Msg::ClipboardPaste`. **Migrate the three existing paste tests (Codex plan review named them) — `commands.rs::paste_inserts_register_at_caret` (~661), `paste_on_empty_register_is_noop` (~759), `paste_over_selection_replaces` (~919):** each currently drives `Command::Paste` and asserts an inline buffer mutation, which no longer happens. Rewrite each in `commands.rs` to assert ONLY that `Command::Paste` sets `editor.clipboard_get_pending` and leaves the buffer UNCHANGED (the command no longer inserts). The actual insert behavior they used to cover is preserved by the new `app.rs` reduce tests in Step 1 (caret insert, empty-register no-op, over-selection replace via `Msg::ClipboardPaste`). Net coverage is preserved, just relocated from the command layer to the reduce layer where the async insert now lives.
 
 - [ ] **Step 5: Implement the shared paste helper + reduce arms** (`app.rs`):
 ```rust
@@ -477,6 +512,7 @@ fn insert_paste_text(editor: &mut Editor, buffer_id: crate::editor::BufferId, te
         let txn = wordcartel_core::history::Transaction::new(cs)
             .with_selection(wordcartel_core::selection::Selection::single(from + text.len()));
         b.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
+        b.desired_col = None; // match the existing Cut/Paste reset (Codex plan review)
     } // b borrow ends here
     if buffer_id == active_id {
         crate::derive::rebuild(editor);
@@ -484,29 +520,41 @@ fn insert_paste_text(editor: &mut Editor, buffer_id: crate::editor::BufferId, te
     }
     true
 }
+
+/// Apply a clipboard paste reply (OS text or register fallback). Factored so it is
+/// reachable from BOTH the normal reduce arm AND the prompt-interception block
+/// (Codex plan review: an async reply must not be starved by an open modal).
+/// The register is updated ONLY when the insert actually happened (not on an
+/// oversize-skipped paste).
+fn apply_clipboard_paste(editor: &mut Editor, buffer_id: crate::editor::BufferId, text: Option<String>, clock: &dyn Clock) {
+    match text {
+        Some(t) if !t.is_empty() => {
+            if insert_paste_text(editor, buffer_id, &t, clock) {
+                editor.register.set(t);
+            }
+        }
+        _ => { // None / empty → register fallback (the old synchronous paste behavior)
+            if let Some(t) = editor.register.get().map(str::to_owned) {
+                insert_paste_text(editor, buffer_id, &t, clock);
+            }
+        }
+    }
+}
+
+fn apply_clipboard_availability(editor: &mut Editor, ok: bool) {
+    if !ok && !editor.clipboard_notice_shown {
+        editor.status = "system clipboard unavailable — copy/paste work in-editor; using OSC 52 for terminal sync".into();
+        editor.clipboard_notice_shown = true;
+    }
+}
 ```
-Replace the temporary no-op arm (Task 2 Step 6) with the real arms in `reduce`'s normal match:
+Replace the temporary no-op arms (Task 2 Step 6) with real arms in BOTH `reduce`'s normal match AND the `editor.prompt.is_some()` interception block (parallel to the existing `Msg::FilterDone`/`TransformDone` arms there — the prompt block's `_ => {}` would otherwise SILENTLY DROP a paste reply / availability message; Codex plan review IMPORTANT):
 ```rust
-        Msg::ClipboardPaste { buffer_id, text, .. } => {
-            match text {
-                Some(t) if !t.is_empty() => {
-                    editor.register.set(t.clone());
-                    insert_paste_text(editor, buffer_id, &t, clock);
-                }
-                _ => { // None / empty → register fallback
-                    if let Some(t) = editor.register.get().map(str::to_owned) {
-                        insert_paste_text(editor, buffer_id, &t, clock);
-                    }
-                }
-            }
-        }
-        Msg::ClipboardAvailability(ok) => {
-            if !ok && !editor.clipboard_notice_shown {
-                editor.status = "system clipboard unavailable — copy/paste work in-editor; using OSC 52 for terminal sync".into();
-                editor.clipboard_notice_shown = true;
-            }
-        }
+        // in the normal match AND inside the `if editor.prompt.is_some()` block:
+        Msg::ClipboardPaste { buffer_id, text, .. } => apply_clipboard_paste(editor, buffer_id, text, clock),
+        Msg::ClipboardAvailability(ok) => apply_clipboard_availability(editor, ok),
 ```
+(`Event::Paste` under a prompt stays ignored — it hits the prompt block's `_ => {}`, which is the desired modal behavior; only the two `Msg::Clipboard*` messages need the explicit prompt-block arms.)
 Add `pub const PASTE_MAX_BYTES: usize = 8 * 1024 * 1024;` to `clipboard.rs`. The `insert_paste_text` above already resolves the borrow-split (active id captured first; the `by_id_mut` borrow scoped in a block that ends before `derive::rebuild(editor)`) — keep that structure.
 
 - [ ] **Step 6: Run tests + suite.** `cargo test -p wordcartel --lib` then `cargo test --workspace` → all pass; `cargo build --workspace` zero warnings. Remove now-stale `#[allow(dead_code)]` on `next_paste_id`/`PasteIntent`.
@@ -587,8 +635,10 @@ git commit -m "feat(clipboard): copy/cut sync intent + async buffer-targeted pas
             } else if let Some(mb) = editor.minibuffer.as_mut() {
                 for ch in text.chars() { mb.insert(ch); }
             } else {
-                insert_paste_text(editor, editor.active().id, &text, clock);
-                editor.register.set(text);
+                let bid = editor.active().id;
+                if insert_paste_text(editor, bid, &text, clock) {
+                    editor.register.set(text); // update register ONLY if the insert happened (not oversize-skipped)
+                }
             }
         }
 ```
@@ -617,6 +667,8 @@ git commit -m "feat(clipboard): bracketed paste (per-mode) + run() worker spawn 
 ## Self-Review (4c-3)
 
 **Spec coverage:** §2 backend trait + dep + base64/OSC52 (Task 1); §2.1 drain seam + intent fields (Tasks 2/3); §3.1 worker off-startup init + unbounded channel + availability (Task 2); §4.1 write path copy/cut + OSC 52 ST + encoded cap (Tasks 1/3); §4.2 async buffer-targeted paste + register fallback + bracketed-paste per mode + PASTE_MAX_BYTES (Tasks 3/4); §5 one-time notice + detached-worker shutdown ordering (Tasks 3/4); §6 degrade-never-unwrap, OS-write-only-on-copy/cut (Tasks 1/3); §8 fake/seam/per-mode tests (all tasks). ✅
+
+**Codex plan-review fixes applied (5 important + 2 minor):** (1) `Msg::ClipboardPaste`/`ClipboardAvailability` get explicit arms in the prompt-interception block too (factored into `apply_clipboard_paste`/`apply_clipboard_availability`) — the prompt block's `_ => {}` would otherwise silently drop an async reply; (2) added `Selection::range(anchor,head)` to core (only `single` existed) — Step 2b; (3) `insert_paste_text` resets `b.desired_col = None` matching the existing Cut/Paste; (4) the register is updated ONLY when the insert actually happened (oversize-skipped paste no longer mutates the register) — both the OS-text and bracketed-paste paths; (5) concrete migration of the three named existing paste tests (`paste_inserts_register_at_caret`/`paste_on_empty_register_is_noop`/`paste_over_selection_replaces`) → assert intent-set at the command layer + the insert behavior relocated to new reduce tests (caret, empty-register no-op, over-selection replace). MINOR: arboard `set_text` accepts `Into<Cow<str>>` (the `.to_owned()` is harmless); Cargo version ranges resolve to the assumed versions. Codex CONFIRMED ratatui 0.29 `CrosstermBackend: io::Write` (the run()-wiring assumption holds) and crossterm 0.28 bracketed-paste APIs.
 
 **Codex spec-review fixes reflected:** dep stanza with `wayland-data-control`+`default-features=false` (T1); PasteIntent{id,buffer_id} buffer-targeted async paste, drop-if-closed (T3); per-mode bracketed paste (T4); detached worker + terminal-restored-first (T4 + existing order); arboard init inside the worker + unbounded channel + ClipboardAvailability (T2); OSC 52 encoded-payload cap + ST terminator + emit via backend writer between reduce and draw (T1/T4); PASTE_MAX_BYTES (T3); pure drain_clipboard_intents seam tested with Vec<u8>+fake channels (T2); OS-write-scope invariant (copy/cut only — T3); security/opt-out noted in spec §10 (no code this effort).
 
