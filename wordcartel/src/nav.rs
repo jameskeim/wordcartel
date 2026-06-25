@@ -6,6 +6,8 @@
 
 use crate::derive;
 use crate::editor::{Editor, RenderMode};
+use wordcartel_core::block_tree::{Block, BlockTree};
+use wordcartel_core::buffer::TextBuffer;
 use wordcartel_core::layout;
 
 /// The raw caret byte-offset: `selection.primary().head`.
@@ -119,6 +121,19 @@ fn get_or_layout(editor: &Editor, l: usize) -> wordcartel_core::layout::ColMap {
     } else {
         layout_line_on_demand(editor, l)
     }
+}
+
+/// Clamp `off` to `0..=len` and snap it to a grapheme stop on ITS OWN line
+/// (a mark/ring/session offset may be on a different line than the caret).
+pub fn clamp_snap(editor: &Editor, off: usize) -> usize {
+    let buf = &editor.active().document.buffer;
+    let len = buf.len();
+    let off = off.min(len);
+    if len == 0 { return 0; }
+    let line = buf.byte_to_line(off.min(len.saturating_sub(1)));
+    let ls = derive::line_start(buf, line);
+    let map = get_or_layout(editor, line);
+    ls + map.snap_to_stop(off.saturating_sub(ls))
 }
 
 /// Move the caret one grapheme to the right.
@@ -424,6 +439,240 @@ fn advance_view_top_one_row(editor: &mut Editor, max_scroll: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// Paragraph span helpers (consumed by Tasks 5/6/7)
+// ---------------------------------------------------------------------------
+
+/// Deepest block whose span contains `pos`, searching children first so a
+/// list item / blockquote paragraph wins over its container.
+fn deepest_block_at(block: &Block, pos: usize) -> Option<&Block> {
+    if !(pos >= block.span.start && pos < block.span.end) {
+        return None;
+    }
+    for child in &block.children {
+        if let Some(b) = deepest_block_at(child, pos) {
+            return Some(b);
+        }
+    }
+    Some(block)
+}
+
+/// The (from, to) paragraph span at `pos`. Total over the document: a leaf
+/// block if `pos` is inside one, else the blank-line-delimited run around
+/// `pos` (the gap fallback).
+pub fn paragraph_range_at(blocks: &BlockTree, buf: &TextBuffer, pos: usize) -> (usize, usize) {
+    let pos = pos.min(buf.len());
+    for top in blocks.top_level() {
+        if let Some(b) = deepest_block_at(top, pos) {
+            return (b.span.start, b.span.end);
+        }
+    }
+    // Gap fallback: expand to the maximal run of non-blank logical lines.
+    let total = derive::total_logical_lines(buf);
+    if total == 0 {
+        return (0, 0);
+    }
+    // pos may equal buf.len() (past the last byte); clamp to len-1 so byte_to_line gets a valid index.
+    let line = buf.byte_to_line(pos.min(buf.len().saturating_sub(1)));
+    let is_blank = |l: usize| derive::line_text(buf, l).trim().is_empty();
+    if is_blank(line) {
+        let s = derive::line_start(buf, line);
+        return (s, s); // empty range on a blank line
+    }
+    let mut top_line = line;
+    while top_line > 0 && !is_blank(top_line - 1) {
+        top_line -= 1;
+    }
+    let mut bot_line = line;
+    while bot_line + 1 < total && !is_blank(bot_line + 1) {
+        bot_line += 1;
+    }
+    let from = derive::line_start(buf, top_line);
+    let to = derive::line_start(buf, bot_line) + derive::line_text(buf, bot_line).len();
+    (from, to)
+}
+
+/// Depth-first leaf-block spans in document order (a "paragraph" for motion).
+fn collect_leaf_spans(block: &Block, out: &mut Vec<(usize, usize)>) {
+    if block.children.is_empty() {
+        out.push((block.span.start, block.span.end));
+    } else {
+        for c in &block.children { collect_leaf_spans(c, out); }
+    }
+}
+
+fn leaf_spans(blocks: &BlockTree) -> Vec<(usize, usize)> {
+    let mut v = Vec::new();
+    for top in blocks.top_level() { collect_leaf_spans(top, &mut v); }
+    v.sort_by_key(|s| s.0);
+    v
+}
+
+/// Start of the next leaf block beginning strictly after `pos`, else `buf.len()`.
+pub fn next_paragraph_start(blocks: &BlockTree, buf: &TextBuffer, pos: usize) -> usize {
+    leaf_spans(blocks).into_iter().map(|(s, _)| s).find(|&s| s > pos).unwrap_or(buf.len())
+}
+
+/// Start of the leaf block before the one containing `pos`, else `0`.
+pub fn prev_paragraph_start(blocks: &BlockTree, _buf: &TextBuffer, pos: usize) -> usize {
+    // caller passes the *current paragraph start* as `pos` boundary; pick the
+    // last leaf start strictly before it.
+    leaf_spans(blocks).into_iter().map(|(s, _)| s).filter(|&s| s < pos).next_back().unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Paragraph / page / document navigation (Task 6)
+// ---------------------------------------------------------------------------
+
+pub fn move_paragraph_down(editor: &mut Editor) -> usize {
+    let h = head(editor);
+    let result = {
+        let buf = &editor.active().document.buffer;
+        let blocks = &editor.active().document.blocks;
+        next_paragraph_start(blocks, buf, h) // next leaf-block start, else buf.len()
+    };
+    editor.active_mut().desired_col = None;
+    result
+}
+
+pub fn move_paragraph_up(editor: &mut Editor) -> usize {
+    let h = head(editor);
+    let result = {
+        let buf = &editor.active().document.buffer;
+        let blocks = &editor.active().document.blocks;
+        let (from, _to) = paragraph_range_at(blocks, buf, h);
+        if from < h { from } else { prev_paragraph_start(blocks, buf, from) }
+    };
+    editor.active_mut().desired_col = None;
+    result
+}
+
+pub fn move_doc_start(editor: &mut Editor) -> usize { editor.active_mut().desired_col = None; 0 }
+
+pub fn move_doc_end(editor: &mut Editor) -> usize {
+    let len = editor.active().document.buffer.len();
+    editor.active_mut().desired_col = None;
+    len
+}
+
+/// Page step: editing_height − 1 for one row of context overlap.
+/// `editing_height = area.1 - 1` (the status row is reserved — matches nav.rs:62).
+fn page_step(editor: &Editor) -> usize {
+    let editing_height = (editor.active().view.area.1 as usize).saturating_sub(1);
+    editing_height.saturating_sub(1).max(1)
+}
+
+pub fn move_page_down(editor: &mut Editor) -> usize {
+    let steps = page_step(editor);
+    let mut off = head(editor);
+    for _ in 0..steps {
+        let next = move_down(editor); // preserves desired_col across the run
+        if next == off { break; }
+        editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(next);
+        off = next;
+    }
+    off
+}
+
+pub fn move_page_up(editor: &mut Editor) -> usize {
+    let steps = page_step(editor);
+    let mut off = head(editor);
+    for _ in 0..steps {
+        let next = move_up(editor);
+        if next == off { break; }
+        editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(next);
+        off = next;
+    }
+    off
+}
+
+/// Move to the start of the next word, crossing block boundaries (skipping gaps).
+pub fn move_word_right(editor: &mut Editor) -> usize {
+    let h = head(editor);
+    let new = {
+        let buf = &editor.active().document.buffer;
+        let blocks = &editor.active().document.blocks;
+        let (wstart, wend) = paragraph_range_at(blocks, buf, h);
+        let window = buf.slice(wstart..wend);
+        let rel = h.saturating_sub(wstart);
+        match wordcartel_core::textobj::next_word_start(&window, rel) {
+            Some(r) => wstart + r,
+            None => {
+                // First word of the next leaf block (skips blank-line gaps), else doc end.
+                let nps = next_paragraph_start(blocks, buf, wend);
+                if nps >= buf.len() {
+                    buf.len()
+                } else {
+                    let next_end = paragraph_range_at(blocks, buf, nps).1;
+                    let ntext = buf.slice(nps..next_end);
+                    wordcartel_core::textobj::next_word_start(&ntext, 0)
+                        .map(|r| nps + r)
+                        .unwrap_or(nps) // block starts with its first word
+                }
+            }
+        }
+    };
+    editor.active_mut().desired_col = None;
+    new
+}
+
+/// Move to the start of the previous word, crossing block boundaries (skipping gaps).
+pub fn move_word_left(editor: &mut Editor) -> usize {
+    let h = head(editor);
+    let new = {
+        let buf = &editor.active().document.buffer;
+        let blocks = &editor.active().document.blocks;
+        let (wstart, wend) = paragraph_range_at(blocks, buf, h);
+        let window = buf.slice(wstart..wend);
+        let rel = h.saturating_sub(wstart);
+        match wordcartel_core::textobj::prev_word_start(&window, rel) {
+            Some(r) => wstart + r,
+            None if wstart > 0 => {
+                let pps = prev_paragraph_start(blocks, buf, wstart);
+                let prev_end = paragraph_range_at(blocks, buf, pps).1;
+                let ptext = buf.slice(pps..prev_end);
+                wordcartel_core::textobj::prev_word_start(&ptext, ptext.len())
+                    .map(|r| pps + r)
+                    .unwrap_or(pps)
+            }
+            None => 0,
+        }
+    };
+    editor.active_mut().desired_col = None;
+    new
+}
+
+// ---------------------------------------------------------------------------
+// Cell → offset reverse map (inverse of screen_pos)
+// ---------------------------------------------------------------------------
+
+/// Inverse of `screen_pos`: the document byte offset under screen cell
+/// `(col, row)` in the editing area, or `None` if `row` is past content.
+#[allow(dead_code)] // wired in 5c-m (mouse)
+pub fn offset_at_cell(editor: &Editor, col: u16, row: u16) -> Option<usize> {
+    let target = row as usize;
+    let scroll = editor.active().view.scroll;
+    let scroll_row = editor.active().view.scroll_row;
+    let total = derive::total_logical_lines(&editor.active().document.buffer);
+    let mut acc = 0usize; // visible rows consumed
+    let mut line = scroll;
+    while line < total {
+        let rows = rows_of_line(editor, line);
+        let first_vrow = if line == scroll { scroll_row } else { 0 };
+        for vrow in first_vrow..rows {
+            if acc == target {
+                let map = get_or_layout(editor, line);
+                let in_off = map.visual_to_source(vrow, col as usize);
+                let snapped = map.snap_to_stop(in_off);
+                return Some(derive::line_start(&editor.active().document.buffer, line) + snapped);
+            }
+            acc += 1;
+        }
+        line += 1;
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -626,6 +875,42 @@ mod tests {
         assert_eq!(e.active().desired_col, Some(2)); // still preserved
     }
 
+    // ------------------------------------------------------------------
+    // Task 2: paragraph_range_at (RED → GREEN)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn paragraph_range_selects_leaf_block_not_container() {
+        // A list: paragraph_range at a list item must select the ITEM span,
+        // not the whole list container.
+        let mut e = Editor::new_from_text("- one\n- two\n\nAfter\n", None, (80, 24));
+        derive::rebuild(&mut e);
+        let buf = &e.active().document.buffer;
+        let blocks = &e.active().document.blocks;
+        // pos inside "two" (second list item)
+        let pos = 8;
+        let (from, to) = super::paragraph_range_at(blocks, buf, pos);
+        let slice = buf.slice(from..to);
+        assert!(slice.contains("two") && !slice.contains("one"),
+            "expected the 'two' item span, got {slice:?}");
+    }
+
+    #[test]
+    fn paragraph_range_gap_falls_back_to_blank_delimited_run() {
+        // "A\n\nB\n" — pos on the blank line (offset 2) has no block span;
+        // fallback returns an empty/whitespace range (no panic), and a pos in
+        // paragraph "B" returns the B line range.
+        let mut e = Editor::new_from_text("A\n\nB\n", None, (80, 24));
+        derive::rebuild(&mut e);
+        let buf = &e.active().document.buffer;
+        let blocks = &e.active().document.blocks;
+        let (bf, bt) = super::paragraph_range_at(blocks, buf, 3); // inside "B"
+        assert_eq!(buf.slice(bf..bt).trim(), "B");
+        // gap: must not panic and must yield a valid (from<=to<=len) range
+        let (gf, gt) = super::paragraph_range_at(blocks, buf, 2);
+        assert!(gf <= gt && gt <= buf.len());
+    }
+
     #[test]
     fn desired_col_survives_ragged_short_line() {
         // Classic ragged-column case: descending through a SHORT middle line must
@@ -641,5 +926,18 @@ mod tests {
         let p2 = move_down(&mut e); // desired still 4 -> "world" col 4 -> offset 13 (NOT col 2)
         assert_eq!(p2, 13);
         assert_eq!(e.active().desired_col, Some(4));
+    }
+
+    // ------------------------------------------------------------------
+    // Task 11: offset_at_cell (RED → GREEN)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn offset_at_cell_inverts_screen_pos() {
+        let mut e = Editor::new_from_text("abc\ndef\n", None, (80, 24));
+        set_caret(&mut e, 5); // 'e' on line 1, col 1
+        derive::rebuild(&mut e);
+        let (col, row) = screen_pos(&e).unwrap();
+        assert_eq!(super::offset_at_cell(&e, col, row), Some(5));
     }
 }

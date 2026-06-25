@@ -245,6 +245,18 @@ pub fn apply_resume(
     Some((e.cursor.min(doc_len), e.scroll))
 }
 
+/// Populate the active buffer's marks from a session entry (string→char keys),
+/// clamped+grapheme-snapped. Call only when the staleness guard has accepted
+/// the entry (mirrors cursor/scroll restore).
+pub fn load_marks_from_entry(editor: &mut Editor, entry: &crate::state::StateEntry) {
+    for (k, &raw) in &entry.marks {
+        if let Some(ch) = k.chars().next() {
+            let off = crate::nav::clamp_snap(editor, raw);
+            editor.active_mut().marks.insert(ch, off);
+        }
+    }
+}
+
 /// Execute the action chosen in a modal prompt, then clear the prompt.
 pub fn resolve_prompt(
     action: PromptAction,
@@ -447,6 +459,23 @@ pub fn reduce(
     clock: &dyn Clock,
     msg_tx: &std::sync::mpsc::Sender<Msg>,
 ) -> bool {
+    // pending_mark intercepts the very next key as the mark letter.
+    // Non-key messages fall through to normal handling.
+    if editor.pending_mark.is_some() {
+        if let Msg::Input(Event::Key(k)) = &msg {
+            if k.kind == crossterm::event::KeyEventKind::Press {
+                match k.code {
+                    crossterm::event::KeyCode::Esc => { editor.pending_mark = None; editor.status.clear(); }
+                    crossterm::event::KeyCode::Char(c) => crate::marks::resolve_pending(editor, c),
+                    _ => { editor.pending_mark = None; } // non-name key cancels
+                }
+            }
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
+        }
+        // non-key message: fall through to normal handling
+    }
+
     // Menu overlay intercepts KEY INPUT and PASTE (no text field; paste is
     // consumed / silently dropped). Non-key, non-paste messages fall through to
     // the normal handlers so background work continues while the menu is open.
@@ -965,6 +994,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
                             let sel = wordcartel_core::selection::Selection::single(cur);
                             editor.active_mut().document.selection = sel;
                             editor.active_mut().view.scroll = scroll;
+                            load_marks_from_entry(&mut editor, entry);
                         }
                     }
                 }
@@ -1058,7 +1088,7 @@ fn persist_session(
     let entry = crate::state::StateEntry {
         cursor,
         scroll,
-        marks: std::collections::BTreeMap::new(), // 5c will fill this
+        marks: editor.active().marks.iter().map(|(c, &o)| (c.to_string(), o)).collect(),
         mtime,
         size,
         seq,
@@ -2197,5 +2227,50 @@ mod tests {
         // F10 with menu open → closes the menu
         crate::app::reduce(Msg::Input(f10()), &mut e, &reg, &km, &ex, &clk, &tx);
         assert!(e.menu.is_none(), "F10 should close menu when open");
+    }
+
+    #[test]
+    fn pending_mark_consumes_one_key_then_clears() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        e.pending_mark = Some(crate::editor::MarkPending::Set);
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &Registry::builtins());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let press = |c, m| Event::Key(KeyEvent { code: c, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(press(KeyCode::Char('q'), KeyModifiers::NONE)), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.pending_mark, None, "capture consumed the key");
+        assert_eq!(e.active().marks.get(&'q'), Some(&0));
+        assert_eq!(e.active().document.buffer.to_string(), "abc\n", "captured key did NOT type into the doc");
+    }
+
+    #[test]
+    fn esc_cancels_pending_mark() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        e.pending_mark = Some(crate::editor::MarkPending::Set);
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &Registry::builtins());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let esc = Event::Key(KeyEvent { code: KeyCode::Esc, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(esc), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.pending_mark, None);
+        assert!(e.active().marks.is_empty());
+    }
+
+    #[test]
+    fn load_marks_from_entry_populates_clamped() {
+        use std::collections::BTreeMap;
+        // No trailing newline so clamp_snap(999) == buffer.len() == 11.
+        let mut e = Editor::new_from_text("hello world", None, (80, 24));
+        let mut marks = BTreeMap::new();
+        marks.insert("a".to_string(), 6usize);
+        marks.insert("b".to_string(), 999usize); // past EOF → clamped to len
+        let entry = crate::state::StateEntry { cursor: 0, scroll: 0, marks, mtime: 0, size: 0, seq: 1 };
+        crate::app::load_marks_from_entry(&mut e, &entry);
+        assert_eq!(e.active().marks.get(&'a'), Some(&6));
+        assert_eq!(e.active().marks.get(&'b'), Some(&e.active().document.buffer.len()));
     }
 }

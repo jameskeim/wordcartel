@@ -20,6 +20,10 @@ use wordcartel_core::history::{Clock, EditKind, Transaction};
 use wordcartel_core::register;
 use wordcartel_core::selection::{Range, Selection};
 
+/// Text object scope for selection expansion commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope { Word, Sentence, Paragraph, Document }
+
 /// Direction of caret movement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dir {
@@ -29,6 +33,14 @@ pub enum Dir {
     Down,
     LineStart,
     LineEnd,
+    WordLeft,
+    WordRight,
+    ParagraphUp,
+    ParagraphDown,
+    PageUp,
+    PageDown,
+    DocStart,
+    DocEnd,
 }
 
 /// Commands that can be dispatched to the editor.
@@ -56,6 +68,14 @@ pub enum Command {
     Save,
     /// Request to quit; a second Quit while dirty force-quits.
     Quit,
+    /// Delete one word backwards (back=true) or forwards (back=false).
+    DeleteWord { back: bool },
+    /// Select the given text-object scope at the caret (clears sel_history).
+    SelectScope(Scope),
+    /// Grow selection: word → sentence → paragraph → document (pushes to sel_history).
+    ExpandSelection,
+    /// Shrink selection: pop one level from sel_history.
+    ShrinkSelection,
 }
 
 /// Result returned by `run`.
@@ -108,6 +128,44 @@ pub fn build_range_replace(
     let cs = replace_changeset(from, to, text, doc_len); // existing private builder
     let edit = wordcartel_core::block_tree::Edit { range: from..to, new_len: text.len() };
     (cs, edit)
+}
+
+/// Compute the (from, to) byte range of `scope` at the caret position.
+/// Borrows `editor` immutably and returns owned `(usize, usize)`.
+fn scope_range(editor: &Editor, scope: Scope) -> (usize, usize) {
+    let buf = &editor.active().document.buffer;
+    let blocks = &editor.active().document.blocks;
+    let h = nav::head(editor);
+    match scope {
+        Scope::Word => {
+            let (ps, pe) = nav::paragraph_range_at(blocks, buf, h);
+            let win = buf.slice(ps..pe);
+            let (wf, wt) = wordcartel_core::textobj::word_bounds(&win, h - ps);
+            if wf == wt {
+                // in whitespace → nearest word (next within block, else prev)
+                match wordcartel_core::textobj::next_word_start(&win, h - ps)
+                    .or_else(|| wordcartel_core::textobj::prev_word_start(&win, h - ps)) {
+                    Some(r) => { let (a, b) = wordcartel_core::textobj::word_bounds(&win, r); (ps + a, ps + b) }
+                    None => (h, h),
+                }
+            } else { (ps + wf, ps + wt) }
+        }
+        Scope::Sentence => {
+            let (ps, pe) = nav::paragraph_range_at(blocks, buf, h);
+            let win = buf.slice(ps..pe);
+            let (sf, st) = wordcartel_core::textobj::sentence_bounds(&win, h - ps);
+            (ps + sf, ps + st)
+        }
+        Scope::Paragraph => nav::paragraph_range_at(blocks, buf, h),
+        Scope::Document => (0, buf.len()),
+    }
+}
+
+/// Set the selection to [from, to) and re-derive + ensure visibility.
+fn set_selection_range(editor: &mut Editor, from: usize, to: usize) {
+    editor.active_mut().document.selection = Selection::range(from, to);
+    derive::rebuild(editor);
+    nav::ensure_visible(editor);
 }
 
 /// Execute `cmd` against `editor`, then re-derive + ensure visibility.
@@ -253,6 +311,14 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         }
 
         Command::Move { dir, extend } => {
+            // Reset the expand-selection ladder on every motion (Task 7).
+            editor.active_mut().sel_history.clear();
+            // DocStart / DocEnd are deliberate long-range jumps: push the ring
+            // so the user can alt-left back to where they came from.
+            if matches!(dir, Dir::DocStart | Dir::DocEnd) {
+                let pre = nav::head(editor);
+                crate::marks::record_jump(editor.active_mut(), pre);
+            }
             // Compute the new head offset using the appropriate nav function.
             let new_head = match dir {
                 Dir::Left     => nav::move_left(editor),
@@ -261,6 +327,14 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                 Dir::Down     => nav::move_down(editor),
                 Dir::LineStart => nav::move_home(editor),
                 Dir::LineEnd   => nav::move_end(editor),
+                Dir::WordLeft      => nav::move_word_left(editor),
+                Dir::WordRight     => nav::move_word_right(editor),
+                Dir::ParagraphUp   => nav::move_paragraph_up(editor),
+                Dir::ParagraphDown => nav::move_paragraph_down(editor),
+                Dir::PageUp        => nav::move_page_up(editor),
+                Dir::PageDown      => nav::move_page_down(editor),
+                Dir::DocStart      => nav::move_doc_start(editor),
+                Dir::DocEnd        => nav::move_doc_end(editor),
             };
             // Up/Down preserve desired_col (handled inside move_up/move_down).
             // Horizontal moves reset desired_col to None (handled inside move_left/right/home/end).
@@ -403,6 +477,58 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                 editor.quit = true;
                 CommandResult::Quit
             }
+        }
+
+        Command::DeleteWord { back } => {
+            let h = nav::head(editor);
+            let target = if back { nav::move_word_left(editor) } else { nav::move_word_right(editor) };
+            let (from, to) = if back { (target, h) } else { (h, target) };
+            if from == to { return CommandResult::Noop; }
+            let doc_len = editor.active().document.buffer.len();
+            let cs = ChangeSet::delete(from..to, doc_len);
+            let edit = Edit { range: from..to, new_len: 0 };
+            let txn = Transaction::new(cs).with_selection(Selection::single(from));
+            // EditKind::Other — matches existing delete commands, avoids coalescing with typed chars.
+            editor.apply(txn, edit, EditKind::Other, clock);
+            derive::rebuild(editor);
+            nav::ensure_visible(editor);
+            editor.active_mut().desired_col = None;
+            CommandResult::Handled
+        }
+
+        Command::SelectScope(scope) => {
+            editor.active_mut().sel_history.clear();
+            let (from, to) = scope_range(editor, scope);
+            set_selection_range(editor, from, to);
+            CommandResult::Handled
+        }
+
+        Command::ExpandSelection => {
+            let cur = editor.active().document.selection.primary();
+            let (cf, ct) = (cur.from(), cur.to());
+            // Find the smallest scope strictly larger than the current selection.
+            let order = [Scope::Word, Scope::Sentence, Scope::Paragraph, Scope::Document];
+            let mut next: Option<(usize, usize)> = None;
+            for sc in order {
+                let (f, t) = scope_range(editor, sc);
+                if f <= cf && t >= ct && (f < cf || t > ct) { next = Some((f, t)); break; }
+            }
+            if let Some((f, t)) = next {
+                // Clone to a local first — avoids overlapping active()/active_mut() borrow.
+                let cur_sel = editor.active().document.selection.clone();
+                editor.active_mut().sel_history.push(cur_sel);
+                set_selection_range(editor, f, t);
+                CommandResult::Handled
+            } else { CommandResult::Noop }
+        }
+
+        Command::ShrinkSelection => {
+            if let Some(prev) = editor.active_mut().sel_history.pop() {
+                editor.active_mut().document.selection = prev;
+                derive::rebuild(editor);
+                nav::ensure_visible(editor);
+                CommandResult::Handled
+            } else { CommandResult::Noop }
         }
     }
 }
@@ -999,6 +1125,109 @@ mod tests {
         let txn = Transaction::new(cs).with_selection(wordcartel_core::selection::Selection::single(2));
         e.active_mut().apply(txn, edit, EditKind::Other, &TestClock(0));
         assert_eq!(e.active().document.buffer.to_string(), "aXde\n");
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 5: Word navigation + word-delete
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn move_word_right_crosses_into_next_word_and_block() {
+        let mut e = Editor::new_from_text("alpha beta\n\ngamma\n", None, (80, 24));
+        set_caret(&mut e, 0); derive::rebuild(&mut e);
+        run(Command::Move { dir: Dir::WordRight, extend: false }, &mut e, &TestClock(0));
+        assert_eq!(nav::head(&e), 6); // start of "beta"
+        run(Command::Move { dir: Dir::WordRight, extend: false }, &mut e, &TestClock(0));
+        assert_eq!(nav::head(&e), 12); // start of "gamma" (across the blank-line gap)
+    }
+
+    #[test]
+    fn select_word_left_extends_selection() {
+        let mut e = Editor::new_from_text("alpha beta", None, (80, 24));
+        set_caret(&mut e, 10); derive::rebuild(&mut e); // end of "beta"
+        run(Command::Move { dir: Dir::WordLeft, extend: true }, &mut e, &TestClock(0));
+        let r = e.active().document.selection.primary();
+        assert_eq!((r.from(), r.to()), (6, 10)); // "beta" selected
+    }
+
+    #[test]
+    fn delete_word_back_is_one_undo_step() {
+        let mut e = Editor::new_from_text("alpha beta", None, (80, 24));
+        set_caret(&mut e, 10); derive::rebuild(&mut e);
+        run(Command::DeleteWord { back: true }, &mut e, &TestClock(0));
+        assert_eq!(e.active().document.buffer.to_string(), "alpha ");
+        e.undo();
+        assert_eq!(e.active().document.buffer.to_string(), "alpha beta");
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 6: Paragraph, page & document navigation
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn paragraph_down_jumps_to_next_block_start() {
+        let mut e = Editor::new_from_text("Para one.\n\nPara two.\n\nThree.\n", None, (80, 24));
+        set_caret(&mut e, 0); derive::rebuild(&mut e);
+        run(Command::Move { dir: Dir::ParagraphDown, extend: false }, &mut e, &TestClock(0));
+        let h = nav::head(&e);
+        assert_eq!(e.active().document.buffer.slice(h..h+8), "Para two");
+    }
+
+    #[test]
+    fn doc_start_and_end() {
+        let mut e = Editor::new_from_text("aaa\nbbb\nccc\n", None, (80, 24));
+        set_caret(&mut e, 5); derive::rebuild(&mut e);
+        run(Command::Move { dir: Dir::DocEnd, extend: false }, &mut e, &TestClock(0));
+        assert_eq!(nav::head(&e), e.active().document.buffer.len());
+        run(Command::Move { dir: Dir::DocStart, extend: false }, &mut e, &TestClock(0));
+        assert_eq!(nav::head(&e), 0);
+    }
+
+    #[test]
+    fn page_down_moves_down_about_a_page() {
+        let text: String = (0..40).map(|i| format!("line {i}\n")).collect();
+        let mut e = Editor::new_from_text(&text, None, (80, 10)); // ~9 content rows
+        set_caret(&mut e, 0); derive::rebuild(&mut e);
+        run(Command::Move { dir: Dir::PageDown, extend: false }, &mut e, &TestClock(0));
+        assert!(nav::caret_line(&e) >= 7 && nav::caret_line(&e) <= 9,
+            "page-down should advance ~one viewport, got line {}", nav::caret_line(&e));
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 7: Text objects — select word/sentence/paragraph + expand/shrink
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn select_paragraph_selects_block() {
+        let mut e = Editor::new_from_text("One two.\n\nThree four.\n", None, (80, 24));
+        set_caret(&mut e, 12); derive::rebuild(&mut e); // inside "Three four."
+        run(Command::SelectScope(Scope::Paragraph), &mut e, &TestClock(0));
+        let r = e.active().document.selection.primary();
+        assert_eq!(e.active().document.buffer.slice(r.from()..r.to()).trim(), "Three four.");
+    }
+
+    #[test]
+    fn expand_then_shrink_round_trips() {
+        let mut e = Editor::new_from_text("One two. Three four.\n", None, (80, 24));
+        set_caret(&mut e, 1); derive::rebuild(&mut e); // inside "One"
+        run(Command::ExpandSelection, &mut e, &TestClock(0)); // → word "One"
+        let w = e.active().document.selection.primary();
+        assert_eq!(e.active().document.buffer.slice(w.from()..w.to()), "One");
+        run(Command::ExpandSelection, &mut e, &TestClock(0)); // → sentence
+        let s = e.active().document.selection.primary();
+        assert!(e.active().document.buffer.slice(s.from()..s.to()).starts_with("One two."));
+        run(Command::ShrinkSelection, &mut e, &TestClock(0)); // back to word
+        let w2 = e.active().document.selection.primary();
+        assert_eq!((w2.from(), w2.to()), (w.from(), w.to()));
+    }
+
+    #[test]
+    fn a_motion_resets_the_expand_ladder() {
+        let mut e = Editor::new_from_text("One two.\n", None, (80, 24));
+        set_caret(&mut e, 1); derive::rebuild(&mut e);
+        run(Command::ExpandSelection, &mut e, &TestClock(0));
+        run(Command::Move { dir: Dir::Right, extend: false }, &mut e, &TestClock(0)); // resets
+        assert!(e.active().sel_history.is_empty());
     }
 
     #[test]

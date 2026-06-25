@@ -253,6 +253,30 @@ static CUA: &[(&str, &str)] = &[
     ("shift-down",  "select_down"),
     ("shift-home",  "select_line_start"),
     ("shift-end",   "select_line_end"),
+    // Paragraph / page / document navigation
+    ("ctrl-up",   "move_paragraph_up"),
+    ("ctrl-down", "move_paragraph_down"),
+    ("pageup",    "move_page_up"),
+    ("pagedown",  "move_page_down"),
+    ("ctrl-home", "move_doc_start"),
+    ("ctrl-end",  "move_doc_end"),
+    // Word navigation
+    ("ctrl-left",       "move_word_left"),
+    ("ctrl-right",      "move_word_right"),
+    ("ctrl-shift-left", "select_word_left"),
+    ("ctrl-shift-right","select_word_right"),
+    // Word delete
+    ("ctrl-backspace", "delete_word_back"),
+    ("ctrl-del",       "delete_word_forward"),
+    // Text object expand/shrink (Task 7 / Effort 5c)
+    ("ctrl-w",       "expand_selection"),
+    ("ctrl-shift-w", "shrink_selection"),
+    // Named marks (Task 8 / Effort 5c)
+    ("ctrl-k m", "set_mark"),
+    ("ctrl-k j", "jump_to_mark"),
+    // Jump-back ring (Task 9 / Effort 5c)
+    ("alt-left",  "jump_back"),
+    ("alt-right", "jump_forward"),
     // Editing  (input.rs lines 111–113)
     ("enter",     "insert_newline"),
     ("backspace", "backspace"),
@@ -280,6 +304,9 @@ static WORDSTAR: &[(&str, &str)] = &[
     // Undo / redo
     ("ctrl-z", "undo"),
     ("ctrl-y", "redo"),
+    // Named marks (Task 8 / Effort 5c)
+    ("ctrl-k m", "set_mark"),
+    ("ctrl-k j", "jump_to_mark"),
     // Editing
     ("backspace", "backspace"),
     ("del",       "delete_forward"),

@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::commands::{self, Command, CommandResult, Dir};
+use crate::commands::{self, Command, CommandResult, Dir, Scope};
 use crate::editor::Editor;
 use crate::jobs::Executor;
 use crate::app::Msg;
@@ -87,6 +87,26 @@ impl Registry {
         r.register("select_line_start", "Select Line Start", None, |c| run(c, Command::Move { dir: Dir::LineStart, extend: true }));
         r.register("select_line_end",   "Select Line End",   None, |c| run(c, Command::Move { dir: Dir::LineEnd,   extend: true }));
 
+        // Word motions (collapse selection) — palette-only (menu: None).
+        r.register("move_word_left",  "Move Word Left",  None, |c| run(c, Command::Move { dir: Dir::WordLeft,  extend: false }));
+        r.register("move_word_right", "Move Word Right", None, |c| run(c, Command::Move { dir: Dir::WordRight, extend: false }));
+
+        // Word selecting motions (extend) — palette-only (menu: None).
+        r.register("select_word_left",  "Select Word Left",  None, |c| run(c, Command::Move { dir: Dir::WordLeft,  extend: true }));
+        r.register("select_word_right", "Select Word Right", None, |c| run(c, Command::Move { dir: Dir::WordRight, extend: true }));
+
+        // Paragraph / page / document navigation — palette-only (menu: None).
+        r.register("move_paragraph_up",   "Move Paragraph Up",   None, |c| run(c, Command::Move { dir: Dir::ParagraphUp,   extend: false }));
+        r.register("move_paragraph_down", "Move Paragraph Down", None, |c| run(c, Command::Move { dir: Dir::ParagraphDown, extend: false }));
+        r.register("move_page_up",   "Move Page Up",   None, |c| run(c, Command::Move { dir: Dir::PageUp,   extend: false }));
+        r.register("move_page_down", "Move Page Down", None, |c| run(c, Command::Move { dir: Dir::PageDown, extend: false }));
+        r.register("move_doc_start", "Move to Start",  None, |c| run(c, Command::Move { dir: Dir::DocStart, extend: false }));
+        r.register("move_doc_end",   "Move to End",    None, |c| run(c, Command::Move { dir: Dir::DocEnd,   extend: false }));
+
+        // Word delete — Edit menu.
+        r.register("delete_word_back",    "Delete Word Left",  Some(MenuCategory::Edit), |c| run(c, Command::DeleteWord { back: true }));
+        r.register("delete_word_forward", "Delete Word Right", Some(MenuCategory::Edit), |c| run(c, Command::DeleteWord { back: false }));
+
         // Editing — palette-only (menu: None).
         r.register("insert_newline", "Insert Newline",   None, |c| run(c, Command::InsertNewline));
         r.register("backspace",      "Backspace",        None, |c| run(c, Command::Backspace));
@@ -128,6 +148,13 @@ impl Registry {
             CommandResult::Handled
         });
 
+        // Text object selection — palette-only (Task 7 / Effort 5c).
+        r.register("select_word",      "Select Word",      None, |c| run(c, Command::SelectScope(Scope::Word)));
+        r.register("select_sentence",  "Select Sentence",  None, |c| run(c, Command::SelectScope(Scope::Sentence)));
+        r.register("select_paragraph", "Select Paragraph", None, |c| run(c, Command::SelectScope(Scope::Paragraph)));
+        r.register("expand_selection", "Expand Selection", None, |c| run(c, Command::ExpandSelection));
+        r.register("shrink_selection", "Shrink Selection", None, |c| run(c, Command::ShrinkSelection));
+
         // View menu — palette command (Task 3 / Effort 5b).
         r.register("palette", "Command Palette\u{2026}", Some(MenuCategory::View), |c| {
             c.editor.open_palette();
@@ -138,6 +165,7 @@ impl Registry {
             c.editor.prompt = None;
             c.editor.minibuffer = None;
             c.editor.pending_keys.clear();
+            c.editor.pending_mark = None;
             c.editor.menu = if c.editor.menu.is_some() {
                 None
             } else {
@@ -145,6 +173,14 @@ impl Registry {
             };
             CommandResult::Handled
         });
+
+        // Named marks (Task 8 / Effort 5c).
+        r.register("set_mark",     "Set Mark\u{2026}",     None, |c| { crate::marks::set_mark(c.editor); CommandResult::Handled });
+        r.register("jump_to_mark", "Jump to Mark\u{2026}", None, |c| { crate::marks::jump_to_mark(c.editor); CommandResult::Handled });
+
+        // Jump-back ring (Task 9 / Effort 5c).
+        r.register("jump_back",    "Jump Back",    None, |c| { crate::marks::jump_back(c.editor); CommandResult::Handled });
+        r.register("jump_forward", "Jump Forward", None, |c| { crate::marks::jump_forward(c.editor); CommandResult::Handled });
 
         // Format menu — discrete transform commands (Task 1 / Effort 5b).
         r.register("reflow", "Reflow", Some(MenuCategory::Format), |c| {
