@@ -110,33 +110,32 @@ pub fn build(reg: &Registry, keymap: &KeyTrie) -> MenuView {
 ```rust
         if let Msg::Input(Event::Key(k)) = &msg {
             if k.kind == crossterm::event::KeyEventKind::Press {
-                let mut selected: Option<crate::registry::CommandId> = None;
-                if let Some(menu) = editor.menu.as_mut() {
-                    let ncat = menu.groups.len();
-                    match k.code {
-                        crossterm::event::KeyCode::Esc | crossterm::event::KeyCode::F(10) => { editor.menu = None; }
-                        crossterm::event::KeyCode::Left if ncat > 0 => {
-                            menu.open = (menu.open + ncat - 1) % ncat; menu.highlighted = 0;
+                use crossterm::event::KeyCode;
+                // Close OUTSIDE any menu borrow (Codex Critical: `editor.menu = None`
+                // must not run while `editor.menu.as_mut()` is held).
+                if matches!(k.code, KeyCode::Esc | KeyCode::F(10)) {
+                    editor.menu = None;
+                } else {
+                    let mut selected: Option<crate::registry::CommandId> = None;
+                    if let Some(menu) = editor.menu.as_mut() {   // borrow scoped to this block
+                        let ncat = menu.groups.len();
+                        match k.code {
+                            KeyCode::Left if ncat > 0 => { menu.open = (menu.open + ncat - 1) % ncat; menu.highlighted = 0; }
+                            KeyCode::Right if ncat > 0 => { menu.open = (menu.open + 1) % ncat; menu.highlighted = 0; }
+                            KeyCode::Up if ncat > 0 => { menu.highlighted = menu.highlighted.saturating_sub(1); }
+                            KeyCode::Down if ncat > 0 => {
+                                let n = menu.groups[menu.open].1.len();
+                                if n > 0 { menu.highlighted = (menu.highlighted + 1).min(n - 1); }
+                            }
+                            KeyCode::Enter if ncat > 0 => {
+                                if let Some((_, id)) = menu.groups[menu.open].1.get(menu.highlighted) { selected = Some(*id); }
+                            }
+                            _ => {}
                         }
-                        crossterm::event::KeyCode::Right if ncat > 0 => {
-                            menu.open = (menu.open + 1) % ncat; menu.highlighted = 0;
-                        }
-                        crossterm::event::KeyCode::Up if ncat > 0 => {
-                            menu.highlighted = menu.highlighted.saturating_sub(1);
-                        }
-                        crossterm::event::KeyCode::Down if ncat > 0 => {
-                            let n = menu.groups[menu.open].1.len();
-                            if n > 0 { menu.highlighted = (menu.highlighted + 1).min(n - 1); }
-                        }
-                        crossterm::event::KeyCode::Enter if ncat > 0 => {
-                            let leaves = &menu.groups[menu.open].1;
-                            if let Some((_, id)) = leaves.get(menu.highlighted) { selected = Some(*id); }
-                        }
-                        _ => {}
+                    } // menu borrow dropped here
+                    if let Some(id) = selected {
+                        dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
                     }
-                }
-                if let Some(id) = selected {
-                    dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
                 }
             }
             for r in ex.drain() { apply_result(r, editor); }
@@ -498,7 +497,33 @@ git commit -m "feat(mouse): MouseState + Event::Mouse reduce arm + click→caret
         MouseEventKind::Up(MouseButton::Left) => { editor.mouse.dragging = false; }
 ```
 
-Add tiny `nav::scroll_up_one`/`scroll_down_one` helpers if not present (adjust `view.scroll`/`scroll_row` by one logical row, clamped) — reuse the existing scroll arithmetic in `nav.rs`.
+Add the `nav::scroll_up_one`/`scroll_down_one` helpers (Codex Important — only the private downward primitive `advance_view_top_one_row` exists today; spell both out so wrapped-row `scroll_row` semantics don't diverge):
+
+```rust
+/// Advance the viewport top down by one visual row (reuses the existing
+/// private `advance_view_top_one_row`, which rolls scroll_row→next line).
+pub fn scroll_down_one(editor: &mut Editor) {
+    let total = derive::total_logical_lines(&editor.active().document.buffer);
+    let max_scroll = total.saturating_sub(1);
+    advance_view_top_one_row(editor, max_scroll);
+}
+/// Move the viewport top up by one visual row: decrement scroll_row, or cross
+/// to the previous logical line's last visual row.
+pub fn scroll_up_one(editor: &mut Editor) {
+    let (scroll, scroll_row) = { let v = &editor.active().view; (v.scroll, v.scroll_row) };
+    if scroll_row > 0 {
+        editor.active_mut().view.scroll_row = scroll_row - 1;
+    } else if scroll > 0 {
+        let prev = scroll - 1;
+        let rows = rows_of_line(editor, prev); // existing nav helper; immutable borrow ends here
+        let v = &mut editor.active_mut().view;
+        v.scroll = prev;
+        v.scroll_row = rows.saturating_sub(1);
+    }
+}
+```
+
+(`advance_view_top_one_row` is currently private in `nav.rs` — `scroll_down_one` lives in `nav.rs` too, so it calls it directly; `rows_of_line` and `derive::total_logical_lines` are existing helpers.)
 
 - [ ] **Step 4: Run tests + suite.** `cargo test -p wordcartel --lib mouse::` → PASS; `cargo test --workspace` → green; zero warnings.
 
@@ -722,15 +747,27 @@ git commit -m "feat(mouse): auto-hiding draggable scrollbar (loop-deadline fade,
   - `render.rs`: extract `pub(crate) fn palette_overlay_rect(area: Rect) -> Rect` (the ov_x/ov_y/ov_w/ov_h computation at render.rs:193-196) and `pub(crate) fn palette_row_at(area: Rect, palette: &Palette, col: u16, row: u16) -> Option<usize>` (list starts at `ov_y+2`, height = visible rows); render's palette paint calls them so geometry is shared.
   - `mouse.rs`: at the TOP of `handle` (after the pending_mark/capture guards), route overlays BEFORE the text area:
 
+**Borrow discipline (Codex Critical):** every overlay hit-test runs in a SCOPED immutable borrow that yields an OWNED value (`usize`/`CommandId` — both `Copy`); the borrow drops before any `editor.menu = None` / `as_mut()` / `dispatch_overlay_command(editor, …)`. The menu row tuple is `(String, CommandId)` — NOT `Copy` — so extract `*id` (a `CommandId`), never `.copied()` the whole tuple.
+
 ```rust
+    let (w, h) = editor.active().view.area;
+    let area = ratatui::layout::Rect::new(0, 0, w, h);
     if editor.palette.is_some() {
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            let area = ratatui::layout::Rect::new(0, 0, editor.active().view.area.0, editor.active().view.area.1);
-            if let Some(idx) = crate::render::palette_row_at(area, editor.palette.as_ref().unwrap(), ev.column, ev.row) {
-                if let Some(id) = editor.palette.as_ref().unwrap().rows.get(idx).map(|r| r.id) {
-                    crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
-                }
-            } else {
+            // scoped borrow → owned Option<CommandId>
+            let hit_id: Option<crate::registry::CommandId> = {
+                let p = editor.palette.as_ref().unwrap();
+                crate::render::palette_row_at(area, p, ev.column, ev.row)
+                    .and_then(|idx| p.rows.get(idx).map(|r| r.id))
+            };
+            // was the click inside the overlay rect at all?
+            let inside = {
+                let r = crate::render::palette_overlay_rect(area);
+                ev.column >= r.x && ev.column < r.x + r.width && ev.row >= r.y && ev.row < r.y + r.height
+            };
+            if let Some(id) = hit_id {
+                crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
+            } else if !inside {
                 editor.palette = None; // click outside closes
             }
         }
@@ -738,15 +775,24 @@ git commit -m "feat(mouse): auto-hiding draggable scrollbar (loop-deadline fade,
     }
     if editor.menu.is_some() {
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            let area = ratatui::layout::Rect::new(0, 0, editor.active().view.area.0, editor.active().view.area.1);
-            let groups = &editor.menu.as_ref().unwrap().groups;
-            if let Some((cat, _)) = crate::render::menu_bar_layout(area, groups).into_iter().find(|(_, r)| ev.column >= r.x && ev.column < r.x + r.width && ev.row == r.y) {
+            let open = editor.menu.as_ref().unwrap().open;
+            // scoped borrows → owned hit results
+            let bar_hit: Option<usize> = {
+                let groups = &editor.menu.as_ref().unwrap().groups;
+                crate::render::menu_bar_layout(area, groups).into_iter()
+                    .find(|(_, r)| ev.column >= r.x && ev.column < r.x + r.width && ev.row == r.y)
+                    .map(|(cat, _)| cat)
+            };
+            let row_id: Option<crate::registry::CommandId> = {
+                let groups = &editor.menu.as_ref().unwrap().groups;
+                crate::render::menu_dropdown_row_at(area, groups, open, ev.column, ev.row)
+                    .and_then(|row| groups.get(open).and_then(|g| g.1.get(row)).map(|(_, id)| *id))
+            };
+            // all borrows dropped — now mutate/dispatch/clear
+            if let Some(cat) = bar_hit {
                 let m = editor.menu.as_mut().unwrap(); m.open = cat; m.highlighted = 0;
-            } else if let Some(row) = crate::render::menu_dropdown_row_at(area, groups, editor.menu.as_ref().unwrap().open, ev.column, ev.row) {
-                let open = editor.menu.as_ref().unwrap().open;
-                if let Some((_, id)) = editor.menu.as_ref().unwrap().groups.get(open).and_then(|g| g.1.get(row)).copied().map(|x| ((), x.1)) {
-                    crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
-                }
+            } else if let Some(id) = row_id {
+                crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
             } else {
                 editor.menu = None; // outside → close
             }
