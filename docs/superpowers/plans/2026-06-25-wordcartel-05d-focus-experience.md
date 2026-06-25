@@ -199,23 +199,23 @@ struct RawView {
         if let Some(a) = raw.view.typewriter_anchor {
             if (0.0..=1.0).contains(&a) { cfg.view.typewriter_anchor = a; }
             else { cfg.view.typewriter_anchor = a.clamp(0.0, 1.0);
-                   warnings.push(format!("view.typewriter_anchor {a} out of 0.0..=1.0; clamped")); }
+                   warns.push(format!("view.typewriter_anchor {a} out of 0.0..=1.0; clamped")); }
         }
         if let Some(c) = raw.view.wrap_column {
             if c >= 20 { cfg.view.wrap_column = c; }
             else { cfg.view.wrap_column = 20;
-                   warnings.push(format!("view.wrap_column {c} below min 20; clamped to 20")); }
+                   warns.push(format!("view.wrap_column {c} below min 20; clamped to 20")); }
         }
         if let Some(g) = raw.view.focus_granularity {
             match g.as_str() {
                 "paragraph" => cfg.view.focus_granularity = FocusGranularity::Paragraph,
                 "sentence"  => cfg.view.focus_granularity = FocusGranularity::Sentence,
-                other => warnings.push(format!("view.focus_granularity \"{other}\" invalid; using paragraph")),
+                other => warns.push(format!("view.focus_granularity \"{other}\" invalid; using paragraph")),
             }
         }
 ```
 
-   (Match the real `warnings` variable name in `load()` — it returns `(Config, Vec<String>)`.)
+   (The real accumulator in load() is named `warns` — config.rs:153 — it returns `(Config, Vec<String>)`.)
   - `editor.rs` — `pub view_opts: crate::config::ViewConfig` on `Editor` (init `crate::config::ViewConfig::default()` in `new_from_text`).
   - `app.rs` — seed after the mouse seed (app.rs:886): `editor.view_opts = cfg.view.clone();`.
   - `registry.rs` — register (after the existing View-category commands):
@@ -223,12 +223,12 @@ struct RawView {
 ```rust
         r.register("toggle_typewriter", "Toggle Typewriter", Some(MenuCategory::View), |c| { c.editor.view_opts.typewriter = !c.editor.view_opts.typewriter; CommandResult::Handled });
         r.register("toggle_focus",      "Toggle Focus Mode", Some(MenuCategory::View), |c| { c.editor.view_opts.focus = !c.editor.view_opts.focus; CommandResult::Handled });
-        r.register("toggle_measure",    "Toggle Centered Measure", Some(MenuCategory::View), |c| { c.editor.view_opts.measure = !c.editor.view_opts.measure; c.editor.active_mut().view.line_layouts.clear(); CommandResult::Handled });
+        r.register("toggle_measure",    "Toggle Centered Measure", Some(MenuCategory::View), |c| { c.editor.view_opts.measure = !c.editor.view_opts.measure; crate::derive::rebuild(c.editor); CommandResult::Handled });
         r.register("toggle_wrap_guide", "Toggle Wrap Guide", Some(MenuCategory::View), |c| { c.editor.view_opts.wrap_guide = !c.editor.view_opts.wrap_guide; CommandResult::Handled });
         r.register("toggle_word_count", "Toggle Word Count", Some(MenuCategory::View), |c| { c.editor.view_opts.word_count = !c.editor.view_opts.word_count; CommandResult::Handled });
 ```
 
-   (`toggle_measure` clears `line_layouts` so the next `derive::rebuild` re-wraps at the new width — Task 3 makes the width depend on `measure`.)
+   (`toggle_measure` calls `derive::rebuild` (which clears + repopulates `line_layouts`) so the cache re-wraps at the new width immediately — Codex Critical: registry-dispatched commands are NOT auto-followed by a rebuild (app.rs:705), and render reads only the cache (no on-demand fallback), so a width change without a rebuild blanks the editing rows. Task 3 makes the width depend on `measure`; until then this rebuild is inert but correct.)
 
 - [ ] **Step 4: Run tests + suite.** `cargo test -p wordcartel --lib config:: registry::` → PASS; `cargo test --workspace` → green; `cargo build --workspace` → zero warnings. (Several `view_opts` fields are read only in Tasks 3-7 → no `#[allow(dead_code)]` needed since the struct is public + constructed.)
 
@@ -244,7 +244,7 @@ git commit -m "feat(view): [view] config + ViewConfig validation + view_opts + 5
 ## Task 3: The keystone — centered measure (`text_geometry` threaded everywhere)
 
 **Files:**
-- Modify: `wordcartel/src/nav.rs` (`text_geometry`, `offset_at_cell`), `wordcartel/src/derive.rs` (`rebuild` width), `wordcartel/src/render.rs` (paint rect + cursor)
+- Modify: `wordcartel/src/nav.rs` (`text_geometry`, `offset_at_cell`), `wordcartel/src/derive.rs` (`rebuild` width + drop unused `area_width`), `wordcartel/src/render.rs` (paint rect + cursor), `wordcartel/src/app.rs` (pre-draw `derive::rebuild` before the in-loop draw)
 - Test: `wordcartel/src/nav.rs`
 
 **Interfaces:**
@@ -307,8 +307,9 @@ pub fn text_geometry(editor: &Editor) -> TextGeometry {
 
   - `nav.rs` — the two on-demand layout sites (nav.rs:40 and nav.rs:111) change `let vp_width = (editor.active().view.area.0 as usize).max(1);` → `let vp_width = text_geometry(editor).text_width as usize;`.
   - `nav.rs` — `offset_at_cell(editor, col, row)` (nav.rs:672): subtract `text_left` from the incoming `col` as the FIRST step, so the rest of the function works in text-relative columns: `let text_left = text_geometry(editor).text_left; let col = col.saturating_sub(text_left);` (a click left of the column → 0 = line start; the existing visual_to_source clamps the right side to the line end).
-  - `derive.rs` — `rebuild`: replace `let vp_width = area_width.max(1);` (derive.rs:130) with `let vp_width = crate::nav::text_geometry(editor).text_width as usize;` (compute it before the cache-clear/loop; it returns an owned value so no borrow conflict with the later `active_mut()`).
+  - `derive.rs` — `rebuild`: replace `let vp_width = area_width.max(1);` (derive.rs:130) with `let vp_width = crate::nav::text_geometry(editor).text_width as usize;` (compute it before the cache-clear/loop; it returns an owned value so no borrow conflict with the later `active_mut()`). **Codex Important — remove the now-unused `area_width` binding** from the tuple destructured at derive.rs:115-128 (it was only used by the line you're replacing; leaving it triggers an unused-variable warning, violating zero-warnings). Keep `area_height` (still used for `overscan_budget`).
   - `render.rs` — compute `let tg = crate::nav::text_geometry(editor);` once; change each visible-row paint rect from `Rect::new(area.x, edit_top + screen_row, w, 1)` (render.rs:167) to `Rect::new(area.x + tg.text_left, edit_top + screen_row, tg.text_width, 1)`; and the hardware-cursor placement (render.rs:252-253) from `area.x + col` to `area.x + tg.text_left + col`.
+  - **`app.rs` — pre-draw rebuild (Codex Critical, fixes BOTH the measure-toggle and the typewriter blanking):** render reads only the layout cache (no on-demand fallback, render.rs:132-140) and registry-dispatched commands are not auto-followed by a rebuild (app.rs:705). A width change (measure) or a big scroll jump (typewriter, Task 5) leaves the cache stale → blank editing rows. Add `derive::rebuild(&mut editor);` immediately **before the in-loop `guard.terminal().draw(|f| render::render(f, &mut editor))?;`** (the in-loop draw ~app.rs:1050, next to the existing `recompute_scrollbar_visible` call) so the cache always matches the final `(scroll, text_width)` before paint. (The pre-loop draw at app.rs:919 already rebuilds first. This one extra rebuild per processed message is cheap — one layout pass of ≈ visible-height lines — and the loop only draws after a message, so no busy-spin.) This makes the per-command rebuilds redundant-but-harmless and is the single fix that lets typewriter (Task 5) and `toggle_measure` render correctly.
 
 - [ ] **Step 4: Run tests + suite.** `cargo test -p wordcartel --lib nav:: render::` → PASS; `cargo test --workspace` → green (the existing screen_pos/offset_at_cell/render tests still pass with measure OFF — the default); `cargo build --workspace` → zero warnings.
 
@@ -348,7 +349,7 @@ git commit -m "feat(view): centered measure — text_geometry threaded through d
 
 - [ ] **Step 2: Run to verify failure.** `cargo test -p wordcartel --lib render::tests::wrap_guide` → FAIL.
 
-- [ ] **Step 3: Implement** in `render.rs` (after the text rows are painted, before/under the cursor): when `editor.view_opts.wrap_guide`, compute `gx = area.x + tg.text_left + editor.view_opts.wrap_column`; if `gx < area.x + w` AND (scrollbar hidden OR `gx != area.x + w - 1`), paint a dim `│` at column `gx` for each editing row (`Rect::new(gx, edit_top + r, 1, 1)` with a `DarkGray` styled `│`, for `r in 0..edit_height`). Text already painted at those cells (Task 3) overwrites the guide where they coincide — paint the guide BEFORE the text rows, or only on cells the text doesn't occupy. Simplest: paint the guide line FIRST (before the row loop) so text overwrites it; a guide cell with no text shows through.
+- [ ] **Step 3: Implement** in `render.rs`: when `editor.view_opts.wrap_guide`, compute `gx = area.x + tg.text_left + editor.view_opts.wrap_column`; if `gx < area.x + w` AND (scrollbar hidden OR `gx != area.x + w - 1`), paint a dim `│` at column `gx` for each editing row (`Rect::new(gx, edit_top + r, 1, 1)` with a `DarkGray` styled `│`, for `r in 0..edit_height`). **Where the guide lands (Codex Minor):** with the measure ON, `text_width == wrap_column` so `gx = text_left + wrap_column` is the column *just past* the text rect's right edge (in the right margin) — the intended "boundary marker after the last text column", not over text. With the measure OFF (`text_left = 0`), `gx = wrap_column` falls *within* the full-width text, so the guide can sit under text. **Paint the guide line FIRST (before the row loop)** so any coinciding text cell overwrites it; a guide cell with no text shows through.
 
 - [ ] **Step 4: Run tests + suite.** `cargo test -p wordcartel --lib render::` → PASS; `cargo test --workspace` → green; zero warnings.
 
@@ -421,7 +422,7 @@ git commit -m "feat(view): wrap-guide line (shares wrap_column; skips scrollbar/
     // ... existing minimal-scroll body unchanged ...
 ```
 
-(Walking all logical lines for `caret_abs` is O(lines-before-caret); acceptable for v1. If a huge-doc perf issue ever appears, cap the walk — not needed now. The `target_top` naturally clamps at 0 via `saturating_sub`; near the bottom the caret drifts below the anchor because `target_top` can exceed the last valid top, which the `for` loop bounds to the last line — the deliberate v1 boundary behavior.)
+(Walking all logical lines for `caret_abs` is O(lines-before-caret); acceptable for v1. If a huge-doc perf issue ever appears, cap the walk — not needed now. The `target_top` naturally clamps at 0 via `saturating_sub`; near the bottom the caret drifts below the anchor because `target_top` can exceed the last valid top, which the `for` loop bounds to the last line — the deliberate v1 boundary behavior. `rows_of_line`/`caret_visual_row` lay out uncached lines on demand, so this computation works even when the cache doesn't yet cover the caret. **The typewriter branch only sets `scroll`/`scroll_row` and returns — it does NOT rebuild; the Task-3 pre-draw `derive::rebuild` (app.rs in-loop, before the draw) repopulates the cache for the new viewport. Without that pre-draw rebuild a big typewriter jump would blank the screen — so Task 3 must land its pre-draw rebuild for typewriter to render correctly in production.** The Task-5 test rebuilds explicitly after `ensure_visible`, so it passes regardless.)
 
 - [ ] **Step 4: Run tests + suite.** `cargo test -p wordcartel --lib nav::` → PASS; `cargo test --workspace` → green (typewriter OFF default → existing ensure_visible tests unchanged); zero warnings.
 
