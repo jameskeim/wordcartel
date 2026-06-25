@@ -16,7 +16,7 @@
 - **Degrade, never abort:** a missing/bad config or state file warns (status line) and falls back to defaults; the editor always starts and always edits. Never `unwrap` on config/state IO.
 - **Resolve through the registry:** keymap chords map to `CommandId`s resolved/validated via `Registry::resolve_name`; the in-memory keymap never holds an id the registry doesn't know.
 - **Esc precedence (exact):** prompt-dismiss > minibuffer-dismiss > pending-sequence-cancel > filter-cancel > normal keymap dispatch. Opening a prompt/minibuffer clears `pending_keys`. A pending sequence can only exist in normal mode.
-- **Config keymap shape (serde-native):** `KeymapConfig { preset: Option<String>, bind: BTreeMap<String,String>, unbind: Vec<String> }`. `preset` resolved across all layers first (last wins) → base; then all layers' `bind`/`unbind` apply in precedence order. Unknown keys silently ignored (forward-compat, no `deny_unknown_fields`).
+- **Config keymap shape (serde-native):** per-layer raw `RawKeymap { preset: Option<String>, bind: BTreeMap<String,String>, unbind: Vec<String> }`; folded into `KeymapConfig { preset: String, patches: Vec<KeymapPatch> }` where `patches` is one ordered entry per layer. `preset` resolved across all layers first (last set wins) → base; then each layer's `bind`/`unbind` apply **in precedence order** (so a high layer's bind beats a low layer's unbind). State + preset merge **per-field** (an omitted field inherits the lower layer, never resets to default). Unknown keys silently ignored (forward-compat, no `deny_unknown_fields`).
 - **Config precedence:** built-in `<` XDG `~/.config/wordcartel/config.toml` `<` project-local `.wordcartel.toml` (anchor = initial CLI file's parent dir, else CWD) `<` `--config <path>`. `--no-config` → built-ins only.
 - **Session state:** path-keyed (canonical abs path) `{cursor,scroll,marks,mtime,size}` in the XDG state dir; restore only if mtime+size match (else discard); debounced write on save/quit (not per keystroke); LRU prune at `max_entries` (default 200); scratch buffers not persisted; atomic write via `save_atomic_bytes`.
 - `cargo build --workspace` zero warnings; not-yet-wired items carry scoped `#[allow(dead_code)]` with a `// wired in Task N` note. No prior test weakened.
@@ -90,11 +90,13 @@ git commit -m "feat(registry): Borrow<str> for CommandId + resolve_name(&str) fo
 **Interfaces:**
 - Produces:
   - `pub struct Cli { pub path: Option<PathBuf>, pub config_path: Option<PathBuf>, pub no_config: bool }` + `pub fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> Cli` (skips argv[0]).
-  - `pub struct Config { pub keymap: KeymapConfig, pub state: StateConfig }` (`#[derive(Default)]`).
-  - `pub struct KeymapConfig { pub preset: Option<String>, pub bind: BTreeMap<String,String>, pub unbind: Vec<String> }`.
+  - `pub struct Config { pub keymap: KeymapConfig, pub state: StateConfig }` (resolved/folded result).
+  - `pub struct KeymapConfig { pub preset: String, pub patches: Vec<KeymapPatch> }` — `preset` is the final-merged base name (default `"cua"`); `patches` is the **ordered** (lowest→highest precedence) per-layer patch list, applied in order by `build_keymap` (Task 3). **This preserves cross-layer precedence** — a low layer's `unbind` can't clobber a high layer's later `bind`.
+  - `pub struct KeymapPatch { pub bind: BTreeMap<String,String>, pub unbind: Vec<String> }` (one layer's chord changes).
   - `pub struct StateConfig { pub resume: bool, pub max_entries: usize }` (defaults: `resume=true`, `max_entries=200`).
+  - Internal raw types (per-layer deserialize, all fields optional so an omitted key inherits rather than resets): `RawConfig { keymap: RawKeymap, state: RawState }`, `RawKeymap { preset: Option<String>, bind: BTreeMap<String,String>, unbind: Vec<String> }`, `RawState { resume: Option<bool>, max_entries: Option<usize> }`.
   - `pub fn config_layer_paths(cli: &Cli, xdg_config_dir: Option<&Path>, anchor_dir: &Path) -> Vec<PathBuf>` — the ordered EXISTING config files (XDG, project-local `.wordcartel.toml` nearest walking up from `anchor_dir`, `--config`), or empty when `cli.no_config`.
-  - `pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>)` — parse each layer (lowest→highest precedence), fold into `Config`, returning warnings (parse errors). Built-in defaults are the starting point.
+  - `pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>)` — parse each layer (lowest→highest), **per-field** fold (a field is overridden only when the layer sets it), returning warnings.
 
 - [ ] **Step 1: Add deps + module.** In `wordcartel/Cargo.toml` `[dependencies]`:
 ```toml
@@ -131,15 +133,19 @@ mod tests {
     }
 
     #[test]
-    fn later_layers_override_state_and_accumulate_binds() {
+    fn later_layers_override_per_field_and_keep_ordered_patches() {
         let d = tempdir();
-        let lo = write(&d, "lo.toml", "[state]\nmax_entries = 50\n[keymap]\npreset='cua'\nbind={ \"ctrl-a\"='move_line_start' }\n");
-        let hi = write(&d, "hi.toml", "[state]\nmax_entries = 99\n[keymap]\npreset='wordstar'\nbind={ \"ctrl-b\"='move_left' }\n");
+        // lo sets BOTH state fields + a bind; hi sets ONLY max_entries (omits resume) + preset + a bind.
+        let lo = write(&d, "lo.toml", "[state]\nresume=false\nmax_entries=50\n[keymap]\npreset='cua'\nbind={ \"ctrl-a\"='move_line_start' }\n");
+        let hi = write(&d, "hi.toml", "[state]\nmax_entries=99\n[keymap]\npreset='wordstar'\nbind={ \"ctrl-b\"='move_left' }\n");
         let (cfg, warns) = load(&[lo, hi]);
         assert!(warns.is_empty());
-        assert_eq!(cfg.state.max_entries, 99);                 // last wins
-        assert_eq!(cfg.keymap.preset.as_deref(), Some("wordstar")); // last wins
-        assert!(cfg.keymap.bind.contains_key("ctrl-a") && cfg.keymap.bind.contains_key("ctrl-b")); // accumulate
+        assert_eq!(cfg.state.max_entries, 99, "hi set it → wins");
+        assert_eq!(cfg.state.resume, false, "hi OMITTED resume → lo's false is preserved (NOT reset to default true)");
+        assert_eq!(cfg.keymap.preset, "wordstar", "final-merged preset");
+        assert_eq!(cfg.keymap.patches.len(), 2, "one ordered patch per layer");
+        assert!(cfg.keymap.patches[0].bind.contains_key("ctrl-a"));
+        assert!(cfg.keymap.patches[1].bind.contains_key("ctrl-b"));
     }
 
     #[test]
@@ -148,7 +154,8 @@ mod tests {
         assert!(warns.is_empty());
         assert!(cfg.state.resume);
         assert_eq!(cfg.state.max_entries, 200);
-        assert!(cfg.keymap.bind.is_empty());
+        assert_eq!(cfg.keymap.preset, "cua");
+        assert!(cfg.keymap.patches.is_empty());
     }
 
     #[test]
@@ -198,22 +205,32 @@ pub fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> Cli {
     cli
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
-#[serde(default)]
+// --- Resolved (folded) config the rest of the app consumes ---
+#[derive(Debug, Default, Clone)]
 pub struct Config { pub keymap: KeymapConfig, pub state: StateConfig }
 
-#[derive(Debug, Default, Clone, Deserialize)]
-#[serde(default)]
-pub struct KeymapConfig {
-    pub preset: Option<String>,
-    pub bind: BTreeMap<String, String>,
-    pub unbind: Vec<String>,
-}
+#[derive(Debug, Clone)]
+pub struct KeymapConfig { pub preset: String, pub patches: Vec<KeymapPatch> }
+impl Default for KeymapConfig { fn default() -> Self { KeymapConfig { preset: "cua".into(), patches: Vec::new() } } }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Default)]
+pub struct KeymapPatch { pub bind: BTreeMap<String, String>, pub unbind: Vec<String> }
+
+#[derive(Debug, Clone)]
 pub struct StateConfig { pub resume: bool, pub max_entries: usize }
 impl Default for StateConfig { fn default() -> Self { StateConfig { resume: true, max_entries: 200 } } }
+
+// --- Raw per-layer deserialize: every field optional so an OMITTED key inherits
+//     the lower layer rather than resetting it to a default (Codex plan-review fix) ---
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawConfig { keymap: RawKeymap, state: RawState }
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawKeymap { preset: Option<String>, bind: BTreeMap<String, String>, unbind: Vec<String> }
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawState { resume: Option<bool>, max_entries: Option<usize> }
 
 /// Ordered existing config files, lowest→highest precedence. Empty when --no-config.
 pub fn config_layer_paths(cli: &Cli, xdg_config_dir: Option<&Path>, anchor_dir: &Path) -> Vec<PathBuf> {
@@ -237,33 +254,33 @@ pub fn config_layer_paths(cli: &Cli, xdg_config_dir: Option<&Path>, anchor_dir: 
     v
 }
 
-/// Parse + fold layers into a Config. `state` fields & `preset` last-wins;
-/// `bind`/`unbind` accumulate in precedence order.
+/// Parse + fold layers (lowest→highest precedence) into a resolved Config.
+/// PER-FIELD merge: `preset` & each `state` field override only when the layer
+/// SETS them (Option); `patches` keeps one ordered entry per layer so
+/// build_keymap applies them in precedence order (Codex plan-review fix).
 pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
     let mut cfg = Config::default();
     let mut warns = Vec::new();
-    let mut state_seen = false;
     for p in paths {
         let text = match std::fs::read_to_string(p) {
             Ok(t) => t,
             Err(e) => { warns.push(format!("config: cannot read {}: {e}", p.display())); continue; }
         };
-        let raw: Config = match toml::from_str(&text) {
+        let raw: RawConfig = match toml::from_str(&text) {
             Ok(r) => r,
             Err(e) => { warns.push(format!("config: parse error in {}: {e}", p.display())); continue; }
         };
-        // keymap: preset last-wins; bind/unbind accumulate.
-        if raw.keymap.preset.is_some() { cfg.keymap.preset = raw.keymap.preset; }
-        cfg.keymap.bind.extend(raw.keymap.bind);
-        cfg.keymap.unbind.extend(raw.keymap.unbind);
-        // state: last layer that sets [state] wins as a block (simple + predictable).
-        cfg.state = raw.state; state_seen = true;
+        // keymap: preset overrides only if set; each layer contributes ONE ordered patch.
+        if let Some(p) = raw.keymap.preset { cfg.keymap.preset = p; }
+        cfg.keymap.patches.push(KeymapPatch { bind: raw.keymap.bind, unbind: raw.keymap.unbind });
+        // state: per-field override (omitted field inherits the lower layer).
+        if let Some(r) = raw.state.resume { cfg.state.resume = r; }
+        if let Some(m) = raw.state.max_entries { cfg.state.max_entries = m; }
     }
-    let _ = state_seen;
     (cfg, warns)
 }
 ```
-**Implementer notes:** (a) `#[serde(default)]` on each struct means a layer omitting a section/field gets defaults — so a layer that doesn't set `[state]` deserializes to `StateConfig::default()`; the "last `[state]` wins as a block" above is acceptable for v1 (state has only 2 fields). If you prefer per-field state merge, fold field-by-field — but keep it simple unless a test needs otherwise. (b) `toml = "0.8"` + `serde` derive; confirm versions.
+**Implementer notes:** (a) Parsing into `RawConfig` (Option fields) is what makes per-field merge possible — `#[serde(default)]` alone can't distinguish "set to the default value" from "omitted". (b) An empty patch (a layer with no `bind`/`unbind`) is harmless in the `patches` vec; build_keymap skips empties. (c) `toml = "0.8"` + `serde` derive; confirm versions.
 
 - [ ] **Step 5: Run tests + suite.** `cargo test -p wordcartel --lib config::tests` → pass; `cargo test --workspace` green; zero warnings. (`config_layer_paths`/`Cli`/`Config` unused in production until Task 5 → scoped `#[allow(dead_code)] // wired in Task 5`.)
 
@@ -301,11 +318,40 @@ mod tests {
 
     fn km(bind: &[(&str,&str)], unbind: &[&str], preset: Option<&str>) -> (KeyTrie, Vec<String>) {
         let cfg = crate::config::KeymapConfig {
-            preset: preset.map(String::from),
-            bind: bind.iter().map(|(k,v)| (k.to_string(), v.to_string())).collect(),
-            unbind: unbind.iter().map(|s| s.to_string()).collect(),
+            preset: preset.unwrap_or("cua").to_string(),
+            patches: vec![crate::config::KeymapPatch {
+                bind: bind.iter().map(|(k,v)| (k.to_string(), v.to_string())).collect(),
+                unbind: unbind.iter().map(|s| s.to_string()).collect(),
+            }],
         };
         build_keymap(&cfg, &Registry::builtins())
+    }
+
+    #[test]
+    fn cross_layer_high_bind_beats_low_unbind() {
+        // CRITICAL fix: low layer unbinds ctrl-c, high layer re-binds it → bound (high wins).
+        let cfg = crate::config::KeymapConfig {
+            preset: "cua".into(),
+            patches: vec![
+                crate::config::KeymapPatch { bind: Default::default(), unbind: vec!["ctrl-c".into()] }, // low
+                crate::config::KeymapPatch { bind: [("ctrl-c".to_string(), "copy".to_string())].into_iter().collect(), unbind: vec![] }, // high
+            ],
+        };
+        let (t, _) = build_keymap(&cfg, &Registry::builtins());
+        let c = parse_chord("ctrl-c").unwrap();
+        assert!(matches!(t.resolve(&[c]), Resolution::Command(CommandId("copy"))), "high-layer bind beats low-layer unbind");
+    }
+
+    #[test]
+    fn shift_char_normalizes_identically_in_event_and_config() {
+        use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
+        // crossterm delivers a shifted letter as Char('Z') + SHIFT (+ CONTROL).
+        let ev = KeyEvent { code: KeyCode::Char('Z'), modifiers: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE };
+        let from_ev = from_key_event(ev).unwrap();
+        let from_cfg = parse_chord("ctrl-shift-z").unwrap();
+        assert_eq!(from_ev, from_cfg, "event + config chord must normalize the same way");
+        assert_eq!(from_cfg, KeyChord { code: KeyCode::Char('Z'), mods: KeyModifiers::CONTROL });
     }
 
     #[test]
@@ -384,11 +430,22 @@ pub struct KeyChord { pub code: KeyCode, pub mods: KeyModifiers }
 
 pub fn from_key_event(k: KeyEvent) -> Option<KeyChord> {
     if k.kind != KeyEventKind::Press { return None; }
-    // Normalize: drop the SHIFT bit for Char (shift is encoded in the char itself);
-    // keep CONTROL/ALT. (Match how key_to_command_id reads modifiers today.)
-    let mut mods = k.modifiers;
-    if let KeyCode::Char(_) = k.code { mods.remove(KeyModifiers::SHIFT); }
-    Some(KeyChord { code: k.code, mods })
+    Some(normalize(k.code, k.modifiers))
+}
+
+/// Normalize a (code, mods) so config chords and live events agree (Codex fix):
+/// for a char, SHIFT is folded into the char itself (uppercase) and the SHIFT
+/// bit is dropped; CONTROL/ALT are kept. crossterm delivers a shifted letter as
+/// `Char('Z') + SHIFT`, so we uppercase + strip SHIFT on BOTH sides.
+fn normalize(code: KeyCode, mods: KeyModifiers) -> KeyChord {
+    match code {
+        KeyCode::Char(c) => {
+            let c = if mods.contains(KeyModifiers::SHIFT) { c.to_ascii_uppercase() } else { c };
+            let mut m = mods; m.remove(KeyModifiers::SHIFT);
+            KeyChord { code: KeyCode::Char(c), mods: m }
+        }
+        other => KeyChord { code: other, mods },
+    }
 }
 
 pub fn parse_chord(s: &str) -> Option<KeyChord> {
@@ -408,8 +465,7 @@ pub fn parse_chord(s: &str) -> Option<KeyChord> {
         c if c.chars().count() == 1 => KeyCode::Char(c.chars().next().unwrap()),
         _ => return None,
     };
-    if let KeyCode::Char(_) = code { mods.remove(KeyModifiers::SHIFT); } // normalize like from_key_event
-    Some(KeyChord { code, mods })
+    Some(normalize(code, mods)) // same normalization as from_key_event (uppercase+strip SHIFT for chars)
 }
 
 pub fn parse_seq(s: &str) -> Option<Vec<KeyChord>> {
@@ -418,8 +474,9 @@ pub fn parse_seq(s: &str) -> Option<Vec<KeyChord>> {
 
 pub enum Resolution { Command(CommandId), Pending, None }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct KeyTrie { map: HashMap<Vec<KeyChord>, CommandId> } // exact-seq → cmd
+// (Debug+Clone required because `Editor` derives them and stores a KeyTrie — Task 5.)
 
 impl KeyTrie {
     fn insert(&mut self, seq: Vec<KeyChord>, id: CommandId) { self.map.insert(seq, id); }
@@ -454,20 +511,24 @@ static WORDSTAR: &[(&str, &str)] = &[
 pub fn build_keymap(km: &crate::config::KeymapConfig, reg: &Registry) -> (KeyTrie, Vec<String>) {
     let mut warns = Vec::new();
     let mut trie = KeyTrie::default();
-    let preset = km.preset.as_deref().unwrap_or("cua");
-    let base = preset_bindings(preset).unwrap_or_else(|| {
-        warns.push(format!("config: unknown keymap.preset '{preset}', using 'cua'"));
+    // 1) Preset base (the final-merged preset name was resolved across all layers in config::load).
+    let base = preset_bindings(&km.preset).unwrap_or_else(|| {
+        warns.push(format!("config: unknown keymap.preset '{}', using 'cua'", km.preset));
         preset_bindings("cua").unwrap()
     });
-    let mut apply = |chord: &str, id_str: &str, warns: &mut Vec<String>, trie: &mut KeyTrie| {
+    let apply_bind = |chord: &str, id_str: &str, warns: &mut Vec<String>, trie: &mut KeyTrie| {
         let Some(seq) = parse_seq(chord) else { warns.push(format!("config: bad chord '{chord}'")); return; };
         let Some(id) = reg.resolve_name(id_str) else { warns.push(format!("config: '{chord}' → unknown command '{id_str}'")); return; };
         trie.insert(seq, id);
     };
-    for (chord, id) in base { apply(chord, id, &mut warns, &mut trie); } // base never warns in tests (preset-integrity)
-    for (chord, id) in &km.bind { apply(chord, id, &mut warns, &mut trie); }
-    for chord in &km.unbind {
-        match parse_seq(chord) { Some(seq) => trie.remove(&seq), None => warns.push(format!("config: bad unbind chord '{chord}'")) }
+    for (chord, id) in base { apply_bind(chord, id, &mut warns, &mut trie); } // preset-integrity test guarantees no warns here
+    // 2) Apply each layer's patch IN PRECEDENCE ORDER (lowest→highest) so a high
+    //    layer's bind overrides a low layer's bind/unbind (Codex CRITICAL fix).
+    for patch in &km.patches {
+        for (chord, id) in &patch.bind { apply_bind(chord, id, &mut warns, &mut trie); }
+        for chord in &patch.unbind {
+            match parse_seq(chord) { Some(seq) => trie.remove(&seq), None => warns.push(format!("config: bad unbind chord '{chord}'")) }
+        }
     }
     (trie, warns)
 }
@@ -525,8 +586,9 @@ git commit -m "feat(keymap): KeyTrie multi-key resolution + cua/wordstar presets
         use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
         use crossterm::event::{KeyCode, KeyModifiers};
         // bind a 2-key save sequence
-        let cfg = crate::config::KeymapConfig { preset: Some("cua".into()),
-            bind: [("ctrl-k ctrl-s".to_string(), "save".to_string())].into_iter().collect(), unbind: vec![] };
+        let cfg = crate::config::KeymapConfig { preset: "cua".into(),
+            patches: vec![crate::config::KeymapPatch {
+                bind: [("ctrl-k ctrl-s".to_string(), "save".to_string())].into_iter().collect(), unbind: vec![] }] };
         let (km, _) = crate::keymap::build_keymap(&cfg, &Registry::builtins());
         let mut e = Editor::new_from_text("x\n", Some("/tmp/wc-kmtest.md".into()), (80, 24));
         let (tx,_rx)=std::sync::mpsc::channel();
@@ -543,8 +605,9 @@ git commit -m "feat(keymap): KeyTrie multi-key resolution + cua/wordstar presets
     fn esc_cancels_pending_without_other_effect() {
         use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
         use crossterm::event::{KeyCode, KeyModifiers};
-        let cfg = crate::config::KeymapConfig { preset: Some("cua".into()),
-            bind: [("ctrl-k ctrl-s".to_string(), "save".to_string())].into_iter().collect(), unbind: vec![] };
+        let cfg = crate::config::KeymapConfig { preset: "cua".into(),
+            patches: vec![crate::config::KeymapPatch {
+                bind: [("ctrl-k ctrl-s".to_string(), "save".to_string())].into_iter().collect(), unbind: vec![] }] };
         let (km, _) = crate::keymap::build_keymap(&cfg, &Registry::builtins());
         let mut e = Editor::new_from_text("abc\n", None, (80, 24));
         let before = e.active().document.buffer.to_string();
@@ -578,11 +641,19 @@ git commit -m "feat(keymap): KeyTrie multi-key resolution + cua/wordstar presets
   - In the **normal-mode** key arm (the one that currently calls `input::key_to_command_id` → `reg.dispatch`), replace with:
 ```rust
         Msg::Input(Event::Key(k)) if k.kind == crossterm::event::KeyEventKind::Press => {
-            // Esc precedence: prompt/minibuffer Esc handled in their interception blocks
-            // ABOVE this point. Here (normal mode), Esc first cancels a pending sequence.
-            if k.code == crossterm::event::KeyCode::Esc && !editor.pending_keys.is_empty() {
-                editor.pending_keys.clear();
-                editor.status.clear(); // drop the pending indicator
+            // Esc precedence (Codex CRITICAL): prompt/minibuffer Esc are handled in their
+            // interception blocks ABOVE this point. Here in normal mode the order is
+            // pending-cancel > filter-cancel. This arm SUBSUMES the old standalone
+            // filter-cancel Esc check (remove that separate check — it must NOT run before
+            // pending-cancel). Esc is reserved for cancel/dismiss in v1 (not routed to the keymap).
+            if k.code == crossterm::event::KeyCode::Esc {
+                if !editor.pending_keys.is_empty() {
+                    editor.pending_keys.clear();
+                    editor.status.clear(); // drop the pending indicator
+                } else if editor.filter_in_flight.is_some() {
+                    editor.filter_in_flight.take().unwrap().cancel(); // existing filter-cancel, now sequenced AFTER pending-cancel
+                    editor.status = "cancelling…".into();
+                }
             } else if let Some(chord) = crate::keymap::from_key_event(k) {
                 editor.pending_keys.push(chord);
                 match keymap.resolve(&editor.pending_keys) {
@@ -612,7 +683,7 @@ git commit -m "feat(keymap): KeyTrie multi-key resolution + cua/wordstar presets
             }
         }
 ```
-**Implementer notes:** (a) `chords_display(&[KeyChord]) -> String` renders the pending prefix (e.g. `"ctrl-k"`); add a small helper in keymap.rs (inverse of `parse_chord`, good enough for the indicator). (b) Confirm the exact existing insert path — today an unbound printable goes through `key_to_command_id` → `KeyAction::Insert(c)` → some insert. Reuse that EXACT path (likely `Command::InsertChar(c)` via `commands::run`, or whatever the current arm does) so behavior is identical. (c) **Esc precedence:** ensure this normal-mode arm runs AFTER the existing `editor.prompt.is_some()` and `editor.minibuffer.is_some()` interception blocks (which already consume Esc + return). Also: where a prompt/minibuffer is OPENED, clear `editor.pending_keys` (add `editor.pending_keys.clear()` at those open sites, or assert pending is empty — pending only accrues in normal mode, but be defensive). (d) Borrow care: `reg.dispatch` needs `&mut Ctx` holding `&mut editor`; structure so `editor.pending_keys`/`status` mutations and the `Ctx` borrow don't overlap (clear pending BEFORE building Ctx, as shown).
+**Implementer notes:** (a) `chords_display(&[KeyChord]) -> String` renders the pending prefix (e.g. `"ctrl-k"`); add a small helper in keymap.rs (inverse of `parse_chord`, good enough for the indicator). (b) The printable fallthrough is **confirmed** (Codex): today an unbound printable → `KeyAction::Insert(c)` → `Command::InsertChar(c)` via `commands::run`, which does the rebuild + ensure-visible + `desired_col` reset; the sketch's `commands::run(Command::InsertChar(c), editor, clock)` reuses that exact path. (c) **Esc precedence (CRITICAL):** this normal-mode arm runs AFTER the `editor.prompt.is_some()` and `editor.minibuffer.is_some()` interception blocks (which already consume Esc + return). **Delete the pre-existing standalone filter-cancel Esc check** — the Esc handling is now entirely in this arm, ordered pending-cancel → filter-cancel. Also clear `editor.pending_keys` wherever a prompt/minibuffer is OPENED (defensive; pending only accrues in normal mode). (d) Borrow care: `reg.dispatch` needs `&mut Ctx` holding `&mut editor`; clear pending/status BEFORE building `Ctx` (as shown).
 
 - [ ] **Step 5: Retire the legacy key path** (`input.rs` / tests). The production dispatch no longer calls `input::key_to_command_id`. Either delete `key_to_command_id` (if nothing else uses it) or `#[cfg(test)]`-gate it; rewrite the legacy `key_to_command`/`step` test helper to drive `reduce` with the keymap (so the duplicate CUA table doesn't rot). Keep `KeyAction` only if still referenced. (Confirm what `step`/`key_to_command` are used by and migrate them.)
 
@@ -645,9 +716,11 @@ git commit -m "feat(keymap): resolve keys through the trie in reduce (pending se
         // We can't run the TUI loop in a test, so test the startup builder in isolation:
         // a helper that turns (Cli-derived paths) into the effective keymap.
         let cfg = crate::config::KeymapConfig {
-            preset: Some("cua".into()),
-            bind: [("ctrl-g".to_string(), "move_line_start".to_string())].into_iter().collect(),
-            unbind: vec![],
+            preset: "cua".into(),
+            patches: vec![crate::config::KeymapPatch {
+                bind: [("ctrl-g".to_string(), "move_line_start".to_string())].into_iter().collect(),
+                unbind: vec![],
+            }],
         };
         let (km, warns) = crate::keymap::build_keymap(&cfg, &crate::registry::Registry::builtins());
         assert!(warns.is_empty());
@@ -713,7 +786,7 @@ git commit -m "feat(config): wire CLI → layered config → built keymap into r
 **Interfaces:**
 - Consumes: `swap::state_dir`, `file::save_atomic_bytes`, `toml`/`serde`.
 - Produces:
-  - `pub struct StateEntry { pub cursor: usize, pub scroll: usize, pub marks: BTreeMap<char,usize>, pub mtime: i64, pub size: u64, pub seq: u64 }`.
+  - `pub struct StateEntry { pub cursor: usize, pub scroll: usize, pub marks: BTreeMap<String,usize>, pub mtime: i64, pub size: u64, pub seq: u64 }`. **`marks` keys are single-char Strings, NOT `char`** (Codex CRITICAL: `toml` rejects non-string map keys). The mark/jump commands (5c) convert `char`↔single-char `String` at the app boundary; 5a only stores/loads the map.
   - `pub struct SessionState { pub entries: BTreeMap<String, StateEntry> }` (key = canonical abs path string).
   - `pub fn load() -> SessionState` (tolerate corrupt → empty); `SessionState::record(&mut self, path, entry, max_entries)` (insert + LRU-prune by `seq`); `pub fn save(&self) -> std::io::Result<()>` (TOML → `save_atomic_bytes` into `state_dir()/session.toml`).
   - `pub fn file_identity(path: &Path) -> Option<(i64, u64)>` (mtime secs + size) for the staleness guard.
@@ -777,7 +850,7 @@ use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StateEntry { pub cursor: usize, pub scroll: usize,
-    pub marks: BTreeMap<char, usize>, pub mtime: i64, pub size: u64, pub seq: u64 }
+    pub marks: BTreeMap<String, usize>, pub mtime: i64, pub size: u64, pub seq: u64 } // String keys (toml has no char keys)
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionState { pub entries: BTreeMap<String, StateEntry> }
@@ -793,8 +866,10 @@ impl SessionState {
         }
     }
     pub fn save_in(&self, dir: &Path) -> std::io::Result<()> {
-        let bytes = toml::to_string(self).unwrap_or_default().into_bytes();
-        crate::file::save_atomic_bytes(&dir.join("session.toml"), &bytes)
+        // Propagate serialization errors (Codex fix: do NOT silently drop state via unwrap_or_default).
+        let text = toml::to_string(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("session serialize: {e}")))?;
+        crate::file::save_atomic_bytes(&dir.join("session.toml"), text.as_bytes())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
     }
     pub fn save(&self) -> std::io::Result<()> { self.save_in(&crate::swap::state_dir()?) }
@@ -828,9 +903,29 @@ pub fn apply_resume(e: &crate::state::StateEntry, current: (i64,u64), doc_len: u
     Some((e.cursor.min(doc_len), e.scroll))
 }
 ```
-In `run()`: after loading the document, if `cfg.state.resume` and the file has a path, look up `session.entries[canonical_path]`, compute `file_identity`, call `apply_resume`, and if `Some((cur,scroll))` set the editor cursor + scroll. On each successful **save** and on **quit**, write the active file's entry (cursor/scroll, marks (empty in 5a), current `file_identity`, bumped `seq`) via `record(.., cfg.state.max_entries)` + `save()`. Load the `SessionState` once at startup. (Mark the seq counter with a monotonic `editor`/run-loop counter; persisted `seq` only needs to be monotonic across a run for LRU.)
+In `run()`: load the `SessionState` once at startup. After loading the document, if `cfg.state.resume` and the file has a canonical path, look up `session.entries[path]`, compute `file_identity`, call `apply_resume`, and if `Some((cur,scroll))` set the editor cursor + scroll.
 
-**Implementer notes:** (a) canonicalize the path with `std::fs::canonicalize` (fall back to the path as-is if it fails, e.g. a not-yet-saved new file → don't persist). (b) Scratch (no path) → never recorded. (c) Persisting "on save and on quit" satisfies the spec's debounced policy without a timer; do NOT write per keystroke. (d) Restore must clamp scroll too if your view requires it; cursor clamp shown.
+**Persistence happens in the `run()` LOOP and at quit — NOT inside `reduce` (Codex IMPORTANT).** Save-success is observed via the document's `saved_version` (4b's saved/dirty model), which `reduce`→`apply_result` advances internally; the loop can detect it without threading session state through `reduce`:
+```rust
+    let mut last_persisted_saved = editor.active().saved_version;
+    loop {
+        // … recv msg …
+        let keep = reduce(msg, &mut editor, &reg, &keymap, &executor, &clock, &msg_tx);
+        // … draw, clipboard drain, etc. …
+        // Persist session state when a save just completed (saved_version advanced).
+        let sv = editor.active().saved_version;
+        if sv != last_persisted_saved {
+            persist_session(&mut session, &editor, &cfg);   // record active entry + session.save()
+            last_persisted_saved = sv;
+        }
+        if !keep { break; }
+    }
+    // On clean quit: persist once more (cursor moved since the last save).
+    persist_session(&mut session, &editor, &cfg);
+```
+where `persist_session` records the active file's entry — `{cursor, scroll, marks (empty in 5a), file_identity(path), seq: next_seq()}` via `session.record(canonical_path, entry, cfg.state.max_entries)` then best-effort `session.save()` (a write error → status warning, never blocks quit).
+
+**Implementer notes:** (a) confirm the `saved_version` field name on the document (4b); if the save model exposes a different "saved" signal, watch that instead — the principle is "persist when a save completes + at quit," never per keystroke. (b) canonicalize via `std::fs::canonicalize` (fall back / skip if it fails — e.g. a not-yet-saved new file → don't persist). (c) Scratch (no path) → never recorded. (d) `seq` is a monotonic run-loop counter (only needs to be monotonic within a run for LRU). (e) clamp scroll too if the view requires it.
 
 - [ ] **Step 5: Run tests + suite.** `cargo test --workspace` → all pass; `cargo build --workspace` zero warnings.
 
@@ -845,6 +940,8 @@ git commit -m "feat(state): path-keyed session store — resume-at-position (mti
 ## Self-Review (5a)
 
 **Spec coverage:** §2 modules/deps (all tasks; toml/serde T2); §3 config load + precedence + `--config`/`--no-config` (T2) + project-local anchor (T2/T5); §4 keymap trie + multi-key + presets + patch-merge + pending + Esc precedence (T3 engine, T4 integration); §5.1 CommandId Borrow/resolve_name (T1); §5.2 replace key_to_command_id + Press guard + printable fallthrough + legacy retirement (T3/T4); §6 session state + mtime/size staleness + resume + prune + atomic + scratch-skip (T6); §7 degrade-don't-abort (warnings throughout); §9 tests (each task). ✅
+
+**Codex plan-review fixes applied (4 critical + 2 important):** (1) per-field config merge via `RawConfig` Option fields — an omitted `[state]` field inherits the lower layer instead of resetting to default (T2); (2) ordered `Vec<KeymapPatch>` (one per layer) applied in precedence order in `build_keymap` — a high layer's bind beats a low layer's unbind (T2/T3, `cross_layer_high_bind_beats_low_unbind` test); (3) Esc precedence folded into the normal-mode arm (pending-cancel → filter-cancel; the standalone filter-cancel Esc check is removed) (T4); (4) `marks: BTreeMap<String,usize>` (toml has no char keys) + `save_in` propagates serialize errors (T6); SHIFT normalization shared by `from_key_event`/`parse_chord` (uppercase + strip SHIFT for chars) with a matching test (T3); `KeyTrie` derives `Debug,Clone,Default` so it can live on `Editor` (T3/T5); session persistence driven by a `saved_version` watch in the `run()` loop + at quit, not inside `reduce` (T6). Codex confirmed T1's `Borrow<str>` lookup and T4's `InsertChar` fallthrough are correct as written.
 
 **Codex spec-review fixes reflected:** Esc precedence pinned (T4 Step 4 — normal-mode Esc cancels pending only after prompt/minibuffer blocks); serde-native `preset`/`bind`/`unbind` shape (T2); `Borrow<str>`+`resolve_name` (T1); Press guard in `from_key_event` (T3); project-local anchor = CLI-file parent/CWD (T5); preset resolved-before-patch (T3 `build_keymap`); mtime+size staleness guard (T6 `apply_resume`); real CLI parser (T2 `parse_cli`); legacy test-keymap retired (T4 Step 5); bundled-preset id-validation test (T3 `both_presets_resolve_against_builtins`).
 
