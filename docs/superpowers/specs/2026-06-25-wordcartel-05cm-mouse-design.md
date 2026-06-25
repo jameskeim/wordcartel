@@ -28,19 +28,20 @@ No new dependencies.
 
 | Unit | Responsibility | Depends on |
 |------|----------------|-----------|
-| **`wordcartel/src/mouse.rs`** (new) | All mouse-event handling: coord translation, click/drag/wheel, multi-click, scrollbar drag, overlay hit-testing. | `nav::offset_at_cell`, `commands::scope_range`/`SelectScope`, `dispatch_overlay_command`, render geometry helpers |
-| `wordcartel/src/term.rs` (extend) | `EnableMouseCapture` in setup; `DisableMouseCapture` at all 3 teardown sites. | crossterm |
+| **`wordcartel/src/mouse.rs`** (new) | All mouse-event handling: coord translation, click/drag/wheel, multi-click, scrollbar drag, palette hit-testing + outside-dismiss. | `nav::offset_at_cell`, `commands::scope_range_at`/`Scope`, `dispatch_overlay_command`, render geometry helpers |
+| `wordcartel/src/term.rs` (extend) | `TerminalGuard::new(enable_mouse)` runs `EnableMouseCapture` in setup when enabled; `DisableMouseCapture` at all 3 teardown sites. | crossterm |
+| `wordcartel/src/commands.rs` (extend) | `pub fn scope_range_at(editor, offset, Scope)` (existing private `scope_range` delegates). | 5c textobj/nav |
 | `wordcartel/src/editor.rs` (extend) | `Editor.mouse_capture: bool`; `Editor.mouse: MouseState`. | — |
-| `wordcartel/src/app.rs` (extend) | `Msg::Input(Event::Mouse(ev))` arm → `mouse::handle`; `Tick` updates scrollbar-visible bool; main-loop `reconcile_mouse_capture`. | — |
-| `wordcartel/src/render.rs` (extend) | Render the auto-hiding scrollbar; **extract overlay-rect geometry into shared helpers** (`palette_overlay_rect`, `menu_bar_area`) so `render` and `mouse` agree (DRY — no drift). | ratatui Scrollbar |
+| `wordcartel/src/app.rs` (extend) | `Msg::Input(Event::Mouse(ev))` arm → `mouse::handle`; recompute `scrollbar_visible`; main-loop `reconcile_mouse_capture` (post-guard + per-iteration) + feed `scrollbar_until_ms` into the loop's `recv_timeout` deadline. | — |
+| `wordcartel/src/render.rs` (extend) | Render the auto-hiding scrollbar; **extract overlay geometry into shared helpers** (`palette_overlay_rect`, `palette_row_at`, `menu_bar_area`) so `render` and `mouse` agree (DRY — no drift). | ratatui Scrollbar |
 | `wordcartel/src/config.rs` (extend) | `mouse.capture: bool` (default `true`). | 5a config |
 | `wordcartel/src/registry.rs` / `keymap.rs` (extend) | `toggle_mouse_capture` command (palette-only, no default chord). | 5b registry |
 
 ## 4. Capture lifecycle & the escape hatch
 
-- **Setup (`term.rs`):** add `EnableMouseCapture` to the guard's setup `execute!` (after `EnableBracketedPaste`, term.rs:40). **Teardown:** add `DisableMouseCapture` to all three cleanup `execute!` calls (term.rs:46, 62, 82) so a panic/exit always releases the mouse.
-- **Config:** `mouse.capture` (RawConfig `Option<bool>`, default `true`, merged per the 5a layered-config pattern). On startup the initial capture state follows the config.
-- **Toggle:** `toggle_mouse_capture` command flips `editor.mouse_capture`. The **main loop reconciles** the flag with the terminal — mirroring `drain_clipboard_intents` (app.rs:1039): a `reconcile_mouse_capture(&mut editor, terminal.backend_mut(), &mut applied)` call compares `editor.mouse_capture` to the last-applied state and runs `execute!(Enable/DisableMouseCapture)` on change. (The command can't do terminal IO itself — the guard owns stdout — so it only sets the flag.)
+- **Config:** `mouse.capture` (RawConfig `Option<bool>`, default `true`, merged per the 5a layered-config pattern). The config-resolved value seeds `editor.mouse_capture` at startup.
+- **Setup honors the config (Codex Important — `TerminalGuard::new()` is unconditional today):** `TerminalGuard::new(enable_mouse: bool)` takes the initial capture state; it runs `EnableMouseCapture` in the setup `execute!` (after `EnableBracketedPaste`, term.rs:40) **only when `enable_mouse`**. So `mouse.capture = false` is honored from the first frame — capture is never silently on while idle. **Teardown:** add `DisableMouseCapture` to all three cleanup `execute!` calls (term.rs:46 panic hook, 62, 82) so a panic/exit always releases the mouse (harmless if capture was never enabled).
+- **Toggle:** `toggle_mouse_capture` command flips `editor.mouse_capture` (sets the flag only — it can't do terminal IO; the guard owns stdout). The **main loop reconciles** the flag with the terminal — mirroring `drain_clipboard_intents` (app.rs:1039): `reconcile_mouse_capture(&mut editor, terminal.backend_mut(), &mut applied)` compares `editor.mouse_capture` to the last-applied `bool` and runs `execute!(backend, Enable/DisableMouseCapture)` on change (valid: `backend_mut()` is a `CrosstermBackend: Write`). It is called once **immediately after the guard is constructed (before the first draw)** AND each loop iteration, so both the config-seeded initial state and runtime toggles are applied promptly. **When capture transitions OFF, `reconcile_mouse_capture` clears the drag state** (`mouse.dragging`/`scrollbar_dragging`/`anchor` → reset) so no `Up` event is awaited that will never arrive (Codex Minor).
 - **Escape hatch:** with capture **off**, the terminal's native click-drag-select-and-copy works normally. The spec/README documents that most emulators (kitty, foot, VTE, iTerm2, Windows Terminal) also let you hold **Shift** to bypass app capture for a one-off native drag without toggling.
 
 ## 5. Coordinate translation
@@ -57,13 +58,14 @@ classifies a point: `MenuBar` (row < menu_rows, menu open), `Status` (row == h-1
 
 Driven by `MouseEventKind` on `MouseButton::Left` (handler ignores Right; Middle is reserved for the deferred paste effort). All selection changes clear `sel_history` (consistent with 5c) except the multi-click ladder, which *seeds* it.
 
+- **Offset selection helper (Codex Important — `commands::scope_range` is private and caret-anchored):** add `pub fn commands::scope_range_at(editor: &Editor, offset: usize, scope: Scope) -> (usize, usize)` that computes a scope's range at an ARBITRARY `offset` (not `nav::head`); refactor the existing private `scope_range` to delegate (`scope_range(editor, scope) = scope_range_at(editor, nav::head(editor), scope)`). `mouse.rs` uses `scope_range_at` so double/triple-click select at the *clicked* offset, not the caret.
 - **Down(Left)** on Text:
-  - **Multi-click:** consult `MouseState.last_click = Option<{offset, at_ms, count}>`. If `clock.now_ms() - at_ms <= 400` and the new offset is on the same cell, increment `count`; else `count = 1`. Then:
+  - **Multi-click:** `MouseState.last_click = Option<{cell: (u16,u16), at_ms, count}>`. If `clock.now_ms() - at_ms <= 400` AND the new click is on the **same screen cell `(col,row)`** (compare cells, not offsets — resolves the §-intro wording), increment `count`; else `count = 1`. Then, with `offset = offset_at_cell(...)`:
     - `count == 1` → place caret: `Selection::single(offset)`, clear `sel_history`.
-    - `count == 2` → `select_word` at offset (via `commands::scope_range(.., Scope::Word)`), seed `sel_history`.
-    - `count == 3` → `select_paragraph` at offset, seed `sel_history`.
+    - `count == 2` → `Selection::range` from `scope_range_at(editor, offset, Scope::Word)`, seed `sel_history`.
+    - `count == 3` → `scope_range_at(editor, offset, Scope::Paragraph)`, seed `sel_history`.
     - `count >= 4` → wrap to `1` (place caret).
-  - Set `MouseState.anchor = Some(offset)`, `dragging = true`. Update `last_click`.
+  - Set `MouseState.anchor = Some(offset)`, `dragging = true`. Update `last_click` (cell + now_ms + count).
   - **Shift held** (`ev.modifiers` contains SHIFT) → *extend*: keep the current selection anchor, set head = clicked offset (`Selection::range(anchor, offset)`); does not start a fresh multi-click sequence.
 - **Drag(Left)** on Text (or past the edges): head = `offset_at_cell(clamped to area)`, `Selection::range(MouseState.anchor, head)`. **Edge auto-scroll:** if `row < edit_top` scroll up one line; if `row >= edit_top + edit_height` scroll down one line (then recompute head at the clamped edge row). `ensure_visible` is NOT called mid-drag (the drag itself drives scroll).
 - **Up(Left):** `dragging = false`; selection persists.
@@ -72,27 +74,34 @@ Driven by `MouseEventKind` on `MouseButton::Left` (handler ignores Right; Middle
 
 ## 7. Auto-hiding scrollbar
 
-- **Visibility:** `MouseState.scrollbar_until_ms` is set on every scroll/scrollbar-drag. The `Msg::Tick` handler sets a plain bool `MouseState.scrollbar_visible = clock.now_ms() < scrollbar_until_ms` each tick (so `render`, which has no clock, just reads the bool). Hidden by default; appears for ~1.2 s after the last scroll, then fades.
+- **Visibility:** `MouseState.scrollbar_until_ms` is set on every scroll/scrollbar-drag. A plain bool `MouseState.scrollbar_visible` is what `render` reads (render has no clock). The bool is recomputed (`scrollbar_visible = clock.now_ms() < scrollbar_until_ms`) whenever a message is processed (it is set true at scroll time, and re-evaluated on the next wake).
+- **Fade timing (Codex Important — the idle loop timeout is up to 1 hour, so `Tick` alone won't fire to fade it):** `scrollbar_until_ms` must feed the main loop's `recv_timeout` deadline calculation, alongside the existing swap/save deadlines (app.rs loop). So while the scrollbar is up, the loop wakes at the fade time, flips `scrollbar_visible = false`, and redraws — the scrollbar reliably disappears ~1.2 s after the last scroll even with no other activity. (If the loop's deadline plumbing makes adding a source costly, the fallback is to keep the scrollbar visible until the next input event — acceptable but less polished; the deadline approach is preferred.)
 - **Render:** when visible, a `ratatui::Scrollbar` (`ScrollbarOrientation::VerticalRight`) on the rightmost editing column, with `ScrollbarState` built from `view.scroll` (position) and `derive::total_logical_lines` (content length) — computed locally in `render`, no stored widget state.
 - **Drag/scrub:** a `Down`/`Drag(Left)` on the scrollbar column maps the row within the track to a scroll position proportionally (`scroll = (erow / edit_height) * max_scroll`), clamped. Sets the visibility window so it stays up during the drag. (Approximate against wrapped lines — acceptable for v1; the keyboard remains exact.)
 
 ## 8. Mouse on overlays
 
-When `editor.palette` or `editor.menu` is open, `mouse::handle` routes clicks against the overlay BEFORE the text area:
-- **Geometry (DRY):** extract the palette overlay rect and list-row layout (currently inline at render.rs:193-223) and the menu bar area (render.rs:246) into shared helpers in `render.rs` (`palette_overlay_rect(area) -> Rect`, `palette_row_at(area, col, row) -> Option<usize>`, `menu_bar_hit(area, col, row) -> Option<…>`). `render` and `mouse` both call them so a layout change can never desync hit-testing from the paint.
-- **Palette:** a `Down(Left)` inside the list area → the row index → dispatch that row's command via `dispatch_overlay_command` (5b — closes the overlay, dispatches, drains, hydrates). A click outside the overlay rect → close the palette. Scroll on the palette → move the selected row (optional; v1 may ignore).
-- **Menu:** a click on a top-level menu label → open/activate it through the existing `tui_menu::MenuState` nav; a click outside → close the menu. (If `tui-menu` 0.3 lacks usable mouse hit APIs, fall back to our own label hit-test → drive `MenuState`.)
-- A captured click while a modal is open therefore never feels dead.
+When `editor.palette` or `editor.menu` is open, `mouse::handle` routes clicks against the overlay BEFORE the text area.
+
+**Palette (fully clickable):**
+- **Geometry (DRY):** extract the palette overlay rect + list-row layout (currently inline at render.rs:193-223) into shared helpers in `render.rs` — `palette_overlay_rect(area) -> Rect` and `palette_row_at(area, palette, col, row) -> Option<usize>`. `render` and `mouse` both call them so a layout change can never desync hit-testing from the paint.
+- A `Down(Left)` inside the list area → the row index → dispatch that row's command via `dispatch_overlay_command` (5b — closes the overlay, dispatches, drains, hydrates). A click **outside** the overlay rect → close the palette.
+
+**Menu (click-outside-to-dismiss only — scoped down per Codex Important):** `tui-menu 0.3` exposes no mouse/hit API, and `MenuView` retains only `MenuState<CommandId>` + `built` (the grouped label model is discarded after `build`, and the dropdown geometry is internal to tui-menu and not queryable). So in-menu item clicking is **not feasible in 5c-m without replacing tui-menu's rendering with our own** (a larger change to 5b's menu, out of scope here). For 5c-m the menu stays **keyboard-driven** (F10 + arrows, as 5b), with one mouse affordance: a `Down(Left)` **outside the menu's drawn area** dismisses it (`menu_bar_area`, render.rs:246, exposed as a shared helper for the outside-test). Clicking a menu item is a documented non-goal for this effort; a follow-up can add full menu mouse by retaining the grouped model + self-rendering the dropdowns.
+
+A captured click while the palette is open dispatches/dismisses; while the menu is open it dismisses on an outside click — so a captured click is never fully dead.
 
 ## 9. State, error handling, edge cases
 
 - **`Editor` additions:** `pub mouse_capture: bool` (config-seeded) and `pub mouse: MouseState`, where `MouseState { anchor: Option<usize>, last_click: Option<ClickRecord>, dragging: bool, scrollbar_dragging: bool, scrollbar_until_ms: u64, scrollbar_visible: bool }`, `ClickRecord { offset: usize, at_ms: u64, count: u8 }`. The main loop tracks an `applied_mouse_capture: bool` for reconciliation.
-- Click past end-of-line / last line → `offset_at_cell` clamps to the line/content end (5c behavior).
+- **`pending_mark` guard (Codex Important):** the new `Msg::Input(Event::Mouse(_))` arm sits at the bottom of `reduce` (below the key/paste interceptors), so a mouse event during a mark-capture would otherwise be *handled* (the 5c `pending_mark` block only intercepts `Event::Key`). Therefore **`mouse::handle` early-returns when `editor.pending_mark.is_some()`** — a click during mark-capture is ignored; the capture still resolves on the next key.
+- **`offset_at_cell` None policy (Codex Minor):** `offset_at_cell` returns `None` when the click row is past rendered content (it does not clamp). On a `Text` hit that yields `None` (e.g. clicking below the last line), `mouse::handle` places the caret at **document end** (`clamp_snap(editor, buf.len())`) — the intuitive "click in the empty area below the text → go to end." A click that is `Outside`/`Status`/`MenuBar` (not a Text hit) is ignored (or routed per §8/§5).
+- Click past end-of-line (within a real content row) → `offset_at_cell` snaps to the line end (5c behavior).
 - Drag that produces an empty range (anchor == head) → a collapsed caret (fine).
 - Rapid clicks beyond triple wrap to single (count modulo).
 - Resize between events → coordinates recomputed per event from current `view.area`; no stale geometry.
-- Capture currently off → mouse events still arrive only if the terminal sends them; the handler early-returns when `!editor.mouse_capture` (defensive — though disabling capture stops the stream).
-- Overlay open + click: handled by §8 before text; `pending_mark` capture (5c) ignores mouse (it only consumes `Event::Key`), so a mouse event while a mark capture is pending falls through harmlessly — spec note: a click during mark-capture is ignored (capture resolves on the next *key*).
+- Capture off → the terminal stops sending mouse events; defensively, `mouse::handle` also early-returns when `!editor.mouse_capture`.
+- Toggling capture off mid-drag → `reconcile_mouse_capture` resets `MouseState` drag fields (§4), so no stuck `dragging`.
 
 ## 10. Testing strategy
 
@@ -104,9 +113,12 @@ When `editor.palette` or `editor.menu` is open, `mouse::handle` routes clicks ag
   - Wheel→`view.scroll` changes, `selection` (caret) unchanged.
   - Scrollbar drag→`view.scroll` proportional; `scrollbar_until_ms` set.
   - Palette open + click on a row→that command dispatched + palette closed; click outside→palette closed.
-  - `toggle_mouse_capture`→flips `editor.mouse_capture`.
-- **`term.rs`:** a guard test (or doc-asserted) that teardown includes `DisableMouseCapture` (mirrors the existing bracketed-paste teardown check).
-- **Tick:** `scrollbar_visible` flips false once `now_ms()` passes `scrollbar_until_ms`.
+  - Menu open + click outside→menu closed (in-menu item click is out of scope this effort).
+  - Mouse event while `pending_mark` is Some→ignored (no caret move, capture still pending).
+  - Click below all content (offset_at_cell None)→caret at document end.
+  - `toggle_mouse_capture`→flips `editor.mouse_capture`; toggling off mid-drag clears `MouseState` drag fields.
+- **`term.rs`:** a guard test (or doc-asserted) that teardown includes `DisableMouseCapture`, and that `TerminalGuard::new(false)` does not enable capture.
+- **Scrollbar visibility:** `scrollbar_visible` is false once `now_ms()` passes `scrollbar_until_ms`.
 - No pre-existing test weakened; full workspace green, zero warnings.
 
 ## 11. Module & command summary
@@ -115,8 +127,11 @@ When `editor.palette` or `editor.menu` is open, `mouse::handle` routes clicks ag
 - **New command:** `toggle_mouse_capture` (palette-only).
 - **New config:** `mouse.capture` (bool, default true).
 - **New `Editor` state:** `mouse_capture`, `mouse: MouseState`.
-- **Render extraction (DRY for hit-testing):** `palette_overlay_rect` / `palette_row_at` / `menu_bar_hit` shared between `render` and `mouse`.
-- **Reuses from 5c/5b:** `nav::offset_at_cell`, `commands::scope_range`/`Scope`, `sel_history` seeding, `dispatch_overlay_command`, `ensure_visible`, the scroll fields.
+- **New public helper:** `commands::scope_range_at(editor, offset, Scope)` (private `scope_range` delegates).
+- **Signature change:** `TerminalGuard::new(enable_mouse: bool)` (update its call site).
+- **Render extraction (DRY for hit-testing):** `palette_overlay_rect` / `palette_row_at` / `menu_bar_area` shared between `render` and `mouse`.
+- **Main-loop additions:** `reconcile_mouse_capture` (post-guard + per-iteration, clears drag state on off); `scrollbar_until_ms` fed into the `recv_timeout` deadline.
+- **Reuses from 5c/5b:** `nav::offset_at_cell`, `commands::scope_range_at`/`Scope`, `sel_history` seeding, `dispatch_overlay_command`, `ensure_visible`, the scroll fields.
 
 ## 12. Deliberate decisions (for review)
 
@@ -124,6 +139,8 @@ When `editor.palette` or `editor.menu` is open, `mouse::handle` routes clicks ag
 2. **Wheel scrolls the view, caret unchanged** — reading vs editing (§6).
 3. **Double=word, triple=paragraph**, seeding the 5c expand ladder; no quad-click (§6).
 4. **`toggle_mouse_capture` has no default keybinding** — rare power toggle; saves key space (§3).
-5. **Auto-hiding scrollbar, not always-on; overlays the last column while visible (no text reflow on scroll)** (§5/§7).
-6. **Overlay hit-test geometry extracted into shared render helpers** so paint and hit-testing can't desync (§8).
-7. **Middle-click paste deferred** to its own effort (§1).
+5. **Auto-hiding scrollbar, not always-on; overlays the last column while visible (no text reflow on scroll); fade driven by a loop `recv_timeout` deadline, not idle `Tick`** (§5/§7).
+6. **Palette is fully mouse-clickable via extracted shared render geometry; the menu is click-outside-to-dismiss only** — in-menu item clicking is deferred because `tui-menu 0.3` exposes no mouse/geometry API and `MenuView` discards its label model (Codex; §8). A follow-up can add full menu mouse by self-rendering the dropdowns.
+7. **Capture honored from frame 1** via `TerminalGuard::new(enable_mouse)` + a post-guard reconcile; toggling off clears drag state (§4).
+8. **Mouse ignored during `pending_mark` capture; click below content → caret to document end** (§9).
+9. **Middle-click paste deferred** to its own effort (§1).
