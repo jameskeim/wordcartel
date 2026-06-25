@@ -33,65 +33,127 @@ pub struct Ctx<'a> {
 
 pub type Handler = fn(&mut Ctx) -> CommandResult;
 
+// ── Command metadata ──────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MenuCategory { File, Edit, Format, View, Export }
+
+#[allow(dead_code)] // wired in Task 3/4
+pub const MENU_ORDER: [MenuCategory; 5] =
+    [MenuCategory::File, MenuCategory::Edit, MenuCategory::Format, MenuCategory::View, MenuCategory::Export];
+
+#[derive(Clone, Copy)]
+pub struct CommandMeta {
+    pub label: &'static str,
+    pub menu: Option<MenuCategory>,
+}
+
+// ── Registry ──────────────────────────────────────────────────────────────────
+
+struct CommandEntry {
+    id: CommandId,
+    handler: Handler,
+    meta: CommandMeta,
+}
+
 pub struct Registry {
-    map: HashMap<CommandId, Handler>,
+    entries: Vec<CommandEntry>,
+    index: HashMap<CommandId, usize>,
 }
 
 impl Registry {
+    fn register(&mut self, id: &'static str, label: &'static str, menu: Option<MenuCategory>, handler: Handler) {
+        let cid = CommandId(id);
+        self.index.insert(cid, self.entries.len());
+        self.entries.push(CommandEntry { id: cid, handler, meta: CommandMeta { label, menu } });
+    }
+
     pub fn builtins() -> Registry {
-        let mut map: HashMap<CommandId, Handler> = HashMap::new();
-        // Motions (collapse selection).
-        map.insert(CommandId("move_left"),  |c| run(c, Command::Move { dir: Dir::Left,  extend: false }));
-        map.insert(CommandId("move_right"), |c| run(c, Command::Move { dir: Dir::Right, extend: false }));
-        map.insert(CommandId("move_up"),    |c| run(c, Command::Move { dir: Dir::Up,    extend: false }));
-        map.insert(CommandId("move_down"),  |c| run(c, Command::Move { dir: Dir::Down,  extend: false }));
-        map.insert(CommandId("move_line_start"), |c| run(c, Command::Move { dir: Dir::LineStart, extend: false }));
-        map.insert(CommandId("move_line_end"),   |c| run(c, Command::Move { dir: Dir::LineEnd,   extend: false }));
-        // Selecting motions (extend).
-        map.insert(CommandId("select_left"),  |c| run(c, Command::Move { dir: Dir::Left,  extend: true }));
-        map.insert(CommandId("select_right"), |c| run(c, Command::Move { dir: Dir::Right, extend: true }));
-        map.insert(CommandId("select_up"),    |c| run(c, Command::Move { dir: Dir::Up,    extend: true }));
-        map.insert(CommandId("select_down"),  |c| run(c, Command::Move { dir: Dir::Down,  extend: true }));
-        map.insert(CommandId("select_line_start"), |c| run(c, Command::Move { dir: Dir::LineStart, extend: true }));
-        map.insert(CommandId("select_line_end"),   |c| run(c, Command::Move { dir: Dir::LineEnd,   extend: true }));
-        // Editing.
-        map.insert(CommandId("insert_newline"), |c| run(c, Command::InsertNewline));
-        map.insert(CommandId("backspace"),      |c| run(c, Command::Backspace));
-        map.insert(CommandId("delete_forward"), |c| run(c, Command::DeleteForward));
-        // Clipboard / history / view.
-        map.insert(CommandId("copy"),  |c| run(c, Command::Copy));
-        map.insert(CommandId("cut"),   |c| run(c, Command::Cut));
-        map.insert(CommandId("paste"), |c| run(c, Command::Paste));
-        map.insert(CommandId("undo"),  |c| run(c, Command::Undo));
-        map.insert(CommandId("redo"),  |c| run(c, Command::Redo));
-        map.insert(CommandId("cycle_render_mode"), |c| run(c, Command::CycleRenderMode));
-        // Save / quit. (Task 9: save is now a background job dispatcher.)
-        map.insert(CommandId("save"), |c| crate::save::dispatch_save(c));
-        map.insert(CommandId("quit"), |c| run(c, Command::Quit));
-        // Filter / minibuffer.
-        map.insert(CommandId("filter"), |c| {
+        let mut r = Registry { entries: Vec::new(), index: HashMap::new() };
+
+        // Motions (collapse selection) — palette-only (menu: None).
+        r.register("move_left",       "Move Left",       None, |c| run(c, Command::Move { dir: Dir::Left,      extend: false }));
+        r.register("move_right",      "Move Right",      None, |c| run(c, Command::Move { dir: Dir::Right,     extend: false }));
+        r.register("move_up",         "Move Up",         None, |c| run(c, Command::Move { dir: Dir::Up,        extend: false }));
+        r.register("move_down",       "Move Down",       None, |c| run(c, Command::Move { dir: Dir::Down,      extend: false }));
+        r.register("move_line_start", "Move Line Start", None, |c| run(c, Command::Move { dir: Dir::LineStart, extend: false }));
+        r.register("move_line_end",   "Move Line End",   None, |c| run(c, Command::Move { dir: Dir::LineEnd,   extend: false }));
+
+        // Selecting motions (extend) — palette-only (menu: None).
+        r.register("select_left",       "Select Left",       None, |c| run(c, Command::Move { dir: Dir::Left,      extend: true }));
+        r.register("select_right",      "Select Right",      None, |c| run(c, Command::Move { dir: Dir::Right,     extend: true }));
+        r.register("select_up",         "Select Up",         None, |c| run(c, Command::Move { dir: Dir::Up,        extend: true }));
+        r.register("select_down",       "Select Down",       None, |c| run(c, Command::Move { dir: Dir::Down,      extend: true }));
+        r.register("select_line_start", "Select Line Start", None, |c| run(c, Command::Move { dir: Dir::LineStart, extend: true }));
+        r.register("select_line_end",   "Select Line End",   None, |c| run(c, Command::Move { dir: Dir::LineEnd,   extend: true }));
+
+        // Editing — palette-only (menu: None).
+        r.register("insert_newline", "Insert Newline",   None, |c| run(c, Command::InsertNewline));
+        r.register("backspace",      "Backspace",        None, |c| run(c, Command::Backspace));
+        r.register("delete_forward", "Delete Forward",   None, |c| run(c, Command::DeleteForward));
+
+        // Edit menu.
+        r.register("copy",  "Copy",  Some(MenuCategory::Edit), |c| run(c, Command::Copy));
+        r.register("cut",   "Cut",   Some(MenuCategory::Edit), |c| run(c, Command::Cut));
+        r.register("paste", "Paste", Some(MenuCategory::Edit), |c| run(c, Command::Paste));
+        r.register("undo",  "Undo",  Some(MenuCategory::Edit), |c| run(c, Command::Undo));
+        r.register("redo",  "Redo",  Some(MenuCategory::Edit), |c| run(c, Command::Redo));
+        r.register("filter", "Filter…", Some(MenuCategory::Edit), |c| {
             c.editor.open_minibuffer("> ");
             CommandResult::Handled
         });
-        // Export (pandoc presets).
-        map.insert(CommandId("export_html"), |c| {
-            crate::export::run_export(c.editor, "html", &c.msg_tx);
-            CommandResult::Handled
-        });
-        map.insert(CommandId("export_docx"), |c| {
-            crate::export::run_export(c.editor, "docx", &c.msg_tx);
-            CommandResult::Handled
-        });
-        map.insert(CommandId("export_pdf"), |c| {
-            crate::export::run_export(c.editor, "pdf", &c.msg_tx);
-            CommandResult::Handled
-        });
-        // Transform chooser.
-        map.insert(CommandId("transform"), |c| {
+
+        // File menu.
+        r.register("save", "Save", Some(MenuCategory::File), |c| crate::save::dispatch_save(c));
+        r.register("quit", "Quit", Some(MenuCategory::File), |c| run(c, Command::Quit));
+
+        // View menu.
+        r.register("cycle_render_mode", "Cycle Render Mode", Some(MenuCategory::View), |c| run(c, Command::CycleRenderMode));
+        r.register("transform", "Transform…", Some(MenuCategory::View), |c| {
             c.editor.prompt = Some(crate::prompt::Prompt::transform_chooser());
             CommandResult::Handled
         });
-        Registry { map }
+
+        // Export menu.
+        r.register("export_html", "Export HTML", Some(MenuCategory::Export), |c| {
+            crate::export::run_export(c.editor, "html", &c.msg_tx);
+            CommandResult::Handled
+        });
+        r.register("export_docx", "Export DOCX", Some(MenuCategory::Export), |c| {
+            crate::export::run_export(c.editor, "docx", &c.msg_tx);
+            CommandResult::Handled
+        });
+        r.register("export_pdf", "Export PDF", Some(MenuCategory::Export), |c| {
+            crate::export::run_export(c.editor, "pdf", &c.msg_tx);
+            CommandResult::Handled
+        });
+
+        // Format menu — discrete transform commands (Task 1 / Effort 5b).
+        r.register("reflow", "Reflow", Some(MenuCategory::Format), |c| {
+            crate::transform::dispatch_transform(c.editor, crate::transform::TransformKind::Reflow, c.clock, &c.msg_tx);
+            CommandResult::Handled
+        });
+        r.register("unwrap", "Unwrap", Some(MenuCategory::Format), |c| {
+            crate::transform::dispatch_transform(c.editor, crate::transform::TransformKind::Unwrap, c.clock, &c.msg_tx);
+            CommandResult::Handled
+        });
+        r.register("ventilate", "Ventilate", Some(MenuCategory::Format), |c| {
+            crate::transform::dispatch_transform(c.editor, crate::transform::TransformKind::Ventilate, c.clock, &c.msg_tx);
+            CommandResult::Handled
+        });
+
+        r
+    }
+
+    /// Dispatch by id. Unknown ids surface a status (never a silent no-op, §12.5).
+    pub fn dispatch(&self, id: CommandId, ctx: &mut Ctx) -> CommandResult {
+        match self.index.get(&id) {
+            Some(&i) => (self.entries[i].handler)(ctx),
+            None => {
+                ctx.editor.status = format!("unknown command: {}", id.0);
+                CommandResult::Noop
+            }
+        }
     }
 
     /// Resolve a runtime command-id string to the registry's stored `CommandId`
@@ -99,18 +161,19 @@ impl Registry {
     /// None if no command with that name is registered.
     #[allow(dead_code)] // wired in Task 3
     pub fn resolve_name(&self, name: &str) -> Option<CommandId> {
-        self.map.get_key_value(name).map(|(id, _)| *id)
+        self.index.get_key_value(name).map(|(id, _)| *id)
     }
 
-    /// Dispatch by id. Unknown ids surface a status (never a silent no-op, §12.5).
-    pub fn dispatch(&self, id: CommandId, ctx: &mut Ctx) -> CommandResult {
-        match self.map.get(&id) {
-            Some(handler) => handler(ctx),
-            None => {
-                ctx.editor.status = format!("unknown command: {}", id.0);
-                CommandResult::Noop
-            }
-        }
+    /// Look up metadata for a registered command.
+    #[allow(dead_code)] // wired in Task 3/4
+    pub fn meta(&self, id: CommandId) -> Option<&CommandMeta> {
+        self.index.get(&id).map(|&i| &self.entries[i].meta)
+    }
+
+    /// Iterate registered commands in insertion order, yielding (id, meta) pairs.
+    #[allow(dead_code)] // wired in Task 3/4
+    pub fn commands(&self) -> impl Iterator<Item = (CommandId, &CommandMeta)> {
+        self.entries.iter().map(|e| (e.id, &e.meta))
     }
 }
 
@@ -128,6 +191,39 @@ mod tests {
 
     struct Z;
     impl Clock for Z { fn now_ms(&self) -> u64 { 0 } }
+
+    #[test]
+    fn commands_iterate_in_registration_order_with_meta() {
+        let reg = Registry::builtins();
+        let ids: Vec<&str> = reg.commands().map(|(id, _)| id.0).collect();
+        // deterministic + stable across calls
+        let ids2: Vec<&str> = reg.commands().map(|(id, _)| id.0).collect();
+        assert_eq!(ids, ids2);
+        // every command has a non-empty label
+        assert!(reg.commands().all(|(_, m)| !m.label.is_empty()));
+        // a known command's meta
+        let cut = reg.meta(CommandId("cut")).unwrap();
+        assert_eq!(cut.label, "Cut");
+        assert_eq!(cut.menu, Some(MenuCategory::Edit));
+    }
+
+    #[test]
+    fn transforms_are_registered_commands_in_format_category() {
+        let reg = Registry::builtins();
+        for (id, cat) in [("reflow","Reflow"), ("unwrap","Unwrap"), ("ventilate","Ventilate")] {
+            let m = reg.meta(CommandId(id)).unwrap_or_else(|| panic!("missing {id}"));
+            assert_eq!(m.menu, Some(MenuCategory::Format));
+            assert_eq!(m.label, cat);
+            assert!(reg.resolve_name(id).is_some());
+        }
+    }
+
+    #[test]
+    fn resolve_name_and_dispatch_still_work_after_refactor() {
+        let reg = Registry::builtins();
+        assert_eq!(reg.resolve_name("save"), Some(CommandId("save")));
+        assert_eq!(reg.resolve_name("nope"), None);
+    }
 
     #[test]
     fn dispatch_save_id_runs_save_handler() {
