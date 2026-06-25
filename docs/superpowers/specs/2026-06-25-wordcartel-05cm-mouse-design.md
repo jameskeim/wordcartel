@@ -20,9 +20,10 @@ Make the mouse genuinely useful **without** displacing the keyboard-first, text-
 
 ## 2. Crate & widget posture
 
-No new dependencies.
+No new dependencies — and 5c-m **removes** one (`tui-menu`, see §8).
 - **`crossterm` (0.28, present):** `event::{EnableMouseCapture, DisableMouseCapture, MouseEvent, MouseEventKind, MouseButton}`. Once capture is enabled, the existing input thread already forwards `Event::Mouse` as `Msg::Input` — today it lands in `reduce`'s `Msg::Input(_) => {}` no-op (app.rs:764); 5c-m adds the handling arm.
-- **`ratatui` (0.29, present):** `widgets::{Scrollbar, ScrollbarState, ScrollbarOrientation}` for rendering the scrollbar. Drag hit-testing is ours.
+- **`ratatui` (0.29, present):** ratatui is a pure immediate-mode renderer with **no interactive/clickable widgets and no event system** (verified: its 0.29 widget set is block/paragraph/list/table/tabs/gauge/chart/barchart/sparkline/scrollbar/calendar/canvas/clear/logo — none handle input). "Clickable" therefore means *we own the `Rect` and hit-test mouse coords ourselves* (exactly how the palette already works). 5c-m uses `widgets::{Scrollbar, ScrollbarState, ScrollbarOrientation}` for the scrollbar and `widgets::{List, Block, Clear, Paragraph}` for the self-rendered menu (§8).
+- **`tui-menu` (=0.3.0) — REMOVED:** it has no mouse/hit API and hides its dropdown geometry, so 5c-m replaces it with a self-rendered menu and drops the dependency + its version pin (§8).
 
 ## 3. Architecture & modules
 
@@ -33,7 +34,9 @@ No new dependencies.
 | `wordcartel/src/commands.rs` (extend) | `pub fn scope_range_at(editor, offset, Scope)` (existing private `scope_range` delegates). | 5c textobj/nav |
 | `wordcartel/src/editor.rs` (extend) | `Editor.mouse_capture: bool`; `Editor.mouse: MouseState`. | — |
 | `wordcartel/src/app.rs` (extend) | `Msg::Input(Event::Mouse(ev))` arm → `mouse::handle`; recompute `scrollbar_visible`; main-loop `reconcile_mouse_capture` (post-guard + per-iteration) + feed `scrollbar_until_ms` into the loop's `recv_timeout` deadline. | — |
-| `wordcartel/src/render.rs` (extend) | Render the auto-hiding scrollbar; **extract overlay geometry into shared helpers** (`palette_overlay_rect`, `palette_row_at`, `menu_bar_area`) so `render` and `mouse` agree (DRY — no drift). | ratatui Scrollbar |
+| `wordcartel/src/menu.rs` (rewrite) | Self-rendered shallow menu: `MenuView { groups, open, highlighted, built }`; drop `tui-menu`/`MenuState`. | render geometry helpers |
+| `wordcartel/src/render.rs` (extend) | Auto-hiding scrollbar; self-render the menu bar+dropdown; **shared geometry helpers** (`palette_overlay_rect`, `palette_row_at`, `menu_bar_layout`, `menu_dropdown_rect`, `menu_dropdown_row_at`) so `render` and `mouse` agree (DRY — no drift). | ratatui Scrollbar/List/Clear |
+| `wordcartel/Cargo.toml` (edit) | Remove `tui-menu = "=0.3.0"`. | — |
 | `wordcartel/src/config.rs` (extend) | `mouse.capture: bool` (default `true`). | 5a config |
 | `wordcartel/src/registry.rs` / `keymap.rs` (extend) | `toggle_mouse_capture` command (palette-only, no default chord). | 5b registry |
 
@@ -87,9 +90,14 @@ When `editor.palette` or `editor.menu` is open, `mouse::handle` routes clicks ag
 - **Geometry (DRY):** extract the palette overlay rect + list-row layout (currently inline at render.rs:193-223) into shared helpers in `render.rs` — `palette_overlay_rect(area) -> Rect` and `palette_row_at(area, palette, col, row) -> Option<usize>`. `render` and `mouse` both call them so a layout change can never desync hit-testing from the paint.
 - A `Down(Left)` inside the list area → the row index → dispatch that row's command via `dispatch_overlay_command` (5b — closes the overlay, dispatches, drains, hydrates). A click **outside** the overlay rect → close the palette.
 
-**Menu (click-outside-to-dismiss only — scoped down per Codex Important):** `tui-menu 0.3` exposes no mouse/hit API, and `MenuView` retains only `MenuState<CommandId>` + `built` (the grouped label model is discarded after `build`, and the dropdown geometry is internal to tui-menu and not queryable). So in-menu item clicking is **not feasible in 5c-m without replacing tui-menu's rendering with our own** (a larger change to 5b's menu, out of scope here). For 5c-m the menu stays **keyboard-driven** (F10 + arrows, as 5b), with one mouse affordance: a `Down(Left)` **outside the menu's drawn area** dismisses it (`menu_bar_area`, render.rs:246, exposed as a shared helper for the outside-test). Clicking a menu item is a documented non-goal for this effort; a follow-up can add full menu mouse by retaining the grouped model + self-rendering the dropdowns.
+**Menu — self-rendered, fully clickable (replaces `tui-menu`):** `tui-menu 0.3` exposes no mouse/hit API and hides its dropdown geometry, so 5c-m **drops `tui-menu` and renders the menu with ratatui primitives** (the palette pattern — ratatui has no interactive widgets; "clickable" = we own the `Rect`s and hit-test them). The menu is *shallow* (categories → flat command lists, no nested submenus) and `menu::grouped_commands` (menu.rs:48) already builds the model, so this is bounded.
 
-A captured click while the palette is open dispatches/dismisses; while the menu is open it dismisses on an outside click — so a captured click is never fully dead.
+- **`MenuView` (rewritten, menu.rs):** `MenuView { groups: Vec<(MenuCategory, Vec<(String, CommandId)>)>, open: usize, highlighted: usize, built: bool }` — `groups` from the existing `grouped_commands`; `open` = index of the open category's dropdown; `highlighted` = index within that dropdown. `build()` stores `groups`, `open = 0`, `highlighted = 0`; `empty()` has empty groups. Drop `menu_items_from_groups`, `MenuState`, and the `tui_menu` import. (`MenuView` becomes `Clone`; update the editor.rs:117 "not Clone" note — `Editor` may stay non-Clone, no need to re-derive.)
+- **Render (render.rs, replaces the `tui_menu::Menu` paint at render.rs:245-256):** paint the **bar row** (top row of `menu_area`) — category labels left-to-right with separators, the `open` category highlighted; and, below it, the **dropdown** for the `open` category (a `Clear` + `List` of its leaf labels, `highlighted` row reversed) at the open category's x-position. Layout via shared helpers so mouse agrees: `menu_bar_layout(area, &groups) -> Vec<(usize /*cat*/, Rect /*label*/)>` and `menu_dropdown_rect(area, &groups, open) -> Rect` + `menu_dropdown_row_at(area, &groups, open, col, row) -> Option<usize>`.
+- **Keyboard (app.rs, replaces the `MenuState` nav at app.rs:487-533 — behavior preserved):** `Esc`/`F10` → close; `Left`/`Right` → move `open` to prev/next category (wrap), reset `highlighted = 0`; `Up`/`Down` → move `highlighted` within `groups[open].1` (clamp); `Enter` → dispatch `groups[open].1[highlighted].1` via `dispatch_overlay_command`. The F10-opens / F10-toggles-closed behavior and the menu→palette cross-link are unchanged.
+- **Mouse (5c-m):** `Down(Left)` on a bar label (`menu_bar_layout` hit) → set `open` to that category, `highlighted = 0`; on a dropdown row (`menu_dropdown_row_at`) → dispatch that command via `dispatch_overlay_command`; **outside** both the bar and the open dropdown → close the menu.
+
+**Both overlays are now fully click + keyboard.** A captured click is never dead. Dropping `tui-menu` also removes the `=0.3.0` dependency pin (Cargo.toml).
 
 ## 9. State, error handling, edge cases
 
@@ -113,7 +121,8 @@ A captured click while the palette is open dispatches/dismisses; while the menu 
   - Wheel→`view.scroll` changes, `selection` (caret) unchanged.
   - Scrollbar drag→`view.scroll` proportional; `scrollbar_until_ms` set.
   - Palette open + click on a row→that command dispatched + palette closed; click outside→palette closed.
-  - Menu open + click outside→menu closed (in-menu item click is out of scope this effort).
+  - Menu open + click a bar label→that category's dropdown opens; click a dropdown item→that command dispatched + menu closed; click outside→menu closed.
+- **Menu keyboard parity (self-render must not regress 5b):** the existing menu tests stay green — `f10_opens_menu`, `f10_toggles_menu_closed_when_open`, the `grouped_commands` grouping test (model unchanged), and the menu→`dispatch_overlay_command` path (the `menu_select_for_test` shim now drives the self-rendered nav). Add: `Left/Right` moves `open` across categories; `Up/Down` moves `highlighted`; `Enter` dispatches `groups[open][highlighted]`.
   - Mouse event while `pending_mark` is Some→ignored (no caret move, capture still pending).
   - Click below all content (offset_at_cell None)→caret at document end.
   - `toggle_mouse_capture`→flips `editor.mouse_capture`; toggling off mid-drag clears `MouseState` drag fields.
@@ -129,9 +138,10 @@ A captured click while the palette is open dispatches/dismisses; while the menu 
 - **New `Editor` state:** `mouse_capture`, `mouse: MouseState`.
 - **New public helper:** `commands::scope_range_at(editor, offset, Scope)` (private `scope_range` delegates).
 - **Signature change:** `TerminalGuard::new(enable_mouse: bool)` (update its call site).
-- **Render extraction (DRY for hit-testing):** `palette_overlay_rect` / `palette_row_at` / `menu_bar_area` shared between `render` and `mouse`.
+- **Menu rewrite (drop `tui-menu`):** `MenuView { groups, open, highlighted, built }` self-rendered with ratatui primitives; rewire the app.rs menu keyboard block + the render paint; remove the `tui-menu` dependency from `Cargo.toml`.
+- **Render extraction (DRY for hit-testing):** `palette_overlay_rect` / `palette_row_at` / `menu_bar_layout` / `menu_dropdown_rect` / `menu_dropdown_row_at` shared between `render` and `mouse`.
 - **Main-loop additions:** `reconcile_mouse_capture` (post-guard + per-iteration, clears drag state on off); `scrollbar_until_ms` fed into the `recv_timeout` deadline.
-- **Reuses from 5c/5b:** `nav::offset_at_cell`, `commands::scope_range_at`/`Scope`, `sel_history` seeding, `dispatch_overlay_command`, `ensure_visible`, the scroll fields.
+- **Reuses from 5c/5b:** `nav::offset_at_cell`, `commands::scope_range_at`/`Scope`, `sel_history` seeding, `dispatch_overlay_command`, `ensure_visible`, the scroll fields, `menu::grouped_commands`.
 
 ## 12. Deliberate decisions (for review)
 
@@ -140,7 +150,7 @@ A captured click while the palette is open dispatches/dismisses; while the menu 
 3. **Double=word, triple=paragraph**, seeding the 5c expand ladder; no quad-click (§6).
 4. **`toggle_mouse_capture` has no default keybinding** — rare power toggle; saves key space (§3).
 5. **Auto-hiding scrollbar, not always-on; overlays the last column while visible (no text reflow on scroll); fade driven by a loop `recv_timeout` deadline, not idle `Tick`** (§5/§7).
-6. **Palette is fully mouse-clickable via extracted shared render geometry; the menu is click-outside-to-dismiss only** — in-menu item clicking is deferred because `tui-menu 0.3` exposes no mouse/geometry API and `MenuView` discards its label model (Codex; §8). A follow-up can add full menu mouse by self-rendering the dropdowns.
+6. **Both overlays fully click + keyboard.** The palette uses extracted shared render geometry. The **menu is self-rendered with ratatui primitives, dropping `tui-menu`** (which has no mouse/geometry API) — bar labels and dropdown items become clickable, keyboard nav is preserved, and the `=0.3.0` dependency pin is removed (§8). Chosen over keeping `tui-menu` (menu would be click-outside-dismiss only) because the menu is shallow and `grouped_commands` already builds the model, so the self-render is bounded.
 7. **Capture honored from frame 1** via `TerminalGuard::new(enable_mouse)` + a post-guard reconcile; toggling off clears drag state (§4).
 8. **Mouse ignored during `pending_mark` capture; click below content → caret to document end** (§9).
 9. **Middle-click paste deferred** to its own effort (§1).
