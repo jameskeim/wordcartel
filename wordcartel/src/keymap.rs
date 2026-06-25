@@ -253,6 +253,14 @@ static CUA: &[(&str, &str)] = &[
     ("shift-down",  "select_down"),
     ("shift-home",  "select_line_start"),
     ("shift-end",   "select_line_end"),
+    // Word navigation
+    ("ctrl-left",       "move_word_left"),
+    ("ctrl-right",      "move_word_right"),
+    ("ctrl-shift-left", "select_word_left"),
+    ("ctrl-shift-right","select_word_right"),
+    // Word delete
+    ("ctrl-backspace", "delete_word_back"),
+    ("ctrl-del",       "delete_word_forward"),
     // Editing  (input.rs lines 111–113)
     ("enter",     "insert_newline"),
     ("backspace", "backspace"),

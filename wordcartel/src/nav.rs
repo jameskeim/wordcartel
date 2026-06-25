@@ -495,17 +495,72 @@ fn leaf_spans(blocks: &BlockTree) -> Vec<(usize, usize)> {
 }
 
 /// Start of the next leaf block beginning strictly after `pos`, else `buf.len()`.
-#[allow(dead_code)] // wired in Task 5/6/7
 pub fn next_paragraph_start(blocks: &BlockTree, buf: &TextBuffer, pos: usize) -> usize {
     leaf_spans(blocks).into_iter().map(|(s, _)| s).find(|&s| s > pos).unwrap_or(buf.len())
 }
 
 /// Start of the leaf block before the one containing `pos`, else `0`.
-#[allow(dead_code)] // wired in Task 5/6/7
 pub fn prev_paragraph_start(blocks: &BlockTree, _buf: &TextBuffer, pos: usize) -> usize {
     // caller passes the *current paragraph start* as `pos` boundary; pick the
     // last leaf start strictly before it.
     leaf_spans(blocks).into_iter().map(|(s, _)| s).filter(|&s| s < pos).next_back().unwrap_or(0)
+}
+
+/// Move to the start of the next word, crossing block boundaries (skipping gaps).
+pub fn move_word_right(editor: &mut Editor) -> usize {
+    let h = head(editor);
+    let new = {
+        let buf = &editor.active().document.buffer;
+        let blocks = &editor.active().document.blocks;
+        let (wstart, wend) = paragraph_range_at(blocks, buf, h);
+        let window = buf.slice(wstart..wend);
+        let rel = h.saturating_sub(wstart);
+        match wordcartel_core::textobj::next_word_start(&window, rel) {
+            Some(r) => wstart + r,
+            None => {
+                // First word of the next leaf block (skips blank-line gaps), else doc end.
+                let nps = next_paragraph_start(blocks, buf, wend);
+                if nps >= buf.len() {
+                    buf.len()
+                } else {
+                    let next_end = paragraph_range_at(blocks, buf, nps).1;
+                    let ntext = buf.slice(nps..next_end);
+                    wordcartel_core::textobj::next_word_start(&ntext, 0)
+                        .map(|r| nps + r)
+                        .unwrap_or(nps) // block starts with its first word
+                }
+            }
+        }
+    };
+    editor.active_mut().desired_col = None;
+    new
+}
+
+/// Move to the start of the previous word, crossing block boundaries (skipping gaps).
+pub fn move_word_left(editor: &mut Editor) -> usize {
+    let h = head(editor);
+    let new = {
+        let buf = &editor.active().document.buffer;
+        let blocks = &editor.active().document.blocks;
+        let (wstart, wend) = paragraph_range_at(blocks, buf, h);
+        let _ = wend;
+        let window = buf.slice(wstart..wend);
+        let rel = h.saturating_sub(wstart);
+        match wordcartel_core::textobj::prev_word_start(&window, rel) {
+            Some(r) => wstart + r,
+            None if wstart > 0 => {
+                let pps = prev_paragraph_start(blocks, buf, wstart);
+                let prev_end = paragraph_range_at(blocks, buf, pps).1;
+                let ptext = buf.slice(pps..prev_end);
+                wordcartel_core::textobj::prev_word_start(&ptext, ptext.len())
+                    .map(|r| pps + r)
+                    .unwrap_or(pps)
+            }
+            None => 0,
+        }
+    };
+    editor.active_mut().desired_col = None;
+    new
 }
 
 // ---------------------------------------------------------------------------
