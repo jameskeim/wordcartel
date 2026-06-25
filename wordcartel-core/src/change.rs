@@ -120,6 +120,27 @@ impl ChangeSet {
     }
 }
 
+/// Map one byte position through a ChangeSet (insertion bias = After).
+/// Shared by `Selection` mapping and 5c marks/ring mapping.
+pub fn map_pos(pos: usize, cs: &ChangeSet) -> usize {
+    let mut old = 0usize;
+    let mut new = 0usize;
+    for op in &cs.ops {
+        match op {
+            Op::Retain(n) => {
+                if pos < old + n { return new + (pos - old); }
+                old += n; new += n;
+            }
+            Op::Insert(s) => { new += s.len(); }
+            Op::Delete(n) => {
+                if pos < old + n { return new; }
+                old += n;
+            }
+        }
+    }
+    new + pos.saturating_sub(old)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +227,21 @@ mod tests {
         cs.apply(&mut b);
         assert_eq!(b.to_string(), "hello!"); // appended
         assert_eq!(cs.len_after, len + 1);
+    }
+
+    #[test]
+    fn map_pos_shifts_after_insert_and_clamps_in_delete() {
+        use crate::buffer::TextBuffer;
+        let buf = TextBuffer::from_str("abcdef");
+        // insert "XY" at offset 2 → positions >= 2 shift by 2
+        let cs = ChangeSet::insert(2, "XY", buf.len());
+        assert_eq!(map_pos(0, &cs), 0);
+        assert_eq!(map_pos(2, &cs), 4); // bias After
+        assert_eq!(map_pos(5, &cs), 7);
+        // delete 2..4 → a position inside the deletion clamps to its start
+        let cs2 = ChangeSet::delete(2..4, buf.len());
+        assert_eq!(map_pos(3, &cs2), 2);
+        assert_eq!(map_pos(5, &cs2), 3);
     }
 
     use proptest::prelude::*;

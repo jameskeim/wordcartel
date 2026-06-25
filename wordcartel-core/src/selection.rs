@@ -1,6 +1,6 @@
 //! Selection over byte offsets. `map` keeps positions valid across edits — the
 //! #1 "cursor jumped" bug class (spec §10.2). Reimplemented from Helix's pattern.
-use crate::change::{ChangeSet, Op};
+use crate::change::ChangeSet;
 use crate::BytePos;
 use smallvec::{smallvec, SmallVec};
 
@@ -33,39 +33,10 @@ impl Range {
     /// Map both ends through a ChangeSet (insertion bias = After).
     pub fn map(&self, cs: &ChangeSet) -> Range {
         Range {
-            anchor: map_pos(self.anchor, cs),
-            head: map_pos(self.head, cs),
+            anchor: crate::change::map_pos(self.anchor, cs),
+            head: crate::change::map_pos(self.head, cs),
         }
     }
-}
-
-/// Map one byte position through a ChangeSet.
-/// - Retain(n): positions in the retained span shift by the net delta so far.
-/// - Insert(s): a position at/after the insert point gains s.len() (bias After).
-/// - Delete(n): a position inside the deleted span clamps to its start.
-fn map_pos(pos: BytePos, cs: &ChangeSet) -> BytePos {
-    let mut old = 0usize; // cursor in the pre-change doc
-    let mut new = 0usize; // cursor in the post-change doc
-    for op in &cs.ops {
-        match op {
-            Op::Retain(n) => {
-                if pos < old + n {
-                    return new + (pos - old);
-                }
-                old += n;
-                new += n;
-            }
-            Op::Insert(s) => { new += s.len(); }
-            Op::Delete(n) => {
-                if pos < old + n {
-                    // inside (or at start of) the deletion → clamp to its start
-                    return new;
-                }
-                old += n;
-            }
-        }
-    }
-    new + pos.saturating_sub(old)
 }
 
 impl Selection {
@@ -160,7 +131,7 @@ mod tests {
             } else {
                 ChangeSet::insert(at, "x", doc_len)
             };
-            let mapped = super::map_pos(pos, &cs);
+            let mapped = crate::change::map_pos(pos, &cs);
             prop_assert!(mapped <= cs.len_after);
         }
     }
