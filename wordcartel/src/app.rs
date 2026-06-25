@@ -8,10 +8,11 @@ use crossterm::event::Event;
 use crossterm::event::KeyEvent;
 use std::path::PathBuf;
 
-use crate::{commands, derive, editor::Editor, file, input, render, term};
+use crate::{commands, derive, editor::Editor, file, render, term};
+#[cfg(test)]
+use crate::input;
 use crate::jobs::{is_stale, Executor, JobResult};
 use crate::registry::{Ctx, Registry};
-use crate::input::KeyAction;
 use crate::prompt::PromptAction;
 use wordcartel_core::history::Clock;
 
@@ -382,6 +383,7 @@ pub fn reduce(
     msg: Msg,
     editor: &mut Editor,
     reg: &Registry,
+    keymap: &crate::keymap::KeyTrie,
     ex: &dyn Executor,
     clock: &dyn Clock,
     msg_tx: &std::sync::mpsc::Sender<Msg>,
@@ -465,31 +467,48 @@ pub fn reduce(
 
     let before = editor.active().document.version;
     match msg {
-        Msg::Input(Event::Key(key)) => {
-            if key.kind == crossterm::event::KeyEventKind::Press
-                && key.code == crossterm::event::KeyCode::Esc
-                && editor.filter_in_flight.is_some()
-            {
-                // Esc here cancels an in-flight filter. Safe only while no other handler claims
-                // bare Esc before this point — Task 4's minibuffer Esc must be ordered to run
-                // BEFORE this check (minibuffer-dismiss takes precedence over filter-cancel).
-                // Revisit if any new bare-Esc binding is added.
-                editor.filter_in_flight.take().unwrap().cancel();
-                editor.status = "cancelling...".into();
-                for r in ex.drain() {
-                    apply_result(r, editor);
+        Msg::Input(Event::Key(k)) if k.kind == crossterm::event::KeyEventKind::Press => {
+            // Esc precedence (Codex CRITICAL): prompt/minibuffer Esc are handled in their
+            // interception blocks ABOVE this point. Here in normal mode the order is
+            // pending-cancel > filter-cancel. This arm SUBSUMES the old standalone
+            // filter-cancel Esc check (removed above). Esc is reserved for cancel/dismiss
+            // in v1 (not routed to the keymap).
+            if k.code == crossterm::event::KeyCode::Esc {
+                if !editor.pending_keys.is_empty() {
+                    editor.pending_keys.clear();
+                    editor.status.clear();
+                } else if editor.filter_in_flight.is_some() {
+                    editor.filter_in_flight.take().unwrap().cancel();
+                    editor.status = "cancelling…".into();
                 }
-                return !editor.quit;
-            }
-            match input::key_to_command_id(key) {
-                Some(KeyAction::Id(id)) => {
-                    let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
-                    reg.dispatch(id, &mut ctx);
+            } else if let Some(chord) = crate::keymap::from_key_event(k) {
+                editor.pending_keys.push(chord);
+                match keymap.resolve(&editor.pending_keys) {
+                    crate::keymap::Resolution::Command(id) => {
+                        editor.pending_keys.clear();
+                        editor.status.clear();
+                        let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
+                        reg.dispatch(id, &mut ctx);
+                    }
+                    crate::keymap::Resolution::Pending => {
+                        editor.status = format!("{} …", crate::keymap::chords_display(&editor.pending_keys));
+                    }
+                    crate::keymap::Resolution::None => {
+                        let was_single = editor.pending_keys.len() == 1;
+                        editor.pending_keys.clear();
+                        editor.status.clear();
+                        // Printable fallthrough: single unmodified printable → literal insert.
+                        if was_single {
+                            if let crossterm::event::KeyCode::Char(c) = k.code {
+                                if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                                    && !k.modifiers.contains(crossterm::event::KeyModifiers::ALT)
+                                {
+                                    commands::run(commands::Command::InsertChar(c), editor, clock);
+                                }
+                            }
+                        }
+                    }
                 }
-                Some(KeyAction::Insert(c)) => {
-                    commands::run(commands::Command::InsertChar(c), editor, clock);
-                }
-                None => {}
             }
         }
         Msg::Input(Event::Paste(text)) => {
@@ -660,6 +679,8 @@ pub fn run(path: Option<PathBuf>) -> std::io::Result<()> {
     let _ = crate::export::probe_pandoc();
 
     let reg = Registry::builtins();
+    // Task 4: build a local default keymap to pass to reduce until Task 5 wires config-driven startup.
+    let (keymap, _keymap_warns) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
     let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Msg>();
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
     let executor = crate::jobs::ThreadExecutor::new(wake_tx);
@@ -723,7 +744,7 @@ pub fn run(path: Option<PathBuf>) -> std::io::Result<()> {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Msg::Tick,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        let keep = reduce(msg, &mut editor, &reg, &executor, &clock, &msg_tx);
+        let keep = reduce(msg, &mut editor, &reg, &keymap, &executor, &clock, &msg_tx);
         crate::clipboard::drain_clipboard_intents(&mut editor, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
         guard.terminal().draw(|f| render::render(f, &editor))?;
         if !keep { break; }
@@ -766,6 +787,16 @@ mod tests {
         }
     }
 
+    fn cua_keymap() -> crate::keymap::KeyTrie {
+        let (t, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &crate::registry::Registry::builtins());
+        t
+    }
+
+    fn press(code: crossterm::event::KeyCode, mods: crossterm::event::KeyModifiers) -> Msg {
+        use crossterm::event::{Event, KeyEvent, KeyEventKind, KeyEventState};
+        Msg::Input(Event::Key(KeyEvent { code, modifiers: mods, kind: KeyEventKind::Press, state: KeyEventState::NONE }))
+    }
+
     // -------------------------------------------------------------------------
     // Brief's required failing test (Task 12 step 1)
     // -------------------------------------------------------------------------
@@ -778,6 +809,7 @@ mod tests {
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         let mut e = Editor::new_from_text("\n", None, (80, 24));
         let reg = Registry::builtins();
+        let km = cua_keymap();
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -787,13 +819,13 @@ mod tests {
         // First Ctrl+Q: dirty → modal up, NOT quit yet
         let ctrl_q = Event::Key(KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(crate::app::Msg::Input(ctrl_q), &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(crate::app::Msg::Input(ctrl_q), &mut e, &reg, &km, &ex, &clk, &tx);
         assert!(e.prompt.is_some(), "dirty quit must raise modal");
         assert!(!e.quit);
         // Press 'q' → routed to QuitAnyway via the modal.
         let q = Event::Key(KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(crate::app::Msg::Input(q), &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(crate::app::Msg::Input(q), &mut e, &reg, &km, &ex, &clk, &tx);
         assert!(e.quit);
         assert_eq!(e.active().document.buffer.to_string(), "hi\n");
     }
@@ -809,7 +841,7 @@ mod tests {
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let ctrl_c = Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(ctrl_c), &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(ctrl_c), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.register.get(), Some("hello"));
         assert_eq!(e.clipboard_sync_request.as_deref(), Some("hello"));
     }
@@ -825,7 +857,7 @@ mod tests {
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let ctrl_v = Event::Key(KeyEvent { code: KeyCode::Char('v'), modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(ctrl_v), &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(ctrl_v), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), before, "Ctrl+V no longer pastes inline");
         assert!(e.clipboard_get_pending.is_some(), "Ctrl+V sets a paste intent");
     }
@@ -838,7 +870,7 @@ mod tests {
         let bid = e.active().id;
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("XY".into()) }, &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("XY".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "aXYb\n");
         assert_eq!(e.register.get(), Some("XY"), "OS text updates the register");
         e.active_mut().undo();
@@ -854,7 +886,7 @@ mod tests {
         let bid = e.active().id;
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: None }, &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: None }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "aRb\n", "None -> register fallback");
     }
 
@@ -865,7 +897,7 @@ mod tests {
         let bid = e.active().id;
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: None }, &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: None }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "ab\n", "empty register -> no change");
     }
 
@@ -877,7 +909,7 @@ mod tests {
         let bid = e.active().id;
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("XY".into()) }, &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("XY".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "aXYd\n", "selection replaced by pasted text");
         e.active_mut().undo();
         assert_eq!(e.active().document.buffer.to_string(), "abcd\n");
@@ -889,7 +921,7 @@ mod tests {
         let mut e = Editor::new_from_text("ab\n", None, (80, 24));
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: BufferId(99999), text: Some("X".into()) }, &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: BufferId(99999), text: Some("X".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "ab\n", "unknown buffer -> dropped");
     }
 
@@ -903,7 +935,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let huge = "x".repeat(crate::clipboard::PASTE_MAX_BYTES + 1);
-        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some(huge) }, &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some(huge) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "ab\n", "oversize paste must not insert");
         assert_eq!(e.register.get(), Some("orig"), "oversize paste must not mutate the register");
         assert!(e.status.to_lowercase().contains("too large"));
@@ -915,11 +947,11 @@ mod tests {
         let mut e = Editor::new_from_text("ab\n", None, (80, 24));
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::ClipboardAvailability(false), &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(Msg::ClipboardAvailability(false), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert!(e.status.to_lowercase().contains("clipboard"));
         assert!(e.clipboard_notice_shown);
         e.status = "typing".into();
-        crate::app::reduce(Msg::ClipboardAvailability(false), &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(Msg::ClipboardAvailability(false), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.status, "typing", "notice shown only once");
     }
 
@@ -1002,7 +1034,7 @@ mod tests {
         for c in "hi".chars() {
             let ev = Event::Key(KeyEvent { code: KeyCode::Char(c), modifiers: KeyModifiers::NONE,
                 kind: KeyEventKind::Press, state: KeyEventState::NONE });
-            assert!(crate::app::reduce(crate::app::Msg::Input(ev), &mut e, &reg, &ex, &clk, &tx));
+            assert!(crate::app::reduce(crate::app::Msg::Input(ev), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx));
         }
         assert_eq!(e.active().document.buffer.to_string(), "hi\n");
     }
@@ -1019,7 +1051,7 @@ mod tests {
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let msg = Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
             disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) };
-        crate::app::reduce(msg, &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "aXde\n");
         // one undo step restores the original
         e.active_mut().undo();
@@ -1037,7 +1069,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         crate::app::reduce(Msg::FilterDone { buffer_id: id, version: stale_v, range: 1..3, cursor: 2,
-            disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) }, &mut e, &reg, &ex, &clk, &tx);
+            disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "abcde\n", "stale filter result discarded");
         assert!(e.status.to_lowercase().contains("discarded"));
     }
@@ -1054,7 +1086,7 @@ mod tests {
         crate::app::reduce(Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
             disposition: Disposition::Filter,
             outcome: RunResult::Err(FilterError::NonZero { code: "Exited(3)".into(), stderr: "boom".into() }) },
-            &mut e, &reg, &ex, &clk, &tx);
+            &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "abcde\n");
         assert!(e.status.contains("boom") && e.status.contains('3'));
     }
@@ -1094,7 +1126,7 @@ mod tests {
         // Clock past the idle threshold.
         struct C(u64); impl wordcartel_core::history::Clock for C { fn now_ms(&self) -> u64 { self.0 } }
         let clk = C(crate::swap::T_IDLE_MS + 5);
-        crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert!(e.active().last_swap_at.is_some(), "an idle Tick on a dirty buffer writes a swap");
         let sp = crate::swap::swap_path(Some(&doc_path)).unwrap();
         assert!(sp.exists());
@@ -1117,12 +1149,12 @@ mod tests {
         let ctrl_q = Event::Key(KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
         // First Ctrl+Q → modal up, not quit.
-        crate::app::reduce(crate::app::Msg::Input(ctrl_q.clone()), &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(crate::app::Msg::Input(ctrl_q.clone()), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert!(e.prompt.is_some() && !e.quit);
         // Press 'q' → routed to QuitAnyway.
         let q = Event::Key(KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(crate::app::Msg::Input(q), &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(crate::app::Msg::Input(q), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert!(e.quit, "Quit anyway exits");
         assert!(e.prompt.is_none(), "prompt cleared");
     }
@@ -1240,12 +1272,12 @@ mod tests {
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let key = |c: char| Event::Key(KeyEvent { code: KeyCode::Char(c), modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        for c in "cat".chars() { crate::app::reduce(Msg::Input(key(c)), &mut e, &reg, &ex, &clk, &tx); }
+        for c in "cat".chars() { crate::app::reduce(Msg::Input(key(c)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx); }
         assert_eq!(e.minibuffer.as_ref().unwrap().text, "cat");
         // Enter submits -> dispatch_filter -> a FilterDone arrives, minibuffer cleared
         let enter = Event::Key(KeyEvent { code: KeyCode::Enter, modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert!(e.minibuffer.is_none(), "submit clears the minibuffer");
         match rx.recv().unwrap() { Msg::FilterDone { outcome: crate::filter::RunResult::Stdout(s), .. } => assert_eq!(s, "abc\n"),
                                    o => panic!("expected FilterDone, got {o:?}") }
@@ -1262,7 +1294,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel(); let reg = Registry::builtins();
         let ex = InlineExecutor::default(); let clk = TestClock(0);
         crate::app::reduce(Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
-            disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) }, &mut e, &reg, &ex, &clk, &tx);
+            disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "aXde\n", "FilterDone applies even under an open minibuffer");
     }
 
@@ -1300,7 +1332,7 @@ mod tests {
             result: Ok(ExportResult::Bytes(content_bytes.clone())),
             overwrite_confirmed: false,
         };
-        crate::app::reduce(msg, &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
 
         // The output file must exist beside the source.
         assert!(output_path.exists(), "exported file must exist");
@@ -1351,7 +1383,7 @@ mod tests {
             result: Ok(ExportResult::Bytes(b"<h1>Hello</h1>\n".to_vec())),
             overwrite_confirmed: false,
         };
-        crate::app::reduce(msg, &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
 
         // The racing file is untouched; status tells the user to re-run.
         let got = std::fs::read(&output_path).expect("read target");
@@ -1397,7 +1429,7 @@ mod tests {
             result: Ok(ExportResult::Bytes(new_bytes.clone())),
             overwrite_confirmed: true,
         };
-        crate::app::reduce(msg, &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
 
         let got = std::fs::read(&output_path).expect("read target");
         assert_eq!(got, new_bytes, "confirmed export must overwrite the existing target");
@@ -1443,7 +1475,7 @@ mod tests {
             result: Ok(ExportResult::Bytes(content_bytes.clone())),
             overwrite_confirmed: false,
         };
-        crate::app::reduce(msg, &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
 
         assert!(output_path.exists(), "ExportDone under prompt must still write the file");
         assert!(e.status.contains("exported"));
@@ -1475,7 +1507,7 @@ mod tests {
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let key = Event::Key(KeyEvent { code: KeyCode::Char('t'), modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(Msg::Input(key), &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(key), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert!(e.prompt.is_some(), "Ctrl+T must open the transform chooser");
         assert_eq!(
             e.prompt.as_ref().unwrap().action_for('r'),
@@ -1527,7 +1559,7 @@ mod tests {
         let range = 0..e.active().document.buffer.to_string().len();
         let out = "one\ntwo\n".to_string(); // pretend ventilate output
         crate::app::reduce(Msg::TransformDone { buffer_id: id, version: v, range,
-            kind: TransformKind::Ventilate, result: Ok(out.clone()) }, &mut e, &reg, &ex, &clk, &tx);
+            kind: TransformKind::Ventilate, result: Ok(out.clone()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), out);
         e.active_mut().undo();
         assert_eq!(e.active().document.buffer.to_string(), "one two three four five six seven\n");
@@ -1545,7 +1577,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         crate::app::reduce(Msg::TransformDone { buffer_id: id, version: stale, range: 0..10,
-            kind: TransformKind::Reflow, result: Ok("X".into()) }, &mut e, &reg, &ex, &clk, &tx);
+            kind: TransformKind::Reflow, result: Ok("X".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "alpha beta\n", "stale result discarded");
         assert!(e.status.to_lowercase().contains("discarded"));
         assert!(!e.transform_in_flight, "in-flight cleared even on discard");
@@ -1574,7 +1606,7 @@ mod tests {
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::Input(Event::Paste("XY".into())), &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(Event::Paste("XY".into())), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "aXYb\n");
         assert_eq!(e.register.get(), Some("XY"));
         e.active_mut().undo();
@@ -1590,7 +1622,7 @@ mod tests {
         let doc_before = e.active().document.buffer.to_string();
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::Input(Event::Paste("cat".into())), &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(Event::Paste("cat".into())), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.minibuffer.as_ref().unwrap().text, "cat", "paste goes into the minibuffer");
         assert_eq!(e.active().document.buffer.to_string(), doc_before, "document untouched");
     }
@@ -1604,7 +1636,7 @@ mod tests {
         let doc_before = e.active().document.buffer.to_string();
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::Input(Event::Paste("x".into())), &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(Event::Paste("x".into())), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), doc_before, "paste ignored under a modal");
         assert!(e.prompt.is_some());
     }
@@ -1618,7 +1650,7 @@ mod tests {
         e.register.set("keep".into());
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        crate::app::reduce(Msg::Input(Event::Paste(String::new())), &mut e, &reg, &ex, &clk, &tx);
+        crate::app::reduce(Msg::Input(Event::Paste(String::new())), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "abcd\n", "empty paste must NOT delete the selection");
         assert_eq!(e.register.get(), Some("keep"), "empty paste must NOT clear the register");
     }
@@ -1635,5 +1667,71 @@ mod tests {
             merge: Box::new(|ed: &mut Editor| ed.status = "durability ran".into()),
         }, &mut e);
         assert_eq!(e.status, "durability ran");
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 4: keymap integration tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn single_chord_dispatches_via_keymap() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::range(0, 3); // select abc
+        let km = cua_keymap(); let (tx,_rx)=std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(press(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.register.get(), Some("abc"), "Ctrl+C copied via the data-driven keymap");
+    }
+
+    #[test]
+    fn pending_sequence_then_completes() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{KeyCode, KeyModifiers};
+        // bind a 2-key save sequence
+        let cfg = crate::config::KeymapConfig { preset: "cua".into(),
+            patches: vec![crate::config::KeymapPatch {
+                bind: [("ctrl-k ctrl-s".to_string(), "save".to_string())].into_iter().collect(), unbind: vec![] }] };
+        let (km, _) = crate::keymap::build_keymap(&cfg, &Registry::builtins());
+        let mut e = Editor::new_from_text("x\n", Some("/tmp/wc-kmtest.md".into()), (80, 24));
+        let (tx,_rx)=std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(press(KeyCode::Char('k'), KeyModifiers::CONTROL), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.pending_keys.len(), 1, "first key is pending");
+        assert!(e.status.contains("ctrl-k") || e.status.to_lowercase().contains("k"), "pending shown");
+        crate::app::reduce(press(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.pending_keys.is_empty(), "sequence resolved, pending cleared");
+        // (save dispatched — the file path means dispatch_save runs; assert via status or saved flag per the real save)
+    }
+
+    #[test]
+    fn esc_cancels_pending_without_other_effect() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let cfg = crate::config::KeymapConfig { preset: "cua".into(),
+            patches: vec![crate::config::KeymapPatch {
+                bind: [("ctrl-k ctrl-s".to_string(), "save".to_string())].into_iter().collect(), unbind: vec![] }] };
+        let (km, _) = crate::keymap::build_keymap(&cfg, &Registry::builtins());
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        let before = e.active().document.buffer.to_string();
+        let (tx,_rx)=std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(press(KeyCode::Char('k'), KeyModifiers::CONTROL), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.pending_keys.len(), 1);
+        crate::app::reduce(press(KeyCode::Esc, KeyModifiers::NONE), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.pending_keys.is_empty(), "Esc cleared the pending sequence");
+        assert_eq!(e.active().document.buffer.to_string(), before, "no buffer change");
+    }
+
+    #[test]
+    fn printable_falls_through_to_insert() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut e = Editor::new_from_text("", None, (80, 24));
+        let km = cua_keymap(); let (tx,_rx)=std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(press(KeyCode::Char('h'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "h", "unbound printable inserts literally");
     }
 }

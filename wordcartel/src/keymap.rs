@@ -110,6 +110,36 @@ pub fn parse_seq(s: &str) -> Option<Vec<KeyChord>> {
     s.split_whitespace().map(parse_chord).collect()
 }
 
+/// Render a pending key sequence as a human-readable string for the status bar.
+/// E.g. `[ctrl-k, ctrl-s]` → `"ctrl-k ctrl-s"`.
+pub fn chords_display(chords: &[KeyChord]) -> String {
+    chords.iter().map(|ch| {
+        let mut parts: Vec<&str> = Vec::new();
+        if ch.mods.contains(KeyModifiers::CONTROL) { parts.push("ctrl"); }
+        if ch.mods.contains(KeyModifiers::ALT)     { parts.push("alt"); }
+        if ch.mods.contains(KeyModifiers::SHIFT)   { parts.push("shift"); }
+        let key_str: String = match ch.code {
+            KeyCode::Char(c) => c.to_string(),
+            KeyCode::Enter     => "enter".into(),
+            KeyCode::Tab       => "tab".into(),
+            KeyCode::Esc       => "esc".into(),
+            KeyCode::Backspace => "backspace".into(),
+            KeyCode::Delete    => "del".into(),
+            KeyCode::Left      => "left".into(),
+            KeyCode::Right     => "right".into(),
+            KeyCode::Up        => "up".into(),
+            KeyCode::Down      => "down".into(),
+            KeyCode::Home      => "home".into(),
+            KeyCode::End       => "end".into(),
+            KeyCode::PageUp    => "pageup".into(),
+            KeyCode::PageDown  => "pagedown".into(),
+            KeyCode::F(n)      => format!("f{n}"),
+            other              => format!("{other:?}").to_ascii_lowercase(),
+        };
+        if parts.is_empty() { key_str } else { format!("{}-{key_str}", parts.join("-")) }
+    }).collect::<Vec<_>>().join(" ")
+}
+
 // ---------------------------------------------------------------------------
 // KeyTrie + Resolution
 // ---------------------------------------------------------------------------

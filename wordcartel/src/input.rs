@@ -3,10 +3,12 @@
 // Only handles KeyEventKind::Press (ignores Release/Repeat) to avoid
 // double-input on terminals that emit both.
 
+#[cfg(test)]
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 #[cfg(test)]
 use crate::commands::{Command, Dir};
+#[cfg(test)]
 use crate::registry::CommandId;
 
 /// Translate a crossterm `KeyEvent` to a `Command`, or `None` for unmapped keys.
@@ -72,6 +74,10 @@ pub fn key_to_command(key: KeyEvent) -> Option<Command> {
 
 /// What a key resolves to: a named command, or a literal character insert
 /// (the §10.4 printable fallthrough — not a registered command).
+///
+/// Retained for tests; production dispatch now goes through the keymap trie
+/// in `reduce` (Task 4).
+#[cfg(test)]
 #[derive(Debug)]
 pub enum KeyAction {
     Id(CommandId),
@@ -79,6 +85,10 @@ pub enum KeyAction {
 }
 
 /// Registry-facing keymap: key → CommandId (or literal insert).
+///
+/// Retired from production use in Task 4; kept here `#[cfg(test)]` so the
+/// existing mapping tests continue to exercise the translation table.
+#[cfg(test)]
 pub fn key_to_command_id(key: KeyEvent) -> Option<KeyAction> {
     if key.kind != KeyEventKind::Press {
         return None;

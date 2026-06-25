@@ -116,6 +116,7 @@ pub struct Editor {
     pub clipboard_sync_request: Option<String>,
     pub clipboard_get_pending: Option<crate::clipboard::PasteIntent>,
     pub clipboard_notice_shown: bool,
+    pub pending_keys: Vec<crate::keymap::KeyChord>,
 }
 
 impl Editor {
@@ -138,6 +139,7 @@ impl Editor {
             prompt: None, quit_after_save: None, quit_after_save_at: None,
             filter_in_flight: None, transform_in_flight: false, minibuffer: None, pending_export: None,
             clipboard_sync_request: None, clipboard_get_pending: None, clipboard_notice_shown: false,
+            pending_keys: Vec::new(),
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer {
