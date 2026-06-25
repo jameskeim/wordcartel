@@ -68,6 +68,16 @@ pub fn handle(
     if editor.pending_mark.is_some() || !editor.mouse_capture {
         return;
     }
+    // Universal drag clear: a button release always ends any drag, regardless of
+    // whether an overlay is open. This prevents stale drag state if the user opens
+    // the palette/menu via keyboard while a drag is in flight, then releases the
+    // button — the Up would otherwise be consumed by the overlay branch without
+    // clearing `dragging`/`scrollbar_dragging`. Fall through so normal Up handling
+    // (which redundantly clears the same fields) still runs in the non-overlay path.
+    if let MouseEventKind::Up(MouseButton::Left) = ev.kind {
+        editor.mouse.dragging = false;
+        editor.mouse.scrollbar_dragging = false;
+    }
     let (w, h) = editor.active().view.area;
     let area = ratatui::layout::Rect::new(0, 0, w, h);
     if editor.palette.is_some() {
@@ -402,5 +412,32 @@ mod tests {
         handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
         assert!(e.mouse.scrollbar_dragging);
         assert!(e.active().view.scroll > 0, "scrubbed to a lower position");
+    }
+
+    /// Finding 2 regression: if the palette (or menu) is open while a text or
+    /// scrollbar drag is in flight and the user releases the mouse button, the
+    /// Up(Left) event is consumed by the overlay branch — but drag state must
+    /// still be cleared so later events aren't misrouted.
+    #[test]
+    fn overlay_open_mid_drag_up_clears_drag_state() {
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        // Simulate a drag in flight.
+        e.mouse.dragging = true;
+        e.mouse.scrollbar_dragging = true;
+        // Open the palette (keyboard user opened it while drag was in flight).
+        e.palette = Some(crate::palette::Palette::default());
+        let (reg, ex, clk, tx, km) = ctx();
+        // Send the Up(Left) — the overlay branch would normally `return` here without
+        // clearing drag state; after the fix it must clear it first.
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle(&mut e, up, &reg, &km, &ex, &clk, &tx);
+        assert!(!e.mouse.dragging, "dragging must be cleared when Up(Left) arrives during overlay");
+        assert!(!e.mouse.scrollbar_dragging, "scrollbar_dragging must be cleared when Up(Left) arrives during overlay");
     }
 }

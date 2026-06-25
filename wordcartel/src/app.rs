@@ -999,12 +999,10 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     // Reconcile mouse capture once before the first draw (post-guard invariant).
     reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
 
+    recompute_scrollbar_visible(&mut editor, clock.now_ms());
     guard.terminal().draw(|f| render::render(f, &mut editor))?;
     loop {
         let now = clock.now_ms();
-        // Recompute scrollbar visibility from the clock so the bar fades when
-        // scrollbar_until_ms expires (driven by the deadline below, not idle Tick).
-        recompute_scrollbar_visible(&mut editor, now);
         // Bounded save&quit: if waiting for an in-flight save to complete and
         // 5 s have elapsed since the last edit, re-raise the quit-confirm modal.
         if let Some(_v) = editor.quit_after_save {
@@ -1048,6 +1046,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
         let keep = reduce(msg, &mut editor, &reg, &keymap, &executor, &clock, &msg_tx);
         crate::clipboard::drain_clipboard_intents(&mut editor, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
         reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
+        recompute_scrollbar_visible(&mut editor, clock.now_ms());
         guard.terminal().draw(|f| render::render(f, &mut editor))?;
         // Persist session state when a save just completed (saved_version advanced).
         let sv = editor.active().document.saved_version;
@@ -1089,15 +1088,19 @@ pub fn recompute_scrollbar_visible(editor: &mut crate::editor::Editor, now_ms: u
 pub fn reconcile_mouse_capture<W: std::io::Write>(editor: &mut crate::editor::Editor, backend: &mut W, applied: &mut bool) {
     if editor.mouse_capture != *applied {
         if editor.mouse_capture {
-            let _ = crossterm::execute!(backend, crossterm::event::EnableMouseCapture);
+            if crossterm::execute!(backend, crossterm::event::EnableMouseCapture).is_ok() {
+                *applied = editor.mouse_capture;
+            }
         } else {
-            let _ = crossterm::execute!(backend, crossterm::event::DisableMouseCapture);
-            // clear drag state so no Up is awaited that won't arrive
+            // clear drag state regardless of IO outcome — it is local state,
+            // not tied to the terminal write succeeding.
             editor.mouse.dragging = false;
             editor.mouse.scrollbar_dragging = false;
             editor.mouse.anchor = None;
+            if crossterm::execute!(backend, crossterm::event::DisableMouseCapture).is_ok() {
+                *applied = editor.mouse_capture;
+            }
         }
-        *applied = editor.mouse_capture;
     }
 }
 
@@ -2363,5 +2366,39 @@ mod tests {
         assert!(e.mouse.scrollbar_visible);
         crate::app::recompute_scrollbar_visible(&mut e, 1200); // after
         assert!(!e.mouse.scrollbar_visible);
+    }
+
+    /// Finding 1 regression: wheel event sets scrollbar_until_ms; recomputing
+    /// immediately after (now == t, t < t+1200) must yield visible == true.
+    /// A later recompute at t+1300 must yield false (bar fades after deadline).
+    #[test]
+    fn wheel_then_recompute_makes_scrollbar_visible() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        use crossterm::event::{MouseEvent, MouseEventKind, KeyModifiers};
+        let text: String = (0..50).map(|i| format!("line {i}\n")).collect();
+        let mut e = Editor::new_from_text(&text, None, (80, 10));
+        crate::derive::rebuild(&mut e);
+        let reg = Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ex = InlineExecutor::default();
+        let t: u64 = 5000;
+        let clk = TestClock(t);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Dispatch the scroll event (sets scrollbar_until_ms = t + 1200).
+        crate::mouse::handle(&mut e, wheel, &reg, &km, &ex, &clk, &tx);
+        // Recompute at t (now < until) — bar must be visible.
+        crate::app::recompute_scrollbar_visible(&mut e, t);
+        assert!(e.mouse.scrollbar_visible, "scrollbar must be visible immediately after a scroll event");
+        // Recompute after the fade deadline — bar must hide.
+        crate::app::recompute_scrollbar_visible(&mut e, t + 1300);
+        assert!(!e.mouse.scrollbar_visible, "scrollbar must hide after scrollbar_until_ms expires");
     }
 }
