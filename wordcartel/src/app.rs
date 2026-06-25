@@ -495,7 +495,7 @@ pub fn reduce(
         Msg::Input(Event::Paste(text)) => {
             if editor.minibuffer.is_some() {
                 for ch in text.chars() { editor.minibuffer.as_mut().unwrap().insert(ch); }
-            } else {
+            } else if !text.is_empty() {
                 let bid = editor.active().id;
                 if insert_paste_text(editor, bid, &text, clock) {
                     editor.register.set(text);
@@ -1607,6 +1607,20 @@ mod tests {
         crate::app::reduce(Msg::Input(Event::Paste("x".into())), &mut e, &reg, &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), doc_before, "paste ignored under a modal");
         assert!(e.prompt.is_some());
+    }
+
+    #[test]
+    fn bracketed_paste_empty_preserves_selection_and_register() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::Event;
+        let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::range(1, 3); // select "bc"
+        e.register.set("keep".into());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::Input(Event::Paste(String::new())), &mut e, &reg, &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "abcd\n", "empty paste must NOT delete the selection");
+        assert_eq!(e.register.get(), Some("keep"), "empty paste must NOT clear the register");
     }
 
     #[test]
