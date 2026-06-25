@@ -459,7 +459,7 @@ pub fn reduce(
             if k.kind == crossterm::event::KeyEventKind::Press {
                 let mut selected = None;
                 match k.code {
-                    crossterm::event::KeyCode::Esc => {
+                    crossterm::event::KeyCode::Esc | crossterm::event::KeyCode::F(10) => {
                         editor.menu = None;
                     }
                     crossterm::event::KeyCode::Up => {
@@ -2183,5 +2183,19 @@ mod tests {
         let esc = Event::Key(KeyEvent { code: KeyCode::Esc, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE });
         crate::app::reduce(Msg::Input(esc), &mut e, &reg, &km, &ex, &clk, &tx);
         assert!(e.palette.is_none());
+    }
+
+    #[test]
+    fn f10_toggles_menu_closed_when_open() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let reg = Registry::builtins(); let km = cua_keymap(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        // F10 with menu closed → opens the menu
+        crate::app::reduce(Msg::Input(f10()), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.menu.is_some(), "F10 should open menu when closed");
+        // F10 with menu open → closes the menu
+        crate::app::reduce(Msg::Input(f10()), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.menu.is_none(), "F10 should close menu when open");
     }
 }

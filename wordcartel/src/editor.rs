@@ -178,9 +178,10 @@ impl Editor {
     /// Open the minibuffer with the given prompt string.
     ///
     /// Invariant: prompt XOR minibuffer — only one may be active at a time.
-    /// `debug_assert!`s that no modal prompt is currently open.
+    /// Clears `prompt`, `palette`, `menu`, and `pending_keys` before opening.
     pub fn open_minibuffer(&mut self, prompt: &str) {
         debug_assert!(self.prompt.is_none(), "prompt xor minibuffer: cannot open minibuffer while a modal prompt is active");
+        self.prompt = None;
         self.pending_keys.clear();
         self.palette = None;
         self.menu = None;
@@ -193,13 +194,26 @@ impl Editor {
 
     /// Open a modal prompt, enforcing single-overlay XOR invariant.
     ///
-    /// Clears `palette` and `pending_keys` before setting the prompt.
+    /// Clears `palette`, `minibuffer`, `menu`, and `pending_keys` before setting the prompt.
     /// At most one of {prompt, minibuffer, palette} is ever active at once.
     pub fn open_prompt(&mut self, p: crate::prompt::Prompt) {
         self.palette = None;
+        self.minibuffer = None;
         self.menu = None;
         self.pending_keys.clear();
         self.prompt = Some(p);
+    }
+
+    /// Open the command palette, enforcing single-overlay XOR invariant.
+    ///
+    /// Clears `prompt`, `minibuffer`, `menu`, and `pending_keys` before opening.
+    /// At most one of {prompt, minibuffer, palette, menu} is ever active at once.
+    pub fn open_palette(&mut self) {
+        self.prompt = None;
+        self.minibuffer = None;
+        self.menu = None;
+        self.pending_keys.clear();
+        self.palette = Some(crate::palette::Palette::default());
     }
 
     // Thin delegators — external callers unchanged.
