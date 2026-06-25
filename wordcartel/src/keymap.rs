@@ -174,6 +174,16 @@ impl KeyTrie {
         self.map.remove(seq);
     }
 
+    /// Reverse-lookup: a display chord bound to `id`, or None if unbound.
+    /// Shortest sequence wins; ties broken by the rendered string (KeyChord isn't Ord).
+    #[allow(dead_code)] // wired in Task 3
+    pub fn chord_for(&self, id: CommandId) -> Option<String> {
+        self.map.iter()
+            .filter(|(_, v)| **v == id)
+            .map(|(seq, _)| chords_display(seq))
+            .min_by(|a, b| a.chars().count().cmp(&b.chars().count()).then_with(|| a.cmp(b)))
+    }
+
     /// Resolve `pending` against the trie.
     pub fn resolve(&self, pending: &[KeyChord]) -> Resolution {
         if let Some(id) = self.map.get(pending) {
@@ -224,6 +234,8 @@ static CUA: &[(&str, &str)] = &[
     // Tools  (input.rs lines 100–101)
     ("ctrl-e", "filter"),
     ("ctrl-t", "transform"),
+    ("ctrl-p", "palette"),
+    ("f10",    "menu"),
     // View  (input.rs lines 102, 114)
     ("ctrl-\\", "cycle_render_mode"),
     ("f1",      "cycle_render_mode"),
@@ -498,5 +510,13 @@ mod tests {
                 assert!(reg.resolve_name(id).is_some(), "preset {preset} id {id} not in registry");
             }
         }
+    }
+
+    #[test]
+    fn chord_for_returns_shortest_and_blank_when_unbound() {
+        let (t, _) = build_keymap(&crate::config::KeymapConfig::default(), &crate::registry::Registry::builtins());
+        assert_eq!(t.chord_for(crate::registry::CommandId("cut")).as_deref(), Some("ctrl-x"));
+        // a command with no default binding → None
+        assert_eq!(t.chord_for(crate::registry::CommandId("ventilate")), None);
     }
 }

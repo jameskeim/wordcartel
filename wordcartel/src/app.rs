@@ -390,6 +390,53 @@ fn apply_clipboard_availability(editor: &mut Editor, ok: bool) {
     }
 }
 
+/// Fill rows for a freshly-opened palette (empty rows + empty query → rebuild).
+/// Called immediately after any command dispatch and after dispatch_overlay_command
+/// so a just-opened overlay has content before the first render.
+fn hydrate_overlays(editor: &mut Editor, reg: &crate::registry::Registry, keymap: &crate::keymap::KeyTrie) {
+    if let Some(ref mut p) = editor.palette {
+        if p.rows.is_empty() && p.query.is_empty() {
+            crate::palette::rebuild_rows(p, reg, keymap);
+        }
+    }
+    if editor.menu.as_ref().is_some_and(|v| !v.built) {
+        editor.menu = Some(crate::menu::build(reg, keymap));
+    }
+}
+
+/// Close the active overlay, dispatch `id` via the registry, drain executor results,
+/// then hydrate any overlay opened by the dispatched command.
+fn dispatch_overlay_command(
+    editor: &mut Editor,
+    reg: &crate::registry::Registry,
+    keymap: &crate::keymap::KeyTrie,
+    ex: &dyn crate::jobs::Executor,
+    clock: &dyn wordcartel_core::history::Clock,
+    msg_tx: &std::sync::mpsc::Sender<Msg>,
+    id: crate::registry::CommandId,
+) {
+    editor.palette = None;
+    editor.menu = None;
+    let mut ctx = crate::registry::Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
+    reg.dispatch(id, &mut ctx);
+    for r in ex.drain() { apply_result(r, editor); }
+    // Hydrate any overlay the dispatched command may have opened (Codex 3c).
+    hydrate_overlays(editor, reg, keymap);
+}
+
+#[cfg(test)]
+pub fn menu_select_for_test(
+    editor: &mut Editor,
+    reg: &crate::registry::Registry,
+    ex: &dyn crate::jobs::Executor,
+    clock: &dyn wordcartel_core::history::Clock,
+    msg_tx: &std::sync::mpsc::Sender<Msg>,
+    id: crate::registry::CommandId,
+) {
+    let (keymap, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), reg);
+    dispatch_overlay_command(editor, reg, &keymap, ex, clock, msg_tx, id);
+}
+
 /// Process one message. Returns true while the app should keep running.
 pub fn reduce(
     msg: Msg,
@@ -400,6 +447,153 @@ pub fn reduce(
     clock: &dyn Clock,
     msg_tx: &std::sync::mpsc::Sender<Msg>,
 ) -> bool {
+    // Menu overlay intercepts KEY INPUT and PASTE (no text field; paste is
+    // consumed / silently dropped). Non-key, non-paste messages fall through to
+    // the normal handlers so background work continues while the menu is open.
+    if editor.menu.is_some() {
+        if let Msg::Input(Event::Paste(_)) = &msg {
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
+        }
+        if let Msg::Input(Event::Key(k)) = &msg {
+            if k.kind == crossterm::event::KeyEventKind::Press {
+                let mut selected = None;
+                match k.code {
+                    crossterm::event::KeyCode::Esc | crossterm::event::KeyCode::F(10) => {
+                        editor.menu = None;
+                    }
+                    crossterm::event::KeyCode::Up => {
+                        if let Some(menu) = editor.menu.as_mut() {
+                            menu.state.up();
+                        }
+                    }
+                    crossterm::event::KeyCode::Down => {
+                        if let Some(menu) = editor.menu.as_mut() {
+                            menu.state.down();
+                        }
+                    }
+                    crossterm::event::KeyCode::Left => {
+                        if let Some(menu) = editor.menu.as_mut() {
+                            menu.state.left();
+                        }
+                    }
+                    crossterm::event::KeyCode::Right => {
+                        if let Some(menu) = editor.menu.as_mut() {
+                            menu.state.right();
+                        }
+                    }
+                    crossterm::event::KeyCode::Enter => {
+                        if let Some(menu) = editor.menu.as_mut() {
+                            menu.state.select();
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(menu) = editor.menu.as_mut() {
+                    for ev in menu.state.drain_events() {
+                        match ev {
+                            tui_menu::MenuEvent::Selected(id) => {
+                                selected = Some(id);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if let Some(id) = selected {
+                    dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
+                }
+            }
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
+        }
+        // Non-key msg falls through to normal handling while menu stays open.
+    }
+
+    // Palette overlay intercepts KEY INPUT and PASTE. Non-key, non-paste messages
+    // (FilterDone, JobDone, Tick) fall through to normal handling while the
+    // palette stays open.
+    if editor.palette.is_some() {
+        if let Msg::Input(Event::Paste(text)) = msg {
+            if let Some(p) = editor.palette.as_mut() {
+                p.query.insert_str(p.cursor, &text);
+                p.cursor += text.len();
+                crate::palette::rebuild_rows(p, reg, keymap);
+                let max = p.rows.len().saturating_sub(1);
+                if p.selected > max { p.selected = max; }
+            }
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
+        }
+        if let Msg::Input(Event::Key(k)) = &msg {
+            if k.kind == crossterm::event::KeyEventKind::Press {
+                match k.code {
+                    crossterm::event::KeyCode::Esc => {
+                        editor.palette = None;
+                    }
+                    crossterm::event::KeyCode::Enter => {
+                        let id_opt = editor.palette.as_ref()
+                            .and_then(|p| p.rows.get(p.selected))
+                            .map(|r| r.id);
+                        if let Some(id) = id_opt {
+                            dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
+                        }
+                    }
+                    crossterm::event::KeyCode::Up => {
+                        if let Some(p) = editor.palette.as_mut() {
+                            p.selected = p.selected.saturating_sub(1);
+                        }
+                    }
+                    crossterm::event::KeyCode::Down => {
+                        if let Some(p) = editor.palette.as_mut() {
+                            let max = p.rows.len().saturating_sub(1);
+                            p.selected = (p.selected + 1).min(max);
+                        }
+                    }
+                    crossterm::event::KeyCode::Backspace => {
+                        if let Some(p) = editor.palette.as_mut() {
+                            if p.cursor > 0 {
+                                // remove the char before cursor (byte-safe for ASCII labels)
+                                let byte_pos = p.query[..p.cursor].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                                p.query.remove(byte_pos);
+                                p.cursor = byte_pos;
+                            }
+                            crate::palette::rebuild_rows(p, reg, keymap);
+                        }
+                    }
+                    crossterm::event::KeyCode::Left => {
+                        if let Some(p) = editor.palette.as_mut() {
+                            if p.cursor > 0 {
+                                p.cursor -= p.query[..p.cursor].char_indices().next_back().map(|(_, c)| c.len_utf8()).unwrap_or(0);
+                            }
+                        }
+                    }
+                    crossterm::event::KeyCode::Right => {
+                        if let Some(p) = editor.palette.as_mut() {
+                            if p.cursor < p.query.len() {
+                                let c = p.query[p.cursor..].chars().next().unwrap();
+                                p.cursor += c.len_utf8();
+                            }
+                        }
+                    }
+                    crossterm::event::KeyCode::Char(c)
+                        if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                            && !k.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
+                    {
+                        if let Some(p) = editor.palette.as_mut() {
+                            p.query.insert(p.cursor, c);
+                            p.cursor += c.len_utf8();
+                            crate::palette::rebuild_rows(p, reg, keymap);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
+        }
+        // Non-key msg falls through to normal handling while palette stays open.
+    }
+
     // Active modal intercepts KEY INPUT only (§5.3). Background results and ticks
     // must still be processed — a JobDone arriving while a modal is up (e.g. an
     // in-flight save completing during the quit-confirm prompt) must not be
@@ -501,6 +695,7 @@ pub fn reduce(
                         editor.status.clear();
                         let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
                         reg.dispatch(id, &mut ctx);
+                        hydrate_overlays(editor, reg, keymap);
                     }
                     crate::keymap::Resolution::Pending => {
                         editor.status = format!("{} …", crate::keymap::chords_display(&editor.pending_keys));
@@ -686,14 +881,14 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
             }
             crate::swap::RecoveryDecision::Prompt(_h, body) => {
                 editor.active_mut().pending_swap_body = Some(body);
-                editor.prompt = Some(crate::prompt::Prompt::swap_recovery());
+                editor.open_prompt(crate::prompt::Prompt::swap_recovery());
                 editor.status = "Recovery file found".into();
             }
         }
     } else if let Some((sp, _header, body)) = crate::swap::find_orphan_scratch_swap() {
         editor.active_mut().pending_swap_body = Some(body);
         editor.active_mut().pending_swap_path = Some(sp);
-        editor.prompt = Some(crate::prompt::Prompt::swap_recovery());
+        editor.open_prompt(crate::prompt::Prompt::swap_recovery());
         editor.status = "Recovery file found".into();
     }
 
@@ -780,7 +975,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     // Track saved_version to detect when a save completes in the loop.
     let mut last_persisted_saved = editor.active().document.saved_version;
 
-    guard.terminal().draw(|f| render::render(f, &editor))?;
+    guard.terminal().draw(|f| render::render(f, &mut editor))?;
     loop {
         let now = clock.now_ms();
         // Bounded save&quit: if waiting for an in-flight save to complete and
@@ -790,7 +985,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
             if waited > SAVE_QUIT_TIMEOUT_MS {
                 editor.quit_after_save = None;
                 editor.quit_after_save_at = None;
-                editor.prompt = Some(crate::prompt::Prompt::quit_confirm());
+                editor.open_prompt(crate::prompt::Prompt::quit_confirm());
                 editor.status = "Save still running — choose again".into();
             }
         }
@@ -812,7 +1007,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
         };
         let keep = reduce(msg, &mut editor, &reg, &keymap, &executor, &clock, &msg_tx);
         crate::clipboard::drain_clipboard_intents(&mut editor, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
-        guard.terminal().draw(|f| render::render(f, &editor))?;
+        guard.terminal().draw(|f| render::render(f, &mut editor))?;
         // Persist session state when a save just completed (saved_version advanced).
         let sv = editor.active().document.saved_version;
         if sv != last_persisted_saved {
@@ -922,6 +1117,15 @@ mod tests {
         Msg::Input(Event::Key(KeyEvent { code, modifiers: mods, kind: KeyEventKind::Press, state: KeyEventState::NONE }))
     }
 
+    fn f10() -> crossterm::event::Event {
+        crossterm::event::Event::Key(KeyEvent {
+            code: KeyCode::F(10),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })
+    }
+
     // -------------------------------------------------------------------------
     // Brief's required failing test (Task 12 step 1)
     // -------------------------------------------------------------------------
@@ -1000,6 +1204,23 @@ mod tests {
         assert_eq!(e.register.get(), Some("XY"), "OS text updates the register");
         e.active_mut().undo();
         assert_eq!(e.active().document.buffer.to_string(), "ab\n");
+    }
+
+    #[test]
+    fn f10_opens_menu_and_selected_event_dispatches() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::range(0, 3);
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &Registry::builtins());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        // Simulate a menu selection routing: open, then feed a synthesized Selected(copy) via the menu handler path.
+        crate::app::reduce(Msg::Input(f10()), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.menu.is_some(), "F10 opens the menu");
+        // drive a selection of "copy" through the menu->dispatch path (helper exercising drain_events->dispatch_overlay_command)
+        crate::app::menu_select_for_test(&mut e, &reg, &ex, &clk, &tx, crate::registry::CommandId("copy"));
+        assert!(e.menu.is_none(), "selection closes the menu");
+        assert_eq!(e.register.get(), Some("abc"));
     }
 
     #[test]
@@ -1585,7 +1806,7 @@ mod tests {
         let mut e = Editor::new_from_text("x\n", Some(source.clone()), (80, 24));
         e.active_mut().document.version = 1; // dirty → prompt would normally be up
         // Manually raise a prompt to simulate the overlay scenario.
-        e.prompt = Some(crate::prompt::Prompt::quit_confirm());
+        e.open_prompt(crate::prompt::Prompt::quit_confirm());
 
         let buffer_id = e.active().id;
         let reg = Registry::builtins();
@@ -1753,11 +1974,44 @@ mod tests {
     }
 
     #[test]
+    fn paste_into_open_palette_edits_query_not_document() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::Event;
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        let reg = Registry::builtins();
+        let (keymap, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let mut p = crate::palette::Palette::default();
+        crate::palette::rebuild_rows(&mut p, &reg, &keymap);
+        e.palette = Some(p);
+        let doc_before = e.active().document.buffer.to_string();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::Input(Event::Paste("foo".into())), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), doc_before, "document untouched under open palette");
+        assert_eq!(e.palette.as_ref().unwrap().query, "foo", "paste inserted into palette query");
+        assert!(e.palette.is_some(), "palette remains open after paste");
+    }
+
+    #[test]
+    fn paste_under_open_menu_does_not_touch_document() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::Event;
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        e.menu = Some(crate::menu::empty());
+        let doc_before = e.active().document.buffer.to_string();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::Input(Event::Paste("bar".into())), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), doc_before, "document untouched under open menu");
+        assert!(e.menu.is_some(), "menu remains open after paste");
+    }
+
+    #[test]
     fn bracketed_paste_with_modal_prompt_is_ignored() {
         use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
         use crossterm::event::Event;
         let mut e = Editor::new_from_text("doc\n", None, (80, 24));
-        e.prompt = Some(crate::prompt::Prompt::quit_confirm());
+        e.open_prompt(crate::prompt::Prompt::quit_confirm());
         let doc_before = e.active().document.buffer.to_string();
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
@@ -1888,5 +2142,60 @@ mod tests {
         assert_eq!(crate::app::apply_resume(&e, (10,20), 3), Some((3,2)), "cursor clamped to doc_len");
         // identity mismatch → discard
         assert_eq!(crate::app::apply_resume(&e, (11,20), 100), None);
+    }
+
+    #[test]
+    fn ctrl_p_opens_palette_and_enter_dispatches_selected() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::range(0, 3);
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &Registry::builtins());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let press = |c, m| Event::Key(KeyEvent { code: c, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        // Ctrl+P opens + hydrates
+        crate::app::reduce(Msg::Input(press(KeyCode::Char('p'), KeyModifiers::CONTROL)), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.palette.is_some());
+        assert!(!e.palette.as_ref().unwrap().rows.is_empty(), "palette hydrated with all commands on open");
+        // type "copy", select first, Enter → dispatches copy (register gets the selection)
+        for ch in "copy".chars() { crate::app::reduce(Msg::Input(press(KeyCode::Char(ch), KeyModifiers::NONE)), &mut e, &reg, &km, &ex, &clk, &tx); }
+        crate::app::reduce(Msg::Input(press(KeyCode::Enter, KeyModifiers::NONE)), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.palette.is_none(), "Enter closes the palette");
+        assert_eq!(e.register.get(), Some("abc"), "selected command (Copy) dispatched");
+    }
+
+    #[test]
+    fn palette_esc_closes_and_nonkey_falls_through() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        e.palette = Some(crate::palette::Palette::default());
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &Registry::builtins());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        // a non-key Msg while palette open still applies (falls through) — e.g. a transform result
+        let bid = e.active().id;
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("X".into()) }, &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.palette.is_some(), "palette still open");
+        assert_eq!(e.active().document.buffer.to_string(), "Xab\n", "non-key msg fell through while palette open");
+        // Esc closes the palette
+        let esc = Event::Key(KeyEvent { code: KeyCode::Esc, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(esc), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.palette.is_none());
+    }
+
+    #[test]
+    fn f10_toggles_menu_closed_when_open() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let reg = Registry::builtins(); let km = cua_keymap(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        // F10 with menu closed → opens the menu
+        crate::app::reduce(Msg::Input(f10()), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.menu.is_some(), "F10 should open menu when closed");
+        // F10 with menu open → closes the menu
+        crate::app::reduce(Msg::Input(f10()), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.menu.is_none(), "F10 should close menu when open");
     }
 }

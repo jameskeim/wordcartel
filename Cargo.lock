@@ -469,6 +469,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nucleo-matcher"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf33f538733d1a5a3494b836ba913207f14d9d4a1d3cd67030c5061bdd2cac85"
+dependencies = [
+ "memchr",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1147,6 +1157,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tui-menu"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5165784d84bca6340bcb189960dcd63136faf19404ebdf420da05ab7fce55277"
+dependencies = [
+ "ratatui",
+]
+
+[[package]]
 name = "unarray"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1509,6 +1528,7 @@ dependencies = [
  "arboard",
  "crossterm",
  "dirs",
+ "nucleo-matcher",
  "proptest",
  "ratatui",
  "repar",
@@ -1517,6 +1537,7 @@ dependencies = [
  "subprocess",
  "thiserror 2.0.18",
  "toml",
+ "tui-menu",
  "wordcartel-core",
 ]
 
