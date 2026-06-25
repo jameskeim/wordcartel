@@ -186,7 +186,7 @@ git commit -m "feat(core): textobj word/sentence bounds (UAX-29) — pure block-
 
 **Interfaces:**
 - Consumes: `wordcartel_core::block_tree::{BlockTree, Block}` (`top_level()`, `Block.span: Range<usize>`, `Block.children: Vec<Block>`); `editor.active().document.blocks`; `editor.active().document.buffer` (`len()`, `byte_to_line`, `line_to_byte`).
-- Produces: `pub fn paragraph_range_at(blocks: &BlockTree, buf: &TextBuffer, pos: usize) -> (usize, usize)` — total over the document.
+- Produces: `pub fn paragraph_range_at(blocks: &BlockTree, buf: &TextBuffer, pos: usize) -> (usize, usize)` — total over the document; plus motion helpers `pub fn next_paragraph_start(blocks, buf, pos) -> usize` and `pub fn prev_paragraph_start(blocks, buf, pos) -> usize` used by Tasks 5/6 (these skip blank-line gaps and land on real leaf-block starts — `paragraph_range_at(.., wend)` must NOT be used for forward motion because the byte after a paragraph is usually a blank-line gap, Codex plan-review).
 
 - [ ] **Step 1: Write the failing tests** in `nav.rs` tests module:
 
@@ -283,7 +283,36 @@ pub fn paragraph_range_at(blocks: &BlockTree, buf: &TextBuffer, pos: usize) -> (
 
 (`total_logical_lines`, `line_start`, `line_text` are existing `derive` helpers used elsewhere in `nav.rs`; reuse them.)
 
-- [ ] **Step 4: Run tests + build.** `cargo test -p wordcartel --lib nav::tests::paragraph_range` → PASS; `cargo build -p wordcartel` → zero warnings (the fn is consumed by Tasks 6/7; if Task 2 lands alone it is briefly unused → add `#[allow(dead_code)] // wired in Task 6/7` and remove it in Task 6).
+Also add the **motion helpers** (forward/back paragraph starts that skip blank-line gaps — these collect leaf-block starts in document order, so they land on real paragraphs, not gaps):
+
+```rust
+/// Depth-first leaf-block spans in document order (a "paragraph" for motion).
+fn collect_leaf_spans(block: &Block, out: &mut Vec<(usize, usize)>) {
+    if block.children.is_empty() {
+        out.push((block.span.start, block.span.end));
+    } else {
+        for c in &block.children { collect_leaf_spans(c, out); }
+    }
+}
+fn leaf_spans(blocks: &BlockTree) -> Vec<(usize, usize)> {
+    let mut v = Vec::new();
+    for top in blocks.top_level() { collect_leaf_spans(top, &mut v); }
+    v.sort_by_key(|s| s.0);
+    v
+}
+/// Start of the next leaf block beginning strictly after `pos`, else `buf.len()`.
+pub fn next_paragraph_start(blocks: &BlockTree, buf: &TextBuffer, pos: usize) -> usize {
+    leaf_spans(blocks).into_iter().map(|(s, _)| s).find(|&s| s > pos).unwrap_or(buf.len())
+}
+/// Start of the leaf block before the one containing `pos`, else `0`.
+pub fn prev_paragraph_start(blocks: &BlockTree, buf: &TextBuffer, _pos: usize) -> usize {
+    // caller passes the *current paragraph start* as `pos` boundary; pick the
+    // last leaf start strictly before it.
+    leaf_spans(blocks).into_iter().map(|(s, _)| s).filter(|&s| s < _pos).next_back().unwrap_or(0)
+}
+```
+
+- [ ] **Step 4: Run tests + build.** `cargo test -p wordcartel --lib nav::tests::paragraph_range` → PASS; `cargo build -p wordcartel` → zero warnings (the fns are consumed by Tasks 5/6/7; if Task 2 lands alone they are briefly unused → add `#[allow(dead_code)] // wired in Task 5/6/7` and remove in Task 5/6).
 
 - [ ] **Step 5: Commit.**
 
@@ -407,7 +436,7 @@ fn apply_clears_sel_history() {
 - [ ] **Step 2: Run to verify failure.** `cargo test -p wordcartel --lib editor::tests::marks_follow editor::tests::apply_clears` → FAIL.
 
 - [ ] **Step 3: Implement.**
-  - Add to the `Buffer` struct (editor.rs ~line 60), and initialize them in **both** buffer-construction sites (`new_from_text` ~line 156 and any `alloc`/`open` path):
+  - Add to the `Buffer` struct (editor.rs ~line 60), and initialize them in the **only full `Buffer { … }` literal** (`new_from_text` ~line 156). Codex confirmed the reload/recovery paths (save.rs:132,150) use struct-update `..base` and inherit the new fields automatically — but grep `Buffer {` to confirm no second literal slipped in; if one exists, initialize there too:
 
 ```rust
     pub marks: std::collections::BTreeMap<char, usize>,
@@ -509,25 +538,32 @@ fn delete_word_back_is_one_undo_step() {
 - [ ] **Step 3: Implement.**
   - `nav.rs` — word motions with cross-block stitching (window = caret's leaf block via `paragraph_range_at`):
 
+**Borrow discipline (Codex plan-review):** every nav fn computes its result into a local `usize` using only immutable borrows, then takes `editor.active_mut()` to clear `desired_col` and returns the local — never reuse `buf`/`blocks` after `active_mut()`.
+
 ```rust
-/// Move to the start of the next word, crossing block boundaries.
+/// Move to the start of the next word, crossing block boundaries (skipping gaps).
 pub fn move_word_right(editor: &mut Editor) -> usize {
-    let buf = &editor.active().document.buffer;
-    let blocks = &editor.active().document.blocks;
     let h = head(editor);
-    let (wstart, wend) = paragraph_range_at(blocks, buf, h);
-    let window = buf.slice(wstart..wend);
-    let rel = h.saturating_sub(wstart);
-    let new = match wordcartel_core::textobj::next_word_start(&window, rel) {
-        Some(r) => wstart + r,
-        None => {
-            // No further word in this block → first word of the next block, else doc end.
-            let next_para = paragraph_range_at(blocks, buf, wend.min(buf.len().saturating_sub(0)));
-            let ntext = buf.slice(next_para.0..next_para.1);
-            match wordcartel_core::textobj::next_word_start(&ntext, 0)
-                .or_else(|| (!ntext.is_empty()).then_some(0)) {
-                Some(r) if next_para.0 + r > h => next_para.0 + r,
-                _ => buf.len(),
+    let new = {
+        let buf = &editor.active().document.buffer;
+        let blocks = &editor.active().document.blocks;
+        let (wstart, wend) = paragraph_range_at(blocks, buf, h);
+        let window = buf.slice(wstart..wend);
+        let rel = h.saturating_sub(wstart);
+        match wordcartel_core::textobj::next_word_start(&window, rel) {
+            Some(r) => wstart + r,
+            None => {
+                // First word of the next leaf block (skips blank-line gaps), else doc end.
+                let nps = next_paragraph_start(blocks, buf, wend);
+                if nps >= buf.len() {
+                    buf.len()
+                } else {
+                    let next_end = paragraph_range_at(blocks, buf, nps).1;
+                    let ntext = buf.slice(nps..next_end);
+                    wordcartel_core::textobj::next_word_start(&ntext, 0)
+                        .map(|r| nps + r)
+                        .unwrap_or(nps) // block starts with its first word
+                }
             }
         }
     };
@@ -535,25 +571,28 @@ pub fn move_word_right(editor: &mut Editor) -> usize {
     new
 }
 
-/// Move to the start of the previous word, crossing block boundaries.
+/// Move to the start of the previous word, crossing block boundaries (skipping gaps).
 pub fn move_word_left(editor: &mut Editor) -> usize {
-    let buf = &editor.active().document.buffer;
-    let blocks = &editor.active().document.blocks;
     let h = head(editor);
-    let (wstart, wend) = paragraph_range_at(blocks, buf, h);
-    let window = buf.slice(wstart..wend);
-    let rel = h.saturating_sub(wstart);
-    let new = match wordcartel_core::textobj::prev_word_start(&window, rel) {
-        Some(r) => wstart + r,
-        None if wstart > 0 => {
-            let prev_para = paragraph_range_at(blocks, buf, wstart - 1);
-            let ptext = buf.slice(prev_para.0..prev_para.1);
-            let rel_end = ptext.len();
-            wordcartel_core::textobj::prev_word_start(&ptext, rel_end)
-                .map(|r| prev_para.0 + r)
-                .unwrap_or(prev_para.0)
+    let new = {
+        let buf = &editor.active().document.buffer;
+        let blocks = &editor.active().document.blocks;
+        let (wstart, wend) = paragraph_range_at(blocks, buf, h);
+        let _ = wend;
+        let window = buf.slice(wstart..wend);
+        let rel = h.saturating_sub(wstart);
+        match wordcartel_core::textobj::prev_word_start(&window, rel) {
+            Some(r) => wstart + r,
+            None if wstart > 0 => {
+                let pps = prev_paragraph_start(blocks, buf, wstart);
+                let prev_end = paragraph_range_at(blocks, buf, pps).1;
+                let ptext = buf.slice(pps..prev_end);
+                wordcartel_core::textobj::prev_word_start(&ptext, ptext.len())
+                    .map(|r| pps + r)
+                    .unwrap_or(pps)
+            }
+            None => 0,
         }
-        None => 0,
     };
     editor.active_mut().desired_col = None;
     new
@@ -581,7 +620,7 @@ pub fn move_word_left(editor: &mut Editor) -> usize {
             let cs = ChangeSet::delete(from..to, doc_len);
             let edit = Edit { range: from..to, new_len: 0 };
             let txn = Transaction::new(cs).with_selection(Selection::single(from));
-            editor.apply(txn, edit, EditKind::Type, clock);
+            editor.apply(txn, edit, EditKind::Other, clock); // EditKind::Other — match existing delete commands (commands.rs:209), avoid coalescing with typed chars
             nav::ensure_visible(editor);
             editor.active_mut().desired_col = None;
             CommandResult::Handled
@@ -660,24 +699,30 @@ fn page_down_moves_down_about_a_page() {
 - [ ] **Step 3: Implement.**
   - `nav.rs`:
 
+**Borrow discipline (Codex plan-review):** compute the result into a local with immutable borrows, then `active_mut()` for `desired_col`, then return — do not reuse `buf`/`blocks` after `active_mut()`. Paragraph motion uses the gap-skipping helpers from Task 2.
+
 ```rust
 pub fn move_paragraph_down(editor: &mut Editor) -> usize {
-    let buf = &editor.active().document.buffer;
-    let blocks = &editor.active().document.blocks;
     let h = head(editor);
-    let (_from, to) = paragraph_range_at(blocks, buf, h);
-    let next = paragraph_range_at(blocks, buf, to.min(buf.len()));
+    let result = {
+        let buf = &editor.active().document.buffer;
+        let blocks = &editor.active().document.blocks;
+        next_paragraph_start(blocks, buf, h) // next leaf-block start, else buf.len()
+    };
     editor.active_mut().desired_col = None;
-    if next.0 > h { next.0 } else { buf.len() }
+    result
 }
 
 pub fn move_paragraph_up(editor: &mut Editor) -> usize {
-    let buf = &editor.active().document.buffer;
-    let blocks = &editor.active().document.blocks;
     let h = head(editor);
-    let (from, _to) = paragraph_range_at(blocks, buf, h);
+    let result = {
+        let buf = &editor.active().document.buffer;
+        let blocks = &editor.active().document.blocks;
+        let (from, _to) = paragraph_range_at(blocks, buf, h);
+        if from < h { from } else { prev_paragraph_start(blocks, buf, from) }
+    };
     editor.active_mut().desired_col = None;
-    if from < h { from } else if from == 0 { 0 } else { paragraph_range_at(blocks, buf, from - 1).0 }
+    result
 }
 
 pub fn move_doc_start(editor: &mut Editor) -> usize { editor.active_mut().desired_col = None; 0 }
@@ -686,13 +731,19 @@ pub fn move_doc_end(editor: &mut Editor) -> usize {
     editor.active_mut().desired_col = None; len
 }
 
-/// Move the caret down by (editing-area height − 1) visual rows, preserving
-/// desired_col (like move_down). Implemented by repeated move_down so wrapped
-/// lines are handled by the existing layout-aware logic.
+/// Move the caret by one page (one-row overlap), preserving desired_col (like
+/// move_up/down). Implemented by repeated move_up/down so wrapped lines are
+/// handled by the existing layout-aware logic. `editing_height = area.1 - 1`
+/// (the status row is reserved — matches nav.rs:62); page step = editing_height
+/// − 1 for one row of context overlap.
+fn page_step(editor: &Editor) -> usize {
+    let editing_height = (editor.active().view.area.1 as usize).saturating_sub(1);
+    editing_height.saturating_sub(1).max(1)
+}
 pub fn move_page_down(editor: &mut Editor) -> usize {
-    let h = (editor.active().view.area.1 as usize).saturating_sub(1).max(1) - 1;
+    let steps = page_step(editor);
     let mut off = head(editor);
-    for _ in 0..h.max(1) {
+    for _ in 0..steps {
         let next = move_down(editor); // preserves desired_col across the run
         if next == off { break; }
         editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(next);
@@ -701,9 +752,9 @@ pub fn move_page_down(editor: &mut Editor) -> usize {
     off
 }
 pub fn move_page_up(editor: &mut Editor) -> usize {
-    let h = (editor.active().view.area.1 as usize).saturating_sub(1).max(1) - 1;
+    let steps = page_step(editor);
     let mut off = head(editor);
-    for _ in 0..h.max(1) {
+    for _ in 0..steps {
         let next = move_up(editor);
         if next == off { break; }
         editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(next);
@@ -713,7 +764,7 @@ pub fn move_page_up(editor: &mut Editor) -> usize {
 }
 ```
 
-  (Note: `move_page_*` step the real selection internally because `move_up/down` read the live caret; the `Move` arm then sets the final selection from the returned offset. This preserves `desired_col` across the page jump, matching arrow behavior.)
+  (Note: `move_page_*` step the real selection internally because `move_up/down` read the live caret; the `Move` arm then sets the final selection from the returned offset. This preserves `desired_col` across the page jump, matching arrow behavior. The `page_down_moves_down_about_a_page` test bound may need ±1 adjustment to match `page_step` — assert a range, not an exact line.)
 
   - `commands.rs` — extend `Dir` with `ParagraphUp, ParagraphDown, PageUp, PageDown, DocStart, DocEnd` and add the match arms:
 
@@ -869,7 +920,8 @@ fn set_selection_range(editor: &mut Editor, from: usize, to: usize) {
                 if f <= cf && t >= ct && (f < cf || t > ct) { next = Some((f, t)); break; }
             }
             if let Some((f, t)) = next {
-                editor.active_mut().sel_history.push(editor.active().document.selection.clone());
+                let cur_sel = editor.active().document.selection.clone(); // clone to a local first (Codex: no overlapping borrow)
+                editor.active_mut().sel_history.push(cur_sel);
                 set_selection_range(editor, f, t);
                 CommandResult::Handled
             } else { CommandResult::Noop }
@@ -884,7 +936,7 @@ fn set_selection_range(editor: &mut Editor, from: usize, to: usize) {
         }
 ```
 
-  - `registry.rs`:
+  - `registry.rs` — **add `Scope` to the `use crate::commands::{…}` import** (it currently imports `Command, CommandResult, Dir` but not `Scope` — Codex), then register:
 
 ```rust
         r.register("select_word",      "Select Word",      None, |c| run(c, Command::SelectScope(Scope::Word)));
@@ -1013,10 +1065,11 @@ pub fn resolve_pending(editor: &mut Editor, ch: char) {
         }
         Some(MarkPending::Jump) => {
             editor.active_mut().sel_history.clear();
-            if let Some(&raw) = editor.active().marks.get(&ch) {
+            let raw = editor.active().marks.get(&ch).copied(); // copy out → borrow ends
+            if let Some(raw) = raw {
                 let pre = nav::head(editor);
                 record_jump(editor.active_mut(), pre);
-                let off = nav::clamp_snap(editor, raw); // Task 11 helper; see note
+                let off = nav::clamp_snap(editor, raw);
                 editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(off);
                 crate::derive::rebuild(editor);
                 nav::ensure_visible(editor);
@@ -1030,7 +1083,22 @@ pub fn resolve_pending(editor: &mut Editor, ch: char) {
 }
 ```
 
-   **Note on `nav::clamp_snap`:** add a small public helper in `nav.rs` now (it is also used by Tasks 9–10): `pub fn clamp_snap(editor: &Editor, off: usize) -> usize` that clamps to `0..=len`, finds the caret line, gets/derives its `ColMap`, and returns `line_start + map.snap_to_stop(off - line_start)`. Model it on the snapping already done in `screen_pos` (nav.rs:88).
+   **`nav::clamp_snap` (add to `nav.rs` now; used by Tasks 8–10) — snaps against the OFFSET's OWN line, not the caret line (Codex Critical):**
+
+```rust
+/// Clamp `off` to `0..=len` and snap it to a grapheme stop on ITS OWN line
+/// (a mark/ring/session offset may be on a different line than the caret).
+pub fn clamp_snap(editor: &Editor, off: usize) -> usize {
+    let buf = &editor.active().document.buffer;
+    let len = buf.len();
+    let off = off.min(len);
+    if len == 0 { return 0; }
+    let line = buf.byte_to_line(off.min(len.saturating_sub(1)));
+    let ls = derive::line_start(buf, line);
+    let map = get_or_layout(editor, line);
+    ls + map.snap_to_stop(off.saturating_sub(ls))
+}
+```
 
   - `app.rs` — add the **interception block at the very top of `reduce`** (above the menu/palette blocks), key-only, non-key falls through:
 
@@ -1039,8 +1107,8 @@ pub fn resolve_pending(editor: &mut Editor, ch: char) {
         if let Msg::Input(Event::Key(k)) = &msg {
             if k.kind == crossterm::event::KeyEventKind::Press {
                 match k.code {
-                    KeyCode::Esc => { editor.pending_mark = None; editor.status.clear(); }
-                    KeyCode::Char(c) => crate::marks::resolve_pending(editor, c),
+                    crossterm::event::KeyCode::Esc => { editor.pending_mark = None; editor.status.clear(); }
+                    crossterm::event::KeyCode::Char(c) => crate::marks::resolve_pending(editor, c),
                     _ => { editor.pending_mark = None; } // non-name key cancels
                 }
             }
@@ -1051,7 +1119,7 @@ pub fn resolve_pending(editor: &mut Editor, ch: char) {
     }
 ```
 
-   and in the `menu` command body (registry.rs, where it already clears prompt/minibuffer/palette/pending_keys) add `c.editor.pending_mark = None;`. Also add `self.pending_mark = None;` is NOT needed in `open_prompt`/`open_minibuffer`/`open_palette` directly — instead add it there too for symmetry (one line each) so every modal opener clears it.
+   (`KeyCode` is fully qualified because `app.rs` does not import it at the top — Codex.) For the single-modal invariant, clear `pending_mark` at every modal-open site: add `self.pending_mark = None;` to `open_prompt` (editor.rs:199), `open_minibuffer` (editor.rs:182), and `open_palette` (editor.rs:211), and add `c.editor.pending_mark = None;` to the `menu` command body (registry.rs:136, which already clears prompt/minibuffer/palette/pending_keys).
 
   - `registry.rs`:
 
@@ -1110,19 +1178,26 @@ fn jump_back_and_forward_walk_the_ring() {
 
 - [ ] **Step 3: Implement** in `marks.rs`:
 
+**Borrow discipline (Codex plan-review):** scope the `active_mut()` ring bookkeeping into a block that yields the target `raw: usize`, so the mutable borrow ends before `nav::clamp_snap(editor, …)` (which borrows `&Editor`) runs.
+
 ```rust
 pub fn jump_back(editor: &mut Editor) {
     editor.active_mut().sel_history.clear();
     let here = nav::head(editor);
-    let buf = editor.active_mut();
-    if buf.ring_cursor == buf.jump_ring.len() {
-        // parked at the live caret — record it as the forward anchor
-        if buf.jump_ring.last() != Some(&here) { buf.jump_ring.push(here); }
-    }
-    if buf.ring_cursor == 0 { editor.status = "ring: at oldest".into(); return; }
-    let buf = editor.active_mut();
-    buf.ring_cursor -= 1;
-    let raw = buf.jump_ring[buf.ring_cursor];
+    let raw: Option<usize> = {
+        let buf = editor.active_mut();
+        if buf.ring_cursor == buf.jump_ring.len() {
+            // parked at the live caret — record it as the forward anchor
+            if buf.jump_ring.last() != Some(&here) { buf.jump_ring.push(here); }
+        }
+        if buf.ring_cursor == 0 {
+            None
+        } else {
+            buf.ring_cursor -= 1;
+            Some(buf.jump_ring[buf.ring_cursor])
+        }
+    }; // <- mutable borrow ends here
+    let Some(raw) = raw else { editor.status = "ring: at oldest".into(); return; };
     let off = nav::clamp_snap(editor, raw);
     editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(off);
     crate::derive::rebuild(editor);
@@ -1131,10 +1206,16 @@ pub fn jump_back(editor: &mut Editor) {
 
 pub fn jump_forward(editor: &mut Editor) {
     editor.active_mut().sel_history.clear();
-    let buf = editor.active_mut();
-    if buf.ring_cursor + 1 >= buf.jump_ring.len() { editor.status = "ring: at newest".into(); return; }
-    buf.ring_cursor += 1;
-    let raw = buf.jump_ring[buf.ring_cursor];
+    let raw: Option<usize> = {
+        let buf = editor.active_mut();
+        if buf.ring_cursor + 1 >= buf.jump_ring.len() {
+            None
+        } else {
+            buf.ring_cursor += 1;
+            Some(buf.jump_ring[buf.ring_cursor])
+        }
+    };
+    let Some(raw) = raw else { editor.status = "ring: at newest".into(); return; };
     let off = nav::clamp_snap(editor, raw);
     editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(off);
     crate::derive::rebuild(editor);
@@ -1178,52 +1259,59 @@ git commit -m "feat(marks): jump-back ring (alt-left/right); doc-extent jumps pu
 - Test: `wordcartel/src/app.rs`
 
 **Interfaces:**
-- Consumes: `Buffer.marks` (Task 4); `state.rs` `StateEntry.marks: BTreeMap<String, usize>` + the existing mtime/size staleness guard; `nav::clamp_snap` (Task 8).
-- Produces: marks survive a save→reopen round-trip when the staleness guard accepts the entry.
+- Consumes: `Buffer.marks` (Task 4); `state.rs` `StateEntry.marks: BTreeMap<String, usize>`; `nav::clamp_snap` (Task 8). NOTE (Codex): `apply_resume` (app.rs:237) is a **pure** `fn apply_resume(e: &StateEntry, current: (i64,u64), doc_len) -> Option<(usize,usize)>` with no `editor` param — it only DECIDES the resume position. The mutation happens at its call site (app.rs:964-968, inside the `if let Some((cur, scroll)) = apply_resume(...)` guard-passed branch). Marks load goes THERE, not inside `apply_resume`.
+- Produces: `pub fn load_marks_from_entry(editor: &mut Editor, entry: &crate::state::StateEntry)` (testable helper, called at the guard-passed site); marks survive a save→reopen round-trip when the staleness guard accepts the entry.
 
 - [ ] **Step 1: Write the failing test** in `app.rs`:
 
 ```rust
 #[test]
-fn marks_round_trip_through_state_entry() {
-    // Build a StateEntry with a mark, run apply_resume, assert Buffer.marks populated.
+fn load_marks_from_entry_populates_clamped() {
     use std::collections::BTreeMap;
     let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
     let mut marks = BTreeMap::new();
     marks.insert("a".to_string(), 6usize);
-    let entry = crate::state::StateEntry {
-        cursor: 0, scroll: 0, marks, mtime: 0, size: 0, seq: 1,
-    };
-    // staleness guard accepts when mtime/size match (here both 0 vs a fresh buffer's 0/len);
-    // call the resume applier with a guard-pass and assert marks loaded + clamped.
-    crate::app::apply_resume_for_test(&mut e, &entry, /*guard_ok=*/true);
+    marks.insert("b".to_string(), 999usize); // past EOF → clamped to len
+    let entry = crate::state::StateEntry { cursor: 0, scroll: 0, marks, mtime: 0, size: 0, seq: 1 };
+    crate::app::load_marks_from_entry(&mut e, &entry);
     assert_eq!(e.active().marks.get(&'a'), Some(&6));
+    assert_eq!(e.active().marks.get(&'b'), Some(&e.active().document.buffer.len()));
 }
 ```
 
-(If `apply_resume` is not directly callable, add a thin `#[cfg(test)] pub fn apply_resume_for_test(...)` shim mirroring the production path, as 5b did for menu routing.)
+(`load_marks_from_entry` is the production helper — calling it directly tests the load logic without the session/path/file-identity plumbing. The staleness gate is enforced by the *call site* — see Step 3 — so the test deliberately exercises the helper alone.)
 
-- [ ] **Step 2: Run to verify failure.** `cargo test -p wordcartel --lib app::tests::marks_round_trip` → FAIL.
+- [ ] **Step 2: Run to verify failure.** `cargo test -p wordcartel --lib app::tests::load_marks_from_entry` → FAIL.
 
 - [ ] **Step 3: Implement.**
-  - In the production resume path (`apply_resume`, app.rs ~line 237) where it currently applies only cursor/scroll under the staleness guard, also populate marks (string→char, clamped+snapped):
+  - Add the helper near `apply_resume` in app.rs:
 
 ```rust
-        for (k, &raw) in &entry.marks {
-            if let Some(ch) = k.chars().next() {
-                let off = nav::clamp_snap(editor, raw);
-                editor.active_mut().marks.insert(ch, off);
-            }
+/// Populate the active buffer's marks from a session entry (string→char keys),
+/// clamped+grapheme-snapped. Call only when the staleness guard has accepted
+/// the entry (mirrors cursor/scroll restore).
+pub fn load_marks_from_entry(editor: &mut Editor, entry: &crate::state::StateEntry) {
+    for (k, &raw) in &entry.marks {
+        if let Some(ch) = k.chars().next() {
+            let off = nav::clamp_snap(editor, raw);
+            editor.active_mut().marks.insert(ch, off);
         }
+    }
+}
 ```
 
-  - In the persist path (where `StateEntry { … marks: BTreeMap::new() … }` is built, app.rs ~line 1058), replace the empty map with the live marks:
+  - Call it at the **guard-passed** resume site (app.rs:968), inside the existing `if let Some((cur, scroll)) = apply_resume(...)` block, right after `editor.active_mut().view.scroll = scroll;`:
+
+```rust
+                            load_marks_from_entry(&mut editor, entry);
+```
+
+   (So marks load only when mtime+size match — the same gate as cursor/scroll.)
+  - In the persist path, replace `marks: std::collections::BTreeMap::new(), // 5c will fill this` (app.rs:1061) with the live marks:
 
 ```rust
         marks: editor.active().marks.iter().map(|(c, &o)| (c.to_string(), o)).collect(),
 ```
-
-  - Keep the existing mtime/size staleness gate unchanged — marks load only when cursor/scroll do.
 
 - [ ] **Step 4: Run tests + suite.** `cargo test -p wordcartel --lib app::` → PASS; `cargo test --workspace` → green; `cargo build --workspace` → zero warnings.
 
