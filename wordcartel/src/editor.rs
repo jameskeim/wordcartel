@@ -97,6 +97,7 @@ impl Buffer {
     }
 }
 
+// Not Clone: the menu field's tui_menu::MenuState is !Clone.
 #[derive(Debug)]
 pub struct Editor {
     pub buffers: Vec<Buffer>,

@@ -447,9 +447,14 @@ pub fn reduce(
     clock: &dyn Clock,
     msg_tx: &std::sync::mpsc::Sender<Msg>,
 ) -> bool {
-    // Menu overlay intercepts KEY INPUT only. Non-key messages fall through to
+    // Menu overlay intercepts KEY INPUT and PASTE (no text field; paste is
+    // consumed / silently dropped). Non-key, non-paste messages fall through to
     // the normal handlers so background work continues while the menu is open.
     if editor.menu.is_some() {
+        if let Msg::Input(Event::Paste(_)) = &msg {
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
+        }
         if let Msg::Input(Event::Key(k)) = &msg {
             if k.kind == crossterm::event::KeyEventKind::Press {
                 let mut selected = None;
@@ -504,10 +509,21 @@ pub fn reduce(
         // Non-key msg falls through to normal handling while menu stays open.
     }
 
-    // Palette overlay intercepts KEY INPUT only (§5.3 analogue). Non-key messages
-    // (ClipboardPaste, FilterDone, JobDone, Tick) fall through to normal handling
-    // while the palette stays open.
+    // Palette overlay intercepts KEY INPUT and PASTE. Non-key, non-paste messages
+    // (FilterDone, JobDone, Tick) fall through to normal handling while the
+    // palette stays open.
     if editor.palette.is_some() {
+        if let Msg::Input(Event::Paste(text)) = msg {
+            if let Some(p) = editor.palette.as_mut() {
+                p.query.insert_str(p.cursor, &text);
+                p.cursor += text.len();
+                crate::palette::rebuild_rows(p, reg, keymap);
+                let max = p.rows.len().saturating_sub(1);
+                if p.selected > max { p.selected = max; }
+            }
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
+        }
         if let Msg::Input(Event::Key(k)) = &msg {
             if k.kind == crossterm::event::KeyEventKind::Press {
                 match k.code {
@@ -1955,6 +1971,39 @@ mod tests {
         crate::app::reduce(Msg::Input(Event::Paste("cat".into())), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.minibuffer.as_ref().unwrap().text, "cat", "paste goes into the minibuffer");
         assert_eq!(e.active().document.buffer.to_string(), doc_before, "document untouched");
+    }
+
+    #[test]
+    fn paste_into_open_palette_edits_query_not_document() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::Event;
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        let reg = Registry::builtins();
+        let (keymap, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let mut p = crate::palette::Palette::default();
+        crate::palette::rebuild_rows(&mut p, &reg, &keymap);
+        e.palette = Some(p);
+        let doc_before = e.active().document.buffer.to_string();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::Input(Event::Paste("foo".into())), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), doc_before, "document untouched under open palette");
+        assert_eq!(e.palette.as_ref().unwrap().query, "foo", "paste inserted into palette query");
+        assert!(e.palette.is_some(), "palette remains open after paste");
+    }
+
+    #[test]
+    fn paste_under_open_menu_does_not_touch_document() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::Event;
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        e.menu = Some(crate::menu::empty());
+        let doc_before = e.active().document.buffer.to_string();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::Input(Event::Paste("bar".into())), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), doc_before, "document untouched under open menu");
+        assert!(e.menu.is_some(), "menu remains open after paste");
     }
 
     #[test]

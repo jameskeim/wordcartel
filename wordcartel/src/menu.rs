@@ -4,7 +4,6 @@ use tui_menu::{MenuItem, MenuState};
 
 pub struct MenuView {
     pub state: MenuState<CommandId>,
-    pub items: Vec<MenuItem<CommandId>>,
     pub built: bool,
 }
 
@@ -19,17 +18,15 @@ impl std::fmt::Debug for MenuView {
 pub fn empty() -> MenuView {
     MenuView {
         state: MenuState::new(Vec::new()),
-        items: Vec::new(),
         built: false,
     }
 }
 
 pub fn build(reg: &Registry, keymap: &KeyTrie) -> MenuView {
     let groups = grouped_commands(reg, keymap);
-    let items = menu_items_from_groups(&groups);
     let mut state = MenuState::new(menu_items_from_groups(&groups));
     state.activate();
-    MenuView { state, items, built: true }
+    MenuView { state, built: true }
 }
 
 fn menu_items_from_groups(groups: &[(MenuCategory, Vec<(String, CommandId)>)]) -> Vec<MenuItem<CommandId>> {
