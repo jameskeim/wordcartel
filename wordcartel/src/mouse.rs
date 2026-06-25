@@ -44,6 +44,19 @@ pub fn editing_cell(editor: &Editor, col: u16, row: u16) -> CellHit {
 /// when `mouse_capture` is disabled.  Left-click → caret placement, Shift+click
 /// → extend selection, Drag → drag-select with edge auto-scroll, Up → clear
 /// dragging.
+/// Push the current selection onto sel_history, then set a range selection [f,t),
+/// rebuild, and ensure the caret is visible.  The sel_history push lets a
+/// following Ctrl+W (ExpandSelection) grow from the mouse selection.
+fn seed_and_select(editor: &mut Editor, f: usize, t: usize) {
+    // Clone to a local first — avoids overlapping active()/active_mut() borrow.
+    let cur_sel = editor.active().document.selection.clone();
+    editor.active_mut().sel_history.push(cur_sel);
+    editor.active_mut().document.selection =
+        wordcartel_core::selection::Selection::range(f, t);
+    crate::derive::rebuild(editor);
+    crate::nav::ensure_visible(editor);
+}
+
 pub fn handle(
     editor: &mut Editor,
     ev: MouseEvent,
@@ -71,15 +84,40 @@ pub fn handle(
                         wordcartel_core::selection::Selection::range(anchor, off);
                     editor.mouse.anchor = Some(anchor);
                 } else {
-                    editor.active_mut().document.selection =
-                        wordcartel_core::selection::Selection::single(off);
+                    let now = clock.now_ms();
+                    let cell = (ev.column, ev.row);
+                    let count = match editor.mouse.last_click {
+                        Some(ref lc) if now.saturating_sub(lc.at_ms) <= 400 && lc.cell == cell => {
+                            (lc.count % 3) + 1
+                        }
+                        _ => 1,
+                    };
+                    editor.mouse.last_click = Some(crate::editor::ClickRecord { cell, at_ms: now, count });
+                    match count {
+                        2 => {
+                            let (f, t) = crate::commands::scope_range_at(editor, off, crate::commands::Scope::Word);
+                            seed_and_select(editor, f, t);
+                        }
+                        3 => {
+                            let (f, t) = crate::commands::scope_range_at(editor, off, crate::commands::Scope::Paragraph);
+                            seed_and_select(editor, f, t);
+                        }
+                        _ => {
+                            editor.active_mut().document.selection =
+                                wordcartel_core::selection::Selection::single(off);
+                            editor.mouse.anchor = Some(off);
+                            crate::derive::rebuild(editor);
+                            crate::nav::ensure_visible(editor);
+                        }
+                    }
                     editor.mouse.anchor = Some(off);
-                    // (multi-click in Task 5)
                 }
                 editor.mouse.dragging = true;
-                let _ = clock; // multi-click timing wired in Task 5
-                crate::derive::rebuild(editor);
-                crate::nav::ensure_visible(editor);
+                // rebuild+ensure_visible done per-branch above for non-shift path
+                if ev.modifiers.contains(KeyModifiers::SHIFT) {
+                    crate::derive::rebuild(editor);
+                    crate::nav::ensure_visible(editor);
+                }
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -103,7 +141,15 @@ pub fn handle(
             }
         }
         MouseEventKind::Up(MouseButton::Left) => { editor.mouse.dragging = false; }
-        _ => {} // wheel/etc wired in Tasks 5+
+        MouseEventKind::ScrollDown => {
+            crate::nav::scroll_down_one(editor);
+            editor.mouse.scrollbar_until_ms = clock.now_ms() + 1200;
+        }
+        MouseEventKind::ScrollUp => {
+            crate::nav::scroll_up_one(editor);
+            editor.mouse.scrollbar_until_ms = clock.now_ms() + 1200;
+        }
+        _ => {}
     }
 }
 
@@ -197,5 +243,34 @@ mod tests {
         handle(&mut e, shift_down, &reg, &km, &ex, &clk, &tx);
         let r = e.active().document.selection.primary();
         assert_eq!((r.from(), r.to()), (1, 4), "extends from existing anchor to click");
+    }
+
+    #[test]
+    fn double_click_selects_word_triple_selects_paragraph() {
+        let mut e = Editor::new_from_text("alpha beta\n\ngamma\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        let (reg, ex, clk, tx, km) = ctx();
+        // two Downs on the same cell within 400ms (TestClock fixed at 0)
+        handle(&mut e, down(7, 0), &reg, &km, &ex, &clk, &tx);
+        handle(&mut e, down(7, 0), &reg, &km, &ex, &clk, &tx);
+        let r = e.active().document.selection.primary();
+        assert_eq!(e.active().document.buffer.slice(r.from()..r.to()), "beta");
+        handle(&mut e, down(7, 0), &reg, &km, &ex, &clk, &tx); // triple → paragraph
+        let r2 = e.active().document.selection.primary();
+        assert!(e.active().document.buffer.slice(r2.from()..r2.to()).starts_with("alpha beta"));
+        assert!(!e.active().sel_history.is_empty(), "multi-click seeds the expand ladder");
+    }
+
+    #[test]
+    fn wheel_scrolls_view_not_caret() {
+        let text: String = (0..50).map(|i| format!("line {i}\n")).collect();
+        let mut e = Editor::new_from_text(&text, None, (80, 10));
+        crate::derive::rebuild(&mut e);
+        let (reg, ex, clk, tx, km) = ctx();
+        let before = crate::nav::head(&e);
+        let wheel = MouseEvent { kind: MouseEventKind::ScrollDown, column: 0, row: 0, modifiers: KeyModifiers::NONE };
+        handle(&mut e, wheel, &reg, &km, &ex, &clk, &tx);
+        assert!(e.active().view.scroll > 0, "view scrolled");
+        assert_eq!(crate::nav::head(&e), before, "caret unchanged");
     }
 }
