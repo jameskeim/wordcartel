@@ -123,20 +123,18 @@ pub struct ClickRecord {
 #[derive(Default, Debug, Clone)]
 pub struct MouseState {
     /// Byte-offset anchor for drag selection; None when no drag is active.
-    #[allow(dead_code)] // wired in Task 3
     pub anchor: Option<usize>,
     /// Last recorded click (cell, timestamp, repeat count).
-    #[allow(dead_code)] // wired in Task 3
+    #[allow(dead_code)] // wired in Task 5
     pub last_click: Option<ClickRecord>,
     /// True while a text-area drag is in progress.
     pub dragging: bool,
     /// True while the scrollbar thumb is being dragged.
     pub scrollbar_dragging: bool,
     /// Timestamp until which the scrollbar overlay remains visible after hover.
-    #[allow(dead_code)] // wired in Task 3
+    #[allow(dead_code)] // wired in Task 5
     pub scrollbar_until_ms: u64,
     /// Whether the scrollbar overlay is currently visible.
-    #[allow(dead_code)] // wired in Task 3
     pub scrollbar_visible: bool,
 }
 

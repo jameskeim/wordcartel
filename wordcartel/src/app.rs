@@ -744,6 +744,9 @@ pub fn reduce(
             editor.active_mut().view.area = (w, h);
             derive::rebuild(editor);
         }
+        Msg::Input(Event::Mouse(ev)) => {
+            crate::mouse::handle(editor, ev, reg, keymap, ex, clock, msg_tx);
+        }
         Msg::Input(_) => {}
         Msg::JobDone(r) => apply_result(r, editor),
         Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {

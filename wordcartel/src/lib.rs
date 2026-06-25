@@ -26,3 +26,4 @@ pub mod state;
 pub mod palette;
 pub mod menu;
 pub mod marks;
+pub mod mouse;
