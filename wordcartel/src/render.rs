@@ -132,6 +132,24 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     // Centered-measure geometry: ONE call here so paint + cursor never desync.
     let tg = crate::nav::text_geometry(editor);
 
+    // -----------------------------------------------------------------------
+    // Wrap-guide line (painted BEFORE the text-row loop so text overwrites it)
+    // -----------------------------------------------------------------------
+    if editor.view_opts.wrap_guide {
+        let gx = area.x + tg.text_left + editor.view_opts.wrap_column;
+        let within_viewport = gx < area.x + w;
+        let not_scrollbar_col = !(editor.mouse.scrollbar_visible && gx == area.x + w - 1);
+        if within_viewport && not_scrollbar_col {
+            let guide_style = RStyle::default().fg(Color::DarkGray);
+            for r in 0..edit_height {
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled("│", guide_style))),
+                    Rect::new(gx, edit_top + r, 1, 1),
+                );
+            }
+        }
+    }
+
     // Collect sorted logical line indices from the layout cache.
     let mut sorted_lines: Vec<usize> = editor.active().view.line_layouts.keys().copied().collect();
     sorted_lines.sort_unstable();
@@ -472,6 +490,21 @@ mod tests {
 
         assert_eq!(row0, "mnop");
         assert!(crate::nav::screen_pos(&e).is_some());
+    }
+
+    #[test]
+    fn wrap_guide_column_position() {
+        // measure off, wrap_guide on, column 40, viewport 80 → guide at screen col 40
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.view_opts.wrap_guide = true; e.view_opts.wrap_column = 40;
+        let tg = crate::nav::text_geometry(&e);
+        let gx = tg.text_left + e.view_opts.wrap_column;
+        assert_eq!(gx, 40);
+        assert!(gx < e.active().view.area.0, "guide within viewport");
+        // measure on, column 40, viewport 80 → text_left 20, guide at 60 (right edge)
+        e.view_opts.measure = true;
+        let tg = crate::nav::text_geometry(&e);
+        assert_eq!(tg.text_left + e.view_opts.wrap_column, 60);
     }
 
     /// palette_overlay_rect sizes height to the actual row count, not fixed-15.
