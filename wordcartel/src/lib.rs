@@ -20,3 +20,4 @@ pub mod minibuffer;
 pub mod export;
 pub mod transform;
 pub mod clipboard;
+pub mod config;

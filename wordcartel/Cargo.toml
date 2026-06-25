@@ -16,6 +16,8 @@ ratatui = "0.29"
 crossterm = "0.28"
 thiserror = "2"
 dirs = "5"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 subprocess = "0.2"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 
