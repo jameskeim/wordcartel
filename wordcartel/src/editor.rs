@@ -71,13 +71,9 @@ pub struct Buffer {
     pub pending_swap_body: Option<String>,
     pub pending_swap_path: Option<PathBuf>,
     // 5c: marks/ring/sel_history — wired in Tasks 5–10
-    #[allow(dead_code)] // wired in Task 5
     pub marks: std::collections::BTreeMap<char, usize>,
-    #[allow(dead_code)] // wired in Task 5
     pub jump_ring: Vec<usize>,
-    #[allow(dead_code)] // wired in Task 5
     pub ring_cursor: usize,
-    #[allow(dead_code)] // wired in Task 5
     pub sel_history: Vec<wordcartel_core::selection::Selection>,
 }
 

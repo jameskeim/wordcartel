@@ -622,7 +622,6 @@ pub fn move_word_left(editor: &mut Editor) -> usize {
         let buf = &editor.active().document.buffer;
         let blocks = &editor.active().document.blocks;
         let (wstart, wend) = paragraph_range_at(blocks, buf, h);
-        let _ = wend;
         let window = buf.slice(wstart..wend);
         let rel = h.saturating_sub(wstart);
         match wordcartel_core::textobj::prev_word_start(&window, rel) {
