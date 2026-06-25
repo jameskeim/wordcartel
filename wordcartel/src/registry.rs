@@ -15,6 +15,12 @@ use wordcartel_core::history::Clock;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct CommandId(pub &'static str);
 
+impl std::borrow::Borrow<str> for CommandId {
+    fn borrow(&self) -> &str {
+        self.0
+    }
+}
+
 /// Everything a handler may touch. The executor is here so job-dispatching
 /// handlers (save, swap) have it; today's built-ins ignore it.
 pub struct Ctx<'a> {
@@ -86,6 +92,14 @@ impl Registry {
             CommandResult::Handled
         });
         Registry { map }
+    }
+
+    /// Resolve a runtime command-id string to the registry's stored `CommandId`
+    /// (which wraps a `&'static str`) — without allocating or leaking. Returns
+    /// None if no command with that name is registered.
+    #[allow(dead_code)] // wired in Task 3
+    pub fn resolve_name(&self, name: &str) -> Option<CommandId> {
+        self.map.get_key_value(name).map(|(id, _)| *id)
     }
 
     /// Dispatch by id. Unknown ids surface a status (never a silent no-op, §12.5).
@@ -182,5 +196,13 @@ mod tests {
             crate::input::key_to_command_id(ctrl_t),
             Some(crate::input::KeyAction::Id(CommandId("transform")))
         ));
+    }
+
+    #[test]
+    fn resolve_name_recovers_static_command_id() {
+        let reg = Registry::builtins();
+        assert_eq!(reg.resolve_name("cut"), Some(CommandId("cut")));
+        assert_eq!(reg.resolve_name("save"), Some(CommandId("save")));
+        assert_eq!(reg.resolve_name("definitely-not-a-command"), None);
     }
 }
