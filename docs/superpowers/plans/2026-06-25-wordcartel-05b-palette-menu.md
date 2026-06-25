@@ -104,7 +104,15 @@ impl Registry {
         self.entries.push(CommandEntry { id: cid, handler, meta: CommandMeta { label, menu } });
     }
     pub fn dispatch(&self, id: CommandId, ctx: &mut Ctx) -> CommandResult {
-        match self.index.get(&id) { Some(&i) => (self.entries[i].handler)(ctx), None => CommandResult::Noop }
+        match self.index.get(&id) {
+            Some(&i) => (self.entries[i].handler)(ctx),
+            None => {
+                // PRESERVE the current behavior (Codex plan-review CRITICAL): the
+                // existing dispatch sets a status on an unknown id, NOT a silent Noop.
+                ctx.editor.status = format!("unknown command: {}", id.0);
+                CommandResult::Noop
+            }
+        }
     }
     pub fn resolve_name(&self, name: &str) -> Option<CommandId> {
         self.index.get_key_value(name).map(|(id, _)| *id) // CommandId: Borrow<str> (5a)
@@ -146,7 +154,7 @@ impl Registry {
         r
     }
 ```
-**Implementer note:** read the CURRENT `builtins()` and migrate EVERY `map.insert` to a `register(...)` call with a label + category — do not drop any command. Choose labels/categories sensibly; `move_*`/`select_*` are `menu: None`. The `commands_iterate…` test guards that all have labels.
+**Implementer note:** read the CURRENT `builtins()` and migrate EVERY `map.insert` to a `register(...)` call with a label + category — do not drop any command. **The full current set is exactly these 28 (Codex-enumerated; transcribe ALL):** `move_left`, `move_right`, `move_up`, `move_down`, `move_line_start`, `move_line_end`, `select_left`, `select_right`, `select_up`, `select_down`, `select_line_start`, `select_line_end`, `insert_newline`, `backspace`, `delete_forward`, `copy`, `cut`, `paste`, `undo`, `redo`, `cycle_render_mode`, `save`, `quit`, `filter`, `export_html`, `export_docx`, `export_pdf`, `transform`. Motions/selection + `insert_newline`/`backspace`/`delete_forward` are `menu: None` (palette-only) with labels like `"Move Left"`; `copy`/`cut`/`paste`/`undo`/`redo`→Edit, `save`/`quit`→File, `cycle_render_mode`/`transform`(label `"Transform…"`)→View, `export_*`→Export, `filter`(`"Filter…"`)→Edit. (Then Step 5 adds the 3 transform commands; `palette`/`menu` are added in Tasks 3/4.) The `commands_iterate…` test guards every command has a label.
 
 - [ ] **Step 5: Register the 3 transform commands** (`transform.rs` is where dispatch lives; register in `builtins()`):
 ```rust
@@ -231,7 +239,7 @@ git commit -m "feat(keymap): chord_for(CommandId) reverse lookup for in-place sh
   - `app.rs`: the `palette` command (sets `editor.palette = Some(Palette::default())`); `fn hydrate_overlays(editor, reg, keymap)` (build rows for a freshly-opened palette / menu tree for a freshly-opened menu); `fn dispatch_overlay_command(editor, reg, ex, clock, msg_tx, id)` (close overlay, build Ctx, dispatch, drain).
   - `Ctrl+P` bound to `palette` in the keymap presets.
 
-- [ ] **Step 1: Add the dep + module.** `wordcartel/Cargo.toml`: `nucleo-matcher = "0.3"`. `lib.rs`: `pub mod palette;`. `cargo build -p wordcartel` to confirm it resolves.
+- [ ] **Step 1: Add the dep + module + LOCK the scoring API (Codex IMPORTANT).** `wordcartel/Cargo.toml`: `nucleo-matcher = "0.3"`. `lib.rs`: `pub mod palette;`. `cargo build -p wordcartel` to confirm it resolves. **Before writing `rebuild_rows`, read the installed `nucleo-matcher` 0.3 source/rustdoc (`~/.cargo/registry/.../nucleo-matcher-0.3*/`) and LOCK the exact scoring call** — confirm whether ranking a list of `&str` labels uses `Pattern::match_list(items, &mut matcher) -> Vec<(T, u32)>` (returns matches sorted desc — preferred) or `Pattern::score(Utf32Str, &mut matcher) -> Option<u32>` (per-item; needs the `Utf32Str`/`Utf32String` buffer dance). Use whichever the real 0.3 API provides; the Step-4 code is illustrative on this exact call. Record the confirmed API in the report.
 
 - [ ] **Step 2: Write failing tests.** In `palette.rs`:
 ```rust
@@ -348,10 +356,10 @@ pub fn rebuild_rows(p: &mut Palette, reg: &Registry, keymap: &KeyTrie) {
 **Implementer note:** confirm the exact `nucleo-matcher` 0.3 scoring call (`Pattern::score(Utf32Str, &mut Matcher) -> Option<u32>`, or `Pattern::match_list(items, &mut matcher) -> Vec<(T,u32)>`). If `match_list` is cleaner, use it (it returns matches sorted desc) and recover registration order as the tiebreak. Reuse ONE `Matcher`.
 
 - [ ] **Step 5: Editor field + commands + reduce wiring** (`editor.rs`, `app.rs`):
-  - `editor.rs`: `pub palette: Option<crate::palette::Palette>,` init `None` in `new_from_text`; also clear it where prompts/minibuffer open (XOR) and in `open_minibuffer`.
+  - `editor.rs`: `pub palette: Option<crate::palette::Palette>,` init `None` in `new_from_text`. **XOR via a centralized opener (Codex IMPORTANT — don't leave raw `prompt = Some(..)` sites uncovered):** add `pub fn open_prompt(&mut self, p: Prompt) { self.palette = None; self.menu = None; self.pending_keys.clear(); self.prompt = Some(p); }` and **route EVERY existing `editor.prompt = Some(...)` assignment through it** — Codex enumerated the sites: `registry.rs:~90` (quit_confirm), `export.rs:~218` (overwrite), `save.rs:~100`, `commands.rs:~400`, and the `app.rs` startup/timeout sites (`~689`/`~696`/`~793`). Also have `open_minibuffer` clear `palette`/`menu` (it already clears `pending_keys` from 5a). This guarantees at most one of {prompt, minibuffer, palette, menu} is ever active.
   - `app.rs` register the `palette` command in `builtins()` (Task 1 file, but the handler is defined where Editor is in scope): `r.register("palette", "Command Palette…", Some(MenuCategory::View), |c| { c.editor.palette = Some(crate::palette::Palette::default()); CommandResult::Handled });`
   - **Hydrate-on-open:** add `fn hydrate_overlays(editor, reg, keymap)` and call it in reduce immediately AFTER any command dispatch (normal-mode arm + `dispatch_overlay_command`): if `editor.palette` is Some with empty rows AND empty query → `rebuild_rows(...)`. (A just-opened palette has empty rows; this fills them so the first render shows all commands.)
-  - **`dispatch_overlay_command(editor, reg, ex, clock, msg_tx, id)`:** `editor.palette = None; editor.menu = None;` then `let mut ctx = Ctx{editor, clock, executor: ex, msg_tx: msg_tx.clone()}; reg.dispatch(id, &mut ctx); for r in ex.drain() { apply_result(r, editor); }`.
+  - **`dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id)`:** `editor.palette = None; editor.menu = None;` then `let mut ctx = Ctx{editor, clock, executor: ex, msg_tx: msg_tx.clone()}; reg.dispatch(id, &mut ctx); for r in ex.drain() { apply_result(r, editor); }` and **finally `hydrate_overlays(editor, reg, keymap);`** (Codex 3c — so a dispatched command that OPENS another overlay, e.g. the menu's "Command Palette…" → `palette` command, gets its rows/tree built before the next render). It therefore takes `keymap` too.
   - **Palette reduce block** (ABOVE the prompt block, since overlays are top-level): `if editor.palette.is_some() { if let Msg::Input(Event::Key(k)) = &msg { if Press { match k.code: Esc → editor.palette=None; Enter → let id = selected row id; dispatch_overlay_command(.., id) (if any rows); Up/Down → move selected (clamp); Backspace/Left/Right/Char → edit query then rebuild_rows(.., reg, keymap) } } for r in ex.drain(){apply_result(r,editor);} return !editor.quit; } /* non-key falls through */ }`.
   - Esc precedence: the palette block returns early for keys, so its Esc is handled before prompt/minibuffer/pending — matches the spec stack.
   - Keymap preset: add `("ctrl-p","palette")` to the CUA preset (and confirm Ctrl+P is free).
@@ -378,11 +386,11 @@ git commit -m "feat(palette): Ctrl+P fuzzy command palette (nucleo) — overlay 
 **Interfaces:**
 - Consumes: `Registry::{commands, meta}`, `keymap::chord_for`, `MENU_ORDER`, `dispatch_overlay_command` (Task 3), `tui_menu::{Menu, MenuItem, MenuState, MenuEvent}`.
 - Produces:
-  - `menu.rs`: `pub struct MenuView { pub state: tui_menu::MenuState<CommandId>, pub items: Vec<tui_menu::MenuItem<CommandId>> }`; `pub fn build(reg: &Registry, keymap: &KeyTrie) -> MenuView` (group `commands()` with `menu == Some(cat)` by `MENU_ORDER`, omit empty categories; each leaf label = `"{label}    {chord}"`, payload = `CommandId`; add a "Command Palette…" leaf under View routing the `palette` command id).
+  - `menu.rs`: `pub struct MenuView { pub state: tui_menu::MenuState<CommandId>, pub items: Vec<tui_menu::MenuItem<CommandId>>, pub built: bool }` (`built: false` marks a just-opened, not-yet-hydrated view — explicit flag, NOT inferred from `items.is_empty()`, per Codex 3d); `pub fn empty() -> MenuView` (built=false); `pub fn build(reg: &Registry, keymap: &KeyTrie) -> MenuView` (built=true; group `commands()` with `menu == Some(cat)` by `MENU_ORDER`, omit empty categories; each leaf label = `"{label}    {chord}"`, payload = `CommandId`; add a "Command Palette…" leaf under View routing the `palette` command id).
   - `Editor.menu: Option<MenuView>` (init `None`).
   - the `menu` command (`F10`) sets `editor.menu = Some(MenuView::default-empty)`, hydrated on open.
 
-- [ ] **Step 1: Add the dep + module.** `Cargo.toml`: `tui-menu = "=0.3.0"` (exact pin). `lib.rs`: `pub mod menu;`. `cargo build -p wordcartel` to confirm `tui-menu` 0.3.0 resolves against ratatui 0.29. **Re-confirm the `tui-menu` 0.3.0 API** against its docs/source (`MenuItem::item(label, data)` / `MenuItem::group(label, children)`, `Menu::new(items)`, `MenuState<T>`, `state.drain_events() -> impl Iterator<Item = MenuEvent<T>>`, `MenuEvent::Selected(T)`, and the navigation methods to drive from key events). If any name differs, adapt — report exact names in the report.
+- [ ] **Step 1: Add the dep + module + VERIFY the render/event API (Codex CRITICAL).** `Cargo.toml`: `tui-menu = "=0.3.0"` (exact pin). `lib.rs`: `pub mod menu;`. `cargo build -p wordcartel` to confirm `tui-menu` 0.3.0 resolves against ratatui 0.29. **Re-confirm the `tui-menu` 0.3.0 API** against its installed source (`~/.cargo/registry/.../tui-menu-0.3.0/`): `MenuItem::item(label, data)` / `MenuItem::group(label, children)`, `Menu::new(items)`, `MenuState<T>`, `state.drain_events() -> impl Iterator<Item = MenuEvent<T>>`, `MenuEvent::Selected(T)`, and the navigation methods (e.g. `activate`/`up`/`down`/`left`/`right`/`select`) to drive from key events. **CRUCIAL render-borrow question:** is `Menu` a `StatefulWidget` rendered via `frame.render_stateful_widget(menu, area, &mut state)`? If YES (the standard ratatui pattern — likely), `render` needs **mutable** access to the menu state, which conflicts with `render(frame, &Editor)`. **Resolution:** change the render signature to **`pub fn render(frame: &mut Frame, editor: &mut Editor)`** and update its callers — the `run()` draw closure (`guard.terminal().draw(|f| render::render(f, &mut editor))?`) and every render test. (The palette still only *reads* `Editor`; the `&mut` is solely so the menu's stateful widget can take `&mut editor.menu…state`.) If `Menu` turns out to be a plain `Widget` (no `&mut` state), keep `render(&Editor)`. Decide this in Step 1 and note it in the report; do NOT discover it mid-implementation.
 
 - [ ] **Step 2: Write failing tests** in `menu.rs`:
 ```rust
@@ -433,7 +441,7 @@ And in `app.rs`:
 - [ ] **Step 5: Editor field + command + reduce + render wiring** (`editor.rs`/`app.rs`/`render.rs`):
   - `editor.rs`: `pub menu: Option<crate::menu::MenuView>,` init `None`; clear on XOR (prompt/minibuffer/palette open).
   - `builtins()`: `r.register("menu", "Menu Bar", None, |c| { c.editor.menu = Some(crate::menu::MenuView::empty()); CommandResult::Handled });` (palette-only meta — it's a toggle, not a menu entry). Toggle semantics: if already open, the command closes it (`if c.editor.menu.is_some() { c.editor.menu = None } else { Some(empty) }`).
-  - `hydrate_overlays`: if `editor.menu` is Some + unbuilt → `*editor.menu = Some(menu::build(reg, keymap))` (build the real tree; `MenuView::empty()` marks "needs build").
+  - `hydrate_overlays`: if `editor.menu` is `Some(v)` with `!v.built` → replace with `menu::build(reg, keymap)` (built=true). (And the palette branch: `Some(p)` with `p.rows.is_empty() && p.query.is_empty()` → `rebuild_rows`.) Both checks are unambiguous (Codex 3d).
   - **Menu reduce block** (ABOVE prompt, alongside palette): `if editor.menu.is_some() { if let Msg::Input(Event::Key(k)) = &msg { Press: Esc → editor.menu=None; arrows/Enter → drive the tui-menu nav methods on editor.menu.state; then drain: for ev in state.drain_events() { if let MenuEvent::Selected(id) = ev { dispatch_overlay_command(.., id); break } } } for r in ex.drain(){apply_result(r,editor);} return !editor.quit; } /* non-key falls through */ }`.
   - Keymap preset: add `("f10","menu")` to CUA.
   - `render.rs`: when `editor.menu.is_some()`, render the menu bar on the top row + the `tui_menu::Menu` (built from `editor.menu.items`) with `editor.menu.state` beneath. Paint from `editor.menu` only.
@@ -451,6 +459,8 @@ git commit -m "feat(menu): F10 hideable menu bar (tui-menu view over registry) �
 ## Self-Review (5b)
 
 **Spec coverage:** §2 deps/modules (T1/T3/T4); §3 CommandMeta + ordered registry + iteration (T1); §3.1 transform commands (T1); §4 palette overlay + nucleo + dispatch (T3); §5 chord_for (T2); §6 menu via tui-menu, categories, chords-in-labels, palette cross-link, F10 soft (T4); §7.1 render-from-precomputed-state (T3/T4 hydrate-on-open + render paints from Editor state); §7.2 XOR (T3/T4 fields + clear-on-open); §7.3 key-only interception + non-key fallthrough (T3/T4 blocks); §7.4 dispatch_overlay_command (T3, reused T4); §7.5 Esc precedence (T3/T4 blocks above prompt); §8/§10 error handling + tests (each task). ✅
+
+**Codex plan-review fixes applied (2 crit + 2 imp + minors):** (1) `dispatch` preserves the unknown-command status write (not a silent `Noop`) — T1; (2) `tui-menu` is a stateful widget → T4 Step 1 verifies and, if `render_stateful_widget(&mut state)`, changes `render` to `&mut Editor` + updates callers; (3) XOR centralized via `Editor::open_prompt` routed through ALL prompt-open sites (registry/export/save/commands/app startup+timeout) — T3; (4) `nucleo-matcher` 0.3 scoring API locked from installed source before coding — T3 Step 1; plus `dispatch_overlay_command` calls `hydrate_overlays` (menu→palette case), `MenuView.built` explicit flag, and the full 28-command transcription list. Codex confirmed: `Ctx` fields, reduce has `&reg`+`&keymap`, hydrate timing (reduce→draw) is safe, no external `Registry.map` consumers, the task sequence compiles stepwise.
 
 **Codex spec-review fixes reflected:** ordered registry (T1 Vec+index); render reads precomputed state via hydrate-on-open (T3/T4 — render unchanged, sidesteps 5a mem::take); XOR + clear pending on open (T3/T4); key-only interception, non-key fallthrough (T3/T4 + the `palette_esc_closes_and_nonkey_falls_through` test); shared `dispatch_overlay_command` (T3); chord_for tie-break by rendered string + reuse `chords_display` (T2); verified tui-menu 0.3.0 API re-confirmed at impl (T4 Step 1).
 
