@@ -130,8 +130,7 @@ impl Registry {
 
         // View menu — palette command (Task 3 / Effort 5b).
         r.register("palette", "Command Palette\u{2026}", Some(MenuCategory::View), |c| {
-            c.editor.palette = Some(crate::palette::Palette::default());
-            c.editor.menu = None;
+            c.editor.open_palette();
             CommandResult::Handled
         });
         r.register("menu", "Menu Bar", None, |c| {
