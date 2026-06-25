@@ -405,7 +405,7 @@ fn apply_clipboard_availability(editor: &mut Editor, ok: bool) {
 /// Fill rows for a freshly-opened palette (empty rows + empty query → rebuild).
 /// Called immediately after any command dispatch and after dispatch_overlay_command
 /// so a just-opened overlay has content before the first render.
-fn hydrate_overlays(editor: &mut Editor, reg: &crate::registry::Registry, keymap: &crate::keymap::KeyTrie) {
+pub(crate) fn hydrate_overlays(editor: &mut Editor, reg: &crate::registry::Registry, keymap: &crate::keymap::KeyTrie) {
     if let Some(ref mut p) = editor.palette {
         if p.rows.is_empty() && p.query.is_empty() {
             crate::palette::rebuild_rows(p, reg, keymap);
@@ -418,7 +418,7 @@ fn hydrate_overlays(editor: &mut Editor, reg: &crate::registry::Registry, keymap
 
 /// Close the active overlay, dispatch `id` via the registry, drain executor results,
 /// then hydrate any overlay opened by the dispatched command.
-fn dispatch_overlay_command(
+pub(crate) fn dispatch_overlay_command(
     editor: &mut Editor,
     reg: &crate::registry::Registry,
     keymap: &crate::keymap::KeyTrie,
@@ -445,6 +445,7 @@ pub fn menu_select_for_test(
     msg_tx: &std::sync::mpsc::Sender<Msg>,
     id: crate::registry::CommandId,
 ) {
+    editor.menu = None;
     let (keymap, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), reg);
     dispatch_overlay_command(editor, reg, &keymap, ex, clock, msg_tx, id);
 }
@@ -486,50 +487,32 @@ pub fn reduce(
         }
         if let Msg::Input(Event::Key(k)) = &msg {
             if k.kind == crossterm::event::KeyEventKind::Press {
-                let mut selected = None;
-                match k.code {
-                    crossterm::event::KeyCode::Esc | crossterm::event::KeyCode::F(10) => {
-                        editor.menu = None;
-                    }
-                    crossterm::event::KeyCode::Up => {
-                        if let Some(menu) = editor.menu.as_mut() {
-                            menu.state.up();
-                        }
-                    }
-                    crossterm::event::KeyCode::Down => {
-                        if let Some(menu) = editor.menu.as_mut() {
-                            menu.state.down();
-                        }
-                    }
-                    crossterm::event::KeyCode::Left => {
-                        if let Some(menu) = editor.menu.as_mut() {
-                            menu.state.left();
-                        }
-                    }
-                    crossterm::event::KeyCode::Right => {
-                        if let Some(menu) = editor.menu.as_mut() {
-                            menu.state.right();
-                        }
-                    }
-                    crossterm::event::KeyCode::Enter => {
-                        if let Some(menu) = editor.menu.as_mut() {
-                            menu.state.select();
-                        }
-                    }
-                    _ => {}
-                }
-                if let Some(menu) = editor.menu.as_mut() {
-                    for ev in menu.state.drain_events() {
-                        match ev {
-                            tui_menu::MenuEvent::Selected(id) => {
-                                selected = Some(id);
-                                break;
+                use crossterm::event::KeyCode;
+                // Close OUTSIDE any menu borrow (Codex Critical: `editor.menu = None`
+                // must not run while `editor.menu.as_mut()` is held).
+                if matches!(k.code, KeyCode::Esc | KeyCode::F(10)) {
+                    editor.menu = None;
+                } else {
+                    let mut selected: Option<crate::registry::CommandId> = None;
+                    if let Some(menu) = editor.menu.as_mut() {   // borrow scoped to this block
+                        let ncat = menu.groups.len();
+                        match k.code {
+                            KeyCode::Left if ncat > 0 => { menu.open = (menu.open + ncat - 1) % ncat; menu.highlighted = 0; }
+                            KeyCode::Right if ncat > 0 => { menu.open = (menu.open + 1) % ncat; menu.highlighted = 0; }
+                            KeyCode::Up if ncat > 0 => { menu.highlighted = menu.highlighted.saturating_sub(1); }
+                            KeyCode::Down if ncat > 0 => {
+                                let n = menu.groups[menu.open].1.len();
+                                if n > 0 { menu.highlighted = (menu.highlighted + 1).min(n - 1); }
                             }
+                            KeyCode::Enter if ncat > 0 => {
+                                if let Some((_, id)) = menu.groups[menu.open].1.get(menu.highlighted) { selected = Some(*id); }
+                            }
+                            _ => {}
                         }
+                    } // menu borrow dropped here
+                    if let Some(id) = selected {
+                        dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
                     }
-                }
-                if let Some(id) = selected {
-                    dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
                 }
             }
             for r in ex.drain() { apply_result(r, editor); }
@@ -761,6 +744,9 @@ pub fn reduce(
             editor.active_mut().view.area = (w, h);
             derive::rebuild(editor);
         }
+        Msg::Input(Event::Mouse(ev)) => {
+            crate::mouse::handle(editor, ev, reg, keymap, ex, clock, msg_tx);
+        }
         Msg::Input(_) => {}
         Msg::JobDone(r) => apply_result(r, editor),
         Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {
@@ -896,6 +882,9 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
 
     let mut editor = editor;
 
+    // Seed mouse_capture from config (default true; may be overridden by config layers).
+    editor.mouse_capture = cfg.mouse.mouse_capture;
+
     // Recovery-on-open (§5.1).
     // Named files: use assess() with content-hash comparison.
     // Scratch buffers: their swap is pid-keyed, so look for an orphan from a
@@ -922,7 +911,9 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     }
 
     // Install the terminal guard: enable raw mode + enter alternate screen.
-    let mut guard = term::TerminalGuard::new()?;
+    // Mouse capture is gated on editor.mouse_capture (seeded from config above).
+    let mut guard = term::TerminalGuard::new(editor.mouse_capture)?;
+    let mut applied_mouse = editor.mouse_capture;
 
     // Initial derive so the first draw has up-to-date layouts.
     derive::rebuild(&mut editor);
@@ -1005,6 +996,10 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     // Track saved_version to detect when a save completes in the loop.
     let mut last_persisted_saved = editor.active().document.saved_version;
 
+    // Reconcile mouse capture once before the first draw (post-guard invariant).
+    reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
+
+    recompute_scrollbar_visible(&mut editor, clock.now_ms());
     guard.terminal().draw(|f| render::render(f, &mut editor))?;
     loop {
         let now = clock.now_ms();
@@ -1021,7 +1016,20 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
         }
         let swap_deadline = crate::swap::next_deadline_ms(now, editor.active().last_edit_at, editor.active().last_swap_at);
         let sq_deadline = editor.quit_after_save_at.map(|t| t.saturating_add(SAVE_QUIT_TIMEOUT_MS));
+        // Include scrollbar_until_ms in the deadline so the loop wakes when the
+        // bar should fade (avoids relying on the idle 1-hour Tick).
+        let sb_deadline = if editor.mouse.scrollbar_until_ms > now {
+            Some(editor.mouse.scrollbar_until_ms)
+        } else {
+            None
+        };
         let deadline = match (swap_deadline, sq_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let deadline = match (deadline, sb_deadline) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
             (None, Some(b)) => Some(b),
@@ -1037,6 +1045,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
         };
         let keep = reduce(msg, &mut editor, &reg, &keymap, &executor, &clock, &msg_tx);
         crate::clipboard::drain_clipboard_intents(&mut editor, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
+        reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
+        recompute_scrollbar_visible(&mut editor, clock.now_ms());
         guard.terminal().draw(|f| render::render(f, &mut editor))?;
         // Persist session state when a save just completed (saved_version advanced).
         let sv = editor.active().document.saved_version;
@@ -1059,6 +1069,39 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     // is the "never lose work" behavior). The 5 s save&quit guard above bounds the wait.
     drop(guard);
     Ok(())
+}
+
+/// Recompute `editor.mouse.scrollbar_visible` from the clock.
+///
+/// Must be called at the top of the run loop (with `clock.now_ms()`) so that
+/// the scrollbar fades exactly when `scrollbar_until_ms` expires, driven by
+/// the loop's `deadline` (not an idle Tick).
+pub fn recompute_scrollbar_visible(editor: &mut crate::editor::Editor, now_ms: u64) {
+    editor.mouse.scrollbar_visible = now_ms < editor.mouse.scrollbar_until_ms;
+}
+
+/// Reconcile the terminal's mouse-capture state with `editor.mouse_capture`.
+///
+/// Enables or disables mouse capture on the backend when the desired state
+/// diverges from `applied`. On disable, clears drag state so no stale Up
+/// events are awaited for a capture that will never arrive.
+pub fn reconcile_mouse_capture<W: std::io::Write>(editor: &mut crate::editor::Editor, backend: &mut W, applied: &mut bool) {
+    if editor.mouse_capture != *applied {
+        if editor.mouse_capture {
+            if crossterm::execute!(backend, crossterm::event::EnableMouseCapture).is_ok() {
+                *applied = editor.mouse_capture;
+            }
+        } else {
+            // clear drag state regardless of IO outcome — it is local state,
+            // not tied to the terminal write succeeding.
+            editor.mouse.dragging = false;
+            editor.mouse.scrollbar_dragging = false;
+            editor.mouse.anchor = None;
+            if crossterm::execute!(backend, crossterm::event::DisableMouseCapture).is_ok() {
+                *applied = editor.mouse_capture;
+            }
+        }
+    }
 }
 
 /// Record the active buffer's position into the session store and flush to disk.
@@ -1123,6 +1166,9 @@ mod tests {
     static SEQ: AtomicU32 = AtomicU32::new(0);
 
     struct TestClock(u64);
+    impl TestClock {
+        fn new(ms: u64) -> Self { TestClock(ms) }
+    }
     impl Clock for TestClock {
         fn now_ms(&self) -> u64 { self.0 }
     }
@@ -1251,6 +1297,29 @@ mod tests {
         crate::app::menu_select_for_test(&mut e, &reg, &ex, &clk, &tx, crate::registry::CommandId("copy"));
         assert!(e.menu.is_none(), "selection closes the menu");
         assert_eq!(e.register.get(), Some("abc"));
+    }
+
+    #[test]
+    fn menu_keyboard_nav_moves_and_dispatches() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::range(0, 3);
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &Registry::builtins());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let press = |c| Event::Key(KeyEvent { code: c, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        // F10 opens; menu hydrated with groups
+        crate::app::reduce(Msg::Input(press(KeyCode::F(10))), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.menu.is_some());
+        let m = e.menu.as_ref().unwrap();
+        assert!(!m.groups.is_empty(), "menu hydrated with groups");
+        assert_eq!(m.open, 0);
+        // Right moves to the next category, Down highlights a row
+        crate::app::reduce(Msg::Input(press(KeyCode::Right)), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.menu.as_ref().unwrap().open, 1);
+        crate::app::reduce(Msg::Input(press(KeyCode::Down)), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.menu.as_ref().unwrap().highlighted, 1);
     }
 
     #[test]
@@ -2272,5 +2341,64 @@ mod tests {
         crate::app::load_marks_from_entry(&mut e, &entry);
         assert_eq!(e.active().marks.get(&'a'), Some(&6));
         assert_eq!(e.active().marks.get(&'b'), Some(&e.active().document.buffer.len()));
+    }
+
+    #[test]
+    fn toggle_mouse_capture_flips_flag() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        assert!(e.mouse_capture, "default on");
+        let (_km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &Registry::builtins());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock::new(0);
+        let id = reg.resolve_name("toggle_mouse_capture").expect("registered");
+        { let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
+          reg.dispatch(id, &mut ctx); }
+        assert!(!e.mouse_capture, "toggled off");
+    }
+
+    #[test]
+    fn scrollbar_visible_recomputed_against_clock() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.mouse.scrollbar_until_ms = 1000;
+        crate::app::recompute_scrollbar_visible(&mut e, 500); // before deadline
+        assert!(e.mouse.scrollbar_visible);
+        crate::app::recompute_scrollbar_visible(&mut e, 1200); // after
+        assert!(!e.mouse.scrollbar_visible);
+    }
+
+    /// Finding 1 regression: wheel event sets scrollbar_until_ms; recomputing
+    /// immediately after (now == t, t < t+1200) must yield visible == true.
+    /// A later recompute at t+1300 must yield false (bar fades after deadline).
+    #[test]
+    fn wheel_then_recompute_makes_scrollbar_visible() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        use crossterm::event::{MouseEvent, MouseEventKind, KeyModifiers};
+        let text: String = (0..50).map(|i| format!("line {i}\n")).collect();
+        let mut e = Editor::new_from_text(&text, None, (80, 10));
+        crate::derive::rebuild(&mut e);
+        let reg = Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ex = InlineExecutor::default();
+        let t: u64 = 5000;
+        let clk = TestClock(t);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Dispatch the scroll event (sets scrollbar_until_ms = t + 1200).
+        crate::mouse::handle(&mut e, wheel, &reg, &km, &ex, &clk, &tx);
+        // Recompute at t (now < until) — bar must be visible.
+        crate::app::recompute_scrollbar_visible(&mut e, t);
+        assert!(e.mouse.scrollbar_visible, "scrollbar must be visible immediately after a scroll event");
+        // Recompute after the fade deadline — bar must hide.
+        crate::app::recompute_scrollbar_visible(&mut e, t + 1300);
+        assert!(!e.mouse.scrollbar_visible, "scrollbar must hide after scrollbar_until_ms expires");
     }
 }

@@ -438,6 +438,28 @@ fn advance_view_top_one_row(editor: &mut Editor, max_scroll: usize) {
     }
 }
 
+/// Advance the viewport top down by one visual row (wraps `advance_view_top_one_row`).
+pub fn scroll_down_one(editor: &mut Editor) {
+    let total = derive::total_logical_lines(&editor.active().document.buffer);
+    let max_scroll = total.saturating_sub(1);
+    advance_view_top_one_row(editor, max_scroll);
+}
+
+/// Move the viewport top up by one visual row: decrement scroll_row, or cross
+/// to the previous logical line's last visual row.
+pub fn scroll_up_one(editor: &mut Editor) {
+    let (scroll, scroll_row) = { let v = &editor.active().view; (v.scroll, v.scroll_row) };
+    if scroll_row > 0 {
+        editor.active_mut().view.scroll_row = scroll_row - 1;
+    } else if scroll > 0 {
+        let prev = scroll - 1;
+        let rows = rows_of_line(editor, prev); // immutable borrow ends here
+        let v = &mut editor.active_mut().view;
+        v.scroll = prev;
+        v.scroll_row = rows.saturating_sub(1);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Paragraph span helpers (consumed by Tasks 5/6/7)
 // ---------------------------------------------------------------------------
@@ -647,7 +669,6 @@ pub fn move_word_left(editor: &mut Editor) -> usize {
 
 /// Inverse of `screen_pos`: the document byte offset under screen cell
 /// `(col, row)` in the editing area, or `None` if `row` is past content.
-#[allow(dead_code)] // wired in 5c-m (mouse)
 pub fn offset_at_cell(editor: &Editor, col: u16, row: u16) -> Option<usize> {
     let target = row as usize;
     let scroll = editor.active().view.scroll;

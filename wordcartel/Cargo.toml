@@ -21,7 +21,6 @@ toml = "0.8"
 subprocess = "0.2"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 nucleo-matcher = "0.3"
-tui-menu = "=0.3.0"
 
 [dev-dependencies]
 proptest = "1"

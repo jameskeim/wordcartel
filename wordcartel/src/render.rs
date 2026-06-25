@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Position, Rect},
     style::{Color, Modifier, Style as RStyle},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 use wordcartel_core::style::Style;
@@ -27,6 +27,66 @@ pub fn style_to_ratatui(s: Style) -> RStyle {
         Style::Strikethrough => RStyle::default().add_modifier(Modifier::CROSSED_OUT),
         Style::Code => RStyle::default().fg(Color::Cyan),
         Style::Link => RStyle::default().add_modifier(Modifier::UNDERLINED).fg(Color::Yellow),
+    }
+}
+
+// Shared geometry — render AND mouse (Task 7) both call these.
+pub(crate) fn menu_bar_layout(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)]) -> Vec<(usize, Rect)> {
+    let mut out = Vec::new();
+    let mut x = area.x;
+    for (i, (cat, _)) in groups.iter().enumerate() {
+        let label = crate::menu::category_label_pub(*cat);
+        let wgt = label.chars().count() as u16 + 2; // 1 space padding each side
+        out.push((i, Rect::new(x, area.y, wgt, 1)));
+        x = x.saturating_add(wgt);
+    }
+    out
+}
+
+pub(crate) fn menu_dropdown_rect(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)], open: usize) -> Option<Rect> {
+    let bar = menu_bar_layout(area, groups);
+    let (_, label_rect) = bar.get(open)?;
+    let leaves = &groups.get(open)?.1;
+    if leaves.is_empty() { return None; }
+    let width = leaves.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0) as u16 + 2;
+    let height = leaves.len() as u16;
+    Some(Rect::new(label_rect.x, area.y + 1, width.min(area.width.saturating_sub(label_rect.x.saturating_sub(area.x))), height.min(area.height.saturating_sub(1))))
+}
+
+#[allow(dead_code)] // used by Task 7 (mouse hit-testing)
+pub(crate) fn menu_dropdown_row_at(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)], open: usize, col: u16, row: u16) -> Option<usize> {
+    let r = menu_dropdown_rect(area, groups, open)?;
+    if col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height {
+        Some((row - r.y) as usize)
+    } else { None }
+}
+
+/// Compute the palette overlay bounding rect for a given terminal area and row count.
+/// The overlay height is sized to the actual number of palette rows (capped at 15).
+/// Both the render code and mouse hit-testing call this to share geometry.
+pub(crate) fn palette_overlay_rect(area: Rect, row_count: usize) -> Rect {
+    let w = area.width;
+    let h = area.height;
+    let ov_w = (w * 3 / 5).max(30).min(80).min(w);
+    let list_h: u16 = (row_count as u16).min(15).min(h.saturating_sub(4));
+    let ov_h = (list_h + 3).min(h);
+    let ov_x = area.x.saturating_add((w.saturating_sub(ov_w)) / 2);
+    let ov_y = area.y.saturating_add((h.saturating_sub(ov_h)) / 4);
+    Rect::new(ov_x, ov_y, ov_w, ov_h)
+}
+
+/// Return the zero-based list row index that `(col, row)` hits, or `None`.
+/// The list starts at `ov_y + 2` and has at most `palette.rows.len()` entries.
+pub(crate) fn palette_row_at(area: Rect, palette: &crate::palette::Palette, col: u16, row: u16) -> Option<usize> {
+    let r = palette_overlay_rect(area, palette.rows.len());
+    let list_top = r.y.saturating_add(2);
+    let list_h = (palette.rows.len() as u16).min(15).min(area.height.saturating_sub(4));
+    if col >= r.x.saturating_add(1) && col < r.x.saturating_add(r.width).saturating_sub(1)
+        && row >= list_top && row < list_top.saturating_add(list_h)
+    {
+        Some((row - list_top) as usize)
+    } else {
+        None
     }
 }
 
@@ -112,6 +172,21 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     }
 
     // -----------------------------------------------------------------------
+    // Scrollbar overlay (painted over editing area, rightmost column)
+    // -----------------------------------------------------------------------
+    if editor.mouse.scrollbar_visible {
+        let total = crate::derive::total_logical_lines(&editor.active().document.buffer);
+        let scroll_pos = editor.active().view.scroll;
+        let sb_area = Rect::new(area.x, edit_top, w, edit_height);
+        let mut sb_state = ScrollbarState::new(total).position(scroll_pos);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            sb_area,
+            &mut sb_state,
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Status line (bottom row)
     // -----------------------------------------------------------------------
     {
@@ -183,17 +258,14 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     // Command palette overlay (drawn on top of everything else)
     // -----------------------------------------------------------------------
     if let Some(ref palette) = editor.palette {
-        // Overlay dimensions: width = 60% of terminal (min 30, max 80), height = up to 20 rows.
-        let ov_w = (w * 3 / 5).max(30).min(80).min(w);
-        let max_rows = palette.rows.len() as u16;
-        let list_h = max_rows.min(15).min(h.saturating_sub(4));
-        let ov_h = (list_h + 3).min(h); // 1 border top + 1 query row + list_h list rows + 1 border bottom = list_h + 3; clamp to h
-
-        // Center the overlay.
-        let ov_x = area.x + (w.saturating_sub(ov_w)) / 2;
-        let ov_y = area.y + (h.saturating_sub(ov_h)) / 4; // slightly above center
-
-        let ov_rect = Rect::new(ov_x, ov_y, ov_w, ov_h);
+        // Overlay dimensions — shared with mouse hit-testing via palette_overlay_rect.
+        let ov_rect = palette_overlay_rect(area, palette.rows.len());
+        let ov_x = ov_rect.x;
+        let ov_y = ov_rect.y;
+        let ov_w = ov_rect.width;
+        let ov_h = ov_rect.height;
+        // list_h mirrors the computation inside palette_overlay_rect.
+        let list_h = (palette.rows.len() as u16).min(15).min(h.saturating_sub(4));
 
         // Clear the overlay area.
         frame.render_widget(Clear, ov_rect);
@@ -242,17 +314,41 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         );
     }
 
-    if let Some(ref mut menu) = editor.menu {
-        let menu_area = Rect::new(area.x, area.y, w, h.saturating_sub(1));
-        frame.render_stateful_widget(
-            tui_menu::Menu::<crate::registry::CommandId>::new()
-                .default_style(RStyle::default().fg(Color::White).bg(Color::Black))
-                .highlight(RStyle::default().fg(Color::Black).bg(Color::White))
-                .dropdown_style(RStyle::default().fg(Color::White).bg(Color::DarkGray))
-                .dropdown_width(28),
-            menu_area,
-            &mut menu.state,
-        );
+    if let Some(ref menu) = editor.menu {
+        if !menu.groups.is_empty() {
+            let menu_area = Rect::new(area.x, area.y, w, h.saturating_sub(1));
+            // Paint the menu bar (one label per category)
+            let bar = menu_bar_layout(menu_area, &menu.groups);
+            for (i, rect) in &bar {
+                let cat = menu.groups[*i].0;
+                let label = crate::menu::category_label_pub(cat);
+                let text = format!(" {label} ");
+                let style = if *i == menu.open {
+                    RStyle::default().fg(Color::Black).bg(Color::White)
+                } else {
+                    RStyle::default().fg(Color::White).bg(Color::Black)
+                };
+                frame.render_widget(Paragraph::new(text).style(style), *rect);
+            }
+            // Paint the dropdown for the open category
+            if let Some(drop_rect) = menu_dropdown_rect(menu_area, &menu.groups, menu.open) {
+                frame.render_widget(Clear, drop_rect);
+                let leaves = &menu.groups[menu.open].1;
+                let items: Vec<ListItem> = leaves
+                    .iter()
+                    .enumerate()
+                    .map(|(row, (label, _))| {
+                        let style = if row == menu.highlighted {
+                            RStyle::default().fg(Color::Black).bg(Color::White)
+                        } else {
+                            RStyle::default().fg(Color::White).bg(Color::DarkGray)
+                        };
+                        ListItem::new(format!(" {label} ")).style(style)
+                    })
+                    .collect();
+                frame.render_widget(List::new(items), drop_rect);
+            }
+        }
     }
 }
 
@@ -373,5 +469,17 @@ mod tests {
 
         assert_eq!(row0, "mnop");
         assert!(crate::nav::screen_pos(&e).is_some());
+    }
+
+    /// palette_overlay_rect sizes height to the actual row count, not fixed-15.
+    #[test]
+    fn palette_overlay_rect_sizes_to_row_count() {
+        let area = Rect::new(0, 0, 80, 40);
+        // 3 rows → list_h=3, ov_h=3+3=6
+        let r3 = palette_overlay_rect(area, 3);
+        assert_eq!(r3.height, 6, "3 rows: expected height 6 (3 list + 3 chrome)");
+        // 30 rows → list_h capped at 15, ov_h=15+3=18
+        let r30 = palette_overlay_rect(area, 30);
+        assert_eq!(r30.height, 18, "30 rows: expected height 18 (15 capped + 3 chrome)");
     }
 }

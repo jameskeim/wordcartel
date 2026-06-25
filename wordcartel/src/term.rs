@@ -7,7 +7,7 @@ use std::io::{self, Stdout};
 
 use crossterm::{
     cursor::Show,
-    event::{DisableBracketedPaste, EnableBracketedPaste},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -25,10 +25,12 @@ impl TerminalGuard {
     /// Enable raw mode, enter the alternate screen, and return a `TerminalGuard`
     /// whose `Drop` impl will restore the terminal.
     ///
+    /// If `enable_mouse` is true, mouse capture is enabled (best-effort).
+    ///
     /// If any step after `enable_raw_mode` fails, raw mode and the alternate
     /// screen are rolled back before returning the error so the terminal is
     /// always left in a usable state (no raw-mode leak).
-    pub fn new() -> io::Result<Self> {
+    pub fn new(enable_mouse: bool) -> io::Result<Self> {
         enable_raw_mode()?;
         // From this point forward any failure must roll back raw mode.
         let mut stdout = io::stdout();
@@ -38,12 +40,16 @@ impl TerminalGuard {
         }
         // Enable bracketed paste (best-effort: if the terminal doesn't support it, ignore).
         let _ = execute!(stdout, EnableBracketedPaste);
+        // Enable mouse capture only when requested (best-effort).
+        if enable_mouse {
+            let _ = execute!(stdout, EnableMouseCapture);
+        }
         let backend = CrosstermBackend::new(io::stdout());
         let terminal = match Terminal::new(backend) {
             Ok(t) => t,
             Err(e) => {
                 let _ = disable_raw_mode();
-                let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen, Show);
+                let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen, Show);
                 return Err(e);
             }
         };
@@ -59,7 +65,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen, Show);
+        let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen, Show);
     }
 }
 
@@ -79,7 +85,7 @@ pub fn install_panic_hook() {
             crate::recovery::dump_on_panic();
             // Restore the terminal.
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen, Show);
+            let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen, Show);
             prev(info);
         }));
     });

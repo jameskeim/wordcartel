@@ -111,10 +111,35 @@ impl Buffer {
     }
 }
 
+/// Per-click tracking for double/triple-click detection.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct ClickRecord {
+    pub cell: (u16, u16),
+    pub at_ms: u64,
+    pub count: u8,
+}
+
+/// Transient mouse gesture state — reset on capture disable (reconcile clears drag).
+#[derive(Default, Debug, Clone)]
+pub struct MouseState {
+    /// Byte-offset anchor for drag selection; None when no drag is active.
+    pub anchor: Option<usize>,
+    /// Last recorded click (cell, timestamp, repeat count).
+    pub last_click: Option<ClickRecord>,
+    /// True while a text-area drag is in progress.
+    pub dragging: bool,
+    /// True while the scrollbar thumb is being dragged.
+    pub scrollbar_dragging: bool,
+    /// Timestamp until which the scrollbar overlay remains visible after hover.
+    pub scrollbar_until_ms: u64,
+    /// Whether the scrollbar overlay is currently visible.
+    pub scrollbar_visible: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkPending { Set, Jump }
 
-// Not Clone: the menu field's tui_menu::MenuState is !Clone.
+// MenuView is now Clone (#[derive(Clone, Debug)]); Editor intentionally remains !Clone.
 #[derive(Debug)]
 pub struct Editor {
     pub buffers: Vec<Buffer>,
@@ -139,6 +164,11 @@ pub struct Editor {
     pub keymap: crate::keymap::KeyTrie,
     pub palette: Option<crate::palette::Palette>,
     pub menu: Option<crate::menu::MenuView>,
+    /// Whether mouse capture is currently requested (toggled by `toggle_mouse_capture`).
+    /// Seeded from config at startup; defaults to `true` in test/scratch contexts.
+    pub mouse_capture: bool,
+    /// Transient mouse gesture state; cleared by `reconcile_mouse_capture` on disable.
+    pub mouse: MouseState,
 }
 
 impl Editor {
@@ -170,6 +200,8 @@ impl Editor {
             keymap,
             palette: None,
             menu: None,
+            mouse_capture: true,
+            mouse: MouseState::default(),
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer {

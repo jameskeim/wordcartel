@@ -130,12 +130,11 @@ pub fn build_range_replace(
     (cs, edit)
 }
 
-/// Compute the (from, to) byte range of `scope` at the caret position.
+/// Compute the (from, to) byte range of `scope` at the given byte offset `h`.
 /// Borrows `editor` immutably and returns owned `(usize, usize)`.
-fn scope_range(editor: &Editor, scope: Scope) -> (usize, usize) {
+pub fn scope_range_at(editor: &Editor, h: usize, scope: Scope) -> (usize, usize) {
     let buf = &editor.active().document.buffer;
     let blocks = &editor.active().document.blocks;
-    let h = nav::head(editor);
     match scope {
         Scope::Word => {
             let (ps, pe) = nav::paragraph_range_at(blocks, buf, h);
@@ -159,6 +158,12 @@ fn scope_range(editor: &Editor, scope: Scope) -> (usize, usize) {
         Scope::Paragraph => nav::paragraph_range_at(blocks, buf, h),
         Scope::Document => (0, buf.len()),
     }
+}
+
+/// Compute the (from, to) byte range of `scope` at the caret position.
+/// Borrows `editor` immutably and returns owned `(usize, usize)`.
+fn scope_range(editor: &Editor, scope: Scope) -> (usize, usize) {
+    scope_range_at(editor, nav::head(editor), scope)
 }
 
 /// Set the selection to [from, to) and re-derive + ensure visibility.
@@ -1245,5 +1250,17 @@ mod tests {
         let caret_line = e.active().document.buffer.snapshot().byte_to_line(nav::head(&e));
         assert!(e.active().view.line_layouts.contains_key(&caret_line),
             "caret's logical line must be laid out (visible) after a mode change");
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 5 (effort-5c-m): scope_range_at with explicit offset
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn scope_range_at_word_at_offset() {
+        let mut e = Editor::new_from_text("alpha beta", None, (80, 24));
+        derive::rebuild(&mut e);
+        // offset 7 is inside "beta" (6..10)
+        assert_eq!(super::scope_range_at(&e, 7, Scope::Word), (6, 10));
     }
 }

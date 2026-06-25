@@ -196,6 +196,12 @@ impl Registry {
             CommandResult::Handled
         });
 
+        // View menu — mouse capture toggle (Task 2 / Effort 5c-m).
+        r.register("toggle_mouse_capture", "Toggle Mouse Capture", Some(MenuCategory::View), |c| {
+            c.editor.mouse_capture = !c.editor.mouse_capture;
+            CommandResult::Handled
+        });
+
         r
     }
 
