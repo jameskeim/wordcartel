@@ -458,6 +458,7 @@ pub fn paragraph_range_at(blocks: &BlockTree, buf: &TextBuffer, pos: usize) -> (
     if total == 0 {
         return (0, 0);
     }
+    // pos may equal buf.len() (past the last byte); clamp to len-1 so byte_to_line gets a valid index.
     let line = buf.byte_to_line(pos.min(buf.len().saturating_sub(1)));
     let is_blank = |l: usize| derive::line_text(buf, l).trim().is_empty();
     if is_blank(line) {
@@ -501,10 +502,10 @@ pub fn next_paragraph_start(blocks: &BlockTree, buf: &TextBuffer, pos: usize) ->
 
 /// Start of the leaf block before the one containing `pos`, else `0`.
 #[allow(dead_code)] // wired in Task 5/6/7
-pub fn prev_paragraph_start(blocks: &BlockTree, _buf: &TextBuffer, _pos: usize) -> usize {
+pub fn prev_paragraph_start(blocks: &BlockTree, _buf: &TextBuffer, pos: usize) -> usize {
     // caller passes the *current paragraph start* as `pos` boundary; pick the
     // last leaf start strictly before it.
-    leaf_spans(blocks).into_iter().map(|(s, _)| s).filter(|&s| s < _pos).next_back().unwrap_or(0)
+    leaf_spans(blocks).into_iter().map(|(s, _)| s).filter(|&s| s < pos).next_back().unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
