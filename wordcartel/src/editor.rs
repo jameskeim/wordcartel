@@ -113,6 +113,9 @@ pub struct Editor {
     pub transform_in_flight: bool,
     pub minibuffer: Option<crate::minibuffer::Minibuffer>,
     pub pending_export: Option<crate::export::PendingExport>,
+    pub clipboard_sync_request: Option<String>,
+    pub clipboard_get_pending: Option<crate::clipboard::PasteIntent>,
+    pub clipboard_notice_shown: bool,
 }
 
 impl Editor {
@@ -134,6 +137,7 @@ impl Editor {
             register: Register::default(), status: String::new(), quit: false,
             prompt: None, quit_after_save: None, quit_after_save_at: None,
             filter_in_flight: None, transform_in_flight: false, minibuffer: None, pending_export: None,
+            clipboard_sync_request: None, clipboard_get_pending: None, clipboard_notice_shown: false,
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer {

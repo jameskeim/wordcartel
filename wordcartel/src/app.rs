@@ -52,6 +52,8 @@ pub enum Msg {
         kind: crate::transform::TransformKind,
         result: Result<String, crate::transform::TransformError>,
     },
+    ClipboardPaste { id: u64, buffer_id: crate::editor::BufferId, text: Option<String> },
+    ClipboardAvailability(bool),
     Tick,
 }
 
@@ -81,6 +83,10 @@ impl std::fmt::Debug for Msg {
                 .field("range", range)
                 .field("kind", kind)
                 .finish(),
+            Msg::ClipboardPaste { id, buffer_id, text } => f.debug_struct("ClipboardPaste")
+                .field("id", id).field("buffer_id", buffer_id)
+                .field("has_text", &text.is_some()).finish(),
+            Msg::ClipboardAvailability(ok) => f.debug_tuple("ClipboardAvailability").field(ok).finish(),
             Msg::Tick => f.write_str("Tick"),
         }
     }
@@ -464,6 +470,8 @@ pub fn reduce(
                 crate::swap::dispatch_swap_write(&mut ctx);
             }
         }
+        // Task 3 wires the real handling; the prompt/minibuffer blocks already have `_ => {}`.
+        Msg::ClipboardPaste { .. } | Msg::ClipboardAvailability(_) => {}
     }
     if editor.active().document.version != before {
         editor.active_mut().last_edit_at = Some(clock.now_ms());
