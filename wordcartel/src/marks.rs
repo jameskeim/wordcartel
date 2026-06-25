@@ -5,9 +5,7 @@ use crate::nav;
 pub fn set_mark(editor: &mut Editor)  { editor.active_mut().sel_history.clear(); editor.pending_mark = Some(MarkPending::Set); editor.status = "set mark:".into(); }
 pub fn jump_to_mark(editor: &mut Editor) { editor.pending_mark = Some(MarkPending::Jump); editor.status = "jump to mark:".into(); }
 
-/// Push `pre` onto the ring as a deliberate jump origin (Task 9 fills in the
-/// back/forward navigation; this is the shared push).
-#[allow(dead_code)] // wired in Task 9
+/// Push `pre` onto the ring as a deliberate jump origin.
 pub fn record_jump(buf: &mut Buffer, pre: usize) {
     const CAP: usize = 64;
     if buf.ring_cursor < buf.jump_ring.len() {
@@ -18,6 +16,47 @@ pub fn record_jump(buf: &mut Buffer, pre: usize) {
         if buf.jump_ring.len() > CAP { buf.jump_ring.remove(0); }
     }
     buf.ring_cursor = buf.jump_ring.len();
+}
+
+pub fn jump_back(editor: &mut Editor) {
+    editor.active_mut().sel_history.clear();
+    let here = nav::head(editor);
+    let raw: Option<usize> = {
+        let buf = editor.active_mut();
+        if buf.ring_cursor == buf.jump_ring.len() {
+            // parked at the live caret — record it as the forward anchor
+            if buf.jump_ring.last() != Some(&here) { buf.jump_ring.push(here); }
+        }
+        if buf.ring_cursor == 0 {
+            None
+        } else {
+            buf.ring_cursor -= 1;
+            Some(buf.jump_ring[buf.ring_cursor])
+        }
+    }; // <- mutable borrow ends here
+    let Some(raw) = raw else { editor.status = "ring: at oldest".into(); return; };
+    let off = nav::clamp_snap(editor, raw);
+    editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(off);
+    crate::derive::rebuild(editor);
+    nav::ensure_visible(editor);
+}
+
+pub fn jump_forward(editor: &mut Editor) {
+    editor.active_mut().sel_history.clear();
+    let raw: Option<usize> = {
+        let buf = editor.active_mut();
+        if buf.ring_cursor + 1 >= buf.jump_ring.len() {
+            None
+        } else {
+            buf.ring_cursor += 1;
+            Some(buf.jump_ring[buf.ring_cursor])
+        }
+    };
+    let Some(raw) = raw else { editor.status = "ring: at newest".into(); return; };
+    let off = nav::clamp_snap(editor, raw);
+    editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(off);
+    crate::derive::rebuild(editor);
+    nav::ensure_visible(editor);
 }
 
 /// Apply the captured mark char for the pending operation.
@@ -50,6 +89,26 @@ pub fn resolve_pending(editor: &mut Editor, ch: char) {
 #[cfg(test)]
 mod tests {
     use crate::editor::{Editor, MarkPending};
+
+    #[test]
+    fn jump_back_and_forward_walk_the_ring() {
+        let mut e = Editor::new_from_text("0123456789\n", None, (80, 24));
+        // simulate two deliberate jumps from 0 → 5 → 9
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(0);
+        super::record_jump(e.active_mut(), 0);
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(5);
+        super::record_jump(e.active_mut(), 5);
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(9);
+        // back → 5, back → 0
+        super::jump_back(&mut e);
+        assert_eq!(e.active().document.selection.primary().head, 5);
+        super::jump_back(&mut e);
+        assert_eq!(e.active().document.selection.primary().head, 0);
+        // forward → 5
+        super::jump_forward(&mut e);
+        assert_eq!(e.active().document.selection.primary().head, 5);
+    }
+
     #[test]
     fn set_then_jump_mark_round_trips() {
         let mut e = Editor::new_from_text("line0\nline1\nline2\n", None, (80, 24));

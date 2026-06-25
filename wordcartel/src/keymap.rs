@@ -274,6 +274,9 @@ static CUA: &[(&str, &str)] = &[
     // Named marks (Task 8 / Effort 5c)
     ("ctrl-k m", "set_mark"),
     ("ctrl-k j", "jump_to_mark"),
+    // Jump-back ring (Task 9 / Effort 5c)
+    ("alt-left",  "jump_back"),
+    ("alt-right", "jump_forward"),
     // Editing  (input.rs lines 111–113)
     ("enter",     "insert_newline"),
     ("backspace", "backspace"),

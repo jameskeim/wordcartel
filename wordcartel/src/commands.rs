@@ -313,6 +313,12 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         Command::Move { dir, extend } => {
             // Reset the expand-selection ladder on every motion (Task 7).
             editor.active_mut().sel_history.clear();
+            // DocStart / DocEnd are deliberate long-range jumps: push the ring
+            // so the user can alt-left back to where they came from.
+            if matches!(dir, Dir::DocStart | Dir::DocEnd) {
+                let pre = nav::head(editor);
+                crate::marks::record_jump(editor.active_mut(), pre);
+            }
             // Compute the new head offset using the appropriate nav function.
             let new_head = match dir {
                 Dir::Left     => nav::move_left(editor),
