@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Position, Rect},
     style::{Color, Modifier, Style as RStyle},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 use wordcartel_core::style::Style;
@@ -140,6 +140,21 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
 
             screen_row += 1;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Scrollbar overlay (painted over editing area, rightmost column)
+    // -----------------------------------------------------------------------
+    if editor.mouse.scrollbar_visible {
+        let total = crate::derive::total_logical_lines(&editor.active().document.buffer);
+        let scroll_pos = editor.active().view.scroll;
+        let sb_area = Rect::new(area.x, edit_top, w, edit_height);
+        let mut sb_state = ScrollbarState::new(total).position(scroll_pos);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            sb_area,
+            &mut sb_state,
+        );
     }
 
     // -----------------------------------------------------------------------

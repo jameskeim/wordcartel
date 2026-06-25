@@ -1002,6 +1002,9 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     guard.terminal().draw(|f| render::render(f, &mut editor))?;
     loop {
         let now = clock.now_ms();
+        // Recompute scrollbar visibility from the clock so the bar fades when
+        // scrollbar_until_ms expires (driven by the deadline below, not idle Tick).
+        recompute_scrollbar_visible(&mut editor, now);
         // Bounded save&quit: if waiting for an in-flight save to complete and
         // 5 s have elapsed since the last edit, re-raise the quit-confirm modal.
         if let Some(_v) = editor.quit_after_save {
@@ -1015,7 +1018,20 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
         }
         let swap_deadline = crate::swap::next_deadline_ms(now, editor.active().last_edit_at, editor.active().last_swap_at);
         let sq_deadline = editor.quit_after_save_at.map(|t| t.saturating_add(SAVE_QUIT_TIMEOUT_MS));
+        // Include scrollbar_until_ms in the deadline so the loop wakes when the
+        // bar should fade (avoids relying on the idle 1-hour Tick).
+        let sb_deadline = if editor.mouse.scrollbar_until_ms > now {
+            Some(editor.mouse.scrollbar_until_ms)
+        } else {
+            None
+        };
         let deadline = match (swap_deadline, sq_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let deadline = match (deadline, sb_deadline) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
             (None, Some(b)) => Some(b),
@@ -1061,6 +1077,15 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
 /// Enables or disables mouse capture on the backend when the desired state
 /// diverges from `applied`. On disable, clears drag state so no stale Up
 /// events are awaited for a capture that will never arrive.
+/// Recompute `editor.mouse.scrollbar_visible` from the clock.
+///
+/// Must be called at the top of the run loop (with `clock.now_ms()`) so that
+/// the scrollbar fades exactly when `scrollbar_until_ms` expires, driven by
+/// the loop's `deadline` (not an idle Tick).
+pub fn recompute_scrollbar_visible(editor: &mut crate::editor::Editor, now_ms: u64) {
+    editor.mouse.scrollbar_visible = now_ms < editor.mouse.scrollbar_until_ms;
+}
+
 pub fn reconcile_mouse_capture<W: std::io::Write>(editor: &mut crate::editor::Editor, backend: &mut W, applied: &mut bool) {
     if editor.mouse_capture != *applied {
         if editor.mouse_capture {
@@ -2327,5 +2352,16 @@ mod tests {
         { let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
           reg.dispatch(id, &mut ctx); }
         assert!(!e.mouse_capture, "toggled off");
+    }
+
+    #[test]
+    fn scrollbar_visible_recomputed_against_clock() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.mouse.scrollbar_until_ms = 1000;
+        crate::app::recompute_scrollbar_visible(&mut e, 500); // before deadline
+        assert!(e.mouse.scrollbar_visible);
+        crate::app::recompute_scrollbar_visible(&mut e, 1200); // after
+        assert!(!e.mouse.scrollbar_visible);
     }
 }

@@ -7,9 +7,7 @@ pub enum CellHit {
     Text { col: u16, erow: u16 },
     MenuBar,
     Status,
-    #[allow(dead_code)] // wired in Task 6
     Scrollbar,
-    #[allow(dead_code)] // wired in Task 5
     Outside,
 }
 
@@ -71,7 +69,22 @@ pub fn handle(
     }
     match ev.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if let CellHit::Text { col, erow } = editing_cell(editor, ev.column, ev.row) {
+            if let CellHit::Scrollbar = editing_cell(editor, ev.column, ev.row) {
+                let (_w, h) = editor.active().view.area;
+                let menu_rows = u16::from(editor.menu.is_some());
+                let edit_height = h.saturating_sub(1 + menu_rows) as usize;
+                let erow_in_track = ev.row.saturating_sub(menu_rows) as usize;
+                let total = crate::derive::total_logical_lines(&editor.active().document.buffer);
+                let max_scroll = total.saturating_sub(1);
+                let new_scroll = if edit_height > 0 {
+                    ((erow_in_track * max_scroll) / edit_height).min(max_scroll)
+                } else {
+                    0
+                };
+                editor.active_mut().view.scroll = new_scroll;
+                editor.mouse.scrollbar_dragging = true;
+                editor.mouse.scrollbar_until_ms = clock.now_ms() + 1200;
+            } else if let CellHit::Text { col, erow } = editing_cell(editor, ev.column, ev.row) {
                 let buf_len = editor.active().document.buffer.len();
                 let off = match crate::nav::offset_at_cell(editor, col, erow) {
                     Some(o) => crate::nav::clamp_snap(editor, o),
@@ -121,6 +134,22 @@ pub fn handle(
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            if editor.mouse.scrollbar_dragging {
+                let (_w, h) = editor.active().view.area;
+                let menu_rows = u16::from(editor.menu.is_some());
+                let edit_height = h.saturating_sub(1 + menu_rows) as usize;
+                let erow_in_track = ev.row.saturating_sub(menu_rows) as usize;
+                let total = crate::derive::total_logical_lines(&editor.active().document.buffer);
+                let max_scroll = total.saturating_sub(1);
+                let new_scroll = if edit_height > 0 {
+                    ((erow_in_track * max_scroll) / edit_height).min(max_scroll)
+                } else {
+                    0
+                };
+                editor.active_mut().view.scroll = new_scroll;
+                editor.mouse.scrollbar_until_ms = clock.now_ms() + 1200;
+                return;
+            }
             if !editor.mouse.dragging { return; }
             let (_w, h) = editor.active().view.area;
             let menu_rows = u16::from(editor.menu.is_some());
@@ -140,7 +169,10 @@ pub fn handle(
                 crate::derive::rebuild(editor);
             }
         }
-        MouseEventKind::Up(MouseButton::Left) => { editor.mouse.dragging = false; }
+        MouseEventKind::Up(MouseButton::Left) => {
+            editor.mouse.dragging = false;
+            editor.mouse.scrollbar_dragging = false;
+        }
         MouseEventKind::ScrollDown => {
             crate::nav::scroll_down_one(editor);
             editor.mouse.scrollbar_until_ms = clock.now_ms() + 1200;
@@ -272,5 +304,19 @@ mod tests {
         handle(&mut e, wheel, &reg, &km, &ex, &clk, &tx);
         assert!(e.active().view.scroll > 0, "view scrolled");
         assert_eq!(crate::nav::head(&e), before, "caret unchanged");
+    }
+
+    #[test]
+    fn scrollbar_drag_scrubs_view() {
+        let text: String = (0..100).map(|i| format!("l{i}\n")).collect();
+        let mut e = Editor::new_from_text(&text, None, (80, 12));
+        e.mouse.scrollbar_visible = true;
+        crate::derive::rebuild(&mut e);
+        let (reg, ex, clk, tx, km) = ctx();
+        // Down on the scrollbar column (w-1 = 79), mid-track row
+        let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 79, row: 6, modifiers: KeyModifiers::NONE };
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        assert!(e.mouse.scrollbar_dragging);
+        assert!(e.active().view.scroll > 0, "scrubbed to a lower position");
     }
 }
