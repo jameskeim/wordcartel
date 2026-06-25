@@ -268,6 +268,9 @@ static CUA: &[(&str, &str)] = &[
     // Word delete
     ("ctrl-backspace", "delete_word_back"),
     ("ctrl-del",       "delete_word_forward"),
+    // Text object expand/shrink (Task 7 / Effort 5c)
+    ("ctrl-w",       "expand_selection"),
+    ("ctrl-shift-w", "shrink_selection"),
     // Editing  (input.rs lines 111–113)
     ("enter",     "insert_newline"),
     ("backspace", "backspace"),

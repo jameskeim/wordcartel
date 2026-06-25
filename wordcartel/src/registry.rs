@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::commands::{self, Command, CommandResult, Dir};
+use crate::commands::{self, Command, CommandResult, Dir, Scope};
 use crate::editor::Editor;
 use crate::jobs::Executor;
 use crate::app::Msg;
@@ -147,6 +147,13 @@ impl Registry {
             crate::export::run_export(c.editor, "pdf", &c.msg_tx);
             CommandResult::Handled
         });
+
+        // Text object selection — palette-only (Task 7 / Effort 5c).
+        r.register("select_word",      "Select Word",      None, |c| run(c, Command::SelectScope(Scope::Word)));
+        r.register("select_sentence",  "Select Sentence",  None, |c| run(c, Command::SelectScope(Scope::Sentence)));
+        r.register("select_paragraph", "Select Paragraph", None, |c| run(c, Command::SelectScope(Scope::Paragraph)));
+        r.register("expand_selection", "Expand Selection", None, |c| run(c, Command::ExpandSelection));
+        r.register("shrink_selection", "Shrink Selection", None, |c| run(c, Command::ShrinkSelection));
 
         // View menu — palette command (Task 3 / Effort 5b).
         r.register("palette", "Command Palette\u{2026}", Some(MenuCategory::View), |c| {

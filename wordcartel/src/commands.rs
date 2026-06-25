@@ -20,6 +20,10 @@ use wordcartel_core::history::{Clock, EditKind, Transaction};
 use wordcartel_core::register;
 use wordcartel_core::selection::{Range, Selection};
 
+/// Text object scope for selection expansion commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope { Word, Sentence, Paragraph, Document }
+
 /// Direction of caret movement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dir {
@@ -66,6 +70,12 @@ pub enum Command {
     Quit,
     /// Delete one word backwards (back=true) or forwards (back=false).
     DeleteWord { back: bool },
+    /// Select the given text-object scope at the caret (clears sel_history).
+    SelectScope(Scope),
+    /// Grow selection: word → sentence → paragraph → document (pushes to sel_history).
+    ExpandSelection,
+    /// Shrink selection: pop one level from sel_history.
+    ShrinkSelection,
 }
 
 /// Result returned by `run`.
@@ -118,6 +128,44 @@ pub fn build_range_replace(
     let cs = replace_changeset(from, to, text, doc_len); // existing private builder
     let edit = wordcartel_core::block_tree::Edit { range: from..to, new_len: text.len() };
     (cs, edit)
+}
+
+/// Compute the (from, to) byte range of `scope` at the caret position.
+/// Borrows `editor` immutably and returns owned `(usize, usize)`.
+fn scope_range(editor: &Editor, scope: Scope) -> (usize, usize) {
+    let buf = &editor.active().document.buffer;
+    let blocks = &editor.active().document.blocks;
+    let h = nav::head(editor);
+    match scope {
+        Scope::Word => {
+            let (ps, pe) = nav::paragraph_range_at(blocks, buf, h);
+            let win = buf.slice(ps..pe);
+            let (wf, wt) = wordcartel_core::textobj::word_bounds(&win, h - ps);
+            if wf == wt {
+                // in whitespace → nearest word (next within block, else prev)
+                match wordcartel_core::textobj::next_word_start(&win, h - ps)
+                    .or_else(|| wordcartel_core::textobj::prev_word_start(&win, h - ps)) {
+                    Some(r) => { let (a, b) = wordcartel_core::textobj::word_bounds(&win, r); (ps + a, ps + b) }
+                    None => (h, h),
+                }
+            } else { (ps + wf, ps + wt) }
+        }
+        Scope::Sentence => {
+            let (ps, pe) = nav::paragraph_range_at(blocks, buf, h);
+            let win = buf.slice(ps..pe);
+            let (sf, st) = wordcartel_core::textobj::sentence_bounds(&win, h - ps);
+            (ps + sf, ps + st)
+        }
+        Scope::Paragraph => nav::paragraph_range_at(blocks, buf, h),
+        Scope::Document => (0, buf.len()),
+    }
+}
+
+/// Set the selection to [from, to) and re-derive + ensure visibility.
+fn set_selection_range(editor: &mut Editor, from: usize, to: usize) {
+    editor.active_mut().document.selection = Selection::range(from, to);
+    derive::rebuild(editor);
+    nav::ensure_visible(editor);
 }
 
 /// Execute `cmd` against `editor`, then re-derive + ensure visibility.
@@ -440,6 +488,41 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             nav::ensure_visible(editor);
             editor.active_mut().desired_col = None;
             CommandResult::Handled
+        }
+
+        Command::SelectScope(scope) => {
+            editor.active_mut().sel_history.clear();
+            let (from, to) = scope_range(editor, scope);
+            set_selection_range(editor, from, to);
+            CommandResult::Handled
+        }
+
+        Command::ExpandSelection => {
+            let cur = editor.active().document.selection.primary();
+            let (cf, ct) = (cur.from(), cur.to());
+            // Find the smallest scope strictly larger than the current selection.
+            let order = [Scope::Word, Scope::Sentence, Scope::Paragraph, Scope::Document];
+            let mut next: Option<(usize, usize)> = None;
+            for sc in order {
+                let (f, t) = scope_range(editor, sc);
+                if f <= cf && t >= ct && (f < cf || t > ct) { next = Some((f, t)); break; }
+            }
+            if let Some((f, t)) = next {
+                // Clone to a local first — avoids overlapping active()/active_mut() borrow.
+                let cur_sel = editor.active().document.selection.clone();
+                editor.active_mut().sel_history.push(cur_sel);
+                set_selection_range(editor, f, t);
+                CommandResult::Handled
+            } else { CommandResult::Noop }
+        }
+
+        Command::ShrinkSelection => {
+            if let Some(prev) = editor.active_mut().sel_history.pop() {
+                editor.active_mut().document.selection = prev;
+                derive::rebuild(editor);
+                nav::ensure_visible(editor);
+                CommandResult::Handled
+            } else { CommandResult::Noop }
         }
     }
 }
@@ -1102,6 +1185,43 @@ mod tests {
         run(Command::Move { dir: Dir::PageDown, extend: false }, &mut e, &TestClock(0));
         assert!(nav::caret_line(&e) >= 7 && nav::caret_line(&e) <= 9,
             "page-down should advance ~one viewport, got line {}", nav::caret_line(&e));
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 7: Text objects — select word/sentence/paragraph + expand/shrink
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn select_paragraph_selects_block() {
+        let mut e = Editor::new_from_text("One two.\n\nThree four.\n", None, (80, 24));
+        set_caret(&mut e, 12); derive::rebuild(&mut e); // inside "Three four."
+        run(Command::SelectScope(Scope::Paragraph), &mut e, &TestClock(0));
+        let r = e.active().document.selection.primary();
+        assert_eq!(e.active().document.buffer.slice(r.from()..r.to()).trim(), "Three four.");
+    }
+
+    #[test]
+    fn expand_then_shrink_round_trips() {
+        let mut e = Editor::new_from_text("One two. Three four.\n", None, (80, 24));
+        set_caret(&mut e, 1); derive::rebuild(&mut e); // inside "One"
+        run(Command::ExpandSelection, &mut e, &TestClock(0)); // → word "One"
+        let w = e.active().document.selection.primary();
+        assert_eq!(e.active().document.buffer.slice(w.from()..w.to()), "One");
+        run(Command::ExpandSelection, &mut e, &TestClock(0)); // → sentence
+        let s = e.active().document.selection.primary();
+        assert!(e.active().document.buffer.slice(s.from()..s.to()).starts_with("One two."));
+        run(Command::ShrinkSelection, &mut e, &TestClock(0)); // back to word
+        let w2 = e.active().document.selection.primary();
+        assert_eq!((w2.from(), w2.to()), (w.from(), w.to()));
+    }
+
+    #[test]
+    fn a_motion_resets_the_expand_ladder() {
+        let mut e = Editor::new_from_text("One two.\n", None, (80, 24));
+        set_caret(&mut e, 1); derive::rebuild(&mut e);
+        run(Command::ExpandSelection, &mut e, &TestClock(0));
+        run(Command::Move { dir: Dir::Right, extend: false }, &mut e, &TestClock(0)); // resets
+        assert!(e.active().sel_history.is_empty());
     }
 
     #[test]
