@@ -30,6 +30,37 @@ pub fn style_to_ratatui(s: Style) -> RStyle {
     }
 }
 
+// Shared geometry — render AND mouse (Task 7) both call these.
+pub(crate) fn menu_bar_layout(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)]) -> Vec<(usize, Rect)> {
+    let mut out = Vec::new();
+    let mut x = area.x;
+    for (i, (cat, _)) in groups.iter().enumerate() {
+        let label = crate::menu::category_label_pub(*cat);
+        let wgt = label.chars().count() as u16 + 2; // 1 space padding each side
+        out.push((i, Rect::new(x, area.y, wgt, 1)));
+        x = x.saturating_add(wgt);
+    }
+    out
+}
+
+pub(crate) fn menu_dropdown_rect(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)], open: usize) -> Option<Rect> {
+    let bar = menu_bar_layout(area, groups);
+    let (_, label_rect) = bar.get(open)?;
+    let leaves = &groups.get(open)?.1;
+    if leaves.is_empty() { return None; }
+    let width = leaves.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0) as u16 + 2;
+    let height = leaves.len() as u16;
+    Some(Rect::new(label_rect.x, area.y + 1, width.min(area.width.saturating_sub(label_rect.x - area.x)), height.min(area.height.saturating_sub(1))))
+}
+
+#[allow(dead_code)] // used by Task 7 (mouse hit-testing)
+pub(crate) fn menu_dropdown_row_at(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)], open: usize, col: u16, row: u16) -> Option<usize> {
+    let r = menu_dropdown_rect(area, groups, open)?;
+    if col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height {
+        Some((row - r.y) as usize)
+    } else { None }
+}
+
 /// Paint the viewport + status line to `frame` using `editor` state.
 ///
 /// The editor is borrowed mutably so stateful overlay widgets can update their
@@ -242,17 +273,41 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         );
     }
 
-    if let Some(ref mut menu) = editor.menu {
-        let menu_area = Rect::new(area.x, area.y, w, h.saturating_sub(1));
-        frame.render_stateful_widget(
-            tui_menu::Menu::<crate::registry::CommandId>::new()
-                .default_style(RStyle::default().fg(Color::White).bg(Color::Black))
-                .highlight(RStyle::default().fg(Color::Black).bg(Color::White))
-                .dropdown_style(RStyle::default().fg(Color::White).bg(Color::DarkGray))
-                .dropdown_width(28),
-            menu_area,
-            &mut menu.state,
-        );
+    if let Some(ref menu) = editor.menu {
+        if !menu.groups.is_empty() {
+            let menu_area = Rect::new(area.x, area.y, w, h.saturating_sub(1));
+            // Paint the menu bar (one label per category)
+            let bar = menu_bar_layout(menu_area, &menu.groups);
+            for (i, rect) in &bar {
+                let cat = menu.groups[*i].0;
+                let label = crate::menu::category_label_pub(cat);
+                let text = format!(" {label} ");
+                let style = if *i == menu.open {
+                    RStyle::default().fg(Color::Black).bg(Color::White)
+                } else {
+                    RStyle::default().fg(Color::White).bg(Color::Black)
+                };
+                frame.render_widget(Paragraph::new(text).style(style), *rect);
+            }
+            // Paint the dropdown for the open category
+            if let Some(drop_rect) = menu_dropdown_rect(menu_area, &menu.groups, menu.open) {
+                frame.render_widget(Clear, drop_rect);
+                let leaves = &menu.groups[menu.open].1;
+                let items: Vec<ListItem> = leaves
+                    .iter()
+                    .enumerate()
+                    .map(|(row, (label, _))| {
+                        let style = if row == menu.highlighted {
+                            RStyle::default().fg(Color::Black).bg(Color::White)
+                        } else {
+                            RStyle::default().fg(Color::White).bg(Color::DarkGray)
+                        };
+                        ListItem::new(format!(" {label} ")).style(style)
+                    })
+                    .collect();
+                frame.render_widget(List::new(items), drop_rect);
+            }
+        }
     }
 }
 

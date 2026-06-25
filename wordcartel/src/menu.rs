@@ -1,44 +1,24 @@
 use crate::keymap::KeyTrie;
 use crate::registry::{CommandId, MenuCategory, Registry, MENU_ORDER};
-use tui_menu::{MenuItem, MenuState};
 
+#[derive(Clone, Debug)]
 pub struct MenuView {
-    pub state: MenuState<CommandId>,
+    pub groups: Vec<(MenuCategory, Vec<(String, CommandId)>)>,
+    pub open: usize,
+    pub highlighted: usize,
     pub built: bool,
 }
 
-impl std::fmt::Debug for MenuView {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MenuView")
-            .field("built", &self.built)
-            .finish_non_exhaustive()
-    }
-}
-
 pub fn empty() -> MenuView {
-    MenuView {
-        state: MenuState::new(Vec::new()),
-        built: false,
-    }
+    MenuView { groups: Vec::new(), open: 0, highlighted: 0, built: false }
 }
 
 pub fn build(reg: &Registry, keymap: &KeyTrie) -> MenuView {
-    let groups = grouped_commands(reg, keymap);
-    let mut state = MenuState::new(menu_items_from_groups(&groups));
-    state.activate();
-    MenuView { state, built: true }
+    MenuView { groups: grouped_commands(reg, keymap), open: 0, highlighted: 0, built: true }
 }
 
-fn menu_items_from_groups(groups: &[(MenuCategory, Vec<(String, CommandId)>)]) -> Vec<MenuItem<CommandId>> {
-    groups
-        .iter()
-        .map(|(cat, leaves)| {
-            MenuItem::group(
-                category_label(*cat),
-                leaves.iter().map(|(label, id)| MenuItem::item(label.clone(), *id)).collect(),
-            )
-        })
-        .collect()
+pub(crate) fn category_label_pub(cat: MenuCategory) -> &'static str {
+    category_label(cat)
 }
 
 fn grouped_commands(reg: &Registry, keymap: &KeyTrie) -> Vec<(MenuCategory, Vec<(String, CommandId)>)> {

@@ -114,7 +114,7 @@ impl Buffer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkPending { Set, Jump }
 
-// Not Clone: the menu field's tui_menu::MenuState is !Clone.
+// MenuView is now Clone (#[derive(Clone, Debug)]); Editor intentionally remains !Clone.
 #[derive(Debug)]
 pub struct Editor {
     pub buffers: Vec<Buffer>,

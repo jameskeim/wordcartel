@@ -445,6 +445,7 @@ pub fn menu_select_for_test(
     msg_tx: &std::sync::mpsc::Sender<Msg>,
     id: crate::registry::CommandId,
 ) {
+    editor.menu = None;
     let (keymap, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), reg);
     dispatch_overlay_command(editor, reg, &keymap, ex, clock, msg_tx, id);
 }
@@ -486,50 +487,32 @@ pub fn reduce(
         }
         if let Msg::Input(Event::Key(k)) = &msg {
             if k.kind == crossterm::event::KeyEventKind::Press {
-                let mut selected = None;
-                match k.code {
-                    crossterm::event::KeyCode::Esc | crossterm::event::KeyCode::F(10) => {
-                        editor.menu = None;
-                    }
-                    crossterm::event::KeyCode::Up => {
-                        if let Some(menu) = editor.menu.as_mut() {
-                            menu.state.up();
-                        }
-                    }
-                    crossterm::event::KeyCode::Down => {
-                        if let Some(menu) = editor.menu.as_mut() {
-                            menu.state.down();
-                        }
-                    }
-                    crossterm::event::KeyCode::Left => {
-                        if let Some(menu) = editor.menu.as_mut() {
-                            menu.state.left();
-                        }
-                    }
-                    crossterm::event::KeyCode::Right => {
-                        if let Some(menu) = editor.menu.as_mut() {
-                            menu.state.right();
-                        }
-                    }
-                    crossterm::event::KeyCode::Enter => {
-                        if let Some(menu) = editor.menu.as_mut() {
-                            menu.state.select();
-                        }
-                    }
-                    _ => {}
-                }
-                if let Some(menu) = editor.menu.as_mut() {
-                    for ev in menu.state.drain_events() {
-                        match ev {
-                            tui_menu::MenuEvent::Selected(id) => {
-                                selected = Some(id);
-                                break;
+                use crossterm::event::KeyCode;
+                // Close OUTSIDE any menu borrow (Codex Critical: `editor.menu = None`
+                // must not run while `editor.menu.as_mut()` is held).
+                if matches!(k.code, KeyCode::Esc | KeyCode::F(10)) {
+                    editor.menu = None;
+                } else {
+                    let mut selected: Option<crate::registry::CommandId> = None;
+                    if let Some(menu) = editor.menu.as_mut() {   // borrow scoped to this block
+                        let ncat = menu.groups.len();
+                        match k.code {
+                            KeyCode::Left if ncat > 0 => { menu.open = (menu.open + ncat - 1) % ncat; menu.highlighted = 0; }
+                            KeyCode::Right if ncat > 0 => { menu.open = (menu.open + 1) % ncat; menu.highlighted = 0; }
+                            KeyCode::Up if ncat > 0 => { menu.highlighted = menu.highlighted.saturating_sub(1); }
+                            KeyCode::Down if ncat > 0 => {
+                                let n = menu.groups[menu.open].1.len();
+                                if n > 0 { menu.highlighted = (menu.highlighted + 1).min(n - 1); }
                             }
+                            KeyCode::Enter if ncat > 0 => {
+                                if let Some((_, id)) = menu.groups[menu.open].1.get(menu.highlighted) { selected = Some(*id); }
+                            }
+                            _ => {}
                         }
+                    } // menu borrow dropped here
+                    if let Some(id) = selected {
+                        dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
                     }
-                }
-                if let Some(id) = selected {
-                    dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
                 }
             }
             for r in ex.drain() { apply_result(r, editor); }
@@ -1251,6 +1234,29 @@ mod tests {
         crate::app::menu_select_for_test(&mut e, &reg, &ex, &clk, &tx, crate::registry::CommandId("copy"));
         assert!(e.menu.is_none(), "selection closes the menu");
         assert_eq!(e.register.get(), Some("abc"));
+    }
+
+    #[test]
+    fn menu_keyboard_nav_moves_and_dispatches() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::range(0, 3);
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &Registry::builtins());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let press = |c| Event::Key(KeyEvent { code: c, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        // F10 opens; menu hydrated with groups
+        crate::app::reduce(Msg::Input(press(KeyCode::F(10))), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.menu.is_some());
+        let m = e.menu.as_ref().unwrap();
+        assert!(!m.groups.is_empty(), "menu hydrated with groups");
+        assert_eq!(m.open, 0);
+        // Right moves to the next category, Down highlights a row
+        crate::app::reduce(Msg::Input(press(KeyCode::Right)), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.menu.as_ref().unwrap().open, 1);
+        crate::app::reduce(Msg::Input(press(KeyCode::Down)), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.menu.as_ref().unwrap().highlighted, 1);
     }
 
     #[test]
