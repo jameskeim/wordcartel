@@ -7,7 +7,7 @@ pub enum CellHit {
     Text { col: u16, erow: u16 },
     MenuBar,
     Status,
-    #[allow(dead_code)] // wired in Task 4
+    #[allow(dead_code)] // wired in Task 6
     Scrollbar,
     #[allow(dead_code)] // wired in Task 5
     Outside,
@@ -92,9 +92,10 @@ pub fn handle(
             if ev.row < edit_top { crate::nav::scroll_up_one(editor); }
             else if ev.row >= edit_bottom { crate::nav::scroll_down_one(editor); }
             let erow = ev.row.clamp(edit_top, edit_bottom.saturating_sub(1)).saturating_sub(menu_rows);
-            let head = crate::nav::offset_at_cell(editor, ev.column, erow)
-                .unwrap_or_else(|| editor.active().document.buffer.len());
-            let head = crate::nav::clamp_snap(editor, head);
+            let head = match crate::nav::offset_at_cell(editor, ev.column, erow) {
+                Some(o) => crate::nav::clamp_snap(editor, o),
+                None => editor.active().document.buffer.len(),
+            };
             if let Some(anchor) = editor.mouse.anchor {
                 editor.active_mut().document.selection =
                     wordcartel_core::selection::Selection::range(anchor, head);
