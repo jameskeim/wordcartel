@@ -1,14 +1,11 @@
 #![forbid(unsafe_code)]
 //! `wcartel` — thin binary entry point.
 //!
-//! Usage: `wcartel [file.md]`
-
-use std::path::PathBuf;
-use wordcartel::app;
+//! Usage: `wcartel [--no-config] [--config <path>] [file.md]`
 
 fn main() {
-    let path = std::env::args().nth(1).map(PathBuf::from);
-    if let Err(e) = app::run(path) {
+    let cli = wordcartel::config::parse_cli(std::env::args());
+    if let Err(e) = wordcartel::app::run(cli) {
         eprintln!("wcartel: {e}");
         std::process::exit(1);
     }

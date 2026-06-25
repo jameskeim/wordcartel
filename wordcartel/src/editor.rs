@@ -117,6 +117,7 @@ pub struct Editor {
     pub clipboard_get_pending: Option<crate::clipboard::PasteIntent>,
     pub clipboard_notice_shown: bool,
     pub pending_keys: Vec<crate::keymap::KeyChord>,
+    pub keymap: crate::keymap::KeyTrie,
 }
 
 impl Editor {
@@ -133,6 +134,10 @@ impl Editor {
         let view = View { scroll: 0, scroll_row: 0, area, mode: RenderMode::LivePreview, line_layouts: BTreeMap::new() };
         // Build the workspace, then allocate the buffer's id through the single
         // id source (alloc_id) so there is no second id-assignment path (Codex review).
+        let (keymap, _) = crate::keymap::build_keymap(
+            &crate::config::KeymapConfig::default(),
+            &crate::registry::Registry::builtins(),
+        );
         let mut e = Editor {
             buffers: Vec::new(), active: 0, next_buffer_id: 0,
             register: Register::default(), status: String::new(), quit: false,
@@ -140,6 +145,7 @@ impl Editor {
             filter_in_flight: None, transform_in_flight: false, minibuffer: None, pending_export: None,
             clipboard_sync_request: None, clipboard_get_pending: None, clipboard_notice_shown: false,
             pending_keys: Vec::new(),
+            keymap,
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer {

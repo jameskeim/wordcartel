@@ -1,5 +1,4 @@
 //! Layered TOML config + CLI parsing. Built-in defaults < XDG < project-local < --config.
-#![allow(dead_code)] // wired in Task 5
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use serde::Deserialize;
@@ -172,7 +171,6 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     fn write(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
         let p = dir.join(name);
@@ -249,9 +247,4 @@ mod tests {
         p
     }
 
-    // Suppress unused import warning from the brief's test skeleton
-    #[allow(dead_code)]
-    fn _use_write_trait() {
-        let _ = std::io::stdout().write_all(b"");
-    }
 }

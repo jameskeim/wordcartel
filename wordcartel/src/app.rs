@@ -6,9 +6,8 @@
 use crossterm::event::Event;
 #[cfg(test)]
 use crossterm::event::KeyEvent;
-use std::path::PathBuf;
 
-use crate::{commands, derive, editor::Editor, file, render, term};
+use crate::{commands, config, derive, editor::Editor, file, keymap, render, term};
 #[cfg(test)]
 use crate::input;
 use crate::jobs::{is_stale, Executor, JobResult};
@@ -599,15 +598,31 @@ impl Clock for SystemClock {
 // run — the real terminal loop; terminal IO lives entirely here
 // ---------------------------------------------------------------------------
 
-/// Open `path` (or scratch buffer), install the terminal guard, then loop:
+/// Open the file named by `cli.path` (or a scratch buffer), load layered config,
+/// build the keymap, install the terminal guard, then loop:
 /// draw → read event → step → repeat until `editor.quit`.
-pub fn run(path: Option<PathBuf>) -> std::io::Result<()> {
+pub fn run(cli: config::Cli) -> std::io::Result<()> {
     // Install the panic hook (once) so the terminal is restored on panic.
     term::install_panic_hook();
+
+    // Resolve config layers and build the keymap from them.
+    let anchor = cli.path.as_ref()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+    let xdg = dirs::config_dir();
+    let paths = config::config_layer_paths(&cli, xdg.as_deref(), &anchor);
+    let (cfg, mut warns) = config::load(&paths);
+    if let Some(c) = &cli.config_path {
+        if !c.is_file() {
+            warns.push(format!("config: --config path not found: {}", c.display()));
+        }
+    }
 
     // Determine the initial terminal size.
     let (cols, rows) = crossterm::terminal::size()?;
     let area = (cols, rows);
+
+    let path = cli.path;
 
     // Open the file and branch on errors per §C5.
     let editor = match path.as_deref() {
@@ -679,8 +694,17 @@ pub fn run(path: Option<PathBuf>) -> std::io::Result<()> {
     let _ = crate::export::probe_pandoc();
 
     let reg = Registry::builtins();
-    // Task 4: build a local default keymap to pass to reduce until Task 5 wires config-driven startup.
-    let (keymap, _keymap_warns) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+    // Build the keymap from the loaded config and surface any warnings.
+    let (built_keymap, mut kw) = keymap::build_keymap(&cfg.keymap, &reg);
+    warns.append(&mut kw);
+    editor.keymap = built_keymap;
+    if let Some(w) = warns.first() {
+        editor.status = w.clone();
+    }
+    // Take the keymap out of editor into a loop-local to avoid a simultaneous
+    // &mut editor / &editor.keymap borrow conflict when calling reduce.
+    // (The keymap doesn't change during the loop in v1.)
+    let keymap = std::mem::take(&mut editor.keymap);
     let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Msg>();
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
     let executor = crate::jobs::ThreadExecutor::new(wake_tx);
@@ -1722,6 +1746,23 @@ mod tests {
         crate::app::reduce(press(KeyCode::Esc, KeyModifiers::NONE), &mut e, &reg, &km, &ex, &clk, &tx);
         assert!(e.pending_keys.is_empty(), "Esc cleared the pending sequence");
         assert_eq!(e.active().document.buffer.to_string(), before, "no buffer change");
+    }
+
+    #[test]
+    fn run_startup_builds_keymap_from_config_with_user_bind() {
+        // We can't run the TUI loop in a test, so test the startup builder in isolation:
+        // a helper that turns (Cli-derived paths) into the effective keymap.
+        let cfg = crate::config::KeymapConfig {
+            preset: "cua".into(),
+            patches: vec![crate::config::KeymapPatch {
+                bind: [("ctrl-g".to_string(), "move_line_start".to_string())].into_iter().collect(),
+                unbind: vec![],
+            }],
+        };
+        let (km, warns) = crate::keymap::build_keymap(&cfg, &crate::registry::Registry::builtins());
+        assert!(warns.is_empty());
+        let g = crate::keymap::parse_chord("ctrl-g").unwrap();
+        assert!(matches!(km.resolve(&[g]), crate::keymap::Resolution::Command(crate::registry::CommandId("move_line_start"))));
     }
 
     #[test]
