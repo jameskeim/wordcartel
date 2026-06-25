@@ -5,6 +5,7 @@
 pub mod block_tree;
 pub mod buffer;
 pub mod change;
+pub mod count;
 pub mod history;
 pub mod register;
 pub mod selection;
