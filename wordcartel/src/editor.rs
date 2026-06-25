@@ -135,7 +135,6 @@ pub struct Editor {
     pub transform_in_flight: bool,
     pub minibuffer: Option<crate::minibuffer::Minibuffer>,
     pub pending_export: Option<crate::export::PendingExport>,
-    #[allow(dead_code)] // wired in Task 5
     pub pending_mark: Option<MarkPending>,
     pub clipboard_sync_request: Option<String>,
     pub clipboard_get_pending: Option<crate::clipboard::PasteIntent>,
@@ -208,6 +207,7 @@ impl Editor {
         debug_assert!(self.prompt.is_none(), "prompt xor minibuffer: cannot open minibuffer while a modal prompt is active");
         self.prompt = None;
         self.pending_keys.clear();
+        self.pending_mark = None;
         self.palette = None;
         self.menu = None;
         self.minibuffer = Some(crate::minibuffer::Minibuffer {
@@ -226,6 +226,7 @@ impl Editor {
         self.minibuffer = None;
         self.menu = None;
         self.pending_keys.clear();
+        self.pending_mark = None;
         self.prompt = Some(p);
     }
 
@@ -238,6 +239,7 @@ impl Editor {
         self.minibuffer = None;
         self.menu = None;
         self.pending_keys.clear();
+        self.pending_mark = None;
         self.palette = Some(crate::palette::Palette::default());
     }
 

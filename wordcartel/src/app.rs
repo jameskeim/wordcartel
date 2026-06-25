@@ -447,6 +447,23 @@ pub fn reduce(
     clock: &dyn Clock,
     msg_tx: &std::sync::mpsc::Sender<Msg>,
 ) -> bool {
+    // pending_mark intercepts the very next key as the mark letter.
+    // Non-key messages fall through to normal handling.
+    if editor.pending_mark.is_some() {
+        if let Msg::Input(Event::Key(k)) = &msg {
+            if k.kind == crossterm::event::KeyEventKind::Press {
+                match k.code {
+                    crossterm::event::KeyCode::Esc => { editor.pending_mark = None; editor.status.clear(); }
+                    crossterm::event::KeyCode::Char(c) => crate::marks::resolve_pending(editor, c),
+                    _ => { editor.pending_mark = None; } // non-name key cancels
+                }
+            }
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
+        }
+        // non-key message: fall through to normal handling
+    }
+
     // Menu overlay intercepts KEY INPUT and PASTE (no text field; paste is
     // consumed / silently dropped). Non-key, non-paste messages fall through to
     // the normal handlers so background work continues while the menu is open.
@@ -2197,5 +2214,36 @@ mod tests {
         // F10 with menu open → closes the menu
         crate::app::reduce(Msg::Input(f10()), &mut e, &reg, &km, &ex, &clk, &tx);
         assert!(e.menu.is_none(), "F10 should close menu when open");
+    }
+
+    #[test]
+    fn pending_mark_consumes_one_key_then_clears() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        e.pending_mark = Some(crate::editor::MarkPending::Set);
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &Registry::builtins());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let press = |c, m| Event::Key(KeyEvent { code: c, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(press(KeyCode::Char('q'), KeyModifiers::NONE)), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.pending_mark, None, "capture consumed the key");
+        assert_eq!(e.active().marks.get(&'q'), Some(&0));
+        assert_eq!(e.active().document.buffer.to_string(), "abc\n", "captured key did NOT type into the doc");
+    }
+
+    #[test]
+    fn esc_cancels_pending_mark() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        e.pending_mark = Some(crate::editor::MarkPending::Set);
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &Registry::builtins());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let esc = Event::Key(KeyEvent { code: KeyCode::Esc, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(esc), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.pending_mark, None);
+        assert!(e.active().marks.is_empty());
     }
 }

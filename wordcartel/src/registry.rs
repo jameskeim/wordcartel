@@ -165,6 +165,7 @@ impl Registry {
             c.editor.prompt = None;
             c.editor.minibuffer = None;
             c.editor.pending_keys.clear();
+            c.editor.pending_mark = None;
             c.editor.menu = if c.editor.menu.is_some() {
                 None
             } else {
@@ -172,6 +173,10 @@ impl Registry {
             };
             CommandResult::Handled
         });
+
+        // Named marks (Task 8 / Effort 5c).
+        r.register("set_mark",     "Set Mark\u{2026}",     None, |c| { crate::marks::set_mark(c.editor); CommandResult::Handled });
+        r.register("jump_to_mark", "Jump to Mark\u{2026}", None, |c| { crate::marks::jump_to_mark(c.editor); CommandResult::Handled });
 
         // Format menu — discrete transform commands (Task 1 / Effort 5b).
         r.register("reflow", "Reflow", Some(MenuCategory::Format), |c| {

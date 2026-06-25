@@ -271,6 +271,9 @@ static CUA: &[(&str, &str)] = &[
     // Text object expand/shrink (Task 7 / Effort 5c)
     ("ctrl-w",       "expand_selection"),
     ("ctrl-shift-w", "shrink_selection"),
+    // Named marks (Task 8 / Effort 5c)
+    ("ctrl-k m", "set_mark"),
+    ("ctrl-k j", "jump_to_mark"),
     // Editing  (input.rs lines 111–113)
     ("enter",     "insert_newline"),
     ("backspace", "backspace"),
@@ -298,6 +301,9 @@ static WORDSTAR: &[(&str, &str)] = &[
     // Undo / redo
     ("ctrl-z", "undo"),
     ("ctrl-y", "redo"),
+    // Named marks (Task 8 / Effort 5c)
+    ("ctrl-k m", "set_mark"),
+    ("ctrl-k j", "jump_to_mark"),
     // Editing
     ("backspace", "backspace"),
     ("del",       "delete_forward"),

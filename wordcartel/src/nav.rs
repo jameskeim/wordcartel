@@ -123,6 +123,19 @@ fn get_or_layout(editor: &Editor, l: usize) -> wordcartel_core::layout::ColMap {
     }
 }
 
+/// Clamp `off` to `0..=len` and snap it to a grapheme stop on ITS OWN line
+/// (a mark/ring/session offset may be on a different line than the caret).
+pub fn clamp_snap(editor: &Editor, off: usize) -> usize {
+    let buf = &editor.active().document.buffer;
+    let len = buf.len();
+    let off = off.min(len);
+    if len == 0 { return 0; }
+    let line = buf.byte_to_line(off.min(len.saturating_sub(1)));
+    let ls = derive::line_start(buf, line);
+    let map = get_or_layout(editor, line);
+    ls + map.snap_to_stop(off.saturating_sub(ls))
+}
+
 /// Move the caret one grapheme to the right.
 ///
 /// Returns the new global byte offset. Sets `editor.desired_col = None` to
