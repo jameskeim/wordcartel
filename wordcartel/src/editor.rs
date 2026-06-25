@@ -70,17 +70,35 @@ pub struct Buffer {
     pub swap_in_flight: bool,
     pub pending_swap_body: Option<String>,
     pub pending_swap_path: Option<PathBuf>,
+    // 5c: marks/ring/sel_history — wired in Tasks 5–10
+    #[allow(dead_code)] // wired in Task 5
+    pub marks: std::collections::BTreeMap<char, usize>,
+    #[allow(dead_code)] // wired in Task 5
+    pub jump_ring: Vec<usize>,
+    #[allow(dead_code)] // wired in Task 5
+    pub ring_cursor: usize,
+    #[allow(dead_code)] // wired in Task 5
+    pub sel_history: Vec<wordcartel_core::selection::Selection>,
 }
 
 impl Buffer {
     /// Single mutation channel for THIS buffer's document (spec §10.1).
     pub fn apply(&mut self, txn: Transaction, edit: wordcartel_core::block_tree::Edit, kind: EditKind, clock: &dyn Clock) {
+        let cs = txn.changes.clone();                    // capture BEFORE commit consumes txn
         let old_rope = self.document.buffer.snapshot();
         let before = self.document.selection.clone();
         self.document.selection = self.document.history.commit_coalescing(txn, &mut self.document.buffer, before, clock, kind);
         self.document.version += 1;
         self.pre_edit_rope = Some(old_rope);
         self.last_edit = Some(edit);
+        // 5c: marks & ring follow the text; the expand ladder resets on any edit.
+        for v in self.marks.values_mut() {
+            *v = wordcartel_core::change::map_pos(*v, &cs);
+        }
+        for v in self.jump_ring.iter_mut() {
+            *v = wordcartel_core::change::map_pos(*v, &cs);
+        }
+        self.sel_history.clear();
         crate::recovery::record_snapshot(self.document.path.as_deref(), self.document.buffer.snapshot());
     }
     pub fn undo(&mut self) -> bool {
@@ -96,6 +114,9 @@ impl Buffer {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkPending { Set, Jump }
 
 // Not Clone: the menu field's tui_menu::MenuState is !Clone.
 #[derive(Debug)]
@@ -114,6 +135,8 @@ pub struct Editor {
     pub transform_in_flight: bool,
     pub minibuffer: Option<crate::minibuffer::Minibuffer>,
     pub pending_export: Option<crate::export::PendingExport>,
+    #[allow(dead_code)] // wired in Task 5
+    pub pending_mark: Option<MarkPending>,
     pub clipboard_sync_request: Option<String>,
     pub clipboard_get_pending: Option<crate::clipboard::PasteIntent>,
     pub clipboard_notice_shown: bool,
@@ -146,6 +169,7 @@ impl Editor {
             register: Register::default(), status: String::new(), quit: false,
             prompt: None, quit_after_save: None, quit_after_save_at: None,
             filter_in_flight: None, transform_in_flight: false, minibuffer: None, pending_export: None,
+            pending_mark: None,
             clipboard_sync_request: None, clipboard_get_pending: None, clipboard_notice_shown: false,
             pending_keys: Vec::new(),
             keymap,
@@ -158,6 +182,7 @@ impl Editor {
             desired_col: None, pre_edit_rope: None, last_edit: None,
             last_edit_at: None, last_swap_at: None, swap_in_flight: false,
             pending_swap_body: None, pending_swap_path: None,
+            marks: Default::default(), jump_ring: Vec::new(), ring_cursor: 0, sel_history: Vec::new(),
         });
         e
     }
@@ -340,6 +365,32 @@ mod tests {
         assert_eq!(a, BufferId(1));
         assert_eq!(b, BufferId(2));
         assert_ne!(a, e.active().id); // never collides with the existing buffer's id
+    }
+
+    #[test]
+    fn marks_follow_edits_above_them() {
+        use wordcartel_core::change::ChangeSet;
+        use wordcartel_core::history::Transaction;
+        let clk = TestClock(std::cell::Cell::new(0));
+        let mut e = Editor::new_from_text("abcdef", None, (80, 24));
+        e.active_mut().marks.insert('a', 4); // mark at 'e'
+        // insert "XY" at offset 1 → mark should shift 4 → 6
+        let cs = ChangeSet::insert(1, "XY", e.active().document.buffer.len());
+        e.apply(Transaction::new(cs), Edit { range: 1..1, new_len: 2 }, EditKind::Type, &clk);
+        assert_eq!(e.active().marks.get(&'a'), Some(&6));
+    }
+
+    #[test]
+    fn apply_clears_sel_history() {
+        use wordcartel_core::change::ChangeSet;
+        use wordcartel_core::history::Transaction;
+        use wordcartel_core::selection::Selection;
+        let clk = TestClock(std::cell::Cell::new(0));
+        let mut e = Editor::new_from_text("abcdef", None, (80, 24));
+        e.active_mut().sel_history.push(Selection::single(0));
+        let cs = ChangeSet::insert(1, "X", e.active().document.buffer.len());
+        e.apply(Transaction::new(cs), Edit { range: 1..1, new_len: 1 }, EditKind::Type, &clk);
+        assert!(e.active().sel_history.is_empty(), "edit must reset the expand ladder");
     }
 
     #[test]
