@@ -97,7 +97,7 @@ pub fn dispatch_save(ctx: &mut Ctx) -> CommandResult {
     // diverged from what we last wrote, refuse and raise the external-mod modal.
     let current_fp = fingerprint(&path);
     if current_fp != ctx.editor.active().document.stored_fp {
-        ctx.editor.prompt = Some(crate::prompt::Prompt::external_mod());
+        ctx.editor.open_prompt(crate::prompt::Prompt::external_mod());
         ctx.editor.status =
             "File changed on disk \u{2014} choose [R]eload or [O]verwrite".to_string();
         return CommandResult::Handled;

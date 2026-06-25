@@ -118,6 +118,7 @@ pub struct Editor {
     pub clipboard_notice_shown: bool,
     pub pending_keys: Vec<crate::keymap::KeyChord>,
     pub keymap: crate::keymap::KeyTrie,
+    pub palette: Option<crate::palette::Palette>,
 }
 
 impl Editor {
@@ -146,6 +147,7 @@ impl Editor {
             clipboard_sync_request: None, clipboard_get_pending: None, clipboard_notice_shown: false,
             pending_keys: Vec::new(),
             keymap,
+            palette: None,
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer {
@@ -177,11 +179,24 @@ impl Editor {
     pub fn open_minibuffer(&mut self, prompt: &str) {
         debug_assert!(self.prompt.is_none(), "prompt xor minibuffer: cannot open minibuffer while a modal prompt is active");
         self.pending_keys.clear();
+        self.palette = None;
+        // Task 4 adds: self.menu = None;
         self.minibuffer = Some(crate::minibuffer::Minibuffer {
             prompt: prompt.into(),
             text: String::new(),
             cursor: 0,
         });
+    }
+
+    /// Open a modal prompt, enforcing single-overlay XOR invariant.
+    ///
+    /// Clears `palette` and `pending_keys` before setting the prompt.
+    /// At most one of {prompt, minibuffer, palette} is ever active at once.
+    pub fn open_prompt(&mut self, p: crate::prompt::Prompt) {
+        self.palette = None;
+        // Task 4 adds: self.menu = None;
+        self.pending_keys.clear();
+        self.prompt = Some(p);
     }
 
     // Thin delegators — external callers unchanged.

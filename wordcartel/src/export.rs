@@ -215,7 +215,7 @@ pub fn run_export(
             ext: ext.to_owned(),
             target: target.clone(),
         });
-        editor.prompt = Some(crate::prompt::Prompt::export_overwrite(&target));
+        editor.open_prompt(crate::prompt::Prompt::export_overwrite(&target));
         return;
     }
 

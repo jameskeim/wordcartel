@@ -23,3 +23,4 @@ pub mod clipboard;
 pub mod config;
 pub mod keymap;
 pub mod state;
+pub mod palette;

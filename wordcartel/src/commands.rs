@@ -397,7 +397,7 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
 
         Command::Quit => {
             if editor.active().document.dirty() {
-                editor.prompt = Some(crate::prompt::Prompt::quit_confirm());
+                editor.open_prompt(crate::prompt::Prompt::quit_confirm());
                 CommandResult::Handled
             } else {
                 editor.quit = true;

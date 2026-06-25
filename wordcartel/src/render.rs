@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Position, Rect},
     style::{Color, Modifier, Style as RStyle},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
     Frame,
 };
 use wordcartel_core::style::Style;
@@ -175,6 +175,69 @@ pub fn render(frame: &mut Frame, editor: &Editor) {
             frame.set_cursor_position(Position { x: area.x + col, y: area.y + row });
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Command palette overlay (drawn on top of everything else)
+    // -----------------------------------------------------------------------
+    if let Some(ref palette) = editor.palette {
+        // Overlay dimensions: width = 60% of terminal (min 30, max 80), height = up to 20 rows.
+        let ov_w = (w * 3 / 5).max(30).min(80).min(w);
+        let max_rows = palette.rows.len() as u16;
+        let list_h = max_rows.min(15).min(h.saturating_sub(4));
+        let ov_h = (list_h + 3).min(h); // 1 border top + 1 query + 1 separator + list_h + 1 border bottom = list_h + 4; clamp
+
+        // Center the overlay.
+        let ov_x = area.x + (w.saturating_sub(ov_w)) / 2;
+        let ov_y = area.y + (h.saturating_sub(ov_h)) / 4; // slightly above center
+
+        let ov_rect = Rect::new(ov_x, ov_y, ov_w, ov_h);
+
+        // Clear the overlay area.
+        frame.render_widget(Clear, ov_rect);
+
+        // Draw the border.
+        let block = Block::default().borders(Borders::ALL).title(" Command Palette ");
+        frame.render_widget(block, ov_rect);
+
+        if ov_h < 3 {
+            return; // too small to render query + any rows
+        }
+
+        // Query row (just inside top border).
+        let query_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), 1);
+        let query_display = format!("> {}", palette.query);
+        let truncated_q: String = query_display.chars().take(query_area.width as usize).collect();
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(truncated_q, RStyle::default()))),
+            query_area,
+        );
+
+        if ov_h < 4 || list_h == 0 {
+            return;
+        }
+
+        // List of rows (below query, inside border).
+        let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h);
+        let highlight_style = RStyle::default().add_modifier(Modifier::REVERSED);
+        let items: Vec<ListItem> = palette.rows.iter().take(list_h as usize).map(|row| {
+            // Left: label; right-aligned: chord.
+            let chord_w = row.chord.chars().count() as u16;
+            let label_w = list_area.width.saturating_sub(chord_w + 1) as usize;
+            let label: String = row.label.chars().take(label_w).collect();
+            let padding = " ".repeat(list_area.width.saturating_sub(label.chars().count() as u16 + chord_w) as usize);
+            let text = format!("{label}{padding}{}", row.chord);
+            ListItem::new(Line::from(text))
+        }).collect();
+
+        let mut list_state = ListState::default();
+        list_state.select(if palette.rows.is_empty() { None } else { Some(palette.selected) });
+
+        frame.render_stateful_widget(
+            List::new(items).highlight_style(highlight_style),
+            list_area,
+            &mut list_state,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -233,7 +296,7 @@ mod tests {
     fn renders_active_prompt_on_status_row() {
         let mut e = Editor::new_from_text("hello\n", None, (40, 6));
         e.active_mut().document.version = 1; // dirty so quit_confirm is realistic
-        e.prompt = Some(crate::prompt::Prompt::quit_confirm());
+        e.open_prompt(crate::prompt::Prompt::quit_confirm());
         derive::rebuild(&mut e);
         let mut term = Terminal::new(TestBackend::new(40, 6)).unwrap();
         term.draw(|f| render(f, &e)).unwrap();

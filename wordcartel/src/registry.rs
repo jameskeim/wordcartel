@@ -110,7 +110,7 @@ impl Registry {
         // View menu.
         r.register("cycle_render_mode", "Cycle Render Mode", Some(MenuCategory::View), |c| run(c, Command::CycleRenderMode));
         r.register("transform", "Transform…", Some(MenuCategory::View), |c| {
-            c.editor.prompt = Some(crate::prompt::Prompt::transform_chooser());
+            c.editor.open_prompt(crate::prompt::Prompt::transform_chooser());
             CommandResult::Handled
         });
 
@@ -125,6 +125,12 @@ impl Registry {
         });
         r.register("export_pdf", "Export PDF", Some(MenuCategory::Export), |c| {
             crate::export::run_export(c.editor, "pdf", &c.msg_tx);
+            CommandResult::Handled
+        });
+
+        // View menu — palette command (Task 3 / Effort 5b).
+        r.register("palette", "Command Palette\u{2026}", Some(MenuCategory::View), |c| {
+            c.editor.palette = Some(crate::palette::Palette::default());
             CommandResult::Handled
         });
 
