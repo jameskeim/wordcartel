@@ -170,6 +170,7 @@ impl Editor {
     /// `debug_assert!`s that no modal prompt is currently open.
     pub fn open_minibuffer(&mut self, prompt: &str) {
         debug_assert!(self.prompt.is_none(), "prompt xor minibuffer: cannot open minibuffer while a modal prompt is active");
+        self.pending_keys.clear();
         self.minibuffer = Some(crate::minibuffer::Minibuffer {
             prompt: prompt.into(),
             text: String::new(),
@@ -301,5 +302,16 @@ mod tests {
         assert_eq!(a, BufferId(1));
         assert_eq!(b, BufferId(2));
         assert_ne!(a, e.active().id); // never collides with the existing buffer's id
+    }
+
+    #[test]
+    fn open_minibuffer_clears_pending_keys() {
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.pending_keys.push(crate::keymap::KeyChord {
+            code: crossterm::event::KeyCode::Char('k'),
+            mods: crossterm::event::KeyModifiers::CONTROL,
+        });
+        e.open_minibuffer("> ");
+        assert!(e.pending_keys.is_empty(), "opening the minibuffer must clear a pending key sequence");
     }
 }
