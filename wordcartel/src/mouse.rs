@@ -80,7 +80,8 @@ pub fn handle(
             };
             // was the click inside the overlay rect at all?
             let inside = {
-                let r = crate::render::palette_overlay_rect(area);
+                let row_count = editor.palette.as_ref().unwrap().rows.len();
+                let r = crate::render::palette_overlay_rect(area, row_count);
                 ev.column >= r.x && ev.column < r.x + r.width && ev.row >= r.y && ev.row < r.y + r.height
             };
             if let Some(id) = hit_id {
@@ -209,7 +210,8 @@ pub fn handle(
             // edge auto-scroll
             if ev.row < edit_top { crate::nav::scroll_up_one(editor); }
             else if ev.row >= edit_bottom { crate::nav::scroll_down_one(editor); }
-            let erow = ev.row.clamp(edit_top, edit_bottom.saturating_sub(1)).saturating_sub(menu_rows);
+            let hi = edit_bottom.saturating_sub(1).max(edit_top);
+            let erow = ev.row.clamp(edit_top, hi).saturating_sub(menu_rows);
             let head = match crate::nav::offset_at_cell(editor, ev.column, erow) {
                 Some(o) => crate::nav::clamp_snap(editor, o),
                 None => editor.active().document.buffer.len(),
@@ -370,7 +372,7 @@ mod tests {
         let rows = &e.palette.as_ref().unwrap().rows;
         let idx = rows.iter().position(|r| r.id == crate::registry::CommandId("move_right")).unwrap();
         let area = ratatui::layout::Rect::new(0, 0, 80, 24);
-        let rect = crate::render::palette_overlay_rect(area);
+        let rect = crate::render::palette_overlay_rect(area, e.palette.as_ref().unwrap().rows.len());
         let click_row = rect.y + 2 + idx as u16; // list starts at ov_y+2
         let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };
         handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
