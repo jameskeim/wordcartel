@@ -43,7 +43,7 @@ impl TerminalGuard {
             Ok(t) => t,
             Err(e) => {
                 let _ = disable_raw_mode();
-                let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+                let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen, Show);
                 return Err(e);
             }
         };
