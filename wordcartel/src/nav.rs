@@ -643,6 +643,37 @@ pub fn move_word_left(editor: &mut Editor) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Cell → offset reverse map (inverse of screen_pos)
+// ---------------------------------------------------------------------------
+
+/// Inverse of `screen_pos`: the document byte offset under screen cell
+/// `(col, row)` in the editing area, or `None` if `row` is past content.
+#[allow(dead_code)] // wired in 5c-m (mouse)
+pub fn offset_at_cell(editor: &Editor, col: u16, row: u16) -> Option<usize> {
+    let target = row as usize;
+    let scroll = editor.active().view.scroll;
+    let scroll_row = editor.active().view.scroll_row;
+    let total = derive::total_logical_lines(&editor.active().document.buffer);
+    let mut acc = 0usize; // visible rows consumed
+    let mut line = scroll;
+    while line < total {
+        let rows = rows_of_line(editor, line);
+        let first_vrow = if line == scroll { scroll_row } else { 0 };
+        for vrow in first_vrow..rows {
+            if acc == target {
+                let map = get_or_layout(editor, line);
+                let in_off = map.visual_to_source(vrow, col as usize);
+                let snapped = map.snap_to_stop(in_off);
+                return Some(derive::line_start(&editor.active().document.buffer, line) + snapped);
+            }
+            acc += 1;
+        }
+        line += 1;
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -896,5 +927,18 @@ mod tests {
         let p2 = move_down(&mut e); // desired still 4 -> "world" col 4 -> offset 13 (NOT col 2)
         assert_eq!(p2, 13);
         assert_eq!(e.active().desired_col, Some(4));
+    }
+
+    // ------------------------------------------------------------------
+    // Task 11: offset_at_cell (RED → GREEN)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn offset_at_cell_inverts_screen_pos() {
+        let mut e = Editor::new_from_text("abc\ndef\n", None, (80, 24));
+        set_caret(&mut e, 5); // 'e' on line 1, col 1
+        derive::rebuild(&mut e);
+        let (col, row) = screen_pos(&e).unwrap();
+        assert_eq!(super::offset_at_cell(&e, col, row), Some(5));
     }
 }
