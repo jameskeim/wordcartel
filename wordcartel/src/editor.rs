@@ -97,7 +97,7 @@ impl Buffer {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Editor {
     pub buffers: Vec<Buffer>,
     pub active: usize,
@@ -119,6 +119,7 @@ pub struct Editor {
     pub pending_keys: Vec<crate::keymap::KeyChord>,
     pub keymap: crate::keymap::KeyTrie,
     pub palette: Option<crate::palette::Palette>,
+    pub menu: Option<crate::menu::MenuView>,
 }
 
 impl Editor {
@@ -148,6 +149,7 @@ impl Editor {
             pending_keys: Vec::new(),
             keymap,
             palette: None,
+            menu: None,
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer {
@@ -180,7 +182,7 @@ impl Editor {
         debug_assert!(self.prompt.is_none(), "prompt xor minibuffer: cannot open minibuffer while a modal prompt is active");
         self.pending_keys.clear();
         self.palette = None;
-        // Task 4 adds: self.menu = None;
+        self.menu = None;
         self.minibuffer = Some(crate::minibuffer::Minibuffer {
             prompt: prompt.into(),
             text: String::new(),
@@ -194,7 +196,7 @@ impl Editor {
     /// At most one of {prompt, minibuffer, palette} is ever active at once.
     pub fn open_prompt(&mut self, p: crate::prompt::Prompt) {
         self.palette = None;
-        // Task 4 adds: self.menu = None;
+        self.menu = None;
         self.pending_keys.clear();
         self.prompt = Some(p);
     }

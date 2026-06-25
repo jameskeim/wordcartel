@@ -131,6 +131,19 @@ impl Registry {
         // View menu — palette command (Task 3 / Effort 5b).
         r.register("palette", "Command Palette\u{2026}", Some(MenuCategory::View), |c| {
             c.editor.palette = Some(crate::palette::Palette::default());
+            c.editor.menu = None;
+            CommandResult::Handled
+        });
+        r.register("menu", "Menu Bar", None, |c| {
+            c.editor.palette = None;
+            c.editor.prompt = None;
+            c.editor.minibuffer = None;
+            c.editor.pending_keys.clear();
+            c.editor.menu = if c.editor.menu.is_some() {
+                None
+            } else {
+                Some(crate::menu::empty())
+            };
             CommandResult::Handled
         });
 

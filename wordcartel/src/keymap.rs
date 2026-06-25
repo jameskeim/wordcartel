@@ -235,6 +235,7 @@ static CUA: &[(&str, &str)] = &[
     ("ctrl-e", "filter"),
     ("ctrl-t", "transform"),
     ("ctrl-p", "palette"),
+    ("f10",    "menu"),
     // View  (input.rs lines 102, 114)
     ("ctrl-\\", "cycle_render_mode"),
     ("f1",      "cycle_render_mode"),

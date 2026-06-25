@@ -32,7 +32,8 @@ pub fn style_to_ratatui(s: Style) -> RStyle {
 
 /// Paint the viewport + status line to `frame` using `editor` state.
 ///
-/// Pure: the `editor` is borrowed immutably; nothing is mutated.
+/// The editor is borrowed mutably so stateful overlay widgets can update their
+/// internal render state.
 ///
 /// Layout:
 /// - Editing area = full frame area minus the bottom row.
@@ -40,7 +41,7 @@ pub fn style_to_ratatui(s: Style) -> RStyle {
 ///
 /// §15.6 tiny-terminal guard: if width < 4 or height < 2, paint a clamped
 /// "too small" notice and return without indexing out of bounds.
-pub fn render(frame: &mut Frame, editor: &Editor) {
+pub fn render(frame: &mut Frame, editor: &mut Editor) {
     let area = frame.area();
     let w = area.width;
     let h = area.height;
@@ -57,7 +58,9 @@ pub fn render(frame: &mut Frame, editor: &Editor) {
         return;
     }
 
-    let edit_height = h - 1; // rows available for editing content
+    let menu_rows = u16::from(editor.menu.is_some());
+    let edit_height = h.saturating_sub(1 + menu_rows); // rows available for editing content
+    let edit_top = area.y + menu_rows;
     let status_row = area.y + h - 1;
 
     // -----------------------------------------------------------------------
@@ -101,7 +104,7 @@ pub fn render(frame: &mut Frame, editor: &Editor) {
             }
 
             let line_widget = Line::from(spans);
-            let row_area = Rect::new(area.x, area.y + screen_row, w, 1);
+            let row_area = Rect::new(area.x, edit_top + screen_row, w, 1);
             frame.render_widget(Paragraph::new(line_widget), row_area);
 
             screen_row += 1;
@@ -172,7 +175,7 @@ pub fn render(frame: &mut Frame, editor: &Editor) {
     } else if let Some((col, row)) = nav::screen_pos(editor) {
         // Guard: only set if within the editing area (not into the status line).
         if row < edit_height && col < w {
-            frame.set_cursor_position(Position { x: area.x + col, y: area.y + row });
+            frame.set_cursor_position(Position { x: area.x + col, y: edit_top + row });
         }
     }
 
@@ -238,6 +241,19 @@ pub fn render(frame: &mut Frame, editor: &Editor) {
             &mut list_state,
         );
     }
+
+    if let Some(ref mut menu) = editor.menu {
+        let menu_area = Rect::new(area.x, area.y, w, h.saturating_sub(1));
+        frame.render_stateful_widget(
+            tui_menu::Menu::<crate::registry::CommandId>::new()
+                .default_style(RStyle::default().fg(Color::White).bg(Color::Black))
+                .highlight(RStyle::default().fg(Color::Black).bg(Color::White))
+                .dropdown_style(RStyle::default().fg(Color::White).bg(Color::DarkGray))
+                .dropdown_width(28),
+            menu_area,
+            &mut menu.state,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -262,7 +278,7 @@ mod tests {
         set_caret(&mut e, 10); // somewhere in "body" so heading line is inactive/concealed
         derive::rebuild(&mut e);
         let mut term = Terminal::new(TestBackend::new(20, 6)).unwrap();
-        term.draw(|f| render(f, &e)).unwrap();
+        term.draw(|f| render(f, &mut e)).unwrap();
         let buf = term.backend().buffer();
         // row 0 shows "Title" (concealed "# "), not "# Title"
         let row0: String = (0u16..20).map(|x| buf[(x, 0u16)].symbol().chars().next().unwrap_or(' ')).collect();
@@ -287,7 +303,7 @@ mod tests {
             let mut e = Editor::new_from_text("# Title\n\nbody\n", None, (w, h));
             derive::rebuild(&mut e);
             let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-            term.draw(|f| render(f, &e)).unwrap(); // must not panic at any tiny size
+            term.draw(|f| render(f, &mut e)).unwrap(); // must not panic at any tiny size
         }
     }
 
@@ -299,7 +315,7 @@ mod tests {
         e.open_prompt(crate::prompt::Prompt::quit_confirm());
         derive::rebuild(&mut e);
         let mut term = Terminal::new(TestBackend::new(40, 6)).unwrap();
-        term.draw(|f| render(f, &e)).unwrap();
+        term.draw(|f| render(f, &mut e)).unwrap();
         let buf = term.backend().buffer();
         // Bottom row (row 5) must show the prompt message, not the normal status.
         let status_row: String = (0u16..40)
@@ -325,7 +341,7 @@ mod tests {
         e.minibuffer.as_mut().unwrap().insert('t');
         derive::rebuild(&mut e);
         let mut term = Terminal::new(TestBackend::new(40, 6)).unwrap();
-        term.draw(|f| render(f, &e)).unwrap();
+        term.draw(|f| render(f, &mut e)).unwrap();
         let buf = term.backend().buffer();
         // Bottom row (row 5) must show "> cat"
         let status_row: String = (0u16..40)
@@ -349,7 +365,7 @@ mod tests {
         assert_eq!(e.active().view.scroll_row, 3);
 
         let mut term = Terminal::new(TestBackend::new(4, 5)).unwrap();
-        term.draw(|f| render(f, &e)).unwrap();
+        term.draw(|f| render(f, &mut e)).unwrap();
         let buf = term.backend().buffer();
         let row0: String = (0u16..4)
             .map(|x| buf[(x, 0u16)].symbol().chars().next().unwrap_or(' '))
