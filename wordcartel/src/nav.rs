@@ -6,6 +6,8 @@
 
 use crate::derive;
 use crate::editor::{Editor, RenderMode};
+use wordcartel_core::block_tree::{Block, BlockTree};
+use wordcartel_core::buffer::TextBuffer;
 use wordcartel_core::layout;
 
 /// The raw caret byte-offset: `selection.primary().head`.
@@ -424,6 +426,88 @@ fn advance_view_top_one_row(editor: &mut Editor, max_scroll: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// Paragraph span helpers (consumed by Tasks 5/6/7)
+// ---------------------------------------------------------------------------
+
+/// Deepest block whose span contains `pos`, searching children first so a
+/// list item / blockquote paragraph wins over its container.
+fn deepest_block_at(block: &Block, pos: usize) -> Option<&Block> {
+    if !(pos >= block.span.start && pos < block.span.end) {
+        return None;
+    }
+    for child in &block.children {
+        if let Some(b) = deepest_block_at(child, pos) {
+            return Some(b);
+        }
+    }
+    Some(block)
+}
+
+/// The (from, to) paragraph span at `pos`. Total over the document: a leaf
+/// block if `pos` is inside one, else the blank-line-delimited run around
+/// `pos` (the gap fallback).
+pub fn paragraph_range_at(blocks: &BlockTree, buf: &TextBuffer, pos: usize) -> (usize, usize) {
+    let pos = pos.min(buf.len());
+    for top in blocks.top_level() {
+        if let Some(b) = deepest_block_at(top, pos) {
+            return (b.span.start, b.span.end);
+        }
+    }
+    // Gap fallback: expand to the maximal run of non-blank logical lines.
+    let total = derive::total_logical_lines(buf);
+    if total == 0 {
+        return (0, 0);
+    }
+    let line = buf.byte_to_line(pos.min(buf.len().saturating_sub(1)));
+    let is_blank = |l: usize| derive::line_text(buf, l).trim().is_empty();
+    if is_blank(line) {
+        let s = derive::line_start(buf, line);
+        return (s, s); // empty range on a blank line
+    }
+    let mut top_line = line;
+    while top_line > 0 && !is_blank(top_line - 1) {
+        top_line -= 1;
+    }
+    let mut bot_line = line;
+    while bot_line + 1 < total && !is_blank(bot_line + 1) {
+        bot_line += 1;
+    }
+    let from = derive::line_start(buf, top_line);
+    let to = derive::line_start(buf, bot_line) + derive::line_text(buf, bot_line).len();
+    (from, to)
+}
+
+/// Depth-first leaf-block spans in document order (a "paragraph" for motion).
+fn collect_leaf_spans(block: &Block, out: &mut Vec<(usize, usize)>) {
+    if block.children.is_empty() {
+        out.push((block.span.start, block.span.end));
+    } else {
+        for c in &block.children { collect_leaf_spans(c, out); }
+    }
+}
+
+fn leaf_spans(blocks: &BlockTree) -> Vec<(usize, usize)> {
+    let mut v = Vec::new();
+    for top in blocks.top_level() { collect_leaf_spans(top, &mut v); }
+    v.sort_by_key(|s| s.0);
+    v
+}
+
+/// Start of the next leaf block beginning strictly after `pos`, else `buf.len()`.
+#[allow(dead_code)] // wired in Task 5/6/7
+pub fn next_paragraph_start(blocks: &BlockTree, buf: &TextBuffer, pos: usize) -> usize {
+    leaf_spans(blocks).into_iter().map(|(s, _)| s).find(|&s| s > pos).unwrap_or(buf.len())
+}
+
+/// Start of the leaf block before the one containing `pos`, else `0`.
+#[allow(dead_code)] // wired in Task 5/6/7
+pub fn prev_paragraph_start(blocks: &BlockTree, _buf: &TextBuffer, _pos: usize) -> usize {
+    // caller passes the *current paragraph start* as `pos` boundary; pick the
+    // last leaf start strictly before it.
+    leaf_spans(blocks).into_iter().map(|(s, _)| s).filter(|&s| s < _pos).next_back().unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -624,6 +708,42 @@ mod tests {
         let down_pos = move_down(&mut e); // -> back to "world" col 2 -> offset 8
         assert_eq!(down_pos, 8);
         assert_eq!(e.active().desired_col, Some(2)); // still preserved
+    }
+
+    // ------------------------------------------------------------------
+    // Task 2: paragraph_range_at (RED → GREEN)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn paragraph_range_selects_leaf_block_not_container() {
+        // A list: paragraph_range at a list item must select the ITEM span,
+        // not the whole list container.
+        let mut e = Editor::new_from_text("- one\n- two\n\nAfter\n", None, (80, 24));
+        derive::rebuild(&mut e);
+        let buf = &e.active().document.buffer;
+        let blocks = &e.active().document.blocks;
+        // pos inside "two" (second list item)
+        let pos = 8;
+        let (from, to) = super::paragraph_range_at(blocks, buf, pos);
+        let slice = buf.slice(from..to);
+        assert!(slice.contains("two") && !slice.contains("one"),
+            "expected the 'two' item span, got {slice:?}");
+    }
+
+    #[test]
+    fn paragraph_range_gap_falls_back_to_blank_delimited_run() {
+        // "A\n\nB\n" — pos on the blank line (offset 2) has no block span;
+        // fallback returns an empty/whitespace range (no panic), and a pos in
+        // paragraph "B" returns the B line range.
+        let mut e = Editor::new_from_text("A\n\nB\n", None, (80, 24));
+        derive::rebuild(&mut e);
+        let buf = &e.active().document.buffer;
+        let blocks = &e.active().document.blocks;
+        let (bf, bt) = super::paragraph_range_at(blocks, buf, 3); // inside "B"
+        assert_eq!(buf.slice(bf..bt).trim(), "B");
+        // gap: must not panic and must yield a valid (from<=to<=len) range
+        let (gf, gt) = super::paragraph_range_at(blocks, buf, 2);
+        assert!(gf <= gt && gt <= buf.len());
     }
 
     #[test]
