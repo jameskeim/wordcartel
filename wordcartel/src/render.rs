@@ -184,7 +184,7 @@ pub fn render(frame: &mut Frame, editor: &Editor) {
         let ov_w = (w * 3 / 5).max(30).min(80).min(w);
         let max_rows = palette.rows.len() as u16;
         let list_h = max_rows.min(15).min(h.saturating_sub(4));
-        let ov_h = (list_h + 3).min(h); // 1 border top + 1 query + 1 separator + list_h + 1 border bottom = list_h + 4; clamp
+        let ov_h = (list_h + 3).min(h); // 1 border top + 1 query row + list_h list rows + 1 border bottom = list_h + 3; clamp to h
 
         // Center the overlay.
         let ov_x = area.x + (w.saturating_sub(ov_w)) / 2;
