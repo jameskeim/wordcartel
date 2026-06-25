@@ -17,6 +17,7 @@ crossterm = "0.28"
 thiserror = "2"
 dirs = "5"
 subprocess = "0.2"
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 
 [dev-dependencies]
 proptest = "1"
