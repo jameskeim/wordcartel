@@ -72,6 +72,9 @@ impl Selection {
     pub fn single(pos: BytePos) -> Selection {
         Selection { ranges: smallvec![Range::point(pos)], primary: 0 }
     }
+    pub fn range(anchor: BytePos, head: BytePos) -> Selection {
+        Selection { ranges: smallvec![Range { anchor, head }], primary: 0 }
+    }
     pub fn primary(&self) -> Range {
         debug_assert!(
             self.primary < self.ranges.len(),
@@ -100,6 +103,11 @@ mod tests {
         let cs = ChangeSet::insert(2, "XY", 10);
         let mapped = cur.map(&cs);
         assert_eq!(mapped, Range { anchor: 7, head: 7 });
+    }
+
+    #[test]
+    fn range_constructor_sets_primary() {
+        assert_eq!(Selection::range(0, 5).primary().from(), 0);
     }
 
     #[test]

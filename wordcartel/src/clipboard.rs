@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
 pub const OSC52_MAX_ENCODED: usize = 100_000;
+pub const PASTE_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // PasteIntent, ClipReq, next_paste_id
@@ -25,13 +26,13 @@ pub enum ClipReq {
 
 static PASTE_SEQ: AtomicU64 = AtomicU64::new(1);
 
-#[allow(dead_code)] // wired in Task 3/4
 pub fn next_paste_id() -> u64 {
     PASTE_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Called by run() after reduce, before the frame draw. `out` is the terminal
 /// backend writer (a Vec<u8> in tests). Never blocks: the channel is unbounded.
+#[allow(dead_code)] // wired in Task 4
 pub fn drain_clipboard_intents(
     editor: &mut crate::editor::Editor,
     out: &mut impl std::io::Write,

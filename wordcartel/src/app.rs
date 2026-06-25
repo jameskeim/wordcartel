@@ -331,6 +331,52 @@ fn submit_filter_line(
     crate::filter::dispatch_filter(editor, spec, msg_tx.clone());
 }
 
+fn insert_paste_text(editor: &mut Editor, buffer_id: crate::editor::BufferId, text: &str, clock: &dyn Clock) -> bool {
+    if text.len() > crate::clipboard::PASTE_MAX_BYTES {
+        editor.status = format!("paste too large ({} MiB) -- skipped", text.len() / (1 << 20));
+        return false;
+    }
+    let active_id = editor.active().id;
+    {
+        let Some(b) = editor.by_id_mut(buffer_id) else { return false; };
+        let sel = b.document.selection.primary();
+        let (from, to) = (sel.from(), sel.to());
+        let doc_len = b.document.buffer.len();
+        let (cs, edit) = crate::commands::build_range_replace(from, to, text, doc_len);
+        let txn = wordcartel_core::history::Transaction::new(cs)
+            .with_selection(wordcartel_core::selection::Selection::single(from + text.len()));
+        b.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
+        b.desired_col = None;
+    }
+    if buffer_id == active_id {
+        crate::derive::rebuild(editor);
+        crate::nav::ensure_visible(editor);
+    }
+    true
+}
+
+fn apply_clipboard_paste(editor: &mut Editor, buffer_id: crate::editor::BufferId, text: Option<String>, clock: &dyn Clock) {
+    match text {
+        Some(t) if !t.is_empty() => {
+            if insert_paste_text(editor, buffer_id, &t, clock) {
+                editor.register.set(t);
+            }
+        }
+        _ => {
+            if let Some(t) = editor.register.get().map(str::to_owned) {
+                insert_paste_text(editor, buffer_id, &t, clock);
+            }
+        }
+    }
+}
+
+fn apply_clipboard_availability(editor: &mut Editor, ok: bool) {
+    if !ok && !editor.clipboard_notice_shown {
+        editor.status = "system clipboard unavailable -- copy/paste work in-editor; using OSC 52 for terminal sync".into();
+        editor.clipboard_notice_shown = true;
+    }
+}
+
 /// Process one message. Returns true while the app should keep running.
 pub fn reduce(
     msg: Msg,
@@ -367,6 +413,8 @@ pub fn reduce(
             Msg::TransformDone { buffer_id, version, range, kind, result } => {
                 apply_transform_done(editor, buffer_id, version, range, kind, result, clock);
             }
+            Msg::ClipboardPaste { buffer_id, text, .. } => apply_clipboard_paste(editor, buffer_id, text, clock),
+            Msg::ClipboardAvailability(ok) => apply_clipboard_availability(editor, ok),
             // Resize/Tick/other input: ignored for the modal, but results still drain below.
             _ => {}
         }
@@ -470,8 +518,8 @@ pub fn reduce(
                 crate::swap::dispatch_swap_write(&mut ctx);
             }
         }
-        // Task 3 wires the real handling; the prompt/minibuffer blocks already have `_ => {}`.
-        Msg::ClipboardPaste { .. } | Msg::ClipboardAvailability(_) => {}
+        Msg::ClipboardPaste { buffer_id, text, .. } => apply_clipboard_paste(editor, buffer_id, text, clock),
+        Msg::ClipboardAvailability(ok) => apply_clipboard_availability(editor, ok),
     }
     if editor.active().document.version != before {
         editor.active_mut().last_edit_at = Some(clock.now_ms());
@@ -736,6 +784,115 @@ mod tests {
         crate::app::reduce(crate::app::Msg::Input(q), &mut e, &reg, &ex, &clk, &tx);
         assert!(e.quit);
         assert_eq!(e.active().document.buffer.to_string(), "hi\n");
+    }
+
+    #[test]
+    fn copy_sets_register_and_sync_request() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        // select "hello" (0..5)
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::range(0, 5);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let ctrl_c = Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(ctrl_c), &mut e, &reg, &ex, &clk, &tx);
+        assert_eq!(e.register.get(), Some("hello"));
+        assert_eq!(e.clipboard_sync_request.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn paste_keypress_sets_intent_not_inline_paste() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        e.register.set("Z".into());
+        let before = e.active().document.buffer.to_string();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let ctrl_v = Event::Key(KeyEvent { code: KeyCode::Char('v'), modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(ctrl_v), &mut e, &reg, &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), before, "Ctrl+V no longer pastes inline");
+        assert!(e.clipboard_get_pending.is_some(), "Ctrl+V sets a paste intent");
+    }
+
+    #[test]
+    fn clipboardpaste_some_inserts_os_text_one_undo() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1); // caret after 'a'
+        let bid = e.active().id;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("XY".into()) }, &mut e, &reg, &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "aXYb\n");
+        assert_eq!(e.register.get(), Some("XY"), "OS text updates the register");
+        e.active_mut().undo();
+        assert_eq!(e.active().document.buffer.to_string(), "ab\n");
+    }
+
+    #[test]
+    fn clipboardpaste_none_falls_back_to_register() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);
+        e.register.set("R".into());
+        let bid = e.active().id;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: None }, &mut e, &reg, &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "aRb\n", "None -> register fallback");
+    }
+
+    #[test]
+    fn clipboardpaste_none_empty_register_is_noop() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        let bid = e.active().id;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: None }, &mut e, &reg, &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "ab\n", "empty register -> no change");
+    }
+
+    #[test]
+    fn clipboardpaste_replaces_active_selection() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::range(1, 3); // select "bc"
+        let bid = e.active().id;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("XY".into()) }, &mut e, &reg, &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "aXYd\n", "selection replaced by pasted text");
+        e.active_mut().undo();
+        assert_eq!(e.active().document.buffer.to_string(), "abcd\n");
+    }
+
+    #[test]
+    fn clipboardpaste_for_missing_buffer_is_noop() {
+        use crate::editor::{Editor, BufferId}; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: BufferId(99999), text: Some("X".into()) }, &mut e, &reg, &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "ab\n", "unknown buffer -> dropped");
+    }
+
+    #[test]
+    fn availability_false_shows_notice_once() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::ClipboardAvailability(false), &mut e, &reg, &ex, &clk, &tx);
+        assert!(e.status.to_lowercase().contains("clipboard"));
+        assert!(e.clipboard_notice_shown);
+        e.status = "typing".into();
+        crate::app::reduce(Msg::ClipboardAvailability(false), &mut e, &reg, &ex, &clk, &tx);
+        assert_eq!(e.status, "typing", "notice shown only once");
     }
 
     // -------------------------------------------------------------------------

@@ -292,6 +292,9 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             // applies now that the buffer lives under editor.active() rather than directly on Editor).
             let buf_snap = editor.active().document.buffer.clone();
             register::copy(&buf_snap, r, &mut editor.register);
+            if let Some(text) = editor.register.get().map(str::to_owned) {
+                editor.clipboard_sync_request = Some(text);
+            }
             editor.status = "Copied".to_string();
             CommandResult::Handled
         }
@@ -309,6 +312,9 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             let edit = Edit { range: r.from()..r.to(), new_len: 0 };
             let txn = Transaction::new(cs).with_selection(Selection::single(r.from()));
             editor.apply(txn, edit, EditKind::Other, clock);
+            if let Some(text) = editor.register.get().map(str::to_owned) {
+                editor.clipboard_sync_request = Some(text);
+            }
             derive::rebuild(editor);
             nav::ensure_visible(editor);
             editor.active_mut().desired_col = None;
@@ -316,40 +322,11 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         }
 
         Command::Paste => {
-            let sel = editor.active().document.selection.primary();
-            if !sel.is_empty() {
-                // Non-empty selection: replace it with the register contents (CUA).
-                if let Some(text) = editor.register.get().map(str::to_owned) {
-                    let (from, to) = (sel.from(), sel.to());
-                    let doc_len = editor.active().document.buffer.len();
-                    let cs = replace_changeset(from, to, &text, doc_len);
-                    let edit = Edit { range: from..to, new_len: text.len() };
-                    let txn =
-                        Transaction::new(cs).with_selection(Selection::single(from + text.len()));
-                    editor.apply(txn, edit, EditKind::Other, clock);
-                    derive::rebuild(editor);
-                    nav::ensure_visible(editor);
-                    editor.active_mut().desired_col = None;
-                    return CommandResult::Handled;
-                }
-                // Register is empty → fall through to Noop below.
-                return CommandResult::Noop;
-            }
-            // Collapsed selection: normal paste-at-caret path.
-            let at = nav::head(editor);
-            let doc_len = editor.active().document.buffer.len();
-            if let Some(cs) = register::paste(at, doc_len, &editor.register) {
-                let n = editor.register.get().map(str::len).unwrap_or(0);
-                let edit = Edit { range: at..at, new_len: n };
-                let txn = Transaction::new(cs).with_selection(Selection::single(at + n));
-                editor.apply(txn, edit, EditKind::Other, clock);
-                derive::rebuild(editor);
-                nav::ensure_visible(editor);
-                editor.active_mut().desired_col = None;
-                CommandResult::Handled
-            } else {
-                CommandResult::Noop
-            }
+            editor.clipboard_get_pending = Some(crate::clipboard::PasteIntent {
+                id: crate::clipboard::next_paste_id(),
+                buffer_id: editor.active().id,
+            });
+            CommandResult::Handled
         }
 
         Command::Undo => {
@@ -659,28 +636,17 @@ mod tests {
     /// Paste inserts register contents at the current caret position.
     #[test]
     fn paste_inserts_register_at_caret() {
-        let mut e = Editor::new_from_text("cd\n", None, (80, 24));
-        set_caret(&mut e, 0);
+        let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
+        set_caret(&mut e, 4);
+        e.register.set("ab".into());
         derive::rebuild(&mut e);
         let clk = TestClock(0);
+        let before = e.active().document.buffer.to_string();
 
-        // Pre-load the register by typing "ab" and cutting it, or directly using
-        // a Copy. Simpler: Copy a range, then Paste somewhere.
-        // Use "abcd\n", select "ab", Copy, then move to offset 2 and Paste.
-        let mut e2 = Editor::new_from_text("abcd\n", None, (80, 24));
-        set_caret(&mut e2, 0);
-        derive::rebuild(&mut e2);
-        run(Command::Move { dir: Dir::Right, extend: true }, &mut e2, &clk);
-        run(Command::Move { dir: Dir::Right, extend: true }, &mut e2, &clk);
-        run(Command::Copy, &mut e2, &clk);
-
-        // Now move head to offset 4 (before '\n') and paste
-        set_caret(&mut e2, 4);
-        e2.active_mut().document.selection = wordcartel_core::selection::Selection::single(4);
-        run(Command::Paste, &mut e2, &clk);
-        // "abcd\n" with "ab" pasted at offset 4 → "abcdab\n"
-        assert_eq!(e2.active().document.buffer.to_string(), "abcdab\n", "Paste must insert register text at caret");
-        assert_eq!(nav::head(&e2), 6, "caret must be after the pasted text");
+        let result = run(Command::Paste, &mut e, &clk);
+        assert_eq!(result, CommandResult::Handled);
+        assert!(e.clipboard_get_pending.is_some(), "Paste must request async clipboard text");
+        assert_eq!(e.active().document.buffer.to_string(), before, "Paste must not mutate inline");
     }
 
     /// Move with extend=false collapses the selection to a point.
@@ -761,9 +727,12 @@ mod tests {
         set_caret(&mut e, 0);
         derive::rebuild(&mut e);
         let clk = TestClock(0);
+        let before = e.active().document.buffer.to_string();
+
         let result = run(Command::Paste, &mut e, &clk);
-        assert_eq!(result, CommandResult::Noop);
-        assert_eq!(e.active().document.buffer.to_string(), "abcd\n");
+        assert_eq!(result, CommandResult::Handled);
+        assert!(e.clipboard_get_pending.is_some(), "Paste must request async clipboard text");
+        assert_eq!(e.active().document.buffer.to_string(), before, "Paste must not mutate inline");
     }
 
     // -------------------------------------------------------------------------
@@ -918,18 +887,7 @@ mod tests {
     #[test]
     fn paste_over_selection_replaces() {
         let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
-        // Pre-load register with "XY" via copy from another editor.
-        let mut src = Editor::new_from_text("XY\n", None, (80, 24));
-        src.active_mut().document.selection = Selection {
-            ranges: [wordcartel_core::selection::Range { anchor: 0, head: 2 }]
-                .into_iter()
-                .collect(),
-            primary: 0,
-        };
-        derive::rebuild(&mut src);
-        run(Command::Copy, &mut src, &TestClock(0));
-        // Copy the register reference into `e`.
-        e.register = src.register;
+        e.register.set("XY".into());
 
         // Set non-empty selection anchor=1 head=3 (selects "bc")
         e.active_mut().document.selection = Selection {
@@ -940,10 +898,12 @@ mod tests {
         };
         derive::rebuild(&mut e);
         let clk = TestClock(0);
+        let before = e.active().document.buffer.to_string();
+
         let result = run(Command::Paste, &mut e, &clk);
         assert_eq!(result, CommandResult::Handled);
-        assert_eq!(e.active().document.buffer.to_string(), "aXYd\n", "Paste must replace the selection");
-        assert_eq!(nav::head(&e), 3, "caret must be after the pasted text");
+        assert!(e.clipboard_get_pending.is_some(), "Paste must request async clipboard text");
+        assert_eq!(e.active().document.buffer.to_string(), before, "Paste must not mutate inline");
     }
 
     /// DeleteForward with a non-empty selection deletes the selection range,
