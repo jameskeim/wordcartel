@@ -333,7 +333,7 @@ fn submit_filter_line(
 
 fn insert_paste_text(editor: &mut Editor, buffer_id: crate::editor::BufferId, text: &str, clock: &dyn Clock) -> bool {
     if text.len() > crate::clipboard::PASTE_MAX_BYTES {
-        editor.status = format!("paste too large ({} MiB) -- skipped", text.len() / (1 << 20));
+        editor.status = format!("paste too large ({} MiB) — skipped", text.len() / (1 << 20));
         return false;
     }
     let active_id = editor.active().id;
@@ -460,7 +460,7 @@ pub fn reduce(
             for r in ex.drain() { apply_result(r, editor); }
             return !editor.quit;
         }
-        // non-key (FilterDone/JobDone/Tick/Resize) falls through to the normal match below
+        // non-key (FilterDone/JobDone/Tick/Resize/ClipboardPaste/ClipboardAvailability) falls through to the normal match below
     }
 
     let before = editor.active().document.version;
@@ -879,6 +879,22 @@ mod tests {
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: BufferId(99999), text: Some("X".into()) }, &mut e, &reg, &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "ab\n", "unknown buffer -> dropped");
+    }
+
+    #[test]
+    fn clipboardpaste_oversize_skips_insert_and_register() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("ab\n", None, (80, 24));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);
+        e.register.set("orig".into());
+        let bid = e.active().id;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let huge = "x".repeat(crate::clipboard::PASTE_MAX_BYTES + 1);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some(huge) }, &mut e, &reg, &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "ab\n", "oversize paste must not insert");
+        assert_eq!(e.register.get(), Some("orig"), "oversize paste must not mutate the register");
+        assert!(e.status.to_lowercase().contains("too large"));
     }
 
     #[test]
