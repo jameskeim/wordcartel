@@ -3,6 +3,7 @@ use crossterm::event::{MouseEvent, MouseEventKind, MouseButton, KeyModifiers};
 use crate::editor::Editor;
 
 /// Classification of a terminal cell hit relative to the editing layout.
+#[derive(Clone, Copy)]
 pub enum CellHit {
     Text { col: u16, erow: u16 },
     MenuBar,
@@ -69,7 +70,8 @@ pub fn handle(
     }
     match ev.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if let CellHit::Scrollbar = editing_cell(editor, ev.column, ev.row) {
+            let hit = editing_cell(editor, ev.column, ev.row);
+            if let CellHit::Scrollbar = hit {
                 let (_w, h) = editor.active().view.area;
                 let menu_rows = u16::from(editor.menu.is_some());
                 let edit_height = h.saturating_sub(1 + menu_rows) as usize;
@@ -84,7 +86,7 @@ pub fn handle(
                 editor.active_mut().view.scroll = new_scroll;
                 editor.mouse.scrollbar_dragging = true;
                 editor.mouse.scrollbar_until_ms = clock.now_ms() + 1200;
-            } else if let CellHit::Text { col, erow } = editing_cell(editor, ev.column, ev.row) {
+            } else if let CellHit::Text { col, erow } = hit {
                 let buf_len = editor.active().document.buffer.len();
                 let off = match crate::nav::offset_at_cell(editor, col, erow) {
                     Some(o) => crate::nav::clamp_snap(editor, o),

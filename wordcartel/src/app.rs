@@ -1072,11 +1072,6 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Reconcile the terminal's mouse-capture state with `editor.mouse_capture`.
-///
-/// Enables or disables mouse capture on the backend when the desired state
-/// diverges from `applied`. On disable, clears drag state so no stale Up
-/// events are awaited for a capture that will never arrive.
 /// Recompute `editor.mouse.scrollbar_visible` from the clock.
 ///
 /// Must be called at the top of the run loop (with `clock.now_ms()`) so that
@@ -1086,6 +1081,11 @@ pub fn recompute_scrollbar_visible(editor: &mut crate::editor::Editor, now_ms: u
     editor.mouse.scrollbar_visible = now_ms < editor.mouse.scrollbar_until_ms;
 }
 
+/// Reconcile the terminal's mouse-capture state with `editor.mouse_capture`.
+///
+/// Enables or disables mouse capture on the backend when the desired state
+/// diverges from `applied`. On disable, clears drag state so no stale Up
+/// events are awaited for a capture that will never arrive.
 pub fn reconcile_mouse_capture<W: std::io::Write>(editor: &mut crate::editor::Editor, backend: &mut W, applied: &mut bool) {
     if editor.mouse_capture != *applied {
         if editor.mouse_capture {
