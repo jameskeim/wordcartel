@@ -24,3 +24,4 @@ nucleo-matcher = "0.3"
 
 [dev-dependencies]
 proptest = "1"
+tempfile = "3"
