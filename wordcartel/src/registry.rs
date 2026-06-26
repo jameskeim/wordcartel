@@ -178,6 +178,7 @@ impl Registry {
             c.editor.palette = None;
             c.editor.prompt = None;
             c.editor.minibuffer = None;
+            c.editor.search = None;
             c.editor.pending_keys.clear();
             c.editor.pending_mark = None;
             c.editor.menu = if c.editor.menu.is_some() {

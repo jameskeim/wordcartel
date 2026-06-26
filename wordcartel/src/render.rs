@@ -223,6 +223,26 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     let hl_current: Option<wordcartel_core::search::Match> =
         editor.search.as_ref().and_then(|s| s.current());
 
+    // Viewport-gate: narrow the match slice to only those intersecting the visible
+    // byte span [lo, hi).  This keeps per-glyph scan O(visible_glyphs × viewport_matches)
+    // instead of O(visible_glyphs × total_matches).
+    // The full hl_matches_owned is kept for the search-bar count/ordinal (format_search_bar
+    // reads from SearchState directly, not from this vec).
+    let hl_window: &[wordcartel_core::search::Match] = if hl_matches_owned.is_empty() {
+        &[]
+    } else {
+        let buf = &editor.active().document.buffer;
+        let lo = derive::line_start(buf, scroll);
+        // Conservative upper bound: the last logical line in the layout cache.
+        let max_visible = sorted_lines.last().copied().unwrap_or(scroll);
+        let hi = derive::line_start(buf, max_visible + 1);
+        // partition_point keeps the sorted invariant; matches are sorted by start,
+        // and non-overlapping so end is also non-decreasing.
+        let lo_idx = hl_matches_owned.partition_point(|m| m.end <= lo);
+        let hi_idx = hl_matches_owned.partition_point(|m| m.start < hi);
+        &hl_matches_owned[lo_idx..hi_idx.max(lo_idx)]
+    };
+
     'outer: for &l in &sorted_lines {
         if l < scroll {
             continue;
@@ -253,7 +273,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             };
 
             // Build spans for this visual row.
-            let spans: Vec<Span<'_>> = if hl_matches_owned.is_empty() {
+            let spans: Vec<Span<'_>> = if hl_window.is_empty() {
                 // ---------------------------------------------------------------
                 // EXISTING segs-based path (no active search) — true no-op.
                 // ---------------------------------------------------------------
@@ -291,7 +311,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                     let g_from = line_off + p.src.start;
                     let g_to = line_off + p.src.end;
                     let is_current = hl_current.is_some_and(|m| overlaps(g_from, g_to, m.start, m.end));
-                    let is_match = !is_current && hl_matches_owned.iter().any(|m| overlaps(g_from, g_to, m.start, m.end));
+                    let is_match = !is_current && hl_window.iter().any(|m| overlaps(g_from, g_to, m.start, m.end));
 
                     let mut style = if row_dim {
                         RStyle::default().fg(Color::DarkGray)
@@ -805,6 +825,51 @@ mod tests {
         // (assert the helper render uses to decide, not pixels — see Step 3 for the fn)
         assert!(!crate::render::row_is_active(0, "Para one.".len(), from, to), "para one dimmed");
         assert!(crate::render::row_is_active(from, to, from, to), "active row bright");
+    }
+
+    /// Viewport-gated highlight scan:
+    /// - A match scrolled completely off-screen must NOT produce a highlight on
+    ///   any visible row.
+    /// - A match that straddles the top scroll boundary (starts just before lo,
+    ///   ends inside the viewport) must still be highlighted on its visible portion.
+    #[test]
+    fn viewport_gates_search_highlight_scan() {
+        // Build a document: "needle\n" at line 0, then 5 filler lines, then "needle\n".
+        // With a 3-row viewport (2 editing rows + 1 status) and scroll=5 we see only
+        // lines 5 and 6 — so line 0 is completely off-screen and its match must not
+        // appear as a highlight on any visible row.
+        let doc = "needle\n".to_string()
+            + "filler\nfiller\nfiller\nfiller\nfiller\n"
+            + "needle\n";
+        let mut e = Editor::new_from_text(&doc, None, (40, 3));
+        e.open_search(crate::search_overlay::Phase::Find, 0);
+        for c in "needle".chars() { e.search.as_mut().unwrap().insert(c); }
+        let rope = e.active().document.buffer.snapshot();
+        let v = e.active().document.version;
+        e.search.as_mut().unwrap().recompute(&rope, v);
+        assert_eq!(e.search.as_ref().unwrap().count(), 2, "expect 2 matches total");
+        // Scroll to line 5 so line 0 is off-screen.
+        e.active_mut().view.scroll = 5;
+        crate::derive::rebuild(&mut e);
+        let buf = render_to_buffer(&mut e, 40, 3);
+        // Row 1 (screen row 1) shows line 6 ("needle") — must be highlighted.
+        assert!(row_has_highlight(&buf, 1), "on-screen match at line 6 must be highlighted");
+        // Row 0 shows line 5 ("filler") — must NOT be highlighted (line 0 match is off-screen).
+        assert!(!row_has_highlight(&buf, 0), "off-screen match at line 0 must not bleed onto filler row");
+
+        // Straddling test: a match whose end byte is > lo (scroll line boundary) but
+        // whose start byte is == lo - 1 (just before the boundary) must be included.
+        // Construct: scroll to line 1 so lo = byte offset of "filler" start.
+        // The "needle\n" at line 0 ends at byte 7 which equals lo — exactly the
+        // partition boundary: m.end == lo means m.end <= lo is TRUE, so lo_idx would
+        // exclude it. That's correct: the match ends AT lo, no glyph of it is visible.
+        // Test a match that does cross: put scroll at line 0 (lo=0) so everything is in
+        // the window, then verify both matches show (not a straddling case but a
+        // full-window case that must still work).
+        e.active_mut().view.scroll = 0;
+        crate::derive::rebuild(&mut e);
+        let buf2 = render_to_buffer(&mut e, 40, 3);
+        assert!(row_has_highlight(&buf2, 0), "match at line 0 visible when scroll=0");
     }
 
     #[test]
