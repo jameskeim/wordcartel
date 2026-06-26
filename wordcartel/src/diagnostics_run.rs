@@ -67,6 +67,9 @@ pub fn dispatch_diagnostics(
 /// Returns `Ok(())` on success, `Err(e)` on IO failure (caller shows status).
 pub fn append_word_to_dict(path: &std::path::Path, word: &str) -> std::io::Result<()> {
     use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(f, "{}", word)
 }
@@ -131,5 +134,27 @@ mod tests {
             message: "x".into(), suggestions: vec![] });
         assert!(s.valid_for(5));
         assert!(!s.valid_for(6)); // edited since → hidden
+    }
+
+    #[test]
+    fn append_word_to_dict_creates_parent_dir() {
+        let temp_dir = format!("/tmp/wordcartel_test_{}", std::process::id());
+        let dict_path = std::path::PathBuf::from(&temp_dir)
+            .join("subdir")
+            .join("nested")
+            .join("dictionary.txt");
+
+        // Clean up before test
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        // Should succeed even though parent dirs don't exist
+        append_word_to_dict(&dict_path, "testword").expect("append should succeed");
+
+        assert!(dict_path.exists(), "dictionary file should exist");
+        let content = std::fs::read_to_string(&dict_path).expect("should read file");
+        assert!(content.contains("testword"), "file should contain the appended word");
+
+        // Clean up after test
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
