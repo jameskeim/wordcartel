@@ -99,6 +99,7 @@ pub fn handle(
             } else if !inside {
                 editor.palette = None; // click outside closes
                 editor.search = None;
+                editor.diag = None;
             }
         }
         return;
@@ -126,6 +127,7 @@ pub fn handle(
             } else {
                 editor.menu = None; // outside → close
                 editor.search = None;
+                editor.diag = None;
             }
         }
         return;

@@ -52,6 +52,11 @@ pub enum Msg {
         kind: crate::transform::TransformKind,
         result: Result<String, crate::transform::TransformError>,
     },
+    DiagnosticsDone {
+        buffer_id: crate::editor::BufferId,
+        version: u64,
+        diagnostics: Vec<wordcartel_core::diagnostics::Diagnostic>,
+    },
     ClipboardPaste { id: u64, buffer_id: crate::editor::BufferId, text: Option<String> },
     ClipboardAvailability(bool),
     Tick,
@@ -82,6 +87,12 @@ impl std::fmt::Debug for Msg {
                 .field("version", version)
                 .field("range", range)
                 .field("kind", kind)
+                .finish(),
+            Msg::DiagnosticsDone { buffer_id, version, diagnostics } => f
+                .debug_struct("DiagnosticsDone")
+                .field("buffer_id", buffer_id)
+                .field("version", version)
+                .field("count", &diagnostics.len())
                 .finish(),
             Msg::ClipboardPaste { id, buffer_id, text } => f.debug_struct("ClipboardPaste")
                 .field("id", id).field("buffer_id", buffer_id)
@@ -570,6 +581,86 @@ fn search_pin(editor: &mut Editor) {
     }
 }
 
+/// Accept, ignore, or add-to-dict based on the overlay's current selection.
+/// Clears `editor.diag` when done (regardless of outcome).
+fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
+    // Clone what we need out of the overlay before mutating editor.
+    let overlay_info = editor.diag.as_ref().map(|ov| {
+        let is_ignore = ov.is_ignore();
+        let is_add_dict = ov.is_add_dict();
+        let suggestion = ov.chosen_suggestion().cloned();
+        (ov.anchor.range.start, ov.anchor.range.end, is_ignore, is_add_dict, suggestion, ov.opened_version)
+    });
+    let Some((raw_a, raw_b, is_ignore, is_add_dict, suggestion, opened_version)) = overlay_info else { return; };
+
+    // Fix A4: if the buffer was mutated while the overlay was open, the anchor
+    // ranges are stale.  Refuse to apply — a stale range can cause a panic on
+    // multibyte boundaries or silently apply at wrong offsets.
+    if editor.active().document.version != opened_version {
+        editor.status = "document changed; re-open".into();
+        editor.diag = None;
+        return;
+    }
+
+    // Clamp the stale/oversized anchor range to the current doc length so a
+    // multibyte/shrink race can never cause buffer.slice or build_range_replace
+    // to panic (defense-in-depth even when the command-handler validity gate fires).
+    let doc_len = editor.active().document.buffer.len();
+    let a = raw_a.min(doc_len);
+    let b = raw_b.min(doc_len);
+
+    if is_ignore {
+        // Add the surface word to session_ignores, close, re-arm a recheck.
+        let word = editor.active().document.buffer.slice(a..b).to_string();
+        editor.session_ignores.insert(word);
+        editor.diag = None;
+        if editor.diag_cfg.enabled {
+            let debounce_ms = editor.diag_cfg.debounce_ms;
+            editor.active_mut().diagnostics.arm(clock.now_ms(), debounce_ms);
+        }
+    } else if is_add_dict {
+        // Append word to dictionary file + in-memory set, close, re-arm.
+        let word = editor.active().document.buffer.slice(a..b).to_string();
+        if let Some(ref dict_path) = editor.diag_cfg.dictionary.clone() {
+            match crate::diagnostics_run::append_word_to_dict(dict_path, &word) {
+                Ok(()) => { editor.dictionary.insert(word); }
+                Err(e) => { editor.status = format!("add to dictionary failed: {e}"); }
+            }
+        } else {
+            editor.status = "no dictionary path configured".into();
+        }
+        editor.diag = None;
+        if editor.diag_cfg.enabled {
+            let debounce_ms = editor.diag_cfg.debounce_ms;
+            editor.active_mut().diagnostics.arm(clock.now_ms(), debounce_ms);
+        }
+    } else if let Some(s) = suggestion {
+        // Apply the suggestion as an undoable edit, then close.
+        let (cs, edit) = match &s {
+            wordcartel_core::diagnostics::Suggestion::ReplaceWith(t) =>
+                crate::commands::build_range_replace(a, b, t, doc_len),
+            wordcartel_core::diagnostics::Suggestion::InsertAfter(t) =>
+                crate::commands::build_range_replace(b, b, t, doc_len),
+            wordcartel_core::diagnostics::Suggestion::Remove =>
+                crate::commands::build_range_replace(a, b, "", doc_len),
+        };
+        // Determine cursor position: for ReplaceWith/InsertAfter place after inserted text;
+        // for Remove place at a (start of deleted region).
+        let new_cursor = match &s {
+            wordcartel_core::diagnostics::Suggestion::ReplaceWith(t) => a + t.len(),
+            wordcartel_core::diagnostics::Suggestion::InsertAfter(t) => b + t.len(),
+            wordcartel_core::diagnostics::Suggestion::Remove => a,
+        };
+        let txn = wordcartel_core::history::Transaction::new(cs)
+            .with_selection(wordcartel_core::selection::Selection::single(new_cursor));
+        editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
+        derive::rebuild(editor);
+        crate::nav::ensure_visible(editor);
+        editor.diag = None;
+    }
+    // else: no suggestion and not ignore/add_dict — unreachable (selected is always in range).
+}
+
 /// Process one message. Returns true while the app should keep running.
 pub fn reduce(
     msg: Msg,
@@ -753,6 +844,9 @@ pub fn reduce(
             Msg::TransformDone { buffer_id, version, range, kind, result } => {
                 apply_transform_done(editor, buffer_id, version, range, kind, result, clock);
             }
+            Msg::DiagnosticsDone { buffer_id, version, diagnostics } => {
+                crate::diagnostics_run::apply_diagnostics_done(editor, buffer_id, version, diagnostics);
+            }
             Msg::ClipboardPaste { buffer_id, text, .. } => apply_clipboard_paste(editor, buffer_id, text, clock),
             Msg::ClipboardAvailability(ok) => apply_clipboard_availability(editor, ok),
             // Resize/Tick/other input: ignored for the modal, but results still drain below.
@@ -866,6 +960,26 @@ pub fn reduce(
         // fall through to the normal handlers below.
     }
 
+    // Diag overlay intercepts KEY INPUT only; non-key messages fall through to
+    // normal handling so background work is never starved while the overlay is open
+    // (mirror of minibuffer/search blocks above — 5e starvation lesson).
+    if editor.diag.is_some() {
+        if let Msg::Input(Event::Key(k)) = &msg {
+            if k.kind == crossterm::event::KeyEventKind::Press {
+                match k.code {
+                    crossterm::event::KeyCode::Up   => { editor.diag.as_mut().unwrap().up(); }
+                    crossterm::event::KeyCode::Down => { editor.diag.as_mut().unwrap().down(); }
+                    crossterm::event::KeyCode::Esc  => { editor.diag = None; }
+                    crossterm::event::KeyCode::Enter => { diag_apply_selected(editor, clock); }
+                    _ => {} // bare Ctrl+key or anything else: no-op, consumed
+                }
+            }
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit; // return ONLY for key events (including non-Press)
+        }
+        // Non-key messages fall through to normal handlers below.
+    }
+
     let before = editor.active().document.version;
     match msg {
         Msg::Input(Event::Key(k)) if k.kind == crossterm::event::KeyEventKind::Press => {
@@ -942,6 +1056,9 @@ pub fn reduce(
         Msg::TransformDone { buffer_id, version, range, kind, result } => {
             apply_transform_done(editor, buffer_id, version, range, kind, result, clock);
         }
+        Msg::DiagnosticsDone { buffer_id, version, diagnostics } => {
+            crate::diagnostics_run::apply_diagnostics_done(editor, buffer_id, version, diagnostics);
+        }
         Msg::Tick => {
             let now = clock.now_ms();
             if editor.active().document.dirty()
@@ -952,12 +1069,28 @@ pub fn reduce(
                 let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
                 crate::swap::dispatch_swap_write(&mut ctx);
             }
+            // Dispatch diagnostics if due.
+            let version = editor.active().document.version;
+            if editor.diag_cfg.enabled
+                && crate::diagnostics_run::diag_due(&editor.active().diagnostics, now, version)
+            {
+                let ignore_words = std::sync::Arc::new(
+                    editor.dictionary.iter().chain(editor.session_ignores.iter()).cloned().collect::<std::collections::HashSet<String>>()
+                );
+                let diag_cfg = editor.diag_cfg.clone();
+                crate::diagnostics_run::dispatch_diagnostics(editor, &diag_cfg, ignore_words, msg_tx.clone());
+            }
         }
         Msg::ClipboardPaste { buffer_id, text, .. } => apply_clipboard_paste(editor, buffer_id, text, clock),
         Msg::ClipboardAvailability(ok) => apply_clipboard_availability(editor, ok),
     }
     if editor.active().document.version != before {
         editor.active_mut().last_edit_at = Some(clock.now_ms());
+        // Arm debounce for diagnostics if enabled.
+        if editor.diag_cfg.enabled {
+            let debounce_ms = editor.diag_cfg.debounce_ms;
+            editor.active_mut().diagnostics.arm(clock.now_ms(), debounce_ms);
+        }
     }
     // Fold any other results that became ready while handling this message.
     for r in ex.drain() {
@@ -1069,6 +1202,13 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     // Seed mouse_capture from config (default true; may be overridden by config layers).
     editor.mouse_capture = cfg.mouse.mouse_capture;
     editor.view_opts = cfg.view.clone();
+    editor.diag_cfg = cfg.diagnostics.clone();
+    // Load the personal dictionary from disk (missing/unreadable → empty; no abort).
+    if let Some(dict_path) = &cfg.diagnostics.dictionary {
+        if let Ok(text) = std::fs::read_to_string(dict_path) {
+            editor.dictionary = text.lines().map(|l| l.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        }
+    }
 
     // Recovery-on-open (§5.1).
     // Named files: use assess() with content-hash comparison.
@@ -1105,6 +1245,19 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
 
     // Warm the pandoc probe cache so the first export command doesn't pay latency.
     let _ = crate::export::probe_pandoc();
+
+    // Warm Harper's FstDictionary LazyLock off the critical path so the first
+    // real diagnostics check isn't ~11s. Fire-and-forget; discard the result.
+    if editor.diag_cfg.enabled {
+        std::thread::Builder::new()
+            .name("wcartel-diag-warm".into())
+            .spawn(|| {
+                let ignore = std::collections::HashSet::new();
+                let opts = wordcartel_core::diagnostics::CheckOpts { grammar: false, ignore_words: &ignore };
+                let _ = wordcartel_core::diagnostics::check("", &opts);
+            })
+            .expect("spawn diag warmup thread");
+    }
 
     let reg = Registry::builtins();
     // Build the keymap from the loaded config and surface any warnings.
@@ -1212,18 +1365,23 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
         } else {
             None
         };
-        let deadline = match (swap_deadline, sq_deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
+        // Fix A3: include the diagnostics deadline ONLY when no check is in
+        // flight.  When a check is in flight, recheck_due_at may be a past
+        // timestamp (armed before the check started), which would drive
+        // recv_timeout(0) → 100% CPU spin until the worker completes.
+        // When the result lands it clears in_flight_version; the next
+        // iteration will re-include the (re-armed) deadline and dispatch.
+        let diag_deadline = if editor.active().diagnostics.in_flight_version.is_none() {
+            editor.active().diagnostics.recheck_due_at
+        } else {
+            None
         };
-        let deadline = match (deadline, sb_deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
+        let deadline = crate::diagnostics_run::next_deadline(&[
+            swap_deadline,
+            sq_deadline,
+            sb_deadline,
+            diag_deadline,
+        ]);
         let timeout = deadline
             .map(|d| std::time::Duration::from_millis(d.saturating_sub(now)))
             .unwrap_or(std::time::Duration::from_secs(3600));
@@ -2788,5 +2946,217 @@ mod tests {
         r(&mut e, press(KeyCode::Enter, KeyModifiers::ALT));
         r(&mut e, press(KeyCode::Char('!'), KeyModifiers::NONE));      // finish all remaining
         assert_eq!(e.active().document.buffer.snapshot().to_string(), "b b b\n");
+    }
+
+    #[test]
+    fn diagnostics_done_applies_only_for_current_version() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        let bid = e.active().id;
+        let v = e.active().document.version;
+        let diag = vec![wordcartel_core::diagnostics::Diagnostic {
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            message: "misspelled".into(),
+            suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] }];
+        // current version → stored
+        crate::diagnostics_run::apply_diagnostics_done(&mut e, bid, v, diag.clone());
+        assert_eq!(e.active().diagnostics.diagnostics.len(), 1);
+        assert_eq!(e.active().diagnostics.computed_version, v);
+        // stale version → discarded
+        crate::diagnostics_run::apply_diagnostics_done(&mut e, bid, v.wrapping_sub(1), diag);
+        assert_eq!(e.active().diagnostics.diagnostics.len(), 1, "stale result must not overwrite");
+    }
+
+    #[test]
+    fn tick_dispatches_a_due_check_once() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("teh\n", None, (80, 24));
+        e.diag_cfg.enabled = true;
+        e.active_mut().diagnostics.arm(0, 400); // due at 400
+        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(500); // past due
+        // a Tick at now=500 with diagnostics enabled dispatches one check
+        crate::app::reduce(Msg::Tick, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().diagnostics.in_flight_version, Some(e.active().document.version));
+        // the spawned worker sends a DiagnosticsDone
+        match rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap() {
+            Msg::DiagnosticsDone { diagnostics, .. } => assert!(diagnostics.iter().any(|d| d.kind == wordcartel_core::diagnostics::DiagnosticKind::Spelling)),
+            o => panic!("expected DiagnosticsDone, got {o:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 6 (Effort 5f): quick-fix overlay tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn quick_fix_applies_suggestion_as_undoable_edit() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        let v = e.active().document.version;
+        e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(),
+            suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] }];
+        e.active_mut().diagnostics.computed_version = v;
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1); // cursor inside "teh"
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let press = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(press(KeyCode::Char('.'), KeyModifiers::CONTROL)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert!(e.diag.is_some(), "Ctrl+. opens the quick-fix overlay on the diagnostic");
+        crate::app::reduce(Msg::Input(press(KeyCode::Enter, KeyModifiers::NONE)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.snapshot().to_string(), "the cat\n");
+        assert!(e.diag.is_none(), "overlay closes after apply");
+        assert!(e.active_mut().undo(), "the fix is one undo unit");
+        assert_eq!(e.active().document.buffer.snapshot().to_string(), "teh cat\n");
+    }
+
+    #[test]
+    fn open_diag_clears_siblings_and_open_others_clear_diag() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        let d = wordcartel_core::diagnostics::Diagnostic { range: 0..1, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(), suggestions: vec![] };
+        // open_diag clears a previously-open palette/search (reverse XOR direction)
+        e.open_palette();
+        assert!(e.palette.is_some(), "palette open before open_diag");
+        e.open_diag(d.clone());
+        assert!(e.palette.is_none(), "open_diag clears palette");
+        assert!(e.diag.is_some());
+        // the other direction: opening the palette clears an open diag overlay
+        e.open_palette();
+        assert!(e.diag.is_none(), "open_palette clears diag");
+    }
+
+    /// Regression: quick_fix dispatched after an edit (when valid_for is false) must
+    /// NOT open the overlay and must NOT corrupt the buffer. Before the fix the
+    /// handlers read stale diagnostic byte ranges unchecked.
+    #[test]
+    fn quick_fix_on_stale_diagnostics_is_noop_no_overlay() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        let v = e.active().document.version;
+        // Store a diagnostic at version V.
+        e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(),
+            suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] }];
+        e.active_mut().diagnostics.computed_version = v;
+        // Simulate an intervening edit: bump the document version so valid_for is now false.
+        e.active_mut().document.version = v + 1;
+        assert!(!e.active().diagnostics.valid_for(e.active().document.version),
+            "precondition: diagnostics must be stale after version bump");
+        let buf_before = e.active().document.buffer.to_string();
+        // Place cursor inside the stale diagnostic range.
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let ctrl_dot = Event::Key(KeyEvent { code: KeyCode::Char('.'), modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(ctrl_dot), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        // The overlay must NOT open and the buffer must be unchanged.
+        assert!(e.diag.is_none(), "stale diagnostics: quick_fix must NOT open the overlay");
+        assert_eq!(e.active().document.buffer.to_string(), buf_before, "buffer must be unchanged");
+    }
+
+    #[test]
+    fn diag_next_prev_move_caret_with_wrap() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("teh cat adn dog\n", None, (80, 24));
+        let v = e.active().document.version;
+        e.active_mut().diagnostics.diagnostics = vec![
+            wordcartel_core::diagnostics::Diagnostic { range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message:"x".into(), suggestions: vec![] },
+            wordcartel_core::diagnostics::Diagnostic { range: 8..11, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message:"x".into(), suggestions: vec![] },
+        ];
+        e.active_mut().diagnostics.computed_version = v;
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(0);
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let f8 = Event::Key(KeyEvent { code: KeyCode::F(8), modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(f8.clone()), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.selection.primary().to(), 8, "F8 moves to the next diagnostic");
+        crate::app::reduce(Msg::Input(f8), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.selection.primary().to(), 0, "F8 wraps to the first");
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix A3: no busy-loop while a diagnostics check is in flight
+    // -----------------------------------------------------------------------
+
+    /// When `in_flight_version` is set, the diagnostics deadline must be
+    /// excluded from the loop's `next_deadline` call.  This is a pure logic
+    /// test of the gating condition, validated without touching the real loop.
+    #[test]
+    fn diag_deadline_excluded_when_in_flight() {
+        use crate::diagnostics_run::{DiagStore, next_deadline};
+        // Build a store that has a past-due recheck_due_at AND an in-flight version.
+        let mut store = DiagStore::new();
+        store.recheck_due_at = Some(0); // past due
+        store.in_flight_version = Some(5); // check is in flight
+
+        // Compute the diag_deadline using the same gating logic as the run() loop.
+        let diag_deadline = if store.in_flight_version.is_none() {
+            store.recheck_due_at
+        } else {
+            None
+        };
+
+        // With no other deadlines, the computed deadline should be None (not 0),
+        // so recv_timeout gets a long duration instead of 0 ms.
+        let deadline = next_deadline(&[None, None, None, diag_deadline]);
+        assert_eq!(deadline, None,
+            "when in_flight, diag_deadline must be None so the loop does not spin");
+
+        // Sanity: without in-flight, the past-due timestamp IS included.
+        // temporarily clear in_flight to test the other branch
+        let saved = store.in_flight_version.take();
+        let diag_deadline_no_flight = if store.in_flight_version.is_none() {
+            store.recheck_due_at
+        } else {
+            None
+        };
+        let deadline_no_flight = next_deadline(&[None, None, None, diag_deadline_no_flight]);
+        assert_eq!(deadline_no_flight, Some(0),
+            "without in_flight, past-due recheck_due_at is included in the deadline");
+        store.in_flight_version = saved; // restore
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix A4: stale quick-fix overlay must not apply
+    // -----------------------------------------------------------------------
+
+    /// If the buffer is mutated while the diag overlay is open, pressing Enter
+    /// must NOT apply the (now-stale) suggestion.  The overlay must be closed
+    /// and the buffer left unchanged.
+    #[test]
+    fn quick_fix_refuses_stale_apply_after_concurrent_edit() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        let v = e.active().document.version;
+        // Arm valid diagnostics at version V and open the overlay.
+        e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(),
+            suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] }];
+        e.active_mut().diagnostics.computed_version = v;
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let press = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        // Open the overlay.
+        crate::app::reduce(Msg::Input(press(KeyCode::Char('.'), KeyModifiers::CONTROL)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert!(e.diag.is_some(), "overlay must open");
+        assert_eq!(e.diag.as_ref().unwrap().opened_version, v, "opened_version captured at open");
+        // Simulate a concurrent edit while the overlay is open: bump the document version.
+        e.active_mut().document.version += 1;
+        let buf_before = e.active().document.buffer.to_string();
+        // Press Enter — must be refused because opened_version != current version.
+        crate::app::reduce(Msg::Input(press(KeyCode::Enter, KeyModifiers::NONE)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        // Overlay must be closed and buffer must be unchanged.
+        assert!(e.diag.is_none(), "stale overlay must be closed without applying");
+        assert_eq!(e.active().document.buffer.to_string(), buf_before,
+            "buffer must not be mutated when the overlay is stale");
+        assert!(e.status.contains("changed"), "status must mention the change");
     }
 }

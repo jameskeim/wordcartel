@@ -28,3 +28,5 @@ pub mod menu;
 pub mod marks;
 pub mod mouse;
 pub mod search_overlay;
+pub mod diagnostics_run;
+pub mod diag_overlay;

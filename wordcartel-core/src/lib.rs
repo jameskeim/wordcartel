@@ -10,6 +10,7 @@ pub mod history;
 pub mod register;
 pub mod selection;
 
+pub mod diagnostics;
 pub mod layout;
 pub mod md_parse;
 pub mod search;
