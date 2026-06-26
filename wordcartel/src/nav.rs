@@ -402,25 +402,30 @@ pub fn ensure_visible(editor: &mut Editor) {
     if editor.view_opts.typewriter {
         let edit_height = (editor.active().view.area.1 as usize).saturating_sub(1);
         if edit_height == 0 { return; }
+        let fv = fold_view(editor);
         let anchor = editor.view_opts.typewriter_anchor.clamp(0.0, 1.0);
         let anchor_row = ((edit_height as f32 * anchor).round() as usize).min(edit_height - 1);
-        // caret's absolute visual row = (visual rows of all logical lines before its line) + its vrow
         let l = caret_line(editor);
         let cvr = caret_visual_row(editor, l);
-        let mut caret_abs = cvr;
         let text_width = text_geometry(editor).text_width as usize;
-        for li in 0..l { caret_abs += typewriter_rows_of_line(editor, li, text_width); }
-        // desired viewport-top absolute visual row
-        let target_top = caret_abs.saturating_sub(anchor_row);
-        // convert target_top → (scroll, scroll_row), walking logical lines
-        let mut acc = 0usize; let mut scroll = 0usize; let mut scroll_row = 0usize;
-        let total = derive::total_logical_lines(&editor.active().document.buffer);
-        'outer: for li in 0..total {
-            let rows = rows_of_line(editor, li);
-            if acc + rows > target_top { scroll = li; scroll_row = target_top - acc; break 'outer; }
-            acc += rows; scroll = li; scroll_row = rows.saturating_sub(1);
+        // caret absolute visual row: sum rows of VISIBLE lines before `l` only.
+        let mut caret_abs = cvr;
+        let mut cursor = l;
+        while let Some(p) = fv.prev_visible(cursor) {
+            caret_abs += typewriter_rows_of_line(editor, p, text_width);
+            cursor = p;
         }
-        editor.active_mut().view.scroll = scroll;
+        let target_top = caret_abs.saturating_sub(anchor_row);
+        // convert target_top -> (scroll, scroll_row) walking VISIBLE lines.
+        let mut acc = 0usize; let mut scroll = 0usize; let mut scroll_row = 0usize;
+        let mut vline = Some(0usize);
+        while let Some(li) = vline {
+            let rows = rows_of_line(editor, li);
+            if acc + rows > target_top { scroll = li; scroll_row = target_top - acc; break; }
+            acc += rows; scroll = li; scroll_row = rows.saturating_sub(1);
+            vline = fv.next_visible(li);
+        }
+        editor.active_mut().view.scroll = fv.normalize_line(scroll);
         editor.active_mut().view.scroll_row = scroll_row;
         return;
     }
@@ -441,11 +446,23 @@ pub fn ensure_visible(editor: &mut Editor) {
         editor.active_mut().view.scroll_row = scroll_rows.saturating_sub(1);
     }
 
+    // 5g: normalize current scroll so it is always a visible line.
+    {
+        let fv = fold_view(editor);
+        let s = editor.active().view.scroll;
+        let ns = fv.normalize_line(s);
+        if ns != s {
+            editor.active_mut().view.scroll = ns;
+            editor.active_mut().view.scroll_row = 0;
+        }
+    }
+
     let cvr = caret_visual_row(editor, l);
 
     // If caret is above the scroll, scroll up to caret line
     if l < editor.active().view.scroll || (l == editor.active().view.scroll && cvr < editor.active().view.scroll_row) {
-        editor.active_mut().view.scroll = l;
+        let fv = fold_view(editor);
+        editor.active_mut().view.scroll = fv.normalize_line(l);
         editor.active_mut().view.scroll_row = cvr;
         return;
     }
@@ -455,7 +472,8 @@ pub fn ensure_visible(editor: &mut Editor) {
     }
 
     let Some(mut rows_before) = rows_before_caret(editor, l, cvr) else {
-        editor.active_mut().view.scroll = l;
+        let fv = fold_view(editor);
+        editor.active_mut().view.scroll = fv.normalize_line(l);
         editor.active_mut().view.scroll_row = cvr;
         return;
     };
@@ -522,9 +540,13 @@ fn rows_before_caret(editor: &Editor, caret_line: usize, caret_vrow: usize) -> O
         return caret_vrow.checked_sub(scroll_row);
     }
 
+    let fv = fold_view(editor);
     let mut rows_before = rows_of_line(editor, scroll).saturating_sub(scroll_row);
-    for line_idx in (scroll + 1)..caret_line {
+    let mut li = fv.next_visible(scroll);
+    while let Some(line_idx) = li {
+        if line_idx >= caret_line { break; }
         rows_before += rows_of_line(editor, line_idx);
+        li = fv.next_visible(line_idx);
     }
     Some(rows_before + caret_vrow)
 }
@@ -532,11 +554,17 @@ fn rows_before_caret(editor: &Editor, caret_line: usize, caret_vrow: usize) -> O
 fn advance_view_top_one_row(editor: &mut Editor, max_scroll: usize) {
     let rows = rows_of_line(editor, editor.active().view.scroll);
     editor.active_mut().view.scroll_row += 1;
-    if editor.active().view.scroll_row >= rows && editor.active().view.scroll < max_scroll {
-        editor.active_mut().view.scroll += 1;
-        editor.active_mut().view.scroll_row = 0;
-    } else if editor.active().view.scroll_row >= rows {
-        editor.active_mut().view.scroll_row = rows.saturating_sub(1);
+    if editor.active().view.scroll_row >= rows {
+        let fv = fold_view(editor);
+        match fv.next_visible(editor.active().view.scroll) {
+            Some(nl) if editor.active().view.scroll < max_scroll => {
+                editor.active_mut().view.scroll = nl;
+                editor.active_mut().view.scroll_row = 0;
+            }
+            _ => {
+                editor.active_mut().view.scroll_row = rows.saturating_sub(1);
+            }
+        }
     }
 }
 
@@ -554,11 +582,13 @@ pub fn scroll_up_one(editor: &mut Editor) {
     if scroll_row > 0 {
         editor.active_mut().view.scroll_row = scroll_row - 1;
     } else if scroll > 0 {
-        let prev = scroll - 1;
-        let rows = rows_of_line(editor, prev); // immutable borrow ends here
-        let v = &mut editor.active_mut().view;
-        v.scroll = prev;
-        v.scroll_row = rows.saturating_sub(1);
+        let fv = fold_view(editor);
+        if let Some(prev) = fv.prev_visible(scroll) {
+            let rows = rows_of_line(editor, prev);
+            let v = &mut editor.active_mut().view;
+            v.scroll = prev;
+            v.scroll_row = rows.saturating_sub(1);
+        }
     }
 }
 
@@ -1172,6 +1202,67 @@ mod tests {
 
         let pos = screen_pos(&e);
         assert!(pos.is_some(), "caret on wrapped line should be visible");
+    }
+
+    // ------------------------------------------------------------------
+    // Task 7 (Effort 5g): fold-aware scroll/viewport
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn ensure_visible_never_pins_scroll_to_hidden_line() {
+        let doc = "# Top\nintro\n## A\nb1\nb2\nb3\n## B\ntail\n";
+        let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 3));
+        ed.active_mut().folds.toggle(doc.find("## A").unwrap());
+        crate::derive::rebuild(&mut ed);
+        // caret on tail
+        let tail = doc.find("tail").unwrap();
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(tail);
+        crate::nav::ensure_visible(&mut ed);
+        let fv = {
+            let b = ed.active();
+            crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer)
+        };
+        assert!(!fv.is_hidden(ed.active().view.scroll));
+    }
+
+    #[test]
+    fn scroll_down_one_steps_over_hidden_lines() {
+        let doc = "# Top\nintro\n## A\nb1\nb2\n## B\ntail\n";
+        let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 24));
+        ed.active_mut().folds.toggle(doc.find("## A").unwrap());
+        crate::derive::rebuild(&mut ed);
+        ed.active_mut().view.scroll = 2;    // ## A
+        ed.active_mut().view.scroll_row = 0;
+        crate::nav::scroll_down_one(&mut ed);
+        // next visible after line 2 is line 5 (## B), not hidden body lines 3/4.
+        assert_eq!(ed.active().view.scroll, 5);
+    }
+
+    #[test]
+    fn page_down_skips_folded_section() {
+        let doc = "# Top\nintro\n## A\nb1\nb2\nb3\nb4\n## B\ntail\n";
+        let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 4));
+        ed.active_mut().folds.toggle(doc.find("## A").unwrap());
+        crate::derive::rebuild(&mut ed);
+        let top = doc.find("# Top").unwrap();
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(top);
+        let landed = crate::nav::move_page_down(&mut ed);
+        let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer) };
+        assert!(!fv.is_hidden(ed.active().document.buffer.byte_to_line(landed)));
+    }
+
+    #[test]
+    fn typewriter_scroll_is_visible_under_folds() {
+        let doc = "# Top\nintro\n## A\nb1\nb2\nb3\n## B\nt1\nt2\nt3\n";
+        let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 6));
+        ed.view_opts.typewriter = true; // view_opts is on Editor, not Buffer
+        ed.active_mut().folds.toggle(doc.find("## A").unwrap());
+        crate::derive::rebuild(&mut ed);
+        let t2 = doc.find("t2").unwrap();
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(t2);
+        crate::nav::ensure_visible(&mut ed);
+        let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer) };
+        assert!(!fv.is_hidden(ed.active().view.scroll));
     }
 
     // ------------------------------------------------------------------
