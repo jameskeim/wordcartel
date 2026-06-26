@@ -6,7 +6,7 @@
 
 **Architecture:** Match-finding is a new IO-free `wordcartel-core::search` module (`regex-cursor` over the rope; oracle-tested vs the `regex` crate). The shell adds a `SearchState` overlay (XOR with prompt/palette/menu/minibuffer) holding a **version-keyed match cache**, a `reduce()` interception branch, a search bar + a `ColMap`-projected highlight layer in `render.rs`, and a multi-op replace path reusing the existing `editor.apply` commit contract.
 
-**Tech Stack:** Rust, `ropey =1.6.1`, `regex-cursor` + `regex-automata` (new core deps), `ratatui`, `crossterm`.
+**Tech Stack:** Rust, `ropey =1.6.1`, `regex-cursor` (feature `ropey`) + `regex-automata` + `regex-syntax` (new core deps), `ratatui`, `crossterm`. Search engine = `regex_cursor::engines::meta::Regex` over a `RopeyCursor`; capture interpolation = `regex_automata::meta::Regex` over the materialized matched region.
 
 ## Global Constraints
 
@@ -21,7 +21,9 @@
 - **Zero-width matches** advance to the **next UTF-8 char boundary** (≥1 byte, never mid-codepoint).
 - **Match cache** keyed by `(needle, mode, case, buffer.version)`; highlight/count/next/prev read the cache. Full-scan count; cap deferred.
 - **Overlay XOR is not centralized** — every `open_*` clears `search`; `open_search` clears all siblings + `pending_keys` + `pending_mark` (spec §3.3).
-- **Search keys are config-driven:** register the **commands**, bind them in `input::key_to_command_id` AND the CUA preset in `keymap.rs`. A preset that rebinds a key (WordStar `ctrl-f`) shadowing search is expected.
+- **Search keys are config-driven:** register the **commands**; bind them in the **CUA preset table in `keymap.rs`** (the production path — `reduce()` resolves chords through the keymap trie). `input::key_to_command_id` is `#[cfg(test)]`-only; mirror the binds there solely to keep the existing mapping tests consistent. A preset that rebinds a key (WordStar `ctrl-f`) shadowing search is expected.
+- **Engine types (Codex Critical):** search = `regex_cursor::{Input, RopeyCursor, engines::meta::Regex}` (NOT `regex_automata::Input`/`meta::Regex`, which are byte-slice-only); literal escape = `regex_syntax::escape`; capture interpolation = `regex_automata::meta::Regex` over the materialized matched region.
+- **Task 7 is conditional:** ship interactive query-replace only if Tasks 1–6 land clean; otherwise defer to 5e-r and ship find + replace-all.
 - **Default-off / inactive = true no-op:** when `editor.search` is `None`, render and reduce behave exactly as today (existing tests stay green).
 - Commit trailers on every commit:
   ```
@@ -36,7 +38,7 @@
 
 | File | Change | Responsibility |
 |------|--------|----------------|
-| `wordcartel-core/Cargo.toml` | Modify | add `regex-cursor`, `regex-automata` deps |
+| `wordcartel-core/Cargo.toml` | Modify | add `regex-cursor` (feature `ropey`), `regex-automata`, `regex-syntax` deps; `regex` dev-dep (oracle) |
 | `wordcartel-core/src/lib.rs` | Modify | `pub mod search;` |
 | `wordcartel-core/src/search.rs` | **Create** | `compile`, `all_matches`, `find_next`, `expand_replacement`; `Matcher`, `Match`, `QueryMode`, `CaseMode`, `CompileError`. Oracle-tested. |
 | `wordcartel/src/search_overlay.rs` | **Create** | `SearchState` (fields, phase/field enums), version-keyed match cache, field editing, `recompute`, `current`/`count`/`next`/`prev` helpers. |
@@ -47,6 +49,32 @@
 | `wordcartel/src/app.rs` | Modify | `reduce()` search-overlay interception branch; clear `search` on buffer-swap/click-outside. |
 | `wordcartel/src/render.rs` | Modify | search bar (status row) + `ColMap`-projected highlight layer. |
 | `wordcartel/src/commands.rs` | Modify | `build_multi_replace` (multi-op ChangeSet + covering Edit). |
+| `wordcartel/src/mouse.rs` | Modify | click-outside arms (~100/126) also clear `editor.search`. |
+| `wordcartel/src/save.rs` | Modify | `reload_from_disk`/`load_recovered` clear `editor.search`. |
+
+---
+
+## Prior Art / Reference Implementations (Codex plan review)
+
+Mirror these well-used implementations rather than inventing — they solve the
+exact problems 5e faces:
+
+- **`regex-cursor` docs.rs example** — the canonical `RopeyCursor::at(slice, from)`
+  + `Input::new(cursor).range(from..end)` + `Regex::find(input)` shape. Task 1's
+  `next_from` follows it directly. <https://docs.rs/regex-cursor/latest/regex_cursor/>
+- **CodeMirror 6 `@codemirror/search`** (`src/search.ts`) — closest UI-model match:
+  a `SearchQuery` value, decorations recomputed on doc/selection/viewport change,
+  highlight restricted to the visible range, and `replaceAll`. Our version-keyed
+  match cache + viewport-projected highlight is the same shape.
+- **Emacs `replace.el` `perform-replace`** — the reference state machine for
+  interactive query-replace: `y`/`n`/`!`/`q` dispatch, advancing point past each
+  replacement, and **re-searching forward on the mutated buffer**. Task 7 mirrors
+  this; Codex confirmed our "re-find on the mutated rope per `y`" is exactly what
+  Emacs and Helix do — a precomputed match-list-with-offset-remap is more complex,
+  saves nothing at our doc sizes, and risks stale-offset bugs. **Do not adopt it.**
+- **Helix** — reference for rope + transaction editing patterns (its `ChangeSet`
+  lineage is the one `wordcartel-core::change` already follows). Its search UI
+  predates the author's own `regex-cursor`, so it is not a cursor-search example.
 
 ---
 
@@ -77,9 +105,11 @@
 
 In `wordcartel-core/Cargo.toml` under `[dependencies]`:
 ```toml
-regex-cursor = "0.1"
+regex-cursor = { version = "0.1", features = ["ropey"] }   # ropey feature gates RopeyCursor
 regex-automata = "0.4"
+regex-syntax = "0.8"                                        # for escape() (literal mode)
 ```
+> **Codex Critical:** `RopeyCursor` is behind `regex-cursor`'s **`ropey` feature** — a bare `"0.1"` omits it and `RopeyCursor` won't exist. `regex_automata::util::escape` does **not** exist in 0.4; the real escaper is `regex_syntax::escape`.
 
 - [ ] **Step 2: Build gate — prove it compiles against the pinned rope**
 
@@ -200,9 +230,13 @@ regex = "1"
 //! search iteration is allocation-free; only `expand_replacement` (Task 2) may
 //! materialize the single matched region. Oracle-tested vs the `regex` crate.
 use ropey::Rope;
-use regex_automata::meta::Regex;
-use regex_automata::Input;
-use regex_cursor::RopeyCursor;
+// SEARCH engine: cursor-streamed over the rope (Codex Critical — these are the
+// regex-CURSOR types, NOT regex-automata's byte-slice Input/Regex).
+use regex_cursor::{Input as CursorInput, RopeyCursor};
+use regex_cursor::engines::meta::Regex as CursorRegex;
+// CAPTURE engine: regex-automata's meta::Regex, used by expand_replacement
+// (Task 2) over a MATERIALIZED &str region (regex-cursor has no captures path).
+use regex_automata::meta::Regex as AutomataRegex;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueryMode { Literal, Regex }
@@ -216,13 +250,15 @@ pub struct CompileError(pub String);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Match { pub start: usize, pub end: usize }
 
-pub struct Matcher { re: Regex }
+/// Holds BOTH engines built from the same resolved pattern: the cursor engine
+/// for rope search, the automata engine for capture interpolation.
+pub struct Matcher { search: CursorRegex, captures: AutomataRegex }
 
-/// Build a matcher. Literal mode escapes the needle. Smart-case resolves to
-/// Insensitive unless `needle` contains an uppercase letter.
+/// Build a matcher. Literal mode escapes the needle (`regex_syntax::escape`).
+/// Smart-case resolves to Insensitive unless `needle` has an uppercase letter.
 pub fn compile(needle: &str, mode: QueryMode, case: CaseMode) -> Result<Matcher, CompileError> {
     let pattern = match mode {
-        QueryMode::Literal => regex_automata::util::escape(needle),
+        QueryMode::Literal => regex_syntax::escape(needle),
         QueryMode::Regex => needle.to_string(),
     };
     let insensitive = match case {
@@ -230,12 +266,11 @@ pub fn compile(needle: &str, mode: QueryMode, case: CaseMode) -> Result<Matcher,
         CaseMode::Sensitive => false,
         CaseMode::Smart => !needle.chars().any(|c| c.is_uppercase()),
     };
-    // (?i) prefix toggles case-insensitivity in regex-automata's meta engine.
+    // (?i) prefix toggles case-insensitivity in both meta engines.
     let full = if insensitive { format!("(?i){pattern}") } else { pattern };
-    let re = Regex::builder()
-        .build(&full)
-        .map_err(|e| CompileError(e.to_string()))?;
-    Ok(Matcher { re })
+    let search = CursorRegex::new(&full).map_err(|e| CompileError(e.to_string()))?;
+    let captures = AutomataRegex::new(&full).map_err(|e| CompileError(e.to_string()))?;
+    Ok(Matcher { search, captures })
 }
 
 /// All non-overlapping matches over the whole rope, left-to-right.
@@ -243,12 +278,15 @@ pub fn all_matches(rope: &Rope, m: &Matcher) -> Vec<Match> {
     let mut out = Vec::new();
     let mut at = 0usize;
     let end = rope.len_bytes();
-    while at <= end {
+    loop {
         match next_from(rope, m, at) {
             Some(mm) => {
+                // Zero-width: advance past the match to the next char boundary so
+                // we never re-find the same empty match (Codex: do NOT clamp back
+                // to len — advance strictly forward).
                 let advance = if mm.end > mm.start { mm.end } else { next_boundary(rope, mm.end) };
                 out.push(mm);
-                if advance <= at { break; } // safety
+                if advance > end || advance <= at { break; }
                 at = advance;
             }
             None => break,
@@ -262,33 +300,30 @@ pub fn find_next(rope: &Rope, m: &Matcher, from: usize) -> Option<Match> {
     next_from(rope, m, from.min(rope.len_bytes()))
 }
 
-// Lowest-level: search the rope starting at byte `from` via a RopeyCursor.
+/// Lowest-level: first match at/after byte `from`, searched via a RopeyCursor.
+/// This mirrors the canonical regex-cursor docs.rs example (see Prior Art).
 fn next_from(rope: &Rope, m: &Matcher, from: usize) -> Option<Match> {
     let cursor = RopeyCursor::at(rope.slice(..), from);
-    let input = Input::new(cursor).span(from..rope.len_bytes());
-    m.re.search_with(&mut regex_automata::util::pool::...) // see note
-        ;
-    // NOTE: the exact regex-cursor call (`regex_cursor::Input` + `m.re.find`) is
-    // settled at Task-1 build time against the resolved crate version; the
-    // contract is: return the first Match at/after `from`, or None. Use
-    // regex-cursor's documented `find`/`search` entry that accepts a RopeyCursor.
+    let input = CursorInput::new(cursor).range(from..rope.len_bytes());
+    m.search.find(input).map(|hit| Match { start: hit.start(), end: hit.end() })
 }
 
-/// Next UTF-8 char boundary strictly after `pos` (for zero-width progress).
+/// Next UTF-8 char boundary strictly after `pos` (zero-width progress).
 fn next_boundary(rope: &Rope, pos: usize) -> usize {
-    if pos >= rope.len_bytes() { return pos + 1; }
+    if pos >= rope.len_bytes() { return rope.len_bytes() + 1; } // forces loop exit
     let ch = rope.byte_to_char(pos);
     let next_char = (ch + 1).min(rope.len_chars());
     rope.char_to_byte(next_char).max(pos + 1)
 }
 ```
 
-> Implementer note: `next_from`'s body is the one place that depends on the
-> resolved `regex-cursor` surface. The build gate (Step 2) fixes the version;
-> wire `RopeyCursor` + `regex_cursor::Input` to `Regex::find` per that version's
-> docs. The **contract and all tests above are fixed**; only the 3-5 lines
-> inside `next_from` adapt to the crate. If the resolved API differs, keep the
-> signature and make the oracle test pass.
+> Implementer note (Codex-corrected API): the search path uses
+> `regex_cursor::{Input, RopeyCursor, engines::meta::Regex}` — **not**
+> `regex_automata::Input`/`meta::Regex`, which are byte-slice-only and cannot
+> take a `RopeyCursor`. `find(input)` returns regex-cursor's match with
+> `.start()`/`.end()`. If the resolved 0.1.x names differ slightly (e.g.
+> `regex.find(input)` vs `regex.find_iter`), keep the `next_from` signature and
+> the fixed tests; adapt only the call. Build gate (Step 2) pins the version.
 
 - [ ] **Step 8: Run tests to verify they pass**
 
@@ -361,24 +396,26 @@ pub fn expand_replacement(rope: &Rope, m: &Matcher, at: &Match, template: &str, 
     if matches!(mode, QueryMode::Literal) {
         return template.to_string();
     }
-    // Materialize ONLY the matched region, re-run in capture mode against it,
-    // and interpolate. Offsets within `region` are match-relative.
+    // Materialize ONLY the matched region, run the AUTOMATA engine in capture
+    // mode against it (regex-cursor has no captures path — Codex Critical), and
+    // interpolate. Offsets within `region` are match-relative.
     let region: String = rope.slice(rope.byte_to_char(at.start)..rope.byte_to_char(at.end)).to_string();
-    let mut caps = m.re.create_captures();
-    m.re.captures(&region, &mut caps);
+    let mut caps = m.captures.create_captures();
+    m.captures.captures(regex_automata::Input::new(region.as_str()), &mut caps);
     let mut dst = String::new();
     caps.interpolate_string_into(&region, template, &mut dst);
     dst
 }
 ```
 
-> Implementer note: `create_captures` / `captures` / `interpolate_string_into`
-> are the `regex-automata` capture+interpolation entry points. If the resolved
-> version names them differently, keep the signature and the three tests; if
-> `regex-cursor` exposes no captures path at all and meta-captures on the
-> region is unavailable, the documented fallback (spec §3.1) is literal-only
-> replacement — implement that and mark the two regex tests `#[ignore]` with a
-> comment citing the gate outcome, then raise it for the review.
+> Implementer note: `m.captures` is the `regex_automata::meta::Regex` built in
+> Task 1's `compile`. `create_captures` / `captures(Input, &mut Captures)` /
+> `interpolate_string_into` are regex-automata 0.4 capture+interpolation entry
+> points over a `&str` (the materialized region). If a name differs in the
+> resolved version, keep the signature and the three tests. If captures prove
+> unavailable, the documented fallback (spec §3.1) is literal-only replacement —
+> implement that, mark the two regex tests `#[ignore]` with a comment citing the
+> gate outcome, and raise it for the review.
 
 - [ ] **Step 4: Run to verify they pass**
 
@@ -694,21 +731,27 @@ r.register("find_next", "Find Next", None, |_c| CommandResult::Handled);
 r.register("find_prev", "Find Previous", None, |_c| CommandResult::Handled);
 ```
 
-- [ ] **Step 2: Bind the keys (both tables)**
+- [ ] **Step 2: Bind the keys in the CUA preset (production path)**
 
-In `input.rs` `key_to_command_id`, in the Ctrl block (near `ctrl-e → filter`):
-```rust
-KeyCode::Char('f') if ctrl => id("find"),
-KeyCode::Char('r') if ctrl => id("replace"),
-KeyCode::F(3) if shift     => id("find_prev"),
-KeyCode::F(3)              => id("find_next"),
-```
-In `keymap.rs`, add to the CUA preset table (mirroring `("ctrl-e","filter")`):
+**Codex Important:** production dispatch is the **keymap trie** populated from the
+CUA preset table in `keymap.rs` (app.rs ~702 resolves chords via `keymap.resolve`);
+`input::key_to_command_id` is `#[cfg(test)]`-only ("Retired from production use").
+So the **binding** goes in the CUA table; mirror it in the test table only to keep
+the existing mapping tests consistent.
+
+In `keymap.rs`, add to the `CUA` preset table (mirroring `("ctrl-e", "filter")`):
 ```rust
 ("ctrl-f", "find"),
 ("ctrl-r", "replace"),
 ("f3", "find_next"),
 ("shift-f3", "find_prev"),
+```
+In `input.rs` `key_to_command_id` (the `#[cfg(test)]` mirror), add the matching arms so the existing translation-table tests stay consistent:
+```rust
+KeyCode::Char('f') if ctrl => id("find"),
+KeyCode::Char('r') if ctrl => id("replace"),
+KeyCode::F(3) if shift     => id("find_prev"),
+KeyCode::F(3)              => id("find_next"),
 ```
 
 - [ ] **Step 3: Write the failing tests**
@@ -814,7 +857,11 @@ fn search_cancel(editor: &mut Editor) {
     crate::nav::ensure_visible(editor);
 }
 ```
-Also: in the buffer-swap path and the mouse click-outside path (where other overlays are cleared), add `editor.search = None;`.
+**Also clear `search` at every state-replacing / overlay-closing site (Codex Important — these are NOT centralized):**
+- `wordcartel/src/mouse.rs:~100` and `:~126` — the click-outside arms that already set `editor.palette = None` / `editor.menu = None`: add `editor.search = None;`.
+- `wordcartel/src/save.rs` `reload_from_disk` (~122) and `load_recovered` (~144) — both replace the active document wholesale: add `editor.search = None;` so a stale overlay can't outlive its buffer.
+- Any active-buffer swap path (if present) — same.
+Add a test asserting `reload_from_disk` clears an open search overlay.
 
 - [ ] **Step 6: Run to verify they pass**
 
@@ -875,7 +922,29 @@ fn highlight_skips_concealed_markers_in_live_preview() {
     assert!(row_has_highlight(&buf, 0));
 }
 ```
-If `row_has_highlight` / `row_string` helpers don't exist, add small ones in the test module that scan the ratatui `Buffer` cells for a non-default bg / collect a row's chars.
+**Codex Important — these helpers do NOT exist yet** (current render tests build row strings inline, render.rs ~466-484). Add them to the `render.rs` test module first:
+```rust
+// Render the editor to a standalone ratatui Buffer for assertions.
+fn render_to_buffer(editor: &crate::editor::Editor, w: u16, h: u16) -> ratatui::buffer::Buffer {
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    // `render` is this module's draw entry; clone editor as the draw needs &Editor.
+    let e = editor.clone();
+    term.draw(|f| super::render(f, &e)).unwrap();
+    term.backend().buffer().clone()
+}
+fn row_string(buf: &ratatui::buffer::Buffer, row: u16) -> String {
+    (0..buf.area.width).map(|x| buf.get(x, row).symbol().to_string()).collect()
+}
+fn row_has_highlight(buf: &ratatui::buffer::Buffer, row: u16) -> bool {
+    use ratatui::style::{Color, Modifier};
+    (0..buf.area.width).any(|x| {
+        let c = buf.get(x, row);
+        c.style().bg == Some(Color::Yellow) || c.style().add_modifier.contains(Modifier::REVERSED)
+    })
+}
+```
+> If `Editor` is not `Clone`, render against a borrowed `&editor` directly — adapt the draw call to `render`'s real signature (check render.rs for the public draw fn name and whether it takes `&Editor` or `&mut`). Keep the three helper contracts.
 
 - [ ] **Step 2: Run to verify they fail**
 
@@ -925,7 +994,11 @@ Add the half-open overlap helper near `row_is_active`:
 ```rust
 pub(crate) fn overlaps(a0: usize, a1: usize, b0: usize, b1: usize) -> bool { a0 < b1 && b0 < a1 }
 ```
-> Note: `row_index` is the position of `vr` within `visual_rows` (track it as the loop enumerates), matching `Placed.row`. `map.placed` for an inactive concealed line omits the `**` markers entirely, so a raw-byte match over `2..6` simply lands on the visible `bold` glyphs — no special-casing.
+> **Notes (Codex Important/Minor):**
+> - `row_index` is the position of `vr` within `visual_rows` (track it as the loop enumerates), matching `Placed.row`.
+> - **Full-list, not viewport-sliced:** test each visible glyph against the **whole cached match list** `s.matches()`, not a `matches_in(lo,hi)` slice. This is what makes **multi-line matches** (a match spanning a `\n`) and **matches that start before the viewport but extend into it** highlight correctly — each logical line independently compares its `line_off + p.src` glyphs against every match. Cost is O(visible glyphs × matches); visible glyphs are bounded by the viewport, fine for v1 (if `matches` is huge, sort once and binary-search the glyph's range — deferred).
+> - **`row_dim` precedence:** focus dimming sets a DarkGray base; the highlight is applied **on top** and **wins** — `is_current` → `REVERSED`, `is_match` → yellow bg + black fg — so matches stay visible even inside a dimmed (out-of-focus) paragraph. Build the base style from `row_dim` first, then override with the highlight, exactly as the code above orders it.
+> - `map.placed` for an inactive concealed line omits the `**` markers entirely, so a raw-byte match over `2..6` simply lands on the visible `bold` glyphs — no special-casing.
 
 - [ ] **Step 4: Implement the search bar (status row)**
 
@@ -956,7 +1029,20 @@ fn format_search_bar(s: &crate::search_overlay::SearchState) -> String {
     }
 }
 ```
-And in the hardware-cursor section, when `editor.search.is_some()` place the caret on the status row at the focused field's caret column (mirror the minibuffer caret math).
+And in the hardware-cursor section, when `editor.search.is_some()` place the caret on the status row. **UTF-8-safe caret math (Codex — under-scoped):** the column is the rendered prefix width plus the **char count** (not byte count) of the focused field up to the caret:
+```rust
+let s = editor.search.as_ref().unwrap();
+let prefix_cols = match s.field {
+    crate::search_overlay::Field::Needle => "Find: ".chars().count(),
+    // Template's prefix is everything the bar prints before "Replace: <here>".
+    crate::search_overlay::Field::Template =>
+        format!("Find: {}  Replace: ", s.needle).chars().count(),
+};
+let caret_cols = s.focused_field()[..s.cursor].chars().count();
+let x = area.x + (prefix_cols + caret_cols) as u16;
+// y = status_row; clamp x to the bar width.
+```
+Add a test that types a multibyte needle (e.g. `café`) and asserts the reported cursor column equals `"Find: ".chars().count() + 4`, not the byte length.
 
 - [ ] **Step 5: Run to verify they pass**
 
@@ -1135,7 +1221,16 @@ git commit -m "feat(search): replace-all — one composed ChangeSet (single undo
 
 ---
 
-## Task 7: Interactive query-replace (stepping)
+## Task 7 (CONDITIONAL): Interactive query-replace (stepping)
+
+> **Scope gate (Codex plan review):** Tasks 1–6 deliver the complete
+> find + highlight + replace-all feature and are the spine. Task 7 (per-match
+> `y`/`n`/`!`/`q` stepping) adds the largest remaining surface for the smallest
+> incremental engine work. **Ship Task 7 only if Tasks 1–6 land clean with all
+> render + replace tests green.** If Task 1's dependency gate or the render
+> highlight proves costlier than budgeted, defer Task 7 to a follow-up (5e-r)
+> and ship 5e as find + replace-all. This is a checkpoint, not an automatic
+> proceed — surface the 1–6 status before starting 7.
 
 **Files:**
 - Modify: `wordcartel/src/app.rs` (Stepping phase: Alt+Enter to start; y/n/!/q)
@@ -1305,3 +1400,24 @@ git commit -m "feat(search): interactive query-replace — y/n/!/q stepping, re-
 **Type consistency:** `Match{start,end}`, `QueryMode`, `CaseMode`, `Matcher` used identically core↔shell; `SearchState` field/method names match across Tasks 3–7 (`matches()`, `matcher()`, `current()`, `cache_invalidate()`, `set_current_at_or_after()`); `build_multi_replace`/`build_range_replace` signatures consistent commands↔app.
 
 **Placeholder scan:** the two `next_from` / `expand_replacement` bodies carry explicit "adapt to the resolved crate version, keep the contract+tests" implementer notes (the regex-cursor surface is version-pinned at the Task-1 gate) — these are bounded, not open-ended TODOs.
+
+## Codex Plan Review — resolutions (round applied to this revision)
+
+Verdict was FIX-PLAN-FIRST (3 Critical, 6 Important). All applied:
+
+| # | Sev | Finding | Resolution |
+|---|-----|---------|------------|
+| 1 | Crit | wrong `Input`/`Regex` types — `regex_automata` can't take a `RopeyCursor` | Task 1 uses `regex_cursor::{Input, RopeyCursor, engines::meta::Regex}` for search; `regex_automata::meta::Regex` only for capture interpolation over the materialized region; `Matcher` holds both |
+| 2 | Crit | `RopeyCursor` behind the `ropey` feature | `regex-cursor = { version="0.1", features=["ropey"] }` |
+| 3 | Crit | `regex_automata::util::escape` doesn't exist | `regex_syntax::escape` (+ `regex-syntax` dep) |
+| 4 | Imp | EOF clamp → zero-width infinite-loop risk | `all_matches` advances strictly forward; `next_boundary` returns `len+1` at EOF to force loop exit |
+| 5 | Imp | `key_to_command_id` is `#[cfg(test)]`-only | bind in the **CUA preset table** (production); mirror in the test table only |
+| 6 | Imp | overlay-clear sites incomplete | clear `search` in `mouse.rs` click-outside + `save.rs` `reload_from_disk`/`load_recovered`; + test |
+| 7 | Imp | render test helpers don't exist | Task 5 writes `render_to_buffer`/`row_string`/`row_has_highlight` first |
+| 8 | Imp | multi-line highlight under-specified | highlight tests each visible glyph against the **full** match list (handles cross-newline + before-viewport matches) |
+| 9 | Min | `row_dim` vs highlight precedence | highlight applied on top of the dim base and **wins** (matches visible in dimmed paragraphs) |
+| — | scope | Task 7 broad | marked **conditional** — ship only if Tasks 1–6 land clean, else defer to 5e-r |
+| — | art | prior art | added Prior Art section (regex-cursor docs, CodeMirror 6, Emacs `perform-replace`); confirmed re-find-on-mutated-rope is correct — do NOT adopt match-list-remap |
+| — | Min | UTF-8 search-bar caret | Task 5 adds char-count (not byte) caret math + a multibyte-needle test |
+
+Confirmed-real-as-written by Codex (no change): ropey 1.6.1 methods, all shell APIs (Selection/Editor/Transaction/TextBuffer/map_pos/Edit), version-keyed cache soundness (`version` bumps on apply/undo/redo), chord-string parseability.
