@@ -360,13 +360,10 @@ mod tests {
         f.toggle(doc.find("# Top").unwrap()); // hides everything from t1 to ## B start; ## A folds a1..a2
         f.toggle(doc.find("## A").unwrap());  // # Top folds t1..##B start; ## A folds a1..a2
         let fv = FoldView::compute(&f, &blocks, &buf);
-        let total = buf.snapshot().len_lines();
         // The union of hidden lines is t1, a1, a2 (## A heading line stays the
         // boundary of # Top's body; ## A's body is inside # Top's body). The merge
         // must count each hidden line once.
-        let hidden_lines = total - fv.visible_count();
-        // visible_count + hidden_lines == total, and no line counted twice:
-        assert!(hidden_lines <= total);
+        assert_eq!(fv.visible_count(), 2, "nested folds must not double-count hidden lines");
         // ordinal round-trips through the merged view
         let vc = fv.visible_count();
         for ord in 0..vc {
