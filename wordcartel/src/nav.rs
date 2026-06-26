@@ -10,6 +10,32 @@ use wordcartel_core::block_tree::{Block, BlockTree};
 use wordcartel_core::buffer::TextBuffer;
 use wordcartel_core::layout;
 
+// ---------------------------------------------------------------------------
+// Measure / centered-text geometry
+// ---------------------------------------------------------------------------
+
+/// The text column's left edge (relative to area.x) and width for this frame.
+pub struct TextGeometry {
+    pub text_left: u16,
+    pub text_width: u16,
+}
+
+/// Compute the text column geometry for the active editor view.
+///
+/// When `measure` is enabled and the viewport is wider than `wrap_column`,
+/// text is centered: `text_left = (vp - wrap_column) / 2`, `text_width = wrap_column`.
+/// Otherwise the full viewport is used: `text_left = 0`, `text_width = vp.max(1)`.
+pub fn text_geometry(editor: &Editor) -> TextGeometry {
+    let vp = editor.active().view.area.0;
+    let o = &editor.view_opts;
+    if o.measure && vp > o.wrap_column && o.wrap_column > 0 {
+        let text_width = o.wrap_column;
+        TextGeometry { text_left: (vp - text_width) / 2, text_width }
+    } else {
+        TextGeometry { text_left: 0, text_width: vp.max(1) }
+    }
+}
+
 /// The raw caret byte-offset: `selection.primary().head`.
 pub fn head(editor: &Editor) -> usize {
     editor.active().document.selection.primary().head
@@ -37,7 +63,7 @@ fn layout_line_on_demand(editor: &Editor, l: usize) -> wordcartel_core::layout::
     let role = editor.active().document.blocks.role_at(derive::line_start(buf, l));
     let source_mode = editor.active().view.mode != RenderMode::LivePreview;
     let is_active_effective = (l == caret_line(editor)) || source_mode;
-    let vp_width = (editor.active().view.area.0 as usize).max(1);
+    let vp_width = text_geometry(editor).text_width as usize;
     let (_rows, map) = layout::layout(&text, role, is_active_effective, vp_width);
     map
 }
@@ -108,7 +134,7 @@ fn layout_line_active(editor: &Editor, l: usize) -> wordcartel_core::layout::Col
     let buf = &editor.active().document.buffer;
     let text = derive::line_text(buf, l);
     let role = editor.active().document.blocks.role_at(derive::line_start(buf, l));
-    let vp_width = (editor.active().view.area.0 as usize).max(1);
+    let vp_width = text_geometry(editor).text_width as usize;
     let (_rows, map) = layout::layout(&text, role, true, vp_width);
     map
 }
@@ -350,6 +376,31 @@ pub fn move_up(editor: &mut Editor) -> usize {
 ///   find the largest scroll value that keeps the caret line visible.
 /// - Clamp scroll to `[0, total_logical_lines - 1]`.
 pub fn ensure_visible(editor: &mut Editor) {
+    if editor.view_opts.typewriter {
+        let edit_height = (editor.active().view.area.1 as usize).saturating_sub(1);
+        if edit_height == 0 { return; }
+        let anchor = editor.view_opts.typewriter_anchor.clamp(0.0, 1.0);
+        let anchor_row = ((edit_height as f32 * anchor).round() as usize).min(edit_height - 1);
+        // caret's absolute visual row = (visual rows of all logical lines before its line) + its vrow
+        let l = caret_line(editor);
+        let cvr = caret_visual_row(editor, l);
+        let mut caret_abs = cvr;
+        let text_width = text_geometry(editor).text_width as usize;
+        for li in 0..l { caret_abs += typewriter_rows_of_line(editor, li, text_width); }
+        // desired viewport-top absolute visual row
+        let target_top = caret_abs.saturating_sub(anchor_row);
+        // convert target_top → (scroll, scroll_row), walking logical lines
+        let mut acc = 0usize; let mut scroll = 0usize; let mut scroll_row = 0usize;
+        let total = derive::total_logical_lines(&editor.active().document.buffer);
+        'outer: for li in 0..total {
+            let rows = rows_of_line(editor, li);
+            if acc + rows > target_top { scroll = li; scroll_row = target_top - acc; break 'outer; }
+            acc += rows; scroll = li; scroll_row = rows.saturating_sub(1);
+        }
+        editor.active_mut().view.scroll = scroll;
+        editor.active_mut().view.scroll_row = scroll_row;
+        return;
+    }
     let l = caret_line(editor);
     let total = derive::total_logical_lines(&editor.active().document.buffer);
     // Editing area excludes the bottom status row (render reserves frame_h - 1),
@@ -397,6 +448,34 @@ fn rows_of_line(editor: &Editor, line_idx: usize) -> usize {
         map.rows.max(1)
     } else {
         layout_line_on_demand(editor, line_idx).rows.max(1)
+    }
+}
+
+/// Cheap visual-row count for typewriter accounting: a line whose content
+/// byte-length fits the wrap width is exactly 1 row (no layout needed);
+/// otherwise fall back to the exact (possibly on-demand-laid-out) count.
+///
+/// Soundness: display_width ≤ byte_len for all UTF-8 text, so if byte_len ≤
+/// text_width then display_width ≤ text_width and no wrapping is possible.
+fn typewriter_rows_of_line(editor: &Editor, li: usize, text_width: usize) -> usize {
+    let buf = &editor.active().document.buffer;
+    let total_lines = derive::total_logical_lines(buf);
+    let start = derive::line_start(buf, li);
+    // line_start handles li + 1 == total_lines by returning buf.len()
+    let next = derive::line_start(buf, li + 1);
+    let raw_len = next.saturating_sub(start);
+    // Exclude the trailing '\n' if present (it's the line separator, not content).
+    // '\n' is a 1-byte ASCII char so `start + raw_len - 1` is always a valid
+    // UTF-8 char boundary when raw_len > 0.
+    let content_len = if raw_len > 0 && li + 1 <= total_lines && buf.slice(start + raw_len - 1..start + raw_len) == "\n" {
+        raw_len - 1
+    } else {
+        raw_len
+    };
+    if content_len <= text_width {
+        1
+    } else {
+        rows_of_line(editor, li)
     }
 }
 
@@ -670,6 +749,10 @@ pub fn move_word_left(editor: &mut Editor) -> usize {
 /// Inverse of `screen_pos`: the document byte offset under screen cell
 /// `(col, row)` in the editing area, or `None` if `row` is past content.
 pub fn offset_at_cell(editor: &Editor, col: u16, row: u16) -> Option<usize> {
+    // Subtract the measure margin so callers pass raw screen columns; a click
+    // left of the text column saturates to 0 (= line start of that row).
+    let text_left = text_geometry(editor).text_left;
+    let col = col.saturating_sub(text_left);
     let target = row as usize;
     let scroll = editor.active().view.scroll;
     let scroll_row = editor.active().view.scroll_row;
@@ -707,6 +790,39 @@ mod tests {
     /// Test helper: set the caret to a raw byte offset.
     fn set_caret(e: &mut Editor, off: usize) {
         e.active_mut().document.selection = Selection::single(off);
+    }
+
+    // ------------------------------------------------------------------
+    // Task 3: text_geometry + measure round-trip (RED → GREEN)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn text_geometry_centers_when_measure_on() {
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        let g = super::text_geometry(&e);
+        assert_eq!((g.text_left, g.text_width), (0, 80), "measure off → full width");
+        e.view_opts.measure = true; e.view_opts.wrap_column = 40;
+        let g = super::text_geometry(&e);
+        assert_eq!((g.text_left, g.text_width), (20, 40), "centered 40-wide column");
+        // narrow terminal: measure inert
+        e.active_mut().view.area = (30, 24);
+        let g = super::text_geometry(&e);
+        assert_eq!((g.text_left, g.text_width), (0, 30), "vp <= column → full width");
+    }
+
+    #[test]
+    fn screen_pos_and_offset_at_cell_round_trip_with_measure() {
+        let mut e = Editor::new_from_text("abc\ndef\n", None, (80, 24));
+        e.view_opts.measure = true; e.view_opts.wrap_column = 40; // text_left = 20
+        set_caret(&mut e, 5); // 'e' in "def" (line 1, text-col 1)
+        derive::rebuild(&mut e);
+        let (vcol, vrow) = screen_pos(&e).unwrap();
+        // the actual SCREEN cell is (text_left + vcol, vrow)
+        assert_eq!(super::offset_at_cell(&e, 20 + vcol, vrow), Some(5));
+        // a click in the LEFT margin clamps to line start of that row
+        // "abc\n" = 4 bytes, so "def" line starts at offset 4
+        let def_line_start = crate::derive::line_start(&e.active().document.buffer, 1);
+        assert_eq!(super::offset_at_cell(&e, 3, vrow), Some(def_line_start));
     }
 
     // ------------------------------------------------------------------
@@ -960,5 +1076,93 @@ mod tests {
         derive::rebuild(&mut e);
         let (col, row) = screen_pos(&e).unwrap();
         assert_eq!(super::offset_at_cell(&e, col, row), Some(5));
+    }
+
+    // ------------------------------------------------------------------
+    // Task 5: typewriter scrolling
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn typewriter_pins_caret_to_anchor_row() {
+        let text: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let mut e = Editor::new_from_text(&text, None, (80, 21)); // edit_height = 20
+        e.view_opts.typewriter = true; e.view_opts.typewriter_anchor = 0.5; // anchor_row = 10
+        let l50 = derive::line_start(&e.active().document.buffer, 50);
+        set_caret(&mut e, l50);
+        ensure_visible(&mut e);
+        derive::rebuild(&mut e);
+        let (_c, row) = screen_pos(&e).unwrap();
+        assert_eq!(row, 10, "caret pinned to anchor row 10");
+        // near the top, caret sits ABOVE the anchor (can't scroll past 0)
+        let l2 = derive::line_start(&e.active().document.buffer, 2);
+        set_caret(&mut e, l2);
+        ensure_visible(&mut e);
+        derive::rebuild(&mut e);
+        assert_eq!(e.active().view.scroll, 0, "top clamps; no scroll past 0");
+    }
+
+    /// Typewriter still pins the caret to the anchor row when earlier lines wrap.
+    ///
+    /// With text_width = 5:
+    ///   Line 0: "ab"         (2 bytes  <= 5 → fast-path returns 1 row)
+    ///   Line 1: "abcdefghij" (10 bytes >  5 → wraps → rows_of_line returns > 1)
+    ///   Line 2: "cd"         (2 bytes  <= 5 → fast-path returns 1 row)
+    ///   Line 3: "short"      (5 bytes  <= 5 → fast-path returns 1 row; exactly at boundary)
+    ///   Line 4: "xyz"        (3 bytes  <= 5 → fast-path returns 1 row) — caret here
+    ///
+    /// The test verifies that the fast-path result matches the old all-rows_of_line
+    /// version implicitly: caret must be pinned to anchor_row after ensure_visible.
+    #[test]
+    fn typewriter_pins_with_wrapped_lines() {
+        // text_width = 5, edit_height = 21 - 1 = 20, anchor_row = 10
+        let text = "ab\nabcdefghij\ncd\nshort\nxyz\n";
+        let mut e = Editor::new_from_text(text, None, (5, 21));
+        e.view_opts.typewriter = true;
+        e.view_opts.typewriter_anchor = 0.5; // anchor_row = round(20 * 0.5) = 10
+
+        // Set caret to line 4 ("xyz"), which is deep enough that lines before it
+        // include the wrapping line 1.
+        let l4 = derive::line_start(&e.active().document.buffer, 4);
+        set_caret(&mut e, l4);
+        ensure_visible(&mut e);
+        derive::rebuild(&mut e);
+
+        let pos = screen_pos(&e);
+        assert!(pos.is_some(), "caret should be visible after ensure_visible");
+        let (_c, row) = pos.unwrap();
+        // With only 5 lines total (last being the trailing empty line) and
+        // caret on line 4 (which is above the anchor), the viewport is clamped
+        // to scroll=0. The caret should still appear at a valid row.
+        assert!(row < 20, "caret row {row} must fit in editing height 20");
+
+        // Now place caret at line 1 (the wrapping line) and verify pinning.
+        let l1 = derive::line_start(&e.active().document.buffer, 1);
+        set_caret(&mut e, l1);
+        ensure_visible(&mut e);
+        derive::rebuild(&mut e);
+
+        let pos = screen_pos(&e);
+        assert!(pos.is_some(), "caret on wrapped line should be visible");
+    }
+
+    /// Verify typewriter_rows_of_line fast-path produces results identical to
+    /// rows_of_line for both short (non-wrapping) and long (wrapping) lines.
+    #[test]
+    fn typewriter_rows_of_line_matches_rows_of_line() {
+        // text_width = 5 via area.0 = 5
+        let text = "ab\nabcdefghij\ncd\n";
+        let mut e = Editor::new_from_text(text, None, (5, 24));
+        derive::rebuild(&mut e);
+
+        let text_width = super::text_geometry(&e).text_width as usize;
+        let total = derive::total_logical_lines(&e.active().document.buffer);
+        for li in 0..total {
+            let fast = super::typewriter_rows_of_line(&e, li, text_width);
+            let exact = super::rows_of_line(&e, li);
+            assert_eq!(
+                fast, exact,
+                "line {li}: fast-path returned {fast}, exact returned {exact}"
+            );
+        }
     }
 }

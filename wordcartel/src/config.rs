@@ -35,6 +35,29 @@ pub struct Config {
     pub keymap: KeymapConfig,
     pub state: StateConfig,
     pub mouse: MouseConfig,
+    pub view: ViewConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusGranularity { Paragraph, Sentence }
+
+#[derive(Debug, Clone)]
+pub struct ViewConfig {
+    pub typewriter: bool,
+    pub typewriter_anchor: f32,
+    pub focus: bool,
+    pub focus_granularity: FocusGranularity,
+    pub measure: bool,
+    pub wrap_column: u16,
+    pub wrap_guide: bool,
+    pub word_count: bool,
+}
+impl Default for ViewConfig {
+    fn default() -> Self {
+        ViewConfig { typewriter: false, typewriter_anchor: 0.5, focus: false,
+            focus_granularity: FocusGranularity::Paragraph, measure: false,
+            wrap_column: 80, wrap_guide: false, word_count: false }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +112,7 @@ struct RawConfig {
     keymap: RawKeymap,
     state: RawState,
     mouse: RawMouse,
+    view: RawView,
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -107,6 +131,18 @@ struct RawState {
 #[serde(default)]
 struct RawMouse {
     capture: Option<bool>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawView {
+    typewriter: Option<bool>,
+    typewriter_anchor: Option<f32>,
+    focus: Option<bool>,
+    focus_granularity: Option<String>,
+    measure: Option<bool>,
+    wrap_column: Option<u16>,
+    wrap_guide: Option<bool>,
+    word_count: Option<bool>,
 }
 
 /// Ordered existing config files, lowest→highest precedence. Empty when --no-config.
@@ -185,6 +221,29 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
         if let Some(c) = raw.mouse.capture {
             cfg.mouse.mouse_capture = c;
         }
+        // view: per-field override + validation.
+        if let Some(v) = raw.view.typewriter { cfg.view.typewriter = v; }
+        if let Some(v) = raw.view.focus { cfg.view.focus = v; }
+        if let Some(v) = raw.view.measure { cfg.view.measure = v; }
+        if let Some(v) = raw.view.wrap_guide { cfg.view.wrap_guide = v; }
+        if let Some(v) = raw.view.word_count { cfg.view.word_count = v; }
+        if let Some(a) = raw.view.typewriter_anchor {
+            if (0.0..=1.0).contains(&a) { cfg.view.typewriter_anchor = a; }
+            else { cfg.view.typewriter_anchor = a.clamp(0.0, 1.0);
+                   warns.push(format!("view.typewriter_anchor {a} out of 0.0..=1.0; clamped")); }
+        }
+        if let Some(c) = raw.view.wrap_column {
+            if c >= 20 { cfg.view.wrap_column = c; }
+            else { cfg.view.wrap_column = 20;
+                   warns.push(format!("view.wrap_column {c} below min 20; clamped to 20")); }
+        }
+        if let Some(g) = raw.view.focus_granularity {
+            match g.as_str() {
+                "paragraph" => cfg.view.focus_granularity = FocusGranularity::Paragraph,
+                "sentence"  => cfg.view.focus_granularity = FocusGranularity::Sentence,
+                other => warns.push(format!("view.focus_granularity \"{other}\" invalid; using paragraph")),
+            }
+        }
     }
     (cfg, warns)
 }
@@ -253,6 +312,26 @@ mod tests {
         let (cfg, warns) = load(&[bad]);
         assert_eq!(warns.len(), 1, "one warning for the bad layer");
         assert_eq!(cfg.state.max_entries, 200, "fell back to default");
+    }
+
+    #[test]
+    fn view_config_parses_and_validates() {
+        let toml = r#"
+            [view]
+            measure = true
+            wrap_column = 5
+            typewriter_anchor = 1.5
+            focus_granularity = "bogus"
+        "#;
+        let d = tempdir();
+        let path = write(&d, "view.toml", toml);
+        let (cfg, warnings) = load(&[path]);
+        assert!(cfg.view.measure);
+        assert_eq!(cfg.view.wrap_column, 20, "wrap_column clamped to min 20");
+        assert_eq!(cfg.view.typewriter_anchor, 1.0, "anchor clamped to <=1.0");
+        assert_eq!(cfg.view.focus_granularity, FocusGranularity::Paragraph, "bad granularity -> default");
+        assert!(warnings.iter().any(|w| w.contains("wrap_column")));
+        assert!(warnings.iter().any(|w| w.contains("focus_granularity")));
     }
 
     // tiny temp-dir helper (unique; avoids real $HOME)

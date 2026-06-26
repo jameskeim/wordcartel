@@ -169,6 +169,8 @@ pub struct Editor {
     pub mouse_capture: bool,
     /// Transient mouse gesture state; cleared by `reconcile_mouse_capture` on disable.
     pub mouse: MouseState,
+    /// View/focus/writing-experience flags. Seeded from config; toggled by the 5 toggle_ commands.
+    pub view_opts: crate::config::ViewConfig,
 }
 
 impl Editor {
@@ -202,6 +204,7 @@ impl Editor {
             menu: None,
             mouse_capture: true,
             mouse: MouseState::default(),
+            view_opts: crate::config::ViewConfig::default(),
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer {

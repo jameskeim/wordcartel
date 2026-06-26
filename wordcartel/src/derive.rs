@@ -112,11 +112,11 @@ pub fn rebuild(editor: &mut Editor) {
     // ------------------------------------------------------------------
     // Snapshot all read-only scalar values from the active buffer before any
     // mutable borrow, so the borrow checker sees no overlap.
-    let (total_lines, active_line, area_width, area_height, first_line, source_mode) = {
+    let (total_lines, active_line, area_height, first_line, source_mode, scroll_row) = {
         let b = editor.active();
         let buf = &b.document.buffer;
         let total_lines = total_logical_lines(buf);
-        let (area_width, area_height) = (b.view.area.0 as usize, b.view.area.1 as usize);
+        let area_height = b.view.area.1 as usize;
         let caret_byte = b.document.selection.primary().head;
         let active_line = if buf.len() == 0 {
             0
@@ -125,12 +125,16 @@ pub fn rebuild(editor: &mut Editor) {
         };
         let first_line = b.view.scroll.min(total_lines.saturating_sub(1));
         let source_mode = b.view.mode != RenderMode::LivePreview;
-        (total_lines, active_line, area_width, area_height, first_line, source_mode)
+        let scroll_row = b.view.scroll_row;
+        (total_lines, active_line, area_height, first_line, source_mode, scroll_row)
     };
-    let vp_width = area_width.max(1);
+    // Use the shared geometry helper so rebuild, render, and nav all agree on width.
+    // text_geometry returns an owned value; the immutable borrow ends here, before
+    // the later active_mut() calls.
+    let vp_width = crate::nav::text_geometry(editor).text_width as usize;
 
     let mut visual_rows_accumulated: usize = 0;
-    let overscan_budget = area_height.saturating_add(1);
+    let overscan_budget = area_height.saturating_add(scroll_row).saturating_add(1);
 
     // Clear the old cache and fill for the visible range.
     editor.active_mut().view.line_layouts.clear();
@@ -327,5 +331,60 @@ mod tests {
         rebuild(&mut e);
         assert!(e.active().pre_edit_rope.is_none(), "pre_edit_rope should be cleared after rebuild");
         assert!(e.active().last_edit.is_none(), "last_edit should be cleared after rebuild");
+    }
+
+    // ------------------------------------------------------------------
+    // Overscan budget accounts for scroll_row (no blank bottom rows).
+    // ------------------------------------------------------------------
+
+    /// Regression test for the overscan-budget bug: when the viewport is
+    /// partially scrolled into the first logical line (`scroll_row > 0`),
+    /// the layout cache must still cover all editing rows.
+    ///
+    /// Setup:
+    ///   area = (20, 6), scroll_row = 2
+    ///   Line 0: 21 chars → wraps to 2 visual rows at width 20 (= scroll_row)
+    ///   Lines 1-7: 1 char each → 1 visual row each
+    ///
+    /// OLD budget = area_height + 1 = 7.  Loop caches lines 0-5 (sum = 7).
+    ///   sum_cached - scroll_row = 5 < area_height (6).  RED.
+    ///
+    /// NEW budget = area_height + scroll_row + 1 = 9.  Loop caches lines 0-7
+    ///   (sum = 9).  sum_cached - scroll_row = 7 >= area_height (6).  GREEN.
+    #[test]
+    fn rebuild_fills_editing_rows_when_top_line_wrapped() {
+        // Line 0: 21-char plain line → 2 visual rows at width 20.
+        // Lines 1-7: 1-char plain lines → 1 visual row each.
+        let text = "abcdefghijklmnopqrstu\na\nb\nc\nd\ne\nf\ng\n";
+        let mut e = Editor::new_from_text(text, None, (20, 6));
+        // Cursor at byte 0 → line 0 is active (raw layout, 2 rows).
+        e.active_mut().document.selection =
+            wordcartel_core::selection::Selection::single(0);
+        // Simulate a partial scroll into line 0: 2 visual rows of line 0 are
+        // above the top of the viewport.
+        e.active_mut().view.scroll = 0;
+        e.active_mut().view.scroll_row = 2;
+
+        rebuild(&mut e);
+
+        let area_height = e.active().view.area.1 as usize; // 6
+        let scroll_row = e.active().view.scroll_row;       // 2
+
+        // Sum the visual-row counts of all cached lines.
+        let sum_cached: usize = e
+            .active()
+            .view
+            .line_layouts
+            .values()
+            .map(|(rows, _)| rows.len())
+            .sum();
+
+        assert!(
+            sum_cached.saturating_sub(scroll_row) >= area_height,
+            "cache covers only {} rows after skipping scroll_row={}; need >= {} (area_height)",
+            sum_cached,
+            scroll_row,
+            area_height,
+        );
     }
 }

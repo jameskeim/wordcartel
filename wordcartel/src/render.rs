@@ -1,7 +1,8 @@
 // Task 5: ratatui live-preview render + status line.
 // Pure: takes &Editor, mutates NOTHING on the editor.
 
-use crate::{editor::Editor, nav};
+use crate::{derive, editor::Editor, nav};
+use wordcartel_core::count;
 use ratatui::{
     layout::{Position, Rect},
     style::{Color, Modifier, Style as RStyle},
@@ -10,6 +11,14 @@ use ratatui::{
     Frame,
 };
 use wordcartel_core::style::Style;
+
+/// Half-open interval intersection: is the row's global byte range active?
+///
+/// Returns `true` if the row's span `[row_from, row_to)` overlaps with the
+/// active region `[region_from, region_to)` (any overlap → bright).
+pub(crate) fn row_is_active(row_from: usize, row_to: usize, region_from: usize, region_to: usize) -> bool {
+    row_from < region_to && region_from < row_to
+}
 
 /// Map a wordcartel inline `Style` to a ratatui `Style`.
 ///
@@ -90,6 +99,28 @@ pub(crate) fn palette_row_at(area: Rect, palette: &crate::palette::Palette, col:
     }
 }
 
+/// Return a word/char count segment for the status bar, or `None` if the
+/// feature is disabled (`view_opts.word_count = false`).
+///
+/// When the primary selection is non-empty, counts only the selected text;
+/// otherwise counts the whole document buffer.
+pub(crate) fn word_count_segment(editor: &Editor) -> Option<String> {
+    if !editor.view_opts.word_count {
+        return None;
+    }
+    let sel = editor.active().document.selection.primary();
+    let text = if !sel.is_empty() {
+        editor.active().document.buffer.slice(sel.from()..sel.to())
+    } else {
+        editor.active().document.buffer.to_string()
+    };
+    Some(format!(
+        "{} words · {} chars",
+        count::word_count(&text),
+        count::char_count(&text)
+    ))
+}
+
 /// Paint the viewport + status line to `frame` using `editor` state.
 ///
 /// The editor is borrowed mutably so stateful overlay widgets can update their
@@ -129,6 +160,50 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     let scroll = editor.active().view.scroll;
     let mut screen_row: u16 = 0;
 
+    // Centered-measure geometry: ONE call here so paint + cursor never desync.
+    let tg = crate::nav::text_geometry(editor);
+
+    // -----------------------------------------------------------------------
+    // Wrap-guide line (painted BEFORE the text-row loop so text overwrites it)
+    // -----------------------------------------------------------------------
+    if editor.view_opts.wrap_guide {
+        let gx = area.x + tg.text_left + editor.view_opts.wrap_column;
+        let within_viewport = gx < area.x + w;
+        let not_scrollbar_col = !(editor.mouse.scrollbar_visible && gx == area.x + w - 1);
+        if within_viewport && not_scrollbar_col {
+            let guide_style = RStyle::default().fg(Color::DarkGray);
+            for r in 0..edit_height {
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled("│", guide_style))),
+                    Rect::new(gx, edit_top + r, 1, 1),
+                );
+            }
+        }
+    }
+
+    // Compute the active focus region once (before the row loop) when focus is on.
+    // For Paragraph: use paragraph_range_at at the caret.
+    // For Sentence: scope paragraph_range_at first, then sentence_bounds within that window.
+    let focus_region: Option<(usize, usize)> = if editor.view_opts.focus {
+        let buf = &editor.active().document.buffer;
+        let blocks = &editor.active().document.blocks;
+        let head = nav::head(editor);
+        let region = match editor.view_opts.focus_granularity {
+            crate::config::FocusGranularity::Paragraph => {
+                nav::paragraph_range_at(blocks, buf, head)
+            }
+            crate::config::FocusGranularity::Sentence => {
+                let (ps, pe) = nav::paragraph_range_at(blocks, buf, head);
+                let win = buf.slice(ps..pe);
+                let (sf, st) = wordcartel_core::textobj::sentence_bounds(&win, head - ps);
+                (ps + sf, ps + st)
+            }
+        };
+        Some(region)
+    } else {
+        None
+    };
+
     // Collect sorted logical line indices from the layout cache.
     let mut sorted_lines: Vec<usize> = editor.active().view.line_layouts.keys().copied().collect();
     sorted_lines.sort_unstable();
@@ -147,24 +222,36 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             if screen_row >= edit_height {
                 break 'outer;
             }
+
+            // Determine whether this visual row is dim (outside the active region).
+            let row_dim = if let Some((from, to)) = focus_region {
+                let buf = &editor.active().document.buffer;
+                let line_off = derive::line_start(buf, l);
+                let g_from = line_off + vr.src_span.start;
+                let g_to = line_off + vr.src_span.end;
+                !row_is_active(g_from, g_to, from, to)
+            } else {
+                false
+            };
+
             // Build spans for this visual row.
             let mut spans: Vec<Span<'_>> = Vec::new();
 
+            // One span per StyledSeg — apply DarkGray dim when row is outside active region.
+            let dim_style = RStyle::default().fg(Color::DarkGray);
+
             // Prepend prefix_glyph as a dim span (first visual row only).
             if let Some(ref glyph) = vr.prefix_glyph {
-                spans.push(Span::styled(
-                    glyph.clone(),
-                    RStyle::default().add_modifier(Modifier::DIM),
-                ));
+                let gstyle = if row_dim { dim_style } else { RStyle::default().add_modifier(Modifier::DIM) };
+                spans.push(Span::styled(glyph.clone(), gstyle));
             }
-
-            // One span per StyledSeg.
             for seg in &vr.segs {
-                spans.push(Span::styled(seg.text.clone(), style_to_ratatui(seg.style)));
+                let style = if row_dim { dim_style } else { style_to_ratatui(seg.style) };
+                spans.push(Span::styled(seg.text.clone(), style));
             }
 
             let line_widget = Line::from(spans);
-            let row_area = Rect::new(area.x, edit_top + screen_row, w, 1);
+            let row_area = Rect::new(area.x + tg.text_left, edit_top + screen_row, tg.text_width, 1);
             frame.render_widget(Paragraph::new(line_widget), row_area);
 
             screen_row += 1;
@@ -227,8 +314,24 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             (text, RStyle::default().add_modifier(Modifier::REVERSED))
         };
 
-        // Truncate to fit the terminal width.
-        let truncated: String = status_text.chars().take(w as usize).collect();
+        // Compose the status line.
+        // When in the normal branch (no prompt/minibuffer) and word_count is on,
+        // flush the count segment to the right and truncate the left (path/mode) to fit.
+        let has_overlay = editor.minibuffer.is_some() || editor.prompt.is_some();
+        let composed = if !has_overlay {
+            if let Some(right) = word_count_segment(editor) {
+                let reserve = right.chars().count() + 1;
+                let left: String = status_text.chars().take((w as usize).saturating_sub(reserve)).collect();
+                let pad = (w as usize).saturating_sub(left.chars().count() + right.chars().count());
+                format!("{left}{}{right}", " ".repeat(pad))
+            } else {
+                status_text.chars().take(w as usize).collect()
+            }
+        } else {
+            status_text.chars().take(w as usize).collect()
+        };
+        // Truncate the composed string to the terminal width (guard for very narrow terminals).
+        let truncated: String = composed.chars().take(w as usize).collect();
         let status_line = Line::from(Span::styled(truncated, status_style));
         let status_area = Rect::new(area.x, status_row, w, 1);
         frame.render_widget(Paragraph::new(status_line), status_area);
@@ -249,8 +352,8 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         }
     } else if let Some((col, row)) = nav::screen_pos(editor) {
         // Guard: only set if within the editing area (not into the status line).
-        if row < edit_height && col < w {
-            frame.set_cursor_position(Position { x: area.x + col, y: edit_top + row });
+        if row < edit_height && col < tg.text_width {
+            frame.set_cursor_position(Position { x: area.x + tg.text_left + col, y: edit_top + row });
         }
     }
 
@@ -471,6 +574,21 @@ mod tests {
         assert!(crate::nav::screen_pos(&e).is_some());
     }
 
+    #[test]
+    fn wrap_guide_column_position() {
+        // measure off, wrap_guide on, column 40, viewport 80 → guide at screen col 40
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.view_opts.wrap_guide = true; e.view_opts.wrap_column = 40;
+        let tg = crate::nav::text_geometry(&e);
+        let gx = tg.text_left + e.view_opts.wrap_column;
+        assert_eq!(gx, 40);
+        assert!(gx < e.active().view.area.0, "guide within viewport");
+        // measure on, column 40, viewport 80 → text_left 20, guide at 60 (right edge)
+        e.view_opts.measure = true;
+        let tg = crate::nav::text_geometry(&e);
+        assert_eq!(tg.text_left + e.view_opts.wrap_column, 60);
+    }
+
     /// palette_overlay_rect sizes height to the actual row count, not fixed-15.
     #[test]
     fn palette_overlay_rect_sizes_to_row_count() {
@@ -481,5 +599,34 @@ mod tests {
         // 30 rows → list_h capped at 15, ov_h=15+3=18
         let r30 = palette_overlay_rect(area, 30);
         assert_eq!(r30.height, 18, "30 rows: expected height 18 (15 capped + 3 chrome)");
+    }
+
+    #[test]
+    fn focus_active_region_is_paragraph_at_caret() {
+        let mut e = Editor::new_from_text("Para one.\n\nPara two.\n\nThree.\n", None, (80, 24));
+        e.view_opts.focus = true; // paragraph default
+        set_caret(&mut e, 12); // inside "Para two."
+        derive::rebuild(&mut e);
+        // the active region used by render = paragraph_range_at at the caret
+        let buf = &e.active().document.buffer; let blocks = &e.active().document.blocks;
+        let (from, to) = crate::nav::paragraph_range_at(blocks, buf, 12);
+        assert_eq!(buf.slice(from..to).trim(), "Para two.");
+        // a row whose global src span is outside [from,to) is dimmed; inside is bright.
+        // (assert the helper render uses to decide, not pixels — see Step 3 for the fn)
+        assert!(!crate::render::row_is_active(0, "Para one.".len(), from, to), "para one dimmed");
+        assert!(crate::render::row_is_active(from, to, from, to), "active row bright");
+    }
+
+    #[test]
+    fn word_count_segment_selection_aware() {
+        let mut e = Editor::new_from_text("alpha beta gamma\n", None, (80, 24));
+        e.view_opts.word_count = true;
+        // whole doc: 3 words, 17 chars (including trailing \n)
+        assert_eq!(crate::render::word_count_segment(&e), Some("3 words · 17 chars".to_string()));
+        // select "alpha" → 1 word, 5 chars
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::range(0, 5);
+        assert_eq!(crate::render::word_count_segment(&e), Some("1 words · 5 chars".to_string()));
+        e.view_opts.word_count = false;
+        assert_eq!(crate::render::word_count_segment(&e), None);
     }
 }
