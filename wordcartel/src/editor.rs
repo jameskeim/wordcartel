@@ -77,6 +77,8 @@ pub struct Buffer {
     pub sel_history: Vec<wordcartel_core::selection::Selection>,
     // 5f: per-buffer diagnostics store
     pub diagnostics: crate::diagnostics_run::DiagStore,
+    // 5g: per-buffer fold state
+    pub folds: crate::fold::FoldState,
 }
 
 impl Buffer {
@@ -231,6 +233,7 @@ impl Editor {
             pending_swap_body: None, pending_swap_path: None,
             marks: Default::default(), jump_ring: Vec::new(), ring_cursor: 0, sel_history: Vec::new(),
             diagnostics: crate::diagnostics_run::DiagStore::new(),
+            folds: crate::fold::FoldState::default(),
         });
         e
     }
