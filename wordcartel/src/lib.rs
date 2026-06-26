@@ -27,3 +27,4 @@ pub mod palette;
 pub mod menu;
 pub mod marks;
 pub mod mouse;
+pub mod search_overlay;

@@ -171,6 +171,8 @@ pub struct Editor {
     pub mouse: MouseState,
     /// View/focus/writing-experience flags. Seeded from config; toggled by the 5 toggle_ commands.
     pub view_opts: crate::config::ViewConfig,
+    /// Search/replace overlay state. XOR with prompt/minibuffer/palette/menu.
+    pub search: Option<crate::search_overlay::SearchState>,
 }
 
 impl Editor {
@@ -205,6 +207,7 @@ impl Editor {
             mouse_capture: true,
             mouse: MouseState::default(),
             view_opts: crate::config::ViewConfig::default(),
+            search: None,
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer {
@@ -241,6 +244,7 @@ impl Editor {
         self.pending_mark = None;
         self.palette = None;
         self.menu = None;
+        self.search = None;
         self.minibuffer = Some(crate::minibuffer::Minibuffer {
             prompt: prompt.into(),
             text: String::new(),
@@ -258,6 +262,7 @@ impl Editor {
         self.menu = None;
         self.pending_keys.clear();
         self.pending_mark = None;
+        self.search = None;
         self.prompt = Some(p);
     }
 
@@ -271,7 +276,19 @@ impl Editor {
         self.menu = None;
         self.pending_keys.clear();
         self.pending_mark = None;
+        self.search = None;
         self.palette = Some(crate::palette::Palette::default());
+    }
+
+    /// Open the search overlay, enforcing single-overlay XOR invariant.
+    ///
+    /// Clears `prompt`, `minibuffer`, `palette`, `menu`, and `pending_keys` before opening.
+    /// At most one of {prompt, minibuffer, palette, menu, search} is ever active at once.
+    pub fn open_search(&mut self, phase: crate::search_overlay::Phase, origin: usize) {
+        self.prompt = None; self.minibuffer = None; self.palette = None; self.menu = None;
+        self.pending_keys.clear(); self.pending_mark = None;
+        let bid = self.active().id;
+        self.search = Some(crate::search_overlay::SearchState::open(phase, origin, bid));
     }
 
     // Thin delegators — external callers unchanged.
@@ -455,5 +472,16 @@ mod tests {
         });
         e.open_minibuffer("> ");
         assert!(e.pending_keys.is_empty(), "opening the minibuffer must clear a pending key sequence");
+    }
+
+    #[test]
+    fn open_search_clears_siblings_and_open_others_clear_search() {
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.open_minibuffer("> ");
+        e.open_search(crate::search_overlay::Phase::Find, 0);
+        assert!(e.search.is_some() && e.minibuffer.is_none() && e.prompt.is_none()
+                && e.palette.is_none() && e.menu.is_none());
+        e.open_palette();
+        assert!(e.search.is_none(), "open_palette must clear search");
     }
 }
