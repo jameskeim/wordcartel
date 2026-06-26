@@ -81,6 +81,18 @@ fn map_pos_before_keeps_anchor_before_insertion() {
     let csd = ChangeSet::delete(2..4, buf.len());
     assert_eq!(map_pos_before(3, &csd), 2);
     assert_eq!(map_pos_before(5, &csd), 3);
+    // REPLACE 2..4 with "XY": an anchor at byte 4 (right edge of the replace =
+    // the next heading start) must map AFTER the new text (4), NOT back onto it.
+    // Build the real Retain,Delete,Insert,Retain shape the shell emits.
+    let cs_rep = ChangeSet {
+        ops: vec![Op::Retain(2), Op::Delete(2), Op::Insert("XY".into()), Op::Retain(2)],
+        len_before: buf.len(),
+        len_after: buf.len(),
+    };
+    assert_eq!(map_pos_before(4, &cs_rep), 4); // not 2
+    // a PURE insert at a mid-doc boundary still stays before
+    let cs_mid = ChangeSet::insert(4, "Q", buf.len());
+    assert_eq!(map_pos_before(4, &cs_mid), 4);
 }
 ```
 
@@ -91,34 +103,40 @@ Expected: FAIL — `cannot find function map_pos_before`.
 
 - [ ] **Step 3: Implement `map_pos_before`**
 
-Add directly below `map_pos`. The ONLY difference from `map_pos` is an explicit Before guard on the `Insert` arm: when the position sits exactly at the current boundary (`pos == old`), return `new` BEFORE adding the insert length, so an insertion at the anchor stays in front of it. (A leading `Insert` at offset 0 has no preceding `Retain` to catch `pos == 0`, which is exactly the case the naive `<=`-on-Retain version got wrong — it mapped `0 → 1`.)
+Add directly below `map_pos`. The before-bias applies ONLY to a *pure* insertion at the anchor — an insertion that follows a non-empty deletion ending at the anchor (a REPLACE, op shape `Retain, Delete, Insert, Retain`) must let the position advance past the inserted text exactly like `map_pos`, or a fold anchor at the next heading start gets pulled backward onto the replacement text. So the `Insert` guard fires only when `pos == old` AND the immediately preceding op was not a delete consuming up to `old`. (A leading `Insert` at offset 0 still returns 0; `map_pos`'s naive `<=`-on-Retain version got that wrong with `0 → 1`.)
 
 ```rust
 /// Map one byte position through a ChangeSet with insertion bias = Before.
-/// A position sitting exactly at an insertion point stays BEFORE the inserted
-/// text (the opposite of `map_pos`). Used for fold anchors at heading starts:
-/// inserting text at the heading's first byte must not push the anchor into the
-/// body. Deletion behaviour matches `map_pos` (a position inside a deletion
-/// clamps to the deletion start).
+/// A position sitting exactly at a PURE insertion point stays BEFORE the
+/// inserted text (the opposite of `map_pos`). Used for fold anchors at heading
+/// starts: inserting text at the heading's first byte must not push the anchor
+/// into the body. An insertion that follows a deletion ending at the anchor (a
+/// replace) behaves like `map_pos` — the anchor advances past the new text.
+/// Deletion behaviour matches `map_pos` (a position inside a deletion clamps to
+/// the deletion start).
 pub fn map_pos_before(pos: usize, cs: &ChangeSet) -> usize {
     let mut old = 0usize;
     let mut new = 0usize;
+    let mut prev_was_delete = false; // did the previous op delete up to `old`?
     for op in &cs.ops {
         match op {
             Op::Retain(n) => {
                 if pos < old + n { return new + (pos - old); }
                 old += n; new += n;
+                prev_was_delete = false;
             }
             Op::Insert(s) => {
-                // Before bias: a position exactly at the insertion point stays
-                // in front of the inserted text. (map_pos omits this guard, so a
-                // boundary position is carried past the insert = After bias.)
-                if pos == old { return new; }
+                // Before bias for a PURE insertion at the anchor only. After a
+                // delete-to-here (replace), fall through so `pos` advances past
+                // the inserted text (matches map_pos).
+                if pos == old && !prev_was_delete { return new; }
                 new += s.len();
+                prev_was_delete = false;
             }
             Op::Delete(n) => {
                 if pos < old + n { return new; }
                 old += n;
+                prev_was_delete = true;
             }
         }
     }
@@ -386,24 +404,49 @@ pub fn heading_starts(blocks: &BlockTree, rope: &Rope) -> BTreeSet<usize> {
     ordered(blocks, rope).into_iter().map(|h| h.byte).collect()
 }
 
-/// The foldable BODY range of the heading at `heading_byte`: from the start of
-/// the first line AFTER the heading's own line(s) to the section end. The
-/// heading's line(s) stay visible — for a setext heading this correctly leaves
-/// BOTH the title and the underline visible (body starts after `heading.end`),
-/// fixing the off-by-one that `byte_to_line(heading_byte) + 1` would cause.
-/// Returns an empty range (`start == end`) when the section has no body.
-/// The single source of body-start math for `FoldState`/`normalize_caret`/
-/// `unfold_ancestors_of`.
-pub fn body_range(blocks: &BlockTree, rope: &Rope, heading_byte: usize) -> Range<usize> {
+/// A heading paired with its foldable body byte-range.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Section {
+    pub heading: Heading,
+    /// Body range: first line AFTER the heading's own line(s) .. section end.
+    /// Empty (`start == end`) when the section has no body.
+    pub body: Range<usize>,
+}
+
+/// All sections in document order, each with its body range — computed in ONE
+/// pass over the heading list. This is the per-frame-friendly batch API used by
+/// `FoldView::compute`/`FoldState::hidden_byte_ranges`; it avoids the
+/// O(folds × headings) blow-up of calling `body_range` per folded anchor.
+pub fn sections(blocks: &BlockTree, rope: &Rope) -> Vec<Section> {
     let hs = ordered(blocks, rope);
-    let Some(h) = hs.iter().find(|h| h.byte == heading_byte) else {
-        return heading_byte..heading_byte;
-    };
-    let section_end = section_range(blocks, rope, heading_byte).end;
-    // First line strictly after the heading's last own line.
-    let heading_last_line = rope.byte_to_line(h.end.saturating_sub(1).max(h.byte));
-    let body_start = rope.line_to_byte(heading_last_line + 1).min(section_end);
-    body_start..section_end
+    let doc_end = rope.len_bytes();
+    let mut out = Vec::with_capacity(hs.len());
+    for (i, h) in hs.iter().enumerate() {
+        // section end = next heading with level <= this level, else doc end.
+        let section_end = hs[i + 1..]
+            .iter()
+            .find(|n| n.level <= h.level)
+            .map(|n| n.byte)
+            .unwrap_or(doc_end);
+        // body begins on the first line strictly after the heading's last own
+        // line (h.end-1's line). Correct for ATX (1 line) and setext (2 lines).
+        let heading_last_line = rope.byte_to_line(h.end.saturating_sub(1).max(h.byte));
+        let body_start = rope.line_to_byte(heading_last_line + 1).min(section_end);
+        out.push(Section { heading: h.clone(), body: body_start..section_end });
+    }
+    out
+}
+
+/// The foldable BODY range of the heading at `heading_byte`. Single source of
+/// body-start math for the COLD paths (`normalize_caret`/`unfold_ancestors_of`/
+/// `hidden_count_lines`). For the per-frame path, use `sections` once instead.
+/// Returns an empty range when `heading_byte` isn't a heading or has no body.
+pub fn body_range(blocks: &BlockTree, rope: &Rope, heading_byte: usize) -> Range<usize> {
+    sections(blocks, rope)
+        .into_iter()
+        .find(|s| s.heading.byte == heading_byte)
+        .map(|s| s.body)
+        .unwrap_or(heading_byte..heading_byte)
 }
 ```
 
@@ -613,8 +656,21 @@ mod tests {
         assert!(fv.is_hidden(2));
         assert!(fv.is_hidden(3));
         // a caret in the hidden body normalizes to the TITLE line (0), not the
-        // underline line (1).
+        // underline line (1) — owner is the heading's own line.
         assert_eq!(fv.normalize_line(2), 0);
+    }
+
+    #[test]
+    fn fold_hides_final_body_without_trailing_newline() {
+        // No trailing newline: "## A\nbody" — body is one line with no '\n'.
+        let doc = "## A\nbody";
+        let (blocks, buf) = parse(doc);
+        let mut f = FoldState::default();
+        f.toggle(0);
+        let fv = FoldView::compute(&f, &blocks, &buf);
+        assert!(!fv.is_hidden(0));      // "## A" visible
+        assert!(fv.is_hidden(1));       // "body" hidden (the EOF-safe end-line fix)
+        assert_eq!(hidden_count_lines(&f, &blocks, &buf, 0), 1);
     }
 }
 ```
@@ -661,23 +717,17 @@ impl FoldState {
         self.folded.retain(|b| starts.contains(b));
     }
 
-    /// Hidden body ranges in BYTES. For each folded heading still present, hide
-    /// its foldable body (`outline::body_range`), keeping the heading line(s)
-    /// visible. Anchors that aren't heading starts are skipped. The body math
-    /// lives in `outline::body_range` so ATX/setext are handled in one place.
+    /// Hidden body ranges in BYTES. Computed from `outline::sections` in ONE
+    /// pass (no per-anchor recompute): for each section whose heading is folded
+    /// and has a non-empty body, hide the body, keeping the heading line(s)
+    /// visible. Anchors that aren't heading starts are skipped.
     pub fn hidden_byte_ranges(&self, blocks: &BlockTree, buf: &TextBuffer) -> Vec<Range<usize>> {
         let rope = buf.snapshot();
-        let starts = outline::heading_starts(blocks, &rope);
-        let mut out = Vec::new();
-        for &hb in &self.folded {
-            if !starts.contains(&hb) {
-                continue;
-            }
-            let body = outline::body_range(blocks, &rope, hb);
-            if body.start < body.end {
-                out.push(body);
-            }
-        }
+        let mut out: Vec<Range<usize>> = outline::sections(blocks, &rope)
+            .into_iter()
+            .filter(|s| self.folded.contains(&s.heading.byte) && s.body.start < s.body.end)
+            .map(|s| s.body)
+            .collect();
         out.sort_by_key(|r| r.start);
         out
     }
@@ -702,17 +752,21 @@ pub struct FoldView {
 
 impl FoldView {
     pub fn compute(folds: &FoldState, blocks: &BlockTree, buf: &TextBuffer) -> FoldView {
-        let total = buf.snapshot().len_lines();
-        // (body line range, owner heading line) per folded heading.
-        let mut runs: Vec<HiddenRun> = folds
-            .hidden_byte_ranges(blocks, buf)
+        let rope = buf.snapshot();
+        let total = rope.len_lines();
+        // ONE sections pass; owner is the heading's OWN line (correct for setext,
+        // where the heading is two lines and the body starts after the underline).
+        let mut runs: Vec<HiddenRun> = outline::sections(blocks, &rope)
             .into_iter()
-            .filter_map(|r| {
-                let first = buf.byte_to_line(r.start);
-                let last = buf.byte_to_line(r.end); // exclusive boundary line
+            .filter(|s| folds.folded.contains(&s.heading.byte) && s.body.start < s.body.end)
+            .filter_map(|s| {
+                let first = buf.byte_to_line(s.body.start);
+                // EOF-safe exclusive end line: byte_to_line(end) collapses to the
+                // body's own line when the doc has no trailing newline, dropping
+                // the run. Derive from end-1 instead, clamped to total.
+                let last = (buf.byte_to_line(s.body.end.saturating_sub(1)) + 1).min(total);
                 if first < last {
-                    // owner = the heading line just above the body's first line.
-                    Some(HiddenRun { lines: first..last, owner: first.saturating_sub(1) })
+                    Some(HiddenRun { lines: first..last, owner: buf.byte_to_line(s.heading.byte) })
                 } else {
                     None
                 }
@@ -849,7 +903,10 @@ pub fn hidden_count_lines(
     if body.start >= body.end {
         return 0;
     }
-    buf.byte_to_line(body.end).saturating_sub(buf.byte_to_line(body.start))
+    // EOF-safe: derive the exclusive end line from end-1, matching FoldView.
+    let first = buf.byte_to_line(body.start);
+    let last = buf.byte_to_line(body.end.saturating_sub(1)) + 1;
+    last.saturating_sub(first)
 }
 ```
 
@@ -1510,7 +1567,7 @@ Add a test:
 fn typewriter_scroll_is_visible_under_folds() {
     let doc = "# Top\nintro\n## A\nb1\nb2\nb3\n## B\nt1\nt2\nt3\n";
     let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 6));
-    ed.active_mut().view_opts.typewriter = true;
+    ed.view_opts.typewriter = true; // view_opts is on Editor, not Buffer
     ed.active_mut().folds.toggle(doc.find("## A").unwrap());
     crate::derive::rebuild(&mut ed);
     let t2 = doc.find("t2").unwrap();
