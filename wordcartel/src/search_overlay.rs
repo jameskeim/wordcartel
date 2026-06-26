@@ -114,6 +114,12 @@ impl SearchState {
     pub fn matcher(&self) -> Option<&Matcher> { self.matcher.as_ref() }
     pub fn matches(&self) -> &[Match] { &self.matches }
 
+    pub fn cache_invalidate(&mut self) { self.cache_sig = None; }
+    pub fn set_current_at_or_after(&mut self, off: usize) { self.cur_idx = self.first_at_or_after_strict(off); }
+    fn first_at_or_after_strict(&self, off: usize) -> Option<usize> {
+        self.matches.iter().position(|m| m.start >= off) // None when past the last match → stepping ends
+    }
+
     pub fn next(&mut self) -> Option<Match> {
         if self.matches.is_empty() { return None; }
         self.direction = Direction::Forward;
