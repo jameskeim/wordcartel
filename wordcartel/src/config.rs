@@ -49,7 +49,10 @@ pub struct DiagnosticsConfig {
 }
 impl Default for DiagnosticsConfig {
     fn default() -> Self {
-        DiagnosticsConfig { enabled: true, grammar: true, debounce_ms: 400, dictionary: None, linters: None }
+        // Fix A7: resolve a sensible default dictionary path (<config_dir>/wordcartel/dictionary.txt)
+        // so add-to-dictionary works out of the box without explicit configuration.
+        let dictionary = dirs::config_dir().map(|d| d.join("wordcartel").join("dictionary.txt"));
+        DiagnosticsConfig { enabled: true, grammar: true, debounce_ms: 400, dictionary, linters: None }
     }
 }
 
@@ -281,7 +284,19 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
             }
         }
         if let Some(s) = raw.diagnostics.dictionary {
-            cfg.diagnostics.dictionary = Some(std::path::PathBuf::from(s));
+            // Fix A7: expand a leading `~/` (or bare `~`) to the home directory so
+            // paths like `~/foo/dict.txt` work correctly.  Without expansion a raw
+            // PathBuf would write to a literal `~` directory.
+            let expanded = if s == "~" {
+                dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("~"))
+            } else if let Some(rest) = s.strip_prefix("~/") {
+                dirs::home_dir()
+                    .map(|h| h.join(rest))
+                    .unwrap_or_else(|| std::path::PathBuf::from(&s))
+            } else {
+                std::path::PathBuf::from(&s)
+            };
+            cfg.diagnostics.dictionary = Some(expanded);
         }
         if let Some(v) = raw.diagnostics.linters { cfg.diagnostics.linters = Some(v); }
         // unknown linter names are validated against the core catalog later (Task 4 assembly) — warn there.
@@ -405,6 +420,66 @@ mod tests {
         let (cfg, warns) = load(&[p]);
         assert_eq!(cfg.diagnostics.debounce_ms, 100, "debounce_ms clamped to floor 100");
         assert!(warns.iter().any(|w| w.contains("debounce_ms")), "clamp warns");
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix A7: default dictionary path + tilde expansion
+    // -----------------------------------------------------------------------
+
+    /// `DiagnosticsConfig::default().dictionary` must resolve to
+    /// `<config_dir>/wordcartel/dictionary.txt` (not None).
+    #[test]
+    fn diagnostics_default_dictionary_is_not_none() {
+        let cfg = DiagnosticsConfig::default();
+        // If dirs::config_dir() is available (it always is on Linux/macOS/Windows),
+        // the default must be Some(<config_dir>/wordcartel/dictionary.txt).
+        // We do NOT require the file to exist — just that the path is set.
+        if let Some(config_dir) = dirs::config_dir() {
+            let expected = config_dir.join("wordcartel").join("dictionary.txt");
+            assert_eq!(cfg.dictionary, Some(expected),
+                "default dictionary must point to <config_dir>/wordcartel/dictionary.txt");
+        } else {
+            // On exotic platforms where config_dir() returns None, None is acceptable.
+            // (We can't assert Some in that case.)
+        }
+    }
+
+    /// A `~/` prefix in the configured dictionary path must be expanded to the
+    /// real home directory — NOT stored as a literal `~`.
+    #[test]
+    fn dictionary_tilde_is_expanded() {
+        let dir = tempdir();
+        let p = dir.join("c.toml");
+        // Use a temp-dir-based path that doesn't touch the real home directory.
+        // We test the expansion logic by checking whether a configured "~/foo/dict.txt"
+        // expands to <home>/foo/dict.txt.
+        std::fs::write(&p, "[diagnostics]\ndictionary = \"~/foo/dict.txt\"\n").unwrap();
+        let (cfg, warns) = load(&[p]);
+        assert!(warns.is_empty(), "tilde path must not produce warnings");
+        if let Some(home) = dirs::home_dir() {
+            let expected = home.join("foo").join("dict.txt");
+            assert_eq!(cfg.diagnostics.dictionary, Some(expected),
+                "~/foo/dict.txt must expand to <home>/foo/dict.txt, not a literal ~");
+        }
+        // Regardless of home detection: the path must NOT start with a literal tilde byte.
+        if let Some(dict_path) = &cfg.diagnostics.dictionary {
+            let first = dict_path.to_string_lossy();
+            assert!(!first.starts_with('~'),
+                "expanded dictionary path must not start with a literal tilde, got: {first}");
+        }
+    }
+
+    /// A bare `~` expands to home_dir (not a literal tilde directory).
+    #[test]
+    fn dictionary_bare_tilde_expands_to_home() {
+        let dir = tempdir();
+        let p = dir.join("c.toml");
+        std::fs::write(&p, "[diagnostics]\ndictionary = \"~\"\n").unwrap();
+        let (cfg, _warns) = load(&[p]);
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(cfg.diagnostics.dictionary, Some(home),
+                "bare ~ must expand to home_dir");
+        }
     }
 
 }

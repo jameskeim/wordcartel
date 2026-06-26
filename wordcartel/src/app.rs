@@ -589,9 +589,18 @@ fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_core::history
         let is_ignore = ov.is_ignore();
         let is_add_dict = ov.is_add_dict();
         let suggestion = ov.chosen_suggestion().cloned();
-        (ov.anchor.range.start, ov.anchor.range.end, is_ignore, is_add_dict, suggestion)
+        (ov.anchor.range.start, ov.anchor.range.end, is_ignore, is_add_dict, suggestion, ov.opened_version)
     });
-    let Some((raw_a, raw_b, is_ignore, is_add_dict, suggestion)) = overlay_info else { return; };
+    let Some((raw_a, raw_b, is_ignore, is_add_dict, suggestion, opened_version)) = overlay_info else { return; };
+
+    // Fix A4: if the buffer was mutated while the overlay was open, the anchor
+    // ranges are stale.  Refuse to apply — a stale range can cause a panic on
+    // multibyte boundaries or silently apply at wrong offsets.
+    if editor.active().document.version != opened_version {
+        editor.status = "document changed; re-open".into();
+        editor.diag = None;
+        return;
+    }
 
     // Clamp the stale/oversized anchor range to the current doc length so a
     // multibyte/shrink race can never cause buffer.slice or build_range_replace
@@ -1356,11 +1365,22 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
         } else {
             None
         };
+        // Fix A3: include the diagnostics deadline ONLY when no check is in
+        // flight.  When a check is in flight, recheck_due_at may be a past
+        // timestamp (armed before the check started), which would drive
+        // recv_timeout(0) → 100% CPU spin until the worker completes.
+        // When the result lands it clears in_flight_version; the next
+        // iteration will re-include the (re-armed) deadline and dispatch.
+        let diag_deadline = if editor.active().diagnostics.in_flight_version.is_none() {
+            editor.active().diagnostics.recheck_due_at
+        } else {
+            None
+        };
         let deadline = crate::diagnostics_run::next_deadline(&[
             swap_deadline,
             sq_deadline,
             sb_deadline,
-            editor.active().diagnostics.recheck_due_at,
+            diag_deadline,
         ]);
         let timeout = deadline
             .map(|d| std::time::Duration::from_millis(d.saturating_sub(now)))
@@ -3058,5 +3078,85 @@ mod tests {
         assert_eq!(e.active().document.selection.primary().to(), 8, "F8 moves to the next diagnostic");
         crate::app::reduce(Msg::Input(f8), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.selection.primary().to(), 0, "F8 wraps to the first");
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix A3: no busy-loop while a diagnostics check is in flight
+    // -----------------------------------------------------------------------
+
+    /// When `in_flight_version` is set, the diagnostics deadline must be
+    /// excluded from the loop's `next_deadline` call.  This is a pure logic
+    /// test of the gating condition, validated without touching the real loop.
+    #[test]
+    fn diag_deadline_excluded_when_in_flight() {
+        use crate::diagnostics_run::{DiagStore, next_deadline};
+        // Build a store that has a past-due recheck_due_at AND an in-flight version.
+        let mut store = DiagStore::new();
+        store.recheck_due_at = Some(0); // past due
+        store.in_flight_version = Some(5); // check is in flight
+
+        // Compute the diag_deadline using the same gating logic as the run() loop.
+        let diag_deadline = if store.in_flight_version.is_none() {
+            store.recheck_due_at
+        } else {
+            None
+        };
+
+        // With no other deadlines, the computed deadline should be None (not 0),
+        // so recv_timeout gets a long duration instead of 0 ms.
+        let deadline = next_deadline(&[None, None, None, diag_deadline]);
+        assert_eq!(deadline, None,
+            "when in_flight, diag_deadline must be None so the loop does not spin");
+
+        // Sanity: without in-flight, the past-due timestamp IS included.
+        // temporarily clear in_flight to test the other branch
+        let saved = store.in_flight_version.take();
+        let diag_deadline_no_flight = if store.in_flight_version.is_none() {
+            store.recheck_due_at
+        } else {
+            None
+        };
+        let deadline_no_flight = next_deadline(&[None, None, None, diag_deadline_no_flight]);
+        assert_eq!(deadline_no_flight, Some(0),
+            "without in_flight, past-due recheck_due_at is included in the deadline");
+        store.in_flight_version = saved; // restore
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix A4: stale quick-fix overlay must not apply
+    // -----------------------------------------------------------------------
+
+    /// If the buffer is mutated while the diag overlay is open, pressing Enter
+    /// must NOT apply the (now-stale) suggestion.  The overlay must be closed
+    /// and the buffer left unchanged.
+    #[test]
+    fn quick_fix_refuses_stale_apply_after_concurrent_edit() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        let v = e.active().document.version;
+        // Arm valid diagnostics at version V and open the overlay.
+        e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(),
+            suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] }];
+        e.active_mut().diagnostics.computed_version = v;
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let press = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        // Open the overlay.
+        crate::app::reduce(Msg::Input(press(KeyCode::Char('.'), KeyModifiers::CONTROL)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert!(e.diag.is_some(), "overlay must open");
+        assert_eq!(e.diag.as_ref().unwrap().opened_version, v, "opened_version captured at open");
+        // Simulate a concurrent edit while the overlay is open: bump the document version.
+        e.active_mut().document.version += 1;
+        let buf_before = e.active().document.buffer.to_string();
+        // Press Enter — must be refused because opened_version != current version.
+        crate::app::reduce(Msg::Input(press(KeyCode::Enter, KeyModifiers::NONE)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        // Overlay must be closed and buffer must be unchanged.
+        assert!(e.diag.is_none(), "stale overlay must be closed without applying");
+        assert_eq!(e.active().document.buffer.to_string(), buf_before,
+            "buffer must not be mutated when the overlay is stale");
+        assert!(e.status.contains("changed"), "status must mention the change");
     }
 }

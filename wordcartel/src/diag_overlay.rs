@@ -11,11 +11,15 @@ pub struct DiagOverlay {
     pub anchor: Diagnostic,
     pub selected: usize,
     pub buffer_id: BufferId,
+    /// Document version at the time the overlay was opened.  Used to refuse
+    /// to apply a quick-fix if the buffer was mutated while the overlay was
+    /// open (Fix A4: stale-range panic / wrong-offset apply guard).
+    pub opened_version: u64,
 }
 
 impl DiagOverlay {
-    pub fn new(anchor: Diagnostic, buffer_id: BufferId) -> Self {
-        DiagOverlay { anchor, selected: 0, buffer_id }
+    pub fn new(anchor: Diagnostic, buffer_id: BufferId, opened_version: u64) -> Self {
+        DiagOverlay { anchor, selected: 0, buffer_id, opened_version }
     }
 
     /// Total row count: one per suggestion, plus "ignore once" + "add to dictionary".

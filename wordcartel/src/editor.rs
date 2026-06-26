@@ -313,11 +313,14 @@ impl Editor {
     /// Open the quick-fix overlay for a given diagnostic, enforcing single-overlay XOR invariant.
     ///
     /// Clears prompt/minibuffer/palette/menu/search + pending_keys + pending_mark.
+    /// Records `opened_version` so `diag_apply_selected` can refuse a stale apply
+    /// if the buffer is mutated while the overlay is open (Fix A4).
     pub fn open_diag(&mut self, d: wordcartel_core::diagnostics::Diagnostic) {
         self.prompt = None; self.minibuffer = None; self.palette = None; self.menu = None; self.search = None;
         self.pending_keys.clear(); self.pending_mark = None;
         let bid = self.active().id;
-        self.diag = Some(crate::diag_overlay::DiagOverlay::new(d, bid));
+        let ver = self.active().document.version;
+        self.diag = Some(crate::diag_overlay::DiagOverlay::new(d, bid, ver));
     }
 
     // Thin delegators — external callers unchanged.

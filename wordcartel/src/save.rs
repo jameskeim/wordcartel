@@ -125,9 +125,22 @@ pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
         Ok(t) => t,
         Err(e) => { editor.status = e.to_string(); return; }
     };
+    // Fix A1: capture the previous version BEFORE replacing the buffer so we
+    // can carry it forward.  A diagnostics check in flight before the reload
+    // was stamped with `previous_version` (or earlier); the new buffer must
+    // start at `previous_version + 1` so any late pre-reload result can never
+    // match the version gate in `apply_diagnostics_done`.
+    let previous_version = editor.active().document.version;
     let area = editor.active().view.area;
     let fresh = crate::editor::Editor::new_from_text(&text, Some(path.clone()), area); // saved_version=Some(0) → clean
-    let new_buf = fresh.buffers.into_iter().next().expect("new_from_text yields one buffer");
+    let mut new_buf = fresh.buffers.into_iter().next().expect("new_from_text yields one buffer");
+    // Bump version past the pre-reload value so stale diagnostics results can't match.
+    new_buf.document.version = previous_version + 1;
+    // Preserve saved_version relative to the new version: the file we just
+    // loaded IS the on-disk content, so mark it as saved at the new version.
+    new_buf.document.saved_version = Some(previous_version + 1);
+    // Reset the DiagStore so no stale underlines from the old content persist.
+    new_buf.diagnostics = crate::diagnostics_run::DiagStore::new();
     let id = editor.active().id;                 // preserve THIS buffer's id
     *editor.active_mut() = crate::editor::Buffer { id, ..new_buf };
     // Clear any stale search/diag overlay — the buffer content has changed wholesale.
@@ -146,15 +159,23 @@ pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
 /// Sanctioned whole-document replacement (fresh Document, history reset).
 pub fn load_recovered(editor: &mut crate::editor::Editor, body: &str) {
     let path = editor.active().document.path.clone();
+    // Fix A1: capture the previous version BEFORE replacing the buffer so we
+    // can carry it forward, preventing late pre-reload diagnostics results
+    // from matching the version gate in `apply_diagnostics_done`.
+    let previous_version = editor.active().document.version;
     let area = editor.active().view.area;
     let fresh = crate::editor::Editor::new_from_text(body, path.clone(), area);
-    let new_buf = fresh.buffers.into_iter().next().expect("new_from_text yields one buffer");
+    let mut new_buf = fresh.buffers.into_iter().next().expect("new_from_text yields one buffer");
+    // Bump version past the pre-reload value; recovered content is unsaved.
+    new_buf.document.version = previous_version + 1;
+    new_buf.document.saved_version = None; // recovered work is unsaved
+    // Reset the DiagStore so no stale underlines from the old content persist.
+    new_buf.diagnostics = crate::diagnostics_run::DiagStore::new();
     let id = editor.active().id;                 // preserve THIS buffer's id
     *editor.active_mut() = crate::editor::Buffer { id, ..new_buf };
     // Clear any stale search/diag overlay — the buffer content has changed wholesale.
     editor.search = None;
     editor.diag = None;
-    editor.active_mut().document.saved_version = None; // recovered work is unsaved
     editor.active_mut().view.line_layouts.clear();
     crate::derive::rebuild(editor);
     crate::nav::ensure_visible(editor);
@@ -378,5 +399,116 @@ mod tests {
         assert!(e.status.to_lowercase().contains("changed on disk"), "status surfaces the refusal");
         assert!(e.active().document.dirty(), "buffer stays dirty when a save is refused");
         let _ = std::fs::remove_file(&p);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix A1: reload version-bump + DiagStore reset
+    // -----------------------------------------------------------------------
+
+    /// A late DiagnosticsDone result for the pre-reload version must be DISCARDED
+    /// after reload_from_disk, because the reload bumps the version past V.
+    #[test]
+    fn reload_discards_pre_reload_diagnostics_done() {
+        let p = scratch();
+        std::fs::write(&p, "new content\n").unwrap();
+        let mut e = Editor::new_from_text("old content\n", Some(p.clone()), (80, 24));
+        // Version V; arm a fake in-flight diagnostics check.
+        let pre_reload_version = e.active().document.version; // 0
+        e.active_mut().diagnostics.in_flight_version = Some(pre_reload_version);
+        e.active_mut().diagnostics.diagnostics = vec![
+            wordcartel_core::diagnostics::Diagnostic {
+                range: 0..3,
+                kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                message: "fake".into(),
+                suggestions: vec![],
+            }
+        ];
+        e.active_mut().diagnostics.computed_version = pre_reload_version;
+        reload_from_disk(&mut e);
+        // Post-reload: version must be strictly greater than pre_reload_version.
+        assert!(e.active().document.version > pre_reload_version,
+            "reload must bump version past the pre-reload value");
+        // DiagStore must be cleared of any stale underlines.
+        assert!(e.active().diagnostics.diagnostics.is_empty(),
+            "reload must reset DiagStore (no stale underlines)");
+        assert!(e.active().diagnostics.in_flight_version.is_none(),
+            "reload must clear in_flight_version");
+        // Now deliver the late DiagnosticsDone for the pre-reload version V.
+        let new_version = e.active().document.version;
+        let buffer_id = e.active().id;
+        crate::diagnostics_run::apply_diagnostics_done(
+            &mut e,
+            buffer_id,
+            pre_reload_version, // stale version
+            vec![wordcartel_core::diagnostics::Diagnostic {
+                range: 0..3,
+                kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                message: "stale".into(),
+                suggestions: vec![],
+            }],
+        );
+        // The stale result must NOT be stored.
+        assert!(e.active().diagnostics.diagnostics.is_empty(),
+            "late pre-reload DiagnosticsDone must be discarded (version gate)");
+        // computed_version must not have been set to the new buffer's version by the stale result
+        // (i.e., the new buffer's version != pre_reload_version, and diagnostics are still empty).
+        assert_ne!(e.active().document.version, pre_reload_version,
+            "new buffer must have a different version than the pre-reload snapshot");
+        // Sanity: a fresh result for the new version IS accepted.
+        crate::diagnostics_run::apply_diagnostics_done(
+            &mut e,
+            buffer_id,
+            new_version,
+            vec![wordcartel_core::diagnostics::Diagnostic {
+                range: 0..3,
+                kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                message: "fresh".into(),
+                suggestions: vec![],
+            }],
+        );
+        assert_eq!(e.active().diagnostics.diagnostics.len(), 1,
+            "fresh result for the new version must be stored");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Same invariant for load_recovered: a late DiagnosticsDone for the
+    /// pre-recovery version is discarded after the version bump.
+    #[test]
+    fn load_recovered_discards_pre_recovery_diagnostics_done() {
+        let mut e = Editor::new_from_text("old content\n", None, (80, 24));
+        let pre_recovery_version = e.active().document.version; // 0
+        e.active_mut().diagnostics.in_flight_version = Some(pre_recovery_version);
+        // Simulate stale underlines that must be wiped by recovery.
+        e.active_mut().diagnostics.diagnostics = vec![
+            wordcartel_core::diagnostics::Diagnostic {
+                range: 0..3,
+                kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                message: "old".into(),
+                suggestions: vec![],
+            }
+        ];
+        e.active_mut().diagnostics.computed_version = pre_recovery_version;
+        load_recovered(&mut e, "recovered content\n");
+        assert!(e.active().document.version > pre_recovery_version,
+            "load_recovered must bump version past the pre-recovery value");
+        assert!(e.active().diagnostics.diagnostics.is_empty(),
+            "load_recovered must reset DiagStore");
+        assert!(e.active().diagnostics.in_flight_version.is_none(),
+            "load_recovered must clear in_flight_version");
+        let buffer_id = e.active().id;
+        // Deliver a late result for the pre-recovery version — must be discarded.
+        crate::diagnostics_run::apply_diagnostics_done(
+            &mut e,
+            buffer_id,
+            pre_recovery_version,
+            vec![wordcartel_core::diagnostics::Diagnostic {
+                range: 0..3,
+                kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                message: "stale".into(),
+                suggestions: vec![],
+            }],
+        );
+        assert!(e.active().diagnostics.diagnostics.is_empty(),
+            "late pre-recovery DiagnosticsDone must be discarded");
     }
 }
