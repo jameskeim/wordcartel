@@ -369,9 +369,10 @@ impl Editor {
         self.search = None; self.diag = None;
         self.pending_keys.clear(); self.pending_mark = None;
         let bid = self.active().id;
+        let ver = self.active().document.version;
         let blocks = self.active().document.blocks.clone();
         let rope = self.active().document.buffer.snapshot();
-        self.outline = Some(crate::outline_overlay::OutlineOverlay::open(bid, &blocks, &rope));
+        self.outline = Some(crate::outline_overlay::OutlineOverlay::open(bid, ver, &blocks, &rope));
     }
 
     // Thin delegators — external callers unchanged.
@@ -578,12 +579,10 @@ mod tests {
     }
     fn apply_delete(buf: &mut Buffer, range: std::ops::Range<usize>, clk: &TestClock) {
         let len_before = buf.document.buffer.len();
-        let del_len = range.end - range.start;
         let cs = ChangeSet::delete(range.clone(), len_before);
         let txn = Transaction::new(cs);
         let edit = wordcartel_core::block_tree::Edit { range: range.clone(), new_len: 0 };
         buf.apply(txn, edit, EditKind::Other, clk);
-        let _ = del_len;
     }
 
     #[test]

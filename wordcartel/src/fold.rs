@@ -214,12 +214,10 @@ pub fn normalize_caret(
 
 /// Number of hidden body LINES for a folded heading (for the "… N lines" marker).
 pub fn hidden_count_lines(
-    folds: &FoldState,
     blocks: &BlockTree,
     buf: &TextBuffer,
     heading_byte: usize,
 ) -> usize {
-    let _ = folds;
     let rope = buf.snapshot();
     let body = outline::body_range(blocks, &rope, heading_byte);
     if body.start >= body.end {
@@ -346,9 +344,8 @@ mod tests {
     #[test]
     fn hidden_count_lines_reports_body_line_count() {
         let (blocks, buf) = parse(DOC);
-        let f = FoldState::default();
         // ## A body is body1, body2 -> 2 lines
-        assert_eq!(hidden_count_lines(&f, &blocks, &buf, DOC.find("## A").unwrap()), 2);
+        assert_eq!(hidden_count_lines(&blocks, &buf, DOC.find("## A").unwrap()), 2);
     }
 
     #[test]
@@ -400,6 +397,6 @@ mod tests {
         let fv = FoldView::compute(&f, &blocks, &buf);
         assert!(!fv.is_hidden(0));      // "## A" visible
         assert!(fv.is_hidden(1));       // "body" hidden (the EOF-safe end-line fix)
-        assert_eq!(hidden_count_lines(&f, &blocks, &buf, 0), 1);
+        assert_eq!(hidden_count_lines(&blocks, &buf, 0), 1);
     }
 }

@@ -741,7 +741,7 @@ pub fn fold_marker_for(editor: &crate::editor::Editor, l: usize) -> Option<usize
     let buf = &b.document.buffer;
     // The folded anchor whose heading line is `l`.
     let hb = b.folds.folded.iter().copied().find(|&hb| buf.byte_to_line(hb) == l)?;
-    Some(crate::fold::hidden_count_lines(&b.folds, &b.document.blocks, buf, hb))
+    Some(crate::fold::hidden_count_lines(&b.document.blocks, buf, hb))
 }
 
 // ---------------------------------------------------------------------------

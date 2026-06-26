@@ -1018,6 +1018,12 @@ pub fn reduce(
                         }
                     }
                     KeyCode::Enter => {
+                        if editor.outline.as_ref().map(|o| o.opened_version) != Some(editor.active().document.version) {
+                            editor.status = "document changed; outline closed".into();
+                            editor.outline = None;
+                            for r in ex.drain() { apply_result(r, editor); }
+                            return !editor.quit;
+                        }
                         let target = editor.outline.as_ref()
                             .and_then(|o| o.rows.get(o.selected))
                             .map(|r| r.byte);
@@ -3004,6 +3010,32 @@ mod tests {
             disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "# H\nXcde\n", "FilterDone applies even under an open outline overlay");
         assert!(e.outline.is_some(), "outline overlay remains open after non-key message");
+    }
+
+    #[test]
+    fn outline_jump_refused_after_background_edit() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("# Top\nintro\n## A\nbody\n", None, (80, 24));
+        let start = e.active().document.selection.primary().head;
+        e.open_outline();
+        assert!(e.outline.is_some(), "outline overlay must open");
+        let opened_version = e.outline.as_ref().unwrap().opened_version;
+        e.active_mut().document.version = opened_version + 1;
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let enter = Event::Key(KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert!(e.outline.is_none(), "stale outline overlay must close without jumping");
+        assert_eq!(e.active().document.selection.primary().head, start,
+            "stale outline Enter must not move the caret");
+        assert!(e.status.contains("changed"), "status must mention the change");
     }
 
     #[test]

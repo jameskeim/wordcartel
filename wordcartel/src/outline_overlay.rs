@@ -13,6 +13,7 @@ pub struct OutlineRow {
 #[derive(Debug, Clone)]
 pub struct OutlineOverlay {
     pub buffer_id: crate::editor::BufferId,
+    pub opened_version: u64,
     pub query: String,
     pub cursor: usize,
     pub rows: Vec<OutlineRow>,
@@ -21,7 +22,7 @@ pub struct OutlineOverlay {
 }
 
 impl OutlineOverlay {
-    pub fn open(buffer_id: crate::editor::BufferId, blocks: &BlockTree, rope: &Rope) -> OutlineOverlay {
+    pub fn open(buffer_id: crate::editor::BufferId, opened_version: u64, blocks: &BlockTree, rope: &Rope) -> OutlineOverlay {
         let all: Vec<OutlineRow> = wordcartel_core::outline::headings(blocks, rope)
             .into_iter()
             .map(|h| OutlineRow {
@@ -32,6 +33,7 @@ impl OutlineOverlay {
             .collect();
         OutlineOverlay {
             buffer_id,
+            opened_version,
             query: String::new(),
             cursor: 0,
             rows: all.clone(),
@@ -55,7 +57,7 @@ mod tests {
         let doc = "# Top\n## Alpha\n## Beta\n### Beta1\n";
         let buf = wordcartel_core::buffer::TextBuffer::from_str(doc);
         let blocks = wordcartel_core::block_tree::full_parse_rope(&buf.snapshot());
-        let mut ov = super::OutlineOverlay::open(crate::editor::BufferId(7), &blocks, &buf.snapshot());
+        let mut ov = super::OutlineOverlay::open(crate::editor::BufferId(7), 0, &blocks, &buf.snapshot());
         assert_eq!(ov.rows.len(), 4);
         assert_eq!(ov.rows[0].indent, 0);
         assert_eq!(ov.rows[3].indent, 2);

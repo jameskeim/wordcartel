@@ -596,6 +596,45 @@ mod tests {
             "## A fold must be cleared when diag_next lands inside its body");
     }
 
+    #[test]
+    fn diag_prev_into_fold_auto_unfolds() {
+        // Build a buffer with a folded ## A section and a diagnostic inside it.
+        // Seed the DiagStore directly (no real Harper worker).
+        let doc = "# Top\nintro\n## A\nbad_word here\nmore\n## B\n";
+        let mut ed = Editor::new_from_text(doc, None, (80, 24));
+        let a_byte = doc.find("## A").unwrap();
+        let bad_byte = doc.find("bad_word").unwrap();
+
+        // Seed the DiagStore with a diagnostic inside ## A's body.
+        let v = ed.active().document.version;
+        ed.active_mut().diagnostics.diagnostics = vec![
+            wordcartel_core::diagnostics::Diagnostic {
+                range: bad_byte..(bad_byte + "bad_word".len()),
+                kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                message: "x".into(),
+                suggestions: vec![],
+            }
+        ];
+        ed.active_mut().diagnostics.computed_version = v;
+
+        // Fold ## A AFTER seeding diagnostics (version unchanged).
+        ed.active_mut().folds.toggle(a_byte);
+        crate::derive::rebuild(&mut ed);
+
+        // Place caret after the diagnostic.
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(doc.find("## B").unwrap());
+
+        // Dispatch diag_prev.
+        dispatch_id(&mut ed, "diag_prev");
+
+        // Caret must be at the diagnostic's start.
+        assert_eq!(ed.active().document.selection.primary().head, bad_byte,
+            "diag_prev must jump caret to the diagnostic");
+        // ## A fold must be cleared.
+        assert!(!ed.active().folds.folded.contains(&a_byte),
+            "## A fold must be cleared when diag_prev lands inside its body");
+    }
+
     // Helper: build a Ctx and dispatch a command id against the given Editor.
     fn dispatch_id(ed: &mut Editor, id: &'static str) {
         let reg = Registry::builtins();
@@ -637,5 +676,17 @@ mod tests {
         ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(a1);
         dispatch_id(&mut ed, "heading_parent");
         assert_eq!(ed.active().document.selection.primary().head, doc.find("## A").unwrap());
+    }
+
+    #[test]
+    fn heading_prev_navigates_and_pushes_ring() {
+        let doc = "# Top\nintro\n## A\nbody\n### A1\nx\n## B\n";
+        let mut ed = Editor::new_from_text(doc, None, (80, 24));
+        crate::derive::rebuild(&mut ed);
+        let b = doc.find("## B").unwrap();
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(b);
+        dispatch_id(&mut ed, "heading_prev");
+        assert_eq!(ed.active().document.selection.primary().head, doc.find("### A1").unwrap());
+        assert!(ed.active().jump_ring.contains(&b));
     }
 }
