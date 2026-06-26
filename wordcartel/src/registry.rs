@@ -249,6 +249,7 @@ impl Registry {
                 .find(|d| d.range.start > caret)
                 .unwrap_or(&diags[0])
                 .range.start;
+            unfold_ancestors_of(c.editor, target);
             c.editor.active_mut().document.selection =
                 wordcartel_core::selection::Selection::single(target);
             crate::derive::rebuild(c.editor);
@@ -269,6 +270,7 @@ impl Registry {
                 .find(|d| d.range.start < caret)
                 .unwrap_or(&diags[last])
                 .range.start;
+            unfold_ancestors_of(c.editor, target);
             c.editor.active_mut().document.selection =
                 wordcartel_core::selection::Selection::single(target);
             crate::derive::rebuild(c.editor);
@@ -549,6 +551,49 @@ mod tests {
         assert_eq!(reg.resolve_name("cut"), Some(CommandId("cut")));
         assert_eq!(reg.resolve_name("save"), Some(CommandId("save")));
         assert_eq!(reg.resolve_name("definitely-not-a-command"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 12 (Effort 5g): diag_next into a folded section auto-unfolds
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn diag_next_into_fold_auto_unfolds() {
+        // Build a buffer with a folded ## A section and a diagnostic inside it.
+        // Seed the DiagStore directly (no real Harper worker).
+        let doc = "# Top\nintro\n## A\nbad_word here\nmore\n## B\n";
+        let mut ed = Editor::new_from_text(doc, None, (80, 24));
+        let a_byte = doc.find("## A").unwrap();
+        let bad_byte = doc.find("bad_word").unwrap();
+
+        // Seed the DiagStore with a diagnostic inside ## A's body.
+        let v = ed.active().document.version;
+        ed.active_mut().diagnostics.diagnostics = vec![
+            wordcartel_core::diagnostics::Diagnostic {
+                range: bad_byte..(bad_byte + "bad_word".len()),
+                kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                message: "x".into(),
+                suggestions: vec![],
+            }
+        ];
+        ed.active_mut().diagnostics.computed_version = v;
+
+        // Fold ## A AFTER seeding diagnostics (version unchanged).
+        ed.active_mut().folds.toggle(a_byte);
+        crate::derive::rebuild(&mut ed);
+
+        // Place caret before the diagnostic (at start of doc).
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(0);
+
+        // Dispatch diag_next.
+        dispatch_id(&mut ed, "diag_next");
+
+        // Caret must be at the diagnostic's start.
+        assert_eq!(ed.active().document.selection.primary().head, bad_byte,
+            "diag_next must jump caret to the diagnostic");
+        // ## A fold must be cleared.
+        assert!(!ed.active().folds.folded.contains(&a_byte),
+            "## A fold must be cleared when diag_next lands inside its body");
     }
 
     // Helper: build a Ctx and dispatch a command id against the given Editor.

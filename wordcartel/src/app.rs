@@ -465,6 +465,7 @@ fn search_sync(editor: &mut Editor) {
     let (rope, version) = { let d = &editor.active().document; (d.buffer.snapshot(), d.version) };
     if let Some(s) = editor.search.as_mut() { s.recompute(&rope, version); }
     if let Some(m) = editor.search.as_ref().and_then(|s| s.current()) {
+        crate::registry::unfold_ancestors_of(editor, m.start);
         editor.active_mut().document.selection = wordcartel_core::selection::Selection::range(m.start, m.end);
         derive::rebuild(editor);
         crate::nav::ensure_visible(editor);
@@ -474,6 +475,7 @@ fn search_sync(editor: &mut Editor) {
 fn search_step(editor: &mut Editor, forward: bool) {
     if let Some(s) = editor.search.as_mut() { if forward { s.next(); } else { s.prev(); } }
     if let Some(m) = editor.search.as_ref().and_then(|s| s.current()) {
+        crate::registry::unfold_ancestors_of(editor, m.start);
         editor.active_mut().document.selection = wordcartel_core::selection::Selection::range(m.start, m.end);
         derive::rebuild(editor);
         crate::nav::ensure_visible(editor);
@@ -576,6 +578,7 @@ fn search_step_rest(editor: &mut Editor, clock: &dyn wordcartel_core::history::C
 
 fn search_pin(editor: &mut Editor) {
     if let Some(m) = editor.search.as_ref().and_then(|s| s.current()) {
+        crate::registry::unfold_ancestors_of(editor, m.start);
         editor.active_mut().document.selection = wordcartel_core::selection::Selection::range(m.start, m.end);
         derive::rebuild(editor); crate::nav::ensure_visible(editor);
     }
@@ -654,6 +657,8 @@ fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_core::history
         let txn = wordcartel_core::history::Transaction::new(cs)
             .with_selection(wordcartel_core::selection::Selection::single(new_cursor));
         editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
+        derive::rebuild(editor);
+        crate::registry::unfold_ancestors_of(editor, new_cursor);
         derive::rebuild(editor);
         crate::nav::ensure_visible(editor);
         editor.diag = None;
@@ -3258,5 +3263,35 @@ mod tests {
         assert_eq!(e.active().document.buffer.to_string(), buf_before,
             "buffer must not be mutated when the overlay is stale");
         assert!(e.status.contains("changed"), "status must mention the change");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 12 (Effort 5g): search caret jumps auto-unfold folded ancestors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn search_hit_inside_fold_auto_unfolds() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let doc = "# Top\nintro\n## A\nneedle here\nmore\n## B\n";
+        let mut ed = Editor::new_from_text(doc, None, (80, 24));
+        // fold ## A
+        let a_byte = doc.find("## A").unwrap();
+        ed.active_mut().folds.toggle(a_byte);
+        crate::derive::rebuild(&mut ed);
+        // open search with Ctrl+F and type "needle"
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let mkpress = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(mkpress(KeyCode::Char('f'), KeyModifiers::CONTROL)), &mut ed, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert!(ed.search.is_some(), "Ctrl+F must open search");
+        for c in "needle".chars() {
+            crate::app::reduce(Msg::Input(mkpress(KeyCode::Char(c), KeyModifiers::NONE)), &mut ed, &reg, &cua_keymap(), &ex, &clk, &tx);
+        }
+        let needle_pos = doc.find("needle").unwrap();
+        assert_eq!(ed.active().document.selection.primary().from(), needle_pos,
+            "caret must be on the 'needle' match");
+        assert!(!ed.active().folds.folded.contains(&a_byte),
+            "## A fold must be cleared when jumping into its body");
     }
 }
