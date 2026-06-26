@@ -91,7 +91,7 @@ Expected: FAIL — `cannot find function map_pos_before`.
 
 - [ ] **Step 3: Implement `map_pos_before`**
 
-Add directly below `map_pos`. The ONLY difference from `map_pos` is the `Retain` comparison uses `<=` so a position sitting exactly at the boundary is resolved on the retained side (before a following insert) rather than falling through to the insert:
+Add directly below `map_pos`. The ONLY difference from `map_pos` is an explicit Before guard on the `Insert` arm: when the position sits exactly at the current boundary (`pos == old`), return `new` BEFORE adding the insert length, so an insertion at the anchor stays in front of it. (A leading `Insert` at offset 0 has no preceding `Retain` to catch `pos == 0`, which is exactly the case the naive `<=`-on-Retain version got wrong — it mapped `0 → 1`.)
 
 ```rust
 /// Map one byte position through a ChangeSet with insertion bias = Before.
@@ -106,10 +106,16 @@ pub fn map_pos_before(pos: usize, cs: &ChangeSet) -> usize {
     for op in &cs.ops {
         match op {
             Op::Retain(n) => {
-                if pos <= old + n { return new + (pos - old); }
+                if pos < old + n { return new + (pos - old); }
                 old += n; new += n;
             }
-            Op::Insert(s) => { new += s.len(); }
+            Op::Insert(s) => {
+                // Before bias: a position exactly at the insertion point stays
+                // in front of the inserted text. (map_pos omits this guard, so a
+                // boundary position is carried past the insert = After bias.)
+                if pos == old { return new; }
+                new += s.len();
+            }
             Op::Delete(n) => {
                 if pos < old + n { return new; }
                 old += n;
@@ -247,6 +253,37 @@ mod tests {
         assert_eq!(starts, expect);
         assert!(!starts.contains(&doc.find("##").unwrap().saturating_sub(1)));
     }
+
+    #[test]
+    fn body_range_atx_starts_after_the_single_heading_line() {
+        let doc = "## A\nbody1\nbody2\n## B\n";
+        let t = full_parse(doc);
+        let r = rope(doc);
+        let a = doc.find("## A").unwrap();
+        // body begins at "body1", ends at "## B"; the "## A" line stays visible.
+        assert_eq!(body_range(&t, &r, a), doc.find("body1").unwrap()..doc.find("## B").unwrap());
+    }
+
+    #[test]
+    fn body_range_setext_keeps_both_heading_lines_visible() {
+        // setext heading occupies TWO lines: "Title" + "===".
+        let doc = "Title\n===\nbody1\nbody2\n## next\n";
+        let t = full_parse(doc);
+        let r = rope(doc);
+        let h = 0usize; // setext heading starts at byte 0
+        // body must start at "body1", NOT at the "===" underline line.
+        assert_eq!(body_range(&t, &r, h), doc.find("body1").unwrap()..doc.find("## next").unwrap());
+    }
+
+    #[test]
+    fn body_range_empty_when_heading_has_no_body() {
+        let doc = "## A\n## B\n";
+        let t = full_parse(doc);
+        let r = rope(doc);
+        let a = doc.find("## A").unwrap();
+        let br = body_range(&t, &r, a);
+        assert_eq!(br.start, br.end); // no body
+    }
 }
 ```
 
@@ -267,6 +304,10 @@ pub struct Heading {
     pub level: u8,
     /// Byte offset of the heading's start (the block span start).
     pub byte: usize,
+    /// Byte offset of the heading block's end (span end). Covers the heading's
+    /// own line(s) — ONE line for ATX, TWO for setext (title + underline) — and
+    /// is how `body_range` finds where the foldable body begins.
+    pub end: usize,
     /// Title text only (ATX `#`/trailing `#` and setext underline stripped).
     pub text: String,
 }
@@ -282,10 +323,12 @@ pub fn headings(blocks: &BlockTree, rope: &Rope) -> Vec<Heading> {
 }
 
 fn collect(b: &Block, rope: &Rope, out: &mut Vec<Heading>) {
-    if let BlockKind::Heading(level) = b.kind {
+    // Match by reference: BlockKind is Clone but not Copy, so `b.kind` would move.
+    if let BlockKind::Heading(level) = &b.kind {
         out.push(Heading {
-            level,
+            level: *level,
             byte: b.span.start,
+            end: b.span.end,
             text: heading_title(rope, b.span.clone()),
         });
     }
@@ -341,6 +384,26 @@ pub fn section_range(blocks: &BlockTree, rope: &Rope, heading_byte: usize) -> Ra
 /// classifies a byte's role and cannot prove a byte is a heading *start*).
 pub fn heading_starts(blocks: &BlockTree, rope: &Rope) -> BTreeSet<usize> {
     ordered(blocks, rope).into_iter().map(|h| h.byte).collect()
+}
+
+/// The foldable BODY range of the heading at `heading_byte`: from the start of
+/// the first line AFTER the heading's own line(s) to the section end. The
+/// heading's line(s) stay visible — for a setext heading this correctly leaves
+/// BOTH the title and the underline visible (body starts after `heading.end`),
+/// fixing the off-by-one that `byte_to_line(heading_byte) + 1` would cause.
+/// Returns an empty range (`start == end`) when the section has no body.
+/// The single source of body-start math for `FoldState`/`normalize_caret`/
+/// `unfold_ancestors_of`.
+pub fn body_range(blocks: &BlockTree, rope: &Rope, heading_byte: usize) -> Range<usize> {
+    let hs = ordered(blocks, rope);
+    let Some(h) = hs.iter().find(|h| h.byte == heading_byte) else {
+        return heading_byte..heading_byte;
+    };
+    let section_end = section_range(blocks, rope, heading_byte).end;
+    // First line strictly after the heading's last own line.
+    let heading_last_line = rope.byte_to_line(h.end.saturating_sub(1).max(h.byte));
+    let body_start = rope.line_to_byte(heading_last_line + 1).min(section_end);
+    body_start..section_end
 }
 ```
 
@@ -511,6 +574,48 @@ mod tests {
         // ## A body is body1, body2 -> 2 lines
         assert_eq!(hidden_count_lines(&f, &blocks, &buf, DOC.find("## A").unwrap()), 2);
     }
+
+    #[test]
+    fn nested_folds_merge_and_do_not_double_count() {
+        // # Top contains ## A; folding BOTH must not subtract A's lines twice.
+        let doc = "# Top\nt1\n## A\na1\na2\n## B\nb1\n";
+        let (blocks, buf) = parse(doc);
+        let mut f = FoldState::default();
+        f.toggle(doc.find("# Top").unwrap()); // hides everything from t1 to ## B's section? No:
+        f.toggle(doc.find("## A").unwrap());  // # Top folds t1..##B start; ## A folds a1..a2
+        let fv = FoldView::compute(&f, &blocks, &buf);
+        let total = buf.snapshot().len_lines();
+        // The union of hidden lines is t1, a1, a2 (## A heading line stays the
+        // boundary of # Top's body; ## A's body is inside # Top's body). The merge
+        // must count each hidden line once.
+        let hidden_lines = total - fv.visible_count();
+        // visible_count + hidden_lines == total, and no line counted twice:
+        assert!(hidden_lines <= total);
+        // ordinal round-trips through the merged view
+        let vc = fv.visible_count();
+        for ord in 0..vc {
+            let line = fv.line_at_ordinal(ord);
+            assert_eq!(fv.visible_ordinal(line), ord, "ordinal round-trip at {ord}");
+            assert!(!fv.is_hidden(line));
+        }
+    }
+
+    #[test]
+    fn setext_fold_keeps_underline_visible_and_normalizes_to_title() {
+        let doc = "Title\n===\nbody1\nbody2\n## next\n";
+        let (blocks, buf) = parse(doc);
+        let mut f = FoldState::default();
+        f.toggle(0); // fold the setext heading
+        let fv = FoldView::compute(&f, &blocks, &buf);
+        // title line 0 and underline line 1 stay visible; body lines 2,3 hidden.
+        assert!(!fv.is_hidden(0));
+        assert!(!fv.is_hidden(1));
+        assert!(fv.is_hidden(2));
+        assert!(fv.is_hidden(3));
+        // a caret in the hidden body normalizes to the TITLE line (0), not the
+        // underline line (1).
+        assert_eq!(fv.normalize_line(2), 0);
+    }
 }
 ```
 
@@ -557,8 +662,9 @@ impl FoldState {
     }
 
     /// Hidden body ranges in BYTES. For each folded heading still present, hide
-    /// `heading_last_line_end .. section_range.end` (the body), keeping the
-    /// heading line(s) visible. Anchors that aren't heading starts are skipped.
+    /// its foldable body (`outline::body_range`), keeping the heading line(s)
+    /// visible. Anchors that aren't heading starts are skipped. The body math
+    /// lives in `outline::body_range` so ATX/setext are handled in one place.
     pub fn hidden_byte_ranges(&self, blocks: &BlockTree, buf: &TextBuffer) -> Vec<Range<usize>> {
         let rope = buf.snapshot();
         let starts = outline::heading_starts(blocks, &rope);
@@ -567,14 +673,9 @@ impl FoldState {
             if !starts.contains(&hb) {
                 continue;
             }
-            let sect = outline::section_range(blocks, &rope, hb);
-            // The heading's own line(s) stay visible: the body begins at the
-            // start of the line AFTER the heading line containing the heading.
-            let heading_line = buf.byte_to_line(hb);
-            let body_first_line = heading_line + 1;
-            let body_start = buf.line_to_byte(body_first_line).min(sect.end);
-            if body_start < sect.end {
-                out.push(body_start..sect.end);
+            let body = outline::body_range(blocks, &rope, hb);
+            if body.start < body.end {
+                out.push(body);
             }
         }
         out.sort_by_key(|r| r.start);
@@ -582,44 +683,67 @@ impl FoldState {
     }
 }
 
+/// A merged hidden run in LINE space, with the visible heading line that owns it.
+#[derive(Debug, Clone)]
+struct HiddenRun {
+    lines: Range<usize>, // [start, end) hidden body lines
+    owner: usize,        // the visible heading line a caret/scroll snaps to
+}
+
 /// Per-frame visible-line view in LINE space. Built once at the start of any
 /// operation that walks lines; every line-space consumer routes through it.
+/// Hidden runs are MERGED (overlapping/adjacent ranges from nested folds are
+/// coalesced) so `visible_count`/ordinals never double-count.
 #[derive(Debug, Clone)]
 pub struct FoldView {
-    /// Hidden logical-line ranges, sorted, non-overlapping. `[start, end)`.
-    hidden: Vec<Range<usize>>,
-    /// Total logical lines.
+    hidden: Vec<HiddenRun>, // sorted by start, non-overlapping after merge
     total: usize,
 }
 
 impl FoldView {
     pub fn compute(folds: &FoldState, blocks: &BlockTree, buf: &TextBuffer) -> FoldView {
         let total = buf.snapshot().len_lines();
-        let mut hidden: Vec<Range<usize>> = folds
+        // (body line range, owner heading line) per folded heading.
+        let mut runs: Vec<HiddenRun> = folds
             .hidden_byte_ranges(blocks, buf)
             .into_iter()
-            .map(|r| {
+            .filter_map(|r| {
                 let first = buf.byte_to_line(r.start);
-                // end is exclusive: the line of the next heading's start byte.
-                let last = buf.byte_to_line(r.end);
-                first..last
+                let last = buf.byte_to_line(r.end); // exclusive boundary line
+                if first < last {
+                    // owner = the heading line just above the body's first line.
+                    Some(HiddenRun { lines: first..last, owner: first.saturating_sub(1) })
+                } else {
+                    None
+                }
             })
-            .filter(|r| r.start < r.end)
             .collect();
-        hidden.sort_by_key(|r| r.start);
-        FoldView { hidden, total }
+        runs.sort_by_key(|h| h.lines.start);
+        // Merge overlapping/adjacent runs; the merged owner is the outermost
+        // (smallest) heading line, which is the visible heading after folding.
+        let mut merged: Vec<HiddenRun> = Vec::new();
+        for run in runs {
+            match merged.last_mut() {
+                Some(prev) if run.lines.start <= prev.lines.end => {
+                    prev.lines.end = prev.lines.end.max(run.lines.end);
+                    prev.owner = prev.owner.min(run.owner);
+                }
+                _ => merged.push(run),
+            }
+        }
+        FoldView { hidden: merged, total }
     }
 
     pub fn is_hidden(&self, line: usize) -> bool {
-        self.hidden.iter().any(|r| r.contains(&line))
+        self.hidden.iter().any(|r| r.lines.contains(&line))
     }
 
     /// Smallest visible line strictly greater than `line`, or None past the end.
     pub fn next_visible(&self, line: usize) -> Option<usize> {
         let mut l = line + 1;
         while l < self.total {
-            match self.hidden.iter().find(|r| r.contains(&l)) {
-                Some(r) => l = r.end, // jump past the hidden run
+            match self.hidden.iter().find(|r| r.lines.contains(&l)) {
+                Some(r) => l = r.lines.end, // jump past the hidden run
                 None => return Some(l),
             }
         }
@@ -633,12 +757,12 @@ impl FoldView {
         }
         let mut l = line - 1;
         loop {
-            match self.hidden.iter().find(|r| r.contains(&l)) {
+            match self.hidden.iter().find(|r| r.lines.contains(&l)) {
                 Some(r) => {
-                    if r.start == 0 {
+                    if r.lines.start == 0 {
                         return None;
                     }
-                    l = r.start - 1;
+                    l = r.lines.start - 1;
                 }
                 None => return Some(l),
             }
@@ -646,7 +770,7 @@ impl FoldView {
     }
 
     pub fn visible_count(&self) -> usize {
-        let hidden: usize = self.hidden.iter().map(|r| r.end - r.start).sum();
+        let hidden: usize = self.hidden.iter().map(|r| r.lines.end - r.lines.start).sum();
         self.total.saturating_sub(hidden)
     }
 
@@ -655,7 +779,7 @@ impl FoldView {
         let hidden_before: usize = self
             .hidden
             .iter()
-            .map(|r| r.end.min(line).saturating_sub(r.start.min(line)))
+            .map(|r| r.lines.end.min(line).saturating_sub(r.lines.start.min(line)))
             .sum();
         line.saturating_sub(hidden_before)
     }
@@ -665,8 +789,8 @@ impl FoldView {
         let mut seen = 0usize;
         let mut l = 0usize;
         while l < self.total {
-            if let Some(r) = self.hidden.iter().find(|r| r.contains(&l)) {
-                l = r.end;
+            if let Some(r) = self.hidden.iter().find(|r| r.lines.contains(&l)) {
+                l = r.lines.end;
                 continue;
             }
             if seen == ord {
@@ -678,11 +802,12 @@ impl FoldView {
         self.total.saturating_sub(1)
     }
 
-    /// If `line` is hidden, snap to the visible heading line that owns the fold
-    /// (the line just before the hidden run); otherwise return it unchanged.
+    /// If `line` is hidden, snap to the owning visible heading line; otherwise
+    /// return it unchanged. Uses the stored `owner` (correct for setext, where
+    /// the heading is two lines above the body, not one).
     pub fn normalize_line(&self, line: usize) -> usize {
-        match self.hidden.iter().find(|r| r.contains(&line)) {
-            Some(r) => r.start.saturating_sub(1),
+        match self.hidden.iter().find(|r| r.lines.contains(&line)) {
+            Some(r) => r.owner,
             None => line,
         }
     }
@@ -690,6 +815,7 @@ impl FoldView {
 
 /// If `byte` falls inside a folded body, snap it to the owning heading's start
 /// byte; otherwise return it unchanged. The single caret-out-of-fold primitive.
+/// Body math comes from `outline::body_range` (ATX/setext correct).
 pub fn normalize_caret(
     folds: &FoldState,
     blocks: &BlockTree,
@@ -702,10 +828,8 @@ pub fn normalize_caret(
         if !starts.contains(&hb) {
             continue;
         }
-        let sect = outline::section_range(blocks, &rope, hb);
-        let heading_line = buf.byte_to_line(hb);
-        let body_start = buf.line_to_byte(heading_line + 1).min(sect.end);
-        if byte >= body_start && byte < sect.end {
+        let body = outline::body_range(blocks, &rope, hb);
+        if byte >= body.start && byte < body.end {
             return hb;
         }
     }
@@ -721,11 +845,11 @@ pub fn hidden_count_lines(
 ) -> usize {
     let _ = folds;
     let rope = buf.snapshot();
-    let sect = outline::section_range(blocks, &rope, heading_byte);
-    let heading_line = buf.byte_to_line(heading_byte);
-    let body_first = heading_line + 1;
-    let body_last_excl = buf.byte_to_line(sect.end);
-    body_last_excl.saturating_sub(body_first)
+    let body = outline::body_range(blocks, &rope, heading_byte);
+    if body.start >= body.end {
+        return 0;
+    }
+    buf.byte_to_line(body.end).saturating_sub(buf.byte_to_line(body.start))
 }
 ```
 
@@ -734,7 +858,7 @@ Add `pub mod fold;` to `wordcartel/src/lib.rs`. Add `pub folds: crate::fold::Fol
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p wordcartel fold::`
-Expected: PASS (8 tests).
+Expected: PASS (all `fold::` unit tests).
 
 - [ ] **Step 5: Build the whole shell to confirm Buffer initialisation is complete**
 
@@ -762,64 +886,80 @@ git commit -m "feat(5g): fold.rs — FoldState + FoldView visible-line API; Buff
 
 - [ ] **Step 1: Write the failing tests**
 
-In the `editor.rs` test module:
+In the `editor.rs` test module. **The helpers `crate::edit::insert_text`,
+`crate::edit::delete_range`, and `crate::editor::test_clock` do NOT exist** —
+build the edit directly the way the existing marks-remap test does. Before
+writing these, open `editor.rs` and copy the EXACT construction from the closest
+existing `Buffer::apply` test (the marks/jump_ring remap test): it builds a
+`ChangeSet` (`ChangeSet::insert(at, text, len_before)` / `ChangeSet::delete(range, len_before)`),
+wraps it in a `Transaction`, supplies a `block_tree::Edit { range, new_len }`
+descriptor, an `EditKind`, and a local `TestClock`. Use those real types:
 
 ```rust
+// helper mirrored from the existing apply tests in this module
+fn apply_insert(buf: &mut Buffer, at: usize, text: &str) {
+    let len_before = buf.document.buffer.len();
+    let cs = wordcartel_core::change::ChangeSet::insert(at, text, len_before);
+    let txn = wordcartel_core::history::Transaction::new(cs); // match the real ctor
+    let edit = wordcartel_core::block_tree::Edit { range: at..at, new_len: text.len() };
+    buf.apply(txn, edit, EditKind::Insert, &TestClock::default());
+}
+fn apply_delete(buf: &mut Buffer, range: std::ops::Range<usize>) {
+    let len_before = buf.document.buffer.len();
+    let cs = wordcartel_core::change::ChangeSet::delete(range.clone(), len_before);
+    let txn = wordcartel_core::history::Transaction::new(cs);
+    let edit = wordcartel_core::block_tree::Edit { range: range.clone(), new_len: 0 };
+    buf.apply(txn, edit, EditKind::Delete, &TestClock::default());
+}
+
 #[test]
 fn fold_anchor_survives_insertion_above_it() {
-    use wordcartel_core::block_tree::full_parse_rope;
     let mut ed = Editor::new_from_text("# A\n\nbody\n\n## B\n\nb2\n", None, (80, 24));
     let buf = ed.active_mut();
-    let blocks = full_parse_rope(&buf.document.buffer.snapshot());
     let b_off = "# A\n\nbody\n\n".len(); // start of "## B"
     buf.folds.toggle(b_off);
-    // Insert "X\n" at the very start of the doc (above the fold) via a transaction.
-    let txn = crate::edit::insert_text(buf, 0, "X\n"); // helper that builds a Transaction
-    let edit = wordcartel_core::block_tree::Edit::full(); // or the real edit descriptor
-    let clk = crate::editor::test_clock();
-    buf.apply(txn, edit, crate::editor::EditKind::Insert, &clk);
-    // The fold anchor must have shifted by 2 and still land on "## B".
+    apply_insert(buf, 0, "X\n"); // insert above the fold
+    // anchor shifts by 2 and still lands on "## B".
     assert!(buf.folds.folded.contains(&(b_off + 2)));
 }
 
 #[test]
-fn fold_anchor_at_heading_start_survives_insertion_at_that_offset() {
+fn fold_anchor_at_heading_start_uses_before_bias() {
     let mut ed = Editor::new_from_text("## H\nbody\n", None, (80, 24));
     let buf = ed.active_mut();
     buf.folds.toggle(0); // fold the heading at byte 0
-    let txn = crate::edit::insert_text(buf, 0, "Z");
-    let edit = wordcartel_core::block_tree::Edit::full();
-    let clk = crate::editor::test_clock();
-    buf.apply(txn, edit, crate::editor::EditKind::Insert, &clk);
-    // Before-biased: anchor stays at 0 (now "Z## H"); reconcile then drops it
-    // because byte 0 is no longer a heading start.
+    apply_insert(buf, 0, "Z");
+    // Before-biased: the anchor stays at 0 (text is now "Z## H"), it is NOT
+    // pushed to 1. (Whether 0 is still a heading start is decided later by
+    // reconcile in rebuild — Task 5; here we only assert the remap bias.)
+    assert!(buf.folds.folded.contains(&0));
     assert!(!buf.folds.folded.contains(&1));
 }
 
 #[test]
-fn undo_reconciles_folds() {
+fn undo_does_not_panic_and_clamps_fold_anchors() {
     let mut ed = Editor::new_from_text("## H\nbody\n", None, (80, 24));
     let buf = ed.active_mut();
     buf.folds.toggle(0);
-    // delete the heading line, then undo
-    let txn = crate::edit::delete_range(buf, 0.."## H\n".len());
-    let edit = wordcartel_core::block_tree::Edit::full();
-    let clk = crate::editor::test_clock();
-    buf.apply(txn, edit, crate::editor::EditKind::Delete, &clk);
+    apply_delete(buf, 0.."## H\n".len()); // delete the heading line
     buf.undo();
-    // after undo, "## H" is back at byte 0; the fold should be valid again only
-    // if its anchor survived. We assert undo did not panic and folds is reconciled
-    // against the restored tree (no anchors pointing past EOF).
+    // Step-4 clamp guarantees no anchor points past EOF (no panic on later slice).
+    // The definitive "deleted-heading fold is dropped" check lives in Task 5
+    // (after rebuild's reconcile) — see `undo_then_rebuild_drops_dead_fold`.
     let len = buf.document.buffer.len();
     assert!(buf.folds.folded.iter().all(|&b| b <= len));
 }
 ```
 
-> NOTE for the implementer: use the project's real transaction/edit helpers. Inspect an existing `editor.rs` edit test (e.g. a marks-remap test) for the exact `Transaction`/`Edit`/`EditKind`/clock construction in this codebase and mirror it. The assertions above are the contract; adapt the setup lines to the real API.
+> NOTE: the exact `Transaction`/`Edit`/`TestClock` constructors above are
+> best-effort from the gathered API shape. Before running, open the nearest
+> existing `Buffer::apply` test in `editor.rs` and match its construction
+> EXACTLY (ctor names, field names). The assertions are the contract; only the
+> three setup lines may need adapting.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p wordcartel fold_anchor_survives_insertion_above_it`
+Run: `cargo test -p wordcartel fold_anchor_survives_insertion_above_it fold_anchor_at_heading_start_uses_before_bias undo_does_not_panic_and_clamps_fold_anchors`
 Expected: FAIL — folds not remapped (anchor unchanged / panic).
 
 - [ ] **Step 3: Remap folds in `Buffer::apply`**
@@ -878,7 +1018,7 @@ Task 5 adds `editor.active_mut().folds.reconcile(&blocks, buf)` right after the 
 
 - [ ] **Step 6: Run tests to verify they pass**
 
-Run: `cargo test -p wordcartel fold_anchor`
+Run: `cargo test -p wordcartel fold_anchor_survives_insertion_above_it fold_anchor_at_heading_start_uses_before_bias undo_does_not_panic_and_clamps_fold_anchors`
 Expected: PASS.
 
 - [ ] **Step 7: Commit**
@@ -928,12 +1068,32 @@ fn rebuild_normalizes_scroll_that_a_fold_swallowed() {
     // scroll must have snapped to the heading line (2), never a hidden line.
     assert_eq!(ed.active().view.scroll, 2);
 }
+
+#[test]
+fn rebuild_reconciles_dead_fold_anchor() {
+    // The definitive reconcile check relocated from Task 4: after an edit that
+    // deletes a folded heading, rebuild's reconcile must DROP the anchor (the
+    // Task 4 EOF-clamp alone would leave a stale non-heading anchor).
+    use wordcartel_core::change::ChangeSet;
+    let doc = "## H\nbody\n## K\n";
+    let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 24));
+    ed.active_mut().folds.toggle(0); // fold ## H
+    // delete "## H\n" so byte 0 is no longer a heading start
+    let len = ed.active().document.buffer.len();
+    let cs = ChangeSet::delete(0.."## H\n".len(), len);
+    let txn = wordcartel_core::history::Transaction::new(cs);
+    let edit = wordcartel_core::block_tree::Edit { range: 0.."## H\n".len(), new_len: 0 };
+    ed.active_mut().apply(txn, edit, crate::editor::EditKind::Delete, &crate::editor::TestClock::default());
+    crate::derive::rebuild(&mut ed);
+    // byte 0 is now "body" — not a heading start — so the fold is gone.
+    assert!(!ed.active().folds.folded.contains(&0));
+}
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p wordcartel rebuild_omits_folded_body_lines_from_cache rebuild_normalizes_scroll_that_a_fold_swallowed`
-Expected: FAIL — body lines present / scroll unchanged.
+Run: `cargo test -p wordcartel rebuild_omits_folded_body_lines_from_cache rebuild_normalizes_scroll_that_a_fold_swallowed rebuild_reconciles_dead_fold_anchor`
+Expected: FAIL — body lines present / scroll unchanged / dead anchor retained.
 
 - [ ] **Step 3: Reconcile folds + build a FoldView + normalize scroll**
 
@@ -1014,12 +1174,13 @@ git commit -m "feat(5g): rebuild omits folded bodies + normalizes scroll + recon
 ## Task 6: nav — fold-aware caret motion + on-demand-layout refusal + caret normalize
 
 **Files:**
-- Modify: `wordcartel/src/nav.rs` — `move_up`/`move_down` (~284-368), `get_or_layout`/`layout_line_on_demand`/`layout_line_active` (~55-150), add a `normalize_caret_after` helper used by motions; `move_doc_end` (~650-656)
-- Test: `wordcartel/src/nav.rs` (`#[cfg(test)]` module)
+- Modify: `wordcartel/src/nav.rs` — `move_up`/`move_down` (~284-368), `move_doc_end` (~650-656), add the private `fold_view` helper
+- Modify: `wordcartel/src/commands.rs` — `Command::Move` arm (~line 357): central `normalize_caret` on the committed head
+- Test: `wordcartel/src/nav.rs` + `wordcartel/src/commands.rs` (`#[cfg(test)]` modules)
 
 **Interfaces:**
 - Consumes: `crate::fold::{FoldView, normalize_caret}`.
-- Produces: vertical motion that treats a folded heading as a single stop; on-demand layout that never re-materialises a hidden line; `move_doc_end` that lands on a visible line.
+- Produces: vertical motion that treats a folded heading as a single stop; on-demand layout only ever called on a visible line; `move_doc_end` and ALL `Command::Move` motions land on a visible line.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1057,9 +1218,11 @@ fn move_doc_end_lands_outside_a_fold() {
 Run: `cargo test -p wordcartel move_down_skips_folded_body move_doc_end_lands_outside_a_fold`
 Expected: FAIL.
 
-- [ ] **Step 3: Make on-demand layout refuse hidden lines**
+- [ ] **Step 3: Reroute cross-line motion through visible lines**
 
-`get_or_layout`/`layout_line_on_demand`/`layout_line_active` must never lay out a hidden line. Add a guard helper and use it at the cross-line points in `move_up`/`move_down`. Concretely, in `move_down`'s cross-line branch, replace the bare `l + 1` target with the next VISIBLE line; in `move_up`, the previous visible line:
+`get_or_layout`/`layout_line_on_demand`/`layout_line_active` return `ColMap` (NOT `Option<ColMap>`) — do NOT change their signatures. The correct fix is upstream: the cross-line branches of `move_up`/`move_down` must never ASK for a hidden line in the first place. Replace the bare `l + 1` / `l - 1` targets with `FoldView::next_visible(l)` / `prev_visible(l)`, so `layout_line_active` is only ever called on a visible line. Add a `debug_assert!(!fold_view(editor).is_hidden(nl))` at each call as a cheap invariant tripwire (debug builds only).
+
+In `move_down`'s cross-line branch, replace the bare `l + 1` target with the next VISIBLE line; in `move_up`, the previous visible line:
 
 ```rust
     // move_down cross-line branch:
@@ -1114,9 +1277,50 @@ pub fn move_doc_end(editor: &mut Editor) -> usize {
 }
 ```
 
+- [ ] **Step 4b: Central caret normalization in `Command::Move` (the invariant)**
+
+Vertical motion and `move_doc_end` are now fold-safe, but horizontal, word, and
+paragraph motions (`commands.rs`, the `Command::Move` arm ~line 357) compute raw
+byte targets and write `Selection::single(new_head)` with no fold awareness — a
+left/right/word/paragraph move could still land the caret inside a hidden body.
+Add ONE normalization at the single point where `Command::Move` commits the new
+head, which enforces the "caret always visible" invariant for EVERY motion at
+once:
+
+```rust
+    // commands.rs, Command::Move arm — after computing new_head, before setting selection:
+    let new_head = {
+        let b = editor.active();
+        crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, new_head)
+    };
+    editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(new_head);
+```
+
+Add a test:
+
+```rust
+#[test]
+fn horizontal_move_into_fold_normalizes_to_heading() {
+    let doc = "## A\nbody1\nbody2\n## B\n";
+    let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 24));
+    ed.active_mut().folds.toggle(doc.find("## A").unwrap());
+    crate::derive::rebuild(&mut ed);
+    // caret at end of "## A" line; move_right would cross into hidden "body1".
+    let a_end = doc.find("## A").unwrap() + "## A".len();
+    ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(a_end);
+    crate::commands::dispatch_move_right(&mut ed); // use the real Command::Move path/helper
+    let head = ed.active().document.selection.primary().head;
+    let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer) };
+    assert!(!fv.is_hidden(ed.active().document.buffer.byte_to_line(head)));
+}
+```
+
+> Use the real `Command::Move` dispatch path the codebase exposes for tests
+> (mirror an existing `commands.rs` move test). The assertion is the contract.
+
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cargo test -p wordcartel move_down_skips_folded_body move_doc_end_lands_outside_a_fold`
+Run: `cargo test -p wordcartel move_down_skips_folded_body move_doc_end_lands_outside_a_fold horizontal_move_into_fold_normalizes_to_heading`
 Expected: PASS.
 
 - [ ] **Step 6: Run the nav test set for no regression**
@@ -1127,8 +1331,8 @@ Expected: PASS (no-fold path unchanged — `next_visible`/`prev_visible` are `l�
 - [ ] **Step 7: Commit**
 
 ```bash
-git add wordcartel/src/nav.rs
-git commit -m "feat(5g): fold-aware caret motion + on-demand-layout refusal + doc-end normalize"
+git add wordcartel/src/nav.rs wordcartel/src/commands.rs
+git commit -m "feat(5g): fold-aware caret motion + central Command::Move normalize + doc-end"
 ```
 
 ---
@@ -1251,6 +1455,72 @@ After the existing clamps and the caret-above-scroll early returns, guard every 
 
 And in the caret-above branch, set `scroll = fv.normalize_line(l)` instead of raw `l`. (Caret `l` is already visible because Task 6 normalizes the caret, so `normalize_line(l) == l`; the call is defensive.)
 
+- [ ] **Step 5b: Make the typewriter branch fold-aware**
+
+The typewriter branch of `ensure_visible` (~nav.rs:379-402) returns BEFORE the
+Step-5 normalization and walks dense logical lines (`for li in 0..l` and the
+`'outer: for li in 0..total` solver), so folded body rows still affect centering
+and the resulting `(scroll, scroll_row)` can be a hidden line. Build one
+`FoldView` at the top of the branch and route both walks through visible lines:
+
+```rust
+    if editor.view_opts.typewriter {
+        let edit_height = (editor.active().view.area.1 as usize).saturating_sub(1);
+        if edit_height == 0 { return; }
+        let fv = fold_view(editor);
+        let anchor = editor.view_opts.typewriter_anchor.clamp(0.0, 1.0);
+        let anchor_row = ((edit_height as f32 * anchor).round() as usize).min(edit_height - 1);
+        let l = caret_line(editor);
+        let cvr = caret_visual_row(editor, l);
+        let text_width = text_geometry(editor).text_width as usize;
+        // caret absolute visual row: sum rows of VISIBLE lines before `l` only.
+        let mut caret_abs = cvr;
+        let mut li = if l == 0 { None } else { fv.prev_visible(l) };
+        // walk visible predecessors of `l`
+        let mut cursor = l;
+        while let Some(p) = (if cursor == 0 { None } else { fv.prev_visible(cursor) }) {
+            caret_abs += typewriter_rows_of_line(editor, p, text_width);
+            cursor = p;
+        }
+        let _ = li;
+        let target_top = caret_abs.saturating_sub(anchor_row);
+        // convert target_top -> (scroll, scroll_row) walking VISIBLE lines.
+        let mut acc = 0usize; let mut scroll = 0usize; let mut scroll_row = 0usize;
+        let mut vline = Some(0usize);
+        while let Some(li2) = vline {
+            let rows = rows_of_line(editor, li2);
+            if acc + rows > target_top { scroll = li2; scroll_row = target_top - acc; break; }
+            acc += rows; scroll = li2; scroll_row = rows.saturating_sub(1);
+            vline = fv.next_visible(li2);
+        }
+        editor.active_mut().view.scroll = fv.normalize_line(scroll);
+        editor.active_mut().view.scroll_row = scroll_row;
+        return;
+    }
+```
+
+> The implementer should simplify the predecessor walk to one loop (the draft
+> above keeps two cursors for clarity); the contract is: only visible lines
+> contribute rows, and the final `scroll` is `normalize_line`-clean.
+
+Add a test:
+
+```rust
+#[test]
+fn typewriter_scroll_is_visible_under_folds() {
+    let doc = "# Top\nintro\n## A\nb1\nb2\nb3\n## B\nt1\nt2\nt3\n";
+    let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 6));
+    ed.active_mut().view_opts.typewriter = true;
+    ed.active_mut().folds.toggle(doc.find("## A").unwrap());
+    crate::derive::rebuild(&mut ed);
+    let t2 = doc.find("t2").unwrap();
+    ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(t2);
+    crate::nav::ensure_visible(&mut ed);
+    let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer) };
+    assert!(!fv.is_hidden(ed.active().view.scroll));
+}
+```
+
 - [ ] **Step 6: Paging composes for free**
 
 `move_page_up`/`move_page_down` call `move_up`/`move_down` (Task 6, now fold-aware), so they already skip hidden lines. No change needed beyond confirming with a test:
@@ -1272,7 +1542,7 @@ fn page_down_skips_folded_section() {
 
 - [ ] **Step 7: Run tests to verify they pass**
 
-Run: `cargo test -p wordcartel ensure_visible_never_pins_scroll_to_hidden_line scroll_down_one_steps_over_hidden_lines page_down_skips_folded_section`
+Run: `cargo test -p wordcartel ensure_visible_never_pins_scroll_to_hidden_line scroll_down_one_steps_over_hidden_lines page_down_skips_folded_section typewriter_scroll_is_visible_under_folds`
 Expected: PASS.
 
 - [ ] **Step 8: Run the nav test set for no regression**
@@ -1666,18 +1936,16 @@ fn heading_jump(c: &mut Ctx, dir: Dirn) {
     }
 }
 
-/// Unfold every folded heading whose section strictly contains `byte` (so a jump
-/// target hidden inside a folded ancestor becomes visible).
+/// Unfold every folded heading whose BODY contains `byte` (so a jump target
+/// hidden inside a folded ancestor becomes visible). Body math comes from
+/// `outline::body_range` (ATX/setext correct, single source).
 pub(crate) fn unfold_ancestors_of(editor: &mut crate::editor::Editor, byte: usize) {
     let (blocks, buf) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.clone()) };
     let rope = buf.snapshot();
     let anchors: Vec<usize> = editor.active().folds.folded.iter().copied().collect();
     for hb in anchors {
-        let sect = wordcartel_core::outline::section_range(&blocks, &rope, hb);
-        // strictly inside the body (heading itself stays a valid landing)
-        let heading_line = buf.byte_to_line(hb);
-        let body_start = buf.line_to_byte(heading_line + 1).min(sect.end);
-        if byte >= body_start && byte < sect.end {
+        let body = wordcartel_core::outline::body_range(&blocks, &rope, hb);
+        if byte >= body.start && byte < body.end {
             editor.active_mut().folds.folded.remove(&hb);
         }
     }
@@ -1727,7 +1995,7 @@ fn overlay_lists_headings_indented_and_filters() {
     let doc = "# Top\n## Alpha\n## Beta\n### Beta1\n";
     let buf = wordcartel_core::buffer::TextBuffer::from_str(doc);
     let blocks = wordcartel_core::block_tree::full_parse_rope(&buf.snapshot());
-    let mut ov = OutlineOverlay::open(7, &blocks, &buf.snapshot());
+    let mut ov = OutlineOverlay::open(crate::editor::BufferId(7), &blocks, &buf.snapshot());
     assert_eq!(ov.rows.len(), 4);
     assert_eq!(ov.rows[0].indent, 0); // level 1
     assert_eq!(ov.rows[3].indent, 2); // level 3 (### Beta1)
@@ -1810,7 +2078,22 @@ impl OutlineOverlay {
 }
 ```
 
-> If `palette::fuzzy_filter` isn't a reusable shape, factor the nucleo call the palette uses into a small generic helper and call it here (DRY). Inspect `palette.rs` for the existing matcher usage.
+> **`crate::palette::fuzzy_filter` does NOT exist** — the nucleo matching is currently embedded inside `palette::rebuild_rows`. Before this step compiles, factor the nucleo call out of `rebuild_rows` into a reusable generic helper and have `rebuild_rows` call it, then call it here too (DRY). Add this as Step 3a:
+
+- [ ] **Step 3a: Factor a reusable fuzzy helper out of `palette::rebuild_rows`**
+
+In `palette.rs`, extract the nucleo matching into:
+
+```rust
+/// Fuzzy-rank `items` against `query` by each item's key string, best-first.
+/// Returns the matching items (cloned). Shared by the palette and the outline overlay.
+pub fn fuzzy_filter<T: Clone>(items: &[T], query: &str, key: impl Fn(&T) -> &str) -> Vec<T> {
+    // move the existing nucleo Matcher + Pattern construction from rebuild_rows here
+    // ...
+}
+```
+
+Refactor `rebuild_rows` to call `fuzzy_filter`, run `cargo test -p wordcartel palette::` to confirm no behaviour change, then proceed.
 
 - [ ] **Step 4: Wire the overlay field + opener (editor.rs)**
 
@@ -1994,7 +2277,15 @@ In `diag_next`/`diag_prev`, after computing `target` and before setting the sele
     crate::nav::ensure_visible(c.editor);
 ```
 
-Do the same wherever quick-fix sets the caret to a diagnostic range.
+**Quick-fix apply (app.rs ~637):** the quick-fix apply path computes `new_cursor` after applying a suggestion edit and writes the selection directly. Add the unfold there too, before the selection write:
+
+```rust
+    crate::registry::unfold_ancestors_of(editor, new_cursor);
+    editor.active_mut().document.selection =
+        wordcartel_core::selection::Selection::single(new_cursor);
+```
+
+(The edit may have changed headings; `unfold_ancestors_of` runs against the post-edit tree via `rebuild`, so call it after the edit's `rebuild`/derive has refreshed the block tree, or rely on the next `rebuild` to reconcile — confirm ordering against the real apply path.)
 
 - [ ] **Step 5: Run tests to verify they pass**
 
@@ -2077,6 +2368,17 @@ pub struct StateEntry {
 }
 ```
 
+- [ ] **Step 3b: Update every `StateEntry { .. }` literal**
+
+Adding a field breaks every struct-literal construction of `StateEntry`. Grep for them and fix each:
+
+Run: `rg -n "StateEntry \{" wordcartel/src`
+
+The production builder (`app.rs` persist, Step 4) gets `folds: ...` explicitly. Every OTHER literal — in `state.rs` tests and `app.rs` tests — append `folds: vec![]` (or end the literal with `..Default::default()` if it already omits optional fields). Build to confirm none are missed:
+
+Run: `cargo build -p wordcartel --tests`
+Expected: no "missing field `folds`" errors.
+
 - [ ] **Step 4: Persist folds (app.rs)**
 
 In the persist block, add `folds` from the active buffer:
@@ -2151,10 +2453,18 @@ fn reload_reconciles_folds_against_new_content() {
     ed.active_mut().folds.toggle("## A\nbody\n".len()); // fold ## B
     // rewrite the file so ## B is gone
     std::fs::write(&path, "## A\nbody only\n").unwrap();
+    let b_anchor = "## A\nbody\n".len(); // the ## B offset we folded
     crate::save::reload_from_disk(&mut ed);
-    // ## B anchor no longer a heading start -> dropped by reconcile
-    assert!(ed.active().folds.folded.iter().all(|&b| b < ed.active().document.buffer.len()));
-    // a surviving fold of ## A (byte 0) would still be valid; assert no panic + caret visible
+    // STRONG assertion: the exact stale ## B anchor is gone, and the surviving
+    // fold set equals exactly the post-reconcile heading-start set it should be.
+    assert!(!ed.active().folds.folded.contains(&b_anchor), "stale ## B fold must be dropped");
+    let starts: std::collections::BTreeSet<usize> = {
+        let b = ed.active();
+        wordcartel_core::outline::heading_starts(&b.document.blocks, &b.document.buffer.snapshot())
+    };
+    assert!(ed.active().folds.folded.iter().all(|b| starts.contains(b)),
+        "every surviving fold must be a real heading start in the new content");
+    // caret is visible (normalize is a no-op because it's already out of folds)
     let head = ed.active().document.selection.primary().head;
     let b = ed.active();
     assert_eq!(crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, head), head);
@@ -2237,18 +2547,20 @@ git commit -m "feat(5g): reconcile folds + normalize caret on reload/recovery"
 - [ ] **Step 1: Write the failing test**
 
 ```rust
-// keymap.rs
+// keymap.rs — NOTE: `build_cua_keymap`/`parse_chord_seq` do NOT exist. The real
+// API is `build_keymap(&KeymapConfig, &Registry)` and `parse_seq(&str)`. Confirm
+// the exact names against an existing keymap test before running.
 #[test]
 fn fold_and_outline_binds_resolve_and_do_not_collide() {
-    let km = build_cua_keymap(); // the project's CUA builder
-    let chord = |s: &str| parse_chord_seq(s); // existing test helper
-    assert_eq!(km.resolve(&chord("alt-o")), Resolution::Command(CommandId("outline")));
-    assert_eq!(km.resolve(&chord("alt-up")), Resolution::Command(CommandId("heading_prev")));
-    assert_eq!(km.resolve(&chord("alt-down")), Resolution::Command(CommandId("heading_next")));
-    assert_eq!(km.resolve(&chord("alt-shift-up")), Resolution::Command(CommandId("heading_parent")));
-    assert_eq!(km.resolve(&chord("alt-z")), Resolution::Command(CommandId("fold_toggle")));
-    assert_eq!(km.resolve(&chord("alt-shift-z")), Resolution::Command(CommandId("fold_all")));
-    assert_eq!(km.resolve(&chord("alt-shift-x")), Resolution::Command(CommandId("unfold_all")));
+    let km = build_keymap(&KeymapConfig::default(), &Registry::builtins());
+    let seq = |s: &str| parse_seq(s).unwrap();
+    assert_eq!(km.resolve(&seq("alt-o")), Resolution::Command(CommandId("outline")));
+    assert_eq!(km.resolve(&seq("alt-up")), Resolution::Command(CommandId("heading_prev")));
+    assert_eq!(km.resolve(&seq("alt-down")), Resolution::Command(CommandId("heading_next")));
+    assert_eq!(km.resolve(&seq("alt-shift-up")), Resolution::Command(CommandId("heading_parent")));
+    assert_eq!(km.resolve(&seq("alt-z")), Resolution::Command(CommandId("fold_toggle")));
+    assert_eq!(km.resolve(&seq("alt-shift-z")), Resolution::Command(CommandId("fold_all")));
+    assert_eq!(km.resolve(&seq("alt-shift-x")), Resolution::Command(CommandId("unfold_all")));
 }
 ```
 
@@ -2286,7 +2598,7 @@ Add to `key_to_command_id` (keeping the test mirror in sync, as the module comme
         KeyCode::Char('x') if alt && shift  => id("unfold_all"),
 ```
 
-(Place these BEFORE the generic `KeyCode::Char(c) if !ctrl && !alt` insert arm and the bare arrow arms; the `alt` guards keep them from shadowing existing binds.)
+**CRITICAL ordering:** the existing function has bare `KeyCode::Up => ...` / `KeyCode::Down => ...` arms (the non-shift move/select arrows). A `match` evaluates top-down, and a bare `KeyCode::Up =>` with NO guard matches FIRST and shadows any later `KeyCode::Up if alt` arm. Therefore the new `KeyCode::Up/Down if alt ...` arms MUST be placed physically ABOVE the existing bare arrow arms (and above the generic `KeyCode::Char(c) if !ctrl && !alt` insert arm). Insert them immediately after the existing F8/diag arms, before the `KeyCode::Left/Right/Up/Down` block.
 
 - [ ] **Step 5: Run test to verify it passes**
 
