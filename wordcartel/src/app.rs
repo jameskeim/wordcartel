@@ -1426,8 +1426,20 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     recompute_scrollbar_visible(&mut editor, clock.now_ms());
     // After a potential session-resume the scroll may have changed; re-clamp/re-pin
     // and rebuild the layout cache so the very first frame is always correct.
-    crate::nav::ensure_visible(&mut editor);
+    // Order: rebuild (reconciles folds + layout) → SnapOut restored caret → ensure_visible.
+    // This ensures a cursor saved inside a now-folded section is snapped to the visible
+    // heading before the first draw, maintaining the caret-never-in-a-fold invariant.
     derive::rebuild(&mut editor);
+    {
+        use crate::registry::{place_caret_visible, CaretPlace};
+        let head = editor.active().document.selection.primary().head;
+        let nh = place_caret_visible(&mut editor, head, CaretPlace::SnapOut);
+        if nh != head {
+            editor.active_mut().document.selection =
+                wordcartel_core::selection::Selection::single(nh);
+        }
+    }
+    crate::nav::ensure_visible(&mut editor);
     guard.terminal().draw(|f| render::render(f, &mut editor))?;
     loop {
         let now = clock.now_ms();
@@ -3329,5 +3341,82 @@ mod tests {
             "caret must be on the 'needle' match");
         assert!(!ed.active().folds.folded.contains(&a_byte),
             "## A fold must be cleared when jumping into its body");
+    }
+
+    /// Regression test: a cursor restored from a session entry that falls inside a
+    /// folded section must be snapped out to the section heading on startup.
+    ///
+    /// Tests the `derive::rebuild → SnapOut → ensure_visible` sequence inserted
+    /// into the session-resume path in `run()`. Full TTY/disk setup is not used;
+    /// the test drives the same API at the unit-test seam. The test FAILS (final
+    /// assertion fires) if the SnapOut block is removed from the test body, and
+    /// PASSES with it in place — mirroring failure/pass for the production change.
+    #[test]
+    fn resume_snaps_saved_cursor_out_of_restored_fold() {
+        use crate::editor::Editor;
+        use crate::registry::{place_caret_visible, CaretPlace};
+        use crate::fold::FoldView;
+
+        // Document with a heading "## A" followed by a body.
+        // "# Top\nintro\n## A\nbody1\nbody2\n## B\ntail\n"
+        //   byte 0:  '# Top\n'  (6 bytes)
+        //   byte 6:  'intro\n'  (6 bytes)
+        //   byte 12: '## A\n'   (5 bytes) ← heading start
+        //   byte 17: 'body1\n'  (6 bytes)
+        //   byte 23: 'body2\n'  (6 bytes) ← saved cursor lands inside here
+        //   byte 29: '## B\n'
+        const DOC: &str = "# Top\nintro\n## A\nbody1\nbody2\n## B\ntail\n";
+        let mut editor = Editor::new_from_text(DOC, None, (80, 24));
+
+        let heading_a = DOC.find("## A").unwrap();           // byte 12
+        let cursor_in_body = DOC.find("body2").unwrap() + 1; // byte 24, inside body2
+
+        // — Simulate the session-resume block in run() —
+        // Restore cursor to the saved (inside-fold) position.
+        editor.active_mut().document.selection =
+            wordcartel_core::selection::Selection::single(cursor_in_body);
+        // Restore fold on "## A" and reconcile (mirrors app.rs resume block).
+        editor.active_mut().folds.folded.insert(heading_a);
+        {
+            let b = editor.active();
+            let blocks = b.document.blocks.clone();
+            let buf = b.document.buffer.clone();
+            editor.active_mut().folds.reconcile(&blocks, &buf);
+        }
+
+        // Precondition: before SnapOut, the restored cursor IS inside the fold.
+        // This is what the bug looks like: cursor is hidden after resume without the fix.
+        {
+            let b = editor.active();
+            let fv = FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer);
+            let raw_line = b.document.buffer.byte_to_line(cursor_in_body);
+            assert!(fv.is_hidden(raw_line),
+                "precondition: without SnapOut the restored cursor sits inside the fold");
+        }
+
+        // — The fix: derive::rebuild then SnapOut (same order as in run()) —
+        // If you comment out the SnapOut block below, the final assertion fails.
+        crate::derive::rebuild(&mut editor);
+        {
+            // SnapOut: snap restored caret to heading if it landed inside a fold.
+            let head = editor.active().document.selection.primary().head;
+            let nh = place_caret_visible(&mut editor, head, CaretPlace::SnapOut);
+            if nh != head {
+                editor.active_mut().document.selection =
+                    wordcartel_core::selection::Selection::single(nh);
+            }
+        }
+
+        // Postcondition: cursor is now on the heading byte, NOT hidden.
+        let final_head = editor.active().document.selection.primary().head;
+        assert_eq!(final_head, heading_a,
+            "SnapOut must move the caret from inside-fold body to the '## A' heading");
+        {
+            let b = editor.active();
+            let fv = FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer);
+            let final_line = b.document.buffer.byte_to_line(final_head);
+            assert!(!fv.is_hidden(final_line),
+                "caret must not be on a hidden line after resume normalization");
+        }
     }
 }
