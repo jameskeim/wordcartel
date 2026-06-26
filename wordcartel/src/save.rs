@@ -541,11 +541,14 @@ mod tests {
         std::fs::write(&path, "## A\nbody\n## B\nx\n").unwrap();
         let mut ed = crate::editor::Editor::new_from_text("## A\nbody\n## B\nx\n", Some(path.clone()), (80, 24));
         crate::derive::rebuild(&mut ed);
+        ed.active_mut().folds.toggle(0); // fold ## A (byte 0, survives rewrite)
         ed.active_mut().folds.toggle("## A\nbody\n".len()); // fold ## B
         // rewrite the file so ## B is gone
         std::fs::write(&path, "## A\nbody only\n").unwrap();
         let b_anchor = "## A\nbody\n".len(); // the ## B offset we folded
         crate::save::reload_from_disk(&mut ed);
+        // STRONG assertion: ## A is still a heading at byte 0 — its fold must be preserved
+        assert!(ed.active().folds.folded.contains(&0), "## A still exists after reload — its fold must be preserved");
         // STRONG assertion: the exact stale ## B anchor is gone, and the surviving
         // fold set equals exactly the post-reconcile heading-start set it should be.
         assert!(!ed.active().folds.folded.contains(&b_anchor), "stale ## B fold must be dropped");
