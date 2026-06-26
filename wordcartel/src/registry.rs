@@ -220,6 +220,11 @@ impl Registry {
 
         // Diagnostics — quick-fix overlay + navigation + recheck (Task 6–7 / Effort 5f).
         r.register("quick_fix", "Quick Fix\u{2026}", None, |c| {
+            let b = c.editor.active();
+            if !b.diagnostics.valid_for(b.document.version) {
+                c.editor.status = "no diagnostic here".into();
+                return CommandResult::Handled;
+            }
             let caret = c.editor.active().document.selection.primary().head;
             let diag = c.editor.active().diagnostics.diagnostics.iter()
                 .find(|d| d.range.start <= caret && caret <= d.range.end)
@@ -232,6 +237,10 @@ impl Registry {
             CommandResult::Handled
         });
         r.register("diag_next", "Next Diagnostic", None, |c| {
+            let b = c.editor.active();
+            if !b.diagnostics.valid_for(b.document.version) {
+                return CommandResult::Handled;
+            }
             let diags = c.editor.active().diagnostics.diagnostics.clone();
             if diags.is_empty() { return CommandResult::Handled; }
             let caret = c.editor.active().document.selection.primary().to();
@@ -246,6 +255,10 @@ impl Registry {
             CommandResult::Handled
         });
         r.register("diag_prev", "Previous Diagnostic", None, |c| {
+            let b = c.editor.active();
+            if !b.diagnostics.valid_for(b.document.version) {
+                return CommandResult::Handled;
+            }
             let diags = c.editor.active().diagnostics.diagnostics.clone();
             if diags.is_empty() { return CommandResult::Handled; }
             let caret = c.editor.active().document.selection.primary().to();

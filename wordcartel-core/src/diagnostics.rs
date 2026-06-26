@@ -134,6 +134,9 @@ fn classify(lint: &HarperLint) -> Option<DiagnosticKind> {
 /// scalar values). `char_indices()` yields `(byte_offset, char)` pairs; we walk
 /// them to map char index → byte offset.
 fn char_span_to_bytes(text: &str, span: harper_core::Span<char>) -> std::ops::Range<usize> {
+    // Sentinel default: `text.len()` maps an end-of-string-exclusive span position
+    // to the byte length of `text`, so spans that reach the very end of the buffer
+    // produce a valid half-open range without an explicit end-of-string case.
     let mut start_byte = text.len();
     let mut end_byte = text.len();
 

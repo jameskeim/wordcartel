@@ -586,14 +586,19 @@ fn search_pin(editor: &mut Editor) {
 fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
     // Clone what we need out of the overlay before mutating editor.
     let overlay_info = editor.diag.as_ref().map(|ov| {
-        let a = ov.anchor.range.start;
-        let b = ov.anchor.range.end;
         let is_ignore = ov.is_ignore();
         let is_add_dict = ov.is_add_dict();
         let suggestion = ov.chosen_suggestion().cloned();
-        (a, b, is_ignore, is_add_dict, suggestion)
+        (ov.anchor.range.start, ov.anchor.range.end, is_ignore, is_add_dict, suggestion)
     });
-    let Some((a, b, is_ignore, is_add_dict, suggestion)) = overlay_info else { return; };
+    let Some((raw_a, raw_b, is_ignore, is_add_dict, suggestion)) = overlay_info else { return; };
+
+    // Clamp the stale/oversized anchor range to the current doc length so a
+    // multibyte/shrink race can never cause buffer.slice or build_range_replace
+    // to panic (defense-in-depth even when the command-handler validity gate fires).
+    let doc_len = editor.active().document.buffer.len();
+    let a = raw_a.min(doc_len);
+    let b = raw_b.min(doc_len);
 
     if is_ignore {
         // Add the surface word to session_ignores, close, re-arm a recheck.
@@ -622,7 +627,6 @@ fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_core::history
         }
     } else if let Some(s) = suggestion {
         // Apply the suggestion as an undoable edit, then close.
-        let doc_len = editor.active().document.buffer.len();
         let (cs, edit) = match &s {
             wordcartel_core::diagnostics::Suggestion::ReplaceWith(t) =>
                 crate::commands::build_range_replace(a, b, t, doc_len),
@@ -645,7 +649,7 @@ fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_core::history
         crate::nav::ensure_visible(editor);
         editor.diag = None;
     }
-    // else: no suggestion and not ignore/add_dict — shouldn't happen, but close anyway.
+    // else: no suggestion and not ignore/add_dict — unreachable (selected is always in range).
 }
 
 /// Process one message. Returns true while the app should keep running.
@@ -1232,6 +1236,19 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
 
     // Warm the pandoc probe cache so the first export command doesn't pay latency.
     let _ = crate::export::probe_pandoc();
+
+    // Warm Harper's FstDictionary LazyLock off the critical path so the first
+    // real diagnostics check isn't ~11s. Fire-and-forget; discard the result.
+    if editor.diag_cfg.enabled {
+        std::thread::Builder::new()
+            .name("wcartel-diag-warm".into())
+            .spawn(|| {
+                let ignore = std::collections::HashSet::new();
+                let opts = wordcartel_core::diagnostics::CheckOpts { grammar: false, ignore_words: &ignore };
+                let _ = wordcartel_core::diagnostics::check("", &opts);
+            })
+            .expect("spawn diag warmup thread");
+    }
 
     let reg = Registry::builtins();
     // Build the keymap from the loaded config and surface any warnings.
@@ -2980,10 +2997,46 @@ mod tests {
         use crate::editor::Editor;
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         let d = wordcartel_core::diagnostics::Diagnostic { range: 0..1, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(), suggestions: vec![] };
-        e.open_diag(d);
+        // open_diag clears a previously-open palette/search (reverse XOR direction)
+        e.open_palette();
+        assert!(e.palette.is_some(), "palette open before open_diag");
+        e.open_diag(d.clone());
+        assert!(e.palette.is_none(), "open_diag clears palette");
         assert!(e.diag.is_some());
+        // the other direction: opening the palette clears an open diag overlay
         e.open_palette();
         assert!(e.diag.is_none(), "open_palette clears diag");
+    }
+
+    /// Regression: quick_fix dispatched after an edit (when valid_for is false) must
+    /// NOT open the overlay and must NOT corrupt the buffer. Before the fix the
+    /// handlers read stale diagnostic byte ranges unchecked.
+    #[test]
+    fn quick_fix_on_stale_diagnostics_is_noop_no_overlay() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        let v = e.active().document.version;
+        // Store a diagnostic at version V.
+        e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(),
+            suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] }];
+        e.active_mut().diagnostics.computed_version = v;
+        // Simulate an intervening edit: bump the document version so valid_for is now false.
+        e.active_mut().document.version = v + 1;
+        assert!(!e.active().diagnostics.valid_for(e.active().document.version),
+            "precondition: diagnostics must be stale after version bump");
+        let buf_before = e.active().document.buffer.to_string();
+        // Place cursor inside the stale diagnostic range.
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let ctrl_dot = Event::Key(KeyEvent { code: KeyCode::Char('.'), modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(ctrl_dot), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        // The overlay must NOT open and the buffer must be unchanged.
+        assert!(e.diag.is_none(), "stale diagnostics: quick_fix must NOT open the overlay");
+        assert_eq!(e.active().document.buffer.to_string(), buf_before, "buffer must be unchanged");
     }
 
     #[test]

@@ -30,10 +30,13 @@ pub fn next_deadline(terms: &[Option<u64>]) -> Option<u64> {
 }
 
 /// A re-check is due if armed, the time has been reached, and no check is
-/// already in flight for this exact version.
-pub fn diag_due(store: &DiagStore, now: u64, version: u64) -> bool {
+/// already in flight (for any version). A check in flight for a different
+/// version also blocks dispatch — the result will arrive shortly and the
+/// debounce will re-arm for the latest version, preventing pile-up during
+/// the slow first Harper init.
+pub fn diag_due(store: &DiagStore, now: u64, _version: u64) -> bool {
     matches!(store.recheck_due_at, Some(t) if now >= t)
-        && store.in_flight_version != Some(version)
+        && store.in_flight_version.is_none()
 }
 
 /// Spawn a worker thread that runs Harper and sends Msg::DiagnosticsDone.
@@ -111,8 +114,12 @@ mod tests {
         s.arm(1000, 400);
         assert!(!diag_due(&s, 1399, 7), "not yet due");
         assert!(diag_due(&s, 1400, 7), "due at deadline");
+        // same version in flight → blocks
         s.in_flight_version = Some(7);
         assert!(!diag_due(&s, 1500, 7), "already in flight for this version");
+        // different version in flight → ALSO blocks (single-in-flight invariant)
+        s.in_flight_version = Some(8);
+        assert!(!diag_due(&s, 1500, 7), "in flight for a different version also blocks dispatch");
     }
 
     #[test]
