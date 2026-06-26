@@ -34,7 +34,8 @@ of scope for v1).
 - Highlight **all** matches in the viewport; distinct style for the current match.
 - `find-next` / `find-prev` with wrap-around + a wrapped indicator.
 - Live `N/M` match count (full-document scan; cap deferred).
-- **Replace-all** as a single undo unit, behind a `[y/n]` confirm.
+- **Replace-all** as a single undo unit, applied directly (no confirm — the
+  single-undo-unit is the safety net, and query-replace covers per-match review).
 - **Interactive query-replace**: per-match `y`/`n`/`!`/`q` stepping.
 - `$1`..`$9` capture references in regex-mode replacements; literal text otherwise.
 - Match-finding in `wordcartel-core` (IO-free, oracle-tested).
@@ -249,9 +250,16 @@ This keeps highlighting O(visible glyphs) per frame. The `N/M` count uses
 the search bar (§5).
 
 ### 4.5 Replace-all
+> **Decision (whole-branch review, 2026-06-26):** replace-all applies
+> **immediately on `Alt+A` with no `[y/n]` confirm**. Rationale: the whole
+> operation is a single undo unit (`Ctrl+Z` reverts it in full), the status line
+> reports the count afterward, and interactive query-replace (§4.6) already
+> covers "review each match" — so a confirm prompt is redundant friction. (The
+> earlier draft gated this behind `[y/n]`; that gate is intentionally removed.)
+
 - `Replace All` (key in §5) on a non-empty valid needle:
-  1. `count` → if 0, status "No matches"; if >0, confirm `Replace N occurrences? [y/n]`.
-  2. On `y`: walk matches **left-to-right** and hand-build **one** multi-op
+  1. `count` → if 0, status "No matches" (no edit). If >0, proceed directly to step 2.
+  2. Walk matches **left-to-right** and hand-build **one** multi-op
      `ChangeSet` over the **original** offsets — a sequence of
      `retain(gap) · delete(match) · insert(expanded-template)` ops covering the
      whole document (this is why no remapping is needed: nothing is applied
@@ -267,7 +275,9 @@ the search bar (§5).
      Because `editor.apply` is one `commit_coalescing` call producing one
      inverse changeset, this is intrinsically **one undo unit** — no separate
      history-grouping mechanism is required.
-  5. Status: "Replaced N occurrences"; caret left at the last replacement.
+  5. Status: "Replaced N occurrences". The overlay closes and the caret lands at
+     the **remapped `origin`** (`map_pos(origin, &cs)`) — Esc-to-origin semantics
+     carried through the replacement, rather than at the last replacement.
 
 ### 4.6 Interactive query-replace (Stepping)
 - `Replace` then step-key (§5) enters `Phase::Stepping`: park on the first match
@@ -339,7 +349,7 @@ Replace "(\w+), (\w+)" → "$2 $1" ?   [y]es [n]o [!]all [q]uit   3/8
 | `Alt+R` | overlay | toggle Literal ↔ Regex |
 | `Alt+C` | overlay | cycle case Smart → Sensitive → Insensitive |
 | `Tab` | Replace | switch focus Needle ↔ Template |
-| `Alt+A` | Replace | Replace-All (→ `[y/n]` confirm) |
+| `Alt+A` | Replace | Replace-All (applies immediately; status reports the count) |
 | `Alt+Enter` | Replace | start interactive query-replace (Stepping) |
 | `y`/`n`/`!`/`q` | Stepping | replace / skip / rest / quit |
 | printable | Find/Replace | insert into focused field |
