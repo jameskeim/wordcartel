@@ -743,6 +743,7 @@ pub fn reduce(
         Msg::Input(Event::Resize(w, h)) => {
             editor.active_mut().view.area = (w, h);
             derive::rebuild(editor);
+            crate::nav::ensure_visible(editor);
         }
         Msg::Input(Event::Mouse(ev)) => {
             crate::mouse::handle(editor, ev, reg, keymap, ex, clock, msg_tx);
@@ -1001,6 +1002,10 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
 
     recompute_scrollbar_visible(&mut editor, clock.now_ms());
+    // After a potential session-resume the scroll may have changed; re-clamp/re-pin
+    // and rebuild the layout cache so the very first frame is always correct.
+    crate::nav::ensure_visible(&mut editor);
+    derive::rebuild(&mut editor);
     guard.terminal().draw(|f| render::render(f, &mut editor))?;
     loop {
         let now = clock.now_ms();
@@ -2405,5 +2410,60 @@ mod tests {
         // Recompute after the fade deadline — bar must hide.
         crate::app::recompute_scrollbar_visible(&mut e, t + 1300);
         assert!(!e.mouse.scrollbar_visible, "scrollbar must hide after scrollbar_until_ms expires");
+    }
+
+    /// Finding 2 regression: after a resize to a smaller terminal the stale
+    /// scroll_row must be clamped so the caret remains visible.
+    ///
+    /// Setup: 50-line doc; scroll to line 30 with scroll_row=5 in a large
+    /// 80×40 terminal. Then resize to 80×10 and dispatch Msg::Input(Resize).
+    /// With the fix, ensure_visible clamps scroll/scroll_row so that a
+    /// subsequent rebuild + screen_pos succeeds.  Without the fix the stale
+    /// scroll_row could exceed the new visible range and render would skip rows.
+    #[test]
+    fn resize_re_pins_scroll() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        use crossterm::event::Event;
+
+        let text: String = (0..50).map(|i| format!("line {i}\n")).collect();
+        let mut e = Editor::new_from_text(&text, None, (80, 40));
+        // Rebuild once for the initial large area so layouts are populated.
+        crate::derive::rebuild(&mut e);
+
+        // Manually push scroll deep into the document (line 30) and set a
+        // non-zero scroll_row to simulate a resumed or scrolled position.
+        e.active_mut().view.scroll = 30;
+        e.active_mut().view.scroll_row = 5;
+
+        // Build a minimal reduce context.
+        let reg = Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        // Dispatch a resize to a much smaller terminal.
+        crate::app::reduce(
+            crate::app::Msg::Input(Event::Resize(80, 10)),
+            &mut e, &reg, &km, &ex, &clk, &tx,
+        );
+
+        // After resize + ensure_visible the cache must be fresh and screen_pos
+        // must return Some (caret is visible on the new geometry).
+        crate::derive::rebuild(&mut e);
+        let pos = crate::nav::screen_pos(&e);
+        assert!(
+            pos.is_some(),
+            "caret must be visible after resize; scroll={} scroll_row={}",
+            e.active().view.scroll, e.active().view.scroll_row,
+        );
+
+        // scroll_row must be 0 (single-visual-row lines) — never a stale large value.
+        assert_eq!(
+            e.active().view.scroll_row, 0,
+            "scroll_row must be clamped to a valid value after resize",
+        );
     }
 }

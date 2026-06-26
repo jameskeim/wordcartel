@@ -237,16 +237,14 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             // Build spans for this visual row.
             let mut spans: Vec<Span<'_>> = Vec::new();
 
-            // Prepend prefix_glyph as a dim span (first visual row only).
-            if let Some(ref glyph) = vr.prefix_glyph {
-                spans.push(Span::styled(
-                    glyph.clone(),
-                    RStyle::default().add_modifier(Modifier::DIM),
-                ));
-            }
-
             // One span per StyledSeg — apply DarkGray dim when row is outside active region.
             let dim_style = RStyle::default().fg(Color::DarkGray);
+
+            // Prepend prefix_glyph as a dim span (first visual row only).
+            if let Some(ref glyph) = vr.prefix_glyph {
+                let gstyle = if row_dim { dim_style } else { RStyle::default().add_modifier(Modifier::DIM) };
+                spans.push(Span::styled(glyph.clone(), gstyle));
+            }
             for seg in &vr.segs {
                 let style = if row_dim { dim_style } else { style_to_ratatui(seg.style) };
                 spans.push(Span::styled(seg.text.clone(), style));
