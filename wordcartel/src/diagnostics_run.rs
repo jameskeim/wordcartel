@@ -1,6 +1,7 @@
 //! Diagnostics runtime (shell): per-buffer store, pure debounce helpers,
 //! worker dispatch (Task 4), version-gated apply (Task 4), dictionary IO.
 use wordcartel_core::diagnostics::Diagnostic;
+use crate::editor::{BufferId, Editor};
 
 #[derive(Debug, Default, Clone)]
 pub struct DiagStore {
@@ -33,6 +34,49 @@ pub fn next_deadline(terms: &[Option<u64>]) -> Option<u64> {
 pub fn diag_due(store: &DiagStore, now: u64, version: u64) -> bool {
     matches!(store.recheck_due_at, Some(t) if now >= t)
         && store.in_flight_version != Some(version)
+}
+
+/// Spawn a worker thread that runs Harper and sends Msg::DiagnosticsDone.
+/// Mirrors filter::dispatch_filter (spawn + msg_tx). Sets in_flight_version.
+pub fn dispatch_diagnostics(
+    editor: &mut Editor,
+    cfg: &crate::config::DiagnosticsConfig,
+    ignore_words: std::sync::Arc<std::collections::HashSet<String>>,
+    msg_tx: std::sync::mpsc::Sender<crate::app::Msg>,
+) {
+    let b = editor.active();
+    let buffer_id = b.id;
+    let version = b.document.version;
+    let text = b.document.buffer.snapshot().to_string();
+    let grammar = cfg.grammar;
+    editor.active_mut().diagnostics.in_flight_version = Some(version);
+    editor.active_mut().diagnostics.recheck_due_at = None; // consumed
+    std::thread::spawn(move || {
+        let opts = wordcartel_core::diagnostics::CheckOpts { grammar, ignore_words: &ignore_words };
+        let diagnostics = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wordcartel_core::diagnostics::check(&text, &opts)
+        })).unwrap_or_default(); // Harper panic → no diagnostics, never crash the loop (spec §8)
+        let _ = msg_tx.send(crate::app::Msg::DiagnosticsDone { buffer_id, version, diagnostics });
+    });
+}
+
+/// Version-gated apply: store only if `version` is still current for `buffer_id`.
+pub fn apply_diagnostics_done(
+    editor: &mut Editor,
+    buffer_id: BufferId,
+    version: u64,
+    diagnostics: Vec<Diagnostic>,
+) {
+    if let Some(b) = editor.by_id_mut(buffer_id) {
+        if b.document.version == version {
+            b.diagnostics.diagnostics = diagnostics;
+            b.diagnostics.computed_version = version;
+        }
+        // clear in_flight for this version regardless (the check completed)
+        if b.diagnostics.in_flight_version == Some(version) {
+            b.diagnostics.in_flight_version = None;
+        }
+    }
 }
 
 #[cfg(test)]

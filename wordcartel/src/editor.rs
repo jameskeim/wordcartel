@@ -175,6 +175,12 @@ pub struct Editor {
     pub view_opts: crate::config::ViewConfig,
     /// Search/replace overlay state. XOR with prompt/minibuffer/palette/menu.
     pub search: Option<crate::search_overlay::SearchState>,
+    /// Diagnostics configuration. Seeded from config at startup.
+    pub diag_cfg: crate::config::DiagnosticsConfig,
+    /// Personal dictionary loaded from `diag_cfg.dictionary` at startup.
+    pub dictionary: std::collections::HashSet<String>,
+    /// Session-level words to ignore (added via ignore-word command).
+    pub session_ignores: std::collections::HashSet<String>,
 }
 
 impl Editor {
@@ -210,6 +216,9 @@ impl Editor {
             mouse: MouseState::default(),
             view_opts: crate::config::ViewConfig::default(),
             search: None,
+            diag_cfg: crate::config::DiagnosticsConfig::default(),
+            dictionary: std::collections::HashSet::new(),
+            session_ignores: std::collections::HashSet::new(),
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer {

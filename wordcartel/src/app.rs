@@ -52,6 +52,11 @@ pub enum Msg {
         kind: crate::transform::TransformKind,
         result: Result<String, crate::transform::TransformError>,
     },
+    DiagnosticsDone {
+        buffer_id: crate::editor::BufferId,
+        version: u64,
+        diagnostics: Vec<wordcartel_core::diagnostics::Diagnostic>,
+    },
     ClipboardPaste { id: u64, buffer_id: crate::editor::BufferId, text: Option<String> },
     ClipboardAvailability(bool),
     Tick,
@@ -82,6 +87,12 @@ impl std::fmt::Debug for Msg {
                 .field("version", version)
                 .field("range", range)
                 .field("kind", kind)
+                .finish(),
+            Msg::DiagnosticsDone { buffer_id, version, diagnostics } => f
+                .debug_struct("DiagnosticsDone")
+                .field("buffer_id", buffer_id)
+                .field("version", version)
+                .field("count", &diagnostics.len())
                 .finish(),
             Msg::ClipboardPaste { id, buffer_id, text } => f.debug_struct("ClipboardPaste")
                 .field("id", id).field("buffer_id", buffer_id)
@@ -753,6 +764,9 @@ pub fn reduce(
             Msg::TransformDone { buffer_id, version, range, kind, result } => {
                 apply_transform_done(editor, buffer_id, version, range, kind, result, clock);
             }
+            Msg::DiagnosticsDone { buffer_id, version, diagnostics } => {
+                crate::diagnostics_run::apply_diagnostics_done(editor, buffer_id, version, diagnostics);
+            }
             Msg::ClipboardPaste { buffer_id, text, .. } => apply_clipboard_paste(editor, buffer_id, text, clock),
             Msg::ClipboardAvailability(ok) => apply_clipboard_availability(editor, ok),
             // Resize/Tick/other input: ignored for the modal, but results still drain below.
@@ -942,6 +956,9 @@ pub fn reduce(
         Msg::TransformDone { buffer_id, version, range, kind, result } => {
             apply_transform_done(editor, buffer_id, version, range, kind, result, clock);
         }
+        Msg::DiagnosticsDone { buffer_id, version, diagnostics } => {
+            crate::diagnostics_run::apply_diagnostics_done(editor, buffer_id, version, diagnostics);
+        }
         Msg::Tick => {
             let now = clock.now_ms();
             if editor.active().document.dirty()
@@ -952,12 +969,28 @@ pub fn reduce(
                 let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
                 crate::swap::dispatch_swap_write(&mut ctx);
             }
+            // Dispatch diagnostics if due.
+            let version = editor.active().document.version;
+            if editor.diag_cfg.enabled
+                && crate::diagnostics_run::diag_due(&editor.active().diagnostics, now, version)
+            {
+                let ignore_words = std::sync::Arc::new(
+                    editor.dictionary.iter().chain(editor.session_ignores.iter()).cloned().collect::<std::collections::HashSet<String>>()
+                );
+                let diag_cfg = editor.diag_cfg.clone();
+                crate::diagnostics_run::dispatch_diagnostics(editor, &diag_cfg, ignore_words, msg_tx.clone());
+            }
         }
         Msg::ClipboardPaste { buffer_id, text, .. } => apply_clipboard_paste(editor, buffer_id, text, clock),
         Msg::ClipboardAvailability(ok) => apply_clipboard_availability(editor, ok),
     }
     if editor.active().document.version != before {
         editor.active_mut().last_edit_at = Some(clock.now_ms());
+        // Arm debounce for diagnostics if enabled.
+        if editor.diag_cfg.enabled {
+            let debounce_ms = editor.diag_cfg.debounce_ms;
+            editor.active_mut().diagnostics.arm(clock.now_ms(), debounce_ms);
+        }
     }
     // Fold any other results that became ready while handling this message.
     for r in ex.drain() {
@@ -1069,6 +1102,13 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     // Seed mouse_capture from config (default true; may be overridden by config layers).
     editor.mouse_capture = cfg.mouse.mouse_capture;
     editor.view_opts = cfg.view.clone();
+    editor.diag_cfg = cfg.diagnostics.clone();
+    // Load the personal dictionary from disk (missing/unreadable → empty; no abort).
+    if let Some(dict_path) = &cfg.diagnostics.dictionary {
+        if let Ok(text) = std::fs::read_to_string(dict_path) {
+            editor.dictionary = text.lines().map(|l| l.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        }
+    }
 
     // Recovery-on-open (§5.1).
     // Named files: use assess() with content-hash comparison.
@@ -1212,18 +1252,12 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
         } else {
             None
         };
-        let deadline = match (swap_deadline, sq_deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
-        let deadline = match (deadline, sb_deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
+        let deadline = crate::diagnostics_run::next_deadline(&[
+            swap_deadline,
+            sq_deadline,
+            sb_deadline,
+            editor.active().diagnostics.recheck_due_at,
+        ]);
         let timeout = deadline
             .map(|d| std::time::Duration::from_millis(d.saturating_sub(now)))
             .unwrap_or(std::time::Duration::from_secs(3600));
@@ -2788,5 +2822,42 @@ mod tests {
         r(&mut e, press(KeyCode::Enter, KeyModifiers::ALT));
         r(&mut e, press(KeyCode::Char('!'), KeyModifiers::NONE));      // finish all remaining
         assert_eq!(e.active().document.buffer.snapshot().to_string(), "b b b\n");
+    }
+
+    #[test]
+    fn diagnostics_done_applies_only_for_current_version() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        let bid = e.active().id;
+        let v = e.active().document.version;
+        let diag = vec![wordcartel_core::diagnostics::Diagnostic {
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            message: "misspelled".into(),
+            suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] }];
+        // current version → stored
+        crate::diagnostics_run::apply_diagnostics_done(&mut e, bid, v, diag.clone());
+        assert_eq!(e.active().diagnostics.diagnostics.len(), 1);
+        assert_eq!(e.active().diagnostics.computed_version, v);
+        // stale version → discarded
+        crate::diagnostics_run::apply_diagnostics_done(&mut e, bid, v.wrapping_sub(1), diag);
+        assert_eq!(e.active().diagnostics.diagnostics.len(), 1, "stale result must not overwrite");
+    }
+
+    #[test]
+    fn tick_dispatches_a_due_check_once() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("teh\n", None, (80, 24));
+        e.diag_cfg.enabled = true;
+        e.active_mut().diagnostics.arm(0, 400); // due at 400
+        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(500); // past due
+        // a Tick at now=500 with diagnostics enabled dispatches one check
+        crate::app::reduce(Msg::Tick, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().diagnostics.in_flight_version, Some(e.active().document.version));
+        // the spawned worker sends a DiagnosticsDone
+        match rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap() {
+            Msg::DiagnosticsDone { diagnostics, .. } => assert!(diagnostics.iter().any(|d| d.kind == wordcartel_core::diagnostics::DiagnosticKind::Spelling)),
+            o => panic!("expected DiagnosticsDone, got {o:?}"),
+        }
     }
 }
