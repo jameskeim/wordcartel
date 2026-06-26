@@ -120,6 +120,36 @@ fn replace_changeset(
     }
 }
 
+/// Build ONE `ChangeSet` performing all `edits` (ascending, non-overlapping
+/// `(from,to,replacement)`) plus ONE covering `block_tree::Edit` spanning
+/// `first.start..last.end`. Applied as a single `editor.apply` → one undo unit.
+pub fn build_multi_replace(
+    edits: &[(usize, usize, String)],
+    doc_len: usize,
+) -> (wordcartel_core::change::ChangeSet, wordcartel_core::block_tree::Edit) {
+    use wordcartel_core::change::{ChangeSet, Op, Tendril};
+    debug_assert!(!edits.is_empty());
+    let mut ops = Vec::new();
+    let mut pos = 0usize;
+    let mut len_after = doc_len;
+    for (from, to, text) in edits {
+        if *from > pos { ops.push(Op::Retain(from - pos)); }
+        if to > from { ops.push(Op::Delete(to - from)); }
+        if !text.is_empty() { ops.push(Op::Insert(Tendril::from(text.as_str()))); }
+        len_after = len_after - (to - from) + text.len();
+        pos = *to;
+    }
+    if doc_len > pos { ops.push(Op::Retain(doc_len - pos)); }
+    let first = edits.first().unwrap().0;
+    let last_to = edits.last().unwrap().1;
+    // new_len of the covering region = (last_to - first) adjusted by all deltas.
+    let delta: isize = edits.iter().map(|(f, t, s)| s.len() as isize - (t - f) as isize).sum();
+    let new_len = ((last_to - first) as isize + delta) as usize;
+    let cs = ChangeSet { ops, len_before: doc_len, len_after };
+    let edit = wordcartel_core::block_tree::Edit { range: first..last_to, new_len };
+    (cs, edit)
+}
+
 /// Build a `(ChangeSet, Edit)` replacing byte range `from..to` with `text`.
 /// Public so the filter merge (filter.rs) can produce one undoable edit.
 pub fn build_range_replace(
@@ -1262,5 +1292,16 @@ mod tests {
         derive::rebuild(&mut e);
         // offset 7 is inside "beta" (6..10)
         assert_eq!(super::scope_range_at(&e, 7, Scope::Word), (6, 10));
+    }
+
+    #[test]
+    fn multi_replace_builds_one_changeset_covering_all() {
+        // "aa aa aa" replace all "aa" -> "b": expect "b b b"
+        let (cs, edit) = super::build_multi_replace(
+            &[(0, 2, "b".into()), (3, 5, "b".into()), (6, 8, "b".into())], 8);
+        let mut tb = wordcartel_core::buffer::TextBuffer::from_str("aa aa aa");
+        cs.apply(&mut tb);
+        assert_eq!(tb.slice(0..tb.len()), "b b b");
+        assert_eq!(edit.range, 0..8); // covering edit spans first.start..last.end
     }
 }

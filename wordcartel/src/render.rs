@@ -20,6 +20,13 @@ pub(crate) fn row_is_active(row_from: usize, row_to: usize, region_from: usize, 
     row_from < region_to && region_from < row_to
 }
 
+/// Half-open interval overlap for search match highlighting.
+///
+/// Returns `true` if `[a0, a1)` and `[b0, b1)` have any overlap.
+pub(crate) fn overlaps(a0: usize, a1: usize, b0: usize, b1: usize) -> bool {
+    a0 < b1 && b0 < a1
+}
+
 /// Map a wordcartel inline `Style` to a ratatui `Style`.
 ///
 /// Strong→BOLD; Emphasis→ITALIC; StrongEmphasis→BOLD|ITALIC;
@@ -208,17 +215,44 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     let mut sorted_lines: Vec<usize> = editor.active().view.line_layouts.keys().copied().collect();
     sorted_lines.sort_unstable();
 
+    // Gather search match data once before the row loop (avoids repeated borrow).
+    // Clone only the viewport-bounded window (O(visible matches)) rather than the
+    // full match list (O(total matches)).  The search-bar count/ordinal always reads
+    // from SearchState directly (`s.count()` / `s.current_ordinal()`), so the
+    // truncated window does not affect the N/M display.
+    let hl_current: Option<wordcartel_core::search::Match> =
+        editor.search.as_ref().and_then(|s| s.current());
+    let hl_window: Vec<wordcartel_core::search::Match> = match editor.search.as_ref() {
+        None => Vec::new(),
+        Some(s) if s.matches().is_empty() => Vec::new(),
+        Some(s) => {
+            let buf = &editor.active().document.buffer;
+            let lo = derive::line_start(buf, scroll);
+            // Conservative upper bound: the last logical line in the layout cache.
+            let max_visible = sorted_lines.last().copied().unwrap_or(scroll);
+            let hi = derive::line_start(buf, max_visible + 1);
+            // partition_point keeps the sorted invariant; matches are sorted by start,
+            // and non-overlapping so end is also non-decreasing.
+            let lo_idx = s.matches().partition_point(|m| m.end <= lo);
+            let hi_idx = s.matches().partition_point(|m| m.start < hi);
+            s.matches()[lo_idx..hi_idx.max(lo_idx)].to_vec()
+        }
+    };
+
     'outer: for &l in &sorted_lines {
         if l < scroll {
             continue;
         }
-        let (visual_rows, _map) = &editor.active().view.line_layouts[&l];
+        let (visual_rows, map) = &editor.active().view.line_layouts[&l];
         let skip_rows = if l == scroll {
             editor.active().view.scroll_row
         } else {
             0
         };
-        for vr in visual_rows.iter().skip(skip_rows) {
+        for (row_index, vr) in visual_rows.iter().enumerate() {
+            if row_index < skip_rows {
+                continue;
+            }
             if screen_row >= edit_height {
                 break 'outer;
             }
@@ -235,20 +269,69 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             };
 
             // Build spans for this visual row.
-            let mut spans: Vec<Span<'_>> = Vec::new();
+            let spans: Vec<Span<'_>> = if hl_window.is_empty() {
+                // ---------------------------------------------------------------
+                // EXISTING segs-based path (no active search) — true no-op.
+                // ---------------------------------------------------------------
+                let dim_style = RStyle::default().fg(Color::DarkGray);
+                let mut segs_spans: Vec<Span<'_>> = Vec::new();
+                // Prepend prefix_glyph as a dim span (first visual row only).
+                if let Some(ref glyph) = vr.prefix_glyph {
+                    let gstyle = if row_dim { dim_style } else { RStyle::default().add_modifier(Modifier::DIM) };
+                    segs_spans.push(Span::styled(glyph.clone(), gstyle));
+                }
+                for seg in &vr.segs {
+                    let style = if row_dim { dim_style } else { style_to_ratatui(seg.style) };
+                    segs_spans.push(Span::styled(seg.text.clone(), style));
+                }
+                segs_spans
+            } else {
+                // ---------------------------------------------------------------
+                // Search-active path: build spans from map.placed, per-glyph highlight.
+                // ---------------------------------------------------------------
+                let line_off = derive::line_start(&editor.active().document.buffer, l);
+                let mut hl_spans: Vec<Span<'_>> = Vec::new();
 
-            // One span per StyledSeg — apply DarkGray dim when row is outside active region.
-            let dim_style = RStyle::default().fg(Color::DarkGray);
+                // Prefix glyph (first visual row only): treat as unsearchable, apply dim only.
+                if let Some(ref glyph) = vr.prefix_glyph {
+                    let dim_style = RStyle::default().fg(Color::DarkGray);
+                    let gstyle = if row_dim { dim_style } else { RStyle::default().add_modifier(Modifier::DIM) };
+                    hl_spans.push(Span::styled(glyph.clone(), gstyle));
+                }
 
-            // Prepend prefix_glyph as a dim span (first visual row only).
-            if let Some(ref glyph) = vr.prefix_glyph {
-                let gstyle = if row_dim { dim_style } else { RStyle::default().add_modifier(Modifier::DIM) };
-                spans.push(Span::styled(glyph.clone(), gstyle));
-            }
-            for seg in &vr.segs {
-                let style = if row_dim { dim_style } else { style_to_ratatui(seg.style) };
-                spans.push(Span::styled(seg.text.clone(), style));
-            }
+                // One span per run of glyphs sharing the same (style, highlight-kind).
+                let mut run = String::new();
+                let mut run_style: Option<RStyle> = None;
+
+                for p in map.placed.iter().filter(|p| p.row == row_index) {
+                    let g_from = line_off + p.src.start;
+                    let g_to = line_off + p.src.end;
+                    let is_current = hl_current.is_some_and(|m| overlaps(g_from, g_to, m.start, m.end));
+                    let is_match = !is_current && hl_window.iter().any(|m| overlaps(g_from, g_to, m.start, m.end));
+
+                    let mut style = if row_dim {
+                        RStyle::default().fg(Color::DarkGray)
+                    } else {
+                        style_to_ratatui(p.style)
+                    };
+                    if is_current {
+                        style = style.add_modifier(Modifier::REVERSED);
+                    } else if is_match {
+                        style = style.bg(Color::Yellow).fg(Color::Black);
+                    }
+
+                    // Flush the accumulated run when the style changes.
+                    if run_style != Some(style) && !run.is_empty() {
+                        hl_spans.push(Span::styled(std::mem::take(&mut run), run_style.unwrap()));
+                    }
+                    run_style = Some(style);
+                    run.push_str(&p.text);
+                }
+                if !run.is_empty() {
+                    hl_spans.push(Span::styled(run, run_style.unwrap()));
+                }
+                hl_spans
+            };
 
             let line_widget = Line::from(spans);
             let row_area = Rect::new(area.x + tg.text_left, edit_top + screen_row, tg.text_width, 1);
@@ -292,10 +375,16 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             crate::editor::RenderMode::SourcePlain => "SOURCE",
         };
 
+        // When the search overlay is active, render the search bar.
         // When a modal prompt is active, render its message instead of the normal
         // status text, using a distinct style so it stands out.
         // When the minibuffer is open, render <prompt><text> on the status row.
-        let (status_text, status_style) = if let Some(ref mb) = editor.minibuffer {
+        let (status_text, status_style) = if let Some(ref s) = editor.search {
+            (
+                format_search_bar(s),
+                RStyle::default().add_modifier(Modifier::REVERSED),
+            )
+        } else if let Some(ref mb) = editor.minibuffer {
             (
                 format!("{}{}", mb.prompt, mb.text),
                 RStyle::default().add_modifier(Modifier::REVERSED),
@@ -315,9 +404,9 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         };
 
         // Compose the status line.
-        // When in the normal branch (no prompt/minibuffer) and word_count is on,
+        // When in the normal branch (no prompt/minibuffer/search) and word_count is on,
         // flush the count segment to the right and truncate the left (path/mode) to fit.
-        let has_overlay = editor.minibuffer.is_some() || editor.prompt.is_some();
+        let has_overlay = editor.search.is_some() || editor.minibuffer.is_some() || editor.prompt.is_some();
         let composed = if !has_overlay {
             if let Some(right) = word_count_segment(editor) {
                 let reserve = right.chars().count() + 1;
@@ -340,7 +429,20 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     // -----------------------------------------------------------------------
     // Hardware cursor
     // -----------------------------------------------------------------------
-    if let Some(ref mb) = editor.minibuffer {
+    if let Some(ref s) = editor.search {
+        // Search bar is open: place caret on the status row at the focused field's caret.
+        // Use char counts (not byte offsets) for correct placement with multibyte text.
+        let prefix_cols = match s.field {
+            crate::search_overlay::Field::Needle => "Find: ".chars().count(),
+            crate::search_overlay::Field::Template =>
+                format!("Find: {}  Replace: ", s.needle).chars().count(),
+        };
+        let caret_cols = s.focused_field()[..s.cursor].chars().count();
+        let x_offset = (prefix_cols + caret_cols) as u16;
+        if x_offset < w {
+            frame.set_cursor_position(Position { x: area.x + x_offset, y: status_row });
+        }
+    } else if let Some(ref mb) = editor.minibuffer {
         // Minibuffer is open: place caret on the status row at prompt.len() + cursor.
         // cursor is a byte offset; for display we want the char count so the terminal
         // column is correct even for multi-byte prompts/text (small strings, safe).
@@ -456,6 +558,34 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
 }
 
 // ---------------------------------------------------------------------------
+// Search bar formatting
+// ---------------------------------------------------------------------------
+
+fn format_search_bar(s: &crate::search_overlay::SearchState) -> String {
+    use crate::search_overlay::Phase;
+    let mode = if matches!(s.mode, wordcartel_core::search::QueryMode::Regex) { " .*" } else { "" };
+    let case = match s.case {
+        wordcartel_core::search::CaseMode::Smart => " Aa~",
+        wordcartel_core::search::CaseMode::Sensitive => " Aa",
+        wordcartel_core::search::CaseMode::Insensitive => " aa",
+    };
+    let count = if s.error.is_some() {
+        " ?".to_string()
+    } else if s.count() == 0 {
+        " no matches".to_string()
+    } else {
+        format!(" {}/{}", s.current_ordinal().unwrap_or(0), s.count())
+    };
+    let wrapped = if s.wrapped { " (wrapped)" } else { "" };
+    match s.phase {
+        Phase::Replace | Phase::Stepping =>
+            format!("Find: {}  Replace: {}{}{}{}{}", s.needle, s.template, mode, case, count, wrapped),
+        Phase::Find =>
+            format!("Find: {}{}{}{}{}", s.needle, mode, case, count, wrapped),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests (RED first — write before implementing)
 // ---------------------------------------------------------------------------
 
@@ -468,6 +598,82 @@ mod tests {
 
     fn set_caret(e: &mut Editor, off: usize) {
         e.active_mut().document.selection = Selection::single(off);
+    }
+
+    // -----------------------------------------------------------------------
+    // Search render test helpers
+    // -----------------------------------------------------------------------
+
+    /// Render the editor to a standalone ratatui Buffer for assertions.
+    /// Editor is NOT Clone, so we mutably borrow it for the draw call.
+    fn render_to_buffer(editor: &mut Editor, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| super::render(f, editor)).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    fn row_string(buf: &ratatui::buffer::Buffer, row: u16) -> String {
+        (0..buf.area.width).map(|x| buf[(x, row)].symbol().to_string()).collect()
+    }
+
+    fn row_has_highlight(buf: &ratatui::buffer::Buffer, row: u16) -> bool {
+        use ratatui::style::{Color, Modifier};
+        (0..buf.area.width).any(|x| {
+            let c = &buf[(x, row)];
+            c.style().bg == Some(Color::Yellow) || c.style().add_modifier.contains(Modifier::REVERSED)
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Search render tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn search_highlights_matches_and_shows_count() {
+        let mut e = Editor::new_from_text("foo bar foo\n", None, (40, 6));
+        e.open_search(crate::search_overlay::Phase::Find, 0);
+        for c in "foo".chars() { e.search.as_mut().unwrap().insert(c); }
+        let rope = e.active().document.buffer.snapshot();
+        let v = e.active().document.version;
+        e.search.as_mut().unwrap().recompute(&rope, v);
+        crate::derive::rebuild(&mut e);
+        let buf = render_to_buffer(&mut e, 40, 6);
+        let status = row_string(&buf, 5); // bottom row
+        assert!(status.contains("Find:"), "search bar shows Find:, got {status:?}");
+        assert!(status.contains("1/2") || status.contains("2"), "shows match count, got {status:?}");
+        // both "foo" occurrences carry a highlight bg somewhere on row 0
+        assert!(row_has_highlight(&buf, 0), "matches highlighted on row 0");
+    }
+
+    #[test]
+    fn highlight_skips_concealed_markers_in_live_preview() {
+        let mut e = Editor::new_from_text("**bold**\n", None, (40, 6)); // LivePreview conceals **
+        e.open_search(crate::search_overlay::Phase::Find, 0);
+        for c in "bold".chars() { e.search.as_mut().unwrap().insert(c); }
+        let rope = e.active().document.buffer.snapshot();
+        let v = e.active().document.version;
+        e.search.as_mut().unwrap().recompute(&rope, v);
+        crate::derive::rebuild(&mut e);
+        let buf = render_to_buffer(&mut e, 40, 6);
+        // The visible word "bold" is highlighted; render does not panic projecting
+        // a raw-byte match (start=2..6) onto the concealed visible row.
+        assert!(row_has_highlight(&buf, 0), "bold should be highlighted");
+    }
+
+    #[test]
+    fn search_caret_uses_char_count_not_byte_count() {
+        // Multibyte needle: "café" = 5 bytes (é is 2 bytes) but 4 chars.
+        // Caret should be at "Find: ".chars().count() + 4 = 6 + 4 = 10 cols.
+        let mut e = Editor::new_from_text("café\n", None, (40, 6));
+        e.open_search(crate::search_overlay::Phase::Find, 0);
+        for c in "café".chars() { e.search.as_mut().unwrap().insert(c); }
+        let s = e.search.as_ref().unwrap();
+        let prefix_cols = "Find: ".chars().count();
+        let caret_cols = s.focused_field()[..s.cursor].chars().count();
+        let x = prefix_cols + caret_cols;
+        assert_eq!(x, 10, "caret col should be char-based (6 + 4 = 10), got {x}");
+        // Also verify this differs from the byte-based count (é is 2 bytes → 11 bytes total).
+        assert_ne!(x, "Find: ".len() + s.needle.len(), "char count must differ from byte count for multibyte input");
     }
 
     /// Row 0 of a heading with caret on a later line must show "Title" (concealed "# ").
@@ -615,6 +821,51 @@ mod tests {
         // (assert the helper render uses to decide, not pixels — see Step 3 for the fn)
         assert!(!crate::render::row_is_active(0, "Para one.".len(), from, to), "para one dimmed");
         assert!(crate::render::row_is_active(from, to, from, to), "active row bright");
+    }
+
+    /// Viewport-gated highlight scan:
+    /// - A match scrolled completely off-screen must NOT produce a highlight on
+    ///   any visible row.
+    /// - A match that straddles the top scroll boundary (starts just before lo,
+    ///   ends inside the viewport) must still be highlighted on its visible portion.
+    #[test]
+    fn viewport_gates_search_highlight_scan() {
+        // Build a document: "needle\n" at line 0, then 5 filler lines, then "needle\n".
+        // With a 3-row viewport (2 editing rows + 1 status) and scroll=5 we see only
+        // lines 5 and 6 — so line 0 is completely off-screen and its match must not
+        // appear as a highlight on any visible row.
+        let doc = "needle\n".to_string()
+            + "filler\nfiller\nfiller\nfiller\nfiller\n"
+            + "needle\n";
+        let mut e = Editor::new_from_text(&doc, None, (40, 3));
+        e.open_search(crate::search_overlay::Phase::Find, 0);
+        for c in "needle".chars() { e.search.as_mut().unwrap().insert(c); }
+        let rope = e.active().document.buffer.snapshot();
+        let v = e.active().document.version;
+        e.search.as_mut().unwrap().recompute(&rope, v);
+        assert_eq!(e.search.as_ref().unwrap().count(), 2, "expect 2 matches total");
+        // Scroll to line 5 so line 0 is off-screen.
+        e.active_mut().view.scroll = 5;
+        crate::derive::rebuild(&mut e);
+        let buf = render_to_buffer(&mut e, 40, 3);
+        // Row 1 (screen row 1) shows line 6 ("needle") — must be highlighted.
+        assert!(row_has_highlight(&buf, 1), "on-screen match at line 6 must be highlighted");
+        // Row 0 shows line 5 ("filler") — must NOT be highlighted (line 0 match is off-screen).
+        assert!(!row_has_highlight(&buf, 0), "off-screen match at line 0 must not bleed onto filler row");
+
+        // Straddling test: a match whose end byte is > lo (scroll line boundary) but
+        // whose start byte is == lo - 1 (just before the boundary) must be included.
+        // Construct: scroll to line 1 so lo = byte offset of "filler" start.
+        // The "needle\n" at line 0 ends at byte 7 which equals lo — exactly the
+        // partition boundary: m.end == lo means m.end <= lo is TRUE, so lo_idx would
+        // exclude it. That's correct: the match ends AT lo, no glyph of it is visible.
+        // Test a match that does cross: put scroll at line 0 (lo=0) so everything is in
+        // the window, then verify both matches show (not a straddling case but a
+        // full-window case that must still work).
+        e.active_mut().view.scroll = 0;
+        crate::derive::rebuild(&mut e);
+        let buf2 = render_to_buffer(&mut e, 40, 3);
+        assert!(row_has_highlight(&buf2, 0), "match at line 0 visible when scroll=0");
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub mod selection;
 
 pub mod layout;
 pub mod md_parse;
+pub mod search;
 pub mod style;
 pub mod textobj;
 

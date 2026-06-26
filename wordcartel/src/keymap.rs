@@ -236,6 +236,11 @@ static CUA: &[(&str, &str)] = &[
     ("ctrl-t", "transform"),
     ("ctrl-p", "palette"),
     ("f10",    "menu"),
+    // Search
+    ("ctrl-f", "find"),
+    ("ctrl-r", "replace"),
+    ("f3",     "find_next"),
+    ("shift-f3", "find_prev"),
     // View  (input.rs lines 102, 114)
     ("ctrl-\\", "cycle_render_mode"),
     ("f1",      "cycle_render_mode"),

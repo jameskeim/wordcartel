@@ -450,6 +450,126 @@ pub fn menu_select_for_test(
     dispatch_overlay_command(editor, reg, &keymap, ex, clock, msg_tx, id);
 }
 
+fn search_sync(editor: &mut Editor) {
+    let (rope, version) = { let d = &editor.active().document; (d.buffer.snapshot(), d.version) };
+    if let Some(s) = editor.search.as_mut() { s.recompute(&rope, version); }
+    if let Some(m) = editor.search.as_ref().and_then(|s| s.current()) {
+        editor.active_mut().document.selection = wordcartel_core::selection::Selection::range(m.start, m.end);
+        derive::rebuild(editor);
+        crate::nav::ensure_visible(editor);
+    }
+}
+
+fn search_step(editor: &mut Editor, forward: bool) {
+    if let Some(s) = editor.search.as_mut() { if forward { s.next(); } else { s.prev(); } }
+    if let Some(m) = editor.search.as_ref().and_then(|s| s.current()) {
+        editor.active_mut().document.selection = wordcartel_core::selection::Selection::range(m.start, m.end);
+        derive::rebuild(editor);
+        crate::nav::ensure_visible(editor);
+    }
+}
+
+fn search_cancel(editor: &mut Editor) {
+    let origin = editor.search.as_ref().map(|s| s.origin).unwrap_or(0);
+    editor.search = None;
+    editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(origin);
+    derive::rebuild(editor);
+    crate::nav::ensure_visible(editor);
+}
+
+fn search_replace_all(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
+    search_sync(editor); // ensure cache is current
+    // §8: invalid regex → distinct status, no mutation.
+    if editor.search.as_ref().is_some_and(|s| s.error.is_some()) {
+        editor.status = "invalid regex".into();
+        return;
+    }
+    let plan: Option<(Vec<(usize, usize, String)>, usize, usize)> = editor.search.as_ref().and_then(|s| {
+        let m = s.matcher()?;
+        if s.matches().is_empty() { return None; }
+        let rope = editor.active().document.buffer.snapshot();
+        let edits: Vec<(usize, usize, String)> = s.matches().iter().map(|mm| {
+            (mm.start, mm.end, wordcartel_core::search::expand_replacement(&rope, m, mm, &s.template, s.mode))
+        }).collect();
+        Some((edits, rope.len_bytes(), s.origin))
+    });
+    let Some((edits, doc_len, origin)) = plan else {
+        editor.status = "No matches".into();
+        return;
+    };
+    let n = edits.len();
+    let (cs, edit) = crate::commands::build_multi_replace(&edits, doc_len);
+    // remap origin through this changeset BEFORE moving it into the transaction
+    let new_origin = wordcartel_core::change::map_pos(origin, &cs);
+    let txn = wordcartel_core::history::Transaction::new(cs)
+        .with_selection(wordcartel_core::selection::Selection::single(new_origin));
+    editor.active_mut().apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
+    if let Some(s) = editor.search.as_mut() { s.origin = new_origin; }
+    editor.status = format!("Replaced {n} occurrences");
+    editor.search = None; // close after replace-all
+    derive::rebuild(editor);
+    crate::nav::ensure_visible(editor);
+}
+
+fn search_step_apply(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
+    let plan = editor.search.as_ref().and_then(|s| {
+        let m = s.matcher()?; let cur = s.current()?;
+        let rope = editor.active().document.buffer.snapshot();
+        let text = wordcartel_core::search::expand_replacement(&rope, m, &cur, &s.template, s.mode);
+        Some((cur, text, rope.len_bytes(), s.origin))
+    });
+    let Some((cur, text, doc_len, origin)) = plan else { editor.search = None; return; };
+    let (cs, edit) = crate::commands::build_range_replace(cur.start, cur.end, &text, doc_len);
+    let new_origin = wordcartel_core::change::map_pos(origin, &cs);
+    let caret = cur.start + text.len();
+    let txn = wordcartel_core::history::Transaction::new(cs)
+        .with_selection(wordcartel_core::selection::Selection::single(caret));
+    editor.active_mut().apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
+    // Re-find the next match on the MUTATED rope, and remap origin.
+    let (rope, version) = { let d = &editor.active().document; (d.buffer.snapshot(), d.version) };
+    if let Some(s) = editor.search.as_mut() {
+        s.origin = new_origin;
+        s.cache_invalidate();                 // force recompute against mutated rope
+        s.recompute(&rope, version);
+        s.set_current_at_or_after(caret);     // park on next match at/after the just-edited spot
+    }
+    search_pin(editor);
+    if editor.search.as_ref().is_some_and(|s| s.current().is_none()) { editor.search = None; } // done
+}
+
+fn search_step_skip(editor: &mut Editor) {
+    if let Some(s) = editor.search.as_mut() { s.next(); }
+    search_pin(editor);
+    if editor.search.as_ref().is_some_and(|s| s.wrapped) { editor.search = None; } // walked off the end
+}
+
+fn search_step_rest(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
+    // Replace current + all remaining (from current.start onward) as one unit.
+    let plan = editor.search.as_ref().and_then(|s| {
+        let m = s.matcher()?; let cur = s.current()?;
+        let rope = editor.active().document.buffer.snapshot();
+        let edits: Vec<(usize, usize, String)> = s.matches().iter().filter(|mm| mm.start >= cur.start)
+            .map(|mm| (mm.start, mm.end, wordcartel_core::search::expand_replacement(&rope, m, mm, &s.template, s.mode)))
+            .collect();
+        Some((edits, rope.len_bytes()))
+    });
+    let Some((edits, doc_len)) = plan else { editor.search = None; return; };
+    if edits.is_empty() { editor.search = None; return; }
+    let (cs, edit) = crate::commands::build_multi_replace(&edits, doc_len);
+    let txn = wordcartel_core::history::Transaction::new(cs)
+        .with_selection(wordcartel_core::selection::Selection::single(edits[0].0));
+    editor.active_mut().apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
+    editor.search = None;
+    derive::rebuild(editor); crate::nav::ensure_visible(editor);
+}
+
+fn search_pin(editor: &mut Editor) {
+    if let Some(m) = editor.search.as_ref().and_then(|s| s.current()) {
+        editor.active_mut().document.selection = wordcartel_core::selection::Selection::range(m.start, m.end);
+        derive::rebuild(editor); crate::nav::ensure_visible(editor);
+    }
+}
+
 /// Process one message. Returns true while the app should keep running.
 pub fn reduce(
     msg: Msg,
@@ -681,6 +801,69 @@ pub fn reduce(
             return !editor.quit;
         }
         // non-key (FilterDone/JobDone/Tick/Resize/ClipboardPaste/ClipboardAvailability) falls through to the normal match below
+    }
+
+    // Search overlay intercepts KEY INPUT only; non-key messages (FilterDone/JobDone/
+    // TransformDone/ExportDone/Tick) fall through to the normal match arm below so
+    // background work is never starved while the overlay is open (mirror of minibuffer
+    // block above — see test `search_does_not_starve_filterdone`).
+    if editor.search.is_some() {
+        if let Msg::Input(Event::Key(k)) = &msg {
+            if k.kind == crossterm::event::KeyEventKind::Press {
+                use crossterm::event::{KeyCode, KeyModifiers};
+                let alt = k.modifiers.contains(KeyModifiers::ALT);
+                let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                // Stepping phase: y/n/!/q intercepted BEFORE the text-insert arm.
+                if editor.search.as_ref().map(|s| s.phase) == Some(crate::search_overlay::Phase::Stepping) {
+                    match k.code {
+                        KeyCode::Char('y') => { search_step_apply(editor, clock); }
+                        KeyCode::Char('n') => { search_step_skip(editor); }
+                        KeyCode::Char('!') => { search_step_rest(editor, clock); }
+                        KeyCode::Char('q') | KeyCode::Esc => { editor.search = None; }
+                        _ => {}
+                    }
+                    for r in ex.drain() { apply_result(r, editor); }
+                    return !editor.quit;
+                }
+                match k.code {
+                    KeyCode::Esc => { search_cancel(editor); return !editor.quit; }
+                    KeyCode::Char('r') if alt => { editor.search.as_mut().unwrap().toggle_mode(); }
+                    KeyCode::Char('c') if alt => { editor.search.as_mut().unwrap().cycle_case(); }
+                    KeyCode::Char('a') if alt => { search_replace_all(editor, clock); return !editor.quit; }
+                    KeyCode::Enter if alt => {
+                        if let Some(s) = editor.search.as_mut() { s.phase = crate::search_overlay::Phase::Stepping; }
+                        search_sync(editor); // park on first match
+                        for r in ex.drain() { apply_result(r, editor); }
+                        return !editor.quit;
+                    }
+                    KeyCode::Enter if shift => { search_step(editor, false); }
+                    KeyCode::F(3) if shift   => { search_step(editor, false); }
+                    KeyCode::Enter           => { search_step(editor, true); }
+                    KeyCode::F(3)            => { search_step(editor, true); }
+                    KeyCode::Tab => {
+                        if let Some(s) = editor.search.as_mut() {
+                            s.field = match s.field {
+                                crate::search_overlay::Field::Needle => crate::search_overlay::Field::Template,
+                                crate::search_overlay::Field::Template => crate::search_overlay::Field::Needle,
+                            };
+                            s.cursor = s.focused_field().len();
+                        }
+                    }
+                    KeyCode::Backspace       => { editor.search.as_mut().unwrap().backspace(); }
+                    KeyCode::Left            => { editor.search.as_mut().unwrap().left(); }
+                    KeyCode::Right           => { editor.search.as_mut().unwrap().right(); }
+                    KeyCode::Char(c) if !ctrl && !alt => { editor.search.as_mut().unwrap().insert(c); }
+                    _ => {}
+                }
+                // Recompute against the live buffer and pin the current match.
+                search_sync(editor);
+            }
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit; // return ONLY for key events (including non-Press)
+        }
+        // Non-key messages (FilterDone/ExportDone/TransformDone/JobDone/Tick/…)
+        // fall through to the normal handlers below.
     }
 
     let before = editor.active().document.version;
@@ -2412,6 +2595,64 @@ mod tests {
         assert!(!e.mouse.scrollbar_visible, "scrollbar must hide after scrollbar_until_ms expires");
     }
 
+    // -------------------------------------------------------------------------
+    // Task 4 (Effort 5e): search overlay reduce() interception tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn ctrl_f_opens_search_and_typing_jumps() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("foo bar foo\n", None, (80, 24));
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let mkpress = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(mkpress(KeyCode::Char('f'), KeyModifiers::CONTROL)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert!(e.search.is_some(), "Ctrl+F opens search");
+        for c in "bar".chars() { crate::app::reduce(Msg::Input(mkpress(KeyCode::Char(c), KeyModifiers::NONE)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx); }
+        let s = e.search.as_ref().unwrap();
+        assert_eq!(s.needle, "bar");
+        assert_eq!(s.current().unwrap().start, 4); // caret jumped to the match
+        assert_eq!(e.active().document.selection.primary().from(), 4);
+    }
+
+    #[test]
+    fn esc_restores_origin_and_closes() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("foo bar\n", None, (80, 24));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(0);
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let mkpress = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(mkpress(KeyCode::Char('f'), KeyModifiers::CONTROL)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        for c in "bar".chars() { crate::app::reduce(Msg::Input(mkpress(KeyCode::Char(c), KeyModifiers::NONE)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx); }
+        crate::app::reduce(Msg::Input(mkpress(KeyCode::Esc, KeyModifiers::NONE)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert!(e.search.is_none(), "Esc closes search");
+        assert_eq!(e.active().document.selection.primary().to(), 0, "caret restored to origin");
+    }
+
+    #[test]
+    fn replace_all_is_one_undo_unit_and_remaps_origin() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("aa aa aa\n", None, (80, 24));
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let press = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        let r = |e: &mut Editor, ev| crate::app::reduce(Msg::Input(ev), e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        r(&mut e, press(KeyCode::Char('r'), KeyModifiers::CONTROL));   // open Replace
+        for c in "aa".chars() { r(&mut e, press(KeyCode::Char(c), KeyModifiers::NONE)); }
+        r(&mut e, press(KeyCode::Tab, KeyModifiers::NONE));            // focus Template
+        r(&mut e, press(KeyCode::Char('b'), KeyModifiers::NONE));
+        r(&mut e, press(KeyCode::Char('a'), KeyModifiers::ALT));       // Alt+A = Replace All
+        assert_eq!(e.active().document.buffer.snapshot().to_string(), "b b b\n");
+        let v_after = e.active().document.version;
+        assert!(e.active_mut().undo());                                // ONE undo reverts ALL
+        assert_eq!(e.active().document.buffer.snapshot().to_string(), "aa aa aa\n");
+        let _ = v_after;
+    }
+
     /// Finding 2 regression: after a resize to a smaller terminal the stale
     /// scroll_row must be clamped so the caret remains visible.
     ///
@@ -2465,5 +2706,87 @@ mod tests {
             e.active().view.scroll_row, 0,
             "scroll_row must be clamped to a valid value after resize",
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 7 (Effort 5e): interactive query-replace stepping tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn query_replace_steps_yes_no_and_remaps() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("aa aa aa\n", None, (80, 24));
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let press = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        let r = |e: &mut Editor, ev| crate::app::reduce(Msg::Input(ev), e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        r(&mut e, press(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        for c in "aa".chars() { r(&mut e, press(KeyCode::Char(c), KeyModifiers::NONE)); }
+        r(&mut e, press(KeyCode::Tab, KeyModifiers::NONE));
+        r(&mut e, press(KeyCode::Char('b'), KeyModifiers::NONE));
+        r(&mut e, press(KeyCode::Enter, KeyModifiers::ALT));           // Alt+Enter starts stepping
+        assert_eq!(e.search.as_ref().unwrap().phase, crate::search_overlay::Phase::Stepping);
+        r(&mut e, press(KeyCode::Char('y'), KeyModifiers::NONE));      // replace #1
+        r(&mut e, press(KeyCode::Char('n'), KeyModifiers::NONE));      // skip #2
+        r(&mut e, press(KeyCode::Char('y'), KeyModifiers::NONE));      // replace #3
+        assert_eq!(e.active().document.buffer.snapshot().to_string(), "b aa b\n");
+    }
+
+    /// Fix A regression: a FilterDone arriving while the search overlay is open
+    /// must be applied, not silently dropped.
+    #[test]
+    fn search_does_not_starve_filterdone() {
+        use crate::editor::Editor;
+        use crate::filter::{Disposition, RunResult};
+        use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("abcde\n", None, (80, 24));
+        let id = e.active().id; let v = e.active().document.version;
+        e.open_search(crate::search_overlay::Phase::Find, 0);
+        let (tx, _rx) = std::sync::mpsc::channel(); let reg = Registry::builtins();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
+            disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "aXde\n", "FilterDone applies even under an open search overlay");
+        assert!(e.search.is_some(), "search overlay remains open after non-key message");
+    }
+
+    /// Fix C regression: replace-all with an invalid regex must set status
+    /// "invalid regex" and leave the buffer unchanged.
+    #[test]
+    fn invalid_regex_replace_all_sets_status() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("aa aa aa\n", None, (80, 24));
+        let before = e.active().document.buffer.to_string();
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let press = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        let r = |e: &mut Editor, ev| crate::app::reduce(Msg::Input(ev), e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        r(&mut e, press(KeyCode::Char('r'), KeyModifiers::CONTROL));    // open Replace (Phase::Replace)
+        r(&mut e, press(KeyCode::Char('r'), KeyModifiers::ALT));        // Alt+R: toggle to regex mode
+        // type an invalid regex pattern: unbalanced open paren
+        r(&mut e, press(KeyCode::Char('('), KeyModifiers::NONE));       // invalid in regex mode
+        r(&mut e, press(KeyCode::Char('a'), KeyModifiers::ALT));        // Alt+A = Replace All
+        assert_eq!(e.active().document.buffer.to_string(), before, "invalid regex must not mutate the buffer");
+        assert_eq!(e.status, "invalid regex", "status must say 'invalid regex', got: {:?}", e.status);
+    }
+
+    #[test]
+    fn query_replace_bang_finishes_rest() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("aa aa aa\n", None, (80, 24));
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let press = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        let r = |e: &mut Editor, ev| crate::app::reduce(Msg::Input(ev), e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        r(&mut e, press(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        for c in "aa".chars() { r(&mut e, press(KeyCode::Char(c), KeyModifiers::NONE)); }
+        r(&mut e, press(KeyCode::Tab, KeyModifiers::NONE));
+        r(&mut e, press(KeyCode::Char('b'), KeyModifiers::NONE));
+        r(&mut e, press(KeyCode::Enter, KeyModifiers::ALT));
+        r(&mut e, press(KeyCode::Char('!'), KeyModifiers::NONE));      // finish all remaining
+        assert_eq!(e.active().document.buffer.snapshot().to_string(), "b b b\n");
     }
 }
