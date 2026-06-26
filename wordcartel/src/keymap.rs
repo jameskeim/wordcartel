@@ -286,6 +286,10 @@ static CUA: &[(&str, &str)] = &[
     ("enter",     "insert_newline"),
     ("backspace", "backspace"),
     ("del",       "delete_forward"),
+    // Diagnostics (Task 6 / Effort 5f)
+    ("ctrl-.", "quick_fix"),
+    ("f8",      "diag_next"),
+    ("shift-f8","diag_prev"),
 ];
 
 /// WordStar preset — classic two-key diamond + file commands mapped to v1 command ids.

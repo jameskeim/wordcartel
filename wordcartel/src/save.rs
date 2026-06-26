@@ -130,8 +130,9 @@ pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
     let new_buf = fresh.buffers.into_iter().next().expect("new_from_text yields one buffer");
     let id = editor.active().id;                 // preserve THIS buffer's id
     *editor.active_mut() = crate::editor::Buffer { id, ..new_buf };
-    // Clear any stale search overlay — the buffer content has changed wholesale.
+    // Clear any stale search/diag overlay — the buffer content has changed wholesale.
     editor.search = None;
+    editor.diag = None;
     // then the existing follow-ups, now on the active buffer:
     editor.active_mut().view.line_layouts.clear();
     crate::derive::rebuild(editor);
@@ -150,8 +151,9 @@ pub fn load_recovered(editor: &mut crate::editor::Editor, body: &str) {
     let new_buf = fresh.buffers.into_iter().next().expect("new_from_text yields one buffer");
     let id = editor.active().id;                 // preserve THIS buffer's id
     *editor.active_mut() = crate::editor::Buffer { id, ..new_buf };
-    // Clear any stale search overlay — the buffer content has changed wholesale.
+    // Clear any stale search/diag overlay — the buffer content has changed wholesale.
     editor.search = None;
+    editor.diag = None;
     editor.active_mut().document.saved_version = None; // recovered work is unsaved
     editor.active_mut().view.line_layouts.clear();
     crate::derive::rebuild(editor);

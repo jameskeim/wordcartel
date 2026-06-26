@@ -114,6 +114,9 @@ pub fn key_to_command_id(key: KeyEvent) -> Option<KeyAction> {
         KeyCode::Char('r') if ctrl           => id("replace"),
         KeyCode::F(3) if shift               => id("find_prev"),
         KeyCode::F(3)                        => id("find_next"),
+        KeyCode::Char('.') if ctrl           => id("quick_fix"),
+        KeyCode::F(8) if shift               => id("diag_prev"),
+        KeyCode::F(8)                        => id("diag_next"),
 
         KeyCode::Left  => id(if shift { "select_left" } else { "move_left" }),
         KeyCode::Right => id(if shift { "select_right" } else { "move_right" }),

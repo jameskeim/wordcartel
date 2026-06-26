@@ -441,7 +441,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         // Compose the status line.
         // When in the normal branch (no prompt/minibuffer/search) and word_count is on,
         // flush the count segment to the right and truncate the left (path/mode) to fit.
-        let has_overlay = editor.search.is_some() || editor.minibuffer.is_some() || editor.prompt.is_some();
+        let has_overlay = editor.search.is_some() || editor.minibuffer.is_some() || editor.prompt.is_some() || editor.diag.is_some();
         let composed = if !has_overlay {
             if let Some(right) = word_count_segment(editor) {
                 let reserve = right.chars().count() + 1;
@@ -588,6 +588,52 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                     .collect();
                 frame.render_widget(List::new(items), drop_rect);
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Diagnostic quick-fix overlay (drawn on top of everything else)
+    // -----------------------------------------------------------------------
+    if let Some(ref diag_ov) = editor.diag {
+        let row_count = diag_ov.row_count();
+        let ov_rect = palette_overlay_rect(area, row_count);
+        let ov_x = ov_rect.x;
+        let ov_y = ov_rect.y;
+        let ov_w = ov_rect.width;
+        let ov_h = ov_rect.height;
+
+        frame.render_widget(Clear, ov_rect);
+
+        let title = format!(" {} ", diag_ov.anchor.message);
+        let block = Block::default().borders(Borders::ALL).title(title);
+        frame.render_widget(block, ov_rect);
+
+        if ov_h >= 3 {
+            let list_h = (row_count as u16).min(15).min(ov_h.saturating_sub(2));
+            let list_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), list_h);
+            let highlight_style = RStyle::default().add_modifier(Modifier::REVERSED);
+
+            let n_sugg = diag_ov.anchor.suggestions.len();
+            let items: Vec<ListItem> = (0..row_count).take(list_h as usize).map(|i| {
+                let label = if i < n_sugg {
+                    crate::diag_overlay::suggestion_label(&diag_ov.anchor.suggestions[i])
+                } else if i == n_sugg {
+                    "Ignore once".to_string()
+                } else {
+                    "Add to dictionary".to_string()
+                };
+                let truncated: String = label.chars().take(list_area.width as usize).collect();
+                ListItem::new(Line::from(truncated))
+            }).collect();
+
+            let mut list_state = ListState::default();
+            list_state.select(if row_count == 0 { None } else { Some(diag_ov.selected) });
+
+            frame.render_stateful_widget(
+                List::new(items).highlight_style(highlight_style),
+                list_area,
+                &mut list_state,
+            );
         }
     }
 }

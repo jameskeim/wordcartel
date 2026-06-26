@@ -179,6 +179,7 @@ impl Registry {
             c.editor.prompt = None;
             c.editor.minibuffer = None;
             c.editor.search = None;
+            c.editor.diag = None;
             c.editor.pending_keys.clear();
             c.editor.pending_mark = None;
             c.editor.menu = if c.editor.menu.is_some() {
@@ -214,6 +215,30 @@ impl Registry {
         // View menu — mouse capture toggle (Task 2 / Effort 5c-m).
         r.register("toggle_mouse_capture", "Toggle Mouse Capture", Some(MenuCategory::View), |c| {
             c.editor.mouse_capture = !c.editor.mouse_capture;
+            CommandResult::Handled
+        });
+
+        // Diagnostics — quick-fix overlay + navigation + recheck (Task 6–7 / Effort 5f).
+        r.register("quick_fix", "Quick Fix\u{2026}", None, |c| {
+            let caret = c.editor.active().document.selection.primary().head;
+            let diag = c.editor.active().diagnostics.diagnostics.iter()
+                .find(|d| d.range.start <= caret && caret <= d.range.end)
+                .cloned();
+            if let Some(d) = diag {
+                c.editor.open_diag(d);
+            } else {
+                c.editor.status = "no diagnostic here".into();
+            }
+            CommandResult::Handled
+        });
+        // Task 7 wires the motion behavior; register stubs here so keys bind.
+        r.register("diag_next", "Next Diagnostic", None, |_c| CommandResult::Handled);
+        r.register("diag_prev", "Previous Diagnostic", None, |_c| CommandResult::Handled);
+        r.register("recheck_diagnostics", "Recheck Diagnostics", None, |c| {
+            if c.editor.diag_cfg.enabled {
+                let debounce_ms = c.editor.diag_cfg.debounce_ms;
+                c.editor.active_mut().diagnostics.arm(c.clock.now_ms(), debounce_ms);
+            }
             CommandResult::Handled
         });
 

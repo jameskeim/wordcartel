@@ -181,6 +181,8 @@ pub struct Editor {
     pub dictionary: std::collections::HashSet<String>,
     /// Session-level words to ignore (added via ignore-word command).
     pub session_ignores: std::collections::HashSet<String>,
+    /// Quick-fix overlay state. XOR with prompt/minibuffer/palette/menu/search.
+    pub diag: Option<crate::diag_overlay::DiagOverlay>,
 }
 
 impl Editor {
@@ -219,6 +221,7 @@ impl Editor {
             diag_cfg: crate::config::DiagnosticsConfig::default(),
             dictionary: std::collections::HashSet::new(),
             session_ignores: std::collections::HashSet::new(),
+            diag: None,
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer {
@@ -257,6 +260,7 @@ impl Editor {
         self.palette = None;
         self.menu = None;
         self.search = None;
+        self.diag = None;
         self.minibuffer = Some(crate::minibuffer::Minibuffer {
             prompt: prompt.into(),
             text: String::new(),
@@ -275,6 +279,7 @@ impl Editor {
         self.pending_keys.clear();
         self.pending_mark = None;
         self.search = None;
+        self.diag = None;
         self.prompt = Some(p);
     }
 
@@ -289,6 +294,7 @@ impl Editor {
         self.pending_keys.clear();
         self.pending_mark = None;
         self.search = None;
+        self.diag = None;
         self.palette = Some(crate::palette::Palette::default());
     }
 
@@ -299,8 +305,19 @@ impl Editor {
     pub fn open_search(&mut self, phase: crate::search_overlay::Phase, origin: usize) {
         self.prompt = None; self.minibuffer = None; self.palette = None; self.menu = None;
         self.pending_keys.clear(); self.pending_mark = None;
+        self.diag = None;
         let bid = self.active().id;
         self.search = Some(crate::search_overlay::SearchState::open(phase, origin, bid));
+    }
+
+    /// Open the quick-fix overlay for a given diagnostic, enforcing single-overlay XOR invariant.
+    ///
+    /// Clears prompt/minibuffer/palette/menu/search + pending_keys + pending_mark.
+    pub fn open_diag(&mut self, d: wordcartel_core::diagnostics::Diagnostic) {
+        self.prompt = None; self.minibuffer = None; self.palette = None; self.menu = None; self.search = None;
+        self.pending_keys.clear(); self.pending_mark = None;
+        let bid = self.active().id;
+        self.diag = Some(crate::diag_overlay::DiagOverlay::new(d, bid));
     }
 
     // Thin delegators — external callers unchanged.

@@ -60,6 +60,14 @@ pub fn dispatch_diagnostics(
     });
 }
 
+/// Append `word` to the personal dictionary file (create if missing).
+/// Returns `Ok(())` on success, `Err(e)` on IO failure (caller shows status).
+pub fn append_word_to_dict(path: &std::path::Path, word: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(f, "{}", word)
+}
+
 /// Version-gated apply: store only if `version` is still current for `buffer_id`.
 pub fn apply_diagnostics_done(
     editor: &mut Editor,

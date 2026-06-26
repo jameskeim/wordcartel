@@ -581,6 +581,73 @@ fn search_pin(editor: &mut Editor) {
     }
 }
 
+/// Accept, ignore, or add-to-dict based on the overlay's current selection.
+/// Clears `editor.diag` when done (regardless of outcome).
+fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
+    // Clone what we need out of the overlay before mutating editor.
+    let overlay_info = editor.diag.as_ref().map(|ov| {
+        let a = ov.anchor.range.start;
+        let b = ov.anchor.range.end;
+        let is_ignore = ov.is_ignore();
+        let is_add_dict = ov.is_add_dict();
+        let suggestion = ov.chosen_suggestion().cloned();
+        (a, b, is_ignore, is_add_dict, suggestion)
+    });
+    let Some((a, b, is_ignore, is_add_dict, suggestion)) = overlay_info else { return; };
+
+    if is_ignore {
+        // Add the surface word to session_ignores, close, re-arm a recheck.
+        let word = editor.active().document.buffer.slice(a..b).to_string();
+        editor.session_ignores.insert(word);
+        editor.diag = None;
+        if editor.diag_cfg.enabled {
+            let debounce_ms = editor.diag_cfg.debounce_ms;
+            editor.active_mut().diagnostics.arm(clock.now_ms(), debounce_ms);
+        }
+    } else if is_add_dict {
+        // Append word to dictionary file + in-memory set, close, re-arm.
+        let word = editor.active().document.buffer.slice(a..b).to_string();
+        if let Some(ref dict_path) = editor.diag_cfg.dictionary.clone() {
+            match crate::diagnostics_run::append_word_to_dict(dict_path, &word) {
+                Ok(()) => { editor.dictionary.insert(word); }
+                Err(e) => { editor.status = format!("add to dictionary failed: {e}"); }
+            }
+        } else {
+            editor.status = "no dictionary path configured".into();
+        }
+        editor.diag = None;
+        if editor.diag_cfg.enabled {
+            let debounce_ms = editor.diag_cfg.debounce_ms;
+            editor.active_mut().diagnostics.arm(clock.now_ms(), debounce_ms);
+        }
+    } else if let Some(s) = suggestion {
+        // Apply the suggestion as an undoable edit, then close.
+        let doc_len = editor.active().document.buffer.len();
+        let (cs, edit) = match &s {
+            wordcartel_core::diagnostics::Suggestion::ReplaceWith(t) =>
+                crate::commands::build_range_replace(a, b, t, doc_len),
+            wordcartel_core::diagnostics::Suggestion::InsertAfter(t) =>
+                crate::commands::build_range_replace(b, b, t, doc_len),
+            wordcartel_core::diagnostics::Suggestion::Remove =>
+                crate::commands::build_range_replace(a, b, "", doc_len),
+        };
+        // Determine cursor position: for ReplaceWith/InsertAfter place after inserted text;
+        // for Remove place at a (start of deleted region).
+        let new_cursor = match &s {
+            wordcartel_core::diagnostics::Suggestion::ReplaceWith(t) => a + t.len(),
+            wordcartel_core::diagnostics::Suggestion::InsertAfter(t) => b + t.len(),
+            wordcartel_core::diagnostics::Suggestion::Remove => a,
+        };
+        let txn = wordcartel_core::history::Transaction::new(cs)
+            .with_selection(wordcartel_core::selection::Selection::single(new_cursor));
+        editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
+        derive::rebuild(editor);
+        crate::nav::ensure_visible(editor);
+        editor.diag = None;
+    }
+    // else: no suggestion and not ignore/add_dict — shouldn't happen, but close anyway.
+}
+
 /// Process one message. Returns true while the app should keep running.
 pub fn reduce(
     msg: Msg,
@@ -878,6 +945,26 @@ pub fn reduce(
         }
         // Non-key messages (FilterDone/ExportDone/TransformDone/JobDone/Tick/…)
         // fall through to the normal handlers below.
+    }
+
+    // Diag overlay intercepts KEY INPUT only; non-key messages fall through to
+    // normal handling so background work is never starved while the overlay is open
+    // (mirror of minibuffer/search blocks above — 5e starvation lesson).
+    if editor.diag.is_some() {
+        if let Msg::Input(Event::Key(k)) = &msg {
+            if k.kind == crossterm::event::KeyEventKind::Press {
+                match k.code {
+                    crossterm::event::KeyCode::Up   => { editor.diag.as_mut().unwrap().up(); }
+                    crossterm::event::KeyCode::Down => { editor.diag.as_mut().unwrap().down(); }
+                    crossterm::event::KeyCode::Esc  => { editor.diag = None; }
+                    crossterm::event::KeyCode::Enter => { diag_apply_selected(editor, clock); }
+                    _ => {} // bare Ctrl+key or anything else: no-op, consumed
+                }
+            }
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit; // return ONLY for key events (including non-Press)
+        }
+        // Non-key messages fall through to normal handlers below.
     }
 
     let before = editor.active().document.version;
@@ -2859,5 +2946,43 @@ mod tests {
             Msg::DiagnosticsDone { diagnostics, .. } => assert!(diagnostics.iter().any(|d| d.kind == wordcartel_core::diagnostics::DiagnosticKind::Spelling)),
             o => panic!("expected DiagnosticsDone, got {o:?}"),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 6 (Effort 5f): quick-fix overlay tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn quick_fix_applies_suggestion_as_undoable_edit() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        let v = e.active().document.version;
+        e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(),
+            suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] }];
+        e.active_mut().diagnostics.computed_version = v;
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1); // cursor inside "teh"
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let press = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(press(KeyCode::Char('.'), KeyModifiers::CONTROL)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert!(e.diag.is_some(), "Ctrl+. opens the quick-fix overlay on the diagnostic");
+        crate::app::reduce(Msg::Input(press(KeyCode::Enter, KeyModifiers::NONE)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.snapshot().to_string(), "the cat\n");
+        assert!(e.diag.is_none(), "overlay closes after apply");
+        assert!(e.active_mut().undo(), "the fix is one undo unit");
+        assert_eq!(e.active().document.buffer.snapshot().to_string(), "teh cat\n");
+    }
+
+    #[test]
+    fn open_diag_clears_siblings_and_open_others_clear_diag() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        let d = wordcartel_core::diagnostics::Diagnostic { range: 0..1, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(), suggestions: vec![] };
+        e.open_diag(d);
+        assert!(e.diag.is_some());
+        e.open_palette();
+        assert!(e.diag.is_none(), "open_palette clears diag");
     }
 }
