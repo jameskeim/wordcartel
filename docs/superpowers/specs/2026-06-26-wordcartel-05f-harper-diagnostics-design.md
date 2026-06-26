@@ -16,11 +16,12 @@ personal dictionary). Next/prev-diagnostic motions walk the document.
 
 Harper runs in a new IO-free `wordcartel-core::diagnostics` module (pure text
 analysis → `Vec<Diagnostic>`, unit-tested deterministically). The shell debounces
-edits, runs the check on the background worker (the 4b `Executor`), surfaces
-results via a **version-gated** `Msg::DiagnosticsDone`, stores them per-buffer,
-projects the markers through `ColMap` in render (the same byte-range projection
-5e built for search highlights), and owns the overlay + dictionary file I/O.
-**Typing is never blocked.**
+edits, runs the check on a **spawned worker thread** (the filter/transform
+`msg_tx` pattern, not the Executor), surfaces results via a **version-gated**
+`Msg::DiagnosticsDone`, stores them per-buffer, projects the markers through
+`ColMap` in render (the same byte-range projection 5e built for search
+highlights), and owns the overlay + dictionary file I/O. **Typing is never
+blocked.**
 
 ## 2. Goals / Non-Goals
 
@@ -33,7 +34,9 @@ projects the markers through `ColMap` in render (the same byte-range projection
 - **Quick-fix overlay** (`Ctrl+.`): message + suggestions; accept = `ChangeSet` edit (undoable); `[ignore]`; `[add to dict]`.
 - **Next/prev-diagnostic motions** (`F8` / `Shift+F8`).
 - **Personal dictionary** (persisted file Harper loads) + `[diagnostics]` config (enable, linter set, debounce ms, dict path).
-- Spellcheck **enabled by default**; deterministic in tests via `InlineExecutor`.
+- Spellcheck **enabled by default**; tests stay deterministic via pure helpers
+  (the deadline/dispatch predicates) and no-op-when-empty render — not by driving
+  the live loop/threads.
 
 ### Non-Goals (v1)
 - Multi-language / per-document language selection (Harper default locale only).
@@ -107,6 +110,17 @@ shell config names linters; core applies them).
 > sensitive — settled at the **Task-1 build gate** (§9.3), same discipline as
 > `regex-cursor` in 5e. The `Diagnostic` contract and the `check` signature are
 > fixed; only the body adapts to the resolved crate.
+>
+> **Core-purity constraint (Codex spec review):** `wordcartel-core` is IO-free.
+> Harper's main dictionary MUST be available to `check` **without core performing
+> filesystem IO** — either Harper bundles/embeds it as static data (preferred;
+> Task-1 confirms), or the **shell loads it and injects it** (the personal
+> dictionary is already shell-injected via `CheckOpts.ignore_words`; the main
+> dictionary would be injected the same way). If Harper requires a runtime
+> file-load that cannot be embedded, that load moves to the **shell**, and
+> `CheckOpts` carries the prepared dictionary/checker handle into `check`. Either
+> way, core does no IO and stays `#![forbid(unsafe_code)]` (the dep's internal
+> unsafe is fine).
 
 ### 3.2 Shell: store, overlay, run
 
@@ -130,8 +144,31 @@ pub struct DiagOverlay {
 - **Markers are valid only when `computed_version == buffer.version`.** Render
   paints diagnostics only then; after any edit (version bump) the markers are
   **hidden** until the next debounced re-check lands a fresh set. No remapping.
-- The **session ignore set** + the **personal dictionary** (loaded from the
-  config path at startup) compose into `CheckOpts.ignore_words`.
+  - **Intended UX (state explicitly — Codex spec review):** underlines
+    **disappear on every edit/undo/redo** and **reappear ~`debounce_ms` after
+    you stop typing**. This is the deliberate trade for never showing a
+    misaligned marker. `buffer.version` increases **monotonically** — `apply`,
+    `undo`, AND `redo` all bump it (editor.rs:82/100/106) — so an undo goes
+    N→N+2, never back to N; a stale `version=N` result can therefore **never** be
+    mistaken for fresh (it can only ever be `< current`, i.e. discarded). No
+    stale-as-fresh window exists.
+- The **session ignore set** + the **personal dictionary** (loaded by the SHELL
+  from the config path at startup — §3.1 core does no IO) compose into
+  `CheckOpts.ignore_words`.
+
+### 3.3 Overlay XOR — the full site list (Codex spec review)
+The XOR overlay set is not centralized (same as 5e §3.3). Adding
+`Editor.diag: Option<DiagOverlay>` means touching every site:
+- `open_minibuffer`, `open_prompt`, `open_palette`, `open_search`
+  (editor.rs:240/259/273/287) — each must additionally set `self.diag = None`.
+- `open_diag` (NEW) — clears `prompt`/`minibuffer`/`palette`/`menu`/`search` +
+  `pending_keys` + `pending_mark` (mirror `open_search`).
+- The menu registry handler (registry.rs:177) and the mouse click-outside path —
+  must close `diag` like the other overlays.
+- Buffer swap / `save.rs` reload paths — clear `diag` (bound to `buffer_id`).
+- **Reducer precedence:** insert the `diag` branch alongside the other bottom-row
+  overlays (after `search`, before normal dispatch); it intercepts only key
+  input and lets non-key messages fall through (§4.2).
 
 ## 4. Data flow
 
@@ -140,7 +177,7 @@ edit → buffer.version bumps → diag store: recheck_due_at = now + debounce_ms
                               markers hidden (version mismatch)
 loop  → recv_timeout(min(existing deadlines, recheck_due_at)) wakes
       → if now >= recheck_due_at and no in_flight for this version:
-            dispatch a diagnostics Job on the Executor for (buffer_id, version, text snapshot)
+            spawn a diagnostics worker thread (msg_tx clone) for (buffer_id, version, text snapshot)
             in_flight_version = version
 worker→ core::diagnostics::check(text, opts) → Msg::DiagnosticsDone{buffer_id, version, diagnostics}
 reduce→ if version == current buffer.version: store diagnostics, computed_version = version,
@@ -153,20 +190,55 @@ F8 / Shift+F8 → move cursor to next/prev diagnostic.range (wrap), pin via ensu
 ```
 
 ### 4.1 Debounce (reuses the existing loop timeout)
-The main loop already computes a deadline and calls `msg_rx.recv_timeout(deadline)`
-(app.rs ~1228-1230, today driven by `scrollbar_until_ms`). Fold
-`recheck_due_at` into that `min()`: the loop wakes when the debounce elapses,
-the wake handler checks "due and not in-flight," and dispatches. **No new timer,
-thread, or tick source.**
+The main loop computes `now = clock.now_ms()` then a deadline as a nested `min()`
+of `swap_deadline` / `sq_deadline` / `sb_deadline` and calls
+`msg_rx.recv_timeout(timeout)`, falling back to `Msg::Tick` on timeout
+(app.rs:1194–1232). Add the **active buffer's `recheck_due_at`** as one more term
+in that `min()`. When the loop wakes (any reason), a handler checks
+"`recheck_due_at` reached AND no `in_flight_version` for the current version" and
+spawns the check (§4.2). **No new timer, thread, or tick source** — it rides the
+existing `recv_timeout`/`Tick`.
 
-### 4.2 Worker dispatch
-The diagnostics check runs on the **existing `Executor`** (single background
-worker, FIFO) as a new `Job`. The result is surfaced as `Msg::DiagnosticsDone`
-and **version-gated** in `reduce` exactly like `FilterDone`/`TransformDone`.
-Only the latest version's result is kept; superseded results are discarded. (The
-worker is also careful not to be starved by overlays — the 5e
-"don't-swallow-background-messages" fix applies: the diag overlay's reduce branch
-must let non-key messages fall through, like minibuffer/search.)
+> Single active buffer in v1; the deadline term is the active buffer's
+> `recheck_due_at`. When multi-buffer (Effort 6) lands, the term becomes the
+> `min` across buffers — noted so it isn't missed.
+
+> **Testability (Codex spec review):** the deadline math lives in `run()`'s loop
+> body and is computed from `clock.now_ms()`; unit tests call `reduce()` directly
+> and never run that loop. So extract the deadline computation into a **pure
+> helper** `next_timeout(now, &[Option<u64>]) -> Duration` (or
+> `next_deadline(now, terms) -> Option<u64>`) and unit-test it with controlled
+> inputs — including the `recheck_due_at` term — rather than driving the live
+> loop. The debounce-arming on edit and the due+in_flight dispatch decision are
+> also pure predicates testable without threads.
+
+### 4.2 Worker dispatch — the `msg_tx` spawned-thread pattern (NOT the Executor)
+
+> **Mechanism (Codex spec review — these are two different paths, do not conflate):**
+> the codebase has TWO async mechanisms: (i) the **`Executor`** dispatches a
+> `Job` and returns a `JobResult` surfaced as `Msg::JobDone` (jobs.rs; used by
+> save/swap; carries `version` + `is_stale`); (ii) **filter/transform** spawn a
+> dedicated thread holding a clone of `msg_tx` and send a **dedicated `Msg`
+> variant** when done (filter.rs:346 `dispatch_filter`, transform.rs:109). 5f
+> uses **mechanism (ii)** — it carries a structured `Vec<Diagnostic>` payload and
+> version-gates in `reduce` exactly as `FilterDone`/`TransformDone` already do.
+> It does **not** use the Executor/`JobResult`/`Msg::JobDone` path.
+
+When a debounce fires (§4.1), the loop spawns a worker thread (clone of `msg_tx`,
+a text snapshot, the `buffer_id`, the current `version`, and the resolved
+`CheckOpts`). The thread runs `core::diagnostics::check` and sends
+`Msg::DiagnosticsDone { buffer_id, version, diagnostics }`. In `reduce`, the
+result is **version-gated**: applied only if `version == buffer.version` for
+`buffer_id`, else discarded (stale) — the same guard `FilterDone`/`TransformDone`
+use. A per-buffer **`in_flight_version`** guard prevents spawning a second check
+for a version already in flight. (Debounced → at most one short-lived check
+thread per idle pause, like filter/transform spawn per invocation.)
+
+The diag overlay must not starve these background results — the 5e
+"don't-swallow-background-messages" fix applies: the diag overlay's `reduce`
+branch lets **non-key** messages (incl. `DiagnosticsDone`/`FilterDone`/etc.)
+fall through to their handlers, intercepting only key input (app.rs:806 search
+branch is the proven template).
 
 ### 4.3 Accept = ordinary edit
 Accepting a suggestion replaces `diagnostic.range` with the suggestion text via
@@ -179,18 +251,28 @@ The edit bumps the version → markers hide → next debounce re-checks.
 ### 5.1 Two visual tiers
 - **Spelling:** `UNDERLINED` + a spelling tier color.
 - **Grammar:** `UNDERLINED` + a distinct grammar tier color.
-- Tier color is applied as the **underline color** (crossterm `SetUnderlineColor`,
-  SGR 58) **where the terminal supports it**; otherwise it falls back to a
-  **foreground tint** on the underlined glyphs. The non-color cue (the underline
-  itself) always survives (roadmap §4 mandates a non-color cue). Capability
-  detection + fallback is a **plan verification item**.
-- Markers project through `ColMap.placed[].src` (global = `line_start(buf,l)+placed.src`),
+- Tier color is applied as the **underline color** via ratatui 0.29's
+  `Style::underline_color()` (the `underline-color` feature is on by default in
+  the pinned ratatui; crossterm 0.28 emits SGR 58) **where the terminal supports
+  it**; otherwise it falls back to a **foreground tint** on the underlined
+  glyphs. The non-color cue (the underline itself) always survives (roadmap §4
+  mandates a non-color cue). Terminal-capability detection + the fg-tint fallback
+  is a **plan verification item** (the API exists; runtime support varies).
+- **Render-path generalization (Codex spec review — not a simple "second
+  overlay"):** 5e's per-grapheme `map.placed` span-builder path is **gated on a
+  search being active** (render.rs ~272/288 — it falls back to the `VisualRow.segs`
+  path when no search). Diagnostics need the `placed` path **whenever EITHER a
+  search highlight OR a diagnostic marker applies**. So this task generalizes the
+  render fork: use the `placed`-based builder when `search active || diagnostics
+  present (and version-valid)`, else the existing `segs` path. Diagnostic ranges
+  then project through `ColMap.placed[].src` (global = `line_start(buf,l)+placed.src`),
   **viewport-bounded** (window the sorted diagnostics to the visible byte span,
-  the same partition_point technique as 5e's highlight). Empty store / version
-  mismatch = **true no-op** (existing render tests unchanged).
+  the same `partition_point` technique as 5e). Empty store / version mismatch /
+  no search = **true no-op** (existing render tests unchanged).
 - Layering: diagnostic underline composes with markdown style and search
   highlight; precedence — a current **search** highlight (REVERSED) wins visually,
-  diagnostic underline otherwise adds to the glyph's style.
+  diagnostic underline otherwise adds (`UNDERLINED` + tier underline-color) to
+  the glyph's style.
 
 ### 5.2 Quick-fix overlay
 ```
@@ -235,9 +317,12 @@ debounce_ms = 400         # idle delay before re-check; min-clamped (e.g. >= 100
 dictionary = "~/.config/wordcartel/dictionary.txt"  # one word per line; created on first add
 # linters = ["spelling", "repeated_words", "sentence_capitalization", ...]  # curated allow-list; omitted = default set
 ```
-Validation (like 5d/5a `load()` → `warns`): clamp `debounce_ms`; unknown linter
-names warn + ignore; missing dictionary file is not an error (created on first
-add-to-dict). `enabled=false` → no dispatch, no markers, true no-op.
+Add a `#[serde(default)]` `RawDiagnostics` sub-struct to `RawConfig`
+(config.rs:110, the established pattern), surfaced as a typed `DiagnosticsConfig`
+on `Config`. Validation in `load()` pushes to the existing `warns: Vec<String>`
+accumulator (config.rs:189): clamp `debounce_ms` (e.g. `>= 100`); unknown linter
+names → warn + ignore; missing dictionary file is **not** an error (created on
+first add-to-dict). `enabled=false` → no dispatch, no markers, true no-op.
 
 ## 7. Performance / responsiveness (the #1 priority)
 
@@ -279,10 +364,20 @@ add-to-dict). `enabled=false` → no dispatch, no markers, true no-op.
 - **Version gate:** a `DiagnosticsDone{version=N}` applied when buffer is at N
   stores; at N+1 (edited meanwhile) is discarded; markers hidden while
   `computed_version != version`.
-- **Debounce:** an edit arms `recheck_due_at`; the loop deadline includes it; a
-  check is dispatched once after the delay, not per keystroke; `in_flight`
-  prevents a second dispatch for the same version. (Driven via `InlineExecutor` +
-  a controllable clock for determinism.)
+- **Debounce (test the pure pieces, not the live loop):** an edit arms
+  `recheck_due_at = now + debounce_ms`; the pure `next_deadline(now, terms)`
+  helper (§4.1) includes that term; the pure "due AND not in_flight" predicate
+  decides dispatch; `in_flight_version` blocks a second dispatch for the same
+  version. Unit-test these pure helpers/predicates with controlled `now` values —
+  the live `run()` loop is not exercised by `reduce()` tests.
+- **Default-on determinism:** with `enabled=true` by default, existing `reduce()`
+  tests must stay deterministic. Guarantee it: the check is dispatched only when
+  `enabled` AND a check would actually run, and render/dispatch are **true no-ops
+  when the store is empty**; a `reduce()` test trips a real Harper check only if
+  it both enables diagnostics AND advances the clock past `debounce_ms`. Provide a
+  `Config::default()`/test path that leaves diagnostics inert for the existing
+  suites (e.g. tests construct buffers without arming the debounce, or use
+  `enabled=false`); document which.
 - **Accept:** applying a suggestion is one undo unit (single `undo()` reverts);
   remaps selection; bumps version.
 - **Ignore / add-to-dict:** the word stops producing a diagnostic after the next
@@ -324,7 +419,7 @@ report — contingency is a human decision (e.g. fall back to a lighter speller)
 | Overlay starves background worker messages | diag reduce branch lets non-key msgs fall through (explicit 5e-pattern test) |
 | Two-tier underline color unsupported by terminal | non-color cue (underline) always present; fg-tint fallback; capability test item |
 | `Ctrl+.` / `Shift+F8` not delivered by some terminals | palette-reachable fallbacks; documented test item |
-| Default-on diagnostics perturb existing tests | dispatch only when enabled AND an Executor is wired; `InlineExecutor` determinism; render no-op when empty |
+| Default-on diagnostics perturb existing tests | dispatch only when enabled AND debounce elapsed; pure deadline/dispatch predicates tested directly; render no-op when store empty |
 
 ## 12. Out of scope → future
 - Multi-language / per-document locale; problems panel; incremental check;
