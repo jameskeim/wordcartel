@@ -479,6 +479,11 @@ fn search_cancel(editor: &mut Editor) {
 
 fn search_replace_all(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
     search_sync(editor); // ensure cache is current
+    // §8: invalid regex → distinct status, no mutation.
+    if editor.search.as_ref().is_some_and(|s| s.error.is_some()) {
+        editor.status = "invalid regex".into();
+        return;
+    }
     let plan: Option<(Vec<(usize, usize, String)>, usize, usize)> = editor.search.as_ref().and_then(|s| {
         let m = s.matcher()?;
         if s.matches().is_empty() { return None; }
@@ -798,7 +803,10 @@ pub fn reduce(
         // non-key (FilterDone/JobDone/Tick/Resize/ClipboardPaste/ClipboardAvailability) falls through to the normal match below
     }
 
-    // Search overlay: intercept before normal editing (spec §3.3 precedence).
+    // Search overlay intercepts KEY INPUT only; non-key messages (FilterDone/JobDone/
+    // TransformDone/ExportDone/Tick) fall through to the normal match arm below so
+    // background work is never starved while the overlay is open (mirror of minibuffer
+    // block above — see test `search_does_not_starve_filterdone`).
     if editor.search.is_some() {
         if let Msg::Input(Event::Key(k)) = &msg {
             if k.kind == crossterm::event::KeyEventKind::Press {
@@ -851,9 +859,11 @@ pub fn reduce(
                 // Recompute against the live buffer and pin the current match.
                 search_sync(editor);
             }
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit; // return ONLY for key events (including non-Press)
         }
-        for r in ex.drain() { apply_result(r, editor); }
-        return !editor.quit;
+        // Non-key messages (FilterDone/ExportDone/TransformDone/JobDone/Tick/…)
+        // fall through to the normal handlers below.
     }
 
     let before = editor.active().document.version;
@@ -2721,6 +2731,45 @@ mod tests {
         r(&mut e, press(KeyCode::Char('n'), KeyModifiers::NONE));      // skip #2
         r(&mut e, press(KeyCode::Char('y'), KeyModifiers::NONE));      // replace #3
         assert_eq!(e.active().document.buffer.snapshot().to_string(), "b aa b\n");
+    }
+
+    /// Fix A regression: a FilterDone arriving while the search overlay is open
+    /// must be applied, not silently dropped.
+    #[test]
+    fn search_does_not_starve_filterdone() {
+        use crate::editor::Editor;
+        use crate::filter::{Disposition, RunResult};
+        use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("abcde\n", None, (80, 24));
+        let id = e.active().id; let v = e.active().document.version;
+        e.open_search(crate::search_overlay::Phase::Find, 0);
+        let (tx, _rx) = std::sync::mpsc::channel(); let reg = Registry::builtins();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
+            disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "aXde\n", "FilterDone applies even under an open search overlay");
+        assert!(e.search.is_some(), "search overlay remains open after non-key message");
+    }
+
+    /// Fix C regression: replace-all with an invalid regex must set status
+    /// "invalid regex" and leave the buffer unchanged.
+    #[test]
+    fn invalid_regex_replace_all_sets_status() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("aa aa aa\n", None, (80, 24));
+        let before = e.active().document.buffer.to_string();
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let press = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        let r = |e: &mut Editor, ev| crate::app::reduce(Msg::Input(ev), e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        r(&mut e, press(KeyCode::Char('r'), KeyModifiers::CONTROL));    // open Replace (Phase::Replace)
+        r(&mut e, press(KeyCode::Char('r'), KeyModifiers::ALT));        // Alt+R: toggle to regex mode
+        // type an invalid regex pattern: unbalanced open paren
+        r(&mut e, press(KeyCode::Char('('), KeyModifiers::NONE));       // invalid in regex mode
+        r(&mut e, press(KeyCode::Char('a'), KeyModifiers::ALT));        // Alt+A = Replace All
+        assert_eq!(e.active().document.buffer.to_string(), before, "invalid regex must not mutate the buffer");
+        assert_eq!(e.status, "invalid regex", "status must say 'invalid regex', got: {:?}", e.status);
     }
 
     #[test]

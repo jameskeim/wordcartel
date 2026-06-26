@@ -216,31 +216,27 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     sorted_lines.sort_unstable();
 
     // Gather search match data once before the row loop (avoids repeated borrow).
-    let hl_matches_owned: Vec<wordcartel_core::search::Match> = match editor.search.as_ref() {
-        Some(s) => s.matches().to_vec(),
-        None => Vec::new(),
-    };
+    // Clone only the viewport-bounded window (O(visible matches)) rather than the
+    // full match list (O(total matches)).  The search-bar count/ordinal always reads
+    // from SearchState directly (`s.count()` / `s.current_ordinal()`), so the
+    // truncated window does not affect the N/M display.
     let hl_current: Option<wordcartel_core::search::Match> =
         editor.search.as_ref().and_then(|s| s.current());
-
-    // Viewport-gate: narrow the match slice to only those intersecting the visible
-    // byte span [lo, hi).  This keeps per-glyph scan O(visible_glyphs × viewport_matches)
-    // instead of O(visible_glyphs × total_matches).
-    // The full hl_matches_owned is kept for the search-bar count/ordinal (format_search_bar
-    // reads from SearchState directly, not from this vec).
-    let hl_window: &[wordcartel_core::search::Match] = if hl_matches_owned.is_empty() {
-        &[]
-    } else {
-        let buf = &editor.active().document.buffer;
-        let lo = derive::line_start(buf, scroll);
-        // Conservative upper bound: the last logical line in the layout cache.
-        let max_visible = sorted_lines.last().copied().unwrap_or(scroll);
-        let hi = derive::line_start(buf, max_visible + 1);
-        // partition_point keeps the sorted invariant; matches are sorted by start,
-        // and non-overlapping so end is also non-decreasing.
-        let lo_idx = hl_matches_owned.partition_point(|m| m.end <= lo);
-        let hi_idx = hl_matches_owned.partition_point(|m| m.start < hi);
-        &hl_matches_owned[lo_idx..hi_idx.max(lo_idx)]
+    let hl_window: Vec<wordcartel_core::search::Match> = match editor.search.as_ref() {
+        None => Vec::new(),
+        Some(s) if s.matches().is_empty() => Vec::new(),
+        Some(s) => {
+            let buf = &editor.active().document.buffer;
+            let lo = derive::line_start(buf, scroll);
+            // Conservative upper bound: the last logical line in the layout cache.
+            let max_visible = sorted_lines.last().copied().unwrap_or(scroll);
+            let hi = derive::line_start(buf, max_visible + 1);
+            // partition_point keeps the sorted invariant; matches are sorted by start,
+            // and non-overlapping so end is also non-decreasing.
+            let lo_idx = s.matches().partition_point(|m| m.end <= lo);
+            let hi_idx = s.matches().partition_point(|m| m.start < hi);
+            s.matches()[lo_idx..hi_idx.max(lo_idx)].to_vec()
+        }
     };
 
     'outer: for &l in &sorted_lines {
