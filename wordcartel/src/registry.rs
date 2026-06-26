@@ -231,13 +231,39 @@ impl Registry {
             }
             CommandResult::Handled
         });
-        // Task 7 wires the motion behavior; register stubs here so keys bind.
-        r.register("diag_next", "Next Diagnostic", None, |_c| CommandResult::Handled);
-        r.register("diag_prev", "Previous Diagnostic", None, |_c| CommandResult::Handled);
+        r.register("diag_next", "Next Diagnostic", None, |c| {
+            let diags = c.editor.active().diagnostics.diagnostics.clone();
+            if diags.is_empty() { return CommandResult::Handled; }
+            let caret = c.editor.active().document.selection.primary().to();
+            let target = diags.iter()
+                .find(|d| d.range.start > caret)
+                .unwrap_or(&diags[0])
+                .range.start;
+            c.editor.active_mut().document.selection =
+                wordcartel_core::selection::Selection::single(target);
+            crate::derive::rebuild(c.editor);
+            crate::nav::ensure_visible(c.editor);
+            CommandResult::Handled
+        });
+        r.register("diag_prev", "Previous Diagnostic", None, |c| {
+            let diags = c.editor.active().diagnostics.diagnostics.clone();
+            if diags.is_empty() { return CommandResult::Handled; }
+            let caret = c.editor.active().document.selection.primary().to();
+            let last = diags.len() - 1;
+            let target = diags.iter()
+                .rev()
+                .find(|d| d.range.start < caret)
+                .unwrap_or(&diags[last])
+                .range.start;
+            c.editor.active_mut().document.selection =
+                wordcartel_core::selection::Selection::single(target);
+            crate::derive::rebuild(c.editor);
+            crate::nav::ensure_visible(c.editor);
+            CommandResult::Handled
+        });
         r.register("recheck_diagnostics", "Recheck Diagnostics", None, |c| {
             if c.editor.diag_cfg.enabled {
-                let debounce_ms = c.editor.diag_cfg.debounce_ms;
-                c.editor.active_mut().diagnostics.arm(c.clock.now_ms(), debounce_ms);
+                c.editor.active_mut().diagnostics.arm(c.clock.now_ms(), 0);
             }
             CommandResult::Handled
         });

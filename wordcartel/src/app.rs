@@ -2985,4 +2985,25 @@ mod tests {
         e.open_palette();
         assert!(e.diag.is_none(), "open_palette clears diag");
     }
+
+    #[test]
+    fn diag_next_prev_move_caret_with_wrap() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("teh cat adn dog\n", None, (80, 24));
+        let v = e.active().document.version;
+        e.active_mut().diagnostics.diagnostics = vec![
+            wordcartel_core::diagnostics::Diagnostic { range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message:"x".into(), suggestions: vec![] },
+            wordcartel_core::diagnostics::Diagnostic { range: 8..11, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message:"x".into(), suggestions: vec![] },
+        ];
+        e.active_mut().diagnostics.computed_version = v;
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(0);
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let f8 = Event::Key(KeyEvent { code: KeyCode::F(8), modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(f8.clone()), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.selection.primary().to(), 8, "F8 moves to the next diagnostic");
+        crate::app::reduce(Msg::Input(f8), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.selection.primary().to(), 0, "F8 wraps to the first");
+    }
 }
