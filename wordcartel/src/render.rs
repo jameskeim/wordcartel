@@ -2,6 +2,7 @@
 // Pure: takes &Editor, mutates NOTHING on the editor.
 
 use crate::{derive, editor::Editor, nav};
+use wordcartel_core::count;
 use ratatui::{
     layout::{Position, Rect},
     style::{Color, Modifier, Style as RStyle},
@@ -96,6 +97,28 @@ pub(crate) fn palette_row_at(area: Rect, palette: &crate::palette::Palette, col:
     } else {
         None
     }
+}
+
+/// Return a word/char count segment for the status bar, or `None` if the
+/// feature is disabled (`view_opts.word_count = false`).
+///
+/// When the primary selection is non-empty, counts only the selected text;
+/// otherwise counts the whole document buffer.
+pub(crate) fn word_count_segment(editor: &Editor) -> Option<String> {
+    if !editor.view_opts.word_count {
+        return None;
+    }
+    let sel = editor.active().document.selection.primary();
+    let text = if !sel.is_empty() {
+        editor.active().document.buffer.slice(sel.from()..sel.to())
+    } else {
+        editor.active().document.buffer.to_string()
+    };
+    Some(format!(
+        "{} words · {} chars",
+        count::word_count(&text),
+        count::char_count(&text)
+    ))
 }
 
 /// Paint the viewport + status line to `frame` using `editor` state.
@@ -293,8 +316,24 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             (text, RStyle::default().add_modifier(Modifier::REVERSED))
         };
 
-        // Truncate to fit the terminal width.
-        let truncated: String = status_text.chars().take(w as usize).collect();
+        // Compose the status line.
+        // When in the normal branch (no prompt/minibuffer) and word_count is on,
+        // flush the count segment to the right and truncate the left (path/mode) to fit.
+        let has_overlay = editor.minibuffer.is_some() || editor.prompt.is_some();
+        let composed = if !has_overlay {
+            if let Some(right) = word_count_segment(editor) {
+                let reserve = right.chars().count() + 1;
+                let left: String = status_text.chars().take((w as usize).saturating_sub(reserve)).collect();
+                let pad = (w as usize).saturating_sub(left.chars().count() + right.chars().count());
+                format!("{left}{}{right}", " ".repeat(pad))
+            } else {
+                status_text.chars().take(w as usize).collect()
+            }
+        } else {
+            status_text.chars().take(w as usize).collect()
+        };
+        // Truncate the composed string to the terminal width (guard for very narrow terminals).
+        let truncated: String = composed.chars().take(w as usize).collect();
         let status_line = Line::from(Span::styled(truncated, status_style));
         let status_area = Rect::new(area.x, status_row, w, 1);
         frame.render_widget(Paragraph::new(status_line), status_area);
@@ -578,5 +617,18 @@ mod tests {
         // (assert the helper render uses to decide, not pixels — see Step 3 for the fn)
         assert!(!crate::render::row_is_active(0, "Para one.".len(), from, to), "para one dimmed");
         assert!(crate::render::row_is_active(from, to, from, to), "active row bright");
+    }
+
+    #[test]
+    fn word_count_segment_selection_aware() {
+        let mut e = Editor::new_from_text("alpha beta gamma\n", None, (80, 24));
+        e.view_opts.word_count = true;
+        // whole doc: 3 words, 17 chars (including trailing \n)
+        assert_eq!(crate::render::word_count_segment(&e), Some("3 words · 17 chars".to_string()));
+        // select "alpha" → 1 word, 5 chars
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::range(0, 5);
+        assert_eq!(crate::render::word_count_segment(&e), Some("1 words · 5 chars".to_string()));
+        e.view_opts.word_count = false;
+        assert_eq!(crate::render::word_count_segment(&e), None);
     }
 }
