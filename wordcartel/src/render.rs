@@ -1,7 +1,7 @@
 // Task 5: ratatui live-preview render + status line.
 // Pure: takes &Editor, mutates NOTHING on the editor.
 
-use crate::{editor::Editor, nav};
+use crate::{derive, editor::Editor, nav};
 use ratatui::{
     layout::{Position, Rect},
     style::{Color, Modifier, Style as RStyle},
@@ -10,6 +10,14 @@ use ratatui::{
     Frame,
 };
 use wordcartel_core::style::Style;
+
+/// Half-open interval intersection: is the row's global byte range active?
+///
+/// Returns `true` if the row's span `[row_from, row_to)` overlaps with the
+/// active region `[region_from, region_to)` (any overlap → bright).
+pub(crate) fn row_is_active(row_from: usize, row_to: usize, region_from: usize, region_to: usize) -> bool {
+    row_from < region_to && region_from < row_to
+}
 
 /// Map a wordcartel inline `Style` to a ratatui `Style`.
 ///
@@ -150,6 +158,29 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         }
     }
 
+    // Compute the active focus region once (before the row loop) when focus is on.
+    // For Paragraph: use paragraph_range_at at the caret.
+    // For Sentence: scope paragraph_range_at first, then sentence_bounds within that window.
+    let focus_region: Option<(usize, usize)> = if editor.view_opts.focus {
+        let buf = &editor.active().document.buffer;
+        let blocks = &editor.active().document.blocks;
+        let head = nav::head(editor);
+        let region = match editor.view_opts.focus_granularity {
+            crate::config::FocusGranularity::Paragraph => {
+                nav::paragraph_range_at(blocks, buf, head)
+            }
+            crate::config::FocusGranularity::Sentence => {
+                let (ps, pe) = nav::paragraph_range_at(blocks, buf, head);
+                let win = buf.slice(ps..pe);
+                let (sf, st) = wordcartel_core::textobj::sentence_bounds(&win, head - ps);
+                (ps + sf, ps + st)
+            }
+        };
+        Some(region)
+    } else {
+        None
+    };
+
     // Collect sorted logical line indices from the layout cache.
     let mut sorted_lines: Vec<usize> = editor.active().view.line_layouts.keys().copied().collect();
     sorted_lines.sort_unstable();
@@ -168,6 +199,18 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             if screen_row >= edit_height {
                 break 'outer;
             }
+
+            // Determine whether this visual row is dim (outside the active region).
+            let row_dim = if let Some((from, to)) = focus_region {
+                let buf = &editor.active().document.buffer;
+                let line_off = derive::line_start(buf, l);
+                let g_from = line_off + vr.src_span.start;
+                let g_to = line_off + vr.src_span.end;
+                !row_is_active(g_from, g_to, from, to)
+            } else {
+                false
+            };
+
             // Build spans for this visual row.
             let mut spans: Vec<Span<'_>> = Vec::new();
 
@@ -179,9 +222,11 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 ));
             }
 
-            // One span per StyledSeg.
+            // One span per StyledSeg — apply DarkGray dim when row is outside active region.
+            let dim_style = RStyle::default().fg(Color::DarkGray);
             for seg in &vr.segs {
-                spans.push(Span::styled(seg.text.clone(), style_to_ratatui(seg.style)));
+                let style = if row_dim { dim_style } else { style_to_ratatui(seg.style) };
+                spans.push(Span::styled(seg.text.clone(), style));
             }
 
             let line_widget = Line::from(spans);
@@ -517,5 +562,21 @@ mod tests {
         // 30 rows → list_h capped at 15, ov_h=15+3=18
         let r30 = palette_overlay_rect(area, 30);
         assert_eq!(r30.height, 18, "30 rows: expected height 18 (15 capped + 3 chrome)");
+    }
+
+    #[test]
+    fn focus_active_region_is_paragraph_at_caret() {
+        let mut e = Editor::new_from_text("Para one.\n\nPara two.\n\nThree.\n", None, (80, 24));
+        e.view_opts.focus = true; // paragraph default
+        set_caret(&mut e, 12); // inside "Para two."
+        derive::rebuild(&mut e);
+        // the active region used by render = paragraph_range_at at the caret
+        let buf = &e.active().document.buffer; let blocks = &e.active().document.blocks;
+        let (from, to) = crate::nav::paragraph_range_at(blocks, buf, 12);
+        assert_eq!(buf.slice(from..to).trim(), "Para two.");
+        // a row whose global src span is outside [from,to) is dimmed; inside is bright.
+        // (assert the helper render uses to decide, not pixels — see Step 3 for the fn)
+        assert!(!crate::render::row_is_active(0, "Para one.".len(), from, to), "para one dimmed");
+        assert!(crate::render::row_is_active(from, to, from, to), "active row bright");
     }
 }
