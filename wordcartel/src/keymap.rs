@@ -290,6 +290,14 @@ static CUA: &[(&str, &str)] = &[
     ("ctrl-.", "quick_fix"),
     ("f8",      "diag_next"),
     ("shift-f8","diag_prev"),
+    // Outline & folding (Effort 5g)
+    ("alt-o",        "outline"),
+    ("alt-up",       "heading_prev"),
+    ("alt-down",     "heading_next"),
+    ("alt-shift-up", "heading_parent"),
+    ("alt-z",        "fold_toggle"),
+    ("alt-shift-z",  "fold_all"),
+    ("alt-shift-x",  "unfold_all"),
 ];
 
 /// WordStar preset — classic two-key diamond + file commands mapped to v1 command ids.
@@ -485,8 +493,9 @@ mod tests {
     #[test]
     fn unknown_sequence_resolves_none() {
         let (t, _) = km(&[], &[], Some("cua"));
-        let z = KeyChord { code: KeyCode::Char('z'), mods: KeyModifiers::ALT };
-        assert!(matches!(t.resolve(&[z]), Resolution::None));
+        // alt-j has no CUA binding (alt-z is now fold_toggle); use it as the "unbound" sentinel.
+        let j = KeyChord { code: KeyCode::Char('j'), mods: KeyModifiers::ALT };
+        assert!(matches!(t.resolve(&[j]), Resolution::None));
     }
 
     #[test]
@@ -554,5 +563,19 @@ mod tests {
         assert_eq!(t.chord_for(crate::registry::CommandId("cut")).as_deref(), Some("ctrl-x"));
         // a command with no default binding → None
         assert_eq!(t.chord_for(crate::registry::CommandId("ventilate")), None);
+    }
+
+    #[test]
+    fn fold_and_outline_binds_resolve_and_do_not_collide() {
+        let (km, warns) = build_keymap(&crate::config::KeymapConfig::default(), &crate::registry::Registry::builtins());
+        assert!(warns.is_empty(), "no warnings expected: {warns:?}");
+        let seq = |s: &str| parse_seq(s).unwrap();
+        assert!(matches!(km.resolve(&seq("alt-o")),         Resolution::Command(CommandId("outline"))));
+        assert!(matches!(km.resolve(&seq("alt-up")),        Resolution::Command(CommandId("heading_prev"))));
+        assert!(matches!(km.resolve(&seq("alt-down")),      Resolution::Command(CommandId("heading_next"))));
+        assert!(matches!(km.resolve(&seq("alt-shift-up")),  Resolution::Command(CommandId("heading_parent"))));
+        assert!(matches!(km.resolve(&seq("alt-z")),         Resolution::Command(CommandId("fold_toggle"))));
+        assert!(matches!(km.resolve(&seq("alt-shift-z")),   Resolution::Command(CommandId("fold_all"))));
+        assert!(matches!(km.resolve(&seq("alt-shift-x")),   Resolution::Command(CommandId("unfold_all"))));
     }
 }

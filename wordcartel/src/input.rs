@@ -118,6 +118,15 @@ pub fn key_to_command_id(key: KeyEvent) -> Option<KeyAction> {
         KeyCode::F(8) if shift               => id("diag_prev"),
         KeyCode::F(8)                        => id("diag_next"),
 
+        // Outline & folding (Effort 5g) — MUST precede bare Up/Down arms to avoid shadowing.
+        KeyCode::Char('o') if alt && !shift  => id("outline"),
+        KeyCode::Up   if alt && shift        => id("heading_parent"),
+        KeyCode::Up   if alt                 => id("heading_prev"),
+        KeyCode::Down if alt                 => id("heading_next"),
+        KeyCode::Char('z') if alt && !shift  => id("fold_toggle"),
+        KeyCode::Char('z') if alt && shift   => id("fold_all"),
+        KeyCode::Char('x') if alt && shift   => id("unfold_all"),
+
         KeyCode::Left  => id(if shift { "select_left" } else { "move_left" }),
         KeyCode::Right => id(if shift { "select_right" } else { "move_right" }),
         KeyCode::Up    => id(if shift { "select_up" } else { "move_up" }),
