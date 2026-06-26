@@ -376,6 +376,30 @@ pub fn move_up(editor: &mut Editor) -> usize {
 ///   find the largest scroll value that keeps the caret line visible.
 /// - Clamp scroll to `[0, total_logical_lines - 1]`.
 pub fn ensure_visible(editor: &mut Editor) {
+    if editor.view_opts.typewriter {
+        let edit_height = (editor.active().view.area.1 as usize).saturating_sub(1);
+        if edit_height == 0 { return; }
+        let anchor = editor.view_opts.typewriter_anchor.clamp(0.0, 1.0);
+        let anchor_row = ((edit_height as f32 * anchor).round() as usize).min(edit_height - 1);
+        // caret's absolute visual row = (visual rows of all logical lines before its line) + its vrow
+        let l = caret_line(editor);
+        let cvr = caret_visual_row(editor, l);
+        let mut caret_abs = cvr;
+        for li in 0..l { caret_abs += rows_of_line(editor, li); }
+        // desired viewport-top absolute visual row
+        let target_top = caret_abs.saturating_sub(anchor_row);
+        // convert target_top → (scroll, scroll_row), walking logical lines
+        let mut acc = 0usize; let mut scroll = 0usize; let mut scroll_row = 0usize;
+        let total = derive::total_logical_lines(&editor.active().document.buffer);
+        'outer: for li in 0..total {
+            let rows = rows_of_line(editor, li);
+            if acc + rows > target_top { scroll = li; scroll_row = target_top - acc; break 'outer; }
+            acc += rows; scroll = li; scroll_row = rows.saturating_sub(1);
+        }
+        editor.active_mut().view.scroll = scroll;
+        editor.active_mut().view.scroll_row = scroll_row;
+        return;
+    }
     let l = caret_line(editor);
     let total = derive::total_logical_lines(&editor.active().document.buffer);
     // Editing area excludes the bottom status row (render reserves frame_h - 1),
@@ -1023,5 +1047,28 @@ mod tests {
         derive::rebuild(&mut e);
         let (col, row) = screen_pos(&e).unwrap();
         assert_eq!(super::offset_at_cell(&e, col, row), Some(5));
+    }
+
+    // ------------------------------------------------------------------
+    // Task 5: typewriter scrolling
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn typewriter_pins_caret_to_anchor_row() {
+        let text: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let mut e = Editor::new_from_text(&text, None, (80, 21)); // edit_height = 20
+        e.view_opts.typewriter = true; e.view_opts.typewriter_anchor = 0.5; // anchor_row = 10
+        let l50 = derive::line_start(&e.active().document.buffer, 50);
+        set_caret(&mut e, l50);
+        ensure_visible(&mut e);
+        derive::rebuild(&mut e);
+        let (_c, row) = screen_pos(&e).unwrap();
+        assert_eq!(row, 10, "caret pinned to anchor row 10");
+        // near the top, caret sits ABOVE the anchor (can't scroll past 0)
+        let l2 = derive::line_start(&e.active().document.buffer, 2);
+        set_caret(&mut e, l2);
+        ensure_visible(&mut e);
+        derive::rebuild(&mut e);
+        assert_eq!(e.active().view.scroll, 0, "top clamps; no scroll past 0");
     }
 }
