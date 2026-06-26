@@ -284,12 +284,15 @@ mod tests {
 
     #[test]
     fn body_range_setext_keeps_both_heading_lines_visible() {
-        // setext heading occupies TWO lines: "Title" + "===".
-        let doc = "Title\n===\nbody1\nbody2\n## next\n";
+        // setext heading occupies TWO lines: "Title" + "---". Using "---" makes
+        // this a LEVEL-2 setext heading, so the following "## next" (also level 2)
+        // terminates the section — letting us assert a bounded body. ("===" would
+        // be level 1, whose section correctly runs past an h2 to doc end.)
+        let doc = "Title\n---\nbody1\nbody2\n## next\n";
         let t = full_parse(doc);
         let r = rope(doc);
         let h = 0usize; // setext heading starts at byte 0
-        // body must start at "body1", NOT at the "===" underline line.
+        // body must start at "body1", NOT at the "---" underline line.
         assert_eq!(body_range(&t, &r, h), doc.find("body1").unwrap()..doc.find("## next").unwrap());
     }
 
