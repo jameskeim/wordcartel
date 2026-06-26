@@ -140,14 +140,19 @@ pub fn handle(
                 let menu_rows = u16::from(editor.menu.is_some());
                 let edit_height = h.saturating_sub(1 + menu_rows) as usize;
                 let erow_in_track = ev.row.saturating_sub(menu_rows) as usize;
-                let total = crate::derive::total_logical_lines(&editor.active().document.buffer);
-                let max_scroll = total.saturating_sub(1);
-                let new_scroll = if edit_height > 0 {
-                    ((erow_in_track * max_scroll) / edit_height).min(max_scroll)
+                let fv = crate::fold::FoldView::compute(
+                    &editor.active().folds,
+                    &editor.active().document.blocks,
+                    &editor.active().document.buffer,
+                );
+                let vis = fv.visible_count();
+                let max_ord = vis.saturating_sub(1);
+                let new_ord = if edit_height > 0 {
+                    ((erow_in_track * max_ord) / edit_height).min(max_ord)
                 } else {
                     0
                 };
-                editor.active_mut().view.scroll = new_scroll;
+                editor.active_mut().view.scroll = fv.line_at_ordinal(new_ord);
                 editor.mouse.scrollbar_dragging = true;
                 editor.mouse.scrollbar_until_ms = clock.now_ms() + 1200;
             } else if let CellHit::Text { col, erow } = hit {
@@ -205,14 +210,19 @@ pub fn handle(
                 let menu_rows = u16::from(editor.menu.is_some());
                 let edit_height = h.saturating_sub(1 + menu_rows) as usize;
                 let erow_in_track = ev.row.saturating_sub(menu_rows) as usize;
-                let total = crate::derive::total_logical_lines(&editor.active().document.buffer);
-                let max_scroll = total.saturating_sub(1);
-                let new_scroll = if edit_height > 0 {
-                    ((erow_in_track * max_scroll) / edit_height).min(max_scroll)
+                let fv = crate::fold::FoldView::compute(
+                    &editor.active().folds,
+                    &editor.active().document.blocks,
+                    &editor.active().document.buffer,
+                );
+                let vis = fv.visible_count();
+                let max_ord = vis.saturating_sub(1);
+                let new_ord = if edit_height > 0 {
+                    ((erow_in_track * max_ord) / edit_height).min(max_ord)
                 } else {
                     0
                 };
-                editor.active_mut().view.scroll = new_scroll;
+                editor.active_mut().view.scroll = fv.line_at_ordinal(new_ord);
                 editor.mouse.scrollbar_until_ms = clock.now_ms() + 1200;
                 return;
             }

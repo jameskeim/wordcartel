@@ -816,21 +816,23 @@ pub fn offset_at_cell(editor: &Editor, col: u16, row: u16) -> Option<usize> {
     let scroll = editor.active().view.scroll;
     let scroll_row = editor.active().view.scroll_row;
     let total = derive::total_logical_lines(&editor.active().document.buffer);
+    let fv = fold_view(editor);
     let mut acc = 0usize; // visible rows consumed
-    let mut line = scroll;
-    while line < total {
-        let rows = rows_of_line(editor, line);
-        let first_vrow = if line == scroll { scroll_row } else { 0 };
+    let mut line = Some(scroll);
+    while let Some(l) = line {
+        if l >= total { break; }
+        let rows = rows_of_line(editor, l);
+        let first_vrow = if l == scroll { scroll_row } else { 0 };
         for vrow in first_vrow..rows {
             if acc == target {
-                let map = get_or_layout(editor, line);
+                let map = get_or_layout(editor, l);
                 let in_off = map.visual_to_source(vrow, col as usize);
                 let snapped = map.snap_to_stop(in_off);
-                return Some(derive::line_start(&editor.active().document.buffer, line) + snapped);
+                return Some(derive::line_start(&editor.active().document.buffer, l) + snapped);
             }
             acc += 1;
         }
-        line += 1;
+        line = fv.next_visible(l);
     }
     None
 }
@@ -1297,6 +1299,20 @@ mod tests {
     }
 
     /// Verify typewriter_rows_of_line fast-path produces results identical to
+    #[test]
+    fn offset_at_cell_never_returns_a_hidden_line() {
+        let doc = "# Top\nintro\n## A\nb1\nb2\n## B\ntail\n";
+        let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 24));
+        ed.active_mut().folds.toggle(doc.find("## A").unwrap());
+        crate::derive::rebuild(&mut ed);
+        // The render shows: line0,line1,line2(## A),line5(## B),line6(tail)...
+        // Row 3 in the editing area is "## B" — clicking it must resolve into line 5,
+        // never a hidden body line.
+        let off = crate::nav::offset_at_cell(&ed, 0, 3).unwrap();
+        let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer) };
+        assert!(!fv.is_hidden(ed.active().document.buffer.byte_to_line(off)));
+    }
+
     /// rows_of_line for both short (non-wrapping) and long (wrapping) lines.
     #[test]
     fn typewriter_rows_of_line_matches_rows_of_line() {
