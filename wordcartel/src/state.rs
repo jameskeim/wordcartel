@@ -16,6 +16,7 @@ pub struct StateEntry {
     pub cursor: usize,
     pub scroll: usize,
     /// Mark name → byte offset. Keys are single-char Strings (toml constraint).
+    #[serde(default)]
     pub marks: BTreeMap<String, usize>,
     /// On-disk mtime (seconds since epoch) at last persist.
     pub mtime: i64,
@@ -23,6 +24,9 @@ pub struct StateEntry {
     pub size: u64,
     /// Monotonic sequence number for LRU eviction. Higher = more recently used.
     pub seq: u64,
+    /// 5g: folded heading byte-offsets. Defaulted so pre-5g session.toml loads.
+    #[serde(default)]
+    pub folds: Vec<usize>,
 }
 
 /// Whole-session store. Keys are canonical absolute path strings.
@@ -139,6 +143,7 @@ mod tests {
                     mtime: 1,
                     size: 1,
                     seq: i,
+                    folds: vec![],
                 },
                 3, // cap 3
             );
@@ -155,8 +160,8 @@ mod tests {
     fn next_seq_is_one_past_max() {
         let mut s = SessionState::default();
         assert_eq!(s.next_seq(), 1, "empty store → next_seq == 1");
-        s.entries.insert("/a".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 5 });
-        s.entries.insert("/b".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 9 });
+        s.entries.insert("/a".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 5, folds: vec![] });
+        s.entries.insert("/b".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 9, folds: vec![] });
         assert_eq!(s.next_seq(), 10, "entries at seq {{5,9}} → next_seq == 10");
     }
 
@@ -165,11 +170,11 @@ mod tests {
         // Simulate: loaded session has entries at seq 5 and 9 (from a prior run).
         // A new entry recorded at seq 10 (from next_seq()) must survive; seq 5 is evicted.
         let mut s = SessionState::default();
-        s.entries.insert("/old-a".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 5 });
-        s.entries.insert("/old-b".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 9 });
+        s.entries.insert("/old-a".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 5, folds: vec![] });
+        s.entries.insert("/old-b".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: 9, folds: vec![] });
         let new_seq = s.next_seq(); // == 10
         assert_eq!(new_seq, 10);
-        s.record("/new".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: new_seq }, 2);
+        s.record("/new".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 0, size: 0, seq: new_seq, folds: vec![] }, 2);
         // Cap is 2: the freshest two must be /old-b (seq 9) and /new (seq 10); /old-a (seq 5) evicted.
         assert_eq!(s.entries.len(), 2, "pruned to cap");
         assert!(s.entries.contains_key("/new"), "newly-recorded entry must survive");
@@ -182,5 +187,29 @@ mod tests {
         let dir = tmp();
         std::fs::write(dir.join("session.toml"), b"\xff not toml").unwrap();
         assert!(load_in(&dir).entries.is_empty());
+    }
+
+    #[test]
+    fn old_session_toml_without_folds_loads_with_empty_folds() {
+        // an entry serialized before `folds` existed must deserialize, not wipe.
+        let toml = r#"
+[entries."/tmp/x.md"]
+cursor = 3
+scroll = 0
+mtime = 1
+size = 2
+seq = 1
+"#;
+        let s: SessionState = toml::from_str(toml).expect("must deserialize without folds");
+        assert!(s.entries["/tmp/x.md"].folds.is_empty());
+    }
+
+    #[test]
+    fn folds_round_trip_through_toml() {
+        let mut s = SessionState::default();
+        s.entries.insert("/tmp/x.md".into(), StateEntry { cursor: 0, scroll: 0, marks: Default::default(), mtime: 1, size: 2, seq: 1, folds: vec![10, 42] });
+        let out = toml::to_string(&s).unwrap();
+        let back: SessionState = toml::from_str(&out).unwrap();
+        assert_eq!(back.entries["/tmp/x.md"].folds, vec![10, 42]);
     }
 }

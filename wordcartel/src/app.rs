@@ -1401,6 +1401,9 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
                             editor.active_mut().document.selection = sel;
                             editor.active_mut().view.scroll = scroll;
                             load_marks_from_entry(&mut editor, entry);
+                            editor.active_mut().folds.folded = entry.folds.iter().copied().collect();
+                            let (blocks, buf) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.clone()) };
+                            editor.active_mut().folds.reconcile(&blocks, &buf);
                         }
                     }
                 }
@@ -1563,6 +1566,7 @@ fn persist_session(
         mtime,
         size,
         seq,
+        folds: editor.active().folds.folded.iter().copied().collect(),
     };
     session.record(
         canon.to_string_lossy().into_owned(),
@@ -2663,7 +2667,7 @@ mod tests {
         // unit-test the resume decision helper directly (no TTY):
         // apply_resume(entry, current_identity, doc_len) -> Option<(cursor,scroll)>
         use crate::state::StateEntry;
-        let e = StateEntry { cursor: 4, scroll: 2, marks: Default::default(), mtime: 10, size: 20, seq: 0 };
+        let e = StateEntry { cursor: 4, scroll: 2, marks: Default::default(), mtime: 10, size: 20, seq: 0, folds: vec![] };
         // identity match → restore (clamped to doc_len)
         assert_eq!(crate::app::apply_resume(&e, (10,20), 100), Some((4,2)));
         assert_eq!(crate::app::apply_resume(&e, (10,20), 3), Some((3,2)), "cursor clamped to doc_len");
@@ -2765,7 +2769,7 @@ mod tests {
         let mut marks = BTreeMap::new();
         marks.insert("a".to_string(), 6usize);
         marks.insert("b".to_string(), 999usize); // past EOF → clamped to len
-        let entry = crate::state::StateEntry { cursor: 0, scroll: 0, marks, mtime: 0, size: 0, seq: 1 };
+        let entry = crate::state::StateEntry { cursor: 0, scroll: 0, marks, mtime: 0, size: 0, seq: 1, folds: vec![] };
         crate::app::load_marks_from_entry(&mut e, &entry);
         assert_eq!(e.active().marks.get(&'a'), Some(&6));
         assert_eq!(e.active().marks.get(&'b'), Some(&e.active().document.buffer.len()));
