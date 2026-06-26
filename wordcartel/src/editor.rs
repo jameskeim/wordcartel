@@ -214,6 +214,8 @@ pub struct Editor {
     pub session_ignores: std::collections::HashSet<String>,
     /// Quick-fix overlay state. XOR with prompt/minibuffer/palette/menu/search.
     pub diag: Option<crate::diag_overlay::DiagOverlay>,
+    /// Outline picker overlay state. XOR with prompt/minibuffer/palette/menu/search/diag.
+    pub outline: Option<crate::outline_overlay::OutlineOverlay>,
 }
 
 impl Editor {
@@ -253,6 +255,7 @@ impl Editor {
             dictionary: std::collections::HashSet::new(),
             session_ignores: std::collections::HashSet::new(),
             diag: None,
+            outline: None,
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer {
@@ -293,6 +296,7 @@ impl Editor {
         self.menu = None;
         self.search = None;
         self.diag = None;
+        self.outline = None;
         self.minibuffer = Some(crate::minibuffer::Minibuffer {
             prompt: prompt.into(),
             text: String::new(),
@@ -312,6 +316,7 @@ impl Editor {
         self.pending_mark = None;
         self.search = None;
         self.diag = None;
+        self.outline = None;
         self.prompt = Some(p);
     }
 
@@ -327,6 +332,7 @@ impl Editor {
         self.pending_mark = None;
         self.search = None;
         self.diag = None;
+        self.outline = None;
         self.palette = Some(crate::palette::Palette::default());
     }
 
@@ -338,6 +344,7 @@ impl Editor {
         self.prompt = None; self.minibuffer = None; self.palette = None; self.menu = None;
         self.pending_keys.clear(); self.pending_mark = None;
         self.diag = None;
+        self.outline = None;
         let bid = self.active().id;
         self.search = Some(crate::search_overlay::SearchState::open(phase, origin, bid));
     }
@@ -350,9 +357,21 @@ impl Editor {
     pub fn open_diag(&mut self, d: wordcartel_core::diagnostics::Diagnostic) {
         self.prompt = None; self.minibuffer = None; self.palette = None; self.menu = None; self.search = None;
         self.pending_keys.clear(); self.pending_mark = None;
+        self.outline = None;
         let bid = self.active().id;
         let ver = self.active().document.version;
         self.diag = Some(crate::diag_overlay::DiagOverlay::new(d, bid, ver));
+    }
+
+    /// Open the outline picker, enforcing single-overlay XOR invariant.
+    pub fn open_outline(&mut self) {
+        self.prompt = None; self.minibuffer = None; self.palette = None; self.menu = None;
+        self.search = None; self.diag = None;
+        self.pending_keys.clear(); self.pending_mark = None;
+        let bid = self.active().id;
+        let blocks = self.active().document.blocks.clone();
+        let rope = self.active().document.buffer.snapshot();
+        self.outline = Some(crate::outline_overlay::OutlineOverlay::open(bid, &blocks, &rope));
     }
 
     // Thin delegators — external callers unchanged.

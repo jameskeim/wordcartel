@@ -180,6 +180,7 @@ impl Registry {
             c.editor.minibuffer = None;
             c.editor.search = None;
             c.editor.diag = None;
+            c.editor.outline = None;
             c.editor.pending_keys.clear();
             c.editor.pending_mark = None;
             c.editor.menu = if c.editor.menu.is_some() {
@@ -325,6 +326,10 @@ impl Registry {
             c.editor.active_mut().folds.unfold_all();
             crate::derive::rebuild(c.editor);
             crate::nav::ensure_visible(c.editor);
+            CommandResult::Handled
+        });
+        r.register("outline", "Outline\u{2026}", Some(MenuCategory::View), |c| {
+            c.editor.open_outline();
             CommandResult::Handled
         });
 

@@ -661,6 +661,16 @@ fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_core::history
     // else: no suggestion and not ignore/add_dict — unreachable (selected is always in range).
 }
 
+pub fn outline_jump_to(editor: &mut Editor, byte: usize) {
+    let origin = editor.active().document.selection.primary().head;
+    crate::marks::record_jump(editor.active_mut(), origin);
+    crate::registry::unfold_ancestors_of(editor, byte);
+    editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(byte);
+    editor.outline = None;
+    derive::rebuild(editor);
+    crate::nav::ensure_visible(editor);
+}
+
 /// Process one message. Returns true while the app should keep running.
 pub fn reduce(
     msg: Msg,
@@ -976,6 +986,68 @@ pub fn reduce(
             }
             for r in ex.drain() { apply_result(r, editor); }
             return !editor.quit; // return ONLY for key events (including non-Press)
+        }
+        // Non-key messages fall through to normal handlers below.
+    }
+
+    if editor.outline.is_some() {
+        if editor.outline.as_ref().map(|o| o.buffer_id) != Some(editor.active().id) {
+            editor.outline = None;
+        }
+    }
+    if editor.outline.is_some() {
+        if let Msg::Input(Event::Key(k)) = &msg {
+            if k.kind == crossterm::event::KeyEventKind::Press {
+                use crossterm::event::{KeyCode, KeyModifiers};
+                match k.code {
+                    KeyCode::Esc => { editor.outline = None; }
+                    KeyCode::Up => {
+                        if let Some(o) = editor.outline.as_mut() {
+                            o.selected = o.selected.saturating_sub(1);
+                        }
+                    }
+                    KeyCode::Down => {
+                        if let Some(o) = editor.outline.as_mut() {
+                            let max = o.rows.len().saturating_sub(1);
+                            o.selected = (o.selected + 1).min(max);
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let target = editor.outline.as_ref()
+                            .and_then(|o| o.rows.get(o.selected))
+                            .map(|r| r.byte);
+                        if let Some(target) = target {
+                            outline_jump_to(editor, target);
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if let Some(o) = editor.outline.as_mut() {
+                            o.query.pop();
+                        }
+                        let q = editor.outline.as_ref().map(|o| o.query.clone()).unwrap_or_default();
+                        let (blocks, rope) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.snapshot()) };
+                        if let Some(o) = editor.outline.as_mut() {
+                            o.set_query(&q, &blocks, &rope);
+                        }
+                    }
+                    KeyCode::Char(c)
+                        if !k.modifiers.contains(KeyModifiers::CONTROL)
+                            && !k.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        if let Some(o) = editor.outline.as_mut() {
+                            o.query.push(c);
+                        }
+                        let q = editor.outline.as_ref().map(|o| o.query.clone()).unwrap_or_default();
+                        let (blocks, rope) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.snapshot()) };
+                        if let Some(o) = editor.outline.as_mut() {
+                            o.set_query(&q, &blocks, &rope);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
         }
         // Non-key messages fall through to normal handlers below.
     }
@@ -2907,6 +2979,34 @@ mod tests {
             disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "aXde\n", "FilterDone applies even under an open search overlay");
         assert!(e.search.is_some(), "search overlay remains open after non-key message");
+    }
+
+    #[test]
+    fn outline_overlay_does_not_starve_background_messages() {
+        use crate::editor::Editor;
+        use crate::filter::{Disposition, RunResult};
+        use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("# H\nabcde\n", None, (80, 24));
+        let id = e.active().id; let v = e.active().document.version;
+        e.open_outline();
+        let (tx, _rx) = std::sync::mpsc::channel(); let reg = Registry::builtins();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::FilterDone { buffer_id: id, version: v, range: 4..6, cursor: 5,
+            disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "# H\nXcde\n", "FilterDone applies even under an open outline overlay");
+        assert!(e.outline.is_some(), "outline overlay remains open after non-key message");
+    }
+
+    #[test]
+    fn outline_jump_auto_unfolds_ancestor_and_moves_caret() {
+        let doc = "# Top\nintro\n## A\nbody\n### A1\nx\n";
+        let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 24));
+        ed.active_mut().folds.toggle(doc.find("## A").unwrap());
+        crate::derive::rebuild(&mut ed);
+        let a1 = doc.find("### A1").unwrap();
+        crate::app::outline_jump_to(&mut ed, a1);
+        assert_eq!(ed.active().document.selection.primary().head, a1);
+        assert!(!ed.active().folds.folded.contains(&doc.find("## A").unwrap()));
     }
 
     /// Fix C regression: replace-all with an invalid regex must set status

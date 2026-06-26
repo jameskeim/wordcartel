@@ -463,7 +463,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         // Compose the status line.
         // When in the normal branch (no prompt/minibuffer/search) and word_count is on,
         // flush the count segment to the right and truncate the left (path/mode) to fit.
-        let has_overlay = editor.search.is_some() || editor.minibuffer.is_some() || editor.prompt.is_some() || editor.diag.is_some();
+        let has_overlay = editor.search.is_some() || editor.minibuffer.is_some() || editor.prompt.is_some() || editor.diag.is_some() || editor.outline.is_some();
         let composed = if !has_overlay {
             if let Some(right) = word_count_segment(editor) {
                 let reserve = right.chars().count() + 1;
@@ -568,6 +568,52 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
 
         let mut list_state = ListState::default();
         list_state.select(if palette.rows.is_empty() { None } else { Some(palette.selected) });
+
+        frame.render_stateful_widget(
+            List::new(items).highlight_style(highlight_style),
+            list_area,
+            &mut list_state,
+        );
+    }
+
+    if let Some(ref outline) = editor.outline {
+        let ov_rect = palette_overlay_rect(area, outline.rows.len());
+        let ov_x = ov_rect.x;
+        let ov_y = ov_rect.y;
+        let ov_w = ov_rect.width;
+        let ov_h = ov_rect.height;
+        let list_h = (outline.rows.len() as u16).min(15).min(h.saturating_sub(4));
+
+        frame.render_widget(Clear, ov_rect);
+        let block = Block::default().borders(Borders::ALL).title(" Outline ");
+        frame.render_widget(block, ov_rect);
+
+        if ov_h < 3 {
+            return;
+        }
+
+        let query_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), 1);
+        let query_display = format!("> {}", outline.query);
+        let truncated_q: String = query_display.chars().take(query_area.width as usize).collect();
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(truncated_q, RStyle::default()))),
+            query_area,
+        );
+
+        if ov_h < 4 || list_h == 0 {
+            return;
+        }
+
+        let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h);
+        let highlight_style = RStyle::default().add_modifier(Modifier::REVERSED);
+        let items: Vec<ListItem> = outline.rows.iter().take(list_h as usize).map(|row| {
+            let mut text = format!("{}{}", " ".repeat(row.indent.saturating_mul(2)), row.text);
+            text = text.chars().take(list_area.width as usize).collect();
+            ListItem::new(Line::from(text))
+        }).collect();
+
+        let mut list_state = ListState::default();
+        list_state.select(if outline.rows.is_empty() { None } else { Some(outline.selected) });
 
         frame.render_stateful_widget(
             List::new(items).highlight_style(highlight_style),
