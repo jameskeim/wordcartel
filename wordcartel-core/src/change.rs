@@ -141,6 +141,43 @@ pub fn map_pos(pos: usize, cs: &ChangeSet) -> usize {
     new + pos.saturating_sub(old)
 }
 
+/// Map one byte position through a ChangeSet with insertion bias = Before.
+/// A position sitting exactly at a PURE insertion point stays BEFORE the
+/// inserted text (the opposite of `map_pos`). Used for fold anchors at heading
+/// starts: inserting text at the heading's first byte must not push the anchor
+/// into the body. An insertion that follows a deletion ending at the anchor (a
+/// replace) behaves like `map_pos` — the anchor advances past the new text.
+/// Deletion behaviour matches `map_pos` (a position inside a deletion clamps to
+/// the deletion start).
+pub fn map_pos_before(pos: usize, cs: &ChangeSet) -> usize {
+    let mut old = 0usize;
+    let mut new = 0usize;
+    let mut prev_was_delete = false; // did the previous op delete up to `old`?
+    for op in &cs.ops {
+        match op {
+            Op::Retain(n) => {
+                if pos < old + n { return new + (pos - old); }
+                old += n; new += n;
+                prev_was_delete = false;
+            }
+            Op::Insert(s) => {
+                // Before bias for a PURE insertion at the anchor only. After a
+                // delete-to-here (replace), fall through so `pos` advances past
+                // the inserted text (matches map_pos).
+                if pos == old && !prev_was_delete { return new; }
+                new += s.len();
+                prev_was_delete = false;
+            }
+            Op::Delete(n) => {
+                if pos < old + n { return new; }
+                old += n;
+                prev_was_delete = true;
+            }
+        }
+    }
+    new + pos.saturating_sub(old)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +279,40 @@ mod tests {
         let cs2 = ChangeSet::delete(2..4, buf.len());
         assert_eq!(map_pos(3, &cs2), 2);
         assert_eq!(map_pos(5, &cs2), 3);
+    }
+
+    #[test]
+    fn map_pos_before_keeps_anchor_before_insertion() {
+        use crate::buffer::TextBuffer;
+        let buf = TextBuffer::from_str("abcdef");
+        // insert "XY" at offset 2
+        let cs = ChangeSet::insert(2, "XY", buf.len());
+        // After-biased map_pos moves 2 -> 4; the Before variant keeps it at 2.
+        assert_eq!(map_pos(2, &cs), 4);
+        assert_eq!(map_pos_before(2, &cs), 2);
+        // positions strictly after the insertion still shift by the insert length
+        assert_eq!(map_pos_before(3, &cs), 5);
+        // positions strictly before are unchanged
+        assert_eq!(map_pos_before(1, &cs), 1);
+        // insertion at offset 0 keeps a byte-0 anchor at 0
+        let cs0 = ChangeSet::insert(0, "Z", buf.len());
+        assert_eq!(map_pos_before(0, &cs0), 0);
+        // deletion behaves identically to map_pos (clamp to deletion start)
+        let csd = ChangeSet::delete(2..4, buf.len());
+        assert_eq!(map_pos_before(3, &csd), 2);
+        assert_eq!(map_pos_before(5, &csd), 3);
+        // REPLACE 2..4 with "XY": an anchor at byte 4 (right edge of the replace =
+        // the next heading start) must map AFTER the new text (4), NOT back onto it.
+        // Build the real Retain,Delete,Insert,Retain shape the shell emits.
+        let cs_rep = ChangeSet {
+            ops: vec![Op::Retain(2), Op::Delete(2), Op::Insert("XY".into()), Op::Retain(2)],
+            len_before: buf.len(),
+            len_after: buf.len(),
+        };
+        assert_eq!(map_pos_before(4, &cs_rep), 4); // not 2
+        // a PURE insert at a mid-doc boundary still stays before
+        let cs_mid = ChangeSet::insert(4, "Q", buf.len());
+        assert_eq!(map_pos_before(4, &cs_mid), 4);
     }
 
     use proptest::prelude::*;
