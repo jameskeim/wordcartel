@@ -588,38 +588,34 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         let block = Block::default().borders(Borders::ALL).title(" Outline ");
         frame.render_widget(block, ov_rect);
 
-        if ov_h < 3 {
-            return;
+        if ov_h >= 3 {
+            let query_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), 1);
+            let query_display = format!("> {}", outline.query);
+            let truncated_q: String = query_display.chars().take(query_area.width as usize).collect();
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(truncated_q, RStyle::default()))),
+                query_area,
+            );
+
+            if ov_h >= 4 && list_h > 0 {
+                let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h);
+                let highlight_style = RStyle::default().add_modifier(Modifier::REVERSED);
+                let items: Vec<ListItem> = outline.rows.iter().take(list_h as usize).map(|row| {
+                    let mut text = format!("{}{}", " ".repeat(row.indent.saturating_mul(2)), row.text);
+                    text = text.chars().take(list_area.width as usize).collect();
+                    ListItem::new(Line::from(text))
+                }).collect();
+
+                let mut list_state = ListState::default();
+                list_state.select(if outline.rows.is_empty() { None } else { Some(outline.selected) });
+
+                frame.render_stateful_widget(
+                    List::new(items).highlight_style(highlight_style),
+                    list_area,
+                    &mut list_state,
+                );
+            }
         }
-
-        let query_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), 1);
-        let query_display = format!("> {}", outline.query);
-        let truncated_q: String = query_display.chars().take(query_area.width as usize).collect();
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(truncated_q, RStyle::default()))),
-            query_area,
-        );
-
-        if ov_h < 4 || list_h == 0 {
-            return;
-        }
-
-        let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h);
-        let highlight_style = RStyle::default().add_modifier(Modifier::REVERSED);
-        let items: Vec<ListItem> = outline.rows.iter().take(list_h as usize).map(|row| {
-            let mut text = format!("{}{}", " ".repeat(row.indent.saturating_mul(2)), row.text);
-            text = text.chars().take(list_area.width as usize).collect();
-            ListItem::new(Line::from(text))
-        }).collect();
-
-        let mut list_state = ListState::default();
-        list_state.select(if outline.rows.is_empty() { None } else { Some(outline.selected) });
-
-        frame.render_stateful_widget(
-            List::new(items).highlight_style(highlight_style),
-            list_area,
-            &mut list_state,
-        );
     }
 
     if let Some(ref menu) = editor.menu {
