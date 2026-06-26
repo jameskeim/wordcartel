@@ -60,7 +60,12 @@
 - Produces:
   ```rust
   pub enum DiagnosticKind { Spelling, Grammar }
-  pub struct Diagnostic { pub range: std::ops::Range<usize>, pub kind: DiagnosticKind, pub message: String, pub suggestions: Vec<String> }
+  // Codex Critical: Harper suggestions are NOT all range-replacements — its
+  // Suggestion enum is ReplaceWith / InsertAfter / Remove. Model that structurally
+  // so quick-fix applies the correct edit (replace range / insert at range.end /
+  // delete range), never flattening to a lossy String.
+  pub enum Suggestion { ReplaceWith(String), InsertAfter(String), Remove }
+  pub struct Diagnostic { pub range: std::ops::Range<usize>, pub kind: DiagnosticKind, pub message: String, pub suggestions: Vec<Suggestion> }
   pub struct CheckOpts<'a> { pub grammar: bool, pub ignore_words: &'a std::collections::HashSet<String> }
   pub fn check(text: &str, opts: &CheckOpts) -> Vec<Diagnostic>; // sorted by range.start
   ```
@@ -69,8 +74,13 @@
 
 In `wordcartel-core/Cargo.toml` under `[dependencies]`:
 ```toml
-harper-core = "0.x"   # resolve the actual latest at the gate
+harper-core = "2"   # 2.5.0 at time of writing — confirm exact latest at the gate
 ```
+> **Codex plan review — real API (harper-core 2.5):** the example entrypoints are
+> `Document::new_curated(text)` (or `new_plain_english`), `FstDictionary::curated()`,
+> `LintGroup::new_curated(dict, ...)`, then `linter.lint(&document) -> Vec<Lint>`.
+> A `Lint` carries `span: Span<char>` (SOURCE character offsets — see the
+> char→byte note in Step 6), a `message`, and `suggestions: Vec<Suggestion>`.
 
 - [ ] **Step 2: Build gate — prove it compiles and is pure**
 
@@ -111,7 +121,8 @@ mod tests {
         assert!(!spell.is_empty(), "expected a spelling diagnostic for 'teh'");
         let d = spell[0];
         assert_eq!(&"I love teh cat."[d.range.clone()], "teh", "range must cover the misspelled word");
-        assert!(d.suggestions.iter().any(|s| s == "the"), "expected 'the' among suggestions, got {:?}", d.suggestions);
+        assert!(d.suggestions.iter().any(|s| matches!(s, Suggestion::ReplaceWith(t) if t == "the")),
+                "expected ReplaceWith(\"the\") among suggestions, got {:?}", d.suggestions);
     }
 
     #[test]
@@ -172,11 +183,18 @@ use std::ops::Range;
 pub enum DiagnosticKind { Spelling, Grammar }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Suggestion {
+    ReplaceWith(String),  // replace the diagnostic's range with this text
+    InsertAfter(String),  // insert this text at range.end (no deletion)
+    Remove,               // delete the diagnostic's range
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Diagnostic {
     pub range: Range<usize>,     // byte range into `text`
     pub kind: DiagnosticKind,
     pub message: String,
-    pub suggestions: Vec<String>,
+    pub suggestions: Vec<Suggestion>,
 }
 
 pub struct CheckOpts<'a> {
@@ -206,12 +224,17 @@ pub fn check(text: &str, opts: &CheckOpts) -> Vec<Diagnostic> {
         .filter_map(|lint| {
             let kind = classify(&lint)?;                  // None → not in enabled set
             if !opts.grammar && kind == DiagnosticKind::Grammar { return None; }
+            // char_span_to_bytes converts Harper's SOURCE character offsets
+            // (Lint.span is Span<char>) to UTF-8 byte offsets into `text`.
             let range = char_span_to_bytes(text, lint.span);
             if kind == DiagnosticKind::Spelling {
                 let surface = text.get(range.clone()).unwrap_or("").to_lowercase();
                 if opts.ignore_words.iter().any(|w| w.to_lowercase() == surface) { return None; }
             }
-            Some(Diagnostic { range, kind, message: lint.message, suggestions: lint.suggestions })
+            // Map Harper's Suggestion enum → ours (ReplaceWith/InsertAfter/Remove),
+            // converting Vec<char> → String. NEVER flatten to a bare string.
+            let suggestions = map_suggestions(lint.suggestions);
+            Some(Diagnostic { range, kind, message: lint.message, suggestions })
         })
         .collect();
     out.sort_by_key(|d| d.range.start);
@@ -220,9 +243,16 @@ pub fn check(text: &str, opts: &CheckOpts) -> Vec<Diagnostic> {
 // `harper_lints`, `classify`, `char_span_to_bytes`, and the `Lint` shim struct
 // are thin adapters over the resolved harper-core API — implement them here.
 ```
-> Implementer note: the adapters (`harper_lints`/`classify`/`char_span_to_bytes`)
-> are the only Harper-version-specific code. Keep the `check` signature and ALL
-> tests fixed; adapt only the adapter bodies. The curated grammar allow-list
+> Implementer note: the adapters (`harper_lints`/`classify`/`char_span_to_bytes`/
+> `map_suggestions`) are the only Harper-version-specific code. Keep the `check`
+> signature, the `Diagnostic`/`Suggestion` types, and ALL tests fixed; adapt only
+> the adapter bodies. **Span conversion (Codex Minor):** use Harper's **source
+> character** indices (`Lint.span` is `Span<char>`) → byte offsets; do NOT use a
+> token-level span (`Span<Token>::to_char_span` exists separately — using
+> token indices would mis-map). `map_suggestions` converts Harper's
+> `Suggestion::{ReplaceWith(Vec<char>), InsertAfter(Vec<char>), Remove}` into our
+> `Suggestion::{ReplaceWith(String), InsertAfter(String), Remove}`. The curated
+> grammar allow-list
 > (which Harper linters map to `Grammar`) is enumerated here from Harper's real
 > linter catalog discovered at the gate — start with a small high-signal set
 > (e.g. repeated words, obvious capitalization/agreement); the shell config
@@ -480,7 +510,8 @@ fn diagnostics_done_applies_only_for_current_version() {
     let v = e.active().document.version;
     let diag = vec![wordcartel_core::diagnostics::Diagnostic {
         range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
-        message: "misspelled".into(), suggestions: vec!["the".into()] }];
+        message: "misspelled".into(),
+        suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] }];
     // current version → stored
     apply_diagnostics_done(&mut e, bid, v, diag.clone());
     assert_eq!(e.active().diagnostics.diagnostics.len(), 1);
@@ -562,7 +593,7 @@ pub fn apply_diagnostics_done(
     version: u64,
     diagnostics: Vec<wordcartel_core::diagnostics::Diagnostic>,
 ) {
-    if let Some(b) = editor.buffer_by_id_mut(buffer_id) {
+    if let Some(b) = editor.by_id_mut(buffer_id) {
         if b.document.version == version {
             b.diagnostics.diagnostics = diagnostics;
             b.diagnostics.computed_version = version;
@@ -574,7 +605,8 @@ pub fn apply_diagnostics_done(
     }
 }
 ```
-> `buffer_by_id_mut` exists (used by FilterDone merge); if the helper name differs, use the same lookup `apply_filter_done` uses.
+> `editor.by_id_mut(buffer_id) -> Option<&mut Buffer>` (editor.rs:232) is the real
+> lookup — the same one `apply_filter_done` uses (app.rs:140).
 
 - [ ] **Step 5: Wire reduce() — arm on edit, dispatch on Tick, apply DiagnosticsDone**
 
@@ -653,7 +685,21 @@ Before the row loop, gather the version-valid diagnostics (empty Vec if `!diag_a
 let diag_all: &[wordcartel_core::diagnostics::Diagnostic] =
     if diag_active { &editor.active().diagnostics.diagnostics } else { &[] };
 ```
-Inside the `placed` builder, for each glyph compute its global src `g = line_off + p.src.start .. line_off + p.src.end` and, in addition to the search-highlight test, test against the viewport-windowed diagnostics (window `diag_all` by `[lo,hi)` with the same `partition_point` pair used for search). If a glyph overlaps a diagnostic, add to its style:
+**Windowing (Codex Important — diagnostics may overlap, unlike search matches):**
+search windows the sorted matches with a `partition_point` PAIR (`m.end <= lo`
+lower bound + `m.start < hi` upper bound), valid only because matches are
+non-overlapping so `end` is monotonic. Diagnostics are sorted by `range.start`
+only and **may overlap**, so the `end <= lo` binary lower-bound is unsound. Window
+them by the **upper bound only** (`partition_point(|d| d.range.start < hi)`),
+then **linearly filter** that start-bounded slice for `d.range.end > lo`:
+```rust
+let hi_idx = diag_all.partition_point(|d| d.range.start < hi);
+let diag_window: Vec<&Diagnostic> = diag_all[..hi_idx].iter().filter(|d| d.range.end > lo).collect();
+```
+(Still viewport-bounded: the upper bound caps the slice at the visible region; the
+linear filter is O(diagnostics-before-hi), fine for v1.)
+
+Inside the `placed` builder, for each glyph compute its global src `g = line_off + p.src.start .. line_off + p.src.end` and, in addition to the search-highlight test, test it against `diag_window`. If a glyph overlaps a diagnostic, add to its style:
 ```rust
 style = style.add_modifier(Modifier::UNDERLINED);
 style = match d.kind {
@@ -695,7 +741,8 @@ fn quick_fix_applies_suggestion_as_undoable_edit() {
     let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
     let v = e.active().document.version;
     e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
-        range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(), suggestions: vec!["the".into()] }];
+        range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(),
+        suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] }];
     e.active_mut().diagnostics.computed_version = v;
     e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1); // cursor inside "teh"
     let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
@@ -739,9 +786,14 @@ impl DiagOverlay {
     pub fn down(&mut self) { if self.selected + 1 < self.row_count() { self.selected += 1; } }
     pub fn is_ignore(&self) -> bool { self.selected == self.anchor.suggestions.len() }
     pub fn is_add_dict(&self) -> bool { self.selected == self.anchor.suggestions.len() + 1 }
-    pub fn chosen_suggestion(&self) -> Option<&str> { self.anchor.suggestions.get(self.selected).map(|s| s.as_str()) }
+    pub fn chosen_suggestion(&self) -> Option<&wordcartel_core::diagnostics::Suggestion> {
+        self.anchor.suggestions.get(self.selected)
+    }
 }
 ```
+> Overlay row rendering: display each `Suggestion` as readable text —
+> `ReplaceWith(t)`/`InsertAfter(t)` show `t` (label the insert, e.g. `+ "t"`),
+> `Remove` shows `(delete)`.
 
 - [ ] **Step 4: Editor field + `open_diag` + XOR**
 
@@ -780,7 +832,18 @@ if editor.diag.is_some() {
     // non-key messages fall through
 }
 ```
-Add `diag_apply_selected`: read the overlay; if `chosen_suggestion()` → `build_range_replace(anchor.range, suggestion, doc_len)` + `editor.apply(...)` (one undo unit), close; if `is_ignore()` → add the surface word to `editor.session_ignores`, close, re-arm a recheck; if `is_add_dict()` → append the word to the dictionary file (diagnostics_run helper) + `editor.dictionary`, close, re-arm.
+Add `diag_apply_selected`: read the overlay's `anchor` (range `a..b`, `doc_len`):
+- `is_ignore()` → add the surface word `text[a..b]` to `editor.session_ignores`, close, re-arm a recheck.
+- `is_add_dict()` → append the word to the dictionary file (diagnostics_run helper) + `editor.dictionary`, close, re-arm.
+- `chosen_suggestion()` → map the `Suggestion` variant to the right **undoable** edit via `build_range_replace`, then `editor.apply(txn, edit, EditKind::Other, clock)` (one undo unit), then close:
+  ```rust
+  match suggestion {
+      Suggestion::ReplaceWith(t) => build_range_replace(a, b, t, doc_len),       // replace a..b
+      Suggestion::InsertAfter(t) => build_range_replace(b, b, t, doc_len),       // insert at b, no delete
+      Suggestion::Remove         => build_range_replace(a, b, "", doc_len),      // delete a..b
+  }
+  ```
+The edit bumps the version → markers hide → next debounce re-checks.
 
 - [ ] **Step 7: Render the overlay** — paint the `DiagOverlay` (message header + suggestions + ignore/add-dict rows, highlighted `selected`) using the palette/search overlay rectangle helpers; place it near the diagnostic. Add `editor.diag.is_some()` to `has_overlay`.
 
@@ -841,4 +904,18 @@ fn diag_next_prev_move_caret_with_wrap() {
 
 **Type consistency:** `Diagnostic{range,kind,message,suggestions}`, `DiagnosticKind{Spelling,Grammar}`, `CheckOpts{grammar,ignore_words}`, `DiagStore{diagnostics,computed_version,recheck_due_at,in_flight_version}`, `next_deadline`/`diag_due`/`valid_for`/`arm`, `Msg::DiagnosticsDone{buffer_id,version,diagnostics}`, `dispatch_diagnostics`/`apply_diagnostics_done`, `DiagOverlay{anchor,selected,buffer_id}` are used identically across tasks.
 
-**Placeholder scan:** the `check` adapter bodies (`harper_lints`/`classify`/`char_span_to_bytes`) and the curated grammar allow-list are explicitly Harper-version-resolved-at-the-gate, with the signature + tests fixed — bounded, not open TODOs (same discipline 5e used for the regex-cursor call site).
+**Placeholder scan:** the `check` adapter bodies (`harper_lints`/`classify`/`char_span_to_bytes`/`map_suggestions`) and the curated grammar allow-list are explicitly Harper-version-resolved-at-the-gate, with the signature + types + tests fixed — bounded, not open TODOs (same discipline 5e used for the regex-cursor call site).
+
+## Codex Plan Review — resolutions (applied to this revision)
+
+Verdict: 1 Critical, 3 Important, 1 Minor. All applied:
+
+| # | Sev | Finding | Resolution |
+|---|-----|---------|------------|
+| 1 | Crit | Harper suggestions aren't all range-replacements (its `Suggestion` enum is `ReplaceWith`/`InsertAfter`/`Remove`); flattening to `Vec<String>` corrupts quick-fix edits | core `Diagnostic.suggestions: Vec<Suggestion>` with structured `Suggestion{ReplaceWith(String),InsertAfter(String),Remove}`; T6 maps each variant to the correct `build_range_replace` (replace `a..b` / insert at `b` / delete `a..b`); tests updated |
+| 2 | Imp | `buffer_by_id_mut` doesn't exist | use `editor.by_id_mut(buffer_id)` (editor.rs:232, the real lookup `apply_filter_done` uses) |
+| 3 | Imp | diagnostic windowing can't reuse search's `partition_point` pair (diagnostics may overlap → `end` not monotonic) | window by upper bound (`start < hi`) only, then **linear-filter** `end > lo` |
+| 4 | Imp | `harper-core = "0.x"` stale (it's 2.5.0) | `harper-core = "2"`; cite real entrypoints (`Document::new_curated`/`FstDictionary::curated`/`LintGroup::new_curated`/`lint`) |
+| 5 | Min | span must use Harper **source char** indices, not token indices | `char_span_to_bytes` note: `Lint.span` is `Span<char>`; avoid `Span<Token>` |
+
+Codex verified-correct (no change): the loop-deadline refactor is grounded (`swap/sq/sb_deadline` are `Option<u64>` at app.rs:1206, `now` from `clock.now_ms()`); `reduce()` captures `before` version + has `clock`/`msg_tx`; `ctrl-.`/`f8`/`shift-f8` parse + are free in CUA; `Style::underline_color` exists in ratatui 0.29.
