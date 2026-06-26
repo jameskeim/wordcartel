@@ -27,7 +27,6 @@ pub struct Match { pub start: usize, pub end: usize }
 pub struct Matcher {
     search: CursorRegex,
     /// Reserved for Task 2's `expand_replacement` over a materialized &str.
-    #[allow(dead_code)]
     captures: AutomataRegex,
 }
 
@@ -84,6 +83,100 @@ fn next_from(rope: &Rope, m: &Matcher, from: usize) -> Option<Match> {
     let cursor = RopeyCursor::at(rope.slice(..), from);
     let input = CursorInput::new(cursor).range(from..rope.len_bytes());
     m.search.find(input).map(|hit| Match { start: hit.start(), end: hit.end() })
+}
+
+/// Expand `$1`..`$9` / `${name}` against the captures of the match at `at`.
+/// Literal mode returns `template` verbatim. Only the matched region is
+/// materialized (bounded) — never the whole document (spec §3.1).
+///
+/// Note: we use custom single-digit parsing so that `$9y` is parsed as
+/// group-ref `$9` followed by literal `y`, not as a greedy name `9y`.
+/// regex-automata's `interpolate_string_into` uses greedy cap-letter parsing
+/// which would consume `y` as part of the name — breaking the spec contract.
+pub fn expand_replacement(rope: &Rope, m: &Matcher, at: &Match, template: &str, mode: QueryMode) -> String {
+    if matches!(mode, QueryMode::Literal) {
+        return template.to_string();
+    }
+    // Materialize ONLY the matched region, run the AUTOMATA engine in capture
+    // mode against it (regex-cursor has no captures path — Codex Critical), and
+    // interpolate. Offsets within `region` are match-relative.
+    let region: String = rope.slice(rope.byte_to_char(at.start)..rope.byte_to_char(at.end)).to_string();
+    let mut caps = m.captures.create_captures();
+    m.captures.captures(regex_automata::Input::new(region.as_str()), &mut caps);
+    interpolate_single_digit(template, &caps, &region)
+}
+
+/// Interpolate `$1`..`$9` / `${name}` as capture group references.
+/// `$$` becomes `$`. Unknown/out-of-range groups expand to empty string.
+/// Unlike regex-automata's built-in interpolation, unbraced `$N` is
+/// exactly ONE digit, so `$9y` → `(group 9)(literal y)`.
+fn interpolate_single_digit(
+    template: &str,
+    caps: &regex_automata::util::captures::Captures,
+    region: &str,
+) -> String {
+    let bytes = template.as_bytes();
+    let mut dst = String::with_capacity(template.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            // Emit next run of non-$ bytes.
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'$' { i += 1; }
+            dst.push_str(&template[start..i]);
+            continue;
+        }
+        // bytes[i] == b'$'
+        match bytes.get(i + 1).copied() {
+            Some(b'$') => {
+                // Escaped dollar.
+                dst.push('$');
+                i += 2;
+            }
+            Some(b'{') => {
+                // Braced reference: ${ref}.
+                let name_start = i + 2;
+                match bytes[name_start..].iter().position(|&b| b == b'}') {
+                    None => {
+                        // Unclosed brace — treat '$' as literal.
+                        dst.push('$');
+                        i += 1;
+                    }
+                    Some(close_rel) => {
+                        let name = &template[name_start..name_start + close_rel];
+                        let group_text = if let Ok(idx) = name.parse::<usize>() {
+                            caps.get_group(idx).map(|s| &region[s.start..s.end]).unwrap_or("")
+                        } else if let Some(pid) = caps.pattern() {
+                            caps.group_info()
+                                .to_index(pid, name)
+                                .and_then(|idx| caps.get_group(idx))
+                                .map(|s| &region[s.start..s.end])
+                                .unwrap_or("")
+                        } else {
+                            ""
+                        };
+                        dst.push_str(group_text);
+                        i = name_start + close_rel + 1; // past closing '}'
+                    }
+                }
+            }
+            Some(d @ b'1'..=b'9') => {
+                // Single-digit numeric group reference ($1..$9 only).
+                let idx = (d - b'0') as usize;
+                if let Some(span) = caps.get_group(idx) {
+                    dst.push_str(&region[span.start..span.end]);
+                }
+                // else: out-of-range → empty string
+                i += 2;
+            }
+            _ => {
+                // '$' followed by anything else — emit '$' literally.
+                dst.push('$');
+                i += 1;
+            }
+        }
+    }
+    dst
 }
 
 /// Next UTF-8 char boundary strictly after `pos` (zero-width progress).
@@ -176,5 +269,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn literal_replacement_is_verbatim() {
+        let rope = Rope::from_str("hello\n");
+        let m = compile("hello", QueryMode::Literal, CaseMode::Sensitive).unwrap();
+        let at = all_matches(&rope, &m)[0];
+        // In literal mode, "$1" is literal text, not a capture ref.
+        assert_eq!(expand_replacement(&rope, &m, &at, "bye $1", QueryMode::Literal), "bye $1");
+    }
+
+    #[test]
+    fn regex_replacement_expands_captures() {
+        let rope = Rope::from_str("Smith, John\n");
+        let m = compile("(\\w+), (\\w+)", QueryMode::Regex, CaseMode::Sensitive).unwrap();
+        let at = all_matches(&rope, &m)[0];
+        assert_eq!(expand_replacement(&rope, &m, &at, "$2 $1", QueryMode::Regex), "John Smith");
+    }
+
+    #[test]
+    fn regex_replacement_out_of_range_group_is_empty() {
+        let rope = Rope::from_str("abc\n");
+        let m = compile("abc", QueryMode::Regex, CaseMode::Sensitive).unwrap();
+        let at = all_matches(&rope, &m)[0];
+        assert_eq!(expand_replacement(&rope, &m, &at, "x$9y", QueryMode::Regex), "xy");
     }
 }
