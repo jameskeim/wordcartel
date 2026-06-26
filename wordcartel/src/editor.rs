@@ -75,6 +75,8 @@ pub struct Buffer {
     pub jump_ring: Vec<usize>,
     pub ring_cursor: usize,
     pub sel_history: Vec<wordcartel_core::selection::Selection>,
+    // 5f: per-buffer diagnostics store
+    pub diagnostics: crate::diagnostics_run::DiagStore,
 }
 
 impl Buffer {
@@ -216,6 +218,7 @@ impl Editor {
             last_edit_at: None, last_swap_at: None, swap_in_flight: false,
             pending_swap_body: None, pending_swap_path: None,
             marks: Default::default(), jump_ring: Vec::new(), ring_cursor: 0, sel_history: Vec::new(),
+            diagnostics: crate::diagnostics_run::DiagStore::new(),
         });
         e
     }
