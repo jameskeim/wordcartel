@@ -124,6 +124,16 @@ pub fn screen_pos(editor: &Editor) -> Option<(u16, u16)> {
 }
 
 // ---------------------------------------------------------------------------
+// Fold-view helper
+// ---------------------------------------------------------------------------
+
+/// Compute the `FoldView` for the active buffer. Used by fold-aware motion functions.
+fn fold_view(editor: &Editor) -> crate::fold::FoldView {
+    let b = editor.active();
+    crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer)
+}
+
+// ---------------------------------------------------------------------------
 // Horizontal navigation
 // ---------------------------------------------------------------------------
 
@@ -311,11 +321,18 @@ pub fn move_down(editor: &mut Editor) -> usize {
                 // Already on the last line — no-op.
                 h
             } else {
-                // Cross into the next logical line.
-                let next_map = layout_line_active(editor, l + 1);
-                let next_ls = derive::line_start(&editor.active().document.buffer, l + 1);
-                let c = layout::enter_from_top(&next_map, desired);
-                next_ls + c.offset
+                // Cross into the next VISIBLE logical line (skipping folded bodies).
+                let fv = fold_view(editor);
+                match fv.next_visible(l) {
+                    None => h, // already on the last visible line — no-op
+                    Some(nl) => {
+                        debug_assert!(!fold_view(editor).is_hidden(nl));
+                        let next_map = layout_line_active(editor, nl);
+                        let next_ls = derive::line_start(&editor.active().document.buffer, nl);
+                        let c = layout::enter_from_top(&next_map, desired);
+                        next_ls + c.offset
+                    }
+                }
             }
         }
     }
@@ -355,13 +372,19 @@ pub fn move_up(editor: &mut Editor) -> usize {
             // At the top visual row of this logical line.
             if l == 0 {
                 // Already on line 0 — no-op.
-                h
-            } else {
-                // Cross into the previous logical line.
-                let prev_map = layout_line_active(editor, l - 1);
-                let prev_ls = derive::line_start(&editor.active().document.buffer, l - 1);
-                let c = layout::enter_from_bottom(&prev_map, desired);
-                prev_ls + c.offset
+                return h;
+            }
+            // Cross into the previous VISIBLE logical line (skipping folded bodies).
+            let fv = fold_view(editor);
+            match fv.prev_visible(l) {
+                None => h,
+                Some(pl) => {
+                    debug_assert!(!fold_view(editor).is_hidden(pl));
+                    let prev_map = layout_line_active(editor, pl);
+                    let prev_ls = derive::line_start(&editor.active().document.buffer, pl);
+                    let c = layout::enter_from_bottom(&prev_map, desired);
+                    prev_ls + c.offset
+                }
             }
         }
     }
@@ -652,7 +675,13 @@ pub fn move_doc_start(editor: &mut Editor) -> usize { editor.active_mut().desire
 pub fn move_doc_end(editor: &mut Editor) -> usize {
     let len = editor.active().document.buffer.len();
     editor.active_mut().desired_col = None;
-    len
+    let b = editor.active();
+    // `len` is the exclusive-end sentinel (past the last byte), so normalize
+    // using `len.saturating_sub(1)` to land inside any trailing hidden body,
+    // then return the snap target (or `len` when nothing is folded there).
+    let probe = if len > 0 { len - 1 } else { 0 };
+    let snapped = crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, probe);
+    if snapped != probe { snapped } else { len }
 }
 
 /// Page step: editing_height − 1 for one row of context overlap.
@@ -1143,6 +1172,37 @@ mod tests {
 
         let pos = screen_pos(&e);
         assert!(pos.is_some(), "caret on wrapped line should be visible");
+    }
+
+    // ------------------------------------------------------------------
+    // Task 6 (Effort 5g): fold-aware vertical motion + move_doc_end
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn move_down_skips_folded_body() {
+        let doc = "# Top\nintro\n## A\nbody1\nbody2\n## B\ntail\n";
+        let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 24));
+        ed.active_mut().folds.toggle(doc.find("## A").unwrap());
+        crate::derive::rebuild(&mut ed);
+        // put caret on "## A" (line 2)
+        let a = doc.find("## A").unwrap();
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(a);
+        let next = crate::nav::move_down(&mut ed);
+        // one row down from the folded heading lands on "## B" (line 5), not body1.
+        let b = doc.find("## B").unwrap();
+        assert_eq!(ed.active().document.buffer.byte_to_line(next), ed.active().document.buffer.byte_to_line(b));
+    }
+
+    #[test]
+    fn move_doc_end_lands_outside_a_fold() {
+        let doc = "# Top\nintro\n## tail\nx\ny\nz\n";
+        let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 24));
+        ed.active_mut().folds.toggle(doc.find("## tail").unwrap());
+        crate::derive::rebuild(&mut ed);
+        let end = crate::nav::move_doc_end(&mut ed);
+        // end must not be inside the hidden body; it snaps to the "## tail" heading.
+        let h = doc.find("## tail").unwrap();
+        assert_eq!(end, h);
     }
 
     /// Verify typewriter_rows_of_line fast-path produces results identical to
