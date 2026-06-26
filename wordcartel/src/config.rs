@@ -36,6 +36,21 @@ pub struct Config {
     pub state: StateConfig,
     pub mouse: MouseConfig,
     pub view: ViewConfig,
+    pub diagnostics: DiagnosticsConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiagnosticsConfig {
+    pub enabled: bool,
+    pub grammar: bool,
+    pub debounce_ms: u64,
+    pub dictionary: Option<std::path::PathBuf>,
+    pub linters: Option<Vec<String>>,
+}
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        DiagnosticsConfig { enabled: true, grammar: true, debounce_ms: 400, dictionary: None, linters: None }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +128,16 @@ struct RawConfig {
     state: RawState,
     mouse: RawMouse,
     view: RawView,
+    diagnostics: RawDiagnostics,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawDiagnostics {
+    enabled: Option<bool>,
+    grammar: Option<bool>,
+    debounce_ms: Option<u64>,
+    dictionary: Option<String>,
+    linters: Option<Vec<String>>,
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -244,6 +269,22 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
                 other => warns.push(format!("view.focus_granularity \"{other}\" invalid; using paragraph")),
             }
         }
+        // diagnostics: per-field override + debounce_ms floor validation.
+        if let Some(v) = raw.diagnostics.enabled { cfg.diagnostics.enabled = v; }
+        if let Some(v) = raw.diagnostics.grammar { cfg.diagnostics.grammar = v; }
+        if let Some(v) = raw.diagnostics.debounce_ms {
+            if v < 100 {
+                warns.push(format!("config: diagnostics.debounce_ms {v} below floor 100; clamped"));
+                cfg.diagnostics.debounce_ms = 100;
+            } else {
+                cfg.diagnostics.debounce_ms = v;
+            }
+        }
+        if let Some(s) = raw.diagnostics.dictionary {
+            cfg.diagnostics.dictionary = Some(std::path::PathBuf::from(s));
+        }
+        if let Some(v) = raw.diagnostics.linters { cfg.diagnostics.linters = Some(v); }
+        // unknown linter names are validated against the core catalog later (Task 4 assembly) — warn there.
     }
     (cfg, warns)
 }
@@ -345,6 +386,25 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn diagnostics_config_defaults_and_validation() {
+        // default: enabled, grammar on, debounce 400
+        let (cfg, _warns) = load(&[]);
+        assert!(cfg.diagnostics.enabled);
+        assert!(cfg.diagnostics.grammar);
+        assert_eq!(cfg.diagnostics.debounce_ms, 400);
+    }
+
+    #[test]
+    fn diagnostics_debounce_is_clamped_with_warning() {
+        let dir = tempdir();
+        let p = dir.join("c.toml");
+        std::fs::write(&p, "[diagnostics]\ndebounce_ms = 5\n").unwrap();
+        let (cfg, warns) = load(&[p]);
+        assert_eq!(cfg.diagnostics.debounce_ms, 100, "debounce_ms clamped to floor 100");
+        assert!(warns.iter().any(|w| w.contains("debounce_ms")), "clamp warns");
     }
 
 }
