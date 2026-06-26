@@ -239,6 +239,16 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         }
     };
 
+    // Diagnostic overlay: check version validity once before the row loop.
+    // diag_active = true iff the stored diagnostics were computed for the current
+    // document version (and are non-empty). When false, diag_all is empty.
+    let diag_active = editor.active().diagnostics.valid_for(editor.active().document.version);
+    let diag_all: &[wordcartel_core::diagnostics::Diagnostic] =
+        if diag_active { &editor.active().diagnostics.diagnostics } else { &[] };
+
+    // Use the placed-path builder when search is active OR valid diagnostics exist.
+    let use_placed = !hl_window.is_empty() || diag_active;
+
     'outer: for &l in &sorted_lines {
         if l < scroll {
             continue;
@@ -269,9 +279,9 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             };
 
             // Build spans for this visual row.
-            let spans: Vec<Span<'_>> = if hl_window.is_empty() {
+            let spans: Vec<Span<'_>> = if !use_placed {
                 // ---------------------------------------------------------------
-                // EXISTING segs-based path (no active search) — true no-op.
+                // EXISTING segs-based path (no active search, no diagnostics) — true no-op.
                 // ---------------------------------------------------------------
                 let dim_style = RStyle::default().fg(Color::DarkGray);
                 let mut segs_spans: Vec<Span<'_>> = Vec::new();
@@ -287,10 +297,25 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 segs_spans
             } else {
                 // ---------------------------------------------------------------
-                // Search-active path: build spans from map.placed, per-glyph highlight.
+                // Placed path: build spans from map.placed, per-glyph search highlight
+                // and/or diagnostic underline. Fires when search is active OR valid
+                // diagnostics are present.
                 // ---------------------------------------------------------------
-                let line_off = derive::line_start(&editor.active().document.buffer, l);
+                let buf = &editor.active().document.buffer;
+                let line_off = derive::line_start(buf, l);
                 let mut hl_spans: Vec<Span<'_>> = Vec::new();
+
+                // Compute the visible byte span for this visual row so we can window
+                // the diagnostics. src_span is relative to the logical line start.
+                let lo = line_off + vr.src_span.start;
+                let hi = line_off + vr.src_span.end;
+
+                // Window diagnostics by upper bound only (diagnostics may overlap so
+                // end is not monotonic — binary lower-bound on end is unsound).
+                // Upper-bound partition_point + linear filter for end > lo.
+                let hi_idx = diag_all.partition_point(|d| d.range.start < hi);
+                let diag_window: Vec<&wordcartel_core::diagnostics::Diagnostic> =
+                    diag_all[..hi_idx].iter().filter(|d| d.range.end > lo).collect();
 
                 // Prefix glyph (first visual row only): treat as unsearchable, apply dim only.
                 if let Some(ref glyph) = vr.prefix_glyph {
@@ -318,6 +343,16 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                         style = style.add_modifier(Modifier::REVERSED);
                     } else if is_match {
                         style = style.bg(Color::Yellow).fg(Color::Black);
+                    }
+
+                    // Apply diagnostic underline if this glyph overlaps any diagnostic.
+                    // Search-highlight precedence stands: underline may stack on REVERSED.
+                    if let Some(d) = diag_window.iter().find(|d| overlaps(g_from, g_to, d.range.start, d.range.end)) {
+                        style = style.add_modifier(Modifier::UNDERLINED);
+                        style = match d.kind {
+                            wordcartel_core::diagnostics::DiagnosticKind::Spelling => style.underline_color(Color::Red),
+                            wordcartel_core::diagnostics::DiagnosticKind::Grammar  => style.underline_color(Color::Blue),
+                        };
                     }
 
                     // Flush the accumulated run when the style changes.
@@ -624,6 +659,13 @@ mod tests {
         })
     }
 
+    fn row_has_underline(buf: &ratatui::buffer::Buffer, row: u16) -> bool {
+        use ratatui::style::Modifier;
+        (0..buf.area.width).any(|x| {
+            buf[(x, row)].style().add_modifier.contains(Modifier::UNDERLINED)
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Search render tests
     // -----------------------------------------------------------------------
@@ -866,6 +908,31 @@ mod tests {
         crate::derive::rebuild(&mut e);
         let buf2 = render_to_buffer(&mut e, 40, 3);
         assert!(row_has_highlight(&buf2, 0), "match at line 0 visible when scroll=0");
+    }
+
+    #[test]
+    fn diagnostics_underline_the_flagged_glyphs() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("teh cat\n", None, (40, 6));
+        let v = e.active().document.version;
+        e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(), suggestions: vec![] }];
+        e.active_mut().diagnostics.computed_version = v;
+        crate::derive::rebuild(&mut e);
+        let buf = render_to_buffer(&mut e, 40, 6);
+        assert!(row_has_underline(&buf, 0), "the misspelled 'teh' is underlined");
+    }
+
+    #[test]
+    fn stale_diagnostics_are_not_painted() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("teh cat\n", None, (40, 6));
+        e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(), suggestions: vec![] }];
+        e.active_mut().diagnostics.computed_version = 999; // != current version
+        crate::derive::rebuild(&mut e);
+        let buf = render_to_buffer(&mut e, 40, 6);
+        assert!(!row_has_underline(&buf, 0), "version-mismatched diagnostics are hidden");
     }
 
     #[test]
