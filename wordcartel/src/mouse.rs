@@ -98,6 +98,7 @@ pub fn handle(
                 crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
             } else if !inside {
                 editor.palette = None; // click outside closes
+                editor.search = None;
             }
         }
         return;
@@ -124,6 +125,7 @@ pub fn handle(
                 crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
             } else {
                 editor.menu = None; // outside → close
+                editor.search = None;
             }
         }
         return;

@@ -130,6 +130,8 @@ pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
     let new_buf = fresh.buffers.into_iter().next().expect("new_from_text yields one buffer");
     let id = editor.active().id;                 // preserve THIS buffer's id
     *editor.active_mut() = crate::editor::Buffer { id, ..new_buf };
+    // Clear any stale search overlay — the buffer content has changed wholesale.
+    editor.search = None;
     // then the existing follow-ups, now on the active buffer:
     editor.active_mut().view.line_layouts.clear();
     crate::derive::rebuild(editor);
@@ -148,6 +150,8 @@ pub fn load_recovered(editor: &mut crate::editor::Editor, body: &str) {
     let new_buf = fresh.buffers.into_iter().next().expect("new_from_text yields one buffer");
     let id = editor.active().id;                 // preserve THIS buffer's id
     *editor.active_mut() = crate::editor::Buffer { id, ..new_buf };
+    // Clear any stale search overlay — the buffer content has changed wholesale.
+    editor.search = None;
     editor.active_mut().document.saved_version = None; // recovered work is unsaved
     editor.active_mut().view.line_layouts.clear();
     crate::derive::rebuild(editor);
@@ -335,6 +339,20 @@ mod tests {
         assert_eq!(e.active().document.buffer.to_string(), "on disk\n");
         assert!(!e.active().document.dirty(), "reloaded buffer is clean");
         assert_eq!(e.active().document.stored_fp, crate::save::fingerprint(&p), "reload refreshes stored_fp");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn reload_from_disk_clears_open_search_overlay() {
+        let p = scratch();
+        std::fs::write(&p, "fresh content\n").unwrap();
+        let mut e = Editor::new_from_text("in memory edits\n", Some(p.clone()), (80, 24));
+        // Open a search overlay so we can assert it gets cleared.
+        e.open_search(crate::search_overlay::Phase::Find, 0);
+        assert!(e.search.is_some(), "search overlay open before reload");
+        reload_from_disk(&mut e);
+        assert!(e.search.is_none(), "reload_from_disk must clear any open search overlay");
+        assert_eq!(e.active().document.buffer.to_string(), "fresh content\n");
         let _ = std::fs::remove_file(&p);
     }
 

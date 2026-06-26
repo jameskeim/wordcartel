@@ -122,6 +122,20 @@ impl Registry {
             c.editor.open_minibuffer("> ");
             CommandResult::Handled
         });
+        r.register("find", "Find…", Some(MenuCategory::Edit), |c| {
+            let origin = c.editor.active().document.selection.primary().to();
+            c.editor.open_search(crate::search_overlay::Phase::Find, origin);
+            CommandResult::Handled
+        });
+        r.register("replace", "Replace…", Some(MenuCategory::Edit), |c| {
+            let origin = c.editor.active().document.selection.primary().to();
+            c.editor.open_search(crate::search_overlay::Phase::Replace, origin);
+            CommandResult::Handled
+        });
+        // find_next / find_prev are no-ops unless the overlay is open (handled in reduce);
+        // register them so they appear in the palette and can be bound.
+        r.register("find_next", "Find Next", None, |_c| CommandResult::Handled);
+        r.register("find_prev", "Find Previous", None, |_c| CommandResult::Handled);
 
         // File menu.
         r.register("save", "Save", Some(MenuCategory::File), |c| crate::save::dispatch_save(c));

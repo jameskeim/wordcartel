@@ -450,6 +450,33 @@ pub fn menu_select_for_test(
     dispatch_overlay_command(editor, reg, &keymap, ex, clock, msg_tx, id);
 }
 
+fn search_sync(editor: &mut Editor) {
+    let (rope, version) = { let d = &editor.active().document; (d.buffer.snapshot(), d.version) };
+    if let Some(s) = editor.search.as_mut() { s.recompute(&rope, version); }
+    if let Some(m) = editor.search.as_ref().and_then(|s| s.current()) {
+        editor.active_mut().document.selection = wordcartel_core::selection::Selection::range(m.start, m.end);
+        derive::rebuild(editor);
+        crate::nav::ensure_visible(editor);
+    }
+}
+
+fn search_step(editor: &mut Editor, forward: bool) {
+    if let Some(s) = editor.search.as_mut() { if forward { s.next(); } else { s.prev(); } }
+    if let Some(m) = editor.search.as_ref().and_then(|s| s.current()) {
+        editor.active_mut().document.selection = wordcartel_core::selection::Selection::range(m.start, m.end);
+        derive::rebuild(editor);
+        crate::nav::ensure_visible(editor);
+    }
+}
+
+fn search_cancel(editor: &mut Editor) {
+    let origin = editor.search.as_ref().map(|s| s.origin).unwrap_or(0);
+    editor.search = None;
+    editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(origin);
+    derive::rebuild(editor);
+    crate::nav::ensure_visible(editor);
+}
+
 /// Process one message. Returns true while the app should keep running.
 pub fn reduce(
     msg: Msg,
@@ -681,6 +708,36 @@ pub fn reduce(
             return !editor.quit;
         }
         // non-key (FilterDone/JobDone/Tick/Resize/ClipboardPaste/ClipboardAvailability) falls through to the normal match below
+    }
+
+    // Search overlay: intercept before normal editing (spec §3.3 precedence).
+    if editor.search.is_some() {
+        if let Msg::Input(Event::Key(k)) = &msg {
+            if k.kind == crossterm::event::KeyEventKind::Press {
+                use crossterm::event::{KeyCode, KeyModifiers};
+                let alt = k.modifiers.contains(KeyModifiers::ALT);
+                let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                match k.code {
+                    KeyCode::Esc => { search_cancel(editor); return !editor.quit; }
+                    KeyCode::Char('r') if alt => { editor.search.as_mut().unwrap().toggle_mode(); }
+                    KeyCode::Char('c') if alt => { editor.search.as_mut().unwrap().cycle_case(); }
+                    KeyCode::Enter if shift => { search_step(editor, false); }
+                    KeyCode::F(3) if shift   => { search_step(editor, false); }
+                    KeyCode::Enter           => { search_step(editor, true); }
+                    KeyCode::F(3)            => { search_step(editor, true); }
+                    KeyCode::Backspace       => { editor.search.as_mut().unwrap().backspace(); }
+                    KeyCode::Left            => { editor.search.as_mut().unwrap().left(); }
+                    KeyCode::Right           => { editor.search.as_mut().unwrap().right(); }
+                    KeyCode::Char(c) if !ctrl => { editor.search.as_mut().unwrap().insert(c); }
+                    _ => {}
+                }
+                // Recompute against the live buffer and pin the current match.
+                search_sync(editor);
+            }
+        }
+        for r in ex.drain() { apply_result(r, editor); }
+        return !editor.quit;
     }
 
     let before = editor.active().document.version;
@@ -2410,6 +2467,43 @@ mod tests {
         // Recompute after the fade deadline — bar must hide.
         crate::app::recompute_scrollbar_visible(&mut e, t + 1300);
         assert!(!e.mouse.scrollbar_visible, "scrollbar must hide after scrollbar_until_ms expires");
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 4 (Effort 5e): search overlay reduce() interception tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn ctrl_f_opens_search_and_typing_jumps() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("foo bar foo\n", None, (80, 24));
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let mkpress = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(mkpress(KeyCode::Char('f'), KeyModifiers::CONTROL)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert!(e.search.is_some(), "Ctrl+F opens search");
+        for c in "bar".chars() { crate::app::reduce(Msg::Input(mkpress(KeyCode::Char(c), KeyModifiers::NONE)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx); }
+        let s = e.search.as_ref().unwrap();
+        assert_eq!(s.needle, "bar");
+        assert_eq!(s.current().unwrap().start, 4); // caret jumped to the match
+        assert_eq!(e.active().document.selection.primary().from(), 4);
+    }
+
+    #[test]
+    fn esc_restores_origin_and_closes() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("foo bar\n", None, (80, 24));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(0);
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let mkpress = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(mkpress(KeyCode::Char('f'), KeyModifiers::CONTROL)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        for c in "bar".chars() { crate::app::reduce(Msg::Input(mkpress(KeyCode::Char(c), KeyModifiers::NONE)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx); }
+        crate::app::reduce(Msg::Input(mkpress(KeyCode::Esc, KeyModifiers::NONE)), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert!(e.search.is_none(), "Esc closes search");
+        assert_eq!(e.active().document.selection.primary().to(), 0, "caret restored to origin");
     }
 
     /// Finding 2 regression: after a resize to a smaller terminal the stale
