@@ -6716,6 +6716,7 @@ dependencies = [
  "ropey",
  "serde",
  "subprocess",
+ "tempfile",
  "thiserror 2.0.18",
  "toml 0.8.23",
  "wordcartel-core",

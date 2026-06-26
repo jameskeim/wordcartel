@@ -18,27 +18,34 @@ pub struct PaletteRow {
     pub chord: String,
 }
 
+/// Fuzzy-rank `items` against `query` by each item's key string, best-first.
+/// Returns the matching items (cloned). Shared by the palette and the outline overlay.
+pub fn fuzzy_filter<T: Clone>(items: &[T], query: &str, key: impl Fn(&T) -> &str) -> Vec<T> {
+    if query.is_empty() {
+        return items.to_vec();
+    }
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let pat = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
+    let mut scored: Vec<(usize, u32, T)> = items.iter().enumerate()
+        .filter_map(|(i, item)| {
+            let mut buf = Vec::new();
+            let hay = nucleo_matcher::Utf32Str::new(key(item), &mut buf);
+            pat.score(hay, &mut matcher).map(|s| (i, s, item.clone()))
+        }).collect();
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    scored.into_iter().map(|(_, _, item)| item).collect()
+}
+
 /// Rebuild the (precomputed) rows from the registry, ranked by `query`.
 /// Empty query → all commands in registration order.
 /// Non-empty query → matches only, sorted by score desc, ties broken by registration order (stable).
 /// No match → empty rows. `selected` clamped.
 pub fn rebuild_rows(p: &mut Palette, reg: &Registry, keymap: &KeyTrie) {
     let all: Vec<(CommandId, &str)> = reg.commands().map(|(id, m)| (id, m.label)).collect();
-    let ranked: Vec<CommandId> = if p.query.is_empty() {
-        all.iter().map(|(id, _)| *id).collect()
-    } else {
-        let mut matcher = Matcher::new(Config::DEFAULT);
-        let pat = Pattern::parse(&p.query, CaseMatching::Ignore, Normalization::Smart);
-        // score each label; keep matches; sort by score desc, then registration order (stable).
-        let mut scored: Vec<(usize, u32, CommandId)> = all.iter().enumerate()
-            .filter_map(|(i, (id, label))| {
-                let mut buf = Vec::new();
-                let hay = nucleo_matcher::Utf32Str::new(label, &mut buf);
-                pat.score(hay, &mut matcher).map(|s| (i, s, *id))
-            }).collect();
-        scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        scored.into_iter().map(|(_, _, id)| id).collect()
-    };
+    let ranked: Vec<CommandId> = fuzzy_filter(&all, &p.query, |(_, label)| label)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
     p.rows = ranked.into_iter().map(|id| PaletteRow {
         id,
         label: reg.meta(id).map(|m| m.label.to_string()).unwrap_or_default(),

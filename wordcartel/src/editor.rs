@@ -77,6 +77,8 @@ pub struct Buffer {
     pub sel_history: Vec<wordcartel_core::selection::Selection>,
     // 5f: per-buffer diagnostics store
     pub diagnostics: crate::diagnostics_run::DiagStore,
+    // 5g: per-buffer fold state
+    pub folds: crate::fold::FoldState,
 }
 
 impl Buffer {
@@ -96,18 +98,47 @@ impl Buffer {
         for v in self.jump_ring.iter_mut() {
             *v = wordcartel_core::change::map_pos(*v, &cs);
         }
+        // 5g: fold anchors are heading STARTS — use Before bias so an insertion
+        // at the heading's first byte does not push the anchor into the body.
+        let remapped: std::collections::BTreeSet<usize> = self
+            .folds
+            .folded
+            .iter()
+            .map(|&b| wordcartel_core::change::map_pos_before(b, &cs))
+            .collect();
+        self.folds.folded = remapped;
         self.sel_history.clear();
         crate::recovery::record_snapshot(self.document.path.as_deref(), self.document.buffer.snapshot());
     }
     pub fn undo(&mut self) -> bool {
         match self.document.history.undo(&mut self.document.buffer) {
-            Some(sel) => { self.document.selection = sel; self.document.version += 1; self.last_edit = None; self.pre_edit_rope = None; self.sel_history.clear(); true }
+            Some(sel) => {
+                self.document.selection = sel;
+                self.document.version += 1;
+                self.last_edit = None;
+                self.pre_edit_rope = None;
+                self.sel_history.clear();
+                // 5g: drop fold anchors now past EOF; rebuild reconciles the rest.
+                let len = self.document.buffer.len();
+                self.folds.folded.retain(|&b| b <= len);
+                true
+            }
             None => false,
         }
     }
     pub fn redo(&mut self) -> bool {
         match self.document.history.redo(&mut self.document.buffer) {
-            Some(sel) => { self.document.selection = sel; self.document.version += 1; self.last_edit = None; self.pre_edit_rope = None; self.sel_history.clear(); true }
+            Some(sel) => {
+                self.document.selection = sel;
+                self.document.version += 1;
+                self.last_edit = None;
+                self.pre_edit_rope = None;
+                self.sel_history.clear();
+                // 5g: drop fold anchors now past EOF; rebuild reconciles the rest.
+                let len = self.document.buffer.len();
+                self.folds.folded.retain(|&b| b <= len);
+                true
+            }
             None => false,
         }
     }
@@ -183,6 +214,8 @@ pub struct Editor {
     pub session_ignores: std::collections::HashSet<String>,
     /// Quick-fix overlay state. XOR with prompt/minibuffer/palette/menu/search.
     pub diag: Option<crate::diag_overlay::DiagOverlay>,
+    /// Outline picker overlay state. XOR with prompt/minibuffer/palette/menu/search/diag.
+    pub outline: Option<crate::outline_overlay::OutlineOverlay>,
 }
 
 impl Editor {
@@ -222,6 +255,7 @@ impl Editor {
             dictionary: std::collections::HashSet::new(),
             session_ignores: std::collections::HashSet::new(),
             diag: None,
+            outline: None,
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer {
@@ -231,6 +265,7 @@ impl Editor {
             pending_swap_body: None, pending_swap_path: None,
             marks: Default::default(), jump_ring: Vec::new(), ring_cursor: 0, sel_history: Vec::new(),
             diagnostics: crate::diagnostics_run::DiagStore::new(),
+            folds: crate::fold::FoldState::default(),
         });
         e
     }
@@ -261,6 +296,7 @@ impl Editor {
         self.menu = None;
         self.search = None;
         self.diag = None;
+        self.outline = None;
         self.minibuffer = Some(crate::minibuffer::Minibuffer {
             prompt: prompt.into(),
             text: String::new(),
@@ -280,6 +316,7 @@ impl Editor {
         self.pending_mark = None;
         self.search = None;
         self.diag = None;
+        self.outline = None;
         self.prompt = Some(p);
     }
 
@@ -295,6 +332,7 @@ impl Editor {
         self.pending_mark = None;
         self.search = None;
         self.diag = None;
+        self.outline = None;
         self.palette = Some(crate::palette::Palette::default());
     }
 
@@ -306,6 +344,7 @@ impl Editor {
         self.prompt = None; self.minibuffer = None; self.palette = None; self.menu = None;
         self.pending_keys.clear(); self.pending_mark = None;
         self.diag = None;
+        self.outline = None;
         let bid = self.active().id;
         self.search = Some(crate::search_overlay::SearchState::open(phase, origin, bid));
     }
@@ -318,9 +357,22 @@ impl Editor {
     pub fn open_diag(&mut self, d: wordcartel_core::diagnostics::Diagnostic) {
         self.prompt = None; self.minibuffer = None; self.palette = None; self.menu = None; self.search = None;
         self.pending_keys.clear(); self.pending_mark = None;
+        self.outline = None;
         let bid = self.active().id;
         let ver = self.active().document.version;
         self.diag = Some(crate::diag_overlay::DiagOverlay::new(d, bid, ver));
+    }
+
+    /// Open the outline picker, enforcing single-overlay XOR invariant.
+    pub fn open_outline(&mut self) {
+        self.prompt = None; self.minibuffer = None; self.palette = None; self.menu = None;
+        self.search = None; self.diag = None;
+        self.pending_keys.clear(); self.pending_mark = None;
+        let bid = self.active().id;
+        let ver = self.active().document.version;
+        let blocks = self.active().document.blocks.clone();
+        let rope = self.active().document.buffer.snapshot();
+        self.outline = Some(crate::outline_overlay::OutlineOverlay::open(bid, ver, &blocks, &rope));
     }
 
     // Thin delegators — external callers unchanged.
@@ -515,5 +567,62 @@ mod tests {
                 && e.palette.is_none() && e.menu.is_none());
         e.open_palette();
         assert!(e.search.is_none(), "open_palette must clear search");
+    }
+
+    // 5g: fold anchor remap helpers — mirrored from the marks_follow_edits_above_them test.
+    fn apply_insert(buf: &mut Buffer, at: usize, text: &str, clk: &TestClock) {
+        let len_before = buf.document.buffer.len();
+        let cs = ChangeSet::insert(at, text, len_before);
+        let txn = Transaction::new(cs);
+        let edit = wordcartel_core::block_tree::Edit { range: at..at, new_len: text.len() };
+        buf.apply(txn, edit, EditKind::Type, clk);
+    }
+    fn apply_delete(buf: &mut Buffer, range: std::ops::Range<usize>, clk: &TestClock) {
+        let len_before = buf.document.buffer.len();
+        let cs = ChangeSet::delete(range.clone(), len_before);
+        let txn = Transaction::new(cs);
+        let edit = wordcartel_core::block_tree::Edit { range: range.clone(), new_len: 0 };
+        buf.apply(txn, edit, EditKind::Other, clk);
+    }
+
+    #[test]
+    fn fold_anchor_survives_insertion_above_it() {
+        let mut ed = Editor::new_from_text("# A\n\nbody\n\n## B\n\nb2\n", None, (80, 24));
+        let clk = TestClock(std::cell::Cell::new(0));
+        let buf = ed.active_mut();
+        let b_off = "# A\n\nbody\n\n".len(); // start of "## B"
+        buf.folds.toggle(b_off);
+        apply_insert(buf, 0, "X\n", &clk); // insert above the fold
+        // anchor shifts by 2 and still lands on "## B".
+        assert!(buf.folds.folded.contains(&(b_off + 2)));
+    }
+
+    #[test]
+    fn fold_anchor_at_heading_start_uses_before_bias() {
+        let mut ed = Editor::new_from_text("## H\nbody\n", None, (80, 24));
+        let clk = TestClock(std::cell::Cell::new(0));
+        let buf = ed.active_mut();
+        buf.folds.toggle(0); // fold the heading at byte 0
+        apply_insert(buf, 0, "Z", &clk);
+        // Before-biased: the anchor stays at 0 (text is now "Z## H"), it is NOT
+        // pushed to 1. (Whether 0 is still a heading start is decided later by
+        // reconcile in rebuild — Task 5; here we only assert the remap bias.)
+        assert!(buf.folds.folded.contains(&0));
+        assert!(!buf.folds.folded.contains(&1));
+    }
+
+    #[test]
+    fn undo_does_not_panic_and_clamps_fold_anchors() {
+        let mut ed = Editor::new_from_text("## H\nbody\n", None, (80, 24));
+        let clk = TestClock(std::cell::Cell::new(0));
+        let buf = ed.active_mut();
+        buf.folds.toggle(0);
+        apply_delete(buf, 0.."## H\n".len(), &clk); // delete the heading line
+        buf.undo();
+        // Step-4 clamp guarantees no anchor points past EOF (no panic on later slice).
+        // The definitive "deleted-heading fold is dropped" check lives in Task 5
+        // (after rebuild's reconcile) — see `undo_then_rebuild_drops_dead_fold`.
+        let len = buf.document.buffer.len();
+        assert!(buf.folds.folded.iter().all(|&b| b <= len));
     }
 }

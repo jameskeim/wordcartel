@@ -142,13 +142,24 @@ pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
     // Reset the DiagStore so no stale underlines from the old content persist.
     new_buf.diagnostics = crate::diagnostics_run::DiagStore::new();
     let id = editor.active().id;                 // preserve THIS buffer's id
+    // 5g: capture folds before replacement so we can carry them forward.
+    let prev_folds = editor.active().folds.clone();
     *editor.active_mut() = crate::editor::Buffer { id, ..new_buf };
+    // 5g: carry folds across the reload and reconcile against the new tree.
+    editor.active_mut().folds = prev_folds;
     // Clear any stale search/diag overlay — the buffer content has changed wholesale.
     editor.search = None;
     editor.diag = None;
     // then the existing follow-ups, now on the active buffer:
     editor.active_mut().view.line_layouts.clear();
-    crate::derive::rebuild(editor);
+    crate::derive::rebuild(editor); // reconciles folds + normalizes scroll
+    // normalize the caret out of any fold the new content created/changed.
+    let head = editor.active().document.selection.primary().head;
+    let nc = {
+        let b = editor.active();
+        crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, head)
+    };
+    editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(nc);
     crate::nav::ensure_visible(editor);
     editor.active_mut().document.stored_fp = fingerprint(&path);
     editor.status = "Reloaded".into();
@@ -172,12 +183,23 @@ pub fn load_recovered(editor: &mut crate::editor::Editor, body: &str) {
     // Reset the DiagStore so no stale underlines from the old content persist.
     new_buf.diagnostics = crate::diagnostics_run::DiagStore::new();
     let id = editor.active().id;                 // preserve THIS buffer's id
+    // 5g: capture folds before replacement so we can carry them forward.
+    let prev_folds = editor.active().folds.clone();
     *editor.active_mut() = crate::editor::Buffer { id, ..new_buf };
+    // 5g: carry folds across the recovery and reconcile against the new tree.
+    editor.active_mut().folds = prev_folds;
     // Clear any stale search/diag overlay — the buffer content has changed wholesale.
     editor.search = None;
     editor.diag = None;
     editor.active_mut().view.line_layouts.clear();
-    crate::derive::rebuild(editor);
+    crate::derive::rebuild(editor); // reconciles folds + normalizes scroll
+    // normalize the caret out of any fold the new content created/changed.
+    let head = editor.active().document.selection.primary().head;
+    let nc = {
+        let b = editor.active();
+        crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, head)
+    };
+    editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(nc);
     crate::nav::ensure_visible(editor);
     editor.active_mut().document.stored_fp = path.as_deref().and_then(fingerprint);
     editor.status = "Recovered unsaved changes".into();
@@ -510,5 +532,35 @@ mod tests {
         );
         assert!(e.active().diagnostics.diagnostics.is_empty(),
             "late pre-recovery DiagnosticsDone must be discarded");
+    }
+
+    #[test]
+    fn reload_reconciles_folds_against_new_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.md");
+        std::fs::write(&path, "## A\nbody\n## B\nx\n").unwrap();
+        let mut ed = crate::editor::Editor::new_from_text("## A\nbody\n## B\nx\n", Some(path.clone()), (80, 24));
+        crate::derive::rebuild(&mut ed);
+        ed.active_mut().folds.toggle(0); // fold ## A (byte 0, survives rewrite)
+        ed.active_mut().folds.toggle("## A\nbody\n".len()); // fold ## B
+        // rewrite the file so ## B is gone
+        std::fs::write(&path, "## A\nbody only\n").unwrap();
+        let b_anchor = "## A\nbody\n".len(); // the ## B offset we folded
+        crate::save::reload_from_disk(&mut ed);
+        // STRONG assertion: ## A is still a heading at byte 0 — its fold must be preserved
+        assert!(ed.active().folds.folded.contains(&0), "## A still exists after reload — its fold must be preserved");
+        // STRONG assertion: the exact stale ## B anchor is gone, and the surviving
+        // fold set equals exactly the post-reconcile heading-start set it should be.
+        assert!(!ed.active().folds.folded.contains(&b_anchor), "stale ## B fold must be dropped");
+        let starts: std::collections::BTreeSet<usize> = {
+            let b = ed.active();
+            wordcartel_core::outline::heading_starts(&b.document.blocks, &b.document.buffer.snapshot())
+        };
+        assert!(ed.active().folds.folded.iter().all(|b| starts.contains(b)),
+            "every surviving fold must be a real heading start in the new content");
+        // caret is visible (normalize is a no-op because it's already out of folds)
+        let head = ed.active().document.selection.primary().head;
+        let b = ed.active();
+        assert_eq!(crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, head), head);
     }
 }

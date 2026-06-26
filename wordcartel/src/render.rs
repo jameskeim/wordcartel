@@ -278,6 +278,13 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 false
             };
 
+            // 5g: compute fold marker before span-building borrows.
+            let fold_marker_n: Option<usize> = if row_index == skip_rows {
+                fold_marker_for(editor, l)
+            } else {
+                None
+            };
+
             // Build spans for this visual row.
             let spans: Vec<Span<'_>> = if !use_placed {
                 // ---------------------------------------------------------------
@@ -368,6 +375,16 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 hl_spans
             };
 
+            // 5g: fold marker on the heading's first visual row.
+            let mut spans = spans;
+            if let Some(n) = fold_marker_n {
+                spans.insert(0, Span::styled("▸ ", RStyle::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    format!("  … {n} lines"),
+                    RStyle::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                ));
+            }
+
             let line_widget = Line::from(spans);
             let row_area = Rect::new(area.x + tg.text_left, edit_top + screen_row, tg.text_width, 1);
             frame.render_widget(Paragraph::new(line_widget), row_area);
@@ -380,8 +397,13 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     // Scrollbar overlay (painted over editing area, rightmost column)
     // -----------------------------------------------------------------------
     if editor.mouse.scrollbar_visible {
-        let total = crate::derive::total_logical_lines(&editor.active().document.buffer);
-        let scroll_pos = editor.active().view.scroll;
+        let fv = crate::fold::FoldView::compute(
+            &editor.active().folds,
+            &editor.active().document.blocks,
+            &editor.active().document.buffer,
+        );
+        let total = fv.visible_count();
+        let scroll_pos = fv.visible_ordinal(editor.active().view.scroll);
         let sb_area = Rect::new(area.x, edit_top, w, edit_height);
         let mut sb_state = ScrollbarState::new(total).position(scroll_pos);
         frame.render_stateful_widget(
@@ -441,7 +463,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         // Compose the status line.
         // When in the normal branch (no prompt/minibuffer/search) and word_count is on,
         // flush the count segment to the right and truncate the left (path/mode) to fit.
-        let has_overlay = editor.search.is_some() || editor.minibuffer.is_some() || editor.prompt.is_some() || editor.diag.is_some();
+        let has_overlay = editor.search.is_some() || editor.minibuffer.is_some() || editor.prompt.is_some() || editor.diag.is_some() || editor.outline.is_some();
         let composed = if !has_overlay {
             if let Some(right) = word_count_segment(editor) {
                 let reserve = right.chars().count() + 1;
@@ -554,6 +576,48 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         );
     }
 
+    if let Some(ref outline) = editor.outline {
+        let ov_rect = palette_overlay_rect(area, outline.rows.len());
+        let ov_x = ov_rect.x;
+        let ov_y = ov_rect.y;
+        let ov_w = ov_rect.width;
+        let ov_h = ov_rect.height;
+        let list_h = (outline.rows.len() as u16).min(15).min(h.saturating_sub(4));
+
+        frame.render_widget(Clear, ov_rect);
+        let block = Block::default().borders(Borders::ALL).title(" Outline ");
+        frame.render_widget(block, ov_rect);
+
+        if ov_h >= 3 {
+            let query_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), 1);
+            let query_display = format!("> {}", outline.query);
+            let truncated_q: String = query_display.chars().take(query_area.width as usize).collect();
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(truncated_q, RStyle::default()))),
+                query_area,
+            );
+
+            if ov_h >= 4 && list_h > 0 {
+                let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h);
+                let highlight_style = RStyle::default().add_modifier(Modifier::REVERSED);
+                let items: Vec<ListItem> = outline.rows.iter().take(list_h as usize).map(|row| {
+                    let mut text = format!("{}{}", " ".repeat(row.indent.saturating_mul(2)), row.text);
+                    text = text.chars().take(list_area.width as usize).collect();
+                    ListItem::new(Line::from(text))
+                }).collect();
+
+                let mut list_state = ListState::default();
+                list_state.select(if outline.rows.is_empty() { None } else { Some(outline.selected) });
+
+                frame.render_stateful_widget(
+                    List::new(items).highlight_style(highlight_style),
+                    list_area,
+                    &mut list_state,
+                );
+            }
+        }
+    }
+
     if let Some(ref menu) = editor.menu {
         if !menu.groups.is_empty() {
             let menu_area = Rect::new(area.x, area.y, w, h.saturating_sub(1));
@@ -664,6 +728,20 @@ fn format_search_bar(s: &crate::search_overlay::SearchState) -> String {
         Phase::Find =>
             format!("Find: {}{}{}{}{}", s.needle, mode, case, count, wrapped),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fold marker helper
+// ---------------------------------------------------------------------------
+
+/// If logical line `l` is the heading line of a folded section, return the hidden
+/// body line count; otherwise None. Pure — drives both the marker glyph and tests.
+pub fn fold_marker_for(editor: &crate::editor::Editor, l: usize) -> Option<usize> {
+    let b = editor.active();
+    let buf = &b.document.buffer;
+    // The folded anchor whose heading line is `l`.
+    let hb = b.folds.folded.iter().copied().find(|&hb| buf.byte_to_line(hb) == l)?;
+    Some(crate::fold::hidden_count_lines(&b.document.blocks, buf, hb))
 }
 
 // ---------------------------------------------------------------------------
@@ -979,6 +1057,17 @@ mod tests {
         crate::derive::rebuild(&mut e);
         let buf = render_to_buffer(&mut e, 40, 6);
         assert!(!row_has_underline(&buf, 0), "version-mismatched diagnostics are hidden");
+    }
+
+    #[test]
+    fn fold_marker_helper_reports_marker_for_folded_heading() {
+        let doc = "## A\nb1\nb2\n## B\n";
+        let mut ed = crate::editor::Editor::new_from_text(doc, None, (40, 10));
+        ed.active_mut().folds.toggle(doc.find("## A").unwrap());
+        crate::derive::rebuild(&mut ed);
+        let a_line = 0usize; // "## A"
+        assert_eq!(crate::render::fold_marker_for(&ed, a_line), Some(2)); // 2 hidden lines
+        assert_eq!(crate::render::fold_marker_for(&ed, 3), None);          // "## B" not folded
     }
 
     #[test]

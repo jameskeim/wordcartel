@@ -465,6 +465,7 @@ fn search_sync(editor: &mut Editor) {
     let (rope, version) = { let d = &editor.active().document; (d.buffer.snapshot(), d.version) };
     if let Some(s) = editor.search.as_mut() { s.recompute(&rope, version); }
     if let Some(m) = editor.search.as_ref().and_then(|s| s.current()) {
+        crate::registry::unfold_ancestors_of(editor, m.start);
         editor.active_mut().document.selection = wordcartel_core::selection::Selection::range(m.start, m.end);
         derive::rebuild(editor);
         crate::nav::ensure_visible(editor);
@@ -474,6 +475,7 @@ fn search_sync(editor: &mut Editor) {
 fn search_step(editor: &mut Editor, forward: bool) {
     if let Some(s) = editor.search.as_mut() { if forward { s.next(); } else { s.prev(); } }
     if let Some(m) = editor.search.as_ref().and_then(|s| s.current()) {
+        crate::registry::unfold_ancestors_of(editor, m.start);
         editor.active_mut().document.selection = wordcartel_core::selection::Selection::range(m.start, m.end);
         derive::rebuild(editor);
         crate::nav::ensure_visible(editor);
@@ -576,6 +578,7 @@ fn search_step_rest(editor: &mut Editor, clock: &dyn wordcartel_core::history::C
 
 fn search_pin(editor: &mut Editor) {
     if let Some(m) = editor.search.as_ref().and_then(|s| s.current()) {
+        crate::registry::unfold_ancestors_of(editor, m.start);
         editor.active_mut().document.selection = wordcartel_core::selection::Selection::range(m.start, m.end);
         derive::rebuild(editor); crate::nav::ensure_visible(editor);
     }
@@ -655,10 +658,22 @@ fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_core::history
             .with_selection(wordcartel_core::selection::Selection::single(new_cursor));
         editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
         derive::rebuild(editor);
+        crate::registry::unfold_ancestors_of(editor, new_cursor);
+        derive::rebuild(editor);
         crate::nav::ensure_visible(editor);
         editor.diag = None;
     }
     // else: no suggestion and not ignore/add_dict — unreachable (selected is always in range).
+}
+
+pub fn outline_jump_to(editor: &mut Editor, byte: usize) {
+    let origin = editor.active().document.selection.primary().head;
+    crate::marks::record_jump(editor.active_mut(), origin);
+    crate::registry::unfold_ancestors_of(editor, byte);
+    editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(byte);
+    editor.outline = None;
+    derive::rebuild(editor);
+    crate::nav::ensure_visible(editor);
 }
 
 /// Process one message. Returns true while the app should keep running.
@@ -976,6 +991,74 @@ pub fn reduce(
             }
             for r in ex.drain() { apply_result(r, editor); }
             return !editor.quit; // return ONLY for key events (including non-Press)
+        }
+        // Non-key messages fall through to normal handlers below.
+    }
+
+    if editor.outline.is_some() {
+        if editor.outline.as_ref().map(|o| o.buffer_id) != Some(editor.active().id) {
+            editor.outline = None;
+        }
+    }
+    if editor.outline.is_some() {
+        if let Msg::Input(Event::Key(k)) = &msg {
+            if k.kind == crossterm::event::KeyEventKind::Press {
+                use crossterm::event::{KeyCode, KeyModifiers};
+                match k.code {
+                    KeyCode::Esc => { editor.outline = None; }
+                    KeyCode::Up => {
+                        if let Some(o) = editor.outline.as_mut() {
+                            o.selected = o.selected.saturating_sub(1);
+                        }
+                    }
+                    KeyCode::Down => {
+                        if let Some(o) = editor.outline.as_mut() {
+                            let max = o.rows.len().saturating_sub(1);
+                            o.selected = (o.selected + 1).min(max);
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if editor.outline.as_ref().map(|o| o.opened_version) != Some(editor.active().document.version) {
+                            editor.status = "document changed; outline closed".into();
+                            editor.outline = None;
+                            for r in ex.drain() { apply_result(r, editor); }
+                            return !editor.quit;
+                        }
+                        let target = editor.outline.as_ref()
+                            .and_then(|o| o.rows.get(o.selected))
+                            .map(|r| r.byte);
+                        if let Some(target) = target {
+                            outline_jump_to(editor, target);
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if let Some(o) = editor.outline.as_mut() {
+                            o.query.pop();
+                        }
+                        let q = editor.outline.as_ref().map(|o| o.query.clone()).unwrap_or_default();
+                        let (blocks, rope) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.snapshot()) };
+                        if let Some(o) = editor.outline.as_mut() {
+                            o.set_query(&q, &blocks, &rope);
+                        }
+                    }
+                    KeyCode::Char(c)
+                        if !k.modifiers.contains(KeyModifiers::CONTROL)
+                            && !k.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        if let Some(o) = editor.outline.as_mut() {
+                            o.query.push(c);
+                        }
+                        let q = editor.outline.as_ref().map(|o| o.query.clone()).unwrap_or_default();
+                        let (blocks, rope) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.snapshot()) };
+                        if let Some(o) = editor.outline.as_mut() {
+                            o.set_query(&q, &blocks, &rope);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
         }
         // Non-key messages fall through to normal handlers below.
     }
@@ -1324,6 +1407,9 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
                             editor.active_mut().document.selection = sel;
                             editor.active_mut().view.scroll = scroll;
                             load_marks_from_entry(&mut editor, entry);
+                            editor.active_mut().folds.folded = entry.folds.iter().copied().collect();
+                            let (blocks, buf) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.clone()) };
+                            editor.active_mut().folds.reconcile(&blocks, &buf);
                         }
                     }
                 }
@@ -1340,8 +1426,20 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     recompute_scrollbar_visible(&mut editor, clock.now_ms());
     // After a potential session-resume the scroll may have changed; re-clamp/re-pin
     // and rebuild the layout cache so the very first frame is always correct.
-    crate::nav::ensure_visible(&mut editor);
+    // Order: rebuild (reconciles folds + layout) → SnapOut restored caret → ensure_visible.
+    // This ensures a cursor saved inside a now-folded section is snapped to the visible
+    // heading before the first draw, maintaining the caret-never-in-a-fold invariant.
     derive::rebuild(&mut editor);
+    {
+        use crate::registry::{place_caret_visible, CaretPlace};
+        let head = editor.active().document.selection.primary().head;
+        let nh = place_caret_visible(&mut editor, head, CaretPlace::SnapOut);
+        if nh != head {
+            editor.active_mut().document.selection =
+                wordcartel_core::selection::Selection::single(nh);
+        }
+    }
+    crate::nav::ensure_visible(&mut editor);
     guard.terminal().draw(|f| render::render(f, &mut editor))?;
     loop {
         let now = clock.now_ms();
@@ -1486,6 +1584,7 @@ fn persist_session(
         mtime,
         size,
         seq,
+        folds: editor.active().folds.folded.iter().copied().collect(),
     };
     session.record(
         canon.to_string_lossy().into_owned(),
@@ -2586,7 +2685,7 @@ mod tests {
         // unit-test the resume decision helper directly (no TTY):
         // apply_resume(entry, current_identity, doc_len) -> Option<(cursor,scroll)>
         use crate::state::StateEntry;
-        let e = StateEntry { cursor: 4, scroll: 2, marks: Default::default(), mtime: 10, size: 20, seq: 0 };
+        let e = StateEntry { cursor: 4, scroll: 2, marks: Default::default(), mtime: 10, size: 20, seq: 0, folds: vec![] };
         // identity match → restore (clamped to doc_len)
         assert_eq!(crate::app::apply_resume(&e, (10,20), 100), Some((4,2)));
         assert_eq!(crate::app::apply_resume(&e, (10,20), 3), Some((3,2)), "cursor clamped to doc_len");
@@ -2688,7 +2787,7 @@ mod tests {
         let mut marks = BTreeMap::new();
         marks.insert("a".to_string(), 6usize);
         marks.insert("b".to_string(), 999usize); // past EOF → clamped to len
-        let entry = crate::state::StateEntry { cursor: 0, scroll: 0, marks, mtime: 0, size: 0, seq: 1 };
+        let entry = crate::state::StateEntry { cursor: 0, scroll: 0, marks, mtime: 0, size: 0, seq: 1, folds: vec![] };
         crate::app::load_marks_from_entry(&mut e, &entry);
         assert_eq!(e.active().marks.get(&'a'), Some(&6));
         assert_eq!(e.active().marks.get(&'b'), Some(&e.active().document.buffer.len()));
@@ -2907,6 +3006,60 @@ mod tests {
             disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "aXde\n", "FilterDone applies even under an open search overlay");
         assert!(e.search.is_some(), "search overlay remains open after non-key message");
+    }
+
+    #[test]
+    fn outline_overlay_does_not_starve_background_messages() {
+        use crate::editor::Editor;
+        use crate::filter::{Disposition, RunResult};
+        use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("# H\nabcde\n", None, (80, 24));
+        let id = e.active().id; let v = e.active().document.version;
+        e.open_outline();
+        let (tx, _rx) = std::sync::mpsc::channel(); let reg = Registry::builtins();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::FilterDone { buffer_id: id, version: v, range: 4..6, cursor: 5,
+            disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "# H\nXcde\n", "FilterDone applies even under an open outline overlay");
+        assert!(e.outline.is_some(), "outline overlay remains open after non-key message");
+    }
+
+    #[test]
+    fn outline_jump_refused_after_background_edit() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("# Top\nintro\n## A\nbody\n", None, (80, 24));
+        let start = e.active().document.selection.primary().head;
+        e.open_outline();
+        assert!(e.outline.is_some(), "outline overlay must open");
+        let opened_version = e.outline.as_ref().unwrap().opened_version;
+        e.active_mut().document.version = opened_version + 1;
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let enter = Event::Key(KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert!(e.outline.is_none(), "stale outline overlay must close without jumping");
+        assert_eq!(e.active().document.selection.primary().head, start,
+            "stale outline Enter must not move the caret");
+        assert!(e.status.contains("changed"), "status must mention the change");
+    }
+
+    #[test]
+    fn outline_jump_auto_unfolds_ancestor_and_moves_caret() {
+        let doc = "# Top\nintro\n## A\nbody\n### A1\nx\n";
+        let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 24));
+        ed.active_mut().folds.toggle(doc.find("## A").unwrap());
+        crate::derive::rebuild(&mut ed);
+        let a1 = doc.find("### A1").unwrap();
+        crate::app::outline_jump_to(&mut ed, a1);
+        assert_eq!(ed.active().document.selection.primary().head, a1);
+        assert!(!ed.active().folds.folded.contains(&doc.find("## A").unwrap()));
     }
 
     /// Fix C regression: replace-all with an invalid regex must set status
@@ -3158,5 +3311,112 @@ mod tests {
         assert_eq!(e.active().document.buffer.to_string(), buf_before,
             "buffer must not be mutated when the overlay is stale");
         assert!(e.status.contains("changed"), "status must mention the change");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 12 (Effort 5g): search caret jumps auto-unfold folded ancestors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn search_hit_inside_fold_auto_unfolds() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let doc = "# Top\nintro\n## A\nneedle here\nmore\n## B\n";
+        let mut ed = Editor::new_from_text(doc, None, (80, 24));
+        // fold ## A
+        let a_byte = doc.find("## A").unwrap();
+        ed.active_mut().folds.toggle(a_byte);
+        crate::derive::rebuild(&mut ed);
+        // open search with Ctrl+F and type "needle"
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let mkpress = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(mkpress(KeyCode::Char('f'), KeyModifiers::CONTROL)), &mut ed, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert!(ed.search.is_some(), "Ctrl+F must open search");
+        for c in "needle".chars() {
+            crate::app::reduce(Msg::Input(mkpress(KeyCode::Char(c), KeyModifiers::NONE)), &mut ed, &reg, &cua_keymap(), &ex, &clk, &tx);
+        }
+        let needle_pos = doc.find("needle").unwrap();
+        assert_eq!(ed.active().document.selection.primary().from(), needle_pos,
+            "caret must be on the 'needle' match");
+        assert!(!ed.active().folds.folded.contains(&a_byte),
+            "## A fold must be cleared when jumping into its body");
+    }
+
+    /// Regression test: a cursor restored from a session entry that falls inside a
+    /// folded section must be snapped out to the section heading on startup.
+    ///
+    /// Tests the `derive::rebuild → SnapOut → ensure_visible` sequence inserted
+    /// into the session-resume path in `run()`. Full TTY/disk setup is not used;
+    /// the test drives the same API at the unit-test seam. The test FAILS (final
+    /// assertion fires) if the SnapOut block is removed from the test body, and
+    /// PASSES with it in place — mirroring failure/pass for the production change.
+    #[test]
+    fn resume_snaps_saved_cursor_out_of_restored_fold() {
+        use crate::editor::Editor;
+        use crate::registry::{place_caret_visible, CaretPlace};
+        use crate::fold::FoldView;
+
+        // Document with a heading "## A" followed by a body.
+        // "# Top\nintro\n## A\nbody1\nbody2\n## B\ntail\n"
+        //   byte 0:  '# Top\n'  (6 bytes)
+        //   byte 6:  'intro\n'  (6 bytes)
+        //   byte 12: '## A\n'   (5 bytes) ← heading start
+        //   byte 17: 'body1\n'  (6 bytes)
+        //   byte 23: 'body2\n'  (6 bytes) ← saved cursor lands inside here
+        //   byte 29: '## B\n'
+        const DOC: &str = "# Top\nintro\n## A\nbody1\nbody2\n## B\ntail\n";
+        let mut editor = Editor::new_from_text(DOC, None, (80, 24));
+
+        let heading_a = DOC.find("## A").unwrap();           // byte 12
+        let cursor_in_body = DOC.find("body2").unwrap() + 1; // byte 24, inside body2
+
+        // — Simulate the session-resume block in run() —
+        // Restore cursor to the saved (inside-fold) position.
+        editor.active_mut().document.selection =
+            wordcartel_core::selection::Selection::single(cursor_in_body);
+        // Restore fold on "## A" and reconcile (mirrors app.rs resume block).
+        editor.active_mut().folds.folded.insert(heading_a);
+        {
+            let b = editor.active();
+            let blocks = b.document.blocks.clone();
+            let buf = b.document.buffer.clone();
+            editor.active_mut().folds.reconcile(&blocks, &buf);
+        }
+
+        // Precondition: before SnapOut, the restored cursor IS inside the fold.
+        // This is what the bug looks like: cursor is hidden after resume without the fix.
+        {
+            let b = editor.active();
+            let fv = FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer);
+            let raw_line = b.document.buffer.byte_to_line(cursor_in_body);
+            assert!(fv.is_hidden(raw_line),
+                "precondition: without SnapOut the restored cursor sits inside the fold");
+        }
+
+        // — The fix: derive::rebuild then SnapOut (same order as in run()) —
+        // If you comment out the SnapOut block below, the final assertion fails.
+        crate::derive::rebuild(&mut editor);
+        {
+            // SnapOut: snap restored caret to heading if it landed inside a fold.
+            let head = editor.active().document.selection.primary().head;
+            let nh = place_caret_visible(&mut editor, head, CaretPlace::SnapOut);
+            if nh != head {
+                editor.active_mut().document.selection =
+                    wordcartel_core::selection::Selection::single(nh);
+            }
+        }
+
+        // Postcondition: cursor is now on the heading byte, NOT hidden.
+        let final_head = editor.active().document.selection.primary().head;
+        assert_eq!(final_head, heading_a,
+            "SnapOut must move the caret from inside-fold body to the '## A' heading");
+        {
+            let b = editor.active();
+            let fv = FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer);
+            let final_line = b.document.buffer.byte_to_line(final_head);
+            assert!(!fv.is_hidden(final_line),
+                "caret must not be on a hidden line after resume normalization");
+        }
     }
 }

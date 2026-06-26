@@ -108,6 +108,21 @@ pub fn rebuild(editor: &mut Editor) {
     // last_edit and pre_edit_rope were already cleared by .take() above.
 
     // ------------------------------------------------------------------
+    // 5g: Reconcile fold anchors against the fresh block tree, then build
+    // a FoldView for the visible-line walk below.
+    // ------------------------------------------------------------------
+    {
+        let b = editor.active_mut();
+        let blocks = b.document.blocks.clone();
+        let buf = b.document.buffer.clone();
+        b.folds.reconcile(&blocks, &buf);
+    }
+    let fold_view = {
+        let b = editor.active();
+        crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer)
+    };
+
+    // ------------------------------------------------------------------
     // 2. Visible range
     // ------------------------------------------------------------------
     // Snapshot all read-only scalar values from the active buffer before any
@@ -123,11 +138,16 @@ pub fn rebuild(editor: &mut Editor) {
         } else {
             buf.byte_to_line(caret_byte.min(buf.len().saturating_sub(1)))
         };
-        let first_line = b.view.scroll.min(total_lines.saturating_sub(1));
+        // 5g: normalize scroll to the nearest visible line before the walk.
+        let raw_scroll = b.view.scroll.min(total_lines.saturating_sub(1));
+        let first_line = fold_view.normalize_line(raw_scroll);
         let source_mode = b.view.mode != RenderMode::LivePreview;
         let scroll_row = b.view.scroll_row;
         (total_lines, active_line, area_height, first_line, source_mode, scroll_row)
     };
+    // Persist the normalized scroll so consumers agree.
+    editor.active_mut().view.scroll = first_line;
+
     // Use the shared geometry helper so rebuild, render, and nav all agree on width.
     // text_geometry returns an owned value; the immutable borrow ends here, before
     // the later active_mut() calls.
@@ -152,7 +172,8 @@ pub fn rebuild(editor: &mut Editor) {
         let (rows, map) = layout::layout(&text, role, is_active_effective, vp_width);
         visual_rows_accumulated += rows.len();
         editor.active_mut().view.line_layouts.insert(l, (rows, map));
-        l += 1;
+        // 5g: jump past any folded body that follows this line.
+        l = fold_view.next_visible(l).unwrap_or(total_lines);
     }
 }
 
@@ -386,5 +407,63 @@ mod tests {
             scroll_row,
             area_height,
         );
+    }
+
+    // ------------------------------------------------------------------
+    // 5g: fold-aware rebuild tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn rebuild_omits_folded_body_lines_from_cache() {
+        let doc = "# Top\nintro\n## A\nbody1\nbody2\n## B\ntail\n";
+        let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 24));
+        let a = doc.find("## A").unwrap();
+        ed.active_mut().folds.toggle(a);
+        crate::derive::rebuild(&mut ed);
+        let keys: Vec<usize> = ed.active().view.line_layouts.keys().copied().collect();
+        // line 2 (## A) present; lines 3,4 (body1,body2) absent; line 5 (## B) present.
+        assert!(keys.contains(&2));
+        assert!(!keys.contains(&3));
+        assert!(!keys.contains(&4));
+        assert!(keys.contains(&5));
+    }
+
+    #[test]
+    fn rebuild_normalizes_scroll_that_a_fold_swallowed() {
+        let doc = "# Top\nintro\n## A\nbody1\nbody2\n## B\ntail\n";
+        let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 4));
+        ed.active_mut().view.scroll = 3; // park scroll on body1
+        ed.active_mut().folds.toggle(doc.find("## A").unwrap());
+        crate::derive::rebuild(&mut ed);
+        // scroll must have snapped to the heading line (2), never a hidden line.
+        assert_eq!(ed.active().view.scroll, 2);
+    }
+
+    #[test]
+    fn rebuild_reconciles_dead_fold_anchor() {
+        // The definitive reconcile check relocated from Task 4: after an edit that
+        // deletes a folded heading, rebuild's reconcile must DROP the anchor (the
+        // Task 4 EOF-clamp alone would leave a stale non-heading anchor).
+        use wordcartel_core::change::ChangeSet;
+        use wordcartel_core::history::EditKind;
+
+        struct TestClock(std::cell::Cell<u64>);
+        impl wordcartel_core::history::Clock for TestClock {
+            fn now_ms(&self) -> u64 { self.0.get() }
+        }
+
+        let doc = "## H\nbody\n## K\n";
+        let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 24));
+        ed.active_mut().folds.toggle(0); // fold ## H
+        // delete "## H\n" so byte 0 is no longer a heading start
+        let len = ed.active().document.buffer.len();
+        let cs = ChangeSet::delete(0.."## H\n".len(), len);
+        let txn = wordcartel_core::history::Transaction::new(cs);
+        let edit = wordcartel_core::block_tree::Edit { range: 0.."## H\n".len(), new_len: 0 };
+        let clk = TestClock(std::cell::Cell::new(0));
+        ed.active_mut().apply(txn, edit, EditKind::Other, &clk);
+        crate::derive::rebuild(&mut ed);
+        // byte 0 is now "body" — not a heading start — so the fold is gone.
+        assert!(!ed.active().folds.folded.contains(&0));
     }
 }

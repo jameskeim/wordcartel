@@ -180,6 +180,7 @@ impl Registry {
             c.editor.minibuffer = None;
             c.editor.search = None;
             c.editor.diag = None;
+            c.editor.outline = None;
             c.editor.pending_keys.clear();
             c.editor.pending_mark = None;
             c.editor.menu = if c.editor.menu.is_some() {
@@ -248,6 +249,7 @@ impl Registry {
                 .find(|d| d.range.start > caret)
                 .unwrap_or(&diags[0])
                 .range.start;
+            unfold_ancestors_of(c.editor, target);
             c.editor.active_mut().document.selection =
                 wordcartel_core::selection::Selection::single(target);
             crate::derive::rebuild(c.editor);
@@ -268,6 +270,7 @@ impl Registry {
                 .find(|d| d.range.start < caret)
                 .unwrap_or(&diags[last])
                 .range.start;
+            unfold_ancestors_of(c.editor, target);
             c.editor.active_mut().document.selection =
                 wordcartel_core::selection::Selection::single(target);
             crate::derive::rebuild(c.editor);
@@ -287,6 +290,55 @@ impl Registry {
         r.register("toggle_measure",    "Toggle Centered Measure", Some(MenuCategory::View), |c| { c.editor.view_opts.measure = !c.editor.view_opts.measure; crate::derive::rebuild(c.editor); CommandResult::Handled });
         r.register("toggle_wrap_guide", "Toggle Wrap Guide", Some(MenuCategory::View), |c| { c.editor.view_opts.wrap_guide = !c.editor.view_opts.wrap_guide; CommandResult::Handled });
         r.register("toggle_word_count", "Toggle Word Count", Some(MenuCategory::View), |c| { c.editor.view_opts.word_count = !c.editor.view_opts.word_count; CommandResult::Handled });
+
+        // View menu — section folding (Task 10 / Effort 5g).
+        r.register("fold_toggle", "Fold/Unfold Section", Some(MenuCategory::View), |c| {
+            let caret = c.editor.active().document.selection.primary().head;
+            let (blocks, buf) = {
+                let b = c.editor.active();
+                (b.document.blocks.clone(), b.document.buffer.clone())
+            };
+            let rope = buf.snapshot();
+            let hs = wordcartel_core::outline::headings(&blocks, &rope);
+            if let Some(h) = hs.iter().rev().find(|h| h.byte <= caret) {
+                let hb = h.byte;
+                c.editor.active_mut().folds.toggle(hb);
+                let b = c.editor.active();
+                let nc = crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, caret);
+                c.editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(nc);
+                crate::derive::rebuild(c.editor);
+                crate::nav::ensure_visible(c.editor);
+            } else {
+                c.editor.status = "no heading at cursor".into();
+            }
+            CommandResult::Handled
+        });
+        r.register("fold_all", "Fold All Sections", Some(MenuCategory::View), |c| {
+            let (blocks, buf) = { let b = c.editor.active(); (b.document.blocks.clone(), b.document.buffer.clone()) };
+            c.editor.active_mut().folds.fold_all(&blocks, &buf);
+            let caret = c.editor.active().document.selection.primary().head;
+            let b = c.editor.active();
+            let nc = crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, caret);
+            c.editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(nc);
+            crate::derive::rebuild(c.editor);
+            crate::nav::ensure_visible(c.editor);
+            CommandResult::Handled
+        });
+        r.register("unfold_all", "Unfold All Sections", Some(MenuCategory::View), |c| {
+            c.editor.active_mut().folds.unfold_all();
+            crate::derive::rebuild(c.editor);
+            crate::nav::ensure_visible(c.editor);
+            CommandResult::Handled
+        });
+        r.register("outline", "Outline\u{2026}", Some(MenuCategory::View), |c| {
+            c.editor.open_outline();
+            CommandResult::Handled
+        });
+
+        // Heading navigation motions (Task 10 / Effort 5g).
+        r.register("heading_next",   "Next Heading",   None, |c| { heading_jump(c, Dirn::Next);   CommandResult::Handled });
+        r.register("heading_prev",   "Previous Heading", None, |c| { heading_jump(c, Dirn::Prev); CommandResult::Handled });
+        r.register("heading_parent", "Parent Heading", None, |c| { heading_jump(c, Dirn::Parent); CommandResult::Handled });
 
         r
     }
@@ -326,6 +378,66 @@ impl Registry {
 /// Thin adapter: run a built-in `Command` against the Ctx's editor+clock.
 fn run(ctx: &mut Ctx, cmd: Command) -> CommandResult {
     commands::run(cmd, ctx.editor, ctx.clock)
+}
+
+// ── Fold/heading helpers ──────────────────────────────────────────────────────
+
+enum Dirn { Next, Prev, Parent }
+
+fn heading_jump(c: &mut Ctx, dir: Dirn) {
+    let caret = c.editor.active().document.selection.primary().head;
+    let (blocks, buf) = { let b = c.editor.active(); (b.document.blocks.clone(), b.document.buffer.clone()) };
+    let rope = buf.snapshot();
+    let hs = wordcartel_core::outline::headings(&blocks, &rope);
+    let target = match dir {
+        Dirn::Next => hs.iter().find(|h| h.byte > caret).map(|h| h.byte),
+        Dirn::Prev => hs.iter().rev().find(|h| h.byte < caret).map(|h| h.byte),
+        Dirn::Parent => {
+            let cur = hs.iter().rev().find(|h| h.byte <= caret);
+            match cur {
+                Some(cur) => hs.iter().rev().find(|h| h.byte < cur.byte && h.level < cur.level).map(|h| h.byte),
+                None => None,
+            }
+        }
+    };
+    if let Some(t) = target {
+        crate::marks::record_jump(c.editor.active_mut(), caret);
+        unfold_ancestors_of(c.editor, t);
+        c.editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(t);
+        crate::derive::rebuild(c.editor);
+        crate::nav::ensure_visible(c.editor);
+    } else {
+        c.editor.status = "no heading".into();
+    }
+}
+
+/// Unfold every folded heading whose body contains `byte`.
+pub(crate) fn unfold_ancestors_of(editor: &mut crate::editor::Editor, byte: usize) {
+    let (blocks, buf) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.clone()) };
+    let rope = buf.snapshot();
+    let anchors: Vec<usize> = editor.active().folds.folded.iter().copied().collect();
+    for hb in anchors {
+        let body = wordcartel_core::outline::body_range(&blocks, &rope, hb);
+        if byte >= body.start && byte < body.end {
+            editor.active_mut().folds.folded.remove(&hb);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CaretPlace { UnfoldTo, SnapOut }
+
+pub(crate) fn place_caret_visible(editor: &mut crate::editor::Editor, raw: usize, mode: CaretPlace) -> usize {
+    match mode {
+        CaretPlace::UnfoldTo => {
+            unfold_ancestors_of(editor, raw);
+            raw
+        }
+        CaretPlace::SnapOut => {
+            let b = editor.active();
+            crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, raw)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -455,5 +567,142 @@ mod tests {
         assert_eq!(reg.resolve_name("cut"), Some(CommandId("cut")));
         assert_eq!(reg.resolve_name("save"), Some(CommandId("save")));
         assert_eq!(reg.resolve_name("definitely-not-a-command"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 12 (Effort 5g): diag_next into a folded section auto-unfolds
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn diag_next_into_fold_auto_unfolds() {
+        // Build a buffer with a folded ## A section and a diagnostic inside it.
+        // Seed the DiagStore directly (no real Harper worker).
+        let doc = "# Top\nintro\n## A\nbad_word here\nmore\n## B\n";
+        let mut ed = Editor::new_from_text(doc, None, (80, 24));
+        let a_byte = doc.find("## A").unwrap();
+        let bad_byte = doc.find("bad_word").unwrap();
+
+        // Seed the DiagStore with a diagnostic inside ## A's body.
+        let v = ed.active().document.version;
+        ed.active_mut().diagnostics.diagnostics = vec![
+            wordcartel_core::diagnostics::Diagnostic {
+                range: bad_byte..(bad_byte + "bad_word".len()),
+                kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                message: "x".into(),
+                suggestions: vec![],
+            }
+        ];
+        ed.active_mut().diagnostics.computed_version = v;
+
+        // Fold ## A AFTER seeding diagnostics (version unchanged).
+        ed.active_mut().folds.toggle(a_byte);
+        crate::derive::rebuild(&mut ed);
+
+        // Place caret before the diagnostic (at start of doc).
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(0);
+
+        // Dispatch diag_next.
+        dispatch_id(&mut ed, "diag_next");
+
+        // Caret must be at the diagnostic's start.
+        assert_eq!(ed.active().document.selection.primary().head, bad_byte,
+            "diag_next must jump caret to the diagnostic");
+        // ## A fold must be cleared.
+        assert!(!ed.active().folds.folded.contains(&a_byte),
+            "## A fold must be cleared when diag_next lands inside its body");
+    }
+
+    #[test]
+    fn diag_prev_into_fold_auto_unfolds() {
+        // Build a buffer with a folded ## A section and a diagnostic inside it.
+        // Seed the DiagStore directly (no real Harper worker).
+        let doc = "# Top\nintro\n## A\nbad_word here\nmore\n## B\n";
+        let mut ed = Editor::new_from_text(doc, None, (80, 24));
+        let a_byte = doc.find("## A").unwrap();
+        let bad_byte = doc.find("bad_word").unwrap();
+
+        // Seed the DiagStore with a diagnostic inside ## A's body.
+        let v = ed.active().document.version;
+        ed.active_mut().diagnostics.diagnostics = vec![
+            wordcartel_core::diagnostics::Diagnostic {
+                range: bad_byte..(bad_byte + "bad_word".len()),
+                kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                message: "x".into(),
+                suggestions: vec![],
+            }
+        ];
+        ed.active_mut().diagnostics.computed_version = v;
+
+        // Fold ## A AFTER seeding diagnostics (version unchanged).
+        ed.active_mut().folds.toggle(a_byte);
+        crate::derive::rebuild(&mut ed);
+
+        // Place caret after the diagnostic.
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(doc.find("## B").unwrap());
+
+        // Dispatch diag_prev.
+        dispatch_id(&mut ed, "diag_prev");
+
+        // Caret must be at the diagnostic's start.
+        assert_eq!(ed.active().document.selection.primary().head, bad_byte,
+            "diag_prev must jump caret to the diagnostic");
+        // ## A fold must be cleared.
+        assert!(!ed.active().folds.folded.contains(&a_byte),
+            "## A fold must be cleared when diag_prev lands inside its body");
+    }
+
+    // Helper: build a Ctx and dispatch a command id against the given Editor.
+    fn dispatch_id(ed: &mut Editor, id: &'static str) {
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = Ctx { editor: ed, clock: &clk, executor: &ex, msg_tx: tx };
+        reg.dispatch(CommandId(id), &mut ctx);
+    }
+
+    #[test]
+    fn fold_toggle_folds_caret_section_and_moves_caret_to_heading() {
+        let doc = "# Top\nintro\n## A\nbody1\nbody2\n## B\n";
+        let mut ed = Editor::new_from_text(doc, None, (80, 24));
+        crate::derive::rebuild(&mut ed);
+        // caret inside ## A's body
+        let inside = doc.find("body2").unwrap();
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(inside);
+        dispatch_id(&mut ed, "fold_toggle");
+        let a = doc.find("## A").unwrap();
+        assert!(ed.active().folds.folded.contains(&a));
+        // caret moved out of the now-hidden body, onto the heading
+        assert_eq!(ed.active().document.selection.primary().head, a);
+    }
+
+    #[test]
+    fn heading_next_prev_parent_navigate_and_push_ring() {
+        let doc = "# Top\nintro\n## A\nbody\n### A1\nx\n## B\n";
+        let mut ed = Editor::new_from_text(doc, None, (80, 24));
+        crate::derive::rebuild(&mut ed);
+        let top = doc.find("# Top").unwrap();
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(top);
+        dispatch_id(&mut ed, "heading_next");
+        assert_eq!(ed.active().document.selection.primary().head, doc.find("## A").unwrap());
+        // ring got the origin pushed
+        assert!(ed.active().jump_ring.contains(&top));
+        // parent of ### A1 is ## A
+        let a1 = doc.find("### A1").unwrap();
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(a1);
+        dispatch_id(&mut ed, "heading_parent");
+        assert_eq!(ed.active().document.selection.primary().head, doc.find("## A").unwrap());
+    }
+
+    #[test]
+    fn heading_prev_navigates_and_pushes_ring() {
+        let doc = "# Top\nintro\n## A\nbody\n### A1\nx\n## B\n";
+        let mut ed = Editor::new_from_text(doc, None, (80, 24));
+        crate::derive::rebuild(&mut ed);
+        let b = doc.find("## B").unwrap();
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(b);
+        dispatch_id(&mut ed, "heading_prev");
+        assert_eq!(ed.active().document.selection.primary().head, doc.find("### A1").unwrap());
+        assert!(ed.active().jump_ring.contains(&b));
     }
 }
