@@ -14,6 +14,7 @@ use crate::derive;
 use crate::editor::{Editor, RenderMode};
 use crate::file;
 use crate::nav;
+use crate::registry::{place_caret_visible, CaretPlace};
 use wordcartel_core::block_tree::Edit;
 use wordcartel_core::change::ChangeSet;
 use wordcartel_core::history::{Clock, EditKind, Transaction};
@@ -450,6 +451,11 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                 return CommandResult::Noop;
             }
             derive::rebuild(editor);
+            let head = editor.active().document.selection.primary().head;
+            let snapped = place_caret_visible(editor, head, CaretPlace::SnapOut);
+            if snapped != head {
+                editor.active_mut().document.selection = Selection::single(snapped);
+            }
             nav::ensure_visible(editor);
             editor.active_mut().desired_col = None;
             CommandResult::Handled
@@ -460,6 +466,11 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                 return CommandResult::Noop;
             }
             derive::rebuild(editor);
+            let head = editor.active().document.selection.primary().head;
+            let snapped = place_caret_visible(editor, head, CaretPlace::SnapOut);
+            if snapped != head {
+                editor.active_mut().document.selection = Selection::single(snapped);
+            }
             nav::ensure_visible(editor);
             editor.active_mut().desired_col = None;
             CommandResult::Handled
@@ -568,6 +579,11 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             if let Some(prev) = editor.active_mut().sel_history.pop() {
                 editor.active_mut().document.selection = prev;
                 derive::rebuild(editor);
+                let head = editor.active().document.selection.primary().head;
+                let snapped = place_caret_visible(editor, head, CaretPlace::SnapOut);
+                if snapped != head {
+                    editor.active_mut().document.selection = Selection::single(snapped);
+                }
                 nav::ensure_visible(editor);
                 CommandResult::Handled
             } else { CommandResult::Noop }
@@ -1319,6 +1335,47 @@ mod tests {
         run(Command::Move { dir: Dir::Right, extend: false }, &mut ed, &clk);
         let head = ed.active().document.selection.primary().head;
         let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer) };
+        assert!(!fv.is_hidden(ed.active().document.buffer.byte_to_line(head)));
+    }
+
+    #[test]
+    fn undo_snaps_caret_out_of_fold() {
+        let doc = "## A\nbody1\nbody2\n## B\n";
+        let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 24));
+        crate::derive::rebuild(&mut ed);
+        let a = doc.find("## A").unwrap();
+        let inside = doc.find("body2").unwrap();
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(inside);
+        run(Command::InsertChar('X'), &mut ed, &TestClock(0));
+        ed.active_mut().folds.toggle(a);
+        crate::derive::rebuild(&mut ed);
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(a);
+
+        run(Command::Undo, &mut ed, &TestClock(1_000));
+
+        let head = ed.active().document.selection.primary().head;
+        let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer) };
+        assert_eq!(head, a);
+        assert!(!fv.is_hidden(ed.active().document.buffer.byte_to_line(head)));
+    }
+
+    #[test]
+    fn shrink_selection_snaps_restored_caret_out_of_fold() {
+        let doc = "## A\nbody1\nbody2\n## B\n";
+        let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 24));
+        crate::derive::rebuild(&mut ed);
+        let a = doc.find("## A").unwrap();
+        let inside = doc.find("body2").unwrap();
+        ed.active_mut().sel_history.push(wordcartel_core::selection::Selection::single(inside));
+        ed.active_mut().folds.toggle(a);
+        crate::derive::rebuild(&mut ed);
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(a);
+
+        run(Command::ShrinkSelection, &mut ed, &TestClock(0));
+
+        let head = ed.active().document.selection.primary().head;
+        let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer) };
+        assert_eq!(head, a);
         assert!(!fv.is_hidden(ed.active().document.buffer.byte_to_line(head)));
     }
 

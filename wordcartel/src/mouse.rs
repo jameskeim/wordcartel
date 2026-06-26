@@ -1,6 +1,7 @@
 //! Mouse coordinate translation and gesture dispatch.
 use crossterm::event::{MouseEvent, MouseEventKind, MouseButton, KeyModifiers};
 use crate::editor::Editor;
+use crate::registry::{place_caret_visible, CaretPlace};
 
 /// Classification of a terminal cell hit relative to the editing layout.
 #[derive(Clone, Copy)]
@@ -54,6 +55,13 @@ fn seed_and_select(editor: &mut Editor, f: usize, t: usize) {
         wordcartel_core::selection::Selection::range(f, t);
     crate::derive::rebuild(editor);
     crate::nav::ensure_visible(editor);
+}
+
+fn visible_doc_end(editor: &mut Editor) -> usize {
+    let len = editor.active().document.buffer.len();
+    let probe = if len > 0 { len - 1 } else { 0 };
+    let snapped = place_caret_visible(editor, probe, CaretPlace::SnapOut);
+    if snapped != probe { snapped } else { len }
 }
 
 pub fn handle(
@@ -156,10 +164,9 @@ pub fn handle(
                 editor.mouse.scrollbar_dragging = true;
                 editor.mouse.scrollbar_until_ms = clock.now_ms() + 1200;
             } else if let CellHit::Text { col, erow } = hit {
-                let buf_len = editor.active().document.buffer.len();
                 let off = match crate::nav::offset_at_cell(editor, col, erow) {
                     Some(o) => crate::nav::clamp_snap(editor, o),
-                    None => buf_len,
+                    None => visible_doc_end(editor),
                 };
                 editor.active_mut().sel_history.clear();
                 if ev.modifiers.contains(KeyModifiers::SHIFT) {
@@ -238,7 +245,7 @@ pub fn handle(
             let erow = ev.row.clamp(edit_top, hi).saturating_sub(menu_rows);
             let head = match crate::nav::offset_at_cell(editor, ev.column, erow) {
                 Some(o) => crate::nav::clamp_snap(editor, o),
-                None => editor.active().document.buffer.len(),
+                None => visible_doc_end(editor),
             };
             if let Some(anchor) = editor.mouse.anchor {
                 editor.active_mut().document.selection =
@@ -318,6 +325,26 @@ mod tests {
         let (reg, ex, clk, tx, km) = ctx();
         handle(&mut e, down(0, 10), &reg, &km, &ex, &clk, &tx); // row past content
         assert_eq!(crate::nav::head(&e), e.active().document.buffer.len());
+    }
+
+    #[test]
+    fn mouse_click_below_folded_tail_snaps_to_heading() {
+        let doc = "intro\n## Tail\nbody1\nbody2\n";
+        let mut e = Editor::new_from_text(doc, None, (80, 24));
+        let tail = doc.find("## Tail").unwrap();
+        e.active_mut().folds.toggle(tail);
+        crate::derive::rebuild(&mut e);
+        let (reg, ex, clk, tx, km) = ctx();
+
+        handle(&mut e, down(0, 10), &reg, &km, &ex, &clk, &tx);
+
+        let head = crate::nav::head(&e);
+        let fv = {
+            let b = e.active();
+            crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer)
+        };
+        assert_eq!(head, tail);
+        assert!(!fv.is_hidden(e.active().document.buffer.byte_to_line(head)));
     }
 
     #[test]

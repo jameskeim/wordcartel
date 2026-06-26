@@ -424,6 +424,22 @@ pub(crate) fn unfold_ancestors_of(editor: &mut crate::editor::Editor, byte: usiz
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CaretPlace { UnfoldTo, SnapOut }
+
+pub(crate) fn place_caret_visible(editor: &mut crate::editor::Editor, raw: usize, mode: CaretPlace) -> usize {
+    match mode {
+        CaretPlace::UnfoldTo => {
+            unfold_ancestors_of(editor, raw);
+            raw
+        }
+        CaretPlace::SnapOut => {
+            let b = editor.active();
+            crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, raw)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

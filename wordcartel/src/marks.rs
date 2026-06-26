@@ -1,6 +1,7 @@
 //! Named marks + jump-ring command bodies (5c).
 use crate::editor::{Buffer, Editor, MarkPending};
 use crate::nav;
+use crate::registry::{place_caret_visible, CaretPlace};
 
 const CAP: usize = 64;
 
@@ -43,6 +44,7 @@ pub fn jump_back(editor: &mut Editor) {
     }; // <- mutable borrow ends here
     let Some(raw) = raw else { editor.status = "ring: at oldest".into(); return; };
     let off = nav::clamp_snap(editor, raw);
+    let off = place_caret_visible(editor, off, CaretPlace::UnfoldTo);
     editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(off);
     crate::derive::rebuild(editor);
     nav::ensure_visible(editor);
@@ -61,6 +63,7 @@ pub fn jump_forward(editor: &mut Editor) {
     };
     let Some(raw) = raw else { editor.status = "ring: at newest".into(); return; };
     let off = nav::clamp_snap(editor, raw);
+    let off = place_caret_visible(editor, off, CaretPlace::UnfoldTo);
     editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(off);
     crate::derive::rebuild(editor);
     nav::ensure_visible(editor);
@@ -81,6 +84,7 @@ pub fn resolve_pending(editor: &mut Editor, ch: char) {
                 let pre = nav::head(editor);
                 record_jump(editor.active_mut(), pre);
                 let off = nav::clamp_snap(editor, raw);
+                let off = place_caret_visible(editor, off, CaretPlace::UnfoldTo);
                 editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(off);
                 crate::derive::rebuild(editor);
                 nav::ensure_visible(editor);
@@ -130,5 +134,27 @@ mod tests {
         super::jump_to_mark(&mut e);
         super::resolve_pending(&mut e, 'a');
         assert_eq!(e.active().document.selection.primary().head, 6);
+    }
+
+    #[test]
+    fn jump_to_mark_into_fold_reveals_target() {
+        let doc = "# Top\nintro\n## A\nbody1\nbody2\n## B\n";
+        let mut e = Editor::new_from_text(doc, None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        let a = doc.find("## A").unwrap();
+        let target = doc.find("body2").unwrap();
+
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(target);
+        super::set_mark(&mut e);
+        super::resolve_pending(&mut e, 'a');
+        e.active_mut().folds.toggle(a);
+        crate::derive::rebuild(&mut e);
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(0);
+
+        super::jump_to_mark(&mut e);
+        super::resolve_pending(&mut e, 'a');
+
+        assert_eq!(e.active().document.selection.primary().head, target);
+        assert!(!e.active().folds.folded.contains(&a));
     }
 }
