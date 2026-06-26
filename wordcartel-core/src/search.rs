@@ -63,6 +63,7 @@ pub fn all_matches(rope: &Rope, m: &Matcher) -> Vec<Match> {
                 // to len — advance strictly forward).
                 let advance = if mm.end > mm.start { mm.end } else { next_boundary(rope, mm.end) };
                 out.push(mm);
+                // advance>end is the real EOF terminator (next_boundary returns len+1); advance<=at is an infallibility guard.
                 if advance > end || advance <= at { break; }
                 at = advance;
             }
@@ -88,7 +89,9 @@ fn next_from(rope: &Rope, m: &Matcher, from: usize) -> Option<Match> {
 /// Next UTF-8 char boundary strictly after `pos` (zero-width progress).
 fn next_boundary(rope: &Rope, pos: usize) -> usize {
     if pos >= rope.len_bytes() { return rope.len_bytes() + 1; } // forces loop exit
-    let ch = rope.byte_to_char(pos);
+    // Defensive: regex-cursor yields char-aligned matches, but never panic if a
+    // future caller passes a mid-codepoint offset — just step forward one byte.
+    let Ok(ch) = rope.try_byte_to_char(pos) else { return pos + 1; };
     let next_char = (ch + 1).min(rope.len_chars());
     rope.char_to_byte(next_char).max(pos + 1)
 }
