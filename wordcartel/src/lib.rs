@@ -32,3 +32,4 @@ pub mod diagnostics_run;
 pub mod diag_overlay;
 pub mod fold;
 pub mod outline_overlay;
+pub mod compose;
