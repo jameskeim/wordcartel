@@ -216,6 +216,9 @@ pub struct Editor {
     pub diag: Option<crate::diag_overlay::DiagOverlay>,
     /// Outline picker overlay state. XOR with prompt/minibuffer/palette/menu/search/diag.
     pub outline: Option<crate::outline_overlay::OutlineOverlay>,
+    /// Active theme + terminal color depth. Seeded at startup (real depth detection: plan ③).
+    pub theme: wordcartel_core::theme::Theme,
+    pub depth: wordcartel_core::theme::Depth,
 }
 
 impl Editor {
@@ -256,6 +259,8 @@ impl Editor {
             session_ignores: std::collections::HashSet::new(),
             diag: None,
             outline: None,
+            theme: wordcartel_core::theme::default(),
+            depth: wordcartel_core::theme::Depth::Truecolor,
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer {
@@ -624,5 +629,12 @@ mod tests {
         // (after rebuild's reconcile) — see `undo_then_rebuild_drops_dead_fold`.
         let len = buf.document.buffer.len();
         assert!(buf.folds.folded.iter().all(|&b| b <= len));
+    }
+
+    #[test]
+    fn editor_seeds_default_theme_truecolor() {
+        let ed = Editor::new_from_text("x", None, (80, 24));
+        assert_eq!(ed.theme.name, "default");
+        assert_eq!(ed.depth, wordcartel_core::theme::Depth::Truecolor);
     }
 }
