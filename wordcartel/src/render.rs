@@ -1881,7 +1881,10 @@ mod tests {
         crate::derive::rebuild(&mut ed);
         let buf = render_to_buffer(&mut ed, 40, 6);
         let cell = &buf[(0u16, 0u16)];
-        assert!(cell.style().bg.is_some(), "phosphor source canvas sets a bg");
+        assert!(
+            matches!(cell.style().bg, Some(ratatui::style::Color::Rgb(..))),
+            "phosphor-amber source canvas must set a specific RGB bg (not Reset); got {:?}", cell.style().bg
+        );
         // Default theme: source canvas stays terminal-default (no themed bg).
         let mut ed2 = Editor::new_from_text("# raw markdown\n", None, (40, 6));
         ed2.active_mut().view.mode = crate::editor::RenderMode::SourcePlain;
@@ -1908,6 +1911,9 @@ mod tests {
             let c = &buf[(0u16, r)];
             if c.style().add_modifier.contains(ratatui::style::Modifier::DIM) { Some(c.style().bg) } else { None }
         });
-        assert_eq!(dimmed.flatten().is_some(), true, "dimmed source row retains the phosphor canvas bg");
+        assert!(
+            matches!(dimmed.flatten(), Some(ratatui::style::Color::Rgb(..))),
+            "dimmed phosphor source row must carry RGB canvas bg (not Reset); got {:?}", dimmed.flatten()
+        );
     }
 }
