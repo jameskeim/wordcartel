@@ -716,6 +716,12 @@ pub fn reduce(
     // consumed / silently dropped). Non-key, non-paste messages fall through to
     // the normal handlers so background work continues while the menu is open.
     if editor.menu.is_some() {
+        if matches!(&msg, Msg::ClipboardPaste { .. }) {
+            // Drop an async clipboard-paste result that arrives while the menu is
+            // open — it must not land in the document behind the overlay.
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
+        }
         if let Msg::Input(Event::Paste(_)) = &msg {
             for r in ex.drain() { apply_result(r, editor); }
             return !editor.quit;
@@ -760,6 +766,12 @@ pub fn reduce(
     // (FilterDone, JobDone, Tick) fall through to normal handling while the
     // palette stays open.
     if editor.palette.is_some() {
+        if matches!(&msg, Msg::ClipboardPaste { .. }) {
+            // Drop an async clipboard-paste result that arrives while the palette is
+            // open — it must not land in the document behind the overlay.
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
+        }
         if let Msg::Input(Event::Paste(text)) = msg {
             if let Some(p) = editor.palette.as_mut() {
                 p.query.insert_str(p.cursor, &text);
@@ -846,6 +858,12 @@ pub fn reduce(
     if editor.theme_picker.is_some() {
         // Paste intercept FIRST (mirror the palette, app.rs palette block) — else paste leaks
         // into the document while the picker is open (Codex I6).
+        if matches!(&msg, Msg::ClipboardPaste { .. }) {
+            // Drop an async clipboard-paste result that arrives while the theme picker is
+            // open — it must not land in the document behind the overlay.
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
+        }
         if let Msg::Input(Event::Paste(text)) = &msg {
             if let Some(tp) = editor.theme_picker.as_mut() {
                 tp.query.push_str(text);
@@ -2632,6 +2650,59 @@ mod tests {
         assert!(e.menu.is_some(), "menu remains open after paste");
     }
 
+    // -------------------------------------------------------------------------
+    // Regression: async ClipboardPaste must be dropped (not applied to doc)
+    // while an overlay is open (menu / palette / theme_picker).
+    // Each test fails WITHOUT the guard and passes WITH it.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn async_clipboard_paste_under_open_menu_is_dropped() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        e.menu = Some(crate::menu::empty());
+        let doc_before = e.active().document.buffer.to_string();
+        let bid = e.active().id;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("XY".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), doc_before, "async paste must not land in doc behind open menu");
+        assert!(e.menu.is_some(), "menu remains open after ClipboardPaste is dropped");
+    }
+
+    #[test]
+    fn async_clipboard_paste_under_open_palette_is_dropped() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        let reg = Registry::builtins();
+        let (keymap, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let mut p = crate::palette::Palette::default();
+        crate::palette::rebuild_rows(&mut p, &reg, &keymap);
+        e.palette = Some(p);
+        let doc_before = e.active().document.buffer.to_string();
+        let bid = e.active().id;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("XY".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), doc_before, "async paste must not land in doc behind open palette");
+        assert!(e.palette.is_some(), "palette remains open after ClipboardPaste is dropped");
+    }
+
+    #[test]
+    fn async_clipboard_paste_under_open_theme_picker_is_dropped() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        e.open_theme_picker();
+        assert!(e.theme_picker.is_some(), "precondition: picker opened");
+        let doc_before = e.active().document.buffer.to_string();
+        let bid = e.active().id;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("XY".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), doc_before, "async paste must not land in doc behind open theme picker");
+        assert!(e.theme_picker.is_some(), "theme picker remains open after ClipboardPaste is dropped");
+    }
+
     #[test]
     fn bracketed_paste_with_modal_prompt_is_ignored() {
         use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
@@ -2792,7 +2863,7 @@ mod tests {
     }
 
     #[test]
-    fn palette_esc_closes_and_nonkey_falls_through() {
+    fn palette_esc_closes_and_clipboard_paste_is_dropped() {
         use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         let mut e = Editor::new_from_text("ab\n", None, (80, 24));
@@ -2800,11 +2871,12 @@ mod tests {
         let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &Registry::builtins());
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
-        // a non-key Msg while palette open still applies (falls through) — e.g. a transform result
+        // An async ClipboardPaste arriving while the palette is open must be
+        // intercepted and dropped — it must NOT reach the document (race fix).
         let bid = e.active().id;
         crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some("X".into()) }, &mut e, &reg, &km, &ex, &clk, &tx);
         assert!(e.palette.is_some(), "palette still open");
-        assert_eq!(e.active().document.buffer.to_string(), "Xab\n", "non-key msg fell through while palette open");
+        assert_eq!(e.active().document.buffer.to_string(), "ab\n", "ClipboardPaste must be dropped while palette is open");
         // Esc closes the palette
         let esc = Event::Key(KeyEvent { code: KeyCode::Esc, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE });
         crate::app::reduce(Msg::Input(esc), &mut e, &reg, &km, &ex, &clk, &tx);
