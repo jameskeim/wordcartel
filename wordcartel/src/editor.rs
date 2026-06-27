@@ -219,6 +219,8 @@ pub struct Editor {
     /// Active theme + terminal color depth. Seeded at startup (real depth detection: plan ③).
     pub theme: wordcartel_core::theme::Theme,
     pub depth: wordcartel_core::theme::Depth,
+    /// Heading-level glyph toggle from config (seeded at startup; used by runtime picker — Task 7).
+    pub heading_glyph_cfg: Option<bool>,
 }
 
 impl Editor {
@@ -261,6 +263,7 @@ impl Editor {
             outline: None,
             theme: wordcartel_core::theme::default(),
             depth: wordcartel_core::theme::Depth::Truecolor,
+            heading_glyph_cfg: None,
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer {

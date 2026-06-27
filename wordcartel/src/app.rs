@@ -1286,6 +1286,13 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     editor.mouse_capture = cfg.mouse.mouse_capture;
     editor.view_opts = cfg.view.clone();
     editor.diag_cfg = cfg.diagnostics.clone();
+    // Resolve and seed the active theme + color depth (once, at startup — §3.6).
+    let env = crate::theme_resolve::EnvSnapshot::from_env();
+    let resolved = crate::theme_resolve::resolve_theme(&cfg.theme, &env);
+    editor.theme = resolved.theme;
+    editor.depth = resolved.depth;
+    editor.heading_glyph_cfg = cfg.theme.heading_level_glyph; // for runtime picker switches (Task 7)
+    warns.extend(resolved.warnings); // join the existing startup warning stream
     // Load the personal dictionary from disk (missing/unreadable → empty; no abort).
     if let Some(dict_path) = &cfg.diagnostics.dictionary {
         if let Ok(text) = std::fs::read_to_string(dict_path) {
