@@ -144,10 +144,11 @@ impl Theme {
         match name {
             "default" => Some(default()),
             "no-color" => Some(no_color()),
-            _ => None, // tokyo-night/phosphor wired in later tasks
+            "tokyo-night" => Some(tokyo_night()),
+            _ => None,
         }
     }
-    pub fn builtin_names() -> &'static [&'static str] { &["default", "no-color"] } // extended in later tasks
+    pub fn builtin_names() -> &'static [&'static str] { &["default", "no-color", "tokyo-night"] }
 }
 
 // helper for terse face literals
@@ -224,6 +225,68 @@ pub fn default() -> Theme {
             chrome_reverse: modface(None, false, false, false, false, true),
             chrome_selected: Face { fg: Some(Color::Black), bg: Some(Color::White), ..Face::default() },
             chrome_muted: Face { fg: Some(Color::White), bg: Some(Color::DarkGray), ..Face::default() },
+        },
+    }
+}
+
+const fn rgb(r: u8, g: u8, b: u8) -> Color { Color::Rgb { r, g, b } }
+
+pub fn tokyo_night() -> Theme {
+    // Tokyo Night palette — MIT license, folke/tokyonight.nvim
+    const BG:        Color = rgb(0x1a, 0x1b, 0x26); // #1a1b26
+    const FG:        Color = rgb(0xc0, 0xca, 0xf5); // #c0caf5
+    const BLUE:      Color = rgb(0x7a, 0xa2, 0xf7); // #7aa2f7
+    const CYAN:      Color = rgb(0x7d, 0xcf, 0xff); // #7dcfff
+    const GREEN:     Color = rgb(0x9e, 0xce, 0x6a); // #9ece6a
+    const MAGENTA:   Color = rgb(0xbb, 0x9a, 0xf7); // #bb9af7
+    const ORANGE:    Color = rgb(0xff, 0x9e, 0x64); // #ff9e64
+    const RED:       Color = rgb(0xf7, 0x76, 0x8e); // #f7768e
+    const YELLOW:    Color = rgb(0xe0, 0xaf, 0x68); // #e0af68
+    const COMMENT:   Color = rgb(0x56, 0x5f, 0x89); // #565f89
+    const DARK3:     Color = rgb(0x54, 0x5c, 0x7e); // #545c7e
+    const SEL_BG:    Color = rgb(0x28, 0x34, 0x57); // #283457
+    const PANEL_BG:  Color = rgb(0x16, 0x16, 0x1e); // #16161e
+
+    Theme {
+        name: "tokyo-night".into(),
+        base_fg: FG,
+        base_bg: BG,
+        heading_level_glyph: false,
+        monochrome: false,
+        faces: ThemeFaces {
+            text: Face::default(),
+            emphasis: Face { italic: Some(true), ..Face::default() },
+            strong: Face { bold: Some(true), ..Face::default() },
+            strong_emphasis: Face { bold: Some(true), italic: Some(true), ..Face::default() },
+            code: Face { fg: Some(GREEN), ..Face::default() },
+            strikethrough: Face { strike: Some(true), ..Face::default() },
+            link: Face { fg: Some(BLUE), underline: Some(true), ..Face::default() },
+            heading: [
+                Face { fg: Some(MAGENTA), bold: Some(true), ..Face::default() }, // h1
+                Face { fg: Some(BLUE),    bold: Some(true), ..Face::default() }, // h2
+                Face { fg: Some(CYAN),    bold: Some(true), ..Face::default() }, // h3
+                Face { fg: Some(GREEN),   bold: Some(true), ..Face::default() }, // h4
+                Face { fg: Some(YELLOW),  bold: Some(true), ..Face::default() }, // h5
+                Face { fg: Some(ORANGE),  bold: Some(true), ..Face::default() }, // h6
+            ],
+            block_quote: Face { fg: Some(DARK3), italic: Some(true), ..Face::default() },
+            code_block: Face { fg: Some(GREEN), ..Face::default() },
+            list_marker: Face { fg: Some(BLUE), ..Face::default() },
+            thematic_break: Face { fg: Some(DARK3), ..Face::default() },
+            front_matter: Face { fg: Some(DARK3), ..Face::default() },
+            comment: Face { fg: Some(COMMENT), italic: Some(true), dim: Some(true), ..Face::default() },
+            selection: Face { bg: Some(SEL_BG), ..Face::default() },
+            search_match: Face { bg: Some(SEL_BG), ..Face::default() },
+            search_current: Face { reverse: Some(true), ..Face::default() },
+            diag_spelling: Face { underline: Some(true), underline_color: Some(RED), ..Face::default() },
+            diag_grammar:  Face { underline: Some(true), underline_color: Some(YELLOW), ..Face::default() },
+            focus_dim: Face { fg: Some(COMMENT), dim: Some(true), ..Face::default() },
+            fold_marker: Face { fg: Some(DARK3), ..Face::default() },
+            wrap_guide: Face { fg: Some(DARK3), ..Face::default() },
+            chrome: Face { fg: Some(FG), bg: Some(PANEL_BG), ..Face::default() },
+            chrome_reverse: Face { reverse: Some(true), ..Face::default() },
+            chrome_selected: Face { fg: Some(BG), bg: Some(FG), ..Face::default() },
+            chrome_muted: Face { fg: Some(DARK3), dim: Some(true), ..Face::default() },
         },
     }
 }
@@ -347,5 +410,15 @@ mod tests {
         for el in ALL_ELEMENTS { let _ = t.face(el); } // never panics
         assert_eq!(t.face(SemanticElement::Heading(0)), t.face(SemanticElement::Heading(1)));
         assert_eq!(t.face(SemanticElement::Heading(9)), t.face(SemanticElement::Heading(6)));
+    }
+
+    #[test]
+    fn tokyo_night_is_colored_and_total() {
+        let t = tokyo_night();
+        assert!(!t.monochrome);
+        assert_ne!(t.base_bg, Color::Default);                 // dark bg
+        // headings carry color here (unlike Default)
+        assert!(matches!(t.face(SemanticElement::Heading(1)).fg, Some(Color::Rgb{..})));
+        for el in ALL_ELEMENTS { let _ = t.face(el); }         // total
     }
 }
