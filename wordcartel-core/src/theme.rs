@@ -143,10 +143,11 @@ impl Theme {
     pub fn builtin(name: &str) -> Option<Theme> {
         match name {
             "default" => Some(default()),
-            _ => None, // no-color/tokyo-night/phosphor wired in later tasks
+            "no-color" => Some(no_color()),
+            _ => None, // tokyo-night/phosphor wired in later tasks
         }
     }
-    pub fn builtin_names() -> &'static [&'static str] { &["default"] } // extended in later tasks
+    pub fn builtin_names() -> &'static [&'static str] { &["default", "no-color"] } // extended in later tasks
 }
 
 // helper for terse face literals
@@ -154,6 +155,41 @@ fn modface(fg: Option<Color>, bold: bool, italic: bool, underline: bool, strike:
     Face { fg, bold: bold.then_some(true), italic: italic.then_some(true),
            underline: underline.then_some(true), strike: strike.then_some(true),
            reverse: reverse.then_some(true), ..Face::default() }
+}
+
+pub fn no_color() -> Theme {
+    let m = |bold, italic, underline, strike, reverse| modface(None, bold, italic, underline, strike, reverse);
+    Theme {
+        name: "no-color".into(),
+        base_fg: Color::Default, base_bg: Color::Default,
+        heading_level_glyph: true, monochrome: true,
+        faces: ThemeFaces {
+            text: Face::default(),
+            emphasis: m(false, true, false, false, false),
+            strong: m(true, false, false, false, false),
+            strong_emphasis: m(true, true, false, false, false),
+            code: m(false, false, false, false, true),                 // reverse
+            strikethrough: m(false, false, false, true, false),
+            link: m(false, false, true, false, false),                 // underline
+            heading: [m(true,false,false,false,false); 6],             // bold; level glyph (plan ②) adds density
+            block_quote: Face::default(),                              // glyph cue is plan ②
+            code_block: m(false, false, false, false, true),           // reverse (block context)
+            list_marker: Face::default(), thematic_break: Face::default(),
+            front_matter: m(false, true, false, false, true),          // reverse + italic (distinct from Code)
+            comment: Face { italic: Some(true), dim: Some(true), ..Face::default() }, // italic+dim (distinct from Emphasis=italic)
+            selection: m(false, false, true, false, true),            // reverse + underline (visible over reverse)
+            search_match: m(false, false, false, false, true),        // reverse
+            search_current: m(true, false, false, false, true),       // reverse + bold
+            diag_spelling: m(true, false, true, false, false),        // bold + underline (distinct from Link)
+            diag_grammar:  m(true, false, true, false, false),
+            focus_dim: Face { dim: Some(true), ..Face::default() },     // DIM inactive rows
+            fold_marker: Face::default(), wrap_guide: Face::default(),
+            chrome: Face::default(),
+            chrome_reverse: m(false, false, false, false, true),     // REVERSED
+            chrome_selected: m(false, false, false, false, true),    // no-color: reverse (can't do black-on-white)
+            chrome_muted: Face { dim: Some(true), ..Face::default() },
+        },
+    }
 }
 
 pub fn default() -> Theme {
@@ -265,6 +301,35 @@ mod tests {
         assert_eq!(t.face(SemanticElement::Heading(1)), Face::default());
         assert_eq!(t.face(SemanticElement::Text), Face::default());
     }
+    #[test]
+    fn no_color_is_monochrome_with_modifier_cues() {
+        let t = no_color();
+        assert!(t.monochrome);
+        assert_eq!(t.base_fg, Color::Default);
+        // no element carries a real color
+        for el in ALL_ELEMENTS {
+            let f = t.face(el);
+            for c in [f.fg, f.bg, f.underline_color].into_iter().flatten() {
+                assert_eq!(c, Color::Default, "{el:?} must be color-free in no_color");
+            }
+        }
+        // every Face-cued element has >=1 modifier (the §4-layer-1 invariant; glyph-only
+        // elements BlockQuote/ThematicBreak/ListMarker/FoldMarker/WrapGuide/Text/Chrome are exempt here —
+        // their cue is a glyph/placement added in plan ②/chrome task).
+        let cued = [SemanticElement::Strong, SemanticElement::Emphasis, SemanticElement::Code,
+                    SemanticElement::Link, SemanticElement::Strikethrough, SemanticElement::FrontMatter,
+                    SemanticElement::Comment, SemanticElement::Selection, SemanticElement::SearchMatch];
+        for el in cued {
+            let f = t.face(el);
+            assert!(f.bold.unwrap_or(false) || f.italic.unwrap_or(false) || f.underline.unwrap_or(false)
+                    || f.strike.unwrap_or(false) || f.reverse.unwrap_or(false),
+                    "{el:?} needs a modifier cue");
+        }
+        // pairwise distinctness for the §4 same-context pairs
+        assert_ne!(t.face(SemanticElement::Comment), t.face(SemanticElement::Emphasis));
+        assert_ne!(t.face(SemanticElement::FrontMatter), t.face(SemanticElement::Code));
+    }
+
     const ALL_ELEMENTS: [SemanticElement; 31] = {
         use SemanticElement::*;
         [Text, Emphasis, Strong, StrongEmphasis, Code, Strikethrough, Link,
