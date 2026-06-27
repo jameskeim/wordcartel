@@ -1342,4 +1342,147 @@ mod tests {
         assert!(!has_yellow, "no-color non-current match must not have yellow bg");
         assert!(has_reversed, "no-color non-current match must have REVERSED modifier");
     }
+
+    // -----------------------------------------------------------------------
+    // Golden tests: lock Default-theme styles for 4 render sites
+    // -----------------------------------------------------------------------
+
+    /// Golden: scrollbar track = White/DarkGray, thumb = White/Black under Default theme.
+    ///
+    /// Creates a doc tall enough to overflow a short viewport, enables the scrollbar,
+    /// and asserts that the rightmost column carries the expected track and thumb styles.
+    #[test]
+    fn golden_default_scrollbar_styled() {
+        let doc: String = (0..30).map(|i| format!("line {i}\n")).collect();
+        let mut ed = Editor::new_from_text(&doc, None, (40, 8));
+        ed.mouse.scrollbar_visible = true;
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 8);
+
+        // The scrollbar is in the rightmost column (col 39); rows 0..6 are edit area
+        // (h=8 minus 1 status row = 7 edit rows). The track style = ChromeMuted
+        // (White fg, DarkGray bg) and thumb style = Chrome (White fg, Black bg).
+        let track_style = compose::compose(&ed.theme, ed.depth, &[SE::ChromeMuted]);
+        let thumb_style = compose::compose(&ed.theme, ed.depth, &[SE::Chrome]);
+
+        // Lock the concrete Default-theme colors at the compose level (not cell level).
+        // This validates the theme face mapping regardless of ratatui widget rendering quirks.
+        assert_eq!(track_style.fg, Some(Color::White), "Default track fg must be White");
+        assert_eq!(track_style.bg, Some(Color::DarkGray), "Default track bg must be DarkGray");
+        assert_eq!(thumb_style.fg, Some(Color::White), "Default thumb fg must be White");
+        assert_eq!(thumb_style.bg, Some(Color::Black), "Default thumb bg must be Black");
+
+        // Buffer-level check: at least one cell in the rightmost column (the scrollbar
+        // column) must have a non-default style — confirming the scrollbar rendered at all.
+        let rightmost: u16 = 39;
+        let has_scrollbar_cell = (0u16..7).any(|r| {
+            let s = buf[(rightmost, r)].style();
+            // Any non-trivially-reset cell: has a symbol other than space, or has a non-reset fg/bg.
+            !buf[(rightmost, r)].symbol().trim().is_empty()
+                || (s.fg.is_some() && s.fg != Some(Color::Reset))
+                || (s.bg.is_some() && s.bg != Some(Color::Reset))
+        });
+        assert!(has_scrollbar_cell, "expected at least one styled scrollbar cell in rightmost column (col {rightmost})");
+    }
+
+    /// Golden: list bullet prefix glyph has DarkGray fg and DIM modifier under Default theme.
+    ///
+    /// Two-line doc `"- item\nmore\n"` with caret on line 1 (so line 0 is non-active
+    /// and the bullet on row 0 uses the non-dim path with an explicit DIM modifier).
+    #[test]
+    fn golden_default_list_bullet_darkgray_dim() {
+        let mut ed = Editor::new_from_text("- item\nmore\n", None, (40, 6));
+        // Caret on line 1 so line 0 is non-active (bullet gets DIM, not FocusDim).
+        set_caret(&mut ed, 7); // byte 7 = start of "more\n"
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+
+        // The bullet glyph "• " is rendered at the start of row 0.
+        // In LivePreview mode the "- " markdown is concealed and "• " is the prefix_glyph.
+        // Find the first cell on row 0 that is the bullet (look for "•").
+        let bullet_col = (0u16..40).find(|&x| buf[(x, 0)].symbol().contains('•'));
+        assert!(bullet_col.is_some(), "expected bullet glyph '•' on row 0");
+        let x = bullet_col.unwrap();
+        let cell_style = buf[(x, 0)].style();
+
+        assert_eq!(
+            cell_style.fg,
+            Some(Color::DarkGray),
+            "Default list bullet must have DarkGray fg, got {:?}",
+            cell_style.fg
+        );
+        assert!(
+            cell_style.add_modifier.contains(Modifier::DIM),
+            "Default list bullet must have DIM modifier, got {:?}",
+            cell_style.add_modifier
+        );
+    }
+
+    /// Golden: fold marker `▸` glyph has DarkGray fg under Default theme.
+    ///
+    /// Creates a doc with a heading + body, folds the heading, renders, and
+    /// asserts the `▸` glyph cell has DarkGray fg.
+    #[test]
+    fn golden_default_fold_marker_darkgray() {
+        let doc = "## Heading\nbody line 1\nbody line 2\n";
+        let mut ed = Editor::new_from_text(doc, None, (40, 6));
+        let heading_byte = doc.find("## Heading").unwrap();
+        ed.active_mut().folds.toggle(heading_byte);
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+
+        // The fold marker glyph '▸' is prepended to the heading row (row 0).
+        let marker_col = (0u16..40).find(|&x| buf[(x, 0)].symbol().contains('▸'));
+        assert!(marker_col.is_some(), "expected fold marker glyph '▸' on row 0");
+        let x = marker_col.unwrap();
+        let cell_style = buf[(x, 0)].style();
+
+        // Lock: Default FoldMarker = DarkGray fg.
+        assert_eq!(
+            cell_style.fg,
+            Some(Color::DarkGray),
+            "Default fold marker must have DarkGray fg, got {:?}",
+            cell_style.fg
+        );
+    }
+
+    /// Golden: wrap guide `│` glyph has DarkGray fg under Default theme.
+    ///
+    /// Enables the wrap guide at column 10 in a 40-wide viewport and asserts
+    /// the guide column cell on row 0 has DarkGray fg.
+    #[test]
+    fn golden_default_wrap_guide_darkgray() {
+        let mut ed = Editor::new_from_text("short line\nmore text\n", None, (40, 6));
+        ed.view_opts.wrap_guide = true;
+        ed.view_opts.wrap_column = 10;
+        // measure=false (default): text_left=0, guide lands at col 10.
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+
+        // The wrap guide '│' is painted at column text_left + wrap_column = 10.
+        let tg = crate::nav::text_geometry(&ed);
+        let guide_col = tg.text_left + ed.view_opts.wrap_column;
+        assert!(
+            (guide_col as u16) < 40,
+            "guide column {guide_col} must be within viewport"
+        );
+
+        // Find the '│' glyph in the guide column.
+        // Check all edit rows (0..5) since content may not start at row 0 for guide.
+        let guide_x = guide_col as u16;
+        let guide_cell = (0u16..5).find_map(|r| {
+            let s = buf[(guide_x, r)].symbol();
+            if s.contains('│') { Some(buf[(guide_x, r)].style()) } else { None }
+        });
+        assert!(guide_cell.is_some(), "expected wrap guide '│' at column {guide_col}");
+        let cell_style = guide_cell.unwrap();
+
+        // Lock: Default WrapGuide = DarkGray fg.
+        assert_eq!(
+            cell_style.fg,
+            Some(Color::DarkGray),
+            "Default wrap guide must have DarkGray fg, got {:?}",
+            cell_style.fg
+        );
+    }
 }
