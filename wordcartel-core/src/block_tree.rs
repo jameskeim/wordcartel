@@ -646,14 +646,45 @@ pub fn incremental_update_instrumented_src<S: TextSource>(
 
     // Byte-0 YAML front matter is detected ONLY by the whole-document entry
     // (`full_parse_src`); the localized region reparse below is front-matter-
-    // blind. So any edit that could create, destroy, or resize a leading `---`
+    // blind (it would parse the `---` fences as thematic breaks — the C3 splice
+    // hazard). So any edit that could create, destroy, or resize a leading `---`
     // block must route to a real reparse-from-byte-0 (the SAME mechanism the
-    // `html_in_play` branch above uses). Conservative: when in doubt reparse from
-    // 0 — front matter is a tiny head region, so the cost is negligible.
-    if frontmatter_in_play(old_src, new_src, edit) {
-        let tree = full_parse_src(new_src);
-        return UpdateOutcome { tree, reason: WidenReason::NoOverlapFull, reparsed_bytes: new_src.len() };
-    }
+    // `html_in_play` branch above uses).
+    //
+    // BUT a body edit in a STABLE front-matter doc leaves the head block 0..E
+    // provably untouched, and forcing a full reparse there is the dominant cost
+    // on every keystroke (the head is tiny but the body can be megabytes). So we
+    // tighten: confirm front matter is present with the SAME extent E on both
+    // sides (a bounded head scan, never materializing the whole doc) and that
+    // the edit starts at/after E (strictly in the body). When that holds, the FM
+    // block is untouched and we take the localized incremental path with the
+    // region FLOORED at E (enforced LATE — see below). In every other case
+    // (FM created / destroyed / resized, edit touches the head, or an
+    // over-cap/unconfirmed head) we keep today's conservative full reparse.
+    let fm_floor: Option<usize> = if starts_with_fm_fence(old_src) || starts_with_fm_fence(new_src) {
+        let old_e = fm_end_capped(old_src);
+        let new_e = fm_end_capped(new_src);
+        match (old_e, new_e) {
+            // FM present on BOTH sides, identical extent, and the edit is
+            // strictly in the BODY (at/after the FM end): the FrontMatter block
+            // 0..E is provably unchanged and untouched -> incremental, floored at E.
+            (Some(oe), Some(ne)) if oe == ne && edit_lo >= oe => Some(oe),
+            // Anything else: FM created / destroyed / resized, edit touches the
+            // head, or an unconfirmed (over-cap) head -> full reparse.
+            _ => {
+                let tree = full_parse_src(new_src);
+                return UpdateOutcome {
+                    tree,
+                    reason: WidenReason::NoOverlapFull,
+                    reparsed_bytes: new_src.len(),
+                };
+            }
+        }
+    } else {
+        // No `---` head on either side: not a front-matter concern at all; the
+        // normal incremental machinery below handles it.
+        None
+    };
 
     // DOWNSTREAM ABSORPTION: editing inside / abutting a List, BlockQuote or
     // IndentedCode can change indentation/looseness such that *following* top-
@@ -817,6 +848,25 @@ pub fn incremental_update_instrumented_src<S: TextSource>(
     debug_assert!(region_old_start <= edit_lo);
     debug_assert!(region_old_end >= edit_hi);
 
+    // FRONT-MATTER FLOOR: the FrontMatter block 0..E is unchanged and untouched
+    // (gated above: FM present with identical extent E on both sides, edit_lo >=
+    // E). `parse_region` is front-matter-BLIND, so the localized reparse must
+    // never reach the `---` fences. Clamp here, AFTER all widening/straddle
+    // repair, so no upstream pull-back can re-expose them — in particular the
+    // `!have_overlap` rev-find above would otherwise yank `region_old_start`
+    // back onto the FrontMatter(0..E) block (whose `span.end <= region_old_start`
+    // when the edit is in a gap), dragging the region to 0 and feeding the
+    // FM-blind parser a non-document slice. E is a clean line boundary (the byte
+    // after the closing fence's newline) and every body block starts at/after E,
+    // so clamping introduces no straddle: FrontMatter(0..E) stays a verbatim
+    // "before" block and the reparse sees only body bytes >= E.
+    if let Some(floor) = fm_floor {
+        region_old_start = region_old_start.max(floor);
+    }
+    // Holds: the gate guarantees floor E <= edit_lo, so the max never lifts
+    // region_old_start past edit_lo.
+    debug_assert!(region_old_start <= edit_lo);
+
     let region_new_start = region_old_start;
     let region_new_end = (region_old_end as isize + delta) as usize;
 
@@ -906,31 +956,37 @@ fn html_in_play<S: TextSource>(
     html_opener_count(old_region.as_ref()) > 0 || html_opener_count(new_region.as_ref()) > 0
 }
 
-/// Force a reparse-from-byte-0 when an edit could affect the leading YAML
-/// front-matter region. Front matter is detected only by `full_parse_src` on
-/// the whole document, so the localized region splice (which is front-matter-
-/// blind) would otherwise produce a stale tree whenever an edit creates,
-/// destroys, or resizes a byte-0 `---` block.
+/// Maximum bytes scanned from the document head when confirming front-matter
+/// extent. Front matter is a tiny head region; a `---\n` head with no closing
+/// fence within this cap is treated as UNCONFIRMED (=> conservative full
+/// reparse), which keeps the FM check O(cap) rather than O(document) even on a
+/// pathological never-closed head.
+const FM_HEAD_CAP: usize = 8192;
+
+/// If `src` begins with a COMPLETE front-matter block whose closing fence falls
+/// within `FM_HEAD_CAP` bytes, return its end offset `E` (one past the closing
+/// fence's newline); else `None`.
 ///
-/// Conservative by design — front matter is a tiny head region, so reparsing
-/// from 0 is negligible. The trigger fires when EITHER the old or the new
-/// document begins with the opening fence `---\n` at byte 0. Any document with a
-/// leading `---\n` is a potential front-matter document, and ANY edit to such a
-/// document can flip the front-matter status (or extent) of the whole head:
-///   - editing the head fence/body lines directly resizes/dissolves the block;
-///   - editing the TAIL (past the block) does NOT change the block, but the
-///     localized splice carries the head verbatim — and if a PRIOR step left the
-///     head mis-parsed as thematic breaks (the front-matter-blind `parse_region`
-///     view), only a reparse-from-0 can repair it.
+/// This is the bounded, `TextSource`-generic counterpart to `front_matter_span`
+/// used by the incremental hot path: it scans at most `FM_HEAD_CAP` bytes of the
+/// head, so it never materializes the whole (possibly megabyte) document just to
+/// answer "is there front matter, and where does it end?". An over-cap head
+/// (opening fence present but no closing fence within the cap) returns `None`,
+/// which the caller treats conservatively as "not confirmed -> full reparse".
 ///
-/// So we reparse from 0 whenever a leading `---\n` is present in either snapshot.
-///
-/// It is gated on the `---\n` prefix, so it never hijacks an unrelated byte-0
-/// edit (inserting a code fence, a link-reference definition, prose, …) into a
-/// document that does NOT start with `---\n` — those keep their own widen
-/// instrumentation.
-fn frontmatter_in_play<S: TextSource>(old_src: &S, new_src: &S, _edit: &Edit) -> bool {
-    starts_with_fm_fence(old_src) || starts_with_fm_fence(new_src)
+/// `front_matter_span` (the whole-document detector used by `full_parse_src`)
+/// finds the closing fence on the FIRST matching line, so for any real front
+/// matter the closing fence is at the same byte whether scanned over the capped
+/// head or the whole document — the cap only ever turns a (rare, degenerate)
+/// far-from-head or absent closing fence into `None`, never shifts E.
+fn fm_end_capped<S: TextSource>(src: &S) -> Option<usize> {
+    if !starts_with_fm_fence(src) {
+        return None;
+    }
+    let cap = src.len().min(FM_HEAD_CAP);
+    // Bind the slice to a local so the borrowed `&str` outlives the call.
+    let head = src.slice(0..cap);
+    front_matter_span(head.as_ref()).map(|r| r.end)
 }
 
 /// True if `src` begins with the front-matter opening fence `---\n` at byte 0.

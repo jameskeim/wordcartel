@@ -548,6 +548,150 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
+// Front-matter floor (theming): incremental == full for every edit in a
+// document whose first line is `---`. This is the soundness proof for the
+// span-aware FM floor that lets body edits in a front-matter doc take the
+// localized incremental path instead of a full reparse-from-byte-0.
+//
+// We generate FM-HEADED documents — a mix of:
+//   - valid complete front matter (`---\nk: v\n---\n`) + body,
+//   - an UNCLOSED `---\n` head (no closing fence -> NOT front matter),
+//   - an empty `---\n---\n` front matter,
+//   - front matter followed by varied body blocks,
+// and apply random edit CHAINS whose edits land inside the FM head, on the
+// closing fence, at the FM/body boundary, and deep in the body — including
+// edits that ADD or REMOVE a closing fence (FM create/destroy) and that resize
+// the FM. After each edit we assert incremental == full on BOTH the str and
+// rope paths (via assert_chain_paths_agree!). A failure here is a real
+// soundness hole in the floor predicate, NOT a reason to weaken the assert.
+// ---------------------------------------------------------------------------
+
+/// A front-matter HEAD: opening `---\n`, then a body of `k: v` style lines, then
+/// (most of the time) a closing fence — `---` or `...`. We deliberately include
+/// the unclosed and empty variants so the chain crosses every FM-status
+/// transition (present/absent, valid/invalid, resized).
+fn fm_head_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        // valid complete front matter with 0..4 body lines, closed by `---`
+        prop::collection::vec(
+            ("[a-z]{1,5}", "[a-z0-9 ]{0,6}").prop_map(|(k, v)| format!("{k}: {v}\n")),
+            0..4,
+        )
+        .prop_map(|lines| format!("---\n{}---\n", lines.concat())),
+        // valid complete front matter closed by `...` (YAML doc-end marker)
+        prop::collection::vec(
+            ("[a-z]{1,5}", "[a-z0-9 ]{0,6}").prop_map(|(k, v)| format!("{k}: {v}\n")),
+            0..3,
+        )
+        .prop_map(|lines| format!("---\n{}...\n", lines.concat())),
+        // empty front matter (immediate close)
+        Just("---\n---\n".to_string()),
+        // UNCLOSED head: opening fence, some lines, NO closing fence. This is
+        // NOT front matter (front_matter_span returns None) — the floor must
+        // treat it as such (full reparse, never an FM floor).
+        prop::collection::vec(
+            "[a-z][a-z0-9 ]{0,6}".prop_map(|l| format!("{l}\n")),
+            1..4,
+        )
+        .prop_map(|lines| format!("---\n{}", lines.concat())),
+    ]
+}
+
+/// A whole FM-headed document: an FM head followed by 0..4 ordinary body blocks
+/// drawn from the same block corpus the main oracle uses (headings, lists,
+/// blockquotes, code fences, blank runs, thematic breaks, tables, …).
+fn fm_doc_strategy() -> impl Strategy<Value = String> {
+    (
+        fm_head_strategy(),
+        prop::collection::vec(block_strategy(), 0..4),
+    )
+        .prop_map(|(head, body)| {
+            if body.is_empty() {
+                head
+            } else {
+                format!("{head}\n{}", body.join("\n"))
+            }
+        })
+}
+
+/// Replacements tuned to flip FM status: bare `---`/`...` fences (add/remove a
+/// closing fence), the opening fence, plus ordinary prose and deletions.
+fn fm_replacement_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("".to_string()),
+        Just("x".to_string()),
+        Just("\n".to_string()),
+        Just("\n\n".to_string()),
+        Just("---\n".to_string()),
+        Just("...\n".to_string()),
+        Just("---".to_string()),
+        Just("k: v\n".to_string()),
+        Just("# ".to_string()),
+        Just("> ".to_string()),
+        Just("```\n".to_string()),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 512,
+        max_shrink_iters: 4000,
+        .. ProptestConfig::default()
+    })]
+
+    /// Front-matter floor soundness — multi-edit chain.
+    ///
+    /// Start from a front-matter-headed document and apply a chain of 1..8
+    /// random edits. Positions are permille fractions snapped to char
+    /// boundaries, so edits land anywhere: inside the FM head, on/around the
+    /// closing fence, at the FM/body boundary, and deep in the body. Some
+    /// replacements add or remove a closing fence (creating/destroying/resizing
+    /// the front matter). After EACH edit, assert str-incremental ==
+    /// rope-incremental == full_parse.
+    #[test]
+    fn front_matter_floor_chain_equals_full(
+        initial in fm_doc_strategy(),
+        edits in prop::collection::vec(
+            (0u32..1000, 0u32..1000, fm_replacement_strategy()),
+            1..=8,
+        ),
+    ) {
+        let edits: Vec<(wordcartel_core::block_tree::Edit, String)> = {
+            let mut text = initial.clone();
+            let mut out = Vec::new();
+            for (pa, pb, rep) in edits {
+                let pa = pa as usize;
+                let pb = pb as usize;
+                let lo = snap(&text, pa.min(pb));
+                let hi = snap(&text, pa.max(pb));
+                let (new_text, edit) = apply_edit(&text, lo..hi, &rep);
+                out.push((edit, new_text.clone()));
+                text = new_text;
+            }
+            out
+        };
+        assert_chain_paths_agree!(&initial, &edits);
+    }
+
+    /// Front-matter floor soundness — single edit, broad coverage.
+    ///
+    /// A single random edit on a front-matter-headed doc. Cheaper per-case than
+    /// the chain, so it explores more distinct (doc, edit) shapes per run.
+    #[test]
+    fn front_matter_floor_single_equals_full(
+        doc in fm_doc_strategy(),
+        pa in 0u32..1000,
+        pb in 0u32..1000,
+        rep in fm_replacement_strategy(),
+    ) {
+        let lo = snap(&doc, (pa as usize).min(pb as usize));
+        let hi = snap(&doc, (pa as usize).max(pb as usize));
+        let (new_text, edit) = apply_edit(&doc, lo..hi, &rep);
+        assert_all_paths_agree!(&doc, &edit, &new_text);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Gap 2: delete-to-empty hazard regression
 // ---------------------------------------------------------------------------
 
