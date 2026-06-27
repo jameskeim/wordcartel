@@ -339,9 +339,8 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
         // ---- [theme] (discriminated source; file resolved vs the declaring config) ----
         let rt = raw.theme;
         let layer_dir = p.parent().unwrap_or_else(|| std::path::Path::new("."));
-        let raw_file = rt.file.clone();
         // Resolve a layer's `file` (~ expand + relative-to-this-config) if present.
-        let resolved_file = raw_file.as_ref().map(|s| {
+        let resolved_file = rt.file.as_ref().map(|s| {
             if s == "~" {
                 dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"))
             } else if let Some(rest) = s.strip_prefix("~/") {

@@ -64,6 +64,27 @@ mod tests {
         assert!(ed.palette.is_none(), "opening the theme picker closes the palette (XOR)");
     }
 
+    /// Esc-restore round-trip: open picker (captures original theme A), preview a
+    /// different theme B, then restore original (simulating Esc → app.rs calls
+    /// `apply_theme(tp.original)`). Asserts the active theme returns to A.
+    #[test]
+    fn esc_restore_returns_to_original_theme() {
+        let mut ed = Editor::new_from_text("hello\n", None, (40, 12));
+        crate::derive::rebuild(&mut ed);
+        // default theme is A
+        let default_name = ed.theme.name.clone();
+        assert_eq!(default_name, "default");
+        ed.open_theme_picker();
+        let original = ed.theme_picker.as_ref().unwrap().original.clone();
+        assert_eq!(original.name, default_name, "picker must capture the original theme");
+        // simulate live preview: apply B (tokyo-night)
+        ed.apply_theme(wordcartel_core::theme::tokyo_night());
+        assert_eq!(ed.theme.name, "tokyo-night", "preview must be active");
+        // simulate Esc: restore A from picker.original
+        ed.apply_theme(original);
+        assert_eq!(ed.theme.name, default_name, "Esc restore must return to the original theme");
+    }
+
     #[test]
     fn open_outline_clears_theme_picker() {
         let mut ed = Editor::new_from_text("# Heading\n\nbody\n", None, (40, 12));

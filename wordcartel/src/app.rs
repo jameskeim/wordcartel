@@ -1362,6 +1362,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     editor.depth = resolved.depth;
     editor.heading_glyph_cfg = cfg.theme.heading_level_glyph; // for runtime picker switches (Task 7)
     warns.extend(resolved.warnings); // join the existing startup warning stream
+
     // Load the personal dictionary from disk (missing/unreadable → empty; no abort).
     if let Some(dict_path) = &cfg.diagnostics.dictionary {
         if let Ok(text) = std::fs::read_to_string(dict_path) {
