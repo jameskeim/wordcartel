@@ -155,7 +155,7 @@ pub enum BlockKind { Document, Paragraph, Heading(u8), FencedCode, IndentedCode,
 ```
 (`text` is the region slice already bound in `parse_region`; `range` is region-local, so index `text[range]` not the base-shifted `span`.) (c) `kind_to_role` adds `BlockKind::HtmlComment => Some(BlockRole::Comment),`. (d) **`BlockRole::Comment` does NOT exist (Codex I6) — add it + every exhaustive match site:**
    - `wordcartel-core/src/style.rs:8` — add `Comment` to `pub enum BlockRole { … }`.
-   - `wordcartel-core/src/block_tree.rs::role_precedence` (~:193) — give `Comment` a precedence **lower (numerically) than `Paragraph`** so `collect_role` (which updates only on strictly-lower precedence, ~:226) lets it win over the default Paragraph. (This is the Codex-C2 class — without it `role_at` returns Paragraph, not Comment.)
+   - `wordcartel-core/src/block_tree.rs::role_precedence` (~:193) — give `Comment` a precedence **numerically lower than every container it can nest inside** (`ListItem`≈3 and `BlockQuote`≈4 today, so Comment must be < the smaller of those, e.g. `2`), not merely below `Paragraph`(≈5). `collect_role` updates only on strictly-lower precedence (~:226), and a block `<!-- -->` can be a CHILD of a list item or blockquote — at a lower-than-Paragraph-only value the container role would win and the comment wouldn't be themed (Codex C2). DELIBERATE choice: a comment stays recognizable wherever it appears, so it dominates its container. (Confirm the comparison direction against the real `role_precedence`/`collect_role`: lower number = wins.) Add a `role_at` test for a comment nested in a list item asserting `BlockRole::Comment`.
    - `wordcartel/src/render.rs::role_element` (~:68) — add `BlockRole::Comment => SE::Comment,`.
    - `grep -rn "BlockRole::" wordcartel-core/ wordcartel/` for any OTHER exhaustive `match` on `BlockRole` (md_parse `apply_block_prefix_conceal` matches BlockRole — add a `BlockRole::Comment => None` arm there; any layout/derive match) and add the arm so it compiles.
 
@@ -239,8 +239,11 @@ Add oracle cases to `tests/block_tree_oracle.rs` (use the existing `check`/macro
     check("---\nt: a\n---\n\np\n", 7..7, "x: y\n");
     // a mid-doc `---` must NOT become front matter after an unrelated edit
     check("p\n\n---\n\nq\n", 8..9, "Q");
-    // typing the opening fence at byte 0 turns the head into front matter
-    check("title: a\n\np\n", 0..0, "---\n");
+    // typing the opening fence at byte 0 COMPLETES a front-matter block.
+    // (Codex #11: the post-edit doc must contain a CLOSING fence, or the
+    // scanner returns None and the case doesn't exercise FrontMatter at all.)
+    // start: "title: a\n---\n\np\n"; insert "---\n" at 0 → "---\ntitle: a\n---\n\np\n" (complete block).
+    check("title: a\n---\n\np\n", 0..0, "---\n");
 ```
 (adapt the exact byte ranges to the real strings; each asserts incremental == full via `check`.)
 
@@ -288,6 +291,8 @@ fn prefix_element(role: BlockRole) -> SemanticElement {
 }
 ```
 Paint the prefix glyph span with `compose([prefix_element(vr.role)])` instead of the hardcoded `ListMarker`. (Heading arm is exercised in Task 7; list/other fall through to `ListMarker` exactly as today — no behavior change for existing list bullets.)
+
+> **PRESERVE the non-focused DIM cue (Codex I4-partial).** The existing prefix paint adds a hardcoded `.add_modifier(Modifier::DIM)` on NON-focused rows (~`render.rs:333-337`/`:375-379`) — a focus cue independent of the role face. The Default theme's prefix faces carry no `dim`, so switching to the compose path would silently drop it (the same class as the opus-whole-branch list-bullet finding). Keep the existing non-focused-row dim: apply `compose([prefix_element(vr.role)])` for the COLOR/role, THEN re-apply the `Modifier::DIM` on non-focused rows exactly as today (don't delete that branch). Add an assertion to the Step-3c render test that a non-active blockquote prefix still carries `DIM`.
 - [ ] **Step 3c: Render gate test.** Add a shell render test: a blockquote line paints its `▎` cell with the `BlockQuote` face (not the list-marker face) under the Default theme. Mirror an existing prefix-glyph render assertion.
 
 - [ ] **Step 4: Run** `cargo test -p wordcartel-core md_parse:: blockquote thematic` + `cargo test -p wordcartel render::` — PASS. Then `cargo test -p wordcartel-core` — fix any EXISTING md_parse test that asserted blockquote/thematic prefix_glyph == None (those goldens are intentionally updated: the glyphs are new). Update such a test to expect the glyph.
