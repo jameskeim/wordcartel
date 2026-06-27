@@ -1,0 +1,98 @@
+//! Theme-picker overlay: lists built-in theme names, filters by query, applies
+//! (with live preview) on selection. Mirrors the command palette (palette.rs).
+
+use wordcartel_core::theme::Theme;
+
+#[derive(Debug, Clone)]
+pub struct ThemePicker {
+    pub query: String,
+    pub selected: usize,
+    pub rows: Vec<String>,
+    /// The theme active when the picker opened — restored on Esc (preview cancel).
+    pub original: Theme,
+}
+
+/// Rebuild rows from the built-in theme list, filtered by `query` (case-insensitive
+/// substring). Empty query → all built-ins in registration order. `selected` clamped.
+pub fn rebuild_rows(tp: &mut ThemePicker) {
+    let q = tp.query.to_ascii_lowercase();
+    tp.rows = Theme::builtin_names().iter()   // associated method (Codex C3)
+        .filter(|n| q.is_empty() || n.to_ascii_lowercase().contains(&q))
+        .map(|n| n.to_string())
+        .collect();
+    if tp.selected >= tp.rows.len() { tp.selected = tp.rows.len().saturating_sub(1); }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editor::Editor;
+
+    #[test]
+    fn rebuild_rows_filters_builtins() {
+        let mut tp = ThemePicker { query: String::new(), selected: 0, rows: vec![],
+            original: wordcartel_core::theme::default() };
+        rebuild_rows(&mut tp);
+        assert!(tp.rows.iter().any(|r| r == "tokyo-night"));
+        assert!(tp.rows.len() >= 13);
+        tp.query = "phosphor-amber".into();
+        rebuild_rows(&mut tp);
+        assert!(tp.rows.iter().all(|r| r.contains("phosphor-amber")));
+        assert!(tp.rows.contains(&"phosphor-amber".to_string()));
+        assert!(tp.rows.contains(&"phosphor-amber-flat".to_string()));
+    }
+
+    #[test]
+    fn apply_theme_swaps_and_relayouts() {
+        let mut ed = Editor::new_from_text("# Heading\n\n> quote\n", None, (40, 12));
+        crate::derive::rebuild(&mut ed);
+        let nc = wordcartel_core::theme::no_color(); // monochrome → cue mode forces heading glyph
+        ed.depth = wordcartel_core::theme::Depth::None;
+        ed.apply_theme(nc);
+        assert_eq!(ed.theme.name, "no-color");
+        assert!(ed.theme.heading_level_glyph, "cue mode forces heading glyph on apply");
+        // layout cache was rebuilt (line_layouts repopulated for the visible range)
+        assert!(!ed.active().view.line_layouts.is_empty());
+    }
+
+    #[test]
+    fn open_theme_picker_enforces_xor() {
+        let mut ed = Editor::new_from_text("x\n", None, (40, 12));
+        ed.open_palette();
+        ed.open_theme_picker();
+        assert!(ed.theme_picker.is_some());
+        assert!(ed.palette.is_none(), "opening the theme picker closes the palette (XOR)");
+    }
+
+    /// Esc-restore round-trip: open picker (captures original theme A), preview a
+    /// different theme B, then restore original (simulating Esc → app.rs calls
+    /// `apply_theme(tp.original)`). Asserts the active theme returns to A.
+    #[test]
+    fn esc_restore_returns_to_original_theme() {
+        let mut ed = Editor::new_from_text("hello\n", None, (40, 12));
+        crate::derive::rebuild(&mut ed);
+        // default theme is A
+        let default_name = ed.theme.name.clone();
+        assert_eq!(default_name, "default");
+        ed.open_theme_picker();
+        let original = ed.theme_picker.as_ref().unwrap().original.clone();
+        assert_eq!(original.name, default_name, "picker must capture the original theme");
+        // simulate live preview: apply B (tokyo-night)
+        ed.apply_theme(wordcartel_core::theme::tokyo_night());
+        assert_eq!(ed.theme.name, "tokyo-night", "preview must be active");
+        // simulate Esc: restore A from picker.original
+        ed.apply_theme(original);
+        assert_eq!(ed.theme.name, default_name, "Esc restore must return to the original theme");
+    }
+
+    #[test]
+    fn open_outline_clears_theme_picker() {
+        let mut ed = Editor::new_from_text("# Heading\n\nbody\n", None, (40, 12));
+        crate::derive::rebuild(&mut ed);
+        ed.open_theme_picker();
+        assert!(ed.theme_picker.is_some());
+        ed.open_outline();
+        assert!(ed.theme_picker.is_none(), "opening the outline must clear the theme picker (XOR)");
+        assert!(ed.outline.is_some());
+    }
+}

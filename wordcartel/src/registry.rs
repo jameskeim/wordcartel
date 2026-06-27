@@ -174,6 +174,10 @@ impl Registry {
             c.editor.open_palette();
             CommandResult::Handled
         });
+        r.register("theme", "Select Theme\u{2026}", Some(MenuCategory::View), |c| {
+            c.editor.open_theme_picker();
+            CommandResult::Handled
+        });
         r.register("menu", "Menu Bar", None, |c| {
             c.editor.palette = None;
             c.editor.prompt = None;
@@ -181,6 +185,7 @@ impl Registry {
             c.editor.search = None;
             c.editor.diag = None;
             c.editor.outline = None;
+            c.editor.theme_picker = None;
             c.editor.pending_keys.clear();
             c.editor.pending_mark = None;
             c.editor.menu = if c.editor.menu.is_some() {

@@ -140,6 +140,9 @@ pub fn handle(
         }
         return;
     }
+    if editor.theme_picker.is_some() {
+        return;
+    }
     match ev.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let hit = editing_cell(editor, ev.column, ev.row);
@@ -453,6 +456,18 @@ mod tests {
         handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
         assert!(e.mouse.scrollbar_dragging);
         assert!(e.active().view.scroll > 0, "scrubbed to a lower position");
+    }
+
+    #[test]
+    fn click_with_theme_picker_open_does_not_move_caret() {
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_theme_picker();
+        assert!(e.theme_picker.is_some());
+        let (reg, ex, clk, tx, km) = ctx();
+        handle(&mut e, down(1, 0), &reg, &km, &ex, &clk, &tx);
+        assert_eq!(crate::nav::head(&e), 0, "click absorbed by theme picker — caret must not move");
+        assert!(e.theme_picker.is_some(), "theme picker must remain open after click");
     }
 
     /// Finding 2 regression: if the palette (or menu) is open while a text or

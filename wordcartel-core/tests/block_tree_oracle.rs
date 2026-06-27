@@ -98,6 +98,42 @@ fn check(old_text: &str, range: std::ops::Range<usize>, replacement: &str) -> Up
     outcome
 }
 
+// ---------------------------------------------------------------------------
+// Task 4 (theming): byte-0 YAML front matter — incremental MUST equal full for
+// every edit that touches (or could form/dissolve) the leading `---` block.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn front_matter_editing_body_value_stays_full_eq_incremental() {
+    // "---\ntitle: a\n---\n\npara\n": the body value 'a' is at byte 11.
+    // Replace "a" -> "bb".
+    check("---\ntitle: a\n---\n\npara\n", 11..12, "bb");
+}
+
+#[test]
+fn front_matter_inserting_a_body_line_stays_full_eq_incremental() {
+    // "---\nt: a\n---\n\np\n": insert a new front-matter body line at byte 7
+    // (just before the 'a' of `t: a`).
+    check("---\nt: a\n---\n\np\n", 7..7, "x: y\n");
+}
+
+#[test]
+fn mid_doc_dashes_unaffected_by_unrelated_edit() {
+    // "p\n\n---\n\nq\n": a mid-doc `---` is a thematic break, NOT front matter.
+    // Editing 'q' (byte 8) -> 'Q' far from byte 0 must not perturb it, and the
+    // incremental splice must still equal the full parse.
+    check("p\n\n---\n\nq\n", 8..9, "Q");
+}
+
+#[test]
+fn typing_opening_fence_completes_front_matter_block() {
+    // start "title: a\n---\n\np\n" already has a CLOSING `---`; inserting the
+    // opening fence "---\n" at byte 0 yields "---\ntitle: a\n---\n\np\n", a
+    // COMPLETE front-matter block. The trigger must route this to a real
+    // reparse-from-0 so incremental == full.
+    check("title: a\n---\n\np\n", 0..0, "---\n");
+}
+
 #[test]
 fn typing_inside_paragraph_is_local() {
     let doc = "First para.\n\nSecond para here.\n\nThird para.\n";
@@ -512,6 +548,150 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
+// Front-matter floor (theming): incremental == full for every edit in a
+// document whose first line is `---`. This is the soundness proof for the
+// span-aware FM floor that lets body edits in a front-matter doc take the
+// localized incremental path instead of a full reparse-from-byte-0.
+//
+// We generate FM-HEADED documents — a mix of:
+//   - valid complete front matter (`---\nk: v\n---\n`) + body,
+//   - an UNCLOSED `---\n` head (no closing fence -> NOT front matter),
+//   - an empty `---\n---\n` front matter,
+//   - front matter followed by varied body blocks,
+// and apply random edit CHAINS whose edits land inside the FM head, on the
+// closing fence, at the FM/body boundary, and deep in the body — including
+// edits that ADD or REMOVE a closing fence (FM create/destroy) and that resize
+// the FM. After each edit we assert incremental == full on BOTH the str and
+// rope paths (via assert_chain_paths_agree!). A failure here is a real
+// soundness hole in the floor predicate, NOT a reason to weaken the assert.
+// ---------------------------------------------------------------------------
+
+/// A front-matter HEAD: opening `---\n`, then a body of `k: v` style lines, then
+/// (most of the time) a closing fence — `---` or `...`. We deliberately include
+/// the unclosed and empty variants so the chain crosses every FM-status
+/// transition (present/absent, valid/invalid, resized).
+fn fm_head_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        // valid complete front matter with 0..4 body lines, closed by `---`
+        prop::collection::vec(
+            ("[a-z]{1,5}", "[a-z0-9 ]{0,6}").prop_map(|(k, v)| format!("{k}: {v}\n")),
+            0..4,
+        )
+        .prop_map(|lines| format!("---\n{}---\n", lines.concat())),
+        // valid complete front matter closed by `...` (YAML doc-end marker)
+        prop::collection::vec(
+            ("[a-z]{1,5}", "[a-z0-9 ]{0,6}").prop_map(|(k, v)| format!("{k}: {v}\n")),
+            0..3,
+        )
+        .prop_map(|lines| format!("---\n{}...\n", lines.concat())),
+        // empty front matter (immediate close)
+        Just("---\n---\n".to_string()),
+        // UNCLOSED head: opening fence, some lines, NO closing fence. This is
+        // NOT front matter (front_matter_span returns None) — the floor must
+        // treat it as such (full reparse, never an FM floor).
+        prop::collection::vec(
+            "[a-z][a-z0-9 ]{0,6}".prop_map(|l| format!("{l}\n")),
+            1..4,
+        )
+        .prop_map(|lines| format!("---\n{}", lines.concat())),
+    ]
+}
+
+/// A whole FM-headed document: an FM head followed by 0..4 ordinary body blocks
+/// drawn from the same block corpus the main oracle uses (headings, lists,
+/// blockquotes, code fences, blank runs, thematic breaks, tables, …).
+fn fm_doc_strategy() -> impl Strategy<Value = String> {
+    (
+        fm_head_strategy(),
+        prop::collection::vec(block_strategy(), 0..4),
+    )
+        .prop_map(|(head, body)| {
+            if body.is_empty() {
+                head
+            } else {
+                format!("{head}\n{}", body.join("\n"))
+            }
+        })
+}
+
+/// Replacements tuned to flip FM status: bare `---`/`...` fences (add/remove a
+/// closing fence), the opening fence, plus ordinary prose and deletions.
+fn fm_replacement_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("".to_string()),
+        Just("x".to_string()),
+        Just("\n".to_string()),
+        Just("\n\n".to_string()),
+        Just("---\n".to_string()),
+        Just("...\n".to_string()),
+        Just("---".to_string()),
+        Just("k: v\n".to_string()),
+        Just("# ".to_string()),
+        Just("> ".to_string()),
+        Just("```\n".to_string()),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 512,
+        max_shrink_iters: 4000,
+        .. ProptestConfig::default()
+    })]
+
+    /// Front-matter floor soundness — multi-edit chain.
+    ///
+    /// Start from a front-matter-headed document and apply a chain of 1..8
+    /// random edits. Positions are permille fractions snapped to char
+    /// boundaries, so edits land anywhere: inside the FM head, on/around the
+    /// closing fence, at the FM/body boundary, and deep in the body. Some
+    /// replacements add or remove a closing fence (creating/destroying/resizing
+    /// the front matter). After EACH edit, assert str-incremental ==
+    /// rope-incremental == full_parse.
+    #[test]
+    fn front_matter_floor_chain_equals_full(
+        initial in fm_doc_strategy(),
+        edits in prop::collection::vec(
+            (0u32..1000, 0u32..1000, fm_replacement_strategy()),
+            1..=8,
+        ),
+    ) {
+        let edits: Vec<(wordcartel_core::block_tree::Edit, String)> = {
+            let mut text = initial.clone();
+            let mut out = Vec::new();
+            for (pa, pb, rep) in edits {
+                let pa = pa as usize;
+                let pb = pb as usize;
+                let lo = snap(&text, pa.min(pb));
+                let hi = snap(&text, pa.max(pb));
+                let (new_text, edit) = apply_edit(&text, lo..hi, &rep);
+                out.push((edit, new_text.clone()));
+                text = new_text;
+            }
+            out
+        };
+        assert_chain_paths_agree!(&initial, &edits);
+    }
+
+    /// Front-matter floor soundness — single edit, broad coverage.
+    ///
+    /// A single random edit on a front-matter-headed doc. Cheaper per-case than
+    /// the chain, so it explores more distinct (doc, edit) shapes per run.
+    #[test]
+    fn front_matter_floor_single_equals_full(
+        doc in fm_doc_strategy(),
+        pa in 0u32..1000,
+        pb in 0u32..1000,
+        rep in fm_replacement_strategy(),
+    ) {
+        let lo = snap(&doc, (pa as usize).min(pb as usize));
+        let hi = snap(&doc, (pa as usize).max(pb as usize));
+        let (new_text, edit) = apply_edit(&doc, lo..hi, &rep);
+        assert_all_paths_agree!(&doc, &edit, &new_text);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Gap 2: delete-to-empty hazard regression
 // ---------------------------------------------------------------------------
 
@@ -781,4 +961,194 @@ fn separator_ps_is_not_a_line_break() {
         full_parse(&new),
         "full_parse_rope != full_parse for {:?}", new
     );
+}
+
+// ---------------------------------------------------------------------------
+// Cap-boundary regression: fm_end_capped truncated-false-close guard
+//
+// FM_HEAD_CAP = 8192 (wordcartel-core/src/block_tree.rs — must match this
+// constant). The capped scan passes a `[0..cap]` slice to `front_matter_span`;
+// if a body line beginning with `---` or `...` straddles the cap boundary, the
+// final fragment inside the cap is exactly `---`/`...` (no `\n`), and
+// `front_matter_span`'s `split_inclusive('\n')` returns it as the last element.
+// `strip_suffix('\n').unwrap_or(line)` on that fragment gives `"---"`, which
+// matches the close predicate, so the capped scan reports a FALSE closing fence
+// at `end == cap` while the whole-document scan finds the REAL close later.
+// Without the `if cap < src.len() && end == cap { return None; }` guard in
+// `fm_end_capped`, a body edit below the real close takes the floored
+// incremental path at the wrong `E` → incremental ≠ full → document-model
+// corruption.
+//
+// This section has:
+// 1. A deterministic regression test that constructs the exact repro.
+// 2. A proptest that brackets the cap so the corner is explored by fuzzing.
+// ---------------------------------------------------------------------------
+
+/// Deterministic regression: a `---`-prefixed body line straddles FM_HEAD_CAP.
+///
+/// Document layout (all offsets from byte 0):
+///   0..4     opening fence "---\n"
+///   4..8189  FM body line "a: " + 8182 × "x" + "\n"  (8185 bytes)
+///   8189..8197  body line "---more\n"  (8 bytes; bytes 8189..8192 are "---",
+///               cut by the cap; the capped scan sees fragment "---" → false close)
+///   8197..8201  real closing fence "---\n"  (4 bytes; E = 8201 in whole-doc scan)
+///   8201..    document body "\nbody text here\n"
+///
+/// FM_HEAD_CAP = 8192 is hardcoded below; if the constant changes, the layout
+/// guards (assert_eq!) will fail loudly rather than silently neutering the test.
+#[test]
+fn regression_fm_end_capped_false_close_at_cap_boundary() {
+    // FM_HEAD_CAP value — must match the const in block_tree.rs.
+    const CAP: usize = 8192;
+
+    // The FM body line occupies bytes 4..8189, so its length is 8185.
+    // "a: " (3 bytes) + 8181 × "x" + "\n" (1 byte) = 8185 bytes.
+    let fm_body_line = format!("a: {}\n", "x".repeat(8181));
+    assert_eq!(fm_body_line.len(), 8185, "fm_body_line length must be 8185");
+
+    let opening = "---\n";
+    // offset of the ---more line: 4 (opening) + 8185 (body line) = 8189
+    let false_close_prefix_offset = opening.len() + fm_body_line.len();
+    assert_eq!(false_close_prefix_offset, 8189,
+        "false_close_prefix_offset must be 8189 (= CAP - 3)");
+    // The cap cuts the line "---more\n" at byte 8192; the fragment "---" ends at 8192.
+    assert_eq!(false_close_prefix_offset + 3, CAP,
+        "the first 3 bytes of ---more must align exactly to [CAP-3, CAP)");
+
+    // Real closing fence starts at byte 8197 (after "---more\n" = 8 bytes).
+    let real_close_offset = false_close_prefix_offset + "---more\n".len();
+    assert_eq!(real_close_offset, 8197, "real_close_offset must be 8197");
+    // E (one past the closing fence's newline) = 8197 + 4 = 8201.
+    let expected_e = real_close_offset + "---\n".len();
+    assert_eq!(expected_e, 8201, "expected E must be 8201");
+
+    // Assemble the document.
+    let doc = format!(
+        "{opening}{fm_body_line}---more\n---\n\nbody text here\n"
+    );
+
+    // Verify the layout: the three bytes at [CAP-3, CAP) must be "---".
+    assert_eq!(&doc[CAP - 3..CAP], "---",
+        "bytes [CAP-3, CAP) must be exactly \"---\" (first 3 bytes of ---more\\n)");
+    // Verify the byte immediately past the cap is not a fence terminator.
+    assert_eq!(&doc[CAP..CAP + 1], "m",
+        "byte at CAP must be 'm' (continuation of ---more\\n)");
+    // Verify the real close is where we expect.
+    assert_eq!(&doc[real_close_offset..real_close_offset + 4], "---\n",
+        "real closing fence must be at byte 8197");
+
+    // The edit: insert a character at byte 8193 — INSIDE the "---more\n" body line
+    // (bytes 8189..8197), just after the cap boundary at 8192.
+    //
+    // Why this position triggers the bug when the guard is absent:
+    //   - Without the guard, fm_end_capped returns Some(8192) (false close).
+    //   - edit_lo = 8193 >= 8192 = false_E → the gate lets the incremental path
+    //     through with fm_floor = Some(8192).
+    //   - The old tree (from full_parse) has FrontMatter(0..8201) — the REAL close.
+    //     That block straddles the edit: straddle repair pulls region_old_start to 0,
+    //     then fm_floor clamps it back to 8192.
+    //   - The splice drops FrontMatter(0..8201) (it spans the region boundary) and
+    //     reparsed bytes start at 8192 ("more\n---\n...") — no front matter there.
+    //   - Result: incremental tree has no FrontMatter block; full_parse has
+    //     FrontMatter(0..8201). The trees DIVERGE → document-model corruption.
+    //   - With the guard, fm_end_capped returns None → full reparse → incremental == full.
+    let edit_offset = CAP + 1; // byte 8193, inside "more" part of "---more\n"
+    assert_eq!(&doc[edit_offset..edit_offset + 1], "o",
+        "edit_offset must land on 'o' of 'more'");
+    let (new_doc, edit) = apply_edit(&doc, edit_offset..edit_offset, "Z");
+
+    // Assert incremental == full on both the str and rope paths.
+    // Without the fm_end_capped guard the trees diverge; with it this passes.
+    assert_all_paths_agree_det(&doc, &edit, &new_doc);
+}
+
+/// Cap-bracketing proptest: a front-matter doc whose `---`/`...`-prefixed body
+/// line (or real closing fence) straddles FM_HEAD_CAP = 8192.
+///
+/// The generator places the start of that line at a byte offset drawn from
+/// `8180..8204`, which brackets the cap regardless of its exact value (any line
+/// start in that range will have its three-byte prefix touch 8192 for some
+/// realistic line positions). A chain of random edits is then applied below the
+/// real close, and incremental == full is asserted after each edit.
+fn fm_cap_doc_strategy() -> impl Strategy<Value = String> {
+    // FM_HEAD_CAP = 8192 (coupled; the range 8180..8204 brackets it on both sides
+    // so any future change to the constant is caught by at least some proptest cases).
+    (8180usize..8204usize).prop_flat_map(|false_line_start| {
+        // FM body filler: "a: " + (false_line_start - 4) - 3 bytes of padding + "\n".
+        // We need opening (4) + filler = false_line_start, so filler = false_line_start - 4.
+        // filler is "a: " (3) + pad + "\n" (1) = 4 + pad, so pad = false_line_start - 8.
+        let pad_len = false_line_start.saturating_sub(8);
+        let filler = format!("a: {}\n", "x".repeat(pad_len));
+        assert!(4 + filler.len() == false_line_start,
+            "filler length mismatch: 4 + {} != {}", filler.len(), false_line_start);
+
+        // The triggering line: one of three forms:
+        //  a) "---more\n"  — prefixed with "---", not a real close
+        //  b) "...more\n"  — prefixed with "...", not a real close
+        //  c) "---\n"      — the REAL close (cap may cut before the \n, giving "---" fragment)
+        let triggering_line = prop_oneof![
+            Just("---more\n".to_string()),
+            Just("...more\n".to_string()),
+            Just("---\n".to_string()),
+        ];
+
+        // Body suffix text that follows the real closing fence.
+        let body = prop_oneof![
+            Just("\nbody paragraph\n".to_string()),
+            Just("\npara1\n\npara2\n".to_string()),
+            Just("\n# Heading\n\ntext\n".to_string()),
+        ];
+
+        (triggering_line, body).prop_map(move |(trig, body_text)| {
+            let opening = "---\n";
+            if trig == "---\n" {
+                // trig IS the close; body follows immediately.
+                format!("{opening}{filler}{trig}{body_text}")
+            } else {
+                // trig is a false-close candidate; need a real close after it.
+                format!("{opening}{filler}{trig}---\n{body_text}")
+            }
+        })
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 256,
+        max_shrink_iters: 4000,
+        .. ProptestConfig::default()
+    })]
+
+    /// Cap-boundary FM soundness — edit chain bracketing FM_HEAD_CAP.
+    ///
+    /// Builds a front-matter doc whose triggering line (a `---`/`...`-prefixed
+    /// body line or the real close) starts at an offset that brackets
+    /// FM_HEAD_CAP = 8192. Applies a chain of 1..4 edits in the body below
+    /// the real close and asserts incremental == full after each edit.
+    /// Without the `fm_end_capped` false-close guard this test fails whenever
+    /// the generated offset places the "---" prefix at bytes [cap-3, cap).
+    #[test]
+    fn front_matter_cap_boundary_chain_equals_full(
+        doc in fm_cap_doc_strategy(),
+        edits in prop::collection::vec(
+            (0u32..1000, 0u32..1000, fm_replacement_strategy()),
+            1..=4,
+        ),
+    ) {
+        let edits: Vec<(wordcartel_core::block_tree::Edit, String)> = {
+            let mut text = doc.clone();
+            let mut out = Vec::new();
+            for (pa, pb, rep) in edits {
+                let pa = pa as usize;
+                let pb = pb as usize;
+                let lo = snap(&text, pa.min(pb));
+                let hi = snap(&text, pa.max(pb));
+                let (new_text, edit) = apply_edit(&text, lo..hi, &rep);
+                out.push((edit, new_text.clone()));
+                text = new_text;
+            }
+            out
+        };
+        assert_chain_paths_agree!(&doc, &edits);
+    }
 }

@@ -142,6 +142,9 @@ pub enum BlockKind {
     ListItem,
     ThematicBreak,
     HtmlBlock,
+    HtmlComment,
+    /// A leading YAML front-matter block (`---\n … \n---`) at byte 0 ONLY.
+    FrontMatter,
     Table,
     /// Footnote definitions / metadata blocks / def lists collapsed here.
     Other,
@@ -195,11 +198,16 @@ fn role_precedence(r: &crate::style::BlockRole) -> u8 {
     match r {
         CodeBlock      => 0,
         Heading(_)     => 1,
+        Comment        => 2,
         ThematicBreak  => 2,
         ListItem       => 3,
         BlockQuote     => 4,
+        // FrontMatter is always a top-level byte-0 leaf (it cannot nest), so a
+        // rank just below Paragraph suffices for it to win `role_at` over the
+        // default Paragraph. `collect_role` overrides only on strictly-lower
+        // precedence, so FrontMatter==Paragraph would let Paragraph win.
+        FrontMatter    => 4,
         Paragraph      => 5,
-        FrontMatter    => 5,
     }
 }
 
@@ -212,6 +220,8 @@ fn kind_to_role(kind: &BlockKind) -> Option<crate::style::BlockRole> {
         BlockKind::ThematicBreak => Some(BlockRole::ThematicBreak),
         BlockKind::ListItem => Some(BlockRole::ListItem),
         BlockKind::BlockQuote => Some(BlockRole::BlockQuote),
+        BlockKind::HtmlComment => Some(BlockRole::Comment),
+        BlockKind::FrontMatter => Some(BlockRole::FrontMatter),
         _ => None,
     }
 }
@@ -313,8 +323,53 @@ pub fn full_parse(text: &str) -> BlockTree {
 }
 
 /// Generic version of `full_parse` over any `TextSource`.
+///
+/// THE ONLY true whole-document entry point — `full_parse` and
+/// `full_parse_rope` both route through here, and the incremental update path
+/// calls this (and ONLY this) when an edit forces a reparse-from-byte-0. Byte-0
+/// YAML front-matter detection lives HERE and NOWHERE ELSE: `parse_region` stays
+/// front-matter-blind so that the incremental splice — which calls
+/// `parse_region` on a localized FRAGMENT whose base offset can be 0 — never runs
+/// the byte-0 scanner against a non-document slice (the C3 splice hazard).
 pub fn full_parse_src<S: TextSource>(src: &S) -> BlockTree {
+    // Byte-0 front matter is detected on the whole-document text only.
+    let whole = src.slice(0..src.len());
+    if let Some(fm) = front_matter_span(whole.as_ref()) {
+        // Emit the FrontMatter block first (span 0..fm.end), then parse the
+        // REMAINDER `&src[fm.end..]` with base offset `fm.end` so its spans are
+        // shifted into document coordinates, and append those blocks after it.
+        let mut root = Block {
+            kind: BlockKind::Document,
+            span: 0..src.len(),
+            children: vec![Block {
+                kind: BlockKind::FrontMatter,
+                span: fm.clone(),
+                children: Vec::new(),
+            }],
+        };
+        let remainder = parse_region(src, fm.end..src.len(), fm.end);
+        root.children.extend(remainder.root.children);
+        return BlockTree { root };
+    }
     parse_region(src, 0..src.len(), 0)
+}
+
+/// If `src` begins with a YAML front-matter block (`---\n … \n---`), return its
+/// byte range (the whole block incl. both fences); else `None`. Byte-0 ONLY:
+/// the opening fence MUST sit at byte 0, so a mid-document `---` is never front
+/// matter (`strip_prefix` fails). The closing fence is the first line that is
+/// exactly `---` or `...`.
+fn front_matter_span(src: &str) -> Option<Range<usize>> {
+    let rest = src.strip_prefix("---\n")?; // opening fence MUST be at byte 0
+    let mut off = 4; // bytes consumed by the opening "---\n"
+    for line in rest.split_inclusive('\n') {
+        let trimmed = line.strip_suffix('\n').unwrap_or(line);
+        if trimmed == "---" || trimmed == "..." {
+            return Some(0..off + line.len());
+        }
+        off += line.len();
+    }
+    None
 }
 
 /// Parse the byte range `region` of `src`, treating the region as living at
@@ -337,6 +392,16 @@ fn parse_region<S: TextSource>(src: &S, region: Range<usize>, base: usize) -> Bl
         match event {
             Event::Start(tag) => {
                 if let Some(kind) = tag_to_kind(&tag) {
+                    // Discriminate HTML comment blocks from generic HTML blocks:
+                    // `text` is the region-local slice, `range` is region-local,
+                    // so `text[range.clone()]` correctly indexes the region text.
+                    let kind = if kind == BlockKind::HtmlBlock
+                        && text[range.clone()].trim_start().starts_with("<!--")
+                    {
+                        BlockKind::HtmlComment
+                    } else {
+                        kind
+                    };
                     stack.push(Block { kind, span, children: Vec::new() });
                 }
             }
@@ -579,6 +644,48 @@ pub fn incremental_update_instrumented_src<S: TextSource>(
         return UpdateOutcome { tree, reason: WidenReason::NoOverlapFull, reparsed_bytes: new_src.len() };
     }
 
+    // Byte-0 YAML front matter is detected ONLY by the whole-document entry
+    // (`full_parse_src`); the localized region reparse below is front-matter-
+    // blind (it would parse the `---` fences as thematic breaks — the C3 splice
+    // hazard). So any edit that could create, destroy, or resize a leading `---`
+    // block must route to a real reparse-from-byte-0 (the SAME mechanism the
+    // `html_in_play` branch above uses).
+    //
+    // BUT a body edit in a STABLE front-matter doc leaves the head block 0..E
+    // provably untouched, and forcing a full reparse there is the dominant cost
+    // on every keystroke (the head is tiny but the body can be megabytes). So we
+    // tighten: confirm front matter is present with the SAME extent E on both
+    // sides (a bounded head scan, never materializing the whole doc) and that
+    // the edit starts at/after E (strictly in the body). When that holds, the FM
+    // block is untouched and we take the localized incremental path with the
+    // region FLOORED at E (enforced LATE — see below). In every other case
+    // (FM created / destroyed / resized, edit touches the head, or an
+    // over-cap/unconfirmed head) we keep today's conservative full reparse.
+    let fm_floor: Option<usize> = if starts_with_fm_fence(old_src) || starts_with_fm_fence(new_src) {
+        let old_e = fm_end_capped(old_src);
+        let new_e = fm_end_capped(new_src);
+        match (old_e, new_e) {
+            // FM present on BOTH sides, identical extent, and the edit is
+            // strictly in the BODY (at/after the FM end): the FrontMatter block
+            // 0..E is provably unchanged and untouched -> incremental, floored at E.
+            (Some(oe), Some(ne)) if oe == ne && edit_lo >= oe => Some(oe),
+            // Anything else: FM created / destroyed / resized, edit touches the
+            // head, or an unconfirmed (over-cap) head -> full reparse.
+            _ => {
+                let tree = full_parse_src(new_src);
+                return UpdateOutcome {
+                    tree,
+                    reason: WidenReason::NoOverlapFull,
+                    reparsed_bytes: new_src.len(),
+                };
+            }
+        }
+    } else {
+        // No `---` head on either side: not a front-matter concern at all; the
+        // normal incremental machinery below handles it.
+        None
+    };
+
     // DOWNSTREAM ABSORPTION: editing inside / abutting a List, BlockQuote or
     // IndentedCode can change indentation/looseness such that *following* top-
     // level blocks get pulled in (indented code, paragraphs, sub-lists), or
@@ -741,6 +848,25 @@ pub fn incremental_update_instrumented_src<S: TextSource>(
     debug_assert!(region_old_start <= edit_lo);
     debug_assert!(region_old_end >= edit_hi);
 
+    // FRONT-MATTER FLOOR: the FrontMatter block 0..E is unchanged and untouched
+    // (gated above: FM present with identical extent E on both sides, edit_lo >=
+    // E). `parse_region` is front-matter-BLIND, so the localized reparse must
+    // never reach the `---` fences. Clamp here, AFTER all widening/straddle
+    // repair, so no upstream pull-back can re-expose them — in particular the
+    // `!have_overlap` rev-find above would otherwise yank `region_old_start`
+    // back onto the FrontMatter(0..E) block (whose `span.end <= region_old_start`
+    // when the edit is in a gap), dragging the region to 0 and feeding the
+    // FM-blind parser a non-document slice. E is a clean line boundary (the byte
+    // after the closing fence's newline) and every body block starts at/after E,
+    // so clamping introduces no straddle: FrontMatter(0..E) stays a verbatim
+    // "before" block and the reparse sees only body bytes >= E.
+    if let Some(floor) = fm_floor {
+        region_old_start = region_old_start.max(floor);
+    }
+    // Holds: the gate guarantees floor E <= edit_lo, so the max never lifts
+    // region_old_start past edit_lo.
+    debug_assert!(region_old_start <= edit_lo);
+
     let region_new_start = region_old_start;
     let region_new_end = (region_old_end as isize + delta) as usize;
 
@@ -828,6 +954,67 @@ fn html_in_play<S: TextSource>(
     let new_region_end = ((region_old_end as isize + edit.delta()) as usize).min(new_src.len());
     let new_region = new_src.slice(new_start.min(new_region_end)..new_region_end);
     html_opener_count(old_region.as_ref()) > 0 || html_opener_count(new_region.as_ref()) > 0
+}
+
+/// Maximum bytes scanned from the document head when confirming front-matter
+/// extent. Front matter is a tiny head region; a `---\n` head with no closing
+/// fence within this cap is treated as UNCONFIRMED (=> conservative full
+/// reparse), which keeps the FM check O(cap) rather than O(document) even on a
+/// pathological never-closed head.
+const FM_HEAD_CAP: usize = 8192;
+
+/// If `src` begins with a COMPLETE front-matter block whose closing fence falls
+/// within `FM_HEAD_CAP` bytes, return its end offset `E` (one past the closing
+/// fence's newline); else `None`.
+///
+/// This is the bounded, `TextSource`-generic counterpart to `front_matter_span`
+/// used by the incremental hot path: it scans at most `FM_HEAD_CAP` bytes of the
+/// head, so it never materializes the whole (possibly megabyte) document just to
+/// answer "is there front matter, and where does it end?". An over-cap head
+/// (opening fence present but no closing fence within the cap) returns `None`,
+/// which the caller treats conservatively as "not confirmed -> full reparse".
+///
+/// CAUTION — truncation can manufacture a FALSE close: `front_matter_span` uses
+/// `split_inclusive('\n')`, so on a capped slice the final fragment may be a
+/// partial line with no terminating `\n`. If that partial fragment equals `---`
+/// or `...` exactly, it is accepted as a closing fence, but the WHOLE-document
+/// scan sees the line continues (e.g. `---more\n`) and finds the real first
+/// close elsewhere. The false close always ends at exactly `cap`. `fm_end_capped`
+/// guards against this by rejecting any result where `end == cap` on a truncated
+/// head (see inline comment). When no false close is present, the capped scan
+/// agrees with the whole-document scan because `front_matter_span` matches the
+/// FIRST closing-fence line; the cap only turns a far-from-head or absent close
+/// into `None` (conservative full reparse).
+fn fm_end_capped<S: TextSource>(src: &S) -> Option<usize> {
+    if !starts_with_fm_fence(src) {
+        return None;
+    }
+    let cap = src.len().min(FM_HEAD_CAP);
+    // Bind the slice to a local so the borrowed `&str` outlives the call.
+    let head = src.slice(0..cap);
+    let end = front_matter_span(head.as_ref()).map(|r| r.end)?;
+    // GUARD against a TRUNCATED false close. `front_matter_span` matches the
+    // closing fence via `split_inclusive('\n')`; over a capped slice the FINAL
+    // fragment may be a partial line with no terminating `\n` (the cap cut it
+    // off). If that partial fragment happens to equal `---`/`...`, the capped
+    // scan reports a close that the WHOLE-document scan does NOT see (the real
+    // line continues, e.g. `---more\n`). That false close ALWAYS ends exactly at
+    // `cap`. So when the head was truncated (`cap < len`) and the reported end is
+    // `cap`, treat the head as UNCONFIRMED -> None -> conservative full reparse.
+    // (A genuine close whose `\n` happens to land on the cap boundary is rejected
+    // too, but that alignment is astronomically rare and full reparse is correct.)
+    if cap < src.len() && end == cap {
+        return None;
+    }
+    Some(end)
+}
+
+/// True if `src` begins with the front-matter opening fence `---\n` at byte 0.
+/// Slices to `line_end(0)` (the byte just after the first `\n`, always a valid
+/// char boundary under LF-only semantics) rather than a fixed byte offset, so it
+/// never splits a multibyte char at the head.
+fn starts_with_fm_fence<S: TextSource>(src: &S) -> bool {
+    src.slice(0..src.line_end(0)).as_ref() == "---\n"
 }
 
 fn is_ref_def_line(line: &str) -> bool {
@@ -1208,6 +1395,85 @@ mod tests {
             "str incremental != full_parse"
         );
         assert_eq!(rope_tree, str_tree, "rope incremental != str incremental");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 4 (theming): byte-0 YAML front matter → BlockKind::FrontMatter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn byte0_front_matter_is_front_matter_role() {
+        let doc = "---\ntitle: Hi\n---\n\n# Heading\n";
+        let t = full_parse(doc);
+        assert_eq!(
+            t.role_at(doc.find("title").unwrap()),
+            crate::style::BlockRole::FrontMatter
+        );
+        // the heading after it is unaffected
+        assert_eq!(
+            t.role_at(doc.find("Heading").unwrap()),
+            crate::style::BlockRole::Heading(1)
+        );
+    }
+
+    #[test]
+    fn mid_document_dashes_are_not_front_matter() {
+        // a `---` NOT at byte 0 is a thematic break / setext underline, never front matter.
+        let doc = "para\n\n---\n\nmore\n";
+        let t = full_parse(doc);
+        assert_ne!(
+            t.role_at(doc.find("more").unwrap()),
+            crate::style::BlockRole::FrontMatter
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 3: block <!-- --> → HtmlComment → BlockRole::Comment
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn block_html_comment_maps_to_comment_role() {
+        let doc = "<!-- a block comment -->\n\npara\n";
+        let t = full_parse(doc);
+        let at = |needle: &str| t.role_at(doc.find(needle).unwrap());
+        assert_eq!(at("block comment"), crate::style::BlockRole::Comment);
+    }
+
+    #[test]
+    fn block_div_is_not_comment() {
+        let doc = "<div>x</div>\n\npara\n";
+        let t = full_parse(doc);
+        assert_ne!(t.role_at(doc.find("x").unwrap()), crate::style::BlockRole::Comment);
+    }
+
+    /// A block comment nested inside a list item (as a loose list child) must
+    /// still resolve to BlockRole::Comment, not BlockRole::ListItem.
+    ///
+    /// In CommonMark a blank-separated item body can contain block-level HTML.
+    /// The markdown `"- item\n\n  <!-- c -->\n"` produces a loose list item
+    /// whose children include both a paragraph and an HTML block.  pulldown-cmark
+    /// nests the HtmlBlock under the ListItem; the HtmlComment block is therefore
+    /// a grandchild of the Document.  role_at walks the full tree, so the
+    /// HtmlComment role (precedence 2) beats ListItem (precedence 3), yielding
+    /// BlockRole::Comment.
+    #[test]
+    fn block_comment_nested_in_list_item_wins_over_list_item() {
+        // Loose list: blank line between the paragraph and the comment block
+        // forces the list item to be "loose", making the HTML block a sibling
+        // paragraph inside the list item.
+        let doc = "- item\n\n  <!-- c -->\n";
+        let t = full_parse(doc);
+        // Verify nesting: the HTML comment must actually appear as a nested block.
+        // Walk children to check the structure.
+        let tops = t.top_level();
+        assert!(!tops.is_empty(), "expected at least one top-level block");
+        // The top-level block should be a List containing a ListItem.
+        assert_eq!(tops[0].kind, BlockKind::List, "expected List at top level");
+        // Find the comment block somewhere in the tree
+        let comment_pos = doc.find("<!-- c -->").unwrap();
+        let role = t.role_at(comment_pos);
+        assert_eq!(role, crate::style::BlockRole::Comment,
+            "comment nested in list item should resolve to Comment, got {:?}", role);
     }
 
     /// Extra assertions for the non-LF separator cases: prove that line_start

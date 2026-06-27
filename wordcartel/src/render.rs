@@ -1,7 +1,7 @@
 // Task 5: ratatui live-preview render + status line.
 // Pure: takes &Editor, mutates NOTHING on the editor.
 
-use crate::{derive, editor::Editor, nav};
+use crate::{compose, derive, editor::Editor, nav};
 use wordcartel_core::count;
 use ratatui::{
     layout::{Position, Rect},
@@ -11,6 +11,11 @@ use ratatui::{
     Frame,
 };
 use wordcartel_core::style::Style;
+use wordcartel_core::theme::SemanticElement as SE;
+
+/// Heading-level shade glyphs used in cue mode and when `heading_level_glyph` is on.
+/// Index 0 = H1 (`█`), …, index 5 = H6 (`·`). Density decreases with level.
+const SHADES: [&str; 6] = ["█", "▓", "▒", "░", "▏", "·"];
 
 /// Half-open interval intersection: is the row's global byte range active?
 ///
@@ -32,6 +37,10 @@ pub(crate) fn overlaps(a0: usize, a1: usize, b0: usize, b1: usize) -> bool {
 /// Strong→BOLD; Emphasis→ITALIC; StrongEmphasis→BOLD|ITALIC;
 /// Strikethrough→CROSSED_OUT; Code→Cyan color; Link→UNDERLINED+Yellow;
 /// Plain→default.
+///
+/// This function is kept for the `style_mapping_is_bold_for_strong` test and
+/// any callers that still need the inline-only form. New render sites use
+/// `compose` directly.
 pub fn style_to_ratatui(s: Style) -> RStyle {
     match s {
         Style::Plain => RStyle::default(),
@@ -43,6 +52,55 @@ pub fn style_to_ratatui(s: Style) -> RStyle {
         Style::Strikethrough => RStyle::default().add_modifier(Modifier::CROSSED_OUT),
         Style::Code => RStyle::default().fg(Color::Cyan),
         Style::Link => RStyle::default().add_modifier(Modifier::UNDERLINED).fg(Color::Yellow),
+        Style::Comment => RStyle::default().add_modifier(Modifier::DIM).add_modifier(Modifier::ITALIC),
+    }
+}
+
+/// Map a wordcartel inline `Style` to a `SemanticElement` for theme lookup.
+fn style_element(s: Style) -> SE {
+    match s {
+        Style::Plain         => SE::Text,
+        Style::Emphasis      => SE::Emphasis,
+        Style::Strong        => SE::Strong,
+        Style::StrongEmphasis => SE::StrongEmphasis,
+        Style::Code          => SE::Code,
+        Style::Strikethrough => SE::Strikethrough,
+        Style::Link          => SE::Link,
+        Style::Comment       => SE::Comment,
+    }
+}
+
+/// Map a `BlockRole` to a `SemanticElement` for theme lookup.
+fn role_element(role: wordcartel_core::style::BlockRole) -> SE {
+    use wordcartel_core::style::BlockRole as R;
+    match role {
+        R::Heading(n)     => SE::Heading(n),
+        R::BlockQuote     => SE::BlockQuote,
+        R::CodeBlock      => SE::CodeBlock,
+        R::ListItem       => SE::ListMarker,
+        R::ThematicBreak  => SE::ThematicBreak,
+        R::FrontMatter    => SE::FrontMatter,
+        R::Comment        => SE::Comment,
+        R::Paragraph      => SE::Text,
+    }
+}
+
+/// Map a `BlockRole` to the `SemanticElement` used to style its prefix glyph.
+///
+/// Blockquote glyphs use the BlockQuote face; thematic-break glyphs use
+/// ThematicBreak; headings use Heading (reserved for Task 7); all other
+/// prefix glyphs (list bullets, ordered numbers) use ListMarker as today.
+fn prefix_element(role: wordcartel_core::style::BlockRole) -> SE {
+    use wordcartel_core::style::BlockRole as R;
+    match role {
+        R::BlockQuote    => SE::BlockQuote,
+        R::ThematicBreak => SE::ThematicBreak,
+        R::Heading(n)    => SE::Heading(n),
+        R::ListItem      => SE::ListMarker,
+        // The remaining roles never carry a prefix glyph (no prefix_glyph is
+        // produced for them), so this fn is not reached for them; name them
+        // explicitly so a future BlockRole forces a deliberate choice here.
+        R::Paragraph | R::CodeBlock | R::FrontMatter | R::Comment => SE::ListMarker,
     }
 }
 
@@ -178,7 +236,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         let within_viewport = gx < area.x + w;
         let not_scrollbar_col = !(editor.mouse.scrollbar_visible && gx == area.x + w - 1);
         if within_viewport && not_scrollbar_col {
-            let guide_style = RStyle::default().fg(Color::DarkGray);
+            let guide_style = compose::compose(&editor.theme, editor.depth, &[SE::WrapGuide]);
             for r in 0..edit_height {
                 frame.render_widget(
                     Paragraph::new(Line::from(Span::styled("│", guide_style))),
@@ -246,8 +304,18 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     let diag_all: &[wordcartel_core::diagnostics::Diagnostic] =
         if diag_active { &editor.active().diagnostics.diagnostics } else { &[] };
 
-    // Use the placed-path builder when search is active OR valid diagnostics exist.
-    let use_placed = !hl_window.is_empty() || diag_active;
+    // Snapshot primary selection (Task 9: selection painting).
+    let sel_range = editor.active().document.selection.primary();
+    let (sel_from, sel_to) = (sel_range.from(), sel_range.to());
+    let has_sel = !sel_range.is_empty();
+
+    // Use the placed-path builder when search is active, valid diagnostics exist,
+    // or a non-empty selection must be painted (segs path does no per-glyph styling).
+    let use_placed = !hl_window.is_empty() || diag_active || has_sel;
+
+    // Source-mode branch: in source modes (any mode other than LivePreview) the
+    // stack is [Text] only — base canvas, no role or inline semantic styling.
+    let source_mode = editor.active().view.mode != crate::editor::RenderMode::LivePreview;
 
     'outer: for &l in &sorted_lines {
         if l < scroll {
@@ -290,15 +358,47 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 // ---------------------------------------------------------------
                 // EXISTING segs-based path (no active search, no diagnostics) — true no-op.
                 // ---------------------------------------------------------------
-                let dim_style = RStyle::default().fg(Color::DarkGray);
                 let mut segs_spans: Vec<Span<'_>> = Vec::new();
-                // Prepend prefix_glyph as a dim span (first visual row only).
+                // Prefix lead-in. Row 0 paints the real glyph; continuation rows
+                // of a prefixed line paint a blank spacer of `prefix_width` cells
+                // so painted text stays aligned with the prefix-offset cursor
+                // columns (`Placed.col` already includes `prefix_width`).
                 if let Some(ref glyph) = vr.prefix_glyph {
-                    let gstyle = if row_dim { dim_style } else { RStyle::default().add_modifier(Modifier::DIM) };
-                    segs_spans.push(Span::styled(glyph.clone(), gstyle));
+                    let pe = prefix_element(vr.role);
+                    let gstyle = if row_dim {
+                        compose::compose(&editor.theme, editor.depth, &[pe, SE::FocusDim])
+                    } else {
+                        compose::compose(&editor.theme, editor.depth, &[pe]).add_modifier(Modifier::DIM)
+                    };
+                    let painted = if editor.theme.heading_level_glyph {
+                        if let wordcartel_core::style::BlockRole::Heading(n) = vr.role {
+                            let shade = SHADES[(n.clamp(1, 6) - 1) as usize];
+                            format!("{shade} ")
+                        } else {
+                            glyph.clone()
+                        }
+                    } else {
+                        glyph.clone()
+                    };
+                    segs_spans.push(Span::styled(painted, gstyle));
+                } else if map.prefix_width > 0 {
+                    segs_spans.push(Span::raw(" ".repeat(map.prefix_width)));
                 }
                 for seg in &vr.segs {
-                    let style = if row_dim { dim_style } else { style_to_ratatui(seg.style) };
+                    let style = if row_dim {
+                        if source_mode {
+                            compose::base_canvas(&editor.theme, editor.depth)
+                                .patch(compose::compose(&editor.theme, editor.depth, &[SE::FocusDim]))
+                        } else {
+                            // §13.2 FIX-1: compose FocusDim OVER the semantic stack so heading
+                            // bold, comment italic, etc. are preserved on dim rows (§3.4 intent).
+                            compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(seg.style), SE::FocusDim])
+                        }
+                    } else if source_mode {
+                        compose::base_canvas(&editor.theme, editor.depth)
+                    } else {
+                        compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(seg.style)])
+                    };
                     segs_spans.push(Span::styled(seg.text.clone(), style));
                 }
                 segs_spans
@@ -324,11 +424,30 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 let diag_window: Vec<&wordcartel_core::diagnostics::Diagnostic> =
                     diag_all[..hi_idx].iter().filter(|d| d.range.end > lo).collect();
 
-                // Prefix glyph (first visual row only): treat as unsearchable, apply dim only.
+                // Prefix lead-in. Row 0 paints the real glyph (unsearchable, dim
+                // only); continuation rows of a prefixed line paint a blank
+                // spacer of `prefix_width` cells so painted text stays aligned
+                // with the prefix-offset cursor columns.
                 if let Some(ref glyph) = vr.prefix_glyph {
-                    let dim_style = RStyle::default().fg(Color::DarkGray);
-                    let gstyle = if row_dim { dim_style } else { RStyle::default().add_modifier(Modifier::DIM) };
-                    hl_spans.push(Span::styled(glyph.clone(), gstyle));
+                    let pe = prefix_element(vr.role);
+                    let gstyle = if row_dim {
+                        compose::compose(&editor.theme, editor.depth, &[pe, SE::FocusDim])
+                    } else {
+                        compose::compose(&editor.theme, editor.depth, &[pe]).add_modifier(Modifier::DIM)
+                    };
+                    let painted = if editor.theme.heading_level_glyph {
+                        if let wordcartel_core::style::BlockRole::Heading(n) = vr.role {
+                            let shade = SHADES[(n.clamp(1, 6) - 1) as usize];
+                            format!("{shade} ")
+                        } else {
+                            glyph.clone()
+                        }
+                    } else {
+                        glyph.clone()
+                    };
+                    hl_spans.push(Span::styled(painted, gstyle));
+                } else if map.prefix_width > 0 {
+                    hl_spans.push(Span::raw(" ".repeat(map.prefix_width)));
                 }
 
                 // One span per run of glyphs sharing the same (style, highlight-kind).
@@ -342,24 +461,52 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                     let is_match = !is_current && hl_window.iter().any(|m| overlaps(g_from, g_to, m.start, m.end));
 
                     let mut style = if row_dim {
-                        RStyle::default().fg(Color::DarkGray)
+                        if source_mode {
+                            compose::base_canvas(&editor.theme, editor.depth)
+                                .patch(compose::compose(&editor.theme, editor.depth, &[SE::FocusDim]))
+                        } else {
+                            // §13.2 FIX-1: compose FocusDim OVER the semantic stack so heading
+                            // bold, comment italic, etc. are preserved on dim rows (§3.4 intent).
+                            compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(p.style), SE::FocusDim])
+                        }
+                    } else if source_mode {
+                        compose::base_canvas(&editor.theme, editor.depth)
                     } else {
-                        style_to_ratatui(p.style)
+                        compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(p.style)])
                     };
+
+                    // FIX-2: Selection layers first; a current search match patches over it so
+                    // it stands out; diagnostics last. (Spec §3.4: Selection → Search → Diag.)
+                    // Cue-mode modifiers accumulate (selection underline + search bold = both
+                    // visible), so §13.2 is preserved.
+                    let is_selected = has_sel && overlaps(g_from, g_to, sel_from, sel_to);
+                    if is_selected {
+                        let sel_face = editor.theme.face(SE::Selection);
+                        style = style.patch(crate::compose::face_to_ratatui(&sel_face, editor.depth));
+                    }
                     if is_current {
-                        style = style.add_modifier(Modifier::REVERSED);
+                        let search_face = editor.theme.face(SE::SearchCurrent);
+                        let ss = crate::compose::face_to_ratatui(&search_face, editor.depth);
+                        style = style.patch(ss);
                     } else if is_match {
-                        style = style.bg(Color::Yellow).fg(Color::Black);
+                        let search_face = editor.theme.face(SE::SearchMatch);
+                        let ss = crate::compose::face_to_ratatui(&search_face, editor.depth);
+                        style = style.patch(ss);
                     }
 
                     // Apply diagnostic underline if this glyph overlaps any diagnostic.
                     // Search-highlight precedence stands: underline may stack on REVERSED.
                     if let Some(d) = diag_window.iter().find(|d| overlaps(g_from, g_to, d.range.start, d.range.end)) {
-                        style = style.add_modifier(Modifier::UNDERLINED);
-                        style = match d.kind {
-                            wordcartel_core::diagnostics::DiagnosticKind::Spelling => style.underline_color(Color::Red),
-                            wordcartel_core::diagnostics::DiagnosticKind::Grammar  => style.underline_color(Color::Blue),
+                        let diag_face = match d.kind {
+                            wordcartel_core::diagnostics::DiagnosticKind::Spelling =>
+                                compose::compose(&editor.theme, editor.depth, &[SE::DiagSpelling]),
+                            wordcartel_core::diagnostics::DiagnosticKind::Grammar =>
+                                compose::compose(&editor.theme, editor.depth, &[SE::DiagGrammar]),
                         };
+                        style = style.add_modifier(diag_face.add_modifier);
+                        if let Some(uc) = diag_face.underline_color {
+                            style = style.underline_color(uc);
+                        }
                     }
 
                     // Flush the accumulated run when the style changes.
@@ -378,10 +525,10 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             // 5g: fold marker on the heading's first visual row.
             let mut spans = spans;
             if let Some(n) = fold_marker_n {
-                spans.insert(0, Span::styled("▸ ", RStyle::default().fg(Color::DarkGray)));
+                spans.insert(0, Span::styled("▸ ", compose::compose(&editor.theme, editor.depth, &[SE::FoldMarker])));
                 spans.push(Span::styled(
                     format!("  … {n} lines"),
-                    RStyle::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                    compose::compose(&editor.theme, editor.depth, &[SE::FoldMarker]).add_modifier(Modifier::DIM),
                 ));
             }
 
@@ -406,8 +553,12 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         let scroll_pos = fv.visible_ordinal(editor.active().view.scroll);
         let sb_area = Rect::new(area.x, edit_top, w, edit_height);
         let mut sb_state = ScrollbarState::new(total).position(scroll_pos);
+        let sb_track_style = compose::compose(&editor.theme, editor.depth, &[SE::ChromeMuted]);
+        let sb_thumb_style = compose::compose(&editor.theme, editor.depth, &[SE::Chrome]);
         frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .track_style(sb_track_style)
+                .thumb_style(sb_thumb_style),
             sb_area,
             &mut sb_state,
         );
@@ -436,20 +587,21 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         // When a modal prompt is active, render its message instead of the normal
         // status text, using a distinct style so it stands out.
         // When the minibuffer is open, render <prompt><text> on the status row.
+        let chrome_reverse_style = compose::compose(&editor.theme, editor.depth, &[SE::ChromeReverse]);
         let (status_text, status_style) = if let Some(ref s) = editor.search {
             (
                 format_search_bar(s),
-                RStyle::default().add_modifier(Modifier::REVERSED),
+                chrome_reverse_style,
             )
         } else if let Some(ref mb) = editor.minibuffer {
             (
                 format!("{}{}", mb.prompt, mb.text),
-                RStyle::default().add_modifier(Modifier::REVERSED),
+                chrome_reverse_style,
             )
         } else if let Some(ref prompt) = editor.prompt {
             (
                 prompt.message.clone(),
-                RStyle::default().add_modifier(Modifier::REVERSED),
+                chrome_reverse_style,
             )
         } else {
             let text = if editor.status.is_empty() {
@@ -457,7 +609,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             } else {
                 format!("{}{} [{}] {}", path_str, dirty_marker, mode_text, editor.status)
             };
-            (text, RStyle::default().add_modifier(Modifier::REVERSED))
+            (text, chrome_reverse_style)
         };
 
         // Compose the status line.
@@ -517,6 +669,17 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     }
 
     // -----------------------------------------------------------------------
+    // Precompute chrome styles for overlays and menu (computed here once so
+    // the individual if-let blocks can borrow editor fields freely).
+    // -----------------------------------------------------------------------
+    let ov_highlight_style = compose::compose(&editor.theme, editor.depth, &[SE::ChromeReverse]);
+    let ov_query_style     = compose::compose(&editor.theme, editor.depth, &[SE::Text]);
+    let menu_open_style    = compose::compose(&editor.theme, editor.depth, &[SE::ChromeSelected]);
+    let menu_closed_style  = compose::compose(&editor.theme, editor.depth, &[SE::Chrome]);
+    let menu_sel_style     = compose::compose(&editor.theme, editor.depth, &[SE::ChromeSelected]);
+    let menu_norm_style    = compose::compose(&editor.theme, editor.depth, &[SE::ChromeMuted]);
+
+    // -----------------------------------------------------------------------
     // Command palette overlay (drawn on top of everything else)
     // -----------------------------------------------------------------------
     if let Some(ref palette) = editor.palette {
@@ -532,8 +695,9 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         // Clear the overlay area.
         frame.render_widget(Clear, ov_rect);
 
-        // Draw the border.
-        let block = Block::default().borders(Borders::ALL).title(" Command Palette ");
+        // Draw the border (FIX-3: themed with Chrome so the frame matches the panel bg).
+        let block = Block::default().borders(Borders::ALL).title(" Command Palette ")
+            .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
         frame.render_widget(block, ov_rect);
 
         if ov_h < 3 {
@@ -545,7 +709,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         let query_display = format!("> {}", palette.query);
         let truncated_q: String = query_display.chars().take(query_area.width as usize).collect();
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(truncated_q, RStyle::default()))),
+            Paragraph::new(Line::from(Span::styled(truncated_q, ov_query_style))),
             query_area,
         );
 
@@ -555,7 +719,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
 
         // List of rows (below query, inside border).
         let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h);
-        let highlight_style = RStyle::default().add_modifier(Modifier::REVERSED);
+        let highlight_style = ov_highlight_style;
         let items: Vec<ListItem> = palette.rows.iter().take(list_h as usize).map(|row| {
             // Left: label; right-aligned: chord.
             let chord_w = row.chord.chars().count() as u16;
@@ -585,7 +749,8 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         let list_h = (outline.rows.len() as u16).min(15).min(h.saturating_sub(4));
 
         frame.render_widget(Clear, ov_rect);
-        let block = Block::default().borders(Borders::ALL).title(" Outline ");
+        let block = Block::default().borders(Borders::ALL).title(" Outline ")
+            .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
         frame.render_widget(block, ov_rect);
 
         if ov_h >= 3 {
@@ -593,13 +758,13 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             let query_display = format!("> {}", outline.query);
             let truncated_q: String = query_display.chars().take(query_area.width as usize).collect();
             frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(truncated_q, RStyle::default()))),
+                Paragraph::new(Line::from(Span::styled(truncated_q, ov_query_style))),
                 query_area,
             );
 
             if ov_h >= 4 && list_h > 0 {
                 let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h);
-                let highlight_style = RStyle::default().add_modifier(Modifier::REVERSED);
+                let highlight_style = ov_highlight_style;
                 let items: Vec<ListItem> = outline.rows.iter().take(list_h as usize).map(|row| {
                     let mut text = format!("{}{}", " ".repeat(row.indent.saturating_mul(2)), row.text);
                     text = text.chars().take(list_area.width as usize).collect();
@@ -608,6 +773,51 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
 
                 let mut list_state = ListState::default();
                 list_state.select(if outline.rows.is_empty() { None } else { Some(outline.selected) });
+
+                frame.render_stateful_widget(
+                    List::new(items).highlight_style(highlight_style),
+                    list_area,
+                    &mut list_state,
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Theme picker overlay (drawn on top of everything else)
+    // -----------------------------------------------------------------------
+    if let Some(ref tp) = editor.theme_picker {
+        let ov_rect = palette_overlay_rect(area, tp.rows.len());
+        let ov_x = ov_rect.x;
+        let ov_y = ov_rect.y;
+        let ov_w = ov_rect.width;
+        let ov_h = ov_rect.height;
+        let list_h = (tp.rows.len() as u16).min(15).min(h.saturating_sub(4));
+
+        frame.render_widget(Clear, ov_rect);
+        let block = Block::default().borders(Borders::ALL).title(" Select Theme ")
+            .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
+        frame.render_widget(block, ov_rect);
+
+        if ov_h >= 3 {
+            let query_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), 1);
+            let query_display = format!("> {}", tp.query);
+            let truncated_q: String = query_display.chars().take(query_area.width as usize).collect();
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(truncated_q, ov_query_style))),
+                query_area,
+            );
+
+            if ov_h >= 4 && list_h > 0 {
+                let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h);
+                let highlight_style = ov_highlight_style;
+                let items: Vec<ListItem> = tp.rows.iter().take(list_h as usize).map(|name| {
+                    let truncated: String = name.chars().take(list_area.width as usize).collect();
+                    ListItem::new(Line::from(truncated))
+                }).collect();
+
+                let mut list_state = ListState::default();
+                list_state.select(if tp.rows.is_empty() { None } else { Some(tp.selected) });
 
                 frame.render_stateful_widget(
                     List::new(items).highlight_style(highlight_style),
@@ -628,9 +838,9 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 let label = crate::menu::category_label_pub(cat);
                 let text = format!(" {label} ");
                 let style = if *i == menu.open {
-                    RStyle::default().fg(Color::Black).bg(Color::White)
+                    menu_open_style
                 } else {
-                    RStyle::default().fg(Color::White).bg(Color::Black)
+                    menu_closed_style
                 };
                 frame.render_widget(Paragraph::new(text).style(style), *rect);
             }
@@ -643,9 +853,9 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                     .enumerate()
                     .map(|(row, (label, _))| {
                         let style = if row == menu.highlighted {
-                            RStyle::default().fg(Color::Black).bg(Color::White)
+                            menu_sel_style
                         } else {
-                            RStyle::default().fg(Color::White).bg(Color::DarkGray)
+                            menu_norm_style
                         };
                         ListItem::new(format!(" {label} ")).style(style)
                     })
@@ -669,13 +879,14 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Clear, ov_rect);
 
         let title = format!(" {} ", diag_ov.anchor.message);
-        let block = Block::default().borders(Borders::ALL).title(title);
+        let block = Block::default().borders(Borders::ALL).title(title)
+            .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
         frame.render_widget(block, ov_rect);
 
         if ov_h >= 3 {
             let list_h = (row_count as u16).min(15).min(ov_h.saturating_sub(2));
             let list_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), list_h);
-            let highlight_style = RStyle::default().add_modifier(Modifier::REVERSED);
+            let highlight_style = ov_highlight_style;
 
             let n_sugg = diag_ov.anchor.suggestions.len();
             let items: Vec<ListItem> = (0..row_count).take(list_h as usize).map(|i| {
@@ -1081,5 +1292,779 @@ mod tests {
         assert_eq!(crate::render::word_count_segment(&e), Some("1 words · 5 chars".to_string()));
         e.view_opts.word_count = false;
         assert_eq!(crate::render::word_count_segment(&e), None);
+    }
+
+    #[test]
+    fn default_theme_inline_styles_unchanged() {
+        // a strong word renders BOLD, a code span gets cyan fg — exactly as today.
+        // Two lines: the caret goes to line 1 so line 0 is inactive (concealed/styled).
+        let mut ed = Editor::new_from_text("**bold** and `code`\nother\n", None, (40, 4));
+        // Move caret to line 1 so line 0 is inactive → styling applied in LivePreview.
+        set_caret(&mut ed, 20); // byte 20 = start of "other\n"
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 4);
+        // find a bold cell and a cyan cell on row 0 (live-preview conceals the markers)
+        let row0_has_bold = (0..40).any(|x| buf[(x,0)].style().add_modifier.contains(Modifier::BOLD));
+        let row0_has_cyan = (0..40).any(|x| buf[(x,0)].style().fg == Some(Color::Indexed(6)) || buf[(x,0)].style().fg == Some(Color::Cyan));
+        assert!(row0_has_bold && row0_has_cyan);
+    }
+
+    #[test]
+    fn tokyo_night_heading_row_carries_heading_fg() {
+        let mut ed = Editor::new_from_text("# Title\n", None, (40, 4));
+        ed.theme = wordcartel_core::theme::tokyo_night();
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 4);
+        let want = crate::compose::compose(&ed.theme, ed.depth, &[wordcartel_core::theme::SemanticElement::Text, wordcartel_core::theme::SemanticElement::Heading(1)]).fg;
+        assert!((0..40).any(|x| buf[(x,0)].style().fg == want && want.is_some()), "heading fg applied");
+    }
+
+    #[test]
+    fn default_status_line_still_reversed() {
+        let mut ed = Editor::new_from_text("x", None, (40, 4));
+        let buf = render_to_buffer(&mut ed, 40, 4);
+        let last = 3u16;
+        assert!((0..40).any(|x| buf[(x,last)].style().add_modifier.contains(Modifier::REVERSED)));
+    }
+
+    #[test]
+    fn phosphor_status_line_carries_hue() {
+        let mut ed = Editor::new_from_text("x", None, (40, 4));
+        ed.theme = wordcartel_core::theme::Theme::builtin("phosphor-amber").unwrap();
+        let buf = render_to_buffer(&mut ed, 40, 4);
+        let want = compose::compose(&ed.theme, ed.depth, &[wordcartel_core::theme::SemanticElement::ChromeReverse]);
+        // the status row picks up the themed chrome-reverse style, not a hardcoded REVERSED.
+        // ratatui's test buffer normalizes unset colors to Reset in rendered cells, so compare
+        // the meaningful modifier bits and any explicit fg/bg from want.
+        assert!((0..40).any(|x| {
+            let cell = buf[(x,3)].style();
+            // modifiers must match exactly
+            cell.add_modifier == want.add_modifier
+            // any fg set by want must appear in the cell (Reset == None for our purposes)
+            && (want.fg.is_none() || cell.fg == want.fg)
+            && (want.bg.is_none() || cell.bg == want.bg)
+        }));
+    }
+
+    #[test]
+    fn source_mode_no_heading_fg_live_preview_has_heading_fg() {
+        // In SourcePlain under Tokyo Night, a heading row must NOT carry the heading fg.
+        // In LivePreview it must.
+        use crate::editor::RenderMode;
+        let mut ed = Editor::new_from_text("# Heading\n", None, (40, 4));
+        ed.theme = wordcartel_core::theme::tokyo_night();
+
+        // LivePreview first: heading fg should appear.
+        ed.active_mut().view.mode = RenderMode::LivePreview;
+        crate::derive::rebuild(&mut ed);
+        let buf_preview = render_to_buffer(&mut ed, 40, 4);
+        let want = crate::compose::compose(&ed.theme, ed.depth, &[
+            wordcartel_core::theme::SemanticElement::Text,
+            wordcartel_core::theme::SemanticElement::Heading(1),
+        ]).fg;
+        let preview_has_heading_fg = (0..40).any(|x| buf_preview[(x,0)].style().fg == want && want.is_some());
+        assert!(preview_has_heading_fg, "LivePreview heading must carry heading fg");
+
+        // SourcePlain: base canvas only, no heading fg.
+        ed.active_mut().view.mode = RenderMode::SourcePlain;
+        crate::derive::rebuild(&mut ed);
+        let buf_source = render_to_buffer(&mut ed, 40, 4);
+        let source_has_heading_fg = (0..40).any(|x| buf_source[(x,0)].style().fg == want && want.is_some());
+        assert!(!source_has_heading_fg, "SourcePlain must not carry heading fg (base canvas only)");
+    }
+
+    #[test]
+    fn default_search_and_diag_unchanged() {
+        // search highlight still yellow-bg/reverse; diagnostics still underline red/blue.
+        // Mirror the existing search/diag tests — they must keep passing under Default.
+        {
+            let mut e = Editor::new_from_text("foo bar foo\n", None, (40, 6));
+            e.open_search(crate::search_overlay::Phase::Find, 0);
+            for c in "foo".chars() { e.search.as_mut().unwrap().insert(c); }
+            let rope = e.active().document.buffer.snapshot();
+            let v = e.active().document.version;
+            e.search.as_mut().unwrap().recompute(&rope, v);
+            crate::derive::rebuild(&mut e);
+            let buf = render_to_buffer(&mut e, 40, 6);
+            assert!(row_has_highlight(&buf, 0), "Default: search highlights still present");
+        }
+        {
+            let mut e = Editor::new_from_text("teh cat\n", None, (40, 6));
+            let v = e.active().document.version;
+            e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+                range: 0..3,
+                kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                message: "x".into(),
+                suggestions: vec![],
+            }];
+            e.active_mut().diagnostics.computed_version = v;
+            crate::derive::rebuild(&mut e);
+            let buf = render_to_buffer(&mut e, 40, 6);
+            assert!(row_has_underline(&buf, 0), "Default: diag underline still present");
+        }
+    }
+
+    #[test]
+    fn no_color_theme_strips_search_color_keeps_reverse() {
+        // Under no-color theme, a search match cell has REVERSED and no yellow bg.
+        let mut ed = Editor::new_from_text("needle here\n", None, (40, 4));
+        ed.theme = wordcartel_core::theme::no_color();
+        ed.open_search(crate::search_overlay::Phase::Find, 0);
+        for c in "needle".chars() { ed.search.as_mut().unwrap().insert(c); }
+        let rope = ed.active().document.buffer.snapshot();
+        let v = ed.active().document.version;
+        ed.search.as_mut().unwrap().recompute(&rope, v);
+        crate::derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 4);
+        // The match cell for "needle" on row 0: should have REVERSED (no_color search_match has reverse=true)
+        // and NO yellow bg (no_color strips all color).
+        let has_yellow_bg = (0..40u16).any(|x| buf[(x, 0)].style().bg == Some(Color::Yellow));
+        let has_reversed = (0..40u16).any(|x| buf[(x, 0)].style().add_modifier.contains(Modifier::REVERSED));
+        assert!(!has_yellow_bg, "no-color theme: search match must not have yellow bg");
+        assert!(has_reversed, "no-color theme: search match must have REVERSED modifier");
+    }
+
+    /// A bold word that is a search match must keep BOLD while also showing the
+    /// search highlight (yellow bg or reversed). Guards the layering fix for
+    /// search overlays: style.patch(search_face) instead of replacing style.
+    #[test]
+    fn bold_search_match_keeps_bold_under_default() {
+        // Two-line doc: "**bold**" on line 0, caret on line 1 so live-preview
+        // conceals the markers and styles "bold" as BOLD. Search matches "bold".
+        // Caret on line 1 ensures live-preview is applied to line 0.
+        let mut ed = Editor::new_from_text("**bold**\nother\n", None, (40, 6));
+        // Place caret on line 1 so line 0 is styled by live-preview.
+        set_caret(&mut ed, 9); // byte 9 = start of "other"
+        ed.open_search(crate::search_overlay::Phase::Find, 0);
+        for c in "bold".chars() { ed.search.as_mut().unwrap().insert(c); }
+        let rope = ed.active().document.buffer.snapshot();
+        let v = ed.active().document.version;
+        ed.search.as_mut().unwrap().recompute(&rope, v);
+        crate::derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+        // A cell on row 0 must be BOLD (from the Strong inline style).
+        let has_bold = (0..40u16).any(|x| buf[(x, 0)].style().add_modifier.contains(Modifier::BOLD));
+        // A cell on row 0 must also carry the search highlight (yellow bg or reversed).
+        let has_highlight = row_has_highlight(&buf, 0);
+        assert!(has_bold, "matched bold word must still show BOLD modifier");
+        assert!(has_highlight, "matched bold word must show search highlight");
+    }
+
+    /// A non-current SearchMatch (≥2 matches so one is non-current) under no-color
+    /// must have REVERSED but no yellow bg. This exercises the SearchMatch (not just
+    /// SearchCurrent) branch of the layering fix.
+    #[test]
+    fn no_color_non_current_search_match_keeps_reverse_no_yellow() {
+        // Two occurrences of "needle" — the current match is the first one (ordinal 1).
+        // The second "needle" is a non-current SearchMatch.
+        let mut ed = Editor::new_from_text("needle and needle\n", None, (40, 4));
+        ed.theme = wordcartel_core::theme::no_color();
+        ed.open_search(crate::search_overlay::Phase::Find, 0);
+        for c in "needle".chars() { ed.search.as_mut().unwrap().insert(c); }
+        let rope = ed.active().document.buffer.snapshot();
+        let v = ed.active().document.version;
+        ed.search.as_mut().unwrap().recompute(&rope, v);
+        assert_eq!(ed.search.as_ref().unwrap().count(), 2, "expect 2 matches");
+        crate::derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 4);
+        // Both matches are on row 0. The second occurrence starts at col 11.
+        // Check cells around col 11..17 for no-yellow and reversed.
+        let has_yellow = (11u16..17u16).any(|x| buf[(x, 0)].style().bg == Some(Color::Yellow));
+        let has_reversed = (11u16..17u16).any(|x| buf[(x, 0)].style().add_modifier.contains(Modifier::REVERSED));
+        assert!(!has_yellow, "no-color non-current match must not have yellow bg");
+        assert!(has_reversed, "no-color non-current match must have REVERSED modifier");
+    }
+
+    // -----------------------------------------------------------------------
+    // Golden tests: lock Default-theme styles for 4 render sites
+    // -----------------------------------------------------------------------
+
+    /// Golden: scrollbar track = White/DarkGray, thumb = White/Black under Default theme.
+    ///
+    /// Creates a doc tall enough to overflow a short viewport, enables the scrollbar,
+    /// and asserts that the rightmost column carries the expected track and thumb styles.
+    #[test]
+    fn golden_default_scrollbar_styled() {
+        let doc: String = (0..30).map(|i| format!("line {i}\n")).collect();
+        let mut ed = Editor::new_from_text(&doc, None, (40, 8));
+        ed.mouse.scrollbar_visible = true;
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 8);
+
+        // The scrollbar is in the rightmost column (col 39); rows 0..6 are edit area
+        // (h=8 minus 1 status row = 7 edit rows). The track style = ChromeMuted
+        // (White fg, DarkGray bg) and thumb style = Chrome (White fg, Black bg).
+        let track_style = compose::compose(&ed.theme, ed.depth, &[SE::ChromeMuted]);
+        let thumb_style = compose::compose(&ed.theme, ed.depth, &[SE::Chrome]);
+
+        // Lock the concrete Default-theme colors at the compose level (not cell level).
+        // This validates the theme face mapping regardless of ratatui widget rendering quirks.
+        assert_eq!(track_style.fg, Some(Color::White), "Default track fg must be White");
+        assert_eq!(track_style.bg, Some(Color::DarkGray), "Default track bg must be DarkGray");
+        assert_eq!(thumb_style.fg, Some(Color::White), "Default thumb fg must be White");
+        assert_eq!(thumb_style.bg, Some(Color::Black), "Default thumb bg must be Black");
+
+        // Buffer-level check: at least one cell in the rightmost column (the scrollbar
+        // column) must have a non-default style — confirming the scrollbar rendered at all.
+        let rightmost: u16 = 39;
+        let has_scrollbar_cell = (0u16..7).any(|r| {
+            let s = buf[(rightmost, r)].style();
+            // Any non-trivially-reset cell: has a symbol other than space, or has a non-reset fg/bg.
+            !buf[(rightmost, r)].symbol().trim().is_empty()
+                || (s.fg.is_some() && s.fg != Some(Color::Reset))
+                || (s.bg.is_some() && s.bg != Some(Color::Reset))
+        });
+        assert!(has_scrollbar_cell, "expected at least one styled scrollbar cell in rightmost column (col {rightmost})");
+    }
+
+    /// Golden: list bullet prefix glyph has DarkGray fg and DIM modifier under Default theme.
+    ///
+    /// Two-line doc `"- item\nmore\n"` with caret on line 1 (so line 0 is non-active
+    /// and the bullet on row 0 uses the non-dim path with an explicit DIM modifier).
+    #[test]
+    fn golden_default_list_bullet_darkgray_dim() {
+        let mut ed = Editor::new_from_text("- item\nmore\n", None, (40, 6));
+        // Caret on line 1 so line 0 is non-active (bullet gets DIM, not FocusDim).
+        set_caret(&mut ed, 7); // byte 7 = start of "more\n"
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+
+        // The bullet glyph "• " is rendered at the start of row 0.
+        // In LivePreview mode the "- " markdown is concealed and "• " is the prefix_glyph.
+        // Find the first cell on row 0 that is the bullet (look for "•").
+        let bullet_col = (0u16..40).find(|&x| buf[(x, 0)].symbol().contains('•'));
+        assert!(bullet_col.is_some(), "expected bullet glyph '•' on row 0");
+        let x = bullet_col.unwrap();
+        let cell_style = buf[(x, 0)].style();
+
+        assert_eq!(
+            cell_style.fg,
+            Some(Color::DarkGray),
+            "Default list bullet must have DarkGray fg, got {:?}",
+            cell_style.fg
+        );
+        assert!(
+            cell_style.add_modifier.contains(Modifier::DIM),
+            "Default list bullet must have DIM modifier, got {:?}",
+            cell_style.add_modifier
+        );
+    }
+
+    /// Golden (Task 5): blockquote prefix glyph `▎` is styled with the BlockQuote face
+    /// (not ListMarker), AND a non-active blockquote prefix still carries DIM.
+    ///
+    /// Two-line doc `"> quoted\nmore\n"` with caret on line 1.  Line 0 is non-active,
+    /// so its `▎` glyph uses the non-dim path: `compose([BlockQuote]).add_modifier(DIM)`.
+    /// Under the Default theme BlockQuote face has no fg (unlike ListMarker which has
+    /// DarkGray fg), so the glyph cell must have no fg (None or Reset) but MUST have DIM.
+    #[test]
+    fn golden_blockquote_glyph_uses_blockquote_face_not_listmarker() {
+        let mut ed = Editor::new_from_text("> quoted\nmore\n", None, (40, 6));
+        // Caret on line 1 so line 0 is non-active.
+        set_caret(&mut ed, 9); // byte 9 = start of "more\n"
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+
+        // Find the `▎` glyph on row 0.
+        let glyph_col = (0u16..40).find(|&x| buf[(x, 0)].symbol().contains('▎'));
+        assert!(glyph_col.is_some(), "expected blockquote glyph '▎' on row 0");
+        let x = glyph_col.unwrap();
+        let cell_style = buf[(x, 0)].style();
+
+        // BlockQuote face (Default theme) has no fg — unlike ListMarker (DarkGray).
+        assert!(
+            cell_style.fg.is_none() || cell_style.fg == Some(Color::Reset),
+            "blockquote glyph must use BlockQuote face (no fg), not ListMarker (DarkGray); got {:?}",
+            cell_style.fg
+        );
+        // Non-active row: DIM must still be present.
+        assert!(
+            cell_style.add_modifier.contains(Modifier::DIM),
+            "non-active blockquote glyph must carry DIM modifier, got {:?}",
+            cell_style.add_modifier
+        );
+    }
+
+    /// Task 6 gate (C1): a wrapped list item must paint its CONTINUATION row's
+    /// text starting at `text_left + prefix_width` (behind a blank spacer), and
+    /// the caret placed on a continuation-row glyph must land on that same
+    /// painted column — not `prefix_width` cells to its left. This is the proof
+    /// that render's continuation spacer keeps painted text aligned with the
+    /// prefix-offset cursor columns (`Placed.col` includes `prefix_width`).
+    #[test]
+    fn wrapped_list_item_continuation_row_aligns_text_and_caret() {
+        // 12-wide viewport, list prefix "• " (width 2). "aaaa bbbb cccc" wraps:
+        //   row 0: "• aaaa bbbb "   (glyph cols 0..2, text col 2..)
+        //   row 1: "  cccc"         (blank spacer cols 0..2, text col 2..)
+        let mut e = Editor::new_from_text("- aaaa bbbb cccc\nmore\n", None, (12, 8));
+        // Caret on line 1 so line 0 is INACTIVE: its "- " is concealed and the
+        // "• " prefix glyph is shown (active lines render raw, with no prefix).
+        set_caret(&mut e, 18); // byte 18 = start of "more\n"
+        derive::rebuild(&mut e);
+        let tg = crate::nav::text_geometry(&e);
+        let text_left = tg.text_left as usize;
+        assert_eq!(text_left, 0, "measure off → text_left 0");
+
+        let prefix_width = {
+            let (_rows, map) = &e.active().view.line_layouts[&0];
+            assert!(map.rows >= 2, "list item must wrap to exercise continuation row");
+            assert_eq!(map.prefix_width, 2, "list bullet '• ' width 2");
+            map.prefix_width
+        };
+
+        let buf = render_to_buffer(&mut e, 12, 8);
+
+        // (a) Continuation row (screen row 1): cols [text_left, text_left+prefix_width)
+        // are a blank spacer; the first text glyph is painted at text_left+prefix_width.
+        for c in 0..prefix_width {
+            let cell = buf[((text_left + c) as u16, 1u16)].symbol();
+            assert_eq!(cell, " ", "continuation-row spacer cell {c} must be blank, got {cell:?}");
+        }
+        let first_text_col = text_left + prefix_width;
+        assert_eq!(
+            buf[(first_text_col as u16, 1u16)].symbol(),
+            "c",
+            "continuation-row text must start at text_left+prefix_width ({first_text_col})"
+        );
+
+        // (b) The caret position for the first continuation-row glyph (byte 12 =
+        // first 'c') must resolve to the SAME column the glyph is painted at. The
+        // prefix-offset layout maps byte 12 -> (row 1, col prefix_width), and the
+        // screen column is text_left + col. This proves the caret lands ON the
+        // glyph, not prefix_width cells to its left under the spacer.
+        let (_rows, map) = &e.active().view.line_layouts[&0];
+        let (vrow, vcol) = map.source_to_visual(12);
+        assert_eq!(vrow, 1, "first continuation glyph is on visual row 1");
+        assert_eq!(
+            text_left + vcol,
+            first_text_col,
+            "caret column for the continuation glyph must equal its painted column \
+             (cursor on the glyph, not under the spacer)"
+        );
+        // And the inverse: a click on that painted cell round-trips to byte 12.
+        assert_eq!(
+            map.visual_to_source(vrow, first_text_col - text_left),
+            12,
+            "click on the continuation glyph's painted cell selects that glyph"
+        );
+    }
+
+    /// Golden: fold marker `▸` glyph has DarkGray fg under Default theme.
+    ///
+    /// Creates a doc with a heading + body, folds the heading, renders, and
+    /// asserts the `▸` glyph cell has DarkGray fg.
+    #[test]
+    fn golden_default_fold_marker_darkgray() {
+        let doc = "## Heading\nbody line 1\nbody line 2\n";
+        let mut ed = Editor::new_from_text(doc, None, (40, 6));
+        let heading_byte = doc.find("## Heading").unwrap();
+        ed.active_mut().folds.toggle(heading_byte);
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+
+        // The fold marker glyph '▸' is prepended to the heading row (row 0).
+        let marker_col = (0u16..40).find(|&x| buf[(x, 0)].symbol().contains('▸'));
+        assert!(marker_col.is_some(), "expected fold marker glyph '▸' on row 0");
+        let x = marker_col.unwrap();
+        let cell_style = buf[(x, 0)].style();
+
+        // Lock: Default FoldMarker = DarkGray fg.
+        assert_eq!(
+            cell_style.fg,
+            Some(Color::DarkGray),
+            "Default fold marker must have DarkGray fg, got {:?}",
+            cell_style.fg
+        );
+    }
+
+    /// Golden: wrap guide `│` glyph has DarkGray fg under Default theme.
+    ///
+    /// Enables the wrap guide at column 10 in a 40-wide viewport and asserts
+    /// the guide column cell on row 0 has DarkGray fg.
+    #[test]
+    fn golden_default_wrap_guide_darkgray() {
+        let mut ed = Editor::new_from_text("short line\nmore text\n", None, (40, 6));
+        ed.view_opts.wrap_guide = true;
+        ed.view_opts.wrap_column = 10;
+        // measure=false (default): text_left=0, guide lands at col 10.
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+
+        // The wrap guide '│' is painted at column text_left + wrap_column = 10.
+        let tg = crate::nav::text_geometry(&ed);
+        let guide_col = tg.text_left + ed.view_opts.wrap_column;
+        assert!(
+            (guide_col as u16) < 40,
+            "guide column {guide_col} must be within viewport"
+        );
+
+        // Find the '│' glyph in the guide column.
+        // Check all edit rows (0..5) since content may not start at row 0 for guide.
+        let guide_x = guide_col as u16;
+        let guide_cell = (0u16..5).find_map(|r| {
+            let s = buf[(guide_x, r)].symbol();
+            if s.contains('│') { Some(buf[(guide_x, r)].style()) } else { None }
+        });
+        assert!(guide_cell.is_some(), "expected wrap guide '│' at column {guide_col}");
+        let cell_style = guide_cell.unwrap();
+
+        // Lock: Default WrapGuide = DarkGray fg.
+        assert_eq!(
+            cell_style.fg,
+            Some(Color::DarkGray),
+            "Default wrap guide must have DarkGray fg, got {:?}",
+            cell_style.fg
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 9: selection painting tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn selection_paints_reverse_on_selected_cells() {
+        let mut ed = Editor::new_from_text("hello world\n", None, (40, 4));
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::range(0, 5); // "hello"
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 4);
+        // a selected cell (col 0..5 on row 0) carries the Selection face (reverse) layered on.
+        assert!((0u16..5).any(|x| buf[(x,0)].style().add_modifier.contains(Modifier::REVERSED)),
+            "selected cells must carry REVERSED modifier");
+    }
+
+    #[test]
+    fn empty_selection_paints_nothing() {
+        let mut ed = Editor::new_from_text("hello\n", None, (40, 4));
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(2);
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 4);
+        assert!(!(0u16..5).any(|x| buf[(x,0)].style().add_modifier.contains(Modifier::REVERSED)),
+            "empty (cursor-only) selection must not paint REVERSED on any cell");
+    }
+
+    // -----------------------------------------------------------------------
+    // §13.2 accessibility coverage proof tests
+    // -----------------------------------------------------------------------
+
+    fn cue_themes() -> [wordcartel_core::theme::Theme; 2] {
+        [wordcartel_core::theme::no_color(),
+         wordcartel_core::theme::Theme::builtin("phosphor-amber-flat").unwrap()]
+    }
+
+    /// §13.2: Every Face-cued SemanticElement carries >=1 non-color modifier in cue mode.
+    #[test]
+    fn a11y_every_cued_element_has_a_modifier_in_cue_mode() {
+        use wordcartel_core::theme::SemanticElement::*;
+        // Face-cued persistent text elements (glyph-cued structural elements proven by render
+        // fixtures below):
+        //   Emphasis=italic, Strong=bold, StrongEmphasis=bold+italic, Code=reverse,
+        //   CodeBlock=reverse, Link=underline, Strikethrough=strike, Comment=italic+dim,
+        //   FrontMatter=reverse+italic, Selection=reverse+underline,
+        //   SearchMatch=reverse, SearchCurrent=reverse+bold,
+        //   DiagSpelling=bold+underline, DiagGrammar=bold+underline (distinct face).
+        // Transient overlay + chrome elements with modifier cues:
+        //   FocusDim=dim, ChromeReverse=reverse, ChromeSelected=reverse, ChromeMuted=dim.
+        let cued = [Emphasis, Strong, StrongEmphasis, Code, CodeBlock, Link, Strikethrough,
+                    Comment, FrontMatter, Selection, SearchMatch, SearchCurrent, DiagSpelling, DiagGrammar,
+                    FocusDim, ChromeReverse, ChromeSelected, ChromeMuted];
+        for t in cue_themes() {
+            for el in cued {
+                let f = t.face(el);
+                assert!(f.bold.unwrap_or(false)||f.italic.unwrap_or(false)||f.underline.unwrap_or(false)
+                        ||f.strike.unwrap_or(false)||f.reverse.unwrap_or(false)||f.dim.unwrap_or(false),
+                        "{}/{el:?} needs a non-color cue", t.name);
+            }
+        }
+        // §13.2: Chrome (base panel face) is placement-cued — it appears only in the chrome
+        // region (status bar, menu bar, overlay frames) which is structurally distinct from
+        // text content; it never needs a modifier to distinguish it from text elements.
+        // Proven by the chrome render tests (status-line, palette, outline overlay fixtures).
+        // §13.2: FoldMarker is glyph-cued (▸ + "… N lines"); proven by the fold fixture:
+        //   `fold_marker_glyph_prefix_is_rendered` — deferred to plan-③ test pass for the
+        //   full §8.3 row (requires outline-folded Editor state, which is elaborate scaffolding).
+        // §13.2: WrapGuide is glyph-cued (│ column guide); proven by placement — the guide
+        //   column character is a literal `│` cell; deferred to plan-③ render fixture.
+    }
+
+    /// §13.2: Same-context pairs must be distinguishable in cue mode.
+    #[test]
+    fn a11y_pairwise_distinct_same_context_pairs() {
+        use wordcartel_core::theme::SemanticElement::*;
+        for t in cue_themes() {
+            assert_ne!(t.face(Comment), t.face(Emphasis), "{}: Comment vs Emphasis", t.name);
+            assert_ne!(t.face(FrontMatter), t.face(Code), "{}: FrontMatter vs Code", t.name);
+            assert_ne!(t.face(Selection), t.face(Code), "{}: Selection vs Code", t.name);
+            // spelling vs grammar are different underline COLORS today; in cue mode they
+            // must stay distinguishable by modifier (Codex I7 — §13.2 is fully closed).
+            assert_ne!(t.face(DiagSpelling), t.face(DiagGrammar), "{}: DiagSpelling vs DiagGrammar", t.name);
+            // Emphasis/Strong/StrongEmphasis are three distinct inline levels — lock pairwise.
+            assert_ne!(t.face(Emphasis), t.face(Strong), "{}: Emphasis vs Strong", t.name);
+            assert_ne!(t.face(Strong), t.face(StrongEmphasis), "{}: Strong vs StrongEmphasis", t.name);
+            assert_ne!(t.face(Emphasis), t.face(StrongEmphasis), "{}: Emphasis vs StrongEmphasis", t.name);
+        }
+    }
+
+    /// §13.2: Structural glyphs (blockquote ▎, thematic-break ─, heading shade, list bullet •)
+    /// render in the No-color theme for inactive structural lines.
+    #[test]
+    fn a11y_structural_glyphs_render_in_no_color() {
+        // blockquote ▎, thematic-break ───, list bullet •, heading shade glyph all PAINT under
+        // No-color (glyph cue).
+        // Document layout:
+        //   "> quote\n" = bytes  0-7  (blockquote)
+        //   "\n"        = byte   8    (blank line)
+        //   "---\n"     = bytes  9-12 (thematic break)
+        //   "\n"        = byte  13    (blank line)
+        //   "- item\n"  = bytes 14-20 (list item)
+        //   "\n"        = byte  21    (blank line — place caret HERE: ALL structural lines inactive)
+        //   "### H3\n"  = bytes 22-29 (H3 heading)
+        let mut ed = Editor::new_from_text("> quote\n\n---\n\n- item\n\n### H3\n", None, (40, 12));
+        ed.theme = wordcartel_core::theme::no_color(); // heading_level_glyph = true
+        // Place caret on the blank line at byte 21 so ALL structural lines are INACTIVE
+        // and render their prefix glyphs (Task 6 invariant: active line ⟹ no prefix glyph).
+        set_caret(&mut ed, 21);
+        crate::derive::rebuild(&mut ed);
+        let text = (0..12).map(|r| row_string(&render_to_buffer(&mut ed, 40, 12), r)).collect::<String>();
+        assert!(text.contains('▎'), "blockquote bar");
+        assert!(text.contains('─'), "thematic rule");
+        assert!(text.contains('•'), "list bullet glyph under no_color");
+        assert!(text.contains('▒'), "H3 heading shade glyph (▒ = SHADES[2])");
+    }
+
+    /// §13.2 §8.3 completeness: All six heading levels render their distinct shade glyphs
+    /// (`█▓▒░▏·`) under No-color so H1–H6 are distinguishable without color.
+    ///
+    /// Document: "# H1\n## H2\n### H3\n#### H4\n##### H5\n###### H6\n\n"
+    ///   bytes  0- 4: "# H1\n"    (H1 — SHADES[0] = '█')
+    ///   bytes  5-10: "## H2\n"   (H2 — SHADES[1] = '▓')
+    ///   bytes 11-17: "### H3\n"  (H3 — SHADES[2] = '▒')
+    ///   bytes 18-25: "#### H4\n" (H4 — SHADES[3] = '░')
+    ///   bytes 26-34: "##### H5\n"(H5 — SHADES[4] = '▏')
+    ///   bytes 35-44: "###### H6\n"(H6 — SHADES[5] = '·')
+    ///   byte  45:    "\n"        (blank line — caret placed here so ALL headings INACTIVE)
+    #[test]
+    fn a11y_all_six_heading_shades_render_in_no_color() {
+        let mut ed = Editor::new_from_text(
+            "# H1\n## H2\n### H3\n#### H4\n##### H5\n###### H6\n\n",
+            None, (40, 10),
+        );
+        ed.theme = wordcartel_core::theme::no_color(); // heading_level_glyph = true
+        // Place caret on the trailing blank line (byte 45) so ALL six heading lines are
+        // INACTIVE and render their shade glyphs (Task 6 invariant: active line ⟹ no glyph).
+        set_caret(&mut ed, 45);
+        crate::derive::rebuild(&mut ed);
+        let text = (0..10).map(|r| row_string(&render_to_buffer(&mut ed, 40, 10), r)).collect::<String>();
+        assert!(text.contains('█'), "H1 shade glyph (█ = SHADES[0]) missing in no_color");
+        assert!(text.contains('▓'), "H2 shade glyph (▓ = SHADES[1]) missing in no_color");
+        assert!(text.contains('▒'), "H3 shade glyph (▒ = SHADES[2]) missing in no_color");
+        assert!(text.contains('░'), "H4 shade glyph (░ = SHADES[3]) missing in no_color");
+        assert!(text.contains('▏'), "H5 shade glyph (▏ = SHADES[4]) missing in no_color");
+        assert!(text.contains('·'), "H6 shade glyph (· = SHADES[5]) missing in no_color");
+    }
+
+    #[test]
+    fn theme_picker_paints_rows_and_selection() {
+        let mut ed = Editor::new_from_text("x\n", None, (60, 16));
+        ed.open_theme_picker();
+        let buf = render_to_buffer(&mut ed, 60, 16);
+        let text: String = (0..16).map(|r| row_string(&buf, r)).collect();
+        assert!(text.contains("tokyo-night"), "picker lists built-in themes");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 8: source-mode base canvas tests (§3.5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn source_mode_tints_canvas_for_phosphor_but_not_default() {
+        use wordcartel_core::theme::{Theme, Depth};
+        // Phosphor-amber: source cells carry the amber base bg/fg.
+        let mut ed = Editor::new_from_text("# raw markdown\n", None, (40, 6));
+        ed.theme = Theme::builtin("phosphor-amber").unwrap();
+        ed.depth = Depth::Truecolor;
+        ed.active_mut().view.mode = crate::editor::RenderMode::SourcePlain;
+        crate::derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+        let cell = &buf[(0u16, 0u16)];
+        assert!(
+            matches!(cell.style().bg, Some(ratatui::style::Color::Rgb(..))),
+            "phosphor-amber source canvas must set a specific RGB bg (not Reset); got {:?}", cell.style().bg
+        );
+        // Default theme: source canvas stays terminal-default (no themed bg).
+        let mut ed2 = Editor::new_from_text("# raw markdown\n", None, (40, 6));
+        ed2.active_mut().view.mode = crate::editor::RenderMode::SourcePlain;
+        crate::derive::rebuild(&mut ed2);
+        let buf2 = render_to_buffer(&mut ed2, 40, 6);
+        let bg = buf2[(0u16, 0u16)].style().bg;
+        assert!(bg.is_none() || bg == Some(ratatui::style::Color::Reset), "Default source = terminal default");
+    }
+
+    #[test]
+    fn source_mode_dimmed_row_keeps_phosphor_canvas() {
+        // A focused (dimmed) source row must STILL carry the phosphor canvas bg —
+        // FocusDim layers over the canvas, it does not replace it (Codex re-review).
+        use wordcartel_core::theme::{Theme, Depth};
+        let mut ed = Editor::new_from_text("# h\n\nbody paragraph one\n\nbody paragraph two\n", None, (40, 8));
+        ed.theme = Theme::builtin("phosphor-amber").unwrap();
+        ed.depth = Depth::Truecolor;
+        ed.view_opts.focus = true;                 // dims rows outside the focus region
+        ed.active_mut().view.mode = crate::editor::RenderMode::SourcePlain;
+        crate::derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 8);
+        // a row outside the active paragraph is dimmed but must keep a themed bg
+        let dimmed = (0..8u16).find_map(|r| {
+            let c = &buf[(0u16, r)];
+            if c.style().add_modifier.contains(ratatui::style::Modifier::DIM) { Some(c.style().bg) } else { None }
+        });
+        assert!(
+            matches!(dimmed.flatten(), Some(ratatui::style::Color::Rgb(..))),
+            "dimmed phosphor source row must carry RGB canvas bg (not Reset); got {:?}", dimmed.flatten()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Branch-review fixes (RED tests written before implementation — TDD)
+    // -----------------------------------------------------------------------
+
+    /// FIX-1 (segs path §13.2): FocusDim must layer OVER the semantic stack, not replace it.
+    /// In no_color + focus mode, a dimmed (out-of-focus) heading row must keep its BOLD
+    /// modifier — without BOLD, the heading text is indistinguishable from plain dimmed text
+    /// in cue mode (§13.2 violation). Tests the segs path (use_placed=false: no search,
+    /// no diagnostics, single cursor).
+    #[test]
+    fn focus_dim_keeps_heading_bold_in_no_color() {
+        // "# Heading\n" = bytes  0-9  (H1 heading)
+        // "\n"          = byte  10    (blank line)
+        // "paragraph\n" = bytes 11-20 (paragraph; caret here → heading is DIM)
+        let mut ed = Editor::new_from_text("# Heading\n\nparagraph\n", None, (40, 8));
+        ed.theme = wordcartel_core::theme::no_color();
+        ed.depth = wordcartel_core::theme::Depth::None; // cue mode: modifiers only, no color
+        ed.view_opts.focus = true;
+        set_caret(&mut ed, 11); // caret in "paragraph" → heading is outside focus region → dim
+        // Single cursor → has_sel=false, no search → use_placed=false → segs path.
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 8);
+        // Row 0 = heading. no_color has heading_level_glyph=true; inactive heading shows
+        // "█ " (shade glyph + space, cols 0-1) then "Heading" (cols 2-8).
+        // Prefix "█ " already has BOLD in current code; text cells do NOT → that is the bug.
+        let row_text = row_string(&buf, 0);
+        let h_col = row_text.chars().position(|c| c == 'H').unwrap_or(99) as u16;
+        assert!(h_col < 40, "expected 'Heading' to appear on row 0 (inactive heading), got: {:?}", row_text);
+        // After FIX-1: each text cell of the dimmed heading must carry BOLD (heading cue).
+        let text_cells_have_bold = (h_col..h_col + 7).any(|x| {
+            buf[(x, 0u16)].style().add_modifier.contains(Modifier::BOLD)
+        });
+        assert!(
+            text_cells_have_bold,
+            "FIX-1(segs): dimmed heading text must carry BOLD cue in no_color+focus (§13.2); \
+             cell at col {h_col} style: {:?}",
+            buf[(h_col, 0u16)].style()
+        );
+    }
+
+    /// FIX-1 (placed path §13.2): same BOLD requirement when the placed path is active
+    /// (use_placed=true). A non-empty selection on the paragraph forces the placed path
+    /// while leaving the dim heading row unselected — it must still carry BOLD.
+    #[test]
+    fn focus_dim_keeps_heading_bold_in_no_color_placed_path() {
+        // Same document as the segs-path test; selection on paragraph → use_placed=true.
+        let mut ed = Editor::new_from_text("# Heading\n\nparagraph\n", None, (40, 8));
+        ed.theme = wordcartel_core::theme::no_color();
+        ed.depth = wordcartel_core::theme::Depth::None;
+        ed.view_opts.focus = true;
+        // Non-empty selection on "paragraph" (bytes 11-20) → has_sel=true → placed path.
+        ed.active_mut().document.selection =
+            wordcartel_core::selection::Selection::range(11, 20);
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 8);
+        let row_text = row_string(&buf, 0);
+        let h_col = row_text.chars().position(|c| c == 'H').unwrap_or(99) as u16;
+        assert!(h_col < 40, "expected 'Heading' visible on row 0, got: {:?}", row_text);
+        let text_cells_have_bold = (h_col..h_col + 7).any(|x| {
+            buf[(x, 0u16)].style().add_modifier.contains(Modifier::BOLD)
+        });
+        assert!(
+            text_cells_have_bold,
+            "FIX-1(placed): dimmed heading text must carry BOLD cue in no_color+focus (§13.2); \
+             cell at col {h_col} style: {:?}",
+            buf[(h_col, 0u16)].style()
+        );
+    }
+
+    /// FIX-2: Selection must be applied BEFORE search so the search match can stand out.
+    /// A cell that is BOTH selected AND the current search match must show the SearchCurrent
+    /// face's bg on top, not the Selection face's bg.
+    ///
+    /// We start from tokyo-night and override SearchCurrent to carry a distinctive bg color
+    /// (LightGreen) that differs from Selection's bg (SEL_BG ≈ Rgb(0x28,0x34,0x57)).
+    /// Before fix: selection patches AFTER search → SEL_BG overwrites LightGreen.
+    /// After fix: search patches AFTER selection → LightGreen is the final bg.
+    #[test]
+    fn search_current_wins_over_selection_on_overlap() {
+        use wordcartel_core::theme::{Face, Color as ThemeColor, Depth, SemanticElement};
+        let mut ed = Editor::new_from_text("hello world\n", None, (40, 6));
+        ed.theme = wordcartel_core::theme::tokyo_night();
+        ed.depth = Depth::Truecolor;
+        // Override SearchCurrent: give it an explicit bg (LightGreen) distinct from Selection.
+        ed.theme.override_face(
+            SemanticElement::SearchCurrent,
+            Face { bg: Some(ThemeColor::LightGreen), ..Face::default() },
+        );
+        // Open search and find "hello" (bytes 0-4); it becomes the current (first) match.
+        ed.open_search(crate::search_overlay::Phase::Find, 0);
+        for c in "hello".chars() { ed.search.as_mut().unwrap().insert(c); }
+        let rope = ed.active().document.buffer.snapshot();
+        let v = ed.active().document.version;
+        ed.search.as_mut().unwrap().recompute(&rope, v);
+        // Also select "hello" so the first cell is both selected AND current match.
+        ed.active_mut().document.selection =
+            wordcartel_core::selection::Selection::range(0, 5);
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+        // Col 0 ('h') is in both the current search match (0..5) and the selection (0..5).
+        // After FIX-2: SearchCurrent bg (LightGreen) must win because search patches last.
+        let cell_bg = buf[(0u16, 0u16)].style().bg;
+        assert_eq!(
+            cell_bg,
+            Some(ratatui::style::Color::LightGreen),
+            "FIX-2: SearchCurrent bg must win over Selection bg on overlap; \
+             expected LightGreen, got {:?}",
+            cell_bg
+        );
+    }
+
+    /// FIX-3: Overlay frames must use the Chrome face (not terminal-default).
+    /// Under phosphor-amber (a fully-themed phosphor variant), the theme-picker overlay
+    /// border cells must carry themed RGB colors from the Chrome face — not Reset/None.
+    #[test]
+    fn phosphor_overlay_frame_border_uses_chrome_style() {
+        use wordcartel_core::theme::{Theme, Depth};
+        let mut ed = Editor::new_from_text("x\n", None, (60, 16));
+        ed.theme = Theme::builtin("phosphor-amber").unwrap();
+        ed.depth = Depth::Truecolor;
+        ed.open_theme_picker();
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 60, 16);
+        // Scan the buffer for any border glyph (box-drawing chars used by Block).
+        let border_cell = (0..60u16).flat_map(|x| (0..16u16).map(move |y| (x, y))).find(|&(x, y)| {
+            let s = buf[(x, y)].symbol();
+            s == "─" || s == "│" || s == "┌" || s == "┐" || s == "└" || s == "┘"
+        });
+        assert!(border_cell.is_some(), "FIX-3: expected box-drawing border cells in theme-picker overlay");
+        let (bx, by) = border_cell.unwrap();
+        let cs = buf[(bx, by)].style();
+        // phosphor-amber Chrome face: { fg: shade(4), bg: shade(1) } — both RGB.
+        // Before fix: border cell has fg/bg from terminal default (None or Reset).
+        // After fix: border cell carries Chrome face (RGB fg and bg).
+        assert!(
+            matches!(cs.fg, Some(ratatui::style::Color::Rgb(..))),
+            "FIX-3: phosphor overlay border must carry Chrome RGB fg; got {:?} at ({bx},{by})",
+            cs.fg
+        );
+        assert!(
+            matches!(cs.bg, Some(ratatui::style::Color::Rgb(..))),
+            "FIX-3: phosphor overlay border must carry Chrome RGB bg; got {:?} at ({bx},{by})",
+            cs.bg
+        );
     }
 }

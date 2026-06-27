@@ -12,8 +12,8 @@ fn cursor_crosses_logical_lines_at_desired_col() {
     let text = buf.to_string();
     let lines: Vec<&str> = text.split('\n').collect();
 
-    let (_r0, map0) = layout(lines[0], BlockRole::Paragraph, true, 80);
-    let (_r1, map1) = layout(lines[1], BlockRole::Paragraph, false, 80);
+    let (_r0, map0) = layout(lines[0], BlockRole::Paragraph, true, 80, false);
+    let (_r1, map1) = layout(lines[1], BlockRole::Paragraph, false, 80, false);
 
     // Cursor on line 0 at byte 6 = 'w' of "hello world", visual col 6. Move down
     // off the end of line 0 (single visual row) -> enter line 1 from the top,
@@ -30,7 +30,7 @@ fn cursor_crosses_logical_lines_at_desired_col() {
 fn concealed_line_renders_styled() {
     let buf = TextBuffer::from_str("a **bold** end");
     let line = buf.to_string();
-    let (rows, _map) = layout(&line, BlockRole::Paragraph, false, 80);
+    let (rows, _map) = layout(&line, BlockRole::Paragraph, false, 80, false);
     assert_eq!(rows[0].display, "a bold end");
     assert!(rows[0].segs.iter().any(|s| s.style == wordcartel_core::style::Style::Strong));
 }

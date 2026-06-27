@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 //! Wordcartel terminal shell (imperative shell over wordcartel-core).
+pub mod base16;
 pub mod editor;
 pub mod derive;
 pub mod nav;
@@ -32,3 +33,6 @@ pub mod diagnostics_run;
 pub mod diag_overlay;
 pub mod fold;
 pub mod outline_overlay;
+pub mod compose;
+pub mod theme_resolve;
+pub mod theme_picker;

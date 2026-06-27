@@ -89,6 +89,14 @@ pub fn analyze(line: &str, role: BlockRole, is_active: bool) -> LineAnalysis {
                     styles.push(StyleSpan { src: inner, style: Style::Code });
                 }
             }
+            Event::InlineHtml(_) => {
+                // Style a `<!-- … -->` inline comment; leave other inline HTML (<span> etc.) Plain.
+                let s = &line[range.clone()];
+                if s.starts_with("<!--") && s.ends_with("-->") {
+                    reveal.push(range.clone());          // keep the comment visible
+                    styles.push(StyleSpan { src: range, style: Style::Comment });
+                }
+            }
             _ => {}
         }
     }
@@ -244,7 +252,7 @@ fn apply_block_prefix_conceal(
                     visible[start + 1] = false;
                 }
             }
-            None
+            Some("▎ ".to_string())
         }
 
         BlockRole::ListItem => {
@@ -319,8 +327,11 @@ fn apply_block_prefix_conceal(
             for b in 0..n {
                 visible[b] = false;
             }
-            None
+            Some("─── ".to_string())
         }
+
+        // Block HTML comments: no prefix glyph (the full source is shown as-is).
+        BlockRole::Comment => None,
 
         // Paragraph and others: no prefix conceal.
         _ => None,
@@ -443,6 +454,19 @@ mod tests {
     fn blockquote_prefix_concealed() {
         let a = analyze("> quoted", BlockRole::BlockQuote, false);
         assert_eq!(visible(&a, "> quoted"), "quoted");
+    }
+
+    #[test]
+    fn blockquote_has_bar_glyph() {
+        let a = analyze("> quoted", BlockRole::BlockQuote, false);
+        assert_eq!(a.prefix_glyph.as_deref(), Some("▎ "));
+        assert_eq!(visible(&a, "> quoted"), "quoted"); // existing conceal still holds
+    }
+
+    #[test]
+    fn thematic_break_has_rule_glyph() {
+        let a = analyze("---", BlockRole::ThematicBreak, false);
+        assert_eq!(a.prefix_glyph.as_deref(), Some("─── "));
     }
 
     #[test]
@@ -615,6 +639,22 @@ mod tests {
         let line = "#\t";
         let a = analyze(line, BlockRole::Heading(1), false);
         assert_eq!(visible(&a, line), "");
+    }
+
+    // --- Task 2: inline <!-- --> → Style::Comment ---
+
+    #[test]
+    fn inline_html_comment_is_styled_comment() {
+        let a = analyze("text <!-- note --> more", BlockRole::Paragraph, false);
+        let cmt = a.styles.iter().find(|s| s.style == Style::Comment).expect("comment span");
+        // span covers the `<!-- note -->`
+        assert_eq!(&"text <!-- note --> more"[cmt.src.clone()], "<!-- note -->");
+    }
+
+    #[test]
+    fn inline_html_non_comment_tag_is_not_comment() {
+        let a = analyze("a <span>x</span> b", BlockRole::Paragraph, false);
+        assert!(a.styles.iter().all(|s| s.style != Style::Comment), "a <span> is not a comment");
     }
 
     // --- Regressions ---

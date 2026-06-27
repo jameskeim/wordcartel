@@ -64,7 +64,7 @@ fn layout_line_on_demand(editor: &Editor, l: usize) -> wordcartel_core::layout::
     let source_mode = editor.active().view.mode != RenderMode::LivePreview;
     let is_active_effective = (l == caret_line(editor)) || source_mode;
     let vp_width = text_geometry(editor).text_width as usize;
-    let (_rows, map) = layout::layout(&text, role, is_active_effective, vp_width);
+    let (_rows, map) = layout::layout(&text, role, is_active_effective, vp_width, editor.theme.heading_level_glyph);
     map
 }
 
@@ -145,7 +145,7 @@ fn layout_line_active(editor: &Editor, l: usize) -> wordcartel_core::layout::Col
     let text = derive::line_text(buf, l);
     let role = editor.active().document.blocks.role_at(derive::line_start(buf, l));
     let vp_width = text_geometry(editor).text_width as usize;
-    let (_rows, map) = layout::layout(&text, role, true, vp_width);
+    let (_rows, map) = layout::layout(&text, role, true, vp_width, editor.theme.heading_level_glyph);
     map
 }
 
@@ -513,7 +513,9 @@ fn typewriter_rows_of_line(editor: &Editor, li: usize, text_width: usize) -> usi
     } else {
         raw_len
     };
-    if content_len <= text_width {
+    let prefix_width = editor.active().view.line_layouts
+        .get(&li).map(|(_, m)| m.prefix_width).unwrap_or(0);
+    if content_len + prefix_width <= text_width {
         1
     } else {
         rows_of_line(editor, li)
@@ -851,6 +853,24 @@ mod tests {
     /// Test helper: set the caret to a raw byte offset.
     fn set_caret(e: &mut Editor, off: usize) {
         e.active_mut().document.selection = Selection::single(off);
+    }
+
+    #[test]
+    fn heading_glyph_layout_geometry_under_no_color() {
+        // Under no_color theme (heading_level_glyph=true), an inactive heading line
+        // must reserve 2 cols of prefix width. Caret on line 1 (body), so line 0
+        // (heading) is laid out inactive. Verify the ColMap for line 0 has prefix_width=2.
+        let mut e = Editor::new_from_text("## Heading\nnext\n", None, (80, 24));
+        e.theme = wordcartel_core::theme::no_color();
+        // Caret on 'n' in "next" (line 1, byte offset = "## Heading\n".len() = 11).
+        set_caret(&mut e, 11);
+        derive::rebuild(&mut e);
+        // screen_pos should work for the caret line.
+        assert!(screen_pos(&e).is_some());
+        // The heading line (line 0) should have been laid out with heading_prefix=true.
+        let heading_map = e.active().view.line_layouts.get(&0).map(|(_, m)| m.clone())
+            .expect("line 0 should be in layout cache");
+        assert_eq!(heading_map.prefix_width, 2, "inactive heading reserves 2 cols under no_color");
     }
 
     // ------------------------------------------------------------------
@@ -1331,5 +1351,48 @@ mod tests {
                 "line {li}: fast-path returned {fast}, exact returned {exact}"
             );
         }
+    }
+
+    /// typewriter_rows_of_line must account for prefix_width when computing the
+    /// shortcut. A list item whose raw content_len fits text_width but whose
+    /// content_len + prefix_width exceeds text_width (and whose tab causes an
+    /// actual wrap) must return the real row count, not 1.
+    ///
+    /// Setup: "- \taaaa" on line 0 (inactive, prefix_width=2), "x" on line 1
+    /// (active, caret there). text_width=8.
+    ///   content_len("- \taaaa") = 7  →  7 ≤ 8  →  old shortcut fires, returns 1
+    ///   content_len + prefix_width = 9 > 8  →  new check falls through to rows_of_line
+    ///   actual layout: prefix at cols 0-1, \t fills cols 2-5, "aaa" at 6-8 then
+    ///   the 4th 'a' wraps  →  2 rows
+    #[test]
+    fn typewriter_rows_prefix_aware() {
+        // Line 0: inactive list item with a tab that causes a real wrap.
+        // Line 1: plain "x" — caret lives here so line 0 is inactive → prefix_width=2.
+        let mut ed = Editor::new_from_text("- \taaaa\nx\n", None, (8, 24));
+        ed.view_opts.typewriter = true;
+        // Move caret to line 1 (byte offset of 'x' = "- \taaaa\n".len() = 9).
+        ed.active_mut().document.selection =
+            wordcartel_core::selection::Selection::single(9);
+        derive::rebuild(&mut ed);
+
+        // Confirm the cached prefix_width for line 0 is really 2 (not 0).
+        let cached_prefix_width = ed
+            .active()
+            .view
+            .line_layouts
+            .get(&0)
+            .map(|(_, m)| m.prefix_width)
+            .expect("line 0 must be in layout cache");
+        assert_eq!(cached_prefix_width, 2, "inactive list item must have prefix_width=2");
+
+        let text_width = super::text_geometry(&ed).text_width as usize;
+        assert_eq!(text_width, 8, "sanity: text_width should be 8");
+
+        // content_len = "- \taaaa".len() = 7; 7 ≤ 8 so old shortcut fires.
+        // With fix: 7 + 2 = 9 > 8 → falls through to rows_of_line.
+        let tw = super::typewriter_rows_of_line(&ed, 0, text_width);
+        let real = super::rows_of_line(&ed, 0);
+        assert!(real > 1, "layout must wrap (real rows={real}); test setup is wrong if this fails");
+        assert_eq!(tw, real, "typewriter count must match real row count (prefix-blind shortcut returned 1)");
     }
 }

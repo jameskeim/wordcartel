@@ -37,6 +37,16 @@ pub struct Config {
     pub mouse: MouseConfig,
     pub view: ViewConfig,
     pub diagnostics: DiagnosticsConfig,
+    pub theme: ThemeConfig,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ThemeConfig {
+    pub name: Option<String>,
+    pub file: Option<PathBuf>,           // ~-expanded, resolved relative to declaring config
+    pub depth: Option<String>,           // "truecolor"|"256"|"16"|"none"
+    pub heading_level_glyph: Option<bool>,
+    pub styles: BTreeMap<String, RawFace>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +142,31 @@ struct RawConfig {
     mouse: RawMouse,
     view: RawView,
     diagnostics: RawDiagnostics,
+    theme: RawTheme,
+}
+
+#[derive(Debug, Default, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RawFace {
+    pub fg: Option<String>,
+    pub bg: Option<String>,
+    pub underline_color: Option<String>,
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+    pub underline: Option<bool>,
+    pub strike: Option<bool>,
+    pub reverse: Option<bool>,
+    pub dim: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawTheme {
+    name: Option<String>,
+    file: Option<String>,
+    depth: Option<String>,
+    heading_level_glyph: Option<bool>,
+    styles: BTreeMap<String, RawFace>,
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -300,6 +335,35 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
         }
         if let Some(v) = raw.diagnostics.linters { cfg.diagnostics.linters = Some(v); }
         // unknown linter names are validated against the core catalog later (Task 4 assembly) — warn there.
+
+        // ---- [theme] (discriminated source; file resolved vs the declaring config) ----
+        let rt = raw.theme;
+        let layer_dir = p.parent().unwrap_or_else(|| std::path::Path::new("."));
+        // Resolve a layer's `file` (~ expand + relative-to-this-config) if present.
+        let resolved_file = rt.file.as_ref().map(|s| {
+            if s == "~" {
+                dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"))
+            } else if let Some(rest) = s.strip_prefix("~/") {
+                dirs::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| PathBuf::from(s))
+            } else {
+                let pb = PathBuf::from(s);
+                if pb.is_absolute() { pb } else { layer_dir.join(pb) }
+            }
+        });
+        match (rt.name.clone(), resolved_file) {
+            (Some(_), Some(f)) => {
+                warns.push(format!(
+                    "theme: both `name` and `file` set in {} — `file` wins", p.display()));
+                cfg.theme.name = None;
+                cfg.theme.file = Some(f);
+            }
+            (Some(n), None) => { cfg.theme.name = Some(n); cfg.theme.file = None; } // name clears file
+            (None, Some(f)) => { cfg.theme.file = Some(f); cfg.theme.name = None; } // file clears name
+            (None, None) => {} // neither set this layer → inherit accumulated
+        }
+        if let Some(d) = rt.depth { cfg.theme.depth = Some(d); }
+        if let Some(h) = rt.heading_level_glyph { cfg.theme.heading_level_glyph = Some(h); }
+        for (k, v) in rt.styles { cfg.theme.styles.insert(k, v); } // accumulate across layers
     }
     (cfg, warns)
 }
@@ -480,6 +544,70 @@ mod tests {
             assert_eq!(cfg.diagnostics.dictionary, Some(home),
                 "bare ~ must expand to home_dir");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 3: [theme] config layering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn theme_name_parses() {
+        let d = tempdir();
+        let p = write(&d, "c.toml", "[theme]\nname = \"tokyo-night\"\n");
+        let (cfg, warns) = load(&[p]);
+        assert_eq!(cfg.theme.name.as_deref(), Some("tokyo-night"));
+        assert!(cfg.theme.file.is_none());
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn theme_file_resolves_relative_to_declaring_config() {
+        let d = tempdir();
+        let p = write(&d, "c.toml", "[theme]\nfile = \"palettes/gruvbox.yaml\"\n");
+        let (cfg, _w) = load(&[p]);
+        // resolved against the config file's directory, not CWD
+        assert_eq!(cfg.theme.file, Some(d.join("palettes/gruvbox.yaml")));
+        assert!(cfg.theme.name.is_none());
+    }
+
+    #[test]
+    fn theme_name_then_file_across_layers_is_discriminated() {
+        let d = tempdir();
+        let lo = write(&d, "lo.toml", "[theme]\nname = \"tokyo-night\"\n");
+        let hi = write(&d, "hi.toml", "[theme]\nfile = \"g.yaml\"\n");
+        let (cfg, _w) = load(&[lo, hi]); // hi overrides
+        assert!(cfg.theme.name.is_none(), "a later `file` clears an earlier `name`");
+        assert_eq!(cfg.theme.file, Some(d.join("g.yaml")));
+    }
+
+    #[test]
+    fn theme_name_and_file_same_layer_file_wins_with_warning() {
+        let d = tempdir();
+        let p = write(&d, "c.toml", "[theme]\nname = \"tokyo-night\"\nfile = \"g.yaml\"\n");
+        let (cfg, warns) = load(&[p]);
+        assert!(cfg.theme.name.is_none());
+        assert!(cfg.theme.file.is_some());
+        assert!(warns.iter().any(|w| w.contains("name") && w.contains("file")));
+    }
+
+    #[test]
+    fn theme_styles_accumulate_across_layers() {
+        let d = tempdir();
+        let lo = write(&d, "lo.toml", "[theme.styles]\nheading1 = { fg = \"#bb9af7\", bold = true }\n");
+        let hi = write(&d, "hi.toml", "[theme.styles]\nselection = { bg = \"#283457\" }\n");
+        let (cfg, _w) = load(&[lo, hi]);
+        assert!(cfg.theme.styles.contains_key("heading1"));
+        assert!(cfg.theme.styles.contains_key("selection"));
+    }
+
+    #[test]
+    fn pre_theming_config_still_loads() {
+        let d = tempdir();
+        let p = write(&d, "c.toml", "[view]\ntypewriter = true\n"); // no [theme] at all
+        let (cfg, warns) = load(&[p]);
+        assert!(cfg.view.typewriter);
+        assert!(cfg.theme.name.is_none() && cfg.theme.file.is_none());
+        assert!(warns.is_empty());
     }
 
 }

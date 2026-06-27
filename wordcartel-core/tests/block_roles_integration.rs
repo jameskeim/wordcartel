@@ -16,7 +16,7 @@ fn multi_block_doc_renders_with_roles() {
         let trimmed = line.strip_suffix('\n').unwrap_or(line);
         if !trimmed.is_empty() {
             let role = tree.role_at(offset);
-            let (rows, _m) = layout(trimmed, role, false, 80);
+            let (rows, _m) = layout(trimmed, role, false, 80, false);
             let display: String = rows.iter().map(|r| r.display.clone()).collect();
             got.push((role, display, rows[0].prefix_glyph.clone()));
         }
@@ -24,8 +24,8 @@ fn multi_block_doc_renders_with_roles() {
     }
     // Title heading: "# " concealed -> "Title", role Heading(1)
     assert_eq!(got[0], (BlockRole::Heading(1), "Title".into(), None));
-    // quote: "> " concealed
-    assert_eq!(got[1], (BlockRole::BlockQuote, "a quote".into(), None));
+    // quote: "> " concealed, prefix glyph ▎ (Task 5)
+    assert_eq!(got[1], (BlockRole::BlockQuote, "a quote".into(), Some("▎ ".into())));
     // list items: marker -> bullet glyph
     assert_eq!(got[2], (BlockRole::ListItem, "first".into(), Some("• ".into())));
     assert_eq!(got[3], (BlockRole::ListItem, "second".into(), Some("• ".into())));
