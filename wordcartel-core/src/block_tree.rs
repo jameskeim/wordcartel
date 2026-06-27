@@ -974,11 +974,17 @@ const FM_HEAD_CAP: usize = 8192;
 /// (opening fence present but no closing fence within the cap) returns `None`,
 /// which the caller treats conservatively as "not confirmed -> full reparse".
 ///
-/// `front_matter_span` (the whole-document detector used by `full_parse_src`)
-/// finds the closing fence on the FIRST matching line, so for any real front
-/// matter the closing fence is at the same byte whether scanned over the capped
-/// head or the whole document — the cap only ever turns a (rare, degenerate)
-/// far-from-head or absent closing fence into `None`, never shifts E.
+/// CAUTION — truncation can manufacture a FALSE close: `front_matter_span` uses
+/// `split_inclusive('\n')`, so on a capped slice the final fragment may be a
+/// partial line with no terminating `\n`. If that partial fragment equals `---`
+/// or `...` exactly, it is accepted as a closing fence, but the WHOLE-document
+/// scan sees the line continues (e.g. `---more\n`) and finds the real first
+/// close elsewhere. The false close always ends at exactly `cap`. `fm_end_capped`
+/// guards against this by rejecting any result where `end == cap` on a truncated
+/// head (see inline comment). When no false close is present, the capped scan
+/// agrees with the whole-document scan because `front_matter_span` matches the
+/// FIRST closing-fence line; the cap only turns a far-from-head or absent close
+/// into `None` (conservative full reparse).
 fn fm_end_capped<S: TextSource>(src: &S) -> Option<usize> {
     if !starts_with_fm_fence(src) {
         return None;
@@ -986,7 +992,21 @@ fn fm_end_capped<S: TextSource>(src: &S) -> Option<usize> {
     let cap = src.len().min(FM_HEAD_CAP);
     // Bind the slice to a local so the borrowed `&str` outlives the call.
     let head = src.slice(0..cap);
-    front_matter_span(head.as_ref()).map(|r| r.end)
+    let end = front_matter_span(head.as_ref()).map(|r| r.end)?;
+    // GUARD against a TRUNCATED false close. `front_matter_span` matches the
+    // closing fence via `split_inclusive('\n')`; over a capped slice the FINAL
+    // fragment may be a partial line with no terminating `\n` (the cap cut it
+    // off). If that partial fragment happens to equal `---`/`...`, the capped
+    // scan reports a close that the WHOLE-document scan does NOT see (the real
+    // line continues, e.g. `---more\n`). That false close ALWAYS ends exactly at
+    // `cap`. So when the head was truncated (`cap < len`) and the reported end is
+    // `cap`, treat the head as UNCONFIRMED -> None -> conservative full reparse.
+    // (A genuine close whose `\n` happens to land on the cap boundary is rejected
+    // too, but that alignment is astronomically rare and full reparse is correct.)
+    if cap < src.len() && end == cap {
+        return None;
+    }
+    Some(end)
 }
 
 /// True if `src` begins with the front-matter opening fence `---\n` at byte 0.
