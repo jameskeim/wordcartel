@@ -358,7 +358,6 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 // ---------------------------------------------------------------
                 // EXISTING segs-based path (no active search, no diagnostics) — true no-op.
                 // ---------------------------------------------------------------
-                let dim_style = compose::compose(&editor.theme, editor.depth, &[SE::FocusDim]);
                 let mut segs_spans: Vec<Span<'_>> = Vec::new();
                 // Prefix lead-in. Row 0 paints the real glyph; continuation rows
                 // of a prefixed line paint a blank spacer of `prefix_width` cells
@@ -391,7 +390,9 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                             compose::base_canvas(&editor.theme, editor.depth)
                                 .patch(compose::compose(&editor.theme, editor.depth, &[SE::FocusDim]))
                         } else {
-                            dim_style
+                            // §13.2 FIX-1: compose FocusDim OVER the semantic stack so heading
+                            // bold, comment italic, etc. are preserved on dim rows (§3.4 intent).
+                            compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(seg.style), SE::FocusDim])
                         }
                     } else if source_mode {
                         compose::base_canvas(&editor.theme, editor.depth)
@@ -449,9 +450,6 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                     hl_spans.push(Span::raw(" ".repeat(map.prefix_width)));
                 }
 
-                // Hoist FocusDim compose once per row (mirrors segs path).
-                let dim_style = compose::compose(&editor.theme, editor.depth, &[SE::FocusDim]);
-
                 // One span per run of glyphs sharing the same (style, highlight-kind).
                 let mut run = String::new();
                 let mut run_style: Option<RStyle> = None;
@@ -467,13 +465,25 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                             compose::base_canvas(&editor.theme, editor.depth)
                                 .patch(compose::compose(&editor.theme, editor.depth, &[SE::FocusDim]))
                         } else {
-                            dim_style
+                            // §13.2 FIX-1: compose FocusDim OVER the semantic stack so heading
+                            // bold, comment italic, etc. are preserved on dim rows (§3.4 intent).
+                            compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(p.style), SE::FocusDim])
                         }
                     } else if source_mode {
                         compose::base_canvas(&editor.theme, editor.depth)
                     } else {
                         compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(p.style)])
                     };
+
+                    // FIX-2: Selection layers first; a current search match patches over it so
+                    // it stands out; diagnostics last. (Spec §3.4: Selection → Search → Diag.)
+                    // Cue-mode modifiers accumulate (selection underline + search bold = both
+                    // visible), so §13.2 is preserved.
+                    let is_selected = has_sel && overlaps(g_from, g_to, sel_from, sel_to);
+                    if is_selected {
+                        let sel_face = editor.theme.face(SE::Selection);
+                        style = style.patch(crate::compose::face_to_ratatui(&sel_face, editor.depth));
+                    }
                     if is_current {
                         let search_face = editor.theme.face(SE::SearchCurrent);
                         let ss = crate::compose::face_to_ratatui(&search_face, editor.depth);
@@ -482,15 +492,6 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                         let search_face = editor.theme.face(SE::SearchMatch);
                         let ss = crate::compose::face_to_ratatui(&search_face, editor.depth);
                         style = style.patch(ss);
-                    }
-
-                    // Apply selection reverse. Selection sits below search-current
-                    // (so a current search match stands out) but above the base style.
-                    // Diagnostic underline stacks on top of selection reverse.
-                    let is_selected = has_sel && overlaps(g_from, g_to, sel_from, sel_to);
-                    if is_selected {
-                        let sel_face = editor.theme.face(SE::Selection);
-                        style = style.patch(crate::compose::face_to_ratatui(&sel_face, editor.depth));
                     }
 
                     // Apply diagnostic underline if this glyph overlaps any diagnostic.
@@ -694,8 +695,9 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         // Clear the overlay area.
         frame.render_widget(Clear, ov_rect);
 
-        // Draw the border.
-        let block = Block::default().borders(Borders::ALL).title(" Command Palette ");
+        // Draw the border (FIX-3: themed with Chrome so the frame matches the panel bg).
+        let block = Block::default().borders(Borders::ALL).title(" Command Palette ")
+            .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
         frame.render_widget(block, ov_rect);
 
         if ov_h < 3 {
@@ -747,7 +749,8 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         let list_h = (outline.rows.len() as u16).min(15).min(h.saturating_sub(4));
 
         frame.render_widget(Clear, ov_rect);
-        let block = Block::default().borders(Borders::ALL).title(" Outline ");
+        let block = Block::default().borders(Borders::ALL).title(" Outline ")
+            .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
         frame.render_widget(block, ov_rect);
 
         if ov_h >= 3 {
@@ -792,7 +795,8 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         let list_h = (tp.rows.len() as u16).min(15).min(h.saturating_sub(4));
 
         frame.render_widget(Clear, ov_rect);
-        let block = Block::default().borders(Borders::ALL).title(" Select Theme ");
+        let block = Block::default().borders(Borders::ALL).title(" Select Theme ")
+            .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
         frame.render_widget(block, ov_rect);
 
         if ov_h >= 3 {
@@ -875,7 +879,8 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         frame.render_widget(Clear, ov_rect);
 
         let title = format!(" {} ", diag_ov.anchor.message);
-        let block = Block::default().borders(Borders::ALL).title(title);
+        let block = Block::default().borders(Borders::ALL).title(title)
+            .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
         frame.render_widget(block, ov_rect);
 
         if ov_h >= 3 {
@@ -1914,6 +1919,152 @@ mod tests {
         assert!(
             matches!(dimmed.flatten(), Some(ratatui::style::Color::Rgb(..))),
             "dimmed phosphor source row must carry RGB canvas bg (not Reset); got {:?}", dimmed.flatten()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Branch-review fixes (RED tests written before implementation — TDD)
+    // -----------------------------------------------------------------------
+
+    /// FIX-1 (segs path §13.2): FocusDim must layer OVER the semantic stack, not replace it.
+    /// In no_color + focus mode, a dimmed (out-of-focus) heading row must keep its BOLD
+    /// modifier — without BOLD, the heading text is indistinguishable from plain dimmed text
+    /// in cue mode (§13.2 violation). Tests the segs path (use_placed=false: no search,
+    /// no diagnostics, single cursor).
+    #[test]
+    fn focus_dim_keeps_heading_bold_in_no_color() {
+        // "# Heading\n" = bytes  0-9  (H1 heading)
+        // "\n"          = byte  10    (blank line)
+        // "paragraph\n" = bytes 11-20 (paragraph; caret here → heading is DIM)
+        let mut ed = Editor::new_from_text("# Heading\n\nparagraph\n", None, (40, 8));
+        ed.theme = wordcartel_core::theme::no_color();
+        ed.depth = wordcartel_core::theme::Depth::None; // cue mode: modifiers only, no color
+        ed.view_opts.focus = true;
+        set_caret(&mut ed, 11); // caret in "paragraph" → heading is outside focus region → dim
+        // Single cursor → has_sel=false, no search → use_placed=false → segs path.
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 8);
+        // Row 0 = heading. no_color has heading_level_glyph=true; inactive heading shows
+        // "█ " (shade glyph + space, cols 0-1) then "Heading" (cols 2-8).
+        // Prefix "█ " already has BOLD in current code; text cells do NOT → that is the bug.
+        let row_text = row_string(&buf, 0);
+        let h_col = row_text.chars().position(|c| c == 'H').unwrap_or(99) as u16;
+        assert!(h_col < 40, "expected 'Heading' to appear on row 0 (inactive heading), got: {:?}", row_text);
+        // After FIX-1: each text cell of the dimmed heading must carry BOLD (heading cue).
+        let text_cells_have_bold = (h_col..h_col + 7).any(|x| {
+            buf[(x, 0u16)].style().add_modifier.contains(Modifier::BOLD)
+        });
+        assert!(
+            text_cells_have_bold,
+            "FIX-1(segs): dimmed heading text must carry BOLD cue in no_color+focus (§13.2); \
+             cell at col {h_col} style: {:?}",
+            buf[(h_col, 0u16)].style()
+        );
+    }
+
+    /// FIX-1 (placed path §13.2): same BOLD requirement when the placed path is active
+    /// (use_placed=true). A non-empty selection on the paragraph forces the placed path
+    /// while leaving the dim heading row unselected — it must still carry BOLD.
+    #[test]
+    fn focus_dim_keeps_heading_bold_in_no_color_placed_path() {
+        // Same document as the segs-path test; selection on paragraph → use_placed=true.
+        let mut ed = Editor::new_from_text("# Heading\n\nparagraph\n", None, (40, 8));
+        ed.theme = wordcartel_core::theme::no_color();
+        ed.depth = wordcartel_core::theme::Depth::None;
+        ed.view_opts.focus = true;
+        // Non-empty selection on "paragraph" (bytes 11-20) → has_sel=true → placed path.
+        ed.active_mut().document.selection =
+            wordcartel_core::selection::Selection::range(11, 20);
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 8);
+        let row_text = row_string(&buf, 0);
+        let h_col = row_text.chars().position(|c| c == 'H').unwrap_or(99) as u16;
+        assert!(h_col < 40, "expected 'Heading' visible on row 0, got: {:?}", row_text);
+        let text_cells_have_bold = (h_col..h_col + 7).any(|x| {
+            buf[(x, 0u16)].style().add_modifier.contains(Modifier::BOLD)
+        });
+        assert!(
+            text_cells_have_bold,
+            "FIX-1(placed): dimmed heading text must carry BOLD cue in no_color+focus (§13.2); \
+             cell at col {h_col} style: {:?}",
+            buf[(h_col, 0u16)].style()
+        );
+    }
+
+    /// FIX-2: Selection must be applied BEFORE search so the search match can stand out.
+    /// A cell that is BOTH selected AND the current search match must show the SearchCurrent
+    /// face's bg on top, not the Selection face's bg.
+    ///
+    /// We start from tokyo-night and override SearchCurrent to carry a distinctive bg color
+    /// (LightGreen) that differs from Selection's bg (SEL_BG ≈ Rgb(0x28,0x34,0x57)).
+    /// Before fix: selection patches AFTER search → SEL_BG overwrites LightGreen.
+    /// After fix: search patches AFTER selection → LightGreen is the final bg.
+    #[test]
+    fn search_current_wins_over_selection_on_overlap() {
+        use wordcartel_core::theme::{Face, Color as ThemeColor, Depth, SemanticElement};
+        let mut ed = Editor::new_from_text("hello world\n", None, (40, 6));
+        ed.theme = wordcartel_core::theme::tokyo_night();
+        ed.depth = Depth::Truecolor;
+        // Override SearchCurrent: give it an explicit bg (LightGreen) distinct from Selection.
+        ed.theme.override_face(
+            SemanticElement::SearchCurrent,
+            Face { bg: Some(ThemeColor::LightGreen), ..Face::default() },
+        );
+        // Open search and find "hello" (bytes 0-4); it becomes the current (first) match.
+        ed.open_search(crate::search_overlay::Phase::Find, 0);
+        for c in "hello".chars() { ed.search.as_mut().unwrap().insert(c); }
+        let rope = ed.active().document.buffer.snapshot();
+        let v = ed.active().document.version;
+        ed.search.as_mut().unwrap().recompute(&rope, v);
+        // Also select "hello" so the first cell is both selected AND current match.
+        ed.active_mut().document.selection =
+            wordcartel_core::selection::Selection::range(0, 5);
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+        // Col 0 ('h') is in both the current search match (0..5) and the selection (0..5).
+        // After FIX-2: SearchCurrent bg (LightGreen) must win because search patches last.
+        let cell_bg = buf[(0u16, 0u16)].style().bg;
+        assert_eq!(
+            cell_bg,
+            Some(ratatui::style::Color::LightGreen),
+            "FIX-2: SearchCurrent bg must win over Selection bg on overlap; \
+             expected LightGreen, got {:?}",
+            cell_bg
+        );
+    }
+
+    /// FIX-3: Overlay frames must use the Chrome face (not terminal-default).
+    /// Under phosphor-amber (a fully-themed phosphor variant), the theme-picker overlay
+    /// border cells must carry themed RGB colors from the Chrome face — not Reset/None.
+    #[test]
+    fn phosphor_overlay_frame_border_uses_chrome_style() {
+        use wordcartel_core::theme::{Theme, Depth};
+        let mut ed = Editor::new_from_text("x\n", None, (60, 16));
+        ed.theme = Theme::builtin("phosphor-amber").unwrap();
+        ed.depth = Depth::Truecolor;
+        ed.open_theme_picker();
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 60, 16);
+        // Scan the buffer for any border glyph (box-drawing chars used by Block).
+        let border_cell = (0..60u16).flat_map(|x| (0..16u16).map(move |y| (x, y))).find(|&(x, y)| {
+            let s = buf[(x, y)].symbol();
+            s == "─" || s == "│" || s == "┌" || s == "┐" || s == "└" || s == "┘"
+        });
+        assert!(border_cell.is_some(), "FIX-3: expected box-drawing border cells in theme-picker overlay");
+        let (bx, by) = border_cell.unwrap();
+        let cs = buf[(bx, by)].style();
+        // phosphor-amber Chrome face: { fg: shade(4), bg: shade(1) } — both RGB.
+        // Before fix: border cell has fg/bg from terminal default (None or Reset).
+        // After fix: border cell carries Chrome face (RGB fg and bg).
+        assert!(
+            matches!(cs.fg, Some(ratatui::style::Color::Rgb(..))),
+            "FIX-3: phosphor overlay border must carry Chrome RGB fg; got {:?} at ({bx},{by})",
+            cs.fg
+        );
+        assert!(
+            matches!(cs.bg, Some(ratatui::style::Color::Rgb(..))),
+            "FIX-3: phosphor overlay border must carry Chrome RGB bg; got {:?} at ({bx},{by})",
+            cs.bg
         );
     }
 }
