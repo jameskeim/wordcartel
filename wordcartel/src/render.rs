@@ -357,7 +357,18 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                     } else {
                         compose::compose(&editor.theme, editor.depth, &[pe]).add_modifier(Modifier::DIM)
                     };
-                    segs_spans.push(Span::styled(glyph.clone(), gstyle));
+                    let painted = if editor.theme.heading_level_glyph {
+                        if let wordcartel_core::style::BlockRole::Heading(n) = vr.role {
+                            const SHADES: [&str; 6] = ["█", "▓", "▒", "░", "▏", "·"];
+                            let shade = SHADES[(n.clamp(1, 6) - 1) as usize];
+                            format!("{shade} ")
+                        } else {
+                            glyph.clone()
+                        }
+                    } else {
+                        glyph.clone()
+                    };
+                    segs_spans.push(Span::styled(painted, gstyle));
                 } else if map.prefix_width > 0 {
                     segs_spans.push(Span::raw(" ".repeat(map.prefix_width)));
                 }
@@ -405,7 +416,18 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                     } else {
                         compose::compose(&editor.theme, editor.depth, &[pe]).add_modifier(Modifier::DIM)
                     };
-                    hl_spans.push(Span::styled(glyph.clone(), gstyle));
+                    let painted = if editor.theme.heading_level_glyph {
+                        if let wordcartel_core::style::BlockRole::Heading(n) = vr.role {
+                            const SHADES: [&str; 6] = ["█", "▓", "▒", "░", "▏", "·"];
+                            let shade = SHADES[(n.clamp(1, 6) - 1) as usize];
+                            format!("{shade} ")
+                        } else {
+                            glyph.clone()
+                        }
+                    } else {
+                        glyph.clone()
+                    };
+                    hl_spans.push(Span::styled(painted, gstyle));
                 } else if map.prefix_width > 0 {
                     hl_spans.push(Span::raw(" ".repeat(map.prefix_width)));
                 }
@@ -1615,5 +1637,4 @@ mod tests {
         );
     }
 }
-
 

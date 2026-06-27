@@ -169,7 +169,7 @@ pub fn rebuild(editor: &mut Editor) {
             let is_active_effective = (l == active_line) || source_mode;
             (text, role, is_active_effective)
         };
-        let (rows, map) = layout::layout(&text, role, is_active_effective, vp_width);
+        let (rows, map) = layout::layout(&text, role, is_active_effective, vp_width, editor.theme.heading_level_glyph);
         visual_rows_accumulated += rows.len();
         editor.active_mut().view.line_layouts.insert(l, (rows, map));
         // 5g: jump past any folded body that follows this line.

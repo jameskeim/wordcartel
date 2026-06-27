@@ -64,7 +64,7 @@ fn layout_line_on_demand(editor: &Editor, l: usize) -> wordcartel_core::layout::
     let source_mode = editor.active().view.mode != RenderMode::LivePreview;
     let is_active_effective = (l == caret_line(editor)) || source_mode;
     let vp_width = text_geometry(editor).text_width as usize;
-    let (_rows, map) = layout::layout(&text, role, is_active_effective, vp_width);
+    let (_rows, map) = layout::layout(&text, role, is_active_effective, vp_width, editor.theme.heading_level_glyph);
     map
 }
 
@@ -145,7 +145,7 @@ fn layout_line_active(editor: &Editor, l: usize) -> wordcartel_core::layout::Col
     let text = derive::line_text(buf, l);
     let role = editor.active().document.blocks.role_at(derive::line_start(buf, l));
     let vp_width = text_geometry(editor).text_width as usize;
-    let (_rows, map) = layout::layout(&text, role, true, vp_width);
+    let (_rows, map) = layout::layout(&text, role, true, vp_width, editor.theme.heading_level_glyph);
     map
 }
 
@@ -851,6 +851,24 @@ mod tests {
     /// Test helper: set the caret to a raw byte offset.
     fn set_caret(e: &mut Editor, off: usize) {
         e.active_mut().document.selection = Selection::single(off);
+    }
+
+    #[test]
+    fn heading_glyph_layout_geometry_under_no_color() {
+        // Under no_color theme (heading_level_glyph=true), an inactive heading line
+        // must reserve 2 cols of prefix width. Caret on line 1 (body), so line 0
+        // (heading) is laid out inactive. Verify the ColMap for line 0 has prefix_width=2.
+        let mut e = Editor::new_from_text("## Heading\nnext\n", None, (80, 24));
+        e.theme = wordcartel_core::theme::no_color();
+        // Caret on 'n' in "next" (line 1, byte offset = "## Heading\n".len() = 11).
+        set_caret(&mut e, 11);
+        derive::rebuild(&mut e);
+        // screen_pos should work for the caret line.
+        assert!(screen_pos(&e).is_some());
+        // The heading line (line 0) should have been laid out with heading_prefix=true.
+        let heading_map = e.active().view.line_layouts.get(&0).map(|(_, m)| m.clone())
+            .expect("line 0 should be in layout cache");
+        assert_eq!(heading_map.prefix_width, 2, "inactive heading reserves 2 cols under no_color");
     }
 
     // ------------------------------------------------------------------
