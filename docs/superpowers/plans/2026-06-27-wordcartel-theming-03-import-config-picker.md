@@ -738,7 +738,7 @@ Run `cargo test -p wordcartel compose:: depth_none` + the existing compose/rende
 - Test: same file
 
 **Interfaces:**
-- Consumes: `config::ThemeConfig`, `config::RawFace`, Task 1 (`from_base16`, `override_face`, `element_from_key`), Task 2 (`base16::parse_base16`, `base16::parse_hex6`), Task 4 (`detect_depth`/`parse_depth`/`effective_depth`), `theme::{builtin, default, no_color, Theme, Depth, Face, Color}`.
+- Consumes: `config::ThemeConfig`, `config::RawFace`, Task 1 (`from_base16`, `override_face`, `element_from_key`), Task 2 (`base16::parse_base16`, `base16::parse_hex6`), Task 4 (`detect_depth`/`parse_depth`/`effective_depth`), free fns `theme::{default, no_color, from_base16, element_from_key}` + types `theme::{Theme, Depth, Face, Color}` + the ASSOCIATED method `Theme::builtin` (NOT a free fn — Codex C3).
 - Produces:
   ```rust
   pub struct EnvSnapshot { pub no_color: bool, pub colorterm: Option<String>, pub term: Option<String> }
@@ -958,7 +958,7 @@ pub fn resolve_theme(tc: &ThemeConfig, env: &EnvSnapshot) -> ResolvedTheme {
   - `pub struct ThemePicker { pub query: String, pub selected: usize, pub rows: Vec<String>, pub original: Theme }`
   - `pub fn rebuild_rows(tp: &mut ThemePicker)` — filter `Theme::builtin_names()` (associated method, Codex C3) by `query` (substring, case-insensitive); `selected` clamped.
   - `editor.open_theme_picker()` (XOR), `editor.apply_theme(theme: Theme)` (sets `theme`, re-forces cue-mode glyph for the current depth, `derive::rebuild`, `nav::ensure_visible`).
-- Consumes: `theme::{builtin, builtin_names, Theme}`, `derive::rebuild`, `nav::ensure_visible`, the palette key-handling + render patterns.
+- Consumes: `theme::Theme` + its ASSOCIATED methods `Theme::builtin`/`Theme::builtin_names` (Codex C3), `derive::rebuild`, `nav::ensure_visible`, the palette key-handling + render patterns.
 
 - [ ] **Step 1: Write the failing tests** (`theme_picker.rs`)
 
@@ -1214,6 +1214,26 @@ fn preview_selected_theme(editor: &mut crate::editor::Editor) {
         let bg = buf2[(0u16, 0u16)].style().bg;
         assert!(bg.is_none() || bg == Some(ratatui::style::Color::Reset), "Default source = terminal default");
     }
+
+    #[test]
+    fn source_mode_dimmed_row_keeps_phosphor_canvas() {
+        // A focused (dimmed) source row must STILL carry the phosphor canvas bg —
+        // FocusDim layers over the canvas, it does not replace it (Codex re-review).
+        use wordcartel_core::theme::{Theme, Depth};
+        let mut ed = Editor::new_from_text("# h\n\nbody paragraph one\n\nbody paragraph two\n", None, (40, 8));
+        ed.theme = Theme::builtin("phosphor-amber").unwrap();
+        ed.depth = Depth::Truecolor;
+        ed.view_opts.focus = true;                 // dims rows outside the focus region
+        ed.active_mut().view.mode = crate::editor::RenderMode::SourcePlain;
+        crate::derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 8);
+        // a row outside the active paragraph is dimmed but must keep a themed bg
+        let dimmed = (0..8u16).find_map(|r| {
+            let c = &buf[(0u16, r)];
+            if c.style().add_modifier.contains(ratatui::style::Modifier::DIM) { Some(c.style().bg) } else { None }
+        });
+        assert_eq!(dimmed.flatten().is_some(), true, "dimmed source row retains the phosphor canvas bg");
+    }
 ```
 
 - [ ] **Step 2: Run — fails** (source canvas is currently unthemed for phosphor). `cargo test -p wordcartel source_mode_tints`
@@ -1228,7 +1248,13 @@ pub fn base_canvas(theme: &Theme, depth: Depth) -> RStyle {
 }
 ```
 
-- [ ] **Step 4: Apply it in render's source-mode path.** Where the source branch builds its base style as `compose(&editor.theme, editor.depth, &[SE::Text])` (~:391, ~:462), use `compose::base_canvas(&editor.theme, editor.depth)` as the base instead, then layer the SAME overlays (Selection/search/diag/focus) on top exactly as today. Do NOT add per-element/role/inline faces and NO heading glyph in source mode (the literal `#` shows) — only the canvas changes. (The `Depth::None` color suppression from Task 4b applies here too: phosphor source under `NO_COLOR` → monochrome.)
+- [ ] **Step 4: Apply it in render's source-mode path — BOTH the non-dim AND the `row_dim` branch (Codex re-review).** Where the source branch builds its base style as `compose(&editor.theme, editor.depth, &[SE::Text])` (~:391, ~:462), use `compose::base_canvas(&editor.theme, editor.depth)` as the base instead, then layer the SAME overlays on top exactly as today. **Critically:** the render has a `row_dim && source_mode` branch that today applies `dim_style` alone — it MUST also carry the canvas, or a focused (dimmed) source row loses the phosphor tint. In that branch, use the canvas patched with FocusDim:
+```rust
+    // row_dim && source_mode: canvas + the focus-dim overlay (NOT bare dim_style)
+    compose::base_canvas(&editor.theme, editor.depth)
+        .patch(compose::compose(&editor.theme, editor.depth, &[SE::FocusDim]))
+```
+Do NOT add per-element/role/inline faces and NO heading glyph in source mode (the literal `#` shows) — only the canvas (+ overlays/focus) changes. (The `Depth::None` color suppression from Task 4b flows through `base_canvas` → `face_to_ratatui`: phosphor source under `NO_COLOR` → monochrome.)
 
 - [ ] **Step 5: Run** `cargo test -p wordcartel source_mode_tints render::` — PASS. Then full `cargo test -p wordcartel --lib`. If a Default-theme source-mode golden changed `None`→`Some(Reset)`, that is the accepted Default canvas (Reset == terminal default) — update the golden to match; if any OTHER (live-preview, or non-Default) golden changed, STOP and investigate (the canvas must not touch live-preview).
 
