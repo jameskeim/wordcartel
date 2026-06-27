@@ -359,7 +359,7 @@ fn mono_faces() -> ThemeFaces {
         search_match: m(false, false, false, false, true),
         search_current: m(true, false, false, false, true),
         diag_spelling: m(true, false, true, false, false),        // bold+underline
-        diag_grammar:  m(true, false, true, false, false),
+        diag_grammar:  m(false, true, true, false, false),        // italic+underline (I7: distinct from spelling)
         focus_dim: Face { dim: Some(true), ..Face::default() },
         fold_marker: Face::default(), wrap_guide: Face::default(),
         chrome: Face::default(),

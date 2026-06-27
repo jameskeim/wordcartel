@@ -1678,5 +1678,68 @@ mod tests {
         assert!(!(0u16..5).any(|x| buf[(x,0)].style().add_modifier.contains(Modifier::REVERSED)),
             "empty (cursor-only) selection must not paint REVERSED on any cell");
     }
+
+    // -----------------------------------------------------------------------
+    // §13.2 accessibility coverage proof tests
+    // -----------------------------------------------------------------------
+
+    fn cue_themes() -> [wordcartel_core::theme::Theme; 2] {
+        [wordcartel_core::theme::no_color(),
+         wordcartel_core::theme::Theme::builtin("phosphor-amber-flat").unwrap()]
+    }
+
+    /// §13.2: Every Face-cued SemanticElement carries >=1 non-color modifier in cue mode.
+    #[test]
+    fn a11y_every_cued_element_has_a_modifier_in_cue_mode() {
+        use wordcartel_core::theme::SemanticElement::*;
+        // the Face-cued elements (glyph-cued ones are proven by the render fixtures below)
+        let cued = [Emphasis, Strong, StrongEmphasis, Code, CodeBlock, Link, Strikethrough,
+                    Comment, FrontMatter, Selection, SearchMatch, SearchCurrent, DiagSpelling, DiagGrammar];
+        for t in cue_themes() {
+            for el in cued {
+                let f = t.face(el);
+                assert!(f.bold.unwrap_or(false)||f.italic.unwrap_or(false)||f.underline.unwrap_or(false)
+                        ||f.strike.unwrap_or(false)||f.reverse.unwrap_or(false)||f.dim.unwrap_or(false),
+                        "{}/{el:?} needs a non-color cue", t.name);
+            }
+        }
+    }
+
+    /// §13.2: Same-context pairs must be distinguishable in cue mode.
+    #[test]
+    fn a11y_pairwise_distinct_same_context_pairs() {
+        use wordcartel_core::theme::SemanticElement::*;
+        for t in cue_themes() {
+            assert_ne!(t.face(Comment), t.face(Emphasis), "{}: Comment vs Emphasis", t.name);
+            assert_ne!(t.face(FrontMatter), t.face(Code), "{}: FrontMatter vs Code", t.name);
+            assert_ne!(t.face(Selection), t.face(Code), "{}: Selection vs Code", t.name);
+            // spelling vs grammar are different underline COLORS today; in cue mode they
+            // must stay distinguishable by modifier (Codex I7 — §13.2 is fully closed).
+            assert_ne!(t.face(DiagSpelling), t.face(DiagGrammar), "{}: DiagSpelling vs DiagGrammar", t.name);
+        }
+    }
+
+    /// §13.2: Structural glyphs (blockquote ▎, thematic-break ─, heading shade) render
+    /// in the No-color theme for inactive structural lines.
+    #[test]
+    fn a11y_structural_glyphs_render_in_no_color() {
+        // blockquote ▎, thematic-break ───, heading shade glyph all PAINT under No-color (glyph cue).
+        // Document layout:
+        //   "> quote\n" = bytes 0-7 (blockquote)
+        //   "\n"        = byte  8   (blank line — place caret HERE to avoid activating structural lines)
+        //   "---\n"     = bytes 9-12 (thematic break)
+        //   "\n"        = byte  13  (blank line)
+        //   "### H3\n"  = bytes 14-21 (heading)
+        let mut ed = Editor::new_from_text("> quote\n\n---\n\n### H3\n", None, (40, 12));
+        ed.theme = wordcartel_core::theme::no_color(); // heading_level_glyph = true
+        // Place caret on the blank line (byte 8) so ALL structural lines are INACTIVE
+        // and render their prefix glyphs (Task 6 invariant: active line ⟹ no prefix glyph).
+        set_caret(&mut ed, 8);
+        crate::derive::rebuild(&mut ed);
+        let text = (0..12).map(|r| row_string(&render_to_buffer(&mut ed, 40, 12), r)).collect::<String>();
+        assert!(text.contains('▎'), "blockquote bar");
+        assert!(text.contains('─'), "thematic rule");
+        assert!(text.contains('▒') || text.contains('█'), "heading shade glyph"); // h3 = ▒
+    }
 }
 
