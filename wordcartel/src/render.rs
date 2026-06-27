@@ -13,6 +13,10 @@ use ratatui::{
 use wordcartel_core::style::Style;
 use wordcartel_core::theme::SemanticElement as SE;
 
+/// Heading-level shade glyphs used in cue mode and when `heading_level_glyph` is on.
+/// Index 0 = H1 (`█`), …, index 5 = H6 (`·`). Density decreases with level.
+const SHADES: [&str; 6] = ["█", "▓", "▒", "░", "▏", "·"];
+
 /// Half-open interval intersection: is the row's global byte range active?
 ///
 /// Returns `true` if the row's span `[row_from, row_to)` overlaps with the
@@ -365,7 +369,6 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                     };
                     let painted = if editor.theme.heading_level_glyph {
                         if let wordcartel_core::style::BlockRole::Heading(n) = vr.role {
-                            const SHADES: [&str; 6] = ["█", "▓", "▒", "░", "▏", "·"];
                             let shade = SHADES[(n.clamp(1, 6) - 1) as usize];
                             format!("{shade} ")
                         } else {
@@ -424,7 +427,6 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                     };
                     let painted = if editor.theme.heading_level_glyph {
                         if let wordcartel_core::style::BlockRole::Heading(n) = vr.role {
-                            const SHADES: [&str; 6] = ["█", "▓", "▒", "░", "▏", "·"];
                             let shade = SHADES[(n.clamp(1, 6) - 1) as usize];
                             format!("{shade} ")
                         } else {
@@ -1663,10 +1665,8 @@ mod tests {
         derive::rebuild(&mut ed);
         let buf = render_to_buffer(&mut ed, 40, 4);
         // a selected cell (col 0..5 on row 0) carries the Selection face (reverse) layered on.
-        let sel = compose::compose(&ed.theme, ed.depth, &[wordcartel_core::theme::SemanticElement::Selection]);
         assert!((0u16..5).any(|x| buf[(x,0)].style().add_modifier.contains(Modifier::REVERSED)),
-            "selected cells must carry REVERSED modifier; sel face = {sel:?}");
-        let _ = sel;
+            "selected cells must carry REVERSED modifier");
     }
 
     #[test]
@@ -1692,9 +1692,18 @@ mod tests {
     #[test]
     fn a11y_every_cued_element_has_a_modifier_in_cue_mode() {
         use wordcartel_core::theme::SemanticElement::*;
-        // the Face-cued elements (glyph-cued ones are proven by the render fixtures below)
+        // Face-cued persistent text elements (glyph-cued structural elements proven by render
+        // fixtures below):
+        //   Emphasis=italic, Strong=bold, StrongEmphasis=bold+italic, Code=reverse,
+        //   CodeBlock=reverse, Link=underline, Strikethrough=strike, Comment=italic+dim,
+        //   FrontMatter=reverse+italic, Selection=reverse+underline,
+        //   SearchMatch=reverse, SearchCurrent=reverse+bold,
+        //   DiagSpelling=bold+underline, DiagGrammar=bold+underline (distinct face).
+        // Transient overlay + chrome elements with modifier cues:
+        //   FocusDim=dim, ChromeReverse=reverse, ChromeSelected=reverse, ChromeMuted=dim.
         let cued = [Emphasis, Strong, StrongEmphasis, Code, CodeBlock, Link, Strikethrough,
-                    Comment, FrontMatter, Selection, SearchMatch, SearchCurrent, DiagSpelling, DiagGrammar];
+                    Comment, FrontMatter, Selection, SearchMatch, SearchCurrent, DiagSpelling, DiagGrammar,
+                    FocusDim, ChromeReverse, ChromeSelected, ChromeMuted];
         for t in cue_themes() {
             for el in cued {
                 let f = t.face(el);
@@ -1703,6 +1712,15 @@ mod tests {
                         "{}/{el:?} needs a non-color cue", t.name);
             }
         }
+        // §13.2: Chrome (base panel face) is placement-cued — it appears only in the chrome
+        // region (status bar, menu bar, overlay frames) which is structurally distinct from
+        // text content; it never needs a modifier to distinguish it from text elements.
+        // Proven by the chrome render tests (status-line, palette, outline overlay fixtures).
+        // §13.2: FoldMarker is glyph-cued (▸ + "… N lines"); proven by the fold fixture:
+        //   `fold_marker_glyph_prefix_is_rendered` — deferred to plan-③ test pass for the
+        //   full §8.3 row (requires outline-folded Editor state, which is elaborate scaffolding).
+        // §13.2: WrapGuide is glyph-cued (│ column guide); proven by placement — the guide
+        //   column character is a literal `│` cell; deferred to plan-③ render fixture.
     }
 
     /// §13.2: Same-context pairs must be distinguishable in cue mode.
@@ -1749,5 +1767,35 @@ mod tests {
         assert!(text.contains('•'), "list bullet glyph under no_color");
         assert!(text.contains('▒'), "H3 heading shade glyph (▒ = SHADES[2])");
     }
-}
 
+    /// §13.2 §8.3 completeness: All six heading levels render their distinct shade glyphs
+    /// (`█▓▒░▏·`) under No-color so H1–H6 are distinguishable without color.
+    ///
+    /// Document: "# H1\n## H2\n### H3\n#### H4\n##### H5\n###### H6\n\n"
+    ///   bytes  0- 4: "# H1\n"    (H1 — SHADES[0] = '█')
+    ///   bytes  5-10: "## H2\n"   (H2 — SHADES[1] = '▓')
+    ///   bytes 11-17: "### H3\n"  (H3 — SHADES[2] = '▒')
+    ///   bytes 18-25: "#### H4\n" (H4 — SHADES[3] = '░')
+    ///   bytes 26-34: "##### H5\n"(H5 — SHADES[4] = '▏')
+    ///   bytes 35-44: "###### H6\n"(H6 — SHADES[5] = '·')
+    ///   byte  45:    "\n"        (blank line — caret placed here so ALL headings INACTIVE)
+    #[test]
+    fn a11y_all_six_heading_shades_render_in_no_color() {
+        let mut ed = Editor::new_from_text(
+            "# H1\n## H2\n### H3\n#### H4\n##### H5\n###### H6\n\n",
+            None, (40, 10),
+        );
+        ed.theme = wordcartel_core::theme::no_color(); // heading_level_glyph = true
+        // Place caret on the trailing blank line (byte 45) so ALL six heading lines are
+        // INACTIVE and render their shade glyphs (Task 6 invariant: active line ⟹ no glyph).
+        set_caret(&mut ed, 45);
+        crate::derive::rebuild(&mut ed);
+        let text = (0..10).map(|r| row_string(&render_to_buffer(&mut ed, 40, 10), r)).collect::<String>();
+        assert!(text.contains('█'), "H1 shade glyph (█ = SHADES[0]) missing in no_color");
+        assert!(text.contains('▓'), "H2 shade glyph (▓ = SHADES[1]) missing in no_color");
+        assert!(text.contains('▒'), "H3 shade glyph (▒ = SHADES[2]) missing in no_color");
+        assert!(text.contains('░'), "H4 shade glyph (░ = SHADES[3]) missing in no_color");
+        assert!(text.contains('▏'), "H5 shade glyph (▏ = SHADES[4]) missing in no_color");
+        assert!(text.contains('·'), "H6 shade glyph (· = SHADES[5]) missing in no_color");
+    }
+}

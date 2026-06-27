@@ -922,6 +922,7 @@ fn html_in_play<S: TextSource>(
 ///     localized splice carries the head verbatim — and if a PRIOR step left the
 ///     head mis-parsed as thematic breaks (the front-matter-blind `parse_region`
 ///     view), only a reparse-from-0 can repair it.
+///
 /// So we reparse from 0 whenever a leading `---\n` is present in either snapshot.
 ///
 /// It is gated on the `---\n` prefix, so it never hijacks an unrelated byte-0
