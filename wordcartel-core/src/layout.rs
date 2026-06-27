@@ -70,6 +70,12 @@ pub struct ColMap {
     pub row_end_col: Vec<usize>,
     /// True if produced for the *active* line (raw, no conceal).
     pub is_active: bool,
+    /// Display width of this line's prefix glyph (`• `, `▎ `, …); 0 if none.
+    ///
+    /// Every `Placed.col` is offset by this amount, and continuation rows hang-
+    /// indent to it. A click at a column `< prefix_width` clamps up to it, so a
+    /// hit on the prefix lands on the line's first text glyph.
+    pub prefix_width: usize,
 }
 
 impl ColMap {
@@ -103,6 +109,10 @@ impl ColMap {
     /// mark sharing the cell. (Empirically required by Law 5: otherwise
     /// down->up collapses onto a leading zero-width grapheme.)
     pub fn visual_to_source(&self, row: usize, col: usize) -> usize {
+        // Clamp the prefix region: a click at col < prefix_width is treated as
+        // col == prefix_width, so it lands on the line's first text glyph rather
+        // than under the bullet/quote glyph.
+        let col = col.max(self.prefix_width);
         // First pass: a positive-width grapheme that covers the column.
         for p in &self.placed {
             if p.row == row && p.width > 0 && col >= p.col && col < p.col + p.width {
@@ -227,10 +237,20 @@ pub fn layout(
         }
     }
 
+    // Display width of the block's prefix glyph (e.g. `• `, `▎ `, `─── `). Every
+    // placed column is offset by this, and continuation rows hang-indent to it,
+    // so the effective wrap capacity is `vw - prefix_width`. Computed over the
+    // glyph's GRAPHEMES (matching the painted width), not a char count.
+    let prefix_width: usize = analysis
+        .prefix_glyph
+        .as_deref()
+        .map(|g| g.graphemes(true).map(grapheme_width).sum())
+        .unwrap_or(0);
+
     // Greedy soft-wrap.
     let mut placed: Vec<Placed> = Vec::new();
     let mut row = 0usize;
-    let mut col = 0usize;
+    let mut col = prefix_width;
     let mut row_end_col: Vec<usize> = Vec::new();
 
     for vg in &vgs {
@@ -245,10 +265,10 @@ pub fn layout(
             });
             continue;
         }
-        if col + vg.width > vw && col > 0 {
+        if col + vg.width > vw && col > prefix_width {
             row_end_col.push(col);
             row += 1;
-            col = 0;
+            col = prefix_width;
         }
         placed.push(Placed {
             src: vg.src.clone(),
@@ -311,6 +331,7 @@ pub fn layout(
         eol: line.len(),
         row_end_col,
         is_active,
+        prefix_width,
     };
     (visual_rows, map)
 }
@@ -608,6 +629,34 @@ mod tests {
     fn heading_rows_carry_heading_role() {
         let (rows, _m) = layout("## Title", BlockRole::Heading(2), false, 80);
         assert!(rows.iter().all(|r| r.role == BlockRole::Heading(2)));
+    }
+
+    #[test]
+    fn prefix_offsets_columns_so_cursor_lands_on_text() {
+        // A list item: prefix "• " (width 2). The first text glyph 'i' must be at col 2, not 0.
+        let (_rows, map) = layout("- item", BlockRole::ListItem, false, 40);
+        assert_eq!(map.prefix_width, 2, "• + space");
+        let (row, col) = map.source_to_visual(2); // byte 2 = 'i' (after "- ")
+        assert_eq!((row, col), (0, 2));
+        // A click in the prefix region (col 0/1) lands at the first text byte, not end-of-row.
+        assert_eq!(map.visual_to_source(0, 0), map.visual_to_source(0, 2));
+    }
+
+    #[test]
+    fn no_prefix_is_unchanged() {
+        let (_rows, map) = layout("plain text", BlockRole::Paragraph, false, 40);
+        assert_eq!(map.prefix_width, 0);
+        assert_eq!(map.source_to_visual(0), (0, 0)); // no offset
+    }
+
+    #[test]
+    fn prefix_reduces_wrap_capacity() {
+        // width-6 viewport, prefix width 2 → text wraps after 4 cols, continuation indented to col 2.
+        let (_rows, map) = layout("- aaaa bbbb", BlockRole::ListItem, false, 6);
+        assert!(map.rows >= 2, "should wrap");
+        // A glyph on row 1 starts at col == prefix_width (hanging indent).
+        let first_row1 = map.placed.iter().find(|p| p.row == 1 && p.width > 0).unwrap();
+        assert_eq!(first_row1.col, 2, "continuation indented to prefix_width");
     }
 
     #[test]

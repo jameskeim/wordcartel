@@ -346,7 +346,10 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 // ---------------------------------------------------------------
                 let dim_style = compose::compose(&editor.theme, editor.depth, &[SE::FocusDim]);
                 let mut segs_spans: Vec<Span<'_>> = Vec::new();
-                // Prepend prefix_glyph as a dim span (first visual row only).
+                // Prefix lead-in. Row 0 paints the real glyph; continuation rows
+                // of a prefixed line paint a blank spacer of `prefix_width` cells
+                // so painted text stays aligned with the prefix-offset cursor
+                // columns (`Placed.col` already includes `prefix_width`).
                 if let Some(ref glyph) = vr.prefix_glyph {
                     let pe = prefix_element(vr.role);
                     let gstyle = if row_dim {
@@ -355,6 +358,8 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                         compose::compose(&editor.theme, editor.depth, &[pe]).add_modifier(Modifier::DIM)
                     };
                     segs_spans.push(Span::styled(glyph.clone(), gstyle));
+                } else if map.prefix_width > 0 {
+                    segs_spans.push(Span::raw(" ".repeat(map.prefix_width)));
                 }
                 for seg in &vr.segs {
                     let style = if row_dim {
@@ -389,7 +394,10 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 let diag_window: Vec<&wordcartel_core::diagnostics::Diagnostic> =
                     diag_all[..hi_idx].iter().filter(|d| d.range.end > lo).collect();
 
-                // Prefix glyph (first visual row only): treat as unsearchable, apply dim only.
+                // Prefix lead-in. Row 0 paints the real glyph (unsearchable, dim
+                // only); continuation rows of a prefixed line paint a blank
+                // spacer of `prefix_width` cells so painted text stays aligned
+                // with the prefix-offset cursor columns.
                 if let Some(ref glyph) = vr.prefix_glyph {
                     let pe = prefix_element(vr.role);
                     let gstyle = if row_dim {
@@ -398,6 +406,8 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                         compose::compose(&editor.theme, editor.depth, &[pe]).add_modifier(Modifier::DIM)
                     };
                     hl_spans.push(Span::styled(glyph.clone(), gstyle));
+                } else if map.prefix_width > 0 {
+                    hl_spans.push(Span::raw(" ".repeat(map.prefix_width)));
                 }
 
                 // Hoist FocusDim compose once per row (mirrors segs path).
@@ -1473,6 +1483,70 @@ mod tests {
         );
     }
 
+    /// Task 6 gate (C1): a wrapped list item must paint its CONTINUATION row's
+    /// text starting at `text_left + prefix_width` (behind a blank spacer), and
+    /// the caret placed on a continuation-row glyph must land on that same
+    /// painted column — not `prefix_width` cells to its left. This is the proof
+    /// that render's continuation spacer keeps painted text aligned with the
+    /// prefix-offset cursor columns (`Placed.col` includes `prefix_width`).
+    #[test]
+    fn wrapped_list_item_continuation_row_aligns_text_and_caret() {
+        // 12-wide viewport, list prefix "• " (width 2). "aaaa bbbb cccc" wraps:
+        //   row 0: "• aaaa bbbb "   (glyph cols 0..2, text col 2..)
+        //   row 1: "  cccc"         (blank spacer cols 0..2, text col 2..)
+        let mut e = Editor::new_from_text("- aaaa bbbb cccc\nmore\n", None, (12, 8));
+        // Caret on line 1 so line 0 is INACTIVE: its "- " is concealed and the
+        // "• " prefix glyph is shown (active lines render raw, with no prefix).
+        set_caret(&mut e, 18); // byte 18 = start of "more\n"
+        derive::rebuild(&mut e);
+        let tg = crate::nav::text_geometry(&e);
+        let text_left = tg.text_left as usize;
+        assert_eq!(text_left, 0, "measure off → text_left 0");
+
+        let prefix_width = {
+            let (_rows, map) = &e.active().view.line_layouts[&0];
+            assert!(map.rows >= 2, "list item must wrap to exercise continuation row");
+            assert_eq!(map.prefix_width, 2, "list bullet '• ' width 2");
+            map.prefix_width
+        };
+
+        let buf = render_to_buffer(&mut e, 12, 8);
+
+        // (a) Continuation row (screen row 1): cols [text_left, text_left+prefix_width)
+        // are a blank spacer; the first text glyph is painted at text_left+prefix_width.
+        for c in 0..prefix_width {
+            let cell = buf[((text_left + c) as u16, 1u16)].symbol();
+            assert_eq!(cell, " ", "continuation-row spacer cell {c} must be blank, got {cell:?}");
+        }
+        let first_text_col = text_left + prefix_width;
+        assert_eq!(
+            buf[(first_text_col as u16, 1u16)].symbol(),
+            "c",
+            "continuation-row text must start at text_left+prefix_width ({first_text_col})"
+        );
+
+        // (b) The caret position for the first continuation-row glyph (byte 12 =
+        // first 'c') must resolve to the SAME column the glyph is painted at. The
+        // prefix-offset layout maps byte 12 -> (row 1, col prefix_width), and the
+        // screen column is text_left + col. This proves the caret lands ON the
+        // glyph, not prefix_width cells to its left under the spacer.
+        let (_rows, map) = &e.active().view.line_layouts[&0];
+        let (vrow, vcol) = map.source_to_visual(12);
+        assert_eq!(vrow, 1, "first continuation glyph is on visual row 1");
+        assert_eq!(
+            text_left + vcol,
+            first_text_col,
+            "caret column for the continuation glyph must equal its painted column \
+             (cursor on the glyph, not under the spacer)"
+        );
+        // And the inverse: a click on that painted cell round-trips to byte 12.
+        assert_eq!(
+            map.visual_to_source(vrow, first_text_col - text_left),
+            12,
+            "click on the continuation glyph's painted cell selects that glyph"
+        );
+    }
+
     /// Golden: fold marker `▸` glyph has DarkGray fg under Default theme.
     ///
     /// Creates a doc with a heading + body, folds the heading, renders, and
@@ -1541,3 +1615,5 @@ mod tests {
         );
     }
 }
+
+
