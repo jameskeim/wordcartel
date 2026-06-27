@@ -1,5 +1,5 @@
 use ratatui::style::{Color as RColor, Modifier, Style as RStyle};
-use wordcartel_core::theme::{quantize, Color, Depth, Face};
+use wordcartel_core::theme::{quantize, Color, Depth, Face, SemanticElement, Theme};
 
 fn to_rcolor(c: Color, depth: Depth) -> RColor {
     match quantize(c, depth) {
@@ -26,6 +26,19 @@ fn to_rcolor(c: Color, depth: Depth) -> RColor {
     }
 }
 
+fn merge(acc: Face, f: Face) -> Face {
+    Face {
+        fg: f.fg.or(acc.fg), bg: f.bg.or(acc.bg), underline_color: f.underline_color.or(acc.underline_color),
+        bold: f.bold.or(acc.bold), italic: f.italic.or(acc.italic), underline: f.underline.or(acc.underline),
+        strike: f.strike.or(acc.strike), reverse: f.reverse.or(acc.reverse), dim: f.dim.or(acc.dim),
+    }
+}
+
+pub fn compose(theme: &Theme, depth: Depth, stack: &[SemanticElement]) -> RStyle {
+    let merged = stack.iter().fold(Face::default(), |acc, &el| merge(acc, theme.face(el)));
+    face_to_ratatui(&merged, depth)
+}
+
 pub fn face_to_ratatui(face: &Face, depth: Depth) -> RStyle {
     let mut s = RStyle::default();
     if let Some(c) = face.fg { s = s.fg(to_rcolor(c, depth)); }
@@ -44,7 +57,7 @@ pub fn face_to_ratatui(face: &Face, depth: Depth) -> RStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wordcartel_core::theme::{Color, Face, Depth};
+    use wordcartel_core::theme::{Color, Face, Depth, SemanticElement as E};
     use ratatui::style::{Color as RColor, Modifier};
     #[test]
     fn maps_rgb_and_modifiers_at_truecolor() {
@@ -68,5 +81,19 @@ mod tests {
         let s = face_to_ratatui(&f, Depth::Ansi16);
         // Rgb red → named Red/LightRed → ratatui named (NOT Indexed)
         assert!(matches!(s.fg, Some(RColor::Red) | Some(RColor::LightRed)));
+    }
+    #[test]
+    fn later_face_field_overrides_earlier() {
+        let t = wordcartel_core::theme::tokyo_night();
+        // Heading then Code: Code's reverse/fg should override; heading fields not set by Code persist.
+        let s = compose(&t, Depth::Truecolor, &[E::Text, E::Heading(1), E::Code]);
+        let code = face_to_ratatui(&t.face(E::Code), Depth::Truecolor);
+        // the Code fg wins over the heading fg
+        assert_eq!(s.fg, code.fg);
+    }
+    #[test]
+    fn empty_stack_is_default_style() {
+        let t = wordcartel_core::theme::default();
+        assert_eq!(compose(&t, Depth::Truecolor, &[]), RStyle::default());
     }
 }
