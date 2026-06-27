@@ -203,7 +203,7 @@ pub fn default() -> Theme {
             block_quote: Face::default(), code_block: Face::default(),
             list_marker: Face { fg: Some(Color::DarkGray), ..Face::default() }, // prefix glyph normal
             thematic_break: Face::default(), front_matter: Face::default(), comment: Face::default(),
-            selection: Face::default(),             // not painted in plan ① (no face needed yet)
+            selection: Face { reverse: Some(true), ..Face::default() },
             // search: today match = yellow bg + black fg; current = reverse.
             search_match: Face { bg: Some(Color::Yellow), fg: Some(Color::Black), ..Face::default() },
             search_current: modface(None, false, false, false, false, true),

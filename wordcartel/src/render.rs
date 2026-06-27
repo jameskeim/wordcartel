@@ -296,8 +296,14 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     let diag_all: &[wordcartel_core::diagnostics::Diagnostic] =
         if diag_active { &editor.active().diagnostics.diagnostics } else { &[] };
 
-    // Use the placed-path builder when search is active OR valid diagnostics exist.
-    let use_placed = !hl_window.is_empty() || diag_active;
+    // Snapshot primary selection (Task 9: selection painting).
+    let sel_range = editor.active().document.selection.primary();
+    let (sel_from, sel_to) = (sel_range.from(), sel_range.to());
+    let has_sel = !sel_range.is_empty();
+
+    // Use the placed-path builder when search is active, valid diagnostics exist,
+    // or a non-empty selection must be painted (segs path does no per-glyph styling).
+    let use_placed = !hl_window.is_empty() || diag_active || has_sel;
 
     // Source-mode branch: in source modes (any mode other than LivePreview) the
     // stack is [Text] only — base canvas, no role or inline semantic styling.
@@ -460,6 +466,15 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                         let search_face = editor.theme.face(SE::SearchMatch);
                         let ss = crate::compose::face_to_ratatui(&search_face, editor.depth);
                         style = style.patch(ss);
+                    }
+
+                    // Apply selection reverse. Selection sits below search-current
+                    // (so a current search match stands out) but above the base style.
+                    // Diagnostic underline stacks on top of selection reverse.
+                    let is_selected = has_sel && overlaps(g_from, g_to, sel_from, sel_to);
+                    if is_selected {
+                        let sel_face = editor.theme.face(SE::Selection);
+                        style = style.patch(crate::compose::face_to_ratatui(&sel_face, editor.depth));
                     }
 
                     // Apply diagnostic underline if this glyph overlaps any diagnostic.
@@ -1635,6 +1650,33 @@ mod tests {
             "Default wrap guide must have DarkGray fg, got {:?}",
             cell_style.fg
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 9: selection painting tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn selection_paints_reverse_on_selected_cells() {
+        let mut ed = Editor::new_from_text("hello world\n", None, (40, 4));
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::range(0, 5); // "hello"
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 4);
+        // a selected cell (col 0..5 on row 0) carries the Selection face (reverse) layered on.
+        let sel = compose::compose(&ed.theme, ed.depth, &[wordcartel_core::theme::SemanticElement::Selection]);
+        assert!((0u16..5).any(|x| buf[(x,0)].style().add_modifier.contains(Modifier::REVERSED)),
+            "selected cells must carry REVERSED modifier; sel face = {sel:?}");
+        let _ = sel;
+    }
+
+    #[test]
+    fn empty_selection_paints_nothing() {
+        let mut ed = Editor::new_from_text("hello\n", None, (40, 4));
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(2);
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 4);
+        assert!(!(0u16..5).any(|x| buf[(x,0)].style().add_modifier.contains(Modifier::REVERSED)),
+            "empty (cursor-only) selection must not paint REVERSED on any cell");
     }
 }
 
