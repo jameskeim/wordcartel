@@ -168,6 +168,43 @@ impl Theme {
             "phosphor-purple","phosphor-purple-flat",
         ]
     }
+
+    /// Override a face PER FIELD: each `Some` field of `patch` replaces the stored
+    /// value; `None` fields leave the existing value untouched. Used by `[theme.styles]`.
+    pub fn override_face(&mut self, el: SemanticElement, patch: Face) {
+        let f = self.face_mut(el);
+        if patch.fg.is_some() { f.fg = patch.fg; }
+        if patch.bg.is_some() { f.bg = patch.bg; }
+        if patch.underline_color.is_some() { f.underline_color = patch.underline_color; }
+        if patch.bold.is_some() { f.bold = patch.bold; }
+        if patch.italic.is_some() { f.italic = patch.italic; }
+        if patch.underline.is_some() { f.underline = patch.underline; }
+        if patch.strike.is_some() { f.strike = patch.strike; }
+        if patch.reverse.is_some() { f.reverse = patch.reverse; }
+        if patch.dim.is_some() { f.dim = patch.dim; }
+    }
+
+    /// Mutable accessor mirroring `face()` (same match arms). Private.
+    fn face_mut(&mut self, el: SemanticElement) -> &mut Face {
+        use SemanticElement::*;
+        match el {
+            Text => &mut self.faces.text,
+            Emphasis => &mut self.faces.emphasis, Strong => &mut self.faces.strong,
+            StrongEmphasis => &mut self.faces.strong_emphasis, Code => &mut self.faces.code,
+            Strikethrough => &mut self.faces.strikethrough, Link => &mut self.faces.link,
+            Heading(n) => &mut self.faces.heading[(n.clamp(1, 6) - 1) as usize],
+            BlockQuote => &mut self.faces.block_quote, CodeBlock => &mut self.faces.code_block,
+            ListMarker => &mut self.faces.list_marker, ThematicBreak => &mut self.faces.thematic_break,
+            FrontMatter => &mut self.faces.front_matter, Comment => &mut self.faces.comment,
+            Selection => &mut self.faces.selection,
+            SearchMatch => &mut self.faces.search_match, SearchCurrent => &mut self.faces.search_current,
+            DiagSpelling => &mut self.faces.diag_spelling, DiagGrammar => &mut self.faces.diag_grammar,
+            FocusDim => &mut self.faces.focus_dim, FoldMarker => &mut self.faces.fold_marker,
+            WrapGuide => &mut self.faces.wrap_guide,
+            Chrome => &mut self.faces.chrome, ChromeReverse => &mut self.faces.chrome_reverse,
+            ChromeSelected => &mut self.faces.chrome_selected, ChromeMuted => &mut self.faces.chrome_muted,
+        }
+    }
 }
 
 // helper for terse face literals
@@ -282,6 +319,86 @@ pub fn tokyo_night() -> Theme {
             chrome_muted: Face { fg: Some(DARK3), dim: Some(true), ..Face::default() },
         },
     }
+}
+
+/// A base16 (or base24) palette: 16 canonical slots, optional 8 extra (base10..base17).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BasePalette {
+    pub base: [Color; 16],
+    pub extra: Option<[Color; 8]>,
+}
+
+/// Build a Theme from a base16 palette using the canonical base16 markdown mapping.
+/// Total even from the 16 core slots; `extra` (base24) only refines the chrome panel bg.
+pub fn from_base16(name: &str, p: BasePalette) -> Theme {
+    let b = p.base;
+    // base16 slot conventions:
+    // 00 bg · 01 panel · 02 sel-bg · 03 comment/dim · 04 dark-fg · 05 fg · 06 light-fg · 07 light-bg
+    // 08 red · 09 orange · 0A yellow · 0B green · 0C cyan · 0D blue · 0E magenta · 0F brown
+    let panel = p.extra.map(|e| e[0]).unwrap_or(b[1]); // base10 if base24, else base01
+    Theme {
+        name: name.into(),
+        base_fg: b[5],
+        base_bg: b[0],
+        heading_level_glyph: false,
+        monochrome: false,
+        faces: ThemeFaces {
+            text: Face::default(),
+            emphasis: Face { italic: Some(true), fg: Some(b[0xE]), ..Face::default() },
+            strong: Face { bold: Some(true), fg: Some(b[0xA]), ..Face::default() },
+            strong_emphasis: Face { bold: Some(true), italic: Some(true), fg: Some(b[0x9]), ..Face::default() },
+            code: Face { fg: Some(b[0xB]), ..Face::default() },
+            strikethrough: Face { strike: Some(true), fg: Some(b[0x3]), ..Face::default() },
+            link: Face { fg: Some(b[0xD]), underline: Some(true), ..Face::default() },
+            heading: [
+                Face { fg: Some(b[0xD]), bold: Some(true), ..Face::default() }, // h1 blue
+                Face { fg: Some(b[0xC]), bold: Some(true), ..Face::default() }, // h2 cyan
+                Face { fg: Some(b[0xB]), bold: Some(true), ..Face::default() }, // h3 green
+                Face { fg: Some(b[0xA]), bold: Some(true), ..Face::default() }, // h4 yellow
+                Face { fg: Some(b[0xE]), bold: Some(true), ..Face::default() }, // h5 magenta
+                Face { fg: Some(b[0x8]), bold: Some(true), ..Face::default() }, // h6 red
+            ],
+            block_quote: Face { fg: Some(b[0xC]), italic: Some(true), ..Face::default() },
+            code_block: Face { fg: Some(b[0xB]), ..Face::default() },
+            list_marker: Face { fg: Some(b[0x8]), ..Face::default() },
+            thematic_break: Face { fg: Some(b[0x3]), ..Face::default() },
+            front_matter: Face { fg: Some(b[0xF]), italic: Some(true), ..Face::default() },
+            comment: Face { fg: Some(b[0x3]), italic: Some(true), dim: Some(true), ..Face::default() },
+            selection: Face { bg: Some(b[0x2]), ..Face::default() },
+            search_match: Face { bg: Some(b[0xA]), fg: Some(b[0x0]), ..Face::default() },
+            search_current: Face { reverse: Some(true), ..Face::default() },
+            diag_spelling: Face { underline: Some(true), underline_color: Some(b[0x8]), ..Face::default() },
+            diag_grammar:  Face { underline: Some(true), underline_color: Some(b[0xD]), ..Face::default() },
+            focus_dim: Face { fg: Some(b[0x3]), dim: Some(true), ..Face::default() },
+            fold_marker: Face { fg: Some(b[0x3]), ..Face::default() },
+            wrap_guide: Face { fg: Some(b[0x2]), ..Face::default() },
+            chrome: Face { fg: Some(b[0x5]), bg: Some(panel), ..Face::default() },
+            chrome_reverse: Face { reverse: Some(true), ..Face::default() },
+            chrome_selected: Face { fg: Some(b[0x0]), bg: Some(b[0x5]), ..Face::default() },
+            chrome_muted: Face { fg: Some(b[0x4]), dim: Some(true), ..Face::default() },
+        },
+    }
+}
+
+/// Map a snake-case config key (`[theme.styles]`) to a SemanticElement.
+/// `heading1`..`heading6` map to `Heading(n)`. Unknown → None (caller warns).
+pub fn element_from_key(key: &str) -> Option<SemanticElement> {
+    use SemanticElement::*;
+    Some(match key {
+        "text" => Text,
+        "emphasis" => Emphasis, "strong" => Strong, "strong_emphasis" => StrongEmphasis,
+        "code" => Code, "strikethrough" => Strikethrough, "link" => Link,
+        "heading1" => Heading(1), "heading2" => Heading(2), "heading3" => Heading(3),
+        "heading4" => Heading(4), "heading5" => Heading(5), "heading6" => Heading(6),
+        "block_quote" => BlockQuote, "code_block" => CodeBlock, "list_marker" => ListMarker,
+        "thematic_break" => ThematicBreak, "front_matter" => FrontMatter, "comment" => Comment,
+        "selection" => Selection, "search_match" => SearchMatch, "search_current" => SearchCurrent,
+        "diag_spelling" => DiagSpelling, "diag_grammar" => DiagGrammar, "focus_dim" => FocusDim,
+        "fold_marker" => FoldMarker, "wrap_guide" => WrapGuide,
+        "chrome" => Chrome, "chrome_reverse" => ChromeReverse,
+        "chrome_selected" => ChromeSelected, "chrome_muted" => ChromeMuted,
+        _ => return None,
+    })
 }
 
 fn rgb_to_hsl(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
@@ -590,5 +707,65 @@ mod tests {
             assert_ne!(quantize(t.base_fg, Depth::Ansi16), quantize(t.base_bg, Depth::Ansi16),
                        "{name}: fg/bg collapse at ansi16");
         }
+    }
+
+    // A minimal but realistic base16 palette (Gruvbox-dark-ish), 16 RGB slots.
+    fn sample_base16() -> BasePalette {
+        let c = |r, g, b| Color::Rgb { r, g, b };
+        BasePalette {
+            base: [
+                c(0x28,0x28,0x28), c(0x3c,0x38,0x36), c(0x50,0x49,0x45), c(0x66,0x5c,0x54), // 00..03
+                c(0xbd,0xae,0x93), c(0xd5,0xc4,0xa1), c(0xeb,0xdb,0xb2), c(0xfb,0xf1,0xc7), // 04..07
+                c(0xfb,0x49,0x34), c(0xfe,0x80,0x19), c(0xfa,0xbd,0x2f), c(0xb8,0xbb,0x26), // 08..0B
+                c(0x8e,0xc0,0x7c), c(0x83,0xa5,0x98), c(0xd3,0x86,0x9b), c(0xd6,0x5d,0x0e), // 0C..0F
+            ],
+            extra: None,
+        }
+    }
+
+    #[test]
+    fn from_base16_is_total_and_uses_canonical_slots() {
+        let t = from_base16("base16-gruvbox", sample_base16());
+        assert_eq!(t.name, "base16-gruvbox");
+        assert!(!t.monochrome);
+        // base_bg = base00, base_fg = base05 (base16 convention)
+        assert_eq!(t.base_bg, Color::Rgb { r:0x28, g:0x28, b:0x28 });
+        assert_eq!(t.base_fg, Color::Rgb { r:0xd5, g:0xc4, b:0xa1 });
+        // headings are bold + colored (base0D = blue slot for h1)
+        let h1 = t.face(SemanticElement::Heading(1));
+        assert_eq!(h1.bold, Some(true));
+        assert_eq!(h1.fg, Some(Color::Rgb { r:0x83, g:0xa5, b:0x98 })); // base0D
+        // code colored from base0B (green); link underlined from base0D
+        assert_eq!(t.face(SemanticElement::Code).fg, Some(Color::Rgb { r:0xb8, g:0xbb, b:0x26 }));
+        assert_eq!(t.face(SemanticElement::Link).underline, Some(true));
+        // EVERY element resolves to *some* face without panicking (totality)
+        for el in [SemanticElement::Text, SemanticElement::Comment, SemanticElement::FrontMatter,
+                   SemanticElement::Chrome, SemanticElement::ChromeSelected, SemanticElement::WrapGuide] {
+            let _ = t.face(el);
+        }
+    }
+
+    #[test]
+    fn override_face_is_per_field() {
+        let mut t = default();
+        // override only the bg of Selection; reverse (existing) must remain.
+        t.override_face(SemanticElement::Selection,
+            Face { bg: Some(Color::Rgb { r:0x28, g:0x34, b:0x57 }), ..Face::default() });
+        let sel = t.face(SemanticElement::Selection);
+        assert_eq!(sel.bg, Some(Color::Rgb { r:0x28, g:0x34, b:0x57 })); // set
+        assert_eq!(sel.reverse, Some(true));                            // preserved from default()
+    }
+
+    #[test]
+    fn element_from_key_maps_snake_case_names() {
+        use SemanticElement::*;
+        assert_eq!(element_from_key("heading1"), Some(Heading(1)));
+        assert_eq!(element_from_key("heading6"), Some(Heading(6)));
+        assert_eq!(element_from_key("selection"), Some(Selection));
+        assert_eq!(element_from_key("strong_emphasis"), Some(StrongEmphasis));
+        assert_eq!(element_from_key("chrome_selected"), Some(ChromeSelected));
+        assert_eq!(element_from_key("nope"), None);
+        assert_eq!(element_from_key("heading0"), None); // out of range
+        assert_eq!(element_from_key("heading7"), None);
     }
 }
