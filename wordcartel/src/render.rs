@@ -1716,30 +1716,38 @@ mod tests {
             // spelling vs grammar are different underline COLORS today; in cue mode they
             // must stay distinguishable by modifier (Codex I7 — §13.2 is fully closed).
             assert_ne!(t.face(DiagSpelling), t.face(DiagGrammar), "{}: DiagSpelling vs DiagGrammar", t.name);
+            // Emphasis/Strong/StrongEmphasis are three distinct inline levels — lock pairwise.
+            assert_ne!(t.face(Emphasis), t.face(Strong), "{}: Emphasis vs Strong", t.name);
+            assert_ne!(t.face(Strong), t.face(StrongEmphasis), "{}: Strong vs StrongEmphasis", t.name);
+            assert_ne!(t.face(Emphasis), t.face(StrongEmphasis), "{}: Emphasis vs StrongEmphasis", t.name);
         }
     }
 
-    /// §13.2: Structural glyphs (blockquote ▎, thematic-break ─, heading shade) render
-    /// in the No-color theme for inactive structural lines.
+    /// §13.2: Structural glyphs (blockquote ▎, thematic-break ─, heading shade, list bullet •)
+    /// render in the No-color theme for inactive structural lines.
     #[test]
     fn a11y_structural_glyphs_render_in_no_color() {
-        // blockquote ▎, thematic-break ───, heading shade glyph all PAINT under No-color (glyph cue).
+        // blockquote ▎, thematic-break ───, list bullet •, heading shade glyph all PAINT under
+        // No-color (glyph cue).
         // Document layout:
-        //   "> quote\n" = bytes 0-7 (blockquote)
-        //   "\n"        = byte  8   (blank line — place caret HERE to avoid activating structural lines)
-        //   "---\n"     = bytes 9-12 (thematic break)
-        //   "\n"        = byte  13  (blank line)
-        //   "### H3\n"  = bytes 14-21 (heading)
-        let mut ed = Editor::new_from_text("> quote\n\n---\n\n### H3\n", None, (40, 12));
+        //   "> quote\n" = bytes  0-7  (blockquote)
+        //   "\n"        = byte   8    (blank line)
+        //   "---\n"     = bytes  9-12 (thematic break)
+        //   "\n"        = byte  13    (blank line)
+        //   "- item\n"  = bytes 14-20 (list item)
+        //   "\n"        = byte  21    (blank line — place caret HERE: ALL structural lines inactive)
+        //   "### H3\n"  = bytes 22-29 (H3 heading)
+        let mut ed = Editor::new_from_text("> quote\n\n---\n\n- item\n\n### H3\n", None, (40, 12));
         ed.theme = wordcartel_core::theme::no_color(); // heading_level_glyph = true
-        // Place caret on the blank line (byte 8) so ALL structural lines are INACTIVE
+        // Place caret on the blank line at byte 21 so ALL structural lines are INACTIVE
         // and render their prefix glyphs (Task 6 invariant: active line ⟹ no prefix glyph).
-        set_caret(&mut ed, 8);
+        set_caret(&mut ed, 21);
         crate::derive::rebuild(&mut ed);
         let text = (0..12).map(|r| row_string(&render_to_buffer(&mut ed, 40, 12), r)).collect::<String>();
         assert!(text.contains('▎'), "blockquote bar");
         assert!(text.contains('─'), "thematic rule");
-        assert!(text.contains('▒') || text.contains('█'), "heading shade glyph"); // h3 = ▒
+        assert!(text.contains('•'), "list bullet glyph under no_color");
+        assert!(text.contains('▒'), "H3 heading shade glyph (▒ = SHADES[2])");
     }
 }
 
