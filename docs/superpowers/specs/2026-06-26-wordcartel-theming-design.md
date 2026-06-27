@@ -33,9 +33,10 @@ don't desync the caret (the 5g fold-marker trap). And **document selection** is
 painted on the text for the first time.
 
 Scope = **markdown text + on-text overlays** (search, diagnostics, focus,
-**selection**) + a small **chrome palette**. Phosphor themes also **tint the
-source views** (their base hue applies in source modes), giving the authentic
-green/amber-on-black monitor look.
+**selection**) + a small **chrome palette** (status bar, menu, overlay frames).
+A phosphor theme drives **all** of it in one hue — text, source views *and* chrome
+— so the **entire screen is monochrome**, the authentic green/amber-on-black
+monitor look.
 
 ## 2. Goals / Non-Goals
 
@@ -216,6 +217,15 @@ Three chrome faces cover all chrome sites; the Default theme reproduces today's 
 | muted chrome text (query prompt, inactive menu, secondary) | `ChromeMuted` | white on dark-gray |
 
 (If the plan finds a 4th distinct combo, it adds a face; the table is the contract.)
+
+**Each theme sets its own chrome faces** — chrome is themed, not a fixed gray:
+- **Default** → today's white/black (golden-reproduced).
+- **Tokyo Night / base16** → derived from the palette's panel/selection slots.
+- **Phosphor** → **the hue**: status bar, menu, and overlay frames render in
+  hue shades (e.g. bright-amber-on-dark-amber, `ChromeSelected` = reverse), so the
+  *entire* screen is monochrome — the authentic full-monitor look. The phosphor
+  generator (§3.1) fills `Chrome`/`ChromeSelected`/`ChromeMuted` from the same
+  shade ramp as the text faces.
 
 ### 3.9 Producers (Codex A/B — sound against the real parser)
 - **Front matter (byte-0 only):** do **not** enable pulldown's global metadata
