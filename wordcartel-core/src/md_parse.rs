@@ -330,6 +330,9 @@ fn apply_block_prefix_conceal(
             None
         }
 
+        // Block HTML comments: no prefix glyph (the full source is shown as-is).
+        BlockRole::Comment => None,
+
         // Paragraph and others: no prefix conceal.
         _ => None,
     }

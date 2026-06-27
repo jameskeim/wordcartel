@@ -142,6 +142,7 @@ pub enum BlockKind {
     ListItem,
     ThematicBreak,
     HtmlBlock,
+    HtmlComment,
     Table,
     /// Footnote definitions / metadata blocks / def lists collapsed here.
     Other,
@@ -195,6 +196,7 @@ fn role_precedence(r: &crate::style::BlockRole) -> u8 {
     match r {
         CodeBlock      => 0,
         Heading(_)     => 1,
+        Comment        => 2,
         ThematicBreak  => 2,
         ListItem       => 3,
         BlockQuote     => 4,
@@ -212,6 +214,7 @@ fn kind_to_role(kind: &BlockKind) -> Option<crate::style::BlockRole> {
         BlockKind::ThematicBreak => Some(BlockRole::ThematicBreak),
         BlockKind::ListItem => Some(BlockRole::ListItem),
         BlockKind::BlockQuote => Some(BlockRole::BlockQuote),
+        BlockKind::HtmlComment => Some(BlockRole::Comment),
         _ => None,
     }
 }
@@ -337,6 +340,16 @@ fn parse_region<S: TextSource>(src: &S, region: Range<usize>, base: usize) -> Bl
         match event {
             Event::Start(tag) => {
                 if let Some(kind) = tag_to_kind(&tag) {
+                    // Discriminate HTML comment blocks from generic HTML blocks:
+                    // `text` is the region-local slice, `range` is region-local,
+                    // so `text[range.clone()]` correctly indexes the region text.
+                    let kind = if kind == BlockKind::HtmlBlock
+                        && text[range.clone()].trim_start().starts_with("<!--")
+                    {
+                        BlockKind::HtmlComment
+                    } else {
+                        kind
+                    };
                     stack.push(Block { kind, span, children: Vec::new() });
                 }
             }
@@ -1208,6 +1221,55 @@ mod tests {
             "str incremental != full_parse"
         );
         assert_eq!(rope_tree, str_tree, "rope incremental != str incremental");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 3: block <!-- --> → HtmlComment → BlockRole::Comment
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn block_html_comment_maps_to_comment_role() {
+        let doc = "<!-- a block comment -->\n\npara\n";
+        let t = full_parse(doc);
+        let at = |needle: &str| t.role_at(doc.find(needle).unwrap());
+        assert_eq!(at("block comment"), crate::style::BlockRole::Comment);
+    }
+
+    #[test]
+    fn block_div_is_not_comment() {
+        let doc = "<div>x</div>\n\npara\n";
+        let t = full_parse(doc);
+        assert_ne!(t.role_at(doc.find("x").unwrap()), crate::style::BlockRole::Comment);
+    }
+
+    /// A block comment nested inside a list item (as a loose list child) must
+    /// still resolve to BlockRole::Comment, not BlockRole::ListItem.
+    ///
+    /// In CommonMark a blank-separated item body can contain block-level HTML.
+    /// The markdown `"- item\n\n  <!-- c -->\n"` produces a loose list item
+    /// whose children include both a paragraph and an HTML block.  pulldown-cmark
+    /// nests the HtmlBlock under the ListItem; the HtmlComment block is therefore
+    /// a grandchild of the Document.  role_at walks the full tree, so the
+    /// HtmlComment role (precedence 2) beats ListItem (precedence 3), yielding
+    /// BlockRole::Comment.
+    #[test]
+    fn block_comment_nested_in_list_item_wins_over_list_item() {
+        // Loose list: blank line between the paragraph and the comment block
+        // forces the list item to be "loose", making the HTML block a sibling
+        // paragraph inside the list item.
+        let doc = "- item\n\n  <!-- c -->\n";
+        let t = full_parse(doc);
+        // Verify nesting: the HTML comment must actually appear as a nested block.
+        // Walk children to check the structure.
+        let tops = t.top_level();
+        assert!(!tops.is_empty(), "expected at least one top-level block");
+        // The top-level block should be a List containing a ListItem.
+        assert_eq!(tops[0].kind, BlockKind::List, "expected List at top level");
+        // Find the comment block somewhere in the tree
+        let comment_pos = doc.find("<!-- c -->").unwrap();
+        let role = t.role_at(comment_pos);
+        assert_eq!(role, crate::style::BlockRole::Comment,
+            "comment nested in list item should resolve to Comment, got {:?}", role);
     }
 
     /// Extra assertions for the non-LF separator cases: prove that line_start

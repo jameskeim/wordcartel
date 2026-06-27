@@ -76,6 +76,7 @@ fn role_element(role: wordcartel_core::style::BlockRole) -> SE {
         R::ListItem       => SE::ListMarker,
         R::ThematicBreak  => SE::ThematicBreak,
         R::FrontMatter    => SE::FrontMatter,
+        R::Comment        => SE::Comment,
         R::Paragraph      => SE::Text,
     }
 }

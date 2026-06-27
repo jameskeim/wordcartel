@@ -5,7 +5,7 @@ use std::ops::Range;
 pub enum Style { Plain, Emphasis, Strong, StrongEmphasis, Code, Strikethrough, Link, Comment }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BlockRole { Paragraph, Heading(u8), BlockQuote, ListItem, CodeBlock, ThematicBreak, FrontMatter }
+pub enum BlockRole { Paragraph, Heading(u8), BlockQuote, ListItem, CodeBlock, ThematicBreak, FrontMatter, Comment }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StyleSpan { pub src: Range<usize>, pub style: Style }
@@ -44,5 +44,11 @@ mod tests {
         fn _exhaustive(s: Style) -> u8 { match s {
             Style::Plain=>0, Style::Emphasis=>1, Style::Strong=>2, Style::StrongEmphasis=>3,
             Style::Code=>4, Style::Strikethrough=>5, Style::Link=>6, Style::Comment=>7 } }
+        // compile-guard: every BlockRole variant must be named
+        fn _exhaustive_block_role(r: super::BlockRole) -> u8 { match r {
+            super::BlockRole::Paragraph=>0, super::BlockRole::Heading(_)=>1,
+            super::BlockRole::BlockQuote=>2, super::BlockRole::ListItem=>3,
+            super::BlockRole::CodeBlock=>4, super::BlockRole::ThematicBreak=>5,
+            super::BlockRole::FrontMatter=>6, super::BlockRole::Comment=>7 } }
     }
 }
