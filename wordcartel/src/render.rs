@@ -48,6 +48,7 @@ pub fn style_to_ratatui(s: Style) -> RStyle {
         Style::Strikethrough => RStyle::default().add_modifier(Modifier::CROSSED_OUT),
         Style::Code => RStyle::default().fg(Color::Cyan),
         Style::Link => RStyle::default().add_modifier(Modifier::UNDERLINED).fg(Color::Yellow),
+        Style::Comment => RStyle::default().add_modifier(Modifier::DIM).add_modifier(Modifier::ITALIC),
     }
 }
 
@@ -61,6 +62,7 @@ fn style_element(s: Style) -> SE {
         Style::Code          => SE::Code,
         Style::Strikethrough => SE::Strikethrough,
         Style::Link          => SE::Link,
+        Style::Comment       => SE::Comment,
     }
 }
 
