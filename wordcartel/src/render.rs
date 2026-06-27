@@ -1,7 +1,7 @@
 // Task 5: ratatui live-preview render + status line.
 // Pure: takes &Editor, mutates NOTHING on the editor.
 
-use crate::{derive, editor::Editor, nav};
+use crate::{compose, derive, editor::Editor, nav};
 use wordcartel_core::count;
 use ratatui::{
     layout::{Position, Rect},
@@ -11,6 +11,7 @@ use ratatui::{
     Frame,
 };
 use wordcartel_core::style::Style;
+use wordcartel_core::theme::SemanticElement as SE;
 
 /// Half-open interval intersection: is the row's global byte range active?
 ///
@@ -32,6 +33,10 @@ pub(crate) fn overlaps(a0: usize, a1: usize, b0: usize, b1: usize) -> bool {
 /// Strong→BOLD; Emphasis→ITALIC; StrongEmphasis→BOLD|ITALIC;
 /// Strikethrough→CROSSED_OUT; Code→Cyan color; Link→UNDERLINED+Yellow;
 /// Plain→default.
+///
+/// This function is kept for the `style_mapping_is_bold_for_strong` test and
+/// any callers that still need the inline-only form. New render sites use
+/// `compose` directly.
 pub fn style_to_ratatui(s: Style) -> RStyle {
     match s {
         Style::Plain => RStyle::default(),
@@ -43,6 +48,33 @@ pub fn style_to_ratatui(s: Style) -> RStyle {
         Style::Strikethrough => RStyle::default().add_modifier(Modifier::CROSSED_OUT),
         Style::Code => RStyle::default().fg(Color::Cyan),
         Style::Link => RStyle::default().add_modifier(Modifier::UNDERLINED).fg(Color::Yellow),
+    }
+}
+
+/// Map a wordcartel inline `Style` to a `SemanticElement` for theme lookup.
+fn style_element(s: Style) -> SE {
+    match s {
+        Style::Plain         => SE::Text,
+        Style::Emphasis      => SE::Emphasis,
+        Style::Strong        => SE::Strong,
+        Style::StrongEmphasis => SE::StrongEmphasis,
+        Style::Code          => SE::Code,
+        Style::Strikethrough => SE::Strikethrough,
+        Style::Link          => SE::Link,
+    }
+}
+
+/// Map a `BlockRole` to a `SemanticElement` for theme lookup.
+fn role_element(role: wordcartel_core::style::BlockRole) -> SE {
+    use wordcartel_core::style::BlockRole as R;
+    match role {
+        R::Heading(n)     => SE::Heading(n),
+        R::BlockQuote     => SE::BlockQuote,
+        R::CodeBlock      => SE::CodeBlock,
+        R::ListItem       => SE::ListMarker,
+        R::ThematicBreak  => SE::ThematicBreak,
+        R::FrontMatter    => SE::FrontMatter,
+        R::Paragraph      => SE::Text,
     }
 }
 
@@ -249,6 +281,10 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     // Use the placed-path builder when search is active OR valid diagnostics exist.
     let use_placed = !hl_window.is_empty() || diag_active;
 
+    // Source-mode branch: in source modes (any mode other than LivePreview) the
+    // stack is [Text] only — base canvas, no role or inline semantic styling.
+    let source_mode = editor.active().view.mode != crate::editor::RenderMode::LivePreview;
+
     'outer: for &l in &sorted_lines {
         if l < scroll {
             continue;
@@ -298,7 +334,13 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                     segs_spans.push(Span::styled(glyph.clone(), gstyle));
                 }
                 for seg in &vr.segs {
-                    let style = if row_dim { dim_style } else { style_to_ratatui(seg.style) };
+                    let style = if row_dim {
+                        dim_style
+                    } else if source_mode {
+                        compose::compose(&editor.theme, editor.depth, &[SE::Text])
+                    } else {
+                        compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(seg.style)])
+                    };
                     segs_spans.push(Span::styled(seg.text.clone(), style));
                 }
                 segs_spans
@@ -343,8 +385,10 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
 
                     let mut style = if row_dim {
                         RStyle::default().fg(Color::DarkGray)
+                    } else if source_mode {
+                        compose::compose(&editor.theme, editor.depth, &[SE::Text])
                     } else {
-                        style_to_ratatui(p.style)
+                        compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(p.style)])
                     };
                     if is_current {
                         style = style.add_modifier(Modifier::REVERSED);
@@ -1081,5 +1125,57 @@ mod tests {
         assert_eq!(crate::render::word_count_segment(&e), Some("1 words · 5 chars".to_string()));
         e.view_opts.word_count = false;
         assert_eq!(crate::render::word_count_segment(&e), None);
+    }
+
+    #[test]
+    fn default_theme_inline_styles_unchanged() {
+        // a strong word renders BOLD, a code span gets cyan fg — exactly as today.
+        // Two lines: the caret goes to line 1 so line 0 is inactive (concealed/styled).
+        let mut ed = Editor::new_from_text("**bold** and `code`\nother\n", None, (40, 4));
+        // Move caret to line 1 so line 0 is inactive → styling applied in LivePreview.
+        set_caret(&mut ed, 20); // byte 20 = start of "other\n"
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 4);
+        // find a bold cell and a cyan cell on row 0 (live-preview conceals the markers)
+        let row0_has_bold = (0..40).any(|x| buf[(x,0)].style().add_modifier.contains(Modifier::BOLD));
+        let row0_has_cyan = (0..40).any(|x| buf[(x,0)].style().fg == Some(Color::Indexed(6)) || buf[(x,0)].style().fg == Some(Color::Cyan));
+        assert!(row0_has_bold && row0_has_cyan);
+    }
+
+    #[test]
+    fn tokyo_night_heading_row_carries_heading_fg() {
+        let mut ed = Editor::new_from_text("# Title\n", None, (40, 4));
+        ed.theme = wordcartel_core::theme::tokyo_night();
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 4);
+        let want = crate::compose::compose(&ed.theme, ed.depth, &[wordcartel_core::theme::SemanticElement::Text, wordcartel_core::theme::SemanticElement::Heading(1)]).fg;
+        assert!((0..40).any(|x| buf[(x,0)].style().fg == want && want.is_some()), "heading fg applied");
+    }
+
+    #[test]
+    fn source_mode_no_heading_fg_live_preview_has_heading_fg() {
+        // In SourcePlain under Tokyo Night, a heading row must NOT carry the heading fg.
+        // In LivePreview it must.
+        use crate::editor::RenderMode;
+        let mut ed = Editor::new_from_text("# Heading\n", None, (40, 4));
+        ed.theme = wordcartel_core::theme::tokyo_night();
+
+        // LivePreview first: heading fg should appear.
+        ed.active_mut().view.mode = RenderMode::LivePreview;
+        crate::derive::rebuild(&mut ed);
+        let buf_preview = render_to_buffer(&mut ed, 40, 4);
+        let want = crate::compose::compose(&ed.theme, ed.depth, &[
+            wordcartel_core::theme::SemanticElement::Text,
+            wordcartel_core::theme::SemanticElement::Heading(1),
+        ]).fg;
+        let preview_has_heading_fg = (0..40).any(|x| buf_preview[(x,0)].style().fg == want && want.is_some());
+        assert!(preview_has_heading_fg, "LivePreview heading must carry heading fg");
+
+        // SourcePlain: base canvas only, no heading fg.
+        ed.active_mut().view.mode = RenderMode::SourcePlain;
+        crate::derive::rebuild(&mut ed);
+        let buf_source = render_to_buffer(&mut ed, 40, 4);
+        let source_has_heading_fg = (0..40).any(|x| buf_source[(x,0)].style().fg == want && want.is_some());
+        assert!(!source_has_heading_fg, "SourcePlain must not carry heading fg (base canvas only)");
     }
 }
