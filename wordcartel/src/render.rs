@@ -210,7 +210,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         let within_viewport = gx < area.x + w;
         let not_scrollbar_col = !(editor.mouse.scrollbar_visible && gx == area.x + w - 1);
         if within_viewport && not_scrollbar_col {
-            let guide_style = RStyle::default().fg(Color::DarkGray);
+            let guide_style = compose::compose(&editor.theme, editor.depth, &[SE::WrapGuide]);
             for r in 0..edit_height {
                 frame.render_widget(
                     Paragraph::new(Line::from(Span::styled("│", guide_style))),
@@ -326,11 +326,15 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 // ---------------------------------------------------------------
                 // EXISTING segs-based path (no active search, no diagnostics) — true no-op.
                 // ---------------------------------------------------------------
-                let dim_style = RStyle::default().fg(Color::DarkGray);
+                let dim_style = compose::compose(&editor.theme, editor.depth, &[SE::FocusDim]);
                 let mut segs_spans: Vec<Span<'_>> = Vec::new();
                 // Prepend prefix_glyph as a dim span (first visual row only).
                 if let Some(ref glyph) = vr.prefix_glyph {
-                    let gstyle = if row_dim { dim_style } else { RStyle::default().add_modifier(Modifier::DIM) };
+                    let gstyle = if row_dim {
+                        compose::compose(&editor.theme, editor.depth, &[SE::ListMarker])
+                    } else {
+                        compose::compose(&editor.theme, editor.depth, &[SE::ListMarker]).add_modifier(Modifier::DIM)
+                    };
                     segs_spans.push(Span::styled(glyph.clone(), gstyle));
                 }
                 for seg in &vr.segs {
@@ -368,8 +372,11 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
 
                 // Prefix glyph (first visual row only): treat as unsearchable, apply dim only.
                 if let Some(ref glyph) = vr.prefix_glyph {
-                    let dim_style = RStyle::default().fg(Color::DarkGray);
-                    let gstyle = if row_dim { dim_style } else { RStyle::default().add_modifier(Modifier::DIM) };
+                    let gstyle = if row_dim {
+                        compose::compose(&editor.theme, editor.depth, &[SE::ListMarker])
+                    } else {
+                        compose::compose(&editor.theme, editor.depth, &[SE::ListMarker]).add_modifier(Modifier::DIM)
+                    };
                     hl_spans.push(Span::styled(glyph.clone(), gstyle));
                 }
 
@@ -384,26 +391,31 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                     let is_match = !is_current && hl_window.iter().any(|m| overlaps(g_from, g_to, m.start, m.end));
 
                     let mut style = if row_dim {
-                        RStyle::default().fg(Color::DarkGray)
+                        compose::compose(&editor.theme, editor.depth, &[SE::FocusDim])
                     } else if source_mode {
                         compose::compose(&editor.theme, editor.depth, &[SE::Text])
                     } else {
                         compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(p.style)])
                     };
                     if is_current {
-                        style = style.add_modifier(Modifier::REVERSED);
+                        style = compose::compose(&editor.theme, editor.depth, &[SE::SearchCurrent]);
                     } else if is_match {
-                        style = style.bg(Color::Yellow).fg(Color::Black);
+                        style = compose::compose(&editor.theme, editor.depth, &[SE::SearchMatch]);
                     }
 
                     // Apply diagnostic underline if this glyph overlaps any diagnostic.
                     // Search-highlight precedence stands: underline may stack on REVERSED.
                     if let Some(d) = diag_window.iter().find(|d| overlaps(g_from, g_to, d.range.start, d.range.end)) {
-                        style = style.add_modifier(Modifier::UNDERLINED);
-                        style = match d.kind {
-                            wordcartel_core::diagnostics::DiagnosticKind::Spelling => style.underline_color(Color::Red),
-                            wordcartel_core::diagnostics::DiagnosticKind::Grammar  => style.underline_color(Color::Blue),
+                        let diag_face = match d.kind {
+                            wordcartel_core::diagnostics::DiagnosticKind::Spelling =>
+                                compose::compose(&editor.theme, editor.depth, &[SE::DiagSpelling]),
+                            wordcartel_core::diagnostics::DiagnosticKind::Grammar =>
+                                compose::compose(&editor.theme, editor.depth, &[SE::DiagGrammar]),
                         };
+                        style = style.add_modifier(diag_face.add_modifier);
+                        if let Some(uc) = diag_face.underline_color {
+                            style = style.underline_color(uc);
+                        }
                     }
 
                     // Flush the accumulated run when the style changes.
@@ -422,10 +434,10 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             // 5g: fold marker on the heading's first visual row.
             let mut spans = spans;
             if let Some(n) = fold_marker_n {
-                spans.insert(0, Span::styled("▸ ", RStyle::default().fg(Color::DarkGray)));
+                spans.insert(0, Span::styled("▸ ", compose::compose(&editor.theme, editor.depth, &[SE::FoldMarker])));
                 spans.push(Span::styled(
                     format!("  … {n} lines"),
-                    RStyle::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                    compose::compose(&editor.theme, editor.depth, &[SE::FoldMarker]).add_modifier(Modifier::DIM),
                 ));
             }
 
@@ -1220,5 +1232,56 @@ mod tests {
         let buf_source = render_to_buffer(&mut ed, 40, 4);
         let source_has_heading_fg = (0..40).any(|x| buf_source[(x,0)].style().fg == want && want.is_some());
         assert!(!source_has_heading_fg, "SourcePlain must not carry heading fg (base canvas only)");
+    }
+
+    #[test]
+    fn default_search_and_diag_unchanged() {
+        // search highlight still yellow-bg/reverse; diagnostics still underline red/blue.
+        // Mirror the existing search/diag tests — they must keep passing under Default.
+        {
+            let mut e = Editor::new_from_text("foo bar foo\n", None, (40, 6));
+            e.open_search(crate::search_overlay::Phase::Find, 0);
+            for c in "foo".chars() { e.search.as_mut().unwrap().insert(c); }
+            let rope = e.active().document.buffer.snapshot();
+            let v = e.active().document.version;
+            e.search.as_mut().unwrap().recompute(&rope, v);
+            crate::derive::rebuild(&mut e);
+            let buf = render_to_buffer(&mut e, 40, 6);
+            assert!(row_has_highlight(&buf, 0), "Default: search highlights still present");
+        }
+        {
+            let mut e = Editor::new_from_text("teh cat\n", None, (40, 6));
+            let v = e.active().document.version;
+            e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+                range: 0..3,
+                kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                message: "x".into(),
+                suggestions: vec![],
+            }];
+            e.active_mut().diagnostics.computed_version = v;
+            crate::derive::rebuild(&mut e);
+            let buf = render_to_buffer(&mut e, 40, 6);
+            assert!(row_has_underline(&buf, 0), "Default: diag underline still present");
+        }
+    }
+
+    #[test]
+    fn no_color_theme_strips_search_color_keeps_reverse() {
+        // Under no-color theme, a search match cell has REVERSED and no yellow bg.
+        let mut ed = Editor::new_from_text("needle here\n", None, (40, 4));
+        ed.theme = wordcartel_core::theme::no_color();
+        ed.open_search(crate::search_overlay::Phase::Find, 0);
+        for c in "needle".chars() { ed.search.as_mut().unwrap().insert(c); }
+        let rope = ed.active().document.buffer.snapshot();
+        let v = ed.active().document.version;
+        ed.search.as_mut().unwrap().recompute(&rope, v);
+        crate::derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 4);
+        // The match cell for "needle" on row 0: should have REVERSED (no_color search_match has reverse=true)
+        // and NO yellow bg (no_color strips all color).
+        let has_yellow_bg = (0..40u16).any(|x| buf[(x, 0)].style().bg == Some(Color::Yellow));
+        let has_reversed = (0..40u16).any(|x| buf[(x, 0)].style().add_modifier.contains(Modifier::REVERSED));
+        assert!(!has_yellow_bg, "no-color theme: search match must not have yellow bg");
+        assert!(has_reversed, "no-color theme: search match must have REVERSED modifier");
     }
 }
