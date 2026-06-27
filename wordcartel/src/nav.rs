@@ -513,7 +513,9 @@ fn typewriter_rows_of_line(editor: &Editor, li: usize, text_width: usize) -> usi
     } else {
         raw_len
     };
-    if content_len <= text_width {
+    let prefix_width = editor.active().view.line_layouts
+        .get(&li).map(|(_, m)| m.prefix_width).unwrap_or(0);
+    if content_len + prefix_width <= text_width {
         1
     } else {
         rows_of_line(editor, li)
@@ -1349,5 +1351,48 @@ mod tests {
                 "line {li}: fast-path returned {fast}, exact returned {exact}"
             );
         }
+    }
+
+    /// typewriter_rows_of_line must account for prefix_width when computing the
+    /// shortcut. A list item whose raw content_len fits text_width but whose
+    /// content_len + prefix_width exceeds text_width (and whose tab causes an
+    /// actual wrap) must return the real row count, not 1.
+    ///
+    /// Setup: "- \taaaa" on line 0 (inactive, prefix_width=2), "x" on line 1
+    /// (active, caret there). text_width=8.
+    ///   content_len("- \taaaa") = 7  →  7 ≤ 8  →  old shortcut fires, returns 1
+    ///   content_len + prefix_width = 9 > 8  →  new check falls through to rows_of_line
+    ///   actual layout: prefix at cols 0-1, \t fills cols 2-5, "aaa" at 6-8 then
+    ///   the 4th 'a' wraps  →  2 rows
+    #[test]
+    fn typewriter_rows_prefix_aware() {
+        // Line 0: inactive list item with a tab that causes a real wrap.
+        // Line 1: plain "x" — caret lives here so line 0 is inactive → prefix_width=2.
+        let mut ed = Editor::new_from_text("- \taaaa\nx\n", None, (8, 24));
+        ed.view_opts.typewriter = true;
+        // Move caret to line 1 (byte offset of 'x' = "- \taaaa\n".len() = 9).
+        ed.active_mut().document.selection =
+            wordcartel_core::selection::Selection::single(9);
+        derive::rebuild(&mut ed);
+
+        // Confirm the cached prefix_width for line 0 is really 2 (not 0).
+        let cached_prefix_width = ed
+            .active()
+            .view
+            .line_layouts
+            .get(&0)
+            .map(|(_, m)| m.prefix_width)
+            .expect("line 0 must be in layout cache");
+        assert_eq!(cached_prefix_width, 2, "inactive list item must have prefix_width=2");
+
+        let text_width = super::text_geometry(&ed).text_width as usize;
+        assert_eq!(text_width, 8, "sanity: text_width should be 8");
+
+        // content_len = "- \taaaa".len() = 7; 7 ≤ 8 so old shortcut fires.
+        // With fix: 7 + 2 = 9 > 8 → falls through to rows_of_line.
+        let tw = super::typewriter_rows_of_line(&ed, 0, text_width);
+        let real = super::rows_of_line(&ed, 0);
+        assert!(real > 1, "layout must wrap (real rows={real}); test setup is wrong if this fails");
+        assert_eq!(tw, real, "typewriter count must match real row count (prefix-blind shortcut returned 1)");
     }
 }
