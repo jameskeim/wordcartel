@@ -41,9 +41,11 @@ pub fn compose(theme: &Theme, depth: Depth, stack: &[SemanticElement]) -> RStyle
 
 pub fn face_to_ratatui(face: &Face, depth: Depth) -> RStyle {
     let mut s = RStyle::default();
-    if let Some(c) = face.fg { s = s.fg(to_rcolor(c, depth)); }
-    if let Some(c) = face.bg { s = s.bg(to_rcolor(c, depth)); }
-    if let Some(c) = face.underline_color { s = s.underline_color(to_rcolor(c, depth)); }
+    if depth != Depth::None {                              // cue mode (None) carries NO color
+        if let Some(c) = face.fg { s = s.fg(to_rcolor(c, depth)); }
+        if let Some(c) = face.bg { s = s.bg(to_rcolor(c, depth)); }
+        if let Some(c) = face.underline_color { s = s.underline_color(to_rcolor(c, depth)); }
+    }
     let add = |on: Option<bool>, m: Modifier, s: RStyle| if on == Some(true) { s.add_modifier(m) } else { s };
     s = add(face.bold, Modifier::BOLD, s);
     s = add(face.italic, Modifier::ITALIC, s);
@@ -95,5 +97,13 @@ mod tests {
     fn empty_stack_is_default_style() {
         let t = wordcartel_core::theme::default();
         assert_eq!(compose(&t, Depth::Truecolor, &[]), RStyle::default());
+    }
+    #[test]
+    fn depth_none_suppresses_color_keeps_modifiers() {
+        use wordcartel_core::theme::{Face, Color, Depth};
+        let f = Face { fg: Some(Color::Rgb { r:0x7a, g:0xa2, b:0xf7 }), bold: Some(true), ..Face::default() };
+        let s = face_to_ratatui(&f, Depth::None);
+        assert!(s.fg.is_none(), "no color at Depth::None");
+        assert!(s.add_modifier.contains(ratatui::style::Modifier::BOLD), "modifiers survive");
     }
 }
