@@ -1,7 +1,8 @@
 //! Shell theme resolution: env depth detection + `resolve_theme` (Task 5).
 //! Core stays IO-free; this is where env/file reading happens.
 
-use wordcartel_core::theme::Depth;
+use wordcartel_core::theme::{self, Color, Depth, Face, Theme};
+use crate::config::{ThemeConfig, RawFace};
 
 /// Detect color depth from environment values. Case-insensitive.
 /// `NO_COLOR` set → None; `TERM` empty/`dumb` → None; `COLORTERM`∈{truecolor,24bit}
@@ -39,9 +40,6 @@ pub fn effective_depth(no_color: bool, explicit: Option<Depth>, detected: Depth)
     if no_color { return Depth::None; }
     explicit.unwrap_or(detected)
 }
-
-use wordcartel_core::theme::{self, Color, Face, Theme};
-use crate::config::{ThemeConfig, RawFace};
 
 pub struct EnvSnapshot { pub no_color: bool, pub colorterm: Option<String>, pub term: Option<String> }
 
@@ -118,8 +116,9 @@ pub fn resolve_theme(tc: &ThemeConfig, env: &EnvSnapshot) -> ResolvedTheme {
 
     // Per-element style overrides. On a MONOCHROME theme (cue mode by theme), color
     // fields are dropped (modifiers still apply) so an override can't defeat the §4
-    // cue discipline (Codex C2); the Depth::None case is already color-stripped at
-    // render (Task 4b). A non-monochrome theme keeps colors.
+    // cue discipline (Codex C2). Note: depth==None always yields a monochrome theme
+    // via no_color(), so the C2 scrub ALSO covers that path (doubly protected) —
+    // do NOT remove this check. A non-monochrome theme keeps colors.
     for (key, rf) in &tc.styles {
         match theme::element_from_key(key) {
             Some(el) => {
@@ -233,5 +232,21 @@ mod tests {
         // warnings for the bad hex AND the unknown key
         assert!(r.warnings.iter().any(|w| w.contains("not-a-color") || w.contains("heading1")));
         assert!(r.warnings.iter().any(|w| w.contains("bogus_key")));
+    }
+
+    // C2 invariant: monochrome theme must strip color overrides and keep modifiers.
+    // This test FAILS if the scrub block (lines ~127-130 in resolve_theme) is removed
+    // or the condition is inverted.
+    #[test]
+    fn monochrome_theme_strips_color_overrides_but_keeps_modifiers() {
+        let mut styles = std::collections::BTreeMap::new();
+        styles.insert("heading1".to_string(),
+            RawFace { fg: Some("#ff0000".into()), bold: Some(true), ..Default::default() });
+        let tc = ThemeConfig { styles, ..Default::default() };
+        let r = resolve_theme(&tc, &env(true)); // NO_COLOR → no_color() → monochrome
+        assert!(r.theme.monochrome);
+        assert_eq!(r.theme.face(SemanticElement::Heading(1)).fg, None, "color stripped in cue mode");
+        assert_eq!(r.theme.face(SemanticElement::Heading(1)).bold, Some(true), "modifier preserved");
+        assert!(r.warnings.iter().any(|w| w.contains("heading1")), "cue-mode strip warning emitted");
     }
 }
