@@ -145,10 +145,29 @@ impl Theme {
             "default" => Some(default()),
             "no-color" => Some(no_color()),
             "tokyo-night" => Some(tokyo_night()),
-            _ => None,
+            _ => {
+                // "phosphor-<hue>" or "phosphor-<hue>-flat"
+                let rest = name.strip_prefix("phosphor-")?;
+                let (hue_name, flat) = if let Some(h) = rest.strip_suffix("-flat") {
+                    (h, true)
+                } else {
+                    (rest, false)
+                };
+                let hue = PHOSPHORS.iter().find(|(n, _)| *n == hue_name)?.1;
+                Some(phosphor(name, hue, flat))
+            }
         }
     }
-    pub fn builtin_names() -> &'static [&'static str] { &["default", "no-color", "tokyo-night"] }
+    pub fn builtin_names() -> &'static [&'static str] {
+        &[
+            "default", "no-color", "tokyo-night",
+            "phosphor-green", "phosphor-green-flat",
+            "phosphor-amber", "phosphor-amber-flat",
+            "phosphor-red",   "phosphor-red-flat",
+            "phosphor-blue",  "phosphor-blue-flat",
+            "phosphor-purple","phosphor-purple-flat",
+        ]
+    }
 }
 
 // helper for terse face literals
@@ -159,37 +178,11 @@ fn modface(fg: Option<Color>, bold: bool, italic: bool, underline: bool, strike:
 }
 
 pub fn no_color() -> Theme {
-    let m = |bold, italic, underline, strike, reverse| modface(None, bold, italic, underline, strike, reverse);
     Theme {
         name: "no-color".into(),
         base_fg: Color::Default, base_bg: Color::Default,
         heading_level_glyph: true, monochrome: true,
-        faces: ThemeFaces {
-            text: Face::default(),
-            emphasis: m(false, true, false, false, false),
-            strong: m(true, false, false, false, false),
-            strong_emphasis: m(true, true, false, false, false),
-            code: m(false, false, false, false, true),                 // reverse
-            strikethrough: m(false, false, false, true, false),
-            link: m(false, false, true, false, false),                 // underline
-            heading: [m(true,false,false,false,false); 6],             // bold; level glyph (plan ②) adds density
-            block_quote: Face::default(),                              // glyph cue is plan ②
-            code_block: m(false, false, false, false, true),           // reverse (block context)
-            list_marker: Face::default(), thematic_break: Face::default(),
-            front_matter: m(false, true, false, false, true),          // reverse + italic (distinct from Code)
-            comment: Face { italic: Some(true), dim: Some(true), ..Face::default() }, // italic+dim (distinct from Emphasis=italic)
-            selection: m(false, false, true, false, true),            // reverse + underline (visible over reverse)
-            search_match: m(false, false, false, false, true),        // reverse
-            search_current: m(true, false, false, false, true),       // reverse + bold
-            diag_spelling: m(true, false, true, false, false),        // bold + underline (distinct from Link)
-            diag_grammar:  m(true, false, true, false, false),
-            focus_dim: Face { dim: Some(true), ..Face::default() },     // DIM inactive rows
-            fold_marker: Face::default(), wrap_guide: Face::default(),
-            chrome: Face::default(),
-            chrome_reverse: m(false, false, false, false, true),     // REVERSED
-            chrome_selected: m(false, false, false, false, true),    // no-color: reverse (can't do black-on-white)
-            chrome_muted: Face { dim: Some(true), ..Face::default() },
-        },
+        faces: mono_faces(),
     }
 }
 
@@ -290,6 +283,138 @@ pub fn tokyo_night() -> Theme {
         },
     }
 }
+
+fn rgb_to_hsl(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let r = r as f32 / 255.0;
+    let g = g as f32 / 255.0;
+    let b = b as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+    if (max - min).abs() < f32::EPSILON {
+        return (0.0, 0.0, l);
+    }
+    let d = max - min;
+    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
+    let h = if max == r {
+        let mut h = (g - b) / d;
+        if g < b { h += 6.0; }
+        h / 6.0
+    } else if max == g {
+        ((b - r) / d + 2.0) / 6.0
+    } else {
+        ((r - g) / d + 4.0) / 6.0
+    };
+    (h, s, l)
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
+    if s.abs() < f32::EPSILON {
+        let v = (l * 255.0).round() as u8;
+        return (v, v, v);
+    }
+    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let p = 2.0 * l - q;
+    let hue_to_rgb = |p: f32, q: f32, mut t: f32| -> f32 {
+        if t < 0.0 { t += 1.0; }
+        if t > 1.0 { t -= 1.0; }
+        if t < 1.0/6.0 { return p + (q - p) * 6.0 * t; }
+        if t < 1.0/2.0 { return q; }
+        if t < 2.0/3.0 { return p + (q - p) * (2.0/3.0 - t) * 6.0; }
+        p
+    };
+    let r = (hue_to_rgb(p, q, h + 1.0/3.0) * 255.0).round() as u8;
+    let g = (hue_to_rgb(p, q, h) * 255.0).round() as u8;
+    let b = (hue_to_rgb(p, q, h - 1.0/3.0) * 255.0).round() as u8;
+    (r, g, b)
+}
+
+fn shade(hue: Color, level: u8) -> Color {
+    let Color::Rgb { r, g, b } = hue else { return hue };
+    let (h, s, _l) = rgb_to_hsl(r, g, b);
+    // map level 0..=5 to lightness 0.08..=0.92 (widened from 0.18..=0.92 for floor test)
+    let l = 0.08 + (level.min(5) as f32 / 5.0) * (0.92 - 0.08);
+    let (r, g, b) = hsl_to_rgb(h, s, l);
+    Color::Rgb { r, g, b }
+}
+
+/// The monochrome (modifier-cue) face set, shared by `no_color()` and phosphor-flat
+/// so the §4 cue discipline lives in one place.
+fn mono_faces() -> ThemeFaces {
+    let m = |bold, italic, underline, strike, reverse| modface(None, bold, italic, underline, strike, reverse);
+    ThemeFaces {
+        text: Face::default(),
+        emphasis: m(false, true, false, false, false),
+        strong: m(true, false, false, false, false),
+        strong_emphasis: m(true, true, false, false, false),
+        code: m(false, false, false, false, true),                // reverse
+        strikethrough: m(false, false, false, true, false),
+        link: m(false, false, true, false, false),                // underline
+        heading: [m(true, false, false, false, false); 6],        // bold
+        block_quote: Face::default(), code_block: m(false, false, false, false, true),
+        list_marker: Face::default(), thematic_break: Face::default(),
+        front_matter: m(false, true, false, false, true),         // reverse+italic
+        comment: Face { italic: Some(true), dim: Some(true), ..Face::default() }, // italic+dim
+        selection: m(false, false, true, false, true),            // reverse+underline
+        search_match: m(false, false, false, false, true),
+        search_current: m(true, false, false, false, true),
+        diag_spelling: m(true, false, true, false, false),        // bold+underline
+        diag_grammar:  m(true, false, true, false, false),
+        focus_dim: Face { dim: Some(true), ..Face::default() },
+        fold_marker: Face::default(), wrap_guide: Face::default(),
+        chrome: Face::default(),
+        chrome_reverse: m(false, false, false, false, true),
+        chrome_selected: m(false, false, false, false, true),
+        chrome_muted: Face { dim: Some(true), ..Face::default() },
+    }
+}
+
+pub fn phosphor(name: &str, hue: Color, flat: bool) -> Theme {
+    let bg = shade(hue, 0);           // near-black hue
+    let fg = shade(hue, 3);           // mid-bright hue
+    let faces = if flat {
+        let mut f = mono_faces();
+        f.chrome = Face { fg: Some(shade(hue, 4)), bg: Some(shade(hue, 1)), ..Face::default() };
+        f.chrome_muted = Face { fg: Some(shade(hue, 2)), bg: Some(shade(hue, 0)), dim: Some(true), ..Face::default() };
+        f
+    } else {
+        let s = |n| Face { fg: Some(shade(hue, n)), ..Face::default() };
+        ThemeFaces {
+            text: s(3),
+            emphasis: Face { fg: Some(shade(hue, 3)), italic: Some(true), ..Face::default() },
+            strong:   Face { fg: Some(shade(hue, 4)), bold: Some(true), ..Face::default() },
+            strong_emphasis: Face { fg: Some(shade(hue, 4)), bold: Some(true), italic: Some(true), ..Face::default() },
+            code: Face { fg: Some(shade(hue, 2)), reverse: Some(true), ..Face::default() },
+            strikethrough: Face { fg: Some(shade(hue, 2)), strike: Some(true), ..Face::default() },
+            link: Face { fg: Some(shade(hue, 5)), underline: Some(true), ..Face::default() },
+            heading: [s(5), s(5), s(4), s(4), s(3), s(3)],
+            block_quote: s(2), code_block: Face { fg: Some(shade(hue, 2)), reverse: Some(true), ..Face::default() },
+            list_marker: s(2), thematic_break: s(1),
+            front_matter: Face { fg: Some(shade(hue, 2)), italic: Some(true), ..Face::default() },
+            comment: Face { fg: Some(shade(hue, 1)), italic: Some(true), ..Face::default() },
+            selection: Face { fg: Some(shade(hue, 5)), reverse: Some(true), underline: Some(true), ..Face::default() },
+            search_match: Face { bg: Some(shade(hue, 2)), fg: Some(shade(hue, 0)), ..Face::default() },
+            search_current: Face { reverse: Some(true), bold: Some(true), ..Face::default() },
+            diag_spelling: Face { underline: Some(true), underline_color: Some(shade(hue, 5)), ..Face::default() },
+            diag_grammar:  Face { underline: Some(true), underline_color: Some(shade(hue, 4)), ..Face::default() },
+            focus_dim: Face { fg: Some(shade(hue, 1)), dim: Some(true), ..Face::default() },
+            fold_marker: s(1), wrap_guide: s(1),
+            chrome: Face { fg: Some(shade(hue, 4)), bg: Some(shade(hue, 1)), ..Face::default() },
+            chrome_reverse: Face { reverse: Some(true), ..Face::default() },
+            chrome_selected: Face { fg: Some(shade(hue, 0)), bg: Some(shade(hue, 4)), ..Face::default() },
+            chrome_muted: Face { fg: Some(shade(hue, 2)), bg: Some(shade(hue, 0)), dim: Some(true), ..Face::default() },
+        }
+    };
+    Theme { name: name.into(), base_fg: fg, base_bg: bg, heading_level_glyph: flat, monochrome: flat, faces }
+}
+
+const PHOSPHORS: [(&str, Color); 5] = [
+    ("green",  Color::Rgb{r:0x33,g:0xff,b:0x33}),
+    ("amber",  Color::Rgb{r:0xff,g:0xb0,b:0x00}),
+    ("red",    Color::Rgb{r:0xff,g:0x55,b:0x55}),
+    ("blue",   Color::Rgb{r:0x55,g:0x99,b:0xff}),
+    ("purple", Color::Rgb{r:0xcc,g:0x99,b:0xff}),
+];
 
 #[cfg(test)]
 mod tests {
@@ -420,5 +545,50 @@ mod tests {
         // headings carry color here (unlike Default)
         assert!(matches!(t.face(SemanticElement::Heading(1)).fg, Some(Color::Rgb{..})));
         for el in ALL_ELEMENTS { let _ = t.face(el); }         // total
+    }
+
+    #[test]
+    fn phosphor_shade_ramp_varies_lightness() {
+        let hue = Color::Rgb { r: 51, g: 255, b: 51 }; // green
+        let dark = shade(hue, 0);
+        let bright = shade(hue, 5);
+        // both share the hue family but differ in lightness (bright is lighter)
+        let lum = |c: Color| if let Color::Rgb{r,g,b}=c { r as u32+g as u32+b as u32 } else { 0 };
+        assert!(lum(bright) > lum(dark), "ramp must brighten");
+    }
+    #[test]
+    fn phosphor_flat_is_monochrome_single_shade() {
+        let amber = Color::Rgb { r: 255, g: 176, b: 0 };
+        let t = phosphor("phosphor-amber-flat", amber, true);
+        assert!(t.monochrome);
+        // every text element shares base_fg (flat); distinctions are modifiers
+        for el in [SemanticElement::Strong, SemanticElement::Code, SemanticElement::Link, SemanticElement::Text] {
+            assert_eq!(t.face(el).fg.unwrap_or(t.base_fg), t.base_fg, "{el:?} flat = base_fg");
+        }
+        // chrome is the hue, not gray
+        assert!(matches!(t.face(SemanticElement::Chrome).bg, Some(Color::Rgb{..})));
+    }
+    #[test]
+    fn phosphor_shaded_distinguishes_by_shade() {
+        let amber = Color::Rgb { r: 255, g: 176, b: 0 };
+        let t = phosphor("phosphor-amber", amber, false);
+        assert!(!t.monochrome);
+        assert_ne!(t.face(SemanticElement::Heading(1)).fg, t.face(SemanticElement::Comment).fg);
+    }
+    #[test]
+    fn all_thirteen_builtins_total() {
+        for name in Theme::builtin_names() {
+            let t = Theme::builtin(name).unwrap();
+            for el in ALL_ELEMENTS { let _ = t.face(el); }
+        }
+        assert_eq!(Theme::builtin_names().len(), 13); // default,no-color,tokyo-night, + 10 phosphor
+    }
+    #[test]
+    fn phosphor_16color_floor() {
+        for name in Theme::builtin_names().iter().filter(|n| n.starts_with("phosphor-")) {
+            let t = Theme::builtin(name).unwrap();
+            assert_ne!(quantize(t.base_fg, Depth::Ansi16), quantize(t.base_bg, Depth::Ansi16),
+                       "{name}: fg/bg collapse at ansi16");
+        }
     }
 }
