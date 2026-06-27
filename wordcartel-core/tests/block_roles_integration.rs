@@ -24,8 +24,8 @@ fn multi_block_doc_renders_with_roles() {
     }
     // Title heading: "# " concealed -> "Title", role Heading(1)
     assert_eq!(got[0], (BlockRole::Heading(1), "Title".into(), None));
-    // quote: "> " concealed
-    assert_eq!(got[1], (BlockRole::BlockQuote, "a quote".into(), None));
+    // quote: "> " concealed, prefix glyph ▎ (Task 5)
+    assert_eq!(got[1], (BlockRole::BlockQuote, "a quote".into(), Some("▎ ".into())));
     // list items: marker -> bullet glyph
     assert_eq!(got[2], (BlockRole::ListItem, "first".into(), Some("• ".into())));
     assert_eq!(got[3], (BlockRole::ListItem, "second".into(), Some("• ".into())));

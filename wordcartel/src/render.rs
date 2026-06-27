@@ -81,6 +81,21 @@ fn role_element(role: wordcartel_core::style::BlockRole) -> SE {
     }
 }
 
+/// Map a `BlockRole` to the `SemanticElement` used to style its prefix glyph.
+///
+/// Blockquote glyphs use the BlockQuote face; thematic-break glyphs use
+/// ThematicBreak; headings use Heading (reserved for Task 7); all other
+/// prefix glyphs (list bullets, ordered numbers) use ListMarker as today.
+fn prefix_element(role: wordcartel_core::style::BlockRole) -> SE {
+    use wordcartel_core::style::BlockRole as R;
+    match role {
+        R::BlockQuote    => SE::BlockQuote,
+        R::ThematicBreak => SE::ThematicBreak,
+        R::Heading(n)    => SE::Heading(n),
+        _                => SE::ListMarker,
+    }
+}
+
 // Shared geometry — render AND mouse (Task 7) both call these.
 pub(crate) fn menu_bar_layout(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)]) -> Vec<(usize, Rect)> {
     let mut out = Vec::new();
@@ -333,10 +348,11 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 let mut segs_spans: Vec<Span<'_>> = Vec::new();
                 // Prepend prefix_glyph as a dim span (first visual row only).
                 if let Some(ref glyph) = vr.prefix_glyph {
+                    let pe = prefix_element(vr.role);
                     let gstyle = if row_dim {
-                        compose::compose(&editor.theme, editor.depth, &[SE::ListMarker, SE::FocusDim])
+                        compose::compose(&editor.theme, editor.depth, &[pe, SE::FocusDim])
                     } else {
-                        compose::compose(&editor.theme, editor.depth, &[SE::ListMarker]).add_modifier(Modifier::DIM)
+                        compose::compose(&editor.theme, editor.depth, &[pe]).add_modifier(Modifier::DIM)
                     };
                     segs_spans.push(Span::styled(glyph.clone(), gstyle));
                 }
@@ -375,10 +391,11 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
 
                 // Prefix glyph (first visual row only): treat as unsearchable, apply dim only.
                 if let Some(ref glyph) = vr.prefix_glyph {
+                    let pe = prefix_element(vr.role);
                     let gstyle = if row_dim {
-                        compose::compose(&editor.theme, editor.depth, &[SE::ListMarker, SE::FocusDim])
+                        compose::compose(&editor.theme, editor.depth, &[pe, SE::FocusDim])
                     } else {
-                        compose::compose(&editor.theme, editor.depth, &[SE::ListMarker]).add_modifier(Modifier::DIM)
+                        compose::compose(&editor.theme, editor.depth, &[pe]).add_modifier(Modifier::DIM)
                     };
                     hl_spans.push(Span::styled(glyph.clone(), gstyle));
                 }
@@ -1417,6 +1434,41 @@ mod tests {
         assert!(
             cell_style.add_modifier.contains(Modifier::DIM),
             "Default list bullet must have DIM modifier, got {:?}",
+            cell_style.add_modifier
+        );
+    }
+
+    /// Golden (Task 5): blockquote prefix glyph `▎` is styled with the BlockQuote face
+    /// (not ListMarker), AND a non-active blockquote prefix still carries DIM.
+    ///
+    /// Two-line doc `"> quoted\nmore\n"` with caret on line 1.  Line 0 is non-active,
+    /// so its `▎` glyph uses the non-dim path: `compose([BlockQuote]).add_modifier(DIM)`.
+    /// Under the Default theme BlockQuote face has no fg (unlike ListMarker which has
+    /// DarkGray fg), so the glyph cell must have no fg (None or Reset) but MUST have DIM.
+    #[test]
+    fn golden_blockquote_glyph_uses_blockquote_face_not_listmarker() {
+        let mut ed = Editor::new_from_text("> quoted\nmore\n", None, (40, 6));
+        // Caret on line 1 so line 0 is non-active.
+        set_caret(&mut ed, 9); // byte 9 = start of "more\n"
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+
+        // Find the `▎` glyph on row 0.
+        let glyph_col = (0u16..40).find(|&x| buf[(x, 0)].symbol().contains('▎'));
+        assert!(glyph_col.is_some(), "expected blockquote glyph '▎' on row 0");
+        let x = glyph_col.unwrap();
+        let cell_style = buf[(x, 0)].style();
+
+        // BlockQuote face (Default theme) has no fg — unlike ListMarker (DarkGray).
+        assert!(
+            cell_style.fg.is_none() || cell_style.fg == Some(Color::Reset),
+            "blockquote glyph must use BlockQuote face (no fg), not ListMarker (DarkGray); got {:?}",
+            cell_style.fg
+        );
+        // Non-active row: DIM must still be present.
+        assert!(
+            cell_style.add_modifier.contains(Modifier::DIM),
+            "non-active blockquote glyph must carry DIM modifier, got {:?}",
             cell_style.add_modifier
         );
     }

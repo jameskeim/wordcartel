@@ -252,7 +252,7 @@ fn apply_block_prefix_conceal(
                     visible[start + 1] = false;
                 }
             }
-            None
+            Some("▎ ".to_string())
         }
 
         BlockRole::ListItem => {
@@ -327,7 +327,7 @@ fn apply_block_prefix_conceal(
             for b in 0..n {
                 visible[b] = false;
             }
-            None
+            Some("─── ".to_string())
         }
 
         // Block HTML comments: no prefix glyph (the full source is shown as-is).
@@ -454,6 +454,19 @@ mod tests {
     fn blockquote_prefix_concealed() {
         let a = analyze("> quoted", BlockRole::BlockQuote, false);
         assert_eq!(visible(&a, "> quoted"), "quoted");
+    }
+
+    #[test]
+    fn blockquote_has_bar_glyph() {
+        let a = analyze("> quoted", BlockRole::BlockQuote, false);
+        assert_eq!(a.prefix_glyph.as_deref(), Some("▎ "));
+        assert_eq!(visible(&a, "> quoted"), "quoted"); // existing conceal still holds
+    }
+
+    #[test]
+    fn thematic_break_has_rule_glyph() {
+        let a = analyze("---", BlockRole::ThematicBreak, false);
+        assert_eq!(a.prefix_glyph.as_deref(), Some("─── "));
     }
 
     #[test]
