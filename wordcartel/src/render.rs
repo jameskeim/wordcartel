@@ -387,9 +387,14 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 }
                 for seg in &vr.segs {
                     let style = if row_dim {
-                        dim_style
+                        if source_mode {
+                            compose::base_canvas(&editor.theme, editor.depth)
+                                .patch(compose::compose(&editor.theme, editor.depth, &[SE::FocusDim]))
+                        } else {
+                            dim_style
+                        }
                     } else if source_mode {
-                        compose::compose(&editor.theme, editor.depth, &[SE::Text])
+                        compose::base_canvas(&editor.theme, editor.depth)
                     } else {
                         compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(seg.style)])
                     };
@@ -458,9 +463,14 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                     let is_match = !is_current && hl_window.iter().any(|m| overlaps(g_from, g_to, m.start, m.end));
 
                     let mut style = if row_dim {
-                        dim_style
+                        if source_mode {
+                            compose::base_canvas(&editor.theme, editor.depth)
+                                .patch(compose::compose(&editor.theme, editor.depth, &[SE::FocusDim]))
+                        } else {
+                            dim_style
+                        }
                     } else if source_mode {
-                        compose::compose(&editor.theme, editor.depth, &[SE::Text])
+                        compose::base_canvas(&editor.theme, editor.depth)
                     } else {
                         compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(p.style)])
                     };
@@ -1854,5 +1864,50 @@ mod tests {
         let buf = render_to_buffer(&mut ed, 60, 16);
         let text: String = (0..16).map(|r| row_string(&buf, r)).collect();
         assert!(text.contains("tokyo-night"), "picker lists built-in themes");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 8: source-mode base canvas tests (§3.5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn source_mode_tints_canvas_for_phosphor_but_not_default() {
+        use wordcartel_core::theme::{Theme, Depth};
+        // Phosphor-amber: source cells carry the amber base bg/fg.
+        let mut ed = Editor::new_from_text("# raw markdown\n", None, (40, 6));
+        ed.theme = Theme::builtin("phosphor-amber").unwrap();
+        ed.depth = Depth::Truecolor;
+        ed.active_mut().view.mode = crate::editor::RenderMode::SourcePlain;
+        crate::derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+        let cell = &buf[(0u16, 0u16)];
+        assert!(cell.style().bg.is_some(), "phosphor source canvas sets a bg");
+        // Default theme: source canvas stays terminal-default (no themed bg).
+        let mut ed2 = Editor::new_from_text("# raw markdown\n", None, (40, 6));
+        ed2.active_mut().view.mode = crate::editor::RenderMode::SourcePlain;
+        crate::derive::rebuild(&mut ed2);
+        let buf2 = render_to_buffer(&mut ed2, 40, 6);
+        let bg = buf2[(0u16, 0u16)].style().bg;
+        assert!(bg.is_none() || bg == Some(ratatui::style::Color::Reset), "Default source = terminal default");
+    }
+
+    #[test]
+    fn source_mode_dimmed_row_keeps_phosphor_canvas() {
+        // A focused (dimmed) source row must STILL carry the phosphor canvas bg —
+        // FocusDim layers over the canvas, it does not replace it (Codex re-review).
+        use wordcartel_core::theme::{Theme, Depth};
+        let mut ed = Editor::new_from_text("# h\n\nbody paragraph one\n\nbody paragraph two\n", None, (40, 8));
+        ed.theme = Theme::builtin("phosphor-amber").unwrap();
+        ed.depth = Depth::Truecolor;
+        ed.view_opts.focus = true;                 // dims rows outside the focus region
+        ed.active_mut().view.mode = crate::editor::RenderMode::SourcePlain;
+        crate::derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 8);
+        // a row outside the active paragraph is dimmed but must keep a themed bg
+        let dimmed = (0..8u16).find_map(|r| {
+            let c = &buf[(0u16, r)];
+            if c.style().add_modifier.contains(ratatui::style::Modifier::DIM) { Some(c.style().bg) } else { None }
+        });
+        assert_eq!(dimmed.flatten().is_some(), true, "dimmed source row retains the phosphor canvas bg");
     }
 }

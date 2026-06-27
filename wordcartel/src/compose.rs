@@ -34,6 +34,12 @@ fn merge(acc: Face, f: Face) -> Face {
     }
 }
 
+/// The source-mode canvas: base_fg/base_bg only (Spec §3.5). Default theme's
+/// `base = Default` → `Reset` → terminal default (no themed canvas).
+pub fn base_canvas(theme: &Theme, depth: Depth) -> RStyle {
+    face_to_ratatui(&Face { fg: Some(theme.base_fg), bg: Some(theme.base_bg), ..Face::default() }, depth)
+}
+
 pub fn compose(theme: &Theme, depth: Depth, stack: &[SemanticElement]) -> RStyle {
     let merged = stack.iter().fold(Face::default(), |acc, &el| merge(acc, theme.face(el)));
     face_to_ratatui(&merged, depth)
