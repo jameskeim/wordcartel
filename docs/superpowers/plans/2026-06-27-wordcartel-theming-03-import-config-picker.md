@@ -19,7 +19,7 @@
 - **Warnings append to the existing startup stream:** `config::load` returns `(Config, Vec<String>)`; theme resolution warnings join that same `warns` vec (app.rs ~1237/1348). Spec §3.3.
 - **Discriminated source:** within the config layers, a layer setting `name` clears accumulated `file` (and vice-versa); both in one layer → `file` wins + warning. `file` paths expand `~` and resolve relative to the **declaring** config file. Spec §5.
 
-**Built-in theme names (verbatim, from `theme::builtin_names()`):** `default`, `no-color`, `tokyo-night`, `phosphor-green`, `phosphor-green-flat`, `phosphor-amber`, `phosphor-amber-flat`, `phosphor-red`, `phosphor-red-flat`, `phosphor-blue`, `phosphor-blue-flat`, `phosphor-purple`, `phosphor-purple-flat`.
+**Built-in theme names (verbatim, from `Theme::builtin_names()`):** `default`, `no-color`, `tokyo-night`, `phosphor-green`, `phosphor-green-flat`, `phosphor-amber`, `phosphor-amber-flat`, `phosphor-red`, `phosphor-red-flat`, `phosphor-blue`, `phosphor-blue-flat`, `phosphor-purple`, `phosphor-purple-flat`.
 
 ---
 
@@ -31,6 +31,8 @@
 | `wordcartel/src/base16.rs` (NEW) | hand-rolled base16/24 file parser → `BasePalette`; `parse_hex6` | 2 |
 | `wordcartel/src/config.rs` | `RawTheme`/`RawFace`, `ThemeConfig`, layered `[theme]` parse + discrimination + path resolution | 3 |
 | `wordcartel/src/theme_resolve.rs` (NEW) | `detect_depth`, `effective_depth`, `parse_depth`, `resolve_theme`, `RawFace→Face`, cue-mode forcing | 4, 5 |
+| `wordcartel/src/compose.rs` | `face_to_ratatui` suppress color at `Depth::None`; `base_canvas` helper | 4, 8 |
+| `wordcartel/src/lib.rs` | module declarations (`pub mod base16/theme_resolve/theme_picker;`) | 2, 4, 7 |
 | `wordcartel/src/app.rs` | startup wiring: build env snapshot, call `resolve_theme`, seed editor, append warnings | 6 |
 | `wordcartel/src/theme_picker.rs` (NEW) | `ThemePicker` overlay state + row build | 7 |
 | `wordcartel/src/editor.rs` | `theme_picker` field + `open_theme_picker()` (XOR) | 7 |
@@ -257,7 +259,7 @@ pub fn element_from_key(key: &str) -> Option<SemanticElement> {
 
 **Files:**
 - Create: `wordcartel/src/base16.rs`
-- Modify: `wordcartel/src/main.rs` or `wordcartel/src/lib.rs` (add `mod base16;` — find the module list and add it alphabetically)
+- Modify: `wordcartel/src/lib.rs` (add `pub mod base16;` — the module list is in **lib.rs** at ~line 3, NOT main.rs; Codex I7)
 - Test: `wordcartel/src/base16.rs` `#[cfg(test)]`
 
 **Interfaces:**
@@ -314,6 +316,13 @@ base0F: "d65d0e"
     }
 
     #[test]
+    fn parse_base16_tolerates_inline_comments() {
+        let with_comments = GRUVBOX.replace("base00: \"282828\"", "base00: \"282828\" # bg");
+        let (p, _n) = parse_base16(&with_comments).expect("valid base16 w/ comment");
+        assert_eq!(p.base[0], Color::Rgb { r:0x28, g:0x28, b:0x28 });
+    }
+
+    #[test]
     fn parse_base16_missing_slot_errors() {
         let bad = "base00: \"282828\"\nbase05: \"d5c4a1\"\n"; // missing most slots
         assert!(parse_base16(bad).is_err());
@@ -366,6 +375,15 @@ pub fn parse_base16(text: &str) -> Result<(BasePalette, Option<String>), String>
         // base00..base0F → base[0..16]; base10..base17 → extra[0..8]
         if let Some(hex) = key.strip_prefix("base") {
             if let Ok(idx) = u8::from_str_radix(hex, 16) {
+                // tolerate a trailing inline comment: take through the closing quote
+                // if quoted, else the first whitespace-delimited token (Codex M1).
+                let val = if let Some(rest) = val.strip_prefix('"') {
+                    rest.split('"').next().unwrap_or(rest)
+                } else if let Some(rest) = val.strip_prefix('\'') {
+                    rest.split('\'').next().unwrap_or(rest)
+                } else {
+                    val.split_whitespace().next().unwrap_or(val)
+                };
                 if let Some(c) = parse_hex6(val) {
                     if (idx as usize) < 16 { base[idx as usize] = Some(c); }
                     else if (0x10..=0x17).contains(&idx) { extra[(idx - 0x10) as usize] = Some(c); }
@@ -576,8 +594,9 @@ Add `theme: ThemeConfig` to `pub struct Config` (it derives `Default`, so the ne
 
 **Files:**
 - Create: `wordcartel/src/theme_resolve.rs` (this task adds the depth fns; Task 5 adds `resolve_theme` to the same file)
-- Modify: module list (`mod theme_resolve;`)
-- Test: `wordcartel/src/theme_resolve.rs` `#[cfg(test)]`
+- Modify: `wordcartel/src/lib.rs` (add `pub mod theme_resolve;` — the module list is in **lib.rs**, NOT main.rs — Codex I7)
+- Modify: `wordcartel/src/compose.rs` (`face_to_ratatui` — suppress color at `Depth::None`, Codex C1)
+- Test: `wordcartel/src/theme_resolve.rs` + `wordcartel/src/compose.rs` `#[cfg(test)]`
 
 **Interfaces:**
 - Produces:
@@ -683,7 +702,32 @@ pub fn effective_depth(no_color: bool, explicit: Option<Depth>, detected: Depth)
 
 - [ ] **Step 4: Run** `cargo test -p wordcartel theme_resolve` — PASS.
 
-- [ ] **Step 5: Commit** `feat(theme): env color-depth detection + precedence (NO_COLOR > explicit > detection)`
+- [ ] **Step 4b: CRITICAL (Codex C1) — `face_to_ratatui` must suppress color at `Depth::None`.** Today `compose::face_to_ratatui` (compose.rs) applies `fg`/`bg`/`underline_color` UNCONDITIONALLY; `quantize(_, Depth::None)` is identity. So at `Depth::None` a colored theme renders RGB color — violating "when None, the picker can't re-enable color" (§3.3) and the cue-mode predicate (§4). This never manifested because `depth` was hardcoded `Truecolor`; Task 4 makes `None` reachable (NO_COLOR), so this MUST be fixed now. Add a failing test in `compose.rs`:
+```rust
+    #[test]
+    fn depth_none_suppresses_color_keeps_modifiers() {
+        use wordcartel_core::theme::{Face, Color, Depth};
+        let f = Face { fg: Some(Color::Rgb { r:0x7a, g:0xa2, b:0xf7 }), bold: Some(true), ..Face::default() };
+        let s = face_to_ratatui(&f, Depth::None);
+        assert!(s.fg.is_none(), "no color at Depth::None");
+        assert!(s.add_modifier.contains(ratatui::style::Modifier::BOLD), "modifiers survive");
+    }
+```
+Then guard the three color lines (do NOT touch the modifiers):
+```rust
+pub fn face_to_ratatui(face: &Face, depth: Depth) -> RStyle {
+    let mut s = RStyle::default();
+    if depth != Depth::None {                              // <-- cue mode (None) carries NO color
+        if let Some(c) = face.fg { s = s.fg(to_rcolor(c, depth)); }
+        if let Some(c) = face.bg { s = s.bg(to_rcolor(c, depth)); }
+        if let Some(c) = face.underline_color { s = s.underline_color(to_rcolor(c, depth)); }
+    }
+    // …modifiers unchanged (bold/italic/underline/strike/reverse/dim)…
+}
+```
+Run `cargo test -p wordcartel compose:: depth_none` + the existing compose/render tests (the Default theme at `Truecolor` is unaffected — the guard only fires at `None`). NOTE: a render golden that previously rendered at a non-`None` depth is unchanged; only `Depth::None` paths change (they should already be monochrome since `no_color()` has all-`Default` faces — this guard makes color-bearing themes/overrides also monochrome at `None`).
+
+- [ ] **Step 5: Commit** `feat(theme): env color-depth detection + precedence; face_to_ratatui suppresses color at Depth::None`
 
 ---
 
@@ -831,7 +875,7 @@ pub fn resolve_theme(tc: &ThemeConfig, env: &EnvSnapshot) -> ResolvedTheme {
             Err(e) => { warnings.push(format!("theme file {}: {e} — using default", path.display())); theme::default() }
         }
     } else if let Some(name) = &tc.name {
-        match theme::builtin(name) {
+        match Theme::builtin(name) {   // ASSOCIATED method (impl Theme), NOT a free fn (Codex C3)
             Some(th) => th,
             None => { warnings.push(format!("theme: unknown name `{name}` — using default")); theme::default() }
         }
@@ -839,11 +883,20 @@ pub fn resolve_theme(tc: &ThemeConfig, env: &EnvSnapshot) -> ResolvedTheme {
         theme::default()
     };
 
-    // Per-element style overrides (only when NOT cue-mode-None; no_color ignores color
-    // anyway, but applying modifier overrides is harmless — apply uniformly).
+    // Per-element style overrides. On a MONOCHROME theme (cue mode by theme), color
+    // fields are dropped (modifiers still apply) so an override can't defeat the §4
+    // cue discipline (Codex C2); the Depth::None case is already color-stripped at
+    // render (Task 4b). A non-monochrome theme keeps colors.
     for (key, rf) in &tc.styles {
         match theme::element_from_key(key) {
-            Some(el) => { let patch = raw_face_to_face(key, rf, &mut warnings); t.override_face(el, patch); }
+            Some(el) => {
+                let mut patch = raw_face_to_face(key, rf, &mut warnings);
+                if t.monochrome && (patch.fg.is_some() || patch.bg.is_some() || patch.underline_color.is_some()) {
+                    warnings.push(format!("theme.styles.{key}: color ignored on a monochrome theme (cue mode)"));
+                    patch.fg = None; patch.bg = None; patch.underline_color = None;
+                }
+                t.override_face(el, patch);
+            }
             None => warnings.push(format!("theme.styles: unknown element key `{key}`")),
         }
     }
@@ -876,6 +929,7 @@ pub fn resolve_theme(tc: &ThemeConfig, env: &EnvSnapshot) -> ResolvedTheme {
     let resolved = crate::theme_resolve::resolve_theme(&cfg.theme, &env);
     editor.theme = resolved.theme;
     editor.depth = resolved.depth;
+    editor.heading_glyph_cfg = cfg.theme.heading_level_glyph;  // for runtime picker switches (Codex I4)
     warns.extend(resolved.warnings);   // join the existing startup warning stream
 ```
 (`warns` is `let (cfg, mut warns) = config::load(&paths);` at ~1237, already mutable; keymap warnings already `warns.append` at ~1348 — theme warnings join the same stream and surface via the existing startup-warning UI.)
@@ -892,7 +946,8 @@ pub fn resolve_theme(tc: &ThemeConfig, env: &EnvSnapshot) -> ResolvedTheme {
 
 **Files:**
 - Create: `wordcartel/src/theme_picker.rs` (`ThemePicker` state + row build)
-- Modify: `wordcartel/src/editor.rs` (add `pub theme_picker: Option<...>` field ~line 218; `open_theme_picker()` mirroring `open_palette` ~line 328; add `theme_picker = None` to EVERY other `open_*` XOR clear list)
+- Modify: `wordcartel/src/lib.rs` (add `pub mod theme_picker;` — module list is in lib.rs, Codex I7)
+- Modify: `wordcartel/src/editor.rs` (add `pub theme_picker: Option<...>` + `pub heading_glyph_cfg: Option<bool>` fields ~line 218; `open_theme_picker()` mirroring `open_palette` ~line 332; add `theme_picker = None` to EVERY overlay-opening site — see CRITICAL note below)
 - Modify: `wordcartel/src/registry.rs` (register `theme` command)
 - Modify: `wordcartel/src/app.rs` (key-handling block mirroring the palette block ~line 753-833)
 - Modify: `wordcartel/src/render.rs` (paint the overlay, mirroring the palette render)
@@ -901,7 +956,7 @@ pub fn resolve_theme(tc: &ThemeConfig, env: &EnvSnapshot) -> ResolvedTheme {
 **Interfaces:**
 - Produces:
   - `pub struct ThemePicker { pub query: String, pub selected: usize, pub rows: Vec<String>, pub original: Theme }`
-  - `pub fn rebuild_rows(tp: &mut ThemePicker)` — filter `theme::builtin_names()` by `query` (substring, case-insensitive); `selected` clamped.
+  - `pub fn rebuild_rows(tp: &mut ThemePicker)` — filter `Theme::builtin_names()` (associated method, Codex C3) by `query` (substring, case-insensitive); `selected` clamped.
   - `editor.open_theme_picker()` (XOR), `editor.apply_theme(theme: Theme)` (sets `theme`, re-forces cue-mode glyph for the current depth, `derive::rebuild`, `nav::ensure_visible`).
 - Consumes: `theme::{builtin, builtin_names, Theme}`, `derive::rebuild`, `nav::ensure_visible`, the palette key-handling + render patterns.
 
@@ -974,7 +1029,7 @@ pub struct ThemePicker {
 /// substring). Empty query → all built-ins in registration order. `selected` clamped.
 pub fn rebuild_rows(tp: &mut ThemePicker) {
     let q = tp.query.to_ascii_lowercase();
-    tp.rows = theme::builtin_names().iter()
+    tp.rows = Theme::builtin_names().iter()   // associated method (Codex C3)
         .filter(|n| q.is_empty() || n.to_ascii_lowercase().contains(&q))
         .map(|n| n.to_string())
         .collect();
@@ -982,12 +1037,15 @@ pub fn rebuild_rows(tp: &mut ThemePicker) {
 }
 ```
 
-- [ ] **Step 4: Implement editor methods** (`editor.rs`). Add the field (~line 218, beside `outline`):
+- [ ] **Step 4: Implement editor methods** (`editor.rs`). Add two fields (~line 218, beside `outline`/`theme`/`depth`):
 
 ```rust
     pub theme_picker: Option<crate::theme_picker::ThemePicker>,
+    /// The config's `[theme] heading_level_glyph` override (Codex I4): apply_theme
+    /// uses it for non-cue themes so a runtime switch preserves the user's setting.
+    pub heading_glyph_cfg: Option<bool>,
 ```
-Initialize it `theme_picker: None,` in `new_from_text` (beside the other overlay inits). Add `open_theme_picker` (mirror `open_palette` exactly — clear ALL other overlays):
+Initialize `theme_picker: None,` and `heading_glyph_cfg: None,` in `new_from_text` (beside the other overlay inits; Task 6 seeds `heading_glyph_cfg` from config at startup). Add `open_theme_picker` (mirror `open_palette` exactly — clear ALL other overlays):
 
 ```rust
     /// Open the theme picker, enforcing the single-overlay XOR invariant.
@@ -1002,17 +1060,24 @@ Initialize it `theme_picker: None,` in `new_from_text` (beside the other overlay
         if let Some(tp) = self.theme_picker.as_mut() { crate::theme_picker::rebuild_rows(tp); }
     }
 
-    /// Apply a theme: swap, re-force the cue-mode heading glyph for the CURRENT depth,
-    /// relayout (heading_level_glyph is a layout input — §3.6/§3.7), keep caret visible.
+    /// Apply a theme: swap, re-derive the heading-glyph flag (cue mode forces ON;
+    /// else the CONFIG override `heading_glyph_cfg` wins, else the theme's own flag —
+    /// Codex I4, so a picker switch doesn't drop a configured override), relayout
+    /// (heading_level_glyph is a layout input — §3.6/§3.7), keep caret visible.
     pub fn apply_theme(&mut self, mut theme: wordcartel_core::theme::Theme) {
         let cue = self.depth == wordcartel_core::theme::Depth::None || theme.monochrome;
-        if cue { theme.heading_level_glyph = true; }
+        theme.heading_level_glyph = if cue { true }
+            else { self.heading_glyph_cfg.unwrap_or(theme.heading_level_glyph) };
         self.theme = theme;
         crate::derive::rebuild(self);
         crate::nav::ensure_visible(self);
     }
 ```
-**CRITICAL:** add `self.theme_picker = None;` to the XOR-clear list of EVERY other `open_*` method (`open_palette`, `open_minibuffer`, `open_diag`, `open_outline`, and any prompt/menu/search opener) so the invariant holds both directions. Grep `self.palette = None;` and add `self.theme_picker = None;` beside each.
+**CRITICAL (Codex I5) — the invariant must hold BOTH directions; add `theme_picker = None` to EVERY site that opens a different overlay, not just the `open_*` methods.** The real sites (verified):
+   - `editor.rs`: `open_minibuffer` (~:295), `open_prompt` (~:316), `open_palette` (~:332), `open_search` (~:348), `open_diag` (~:362), `open_outline` (~:372) — add `self.theme_picker = None;` to each (beside the existing `self.palette = None;`).
+   - `registry.rs` (~:177): the **menu** command opens the menu directly (not via an `open_*` method) — add `c.editor.theme_picker = None;` there.
+   - `app.rs::dispatch_overlay_command` (~:441): currently clears only `palette`/`menu` — add `editor.theme_picker = None;`.
+   A missed site means another overlay can open OVER the theme picker (broken XOR). Add the `open_theme_picker` XOR-test (Step 1) plus one asserting `open_outline()` clears `theme_picker`.
 
 - [ ] **Step 5: Register the `theme` command** (`registry.rs`, beside the `palette` registration ~line 173):
 
@@ -1027,6 +1092,17 @@ Initialize it `theme_picker: None,` in `new_from_text` (beside the other overlay
 
 ```rust
     if editor.theme_picker.is_some() {
+        // Paste intercept FIRST (mirror the palette, app.rs:753) — else paste leaks
+        // into the document while the picker is open (Codex I6).
+        if let Msg::Input(Event::Paste(text)) = &msg {
+            if let Some(tp) = editor.theme_picker.as_mut() {
+                tp.query.push_str(text);
+                crate::theme_picker::rebuild_rows(tp);
+            }
+            preview_selected_theme(editor);
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
+        }
         if let Msg::Input(Event::Key(k)) = &msg {
             if k.kind == crossterm::event::KeyEventKind::Press {
                 use crossterm::event::KeyCode;
@@ -1078,13 +1154,13 @@ Add the helper near the other `app.rs` free fns:
 fn preview_selected_theme(editor: &mut crate::editor::Editor) {
     let name = editor.theme_picker.as_ref().and_then(|tp| tp.rows.get(tp.selected).cloned());
     if let Some(name) = name {
-        if let Some(theme) = wordcartel_core::theme::builtin(&name) { editor.apply_theme(theme); }
+        if let Some(theme) = wordcartel_core::theme::Theme::builtin(&name) { editor.apply_theme(theme); }
     }
 }
 ```
 > Match the REAL local names in `app.rs`'s message loop (`msg`, `editor`, `ex`, the early-return shape) — mirror the palette block verbatim for `Paste`/drain/return handling. The palette block is the template.
 
-- [ ] **Step 7: Render the overlay** (`render.rs`). Mirror the palette overlay render (grep `palette` in render.rs for the exact widget/rect pattern): a centered list of `tp.rows`, the `selected` row highlighted via `compose(&editor.theme, editor.depth, &[SE::ChromeReverse])`, the query line via `SE::ChromeMuted`, frame via `SE::Chrome`. Add a render test:
+- [ ] **Step 7: Render the overlay** (`render.rs`). Mirror the palette overlay render (grep `palette` in render.rs for the exact widget/rect pattern): a centered list of `tp.rows`, the `selected` row highlighted via `compose(&editor.theme, editor.depth, &[SE::ChromeReverse])`, the query line via `SE::ChromeMuted`, frame via `SE::Chrome`. Add the render test **inside `render.rs`'s `#[cfg(test)]` module** (the `render_to_buffer`/`row_string` helpers are private there — Codex M2; the logic tests in Step 1 live in `theme_picker.rs` and don't need them):
 
 ```rust
     #[test]
@@ -1103,6 +1179,63 @@ fn preview_selected_theme(editor: &mut crate::editor::Editor) {
 
 ---
 
+## Task 8: Shell — source-mode base canvas (§3.5; phosphor/base16 tint the source text)
+
+**Files:**
+- Modify: `wordcartel/src/render.rs` (the source-mode style path — `compose([Text])` sites at ~:391 and ~:462)
+- Modify: `wordcartel/src/compose.rs` (add a `base_canvas` helper)
+- Test: `wordcartel/src/render.rs` `#[cfg(test)]`
+
+**Why (Codex I8 + the user's explicit requirement):** in Source modes (Highlighted/Plain) the renderer applies `compose([SemanticElement::Text])` only — `Text` is `Face::default()` for every theme, so the source canvas is the **terminal default**, ignoring `theme.base_fg`/`base_bg`. Spec §3.5: source modes apply the **base canvas (`base_fg`/`base_bg`) + overlays** so the **phosphor base hue tints the source** (the authentic green/amber-monitor look the user asked for) while **Default** (base = `Default`) leaves the terminal untouched.
+
+**Interfaces:**
+- Produces: `compose::base_canvas(theme: &Theme, depth: Depth) -> RStyle` — `face_to_ratatui` of a face carrying only `base_fg`/`base_bg`.
+
+- [ ] **Step 1: Write the failing test**
+
+```rust
+    #[test]
+    fn source_mode_tints_canvas_for_phosphor_but_not_default() {
+        use wordcartel_core::theme::{Theme, Depth};
+        // Phosphor-amber: source cells carry the amber base bg/fg.
+        let mut ed = Editor::new_from_text("# raw markdown\n", None, (40, 6));
+        ed.theme = Theme::builtin("phosphor-amber").unwrap();
+        ed.depth = Depth::Truecolor;
+        ed.active_mut().view.mode = crate::editor::RenderMode::SourcePlain;
+        crate::derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+        let cell = &buf[(0u16, 0u16)];
+        assert!(cell.style().bg.is_some(), "phosphor source canvas sets a bg");
+        // Default theme: source canvas stays terminal-default (no themed bg).
+        let mut ed2 = Editor::new_from_text("# raw markdown\n", None, (40, 6));
+        ed2.active_mut().view.mode = crate::editor::RenderMode::SourcePlain;
+        crate::derive::rebuild(&mut ed2);
+        let buf2 = render_to_buffer(&mut ed2, 40, 6);
+        let bg = buf2[(0u16, 0u16)].style().bg;
+        assert!(bg.is_none() || bg == Some(ratatui::style::Color::Reset), "Default source = terminal default");
+    }
+```
+
+- [ ] **Step 2: Run — fails** (source canvas is currently unthemed for phosphor). `cargo test -p wordcartel source_mode_tints`
+
+- [ ] **Step 3: Add the helper** (`compose.rs`):
+
+```rust
+/// The source-mode canvas: base_fg/base_bg only (Spec §3.5). Default theme's
+/// `base = Default` → `Reset` → terminal default (no themed canvas).
+pub fn base_canvas(theme: &Theme, depth: Depth) -> RStyle {
+    face_to_ratatui(&Face { fg: Some(theme.base_fg), bg: Some(theme.base_bg), ..Face::default() }, depth)
+}
+```
+
+- [ ] **Step 4: Apply it in render's source-mode path.** Where the source branch builds its base style as `compose(&editor.theme, editor.depth, &[SE::Text])` (~:391, ~:462), use `compose::base_canvas(&editor.theme, editor.depth)` as the base instead, then layer the SAME overlays (Selection/search/diag/focus) on top exactly as today. Do NOT add per-element/role/inline faces and NO heading glyph in source mode (the literal `#` shows) — only the canvas changes. (The `Depth::None` color suppression from Task 4b applies here too: phosphor source under `NO_COLOR` → monochrome.)
+
+- [ ] **Step 5: Run** `cargo test -p wordcartel source_mode_tints render::` — PASS. Then full `cargo test -p wordcartel --lib`. If a Default-theme source-mode golden changed `None`→`Some(Reset)`, that is the accepted Default canvas (Reset == terminal default) — update the golden to match; if any OTHER (live-preview, or non-Default) golden changed, STOP and investigate (the canvas must not touch live-preview).
+
+- [ ] **Step 6: Commit** `feat(theme): source-mode base canvas — phosphor/base16 tint source text (§3.5)`
+
+---
+
 ## Final Verification
 - [ ] `cargo test` (workspace) — all green.
 - [ ] `cargo clippy -p wordcartel-core -p wordcartel --lib` — no NEW warnings in the touched files.
@@ -1113,6 +1246,8 @@ fn preview_selected_theme(editor: &mut crate::editor::Editor) {
 - §3.3 base16 file parse (no YAML) → Task 2; `detect_depth`/precedence → Task 4; `resolve_theme` → Task 5.
 - §5 `[theme]` config (RawThemeConfig/RawFace, discriminated source, ~/relative paths, serde default) → Task 3; per-element `[theme.styles]` → Task 1 (`override_face`/`element_from_key`) + Task 5 (apply).
 - §3.6 active theme location + relayout-on-switch → Task 6 (startup seed) + Task 7 (`apply_theme` + picker).
-- §4 cue-mode forced heading glyph → Task 5 (`apply_cue_mode_glyph`) + Task 7 (`apply_theme`).
-- **Out of scope (correctly NOT here):** §3.7 prefix geometry (plan ②), §3.9 producers (plan ②), §13.2 proof (plan ②), §3.4 compose/§3.8 chrome faces (plan ①). §3.5 source-mode canvas (base_fg/base_bg) is a plan-①/② render concern — **verify during execution it already paints the canvas in source mode; if not, that is a separate fix, not plan-③ scope.**
+- §4 cue-mode forced heading glyph → Task 5 (`apply_cue_mode_glyph`) + Task 7 (`apply_theme`); cue-mode color suppression → Task 4b (`face_to_ratatui` at `Depth::None`) + Task 5 (monochrome style scrub).
+- §3.5 source-mode base canvas (phosphor/base16 tint source text) → **Task 8** (Codex I8 — the user explicitly asked for the green/amber-monitor source look).
+- **Out of scope (correctly NOT here):** §3.7 prefix geometry (plan ②), §3.9 producers (plan ②), §13.2 proof (plan ②), §3.4 compose merge / §3.8 chrome faces (plan ①).
+- **Codex plan-review folded:** C1 (`Depth::None` color suppression, Task 4b), C2 (monochrome style scrub, Task 5), C3 (`Theme::builtin`/`builtin_names` associated methods), I4 (`heading_glyph_cfg` survives picker switch), I5 (XOR clears all 6 openers + menu cmd + dispatch_overlay_command), I6 (picker Paste intercept), I7 (modules in lib.rs), I8 (Task 8 canvas), M1 (base16 inline comments), M2 (picker render test in render.rs).
 </content>
