@@ -331,7 +331,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 // Prepend prefix_glyph as a dim span (first visual row only).
                 if let Some(ref glyph) = vr.prefix_glyph {
                     let gstyle = if row_dim {
-                        compose::compose(&editor.theme, editor.depth, &[SE::ListMarker])
+                        compose::compose(&editor.theme, editor.depth, &[SE::ListMarker, SE::FocusDim])
                     } else {
                         compose::compose(&editor.theme, editor.depth, &[SE::ListMarker]).add_modifier(Modifier::DIM)
                     };
@@ -373,12 +373,15 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 // Prefix glyph (first visual row only): treat as unsearchable, apply dim only.
                 if let Some(ref glyph) = vr.prefix_glyph {
                     let gstyle = if row_dim {
-                        compose::compose(&editor.theme, editor.depth, &[SE::ListMarker])
+                        compose::compose(&editor.theme, editor.depth, &[SE::ListMarker, SE::FocusDim])
                     } else {
                         compose::compose(&editor.theme, editor.depth, &[SE::ListMarker]).add_modifier(Modifier::DIM)
                     };
                     hl_spans.push(Span::styled(glyph.clone(), gstyle));
                 }
+
+                // Hoist FocusDim compose once per row (mirrors segs path).
+                let dim_style = compose::compose(&editor.theme, editor.depth, &[SE::FocusDim]);
 
                 // One span per run of glyphs sharing the same (style, highlight-kind).
                 let mut run = String::new();
@@ -391,16 +394,20 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                     let is_match = !is_current && hl_window.iter().any(|m| overlaps(g_from, g_to, m.start, m.end));
 
                     let mut style = if row_dim {
-                        compose::compose(&editor.theme, editor.depth, &[SE::FocusDim])
+                        dim_style
                     } else if source_mode {
                         compose::compose(&editor.theme, editor.depth, &[SE::Text])
                     } else {
                         compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(p.style)])
                     };
                     if is_current {
-                        style = compose::compose(&editor.theme, editor.depth, &[SE::SearchCurrent]);
+                        let search_face = editor.theme.face(SE::SearchCurrent);
+                        let ss = crate::compose::face_to_ratatui(&search_face, editor.depth);
+                        style = style.patch(ss);
                     } else if is_match {
-                        style = compose::compose(&editor.theme, editor.depth, &[SE::SearchMatch]);
+                        let search_face = editor.theme.face(SE::SearchMatch);
+                        let ss = crate::compose::face_to_ratatui(&search_face, editor.depth);
+                        style = style.patch(ss);
                     }
 
                     // Apply diagnostic underline if this glyph overlaps any diagnostic.
@@ -1283,5 +1290,56 @@ mod tests {
         let has_reversed = (0..40u16).any(|x| buf[(x, 0)].style().add_modifier.contains(Modifier::REVERSED));
         assert!(!has_yellow_bg, "no-color theme: search match must not have yellow bg");
         assert!(has_reversed, "no-color theme: search match must have REVERSED modifier");
+    }
+
+    /// A bold word that is a search match must keep BOLD while also showing the
+    /// search highlight (yellow bg or reversed). Guards the layering fix for
+    /// search overlays: style.patch(search_face) instead of replacing style.
+    #[test]
+    fn bold_search_match_keeps_bold_under_default() {
+        // Two-line doc: "**bold**" on line 0, caret on line 1 so live-preview
+        // conceals the markers and styles "bold" as BOLD. Search matches "bold".
+        // Caret on line 1 ensures live-preview is applied to line 0.
+        let mut ed = Editor::new_from_text("**bold**\nother\n", None, (40, 6));
+        // Place caret on line 1 so line 0 is styled by live-preview.
+        set_caret(&mut ed, 9); // byte 9 = start of "other"
+        ed.open_search(crate::search_overlay::Phase::Find, 0);
+        for c in "bold".chars() { ed.search.as_mut().unwrap().insert(c); }
+        let rope = ed.active().document.buffer.snapshot();
+        let v = ed.active().document.version;
+        ed.search.as_mut().unwrap().recompute(&rope, v);
+        crate::derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+        // A cell on row 0 must be BOLD (from the Strong inline style).
+        let has_bold = (0..40u16).any(|x| buf[(x, 0)].style().add_modifier.contains(Modifier::BOLD));
+        // A cell on row 0 must also carry the search highlight (yellow bg or reversed).
+        let has_highlight = row_has_highlight(&buf, 0);
+        assert!(has_bold, "matched bold word must still show BOLD modifier");
+        assert!(has_highlight, "matched bold word must show search highlight");
+    }
+
+    /// A non-current SearchMatch (≥2 matches so one is non-current) under no-color
+    /// must have REVERSED but no yellow bg. This exercises the SearchMatch (not just
+    /// SearchCurrent) branch of the layering fix.
+    #[test]
+    fn no_color_non_current_search_match_keeps_reverse_no_yellow() {
+        // Two occurrences of "needle" — the current match is the first one (ordinal 1).
+        // The second "needle" is a non-current SearchMatch.
+        let mut ed = Editor::new_from_text("needle and needle\n", None, (40, 4));
+        ed.theme = wordcartel_core::theme::no_color();
+        ed.open_search(crate::search_overlay::Phase::Find, 0);
+        for c in "needle".chars() { ed.search.as_mut().unwrap().insert(c); }
+        let rope = ed.active().document.buffer.snapshot();
+        let v = ed.active().document.version;
+        ed.search.as_mut().unwrap().recompute(&rope, v);
+        assert_eq!(ed.search.as_ref().unwrap().count(), 2, "expect 2 matches");
+        crate::derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 4);
+        // Both matches are on row 0. The second occurrence starts at col 11.
+        // Check cells around col 11..17 for no-yellow and reversed.
+        let has_yellow = (11u16..17u16).any(|x| buf[(x, 0)].style().bg == Some(Color::Yellow));
+        let has_reversed = (11u16..17u16).any(|x| buf[(x, 0)].style().add_modifier.contains(Modifier::REVERSED));
+        assert!(!has_yellow, "no-color non-current match must not have yellow bg");
+        assert!(has_reversed, "no-color non-current match must have REVERSED modifier");
     }
 }
