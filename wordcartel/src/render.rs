@@ -450,8 +450,12 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         let scroll_pos = fv.visible_ordinal(editor.active().view.scroll);
         let sb_area = Rect::new(area.x, edit_top, w, edit_height);
         let mut sb_state = ScrollbarState::new(total).position(scroll_pos);
+        let sb_track_style = compose::compose(&editor.theme, editor.depth, &[SE::ChromeMuted]);
+        let sb_thumb_style = compose::compose(&editor.theme, editor.depth, &[SE::Chrome]);
         frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .track_style(sb_track_style)
+                .thumb_style(sb_thumb_style),
             sb_area,
             &mut sb_state,
         );
@@ -480,20 +484,21 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         // When a modal prompt is active, render its message instead of the normal
         // status text, using a distinct style so it stands out.
         // When the minibuffer is open, render <prompt><text> on the status row.
+        let chrome_reverse_style = compose::compose(&editor.theme, editor.depth, &[SE::ChromeReverse]);
         let (status_text, status_style) = if let Some(ref s) = editor.search {
             (
                 format_search_bar(s),
-                RStyle::default().add_modifier(Modifier::REVERSED),
+                chrome_reverse_style,
             )
         } else if let Some(ref mb) = editor.minibuffer {
             (
                 format!("{}{}", mb.prompt, mb.text),
-                RStyle::default().add_modifier(Modifier::REVERSED),
+                chrome_reverse_style,
             )
         } else if let Some(ref prompt) = editor.prompt {
             (
                 prompt.message.clone(),
-                RStyle::default().add_modifier(Modifier::REVERSED),
+                chrome_reverse_style,
             )
         } else {
             let text = if editor.status.is_empty() {
@@ -501,7 +506,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             } else {
                 format!("{}{} [{}] {}", path_str, dirty_marker, mode_text, editor.status)
             };
-            (text, RStyle::default().add_modifier(Modifier::REVERSED))
+            (text, chrome_reverse_style)
         };
 
         // Compose the status line.
@@ -561,6 +566,17 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     }
 
     // -----------------------------------------------------------------------
+    // Precompute chrome styles for overlays and menu (computed here once so
+    // the individual if-let blocks can borrow editor fields freely).
+    // -----------------------------------------------------------------------
+    let ov_highlight_style = compose::compose(&editor.theme, editor.depth, &[SE::ChromeReverse]);
+    let ov_query_style     = compose::compose(&editor.theme, editor.depth, &[SE::Text]);
+    let menu_open_style    = compose::compose(&editor.theme, editor.depth, &[SE::ChromeSelected]);
+    let menu_closed_style  = compose::compose(&editor.theme, editor.depth, &[SE::Chrome]);
+    let menu_sel_style     = compose::compose(&editor.theme, editor.depth, &[SE::ChromeSelected]);
+    let menu_norm_style    = compose::compose(&editor.theme, editor.depth, &[SE::ChromeMuted]);
+
+    // -----------------------------------------------------------------------
     // Command palette overlay (drawn on top of everything else)
     // -----------------------------------------------------------------------
     if let Some(ref palette) = editor.palette {
@@ -589,7 +605,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         let query_display = format!("> {}", palette.query);
         let truncated_q: String = query_display.chars().take(query_area.width as usize).collect();
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(truncated_q, RStyle::default()))),
+            Paragraph::new(Line::from(Span::styled(truncated_q, ov_query_style))),
             query_area,
         );
 
@@ -599,7 +615,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
 
         // List of rows (below query, inside border).
         let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h);
-        let highlight_style = RStyle::default().add_modifier(Modifier::REVERSED);
+        let highlight_style = ov_highlight_style;
         let items: Vec<ListItem> = palette.rows.iter().take(list_h as usize).map(|row| {
             // Left: label; right-aligned: chord.
             let chord_w = row.chord.chars().count() as u16;
@@ -637,13 +653,13 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             let query_display = format!("> {}", outline.query);
             let truncated_q: String = query_display.chars().take(query_area.width as usize).collect();
             frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(truncated_q, RStyle::default()))),
+                Paragraph::new(Line::from(Span::styled(truncated_q, ov_query_style))),
                 query_area,
             );
 
             if ov_h >= 4 && list_h > 0 {
                 let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h);
-                let highlight_style = RStyle::default().add_modifier(Modifier::REVERSED);
+                let highlight_style = ov_highlight_style;
                 let items: Vec<ListItem> = outline.rows.iter().take(list_h as usize).map(|row| {
                     let mut text = format!("{}{}", " ".repeat(row.indent.saturating_mul(2)), row.text);
                     text = text.chars().take(list_area.width as usize).collect();
@@ -672,9 +688,9 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 let label = crate::menu::category_label_pub(cat);
                 let text = format!(" {label} ");
                 let style = if *i == menu.open {
-                    RStyle::default().fg(Color::Black).bg(Color::White)
+                    menu_open_style
                 } else {
-                    RStyle::default().fg(Color::White).bg(Color::Black)
+                    menu_closed_style
                 };
                 frame.render_widget(Paragraph::new(text).style(style), *rect);
             }
@@ -687,9 +703,9 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                     .enumerate()
                     .map(|(row, (label, _))| {
                         let style = if row == menu.highlighted {
-                            RStyle::default().fg(Color::Black).bg(Color::White)
+                            menu_sel_style
                         } else {
-                            RStyle::default().fg(Color::White).bg(Color::DarkGray)
+                            menu_norm_style
                         };
                         ListItem::new(format!(" {label} ")).style(style)
                     })
@@ -719,7 +735,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         if ov_h >= 3 {
             let list_h = (row_count as u16).min(15).min(ov_h.saturating_sub(2));
             let list_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), list_h);
-            let highlight_style = RStyle::default().add_modifier(Modifier::REVERSED);
+            let highlight_style = ov_highlight_style;
 
             let n_sugg = diag_ov.anchor.suggestions.len();
             let items: Vec<ListItem> = (0..row_count).take(list_h as usize).map(|i| {
@@ -1150,6 +1166,33 @@ mod tests {
         let buf = render_to_buffer(&mut ed, 40, 4);
         let want = crate::compose::compose(&ed.theme, ed.depth, &[wordcartel_core::theme::SemanticElement::Text, wordcartel_core::theme::SemanticElement::Heading(1)]).fg;
         assert!((0..40).any(|x| buf[(x,0)].style().fg == want && want.is_some()), "heading fg applied");
+    }
+
+    #[test]
+    fn default_status_line_still_reversed() {
+        let mut ed = Editor::new_from_text("x", None, (40, 4));
+        let buf = render_to_buffer(&mut ed, 40, 4);
+        let last = 3u16;
+        assert!((0..40).any(|x| buf[(x,last)].style().add_modifier.contains(Modifier::REVERSED)));
+    }
+
+    #[test]
+    fn phosphor_status_line_carries_hue() {
+        let mut ed = Editor::new_from_text("x", None, (40, 4));
+        ed.theme = wordcartel_core::theme::Theme::builtin("phosphor-amber").unwrap();
+        let buf = render_to_buffer(&mut ed, 40, 4);
+        let want = compose::compose(&ed.theme, ed.depth, &[wordcartel_core::theme::SemanticElement::ChromeReverse]);
+        // the status row picks up the themed chrome-reverse style, not a hardcoded REVERSED.
+        // ratatui's test buffer normalizes unset colors to Reset in rendered cells, so compare
+        // the meaningful modifier bits and any explicit fg/bg from want.
+        assert!((0..40).any(|x| {
+            let cell = buf[(x,3)].style();
+            // modifiers must match exactly
+            cell.add_modifier == want.add_modifier
+            // any fg set by want must appear in the cell (Reset == None for our purposes)
+            && (want.fg.is_none() || cell.fg == want.fg)
+            && (want.bg.is_none() || cell.bg == want.bg)
+        }));
     }
 
     #[test]
