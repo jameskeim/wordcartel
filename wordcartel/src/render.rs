@@ -96,7 +96,11 @@ fn prefix_element(role: wordcartel_core::style::BlockRole) -> SE {
         R::BlockQuote    => SE::BlockQuote,
         R::ThematicBreak => SE::ThematicBreak,
         R::Heading(n)    => SE::Heading(n),
-        _                => SE::ListMarker,
+        R::ListItem      => SE::ListMarker,
+        // The remaining roles never carry a prefix glyph (no prefix_glyph is
+        // produced for them), so this fn is not reached for them; name them
+        // explicitly so a future BlockRole forces a deliberate choice here.
+        R::Paragraph | R::CodeBlock | R::FrontMatter | R::Comment => SE::ListMarker,
     }
 }
 
