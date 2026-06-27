@@ -143,6 +143,8 @@ pub enum BlockKind {
     ThematicBreak,
     HtmlBlock,
     HtmlComment,
+    /// A leading YAML front-matter block (`---\n … \n---`) at byte 0 ONLY.
+    FrontMatter,
     Table,
     /// Footnote definitions / metadata blocks / def lists collapsed here.
     Other,
@@ -200,8 +202,12 @@ fn role_precedence(r: &crate::style::BlockRole) -> u8 {
         ThematicBreak  => 2,
         ListItem       => 3,
         BlockQuote     => 4,
+        // FrontMatter is always a top-level byte-0 leaf (it cannot nest), so a
+        // rank just below Paragraph suffices for it to win `role_at` over the
+        // default Paragraph. `collect_role` overrides only on strictly-lower
+        // precedence, so FrontMatter==Paragraph would let Paragraph win.
+        FrontMatter    => 4,
         Paragraph      => 5,
-        FrontMatter    => 5,
     }
 }
 
@@ -215,6 +221,7 @@ fn kind_to_role(kind: &BlockKind) -> Option<crate::style::BlockRole> {
         BlockKind::ListItem => Some(BlockRole::ListItem),
         BlockKind::BlockQuote => Some(BlockRole::BlockQuote),
         BlockKind::HtmlComment => Some(BlockRole::Comment),
+        BlockKind::FrontMatter => Some(BlockRole::FrontMatter),
         _ => None,
     }
 }
@@ -316,8 +323,53 @@ pub fn full_parse(text: &str) -> BlockTree {
 }
 
 /// Generic version of `full_parse` over any `TextSource`.
+///
+/// THE ONLY true whole-document entry point — `full_parse` and
+/// `full_parse_rope` both route through here, and the incremental update path
+/// calls this (and ONLY this) when an edit forces a reparse-from-byte-0. Byte-0
+/// YAML front-matter detection lives HERE and NOWHERE ELSE: `parse_region` stays
+/// front-matter-blind so that the incremental splice — which calls
+/// `parse_region` on a localized FRAGMENT whose base offset can be 0 — never runs
+/// the byte-0 scanner against a non-document slice (the C3 splice hazard).
 pub fn full_parse_src<S: TextSource>(src: &S) -> BlockTree {
+    // Byte-0 front matter is detected on the whole-document text only.
+    let whole = src.slice(0..src.len());
+    if let Some(fm) = front_matter_span(whole.as_ref()) {
+        // Emit the FrontMatter block first (span 0..fm.end), then parse the
+        // REMAINDER `&src[fm.end..]` with base offset `fm.end` so its spans are
+        // shifted into document coordinates, and append those blocks after it.
+        let mut root = Block {
+            kind: BlockKind::Document,
+            span: 0..src.len(),
+            children: vec![Block {
+                kind: BlockKind::FrontMatter,
+                span: fm.clone(),
+                children: Vec::new(),
+            }],
+        };
+        let remainder = parse_region(src, fm.end..src.len(), fm.end);
+        root.children.extend(remainder.root.children);
+        return BlockTree { root };
+    }
     parse_region(src, 0..src.len(), 0)
+}
+
+/// If `src` begins with a YAML front-matter block (`---\n … \n---`), return its
+/// byte range (the whole block incl. both fences); else `None`. Byte-0 ONLY:
+/// the opening fence MUST sit at byte 0, so a mid-document `---` is never front
+/// matter (`strip_prefix` fails). The closing fence is the first line that is
+/// exactly `---` or `...`.
+fn front_matter_span(src: &str) -> Option<Range<usize>> {
+    let rest = src.strip_prefix("---\n")?; // opening fence MUST be at byte 0
+    let mut off = 4; // bytes consumed by the opening "---\n"
+    for line in rest.split_inclusive('\n') {
+        let trimmed = line.strip_suffix('\n').unwrap_or(line);
+        if trimmed == "---" || trimmed == "..." {
+            return Some(0..off + line.len());
+        }
+        off += line.len();
+    }
+    None
 }
 
 /// Parse the byte range `region` of `src`, treating the region as living at
@@ -592,6 +644,17 @@ pub fn incremental_update_instrumented_src<S: TextSource>(
         return UpdateOutcome { tree, reason: WidenReason::NoOverlapFull, reparsed_bytes: new_src.len() };
     }
 
+    // Byte-0 YAML front matter is detected ONLY by the whole-document entry
+    // (`full_parse_src`); the localized region reparse below is front-matter-
+    // blind. So any edit that could create, destroy, or resize a leading `---`
+    // block must route to a real reparse-from-byte-0 (the SAME mechanism the
+    // `html_in_play` branch above uses). Conservative: when in doubt reparse from
+    // 0 — front matter is a tiny head region, so the cost is negligible.
+    if frontmatter_in_play(old_src, new_src, edit) {
+        let tree = full_parse_src(new_src);
+        return UpdateOutcome { tree, reason: WidenReason::NoOverlapFull, reparsed_bytes: new_src.len() };
+    }
+
     // DOWNSTREAM ABSORPTION: editing inside / abutting a List, BlockQuote or
     // IndentedCode can change indentation/looseness such that *following* top-
     // level blocks get pulled in (indented code, paragraphs, sub-lists), or
@@ -841,6 +904,40 @@ fn html_in_play<S: TextSource>(
     let new_region_end = ((region_old_end as isize + edit.delta()) as usize).min(new_src.len());
     let new_region = new_src.slice(new_start.min(new_region_end)..new_region_end);
     html_opener_count(old_region.as_ref()) > 0 || html_opener_count(new_region.as_ref()) > 0
+}
+
+/// Force a reparse-from-byte-0 when an edit could affect the leading YAML
+/// front-matter region. Front matter is detected only by `full_parse_src` on
+/// the whole document, so the localized region splice (which is front-matter-
+/// blind) would otherwise produce a stale tree whenever an edit creates,
+/// destroys, or resizes a byte-0 `---` block.
+///
+/// Conservative by design — front matter is a tiny head region, so reparsing
+/// from 0 is negligible. The trigger fires when EITHER the old or the new
+/// document begins with the opening fence `---\n` at byte 0. Any document with a
+/// leading `---\n` is a potential front-matter document, and ANY edit to such a
+/// document can flip the front-matter status (or extent) of the whole head:
+///   - editing the head fence/body lines directly resizes/dissolves the block;
+///   - editing the TAIL (past the block) does NOT change the block, but the
+///     localized splice carries the head verbatim — and if a PRIOR step left the
+///     head mis-parsed as thematic breaks (the front-matter-blind `parse_region`
+///     view), only a reparse-from-0 can repair it.
+/// So we reparse from 0 whenever a leading `---\n` is present in either snapshot.
+///
+/// It is gated on the `---\n` prefix, so it never hijacks an unrelated byte-0
+/// edit (inserting a code fence, a link-reference definition, prose, …) into a
+/// document that does NOT start with `---\n` — those keep their own widen
+/// instrumentation.
+fn frontmatter_in_play<S: TextSource>(old_src: &S, new_src: &S, _edit: &Edit) -> bool {
+    starts_with_fm_fence(old_src) || starts_with_fm_fence(new_src)
+}
+
+/// True if `src` begins with the front-matter opening fence `---\n` at byte 0.
+/// Slices to `line_end(0)` (the byte just after the first `\n`, always a valid
+/// char boundary under LF-only semantics) rather than a fixed byte offset, so it
+/// never splits a multibyte char at the head.
+fn starts_with_fm_fence<S: TextSource>(src: &S) -> bool {
+    src.slice(0..src.line_end(0)).as_ref() == "---\n"
 }
 
 fn is_ref_def_line(line: &str) -> bool {
@@ -1221,6 +1318,36 @@ mod tests {
             "str incremental != full_parse"
         );
         assert_eq!(rope_tree, str_tree, "rope incremental != str incremental");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 4 (theming): byte-0 YAML front matter → BlockKind::FrontMatter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn byte0_front_matter_is_front_matter_role() {
+        let doc = "---\ntitle: Hi\n---\n\n# Heading\n";
+        let t = full_parse(doc);
+        assert_eq!(
+            t.role_at(doc.find("title").unwrap()),
+            crate::style::BlockRole::FrontMatter
+        );
+        // the heading after it is unaffected
+        assert_eq!(
+            t.role_at(doc.find("Heading").unwrap()),
+            crate::style::BlockRole::Heading(1)
+        );
+    }
+
+    #[test]
+    fn mid_document_dashes_are_not_front_matter() {
+        // a `---` NOT at byte 0 is a thematic break / setext underline, never front matter.
+        let doc = "para\n\n---\n\nmore\n";
+        let t = full_parse(doc);
+        assert_ne!(
+            t.role_at(doc.find("more").unwrap()),
+            crate::style::BlockRole::FrontMatter
+        );
     }
 
     // -----------------------------------------------------------------------

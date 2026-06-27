@@ -98,6 +98,42 @@ fn check(old_text: &str, range: std::ops::Range<usize>, replacement: &str) -> Up
     outcome
 }
 
+// ---------------------------------------------------------------------------
+// Task 4 (theming): byte-0 YAML front matter — incremental MUST equal full for
+// every edit that touches (or could form/dissolve) the leading `---` block.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn front_matter_editing_body_value_stays_full_eq_incremental() {
+    // "---\ntitle: a\n---\n\npara\n": the body value 'a' is at byte 11.
+    // Replace "a" -> "bb".
+    check("---\ntitle: a\n---\n\npara\n", 11..12, "bb");
+}
+
+#[test]
+fn front_matter_inserting_a_body_line_stays_full_eq_incremental() {
+    // "---\nt: a\n---\n\np\n": insert a new front-matter body line at byte 7
+    // (just before the 'a' of `t: a`).
+    check("---\nt: a\n---\n\np\n", 7..7, "x: y\n");
+}
+
+#[test]
+fn mid_doc_dashes_unaffected_by_unrelated_edit() {
+    // "p\n\n---\n\nq\n": a mid-doc `---` is a thematic break, NOT front matter.
+    // Editing 'q' (byte 8) -> 'Q' far from byte 0 must not perturb it, and the
+    // incremental splice must still equal the full parse.
+    check("p\n\n---\n\nq\n", 8..9, "Q");
+}
+
+#[test]
+fn typing_opening_fence_completes_front_matter_block() {
+    // start "title: a\n---\n\np\n" already has a CLOSING `---`; inserting the
+    // opening fence "---\n" at byte 0 yields "---\ntitle: a\n---\n\np\n", a
+    // COMPLETE front-matter block. The trigger must route this to a real
+    // reparse-from-0 so incremental == full.
+    check("title: a\n---\n\np\n", 0..0, "---\n");
+}
+
 #[test]
 fn typing_inside_paragraph_is_local() {
     let doc = "First para.\n\nSecond para here.\n\nThird para.\n";
