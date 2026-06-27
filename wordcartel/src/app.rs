@@ -440,6 +440,7 @@ pub(crate) fn dispatch_overlay_command(
 ) {
     editor.palette = None;
     editor.menu = None;
+    editor.theme_picker = None;
     let mut ctx = crate::registry::Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
     reg.dispatch(id, &mut ctx);
     for r in ex.drain() { apply_result(r, editor); }
@@ -666,6 +667,14 @@ fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_core::history
     // else: no suggestion and not ignore/add_dict — unreachable (selected is always in range).
 }
 
+/// Apply the theme-picker's currently-selected built-in as a live preview.
+fn preview_selected_theme(editor: &mut crate::editor::Editor) {
+    let name = editor.theme_picker.as_ref().and_then(|tp| tp.rows.get(tp.selected).cloned());
+    if let Some(name) = name {
+        if let Some(theme) = wordcartel_core::theme::Theme::builtin(&name) { editor.apply_theme(theme); }
+    }
+}
+
 pub fn outline_jump_to(editor: &mut Editor, byte: usize) {
     let origin = editor.active().document.selection.primary().head;
     crate::marks::record_jump(editor.active_mut(), origin);
@@ -830,6 +839,66 @@ pub fn reduce(
             return !editor.quit;
         }
         // Non-key msg falls through to normal handling while palette stays open.
+    }
+
+    // Theme picker overlay intercepts KEY INPUT and PASTE. Non-key, non-paste messages
+    // fall through to normal handling while the picker stays open (mirrors palette block).
+    if editor.theme_picker.is_some() {
+        // Paste intercept FIRST (mirror the palette, app.rs palette block) — else paste leaks
+        // into the document while the picker is open (Codex I6).
+        if let Msg::Input(Event::Paste(text)) = &msg {
+            if let Some(tp) = editor.theme_picker.as_mut() {
+                tp.query.push_str(text);
+                crate::theme_picker::rebuild_rows(tp);
+            }
+            preview_selected_theme(editor);
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
+        }
+        if let Msg::Input(Event::Key(k)) = &msg {
+            if k.kind == crossterm::event::KeyEventKind::Press {
+                use crossterm::event::KeyCode;
+                match k.code {
+                    KeyCode::Esc => {
+                        // cancel preview → restore the theme active when we opened.
+                        if let Some(tp) = editor.theme_picker.take() { editor.apply_theme(tp.original); }
+                    }
+                    KeyCode::Enter => { editor.theme_picker = None; } // keep current preview
+                    KeyCode::Up => {
+                        if let Some(tp) = editor.theme_picker.as_mut() { tp.selected = tp.selected.saturating_sub(1); }
+                        preview_selected_theme(editor);
+                    }
+                    KeyCode::Down => {
+                        if let Some(tp) = editor.theme_picker.as_mut() {
+                            let max = tp.rows.len().saturating_sub(1);
+                            tp.selected = (tp.selected + 1).min(max);
+                        }
+                        preview_selected_theme(editor);
+                    }
+                    KeyCode::Backspace => {
+                        if let Some(tp) = editor.theme_picker.as_mut() {
+                            tp.query.pop();
+                            crate::theme_picker::rebuild_rows(tp);
+                        }
+                        preview_selected_theme(editor);
+                    }
+                    KeyCode::Char(c)
+                        if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                            && !k.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
+                    {
+                        if let Some(tp) = editor.theme_picker.as_mut() {
+                            tp.query.push(c);
+                            crate::theme_picker::rebuild_rows(tp);
+                        }
+                        preview_selected_theme(editor);
+                    }
+                    _ => {}
+                }
+            }
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
+        }
+        // Non-key msg falls through to normal handling while picker stays open.
     }
 
     // Active modal intercepts KEY INPUT only (§5.3). Background results and ticks

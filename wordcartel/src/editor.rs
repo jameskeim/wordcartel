@@ -216,6 +216,8 @@ pub struct Editor {
     pub diag: Option<crate::diag_overlay::DiagOverlay>,
     /// Outline picker overlay state. XOR with prompt/minibuffer/palette/menu/search/diag.
     pub outline: Option<crate::outline_overlay::OutlineOverlay>,
+    /// Theme picker overlay state. XOR with all other overlays.
+    pub theme_picker: Option<crate::theme_picker::ThemePicker>,
     /// Active theme + terminal color depth. Seeded at startup (real depth detection: plan ③).
     pub theme: wordcartel_core::theme::Theme,
     pub depth: wordcartel_core::theme::Depth,
@@ -261,6 +263,7 @@ impl Editor {
             session_ignores: std::collections::HashSet::new(),
             diag: None,
             outline: None,
+            theme_picker: None,
             theme: wordcartel_core::theme::default(),
             depth: wordcartel_core::theme::Depth::Truecolor,
             heading_glyph_cfg: None,
@@ -305,6 +308,7 @@ impl Editor {
         self.search = None;
         self.diag = None;
         self.outline = None;
+        self.theme_picker = None;
         self.minibuffer = Some(crate::minibuffer::Minibuffer {
             prompt: prompt.into(),
             text: String::new(),
@@ -325,6 +329,7 @@ impl Editor {
         self.search = None;
         self.diag = None;
         self.outline = None;
+        self.theme_picker = None;
         self.prompt = Some(p);
     }
 
@@ -341,6 +346,7 @@ impl Editor {
         self.search = None;
         self.diag = None;
         self.outline = None;
+        self.theme_picker = None;
         self.palette = Some(crate::palette::Palette::default());
     }
 
@@ -353,6 +359,7 @@ impl Editor {
         self.pending_keys.clear(); self.pending_mark = None;
         self.diag = None;
         self.outline = None;
+        self.theme_picker = None;
         let bid = self.active().id;
         self.search = Some(crate::search_overlay::SearchState::open(phase, origin, bid));
     }
@@ -366,6 +373,7 @@ impl Editor {
         self.prompt = None; self.minibuffer = None; self.palette = None; self.menu = None; self.search = None;
         self.pending_keys.clear(); self.pending_mark = None;
         self.outline = None;
+        self.theme_picker = None;
         let bid = self.active().id;
         let ver = self.active().document.version;
         self.diag = Some(crate::diag_overlay::DiagOverlay::new(d, bid, ver));
@@ -376,11 +384,37 @@ impl Editor {
         self.prompt = None; self.minibuffer = None; self.palette = None; self.menu = None;
         self.search = None; self.diag = None;
         self.pending_keys.clear(); self.pending_mark = None;
+        self.theme_picker = None;
         let bid = self.active().id;
         let ver = self.active().document.version;
         let blocks = self.active().document.blocks.clone();
         let rope = self.active().document.buffer.snapshot();
         self.outline = Some(crate::outline_overlay::OutlineOverlay::open(bid, ver, &blocks, &rope));
+    }
+
+    /// Open the theme picker, enforcing the single-overlay XOR invariant.
+    pub fn open_theme_picker(&mut self) {
+        self.prompt = None; self.minibuffer = None; self.menu = None;
+        self.pending_keys.clear(); self.pending_mark = None;
+        self.search = None; self.diag = None; self.outline = None; self.palette = None;
+        self.theme_picker = Some(crate::theme_picker::ThemePicker {
+            query: String::new(), selected: 0, rows: Vec::new(),
+            original: self.theme.clone(),
+        });
+        if let Some(tp) = self.theme_picker.as_mut() { crate::theme_picker::rebuild_rows(tp); }
+    }
+
+    /// Apply a theme: swap, re-derive the heading-glyph flag (cue mode forces ON;
+    /// else the CONFIG override `heading_glyph_cfg` wins, else the theme's own flag —
+    /// Codex I4, so a picker switch doesn't drop a configured override), relayout
+    /// (heading_level_glyph is a layout input — §3.6/§3.7), keep caret visible.
+    pub fn apply_theme(&mut self, mut theme: wordcartel_core::theme::Theme) {
+        let cue = self.depth == wordcartel_core::theme::Depth::None || theme.monochrome;
+        theme.heading_level_glyph = if cue { true }
+            else { self.heading_glyph_cfg.unwrap_or(theme.heading_level_glyph) };
+        self.theme = theme;
+        crate::derive::rebuild(self);
+        crate::nav::ensure_visible(self);
     }
 
     // Thin delegators — external callers unchanged.

@@ -770,6 +770,50 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Theme picker overlay (drawn on top of everything else)
+    // -----------------------------------------------------------------------
+    if let Some(ref tp) = editor.theme_picker {
+        let ov_rect = palette_overlay_rect(area, tp.rows.len());
+        let ov_x = ov_rect.x;
+        let ov_y = ov_rect.y;
+        let ov_w = ov_rect.width;
+        let ov_h = ov_rect.height;
+        let list_h = (tp.rows.len() as u16).min(15).min(h.saturating_sub(4));
+
+        frame.render_widget(Clear, ov_rect);
+        let block = Block::default().borders(Borders::ALL).title(" Select Theme ");
+        frame.render_widget(block, ov_rect);
+
+        if ov_h >= 3 {
+            let query_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), 1);
+            let query_display = format!("> {}", tp.query);
+            let truncated_q: String = query_display.chars().take(query_area.width as usize).collect();
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(truncated_q, ov_query_style))),
+                query_area,
+            );
+
+            if ov_h >= 4 && list_h > 0 {
+                let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h);
+                let highlight_style = ov_highlight_style;
+                let items: Vec<ListItem> = tp.rows.iter().take(list_h as usize).map(|name| {
+                    let truncated: String = name.chars().take(list_area.width as usize).collect();
+                    ListItem::new(Line::from(truncated))
+                }).collect();
+
+                let mut list_state = ListState::default();
+                list_state.select(if tp.rows.is_empty() { None } else { Some(tp.selected) });
+
+                frame.render_stateful_widget(
+                    List::new(items).highlight_style(highlight_style),
+                    list_area,
+                    &mut list_state,
+                );
+            }
+        }
+    }
+
     if let Some(ref menu) = editor.menu {
         if !menu.groups.is_empty() {
             let menu_area = Rect::new(area.x, area.y, w, h.saturating_sub(1));
@@ -1801,5 +1845,14 @@ mod tests {
         assert!(text.contains('░'), "H4 shade glyph (░ = SHADES[3]) missing in no_color");
         assert!(text.contains('▏'), "H5 shade glyph (▏ = SHADES[4]) missing in no_color");
         assert!(text.contains('·'), "H6 shade glyph (· = SHADES[5]) missing in no_color");
+    }
+
+    #[test]
+    fn theme_picker_paints_rows_and_selection() {
+        let mut ed = Editor::new_from_text("x\n", None, (60, 16));
+        ed.open_theme_picker();
+        let buf = render_to_buffer(&mut ed, 60, 16);
+        let text: String = (0..16).map(|r| row_string(&buf, r)).collect();
+        assert!(text.contains("tokyo-night"), "picker lists built-in themes");
     }
 }
