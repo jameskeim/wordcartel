@@ -37,7 +37,7 @@
 - Test: `wordcartel-core/src/theme.rs` (`#[cfg(test)]`)
 
 **Interfaces:**
-- Produces: `Color` enum (`Rgb{r,g,b}`/`Ansi16(u8)`/`Indexed(u8)`/`Default`), `Face` struct (all-`Option` fields), `SemanticElement` enum, `Depth` enum.
+- Produces: `Color` enum (`Rgb{r,g,b}` / 16 named ANSI variants `Black..White` / `Indexed(u8)` / `Default`), `Face` struct (all-`Option` fields, incl. `dim`), `SemanticElement` enum (incl. `ChromeReverse`), `Depth` enum.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -45,8 +45,17 @@ Create `wordcartel-core/src/theme.rs`:
 ```rust
 //! Pure, UI-agnostic theme model. No IO, no ratatui. The shell maps `Color`→ratatui.
 
+/// Mirrors ratatui's named-color set 1:1 so the Default theme reproduces today's
+/// `Color::Cyan` etc. EXACTLY (ratatui's `Color::Cyan` != `Color::Indexed(6)`).
+/// `Indexed(u8)` is ONLY a quantized 256-color result; `Rgb` is truecolor.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Color { Rgb { r: u8, g: u8, b: u8 }, Ansi16(u8), Indexed(u8), Default }
+pub enum Color {
+    Rgb { r: u8, g: u8, b: u8 },
+    Black, Red, Green, Yellow, Blue, Magenta, Cyan, Gray,
+    DarkGray, LightRed, LightGreen, LightYellow, LightBlue, LightMagenta, LightCyan, White,
+    Indexed(u8),
+    Default,
+}
 
 /// One resolved look. Option None = "inherit accumulated" during composition;
 /// Some(Color::Default) = explicitly reset that color to the terminal default.
@@ -68,7 +77,10 @@ pub enum SemanticElement {
     Heading(u8), BlockQuote, CodeBlock, ListMarker, ThematicBreak,
     FrontMatter, Comment, Selection,
     SearchMatch, SearchCurrent, DiagSpelling, DiagGrammar, FocusDim, FoldMarker, WrapGuide,
-    Chrome, ChromeSelected, ChromeMuted,
+    Chrome,         // panel/frame base (status/menu bar bg, overlay frames)
+    ChromeReverse,  // REVERSED highlight (status line, palette/outline/diag selected row)
+    ChromeSelected, // explicit fg/bg selection (menu item — today Black-on-White, NOT reverse)
+    ChromeMuted,    // dim secondary chrome (menu dropdown normal item, scrollbar track)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -113,7 +125,7 @@ git commit -m "feat(theme): core Color/Face/SemanticElement/Depth types"
 
 **Interfaces:**
 - Consumes: `Color`, `Depth`.
-- Produces: `pub fn quantize(c: Color, depth: Depth) -> Color` — `Rgb`→`Indexed` (6×6×6 cube + 24-gray ramp) at `Indexed256`; `Rgb`/`Indexed`→`Ansi16` at `Ansi16`; `Ansi16`/`Default` pass through at every depth; `Truecolor` passes everything through. (`Depth::None` is never passed here — callers force the No-color theme upstream.)
+- Produces: `pub fn quantize(c: Color, depth: Depth) -> Color` — `Rgb`→`Indexed` (6×6×6 cube + 24-gray ramp) at `Indexed256`; `Rgb`/`Indexed`→the nearest **named** color at `Ansi16`; named colors and `Default` pass through at every depth; `Truecolor` passes everything through. (`Depth::None` is never passed here — callers force the No-color theme upstream.)
 
 - [ ] **Step 1: Write the failing test**
 ```rust
@@ -136,10 +148,10 @@ git commit -m "feat(theme): core Color/Face/SemanticElement/Depth types"
     }
     #[test]
     fn quantize_rgb_to_ansi16_nearest() {
-        // pure red → ansi 9 (bright red) or 1 (red); assert it's one of the reds.
+        // pure red → a named red (Red or LightRed).
         let r = quantize(Color::Rgb { r: 255, g: 0, b: 0 }, Depth::Ansi16);
-        assert!(matches!(r, Color::Ansi16(1) | Color::Ansi16(9)), "red, got {r:?}");
-        assert_eq!(quantize(Color::Ansi16(5), Depth::Ansi16), Color::Ansi16(5)); // passthrough
+        assert!(matches!(r, Color::Red | Color::LightRed), "red, got {r:?}");
+        assert_eq!(quantize(Color::Magenta, Depth::Ansi16), Color::Magenta); // named passthrough
         assert_eq!(quantize(Color::Default, Depth::Ansi16), Color::Default);
     }
     #[test]
@@ -159,19 +171,29 @@ Expected: FAIL — `quantize` not defined.
 
 Add to `theme.rs` (the 256-cube/gray algorithm is the standard xterm mapping; the 16-color step maps via the cube's nearest ANSI):
 ```rust
-/// Nearest-color downsample. Pure arithmetic; no allocation.
+/// Nearest-color downsample. Pure arithmetic; no allocation. Only `Rgb` (and
+/// `Indexed`→ansi16) are converted; named colors and `Default` pass through.
 pub fn quantize(c: Color, depth: Depth) -> Color {
     match (c, depth) {
-        (_, Depth::Truecolor) | (Color::Default, _) | (Color::Ansi16(_), _) => c,
-        (Color::Indexed(_), Depth::Indexed256) => c,
+        (_, Depth::Truecolor) | (_, Depth::None) => c, // None never reached; identity safe
         (Color::Rgb { r, g, b }, Depth::Indexed256) => Color::Indexed(rgb_to_xterm256(r, g, b)),
-        (Color::Rgb { r, g, b }, Depth::Ansi16) => Color::Ansi16(rgb_to_ansi16(r, g, b)),
-        (Color::Indexed(i), Depth::Ansi16) => {
-            let (r, g, b) = xterm256_to_rgb(i);
-            Color::Ansi16(rgb_to_ansi16(r, g, b))
-        }
-        (c, Depth::None) => c, // unreachable in practice; identity is safe
+        (Color::Rgb { r, g, b }, Depth::Ansi16) => rgb_to_named16(r, g, b),
+        (Color::Indexed(i), Depth::Ansi16) => { let (r, g, b) = xterm256_to_rgb(i); rgb_to_named16(r, g, b) }
+        // named colors, Indexed@256, Default → unchanged
+        (c, _) => c,
     }
+}
+
+/// Nearest of the 16 named ANSI colors by squared RGB distance, returned as the
+/// matching named `Color` variant (NOT an index — so it maps to ratatui's named color).
+fn rgb_to_named16(r: u8, g: u8, b: u8) -> Color {
+    const NAMED: [(Color, (u8,u8,u8)); 16] = [
+        (Color::Black,(0,0,0)),(Color::Red,(128,0,0)),(Color::Green,(0,128,0)),(Color::Yellow,(128,128,0)),
+        (Color::Blue,(0,0,128)),(Color::Magenta,(128,0,128)),(Color::Cyan,(0,128,128)),(Color::Gray,(192,192,192)),
+        (Color::DarkGray,(128,128,128)),(Color::LightRed,(255,0,0)),(Color::LightGreen,(0,255,0)),(Color::LightYellow,(255,255,0)),
+        (Color::LightBlue,(0,0,255)),(Color::LightMagenta,(255,0,255)),(Color::LightCyan,(0,255,255)),(Color::White,(255,255,255)),
+    ];
+    NAMED.iter().min_by_key(|(_, rgb)| dist2((r,g,b), *rgb)).unwrap().0
 }
 
 fn rgb_to_xterm256(r: u8, g: u8, b: u8) -> u8 {
@@ -203,11 +225,6 @@ fn xterm256_to_rgb(i: u8) -> (u8, u8, u8) {
         let v = 8 + (i - 232) * 10;
         (v, v, v)
     }
-}
-
-fn rgb_to_ansi16(r: u8, g: u8, b: u8) -> u8 {
-    // nearest of the 16 standard ANSI colors by squared distance.
-    (0u8..16).min_by_key(|&i| dist2((r, g, b), xterm256_to_rgb(i))).unwrap()
 }
 
 fn dist2(a: (u8, u8, u8), b: (u8, u8, u8)) -> u32 {
@@ -253,8 +270,8 @@ git commit -m "feat(theme): quantize (Rgb→256 cube/gray + →ansi16 nearest)"
         assert_eq!(t.face(SemanticElement::Emphasis),       f(None, false, true,  false, false));
         assert_eq!(t.face(SemanticElement::StrongEmphasis), f(None, true,  true,  false, false));
         assert_eq!(t.face(SemanticElement::Strikethrough),  f(None, false, false, false, true));
-        assert_eq!(t.face(SemanticElement::Code), f(Some(Color::Ansi16(6)), false, false, false, false)); // Cyan == ansi 6
-        assert_eq!(t.face(SemanticElement::Link), f(Some(Color::Ansi16(3)), false, false, true,  false));  // Yellow == ansi 3
+        assert_eq!(t.face(SemanticElement::Code), f(Some(Color::Cyan), false, false, false, false));
+        assert_eq!(t.face(SemanticElement::Link), f(Some(Color::Yellow), false, false, true,  false));
     }
     #[test]
     fn default_base_is_terminal_default() {
@@ -277,15 +294,17 @@ git commit -m "feat(theme): quantize (Rgb→256 cube/gray + →ansi16 nearest)"
 ```
 Add a test helper listing every element (used by several tasks):
 ```rust
-    const ALL_ELEMENTS: [SemanticElement; 26] = {
+    const ALL_ELEMENTS: [SemanticElement; 31] = {
         use SemanticElement::*;
         [Text, Emphasis, Strong, StrongEmphasis, Code, Strikethrough, Link,
          Heading(1), Heading(2), Heading(3), Heading(4), Heading(5), Heading(6),
          BlockQuote, CodeBlock, ListMarker, ThematicBreak, FrontMatter, Comment, Selection,
-         SearchMatch, SearchCurrent, DiagSpelling, DiagGrammar, FocusDim, FoldMarker]
+         SearchMatch, SearchCurrent, DiagSpelling, DiagGrammar, FocusDim, FoldMarker, WrapGuide,
+         Chrome, ChromeReverse, ChromeSelected, ChromeMuted]
     };
-    // NOTE: WrapGuide/Chrome×3 are added to ALL_ELEMENTS coverage in the chrome task; keep this
-    // list in sync — the `face_is_total` loop must visit every variant. (26 here; extend later.)
+    // 31 = Text + 6 inline + 6 heading + 4 block + 3 (fm/comment/sel) + 7 overlay + 4 chrome.
+    // This is the totality proof — the count must equal the SemanticElement variant count
+    // (Heading collapsed to its 6 levels). The `face_is_total` loop visits every one.
 ```
 > The implementer: make `ALL_ELEMENTS` cover **every** variant (Text, 7 inline, Heading 1-6, BlockQuote, CodeBlock, ListMarker, ThematicBreak, FrontMatter, Comment, Selection, SearchMatch, SearchCurrent, DiagSpelling, DiagGrammar, FocusDim, FoldMarker, WrapGuide, Chrome, ChromeSelected, ChromeMuted) — count them and fix the array length. The exact count is the proof `face` is total.
 
@@ -296,7 +315,7 @@ Expected: FAIL — `default`/`Theme`/`face` not defined.
 
 - [ ] **Step 3: Implement `Theme` + `face` + `default`**
 
-Model `ThemeFaces` as a struct with a named `Face` per element (totality by construction), and `face()` a match. `default()` sets every Face to reproduce today (most are `Face::default()`; only the inline ones carry the mapped modifiers/colors). Map ratatui named colors to `Color::Ansi16`: Cyan=6, Yellow=3, Red=1, Blue=4, Black=0, White=15, DarkGray=8.
+Model `ThemeFaces` as a struct with a named `Face` per element (totality by construction), and `face()` a match. `default()` sets every Face to reproduce today (most are `Face::default()`; only the inline ones carry the mapped modifiers/colors). Use the **named `Color` variants directly** (`Color::Cyan`, `Color::Yellow`, `Color::Red`, `Color::Blue`, `Color::Black`, `Color::White`, `Color::DarkGray`) — they map 1:1 to ratatui's named colors in Task 7, so a golden test asserting `Some(Color::Cyan)` matches today.
 ```rust
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct ThemeFaces {
@@ -305,7 +324,7 @@ struct ThemeFaces {
     front_matter: Face, comment: Face, selection: Face,
     search_match: Face, search_current: Face, diag_spelling: Face, diag_grammar: Face,
     focus_dim: Face, fold_marker: Face, wrap_guide: Face,
-    chrome: Face, chrome_selected: Face, chrome_muted: Face,
+    chrome: Face, chrome_reverse: Face, chrome_selected: Face, chrome_muted: Face,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -332,7 +351,8 @@ impl Theme {
             SearchMatch => self.faces.search_match, SearchCurrent => self.faces.search_current,
             DiagSpelling => self.faces.diag_spelling, DiagGrammar => self.faces.diag_grammar,
             FocusDim => self.faces.focus_dim, FoldMarker => self.faces.fold_marker, WrapGuide => self.faces.wrap_guide,
-            Chrome => self.faces.chrome, ChromeSelected => self.faces.chrome_selected, ChromeMuted => self.faces.chrome_muted,
+            Chrome => self.faces.chrome, ChromeReverse => self.faces.chrome_reverse,
+            ChromeSelected => self.faces.chrome_selected, ChromeMuted => self.faces.chrome_muted,
         }
     }
     pub fn builtin(name: &str) -> Option<Theme> {
@@ -352,7 +372,6 @@ fn modface(fg: Option<Color>, bold: bool, italic: bool, underline: bool, strike:
 }
 
 pub fn default() -> Theme {
-    let dark_gray = Color::Ansi16(8);
     Theme {
         name: "default".into(),
         base_fg: Color::Default, base_bg: Color::Default,
@@ -362,26 +381,28 @@ pub fn default() -> Theme {
             emphasis: modface(None, false, true, false, false, false),
             strong: modface(None, true, false, false, false, false),
             strong_emphasis: modface(None, true, true, false, false, false),
-            code: modface(Some(Color::Ansi16(6)), false, false, false, false, false), // Cyan
+            code: modface(Some(Color::Cyan), false, false, false, false, false),
             strikethrough: modface(None, false, false, false, true, false),
-            link: modface(Some(Color::Ansi16(3)), false, false, true, false, false), // Yellow + underline
+            link: modface(Some(Color::Yellow), false, false, true, false, false),
             heading: [Face::default(); 6],          // today: no heading color
             block_quote: Face::default(), code_block: Face::default(),
-            list_marker: Face { fg: Some(dark_gray), ..Face::default() }, // prefix glyph dim today
+            list_marker: Face { fg: Some(Color::DarkGray), ..Face::default() }, // prefix glyph normal
             thematic_break: Face::default(), front_matter: Face::default(), comment: Face::default(),
             selection: Face::default(),             // not painted in plan ① (no face needed yet)
             // search: today match = yellow bg + black fg; current = reverse.
-            search_match: Face { bg: Some(Color::Ansi16(3)), fg: Some(Color::Ansi16(0)), ..Face::default() },
+            search_match: Face { bg: Some(Color::Yellow), fg: Some(Color::Black), ..Face::default() },
             search_current: modface(None, false, false, false, false, true),
-            diag_spelling: Face { underline: Some(true), underline_color: Some(Color::Ansi16(1)), ..Face::default() }, // Red
-            diag_grammar:  Face { underline: Some(true), underline_color: Some(Color::Ansi16(4)), ..Face::default() }, // Blue
-            focus_dim: Face { fg: Some(dark_gray), ..Face::default() },   // today: DarkGray dim
-            fold_marker: Face { fg: Some(dark_gray), ..Face::default() },
-            wrap_guide: Face { fg: Some(dark_gray), ..Face::default() },
-            // chrome (today): status/menu = white/black; selected = reverse; muted = white on dark-gray.
-            chrome: Face { fg: Some(Color::Ansi16(15)), bg: Some(Color::Ansi16(0)), ..Face::default() },
-            chrome_selected: modface(None, false, false, false, false, true),
-            chrome_muted: Face { fg: Some(Color::Ansi16(15)), bg: Some(dark_gray), ..Face::default() },
+            diag_spelling: Face { underline: Some(true), underline_color: Some(Color::Red), ..Face::default() },
+            diag_grammar:  Face { underline: Some(true), underline_color: Some(Color::Blue), ..Face::default() },
+            focus_dim: Face { fg: Some(Color::DarkGray), ..Face::default() },   // today: DarkGray
+            fold_marker: Face { fg: Some(Color::DarkGray), ..Face::default() },
+            wrap_guide: Face { fg: Some(Color::DarkGray), ..Face::default() },
+            // chrome today: frame/menu-closed = white/black; status & overlay-selected = REVERSED;
+            // menu-selected = explicit Black-on-White (NOT reverse); dropdown-normal = white/dark-gray.
+            chrome: Face { fg: Some(Color::White), bg: Some(Color::Black), ..Face::default() },
+            chrome_reverse: modface(None, false, false, false, false, true),
+            chrome_selected: Face { fg: Some(Color::Black), bg: Some(Color::White), ..Face::default() },
+            chrome_muted: Face { fg: Some(Color::White), bg: Some(Color::DarkGray), ..Face::default() },
         },
     }
 }
@@ -474,7 +495,8 @@ pub fn no_color() -> Theme {
             focus_dim: Face { dim: Some(true), ..Face::default() },     // DIM inactive rows
             fold_marker: Face::default(), wrap_guide: Face::default(),
             chrome: Face::default(),
-            chrome_selected: m(false, false, false, false, true),
+            chrome_reverse: m(false, false, false, false, true),     // REVERSED
+            chrome_selected: m(false, false, false, false, true),    // no-color: reverse (can't do black-on-white)
             chrome_muted: Face { dim: Some(true), ..Face::default() },
         },
     }
@@ -482,7 +504,10 @@ pub fn no_color() -> Theme {
 ```
 > Uses `Face.dim` (defined in Task 1). Comment = `italic+dim` vs Emphasis = `italic` → genuinely distinct (the pairwise test); FocusDim/ChromeMuted use `dim`. `face_to_ratatui` (Task 7) maps `dim`→`Modifier::DIM`.
 
-Wire `builtin`/`builtin_names` to include `"no-color"`.
+Wire `builtin`/`builtin_names` to include `"no-color"`. (Task 6 extracts these same
+modifier-cue faces into a shared `mono_faces()` helper; when you reach Task 6,
+refactor this `no_color()` to `Theme { ..., faces: mono_faces() }` so the cue set
+has ONE source of truth — the `no_color` tests stay green since the faces are identical.)
 
 - [ ] **Step 4: Run to verify it passes**
 
@@ -615,28 +640,79 @@ fn shade(hue: Color, level: u8) -> Color {
 fn rgb_to_hsl(r: u8, g: u8, b: u8) -> (f32, f32, f32) { /* standard conversion */ }
 fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) { /* standard conversion */ }
 
-pub fn phosphor(name: &str, hue: Color, flat: bool) -> Theme {
-    let bg = shade(hue, 0);          // near-black hue
-    let fg = shade(hue, 3);          // mid-bright hue
-    let lvl = |n| if flat { fg } else { shade(hue, n) };
-    let m = |bold, italic, underline, strike, reverse| modface(if flat { None } else { Some(fg) }, bold, italic, underline, strike, reverse);
-    // shaded: assign a brightness per element; flat: all fg None (→ base_fg) + modifiers/glyphs.
-    Theme {
-        name: name.into(), base_fg: fg, base_bg: bg,
-        heading_level_glyph: flat, monochrome: flat,
-        faces: ThemeFaces {
-            text: Face { fg: Some(fg), ..Face::default() },
-            // ... shaded uses lvl(5) for headings, lvl(4) strong, lvl(2) comment, reverse for code, etc.
-            // flat uses modifiers only (m(...)); chrome from the ramp (bg=shade(hue,1), fg=shade(hue,4)).
-            // Fill EVERY face. Reuse the no_color() modifier discipline for the flat variant so the
-            // monochrome §4 invariant holds (flat reuses the same compound cues).
-            // (full literal omitted here for brevity — the implementer fills it; tests above are the contract)
-            ..todo_fill_from_ramp(hue, flat)
-        },
+/// The monochrome (modifier-cue) face set, shared by `no_color()` and phosphor-flat
+/// so the §4 cue discipline lives in one place. ALL text faces have `fg = None`
+/// (→ inherit the theme's `base_fg`); distinctions are modifiers only.
+fn mono_faces() -> ThemeFaces {
+    let m = |bold, italic, underline, strike, reverse| modface(None, bold, italic, underline, strike, reverse);
+    ThemeFaces {
+        text: Face::default(),
+        emphasis: m(false, true, false, false, false),
+        strong: m(true, false, false, false, false),
+        strong_emphasis: m(true, true, false, false, false),
+        code: m(false, false, false, false, true),                // reverse
+        strikethrough: m(false, false, false, true, false),
+        link: m(false, false, true, false, false),                // underline
+        heading: [m(true, false, false, false, false); 6],        // bold (+ level glyph in plan ②)
+        block_quote: Face::default(), code_block: m(false, false, false, false, true),
+        list_marker: Face::default(), thematic_break: Face::default(),
+        front_matter: m(false, true, false, false, true),         // reverse+italic
+        comment: Face { italic: Some(true), dim: Some(true), ..Face::default() }, // italic+dim
+        selection: m(false, false, true, false, true),            // reverse+underline
+        search_match: m(false, false, false, false, true),
+        search_current: m(true, false, false, false, true),
+        diag_spelling: m(true, false, true, false, false),        // bold+underline
+        diag_grammar:  m(true, false, true, false, false),
+        focus_dim: Face { dim: Some(true), ..Face::default() },
+        fold_marker: Face::default(), wrap_guide: Face::default(),
+        chrome: Face::default(),
+        chrome_reverse: m(false, false, false, false, true),
+        chrome_selected: m(false, false, false, false, true),
+        chrome_muted: Face { dim: Some(true), ..Face::default() },
     }
 }
-```
-> The `..todo_fill_from_ramp` is a placeholder for the implementer to write out the full `ThemeFaces` literal — there is no `todo_fill_from_ramp` function; write each field. For the **flat** variant, copy `no_color()`'s modifier cues verbatim (so the §4 monochrome invariant holds) but set `base_fg/base_bg` to the hue and fill the chrome faces with hue shades. For the **shaded** variant, assign a brightness per element (headings `shade(hue,5)`, strong `shade(hue,4)`, body/text `fg`, comment/front-matter `shade(hue,2)`, code reverse on `shade(hue,1)` bg, etc.). Pick `base_fg=shade(hue,3)`, `base_bg=shade(hue,0)`; verify the 16-color floor test passes (if `shade(hue,3)` and `shade(hue,0)` quantize to the same ANSI cell, widen the lightness spread).
+
+pub fn phosphor(name: &str, hue: Color, flat: bool) -> Theme {
+    let bg = shade(hue, 0);           // near-black hue
+    let fg = shade(hue, 3);           // mid-bright hue
+    let faces = if flat {
+        // flat: reuse the modifier-only mono cues, but theme the chrome in-hue so the
+        // whole screen is monochrome (text inherits base_fg = the hue).
+        let mut f = mono_faces();
+        f.chrome = Face { fg: Some(shade(hue, 4)), bg: Some(shade(hue, 1)), ..Face::default() };
+        f.chrome_muted = Face { fg: Some(shade(hue, 2)), bg: Some(shade(hue, 0)), dim: Some(true), ..Face::default() };
+        f
+    } else {
+        // shaded: distinguish by lightness within the hue.
+        let s = |n| Face { fg: Some(shade(hue, n)), ..Face::default() };
+        ThemeFaces {
+            text: s(3),
+            emphasis: Face { fg: Some(shade(hue, 3)), italic: Some(true), ..Face::default() },
+            strong:   Face { fg: Some(shade(hue, 4)), bold: Some(true), ..Face::default() },
+            strong_emphasis: Face { fg: Some(shade(hue, 4)), bold: Some(true), italic: Some(true), ..Face::default() },
+            code: Face { fg: Some(shade(hue, 2)), reverse: Some(true), ..Face::default() },
+            strikethrough: Face { fg: Some(shade(hue, 2)), strike: Some(true), ..Face::default() },
+            link: Face { fg: Some(shade(hue, 5)), underline: Some(true), ..Face::default() },
+            heading: [s(5), s(5), s(4), s(4), s(3), s(3)],
+            block_quote: s(2), code_block: Face { fg: Some(shade(hue, 2)), reverse: Some(true), ..Face::default() },
+            list_marker: s(2), thematic_break: s(1),
+            front_matter: Face { fg: Some(shade(hue, 2)), italic: Some(true), ..Face::default() },
+            comment: Face { fg: Some(shade(hue, 1)), italic: Some(true), ..Face::default() },
+            selection: Face { fg: Some(shade(hue, 5)), reverse: Some(true), underline: Some(true), ..Face::default() },
+            search_match: Face { bg: Some(shade(hue, 2)), fg: Some(shade(hue, 0)), ..Face::default() },
+            search_current: Face { reverse: Some(true), bold: Some(true), ..Face::default() },
+            diag_spelling: Face { underline: Some(true), underline_color: Some(shade(hue, 5)), ..Face::default() },
+            diag_grammar:  Face { underline: Some(true), underline_color: Some(shade(hue, 4)), ..Face::default() },
+            focus_dim: Face { fg: Some(shade(hue, 1)), dim: Some(true), ..Face::default() },
+            fold_marker: s(1), wrap_guide: s(1),
+            chrome: Face { fg: Some(shade(hue, 4)), bg: Some(shade(hue, 1)), ..Face::default() },
+            chrome_reverse: Face { reverse: Some(true), ..Face::default() },
+            chrome_selected: Face { fg: Some(shade(hue, 0)), bg: Some(shade(hue, 4)), ..Face::default() },
+            chrome_muted: Face { fg: Some(shade(hue, 2)), bg: Some(shade(hue, 0)), dim: Some(true), ..Face::default() },
+        }
+    };
+    Theme { name: name.into(), base_fg: fg, base_bg: bg, heading_level_glyph: flat, monochrome: flat, faces }
+}
 
 Wire `builtin`/`builtin_names`:
 ```rust
@@ -685,12 +761,12 @@ mod tests {
     #[test]
     fn maps_rgb_and_modifiers_at_truecolor() {
         let f = Face { fg: Some(Color::Rgb{r:1,g:2,b:3}), bold: Some(true), underline: Some(true),
-                       underline_color: Some(Color::Ansi16(1)), ..Face::default() };
+                       underline_color: Some(Color::Red), ..Face::default() };
         let s = face_to_ratatui(&f, Depth::Truecolor);
         assert_eq!(s.fg, Some(RColor::Rgb(1,2,3)));
         assert!(s.add_modifier.contains(Modifier::BOLD));
         assert!(s.add_modifier.contains(Modifier::UNDERLINED));
-        assert_eq!(s.underline_color, Some(RColor::Indexed(1)));
+        assert_eq!(s.underline_color, Some(RColor::Red));
     }
     #[test]
     fn default_color_is_reset_not_a_color() {
@@ -702,7 +778,8 @@ mod tests {
     fn quantizes_at_ansi16() {
         let f = Face { fg: Some(Color::Rgb{r:255,g:0,b:0}), ..Face::default() };
         let s = face_to_ratatui(&f, Depth::Ansi16);
-        assert!(matches!(s.fg, Some(RColor::Indexed(1)) | Some(RColor::Indexed(9))));
+        // Rgb red → named Red/LightRed → ratatui named (NOT Indexed)
+        assert!(matches!(s.fg, Some(RColor::Red) | Some(RColor::LightRed)));
     }
 }
 ```
@@ -720,9 +797,16 @@ use wordcartel_core::theme::{quantize, Color, Depth, Face};
 fn to_rcolor(c: Color, depth: Depth) -> RColor {
     match quantize(c, depth) {
         Color::Rgb { r, g, b } => RColor::Rgb(r, g, b),
-        Color::Ansi16(i) => RColor::Indexed(i),
         Color::Indexed(i) => RColor::Indexed(i),
         Color::Default => RColor::Reset,
+        // named → ratatui named (1:1, so the Default theme reproduces today's Color::Cyan etc.)
+        Color::Black => RColor::Black, Color::Red => RColor::Red, Color::Green => RColor::Green,
+        Color::Yellow => RColor::Yellow, Color::Blue => RColor::Blue, Color::Magenta => RColor::Magenta,
+        Color::Cyan => RColor::Cyan, Color::Gray => RColor::Gray, Color::DarkGray => RColor::DarkGray,
+        Color::LightRed => RColor::LightRed, Color::LightGreen => RColor::LightGreen,
+        Color::LightYellow => RColor::LightYellow, Color::LightBlue => RColor::LightBlue,
+        Color::LightMagenta => RColor::LightMagenta, Color::LightCyan => RColor::LightCyan,
+        Color::White => RColor::White,
     }
 }
 
@@ -923,7 +1007,19 @@ fn role_element(role: wordcartel_core::style::BlockRole) -> wordcartel_core::the
                  R::Paragraph => E::Text }
 }
 ```
-The row already has its `role` (from derive/block_tree) at the paint site — thread it into the stack. For the Default theme, the role/Text faces are empty so this is a no-op; for Tokyo Night/phosphor the heading/quote/code-block fg appears. Keep `style_to_ratatui` as a thin wrapper that calls `compose(&theme, depth, &[Text, style_element(s)])` if any caller still needs the inline-only form, OR inline the compose call.
+The row's role is available as `vr.role` at both inline paint sites (layout.rs:51; render.rs ~300 and ~338) — thread it in. For the Default theme, the role/Text faces are empty so this is a no-op; for Tokyo Night/phosphor the heading/quote/code-block fg appears. Keep `style_to_ratatui` as a thin wrapper that calls `compose(&theme, depth, &[Text, style_element(s)])` if any caller still needs the inline-only form, OR inline the compose call.
+
+**(c) Render-mode branch (Codex I4 — source modes get base canvas only, NO roles/inline):**
+the renderer already computes `source_mode = editor.active().view.mode != RenderMode::LivePreview` (derive.rs:130-145). Build the stack conditionally:
+```rust
+let stack: Vec<SemanticElement> = if source_mode {
+    vec![E::Text]                                   // base canvas only (Default→terminal default; phosphor→hue tint)
+} else {
+    vec![E::Text, role_element(role), style_element(seg.style)]  // live-preview: full semantic styling
+};
+let style = compose(&editor.theme, editor.depth, &stack);
+```
+(Overlays — search/diag/focus — are layered by Tasks 11/12 in **both** modes; selection painting is plan ②.) Add a test: a `# Heading` in `RenderMode::SourcePlain` under Tokyo Night does **not** carry the heading fg (it's literal source); the same heading in LivePreview does.
 
 - [ ] **Step 4: Run to verify they pass + golden sweep**
 
@@ -945,16 +1041,18 @@ git commit -m "feat(theme): centralize inline styles + role base color via compo
 **Interfaces:** Consumes `compose`, the chrome faces (`Chrome`/`ChromeSelected`/`ChromeMuted`). Replaces the status-line, menu, palette/outline/diag-overlay, and scrollbar hardcoded color sites.
 
 **Site → element mapping (from the spec §3.8 table + the render inventory):**
-| render.rs site | replace with element(s) |
+| render.rs site | replace with element |
 |---|---|
-| status lines (442,447,452,460 — REVERSED) | `ChromeSelected` |
-| palette/outline/diag selected row (558,602,678 — REVERSED) | `ChromeSelected` |
-| palette/outline query (548,596 — default) | `Chrome` |
-| menu open category (631 — black/white) | `ChromeSelected` |
-| menu closed category (633 — white/black) | `Chrome` |
-| menu dropdown selected (646) | `ChromeSelected` |
-| menu dropdown normal (648 — white/dark-gray) | `ChromeMuted` |
+| status lines (442,447,452,460 — REVERSED) | `ChromeReverse` |
+| palette/outline/diag selected row (558,602,678 — REVERSED) | `ChromeReverse` |
+| palette/outline query (548,596 — `RStyle::default()`) | `Text` (Codex C3 — Chrome's white-on-black would break the query row; `Text`=empty for Default → unchanged) |
+| menu open category (631 — **Black on White**) | `ChromeSelected` |
+| menu closed category (633 — White on Black) | `Chrome` |
+| menu dropdown selected (646 — Black on White) | `ChromeSelected` |
+| menu dropdown normal (648 — White on DarkGray) | `ChromeMuted` |
 | scrollbar track/thumb (397-413) | `ChromeMuted` / `Chrome` |
+
+> Codex C2: REVERSED highlights (status/list/overlay) use **`ChromeReverse`** (a `REVERSED` modifier — adapts to the themed bg); the menu's explicit Black-on-White selection uses **`ChromeSelected`** (a fixed fg/bg). They are different ratatui styles and must not collapse to one face.
 
 - [ ] **Step 1: Write the failing test** (Default reproduces today; a phosphor theme tints chrome)
 ```rust
@@ -970,8 +1068,8 @@ git commit -m "feat(theme): centralize inline styles + role base color via compo
         let mut ed = Editor::new_from_text("x", None, (40, 4));
         ed.theme = wordcartel_core::theme::Theme::builtin("phosphor-amber").unwrap();
         let buf = render_to_buffer(&mut ed, 40, 4);
-        let want = compose::compose(&ed.theme, ed.depth, &[wordcartel_core::theme::SemanticElement::ChromeSelected]);
-        // the status row picks up the themed chrome style (hue/reverse), not hardcoded reverse-only
+        let want = compose::compose(&ed.theme, ed.depth, &[wordcartel_core::theme::SemanticElement::ChromeReverse]);
+        // the status row picks up the themed chrome-reverse style, not a hardcoded REVERSED
         assert!((0..40).any(|x| buf[(x,3)].style() == want));
     }
 ```
@@ -1010,9 +1108,13 @@ git commit -m "feat(theme): centralize chrome (status/menu/overlays/scrollbar) v
 | spelling diag underline (360 — red) | `DiagSpelling` |
 | grammar diag underline (361 — blue) | `DiagGrammar` |
 | focus dim rows (293,345 — DarkGray) | `FocusDim` |
-| prefix-glyph dim (297,329-330) | `ListMarker` (its face) |
-| fold marker glyph (381) + count (384) | `FoldMarker` |
+| prefix glyph, normal (329-330 — DarkGray) | `ListMarker` |
+| prefix glyph, active row (297 — DIM) | `ListMarker` **+ `Modifier::DIM`** (Codex I5 — the active-row prefix is dimmer; add DIM on top of the themed face to reproduce today) |
+| fold marker glyph (381 — DarkGray) | `FoldMarker` |
+| fold marker count (384 — DarkGray + DIM) | `FoldMarker` **+ `Modifier::DIM`** |
 | wrap guide (181 — DarkGray) | `WrapGuide` |
+
+> Codex I5: the active-prefix and fold-count are the **base element face + `DIM`**, not a separate face. At those two sites: `compose(&theme, depth, &[ListMarker]).add_modifier(Modifier::DIM)` / `&[FoldMarker]).add_modifier(Modifier::DIM)`. This reproduces today (DarkGray+DIM) and themes correctly (hue+DIM under phosphor).
 
 > The structural glyphs (blockquote/hr/heading glyph) are NOT added here (plan ②). These sites already exist; only their *style* is re-sourced from the theme.
 
