@@ -111,6 +111,9 @@ pub struct Theme {
     pub name: String,
     pub base_fg: Color, pub base_bg: Color,  // the canvas; applies in source modes too (§3.5)
     pub heading_level_glyph: bool,           // show the level shade glyph in live-preview (§3.7/§4)
+    /// Color does not distinguish elements in this theme (No-color; phosphor-*-flat).
+    /// Drives "cue mode" (§4): heading glyph forced on, distinct-modifier discipline enforced.
+    pub monochrome: bool,
     faces: ThemeFaces,                       // total: a Face per element
 }
 impl Theme {
@@ -118,13 +121,15 @@ impl Theme {
     pub fn builtin(name: &str) -> Option<Theme>;
     pub fn builtin_names() -> &'static [&'static str]; // default,no-color,tokyo-night,phosphor-*[-flat]
 }
-pub fn default() -> Theme;     // reproduces today's color SITES (base_fg/bg = Default → source unchanged)
-pub fn no_color() -> Theme;    // all fg/bg/underline_color = Default; cues via modifiers/glyphs (§4)
-pub fn tokyo_night() -> Theme; // MIT palette from tokyonight.nvim
+pub fn default() -> Theme;     // monochrome=false; base_fg/bg = Default → source unchanged
+pub fn no_color() -> Theme;    // monochrome=TRUE; all fg/bg/underline_color = Default; cues via modifiers/glyphs (§4)
+pub fn tokyo_night() -> Theme; // monochrome=false; MIT palette from tokyonight.nvim
 
 /// Phosphor monitor family. `hue` = the phosphor color; `flat` = single-shade
-/// (modifiers/glyphs only) vs shaded (lightness varies by element). base_bg = a
-/// near-black tint of the hue; base_fg = the hue (so SOURCE views are tinted, §3.5).
+/// (sets `monochrome=true` → cue mode, modifiers/glyphs only) vs shaded (lightness
+/// varies by element, `monochrome=false`). base_bg = a near-black tint of the hue;
+/// base_fg = the hue (so SOURCE views are tinted, §3.5); chrome faces filled from
+/// the same shade ramp (§3.8).
 pub fn phosphor(name: &str, hue: Rgb, flat: bool) -> Theme;
 /// Lightness ramp of a single hue (HSL L scaling), for shaded phosphor + the no-color glyph density.
 fn shade(hue: Rgb, level: u8) -> Color;
@@ -195,8 +200,19 @@ Fix: **the row prefix becomes part of the visual geometry in `layout`.** `layout
 returns a per-row `prefix: { text: String, width: u16 }`; every visual column in
 `ColMap` is offset by `width`; soft-wrap capacity is reduced by `width`;
 `nav::source_to_visual`/`visual_to_source`, cursor placement, and
-`mouse::offset_at_cell` all add `width`. All synthetic prefixes flow through this
-one path:
+`mouse::offset_at_cell` all add `width`.
+
+**Every line-geometry consumer must be prefix-aware** — not just cursor/mouse:
+- **`nav::typewriter_rows_of_line` (5d)** currently shortcuts to 1 row when
+  `content_len <= text_width` (nav.rs:495-520). With a prefix the effective
+  capacity is `text_width - width`, so a row whose content *fits* the full width
+  can still wrap — the shortcut must compute prefix-aware effective capacity (or
+  drop the shortcut when a prefix can be present). Codex Finding 1.
+- The **5g fold visible-line mapping**, **horizontal intra-line scroll**, and the
+  **scrollbar** read rows/positions through the same ColMap/`rows_of_line` path,
+  so they inherit the corrected width — but each gets a regression test (below).
+
+All synthetic prefixes flow through this one path:
 - **list bullet `•`, blockquote `▎`, thematic-break `───`** — content-driven,
   always produced in `md_parse`/layout (theme-independent).
 - **heading-level glyph** — theme-driven; `layout` takes a `heading_prefix: bool`
@@ -215,6 +231,7 @@ Three chrome faces cover all chrome sites; the Default theme reproduces today's 
 | status bar; menu bar; overlay frames (palette/outline/diag) | `Chrome` | white on black |
 | selected/active row (menu item, palette/outline/diag selection); status REVERSED | `ChromeSelected` | black on white (reverse) |
 | muted chrome text (query prompt, inactive menu, secondary) | `ChromeMuted` | white on dark-gray |
+| scrollbar track / thumb (render.rs:397-413) | `ChromeMuted` / `Chrome` | today's default widget styling |
 
 (If the plan finds a 4th distinct combo, it adds a face; the table is the contract.)
 
@@ -232,9 +249,16 @@ Three chrome faces cover all chrome sites; the Default theme reproduces today's 
   option (it would let the incremental reparser misclassify a mid-document `--- … ---`
   region, breaking full/incremental oracle equivalence). Instead a dedicated
   **byte-0 prefix scan** recognizes a leading `---\n … \n---` block → a new
-  `BlockKind::FrontMatter`; the remainder parses with ordinary options. Edits
-  intersecting the front-matter delimiters **force a reparse from byte 0**. Oracle
-  gains mid-document `--- --- ` and delimiter insert/remove cases. Only
+  `BlockKind::FrontMatter`; the remainder parses with ordinary options. The
+  incremental reparser splices a localized region from a non-zero base
+  (block_tree.rs:747-766), which a byte-0 parser can't run inside — so **force a
+  reparse from byte 0** for *any* edit that (a) intersects the existing
+  front-matter **block span** (a body-line length change can otherwise lose the
+  block), (b) lands before/at the opening `---`, or (c) could insert/remove a `---`
+  closing delimiter. Oracle gains: mid-document `--- … ---` (stays thematic
+  break/setext, NOT front matter); delimiter insert/remove; **and front-matter-body
+  edits** (edit a YAML value, insert/delete a body line, edit the first line after
+  the closing `---`) — each asserting full == incremental. Only
   `BlockKind::FrontMatter` maps to `BlockRole::FrontMatter` (not the existing `Other`).
 - **Comments:** add `BlockKind::HtmlComment` (a block whose source begins `<!--`) →
   `BlockRole::Comment`; generic `HtmlBlock` stays separate (we do **not** color
@@ -245,43 +269,64 @@ Three chrome faces cover all chrome sites; the Default theme reproduces today's 
   arm fails to compile/test).
 
 ## 4. §13.2 — color-independent cues
-**Requirement, precisely:** when **color is absent** (effective `Depth::None`, the
-No-color theme, or a phosphor theme reduced to one shade), **every distinction
-carries a non-color cue**. When color is present, color may be the cue. So the
-No-color theme is the proof object; colored themes layer color *over* a
-cue-bearing base.
+**Cue mode (the precise predicate):** color fails to distinguish elements when
+`effective Depth == None` **OR** `theme.monochrome` (the No-color theme and every
+phosphor-`*-flat`). In **cue mode, every distinction must be carried by a
+modifier/glyph**, and no two elements that can appear in the same context may share
+an identical cue set. Outside cue mode (a shaded/colored theme on a color-capable
+terminal), color may be the distinguishing cue, layered *over* the same cue-bearing
+base. The No-color theme is the proof object (all faces `Default`).
 
-**Locked:** when effective `Depth == None`, `heading_level_glyph` is **forced on**
-regardless of theme/config (Codex Part3-1) — headings stay distinguishable.
+**Locked:** in cue mode, `heading_level_glyph` is **forced on** regardless of
+theme/config (so headings stay distinguishable); a colored theme may leave it off.
 
-| Element | No-color cue |
+Cue mode is divided into three groups so same-context pairs never collide:
+
+**Persistent text elements** (distinct from each other):
+| Element | Cue |
 |---|---|
-| Heading 1–6 | bold + the **level shade glyph `█▓▒░▏·`** (forced on at Depth::None); density = level |
-| Strong/Emphasis/StrongEmphasis | bold / italic / bold+italic |
-| Code, CodeBlock | reverse |
+| Heading 1–6 | bold + the **level shade glyph `█▓▒░▏·`** (forced on in cue mode); density = level |
+| Strong / Emphasis / StrongEmphasis | bold / italic / bold+italic |
+| Code (inline) | reverse |
+| CodeBlock | reverse (whole-block context — a run of full reversed lines, structurally distinct from an inline reversed span) |
 | Link | underline |
-| Diagnostics (spell/grammar) | **bold + underline** (distinct from a plain-underline Link) |
+| Diagnostics (spell/grammar) | bold + underline (distinct from a plain-underline Link) |
 | Strikethrough | strike |
+| **Comment** | **italic + dim** (distinct from Emphasis = italic) |
+| **FrontMatter** | **reverse + italic** (distinct from Code's plain reverse) |
+
+**Structural glyph elements** (carried by a glyph, not a text modifier — never collide with the above):
+| Element | Cue |
+|---|---|
 | BlockQuote | `▎` prefix glyph + indent |
 | ThematicBreak | `───` glyph |
 | ListMarker | bullet glyph |
-| FrontMatter | reverse (inverted metadata block) |
-| Comment | italic |
-| **Selection** | **reverse + underline** (compound, so it stays visible *over* reverse elements like Code/FrontMatter/Search — Codex C3) |
-| SearchMatch / SearchCurrent | reverse / reverse+bold |
 | FoldMarker | `▸` + `… N lines` |
-| FocusDim | inactive rows `DIM`; active region full-weight (contrast is the cue) |
+| WrapGuide | `│` guide glyph (a literal column, not a color) |
 
-**Enforced by tests, two layers:** (1) core: `no_color().face(el)` has ≥1 modifier
-for every Face-cued element; (2) **shell render proof** — a `TestBackend` buffer in
-**LivePreview** with No-color, asserting **every `SemanticElement`** (the §8.3
-coverage table) is distinguishable by modifier/glyph, including all six heading
-levels, Selection×{Code,Search}, the chrome faces, and source-mode selection.
+**Transient overlays** (resolved by user action context; layer over persistent cues):
+| Element | Cue |
+|---|---|
+| **Selection** | **reverse + underline** (compound — stays visible over reverse elements; Codex C3) |
+| SearchMatch / SearchCurrent | reverse / reverse + bold |
+| FocusDim | inactive rows `DIM`; active region full-weight |
 
-**Modifier scarcity (accepted):** ~5 modifiers for ~20 elements, so several cues
-reuse `reverse`; each element is individually distinguishable, and overlaps resolve
-by pipeline order (Selection's compound `reverse+underline` keeps it visible over
-other reverse elements). No element relies on color alone when color is off.
+**Chrome** (a separate region — never overlaps text elements): `Chrome` = frame/status
+placement; `ChromeSelected` = reverse; `ChromeMuted` = dim. **`Text`** = the baseline
+(no cue; the control everything else is measured against).
+
+**Enforced by tests, two layers:** (1) core: every Face-cued element in a `monochrome`
+theme has ≥1 modifier; (2) **shell render proof** (§8.3) — a `TestBackend` buffer in
+**LivePreview** with No-color asserting **every `SemanticElement`** is distinguishable
+by modifier/glyph (all six heading levels, the chrome faces, source-mode selection),
+**plus pairwise collision tests** for the same-context persistent pairs the spec calls
+out (Comment vs Emphasis; FrontMatter vs Code; Code vs CodeBlock; Selection vs Code).
+
+**Transient/structural overlap (accepted):** a transient overlay reusing `reverse`
+(Search over Code) resolves by user-action context, and Selection's compound
+`reverse+underline` keeps it visible over any single-`reverse` element. The bar:
+every distinction has a non-color cue in cue mode, and persistent same-context pairs
+are pairwise distinct.
 
 ## 5. Config (extends §12.5 / 5a)
 ```toml
@@ -289,7 +334,7 @@ other reverse elements). No element relies on color alone when color is off.
 name = "phosphor-amber"          # built-in; default = "default"
 # file = "~/.config/wordcartel/base16-gruvbox-dark.yaml"   # OR a base16/24 palette
 # depth = "truecolor"            # override detection (truecolor|256|16|none)
-# heading_level_glyph = true     # override the theme's flag (ignored — forced on — at depth none)
+# heading_level_glyph = true     # override the theme's flag (forced on in cue mode — §4)
 [theme.styles]                   # per-element overrides
 heading1  = { fg = "#bb9af7", bold = true }
 selection = { bg = "#283457" }
@@ -326,14 +371,15 @@ relayouts, Esc cancels; XOR + non-key fallthrough (5e/5f lesson). No arg command
 - `default()` faces match today's hardcoded sites; `default().base_*` = `Default` (source untouched). Golden anchor.
 - `quantize` known Rgb → Indexed (cube+grays) and Ansi16; passthrough; idempotent.
 - `from_base16` canonical mapping; total from a 16-slot input. Hand-rolled base16 parser: valid file, missing/extra slots, quotes/`#`, junk → error.
-- `no_color()` all-`Default`, every Face-cued element ≥1 modifier. Phosphor-flat: all elements share `base_fg`, distinguished by modifiers; phosphor-shaded: distinct shades.
+- `no_color()` all-`Default`, every Face-cued element ≥1 modifier. Phosphor-flat (`monochrome=true`): all elements share `base_fg`, distinguished by modifiers (the pairwise-collision tests, §8.3); phosphor-shaded: distinct shades.
+- **Phosphor 16-color floor:** for each phosphor built-in at `Depth::Ansi16`, `quantize(base_fg) != quantize(base_bg)`, and no primary text/chrome foreground quantizes to the background slot (don't self-collapse on a weak terminal).
 - `Style` total-map test (so `Style::Comment` can't miss an arm).
 - **Producers:** blockquote/thematic-break prefix glyphs; inline `<!--x-->`→`Comment` but `<span>`→Plain; byte-0 `---` block→`FrontMatter` but mid-doc `--- ---`→**unchanged** (oracle full==incremental); block `<!--`→`HtmlComment`, `<div>`→`HtmlBlock`.
 
 ### 8.2 Shell
 - `detect_depth` cases + precedence; `resolve_theme` (built-in/base16/bad-input/discriminated source/relative path).
 - `face_to_ratatui` per depth; `compose` cross-products (heading+code, link+diag, selection×code, selection×search, focus+search).
-- **Prefix geometry (§3.7):** cursor round-trips and mouse hit-test land correctly on rows with a list/blockquote/heading prefix, including wrapped + narrow-width rows (the regression net for the keystone).
+- **Prefix geometry (§3.7):** cursor round-trips and mouse hit-test land correctly on rows with a list/blockquote/heading prefix, including wrapped + narrow-width rows. **Prefix-aware `typewriter_rows_of_line`:** a row with `content_len == text_width` and a non-zero prefix wraps (effective capacity `text_width - width`) and typewriter caret-visibility uses the correct wrapped row count (Codex Finding 1). Fold visible-line mapping + scrollbar inherit the corrected width — assert one fold + one scrollbar case on a prefixed doc.
 - Selection painting (both modes; empty = no-op; wrapped; under search). Heading glyph (on for No-color/forced at depth none; off otherwise; never in source).
 - Phosphor source tint: a phosphor theme tints source-mode cells with `base_fg/bg`; Default leaves source = terminal default.
 - `theme` picker opens/applies/relayouts; depth `None` keeps colors off.
@@ -343,8 +389,12 @@ A checked table keyed by **every** `SemanticElement` (Text, all inline, Heading 
 BlockQuote, CodeBlock, ListMarker, ThematicBreak, FrontMatter, Comment, Selection,
 SearchMatch, SearchCurrent, DiagSpelling, DiagGrammar, FocusDim, FoldMarker,
 WrapGuide, Chrome×3) → each has either a core modifier assertion **or** a concrete
-No-color render fixture (LivePreview, and source mode where the element appears).
-The build fails if an element lacks a row.
+cue-mode render fixture (LivePreview, and source mode where the element appears).
+The build fails if an element lacks a row. Run the table in **both** cue-mode themes
+(No-color **and** a phosphor-`*-flat`) so the `monochrome` discipline is proven for
+the single-hue case, not just all-`Default`. **Pairwise collision tests** (the §4
+persistent same-context pairs): Comment≠Emphasis, FrontMatter≠Code, Code≠CodeBlock,
+Selection≠Code — each asserts the two render with different cue sets.
 
 ## 9. Performance & the "Default reproduces today" guarantee
 - Resolution/depth/relayout happen **once** at startup and on switch — never per
@@ -362,7 +412,7 @@ The build fails if an element lacks a row.
 | Global metadata option breaks incremental oracle | byte-0-only front-matter parser + reparse-from-0 on delimiter edits + oracle cases (§3.9) |
 | `<div>` colored as comment / inline tag mis-styled | `HtmlComment`/`Comment` only when source begins `<!--`; inline only `<!-- -->` (§3.9) |
 | Selection invisible over reverse elements | compound `reverse+underline` (§4) + overlap tests |
-| Heading hierarchy lost at depth none | glyph forced on when `Depth::None` (§4) |
+| Heading hierarchy / element collisions lost in cue mode (no-color / phosphor-flat) | glyph forced on in cue mode (`Depth::None` OR `theme.monochrome`); distinct compound cues + pairwise collision tests (§4/§8.3) |
 | `serde_yml` unmaintained/RUSTSEC | hand-rolled base16 parser, no YAML dep (§3.3) |
 | SourcePlain over-styled | source modes apply base canvas + overlays only, no semantic faces (§3.5) |
 | Centralizing 21 colors regresses look | Default reproduces pre-existing sites; golden tests (§9) |
@@ -370,9 +420,10 @@ The build fails if an element lacks a row.
 
 ## 11. Out of scope → future
 - Helix/`.tmTheme`/VSCode importers; YAML-syntax highlighting inside front matter;
-  full chrome re-skin (dialogs, scrollbar beyond base); per-buffer themes; theme
-  hot-reload; theme-editor UI; richer diagnostic shape (curly underline/gutter);
-  SourceHighlighted true syntax highlighting.
+  full chrome re-skin (dialog widgets, **custom scrollbar symbols** — the scrollbar's
+  *colors* ARE themed via the §3.8 chrome faces, but bespoke track/thumb glyphs are
+  out); per-buffer themes; theme hot-reload; theme-editor UI; richer diagnostic shape
+  (curly underline/gutter); SourceHighlighted true syntax highlighting.
 
 ## 12. Execution — three independently-green plans (one design)
 Codex flagged ~13–15 tasks across independent invariants as too big for one plan.
