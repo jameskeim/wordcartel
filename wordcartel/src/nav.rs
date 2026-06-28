@@ -595,18 +595,29 @@ pub fn scroll_up_one(editor: &mut Editor) {
 }
 
 /// After a viewport scroll, pull the caret back inside the visible range (WordStar
-/// keeps the caret on screen). No-op if already visible. Relies on `move_screen_top`/
-/// `move_screen_bottom` being **bidirectional** (Task 5): when the caret is ABOVE the
-/// viewport (`cl < top`), `move_screen_top` moves it DOWN to `top`; when BELOW
-/// (`cl > bottom`), `move_screen_bottom` moves it UP to `bottom`.
+/// keeps the caret on screen). No-op if already visible.
+///
+/// Soft-wrap-aware: `screen_pos` returns `None` iff the caret is off-screen
+/// (it checks `scroll_row` and per-line wrap via the ColMap). Logical-line
+/// comparison alone misses a caret on an early visual row of the
+/// partially-scrolled top line (when `scroll_row > 0`).
 pub fn clamp_caret_into_view(editor: &mut Editor) {
-    let top = editor.active().view.scroll;
+    if screen_pos(editor).is_some() { return; }
+    let scroll = editor.active().view.scroll;
     let bottom = last_fully_visible_line(editor);
     let cl = editor.active().document.buffer.byte_to_line(head(editor));
-    if cl < top {
-        move_screen_top(editor);
-    } else if cl > bottom {
-        move_screen_bottom(editor);
+    if cl > bottom {
+        // Off-screen below → pull up to the last fully-visible line.
+        move_caret_to_line(editor, bottom);
+    } else {
+        // At/above the (possibly partial) top line → first FULLY-visible line.
+        // When scroll_row > 0 the top logical line is partially scrolled; skip it.
+        let target = if editor.active().view.scroll_row > 0 {
+            fold_view(editor).next_visible(scroll).unwrap_or(scroll)
+        } else {
+            scroll
+        };
+        move_caret_to_line(editor, target);
     }
 }
 
@@ -1542,5 +1553,56 @@ mod tests {
         crate::nav::scroll_line_up(&mut e); // viewport up → l4,l5,l6; l7 now below
         let caret_line = e.active().document.buffer.byte_to_line(e.active().document.selection.primary().head);
         assert_eq!(caret_line, crate::nav::last_fully_visible_line(&e), "caret clamped up onto last fully-visible line");
+    }
+
+    #[test]
+    fn scroll_line_down_clamps_caret_when_soft_wrap_advances_scroll_row() {
+        // Regression test for soft-wrap-blind clamp (Codex pre-merge blocker).
+        //
+        // Build a buffer whose first line soft-wraps into ≥3 visual rows at width 10:
+        //   line 0: 30 'a' chars → ceil(30/10) = 3 visual rows.
+        //   lines 1-3: short single-row lines.
+        // Terminal area: (10, 6) → editing height = 5 rows (area.1 - 1 status bar).
+        //
+        // Scenario: caret starts at byte 0 (line 0, visual row 0).
+        // `scroll_line_down` advances the viewport top by ONE visual row:
+        //   → scroll=0, scroll_row=1 (still inside logical line 0).
+        //
+        // Pre-fix clamp: only compares logical line numbers.
+        //   cl=0, top=scroll=0 → cl==top → no-op.  Caret stranded at vrow 0 while
+        //   viewport starts at vrow 1.  screen_pos returns None.  BUG.
+        //
+        // Post-fix clamp: gates on screen_pos (soft-wrap-aware).
+        //   screen_pos=None → clamp fires.  cl=0 ≤ bottom, and scroll_row=1>0
+        //   → target = next_visible(0) = 1 → move caret to line 1 (fully visible).
+        //   screen_pos then returns Some.  FIXED.
+        let long_line = "a".repeat(30); // 3 visual rows at width 10
+        let text = format!("{long_line}\nline1\nline2\nline3\n");
+        let mut e = Editor::new_from_text(&text, None, (10, 6));
+        crate::derive::rebuild(&mut e);
+
+        // Sanity: confirm the wrap actually happens.
+        let rows_of_0 = super::rows_of_line(&e, 0);
+        assert!(rows_of_0 >= 3,
+            "line 0 must produce ≥3 visual rows at width 10 (got {rows_of_0}); adjust test setup");
+
+        // Place caret at byte 0 — line 0, visual row 0.
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(0);
+        e.active_mut().view.scroll = 0;
+        e.active_mut().view.scroll_row = 0;
+
+        // Advance viewport by one visual row (WordStar ^Z).
+        crate::nav::scroll_line_down(&mut e);
+
+        // After scroll: scroll=0, scroll_row=1.  Caret at vrow 0 < scroll_row 1 → off-screen
+        // (screen_pos returns None) unless the clamp moved it to a visible line.
+        assert!(
+            crate::nav::screen_pos(&e).is_some(),
+            "caret must be visible after scroll_line_down on a soft-wrapped line \
+             (scroll={}, scroll_row={}, caret_line={})",
+            e.active().view.scroll,
+            e.active().view.scroll_row,
+            e.active().document.buffer.byte_to_line(e.active().document.selection.primary().head),
+        );
     }
 }
