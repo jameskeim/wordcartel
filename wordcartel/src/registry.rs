@@ -100,6 +100,8 @@ impl Registry {
         r.register("move_paragraph_down", "Move Paragraph Down", None, |c| run(c, Command::Move { dir: Dir::ParagraphDown, extend: false }));
         r.register("move_page_up",   "Move Page Up",   None, |c| run(c, Command::Move { dir: Dir::PageUp,   extend: false }));
         r.register("move_page_down", "Move Page Down", None, |c| run(c, Command::Move { dir: Dir::PageDown, extend: false }));
+        r.register("move_screen_top",    "Move to Screen Top",    None, |c| run(c, Command::Move { dir: Dir::ScreenTop,    extend: false }));
+        r.register("move_screen_bottom", "Move to Screen Bottom", None, |c| run(c, Command::Move { dir: Dir::ScreenBottom, extend: false }));
         r.register("move_doc_start", "Move to Start",  None, |c| run(c, Command::Move { dir: Dir::DocStart, extend: false }));
         r.register("move_doc_end",   "Move to End",    None, |c| run(c, Command::Move { dir: Dir::DocEnd,   extend: false }));
 

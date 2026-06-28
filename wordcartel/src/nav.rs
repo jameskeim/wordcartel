@@ -747,6 +747,61 @@ pub fn move_page_up(editor: &mut Editor) -> usize {
     off
 }
 
+/// Last logical line whose final visual row still fits fully within the viewport,
+/// walking visible (fold-aware) lines from (view.scroll, view.scroll_row).
+pub(crate) fn last_fully_visible_line(editor: &Editor) -> usize {
+    let (top, skip) = { let v = &editor.active().view; (v.scroll, v.scroll_row) };
+    // view.area is (width, height); the editing region reserves one row for the
+    // status bar (matches nav.rs:90/403/page_step).
+    let height = (editor.active().view.area.1 as usize).saturating_sub(1);
+    if height == 0 { return top; }
+    let fv = fold_view(editor);
+    let mut line = top;
+    let mut used = 0usize;
+    let mut last_full = top;
+    let mut first = true;
+    loop {
+        let rows = rows_of_line(editor, line);
+        let contrib = if first { rows.saturating_sub(skip) } else { rows };
+        if used + contrib > height { break; }   // this line's last row is clipped
+        used += contrib;
+        last_full = line;
+        first = false;
+        match fv.next_visible(line) { Some(n) => line = n, None => break }
+        if used >= height { break; }
+    }
+    last_full
+}
+
+/// Move the caret to a target logical line, column preserved, **bidirectionally**
+/// (up or down depending on the current side). Bidirectional so it works both for
+/// `^QE`/`^QX` (caret already on-screen) AND for the scroll caret-clamp (Task 6), where
+/// the caret may be above OR below the viewport.
+fn move_caret_to_line(editor: &mut Editor, target: usize) -> usize {
+    let mut off = head(editor);
+    loop {
+        let cur = editor.active().document.buffer.byte_to_line(off);
+        if cur == target { break; }
+        let next = if cur > target { move_up(editor) } else { move_down(editor) };
+        if next == off { break; } // hit doc bound
+        editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(next);
+        off = next;
+    }
+    off
+}
+
+/// Move the caret to the first visible logical line (view.scroll), column preserved.
+pub fn move_screen_top(editor: &mut Editor) -> usize {
+    let top = editor.active().view.scroll;
+    move_caret_to_line(editor, top)
+}
+
+/// Move the caret to the last fully-visible logical line, column preserved.
+pub fn move_screen_bottom(editor: &mut Editor) -> usize {
+    let bottom = last_fully_visible_line(editor);
+    move_caret_to_line(editor, bottom)
+}
+
 /// Move to the start of the next word, crossing block boundaries (skipping gaps).
 pub fn move_word_right(editor: &mut Editor) -> usize {
     let h = head(editor);
@@ -1351,6 +1406,28 @@ mod tests {
                 "line {li}: fast-path returned {fast}, exact returned {exact}"
             );
         }
+    }
+
+    #[test]
+    fn move_screen_top_lands_on_first_visible_line() {
+        let mut e = Editor::new_from_text("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\n", None, (20, 4));
+        crate::derive::rebuild(&mut e);
+        e.active_mut().view.scroll = 2;     // first visible logical line = l2
+        e.active_mut().view.scroll_row = 0;
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(e.active().document.buffer.line_to_byte(4)); // caret on l4
+        let off = crate::nav::move_screen_top(&mut e);
+        assert_eq!(e.active().document.buffer.byte_to_line(off), 2, "caret pulled to top visible line");
+    }
+
+    #[test]
+    fn move_screen_bottom_lands_on_last_fully_visible_line() {
+        let mut e = Editor::new_from_text("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\n", None, (20, 4)); // editing height = 4-1 = 3
+        crate::derive::rebuild(&mut e);
+        e.active_mut().view.scroll = 1;     // visible logical lines l1,l2,l3 (height 3, no wrap)
+        e.active_mut().view.scroll_row = 0;
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(e.active().document.buffer.line_to_byte(1));
+        let off = crate::nav::move_screen_bottom(&mut e);
+        assert_eq!(e.active().document.buffer.byte_to_line(off), 3, "caret to last fully-visible line");
     }
 
     /// typewriter_rows_of_line must account for prefix_width when computing the

@@ -40,6 +40,8 @@ pub enum Dir {
     ParagraphDown,
     PageUp,
     PageDown,
+    ScreenTop,
+    ScreenBottom,
     DocStart,
     DocEnd,
 }
@@ -375,6 +377,8 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                 Dir::ParagraphDown => nav::move_paragraph_down(editor),
                 Dir::PageUp        => nav::move_page_up(editor),
                 Dir::PageDown      => nav::move_page_down(editor),
+                Dir::ScreenTop     => nav::move_screen_top(editor),
+                Dir::ScreenBottom  => nav::move_screen_bottom(editor),
                 Dir::DocStart      => nav::move_doc_start(editor),
                 Dir::DocEnd        => nav::move_doc_end(editor),
             };
