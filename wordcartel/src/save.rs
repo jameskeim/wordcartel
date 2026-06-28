@@ -107,6 +107,19 @@ pub fn dispatch_save(ctx: &mut Ctx) -> CommandResult {
     CommandResult::Handled
 }
 
+/// Save, then arm quit-after-save so the editor exits when the save completes.
+/// Arms ONLY if a save job was actually dispatched (path present, no modal raised) —
+/// otherwise leaves dispatch_save's status and stays open. Shared by the quit-confirm
+/// prompt (PromptAction::SaveAndQuit) and the `save_and_quit` command (Effort 9B).
+pub(crate) fn dispatch_save_and_quit(ctx: &mut crate::registry::Ctx) {
+    let v = ctx.editor.active().document.version;
+    dispatch_save(ctx);
+    if ctx.editor.active().document.path.is_some() && ctx.editor.prompt.is_none() {
+        ctx.editor.quit_after_save = Some(v);
+        ctx.editor.quit_after_save_at = Some(ctx.clock.now_ms());
+    }
+}
+
 /// Save bypassing the fingerprint conflict (the [O]verwrite modal action).
 pub fn overwrite_save(ctx: &mut Ctx) {
     if ctx.editor.active().document.path.is_none() {

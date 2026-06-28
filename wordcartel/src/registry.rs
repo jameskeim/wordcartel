@@ -142,6 +142,10 @@ impl Registry {
 
         // File menu.
         r.register("save", "Save", Some(MenuCategory::File), |c| crate::save::dispatch_save(c));
+        r.register("save_and_quit", "Save and Quit", Some(MenuCategory::File), |c| {
+            crate::save::dispatch_save_and_quit(c);
+            CommandResult::Handled
+        });
         r.register("quit", "Quit", Some(MenuCategory::File), |c| run(c, Command::Quit));
 
         // View menu.
