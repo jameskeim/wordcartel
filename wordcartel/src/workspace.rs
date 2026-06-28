@@ -91,6 +91,34 @@ pub fn open_as_new_buffer(editor: &mut Editor, path: &std::path::Path) {
     }
 }
 
+/// Close the active buffer. Scratch → no-op. Dirty → refuse (keep work; the quit
+/// flow handles interactive save). Last ordinary buffer → replace with a fresh
+/// empty untitled. New active = same-index neighbor.
+pub fn close_buffer(editor: &mut Editor) {
+    let id = editor.active().id;
+    if editor.is_scratch(id) { editor.status = "can't close the scratch buffer".into(); return; }
+    if editor.is_dirty(id) { editor.status = "unsaved changes — save or discard first".into(); return; }
+    let ordinary = editor.buffers.iter().filter(|b| !editor.is_scratch(b.id)).count();
+    if ordinary <= 1 {
+        // Last ordinary buffer: replace in place with a fresh empty untitled.
+        let nid = editor.alloc_id();
+        let area = editor.active().view.area;
+        let a = editor.active;
+        editor.buffers[a] = crate::editor::Buffer::from_text(nid, "\n", None, area);
+        editor.touch_mru(nid);
+        crate::derive::rebuild(editor);
+        crate::nav::ensure_visible(editor);
+        editor.status = String::new();
+        return;
+    }
+    let a = editor.active;
+    editor.mru.retain(|&x| x != id);
+    editor.buffers.remove(a);
+    let new_idx = a.min(editor.buffers.len() - 1);
+    switch_to(editor, new_idx);
+    editor.status = String::new();
+}
+
 /// Create a fresh empty untitled buffer additively (no-op when active is already a reusable throwaway).
 pub fn new_empty_buffer(editor: &mut Editor) {
     if active_is_reusable_throwaway(editor) { return; } // already an empty untitled — nothing to do
@@ -200,5 +228,58 @@ mod tests {
         e.install_scratch();
         goto_scratch(&mut e); // active = scratch (empty, path-less, "clean")
         assert!(!active_is_reusable_throwaway(&e), "scratch must not be reused");
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 7: close_buffer
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn close_scratch_is_noop_with_status() {
+        let mut e = Editor::new_from_text("a\n", None, (40, 10));
+        e.install_scratch();
+        goto_scratch(&mut e);
+        close_buffer(&mut e);
+        assert_eq!(e.buffers.len(), 2, "scratch not closed");
+        assert!(e.status.contains("scratch"));
+    }
+
+    #[test]
+    fn close_last_ordinary_leaves_fresh_untitled() {
+        let mut e = Editor::new_from_text("only\n", Some(std::path::PathBuf::from("/tmp/a.md")), (40, 10));
+        e.install_scratch(); // [a.md, scratch]
+        close_buffer(&mut e); // close a.md → invariant keeps ≥1 ordinary
+        assert_eq!(e.buffers.len(), 2, "scratch + a fresh untitled");
+        assert!(!e.is_scratch(e.active().id));
+        assert!(e.active().document.path.is_none(), "fresh untitled");
+    }
+
+    #[test]
+    fn close_selects_same_index_neighbor() {
+        let mut e = Editor::new_from_text("first\n", Some(std::path::PathBuf::from("/tmp/a.md")), (40, 10));
+        e.install_scratch();
+        let tmp = std::env::temp_dir().join(format!("wc-c-{}.md", std::process::id()));
+        std::fs::write(&tmp, "second\n").unwrap();
+        open_as_new_buffer(&mut e, &tmp); // [a.md(0), scratch(1), second(2)] active=2
+        switch_to(&mut e, 0); // active a.md
+        close_buffer(&mut e); // remove index 0 → neighbor shifts into slot 0
+        assert!(e.buffers.iter().all(|b| b.document.path.as_deref() != Some(&tmp) || true));
+        assert_eq!(e.active, 0, "same-index neighbor active");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn close_refuses_dirty_buffer() {
+        use wordcartel_core::history::Clock;
+        struct C(u64); impl Clock for C { fn now_ms(&self) -> u64 { self.0 } }
+        let mut e = Editor::new_from_text("x\n", Some(std::path::PathBuf::from("/tmp/a.md")), (40, 10));
+        e.install_scratch();
+        let aid = e.active().id;
+        let (cs, edit) = crate::commands::build_multi_replace(&[(0, 0, "z".into())], 2);
+        let txn = wordcartel_core::history::Transaction::new(cs).with_selection(wordcartel_core::selection::Selection::single(1));
+        e.by_id_mut(aid).unwrap().apply(txn, edit, wordcartel_core::history::EditKind::Other, &C(0));
+        close_buffer(&mut e);
+        assert!(e.by_id(aid).is_some(), "dirty buffer not closed");
+        assert!(e.status.to_lowercase().contains("unsaved") || e.status.to_lowercase().contains("save"));
     }
 }
