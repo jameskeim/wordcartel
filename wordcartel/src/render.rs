@@ -164,6 +164,37 @@ pub(crate) fn palette_row_at(area: Rect, palette: &crate::palette::Palette, col:
     }
 }
 
+/// Assemble the left-hand portion of the normal status line (no overlay active).
+///
+/// Format: `[i/n] <name> [<mode>]` (plus optional status message and BLK indicator).
+/// `i` is 1-based active buffer index; `n` is total buffer count.
+/// `<name>` comes from `workspace::buffer_display_name` which already handles
+/// `*scratch*` / `*untitled*` / filename and the dirty-`*` prefix — so there is
+/// no separate dirty marker here.
+pub(crate) fn status_left_text(editor: &Editor) -> String {
+    let idx = editor.active + 1;
+    let count = editor.buffers.len();
+    let name = crate::workspace::buffer_display_name(editor, editor.active().id);
+    let head = format!("[{idx}/{count}] {name}");
+    let mode_text = match editor.active().view.mode {
+        crate::editor::RenderMode::LivePreview => "PREVIEW",
+        crate::editor::RenderMode::SourceHighlighted => "SRC-HI",
+        crate::editor::RenderMode::SourcePlain => "SOURCE",
+    };
+    let mut text = if editor.status.is_empty() {
+        format!("{head} [{mode_text}]")
+    } else {
+        format!("{head} [{mode_text}] {}", editor.status)
+    };
+    // BLK indicator: `· BLK` when a block is marked; `· BLK·hidden` when hidden.
+    match editor.active().marked_block {
+        Some(b) if b.hidden => text.push_str(" · BLK·hidden"),
+        Some(_) => text.push_str(" · BLK"),
+        None => {}
+    }
+    text
+}
+
 /// Return a word/char count segment for the status bar, or `None` if the
 /// feature is disabled (`view_opts.word_count = false`).
 ///
@@ -586,21 +617,6 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     // Status line (bottom row)
     // -----------------------------------------------------------------------
     {
-        let path_str = editor
-            .active()
-            .document
-            .path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "[no name]".to_string());
-
-        let dirty_marker = if editor.active().document.dirty() { "*" } else { "" };
-        let mode_text = match editor.active().view.mode {
-            crate::editor::RenderMode::LivePreview => "PREVIEW",
-            crate::editor::RenderMode::SourceHighlighted => "SRC-HI",
-            crate::editor::RenderMode::SourcePlain => "SOURCE",
-        };
-
         // When the search overlay is active, render the search bar.
         // When a modal prompt is active, render its message instead of the normal
         // status text, using a distinct style so it stands out.
@@ -622,19 +638,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 chrome_reverse_style,
             )
         } else {
-            let mut text = if editor.status.is_empty() {
-                format!("{}{} [{}]", path_str, dirty_marker, mode_text)
-            } else {
-                format!("{}{} [{}] {}", path_str, dirty_marker, mode_text, editor.status)
-            };
-            // Effort 9A: BLK indicator on the LEFT status text (not the word-count-gated
-            // right segment). `· BLK` when a block is marked; `· BLK·hidden` when hidden.
-            match editor.active().marked_block {
-                Some(b) if b.hidden => text.push_str(" · BLK·hidden"),
-                Some(_) => text.push_str(" · BLK"),
-                None => {}
-            }
-            (text, chrome_reverse_style)
+            (status_left_text(editor), chrome_reverse_style)
         };
 
         // Compose the status line.
@@ -2211,5 +2215,28 @@ mod tests {
             "FIX-3: phosphor overlay border must carry Chrome RGB bg; got {:?} at ({bx},{by})",
             cs.bg
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Effort 6 Task 9: status-line buffer [i/n] indicator + display names
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn status_line_shows_buffer_index_and_count() {
+        let mut e = crate::editor::Editor::new_from_text("a\n", Some(std::path::PathBuf::from("/tmp/a.md")), (40, 10));
+        e.install_scratch(); // 2 buffers, active index 0
+        let s = crate::render::status_left_text(&e);
+        assert!(s.contains("[1/2]"), "shows active/count: {s}");
+    }
+
+    #[test]
+    fn status_line_names_untitled_and_scratch() {
+        let mut e = crate::editor::Editor::new_from_text("\n", None, (40, 10));
+        e.install_scratch();
+        let s_untitled = crate::render::status_left_text(&e);
+        assert!(s_untitled.contains("*untitled*"), "untitled buffer shows *untitled*: {s_untitled}");
+        crate::workspace::goto_scratch(&mut e);
+        let s_scratch = crate::render::status_left_text(&e);
+        assert!(s_scratch.contains("*scratch*"), "scratch buffer shows *scratch*: {s_scratch}");
     }
 }

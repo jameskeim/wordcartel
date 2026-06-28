@@ -307,6 +307,14 @@ static CUA: &[(&str, &str)] = &[
     ("alt-shift-x",  "unfold_all"),
     // Block operations (Effort 9A)
     ("alt-b",        "mark_block_from_selection"),
+    // Effort 6: send-to-scratch verbs (CUA bindings)
+    ("alt-shift-c",  "copy_block_to_scratch"),
+    ("alt-shift-v",  "move_block_to_scratch"),
+    // Effort 6: buffer cycling (CUA bindings)
+    ("alt-,", "prev_buffer"),
+    ("alt-.", "next_buffer"),
+    // Effort 6: buffer switcher (ctrl-shift-e is free; ctrl-e is "filter")
+    ("ctrl-shift-e", "switch_buffer"),
 ];
 
 /// WordStar preset — full faithful classic keymap mapped to v1 command ids.
@@ -364,6 +372,14 @@ static WORDSTAR: &[(&str, &str)] = &[
     ("ctrl-k ctrl-y", "block_delete"),         ("ctrl-k y", "block_delete"),
     ("ctrl-k ctrl-w", "block_write"),          ("ctrl-k w", "block_write"),
     ("ctrl-k ctrl-h", "block_toggle_hidden"),  ("ctrl-k h", "block_toggle_hidden"),
+    // Effort 6: send-to-scratch verbs (WordStar ^K bindings)
+    ("ctrl-k ctrl-g", "copy_block_to_scratch"), ("ctrl-k g", "copy_block_to_scratch"),
+    ("ctrl-k ctrl-a", "move_block_to_scratch"), ("ctrl-k a", "move_block_to_scratch"),
+    // Effort 6: buffer cycling (WordStar ^K bindings — plain-only, precedent ^KM/^KJ)
+    ("ctrl-k ,", "prev_buffer"),
+    ("ctrl-k .", "next_buffer"),
+    // Effort 6: buffer switcher (^KL / ^K^L — free; ^QL is find_next, not ^KL)
+    ("ctrl-k ctrl-l", "switch_buffer"), ("ctrl-k l", "switch_buffer"),
     ("ctrl-q ctrl-b", "block_jump_begin"),     ("ctrl-q b", "block_jump_begin"),
     ("ctrl-q ctrl-k", "block_jump_end"),       ("ctrl-q k", "block_jump_end"),
     ("ctrl-k m", "set_mark"),       // plain-only (^M reserved)
@@ -704,9 +720,70 @@ mod tests {
     }
 
     #[test]
+    fn switch_buffer_binds_resolve_and_do_not_collide() {
+        // CUA: ctrl-shift-e (free — ctrl-e is already "filter", ctrl-shift-e is distinct)
+        let (km, warns) = build_keymap(&crate::config::KeymapConfig::default(), &crate::registry::Registry::builtins());
+        assert!(warns.is_empty(), "no CUA warnings expected: {warns:?}");
+        let seq = |s: &str| parse_seq(s).unwrap();
+        assert!(matches!(km.resolve(&seq("ctrl-shift-e")), Resolution::Command(CommandId("switch_buffer"))),
+            "CUA ctrl-shift-e must resolve to switch_buffer");
+        // WordStar: ctrl-k l (plain) and ctrl-k ctrl-l (ctrl-held), both free
+        let ws_cfg = crate::config::KeymapConfig { preset: "wordstar".into(), patches: vec![] };
+        let (km_ws, warns_ws) = build_keymap(&ws_cfg, &crate::registry::Registry::builtins());
+        assert!(warns_ws.is_empty(), "WordStar: no warnings expected: {warns_ws:?}");
+        assert!(matches!(km_ws.resolve(&seq("ctrl-k l")), Resolution::Command(CommandId("switch_buffer"))),
+            "WordStar ctrl-k l must resolve to switch_buffer");
+        assert!(matches!(km_ws.resolve(&seq("ctrl-k ctrl-l")), Resolution::Command(CommandId("switch_buffer"))),
+            "WordStar ctrl-k ctrl-l must resolve to switch_buffer");
+        // Confirm ctrl-q l is still find_next (not shadowed)
+        assert!(matches!(km_ws.resolve(&seq("ctrl-q l")), Resolution::Command(CommandId("find_next"))),
+            "ctrl-q l (find_next) must not be shadowed by ctrl-k l");
+    }
+
+    #[test]
     fn cua_alt_b_promotes() {
         let (t, _) = build_keymap(&crate::config::KeymapConfig::default(), &Registry::builtins());
         assert!(matches!(t.resolve(&parse_seq("alt-b").unwrap()), Resolution::Command(CommandId("mark_block_from_selection"))));
+    }
+
+    #[test]
+    fn scratch_verbs_resolve_in_both_presets() {
+        // CUA preset: single-chord bindings
+        {
+            let cfg = crate::config::KeymapConfig { preset: "cua".into(), patches: vec![] };
+            let (t, w) = build_keymap(&cfg, &Registry::builtins());
+            assert!(w.is_empty(), "cua: no warnings expected: {w:?}");
+            let seq = |s: &str| parse_seq(s).unwrap();
+            assert!(matches!(t.resolve(&seq("alt-shift-c")), Resolution::Command(CommandId("copy_block_to_scratch"))),
+                "CUA: alt-shift-c → copy_block_to_scratch");
+            assert!(matches!(t.resolve(&seq("alt-shift-v")), Resolution::Command(CommandId("move_block_to_scratch"))),
+                "CUA: alt-shift-v → move_block_to_scratch");
+        }
+        // WordStar preset: plain second-key forms of ^K prefix bindings
+        {
+            let cfg = crate::config::KeymapConfig { preset: "wordstar".into(), patches: vec![] };
+            let (t, w) = build_keymap(&cfg, &Registry::builtins());
+            assert!(w.is_empty(), "wordstar: no warnings expected: {w:?}");
+            let seq = |s: &str| parse_seq(s).unwrap();
+            assert!(matches!(t.resolve(&seq("ctrl-k g")), Resolution::Command(CommandId("copy_block_to_scratch"))),
+                "WordStar: ctrl-k g → copy_block_to_scratch");
+            assert!(matches!(t.resolve(&seq("ctrl-k a")), Resolution::Command(CommandId("move_block_to_scratch"))),
+                "WordStar: ctrl-k a → move_block_to_scratch");
+        }
+    }
+
+    #[test]
+    fn buffer_cycle_chords_parse_and_resolve() {
+        // Codex I2: the real sequence parser is `parse_seq` (keymap.rs:109), NOT
+        // `parse_chord_seq`. `parse_chord` (keymap.rs:59) parses a single chord.
+        for s in ["ctrl-k ,", "ctrl-k .", "alt-,", "alt-."] {
+            assert!(crate::keymap::parse_seq(s).is_some(), "parse {s}");
+        }
+        // Both presets build with no warnings (no collision / prefix-shadow).
+        let (_t, w) = km(&[], &[], Some("wordstar"));
+        assert!(w.is_empty(), "no wordstar warnings: {w:?}");
+        let (_t, w) = km(&[], &[], Some("cua"));
+        assert!(w.is_empty(), "no cua warnings: {w:?}");
     }
 
     #[test]

@@ -7,12 +7,6 @@ pub enum PromptAction {
     Cancel,
     QuitAnyway,
     SaveAndQuit,
-    /// Dirty-guard: save first, then perform the pending PostSaveAction.
-    /// Distinct from SaveAndQuit (which is quit-confirm only).
-    SaveAndProceed,
-    /// Dirty-guard: discard unsaved changes, then perform the pending PostSaveAction.
-    /// Distinct from QuitAnyway (which is quit-confirm only).
-    DiscardAndProceed,
     Reload,
     Overwrite,
     OverwriteExport,
@@ -22,6 +16,14 @@ pub enum PromptAction {
     DiscardSwap,
     OpenOriginal,
     Transform(crate::transform::TransformKind),
+    /// Effort 6 multi-buffer quit: save every dirty buffer then quit.
+    QuitSaveAll,
+    /// Effort 6 multi-buffer quit: visit each dirty buffer with a per-buffer prompt.
+    QuitReviewEach,
+    /// Effort 6 review-each: save the buffer under review, then continue the drain.
+    ReviewSave,
+    /// Effort 6 review-each: discard the buffer under review, then continue the drain.
+    ReviewDiscard,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +56,30 @@ impl Prompt {
                 Choice { key: 's', label: "Save & quit", action: PromptAction::SaveAndQuit },
                 Choice { key: 'q', label: "Quit anyway", action: PromptAction::QuitAnyway },
                 Choice { key: 'c', label: "Cancel",      action: PromptAction::Cancel },
+            ],
+        }
+    }
+
+    /// Effort 6 top-level multi-buffer quit prompt: N buffers have unsaved work.
+    pub fn quit_multi(n: usize) -> Prompt {
+        Prompt {
+            message: format!("{n} buffer(s) unsaved: [A]ll save · [R]eview each · [C]ancel"),
+            choices: vec![
+                Choice { key: 'a', label: "Save all",    action: PromptAction::QuitSaveAll },
+                Choice { key: 'r', label: "Review each",  action: PromptAction::QuitReviewEach },
+                Choice { key: 'c', label: "Cancel",       action: PromptAction::Cancel },
+            ],
+        }
+    }
+
+    /// Effort 6 per-buffer review prompt raised while draining in Review-each mode.
+    pub fn quit_review_buffer(name: &str) -> Prompt {
+        Prompt {
+            message: format!("{name}: [S]ave · [D]iscard · [C]ancel"),
+            choices: vec![
+                Choice { key: 's', label: "Save",    action: PromptAction::ReviewSave },
+                Choice { key: 'd', label: "Discard", action: PromptAction::ReviewDiscard },
+                Choice { key: 'c', label: "Cancel",  action: PromptAction::Cancel },
             ],
         }
     }
@@ -108,19 +134,6 @@ impl Prompt {
             choices: vec![
                 Choice { key: 'o', label: "Overwrite", action: PromptAction::OverwriteWriteBlock },
                 Choice { key: 'c', label: "Cancel",    action: PromptAction::Cancel },
-            ],
-        }
-    }
-
-    /// Dirty-guard modal: raised by New (and Open in Task 5) when the buffer has unsaved changes.
-    /// Choices: [S]ave (save first, then proceed) · [D]iscard (drop changes, proceed) · [C]ancel.
-    pub fn dirty_guard() -> Prompt {
-        Prompt {
-            message: "Unsaved changes: [S]ave · [D]iscard · [C]ancel".into(),
-            choices: vec![
-                Choice { key: 's', label: "Save",    action: PromptAction::SaveAndProceed },
-                Choice { key: 'd', label: "Discard", action: PromptAction::DiscardAndProceed },
-                Choice { key: 'c', label: "Cancel",  action: PromptAction::Cancel },
             ],
         }
     }

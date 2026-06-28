@@ -11,8 +11,24 @@ use wordcartel_core::selection::Selection;
 pub struct BufferId(pub u64);
 
 /// What to do once a pending save completes successfully.
+/// `Quit` is the single-buffer save-then-quit; `ContinueQuitDrain` advances the
+/// multi-buffer quit state machine (Effort 6) after each buffer's save lands.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PostSaveAction { Quit, Open(std::path::PathBuf), New }
+pub enum PostSaveAction { Quit, ContinueQuitDrain }
+
+/// Effort 6 multi-buffer quit: how the drain disposes of each dirty buffer.
+/// `Copy` so `let mode = drain.mode;` copies out without holding a borrow on
+/// `quit_drain` across `is_dirty`/`switch_to`/`dispatch_save_then` (Codex I-new-1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum QuitMode { SaveAll, ReviewEach }
+
+/// Effort 6 multi-buffer quit drain: the FIFO of dirty buffers still to dispose
+/// of, plus the chosen disposition. Driven one buffer per step by `drive_quit_drain`.
+#[derive(Clone, Debug)]
+pub struct QuitDrain {
+    pub queue: std::collections::VecDeque<BufferId>,
+    pub mode: QuitMode,
+}
 
 /// An in-flight "save, then act" request. Armed by `dispatch_save_then`;
 /// consumed by `apply_result` when the save lands clean.
@@ -328,6 +344,18 @@ pub struct Editor {
     /// Whether session-resume restore is enabled (seeded from `cfg.state.resume` in run()).
     /// Gates `open_into_current`'s resume restore. Defaults false until run() seeds it.
     pub resume_enabled: bool,
+    /// Effort 6: the permanent path-less *scratch* buffer's id. `None` in unit
+    /// contexts that never call `install_scratch`. Scratch is identified by id,
+    /// not by a name field.
+    pub scratch_id: Option<BufferId>,
+    /// Most-recently-used buffer ids, most-recent first. Drives the switcher palette.
+    pub mru: Vec<BufferId>,
+    /// Effort 6: the in-progress multi-buffer quit drain, if any. `Some` while the
+    /// Save-All / Review-each state machine is disposing of dirty buffers.
+    pub quit_drain: Option<QuitDrain>,
+    /// Effort 6: set by `apply_result`'s ContinueQuitDrain arm to ask the JobDone
+    /// funnel (`apply_job_result`) to re-drive the drain once the save merge lands.
+    pub quit_drain_advance: bool,
 }
 
 impl Editor {
@@ -365,6 +393,10 @@ impl Editor {
             depth: wordcartel_core::theme::Depth::Truecolor,
             heading_glyph_cfg: None,
             resume_enabled: false,
+            scratch_id: None,
+            mru: Vec::new(),
+            quit_drain: None,
+            quit_drain_advance: false,
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer::from_text(id, text, path, area));
@@ -384,13 +416,39 @@ impl Editor {
     /// Allocate a fresh, never-reused BufferId.
     pub fn alloc_id(&mut self) -> BufferId { let id = BufferId(self.next_buffer_id); self.next_buffer_id += 1; id }
 
-    /// Replace the active buffer with a fresh unnamed scratch buffer.
-    /// Caller must run `derive::rebuild` + `nav::ensure_visible` afterwards.
-    pub fn replace_active_with_scratch(&mut self) {
+    /// Effort 6: create the permanent *scratch* buffer and record its id.
+    /// Appended AFTER the launch buffer so the launch buffer stays at index 0
+    /// (active). Idempotent guard: a second call is a no-op.
+    pub fn install_scratch(&mut self) {
+        if self.scratch_id.is_some() { return; }
         let id = self.alloc_id();
         let area = self.active().view.area;
-        let a = self.active;
-        self.buffers[a] = Buffer::from_text(id, "\n", None, area);
+        self.buffers.push(Buffer::from_text(id, "", None, area)); // empty (len 0)
+        self.scratch_id = Some(id);
+        // Seed MRU: active buffer first, scratch last.
+        let active_id = self.buffers[self.active].id;
+        self.mru = vec![active_id, id];
+    }
+    /// True iff `id` is the scratch buffer.
+    #[inline] pub fn is_scratch(&self, id: BufferId) -> bool { self.scratch_id == Some(id) }
+    /// Scratch-aware unsaved-work predicate. Scratch is NEVER dirty (it has no
+    /// file and is auto-persisted to session state). All workspace logic uses this.
+    pub fn is_dirty(&self, id: BufferId) -> bool {
+        if self.is_scratch(id) { return false; }
+        self.by_id(id).map_or(false, |b| b.document.dirty())
+    }
+
+    /// Move `id` to the front of the MRU list.
+    pub fn touch_mru(&mut self, id: BufferId) {
+        self.mru.retain(|&x| x != id);
+        self.mru.insert(0, id);
+    }
+    /// Set the active buffer by index and record it MRU-front. Out-of-range → no-op.
+    pub fn switch_to_index(&mut self, idx: usize) {
+        if idx >= self.buffers.len() { return; }
+        self.active = idx;
+        let id = self.buffers[idx].id;
+        self.touch_mru(id);
     }
 
     /// Open the minibuffer with the given prompt string.
@@ -509,6 +567,44 @@ impl Editor {
             original: self.theme.clone(),
         });
         if let Some(tp) = self.theme_picker.as_mut() { crate::theme_picker::rebuild_rows(tp); }
+    }
+
+    /// Open the buffer-switcher palette, enforcing the single-overlay XOR invariant.
+    ///
+    /// Sets `palette.kind = Buffers` and seeds rows from the MRU-ordered buffer
+    /// list (via `workspace::buffer_switch_rows`). `rebuild_rows` is called
+    /// immediately so rows are available before the first render.
+    pub fn open_buffer_switcher(&mut self) {
+        self.prompt = None;
+        self.minibuffer = None;
+        self.menu = None;
+        self.pending_keys.clear();
+        self.pending_mark = None;
+        self.search = None;
+        self.diag = None;
+        self.outline = None;
+        self.theme_picker = None;
+        self.file_browser = None;
+        let source_rows: Vec<crate::palette::PaletteRow> =
+            crate::workspace::buffer_switch_rows(self)
+                .into_iter()
+                .map(|(id, label)| crate::palette::PaletteRow {
+                    id: crate::registry::CommandId("palette"),
+                    label,
+                    chord: String::new(),
+                    buffer: Some(id),
+                })
+                .collect();
+        let mut p = crate::palette::Palette {
+            kind: crate::palette::PaletteKind::Buffers,
+            source_rows,
+            ..Default::default()
+        };
+        // rebuild_rows for Buffers kind ignores the registry and keymap;
+        // pass a dummy registry so the signature is satisfied.
+        let reg = crate::registry::Registry::builtins();
+        crate::palette::rebuild_rows(&mut p, &reg, &crate::keymap::KeyTrie::default());
+        self.palette = Some(p);
     }
 
     /// Open the file browser at `dir`, enforcing the single-overlay XOR invariant.
@@ -877,5 +973,81 @@ mod tests {
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 2, hidden: false });
         e.undo(); // Editor::undo exists (editor.rs:512)
         assert!(e.active().marked_block.is_none(), "undo clears the block (it bypasses apply mapping)");
+    }
+
+    #[test]
+    fn open_buffer_switcher_yields_buffers_kind_palette() {
+        let mut e = Editor::new_from_text("doc\n", None, (40, 10));
+        e.install_scratch();
+        e.buffers[0].document.path = Some(std::path::PathBuf::from("/tmp/doc.md"));
+        e.open_buffer_switcher();
+        let p = e.palette.as_ref().expect("palette opened by open_buffer_switcher");
+        assert!(matches!(p.kind, crate::palette::PaletteKind::Buffers),
+            "kind must be Buffers, not Commands");
+        assert!(!p.rows.is_empty(), "rows populated immediately (no hydrate needed)");
+        assert!(p.rows.iter().all(|r| r.buffer.is_some()),
+            "all buffer-switcher rows carry a BufferId");
+        // rows[0] should be doc (install_scratch seeds MRU as [doc, scratch])
+        assert!(p.rows.iter().any(|r| r.label.contains("doc.md")));
+        assert!(p.rows.iter().any(|r| r.label == "*scratch*"));
+    }
+
+    #[test]
+    fn install_scratch_adds_permanent_pathless_buffer() {
+        let mut e = Editor::new_from_text("doc\n", None, (40, 10));
+        assert_eq!(e.buffers.len(), 1);
+        assert_eq!(e.scratch_id, None, "no scratch until installed");
+        e.install_scratch();
+        assert_eq!(e.buffers.len(), 2, "scratch appended");
+        let sid = e.scratch_id.expect("scratch_id set");
+        assert!(e.is_scratch(sid));
+        let sb = e.by_id(sid).unwrap();
+        assert!(sb.document.path.is_none(), "scratch has no path");
+        assert_eq!(e.active, 0, "launch buffer stays active");
+    }
+
+    #[test]
+    fn is_dirty_excludes_scratch_even_when_edited() {
+        use wordcartel_core::history::Clock;
+        struct C(u64); impl Clock for C { fn now_ms(&self) -> u64 { self.0 } }
+        let mut e = Editor::new_from_text("doc\n", None, (40, 10));
+        e.install_scratch();
+        let sid = e.scratch_id.unwrap();
+        // Edit the scratch buffer directly via build_multi_replace + Buffer::apply.
+        let (cs, edit) = crate::commands::build_multi_replace(&[(0, 0, "hi".into())], 0);
+        let txn = wordcartel_core::history::Transaction::new(cs)
+            .with_selection(wordcartel_core::selection::Selection::single(2));
+        e.by_id_mut(sid).unwrap().apply(txn, edit, wordcartel_core::history::EditKind::Other, &C(0));
+        assert!(e.by_id(sid).unwrap().document.dirty(), "raw predicate says dirty");
+        assert!(!e.is_dirty(sid), "is_dirty excludes scratch");
+        // An edited ordinary buffer IS dirty via is_dirty.
+        let aid = e.buffers[0].id;
+        let (cs2, edit2) = crate::commands::build_multi_replace(&[(0, 0, "x".into())], 4);
+        let txn2 = wordcartel_core::history::Transaction::new(cs2)
+            .with_selection(wordcartel_core::selection::Selection::single(1));
+        e.by_id_mut(aid).unwrap().apply(txn2, edit2, wordcartel_core::history::EditKind::Other, &C(0));
+        assert!(e.is_dirty(aid), "ordinary edited buffer is dirty via is_dirty");
+    }
+
+    #[test]
+    fn switch_to_index_sets_active_and_touches_mru() {
+        let mut e = Editor::new_from_text("a\n", None, (40, 10));
+        e.install_scratch(); // [doc(0), scratch(1)], mru = [doc, scratch]
+        let scratch = e.scratch_id.unwrap();
+        e.switch_to_index(1);
+        assert_eq!(e.active, 1);
+        assert_eq!(e.mru.first().copied(), Some(scratch), "switched buffer is MRU-front");
+    }
+
+    #[test]
+    fn scratch_buffer_derive_rebuild_smoke() {
+        // An empty (len 0) scratch buffer must survive derive::rebuild without panic.
+        let mut e = Editor::new_from_text("doc\n", None, (40, 10));
+        e.install_scratch();
+        let sid = e.scratch_id.unwrap();
+        let idx = e.buffers.iter().position(|b| b.id == sid).unwrap();
+        e.active = idx;
+        crate::derive::rebuild(&mut e);
+        assert_eq!(e.by_id(sid).unwrap().document.buffer.len(), 0);
     }
 }

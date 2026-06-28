@@ -267,6 +267,17 @@ impl Registry {
         // Marked block write-to-file (Task 4 / Effort 9A).
         r.register("block_write", "Write Block to File\u{2026}", Some(MenuCategory::File), |c| { crate::blocks_marked::block_write(c.editor); CommandResult::Handled });
 
+        // Effort 6: send-to-scratch verbs.
+        r.register("copy_block_to_scratch", "Copy Block to Scratch", Some(MenuCategory::Edit), |c| { crate::scratch::copy_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
+        r.register("move_block_to_scratch", "Move Block to Scratch", Some(MenuCategory::Edit), |c| { crate::scratch::move_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
+
+        // Effort 6: workspace navigation.
+        r.register("next_buffer", "Next Buffer", Some(MenuCategory::View), |c| { crate::workspace::next_buffer(c.editor); CommandResult::Handled });
+        r.register("prev_buffer", "Previous Buffer", Some(MenuCategory::View), |c| { crate::workspace::prev_buffer(c.editor); CommandResult::Handled });
+        r.register("goto_scratch", "Go to Scratch Buffer", Some(MenuCategory::View), |c| { crate::workspace::goto_scratch(c.editor); CommandResult::Handled });
+        r.register("switch_buffer", "Switch Buffer\u{2026}", Some(MenuCategory::View), |c| { c.editor.open_buffer_switcher(); CommandResult::Handled });
+        r.register("close_buffer", "Close Buffer", Some(MenuCategory::File), |c| { crate::workspace::close_buffer(c.editor); CommandResult::Handled });
+
         // Format menu — discrete transform commands (Task 1 / Effort 5b).
         r.register("reflow", "Reflow", Some(MenuCategory::Format), |c| {
             crate::transform::dispatch_transform(c.editor, crate::transform::TransformKind::Reflow, c.clock, &c.msg_tx);
@@ -613,6 +624,15 @@ mod tests {
             crate::input::key_to_command_id(ctrl_e),
             Some(crate::input::KeyAction::Id(CommandId("filter")))
         ));
+    }
+
+    #[test]
+    fn switch_buffer_is_registered_in_view_menu() {
+        let reg = Registry::builtins();
+        let m = reg.meta(CommandId("switch_buffer"))
+            .expect("switch_buffer must be registered");
+        assert_eq!(m.label, "Switch Buffer\u{2026}");
+        assert_eq!(m.menu, Some(MenuCategory::View));
     }
 
     #[test]
