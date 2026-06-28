@@ -55,14 +55,14 @@
 
 ```rust
     // Editor has NO insert/delete helpers (Codex) — drive edits through apply, building the
-    // changeset with the existing build_multi_replace. Use the same clock the editor.rs
-    // apply-based tests use (mirror undo_redo_round_trip's clock).
+    // changeset with the existing build_multi_replace. The editor.rs test module's TestClock
+    // is `Cell<u64>`-based (editor.rs:522): `TestClock(std::cell::Cell::new(0))` — Codex.
     fn ap(e: &mut Editor, edits: &[(usize, usize, &str)]) {
         let doc_len = e.active().document.buffer.len();
         let owned: Vec<(usize, usize, String)> = edits.iter().map(|(a,b,s)| (*a,*b,s.to_string())).collect();
         let (cs, edit) = crate::commands::build_multi_replace(&owned, doc_len);
         let txn = wordcartel_core::history::Transaction::new(cs);
-        e.apply(txn, edit, wordcartel_core::history::EditKind::Other, &TestClock(0));
+        e.apply(txn, edit, wordcartel_core::history::EditKind::Other, &TestClock(std::cell::Cell::new(0)));
     }
 
     #[test]
@@ -252,6 +252,11 @@ Register in `registry.rs` (Edit menu): `block_begin`, `block_end`, `mark_block_f
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
+    // blocks_marked.rs is a NEW module — define a local clock (Codex); the block ops that edit
+    // take `&dyn wordcartel_core::history::Clock`.
+    struct TestClock(u64);
+    impl wordcartel_core::history::Clock for TestClock { fn now_ms(&self) -> u64 { self.0 } }
+
     #[test]
     fn block_copy_inserts_at_caret_and_keeps_block() {
         let mut e = Editor::new_from_text("hello world\n", None, (40, 10));
@@ -606,6 +611,13 @@ And in `render.rs`:
         assert!(matches!(cmd("ctrl-k h"), Resolution::Command(CommandId("block_toggle_hidden"))));
         assert!(matches!(cmd("ctrl-q b"), Resolution::Command(CommandId("block_jump_begin"))));
         assert!(matches!(cmd("ctrl-q k"), Resolution::Command(CommandId("block_jump_end"))));
+        // remaining ctrl-held forms (lock the both-forms contract — Codex completeness)
+        assert!(matches!(cmd("ctrl-k ctrl-k"), Resolution::Command(CommandId("block_end"))));
+        assert!(matches!(cmd("ctrl-k ctrl-y"), Resolution::Command(CommandId("block_delete"))));
+        assert!(matches!(cmd("ctrl-k ctrl-w"), Resolution::Command(CommandId("block_write"))));
+        assert!(matches!(cmd("ctrl-k ctrl-h"), Resolution::Command(CommandId("block_toggle_hidden"))));
+        assert!(matches!(cmd("ctrl-q ctrl-b"), Resolution::Command(CommandId("block_jump_begin"))));
+        assert!(matches!(cmd("ctrl-q ctrl-k"), Resolution::Command(CommandId("block_jump_end"))));
     }
 
     #[test]
