@@ -70,6 +70,11 @@ pub struct View {
     pub line_layouts: BTreeMap<usize, (Vec<VisualRow>, ColMap)>,
 }
 
+/// 9a: a persistent marked block — a half-open `[start, end)` byte range that
+/// follows the text across edits (see `Buffer::apply`). `hidden` drives folding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarkedBlock { pub start: usize, pub end: usize, pub hidden: bool }
+
 #[derive(Debug, Clone)]
 pub struct Buffer {
     pub id: BufferId,
@@ -93,6 +98,9 @@ pub struct Buffer {
     pub diagnostics: crate::diagnostics_run::DiagStore,
     // 5g: per-buffer fold state
     pub folds: crate::fold::FoldState,
+    // 9a: persistent marked block (half-open [start,end)) + a deferred begin anchor.
+    pub marked_block: Option<MarkedBlock>,
+    pub pending_block_begin: Option<usize>,
 }
 
 impl Buffer {
@@ -136,6 +144,8 @@ impl Buffer {
             sel_history: Vec::new(),
             diagnostics: crate::diagnostics_run::DiagStore::new(),
             folds: crate::fold::FoldState::default(),
+            marked_block: None,
+            pending_block_begin: None,
         }
     }
 
@@ -174,6 +184,17 @@ impl Buffer {
             .map(|&b| wordcartel_core::change::map_pos_before(b, &cs))
             .collect();
         self.folds.folded = remapped;
+        // 9A: the marked block follows the text. start uses map_pos, end + pending use
+        // map_pos_before → boundary inserts stay outside the half-open [start,end).
+        self.pending_block_begin = self.pending_block_begin
+            .map(|p| wordcartel_core::change::map_pos_before(p, &cs));
+        if let Some(b) = self.marked_block.as_mut() {
+            b.start = wordcartel_core::change::map_pos(b.start, &cs);
+            b.end   = wordcartel_core::change::map_pos_before(b.end, &cs);
+        }
+        if self.marked_block.map_or(false, |b| b.start >= b.end) {
+            self.marked_block = None; // collapsed → clear
+        }
         self.sel_history.clear();
         crate::recovery::record_snapshot(self.document.path.as_deref(), self.document.buffer.snapshot());
     }
@@ -188,6 +209,9 @@ impl Buffer {
                 // 5g: drop fold anchors now past EOF; rebuild reconciles the rest.
                 let len = self.document.buffer.len();
                 self.folds.folded.retain(|&b| b <= len);
+                // 9A: undo/redo bypass apply's mapping → clear the block (acting on stale offsets unsafe).
+                self.marked_block = None;
+                self.pending_block_begin = None;
                 true
             }
             None => false,
@@ -204,6 +228,9 @@ impl Buffer {
                 // 5g: drop fold anchors now past EOF; rebuild reconciles the rest.
                 let len = self.document.buffer.len();
                 self.folds.folded.retain(|&b| b <= len);
+                // 9A: undo/redo bypass apply's mapping → clear the block (acting on stale offsets unsafe).
+                self.marked_block = None;
+                self.pending_block_begin = None;
                 true
             }
             None => false,
@@ -804,5 +831,48 @@ mod tests {
         let ed = Editor::new_from_text("x", None, (80, 24));
         assert_eq!(ed.theme.name, "default");
         assert_eq!(ed.depth, wordcartel_core::theme::Depth::Truecolor);
+    }
+
+    // Editor has NO insert/delete helpers (Codex) — drive edits through apply, building the
+    // changeset with the existing build_multi_replace. The editor.rs test module's TestClock
+    // is `Cell<u64>`-based (editor.rs:522): `TestClock(std::cell::Cell::new(0))` — Codex.
+    fn ap(e: &mut Editor, edits: &[(usize, usize, &str)]) {
+        let doc_len = e.active().document.buffer.len();
+        let owned: Vec<(usize, usize, String)> = edits.iter().map(|(a,b,s)| (*a,*b,s.to_string())).collect();
+        let (cs, edit) = crate::commands::build_multi_replace(&owned, doc_len);
+        let txn = wordcartel_core::history::Transaction::new(cs);
+        e.apply(txn, edit, wordcartel_core::history::EditKind::Other, &TestClock(std::cell::Cell::new(0)));
+    }
+
+    #[test]
+    fn marked_block_tracks_edits_and_collapses() {
+        let mut e = Editor::new_from_text("hello world\n", None, (40, 10));
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 6, end: 11, hidden: false }); // "world"
+        ap(&mut e, &[(0, 0, "XX")]); // insert "XX" at byte 0 → block shifts right by 2
+        let b = e.active().marked_block.unwrap();
+        assert_eq!((b.start, b.end), (8, 13));
+        let len = e.active().document.buffer.len();
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: len, hidden: false });
+        ap(&mut e, &[(0, len, "")]); // delete the whole region → collapse → cleared
+        assert!(e.active().marked_block.is_none(), "fully-deleted block clears");
+    }
+
+    #[test]
+    fn marked_block_boundary_inserts_stay_outside() {
+        let mut e = Editor::new_from_text("ab cd\n", None, (40, 10));
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 3, end: 5, hidden: false }); // "cd"
+        ap(&mut e, &[(5, 5, "X")]); // insert at end → end stays (map_pos_before), block does NOT grow
+        assert_eq!(e.active().marked_block.unwrap().end, 5);
+        ap(&mut e, &[(3, 3, "Y")]); // insert at start → start moves past (map_pos), block does NOT grow at front
+        assert_eq!(e.active().marked_block.unwrap().start, 4);
+    }
+
+    #[test]
+    fn undo_clears_marked_block() {
+        let mut e = Editor::new_from_text("abc\n", None, (40, 10));
+        ap(&mut e, &[(0, 0, "Z")]); // make history non-empty
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 2, hidden: false });
+        e.undo(); // Editor::undo exists (editor.rs:512)
+        assert!(e.active().marked_block.is_none(), "undo clears the block (it bypasses apply mapping)");
     }
 }
