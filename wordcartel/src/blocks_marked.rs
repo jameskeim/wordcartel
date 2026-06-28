@@ -145,6 +145,9 @@ pub fn mark_block_from_selection(editor: &mut Editor) {
         return;
     }
     let caret = nav::head(editor);
+    // INVARIANT: `from != to` (guarded above) → set_block cannot hit its empty-reject path,
+    // so the block IS set; clearing the selection below is unconditionally safe. If set_block
+    // ever gains a new rejection path, gate the selection-clear on success.
     set_block(editor, from, to);
     editor.active_mut().pending_block_begin = None;
     // Convert: clear the live selection back to a single caret.
@@ -249,6 +252,7 @@ mod tests {
         crate::blocks_marked::block_begin(&mut e);
         crate::blocks_marked::block_end(&mut e); // begin==end==2 → reject
         assert!(e.active().marked_block.is_none());
+        assert!(e.active().pending_block_begin.is_none(), "pending cleared even on empty-reject");
         assert_eq!(e.status, "empty block");
     }
 
