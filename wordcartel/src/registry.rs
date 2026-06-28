@@ -100,12 +100,16 @@ impl Registry {
         r.register("move_paragraph_down", "Move Paragraph Down", None, |c| run(c, Command::Move { dir: Dir::ParagraphDown, extend: false }));
         r.register("move_page_up",   "Move Page Up",   None, |c| run(c, Command::Move { dir: Dir::PageUp,   extend: false }));
         r.register("move_page_down", "Move Page Down", None, |c| run(c, Command::Move { dir: Dir::PageDown, extend: false }));
+        r.register("move_screen_top",    "Move to Screen Top",    None, |c| run(c, Command::Move { dir: Dir::ScreenTop,    extend: false }));
+        r.register("move_screen_bottom", "Move to Screen Bottom", None, |c| run(c, Command::Move { dir: Dir::ScreenBottom, extend: false }));
         r.register("move_doc_start", "Move to Start",  None, |c| run(c, Command::Move { dir: Dir::DocStart, extend: false }));
         r.register("move_doc_end",   "Move to End",    None, |c| run(c, Command::Move { dir: Dir::DocEnd,   extend: false }));
 
         // Word delete — Edit menu.
         r.register("delete_word_back",    "Delete Word Left",  Some(MenuCategory::Edit), |c| run(c, Command::DeleteWord { back: true }));
         r.register("delete_word_forward", "Delete Word Right", Some(MenuCategory::Edit), |c| run(c, Command::DeleteWord { back: false }));
+        r.register("delete_line",         "Delete Line",        Some(MenuCategory::Edit), |c| run(c, Command::DeleteLine));
+        r.register("delete_to_line_end",  "Delete to Line End", Some(MenuCategory::Edit), |c| run(c, Command::DeleteToLineEnd));
 
         // Editing — palette-only (menu: None).
         r.register("insert_newline", "Insert Newline",   None, |c| run(c, Command::InsertNewline));
@@ -140,6 +144,10 @@ impl Registry {
 
         // File menu.
         r.register("save", "Save", Some(MenuCategory::File), |c| crate::save::dispatch_save(c));
+        r.register("save_and_quit", "Save and Quit", Some(MenuCategory::File), |c| {
+            crate::save::dispatch_save_and_quit(c);
+            CommandResult::Handled
+        });
         r.register("quit", "Quit", Some(MenuCategory::File), |c| run(c, Command::Quit));
 
         // View menu.
@@ -200,6 +208,27 @@ impl Registry {
         // Named marks (Task 8 / Effort 5c).
         r.register("set_mark",     "Set Mark\u{2026}",     None, |c| { crate::marks::set_mark(c.editor); CommandResult::Handled });
         r.register("jump_to_mark", "Jump to Mark\u{2026}", None, |c| { crate::marks::jump_to_mark(c.editor); CommandResult::Handled });
+
+        // Numbered bookmarks ^K0-9/^Q0-9 (Task 4 / Effort 9b).
+        // Handler is a fn pointer — runtime loop can't capture `ch`, so use a macro with literal digits.
+        macro_rules! register_bookmarks {
+            ($r:expr, $($d:literal => $ch:literal),+ $(,)?) => {$(
+                $r.register(concat!("set_bookmark_", $d), concat!("Set Bookmark ", $d), None,
+                    |c| { crate::marks::set_char_mark(c.editor, $ch);
+                          c.editor.status = concat!("bookmark ", $d, " set").to_string();
+                          CommandResult::Handled });
+                $r.register(concat!("jump_bookmark_", $d), concat!("Jump to Bookmark ", $d), None,
+                    |c| { if crate::marks::jump_char_mark(c.editor, $ch) {
+                              c.editor.status = concat!("jumped to bookmark ", $d).to_string();
+                          } else {
+                              c.editor.status = concat!("no bookmark ", $d).to_string();
+                          }
+                          CommandResult::Handled });
+            )+};
+        }
+        register_bookmarks!(r,
+            "0" => '0', "1" => '1', "2" => '2', "3" => '3', "4" => '4',
+            "5" => '5', "6" => '6', "7" => '7', "8" => '8', "9" => '9');
 
         // Jump-back ring (Task 9 / Effort 5c).
         r.register("jump_back",    "Jump Back",    None, |c| { crate::marks::jump_back(c.editor); CommandResult::Handled });
@@ -349,6 +378,10 @@ impl Registry {
         r.register("heading_next",   "Next Heading",   None, |c| { heading_jump(c, Dirn::Next);   CommandResult::Handled });
         r.register("heading_prev",   "Previous Heading", None, |c| { heading_jump(c, Dirn::Prev); CommandResult::Handled });
         r.register("heading_parent", "Parent Heading", None, |c| { heading_jump(c, Dirn::Parent); CommandResult::Handled });
+
+        // WordStar viewport scroll (Task 6 / Effort 9b): ^W/^Z scroll one row, caret clamped.
+        r.register("scroll_line_up",   "Scroll Line Up",   None, |c| { crate::nav::scroll_line_up(c.editor);   CommandResult::Handled });
+        r.register("scroll_line_down", "Scroll Line Down", None, |c| { crate::nav::scroll_line_down(c.editor); CommandResult::Handled });
 
         r
     }

@@ -40,6 +40,8 @@ pub enum Dir {
     ParagraphDown,
     PageUp,
     PageDown,
+    ScreenTop,
+    ScreenBottom,
     DocStart,
     DocEnd,
 }
@@ -71,6 +73,10 @@ pub enum Command {
     Quit,
     /// Delete one word backwards (back=true) or forwards (back=false).
     DeleteWord { back: bool },
+    /// Delete the entire logical line the caret is on, including its trailing newline.
+    DeleteLine,
+    /// Delete from the caret to the end of the current logical line, keeping the newline.
+    DeleteToLineEnd,
     /// Select the given text-object scope at the caret (clears sel_history).
     SelectScope(Scope),
     /// Grow selection: word → sentence → paragraph → document (pushes to sel_history).
@@ -371,6 +377,8 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                 Dir::ParagraphDown => nav::move_paragraph_down(editor),
                 Dir::PageUp        => nav::move_page_up(editor),
                 Dir::PageDown      => nav::move_page_down(editor),
+                Dir::ScreenTop     => nav::move_screen_top(editor),
+                Dir::ScreenBottom  => nav::move_screen_bottom(editor),
                 Dir::DocStart      => nav::move_doc_start(editor),
                 Dir::DocEnd        => nav::move_doc_end(editor),
             };
@@ -544,6 +552,68 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             let edit = Edit { range: from..to, new_len: 0 };
             let txn = Transaction::new(cs).with_selection(Selection::single(from));
             // EditKind::Other — matches existing delete commands, avoids coalescing with typed chars.
+            editor.apply(txn, edit, EditKind::Other, clock);
+            derive::rebuild(editor);
+            nav::ensure_visible(editor);
+            editor.active_mut().desired_col = None;
+            CommandResult::Handled
+        }
+
+        Command::DeleteLine => {
+            // Operates on the caret-head's logical line; any active selection is
+            // intentionally disregarded (matches DeleteWord + faithful WordStar ^Y).
+            let head = nav::head(editor);
+            let len = editor.active().document.buffer.len();
+            if len == 0 { return CommandResult::Noop; }
+            let (from, to) = {
+                let buf = &editor.active().document.buffer;
+                let total = derive::total_logical_lines(buf);
+                let l = buf.byte_to_line(head);
+                let start = buf.line_to_byte(l);
+                let end = if l + 1 < total { buf.line_to_byte(l + 1) } else { len };
+                if start == end {
+                    // Empty line — the phantom final logical line that exists only because
+                    // of a trailing '\n' (start == len). Remove the preceding newline so it
+                    // disappears.
+                    if start > 0 { (start - 1, end) } else { (start, end) }
+                } else if end == len && buf.slice(len - 1..len) != "\n" {
+                    // Final line with NO trailing newline → absorb the preceding newline too,
+                    // so the line fully vanishes (slice returns String).
+                    if start > 0 { (start - 1, end) } else { (start, end) }
+                } else {
+                    (start, end)
+                }
+            };
+            if from == to { return CommandResult::Noop; }
+            let cs = ChangeSet::delete(from..to, len);
+            let edit = Edit { range: from..to, new_len: 0 };
+            let txn = Transaction::new(cs).with_selection(Selection::single(from));
+            editor.apply(txn, edit, EditKind::Other, clock);
+            derive::rebuild(editor);
+            nav::ensure_visible(editor);
+            editor.active_mut().desired_col = None;
+            CommandResult::Handled
+        }
+
+        Command::DeleteToLineEnd => {
+            let head = nav::head(editor);
+            let len = editor.active().document.buffer.len();
+            let to = {
+                let buf = &editor.active().document.buffer;
+                let total = derive::total_logical_lines(buf);
+                let l = buf.byte_to_line(head);
+                let line_end = if l + 1 < total { buf.line_to_byte(l + 1) } else { len };
+                // Keep the newline: stop before a trailing '\n' if present.
+                if line_end > head && line_end > 0 && buf.slice(line_end - 1..line_end) == "\n" {
+                    line_end - 1
+                } else {
+                    line_end
+                }
+            };
+            if head >= to { return CommandResult::Noop; } // at/after EOL → no empty changeset
+            let cs = ChangeSet::delete(head..to, len);
+            let edit = Edit { range: head..to, new_len: 0 };
+            let txn = Transaction::new(cs).with_selection(Selection::single(head));
             editor.apply(txn, edit, EditKind::Other, clock);
             derive::rebuild(editor);
             nav::ensure_visible(editor);
@@ -1423,5 +1493,65 @@ mod tests {
         cs.apply(&mut tb);
         assert_eq!(tb.slice(0..tb.len()), "b b b");
         assert_eq!(edit.range, 0..8); // covering edit spans first.start..last.end
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 2 (Effort 9B): DeleteLine + DeleteToLineEnd
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn delete_line_removes_whole_line_including_newline() {
+        let mut e = Editor::new_from_text("aaa\nbbb\nccc\n", None, (40, 10));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(5); // in "bbb"
+        run(Command::DeleteLine, &mut e, &TestClock(0));
+        assert_eq!(e.active().document.buffer.to_string(), "aaa\nccc\n");
+        assert_eq!(e.active().document.selection.primary().head, 4); // start of "ccc"
+    }
+
+    #[test]
+    fn delete_line_last_line_without_trailing_newline_vanishes() {
+        let mut e = Editor::new_from_text("aaa\nbbb", None, (40, 10)); // no trailing \n
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(5); // in "bbb"
+        run(Command::DeleteLine, &mut e, &TestClock(0));
+        assert_eq!(e.active().document.buffer.to_string(), "aaa"); // preceding \n absorbed
+        assert_eq!(e.active().document.selection.primary().head, 3, "caret at end of remaining text");
+    }
+
+    #[test]
+    fn delete_line_on_empty_trailing_line_removes_preceding_newline() {
+        let mut e = Editor::new_from_text("aaa\n", None, (40, 10)); // logical lines: "aaa", ""
+        let len = e.active().document.buffer.len();
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(len); // phantom empty line
+        run(Command::DeleteLine, &mut e, &TestClock(0));
+        assert_eq!(e.active().document.buffer.to_string(), "aaa");
+        assert_eq!(e.active().document.selection.primary().head, 3, "caret at end after the empty line is removed");
+    }
+
+    #[test]
+    fn delete_line_single_line_empties_buffer() {
+        let mut e = Editor::new_from_text("only line", None, (40, 10));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(3);
+        run(Command::DeleteLine, &mut e, &TestClock(0));
+        assert_eq!(e.active().document.buffer.to_string(), "");
+        assert_eq!(e.active().document.selection.primary().head, 0);
+    }
+
+    #[test]
+    fn delete_to_line_end_deletes_to_eol_keeps_newline() {
+        let mut e = Editor::new_from_text("hello world\nnext\n", None, (40, 10));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(5); // after "hello"
+        run(Command::DeleteToLineEnd, &mut e, &TestClock(0));
+        assert_eq!(e.active().document.buffer.to_string(), "hello\nnext\n");
+    }
+
+    #[test]
+    fn delete_to_line_end_at_eol_is_noop() {
+        let mut e = Editor::new_from_text("hello\nnext\n", None, (40, 10));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(5); // at end of "hello"
+        let before = e.active().document.version;
+        let r = run(Command::DeleteToLineEnd, &mut e, &TestClock(0));
+        assert_eq!(e.active().document.buffer.to_string(), "hello\nnext\n", "byte-identical");
+        assert_eq!(e.active().document.version, before, "no changeset applied");
+        assert!(matches!(r, CommandResult::Noop));
     }
 }

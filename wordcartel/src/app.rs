@@ -282,18 +282,10 @@ pub fn resolve_prompt(
         }
         PromptAction::QuitAnyway => { editor.quit = true; }
         PromptAction::SaveAndQuit => {
-            let v = editor.active().document.version;
             editor.prompt = None; // dismiss the quit-confirm modal first
-            { let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() }; crate::save::dispatch_save(&mut ctx); }
-            // Arm quit-after-save ONLY if a save job was actually dispatched.
-            // dispatch_save dispatches nothing when there is no path (status set)
-            // or when it raised an external-mod modal (editor.prompt now Some) —
-            // in those cases abort the quit and let the user resolve (Codex #4).
-            if editor.active().document.path.is_some() && editor.prompt.is_none() {
-                editor.quit_after_save = Some(v);
-                editor.quit_after_save_at = Some(clock.now_ms());
-            }
-            return; // prompt handled above; must NOT clear an external-mod modal
+            let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
+            crate::save::dispatch_save_and_quit(&mut ctx);
+            return; // prompt handled; must NOT clear an external-mod modal
         }
         PromptAction::Reload => crate::save::reload_from_disk(editor),
         PromptAction::Overwrite => {
@@ -2206,6 +2198,47 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         crate::app::resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk, &tx);
         assert_eq!(e.quit_after_save, None, "no job dispatched → do not arm quit-after-save");
+        assert!(!e.quit);
+    }
+
+    #[test]
+    fn save_and_quit_command_arms_quit_after_save_like_prompt() {
+        // The save_and_quit registry command must reach the SAME armed state as the
+        // PromptAction::SaveAndQuit path (proves the DRY factor).
+        use crate::editor::Editor;
+        use crate::jobs::{Executor, InlineExecutor};
+        let p = std::env::temp_dir().join(format!("wc-savequit-cmd-{}.md", std::process::id()));
+        std::fs::write(&p, "old\n").unwrap();
+        let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
+        e.active_mut().document.saved_version = None; e.active_mut().document.version = 1;
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        {
+            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
+            crate::save::dispatch_save_and_quit(&mut ctx);
+        }
+        assert_eq!(e.quit_after_save, Some(1), "command path arms quit_after_save");
+        assert!(!e.quit, "not yet — waiting for the save result");
+        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        assert!(e.quit, "matching save result triggers quit");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn save_and_quit_command_on_unnamed_buffer_does_not_arm() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        let mut e = Editor::new_from_text("scratch\n", None, (80, 24));
+        e.active_mut().document.version = 1;
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        {
+            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
+            crate::save::dispatch_save_and_quit(&mut ctx);
+        }
+        assert_eq!(e.quit_after_save, None, "no path → not armed");
         assert!(!e.quit);
     }
 
