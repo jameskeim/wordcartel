@@ -1,8 +1,103 @@
-//! Persistent marked-block creation (Effort 9A Task 2).
+//! Persistent marked-block creation and operations (Effort 9A Tasks 2–3).
 //! ^KB = block_begin, ^KK = block_end, promote-from-selection.
+//! Task 3 adds: copy/move/delete/jump/hide/clear.
 
 use crate::editor::{Editor, MarkedBlock};
 use crate::nav;
+use wordcartel_core::history::Clock;
+
+// --- Task 3: act-on-block operations ---
+
+fn block(editor: &Editor) -> Option<crate::editor::MarkedBlock> { editor.active().marked_block }
+
+pub fn block_copy(editor: &mut Editor, clock: &dyn Clock) {
+    let Some(b) = block(editor) else { editor.status = "no marked block".into(); return; };
+    let text = editor.active().document.buffer.slice(b.start..b.end);
+    let caret = nav::head(editor);
+    let doc_len = editor.active().document.buffer.len();
+    let (cs, edit) = crate::commands::build_multi_replace(&[(caret, caret, text.clone())], doc_len);
+    let new_caret = caret + text.len();
+    apply_edit(editor, cs, edit, new_caret, clock);
+    // block stays — its endpoints map through the insertion via apply.
+    editor.status = "block copied".into();
+}
+
+pub fn block_move(editor: &mut Editor, clock: &dyn Clock) {
+    let Some(b) = block(editor) else { editor.status = "no marked block".into(); return; };
+    let caret = nav::head(editor);
+    if caret >= b.start && caret < b.end {
+        editor.status = "can't move a block into itself".into();
+        return;
+    }
+    let text = editor.active().document.buffer.slice(b.start..b.end);
+    let doc_len = editor.active().document.buffer.len();
+    // ascending, non-overlapping edits (build_multi_replace requires order)
+    let (edits, new_caret) = if caret < b.start {
+        (vec![(caret, caret, text.clone()), (b.start, b.end, String::new())], caret + text.len())
+    } else {
+        // caret >= b.end (inside guarded above)
+        (vec![(b.start, b.end, String::new()), (caret, caret, text.clone())], caret - (b.end - b.start) + text.len())
+    };
+    let (cs, edit) = crate::commands::build_multi_replace(&edits, doc_len);
+    apply_edit(editor, cs, edit, new_caret, clock);
+    editor.active_mut().marked_block = None; // consumed
+    editor.status = "block moved".into();
+}
+
+pub fn block_delete(editor: &mut Editor, clock: &dyn Clock) {
+    let Some(b) = block(editor) else { editor.status = "no marked block".into(); return; };
+    let doc_len = editor.active().document.buffer.len();
+    let (cs, edit) = crate::commands::build_multi_replace(&[(b.start, b.end, String::new())], doc_len);
+    apply_edit(editor, cs, edit, b.start, clock);
+    editor.active_mut().marked_block = None;
+    editor.status = "block deleted".into();
+}
+
+fn apply_edit(
+    editor: &mut Editor,
+    cs: wordcartel_core::change::ChangeSet,
+    edit: wordcartel_core::block_tree::Edit,
+    new_caret: usize,
+    clock: &dyn Clock,
+) {
+    let txn = wordcartel_core::history::Transaction::new(cs)
+        .with_selection(wordcartel_core::selection::Selection::single(new_caret));
+    editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
+    crate::derive::rebuild(editor);
+    nav::ensure_visible(editor);
+    editor.active_mut().desired_col = None;
+}
+
+pub fn block_jump_begin(editor: &mut Editor) { block_jump(editor, true); }
+pub fn block_jump_end(editor: &mut Editor)   { block_jump(editor, false); }
+fn block_jump(editor: &mut Editor, to_start: bool) {
+    let Some(b) = block(editor) else { editor.status = "no marked block".into(); return; };
+    let target = if to_start { b.start } else { b.end };
+    let pre = nav::head(editor);
+    crate::marks::record_jump(editor.active_mut(), pre);
+    let off = nav::clamp_snap(editor, target);
+    let off = crate::registry::place_caret_visible(editor, off, crate::registry::CaretPlace::UnfoldTo);
+    editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(off);
+    crate::derive::rebuild(editor);
+    nav::ensure_visible(editor);
+}
+
+pub fn block_toggle_hidden(editor: &mut Editor) {
+    match editor.active_mut().marked_block.as_mut() {
+        Some(b) => {
+            b.hidden = !b.hidden;
+            let h = b.hidden;
+            editor.status = if h { "block hidden".into() } else { "block shown".into() };
+        }
+        None => editor.status = "no marked block".into(),
+    }
+}
+
+pub fn block_clear(editor: &mut Editor) {
+    editor.active_mut().marked_block = None;
+    editor.active_mut().pending_block_begin = None;
+    editor.status = "block cleared".into();
+}
 
 /// Set `pending_block_begin` to the current caret position (^KB).
 pub fn block_begin(editor: &mut Editor) {
@@ -55,6 +150,61 @@ fn set_block(editor: &mut Editor, a: usize, b: usize) {
 #[cfg(test)]
 mod tests {
     use crate::editor::{Editor, MarkedBlock};
+
+    // --- Task 3: ops tests ---
+    struct TestClock(u64);
+    impl wordcartel_core::history::Clock for TestClock { fn now_ms(&self) -> u64 { self.0 } }
+
+    #[test]
+    fn block_copy_inserts_at_caret_and_keeps_block() {
+        let mut e = Editor::new_from_text("hello world\n", None, (40, 10));
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false }); // "hello"
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(11); // before "\n"
+        crate::blocks_marked::block_copy(&mut e, &TestClock(0));
+        assert_eq!(e.active().document.buffer.to_string(), "hello worldhello\n");
+        assert!(e.active().marked_block.is_some(), "block stays after copy");
+        assert_eq!(e.active().document.selection.primary().head, 16, "caret at end of inserted text");
+    }
+
+    #[test]
+    fn block_move_relocates_and_clears_one_undo() {
+        let mut e = Editor::new_from_text("AAA BBB\n", None, (40, 10));
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 4, hidden: false }); // "AAA "
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(7); // end (before \n)
+        crate::blocks_marked::block_move(&mut e, &TestClock(0));
+        assert_eq!(e.active().document.buffer.to_string(), "BBBAAA \n"); // "AAA " moved to caret
+        assert!(e.active().marked_block.is_none(), "block consumed by move");
+        let before = e.active().document.buffer.to_string();
+        e.undo();
+        assert_eq!(e.active().document.buffer.to_string(), "AAA BBB\n", "one undo step restores");
+        let _ = before;
+    }
+
+    #[test]
+    fn block_move_into_itself_is_noop() {
+        let mut e = Editor::new_from_text("hello\n", None, (40, 10));
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false });
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(2); // inside
+        crate::blocks_marked::block_move(&mut e, &TestClock(0));
+        assert_eq!(e.active().document.buffer.to_string(), "hello\n");
+        assert_eq!(e.status, "can't move a block into itself");
+    }
+
+    #[test]
+    fn block_delete_removes_and_clears() {
+        let mut e = Editor::new_from_text("hello world\n", None, (40, 10));
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 5, end: 11, hidden: false }); // " world"
+        crate::blocks_marked::block_delete(&mut e, &TestClock(0));
+        assert_eq!(e.active().document.buffer.to_string(), "hello\n");
+        assert!(e.active().marked_block.is_none());
+    }
+
+    #[test]
+    fn ops_with_no_block_status() {
+        let mut e = Editor::new_from_text("abc\n", None, (40, 10));
+        crate::blocks_marked::block_copy(&mut e, &TestClock(0));
+        assert_eq!(e.status, "no marked block");
+    }
 
     #[test]
     fn begin_then_end_forms_normalized_block() {
