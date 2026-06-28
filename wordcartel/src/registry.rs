@@ -207,6 +207,27 @@ impl Registry {
         r.register("set_mark",     "Set Mark\u{2026}",     None, |c| { crate::marks::set_mark(c.editor); CommandResult::Handled });
         r.register("jump_to_mark", "Jump to Mark\u{2026}", None, |c| { crate::marks::jump_to_mark(c.editor); CommandResult::Handled });
 
+        // Numbered bookmarks ^K0-9/^Q0-9 (Task 4 / Effort 9b).
+        // Handler is a fn pointer — runtime loop can't capture `ch`, so use a macro with literal digits.
+        macro_rules! register_bookmarks {
+            ($r:expr, $($d:literal => $ch:literal),+ $(,)?) => {$(
+                $r.register(concat!("set_bookmark_", $d), concat!("Set Bookmark ", $d), None,
+                    |c| { crate::marks::set_char_mark(c.editor, $ch);
+                          c.editor.status = concat!("bookmark ", $d, " set").to_string();
+                          CommandResult::Handled });
+                $r.register(concat!("jump_bookmark_", $d), concat!("Jump to Bookmark ", $d), None,
+                    |c| { if crate::marks::jump_char_mark(c.editor, $ch) {
+                              c.editor.status = concat!("jumped to bookmark ", $d).to_string();
+                          } else {
+                              c.editor.status = concat!("no bookmark ", $d).to_string();
+                          }
+                          CommandResult::Handled });
+            )+};
+        }
+        register_bookmarks!(r,
+            "0" => '0', "1" => '1', "2" => '2', "3" => '3', "4" => '4',
+            "5" => '5', "6" => '6', "7" => '7', "8" => '8', "9" => '9');
+
         // Jump-back ring (Task 9 / Effort 5c).
         r.register("jump_back",    "Jump Back",    None, |c| { crate::marks::jump_back(c.editor); CommandResult::Handled });
         r.register("jump_forward", "Jump Forward", None, |c| { crate::marks::jump_forward(c.editor); CommandResult::Handled });
