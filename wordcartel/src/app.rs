@@ -132,6 +132,76 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
                         editor.quit = true;
                     }
                 }
+                crate::editor::PostSaveAction::ContinueQuitDrain => {
+                    editor.pending_after_save = None;
+                    if saved_this && !editor.is_dirty(buffer_id) {
+                        // Saved clean: drop this buffer from the queue and advance.
+                        if let Some(d) = editor.quit_drain.as_mut() { d.queue.pop_front(); }
+                        editor.quit_drain_advance = true; // apply_job_result re-drives with ctx
+                    } else if saved_this {
+                        // Codex C-new: the user typed DURING the in-flight save → this buffer
+                        // is dirty again. Do NOT pop/skip it (that would silently lose the new
+                        // edits). Re-drive WITHOUT popping → drive_quit_drain re-saves the newer
+                        // version of the same front buffer. Converges once the user stops typing.
+                        editor.quit_drain_advance = true;
+                    } else {
+                        // Save failed (Codex 8d): abort the drain so it can't linger with no
+                        // in-flight save and no re-drive. The merge's error status stands.
+                        editor.quit_drain = None;
+                        editor.quit_drain_advance = false;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Apply a finished job's result, then advance a multi-buffer quit drain if one
+/// is waiting on this completion. The single funnel for all JobDone handling so
+/// the re-drive cannot be skipped on an early-returning reduce branch (Codex C1).
+pub fn apply_job_result(r: JobResult, editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock, msg_tx: &std::sync::mpsc::Sender<Msg>) {
+    apply_result(r, editor);
+    if editor.quit_drain_advance {
+        editor.quit_drain_advance = false;
+        drive_quit_drain(editor, ex, clock, msg_tx);
+    }
+}
+
+/// Advance the quit drain by one step: pick the next dirty buffer, switch to it,
+/// and either dispatch its save (SaveAll) or raise the per-buffer review prompt
+/// (ReviewEach). When the queue is empty, quit. Re-driven by save completion
+/// (apply_result sets `quit_drain_advance`) and by review-prompt resolution.
+pub fn drive_quit_drain(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock, msg_tx: &std::sync::mpsc::Sender<Msg>) {
+    loop {
+        if editor.quit_drain.is_none() { return; }
+        // Pop already-clean / vanished buffers off the front. Each iteration uses a
+        // SHORT immutable borrow to read the front id (Codex I-new-1: never hold a
+        // `quit_drain` borrow across an `editor.is_dirty`/`switch_to`/method call),
+        // then mutates the queue in a SEPARATE borrow.
+        let front = editor.quit_drain.as_ref().and_then(|d| d.queue.front().copied());
+        let Some(id) = front else {
+            editor.quit_drain = None;
+            editor.quit = true;
+            return;
+        };
+        let gone = editor.buffers.iter().all(|b| b.id != id);
+        if gone || !editor.is_dirty(id) {
+            if let Some(d) = editor.quit_drain.as_mut() { d.queue.pop_front(); }
+            continue;
+        }
+        let idx = editor.buffers.iter().position(|b| b.id == id).unwrap();
+        crate::workspace::switch_to(editor, idx); // show the buffer in question
+        let mode = editor.quit_drain.as_ref().unwrap().mode;
+        match mode {
+            crate::editor::QuitMode::SaveAll => {
+                let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
+                crate::save::dispatch_save_then(&mut ctx, crate::editor::PostSaveAction::ContinueQuitDrain);
+                return; // wait for the save (named) or Save-As (unnamed) to complete
+            }
+            crate::editor::QuitMode::ReviewEach => {
+                let name = crate::workspace::buffer_display_name(editor, id);
+                editor.open_prompt(crate::prompt::Prompt::quit_review_buffer(&name));
+                return; // wait for ReviewSave/ReviewDiscard/Cancel
             }
         }
     }
@@ -400,7 +470,14 @@ pub fn save_as_submit(editor: &mut crate::editor::Editor, text: &str,
                       executor: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
                       msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
     let t = text.trim();
-    if t.is_empty() { editor.status = "save-as: empty path".into(); editor.pending_save_as = None; return; }
+    if t.is_empty() {
+        editor.status = "save-as: empty path".into();
+        editor.pending_save_as = None;
+        // Effort 6 (Codex C2): backing out of a drain's Save-As aborts the quit.
+        editor.quit_drain = None;
+        editor.quit_drain_advance = false;
+        return;
+    }
     let target = expand_path(t);
     if target.exists() {
         editor.pending_save_overwrite = Some(target.clone());
@@ -458,6 +535,10 @@ fn perform_post_save_action(
         crate::editor::PostSaveAction::Quit => {
             editor.quit = true;
         }
+        // ContinueQuitDrain is only ever armed via the drain's `dispatch_save_then`
+        // and consumed by `apply_result`; it never reaches this immediate-perform
+        // path (which serves the dirty-guard New flow). No-op defensively.
+        crate::editor::PostSaveAction::ContinueQuitDrain => {}
     }
 }
 
@@ -484,6 +565,30 @@ pub fn resolve_prompt(
             editor.pending_save_overwrite = None;
             editor.pending_save_as = None;
             editor.pending_write_block = None;
+            // Effort 6: abort an in-progress multi-buffer quit (no data loss; the
+            // user backed out). Leave `quit` false.
+            editor.quit_drain = None;
+            editor.quit_drain_advance = false;
+        }
+        PromptAction::QuitSaveAll | PromptAction::QuitReviewEach => {
+            editor.prompt = None;
+            let mode = if matches!(action, PromptAction::QuitSaveAll) { crate::editor::QuitMode::SaveAll } else { crate::editor::QuitMode::ReviewEach };
+            let queue: std::collections::VecDeque<_> = editor.buffers.iter().filter(|b| editor.is_dirty(b.id)).map(|b| b.id).collect();
+            editor.quit_drain = Some(crate::editor::QuitDrain { queue, mode });
+            drive_quit_drain(editor, ex, clock, msg_tx);
+            return;
+        }
+        PromptAction::ReviewSave => {
+            editor.prompt = None;
+            let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
+            crate::save::dispatch_save_then(&mut ctx, crate::editor::PostSaveAction::ContinueQuitDrain);
+            return;
+        }
+        PromptAction::ReviewDiscard => {
+            editor.prompt = None;
+            if let Some(d) = editor.quit_drain.as_mut() { d.queue.pop_front(); }
+            drive_quit_drain(editor, ex, clock, msg_tx);
+            return;
         }
         PromptAction::QuitAnyway => { editor.quit = true; }
         PromptAction::SaveAndQuit => {
@@ -695,7 +800,7 @@ pub(crate) fn dispatch_overlay_command(
     editor.file_browser = None;
     let mut ctx = crate::registry::Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
     reg.dispatch(id, &mut ctx);
-    for r in ex.drain() { apply_result(r, editor); }
+    for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
     // Hydrate any overlay the dispatched command may have opened (Codex 3c).
     hydrate_overlays(editor, reg, keymap);
 }
@@ -958,7 +1063,7 @@ pub fn reduce(
                     _ => { editor.pending_mark = None; } // non-name key cancels
                 }
             }
-            for r in ex.drain() { apply_result(r, editor); }
+            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         // non-key message: fall through to normal handling
@@ -971,11 +1076,11 @@ pub fn reduce(
         if matches!(&msg, Msg::ClipboardPaste { .. }) {
             // Drop an async clipboard-paste result that arrives while the menu is
             // open — it must not land in the document behind the overlay.
-            for r in ex.drain() { apply_result(r, editor); }
+            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Paste(_)) = &msg {
-            for r in ex.drain() { apply_result(r, editor); }
+            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Key(k)) = &msg {
@@ -1008,7 +1113,7 @@ pub fn reduce(
                     }
                 }
             }
-            for r in ex.drain() { apply_result(r, editor); }
+            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         // Non-key msg falls through to normal handling while menu stays open.
@@ -1021,7 +1126,7 @@ pub fn reduce(
         if matches!(&msg, Msg::ClipboardPaste { .. }) {
             // Drop an async clipboard-paste result that arrives while the palette is
             // open — it must not land in the document behind the overlay.
-            for r in ex.drain() { apply_result(r, editor); }
+            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Paste(text)) = msg {
@@ -1032,7 +1137,7 @@ pub fn reduce(
                 let max = p.rows.len().saturating_sub(1);
                 if p.selected > max { p.selected = max; }
             }
-            for r in ex.drain() { apply_result(r, editor); }
+            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Key(k)) = &msg {
@@ -1107,7 +1212,7 @@ pub fn reduce(
                     _ => {}
                 }
             }
-            for r in ex.drain() { apply_result(r, editor); }
+            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         // Non-key msg falls through to normal handling while palette stays open.
@@ -1121,7 +1226,7 @@ pub fn reduce(
         if matches!(&msg, Msg::ClipboardPaste { .. }) {
             // Drop an async clipboard-paste result that arrives while the theme picker is
             // open — it must not land in the document behind the overlay.
-            for r in ex.drain() { apply_result(r, editor); }
+            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Paste(text)) = &msg {
@@ -1130,7 +1235,7 @@ pub fn reduce(
                 crate::theme_picker::rebuild_rows(tp);
             }
             preview_selected_theme(editor);
-            for r in ex.drain() { apply_result(r, editor); }
+            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Key(k)) = &msg {
@@ -1173,7 +1278,7 @@ pub fn reduce(
                     _ => {}
                 }
             }
-            for r in ex.drain() { apply_result(r, editor); }
+            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         // Non-key msg falls through to normal handling while picker stays open.
@@ -1185,7 +1290,7 @@ pub fn reduce(
         // Drop an async clipboard-paste result that arrives while the browser is open —
         // it must not land in the document behind the overlay (Codex I6, mirror palette).
         if matches!(&msg, Msg::ClipboardPaste { .. }) {
-            for r in ex.drain() { apply_result(r, editor); }
+            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Paste(text)) = &msg {
@@ -1193,7 +1298,7 @@ pub fn reduce(
                 fb.query.push_str(text);
                 crate::file_browser::rebuild_entries(fb);
             }
-            for r in ex.drain() { apply_result(r, editor); }
+            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Key(k)) = &msg {
@@ -1265,7 +1370,7 @@ pub fn reduce(
                     _ => {}
                 }
             }
-            for r in ex.drain() { apply_result(r, editor); }
+            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         // Non-key msg falls through to normal handling while the browser stays open.
@@ -1291,7 +1396,7 @@ pub fn reduce(
                 }
             }
             // Merge a directly-delivered background result even under a modal.
-            Msg::JobDone(r) => apply_result(r, editor),
+            Msg::JobDone(r) => apply_job_result(r, editor, ex, clock, msg_tx),
             Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {
                 apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, clock);
             }
@@ -1310,7 +1415,7 @@ pub fn reduce(
             _ => {}
         }
         // Always drain ready results (merges the awaited save&quit result).
-        for r in ex.drain() { apply_result(r, editor); }
+        for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
         return !editor.quit;
     }
 
@@ -1342,6 +1447,9 @@ pub fn reduce(
                         editor.minibuffer = None;
                         // Save-As minibuffer dismiss: drop any queued post-save action.
                         editor.pending_save_as = None;
+                        // Effort 6 (Codex C2): dismissing a drain's Save-As aborts the quit.
+                        editor.quit_drain = None;
+                        editor.quit_drain_advance = false;
                     }
                     crossterm::event::KeyCode::Enter => {
                         let mb = editor.minibuffer.take().unwrap();
@@ -1355,7 +1463,7 @@ pub fn reduce(
                     _ => {}
                 }
             }
-            for r in ex.drain() { apply_result(r, editor); }
+            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         // non-key (FilterDone/JobDone/Tick/Resize/ClipboardPaste/ClipboardAvailability) falls through to the normal match below
@@ -1381,7 +1489,7 @@ pub fn reduce(
                         KeyCode::Char('q') | KeyCode::Esc => { editor.search = None; }
                         _ => {}
                     }
-                    for r in ex.drain() { apply_result(r, editor); }
+                    for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
                     return !editor.quit;
                 }
                 match k.code {
@@ -1392,7 +1500,7 @@ pub fn reduce(
                     KeyCode::Enter if alt => {
                         if let Some(s) = editor.search.as_mut() { s.phase = crate::search_overlay::Phase::Stepping; }
                         search_sync(editor); // park on first match
-                        for r in ex.drain() { apply_result(r, editor); }
+                        for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
                         return !editor.quit;
                     }
                     KeyCode::Enter if shift => { search_step(editor, false); }
@@ -1417,7 +1525,7 @@ pub fn reduce(
                 // Recompute against the live buffer and pin the current match.
                 search_sync(editor);
             }
-            for r in ex.drain() { apply_result(r, editor); }
+            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
             return !editor.quit; // return ONLY for key events (including non-Press)
         }
         // Non-key messages (FilterDone/ExportDone/TransformDone/JobDone/Tick/…)
@@ -1438,7 +1546,7 @@ pub fn reduce(
                     _ => {} // bare Ctrl+key or anything else: no-op, consumed
                 }
             }
-            for r in ex.drain() { apply_result(r, editor); }
+            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
             return !editor.quit; // return ONLY for key events (including non-Press)
         }
         // Non-key messages fall through to normal handlers below.
@@ -1470,7 +1578,7 @@ pub fn reduce(
                         if editor.outline.as_ref().map(|o| o.opened_version) != Some(editor.active().document.version) {
                             editor.status = "document changed; outline closed".into();
                             editor.outline = None;
-                            for r in ex.drain() { apply_result(r, editor); }
+                            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
                             return !editor.quit;
                         }
                         let target = editor.outline.as_ref()
@@ -1506,7 +1614,7 @@ pub fn reduce(
                     _ => {}
                 }
             }
-            for r in ex.drain() { apply_result(r, editor); }
+            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         // Non-key messages fall through to normal handlers below.
@@ -1578,7 +1686,7 @@ pub fn reduce(
             crate::mouse::handle(editor, ev, reg, keymap, ex, clock, msg_tx);
         }
         Msg::Input(_) => {}
-        Msg::JobDone(r) => apply_result(r, editor),
+        Msg::JobDone(r) => apply_job_result(r, editor, ex, clock, msg_tx),
         Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {
             apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, clock);
         }
@@ -1626,7 +1734,7 @@ pub fn reduce(
     }
     // Fold any other results that became ready while handling this message.
     for r in ex.drain() {
-        apply_result(r, editor);
+        apply_job_result(r, editor, ex, clock, msg_tx);
     }
     !editor.quit
 }
@@ -1897,12 +2005,25 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
         if let Some(p) = &editor.pending_after_save {
             let waited = now.saturating_sub(p.at_ms);
             if waited > SAVE_QUIT_TIMEOUT_MS {
-                // pending_after_save can only hold Quit (Open/New are now additive).
-                // Re-raise the quit-confirm modal so the user can choose again.
-                let _ = &p.action; // only Quit exists
+                // Codex I-new-4: match on &p.action via `matches!` BEFORE clearing
+                // pending_after_save (decide the action, then mutate — avoids moving
+                // out of the borrowed `pending_after_save`).
+                let timed_out_drain = matches!(&p.action, crate::editor::PostSaveAction::ContinueQuitDrain);
+                let timed_out_quit  = matches!(&p.action, crate::editor::PostSaveAction::Quit);
                 editor.pending_after_save = None;
-                editor.open_prompt(crate::prompt::Prompt::quit_confirm());
-                editor.status = "Save still running — choose again".into();
+                if timed_out_quit {
+                    // Re-raise the quit-confirm modal so the user can choose again.
+                    editor.open_prompt(crate::prompt::Prompt::quit_confirm());
+                    editor.status = "Save still running — choose again".into();
+                } else if timed_out_drain {
+                    // Codex C3: a stranded drain (no in-flight save, no re-drive) would
+                    // hang the quit. Abort the whole quit rather than silently clearing.
+                    editor.quit_drain = None;
+                    editor.quit_drain_advance = false;
+                    editor.status = "save timed out — quit cancelled".into();
+                } else {
+                    editor.status = "Save still running — try again".into();
+                }
             }
         }
         let swap_deadline = crate::swap::next_deadline_ms(now, editor.active().last_edit_at, editor.active().last_swap_at);
@@ -2145,17 +2266,21 @@ mod tests {
         for c in "hi".chars() {
             crate::app::step(&mut e, key_char(c), &clk);
         }
-        // First Ctrl+Q: dirty → modal up, NOT quit yet
+        // First Ctrl+Q: dirty → multi-buffer quit modal up, NOT quit yet (Effort 6).
         let ctrl_q = Event::Key(KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
         crate::app::reduce(crate::app::Msg::Input(ctrl_q), &mut e, &reg, &km, &ex, &clk, &tx);
-        assert!(e.prompt.is_some(), "dirty quit must raise modal");
+        assert!(e.prompt.is_some(), "dirty quit must raise the multi-buffer modal");
         assert!(!e.quit);
-        // Press 'q' → routed to QuitAnyway via the modal.
-        let q = Event::Key(KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::NONE,
+        // Press 'r' → Review each → per-buffer review prompt for the one dirty buffer.
+        let key = |c: char| Event::Key(KeyEvent { code: KeyCode::Char(c), modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(crate::app::Msg::Input(q), &mut e, &reg, &km, &ex, &clk, &tx);
-        assert!(e.quit);
+        crate::app::reduce(crate::app::Msg::Input(key('r')), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.prompt.is_some(), "review-each raises the per-buffer prompt");
+        assert!(!e.quit);
+        // Press 'd' → Discard this buffer → drain empties → quit.
+        crate::app::reduce(crate::app::Msg::Input(key('d')), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.quit, "discarding the last dirty buffer quits");
         assert_eq!(e.active().document.buffer.to_string(), "hi\n");
     }
 
@@ -2532,7 +2657,9 @@ mod tests {
     }
 
     #[test]
-    fn quit_with_unsaved_raises_modal_then_quit_anyway_exits() {
+    fn quit_with_unsaved_raises_multi_then_review_discard_exits() {
+        // Effort 6: a dirty buffer now raises the multi-buffer quit modal; the
+        // "quit anyway" equivalent is Review-each → Discard.
         use crate::editor::Editor;
         use crate::jobs::InlineExecutor;
         use crate::registry::Registry;
@@ -2545,15 +2672,144 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let ctrl_q = Event::Key(KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        // First Ctrl+Q → modal up, not quit.
+        // First Ctrl+Q → multi-buffer modal up, not quit.
         crate::app::reduce(crate::app::Msg::Input(ctrl_q.clone()), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert!(e.prompt.is_some() && !e.quit);
-        // Press 'q' → routed to QuitAnyway.
-        let q = Event::Key(KeyEvent { code: KeyCode::Char('q'), modifiers: KeyModifiers::NONE,
+        let key = |c: char| Event::Key(KeyEvent { code: KeyCode::Char(c), modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        crate::app::reduce(crate::app::Msg::Input(q), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
-        assert!(e.quit, "Quit anyway exits");
+        // 'r' → Review each → per-buffer prompt.
+        crate::app::reduce(crate::app::Msg::Input(key('r')), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert!(e.prompt.is_some() && !e.quit, "review-each raises the per-buffer prompt");
+        // 'd' → Discard → drain empties → quit.
+        crate::app::reduce(crate::app::Msg::Input(key('d')), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert!(e.quit, "discard exits");
         assert!(e.prompt.is_none(), "prompt cleared");
+    }
+
+    // -----------------------------------------------------------------------
+    // Effort 6 Task 8: multi-buffer quit (Save-All / Review-each) state machine
+    // -----------------------------------------------------------------------
+
+    fn quit_tmp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "wc-quit8-{}-{}-{}.md",
+            tag, std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)))
+    }
+
+    #[test]
+    fn quit_with_no_dirty_buffers_quits_immediately() {
+        use crate::editor::Editor;
+        let clk = TestClock(0);
+        let mut e = Editor::new_from_text("clean\n", Some(quit_tmp("clean")), (40, 10));
+        e.install_scratch();
+        let v = e.active().document.version;
+        e.active_mut().document.mark_saved(v); // clean (no dirty buffers)
+        let r = crate::commands::run(crate::commands::Command::Quit, &mut e, &clk);
+        assert!(e.quit, "no dirty buffers → quit immediately");
+        assert!(matches!(r, crate::commands::CommandResult::Quit));
+        assert!(e.prompt.is_none(), "no modal raised when nothing is dirty");
+    }
+
+    #[test]
+    fn quit_save_all_drains_named_dirty_then_quits() {
+        use crate::editor::{Buffer, Editor};
+        use crate::jobs::{Executor, InlineExecutor};
+        use crate::prompt::PromptAction;
+        let p0 = quit_tmp("a"); std::fs::write(&p0, "old\n").unwrap();
+        let p1 = quit_tmp("b"); std::fs::write(&p1, "old\n").unwrap();
+        let mut e = Editor::new_from_text("new0\n", Some(p0.clone()), (80, 24));
+        e.active_mut().document.saved_version = None; e.active_mut().document.version = 1; // dirty
+        let id1 = e.alloc_id();
+        let area = e.active().view.area;
+        e.buffers.push(Buffer::from_text(id1, "new1\n", Some(p1.clone()), area));
+        e.buffers[1].document.saved_version = None; e.buffers[1].document.version = 1; // dirty
+        e.install_scratch();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::app::resolve_prompt(PromptAction::QuitSaveAll, &mut e, &ex, &clk, &tx);
+        // Drive the drain to completion: each save result re-drives via apply_job_result.
+        let mut guard = 0;
+        while !e.quit {
+            let rs = ex.drain();
+            if rs.is_empty() { break; }
+            for r in rs { crate::app::apply_job_result(r, &mut e, &ex, &clk, &tx); }
+            guard += 1; assert!(guard < 16, "drain did not converge");
+        }
+        assert!(e.quit, "Save-All drains both dirty buffers then quits");
+        assert!(e.quit_drain.is_none(), "drain consumed");
+        assert_eq!(std::fs::read_to_string(&p0).unwrap(), "new0\n");
+        assert_eq!(std::fs::read_to_string(&p1).unwrap(), "new1\n");
+        let _ = std::fs::remove_file(&p0); let _ = std::fs::remove_file(&p1);
+    }
+
+    #[test]
+    fn quit_review_each_cancel_aborts() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::prompt::PromptAction;
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.active_mut().document.version = 1; // dirty
+        e.install_scratch();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::app::resolve_prompt(PromptAction::QuitReviewEach, &mut e, &ex, &clk, &tx);
+        assert!(e.quit_drain.is_some(), "drain started");
+        assert!(e.prompt.is_some(), "per-buffer review prompt raised");
+        crate::app::resolve_prompt(PromptAction::Cancel, &mut e, &ex, &clk, &tx);
+        assert!(e.quit_drain.is_none(), "cancel aborts the drain");
+        assert!(!e.quit, "not quitting after cancel");
+    }
+
+    #[test]
+    fn quit_drain_aborts_on_save_failure() {
+        // Save-All over a buffer whose save fails (symlink target is refused) →
+        // quit_drain cleared, quit stays false, error status surfaced.
+        #[cfg(not(unix))] { return; }
+        #[cfg(unix)]
+        {
+            use crate::editor::Editor;
+            use crate::jobs::{Executor, InlineExecutor};
+            use crate::prompt::PromptAction;
+            let real = quit_tmp("real"); std::fs::write(&real, "real\n").unwrap();
+            let link = quit_tmp("link"); std::os::unix::fs::symlink(&real, &link).unwrap();
+            let mut e = Editor::new_from_text("x\n", Some(link.clone()), (80, 24));
+            e.active_mut().document.saved_version = None; e.active_mut().document.version = 1; // dirty
+            e.install_scratch();
+            let ex = InlineExecutor::default();
+            let clk = TestClock(0);
+            let (tx, _rx) = std::sync::mpsc::channel();
+            crate::app::resolve_prompt(PromptAction::QuitSaveAll, &mut e, &ex, &clk, &tx);
+            for r in ex.drain() { crate::app::apply_job_result(r, &mut e, &ex, &clk, &tx); }
+            assert!(e.quit_drain.is_none(), "failed save aborts the drain");
+            assert!(!e.quit, "a failed save must not quit (no data loss)");
+            assert!(e.status.to_lowercase().contains("symlink"), "error status surfaced");
+            let _ = std::fs::remove_file(&link); let _ = std::fs::remove_file(&real);
+        }
+    }
+
+    #[test]
+    fn quit_drain_aborts_when_save_as_dismissed() {
+        // Drain reaches a dirty UNNAMED buffer → Save-As minibuffer opens. An empty
+        // submit (dismiss) aborts the quit: quit_drain cleared, quit stays false.
+        use crate::editor::Editor;
+        use crate::prompt::PromptAction;
+        use crate::jobs::InlineExecutor;
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.active_mut().document.version = 1; // dirty UNNAMED
+        e.install_scratch();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::app::resolve_prompt(PromptAction::QuitSaveAll, &mut e, &ex, &clk, &tx);
+        assert_eq!(e.minibuffer.as_ref().map(|m| m.kind), Some(crate::minibuffer::MinibufferKind::SaveAs),
+            "unnamed dirty buffer in the drain opens the Save-As minibuffer");
+        assert!(e.quit_drain.is_some(), "drain still pending while Save-As is open");
+        // Dismiss via empty submit.
+        crate::app::save_as_submit(&mut e, "", &ex, &clk, &tx);
+        assert!(e.quit_drain.is_none(), "dismissing the Save-As aborts the drain");
+        assert!(!e.quit, "backing out of Save-As must not quit");
     }
 
     #[test]

@@ -533,8 +533,12 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         }
 
         Command::Quit => {
-            if editor.active().document.dirty() {
-                editor.open_prompt(crate::prompt::Prompt::quit_confirm());
+            // Effort 6: quit considers the WHOLE workspace, not just the active
+            // buffer. Scratch is never dirty (is_dirty excludes it).
+            let any_dirty = editor.buffers.iter().any(|b| editor.is_dirty(b.id));
+            if any_dirty {
+                let n = editor.buffers.iter().filter(|b| editor.is_dirty(b.id)).count();
+                editor.open_prompt(crate::prompt::Prompt::quit_multi(n));
                 CommandResult::Handled
             } else {
                 editor.quit = true;

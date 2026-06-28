@@ -22,6 +22,14 @@ pub enum PromptAction {
     DiscardSwap,
     OpenOriginal,
     Transform(crate::transform::TransformKind),
+    /// Effort 6 multi-buffer quit: save every dirty buffer then quit.
+    QuitSaveAll,
+    /// Effort 6 multi-buffer quit: visit each dirty buffer with a per-buffer prompt.
+    QuitReviewEach,
+    /// Effort 6 review-each: save the buffer under review, then continue the drain.
+    ReviewSave,
+    /// Effort 6 review-each: discard the buffer under review, then continue the drain.
+    ReviewDiscard,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +62,30 @@ impl Prompt {
                 Choice { key: 's', label: "Save & quit", action: PromptAction::SaveAndQuit },
                 Choice { key: 'q', label: "Quit anyway", action: PromptAction::QuitAnyway },
                 Choice { key: 'c', label: "Cancel",      action: PromptAction::Cancel },
+            ],
+        }
+    }
+
+    /// Effort 6 top-level multi-buffer quit prompt: N buffers have unsaved work.
+    pub fn quit_multi(n: usize) -> Prompt {
+        Prompt {
+            message: format!("{n} buffer(s) unsaved: [A]ll save · [R]eview each · [C]ancel"),
+            choices: vec![
+                Choice { key: 'a', label: "Save all",    action: PromptAction::QuitSaveAll },
+                Choice { key: 'r', label: "Review each",  action: PromptAction::QuitReviewEach },
+                Choice { key: 'c', label: "Cancel",       action: PromptAction::Cancel },
+            ],
+        }
+    }
+
+    /// Effort 6 per-buffer review prompt raised while draining in Review-each mode.
+    pub fn quit_review_buffer(name: &str) -> Prompt {
+        Prompt {
+            message: format!("{name}: [S]ave · [D]iscard · [C]ancel"),
+            choices: vec![
+                Choice { key: 's', label: "Save",    action: PromptAction::ReviewSave },
+                Choice { key: 'd', label: "Discard", action: PromptAction::ReviewDiscard },
+                Choice { key: 'c', label: "Cancel",  action: PromptAction::Cancel },
             ],
         }
     }

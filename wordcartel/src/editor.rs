@@ -11,9 +11,24 @@ use wordcartel_core::selection::Selection;
 pub struct BufferId(pub u64);
 
 /// What to do once a pending save completes successfully.
-/// Only Quit remains — Open/New are additive (Effort 6) and need no save-first gate.
+/// `Quit` is the single-buffer save-then-quit; `ContinueQuitDrain` advances the
+/// multi-buffer quit state machine (Effort 6) after each buffer's save lands.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PostSaveAction { Quit }
+pub enum PostSaveAction { Quit, ContinueQuitDrain }
+
+/// Effort 6 multi-buffer quit: how the drain disposes of each dirty buffer.
+/// `Copy` so `let mode = drain.mode;` copies out without holding a borrow on
+/// `quit_drain` across `is_dirty`/`switch_to`/`dispatch_save_then` (Codex I-new-1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum QuitMode { SaveAll, ReviewEach }
+
+/// Effort 6 multi-buffer quit drain: the FIFO of dirty buffers still to dispose
+/// of, plus the chosen disposition. Driven one buffer per step by `drive_quit_drain`.
+#[derive(Clone, Debug)]
+pub struct QuitDrain {
+    pub queue: std::collections::VecDeque<BufferId>,
+    pub mode: QuitMode,
+}
 
 /// An in-flight "save, then act" request. Armed by `dispatch_save_then`;
 /// consumed by `apply_result` when the save lands clean.
@@ -335,6 +350,12 @@ pub struct Editor {
     pub scratch_id: Option<BufferId>,
     /// Most-recently-used buffer ids, most-recent first. Drives the switcher palette.
     pub mru: Vec<BufferId>,
+    /// Effort 6: the in-progress multi-buffer quit drain, if any. `Some` while the
+    /// Save-All / Review-each state machine is disposing of dirty buffers.
+    pub quit_drain: Option<QuitDrain>,
+    /// Effort 6: set by `apply_result`'s ContinueQuitDrain arm to ask the JobDone
+    /// funnel (`apply_job_result`) to re-drive the drain once the save merge lands.
+    pub quit_drain_advance: bool,
 }
 
 impl Editor {
@@ -374,6 +395,8 @@ impl Editor {
             resume_enabled: false,
             scratch_id: None,
             mru: Vec::new(),
+            quit_drain: None,
+            quit_drain_advance: false,
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer::from_text(id, text, path, area));
