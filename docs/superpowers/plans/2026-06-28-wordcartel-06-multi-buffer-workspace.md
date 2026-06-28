@@ -1704,6 +1704,8 @@ $(printf 'Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n
 - I-new-6 six New/Open test sites (2718/2749/2777/2804/2828/2851) (Task 6). ✓
 - Confirmed clean by Codex (round 2): C2 unnamed-buffer SaveAll continuation coherent (action survives pending_save_as→pending_after_save→JobDone); Save-As cancel sites correct; `alt-shift-v`/`parse_seq`/`Prompt{}` literal/`clamp_snap` side-effect-free/`status_left_text` extraction all sound.
 
+**Codex plan review (round 3): CLEAN — ready to implement.** No Critical/Important/Minor; all round-2 edits (drain convergence, borrow-safe driver, apply_job_result sites, timeout `matches!`, palette kind model) verified coherent against the real code.
+
 **Open verification points flagged inline for implementers (not placeholders — real "confirm against code" checks):**
 - Task 2: exact char-boundary snap helper name on `TextBuffer` (`snap_to_boundary` vs `clamp_snap`).
 - Task 3/4/5: confirm `^Kg`/`^Ka`/`^Kl`, `alt-shift-c`/`alt-shift-x`, and the CUA switch_buffer chord are unbound; confirm the real chord-parse fn name.
