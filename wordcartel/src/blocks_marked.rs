@@ -10,6 +10,16 @@ use wordcartel_core::history::Clock;
 
 fn block(editor: &Editor) -> Option<crate::editor::MarkedBlock> { editor.active().marked_block }
 
+/// Copy the marked block's text and insert it at the caret. The block survives the
+/// copy: its endpoints map through the insertion via `apply`.
+///
+/// Unlike `block_move`, there is intentionally NO caret-inside-`[start, end)` guard.
+/// With the caret strictly inside the block, the inserted duplicate lands within the
+/// block's span, so `map_pos_before` advances `end` past the insert and the block
+/// GROWS to include its own copy. This is by design: copy is non-destructive (it
+/// never loses data), so a caret-inside copy is well-defined and safe — the guard
+/// `block_move` needs (to avoid relocating a block into the hole it leaves) does not
+/// apply here.
 pub fn block_copy(editor: &mut Editor, clock: &dyn Clock) {
     let Some(b) = block(editor) else { editor.status = "no marked block".into(); return; };
     let text = editor.active().document.buffer.slice(b.start..b.end);
@@ -141,6 +151,7 @@ pub fn mark_block_from_selection(editor: &mut Editor) {
     let sel = editor.active().document.selection.primary();
     let (from, to) = (sel.from(), sel.to());
     if from == to {
+        editor.active_mut().pending_block_begin = None;
         editor.status = "no selection to mark".into();
         return;
     }
@@ -184,6 +195,26 @@ mod tests {
         assert_eq!(e.active().document.buffer.to_string(), "hello worldhello\n");
         assert!(e.active().marked_block.is_some(), "block stays after copy");
         assert_eq!(e.active().document.selection.primary().head, 16, "caret at end of inserted text");
+    }
+
+    /// Pins the documented caret-inside-block copy GROW behavior (see `block_copy`
+    /// doc): with the caret strictly inside `[start, end)`, the inserted duplicate
+    /// lands within the block, `end` maps past the insert, and the block grows to
+    /// span the original text plus its copy. Non-destructive by design (no guard,
+    /// unlike `block_move`).
+    #[test]
+    fn block_copy_caret_inside_grows_block() {
+        let mut e = Editor::new_from_text("hello world\n", None, (40, 10));
+        // Block = "hello world" (0..11). Caret strictly inside at 5 (after "hello").
+        e.active_mut().marked_block = Some(MarkedBlock { start: 0, end: 11, hidden: false });
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(5);
+        crate::blocks_marked::block_copy(&mut e, &TestClock(0));
+        // The 11-byte block text is duplicated at offset 5 → buffer gains the copy.
+        assert_eq!(e.active().document.buffer.to_string(), "hellohello world world\n");
+        let b = e.active().marked_block.expect("block survives copy");
+        // Block grows: start unchanged, end advances past the 11-byte insert (11→22).
+        assert_eq!(b.start, 0, "start anchored");
+        assert_eq!(b.end, 22, "end mapped past the inserted duplicate → block grew");
     }
 
     #[test]

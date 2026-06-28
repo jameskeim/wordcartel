@@ -308,6 +308,27 @@ pub fn load_marks_from_entry(editor: &mut Editor, entry: &crate::state::StateEnt
     }
 }
 
+/// Restore the persisted marked block from a session entry into the active buffer.
+/// Call only when the staleness guard has accepted the entry (mirrors cursor/marks).
+///
+/// Both endpoints are clamped+grapheme-snapped via `clamp_snap` (the SAME treatment
+/// marks get). This is load-bearing: `persist_session` records the block from the
+/// in-memory buffer, but the staleness guard keys on on-disk mtime+size. A dirty
+/// buffer longer than the on-disk file can persist a block whose `end` exceeds the
+/// on-disk length; on a dirty-quit + reopen-unchanged-file cycle the buffer reloads
+/// SHORTER yet the guard still passes, so a raw restore would hand `block_*` ops an
+/// out-of-range range and `buffer.slice()` would assert/panic. Clamping prevents that;
+/// a block that collapses to empty after clamping is dropped.
+pub fn load_block_from_entry(editor: &mut Editor, entry: &crate::state::StateEntry) {
+    if let Some((s, en)) = entry.block {
+        let s = crate::nav::clamp_snap(editor, s);
+        let en = crate::nav::clamp_snap(editor, en);
+        if s < en {
+            editor.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: s, end: en, hidden: false });
+        }
+    }
+}
+
 /// Restore session-resume state (cursor, scroll, marks, folds) for `path` into the
 /// active buffer. Factored verbatim from run()'s launch resume block so launch and
 /// `open_into_current` share one code path. Reloads `state::load()` itself so it works
@@ -327,9 +348,7 @@ pub fn restore_resume(editor: &mut Editor, path: &std::path::Path) {
                     editor.active_mut().folds.folded = entry.folds.iter().copied().collect();
                     let (blocks, buf) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.clone()) };
                     editor.active_mut().folds.reconcile(&blocks, &buf);
-                    if let Some((s, en)) = entry.block {
-                        editor.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: s, end: en, hidden: false });
-                    }
+                    load_block_from_entry(editor, entry);
                 }
             }
         }
@@ -572,6 +591,8 @@ pub fn resolve_prompt(
             if let Some(t) = editor.pending_write_block.take() {
                 if let Some(b) = editor.active().marked_block {
                     perform_block_write(editor, &t, b.start, b.end);
+                } else {
+                    editor.status = "no marked block".into();
                 }
             }
         }
@@ -3660,6 +3681,56 @@ mod tests {
         }
         // Non-vacuous: restore code is present above; guard prevented it from running.
         assert!(e2.active().marked_block.is_none(), "block discarded on mismatch — guard blocked restore");
+    }
+
+    /// Task 5 (9A) regression: an out-of-range persisted block (dirty-quit → reopen
+    /// shorter file, guard still passes) must NOT reach `buffer.slice()` and panic.
+    /// Drives the REAL restore helper (`load_block_from_entry`, the exact code
+    /// `restore_resume` uses). Pre-fix this restored `end=8 > len=4` and the
+    /// `block_copy`/`block_delete` below asserted in `slice()` → panic.
+    #[test]
+    fn restore_clamps_out_of_range_block_no_slice_panic() {
+        use crate::editor::Editor;
+        use crate::state::StateEntry;
+
+        // Short buffer (len 4) but the persisted block end (8) is past EOF.
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        let len = e.active().document.buffer.len();
+        assert_eq!(len, 4);
+        let entry = StateEntry {
+            cursor: 0, scroll: 0, marks: Default::default(),
+            mtime: 10, size: 20, seq: 1, folds: vec![],
+            block: Some((4, 8)), // start at EOF, end beyond EOF
+        };
+
+        // Real production restore path (post-staleness-guard).
+        crate::app::load_block_from_entry(&mut e, &entry);
+
+        // Clamped to <= len, or dropped entirely — never out of range.
+        if let Some(b) = e.active().marked_block {
+            assert!(b.end <= len, "restored block end clamped to buffer len");
+            assert!(b.start <= b.end, "restored block normalized");
+        }
+        // (4,8) clamps to (4,4) which collapses → dropped.
+        assert!(e.active().marked_block.is_none(), "collapsed block dropped");
+
+        // The KEY assertion: block ops do not panic in slice() with the restored state.
+        crate::blocks_marked::block_copy(&mut e, &TestClock(0));
+        crate::blocks_marked::block_delete(&mut e, &TestClock(0));
+
+        // And a genuinely out-of-range END that does NOT collapse is still clamped.
+        let mut e2 = Editor::new_from_text("abc\n", None, (80, 24));
+        let entry2 = StateEntry {
+            cursor: 0, scroll: 0, marks: Default::default(),
+            mtime: 10, size: 20, seq: 1, folds: vec![],
+            block: Some((1, 99)), // start in-range, end far past EOF
+        };
+        crate::app::load_block_from_entry(&mut e2, &entry2);
+        let b = e2.active().marked_block.expect("non-collapsing block restored");
+        assert!(b.end <= e2.active().document.buffer.len(), "end clamped to len");
+        // Must not panic:
+        crate::blocks_marked::block_copy(&mut e2, &TestClock(0));
+        crate::blocks_marked::block_delete(&mut e2, &TestClock(0));
     }
 
     #[test]
