@@ -107,9 +107,18 @@ impl ThreadExecutor {
             .spawn(move || {
                 // FIFO: process jobs in dispatch order. Exit when job_tx drops.
                 while let Ok(job) = job_rx.recv() {
-                    let result = (job.run)();
-                    if result_tx.send(result).is_err() { break; }
-                    let _ = wake.send(()); // nudge the loop to drain
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (job.run)())) {
+                        Ok(result) => {
+                            if result_tx.send(result).is_err() { break; }
+                            let _ = wake.send(()); // nudge the loop to drain
+                        }
+                        Err(_) => {
+                            // Job panicked; the worker survives and continues the loop.
+                            // The panic hook (term::install_panic_hook) is gated to the
+                            // main thread, so the live terminal is not disturbed.
+                            // Surfacing the panic as a user-visible status is deferred.
+                        }
+                    }
                 }
             })
             .expect("spawn jobs worker");
@@ -217,6 +226,59 @@ mod tests {
         let r_missing = JobResult { buffer_id: BufferId(999), class: ResultClass::Durability,
             version: 1, kind: JobKind::Save, merge: Box::new(|_| {}) };
         assert!(!is_stale(&r_missing, &e));
+    }
+
+    /// Verify that a job panic does not kill the worker thread.
+    ///
+    /// Dispatches a job whose closure panics, then a second normal job.  The
+    /// second job signals via a channel; if the worker died after the first job
+    /// the channel would never be satisfied and the test would time-out/fail.
+    ///
+    /// Note: the default panic hook prints "panicked at …" to stderr even when
+    /// `catch_unwind` catches the panic.  Suppressing it via `set_hook`/
+    /// `take_hook` would race with other tests running concurrently in the same
+    /// process (hooks are process-global), so we accept the stderr noise.
+    #[test]
+    fn worker_survives_panicking_job_and_runs_next_job() {
+        use std::sync::mpsc;
+        let (wake_tx, _wake_rx) = mpsc::channel::<()>();
+        let ex = ThreadExecutor::new(wake_tx);
+
+        // First job: panics immediately.
+        ex.dispatch(Job {
+            buffer_id: BufferId(0),
+            class: ResultClass::Durability,
+            version: 1,
+            kind: JobKind::Save,
+            run: Box::new(|| panic!("deliberate test panic — worker must survive")),
+        });
+
+        // Second job: signals completion and returns a result.
+        let (done_tx, done_rx) = mpsc::channel::<u64>();
+        ex.dispatch(Job {
+            buffer_id: BufferId(0),
+            class: ResultClass::Durability,
+            version: 2,
+            kind: JobKind::Save,
+            run: Box::new(move || {
+                done_tx.send(2).unwrap();
+                JobResult {
+                    buffer_id: BufferId(0),
+                    class: ResultClass::Durability,
+                    version: 2,
+                    kind: JobKind::Save,
+                    merge: Box::new(|_| {}),
+                }
+            }),
+        });
+
+        // Block until the second job's closure fires — proves the worker survived.
+        assert_eq!(done_rx.recv().unwrap(), 2, "worker must survive a panicking job");
+
+        // The result channel must also deliver the second job's result.
+        let mut results = Vec::new();
+        while results.is_empty() { results = ex.drain(); }
+        assert_eq!(results[0].version, 2, "post-panic job result must be drainable");
     }
 
     #[test]

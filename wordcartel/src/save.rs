@@ -15,12 +15,28 @@ use crate::registry::Ctx;
 pub struct FileFingerprint {
     pub mtime: Option<SystemTime>,
     pub size: u64,
+    /// FNV-style content discriminator: catches same-size/same-mtime edits that
+    /// would otherwise produce an identical (mtime, size) fingerprint on
+    /// filesystems with coarse mtime granularity (ext3, FAT, HFS+, etc.).
+    pub hash: u64,
 }
 
 /// Fingerprint a path, or `None` if it does not exist / cannot be stat'd.
+///
+/// Reads the full file so the hash and size come from the same data (no
+/// TOCTOU between stat and read). Called on user-initiated save/load only —
+/// not the per-keystroke hot path — so the full read is acceptable for the
+/// ~5 MB document budget.
 pub fn fingerprint(path: &Path) -> Option<FileFingerprint> {
+    let bytes = std::fs::read(path).ok()?;
     let meta = std::fs::metadata(path).ok()?;
-    Some(FileFingerprint { mtime: meta.modified().ok(), size: meta.len() })
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hasher::write(&mut h, &bytes);
+    Some(FileFingerprint {
+        mtime: meta.modified().ok(),
+        size: bytes.len() as u64,
+        hash: std::hash::Hasher::finish(&h),
+    })
 }
 
 /// Whether a save job writes the document's own path (Normal) or re-keys the
@@ -617,5 +633,59 @@ mod tests {
         let head = ed.active().document.selection.primary().head;
         let b = ed.active();
         assert_eq!(crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, head), head);
+    }
+
+    // -----------------------------------------------------------------------
+    // BUG-2 regression: content discriminator (hash) catches same-size/same-mtime edits
+    // -----------------------------------------------------------------------
+
+    /// Regression for BUG-2: a same-byte-count external edit that lands within the
+    /// same mtime tick must still be detected as a change.  The hash field in
+    /// `FileFingerprint` provides the content discriminator that (mtime, size) alone
+    /// cannot.
+    #[test]
+    fn fingerprint_detects_same_size_different_content() {
+        let p = scratch();
+        std::fs::write(&p, b"aaaa").unwrap();
+        let fp_a = fingerprint(&p).expect("fingerprint of 'aaaa' file");
+
+        // Overwrite with same-length content — no sleep, so mtime may be identical.
+        std::fs::write(&p, b"bbbb").unwrap();
+        let fp_b = fingerprint(&p).expect("fingerprint of 'bbbb' file");
+
+        // Size is the same (4 bytes); the hash must differ so the fingerprints are !=.
+        assert_eq!(fp_a.size, fp_b.size, "sizes must match for this to be a meaningful test");
+        assert_ne!(fp_a.hash, fp_b.hash, "hash must differ for different content");
+        assert_ne!(fp_a, fp_b,
+            "FileFingerprint must detect same-size/same-mtime external content change (BUG-2)");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// BUG-2 integration: dispatch_save must raise the external-mod modal when an
+    /// external process rewrites the file with same-length content (no mtime change
+    /// guaranteed).  Without the hash field this would silently overwrite the edit.
+    #[test]
+    fn dispatch_save_raises_modal_on_same_size_external_change() {
+        let p = scratch();
+        // Write exactly 4-byte initial content.
+        std::fs::write(&p, b"aaaa").unwrap();
+        let mut e = Editor::new_from_text("mine\n", Some(p.clone()), (80, 24));
+        // stored_fp is now fingerprint of "aaaa".  Simulate a same-size external edit
+        // (no sleep — we deliberately do NOT wait for a new mtime tick).
+        std::fs::write(&p, b"bbbb").unwrap();
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = None;
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        {
+            let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() };
+            dispatch_save(&mut ctx);
+        }
+        assert!(e.prompt.is_some(),
+            "same-size external content change must raise the external-mod modal (BUG-2)");
+        assert!(ex.drain().is_empty(),
+            "no save job must be dispatched when same-size external change is detected");
+        let _ = std::fs::remove_file(&p);
     }
 }
