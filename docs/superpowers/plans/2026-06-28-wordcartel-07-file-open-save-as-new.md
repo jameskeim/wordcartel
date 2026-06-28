@@ -314,7 +314,7 @@ In `app.rs::apply_result`, replace the `quit_after_save` block with the generali
 ```
 Generalize the save-quit **timeout** (app.rs ~1558, the `quit_after_save_at`/`SAVE_QUIT_TIMEOUT_MS` block) to read/clear `editor.pending_after_save` (`p.at_ms`). Update the existing tests that reference `quit_after_save`/`quit_after_save_at` (app.rs ~2168) to the new field.
 
-- [ ] **Step 4: Run** `cargo test -p wordcartel save_and_quit` + `cargo test -p wordcartel --lib` — green (the unnamed-no-arm test still passes; the timeout test still passes).
+- [ ] **Step 4: Run** `cargo test -p wordcartel save_and_quit` + `cargo test -p wordcartel --lib` — green. The existing unnamed save-and-quit test still passes: it asserts **no `pending_after_save` arm** (which holds — the unnamed path sets `pending_save_as` instead, a different field, and now also opens the Save-As minibuffer; update the test's expectation only if it asserted the *absence* of a minibuffer). The timeout test still passes.
 
 - [ ] **Step 5: Commit** `feat(7): generalize quit_after_save → pending_after_save (PostSaveAction)`
 
@@ -591,7 +591,7 @@ resolve_prompt arms (the dirty-guard choices):
         if let Some(action) = editor.pending_save_as.take() { perform_post_save_action(editor, action, ex, clock, msg_tx); }
     }
     PromptAction::SaveAndProceed => {
-        editor.prompt = None;
+        editor.prompt = None; // dismiss the dirty-guard modal first
         // Unified: dispatch_save_then handles NAMED (save+arm pending_after_save) AND UNNAMED
         // (opens Save-As, re-carrying the action in pending_save_as). Take the intent first so
         // the named path doesn't leave a stale pending_save_as (Codex re-review).
@@ -599,9 +599,12 @@ resolve_prompt arms (the dirty-guard choices):
             let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
             crate::save::dispatch_save_then(&mut ctx, action);
         }
+        return; // MUST return — dispatch_save_then may have opened an external-mod (named) or
+                // Save-As (unnamed) overlay; the trailing resolve_prompt prompt-clear would wipe
+                // it otherwise (mirrors the SaveAndQuit arm's return — Codex re-review).
     }
 ```
-> No overlapping borrow: `dispatch_save_then` captures path/version internally and owns arming. For the unnamed case it re-sets `pending_save_as` (so the eventual Save-As fires the action); for the named case `pending_save_as` stays cleared (taken here). The carrier is also cleared on the dirty-guard **Cancel** arm.
+> No overlapping borrow: `dispatch_save_then` captures path/version internally and owns arming. For the unnamed case it re-sets `pending_save_as` (so the eventual Save-As fires the action); for the named case `pending_save_as` stays cleared (taken here). The carrier is also cleared on the dirty-guard **Cancel** arm. The `return` matches `PromptAction::SaveAndQuit`'s control flow (app.rs:296).
 > `open_into_current` already exists (Task 1), so the `Open` arm compiles; it is *triggered* in Task 5 (this task triggers only `New`). Register `new` (File) → `|c| { crate::app::request_new(c.editor, c.executor, c.clock, &c.msg_tx); CommandResult::Handled }`; cua bind `("ctrl-n", "new")`.
 
 - [ ] **Step 4: Run** `cargo test -p wordcartel new_on_` + an integration test that resolves Discard→scratch and Cancel→untouched + `cargo test -p wordcartel --lib` — green.
