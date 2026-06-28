@@ -36,12 +36,22 @@ pub struct MarkedBlock { pub start: usize, pub end: usize, pub hidden: bool } //
 ```
 - **Edit-tracking is free:** add `marked_block.{start,end}` and `pending_block_begin` to the
   existing `Buffer::apply` loop that maps `marks`/`jump_ring` through `change::map_pos`
-  (editor.rs:162). Both endpoints map via `map_pos` (same as `Selection::anchor`/`head`), so
-  the block: **moves** on an external insert/delete, **grows** on an insert inside it,
-  **shrinks** on a delete inside it.
+  (editor.rs:162). **Boundary semantics (Codex):** map `start` via **`map_pos`** and `end`
+  via **`map_pos_before`** — so an insert exactly at a boundary stays *outside* the block
+  (insert-at-start lands before the new start; insert-at-end lands after the unchanged end),
+  giving a clean half-open `[start, end)` that **grows only on a strictly-interior insert**
+  and shrinks on an interior delete; the block **moves** on an external insert/delete.
 - **Collapse → clear:** after mapping, if `start == end` (the region was fully deleted) →
   `marked_block = None`. A half-set `pending_block_begin` that maps onto a deletion just
   tracks; it is dropped on completion/replacement.
+- **Undo/redo (Codex correction):** `Editor::undo`/`redo` call `history.undo(&mut buffer)`
+  **directly — they bypass `apply`**, so they do NOT map `marks`/`jump_ring`/the block through
+  the inverse changeset. To avoid acting on **stale** byte offsets (a block whose endpoints no
+  longer match the reverted text could copy/move the wrong bytes), **undo and redo CLEAR the
+  marked block + `pending_block_begin`**. (Conservative, safe v1 choice — a future refinement
+  could map the block through the inverse changeset instead. This is stricter than `marks`,
+  which today go stale on undo; the block clears because *acting* on a stale block is more
+  damaging than a stale jump.)
 
 ---
 
@@ -82,18 +92,21 @@ through `editor.apply` (one undo step each):
   acts; only its highlight is suppressed (§7).
 - **clear-block** (`block_clear`): `marked_block = None`, `pending_block_begin = None`.
 
-**Move ordering note:** `block_move` must construct the ChangeSet so the insert and delete
-offsets are mutually consistent (the classic "delete original then insert at adjusted target",
-or one composed ChangeSet over the original document). The plan specifies the exact
-construction; the contract is: the block text ends up at the caret, the original is gone, and
-it is **one** undo step.
+**Move ordering note (Codex — feasible via the existing API):** `block_move` reuses
+`commands::build_multi_replace(edits, doc_len)`, which already composes **ascending,
+non-overlapping** replacements into one `ChangeSet` + one `block_tree::Edit` (one undo step).
+- caret **before** the block: edits `[(caret, caret, text), (start, end, "")]`; resulting
+  caret = `caret + text.len()`.
+- caret **at/after** `end`: edits `[(start, end, ""), (caret, caret, text)]`; resulting caret
+  = `caret` (the deletion shifts the later insert into place).
+- caret **inside** `[start, end)` → no-op + status (would overlap the edits anyway).
+The contract: the block text ends up at the caret, the original is gone, the caret lands at
+the **end of the moved text**, and it is **one** undo step.
 
-**Undo interaction (consistency, not a bug):** the `marked_block` is *editor state*, not part
-of the undo transaction — exactly like `marks` and the live `Selection`. `apply` (including an
-undo, which is itself an `apply` of the inverse changeset) **maps** the block endpoints via
-`map_pos` but does **not** restore a block that was *cleared*. So `^KY` (or an edit that
-collapses the block) followed by **undo** brings the text back but **not** the block. This
-matches the existing marks/selection behavior; it is documented, not special-cased.
+**Undo interaction:** see §2 — `undo`/`redo` bypass `apply` and therefore **clear** the marked
+block (they can't map it through the inverse changeset, and acting on stale offsets is unsafe).
+So `^KY` then **undo** restores the text but leaves **no** block (you'd re-mark). `^KC` then
+undo removes the inserted copy and clears the block.
 
 **No system-clipboard sync (deliberate):** `^KC`/`^KV` are the block's **own** channel — they
 insert directly at the caret and do **not** populate the OS clipboard / OSC-52 register. A
@@ -106,10 +119,13 @@ choice, stated so it is not read as an omission.)
 
 `block_write` reuses Effort 7's Save-As minibuffer infrastructure:
 - A **`MinibufferKind::WriteBlock`** prompt ("Write block to: ", pre-filled with the doc's
-  dir / cwd) → resolve path (`~`/relative expansion, as Save-As) → if the target exists, an
-  **overwrite confirm** (a new `PromptAction::OverwriteWriteBlock` + `pending_write_block:
+  dir / cwd) → resolve path (`~`/relative expansion) → if the target exists, an **overwrite
+  confirm** (a new `PromptAction::OverwriteWriteBlock` + `pending_write_block:
   Option<PathBuf>`, mirroring `OverwriteSaveAs`/`pending_save_overwrite`) → `file::save_atomic`
   of the **block text** (`slice(start..end)`).
+- **Factor the path expansion (Codex):** Effort 7's `save_as_submit` expands `~`/relative
+  inline; extract that into a shared `expand_path(text) -> PathBuf` helper that both Save-As
+  and `block_write` call (no duplication).
 - **No** document `path`/`stored_fp`/`saved_version` change and **no swap re-key** — this
   writes a *separate* file; the current document is untouched. The block **stays**.
 - Status "wrote block to {path}" / on error the `save_atomic` error string.
@@ -124,8 +140,11 @@ cursor/marks/folds:
 - `StateEntry` gains `#[serde(default)] block: Option<(usize, usize)>` (serde-defaulted so
   pre-9A `session.toml` loads). Only a **complete** `marked_block` is persisted (start, end);
   the half-set `pending_block_begin` is **not** persisted.
-- **Persist:** wherever the session entry is built on save/exit (alongside cursor/marks/folds),
-  record `block = marked_block.map(|b| (b.start, b.end))`.
+- **Persist:** the `StateEntry` is built in **`app.rs::persist_session`** (called after save
+  completion and on exit) — record `block = marked_block.map(|b| (b.start, b.end))` there,
+  alongside cursor/marks/folds. **Compile churn (Codex):** several tests build `StateEntry { …
+  }` literals; adding the field requires `block: None` in each (or `..Default::default()`),
+  exactly as the `folds` field addition did.
 - **Restore** (in `restore_resume`): if the staleness guard passes and `entry.block` is set →
   `marked_block = Some({start, end, hidden:false})` (**`hidden` resets to visible on reload**).
   If the file changed on disk (guard fails) → the whole entry (incl. block) is discarded — we
@@ -143,24 +162,35 @@ cursor/marks/folds:
   constructor that builds faces (the 13 builtins, `from_base16`, `face`/`face_mut`,
   `element_from_key`, the a11y/coverage test lists) gains a `MarkedBlock` default — **distinct
   from `Selection`**.
-- **Monochrome-safe (§13.2):** `Selection` is **reverse**; `MarkedBlock` is **reverse +
-  italic**. This must be **pairwise-distinct** from every other cued element under the
-  theming a11y proof — notably `Selection` (reverse alone), the search faces, and the
-  diagnostics (which already use **underline**-based modifiers: spelling = bold+underline,
-  grammar = italic+underline). `reverse + italic` is distinct from all of these. In color:
-  a tinted background **plus** the `reverse + italic` modifiers (so the cue survives at
-  `Depth::None`). `MarkedBlock` MUST be added to the a11y pairwise-distinct test set.
+- **Monochrome-safe (§13.2) — `reverse + bold + underline` (Codex-corrected):** the block's
+  mono modifier MUST be **pairwise-distinct** from every other cued element under the theming
+  a11y proof. The real `mono_faces()` already occupies the **entire** 2-modifier space of the
+  prominent attributes: `selection = reverse+underline`, `front_matter = reverse+italic`,
+  `search_current = bold+reverse`, `diag_spelling = bold+underline`, `diag_grammar =
+  italic+underline`, `strong_emphasis = bold+italic` (and the singles: emphasis=italic,
+  strong/heading=bold, link=underline, code/search_match=reverse). So no 2-modifier combo of
+  {bold,italic,underline,reverse} is free. **`MarkedBlock` therefore uses the 3-modifier
+  `reverse + bold + underline`** — a strong, block-like highlight, distinct from `selection`
+  (reverse+underline, no bold), `search_current` (bold+reverse, no underline), and
+  `diag_spelling` (bold+underline, no reverse). In color: a tinted background **plus** these
+  modifiers (so the cue survives at `Depth::None`). `MarkedBlock` MUST be added to the a11y
+  pairwise-distinct test set, which will confirm the choice.
 - **Render layering:** the block paints as a **backdrop below** Selection/Search/Diag (active
   things win where they overlap), via the same placed-path compose layering the theming work
-  established (base → MarkedBlock → Selection → Search → Diag). `hidden == true` → not painted.
-  Overlap is normally absent (the block is elsewhere from the caret/selection; promote clears
-  the selection).
+  established (base → MarkedBlock → Selection → Search → Diag). **Forces the placed path
+  (Codex):** like a visible selection, a row that intersects a non-hidden block must set
+  `use_placed` so the per-cell faces are composed. `hidden == true` → not painted. **Folds
+  (Codex):** a block spanning folded text is only partially visible — paint only the visible
+  cells (must not panic on hidden lines); `^QB`/`^QK` unfold to the target. Overlap with the
+  selection is normally absent (promote clears the selection).
 - **Status-bar presence indicator.** A marked block can be entirely **off-screen**, with no
   on-screen signal that one is armed. So when `marked_block` is set, the status line shows a
-  small **`BLK`** segment (themed via `SemanticElement::Chrome`, like the other status
-  segments), riding the existing status-line assembly (`render.rs`, alongside `Ln, Col` /
-  word-count). When the block is **hidden** (`^KH`), the indicator reads **`BLK·hidden`** (the
-  block still exists and acts — the indicator is how you know). No block → no segment.
+  small **`BLK`** segment (themed via `SemanticElement::Chrome`). **It must NOT be gated on the
+  word-count toggle (Codex):** `Ln, Col` and word-count ride the optional *right* segment
+  (`word_count_segment` → `Some`), which a user can disable. The `BLK` indicator must always
+  show when a block exists, so it lives in the **left** status text (path · dirty · mode · …)
+  or a dedicated builder independent of word-count. When the block is **hidden** (`^KH`), it
+  reads **`BLK·hidden`** (the block still exists and acts). No block → no segment.
 
 ---
 
@@ -194,7 +224,7 @@ cursor/marks/folds:
 | `wordcartel/src/render.rs` | paint `MarkedBlock` (placed path, below Selection; skip when hidden); add the **`BLK`/`BLK·hidden`** status-line segment when a block is set |
 | `wordcartel/src/state.rs` | `StateEntry.block: Option<(usize,usize)>` (serde default) |
 | `wordcartel/src/app.rs` (`restore_resume`) | restore `marked_block` from `entry.block` (staleness-guarded; hidden=false) |
-| `wordcartel-core/src/theme.rs` | `SemanticElement::MarkedBlock` + `ThemeFaces.marked_block` + defaults across the 13 builtins / `from_base16` / `face`/`element_from_key` / a11y test lists |
+| `wordcartel-core/src/theme.rs` | `SemanticElement::MarkedBlock` + `ThemeFaces.marked_block`; wire it through **every** touchpoint (Codex-enumerated): `face()`, `face_mut()`, `default()`, `tokyo_night()`, `from_base16()`, **`mono_faces()` = `reverse+bold+underline`**, `phosphor`/HSL builtins, `element_from_key()`, `ALL_ELEMENTS`, and the a11y pairwise-distinct test list |
 
 ---
 
@@ -214,8 +244,9 @@ cursor/marks/folds:
   range + clears; `block_jump_begin/end` move the caret + record a jump-back + unfold a folded
   target; `block_toggle_hidden` flips the flag; `block_clear` clears; every op with **no
   block** → "no marked block".
-- **undo interaction:** `block_delete` then **undo** restores the text but **not** the block
-  (the block is editor state, not in the undo transaction — matches marks/selection).
+- **undo interaction:** `block_delete` then **undo** restores the text and leaves **no** block
+  (undo/redo bypass `apply` → the block is cleared, not mapped); a block set, then an
+  unrelated `undo`, is also cleared (the conservative safe behavior).
 - **`^KW`:** writes the block text to a new path (`file::open` reads it back); existing target
   → `OverwriteWriteBlock` confirm; the **document is unchanged** (path/saved_version/swap
   untouched); block stays.
@@ -229,8 +260,10 @@ cursor/marks/folds:
 - **status indicator:** with a block set, the status line shows **`BLK`**; with `hidden` set,
   **`BLK·hidden`**; no block → no segment.
 - **keymap:** WORDSTAR `^KB`/`^KK`/`^KC`/`^KV`/`^KY`/`^KW`/`^KH`/`^QB`/`^QK` resolve to the
-  `block_*` ids (both prefix forms); `^KC`/`^KV` no longer resolve to copy/paste; CUA `alt-b`
-  → promote; `both_presets_resolve_against_builtins` + the collision/prefix-shadow test pass.
+  `block_*` ids (both prefix forms); `^KC`/`^KV` **no longer resolve to copy/paste** (update
+  the 9B `wordstar_new_chords_resolve` assertions that expect `^KC`/`^KV`); CUA `alt-b` →
+  `mark_block_from_selection`; the `block_*` ids must be **registered** so
+  `both_presets_resolve_against_builtins` + the collision/prefix-shadow test still pass.
 
 ---
 
