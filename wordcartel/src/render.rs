@@ -617,7 +617,10 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         // flush the count segment to the right and truncate the left (path/mode) to fit.
         let has_overlay = editor.search.is_some() || editor.minibuffer.is_some() || editor.prompt.is_some() || editor.diag.is_some() || editor.outline.is_some();
         let composed = if !has_overlay {
-            if let Some(right) = word_count_segment(editor) {
+            if let Some(wc) = word_count_segment(editor) {
+                let caret = crate::nav::head(editor);
+                let (l, c) = editor.active().document.buffer.caret_line_col(caret);
+                let right = format!("Ln {l}, Col {c} · {wc}");
                 let reserve = right.chars().count() + 1;
                 let left: String = status_text.chars().take((w as usize).saturating_sub(reserve)).collect();
                 let pad = (w as usize).saturating_sub(left.chars().count() + right.chars().count());
@@ -2031,6 +2034,52 @@ mod tests {
              expected LightGreen, got {:?}",
             cell_bg
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Effort 8 Task 4: Ln,Col cursor-position status indicator
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn status_shows_ln_col_when_word_count_on() {
+        // "hello\nworld\n": byte 8 = 'r' in "world" → line 2, col 3 ("wo|rld")
+        // Line 2 starts at byte 6; bytes 6='w', 7='o' → 2 graphemes before caret → col 3
+        let mut e = Editor::new_from_text("hello\nworld\n", None, (60, 6));
+        e.view_opts.word_count = true;
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(8);
+        crate::derive::rebuild(&mut e);
+        let buf = render_to_buffer(&mut e, 60, 6);
+        let status = row_string(&buf, 5); // bottom row (h-1)
+        assert!(status.contains("Ln 2, Col 3"), "got: {status}");
+        assert!(status.contains("words"), "still shows the count: {status}");
+    }
+
+    #[test]
+    fn status_hides_ln_col_when_word_count_off() {
+        let mut e = Editor::new_from_text("hello\n", None, (60, 6));
+        e.view_opts.word_count = false;
+        crate::derive::rebuild(&mut e);
+        let status = row_string(&render_to_buffer(&mut e, 60, 6), 5);
+        assert!(!status.contains("Ln "), "position rides word-count; off → hidden: {status}");
+    }
+
+    #[test]
+    fn ln_col_is_view_independent() {
+        // "# Heading\n\n**bold** text\n": byte 14 = 'o' in "bold"
+        // Line 3 ("**bold** text\n") starts at byte 11; bytes 11='*', 12='*', 13='b' → 3 graphemes
+        // before caret → col 4.  Ln,Col must be identical in LivePreview and SourcePlain.
+        let mk = |mode| {
+            let mut e = Editor::new_from_text("# Heading\n\n**bold** text\n", None, (60, 8));
+            e.view_opts.word_count = true;
+            e.active_mut().view.mode = mode;
+            e.active_mut().document.selection = wordcartel_core::selection::Selection::single(14);
+            crate::derive::rebuild(&mut e);
+            row_string(&render_to_buffer(&mut e, 60, 8), 7)
+        };
+        let live = mk(crate::editor::RenderMode::LivePreview);
+        let src  = mk(crate::editor::RenderMode::SourcePlain);
+        let pick = |s: &str| s.split_once("Ln ").map(|(_, r)| format!("Ln {}", r.split(" ·").next().unwrap_or(r))).unwrap_or_default();
+        assert_eq!(pick(&live), pick(&src), "Ln,Col identical across views\nlive: {live}\nsrc:  {src}");
     }
 
     /// FIX-3: Overlay frames must use the Chrome face (not terminal-default).
