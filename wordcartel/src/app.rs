@@ -336,7 +336,7 @@ pub fn open_save_as(editor: &mut crate::editor::Editor) {
     let pre = editor.active().document.path.as_ref()
         .and_then(|p| p.parent()).map(|d| format!("{}/", d.display())).unwrap_or_default();
     editor.open_minibuffer("Save as: ", crate::minibuffer::MinibufferKind::SaveAs);
-    if let Some(mb) = editor.minibuffer.as_mut() { mb.text = pre.clone(); mb.cursor = pre.len(); }
+    if let Some(mb) = editor.minibuffer.as_mut() { mb.cursor = pre.len(); mb.text = pre; }
 }
 
 /// Submit the Save-As minibuffer line: expand the path, raise an overwrite
@@ -379,11 +379,12 @@ fn perform_save_as(editor: &mut crate::editor::Editor, target: std::path::PathBu
 fn perform_post_save_action(
     editor: &mut Editor,
     action: crate::editor::PostSaveAction,
-    ex: &dyn Executor,
-    clock: &dyn Clock,
-    msg_tx: &std::sync::mpsc::Sender<Msg>,
+    // Unused: New/Open/Quit are editor-only (Open routes through open_into_current, no async).
+    // Kept for call-site signature uniformity with the save-then-action paths.
+    _ex: &dyn Executor,
+    _clock: &dyn Clock,
+    _msg_tx: &std::sync::mpsc::Sender<Msg>,
 ) {
-    let _ = (ex, clock, msg_tx); // Open(p) uses ex/clock/msg_tx only via open_into_current (no async needed)
     match action {
         crate::editor::PostSaveAction::New => {
             editor.replace_active_with_scratch();

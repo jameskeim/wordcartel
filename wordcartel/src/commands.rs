@@ -507,7 +507,7 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             let path_opt = editor.active().document.path.clone();
             match path_opt {
                 None => {
-                    editor.status = "No file name (save-as is Effort 5)".to_string();
+                    editor.status = "No file name — use Save As".to_string();
                 }
                 Some(path) => {
                     let v = editor.active().document.version;

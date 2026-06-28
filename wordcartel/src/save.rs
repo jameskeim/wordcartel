@@ -165,7 +165,7 @@ pub(crate) fn dispatch_save_and_quit(ctx: &mut crate::registry::Ctx) {
 /// Save bypassing the fingerprint conflict (the [O]verwrite modal action).
 pub fn overwrite_save(ctx: &mut Ctx) {
     if ctx.editor.active().document.path.is_none() {
-        ctx.editor.status = "No file name (save-as is Effort 5)".to_string();
+        ctx.editor.status = "No file name — use Save As".to_string();
         return;
     }
     do_save(ctx); // no stat check
