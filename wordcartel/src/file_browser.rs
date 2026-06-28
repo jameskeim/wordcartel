@@ -74,6 +74,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // Advisory #2 regression: Enter on an unreadable directory must keep fb.dir unchanged
+    // and set a status — the browser must NOT descend into an unreadable dir.
+    #[test]
+    #[cfg(unix)]
+    fn enter_on_unreadable_dir_stays_put_and_sets_status() {
+        use crate::editor::Editor;
+        use crate::app::Msg;
+        use crate::registry::Registry;
+        use crate::jobs::InlineExecutor;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = std::env::temp_dir().join(format!("wc-fb-unreadable-{}", std::process::id()));
+        let secret = parent.join("secret");
+        std::fs::create_dir_all(&secret).unwrap();
+        // chmod 000: read_dir will fail
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut e = Editor::new_from_text("x\n", None, (40, 12));
+        e.open_file_browser(parent.clone());
+        // Rebuild entries so "secret" appears in the list.
+        if let Some(fb) = e.file_browser.as_mut() { rebuild_entries(fb); }
+        // Select the "secret" entry (skip ".." which is index 0).
+        if let Some(fb) = e.file_browser.as_mut() {
+            let idx = fb.entries.iter().position(|en| en.name == "secret").expect("secret dir in entries");
+            fb.selected = idx;
+        }
+
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let reg = Registry::builtins();
+        let km = {
+            let (t, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+            t
+        };
+        let ex = InlineExecutor::default();
+        struct LocalClock;
+        impl wordcartel_core::history::Clock for LocalClock { fn now_ms(&self) -> u64 { 0 } }
+        let clk = LocalClock;
+        let enter = Event::Key(KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &km, &ex, &clk, &tx);
+
+        // Dir must NOT have changed — still at parent.
+        let fb_dir = e.file_browser.as_ref().map(|fb| fb.dir.clone());
+        assert_eq!(fb_dir.as_deref(), Some(parent.as_path()),
+            "fb.dir must remain at parent after Enter on unreadable dir, got: {:?}", fb_dir);
+        // Status must mention the unreadable directory.
+        assert!(e.status.contains("cannot read directory"),
+            "status must mention 'cannot read directory', got: {:?}", e.status);
+
+        // Restore permissions so cleanup can remove the dir.
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
     #[test]
     fn open_file_browser_enforces_xor() {
         let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 12));

@@ -144,17 +144,21 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
                         editor.replace_active_with_scratch();
                         crate::derive::rebuild(editor);
                         crate::nav::ensure_visible(editor);
-                    } else {
+                    } else if saved_this {
+                        // Save succeeded but user edited during flight — abandon New.
                         editor.status = "edited during save — New cancelled".to_string();
                     }
+                    // else: save failed → merge's error status is already set; don't overwrite it.
                 }
                 crate::editor::PostSaveAction::Open(path) => {
                     editor.pending_after_save = None;
                     if still_clean {
                         crate::app::open_into_current(editor, &path);
-                    } else {
+                    } else if saved_this {
+                        // Save succeeded but user edited during flight — abandon Open.
                         editor.status = "edited during save — Open cancelled".to_string();
                     }
+                    // else: save failed → merge's error status is already set; don't overwrite it.
                 }
             }
         }
@@ -1170,16 +1174,27 @@ pub fn reduce(
                         });
                         if let Some((name, is_dir)) = chosen {
                             if is_dir {
-                                if let Some(fb) = editor.file_browser.as_mut() {
-                                    let new_dir = if name == ".." {
+                                // Compute the target directory without mutating fb yet.
+                                let target = editor.file_browser.as_ref().map(|fb| {
+                                    if name == ".." {
                                         fb.dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| fb.dir.clone())
                                     } else {
                                         fb.dir.join(&name)
-                                    };
-                                    fb.dir = new_dir;
-                                    fb.query.clear();
-                                    fb.selected = 0;
-                                    crate::file_browser::rebuild_entries(fb);
+                                    }
+                                });
+                                if let Some(target) = target {
+                                    // §3: check readability BEFORE committing fb.dir.
+                                    if std::fs::read_dir(&target).is_ok() {
+                                        if let Some(fb) = editor.file_browser.as_mut() {
+                                            fb.dir = target;
+                                            fb.query.clear();
+                                            fb.selected = 0;
+                                            crate::file_browser::rebuild_entries(fb);
+                                        }
+                                    } else {
+                                        editor.status = format!("cannot read directory: {}", target.display());
+                                        // stay in prior dir — do NOT mutate fb.dir
+                                    }
                                 }
                             } else {
                                 let path = editor.file_browser.as_ref().unwrap().dir.join(&name);
@@ -2708,6 +2723,56 @@ mod tests {
         assert!(e.pending_after_save.is_none());
         let _ = std::fs::remove_file(&target);
         let _ = std::fs::remove_file(&named);
+    }
+
+    // Advisory #1 regression: a FAILED save (merge does not update saved_version and sets
+    // an error status) must NOT overwrite the error status with "Open cancelled".
+    // saved_this=false → else-if branch skipped → merge's error status preserved.
+    #[test]
+    fn apply_result_save_failure_preserves_error_status_for_open() {
+        use crate::editor::{Editor, PostSaveAction, PendingAfterSave};
+        use crate::jobs::{JobResult, JobKind, ResultClass};
+        let target = std::env::temp_dir().join(format!("wc-savefail-open-{}.md", std::process::id()));
+        std::fs::write(&target, "TARGET\n").unwrap();
+        let mut e = Editor::new_from_text("content\n", None, (80, 24));
+        let id = e.active().id;
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = None; // unsaved → dirty
+        // Arm pending Open at version 1.
+        e.pending_after_save = Some(PendingAfterSave {
+            buffer_id: id, version: 1, action: PostSaveAction::Open(target.clone()), at_ms: 0,
+        });
+        // Save FAILS: merge records an error status but does NOT update saved_version.
+        crate::app::apply_result(JobResult {
+            buffer_id: id, class: ResultClass::Durability, version: 1, kind: JobKind::Save,
+            merge: Box::new(|ed: &mut Editor| { ed.status = "save error: disk full".into(); }),
+        }, &mut e);
+        // Status must be the save error, NOT "edited during save — Open cancelled".
+        assert_eq!(e.status, "save error: disk full",
+            "save failure must not overwrite error status with 'Open cancelled', got: {}", e.status);
+        assert!(e.pending_after_save.is_none(), "pending_after_save cleared");
+        let _ = std::fs::remove_file(&target);
+    }
+
+    // Advisory #1 — New variant: same guarantee for the New arm.
+    #[test]
+    fn apply_result_save_failure_preserves_error_status_for_new() {
+        use crate::editor::{Editor, PostSaveAction, PendingAfterSave};
+        use crate::jobs::{JobResult, JobKind, ResultClass};
+        let mut e = Editor::new_from_text("content\n", None, (80, 24));
+        let id = e.active().id;
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = None; // unsaved → dirty
+        e.pending_after_save = Some(PendingAfterSave {
+            buffer_id: id, version: 1, action: PostSaveAction::New, at_ms: 0,
+        });
+        crate::app::apply_result(JobResult {
+            buffer_id: id, class: ResultClass::Durability, version: 1, kind: JobKind::Save,
+            merge: Box::new(|ed: &mut Editor| { ed.status = "save error: disk full".into(); }),
+        }, &mut e);
+        assert_eq!(e.status, "save error: disk full",
+            "save failure must not overwrite error status with 'New cancelled', got: {}", e.status);
+        assert!(e.pending_after_save.is_none());
     }
 
     // Clean path for New: no edit during save → fresh scratch replaces the buffer.
