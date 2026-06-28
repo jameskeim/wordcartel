@@ -602,7 +602,7 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                 let l = buf.byte_to_line(head);
                 let line_end = if l + 1 < total { buf.line_to_byte(l + 1) } else { len };
                 // Keep the newline: stop before a trailing '\n' if present.
-                if line_end > head && line_end <= len && line_end > 0 && buf.slice(line_end - 1..line_end) == "\n" {
+                if line_end > head && line_end > 0 && buf.slice(line_end - 1..line_end) == "\n" {
                     line_end - 1
                 } else {
                     line_end
@@ -1512,6 +1512,7 @@ mod tests {
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(5); // in "bbb"
         run(Command::DeleteLine, &mut e, &TestClock(0));
         assert_eq!(e.active().document.buffer.to_string(), "aaa"); // preceding \n absorbed
+        assert_eq!(e.active().document.selection.primary().head, 3, "caret at end of remaining text");
     }
 
     #[test]
@@ -1521,6 +1522,7 @@ mod tests {
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(len); // phantom empty line
         run(Command::DeleteLine, &mut e, &TestClock(0));
         assert_eq!(e.active().document.buffer.to_string(), "aaa");
+        assert_eq!(e.active().document.selection.primary().head, 3, "caret at end after the empty line is removed");
     }
 
     #[test]

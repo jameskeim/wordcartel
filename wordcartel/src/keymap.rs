@@ -659,6 +659,7 @@ mod tests {
         assert!(matches!(cmd("ctrl-k m"), Resolution::Command(CommandId("set_mark"))));
         assert!(matches!(cmd("ctrl-k j"), Resolution::Command(CommandId("jump_to_mark"))));
         assert!(matches!(cmd("ctrl-k ctrl-m"), Resolution::None), "^KM ctrl-form reserved, not bound");
+        assert!(matches!(cmd("ctrl-k ctrl-j"), Resolution::None), "^KJ ctrl-form reserved, not bound");
     }
 
     #[test]

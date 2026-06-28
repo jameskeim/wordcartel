@@ -786,6 +786,8 @@ pub(crate) fn last_fully_visible_line(editor: &Editor) -> usize {
     let fv = fold_view(editor);
     let mut line = top;
     let mut used = 0usize;
+    // Defaults to `top`: under the editor's scroll invariants the top line's remaining
+    // rows always fit, so `top` is a safe floor even if the first line alone overflows.
     let mut last_full = top;
     let mut first = true;
     loop {
@@ -1511,7 +1513,8 @@ mod tests {
         assert!(e.active().view.scroll >= 1, "viewport advanced");
         // caret was on l0 (now above viewport) → nudged down to the new first visible line
         let caret_line = e.active().document.buffer.byte_to_line(e.active().document.selection.primary().head);
-        assert!(caret_line >= e.active().view.scroll, "caret stays within viewport");
+        assert!(caret_line >= e.active().view.scroll, "caret at/below new top");
+        assert!(caret_line <= crate::nav::last_fully_visible_line(&e), "caret at/above bottom — stays within viewport");
     }
 
     #[test]
