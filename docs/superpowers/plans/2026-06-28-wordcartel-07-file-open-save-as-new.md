@@ -4,7 +4,7 @@
 
 **Goal:** Let the editor open another file, save to a new name, and start a fresh document from within the app — closing the biggest completeness gap (today files load only via the launch CLI arg; unnamed buffers can't save).
 
-**Architecture:** All in the `wordcartel` shell. A buffer-extensible `Buffer::from_file(id,..)` seam (factored from `run()`); a `theme_picker`-style `file_browser` overlay (Open); a `MinibufferKind::SaveAs` prompt (Save-As); a `new` scratch command. The 9B `quit_after_save` mechanism is generalized to `pending_after_save { version, PostSaveAction::{Quit,Open,New} }` so "Save then proceed" works; the save merge closure does the SaveAs re-key. No `wordcartel-core` change. Spec: `docs/superpowers/specs/2026-06-28-wordcartel-07-file-open-save-as-new-design.md`.
+**Architecture:** All in the `wordcartel` shell. A buffer-extensible `Buffer::from_file(id,..)` seam (factored from `run()`); a `theme_picker`-style `file_browser` overlay (Open); a `MinibufferKind::SaveAs` prompt (Save-As); a `new` scratch command. The 9B `quit_after_save` mechanism is generalized to `pending_after_save { buffer_id, version, action: PostSaveAction::{Quit,Open,New}, at_ms }` so "Save then proceed" works; the save merge closure does the SaveAs re-key. No `wordcartel-core` change. Spec: `docs/superpowers/specs/2026-06-28-wordcartel-07-file-open-save-as-new-design.md`.
 
 **Tech Stack:** Rust, ratatui 0.30, crossterm, `std::fs`.
 
@@ -29,7 +29,8 @@
 | `wordcartel/src/minibuffer.rs` | `MinibufferKind::SaveAs` | 3 |
 | `wordcartel/src/prompt.rs` | `PromptAction::OverwriteSaveAs`; `Prompt::save_overwrite`/`dirty_guard` constructors | 3,4 |
 | `wordcartel/src/file_browser.rs` (new) | `FileBrowser` state + `rebuild_entries` (mirror `theme_picker.rs`) | 5 |
-| `wordcartel/src/app.rs` | post-save generalization; `save_as_submit`; dirty-guard helpers; `open_into_current`; `file_browser` key block/render/XOR; `apply_result` PostSaveAction; `run()` seam + `resume_enabled` seed | 1–5 |
+| `wordcartel/src/app.rs` | post-save generalization; `save_as_submit`; dirty-guard helpers; `open_into_current`; `file_browser` **key block** (in `reduce`) + XOR; `apply_result` PostSaveAction; `run()` seam + `resume_enabled` seed | 1–5 |
+| `wordcartel/src/render.rs` | `file_browser` **render** (overlay rendering lives here, not app.rs — render.rs:686/746/792) | 5 |
 | `wordcartel/src/registry.rs` | register `open`/`save_as`/`new`; clear `file_browser` in menu/`dispatch_overlay_command` | 3,4,5 |
 | `wordcartel/src/keymap.rs` | cua `ctrl-o`/`ctrl-shift-s`/`ctrl-n` | 3,4,5 |
 | `wordcartel/src/mouse.rs` | absorb mouse while `file_browser` open | 5 |
@@ -211,7 +212,7 @@ pub fn open_into_current(editor: &mut crate::editor::Editor, path: &std::path::P
 - Test: `wordcartel/src/app.rs` `#[cfg(test)]`
 
 **Interfaces:**
-- Produces: `pub enum PostSaveAction { Quit, Open(PathBuf), New }`; `pub struct PendingAfterSave { pub version: u64, pub action: PostSaveAction, pub at_ms: u64 }`; `Editor.pending_after_save: Option<PendingAfterSave>`.
+- Produces: `pub enum PostSaveAction { Quit, Open(PathBuf), New }`; `pub struct PendingAfterSave { pub buffer_id: BufferId, pub version: u64, pub action: PostSaveAction, pub at_ms: u64 }`; `Editor.pending_after_save: Option<PendingAfterSave>`; `save::dispatch_save_then(ctx, action)`.
 - Consumes: `apply_result`'s `(kind, version, buffer_id)`, `editor.by_id`, `SAVE_QUIT_TIMEOUT_MS`, `editor.replace_active_with_scratch` (added here), `app::open_into_current` (defined in Task 1).
 
 > **Scope note:** only the **`Quit`** arm is exercised by a caller in this task (the existing save-and-quit). The `New`/`Open` arms are defined now (they compile — `New` → `replace_active_with_scratch`, `Open(p)` → `open_into_current`, both already exist) and are *triggered* in Tasks 4/5. No stubs needed.
@@ -270,13 +271,24 @@ impl Editor {
 
 **Factor the arming into a general `dispatch_save_then` (Codex #4/#5).** In `save.rs`, replace `dispatch_save_and_quit`'s inline arming with a reusable form that goes through `dispatch_save` (so the **external-mod fingerprint check is NOT bypassed**) and arms only if a job was actually dispatched:
 ```rust
-/// Run `dispatch_save` (external-mod-checked), then arm `pending_after_save` with `action`
-/// IFF a save job was dispatched (named buffer, no modal raised).
+/// The unified "save, then do `action`" entry. Goes through `dispatch_save`
+/// (external-mod-checked). Handles all three buffer states (Codex re-review):
+/// - NAMED, no conflict → a save job is dispatched → arm `pending_after_save{action}`.
+/// - NAMED, external-mod conflict → `dispatch_save` raised the modal → do NOT arm
+///   (the user resolves the modal and re-issues).
+/// - UNNAMED → `dispatch_save` opened the Save-As minibuffer → carry the action in
+///   `pending_save_as` so it fires after the Save-As write completes.
 pub(crate) fn dispatch_save_then(ctx: &mut Ctx, action: crate::editor::PostSaveAction) {
+    let was_unnamed = ctx.editor.active().document.path.is_none();
     let buffer_id = ctx.editor.active().id;
     let v = ctx.editor.active().document.version;
     dispatch_save(ctx);
-    if ctx.editor.active().document.path.is_some() && ctx.editor.prompt.is_none() {
+    if was_unnamed {
+        // dispatch_save opened Save-As (MinibufferKind::SaveAs) for the no-path buffer.
+        if ctx.editor.minibuffer.as_ref().map(|m| m.kind) == Some(crate::minibuffer::MinibufferKind::SaveAs) {
+            ctx.editor.pending_save_as = Some(action);
+        }
+    } else if ctx.editor.active().document.path.is_some() && ctx.editor.prompt.is_none() {
         ctx.editor.pending_after_save = Some(crate::editor::PendingAfterSave {
             buffer_id, version: v, action, at_ms: ctx.clock.now_ms(),
         });
@@ -580,20 +592,16 @@ resolve_prompt arms (the dirty-guard choices):
     }
     PromptAction::SaveAndProceed => {
         editor.prompt = None;
-        if editor.active().document.path.is_some() {
-            // NAMED: go through dispatch_save_then so the external-mod fingerprint check is NOT
-            // bypassed (Codex). It arms pending_after_save{action} iff a job was dispatched
-            // (no external-mod modal raised). The carrier moves into the arm.
-            let action = editor.pending_save_as.take().unwrap_or(crate::editor::PostSaveAction::New);
+        // Unified: dispatch_save_then handles NAMED (save+arm pending_after_save) AND UNNAMED
+        // (opens Save-As, re-carrying the action in pending_save_as). Take the intent first so
+        // the named path doesn't leave a stale pending_save_as (Codex re-review).
+        if let Some(action) = editor.pending_save_as.take() {
             let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
             crate::save::dispatch_save_then(&mut ctx, action);
-        } else {
-            // UNNAMED: route into Save-As, carrying the intent in pending_save_as (already set).
-            open_save_as(editor);
         }
     }
 ```
-> No overlapping borrow: `dispatch_save_then` captures the path/version internally (Codex). If `dispatch_save` raised the external-mod modal (conflict), it did **not** arm — and `pending_save_as` was already taken; that's acceptable (the user resolves the modal, then re-issues). The carrier is cleared on the dirty-guard **Cancel** arm too.
+> No overlapping borrow: `dispatch_save_then` captures path/version internally and owns arming. For the unnamed case it re-sets `pending_save_as` (so the eventual Save-As fires the action); for the named case `pending_save_as` stays cleared (taken here). The carrier is also cleared on the dirty-guard **Cancel** arm.
 > `open_into_current` already exists (Task 1), so the `Open` arm compiles; it is *triggered* in Task 5 (this task triggers only `New`). Register `new` (File) → `|c| { crate::app::request_new(c.editor, c.executor, c.clock, &c.msg_tx); CommandResult::Handled }`; cua bind `("ctrl-n", "new")`.
 
 - [ ] **Step 4: Run** `cargo test -p wordcartel new_on_` + an integration test that resolves Discard→scratch and Cancel→untouched + `cargo test -p wordcartel --lib` — green.
@@ -608,7 +616,7 @@ resolve_prompt arms (the dirty-guard choices):
 - Create: `wordcartel/src/file_browser.rs`; Modify: `wordcartel/src/lib.rs` (`pub mod file_browser`)
 - Modify: `wordcartel/src/editor.rs` (`file_browser: Option<FileBrowser>` field + `open_file_browser` + `file_browser = None` in every other `open_*`)
 - Modify: `wordcartel/src/app.rs` (`file_browser` **key block** in `reduce`; Enter-on-file → `request_replace(Open(path))`)
-- Modify: `wordcartel/src/render.rs` (**file_browser render** alongside palette/outline/theme_picker at render.rs:686/746/792; add `file_browser` to the `has_overlay` check at render.rs:618 if chrome/status depends on an open overlay) — **Codex: rendering lives in render.rs, not app.rs**
+- Modify: `wordcartel/src/render.rs` (**file_browser render** alongside palette/outline/theme_picker at render.rs:686/746/792) — **Codex: rendering lives in render.rs, not app.rs.** **Decision:** do **NOT** add `file_browser` to `has_overlay` (render.rs:618) — `theme_picker` is likewise excluded and renders fine over the content; the status line under the overlay is harmless. (Match `theme_picker` exactly.)
 - Modify: `wordcartel/src/registry.rs` (`open` + `file_browser=None` in menu/`dispatch_overlay_command`), `keymap.rs` (cua `ctrl-o`), `mouse.rs` (absorb)
 - Test: `wordcartel/src/file_browser.rs` + `wordcartel/src/app.rs` `#[cfg(test)]`
 
@@ -695,7 +703,7 @@ pub fn rebuild_entries(fb: &mut FileBrowser) {
 }
 ```
 `lib.rs`: `pub mod file_browser;`. `editor.rs`: add `pub file_browser: Option<crate::file_browser::FileBrowser>,` (init None) + `open_file_browser(dir)` (mirror `open_theme_picker`: clear all other overlays incl `file_browser`, then set it with `rebuild_entries`), and add `self.file_browser = None;` to EVERY other `open_*` helper (open_minibuffer/open_prompt/open_palette/open_menu/open_search/open_diag/open_outline/open_theme_picker).
-Add the `file_browser` **key block** in `app.rs` (mirror the `theme_picker` block ~870): printable→`query`+`rebuild_entries`; Backspace→pop+rebuild; Up/Down→`selected`; Enter→ if `entries[selected].is_dir` set `dir` (join `..`→parent / name→child), clear query, rebuild, selected=0 — else `let path = fb.dir.join(name); editor.file_browser=None; request_replace(editor, crate::editor::PostSaveAction::Open(path), executor, clock, msg_tx);` (the dirty-guard from Task 4 handles clean→immediate `open_into_current` vs dirty→modal); Esc→`file_browser=None`; drain async `ClipboardPaste` (mirror the other overlays). Add the **render in `render.rs`** (mirror the `theme_picker`/outline overlay render at render.rs:686/746/792 — NOT app.rs; Codex), and add `file_browser` to `has_overlay` (render.rs:618) if needed. Register `open` (File) → `|c| { let dir = c.editor.active().document.path.as_ref().and_then(|p| p.parent()).map(|d| d.to_path_buf()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default()); c.editor.open_file_browser(dir); CommandResult::Handled }`; cua bind `("ctrl-o", "open")`; clear `file_browser` in `registry.rs` menu/`dispatch_overlay_command`; absorb in `mouse.rs`.
+Add the `file_browser` **key block** in `app.rs` (mirror the `theme_picker` block ~870): printable→`query`+`rebuild_entries`; Backspace→pop+rebuild; Up/Down→`selected`; Enter→ if `entries[selected].is_dir` set `dir` (join `..`→parent / name→child), clear query, rebuild, selected=0 — else `let path = fb.dir.join(name); editor.file_browser=None; request_replace(editor, crate::editor::PostSaveAction::Open(path), ex, clock, msg_tx);` (**vars are `ex`/`clock`/`msg_tx` in `reduce`, not `executor`** — Codex; the dirty-guard from Task 4 handles clean→immediate `open_into_current` vs dirty→modal); Esc→`file_browser=None`; drain async `ClipboardPaste` (mirror the other overlays). Add the **render in `render.rs`** (mirror the `theme_picker`/outline overlay render at render.rs:686/746/792 — NOT app.rs; Codex). Do **not** add `file_browser` to `has_overlay` (match `theme_picker`, which is excluded). Register `open` (File) → `|c| { let dir = c.editor.active().document.path.as_ref().and_then(|p| p.parent()).map(|d| d.to_path_buf()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default()); c.editor.open_file_browser(dir); CommandResult::Handled }`; cua bind `("ctrl-o", "open")`; clear `file_browser` in `registry.rs` menu/`dispatch_overlay_command`; absorb in `mouse.rs`.
 
 - [ ] **Step 4: Run** `cargo test -p wordcartel file_browser` + `cargo test -p wordcartel open_into_current` + `cargo test -p wordcartel --lib` + `cargo test` (workspace) — all green.
 
