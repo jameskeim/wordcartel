@@ -201,6 +201,27 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
+    /// Regression: open_into_current (reached via throwaway-reuse path) must update MRU.
+    /// Before the fix: old throwaway id remained in MRU as a ghost; new id was absent.
+    #[test]
+    fn open_into_current_updates_mru_no_ghost() {
+        let tmp = std::env::temp_dir().join(format!("wc-oic-mru-{}.md", std::process::id()));
+        std::fs::write(&tmp, "content\n").unwrap();
+        let mut e = Editor::new_from_text("\n", None, (40, 10)); // clean empty untitled throwaway
+        e.install_scratch(); // seeds MRU as [doc, scratch]
+        let old_id = e.active().id; // throwaway id (doc buffer)
+        assert!(e.mru.contains(&old_id), "throwaway id must be in MRU before open");
+        // open_as_new_buffer takes the reuse path → calls open_into_current
+        assert!(active_is_reusable_throwaway(&e), "pre-condition: active must be throwaway");
+        open_as_new_buffer(&mut e, &tmp);
+        let new_id = e.active().id;
+        assert_ne!(new_id, old_id, "fresh id allocated for new buffer");
+        assert!(!e.mru.contains(&old_id), "ghost old throwaway id must NOT remain in MRU");
+        assert!(e.mru.contains(&new_id), "new buffer id must be in MRU");
+        assert_eq!(e.mru[0], new_id, "new buffer must be at MRU front");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
     #[test]
     fn open_adds_buffer_when_active_is_real() {
         let mut e = Editor::new_from_text("real content\n", Some(std::path::PathBuf::from("/tmp/a.md")), (40, 10));

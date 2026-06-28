@@ -426,12 +426,17 @@ pub fn restore_scratch(editor: &mut Editor, st: &crate::state::ScratchState) {
 /// `by_id_mut(old_id)` → `None` (harmless no-op). On OpenError: set status, do NOT replace
 /// (keep the user's work).
 pub fn open_into_current(editor: &mut Editor, path: &std::path::Path) {
+    let old_id = editor.active().id; // capture BEFORE alloc so MRU can replace old→new
     let id = editor.alloc_id(); // FRESH id → an in-flight job for the old buffer no-ops via by_id_mut(old_id)=None
     let area = editor.active().view.area;
     match crate::editor::Buffer::from_file(id, path, area) {
         Ok(b) => {
             let a = editor.active;
             editor.buffers[a] = b;
+            // Keep MRU consistent: remove the ghost old id and put the new id at front.
+            // Mirrors the close_buffer / restore_scratch patterns (workspace.rs, app.rs).
+            editor.mru.retain(|&x| x != old_id);
+            editor.touch_mru(id);
             if editor.resume_enabled {
                 restore_resume(editor, path);
             }
@@ -523,25 +528,6 @@ fn perform_save_as(editor: &mut crate::editor::Editor, target: std::path::PathBu
     }
 }
 
-/// Perform a PostSaveAction immediately (no save): Quit only — New/Open are now additive.
-fn perform_post_save_action(
-    editor: &mut Editor,
-    action: crate::editor::PostSaveAction,
-    _ex: &dyn Executor,
-    _clock: &dyn Clock,
-    _msg_tx: &std::sync::mpsc::Sender<Msg>,
-) {
-    match action {
-        crate::editor::PostSaveAction::Quit => {
-            editor.quit = true;
-        }
-        // ContinueQuitDrain is only ever armed via the drain's `dispatch_save_then`
-        // and consumed by `apply_result`; it never reaches this immediate-perform
-        // path (which serves the dirty-guard New flow). No-op defensively.
-        crate::editor::PostSaveAction::ContinueQuitDrain => {}
-    }
-}
-
 /// Request a new empty untitled buffer additively (never raises a dirty-guard modal).
 pub fn request_new(
     editor: &mut Editor,
@@ -596,26 +582,6 @@ pub fn resolve_prompt(
             let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
             crate::save::dispatch_save_and_quit(&mut ctx);
             return; // prompt handled; must NOT clear an external-mod modal
-        }
-        PromptAction::DiscardAndProceed => {
-            // Dirty-guard: discard unsaved changes and immediately perform the pending action.
-            if let Some(action) = editor.pending_save_as.take() {
-                perform_post_save_action(editor, action, ex, clock, msg_tx);
-            }
-        }
-        PromptAction::SaveAndProceed => {
-            // Dirty-guard: dismiss the modal first, then dispatch a save followed by the pending
-            // action. dispatch_save_then handles NAMED (saves + arms pending_after_save) AND
-            // UNNAMED (opens Save-As carrying the action in pending_save_as). Take the intent
-            // first so the named path doesn't leave a stale pending_save_as.
-            editor.prompt = None; // dismiss the dirty-guard modal first
-            if let Some(action) = editor.pending_save_as.take() {
-                let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
-                crate::save::dispatch_save_then(&mut ctx, action);
-            }
-            return; // MUST return — dispatch_save_then may have opened an external-mod or Save-As
-                    // overlay; the trailing resolve_prompt prompt-clear would wipe it otherwise
-                    // (mirrors the SaveAndQuit arm's return).
         }
         PromptAction::Reload => crate::save::reload_from_disk(editor),
         PromptAction::Overwrite => {
