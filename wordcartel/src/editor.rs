@@ -554,6 +554,44 @@ impl Editor {
         if let Some(tp) = self.theme_picker.as_mut() { crate::theme_picker::rebuild_rows(tp); }
     }
 
+    /// Open the buffer-switcher palette, enforcing the single-overlay XOR invariant.
+    ///
+    /// Sets `palette.kind = Buffers` and seeds rows from the MRU-ordered buffer
+    /// list (via `workspace::buffer_switch_rows`). `rebuild_rows` is called
+    /// immediately so rows are available before the first render.
+    pub fn open_buffer_switcher(&mut self) {
+        self.prompt = None;
+        self.minibuffer = None;
+        self.menu = None;
+        self.pending_keys.clear();
+        self.pending_mark = None;
+        self.search = None;
+        self.diag = None;
+        self.outline = None;
+        self.theme_picker = None;
+        self.file_browser = None;
+        let source_rows: Vec<crate::palette::PaletteRow> =
+            crate::workspace::buffer_switch_rows(self)
+                .into_iter()
+                .map(|(id, label)| crate::palette::PaletteRow {
+                    id: crate::registry::CommandId("palette"),
+                    label,
+                    chord: String::new(),
+                    buffer: Some(id),
+                })
+                .collect();
+        let mut p = crate::palette::Palette {
+            kind: crate::palette::PaletteKind::Buffers,
+            source_rows,
+            ..Default::default()
+        };
+        // rebuild_rows for Buffers kind ignores the registry and keymap;
+        // pass a dummy registry so the signature is satisfied.
+        let reg = crate::registry::Registry::builtins();
+        crate::palette::rebuild_rows(&mut p, &reg, &crate::keymap::KeyTrie::default());
+        self.palette = Some(p);
+    }
+
     /// Open the file browser at `dir`, enforcing the single-overlay XOR invariant.
     pub fn open_file_browser(&mut self, dir: std::path::PathBuf) {
         self.prompt = None; self.minibuffer = None; self.menu = None; self.palette = None;
@@ -920,6 +958,23 @@ mod tests {
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 2, hidden: false });
         e.undo(); // Editor::undo exists (editor.rs:512)
         assert!(e.active().marked_block.is_none(), "undo clears the block (it bypasses apply mapping)");
+    }
+
+    #[test]
+    fn open_buffer_switcher_yields_buffers_kind_palette() {
+        let mut e = Editor::new_from_text("doc\n", None, (40, 10));
+        e.install_scratch();
+        e.buffers[0].document.path = Some(std::path::PathBuf::from("/tmp/doc.md"));
+        e.open_buffer_switcher();
+        let p = e.palette.as_ref().expect("palette opened by open_buffer_switcher");
+        assert!(matches!(p.kind, crate::palette::PaletteKind::Buffers),
+            "kind must be Buffers, not Commands");
+        assert!(!p.rows.is_empty(), "rows populated immediately (no hydrate needed)");
+        assert!(p.rows.iter().all(|r| r.buffer.is_some()),
+            "all buffer-switcher rows carry a BufferId");
+        // rows[0] should be doc (install_scratch seeds MRU as [doc, scratch])
+        assert!(p.rows.iter().any(|r| r.label.contains("doc.md")));
+        assert!(p.rows.iter().any(|r| r.label == "*scratch*"));
     }
 
     #[test]

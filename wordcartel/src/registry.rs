@@ -275,6 +275,7 @@ impl Registry {
         r.register("next_buffer", "Next Buffer", Some(MenuCategory::View), |c| { crate::workspace::next_buffer(c.editor); CommandResult::Handled });
         r.register("prev_buffer", "Previous Buffer", Some(MenuCategory::View), |c| { crate::workspace::prev_buffer(c.editor); CommandResult::Handled });
         r.register("goto_scratch", "Go to Scratch Buffer", Some(MenuCategory::View), |c| { crate::workspace::goto_scratch(c.editor); CommandResult::Handled });
+        r.register("switch_buffer", "Switch Buffer\u{2026}", Some(MenuCategory::View), |c| { c.editor.open_buffer_switcher(); CommandResult::Handled });
 
         // Format menu — discrete transform commands (Task 1 / Effort 5b).
         r.register("reflow", "Reflow", Some(MenuCategory::Format), |c| {
@@ -622,6 +623,15 @@ mod tests {
             crate::input::key_to_command_id(ctrl_e),
             Some(crate::input::KeyAction::Id(CommandId("filter")))
         ));
+    }
+
+    #[test]
+    fn switch_buffer_is_registered_in_view_menu() {
+        let reg = Registry::builtins();
+        let m = reg.meta(CommandId("switch_buffer"))
+            .expect("switch_buffer must be registered");
+        assert_eq!(m.label, "Switch Buffer\u{2026}");
+        assert_eq!(m.menu, Some(MenuCategory::View));
     }
 
     #[test]

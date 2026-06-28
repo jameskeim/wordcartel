@@ -1097,11 +1097,19 @@ pub fn reduce(
                         editor.palette = None;
                     }
                     crossterm::event::KeyCode::Enter => {
-                        let id_opt = editor.palette.as_ref()
-                            .and_then(|p| p.rows.get(p.selected))
-                            .map(|r| r.id);
-                        if let Some(id) = id_opt {
-                            dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
+                        let row = editor.palette.as_ref()
+                            .and_then(|p| p.rows.get(p.selected).cloned());
+                        if let Some(row) = row {
+                            if let Some(bid) = row.buffer {
+                                // Buffer-switcher row: dismiss palette, jump to buffer.
+                                editor.palette = None;
+                                if let Some(idx) = editor.buffers.iter().position(|b| b.id == bid) {
+                                    crate::workspace::switch_to(editor, idx);
+                                }
+                            } else {
+                                // Command-palette row: dispatch through registry.
+                                dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, row.id);
+                            }
                         }
                     }
                     crossterm::event::KeyCode::Up => {
@@ -2209,6 +2217,34 @@ mod tests {
         crate::app::reduce(crate::app::Msg::Input(q), &mut e, &reg, &km, &ex, &clk, &tx);
         assert!(e.quit);
         assert_eq!(e.active().document.buffer.to_string(), "hi\n");
+    }
+
+    #[test]
+    fn palette_enter_on_buffer_row_switches_buffer_and_closes_palette() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        e.buffers[0].document.path = Some(std::path::PathBuf::from("/tmp/doc.md"));
+        e.install_scratch();
+        let scratch_id = e.scratch_id.unwrap();
+        // install_scratch seeds MRU as [doc, scratch]; open switcher → rows[0]=doc, rows[1]=scratch
+        e.open_buffer_switcher();
+        // Select the scratch row (index 1)
+        e.palette.as_mut().unwrap().selected = 1;
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let enter = Msg::Input(Event::Key(KeyEvent {
+            code: KeyCode::Enter, modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE,
+        }));
+        crate::app::reduce(enter, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert!(e.palette.is_none(), "buffer-switcher palette must be dismissed after Enter");
+        assert_eq!(e.active().id, scratch_id,
+            "active buffer must be the buffer selected in the switcher");
     }
 
     #[test]

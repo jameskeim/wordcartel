@@ -313,6 +313,8 @@ static CUA: &[(&str, &str)] = &[
     // Effort 6: buffer cycling (CUA bindings)
     ("alt-,", "prev_buffer"),
     ("alt-.", "next_buffer"),
+    // Effort 6: buffer switcher (ctrl-shift-e is free; ctrl-e is "filter")
+    ("ctrl-shift-e", "switch_buffer"),
 ];
 
 /// WordStar preset — full faithful classic keymap mapped to v1 command ids.
@@ -376,6 +378,8 @@ static WORDSTAR: &[(&str, &str)] = &[
     // Effort 6: buffer cycling (WordStar ^K bindings — plain-only, precedent ^KM/^KJ)
     ("ctrl-k ,", "prev_buffer"),
     ("ctrl-k .", "next_buffer"),
+    // Effort 6: buffer switcher (^KL / ^K^L — free; ^QL is find_next, not ^KL)
+    ("ctrl-k ctrl-l", "switch_buffer"), ("ctrl-k l", "switch_buffer"),
     ("ctrl-q ctrl-b", "block_jump_begin"),     ("ctrl-q b", "block_jump_begin"),
     ("ctrl-q ctrl-k", "block_jump_end"),       ("ctrl-q k", "block_jump_end"),
     ("ctrl-k m", "set_mark"),       // plain-only (^M reserved)
@@ -713,6 +717,27 @@ mod tests {
         assert!(matches!(cmd("ctrl-k ctrl-h"), Resolution::Command(CommandId("block_toggle_hidden"))));
         assert!(matches!(cmd("ctrl-q ctrl-b"), Resolution::Command(CommandId("block_jump_begin"))));
         assert!(matches!(cmd("ctrl-q ctrl-k"), Resolution::Command(CommandId("block_jump_end"))));
+    }
+
+    #[test]
+    fn switch_buffer_binds_resolve_and_do_not_collide() {
+        // CUA: ctrl-shift-e (free — ctrl-e is already "filter", ctrl-shift-e is distinct)
+        let (km, warns) = build_keymap(&crate::config::KeymapConfig::default(), &crate::registry::Registry::builtins());
+        assert!(warns.is_empty(), "no CUA warnings expected: {warns:?}");
+        let seq = |s: &str| parse_seq(s).unwrap();
+        assert!(matches!(km.resolve(&seq("ctrl-shift-e")), Resolution::Command(CommandId("switch_buffer"))),
+            "CUA ctrl-shift-e must resolve to switch_buffer");
+        // WordStar: ctrl-k l (plain) and ctrl-k ctrl-l (ctrl-held), both free
+        let ws_cfg = crate::config::KeymapConfig { preset: "wordstar".into(), patches: vec![] };
+        let (km_ws, warns_ws) = build_keymap(&ws_cfg, &crate::registry::Registry::builtins());
+        assert!(warns_ws.is_empty(), "WordStar: no warnings expected: {warns_ws:?}");
+        assert!(matches!(km_ws.resolve(&seq("ctrl-k l")), Resolution::Command(CommandId("switch_buffer"))),
+            "WordStar ctrl-k l must resolve to switch_buffer");
+        assert!(matches!(km_ws.resolve(&seq("ctrl-k ctrl-l")), Resolution::Command(CommandId("switch_buffer"))),
+            "WordStar ctrl-k ctrl-l must resolve to switch_buffer");
+        // Confirm ctrl-q l is still find_next (not shadowed)
+        assert!(matches!(km_ws.resolve(&seq("ctrl-q l")), Resolution::Command(CommandId("find_next"))),
+            "ctrl-q l (find_next) must not be shadowed by ctrl-k l");
     }
 
     #[test]
