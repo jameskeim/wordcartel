@@ -637,6 +637,7 @@ pub(crate) fn dispatch_overlay_command(
     editor.palette = None;
     editor.menu = None;
     editor.theme_picker = None;
+    editor.file_browser = None;
     let mut ctx = crate::registry::Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
     reg.dispatch(id, &mut ctx);
     for r in ex.drain() { apply_result(r, editor); }
@@ -1113,6 +1114,87 @@ pub fn reduce(
             return !editor.quit;
         }
         // Non-key msg falls through to normal handling while picker stays open.
+    }
+
+    // File browser overlay intercepts KEY INPUT and PASTE. Non-key, non-paste messages
+    // fall through to normal handling while the browser stays open (mirrors theme_picker).
+    if editor.file_browser.is_some() {
+        // Drop an async clipboard-paste result that arrives while the browser is open —
+        // it must not land in the document behind the overlay (Codex I6, mirror palette).
+        if matches!(&msg, Msg::ClipboardPaste { .. }) {
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
+        }
+        if let Msg::Input(Event::Paste(text)) = &msg {
+            if let Some(fb) = editor.file_browser.as_mut() {
+                fb.query.push_str(text);
+                crate::file_browser::rebuild_entries(fb);
+            }
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
+        }
+        if let Msg::Input(Event::Key(k)) = &msg {
+            if k.kind == crossterm::event::KeyEventKind::Press {
+                use crossterm::event::KeyCode;
+                match k.code {
+                    KeyCode::Esc => { editor.file_browser = None; }
+                    KeyCode::Enter => {
+                        // Resolve the selected entry: descend into a directory (incl. ".."),
+                        // or open a file through the Task-4 dirty-guard.
+                        let chosen = editor.file_browser.as_ref().and_then(|fb| {
+                            fb.entries.get(fb.selected).map(|e| (e.name.clone(), e.is_dir))
+                        });
+                        if let Some((name, is_dir)) = chosen {
+                            if is_dir {
+                                if let Some(fb) = editor.file_browser.as_mut() {
+                                    let new_dir = if name == ".." {
+                                        fb.dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| fb.dir.clone())
+                                    } else {
+                                        fb.dir.join(&name)
+                                    };
+                                    fb.dir = new_dir;
+                                    fb.query.clear();
+                                    fb.selected = 0;
+                                    crate::file_browser::rebuild_entries(fb);
+                                }
+                            } else {
+                                let path = editor.file_browser.as_ref().unwrap().dir.join(&name);
+                                editor.file_browser = None;
+                                request_replace(editor, crate::editor::PostSaveAction::Open(path), ex, clock, msg_tx);
+                            }
+                        }
+                    }
+                    KeyCode::Up => {
+                        if let Some(fb) = editor.file_browser.as_mut() { fb.selected = fb.selected.saturating_sub(1); }
+                    }
+                    KeyCode::Down => {
+                        if let Some(fb) = editor.file_browser.as_mut() {
+                            let max = fb.entries.len().saturating_sub(1);
+                            fb.selected = (fb.selected + 1).min(max);
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if let Some(fb) = editor.file_browser.as_mut() {
+                            fb.query.pop();
+                            crate::file_browser::rebuild_entries(fb);
+                        }
+                    }
+                    KeyCode::Char(c)
+                        if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                            && !k.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
+                    {
+                        if let Some(fb) = editor.file_browser.as_mut() {
+                            fb.query.push(c);
+                            crate::file_browser::rebuild_entries(fb);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
+        }
+        // Non-key msg falls through to normal handling while the browser stays open.
     }
 
     // Active modal intercepts KEY INPUT only (§5.3). Background results and ticks
@@ -1928,6 +2010,20 @@ mod tests {
         assert_eq!(e.active().document.buffer.to_string(), "opened\n");
         assert!(!e.active().document.dirty());
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn file_browser_enter_on_file_opens_it_when_clean() {
+        use crate::editor::Editor;
+        let dir = std::env::temp_dir().join(format!("wc-fbopen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("note.md"), "loaded\n").unwrap();
+        let mut e = Editor::new_from_text("clean\n", None, (80, 24)); // clean
+        e.open_file_browser(dir.clone());
+        // select "note.md" and simulate Enter via the browser's open path:
+        crate::app::open_into_current(&mut e, &dir.join("note.md")); // the clean-path the Enter handler takes
+        assert_eq!(e.active().document.buffer.to_string(), "loaded\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn press(code: crossterm::event::KeyCode, mods: crossterm::event::KeyModifiers) -> Msg {

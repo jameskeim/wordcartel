@@ -289,6 +289,8 @@ pub struct Editor {
     pub outline: Option<crate::outline_overlay::OutlineOverlay>,
     /// Theme picker overlay state. XOR with all other overlays.
     pub theme_picker: Option<crate::theme_picker::ThemePicker>,
+    /// File browser overlay state. XOR with all other overlays.
+    pub file_browser: Option<crate::file_browser::FileBrowser>,
     /// Active theme + terminal color depth. Seeded at startup (real depth detection: plan ③).
     pub theme: wordcartel_core::theme::Theme,
     pub depth: wordcartel_core::theme::Depth,
@@ -328,6 +330,7 @@ impl Editor {
             diag: None,
             outline: None,
             theme_picker: None,
+            file_browser: None,
             theme: wordcartel_core::theme::default(),
             depth: wordcartel_core::theme::Depth::Truecolor,
             heading_glyph_cfg: None,
@@ -375,6 +378,7 @@ impl Editor {
         self.diag = None;
         self.outline = None;
         self.theme_picker = None;
+        self.file_browser = None;
         self.minibuffer = Some(crate::minibuffer::Minibuffer {
             prompt: prompt.into(),
             text: String::new(),
@@ -397,6 +401,7 @@ impl Editor {
         self.diag = None;
         self.outline = None;
         self.theme_picker = None;
+        self.file_browser = None;
         self.prompt = Some(p);
     }
 
@@ -414,6 +419,7 @@ impl Editor {
         self.diag = None;
         self.outline = None;
         self.theme_picker = None;
+        self.file_browser = None;
         self.palette = Some(crate::palette::Palette::default());
     }
 
@@ -427,6 +433,7 @@ impl Editor {
         self.diag = None;
         self.outline = None;
         self.theme_picker = None;
+        self.file_browser = None;
         let bid = self.active().id;
         self.search = Some(crate::search_overlay::SearchState::open(phase, origin, bid));
     }
@@ -441,6 +448,7 @@ impl Editor {
         self.pending_keys.clear(); self.pending_mark = None;
         self.outline = None;
         self.theme_picker = None;
+        self.file_browser = None;
         let bid = self.active().id;
         let ver = self.active().document.version;
         self.diag = Some(crate::diag_overlay::DiagOverlay::new(d, bid, ver));
@@ -452,6 +460,7 @@ impl Editor {
         self.search = None; self.diag = None;
         self.pending_keys.clear(); self.pending_mark = None;
         self.theme_picker = None;
+        self.file_browser = None;
         let bid = self.active().id;
         let ver = self.active().document.version;
         let blocks = self.active().document.blocks.clone();
@@ -464,11 +473,23 @@ impl Editor {
         self.prompt = None; self.minibuffer = None; self.menu = None;
         self.pending_keys.clear(); self.pending_mark = None;
         self.search = None; self.diag = None; self.outline = None; self.palette = None;
+        self.file_browser = None;
         self.theme_picker = Some(crate::theme_picker::ThemePicker {
             query: String::new(), selected: 0, rows: Vec::new(),
             original: self.theme.clone(),
         });
         if let Some(tp) = self.theme_picker.as_mut() { crate::theme_picker::rebuild_rows(tp); }
+    }
+
+    /// Open the file browser at `dir`, enforcing the single-overlay XOR invariant.
+    pub fn open_file_browser(&mut self, dir: std::path::PathBuf) {
+        self.prompt = None; self.minibuffer = None; self.menu = None; self.palette = None;
+        self.pending_keys.clear(); self.pending_mark = None;
+        self.search = None; self.diag = None; self.outline = None; self.theme_picker = None;
+        self.file_browser = Some(crate::file_browser::FileBrowser {
+            dir, query: String::new(), entries: Vec::new(), selected: 0,
+        });
+        if let Some(fb) = self.file_browser.as_mut() { crate::file_browser::rebuild_entries(fb); }
     }
 
     /// Apply a theme: swap, re-derive the heading-glyph flag (cue mode forces ON;
