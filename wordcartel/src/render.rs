@@ -309,9 +309,17 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     let (sel_from, sel_to) = (sel_range.from(), sel_range.to());
     let has_sel = !sel_range.is_empty();
 
+    // Snapshot the persistent marked block (Effort 9A). A visible (non-hidden)
+    // block is painted on the placed path; a hidden block is never painted.
+    let marked_block = editor.active().marked_block;
+    let block_hidden = marked_block.is_some_and(|b| b.hidden);
+    let has_block = marked_block.is_some() && !block_hidden;
+
     // Use the placed-path builder when search is active, valid diagnostics exist,
-    // or a non-empty selection must be painted (segs path does no per-glyph styling).
-    let use_placed = !hl_window.is_empty() || diag_active || has_sel;
+    // a non-empty selection must be painted, or a visible marked block must be
+    // painted (segs path does no per-glyph styling). Computed ONCE (Codex): a
+    // visible block forces the placed path even with no selection/search/diag.
+    let use_placed = !hl_window.is_empty() || diag_active || has_sel || has_block;
 
     // Source-mode branch: in source modes (any mode other than LivePreview) the
     // stack is [Text] only — base canvas, no role or inline semantic styling.
@@ -475,6 +483,16 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                         compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(p.style)])
                     };
 
+                    // MarkedBlock composes BELOW Selection/Search/Diag (base → MarkedBlock →
+                    // Selection → …). Only visible placed cells are touched; hidden lines are
+                    // never in `map.placed`, so the block paint is inherently fold-safe.
+                    if let Some(b) = marked_block {
+                        if !b.hidden && overlaps(g_from, g_to, b.start, b.end) {
+                            let mb_face = editor.theme.face(SE::MarkedBlock);
+                            style = style.patch(crate::compose::face_to_ratatui(&mb_face, editor.depth));
+                        }
+                    }
+
                     // FIX-2: Selection layers first; a current search match patches over it so
                     // it stands out; diagnostics last. (Spec §3.4: Selection → Search → Diag.)
                     // Cue-mode modifiers accumulate (selection underline + search bold = both
@@ -604,11 +622,18 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 chrome_reverse_style,
             )
         } else {
-            let text = if editor.status.is_empty() {
+            let mut text = if editor.status.is_empty() {
                 format!("{}{} [{}]", path_str, dirty_marker, mode_text)
             } else {
                 format!("{}{} [{}] {}", path_str, dirty_marker, mode_text, editor.status)
             };
+            // Effort 9A: BLK indicator on the LEFT status text (not the word-count-gated
+            // right segment). `· BLK` when a block is marked; `· BLK·hidden` when hidden.
+            match editor.active().marked_block {
+                Some(b) if b.hidden => text.push_str(" · BLK·hidden"),
+                Some(_) => text.push_str(" · BLK"),
+                None => {}
+            }
             (text, chrome_reverse_style)
         };
 
@@ -1375,6 +1400,29 @@ mod tests {
         let buf = render_to_buffer(&mut ed, 40, 4);
         let last = 3u16;
         assert!((0..40).any(|x| buf[(x,last)].style().add_modifier.contains(Modifier::REVERSED)));
+    }
+
+    #[test]
+    fn marked_block_paints_and_status_shows_blk() {
+        let mut e = Editor::new_from_text("hello world\n", None, (60, 6));
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false });
+        crate::derive::rebuild(&mut e);
+        let buf = render_to_buffer(&mut e, 60, 6);
+        // the block cells carry a non-default style distinct from unselected cells (reverse modifier)
+        assert!(row_has_highlight(&buf, 0), "block cells painted with a modifier");
+        // and the status row contains "BLK"
+        assert!(row_string(&buf, 5).contains("BLK"), "status shows BLK indicator");
+    }
+
+    #[test]
+    fn hidden_block_status_reads_blk_hidden_and_not_painted() {
+        let mut e = Editor::new_from_text("hello\n", None, (60, 6));
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: true });
+        crate::derive::rebuild(&mut e);
+        let buf = render_to_buffer(&mut e, 60, 6);
+        assert!(row_string(&buf, 5).contains("BLK·hidden"));
+        // a hidden block is not painted into the text rows
+        assert!(!row_has_highlight(&buf, 0), "hidden block not painted");
     }
 
     #[test]

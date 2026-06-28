@@ -251,6 +251,22 @@ impl Registry {
         r.register("jump_back",    "Jump Back",    None, |c| { crate::marks::jump_back(c.editor); CommandResult::Handled });
         r.register("jump_forward", "Jump Forward", None, |c| { crate::marks::jump_forward(c.editor); CommandResult::Handled });
 
+        // Marked block creation (Task 2 / Effort 9A).
+        r.register("block_begin",               "Set Block Begin",         Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_begin(c.editor); CommandResult::Handled });
+        r.register("block_end",                 "Set Block End",           Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_end(c.editor); CommandResult::Handled });
+        r.register("mark_block_from_selection", "Mark Block from Selection", Some(MenuCategory::Edit), |c| { crate::blocks_marked::mark_block_from_selection(c.editor); CommandResult::Handled });
+
+        // Marked block operations (Task 3 / Effort 9A).
+        r.register("block_copy",          "Copy Block",        Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_copy(c.editor, c.clock);   CommandResult::Handled });
+        r.register("block_move",          "Move Block",        Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_move(c.editor, c.clock);   CommandResult::Handled });
+        r.register("block_delete",        "Delete Block",      Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_delete(c.editor, c.clock); CommandResult::Handled });
+        r.register("block_jump_begin",    "Jump to Block Begin", Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_jump_begin(c.editor);    CommandResult::Handled });
+        r.register("block_jump_end",      "Jump to Block End",   Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_jump_end(c.editor);      CommandResult::Handled });
+        r.register("block_toggle_hidden", "Toggle Block Hidden", Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_toggle_hidden(c.editor); CommandResult::Handled });
+        r.register("block_clear",         "Clear Block",         Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_clear(c.editor);         CommandResult::Handled });
+        // Marked block write-to-file (Task 4 / Effort 9A).
+        r.register("block_write", "Write Block to File\u{2026}", Some(MenuCategory::File), |c| { crate::blocks_marked::block_write(c.editor); CommandResult::Handled });
+
         // Format menu — discrete transform commands (Task 1 / Effort 5b).
         r.register("reflow", "Reflow", Some(MenuCategory::Format), |c| {
             crate::transform::dispatch_transform(c.editor, crate::transform::TransformKind::Reflow, c.clock, &c.msg_tx);

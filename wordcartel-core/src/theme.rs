@@ -30,7 +30,7 @@ pub enum SemanticElement {
     Text,
     Emphasis, Strong, StrongEmphasis, Code, Strikethrough, Link,
     Heading(u8), BlockQuote, CodeBlock, ListMarker, ThematicBreak,
-    FrontMatter, Comment, Selection,
+    FrontMatter, Comment, Selection, MarkedBlock,
     SearchMatch, SearchCurrent, DiagSpelling, DiagGrammar, FocusDim, FoldMarker, WrapGuide,
     Chrome,         // panel/frame base (status/menu bar bg, overlay frames)
     ChromeReverse,  // REVERSED highlight (status line, palette/outline/diag selected row)
@@ -106,7 +106,7 @@ fn dist2(a: (u8, u8, u8), b: (u8, u8, u8)) -> u32 {
 struct ThemeFaces {
     text: Face, emphasis: Face, strong: Face, strong_emphasis: Face, code: Face, strikethrough: Face, link: Face,
     heading: [Face; 6], block_quote: Face, code_block: Face, list_marker: Face, thematic_break: Face,
-    front_matter: Face, comment: Face, selection: Face,
+    front_matter: Face, comment: Face, selection: Face, marked_block: Face,
     search_match: Face, search_current: Face, diag_spelling: Face, diag_grammar: Face,
     focus_dim: Face, fold_marker: Face, wrap_guide: Face,
     chrome: Face, chrome_reverse: Face, chrome_selected: Face, chrome_muted: Face,
@@ -133,6 +133,7 @@ impl Theme {
             BlockQuote => self.faces.block_quote, CodeBlock => self.faces.code_block,
             ListMarker => self.faces.list_marker, ThematicBreak => self.faces.thematic_break,
             FrontMatter => self.faces.front_matter, Comment => self.faces.comment, Selection => self.faces.selection,
+            MarkedBlock => self.faces.marked_block,
             SearchMatch => self.faces.search_match, SearchCurrent => self.faces.search_current,
             DiagSpelling => self.faces.diag_spelling, DiagGrammar => self.faces.diag_grammar,
             FocusDim => self.faces.focus_dim, FoldMarker => self.faces.fold_marker, WrapGuide => self.faces.wrap_guide,
@@ -197,6 +198,7 @@ impl Theme {
             ListMarker => &mut self.faces.list_marker, ThematicBreak => &mut self.faces.thematic_break,
             FrontMatter => &mut self.faces.front_matter, Comment => &mut self.faces.comment,
             Selection => &mut self.faces.selection,
+            MarkedBlock => &mut self.faces.marked_block,
             SearchMatch => &mut self.faces.search_match, SearchCurrent => &mut self.faces.search_current,
             DiagSpelling => &mut self.faces.diag_spelling, DiagGrammar => &mut self.faces.diag_grammar,
             FocusDim => &mut self.faces.focus_dim, FoldMarker => &mut self.faces.fold_marker,
@@ -241,6 +243,8 @@ pub fn default() -> Theme {
             list_marker: Face { fg: Some(Color::DarkGray), ..Face::default() }, // prefix glyph normal
             thematic_break: Face::default(), front_matter: Face::default(), comment: Face::default(),
             selection: Face { reverse: Some(true), ..Face::default() },
+            // §13.2 marked block: tinted bg + reverse+bold+underline (distinct from selection=reverse).
+            marked_block: Face { bg: Some(Color::DarkGray), reverse: Some(true), bold: Some(true), underline: Some(true), ..Face::default() },
             // search: today match = yellow bg + black fg; current = reverse.
             search_match: Face { bg: Some(Color::Yellow), fg: Some(Color::Black), ..Face::default() },
             search_current: modface(None, false, false, false, false, true),
@@ -306,6 +310,8 @@ pub fn tokyo_night() -> Theme {
             front_matter: Face { fg: Some(DARK3), ..Face::default() },
             comment: Face { fg: Some(COMMENT), italic: Some(true), dim: Some(true), ..Face::default() },
             selection: Face { bg: Some(SEL_BG), ..Face::default() },
+            // §13.2 marked block: lighter-than-selection bg + reverse+bold+underline.
+            marked_block: Face { bg: Some(DARK3), reverse: Some(true), bold: Some(true), underline: Some(true), ..Face::default() },
             search_match: Face { bg: Some(SEL_BG), ..Face::default() },
             search_current: Face { reverse: Some(true), ..Face::default() },
             diag_spelling: Face { underline: Some(true), underline_color: Some(RED), ..Face::default() },
@@ -365,6 +371,8 @@ pub fn from_base16(name: &str, p: BasePalette) -> Theme {
             front_matter: Face { fg: Some(b[0xF]), italic: Some(true), ..Face::default() },
             comment: Face { fg: Some(b[0x3]), italic: Some(true), dim: Some(true), ..Face::default() },
             selection: Face { bg: Some(b[0x2]), ..Face::default() },
+            // §13.2 marked block: distinct (comment-slot) bg + reverse+bold+underline.
+            marked_block: Face { bg: Some(b[0x3]), reverse: Some(true), bold: Some(true), underline: Some(true), ..Face::default() },
             search_match: Face { bg: Some(b[0xA]), fg: Some(b[0x0]), ..Face::default() },
             search_current: Face { reverse: Some(true), ..Face::default() },
             diag_spelling: Face { underline: Some(true), underline_color: Some(b[0x8]), ..Face::default() },
@@ -392,7 +400,8 @@ pub fn element_from_key(key: &str) -> Option<SemanticElement> {
         "heading4" => Heading(4), "heading5" => Heading(5), "heading6" => Heading(6),
         "block_quote" => BlockQuote, "code_block" => CodeBlock, "list_marker" => ListMarker,
         "thematic_break" => ThematicBreak, "front_matter" => FrontMatter, "comment" => Comment,
-        "selection" => Selection, "search_match" => SearchMatch, "search_current" => SearchCurrent,
+        "selection" => Selection, "marked_block" => MarkedBlock,
+        "search_match" => SearchMatch, "search_current" => SearchCurrent,
         "diag_spelling" => DiagSpelling, "diag_grammar" => DiagGrammar, "focus_dim" => FocusDim,
         "fold_marker" => FoldMarker, "wrap_guide" => WrapGuide,
         "chrome" => Chrome, "chrome_reverse" => ChromeReverse,
@@ -473,6 +482,7 @@ fn mono_faces() -> ThemeFaces {
         front_matter: m(false, true, false, false, true),         // reverse+italic
         comment: Face { italic: Some(true), dim: Some(true), ..Face::default() }, // italic+dim
         selection: m(false, false, true, false, true),            // reverse+underline
+        marked_block: m(true, false, true, false, true),          // reverse+bold+underline (§13.2 distinct)
         search_match: m(false, false, false, false, true),
         search_current: m(true, false, false, false, true),
         diag_spelling: m(true, false, true, false, false),        // bold+underline
@@ -510,6 +520,7 @@ pub fn phosphor(name: &str, hue: Color, flat: bool) -> Theme {
             front_matter: Face { fg: Some(shade(hue, 2)), italic: Some(true), ..Face::default() },
             comment: Face { fg: Some(shade(hue, 1)), italic: Some(true), ..Face::default() },
             selection: Face { fg: Some(shade(hue, 5)), reverse: Some(true), underline: Some(true), ..Face::default() },
+            marked_block: Face { bg: Some(shade(hue, 2)), reverse: Some(true), bold: Some(true), underline: Some(true), ..Face::default() },
             search_match: Face { bg: Some(shade(hue, 2)), fg: Some(shade(hue, 0)), ..Face::default() },
             search_current: Face { reverse: Some(true), bold: Some(true), ..Face::default() },
             diag_spelling: Face { underline: Some(true), underline_color: Some(shade(hue, 5)), ..Face::default() },
@@ -635,15 +646,29 @@ mod tests {
         assert_ne!(t.face(SemanticElement::FrontMatter), t.face(SemanticElement::Code));
     }
 
-    const ALL_ELEMENTS: [SemanticElement; 31] = {
+    // a11y: MarkedBlock has a distinct mono modifier (reverse+bold+underline) and is in ALL_ELEMENTS.
+    #[test]
+    fn marked_block_mono_modifier_is_distinct() {
+        let t = no_color();
+        let mb = t.face(SemanticElement::MarkedBlock);
+        assert_eq!((mb.reverse, mb.bold, mb.underline), (Some(true), Some(true), Some(true)));
+        // distinct from selection (reverse+underline), search_current (bold+reverse), diag_spelling (bold+underline)
+        assert_ne!(mb, t.face(SemanticElement::Selection));
+        assert_ne!(mb, t.face(SemanticElement::SearchCurrent));
+        assert_ne!(mb, t.face(SemanticElement::DiagSpelling));
+        // present in the totality set
+        assert!(ALL_ELEMENTS.contains(&SemanticElement::MarkedBlock));
+    }
+
+    const ALL_ELEMENTS: [SemanticElement; 32] = {
         use SemanticElement::*;
         [Text, Emphasis, Strong, StrongEmphasis, Code, Strikethrough, Link,
          Heading(1), Heading(2), Heading(3), Heading(4), Heading(5), Heading(6),
-         BlockQuote, CodeBlock, ListMarker, ThematicBreak, FrontMatter, Comment, Selection,
+         BlockQuote, CodeBlock, ListMarker, ThematicBreak, FrontMatter, Comment, Selection, MarkedBlock,
          SearchMatch, SearchCurrent, DiagSpelling, DiagGrammar, FocusDim, FoldMarker, WrapGuide,
          Chrome, ChromeReverse, ChromeSelected, ChromeMuted]
     };
-    // 31 = Text + 6 inline + 6 heading + 4 block + 3 (fm/comment/sel) + 7 overlay + 4 chrome.
+    // 32 = Text + 6 inline + 6 heading + 4 block + 4 (fm/comment/sel/marked-block) + 7 overlay + 4 chrome.
     // This is the totality proof — the count must equal the SemanticElement variant count
     // (Heading collapsed to its 6 levels). The `face_is_total` loop visits every one.
     #[test]

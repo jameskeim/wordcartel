@@ -305,6 +305,8 @@ static CUA: &[(&str, &str)] = &[
     ("alt-z",        "fold_toggle"),
     ("alt-shift-z",  "fold_all"),
     ("alt-shift-x",  "unfold_all"),
+    // Block operations (Effort 9A)
+    ("alt-b",        "mark_block_from_selection"),
 ];
 
 /// WordStar preset — full faithful classic keymap mapped to v1 command ids.
@@ -354,8 +356,16 @@ static WORDSTAR: &[(&str, &str)] = &[
     ("ctrl-k ctrl-d", "save"), ("ctrl-k d", "save"),
     ("ctrl-k ctrl-x", "save_and_quit"), ("ctrl-k x", "save_and_quit"),
     ("ctrl-k ctrl-q", "quit"), ("ctrl-k q", "quit"),
-    ("ctrl-k ctrl-c", "copy"),  ("ctrl-k c", "copy"),   // interim (9A reclaims ^KC for block copy)
-    ("ctrl-k ctrl-v", "paste"), ("ctrl-k v", "paste"),  // interim (9A reclaims ^KV for block move)
+    // Block operations (Effort 9A — reclaims ^KC/^KV from interim copy/paste)
+    ("ctrl-k ctrl-b", "block_begin"),          ("ctrl-k b", "block_begin"),
+    ("ctrl-k ctrl-k", "block_end"),            ("ctrl-k k", "block_end"),
+    ("ctrl-k ctrl-c", "block_copy"),           ("ctrl-k c", "block_copy"),
+    ("ctrl-k ctrl-v", "block_move"),           ("ctrl-k v", "block_move"),
+    ("ctrl-k ctrl-y", "block_delete"),         ("ctrl-k y", "block_delete"),
+    ("ctrl-k ctrl-w", "block_write"),          ("ctrl-k w", "block_write"),
+    ("ctrl-k ctrl-h", "block_toggle_hidden"),  ("ctrl-k h", "block_toggle_hidden"),
+    ("ctrl-q ctrl-b", "block_jump_begin"),     ("ctrl-q b", "block_jump_begin"),
+    ("ctrl-q ctrl-k", "block_jump_end"),       ("ctrl-q k", "block_jump_end"),
     ("ctrl-k m", "set_mark"),       // plain-only (^M reserved)
     ("ctrl-k j", "jump_to_mark"),   // plain-only (^J reserved)
     ("ctrl-k 0", "set_bookmark_0"), ("ctrl-k 1", "set_bookmark_1"),
@@ -663,6 +673,40 @@ mod tests {
         assert!(matches!(cmd("ctrl-k j"), Resolution::Command(CommandId("jump_to_mark"))));
         assert!(matches!(cmd("ctrl-k ctrl-m"), Resolution::None), "^KM ctrl-form reserved, not bound");
         assert!(matches!(cmd("ctrl-k ctrl-j"), Resolution::None), "^KJ ctrl-form reserved, not bound");
+    }
+
+    #[test]
+    fn wordstar_block_chords_resolve() {
+        let cfg = crate::config::KeymapConfig { preset: "wordstar".into(), patches: vec![] };
+        let (t, w) = build_keymap(&cfg, &Registry::builtins());
+        assert!(w.is_empty(), "{w:?}");
+        let cmd = |s: &str| t.resolve(&parse_seq(s).unwrap());
+        // both the plain AND ctrl-held second-key forms (9B prefix convention)
+        assert!(matches!(cmd("ctrl-k b"), Resolution::Command(CommandId("block_begin"))));
+        assert!(matches!(cmd("ctrl-k ctrl-b"), Resolution::Command(CommandId("block_begin"))));
+        assert!(matches!(cmd("ctrl-k k"), Resolution::Command(CommandId("block_end"))));
+        assert!(matches!(cmd("ctrl-k c"), Resolution::Command(CommandId("block_copy"))), "^KC reclaimed from copy");
+        assert!(matches!(cmd("ctrl-k ctrl-c"), Resolution::Command(CommandId("block_copy"))), "^K^C reclaimed too");
+        assert!(matches!(cmd("ctrl-k v"), Resolution::Command(CommandId("block_move"))), "^KV reclaimed from paste");
+        assert!(matches!(cmd("ctrl-k ctrl-v"), Resolution::Command(CommandId("block_move"))), "^K^V reclaimed too");
+        assert!(matches!(cmd("ctrl-k y"), Resolution::Command(CommandId("block_delete"))));
+        assert!(matches!(cmd("ctrl-k w"), Resolution::Command(CommandId("block_write"))));
+        assert!(matches!(cmd("ctrl-k h"), Resolution::Command(CommandId("block_toggle_hidden"))));
+        assert!(matches!(cmd("ctrl-q b"), Resolution::Command(CommandId("block_jump_begin"))));
+        assert!(matches!(cmd("ctrl-q k"), Resolution::Command(CommandId("block_jump_end"))));
+        // remaining ctrl-held forms (lock the both-forms contract — Codex completeness)
+        assert!(matches!(cmd("ctrl-k ctrl-k"), Resolution::Command(CommandId("block_end"))));
+        assert!(matches!(cmd("ctrl-k ctrl-y"), Resolution::Command(CommandId("block_delete"))));
+        assert!(matches!(cmd("ctrl-k ctrl-w"), Resolution::Command(CommandId("block_write"))));
+        assert!(matches!(cmd("ctrl-k ctrl-h"), Resolution::Command(CommandId("block_toggle_hidden"))));
+        assert!(matches!(cmd("ctrl-q ctrl-b"), Resolution::Command(CommandId("block_jump_begin"))));
+        assert!(matches!(cmd("ctrl-q ctrl-k"), Resolution::Command(CommandId("block_jump_end"))));
+    }
+
+    #[test]
+    fn cua_alt_b_promotes() {
+        let (t, _) = build_keymap(&crate::config::KeymapConfig::default(), &Registry::builtins());
+        assert!(matches!(t.resolve(&parse_seq("alt-b").unwrap()), Resolution::Command(CommandId("mark_block_from_selection"))));
     }
 
     #[test]

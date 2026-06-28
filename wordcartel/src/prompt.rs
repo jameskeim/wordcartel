@@ -17,6 +17,7 @@ pub enum PromptAction {
     Overwrite,
     OverwriteExport,
     OverwriteSaveAs,
+    OverwriteWriteBlock,
     Recover,
     DiscardSwap,
     OpenOriginal,
@@ -96,6 +97,16 @@ impl Prompt {
             message: format!("{} exists: [O]verwrite · [C]ancel", target.display()),
             choices: vec![
                 Choice { key: 'o', label: "Overwrite", action: PromptAction::OverwriteSaveAs },
+                Choice { key: 'c', label: "Cancel",    action: PromptAction::Cancel },
+            ],
+        }
+    }
+
+    pub fn write_block_overwrite(target: &std::path::Path) -> Prompt {
+        Prompt {
+            message: format!("{} exists: [O]verwrite · [C]ancel", target.display()),
+            choices: vec![
+                Choice { key: 'o', label: "Overwrite", action: PromptAction::OverwriteWriteBlock },
                 Choice { key: 'c', label: "Cancel",    action: PromptAction::Cancel },
             ],
         }

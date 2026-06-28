@@ -308,6 +308,27 @@ pub fn load_marks_from_entry(editor: &mut Editor, entry: &crate::state::StateEnt
     }
 }
 
+/// Restore the persisted marked block from a session entry into the active buffer.
+/// Call only when the staleness guard has accepted the entry (mirrors cursor/marks).
+///
+/// Both endpoints are clamped+grapheme-snapped via `clamp_snap` (the SAME treatment
+/// marks get). This is load-bearing: `persist_session` records the block from the
+/// in-memory buffer, but the staleness guard keys on on-disk mtime+size. A dirty
+/// buffer longer than the on-disk file can persist a block whose `end` exceeds the
+/// on-disk length; on a dirty-quit + reopen-unchanged-file cycle the buffer reloads
+/// SHORTER yet the guard still passes, so a raw restore would hand `block_*` ops an
+/// out-of-range range and `buffer.slice()` would assert/panic. Clamping prevents that;
+/// a block that collapses to empty after clamping is dropped.
+pub fn load_block_from_entry(editor: &mut Editor, entry: &crate::state::StateEntry) {
+    if let Some((s, en)) = entry.block {
+        let s = crate::nav::clamp_snap(editor, s);
+        let en = crate::nav::clamp_snap(editor, en);
+        if s < en {
+            editor.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: s, end: en, hidden: false });
+        }
+    }
+}
+
 /// Restore session-resume state (cursor, scroll, marks, folds) for `path` into the
 /// active buffer. Factored verbatim from run()'s launch resume block so launch and
 /// `open_into_current` share one code path. Reloads `state::load()` itself so it works
@@ -327,6 +348,7 @@ pub fn restore_resume(editor: &mut Editor, path: &std::path::Path) {
                     editor.active_mut().folds.folded = entry.folds.iter().copied().collect();
                     let (blocks, buf) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.clone()) };
                     editor.active_mut().folds.reconcile(&blocks, &buf);
+                    load_block_from_entry(editor, entry);
                 }
             }
         }
@@ -366,6 +388,16 @@ pub fn open_save_as(editor: &mut crate::editor::Editor) {
     if let Some(mb) = editor.minibuffer.as_mut() { mb.cursor = pre.len(); mb.text = pre; }
 }
 
+/// Expand a user-typed path: `~/` prefix → home dir; relative → joined onto cwd.
+/// Mirrors the `~` handling used by the dictionary/config path loaders.
+pub fn expand_path(text: &str) -> std::path::PathBuf {
+    let expanded = if let Some(rest) = text.strip_prefix("~/") {
+        dirs::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| std::path::PathBuf::from(text))
+    } else { std::path::PathBuf::from(text) };
+    if expanded.is_absolute() { expanded }
+    else { std::env::current_dir().map(|d| d.join(&expanded)).unwrap_or(expanded) }
+}
+
 /// Submit the Save-As minibuffer line: expand the path, raise an overwrite
 /// confirmation if the target exists, else perform the save-as immediately.
 pub fn save_as_submit(editor: &mut crate::editor::Editor, text: &str,
@@ -373,21 +405,37 @@ pub fn save_as_submit(editor: &mut crate::editor::Editor, text: &str,
                       msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
     let t = text.trim();
     if t.is_empty() { editor.status = "save-as: empty path".into(); editor.pending_save_as = None; return; }
-    // expand_path: ~ → home; relative → joined onto cwd. Mirror the ~ handling used by the
-    // dictionary/config path loaders.
-    let target: std::path::PathBuf = {
-        let expanded = if let Some(rest) = t.strip_prefix("~/") {
-            dirs::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| std::path::PathBuf::from(t))
-        } else { std::path::PathBuf::from(t) };
-        if expanded.is_absolute() { expanded }
-        else { std::env::current_dir().map(|d| d.join(&expanded)).unwrap_or(expanded) }
-    };
+    let target = expand_path(t);
     if target.exists() {
         editor.pending_save_overwrite = Some(target.clone());
         editor.open_prompt(crate::prompt::Prompt::save_overwrite(&target));
         return;
     }
     perform_save_as(editor, target, executor, clock, msg_tx);
+}
+
+/// Submit the Write-Block minibuffer line: expand the path, raise an overwrite
+/// confirmation if the target exists, else write the block text immediately.
+/// Synchronous: uses `file::save_atomic` directly; does NOT touch document state.
+pub fn block_write_submit(editor: &mut crate::editor::Editor, text: &str) {
+    let Some(b) = editor.active().marked_block else { editor.status = "no marked block".into(); return; };
+    let t = text.trim();
+    if t.is_empty() { editor.status = "write block: empty path".into(); return; }
+    let target = expand_path(t);
+    if target.exists() {
+        editor.pending_write_block = Some(target.clone());
+        editor.open_prompt(crate::prompt::Prompt::write_block_overwrite(&target));
+        return;
+    }
+    perform_block_write(editor, &target, b.start, b.end);
+}
+
+fn perform_block_write(editor: &mut crate::editor::Editor, target: &std::path::Path, start: usize, end: usize) {
+    let text = editor.active().document.buffer.slice(start..end);
+    match crate::file::save_atomic(target, &text) {
+        Ok(_)  => editor.status = format!("wrote block to {}", target.display()),
+        Err(e) => editor.status = e.to_string(),
+    }
 }
 
 fn perform_save_as(editor: &mut crate::editor::Editor, target: std::path::PathBuf,
@@ -466,6 +514,7 @@ pub fn resolve_prompt(
             editor.pending_export = None;
             editor.pending_save_overwrite = None;
             editor.pending_save_as = None;
+            editor.pending_write_block = None;
         }
         PromptAction::QuitAnyway => { editor.quit = true; }
         PromptAction::SaveAndQuit => {
@@ -536,6 +585,15 @@ pub fn resolve_prompt(
         PromptAction::OverwriteSaveAs => {
             if let Some(t) = editor.pending_save_overwrite.take() {
                 perform_save_as(editor, t, ex, clock, msg_tx);
+            }
+        }
+        PromptAction::OverwriteWriteBlock => {
+            if let Some(t) = editor.pending_write_block.take() {
+                if let Some(b) = editor.active().marked_block {
+                    perform_block_write(editor, &t, b.start, b.end);
+                } else {
+                    editor.status = "no marked block".into();
+                }
             }
         }
         PromptAction::Transform(kind) => {
@@ -1248,6 +1306,7 @@ pub fn reduce(
                     editor.pending_export = None;
                     editor.pending_save_overwrite = None;
                     editor.pending_save_as = None;
+                    editor.pending_write_block = None;
                 } else if let crossterm::event::KeyCode::Char(ch) = key.code {
                     if let Some(action) = editor.prompt.as_ref().unwrap().action_for(ch) {
                         resolve_prompt(action, editor, ex, clock, msg_tx);
@@ -1310,9 +1369,10 @@ pub fn reduce(
                     crossterm::event::KeyCode::Enter => {
                         let mb = editor.minibuffer.take().unwrap();
                         match mb.kind {
-                            crate::minibuffer::MinibufferKind::Filter   => submit_filter_line(editor, &mb.text, msg_tx),
-                            crate::minibuffer::MinibufferKind::GotoLine => goto_line_submit(editor, &mb.text),
-                            crate::minibuffer::MinibufferKind::SaveAs   => save_as_submit(editor, &mb.text, ex, clock, msg_tx),
+                            crate::minibuffer::MinibufferKind::Filter     => submit_filter_line(editor, &mb.text, msg_tx),
+                            crate::minibuffer::MinibufferKind::GotoLine   => goto_line_submit(editor, &mb.text),
+                            crate::minibuffer::MinibufferKind::SaveAs     => save_as_submit(editor, &mb.text, ex, clock, msg_tx),
+                            crate::minibuffer::MinibufferKind::WriteBlock => block_write_submit(editor, &mb.text),
                         }
                     }
                     _ => {}
@@ -1992,6 +2052,7 @@ fn persist_session(
         size,
         seq,
         folds: editor.active().folds.folded.iter().copied().collect(),
+        block: editor.active().marked_block.map(|b| (b.start, b.end)),
     };
     session.record(
         canon.to_string_lossy().into_owned(),
@@ -3456,7 +3517,7 @@ mod tests {
         // unit-test the resume decision helper directly (no TTY):
         // apply_resume(entry, current_identity, doc_len) -> Option<(cursor,scroll)>
         use crate::state::StateEntry;
-        let e = StateEntry { cursor: 4, scroll: 2, marks: Default::default(), mtime: 10, size: 20, seq: 0, folds: vec![] };
+        let e = StateEntry { cursor: 4, scroll: 2, marks: Default::default(), mtime: 10, size: 20, seq: 0, folds: vec![], block: None };
         // identity match → restore (clamped to doc_len)
         assert_eq!(crate::app::apply_resume(&e, (10,20), 100), Some((4,2)));
         assert_eq!(crate::app::apply_resume(&e, (10,20), 3), Some((3,2)), "cursor clamped to doc_len");
@@ -3559,10 +3620,117 @@ mod tests {
         let mut marks = BTreeMap::new();
         marks.insert("a".to_string(), 6usize);
         marks.insert("b".to_string(), 999usize); // past EOF → clamped to len
-        let entry = crate::state::StateEntry { cursor: 0, scroll: 0, marks, mtime: 0, size: 0, seq: 1, folds: vec![] };
+        let entry = crate::state::StateEntry { cursor: 0, scroll: 0, marks, mtime: 0, size: 0, seq: 1, folds: vec![], block: None };
         crate::app::load_marks_from_entry(&mut e, &entry);
         assert_eq!(e.active().marks.get(&'a'), Some(&6));
         assert_eq!(e.active().marks.get(&'b'), Some(&e.active().document.buffer.len()));
+    }
+
+    /// Task 5 (9A): marked block persists and restores across sessions.
+    /// Mirrors `load_marks_from_entry_populates_clamped` — tests the restore code path
+    /// directly (analogous to how marks/folds restore tests work).
+    #[test]
+    fn marked_block_persists_and_restores_under_matching_identity() {
+        use crate::editor::{Editor, MarkedBlock};
+        use crate::state::StateEntry;
+
+        // Construct an entry with a block — compile fails until StateEntry has `block`.
+        let entry = StateEntry {
+            cursor: 0, scroll: 0, marks: Default::default(),
+            mtime: 10, size: 20, seq: 1, folds: vec![],
+            block: Some((3, 8)),
+        };
+
+        // ── matching identity: guard passes → block restores with hidden=false ──
+        let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
+        let doc_len = e.active().document.buffer.len();
+        assert!(
+            crate::app::apply_resume(&entry, (10, 20), doc_len).is_some(),
+            "identity match → guard passes"
+        );
+        // Simulate what restore_resume does after the staleness guard:
+        if let Some((s, en)) = entry.block {
+            e.active_mut().marked_block = Some(MarkedBlock { start: s, end: en, hidden: false });
+        }
+        assert_eq!(
+            e.active().marked_block,
+            Some(MarkedBlock { start: 3, end: 8, hidden: false }),
+            "block restores with hidden=false under matching identity"
+        );
+
+        // ── mismatching identity: guard rejects → block NOT restored ──
+        //
+        // Previously vacuous: e2 was a fresh Editor and `marked_block` was never
+        // set, so the final assert was trivially true regardless of the guard.
+        //
+        // Hardened: we now drive the same conditional-restore path that
+        // restore_resume uses (apply_resume as gate → block only if Some).
+        // The block-application code IS present; the staleness guard (mtime 99 ≠
+        // stored 10) stops it.  If apply_resume were made to ignore mismatches
+        // (always return Some), the final assert would flip to RED.
+        let mut e2 = Editor::new_from_text("hello world\n", None, (80, 24));
+        let doc_len2 = e2.active().document.buffer.len();
+        let guard = crate::app::apply_resume(&entry, (99, 20), doc_len2);
+        assert!(guard.is_none(), "identity mismatch → guard rejects");
+        // Mirror restore_resume: set block only when guard passes.
+        if let Some(_) = guard {
+            if let Some((s, en)) = entry.block {
+                e2.active_mut().marked_block =
+                    Some(MarkedBlock { start: s, end: en, hidden: false });
+            }
+        }
+        // Non-vacuous: restore code is present above; guard prevented it from running.
+        assert!(e2.active().marked_block.is_none(), "block discarded on mismatch — guard blocked restore");
+    }
+
+    /// Task 5 (9A) regression: an out-of-range persisted block (dirty-quit → reopen
+    /// shorter file, guard still passes) must NOT reach `buffer.slice()` and panic.
+    /// Drives the REAL restore helper (`load_block_from_entry`, the exact code
+    /// `restore_resume` uses). Pre-fix this restored `end=8 > len=4` and the
+    /// `block_copy`/`block_delete` below asserted in `slice()` → panic.
+    #[test]
+    fn restore_clamps_out_of_range_block_no_slice_panic() {
+        use crate::editor::Editor;
+        use crate::state::StateEntry;
+
+        // Short buffer (len 4) but the persisted block end (8) is past EOF.
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        let len = e.active().document.buffer.len();
+        assert_eq!(len, 4);
+        let entry = StateEntry {
+            cursor: 0, scroll: 0, marks: Default::default(),
+            mtime: 10, size: 20, seq: 1, folds: vec![],
+            block: Some((4, 8)), // start at EOF, end beyond EOF
+        };
+
+        // Real production restore path (post-staleness-guard).
+        crate::app::load_block_from_entry(&mut e, &entry);
+
+        // Clamped to <= len, or dropped entirely — never out of range.
+        if let Some(b) = e.active().marked_block {
+            assert!(b.end <= len, "restored block end clamped to buffer len");
+            assert!(b.start <= b.end, "restored block normalized");
+        }
+        // (4,8) clamps to (4,4) which collapses → dropped.
+        assert!(e.active().marked_block.is_none(), "collapsed block dropped");
+
+        // The KEY assertion: block ops do not panic in slice() with the restored state.
+        crate::blocks_marked::block_copy(&mut e, &TestClock(0));
+        crate::blocks_marked::block_delete(&mut e, &TestClock(0));
+
+        // And a genuinely out-of-range END that does NOT collapse is still clamped.
+        let mut e2 = Editor::new_from_text("abc\n", None, (80, 24));
+        let entry2 = StateEntry {
+            cursor: 0, scroll: 0, marks: Default::default(),
+            mtime: 10, size: 20, seq: 1, folds: vec![],
+            block: Some((1, 99)), // start in-range, end far past EOF
+        };
+        crate::app::load_block_from_entry(&mut e2, &entry2);
+        let b = e2.active().marked_block.expect("non-collapsing block restored");
+        assert!(b.end <= e2.active().document.buffer.len(), "end clamped to len");
+        // Must not panic:
+        crate::blocks_marked::block_copy(&mut e2, &TestClock(0));
+        crate::blocks_marked::block_delete(&mut e2, &TestClock(0));
     }
 
     #[test]
@@ -4294,5 +4462,36 @@ mod tests {
             assert!(e.pending_save_as.is_none(), "Cancel clears pending_save_as");
             assert!(e.prompt.is_none(), "prompt cleared after Cancel");
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 4 (Effort 9A): ^KW block_write — write block text to file
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn block_write_writes_block_text_only_doc_unchanged() {
+        use crate::editor::Editor;
+        let p = std::env::temp_dir().join(format!("wc-blkw-{}.md", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false }); // "hello"
+        let before_doc = e.active().document.buffer.to_string();
+        crate::app::block_write_submit(&mut e, p.to_str().unwrap());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hello", "block text written");
+        assert_eq!(e.active().document.buffer.to_string(), before_doc, "document unchanged");
+        assert!(e.active().marked_block.is_some(), "block stays after write");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn block_write_existing_target_raises_overwrite() {
+        use crate::editor::Editor;
+        let p = std::env::temp_dir().join(format!("wc-blkw-ow-{}.md", std::process::id()));
+        std::fs::write(&p, "old").unwrap();
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 3, hidden: false });
+        crate::app::block_write_submit(&mut e, p.to_str().unwrap());
+        assert_eq!(e.prompt.as_ref().unwrap().action_for('o'), Some(crate::prompt::PromptAction::OverwriteWriteBlock));
+        let _ = std::fs::remove_file(&p);
     }
 }
