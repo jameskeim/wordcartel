@@ -2079,6 +2079,7 @@ mod tests {
         let live = mk(crate::editor::RenderMode::LivePreview);
         let src  = mk(crate::editor::RenderMode::SourcePlain);
         let pick = |s: &str| s.split_once("Ln ").map(|(_, r)| format!("Ln {}", r.split(" ·").next().unwrap_or(r))).unwrap_or_default();
+        assert!(pick(&live).starts_with("Ln "), "expected Ln,Col in live status; got: {live}");
         assert_eq!(pick(&live), pick(&src), "Ln,Col identical across views\nlive: {live}\nsrc:  {src}");
     }
 
