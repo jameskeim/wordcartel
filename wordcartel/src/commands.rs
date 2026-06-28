@@ -77,6 +77,8 @@ pub enum Command {
     ExpandSelection,
     /// Shrink selection: pop one level from sel_history.
     ShrinkSelection,
+    /// Select the entire buffer contents.
+    SelectAll,
 }
 
 /// Result returned by `run`.
@@ -587,6 +589,16 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                 nav::ensure_visible(editor);
                 CommandResult::Handled
             } else { CommandResult::Noop }
+        }
+
+        Command::SelectAll => {
+            let len = editor.active().document.buffer.len();
+            editor.active_mut().document.selection =
+                wordcartel_core::selection::Selection::range(0, len);
+            editor.active_mut().desired_col = None;
+            editor.active_mut().sel_history.clear();
+            nav::ensure_visible(editor);
+            CommandResult::Handled
         }
     }
 }
@@ -1377,6 +1389,27 @@ mod tests {
         let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer) };
         assert_eq!(head, a);
         assert!(!fv.is_hidden(ed.active().document.buffer.byte_to_line(head)));
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 2 (Effort 8): Select All command
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn select_all_selects_whole_buffer() {
+        let mut e = Editor::new_from_text("hello\nworld\n", None, (40, 10));
+        let len = e.active().document.buffer.len();
+        run(Command::SelectAll, &mut e, &TestClock(0));
+        let sel = e.active().document.selection.primary();
+        assert_eq!((sel.from(), sel.to()), (0, len));
+        assert!(e.active().desired_col.is_none());
+    }
+
+    #[test]
+    fn select_all_empty_buffer_is_noop_safe() {
+        let mut e = Editor::new_from_text("", None, (40, 10));
+        run(Command::SelectAll, &mut e, &TestClock(0));
+        assert!(e.active().document.selection.primary().is_empty());
     }
 
     #[test]

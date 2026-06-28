@@ -113,6 +113,7 @@ impl Registry {
         r.register("delete_forward", "Delete Forward",   None, |c| run(c, Command::DeleteForward));
 
         // Edit menu.
+        r.register("select_all", "Select All", Some(MenuCategory::Edit), |c| run(c, Command::SelectAll));
         r.register("copy",  "Copy",  Some(MenuCategory::Edit), |c| run(c, Command::Copy));
         r.register("cut",   "Cut",   Some(MenuCategory::Edit), |c| run(c, Command::Cut));
         r.register("paste", "Paste", Some(MenuCategory::Edit), |c| run(c, Command::Paste));
