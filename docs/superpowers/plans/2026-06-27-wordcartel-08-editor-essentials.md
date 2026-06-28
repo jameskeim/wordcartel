@@ -74,6 +74,14 @@ Task order: **1 → 2 → 3 → 4.** Task 4 consumes Task 1's helper; Tasks 2 an
         let before_x = "e\u{301}".len(); // byte offset of 'x'
         assert_eq!(b.caret_line_col(before_x), (1, 2)); // one grapheme before caret → col 2
     }
+
+    #[test]
+    fn caret_line_col_wide_cjk_counts_one_column() {
+        // A wide CJK glyph is ONE grapheme = ONE column (NOT display width 2).
+        let b = TextBuffer::from_str("漢x\n");
+        let before_x = "漢".len(); // byte offset of 'x' (漢 is 3 bytes)
+        assert_eq!(b.caret_line_col(before_x), (1, 2)); // one grapheme (漢) before caret → col 2
+    }
 ```
 
 > Match the real constructor (`TextBuffer::from_str` per existing buffer tests — confirm the exact name/signature in this file and mirror it).
@@ -91,13 +99,13 @@ Task order: **1 → 2 → 3 → 4.** Task 4 consumes Task 1's helper; Tasks 2 an
         use unicode_segmentation::UnicodeSegmentation;
         let line = self.byte_to_line(caret);
         let line_start = self.line_to_byte(line);
-        let prefix = self.slice(line_start..caret).to_string(); // the line up to the caret
+        let prefix = self.slice(line_start..caret); // `String` — the line up to the caret
         let col = UnicodeSegmentation::graphemes(prefix.as_str(), true).count();
         (line + 1, col + 1)
     }
 ```
 
-> If `self.slice(..)` already yields an owned `String`/`Cow<str>` you can drop `.to_string()` and take `.as_ref()` — match the real `slice` return type (the one `word_count_segment` passes). The behavior (grapheme count over the line prefix) is the contract.
+> `slice(..)` returns an owned `String` (confirmed), so no extra `.to_string()` is needed — call `.as_str()` directly. The behavior (grapheme count over the line prefix) is the contract.
 
 - [ ] **Step 4: Run** `cargo test -p wordcartel-core caret_line_col` — PASS. Then `cargo test -p wordcartel-core` — green.
 
@@ -201,6 +209,27 @@ And add to the `cua` preset (keymap.rs `CUA` table): `("ctrl-a", "select_all"),`
         // line 3 ("three") starts at byte 8
         assert_eq!(e.active().document.selection.primary().head, e.active().document.buffer.line_to_byte(2));
         assert!(e.minibuffer.is_none(), "submit closes the minibuffer");
+        // jump-back: the origin (end) was recorded so the user can return.
+        // (Asserts record_jump fired — would fail if removed. Use the real jump-ring
+        // field/accessor; jump_ring is on the active Buffer.)
+        assert!(e.active().jump_ring.contains(&end), "goto recorded the origin for jump-back");
+    }
+
+    #[test]
+    fn goto_line_into_folded_body_unfolds_to_reveal_target() {
+        // Spec §2 / Codex: a goto target inside a folded body must UNFOLD, not land hidden.
+        // Mirror an existing 5g fold test for the setup: build a doc with a foldable
+        // heading + body, fold it (the fold-by-heading command / FoldView), then goto a
+        // line INSIDE the folded body and assert (a) the caret lands at that line's start
+        // and (b) the fold covering the target is gone (the target line is visible again).
+        let mut e = Editor::new_from_text("# H\n\nbody one\nbody two\nbody three\n", None, (40, 12));
+        crate::derive::rebuild(&mut e);
+        // …fold the "# H" section via the real fold API (mirror the 5g fold test)…
+        // goto line 4 ("body two"), which is inside the folded body:
+        crate::app::goto_line_submit(&mut e, "4");
+        assert_eq!(e.active().document.selection.primary().head, e.active().document.buffer.line_to_byte(3));
+        // assert the section is no longer folded over the target (use the real fold-state
+        // query the 5g tests use — e.g. the FoldView/`folds` no longer hides line index 3).
     }
 
     #[test]
@@ -285,11 +314,12 @@ pub(crate) fn goto_line_submit(editor: &mut crate::editor::Editor, text: &str) {
     editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(caret);
     editor.active_mut().desired_col = None;
     editor.active_mut().sel_history.clear();
+    crate::derive::rebuild(editor);   // UnfoldTo can change fold state → relayout (mirrors registry.rs:409 / app.rs:680)
     crate::nav::ensure_visible(editor);
 }
 ```
 
-- [ ] **Step 7: Run** `cargo test -p wordcartel goto_line minibuffer` + `cargo test -p wordcartel --lib` — green. The existing `minibuffer_routing_and_submit_dispatches_filter` test must still pass (it now constructs/opens with `Filter`).
+- [ ] **Step 7: Run** `cargo test -p wordcartel goto_line` then `cargo test -p wordcartel --lib` — green (one filter per `cargo test`; the full `--lib` run covers the existing `minibuffer_routing_and_submit_dispatches_filter`, which must still pass now that it constructs/opens with `Filter`).
 
 - [ ] **Step 8: Commit** `feat(8): Go to line (Ctrl+G) — minibuffer kind, clamp, jumplist, fold-aware`
 
@@ -348,7 +378,7 @@ pub(crate) fn goto_line_submit(editor: &mut crate::editor::Editor, text: &str) {
 
 > Use the real private render test helpers `render_to_buffer`/`row_string`. Adapt the caret byte offsets to the real strings; the assertions (Ln/Col present with word-count on, absent with it off, identical across views) are the contract.
 
-- [ ] **Step 2: Run — fails** (no position in status). `cargo test -p wordcartel status_shows_ln_col status_hides_ln_col ln_col_is_view_independent`
+- [ ] **Step 2: Run — fails** (no position in status). `cargo test -p wordcartel ln_col` (single filter; all three test names contain `ln_col`).
 
 - [ ] **Step 3: Implement.** In `render.rs`, in the right-segment branch (~line 619-620), prepend the position to the word-count text:
 ```rust
@@ -361,7 +391,7 @@ pub(crate) fn goto_line_submit(editor: &mut crate::editor::Editor, text: &str) {
 ```
 Keep the rest of the flush-right + truncation logic exactly as-is (it already guards tiny terminals and is suppressed under overlays). Only the `right` string gains the `Ln {l}, Col {c} · ` prefix.
 
-- [ ] **Step 4: Run** `cargo test -p wordcartel render:: status_shows status_hides ln_col` + `cargo test -p wordcartel --lib` — green. No other status/render golden should change (position only appears when word_count is on, which the existing render tests don't enable unless they assert the count).
+- [ ] **Step 4: Run** `cargo test -p wordcartel ln_col` then `cargo test -p wordcartel --lib` — green. No other status/render golden should change (position only appears when word_count is on, which the existing render tests don't enable unless they assert the count).
 
 - [ ] **Step 5: Commit** `feat(8): Ln,Col cursor-position status indicator (rides word-count segment)`
 
