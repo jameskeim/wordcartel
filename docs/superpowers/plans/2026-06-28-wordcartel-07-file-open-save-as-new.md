@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - **No `wordcartel-core` change.** New commands register through the name-keyed registry (palette-reachable, config-bindable). cua binds `ctrl-o`→`open`, `ctrl-shift-s`→`save_as`, `ctrl-n`→`new` (all verified free); WordStar binds deferred.
-- **`BufferId`s are never reused** (job routing is by `BufferId`+`version`). `Buffer::from_file` takes a caller-allocated id; `open_into_current` allocates a **fresh** id so in-flight jobs for the replaced buffer are ignored by `apply_result`'s `is_stale`.
+- **`BufferId`s are never reused** (job routing is by `BufferId`). `Buffer::from_file` takes a caller-allocated id; `open_into_current` allocates a **fresh** id so an in-flight save/swap job for the *replaced* buffer — whose merge routes through `by_id_mut(old_id)` — finds **no** matching buffer and harmlessly no-ops (it cannot mutate the new file). (Durability jobs are not dropped by `is_stale`; the id mismatch is what protects them — Codex.)
 - **Save-As failure must not mutate state:** the target path rides the job; `document.path`/`stored_fp`/`saved_version` and the prior swap change **only in the success merge**.
 - **In-app swap recovery is DEFERRED** (the swap persists; next launch recovers). Resume-on-open is kept.
 - **Single-overlay XOR:** `file_browser` joins the XOR set everywhere `theme_picker` is cleared.
@@ -180,7 +180,7 @@ Reimplement `new_from_text` to use `from_text` (replace the inline `document`/`v
 - [ ] **Step 5: Implement `open_into_current` + factor `restore_resume`.** Factor the launch resume logic (run()'s resume block ~app.rs:1506 — `state::load`/`file_identity` staleness guard/`apply_resume`/`load_marks_from_entry`) into a shared `fn restore_resume(editor: &mut Editor, path: &Path)` that **reloads `state::load()`** (so it works with only `&mut Editor`, which `apply_result` has), and call it from BOTH `run()` (replacing the inline block — behavior unchanged) and `open_into_current`:
 ```rust
 pub fn open_into_current(editor: &mut crate::editor::Editor, path: &std::path::Path) {
-    let id = editor.alloc_id(); // FRESH id → stale in-flight jobs for the replaced buffer are ignored
+    let id = editor.alloc_id(); // FRESH id → an in-flight job for the old buffer merges via by_id_mut(old_id)=None (no-op)
     let area = editor.active().view.area;
     match crate::editor::Buffer::from_file(id, path, area) {
         Ok(b) => {
@@ -194,7 +194,7 @@ pub fn open_into_current(editor: &mut crate::editor::Editor, path: &std::path::P
     }
 }
 ```
-> `restore_resume` must reuse the SAME staleness guard (`state::file_identity` mtime+size) and `apply_resume`/`load_marks_from_entry` the launch path uses — factor, don't fork. Keep launch behavior byte-identical (existing resume tests pass).
+> `restore_resume` must reuse the SAME launch resume block verbatim (app.rs ~1506-1520): the `state::file_identity` mtime+size staleness guard, `apply_resume` (cursor+scroll), `load_marks_from_entry`, **AND the fold restore + `folds.reconcile(...)`** the launch path does (Codex — don't drop folds). Factor, don't fork; keep launch behavior byte-identical (existing resume tests pass).
 
 - [ ] **Step 6: Run** `cargo test -p wordcartel buffer_from_file` + `cargo test -p wordcartel open_into_current` + `cargo test -p wordcartel --lib` — green (all existing open/run/resume tests pass unchanged).
 
@@ -250,46 +250,57 @@ pub fn open_into_current(editor: &mut crate::editor::Editor, path: &std::path::P
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PostSaveAction { Quit, Open(std::path::PathBuf), New }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PendingAfterSave { pub version: u64, pub action: PostSaveAction, pub at_ms: u64 }
+pub struct PendingAfterSave { pub buffer_id: BufferId, pub version: u64, pub action: PostSaveAction, pub at_ms: u64 }
 // in Editor: pub pending_after_save: Option<PendingAfterSave>,   (init None)
 ```
-Add a trivial helper used by `New` and (later) New command:
+> **`buffer_id` added (Codex advisory):** carry the originating buffer id so the action fires only for *that* buffer's save — version-only is single-buffer-only; this keeps Effort 6 from re-threading it.
+
+Add a trivial helper used by `New` (and the New command, Task 4):
 ```rust
 impl Editor {
-    /// Replace the active buffer with a fresh unnamed scratch buffer.
+    /// Replace the active buffer with a fresh unnamed scratch buffer, then relayout.
     pub fn replace_active_with_scratch(&mut self) {
         let id = self.alloc_id();
         let area = self.active().view.area;
-        let b = Buffer::from_text(id, "\n", None, area);
-        let a = self.active; self.buffers[a] = b;
+        let a = self.active; self.buffers[a] = Buffer::from_text(id, "\n", None, area);
     }
 }
 ```
-In `save.rs::dispatch_save_and_quit`, replace the `quit_after_save = Some(v)` arming with:
+> After calling `replace_active_with_scratch`, the caller runs `derive::rebuild(editor)` + `nav::ensure_visible(editor)` (the new scratch buffer's `line_layouts` is empty — Codex). The `apply_result` `New` arm and `request_new` both do this.
+
+**Factor the arming into a general `dispatch_save_then` (Codex #4/#5).** In `save.rs`, replace `dispatch_save_and_quit`'s inline arming with a reusable form that goes through `dispatch_save` (so the **external-mod fingerprint check is NOT bypassed**) and arms only if a job was actually dispatched:
 ```rust
+/// Run `dispatch_save` (external-mod-checked), then arm `pending_after_save` with `action`
+/// IFF a save job was dispatched (named buffer, no modal raised).
+pub(crate) fn dispatch_save_then(ctx: &mut Ctx, action: crate::editor::PostSaveAction) {
+    let buffer_id = ctx.editor.active().id;
+    let v = ctx.editor.active().document.version;
+    dispatch_save(ctx);
     if ctx.editor.active().document.path.is_some() && ctx.editor.prompt.is_none() {
         ctx.editor.pending_after_save = Some(crate::editor::PendingAfterSave {
-            version: v, action: crate::editor::PostSaveAction::Quit, at_ms: ctx.clock.now_ms(),
+            buffer_id, version: v, action, at_ms: ctx.clock.now_ms(),
         });
     }
+}
+pub(crate) fn dispatch_save_and_quit(ctx: &mut Ctx) { dispatch_save_then(ctx, crate::editor::PostSaveAction::Quit); }
 ```
-In `app.rs::apply_result`, replace the `quit_after_save` block with the generalized dispatch:
+In `app.rs::apply_result`, replace the `quit_after_save` block with the generalized dispatch (gated on the originating buffer id):
 ```rust
     if kind == crate::jobs::JobKind::Save {
         if let Some(p) = &editor.pending_after_save {
             let saved_clean = editor.by_id(buffer_id).map(|b| b.document.saved_version) == Some(Some(version));
-            if p.version == version && saved_clean {
+            if p.buffer_id == buffer_id && p.version == version && saved_clean {
                 let action = editor.pending_after_save.take().unwrap().action;
                 match action {
                     crate::editor::PostSaveAction::Quit => editor.quit = true,
-                    crate::editor::PostSaveAction::New  => editor.replace_active_with_scratch(),
+                    crate::editor::PostSaveAction::New  => { editor.replace_active_with_scratch(); crate::derive::rebuild(editor); crate::nav::ensure_visible(editor); }
                     crate::editor::PostSaveAction::Open(path) => crate::app::open_into_current(editor, &path),
                 }
             }
         }
     }
 ```
-Generalize the save-quit **timeout** (app.rs ~1566, the `quit_after_save_at`/`SAVE_QUIT_TIMEOUT_MS` block) to read/clear `editor.pending_after_save` (`p.at_ms`).
+Generalize the save-quit **timeout** (app.rs ~1558, the `quit_after_save_at`/`SAVE_QUIT_TIMEOUT_MS` block) to read/clear `editor.pending_after_save` (`p.at_ms`). Update the existing tests that reference `quit_after_save`/`quit_after_save_at` (app.rs ~2168) to the new field.
 
 - [ ] **Step 4: Run** `cargo test -p wordcartel save_and_quit` + `cargo test -p wordcartel --lib` — green (the unnamed-no-arm test still passes; the timeout test still passes).
 
@@ -369,7 +380,8 @@ Generalize the save-quit **timeout** (app.rs ~1566, the `quit_after_save_at`/`SA
 
 - [ ] **Step 3: Implement the save-job refactor + SaveAs merge.** In `save.rs`:
 ```rust
-pub enum SaveMode { Normal, SaveAs }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SaveMode { Normal, SaveAs }   // Copy → free to `matches!` repeatedly in the moved closure (Codex)
 
 /// Dispatch a Save job writing `target`. SaveMode::SaveAs re-keys the buffer on success.
 pub(crate) fn do_save_to(ctx: &mut Ctx, target: std::path::PathBuf, mode: SaveMode) {
@@ -400,11 +412,17 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: std::path::PathBuf, mode: SaveMo
                                     if matches!(mode, SaveMode::SaveAs) { crate::swap::delete(prior_key.as_deref()); }
                                 } else {
                                     status = format!("Saved v{v} (still editing)");
-                                    // Staged re-key: dropped the old key but the buffer is dirty →
-                                    // protect the NEW path immediately so there is no gap.
+                                    // Staged re-key (Codex): the buffer was edited during the write
+                                    // (now v+1). Delete the prior/scratch swap (its v content is now
+                                    // ON DISK at `target`, and leaving a scratch swap would trigger a
+                                    // spurious recovery next launch) and EXPEDITE a swap under the new
+                                    // path: `last_swap_at = None` makes the next `due()` fire promptly,
+                                    // writing a swap for the v+1 body under `target`. Exposure for the
+                                    // v→v+1 keystrokes is bounded by the normal swap cadence (the same
+                                    // window normal editing has between periodic swap writes).
                                     if matches!(mode, SaveMode::SaveAs) {
                                         crate::swap::delete(prior_key.as_deref());
-                                        b.last_swap_at = None; // force the next due() to write a swap under `target`
+                                        b.last_swap_at = None;
                                     }
                                 }
                             }
@@ -442,7 +460,7 @@ pub fn open_save_as(editor: &mut crate::editor::Editor) {
 }
 
 pub fn save_as_submit(editor: &mut crate::editor::Editor, text: &str,
-                      executor: &dyn crate::jobs::Executor, clock: &dyn crate::jobs::Clock,
+                      executor: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
                       msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
     let t = text.trim();
     if t.is_empty() { editor.status = "save-as: empty path".into(); editor.pending_save_as = None; return; }
@@ -464,17 +482,18 @@ pub fn save_as_submit(editor: &mut crate::editor::Editor, text: &str,
 }
 
 fn perform_save_as(editor: &mut crate::editor::Editor, target: std::path::PathBuf,
-                   executor: &dyn crate::jobs::Executor, clock: &dyn crate::jobs::Clock,
+                   executor: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
                    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
     let v = editor.active().document.version;
+    let buffer_id = editor.active().id;
     { let mut ctx = crate::registry::Ctx { editor, clock, executor, msg_tx: msg_tx.clone() };
       crate::save::do_save_to(&mut ctx, target, crate::save::SaveMode::SaveAs); }
     if let Some(action) = editor.pending_save_as.take() {
-        editor.pending_after_save = Some(crate::editor::PendingAfterSave { version: v, action, at_ms: clock.now_ms() });
+        editor.pending_after_save = Some(crate::editor::PendingAfterSave { buffer_id, version: v, action, at_ms: clock.now_ms() });
     }
 }
 ```
-Route the minibuffer `Enter` (app.rs ~1003) — add `MinibufferKind::SaveAs => save_as_submit(editor, &mb.text, executor, clock, msg_tx)` (the submit site has `executor`/`clock`/`msg_tx` in scope — confirm and thread them). Add the resolve_prompt arm: `PromptAction::OverwriteSaveAs => { if let Some(t) = editor.pending_save_overwrite.take() { perform_save_as(editor, t, ex, clock, msg_tx); } }`, and ensure `PromptAction::Cancel` clears `pending_save_overwrite` and `pending_save_as`. Register `save_as` (File menu) → `|c| { crate::app::open_save_as(c.editor); CommandResult::Handled }`; cua bind `("ctrl-shift-s", "save_as")`.
+Route the minibuffer `Enter` (app.rs ~1003) — add `crate::minibuffer::MinibufferKind::SaveAs => save_as_submit(editor, &mb.text, ex, clock, msg_tx)` — **the submit site's variables are named `ex`, `clock`, `msg_tx`** (not `executor`) — Codex. Add the resolve_prompt arm: `PromptAction::OverwriteSaveAs => { if let Some(t) = editor.pending_save_overwrite.take() { perform_save_as(editor, t, ex, clock, msg_tx); } }`. **Clear the carriers on EVERY cancel/dismiss path (Codex):** `PromptAction::Cancel` clears both `pending_save_overwrite` and `pending_save_as`; the **Save-As minibuffer Esc** (the minibuffer-dismiss path) clears `pending_save_as`; the **dirty-guard Cancel** (Task 4) clears `pending_save_as`. Register `save_as` (File menu) → `|c| { crate::app::open_save_as(c.editor); CommandResult::Handled }`; cua bind `("ctrl-shift-s", "save_as")`.
 
 - [ ] **Step 4: Run** `cargo test -p wordcartel save_as` + `cargo test -p wordcartel --lib` — green (existing save tests unaffected: `do_save`→`do_save_to(Normal)` is behavior-identical).
 
@@ -531,7 +550,7 @@ Route the minibuffer `Enter` (app.rs ~1003) — add `MinibufferKind::SaveAs => s
 /// Dirty-guard: perform `action` now if clean, else raise the Save/Discard/Cancel modal
 /// (the intent is held in pending_save_as until the choice resolves).
 fn request_replace(editor: &mut crate::editor::Editor, action: crate::editor::PostSaveAction,
-                   ex: &dyn crate::jobs::Executor, clock: &dyn crate::jobs::Clock,
+                   ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
                    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
     if !editor.active().document.dirty() { perform_post_save_action(editor, action, ex, clock, msg_tx); return; }
     editor.pending_save_as = Some(action);
@@ -540,17 +559,17 @@ fn request_replace(editor: &mut crate::editor::Editor, action: crate::editor::Po
 
 /// Perform a PostSaveAction immediately (no save): used for the clean path and Discard.
 fn perform_post_save_action(editor: &mut crate::editor::Editor, action: crate::editor::PostSaveAction,
-                            ex: &dyn crate::jobs::Executor, clock: &dyn crate::jobs::Clock,
+                            ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
                             msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
     match action {
-        crate::editor::PostSaveAction::New => editor.replace_active_with_scratch(),
-        crate::editor::PostSaveAction::Open(p) => open_into_current(editor, &p), // Task 5
+        crate::editor::PostSaveAction::New => { editor.replace_active_with_scratch(); crate::derive::rebuild(editor); crate::nav::ensure_visible(editor); }
+        crate::editor::PostSaveAction::Open(p) => open_into_current(editor, &p), // Task 5 triggers; defined Task 1
         crate::editor::PostSaveAction::Quit => editor.quit = true,
     }
 }
 
 pub fn request_new(editor: &mut crate::editor::Editor, ex: &dyn crate::jobs::Executor,
-                   clock: &dyn crate::jobs::Clock, msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
+                   clock: &dyn wordcartel_core::history::Clock, msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
     request_replace(editor, crate::editor::PostSaveAction::New, ex, clock, msg_tx);
 }
 ```
@@ -560,21 +579,21 @@ resolve_prompt arms (the dirty-guard choices):
         if let Some(action) = editor.pending_save_as.take() { perform_post_save_action(editor, action, ex, clock, msg_tx); }
     }
     PromptAction::SaveAndProceed => {
-        let action = editor.pending_save_as.clone(); // keep until armed/routed
         editor.prompt = None;
         if editor.active().document.path.is_some() {
-            // named: save now, arm pending_after_save with the intent
-            let v = editor.active().document.version;
-            { let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
-              crate::save::do_save_to(&mut ctx, ctx.editor.active().document.path.clone().unwrap(), crate::save::SaveMode::Normal); }
-            if let Some(a) = action { editor.pending_after_save = Some(crate::editor::PendingAfterSave { version: v, action: a, at_ms: clock.now_ms() }); }
-            editor.pending_save_as = None;
+            // NAMED: go through dispatch_save_then so the external-mod fingerprint check is NOT
+            // bypassed (Codex). It arms pending_after_save{action} iff a job was dispatched
+            // (no external-mod modal raised). The carrier moves into the arm.
+            let action = editor.pending_save_as.take().unwrap_or(crate::editor::PostSaveAction::New);
+            let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
+            crate::save::dispatch_save_then(&mut ctx, action);
         } else {
-            // unnamed: route into Save-As, carrying the intent in pending_save_as (already set)
+            // UNNAMED: route into Save-As, carrying the intent in pending_save_as (already set).
             open_save_as(editor);
         }
     }
 ```
+> No overlapping borrow: `dispatch_save_then` captures the path/version internally (Codex). If `dispatch_save` raised the external-mod modal (conflict), it did **not** arm — and `pending_save_as` was already taken; that's acceptable (the user resolves the modal, then re-issues). The carrier is cleared on the dirty-guard **Cancel** arm too.
 > `open_into_current` already exists (Task 1), so the `Open` arm compiles; it is *triggered* in Task 5 (this task triggers only `New`). Register `new` (File) → `|c| { crate::app::request_new(c.editor, c.executor, c.clock, &c.msg_tx); CommandResult::Handled }`; cua bind `("ctrl-n", "new")`.
 
 - [ ] **Step 4: Run** `cargo test -p wordcartel new_on_` + an integration test that resolves Discard→scratch and Cancel→untouched + `cargo test -p wordcartel --lib` — green.
@@ -588,7 +607,8 @@ resolve_prompt arms (the dirty-guard choices):
 **Files:**
 - Create: `wordcartel/src/file_browser.rs`; Modify: `wordcartel/src/lib.rs` (`pub mod file_browser`)
 - Modify: `wordcartel/src/editor.rs` (`file_browser: Option<FileBrowser>` field + `open_file_browser` + `file_browser = None` in every other `open_*`)
-- Modify: `wordcartel/src/app.rs` (`file_browser` key block + render; `open_into_current`; Enter-on-file → `request_replace(Open(path))`)
+- Modify: `wordcartel/src/app.rs` (`file_browser` **key block** in `reduce`; Enter-on-file → `request_replace(Open(path))`)
+- Modify: `wordcartel/src/render.rs` (**file_browser render** alongside palette/outline/theme_picker at render.rs:686/746/792; add `file_browser` to the `has_overlay` check at render.rs:618 if chrome/status depends on an open overlay) — **Codex: rendering lives in render.rs, not app.rs**
 - Modify: `wordcartel/src/registry.rs` (`open` + `file_browser=None` in menu/`dispatch_overlay_command`), `keymap.rs` (cua `ctrl-o`), `mouse.rs` (absorb)
 - Test: `wordcartel/src/file_browser.rs` + `wordcartel/src/app.rs` `#[cfg(test)]`
 
@@ -675,7 +695,7 @@ pub fn rebuild_entries(fb: &mut FileBrowser) {
 }
 ```
 `lib.rs`: `pub mod file_browser;`. `editor.rs`: add `pub file_browser: Option<crate::file_browser::FileBrowser>,` (init None) + `open_file_browser(dir)` (mirror `open_theme_picker`: clear all other overlays incl `file_browser`, then set it with `rebuild_entries`), and add `self.file_browser = None;` to EVERY other `open_*` helper (open_minibuffer/open_prompt/open_palette/open_menu/open_search/open_diag/open_outline/open_theme_picker).
-Add the `file_browser` **key block** in `app.rs` (mirror the `theme_picker` block ~870): printable→`query`+`rebuild_entries`; Backspace→pop+rebuild; Up/Down→`selected`; Enter→ if `entries[selected].is_dir` set `dir` (join `..`→parent / name→child), clear query, rebuild, selected=0 — else `let path = fb.dir.join(name); editor.file_browser=None; request_replace(editor, crate::editor::PostSaveAction::Open(path), executor, clock, msg_tx);` (the dirty-guard from Task 4 handles clean→immediate `open_into_current` vs dirty→modal); Esc→`file_browser=None`; drain async `ClipboardPaste` (mirror the other overlays). Add the **render** (mirror the `theme_picker`/outline overlay render). Register `open` (File) → `|c| { let dir = c.editor.active().document.path.as_ref().and_then(|p| p.parent()).map(|d| d.to_path_buf()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default()); c.editor.open_file_browser(dir); CommandResult::Handled }`; cua bind `("ctrl-o", "open")`; clear `file_browser` in `registry.rs` menu/`dispatch_overlay_command`; absorb in `mouse.rs`.
+Add the `file_browser` **key block** in `app.rs` (mirror the `theme_picker` block ~870): printable→`query`+`rebuild_entries`; Backspace→pop+rebuild; Up/Down→`selected`; Enter→ if `entries[selected].is_dir` set `dir` (join `..`→parent / name→child), clear query, rebuild, selected=0 — else `let path = fb.dir.join(name); editor.file_browser=None; request_replace(editor, crate::editor::PostSaveAction::Open(path), executor, clock, msg_tx);` (the dirty-guard from Task 4 handles clean→immediate `open_into_current` vs dirty→modal); Esc→`file_browser=None`; drain async `ClipboardPaste` (mirror the other overlays). Add the **render in `render.rs`** (mirror the `theme_picker`/outline overlay render at render.rs:686/746/792 — NOT app.rs; Codex), and add `file_browser` to `has_overlay` (render.rs:618) if needed. Register `open` (File) → `|c| { let dir = c.editor.active().document.path.as_ref().and_then(|p| p.parent()).map(|d| d.to_path_buf()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default()); c.editor.open_file_browser(dir); CommandResult::Handled }`; cua bind `("ctrl-o", "open")`; clear `file_browser` in `registry.rs` menu/`dispatch_overlay_command`; absorb in `mouse.rs`.
 
 - [ ] **Step 4: Run** `cargo test -p wordcartel file_browser` + `cargo test -p wordcartel open_into_current` + `cargo test -p wordcartel --lib` + `cargo test` (workspace) — all green.
 
