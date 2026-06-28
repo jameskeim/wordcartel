@@ -21,10 +21,25 @@ single-buffer behavior runs on top of multi-buffer-ready infrastructure:
 - `Editor.buffers: Vec<Buffer>` + `active: usize` (editor.rs) — already a
   collection, currently only ever holding one member.
 - `BufferId(u64)` + `Editor::alloc_id()` + `by_id()` / `by_id_mut()`.
-- Async jobs (save, filter, export, clipboard paste) already carry `buffer_id`
-  and merge via `by_id_mut(buffer_id)` — never `active()` — so a result lands on
-  its originating buffer even after a buffer switch. (save.rs cites "multi-buffer,
-  Effort 6" verbatim.)
+- **Save, filter, and clipboard-paste** results already carry `buffer_id` and
+  merge via `by_id_mut(buffer_id)` — never `active()` — so they land on the
+  originating buffer even after a switch (save.rs:61; filter app.rs:191;
+  clipboard app.rs:659). (save.rs cites "multi-buffer, Effort 6" verbatim.)
+- **Export is the exception** (Codex I1): it captures `buffer_id` (export.rs:98)
+  but the reducer discards it — `apply_export_done` writes a file path and sets
+  status, with no buffer merge (app.rs:232, 1608). That's fine: export targets a
+  *file*, not a buffer, so it needs no per-buffer routing. Effort 6 leaves export
+  as-is; the only open question is whether the export *overwrite prompt* should be
+  bound to its originating buffer — decided **no** for now (the prompt is modal and
+  resolved before any switch matters; revisit only if export becomes async-and-
+  switchable).
+- **Filter/transform are global single-flight** (Codex I2): `filter_in_flight` /
+  `transform_in_flight` are single flags on `Editor` (editor.rs:288) and a second
+  job is rejected workspace-wide (filter.rs:327; app.rs:178 already notes per-buffer
+  tracking would be needed for concurrency). **Effort 6 deliberately keeps these
+  single-flight across the whole workspace** — no per-buffer job maps. (YAGNI; a
+  filter is a brief modal-ish operation. Per-buffer concurrent jobs are out of
+  scope.)
 - **Per-buffer state already lives on `Buffer`/`Document`:** selection/cursor,
   `marks`, `jump_ring`, `folds`, `marked_block`, `view.scroll`. Switching buffers
   therefore preserves each buffer's state for free.
@@ -64,15 +79,33 @@ single-buffer behavior runs on top of multi-buffer-ready infrastructure:
 
 - A permanent, un-closeable, path-less `Buffer` named `*scratch*`, created at
   startup as a normal member of `Editor.buffers`.
-- Tracked via a stored `Editor.scratch_id: BufferId` so lifecycle rules can
-  special-case it (cannot close; excluded from throwaway-reuse; excluded from
-  dirty/quit accounting; excluded from the "last non-scratch buffer" invariant).
+- **`Editor.scratch_id: BufferId` is a NEW field** (Codex I6 — it does not exist
+  today: editor.rs:271 has `buffers` / `active` / `next_buffer_id` only). Lifecycle
+  rules special-case scratch by id: cannot close; excluded from throwaway-reuse;
+  excluded from dirty/quit accounting; excluded from the "last non-scratch buffer"
+  invariant.
+- **Startup change** (Codex I6): today init creates one buffer and replaces
+  `buffers[0]` with the CLI file (app.rs:1725), and a test pins
+  `buffers.len() == 1` (editor.rs:683). Effort 6 init instead creates the scratch
+  buffer **plus** one ordinary buffer (the CLI file, or an empty untitled buffer);
+  `scratch_id` is recorded; the old slot-0 replacement becomes the normal
+  throwaway-reuse path. The single-buffer test (editor.rs:683) is updated to the
+  new startup invariant (one ordinary buffer + scratch).
 - It is a full member of the buffer list: reachable via cycle, switcher palette,
   and `goto_scratch`.
 - Every existing command works inside it unchanged (motion, block, fold, search,
   copy/paste).
-- **Never considered "dirty"**: it has no file and is auto-persisted to session
-  state, so all save/quit prompts skip it.
+- **Never considered "dirty" — via a new predicate** (Codex I3): dirty is computed
+  purely as `Some(version) != saved_version` (editor.rs:53), and `Buffer::apply`
+  bumps `document.version` on every edit (editor.rs:167) — so an edited scratch
+  buffer *would* read as dirty under the raw predicate. Effort 6 adds
+  **`Editor::is_dirty(buffer_id) -> bool`** that returns `false` for `scratch_id`
+  and otherwise applies the raw predicate. All dirty-sensitive sites route through
+  it: the status-line dirty marker, quit accounting, the close prompt, the
+  throwaway-reuse check, and **swap-eligibility** (app.rs:1619 treats a dirty
+  active buffer as swap-eligible — scratch is path-less so the swap/persist path
+  already early-returns on `path == None` at app.rs:2023, but routing through
+  `is_dirty` makes the exclusion explicit rather than incidental).
 
 ### Scratch verbs
 
@@ -119,13 +152,22 @@ single-buffer behavior runs on top of multi-buffer-ready infrastructure:
     the scratch buffer.
 - **Quit with unsaved changes** → a single summary prompt: **Save All / Review
   each / Cancel**.
-  - Scratch is excluded from the unsaved count (auto-persisted).
-  - **Save All** saves every dirty buffer; a dirty *untitled* buffer triggers its
-    Save-As prompt (reuses Effort 7's `do_save_to` / Save-As machinery and the
-    `pending_after_save` post-save chaining).
-  - **Review each** drops into a per-buffer walk: switch-to → show → Save /
-    Discard / Cancel, one dirty buffer at a time, then quit.
-  - **Cancel** aborts the quit.
+  - Scratch is excluded from the unsaved count (via `is_dirty`, auto-persisted).
+  - **New multi-buffer quit-save state machine** (Codex I5): the existing
+    `Editor.pending_after_save` is a *single* `Option<PendingAfterSave>`
+    (editor.rs:280) and the current quit prompt only offers Save & quit / Quit
+    anyway / Cancel (prompt.rs:50) — neither can sequence N saves. Effort 6 adds a
+    quit-save driver on `Editor`: a **queue of dirty `BufferId`s** plus a `mode`
+    (SaveAll | ReviewEach) and a current Save-As target. It processes the queue one
+    buffer at a time, reusing Effort 7's per-buffer `do_save_to` / Save-As prompt
+    for each; `editor.quit` is set only when the queue **drains**. Any Cancel
+    (including Cancel inside an untitled buffer's Save-As) **aborts the whole quit**
+    and clears the queue — no data loss.
+  - **Save All** enqueues every dirty (non-scratch) buffer and drains the queue;
+    a dirty *untitled* buffer in the queue raises its Save-As prompt.
+  - **Review each** drains the same queue but, per buffer, switches-to → shows →
+    asks Save / Discard / Cancel before advancing.
+  - **Cancel** aborts the quit and clears the queue.
   - No single-key discard-all is offered.
 
 ### Keybindings
@@ -163,12 +205,22 @@ the same deliverability reason.
   staleness-guarded by mtime+size as today.
 - **The open-file set is NOT durable.** Launch opens only the file(s) named on the
   CLI / opened explicitly. No workspace-restore.
-- **Scratch content IS durable.** Persisted to a new path-less slot in
-  `state.toml` — a `[scratch]` section holding the scratch text and its cursor
-  offset — written by `persist_session` and restored at startup (before/around
-  the existing `restore_resume` flow). If no saved scratch exists, scratch starts
-  empty. Restored scratch cursor is clamped/snapped to a char boundary within
-  `[0, len]` (same discipline as 9A's `clamp_snap` for restored offsets).
+- **Scratch content IS durable** (schema corrected per Codex I4). `SessionState`
+  today serializes *only* `entries: BTreeMap<String, StateEntry>` (state.rs:37), so
+  a bare `[scratch]` key cannot just be dropped in. Effort 6 adds a **typed sibling
+  field** `scratch: Option<ScratchState>` to `SessionState` (kept *outside*
+  `entries`; `ScratchState { text: String, cursor: usize }`, `#[serde(default)]`).
+  Because it is a named struct field, it serializes as its own `[scratch]` table
+  with no key collision against the `[entries."/path"]` map.
+- **Persist must not piggyback on the active buffer.** `persist_session` currently
+  early-returns when the active buffer's `path == None` (app.rs:2023) and is
+  triggered off the active buffer's `saved_version` (app.rs:1967). Scratch is
+  path-less and frequently the *inactive* buffer, so its persistence is written
+  **explicitly and unconditionally** (whenever the workspace persists), independent
+  of which buffer is active and independent of the path==None early-return.
+- If no saved scratch exists, scratch starts empty. The restored scratch cursor is
+  clamped/snapped to a char boundary within `[0, len]` (same discipline as 9A's
+  `clamp_snap` for restored offsets) so a stale offset never panics a `slice()`.
 
 ### Status line
 
@@ -232,12 +284,43 @@ fallback.
 - move_block_to_scratch two-buffer mutation: source shortened, scratch grown;
   undo in source restores; undo in scratch removes; independence verified.
 - Scratch persistence round-trip: write text, persist, restore at startup;
-  out-of-range restored offset clamps (no slice panic).
+  out-of-range restored offset clamps (no slice panic); `SessionState.scratch`
+  serializes as a `[scratch]` table without colliding with `[entries."/path"]`.
+- `Editor::is_dirty`: returns false for an edited scratch buffer; true for an
+  edited ordinary buffer; status marker / quit count / close prompt / throwaway
+  reuse / swap-eligibility all honor it.
+- Quit-save state machine: Save-All drains a multi-buffer queue (incl. Save-As for
+  an untitled member); Review-each walks per buffer; Cancel mid-queue aborts the
+  whole quit and clears the queue (no buffer left half-processed).
 - Navigation: cycle wraps in stable order incl. scratch; switcher lists MRU
   order; goto_scratch jumps.
-- Keymap: both presets resolve `prev_buffer`/`next_buffer` (and the
-  plan-assigned chords) against builtins with no collision / prefix-shadow.
+- Keymap (Codex M1, explicit): add parse tests for the chord strings
+  `"ctrl-k ,"`, `"ctrl-k ."`, `"alt-,"`, `"alt-."` (the parser accepts any
+  single-char token, keymap.rs:99, but these specific tokens are not yet
+  test-pinned); and no-collision / no-prefix-shadow checks for the new commands in
+  both presets after registration (extending the existing
+  `both_presets_resolve_against_builtins` + WordStar prefix-shadow tests at
+  keymap.rs:713). Note CUA currently binds `ctrl-.` (keymap.rs:297) but not
+  `alt-,`/`alt-.`, and the WordStar `^K` subtree binds letters/digits but not
+  comma/period — both new homes are free.
 - Status line: `[i/n]` indicator; `*scratch*` / `*untitled*` display names.
+
+## New code surface (checklist for the plan; from Codex review)
+
+- `Editor.scratch_id: BufferId` field + scratch creation at init; remove the
+  startup `buffers[0]` replacement (app.rs:1725); update the single-buffer test
+  (editor.rs:683). [I6]
+- `Editor::is_dirty(BufferId) -> bool` (scratch-aware); route status marker, quit
+  count, close prompt, throwaway-reuse, swap-eligibility through it. [I3]
+- `SessionState.scratch: Option<ScratchState>` sibling field + explicit,
+  active-buffer-independent scratch persist/restore. [I4]
+- Quit-save state machine (queue of dirty `BufferId`s + SaveAll/ReviewEach mode +
+  Save-As target; quit only on drain; Cancel aborts). [I5]
+- `next_buffer`/`prev_buffer`/`switch_buffer`/`goto_scratch`/`close_buffer`/
+  `copy_block_to_scratch`/`move_block_to_scratch` commands + MRU access list on
+  `Editor`; keymap chords + parse/collision tests. [M1]
+- Export routing left as-is (file-targeted, no buffer merge); filter/transform
+  kept workspace-single-flight. [I1, I2]
 
 ## Out of scope (explicitly deferred)
 
