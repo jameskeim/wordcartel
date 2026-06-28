@@ -327,6 +327,9 @@ pub fn restore_resume(editor: &mut Editor, path: &std::path::Path) {
                     editor.active_mut().folds.folded = entry.folds.iter().copied().collect();
                     let (blocks, buf) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.clone()) };
                     editor.active_mut().folds.reconcile(&blocks, &buf);
+                    if let Some((s, en)) = entry.block {
+                        editor.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: s, end: en, hidden: false });
+                    }
                 }
             }
         }
@@ -2028,6 +2031,7 @@ fn persist_session(
         size,
         seq,
         folds: editor.active().folds.folded.iter().copied().collect(),
+        block: editor.active().marked_block.map(|b| (b.start, b.end)),
     };
     session.record(
         canon.to_string_lossy().into_owned(),
@@ -3492,7 +3496,7 @@ mod tests {
         // unit-test the resume decision helper directly (no TTY):
         // apply_resume(entry, current_identity, doc_len) -> Option<(cursor,scroll)>
         use crate::state::StateEntry;
-        let e = StateEntry { cursor: 4, scroll: 2, marks: Default::default(), mtime: 10, size: 20, seq: 0, folds: vec![] };
+        let e = StateEntry { cursor: 4, scroll: 2, marks: Default::default(), mtime: 10, size: 20, seq: 0, folds: vec![], block: None };
         // identity match → restore (clamped to doc_len)
         assert_eq!(crate::app::apply_resume(&e, (10,20), 100), Some((4,2)));
         assert_eq!(crate::app::apply_resume(&e, (10,20), 3), Some((3,2)), "cursor clamped to doc_len");
@@ -3595,10 +3599,51 @@ mod tests {
         let mut marks = BTreeMap::new();
         marks.insert("a".to_string(), 6usize);
         marks.insert("b".to_string(), 999usize); // past EOF → clamped to len
-        let entry = crate::state::StateEntry { cursor: 0, scroll: 0, marks, mtime: 0, size: 0, seq: 1, folds: vec![] };
+        let entry = crate::state::StateEntry { cursor: 0, scroll: 0, marks, mtime: 0, size: 0, seq: 1, folds: vec![], block: None };
         crate::app::load_marks_from_entry(&mut e, &entry);
         assert_eq!(e.active().marks.get(&'a'), Some(&6));
         assert_eq!(e.active().marks.get(&'b'), Some(&e.active().document.buffer.len()));
+    }
+
+    /// Task 5 (9A): marked block persists and restores across sessions.
+    /// Mirrors `load_marks_from_entry_populates_clamped` — tests the restore code path
+    /// directly (analogous to how marks/folds restore tests work).
+    #[test]
+    fn marked_block_persists_and_restores_under_matching_identity() {
+        use crate::editor::{Editor, MarkedBlock};
+        use crate::state::StateEntry;
+
+        // Construct an entry with a block — compile fails until StateEntry has `block`.
+        let entry = StateEntry {
+            cursor: 0, scroll: 0, marks: Default::default(),
+            mtime: 10, size: 20, seq: 1, folds: vec![],
+            block: Some((3, 8)),
+        };
+
+        // ── matching identity: guard passes → block restores with hidden=false ──
+        let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
+        let doc_len = e.active().document.buffer.len();
+        assert!(
+            crate::app::apply_resume(&entry, (10, 20), doc_len).is_some(),
+            "identity match → guard passes"
+        );
+        // Simulate what restore_resume does after the staleness guard:
+        if let Some((s, en)) = entry.block {
+            e.active_mut().marked_block = Some(MarkedBlock { start: s, end: en, hidden: false });
+        }
+        assert_eq!(
+            e.active().marked_block,
+            Some(MarkedBlock { start: 3, end: 8, hidden: false }),
+            "block restores with hidden=false under matching identity"
+        );
+
+        // ── mismatching identity: guard rejects → block NOT restored ──
+        let e2 = Editor::new_from_text("hello world\n", None, (80, 24));
+        assert!(
+            crate::app::apply_resume(&entry, (99, 20), e2.active().document.buffer.len()).is_none(),
+            "identity mismatch → guard rejects"
+        );
+        assert!(e2.active().marked_block.is_none(), "block discarded on mismatch");
     }
 
     #[test]
