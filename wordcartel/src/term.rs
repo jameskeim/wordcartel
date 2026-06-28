@@ -73,14 +73,36 @@ impl Drop for TerminalGuard {
 // install_panic_hook — call once from `app::run` before entering the loop
 // ---------------------------------------------------------------------------
 
+/// Returns `true` when `panicking` is the main thread that owns the terminal.
+///
+/// Extracted for testability: the hook itself cannot be unit-tested without
+/// real terminal I/O, but this predicate can be.
+pub(crate) fn should_handle_panic(
+    panicking: std::thread::ThreadId,
+    main: std::thread::ThreadId,
+) -> bool {
+    panicking == main
+}
+
 /// Install a panic hook that restores the terminal before chaining to the
 /// previous hook. Safe to call multiple times (uses `std::sync::Once`).
+///
+/// Only the main thread (the one that called `install_panic_hook`) triggers
+/// the dump + terminal restore.  A non-main-thread panic (job worker,
+/// clipboard helper, input reader) is caught by the thread's own
+/// `catch_unwind`; the hook must not touch the terminal there, or it corrupts
+/// the live UI while the main loop keeps running.
 pub fn install_panic_hook() {
     use std::sync::Once;
     static HOOK_INSTALLED: Once = Once::new();
     HOOK_INSTALLED.call_once(|| {
+        let main_id = std::thread::current().id();
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
+            // Non-main-thread panic (job/clipboard/input worker): caught by the
+            // thread's own catch_unwind; must NOT restore the terminal or it
+            // corrupts the live UI. No-op here.
+            if !should_handle_panic(std::thread::current().id(), main_id) { return; }
             // Best-effort emergency dump (try_lock; never deadlock).
             crate::recovery::dump_on_panic();
             // Restore the terminal.
@@ -89,4 +111,26 @@ pub fn install_panic_hook() {
             prev(info);
         }));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_handle_panic_same_thread_is_true() {
+        let id = std::thread::current().id();
+        assert!(should_handle_panic(id, id),
+            "same thread id must be handled (main-thread panic)");
+    }
+
+    #[test]
+    fn should_handle_panic_different_thread_is_false() {
+        let main_id = std::thread::current().id();
+        let worker_id = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .unwrap();
+        assert!(!should_handle_panic(worker_id, main_id),
+            "worker thread id must NOT be handled (non-main panic)");
+    }
 }
