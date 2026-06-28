@@ -268,6 +268,55 @@ pub fn load_marks_from_entry(editor: &mut Editor, entry: &crate::state::StateEnt
     }
 }
 
+/// Restore session-resume state (cursor, scroll, marks, folds) for `path` into the
+/// active buffer. Factored verbatim from run()'s launch resume block so launch and
+/// `open_into_current` share one code path. Reloads `state::load()` itself so it works
+/// with only `&mut Editor`. No-op if there is no matching/non-stale session entry.
+pub fn restore_resume(editor: &mut Editor, path: &std::path::Path) {
+    let session = crate::state::load();
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        let key = canon.to_string_lossy().into_owned();
+        if let Some(entry) = session.entries.get(&key) {
+            if let Some(identity) = crate::state::file_identity(path) {
+                let doc_len = editor.active().document.buffer.len();
+                if let Some((cur, scroll)) = apply_resume(entry, identity, doc_len) {
+                    let sel = wordcartel_core::selection::Selection::single(cur);
+                    editor.active_mut().document.selection = sel;
+                    editor.active_mut().view.scroll = scroll;
+                    load_marks_from_entry(editor, entry);
+                    editor.active_mut().folds.folded = entry.folds.iter().copied().collect();
+                    let (blocks, buf) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.clone()) };
+                    editor.active_mut().folds.reconcile(&blocks, &buf);
+                }
+            }
+        }
+    }
+}
+
+/// Open `path` into the active buffer slot (the buffer-load seam reused by Tasks 2/4/5).
+/// Allocates a FRESH id so an in-flight save/swap job for the replaced buffer merges via
+/// `by_id_mut(old_id)` → `None` (harmless no-op). On OpenError: set status, do NOT replace
+/// (keep the user's work).
+pub fn open_into_current(editor: &mut Editor, path: &std::path::Path) {
+    let id = editor.alloc_id(); // FRESH id → an in-flight job for the old buffer no-ops via by_id_mut(old_id)=None
+    let area = editor.active().view.area;
+    match crate::editor::Buffer::from_file(id, path, area) {
+        Ok(b) => {
+            let a = editor.active;
+            editor.buffers[a] = b;
+            if editor.resume_enabled {
+                restore_resume(editor, path);
+            }
+            crate::derive::rebuild(editor);
+            crate::nav::ensure_visible(editor);
+            editor.status = String::new();
+        }
+        Err(e) => {
+            editor.status = e.to_string();
+        }
+    }
+}
+
 /// Execute the action chosen in a modal prompt, then clear the prompt.
 pub fn resolve_prompt(
     action: PromptAction,
@@ -1349,44 +1398,38 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
 
     let path = cli.path;
 
-    // Open the file and branch on errors per §C5.
-    let editor = match path.as_deref() {
-        None => {
-            // No path given: scratch buffer.
-            Editor::new_from_text("\n", None, area)
+    // Open the file and branch on errors per §C5. Built on the Buffer::from_file seam
+    // (Effort 7 Task 1) without behavior change: Ok → named clean; NotFound → named "new
+    // file"; Binary/Permission/IsDir/Io → UNNAMED scratch kept + e.to_string() status.
+    let mut editor = Editor::new_from_text("\n", None, area); // scratch host; the real buffer (if any) replaces slot 0 below
+    if let Some(p) = path.as_deref() {
+        let id = editor.active().id; // reuse slot 0's id for the launch buffer
+        match crate::editor::Buffer::from_file(id, p, area) {
+            Ok(b) => {
+                let was_new_file = b.document.path.is_some() && !p.exists();
+                editor.buffers[0] = b;
+                if was_new_file {
+                    // New file: empty buffer NAMED with the path; first save creates it.
+                    editor.status = "new file".to_string();
+                }
+            }
+            // NotFound is mapped to Ok (named "new file") inside from_file, so it never
+            // reaches here; list it for exhaustiveness. The rest are rejected targets:
+            // UNNAMED scratch kept so a save can't clobber the file.
+            Err(e @ (file::OpenError::NotFound(_)
+                   | file::OpenError::Binary(_)
+                   | file::OpenError::Permission(_)
+                   | file::OpenError::IsDir(_)
+                   | file::OpenError::Io(_))) => {
+                editor.status = e.to_string();
+            }
         }
-        Some(p) => match file::open(p) {
-            Ok(text) => {
-                Editor::new_from_text(&text, Some(p.to_path_buf()), area)
-            }
-            Err(file::OpenError::NotFound(_)) => {
-                // New file: empty buffer NAMED with the path; first save creates it.
-                let mut e = Editor::new_from_text("\n", Some(p.to_path_buf()), area);
-                e.status = "new file".to_string();
-                e
-            }
-            Err(e @ file::OpenError::Binary(_))
-            | Err(e @ file::OpenError::Permission(_))
-            | Err(e @ file::OpenError::IsDir(_)) => {
-                // Rejected target: UNNAMED buffer so a save can't clobber it.
-                let mut ed = Editor::new_from_text("\n", None, area);
-                ed.status = e.to_string();
-                ed
-            }
-            Err(e @ file::OpenError::Io(_)) => {
-                // Generic IO error: also unnamed.
-                let mut ed = Editor::new_from_text("\n", None, area);
-                ed.status = e.to_string();
-                ed
-            }
-        },
-    };
-
-    let mut editor = editor;
+    }
 
     // Seed mouse_capture from config (default true; may be overridden by config layers).
     editor.mouse_capture = cfg.mouse.mouse_capture;
     editor.view_opts = cfg.view.clone();
+    editor.resume_enabled = cfg.state.resume; // gates open_into_current's resume restore (Effort 7)
     editor.diag_cfg = cfg.diagnostics.clone();
     // Resolve and seed the active theme + color depth (once, at startup — §3.6).
     let env = crate::theme_resolve::EnvSnapshot::from_env();
@@ -1503,27 +1546,13 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     // recorded entries always outrank loaded ones for LRU eviction (Codex pre-merge fix).
     let mut session_seq: u64 = session.next_seq();
 
-    // Resume-on-open: if cfg.state.resume is set, the buffer has a path, and the
-    // stored mtime+size identity matches → restore cursor and scroll.
+    // Resume-on-open: if cfg.state.resume is set and the buffer has a path, restore
+    // cursor/scroll/marks/folds via the shared seam (factored from this block so launch
+    // and open_into_current stay byte-identical). The staleness guard lives in
+    // restore_resume → apply_resume.
     if cfg.state.resume {
         if let Some(raw_path) = editor.active().document.path.clone() {
-            if let Ok(canon) = std::fs::canonicalize(&raw_path) {
-                let key = canon.to_string_lossy().into_owned();
-                if let Some(entry) = session.entries.get(&key) {
-                    if let Some(identity) = crate::state::file_identity(&raw_path) {
-                        let doc_len = editor.active().document.buffer.len();
-                        if let Some((cur, scroll)) = apply_resume(entry, identity, doc_len) {
-                            let sel = wordcartel_core::selection::Selection::single(cur);
-                            editor.active_mut().document.selection = sel;
-                            editor.active_mut().view.scroll = scroll;
-                            load_marks_from_entry(&mut editor, entry);
-                            editor.active_mut().folds.folded = entry.folds.iter().copied().collect();
-                            let (blocks, buf) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.clone()) };
-                            editor.active_mut().folds.reconcile(&blocks, &buf);
-                        }
-                    }
-                }
-            }
+            restore_resume(&mut editor, &raw_path);
         }
     }
 
@@ -1746,6 +1775,20 @@ mod tests {
     fn cua_keymap() -> crate::keymap::KeyTrie {
         let (t, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &crate::registry::Registry::builtins());
         t
+    }
+
+    #[test]
+    fn open_into_current_replaces_with_fresh_id_and_clean() {
+        use crate::editor::Editor;
+        let p = std::env::temp_dir().join(format!("wc-oic-{}.md", std::process::id()));
+        std::fs::write(&p, "opened\n").unwrap();
+        let mut e = Editor::new_from_text("scratch\n", None, (80, 24));
+        let old_id = e.active().id;
+        crate::app::open_into_current(&mut e, &p);
+        assert_ne!(e.active().id, old_id, "fresh id → stale in-flight jobs for old buffer are ignored");
+        assert_eq!(e.active().document.buffer.to_string(), "opened\n");
+        assert!(!e.active().document.dirty());
+        let _ = std::fs::remove_file(&p);
     }
 
     fn press(code: crossterm::event::KeyCode, mods: crossterm::event::KeyModifiers) -> Msg {
