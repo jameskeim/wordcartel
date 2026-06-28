@@ -267,6 +267,10 @@ impl Registry {
         // Marked block write-to-file (Task 4 / Effort 9A).
         r.register("block_write", "Write Block to File\u{2026}", Some(MenuCategory::File), |c| { crate::blocks_marked::block_write(c.editor); CommandResult::Handled });
 
+        // Effort 6: send-to-scratch verbs.
+        r.register("copy_block_to_scratch", "Copy Block to Scratch", Some(MenuCategory::Edit), |c| { crate::scratch::copy_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
+        r.register("move_block_to_scratch", "Move Block to Scratch", Some(MenuCategory::Edit), |c| { crate::scratch::move_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
+
         // Format menu — discrete transform commands (Task 1 / Effort 5b).
         r.register("reflow", "Reflow", Some(MenuCategory::Format), |c| {
             crate::transform::dispatch_transform(c.editor, crate::transform::TransformKind::Reflow, c.clock, &c.msg_tx);

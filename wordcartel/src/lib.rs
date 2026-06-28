@@ -38,3 +38,4 @@ pub mod theme_resolve;
 pub mod theme_picker;
 pub mod file_browser;
 pub mod blocks_marked;
+pub mod scratch;

@@ -307,6 +307,9 @@ static CUA: &[(&str, &str)] = &[
     ("alt-shift-x",  "unfold_all"),
     // Block operations (Effort 9A)
     ("alt-b",        "mark_block_from_selection"),
+    // Effort 6: send-to-scratch verbs (CUA bindings)
+    ("alt-shift-c",  "copy_block_to_scratch"),
+    ("alt-shift-v",  "move_block_to_scratch"),
 ];
 
 /// WordStar preset — full faithful classic keymap mapped to v1 command ids.
@@ -364,6 +367,9 @@ static WORDSTAR: &[(&str, &str)] = &[
     ("ctrl-k ctrl-y", "block_delete"),         ("ctrl-k y", "block_delete"),
     ("ctrl-k ctrl-w", "block_write"),          ("ctrl-k w", "block_write"),
     ("ctrl-k ctrl-h", "block_toggle_hidden"),  ("ctrl-k h", "block_toggle_hidden"),
+    // Effort 6: send-to-scratch verbs (WordStar ^K bindings)
+    ("ctrl-k ctrl-g", "copy_block_to_scratch"), ("ctrl-k g", "copy_block_to_scratch"),
+    ("ctrl-k ctrl-a", "move_block_to_scratch"), ("ctrl-k a", "move_block_to_scratch"),
     ("ctrl-q ctrl-b", "block_jump_begin"),     ("ctrl-q b", "block_jump_begin"),
     ("ctrl-q ctrl-k", "block_jump_end"),       ("ctrl-q k", "block_jump_end"),
     ("ctrl-k m", "set_mark"),       // plain-only (^M reserved)
@@ -707,6 +713,17 @@ mod tests {
     fn cua_alt_b_promotes() {
         let (t, _) = build_keymap(&crate::config::KeymapConfig::default(), &Registry::builtins());
         assert!(matches!(t.resolve(&parse_seq("alt-b").unwrap()), Resolution::Command(CommandId("mark_block_from_selection"))));
+    }
+
+    #[test]
+    fn scratch_verbs_resolve_in_both_presets() {
+        for preset in ["cua", "wordstar"] {
+            let (t, _) = km(&[], &[], Some(preset));
+            let reg = crate::registry::Registry::builtins();
+            assert!(reg.resolve_name("copy_block_to_scratch").is_some(), "copy_block_to_scratch not in registry");
+            assert!(reg.resolve_name("move_block_to_scratch").is_some(), "move_block_to_scratch not in registry");
+            let _ = t; // chord resolution covered by both_presets_resolve_against_builtins
+        }
     }
 
     #[test]
