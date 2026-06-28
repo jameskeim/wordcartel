@@ -314,9 +314,9 @@ static WORDSTAR: &[(&str, &str)] = &[
     ("ctrl-d", "move_right"),
     ("ctrl-e", "move_up"),
     ("ctrl-x", "move_down"),
-    // Word navigation (^A left-word, ^F right-word — best-effort to char motions)
-    ("ctrl-a", "move_left"),
-    ("ctrl-f", "move_right"),
+    // Word navigation (^A left-word, ^F right-word)
+    ("ctrl-a", "move_word_left"),
+    ("ctrl-f", "move_word_right"),
     // ^K block / file commands
     ("ctrl-k ctrl-s", "save"),
     ("ctrl-k ctrl-q", "quit"),
@@ -581,5 +581,16 @@ mod tests {
         assert!(matches!(km.resolve(&seq("alt-z")),         Resolution::Command(CommandId("fold_toggle"))));
         assert!(matches!(km.resolve(&seq("alt-shift-z")),   Resolution::Command(CommandId("fold_all"))));
         assert!(matches!(km.resolve(&seq("alt-shift-x")),   Resolution::Command(CommandId("unfold_all"))));
+    }
+
+    #[test]
+    fn wordstar_ctrl_a_f_are_word_motions() {
+        let cfg = crate::config::KeymapConfig { preset: "wordstar".into(), patches: vec![] };
+        let (t, w) = build_keymap(&cfg, &Registry::builtins());
+        assert!(w.is_empty(), "no warnings: {w:?}");
+        let a = parse_chord("ctrl-a").unwrap();
+        let f = parse_chord("ctrl-f").unwrap();
+        assert!(matches!(t.resolve(&[a]), Resolution::Command(CommandId("move_word_left"))), "^A = word-left");
+        assert!(matches!(t.resolve(&[f]), Resolution::Command(CommandId("move_word_right"))), "^F = word-right");
     }
 }
