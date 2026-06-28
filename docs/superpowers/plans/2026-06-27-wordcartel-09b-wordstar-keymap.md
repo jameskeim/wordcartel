@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - **Opt-in only:** keybinding changes live in the `WORDSTAR` table (`keymap.rs`); the `CUA` default is **untouched**.
-- **New commands are first-class registry citizens** (palette-reachable, config-bindable in any preset). Menu category matches siblings: `None` for nav/edit/mark commands (like `move_*`, `delete_word`, `set_mark`), `Some(MenuCategory::File)` for `save_and_quit` (like `save`).
+- **New commands are first-class registry citizens** (palette-reachable, config-bindable in any preset). Menu category matches siblings (verified): `Some(MenuCategory::Edit)` for `delete_line`/`delete_to_line_end` (like `delete_word_*` at registry.rs:106); `Some(MenuCategory::File)` for `save_and_quit` (like `save`); `None` for nav/scroll/bookmark commands (like `move_*` and `set_mark`/`jump_to_mark`, which are `None`).
 - **Prefix convention:** `^Q`/`^K` second key accepted **ctrl-held *or* plain** (two rows each) — **except** `^KM`/`^KJ`, which are **plain-only** (`ctrl-k m`/`ctrl-k j`) because `^M`=Enter/`^J`=LF are terminal-reserved. Bookmarks are digit-only.
 - **`^K`/`^Q` are never bound as one-chord commands** (prefix-only; a one-chord binding would shadow sub-sequences).
 - **Marks track normal edits** (via `Buffer::apply` → `change::map_pos`) but **not** undo/redo — matches existing mark behavior.
@@ -113,6 +113,15 @@ with:
     }
 
     #[test]
+    fn delete_line_on_empty_trailing_line_removes_preceding_newline() {
+        let mut e = Editor::new_from_text("aaa\n", None, (40, 10)); // logical lines: "aaa", ""
+        let len = e.active().document.buffer.len();
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(len); // phantom empty line
+        run(Command::DeleteLine, &mut e, &TestClock(0));
+        assert_eq!(e.active().document.buffer.to_string(), "aaa");
+    }
+
+    #[test]
     fn delete_line_single_line_empties_buffer() {
         let mut e = Editor::new_from_text("only line", None, (40, 10));
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(3);
@@ -162,10 +171,18 @@ Add arms to `run()` (after the `DeleteWord` arm, mirroring its `ChangeSet`/`Edit
                 let l = buf.byte_to_line(head);
                 let start = buf.line_to_byte(l);
                 let end = if l + 1 < total { buf.line_to_byte(l + 1) } else { len };
-                // Final line with no trailing newline → absorb the preceding newline so
-                // the line vanishes (slice the last byte to check; slice returns String).
-                let no_trailing_nl = end == len && (len == 0 || buf.slice(len - 1..len) != "\n");
-                if no_trailing_nl && start > 0 { (start - 1, len) } else { (start, end) }
+                if start == end {
+                    // Empty line — the phantom final logical line that exists only because
+                    // of a trailing '\n' (start == len). Remove the preceding newline so it
+                    // disappears (Codex).
+                    if start > 0 { (start - 1, end) } else { (start, end) }
+                } else if end == len && buf.slice(len - 1..len) != "\n" {
+                    // Final line with NO trailing newline → absorb the preceding newline too,
+                    // so the line fully vanishes (slice returns String).
+                    if start > 0 { (start - 1, end) } else { (start, end) }
+                } else {
+                    (start, end)
+                }
             };
             if from == to { return CommandResult::Noop; }
             let cs = ChangeSet::delete(from..to, len);
@@ -204,10 +221,10 @@ Add arms to `run()` (after the `DeleteWord` arm, mirroring its `ChangeSet`/`Edit
             CommandResult::Handled
         }
 ```
-Register (registry.rs, near the `delete_word` registrations; `None` menu to match siblings):
+Register (registry.rs, near the `delete_word` registrations; `Some(MenuCategory::Edit)` to match the `delete_word_*` siblings — Codex):
 ```rust
-        r.register("delete_line",         "Delete Line",        None, |c| run(c, Command::DeleteLine));
-        r.register("delete_to_line_end",  "Delete to Line End", None, |c| run(c, Command::DeleteToLineEnd));
+        r.register("delete_line",         "Delete Line",        Some(MenuCategory::Edit), |c| run(c, Command::DeleteLine));
+        r.register("delete_to_line_end",  "Delete to Line End", Some(MenuCategory::Edit), |c| run(c, Command::DeleteToLineEnd));
 ```
 
 - [ ] **Step 4: Run** `cargo test -p wordcartel delete_line` + `cargo test -p wordcartel delete_to_line_end` + `cargo test -p wordcartel --lib` — green.
@@ -378,12 +395,15 @@ Register the command (registry.rs, File menu, near `save`):
     }
 ```
 
-- [ ] **Step 2: Run — fails** (`set_char_mark`/`jump_char_mark` undefined). `cargo test -p wordcartel -p wordcartel bookmark` (run `cargo test -p wordcartel bookmark`)
+- [ ] **Step 2: Run — fails** (`set_char_mark`/`jump_char_mark` undefined). `cargo test -p wordcartel bookmark`
 
 - [ ] **Step 3: Factor the helpers.** In `marks.rs`, add the status-free cores and route `resolve_pending` through them:
 ```rust
 /// Store a mark at the caret under `ch` (no status — caller sets wording).
+/// Clears `sel_history` to match the interactive `set_mark` path (marks.rs:8) so a
+/// numbered-bookmark set resets the expand-selection ladder identically (Codex).
 pub fn set_char_mark(editor: &mut Editor, ch: char) {
+    editor.active_mut().sel_history.clear();
     let at = nav::head(editor);
     editor.active_mut().marks.insert(ch, at);
 }
@@ -480,17 +500,17 @@ pub fn resolve_pending(editor: &mut Editor, ch: char) {
 
     #[test]
     fn move_screen_bottom_lands_on_last_fully_visible_line() {
-        let mut e = Editor::new_from_text("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\n", None, (20, 4)); // area height 4
+        let mut e = Editor::new_from_text("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\n", None, (20, 4)); // editing height = 4-1 = 3
         crate::derive::rebuild(&mut e);
-        e.active_mut().view.scroll = 1;     // visible logical lines l1..l4 (height 4, no wrap)
+        e.active_mut().view.scroll = 1;     // visible logical lines l1,l2,l3 (height 3, no wrap)
         e.active_mut().view.scroll_row = 0;
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(e.active().document.buffer.line_to_byte(1));
         let off = crate::nav::move_screen_bottom(&mut e);
-        assert_eq!(e.active().document.buffer.byte_to_line(off), 4, "caret to last fully-visible line");
+        assert_eq!(e.active().document.buffer.byte_to_line(off), 3, "caret to last fully-visible line");
     }
 ```
 
-> Confirm `view.area`'s height field name (e.g. `area.height`) and that the test terminal size `(20, 4)` yields a text-area height of 4 logical rows with no soft-wrap for `lN` strings; adjust the expected line indices to the real visible-row math if the status/chrome consumes a row.
+> `view.area` is `(width, height)` (a tuple — use `area.1`, NOT `area.height`); the **editing** height reserves one row for the status bar (`(area.1 as usize).saturating_sub(1)`), so `(20, 4)` gives 3 visible rows. Adjust expected line indices if soft-wrap of the `lN` strings changes the visible-row math.
 
 - [ ] **Step 2: Run — fails** (`move_screen_top` undefined). `cargo test -p wordcartel move_screen`
 
@@ -500,7 +520,9 @@ pub fn resolve_pending(editor: &mut Editor, ch: char) {
 /// walking visible (fold-aware) lines from (view.scroll, view.scroll_row).
 pub(crate) fn last_fully_visible_line(editor: &Editor) -> usize {
     let (top, skip) = { let v = &editor.active().view; (v.scroll, v.scroll_row) };
-    let height = editor.active().view.area.height as usize;
+    // view.area is (width, height); the editing region reserves one row for the
+    // status bar (matches nav.rs:90/403/page_step).
+    let height = (editor.active().view.area.1 as usize).saturating_sub(1);
     if height == 0 { return top; }
     let fv = fold_view(editor);
     let mut line = top;
@@ -520,30 +542,33 @@ pub(crate) fn last_fully_visible_line(editor: &Editor) -> usize {
     last_full
 }
 
-/// Move the caret up to the first visible logical line (view.scroll), column preserved.
-pub fn move_screen_top(editor: &mut Editor) -> usize {
-    let top = editor.active().view.scroll;
+/// Move the caret to a target logical line, column preserved, **bidirectionally**
+/// (up or down depending on the current side). Bidirectional so it works both for
+/// `^QE`/`^QX` (caret already on-screen) AND for the scroll caret-clamp (Task 6), where
+/// the caret may be above OR below the viewport (Codex).
+fn move_caret_to_line(editor: &mut Editor, target: usize) -> usize {
     let mut off = head(editor);
-    while editor.active().document.buffer.byte_to_line(off) > top {
-        let next = move_up(editor);
-        if next == off { break; }
+    loop {
+        let cur = editor.active().document.buffer.byte_to_line(off);
+        if cur == target { break; }
+        let next = if cur > target { move_up(editor) } else { move_down(editor) };
+        if next == off { break; } // hit doc bound
         editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(next);
         off = next;
     }
     off
 }
 
-/// Move the caret down to the last fully-visible logical line, column preserved.
+/// Move the caret to the first visible logical line (view.scroll), column preserved.
+pub fn move_screen_top(editor: &mut Editor) -> usize {
+    let top = editor.active().view.scroll;
+    move_caret_to_line(editor, top)
+}
+
+/// Move the caret to the last fully-visible logical line, column preserved.
 pub fn move_screen_bottom(editor: &mut Editor) -> usize {
     let bottom = last_fully_visible_line(editor);
-    let mut off = head(editor);
-    while editor.active().document.buffer.byte_to_line(off) < bottom {
-        let next = move_down(editor);
-        if next == off { break; }
-        editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(next);
-        off = next;
-    }
-    off
+    move_caret_to_line(editor, bottom)
 }
 ```
 Add `Dir::ScreenTop, Dir::ScreenBottom` to the `Dir` enum (commands.rs) and to the `Command::Move` match (after `Dir::PageUp`/`PageDown`):
@@ -609,7 +634,10 @@ Register (registry.rs, `None` menu like other `move_*`):
 - [ ] **Step 3: Implement.** In `nav.rs`:
 ```rust
 /// After a viewport scroll, pull the caret back inside the visible range (WordStar
-/// keeps the caret on screen). Moves the caret the minimum needed; no-op if visible.
+/// keeps the caret on screen). No-op if already visible. Relies on `move_screen_top`/
+/// `move_screen_bottom` being **bidirectional** (Task 5): when the caret is ABOVE the
+/// viewport (`cl < top`), `move_screen_top` moves it DOWN to `top`; when BELOW
+/// (`cl > bottom`), `move_screen_bottom` moves it UP to `bottom`.
 pub fn clamp_caret_into_view(editor: &mut Editor) {
     let top = editor.active().view.scroll;
     let bottom = last_fully_visible_line(editor);
