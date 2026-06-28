@@ -379,6 +379,10 @@ impl Registry {
         r.register("heading_prev",   "Previous Heading", None, |c| { heading_jump(c, Dirn::Prev); CommandResult::Handled });
         r.register("heading_parent", "Parent Heading", None, |c| { heading_jump(c, Dirn::Parent); CommandResult::Handled });
 
+        // WordStar viewport scroll (Task 6 / Effort 9b): ^W/^Z scroll one row, caret clamped.
+        r.register("scroll_line_up",   "Scroll Line Up",   None, |c| { crate::nav::scroll_line_up(c.editor);   CommandResult::Handled });
+        r.register("scroll_line_down", "Scroll Line Down", None, |c| { crate::nav::scroll_line_down(c.editor); CommandResult::Handled });
+
         r
     }
 

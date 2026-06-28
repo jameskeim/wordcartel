@@ -594,6 +594,34 @@ pub fn scroll_up_one(editor: &mut Editor) {
     }
 }
 
+/// After a viewport scroll, pull the caret back inside the visible range (WordStar
+/// keeps the caret on screen). No-op if already visible. Relies on `move_screen_top`/
+/// `move_screen_bottom` being **bidirectional** (Task 5): when the caret is ABOVE the
+/// viewport (`cl < top`), `move_screen_top` moves it DOWN to `top`; when BELOW
+/// (`cl > bottom`), `move_screen_bottom` moves it UP to `bottom`.
+pub fn clamp_caret_into_view(editor: &mut Editor) {
+    let top = editor.active().view.scroll;
+    let bottom = last_fully_visible_line(editor);
+    let cl = editor.active().document.buffer.byte_to_line(head(editor));
+    if cl < top {
+        move_screen_top(editor);
+    } else if cl > bottom {
+        move_screen_bottom(editor);
+    }
+}
+
+/// WordStar ^W: scroll viewport up one row, keep caret visible.
+pub fn scroll_line_up(editor: &mut Editor) {
+    scroll_up_one(editor);
+    clamp_caret_into_view(editor);
+}
+
+/// WordStar ^Z: scroll viewport down one row, keep caret visible.
+pub fn scroll_line_down(editor: &mut Editor) {
+    scroll_down_one(editor);
+    clamp_caret_into_view(editor);
+}
+
 // ---------------------------------------------------------------------------
 // Paragraph span helpers (consumed by Tasks 5/6/7)
 // ---------------------------------------------------------------------------
@@ -1471,5 +1499,29 @@ mod tests {
         let real = super::rows_of_line(&ed, 0);
         assert!(real > 1, "layout must wrap (real rows={real}); test setup is wrong if this fails");
         assert_eq!(tw, real, "typewriter count must match real row count (prefix-blind shortcut returned 1)");
+    }
+
+    #[test]
+    fn scroll_line_down_moves_viewport_and_keeps_caret_visible() {
+        let mut e = Editor::new_from_text("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\n", None, (20, 4));
+        crate::derive::rebuild(&mut e);
+        e.active_mut().view.scroll = 0;
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(0); // caret on l0
+        crate::nav::scroll_line_down(&mut e); // viewport down one; l0 scrolls off-top
+        assert!(e.active().view.scroll >= 1, "viewport advanced");
+        // caret was on l0 (now above viewport) → nudged down to the new first visible line
+        let caret_line = e.active().document.buffer.byte_to_line(e.active().document.selection.primary().head);
+        assert!(caret_line >= e.active().view.scroll, "caret stays within viewport");
+    }
+
+    #[test]
+    fn scroll_line_up_does_not_move_caret_when_still_visible() {
+        let mut e = Editor::new_from_text("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\n", None, (20, 4));
+        crate::derive::rebuild(&mut e);
+        e.active_mut().view.scroll = 4;
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(e.active().document.buffer.line_to_byte(4));
+        let before = e.active().document.selection.primary().head;
+        crate::nav::scroll_line_up(&mut e); // viewport up; caret line still within view
+        assert_eq!(e.active().document.selection.primary().head, before, "caret unmoved while visible");
     }
 }
