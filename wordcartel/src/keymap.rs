@@ -310,6 +310,9 @@ static CUA: &[(&str, &str)] = &[
     // Effort 6: send-to-scratch verbs (CUA bindings)
     ("alt-shift-c",  "copy_block_to_scratch"),
     ("alt-shift-v",  "move_block_to_scratch"),
+    // Effort 6: buffer cycling (CUA bindings)
+    ("alt-,", "prev_buffer"),
+    ("alt-.", "next_buffer"),
 ];
 
 /// WordStar preset — full faithful classic keymap mapped to v1 command ids.
@@ -370,6 +373,9 @@ static WORDSTAR: &[(&str, &str)] = &[
     // Effort 6: send-to-scratch verbs (WordStar ^K bindings)
     ("ctrl-k ctrl-g", "copy_block_to_scratch"), ("ctrl-k g", "copy_block_to_scratch"),
     ("ctrl-k ctrl-a", "move_block_to_scratch"), ("ctrl-k a", "move_block_to_scratch"),
+    // Effort 6: buffer cycling (WordStar ^K bindings — plain-only, precedent ^KM/^KJ)
+    ("ctrl-k ,", "prev_buffer"),
+    ("ctrl-k .", "next_buffer"),
     ("ctrl-q ctrl-b", "block_jump_begin"),     ("ctrl-q b", "block_jump_begin"),
     ("ctrl-q ctrl-k", "block_jump_end"),       ("ctrl-q k", "block_jump_end"),
     ("ctrl-k m", "set_mark"),       // plain-only (^M reserved)
@@ -739,6 +745,20 @@ mod tests {
             assert!(matches!(t.resolve(&seq("ctrl-k a")), Resolution::Command(CommandId("move_block_to_scratch"))),
                 "WordStar: ctrl-k a → move_block_to_scratch");
         }
+    }
+
+    #[test]
+    fn buffer_cycle_chords_parse_and_resolve() {
+        // Codex I2: the real sequence parser is `parse_seq` (keymap.rs:109), NOT
+        // `parse_chord_seq`. `parse_chord` (keymap.rs:59) parses a single chord.
+        for s in ["ctrl-k ,", "ctrl-k .", "alt-,", "alt-."] {
+            assert!(crate::keymap::parse_seq(s).is_some(), "parse {s}");
+        }
+        // Both presets build with no warnings (no collision / prefix-shadow).
+        let (_t, w) = km(&[], &[], Some("wordstar"));
+        assert!(w.is_empty(), "no wordstar warnings: {w:?}");
+        let (_t, w) = km(&[], &[], Some("cua"));
+        assert!(w.is_empty(), "no cua warnings: {w:?}");
     }
 
     #[test]

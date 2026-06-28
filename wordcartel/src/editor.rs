@@ -414,6 +414,19 @@ impl Editor {
         self.by_id(id).map_or(false, |b| b.document.dirty())
     }
 
+    /// Move `id` to the front of the MRU list.
+    pub fn touch_mru(&mut self, id: BufferId) {
+        self.mru.retain(|&x| x != id);
+        self.mru.insert(0, id);
+    }
+    /// Set the active buffer by index and record it MRU-front. Out-of-range → no-op.
+    pub fn switch_to_index(&mut self, idx: usize) {
+        if idx >= self.buffers.len() { return; }
+        self.active = idx;
+        let id = self.buffers[idx].id;
+        self.touch_mru(id);
+    }
+
     /// Replace the active buffer with a fresh unnamed scratch buffer.
     /// Caller must run `derive::rebuild` + `nav::ensure_visible` afterwards.
     pub fn replace_active_with_scratch(&mut self) {
@@ -944,6 +957,16 @@ mod tests {
             .with_selection(wordcartel_core::selection::Selection::single(1));
         e.by_id_mut(aid).unwrap().apply(txn2, edit2, wordcartel_core::history::EditKind::Other, &C(0));
         assert!(e.is_dirty(aid), "ordinary edited buffer is dirty via is_dirty");
+    }
+
+    #[test]
+    fn switch_to_index_sets_active_and_touches_mru() {
+        let mut e = Editor::new_from_text("a\n", None, (40, 10));
+        e.install_scratch(); // [doc(0), scratch(1)], mru = [doc, scratch]
+        let scratch = e.scratch_id.unwrap();
+        e.switch_to_index(1);
+        assert_eq!(e.active, 1);
+        assert_eq!(e.mru.first().copied(), Some(scratch), "switched buffer is MRU-front");
     }
 
     #[test]
