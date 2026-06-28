@@ -129,7 +129,14 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
                 crate::editor::PostSaveAction::Quit => {
                     if saved_this {
                         editor.pending_after_save = None;
-                        editor.quit = true;
+                        if !editor.is_dirty(buffer_id) {
+                            editor.quit = true;
+                        } else {
+                            // Saved, but the user typed during the in-flight save → buffer
+                            // dirty again. Do NOT quit (would lose those edits). User
+                            // re-issues quit when ready.
+                            editor.status = "edited during save — quit cancelled".into();
+                        }
                     }
                 }
                 crate::editor::PostSaveAction::ContinueQuitDrain => {
@@ -1355,6 +1362,14 @@ pub fn reduce(
                     editor.pending_save_overwrite = None;
                     editor.pending_save_as = None;
                     editor.pending_write_block = None;
+                    // Effort 6 / Codex gate #2: Esc on a per-buffer review prompt (raised
+                    // by drive_quit_drain) must abort the quit drain, just like Cancel does.
+                    // Without this, quit_drain stays Some-but-inert: the drain is
+                    // stranded with no in-flight save and no re-drive pending.
+                    if editor.quit_drain.is_some() {
+                        editor.quit_drain = None;
+                        editor.quit_drain_advance = false;
+                    }
                 } else if let crossterm::event::KeyCode::Char(ch) = key.code {
                     if let Some(action) = editor.prompt.as_ref().unwrap().action_for(ch) {
                         resolve_prompt(action, editor, ex, clock, msg_tx);
@@ -2729,6 +2744,40 @@ mod tests {
     }
 
     #[test]
+    fn review_prompt_esc_aborts_quit_drain() {
+        // Regression (Codex gate Finding 2): pressing Esc on the per-buffer review
+        // prompt (raised by drive_quit_drain in ReviewEach mode) must abort the quit
+        // drain, matching the behaviour of PromptAction::Cancel.
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::prompt::PromptAction;
+        use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.active_mut().document.version = 1; // dirty (saved_version=Some(0) vs version=1)
+        e.install_scratch();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        // Start a ReviewEach quit drain — drive_quit_drain raises the per-buffer prompt.
+        crate::app::resolve_prompt(PromptAction::QuitReviewEach, &mut e, &ex, &clk, &tx);
+        assert!(e.quit_drain.is_some(), "drain started");
+        assert!(e.prompt.is_some(), "per-buffer review prompt raised by drive_quit_drain");
+        // Simulate Esc on the review prompt via the real reduce path.
+        let reg = Registry::builtins();
+        let km = cua_keymap();
+        let esc = Event::Key(KeyEvent {
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        crate::app::reduce(crate::app::Msg::Input(esc), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.quit_drain.is_none(), "Esc on review prompt aborts the drain");
+        assert!(!e.quit, "app does not quit after Esc-abort");
+    }
+
+    #[test]
     fn quit_drain_aborts_on_save_failure() {
         // Save-All over a buffer whose save fails (symlink target is refused) →
         // quit_drain cleared, quit stays false, error status surfaced.
@@ -2875,6 +2924,48 @@ mod tests {
         assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::Quit, .. })));
         for r in ex.drain() { crate::app::apply_result(r, &mut e); }
         assert!(e.quit, "matching save result triggers quit");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn quit_after_save_cancelled_when_edited_during_flight() {
+        // Regression (Codex gate Finding 1): if the user types DURING a single-buffer
+        // save-and-quit's in-flight save, the save result fires (saved_this=true) but
+        // the buffer is dirty again. The app must NOT quit and must not lose those edits.
+        use crate::editor::{Editor, PostSaveAction};
+        use crate::jobs::{JobResult, JobKind, ResultClass};
+        let p = std::env::temp_dir().join(format!("wc-sqflight-{}.md", std::process::id()));
+        std::fs::write(&p, "old\n").unwrap();
+        let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
+        let id = e.active().id;
+        // Arm pending_after_save{Quit} at version=1 (what dispatch_save_and_quit would set).
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = None; // dirty
+        e.pending_after_save = Some(crate::editor::PendingAfterSave {
+            buffer_id: id,
+            version: 1,
+            action: PostSaveAction::Quit,
+            at_ms: 0,
+        });
+        // Simulate typing during the in-flight save: version advances to 2, buffer dirty.
+        e.active_mut().document.version = 2;
+        // Deliver the in-flight save result for version=1. The merge sets
+        // saved_version=Some(1), but document.version==2 → still dirty.
+        let save_result = JobResult {
+            buffer_id: id,
+            class: ResultClass::Durability,
+            version: 1,
+            kind: JobKind::Save,
+            merge: Box::new(move |editor: &mut Editor| {
+                if let Some(b) = editor.by_id_mut(id) {
+                    b.document.saved_version = Some(1);
+                }
+            }),
+        };
+        crate::app::apply_result(save_result, &mut e);
+        assert!(!e.quit, "must NOT quit — buffer is dirty again from edits typed during the save");
+        assert!(e.active().document.dirty(), "buffer still holds the newer edits");
+        assert!(e.pending_after_save.is_none(), "pending_after_save consumed on save match");
         let _ = std::fs::remove_file(&p);
     }
 
