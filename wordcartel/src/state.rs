@@ -32,10 +32,22 @@ pub struct StateEntry {
     pub block: Option<(usize, usize)>,
 }
 
+/// Effort 6: the permanent *scratch* buffer's persisted content. Path-less, so it
+/// cannot live in the path-keyed `entries` map — it is a sibling table.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScratchState {
+    pub text: String,
+    pub cursor: usize,
+}
+
 /// Whole-session store. Keys are canonical absolute path strings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionState {
     pub entries: BTreeMap<String, StateEntry>,
+    /// Effort 6: scratch buffer content (sibling table; omitted when None so old
+    /// readers and a never-used scratch don't emit an empty [scratch]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch: Option<ScratchState>,
 }
 
 impl SessionState {
@@ -244,5 +256,26 @@ seq = 1
         let out = toml::to_string(&s).unwrap();
         let back: SessionState = toml::from_str(&out).unwrap();
         assert_eq!(back.entries["/tmp/x.md"].block, Some((10, 42)));
+    }
+
+    #[test]
+    fn scratch_state_round_trips_and_is_optional() {
+        // Missing [scratch] → None.
+        let s: SessionState = toml::from_str(r#"
+[entries."/tmp/x.md"]
+cursor = 1
+scroll = 0
+mtime = 1
+size = 2
+seq = 1
+"#).unwrap();
+        assert!(s.scratch.is_none(), "absent [scratch] → None");
+        // Present round-trips and serializes as its own [scratch] table.
+        let mut s2 = SessionState::default();
+        s2.scratch = Some(ScratchState { text: "stash\n\nmore".into(), cursor: 5 });
+        let out = toml::to_string(&s2).unwrap();
+        assert!(out.contains("[scratch]"), "serializes as [scratch] table");
+        let back: SessionState = toml::from_str(&out).unwrap();
+        assert_eq!(back.scratch.unwrap().text, "stash\n\nmore");
     }
 }

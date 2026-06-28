@@ -355,6 +355,30 @@ pub fn restore_resume(editor: &mut Editor, path: &std::path::Path) {
     }
 }
 
+/// Effort 6: load persisted scratch content into the scratch buffer. Replaces the
+/// scratch Buffer in place (fresh id so any stale job no-ops), then clamp-snaps the
+/// cursor into `[0, len]` on a char boundary (mirrors 9A's clamp discipline so a
+/// stale offset never panics a later `slice()`). No-op if no scratch installed.
+pub fn restore_scratch(editor: &mut Editor, st: &crate::state::ScratchState) {
+    let Some(sid) = editor.scratch_id else { return; };
+    let Some(idx) = editor.buffers.iter().position(|b| b.id == sid) else { return; };
+    let area = editor.buffers[idx].view.area;
+    let id = editor.alloc_id();
+    editor.buffers[idx] = crate::editor::Buffer::from_text(id, &st.text, None, area);
+    editor.scratch_id = Some(id);
+    // Update MRU id mapping (old scratch id → new).
+    for m in editor.mru.iter_mut() { if *m == sid { *m = id; } }
+    // Char-boundary clamp via `nav::clamp_snap` (Codex I3: TextBuffer has NO
+    // `snap_to_boundary`; clamp_snap at nav.rs:164 operates on the ACTIVE buffer).
+    // restore_scratch runs at startup; briefly make scratch active to clamp, then
+    // restore the prior active index.
+    let prev_active = editor.active;
+    editor.active = idx;
+    let cur = crate::nav::clamp_snap(editor, st.cursor);
+    editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(cur);
+    editor.active = prev_active;
+}
+
 /// Open `path` into the active buffer slot (the buffer-load seam reused by Tasks 2/4/5).
 /// Allocates a FRESH id so an in-flight save/swap job for the replaced buffer merges via
 /// `by_id_mut(old_id)` → `None` (harmless no-op). On OpenError: set status, do NOT replace
@@ -1750,6 +1774,15 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     // Effort 6: install the permanent *scratch* buffer (index 1; launch buffer stays active at 0).
     editor.install_scratch();
 
+    // Effort 6: restore persisted scratch content (independent of resume_enabled —
+    // scratch is the user's stash, not a per-file resume position).
+    {
+        let saved = crate::state::load();
+        if let Some(st) = saved.scratch.as_ref() {
+            restore_scratch(&mut editor, st);
+        }
+    }
+
     // Seed mouse_capture from config (default true; may be overridden by config layers).
     editor.mouse_capture = cfg.mouse.mouse_capture;
     editor.view_opts = cfg.view.clone();
@@ -2024,7 +2057,7 @@ pub fn reconcile_mouse_capture<W: std::io::Write>(editor: &mut crate::editor::Ed
 }
 
 /// Record the active buffer's position into the session store and flush to disk.
-/// Scratch (no path) buffers and paths that fail canonicalization are skipped.
+/// Scratch content is always captured; per-file entry only for named buffers.
 /// A write failure → status warning only (never blocks quit or loses the document).
 fn persist_session(
     session: &mut crate::state::SessionState,
@@ -2032,45 +2065,39 @@ fn persist_session(
     cfg: &config::Config,
     seq: u64,
 ) {
-    // Scratch buffers are never persisted.
-    let raw_path = match editor.active().document.path.as_deref() {
-        Some(p) => p,
-        None => return,
-    };
-    // Canonicalize: skip if it fails (e.g. a new file that hasn't been saved yet).
-    let canon = match std::fs::canonicalize(raw_path) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    // Get the file identity at persist time (skip if unavailable).
-    let Some((mtime, size)) = crate::state::file_identity(raw_path) else { return };
-
-    let cursor = editor.active().document.selection.primary().head;
-    let scroll = editor.active().view.scroll;
-    let entry = crate::state::StateEntry {
-        cursor,
-        scroll,
-        marks: editor.active().marks.iter().map(|(c, &o)| (c.to_string(), o)).collect(),
-        mtime,
-        size,
-        seq,
-        folds: editor.active().folds.folded.iter().copied().collect(),
-        block: editor.active().marked_block.map(|b| (b.start, b.end)),
-    };
-    session.record(
-        canon.to_string_lossy().into_owned(),
-        entry,
-        cfg.state.max_entries,
-    );
-    if let Err(e) = session.save() {
-        // Degrade: write error → warning in the terminal title area; never blocks quit.
-        // The terminal is still up here (we drop guard after this in run()), so we
-        // can mutate the editor status without any special handling.
-        let _ = e; // best-effort; we can't easily update editor.status here without &mut editor
-        // We don't have &mut editor in this helper; the warning is silently swallowed.
-        // This is acceptable per the brief ("best-effort save, write error → status warning").
-        // Callers that need the error can check the return if we make it Result in a later effort.
+    // Effort 6: capture scratch content first, independent of the active buffer.
+    if let Some(sid) = editor.scratch_id {
+        if let Some(sb) = editor.by_id(sid) {
+            session.scratch = Some(crate::state::ScratchState {
+                text: sb.document.buffer.to_string(),
+                cursor: sb.document.selection.primary().head,
+            });
+        }
     }
+    // Per-file entry for the active buffer (unchanged): only when it has a real,
+    // canonicalizable path. Scratch/new buffers contribute no per-file entry.
+    if let Some(raw_path) = editor.active().document.path.as_deref() {
+        if let Ok(canon) = std::fs::canonicalize(raw_path) {
+            if let Some((mtime, size)) = crate::state::file_identity(raw_path) {
+                let entry = crate::state::StateEntry {
+                    cursor: editor.active().document.selection.primary().head,
+                    scroll: editor.active().view.scroll,
+                    marks: editor.active().marks.iter().map(|(c, &o)| (c.to_string(), o)).collect(),
+                    mtime, size, seq,
+                    folds: editor.active().folds.folded.iter().copied().collect(),
+                    block: editor.active().marked_block.map(|b| (b.start, b.end)),
+                };
+                session.record(canon.to_string_lossy().into_owned(), entry, cfg.state.max_entries);
+            }
+        }
+    }
+    // Always flush — scratch durability does not depend on the active buffer.
+    let _ = session.save();
+}
+
+#[cfg(test)]
+pub fn persist_session_for_test(s: &mut crate::state::SessionState, e: &Editor, cfg: &config::Config, seq: u64) {
+    persist_session(s, e, cfg, seq);
 }
 
 // ---------------------------------------------------------------------------
@@ -4496,5 +4523,38 @@ mod tests {
         crate::app::block_write_submit(&mut e, p.to_str().unwrap());
         assert_eq!(e.prompt.as_ref().unwrap().action_for('o'), Some(crate::prompt::PromptAction::OverwriteWriteBlock));
         let _ = std::fs::remove_file(&p);
+    }
+
+    // -------------------------------------------------------------------------
+    // Effort 6, Task 2: scratch persistence
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn restore_scratch_loads_text_and_clamps_cursor() {
+        let mut e = crate::editor::Editor::new_from_text("doc\n", None, (40, 10));
+        e.install_scratch();
+        let st = crate::state::ScratchState { text: "hello".into(), cursor: 999 }; // out of range
+        crate::app::restore_scratch(&mut e, &st);
+        let sid = e.scratch_id.unwrap();
+        let sb = e.by_id(sid).unwrap();
+        assert_eq!(sb.document.buffer.to_string(), "hello");
+        assert_eq!(sb.document.selection.primary().head, 5, "cursor clamped to len");
+    }
+
+    #[test]
+    fn persist_session_captures_scratch_even_when_active_unnamed() {
+        use wordcartel_core::history::Clock;
+        struct C(u64); impl Clock for C { fn now_ms(&self) -> u64 { self.0 } }
+        let mut e = crate::editor::Editor::new_from_text("\n", None, (40, 10)); // active unnamed
+        e.install_scratch();
+        let sid = e.scratch_id.unwrap();
+        let (cs, edit) = crate::commands::build_multi_replace(&[(0, 0, "stash".into())], 0);
+        let txn = wordcartel_core::history::Transaction::new(cs)
+            .with_selection(wordcartel_core::selection::Selection::single(5));
+        e.by_id_mut(sid).unwrap().apply(txn, edit, wordcartel_core::history::EditKind::Other, &C(0));
+        let mut session = crate::state::SessionState::default();
+        let cfg = crate::config::Config::default();
+        crate::app::persist_session_for_test(&mut session, &e, &cfg, 1);
+        assert_eq!(session.scratch.as_ref().unwrap().text, "stash");
     }
 }
