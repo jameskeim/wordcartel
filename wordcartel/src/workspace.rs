@@ -58,6 +58,52 @@ pub fn goto_scratch(editor: &mut Editor) {
     }
 }
 
+/// True iff the active buffer is a reusable empty untitled throwaway (NOT scratch).
+/// Reuse rule: path-less, not dirty, content `""` or `"\n"`, and not the scratch buffer.
+pub fn active_is_reusable_throwaway(editor: &Editor) -> bool {
+    let b = editor.active();
+    if editor.is_scratch(b.id) { return false; }
+    if b.document.path.is_some() { return false; }
+    if editor.is_dirty(b.id) { return false; }
+    let t = b.document.buffer.to_string();
+    t.is_empty() || t == "\n"
+}
+
+/// Open `path` additively: reuse a throwaway active buffer in-place, else push a new buffer and switch.
+pub fn open_as_new_buffer(editor: &mut Editor, path: &std::path::Path) {
+    if active_is_reusable_throwaway(editor) {
+        crate::app::open_into_current(editor, path); // replace-in-place seam
+        return;
+    }
+    let id = editor.alloc_id();
+    let area = editor.active().view.area;
+    match crate::editor::Buffer::from_file(id, path, area) {
+        Ok(b) => {
+            editor.buffers.push(b);
+            let idx = editor.buffers.len() - 1;
+            editor.switch_to_index(idx);
+            if editor.resume_enabled { crate::app::restore_resume(editor, path); }
+            crate::derive::rebuild(editor);
+            crate::nav::ensure_visible(editor);
+            editor.status = String::new();
+        }
+        Err(e) => editor.status = e.to_string(),
+    }
+}
+
+/// Create a fresh empty untitled buffer additively (no-op when active is already a reusable throwaway).
+pub fn new_empty_buffer(editor: &mut Editor) {
+    if active_is_reusable_throwaway(editor) { return; } // already an empty untitled — nothing to do
+    let id = editor.alloc_id();
+    let area = editor.active().view.area;
+    editor.buffers.push(crate::editor::Buffer::from_text(id, "\n", None, area));
+    let idx = editor.buffers.len() - 1;
+    editor.switch_to_index(idx);
+    crate::derive::rebuild(editor);
+    crate::nav::ensure_visible(editor);
+    editor.status = String::new();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +153,52 @@ mod tests {
         let mut e = Editor::new_from_text("a\n", None, (40, 10)); // no scratch → 1 buffer
         next_buffer(&mut e);
         assert_eq!(e.active, 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 6: additive open/new + throwaway reuse
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn open_reuses_clean_untitled_throwaway() {
+        let mut e = Editor::new_from_text("\n", None, (40, 10)); // throwaway launch buffer
+        e.install_scratch();
+        assert_eq!(e.buffers.len(), 2);
+        let tmp = std::env::temp_dir().join(format!("wc-open-{}.md", std::process::id()));
+        std::fs::write(&tmp, "file body\n").unwrap();
+        open_as_new_buffer(&mut e, &tmp);
+        assert_eq!(e.buffers.len(), 2, "throwaway reused, not added");
+        assert_eq!(e.active().document.buffer.to_string(), "file body\n");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn open_adds_buffer_when_active_is_real() {
+        let mut e = Editor::new_from_text("real content\n", Some(std::path::PathBuf::from("/tmp/a.md")), (40, 10));
+        e.install_scratch();
+        let tmp = std::env::temp_dir().join(format!("wc-open2-{}.md", std::process::id()));
+        std::fs::write(&tmp, "second\n").unwrap();
+        open_as_new_buffer(&mut e, &tmp);
+        assert_eq!(e.buffers.len(), 3, "added a new buffer");
+        assert_eq!(e.active().document.buffer.to_string(), "second\n");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn new_empty_buffer_is_additive_and_not_scratch() {
+        let mut e = Editor::new_from_text("real\n", Some(std::path::PathBuf::from("/tmp/a.md")), (40, 10));
+        e.install_scratch();
+        new_empty_buffer(&mut e);
+        assert_eq!(e.buffers.len(), 3);
+        assert!(e.active().document.path.is_none());
+        assert!(!e.is_scratch(e.active().id), "New buffer is not the scratch buffer");
+    }
+
+    #[test]
+    fn scratch_is_never_a_reuse_target() {
+        let mut e = Editor::new_from_text("real\n", Some(std::path::PathBuf::from("/tmp/a.md")), (40, 10));
+        e.install_scratch();
+        goto_scratch(&mut e); // active = scratch (empty, path-less, "clean")
+        assert!(!active_is_reusable_throwaway(&e), "scratch must not be reused");
     }
 }

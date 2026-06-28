@@ -11,8 +11,9 @@ use wordcartel_core::selection::Selection;
 pub struct BufferId(pub u64);
 
 /// What to do once a pending save completes successfully.
+/// Only Quit remains — Open/New are additive (Effort 6) and need no save-first gate.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PostSaveAction { Quit, Open(std::path::PathBuf), New }
+pub enum PostSaveAction { Quit }
 
 /// An in-flight "save, then act" request. Armed by `dispatch_save_then`;
 /// consumed by `apply_result` when the save lands clean.
@@ -425,15 +426,6 @@ impl Editor {
         self.active = idx;
         let id = self.buffers[idx].id;
         self.touch_mru(id);
-    }
-
-    /// Replace the active buffer with a fresh unnamed scratch buffer.
-    /// Caller must run `derive::rebuild` + `nav::ensure_visible` afterwards.
-    pub fn replace_active_with_scratch(&mut self) {
-        let id = self.alloc_id();
-        let area = self.active().view.area;
-        let a = self.active;
-        self.buffers[a] = Buffer::from_text(id, "\n", None, area);
     }
 
     /// Open the minibuffer with the given prompt string.
