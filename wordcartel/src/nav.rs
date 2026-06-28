@@ -1527,4 +1527,20 @@ mod tests {
         crate::nav::scroll_line_up(&mut e); // viewport up; caret line still within view
         assert_eq!(e.active().document.selection.primary().head, before, "caret unmoved while visible");
     }
+
+    #[test]
+    fn scroll_line_up_clamps_caret_up_when_it_falls_below_viewport() {
+        // Symmetric to the down-scroll clamp: scrolling the viewport UP can push a
+        // near-bottom caret BELOW the visible range → it must be pulled up to the last
+        // fully-visible line (exercises clamp_caret_into_view's move_screen_bottom branch).
+        let mut e = Editor::new_from_text("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\n", None, (20, 4));
+        crate::derive::rebuild(&mut e);
+        e.active_mut().view.scroll = 5;     // visible l5,l6,l7 (editing height 3)
+        e.active_mut().view.scroll_row = 0;
+        e.active_mut().document.selection =
+            wordcartel_core::selection::Selection::single(e.active().document.buffer.line_to_byte(7)); // caret on l7
+        crate::nav::scroll_line_up(&mut e); // viewport up → l4,l5,l6; l7 now below
+        let caret_line = e.active().document.buffer.byte_to_line(e.active().document.selection.primary().head);
+        assert_eq!(caret_line, crate::nav::last_fully_visible_line(&e), "caret clamped up onto last fully-visible line");
+    }
 }

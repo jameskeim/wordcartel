@@ -560,6 +560,8 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         }
 
         Command::DeleteLine => {
+            // Operates on the caret-head's logical line; any active selection is
+            // intentionally disregarded (matches DeleteWord + faithful WordStar ^Y).
             let head = nav::head(editor);
             let len = editor.active().document.buffer.len();
             if len == 0 { return CommandResult::Noop; }
