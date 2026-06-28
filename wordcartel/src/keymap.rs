@@ -717,12 +717,27 @@ mod tests {
 
     #[test]
     fn scratch_verbs_resolve_in_both_presets() {
-        for preset in ["cua", "wordstar"] {
-            let (t, _) = km(&[], &[], Some(preset));
-            let reg = crate::registry::Registry::builtins();
-            assert!(reg.resolve_name("copy_block_to_scratch").is_some(), "copy_block_to_scratch not in registry");
-            assert!(reg.resolve_name("move_block_to_scratch").is_some(), "move_block_to_scratch not in registry");
-            let _ = t; // chord resolution covered by both_presets_resolve_against_builtins
+        // CUA preset: single-chord bindings
+        {
+            let cfg = crate::config::KeymapConfig { preset: "cua".into(), patches: vec![] };
+            let (t, w) = build_keymap(&cfg, &Registry::builtins());
+            assert!(w.is_empty(), "cua: no warnings expected: {w:?}");
+            let seq = |s: &str| parse_seq(s).unwrap();
+            assert!(matches!(t.resolve(&seq("alt-shift-c")), Resolution::Command(CommandId("copy_block_to_scratch"))),
+                "CUA: alt-shift-c → copy_block_to_scratch");
+            assert!(matches!(t.resolve(&seq("alt-shift-v")), Resolution::Command(CommandId("move_block_to_scratch"))),
+                "CUA: alt-shift-v → move_block_to_scratch");
+        }
+        // WordStar preset: plain second-key forms of ^K prefix bindings
+        {
+            let cfg = crate::config::KeymapConfig { preset: "wordstar".into(), patches: vec![] };
+            let (t, w) = build_keymap(&cfg, &Registry::builtins());
+            assert!(w.is_empty(), "wordstar: no warnings expected: {w:?}");
+            let seq = |s: &str| parse_seq(s).unwrap();
+            assert!(matches!(t.resolve(&seq("ctrl-k g")), Resolution::Command(CommandId("copy_block_to_scratch"))),
+                "WordStar: ctrl-k g → copy_block_to_scratch");
+            assert!(matches!(t.resolve(&seq("ctrl-k a")), Resolution::Command(CommandId("move_block_to_scratch"))),
+                "WordStar: ctrl-k a → move_block_to_scratch");
         }
     }
 

@@ -110,4 +110,12 @@ mod tests {
         copy_block_to_scratch(&mut e, &C(0));
         assert_eq!(e.status, "no marked block");
     }
+
+    #[test]
+    fn move_no_block_sets_status() {
+        let mut e = setup();
+        move_block_to_scratch(&mut e, &C(0));
+        assert_eq!(e.status, "no marked block");
+        assert_eq!(e.active().document.buffer.to_string(), "hello world\n", "buffer unchanged");
+    }
 }
