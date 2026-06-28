@@ -10,6 +10,20 @@ use wordcartel_core::selection::Selection;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Ord, PartialOrd)]
 pub struct BufferId(pub u64);
 
+/// What to do once a pending save completes successfully.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PostSaveAction { Quit, Open(std::path::PathBuf), New }
+
+/// An in-flight "save, then act" request. Armed by `dispatch_save_then`;
+/// consumed by `apply_result` when the save lands clean.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingAfterSave {
+    pub buffer_id: BufferId,
+    pub version: u64,
+    pub action: PostSaveAction,
+    pub at_ms: u64,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RenderMode {
     LivePreview,
@@ -236,8 +250,10 @@ pub struct Editor {
     pub status: String,
     pub quit: bool,
     pub prompt: Option<crate::prompt::Prompt>,
-    pub quit_after_save: Option<u64>,
-    pub quit_after_save_at: Option<u64>,
+    /// Armed by `dispatch_save_then`; consumed by `apply_result` when the save lands.
+    pub pending_after_save: Option<PendingAfterSave>,
+    /// Carry the post-save action across an unnamed buffer's Save-As flow (Task 3).
+    pub pending_save_as: Option<PostSaveAction>,
     pub filter_in_flight: Option<crate::filter::CancelFlag>,
     pub transform_in_flight: bool,
     pub minibuffer: Option<crate::minibuffer::Minibuffer>,
@@ -292,7 +308,7 @@ impl Editor {
         let mut e = Editor {
             buffers: Vec::new(), active: 0, next_buffer_id: 0,
             register: Register::default(), status: String::new(), quit: false,
-            prompt: None, quit_after_save: None, quit_after_save_at: None,
+            prompt: None, pending_after_save: None, pending_save_as: None,
             filter_in_flight: None, transform_in_flight: false, minibuffer: None, pending_export: None,
             pending_mark: None,
             clipboard_sync_request: None, clipboard_get_pending: None, clipboard_notice_shown: false,
@@ -332,6 +348,15 @@ impl Editor {
     pub fn by_id_mut(&mut self, id: BufferId) -> Option<&mut Buffer> { self.buffers.iter_mut().find(|b| b.id == id) }
     /// Allocate a fresh, never-reused BufferId.
     pub fn alloc_id(&mut self) -> BufferId { let id = BufferId(self.next_buffer_id); self.next_buffer_id += 1; id }
+
+    /// Replace the active buffer with a fresh unnamed scratch buffer.
+    /// Caller must run `derive::rebuild` + `nav::ensure_visible` afterwards.
+    pub fn replace_active_with_scratch(&mut self) {
+        let id = self.alloc_id();
+        let area = self.active().view.area;
+        let a = self.active;
+        self.buffers[a] = Buffer::from_text(id, "\n", None, area);
+    }
 
     /// Open the minibuffer with the given prompt string.
     ///

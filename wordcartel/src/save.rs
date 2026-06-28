@@ -107,17 +107,33 @@ pub fn dispatch_save(ctx: &mut Ctx) -> CommandResult {
     CommandResult::Handled
 }
 
-/// Save, then arm quit-after-save so the editor exits when the save completes.
-/// Arms ONLY if a save job was actually dispatched (path present, no modal raised) —
-/// otherwise leaves dispatch_save's status and stays open. Shared by the quit-confirm
-/// prompt (PromptAction::SaveAndQuit) and the `save_and_quit` command (Effort 9B).
-pub(crate) fn dispatch_save_and_quit(ctx: &mut crate::registry::Ctx) {
+/// The unified "save, then do `action`" entry. Goes through `dispatch_save`
+/// (external-mod-checked). Handles all three buffer states:
+/// - NAMED, no conflict → a save job is dispatched → arm `pending_after_save{action}`.
+/// - NAMED, external-mod conflict → `dispatch_save` raised the modal → do NOT arm
+///   (the user resolves the modal and re-issues).
+/// - UNNAMED → `dispatch_save` opened the Save-As minibuffer → carry the action in
+///   `pending_save_as` so it fires after the Save-As write completes.
+pub(crate) fn dispatch_save_then(ctx: &mut crate::registry::Ctx, action: crate::editor::PostSaveAction) {
+    let was_unnamed = ctx.editor.active().document.path.is_none();
+    let buffer_id = ctx.editor.active().id;
     let v = ctx.editor.active().document.version;
     dispatch_save(ctx);
-    if ctx.editor.active().document.path.is_some() && ctx.editor.prompt.is_none() {
-        ctx.editor.quit_after_save = Some(v);
-        ctx.editor.quit_after_save_at = Some(ctx.clock.now_ms());
+    if was_unnamed {
+        // dispatch_save opened Save-As (MinibufferKind::SaveAs) for the no-path buffer.
+        if ctx.editor.minibuffer.as_ref().map(|m| m.kind) == Some(crate::minibuffer::MinibufferKind::SaveAs) {
+            ctx.editor.pending_save_as = Some(action);
+        }
+    } else if ctx.editor.active().document.path.is_some() && ctx.editor.prompt.is_none() {
+        ctx.editor.pending_after_save = Some(crate::editor::PendingAfterSave {
+            buffer_id, version: v, action, at_ms: ctx.clock.now_ms(),
+        });
     }
+}
+
+/// Save, then quit once the save completes. Delegates to `dispatch_save_then`.
+pub(crate) fn dispatch_save_and_quit(ctx: &mut crate::registry::Ctx) {
+    dispatch_save_then(ctx, crate::editor::PostSaveAction::Quit);
 }
 
 /// Save bypassing the fingerprint conflict (the [O]verwrite modal action).

@@ -116,12 +116,25 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
         "buffer-local result for a missing buffer slipped past is_stale"
     );
     (r.merge)(editor);
-    // Save & quit: exit once the awaited save version lands clean for that buffer.
-    if kind == crate::jobs::JobKind::Save
-        && editor.quit_after_save == Some(version)
-        && editor.by_id(buffer_id).map(|b| b.document.saved_version) == Some(Some(version))
-    {
-        editor.quit = true;
+    // Post-save dispatch: fire the pending action when its save lands clean.
+    if kind == crate::jobs::JobKind::Save {
+        if let Some(p) = &editor.pending_after_save {
+            let saved_clean = editor.by_id(buffer_id).map(|b| b.document.saved_version) == Some(Some(version));
+            if p.buffer_id == buffer_id && p.version == version && saved_clean {
+                let action = editor.pending_after_save.take().unwrap().action;
+                match action {
+                    crate::editor::PostSaveAction::Quit => editor.quit = true,
+                    crate::editor::PostSaveAction::New => {
+                        editor.replace_active_with_scratch();
+                        crate::derive::rebuild(editor);
+                        crate::nav::ensure_visible(editor);
+                    }
+                    crate::editor::PostSaveAction::Open(path) => {
+                        crate::app::open_into_current(editor, &path);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1052,6 +1065,8 @@ pub fn reduce(
                         match mb.kind {
                             crate::minibuffer::MinibufferKind::Filter   => submit_filter_line(editor, &mb.text, msg_tx),
                             crate::minibuffer::MinibufferKind::GotoLine => goto_line_submit(editor, &mb.text),
+                            // Task 3 wires the Save-As handler; for now just dismiss.
+                            crate::minibuffer::MinibufferKind::SaveAs   => {}
                         }
                     }
                     _ => {}
@@ -1584,17 +1599,16 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
         let now = clock.now_ms();
         // Bounded save&quit: if waiting for an in-flight save to complete and
         // 5 s have elapsed since the last edit, re-raise the quit-confirm modal.
-        if let Some(_v) = editor.quit_after_save {
-            let waited = now.saturating_sub(editor.quit_after_save_at.unwrap_or(now));
+        if let Some(p) = &editor.pending_after_save {
+            let waited = now.saturating_sub(p.at_ms);
             if waited > SAVE_QUIT_TIMEOUT_MS {
-                editor.quit_after_save = None;
-                editor.quit_after_save_at = None;
+                editor.pending_after_save = None;
                 editor.open_prompt(crate::prompt::Prompt::quit_confirm());
                 editor.status = "Save still running — choose again".into();
             }
         }
         let swap_deadline = crate::swap::next_deadline_ms(now, editor.active().last_edit_at, editor.active().last_swap_at);
-        let sq_deadline = editor.quit_after_save_at.map(|t| t.saturating_add(SAVE_QUIT_TIMEOUT_MS));
+        let sq_deadline = editor.pending_after_save.as_ref().map(|p| p.at_ms.saturating_add(SAVE_QUIT_TIMEOUT_MS));
         // Include scrollbar_until_ms in the deadline so the loop wakes when the
         // bar should fade (avoids relying on the idle 1-hour Tick).
         let sb_deadline = if editor.mouse.scrollbar_until_ms > now {
@@ -2208,8 +2222,8 @@ mod tests {
     }
 
     #[test]
-    fn save_and_quit_sets_quit_after_save_and_exits_on_matching_result() {
-        use crate::editor::Editor;
+    fn save_and_quit_sets_pending_after_save_and_exits_on_matching_result() {
+        use crate::editor::{Editor, PostSaveAction};
         use crate::jobs::{Executor, InlineExecutor};
         use crate::prompt::PromptAction;
         let p = std::env::temp_dir().join(format!("wc-savequit-{}.md", std::process::id()));
@@ -2220,7 +2234,7 @@ mod tests {
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
         crate::app::resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk, &tx);
-        assert_eq!(e.quit_after_save, Some(1));
+        assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::Quit, .. })));
         assert!(!e.quit, "not yet — waiting for the save result");
         for r in ex.drain() { crate::app::apply_result(r, &mut e); }
         assert!(e.quit, "matching save result triggers quit");
@@ -2228,8 +2242,8 @@ mod tests {
     }
 
     #[test]
-    fn save_and_quit_on_unnamed_buffer_does_not_arm_quit_after_save() {
-        // No path → dispatch_save dispatches NO job. quit_after_save must stay None,
+    fn save_and_quit_on_unnamed_buffer_does_not_arm_pending_after_save() {
+        // No path → dispatch_save dispatches NO job. pending_after_save must stay None,
         // or the app would wait forever for a result that never comes (Codex #4).
         use crate::editor::Editor;
         use crate::jobs::InlineExecutor;
@@ -2240,15 +2254,15 @@ mod tests {
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
         crate::app::resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk, &tx);
-        assert_eq!(e.quit_after_save, None, "no job dispatched → do not arm quit-after-save");
+        assert!(e.pending_after_save.is_none(), "no job dispatched → do not arm pending_after_save");
         assert!(!e.quit);
     }
 
     #[test]
-    fn save_and_quit_command_arms_quit_after_save_like_prompt() {
+    fn save_and_quit_command_arms_pending_after_save_like_prompt() {
         // The save_and_quit registry command must reach the SAME armed state as the
         // PromptAction::SaveAndQuit path (proves the DRY factor).
-        use crate::editor::Editor;
+        use crate::editor::{Editor, PostSaveAction};
         use crate::jobs::{Executor, InlineExecutor};
         let p = std::env::temp_dir().join(format!("wc-savequit-cmd-{}.md", std::process::id()));
         std::fs::write(&p, "old\n").unwrap();
@@ -2261,7 +2275,8 @@ mod tests {
             let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
             crate::save::dispatch_save_and_quit(&mut ctx);
         }
-        assert_eq!(e.quit_after_save, Some(1), "command path arms quit_after_save");
+        assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::Quit, .. })),
+            "command path arms pending_after_save{{Quit}}");
         assert!(!e.quit, "not yet — waiting for the save result");
         for r in ex.drain() { crate::app::apply_result(r, &mut e); }
         assert!(e.quit, "matching save result triggers quit");
@@ -2281,8 +2296,29 @@ mod tests {
             let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
             crate::save::dispatch_save_and_quit(&mut ctx);
         }
-        assert_eq!(e.quit_after_save, None, "no path → not armed");
+        assert_eq!(e.pending_after_save, None, "no path → not armed");
         assert!(!e.quit);
+    }
+
+    #[test]
+    fn save_and_quit_arms_pending_after_save_quit_and_exits() {
+        use crate::editor::{Editor, PostSaveAction};
+        use crate::jobs::{Executor, InlineExecutor};
+        let p = std::env::temp_dir().join(format!("wc-pas-{}.md", std::process::id()));
+        std::fs::write(&p, "old\n").unwrap();
+        let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
+        e.active_mut().document.saved_version = None; e.active_mut().document.version = 1;
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        {
+            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
+            crate::save::dispatch_save_and_quit(&mut ctx);
+        }
+        assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::Quit, .. })));
+        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        assert!(e.quit, "matching save result triggers quit");
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
