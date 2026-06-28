@@ -366,6 +366,16 @@ pub fn open_save_as(editor: &mut crate::editor::Editor) {
     if let Some(mb) = editor.minibuffer.as_mut() { mb.cursor = pre.len(); mb.text = pre; }
 }
 
+/// Expand a user-typed path: `~/` prefix → home dir; relative → joined onto cwd.
+/// Mirrors the `~` handling used by the dictionary/config path loaders.
+pub fn expand_path(text: &str) -> std::path::PathBuf {
+    let expanded = if let Some(rest) = text.strip_prefix("~/") {
+        dirs::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| std::path::PathBuf::from(text))
+    } else { std::path::PathBuf::from(text) };
+    if expanded.is_absolute() { expanded }
+    else { std::env::current_dir().map(|d| d.join(&expanded)).unwrap_or(expanded) }
+}
+
 /// Submit the Save-As minibuffer line: expand the path, raise an overwrite
 /// confirmation if the target exists, else perform the save-as immediately.
 pub fn save_as_submit(editor: &mut crate::editor::Editor, text: &str,
@@ -373,21 +383,37 @@ pub fn save_as_submit(editor: &mut crate::editor::Editor, text: &str,
                       msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
     let t = text.trim();
     if t.is_empty() { editor.status = "save-as: empty path".into(); editor.pending_save_as = None; return; }
-    // expand_path: ~ → home; relative → joined onto cwd. Mirror the ~ handling used by the
-    // dictionary/config path loaders.
-    let target: std::path::PathBuf = {
-        let expanded = if let Some(rest) = t.strip_prefix("~/") {
-            dirs::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| std::path::PathBuf::from(t))
-        } else { std::path::PathBuf::from(t) };
-        if expanded.is_absolute() { expanded }
-        else { std::env::current_dir().map(|d| d.join(&expanded)).unwrap_or(expanded) }
-    };
+    let target = expand_path(t);
     if target.exists() {
         editor.pending_save_overwrite = Some(target.clone());
         editor.open_prompt(crate::prompt::Prompt::save_overwrite(&target));
         return;
     }
     perform_save_as(editor, target, executor, clock, msg_tx);
+}
+
+/// Submit the Write-Block minibuffer line: expand the path, raise an overwrite
+/// confirmation if the target exists, else write the block text immediately.
+/// Synchronous: uses `file::save_atomic` directly; does NOT touch document state.
+pub fn block_write_submit(editor: &mut crate::editor::Editor, text: &str) {
+    let Some(b) = editor.active().marked_block else { editor.status = "no marked block".into(); return; };
+    let t = text.trim();
+    if t.is_empty() { editor.status = "write block: empty path".into(); return; }
+    let target = expand_path(t);
+    if target.exists() {
+        editor.pending_write_block = Some(target.clone());
+        editor.open_prompt(crate::prompt::Prompt::write_block_overwrite(&target));
+        return;
+    }
+    perform_block_write(editor, &target, b.start, b.end);
+}
+
+fn perform_block_write(editor: &mut crate::editor::Editor, target: &std::path::Path, start: usize, end: usize) {
+    let text = editor.active().document.buffer.slice(start..end);
+    match crate::file::save_atomic(target, &text) {
+        Ok(_)  => editor.status = format!("wrote block to {}", target.display()),
+        Err(e) => editor.status = e.to_string(),
+    }
 }
 
 fn perform_save_as(editor: &mut crate::editor::Editor, target: std::path::PathBuf,
@@ -466,6 +492,7 @@ pub fn resolve_prompt(
             editor.pending_export = None;
             editor.pending_save_overwrite = None;
             editor.pending_save_as = None;
+            editor.pending_write_block = None;
         }
         PromptAction::QuitAnyway => { editor.quit = true; }
         PromptAction::SaveAndQuit => {
@@ -536,6 +563,13 @@ pub fn resolve_prompt(
         PromptAction::OverwriteSaveAs => {
             if let Some(t) = editor.pending_save_overwrite.take() {
                 perform_save_as(editor, t, ex, clock, msg_tx);
+            }
+        }
+        PromptAction::OverwriteWriteBlock => {
+            if let Some(t) = editor.pending_write_block.take() {
+                if let Some(b) = editor.active().marked_block {
+                    perform_block_write(editor, &t, b.start, b.end);
+                }
             }
         }
         PromptAction::Transform(kind) => {
@@ -1248,6 +1282,7 @@ pub fn reduce(
                     editor.pending_export = None;
                     editor.pending_save_overwrite = None;
                     editor.pending_save_as = None;
+                    editor.pending_write_block = None;
                 } else if let crossterm::event::KeyCode::Char(ch) = key.code {
                     if let Some(action) = editor.prompt.as_ref().unwrap().action_for(ch) {
                         resolve_prompt(action, editor, ex, clock, msg_tx);
@@ -1310,9 +1345,10 @@ pub fn reduce(
                     crossterm::event::KeyCode::Enter => {
                         let mb = editor.minibuffer.take().unwrap();
                         match mb.kind {
-                            crate::minibuffer::MinibufferKind::Filter   => submit_filter_line(editor, &mb.text, msg_tx),
-                            crate::minibuffer::MinibufferKind::GotoLine => goto_line_submit(editor, &mb.text),
-                            crate::minibuffer::MinibufferKind::SaveAs   => save_as_submit(editor, &mb.text, ex, clock, msg_tx),
+                            crate::minibuffer::MinibufferKind::Filter     => submit_filter_line(editor, &mb.text, msg_tx),
+                            crate::minibuffer::MinibufferKind::GotoLine   => goto_line_submit(editor, &mb.text),
+                            crate::minibuffer::MinibufferKind::SaveAs     => save_as_submit(editor, &mb.text, ex, clock, msg_tx),
+                            crate::minibuffer::MinibufferKind::WriteBlock => block_write_submit(editor, &mb.text),
                         }
                     }
                     _ => {}
@@ -4294,5 +4330,36 @@ mod tests {
             assert!(e.pending_save_as.is_none(), "Cancel clears pending_save_as");
             assert!(e.prompt.is_none(), "prompt cleared after Cancel");
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 4 (Effort 9A): ^KW block_write — write block text to file
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn block_write_writes_block_text_only_doc_unchanged() {
+        use crate::editor::Editor;
+        let p = std::env::temp_dir().join(format!("wc-blkw-{}.md", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false }); // "hello"
+        let before_doc = e.active().document.buffer.to_string();
+        crate::app::block_write_submit(&mut e, p.to_str().unwrap());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hello", "block text written");
+        assert_eq!(e.active().document.buffer.to_string(), before_doc, "document unchanged");
+        assert!(e.active().marked_block.is_some(), "block stays after write");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn block_write_existing_target_raises_overwrite() {
+        use crate::editor::Editor;
+        let p = std::env::temp_dir().join(format!("wc-blkw-ow-{}.md", std::process::id()));
+        std::fs::write(&p, "old").unwrap();
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 3, hidden: false });
+        crate::app::block_write_submit(&mut e, p.to_str().unwrap());
+        assert_eq!(e.prompt.as_ref().unwrap().action_for('o'), Some(crate::prompt::PromptAction::OverwriteWriteBlock));
+        let _ = std::fs::remove_file(&p);
     }
 }

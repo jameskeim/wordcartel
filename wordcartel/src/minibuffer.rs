@@ -10,6 +10,8 @@ pub enum MinibufferKind {
     GotoLine,
     /// File-name input for Save As.
     SaveAs,
+    /// File-name input for Write Block (^KW).
+    WriteBlock,
 }
 
 #[derive(Debug, Clone)]

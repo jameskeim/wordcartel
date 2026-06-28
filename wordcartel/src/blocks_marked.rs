@@ -99,6 +99,23 @@ pub fn block_clear(editor: &mut Editor) {
     editor.status = "block cleared".into();
 }
 
+/// ^KW: open the Write-Block minibuffer pre-filled with the document's directory.
+pub fn block_write(editor: &mut Editor) {
+    if editor.active().marked_block.is_none() {
+        editor.status = "no marked block".into();
+        return;
+    }
+    let pre = editor.active().document.path.as_ref()
+        .and_then(|p| p.parent())
+        .map(|d| format!("{}/", d.display()))
+        .unwrap_or_default();
+    editor.open_minibuffer("Write block to: ", crate::minibuffer::MinibufferKind::WriteBlock);
+    if let Some(mb) = editor.minibuffer.as_mut() {
+        mb.cursor = pre.len();
+        mb.text = pre;
+    }
+}
+
 /// Set `pending_block_begin` to the current caret position (^KB).
 pub fn block_begin(editor: &mut Editor) {
     let at = nav::head(editor);

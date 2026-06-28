@@ -264,6 +264,8 @@ impl Registry {
         r.register("block_jump_end",      "Jump to Block End",   Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_jump_end(c.editor);      CommandResult::Handled });
         r.register("block_toggle_hidden", "Toggle Block Hidden", Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_toggle_hidden(c.editor); CommandResult::Handled });
         r.register("block_clear",         "Clear Block",         Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_clear(c.editor);         CommandResult::Handled });
+        // Marked block write-to-file (Task 4 / Effort 9A).
+        r.register("block_write", "Write Block to File\u{2026}", Some(MenuCategory::File), |c| { crate::blocks_marked::block_write(c.editor); CommandResult::Handled });
 
         // Format menu — discrete transform commands (Task 1 / Effort 5b).
         r.register("reflow", "Reflow", Some(MenuCategory::Format), |c| {

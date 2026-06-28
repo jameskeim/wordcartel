@@ -283,6 +283,8 @@ pub struct Editor {
     pub pending_save_as: Option<PostSaveAction>,
     /// The target awaiting an OverwriteSaveAs confirmation (existing-file Save-As). (Task 3)
     pub pending_save_overwrite: Option<PathBuf>,
+    /// The target awaiting an OverwriteWriteBlock confirmation (^KW existing file). (9A Task 4)
+    pub pending_write_block: Option<PathBuf>,
     pub filter_in_flight: Option<crate::filter::CancelFlag>,
     pub transform_in_flight: bool,
     pub minibuffer: Option<crate::minibuffer::Minibuffer>,
@@ -340,6 +342,7 @@ impl Editor {
             buffers: Vec::new(), active: 0, next_buffer_id: 0,
             register: Register::default(), status: String::new(), quit: false,
             prompt: None, pending_after_save: None, pending_save_as: None, pending_save_overwrite: None,
+            pending_write_block: None,
             filter_in_flight: None, transform_in_flight: false, minibuffer: None, pending_export: None,
             pending_mark: None,
             clipboard_sync_request: None, clipboard_get_pending: None, clipboard_notice_shown: false,
