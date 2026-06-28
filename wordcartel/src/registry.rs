@@ -106,6 +106,8 @@ impl Registry {
         // Word delete — Edit menu.
         r.register("delete_word_back",    "Delete Word Left",  Some(MenuCategory::Edit), |c| run(c, Command::DeleteWord { back: true }));
         r.register("delete_word_forward", "Delete Word Right", Some(MenuCategory::Edit), |c| run(c, Command::DeleteWord { back: false }));
+        r.register("delete_line",         "Delete Line",        Some(MenuCategory::Edit), |c| run(c, Command::DeleteLine));
+        r.register("delete_to_line_end",  "Delete to Line End", Some(MenuCategory::Edit), |c| run(c, Command::DeleteToLineEnd));
 
         // Editing — palette-only (menu: None).
         r.register("insert_newline", "Insert Newline",   None, |c| run(c, Command::InsertNewline));
