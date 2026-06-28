@@ -1116,7 +1116,7 @@ mod tests {
     #[test]
     fn renders_active_minibuffer_on_status_row() {
         let mut e = Editor::new_from_text("hello\n", None, (40, 6));
-        e.open_minibuffer("> ");
+        e.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter);
         // Simulate typing "cat" into the minibuffer
         e.minibuffer.as_mut().unwrap().insert('c');
         e.minibuffer.as_mut().unwrap().insert('a');

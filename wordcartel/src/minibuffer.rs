@@ -3,11 +3,19 @@
 /// The cursor is a *byte* offset into `text`, advanced/retreated by whole
 /// UTF-8 codepoints.  Multibyte caret arithmetic is safe because `text` is
 /// typically very short (a shell invocation).
+/// What an open minibuffer's submitted line means — routes the `Enter` handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinibufferKind {
+    Filter,
+    GotoLine,
+}
+
 #[derive(Debug, Clone)]
 pub struct Minibuffer {
     pub prompt: String,
     pub text: String,
     pub cursor: usize, // byte offset into `text`
+    pub kind: MinibufferKind,
 }
 
 impl Minibuffer {
@@ -58,7 +66,7 @@ mod tests {
 
     #[test]
     fn minibuffer_edits_text() {
-        let mut m = Minibuffer { prompt: "> ".into(), text: String::new(), cursor: 0 };
+        let mut m = Minibuffer { prompt: "> ".into(), text: String::new(), cursor: 0, kind: MinibufferKind::Filter };
         for c in "abc".chars() { m.insert(c); }
         assert_eq!((m.text.as_str(), m.cursor), ("abc", 3));
         m.left(); m.backspace();

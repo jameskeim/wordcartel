@@ -120,7 +120,7 @@ impl Registry {
         r.register("undo",  "Undo",  Some(MenuCategory::Edit), |c| run(c, Command::Undo));
         r.register("redo",  "Redo",  Some(MenuCategory::Edit), |c| run(c, Command::Redo));
         r.register("filter", "Filter…", Some(MenuCategory::Edit), |c| {
-            c.editor.open_minibuffer("> ");
+            c.editor.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter);
             CommandResult::Handled
         });
         r.register("find", "Find…", Some(MenuCategory::Edit), |c| {
@@ -328,6 +328,10 @@ impl Registry {
             c.editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(nc);
             crate::derive::rebuild(c.editor);
             crate::nav::ensure_visible(c.editor);
+            CommandResult::Handled
+        });
+        r.register("goto_line", "Go to Line\u{2026}", Some(MenuCategory::View), |c| {
+            c.editor.open_minibuffer("Go to line: ", crate::minibuffer::MinibufferKind::GotoLine);
             CommandResult::Handled
         });
         r.register("unfold_all", "Unfold All Sections", Some(MenuCategory::View), |c| {

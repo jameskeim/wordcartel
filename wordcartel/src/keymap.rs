@@ -241,6 +241,8 @@ static CUA: &[(&str, &str)] = &[
     // Search
     ("ctrl-f", "find"),
     ("ctrl-r", "replace"),
+    // Go to line (Effort 8)
+    ("ctrl-g", "goto_line"),
     ("f3",     "find_next"),
     ("shift-f3", "find_prev"),
     // View  (input.rs lines 102, 114)

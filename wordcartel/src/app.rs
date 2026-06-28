@@ -367,6 +367,26 @@ fn submit_filter_line(
     crate::filter::dispatch_filter(editor, spec, msg_tx.clone());
 }
 
+/// Submit a minibuffer line as a go-to-line target (Effort 8). 1-based, clamped;
+/// records a jump origin (jump-back), unfolds to the target, lands at column 1.
+pub(crate) fn goto_line_submit(editor: &mut crate::editor::Editor, text: &str) {
+    let n: usize = match text.trim().parse() {
+        Ok(n) => n,
+        Err(_) => { editor.status = "not a line number".to_string(); return; }
+    };
+    let total = crate::derive::total_logical_lines(&editor.active().document.buffer);
+    let line_index = n.max(1).min(total) - 1;            // 1-based clamp → 0-based index
+    let pre = crate::nav::head(editor);
+    crate::marks::record_jump(editor.active_mut(), pre); // jump-back support
+    let target = editor.active().document.buffer.line_to_byte(line_index);
+    let caret = crate::registry::place_caret_visible(editor, target, crate::registry::CaretPlace::UnfoldTo);
+    editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(caret);
+    editor.active_mut().desired_col = None;
+    editor.active_mut().sel_history.clear();
+    crate::derive::rebuild(editor);   // UnfoldTo can change fold state → relayout (mirrors registry.rs:409 / app.rs:680)
+    crate::nav::ensure_visible(editor);
+}
+
 fn insert_paste_text(editor: &mut Editor, buffer_id: crate::editor::BufferId, text: &str, clock: &dyn Clock) -> bool {
     if text.len() > crate::clipboard::PASTE_MAX_BYTES {
         editor.status = format!("paste too large ({} MiB) — skipped", text.len() / (1 << 20));
@@ -987,8 +1007,11 @@ pub fn reduce(
                         editor.minibuffer = None;
                     }
                     crossterm::event::KeyCode::Enter => {
-                        let line = editor.minibuffer.take().unwrap().text;
-                        submit_filter_line(editor, &line, msg_tx);
+                        let mb = editor.minibuffer.take().unwrap();
+                        match mb.kind {
+                            crate::minibuffer::MinibufferKind::Filter   => submit_filter_line(editor, &mb.text, msg_tx),
+                            crate::minibuffer::MinibufferKind::GotoLine => goto_line_submit(editor, &mb.text),
+                        }
                     }
                     _ => {}
                 }
@@ -2257,7 +2280,7 @@ mod tests {
         use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         let mut e = Editor::new_from_text("abc\n", None, (80, 24));
-        e.open_minibuffer("> ");
+        e.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter);
         let (tx, rx) = std::sync::mpsc::channel::<Msg>();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let key = |c: char| Event::Key(KeyEvent { code: KeyCode::Char(c), modifiers: KeyModifiers::NONE,
@@ -2274,13 +2297,68 @@ mod tests {
     }
 
     #[test]
+    fn goto_line_jumps_to_line_start_and_records_jumpback() {
+        use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::Event;
+        let mut e = Editor::new_from_text("one\ntwo\nthree\nfour\n", None, (40, 10));
+        crate::derive::rebuild(&mut e);
+        // start at end so the jump is a real move
+        let end = e.active().document.buffer.len();
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(end);
+        e.open_minibuffer("Go to line: ", crate::minibuffer::MinibufferKind::GotoLine);
+        // type "3" then Enter
+        let (tx, _rx) = std::sync::mpsc::channel();
+        for ch in "3".chars() { crate::app::reduce(Msg::Input(Event::Key(KeyEvent{code:KeyCode::Char(ch),modifiers:KeyModifiers::NONE,kind:KeyEventKind::Press,state:KeyEventState::NONE})), &mut e, &Registry::builtins(), &cua_keymap(), &InlineExecutor::default(), &TestClock(0), &tx); }
+        crate::app::reduce(Msg::Input(Event::Key(KeyEvent{code:KeyCode::Enter,modifiers:KeyModifiers::NONE,kind:KeyEventKind::Press,state:KeyEventState::NONE})), &mut e, &Registry::builtins(), &cua_keymap(), &InlineExecutor::default(), &TestClock(0), &tx);
+        // line 3 ("three") starts at byte 8
+        assert_eq!(e.active().document.selection.primary().head, e.active().document.buffer.line_to_byte(2));
+        assert!(e.minibuffer.is_none(), "submit closes the minibuffer");
+        // jump-back: the origin (end) was recorded so the user can return.
+        assert!(e.active().jump_ring.contains(&end), "goto recorded the origin for jump-back");
+    }
+
+    #[test]
+    fn goto_line_into_folded_body_unfolds_to_reveal_target() {
+        // Spec §2 / Codex: a goto target inside a folded body must UNFOLD, not land hidden.
+        let mut e = Editor::new_from_text("# H\n\nbody one\nbody two\nbody three\n", None, (40, 12));
+        crate::derive::rebuild(&mut e);
+        // Fold the "# H" section via the real fold API (mirrors the 5g fold tests:
+        // `folds.toggle(heading_byte)` + rebuild — the heading anchor is byte 0).
+        let h_byte = 0usize;
+        e.active_mut().folds.toggle(h_byte);
+        crate::derive::rebuild(&mut e);
+        assert!(e.active().folds.folded.contains(&h_byte), "precondition: # H is folded");
+        // goto line 4 ("body two"), which is inside the folded body:
+        crate::app::goto_line_submit(&mut e, "4");
+        assert_eq!(e.active().document.selection.primary().head, e.active().document.buffer.line_to_byte(3));
+        // The section is no longer folded over the target (real fold-state query: the
+        // heading anchor is gone from `folds.folded`, so line index 3 is visible again).
+        assert!(!e.active().folds.folded.contains(&h_byte),
+            "goto into a folded body must unfold the covering section to reveal the target");
+    }
+
+    #[test]
+    fn goto_line_clamps_and_rejects_garbage() {
+        let mut e = Editor::new_from_text("a\nb\nc\n", None, (40, 10));
+        crate::derive::rebuild(&mut e);
+        crate::app::goto_line_submit(&mut e, "999");          // clamp-high → last line
+        let total = crate::derive::total_logical_lines(&e.active().document.buffer);
+        assert_eq!(e.active().document.selection.primary().head, e.active().document.buffer.line_to_byte(total - 1));
+        crate::app::goto_line_submit(&mut e, "0");            // clamp-low → line 1
+        assert_eq!(e.active().document.selection.primary().head, 0);
+        crate::app::goto_line_submit(&mut e, "xyz");          // garbage → status, no move
+        assert_eq!(e.active().document.selection.primary().head, 0);
+        assert_eq!(e.status, "not a line number");           // rejected input sets the status
+    }
+
+    #[test]
     fn minibuffer_does_not_starve_filterdone() {
         use crate::editor::Editor;
         use crate::filter::{Disposition, RunResult};
         use crate::jobs::InlineExecutor; use crate::registry::Registry;
         let mut e = Editor::new_from_text("abcde\n", None, (80, 24));
         let id = e.active().id; let v = e.active().document.version;
-        e.open_minibuffer("> ");
+        e.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter);
         let (tx, _rx) = std::sync::mpsc::channel(); let reg = Registry::builtins();
         let ex = InlineExecutor::default(); let clk = TestClock(0);
         crate::app::reduce(Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
@@ -2608,7 +2686,7 @@ mod tests {
         use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
         use crossterm::event::Event;
         let mut e = Editor::new_from_text("doc\n", None, (80, 24));
-        e.open_minibuffer("> ");
+        e.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter);
         let doc_before = e.active().document.buffer.to_string();
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
