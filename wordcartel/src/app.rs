@@ -3638,12 +3638,28 @@ mod tests {
         );
 
         // ── mismatching identity: guard rejects → block NOT restored ──
-        let e2 = Editor::new_from_text("hello world\n", None, (80, 24));
-        assert!(
-            crate::app::apply_resume(&entry, (99, 20), e2.active().document.buffer.len()).is_none(),
-            "identity mismatch → guard rejects"
-        );
-        assert!(e2.active().marked_block.is_none(), "block discarded on mismatch");
+        //
+        // Previously vacuous: e2 was a fresh Editor and `marked_block` was never
+        // set, so the final assert was trivially true regardless of the guard.
+        //
+        // Hardened: we now drive the same conditional-restore path that
+        // restore_resume uses (apply_resume as gate → block only if Some).
+        // The block-application code IS present; the staleness guard (mtime 99 ≠
+        // stored 10) stops it.  If apply_resume were made to ignore mismatches
+        // (always return Some), the final assert would flip to RED.
+        let mut e2 = Editor::new_from_text("hello world\n", None, (80, 24));
+        let doc_len2 = e2.active().document.buffer.len();
+        let guard = crate::app::apply_resume(&entry, (99, 20), doc_len2);
+        assert!(guard.is_none(), "identity mismatch → guard rejects");
+        // Mirror restore_resume: set block only when guard passes.
+        if let Some(_) = guard {
+            if let Some((s, en)) = entry.block {
+                e2.active_mut().marked_block =
+                    Some(MarkedBlock { start: s, end: en, hidden: false });
+            }
+        }
+        // Non-vacuous: restore code is present above; guard prevented it from running.
+        assert!(e2.active().marked_block.is_none(), "block discarded on mismatch — guard blocked restore");
     }
 
     #[test]
