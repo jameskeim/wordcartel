@@ -251,6 +251,11 @@ impl Registry {
         r.register("jump_back",    "Jump Back",    None, |c| { crate::marks::jump_back(c.editor); CommandResult::Handled });
         r.register("jump_forward", "Jump Forward", None, |c| { crate::marks::jump_forward(c.editor); CommandResult::Handled });
 
+        // Marked block creation (Task 2 / Effort 9A).
+        r.register("block_begin",               "Set Block Begin",         Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_begin(c.editor); CommandResult::Handled });
+        r.register("block_end",                 "Set Block End",           Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_end(c.editor); CommandResult::Handled });
+        r.register("mark_block_from_selection", "Mark Block from Selection", Some(MenuCategory::Edit), |c| { crate::blocks_marked::mark_block_from_selection(c.editor); CommandResult::Handled });
+
         // Format menu — discrete transform commands (Task 1 / Effort 5b).
         r.register("reflow", "Reflow", Some(MenuCategory::Format), |c| {
             crate::transform::dispatch_transform(c.editor, crate::transform::TransformKind::Reflow, c.clock, &c.msg_tx);
