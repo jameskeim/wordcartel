@@ -105,6 +105,7 @@ pub fn close_buffer(editor: &mut Editor) {
         let area = editor.active().view.area;
         let a = editor.active;
         editor.buffers[a] = crate::editor::Buffer::from_text(nid, "\n", None, area);
+        editor.mru.retain(|&x| x != id);
         editor.touch_mru(nid);
         crate::derive::rebuild(editor);
         crate::nav::ensure_visible(editor);
@@ -263,9 +264,30 @@ mod tests {
         open_as_new_buffer(&mut e, &tmp); // [a.md(0), scratch(1), second(2)] active=2
         switch_to(&mut e, 0); // active a.md
         close_buffer(&mut e); // remove index 0 → neighbor shifts into slot 0
-        assert!(e.buffers.iter().all(|b| b.document.path.as_deref() != Some(&tmp) || true));
+        assert!(
+            e.buffers.iter().all(|b| b.document.path.as_deref() != Some(std::path::Path::new("/tmp/a.md"))),
+            "closed buffer a.md should be gone"
+        );
+        assert!(
+            e.buffers.iter().any(|b| b.document.path.as_deref() == Some(tmp.as_path())),
+            "neighbor (second file) should still be present"
+        );
         assert_eq!(e.active, 0, "same-index neighbor active");
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn close_last_ordinary_prunes_old_mru_id() {
+        let mut e = Editor::new_from_text("only\n", None, (40, 10));
+        e.install_scratch();
+        let old_id = e.active().id;
+        // Simulate the buffer having been visited so its id is in MRU.
+        e.touch_mru(old_id);
+        assert!(e.mru.contains(&old_id), "old id must be in MRU before close");
+        close_buffer(&mut e); // last-ordinary path: replaces in place
+        assert!(!e.mru.contains(&old_id), "old buffer id should be pruned from MRU after close");
+        let new_id = e.active().id;
+        assert!(e.mru.contains(&new_id), "new untitled buffer id should be in MRU");
     }
 
     #[test]
