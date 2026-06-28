@@ -232,6 +232,7 @@ static CUA: &[(&str, &str)] = &[
     ("ctrl-v", "paste"),
     // File  (input.rs lines 98–99)
     ("ctrl-s", "save"),
+    ("ctrl-shift-s", "save_as"),
     ("ctrl-q", "quit"),
     // Tools  (input.rs lines 100–101)
     ("ctrl-e", "filter"),

@@ -144,6 +144,10 @@ impl Registry {
 
         // File menu.
         r.register("save", "Save", Some(MenuCategory::File), |c| crate::save::dispatch_save(c));
+        r.register("save_as", "Save As…", Some(MenuCategory::File), |c| {
+            crate::app::open_save_as(c.editor);
+            CommandResult::Handled
+        });
         r.register("save_and_quit", "Save and Quit", Some(MenuCategory::File), |c| {
             crate::save::dispatch_save_and_quit(c);
             CommandResult::Handled
@@ -535,9 +539,11 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
         let r = reg.dispatch(CommandId("save"), &mut ctx);
-        // No path → save handler reports the no-name status (delegates to run()).
+        // No path → save handler opens the Save-As minibuffer (Effort 7, Task 3).
         assert_eq!(r, crate::commands::CommandResult::Handled);
-        assert!(e.status.contains("No file name"));
+        assert!(matches!(e.minibuffer.as_ref().map(|m| m.kind),
+            Some(crate::minibuffer::MinibufferKind::SaveAs)),
+            "unnamed save opens the Save-As minibuffer");
     }
 
     #[test]

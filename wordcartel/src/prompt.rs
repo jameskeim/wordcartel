@@ -10,6 +10,7 @@ pub enum PromptAction {
     Reload,
     Overwrite,
     OverwriteExport,
+    OverwriteSaveAs,
     Recover,
     DiscardSwap,
     OpenOriginal,
@@ -80,6 +81,16 @@ impl Prompt {
                 Choice { key: 'r', label: "Reflow",    action: PromptAction::Transform(TransformKind::Reflow) },
                 Choice { key: 'u', label: "Unwrap",    action: PromptAction::Transform(TransformKind::Unwrap) },
                 Choice { key: 'v', label: "Ventilate", action: PromptAction::Transform(TransformKind::Ventilate) },
+            ],
+        }
+    }
+
+    pub fn save_overwrite(target: &std::path::Path) -> Prompt {
+        Prompt {
+            message: format!("{} exists: [O]verwrite · [C]ancel", target.display()),
+            choices: vec![
+                Choice { key: 'o', label: "Overwrite", action: PromptAction::OverwriteSaveAs },
+                Choice { key: 'c', label: "Cancel",    action: PromptAction::Cancel },
             ],
         }
     }

@@ -8,7 +8,7 @@
 pub enum MinibufferKind {
     Filter,
     GotoLine,
-    /// File-name input for Save As (Task 3 wires the handler; Task 2 adds the variant).
+    /// File-name input for Save As.
     SaveAs,
 }
 

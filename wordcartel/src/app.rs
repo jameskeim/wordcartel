@@ -331,6 +331,50 @@ pub fn open_into_current(editor: &mut Editor, path: &std::path::Path) {
 }
 
 /// Execute the action chosen in a modal prompt, then clear the prompt.
+/// Open the Save-As minibuffer pre-filled with the active doc's directory.
+pub fn open_save_as(editor: &mut crate::editor::Editor) {
+    let pre = editor.active().document.path.as_ref()
+        .and_then(|p| p.parent()).map(|d| format!("{}/", d.display())).unwrap_or_default();
+    editor.open_minibuffer("Save as: ", crate::minibuffer::MinibufferKind::SaveAs);
+    if let Some(mb) = editor.minibuffer.as_mut() { mb.text = pre.clone(); mb.cursor = pre.len(); }
+}
+
+/// Submit the Save-As minibuffer line: expand the path, raise an overwrite
+/// confirmation if the target exists, else perform the save-as immediately.
+pub fn save_as_submit(editor: &mut crate::editor::Editor, text: &str,
+                      executor: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
+                      msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
+    let t = text.trim();
+    if t.is_empty() { editor.status = "save-as: empty path".into(); editor.pending_save_as = None; return; }
+    // expand_path: ~ → home; relative → joined onto cwd. Mirror the ~ handling used by the
+    // dictionary/config path loaders.
+    let target: std::path::PathBuf = {
+        let expanded = if let Some(rest) = t.strip_prefix("~/") {
+            dirs::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| std::path::PathBuf::from(t))
+        } else { std::path::PathBuf::from(t) };
+        if expanded.is_absolute() { expanded }
+        else { std::env::current_dir().map(|d| d.join(&expanded)).unwrap_or(expanded) }
+    };
+    if target.exists() {
+        editor.pending_save_overwrite = Some(target.clone());
+        editor.open_prompt(crate::prompt::Prompt::save_overwrite(&target));
+        return;
+    }
+    perform_save_as(editor, target, executor, clock, msg_tx);
+}
+
+fn perform_save_as(editor: &mut crate::editor::Editor, target: std::path::PathBuf,
+                   executor: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
+                   msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
+    let v = editor.active().document.version;
+    let buffer_id = editor.active().id;
+    { let mut ctx = crate::registry::Ctx { editor, clock, executor, msg_tx: msg_tx.clone() };
+      crate::save::do_save_to(&mut ctx, target, crate::save::SaveMode::SaveAs); }
+    if let Some(action) = editor.pending_save_as.take() {
+        editor.pending_after_save = Some(crate::editor::PendingAfterSave { buffer_id, version: v, action, at_ms: clock.now_ms() });
+    }
+}
+
 pub fn resolve_prompt(
     action: PromptAction,
     editor: &mut Editor,
@@ -341,6 +385,8 @@ pub fn resolve_prompt(
     match action {
         PromptAction::Cancel => {
             editor.pending_export = None;
+            editor.pending_save_overwrite = None;
+            editor.pending_save_as = None;
         }
         PromptAction::QuitAnyway => { editor.quit = true; }
         PromptAction::SaveAndQuit => {
@@ -386,6 +432,11 @@ pub fn resolve_prompt(
             if let Some(pe) = editor.pending_export.take() {
                 // User explicitly confirmed clobbering the existing target.
                 crate::export::do_export(editor, &pe.ext, &pe.target, msg_tx, true);
+            }
+        }
+        PromptAction::OverwriteSaveAs => {
+            if let Some(t) = editor.pending_save_overwrite.take() {
+                perform_save_as(editor, t, ex, clock, msg_tx);
             }
         }
         PromptAction::Transform(kind) => {
@@ -1003,6 +1054,8 @@ pub fn reduce(
                 if key.code == crossterm::event::KeyCode::Esc {
                     editor.prompt = None; // Esc cancels any prompt
                     editor.pending_export = None;
+                    editor.pending_save_overwrite = None;
+                    editor.pending_save_as = None;
                 } else if let crossterm::event::KeyCode::Char(ch) = key.code {
                     if let Some(action) = editor.prompt.as_ref().unwrap().action_for(ch) {
                         resolve_prompt(action, editor, ex, clock, msg_tx);
@@ -1059,14 +1112,15 @@ pub fn reduce(
                         // here and does NOT reach the filter-cancel Esc check below, so
                         // any in-flight filter continues running.
                         editor.minibuffer = None;
+                        // Save-As minibuffer dismiss: drop any queued post-save action.
+                        editor.pending_save_as = None;
                     }
                     crossterm::event::KeyCode::Enter => {
                         let mb = editor.minibuffer.take().unwrap();
                         match mb.kind {
                             crate::minibuffer::MinibufferKind::Filter   => submit_filter_line(editor, &mb.text, msg_tx),
                             crate::minibuffer::MinibufferKind::GotoLine => goto_line_submit(editor, &mb.text),
-                            // Task 3 wires the Save-As handler; for now just dismiss.
-                            crate::minibuffer::MinibufferKind::SaveAs   => {}
+                            crate::minibuffer::MinibufferKind::SaveAs   => save_as_submit(editor, &mb.text, ex, clock, msg_tx),
                         }
                     }
                     _ => {}
@@ -3757,5 +3811,54 @@ mod tests {
             assert!(!fv.is_hidden(final_line),
                 "caret must not be on a hidden line after resume normalization");
         }
+    }
+
+    #[test]
+    fn save_as_writes_new_path_and_rekeys() {
+        use crate::editor::Editor;
+        use crate::jobs::{Executor, InlineExecutor};
+        let dir = std::env::temp_dir().join(format!("wc-saveas-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("out.md");
+        let _ = std::fs::remove_file(&p);
+        let mut e = Editor::new_from_text("content\n", None, (80, 24)); // UNNAMED, dirty-ish
+        e.active_mut().document.version = 1; e.active_mut().document.saved_version = None;
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::app::save_as_submit(&mut e, p.to_str().unwrap(), &ex, &clk, &tx);
+        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "content\n", "file written");
+        assert_eq!(e.active().document.path.as_deref(), Some(p.as_path()), "path re-keyed");
+        assert!(!e.active().document.dirty(), "clean after save-as");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_on_unnamed_buffer_opens_save_as_prompt() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        crate::save::dispatch_save(&mut ctx); // no path → opens Save-As, NOT the dead stub
+        assert!(matches!(e.minibuffer.as_ref().map(|m| m.kind),
+            Some(crate::minibuffer::MinibufferKind::SaveAs)), "unnamed save opens the SaveAs minibuffer");
+    }
+
+    #[test]
+    fn save_as_existing_target_raises_overwrite_prompt() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        let p = std::env::temp_dir().join(format!("wc-ow-{}.md", std::process::id()));
+        std::fs::write(&p, "old\n").unwrap();
+        let mut e = Editor::new_from_text("new\n", None, (80, 24));
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::app::save_as_submit(&mut e, p.to_str().unwrap(), &ex, &clk, &tx);
+        assert!(e.prompt.is_some(), "existing target → confirm modal");
+        assert_eq!(e.prompt.as_ref().unwrap().action_for('o'), Some(crate::prompt::PromptAction::OverwriteSaveAs));
+        assert_ne!(crate::prompt::PromptAction::OverwriteSaveAs, crate::prompt::PromptAction::Overwrite);
+        let _ = std::fs::remove_file(&p);
     }
 }
