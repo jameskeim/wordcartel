@@ -192,4 +192,11 @@ mod tests {
         let before_x = "漢".len(); // byte offset of 'x' (漢 is 3 bytes)
         assert_eq!(b.caret_line_col(before_x), (1, 2)); // one grapheme (漢) before caret → col 2
     }
+
+    #[test]
+    fn caret_line_col_empty_buffer_is_line_1_col_1() {
+        // Empty doc: caret at byte 0 is line 1, column 1 (no panic on the empty rope).
+        let b = TextBuffer::from_str("");
+        assert_eq!(b.caret_line_col(0), (1, 1));
+    }
 }

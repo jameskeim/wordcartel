@@ -1402,7 +1402,9 @@ mod tests {
         run(Command::SelectAll, &mut e, &TestClock(0));
         let sel = e.active().document.selection.primary();
         assert_eq!((sel.from(), sel.to()), (0, len));
+        assert_eq!(sel.head, len, "forward selection: caret (head) lands at end");
         assert!(e.active().desired_col.is_none());
+        assert!(e.active().sel_history.is_empty(), "expand-selection ladder reset on select-all");
     }
 
     #[test]
