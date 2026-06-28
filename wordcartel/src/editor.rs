@@ -328,6 +328,12 @@ pub struct Editor {
     /// Whether session-resume restore is enabled (seeded from `cfg.state.resume` in run()).
     /// Gates `open_into_current`'s resume restore. Defaults false until run() seeds it.
     pub resume_enabled: bool,
+    /// Effort 6: the permanent path-less *scratch* buffer's id. `None` in unit
+    /// contexts that never call `install_scratch`. Scratch is identified by id,
+    /// not by a name field.
+    pub scratch_id: Option<BufferId>,
+    /// Most-recently-used buffer ids, most-recent first. Drives the switcher palette.
+    pub mru: Vec<BufferId>,
 }
 
 impl Editor {
@@ -365,6 +371,8 @@ impl Editor {
             depth: wordcartel_core::theme::Depth::Truecolor,
             heading_glyph_cfg: None,
             resume_enabled: false,
+            scratch_id: None,
+            mru: Vec::new(),
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer::from_text(id, text, path, area));
@@ -383,6 +391,28 @@ impl Editor {
     pub fn by_id_mut(&mut self, id: BufferId) -> Option<&mut Buffer> { self.buffers.iter_mut().find(|b| b.id == id) }
     /// Allocate a fresh, never-reused BufferId.
     pub fn alloc_id(&mut self) -> BufferId { let id = BufferId(self.next_buffer_id); self.next_buffer_id += 1; id }
+
+    /// Effort 6: create the permanent *scratch* buffer and record its id.
+    /// Appended AFTER the launch buffer so the launch buffer stays at index 0
+    /// (active). Idempotent guard: a second call is a no-op.
+    pub fn install_scratch(&mut self) {
+        if self.scratch_id.is_some() { return; }
+        let id = self.alloc_id();
+        let area = self.active().view.area;
+        self.buffers.push(Buffer::from_text(id, "", None, area)); // empty (len 0)
+        self.scratch_id = Some(id);
+        // Seed MRU: active buffer first, scratch last.
+        let active_id = self.buffers[self.active].id;
+        self.mru = vec![active_id, id];
+    }
+    /// True iff `id` is the scratch buffer.
+    #[inline] pub fn is_scratch(&self, id: BufferId) -> bool { self.scratch_id == Some(id) }
+    /// Scratch-aware unsaved-work predicate. Scratch is NEVER dirty (it has no
+    /// file and is auto-persisted to session state). All workspace logic uses this.
+    pub fn is_dirty(&self, id: BufferId) -> bool {
+        if self.is_scratch(id) { return false; }
+        self.by_id(id).map_or(false, |b| b.document.dirty())
+    }
 
     /// Replace the active buffer with a fresh unnamed scratch buffer.
     /// Caller must run `derive::rebuild` + `nav::ensure_visible` afterwards.
@@ -877,5 +907,54 @@ mod tests {
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 2, hidden: false });
         e.undo(); // Editor::undo exists (editor.rs:512)
         assert!(e.active().marked_block.is_none(), "undo clears the block (it bypasses apply mapping)");
+    }
+
+    #[test]
+    fn install_scratch_adds_permanent_pathless_buffer() {
+        let mut e = Editor::new_from_text("doc\n", None, (40, 10));
+        assert_eq!(e.buffers.len(), 1);
+        assert_eq!(e.scratch_id, None, "no scratch until installed");
+        e.install_scratch();
+        assert_eq!(e.buffers.len(), 2, "scratch appended");
+        let sid = e.scratch_id.expect("scratch_id set");
+        assert!(e.is_scratch(sid));
+        let sb = e.by_id(sid).unwrap();
+        assert!(sb.document.path.is_none(), "scratch has no path");
+        assert_eq!(e.active, 0, "launch buffer stays active");
+    }
+
+    #[test]
+    fn is_dirty_excludes_scratch_even_when_edited() {
+        use wordcartel_core::history::Clock;
+        struct C(u64); impl Clock for C { fn now_ms(&self) -> u64 { self.0 } }
+        let mut e = Editor::new_from_text("doc\n", None, (40, 10));
+        e.install_scratch();
+        let sid = e.scratch_id.unwrap();
+        // Edit the scratch buffer directly via build_multi_replace + Buffer::apply.
+        let (cs, edit) = crate::commands::build_multi_replace(&[(0, 0, "hi".into())], 0);
+        let txn = wordcartel_core::history::Transaction::new(cs)
+            .with_selection(wordcartel_core::selection::Selection::single(2));
+        e.by_id_mut(sid).unwrap().apply(txn, edit, wordcartel_core::history::EditKind::Other, &C(0));
+        assert!(e.by_id(sid).unwrap().document.dirty(), "raw predicate says dirty");
+        assert!(!e.is_dirty(sid), "is_dirty excludes scratch");
+        // An edited ordinary buffer IS dirty via is_dirty.
+        let aid = e.buffers[0].id;
+        let (cs2, edit2) = crate::commands::build_multi_replace(&[(0, 0, "x".into())], 4);
+        let txn2 = wordcartel_core::history::Transaction::new(cs2)
+            .with_selection(wordcartel_core::selection::Selection::single(1));
+        e.by_id_mut(aid).unwrap().apply(txn2, edit2, wordcartel_core::history::EditKind::Other, &C(0));
+        assert!(e.is_dirty(aid), "ordinary edited buffer is dirty via is_dirty");
+    }
+
+    #[test]
+    fn scratch_buffer_derive_rebuild_smoke() {
+        // An empty (len 0) scratch buffer must survive derive::rebuild without panic.
+        let mut e = Editor::new_from_text("doc\n", None, (40, 10));
+        e.install_scratch();
+        let sid = e.scratch_id.unwrap();
+        let idx = e.buffers.iter().position(|b| b.id == sid).unwrap();
+        e.active = idx;
+        crate::derive::rebuild(&mut e);
+        assert_eq!(e.by_id(sid).unwrap().document.buffer.len(), 0);
     }
 }

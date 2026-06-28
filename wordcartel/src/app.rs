@@ -1747,6 +1747,9 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
         }
     }
 
+    // Effort 6: install the permanent *scratch* buffer (index 1; launch buffer stays active at 0).
+    editor.install_scratch();
+
     // Seed mouse_capture from config (default true; may be overridden by config layers).
     editor.mouse_capture = cfg.mouse.mouse_capture;
     editor.view_opts = cfg.view.clone();
