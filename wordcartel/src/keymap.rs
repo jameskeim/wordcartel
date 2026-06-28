@@ -304,42 +304,72 @@ static CUA: &[(&str, &str)] = &[
     ("alt-shift-x",  "unfold_all"),
 ];
 
-/// WordStar preset — classic two-key diamond + file commands mapped to v1 command ids.
+/// WordStar preset — full faithful classic keymap mapped to v1 command ids.
 ///
-/// Only sequences whose target exists in `Registry::builtins()` are included;
-/// the set grows as later sub-efforts add commands (find/replace, etc.).
+/// Diamond `^E/^X/^S/^D` (cursor), `^A/^F` (word), `^R/^C` (page),
+/// `^W/^Z` (scroll), delete/undo cluster, `^Q` quick prefix (both
+/// ctrl-held and plain second-key forms), `^K` block/file prefix (both
+/// forms except `^KM`/`^KJ` which are plain-only — `^M`/`^J` are
+/// terminal-reserved), and kept modern arrow/home/end/shift-select keys.
 static WORDSTAR: &[(&str, &str)] = &[
-    // Diamond navigation (^E ^S ^D ^X)
-    ("ctrl-s", "move_left"),
-    ("ctrl-d", "move_right"),
+    // Cursor diamond
     ("ctrl-e", "move_up"),
     ("ctrl-x", "move_down"),
-    // Word navigation (^A left-word, ^F right-word)
-    ("ctrl-a", "move_word_left"),
-    ("ctrl-f", "move_word_right"),
-    // ^K block / file commands
-    ("ctrl-k ctrl-s", "save"),
-    ("ctrl-k ctrl-q", "quit"),
-    ("ctrl-k ctrl-c", "copy"),
-    ("ctrl-k ctrl-v", "paste"),
-    // Undo / redo
-    ("ctrl-z", "undo"),
-    ("ctrl-y", "redo"),
-    // Named marks (Task 8 / Effort 5c)
-    ("ctrl-k m", "set_mark"),
-    ("ctrl-k j", "jump_to_mark"),
-    // Editing
+    ("ctrl-s", "move_left"),
+    ("ctrl-d", "move_right"),
+    ("ctrl-a", "move_word_left"),   // Task 1 fix
+    ("ctrl-f", "move_word_right"),  // Task 1 fix
+    ("ctrl-r", "move_page_up"),
+    ("ctrl-c", "move_page_down"),
+    ("ctrl-w", "scroll_line_up"),
+    ("ctrl-z", "scroll_line_down"),
+    // Delete / undo / redo
+    ("ctrl-g", "delete_forward"),
+    ("ctrl-t", "delete_word_forward"),
+    ("ctrl-y", "delete_line"),
+    ("ctrl-u", "undo"),
+    ("ctrl-shift-u", "redo"),
+    // ^Q "quick" prefix (ctrl-held OR plain second key)
+    ("ctrl-q ctrl-s", "move_line_start"), ("ctrl-q s", "move_line_start"),
+    ("ctrl-q ctrl-d", "move_line_end"),   ("ctrl-q d", "move_line_end"),
+    ("ctrl-q ctrl-r", "move_doc_start"),  ("ctrl-q r", "move_doc_start"),
+    ("ctrl-q ctrl-c", "move_doc_end"),    ("ctrl-q c", "move_doc_end"),
+    ("ctrl-q ctrl-e", "move_screen_top"), ("ctrl-q e", "move_screen_top"),
+    ("ctrl-q ctrl-x", "move_screen_bottom"), ("ctrl-q x", "move_screen_bottom"),
+    ("ctrl-q ctrl-f", "find"),    ("ctrl-q f", "find"),
+    ("ctrl-q ctrl-a", "replace"), ("ctrl-q a", "replace"),
+    ("ctrl-q ctrl-l", "find_next"), ("ctrl-q l", "find_next"),
+    ("ctrl-q ctrl-p", "jump_back"), ("ctrl-q p", "jump_back"),
+    ("ctrl-q ctrl-y", "delete_to_line_end"), ("ctrl-q y", "delete_to_line_end"),
+    ("ctrl-q 0", "jump_bookmark_0"), ("ctrl-q 1", "jump_bookmark_1"),
+    ("ctrl-q 2", "jump_bookmark_2"), ("ctrl-q 3", "jump_bookmark_3"),
+    ("ctrl-q 4", "jump_bookmark_4"), ("ctrl-q 5", "jump_bookmark_5"),
+    ("ctrl-q 6", "jump_bookmark_6"), ("ctrl-q 7", "jump_bookmark_7"),
+    ("ctrl-q 8", "jump_bookmark_8"), ("ctrl-q 9", "jump_bookmark_9"),
+    // ^K "block/file" prefix (ctrl-held OR plain, except ^KM/^KJ plain-only)
+    ("ctrl-k ctrl-s", "save"), ("ctrl-k s", "save"),
+    ("ctrl-k ctrl-d", "save"), ("ctrl-k d", "save"),
+    ("ctrl-k ctrl-x", "save_and_quit"), ("ctrl-k x", "save_and_quit"),
+    ("ctrl-k ctrl-q", "quit"), ("ctrl-k q", "quit"),
+    ("ctrl-k ctrl-c", "copy"),  ("ctrl-k c", "copy"),   // interim (9A reclaims ^KC for block copy)
+    ("ctrl-k ctrl-v", "paste"), ("ctrl-k v", "paste"),  // interim (9A reclaims ^KV for block move)
+    ("ctrl-k m", "set_mark"),       // plain-only (^M reserved)
+    ("ctrl-k j", "jump_to_mark"),   // plain-only (^J reserved)
+    ("ctrl-k 0", "set_bookmark_0"), ("ctrl-k 1", "set_bookmark_1"),
+    ("ctrl-k 2", "set_bookmark_2"), ("ctrl-k 3", "set_bookmark_3"),
+    ("ctrl-k 4", "set_bookmark_4"), ("ctrl-k 5", "set_bookmark_5"),
+    ("ctrl-k 6", "set_bookmark_6"), ("ctrl-k 7", "set_bookmark_7"),
+    ("ctrl-k 8", "set_bookmark_8"), ("ctrl-k 9", "set_bookmark_9"),
+    // Kept modern keys (arrows / Home / End / Shift-select / editing)
     ("backspace", "backspace"),
     ("del",       "delete_forward"),
     ("enter",     "insert_newline"),
-    // Arrow keys / home / end
     ("left",  "move_left"),
     ("right", "move_right"),
     ("up",    "move_up"),
     ("down",  "move_down"),
     ("home",  "move_line_start"),
     ("end",   "move_line_end"),
-    // Shift+arrow selecting motions
     ("shift-left",  "select_left"),
     ("shift-right", "select_right"),
     ("shift-up",    "select_up"),
@@ -592,5 +622,64 @@ mod tests {
         let f = parse_chord("ctrl-f").unwrap();
         assert!(matches!(t.resolve(&[a]), Resolution::Command(CommandId("move_word_left"))), "^A = word-left");
         assert!(matches!(t.resolve(&[f]), Resolution::Command(CommandId("move_word_right"))), "^F = word-right");
+    }
+
+    #[test]
+    fn wordstar_new_chords_resolve() {
+        let cfg = crate::config::KeymapConfig { preset: "wordstar".into(), patches: vec![] };
+        let (t, w) = build_keymap(&cfg, &Registry::builtins());
+        assert!(w.is_empty(), "no warnings: {w:?}");
+        let seq = |s: &str| parse_seq(s).unwrap();
+        let cmd = |s: &str| t.resolve(&seq(s));
+        // diamond extensions
+        assert!(matches!(cmd("ctrl-r"), Resolution::Command(CommandId("move_page_up"))));
+        assert!(matches!(cmd("ctrl-c"), Resolution::Command(CommandId("move_page_down"))));
+        assert!(matches!(cmd("ctrl-w"), Resolution::Command(CommandId("scroll_line_up"))));
+        assert!(matches!(cmd("ctrl-z"), Resolution::Command(CommandId("scroll_line_down"))));
+        assert!(matches!(cmd("ctrl-y"), Resolution::Command(CommandId("delete_line"))));
+        assert!(matches!(cmd("ctrl-t"), Resolution::Command(CommandId("delete_word_forward"))));
+        assert!(matches!(cmd("ctrl-g"), Resolution::Command(CommandId("delete_forward"))));
+        assert!(matches!(cmd("ctrl-u"), Resolution::Command(CommandId("undo"))));
+        assert!(matches!(cmd("ctrl-shift-u"), Resolution::Command(CommandId("redo"))));
+        // ^Q quick, both forms
+        assert!(matches!(cmd("ctrl-q ctrl-s"), Resolution::Command(CommandId("move_line_start"))));
+        assert!(matches!(cmd("ctrl-q s"),      Resolution::Command(CommandId("move_line_start"))));
+        assert!(matches!(cmd("ctrl-q e"),      Resolution::Command(CommandId("move_screen_top"))));
+        assert!(matches!(cmd("ctrl-q x"),      Resolution::Command(CommandId("move_screen_bottom"))));
+        assert!(matches!(cmd("ctrl-q f"),      Resolution::Command(CommandId("find"))));
+        assert!(matches!(cmd("ctrl-q y"),      Resolution::Command(CommandId("delete_to_line_end"))));
+        assert!(matches!(cmd("ctrl-q 0"),      Resolution::Command(CommandId("jump_bookmark_0"))));
+        assert!(matches!(cmd("ctrl-q 9"),      Resolution::Command(CommandId("jump_bookmark_9"))));
+        // ^K block/file, both forms + bookmarks
+        assert!(matches!(cmd("ctrl-k ctrl-s"), Resolution::Command(CommandId("save"))));
+        assert!(matches!(cmd("ctrl-k s"),      Resolution::Command(CommandId("save"))));
+        assert!(matches!(cmd("ctrl-k x"),      Resolution::Command(CommandId("save_and_quit"))));
+        assert!(matches!(cmd("ctrl-k 5"),      Resolution::Command(CommandId("set_bookmark_5"))));
+        // ^KM / ^KJ plain-only; the ctrl-form must NOT be bound
+        assert!(matches!(cmd("ctrl-k m"), Resolution::Command(CommandId("set_mark"))));
+        assert!(matches!(cmd("ctrl-k j"), Resolution::Command(CommandId("jump_to_mark"))));
+        assert!(matches!(cmd("ctrl-k ctrl-m"), Resolution::None), "^KM ctrl-form reserved, not bound");
+    }
+
+    #[test]
+    fn wordstar_has_no_chord_collisions_or_prefix_shadows() {
+        let rows = preset_bindings("wordstar").unwrap();
+        // (a) no duplicate chord maps to two ids
+        let mut seen: std::collections::HashMap<Vec<KeyChord>, &str> = std::collections::HashMap::new();
+        for (chord, id) in rows {
+            let seq = parse_seq(chord).unwrap();
+            if let Some(prev) = seen.insert(seq, id) {
+                assert_eq!(prev, *id, "duplicate chord {chord} maps to {prev} AND {id}");
+            }
+        }
+        // (b) no bound sequence is a strict prefix of another (would shadow it on exact-match)
+        let seqs: Vec<Vec<KeyChord>> = rows.iter().map(|(c, _)| parse_seq(c).unwrap()).collect();
+        for a in &seqs {
+            for b in &seqs {
+                if a.len() < b.len() && b.starts_with(a) {
+                    panic!("chord {a:?} is a strict prefix of {b:?} — would shadow it");
+                }
+            }
+        }
     }
 }
