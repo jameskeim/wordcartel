@@ -298,7 +298,7 @@ impl Editor {
     ///
     /// Invariant: prompt XOR minibuffer — only one may be active at a time.
     /// Clears `prompt`, `palette`, `menu`, and `pending_keys` before opening.
-    pub fn open_minibuffer(&mut self, prompt: &str) {
+    pub fn open_minibuffer(&mut self, prompt: &str, kind: crate::minibuffer::MinibufferKind) {
         debug_assert!(self.prompt.is_none(), "prompt xor minibuffer: cannot open minibuffer while a modal prompt is active");
         self.prompt = None;
         self.pending_keys.clear();
@@ -313,6 +313,7 @@ impl Editor {
             prompt: prompt.into(),
             text: String::new(),
             cursor: 0,
+            kind,
         });
     }
 
@@ -596,14 +597,14 @@ mod tests {
             code: crossterm::event::KeyCode::Char('k'),
             mods: crossterm::event::KeyModifiers::CONTROL,
         });
-        e.open_minibuffer("> ");
+        e.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter);
         assert!(e.pending_keys.is_empty(), "opening the minibuffer must clear a pending key sequence");
     }
 
     #[test]
     fn open_search_clears_siblings_and_open_others_clear_search() {
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
-        e.open_minibuffer("> ");
+        e.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter);
         e.open_search(crate::search_overlay::Phase::Find, 0);
         assert!(e.search.is_some() && e.minibuffer.is_none() && e.prompt.is_none()
                 && e.palette.is_none() && e.menu.is_none());

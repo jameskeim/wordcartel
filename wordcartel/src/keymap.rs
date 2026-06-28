@@ -224,6 +224,8 @@ static CUA: &[(&str, &str)] = &[
     ("ctrl-z",       "undo"),
     ("ctrl-y",       "redo"),
     ("ctrl-shift-z", "redo"),      // normalises to Char('Z')+CONTROL (same as ctrl-y variant)
+    // Select All
+    ("ctrl-a", "select_all"),
     // Clipboard  (input.rs lines 95–97)
     ("ctrl-c", "copy"),
     ("ctrl-x", "cut"),
@@ -239,6 +241,8 @@ static CUA: &[(&str, &str)] = &[
     // Search
     ("ctrl-f", "find"),
     ("ctrl-r", "replace"),
+    // Go to line (Effort 8)
+    ("ctrl-g", "goto_line"),
     ("f3",     "find_next"),
     ("shift-f3", "find_prev"),
     // View  (input.rs lines 102, 114)
