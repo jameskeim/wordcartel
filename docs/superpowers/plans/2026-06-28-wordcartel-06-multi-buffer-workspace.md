@@ -302,14 +302,19 @@ pub fn restore_scratch(editor: &mut Editor, st: &crate::state::ScratchState) {
     editor.scratch_id = Some(id);
     // Update MRU id mapping (old scratch id → new).
     for m in editor.mru.iter_mut() { if *m == sid { *m = id; } }
-    let len = editor.buffers[idx].document.buffer.len();
-    let cur = st.cursor.min(len);
-    let cur = editor.buffers[idx].document.buffer.snap_to_boundary(cur);
-    editor.buffers[idx].document.selection = wordcartel_core::selection::Selection::single(cur);
+    // Char-boundary clamp via `nav::clamp_snap` (Codex I3: TextBuffer has NO
+    // `snap_to_boundary`; clamp_snap at nav.rs:164 operates on the ACTIVE buffer).
+    // restore_scratch runs at startup; briefly make scratch active to clamp, then
+    // restore the prior active index.
+    let prev_active = editor.active;
+    editor.active = idx;
+    let cur = crate::nav::clamp_snap(editor, st.cursor);
+    editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(cur);
+    editor.active = prev_active;
 }
 ```
 
-NOTE on `snap_to_boundary`: confirm the exact char-boundary snap helper on `TextBuffer` (grep `snap` / `is_char_boundary` in `wordcartel-core/src/buffer.rs`). If the method name differs, use `crate::nav::clamp_snap` AFTER making the scratch buffer active, OR replicate its boundary logic. The clamp+snap MUST happen; do not store a raw offset.
+NOTE (Codex I3): `TextBuffer` exposes only `len`/`is_empty`/`insert`/`delete`/`slice`/line conversions/`snapshot`/`to_string` (buffer.rs:10–96) — there is no `snap_to_boundary`. Use `nav::clamp_snap` (nav.rs:164) as above; it clamps to `[0,len]` AND snaps to a char boundary. Never store a raw offset.
 
 - [ ] **Step 8: Run test, verify pass**
 
@@ -592,14 +597,14 @@ In `wordcartel/src/keymap.rs`:
     ("ctrl-k ctrl-a", "move_block_to_scratch"), ("ctrl-k a", "move_block_to_scratch"),
 ```
 
-- CUA preset (CUA table, add near the Alt bindings): bind `alt-shift-c` / `alt-shift-x` (free; `alt-c`/`alt-x` may be reserved — verify, prefer the shift variants to avoid collision with copy/cut intuition):
+- CUA preset (CUA table `static CUA`, keymap.rs:222, add near the Alt bindings):
 
 ```rust
     ("alt-shift-c", "copy_block_to_scratch"),
-    ("alt-shift-x", "move_block_to_scratch"),
+    ("alt-shift-v", "move_block_to_scratch"),
 ```
 
-VERIFY before finalizing: grep the CUA and WordStar tables to confirm `^Kg`/`^Ka`, `alt-shift-c`/`alt-shift-x` are unbound. If any is taken, pick another free key in the same family and note it in the report. Keep `both_presets_resolve_against_builtins` green.
+Codex I1: `alt-shift-x` is ALREADY bound to `unfold_all` (keymap.rs:307, asserted at keymap.rs:626) — do NOT use it. `alt-shift-c` and `alt-shift-v` are free in the CUA table. `^Kg`/`^Ka` are free in the WordStar `^K` subtree (keymap.rs:354–375). Re-confirm with a grep before finalizing and keep `both_presets_resolve_against_builtins` + the prefix-shadow tests green.
 
 - [ ] **Step 7: Add a keymap resolution test**
 
@@ -792,19 +797,18 @@ In keymap.rs tests:
 ```rust
 #[test]
 fn buffer_cycle_chords_parse_and_resolve() {
-    // Parse the exact chord strings (parser accepts single-char tokens, keymap.rs:99).
+    // Codex I2: the real sequence parser is `parse_seq` (keymap.rs:109), NOT
+    // `parse_chord_seq`. `parse_chord` (keymap.rs:59) parses a single chord.
     for s in ["ctrl-k ,", "ctrl-k .", "alt-,", "alt-."] {
-        assert!(crate::keymap::parse_chord_seq(s).is_some(), "parse {s}");
+        assert!(crate::keymap::parse_seq(s).is_some(), "parse {s}");
     }
-    // Both presets resolve the commands with no collision (extends the global test).
+    // Both presets build with no warnings (no collision / prefix-shadow).
     let (_t, w) = km(&[], &[], Some("wordstar"));
     assert!(w.is_empty(), "no wordstar warnings: {w:?}");
     let (_t, w) = km(&[], &[], Some("cua"));
     assert!(w.is_empty(), "no cua warnings: {w:?}");
 }
 ```
-
-(Use the project's actual chord-parse entry point — grep `parse_chord` / how `WORDSTAR`/`CUA` strings are parsed; match the real function name.)
 
 - [ ] **Step 8: Run keymap + workspace + full suite**
 
@@ -832,7 +836,26 @@ $(printf 'Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n
 **Interfaces:**
 - Produces: `workspace::buffer_switch_rows(editor) -> Vec<(BufferId, String)>` (MRU order; display name `*scratch*`/`*untitled*`/filename + dirty marker); a palette mode that, on Enter, calls `workspace::switch_to` for the chosen buffer id.
 
-**Implementation note:** The palette today (palette.rs) is command-id-keyed. The cleanest integration that matches the existing pattern: build a dedicated buffer-switcher that lists buffers and, on selection, switches. If the palette is generic over rows+action, reuse it; if it is hard-wired to command ids, add a `PaletteKind::Buffers` discriminant carrying `Vec<BufferId>` and branch on Enter in the palette-submit handler (grep where palette Enter is resolved in app.rs/input.rs). Follow whichever pattern the existing palette uses — do not restructure the palette.
+**Implementation note (Codex I6):** `PaletteRow` stores a `CommandId` (palette.rs:15) and the palette Enter handler reads `r.id` and calls `dispatch_overlay_command(...)` (app.rs:1075–1080) — buffer ids are NOT command ids, so the generic palette cannot carry them unchanged. Add a discriminant to `Palette`: a field `pub buffers: Option<Vec<BufferId>>` (None for the normal command palette; Some for the switcher, parallel-indexed to `rows`). At the Enter site (app.rs:1075), branch BEFORE the `dispatch_overlay_command` call:
+
+```rust
+crossterm::event::KeyCode::Enter => {
+    if let Some(ids) = editor.palette.as_ref().and_then(|p| p.buffers.clone()) {
+        let sel = editor.palette.as_ref().map(|p| p.selected).unwrap_or(0);
+        editor.palette = None;
+        if let Some(&id) = ids.get(sel) {
+            if let Some(idx) = editor.buffers.iter().position(|b| b.id == id) {
+                crate::workspace::switch_to(editor, idx);
+            }
+        }
+    } else {
+        let id_opt = editor.palette.as_ref().and_then(|p| p.rows.get(p.selected)).map(|r| r.id);
+        if let Some(id) = id_opt { dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id); }
+    }
+}
+```
+
+`open_buffer_switcher` builds `rows` (display names, MRU order, each row's `id` set to a harmless sentinel like the `palette` command id since `buffers` drives selection) AND sets `buffers = Some(ids)` in the same MRU order. Filtering reuses the palette's existing fuzzy filter over row labels — but note the filter must keep `rows` and `buffers` index-aligned; if the palette filters `rows` in place, store the `BufferId` ON the row instead (add `pub buffer: Option<BufferId>` to `PaletteRow`) so filtering can't desync the two vecs. Prefer the per-row `buffer` field if the palette filters destructively. Read palette.rs fully first and match its filter model.
 
 - [ ] **Step 1: Write failing test for switcher rows**
 
@@ -1060,10 +1083,14 @@ pub fn request_new(editor: &mut Editor, _ex: &dyn Executor, _clock: &dyn Clock, 
 }
 ```
 
-- File-browser open submit: find where it calls `open_into_current` and change to `crate::workspace::open_as_new_buffer`. (grep `open_into_current` for call sites.)
-- `apply_result` (app.rs:153) `PostSaveAction::Open(path)` arm and `PostSaveAction::New` arm (app.rs:141): these replace-based post-save actions are now unreachable from New/Open. REMOVE `PostSaveAction::New` and `PostSaveAction::Open` variants (editor.rs:15), their `apply_result` arms, and `replace_active_with_scratch` if it has no remaining callers — but KEEP `PostSaveAction::Quit` (used by save-and-quit). If removing a variant cascades widely, instead leave the enum but delete the now-dead arms and add `#[allow(dead_code)]` with a comment; prefer full removal if the blast radius is small. Resolve `request_replace` accordingly (it may become Quit-only or be inlined).
-
-VERIFY with `cargo build -p wordcartel` after each removal; let the compiler list every dead reference.
+- **File-browser open** currently routes through `request_replace(PostSaveAction::Open(...))` (app.rs:1260). Change that call site to `crate::workspace::open_as_new_buffer(editor, &path)` directly (additive; no save-then-replace).
+- **Sequence the removal (Codex I5 — the variants have a large live blast radius).** Do NOT remove the variants first. Order:
+  1. Wire additive `open_as_new_buffer`/`new_empty_buffer` (Steps 3–4, done).
+  2. Reroute `request_new` (app.rs:496) → `new_empty_buffer`, and file-browser open (app.rs:1260) → `open_as_new_buffer`.
+  3. Update the replacement-flow TESTS to additive expectations (Step 6): the New/Open tests at app.rs:2718 and app.rs:2749, plus any asserting `replace_active_with_scratch` / `"Open cancelled"` / `"New cancelled"`.
+  4. ONLY THEN remove `PostSaveAction::New` and `PostSaveAction::Open` (editor.rs:15) and their now-unreferenced sites: the `apply_result` arms (app.rs:141, app.rs:153), the `perform_post_save_action` arms (app.rs:464, app.rs:469), and `replace_active_with_scratch` (editor.rs:389) if it has no remaining callers. **KEEP `PostSaveAction::Quit`** (used by save-and-quit; Task 8 then adds `ContinueQuitDrain`).
+  5. Simplify `request_replace`/`request_new` accordingly (request_replace may collapse to a thin Quit-only helper or be inlined).
+- Run `cargo build -p wordcartel` after the reroute and again after the removal — the compiler enumerates every remaining reference, so removal is mechanical and complete (no `#[allow(dead_code)]` shortcut).
 
 - [ ] **Step 6: Update/inspect existing New/Open tests**
 
@@ -1267,7 +1294,26 @@ fn quit_review_each_cancel_aborts() {
 }
 ```
 
-(Flesh out the two stubbed tests using the file's existing executor/ctx helpers — grep the SaveAndQuit test at app.rs:2565 for the exact harness calls.)
+Plus two abort-path tests (from the Codex C2/C3/8d fixes):
+
+```rust
+#[test]
+fn quit_drain_aborts_on_save_failure() {
+    // SaveAll over a buffer whose save fails: simulate a failed Save JobDone with
+    // action ContinueQuitDrain → quit_drain cleared, quit stays false, error status.
+    // ... assert e.quit_drain.is_none() && !e.quit after the failed completion ...
+}
+
+#[test]
+fn quit_drain_aborts_when_save_as_dismissed() {
+    // Drain reaches a dirty UNNAMED buffer → Save-As minibuffer opens. Dismiss it
+    // (Esc path / empty submit) → quit_drain cleared, quit stays false.
+    // ... drive resolve_prompt(QuitSaveAll); assert minibuffer SaveAs open; invoke
+    //     the dismiss path; assert e.quit_drain.is_none() && !e.quit ...
+}
+```
+
+(Flesh out all four stubbed tests using the file's existing executor/ctx helpers — grep the SaveAndQuit test at app.rs:2565 for the exact harness calls, and the Save-As tests for how an unnamed save routes to the minibuffer.)
 
 - [ ] **Step 2: Run, verify failure**
 
@@ -1317,7 +1363,6 @@ prompt.rs — `PromptAction` (line 6) add: `QuitSaveAll, QuitReviewEach, ReviewS
                 Choice { key: 'r', label: "Review each",  action: PromptAction::QuitReviewEach },
                 Choice { key: 'c', label: "Cancel",       action: PromptAction::Cancel },
             ],
-            ..Default::default() // match the struct's other fields per existing constructors
         }
     }
     pub fn quit_review_buffer(name: &str) -> Prompt {
@@ -1328,12 +1373,11 @@ prompt.rs — `PromptAction` (line 6) add: `QuitSaveAll, QuitReviewEach, ReviewS
                 Choice { key: 'd', label: "Discard", action: PromptAction::ReviewDiscard },
                 Choice { key: 'c', label: "Cancel",  action: PromptAction::Cancel },
             ],
-            ..Default::default()
         }
     }
 ```
 
-(Match the exact `Prompt` literal shape used by `quit_confirm` at prompt.rs:50 — copy its field set.)
+Codex I4: `Prompt` has EXACTLY two fields — `message: String` and `choices: Vec<Choice>` (prompt.rs:34) — and does NOT derive `Default`. Construct both fields literally; do NOT use `..Default::default()`. (Mirrors `quit_confirm` at prompt.rs:50.)
 
 - [ ] **Step 5: `Command::Quit` → multi-buffer**
 
@@ -1441,22 +1485,60 @@ Extend the `Cancel` arm (app.rs:513) to also clear the drain:
                     editor.pending_after_save = None;
                     if saved_this {
                         if let Some(d) = editor.quit_drain.as_mut() { d.queue.pop_front(); }
-                        editor.quit_drain_advance = true; // reduce re-drives with ctx
+                        editor.quit_drain_advance = true; // apply_job_result re-drives with ctx
+                    } else {
+                        // Save failed (Codex 8d): abort the drain so it can't linger with no
+                        // in-flight save and no re-drive. The merge's error status stands.
+                        editor.quit_drain = None;
+                        editor.quit_drain_advance = false;
                     }
-                    // save failed → merge's error status stands; drain stalls (user retries)
                 }
 ```
 
-reduce hook — after the `apply_result`/JobDone handling in `reduce` (grep where `apply_result` is called inside `reduce`), add:
+**Centralize the re-drive (Codex C1).** `apply_result` is called from MULTIPLE `reduce` branches that each return early — the palette-drain path (app.rs:1133), the prompt `JobDone` path (app.rs:1317, drained at 1336, returns 1337), and the main tail (~app.rs:1651). A single hook at the tail would be skipped on the early-return paths. So introduce ONE helper and route EVERY job-result application through it:
 
 ```rust
+/// Apply a finished job's result, then advance a multi-buffer quit drain if one
+/// is waiting on this completion. The single funnel for all JobDone handling so
+/// the re-drive cannot be skipped on an early-returning reduce branch (Codex C1).
+pub fn apply_job_result(r: JobResult, editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock, msg_tx: &std::sync::mpsc::Sender<Msg>) {
+    apply_result(r, editor);
     if editor.quit_drain_advance {
         editor.quit_drain_advance = false;
-        crate::app::drive_quit_drain(editor, executor, clock, &msg_tx);
+        drive_quit_drain(editor, ex, clock, msg_tx);
     }
+}
 ```
 
-(Use the exact identifiers `reduce` has in scope for executor/clock/msg_tx.)
+Grep EVERY `apply_result(` call site reachable from `reduce` (the executor-drain loop AND each direct `Msg::JobDone(r)` branch — at least app.rs:1133, 1317/1336, and the tail ~1651) and replace it with `apply_job_result(r, editor, executor, clock, &msg_tx)`, using the identifiers each branch has in scope. Leave the unit-test shim calling `apply_result` directly.
+
+**Save-As cancel aborts the drain (Codex C2).** A dirty UNNAMED buffer in the drain opens the Save-As MINIBUFFER (not a prompt), so the `PromptAction::Cancel` arm never fires for it. Two sites must abort the drain when `quit_drain.is_some()`:
+- Save-As minibuffer Esc/dismiss (app.rs:1361–1367, where it sets `editor.minibuffer = None; editor.pending_save_as = None;`): also `editor.quit_drain = None; editor.quit_drain_advance = false;`.
+- Empty Save-As submit (`save_as_submit`, app.rs:407, the `t.is_empty()` early return): also clear `quit_drain`/`quit_drain_advance`.
+In both, leave `editor.quit = false` (no data loss; the user backed out).
+
+**Save timeout must handle ContinueQuitDrain (Codex C3).** The bounded-save-quit timeout block (app.rs:1908–1922) only special-cases `PostSaveAction::Quit`; every other action just clears `pending_after_save` with a "try again" status — which would strand a queued `quit_drain` with no in-flight save and no re-drive. Extend that block: when the timed-out action is `ContinueQuitDrain`, ABORT the whole quit (`editor.quit_drain = None; editor.quit_drain_advance = false;`) with status `"save timed out — quit cancelled"`. Do not silently clear only `pending_after_save`.
+
+```rust
+// inside the timeout block, replacing the is_quit branch:
+match p.action {
+    crate::editor::PostSaveAction::Quit => {
+        editor.pending_after_save = None;
+        editor.open_prompt(crate::prompt::Prompt::quit_confirm());
+        editor.status = "Save still running — choose again".into();
+    }
+    crate::editor::PostSaveAction::ContinueQuitDrain => {
+        editor.pending_after_save = None;
+        editor.quit_drain = None;
+        editor.quit_drain_advance = false;
+        editor.status = "save timed out — quit cancelled".into();
+    }
+    _ => {
+        editor.pending_after_save = None;
+        editor.status = "Save still running — try again".into();
+    }
+}
+```
 
 - [ ] **Step 7: Run quit tests, verify pass**
 
@@ -1514,7 +1596,7 @@ fn status_line_names_untitled_and_scratch() {
 }
 ```
 
-If render.rs has no extractable status-builder function, FIRST refactor the status-left assembly into a testable `pub fn status_left_text(editor: &Editor) -> String` (pure; no ratatui), call it from the render path, and keep behavior identical. This is a legitimate small refactor of the file we're modifying.
+Codex M1: there is NO `status_left_text` today — the status-left is assembled inline from `path_str`/`dirty_marker`/`mode_text` (render.rs:589/597/625). So the FIRST step of this task is to extract that inline assembly into a pure `pub(crate) fn status_left_text(editor: &Editor) -> String` (no ratatui types), call it from the render path with identical output, and confirm the existing render tests still pass — THEN add the `[i/n]`/display-name behavior. The extraction is a prerequisite, not a fallback.
 
 - [ ] **Step 2: Run, verify failure**
 
@@ -1575,6 +1657,20 @@ $(printf 'Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n
 - Out of scope (splits, workspace-set restore, cross-buffer block ops, SSH/tmux clipboard) → no tasks. ✓
 
 **Type consistency:** `scratch_id: Option<BufferId>`, `is_dirty(BufferId)`, `is_scratch(BufferId)`, `switch_to_index(usize)`, `switch_to(editor, usize)`, `buffer_display_name(editor, BufferId)`, `QuitDrain { queue: VecDeque<BufferId>, mode: QuitMode }`, `PostSaveAction::ContinueQuitDrain` — used consistently across tasks.
+
+**Codex plan review (round 1) — resolved inline:**
+- C1 centralized quit-drain re-drive via `apply_job_result` at every JobDone site (Task 8). ✓
+- C2 Save-As minibuffer dismiss / empty-submit abort the drain (Task 8). ✓
+- C3 save-timeout handles `ContinueQuitDrain` (abort, not silent-clear) (Task 8). ✓
+- I1 CUA move chord `alt-shift-x`→`alt-shift-v` (x is `unfold_all`) (Task 3). ✓
+- I2 `parse_chord_seq`→`parse_seq` (Task 4). ✓
+- I3 `snap_to_boundary` doesn't exist → `nav::clamp_snap` via temporary-active (Task 2). ✓
+- I4 `Prompt` has no `Default` → literal `{message, choices}` (Task 8). ✓
+- I5 sequenced `PostSaveAction::{New,Open}` removal with all live sites enumerated (Task 6). ✓
+- I6 palette can't carry buffer ids → discriminant + Enter-site branch (Task 5). ✓
+- M1 `status_left_text` extraction made a prerequisite (Task 9). ✓
+- 8d save-failure mid-drain aborts cleanly (no lingering drain) (Task 8). ✓
+- Confirmed clean by Codex: empty `""` scratch supported; cross-buffer apply with `path=None` safe; core signatures/anchors accurate; WordStar `^K` chords free.
 
 **Open verification points flagged inline for implementers (not placeholders — real "confirm against code" checks):**
 - Task 2: exact char-boundary snap helper name on `TextBuffer` (`snap_to_boundary` vs `clamp_snap`).
