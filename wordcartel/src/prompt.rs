@@ -7,6 +7,12 @@ pub enum PromptAction {
     Cancel,
     QuitAnyway,
     SaveAndQuit,
+    /// Dirty-guard: save first, then perform the pending PostSaveAction.
+    /// Distinct from SaveAndQuit (which is quit-confirm only).
+    SaveAndProceed,
+    /// Dirty-guard: discard unsaved changes, then perform the pending PostSaveAction.
+    /// Distinct from QuitAnyway (which is quit-confirm only).
+    DiscardAndProceed,
     Reload,
     Overwrite,
     OverwriteExport,
@@ -91,6 +97,19 @@ impl Prompt {
             choices: vec![
                 Choice { key: 'o', label: "Overwrite", action: PromptAction::OverwriteSaveAs },
                 Choice { key: 'c', label: "Cancel",    action: PromptAction::Cancel },
+            ],
+        }
+    }
+
+    /// Dirty-guard modal: raised by New (and Open in Task 5) when the buffer has unsaved changes.
+    /// Choices: [S]ave (save first, then proceed) · [D]iscard (drop changes, proceed) · [C]ancel.
+    pub fn dirty_guard() -> Prompt {
+        Prompt {
+            message: "Unsaved changes: [S]ave · [D]iscard · [C]ancel".into(),
+            choices: vec![
+                Choice { key: 's', label: "Save",    action: PromptAction::SaveAndProceed },
+                Choice { key: 'd', label: "Discard", action: PromptAction::DiscardAndProceed },
+                Choice { key: 'c', label: "Cancel",  action: PromptAction::Cancel },
             ],
         }
     }

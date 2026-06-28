@@ -375,6 +375,57 @@ fn perform_save_as(editor: &mut crate::editor::Editor, target: std::path::PathBu
     }
 }
 
+/// Perform a PostSaveAction immediately (no save): used for the clean path and Discard.
+fn perform_post_save_action(
+    editor: &mut Editor,
+    action: crate::editor::PostSaveAction,
+    ex: &dyn Executor,
+    clock: &dyn Clock,
+    msg_tx: &std::sync::mpsc::Sender<Msg>,
+) {
+    let _ = (ex, clock, msg_tx); // Open(p) uses ex/clock/msg_tx only via open_into_current (no async needed)
+    match action {
+        crate::editor::PostSaveAction::New => {
+            editor.replace_active_with_scratch();
+            crate::derive::rebuild(editor);
+            crate::nav::ensure_visible(editor);
+        }
+        crate::editor::PostSaveAction::Open(ref p) => {
+            open_into_current(editor, p);
+        }
+        crate::editor::PostSaveAction::Quit => {
+            editor.quit = true;
+        }
+    }
+}
+
+/// Dirty-guard: perform `action` immediately if the buffer is clean, else raise the
+/// Save/Discard/Cancel modal (the intent is held in `pending_save_as` until resolved).
+fn request_replace(
+    editor: &mut Editor,
+    action: crate::editor::PostSaveAction,
+    ex: &dyn Executor,
+    clock: &dyn Clock,
+    msg_tx: &std::sync::mpsc::Sender<Msg>,
+) {
+    if !editor.active().document.dirty() {
+        perform_post_save_action(editor, action, ex, clock, msg_tx);
+        return;
+    }
+    editor.pending_save_as = Some(action);
+    editor.open_prompt(crate::prompt::Prompt::dirty_guard());
+}
+
+/// Request a New (scratch) buffer: immediate if clean, else raise the dirty-guard modal.
+pub fn request_new(
+    editor: &mut Editor,
+    ex: &dyn Executor,
+    clock: &dyn Clock,
+    msg_tx: &std::sync::mpsc::Sender<Msg>,
+) {
+    request_replace(editor, crate::editor::PostSaveAction::New, ex, clock, msg_tx);
+}
+
 pub fn resolve_prompt(
     action: PromptAction,
     editor: &mut Editor,
@@ -394,6 +445,26 @@ pub fn resolve_prompt(
             let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
             crate::save::dispatch_save_and_quit(&mut ctx);
             return; // prompt handled; must NOT clear an external-mod modal
+        }
+        PromptAction::DiscardAndProceed => {
+            // Dirty-guard: discard unsaved changes and immediately perform the pending action.
+            if let Some(action) = editor.pending_save_as.take() {
+                perform_post_save_action(editor, action, ex, clock, msg_tx);
+            }
+        }
+        PromptAction::SaveAndProceed => {
+            // Dirty-guard: dismiss the modal first, then dispatch a save followed by the pending
+            // action. dispatch_save_then handles NAMED (saves + arms pending_after_save) AND
+            // UNNAMED (opens Save-As carrying the action in pending_save_as). Take the intent
+            // first so the named path doesn't leave a stale pending_save_as.
+            editor.prompt = None; // dismiss the dirty-guard modal first
+            if let Some(action) = editor.pending_save_as.take() {
+                let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
+                crate::save::dispatch_save_then(&mut ctx, action);
+            }
+            return; // MUST return — dispatch_save_then may have opened an external-mod or Save-As
+                    // overlay; the trailing resolve_prompt prompt-clear would wipe it otherwise
+                    // (mirrors the SaveAndQuit arm's return).
         }
         PromptAction::Reload => crate::save::reload_from_disk(editor),
         PromptAction::Overwrite => {
@@ -3860,5 +3931,60 @@ mod tests {
         assert_eq!(e.prompt.as_ref().unwrap().action_for('o'), Some(crate::prompt::PromptAction::OverwriteSaveAs));
         assert_ne!(crate::prompt::PromptAction::OverwriteSaveAs, crate::prompt::PromptAction::Overwrite);
         let _ = std::fs::remove_file(&p);
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 4: New command + dirty-guard mechanism
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn new_on_clean_buffer_replaces_with_scratch() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("kept\n", None, (80, 24)); // clean (saved_version=Some(0))
+        let (ex, clk, tx) = (crate::jobs::InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
+        crate::app::request_new(&mut e, &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "\n", "clean buffer → immediate new scratch");
+        assert!(e.active().document.path.is_none());
+        assert!(e.prompt.is_none(), "no modal for a clean buffer");
+    }
+
+    #[test]
+    fn new_on_dirty_buffer_raises_guard_modal() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("draft\n", None, (80, 24));
+        e.active_mut().document.version = 1; // dirty (saved_version=Some(0))
+        let (ex, clk, tx) = (crate::jobs::InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
+        crate::app::request_new(&mut e, &ex, &clk, &tx);
+        assert!(e.prompt.is_some(), "dirty buffer → Save/Discard/Cancel modal");
+        assert_eq!(e.prompt.as_ref().unwrap().action_for('d'), Some(crate::prompt::PromptAction::DiscardAndProceed));
+    }
+
+    #[test]
+    fn dirty_guard_discard_replaces_scratch_and_cancel_preserves() {
+        use crate::editor::Editor;
+        // Discard → proceeds to scratch
+        {
+            let mut e = Editor::new_from_text("draft\n", None, (80, 24));
+            e.active_mut().document.version = 1; // dirty
+            let (ex, clk, tx) = (crate::jobs::InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
+            crate::app::request_new(&mut e, &ex, &clk, &tx);
+            assert!(e.prompt.is_some());
+            crate::app::resolve_prompt(crate::prompt::PromptAction::DiscardAndProceed, &mut e, &ex, &clk, &tx);
+            assert_eq!(e.active().document.buffer.to_string(), "\n", "Discard → scratch");
+            assert!(e.active().document.path.is_none());
+            assert!(e.prompt.is_none(), "prompt cleared after Discard");
+            assert!(e.pending_save_as.is_none(), "pending_save_as cleared after Discard");
+        }
+        // Cancel → untouched buffer, pending_save_as cleared
+        {
+            let mut e = Editor::new_from_text("draft\n", None, (80, 24));
+            e.active_mut().document.version = 1; // dirty
+            let (ex, clk, tx) = (crate::jobs::InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
+            crate::app::request_new(&mut e, &ex, &clk, &tx);
+            crate::app::resolve_prompt(crate::prompt::PromptAction::Cancel, &mut e, &ex, &clk, &tx);
+            assert_eq!(e.active().document.buffer.to_string(), "draft\n", "Cancel → untouched");
+            assert!(e.pending_save_as.is_none(), "Cancel clears pending_save_as");
+            assert!(e.prompt.is_none(), "prompt cleared after Cancel");
+        }
     }
 }
