@@ -91,9 +91,11 @@ pub fn open_as_new_buffer(editor: &mut Editor, path: &std::path::Path) {
     }
 }
 
-/// Close the active buffer. Scratch → no-op. Dirty → refuse (keep work; the quit
-/// flow handles interactive save). Last ordinary buffer → replace with a fresh
-/// empty untitled. New active = same-index neighbor.
+/// Close the active buffer. Scratch → no-op (status set). Dirty → REFUSED with a
+/// status (`"unsaved changes — save or discard first"`); the buffer is not closed and
+/// no interactive prompt is shown (a Save/Discard/Cancel-on-close flow is a planned
+/// follow-up, not yet implemented). Last ordinary buffer → replace with a fresh empty
+/// untitled. New active = same-index neighbor.
 pub fn close_buffer(editor: &mut Editor) {
     let id = editor.active().id;
     if editor.is_scratch(id) { editor.status = "can't close the scratch buffer".into(); return; }

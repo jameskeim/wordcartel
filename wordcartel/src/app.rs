@@ -1659,7 +1659,10 @@ pub fn reduce(
             }
         }
         Msg::Input(Event::Resize(w, h)) => {
-            editor.active_mut().view.area = (w, h);
+            for b in editor.buffers.iter_mut() {
+                b.view.area = (w, h);
+                b.view.line_layouts.clear();
+            }
             derive::rebuild(editor);
             crate::nav::ensure_visible(editor);
         }
@@ -4155,6 +4158,43 @@ mod tests {
             e.active().view.scroll_row, 0,
             "scroll_row must be clamped to a valid value after resize",
         );
+    }
+
+    /// Regression: resize must update EVERY buffer's view.area, not just the active one.
+    /// Background buffers that keep a stale area lay out at the wrong geometry when
+    /// switched to.  Fix: the Resize handler iterates all buffers.
+    #[test]
+    fn resize_updates_all_buffers_area() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        use crossterm::event::Event;
+
+        let mut e = Editor::new_from_text("first buffer\n", None, (80, 40));
+        e.install_scratch(); // second buffer — background after install
+
+        let reg = Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        // Sanity: both buffers start at the initial area.
+        assert!(e.buffers.iter().all(|b| b.view.area == (80, 40)));
+
+        // Dispatch a resize event.
+        crate::app::reduce(
+            crate::app::Msg::Input(Event::Resize(120, 30)),
+            &mut e, &reg, &km, &ex, &clk, &tx,
+        );
+
+        // ALL buffers — not just the active one — must reflect the new dimensions.
+        for b in &e.buffers {
+            assert_eq!(
+                b.view.area, (120, 30),
+                "buffer {:?} has stale area {:?} after resize", b.id, b.view.area,
+            );
+        }
     }
 
     // -------------------------------------------------------------------------

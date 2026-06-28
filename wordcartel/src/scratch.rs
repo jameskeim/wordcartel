@@ -24,6 +24,10 @@ fn append_to_scratch(editor: &mut Editor, text: &str, clock: &dyn Clock) -> bool
 
 /// Copy the active buffer's marked block into scratch; source unchanged, block kept.
 pub fn copy_block_to_scratch(editor: &mut Editor, clock: &dyn Clock) {
+    if editor.scratch_id == Some(editor.active().id) {
+        editor.status = "already in the scratch buffer".into();
+        return;
+    }
     let Some(b) = editor.active().marked_block else { editor.status = "no marked block".into(); return; };
     let text = editor.active().document.buffer.slice(b.start..b.end);
     if append_to_scratch(editor, &text, clock) {
@@ -36,6 +40,10 @@ pub fn copy_block_to_scratch(editor: &mut Editor, clock: &dyn Clock) {
 /// Move the active buffer's marked block into scratch; delete it from the source
 /// (a separate undo step in the source's history). Block is consumed.
 pub fn move_block_to_scratch(editor: &mut Editor, clock: &dyn Clock) {
+    if editor.scratch_id == Some(editor.active().id) {
+        editor.status = "already in the scratch buffer".into();
+        return;
+    }
     let Some(b) = editor.active().marked_block else { editor.status = "no marked block".into(); return; };
     let text = editor.active().document.buffer.slice(b.start..b.end);
     if !append_to_scratch(editor, &text, clock) {
@@ -117,5 +125,25 @@ mod tests {
         move_block_to_scratch(&mut e, &C(0));
         assert_eq!(e.status, "no marked block");
         assert_eq!(e.active().document.buffer.to_string(), "hello world\n", "buffer unchanged");
+    }
+
+    #[test]
+    fn verbs_noop_when_scratch_is_active() {
+        let mut e = setup();
+        // Switch to the scratch buffer.
+        crate::workspace::goto_scratch(&mut e);
+        assert_eq!(e.buffers[e.active].id, e.scratch_id.unwrap(), "active must be scratch");
+
+        // Give the scratch buffer a marked block so we can detect if anything is appended.
+        let scratch_before = e.active().document.buffer.to_string();
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 0, hidden: false });
+
+        copy_block_to_scratch(&mut e, &C(0));
+        assert_eq!(e.status, "already in the scratch buffer");
+        assert_eq!(e.active().document.buffer.to_string(), scratch_before, "copy: scratch content unchanged");
+
+        move_block_to_scratch(&mut e, &C(0));
+        assert_eq!(e.status, "already in the scratch buffer");
+        assert_eq!(e.active().document.buffer.to_string(), scratch_before, "move: scratch content unchanged");
     }
 }
