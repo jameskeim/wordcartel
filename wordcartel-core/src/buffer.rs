@@ -73,6 +73,19 @@ impl TextBuffer {
         self.rope.line_to_byte(line)
     }
 
+    /// 1-based logical line + 1-based **source grapheme column** of `caret`.
+    /// The column counts grapheme clusters from the start of the caret's line
+    /// (`line_to_byte(line)`) to `caret` — source position, NOT visual; so it is
+    /// view- and wrap-independent. O(line): scans only the caret's line.
+    pub fn caret_line_col(&self, caret: BytePos) -> (usize, usize) {
+        use unicode_segmentation::UnicodeSegmentation;
+        let line = self.byte_to_line(caret);
+        let line_start = self.line_to_byte(line);
+        let prefix = self.slice(line_start..caret); // `String` — the line up to the caret
+        let col = UnicodeSegmentation::graphemes(prefix.as_str(), true).count();
+        (line + 1, col + 1)
+    }
+
     pub fn snapshot(&self) -> ropey::Rope {
         self.rope.clone() // O(1) — the async-worker seam (spec §10.3)
     }
@@ -146,5 +159,37 @@ mod tests {
     fn insert_at_mid_char_byte_panics() {
         let mut b = TextBuffer::from_str("héllo");
         b.insert(2, "X"); // byte 2 is inside 'é' — must panic
+    }
+
+    #[test]
+    fn caret_line_col_ascii() {
+        let b = TextBuffer::from_str("abc\ndef\n");
+        assert_eq!(b.caret_line_col(0), (1, 1));   // start of doc
+        assert_eq!(b.caret_line_col(2), (1, 3));   // before 'c'
+        assert_eq!(b.caret_line_col(4), (2, 1));   // start of line 2 ('d')
+        assert_eq!(b.caret_line_col(6), (2, 3));   // before 'f'
+    }
+
+    #[test]
+    fn caret_line_col_counts_graphemes_not_bytes() {
+        // "aéb": 'é' is 2 bytes (U+00E9). Caret before 'b' is byte 3.
+        let b = TextBuffer::from_str("aéb\n");
+        assert_eq!(b.caret_line_col(3), (1, 3)); // graphemes a,é → col 3, NOT byte-4
+    }
+
+    #[test]
+    fn caret_line_col_combining_cluster_is_one_column() {
+        // "e\u{301}" = 'e' + combining acute = ONE grapheme (3 bytes), then 'x'.
+        let b = TextBuffer::from_str("e\u{301}x\n");
+        let before_x = "e\u{301}".len(); // byte offset of 'x'
+        assert_eq!(b.caret_line_col(before_x), (1, 2)); // one grapheme before caret → col 2
+    }
+
+    #[test]
+    fn caret_line_col_wide_cjk_counts_one_column() {
+        // A wide CJK glyph is ONE grapheme = ONE column (NOT display width 2).
+        let b = TextBuffer::from_str("漢x\n");
+        let before_x = "漢".len(); // byte offset of 'x' (漢 is 3 bytes)
+        assert_eq!(b.caret_line_col(before_x), (1, 2)); // one grapheme (漢) before caret → col 2
     }
 }
