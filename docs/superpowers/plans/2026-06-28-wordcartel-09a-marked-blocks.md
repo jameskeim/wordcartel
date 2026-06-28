@@ -54,18 +54,27 @@
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
+    // Editor has NO insert/delete helpers (Codex) — drive edits through apply, building the
+    // changeset with the existing build_multi_replace. Use the same clock the editor.rs
+    // apply-based tests use (mirror undo_redo_round_trip's clock).
+    fn ap(e: &mut Editor, edits: &[(usize, usize, &str)]) {
+        let doc_len = e.active().document.buffer.len();
+        let owned: Vec<(usize, usize, String)> = edits.iter().map(|(a,b,s)| (*a,*b,s.to_string())).collect();
+        let (cs, edit) = crate::commands::build_multi_replace(&owned, doc_len);
+        let txn = wordcartel_core::history::Transaction::new(cs);
+        e.apply(txn, edit, wordcartel_core::history::EditKind::Other, &TestClock(0));
+    }
+
     #[test]
     fn marked_block_tracks_edits_and_collapses() {
         let mut e = Editor::new_from_text("hello world\n", None, (40, 10));
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 6, end: 11, hidden: false }); // "world"
-        // insert "XX" at byte 0 → block shifts right by 2
-        e.insert(0, "XX"); // helper that goes through apply (mirror existing insert test helper)
+        ap(&mut e, &[(0, 0, "XX")]); // insert "XX" at byte 0 → block shifts right by 2
         let b = e.active().marked_block.unwrap();
         assert_eq!((b.start, b.end), (8, 13));
-        // delete the whole block region → collapse → cleared
         let len = e.active().document.buffer.len();
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: len, hidden: false });
-        e.delete(0, len);
+        ap(&mut e, &[(0, len, "")]); // delete the whole region → collapse → cleared
         assert!(e.active().marked_block.is_none(), "fully-deleted block clears");
     }
 
@@ -73,23 +82,23 @@
     fn marked_block_boundary_inserts_stay_outside() {
         let mut e = Editor::new_from_text("ab cd\n", None, (40, 10));
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 3, end: 5, hidden: false }); // "cd"
-        e.insert(5, "X"); // insert exactly at end → end stays (map_pos_before), block does NOT grow
+        ap(&mut e, &[(5, 5, "X")]); // insert at end → end stays (map_pos_before), block does NOT grow
         assert_eq!(e.active().marked_block.unwrap().end, 5);
-        e.insert(3, "Y"); // insert exactly at start → start moves past (map_pos), block does NOT grow at front
+        ap(&mut e, &[(3, 3, "Y")]); // insert at start → start moves past (map_pos), block does NOT grow at front
         assert_eq!(e.active().marked_block.unwrap().start, 4);
     }
 
     #[test]
     fn undo_clears_marked_block() {
         let mut e = Editor::new_from_text("abc\n", None, (40, 10));
-        e.insert(0, "Z"); // make history non-empty
+        ap(&mut e, &[(0, 0, "Z")]); // make history non-empty
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 2, hidden: false });
-        e.undo();
+        e.undo(); // Editor::undo exists (editor.rs:512)
         assert!(e.active().marked_block.is_none(), "undo clears the block (it bypasses apply mapping)");
     }
 ```
 
-> Confirm the real test helpers for `insert`/`delete`/`undo` through `apply` (mirror the existing `insert_and_delete_ascii` / `undo_redo_round_trip` tests in editor.rs). If the helpers differ, drive edits the same way those tests do.
+> Confirm `TestClock` (or the real clock type) the editor.rs `#[cfg(test)]` module uses for `apply`-based tests (e.g. `undo_redo_round_trip`), and that `Editor::undo()` returns `bool`. The block-mutation in `apply`/`undo` must compile (mutating `self.marked_block` after the existing marks/ring/fold loops — no overlapping borrow).
 
 - [ ] **Step 2: Run — fails** (`MarkedBlock` undefined). `cargo test -p wordcartel marked_block`
 
@@ -347,7 +356,7 @@ fn apply_edit(editor: &mut Editor, cs: wordcartel_core::change::ChangeSet,
               edit: wordcartel_core::block_tree::Edit, new_caret: usize, clock: &dyn Clock) {
     let txn = wordcartel_core::history::Transaction::new(cs)
         .with_selection(wordcartel_core::selection::Selection::single(new_caret));
-    editor.apply(txn, edit, crate::editor::EditKind::Other, clock);
+    editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock); // Codex: EditKind is in history, not crate::editor
     crate::derive::rebuild(editor);
     nav::ensure_visible(editor);
     editor.active_mut().desired_col = None;
@@ -459,7 +468,7 @@ fn perform_block_write(editor: &mut crate::editor::Editor, target: &std::path::P
     }
 }
 ```
-Route the minibuffer `Enter` (app.rs ~1003): `MinibufferKind::WriteBlock => block_write_submit(editor, &mb.text)`. `resolve_prompt` arm: `OverwriteWriteBlock => { if let Some(t) = editor.pending_write_block.take() { if let Some(b) = editor.active().marked_block { perform_block_write(editor, &t, b.start, b.end); } } }`, and `Cancel` clears `pending_write_block`. Register `block_write` (File) → `block_write`. cua bind deferred to Task 7.
+Route the minibuffer `Enter` (app.rs ~1003): `MinibufferKind::WriteBlock => block_write_submit(editor, &mb.text)`. `resolve_prompt` arm: `OverwriteWriteBlock => { if let Some(t) = editor.pending_write_block.take() { if let Some(b) = editor.active().marked_block { perform_block_write(editor, &t, b.start, b.end); } } }`. **Clear `pending_write_block` on EVERY dismiss (Codex):** `PromptAction::Cancel` clears it, AND the **raw-`Esc` modal branch** (which today directly clears `pending_export`/`pending_save_overwrite`/`pending_save_as`) must also set `editor.pending_write_block = None` — else it stays armed after Esc. Register `block_write` (File) → `block_write`. cua/WordStar bind deferred to Task 7.
 
 - [ ] **Step 4: Run** `cargo test -p wordcartel block_write` + `cargo test -p wordcartel save_as` (expand_path factor didn't regress) + `cargo test -p wordcartel --lib` — green.
 
@@ -558,7 +567,7 @@ And in `render.rs`:
 
 - [ ] **Step 3: Implement theme.** In `theme.rs` add `MarkedBlock` to `SemanticElement`; add `marked_block: Face` to `ThemeFaces`; add the arm to `face()` (and `face_mut()`), `element_from_key()` (`"marked_block" => MarkedBlock`), and `ALL_ELEMENTS` (now 32). Give it a value in EVERY constructor (mirror how `selection`/`front_matter` are set): `mono_faces()` → `m(true /*bold*/, false, true /*underline*/, false, true /*reverse*/)` (= **reverse+bold+underline**); `default()`/`tokyo_night()`/`from_base16()`/phosphor/HSL builtins → a tinted bg `+ reverse + bold + underline` (a distinct, lighter-than-selection bg). Add `MarkedBlock` to the a11y pairwise-distinct test set (it must pass).
 
-- [ ] **Step 4: Implement render.** In `render.rs`, paint `MarkedBlock` on the **placed path** (mirror the selection paint that layers `face_to_ratatui(theme.face(Selection))`): for a row intersecting a **non-hidden** `marked_block`, force `use_placed` and compose `MarkedBlock` **below** Selection/Search/Diag (base → MarkedBlock → Selection → …). Map the block's source bytes → visual cells via the same `ColMap` the selection uses; **only paint visible cells** (fold-safe; never index hidden lines). Add the **`BLK`** status segment to the **left** status text (NOT the word-count-gated right segment): when `marked_block` is `Some`, append ` · BLK` (or ` · BLK·hidden` when `hidden`), themed `Chrome`.
+- [ ] **Step 4: Implement render.** In `render.rs`, paint `MarkedBlock` on the **placed path** (mirror the selection paint that layers `face_to_ratatui(theme.face(Selection))`). **`use_placed` refactor (Codex):** `use_placed` is computed ONCE before the row loop as an immutable bool; a visible non-hidden `marked_block` must force the placed path too — either fold the block's presence into that precompute (`use_placed = has_selection || has_search || has_diag || (marked_block.is_some() && !hidden)`) or compute a per-row `row_use_placed`. Do **not** only paint inside the existing placed branch (it would silently skip the block when no selection/search/diag is active). Compose `MarkedBlock` **below** Selection/Search/Diag (base → MarkedBlock → Selection → …). Map the block's source bytes → visual cells via the same `ColMap` the selection uses; **only paint visible cells** (fold-safe; never index hidden lines). Add the **`BLK`** status segment to the **left** status text (NOT the word-count-gated right segment): when `marked_block` is `Some`, append ` · BLK` (or ` · BLK·hidden` when `hidden`), themed `Chrome`.
 
 - [ ] **Step 5: Run** `cargo test -p wordcartel-core marked_block` + `cargo test -p wordcartel marked_block` + `cargo test -p wordcartel-core` (a11y/coverage tests pass with the new element) + `cargo test -p wordcartel --lib` — green.
 
@@ -584,10 +593,14 @@ And in `render.rs`:
         let (t, w) = build_keymap(&cfg, &Registry::builtins());
         assert!(w.is_empty(), "{w:?}");
         let cmd = |s: &str| t.resolve(&parse_seq(s).unwrap());
+        // both the plain AND ctrl-held second-key forms (9B prefix convention)
         assert!(matches!(cmd("ctrl-k b"), Resolution::Command(CommandId("block_begin"))));
+        assert!(matches!(cmd("ctrl-k ctrl-b"), Resolution::Command(CommandId("block_begin"))));
         assert!(matches!(cmd("ctrl-k k"), Resolution::Command(CommandId("block_end"))));
         assert!(matches!(cmd("ctrl-k c"), Resolution::Command(CommandId("block_copy"))), "^KC reclaimed from copy");
+        assert!(matches!(cmd("ctrl-k ctrl-c"), Resolution::Command(CommandId("block_copy"))), "^K^C reclaimed too");
         assert!(matches!(cmd("ctrl-k v"), Resolution::Command(CommandId("block_move"))), "^KV reclaimed from paste");
+        assert!(matches!(cmd("ctrl-k ctrl-v"), Resolution::Command(CommandId("block_move"))), "^K^V reclaimed too");
         assert!(matches!(cmd("ctrl-k y"), Resolution::Command(CommandId("block_delete"))));
         assert!(matches!(cmd("ctrl-k w"), Resolution::Command(CommandId("block_write"))));
         assert!(matches!(cmd("ctrl-k h"), Resolution::Command(CommandId("block_toggle_hidden"))));
@@ -609,9 +622,11 @@ And in `render.rs`:
 with the block binds (both ctrl-held and plain second-key forms per the 9B convention):
 `^KB`→`block_begin`, `^KK`→`block_end`, `^KC`→`block_copy`, `^KV`→`block_move`, `^KY`→`block_delete`,
 `^KW`→`block_write`, `^KH`→`block_toggle_hidden`, `^QB`→`block_jump_begin`, `^QK`→`block_jump_end`.
-In `CUA`: add `("alt-b", "mark_block_from_selection")`. **Update** the existing
-`wordstar_new_chords_resolve` test assertions that expect `ctrl-k c`→`copy` / `ctrl-k v`→`paste`
-(they now resolve to `block_copy`/`block_move`).
+In `CUA`: add `("alt-b", "mark_block_from_selection")`. **Codex:** the existing
+`wordstar_new_chords_resolve` test does **not** currently assert `^KC`/`^KV` → copy/paste, so
+there is nothing to "update" — instead **add** the block-chord assertions (Step 1 above) and
+make sure no *other* wordstar test asserts `ctrl-k c`/`ctrl-k v` resolve to `copy`/`paste`
+(remove/adjust any that do).
 
 - [ ] **Step 4: Run** `cargo test -p wordcartel wordstar` (incl `both_presets_resolve_against_builtins` + the collision/prefix-shadow test) + `cargo test -p wordcartel --lib` + `cargo test` (workspace) — all green.
 
