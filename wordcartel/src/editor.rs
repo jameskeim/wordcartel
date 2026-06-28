@@ -10,6 +10,20 @@ use wordcartel_core::selection::Selection;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Ord, PartialOrd)]
 pub struct BufferId(pub u64);
 
+/// What to do once a pending save completes successfully.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PostSaveAction { Quit, Open(std::path::PathBuf), New }
+
+/// An in-flight "save, then act" request. Armed by `dispatch_save_then`;
+/// consumed by `apply_result` when the save lands clean.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingAfterSave {
+    pub buffer_id: BufferId,
+    pub version: u64,
+    pub action: PostSaveAction,
+    pub at_ms: u64,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RenderMode {
     LivePreview,
@@ -82,6 +96,59 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    /// Pure construction of a Buffer with a caller-supplied id (id source = alloc_id).
+    /// Mirrors the buffer push in `Editor::new_from_text` exactly.
+    pub fn from_text(id: BufferId, text: &str, path: Option<PathBuf>, area: (u16, u16)) -> Buffer {
+        let buffer = TextBuffer::from_str(text);
+        let blocks = block_tree::full_parse_rope(&buffer.snapshot());
+        let document = Document {
+            buffer,
+            selection: Selection::single(0),
+            history: History::default(),
+            blocks,
+            version: 0,
+            stored_fp: path.as_deref().and_then(crate::save::fingerprint),
+            path,
+            saved_version: Some(0),
+        };
+        let view = View {
+            scroll: 0,
+            scroll_row: 0,
+            area,
+            mode: RenderMode::LivePreview,
+            line_layouts: BTreeMap::new(),
+        };
+        Buffer {
+            id,
+            document,
+            view,
+            desired_col: None,
+            pre_edit_rope: None,
+            last_edit: None,
+            last_edit_at: None,
+            last_swap_at: None,
+            swap_in_flight: false,
+            pending_swap_body: None,
+            pending_swap_path: None,
+            marks: Default::default(),
+            jump_ring: Vec::new(),
+            ring_cursor: 0,
+            sel_history: Vec::new(),
+            diagnostics: crate::diagnostics_run::DiagStore::new(),
+            folds: crate::fold::FoldState::default(),
+        }
+    }
+
+    /// Open `path` into a named Buffer, mirroring run()'s open branch:
+    /// Ok → named clean; NotFound → named empty "new file" (`"\n"`); other errors propagate.
+    pub fn from_file(id: BufferId, path: &std::path::Path, area: (u16, u16)) -> Result<Buffer, crate::file::OpenError> {
+        match crate::file::open(path) {
+            Ok(text) => Ok(Buffer::from_text(id, &text, Some(path.to_path_buf()), area)),
+            Err(crate::file::OpenError::NotFound(_)) => Ok(Buffer::from_text(id, "\n", Some(path.to_path_buf()), area)),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Single mutation channel for THIS buffer's document (spec §10.1).
     pub fn apply(&mut self, txn: Transaction, edit: wordcartel_core::block_tree::Edit, kind: EditKind, clock: &dyn Clock) {
         let cs = txn.changes.clone();                    // capture BEFORE commit consumes txn
@@ -183,8 +250,12 @@ pub struct Editor {
     pub status: String,
     pub quit: bool,
     pub prompt: Option<crate::prompt::Prompt>,
-    pub quit_after_save: Option<u64>,
-    pub quit_after_save_at: Option<u64>,
+    /// Armed by `dispatch_save_then`; consumed by `apply_result` when the save lands.
+    pub pending_after_save: Option<PendingAfterSave>,
+    /// Carry the post-save action across an unnamed buffer's Save-As flow (Task 3).
+    pub pending_save_as: Option<PostSaveAction>,
+    /// The target awaiting an OverwriteSaveAs confirmation (existing-file Save-As). (Task 3)
+    pub pending_save_overwrite: Option<PathBuf>,
     pub filter_in_flight: Option<crate::filter::CancelFlag>,
     pub transform_in_flight: bool,
     pub minibuffer: Option<crate::minibuffer::Minibuffer>,
@@ -218,25 +289,20 @@ pub struct Editor {
     pub outline: Option<crate::outline_overlay::OutlineOverlay>,
     /// Theme picker overlay state. XOR with all other overlays.
     pub theme_picker: Option<crate::theme_picker::ThemePicker>,
+    /// File browser overlay state. XOR with all other overlays.
+    pub file_browser: Option<crate::file_browser::FileBrowser>,
     /// Active theme + terminal color depth. Seeded at startup (real depth detection: plan ③).
     pub theme: wordcartel_core::theme::Theme,
     pub depth: wordcartel_core::theme::Depth,
     /// Heading-level glyph toggle from config (seeded at startup; used by runtime picker — Task 7).
     pub heading_glyph_cfg: Option<bool>,
+    /// Whether session-resume restore is enabled (seeded from `cfg.state.resume` in run()).
+    /// Gates `open_into_current`'s resume restore. Defaults false until run() seeds it.
+    pub resume_enabled: bool,
 }
 
 impl Editor {
     pub fn new_from_text(text: &str, path: Option<PathBuf>, area: (u16, u16)) -> Editor {
-        let buffer = TextBuffer::from_str(text);
-        let selection = Selection::single(0);
-        let history = History::default();
-        let blocks = block_tree::full_parse_rope(&buffer.snapshot());
-        let document = Document {
-            buffer, selection, history, blocks, version: 0,
-            stored_fp: path.as_deref().and_then(crate::save::fingerprint),
-            path, saved_version: Some(0),
-        };
-        let view = View { scroll: 0, scroll_row: 0, area, mode: RenderMode::LivePreview, line_layouts: BTreeMap::new() };
         // Build the workspace, then allocate the buffer's id through the single
         // id source (alloc_id) so there is no second id-assignment path (Codex review).
         let (keymap, _) = crate::keymap::build_keymap(
@@ -246,7 +312,7 @@ impl Editor {
         let mut e = Editor {
             buffers: Vec::new(), active: 0, next_buffer_id: 0,
             register: Register::default(), status: String::new(), quit: false,
-            prompt: None, quit_after_save: None, quit_after_save_at: None,
+            prompt: None, pending_after_save: None, pending_save_as: None, pending_save_overwrite: None,
             filter_in_flight: None, transform_in_flight: false, minibuffer: None, pending_export: None,
             pending_mark: None,
             clipboard_sync_request: None, clipboard_get_pending: None, clipboard_notice_shown: false,
@@ -264,20 +330,14 @@ impl Editor {
             diag: None,
             outline: None,
             theme_picker: None,
+            file_browser: None,
             theme: wordcartel_core::theme::default(),
             depth: wordcartel_core::theme::Depth::Truecolor,
             heading_glyph_cfg: None,
+            resume_enabled: false,
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
-        e.buffers.push(Buffer {
-            id, document, view,
-            desired_col: None, pre_edit_rope: None, last_edit: None,
-            last_edit_at: None, last_swap_at: None, swap_in_flight: false,
-            pending_swap_body: None, pending_swap_path: None,
-            marks: Default::default(), jump_ring: Vec::new(), ring_cursor: 0, sel_history: Vec::new(),
-            diagnostics: crate::diagnostics_run::DiagStore::new(),
-            folds: crate::fold::FoldState::default(),
-        });
+        e.buffers.push(Buffer::from_text(id, text, path, area));
         e
     }
 
@@ -294,6 +354,15 @@ impl Editor {
     /// Allocate a fresh, never-reused BufferId.
     pub fn alloc_id(&mut self) -> BufferId { let id = BufferId(self.next_buffer_id); self.next_buffer_id += 1; id }
 
+    /// Replace the active buffer with a fresh unnamed scratch buffer.
+    /// Caller must run `derive::rebuild` + `nav::ensure_visible` afterwards.
+    pub fn replace_active_with_scratch(&mut self) {
+        let id = self.alloc_id();
+        let area = self.active().view.area;
+        let a = self.active;
+        self.buffers[a] = Buffer::from_text(id, "\n", None, area);
+    }
+
     /// Open the minibuffer with the given prompt string.
     ///
     /// Invariant: prompt XOR minibuffer — only one may be active at a time.
@@ -309,6 +378,7 @@ impl Editor {
         self.diag = None;
         self.outline = None;
         self.theme_picker = None;
+        self.file_browser = None;
         self.minibuffer = Some(crate::minibuffer::Minibuffer {
             prompt: prompt.into(),
             text: String::new(),
@@ -331,6 +401,7 @@ impl Editor {
         self.diag = None;
         self.outline = None;
         self.theme_picker = None;
+        self.file_browser = None;
         self.prompt = Some(p);
     }
 
@@ -348,6 +419,7 @@ impl Editor {
         self.diag = None;
         self.outline = None;
         self.theme_picker = None;
+        self.file_browser = None;
         self.palette = Some(crate::palette::Palette::default());
     }
 
@@ -361,6 +433,7 @@ impl Editor {
         self.diag = None;
         self.outline = None;
         self.theme_picker = None;
+        self.file_browser = None;
         let bid = self.active().id;
         self.search = Some(crate::search_overlay::SearchState::open(phase, origin, bid));
     }
@@ -375,6 +448,7 @@ impl Editor {
         self.pending_keys.clear(); self.pending_mark = None;
         self.outline = None;
         self.theme_picker = None;
+        self.file_browser = None;
         let bid = self.active().id;
         let ver = self.active().document.version;
         self.diag = Some(crate::diag_overlay::DiagOverlay::new(d, bid, ver));
@@ -386,6 +460,7 @@ impl Editor {
         self.search = None; self.diag = None;
         self.pending_keys.clear(); self.pending_mark = None;
         self.theme_picker = None;
+        self.file_browser = None;
         let bid = self.active().id;
         let ver = self.active().document.version;
         let blocks = self.active().document.blocks.clone();
@@ -398,11 +473,23 @@ impl Editor {
         self.prompt = None; self.minibuffer = None; self.menu = None;
         self.pending_keys.clear(); self.pending_mark = None;
         self.search = None; self.diag = None; self.outline = None; self.palette = None;
+        self.file_browser = None;
         self.theme_picker = Some(crate::theme_picker::ThemePicker {
             query: String::new(), selected: 0, rows: Vec::new(),
             original: self.theme.clone(),
         });
         if let Some(tp) = self.theme_picker.as_mut() { crate::theme_picker::rebuild_rows(tp); }
+    }
+
+    /// Open the file browser at `dir`, enforcing the single-overlay XOR invariant.
+    pub fn open_file_browser(&mut self, dir: std::path::PathBuf) {
+        self.prompt = None; self.minibuffer = None; self.menu = None; self.palette = None;
+        self.pending_keys.clear(); self.pending_mark = None;
+        self.search = None; self.diag = None; self.outline = None; self.theme_picker = None;
+        self.file_browser = Some(crate::file_browser::FileBrowser {
+            dir, query: String::new(), entries: Vec::new(), selected: 0,
+        });
+        if let Some(fb) = self.file_browser.as_mut() { crate::file_browser::rebuild_entries(fb); }
     }
 
     /// Apply a theme: swap, re-derive the heading-glyph flag (cue mode forces ON;
@@ -435,6 +522,49 @@ mod tests {
     struct TestClock(std::cell::Cell<u64>);
     impl wordcartel_core::history::Clock for TestClock {
         fn now_ms(&self) -> u64 { self.0.get() }
+    }
+
+    #[test]
+    fn buffer_from_file_ok_named_clean() {
+        let p = std::env::temp_dir().join(format!("wc-fromfile-{}.md", std::process::id()));
+        std::fs::write(&p, "hello\nworld\n").unwrap();
+        let mut e = Editor::new_from_text("\n", None, (40, 10)); // host editor for ids
+        let id = e.alloc_id();
+        let b = Buffer::from_file(id, &p, (40, 10)).expect("ok");
+        assert_eq!(b.id, id);
+        assert_eq!(b.document.buffer.to_string(), "hello\nworld\n");
+        assert_eq!(b.document.path.as_deref(), Some(p.as_path()));
+        assert!(!b.document.dirty(), "freshly opened file is clean");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn buffer_from_file_not_found_is_named_new_file() {
+        let p = std::env::temp_dir().join(format!("wc-missing-{}.md", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let mut e = Editor::new_from_text("\n", None, (40, 10));
+        let id = e.alloc_id();
+        let b = Buffer::from_file(id, &p, (40, 10)).expect("NotFound → named empty buffer, not Err");
+        assert_eq!(b.document.path.as_deref(), Some(p.as_path()));
+        assert_eq!(b.document.buffer.to_string(), "\n");
+    }
+
+    #[test]
+    fn buffer_from_file_binary_is_err() {
+        let p = std::env::temp_dir().join(format!("wc-bin-{}.bin", std::process::id()));
+        std::fs::write(&p, [0u8, 159, 146, 150]).unwrap(); // invalid UTF-8 / NUL
+        let mut e = Editor::new_from_text("\n", None, (40, 10));
+        let id = e.alloc_id();
+        assert!(matches!(Buffer::from_file(id, &p, (40, 10)), Err(crate::file::OpenError::Binary(_))));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn new_from_text_still_builds_one_buffer_id_zero() {
+        let e = Editor::new_from_text("abc\n", None, (40, 10));
+        assert_eq!(e.active().id, BufferId(0));
+        assert_eq!(e.active().document.buffer.to_string(), "abc\n");
+        assert!(!e.resume_enabled, "default false until run() seeds it"); // field exists, defaults false
     }
 
     #[test]

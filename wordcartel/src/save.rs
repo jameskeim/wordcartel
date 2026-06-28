@@ -23,16 +23,24 @@ pub fn fingerprint(path: &Path) -> Option<FileFingerprint> {
     Some(FileFingerprint { mtime: meta.modified().ok(), size: meta.len() })
 }
 
-/// Internal: dispatch the save job (no external-mod check). Called by
-/// `dispatch_save` (after the check) and `overwrite_save` (bypassing it).
-fn do_save(ctx: &mut Ctx) {
-    let path = ctx.editor.active().document.path.clone().expect("do_save called without a path");
+/// Whether a save job writes the document's own path (Normal) or re-keys the
+/// buffer onto a new `target` on success (SaveAs). `Copy` → free to `matches!`
+/// repeatedly inside the moved merge closure (Codex).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SaveMode { Normal, SaveAs }
 
+/// Internal: dispatch the save job (no external-mod check). `do_save` delegates
+/// here with `SaveMode::Normal`; Save-As enters with `SaveMode::SaveAs` and the
+/// re-key `target`. Called by `dispatch_save`/`overwrite_save` (Normal) and
+/// `perform_save_as` (SaveAs).
+pub(crate) fn do_save_to(ctx: &mut Ctx, target: std::path::PathBuf, mode: SaveMode) {
     // §3.9: status BEFORE dispatch. O(1) snapshot; version captured now.
     ctx.editor.status = "Saving\u{2026}".to_string();
     let snap = ctx.editor.active().document.buffer.snapshot(); // O(1) ropey clone
     let v = ctx.editor.active().document.version;
     let buffer_id = ctx.editor.active().id;
+    let prior_key = ctx.editor.active().document.path.clone(); // for SaveAs swap re-key
+    let write_path = target.clone();
 
     ctx.executor.dispatch(Job {
         buffer_id,
@@ -42,8 +50,8 @@ fn do_save(ctx: &mut Ctx) {
         run: Box::new(move || {
             // Worker: materialize the snapshot off the keystroke path, then write.
             let content = snap.to_string();
-            let outcome = file::save_atomic(&path, &content);
-            let new_fp = fingerprint(&path);
+            let outcome = file::save_atomic(&write_path, &content);
+            let new_fp = fingerprint(&write_path);
             JobResult {
                 buffer_id,
                 class: ResultClass::Durability,
@@ -58,18 +66,32 @@ fn do_save(ctx: &mut Ctx) {
                     if let Some(b) = editor.by_id_mut(buffer_id) {
                         match outcome {
                             Ok(SaveOutcome::Saved) | Ok(SaveOutcome::Unchanged) => {
+                                if matches!(mode, SaveMode::SaveAs) { b.document.path = Some(target.clone()); }
                                 b.document.saved_version = Some(v);
                                 b.document.stored_fp = new_fp;
                                 if b.document.version == v {
                                     status = "Saved".to_string();
                                     crate::swap::delete(b.document.path.as_deref());
+                                    if matches!(mode, SaveMode::SaveAs) { crate::swap::delete(prior_key.as_deref()); }
                                 } else {
                                     status = format!("Saved v{v} (still editing)");
+                                    // Staged re-key (Codex): the buffer was edited during the write
+                                    // (now v+1). Delete the prior/scratch swap (its v content is now
+                                    // ON DISK at `target`, and leaving a scratch swap would trigger a
+                                    // spurious recovery next launch) and EXPEDITE a swap under the new
+                                    // path: `last_swap_at = None` makes the next `due()` fire promptly,
+                                    // writing a swap for the v+1 body under `target`. Exposure for the
+                                    // v→v+1 keystrokes is bounded by the normal swap cadence (the same
+                                    // window normal editing has between periodic swap writes).
+                                    if matches!(mode, SaveMode::SaveAs) {
+                                        crate::swap::delete(prior_key.as_deref());
+                                        b.last_swap_at = None;
+                                    }
                                 }
                             }
                             Err(e) => {
-                                // Failure: leave saved_version/stored_fp untouched
-                                // (buffer stays dirty); surface the error.
+                                // Failure: leave saved_version/stored_fp/path untouched
+                                // (buffer stays dirty; SaveAs path stays None/old); surface the error.
                                 // Do NOT re-introduce SaveError::Symlink match — e.to_string()
                                 // for Symlink still contains "symlink", satisfying the test.
                                 status = e.to_string();
@@ -83,13 +105,17 @@ fn do_save(ctx: &mut Ctx) {
     });
 }
 
+/// Internal: dispatch a Normal save of the document's own path (no external-mod
+/// check). Called by `dispatch_save` (after the check) and `overwrite_save`.
+fn do_save(ctx: &mut Ctx) {
+    let path = ctx.editor.active().document.path.clone().expect("do_save called without a path");
+    do_save_to(ctx, path, SaveMode::Normal);
+}
+
 /// Registry `"save"` handler: external-mod check then dispatch a background save.
 pub fn dispatch_save(ctx: &mut Ctx) -> CommandResult {
     let path = match &ctx.editor.active().document.path {
-        None => {
-            ctx.editor.status = "No file name (save-as is Effort 5)".to_string();
-            return CommandResult::Handled;
-        }
+        None => { crate::app::open_save_as(ctx.editor); return CommandResult::Handled; }
         Some(p) => p.clone(),
     };
 
@@ -107,23 +133,39 @@ pub fn dispatch_save(ctx: &mut Ctx) -> CommandResult {
     CommandResult::Handled
 }
 
-/// Save, then arm quit-after-save so the editor exits when the save completes.
-/// Arms ONLY if a save job was actually dispatched (path present, no modal raised) —
-/// otherwise leaves dispatch_save's status and stays open. Shared by the quit-confirm
-/// prompt (PromptAction::SaveAndQuit) and the `save_and_quit` command (Effort 9B).
-pub(crate) fn dispatch_save_and_quit(ctx: &mut crate::registry::Ctx) {
+/// The unified "save, then do `action`" entry. Goes through `dispatch_save`
+/// (external-mod-checked). Handles all three buffer states:
+/// - NAMED, no conflict → a save job is dispatched → arm `pending_after_save{action}`.
+/// - NAMED, external-mod conflict → `dispatch_save` raised the modal → do NOT arm
+///   (the user resolves the modal and re-issues).
+/// - UNNAMED → `dispatch_save` opened the Save-As minibuffer → carry the action in
+///   `pending_save_as` so it fires after the Save-As write completes.
+pub(crate) fn dispatch_save_then(ctx: &mut crate::registry::Ctx, action: crate::editor::PostSaveAction) {
+    let was_unnamed = ctx.editor.active().document.path.is_none();
+    let buffer_id = ctx.editor.active().id;
     let v = ctx.editor.active().document.version;
     dispatch_save(ctx);
-    if ctx.editor.active().document.path.is_some() && ctx.editor.prompt.is_none() {
-        ctx.editor.quit_after_save = Some(v);
-        ctx.editor.quit_after_save_at = Some(ctx.clock.now_ms());
+    if was_unnamed {
+        // dispatch_save opened Save-As (MinibufferKind::SaveAs) for the no-path buffer.
+        if ctx.editor.minibuffer.as_ref().map(|m| m.kind) == Some(crate::minibuffer::MinibufferKind::SaveAs) {
+            ctx.editor.pending_save_as = Some(action);
+        }
+    } else if ctx.editor.active().document.path.is_some() && ctx.editor.prompt.is_none() {
+        ctx.editor.pending_after_save = Some(crate::editor::PendingAfterSave {
+            buffer_id, version: v, action, at_ms: ctx.clock.now_ms(),
+        });
     }
+}
+
+/// Save, then quit once the save completes. Delegates to `dispatch_save_then`.
+pub(crate) fn dispatch_save_and_quit(ctx: &mut crate::registry::Ctx) {
+    dispatch_save_then(ctx, crate::editor::PostSaveAction::Quit);
 }
 
 /// Save bypassing the fingerprint conflict (the [O]verwrite modal action).
 pub fn overwrite_save(ctx: &mut Ctx) {
     if ctx.editor.active().document.path.is_none() {
-        ctx.editor.status = "No file name (save-as is Effort 5)".to_string();
+        ctx.editor.status = "No file name — use Save As".to_string();
         return;
     }
     do_save(ctx); // no stat check

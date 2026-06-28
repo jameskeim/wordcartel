@@ -143,7 +143,23 @@ impl Registry {
         r.register("find_prev", "Find Previous", None, |_c| CommandResult::Handled);
 
         // File menu.
+        r.register("new", "New", Some(MenuCategory::File), |c| {
+            crate::app::request_new(c.editor, c.executor, c.clock, &c.msg_tx);
+            CommandResult::Handled
+        });
+        r.register("open", "Open…", Some(MenuCategory::File), |c| {
+            let dir = c.editor.active().document.path.as_ref()
+                .and_then(|p| p.parent())
+                .map(|d| d.to_path_buf())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            c.editor.open_file_browser(dir);
+            CommandResult::Handled
+        });
         r.register("save", "Save", Some(MenuCategory::File), |c| crate::save::dispatch_save(c));
+        r.register("save_as", "Save As…", Some(MenuCategory::File), |c| {
+            crate::app::open_save_as(c.editor);
+            CommandResult::Handled
+        });
         r.register("save_and_quit", "Save and Quit", Some(MenuCategory::File), |c| {
             crate::save::dispatch_save_and_quit(c);
             CommandResult::Handled
@@ -195,6 +211,7 @@ impl Registry {
             c.editor.diag = None;
             c.editor.outline = None;
             c.editor.theme_picker = None;
+            c.editor.file_browser = None;
             c.editor.pending_keys.clear();
             c.editor.pending_mark = None;
             c.editor.menu = if c.editor.menu.is_some() {
@@ -535,9 +552,11 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
         let r = reg.dispatch(CommandId("save"), &mut ctx);
-        // No path → save handler reports the no-name status (delegates to run()).
+        // No path → save handler opens the Save-As minibuffer (Effort 7, Task 3).
         assert_eq!(r, crate::commands::CommandResult::Handled);
-        assert!(e.status.contains("No file name"));
+        assert!(matches!(e.minibuffer.as_ref().map(|m| m.kind),
+            Some(crate::minibuffer::MinibufferKind::SaveAs)),
+            "unnamed save opens the Save-As minibuffer");
     }
 
     #[test]

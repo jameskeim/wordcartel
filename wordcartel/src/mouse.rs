@@ -143,6 +143,9 @@ pub fn handle(
     if editor.theme_picker.is_some() {
         return;
     }
+    if editor.file_browser.is_some() {
+        return;
+    }
     match ev.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let hit = editing_cell(editor, ev.column, ev.row);

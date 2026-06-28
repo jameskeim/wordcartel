@@ -116,12 +116,52 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
         "buffer-local result for a missing buffer slipped past is_stale"
     );
     (r.merge)(editor);
-    // Save & quit: exit once the awaited save version lands clean for that buffer.
-    if kind == crate::jobs::JobKind::Save
-        && editor.quit_after_save == Some(version)
-        && editor.by_id(buffer_id).map(|b| b.document.saved_version) == Some(Some(version))
-    {
-        editor.quit = true;
+    // Post-save dispatch: fire the pending action when its awaited save lands.
+    //
+    // Quit (9B semantics, unchanged): fire when the awaited version saved clean.
+    // Open/New (Effort 7) are DESTRUCTIVE — they replace the buffer. They must gate
+    // on the buffer being STILL CLEAN NOW, not on the (possibly stale) saved version:
+    // if the user typed during the in-flight save (v → v+1, dirty), replacing the
+    // buffer would silently discard those keystrokes. In that case, abandon the action.
+    if kind == crate::jobs::JobKind::Save {
+        let fire = editor.pending_after_save.as_ref()
+            .map(|p| p.buffer_id == buffer_id && p.version == version)
+            .unwrap_or(false);
+        if fire {
+            let action = editor.pending_after_save.as_ref().unwrap().action.clone();
+            let saved_this = editor.by_id(buffer_id).map(|b| b.document.saved_version) == Some(Some(version));
+            let still_clean = editor.by_id(buffer_id).map_or(false, |b| !b.document.dirty());
+            match action {
+                crate::editor::PostSaveAction::Quit => {
+                    if saved_this {
+                        editor.pending_after_save = None;
+                        editor.quit = true;
+                    }
+                }
+                crate::editor::PostSaveAction::New => {
+                    editor.pending_after_save = None;
+                    if still_clean {
+                        editor.replace_active_with_scratch();
+                        crate::derive::rebuild(editor);
+                        crate::nav::ensure_visible(editor);
+                    } else if saved_this {
+                        // Save succeeded but user edited during flight — abandon New.
+                        editor.status = "edited during save — New cancelled".to_string();
+                    }
+                    // else: save failed → merge's error status is already set; don't overwrite it.
+                }
+                crate::editor::PostSaveAction::Open(path) => {
+                    editor.pending_after_save = None;
+                    if still_clean {
+                        crate::app::open_into_current(editor, &path);
+                    } else if saved_this {
+                        // Save succeeded but user edited during flight — abandon Open.
+                        editor.status = "edited during save — Open cancelled".to_string();
+                    }
+                    // else: save failed → merge's error status is already set; don't overwrite it.
+                }
+            }
+        }
     }
 }
 
@@ -268,7 +308,152 @@ pub fn load_marks_from_entry(editor: &mut Editor, entry: &crate::state::StateEnt
     }
 }
 
+/// Restore session-resume state (cursor, scroll, marks, folds) for `path` into the
+/// active buffer. Factored verbatim from run()'s launch resume block so launch and
+/// `open_into_current` share one code path. Reloads `state::load()` itself so it works
+/// with only `&mut Editor`. No-op if there is no matching/non-stale session entry.
+pub fn restore_resume(editor: &mut Editor, path: &std::path::Path) {
+    let session = crate::state::load();
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        let key = canon.to_string_lossy().into_owned();
+        if let Some(entry) = session.entries.get(&key) {
+            if let Some(identity) = crate::state::file_identity(path) {
+                let doc_len = editor.active().document.buffer.len();
+                if let Some((cur, scroll)) = apply_resume(entry, identity, doc_len) {
+                    let sel = wordcartel_core::selection::Selection::single(cur);
+                    editor.active_mut().document.selection = sel;
+                    editor.active_mut().view.scroll = scroll;
+                    load_marks_from_entry(editor, entry);
+                    editor.active_mut().folds.folded = entry.folds.iter().copied().collect();
+                    let (blocks, buf) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.clone()) };
+                    editor.active_mut().folds.reconcile(&blocks, &buf);
+                }
+            }
+        }
+    }
+}
+
+/// Open `path` into the active buffer slot (the buffer-load seam reused by Tasks 2/4/5).
+/// Allocates a FRESH id so an in-flight save/swap job for the replaced buffer merges via
+/// `by_id_mut(old_id)` → `None` (harmless no-op). On OpenError: set status, do NOT replace
+/// (keep the user's work).
+pub fn open_into_current(editor: &mut Editor, path: &std::path::Path) {
+    let id = editor.alloc_id(); // FRESH id → an in-flight job for the old buffer no-ops via by_id_mut(old_id)=None
+    let area = editor.active().view.area;
+    match crate::editor::Buffer::from_file(id, path, area) {
+        Ok(b) => {
+            let a = editor.active;
+            editor.buffers[a] = b;
+            if editor.resume_enabled {
+                restore_resume(editor, path);
+            }
+            crate::derive::rebuild(editor);
+            crate::nav::ensure_visible(editor);
+            editor.status = String::new();
+        }
+        Err(e) => {
+            editor.status = e.to_string();
+        }
+    }
+}
+
 /// Execute the action chosen in a modal prompt, then clear the prompt.
+/// Open the Save-As minibuffer pre-filled with the active doc's directory.
+pub fn open_save_as(editor: &mut crate::editor::Editor) {
+    let pre = editor.active().document.path.as_ref()
+        .and_then(|p| p.parent()).map(|d| format!("{}/", d.display())).unwrap_or_default();
+    editor.open_minibuffer("Save as: ", crate::minibuffer::MinibufferKind::SaveAs);
+    if let Some(mb) = editor.minibuffer.as_mut() { mb.cursor = pre.len(); mb.text = pre; }
+}
+
+/// Submit the Save-As minibuffer line: expand the path, raise an overwrite
+/// confirmation if the target exists, else perform the save-as immediately.
+pub fn save_as_submit(editor: &mut crate::editor::Editor, text: &str,
+                      executor: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
+                      msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
+    let t = text.trim();
+    if t.is_empty() { editor.status = "save-as: empty path".into(); editor.pending_save_as = None; return; }
+    // expand_path: ~ → home; relative → joined onto cwd. Mirror the ~ handling used by the
+    // dictionary/config path loaders.
+    let target: std::path::PathBuf = {
+        let expanded = if let Some(rest) = t.strip_prefix("~/") {
+            dirs::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| std::path::PathBuf::from(t))
+        } else { std::path::PathBuf::from(t) };
+        if expanded.is_absolute() { expanded }
+        else { std::env::current_dir().map(|d| d.join(&expanded)).unwrap_or(expanded) }
+    };
+    if target.exists() {
+        editor.pending_save_overwrite = Some(target.clone());
+        editor.open_prompt(crate::prompt::Prompt::save_overwrite(&target));
+        return;
+    }
+    perform_save_as(editor, target, executor, clock, msg_tx);
+}
+
+fn perform_save_as(editor: &mut crate::editor::Editor, target: std::path::PathBuf,
+                   executor: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
+                   msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
+    let v = editor.active().document.version;
+    let buffer_id = editor.active().id;
+    { let mut ctx = crate::registry::Ctx { editor, clock, executor, msg_tx: msg_tx.clone() };
+      crate::save::do_save_to(&mut ctx, target, crate::save::SaveMode::SaveAs); }
+    if let Some(action) = editor.pending_save_as.take() {
+        editor.pending_after_save = Some(crate::editor::PendingAfterSave { buffer_id, version: v, action, at_ms: clock.now_ms() });
+    }
+}
+
+/// Perform a PostSaveAction immediately (no save): used for the clean path and Discard.
+fn perform_post_save_action(
+    editor: &mut Editor,
+    action: crate::editor::PostSaveAction,
+    // Unused: New/Open/Quit are editor-only (Open routes through open_into_current, no async).
+    // Kept for call-site signature uniformity with the save-then-action paths.
+    _ex: &dyn Executor,
+    _clock: &dyn Clock,
+    _msg_tx: &std::sync::mpsc::Sender<Msg>,
+) {
+    match action {
+        crate::editor::PostSaveAction::New => {
+            editor.replace_active_with_scratch();
+            crate::derive::rebuild(editor);
+            crate::nav::ensure_visible(editor);
+        }
+        crate::editor::PostSaveAction::Open(ref p) => {
+            open_into_current(editor, p);
+        }
+        crate::editor::PostSaveAction::Quit => {
+            editor.quit = true;
+        }
+    }
+}
+
+/// Dirty-guard: perform `action` immediately if the buffer is clean, else raise the
+/// Save/Discard/Cancel modal (the intent is held in `pending_save_as` until resolved).
+fn request_replace(
+    editor: &mut Editor,
+    action: crate::editor::PostSaveAction,
+    ex: &dyn Executor,
+    clock: &dyn Clock,
+    msg_tx: &std::sync::mpsc::Sender<Msg>,
+) {
+    if !editor.active().document.dirty() {
+        perform_post_save_action(editor, action, ex, clock, msg_tx);
+        return;
+    }
+    editor.pending_save_as = Some(action);
+    editor.open_prompt(crate::prompt::Prompt::dirty_guard());
+}
+
+/// Request a New (scratch) buffer: immediate if clean, else raise the dirty-guard modal.
+pub fn request_new(
+    editor: &mut Editor,
+    ex: &dyn Executor,
+    clock: &dyn Clock,
+    msg_tx: &std::sync::mpsc::Sender<Msg>,
+) {
+    request_replace(editor, crate::editor::PostSaveAction::New, ex, clock, msg_tx);
+}
+
 pub fn resolve_prompt(
     action: PromptAction,
     editor: &mut Editor,
@@ -279,6 +464,8 @@ pub fn resolve_prompt(
     match action {
         PromptAction::Cancel => {
             editor.pending_export = None;
+            editor.pending_save_overwrite = None;
+            editor.pending_save_as = None;
         }
         PromptAction::QuitAnyway => { editor.quit = true; }
         PromptAction::SaveAndQuit => {
@@ -286,6 +473,26 @@ pub fn resolve_prompt(
             let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
             crate::save::dispatch_save_and_quit(&mut ctx);
             return; // prompt handled; must NOT clear an external-mod modal
+        }
+        PromptAction::DiscardAndProceed => {
+            // Dirty-guard: discard unsaved changes and immediately perform the pending action.
+            if let Some(action) = editor.pending_save_as.take() {
+                perform_post_save_action(editor, action, ex, clock, msg_tx);
+            }
+        }
+        PromptAction::SaveAndProceed => {
+            // Dirty-guard: dismiss the modal first, then dispatch a save followed by the pending
+            // action. dispatch_save_then handles NAMED (saves + arms pending_after_save) AND
+            // UNNAMED (opens Save-As carrying the action in pending_save_as). Take the intent
+            // first so the named path doesn't leave a stale pending_save_as.
+            editor.prompt = None; // dismiss the dirty-guard modal first
+            if let Some(action) = editor.pending_save_as.take() {
+                let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
+                crate::save::dispatch_save_then(&mut ctx, action);
+            }
+            return; // MUST return — dispatch_save_then may have opened an external-mod or Save-As
+                    // overlay; the trailing resolve_prompt prompt-clear would wipe it otherwise
+                    // (mirrors the SaveAndQuit arm's return).
         }
         PromptAction::Reload => crate::save::reload_from_disk(editor),
         PromptAction::Overwrite => {
@@ -324,6 +531,11 @@ pub fn resolve_prompt(
             if let Some(pe) = editor.pending_export.take() {
                 // User explicitly confirmed clobbering the existing target.
                 crate::export::do_export(editor, &pe.ext, &pe.target, msg_tx, true);
+            }
+        }
+        PromptAction::OverwriteSaveAs => {
+            if let Some(t) = editor.pending_save_overwrite.take() {
+                perform_save_as(editor, t, ex, clock, msg_tx);
             }
         }
         PromptAction::Transform(kind) => {
@@ -453,6 +665,7 @@ pub(crate) fn dispatch_overlay_command(
     editor.palette = None;
     editor.menu = None;
     editor.theme_picker = None;
+    editor.file_browser = None;
     let mut ctx = crate::registry::Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
     reg.dispatch(id, &mut ctx);
     for r in ex.drain() { apply_result(r, editor); }
@@ -931,6 +1144,98 @@ pub fn reduce(
         // Non-key msg falls through to normal handling while picker stays open.
     }
 
+    // File browser overlay intercepts KEY INPUT and PASTE. Non-key, non-paste messages
+    // fall through to normal handling while the browser stays open (mirrors theme_picker).
+    if editor.file_browser.is_some() {
+        // Drop an async clipboard-paste result that arrives while the browser is open —
+        // it must not land in the document behind the overlay (Codex I6, mirror palette).
+        if matches!(&msg, Msg::ClipboardPaste { .. }) {
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
+        }
+        if let Msg::Input(Event::Paste(text)) = &msg {
+            if let Some(fb) = editor.file_browser.as_mut() {
+                fb.query.push_str(text);
+                crate::file_browser::rebuild_entries(fb);
+            }
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
+        }
+        if let Msg::Input(Event::Key(k)) = &msg {
+            if k.kind == crossterm::event::KeyEventKind::Press {
+                use crossterm::event::KeyCode;
+                match k.code {
+                    KeyCode::Esc => { editor.file_browser = None; }
+                    KeyCode::Enter => {
+                        // Resolve the selected entry: descend into a directory (incl. ".."),
+                        // or open a file through the Task-4 dirty-guard.
+                        let chosen = editor.file_browser.as_ref().and_then(|fb| {
+                            fb.entries.get(fb.selected).map(|e| (e.name.clone(), e.is_dir))
+                        });
+                        if let Some((name, is_dir)) = chosen {
+                            if is_dir {
+                                // Compute the target directory without mutating fb yet.
+                                let target = editor.file_browser.as_ref().map(|fb| {
+                                    if name == ".." {
+                                        fb.dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| fb.dir.clone())
+                                    } else {
+                                        fb.dir.join(&name)
+                                    }
+                                });
+                                if let Some(target) = target {
+                                    // §3: check readability BEFORE committing fb.dir.
+                                    if std::fs::read_dir(&target).is_ok() {
+                                        if let Some(fb) = editor.file_browser.as_mut() {
+                                            fb.dir = target;
+                                            fb.query.clear();
+                                            fb.selected = 0;
+                                            crate::file_browser::rebuild_entries(fb);
+                                        }
+                                    } else {
+                                        editor.status = format!("cannot read directory: {}", target.display());
+                                        // stay in prior dir — do NOT mutate fb.dir
+                                    }
+                                }
+                            } else {
+                                let path = editor.file_browser.as_ref().unwrap().dir.join(&name);
+                                editor.file_browser = None;
+                                request_replace(editor, crate::editor::PostSaveAction::Open(path), ex, clock, msg_tx);
+                            }
+                        }
+                    }
+                    KeyCode::Up => {
+                        if let Some(fb) = editor.file_browser.as_mut() { fb.selected = fb.selected.saturating_sub(1); }
+                    }
+                    KeyCode::Down => {
+                        if let Some(fb) = editor.file_browser.as_mut() {
+                            let max = fb.entries.len().saturating_sub(1);
+                            fb.selected = (fb.selected + 1).min(max);
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if let Some(fb) = editor.file_browser.as_mut() {
+                            fb.query.pop();
+                            crate::file_browser::rebuild_entries(fb);
+                        }
+                    }
+                    KeyCode::Char(c)
+                        if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                            && !k.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
+                    {
+                        if let Some(fb) = editor.file_browser.as_mut() {
+                            fb.query.push(c);
+                            crate::file_browser::rebuild_entries(fb);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for r in ex.drain() { apply_result(r, editor); }
+            return !editor.quit;
+        }
+        // Non-key msg falls through to normal handling while the browser stays open.
+    }
+
     // Active modal intercepts KEY INPUT only (§5.3). Background results and ticks
     // must still be processed — a JobDone arriving while a modal is up (e.g. an
     // in-flight save completing during the quit-confirm prompt) must not be
@@ -941,6 +1246,8 @@ pub fn reduce(
                 if key.code == crossterm::event::KeyCode::Esc {
                     editor.prompt = None; // Esc cancels any prompt
                     editor.pending_export = None;
+                    editor.pending_save_overwrite = None;
+                    editor.pending_save_as = None;
                 } else if let crossterm::event::KeyCode::Char(ch) = key.code {
                     if let Some(action) = editor.prompt.as_ref().unwrap().action_for(ch) {
                         resolve_prompt(action, editor, ex, clock, msg_tx);
@@ -997,12 +1304,15 @@ pub fn reduce(
                         // here and does NOT reach the filter-cancel Esc check below, so
                         // any in-flight filter continues running.
                         editor.minibuffer = None;
+                        // Save-As minibuffer dismiss: drop any queued post-save action.
+                        editor.pending_save_as = None;
                     }
                     crossterm::event::KeyCode::Enter => {
                         let mb = editor.minibuffer.take().unwrap();
                         match mb.kind {
                             crate::minibuffer::MinibufferKind::Filter   => submit_filter_line(editor, &mb.text, msg_tx),
                             crate::minibuffer::MinibufferKind::GotoLine => goto_line_submit(editor, &mb.text),
+                            crate::minibuffer::MinibufferKind::SaveAs   => save_as_submit(editor, &mb.text, ex, clock, msg_tx),
                         }
                     }
                     _ => {}
@@ -1349,44 +1659,38 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
 
     let path = cli.path;
 
-    // Open the file and branch on errors per §C5.
-    let editor = match path.as_deref() {
-        None => {
-            // No path given: scratch buffer.
-            Editor::new_from_text("\n", None, area)
+    // Open the file and branch on errors per §C5. Built on the Buffer::from_file seam
+    // (Effort 7 Task 1) without behavior change: Ok → named clean; NotFound → named "new
+    // file"; Binary/Permission/IsDir/Io → UNNAMED scratch kept + e.to_string() status.
+    let mut editor = Editor::new_from_text("\n", None, area); // scratch host; the real buffer (if any) replaces slot 0 below
+    if let Some(p) = path.as_deref() {
+        let id = editor.active().id; // reuse slot 0's id for the launch buffer
+        match crate::editor::Buffer::from_file(id, p, area) {
+            Ok(b) => {
+                let was_new_file = b.document.path.is_some() && !p.exists();
+                editor.buffers[0] = b;
+                if was_new_file {
+                    // New file: empty buffer NAMED with the path; first save creates it.
+                    editor.status = "new file".to_string();
+                }
+            }
+            // NotFound is mapped to Ok (named "new file") inside from_file, so it never
+            // reaches here; list it for exhaustiveness. The rest are rejected targets:
+            // UNNAMED scratch kept so a save can't clobber the file.
+            Err(e @ (file::OpenError::NotFound(_)
+                   | file::OpenError::Binary(_)
+                   | file::OpenError::Permission(_)
+                   | file::OpenError::IsDir(_)
+                   | file::OpenError::Io(_))) => {
+                editor.status = e.to_string();
+            }
         }
-        Some(p) => match file::open(p) {
-            Ok(text) => {
-                Editor::new_from_text(&text, Some(p.to_path_buf()), area)
-            }
-            Err(file::OpenError::NotFound(_)) => {
-                // New file: empty buffer NAMED with the path; first save creates it.
-                let mut e = Editor::new_from_text("\n", Some(p.to_path_buf()), area);
-                e.status = "new file".to_string();
-                e
-            }
-            Err(e @ file::OpenError::Binary(_))
-            | Err(e @ file::OpenError::Permission(_))
-            | Err(e @ file::OpenError::IsDir(_)) => {
-                // Rejected target: UNNAMED buffer so a save can't clobber it.
-                let mut ed = Editor::new_from_text("\n", None, area);
-                ed.status = e.to_string();
-                ed
-            }
-            Err(e @ file::OpenError::Io(_)) => {
-                // Generic IO error: also unnamed.
-                let mut ed = Editor::new_from_text("\n", None, area);
-                ed.status = e.to_string();
-                ed
-            }
-        },
-    };
-
-    let mut editor = editor;
+    }
 
     // Seed mouse_capture from config (default true; may be overridden by config layers).
     editor.mouse_capture = cfg.mouse.mouse_capture;
     editor.view_opts = cfg.view.clone();
+    editor.resume_enabled = cfg.state.resume; // gates open_into_current's resume restore (Effort 7)
     editor.diag_cfg = cfg.diagnostics.clone();
     // Resolve and seed the active theme + color depth (once, at startup — §3.6).
     let env = crate::theme_resolve::EnvSnapshot::from_env();
@@ -1503,27 +1807,13 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     // recorded entries always outrank loaded ones for LRU eviction (Codex pre-merge fix).
     let mut session_seq: u64 = session.next_seq();
 
-    // Resume-on-open: if cfg.state.resume is set, the buffer has a path, and the
-    // stored mtime+size identity matches → restore cursor and scroll.
+    // Resume-on-open: if cfg.state.resume is set and the buffer has a path, restore
+    // cursor/scroll/marks/folds via the shared seam (factored from this block so launch
+    // and open_into_current stay byte-identical). The staleness guard lives in
+    // restore_resume → apply_resume.
     if cfg.state.resume {
         if let Some(raw_path) = editor.active().document.path.clone() {
-            if let Ok(canon) = std::fs::canonicalize(&raw_path) {
-                let key = canon.to_string_lossy().into_owned();
-                if let Some(entry) = session.entries.get(&key) {
-                    if let Some(identity) = crate::state::file_identity(&raw_path) {
-                        let doc_len = editor.active().document.buffer.len();
-                        if let Some((cur, scroll)) = apply_resume(entry, identity, doc_len) {
-                            let sel = wordcartel_core::selection::Selection::single(cur);
-                            editor.active_mut().document.selection = sel;
-                            editor.active_mut().view.scroll = scroll;
-                            load_marks_from_entry(&mut editor, entry);
-                            editor.active_mut().folds.folded = entry.folds.iter().copied().collect();
-                            let (blocks, buf) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.clone()) };
-                            editor.active_mut().folds.reconcile(&blocks, &buf);
-                        }
-                    }
-                }
-            }
+            restore_resume(&mut editor, &raw_path);
         }
     }
 
@@ -1555,17 +1845,24 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
         let now = clock.now_ms();
         // Bounded save&quit: if waiting for an in-flight save to complete and
         // 5 s have elapsed since the last edit, re-raise the quit-confirm modal.
-        if let Some(_v) = editor.quit_after_save {
-            let waited = now.saturating_sub(editor.quit_after_save_at.unwrap_or(now));
+        if let Some(p) = &editor.pending_after_save {
+            let waited = now.saturating_sub(p.at_ms);
             if waited > SAVE_QUIT_TIMEOUT_MS {
-                editor.quit_after_save = None;
-                editor.quit_after_save_at = None;
-                editor.open_prompt(crate::prompt::Prompt::quit_confirm());
-                editor.status = "Save still running — choose again".into();
+                // Re-raise per-action: only Quit re-opens the quit-confirm modal.
+                // New/Open are non-terminal — a Quit dialog there would be wrong (and
+                // destructive); just clear the pending action and leave the buffer in place.
+                let is_quit = matches!(p.action, crate::editor::PostSaveAction::Quit);
+                editor.pending_after_save = None;
+                if is_quit {
+                    editor.open_prompt(crate::prompt::Prompt::quit_confirm());
+                    editor.status = "Save still running — choose again".into();
+                } else {
+                    editor.status = "Save still running — try again".into();
+                }
             }
         }
         let swap_deadline = crate::swap::next_deadline_ms(now, editor.active().last_edit_at, editor.active().last_swap_at);
-        let sq_deadline = editor.quit_after_save_at.map(|t| t.saturating_add(SAVE_QUIT_TIMEOUT_MS));
+        let sq_deadline = editor.pending_after_save.as_ref().map(|p| p.at_ms.saturating_add(SAVE_QUIT_TIMEOUT_MS));
         // Include scrollbar_until_ms in the deadline so the loop wakes when the
         // bar should fade (avoids relying on the idle 1-hour Tick).
         let sb_deadline = if editor.mouse.scrollbar_until_ms > now {
@@ -1746,6 +2043,34 @@ mod tests {
     fn cua_keymap() -> crate::keymap::KeyTrie {
         let (t, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &crate::registry::Registry::builtins());
         t
+    }
+
+    #[test]
+    fn open_into_current_replaces_with_fresh_id_and_clean() {
+        use crate::editor::Editor;
+        let p = std::env::temp_dir().join(format!("wc-oic-{}.md", std::process::id()));
+        std::fs::write(&p, "opened\n").unwrap();
+        let mut e = Editor::new_from_text("scratch\n", None, (80, 24));
+        let old_id = e.active().id;
+        crate::app::open_into_current(&mut e, &p);
+        assert_ne!(e.active().id, old_id, "fresh id → stale in-flight jobs for old buffer are ignored");
+        assert_eq!(e.active().document.buffer.to_string(), "opened\n");
+        assert!(!e.active().document.dirty());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn file_browser_enter_on_file_opens_it_when_clean() {
+        use crate::editor::Editor;
+        let dir = std::env::temp_dir().join(format!("wc-fbopen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("note.md"), "loaded\n").unwrap();
+        let mut e = Editor::new_from_text("clean\n", None, (80, 24)); // clean
+        e.open_file_browser(dir.clone());
+        // select "note.md" and simulate Enter via the browser's open path:
+        crate::app::open_into_current(&mut e, &dir.join("note.md")); // the clean-path the Enter handler takes
+        assert_eq!(e.active().document.buffer.to_string(), "loaded\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn press(code: crossterm::event::KeyCode, mods: crossterm::event::KeyModifiers) -> Msg {
@@ -2165,8 +2490,8 @@ mod tests {
     }
 
     #[test]
-    fn save_and_quit_sets_quit_after_save_and_exits_on_matching_result() {
-        use crate::editor::Editor;
+    fn save_and_quit_sets_pending_after_save_and_exits_on_matching_result() {
+        use crate::editor::{Editor, PostSaveAction};
         use crate::jobs::{Executor, InlineExecutor};
         use crate::prompt::PromptAction;
         let p = std::env::temp_dir().join(format!("wc-savequit-{}.md", std::process::id()));
@@ -2177,7 +2502,7 @@ mod tests {
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
         crate::app::resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk, &tx);
-        assert_eq!(e.quit_after_save, Some(1));
+        assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::Quit, .. })));
         assert!(!e.quit, "not yet — waiting for the save result");
         for r in ex.drain() { crate::app::apply_result(r, &mut e); }
         assert!(e.quit, "matching save result triggers quit");
@@ -2185,8 +2510,8 @@ mod tests {
     }
 
     #[test]
-    fn save_and_quit_on_unnamed_buffer_does_not_arm_quit_after_save() {
-        // No path → dispatch_save dispatches NO job. quit_after_save must stay None,
+    fn save_and_quit_on_unnamed_buffer_does_not_arm_pending_after_save() {
+        // No path → dispatch_save dispatches NO job. pending_after_save must stay None,
         // or the app would wait forever for a result that never comes (Codex #4).
         use crate::editor::Editor;
         use crate::jobs::InlineExecutor;
@@ -2197,15 +2522,15 @@ mod tests {
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
         crate::app::resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk, &tx);
-        assert_eq!(e.quit_after_save, None, "no job dispatched → do not arm quit-after-save");
+        assert!(e.pending_after_save.is_none(), "no job dispatched → do not arm pending_after_save");
         assert!(!e.quit);
     }
 
     #[test]
-    fn save_and_quit_command_arms_quit_after_save_like_prompt() {
+    fn save_and_quit_command_arms_pending_after_save_like_prompt() {
         // The save_and_quit registry command must reach the SAME armed state as the
         // PromptAction::SaveAndQuit path (proves the DRY factor).
-        use crate::editor::Editor;
+        use crate::editor::{Editor, PostSaveAction};
         use crate::jobs::{Executor, InlineExecutor};
         let p = std::env::temp_dir().join(format!("wc-savequit-cmd-{}.md", std::process::id()));
         std::fs::write(&p, "old\n").unwrap();
@@ -2218,7 +2543,8 @@ mod tests {
             let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
             crate::save::dispatch_save_and_quit(&mut ctx);
         }
-        assert_eq!(e.quit_after_save, Some(1), "command path arms quit_after_save");
+        assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::Quit, .. })),
+            "command path arms pending_after_save{{Quit}}");
         assert!(!e.quit, "not yet — waiting for the save result");
         for r in ex.drain() { crate::app::apply_result(r, &mut e); }
         assert!(e.quit, "matching save result triggers quit");
@@ -2238,8 +2564,29 @@ mod tests {
             let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
             crate::save::dispatch_save_and_quit(&mut ctx);
         }
-        assert_eq!(e.quit_after_save, None, "no path → not armed");
+        assert_eq!(e.pending_after_save, None, "no path → not armed");
         assert!(!e.quit);
+    }
+
+    #[test]
+    fn save_and_quit_arms_pending_after_save_quit_and_exits() {
+        use crate::editor::{Editor, PostSaveAction};
+        use crate::jobs::{Executor, InlineExecutor};
+        let p = std::env::temp_dir().join(format!("wc-pas-{}.md", std::process::id()));
+        std::fs::write(&p, "old\n").unwrap();
+        let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
+        e.active_mut().document.saved_version = None; e.active_mut().document.version = 1;
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        {
+            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
+            crate::save::dispatch_save_and_quit(&mut ctx);
+        }
+        assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::Quit, .. })));
+        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        assert!(e.quit, "matching save result triggers quit");
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
@@ -2285,6 +2632,171 @@ mod tests {
             merge: Box::new(|ed: &mut Editor| ed.status = "merged".into()),
         }, &mut e);
         assert_eq!(e.status, "merged");
+    }
+
+    // Effort 7 data-loss regression: a background Save → Proceed on a NAMED buffer
+    // arms pending_after_save{Open}; the user keeps typing (buffer → v2, dirty) before
+    // the v1 save lands. When the v1 Save result merges (saved_version=Some(1)), the
+    // post-save gate must NOT replace the buffer — the v1→v2 keystrokes would be lost.
+    #[test]
+    fn apply_result_open_does_not_clobber_edits_typed_during_save() {
+        use crate::editor::{Editor, PostSaveAction, PendingAfterSave};
+        use crate::jobs::{JobResult, JobKind, ResultClass};
+        // Open target: a different file on disk.
+        let target = std::env::temp_dir().join(format!("wc-clobber-open-{}.md", std::process::id()));
+        std::fs::write(&target, "OPEN TARGET\n").unwrap();
+        // NAMED clean buffer at version 1.
+        let named = std::env::temp_dir().join(format!("wc-clobber-named-{}.md", std::process::id()));
+        std::fs::write(&named, "v1 content\n").unwrap();
+        let mut e = Editor::new_from_text("v1 content\n", Some(named.clone()), (80, 24));
+        let id = e.active().id;
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = Some(1); // clean at v1
+        // Arm the pending Open as the dirty-guard Save→Proceed would.
+        e.pending_after_save = Some(PendingAfterSave {
+            buffer_id: id, version: 1, action: PostSaveAction::Open(target.clone()), at_ms: 0,
+        });
+        // User types during the in-flight save: buffer advances to v2 (now dirty).
+        e.active_mut().document.version = 2; // saved_version still Some(1) → dirty
+        // The v1 save completes: its merge sets saved_version = Some(1).
+        crate::app::apply_result(JobResult {
+            buffer_id: id, class: ResultClass::Durability, version: 1, kind: JobKind::Save,
+            merge: Box::new(move |ed: &mut Editor| { if let Some(b) = ed.by_id_mut(id) { b.document.saved_version = Some(1); } }),
+        }, &mut e);
+        // Buffer must NOT have been replaced by the Open target.
+        assert_eq!(e.active().id, id, "active buffer must be the SAME buffer (not the Open target)");
+        assert_eq!(e.active().document.buffer.to_string(), "v1 content\n", "the v2 buffer content must be preserved, not the Open target");
+        assert_ne!(e.active().document.buffer.to_string(), "OPEN TARGET\n");
+        assert!(e.pending_after_save.is_none(), "pending_after_save cleared");
+        assert!(e.status.contains("Open cancelled"), "status indicates the Open was cancelled, got: {}", e.status);
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(&named);
+    }
+
+    // New variant of the same window: edits during save must abandon the New.
+    #[test]
+    fn apply_result_new_does_not_clobber_edits_typed_during_save() {
+        use crate::editor::{Editor, PostSaveAction, PendingAfterSave};
+        use crate::jobs::{JobResult, JobKind, ResultClass};
+        let named = std::env::temp_dir().join(format!("wc-clobber-new-{}.md", std::process::id()));
+        std::fs::write(&named, "v1 content\n").unwrap();
+        let mut e = Editor::new_from_text("v1 content\n", Some(named.clone()), (80, 24));
+        let id = e.active().id;
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = Some(1);
+        e.pending_after_save = Some(PendingAfterSave {
+            buffer_id: id, version: 1, action: PostSaveAction::New, at_ms: 0,
+        });
+        e.active_mut().document.version = 2; // edited during save → dirty
+        crate::app::apply_result(JobResult {
+            buffer_id: id, class: ResultClass::Durability, version: 1, kind: JobKind::Save,
+            merge: Box::new(move |ed: &mut Editor| { if let Some(b) = ed.by_id_mut(id) { b.document.saved_version = Some(1); } }),
+        }, &mut e);
+        assert_eq!(e.active().id, id, "buffer must not be replaced by a scratch");
+        assert_eq!(e.active().document.buffer.to_string(), "v1 content\n", "edited buffer preserved, not a fresh scratch");
+        assert!(e.pending_after_save.is_none());
+        assert!(e.status.contains("New cancelled"), "status indicates the New was cancelled, got: {}", e.status);
+        let _ = std::fs::remove_file(&named);
+    }
+
+    // Clean path: no edit during the save → the pending Open fires normally.
+    #[test]
+    fn apply_result_open_fires_when_buffer_stays_clean() {
+        use crate::editor::{Editor, PostSaveAction, PendingAfterSave};
+        use crate::jobs::{JobResult, JobKind, ResultClass};
+        let target = std::env::temp_dir().join(format!("wc-clean-open-{}.md", std::process::id()));
+        std::fs::write(&target, "OPEN TARGET\n").unwrap();
+        let named = std::env::temp_dir().join(format!("wc-clean-named-{}.md", std::process::id()));
+        std::fs::write(&named, "v1 content\n").unwrap();
+        let mut e = Editor::new_from_text("v1 content\n", Some(named.clone()), (80, 24));
+        let id = e.active().id;
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = Some(1); // clean and stays clean
+        e.pending_after_save = Some(PendingAfterSave {
+            buffer_id: id, version: 1, action: PostSaveAction::Open(target.clone()), at_ms: 0,
+        });
+        crate::app::apply_result(JobResult {
+            buffer_id: id, class: ResultClass::Durability, version: 1, kind: JobKind::Save,
+            merge: Box::new(move |ed: &mut Editor| { if let Some(b) = ed.by_id_mut(id) { b.document.saved_version = Some(1); } }),
+        }, &mut e);
+        assert_eq!(e.active().document.buffer.to_string(), "OPEN TARGET\n", "clean path: pending Open fires");
+        assert!(e.pending_after_save.is_none());
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(&named);
+    }
+
+    // Advisory #1 regression: a FAILED save (merge does not update saved_version and sets
+    // an error status) must NOT overwrite the error status with "Open cancelled".
+    // saved_this=false → else-if branch skipped → merge's error status preserved.
+    #[test]
+    fn apply_result_save_failure_preserves_error_status_for_open() {
+        use crate::editor::{Editor, PostSaveAction, PendingAfterSave};
+        use crate::jobs::{JobResult, JobKind, ResultClass};
+        let target = std::env::temp_dir().join(format!("wc-savefail-open-{}.md", std::process::id()));
+        std::fs::write(&target, "TARGET\n").unwrap();
+        let mut e = Editor::new_from_text("content\n", None, (80, 24));
+        let id = e.active().id;
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = None; // unsaved → dirty
+        // Arm pending Open at version 1.
+        e.pending_after_save = Some(PendingAfterSave {
+            buffer_id: id, version: 1, action: PostSaveAction::Open(target.clone()), at_ms: 0,
+        });
+        // Save FAILS: merge records an error status but does NOT update saved_version.
+        crate::app::apply_result(JobResult {
+            buffer_id: id, class: ResultClass::Durability, version: 1, kind: JobKind::Save,
+            merge: Box::new(|ed: &mut Editor| { ed.status = "save error: disk full".into(); }),
+        }, &mut e);
+        // Status must be the save error, NOT "edited during save — Open cancelled".
+        assert_eq!(e.status, "save error: disk full",
+            "save failure must not overwrite error status with 'Open cancelled', got: {}", e.status);
+        assert!(e.pending_after_save.is_none(), "pending_after_save cleared");
+        let _ = std::fs::remove_file(&target);
+    }
+
+    // Advisory #1 — New variant: same guarantee for the New arm.
+    #[test]
+    fn apply_result_save_failure_preserves_error_status_for_new() {
+        use crate::editor::{Editor, PostSaveAction, PendingAfterSave};
+        use crate::jobs::{JobResult, JobKind, ResultClass};
+        let mut e = Editor::new_from_text("content\n", None, (80, 24));
+        let id = e.active().id;
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = None; // unsaved → dirty
+        e.pending_after_save = Some(PendingAfterSave {
+            buffer_id: id, version: 1, action: PostSaveAction::New, at_ms: 0,
+        });
+        crate::app::apply_result(JobResult {
+            buffer_id: id, class: ResultClass::Durability, version: 1, kind: JobKind::Save,
+            merge: Box::new(|ed: &mut Editor| { ed.status = "save error: disk full".into(); }),
+        }, &mut e);
+        assert_eq!(e.status, "save error: disk full",
+            "save failure must not overwrite error status with 'New cancelled', got: {}", e.status);
+        assert!(e.pending_after_save.is_none());
+    }
+
+    // Clean path for New: no edit during save → fresh scratch replaces the buffer.
+    #[test]
+    fn apply_result_new_fires_when_buffer_stays_clean() {
+        use crate::editor::{Editor, PostSaveAction, PendingAfterSave};
+        use crate::jobs::{JobResult, JobKind, ResultClass};
+        let named = std::env::temp_dir().join(format!("wc-clean-new-{}.md", std::process::id()));
+        std::fs::write(&named, "v1 content\n").unwrap();
+        let mut e = Editor::new_from_text("v1 content\n", Some(named.clone()), (80, 24));
+        let id = e.active().id;
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = Some(1);
+        e.pending_after_save = Some(PendingAfterSave {
+            buffer_id: id, version: 1, action: PostSaveAction::New, at_ms: 0,
+        });
+        crate::app::apply_result(JobResult {
+            buffer_id: id, class: ResultClass::Durability, version: 1, kind: JobKind::Save,
+            merge: Box::new(move |ed: &mut Editor| { if let Some(b) = ed.by_id_mut(id) { b.document.saved_version = Some(1); } }),
+        }, &mut e);
+        assert_ne!(e.active().id, id, "clean path: New replaces with a fresh scratch buffer");
+        assert_eq!(e.active().document.buffer.to_string(), "\n", "scratch buffer");
+        assert!(e.pending_after_save.is_none());
+        let _ = std::fs::remove_file(&named);
     }
 
     #[test]
@@ -3677,6 +4189,110 @@ mod tests {
             let final_line = b.document.buffer.byte_to_line(final_head);
             assert!(!fv.is_hidden(final_line),
                 "caret must not be on a hidden line after resume normalization");
+        }
+    }
+
+    #[test]
+    fn save_as_writes_new_path_and_rekeys() {
+        use crate::editor::Editor;
+        use crate::jobs::{Executor, InlineExecutor};
+        let dir = std::env::temp_dir().join(format!("wc-saveas-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("out.md");
+        let _ = std::fs::remove_file(&p);
+        let mut e = Editor::new_from_text("content\n", None, (80, 24)); // UNNAMED, dirty-ish
+        e.active_mut().document.version = 1; e.active_mut().document.saved_version = None;
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::app::save_as_submit(&mut e, p.to_str().unwrap(), &ex, &clk, &tx);
+        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "content\n", "file written");
+        assert_eq!(e.active().document.path.as_deref(), Some(p.as_path()), "path re-keyed");
+        assert!(!e.active().document.dirty(), "clean after save-as");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_on_unnamed_buffer_opens_save_as_prompt() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        crate::save::dispatch_save(&mut ctx); // no path → opens Save-As, NOT the dead stub
+        assert!(matches!(e.minibuffer.as_ref().map(|m| m.kind),
+            Some(crate::minibuffer::MinibufferKind::SaveAs)), "unnamed save opens the SaveAs minibuffer");
+    }
+
+    #[test]
+    fn save_as_existing_target_raises_overwrite_prompt() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        let p = std::env::temp_dir().join(format!("wc-ow-{}.md", std::process::id()));
+        std::fs::write(&p, "old\n").unwrap();
+        let mut e = Editor::new_from_text("new\n", None, (80, 24));
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::app::save_as_submit(&mut e, p.to_str().unwrap(), &ex, &clk, &tx);
+        assert!(e.prompt.is_some(), "existing target → confirm modal");
+        assert_eq!(e.prompt.as_ref().unwrap().action_for('o'), Some(crate::prompt::PromptAction::OverwriteSaveAs));
+        assert_ne!(crate::prompt::PromptAction::OverwriteSaveAs, crate::prompt::PromptAction::Overwrite);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 4: New command + dirty-guard mechanism
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn new_on_clean_buffer_replaces_with_scratch() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("kept\n", None, (80, 24)); // clean (saved_version=Some(0))
+        let (ex, clk, tx) = (crate::jobs::InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
+        crate::app::request_new(&mut e, &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "\n", "clean buffer → immediate new scratch");
+        assert!(e.active().document.path.is_none());
+        assert!(e.prompt.is_none(), "no modal for a clean buffer");
+    }
+
+    #[test]
+    fn new_on_dirty_buffer_raises_guard_modal() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("draft\n", None, (80, 24));
+        e.active_mut().document.version = 1; // dirty (saved_version=Some(0))
+        let (ex, clk, tx) = (crate::jobs::InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
+        crate::app::request_new(&mut e, &ex, &clk, &tx);
+        assert!(e.prompt.is_some(), "dirty buffer → Save/Discard/Cancel modal");
+        assert_eq!(e.prompt.as_ref().unwrap().action_for('d'), Some(crate::prompt::PromptAction::DiscardAndProceed));
+    }
+
+    #[test]
+    fn dirty_guard_discard_replaces_scratch_and_cancel_preserves() {
+        use crate::editor::Editor;
+        // Discard → proceeds to scratch
+        {
+            let mut e = Editor::new_from_text("draft\n", None, (80, 24));
+            e.active_mut().document.version = 1; // dirty
+            let (ex, clk, tx) = (crate::jobs::InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
+            crate::app::request_new(&mut e, &ex, &clk, &tx);
+            assert!(e.prompt.is_some());
+            crate::app::resolve_prompt(crate::prompt::PromptAction::DiscardAndProceed, &mut e, &ex, &clk, &tx);
+            assert_eq!(e.active().document.buffer.to_string(), "\n", "Discard → scratch");
+            assert!(e.active().document.path.is_none());
+            assert!(e.prompt.is_none(), "prompt cleared after Discard");
+            assert!(e.pending_save_as.is_none(), "pending_save_as cleared after Discard");
+        }
+        // Cancel → untouched buffer, pending_save_as cleared
+        {
+            let mut e = Editor::new_from_text("draft\n", None, (80, 24));
+            e.active_mut().document.version = 1; // dirty
+            let (ex, clk, tx) = (crate::jobs::InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
+            crate::app::request_new(&mut e, &ex, &clk, &tx);
+            crate::app::resolve_prompt(crate::prompt::PromptAction::Cancel, &mut e, &ex, &clk, &tx);
+            assert_eq!(e.active().document.buffer.to_string(), "draft\n", "Cancel → untouched");
+            assert!(e.pending_save_as.is_none(), "Cancel clears pending_save_as");
+            assert!(e.prompt.is_none(), "prompt cleared after Cancel");
         }
     }
 }

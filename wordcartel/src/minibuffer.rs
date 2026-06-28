@@ -8,6 +8,8 @@
 pub enum MinibufferKind {
     Filter,
     GotoLine,
+    /// File-name input for Save As.
+    SaveAs,
 }
 
 #[derive(Debug, Clone)]
