@@ -30,16 +30,19 @@
 
 ---
 
-### Task 1: `fsx` module — seam traits, `RealFs`, and the `atomic_replace` core
+### Task 1: `fsx` seam + `atomic_replace` core, and route `file::save_atomic` / `save_atomic_bytes` through it
+
+> **Why this is one task:** the `fsx` items are `pub(crate)` (crate-internal), so the `dead_code` lint applies to them. `cargo build` does NOT compile `#[cfg(test)]` modules, so if the seam's only callers were the Task-1 tests, a plain `cargo build` would flag every `pub(crate)` item as dead and fail the `-D warnings` gate. Wiring the first production caller (`file.rs`) in the SAME task gives the core real callers immediately, so each task passes the full gates with no `#[allow(dead_code)]` scaffolding.
 
 **Files:**
 - Create: `wordcartel/src/fsx.rs`
-- Modify: `wordcartel/src/lib.rs` (add `pub mod fsx;`, alphabetical-ish near the other IO modules)
-- Test: `wordcartel/src/fsx.rs` (`#[cfg(test)] mod tests`)
+- Modify: `wordcartel/src/lib.rs` (add `pub mod fsx;`, near the other IO modules)
+- Modify: `wordcartel/src/file.rs` (route `save_atomic` / `save_atomic_bytes` through `atomic_replace`; delete `create_temp`/`open_excl`/`TempGuard`/`TEMP_SEQ`; fix imports)
+- Test: `wordcartel/src/fsx.rs` (`#[cfg(test)] mod tests`); existing `file.rs` tests stay green.
 
 **Interfaces:**
-- Consumes: nothing (new leaf module; `std::fs`, `std::io`, `std::path` only).
-- Produces (later tasks rely on these EXACT signatures):
+- Consumes: nothing external (new leaf module; `std::fs`, `std::io`, `std::path` only). `file.rs` consumes `crate::fsx::{atomic_replace, RealFs, ModePolicy, WriteOpts}`.
+- Produces (later tasks rely on these EXACT signatures); `save_atomic` / `save_atomic_bytes` keep their UNCHANGED public signatures:
   - `pub(crate) trait WriteSync { fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()>; fn flush(&mut self) -> std::io::Result<()>; fn set_mode(&self, mode: u32) -> std::io::Result<()>; fn sync_all(&self) -> std::io::Result<()>; }`
   - `pub(crate) trait Fs { fn create_excl(&self, path: &std::path::Path, mode: u32) -> std::io::Result<Box<dyn WriteSync>>; fn existing_mode(&self, path: &std::path::Path) -> Option<u32>; fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()>; fn sync_dir(&self, dir: &std::path::Path) -> std::io::Result<()>; fn remove_file(&self, path: &std::path::Path) -> std::io::Result<()>; }`
   - `pub(crate) struct RealFs;` (zero-size, `Send`) implementing `Fs`.
@@ -376,17 +379,94 @@ pub(crate) fn atomic_replace(
 Run: `cargo test -p wordcartel --lib fsx::tests`
 Expected: `real_fs_replaces_target_no_litter` and `preserve_existing_mode_else_fallback` PASS.
 
-- [ ] **Step 5: Gate-check this task**
+> The remaining steps wire `file.rs` through the new core so the `pub(crate)` items have a production caller (see the "Why this is one task" note above).
 
-Run: `cargo build -p wordcartel 2>&1 | grep -i warning` (expect no output), then
-`cargo clippy -p wordcartel --all-targets -- -D warnings` and `cargo fmt --check`.
+- [ ] **Step 5: Confirm the existing file.rs tests pass (baseline)**
+
+Run: `cargo test -p wordcartel --lib file::tests`
+Expected: PASS (record the count; it must not drop after this task).
+
+- [ ] **Step 6: Rewrite `save_atomic` to delegate**
+
+Replace the body of `save_atomic` (file.rs:163-236) so the pre-checks stay and the commit delegates. The new body:
+
+```rust
+pub fn save_atomic(path: &Path, content: &str) -> Result<SaveOutcome, SaveError> {
+    // (1) Symlink refusal — symlink_metadata does NOT follow the link.
+    match path.symlink_metadata() {
+        Ok(meta) if meta.file_type().is_symlink() => return Err(SaveError::Symlink),
+        _ => {}
+    }
+
+    // (2) Skip-unchanged — if on-disk bytes equal content bytes, skip the write.
+    if let Ok(existing) = fs::read(path) {
+        if existing == content.as_bytes() {
+            return Ok(SaveOutcome::Unchanged);
+        }
+    }
+
+    // (3) Commit through the shared fault-tested core. Mode is preserved from the
+    // existing target (else 0600); dir-fsync after rename for durability.
+    crate::fsx::atomic_replace(
+        &crate::fsx::RealFs,
+        path,
+        content.as_bytes(),
+        crate::fsx::WriteOpts {
+            mode: crate::fsx::ModePolicy::PreserveExistingOr(0o600),
+            dir_fsync: true,
+        },
+    )
+    .map_err(|e| SaveError::Io(e.to_string()))?;
+
+    Ok(SaveOutcome::Saved)
+}
+```
+
+- [ ] **Step 7: Rewrite `save_atomic_bytes` to delegate**
+
+Replace the body of `save_atomic_bytes` (file.rs:243-279):
+
+```rust
+pub fn save_atomic_bytes(path: &Path, content: &[u8]) -> Result<(), SaveError> {
+    crate::fsx::atomic_replace(
+        &crate::fsx::RealFs,
+        path,
+        content,
+        crate::fsx::WriteOpts {
+            mode: crate::fsx::ModePolicy::Fixed(0o600),
+            dir_fsync: true,
+        },
+    )
+    .map_err(|e| SaveError::Io(e.to_string()))
+}
+```
+
+- [ ] **Step 8: Delete the now-unused temp helpers from file.rs + fix imports**
+
+Remove `TEMP_SEQ` (file.rs:107-108), `TempGuard` (110-123), `create_temp` (125-141), and `open_excl` (143-157) — they live in `fsx` now. Remove the now-unused imports `use std::sync::atomic::{AtomicU32, Ordering};` (line 8) and `use std::io::Write as IoWrite;` (line 6) — both were only used by the deleted helpers (the tests import their own atomics at file.rs:288).
+
+**Move `PathBuf` into the test module.** After the deletions and the `save_atomic`/`save_atomic_bytes` rewrites, NO production code in file.rs references `PathBuf` anymore (the dir/name resolution moved into `fsx::atomic_replace`). A top-level `use std::path::PathBuf` would then be unused during `cargo build` (which does NOT compile `#[cfg(test)]` modules) → fatal under `-D warnings`. So:
+- Change the top-level import (file.rs:7) to `use std::path::Path;` (drop `PathBuf`).
+- Add `use std::path::PathBuf;` INSIDE the `#[cfg(test)] mod tests` block (near its existing `use super::*;` at file.rs:287), since `scratch_path` returns `PathBuf` (file.rs:290-300).
+
+- [ ] **Step 9: Run the file.rs tests + warning-free build**
+
+Run: `cargo test -p wordcartel --lib file::tests`
+Expected: the SAME tests pass (roundtrip, unchanged, symlink-refused, no-litter, bytes-roundtrip-no-litter, background_save_command_clears_dirty). Count must match Step 5.
+
+Run: `cargo build -p wordcartel 2>&1 | grep -i warning`
+Expected: no output — confirms `AtomicU32`/`Ordering`/`IoWrite`/top-level `PathBuf` are gone, no orphan `pub(crate)` dead code (file.rs now calls the fsx items), and `cargo test --no-run` compiles the test module with its own `PathBuf`.
+
+- [ ] **Step 10: Gate-check this task**
+
+Run: `cargo clippy -p wordcartel --all-targets -- -D warnings` and `cargo fmt --check`.
 Expected: all clean.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
-git add wordcartel/src/fsx.rs wordcartel/src/lib.rs
-git commit -m "feat(m3): add fsx atomic-write seam + atomic_replace core"
+git add wordcartel/src/fsx.rs wordcartel/src/lib.rs wordcartel/src/file.rs
+git commit -m "feat(m3): fsx atomic-write seam + route file::save_atomic/_bytes through it"
 ```
 
 ---
@@ -585,7 +665,7 @@ Expected: all fault tests + the Task-1 success tests PASS. If any pre-rename fau
 
 - [ ] **Step 6: Gate-check + commit**
 
-Run the four gates (build/clippy/fmt as in Task 1 Step 5). Then:
+Run the four gates (`cargo test`, `cargo build` warning-free, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`). Then:
 
 ```bash
 git add wordcartel/src/fsx.rs
@@ -594,106 +674,7 @@ git commit -m "test(m3): FaultFs harness + durability fault tests (atomicity, no
 
 ---
 
-### Task 3: Route `file::save_atomic` + `save_atomic_bytes` through `atomic_replace`
-
-**Files:**
-- Modify: `wordcartel/src/file.rs` (lines ~163-279 rewritten to delegate; delete `create_temp`/`open_excl`/`TempGuard`/`TEMP_SEQ` at lines ~107-157)
-- Test: existing `file.rs` tests stay green (no new test required; behavior-preserving)
-
-**Interfaces:**
-- Consumes: `crate::fsx::{atomic_replace, RealFs, ModePolicy, WriteOpts}` (Task 1).
-- Produces: `save_atomic` / `save_atomic_bytes` with UNCHANGED public signatures.
-
-- [ ] **Step 1: Confirm the existing file.rs tests pass (baseline)**
-
-Run: `cargo test -p wordcartel --lib file::tests`
-Expected: PASS (record the count; it must not drop after this task).
-
-- [ ] **Step 2: Rewrite `save_atomic` to delegate**
-
-Replace the body of `save_atomic` (file.rs:163-236) so the pre-checks stay and the commit delegates. The new body:
-
-```rust
-pub fn save_atomic(path: &Path, content: &str) -> Result<SaveOutcome, SaveError> {
-    // (1) Symlink refusal — symlink_metadata does NOT follow the link.
-    match path.symlink_metadata() {
-        Ok(meta) if meta.file_type().is_symlink() => return Err(SaveError::Symlink),
-        _ => {}
-    }
-
-    // (2) Skip-unchanged — if on-disk bytes equal content bytes, skip the write.
-    if let Ok(existing) = fs::read(path) {
-        if existing == content.as_bytes() {
-            return Ok(SaveOutcome::Unchanged);
-        }
-    }
-
-    // (3) Commit through the shared fault-tested core. Mode is preserved from the
-    // existing target (else 0600); dir-fsync after rename for durability.
-    crate::fsx::atomic_replace(
-        &crate::fsx::RealFs,
-        path,
-        content.as_bytes(),
-        crate::fsx::WriteOpts {
-            mode: crate::fsx::ModePolicy::PreserveExistingOr(0o600),
-            dir_fsync: true,
-        },
-    )
-    .map_err(|e| SaveError::Io(e.to_string()))?;
-
-    Ok(SaveOutcome::Saved)
-}
-```
-
-- [ ] **Step 3: Rewrite `save_atomic_bytes` to delegate**
-
-Replace the body of `save_atomic_bytes` (file.rs:243-279):
-
-```rust
-pub fn save_atomic_bytes(path: &Path, content: &[u8]) -> Result<(), SaveError> {
-    crate::fsx::atomic_replace(
-        &crate::fsx::RealFs,
-        path,
-        content,
-        crate::fsx::WriteOpts {
-            mode: crate::fsx::ModePolicy::Fixed(0o600),
-            dir_fsync: true,
-        },
-    )
-    .map_err(|e| SaveError::Io(e.to_string()))
-}
-```
-
-- [ ] **Step 4: Delete the now-unused temp helpers from file.rs**
-
-Remove `TEMP_SEQ` (file.rs:107-108), `TempGuard` (110-123), `create_temp` (125-141), and `open_excl` (143-157) — they live in `fsx` now. Remove the now-unused imports `use std::sync::atomic::{AtomicU32, Ordering};` (line 8) and `use std::io::Write as IoWrite;` (line 6) — both were only used by the deleted helpers (the tests import their own atomics at file.rs:288).
-
-**Move `PathBuf` into the test module.** After the deletions and the `save_atomic`/`save_atomic_bytes` rewrites, NO production code in file.rs references `PathBuf` anymore (the dir/name resolution moved into `fsx::atomic_replace`). A top-level `use std::path::PathBuf` would then be unused during `cargo build` (which does NOT compile `#[cfg(test)]` modules) → fatal under `-D warnings`. So:
-- Change the top-level import (file.rs:7) to `use std::path::Path;` (drop `PathBuf`).
-- Add `use std::path::PathBuf;` INSIDE the `#[cfg(test)] mod tests` block (near its existing `use super::*;` at file.rs:287), since `scratch_path` returns `PathBuf` (file.rs:290-300).
-
-After the edits, run `cargo build -p wordcartel 2>&1 | grep -i warning` (Step 5) to confirm `AtomicU32`/`Ordering`/`IoWrite`/`PathBuf` are all warning-free at top level, and `cargo test --no-run` to confirm the test module compiles with its own `PathBuf` import.
-
-- [ ] **Step 5: Run the file.rs tests + full crate build**
-
-Run: `cargo test -p wordcartel --lib file::tests`
-Expected: the SAME tests pass (roundtrip, unchanged, symlink-refused, no-litter, bytes-roundtrip-no-litter, background_save_command_clears_dirty). Count must match Step 1.
-
-Run: `cargo build -p wordcartel 2>&1 | grep -i warning`
-Expected: no output (the deletions must not leave dead code / unused imports).
-
-- [ ] **Step 6: Gate-check + commit**
-
-Run clippy + fmt gates. Then:
-
-```bash
-git add wordcartel/src/file.rs
-git commit -m "refactor(m3): route file::save_atomic + save_atomic_bytes through fsx::atomic_replace"
-```
-
----
-
-### Task 4: Route `swap::write_atomic` through `atomic_replace`
+### Task 3: Route `swap::write_atomic` through `atomic_replace`
 
 **Files:**
 - Modify: `wordcartel/src/swap.rs` (rewrite `write_atomic` at 198-213; delete `open_excl_0600` at 215-223)
@@ -749,7 +730,7 @@ git commit -m "refactor(m3): route swap::write_atomic through fsx::atomic_replac
 
 ---
 
-### Task 5: Component-5 end-to-end — a real failed save keeps the buffer dirty
+### Task 4: Component-5 end-to-end — a real failed save keeps the buffer dirty
 
 **Files:**
 - Modify: `wordcartel/src/save.rs` (`#[cfg(test)] mod tests`, alongside `background_save_failure_keeps_dirty_and_status` at ~339)
@@ -829,8 +810,8 @@ git commit -m "test(m3): end-to-end real-failure (parent-is-file) keeps buffer d
 - Component 2 (`atomic_replace` + `ModePolicy`/`WriteOpts`, mode-read-before-temp, temp-name unification, `TempGuard`) → Task 1. ✔
 - Component 3 (`FaultFs` incl. `SetMode`) → Task 2. ✔
 - Component 4 (fault tests: atomicity, no-litter, error-surfaced, partial-write, pinned dir-fsync, success-path + mode-preservation) → Tasks 1-2. ✔
-- Component 5 (failed save keeps dirty) → Task 5 (existing symlink test kept; real parent-is-file case added). ✔
-- Routing all three primitives → Tasks 3 (file ×2) + 4 (swap). ✔ `state.rs`/`recovery.rs` covered transitively (unchanged signatures).
+- Component 5 (failed save keeps dirty) → Task 4 (existing symlink test kept; real parent-is-file case added). ✔
+- Routing all three primitives → Task 1 (file ×2) + Task 3 (swap). ✔ `state.rs`/`recovery.rs` covered transitively (unchanged signatures).
 - Out-of-scope (export raw rename, reads/metadata/session-load faults) → not touched. ✔
 
 **Type consistency:** `atomic_replace(fs: &dyn Fs, final_path: &Path, bytes: &[u8], opts: WriteOpts) -> io::Result<()>` is referenced identically in Tasks 1-4. `ModePolicy::{Fixed, PreserveExistingOr}`, `WriteOpts{mode, dir_fsync}`, `WriteSync::{write_all, flush, set_mode, sync_all}`, `Fs::{create_excl, existing_mode, rename, sync_dir, remove_file}` are consistent across tasks.
