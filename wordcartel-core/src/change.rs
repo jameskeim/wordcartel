@@ -117,6 +117,16 @@ impl ChangeSet {
     /// Document length this changeset expects before applying.
     pub fn len_before(&self) -> usize { self.len_before }
 
+    /// Heap text this changeset holds: the sum of `Insert` payload byte lengths. `Retain`/`Delete`
+    /// are counts (negligible structural overhead, excluded). A revision's true memory is captured
+    /// by summing this over both its `changes` and `inverse` (a delete's text lives in the inverse).
+    pub fn stored_bytes(&self) -> usize {
+        self.ops.iter().map(|op| match op {
+            Op::Insert(s) => s.len(),
+            Op::Retain(_) | Op::Delete(_) => 0,
+        }).sum()
+    }
+
     /// Validate this changeset against `buf` WITHOUT mutating. Length must match
     /// (→ `StaleLength`), and every op's OLD-text byte boundaries must be char
     /// boundaries in `buf` (→ `OpBoundary`) — so a later `apply` cannot panic partway.
@@ -334,6 +344,15 @@ mod tests {
     fn insert_at_beyond_doc_len_clamps() {
         let len = TextBuffer::from_str("hello").len(); // 5
         let _ = ChangeSet::insert(99, "!", len); // at way past the end → panic
+    }
+
+    // ── Task 2 (M5): stored_bytes ─────────────────────────────────────────────
+
+    #[test]
+    fn stored_bytes_counts_insert_payload_only() {
+        // retain 3, insert "hello" (5), delete 2 -> stored = 5 (only the Insert text).
+        let cs = ChangeSet::from_ops(vec![Op::Retain(3), Op::Insert("hello".into()), Op::Delete(2)], 5);
+        assert_eq!(cs.stored_bytes(), 5);
     }
 
     // ── Task 1 (M1): new failing tests ────────────────────────────────────────

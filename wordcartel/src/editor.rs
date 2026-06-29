@@ -634,6 +634,9 @@ impl Editor {
     // Thin delegators — external callers unchanged.
     pub fn apply(&mut self, txn: Transaction, edit: wordcartel_core::block_tree::Edit, kind: EditKind, clock: &dyn Clock) {
         self.active_mut().apply(txn, edit, kind, clock);
+        if self.active().document.history.last_evicted > 0 {
+            self.status = "Undo history full — oldest dropped".to_string();
+        }
     }
     pub fn undo(&mut self) -> bool { self.active_mut().undo() }
     pub fn redo(&mut self) -> bool { self.active_mut().redo() }
@@ -1049,5 +1052,26 @@ mod tests {
         e.active = idx;
         crate::derive::rebuild(&mut e);
         assert_eq!(e.by_id(sid).unwrap().document.buffer.len(), 0);
+    }
+
+    // ── Task 2 (M5): eviction hint wiring ─────────────────────────────────────
+
+    /// Wiring test: a non-evicting edit (well under MAX_UNDO_BYTES) must NOT set the hint.
+    /// The true-eviction branch is covered by the core `eviction_keeps_current_consistent_for_undo_redo`
+    /// test which directly asserts `last_evicted > 0`; forcing a real eviction here would require
+    /// allocating >64 MiB of insert text per revision.
+    #[test]
+    fn apply_does_not_set_hint_when_no_eviction() {
+        use wordcartel_core::change::ChangeSet;
+        use wordcartel_core::history::Transaction;
+        let clk = TestClock(std::cell::Cell::new(0));
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        let cs = ChangeSet::insert(0, "x", e.active().document.buffer.len());
+        e.apply(Transaction::new(cs), Edit { range: 0..0, new_len: 1 }, EditKind::Type, &clk);
+        assert_ne!(
+            e.status,
+            "Undo history full — oldest dropped",
+            "a tiny edit must not set the eviction hint"
+        );
     }
 }
