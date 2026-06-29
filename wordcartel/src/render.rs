@@ -1009,7 +1009,8 @@ fn format_search_bar(s: &crate::search_overlay::SearchState) -> String {
     } else if s.count() == 0 {
         " no matches".to_string()
     } else {
-        format!(" {}/{}", s.current_ordinal().unwrap_or(0), s.count())
+        let cap_note = if s.capped() { " (first 100000)" } else { "" };
+        format!(" {}/{}{}", s.current_ordinal().unwrap_or(0), s.count(), cap_note)
     };
     let wrapped = if s.wrapped { " (wrapped)" } else { "" };
     match s.phase {

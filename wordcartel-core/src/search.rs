@@ -49,27 +49,30 @@ pub fn compile(needle: &str, mode: QueryMode, case: CaseMode) -> Result<Matcher,
     Ok(Matcher { search, captures })
 }
 
-/// All non-overlapping matches over the whole rope, left-to-right.
-pub fn all_matches(rope: &Rope, m: &Matcher) -> Vec<Match> {
+/// All non-overlapping matches over the whole rope, left-to-right; stops at `limit`.
+/// Returns `(matches, capped)` — `capped` is `true` only when a `(limit+1)`-th
+/// match was found (so exactly `limit` matches is NOT capped).
+pub fn all_matches(rope: &Rope, m: &Matcher, limit: usize) -> (Vec<Match>, bool) {
     let mut out = Vec::new();
     let mut at = 0usize;
     let end = rope.len_bytes();
-    loop {
-        match next_from(rope, m, at) {
-            Some(mm) => {
-                // Zero-width: advance past the match to the next char boundary so
-                // we never re-find the same empty match (Codex: do NOT clamp back
-                // to len — advance strictly forward).
-                let advance = if mm.end > mm.start { mm.end } else { next_boundary(rope, mm.end) };
-                out.push(mm);
-                // advance>end is the real EOF terminator (next_boundary returns len+1); advance<=at is an infallibility guard.
-                if advance > end || advance <= at { break; }
-                at = advance;
-            }
-            None => break,
+    let mut capped = false;
+    while let Some(mm) = next_from(rope, m, at) {
+        if out.len() == limit {
+            // We already hold `limit` matches and another exists → capped; don't push it.
+            capped = true;
+            break;
         }
+        // Zero-width: advance past the match to the next char boundary so
+        // we never re-find the same empty match (Codex: do NOT clamp back
+        // to len — advance strictly forward).
+        let advance = if mm.end > mm.start { mm.end } else { next_boundary(rope, mm.end) };
+        out.push(mm);
+        // advance>end is the real EOF terminator (next_boundary returns len+1); advance<=at is an infallibility guard.
+        if advance > end || advance <= at { break; }
+        at = advance;
     }
-    out
+    (out, capped)
 }
 
 /// First match with `start >= from`.
@@ -206,7 +209,7 @@ mod tests {
         // "a.c" in literal mode matches the literal "a.c", NOT "abc".
         let rope = Rope::from_str("a.c abc\n");
         let m = compile("a.c", QueryMode::Literal, CaseMode::Sensitive).unwrap();
-        assert_eq!(all_matches(&rope, &m), vec![Match { start: 0, end: 3 }]);
+        assert_eq!(all_matches(&rope, &m, usize::MAX).0, vec![Match { start: 0, end: 3 }]);
     }
 
     #[test]
@@ -214,21 +217,21 @@ mod tests {
         let rope = Rope::from_str("a.c abc\n");
         let m = compile("a.c", QueryMode::Regex, CaseMode::Sensitive).unwrap();
         // matches "a.c" (0..3) and "abc" (4..7)
-        assert_eq!(all_matches(&rope, &m), vec![Match { start: 0, end: 3 }, Match { start: 4, end: 7 }]);
+        assert_eq!(all_matches(&rope, &m, usize::MAX).0, vec![Match { start: 0, end: 3 }, Match { start: 4, end: 7 }]);
     }
 
     #[test]
     fn smart_case_insensitive_when_lowercase() {
         let rope = Rope::from_str("The THE the\n");
         let m = compile("the", QueryMode::Literal, CaseMode::Smart).unwrap();
-        assert_eq!(all_matches(&rope, &m).len(), 3); // matches all cases
+        assert_eq!(all_matches(&rope, &m, usize::MAX).0.len(), 3); // matches all cases
     }
 
     #[test]
     fn smart_case_sensitive_when_uppercase() {
         let rope = Rope::from_str("The THE the\n");
         let m = compile("The", QueryMode::Literal, CaseMode::Smart).unwrap();
-        assert_eq!(all_matches(&rope, &m), vec![Match { start: 0, end: 3 }]); // only "The"
+        assert_eq!(all_matches(&rope, &m, usize::MAX).0, vec![Match { start: 0, end: 3 }]); // only "The"
     }
 
     #[test]
@@ -248,7 +251,7 @@ mod tests {
         // "a*" matches empty between/around chars; must terminate and not split UTF-8.
         let rope = Rope::from_str("héllo\n"); // 'é' is 2 bytes
         let m = compile("x*", QueryMode::Regex, CaseMode::Sensitive).unwrap();
-        let ms = all_matches(&rope, &m);
+        let ms = all_matches(&rope, &m, usize::MAX).0;
         // every match start is a char boundary and the scan terminates
         for mm in &ms { assert!(rope.try_byte_to_char(mm.start).is_ok()); }
         assert!(ms.len() <= rope.len_chars() + 1);
@@ -263,7 +266,7 @@ mod tests {
                 for &ci in &[false, true] {
                     let case = if ci { CaseMode::Insensitive } else { CaseMode::Sensitive };
                     let Ok(m) = compile(p, QueryMode::Regex, case) else { continue };
-                    let got: Vec<(usize, usize)> = all_matches(&Rope::from_str(t), &m)
+                    let got: Vec<(usize, usize)> = all_matches(&Rope::from_str(t), &m, usize::MAX).0
                         .into_iter().map(|x| (x.start, x.end)).collect();
                     assert_eq!(got, oracle_all(t, p, ci), "text={t:?} pat={p:?} ci={ci}");
                 }
@@ -275,7 +278,7 @@ mod tests {
     fn literal_replacement_is_verbatim() {
         let rope = Rope::from_str("hello\n");
         let m = compile("hello", QueryMode::Literal, CaseMode::Sensitive).unwrap();
-        let at = all_matches(&rope, &m)[0];
+        let at = all_matches(&rope, &m, usize::MAX).0[0];
         // In literal mode, "$1" is literal text, not a capture ref.
         assert_eq!(expand_replacement(&rope, &m, &at, "bye $1", QueryMode::Literal), "bye $1");
     }
@@ -284,7 +287,7 @@ mod tests {
     fn regex_replacement_expands_captures() {
         let rope = Rope::from_str("Smith, John\n");
         let m = compile("(\\w+), (\\w+)", QueryMode::Regex, CaseMode::Sensitive).unwrap();
-        let at = all_matches(&rope, &m)[0];
+        let at = all_matches(&rope, &m, usize::MAX).0[0];
         assert_eq!(expand_replacement(&rope, &m, &at, "$2 $1", QueryMode::Regex), "John Smith");
     }
 
@@ -292,7 +295,20 @@ mod tests {
     fn regex_replacement_out_of_range_group_is_empty() {
         let rope = Rope::from_str("abc\n");
         let m = compile("abc", QueryMode::Regex, CaseMode::Sensitive).unwrap();
-        let at = all_matches(&rope, &m)[0];
+        let at = all_matches(&rope, &m, usize::MAX).0[0];
         assert_eq!(expand_replacement(&rope, &m, &at, "x$9y", QueryMode::Regex), "xy");
+    }
+
+    #[test]
+    fn all_matches_stops_at_limit_and_reports_capped() {
+        let rope = Rope::from_str(&"a ".repeat(1000)); // 1000 "a" matches
+        let m = compile("a", QueryMode::Literal, CaseMode::Sensitive).unwrap();
+        let (got, capped) = all_matches(&rope, &m, 10);
+        assert_eq!(got.len(), 10, "must stop collecting at the limit");
+        assert!(capped, "more than 10 matches exist → capped");
+
+        let (all, capped2) = all_matches(&rope, &m, usize::MAX);
+        assert_eq!(all.len(), 1000);
+        assert!(!capped2, "collecting everything is not capped");
     }
 }
