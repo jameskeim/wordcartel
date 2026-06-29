@@ -130,7 +130,12 @@ In `impl ChangeSet` (change.rs), add:
 
     /// Document length after this changeset applies.
     pub fn len_after(&self) -> usize { self.len_after }
+
+    /// Document length this changeset expects before applying.
+    pub fn len_before(&self) -> usize { self.len_before }
 ```
+
+(Codex Critical: `len_before()` is added HERE in Task 1 — the Task 1 tests call `cs.len_before()`, and the method form won't compile against a public field. Adding the accessor now is harmless and is needed once the field goes private in Task 2.)
 
 - [ ] **Step 4: Harden `insert`/`delete` (clamp → assert) and `apply` (length-assert)**
 
@@ -182,7 +187,18 @@ Add the length-assert as the **first statement** of `apply` (change.rs ~83):
 
 - [ ] **Step 5: Convert the two old clamp tests to `#[should_panic]`**
 
-The existing release-only tests at change.rs ~243 and ~256 assert that `insert`/`delete` CLAMP an out-of-range offset. That behavior is gone. Find them (grep the test names around those lines — they assert a clamped result) and convert each to the new contract: an out-of-range offset now panics. Replace each old test body with a `#[should_panic(expected = "doc_len")]` test that calls the same out-of-range `insert`/`delete` and expects the panic. (Do NOT delete the coverage — re-point it to the new fail-fast behavior.)
+Codex identified the exact tests (the plan's earlier "243/256" anchors were off):
+- **Convert** `delete_range_end_beyond_doc_len_clamps` (change.rs:247) → a
+  `#[should_panic(expected = "doc_len")]` test that calls the same out-of-bounds `delete`
+  and expects the panic.
+- **Convert** `insert_at_beyond_doc_len_clamps` (change.rs:260) → a
+  `#[should_panic(expected = "doc_len")]` test that calls the same out-of-range `insert`.
+- **KEEP `delete_reversed_range_equals_forward` (change.rs:229) unchanged** — it tests
+  reversed-range *normalization*, which decision 4 preserves. It is NOT a clamp test; do
+  not touch it. (It overlaps the new `delete_normalizes_reversed_in_bounds_range` above;
+  both are fine.)
+
+Re-point the coverage to the new fail-fast behavior; do not delete it.
 
 - [ ] **Step 6: Run, verify pass**
 
@@ -229,11 +245,15 @@ pub struct ChangeSet {
 - [ ] **Step 2: Run the build to enumerate every break**
 
 Run: `cargo build -p wordcartel-core && cargo build -p wordcartel`
-Expected: COMPILE ERRORS at every external construction/read site. The compiler is the worklist. Expected sites (per the spec's Codex grep): `wordcartel/src/commands.rs:125,157` (raw construct), `wordcartel-core/src/selection.rs:135` (reads `len_after`), and same-module test constructions in `change.rs` (~307,430,437). Fix exactly the sites the compiler reports.
+Expected: COMPILE ERRORS at every **external** (cross-module/cross-crate) construction/read site — the compiler worklist: `wordcartel/src/commands.rs:125,157` (raw construct) and `wordcartel-core/src/selection.rs:135` (reads `len_after`). **NOT flagged (Codex Minor):** the same-module test constructions in `change.rs` (~307,430,437) — they live in a child module of `change.rs`, so private-field access still compiles. Those are a *manual* cleanup in Step 5, not compiler-discovered.
 
 - [ ] **Step 3: Migrate `build_range_replace` and `build_multi_replace`**
 
-In `wordcartel/src/commands.rs`, replace the raw `ChangeSet { ops, len_before: doc_len, len_after }` literals (commands.rs:125 in `build_range_replace`, commands.rs:157 in `build_multi_replace`) with `ChangeSet::from_ops(ops, doc_len)`. `from_ops` recomputes `len_after`, so **delete the now-dead local `len_after` computation** in each function (in `build_multi_replace`, the `len_after` accumulator becomes unused — remove it; keep the `Edit`/`new_len` computation, which is separate). Read both functions in full first; preserve everything except the changeset construction.
+In `wordcartel/src/commands.rs`, replace the raw `ChangeSet { ops, len_before: doc_len, len_after }` literals with `ChangeSet::from_ops(ops, doc_len)`:
+- commands.rs:157 in **`build_multi_replace`** — `from_ops` recomputes `len_after`, so the local `len_after` accumulator becomes dead; remove it. Keep the separate `Edit`/`new_len` computation (Codex confirmed it does NOT depend on the `len_after` accumulator).
+- commands.rs:125 — note this literal is inside the private helper **`replace_changeset` (starts ~commands.rs:105), which `build_range_replace` (~commands.rs:164) calls**. Migrate it in `replace_changeset`.
+
+Read both functions in full first; preserve everything except the changeset construction.
 
 - [ ] **Step 4: Migrate the `len_after` read in selection.rs**
 
@@ -241,11 +261,11 @@ At `selection.rs:135`, change the direct field read `cs.len_after` (or `.len_aft
 
 - [ ] **Step 5: Migrate same-module raw-construction tests**
 
-In `change.rs` tests (the sites the compiler flags around ~307,430,437), replace raw `ChangeSet { ops, len_before, len_after }` with `ChangeSet::from_ops(ops, len_before)` (or `insert`/`delete` where that's what the test means). If a test deliberately built an *inconsistent* changeset to exercise some path, re-express it through `from_ops` (which will assert) or drop that specific construction — note it in the report.
+**Manual** (these compile fine same-module — the compiler will NOT flag them; find them by grepping `ChangeSet {` and `.ops`/`.len_before`/`.len_after` field reads within `change.rs`). At the constructions ~307 and ~430 and the `.ops` read ~437, replace raw `ChangeSet { ops, len_before, len_after }` with `ChangeSet::from_ops(ops, len_before)` (or `insert`/`delete` where that's the intent) and field reads with the accessors. This is consistency cleanup + exercises `from_ops` — it is NOT the security fix (Steps 3–4 close the external hole). If a test deliberately built an *inconsistent* changeset, re-express via `from_ops` (which now asserts) or note in the report why it stays.
 
 - [ ] **Step 6: Add `ops()`/`len_before()` accessors ONLY if the compiler still demands them**
 
-If Step 2 flagged any external reader of `ops` or `len_before` beyond what Steps 3–5 fixed, add `pub fn ops(&self) -> &[Op] { &self.ops }` and/or `pub fn len_before(&self) -> usize { self.len_before }` and use them. If no such reader exists, add nothing (YAGNI).
+`len_before()` was already added in Task 1. If Step 2 flagged any external reader of `ops` beyond what Steps 3–5 fixed, add `pub fn ops(&self) -> &[Op] { &self.ops }` and use it. (Codex's grep found none, so likely nothing to add — YAGNI.)
 
 - [ ] **Step 7: Run both suites**
 
