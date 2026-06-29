@@ -121,18 +121,39 @@ impl ChangeSet {
     /// (→ `StaleLength`), and every op's OLD-text byte boundaries must be char
     /// boundaries in `buf` (→ `OpBoundary`) — so a later `apply` cannot panic partway.
     /// Returns the FIRST violation; `Ok(())` means `apply(buf)` is panic-safe.
-    /// This panic-freedom assumes the ChangeSet's sum invariant (sum(Retain)+sum(Delete) == len_before) — which the public constructors guarantee — so old_pos never exceeds buf.len() and is_char_boundary/ropey's byte_to_char is never called out of range.
+    ///
+    /// Unlike `from_ops` (the per-keystroke hot path), this function is the
+    /// untrusted-edit boundary and ENFORCES position bounds: every `old_pos`/`end`
+    /// value passed to `is_char_boundary` is guaranteed `<= len` via checked
+    /// arithmetic. An op whose cumulative position overflows or exceeds `len` is
+    /// rejected as `OpBoundary` — an out-of-range position is, trivially, not a
+    /// valid char boundary. `from_ops` is NOT the right place for this check
+    /// because it runs on the per-keystroke hot path from trusted callers whose
+    /// positions are bounded by ~5 MB (spec §3.9).
     pub fn validate_against(&self, buf: &TextBuffer) -> Result<(), EditError> {
-        if self.len_before != buf.len() {
-            return Err(EditError::StaleLength { expected: self.len_before, actual: buf.len() });
+        let len = buf.len();
+        if self.len_before != len {
+            return Err(EditError::StaleLength { expected: self.len_before, actual: len });
         }
         let mut old_pos: usize = 0;
         for op in &self.ops {
             match op {
-                Op::Retain(n) => old_pos += n,
+                Op::Retain(n) => {
+                    // Reject overflow OR past-end BEFORE any is_char_boundary call.
+                    // Malformed plugin ChangeSets (e.g. Retain(usize::MAX)) whose
+                    // cumulative position wraps past `len` in release builds are caught
+                    // here at the untrusted boundary, not in from_ops (hot path).
+                    old_pos = match old_pos.checked_add(*n) {
+                        Some(p) if p <= len => p,
+                        _ => return Err(EditError::OpBoundary { pos: old_pos.saturating_add(*n) }),
+                    };
+                }
                 Op::Delete(n) => {
                     if !buf.is_char_boundary(old_pos) { return Err(EditError::OpBoundary { pos: old_pos }); }
-                    let end = old_pos + n;
+                    let end = match old_pos.checked_add(*n) {
+                        Some(p) if p <= len => p,
+                        _ => return Err(EditError::OpBoundary { pos: old_pos.saturating_add(*n) }),
+                    };
                     if !buf.is_char_boundary(end) { return Err(EditError::OpBoundary { pos: end }); }
                     old_pos = end;
                 }
@@ -227,6 +248,16 @@ pub fn map_pos_before(pos: usize, cs: &ChangeSet) -> usize {
         }
     }
     new + pos.saturating_sub(old)
+}
+
+/// Test-only bypass: create a ChangeSet without the sum-invariant check.
+/// Allows building adversarial ChangeSets (e.g. ops that overflow or exceed
+/// len_before) to verify validate_against's out-of-range defences.
+#[cfg(test)]
+impl ChangeSet {
+    pub(crate) fn from_ops_unchecked(ops: Vec<Op>, len_before: usize, len_after: usize) -> Self {
+        ChangeSet { ops, len_before, len_after }
+    }
 }
 
 #[cfg(test)]
@@ -439,6 +470,50 @@ mod tests {
         // Retain(1) lands old_pos at byte 1 (mid-é), then Insert there.
         let cs = ChangeSet::from_ops(vec![Op::Retain(1), Op::Insert(Tendril::from("x")), Op::Retain(1)], 2);
         assert_eq!(cs.validate_against(&buf), Err(EditError::OpBoundary { pos: 1 }));
+    }
+
+    /// M2 gate §11.2 — overflow/out-of-range defence.
+    ///
+    /// Before the fix, Retain(n) added `n` to `old_pos` unchecked, then the next
+    /// Insert/Delete called `buf.is_char_boundary(old_pos)` with an out-of-range
+    /// index → ropey's `byte_to_char` panics. After the fix, checked arithmetic
+    /// in `validate_against` catches the violation and returns `Err(OpBoundary)`
+    /// without touching ropey.
+    ///
+    /// `from_ops_unchecked` bypasses the sum-invariant assert so we can build
+    /// adversarial ops in debug builds (where `from_ops`'s overflow would itself
+    /// panic before we could even test the boundary).
+    #[test]
+    fn validate_against_rejects_overflowing_ops() {
+        let buf = TextBuffer::from_str("hello"); // len 5
+
+        // Case A: position exceeds len (Retain(6) on a len-5 buffer).
+        // Old code: old_pos=6, then is_char_boundary(6) panics (6 > len_bytes=5).
+        // Fixed code: 6 > len (5) → Err(OpBoundary { pos: 6 }), no ropey call.
+        let cs_a = ChangeSet::from_ops_unchecked(
+            vec![Op::Retain(6), Op::Insert(Tendril::from("X"))],
+            5, // len_before matches buf → passes the length check
+            6,
+        );
+        assert_eq!(cs_a.validate_against(&buf), Err(EditError::OpBoundary { pos: 6 }));
+
+        // Case B: genuine arithmetic overflow (Retain(usize::MAX)).
+        // Old code in release: wraps to a garbage old_pos, then is_char_boundary panics.
+        // Fixed code: checked_add overflows → None → Err(OpBoundary), no ropey call.
+        let cs_b = ChangeSet::from_ops_unchecked(
+            vec![Op::Retain(usize::MAX), Op::Insert(Tendril::from("X"))],
+            5,
+            6,
+        );
+        assert!(matches!(cs_b.validate_against(&buf), Err(EditError::OpBoundary { .. })));
+
+        // Case C: Delete whose end would overflow.
+        let cs_c = ChangeSet::from_ops_unchecked(
+            vec![Op::Delete(usize::MAX)],
+            5,
+            6,
+        );
+        assert!(matches!(cs_c.validate_against(&buf), Err(EditError::OpBoundary { .. })));
     }
 
     use proptest::prelude::*;
