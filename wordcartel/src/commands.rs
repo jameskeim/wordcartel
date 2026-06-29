@@ -122,11 +122,7 @@ fn replace_changeset(
     if doc_len > to {
         ops.push(Op::Retain(doc_len - to));
     }
-    ChangeSet {
-        ops,
-        len_before: doc_len,
-        len_after: doc_len - (to - from) + text.len(),
-    }
+    ChangeSet::from_ops(ops, doc_len)
 }
 
 /// Build ONE `ChangeSet` performing all `edits` (ascending, non-overlapping
@@ -140,12 +136,10 @@ pub fn build_multi_replace(
     debug_assert!(!edits.is_empty());
     let mut ops = Vec::new();
     let mut pos = 0usize;
-    let mut len_after = doc_len;
     for (from, to, text) in edits {
         if *from > pos { ops.push(Op::Retain(from - pos)); }
         if to > from { ops.push(Op::Delete(to - from)); }
         if !text.is_empty() { ops.push(Op::Insert(Tendril::from(text.as_str()))); }
-        len_after = len_after - (to - from) + text.len();
         pos = *to;
     }
     if doc_len > pos { ops.push(Op::Retain(doc_len - pos)); }
@@ -154,7 +148,7 @@ pub fn build_multi_replace(
     // new_len of the covering region = (last_to - first) adjusted by all deltas.
     let delta: isize = edits.iter().map(|(f, t, s)| s.len() as isize - (t - f) as isize).sum();
     let new_len = ((last_to - first) as isize + delta) as usize;
-    let cs = ChangeSet { ops, len_before: doc_len, len_after };
+    let cs = ChangeSet::from_ops(ops, doc_len);
     let edit = wordcartel_core::block_tree::Edit { range: first..last_to, new_len };
     (cs, edit)
 }

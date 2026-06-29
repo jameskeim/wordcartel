@@ -15,9 +15,9 @@ pub enum Op {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangeSet {
-    pub ops: Vec<Op>,
-    pub len_before: usize,
-    pub len_after: usize,
+    ops: Vec<Op>,
+    len_before: usize,
+    len_after: usize,
 }
 
 // INVARIANT: all positions and lengths here are byte offsets into a single
@@ -216,9 +216,9 @@ mod tests {
     fn len_fields_track_size() {
         let b = TextBuffer::from_str("abc");
         let ins = ChangeSet::insert(1, "XY", b.len());
-        assert_eq!((ins.len_before, ins.len_after), (3, 5));
+        assert_eq!((ins.len_before(), ins.len_after()), (3, 5));
         let del = ChangeSet::delete(0..2, b.len());
-        assert_eq!((del.len_before, del.len_after), (3, 1));
+        assert_eq!((del.len_before(), del.len_after()), (3, 1));
     }
 
     #[test]
@@ -237,9 +237,7 @@ mod tests {
     // ── Fix A: ChangeSet constructor clamping / normalization ──────────────────
 
     /// A reversed range must produce the same changeset + result as the forward range.
-    /// Only runs in release mode; in debug mode the debug_assert tripwire fires first.
     #[test]
-    #[cfg(not(debug_assertions))]
     fn delete_reversed_range_equals_forward() {
         let mut fwd = TextBuffer::from_str("hello world");
         let cs_fwd = ChangeSet::delete(5..7, fwd.len());
@@ -360,11 +358,10 @@ mod tests {
         // REPLACE 2..4 with "XY": an anchor at byte 4 (right edge of the replace =
         // the next heading start) must map AFTER the new text (4), NOT back onto it.
         // Build the real Retain,Delete,Insert,Retain shape the shell emits.
-        let cs_rep = ChangeSet {
-            ops: vec![Op::Retain(2), Op::Delete(2), Op::Insert("XY".into()), Op::Retain(2)],
-            len_before: buf.len(),
-            len_after: buf.len(),
-        };
+        let cs_rep = ChangeSet::from_ops(
+            vec![Op::Retain(2), Op::Delete(2), Op::Insert("XY".into()), Op::Retain(2)],
+            buf.len(),
+        );
         assert_eq!(map_pos_before(4, &cs_rep), 4); // not 2
         // a PURE insert at a mid-doc boundary still stays before
         let cs_mid = ChangeSet::insert(4, "Q", buf.len());
@@ -483,11 +480,7 @@ mod tests {
             ops.push(Op::Delete(d));
             ops.push(Op::Insert(Tendril::from(ins.as_str())));
             ops.push(Op::Retain(c2));
-            let cs = ChangeSet {
-                ops,
-                len_before: len,
-                len_after: c1 + ins.len() + c2,
-            };
+            let cs = ChangeSet::from_ops(ops, len);
 
             // Sanity: 4-op shape.
             prop_assert_eq!(cs.ops.len(), 4, "expected 4 ops; got {:?}", cs.ops);

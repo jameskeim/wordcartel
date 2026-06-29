@@ -132,7 +132,7 @@ mod tests {
                 ChangeSet::insert(at, "x", doc_len)
             };
             let mapped = crate::change::map_pos(pos, &cs);
-            prop_assert!(mapped <= cs.len_after);
+            prop_assert!(mapped <= cs.len_after());
         }
     }
 }
