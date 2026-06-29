@@ -107,10 +107,11 @@ pub(crate) enum ModePolicy {
 pub(crate) struct WriteOpts { pub mode: ModePolicy, pub dir_fsync: bool }
 
 /// [resolve PreserveExistingOr mode-read] → create-temp(O_EXCL,0600) → write_all →
-/// set_mode → flush → fsync → rename → [dir-fsync], with TempGuard cleanup of the temp on
-/// ANY failure. The single durability-critical sequence; all three primitives route their
-/// commit here. Never leaves a temp behind on failure; never half-replaces the target
-/// (rename is the all-or-nothing commit).
+/// set_mode → flush → fsync → close → rename → [dir-fsync], with TempGuard cleanup of the
+/// temp on ANY failure. The handle is closed before rename (consistent across all paths;
+/// required on Windows). The single durability-critical sequence; all three primitives
+/// route their commit here. Never leaves a temp behind on failure; never half-replaces the
+/// target (rename is the all-or-nothing commit).
 pub(crate) fn atomic_replace(
     fs: &dyn Fs,
     final_path: &std::path::Path,
@@ -150,16 +151,20 @@ pub(crate) fn atomic_replace(
 
 ```rust
 #[cfg(test)]
-enum FaultAt { Create, Write { after: usize }, SetMode, Flush, Sync, Rename, SyncDir, Remove }
+enum FaultAt { Create, Write { after: usize }, SetMode, Flush, Sync, Rename, SyncDir }
 #[cfg(test)] struct FaultFs { inner: RealFs, fail: FaultAt }
 ```
 Wraps `RealFs`; injects exactly one failure: `Create`/`SetMode`/`Flush`/`Sync`/`Rename`/
-`SyncDir`/`Remove` return an `io::Error` (e.g. `ErrorKind::Other` / a simulated
-`StorageFull`); `Write { after: n }` writes `n` real bytes to the temp then returns
-`ErrorKind::WriteZero` / ENOSPC (partial write). All other ops delegate to `RealFs` so the
-real temp dir reflects reality. `SetMode` is the fault point for the mode-preservation step
-(it occurs before the rename, so a `SetMode` failure must leave the original intact + no
-litter, just like the other pre-rename faults).
+`SyncDir` return an `io::Error` (e.g. `ErrorKind::Other` / a simulated `StorageFull`);
+`Write { after: n }` writes `n` real bytes to the temp then returns `ErrorKind::WriteZero` /
+ENOSPC (partial write). All other ops delegate to `RealFs` so the real temp dir reflects
+reality. `SetMode` is the fault point for the mode-preservation step (it occurs before the
+rename, so a `SetMode` failure must leave the original intact + no litter, just like the
+other pre-rename faults). **No `Remove` variant:** `fs.remove_file` is only called by
+`TempGuard::drop` on a pre-rename early return — which is itself caused by the one injected
+fault — so the single-fault model can never make the cleanup-remove ALSO fail. The
+`remove_file` seam method is still exercised (and must succeed) in every pre-rename fault
+test, where it is what makes the no-litter assertion hold.
 
 ### 4. Fault tests — the durability invariants
 

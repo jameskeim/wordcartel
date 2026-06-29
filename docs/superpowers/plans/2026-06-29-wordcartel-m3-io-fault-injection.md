@@ -324,7 +324,7 @@ pub(crate) struct WriteOpts {
 
 /// The single durability-critical sequence:
 /// [resolve PreserveExistingOr mode-read] -> create-temp(O_EXCL,0600) -> write_all ->
-/// set_mode -> flush -> fsync -> rename -> [dir-fsync]. The temp is removed on ANY
+/// set_mode -> flush -> fsync -> close -> rename -> [dir-fsync]. The temp is removed on ANY
 /// failure before rename; the target is never half-replaced (rename is the commit).
 pub(crate) fn atomic_replace(
     fs: &dyn Fs,
@@ -357,6 +357,7 @@ pub(crate) fn atomic_replace(
     handle.set_mode(final_mode)?;
     handle.flush()?;
     handle.sync_all()?;
+    drop(handle); // close the temp before rename (consistent across all paths; required on Windows)
 
     fs.rename(&temp, final_path)?;
     guard.disarm(); // temp renamed away; nothing to clean up regardless of what follows
@@ -408,6 +409,11 @@ Add to the `tests` module of `wordcartel/src/fsx.rs`:
 use std::cell::Cell;
 use std::io::{Error, ErrorKind};
 
+// Note: no `Remove` variant. `remove_file` is only ever called by TempGuard::drop on a
+// pre-rename early return — which is itself caused by the ONE injected fault — so the
+// single-fault model can never make the cleanup-remove ALSO fail. The remove path IS still
+// exercised (and must succeed) in every pre-rename fault test, where it is what makes the
+// no-litter assertion hold.
 #[derive(Clone, Copy, Debug)]
 enum FaultAt {
     Create,
@@ -417,7 +423,6 @@ enum FaultAt {
     Sync,
     Rename,
     SyncDir,
-    Remove,
 }
 
 struct FaultFs {
@@ -489,9 +494,9 @@ impl Fs for FaultFs {
         self.inner.sync_dir(dir)
     }
     fn remove_file(&self, path: &Path) -> std::io::Result<()> {
-        if matches!(self.fail, FaultAt::Remove) {
-            return Err(Error::new(ErrorKind::Other, "injected: remove"));
-        }
+        // No injection: cleanup-remove must succeed for the no-litter assertion to hold
+        // under every pre-rename fault. (See the FaultAt note — Remove is unreachable as
+        // a *second* fault.)
         self.inner.remove_file(path)
     }
 }
@@ -661,7 +666,7 @@ pub fn save_atomic_bytes(path: &Path, content: &[u8]) -> Result<(), SaveError> {
 
 - [ ] **Step 4: Delete the now-unused temp helpers from file.rs**
 
-Remove `TEMP_SEQ` (file.rs:107-108), `TempGuard` (110-123), `create_temp` (125-141), and `open_excl` (143-157) — they live in `fsx` now. Remove the now-unused imports: `use std::sync::atomic::{AtomicU32, Ordering};` (line 8) and, if no longer used, `use std::io::Write as IoWrite;` (line 6). Keep `use std::path::{Path, PathBuf};` only if `PathBuf` is still referenced elsewhere in file.rs; otherwise narrow to `Path`.
+Remove `TEMP_SEQ` (file.rs:107-108), `TempGuard` (110-123), `create_temp` (125-141), and `open_excl` (143-157) — they live in `fsx` now. Remove the now-unused imports `use std::sync::atomic::{AtomicU32, Ordering};` (line 8) and `use std::io::Write as IoWrite;` (line 6) — both were only used by the deleted helpers (the tests import their own atomics at file.rs:288). **Keep `use std::path::{Path, PathBuf};` UNCHANGED** — the test module still uses `PathBuf` in `scratch_path` via `use super::*` (file.rs:290-300), so narrowing it would break the tests. After the edits, grep file.rs to confirm `AtomicU32`/`Ordering`/`IoWrite` have no remaining top-level references and `PathBuf` still does (through the test glob).
 
 - [ ] **Step 5: Run the file.rs tests + full crate build**
 
@@ -724,7 +729,7 @@ Remove `open_excl_0600` (both `#[cfg(unix)]` and `#[cfg(not(unix))]` arms, swap.
 Run: `cargo test -p wordcartel --lib swap::tests`
 Expected: the SAME tests pass (roundtrip, orphan detection, recovery assess). Count matches Step 1.
 
-Run: `cargo test -p wordcartel --lib recovery save::tests`
+Run: `cargo test -p wordcartel --lib recovery` then `cargo test -p wordcartel --lib save::tests` (two separate invocations — `cargo test` does not reliably accept multiple filter strings).
 Expected: PASS — `recovery.rs:24` and `save.rs` swap-using tests still work through the unchanged signature.
 
 - [ ] **Step 5: Gate-check + commit**
