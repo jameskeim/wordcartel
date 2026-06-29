@@ -62,13 +62,14 @@ There is **no central limits module** — caps are scattered (filter field, clip
 
 | Cap | Const | Value | Behavior | Enforced at |
 |---|---|---|---|---|
-| Document-open size | `MAX_OPEN_BYTES` | 64 MiB | **Refuse** → `OpenError::TooLarge` | `file::open` — metadata len check BEFORE read |
-| Filter output | `MAX_FILTER_OUTPUT` | 64 MiB | Refuse (existing `FilterError`) | filter call-site defaults (was 1 MiB) |
+| Document-open size | `MAX_OPEN_BYTES` | 64 MiB | **Refuse** → `OpenError::TooLarge` | `file::open` — metadata fast-check **+ bounded `Read::take`** |
+| Filter output | `MAX_FILTER_OUTPUT` | 64 MiB | Refuse (existing `FilterError`) | `app.rs:668-675` production builder (was 1 MiB) |
 | Transform output | `MAX_TRANSFORM_OUTPUT` | 64 MiB | **Refuse** → `TransformError` | post-`run_transform` size check |
-| Undo history | `MAX_UNDO_BYTES` (core) | 64 MiB | **Degrade** → evict oldest, keep ≥1, loud hint | `History::commit`/`commit_coalescing` |
-| Search matches | `MAX_SEARCH_MATCHES` | 100_000 | **Degrade** → stop at N, "first N" | `search_overlay` match collection |
-| Scratch/session size | `MAX_SESSION_BYTES` | 8 MiB | **Degrade** → drop scratch, keep metadata | `state::save_in` |
-| Paste (re-homed) | `PASTE_MAX_BYTES` / `OSC52_MAX_ENCODED` | 8 MiB / 100_000 | unchanged | `clipboard.rs` |
+| Undo history | `MAX_UNDO_BYTES` (core) | 64 MiB | **Degrade** → evict oldest, keep ≥1, loud hint | `History::commit`/`commit_coalescing` (+ `current` fix) |
+| Search matches | `MAX_SEARCH_MATCHES` | 100_000 | **Degrade** → stop at N, "first N" | core `search::all_matches` (limit param) |
+| Scratch/session size | `MAX_SESSION_BYTES` | 8 MiB | **Degrade** → drop scratch, keep metadata | scratch snapshot + `state::save_in` + bounded load |
+| Swap/recovery load | (reuses `MAX_OPEN_BYTES`) | 64 MiB | **Degrade** → over-cap swap treated as absent | `swap.rs` bounded reads (load/orphan-scan) |
+| Paste (re-homed) | `PASTE_MAX_BYTES` / `OSC52_MAX_ENCODED` | 8 MiB / 100_000 | unchanged | `limits.rs` canonical, `clipboard.rs` re-export |
 
 ## Components
 
@@ -104,72 +105,112 @@ pub const MAX_UNDO_BYTES: usize = 64 * 1024 * 1024;
 
 ### 2. Document-open size cap (`file.rs::open`)
 
-Before `fs::read`, stat the file and refuse if too large — so a 10 GB file is never slurped
-into memory:
+A metadata pre-check is necessary but **not sufficient** — a `/proc`-style or sparse file can
+report length 0 yet stream gigabytes, so trusting `metadata().len()` leaves a hole. The
+guard therefore (a) fast-refuses on a trustworthy metadata length, **and** (b) bounds the
+actual read so even a lying-metadata file cannot slurp unbounded:
 ```rust
 pub fn open(path: &Path) -> Result<String, OpenError> {
     let label = path.display().to_string();
-    // Size guard BEFORE reading — never slurp an oversized file.
+    // (a) Fast refusal when metadata is trustworthy (gives an exact size in the error).
     if let Ok(meta) = fs::metadata(path) {
         if meta.is_file() && meta.len() > crate::limits::MAX_OPEN_BYTES {
-            return Err(OpenError::TooLarge { label, size: meta.len(), limit: crate::limits::MAX_OPEN_BYTES });
+            return Err(OpenError::TooLarge { label, size: Some(meta.len()), limit: crate::limits::MAX_OPEN_BYTES });
         }
     }
-    // ... existing fs::read + binary/dir/utf-8 handling unchanged ...
+    // (b) Bounded read: read at most MAX_OPEN_BYTES + 1 bytes. If we got the extra byte,
+    //     the file exceeds the cap regardless of what metadata claimed.
+    let mut bytes = Vec::new();
+    let limit = crate::limits::MAX_OPEN_BYTES;
+    match fs::File::open(path) {
+        Ok(f) => {
+            // Read::take(limit + 1) caps the allocation; errors map as today.
+            std::io::Read::take(f, limit + 1).read_to_end(&mut bytes)
+                .map_err(/* existing IO/NotFound/Permission/IsDir mapping */)?;
+            if bytes.len() as u64 > limit {
+                return Err(OpenError::TooLarge { label, size: None, limit });
+            }
+        }
+        Err(e) => return Err(/* existing kind mapping (NotFound/Permission/IsDir/Io) */),
+    }
+    // ... existing is_dir / is_binary (NUL + utf-8) checks + String::from_utf8 on `bytes` ...
 }
 ```
-New `OpenError::TooLarge { label, size, limit }` variant, with a `#[error]` Display like the
-existing binary/symlink refusals (e.g. `"{label}: too large ({size} bytes > {limit} limit)"`).
-The metadata read is best-effort: if `metadata` fails, fall through to the existing `fs::read`
-path (which maps its own errors) — we do not turn a stat failure into a refusal.
+New `OpenError::TooLarge { label, size: Option<u64>, limit }` variant (`size: None` when only
+the bounded-read tripwire fired), with a `#[error]` Display like the existing binary/symlink
+refusals (e.g. `"{label}: too large (> {limit} bytes)"`). The existing error-kind mapping for
+`fs::read` is preserved by reusing it on the `File::open`/`read_to_end` errors. (The current
+`open` uses `fs::read`; this changes it to `File::open` + bounded `read_to_end`, preserving
+the same downstream binary/dir/utf-8 handling on the resulting `bytes`.)
 
 ### 3. Undo byte budget (core `history.rs`)
 
-- `ChangeSet::stored_bytes(&self) -> usize` — sum of the byte lengths of the `Insert`
-  payloads (the only heap-held text; `Retain`/`Delete` are counts). This is the memory a
-  changeset actually holds.
+- `ChangeSet::stored_bytes(&self) -> usize` — sum of the byte lengths of the `Insert(Tendril)`
+  payloads. A *delete*'s text is held in the revision's *inverse* (as an `Insert`), so summing
+  both `changes.stored_bytes()` and `inverse.stored_bytes()` captures insert AND delete text.
+  (The `Vec<Op>` structural overhead of `Retain(usize)`/`Delete(usize)` is excluded as
+  negligible vs. the payload text — this is a memory budget on the dominant cost.)
 - `History` gains `bytes: usize` (running total of all retained revisions' stored bytes)
   and `last_evicted: usize` (revisions dropped on the most recent commit; reset to 0 each
   commit when nothing is dropped).
 - A `Revision`'s cost = Σ over its `edits` of `changes.stored_bytes() + inverse.stored_bytes()`.
-- `commit` / `commit_coalescing`: after recording the new (or coalesced) revision, update
-  `bytes`; while `bytes > MAX_UNDO_BYTES` **and** `revisions.len() > 1`, pop the oldest
-  revision, subtract its cost, and increment `last_evicted`. **Coalescing caveat:** when
-  `commit_coalescing` merges into the existing last revision, recompute that revision's cost
-  (subtract its old cost, add the new) so `bytes` stays accurate.
+- **Maintaining `bytes` correctly across the redo-tail truncation.** `commit` and the
+  non-merge `commit_coalescing` path discard the redo tail with
+  `self.revisions.truncate(self.current)` (history.rs:67, :132). The byte total MUST subtract
+  the truncated revisions' costs BEFORE pushing the new one — sum `revisions[current..]`
+  costs and subtract, then truncate, then push and add the new revision's cost. Otherwise
+  `bytes` drifts permanently high and evicts unnecessarily.
+- **Coalescing-merge path:** when `commit_coalescing` merges into the existing last revision
+  (rather than pushing), recompute that revision's cost (subtract its old cost, add the new)
+  so `bytes` stays accurate.
+- **Eviction — and the `History.current` invariant (the load-bearing fix).** Eviction runs
+  immediately AFTER a commit, where `current == revisions.len()` (the commit truncated any
+  tail, pushed, and did `current += 1`, so all revisions are "applied"). While
+  `bytes > MAX_UNDO_BYTES` **and** `revisions.len() > 1`: `remove(0)` the oldest revision,
+  subtract its cost, **`current -= 1`**, and increment `last_evicted`. The `current -= 1` is
+  mandatory: `undo`/`redo` index `revisions[current]`/`revisions[current-1]` (history.rs:79-99),
+  so dropping a front revision without shifting `current` down would leave `current` pointing
+  past the shortened vector and corrupt the next undo/redo. Because eviction starts at
+  `current == len` and keeps ≥1 revision, `current` stays in `[1, len]` and consistent.
 - The shell, immediately after submitting the edit, reads
   `editor.active().document.history.last_evicted` and — when `> 0` — sets the one-time status
   hint `"Undo history full — oldest dropped"`. (The shell's edit path is
   `editor.rs:183`'s `document.history.commit_coalescing(...)`; the field is a direct read
   right after, not polling.)
 
-### 4. Search match cap (`search_overlay.rs`)
+### 4. Search match cap (core `search::all_matches` + `search_overlay.rs`)
 
-The match collector stops once it has gathered `MAX_SEARCH_MATCHES`, and records that it
-was capped:
-- Add a `capped: bool` to the search cache (set when collection hit the ceiling).
+The cap must be enforced **inside the collector** (core `all_matches`, `search.rs:52-73`,
+which currently pushes every match to EOF) — a post-hoc length check would not bound the
+peak `Vec<Match>` allocation. So:
+- Core: `all_matches` takes a `limit: usize` and stops collecting once it has `limit`
+  matches, returning whether it was capped (e.g. `-> (Vec<Match>, bool)`, or a small
+  `Matches { items, capped }`). The shell passes `crate::limits::MAX_SEARCH_MATCHES`.
+- Shell (`SearchState::recompute`, search_overlay.rs:92-101): store the returned `capped`
+  flag in the search cache alongside `matches`.
 - Navigation (next/prev/wrap) operates over the capped set unchanged.
 - The search status/echo indicates `"first 100000 matches"` (or similar) when `capped`.
 
-### 5. Session size cap (`state.rs::save_in`)
+### 5. Session size cap (scratch snapshot, `save_in`, and load)
 
-```rust
-pub fn save_in(&self, dir: &Path) -> std::io::Result<()> {
-    let mut text = toml::to_string(self).map_err(...)?;
-    if text.len() > crate::limits::MAX_SESSION_BYTES {
-        // The scratch buffer content is the only part that can be large. Drop it and
-        // re-serialize the (tiny) per-path metadata, so cursor positions still persist.
-        let trimmed = SessionState { scratch: None, ..self.clone() };
-        text = toml::to_string(&trimmed).map_err(...)?;
-        if text.len() > crate::limits::MAX_SESSION_BYTES {
-            return Ok(()); // metadata alone still over cap (shouldn't happen) → skip persist
-        }
-    }
-    // ... existing atomic write of `text` (file::save_atomic_bytes) unchanged ...
-}
-```
-The live scratch buffer is untouched — only its cross-session *persistence* is skipped when
-oversized. Session load already degrades gracefully (a missing/absent scratch → empty).
+Three points, so a large scratch is bounded *before* it is materialized, not just before it
+is written:
+
+- **At the scratch snapshot (`app.rs:2121-2127`).** Today the scratch rope is copied into a
+  `String` via `sb.document.buffer.to_string()` BEFORE persistence. Guard with the rope's
+  O(1) byte length first: if `sb.document.buffer.len_bytes() > MAX_SESSION_BYTES`, persist
+  the session with `scratch: None` (don't build the giant `String` at all). The live scratch
+  buffer is untouched — only its cross-session persistence is skipped.
+- **In `save_in` (`state.rs:81`), as a belt-and-suspenders cap on the serialized TOML.** If
+  `toml::to_string(self).len() > MAX_SESSION_BYTES`, re-serialize with `scratch: None`
+  (`SessionState { scratch: None, ..self.clone() }`) so the tiny per-path metadata still
+  persists; if even that exceeds the cap, skip the write (`Ok(())`). The atomic write
+  (`file::save_atomic_bytes`) is unchanged.
+- **On load (`state.rs::load_in`, ~:98-103).** Today it does
+  `std::fs::read_to_string(dir.join("session.toml"))` unbounded — a pre-existing or corrupt
+  oversized `session.toml` would slurp before parsing. Read it bounded (`File::open` +
+  `Read::take(MAX_SESSION_BYTES + 1).read_to_string`); if over cap, treat as absent → empty
+  session (the existing graceful-degradation path for a missing/unparseable session).
 
 ### 6. Transform output cap (`transform.rs`)
 
@@ -183,28 +224,53 @@ if out.len() > crate::limits::MAX_TRANSFORM_OUTPUT {
 ```
 New `TransformError::OutputTooLarge` (or reuse an existing output-error shape if present),
 rendered to the status line. Refuse — a truncated transform would be silent corruption.
+**Known limitation:** `run_transform` is in-process and materializes the full output `String`
+(`opts.format(input)`) before this check, so the cap refuses *applying* an over-cap result
+but does not prevent the formatter's transient allocation. That peak is acceptable because it
+is bounded by the input (a document region ≤ the open cap) plus the transform's bounded
+expansion — it is not unbounded. (A truly streaming transform cap is out of scope.)
 
-### 7. Filter output cap re-home (`filter.rs` + call sites)
+### 7. Filter output cap re-home (`app.rs` production builder)
 
-Replace the production `max_output: 1 << 20` defaults (the real call sites — `app.rs:674`
-and the filter builders) with `crate::limits::MAX_FILTER_OUTPUT` (64 MiB). **Leave the
-test-only small caps** (e.g. `max_output: 64`) that exist to exercise the cap behavior.
-This is a deliberate behavior change (a filter may now emit up to 64 MiB before being
-killed, vs 1 MiB) that fixes the spurious-refusal-on-large-docs bug.
+The **single production call site** is the filter-job builder at `app.rs:668-675`, which
+sets `max_output: 1 << 20`. Replace that with `crate::limits::MAX_FILTER_OUTPUT` (64 MiB).
+**Leave the test caps unchanged:** the intentionally tiny `max_output: 64` cap-behavior
+tests (`filter.rs:440-455`, `:460-486`) must stay 64; the ordinary `1 << 20` unit tests
+(`filter.rs:390-412`, `:501-509`) may stay or move to the constant — either is fine, they
+are not production. This is a deliberate behavior change (a filter may now emit up to 64 MiB
+before being killed, vs 1 MiB) that fixes the spurious-refusal-on-large-docs bug. The
+filter output replaces a selection via the normal (M2) edit boundary; a 64 MiB replacement
+is a large-but-bounded ChangeSet and undo revision — no new pipeline issue.
 
-### 8. Paste const re-home (`clipboard.rs`)
+### 8. Paste const re-home (`limits.rs` canonical, `clipboard.rs` re-export)
 
-Re-point `clipboard.rs`'s `PASTE_MAX_BYTES` / `OSC52_MAX_ENCODED` to `limits.rs` (values
-unchanged) so every quota is in one place. Pure auditability; no behavior change.
+Define `PASTE_MAX_BYTES` / `OSC52_MAX_ENCODED` canonically in `limits.rs` and re-export them
+from `clipboard.rs` (`pub use crate::limits::{PASTE_MAX_BYTES, OSC52_MAX_ENCODED};`). Values
+unchanged. The re-export means existing `crate::clipboard::PASTE_MAX_BYTES` call sites
+(`app.rs:699-703`, `:2443-2444`) keep compiling with ZERO churn while the canonical
+definition lives in the audit module. Pure auditability; no behavior change.
+
+### 9. Swap / recovery load cap (`swap.rs`)
+
+The startup recovery path reads swap files unbounded — `find_orphan_scratch_swap` reads each
+candidate with `read_to_string(entry.path())` (swap.rs:176-188) and normal recovery reads the
+swap with `read_to_string(&sp)` (swap.rs:241). A pre-existing or corrupt oversized swap file
+would slurp on launch. Bound both reads (`File::open` + `Read::take(MAX_OPEN_BYTES + 1)
+.read_to_string`); a swap that exceeds the cap is treated as **absent/unrecoverable** — the
+existing graceful path (no recovery offered, `OpenNormally`/skip), never a crash or hang. A
+new `MAX_SWAP_BYTES` could be introduced, but reusing `MAX_OPEN_BYTES` (a swap holds a
+document-body snapshot + a small header) keeps the bound consistent with the document
+ceiling.
 
 ## Error handling
 
 - `OpenError::TooLarge` and `TransformError::OutputTooLarge` → status line, like the
   existing binary/symlink/filter refusals. No partial document/result is produced.
 - Degrade paths never error: undo evicts (with the one-time `last_evicted` hint), search
-  caps collection (with a "first N" indication), session skips/trims persistence silently.
-- The open size-guard's metadata read is best-effort — a stat failure falls through to the
-  existing read path, never a spurious refusal.
+  caps collection (with a "first N" indication), session skips/trims persistence silently,
+  an over-cap swap is treated as absent (no recovery offered).
+- The open guard's metadata pre-check is a fast path only; correctness rests on the bounded
+  `Read::take` so a stat failure or a lying-metadata file can never slurp unbounded.
 
 ## Data flow (unchanged in the common case)
 
@@ -222,10 +288,15 @@ single enforcement point above with the specified refuse/degrade behavior.
 - **Undo:** `ChangeSet::stored_bytes` returns the inserted-byte count; committing revisions
   past `MAX_UNDO_BYTES` evicts oldest, keeps ≥1, and `last_evicted` reports the count; a
   single over-budget revision is retained (keep-latest); coalescing keeps `bytes` accurate.
-- **Search:** a buffer with > `MAX_SEARCH_MATCHES` hits caps the vector at the ceiling and
-  sets `capped`; navigation still works.
+  **Critically:** after eviction, `undo` then `redo` round-trip correctly (proves `current`
+  was decremented per eviction — the index invariant); and a commit that truncates a redo
+  tail subtracts the truncated bytes (no drift).
+- **Search:** a buffer with > `MAX_SEARCH_MATCHES` hits caps the collected vector at the
+  ceiling (assert `len == MAX_SEARCH_MATCHES`, not more — proves the cap is in the collector)
+  and sets `capped`; navigation still works.
 - **Session:** an over-cap scratch is dropped but per-path metadata still persists; a
-  normal session round-trips unchanged.
+  normal session round-trips unchanged; an over-cap `session.toml` on load → empty session.
+- **Swap:** an over-cap swap file on recovery is treated as absent (no recovery, no slurp).
 - **Transform:** an over-cap transform output → `TransformError::OutputTooLarge`, document
   unchanged.
 - **Filter:** a filter producing > 1 MiB but < 64 MiB now SUCCEEDS (pins the raised cap);
@@ -241,21 +312,35 @@ single enforcement point above with the specified refuse/degrade behavior.
   is where their quota will live; M5 only establishes the module + the current surfaces.
 - The **fuzz harness itself** (M7) — M5 only provides the caps that make it safe.
 - Tightening the existing **paste** cap or **export** cap (left at their current values).
+- **A hard ceiling on the cumulative live document.** M5 bounds every *load* path (open,
+  session, swap) and every *single-operation* output (filter, transform, paste). It does NOT
+  impose a hard cap on the total in-memory document, which can still grow via many accepted
+  edits (repeated pastes/filters) — and operations that scale with document size (render,
+  layout, diagnostics' `snapshot().to_string()` at diagnostics_run.rs:53) scale with it. A
+  hard live-document ceiling would require a check on every accepted edit and belongs in the
+  edit-submission boundary (M2 territory), not in M5's load/output caps.
 
 ## New code surface (checklist for the plan)
 
 - `wordcartel/src/limits.rs` (new): the shell consts (open/filter/transform/search/session
-  + re-homed paste).
+  + canonical paste consts).
 - `wordcartel/src/lib.rs`: `pub mod limits;`.
 - `wordcartel-core` (`history.rs` or a core consts location): `MAX_UNDO_BYTES`;
   `ChangeSet::stored_bytes`; `History.{bytes, last_evicted}`; eviction in
-  `commit`/`commit_coalescing` (incl. the coalescing recompute).
-- `wordcartel/src/file.rs`: `OpenError::TooLarge` + the pre-read size guard in `open`.
+  `commit`/`commit_coalescing` — incl. **`current -= 1` per eviction**, the **redo-tail
+  truncation byte subtraction**, and the coalescing-merge recompute.
+- `wordcartel-core/src/search.rs`: `all_matches` gains a `limit` param + capped signal.
+- `wordcartel/src/file.rs`: `OpenError::TooLarge { label, size: Option<u64>, limit }` + the
+  metadata fast-check **and bounded `File::open`+`Read::take`** read in `open` (replacing
+  `fs::read`), preserving the downstream binary/dir/utf-8 handling.
 - `wordcartel/src/transform.rs`: `TransformError::OutputTooLarge` + the post-run size check.
-- `wordcartel/src/search_overlay.rs`: collection cap + `capped` flag + status indication.
-- `wordcartel/src/state.rs`: the over-cap drop-scratch-then-skip logic in `save_in`.
-- `wordcartel/src/filter.rs` + `app.rs`: re-point production `max_output` defaults to
-  `MAX_FILTER_OUTPUT` (leave test-only small caps).
-- `wordcartel/src/clipboard.rs`: re-point paste consts to `limits.rs`.
-- The shell-side one-time "undo history full" hint reading `History.last_evicted`.
+- `wordcartel/src/search_overlay.rs`: pass `MAX_SEARCH_MATCHES` to `all_matches`, store the
+  `capped` flag, status indication.
+- `wordcartel/src/state.rs`: over-cap drop-scratch in `save_in` + **bounded `load_in` read**.
+- `wordcartel/src/app.rs`: the scratch-snapshot `len_bytes()` guard (~:2121); re-point the
+  filter builder `max_output` (`:668-675`) to `MAX_FILTER_OUTPUT`; the shell-side one-time
+  "undo history full" hint reading `History.last_evicted`.
+- `wordcartel/src/swap.rs`: bounded reads in `find_orphan_scratch_swap` (~:176-188) and the
+  recovery read (~:241); over-cap → treated as absent.
+- `wordcartel/src/clipboard.rs`: `pub use` re-export of the paste consts from `limits.rs`.
 - Tests per the testing strategy.
