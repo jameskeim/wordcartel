@@ -115,7 +115,7 @@ pub fn open(path: &Path) -> Result<String, OpenError> {
     // (a) Fast refusal when metadata is trustworthy (gives an exact size in the error).
     if let Ok(meta) = fs::metadata(path) {
         if meta.is_file() && meta.len() > crate::limits::MAX_OPEN_BYTES {
-            return Err(OpenError::TooLarge { label, size: Some(meta.len()), limit: crate::limits::MAX_OPEN_BYTES });
+            return Err(OpenError::TooLarge(label, crate::limits::MAX_OPEN_BYTES));
         }
     }
     // (b) Bounded read: read at most MAX_OPEN_BYTES + 1 bytes. If we got the extra byte,
@@ -128,7 +128,7 @@ pub fn open(path: &Path) -> Result<String, OpenError> {
             std::io::Read::take(f, limit + 1).read_to_end(&mut bytes)
                 .map_err(/* existing IO/NotFound/Permission/IsDir mapping */)?;
             if bytes.len() as u64 > limit {
-                return Err(OpenError::TooLarge { label, size: None, limit });
+                return Err(OpenError::TooLarge(label, limit));
             }
         }
         Err(e) => return Err(/* existing kind mapping (NotFound/Permission/IsDir/Io) */),
@@ -136,12 +136,11 @@ pub fn open(path: &Path) -> Result<String, OpenError> {
     // ... existing is_dir / is_binary (NUL + utf-8) checks + String::from_utf8 on `bytes` ...
 }
 ```
-New `OpenError::TooLarge { label, size: Option<u64>, limit }` variant (`size: None` when only
-the bounded-read tripwire fired), with a `#[error]` Display like the existing binary/symlink
-refusals (e.g. `"{label}: too large (> {limit} bytes)"`). The existing error-kind mapping for
-`fs::read` is preserved by reusing it on the `File::open`/`read_to_end` errors. (The current
-`open` uses `fs::read`; this changes it to `File::open` + bounded `read_to_end`, preserving
-the same downstream binary/dir/utf-8 handling on the resulting `bytes`.)
+New `OpenError::TooLarge(String, u64)` variant (label, limit) — tuple form to match the existing
+tuple/string `OpenError` variants — with a `#[error("{0}: too large (> {1} bytes)")]` Display. The
+existing error-kind mapping for `fs::read` is preserved by reusing it on the `File::open`/`read_to_end`
+errors. (The current `open` uses `fs::read`; this changes it to `File::open` + bounded `read_to_end`,
+preserving the same downstream binary/dir/utf-8 handling on the resulting `bytes`.)
 
 ### 3. Undo byte budget (core `history.rs`)
 
@@ -332,7 +331,7 @@ single enforcement point above with the specified refuse/degrade behavior.
 - `wordcartel-core/src/search.rs`: `all_matches` gains a `limit` param + capped signal —
   update its in-module test call sites (`search.rs:209-295`) to pass the limit (e.g.
   `usize::MAX` where the test doesn't exercise the cap).
-- `wordcartel/src/file.rs`: `OpenError::TooLarge { label, size: Option<u64>, limit }` + the
+- `wordcartel/src/file.rs`: `OpenError::TooLarge(String, u64)` + the
   metadata fast-check **and bounded `File::open`+`Read::take`** read in `open` (replacing
   `fs::read`), preserving the downstream binary/dir/utf-8 handling.
 - `wordcartel/src/transform.rs`: `TransformError::OutputTooLarge` + the post-run size check.

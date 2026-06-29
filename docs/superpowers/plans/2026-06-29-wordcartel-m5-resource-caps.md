@@ -113,14 +113,15 @@ fn filter_output_above_old_1mib_cap_succeeds_under_new_cap() {
         timeout: std::time::Duration::from_secs(10),
         max_output: crate::limits::MAX_FILTER_OUTPUT,
     };
-    // Use the existing filter run harness (mirror the neighboring cap tests' call shape).
-    let out = run_filter_for_test(&spec, &input); // adapt to the real test helper name
+    // Real harness (mirrors the neighboring cap tests at filter.rs:431): run_filter(&spec, input, &cancel).
+    let out = run_filter(&spec, &input, &CancelFlag::new());
     assert!(out.is_ok(), "2 MiB output must succeed under the 64 MiB cap");
     assert_eq!(out.unwrap().len(), input.len());
 }
 ```
-Adapt the call to the real filter test harness used by the `max_output: 64` cap tests. Run it,
-watch it pass (the harness uses `MAX_FILTER_OUTPUT`, not `1 << 20`).
+Confirm the exact `run_filter` signature + `CancelFlag` ctor against the neighboring `max_output: 64`
+cap tests (filter.rs:431); mirror their call shape exactly. The point is that the spec uses
+`MAX_FILTER_OUTPUT` (64 MiB), so 2 MiB output no longer trips the cap.
 
 - [ ] **Step 6: Re-point the production builder**
 
@@ -289,7 +290,7 @@ Rewrite the body after `after` is computed (`history.rs:127-143`):
             top.last_ms = now;
             new = revision_bytes(top);
         }
-        self.bytes = self.bytes + new - old; // merged revision grew by (new-old)
+        self.bytes = self.bytes - old + new; // subtract-then-add avoids any underflow path
     } else {
         let tail: usize = self.revisions[self.current..].iter().map(revision_bytes).sum();
         self.bytes = self.bytes.saturating_sub(tail);
@@ -316,20 +317,30 @@ file) or assert via `hist.bytes`.
 
 Run: `cargo test -p wordcartel-core --lib history change` → all green.
 
-- [ ] **Step 7: Shell hint in `Editor::apply` — failing test first**
+- [ ] **Step 7: Shell hint in `Editor::apply` (scoped) — failing test first**
 
-`Editor::apply` (`editor.rs:635`) is the choke point and owns `self.status`. After the inner apply
-delegates to the active buffer (which runs `commit_coalescing`), surface the hint:
+`Editor::apply` (`editor.rs:635`) is the command/typing edit path (called from commands.rs) and owns
+`self.status`; it delegates to the active buffer's `Buffer::apply` (which runs `commit_coalescing`).
+**Scope note:** `Editor::apply` is NOT the universal mutation choke point — `transform`/`filter` merges
+call `Buffer::apply` (editor.rs:179) directly, bypassing it. We scope the hint to `Editor::apply` on
+purpose: sustained TYPING (the coalescing path) is what realistically accumulates 64 MiB of undo and
+triggers eviction; a single transform/filter merge that happens to evict simply won't show the hint
+(the eviction itself still happens correctly — `last_evicted` is set, just not surfaced). This is an
+acceptable scope for a polish hint; do NOT duplicate the hook into `Buffer::apply` (which has no access
+to `Editor.status`).
+
+After the inner apply runs inside `Editor::apply`:
 ```rust
-// after the active buffer's apply has run inside Editor::apply:
 if self.active().document.history.last_evicted > 0 {
     self.status = "Undo history full — oldest dropped".to_string();
 }
 ```
-Shell test (in `editor.rs` tests): drive enough large edits through `Editor::apply` to force eviction,
-assert `editor.status` contains "Undo history full". (If a full 64 MiB×N edit is too slow for a unit
-test, this assertion can live in the core eviction test via `last_evicted`, and the shell test just
-checks the status wiring with a smaller forced case — keep it fast.)
+Shell test (in `editor.rs` tests): the core eviction test already proves `last_evicted` is set; here
+just prove the WIRING — force a small eviction through `Editor::apply` (commit a few tiny edits, but
+the const budget makes a real eviction heavy). Keep it fast: assert that after a NON-evicting edit
+`editor.status` does NOT get the hint (i.e. the guard `last_evicted > 0` is respected), and rely on the
+core test for the eviction-true branch. If a fast eviction-true shell assertion is feasible, add it;
+otherwise document that the true-branch is covered by the core `last_evicted` test.
 
 - [ ] **Step 8: Gates + commit**
 
@@ -413,9 +424,11 @@ pub fn open(path: &Path) -> Result<String, OpenError> {
 }
 ```
 Extract the existing `match e.kind() { NotFound/PermissionDenied/_ => IsDir-or-Io }` logic
-(`file.rs:63-84`) into a small `fn map_open_io_err(e, label, path) -> OpenError` reused by both
-`File::open` and `read_to_end` errors, preserving today's exact mapping (including the `is_dir()`
-disambiguation). `read_to_string` needs `use std::io::Read;` in scope.
+(`file.rs:63-84`) verbatim into a small `fn map_open_io_err(e: std::io::Error, label: &str, path: &Path) -> OpenError`
+reused by both the `File::open` and `read_to_end` error sites. It MUST preserve BOTH `is_dir()`
+disambiguation sites — the one in the `NotFound` arm (a dir can surface as NotFound on some FS) AND the
+one in the catch-all `_` arm — exactly as today, plus the post-read `if path.is_dir()` check and the
+`is_binary`/`from_utf8` cascade. `read_to_end` needs `use std::io::Read;` in scope.
 
 - [ ] **Step 4: Verify the existing open tests still pass + new one**
 
@@ -438,32 +451,49 @@ git commit -m "feat(m5): refuse opening files over MAX_OPEN_BYTES (bounded read,
 
 **Interfaces:**
 - Consumes: `crate::limits::MAX_SEARCH_MATCHES`.
-- Produces: `all_matches(rope: &Rope, m: &Matcher, limit: usize) -> Vec<Match>` (stops at `limit`).
+- Produces: `all_matches(rope: &Rope, m: &Matcher, limit: usize) -> (Vec<Match>, bool)` — at most
+  `limit` matches, plus a `capped` flag that is `true` ONLY when a match beyond `limit` exists
+  (exact: returns `false` when exactly `limit` matches exist).
 
 - [ ] **Step 1: Failing test (core)**
 
+`Matcher` is built via `compile` (search.rs:35) — there is no `Matcher::literal`. Use the real ctor:
 ```rust
 #[test]
-fn all_matches_stops_at_limit() {
+fn all_matches_stops_at_limit_and_reports_capped() {
     let rope = Rope::from_str(&"a ".repeat(1000)); // 1000 "a" matches
-    let m = Matcher::literal("a", CaseMode::Sensitive); // mirror the real Matcher ctor
-    let got = all_matches(&rope, &m, 10);
+    let m = compile("a", QueryMode::Literal, CaseMode::Sensitive).unwrap();
+    let (got, capped) = all_matches(&rope, &m, 10);
     assert_eq!(got.len(), 10, "must stop collecting at the limit");
+    assert!(capped, "more than 10 matches exist → capped");
+
+    let (all, capped2) = all_matches(&rope, &m, usize::MAX);
+    assert_eq!(all.len(), 1000);
+    assert!(!capped2, "collecting everything is not capped");
 }
 ```
+(Confirm the exact `QueryMode`/`CaseMode` variant names against search.rs:35; the call shape is the
+real `compile(needle, mode, case)`.)
 
-- [ ] **Step 2: Add the `limit` param**
+- [ ] **Step 2: Add the `limit` param + exact `capped` detection**
 
-`all_matches` (`search.rs:53`) gains `limit: usize` and breaks when full:
+`all_matches` (`search.rs:53`) gains `limit: usize` and returns `(matches, capped)`. The `capped`
+flag is exact — set only when a `(limit+1)`-th match is actually found (so exactly `limit` matches
+is NOT capped):
 ```rust
-pub fn all_matches(rope: &Rope, m: &Matcher, limit: usize) -> Vec<Match> {
+pub fn all_matches(rope: &Rope, m: &Matcher, limit: usize) -> (Vec<Match>, bool) {
     let mut out = Vec::new();
     let mut at = 0usize;
     let end = rope.len_bytes();
+    let mut capped = false;
     loop {
-        if out.len() >= limit { break; } // cap collection (bounds peak allocation)
         match next_from(rope, m, at) {
             Some(mm) => {
+                if out.len() == limit {
+                    // We already hold `limit` matches and another exists → capped; don't push it.
+                    capped = true;
+                    break;
+                }
                 let advance = if mm.end > mm.start { mm.end } else { next_boundary(rope, mm.end) };
                 out.push(mm);
                 if advance > end || advance <= at { break; }
@@ -472,30 +502,37 @@ pub fn all_matches(rope: &Rope, m: &Matcher, limit: usize) -> Vec<Match> {
             None => break,
         }
     }
-    out
+    (out, capped)
 }
 ```
 
 - [ ] **Step 3: Update the in-module test call sites**
 
-`search.rs:209/217/224/231/251/266/278/287/295` call `all_matches(&rope, &m)` — add `, usize::MAX`
-(these tests don't exercise the cap, so the unlimited behavior is preserved):
-e.g. `all_matches(&rope, &m, usize::MAX)`.
+`search.rs:209/217/224/231/251/266/278/287/295` call `all_matches(&rope, &m)` — change each to
+`all_matches(&rope, &m, usize::MAX).0` (these tests assert on the match vec; `usize::MAX` preserves
+the unlimited behavior and `.0` selects the vec). Run them to confirm green.
 
 - [ ] **Step 4: Shell — pass the cap + record `capped`**
 
-`search_overlay.rs:100`: `self.matches = search::all_matches(rope, &m, crate::limits::MAX_SEARCH_MATCHES);`
-Add a `capped: bool` to `SearchState`'s cache (near `matches: Vec<Match>`), set it right after:
-`self.capped = self.matches.len() >= crate::limits::MAX_SEARCH_MATCHES;`. Where the search echo/status
-is composed, append `" (first 100000)"` (or similar) when `capped`. Navigation is unchanged.
+`search_overlay.rs:100`:
+```rust
+let (matches, capped) = search::all_matches(rope, &m, crate::limits::MAX_SEARCH_MATCHES);
+self.matches = matches;
+self.capped = capped;
+self.matcher = Some(m);
+```
+Add a `capped: bool` field to `SearchState`'s cache (near `matches: Vec<Match>`, search_overlay.rs:26),
+default `false`, and reset it on every recompute (the `recompute` paths that clear `matches` must also
+clear `capped`). Where the search echo/status is composed, append `" (first 100000)"` (or similar)
+when `capped`. Navigation is unchanged.
 
 - [ ] **Step 5: Shell test**
 
-A `search_overlay` test (or extend an existing one): a buffer with > `MAX_SEARCH_MATCHES` matches
-caps `matches.len()` at the ceiling and sets `capped`; nav still works. (Use a small forced case if a
-100k-match buffer is too slow — assert against a temporarily small limit is NOT possible with a const,
-so assert the wiring with a buffer just over a feasible count, OR assert `capped` logic with a unit
-test on the `len >= limit` predicate.)
+A `search_overlay` test: feed a buffer with a feasible match count and a small enough document, assert
+`matches.len() == MAX_SEARCH_MATCHES` would require 100k matches (slow) — so instead assert the core
+contract directly (Step 1 covers the cap+capped logic) and add a lightweight shell test that
+`SearchState.capped` is wired from the returned flag (e.g. via a small helper or by checking that a
+recompute over a tiny buffer leaves `capped == false`). Keep it fast.
 
 - [ ] **Step 6: Gates + commit**
 
@@ -576,12 +613,13 @@ pub fn load_in(dir: &Path) -> SessionState {
 
 - [ ] **Step 4: `app.rs` scratch snapshot — guard before `to_string()`**
 
-At the scratch capture (`app.rs:2118-2128`), check the rope byte length first so a huge scratch is
-never materialized into a `String`:
+At the scratch capture (`app.rs:2118-2128`), check the buffer byte length first so a huge scratch is
+never materialized into a `String`. `TextBuffer::len()` returns `rope.len_bytes()` (buffer.rs:15) —
+use `len()`, NOT `len_bytes()` (no such method on the buffer):
 ```rust
 if let Some(sid) = editor.scratch_id {
     if let Some(sb) = editor.by_id(sid) {
-        if sb.document.buffer.len_bytes() <= crate::limits::MAX_SESSION_BYTES {
+        if sb.document.buffer.len() <= crate::limits::MAX_SESSION_BYTES {
             session.scratch = Some(crate::state::ScratchState {
                 text: sb.document.buffer.to_string(),
                 cursor: sb.document.selection.primary().head,
@@ -590,8 +628,6 @@ if let Some(sid) = editor.scratch_id {
     }
 }
 ```
-(Confirm the rope byte-length accessor name — `len_bytes()` on the buffer/rope; mirror how the buffer
-exposes length elsewhere.)
 
 - [ ] **Step 5: Gates + commit**
 
@@ -735,7 +771,7 @@ git commit -m "feat(m5): refuse applying transform output over MAX_TRANSFORM_OUT
 
 **Type consistency:** `MAX_*` consts referenced identically across tasks; `all_matches(.., limit)` updated at all call sites (prod + 9 tests) in Task 4; `OpenError::TooLarge(String, u64)` and `TransformError::OutputTooLarge { limit }` consistent between definition and tests; `History.{bytes,last_evicted}` and `ChangeSet::stored_bytes` defined in Task 2 before use.
 
-**Placeholder scan:** the filter test harness call (Task 1 Step 5) and the rope byte-length accessor (Task 5 Step 4) say "adapt to the real helper/accessor name" — the implementer must confirm these against the actual code; everything else is concrete.
+**Placeholder scan:** resolved against the real code (Codex plan review): filter harness is `run_filter(&spec, input, &CancelFlag::new())` (Task 1); buffer length is `TextBuffer::len()` not `len_bytes()` (Task 5); search ctor is `compile(needle, QueryMode::Literal, CaseMode::Sensitive)` not `Matcher::literal` (Task 4). The only remaining "confirm exact name" items are the `QueryMode`/`CaseMode` variant spellings and the `run_filter`/`CancelFlag` exact signature — both directly readable from the neighboring tests (search.rs:35, filter.rs:431).
 
 **Ordering:** Task 1 establishes the consts every later task imports. Tasks 2-7 are independent and each leaves the crate compiling + green.
 
