@@ -399,7 +399,7 @@ git commit -m "feat(m3): add fsx atomic-write seam + atomic_replace core"
 
 **Interfaces:**
 - Consumes: `atomic_replace`, `RealFs`, `Fs`, `WriteSync`, `ModePolicy`, `WriteOpts` (Task 1).
-- Produces: `#[cfg(test)] enum FaultAt { Create, Write { after: usize }, SetMode, Flush, Sync, Rename, SyncDir, Remove }` and `struct FaultFs { inner: RealFs, fail: FaultAt }` — test-only, not used outside this module.
+- Produces: `#[cfg(test)] enum FaultAt { Create, Write { after: usize }, SetMode, Flush, Sync, Rename, SyncDir }` and `struct FaultFs { inner: RealFs, fail: FaultAt }` — test-only, not used outside this module.
 
 - [ ] **Step 1: Write the FaultFs harness**
 
@@ -666,7 +666,13 @@ pub fn save_atomic_bytes(path: &Path, content: &[u8]) -> Result<(), SaveError> {
 
 - [ ] **Step 4: Delete the now-unused temp helpers from file.rs**
 
-Remove `TEMP_SEQ` (file.rs:107-108), `TempGuard` (110-123), `create_temp` (125-141), and `open_excl` (143-157) — they live in `fsx` now. Remove the now-unused imports `use std::sync::atomic::{AtomicU32, Ordering};` (line 8) and `use std::io::Write as IoWrite;` (line 6) — both were only used by the deleted helpers (the tests import their own atomics at file.rs:288). **Keep `use std::path::{Path, PathBuf};` UNCHANGED** — the test module still uses `PathBuf` in `scratch_path` via `use super::*` (file.rs:290-300), so narrowing it would break the tests. After the edits, grep file.rs to confirm `AtomicU32`/`Ordering`/`IoWrite` have no remaining top-level references and `PathBuf` still does (through the test glob).
+Remove `TEMP_SEQ` (file.rs:107-108), `TempGuard` (110-123), `create_temp` (125-141), and `open_excl` (143-157) — they live in `fsx` now. Remove the now-unused imports `use std::sync::atomic::{AtomicU32, Ordering};` (line 8) and `use std::io::Write as IoWrite;` (line 6) — both were only used by the deleted helpers (the tests import their own atomics at file.rs:288).
+
+**Move `PathBuf` into the test module.** After the deletions and the `save_atomic`/`save_atomic_bytes` rewrites, NO production code in file.rs references `PathBuf` anymore (the dir/name resolution moved into `fsx::atomic_replace`). A top-level `use std::path::PathBuf` would then be unused during `cargo build` (which does NOT compile `#[cfg(test)]` modules) → fatal under `-D warnings`. So:
+- Change the top-level import (file.rs:7) to `use std::path::Path;` (drop `PathBuf`).
+- Add `use std::path::PathBuf;` INSIDE the `#[cfg(test)] mod tests` block (near its existing `use super::*;` at file.rs:287), since `scratch_path` returns `PathBuf` (file.rs:290-300).
+
+After the edits, run `cargo build -p wordcartel 2>&1 | grep -i warning` (Step 5) to confirm `AtomicU32`/`Ordering`/`IoWrite`/`PathBuf` are all warning-free at top level, and `cargo test --no-run` to confirm the test module compiles with its own `PathBuf` import.
 
 - [ ] **Step 5: Run the file.rs tests + full crate build**
 
