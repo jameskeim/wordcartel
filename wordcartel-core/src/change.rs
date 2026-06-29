@@ -20,6 +20,15 @@ pub struct ChangeSet {
     len_after: usize,
 }
 
+/// Why an untrusted changeset was rejected against a specific buffer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EditError {
+    /// The changeset was built for a different document length than the buffer has.
+    StaleLength { expected: usize, actual: usize },
+    /// An op's byte boundary lands inside a multibyte char in the buffer.
+    OpBoundary { pos: usize },
+}
+
 // INVARIANT: all positions and lengths here are byte offsets into a single
 // in-memory document, so they are bounded by the document's byte length and fit a
 // `usize`. On the 64-bit targets Wordcartel supports, the length/position
@@ -108,6 +117,55 @@ impl ChangeSet {
     /// Document length this changeset expects before applying.
     pub fn len_before(&self) -> usize { self.len_before }
 
+    /// Validate this changeset against `buf` WITHOUT mutating. Length must match
+    /// (→ `StaleLength`), and every op's OLD-text byte boundaries must be char
+    /// boundaries in `buf` (→ `OpBoundary`) — so a later `apply` cannot panic partway.
+    /// Returns the FIRST violation; `Ok(())` means `apply(buf)` is panic-safe.
+    ///
+    /// Unlike `from_ops` (the per-keystroke hot path), this function is the
+    /// untrusted-edit boundary and ENFORCES position bounds: every `old_pos`/`end`
+    /// value passed to `is_char_boundary` is guaranteed `<= len` via checked
+    /// arithmetic. An op whose cumulative position overflows or exceeds `len` is
+    /// rejected as `OpBoundary` — an out-of-range position is, trivially, not a
+    /// valid char boundary. `from_ops` is NOT the right place for this check
+    /// because it runs on the per-keystroke hot path from trusted callers whose
+    /// positions are bounded by ~5 MB (spec §3.9).
+    pub fn validate_against(&self, buf: &TextBuffer) -> Result<(), EditError> {
+        let len = buf.len();
+        if self.len_before != len {
+            return Err(EditError::StaleLength { expected: self.len_before, actual: len });
+        }
+        let mut old_pos: usize = 0;
+        for op in &self.ops {
+            match op {
+                Op::Retain(n) => {
+                    // Reject overflow OR past-end BEFORE any is_char_boundary call.
+                    // Malformed plugin ChangeSets (e.g. Retain(usize::MAX)) whose
+                    // cumulative position wraps past `len` in release builds are caught
+                    // here at the untrusted boundary, not in from_ops (hot path).
+                    old_pos = match old_pos.checked_add(*n) {
+                        Some(p) if p <= len => p,
+                        _ => return Err(EditError::OpBoundary { pos: old_pos.saturating_add(*n) }),
+                    };
+                }
+                Op::Delete(n) => {
+                    if !buf.is_char_boundary(old_pos) { return Err(EditError::OpBoundary { pos: old_pos }); }
+                    let end = match old_pos.checked_add(*n) {
+                        Some(p) if p <= len => p,
+                        _ => return Err(EditError::OpBoundary { pos: old_pos.saturating_add(*n) }),
+                    };
+                    if !buf.is_char_boundary(end) { return Err(EditError::OpBoundary { pos: end }); }
+                    old_pos = end;
+                }
+                Op::Insert(_) => {
+                    if !buf.is_char_boundary(old_pos) { return Err(EditError::OpBoundary { pos: old_pos }); }
+                    // old_pos unchanged: insert adds to the NEW text, not the OLD.
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Produce the inverse changeset. Needs the *original* buffer to recover the
     /// bytes a Delete removed (re-emitted as an Insert).
     pub fn invert(&self, original: &TextBuffer) -> ChangeSet {
@@ -190,6 +248,16 @@ pub fn map_pos_before(pos: usize, cs: &ChangeSet) -> usize {
         }
     }
     new + pos.saturating_sub(old)
+}
+
+/// Test-only bypass: create a ChangeSet without the sum-invariant check.
+/// Allows building adversarial ChangeSets (e.g. ops that overflow or exceed
+/// len_before) to verify validate_against's out-of-range defences.
+#[cfg(test)]
+impl ChangeSet {
+    pub(crate) fn from_ops_unchecked(ops: Vec<Op>, len_before: usize, len_after: usize) -> Self {
+        ChangeSet { ops, len_before, len_after }
+    }
 }
 
 #[cfg(test)]
@@ -368,6 +436,86 @@ mod tests {
         assert_eq!(map_pos_before(4, &cs_mid), 4);
     }
 
+    // ── Task 1 (M2): validate_against tests ──────────────────────────────────
+
+    #[test]
+    fn validate_against_ok_for_matching_valid_changeset() {
+        use super::*;
+        let buf = TextBuffer::from_str("hello"); // len 5
+        let cs = ChangeSet::insert(2, "X", 5);    // built for len 5, boundary 2 is valid
+        assert!(cs.validate_against(&buf).is_ok());
+    }
+
+    #[test]
+    fn validate_against_stale_length() {
+        use super::*;
+        let buf = TextBuffer::from_str("hello"); // len 5
+        let cs = ChangeSet::insert(0, "X", 3);    // built for len 3 ≠ 5
+        assert_eq!(cs.validate_against(&buf), Err(EditError::StaleLength { expected: 3, actual: 5 }));
+    }
+
+    #[test]
+    fn validate_against_delete_end_mid_char() {
+        use super::*;
+        // doc "é" = 2 bytes (0xC3 0xA9); a Delete(1) ends at byte 1 (mid-char).
+        let buf = TextBuffer::from_str("é"); // len 2
+        let cs = ChangeSet::from_ops(vec![Op::Delete(1), Op::Retain(1)], 2); // sum-valid
+        assert_eq!(cs.validate_against(&buf), Err(EditError::OpBoundary { pos: 1 }));
+    }
+
+    #[test]
+    fn validate_against_insert_mid_char() {
+        use super::*;
+        let buf = TextBuffer::from_str("é"); // len 2
+        // Retain(1) lands old_pos at byte 1 (mid-é), then Insert there.
+        let cs = ChangeSet::from_ops(vec![Op::Retain(1), Op::Insert(Tendril::from("x")), Op::Retain(1)], 2);
+        assert_eq!(cs.validate_against(&buf), Err(EditError::OpBoundary { pos: 1 }));
+    }
+
+    /// M2 gate §11.2 — overflow/out-of-range defence.
+    ///
+    /// Before the fix, Retain(n) added `n` to `old_pos` unchecked, then the next
+    /// Insert/Delete called `buf.is_char_boundary(old_pos)` with an out-of-range
+    /// index → ropey's `byte_to_char` panics. After the fix, checked arithmetic
+    /// in `validate_against` catches the violation and returns `Err(OpBoundary)`
+    /// without touching ropey.
+    ///
+    /// `from_ops_unchecked` bypasses the sum-invariant assert so we can build
+    /// adversarial ops in debug builds (where `from_ops`'s overflow would itself
+    /// panic before we could even test the boundary).
+    #[test]
+    fn validate_against_rejects_overflowing_ops() {
+        let buf = TextBuffer::from_str("hello"); // len 5
+
+        // Case A: position exceeds len (Retain(6) on a len-5 buffer).
+        // Old code: old_pos=6, then is_char_boundary(6) panics (6 > len_bytes=5).
+        // Fixed code: 6 > len (5) → Err(OpBoundary { pos: 6 }), no ropey call.
+        let cs_a = ChangeSet::from_ops_unchecked(
+            vec![Op::Retain(6), Op::Insert(Tendril::from("X"))],
+            5, // len_before matches buf → passes the length check
+            6,
+        );
+        assert_eq!(cs_a.validate_against(&buf), Err(EditError::OpBoundary { pos: 6 }));
+
+        // Case B: genuine arithmetic overflow (Retain(usize::MAX)).
+        // Old code in release: wraps to a garbage old_pos, then is_char_boundary panics.
+        // Fixed code: checked_add overflows → None → Err(OpBoundary), no ropey call.
+        let cs_b = ChangeSet::from_ops_unchecked(
+            vec![Op::Retain(usize::MAX), Op::Insert(Tendril::from("X"))],
+            5,
+            6,
+        );
+        assert!(matches!(cs_b.validate_against(&buf), Err(EditError::OpBoundary { .. })));
+
+        // Case C: Delete whose end would overflow.
+        let cs_c = ChangeSet::from_ops_unchecked(
+            vec![Op::Delete(usize::MAX)],
+            5,
+            6,
+        );
+        assert!(matches!(cs_c.validate_against(&buf), Err(EditError::OpBoundary { .. })));
+    }
+
     use proptest::prelude::*;
 
     proptest! {
@@ -493,6 +641,47 @@ mod tests {
             inv.apply(&mut b);
             prop_assert_eq!(b.to_string(), text,
                 "round-trip failed: c1={} d={} ins={:?} c2={}", c1, d, ins, c2);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        /// The load-bearing guarantee: if `validate_against` returns Ok, then `apply`
+        /// NEVER panics and yields exactly `len_after`. (If Err, nothing is applied.)
+        #[test]
+        fn validated_changeset_applies_without_panic(
+            doc in proptest::collection::vec(
+                proptest::sample::select(vec!['a', 'é', '中', '🙂', '\n']), 0..24usize
+            ).prop_map(|cs| cs.into_iter().collect::<String>()),
+            claimed_len in 0usize..28,
+            is_delete in proptest::bool::ANY,
+            p1 in 0usize..28,
+            p2 in 0usize..28,
+            text in proptest::string::string_regex("[aé中]{0,4}").unwrap(),
+        ) {
+            use super::*;
+            let buf = TextBuffer::from_str(&doc);
+            // Build a SUM-VALID changeset (valid-by-construction via M1's insert/delete)
+            // for `claimed_len` — which may NOT match the buffer (→ StaleLength) and whose
+            // positions may land mid-char in the buffer (→ OpBoundary). insert/delete assert
+            // their offset ≤ claimed_len, so keep positions in range of claimed_len.
+            let cs = if is_delete {
+                let a = p1 % (claimed_len + 1);
+                let b = p2 % (claimed_len + 1);
+                ChangeSet::delete(a.min(b)..a.max(b), claimed_len)
+            } else {
+                let at = p1 % (claimed_len + 1);
+                ChangeSet::insert(at, &text, claimed_len)
+            };
+            match cs.validate_against(&buf) {
+                Ok(()) => {
+                    let mut b = buf.clone();
+                    cs.apply(&mut b);                       // must NOT panic
+                    prop_assert_eq!(b.len(), cs.len_after());
+                }
+                Err(_) => { /* rejected — buffer never touched */ }
+            }
         }
     }
 }
