@@ -3,9 +3,7 @@
 // Added: symlink refusal, skip-unchanged, mode preservation (#[cfg(unix)]).
 
 use std::fs;
-use std::io::Write as IoWrite;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Public error / outcome types
@@ -101,62 +99,6 @@ pub fn open(path: &Path) -> Result<String, OpenError> {
 }
 
 // ---------------------------------------------------------------------------
-// Tempfile helpers — ported from repar/src/atomic.rs, adapted for cross-platform
-// ---------------------------------------------------------------------------
-
-/// Monotonic counter: with pid produces a process-unique + call-unique temp name.
-static TEMP_SEQ: AtomicU32 = AtomicU32::new(0);
-
-/// Guards a temp path, removing it on drop unless disarmed.
-struct TempGuard(Option<PathBuf>);
-impl TempGuard {
-    fn disarm(&mut self) {
-        self.0 = None;
-    }
-}
-impl Drop for TempGuard {
-    fn drop(&mut self) {
-        if let Some(p) = &self.0 {
-            let _ = fs::remove_file(p);
-        }
-    }
-}
-
-/// Create an O_EXCL temp file in `dir`. Unique name via pid + monotonic counter.
-/// On Unix the file is created owner-only (0o600) via OpenOptionsExt::mode.
-fn create_temp(dir: &Path, name: &str) -> std::io::Result<(fs::File, PathBuf)> {
-    let pid = std::process::id();
-    let mut counter = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    loop {
-        let temp = dir.join(format!(".{name}.wcartel-{pid}-{counter}.tmp"));
-        let result = open_excl(&temp);
-        match result {
-            Ok(f) => return Ok((f, temp)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                counter = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-// Platform-specific O_EXCL open with 0o600 mode on Unix; plain create_new on other platforms.
-#[cfg(unix)]
-fn open_excl(temp: &Path) -> std::io::Result<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(temp)
-}
-
-#[cfg(not(unix))]
-fn open_excl(temp: &Path) -> std::io::Result<fs::File> {
-    fs::OpenOptions::new().write(true).create_new(true).open(temp)
-}
-
-// ---------------------------------------------------------------------------
 // save_atomic
 // ---------------------------------------------------------------------------
 
@@ -174,63 +116,18 @@ pub fn save_atomic(path: &Path, content: &str) -> Result<SaveOutcome, SaveError>
         }
     }
 
-    // (3) Capture existing mode on Unix before we write anything.
-    #[cfg(unix)]
-    let existing_mode: Option<u32> = {
-        use std::os::unix::fs::PermissionsExt;
-        fs::metadata(path).ok().map(|m| m.permissions().mode())
-    };
-
-    // Resolve parent directory (fall back to "." for bare filenames).
-    let dir = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-
-    // Create temp file (O_EXCL, owner-only on Unix).
-    let (mut file, temp) = create_temp(&dir, &name).map_err(|e| SaveError::Io(e.to_string()))?;
-    let mut guard = TempGuard(Some(temp.clone()));
-
-    // Write content.
-    file.write_all(content.as_bytes())
-        .map_err(|e| SaveError::Io(e.to_string()))?;
-
-    // (4) Mode preservation — apply original mode to the temp before rename (#[cfg(unix)]).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = existing_mode.unwrap_or(0o600);
-        file.set_permissions(fs::Permissions::from_mode(mode))
-            .map_err(|e| SaveError::Io(e.to_string()))?;
-    }
-
-    // fsync the file content+metadata BEFORE the rename.
-    file.flush().map_err(|e| SaveError::Io(e.to_string()))?;
-    file.sync_all().map_err(|e| SaveError::Io(e.to_string()))?;
-
-    // Atomic replace (same-dir temp → same filesystem → rename is atomic).
-    fs::rename(&temp, path).map_err(|e| SaveError::Io(e.to_string()))?;
-
-    // Disarm the guard: the temp file has been renamed away, so there is nothing
-    // left to clean up regardless of what happens next.
-    guard.disarm();
-
-    // fsync the parent directory so the rename entry is durable.
-    // On macOS this is a no-op for platter durability (F_FULLFSYNC needed there),
-    // but atomicity (rename) still holds.
-    // IMPORTANT: we propagate dir-fsync failures as SaveError::Io so the caller
-    // does NOT clear the dirty flag — the buffer remains dirty for a retry.
-    // The TempGuard is already disarmed above; the temp was renamed, so there
-    // is nothing to roll back here.
-    if let Ok(dir_fh) = fs::File::open(&dir) {
-        dir_fh.sync_all().map_err(|e| SaveError::Io(e.to_string()))?;
-    }
+    // (3) Commit through the shared fault-tested core. Mode is preserved from the
+    // existing target (else 0600); dir-fsync after rename for durability.
+    crate::fsx::atomic_replace(
+        &crate::fsx::RealFs,
+        path,
+        content.as_bytes(),
+        crate::fsx::WriteOpts {
+            mode: crate::fsx::ModePolicy::PreserveExistingOr(0o600),
+            dir_fsync: true,
+        },
+    )
+    .map_err(|e| SaveError::Io(e.to_string()))?;
 
     Ok(SaveOutcome::Saved)
 }
@@ -241,41 +138,16 @@ pub fn save_atomic(path: &Path, content: &str) -> Result<SaveOutcome, SaveError>
 // ---------------------------------------------------------------------------
 
 pub fn save_atomic_bytes(path: &Path, content: &[u8]) -> Result<(), SaveError> {
-    // Resolve parent directory (fall back to "." for bare filenames).
-    let dir = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-
-    // Create temp file (O_EXCL, owner-only on Unix).
-    let (mut file, temp) = create_temp(&dir, &name).map_err(|e| SaveError::Io(e.to_string()))?;
-    let mut guard = TempGuard(Some(temp.clone()));
-
-    // Write bytes.
-    file.write_all(content).map_err(|e| SaveError::Io(e.to_string()))?;
-
-    // fsync the file content+metadata BEFORE the rename.
-    file.flush().map_err(|e| SaveError::Io(e.to_string()))?;
-    file.sync_all().map_err(|e| SaveError::Io(e.to_string()))?;
-
-    // Atomic replace.
-    fs::rename(&temp, path).map_err(|e| SaveError::Io(e.to_string()))?;
-
-    // Disarm the guard: the temp file has been renamed away.
-    guard.disarm();
-
-    // fsync the parent directory so the rename entry is durable.
-    if let Ok(dir_fh) = fs::File::open(&dir) {
-        dir_fh.sync_all().map_err(|e| SaveError::Io(e.to_string()))?;
-    }
-
-    Ok(())
+    crate::fsx::atomic_replace(
+        &crate::fsx::RealFs,
+        path,
+        content,
+        crate::fsx::WriteOpts {
+            mode: crate::fsx::ModePolicy::Fixed(0o600),
+            dir_fsync: true,
+        },
+    )
+    .map_err(|e| SaveError::Io(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +157,7 @@ pub fn save_atomic_bytes(path: &Path, content: &[u8]) -> Result<(), SaveError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     // Unique scratch path: pid + monotonic counter + a label.
