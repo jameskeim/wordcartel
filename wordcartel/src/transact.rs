@@ -47,7 +47,7 @@ pub fn submit_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wordcartel_core::change::{ChangeSet, Op, Tendril};
+    use wordcartel_core::change::{ChangeSet, Op};
     struct C(u64);
     impl Clock for C { fn now_ms(&self) -> u64 { self.0 } }
 
@@ -92,6 +92,6 @@ mod tests {
         assert!(r.is_ok());
         assert_eq!(e.active().document.buffer.to_string(), "Xhi\n");
         let head = e.active().document.selection.primary().head;
-        assert!(head <= 4, "cursor snapped into [0, len_after]; got {head}");
+        assert_eq!(head, 4, "cursor snapped to end of [0, len_after]");
     }
 }
