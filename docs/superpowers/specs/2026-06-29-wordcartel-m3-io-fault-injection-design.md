@@ -75,9 +75,12 @@ pub(crate) trait Fs {
 ```
 `RealFs` is a zero-size unit (`Send`) delegating to `std::fs` exactly as today
 (`OpenOptions::create_new(true).mode(0600)`, `write_all`, `flush`,
-`set_permissions(from_mode(..))`, `sync_all`, `fs::rename`, `File::open(dir).sync_all()`,
-`fs::remove_file`; `existing_mode` = `fs::metadata(path).ok().map(|m| m.permissions().mode())`).
-Trait-object (`&dyn Fs`) + boxed `WriteSync` handle — no associated types (so `&dyn Fs` works).
+`set_permissions(from_mode(..))`, `sync_all`, `fs::rename`, `fs::remove_file`;
+`existing_mode` = `fs::metadata(path).ok().map(|m| m.permissions().mode())`).
+**`RealFs::sync_dir` matches today's dir-open swallow** (file.rs:231-232, 273-275):
+`File::open(dir)` → `Ok(f) => f.sync_all()`, `Err(_) => Ok(())` — a dir that can't be opened
+is NOT an error (only a successful-open `sync_all` failure propagates). Trait-object
+(`&dyn Fs`) + boxed `WriteSync` handle — no associated types (so `&dyn Fs` works).
 
 **Threading model (pinned).** `RealFs` is constructed **locally at each call site**:
 `save_atomic` / `save_atomic_bytes` / `write_atomic` each instantiate `RealFs` and call
@@ -103,11 +106,11 @@ pub(crate) enum ModePolicy {
 }
 pub(crate) struct WriteOpts { pub mode: ModePolicy, pub dir_fsync: bool }
 
-/// Create-temp(O_EXCL,0600) → write_all → [resolve mode → set_mode] → flush → fsync →
-/// rename → [dir-fsync], with TempGuard cleanup of the temp on ANY failure. The single
-/// durability-critical sequence; all three primitives route their commit here. Never
-/// leaves a temp behind on failure; never half-replaces the target (rename is the
-/// all-or-nothing commit).
+/// [resolve PreserveExistingOr mode-read] → create-temp(O_EXCL,0600) → write_all →
+/// set_mode → flush → fsync → rename → [dir-fsync], with TempGuard cleanup of the temp on
+/// ANY failure. The single durability-critical sequence; all three primitives route their
+/// commit here. Never leaves a temp behind on failure; never half-replaces the target
+/// (rename is the all-or-nothing commit).
 pub(crate) fn atomic_replace(
     fs: &dyn Fs,
     final_path: &std::path::Path,
@@ -115,19 +118,26 @@ pub(crate) fn atomic_replace(
     opts: WriteOpts,
 ) -> std::io::Result<()>;
 ```
-- **Mode step (matches `save_atomic` today).** Temp is always created `0600` (O_EXCL).
-  After `write_all`, the final mode is resolved from `opts.mode`: `Fixed(m)` → `m`;
-  `PreserveExistingOr(f)` → `fs.existing_mode(final_path).unwrap_or(f)` (best-effort
-  metadata read of the original, which is untouched until rename — a failed read just
-  falls back, exactly as today's `fs::metadata(path).ok()`). Then `handle.set_mode(mode)`
-  **before** `flush`/`sync_all`/`rename` — the same ordering as file.rs today. `set_mode`
-  is a seam call, so it is fault-injectable.
+- **Mode step (matches `save_atomic` today, including order).** For `PreserveExistingOr(f)`,
+  the metadata read `fs.existing_mode(final_path).unwrap_or(f)` happens **at the start of
+  `atomic_replace`, before temp creation** — matching today's `save_atomic`, which captures
+  `existing_mode` before `create_temp` (file.rs:177-182), so the chmod-race window is
+  identical (a failed read just falls back, exactly as today's `fs::metadata(path).ok()`).
+  `Fixed(m)` needs no read → `m`. The temp is always created `0600` (O_EXCL); then after
+  `write_all`, `handle.set_mode(resolved)` is applied **before** `flush`/`sync_all`/`rename`
+  — the same ordering as file.rs today (lines 204-218). `set_mode` is a seam call, so it is
+  fault-injectable.
 - Temp name unifies to one O_EXCL scheme (e.g. `.{name}.wcartel-{pid}-{counter}.tmp`) in
   the target's parent dir. (Internal/transient; safe to unify across the three.) **Note:**
   this **intentionally changes `swap::write_atomic`'s collision behavior** from "one fixed
   `.{name}.tmp-{pid}` name, fail on a pre-existing temp" to the counter-retry scheme — a
   deliberate robustness improvement, not a regression. `find_orphan_scratch_swap` globs
   final `scratch-*.swp` names, **not** temp names, so orphan detection is unaffected.
+  **Also intentional:** `swap::write_atomic` today has **no `TempGuard`** — a write/flush/
+  sync failure leaves its temp behind (swap.rs:198-212). Routing it through `atomic_replace`
+  gives it the same `TempGuard` cleanup as the file-save paths, so swap inherits the
+  no-litter guarantee. This is an improvement, not a behavior a test should pin to the old
+  (litter-on-failure) semantics.
 - `TempGuard` (RAII) removes the temp via `fs.remove_file` on any early return; disarmed
   only after a successful `rename` (the temp is gone after rename anyway).
 - `file::save_atomic` (→ `PreserveExistingOr(0o600)`, `dir_fsync: true`),
@@ -194,9 +204,13 @@ Swap/session/recovery writes likewise route their commit through `atomic_replace
 
 ## Error handling
 
-Every `atomic_replace` failure returns `Err` with the real `io::Error`, mapped by each
-caller to its existing error type. No failure is swallowed; no partial replace; no temp
-litter. A failed save therefore keeps the buffer dirty (no false "saved").
+Every `atomic_replace` failure on a data-loss-critical op (create/write/set_mode/flush/
+sync/rename) returns `Err` with the real `io::Error`, mapped by each caller to its existing
+error type. No partial replace; no temp litter. A failed save therefore keeps the buffer
+dirty (no false "saved"). The **one** non-erroring case is a dir that can't be opened for
+`sync_dir`, which `RealFs` swallows (`Ok(())`) exactly as today — a successful-open
+`sync_all` failure still propagates as `Err` (the pinned dir-fsync semantics). `FaultFs::SyncDir`
+still returns `Err` to exercise the propagation path.
 
 ## Testing strategy
 
