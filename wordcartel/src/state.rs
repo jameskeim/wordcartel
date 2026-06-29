@@ -5,6 +5,7 @@
 // the file on disk at resume time; a mismatch → discard (never restore stale state).
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::Path;
 use serde::{Deserialize, Serialize};
 
@@ -77,16 +78,21 @@ impl SessionState {
     }
 
     /// Serialize to TOML and write atomically to `dir/session.toml`.
-    /// Propagates serialization errors — does NOT silently drop state.
+    /// Oversized scratch is dropped before writing; if metadata alone is still over cap,
+    /// skip the write entirely (graceful). Propagates serialization errors.
     pub fn save_in(&self, dir: &Path) -> std::io::Result<()> {
-        let text = toml::to_string(self).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("session serialize: {e}"),
-            )
-        })?;
+        let mut text = toml::to_string(self)
+            .map_err(|e| std::io::Error::other(format!("session serialize: {e}")))?;
+        if text.len() > crate::limits::MAX_SESSION_BYTES {
+            let trimmed = SessionState { scratch: None, ..self.clone() };
+            text = toml::to_string(&trimmed)
+                .map_err(|e| std::io::Error::other(format!("session serialize: {e}")))?;
+            if text.len() > crate::limits::MAX_SESSION_BYTES {
+                return Ok(()); // metadata alone over cap (shouldn't happen) → skip persist
+            }
+        }
         crate::file::save_atomic_bytes(&dir.join("session.toml"), text.as_bytes())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            .map_err(|e| std::io::Error::other(e.to_string()))
     }
 
     /// Save to the real XDG state dir.
@@ -95,12 +101,17 @@ impl SessionState {
     }
 }
 
-/// Load from a specific directory (testable variant). Corrupt/missing → empty.
+/// Load from a specific directory (testable variant). Corrupt/missing/over-cap → empty.
+/// The read is bounded at MAX_SESSION_BYTES+1 so a huge file is never fully slurped.
 pub fn load_in(dir: &Path) -> SessionState {
-    match std::fs::read_to_string(dir.join("session.toml")) {
-        Ok(t) => toml::from_str(&t).unwrap_or_default(),
-        Err(_) => SessionState::default(),
+    let path = dir.join("session.toml");
+    let Ok(f) = std::fs::File::open(&path) else { return SessionState::default() };
+    let mut text = String::new();
+    let cap = crate::limits::MAX_SESSION_BYTES as u64;
+    if f.take(cap + 1).read_to_string(&mut text).is_err() || text.len() as u64 > cap {
+        return SessionState::default(); // unreadable or over-cap → empty (graceful)
     }
+    toml::from_str(&text).unwrap_or_default()
 }
 
 /// Load from the real XDG state dir. Corrupt/missing → empty.
@@ -277,5 +288,27 @@ seq = 1
         assert!(out.contains("[scratch]"), "serializes as [scratch] table");
         let back: SessionState = toml::from_str(&out).unwrap();
         assert_eq!(back.scratch.unwrap().text, "stash\n\nmore");
+    }
+
+    #[test]
+    fn save_in_drops_oversized_scratch_keeps_metadata() {
+        let d = tmp();
+        let mut s = SessionState::default();
+        s.entries.insert("/a".into(), StateEntry {
+            cursor: 0, scroll: 0, marks: Default::default(),
+            mtime: 1, size: 1, seq: 1, folds: vec![], block: None,
+        });
+        s.scratch = Some(ScratchState { text: "x".repeat(crate::limits::MAX_SESSION_BYTES + 1), cursor: 0 });
+        s.save_in(&d).unwrap();
+        let back = load_in(&d);
+        assert!(back.scratch.is_none(), "oversized scratch dropped");
+        assert!(back.entries.contains_key("/a"), "metadata still persisted");
+    }
+
+    #[test]
+    fn load_in_over_cap_returns_empty() {
+        let d = tmp();
+        std::fs::write(d.join("session.toml"), "x".repeat(crate::limits::MAX_SESSION_BYTES + 1)).unwrap();
+        assert!(load_in(&d).entries.is_empty(), "over-cap session.toml → empty");
     }
 }

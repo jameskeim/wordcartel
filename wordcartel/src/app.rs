@@ -2120,12 +2120,15 @@ fn persist_session(
     seq: u64,
 ) {
     // Effort 6: capture scratch content first, independent of the active buffer.
+    // M5: guard on byte length — never materialize a huge String for persistence.
     if let Some(sid) = editor.scratch_id {
         if let Some(sb) = editor.by_id(sid) {
-            session.scratch = Some(crate::state::ScratchState {
-                text: sb.document.buffer.to_string(),
-                cursor: sb.document.selection.primary().head,
-            });
+            if sb.document.buffer.len() <= crate::limits::MAX_SESSION_BYTES {
+                session.scratch = Some(crate::state::ScratchState {
+                    text: sb.document.buffer.to_string(),
+                    cursor: sb.document.selection.primary().head,
+                });
+            } // else: leave session.scratch = None (live buffer untouched; only persistence skipped)
         }
     }
     // Per-file entry for the active buffer (unchanged): only when it has a real,
