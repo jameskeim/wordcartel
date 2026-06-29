@@ -202,21 +202,18 @@ pub(crate) fn atomic_replace(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    let (mut handle, temp) = create_temp(fs, &dir, &name)?;
+    let (handle, temp) = create_temp(fs, &dir, &name)?;
     let mut guard = TempGuard {
         fs,
         path: Some(temp.clone()),
     };
 
-    // The temp is created 0600 (create_temp) and only widened to `final_mode` AFTER the
-    // content is written. So even when preserving a 0644 target, the bytes are never
-    // momentarily group-/world-readable during the write. Do NOT reorder set_mode before
-    // write_all — that would open a readable window on the partially-written temp.
-    handle.write_all(bytes)?;
-    handle.set_mode(final_mode)?;
-    handle.flush()?;
-    handle.sync_all()?;
-    drop(handle); // close the temp before rename (consistent across all paths; required on Windows)
+    // write_and_sync CONSUMES the handle, so the temp file is closed at its frame exit on
+    // EVERY path — success or an early `?`-failure. That ordering matters: TempGuard::drop
+    // (which fires on a pre-rename failure, since `guard` is still armed) must unlink a
+    // CLOSED file, not an open one. Unlinking an open file works on Unix but fails on
+    // Windows, so closing first keeps cleanup correct on every path, not just before rename.
+    write_and_sync(handle, bytes, final_mode)?;
 
     fs.rename(&temp, final_path)?;
     guard.disarm(); // temp renamed away; nothing to clean up regardless of what follows
@@ -225,6 +222,18 @@ pub(crate) fn atomic_replace(
         fs.sync_dir(&dir)?;
     }
     Ok(())
+}
+
+/// Write the content, widen the mode, flush, and fsync — consuming the handle so it is
+/// closed at return on every path. The temp is created 0600 (create_temp) and only widened
+/// to `mode` AFTER the content is written, so the bytes are never momentarily group-/
+/// world-readable during the write. Do NOT reorder set_mode before write_all — that would
+/// open a readable window on the partially-written temp.
+fn write_and_sync(mut handle: Box<dyn WriteSync>, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+    handle.write_all(bytes)?;
+    handle.set_mode(mode)?;
+    handle.flush()?;
+    handle.sync_all()
 }
 
 #[cfg(test)]
