@@ -121,6 +121,7 @@ impl ChangeSet {
     /// (→ `StaleLength`), and every op's OLD-text byte boundaries must be char
     /// boundaries in `buf` (→ `OpBoundary`) — so a later `apply` cannot panic partway.
     /// Returns the FIRST violation; `Ok(())` means `apply(buf)` is panic-safe.
+    /// This panic-freedom assumes the ChangeSet's sum invariant (sum(Retain)+sum(Delete) == len_before) — which the public constructors guarantee — so old_pos never exceeds buf.len() and is_char_boundary/ropey's byte_to_char is never called out of range.
     pub fn validate_against(&self, buf: &TextBuffer) -> Result<(), EditError> {
         if self.len_before != buf.len() {
             return Err(EditError::StaleLength { expected: self.len_before, actual: buf.len() });
@@ -569,6 +570,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
         /// The load-bearing guarantee: if `validate_against` returns Ok, then `apply`
         /// NEVER panics and yields exactly `len_after`. (If Err, nothing is applied.)
         #[test]
