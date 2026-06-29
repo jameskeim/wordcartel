@@ -1810,7 +1810,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
                    | file::OpenError::Binary(_)
                    | file::OpenError::Permission(_)
                    | file::OpenError::IsDir(_)
-                   | file::OpenError::Io(_))) => {
+                   | file::OpenError::Io(_)
+                   | file::OpenError::TooLarge(..))) => {
                 editor.status = e.to_string();
             }
         }
