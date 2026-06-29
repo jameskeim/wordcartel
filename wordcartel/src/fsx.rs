@@ -208,6 +208,10 @@ pub(crate) fn atomic_replace(
         path: Some(temp.clone()),
     };
 
+    // The temp is created 0600 (create_temp) and only widened to `final_mode` AFTER the
+    // content is written. So even when preserving a 0644 target, the bytes are never
+    // momentarily group-/world-readable during the write. Do NOT reorder set_mode before
+    // write_all — that would open a readable window on the partially-written temp.
     handle.write_all(bytes)?;
     handle.set_mode(final_mode)?;
     handle.flush()?;
@@ -320,11 +324,21 @@ mod tests {
         assert_eq!(m, 0o600, "absent target must land on the fallback mode");
     }
 
+    /// RealFs::sync_dir swallows an un-openable directory (Err(_) => Ok(())) — pins the
+    /// PRODUCTION side of the dir-fsync semantic (the FaultFs::SyncDir test only covers the
+    /// Err-propagation path). An existing dir syncs Ok; a missing dir is NOT an error.
+    #[test]
+    fn real_fs_sync_dir_swallows_unopenable() {
+        let dir = private_dir("syncdir");
+        RealFs.sync_dir(&dir).expect("existing dir must sync Ok");
+        let missing = dir.join("does-not-exist");
+        assert!(RealFs.sync_dir(&missing).is_ok(), "un-openable dir must be swallowed to Ok");
+    }
+
     // ---------------------------------------------------------------------------
     // FaultFs harness — fault-injectable Fs/WriteSync for durability tests
     // ---------------------------------------------------------------------------
 
-    use std::cell::Cell;
     use std::io::{Error, ErrorKind};
 
     // Note: no `Remove` variant. `remove_file` is only ever called by TempGuard::drop on a
@@ -354,7 +368,6 @@ mod tests {
     struct FaultHandle {
         inner: Box<dyn WriteSync>,
         fail: FaultAt,
-        written: Cell<usize>,
     }
 
     impl WriteSync for FaultHandle {
@@ -363,7 +376,6 @@ mod tests {
                 // Write `after` real bytes to the temp, then fail with ENOSPC-like error.
                 let n = after.min(buf.len());
                 self.inner.write_all(&buf[..n])?;
-                self.written.set(self.written.get() + n);
                 return Err(Error::new(ErrorKind::WriteZero, "injected: storage full"));
             }
             self.inner.write_all(buf)
@@ -394,7 +406,7 @@ mod tests {
                 return Err(Error::other("injected: create"));
             }
             let inner = self.inner.create_excl(path, mode)?;
-            Ok(Box::new(FaultHandle { inner, fail: self.fail, written: Cell::new(0) }))
+            Ok(Box::new(FaultHandle { inner, fail: self.fail }))
         }
         fn existing_mode(&self, path: &Path) -> Option<u32> { self.inner.existing_mode(path) }
         fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
