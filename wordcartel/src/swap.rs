@@ -5,7 +5,6 @@ use crate::editor::Editor;
 use crate::jobs::{Job, JobKind, JobResult, ResultClass};
 use crate::registry::Ctx;
 use std::io;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// FNV-1a 64-bit — stable across Rust versions (unlike DefaultHasher), no dep.
@@ -194,32 +193,16 @@ fn find_orphan_scratch_swap_in(dir: &std::path::Path) -> Option<(std::path::Path
     best
 }
 
-/// Atomic 0600 write into our own state dir (no symlink/skip-unchanged logic).
+/// Atomic 0600 write into our own state dir (no symlink/skip-unchanged logic, no
+/// dir-fsync). Routes through the shared fault-tested core, inheriting its
+/// TempGuard cleanup (this path previously left a temp behind on write failure).
 pub fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = dir.join(format!(
-        ".{}.tmp-{}",
-        path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-        std::process::id()
-    ));
-    {
-        let mut f = open_excl_0600(&tmp)?;
-        f.write_all(content.as_bytes())?;
-        f.flush()?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn open_excl_0600(p: &Path) -> io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(p)
-}
-#[cfg(not(unix))]
-fn open_excl_0600(p: &Path) -> io::Result<std::fs::File> {
-    std::fs::OpenOptions::new().write(true).create_new(true).open(p)
+    crate::fsx::atomic_replace(
+        &crate::fsx::RealFs,
+        path,
+        content.as_bytes(),
+        crate::fsx::WriteOpts { mode: crate::fsx::ModePolicy::Fixed(0o600), dir_fsync: false },
+    )
 }
 
 pub fn build_header(editor: &Editor, body: &str, ts_ms: u64) -> SwapHeader {

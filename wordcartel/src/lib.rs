@@ -11,6 +11,7 @@ pub mod render;
 pub mod term;
 pub mod prompt;
 pub mod file;
+pub mod fsx;
 pub mod jobs;
 pub mod save;
 pub mod app;   // App::run + the testable App::step (Task 12)
