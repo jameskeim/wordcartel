@@ -5,6 +5,7 @@ use crate::editor::Editor;
 use crate::jobs::{Job, JobKind, JobResult, ResultClass};
 use crate::registry::Ctx;
 use std::io;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 /// FNV-1a 64-bit — stable across Rust versions (unlike DefaultHasher), no dep.
@@ -163,6 +164,16 @@ fn pid_is_live(_pid: u32) -> bool {
     false // best-effort elsewhere: treat as not-live → offer recovery
 }
 
+/// Read a swap file, refusing (None) if it exceeds the cap — never slurp unbounded.
+fn read_swap_capped(path: &std::path::Path) -> Option<String> {
+    let f = std::fs::File::open(path).ok()?;
+    let cap = crate::limits::MAX_OPEN_BYTES;
+    let mut s = String::new();
+    std::io::Read::take(f, cap + 1).read_to_string(&mut s).ok()?;
+    if s.len() as u64 > cap { return None; }
+    Some(s)
+}
+
 /// Find an orphaned scratch swap from a previous (non-live) process, if any.
 /// Scratch swaps are pid-keyed; after a crash the new session won't find its
 /// own. Skip our own pid and live pids; return the newest valid non-empty
@@ -184,7 +195,7 @@ fn find_orphan_scratch_swap_in(dir: &std::path::Path) -> Option<(std::path::Path
             .and_then(|s| s.parse::<u32>().ok());
         let Some(pid) = pid else { continue };
         if pid == me || pid_is_live(pid) { continue; }
-        let raw = match std::fs::read_to_string(entry.path()) { Ok(s) => s, Err(_) => continue };
+        let Some(raw) = read_swap_capped(&entry.path()) else { continue };
         let Some((header, body)) = parse(&raw) else { continue };
         if body.is_empty() { continue; }
         let newer = match &best { Some((_, h, _)) => header.ts_ms > h.ts_ms, None => true };
@@ -238,7 +249,7 @@ pub enum RecoveryDecision {
 /// `current_file_bytes` is `Some` when the doc path exists on disk, else `None`.
 pub fn assess(doc_path: Option<&Path>, current_file_bytes: Option<&[u8]>) -> RecoveryDecision {
     let sp = match swap_path(doc_path) { Ok(p) => p, Err(_) => return RecoveryDecision::OpenNormally };
-    let raw = match std::fs::read_to_string(&sp) { Ok(s) => s, Err(_) => return RecoveryDecision::OpenNormally };
+    let Some(raw) = read_swap_capped(&sp) else { return RecoveryDecision::OpenNormally };
     let (header, body) = match parse(&raw) {
         Some(x) => x,
         None => return RecoveryDecision::Prompt(
@@ -301,6 +312,14 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
+
+    fn scratch() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "wc-scratch-{}-{}.md",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ))
+    }
 
     #[test]
     fn fnv_is_stable_and_distinguishes() {
@@ -513,6 +532,16 @@ mod tests {
         let _ = std::fs::remove_file(&orphan_path);
         let _ = std::fs::remove_file(&my_path);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn assess_over_cap_swap_opens_normally() {
+        // Write an oversized swap at the doc's swap path; recovery must NOT slurp → OpenNormally.
+        let p = scratch(); // a doc path
+        let sp = swap_path(Some(&p)).unwrap();
+        std::fs::write(&sp, "x".repeat(crate::limits::MAX_OPEN_BYTES as usize + 1)).unwrap();
+        assert!(matches!(assess(Some(&p), None), RecoveryDecision::OpenNormally));
+        let _ = std::fs::remove_file(&sp);
     }
 
     #[test]
