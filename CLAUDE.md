@@ -87,14 +87,27 @@ Style and quality standards for all code in this repo. Items marked **GATE** mus
 before merge.
 
 **GATEs (before any merge):**
-- `cargo test` green; `cargo build` and `cargo test --no-run` warning-free.
-- `cargo clippy --all-targets -- -D warnings` clean. (`-D warnings` lives in the CI/gate,
-  never `#![deny(warnings)]` in source.)
-- `cargo fmt --check` clean.
+- `cargo test` green across all suites (`wordcartel-core` lib + oracle, `wordcartel` lib).
+- `cargo build` and `cargo test --no-run` warning-free for the crate(s) you touched.
+- **No new clippy warnings in the files you touched.** Do NOT gate on a clean
+  `cargo clippy --all-targets -- -D warnings` over the whole workspace — the codebase
+  carries pre-existing clippy debt (tracked as its own pre-Effort-P cleanup). Check your
+  own diff: `cargo clippy -p <crate>` and confirm none of the new findings point at lines
+  you added or changed.
+- New code matches the surrounding **house style** (see below) by review.
 
-**Style:** snake_case fns/vars/modules, PascalCase types/traits, SCREAMING_SNAKE_CASE
-consts; 4-space indent; 100-char lines (rustfmt default). No emoji or emoji-like unicode in
-code — the only exception is tests exercising multibyte text (we test with `é` / `中` / `🙂`).
+**Formatting — do NOT run `cargo fmt`.** This repo is hand-formatted in a deliberate dense
+style and has **no `rustfmt.toml`**; `cargo fmt` reformats the whole tree to rustfmt
+defaults (1000+ hunks), destroying the intentional style and blame. `cargo fmt --check` is
+therefore NOT a gate. Match the neighbors by hand instead: do not reflow code you did not
+otherwise change, and do not let an editor/agent auto-run rustfmt across files.
+
+**Style (house, not rustfmt-default):** snake_case fns/vars/modules, PascalCase
+types/traits, SCREAMING_SNAKE_CASE consts; 4-space indent; ~100-char lines but hand-wrapped
+with judgment (single-line struct literals / match arms are kept inline where they read
+better — do not explode them); imports grouped logically by hand (not rustfmt-reordered);
+`—` (em-dash) in prose comments, never `--`. No emoji or emoji-like unicode in code — the
+only exception is tests exercising multibyte text (we test with `é` / `中` / `🙂`).
 
 **Types & errors:** make struct fields private by default; expose accessors / validated
 constructors (see `ChangeSet`/`Selection`). Use newtypes for semantically distinct values
