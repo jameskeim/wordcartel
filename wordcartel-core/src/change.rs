@@ -32,55 +32,41 @@ pub struct ChangeSet {
 impl ChangeSet {
     /// Insert `text` at byte offset `at` in a document of length `doc_len`.
     ///
-    /// If `at > doc_len` the position is clamped to `doc_len` (safe in release;
-    /// the `debug_assert` fires in debug builds to catch caller bugs early).
+    /// Panics (release) if `at > doc_len`.
     pub fn insert(at: BytePos, text: &str, doc_len: usize) -> ChangeSet {
-        debug_assert!(at <= doc_len, "insert at {} past doc_len {}", at, doc_len);
-        let at = at.min(doc_len);
+        assert!(at <= doc_len, "insert at {} past doc_len {}", at, doc_len);
         let mut ops = Vec::new();
-        if at > 0 {
-            ops.push(Op::Retain(at));
-        }
+        if at > 0 { ops.push(Op::Retain(at)); }
         ops.push(Op::Insert(Tendril::from(text)));
-        if at < doc_len {
-            ops.push(Op::Retain(doc_len - at));
-        }
+        if at < doc_len { ops.push(Op::Retain(doc_len - at)); }
         ChangeSet { ops, len_before: doc_len, len_after: doc_len + text.len() }
     }
 
     /// Delete `range` (bytes) in a document of length `doc_len`.
     ///
     /// A reversed range (`range.start > range.end`) is normalized to the
-    /// equivalent forward range.  Either endpoint beyond `doc_len` is clamped.
-    /// The `debug_assert` fires in debug builds to catch caller bugs early;
-    /// release builds clamp silently.
+    /// equivalent forward range.  Panics (release) if `end > doc_len`.
     pub fn delete(range: Range<BytePos>, doc_len: usize) -> ChangeSet {
-        debug_assert!(
-            range.start <= range.end && range.end <= doc_len,
-            "delete range {:?} invalid for doc_len {}",
-            range,
-            doc_len
-        );
-        // Normalize: handle reversed range, then clamp both endpoints.
+        // Normalize a reversed range (head..anchor); then assert in-bounds.
         let start = range.start.min(range.end);
         let end = range.start.max(range.end);
-        let end = end.min(doc_len);
-        let start = start.min(end);
+        assert!(end <= doc_len, "delete end {} past doc_len {}", end, doc_len);
         let del_len = end - start;
         let mut ops = Vec::new();
-        if start > 0 {
-            ops.push(Op::Retain(start));
-        }
+        if start > 0 { ops.push(Op::Retain(start)); }
         ops.push(Op::Delete(del_len));
-        if end < doc_len {
-            ops.push(Op::Retain(doc_len - end));
-        }
+        if end < doc_len { ops.push(Op::Retain(doc_len - end)); }
         ChangeSet { ops, len_before: doc_len, len_after: doc_len - del_len }
     }
 
     /// Apply in place. O(edit size + #ops·log n): Retain only advances a cursor,
     /// so a single-key edit never copies the whole document.
     pub fn apply(&self, buf: &mut TextBuffer) {
+        assert!(
+            buf.len() == self.len_before,
+            "apply: buf.len() {} != len_before {}",
+            buf.len(), self.len_before
+        );
         let mut pos: BytePos = 0;
         for op in &self.ops {
             match op {
@@ -93,6 +79,34 @@ impl ChangeSet {
             }
         }
     }
+
+    /// Build a ChangeSet from raw ops over a document of length `len_before`.
+    /// Computes `len_after` from the ops; release-asserts the consumption invariant
+    /// `sum(Retain)+sum(Delete) == len_before`. (UTF-8 op-boundary correctness is NOT
+    /// checked here — there is no document; it stays enforced by TextBuffer's asserts in
+    /// `apply`.) Trusted-caller constructor; the future plugin path validates upstream.
+    pub fn from_ops(ops: Vec<Op>, len_before: usize) -> ChangeSet {
+        let (mut retain, mut delete, mut insert) = (0usize, 0usize, 0usize);
+        for op in &ops {
+            match op {
+                Op::Retain(n) => retain += n,
+                Op::Delete(n) => delete += n,
+                Op::Insert(s) => insert += s.len(),
+            }
+        }
+        assert!(
+            retain + delete == len_before,
+            "from_ops: retain+delete {} != len_before {}",
+            retain + delete, len_before
+        );
+        ChangeSet { ops, len_before, len_after: retain + insert }
+    }
+
+    /// Document length after this changeset applies.
+    pub fn len_after(&self) -> usize { self.len_after }
+
+    /// Document length this changeset expects before applying.
+    pub fn len_before(&self) -> usize { self.len_before }
 
     /// Produce the inverse changeset. Needs the *original* buffer to recover the
     /// bytes a Delete removed (re-emitted as an Insert).
@@ -240,30 +254,72 @@ mod tests {
         assert_eq!(fwd.to_string(), rev.to_string());
     }
 
-    /// `range.end` beyond `doc_len` clamps to `doc_len`.
-    /// Only runs in release mode; in debug mode the debug_assert tripwire fires first.
+    /// `range.end` beyond `doc_len` now panics (fail-fast, no clamping).
     #[test]
-    #[cfg(not(debug_assertions))]
+    #[should_panic(expected = "doc_len")]
     fn delete_range_end_beyond_doc_len_clamps() {
-        let mut b = TextBuffer::from_str("hello");
-        let len = b.len(); // 5
-        let cs = ChangeSet::delete(2..99, len); // end way past the end
-        cs.apply(&mut b);
-        assert_eq!(b.to_string(), "he"); // deleted bytes 2..5
-        assert_eq!(cs.len_after, 2);
+        let len = TextBuffer::from_str("hello").len(); // 5
+        let _ = ChangeSet::delete(2..99, len); // end way past the end → panic
     }
 
-    /// `at` beyond `doc_len` clamps to `doc_len` (appends).
-    /// Only runs in release mode; in debug mode the debug_assert tripwire fires first.
+    /// `at` beyond `doc_len` now panics (fail-fast, no clamping).
     #[test]
-    #[cfg(not(debug_assertions))]
+    #[should_panic(expected = "doc_len")]
     fn insert_at_beyond_doc_len_clamps() {
-        let mut b = TextBuffer::from_str("hello");
-        let len = b.len(); // 5
-        let cs = ChangeSet::insert(99, "!", len); // at way past the end
-        cs.apply(&mut b);
-        assert_eq!(b.to_string(), "hello!"); // appended
-        assert_eq!(cs.len_after, len + 1);
+        let len = TextBuffer::from_str("hello").len(); // 5
+        let _ = ChangeSet::insert(99, "!", len); // at way past the end → panic
+    }
+
+    // ── Task 1 (M1): new failing tests ────────────────────────────────────────
+
+    #[test]
+    fn from_ops_computes_len_after_and_accepts_valid() {
+        use super::*;
+        // doc "abc" (3), delete "b", insert "XY": Retain(1) Delete(1) Insert("XY") Retain(1)
+        let ops = vec![Op::Retain(1), Op::Delete(1), Op::Insert(Tendril::from("XY")), Op::Retain(1)];
+        let cs = ChangeSet::from_ops(ops, 3);
+        assert_eq!(cs.len_before(), 3);
+        assert_eq!(cs.len_after(), 4); // retain 2 + insert 2
+    }
+
+    #[test]
+    #[should_panic(expected = "len_before")]
+    fn from_ops_rejects_non_summing_ops() {
+        use super::*;
+        // Retain(1)+Delete(1) = 2, but len_before claimed 5.
+        let _ = ChangeSet::from_ops(vec![Op::Retain(1), Op::Delete(1), Op::Retain(1)], 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "len_before")]
+    fn apply_rejects_buffer_length_mismatch() {
+        use super::*;
+        let cs = ChangeSet::insert(0, "x", 3); // built for doc_len 3
+        let mut buf = TextBuffer::from_str("ab"); // len 2 ≠ 3
+        cs.apply(&mut buf);
+    }
+
+    #[test]
+    #[should_panic(expected = "doc_len")]
+    fn insert_panics_past_doc_len() {
+        use super::*;
+        let _ = ChangeSet::insert(10, "x", 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "doc_len")]
+    fn delete_panics_out_of_bounds() {
+        use super::*;
+        let _ = ChangeSet::delete(2..10, 3);
+    }
+
+    #[test]
+    fn delete_normalizes_reversed_in_bounds_range() {
+        use super::*;
+        // reversed but in-bounds: 3..1 on doc_len 5 → deletes [1,3)
+        let cs = ChangeSet::delete(3..1, 5);
+        assert_eq!(cs.len_before(), 5);
+        assert_eq!(cs.len_after(), 3); // deleted 2 bytes
     }
 
     #[test]
