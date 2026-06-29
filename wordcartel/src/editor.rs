@@ -634,6 +634,10 @@ impl Editor {
     // Thin delegators — external callers unchanged.
     pub fn apply(&mut self, txn: Transaction, edit: wordcartel_core::block_tree::Edit, kind: EditKind, clock: &dyn Clock) {
         self.active_mut().apply(txn, edit, kind, clock);
+        // Best-effort "louder" eviction hint (M5 Decision 5): only the command/keystroke path
+        // funnels through Editor::apply, so large buffer-level merges (filter/transform/paste,
+        // which call Buffer::apply directly) won't surface it — and they set their own status.
+        // The eviction itself is always enforced in core (History::evict_to); this is cosmetic.
         if self.active().document.history.last_evicted > 0 {
             self.status = "Undo history full — oldest dropped".to_string();
         }
