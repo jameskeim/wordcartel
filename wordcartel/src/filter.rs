@@ -498,6 +498,26 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn filter_output_above_old_1mib_cap_succeeds_under_new_cap() {
+        // Emit ~2 MiB through `cat`; with MAX_FILTER_OUTPUT (64 MiB) this must NOT hit the cap.
+        let input = "x".repeat(2 * 1024 * 1024);
+        let expected_len = input.len();
+        let spec = FilterSpec {
+            argv: vec!["cat".into()],
+            shell: false,
+            disposition: Disposition::Filter,
+            input: Input::SelectionElseBuffer,
+            timeout: std::time::Duration::from_secs(10),
+            max_output: crate::limits::MAX_FILTER_OUTPUT,
+        };
+        match run_filter(&spec, input, &CancelFlag::new()) {
+            RunResult::Stdout(ref s) => assert_eq!(s.len(), expected_len),
+            other => panic!("2 MiB output must succeed under the 64 MiB cap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn run_filter_rejects_non_utf8() {
         let spec = FilterSpec {
             argv: vec!["printf".into(), "\\xff".into()],

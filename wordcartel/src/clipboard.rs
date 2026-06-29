@@ -4,8 +4,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
-pub const OSC52_MAX_ENCODED: usize = 100_000;
-pub const PASTE_MAX_BYTES: usize = 8 * 1024 * 1024;
+pub use crate::limits::{OSC52_MAX_ENCODED, PASTE_MAX_BYTES};
 
 // ---------------------------------------------------------------------------
 // PasteIntent, ClipReq, next_paste_id

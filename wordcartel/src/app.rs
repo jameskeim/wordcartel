@@ -671,7 +671,7 @@ fn submit_filter_line(
         disposition: crate::filter::Disposition::Filter,
         input: crate::filter::Input::SelectionElseBuffer,
         timeout: std::time::Duration::from_secs(10),
-        max_output: 1 << 20,
+        max_output: crate::limits::MAX_FILTER_OUTPUT,
     };
     crate::filter::dispatch_filter(editor, spec, msg_tx.clone());
 }

@@ -5,6 +5,8 @@ use crate::change::ChangeSet;
 use crate::selection::Selection;
 
 pub const COALESCE_MS: u64 = 500;
+/// Undo-history memory budget: evict oldest revisions past this, always keeping ≥1 (M5).
+pub const MAX_UNDO_BYTES: usize = 64 * 1024 * 1024;
 
 pub trait Clock {
     fn now_ms(&self) -> u64;

@@ -11,6 +11,7 @@ pub mod render;
 pub mod term;
 pub mod prompt;
 pub mod file;
+pub mod limits;
 pub mod fsx;
 pub mod jobs;
 pub mod save;
