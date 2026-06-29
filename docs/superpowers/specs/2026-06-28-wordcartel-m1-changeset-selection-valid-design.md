@@ -39,24 +39,42 @@ produce valid values; the hole is the raw-field path.
    the plugin effort, where the untrusted caller (a plugin Transaction) actually appears.
    The shell is already valid-by-construction (`build_multi_replace` takes `doc_len`;
    positions are pre-clamped by `nav`), so no `Result` plumbing through editor commands.
-2. **`apply` precondition = release-enforced `assert!`** at entry — the only way (without
-   `Result`) to get "reject before mutating": fail fast, no partial edit, clear message.
-   Matches `TextBuffer`'s release-assert style (buffer.rs:30–63); one O(1) `len` compare,
-   negligible on the hot path. The shell never trips it.
+2. **`apply` precondition = release-enforced `assert!(buf.len() == len_before)`** at entry.
+   This guarantees "reject before mutating" for a **length mismatch** — fail fast, no
+   partial edit, clear message; matches `TextBuffer`'s release-assert style (buffer.rs:30–63);
+   one O(1) `len` compare, negligible on the hot path; the shell never trips it. (Codex
+   confirmed it never false-positives on any current `apply` path — commit/undo/redo/
+   coalescing all satisfy it.) **It does NOT cover op-boundary errors:** a valid-sum
+   changeset with an op on a non-char-boundary would mutate earlier ops then panic in the
+   buffer (a partial edit). Boundary safety stays on `TextBuffer`'s existing apply-time
+   asserts; the full *no-partial-mutation op-boundary preflight* is **deferred to M2**
+   (where untrusted plugin Transactions arrive). M1 claims only length-mismatch
+   reject-before-mutating.
 3. **Privatize only invariant-bearing fields.** `ChangeSet.{ops, len_before, len_after}`
    and `Selection.{ranges, primary}` go private. **`Range.{anchor, head}` stay public** —
    plain byte offsets with no cross-field invariant, read pervasively across `nav`/
    `commands`; privatizing them is gratuitous ripple for zero safety gain.
+4. **`insert`/`delete` release-`assert!` (drop the silent clamp) (Codex Important 2).**
+   D0 forbids clamping *edits* (clamp is for nav/UI recovery only). Today `insert`/`delete`
+   `debug_assert` then **silently clamp** an out-of-range offset in release (change.rs:38–39,
+   58–68) → a *silent wrong edit* (a clamped `delete` removes unintended bytes). Make them
+   **release-`assert!`** their offset validity instead — uniform with `from_ops`/`apply`.
+   Clamping stays the caller's job (`nav::clamp_snap`, already done by the shell), so this
+   never trips for the shell (all shell offsets are pre-clamped). `delete` keeps its
+   **reversed-range normalization** (interpreting `head..anchor` is not corruption) but
+   asserts on **out-of-bounds** (`end > doc_len`).
 
 ## Components
 
 ### `ChangeSet` encapsulation (`wordcartel-core/src/change.rs`)
 
 - Make `ops`, `len_before`, `len_after` **private**.
-- **Keep** `insert(at, text, doc_len)` and `delete(range, doc_len)` exactly as today
-  (already-validating constructors; their debug_assert + release-clamp behavior is
-  unchanged — a clamped insert/delete position is a *defined, non-corrupting* edit, not
-  the raw-field inconsistency this effort closes).
+- **Harden `insert(at, text, doc_len)` / `delete(range, doc_len)` (decision 4):** replace
+  the silent release-clamp with a **release-`assert!`** on offset validity — `insert`
+  asserts `at <= doc_len`; `delete` asserts `end <= doc_len` (after normalizing a reversed
+  `range`). They still produce the same valid ops for in-range input; the only change is
+  an out-of-range offset now fails fast instead of silently clamping. The shell is
+  unaffected (offsets pre-clamped by `nav`).
 - **Add `ChangeSet::from_ops(ops: Vec<Op>, len_before: usize) -> ChangeSet`:**
   - Computes `len_after` from the ops (`sum(Retain) + sum(Insert byte len)`), so the
     caller cannot pass an inconsistent `len_after`.
@@ -69,23 +87,23 @@ produce valid values; the hole is the raw-field path.
     enforced by `TextBuffer`'s existing release char-boundary `assert!`s (buffer.rs:30–63)
     during `apply`. `from_ops` validates *structure* (op sums vs `len_before`); the buffer
     validates *boundaries* at apply time.
-- **Add read accessors** for whatever external code reads after privatization —
-  `ops(&self) -> &[Op]`, `len_before(&self) -> usize`, `len_after(&self) -> usize`
-  (add only those the compiler shows are needed; core-internal readers like `map_pos`/
-  `invert` access private fields directly).
+- **Add read accessors** — Codex's grep shows the only external read after privatization
+  is `len_after` (selection.rs:135), so add **`len_after(&self) -> usize`**; add
+  `ops()`/`len_before()` ONLY if the compiler shows a further external reader (core-internal
+  readers like `map_pos`/`invert` access private fields directly).
 - **`apply`:** add release-enforced `assert!(buf.len() == self.len_before, ...)` as the
-  first statement, before the op loop.
+  first statement, before the op loop (length-mismatch reject-before-mutating; see
+  decision 2 for the boundary caveat).
 
 ### `Selection` encapsulation (`wordcartel-core/src/selection.rs`)
 
 - Make `Selection.{ranges, primary}` **private**. Invariant: `!ranges.is_empty() &&
   primary < ranges.len()`.
 - **Keep** `single(pos)` / `range(anchor, head)` (both produce one range, `primary = 0`
-  — invariant holds).
-- **Add `Selection::from_ranges(ranges: SmallVec<[Range; 1]>, primary: usize) ->
-  Selection`** ONLY IF a multi-range construction site exists (compiler-driven); it
-  **asserts** `!ranges.is_empty() && primary < ranges.len()`.
-- **Add `ranges(&self) -> &[Range]`** accessor for external reads of the range list.
+  — invariant holds). These are sufficient: Codex's grep found **no multi-range
+  construction and no `primary != 0`** anywhere in the codebase. So **`from_ranges` and a
+  `ranges()` accessor are YAGNI and are NOT added** (defer until a real multi-range caller
+  exists — multi-cursor, post-1.0). The raw-`Selection`-literal sites migrate to `range`.
 - `primary()` keeps its `debug_assert!` (now guaranteed by construction → belt-and-
   suspenders dev check; it can no longer fire from a public path).
 - **`Range.{anchor, head}` unchanged (public).**
@@ -97,11 +115,16 @@ produce valid values; the hole is the raw-field path.
   `ChangeSet::from_ops(ops, doc_len)`. `from_ops` recomputes `len_after` from the ops —
   it must equal the hand-computed `len_after` these functions produce today (verify in a
   test; they consume the whole doc so `sum(Retain)+sum(Delete) == doc_len`).
-- Core tests building raw `ChangeSet` (change.rs:430,437 and any others) → `from_ops` /
-  `insert` / `delete`.
-- Any raw `Selection { ranges, primary }` construction (compiler-driven) → `single` /
-  `range` / `from_ranges`.
-- Add the read accessors at every external read site the compiler flags.
+- Core tests building raw `ChangeSet` (change.rs:307,430,437 and any others the compiler
+  flags) → `from_ops` / `insert` / `delete`.
+- **Convert the two release-only tests that lock in the OLD clamp behavior**
+  (change.rs:243,256) to `#[should_panic]` (the new `insert`/`delete` assert on
+  out-of-range offsets — decision 4).
+- Migrate raw `Selection { ranges, primary }` sites to `Selection::range(anchor, head)`:
+  the live site at `commands.rs:398` and the test sites Codex found
+  (commands.rs:952,1112,1142,1163,1184,1247) — and any others the compiler flags.
+- Add the `len_after()` accessor at its read site (selection.rs:135); add others only if
+  the compiler flags them.
 
 ## Data flow (unchanged for the shell)
 
@@ -129,7 +152,11 @@ values are now unconstructable and a mismatched `apply` fails fast.
   valid op sequences: `sum(Retain)+sum(Delete) == len_before`, `sum(Retain)+sum(Insert)
   == len_after`).
 - `from_ops` panics (`#[should_panic]`) when `sum(Retain)+sum(Delete) != len_before`.
-- `apply` panics (`#[should_panic]`) when applied to a buffer whose `len() != len_before`.
+- `apply` panics (`#[should_panic]`) when applied to a buffer whose `len() != len_before`
+  (the length-mismatch precondition — NOT a boundary test).
+- `insert` panics (`#[should_panic]`) on `at > doc_len`; `delete` panics on an
+  out-of-bounds `end > doc_len`; `delete` still normalizes a reversed in-bounds range
+  (decision 4). The two former clamp tests (change.rs:243,256) become these.
 - `build_multi_replace`/`build_range_replace` via `from_ops` produce the same `(ChangeSet,
   Edit)` as before (regression — compare against the existing
   `build_range_replace_yields_changeset_and_matching_edit` test at commands.rs:1261).
@@ -148,6 +175,12 @@ unchanged.
 
 - The `Result`-returning **edit boundary** for untrusted Transactions → **M2** (boundary
   harness) / **Effort P** (plugin `submit_transaction` validator).
+- The **no-partial-mutation op-boundary preflight** in `apply` (validate every op's
+  char-boundary against the buffer *before* the mutation loop) → **M2** (it matters once
+  untrusted ops can reach `apply`; the shell never builds boundary-invalid ops). M1's
+  `apply` assert covers length mismatch only.
+- `Selection::from_ranges` + `ranges()` accessor (no multi-range caller exists yet) →
+  whenever multi-cursor lands.
 - T1–T4 core property tests + F1/F2 fuzz targets → rest of **M7**.
 - `insert`/`delete` behavior change (they keep debug_assert + release-clamp; that is a
   *defined, non-corrupting* edit, not the raw-field hole).
@@ -156,8 +189,11 @@ unchanged.
 ## New code surface (checklist for the plan)
 
 - `change.rs`: 3 fields → private; `ChangeSet::from_ops(ops, len_before)` (validating);
-  `ops()`/`len_before()`/`len_after()` accessors (as needed); `apply` entry assert.
-- `selection.rs`: 2 fields → private; `from_ranges` (if needed); `ranges()` accessor.
-- `commands.rs`: `build_multi_replace`/`build_range_replace` → `from_ops`.
-- Core tests + any flagged read sites → accessors/constructors.
-- Tests: T5 + T6 as above.
+  `len_after()` accessor (+ `ops()`/`len_before()` only if compiler-flagged); `apply`
+  entry length-assert; **`insert`/`delete` clamp → release-assert** (decision 4).
+- `selection.rs`: 2 fields → private (NO `from_ranges`/`ranges()` — YAGNI).
+- `commands.rs`: `build_multi_replace`/`build_range_replace` → `from_ops`; raw `Selection`
+  sites (commands.rs:398 + flagged test sites) → `Selection::range`.
+- Core tests: raw `ChangeSet` → constructors; the 2 clamp tests (change.rs:243,256) →
+  `#[should_panic]`.
+- Tests: T5 + T6 as above (incl. the new insert/delete assert tests).
