@@ -20,6 +20,15 @@ pub struct ChangeSet {
     len_after: usize,
 }
 
+/// Why an untrusted changeset was rejected against a specific buffer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EditError {
+    /// The changeset was built for a different document length than the buffer has.
+    StaleLength { expected: usize, actual: usize },
+    /// An op's byte boundary lands inside a multibyte char in the buffer.
+    OpBoundary { pos: usize },
+}
+
 // INVARIANT: all positions and lengths here are byte offsets into a single
 // in-memory document, so they are bounded by the document's byte length and fit a
 // `usize`. On the 64-bit targets Wordcartel supports, the length/position
@@ -107,6 +116,33 @@ impl ChangeSet {
 
     /// Document length this changeset expects before applying.
     pub fn len_before(&self) -> usize { self.len_before }
+
+    /// Validate this changeset against `buf` WITHOUT mutating. Length must match
+    /// (→ `StaleLength`), and every op's OLD-text byte boundaries must be char
+    /// boundaries in `buf` (→ `OpBoundary`) — so a later `apply` cannot panic partway.
+    /// Returns the FIRST violation; `Ok(())` means `apply(buf)` is panic-safe.
+    pub fn validate_against(&self, buf: &TextBuffer) -> Result<(), EditError> {
+        if self.len_before != buf.len() {
+            return Err(EditError::StaleLength { expected: self.len_before, actual: buf.len() });
+        }
+        let mut old_pos: usize = 0;
+        for op in &self.ops {
+            match op {
+                Op::Retain(n) => old_pos += n,
+                Op::Delete(n) => {
+                    if !buf.is_char_boundary(old_pos) { return Err(EditError::OpBoundary { pos: old_pos }); }
+                    let end = old_pos + n;
+                    if !buf.is_char_boundary(end) { return Err(EditError::OpBoundary { pos: end }); }
+                    old_pos = end;
+                }
+                Op::Insert(_) => {
+                    if !buf.is_char_boundary(old_pos) { return Err(EditError::OpBoundary { pos: old_pos }); }
+                    // old_pos unchanged: insert adds to the NEW text, not the OLD.
+                }
+            }
+        }
+        Ok(())
+    }
 
     /// Produce the inverse changeset. Needs the *original* buffer to recover the
     /// bytes a Delete removed (re-emitted as an Insert).
@@ -368,6 +404,42 @@ mod tests {
         assert_eq!(map_pos_before(4, &cs_mid), 4);
     }
 
+    // ── Task 1 (M2): validate_against tests ──────────────────────────────────
+
+    #[test]
+    fn validate_against_ok_for_matching_valid_changeset() {
+        use super::*;
+        let buf = TextBuffer::from_str("hello"); // len 5
+        let cs = ChangeSet::insert(2, "X", 5);    // built for len 5, boundary 2 is valid
+        assert!(cs.validate_against(&buf).is_ok());
+    }
+
+    #[test]
+    fn validate_against_stale_length() {
+        use super::*;
+        let buf = TextBuffer::from_str("hello"); // len 5
+        let cs = ChangeSet::insert(0, "X", 3);    // built for len 3 ≠ 5
+        assert_eq!(cs.validate_against(&buf), Err(EditError::StaleLength { expected: 3, actual: 5 }));
+    }
+
+    #[test]
+    fn validate_against_delete_end_mid_char() {
+        use super::*;
+        // doc "é" = 2 bytes (0xC3 0xA9); a Delete(1) ends at byte 1 (mid-char).
+        let buf = TextBuffer::from_str("é"); // len 2
+        let cs = ChangeSet::from_ops(vec![Op::Delete(1), Op::Retain(1)], 2); // sum-valid
+        assert_eq!(cs.validate_against(&buf), Err(EditError::OpBoundary { pos: 1 }));
+    }
+
+    #[test]
+    fn validate_against_insert_mid_char() {
+        use super::*;
+        let buf = TextBuffer::from_str("é"); // len 2
+        // Retain(1) lands old_pos at byte 1 (mid-é), then Insert there.
+        let cs = ChangeSet::from_ops(vec![Op::Retain(1), Op::Insert(Tendril::from("x")), Op::Retain(1)], 2);
+        assert_eq!(cs.validate_against(&buf), Err(EditError::OpBoundary { pos: 1 }));
+    }
+
     use proptest::prelude::*;
 
     proptest! {
@@ -493,6 +565,45 @@ mod tests {
             inv.apply(&mut b);
             prop_assert_eq!(b.to_string(), text,
                 "round-trip failed: c1={} d={} ins={:?} c2={}", c1, d, ins, c2);
+        }
+    }
+
+    proptest! {
+        /// The load-bearing guarantee: if `validate_against` returns Ok, then `apply`
+        /// NEVER panics and yields exactly `len_after`. (If Err, nothing is applied.)
+        #[test]
+        fn validated_changeset_applies_without_panic(
+            doc in proptest::collection::vec(
+                proptest::sample::select(vec!['a', 'é', '中', '🙂', '\n']), 0..24usize
+            ).prop_map(|cs| cs.into_iter().collect::<String>()),
+            claimed_len in 0usize..28,
+            is_delete in proptest::bool::ANY,
+            p1 in 0usize..28,
+            p2 in 0usize..28,
+            text in proptest::string::string_regex("[aé中]{0,4}").unwrap(),
+        ) {
+            use super::*;
+            let buf = TextBuffer::from_str(&doc);
+            // Build a SUM-VALID changeset (valid-by-construction via M1's insert/delete)
+            // for `claimed_len` — which may NOT match the buffer (→ StaleLength) and whose
+            // positions may land mid-char in the buffer (→ OpBoundary). insert/delete assert
+            // their offset ≤ claimed_len, so keep positions in range of claimed_len.
+            let cs = if is_delete {
+                let a = p1 % (claimed_len + 1);
+                let b = p2 % (claimed_len + 1);
+                ChangeSet::delete(a.min(b)..a.max(b), claimed_len)
+            } else {
+                let at = p1 % (claimed_len + 1);
+                ChangeSet::insert(at, &text, claimed_len)
+            };
+            match cs.validate_against(&buf) {
+                Ok(()) => {
+                    let mut b = buf.clone();
+                    cs.apply(&mut b);                       // must NOT panic
+                    prop_assert_eq!(b.len(), cs.len_after());
+                }
+                Err(_) => { /* rejected — buffer never touched */ }
+            }
         }
     }
 }

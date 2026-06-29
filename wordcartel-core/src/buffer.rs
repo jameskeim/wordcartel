@@ -22,8 +22,15 @@ impl TextBuffer {
 
     /// Returns `true` iff `b` is a valid UTF-8 char boundary in the rope.
     /// 0 and `self.len()` are always boundaries (empty or at the seam).
-    fn is_char_boundary(&self, b: BytePos) -> bool {
+    pub(crate) fn is_char_boundary(&self, b: BytePos) -> bool {
         b == 0 || b == self.len() || self.rope.char_to_byte(self.rope.byte_to_char(b)) == b
+    }
+
+    /// Clamp `off` to `[0, len]` and floor it to a char boundary. Pure buffer-local
+    /// (no layout). Used to snap an untrusted/plugin-submitted offset to a safe position.
+    pub fn clamp_to_boundary(&self, off: usize) -> usize {
+        let off = off.min(self.len());
+        self.rope.char_to_byte(self.rope.byte_to_char(off))
     }
 
     pub fn insert(&mut self, at: BytePos, text: &str) {
@@ -198,5 +205,14 @@ mod tests {
         // Empty doc: caret at byte 0 is line 1, column 1 (no panic on the empty rope).
         let b = TextBuffer::from_str("");
         assert_eq!(b.caret_line_col(0), (1, 1));
+    }
+
+    #[test]
+    fn clamp_to_boundary_clamps_and_floors() {
+        let b = TextBuffer::from_str("aé"); // 'a'=1 byte, 'é'=2 bytes → len 3; byte 2 is mid-é
+        assert_eq!(b.clamp_to_boundary(99), 3, "clamps past len");
+        assert_eq!(b.clamp_to_boundary(2), 1, "floors mid-char byte 2 to boundary 1");
+        assert_eq!(b.clamp_to_boundary(0), 0);
+        assert_eq!(b.clamp_to_boundary(3), 3);
     }
 }
