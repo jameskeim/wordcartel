@@ -329,7 +329,9 @@ single enforcement point above with the specified refuse/degrade behavior.
   `ChangeSet::stored_bytes`; `History.{bytes, last_evicted}`; eviction in
   `commit`/`commit_coalescing` — incl. **`current -= 1` per eviction**, the **redo-tail
   truncation byte subtraction**, and the coalescing-merge recompute.
-- `wordcartel-core/src/search.rs`: `all_matches` gains a `limit` param + capped signal.
+- `wordcartel-core/src/search.rs`: `all_matches` gains a `limit` param + capped signal —
+  update its in-module test call sites (`search.rs:209-295`) to pass the limit (e.g.
+  `usize::MAX` where the test doesn't exercise the cap).
 - `wordcartel/src/file.rs`: `OpenError::TooLarge { label, size: Option<u64>, limit }` + the
   metadata fast-check **and bounded `File::open`+`Read::take`** read in `open` (replacing
   `fs::read`), preserving the downstream binary/dir/utf-8 handling.
