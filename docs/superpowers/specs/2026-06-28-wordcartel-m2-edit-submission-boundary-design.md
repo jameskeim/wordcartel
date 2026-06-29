@@ -42,8 +42,10 @@ proving the guarantee.
    harness — that is the point.
 2. **Minimal plugin API + conservative reparse Edit.**
    `submit_transaction(editor, txn, clock) -> Result<(), EditError>`. The plugin supplies
-   only a `Transaction`; the boundary derives a **conservative** `block_tree::Edit`
-   (`range: 0..len_before`, `new_len: len_after` → a full reparse) and uses a fixed
+   only a `Transaction`; the boundary derives a **conservative whole-document**
+   `block_tree::Edit` (`range: 0..len_before`, `new_len: len_after`) — a whole-doc Edit
+   through the existing **incremental** derive path (`incremental_update_rope`, NOT a
+   direct `full_parse_rope` call; functionally a full reparse) — and uses a fixed
    `EditKind::Other`. Plugin edits are infrequent and off the per-keystroke hot path, so a
    full reparse is an acceptable cost; the incremental path stays for real typing. (A
    tight/incremental Edit derivation can be added later if plugin edits become frequent.)
@@ -67,21 +69,32 @@ pub enum EditError {
 
 impl ChangeSet {
     /// Validate this changeset against `buf` WITHOUT mutating. Checks
-    /// `len_before == buf.len()` then walks every op, confirming each Delete/Insert
-    /// byte position is a char boundary in `buf`. Returns the FIRST violation. All ops
-    /// are checked before any caller mutates — the no-partial-mutation guarantee.
+    /// `len_before == buf.len()` (→ `StaleLength`) then walks every op, confirming each
+    /// op's byte boundaries are char boundaries in `buf` (→ `OpBoundary`). Returns the
+    /// FIRST violation. All ops are checked before any caller mutates — the
+    /// no-partial-mutation guarantee.
     pub fn validate_against(&self, buf: &TextBuffer) -> Result<(), EditError>;
 }
 ```
 
-- Lives in core because it needs the private `is_char_boundary` (buffer.rs:25) and the
-  private `ops` — and it belongs next to `apply`. No new public field accessor is needed
-  (it uses the private fields directly).
+- Lives in core because it needs `TextBuffer::is_char_boundary` and the private `ops`,
+  and it belongs next to `apply`. **`buffer::is_char_boundary` (buffer.rs:25) is currently
+  private-to-module — M2 makes it `pub(crate)`** so `change.rs` (same crate, different
+  module) can call it. `TextBuffer::len()` already exists (buffer.rs:15). No new public
+  field accessor is needed (same-module access to `ops`).
 - `EditError` is the core type; the shell re-exports it.
-- The op-position walk mirrors `apply`'s cursor walk: `Retain(n)` advances `pos`;
-  `Delete(n)`/`Insert(_)` happen *at* `pos` — that `pos` must be a char boundary. (Insert
-  text content is always valid UTF-8 — a `&str` — so only the insertion *position* needs
-  checking, not the inserted bytes.)
+- **The op-walk tracks an OLD-text cursor (positions are byte offsets into the
+  current/before buffer) (Codex Critical):**
+  - `Retain(n)` → advance `old_pos` by `n`.
+  - `Delete(n)` → check **BOTH** `old_pos` and `old_pos + n` are char boundaries (M1's
+    `TextBuffer::delete` asserts both endpoints, buffer.rs:38 — checking only the start
+    would still let a delete that *ends* mid-multibyte-char panic after earlier ops
+    mutated), then advance `old_pos` by `n`.
+  - `Insert(_)` → check `old_pos` only (the inserted text is a valid-UTF-8 `&str`, so only
+    the insertion *position* matters; `old_pos` does not advance — insert adds to the new
+    text, not the old).
+  On the first non-boundary position, return `Err(OpBoundary { pos })` with that byte
+  offset.
 
 ### 2. The boundary (new module `wordcartel/src/transact.rs`)
 
@@ -99,25 +112,36 @@ pub fn submit_transaction(
 ) -> Result<(), EditError>;
 ```
 
-Flow:
-1. `let buf = &editor.active().document.buffer;` `txn.changes.validate_against(buf)?` —
-   returns `Err(StaleLength|OpBoundary)` with zero mutation.
-2. Snap the selection: if `txn.selection` is `Some(sel)`, map each `Range`'s `anchor`/`head`
-   through `clamp_snap`-style logic into `[0, len_after]` on a char boundary; rebuild the
-   `Transaction` with the snapped selection. (Reuse `nav::clamp_snap` or the same
-   clamp+grapheme-snap primitive; the post-edit buffer is needed for boundary snapping —
-   see "Selection snapping" below.)
-3. Derive `let edit = block_tree::Edit { range: 0..len_before, new_len: len_after };`.
-4. `editor.apply(snapped_txn, edit, EditKind::Other, clock);` → `Ok(())`.
+Flow (the snap is FULLY pre-apply — Codex Important):
+1. `txn.changes.validate_against(&editor.active().document.buffer)?` — returns
+   `Err(StaleLength|OpBoundary)` with **zero mutation**.
+2. **Snap the selection against a CLONE, before touching the live buffer.** Clone the
+   active buffer (O(1) ropey snapshot/clone), apply the *validated* `ChangeSet` to the
+   clone (gives the post-edit text without mutating the live document), then snap the
+   selection against the clone. Snapping must be **pre-apply** because `editor.apply`'s
+   `commit_coalescing` records the selection in the undo revision — passing an *unsnapped*
+   selection would store a bad cursor that a later **redo** restores and panics on
+   (Codex). So: build the final `Transaction` with the *original* `ChangeSet` + the
+   *snapped* selection, and only then call `editor.apply`.
+3. Derive the conservative whole-doc Edit:
+   `block_tree::Edit { range: 0..len_before, new_len: len_after }`.
+4. `editor.apply(snapped_txn, edit, EditKind::Other, clock);` → `Ok(())` — the single,
+   real mutation.
 
-**Selection snapping detail:** the selection is *post-edit* positions, so snapping to a
-char boundary needs the *post-edit* text. Two valid implementations: (a) range-clamp the
-selection to `[0, len_after]` *before* apply (cheap, guarantees in-bounds → `apply`'s
-selection set is valid), then a boundary-snap pass *after* apply against the now-current
-buffer; or (b) compute the post-edit length and clamp pre-apply, relying on
-`apply`/downstream nav to keep the cursor on a boundary. Implementation picks the
-simplest that guarantees the final selection is in-bounds and on a char boundary. Either
-way, a bad selection is **never** a reject — it snaps.
+**Selection snapping detail:**
+- **Single-range only (Codex Important).** Selections are single-range everywhere today
+  (M1's Codex grep found no multi-range, no `primary != 0`), and M1 deliberately did NOT
+  add `Selection::from_ranges`/`ranges()`. So M2 reads the one range via `sel.primary()`
+  (`Range.anchor`/`.head` are public) and rebuilds via `Selection::range(snapped_anchor,
+  snapped_head)`. No new `Selection` API. (Multi-range snapping waits for a multi-cursor
+  effort that adds the accessors.)
+- **`clamp_snap` must be decomposed (Codex Important).** Today `nav::clamp_snap(&Editor,
+  off)` reads `editor.active().document.buffer` — it cannot snap against the *clone*. M2
+  extracts a lower-level `nav::clamp_snap_in(buf: &TextBuffer, off: usize) -> usize` that
+  takes an explicit buffer (clamp to `[0, len]` + grapheme-snap), and rewrites
+  `clamp_snap` as a thin wrapper (`clamp_snap_in(&editor.active()...buffer, off)`). The
+  snapped anchor/head come from `clamp_snap_in(&clone, raw)`.
+- A bad selection is **never** a reject — it snaps.
 
 ### 3. The adversarial harness (tests in `transact.rs`)
 
@@ -145,8 +169,11 @@ way, a bad selection is **never** a reject — it snaps.
 
 Untrusted caller (harness now; Lua plugin in P) → `submit_transaction(editor, txn, clock)`
 → `txn.changes.validate_against(active_buf)` → on `Err`: return (no mutation); on `Ok`:
-snap selection → derive conservative Edit → `editor.apply` (trusted) → `Ok`. Internal
-trusted edits bypass this entirely (continue calling `editor.apply` directly).
+snap selection against a *clone* (apply the validated ChangeSet to a buffer clone, snap
+the single range with `clamp_snap_in`) → derive conservative whole-doc Edit → build the
+final `Transaction` (original ChangeSet + snapped selection) → `editor.apply` (trusted,
+the only live mutation) → `Ok`. Internal trusted edits bypass this entirely (continue
+calling `editor.apply` directly).
 
 ## Error handling
 
@@ -176,10 +203,16 @@ path).
 
 ## New code surface (checklist for the plan)
 
-- `wordcartel-core/src/change.rs`: `EditError` enum; `ChangeSet::validate_against(&self,
-  buf: &TextBuffer) -> Result<(), EditError>`; `EditError` exported from the crate.
+- `wordcartel-core/src/buffer.rs`: make `is_char_boundary` **`pub(crate)`** (currently
+  private-to-module). `len()` already public.
+- `wordcartel-core/src/change.rs`: `EditError` enum (exported from the crate);
+  `ChangeSet::validate_against(&self, buf: &TextBuffer) -> Result<(), EditError>` with the
+  OLD-cursor op-walk (Delete checks BOTH endpoints).
+- `wordcartel/src/nav.rs`: extract `clamp_snap_in(buf: &TextBuffer, off: usize) -> usize`;
+  make `clamp_snap` a wrapper over it.
 - `wordcartel/src/transact.rs` (new): `submit_transaction(editor, txn, clock) ->
-  Result<(), EditError>`; re-export `EditError`; the selection-snap + conservative-Edit
-  logic. Declare `mod transact;`.
-- Tests: `change.rs` unit tests for `validate_against`; `transact.rs` unit + proptest
-  harness for `submit_transaction`.
+  Result<(), EditError>`; re-export `EditError`; the clone-snap-then-apply flow
+  (single-range selection via `primary()` + `Selection::range`) + conservative-Edit
+  derivation. Declare `mod transact;`.
+- Tests: `change.rs` unit tests for `validate_against` (incl. delete-end-mid-char →
+  `OpBoundary`); `transact.rs` unit + proptest harness for `submit_transaction`.
