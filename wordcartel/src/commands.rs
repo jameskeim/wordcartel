@@ -19,7 +19,7 @@ use wordcartel_core::block_tree::Edit;
 use wordcartel_core::change::ChangeSet;
 use wordcartel_core::history::{Clock, EditKind, Transaction};
 use wordcartel_core::register;
-use wordcartel_core::selection::{Range, Selection};
+use wordcartel_core::selection::Selection;
 
 /// Text object scope for selection expansion commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -389,10 +389,7 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             if extend {
                 // Keep the current anchor; move the head to `new_head`.
                 let anchor = editor.active().document.selection.primary().anchor;
-                editor.active_mut().document.selection = Selection {
-                    ranges: [Range { anchor, head: new_head }].into_iter().collect(),
-                    primary: 0,
-                };
+                editor.active_mut().document.selection = Selection::range(anchor, new_head);
             } else {
                 // Collapse to a point at the new head.
                 editor.active_mut().document.selection = Selection::single(new_head);
@@ -943,12 +940,7 @@ mod tests {
     fn backspace_deletes_active_selection() {
         let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
         // Set a non-collapsed selection: anchor=1, head=3 (selects "bc")
-        e.active_mut().document.selection = Selection {
-            ranges: [wordcartel_core::selection::Range { anchor: 1, head: 3 }]
-                .into_iter()
-                .collect(),
-            primary: 0,
-        };
+        e.active_mut().document.selection = Selection::range(1, 3);
         derive::rebuild(&mut e);
         let clk = TestClock(0);
         let result = run(Command::Backspace, &mut e, &clk);
@@ -1103,12 +1095,7 @@ mod tests {
     #[test]
     fn type_over_selection_replaces() {
         let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
-        e.active_mut().document.selection = Selection {
-            ranges: [wordcartel_core::selection::Range { anchor: 1, head: 3 }]
-                .into_iter()
-                .collect(),
-            primary: 0,
-        };
+        e.active_mut().document.selection = Selection::range(1, 3);
         derive::rebuild(&mut e);
         let clk = TestClock(0);
         let result = run(Command::InsertChar('X'), &mut e, &clk);
@@ -1133,12 +1120,7 @@ mod tests {
     #[test]
     fn enter_over_selection_replaces() {
         let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
-        e.active_mut().document.selection = Selection {
-            ranges: [wordcartel_core::selection::Range { anchor: 1, head: 3 }]
-                .into_iter()
-                .collect(),
-            primary: 0,
-        };
+        e.active_mut().document.selection = Selection::range(1, 3);
         derive::rebuild(&mut e);
         let clk = TestClock(0);
         let result = run(Command::InsertNewline, &mut e, &clk);
@@ -1154,12 +1136,7 @@ mod tests {
         e.register.set("XY".into());
 
         // Set non-empty selection anchor=1 head=3 (selects "bc")
-        e.active_mut().document.selection = Selection {
-            ranges: [wordcartel_core::selection::Range { anchor: 1, head: 3 }]
-                .into_iter()
-                .collect(),
-            primary: 0,
-        };
+        e.active_mut().document.selection = Selection::range(1, 3);
         derive::rebuild(&mut e);
         let clk = TestClock(0);
         let before = e.active().document.buffer.to_string();
@@ -1175,12 +1152,7 @@ mod tests {
     #[test]
     fn delete_forward_deletes_selection() {
         let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
-        e.active_mut().document.selection = Selection {
-            ranges: [wordcartel_core::selection::Range { anchor: 1, head: 3 }]
-                .into_iter()
-                .collect(),
-            primary: 0,
-        };
+        e.active_mut().document.selection = Selection::range(1, 3);
         derive::rebuild(&mut e);
         let clk = TestClock(0);
         let result = run(Command::DeleteForward, &mut e, &clk);
@@ -1238,10 +1210,7 @@ mod tests {
         let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
         // Pre-load the register with "seed".
         let mut src = Editor::new_from_text("seed\n", None, (80, 24));
-        src.active_mut().document.selection = Selection {
-            ranges: [wordcartel_core::selection::Range { anchor: 0, head: 4 }].into_iter().collect(),
-            primary: 0,
-        };
+        src.active_mut().document.selection = Selection::range(0, 4);
         run(Command::Copy, &mut src, &TestClock(0));
         e.register = src.register;
         // Now Copy with a COLLAPSED selection must NOT clobber "seed" with "".

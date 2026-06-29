@@ -12,8 +12,8 @@ pub struct Range {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Selection {
-    pub ranges: SmallVec<[Range; 1]>,
-    pub primary: usize,
+    ranges: SmallVec<[Range; 1]>,
+    primary: usize,
 }
 
 impl Range {
@@ -108,6 +108,17 @@ mod tests {
         let cur = Range { anchor: 2, head: 2 };
         let cs = ChangeSet::insert(2, "AB", 10);
         assert_eq!(cur.map(&cs), Range { anchor: 4, head: 4 });
+    }
+
+    #[test]
+    fn constructors_keep_primary_in_bounds_and_nonempty() {
+        for s in [Selection::single(7), Selection::range(2, 5)] {
+            assert!(!s.ranges.is_empty(), "ranges non-empty");
+            assert!(s.primary < s.ranges.len(), "primary in bounds");
+            // primary() must never panic and must return the sole range:
+            let p = s.primary();
+            let _ = (p.from(), p.to());
+        }
     }
 
     use proptest::prelude::*;
