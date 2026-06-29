@@ -1,0 +1,134 @@
+# Wordcartel — project instructions
+
+Markdown-first Rust terminal word processor. Functional-core / imperative-shell:
+`wordcartel-core` (pure, `#![forbid(unsafe_code)]`) + `wordcartel` shell (binary `wcartel`;
+ratatui 0.30, crossterm). Top priority: **instant typing, no data loss, no silent UI
+waits.** Build toward an in-process Lua plugin system (Effort P, the 1.0 capstone).
+
+---
+
+## Development process: gated, review-driven, subagent-executed
+
+Use this pipeline for any non-trivial feature, refactor, or hardening work. Every artifact
+is reviewed by an INDEPENDENT perspective before it advances; nothing is trusted until
+checked against the REAL code. Work effort-by-effort on a branch off the trunk; commit/push
+ONLY when explicitly asked.
+
+### The pipeline (per effort)
+1. **Brainstorm** (`superpowers:brainstorming`). First map the real code surface (a
+   read-only Explore agent for exact files/signatures). Then resolve design forks ONE
+   question at a time, plain-text A/B/C options with a recommendation — never the picker
+   UI. Get section-by-section approval → an approved design.
+2. **Spec → Codex spec review → re-run until clean.** Write the design doc, then dispatch a
+   Codex review that cross-checks every claim AGAINST THE REAL SOURCE (not the diff; do not
+   run cargo). Fold findings; re-run Codex until it returns no Critical/Important/Minor.
+   Treat "not ready" verdicts as blocking.
+3. **Plan** (`superpowers:writing-plans`) **→ Codex plan review → re-run until clean.**
+   Task-by-task, COMPLETE code, TDD steps, grounded in real signatures. Codex re-checks
+   snippets, line anchors, and migration sites.
+4. **Execute** (`superpowers:subagent-driven-development`). Fresh implementer subagent PER
+   TASK (TDD: failing test → impl → green → commit), then a per-task reviewer subagent
+   returning TWO verdicts — spec compliance AND code quality. Critical/Important findings →
+   fix subagent → re-review; Minor → record in the ledger for the final pass.
+5. **Two final gates (both must pass).** An opus whole-branch review (cross-task invariants
+   no single task could see) AND a Codex pre-merge gate (independent GO/NO-GO). Re-run after
+   fixes until clean/GO.
+6. **Merge** (`superpowers:finishing-a-development-branch`, `--no-ff` to the trunk). Verify
+   tests on the merged result; delete the branch. Push only when asked.
+
+### Review layers (the point — different reviewers catch different things)
+- **Codex** = external static cross-check. It reads the actual code adversarially and
+  catches "spec says X, code is Y," missing accessors, overflow/edge panics, and unsound
+  steps. Highest-yield gate — use it on EVERY spec and plan.
+- **Per-task reviewer** = focused gate on one diff (spec + quality).
+- **Opus whole-branch review** = synthesis across tasks (invariants, regressions,
+  data-loss/panic classes). Use the most capable model here.
+- Re-running until clean is mandatory: each round the reviewer reads the REVISED code, so a
+  fix that introduces a new problem is caught.
+
+### Findings discipline
+- Triage Critical / Important / Minor. Critical+Important → dispatch a fix subagent (one
+  fixer for the final-review findings LIST, not per-finding). Minor → record in the ledger;
+  let the final review triage them.
+- A finding that contradicts the plan, or any design change, is the HUMAN's decision —
+  present the finding beside the plan text and ask which governs. Do not silently apply a
+  fix that changes an approved design.
+- Never tell a reviewer what not to flag or pre-rate a severity.
+
+### Machinery (keeps the controller's context clean)
+- The controller curates exactly what each subagent needs and hands artifacts as FILES
+  (`scripts/task-brief`, `scripts/review-package`, per-task report files) — never paste bulk
+  diffs/reports into dispatch prompts.
+- A dispatch prompt describes ONE task + the interfaces it touches + global constraints. No
+  session history.
+- Choose the cheapest model that fits each role: cheap for transcription tasks, standard for
+  integration, most-capable for whole-branch reviews and the hardest implementers. Always
+  set the model explicitly.
+- Track progress in a durable LEDGER (`$(git rev-parse --git-path sdd)/progress.md`): one
+  line per completed task with its commit range. After any compaction, trust the ledger +
+  `git log` over recollection; never re-dispatch a task it marks complete.
+- Save non-obvious decisions to memory (why, not what).
+
+### Commit/push rules
+- Branch per effort off the trunk; never implement on the default branch without consent.
+- Commit/push only when explicitly asked.
+- Every commit ends with the project trailers, verbatim — the `Co-Authored-By` line below,
+  then a `Claude-Session:` line with the current session's URL (provided by the environment):
+  ```
+  Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+  Claude-Session: <current session URL>
+  ```
+
+---
+
+## Rust conventions
+
+Style and quality standards for all code in this repo. Items marked **GATE** must pass
+before merge.
+
+**GATEs (before any merge):**
+- `cargo test` green; `cargo build` and `cargo test --no-run` warning-free.
+- `cargo clippy --all-targets -- -D warnings` clean. (`-D warnings` lives in the CI/gate,
+  never `#![deny(warnings)]` in source.)
+- `cargo fmt --check` clean.
+
+**Style:** snake_case fns/vars/modules, PascalCase types/traits, SCREAMING_SNAKE_CASE
+consts; 4-space indent; 100-char lines (rustfmt default). No emoji or emoji-like unicode in
+code — the only exception is tests exercising multibyte text (we test with `é` / `中` / `🙂`).
+
+**Types & errors:** make struct fields private by default; expose accessors / validated
+constructors (see `ChangeSet`/`Selection`). Use newtypes for semantically distinct values
+of the same primitive (`BytePos`, `BufferId`). Prefer `Option<T>` over sentinels. Errors are
+typed enums (`SaveError`, `OpenError`, `EditError`) surfaced to the **status line** (no
+silent UI) — never to the console, since the app owns the terminal.
+
+**Unwrap:** no `.unwrap()` on fallible/external paths. A guarded unwrap (immediately after
+establishing the invariant) is acceptable, but prefer `.expect("…invariant…")` with a message.
+
+**Performance:** optimize the HOT path — per-keystroke work stays `O(visible)+O(edited)`,
+never `O(document)`; cold paths favor clarity. Avoid needless allocation (`&str` over
+`String`, `Cow<'_, str>` when ownership is conditional, `Vec::with_capacity` when size is
+known). DRY; no dead code; no technical debt.
+
+**Concurrency:** heavy/slow work goes off the hot path onto the `std::thread` + `mpsc` job
+substrate (worker results are `Send`, version-discarded on staleness). Never block the input
+loop.
+
+**Pattern matching:** prefer exhaustive matches; avoid catch-all `_` where it would silently
+absorb a new variant (the theme `SemanticElement` constructors use exhaustive literals on
+purpose).
+
+**Docs:** doc-comment every public item; document params/returns/errors; add a runnable
+`# Examples` block for non-obvious public functions.
+
+**Tests:** unit-test new functions/types; Arrange-Act-Assert; `#[cfg(test)]` modules,
+`use super::*` allowed. Mock the filesystem via the `Fs` seam (M3) for durability/fault
+tests. No committed commented-out tests, `dbg!`, debug `println!`, or commented-out code.
+
+## Hardening campaign (in progress, before Effort P)
+Plan: `docs/superpowers/plans/2026-06-28-wordcartel-hardening-fuzz-proptest-plan.md`
+(minimal-viable spine M1–M7; the real pre-plugin risk is shell durability/panics/untrusted
+input, not more core fuzzing). Done: M1 (valid-by-construction), M2 (untrusted edit
+boundary `submit_transaction`), BUG-1 (worker panic isolation), BUG-2 (external-mod
+fingerprint). In progress: M3 (IO fault injection). Remaining: M5 (resource caps), M7
+(property/fuzz), M4-rest (filter/transform/dispatch `catch_unwind`).
