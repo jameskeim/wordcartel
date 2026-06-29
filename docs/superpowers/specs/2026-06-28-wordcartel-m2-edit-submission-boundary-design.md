@@ -135,12 +135,20 @@ Flow (the snap is FULLY pre-apply — Codex Important):
   (`Range.anchor`/`.head` are public) and rebuilds via `Selection::range(snapped_anchor,
   snapped_head)`. No new `Selection` API. (Multi-range snapping waits for a multi-cursor
   effort that adds the accessors.)
-- **`clamp_snap` must be decomposed (Codex Important).** Today `nav::clamp_snap(&Editor,
-  off)` reads `editor.active().document.buffer` — it cannot snap against the *clone*. M2
-  extracts a lower-level `nav::clamp_snap_in(buf: &TextBuffer, off: usize) -> usize` that
-  takes an explicit buffer (clamp to `[0, len]` + grapheme-snap), and rewrites
-  `clamp_snap` as a thin wrapper (`clamp_snap_in(&editor.active()...buffer, off)`). The
-  snapped anchor/head come from `clamp_snap_in(&clone, raw)`.
+- **Use a NEW buffer-only core helper, NOT `nav::clamp_snap` (Codex re-review).**
+  `nav::clamp_snap(&Editor, off)` is **layout-coupled** — it calls `get_or_layout`
+  (nav.rs:164) which depends on document blocks, view mode, caret line, text geometry, and
+  theme glyph. It is NOT a buffer-only function and cannot be cleanly decomposed to take a
+  `&TextBuffer`. M2 does not need *layout-aware* (visual cursor-stop) snapping for a
+  plugin's programmatic cursor — it only needs the selection to be a **valid byte offset**
+  (in `[0, len]`, on a char boundary) so nothing slices mid-char. That is a pure
+  `TextBuffer` concern. So M2 adds **`TextBuffer::clamp_to_boundary(&self, off: usize) ->
+  usize`** (in buffer.rs, where `is_char_boundary` lives): clamp `off` to `[0, len]`, then
+  floor to a char boundary (`rope.char_to_byte(rope.byte_to_char(off))`). The snapped
+  anchor/head are `clone.clamp_to_boundary(raw_anchor)` / `clone.clamp_to_boundary(
+  raw_head)`. **`nav::clamp_snap` is left untouched.** (The editor re-applies any
+  layout-aware visual snapping on the next nav/render anyway; the byte-boundary clamp is
+  what guarantees safety.)
 - A bad selection is **never** a reject — it snaps.
 
 ### 3. The adversarial harness (tests in `transact.rs`)
@@ -170,7 +178,7 @@ Flow (the snap is FULLY pre-apply — Codex Important):
 Untrusted caller (harness now; Lua plugin in P) → `submit_transaction(editor, txn, clock)`
 → `txn.changes.validate_against(active_buf)` → on `Err`: return (no mutation); on `Ok`:
 snap selection against a *clone* (apply the validated ChangeSet to a buffer clone, snap
-the single range with `clamp_snap_in`) → derive conservative whole-doc Edit → build the
+the single range with `clone.clamp_to_boundary`) → derive conservative whole-doc Edit → build the
 final `Transaction` (original ChangeSet + snapped selection) → `editor.apply` (trusted,
 the only live mutation) → `Ok`. Internal trusted edits bypass this entirely (continue
 calling `editor.apply` directly).
@@ -204,15 +212,16 @@ path).
 ## New code surface (checklist for the plan)
 
 - `wordcartel-core/src/buffer.rs`: make `is_char_boundary` **`pub(crate)`** (currently
-  private-to-module). `len()` already public.
+  private-to-module) for `validate_against`; add **`pub fn clamp_to_boundary(&self, off:
+  usize) -> usize`** (clamp to `[0, len]` + floor to char boundary) for the selection
+  snap. `len()` already public. (`nav::clamp_snap` is NOT touched — it is layout-coupled.)
 - `wordcartel-core/src/change.rs`: `EditError` enum (exported from the crate);
   `ChangeSet::validate_against(&self, buf: &TextBuffer) -> Result<(), EditError>` with the
   OLD-cursor op-walk (Delete checks BOTH endpoints).
-- `wordcartel/src/nav.rs`: extract `clamp_snap_in(buf: &TextBuffer, off: usize) -> usize`;
-  make `clamp_snap` a wrapper over it.
 - `wordcartel/src/transact.rs` (new): `submit_transaction(editor, txn, clock) ->
   Result<(), EditError>`; re-export `EditError`; the clone-snap-then-apply flow
-  (single-range selection via `primary()` + `Selection::range`) + conservative-Edit
-  derivation. Declare `mod transact;`.
+  (single-range selection via `primary()` + `TextBuffer::clamp_to_boundary` +
+  `Selection::range`) + conservative-Edit derivation. Declare `mod transact;`. (No
+  `nav.rs` change.)
 - Tests: `change.rs` unit tests for `validate_against` (incl. delete-end-mid-char →
   `OpBoundary`); `transact.rs` unit + proptest harness for `submit_transaction`.
