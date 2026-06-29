@@ -357,6 +357,36 @@ mod tests {
         let _ = std::fs::remove_file(&link); let _ = std::fs::remove_file(&real);
     }
 
+    /// A real (non-symlink) save failure also keeps the buffer dirty: the target's
+    /// parent is a regular FILE, so temp creation fails immediately (parent not a
+    /// directory). Drives the do_save_to merge's Err arm without any test seam.
+    #[cfg(unix)]
+    #[test]
+    fn background_save_failure_parent_is_file_keeps_dirty() {
+        let parent = scratch();
+        std::fs::write(&parent, "i am a file, not a dir\n").unwrap();
+        // target sits "inside" a regular file → ENOTDIR on temp create.
+        let target = parent.join("doc.md");
+
+        let mut e = Editor::new_from_text("hello\n", Some(target.clone()), (80, 24));
+        e.active_mut().document.saved_version = None;
+        e.active_mut().document.version = 1;
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
+        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+
+        assert!(e.active().document.dirty(), "failed save must leave the buffer dirty");
+        assert!(e.active().document.saved_version.is_none());
+        // Assert the ENOTDIR error itself surfaced (not merely any non-empty status) — this
+        // proves the save was attempted and failed, NOT that the external-mod modal opened.
+        assert!(
+            e.status.to_lowercase().contains("not a directory") || e.status.contains("ENOTDIR"),
+            "OS ENOTDIR must surface as status; got: {:?}", e.status
+        );
+        let _ = std::fs::remove_file(&parent);
+    }
+
     #[test]
     fn save_clean_deletes_swap_but_stale_save_keeps_it() {
         use crate::jobs::{Executor, InlineExecutor};
