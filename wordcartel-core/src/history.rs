@@ -388,4 +388,76 @@ mod tests {
         assert_eq!(hist.last_evicted, 0, "small edits must not trigger eviction");
         assert!(hist.bytes < 1024, "accumulated bytes for tiny edits must be negligible");
     }
+
+    // ── Task 3 (M7): T4 History undo/redo proptests ───────────────────────────
+    use proptest::prelude::*;
+    use crate::proptest_strategies::prop_unicode_string;
+    use crate::test_support::snap;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        #[test]
+        fn t4_undo_redo_round_trips_exact(
+            text in prop_unicode_string(),
+            edits in proptest::collection::vec((0usize..60, prop_unicode_string()), 1..8),
+        ) {
+            use crate::buffer::TextBuffer;
+            let mut buf = TextBuffer::from_str(&text);
+            let mut hist = History::default();
+            let mut sel = Selection::single(0);
+            for (p, ins) in &edits {
+                let at = snap(&buf.slice(0..buf.len()), (*p).min(buf.len()));
+                let cs = ChangeSet::insert(at, ins, buf.len());
+                sel = hist.commit(Transaction::new(cs), &mut buf, sel.clone());
+                // selection valid: in-bounds + on char boundary
+                prop_assert!(sel.primary().head <= buf.len());
+                prop_assert!(buf.slice(0..buf.len()).is_char_boundary(sel.primary().head));
+            }
+            let after_all = buf.slice(0..buf.len());
+            let sel_after_all = sel.clone();
+            // undo then redo returns the exact BUFFER and the exact SELECTION (redo returns the
+            // post-edit `after` selection — assert it, don't drop it — the spec's "undo->redo exact").
+            if hist.undo(&mut buf).is_some() {
+                let redo_sel = hist.redo(&mut buf);
+                prop_assert_eq!(buf.slice(0..buf.len()), after_all);
+                prop_assert_eq!(redo_sel.unwrap().primary().head, sel_after_all.primary().head);
+            }
+            // full undo yields the original
+            while hist.undo(&mut buf).is_some() {}
+            prop_assert_eq!(buf.slice(0..buf.len()), text);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        #[test]
+        fn t4_coalescing_loses_nothing(
+            text in ".{0,20}",
+            chars in proptest::collection::vec(
+                proptest::sample::select(vec!["a", "b", "é", "中", "🙂"]),
+                1..8usize,
+            ),
+        ) {
+            use crate::buffer::TextBuffer;
+            let original = text.clone();
+            let mut buf = TextBuffer::from_str(&text);
+            let mut hist = History::default();
+            let clock = FakeClock::new();
+            let mut sel = Selection::single(0);
+            // all edits at 100ms intervals — always within the 500ms coalesce window
+            for (i, ch) in chars.iter().enumerate() {
+                clock.set(i as u64 * 100);
+                let at = sel.primary().head;
+                let cs = ChangeSet::insert(at, ch, buf.len());
+                let txn = Transaction::new(cs)
+                    .with_selection(Selection::single(at + ch.len()));
+                sel = hist.commit_coalescing(txn, &mut buf, sel.clone(), &clock, EditKind::Type);
+            }
+            // full undo must restore the exact original text — no chars lost
+            while hist.undo(&mut buf).is_some() {}
+            prop_assert_eq!(buf.slice(0..buf.len()), original);
+        }
+    }
 }
