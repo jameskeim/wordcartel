@@ -18,11 +18,15 @@ export) are unguarded, so a panic there crashes the editor or strands `*_in_flig
 
 ## Core principle (from the Codex design review)
 
-**A panic is handled exactly like a failed completion.** Every async path already has a
-failure handler that clears its in-flight flag, keeps the buffer correctly dirty, aborts
-quit-drain, and sets a status — with the clock it needs. So panic recovery reuses that
-existing failure path rather than inventing parallel cleanup. We do NOT catch our own
-command handlers (Q1): a panic in our code is a bug to find and fix, not silently swallow.
+**A panic is treated as a failed completion.** For the ad-hoc async threads
+(transform/filter/export), this is literal: the panic sends the path's existing error-`Msg`,
+routing to the existing failure handler (which has the clock + clears the in-flight flag). For
+executor jobs (Save/SwapWrite), the `Panicked` arm performs the kind's failure cleanup
+**explicitly** — NOT by "reusing the failure path," because the real failed-save path is
+**non-uniform** across `PostSaveAction` (e.g. the `Quit` variant leaves `pending_after_save`
+armed on failure), so the panic cleanup is spelled out field-by-field below to guarantee a
+panicked save never quits/strands. We do NOT catch our own command handlers (Q1): a panic in
+our code is a bug to find and fix, not silently swallow.
 
 ## Decisions
 
@@ -83,21 +87,28 @@ pub enum JobOutcome {
 - **`InlineExecutor`:** likewise `catch_unwind` (currently bare `(job.run)()`, `jobs.rs:84`)
   so the panic path is deterministically testable. No existing test relies on a panic
   propagating out of inline dispatch (the survival test targets `ThreadExecutor`).
-- **`drain() -> Vec<JobOutcome>`** (was `Vec<JobResult>`). Ripples to every drain/apply site
-  — enumerate and update: `app.rs:776`, `app.rs:1720`, `save.rs:313`, `swap.rs:567`,
-  `file.rs:292`.
-- **`is_stale`** applies only to the `Done(JobResult)` arm. A `Panicked` outcome is NOT
-  subject to the staleness-discard *before* cleanup: its per-kind cleanup MUST run (to clear
-  in-flight state), then the outcome is done. Order: route `Panicked` → cleanup first.
+- **`drain() -> Vec<JobOutcome>`** (was `Vec<JobResult>`). The plan MUST audit **every**
+  `ex.drain()` / `apply_result` / `apply_job_result` call site — not just a sample. Known
+  PRODUCTION sites: `app.rs:776`, `app.rs:1720`, **and the early-return `apply_job_result`
+  calls inside `reduce`: `app.rs:1039`, `:1052`, `:1089`, `:1102`, `:1113`** (Codex — these
+  were missed). TEST sites that consume `JobResult` via `crate::app::apply_result` and need
+  `Done`-wrapping or a helper: `save.rs:313`, `:332`, `:353`, `:377`; `swap.rs:567`;
+  `file.rs:292`. `is_stale` unit tests call it directly at `jobs.rs:221`, `:292`, `:300` and
+  must adapt.
+- **`is_stale`** applies only to the `Done(JobResult)` arm (production caller `apply_result`
+  takes a `JobResult`, app.rs:107-108 — confining it to `Done` is sufficient). A `Panicked`
+  outcome is NOT subject to staleness-discard *before* cleanup: its per-kind cleanup MUST run
+  (to clear in-flight state), then the outcome is done. Order: route `Panicked` → cleanup
+  first, unconditionally.
 
 **Apply funnel: route `Panicked` by kind (replicate each kind's FAILURE cleanup).** A
 panicked job's editor state is untouched (the worker thread never mutates the `Editor`; only
 the merge does, and it never ran), so cleanup is exactly the failure path:
 
-| Kind | Panic cleanup (= its failure path) |
+| Kind | Panic cleanup (explicit — the failed-save path is NOT uniform across `PostSaveAction`, so spell it out) |
 |---|---|
-| `Save` | keep buffer **dirty** (don't set `saved_version`), status `"save failed (internal error)"`, **and abort `pending_after_save` / quit-drain** exactly as the failed-save path (`app.rs:119`) so save-and-quit / quit-after-drain are not stranded. |
-| `SwapWrite` | **clear `swap_in_flight`** for the buffer (`swap.rs:295`) + status. (Status-only would hang the next swap.) |
+| `Save` | Keep the buffer **dirty** — do NOT set `saved_version`. A panicked save must NOT quit / lose data, so **explicitly reset the quit state** (the failed-save path leaves `pending_after_save` *armed* for the `Quit` variant — app.rs:129-131 — which we must NOT replicate): set `editor.pending_after_save = None` (editor.rs:297), and `editor.quit_drain = None` (editor.rs:355) + `editor.quit_drain_advance = false` (editor.rs:358) to abort any in-progress quit-drain. Status `"save failed (internal error)"`. (Armed by `dispatch_save_then`, save.rs:159/170.) |
+| `SwapWrite` | **clear `swap_in_flight`** (the buffer-local field, editor.rs:105) for the buffer — mirroring the success merge's clear at `swap.rs:299`. Without it the Tick swap-cadence guard (app.rs:1688-1692) blocks all future swaps for that buffer. + status. |
 | `CoalesceProbe` | test-only; cleanup is a no-op + status. |
 
 ### 3. Ad-hoc async threads: `catch` body + error-`Msg` (`transform.rs`, `filter.rs`, `export.rs`)
@@ -107,23 +118,32 @@ its body in `catch`; on panic it sends the **existing** completion `Msg` with an
 result, so the existing main-thread handler (which has the clock + clears in-flight) treats
 it as a failed completion:
 
-- **Async transform** (`transform.rs:112-118`): on panic send
-  `Msg::TransformDone { …, result: Err(TransformError::Panicked(msg)) }`. The existing
-  `apply_transform_done` handles `Err` → clears `transform_in_flight` + status. **Confirm**
-  `transform_in_flight` is cleared BEFORE the version-staleness check (`app.rs:263`), so a
-  stale/closed buffer still un-sticks the flag.
-- **Filter** (`filter.rs:322`): on panic send
-  `Msg::FilterDone { …, outcome: RunResult::Err(FilterError::Panicked(msg)) }` → existing
-  `apply_filter_done` clears `filter_in_flight` + status. (Same in-flight-before-staleness
-  rule.)
-- **Export** (`export.rs:90`): on panic send `Msg::ExportDone { …, result: Err(<panic>) }`
-  → existing handler clears the export in-flight state + status.
+- **Async transform** (spawn at `transform.rs:112-118`): on panic send
+  `Msg::TransformDone { …, result: Err(TransformError::Panicked(msg)) }` (`result` is
+  `Result<String, TransformError>`, app.rs:48-53). The existing `apply_transform_done`
+  clears `transform_in_flight` (editor.rs:305) + status, and already does so BEFORE the
+  version-staleness check (app.rs:272-273) — so a stale/closed buffer still un-sticks the
+  flag. ✓
+- **Filter** (spawn at `filter.rs:346`): on panic send
+  `Msg::FilterDone { …, outcome: RunResult::Err(FilterError::Panicked(msg)) }` (`RunResult`
+  has an `Err(FilterError)` arm, filter.rs:92-96) → existing `apply_filter_done` clears
+  `filter_in_flight` (editor.rs:304) before staleness (app.rs:230-231) + status. ✓
+- **Export** (spawn at `export.rs:103`): on panic send
+  `Msg::ExportDone { …, result: Err(FilterError::Panicked(msg)) }` (`result` is
+  `Result<ExportResult, FilterError>`, app.rs:37-40; export already uses `FilterError` for
+  failures, export.rs:115). The existing `apply_export_done` `Err` arm (app.rs:329-330)
+  surfaces an error **status**. **Note:** export has NO in-flight flag (`pending_export`,
+  editor.rs:307, is overwrite-confirmation, not a dispatch guard) — so there is nothing to
+  un-stick; the panic simply surfaces an error status instead of silently killing the thread.
 
-New error variants: `TransformError::Panicked(String)`, `FilterError::Panicked(String)`, and
-the export error's equivalent (reuse an existing "internal/io" shape if cleaner). To keep the
+New error variants: `TransformError::Panicked(String)` and a **single shared
+`FilterError::Panicked(String)`** (used by both the filter and export paths). To keep the
 mapping testable without relying on `repar`/a subprocess actually panicking, factor each
 thread body as `match catch(|| work()) { Ok(r) => send(done(r)), Err(msg) => send(err(msg)) }`
-and unit-test the `Err(msg) → error-Msg` mapping with a closure that panics.
+and unit-test the `Err(msg) → error-Msg` mapping with a closure that panics. All three closures
+already capture the metadata the error-`Msg` needs (transform: buffer_id/version/range/kind,
+transform.rs:105-117; filter: buffer_id/version/range/cursor/disposition, filter.rs:331-352;
+export: buffer_id/target/overwrite_confirmed, export.rs:98-105).
 
 ### 4. Sync transform (main thread) (`transform.rs:122-124`)
 
@@ -144,12 +164,17 @@ and loud** so they get fixed.
 ## Out of scope / noted (with rationale)
 
 - **Input and clipboard reader threads** (raw `thread::spawn`, not governed by the executor
-  catch). These do NOT fit the "send an error completion Msg" pattern — they're long-lived
-  readers, not request/response units, and a dead reader is a different failure mode (the app
-  stops receiving input/clipboard = a hang, not a stuck in-flight flag). Deferred to a
-  follow-up that needs its own approach (e.g. a supervisor that detects a dead reader and
-  restarts it or surfaces it). **Also fix** the inaccurate `term.rs:90` comment that claims
-  input/clipboard panics are caught — they are not.
+  catch): the input thread (`app.rs:1935-1938`) and the clipboard worker
+  (`clipboard.rs:63-85`) are both unguarded. These do NOT fit the "send an error completion
+  Msg" pattern — they're long-lived readers, not request/response units, and a dead reader is
+  a different failure mode (the app stops receiving input/clipboard = a hang, not a stuck
+  in-flight flag). Deferred to a follow-up that needs its own approach (a supervisor that
+  detects a dead reader and restarts/surfaces it). **Also fix** the inaccurate `term.rs:90-93`
+  comment that claims input/clipboard reader panics are caught by each thread's own
+  `catch_unwind` — neither thread has one.
+- The **diagnostics warmup thread** (`app.rs:1891-1898`, fire-and-forget) is unguarded but
+  deferred; diagnostics already wraps Harper panics (`diagnostics_run.rs:57-61`), and the wake
+  relay (app.rs:1922-1926) does no untrusted work.
 - **Diagnostics** already has a Harper-specific catch (`diagnostics_run.rs:57`); a broad
   diagnostics-thread catch is deferred unless trivial.
 - **Our command handlers** stay un-caught (Q1-A).
@@ -160,26 +185,36 @@ and loud** so they get fixed.
 
 - `catch` returns `Err(msg)` for `&str`, `String`, and other payloads (→ `"panic"`).
 - **Executor (deterministic via `InlineExecutor`):** a panicking `Save` job →
-  `JobOutcome::Panicked` → buffer stays dirty, `saved_version` unset, `pending_after_save`/
-  quit-drain aborted, status set. A panicking `SwapWrite` → `swap_in_flight` cleared +
-  status. The existing `worker_survives_panicking_job_and_runs_next_job` stays green (adapted
-  to `JobOutcome`).
+  `JobOutcome::Panicked` → buffer stays dirty (`saved_version` unset), and
+  `pending_after_save == None` + `quit_drain == None` + `quit_drain_advance == false` (the
+  quit is aborted, not stranded), status set. A panicking `SwapWrite` → `swap_in_flight`
+  cleared + status. The existing `worker_survives_panicking_job_and_runs_next_job` stays green
+  (adapted to `JobOutcome`).
 - **Sync transform** panic → `TransformError::Panicked` → status, buffer unchanged.
 - **Ad-hoc threads:** the `catch(work) → error-Msg` mapping for transform/filter/export is
-  unit-tested with a panicking work closure → asserts the error-`Msg` is produced (and, where
-  feasible, that handling it clears the in-flight flag).
+  unit-tested with a panicking work closure → asserts the error-`Msg` is produced. Where the
+  handler has an in-flight flag (transform/filter), assert it's cleared; for export, assert an
+  error status (no flag exists).
 - `term.rs` comment corrected.
 
 ## New code surface (checklist for the plan)
 
 - `wordcartel/src/panicx.rs` (new): `catch`, `panic_message`; `pub mod panicx;` in `lib.rs`.
 - `wordcartel/src/jobs.rs`: `JobOutcome` enum; both executors `catch_unwind` + emit
-  `Panicked`; `drain() -> Vec<JobOutcome>`; `is_stale` confined to `Done`.
-- Drain/apply ripple: `app.rs` (the funnel — new `Panicked` routing by kind),
-  `save.rs:313`, `swap.rs:567`, `file.rs:292`, `app.rs:776`/`1720`.
-- `wordcartel/src/transform.rs`: `TransformError::Panicked`; sync `catch`; async thread
-  `catch` + `TransformDone(Err)`.
-- `wordcartel/src/filter.rs`: `FilterError::Panicked`; thread `catch` + `FilterDone(Err)`.
-- `wordcartel/src/export.rs`: export error panic variant; thread `catch` + `ExportDone(Err)`.
-- `wordcartel/src/term.rs`: correct the panic-hook comment.
+  `Panicked` (destructure `Copy` metadata before consuming `job.run`); `drain() -> Vec<JobOutcome>`;
+  `is_stale` confined to `Done`; adapt `is_stale` unit tests (jobs.rs:221/292/300).
+- Drain/apply ripple — ALL sites: production `app.rs:776`/`1720` + the early-return
+  `apply_job_result` calls at `app.rs:1039`/`1052`/`1089`/`1102`/`1113`; the new `Panicked`
+  routing-by-kind in the funnel; test drains `save.rs:313`/`332`/`353`/`377`, `swap.rs:567`,
+  `file.rs:292`.
+- `wordcartel/src/transform.rs`: `TransformError::Panicked`; sync `catch` → that error; async
+  thread (spawn ~112-118) `catch` + `TransformDone(Err)`.
+- `wordcartel/src/filter.rs`: `FilterError::Panicked` (shared with export); thread (spawn 346)
+  `catch` + `FilterDone(Err(FilterError::Panicked))`.
+- `wordcartel/src/export.rs`: thread (spawn 103) `catch` + `ExportDone(Err(FilterError::Panicked))`
+  — status only (no in-flight flag exists).
+- Per-kind `Panicked` cleanup fields: `pending_after_save`/`quit_drain`/`quit_drain_advance`
+  (Save), `swap_in_flight` (SwapWrite).
+- `wordcartel/src/term.rs`: correct the panic-hook comment (input app.rs:1935-1938 + clipboard
+  clipboard.rs:63-85 are NOT caught).
 - Tests per the testing strategy.
