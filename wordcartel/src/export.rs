@@ -101,7 +101,7 @@ pub(crate) fn do_export(
     let msg_tx = msg_tx.clone();
 
     std::thread::spawn(move || {
-        let result = run_pandoc(sink, &stdin, &target);
+        let result = guarded_export(|| run_pandoc(sink, &stdin, &target));
         let _ = msg_tx.send(crate::app::Msg::ExportDone {
             buffer_id,
             target,
@@ -109,6 +109,14 @@ pub(crate) fn do_export(
             overwrite_confirmed,
         });
     });
+}
+
+fn guarded_export(work: impl FnOnce() -> Result<ExportResult, crate::filter::FilterError>)
+    -> Result<ExportResult, crate::filter::FilterError> {
+    match crate::panicx::catch(work) {
+        Ok(r) => r,
+        Err(msg) => Err(crate::filter::FilterError::Panicked(msg)),
+    }
 }
 
 /// The actual pandoc invocation (runs on a worker thread).
@@ -245,5 +253,11 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         run_export(&mut e, "html", &tx);
         assert!(e.status.to_lowercase().contains("save the file first"));
+    }
+
+    #[test]
+    fn guarded_export_maps_panic_to_err() {
+        let r = guarded_export(|| panic!("exp"));
+        assert!(matches!(r, Err(crate::filter::FilterError::Panicked(ref m)) if m == "exp"));
     }
 }

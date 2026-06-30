@@ -52,6 +52,8 @@ pub enum FilterError {
     NotUtf8,
     /// Writing the export file failed (used by export path, Task 5).
     ExportWrite(String),
+    /// The filter or export worker thread panicked.
+    Panicked(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +318,14 @@ pub fn describe_error(err: &FilterError) -> String {
         FilterError::NotUtf8 => "filter produced non-text output".into(),
         FilterError::Spawn(m) => format!("cannot run filter: {m}"),
         FilterError::ExportWrite(m) => m.clone(),
+        FilterError::Panicked(m) => format!("internal error: {m}"),
+    }
+}
+
+fn guarded_filter(work: impl FnOnce() -> RunResult) -> RunResult {
+    match crate::panicx::catch(work) {
+        Ok(o) => o,
+        Err(msg) => RunResult::Err(FilterError::Panicked(msg)),
     }
 }
 
@@ -348,7 +358,7 @@ pub fn dispatch_filter(
             Input::None => String::new(),
             _ => snapshot.byte_slice(range_c.clone()).to_string(),
         };
-        let outcome = run_filter(&spec, stdin, &cancel);
+        let outcome = guarded_filter(|| run_filter(&spec, stdin, &cancel));
         let _ = msg_tx.send(crate::app::Msg::FilterDone {
             buffer_id,
             version,
@@ -547,5 +557,16 @@ mod tests {
             run_filter(&spec, "x".into(), &CancelFlag::new()),
             RunResult::Err(FilterError::Spawn(_))
         ));
+    }
+
+    #[test]
+    fn guarded_filter_maps_panic_to_runresult_err() {
+        let r = guarded_filter(|| panic!("flt"));
+        assert!(matches!(r, RunResult::Err(FilterError::Panicked(ref m)) if m == "flt"));
+    }
+
+    #[test]
+    fn describe_error_renders_panicked() {
+        assert!(describe_error(&FilterError::Panicked("x".into())).to_lowercase().contains("internal"));
     }
 }
