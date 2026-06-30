@@ -9,6 +9,7 @@ pub mod input;
 pub mod registry;
 pub mod render;
 pub mod term;
+pub mod panicx;
 pub mod prompt;
 pub mod file;
 pub mod limits;

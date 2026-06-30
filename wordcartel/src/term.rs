@@ -87,11 +87,11 @@ pub(crate) fn should_handle_panic(
 /// Install a panic hook that restores the terminal before chaining to the
 /// previous hook. Safe to call multiple times (uses `std::sync::Once`).
 ///
-/// Only the main thread (the one that called `install_panic_hook`) triggers
-/// the dump + terminal restore.  A non-main-thread panic (job worker,
-/// clipboard helper, input reader) is caught by the thread's own
-/// `catch_unwind`; the hook must not touch the terminal there, or it corrupts
-/// the live UI while the main loop keeps running.
+/// Only the main thread (the one that called `install_panic_hook`) triggers the dump +
+/// terminal restore.  A non-main-thread panic in the job WORKER is surfaced by the executor
+/// as a failed job (M4); the hook must not touch the terminal off the main thread or it
+/// corrupts the live UI.  NOTE: the clipboard helper and input reader threads are NOT yet
+/// guarded — a panic there is a separate (deferred) failure mode.
 pub fn install_panic_hook() {
     use std::sync::Once;
     static HOOK_INSTALLED: Once = Once::new();
@@ -99,9 +99,11 @@ pub fn install_panic_hook() {
         let main_id = std::thread::current().id();
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            // Non-main-thread panic (job/clipboard/input worker): caught by the
-            // thread's own catch_unwind; must NOT restore the terminal or it
-            // corrupts the live UI. No-op here.
+            // Non-main-thread panic: the job WORKER's panic is surfaced by the executor
+            // (M4) as a failed job; the hook must NOT touch the terminal off the main
+            // thread or it corrupts the live UI.  NOTE: clipboard helper and input reader
+            // threads are NOT yet guarded — a panic there is a deferred failure mode.
+            // No-op here.
             if !should_handle_panic(std::thread::current().id(), main_id) { return; }
             // Best-effort emergency dump (try_lock; never deadlock).
             crate::recovery::dump_on_panic();
