@@ -2,13 +2,11 @@
 //! ad-hoc worker threads, the job Executor, and (later) plugin call-sites.
 
 /// Run `f`, catching a panic and returning a best-effort message instead of unwinding.
-#[allow(dead_code)] // used by Tasks 2-4
 pub(crate) fn catch<T>(f: impl FnOnce() -> T) -> Result<T, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(panic_message)
 }
 
 /// Extract a human-readable string from a panic payload (best-effort).
-#[allow(dead_code)] // used by Tasks 2-4
 pub(crate) fn panic_message(p: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = p.downcast_ref::<&str>() {
         (*s).to_string()

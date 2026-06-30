@@ -564,7 +564,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
           dispatch_swap_write(&mut ctx); }
-        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
         assert_eq!(e.active().last_swap_at, Some(123), "merge records last_swap_at");
         let sp = swap_path(Some(&doc_path)).unwrap();
         let (h, body) = parse(&std::fs::read_to_string(&sp).unwrap()).unwrap();
@@ -572,5 +572,20 @@ mod tests {
         assert_eq!(h.version, 3);
         let _ = std::fs::remove_file(&sp);
         let _ = std::fs::remove_file(&doc_path);
+    }
+
+    #[test]
+    fn panicked_swap_clears_in_flight() {
+        let p = scratch(); std::fs::write(&p, "x\n").unwrap();
+        let mut e = Editor::new_from_text("x\n", Some(p.clone()), (80, 24));
+        let id = e.active().id;
+        e.active_mut().swap_in_flight = true;
+        crate::app::apply_outcome(
+            crate::jobs::JobOutcome::Panicked {
+                buffer_id: id, class: crate::jobs::ResultClass::BufferLocal, version: 1,
+                kind: crate::jobs::JobKind::SwapWrite, msg: "boom".into() },
+            &mut e);
+        assert!(!e.active().swap_in_flight, "panicked swap must clear swap_in_flight");
+        let _ = std::fs::remove_file(&p);
     }
 }

@@ -310,7 +310,7 @@ mod tests {
         }
         assert_eq!(e.status, "Saving\u{2026}", "status set before dispatch (§3.9)");
         // InlineExecutor already ran the job; apply the buffered merge.
-        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
         assert!(!e.active().document.dirty(), "version==saved_version after save → clean");
         assert_eq!(e.status, "Saved");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "new\n");
@@ -329,7 +329,7 @@ mod tests {
         { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
         // User edits on to version 2 BEFORE the merge applies.
         e.active_mut().document.version = 2;
-        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
         // saved_version recorded v1, but the buffer is at v2 → still dirty.
         assert_eq!(e.active().document.saved_version, Some(1));
         assert!(e.active().document.dirty(), "edited-on buffer stays dirty after a stale-version save");
@@ -350,7 +350,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
-        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
         assert!(e.active().document.dirty(), "failed save must leave the buffer dirty");
         assert!(e.active().document.saved_version.is_none());
         assert!(e.status.to_lowercase().contains("symlink"));
@@ -374,7 +374,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
-        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
 
         assert!(e.active().document.dirty(), "failed save must leave the buffer dirty");
         assert!(e.active().document.saved_version.is_none());
@@ -405,7 +405,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
-        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
         assert!(!e.active().document.dirty());
         assert!(!sp.exists(), "a save that leaves the buffer clean deletes the swap");
 
@@ -414,7 +414,7 @@ mod tests {
         e.active_mut().document.version = 2;
         { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
         e.active_mut().document.version = 3; // edited on
-        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
         assert!(e.active().document.dirty());
         assert!(sp.exists(), "a stale-version save must NOT delete the swap");
         let _ = std::fs::remove_file(&sp); let _ = std::fs::remove_file(&p);
@@ -468,7 +468,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; overwrite_save(&mut ctx); }
-        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "mine\n", "overwrite wins");
         assert!(!e.active().document.dirty());
         assert_eq!(e.active().document.stored_fp, crate::save::fingerprint(&p), "overwrite refreshes stored_fp");
@@ -716,6 +716,26 @@ mod tests {
             "same-size external content change must raise the external-mod modal (BUG-2)");
         assert!(ex.drain().is_empty(),
             "no save job must be dispatched when same-size external change is detected");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn panicked_save_keeps_dirty_and_aborts_quit() {
+        let p = scratch(); std::fs::write(&p, "old\n").unwrap();
+        let mut e = Editor::new_from_text("v1\n", Some(p.clone()), (80, 24));
+        e.active_mut().document.saved_version = None; e.active_mut().document.version = 1;
+        let id = e.active().id;
+        e.pending_after_save = Some(crate::editor::PendingAfterSave {
+            buffer_id: id, version: 1, action: crate::editor::PostSaveAction::Quit, at_ms: 0 });
+        crate::app::apply_outcome(
+            crate::jobs::JobOutcome::Panicked {
+                buffer_id: id, class: crate::jobs::ResultClass::Durability, version: 1,
+                kind: crate::jobs::JobKind::Save, msg: "boom".into() },
+            &mut e);
+        assert!(e.active().document.dirty(), "panicked save keeps the buffer dirty");
+        assert!(e.pending_after_save.is_none(), "awaited quit must be cleared");
+        assert!(!e.quit, "must NOT quit on a panicked save");
+        assert!(e.status.to_lowercase().contains("save"));
         let _ = std::fs::remove_file(&p);
     }
 }
