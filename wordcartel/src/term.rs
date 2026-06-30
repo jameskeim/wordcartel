@@ -91,7 +91,8 @@ pub(crate) fn should_handle_panic(
 /// terminal restore.  A non-main-thread panic in the job WORKER is surfaced by the executor
 /// as a failed job (M4); the hook must not touch the terminal off the main thread or it
 /// corrupts the live UI.  NOTE: the clipboard helper and input reader threads are NOT yet
-/// guarded — a panic there is a separate (deferred) failure mode.
+/// guarded — a panic there is a separate (deferred) failure mode. (The wake-relay thread is
+/// also unguarded, but it runs no untrusted user work, so it needs none.)
 pub fn install_panic_hook() {
     use std::sync::Once;
     static HOOK_INSTALLED: Once = Once::new();
