@@ -36,8 +36,8 @@
 ### Task 1: `test_support` module + T1 (TextBuffer model oracle)
 
 **Files:**
-- Create: `wordcartel-core/src/test_support.rs`
-- Modify: `wordcartel-core/src/lib.rs` (`pub mod test_support;` cfg-gated), `wordcartel-core/src/buffer.rs` (T1 proptests + strategies), `wordcartel-core/src/change.rs` (point its local `snap` at `test_support::snap`)
+- Create: `wordcartel-core/src/test_support.rs` (cfg any(test,fuzzing), proptest-free), `wordcartel-core/src/proptest_strategies.rs` (cfg test only)
+- Modify: `wordcartel-core/src/lib.rs` (`#[cfg(any(test, fuzzing))] pub mod test_support;` + `#[cfg(test)] mod proptest_strategies;`), `wordcartel-core/src/buffer.rs` (T1 proptests), `wordcartel-core/src/change.rs` (point its local `snap` at `test_support::snap`)
 - Test: buffer.rs `#[cfg(test)] mod`
 
 **Interfaces:**
@@ -87,19 +87,29 @@ delete the local `fn snap` and change its call sites to `crate::test_support::sn
 signature/semantics). Run `cargo test -p wordcartel-core --lib change` to confirm the existing
 change.rs proptests still pass against the consolidated `snap`.
 
-- [ ] **Step 4: T1 strategies + proptests (buffer.rs)**
+- [ ] **Step 4: Shared `#[cfg(test)]` proptest strategies module**
 
-Add `#[cfg(test)]` strategies (in buffer.rs's test mod or a shared `cfg(test)` helper):
+`prop_unicode_string` is used by T1/T2/T3/T4 (buffer/change/history test mods) — but it uses
+`proptest::` so it CANNOT live in the proptest-free `test_support`. Create a separate
+**`#[cfg(test)]`-only** strategies module (proptest IS available under `cfg(test)`):
+`wordcartel-core/src/proptest_strategies.rs`:
 ```rust
+//! Shared proptest strategies for the M7 property tests. cfg(test)-only (uses proptest, a dev-dep).
 use proptest::prelude::*;
-use crate::test_support::{UNICODE_PALETTE, model_apply, snap};
+use crate::test_support::UNICODE_PALETTE;
 
-/// A unicode-biased string: a sequence of palette pieces.
-fn prop_unicode_string() -> impl Strategy<Value = String> {
+/// A unicode-biased string: a sequence of palette pieces (ASCII + multibyte + combining + ZWJ + emoji).
+pub fn prop_unicode_string() -> impl Strategy<Value = String> {
     proptest::collection::vec(proptest::sample::select(UNICODE_PALETTE), 0..40)
         .prop_map(|parts| parts.concat())
 }
 ```
+`lib.rs`: `#[cfg(test)] mod proptest_strategies;`. Each test module does
+`use crate::proptest_strategies::prop_unicode_string;` (+ `use crate::test_support::{model_apply, snap};`).
+
+- [ ] **Step 5: T1 proptests (buffer.rs)**
+
+Using `crate::proptest_strategies::prop_unicode_string` and `crate::test_support::{model_apply, snap}`:
 The model-oracle property (insert/delete/slice in lockstep with the `String` model):
 ```rust
 proptest! {
@@ -148,12 +158,12 @@ fn t1_insert_at_non_char_boundary_panics_no_corruption() {
 (Add the delete + slice off-boundary analogues. Wrap the buffer in the closure so a poisoned
 state can't leak — `catch_unwind` over an owned buffer.)
 
-- [ ] **Step 5: Run + gates + commit**
+- [ ] **Step 6: Run + gates + commit**
 
 `cargo test -p wordcartel-core --lib buffer change` green; warning-free build/test-compile; clippy clean on new lines.
 ```bash
-git add wordcartel-core/src/test_support.rs wordcartel-core/src/lib.rs wordcartel-core/src/buffer.rs wordcartel-core/src/change.rs
-git commit -m "test(m7): test_support model module + T1 TextBuffer model oracle"
+git add wordcartel-core/src/test_support.rs wordcartel-core/src/proptest_strategies.rs wordcartel-core/src/lib.rs wordcartel-core/src/buffer.rs wordcartel-core/src/change.rs
+git commit -m "test(m7): test_support + proptest_strategies + T1 TextBuffer model oracle"
 ```
 
 ---
@@ -165,7 +175,7 @@ git commit -m "test(m7): test_support model module + T1 TextBuffer model oracle"
 - Test: change.rs `#[cfg(test)] mod`
 
 **Interfaces:**
-- Consumes: `test_support::{model_apply, snap, UNICODE_PALETTE}`; `prop_unicode_string` (lift it to a shared `cfg(test)` location or re-declare in change.rs's test mod).
+- Consumes: `test_support::{model_apply, snap, UNICODE_PALETTE}`; `crate::proptest_strategies::prop_unicode_string` (the shared cfg(test) module from Task 1); `crate::change::Op` (for the `from_ops` replace build).
 
 - [ ] **Step 1: T2 — apply == naive String splice (failing-or-passing property)**
 
@@ -181,27 +191,27 @@ proptest! {
         text in prop_unicode_string(),
         p in 0usize..60, dl in 0usize..20, ins in prop_unicode_string(),
     ) {
+        use crate::change::Op;       // Op is pub; Op::Insert takes Tendril, NOT String
         let len = text.len();
         let at = snap(&text, p.min(len));
         let end = snap(&text, (at + dl).min(len));
-        // build the real changeset (insert when del==0, else a delete+insert via from_ops or two ops)
-        let cs = if end == at {
-            ChangeSet::insert(at, &ins, len)
-        } else {
-            // delete [at,end) then insert — use the real constructors / from_ops
-            // (a delete followed by an insert at the same point); see change.rs for the
-            // exact multi-op build (Retain(at), Delete(end-at), Insert(ins), Retain(len-end)).
-            ChangeSet::from_ops(/* ops as above */ , len)
-        };
+        // Build a REAL replace changeset (delete [at,end) AND insert `ins` at `at`) so the
+        // property exercises replace, not just insert/delete. Op::Insert wants a Tendril.
+        let mut ops = Vec::new();
+        if at > 0 { ops.push(Op::Retain(at)); }
+        if end > at { ops.push(Op::Delete(end - at)); }
+        if !ins.is_empty() { ops.push(Op::Insert(ins.as_str().into())); } // String -> Tendril via .into()
+        if end < len { ops.push(Op::Retain(len - end)); }
+        let cs = ChangeSet::from_ops(ops, len);
         let original = TextBuffer::from_str(&text);
         let inv = cs.invert(&original);                 // INVERT FROM ORIGINAL, before apply
-        let mut buf = original.clone();                 // (TextBuffer: Clone? else from_str(&text))
+        let mut buf = TextBuffer::from_str(&text);       // (TextBuffer derives Clone, but a fresh build is clearest)
         cs.apply(&mut buf);
         let mut model = text.clone();
-        model_apply(&mut model, at, end - at, &ins);
-        prop_assert_eq!(buf.slice(0..buf.len()), model);     // apply == naive splice
+        model_apply(&mut model, at, end - at, &ins);     // exact mirror: replace [at,end) with ins
+        prop_assert_eq!(buf.slice(0..buf.len()), model); // apply == naive splice
         inv.apply(&mut buf);
-        prop_assert_eq!(buf.slice(0..buf.len()), text);      // invert round-trips
+        prop_assert_eq!(buf.slice(0..buf.len()), text);  // invert round-trips
     }
 }
 ```
@@ -277,8 +287,6 @@ proptest! {
         let mut buf = TextBuffer::from_str(&text);
         let mut hist = History::default();
         let mut sel = Selection::single(0);
-        // apply a sequence of insert commits, snapshotting state before each undo test
-        let pre_states: Vec<String> = Vec::new(); let _ = &pre_states;
         for (p, ins) in &edits {
             let at = snap(&buf.slice(0..buf.len()), (*p).min(buf.len()));
             let cs = ChangeSet::insert(at, ins, buf.len());
@@ -288,10 +296,13 @@ proptest! {
             prop_assert!(buf.slice(0..buf.len()).is_char_boundary(sel.primary().head));
         }
         let after_all = buf.slice(0..buf.len());
-        // undo then redo returns the exact state
+        let sel_after_all = sel.clone();
+        // undo then redo returns the exact BUFFER and the exact SELECTION (redo returns the
+        // post-edit `after` selection — assert it, don't drop it — the spec's "undo->redo exact").
         if hist.undo(&mut buf).is_some() {
-            hist.redo(&mut buf);
+            let redo_sel = hist.redo(&mut buf);
             prop_assert_eq!(buf.slice(0..buf.len()), after_all);
+            prop_assert_eq!(redo_sel.unwrap().primary().head, sel_after_all.primary().head);
         }
         // full undo yields the original
         while hist.undo(&mut buf).is_some() {}
@@ -383,7 +394,7 @@ repo root is UNAFFECTED (the fuzz crate is not in the main workspace).
 use libfuzzer_sys::fuzz_target;
 use arbitrary::Arbitrary;
 use wordcartel_core::buffer::TextBuffer;
-use wordcartel_core::change::ChangeSet;
+use wordcartel_core::change::{ChangeSet, Op};
 use wordcartel_core::test_support::{model_apply, snap};
 
 #[derive(Arbitrary, Debug)]
@@ -398,11 +409,15 @@ fuzz_target!(|input: FuzzInput| {
         let len = model.len();
         let at = snap(&model, op.at % (len + 1));
         let end = snap(&model, (at + (op.del % (len - at + 1))).min(len));
-        let cs = if end == at { ChangeSet::insert(at, &op.ins, len) }
-                 else { /* delete [at,end) — build via the real constructor / from_ops */ ChangeSet::delete(at..end, len) };
-        // (a combined delete+insert can be two sequential ops; keep it simple: delete then insert)
-        cs.apply(&mut buf);
-        model_apply(&mut model, at, end - at, if end == at { &op.ins } else { "" });
+        // A real REPLACE per op (delete [at,end) AND insert `ins`) so every op uses op.ins and
+        // the model mirrors EXACTLY (replace [at,end) with ins). Build via from_ops.
+        let mut ops = Vec::new();
+        if at > 0 { ops.push(Op::Retain(at)); }
+        if end > at { ops.push(Op::Delete(end - at)); }
+        if !op.ins.is_empty() { ops.push(Op::Insert(op.ins.as_str().into())); }
+        if end < len { ops.push(Op::Retain(len - end)); }
+        ChangeSet::from_ops(ops, len).apply(&mut buf);
+        model_apply(&mut model, at, end - at, &op.ins);
         assert_eq!(buf.slice(0..buf.len()), model, "apply pipeline diverged from the model");
     }
 });
@@ -460,7 +475,13 @@ git commit -m "test(m7): cargo-fuzz crate — F1 apply pipeline + F2 block_tree 
 
 **Type consistency:** `test_support::{model_apply, EditOp, snap, UNICODE_PALETTE}` referenced consistently; `incremental_equals_full(&str, Range, &str) -> bool` defined (Task 4) before its fuzz use (Task 5); the fuzz DTO is fuzz-local (orphan-rule-clean); invert computed from the original before apply (T2); map_pos positions from char boundaries (T3).
 
-**Placeholder scan:** the multi-op ChangeSet build in T2/F1 (delete+insert) says "build via the real constructor / from_ops" — the implementer must mirror the model splice EXACTLY (the dominant correctness point); `TextBuffer: Clone?` is flagged (use `from_str(&text)` if not Clone). The exact map_pos bias is pinned against the existing unit test. Everything else is concrete.
+**Placeholder scan:** resolved per the Codex plan review — T2/F1 now build a concrete `from_ops`
+replace (`Op::Insert(ins.as_str().into())` → Tendril) that mirrors `model_apply(at, end-at, ins)`
+exactly (the #1 correctness point); `TextBuffer` derives `Clone` (the code uses `from_str` for
+clarity); `prop_unicode_string` lives in the shared `#[cfg(test)] proptest_strategies` module
+(not `test_support`, which is proptest-free); T4 asserts redo's returned selection (not dropping
+it); the `map_pos` bias is pinned against change.rs's `map_pos(2)==4`/`map_pos_before(2)==2` unit
+test. Everything is concrete.
 
 **Ordering:** Task 1 (test_support) first — Tasks 2/3/5 import it. Task 4 (the lift) before Task 5 (the fuzz target uses it). Each task leaves the main workspace compiling + green; the fuzz crate (Task 5) is separate + bounded.
 
