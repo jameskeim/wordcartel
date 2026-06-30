@@ -4,6 +4,12 @@
 
 pub mod block_tree;
 pub mod buffer;
+
+#[cfg(any(test, fuzzing))]
+pub mod test_support;
+
+#[cfg(test)]
+mod proptest_strategies;
 pub mod change;
 pub mod count;
 pub mod history;

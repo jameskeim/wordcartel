@@ -215,4 +215,71 @@ mod tests {
         assert_eq!(b.clamp_to_boundary(0), 0);
         assert_eq!(b.clamp_to_boundary(3), 3);
     }
+
+    // ── T1: TextBuffer model oracle ───────────────────────────────────────────
+
+    use proptest::prelude::*;
+    use crate::proptest_strategies::prop_unicode_string;
+    use crate::test_support::{model_apply, snap};
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        #[test]
+        fn t1_textbuffer_matches_string_model(
+            text in prop_unicode_string(),
+            // a sequence of (op-choice, position, del-len, insert) tuples
+            ops in proptest::collection::vec(
+                (0u8..3, 0usize..60, 0usize..20, prop_unicode_string()), 0..12),
+        ) {
+            let mut buf = TextBuffer::from_str(&text);
+            let mut model = text.clone();
+            for (which, p, dl, ins) in ops {
+                let at = snap(&model, p.min(model.len()));
+                match which {
+                    0 => { buf.insert(at, &ins); model_apply(&mut model, at, 0, &ins); }
+                    1 => {
+                        let end = snap(&model, (at + dl).min(model.len()));
+                        buf.delete(at..end); model_apply(&mut model, at, end - at, "");
+                    }
+                    _ => {
+                        let end = snap(&model, (at + dl).min(model.len()));
+                        prop_assert_eq!(buf.slice(at..end), model[at..end].to_string());
+                    }
+                }
+                prop_assert_eq!(buf.len(), model.len());
+                prop_assert_eq!(buf.slice(0..buf.len()), model.clone());
+            }
+        }
+    }
+
+    /// "é" is 2 bytes (U+00E9 = [0xC3, 0xA9]); offset 1 is mid-char — insert must panic.
+    #[test]
+    fn t1_insert_at_non_char_boundary_panics_no_corruption() {
+        let panicked = std::panic::catch_unwind(|| {
+            let mut buf = TextBuffer::from_str("é");
+            buf.insert(1, "x"); // off-boundary → release-assert
+        });
+        assert!(panicked.is_err(), "off-boundary insert must be refused (panic), never UB");
+    }
+
+    /// delete with range.end landing mid-char must panic without corrupting state.
+    #[test]
+    fn t1_delete_at_non_char_boundary_panics_no_corruption() {
+        let panicked = std::panic::catch_unwind(|| {
+            let mut buf = TextBuffer::from_str("é");
+            buf.delete(0..1); // range.end=1 is mid-é → release-assert
+        });
+        assert!(panicked.is_err(), "off-boundary delete must be refused (panic), never UB");
+    }
+
+    /// slice with range.start landing mid-char must panic.
+    #[test]
+    fn t1_slice_at_non_char_boundary_panics() {
+        let panicked = std::panic::catch_unwind(|| {
+            let buf = TextBuffer::from_str("é");
+            let _ = buf.slice(1..2); // range.start=1 is mid-é → release-assert
+        });
+        assert!(panicked.is_err(), "off-boundary slice must be refused (panic), never UB");
+    }
 }

@@ -551,12 +551,12 @@ mod tests {
             let original = TextBuffer::from_str(&text);
             let len = original.len();
             // clamp to valid byte boundaries by snapping onto char starts
-            let at = snap(&text, at.min(len));
+            let at = crate::test_support::snap(&text, at.min(len));
             // build either an insert or a bounded delete
             let cs = if del_len == 0 || at >= len {
                 ChangeSet::insert(at, &ins, len)
             } else {
-                let end = snap(&text, (at + del_len).min(len));
+                let end = crate::test_support::snap(&text, (at + del_len).min(len));
                 ChangeSet::delete(at..end, len)
             };
             let inv = cs.invert(&original);
@@ -565,14 +565,6 @@ mod tests {
             inv.apply(&mut b);
             prop_assert_eq!(b.to_string(), text);
         }
-    }
-
-    // test helper: snap a byte index down to the nearest char boundary
-    fn snap(s: &str, mut i: usize) -> usize {
-        while i < s.len() && !s.is_char_boundary(i) {
-            i -= 1;
-        }
-        i.min(s.len())
     }
 
     /// Alphabet that includes multi-byte graphemes: ASCII letters, accented chars,
@@ -628,10 +620,10 @@ mod tests {
             // Derive c1 (start of Delete) and c2_start (end of Delete) as char-boundary
             // byte offsets, guaranteed c1 < c2_start < len.
             let raw_c1 = 1 + (c1_frac * (len - 1)) / 100;
-            let c1 = snap(doc, raw_c1.min(len - 1));
+            let c1 = crate::test_support::snap(doc, raw_c1.min(len - 1));
 
             let raw_c2_start = 1 + (d_frac * (len - 1)) / 100;
-            let c2_start = snap(doc, raw_c2_start.min(len - 1));
+            let c2_start = crate::test_support::snap(doc, raw_c2_start.min(len - 1));
 
             // Need c1 < c2_start with at least one char retained at the tail.
             if c1 == 0 || c2_start <= c1 || c2_start == len { return Ok(()); }
@@ -660,6 +652,85 @@ mod tests {
             inv.apply(&mut b);
             prop_assert_eq!(b.to_string(), text,
                 "round-trip failed: c1={} d={} ins={:?} c2={}", c1, d, ins, c2);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        /// T2 — `apply` == naive String splice, and `invert` round-trips.
+        ///
+        /// For every (text, p, dl, ins): build a real replace ChangeSet (Retain/Delete/Insert/Retain),
+        /// verify that `apply` yields the same bytes as `replace_range(at..end, ins)` on a String,
+        /// then verify `invert` restores the original. Covers empty doc, replace-at-0, replace-at-len,
+        /// and multibyte/emoji char boundaries (via `prop_unicode_string`).
+        /// NOTE: `invert` is computed BEFORE `apply` — it captures the about-to-be-deleted bytes.
+        #[test]
+        fn t2_apply_equals_string_splice(
+            text in crate::proptest_strategies::prop_unicode_string(),
+            p in 0usize..60, dl in 0usize..20,
+            ins in crate::proptest_strategies::prop_unicode_string(),
+        ) {
+            let len = text.len();
+            let at  = crate::test_support::snap(&text, p.min(len));
+            let end = crate::test_support::snap(&text, (at + dl).min(len));
+            // Omit zero-length ops — from_ops validates retain+delete == len_before.
+            let mut ops = Vec::new();
+            if at > 0          { ops.push(Op::Retain(at)); }
+            if end > at        { ops.push(Op::Delete(end - at)); }
+            if !ins.is_empty() { ops.push(Op::Insert(ins.as_str().into())); }
+            if end < len       { ops.push(Op::Retain(len - end)); }
+            let cs       = ChangeSet::from_ops(ops, len);
+            let original = TextBuffer::from_str(&text);
+            let inv      = cs.invert(&original);         // invert BEFORE apply
+            let mut buf  = TextBuffer::from_str(&text);
+            cs.apply(&mut buf);
+            let mut model = text.clone();
+            crate::test_support::model_apply(&mut model, at, end - at, &ins);
+            prop_assert_eq!(buf.slice(0..buf.len()), model); // apply == naive splice
+            inv.apply(&mut buf);
+            prop_assert_eq!(buf.slice(0..buf.len()), text);  // invert round-trips
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        /// T3 — `map_pos`/`map_pos_before` are on-boundary, monotonic, and correctly biased.
+        ///
+        /// For a pure insert ChangeSet: both functions produce output positions that land on char
+        /// boundaries in the new doc; both are monotone (p1 ≤ p2 → f(p1) ≤ f(p2)); and at the
+        /// insertion point the before-bias stays left while the after-bias lands right
+        /// (`map_pos_before(at) ≤ map_pos(at)`).
+        #[test]
+        fn t3_map_pos_boundary_monotonic_bias(
+            text in crate::proptest_strategies::prop_unicode_string(),
+            at in 0usize..60, ins in crate::proptest_strategies::prop_unicode_string(),
+            q1 in 0usize..60, q2 in 0usize..60,
+        ) {
+            let len = text.len();
+            let at  = crate::test_support::snap(&text, at.min(len));
+            let cs  = ChangeSet::insert(at, &ins, len);
+            let new_text = {
+                let mut m = text.clone();
+                crate::test_support::model_apply(&mut m, at, 0, &ins);
+                m
+            };
+            // Derive two sorted char-boundary positions in the old doc.
+            let (p1, p2) = (
+                crate::test_support::snap(&text, q1.min(len))
+                    .min(crate::test_support::snap(&text, q2.min(len))),
+                crate::test_support::snap(&text, q1.min(len))
+                    .max(crate::test_support::snap(&text, q2.min(len))),
+            );
+            // on-boundary: outputs land on char boundaries of the new doc
+            prop_assert!(new_text.is_char_boundary(map_pos(p1, &cs)));
+            prop_assert!(new_text.is_char_boundary(map_pos_before(p1, &cs)));
+            // monotonic
+            prop_assert!(map_pos(p1, &cs) <= map_pos(p2, &cs));
+            prop_assert!(map_pos_before(p1, &cs) <= map_pos_before(p2, &cs));
+            // bias at the insertion point: before stays left, after lands right
+            prop_assert!(map_pos_before(at, &cs) <= map_pos(at, &cs));
         }
     }
 
