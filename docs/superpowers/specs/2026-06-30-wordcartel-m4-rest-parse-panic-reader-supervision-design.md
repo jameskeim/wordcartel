@@ -22,10 +22,12 @@ but explicitly deferred two failure modes (`term.rs:92` documents the gap):
    went away), `msg_rx` never disconnects, so the main loop silently hangs —
    visually alive, totally unresponsive, terminal still in raw/alt-screen mode.
 
-This effort closes both. It is **entirely shell-side** and reuses existing
-machinery (`panicx::catch`, the `recovery` dump, the `Msg` channel). The
-functional core (`wordcartel-core`, `#![forbid(unsafe_code)]`) is untouched, with
-one possible trivial exception called out below.
+This effort closes both. It is **almost entirely shell-side** and reuses existing
+machinery (`panicx::catch`, the `recovery` dump, the `Msg` channel). The only
+functional-core (`wordcartel-core`, `#![forbid(unsafe_code)]`) change is one
+trivial **pure** constructor — `block_tree::empty_tree(len)` — needed for the
+parse-panic fallback (no `unsafe`, no parsing; `Block`/`BlockTree` fields are
+already public, so it is a thin wrapper).
 
 ## Goals
 
@@ -50,14 +52,17 @@ one possible trivial exception called out below.
 
 - `wordcartel/src/panicx.rs:5` — `pub(crate) fn catch<T>(f: impl FnOnce() -> T) -> Result<T, String>`
   (wraps `catch_unwind(AssertUnwindSafe(f))`, maps the payload to a `String`).
-- `wordcartel/src/recovery.rs` — the panic-time recovery dump invoked by the hook
-  (`recovery::dump_on_panic`, called at `term.rs` in `install_panic_hook`). The
-  plan confirms the exact entry to call on a graceful input-loss shutdown (reuse
-  `dump_on_panic`, or a sibling non-panic dump if one is cleaner).
+  This effort extends `panicx` with a **thread-local caught-panic guard** (see the
+  panic-hook interaction in Goal 1) so a main-thread caught panic suppresses the
+  hook's teardown.
+- `wordcartel/src/recovery.rs:30` — `recovery::dump_on_panic()` — public, zero-arg,
+  NOT tied to panic metadata; invoked by the hook AND callable directly from the
+  main loop on a graceful input-loss shutdown. It dumps `LAST_GOOD` (recorded
+  per-edit at `editor.rs:215`).
 - `wordcartel/src/term.rs:96` — `install_panic_hook()`; `term.rs:80`
-  `should_handle_panic(panicking, main) -> bool` (main-thread-gated). The terminal
-  restore sequence (`disable_raw_mode` + `LeaveAlternateScreen` + show cursor) used
-  by the hook is the same teardown the input-loss path must run.
+  `should_handle_panic(panicking, main) -> bool` (main-thread-gated). Normal
+  teardown (terminal restore) is RAII via `TerminalGuard::drop` (`term.rs:65`).
+  The hook also runs the restore + `dump_on_panic` on a real main-thread panic.
 - `editor.status: String` — the status-line field, set by mutating it in `reduce`
   or its callees.
 
@@ -77,42 +82,62 @@ All block-tree parsing flows through three call sites:
 and assigns it at `derive.rs:107`:
 `editor.active_mut().document.blocks = new_blocks`.
 
+### Panic-hook interaction (the load-bearing detail)
+
+`catch_unwind` does **not** stop the installed panic hook: Rust runs the hook *at
+the panic site, before* the stack unwinds and before `catch_unwind` returns. So a
+caught **main-thread** parse panic would still fire `term.rs`'s hook — which
+restores the terminal and calls `dump_on_panic` — defeating "catch and keep
+running." (Latent today only because every existing `catch` site is on a non-main
+thread, where `should_handle_panic` already returns `false`.)
+
+**Fix — a thread-local caught-panic guard in `panicx`:**
+- A thread-local flag (e.g. `CAUGHT_GUARD: Cell<bool>`). `panicx::catch` wraps its
+  `catch_unwind` in a **save/restore RAII guard** (`prev = flag.replace(true)`;
+  `Drop` sets `flag = prev`) — re-entrant-safe — established *before* the
+  `catch_unwind` so the flag is still `true` when the hook runs at the panic site.
+- The hook (`term.rs`) consults it: teardown only when
+  `should_handle_panic(current, main) && !panicx::caught_guard_active()`.
+- Effect: a panic *inside* a `panicx::catch` closure on the main thread suppresses
+  the hook's teardown (the `catch` owns the failure); a genuine uncaught
+  main-thread panic still triggers the hook normally. Worker threads are unaffected
+  (already gated off). This makes `panicx::catch` correct on the main thread, which
+  it was not before.
+
 ### Design
 
 Factor `rebuild`'s "compute the new tree" step into a single guarded operation so
-a panic from **either** branch is caught at one point:
+a panic from **either** branch (95 or 104) is caught at one point. On `Ok`, assign
+the new tree and clear the degraded flag; on `Err`, install the **empty-tree
+fallback** and set the degraded flag:
 
 ```
-let prev = editor.active().document.blocks.clone();   // cheap: BlockTree is the prior state, already owned
+let new_len = new_rope.len_bytes();
 let computed: Result<BlockTree, String> = panicx::catch(|| {
     // the existing branch logic: incremental_update_rope(..) or full_parse_rope(..)
 });
-match computed {
-    Ok(tree) => { editor.active_mut().document.blocks = tree; clear_parse_degraded(editor); }
-    Err(_msg) => { /* keep prev: do NOT overwrite document.blocks */ set_parse_degraded(editor); }
-}
+let tree = match computed {
+    Ok(t)  => { clear_parse_degraded(app);              t }
+    Err(_) => { set_parse_degraded(app, editor);        block_tree::empty_tree(new_len) }
+};
+editor.active_mut().document.blocks = tree;
 ```
 
-(The `clone()` of the previous tree is only needed if the borrow of
-`editor.active().document.blocks` inside the closure conflicts with the later
-mutable borrow; the plan picks the minimal borrow-safe shape — e.g. read the
-inputs out first, then `catch`, then assign — to avoid an unnecessary clone on the
-hot path. The hot path must stay `O(visible)+O(edited)`; the only added cost on a
-**successful** parse is the `catch_unwind` frame, which is negligible.)
+The hot path stays `O(visible)+O(edited)`: the only added cost on a **successful**
+parse is the `catch_unwind` frame (negligible). No previous-tree clone is needed.
 
-**Fallback trees:**
-- `derive::rebuild`: **reuse the previous `BlockTree`** (do not overwrite
-  `document.blocks`). Preserves folds and outline state; the worst case is stale
-  block roles for the edited region until the next successful parse. Consumers
-  (`role_at`, fold/nav/transform/outline) tolerate a tree whose spans lag the
-  buffer — they return defaults for out-of-range offsets, never panic.
-- `Buffer::from_text` (`editor.rs:127`): there is **no** previous tree, so fall
-  back to an **empty Document-root `BlockTree`** (a `Document` root spanning
-  `0..len`, no children → every `role_at` returns the default `Paragraph`). Use an
-  existing public empty/plain constructor if `wordcartel-core` exposes one;
-  otherwise add a trivial **pure** `block_tree` constructor (e.g.
-  `pub fn empty_tree(len: usize) -> BlockTree`) — the only candidate core change,
-  and it introduces no `unsafe` and no parsing.
+**Fallback tree — empty-tree, uniformly (Q1 revised → A).** On any caught parse
+panic, set `document.blocks` to an **empty Document-root `BlockTree`** spanning
+`0..new_len` with no children. This is used at **all three seams** (both
+`derive::rebuild` branches and `Buffer::from_text`). Rationale: an empty tree has
+**no child spans**, so the span-slicing consumers (fold / outline / nav /
+transform) cannot slice the current rope out of range — eliminating the
+secondary-panic hazard that reusing a now-stale previous tree (whose spans lag the
+mutated buffer) would create. `role_at` returns the default `Paragraph` everywhere.
+Cost: during a parse-panic episode the document transiently shows no heading
+styling / folds / outline; all of it is restored on the next successful parse. The
+empty tree spans `0..new_len` so even its single root span matches the current
+rope. Requires the trivial pure core constructor `block_tree::empty_tree(len)`.
 
 **Deduped status (Q1).** Add app-level parse-degraded state (a `bool`, e.g.
 `parse_degraded` on the run-loop/App state):
@@ -142,6 +167,13 @@ parse is synchronous, so the `Err` is handled inline in `rebuild`.
 ### Design
 
 1. **New variant:** `Msg::InputThreadDied` (added to the `Msg` enum at `app.rs:26`).
+   This obliges updates the spec must account for: the **manual `Debug` impl**
+   (`app.rs:65–103`) gets a new arm, and the **main exhaustive `match msg`**
+   (`app.rs:1651–1756`) gets a new arm. **Routing:** the modal/overlay match
+   (`app.rs:1403–1442`) uses a catch-all `_ => {}` that would *swallow*
+   `InputThreadDied` while a prompt/overlay is open — so the variant MUST be
+   handled at the top of message dispatch, **before** any modal/overlay
+   interception, so the shutdown fires regardless of UI state.
 2. **Keep the handle + watchdog.** Capture the input thread's `JoinHandle` and
    spawn one tiny watchdog thread (`wcartel-input-watchdog`) holding a `msg_tx`
    clone:
@@ -153,14 +185,20 @@ parse is synchronous, so the `Err` is handled inline in `rebuild`.
    No false positive on normal quit: on quit the input thread is still blocked in
    `read()` (uninterruptible), so `join()` stays blocked and the watchdog is reaped
    by process exit — `InputThreadDied` is sent only on a genuine death.
-3. **Shutdown path.** The main loop, on `Msg::InputThreadDied`, breaks carrying a
-   distinct exit reason. Introduce a small `ExitReason` the loop returns to `run()`:
-   `Normal` (existing quit/disconnect) vs `InputLost`. `run()` inspects it:
-   - always run the existing terminal teardown (restore from raw/alt-screen);
-   - for `InputLost`: additionally invoke the recovery dump
-     (`recovery::dump_on_panic` or its non-panic sibling), print a one-line reason
-     to stderr (e.g. `"input reader stopped — terminal may have closed; recovery
-     written"`), and exit non-zero.
+3. **Shutdown path + exit code.** The main loop, on `Msg::InputThreadDied`, breaks
+   carrying a distinct reason. Introduce a small `ExitReason` { `Normal`,
+   `InputLost` } that the loop produces and `run()` returns to `main()`. Sequence
+   (ordering matters because `std::process::exit` runs **no** destructors):
+   - On the `InputLost` break, before returning, call `recovery::dump_on_panic()`
+     (persist unsaved work — independent of the terminal).
+   - `run()` returns normally so its `TerminalGuard` **drops** (restoring the
+     terminal via RAII, `term.rs:65`) — the terminal is sane *before* any exit call.
+   - `run()` returns `ExitReason` (its signature widens from `io::Result<()>` to
+     `io::Result<ExitReason>`, or it returns the reason alongside its `Result`).
+   - `main()` maps the reason: `Normal` → exit 0; `InputLost` → print a one-line
+     reason to stderr (e.g. `"input reader stopped — terminal may have closed;
+     recovery written"`) and `std::process::exit(<non-zero>)` *after* `run()` has
+     returned (guard already dropped, terminal already restored).
    Factoring the decision into `ExitReason` keeps it unit-testable without real
    thread teardown.
 
@@ -171,32 +209,43 @@ terminal from a non-main thread (which would race concurrent terminal writes).
 
 ## Goal 2b — clipboard-death notice (Q4 → B)
 
-The clipboard-intent drain (`app.rs` ~45–48) already detects a dead clipboard
-worker: `clip_tx.send(ClipReq::Get{..})` returning `Err` synthesizes a fallback
-`Msg::ClipboardPaste { text: None }`, and `clip_tx.send(ClipReq::Set(..))` is
-best-effort-ignored. At that existing `Err` detection point, additionally set
-`editor.status = "clipboard unavailable"` so a silently-failing copy/paste is no
-longer mysterious. ~1–2 lines; no watchdog, no new `Msg`. The clipboard `Get`
-fallback-to-`None` behavior is unchanged.
+The clipboard-intent drain (`clipboard.rs:34`, called from `app.rs:2095`) handles
+the two request paths asymmetrically today: `clip_tx.send(ClipReq::Get{..})`
+already checks `.is_err()` and synthesizes a fallback `Msg::ClipboardPaste { text:
+None }`, but `clip_tx.send(ClipReq::Set(..))` is `let _ = …` — **silently
+ignored, with no error detection to extend**. So this effort:
+- On the **`Get`** path: at the existing `Err` branch, additionally set
+  `editor.status = "clipboard unavailable"` (the `text: None` fallback is unchanged).
+- On the **`Set`** path: *add* `Err` detection (replace `let _ =` with an
+  `if …is_err()` arm) that sets the same `editor.status = "clipboard unavailable"`.
+
+`Editor.status` is public (`editor.rs:293`) and in scope at the drain. ~3–4 lines;
+no watchdog, no new `Msg`.
 
 ## Error-handling summary
 
 | Failure | Response | Data loss? | Terminal | Process |
 |---|---|---|---|---|
-| Markdown parse panic | deduped status, reuse previous tree (empty tree on first parse) | none (text untouched) | intact | keeps running |
+| Markdown parse panic | deduped status, empty-tree fallback (uniform; hook suppressed via guard) | none (text untouched) | intact | keeps running |
 | Input thread death | terminal restored + recovery dump + stderr reason | none (dump persists work) | restored | exit non-zero |
 | Clipboard worker death | status "clipboard unavailable" | none | intact | keeps running |
 
 ## Testing
 
 - **Parse boundary (deterministic):** factor the guarded compute so a test can
-  pass a **panicking closure** in place of the real parse and assert: previous
-  tree reused (unchanged `document.blocks`), `parse_degraded` set, status text
-  set; then a succeeding closure clears `parse_degraded` and the notice. A
-  `Buffer::from_text`-style test asserts the empty-tree fallback on first-parse
-  panic. *Best-effort:* if the real `pulldown-cmark` panic input is cheaply
-  reproducible, pin it as an end-to-end regression test (drive `rebuild` with that
-  text, assert no crash + status set); not a blocker if it can't be minimized.
+  pass a **panicking closure** in place of the real parse and assert: `document.blocks`
+  is the **empty-tree fallback** (root span `0..len`, no children), `parse_degraded`
+  set, status text set; then a succeeding closure assigns the real tree, clears
+  `parse_degraded`, and clears the notice. *Best-effort:* if the real
+  `pulldown-cmark` panic input is cheaply reproducible, pin it as an end-to-end
+  regression test (drive `rebuild` with that text, assert no crash + status set);
+  not a blocker if it can't be minimized.
+- **Panic-hook suppression (deterministic):** a test that, with the hook logic
+  factored into a pure predicate, asserts `should_handle_panic(main, main)` returns
+  `true` normally but the teardown is suppressed when the caught-panic guard is
+  active (`caught_guard_active() == true`) — i.e. a main-thread `panicx::catch`
+  around a panicking closure does **not** select the teardown path. (Test the
+  predicate + guard state, not a real terminal teardown.)
 - **Input watchdog (deterministic):** spawn a thread that returns immediately, run
   the watchdog join+send logic, assert `Msg::InputThreadDied` arrives on the
   channel. Separately, a unit test that the loop given `Msg::InputThreadDied`
@@ -208,12 +257,21 @@ fallback-to-`None` behavior is unchanged.
 
 ## Plan-confirms (resolve during the implementation plan, against real source)
 
-1. The exact recovery-dump entry to call on graceful `InputLost` shutdown
-   (`recovery::dump_on_panic` vs a non-panic variant) and how `run()` currently
-   tears the terminal down on normal exit (so `InputLost` reuses it + adds dump).
-2. Whether `wordcartel-core` already exposes a public empty/plain `BlockTree`
-   constructor; if not, add the trivial pure `block_tree::empty_tree(len)`.
-3. The borrow-safe shape of the guarded `rebuild` step that avoids cloning the
-   previous tree on the successful hot path.
-4. Exact `Msg` enum location/derives and the `reduce`/loop site that must match
-   `Msg::InputThreadDied`, plus where `parse_degraded` state lives (App vs Editor).
+1. The exact `new_len` accessor in `rebuild` for `empty_tree(new_len)` (the new
+   rope's byte length) and the `Buffer::from_text` length for its fallback.
+2. The precise shape of the `panicx` caught-panic guard (thread-local `Cell<bool>`
+   + save/restore RAII) and the exact `term.rs` hook edit that consults
+   `caught_guard_active()`; confirm the guard is established before `catch_unwind`
+   so it is live when the hook runs at the panic site.
+3. `run()`'s current signature/teardown (`TerminalGuard` drop at `term.rs:65`) and
+   the minimal `ExitReason` threading into `main()`; confirm `dump_on_panic()` is
+   called before `run()` returns and `process::exit` only after.
+4. The exact `Msg` enum derives + the three match sites to update (manual `Debug`
+   `app.rs:65–103`; main `match msg` `app.rs:1651–1756`; the pre-modal dispatch
+   point so `InputThreadDied` bypasses the overlay `_ => {}` at `app.rs:1403–1442`),
+   plus where `parse_degraded` state lives (App run-loop state vs `Editor`).
+5. `block_tree::empty_tree(len)` — confirm `BlockTree`/`Block` public fields and the
+   `BlockKind::Document` root shape so the constructor is a thin pure wrapper.
+6. The clipboard drain signature at `clipboard.rs:34` — that `editor` (for
+   `editor.status`) is reachable to set the notice on both the `Get` and `Set`
+   `Err` branches.
