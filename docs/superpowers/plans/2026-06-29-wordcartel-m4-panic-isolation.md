@@ -105,15 +105,23 @@ pub mod panicx;
 
 - [ ] **Step 4: Correct the stale term.rs comment**
 
-In `wordcartel/src/term.rs` (~lines 90-93), the doc comment wrongly claims the clipboard/input
-reader threads catch their own panics. Replace the inaccurate clause:
+There are **TWO** stale comment blocks in `term.rs`, BOTH wrongly claiming the clipboard/input
+reader threads catch their own panics (Codex):
+- the **doc comment** (~lines 90-93, "...is caught by the thread's own `catch_unwind`..."), and
+- the **inline hook comment** (~lines 102-104, "Non-main-thread panic (job/clipboard/input
+  worker): caught by the thread's own catch_unwind...").
+
+Correct BOTH to: the job WORKER's panic is surfaced by the executor (M4); the hook must not
+touch the terminal off the main thread; but the clipboard helper and input reader threads are
+NOT yet guarded — a panic there is a separate (deferred) failure mode. e.g. the doc comment:
 ```rust
-/// the dump + terminal restore.  A non-main-thread panic in the job WORKER is caught by the
-/// executor (it surfaces the panic as a failed job, M4); the hook must not touch the terminal
-/// off the main thread or it corrupts the live UI.  NOTE: the clipboard helper and input reader
-/// threads are NOT yet guarded — a panic there is a separate (deferred) failure mode.
+/// Only the main thread (the one that called `install_panic_hook`) triggers the dump +
+/// terminal restore.  A non-main-thread panic in the job WORKER is surfaced by the executor
+/// as a failed job (M4); the hook must not touch the terminal off the main thread or it
+/// corrupts the live UI.  NOTE: the clipboard helper and input reader threads are NOT yet
+/// guarded — a panic there is a separate (deferred) failure mode.
 ```
-(Match the surrounding comment style; keep the "hook must not touch the terminal off-main" point.)
+(Match the surrounding style; keep the "hook must not touch the terminal off-main" point in both.)
 
 - [ ] **Step 5: Run tests + gates + commit**
 
@@ -205,7 +213,8 @@ fn panicked_save_keeps_dirty_and_aborts_quit() {
     let id = e.active().id;
     // Arm a save-then-quit, then deliver a Panicked Save outcome for it.
     e.pending_after_save = Some(crate::editor::PendingAfterSave {
-        buffer_id: id, version: 1, action: crate::editor::PostSaveAction::Quit });
+        buffer_id: id, version: 1, action: crate::editor::PostSaveAction::Quit, at_ms: 0 });
+    // (PendingAfterSave has a 4th field `at_ms: u64` — editor.rs:36; include it.)
     crate::app::apply_outcome(
         crate::jobs::JobOutcome::Panicked {
             buffer_id: id, class: crate::jobs::ResultClass::Durability, version: 1,
@@ -285,8 +294,11 @@ pub fn apply_job_outcome(outcome: crate::jobs::JobOutcome, editor: &mut Editor, 
 
 - [ ] **Step 4: Grep-audit + thread the `JobOutcome` type through EVERY drain/apply site**
 
-Run `rg '\.drain\(|apply_result|apply_job_result|is_stale' wordcartel/src/` and update EVERY hit
-(production AND tests). The list is large and scattered — the grep is authoritative. Mechanically:
+Run `rg '\.drain\(|apply_result|apply_job_result|is_stale|JobDone' wordcartel/src/` and update
+EVERY hit (production AND tests). The list is large and scattered — the grep is authoritative.
+**Includes `Msg::JobDone`:** its payload is a `JobResult` (app.rs:28) — change it to
+`JobOutcome`, update its `Debug` arm (app.rs:69), and route its handler through
+`apply_job_outcome`. Mechanically:
 - Production `reduce`/loop sites that did `for r in ex.drain() { apply_job_result(r, …) }` →
   `for o in ex.drain() { apply_job_outcome(o, …) }`. Sites that called `apply_result(r, editor)`
   on a drained item → `apply_outcome(o, editor)`.
