@@ -727,13 +727,18 @@ mod tests {
         let id = e.active().id;
         e.pending_after_save = Some(crate::editor::PendingAfterSave {
             buffer_id: id, version: 1, action: crate::editor::PostSaveAction::Quit, at_ms: 0 });
+        // An active quit drain must be ABORTED (not stranded) when the awaited save panics.
+        e.quit_drain = Some(crate::editor::QuitDrain {
+            queue: std::collections::VecDeque::new(), mode: crate::editor::QuitMode::SaveAll });
+        e.quit_drain_advance = true;
         crate::app::apply_outcome(
             crate::jobs::JobOutcome::Panicked {
-                buffer_id: id, class: crate::jobs::ResultClass::Durability, version: 1,
-                kind: crate::jobs::JobKind::Save, msg: "boom".into() },
+                buffer_id: id, version: 1, kind: crate::jobs::JobKind::Save, msg: "boom".into() },
             &mut e);
         assert!(e.active().document.dirty(), "panicked save keeps the buffer dirty");
         assert!(e.pending_after_save.is_none(), "awaited quit must be cleared");
+        assert!(e.quit_drain.is_none(), "the quit drain must be aborted, not stranded");
+        assert!(!e.quit_drain_advance, "quit_drain_advance must be reset");
         assert!(!e.quit, "must NOT quit on a panicked save");
         assert!(e.status.to_lowercase().contains("save"));
         let _ = std::fs::remove_file(&p);

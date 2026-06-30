@@ -582,8 +582,7 @@ mod tests {
         e.active_mut().swap_in_flight = true;
         crate::app::apply_outcome(
             crate::jobs::JobOutcome::Panicked {
-                buffer_id: id, class: crate::jobs::ResultClass::BufferLocal, version: 1,
-                kind: crate::jobs::JobKind::SwapWrite, msg: "boom".into() },
+                buffer_id: id, version: 1, kind: crate::jobs::JobKind::SwapWrite, msg: "boom".into() },
             &mut e);
         assert!(!e.active().swap_in_flight, "panicked swap must clear swap_in_flight");
         let _ = std::fs::remove_file(&p);

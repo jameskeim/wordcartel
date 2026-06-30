@@ -51,7 +51,7 @@ pub struct JobResult {
 /// needed for per-kind cleanup (buffer stays dirty, swap_in_flight cleared, etc.).
 pub enum JobOutcome {
     Done(JobResult),
-    Panicked { buffer_id: crate::editor::BufferId, class: ResultClass, version: u64, kind: JobKind, msg: String },
+    Panicked { buffer_id: crate::editor::BufferId, version: u64, kind: JobKind, msg: String },
 }
 
 /// Staleness now consults the result class + whether the buffer still exists.
@@ -89,10 +89,10 @@ pub struct InlineExecutor {
 
 impl Executor for InlineExecutor {
     fn dispatch(&self, job: Job) {
-        let (buffer_id, class, version, kind) = (job.buffer_id, job.class, job.version, job.kind);
+        let (buffer_id, version, kind) = (job.buffer_id, job.version, job.kind);
         let outcome = match crate::panicx::catch(job.run) {
             Ok(result) => JobOutcome::Done(result),
-            Err(msg) => JobOutcome::Panicked { buffer_id, class, version, kind, msg },
+            Err(msg) => JobOutcome::Panicked { buffer_id, version, kind, msg },
         };
         self.pending.borrow_mut().push(outcome);
     }
@@ -119,10 +119,10 @@ impl ThreadExecutor {
             .spawn(move || {
                 // FIFO: process jobs in dispatch order. Exit when job_tx drops.
                 while let Ok(job) = job_rx.recv() {
-                    let (buffer_id, class, version, kind) = (job.buffer_id, job.class, job.version, job.kind);
+                    let (buffer_id, version, kind) = (job.buffer_id, job.version, job.kind);
                     let outcome = match crate::panicx::catch(job.run) {
                         Ok(result) => JobOutcome::Done(result),
-                        Err(msg) => JobOutcome::Panicked { buffer_id, class, version, kind, msg },
+                        Err(msg) => JobOutcome::Panicked { buffer_id, version, kind, msg },
                     };
                     if result_tx.send(outcome).is_err() { break; }
                     let _ = wake.send(()); // nudge the loop to drain

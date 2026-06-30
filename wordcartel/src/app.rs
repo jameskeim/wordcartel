@@ -179,7 +179,7 @@ pub fn apply_job_result(r: JobResult, editor: &mut Editor, ex: &dyn Executor, cl
 pub fn apply_outcome(outcome: crate::jobs::JobOutcome, editor: &mut Editor) {
     match outcome {
         crate::jobs::JobOutcome::Done(r) => apply_result(r, editor),
-        crate::jobs::JobOutcome::Panicked { buffer_id, version, kind, msg, .. } =>
+        crate::jobs::JobOutcome::Panicked { buffer_id, version, kind, msg } =>
             apply_panic(buffer_id, version, kind, &msg, editor),
     }
 }
