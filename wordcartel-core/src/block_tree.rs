@@ -1106,6 +1106,15 @@ pub fn apply_edit(old_text: &str, range: Range<usize>, replacement: &str) -> (St
     (s, edit)
 }
 
+/// Property oracle (M7 F2): an incremental block-tree update over `[range)`→`repl` must yield the
+/// SAME tree as a full reparse of the resulting text. `cfg(any(test, fuzzing))` so the fuzz crate
+/// (built with --cfg fuzzing) can call it; the cfg(test) unit oracle uses it too.
+#[cfg(any(test, fuzzing))]
+pub fn incremental_equals_full(old: &str, range: std::ops::Range<usize>, repl: &str) -> bool {
+    let (new, edit) = apply_edit(old, range, repl);
+    incremental_update(&full_parse(old), old, &edit, &new) == full_parse(&new)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1389,11 +1398,7 @@ mod tests {
             &edit,
             &ropey::Rope::from_str(&new),
         );
-        assert_eq!(
-            str_tree,
-            full_parse(&new),
-            "str incremental != full_parse"
-        );
+        assert!(incremental_equals_full(old, 9..9, "X"), "str incremental != full_parse");
         assert_eq!(rope_tree, str_tree, "rope incremental != str incremental");
     }
 
