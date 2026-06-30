@@ -979,8 +979,9 @@ pub fn incremental_update_instrumented_src<S: TextSource>(
 /// non-interrupting when it is itself a `Paragraph` (they merge into one) or
 /// `IndentedCode` (an indented line cannot interrupt a paragraph — it is absorbed
 /// as lazy continuation). So if `a` is a Paragraph, `b` is one of those kinds, and
-/// the inter-block gap `[a.end, b.start)` in `new_src` holds no `\n` (no blank line
-/// separates them), a correct full parse would make them ONE paragraph. The
+/// the inter-block gap `[a.end, b.start)` in `new_src` holds no blank line (a
+/// complete line of only spaces/tabs ending in `\n` or `\r\n`) separating them, a
+/// correct full parse would make them ONE paragraph. The
 /// localized splice can manufacture this illegal adjacency at a region seam when an
 /// edit removes the separation (e.g. turns a blank line into a continuation line,
 /// or drops an upstream paragraph-interrupting construct). Detecting it lets the
@@ -998,15 +999,24 @@ fn paragraph_absorbs_next<S: TextSource>(new_src: &S, a: &Block, b: &Block) -> b
         return true; // directly abutting: no separating line at all
     }
     // They fold into one paragraph UNLESS a markdown BLANK line separates them. A
-    // blank line is a COMPLETE line (terminated by '\n') containing ONLY spaces and
-    // tabs — not every '\n' (a `\n` can end a non-blank continuation line), and not
-    // lines holding other "whitespace" such as the vertical tab \u{0b} or form feed,
-    // which CommonMark does NOT treat as blank. So a lone leading-indent run with no
-    // newline (lazy continuation) and a " \u{0b}\n" line both correctly read as
-    // "no blank line" -> merge.
+    // blank line is a COMPLETE line (terminated by a line ending) containing ONLY
+    // spaces and tabs — not every '\n' (a `\n` can end a non-blank continuation
+    // line), and not lines holding other "whitespace" such as the vertical tab
+    // \u{0b} or form feed, which CommonMark does NOT treat as blank. CommonMark
+    // treats `\r\n`, `\r`, and `\n` as line endings, so a CRLF blank line ("\r\n")
+    // must read as blank too — strip an optional trailing '\r' before the
+    // space/tab check. So a lone leading-indent run with no newline (lazy
+    // continuation) and a " \u{0b}\n" line both correctly read as "no blank line"
+    // -> merge, while a "\r\n" gap correctly reads as a blank line -> no merge.
     let gap = new_src.slice(lo..hi);
     let has_blank_line = gap.as_ref().split_inclusive('\n').any(|seg| {
-        seg.ends_with('\n') && seg[..seg.len() - 1].bytes().all(|c| c == b' ' || c == b'\t')
+        if !seg.ends_with('\n') { return false; }
+        // Strip the line ending: the '\n', then an optional '\r' before it (CRLF).
+        // Only '\r' — a vertical tab / form feed before the '\n' is NOT blank
+        // (CommonMark), so the fix-#6 nuance is preserved.
+        let line = &seg[..seg.len() - 1];
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        line.bytes().all(|c| c == b' ' || c == b'\t')
     });
     !has_blank_line
 }
@@ -1316,6 +1326,22 @@ mod tests {
     #[test]
     fn hazard_typing_inside_paragraph_is_local() {
         let doc = "First para.\n\nSecond para here.\n\nThird para.\n";
+        let pos = doc.find("here").unwrap();
+        let out = check(doc, pos..pos, "X");
+        assert_eq!(out.reason, WidenReason::Local);
+        assert!(out.reparsed_bytes < doc.len(), "reparsed {} of {}", out.reparsed_bytes, doc.len());
+    }
+
+    // Regression (M7 final gate): a CRLF document with two adjacent top-level
+    // paragraphs. The seam guard's blank-line predicate must recognize a "\r\n"
+    // blank line — otherwise it reads the gap as "no blank line", concludes the
+    // first paragraph absorbs the next, and forces a FULL REPARSE on ordinary
+    // in-paragraph typing. That would make every keystroke O(document) in CRLF
+    // docs. This test asserts the edit stays on the fast path (WidenReason::Local)
+    // and that the incremental tree equals a full reparse (via `check`).
+    #[test]
+    fn hazard_crlf_paragraph_typing_stays_local() {
+        let doc = "First para.\r\n\r\nSecond para here.\r\n\r\nThird para.\r\n";
         let pos = doc.find("here").unwrap();
         let out = check(doc, pos..pos, "X");
         assert_eq!(out.reason, WidenReason::Local);

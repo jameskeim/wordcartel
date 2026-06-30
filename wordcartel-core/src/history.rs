@@ -421,7 +421,7 @@ mod tests {
             if hist.undo(&mut buf).is_some() {
                 let redo_sel = hist.redo(&mut buf);
                 prop_assert_eq!(buf.slice(0..buf.len()), after_all);
-                prop_assert_eq!(redo_sel.unwrap().primary().head, sel_after_all.primary().head);
+                prop_assert_eq!(redo_sel.unwrap(), sel_after_all);
             }
             // full undo yields the original
             while hist.undo(&mut buf).is_some() {}
@@ -455,6 +455,11 @@ mod tests {
                     .with_selection(Selection::single(at + ch.len()));
                 sel = hist.commit_coalescing(txn, &mut buf, sel.clone(), &clock, EditKind::Type);
             }
+            // Coalescing must actually FIRE: the whole within-window run of same-kind
+            // edits collapses into ONE revision (one undo unit). Without this, "full
+            // undo restores the original" would pass vacuously even if each edit landed
+            // in its own revision — so assert the run is a single revision.
+            prop_assert_eq!(hist.revisions.len(), 1);
             // full undo must restore the exact original text — no chars lost
             while hist.undo(&mut buf).is_some() {}
             prop_assert_eq!(buf.slice(0..buf.len()), original);
