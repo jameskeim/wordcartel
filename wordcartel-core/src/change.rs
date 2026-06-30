@@ -551,12 +551,12 @@ mod tests {
             let original = TextBuffer::from_str(&text);
             let len = original.len();
             // clamp to valid byte boundaries by snapping onto char starts
-            let at = snap(&text, at.min(len));
+            let at = crate::test_support::snap(&text, at.min(len));
             // build either an insert or a bounded delete
             let cs = if del_len == 0 || at >= len {
                 ChangeSet::insert(at, &ins, len)
             } else {
-                let end = snap(&text, (at + del_len).min(len));
+                let end = crate::test_support::snap(&text, (at + del_len).min(len));
                 ChangeSet::delete(at..end, len)
             };
             let inv = cs.invert(&original);
@@ -565,14 +565,6 @@ mod tests {
             inv.apply(&mut b);
             prop_assert_eq!(b.to_string(), text);
         }
-    }
-
-    // test helper: snap a byte index down to the nearest char boundary
-    fn snap(s: &str, mut i: usize) -> usize {
-        while i < s.len() && !s.is_char_boundary(i) {
-            i -= 1;
-        }
-        i.min(s.len())
     }
 
     /// Alphabet that includes multi-byte graphemes: ASCII letters, accented chars,
@@ -628,10 +620,10 @@ mod tests {
             // Derive c1 (start of Delete) and c2_start (end of Delete) as char-boundary
             // byte offsets, guaranteed c1 < c2_start < len.
             let raw_c1 = 1 + (c1_frac * (len - 1)) / 100;
-            let c1 = snap(doc, raw_c1.min(len - 1));
+            let c1 = crate::test_support::snap(doc, raw_c1.min(len - 1));
 
             let raw_c2_start = 1 + (d_frac * (len - 1)) / 100;
-            let c2_start = snap(doc, raw_c2_start.min(len - 1));
+            let c2_start = crate::test_support::snap(doc, raw_c2_start.min(len - 1));
 
             // Need c1 < c2_start with at least one char retained at the tail.
             if c1 == 0 || c2_start <= c1 || c2_start == len { return Ok(()); }
