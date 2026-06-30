@@ -3,6 +3,7 @@
 // Added: symlink refusal, skip-unchanged, mode preservation (#[cfg(unix)]).
 
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -21,6 +22,8 @@ pub enum OpenError {
     IsDir(String),
     #[error("{0}")]
     Io(String),
+    #[error("{0}: too large (> {1} bytes)")]
+    TooLarge(String, u64),
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -51,36 +54,58 @@ fn is_binary(bytes: &[u8]) -> bool {
 // open
 // ---------------------------------------------------------------------------
 
+/// Map an IO error from File::open or read_to_end to the appropriate OpenError.
+/// Preserves BOTH is_dir() disambiguation sites — the NotFound arm (some FS
+/// surfaces a dir-read as NotFound) and the catch-all (some OSes return Other).
+fn map_open_io_err(e: std::io::Error, label: &str, path: &Path) -> OpenError {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => {
+            // Double-check: could be PermissionDenied that looks like NotFound
+            // on some FS. is_dir() does a separate stat — if that fails we keep
+            // NotFound. If the path IS a dir, that takes precedence.
+            if path.is_dir() {
+                OpenError::IsDir(label.to_owned())
+            } else {
+                OpenError::NotFound(label.to_owned())
+            }
+        }
+        std::io::ErrorKind::PermissionDenied => OpenError::Permission(label.to_owned()),
+        _ => {
+            // For anything else, still check IsDir (some OSes return Other
+            // when read() is called on a directory).
+            if path.is_dir() {
+                OpenError::IsDir(label.to_owned())
+            } else {
+                OpenError::Io(format!("{label}: {e}"))
+            }
+        }
+    }
+}
+
 pub fn open(path: &Path) -> Result<String, OpenError> {
     let label = path.display().to_string();
+    let limit = crate::limits::MAX_OPEN_BYTES;
 
-    // Read raw bytes — map the common IO error kinds before anything else.
-    let bytes = match fs::read(path) {
-        Ok(b) => b,
-        Err(e) => {
-            return Err(match e.kind() {
-                std::io::ErrorKind::NotFound => {
-                    // Double-check: could be PermissionDenied that looks like NotFound
-                    // on some FS. is_dir() does a separate stat — if that fails we keep
-                    // NotFound. If the path IS a dir, that takes precedence.
-                    if path.is_dir() {
-                        OpenError::IsDir(label)
-                    } else {
-                        OpenError::NotFound(label)
-                    }
-                }
-                std::io::ErrorKind::PermissionDenied => OpenError::Permission(label),
-                _ => {
-                    // For anything else, still check IsDir (some OSes return Other
-                    // when read() is called on a directory).
-                    if path.is_dir() {
-                        OpenError::IsDir(label)
-                    } else {
-                        OpenError::Io(format!("{label}: {e}"))
-                    }
-                }
-            });
+    // (a) Fast refusal when metadata is trustworthy.
+    if let Ok(meta) = fs::metadata(path) {
+        if meta.is_file() && meta.len() > limit {
+            return Err(OpenError::TooLarge(label, limit));
         }
+    }
+
+    // (b) Bounded read — caps the allocation even if metadata lied (/proc, sparse).
+    let bytes = match fs::File::open(path) {
+        Ok(f) => {
+            let mut buf = Vec::new();
+            if let Err(e) = Read::read_to_end(&mut f.take(limit + 1), &mut buf) {
+                return Err(map_open_io_err(e, &label, path));
+            }
+            if buf.len() as u64 > limit {
+                return Err(OpenError::TooLarge(label, limit));
+            }
+            buf
+        }
+        Err(e) => return Err(map_open_io_err(e, &label, path)),
     };
 
     // Explicit is_dir check AFTER a successful read is unlikely on most OSes, but
@@ -361,6 +386,20 @@ mod tests {
         // Clean up.
         let _ = fs::remove_file(&p);
         let _ = fs::remove_dir(&private_dir);
+    }
+
+    /// open refuses a file larger than MAX_OPEN_BYTES.
+    ///
+    /// A sparse file is created with set_len — no 64 MiB of actual disk I/O.
+    #[test]
+    fn open_refuses_file_over_cap() {
+        let p = scratch_path("toobig");
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(crate::limits::MAX_OPEN_BYTES + 1).unwrap();
+        drop(f);
+        let err = open(&p).expect_err("must refuse oversized file");
+        assert!(matches!(err, OpenError::TooLarge(..)), "expected TooLarge, got {err:?}");
+        let _ = std::fs::remove_file(&p);
     }
 
     /// No temp litter left after a successful save.

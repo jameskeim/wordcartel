@@ -671,7 +671,7 @@ fn submit_filter_line(
         disposition: crate::filter::Disposition::Filter,
         input: crate::filter::Input::SelectionElseBuffer,
         timeout: std::time::Duration::from_secs(10),
-        max_output: 1 << 20,
+        max_output: crate::limits::MAX_FILTER_OUTPUT,
     };
     crate::filter::dispatch_filter(editor, spec, msg_tx.clone());
 }
@@ -1810,7 +1810,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
                    | file::OpenError::Binary(_)
                    | file::OpenError::Permission(_)
                    | file::OpenError::IsDir(_)
-                   | file::OpenError::Io(_))) => {
+                   | file::OpenError::Io(_)
+                   | file::OpenError::TooLarge(..))) => {
                 editor.status = e.to_string();
             }
         }
@@ -2119,12 +2120,20 @@ fn persist_session(
     seq: u64,
 ) {
     // Effort 6: capture scratch content first, independent of the active buffer.
+    // M5: guard on byte length — never materialize a huge String for persistence.
     if let Some(sid) = editor.scratch_id {
         if let Some(sb) = editor.by_id(sid) {
-            session.scratch = Some(crate::state::ScratchState {
-                text: sb.document.buffer.to_string(),
-                cursor: sb.document.selection.primary().head,
-            });
+            if sb.document.buffer.len() <= crate::limits::MAX_SESSION_BYTES {
+                session.scratch = Some(crate::state::ScratchState {
+                    text: sb.document.buffer.to_string(),
+                    cursor: sb.document.selection.primary().head,
+                });
+            } else {
+                // Oversized: skip persisting the live scratch — and CLEAR any stale scratch
+                // loaded from disk, so an old session's scratch is not resurrected. The live
+                // buffer is untouched; only its cross-session persistence is dropped.
+                session.scratch = None;
+            }
         }
     }
     // Per-file entry for the active buffer (unchanged): only when it has a real,
@@ -4812,5 +4821,28 @@ mod tests {
         let cfg = crate::config::Config::default();
         crate::app::persist_session_for_test(&mut session, &e, &cfg, 1);
         assert_eq!(session.scratch.as_ref().unwrap().text, "stash");
+    }
+
+    #[test]
+    fn persist_session_clears_stale_scratch_when_oversized() {
+        use wordcartel_core::history::Clock;
+        struct C(u64); impl Clock for C { fn now_ms(&self) -> u64 { self.0 } }
+        let mut e = crate::editor::Editor::new_from_text("\n", None, (40, 10));
+        e.install_scratch();
+        let sid = e.scratch_id.unwrap();
+        // Make the live scratch buffer oversized (> MAX_SESSION_BYTES).
+        let big = "x".repeat(crate::limits::MAX_SESSION_BYTES + 1);
+        let (cs, edit) = crate::commands::build_multi_replace(&[(0, 0, big)], 0);
+        let txn = wordcartel_core::history::Transaction::new(cs);
+        e.by_id_mut(sid).unwrap().apply(txn, edit, wordcartel_core::history::EditKind::Other, &C(0));
+        // Session carries a STALE scratch loaded from a previous launch.
+        let mut session = crate::state::SessionState {
+            scratch: Some(crate::state::ScratchState { text: "old stale".into(), cursor: 0 }),
+            ..Default::default()
+        };
+        let cfg = crate::config::Config::default();
+        crate::app::persist_session_for_test(&mut session, &e, &cfg, 1);
+        assert!(session.scratch.is_none(),
+            "oversized live scratch must CLEAR the stale loaded scratch, not resurrect it");
     }
 }

@@ -5,6 +5,8 @@ use crate::change::ChangeSet;
 use crate::selection::Selection;
 
 pub const COALESCE_MS: u64 = 500;
+/// Undo-history memory budget: evict oldest revisions past this, always keeping ≥1 (M5).
+pub const MAX_UNDO_BYTES: usize = 64 * 1024 * 1024;
 
 pub trait Clock {
     fn now_ms(&self) -> u64;
@@ -50,29 +52,47 @@ pub struct Revision {
 #[derive(Clone, Debug, Default)]
 pub struct History {
     pub revisions: Vec<Revision>,
-    pub current: usize, // number of revisions currently applied
+    pub current: usize,       // number of revisions currently applied
+    pub bytes: usize,         // running total of retained revisions' stored bytes (M5)
+    pub last_evicted: usize,  // revisions dropped on the most recent commit (M5)
+}
+
+fn revision_bytes(rev: &Revision) -> usize {
+    rev.edits.iter().map(|e| e.changes.stored_bytes() + e.inverse.stored_bytes()).sum()
 }
 
 impl History {
+    /// Evict oldest revisions while over `budget`, keeping ≥1. Sets `last_evicted`. MUST run only
+    /// right after a commit (where `current == revisions.len()`), so decrementing `current` per
+    /// front-eviction keeps undo/redo indices valid.
+    fn evict_to(&mut self, budget: usize) {
+        self.last_evicted = 0;
+        while self.bytes > budget && self.revisions.len() > 1 {
+            let rev = self.revisions.remove(0);
+            self.bytes = self.bytes.saturating_sub(revision_bytes(&rev));
+            self.current = self.current.saturating_sub(1);
+            self.last_evicted += 1;
+        }
+    }
+
     /// Apply `txn` to `buf`, record it as a new revision, and return the new
     /// selection. Clears any redo tail.
     pub fn commit(&mut self, txn: Transaction, buf: &mut TextBuffer, before: Selection) -> Selection {
         let inverse = txn.changes.invert(buf);
         txn.changes.apply(buf);
-        let after = txn
-            .selection
-            .clone()
-            .unwrap_or_else(|| before.map(&txn.changes));
-        // drop any redo tail
+        let after = txn.selection.clone().unwrap_or_else(|| before.map(&txn.changes));
+        // Drop the redo tail — subtract its bytes FIRST so `bytes` stays accurate.
+        let tail: usize = self.revisions[self.current..].iter().map(revision_bytes).sum();
+        self.bytes = self.bytes.saturating_sub(tail);
         self.revisions.truncate(self.current);
-        self.revisions.push(Revision {
+        let rev = Revision {
             edits: vec![Edit { changes: txn.changes, inverse }],
-            before,
-            after: after.clone(),
-            last_ms: 0,
-            kind: EditKind::Other,
-        });
+            before, after: after.clone(), last_ms: 0, kind: EditKind::Other,
+        };
+        self.bytes += revision_bytes(&rev);
+        self.revisions.push(rev);
         self.current += 1;
+        self.evict_to(MAX_UNDO_BYTES);
         after
     }
 
@@ -125,21 +145,29 @@ impl History {
             .unwrap_or_else(|| before.map(&txn.changes));
 
         if can_merge {
-            let top = self.revisions.last_mut().unwrap();
-            top.edits.push(Edit { changes: txn.changes, inverse });
-            top.after = after.clone();
-            top.last_ms = now;
+            let (old, new);
+            {
+                let top = self.revisions.last_mut().unwrap();
+                old = revision_bytes(top);
+                top.edits.push(Edit { changes: txn.changes, inverse });
+                top.after = after.clone();
+                top.last_ms = now;
+                new = revision_bytes(top);
+            }
+            self.bytes = self.bytes - old + new; // subtract-then-add avoids any underflow path
         } else {
+            let tail: usize = self.revisions[self.current..].iter().map(revision_bytes).sum();
+            self.bytes = self.bytes.saturating_sub(tail);
             self.revisions.truncate(self.current);
-            self.revisions.push(Revision {
+            let rev = Revision {
                 edits: vec![Edit { changes: txn.changes, inverse }],
-                before,
-                after: after.clone(),
-                last_ms: now,
-                kind,
-            });
+                before, after: after.clone(), last_ms: now, kind,
+            };
+            self.bytes += revision_bytes(&rev);
+            self.revisions.push(rev);
             self.current += 1;
         }
+        self.evict_to(MAX_UNDO_BYTES);
         after
     }
 }
@@ -147,7 +175,7 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::change::ChangeSet;
+    use crate::change::{ChangeSet, Op};
     use crate::selection::Selection;
 
     fn type_char(buf: &TextBuffer, at: usize, ch: &str) -> Transaction {
@@ -286,5 +314,78 @@ mod tests {
         let redone_sel = hist.redo(&mut buf).unwrap();
         assert_eq!(buf.to_string(), "abc");
         assert_eq!(redone_sel, after_burst, "redo should return the burst's after selection");
+    }
+
+    // ── Task 2 (M5): byte accounting + eviction ───────────────────────────────
+
+    #[test]
+    fn eviction_keeps_current_consistent_for_undo_redo() {
+        use crate::buffer::TextBuffer;
+        let mut hist = History::default();
+        let mut buf = TextBuffer::from_str("");
+        let mut sel = Selection::single(0);
+        for _ in 0..3 {
+            let at = buf.len();
+            let cs = ChangeSet::from_ops(vec![Op::Retain(at), Op::Insert("zzz".into())], at);
+            sel = hist.commit(Transaction::new(cs), &mut buf, sel.clone());
+        }
+        // 3 revisions, stored_bytes 3 each (the "zzz" insert) → bytes == 9. Force eviction to ≤5.
+        hist.evict_to(5);
+        assert!(hist.last_evicted > 0, "oldest revisions must have been evicted");
+        assert!(!hist.revisions.is_empty(), "keep at least one");
+        assert_eq!(hist.current, hist.revisions.len(), "current must equal len after evict");
+        // The critical invariant: undo then redo round-trips without panicking / mis-indexing.
+        let pre = buf.to_string();
+        hist.undo(&mut buf);
+        hist.redo(&mut buf);
+        assert_eq!(buf.to_string(), pre, "undo+redo round-trips after eviction");
+    }
+
+    #[test]
+    fn single_over_budget_revision_is_retained() {
+        use crate::buffer::TextBuffer;
+        let mut hist = History::default();
+        let mut buf = TextBuffer::from_str("");
+        let cs = ChangeSet::from_ops(vec![Op::Insert("hello".into())], 0);
+        hist.commit(Transaction::new(cs), &mut buf, Selection::single(0));
+        hist.evict_to(0); // budget 0, but keep-≥1 means the lone revision stays
+        assert_eq!(hist.revisions.len(), 1);
+        assert_eq!(hist.last_evicted, 0);
+    }
+
+    #[test]
+    fn bytes_accounting_accurate_after_redo_tail_truncation() {
+        use crate::buffer::TextBuffer;
+        let mut hist = History::default();
+        let mut buf = TextBuffer::from_str("");
+        let sel = Selection::single(0);
+        // commit "abc"
+        let cs1 = ChangeSet::from_ops(vec![Op::Insert("abc".into())], 0);
+        let sel = hist.commit(Transaction::new(cs1), &mut buf, sel);
+        // undo to create a redo tail
+        hist.undo(&mut buf);
+        // commit new edit, truncating the redo tail
+        let cs2 = ChangeSet::from_ops(vec![Op::Insert("xy".into())], 0);
+        hist.commit(Transaction::new(cs2), &mut buf, sel);
+        // bytes must equal fresh recompute
+        let expected: usize = hist.revisions.iter().map(revision_bytes).sum();
+        assert_eq!(hist.bytes, expected, "bytes must match fresh recompute after redo-tail truncation");
+    }
+
+    #[test]
+    fn normal_session_never_evicts() {
+        use crate::buffer::TextBuffer;
+        let mut hist = History::default();
+        let mut buf = TextBuffer::from_str("");
+        let mut sel = Selection::single(0);
+        // a handful of small edits — well within 64 MiB
+        for i in 0..5usize {
+            let at = buf.len();
+            let text = format!("word{}", i);
+            let cs = ChangeSet::from_ops(vec![Op::Retain(at), Op::Insert(text.as_str().into())], at);
+            sel = hist.commit(Transaction::new(cs), &mut buf, sel.clone());
+        }
+        assert_eq!(hist.last_evicted, 0, "small edits must not trigger eviction");
+        assert!(hist.bytes < 1024, "accumulated bytes for tiny edits must be negligible");
     }
 }

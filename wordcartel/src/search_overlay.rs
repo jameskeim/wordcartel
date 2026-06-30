@@ -25,6 +25,7 @@ pub struct SearchState {
     // cache:
     matcher: Option<Matcher>,
     matches: Vec<Match>,
+    capped: bool,
     cur_idx: Option<usize>,
     cache_sig: Option<(String, QueryMode, CaseMode, u64)>,
 }
@@ -45,6 +46,7 @@ impl std::fmt::Debug for SearchState {
             .field("error", &self.error)
             .field("buffer_id", &self.buffer_id)
             .field("matches", &self.matches)
+            .field("capped", &self.capped)
             .field("cur_idx", &self.cur_idx)
             .field("cache_sig", &self.cache_sig)
             .finish_non_exhaustive()
@@ -57,7 +59,7 @@ impl SearchState {
             phase, field: Field::Needle, needle: String::new(), template: String::new(),
             cursor: 0, mode: QueryMode::Literal, case: CaseMode::Smart,
             direction: Direction::Forward, origin, wrapped: false, error: None, buffer_id,
-            matcher: None, matches: Vec::new(), cur_idx: None, cache_sig: None,
+            matcher: None, matches: Vec::new(), capped: false, cur_idx: None, cache_sig: None,
         }
     }
 
@@ -94,11 +96,14 @@ impl SearchState {
         let sig = (self.needle.clone(), self.mode, self.case, version);
         if self.cache_sig.as_ref() == Some(&sig) { return; }
         self.cache_sig = Some(sig);
-        self.error = None; self.matches.clear(); self.matcher = None; self.cur_idx = None;
+        self.error = None; self.matches.clear(); self.capped = false; self.matcher = None; self.cur_idx = None;
         if self.needle.is_empty() { return; }
         match search::compile(&self.needle, self.mode, self.case) {
-            Ok(m) => { self.matches = search::all_matches(rope, &m); self.matcher = Some(m);
-                       self.cur_idx = self.first_at_or_after(self.origin); }
+            Ok(m) => {
+                let (matches, capped) = search::all_matches(rope, &m, crate::limits::MAX_SEARCH_MATCHES);
+                self.matches = matches; self.capped = capped; self.matcher = Some(m);
+                self.cur_idx = self.first_at_or_after(self.origin);
+            }
             Err(e) => { self.error = Some(e.0); }
         }
     }
@@ -109,6 +114,7 @@ impl SearchState {
     }
 
     pub fn count(&self) -> usize { self.matches.len() }
+    pub fn capped(&self) -> bool { self.capped }
     pub fn current(&self) -> Option<Match> { self.cur_idx.map(|i| self.matches[i]) }
     pub fn current_ordinal(&self) -> Option<usize> { self.cur_idx.map(|i| i + 1) }
     pub fn matcher(&self) -> Option<&Matcher> { self.matcher.as_ref() }
@@ -198,5 +204,14 @@ mod tests {
         s.recompute(&rope, 0);
         assert!(s.error.is_some());
         assert_eq!(s.count(), 0);
+    }
+
+    #[test]
+    fn capped_is_false_when_all_matches_returned() {
+        let rope = Rope::from_str("aa aa aa\n");
+        let mut s = st("aa");
+        s.recompute(&rope, 0);
+        assert_eq!(s.count(), 3);
+        assert!(!s.capped(), "small doc with 3 matches is not capped");
     }
 }

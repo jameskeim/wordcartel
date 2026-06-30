@@ -27,11 +27,14 @@ impl TransformKind {
 }
 
 #[derive(Debug)]
-pub enum TransformError { Repar(String) }
+pub enum TransformError { Repar(String), OutputTooLarge { limit: usize } }
 
 impl std::fmt::Display for TransformError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self { TransformError::Repar(m) => write!(f, "{m}") }
+        match self {
+            TransformError::Repar(m) => write!(f, "{m}"),
+            TransformError::OutputTooLarge { limit } => write!(f, "transform output too large (> {limit} bytes)"),
+        }
     }
 }
 
@@ -181,13 +184,20 @@ pub fn apply_transform_result(
     merge_transform_into(editor, buffer_id, kind, range, result, clock);
 }
 
+fn check_output_size(out: String) -> Result<String, TransformError> {
+    if out.len() > crate::limits::MAX_TRANSFORM_OUTPUT {
+        Err(TransformError::OutputTooLarge { limit: crate::limits::MAX_TRANSFORM_OUTPUT })
+    } else { Ok(out) }
+}
+
 /// Run a repar transform over `input`, markdown-aware. Pure (no IO).
 pub fn run_transform(kind: TransformKind, input: &str, width: u32) -> Result<String, TransformError> {
     let mut opts = repar::Options::new().width(width);
     // apply_par_args takes &mut self and returns PResult<()> — not chainable.
     opts.apply_par_args([kind.verb()]).map_err(TransformError::from_repar)?;
     opts.apply_fixups("markdown").map_err(TransformError::from_repar)?; // Compat::MARKDOWN
-    opts.format(input).map_err(TransformError::from_repar)
+    let out = opts.format(input).map_err(TransformError::from_repar)?;
+    check_output_size(out)
 }
 
 #[cfg(test)]
@@ -305,5 +315,13 @@ mod tests {
         let out = run_transform(TransformKind::Reflow, &input, 72).unwrap();
         assert!(out.contains("# A heading that is fairly long but is a heading not prose"),
                 "heading must pass through:\n{out}");
+    }
+
+    #[test]
+    fn transform_output_over_cap_refused() {
+        let big = "x".repeat(crate::limits::MAX_TRANSFORM_OUTPUT + 1);
+        assert!(matches!(check_output_size(big), Err(TransformError::OutputTooLarge { .. })));
+        let ok = "small".to_string();
+        assert!(check_output_size(ok).is_ok());
     }
 }
