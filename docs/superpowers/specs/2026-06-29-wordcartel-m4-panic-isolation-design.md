@@ -87,14 +87,20 @@ pub enum JobOutcome {
 - **`InlineExecutor`:** likewise `catch_unwind` (currently bare `(job.run)()`, `jobs.rs:84`)
   so the panic path is deterministically testable. No existing test relies on a panic
   propagating out of inline dispatch (the survival test targets `ThreadExecutor`).
-- **`drain() -> Vec<JobOutcome>`** (was `Vec<JobResult>`). The plan MUST audit **every**
-  `ex.drain()` / `apply_result` / `apply_job_result` call site — not just a sample. Known
-  PRODUCTION sites: `app.rs:776`, `app.rs:1720`, **and the early-return `apply_job_result`
-  calls inside `reduce`: `app.rs:1039`, `:1052`, `:1089`, `:1102`, `:1113`** (Codex — these
-  were missed). TEST sites that consume `JobResult` via `crate::app::apply_result` and need
-  `Done`-wrapping or a helper: `save.rs:313`, `:332`, `:353`, `:377`; `swap.rs:567`;
-  `file.rs:292`. `is_stale` unit tests call it directly at `jobs.rs:221`, `:292`, `:300` and
-  must adapt.
+- **`drain() -> Vec<JobOutcome>`** (was `Vec<JobResult>`). This ripples to **dozens** of
+  call sites across production AND test code (far more than can be reliably hand-listed). The
+  plan MUST mandate a **grep-based audit, not a sample list**: the implementer runs
+  `rg '\.drain\(|apply_result|apply_job_result|is_stale'` across `wordcartel/src/` and updates
+  EVERY hit before the type change compiles. (Per Codex, the real set includes — non-
+  exhaustively — production `app.rs:776`/`1720` + the `apply_job_result` early-returns and
+  `Msg::JobDone` handling scattered through `reduce` at app.rs:1039/1052/1056/1089/1102/1113/
+  1188/1202/1211/1254/1266/1274/1346/1380/1399/1447/1473/1484/1509/1530/1562/1598/1673; tests
+  in save.rs/swap.rs/file.rs/jobs.rs and app.rs's test module. Treat this list as a
+  starting point, NOT the complete set — the grep is authoritative.) The cleanest way to
+  contain the blast radius: keep `apply_result(JobResult, &mut Editor)` as-is and add a thin
+  `apply_outcome(JobOutcome, &mut Editor)` that matches `Done` → existing `apply_result` /
+  `Panicked` → the new per-kind cleanup, so most call sites change only the drained type, not
+  their body. The plan should evaluate that wrapper to minimize churn.
 - **`is_stale`** applies only to the `Done(JobResult)` arm (production caller `apply_result`
   takes a `JobResult`, app.rs:107-108 — confining it to `Done` is sufficient). A `Panicked`
   outcome is NOT subject to staleness-discard *before* cleanup: its per-kind cleanup MUST run
@@ -137,7 +143,9 @@ it as a failed completion:
   un-stick; the panic simply surfaces an error status instead of silently killing the thread.
 
 New error variants: `TransformError::Panicked(String)` and a **single shared
-`FilterError::Panicked(String)`** (used by both the filter and export paths). To keep the
+`FilterError::Panicked(String)`** (used by both the filter and export paths). Adding
+`FilterError::Panicked` requires a new arm in `filter::describe_error` (and any other
+exhaustive `FilterError` match) so the status renders, e.g. `"internal error: {msg}"`. To keep the
 mapping testable without relying on `repar`/a subprocess actually panicking, factor each
 thread body as `match catch(|| work()) { Ok(r) => send(done(r)), Err(msg) => send(err(msg)) }`
 and unit-test the `Err(msg) → error-Msg` mapping with a closure that panics. All three closures
