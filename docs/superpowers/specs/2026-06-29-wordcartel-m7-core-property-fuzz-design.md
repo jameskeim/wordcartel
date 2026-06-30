@@ -79,20 +79,31 @@ pub const UNICODE_PALETTE: &[&str] = &["a", "Z", " ", "\n", "é", "中", "🙂",
   modules: a `prop_unicode_string()` drawing from `UNICODE_PALETTE`, and a `prop_edit(doc)` that
   snaps `at`/`at+del` to char boundaries (valid-edit properties) — plus an unsnapped variant for
   T1's rejection. They build on `test_support` for the model + palette.
-- **Fuzz `arbitrary`** — in the fuzz crate: `Arbitrary` for `(String, Vec<EditOp>)` (string biased
-  toward `UNICODE_PALETTE`, `at`/`del` clamped into range); the fuzz target snaps via
-  `test_support::snap` before building a ChangeSet. Both halves share `test_support`'s model so the
-  proptest and fuzz oracles are identical.
+- **Fuzz `arbitrary`** — the fuzz crate CANNOT impl the foreign trait `arbitrary::Arbitrary` for
+  core's foreign `EditOp` (orphan rule). So the fuzz crate defines its OWN local input DTO and
+  derives `Arbitrary` on it, then converts to the shared model:
+  ```rust
+  #[derive(arbitrary::Arbitrary, Debug)]
+  struct FuzzInput { doc: String, ops: Vec<FuzzOp> }
+  #[derive(arbitrary::Arbitrary, Debug)]
+  struct FuzzOp { at: usize, del: usize, ins: String }
+  ```
+  The target maps each `FuzzOp` to a real edit using `wordcartel_core::test_support::{snap, model_apply}`
+  (clamp+snap `at`/`del` to char boundaries of the live doc, build a `ChangeSet`). Both halves share
+  `test_support`'s `model_apply`/`snap` so the proptest and fuzz oracles are identical — `EditOp`
+  itself needs no `Arbitrary` impl.
 
 ### 2. T1 — TextBuffer model oracle (buffer.rs proptests)
 
 A sequence of insert/delete/slice ops applied in lockstep to a `TextBuffer` and a `String` model:
 - After each op, `buf.len() == model.len()` and `buf.slice(0..buf.len()) == model`.
 - `slice(r)` over an in-bounds, boundary-aligned `r` equals `model[r]`.
-- **Char-boundary rejection:** an `insert`/`delete` at an off-char-boundary byte offset is
-  refused per D0 — assert it panics (release-assert) / returns the typed error, and crucially
-  **never corrupts** the buffer (UB-free). (Use `std::panic::catch_unwind` to assert the panic,
-  or call the `try_*`/validated path if one exists.)
+- **Char-boundary rejection:** `TextBuffer::insert`/`delete`/`slice` guard char boundaries with
+  release `assert!` and return `()`/`String` — there is NO `try_*`/`Result` path on `TextBuffer`
+  (the typed-refusal path is `ChangeSet::validate_against`, M2, a different layer). So assert the
+  off-boundary edit **panics** via `std::panic::catch_unwind` (the release-assert), and that it
+  never produces a corrupted buffer (UB-free). `slice()` likewise asserts (does not clamp) on a
+  bad range.
 - Corpus: strings built from `UNICODE_PALETTE` (é/中/🙂/ZWJ/combining).
 
 ### 3. T2 — ChangeSet apply==splice + invert (change.rs proptests)
@@ -101,12 +112,18 @@ For an arbitrary unicode doc and a boundary-aligned `EditOp`:
 - Build `cs` via the real constructor (`ChangeSet::insert`/`delete`, or `from_ops`); `apply(cs)`
   to a `TextBuffer` seeded with the doc; assert the result equals the naive `String` splice
   `model_apply(doc, at, del, ins)`.
-- `invert(cs)` applied to the post-edit buffer round-trips to the original doc.
+- **Invert ordering (important):** `ChangeSet::invert` needs the ORIGINAL buffer to recover deleted
+  text, so compute `let inv = cs.invert(&original)` **before** `cs.apply(&mut buf)`; then
+  `inv.apply(&mut buf)` round-trips `buf` back to the original doc. (Do NOT compute `invert` from
+  the post-edit buffer — it would lose the deleted text.)
 - Cover: multi-op changesets, full-unicode payloads, `doc_len == 0`, edits at `0` and at `len`.
 
 ### 4. T3 — map_pos / map_pos_before (change.rs proptests)
 
-For an arbitrary doc + changeset and arbitrary positions:
+For an arbitrary doc + changeset and input positions **drawn from the old doc's char boundaries**
+(`map_pos`/`map_pos_before` are pure byte arithmetic with no document access — an off-boundary
+INPUT cannot be expected to yield an on-boundary output, so the strategy must generate valid
+`BytePos` from real char indices of the generated string):
 - **On-boundary:** `map_pos(p, cs)` is a valid char boundary of the post-edit doc.
 - **Monotonic:** `p1 <= p2 ⟹ map_pos(p1,cs) <= map_pos(p2,cs)` (same for `map_pos_before`).
 - **Before/after bias:** at an insertion point, `map_pos_before` stays left of the insert and
@@ -119,9 +136,13 @@ For an arbitrary sequence of commits over an arbitrary doc:
   to the exact pre-undo state.
 - **Selection valid:** every `before`/`after` selection an undo/redo restores is in-bounds and
   on a char boundary.
-- **Version monotonic:** the document `version` strictly increases per applied edit (no reuse).
 - **Coalescing loses nothing:** a coalesced run of `Type` edits, fully undone, yields the exact
   original doc (coalescing changes granularity, not content).
+
+(NOT in core scope: "version strictly increases" — `version` lives on the SHELL `Document`
+(`wordcartel/src/editor.rs`), not on core `History` (which has only `revisions`/`current`/
+`bytes`/`last_evicted`). The monotonic increment happens in shell `Editor::apply`/`undo`/`redo`.
+A core proptest cannot assert it; it would be a shell integration test — out of M7's core scope.)
 
 ### 6. F0 — the fuzz crate (`wordcartel-core/fuzz/`)
 
@@ -133,28 +154,34 @@ the unicode palette + a few real markdown docs.
 
 ### 7. F1 — apply-pipeline fuzz target (the #1 data-loss target)
 
-`fuzz_target!(|input: (String, Vec<EditOp>)|)`:
-- Start with `doc = input.0` (sanitized to valid UTF-8 by `arbitrary`); seed a `TextBuffer` and a
-  `String` model.
-- For each `EditOp`: clamp `at`/`del` into range and **snap to char boundaries** (so we fuzz the
-  VALID-edit pipeline; off-boundary refusal is T1's job), build a real `ChangeSet`, `apply` it,
-  and `model_apply` the same splice.
+`fuzz_target!(|input: FuzzInput|)` (the fuzz-local DTO above):
+- Start with `doc = input.doc` (valid UTF-8 from `arbitrary`); seed a `TextBuffer` and a `String`
+  model.
+- For each `FuzzOp`: clamp `at`/`del` into range and **snap to char boundaries** via
+  `test_support::snap` (so we fuzz the VALID-edit pipeline; off-boundary refusal is T1's job),
+  build a real `ChangeSet`, `apply` it, and `model_apply` the same splice.
 - Assert after every op: `buf` content == `model` (no data loss/corruption). The target never
   panics on valid input (a panic = a fuzz finding). T2 covers the single-op property in-suite;
   F1 is the multi-op, coverage-guided sweep.
 
 ### 8. F2 — block_tree incremental ≡ full (oracle lift + fuzz target)
 
-Lift the incremental-vs-full check into core (today inline in `rope_incremental_matches_full_and_str`,
-block_tree.rs):
+Lift the incremental-vs-full check into core. **`apply_edit` is ALREADY unconditionally `pub`**
+(block_tree.rs ~1100) and is imported by the integration test `tests/block_tree_oracle.rs` — do
+NOT re-gate it (a `cfg(test)` gate would make it invisible to that integration test, which builds
+the lib as an external crate). Add only the new helper, gated `cfg(any(test, fuzzing))`:
 ```rust
 #[cfg(any(test, fuzzing))]
 pub fn incremental_equals_full(old: &str, range: std::ops::Range<usize>, repl: &str) -> bool {
-    let (new, edit) = apply_edit(old, range, repl); // make apply_edit cfg(any(test,fuzzing))-public
+    let (new, edit) = apply_edit(old, range, repl); // already pub — unchanged
     incremental_update(&full_parse(old), old, &edit, &new) == full_parse(&new)
 }
 ```
-The existing test re-expresses its assertion via this fn (keeping the rope-vs-str check too).
+`BlockTree` derives `PartialEq, Eq` (block_tree.rs:164), so `==` is valid. The existing UNIT test
+`rope_incremental_matches_full_and_str` (block_tree.rs ~1380, a `#[cfg(test)]` test — it CAN see
+the `cfg(any(test,fuzzing))` helper) re-expresses its assertion via `incremental_equals_full`
+(keeping its rope-vs-str check too). The integration test in `tests/block_tree_oracle.rs` is
+untouched (it uses the still-`pub` `apply_edit`/`full_parse`/`incremental_update` directly).
 `fuzz_targets/block_tree.rs`: `fuzz_target!(|input: (String, usize, usize, String)|)` →
 derive a valid `old`, clamp+snap `range` to char boundaries, call `incremental_equals_full(old,
 range, repl)`, and assert it returns `true` (a `false`/panic = a fuzz finding — an incremental
@@ -185,8 +212,9 @@ parse that diverges from a full reparse is a real correctness bug).
 - `wordcartel-core/src/buffer.rs`: T1 proptests.
 - `wordcartel-core/src/change.rs`: T2 + T3 proptests.
 - `wordcartel-core/src/history.rs`: T4 proptests.
-- `wordcartel-core/src/block_tree.rs`: lift `incremental_equals_full` (+ make `apply_edit`
-  cfg-public) behind `#[cfg(any(test, fuzzing))]`; re-express the existing oracle test via it.
+- `wordcartel-core/src/block_tree.rs`: add `incremental_equals_full` behind `#[cfg(any(test, fuzzing))]`
+  (leave `apply_edit` unconditionally `pub` — an integration test imports it); re-express the
+  existing UNIT oracle test via the new helper.
 - `wordcartel-core/fuzz/` (new crate): `Cargo.toml`, `fuzz_targets/apply_pipeline.rs` (F1),
   `fuzz_targets/block_tree.rs` (F2), seed `corpus/`.
 - Any minimized fuzz-crash repro → a pinned regression test in the relevant core module.
