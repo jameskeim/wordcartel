@@ -10,7 +10,7 @@ use crossterm::event::KeyEvent;
 use crate::{commands, config, derive, editor::Editor, file, keymap, render, term};
 #[cfg(test)]
 use crate::input;
-use crate::jobs::{is_stale, Executor, JobResult};
+use crate::jobs::{is_stale, Executor, JobOutcome, JobResult};
 use crate::registry::{Ctx, Registry};
 use crate::prompt::PromptAction;
 use wordcartel_core::history::Clock;
@@ -25,7 +25,7 @@ use wordcartel_core::history::Clock;
 
 pub enum Msg {
     Input(Event),
-    JobDone(JobResult),
+    JobDone(JobOutcome),
     FilterDone {
         buffer_id: crate::editor::BufferId,
         version: u64,
@@ -168,6 +168,52 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
 /// the re-drive cannot be skipped on an early-returning reduce branch (Codex C1).
 pub fn apply_job_result(r: JobResult, editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock, msg_tx: &std::sync::mpsc::Sender<Msg>) {
     apply_result(r, editor);
+    if editor.quit_drain_advance {
+        editor.quit_drain_advance = false;
+        drive_quit_drain(editor, ex, clock, msg_tx);
+    }
+}
+
+/// Apply a job outcome: a normal Done routes to the existing apply_result; a Panicked outcome
+/// runs that kind's explicit failure cleanup (a panic is a failed completion).
+pub fn apply_outcome(outcome: crate::jobs::JobOutcome, editor: &mut Editor) {
+    match outcome {
+        crate::jobs::JobOutcome::Done(r) => apply_result(r, editor),
+        crate::jobs::JobOutcome::Panicked { buffer_id, version, kind, msg } =>
+            apply_panic(buffer_id, version, kind, &msg, editor),
+    }
+}
+
+fn apply_panic(buffer_id: crate::editor::BufferId, version: u64, kind: crate::jobs::JobKind, msg: &str, editor: &mut Editor) {
+    use crate::jobs::JobKind;
+    match kind {
+        JobKind::Save => {
+            // The merge never ran, so saved_version is untouched (buffer stays dirty). A panicked
+            // save must NOT quit/strand: clear any awaited-quit state explicitly (the failed-save
+            // Quit path leaves pending_after_save armed — we must not).
+            let awaited = editor.pending_after_save.as_ref()
+                .map(|p| p.buffer_id == buffer_id && p.version == version).unwrap_or(false);
+            if awaited {
+                editor.pending_after_save = None;
+                editor.quit_drain = None;
+                editor.quit_drain_advance = false;
+            }
+            editor.status = format!("save failed (internal error: {msg})");
+        }
+        JobKind::SwapWrite => {
+            if let Some(b) = editor.by_id_mut(buffer_id) { b.swap_in_flight = false; }
+            editor.status = format!("swap failed (internal error: {msg})");
+        }
+        #[cfg(test)]
+        JobKind::CoalesceProbe => { editor.status = format!("job failed (internal error: {msg})"); }
+    }
+}
+
+/// Apply a finished job outcome, then advance a multi-buffer quit drain if one
+/// is waiting on this completion. The single funnel for all JobDone handling so
+/// the re-drive cannot be skipped on an early-returning reduce branch (Codex C1).
+pub fn apply_job_outcome(outcome: crate::jobs::JobOutcome, editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock, msg_tx: &std::sync::mpsc::Sender<Msg>) {
+    apply_outcome(outcome, editor);
     if editor.quit_drain_advance {
         editor.quit_drain_advance = false;
         drive_quit_drain(editor, ex, clock, msg_tx);
@@ -773,7 +819,7 @@ pub(crate) fn dispatch_overlay_command(
     editor.file_browser = None;
     let mut ctx = crate::registry::Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
     reg.dispatch(id, &mut ctx);
-    for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+    for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
     // Hydrate any overlay the dispatched command may have opened (Codex 3c).
     hydrate_overlays(editor, reg, keymap);
 }
@@ -1036,7 +1082,7 @@ pub fn reduce(
                     _ => { editor.pending_mark = None; } // non-name key cancels
                 }
             }
-            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         // non-key message: fall through to normal handling
@@ -1049,11 +1095,11 @@ pub fn reduce(
         if matches!(&msg, Msg::ClipboardPaste { .. }) {
             // Drop an async clipboard-paste result that arrives while the menu is
             // open — it must not land in the document behind the overlay.
-            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Paste(_)) = &msg {
-            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Key(k)) = &msg {
@@ -1086,7 +1132,7 @@ pub fn reduce(
                     }
                 }
             }
-            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         // Non-key msg falls through to normal handling while menu stays open.
@@ -1099,7 +1145,7 @@ pub fn reduce(
         if matches!(&msg, Msg::ClipboardPaste { .. }) {
             // Drop an async clipboard-paste result that arrives while the palette is
             // open — it must not land in the document behind the overlay.
-            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Paste(text)) = msg {
@@ -1110,7 +1156,7 @@ pub fn reduce(
                 let max = p.rows.len().saturating_sub(1);
                 if p.selected > max { p.selected = max; }
             }
-            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Key(k)) = &msg {
@@ -1185,7 +1231,7 @@ pub fn reduce(
                     _ => {}
                 }
             }
-            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         // Non-key msg falls through to normal handling while palette stays open.
@@ -1199,7 +1245,7 @@ pub fn reduce(
         if matches!(&msg, Msg::ClipboardPaste { .. }) {
             // Drop an async clipboard-paste result that arrives while the theme picker is
             // open — it must not land in the document behind the overlay.
-            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Paste(text)) = &msg {
@@ -1208,7 +1254,7 @@ pub fn reduce(
                 crate::theme_picker::rebuild_rows(tp);
             }
             preview_selected_theme(editor);
-            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Key(k)) = &msg {
@@ -1251,7 +1297,7 @@ pub fn reduce(
                     _ => {}
                 }
             }
-            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         // Non-key msg falls through to normal handling while picker stays open.
@@ -1263,7 +1309,7 @@ pub fn reduce(
         // Drop an async clipboard-paste result that arrives while the browser is open —
         // it must not land in the document behind the overlay (Codex I6, mirror palette).
         if matches!(&msg, Msg::ClipboardPaste { .. }) {
-            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Paste(text)) = &msg {
@@ -1271,7 +1317,7 @@ pub fn reduce(
                 fb.query.push_str(text);
                 crate::file_browser::rebuild_entries(fb);
             }
-            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Key(k)) = &msg {
@@ -1343,7 +1389,7 @@ pub fn reduce(
                     _ => {}
                 }
             }
-            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         // Non-key msg falls through to normal handling while the browser stays open.
@@ -1377,7 +1423,7 @@ pub fn reduce(
                 }
             }
             // Merge a directly-delivered background result even under a modal.
-            Msg::JobDone(r) => apply_job_result(r, editor, ex, clock, msg_tx),
+            Msg::JobDone(o) => apply_job_outcome(o, editor, ex, clock, msg_tx),
             Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {
                 apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, clock);
             }
@@ -1396,7 +1442,7 @@ pub fn reduce(
             _ => {}
         }
         // Always drain ready results (merges the awaited save&quit result).
-        for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+        for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
         return !editor.quit;
     }
 
@@ -1444,7 +1490,7 @@ pub fn reduce(
                     _ => {}
                 }
             }
-            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         // non-key (FilterDone/JobDone/Tick/Resize/ClipboardPaste/ClipboardAvailability) falls through to the normal match below
@@ -1470,7 +1516,7 @@ pub fn reduce(
                         KeyCode::Char('q') | KeyCode::Esc => { editor.search = None; }
                         _ => {}
                     }
-                    for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+                    for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
                     return !editor.quit;
                 }
                 match k.code {
@@ -1481,7 +1527,7 @@ pub fn reduce(
                     KeyCode::Enter if alt => {
                         if let Some(s) = editor.search.as_mut() { s.phase = crate::search_overlay::Phase::Stepping; }
                         search_sync(editor); // park on first match
-                        for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+                        for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
                         return !editor.quit;
                     }
                     KeyCode::Enter if shift => { search_step(editor, false); }
@@ -1506,7 +1552,7 @@ pub fn reduce(
                 // Recompute against the live buffer and pin the current match.
                 search_sync(editor);
             }
-            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit; // return ONLY for key events (including non-Press)
         }
         // Non-key messages (FilterDone/ExportDone/TransformDone/JobDone/Tick/…)
@@ -1527,7 +1573,7 @@ pub fn reduce(
                     _ => {} // bare Ctrl+key or anything else: no-op, consumed
                 }
             }
-            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit; // return ONLY for key events (including non-Press)
         }
         // Non-key messages fall through to normal handlers below.
@@ -1559,7 +1605,7 @@ pub fn reduce(
                         if editor.outline.as_ref().map(|o| o.opened_version) != Some(editor.active().document.version) {
                             editor.status = "document changed; outline closed".into();
                             editor.outline = None;
-                            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+                            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
                             return !editor.quit;
                         }
                         let target = editor.outline.as_ref()
@@ -1595,7 +1641,7 @@ pub fn reduce(
                     _ => {}
                 }
             }
-            for r in ex.drain() { apply_job_result(r, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         // Non-key messages fall through to normal handlers below.
@@ -1670,7 +1716,7 @@ pub fn reduce(
             crate::mouse::handle(editor, ev, reg, keymap, ex, clock, msg_tx);
         }
         Msg::Input(_) => {}
-        Msg::JobDone(r) => apply_job_result(r, editor, ex, clock, msg_tx),
+        Msg::JobDone(o) => apply_job_outcome(o, editor, ex, clock, msg_tx),
         Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {
             apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, clock);
         }
@@ -1717,8 +1763,8 @@ pub fn reduce(
         }
     }
     // Fold any other results that became ready while handling this message.
-    for r in ex.drain() {
-        apply_job_result(r, editor, ex, clock, msg_tx);
+    for o in ex.drain() {
+        apply_job_outcome(o, editor, ex, clock, msg_tx);
     }
     !editor.quit
 }
@@ -2726,7 +2772,7 @@ mod tests {
         while !e.quit {
             let rs = ex.drain();
             if rs.is_empty() { break; }
-            for r in rs { crate::app::apply_job_result(r, &mut e, &ex, &clk, &tx); }
+            for o in rs { crate::app::apply_job_outcome(o, &mut e, &ex, &clk, &tx); }
             guard += 1; assert!(guard < 16, "drain did not converge");
         }
         assert!(e.quit, "Save-All drains both dirty buffers then quits");
@@ -2808,7 +2854,7 @@ mod tests {
             let clk = TestClock(0);
             let (tx, _rx) = std::sync::mpsc::channel();
             crate::app::resolve_prompt(PromptAction::QuitSaveAll, &mut e, &ex, &clk, &tx);
-            for r in ex.drain() { crate::app::apply_job_result(r, &mut e, &ex, &clk, &tx); }
+            for o in ex.drain() { crate::app::apply_job_outcome(o, &mut e, &ex, &clk, &tx); }
             assert!(e.quit_drain.is_none(), "failed save aborts the drain");
             assert!(!e.quit, "a failed save must not quit (no data loss)");
             assert!(e.status.to_lowercase().contains("symlink"), "error status surfaced");
@@ -2854,7 +2900,7 @@ mod tests {
         crate::app::resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk, &tx);
         assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::Quit, .. })));
         assert!(!e.quit, "not yet — waiting for the save result");
-        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
         assert!(e.quit, "matching save result triggers quit");
         let _ = std::fs::remove_file(&p);
     }
@@ -2896,7 +2942,7 @@ mod tests {
         assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::Quit, .. })),
             "command path arms pending_after_save{{Quit}}");
         assert!(!e.quit, "not yet — waiting for the save result");
-        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
         assert!(e.quit, "matching save result triggers quit");
         let _ = std::fs::remove_file(&p);
     }
@@ -2934,7 +2980,7 @@ mod tests {
             crate::save::dispatch_save_and_quit(&mut ctx);
         }
         assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::Quit, .. })));
-        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
         assert!(e.quit, "matching save result triggers quit");
         let _ = std::fs::remove_file(&p);
     }
@@ -4674,7 +4720,7 @@ mod tests {
         let ex = InlineExecutor::default(); let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
         crate::app::save_as_submit(&mut e, p.to_str().unwrap(), &ex, &clk, &tx);
-        for r in ex.drain() { crate::app::apply_result(r, &mut e); }
+        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "content\n", "file written");
         assert_eq!(e.active().document.path.as_deref(), Some(p.as_path()), "path re-keyed");
         assert!(!e.active().document.dirty(), "clean after save-as");

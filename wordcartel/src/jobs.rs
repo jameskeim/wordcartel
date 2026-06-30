@@ -46,6 +46,14 @@ pub struct JobResult {
     pub merge: Box<dyn FnOnce(&mut Editor) + Send>,
 }
 
+/// The outcome of a background job: either a normal result or a panic that
+/// was caught by the executor boundary. Panicked outcomes carry the metadata
+/// needed for per-kind cleanup (buffer stays dirty, swap_in_flight cleared, etc.).
+pub enum JobOutcome {
+    Done(JobResult),
+    Panicked { buffer_id: crate::editor::BufferId, version: u64, kind: JobKind, msg: String },
+}
+
 /// Staleness now consults the result class + whether the buffer still exists.
 pub fn is_stale(r: &JobResult, editor: &Editor) -> bool {
     match r.class {
@@ -69,56 +77,55 @@ pub trait Executor {
     /// Enqueue a job for the worker.
     fn dispatch(&self, job: Job);
     /// Non-blocking: collect any results ready now (consumes them).
-    fn drain(&self) -> Vec<JobResult>;
+    fn drain(&self) -> Vec<JobOutcome>;
 }
 
 /// Deterministic test executor: runs `job.run()` immediately on `dispatch`,
 /// buffers the result for `drain`. No threads, no flake.
 #[derive(Default)]
 pub struct InlineExecutor {
-    pending: RefCell<Vec<JobResult>>,
+    pending: RefCell<Vec<JobOutcome>>,
 }
 
 impl Executor for InlineExecutor {
     fn dispatch(&self, job: Job) {
-        let result = (job.run)();
-        self.pending.borrow_mut().push(result);
+        let (buffer_id, version, kind) = (job.buffer_id, job.version, job.kind);
+        let outcome = match crate::panicx::catch(job.run) {
+            Ok(result) => JobOutcome::Done(result),
+            Err(msg) => JobOutcome::Panicked { buffer_id, version, kind, msg },
+        };
+        self.pending.borrow_mut().push(outcome);
     }
-    fn drain(&self) -> Vec<JobResult> {
+    fn drain(&self) -> Vec<JobOutcome> {
         self.pending.borrow_mut().drain(..).collect()
     }
 }
 
 /// Production executor: one worker thread, FIFO. The worker pushes each
-/// JobResult onto an internal channel (drained by `drain`) and sends a unit
+/// JobOutcome onto an internal channel (drained by `drain`) and sends a unit
 /// "wake" nudge on `wake` after each result so the main loop can wake and drain.
 pub struct ThreadExecutor {
     job_tx: Option<Sender<Job>>,
-    result_rx: Receiver<JobResult>,
+    result_rx: Receiver<JobOutcome>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl ThreadExecutor {
     pub fn new(wake: Sender<()>) -> ThreadExecutor {
         let (job_tx, job_rx) = mpsc::channel::<Job>();
-        let (result_tx, result_rx) = mpsc::channel::<JobResult>();
+        let (result_tx, result_rx) = mpsc::channel::<JobOutcome>();
         let worker = std::thread::Builder::new()
             .name("wcartel-jobs".into())
             .spawn(move || {
                 // FIFO: process jobs in dispatch order. Exit when job_tx drops.
                 while let Ok(job) = job_rx.recv() {
-                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (job.run)())) {
-                        Ok(result) => {
-                            if result_tx.send(result).is_err() { break; }
-                            let _ = wake.send(()); // nudge the loop to drain
-                        }
-                        Err(_) => {
-                            // Job panicked; the worker survives and continues the loop.
-                            // The panic hook (term::install_panic_hook) is gated to the
-                            // main thread, so the live terminal is not disturbed.
-                            // Surfacing the panic as a user-visible status is deferred.
-                        }
-                    }
+                    let (buffer_id, version, kind) = (job.buffer_id, job.version, job.kind);
+                    let outcome = match crate::panicx::catch(job.run) {
+                        Ok(result) => JobOutcome::Done(result),
+                        Err(msg) => JobOutcome::Panicked { buffer_id, version, kind, msg },
+                    };
+                    if result_tx.send(outcome).is_err() { break; }
+                    let _ = wake.send(()); // nudge the loop to drain
                 }
             })
             .expect("spawn jobs worker");
@@ -134,7 +141,7 @@ impl Executor for ThreadExecutor {
             let _ = tx.send(job);
         }
     }
-    fn drain(&self) -> Vec<JobResult> {
+    fn drain(&self) -> Vec<JobOutcome> {
         let mut out = Vec::new();
         while let Ok(r) = self.result_rx.try_recv() {
             out.push(r);
@@ -182,7 +189,7 @@ mod tests {
         assert_eq!(done_rx.recv().unwrap(), 7, "worker must run the job");
         let mut results = Vec::new();
         while results.is_empty() { results = ex.drain(); }
-        assert_eq!(results[0].version, 7);
+        assert!(matches!(&results[0], JobOutcome::Done(r) if r.version == 7));
     }
 
     #[test]
@@ -205,8 +212,22 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(ex.drain().is_empty(), "drain must consume buffered results");
         let mut e = Editor::new_from_text("\n", None, (80, 24));
-        (results.remove(0).merge)(&mut e);
+        if let JobOutcome::Done(r) = results.remove(0) {
+            (r.merge)(&mut e);
+        }
         assert_eq!(e.status, "merged");
+    }
+
+    #[test]
+    fn inline_executor_emits_panicked_outcome() {
+        let ex = InlineExecutor::default();
+        ex.dispatch(Job {
+            buffer_id: BufferId(1), class: ResultClass::BufferLocal, version: 1, kind: JobKind::Save,
+            run: Box::new(|| panic!("boom")),
+        });
+        let out = ex.drain();
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], JobOutcome::Panicked { kind: JobKind::Save, msg, .. } if msg == "boom"));
     }
 
     // One-shot Save/SwapWrite results are never discarded by is_stale — correctness
@@ -275,10 +296,15 @@ mod tests {
         // Block until the second job's closure fires — proves the worker survived.
         assert_eq!(done_rx.recv().unwrap(), 2, "worker must survive a panicking job");
 
-        // The result channel must also deliver the second job's result.
-        let mut results = Vec::new();
-        while results.is_empty() { results = ex.drain(); }
-        assert_eq!(results[0].version, 2, "post-panic job result must be drainable");
+        // Both outcomes arrive on the channel — the panicked job1 as Panicked and the
+        // successful job2 as Done. `done_rx.recv()` above unblocks from INSIDE job2's run,
+        // which fires BEFORE the worker constructs+sends Done(v2) — so a single drain may
+        // hold only [Panicked(v1)]. Accumulate across drains until the awaited Done arrives
+        // (no arrival-ordering assumption — keeps this thread test flake-free).
+        let mut outcomes = Vec::new();
+        while !outcomes.iter().any(|o| matches!(o, JobOutcome::Done(r) if r.version == 2)) {
+            outcomes.extend(ex.drain());
+        }
     }
 
     #[test]

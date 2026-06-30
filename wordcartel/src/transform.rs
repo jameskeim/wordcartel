@@ -27,19 +27,30 @@ impl TransformKind {
 }
 
 #[derive(Debug)]
-pub enum TransformError { Repar(String), OutputTooLarge { limit: usize } }
+pub enum TransformError { Repar(String), OutputTooLarge { limit: usize }, Panicked(String) }
 
 impl std::fmt::Display for TransformError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TransformError::Repar(m) => write!(f, "{m}"),
             TransformError::OutputTooLarge { limit } => write!(f, "transform output too large (> {limit} bytes)"),
+            // No "transform failed" prefix here — the status renderer adds it (the
+            // `format!("transform failed: {e}")` site), matching the other variants' Display.
+            TransformError::Panicked(m) => write!(f, "internal error: {m}"),
         }
     }
 }
 
 impl TransformError {
     fn from_repar(e: repar::ParError) -> TransformError { TransformError::Repar(e.to_string()) }
+}
+
+/// Run a transform body, mapping a panic in untrusted (`repar`) code to a recoverable error.
+fn guarded_transform(work: impl FnOnce() -> Result<String, TransformError>) -> Result<String, TransformError> {
+    match crate::panicx::catch(work) {
+        Ok(r) => r,
+        Err(msg) => Err(TransformError::Panicked(msg)),
+    }
 }
 
 use wordcartel_core::block_tree::BlockTree;
@@ -111,7 +122,7 @@ pub fn dispatch_transform(
         let msg_tx = msg_tx.clone();
         std::thread::spawn(move || {
             let input = snapshot.byte_slice(range_c.clone()).to_string();
-            let result = run_transform(kind, &input, DEFAULT_REFLOW_WIDTH);
+            let result = guarded_transform(|| run_transform(kind, &input, DEFAULT_REFLOW_WIDTH));
             let _ = msg_tx.send(crate::app::Msg::TransformDone {
                 buffer_id, version, range: range_c, kind, result,
             });
@@ -120,7 +131,7 @@ pub fn dispatch_transform(
     }
     // Sync branch: region is small enough to run on the keystroke thread.
     let input = editor.active().document.buffer.slice(range.clone()).to_string();
-    let result = run_transform(kind, &input, DEFAULT_REFLOW_WIDTH);
+    let result = guarded_transform(|| run_transform(kind, &input, DEFAULT_REFLOW_WIDTH));
     apply_transform_result(editor, kind, range, result, clock);
 }
 
@@ -323,5 +334,13 @@ mod tests {
         assert!(matches!(check_output_size(big), Err(TransformError::OutputTooLarge { .. })));
         let ok = "small".to_string();
         assert!(check_output_size(ok).is_ok());
+    }
+
+    #[test]
+    fn guarded_transform_maps_panic_to_error() {
+        let r = guarded_transform(|| panic!("kaboom"));
+        assert!(matches!(r, Err(TransformError::Panicked(ref m)) if m == "kaboom"));
+        let ok = guarded_transform(|| Ok("hi".to_string()));
+        assert_eq!(ok.unwrap(), "hi");
     }
 }
