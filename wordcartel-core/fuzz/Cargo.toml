@@ -1,0 +1,35 @@
+[package]
+name = "wordcartel-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detach from the main workspace: the fuzz crate is built only via `cargo +nightly fuzz`
+# (with `--cfg fuzzing` in RUSTFLAGS), never as a member of the root workspace.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.wordcartel-core]
+path = ".."
+
+# F1 — a real REPLACE ChangeSet per op must keep TextBuffer == a String byte-mirror model.
+[[bin]]
+name = "apply_pipeline"
+path = "fuzz_targets/apply_pipeline.rs"
+test = false
+doc = false
+bench = false
+
+# F2 — an incremental block-tree update must equal a full reparse.
+[[bin]]
+name = "block_tree"
+path = "fuzz_targets/block_tree.rs"
+test = false
+doc = false
+bench = false

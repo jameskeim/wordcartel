@@ -639,7 +639,18 @@ pub fn incremental_update_instrumented_src<S: TextSource>(
     // HTML blocks can change where a *preceding* block ends, so a downstream-
     // only widen is not enough — fall back to a full reparse. This is cheap to
     // detect and HTML in prose is rare (see report).
-    if html_in_play(old_src, new_src, edit, region_old_start, region_old_end) {
+    //
+    // Bare CR (a `\r` not part of `\r\n`) is folded into the SAME fallback: it is a
+    // line break to pulldown-cmark but invisible to the LF-only region/line
+    // machinery here, so it can start a block (HTML, heading, fence) at a position
+    // the incremental logic treats as mid-line — and that block can then mis-end,
+    // desyncing the localized reparse from a full parse. Bare CR is vanishingly
+    // rare in real Markdown, so a full reparse when the edited region contains one
+    // is the simplest provably-correct treatment (CRLF is handled fine and is NOT
+    // flagged).
+    if html_in_play(old_src, new_src, edit, region_old_start, region_old_end)
+        || region_has_bare_cr(old_src, new_src, edit, region_old_start, region_old_end)
+    {
         let tree = full_parse_src(new_src);
         return UpdateOutcome { tree, reason: WidenReason::NoOverlapFull, reparsed_bytes: new_src.len() };
     }
@@ -745,7 +756,7 @@ pub fn incremental_update_instrumented_src<S: TextSource>(
         || slack_is_absorptive
         || downstream_container_merge
         || needs_widen_to_end(old_src, new_src, edit, region_old_start, region_old_end);
-    let reason;
+    let mut reason;
     if widen {
         region_old_end = old_src.len();
         reason = WidenReason::WidenToEnd;
@@ -789,10 +800,16 @@ pub fn incremental_update_instrumented_src<S: TextSource>(
         }
         // When editing in a gap, also include the last block before the region
         // start: upstream context (e.g. a paragraph immediately before the gap)
-        // may change how the gap and following content parse.
+        // may change how the gap and following content parse. Re-apply the
+        // blank-delimited group walk to the pulled-back start: the preceding block
+        // can itself sit in a line group whose head is an unblocked construct (a
+        // link-reference def emits NO block, so `line_start(b.span.start)` lands
+        // BELOW it). Reparsing the block's line in isolation, without that upstream
+        // context, can flip its kind (e.g. a `*` line parses as a List on its own
+        // but stays a Paragraph under a ref-def line) — so widen to the whole group.
         if !have_overlap {
             if let Some(b) = tops.iter().rev().find(|b| b.span.end <= region_old_start) {
-                region_old_start = old_src.line_start(b.span.start);
+                region_old_start = blank_delimited_group_start(old_src, old_src.line_start(b.span.start));
             }
         }
         reason = WidenReason::Local;
@@ -830,7 +847,7 @@ pub fn incremental_update_instrumented_src<S: TextSource>(
     // region_old_end), those trailing bytes disappear from the splice result.
     // Extend region_old_end to old_src.len() so they are included in the
     // reparse when necessary.
-    let has_after_block = tops.iter().any(|b| b.span.start >= region_old_end);
+    let has_after_block = tops.iter().any(|b| b.span.start >= region_old_end && b.span.end > region_old_end);
     if !has_after_block && region_old_end < old_src.len() {
         region_old_end = old_src.len();
     }
@@ -868,11 +885,36 @@ pub fn incremental_update_instrumented_src<S: TextSource>(
     debug_assert!(region_old_start <= edit_lo);
 
     let region_new_start = region_old_start;
-    let region_new_end = (region_old_end as isize + delta) as usize;
+    let mut region_new_end = (region_old_end as isize + delta) as usize;
 
     // Materialize only the edited region from new_src (O(region), not O(doc)).
-    let new_region = new_src.slice(region_new_start..region_new_end);
-    let reparsed = parse_region(&new_region.as_ref(), 0..new_region.len(), region_new_start);
+    let mut new_region = new_src.slice(region_new_start..region_new_end);
+    let mut reparsed = parse_region(&new_region.as_ref(), 0..new_region.len(), region_new_start);
+
+    // CREATED-CONTAINER GROWTH: the absorptive-widen gate above only inspects OLD-
+    // tree blocks, so an edit that CREATES an absorptive container (List, BlockQuote,
+    // IndentedCode — each can absorb following lines) is not caught there. If the
+    // reparse's LAST block is such a container and it reached the region boundary
+    // (its span runs to region_new_end), it may keep absorbing content that lives
+    // PAST the region — the localized reparse cut it short, mis-attributing its tail
+    // (e.g. a list item's extent). Document still remaining after the region is the
+    // tell; widen to end and reparse once. (When we already widened, region_old_end
+    // == len, so this never fires twice.)
+    if region_old_end < old_src.len() {
+        let tail_absorptive = reparsed.root.children.last().is_some_and(|last| {
+            matches!(
+                last.kind,
+                BlockKind::List | BlockKind::BlockQuote | BlockKind::IndentedCode
+            ) && last.span.end >= region_new_end
+        });
+        if tail_absorptive {
+            region_old_end = old_src.len();
+            region_new_end = (region_old_end as isize + delta) as usize;
+            new_region = new_src.slice(region_new_start..region_new_end);
+            reparsed = parse_region(&new_region.as_ref(), 0..new_region.len(), region_new_start);
+            reason = WidenReason::WidenToEnd;
+        }
+    }
     let reparsed_bytes = new_region.len();
 
     // Splice driven purely by the final region bounds, so it stays consistent
@@ -886,15 +928,87 @@ pub fn incremental_update_instrumented_src<S: TextSource>(
             result_children.push(b.clone());
         }
     }
+    let before_count = result_children.len();
     result_children.extend(reparsed.root.children.iter().cloned());
+    let after_seam = result_children.len(); // index of the first "after" block, once pushed
     for b in tops.iter() {
-        if b.span.start >= region_old_end {
+        // "after" blocks lie STRICTLY beyond region_old_end. The extra
+        // `span.end > region_old_end` guard excludes a zero-length block sitting
+        // exactly at region_old_end (e.g. the synthetic trailing empty Paragraph
+        // pulldown-cmark emits at end-of-document after a link-reference def):
+        // its span.end == region_old_end means it is already COVERED by the region
+        // reparse above, so shifting it here too would emit it twice. Straddle
+        // repair guarantees no block crosses region_old_end, so this only ever
+        // filters out such zero-length boundary blocks.
+        if b.span.start >= region_old_end && b.span.end > region_old_end {
             result_children.push(shift_block(b, delta));
         }
     }
 
+    // SEAM CONSISTENCY: the splice stitches verbatim "before"/"after" blocks onto
+    // the freshly reparsed region. At each seam an edit can leave a top-level
+    // Paragraph adjacent to a following block that a full parse would FOLD INTO that
+    // paragraph (another Paragraph it merges with, or an indented line it absorbs as
+    // lazy continuation — neither can interrupt a paragraph) with NO blank line
+    // between them. A full parse never produces that arrangement; when the local
+    // splice does, recover with a provably-correct full reparse. Only the two splice
+    // seams (before|reparse, reparse|after) can introduce it, so this is O(1) —
+    // never a document scan. (Both seams collapse to one index when the reparse
+    // emitted no blocks.)
+    let merge_at = |i: usize| {
+        i > 0
+            && i < result_children.len()
+            && paragraph_absorbs_next(new_src, &result_children[i - 1], &result_children[i])
+    };
+    if merge_at(before_count) || merge_at(after_seam) {
+        let tree = full_parse_src(new_src);
+        return UpdateOutcome {
+            tree,
+            reason: WidenReason::NoOverlapFull,
+            reparsed_bytes: new_src.len(),
+        };
+    }
+
     let root = Block { kind: BlockKind::Document, span: 0..new_src.len(), children: result_children };
     UpdateOutcome { tree: BlockTree { root }, reason, reparsed_bytes }
+}
+
+/// Splice consistency guard: in a full parse, would top-level block `a` (a
+/// Paragraph) FOLD IN the immediately following block `b`? A paragraph runs over
+/// subsequent lines until a blank line or a paragraph-INTERRUPTING block. `b` is
+/// non-interrupting when it is itself a `Paragraph` (they merge into one) or
+/// `IndentedCode` (an indented line cannot interrupt a paragraph — it is absorbed
+/// as lazy continuation). So if `a` is a Paragraph, `b` is one of those kinds, and
+/// the inter-block gap `[a.end, b.start)` in `new_src` holds no `\n` (no blank line
+/// separates them), a correct full parse would make them ONE paragraph. The
+/// localized splice can manufacture this illegal adjacency at a region seam when an
+/// edit removes the separation (e.g. turns a blank line into a continuation line,
+/// or drops an upstream paragraph-interrupting construct). Detecting it lets the
+/// caller fall back to a provably-correct full reparse. O(gap) — the gap between
+/// adjacent top-level blocks is whitespace/newlines, never a block interior.
+fn paragraph_absorbs_next<S: TextSource>(new_src: &S, a: &Block, b: &Block) -> bool {
+    if a.kind != BlockKind::Paragraph
+        || !matches!(b.kind, BlockKind::Paragraph | BlockKind::IndentedCode)
+    {
+        return false;
+    }
+    let lo = a.span.end.min(new_src.len());
+    let hi = b.span.start.min(new_src.len());
+    if lo >= hi {
+        return true; // directly abutting: no separating line at all
+    }
+    // They fold into one paragraph UNLESS a markdown BLANK line separates them. A
+    // blank line is a COMPLETE line (terminated by '\n') containing ONLY spaces and
+    // tabs — not every '\n' (a `\n` can end a non-blank continuation line), and not
+    // lines holding other "whitespace" such as the vertical tab \u{0b} or form feed,
+    // which CommonMark does NOT treat as blank. So a lone leading-indent run with no
+    // newline (lazy continuation) and a " \u{0b}\n" line both correctly read as
+    // "no blank line" -> merge.
+    let gap = new_src.slice(lo..hi);
+    let has_blank_line = gap.as_ref().split_inclusive('\n').any(|seg| {
+        seg.ends_with('\n') && seg[..seg.len() - 1].bytes().all(|c| c == b' ' || c == b'\t')
+    });
+    !has_blank_line
 }
 
 /// Conservative triggers that force reparsing to end-of-document.
@@ -954,6 +1068,38 @@ fn html_in_play<S: TextSource>(
     let new_region_end = ((region_old_end as isize + edit.delta()) as usize).min(new_src.len());
     let new_region = new_src.slice(new_start.min(new_region_end)..new_region_end);
     html_opener_count(old_region.as_ref()) > 0 || html_opener_count(new_region.as_ref()) > 0
+}
+
+/// True if the edited region (old or new) contains a BARE carriage return — a
+/// `\r` not immediately followed by `\n`. pulldown-cmark treats bare CR (and CR)
+/// as line breaks, but every line/region helper here is LF-only (`str::lines`,
+/// `line_start`, `line_end`), so a bare CR hides a line boundary that the parser
+/// honors, desyncing the localized reparse. Callers route such edits to a full
+/// reparse. `\r\n` is NOT flagged: the LF machinery already handles it (`lines`
+/// strips the trailing `\r`, and `line_start`/`line_end` key on the `\n`).
+fn region_has_bare_cr<S: TextSource>(
+    old_src: &S,
+    new_src: &S,
+    edit: &Edit,
+    region_old_start: usize,
+    region_old_end: usize,
+) -> bool {
+    let os = region_old_start.min(old_src.len());
+    let oe = region_old_end.min(old_src.len());
+    let old_region = old_src.slice(os.min(oe)..oe);
+    let new_start = region_old_start.min(new_src.len());
+    let new_region_end = ((region_old_end as isize + edit.delta()) as usize).min(new_src.len());
+    let new_region = new_src.slice(new_start.min(new_region_end)..new_region_end);
+    has_bare_cr(old_region.as_ref()) || has_bare_cr(new_region.as_ref())
+}
+
+/// A `\r` not part of a `\r\n` pair (handles a trailing `\r` at end of slice as
+/// bare — erring toward the safe full-reparse path).
+fn has_bare_cr(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.iter()
+        .enumerate()
+        .any(|(i, &c)| c == b'\r' && b.get(i + 1) != Some(&b'\n'))
 }
 
 /// Maximum bytes scanned from the document head when confirming front-matter
@@ -1203,6 +1349,104 @@ mod tests {
         let doc = "para text\n---\n\nbody\n";
         let end = doc.find("\n---").unwrap() + 1;
         check(doc, 0..end, "");
+    }
+
+    // Regression (M7 fuzz, target F2 `block_tree`): an empty edit (range 2..2, repl "")
+    // inside a link-reference-definition-only document. The doc full-parses to a single
+    // synthetic trailing empty Paragraph at span 10..10. The widen-to-end region reparse
+    // [0..10] already reproduces that block, but the splice's "after" predicate
+    // (b.span.start >= region_old_end) also matched the same zero-length block at offset
+    // 10, emitting it a SECOND time — incremental had two empty paragraphs where full had
+    // one. Pinned minimized input from `cargo fuzz tmin`; must stay incremental == full.
+    #[test]
+    fn hazard_zero_length_trailing_block_not_double_spliced() {
+        let doc = "[e_]: h\n\t\t";
+        check(doc, 2..2, "");
+    }
+
+    // Regression (M7 fuzz, target F2 `block_tree`): inserting a byte at end-of-doc
+    // that turns the trailing ATX heading "#" into a paragraph "#\0". An upstream
+    // link-reference def leaves a degenerate empty Paragraph just before the heading;
+    // once the heading becomes a paragraph the two MERGE (full parse: one Paragraph
+    // 13..16). The localized splice kept the empty paragraph as a verbatim "before"
+    // block and reparsed only the heading region, producing two adjacent paragraphs
+    // with no blank line between them. The seam-consistency guard now detects that
+    // illegal adjacency and falls back to a full reparse. Pinned minimized input from
+    // `cargo fuzz tmin`; must stay incremental == full.
+    #[test]
+    fn hazard_heading_to_paragraph_merges_preceding_empty_paragraph() {
+        let doc = "[\u{0}\u{0}d]: ?ht=\n\t\n#";
+        check(doc, 15..15, "\u{0}");
+    }
+
+    // Regression (M7 fuzz, target F2 `block_tree`): inserting an HTML-comment opener
+    // into a document whose lines are separated by BARE carriage returns. pulldown-cmark
+    // honors bare `\r` as a line break and starts the comment at a `\r`-delimited line
+    // start, extending it past where the LF-only region machinery (`str::lines`,
+    // `line_start`) believes — so `html_in_play` failed to see the opener, the region
+    // reparsed Locally with the wrong extent, and a stale trailing Paragraph was left
+    // where the full parse keeps it inside the HtmlComment. The bare-CR fallback now
+    // routes such edits to a full reparse. Pinned minimized input from `cargo fuzz tmin`.
+    #[test]
+    fn hazard_bare_cr_html_comment_extent() {
+        let old = "<!<!---|~||~#\r\n\n]a\r\r\r\r\r<sCde\n\n] \u{17}~\n|---|----\n\n\0\0\0\0\0\0:`";
+        let repl = "<!---\0\0\0\0\0\0\0\0\0\0\0\r\r\r\r\r<sCde\n\n]a\r<sCd\n\n] \u{17}~\n|---|----\n\n\0\r\n\rs";
+        check(old, 23..23, repl);
+    }
+
+    // Regression (M7 fuzz, target F2 `block_tree`): a no-op edit (empty range, empty
+    // repl) inside the blank-line run of a document whose first line group is a link
+    // reference definition immediately followed by a `*` line. The gap edit's upstream
+    // pull-back set region_old_start to the `*` paragraph's line start, EXCLUDING the
+    // ref-def line above it (no blank line separates them). Reparsing the `*` line in
+    // isolation flipped it from Paragraph to List, diverging from the full parse. The
+    // pull-back now re-runs the blank-delimited group walk to include the ref-def
+    // context. Pinned minimized input from `cargo fuzz tmin`.
+    #[test]
+    fn hazard_gap_edit_pullback_includes_ref_def_group() {
+        let doc = "[e\nf]: :`ht\n*\n\n\n\n\n\n\n\n\ne\nh\n|\n\n\u{0}zzzzzzzzzzzzzzzzzz\n";
+        check(doc, 20..20, "");
+    }
+
+    // Regression (M7 fuzz, target F2 `block_tree`): replacing a blank line ("\t\n")
+    // that followed a paragraph with a tab-indented line ("\t~~~`r\n"). Removing the
+    // blank line makes the indented line a LAZY CONTINUATION of the preceding
+    // paragraph (full parse: one Paragraph 0..14), but the localized splice kept the
+    // paragraph verbatim and reparsed the tail as a separate IndentedCode block.
+    // Indented code cannot interrupt a paragraph, so the seam guard now folds it back
+    // and falls back to a full reparse. Pinned minimized input from `cargo fuzz tmin`.
+    #[test]
+    fn hazard_paragraph_lazily_absorbs_indented_continuation() {
+        let doc = "[]o\n\t\u{b}\n\t\n\u{b}";
+        check(doc, 8..10, "~~~`r\n");
+    }
+
+    // Regression (M7 fuzz, target F2 `block_tree`): two paragraphs that a full parse
+    // merges (Paragraph 0..30) but the splice left split, because the "blank" line
+    // between them (" \u{b}\n") holds a VERTICAL TAB — which CommonMark does NOT count
+    // as blank-line whitespace, so the line is a non-blank lazy continuation, not a
+    // separator. The seam guard's blank-line test now accepts only spaces/tabs (not
+    // every '\n', not \u{b}), so it folds the paragraphs and falls back to a full
+    // reparse. Pinned minimized input from `cargo fuzz tmin`.
+    #[test]
+    fn hazard_vertical_tab_line_is_not_a_blank_separator() {
+        let old = "\u{0}&|~\u{1}\u{0}<J<Pre\t\n\u{b}\n \n\n\u{1e}x";
+        let repl = "\u{b}\n\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}}s";
+        check(old, 17..20, repl);
+    }
+
+    // Regression (M7 fuzz, target F2 `block_tree`): an edit that CREATES a list at the
+    // region start (turning "X" into a "- " bullet) whose last item lazily absorbs an
+    // indented code block that lives PAST the localized reparse region. The absorptive-
+    // widen gate only inspects OLD-tree blocks, so the newly-created list was missed and
+    // the Local reparse cut it at the region boundary, mis-attributing the item's
+    // extent. The created-container-growth check now widens to a full reparse when the
+    // reparse's tail block is an absorptive container reaching the region end with
+    // document remaining. Distilled from a `cargo fuzz`-found nested-list divergence.
+    #[test]
+    fn hazard_created_list_absorbs_indented_code_past_region() {
+        let doc = "Xa\n\n  c\n\n    code\n";
+        check(doc, 0..1, "- ");
     }
 
     #[test]
