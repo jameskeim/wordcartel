@@ -211,10 +211,10 @@ and loud** so they get fixed.
 - `wordcartel/src/jobs.rs`: `JobOutcome` enum; both executors `catch_unwind` + emit
   `Panicked` (destructure `Copy` metadata before consuming `job.run`); `drain() -> Vec<JobOutcome>`;
   `is_stale` confined to `Done`; adapt `is_stale` unit tests (jobs.rs:221/292/300).
-- Drain/apply ripple — ALL sites: production `app.rs:776`/`1720` + the early-return
-  `apply_job_result` calls at `app.rs:1039`/`1052`/`1089`/`1102`/`1113`; the new `Panicked`
-  routing-by-kind in the funnel; test drains `save.rs:313`/`332`/`353`/`377`, `swap.rs:567`,
-  `file.rs:292`.
+- Drain/apply ripple — **grep is authoritative** (`rg '\.drain\(|apply_result|apply_job_result|is_stale'`);
+  starting-point sites only: production `app.rs:776`/`1720` + the `apply_job_result`/`Msg::JobDone`
+  sites scattered through `reduce`; the new `Panicked` routing-by-kind in the funnel (consider
+  the `apply_outcome` wrapper); test drains in `save.rs`/`swap.rs`/`file.rs`/`jobs.rs`/app.rs tests.
 - `wordcartel/src/transform.rs`: `TransformError::Panicked`; sync `catch` → that error; async
   thread (spawn ~112-118) `catch` + `TransformDone(Err)`.
 - `wordcartel/src/filter.rs`: `FilterError::Panicked` (shared with export); thread (spawn 346)
