@@ -129,6 +129,10 @@ INPUT cannot be expected to yield an on-boundary output, so the strategy must ge
 - **Before/after bias:** at an insertion point, `map_pos_before` stays left of the insert and
   `map_pos` lands right of it (the documented bias) — pin the exact semantics against the impl.
 
+(The changeset itself must be boundary-valid with UTF-8 insert payloads — built via the real
+`ChangeSet` constructors over boundary-snapped positions — or the "on-boundary output" property
+is not meaningful.)
+
 ### 5. T4 — History undo/redo (history.rs proptests)
 
 For an arbitrary sequence of commits over an arbitrary doc:
@@ -183,9 +187,12 @@ the `cfg(any(test,fuzzing))` helper) re-expresses its assertion via `incremental
 (keeping its rope-vs-str check too). The integration test in `tests/block_tree_oracle.rs` is
 untouched (it uses the still-`pub` `apply_edit`/`full_parse`/`incremental_update` directly).
 `fuzz_targets/block_tree.rs`: `fuzz_target!(|input: (String, usize, usize, String)|)` →
-derive a valid `old`, clamp+snap `range` to char boundaries, call `incremental_equals_full(old,
-range, repl)`, and assert it returns `true` (a `false`/panic = a fuzz finding — an incremental
-parse that diverges from a full reparse is a real correctness bug).
+derive a valid `old`, clamp + snap **BOTH** `range.start` AND `range.end` to char boundaries of
+`old` (`apply_edit` slices `old[..start]` and `old[end..]`, so an off-boundary endpoint panics),
+call `incremental_equals_full(old, range, repl)`, and assert it returns `true` (a `false`/panic =
+a fuzz finding — an incremental parse that diverges from a full reparse is a real correctness
+bug). Note: `incremental_equals_full` checks the `&str` incremental path; it does NOT replace the
+existing integration oracle's broader str/rope/full coverage (`tests/block_tree_oracle.rs`).
 
 ## Definition of done (the M7 bar)
 
