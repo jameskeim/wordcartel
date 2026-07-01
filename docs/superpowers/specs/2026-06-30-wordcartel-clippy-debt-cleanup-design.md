@@ -84,9 +84,9 @@ right call** (fix-properly vs justified-allow vs rename).
 ### (a) `should_implement_trait` — every inherent method clippy flags as confusable with a std trait method
 This lint fires on an inherent method whose NAME matches a std trait method
 (`from_str`→`FromStr`, `default`→`Default`, `next`→`Iterator`, `add`→`Add`, …).
-The confirmed sites (identify the exact set from the fresh clippy run — there is
-**1 confirmed core site plus 2 shell sites on OTHER inherent methods**, since the
-shell has no inherent `from_str` definition):
+The confirmed sites (identify the exact set from the fresh clippy run — 1 core
+site plus the shell sites clippy reports on OTHER inherent methods; the shell has
+no inherent `from_str` definition):
 - **`wordcartel-core` `TextBuffer::from_str`** (`buffer.rs:11`, `fn from_str(&str)
   -> Self` — **infallible**, verified): cannot cleanly implement std `FromStr`
   (which needs `type Err` + returns `Result<Self, Err>`). Options, per-site by
@@ -96,8 +96,11 @@ shell has no inherent `from_str` definition):
   shell, tests, AND the detached fuzz crate (which must be updated separately) —
   so `#[allow]` is a strong candidate here; the implementer weighs churn vs
   clarity and records the reasoning.
-- **The 2 shell sites** (method names TBD from the fresh clippy run): for each,
-  if the inherent method could CLEANLY implement the matching std trait, do so;
+- **The shell site(s)** — the inventory run counted 2 shell `should_implement_trait`
+  warnings; **1 is source-confirmed: `SearchState::next`** (`search_overlay.rs:129`,
+  confusable with `Iterator::next`); the other is to be pinned from the fresh
+  clippy run (possibly in test code). For each: if the inherent method could
+  CLEANLY implement the matching std trait (e.g. `Iterator` for `next`), do so;
   else rename or justified `#[allow]`.
 
 The implementer picks per site and records the reasoning; **Codex reviews each
@@ -191,8 +194,9 @@ The implementer picks and records the reasoning; Codex reviews the pick.
 
 1. The exact set of `should_implement_trait` sites from a fresh clippy run: the
    confirmed core `TextBuffer::from_str` (infallible → rename-vs-allow, weighing
-   the ~61-site rename churn) PLUS the 2 shell sites' actual method names (decide
-   implement-trait vs rename vs allow per site).
+   the ~61-site rename churn) PLUS the shell sites' actual method names (1
+   source-confirmed: `SearchState::next`; pin the rest from clippy) — decide
+   implement-trait vs rename vs allow per site.
 2. `apply_filter_done` (`app.rs:274`) struct-vs-allow (Codex leans `#[allow]`).
 3. The exact `Cargo.toml` workspace layout + `[workspace.lints]`/`[lints]` TOML,
    INCLUDING migrating `wordcartel-core`'s existing `[lints.rust] unexpected_cfgs`
