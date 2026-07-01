@@ -126,6 +126,10 @@ impl SearchState {
         self.matches.iter().position(|m| m.start >= off) // None when past the last match → stepping ends
     }
 
+    // Wrapping bidirectional search cursor (pairs with `prev()`; wraps infinitely,
+    // never yields None once matches exist) — NOT forward-consuming iteration, so
+    // std `Iterator` is the wrong abstraction.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<Match> {
         if self.matches.is_empty() { return None; }
         self.direction = Direction::Forward;

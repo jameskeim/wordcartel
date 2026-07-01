@@ -8,6 +8,9 @@ pub struct TextBuffer {
 }
 
 impl TextBuffer {
+    // Named `from_str` for readability at 61 call sites; std `FromStr` is inapplicable
+    // (this constructor is infallible — no `Result`/`Err`). Renaming buys nothing.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         TextBuffer { rope: ropey::Rope::from_str(s) }
     }
@@ -97,8 +100,11 @@ impl TextBuffer {
         self.rope.clone() // O(1) — the async-worker seam (spec §10.3)
     }
 
-    pub fn to_string(&self) -> String {
-        self.rope.to_string()
+}
+
+impl std::fmt::Display for TextBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.rope)
     }
 }
 

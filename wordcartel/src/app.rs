@@ -271,6 +271,9 @@ pub fn drive_quit_drain(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Cloc
     }
 }
 
+// 8 args mirror Msg::FilterDone's fields 1:1; an args-struct would just duplicate
+// that variant. Called from only the two FilterDone match arms.
+#[allow(clippy::too_many_arguments)]
 fn apply_filter_done(
     editor: &mut crate::editor::Editor,
     buffer_id: crate::editor::BufferId,
@@ -794,7 +797,7 @@ fn apply_clipboard_paste(editor: &mut Editor, buffer_id: crate::editor::BufferId
 
 fn apply_clipboard_availability(editor: &mut Editor, ok: bool) {
     if !ok && !editor.clipboard_notice_shown {
-        editor.status = "system clipboard unavailable -- copy/paste work in-editor; using OSC 52 for terminal sync".into();
+        editor.status = "system clipboard unavailable — copy/paste work in-editor; using OSC 52 for terminal sync".into();
         editor.clipboard_notice_shown = true;
     }
 }
@@ -878,6 +881,8 @@ fn search_cancel(editor: &mut Editor) {
     crate::nav::ensure_visible(editor);
 }
 
+type SearchReplacePlan = Option<(Vec<(usize, usize, String)>, usize, usize)>;
+
 fn search_replace_all(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
     search_sync(editor); // ensure cache is current
     // §8: invalid regex → distinct status, no mutation.
@@ -885,7 +890,7 @@ fn search_replace_all(editor: &mut Editor, clock: &dyn wordcartel_core::history:
         editor.status = "invalid regex".into();
         return;
     }
-    let plan: Option<(Vec<(usize, usize, String)>, usize, usize)> = editor.search.as_ref().and_then(|s| {
+    let plan: SearchReplacePlan = editor.search.as_ref().and_then(|s| {
         let m = s.matcher()?;
         if s.matches().is_empty() { return None; }
         let rope = editor.active().document.buffer.snapshot();
@@ -1590,10 +1595,9 @@ pub fn reduce(
         // Non-key messages fall through to normal handlers below.
     }
 
-    if editor.outline.is_some() {
-        if editor.outline.as_ref().map(|o| o.buffer_id) != Some(editor.active().id) {
-            editor.outline = None;
-        }
+    if editor.outline.is_some()
+        && editor.outline.as_ref().map(|o| o.buffer_id) != Some(editor.active().id) {
+        editor.outline = None;
     }
     if editor.outline.is_some() {
         if let Msg::Input(Event::Key(k)) = &msg {
@@ -1706,8 +1710,8 @@ pub fn reduce(
             }
         }
         Msg::Input(Event::Paste(text)) => {
-            if editor.minibuffer.is_some() {
-                for ch in text.chars() { editor.minibuffer.as_mut().unwrap().insert(ch); }
+            if let Some(mb) = editor.minibuffer.as_mut() {
+                for ch in text.chars() { mb.insert(ch); }
             } else if !text.is_empty() {
                 let bid = editor.active().id;
                 if insert_paste_text(editor, bid, &text, clock) {
@@ -4023,7 +4027,7 @@ mod tests {
         let guard = crate::app::apply_resume(&entry, (99, 20), doc_len2);
         assert!(guard.is_none(), "identity mismatch → guard rejects");
         // Mirror restore_resume: set block only when guard passes.
-        if let Some(_) = guard {
+        if guard.is_some() {
             if let Some((s, en)) = entry.block {
                 e2.active_mut().marked_block =
                     Some(MarkedBlock { start: s, end: en, hidden: false });

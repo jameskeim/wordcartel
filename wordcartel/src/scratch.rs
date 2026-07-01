@@ -107,7 +107,7 @@ mod tests {
         e.undo();
         assert_eq!(e.active().document.buffer.to_string(), "hello world\n");
         // Scratch append is a SEPARATE undo in the scratch buffer's own history.
-        e.buffers.iter().position(|b| b.id == sid).map(|i| { e.active = i; });
+        if let Some(i) = e.buffers.iter().position(|b| b.id == sid) { e.active = i; }
         assert!(e.undo(), "scratch has its own undo step");
         assert_eq!(e.by_id(sid).unwrap().document.buffer.to_string(), "");
     }

@@ -175,7 +175,7 @@ fn run_pandoc(sink: ExportSink, stdin: &str, target: &Path) -> Result<ExportResu
                 timeout,
                 max_output,
                 &cancel,
-            ).map_err(|e| e)?; // child exits 0 on success
+            )?; // child exits 0 on success
 
             // Verify the file was written.
             if !tmp.exists() {

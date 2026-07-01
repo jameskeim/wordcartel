@@ -161,11 +161,7 @@ pub fn handle(
                 );
                 let vis = fv.visible_count();
                 let max_ord = vis.saturating_sub(1);
-                let new_ord = if edit_height > 0 {
-                    ((erow_in_track * max_ord) / edit_height).min(max_ord)
-                } else {
-                    0
-                };
+                let new_ord = (erow_in_track * max_ord).checked_div(edit_height).unwrap_or(0).min(max_ord);
                 editor.active_mut().view.scroll = fv.line_at_ordinal(new_ord);
                 editor.mouse.scrollbar_dragging = true;
                 editor.mouse.scrollbar_until_ms = clock.now_ms() + 1200;
@@ -230,11 +226,7 @@ pub fn handle(
                 );
                 let vis = fv.visible_count();
                 let max_ord = vis.saturating_sub(1);
-                let new_ord = if edit_height > 0 {
-                    ((erow_in_track * max_ord) / edit_height).min(max_ord)
-                } else {
-                    0
-                };
+                let new_ord = (erow_in_track * max_ord).checked_div(edit_height).unwrap_or(0).min(max_ord);
                 editor.active_mut().view.scroll = fv.line_at_ordinal(new_ord);
                 editor.mouse.scrollbar_until_ms = clock.now_ms() + 1200;
                 return;

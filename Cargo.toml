@@ -1,3 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["wordcartel-core", "wordcartel"]
+
+[workspace.lints.clippy]
+all = "deny"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

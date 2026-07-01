@@ -35,8 +35,7 @@ pub fn next_word_start(text: &str, pos: usize) -> Option<usize> {
 pub fn prev_word_start(text: &str, pos: usize) -> Option<usize> {
     let pos = pos.min(text.len());
     text.split_word_bound_indices()
-        .filter(|(start, seg)| *start < pos && is_word(seg))
-        .next_back()
+        .rfind(|(start, seg)| *start < pos && is_word(seg))
         .map(|(start, _)| start)
 }
 

@@ -20,5 +20,5 @@ regex-syntax = "0.8"
 proptest = "1"
 regex = "1"
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+[lints]
+workspace = true

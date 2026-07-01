@@ -213,7 +213,7 @@ impl Buffer {
             b.start = wordcartel_core::change::map_pos(b.start, &cs);
             b.end   = wordcartel_core::change::map_pos_before(b.end, &cs);
         }
-        if self.marked_block.map_or(false, |b| b.start >= b.end) {
+        if self.marked_block.is_some_and(|b| b.start >= b.end) {
             self.marked_block = None; // collapsed → clear
         }
         self.sel_history.clear();
@@ -443,7 +443,7 @@ impl Editor {
     /// file and is auto-persisted to session state). All workspace logic uses this.
     pub fn is_dirty(&self, id: BufferId) -> bool {
         if self.is_scratch(id) { return false; }
-        self.by_id(id).map_or(false, |b| b.document.dirty())
+        self.by_id(id).is_some_and(|b| b.document.dirty())
     }
 
     /// Move `id` to the front of the MRU list.

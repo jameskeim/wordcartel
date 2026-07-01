@@ -89,11 +89,7 @@ before merge.
 **GATEs (before any merge):**
 - `cargo test` green across all suites (`wordcartel-core` lib + oracle, `wordcartel` lib).
 - `cargo build` and `cargo test --no-run` warning-free for the crate(s) you touched.
-- **No new clippy warnings in the files you touched.** Do NOT gate on a clean
-  `cargo clippy --all-targets -- -D warnings` over the whole workspace — the codebase
-  carries pre-existing clippy debt (tracked as its own pre-Effort-P cleanup). Check your
-  own diff: `cargo clippy -p <crate>` and confirm none of the new findings point at lines
-  you added or changed.
+- **Workspace clippy clean is a GATE.** The clippy-debt cleanup (2026-06-30) cleared all `clippy::all` warnings and enabled `[workspace.lints.clippy] all = "deny"`. `cargo clippy --workspace --all-targets` MUST pass clean before merge. New warnings fail the clippy run; deliberate exceptions require an item-local `#[allow(clippy::…)]` with a one-line rationale (never a blanket crate/workspace allow).
 - New code matches the surrounding **house style** (see below) by review.
 
 **Formatting — do NOT run `cargo fmt`.** This repo is hand-formatted in a deliberate dense

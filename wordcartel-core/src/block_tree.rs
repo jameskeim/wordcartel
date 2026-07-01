@@ -439,7 +439,7 @@ fn parse_region<S: TextSource>(src: &S, region: Range<usize>, base: usize) -> Bl
     BlockTree { root }
 }
 
-fn push_child(root: &mut Block, stack: &mut Vec<Block>, done: Block) {
+fn push_child(root: &mut Block, stack: &mut [Block], done: Block) {
     match stack.last_mut() {
         Some(parent) => parent.children.push(done),
         None => root.children.push(done),
@@ -722,7 +722,7 @@ pub fn incremental_update_instrumented_src<S: TextSource>(
     // is the only correct treatment.
     let slack_pos = tops.iter().position(|b| b.span.start >= region_old_end);
     let slack_block = slack_pos.map(|i| &tops[i]);
-    let slack_is_absorptive = slack_block.map_or(false, |b| {
+    let slack_is_absorptive = slack_block.is_some_and(|b| {
         matches!(
             b.kind,
             BlockKind::List | BlockKind::BlockQuote | BlockKind::IndentedCode
@@ -757,8 +757,8 @@ pub fn incremental_update_instrumented_src<S: TextSource>(
             BlockKind::List | BlockKind::ListItem | BlockKind::Table | BlockKind::BlockQuote
         )
     };
-    let downstream_container_merge = slack_block.map_or(false, is_downstream_container)
-        || post_slack_block.map_or(false, is_downstream_container);
+    let downstream_container_merge = slack_block.is_some_and(is_downstream_container)
+        || post_slack_block.is_some_and(is_downstream_container);
 
     let widen = absorptive_in_region
         || slack_is_absorptive
