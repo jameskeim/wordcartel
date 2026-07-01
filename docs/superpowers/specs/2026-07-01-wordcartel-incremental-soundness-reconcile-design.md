@@ -1,6 +1,6 @@
 # Deep incremental-soundness via eventual-consistency reconcile — design
 
-**Status:** approved design (pre-spec-review)
+**Status:** spec-review clean (Codex READY FOR PLANNING, no open findings)
 **Date:** 2026-07-01
 **Effort:** incremental-soundness reconcile (M7 residual (a); pre-Effort-P)
 
