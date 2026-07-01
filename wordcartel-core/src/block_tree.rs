@@ -322,6 +322,14 @@ pub fn full_parse(text: &str) -> BlockTree {
     full_parse_src(&text)
 }
 
+/// A childless `Document`-root tree spanning `0..len`. The safe fallback when a
+/// parse cannot run (M4-rest): it has NO child spans, so span-slicing consumers
+/// (fold / outline / nav / transform) have nothing to slice out of range, and
+/// `role_at` returns the default `Paragraph` everywhere.
+pub fn empty_tree(len: usize) -> BlockTree {
+    BlockTree { root: Block { kind: BlockKind::Document, span: 0..len, children: Vec::new() } }
+}
+
 /// Generic version of `full_parse` over any `TextSource`.
 ///
 /// THE ONLY true whole-document entry point — `full_parse` and
@@ -1781,5 +1789,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn empty_tree_is_a_childless_document_root() {
+        let t = empty_tree(42);
+        assert_eq!(t.root.kind, BlockKind::Document);
+        assert_eq!(t.root.span, 0..42);
+        assert!(t.top_level().is_empty());
+        // Any byte resolves to the default Paragraph role — no child span to slice.
+        assert_eq!(t.role_at(0), crate::style::BlockRole::Paragraph);
+        assert_eq!(t.role_at(41), crate::style::BlockRole::Paragraph);
     }
 }
