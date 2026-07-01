@@ -14,13 +14,16 @@ pub fn record_snapshot(path: Option<&Path>, rope: ropey::Rope) {
     }
 }
 
-/// Write a 0600 dump of `rope` into `dir`. Tested directly (no real panic).
-pub fn write_dump(path: Option<&Path>, rope: &ropey::Rope, dir: &Path) -> std::io::Result<PathBuf> {
+/// Write a 0600 dump of `rope` into `dir`. `seq` disambiguates buffers that would
+/// otherwise derive the same name (path-less buffers, or same-basename files in
+/// different directories) so a multi-buffer recovery dump never overwrites itself.
+/// Tested directly (no real panic).
+pub fn write_dump(path: Option<&Path>, rope: &ropey::Rope, dir: &Path, seq: u64) -> std::io::Result<PathBuf> {
     let name = match path.and_then(|p| p.file_name()) {
         Some(n) => crate::swap::sanitize(&n.to_string_lossy()),
         None => "scratch".to_string(),
     };
-    let out = dir.join(format!("recovered-{}-{}.md", name, std::process::id()));
+    let out = dir.join(format!("recovered-{}-{}-{}.md", name, std::process::id(), seq));
     crate::swap::write_atomic(&out, &rope.to_string())?;
     Ok(out)
 }
@@ -33,10 +36,10 @@ pub fn write_dump(path: Option<&Path>, rope: &ropey::Rope, dir: &Path) -> std::i
 /// (its content is unsaved work); clean/empty buffers are skipped.
 pub fn dump_all_dirty(editor: &crate::editor::Editor, dir: &Path) -> usize {
     let mut n = 0;
-    for b in &editor.buffers {
+    for (i, b) in editor.buffers.iter().enumerate() {
         if b.document.dirty() {
             let rope = b.document.buffer.snapshot();
-            if write_dump(b.document.path.as_deref(), &rope, dir).is_ok() {
+            if write_dump(b.document.path.as_deref(), &rope, dir, i as u64).is_ok() {
                 n += 1;
             }
         }
@@ -50,7 +53,7 @@ pub fn dump_on_panic() {
     if let Ok(g) = LAST_GOOD.try_lock() {
         if let Some((path, rope)) = g.as_ref() {
             if let Ok(dir) = crate::swap::state_dir() {
-                let _ = write_dump(path.as_deref(), rope, &dir);
+                let _ = write_dump(path.as_deref(), rope, &dir, 0);
             }
         }
     }
@@ -65,7 +68,7 @@ mod tests {
     fn write_dump_writes_named_0600_file_with_body() {
         let dir = crate::swap::state_dir().unwrap();
         let rope = ropey::Rope::from_str("unsaved work\n");
-        let out = write_dump(Some(Path::new("/home/u/notes.md")), &rope, &dir).unwrap();
+        let out = write_dump(Some(Path::new("/home/u/notes.md")), &rope, &dir, 0).unwrap();
         let name = out.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.starts_with("recovered-notes.md-") && name.ends_with(".md"));
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "unsaved work\n");
@@ -82,9 +85,32 @@ mod tests {
     fn write_dump_handles_scratch_buffer() {
         let dir = crate::swap::state_dir().unwrap();
         let rope = ropey::Rope::from_str("scratch\n");
-        let out = write_dump(None, &rope, &dir).unwrap();
+        let out = write_dump(None, &rope, &dir, 0).unwrap();
         assert!(out.file_name().unwrap().to_string_lossy().starts_with("recovered-scratch-"));
         let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn dump_all_dirty_does_not_collide_for_two_pathless_buffers() {
+        use crate::editor::Editor;
+        let dir = std::env::temp_dir().join(format!("wcartel-collisiontest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Two PATH-LESS dirty buffers (untitled + scratch) — both derive the "scratch" name.
+        let mut e = Editor::new_from_text("aaa\n", None, (80, 24)); // buffer 0, path-less
+        e.buffers[0].document.version = 1;                          // dirty
+        e.install_scratch();
+        let sid = e.scratch_id.unwrap();
+        e.by_id_mut(sid).unwrap().document.version = 1;            // dirty, also path-less
+
+        let n = dump_all_dirty(&e, &dir);
+        assert_eq!(n, 2);
+        let names: Vec<String> = std::fs::read_dir(&dir).unwrap()
+            .map(|x| x.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names.len(), 2, "two path-less dirty buffers must not overwrite each other");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
