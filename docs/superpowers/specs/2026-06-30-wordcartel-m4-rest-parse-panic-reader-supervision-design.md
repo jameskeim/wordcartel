@@ -192,11 +192,18 @@ parse is synchronous, so the `Err` is handled inline in `rebuild`.
    carrying a distinct reason. Introduce a small `ExitReason` { `Normal`,
    `InputLost` } that the loop produces and `run()` returns to `main()`. Sequence
    (ordering matters because `std::process::exit` runs **no** destructors):
-   - On the `InputLost` break, before returning, **dump every dirty buffer**
-     (persist unsaved work — independent of the terminal): iterate the editor's
-     open buffers, filter `is_dirty`, and for each write a recovery dump via the
-     existing `recovery::write_dump(buffer.document.path.as_deref(), &rope, &dir)`
-     (`dir = swap::state_dir()`, `rope` = the buffer's rope snapshot). This is a
+   - On the `InputLost` break, before returning, **dump every buffer holding
+     unsaved work** (persist it — independent of the terminal): iterate the
+     editor's open buffers (`Editor::buffers`, `editor.rs:287`) and for each whose
+     **raw `Document::dirty()`** (`editor.rs:66`) is true, write a recovery dump via
+     the existing `recovery::write_dump(buffer.document.path.as_deref(), &rope, &dir)`
+     (`dir = swap::state_dir()`, `rope = buffer.document.buffer.snapshot()`).
+     **Predicate note:** use raw `Document::dirty()`, NOT `Editor::is_dirty(id)` —
+     the latter excludes scratch buffers (a quit-prompt convenience), but a scratch
+     buffer with content IS unsaved work we must preserve on input-loss. Raw
+     `dirty()` includes scratch-with-content and excludes clean/empty buffers.
+     `write_dump` already handles a path-less (scratch) buffer via a `"scratch"`
+     name fallback. This is a
      **controlled** main-loop break (not a real panic), so iterating buffers is
      safe here — unlike the panic hook, whose conservative single best-effort
      `try_lock` `dump_on_panic` stays as-is (the hook is unchanged by this effort).
@@ -261,11 +268,12 @@ no watchdog, no new `Msg`.
   channel. Separately, a unit test that the loop given `Msg::InputThreadDied`
   yields `ExitReason::InputLost`, and that `InputLost` drives the dump + non-zero
   exit decision (test the decision function, not real teardown).
-- **All-dirty-buffer dump (deterministic):** build an editor with two dirty
-  buffers and one clean buffer, call `dump_all_dirty(editor)`, assert it returns
-  `2` and that two `recovered-*.md` files were written (the clean buffer skipped),
-  each containing its buffer's text. Reuses `write_dump` (already tested at
-  `recovery.rs`).
+- **All-dirty-buffer dump (deterministic):** build an editor with a dirty file
+  buffer, a scratch buffer holding content, and one clean saved buffer; call
+  `dump_all_dirty(editor)`, assert it returns `2` and that two `recovered-*.md`
+  files were written (dirty file + scratch-with-content; the clean buffer skipped),
+  each containing its buffer's text, and the scratch dump uses the `recovered-scratch-*`
+  name. Reuses `write_dump` (already tested at `recovery.rs`).
 - **Clipboard notice:** drop the clipboard `Receiver`, call the intent drain with
   a `Get` (and a `Set`) intent, assert `editor.status == "clipboard unavailable"`
   and the existing `text: None` fallback still fires.
@@ -282,9 +290,10 @@ no watchdog, no new `Msg`.
    the minimal `ExitReason` threading into `main()`; confirm `dump_all_dirty` runs
    before `run()` returns and `process::exit` only after.
 3a. The editor API to iterate all open buffers and read each one's rope + path for
-   `dump_all_dirty` (buffer list / id iteration; `is_dirty(id)`; the per-buffer
-   rope snapshot and `document.path`) — so the dump touches every dirty buffer, not
-   just the active one.
+   `dump_all_dirty` (`Editor::buffers` `editor.rs:287`; raw `Document::dirty()`
+   `editor.rs:66` as the predicate — NOT `Editor::is_dirty`, so scratch-with-content
+   is included; `buffer.document.buffer.snapshot()` for the rope; `document.path`) —
+   so the dump touches every buffer holding unsaved work, not just the active one.
 4. The exact `Msg` enum derives + the three match sites to update (manual `Debug`
    `app.rs:65–103`; main `match msg` `app.rs:1651–1756`; the pre-modal dispatch
    point so `InputThreadDied` bypasses the overlay `_ => {}` at `app.rs:1403–1442`),
