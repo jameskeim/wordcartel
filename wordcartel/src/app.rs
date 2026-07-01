@@ -60,6 +60,16 @@ pub enum Msg {
     ClipboardPaste { id: u64, buffer_id: crate::editor::BufferId, text: Option<String> },
     ClipboardAvailability(bool),
     Tick,
+    /// The input reader thread ended (Err from read(), or a panic). Surfaced by
+    /// the input watchdog; the run loop turns it into a clean InputLost shutdown.
+    InputThreadDied,
+}
+
+/// Why the run loop exited. Drives the process exit code in `main`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitReason {
+    Normal,
+    InputLost,
 }
 
 impl std::fmt::Debug for Msg {
@@ -99,6 +109,7 @@ impl std::fmt::Debug for Msg {
                 .field("has_text", &text.is_some()).finish(),
             Msg::ClipboardAvailability(ok) => f.debug_tuple("ClipboardAvailability").field(ok).finish(),
             Msg::Tick => f.write_str("Tick"),
+            Msg::InputThreadDied => f.write_str("InputThreadDied"),
         }
     }
 }
@@ -1753,6 +1764,9 @@ pub fn reduce(
         }
         Msg::ClipboardPaste { buffer_id, text, .. } => apply_clipboard_paste(editor, buffer_id, text, clock),
         Msg::ClipboardAvailability(ok) => apply_clipboard_availability(editor, ok),
+        // Intercepted in the run loop before `reduce` (see run()); unreachable here.
+        // Arm required only for exhaustiveness. Do not process the shutdown here.
+        Msg::InputThreadDied => {}
     }
     if editor.active().document.version != before {
         editor.active_mut().last_edit_at = Some(clock.now_ms());
@@ -1811,7 +1825,7 @@ impl Clock for SystemClock {
 /// Open the file named by `cli.path` (or a scratch buffer), load layered config,
 /// build the keymap, install the terminal guard, then loop:
 /// draw → read event → step → repeat until `editor.quit`.
-pub fn run(cli: config::Cli) -> std::io::Result<()> {
+pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // Install the panic hook (once) so the terminal is restored on panic.
     term::install_panic_hook();
 
@@ -1972,18 +1986,28 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
         });
     }
 
-    // Input thread: blocks on read(); forwards every event. Detached — dies with
-    // the process on quit (read() can't be interrupted portably).
+    // Input thread + watchdog. The reader blocks on read() and forwards events;
+    // if it ever ends (Err from read(), or a panic), the watchdog surfaces
+    // Msg::InputThreadDied so the loop shuts down cleanly instead of hanging
+    // (other Sender<Msg> clones keep msg_rx alive, so its disconnect never fires).
     {
-        let msg_tx = msg_tx.clone();
-        std::thread::Builder::new()
+        let input_tx = msg_tx.clone();
+        let input_handle = std::thread::Builder::new()
             .name("wcartel-input".into())
             .spawn(move || {
                 while let Ok(ev) = crossterm::event::read() {
-                    if msg_tx.send(Msg::Input(ev)).is_err() { break; }
+                    if input_tx.send(Msg::Input(ev)).is_err() { break; }
                 }
             })
             .expect("spawn input thread");
+        let watch_tx = msg_tx.clone();
+        std::thread::Builder::new()
+            .name("wcartel-input-watchdog".into())
+            .spawn(move || {
+                let _ = input_handle.join(); // unblocks on ANY reader end (Ok or panic)
+                let _ = watch_tx.send(Msg::InputThreadDied);
+            })
+            .expect("spawn input watchdog");
     }
 
     let clock = SystemClock;
@@ -2029,6 +2053,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     }
     crate::nav::ensure_visible(&mut editor);
     guard.terminal().draw(|f| render::render(f, &mut editor))?;
+    let mut exit_reason = ExitReason::Normal;
     loop {
         let now = clock.now_ms();
         // Bounded save&quit: if waiting for an in-flight save to complete and
@@ -2091,6 +2116,12 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Msg::Tick,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        // Input-reader death: shut down cleanly BEFORE any modal/reduce handling
+        // (the modal match would otherwise swallow it via its `_ => {}`).
+        if let Msg::InputThreadDied = msg {
+            exit_reason = ExitReason::InputLost;
+            break;
+        }
         let keep = reduce(msg, &mut editor, &reg, &keymap, &executor, &clock, &msg_tx);
         crate::clipboard::drain_clipboard_intents(&mut editor, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
         reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
@@ -2110,6 +2141,15 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
         if !keep { break; }
     }
 
+    // Input-loss shutdown: persist every dirty buffer non-interactively (the
+    // interactive quit-drain can't run — input is gone). Controlled break, so
+    // iterating buffers is safe.
+    if exit_reason == ExitReason::InputLost {
+        if let Ok(dir) = crate::swap::state_dir() {
+            crate::recovery::dump_all_dirty(&editor, &dir);
+        }
+    }
+
     // On clean quit: persist once more (cursor may have moved since the last save).
     session_seq += 1;
     persist_session(&mut session, &editor, &cfg, session_seq);
@@ -2120,7 +2160,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<()> {
     // back immediately; we still join (don't abandon an in-flight atomic save — that
     // is the "never lose work" behavior). The 5 s save&quit guard above bounds the wait.
     drop(guard);
-    Ok(())
+    Ok(exit_reason)
 }
 
 /// Recompute `editor.mouse.scrollbar_visible` from the clock.
@@ -4890,5 +4930,21 @@ mod tests {
         crate::app::persist_session_for_test(&mut session, &e, &cfg, 1);
         assert!(session.scratch.is_none(),
             "oversized live scratch must CLEAR the stale loaded scratch, not resurrect it");
+    }
+
+    #[test]
+    fn input_watchdog_emits_input_thread_died_when_the_reader_ends() {
+        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+        // Stand-in for the input reader that has ended (Err from read(), or a panic).
+        let reader = std::thread::spawn(|| { /* returns immediately */ });
+        // The watchdog logic: join, then surface the death.
+        let watch_tx = tx.clone();
+        std::thread::spawn(move || {
+            let _ = reader.join();
+            let _ = watch_tx.send(Msg::InputThreadDied);
+        })
+        .join()
+        .unwrap();
+        assert!(matches!(rx.recv().unwrap(), Msg::InputThreadDied));
     }
 }

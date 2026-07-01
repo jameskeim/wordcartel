@@ -42,11 +42,14 @@ pub fn drain_clipboard_intents(
             let _ = out.write_all(&bytes);
             let _ = out.flush();
         }
-        let _ = clip_tx.send(ClipReq::Set(text));
+        if clip_tx.send(ClipReq::Set(text)).is_err() {
+            editor.status = "clipboard unavailable".to_string();
+        }
     }
     if let Some(pi) = editor.clipboard_get_pending.take() {
         if clip_tx.send(ClipReq::Get { id: pi.id, buffer_id: pi.buffer_id }).is_err() {
-            // No worker (tests / shutdown): fall back to the register paste path.
+            // No worker (tests / shutdown): notify, then fall back to the register paste path.
+            editor.status = "clipboard unavailable".to_string();
             let _ = msg_tx.send(crate::app::Msg::ClipboardPaste {
                 id: pi.id,
                 buffer_id: pi.buffer_id,
@@ -264,5 +267,26 @@ mod tests {
             Ok(crate::app::Msg::ClipboardPaste { text: None, buffer_id, .. }) => assert_eq!(buffer_id, bid),
             o => panic!("{o:?}"),
         }
+    }
+
+    #[test]
+    fn a_dead_clipboard_worker_sets_the_status_notice() {
+        let (clip_tx, clip_rx) = std::sync::mpsc::channel::<ClipReq>();
+        drop(clip_rx); // worker is gone: every send now errors
+        let (msg_tx, _msg_rx) = std::sync::mpsc::channel::<crate::app::Msg>();
+        let mut out: Vec<u8> = Vec::new();
+        let mut ed = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        let bid = ed.active().id;
+
+        // A pending Get with no worker -> notice + None fallback.
+        ed.clipboard_get_pending = Some(PasteIntent { id: 1, buffer_id: bid });
+        drain_clipboard_intents(&mut ed, &mut out, &clip_tx, &msg_tx);
+        assert_eq!(ed.status, "clipboard unavailable");
+
+        // A pending Set with no worker -> notice.
+        ed.status.clear();
+        ed.clipboard_sync_request = Some("hello".to_string());
+        drain_clipboard_intents(&mut ed, &mut out, &clip_tx, &msg_tx);
+        assert_eq!(ed.status, "clipboard unavailable");
     }
 }

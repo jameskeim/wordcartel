@@ -89,21 +89,22 @@ pub fn rebuild(editor: &mut Editor) {
     let maybe_old_rope = editor.active_mut().pre_edit_rope.take();
     let maybe_edit = editor.active_mut().last_edit.take();
 
-    let new_blocks = match (maybe_old_rope, maybe_edit) {
-        (Some(old_rope), Some(edit)) => {
-            // Normal edit path: O(region) incremental reparse.
-            block_tree::incremental_update_rope(
-                &editor.active().document.blocks,
-                &old_rope,
-                &edit,
-                &new_rope,
-            )
-        }
-        _ => {
-            // Initial load, undo, redo, or any state where we lack edit info.
-            block_tree::full_parse_rope(&new_rope)
-        }
-    };
+    let new_len = new_rope.len_bytes();
+    // Guard the parse: an upstream pulldown-cmark panic must not crash the app.
+    // The closure borrows the editor immutably (old blocks) + the taken locals;
+    // panicx::catch returns an owned Result, releasing the borrow before we
+    // mutate the editor below. The main-thread caught-panic guard (panicx) keeps
+    // the panic hook from tearing down the terminal.
+    let computed = crate::panicx::catch(|| match (&maybe_old_rope, &maybe_edit) {
+        (Some(old_rope), Some(edit)) => block_tree::incremental_update_rope(
+            &editor.active().document.blocks,
+            old_rope,
+            edit,
+            &new_rope,
+        ),
+        _ => block_tree::full_parse_rope(&new_rope),
+    });
+    let new_blocks = apply_parse_result(editor, new_len, computed);
     editor.active_mut().document.blocks = new_blocks;
     // last_edit and pre_edit_rope were already cleared by .take() above.
 
@@ -174,6 +175,37 @@ pub fn rebuild(editor: &mut Editor) {
         editor.active_mut().view.line_layouts.insert(l, (rows, map));
         // 5g: jump past any folded body that follows this line.
         l = fold_view.next_visible(l).unwrap_or(total_lines);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parse-panic boundary (M4-rest)
+// ---------------------------------------------------------------------------
+
+/// Turn a guarded parse result into the tree to install, managing the deduped
+/// parse-degraded notice. On `Err` we install the empty-tree fallback (no child
+/// spans → no consumer can slice the current rope out of range) and set the
+/// notice once; on `Ok` we clear the notice if it was set.
+pub(crate) fn apply_parse_result(
+    editor: &mut Editor,
+    new_len: usize,
+    computed: Result<block_tree::BlockTree, String>,
+) -> block_tree::BlockTree {
+    match computed {
+        Ok(tree) => {
+            if editor.parse_degraded {
+                editor.parse_degraded = false;
+                editor.status.clear();
+            }
+            tree
+        }
+        Err(_) => {
+            if !editor.parse_degraded {
+                editor.parse_degraded = true;
+                editor.status = "markdown parse failed — styling may be stale".to_string();
+            }
+            block_tree::empty_tree(new_len)
+        }
     }
 }
 
@@ -465,5 +497,35 @@ mod tests {
         crate::derive::rebuild(&mut ed);
         // byte 0 is now "body" — not a heading start — so the fold is gone.
         assert!(!ed.active().folds.folded.contains(&0));
+    }
+
+    // ------------------------------------------------------------------
+    // M4-rest: apply_parse_result state-transition helper
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn apply_parse_result_err_installs_empty_tree_and_sets_degraded_once() {
+        let mut ed = crate::editor::Editor::new_from_text("hello\n", None, (80, 24));
+        ed.status.clear();
+        ed.parse_degraded = false;
+
+        // First Err: empty tree + degraded + notice.
+        let t = apply_parse_result(&mut ed, 10, Err("boom".to_string()));
+        assert!(ed.parse_degraded);
+        assert_eq!(ed.status, "markdown parse failed — styling may be stale");
+        assert_eq!(t.root.span, 0..10);
+        assert!(t.top_level().is_empty());
+
+        // Second Err while already degraded: still empty tree, notice unchanged (no spam).
+        ed.status = "markdown parse failed — styling may be stale".to_string();
+        let _ = apply_parse_result(&mut ed, 12, Err("again".to_string()));
+        assert!(ed.parse_degraded);
+
+        // Ok while degraded: real tree returned, degraded cleared, notice cleared.
+        let real = block_tree::full_parse_rope(&ropey::Rope::from_str("# H\n"));
+        let got = apply_parse_result(&mut ed, 4, Ok(real.clone()));
+        assert_eq!(got, real);
+        assert!(!ed.parse_degraded);
+        assert_eq!(ed.status, "");
     }
 }
