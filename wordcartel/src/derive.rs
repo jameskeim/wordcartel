@@ -134,7 +134,7 @@ pub fn rebuild(editor: &mut Editor) {
         let total_lines = total_logical_lines(buf);
         let area_height = b.view.area.1 as usize;
         let caret_byte = b.document.selection.primary().head;
-        let active_line = if buf.len() == 0 {
+        let active_line = if buf.is_empty() {
             0
         } else {
             buf.byte_to_line(caret_byte.min(buf.len().saturating_sub(1)))

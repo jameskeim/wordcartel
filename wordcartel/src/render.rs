@@ -141,7 +141,7 @@ pub(crate) fn menu_dropdown_row_at(area: Rect, groups: &[(crate::registry::MenuC
 pub(crate) fn palette_overlay_rect(area: Rect, row_count: usize) -> Rect {
     let w = area.width;
     let h = area.height;
-    let ov_w = (w * 3 / 5).max(30).min(80).min(w);
+    let ov_w = (w * 3 / 5).clamp(30, 80).min(w);
     let list_h: u16 = (row_count as u16).min(15).min(h.saturating_sub(4));
     let ov_h = (list_h + 3).min(h);
     let ov_x = area.x.saturating_add((w.saturating_sub(ov_w)) / 2);
@@ -1801,13 +1801,13 @@ mod tests {
         let tg = crate::nav::text_geometry(&ed);
         let guide_col = tg.text_left + ed.view_opts.wrap_column;
         assert!(
-            (guide_col as u16) < 40,
+            guide_col < 40,
             "guide column {guide_col} must be within viewport"
         );
 
         // Find the '│' glyph in the guide column.
         // Check all edit rows (0..5) since content may not start at row 0 for guide.
-        let guide_x = guide_col as u16;
+        let guide_x = guide_col;
         let guide_cell = (0u16..5).find_map(|r| {
             let s = buf[(guide_x, r)].symbol();
             if s.contains('│') { Some(buf[(guide_x, r)].style()) } else { None }

@@ -282,8 +282,7 @@ seq = 1
 "#).unwrap();
         assert!(s.scratch.is_none(), "absent [scratch] → None");
         // Present round-trips and serializes as its own [scratch] table.
-        let mut s2 = SessionState::default();
-        s2.scratch = Some(ScratchState { text: "stash\n\nmore".into(), cursor: 5 });
+        let s2 = SessionState { scratch: Some(ScratchState { text: "stash\n\nmore".into(), cursor: 5 }), ..Default::default() };
         let out = toml::to_string(&s2).unwrap();
         assert!(out.contains("[scratch]"), "serializes as [scratch] table");
         let back: SessionState = toml::from_str(&out).unwrap();

@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn markdown_mode_leaves_heading_unwrapped() {
         let input = "# A heading that is fairly long but is a heading not prose\n\nbody text\n";
-        let out = run_transform(TransformKind::Reflow, &input, 72).unwrap();
+        let out = run_transform(TransformKind::Reflow, input, 72).unwrap();
         assert!(out.contains("# A heading that is fairly long but is a heading not prose"),
                 "heading must pass through:\n{out}");
     }

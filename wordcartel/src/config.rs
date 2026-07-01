@@ -404,11 +404,7 @@ mod tests {
         let (cfg, warns) = load(&[lo, hi]);
         assert!(warns.is_empty());
         assert_eq!(cfg.state.max_entries, 99, "hi set it → wins");
-        assert_eq!(
-            cfg.state.resume,
-            false,
-            "hi OMITTED resume → lo's false is preserved (NOT reset to default true)"
-        );
+        assert!(!cfg.state.resume, "hi OMITTED resume → lo's false is preserved (NOT reset to default true)");
         assert_eq!(cfg.keymap.preset, "wordstar", "final-merged preset");
         assert_eq!(cfg.keymap.patches.len(), 2, "one ordered patch per layer");
         assert!(cfg.keymap.patches[0].bind.contains_key("ctrl-a"));

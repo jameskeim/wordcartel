@@ -72,7 +72,7 @@ mod tests {
     #[test]
     fn guard_is_inactive_outside_catch_and_active_inside() {
         assert!(!caught_guard_active());
-        let inside = catch(|| caught_guard_active()).unwrap();
+        let inside = catch(caught_guard_active).unwrap();
         assert!(inside, "guard must be active inside catch");
         assert!(!caught_guard_active(), "guard restored after catch");
     }
@@ -81,7 +81,7 @@ mod tests {
     fn guard_restores_previous_value_on_nesting() {
         let inner_seen = catch(|| {
             assert!(caught_guard_active());
-            let deeper = catch(|| caught_guard_active()).unwrap();
+            let deeper = catch(caught_guard_active).unwrap();
             // after the inner catch returns, the outer guard is still active
             (deeper, caught_guard_active())
         })

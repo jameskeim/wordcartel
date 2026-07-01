@@ -45,7 +45,7 @@ pub fn head(editor: &Editor) -> usize {
 pub fn caret_line(editor: &Editor) -> usize {
     let buf = &editor.active().document.buffer;
     let h = head(editor);
-    if buf.len() == 0 {
+    if buf.is_empty() {
         return 0;
     }
     // clamp to last valid byte if head is past end (shouldn't normally happen)
@@ -508,7 +508,7 @@ fn typewriter_rows_of_line(editor: &Editor, li: usize, text_width: usize) -> usi
     // Exclude the trailing '\n' if present (it's the line separator, not content).
     // '\n' is a 1-byte ASCII char so `start + raw_len - 1` is always a valid
     // UTF-8 char boundary when raw_len > 0.
-    let content_len = if raw_len > 0 && li + 1 <= total_lines && buf.slice(start + raw_len - 1..start + raw_len) == "\n" {
+    let content_len = if raw_len > 0 && li < total_lines && buf.slice(start + raw_len - 1..start + raw_len) == "\n" {
         raw_len - 1
     } else {
         raw_len
@@ -711,7 +711,7 @@ pub fn next_paragraph_start(blocks: &BlockTree, buf: &TextBuffer, pos: usize) ->
 pub fn prev_paragraph_start(blocks: &BlockTree, _buf: &TextBuffer, pos: usize) -> usize {
     // caller passes the *current paragraph start* as `pos` boundary; pick the
     // last leaf start strictly before it.
-    leaf_spans(blocks).into_iter().map(|(s, _)| s).filter(|&s| s < pos).next_back().unwrap_or(0)
+    leaf_spans(blocks).into_iter().map(|(s, _)| s).rfind(|&s| s < pos).unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
