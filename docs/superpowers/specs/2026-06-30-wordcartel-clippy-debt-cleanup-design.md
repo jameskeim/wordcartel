@@ -96,12 +96,12 @@ no inherent `from_str` definition):
   shell, tests, AND the detached fuzz crate (which must be updated separately) —
   so `#[allow]` is a strong candidate here; the implementer weighs churn vs
   clarity and records the reasoning.
-- **The shell site(s)** — the inventory run counted 2 shell `should_implement_trait`
-  warnings; **1 is source-confirmed: `SearchState::next`** (`search_overlay.rs:129`,
-  confusable with `Iterator::next`); the other is to be pinned from the fresh
-  clippy run (possibly in test code). For each: if the inherent method could
-  CLEANLY implement the matching std trait (e.g. `Iterator` for `next`), do so;
-  else rename or justified `#[allow]`.
+- **The shell site(s)** — at least **1 is source-confirmed: `SearchState::next`**
+  (`search_overlay.rs:129`, confusable with `Iterator::next`); any additional
+  shell `should_implement_trait` sites are identified from the fresh clippy run
+  (some may be in test code). For each: if the inherent method could CLEANLY
+  implement the matching std trait (e.g. `Iterator` for `next`), do so; else
+  rename or justified `#[allow]`.
 
 The implementer picks per site and records the reasoning; **Codex reviews each
 pick** (the user explicitly asked for this adjudication).
