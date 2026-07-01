@@ -14,7 +14,7 @@
 - **No `cargo fmt`** (ever). **No `clippy --fix`** — hand-apply each fix, matching the dense house style. Do not reflow untouched code.
 - **Behavior-preserving:** after every task, `cargo test -p wordcartel-core -p wordcartel` stays green (baseline 876). No new tests (no new behavior).
 - House style: em-dash `—` not `--` in prose comments; match surrounding style.
-- **The fresh clippy run is authoritative.** Each crate task begins by running `cargo clippy -p <crate> --all-targets` and fixing EVERY warning it reports. The enumerated sites below are the guide (captured at plan time, merged-main @ 775161b); reconcile any delta (a couple of core test-module sites — e.g. `change.rs:324`, `change.rs:405` — may appear only under `--all-targets`).
+- **The fresh clippy run is authoritative.** Each crate task begins by running `cargo clippy -p <crate> --all-targets` and resolving EVERY finding — note clippy reports some lints at `error:` level (e.g. `reversed_empty_ranges`), NOT just `warning:`, so grep for both. The enumerated sites below are the guide (captured at plan time, merged-main @ 775161b); reconcile any delta. Known error-level delta: `change.rs:324`, `change.rs:405` (`reversed_empty_ranges`) — handled explicitly in Task 1 Step 3b (these are `#[allow]`, NOT a fix).
 - **Two judgment calls** (`should_implement_trait`, `too_many_arguments`) — the implementer records the per-site choice + one-line rationale IN A CODE COMMENT and the task report; the Codex plan/pre-merge review adjudicates each. This plan gives the RECOMMENDED choice + complete code; the implementer may deviate with recorded reasoning.
 - Every commit ends with the trailers, verbatim:
   ```
@@ -42,8 +42,8 @@
 
 - [ ] **Step 1: Baseline the warnings**
 
-Run: `cargo clippy -p wordcartel-core --all-targets 2>&1 | grep -E "warning:|-->"`
-Expected: the 17 sites below (reconcile any `--all-targets` test-only delta).
+Run: `cargo clippy -p wordcartel-core --all-targets 2>&1 | grep -E "warning:|error:|-->"`
+Expected: the 17 `warning:` sites below PLUS the 2 `error:`-level `reversed_empty_ranges` at `change.rs:324`, `change.rs:405` (Step 3b) — 19 total.
 
 - [ ] **Step 2: Apply the mechanical/semantic fixes (hand, per clippy's `help:` suggestion)**
 
@@ -68,9 +68,20 @@ visible[..content_start].fill(false);
 ```
 For each of the 6 sites: FIRST confirm the loop index is used ONLY to index `visible` (a pure write, no read of `visible[b]`, no other use of `b`). If so, rewrite to the equivalent `visible[start..end].fill(false)` (adjust the range to the loop bounds). If any site also READS `visible[b]` or uses `b` for something else, use `for v in visible[start..end].iter_mut() { *v = false; }` instead, or keep the loop with `#[allow(clippy::needless_range_loop)]` + a one-line reason. Record which form each site got.
 
+- [ ] **Step 3b: `reversed_empty_ranges` ×2 in `change.rs` tests (`change.rs:324`, `change.rs:405`) — `#[allow]`, do NOT flip**
+
+These are INTENTIONAL reversed-range test inputs — `ChangeSet::delete(7..5, rev.len())` (:324) and `ChangeSet::delete(3..1, 5)` (:405) — that exercise `ChangeSet::delete`'s reversed-range NORMALIZATION. Flipping `7..5`→`5..7` would destroy the test. Instead, add a local `#[allow]` with a comment at EACH site (on the statement, or the enclosing test fn):
+```rust
+        // Intentional reversed range: exercises ChangeSet::delete's reversed-range
+        // normalization. Do not "fix" the direction.
+        #[allow(clippy::reversed_empty_ranges)]
+        let cs_rev = ChangeSet::delete(7..5, rev.len()); // reversed
+```
+and likewise at `change.rs:405` (`let cs = ChangeSet::delete(3..1, 5);`). Confirm the two tests still pass unchanged.
+
 - [ ] **Step 4: `inherent_to_string` → `Display` (`buffer.rs:100`)**
 
-Delete the inherent `to_string` (buffer.rs:100-102) and add a `Display` impl (byte-identical output — both are the rope's `Display`):
+Delete the inherent `to_string` (buffer.rs:100-102) and add a `Display` impl (byte-identical output — both are the rope's `Display`). **Call surface:** `to_string` has production COLD-path callers (`wordcartel/src/export.rs:99` pandoc stdin, `wordcartel/src/workspace.rs:68` persist, `wordcartel/src/commands.rs:506`) PLUS test assertions — ALL keep working unchanged via the blanket `ToString` (none are on the per-keystroke path). The impl:
 ```rust
 impl std::fmt::Display for TextBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -95,7 +106,7 @@ Place it just after the `impl TextBuffer { … }` block. All existing `buf.to_st
 
 - [ ] **Step 6: Verify + commit**
 
-Run: `cargo clippy -p wordcartel-core --all-targets 2>&1 | grep -c "warning:"` → Expected: `0` (aside from the deliberate `#[allow]`, which suppresses its own site).
+Run: `cargo clippy -p wordcartel-core --all-targets 2>&1 | grep -cE "warning:|error:"` → Expected: `0` (the deliberate `#[allow]`s at `from_str` + the 2 reversed-range sites suppress their own findings).
 Run: `cargo test -p wordcartel-core` → Expected: all green (222 lib + oracle).
 `cargo build -p wordcartel-core` + `cargo test --no-run -p wordcartel-core` warning-free.
 ```bash
