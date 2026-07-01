@@ -42,6 +42,15 @@ behavior is introduced.
 Counts: `wordcartel-core` lib 15 (+2 test-only), `wordcartel` lib 18 (+9
 test-only) — ~30–35 unique across the workspace.
 
+**Counts below are INDICATIVE, not authoritative.** They drift as the tree
+changes. The PLAN must enumerate every warning site from a FRESH
+`cargo clippy --all-targets` run (per crate, lib + tests) and fix exactly that
+set. Two indicative counts in the first draft were already stale (Codex spec
+review): there are **zero** shell inherent `from_str` *definitions* (the shell
+`from_str` hits are *calls* to `TextBuffer::from_str`/`Rope::from_str`/
+`toml::from_str`), and there is exactly **one** inherent `to_string`
+(`wordcartel-core/src/buffer.rs:100`), not two.
+
 ### Mechanical set (~20) — idiomatic rewrites, zero behavior change
 `needless_range_loop`, `unnecessary_map_or`, `filter_next` (→ `rfind`),
 `redundant_pattern_matching`, `redundant_closure`, `needless_borrow`,
@@ -58,10 +67,11 @@ test-only) — ~30–35 unique across the workspace.
 - `new_without_default` (×1): add a `Default` impl delegating to `new()`.
 - `manual_checked_ops` (×1): use the checked operation — **preserve exact
   overflow/None semantics** (see Correctness watch).
-- `inherent_to_string` (×2, incl. `TextBuffer::to_string`): implement
-  `std::fmt::Display` instead of an inherent `to_string(&self) -> String`;
-  `.to_string()` continues to work via the blanket `ToString` impl, so call sites
-  are unaffected.
+- `inherent_to_string` (×1: `TextBuffer::to_string`, `buffer.rs:100`, which
+  delegates to `self.rope.to_string()`): implement `std::fmt::Display` instead of
+  the inherent `to_string(&self) -> String`; `.to_string()` continues to work via
+  the blanket `ToString` impl, so call sites are unaffected. Confirm no other
+  inherent `to_string` exists from the fresh clippy run.
 
 ## The two judgment calls (STAGED FOR THE CODEX SPEC REVIEW)
 
@@ -71,28 +81,35 @@ per-site choice + reasoning in the code (a comment) and the task report**, and
 the **Codex spec/plan review is asked to adjudicate whether each choice is the
 right call** (fix-properly vs justified-allow vs rename).
 
-### (a) `should_implement_trait` — `from_str` (×3: `wordcartel-core` `TextBuffer::from_str`, + 2 in shell)
-Clippy flags an inherent method named `from_str` as confusable with
-`std::str::FromStr::from_str`. The proper fix depends on fallibility:
-- If the method is **infallible** (`fn from_str(&str) -> Self`, no `Result`), it
-  CANNOT cleanly implement std `FromStr` (which requires `type Err` and returns
-  `Result<Self, Err>`). Options, decided per-site by readability:
-  1. **Rename** the inherent method (e.g. `from_str` → `from_text` / `parse` /
-     `new`) and migrate call sites — zero user impact, some churn. Preferred when
-     the new name reads clearly.
-  2. **Justified `#[allow(clippy::should_implement_trait)]`** with a one-line
-     rationale — when a rename reads worse than the lint and an `FromStr` impl is
-     genuinely inapplicable.
-- If a method is **fallible and FromStr-shaped**, implement `FromStr` properly.
+### (a) `should_implement_trait` — every inherent method clippy flags as confusable with a std trait method
+This lint fires on an inherent method whose NAME matches a std trait method
+(`from_str`→`FromStr`, `default`→`Default`, `next`→`Iterator`, `add`→`Add`, …).
+The confirmed sites (identify the exact set from the fresh clippy run — there is
+**1 confirmed core site plus 2 shell sites on OTHER inherent methods**, since the
+shell has no inherent `from_str` definition):
+- **`wordcartel-core` `TextBuffer::from_str`** (`buffer.rs:11`, `fn from_str(&str)
+  -> Self` — **infallible**, verified): cannot cleanly implement std `FromStr`
+  (which needs `type Err` + returns `Result<Self, Err>`). Options, per-site by
+  readability: (1) **Rename** (`from_str` → `from_text`/`parse_str`/`new`) and
+  migrate call sites; (2) **justified `#[allow(clippy::should_implement_trait)]`**
+  with a one-line rationale. **NOTE: rename touches ~61 call sites** across core,
+  shell, tests, AND the detached fuzz crate (which must be updated separately) —
+  so `#[allow]` is a strong candidate here; the implementer weighs churn vs
+  clarity and records the reasoning.
+- **The 2 shell sites** (method names TBD from the fresh clippy run): for each,
+  if the inherent method could CLEANLY implement the matching std trait, do so;
+  else rename or justified `#[allow]`.
 
-The implementer picks per site and records the reasoning; Codex reviews the pick.
-(`TextBuffer::from_str` is used widely — confirm its real signature/fallibility
-in source before choosing.)
+The implementer picks per site and records the reasoning; **Codex reviews each
+pick** (the user explicitly asked for this adjudication).
 
-### (b) `too_many_arguments` (×1, shell)
+### (b) `too_many_arguments` (×1, shell — `apply_filter_done`, `app.rs:274`, 8 args)
+`apply_filter_done(editor, buffer_id, version, range, cursor, disposition,
+outcome, clock)` is called only from the two `Msg::FilterDone` match arms
+(`app.rs` ~1438, ~1731). A struct-of-args would largely duplicate the existing
+`Msg::FilterDone` fields (Codex: `#[allow]` is the defensible call).
 - Refactor to a **struct-of-args** IF it genuinely improves clarity.
-- Else a **`#[allow(clippy::too_many_arguments)]`** with a one-line rationale —
-  a deliberately wide signature is sometimes clearer than an args struct.
+- Else a **`#[allow(clippy::too_many_arguments)]`** with a one-line rationale.
 
 The implementer picks and records the reasoning; Codex reviews the pick.
 
@@ -102,7 +119,12 @@ The implementer picks and records the reasoning; Codex reviews the pick.
   `"system clipboard unavailable -- copy/paste work in-editor; using OSC 52 for
   terminal sync"` (currently ~app.rs:797, moved by prior edits) — `--` → `—`.
 - Grep the two crates for any OTHER `--` in user-facing strings or prose comments
-  that the em-dash convention covers, and fix those too.
+  that the em-dash convention covers, and fix those too — **with editorial
+  judgment**. The em-dash rule applies ONLY to prose. Do NOT touch: markdown list
+  syntax / test-fixture markdown (`-- ` bullets, `---` rules), CLI flag arguments
+  (`--config`, `--no-config`), shell-command examples, `// ----` separator-rule
+  comments, or any `--` that is not a real prose em-dash. `app.rs:797` is the one
+  CONFIRMED target; any additional site requires a clear prose-em-dash reading.
 - If any test asserts one of these exact strings, update the assertion.
 - Bounded strictly to `--`→`—`; NOT a broader style audit. (Clippy does not flag
   this — it is a CLAUDE.md house-style rule, separate from the lint work.)
@@ -110,8 +132,18 @@ The implementer picks and records the reasoning; Codex reviews the pick.
 ## The durable gate
 
 - Root `Cargo.toml`: add `[workspace.lints.clippy]` with `all = "deny"`. Each
-  member crate opts in with `[lints]` `workspace = true`. Confirm the exact TOML
-  shape against the real workspace layout during the plan.
+  member crate (`wordcartel-core`, `wordcartel` — the only two members; the fuzz
+  crate is a detached sub-workspace and stays out of scope) opts in with `[lints]`
+  `workspace = true`.
+- **Migrate the existing lint table.** `wordcartel-core/Cargo.toml` ALREADY has a
+  `[lints.rust]` section (M7's `unexpected_cfgs` = `{ level = "warn", check-cfg =
+  ['cfg(fuzzing)'] }`). A crate CANNOT set both `[lints] workspace = true` and its
+  own local `[lints.*]` tables — so this entry must MOVE into
+  `[workspace.lints.rust]` in the root `Cargo.toml` (then `wordcartel-core`
+  inherits it via `workspace = true`). Applying `check-cfg = ['cfg(fuzzing)']`
+  workspace-wide is harmless for the shell (it never uses `cfg(fuzzing)`; the flag
+  only registers the name as known). Confirm the exact TOML against the real
+  layout during the plan.
 - Item-local `#[allow(...)]` from the two judgment calls override the `deny` at
   the item, as intended.
 - Because `clippy::all` lints are emitted only by `cargo clippy` (not `rustc`),
@@ -157,10 +189,14 @@ The implementer picks and records the reasoning; Codex reviews the pick.
 
 ## Plan-confirms (resolve during the implementation plan, against real source)
 
-1. The exact `TextBuffer::from_str` signature/fallibility (and the 2 shell
-   `from_str` sites) to decide rename-vs-allow-vs-FromStr per site.
-2. The `too_many_arguments` function + its call sites to decide struct-vs-allow.
-3. The exact `Cargo.toml` workspace layout + `[workspace.lints]`/`[lints]` TOML.
+1. The exact set of `should_implement_trait` sites from a fresh clippy run: the
+   confirmed core `TextBuffer::from_str` (infallible → rename-vs-allow, weighing
+   the ~61-site rename churn) PLUS the 2 shell sites' actual method names (decide
+   implement-trait vs rename vs allow per site).
+2. `apply_filter_done` (`app.rs:274`) struct-vs-allow (Codex leans `#[allow]`).
+3. The exact `Cargo.toml` workspace layout + `[workspace.lints]`/`[lints]` TOML,
+   INCLUDING migrating `wordcartel-core`'s existing `[lints.rust] unexpected_cfgs`
+   into `[workspace.lints.rust]` (can't mix `workspace = true` with local lints).
 4. The precise CLAUDE.md paragraph to replace + its replacement text.
 5. Each `needless_range_loop` / `manual_checked_ops` / `int_plus_one` site's real
    surrounding code, to confirm the rewrite is semantics-preserving.
