@@ -225,14 +225,14 @@ Real anchors: `derive::rebuild` at derive.rs:82; the parse match at derive.rs:92
     pub parse_degraded: bool,
 ```
 
-Initialize `parse_degraded: false` in every `Editor { … }` struct literal (the compiler will point to each construction site — there is a primary constructor plus test builders).
+Initialize `parse_degraded: false` in the **sole** `Editor { … }` struct literal, in `Editor::new_from_text` (editor.rs:369) — every test helper delegates to it, so that is the only construction site to touch.
 
-- [ ] **Step 2: Write the failing test** for the state-transition helper (in `derive.rs`'s `#[cfg(test)] mod tests`; use the existing test `Editor` construction pattern already used by other derive.rs tests):
+- [ ] **Step 2: Write the failing test** for the state-transition helper (in `derive.rs`'s `#[cfg(test)] mod tests`; build the editor with `Editor::new_from_text`, exactly as the existing derive.rs tests do at derive.rs:198 and derive.rs:208):
 
 ```rust
 #[test]
 fn apply_parse_result_err_installs_empty_tree_and_sets_degraded_once() {
-    let mut ed = /* existing test-editor builder */;
+    let mut ed = crate::editor::Editor::new_from_text("hello\n", None, (80, 24));
     ed.status.clear();
     ed.parse_degraded = false;
 
@@ -354,32 +354,42 @@ git commit -m "fix(derive): guard block-tree parse with empty-tree fallback + de
 
 Real anchors: `Editor.buffers: Vec<Buffer>` (editor.rs:288); each `Buffer` has `id` and `document`; `Document { pub buffer: TextBuffer, pub path: Option<PathBuf>, … }` with `dirty()` (`Some(version) != saved_version`, editor.rs:69); `TextBuffer::snapshot() -> ropey::Rope`. Use raw `Document::dirty()`, NOT `Editor::is_dirty` (which excludes scratch — but scratch-with-content is unsaved work we MUST preserve). `write_dump` names a path-less (scratch) dump `recovered-scratch-<pid>.md`.
 
-- [ ] **Step 1: Write the failing test** (in `recovery.rs`'s `#[cfg(test)] mod tests`; build the editor with the existing test constructor and make buffers dirty via `Buffer::apply`, mirroring editor.rs's dirty-buffer tests; dump into a unique temp dir under `std::env::temp_dir()` and clean up):
+- [ ] **Step 1: Write the failing test** (in `recovery.rs`'s `#[cfg(test)] mod tests`). Build the editor with the real public APIs (`Editor::new_from_text`, `alloc_id`, `Buffer::from_text`, `install_scratch`, `scratch_id`, `by_id_mut`). `Document.version` and `Editor.buffers` are public, so make a buffer dirty by bumping its `version` past `saved_version` (`Some(0)`) — this is the minimal precondition for `dirty()`, which is exactly what `dump_all_dirty` reads (no `build_multi_replace`/`apply` needed here). Dump into a unique temp dir and clean up:
 
 ```rust
 #[test]
 fn dump_all_dirty_writes_one_file_per_dirty_buffer_including_scratch() {
-    // dir: a unique temp subdir (no tempfile crate in the tree).
+    use crate::editor::{Buffer, Editor};
+    use std::path::PathBuf;
+
     let dir = std::env::temp_dir().join(format!("wcartel-dumptest-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    // Build an editor with: a dirty FILE buffer, a dirty SCRATCH buffer, a CLEAN buffer.
-    let mut ed = /* existing test-editor builder with the three buffers described;
-                    dirty ones edited via Buffer::apply so version > saved_version;
-                    the clean one saved (saved_version == version) */;
+    // buffer 0: a CLEAN file buffer (path, never edited → version == saved_version).
+    let mut e = Editor::new_from_text("clean\n", Some(PathBuf::from("/tmp/clean.md")), (80, 24));
 
-    let n = dump_all_dirty(&ed, &dir);
+    // a DIRTY file buffer (pushed, then version bumped past saved_version).
+    let dirty_id = e.alloc_id();
+    e.buffers.push(Buffer::from_text(dirty_id, "work\n", Some(PathBuf::from("/tmp/work.md")), (80, 24)));
+    e.by_id_mut(dirty_id).unwrap().document.version = 1;
+
+    // a DIRTY scratch buffer (pathless → dumped as recovered-scratch-*).
+    e.install_scratch();
+    let scratch_id = e.scratch_id.unwrap();
+    e.by_id_mut(scratch_id).unwrap().document.version = 1;
+
+    let n = dump_all_dirty(&e, &dir);
     assert_eq!(n, 2, "two dirty buffers dumped, clean one skipped");
 
     let names: Vec<String> = std::fs::read_dir(&dir).unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .map(|x| x.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(names.len(), 2);
-    assert!(names.iter().any(|n| n.starts_with("recovered-scratch-")),
+    assert!(names.iter().any(|s| s.starts_with("recovered-scratch-")),
             "the scratch buffer with content is dumped");
 
     std::fs::remove_dir_all(&dir).ok();
-    let _ = &mut ed; // silence unused-mut if the builder doesn't need it
 }
 ```
 
@@ -602,6 +612,8 @@ git commit -m "feat(app): input watchdog -> InputThreadDied -> clean InputLost s
 
 Real anchors: `Set` send is silently ignored at clipboard.rs:45 (`let _ = clip_tx.send(ClipReq::Set(text));`); `Get` send-Err is detected at clipboard.rs:48 and falls back to `Msg::ClipboardPaste { text: None }`.
 
+**Out of scope (explicit):** a pre-existing user-facing status string at `app.rs:786` uses `--` (`system clipboard unavailable -- copy/paste work in-editor; …`). It is NOT introduced by this effort; leave it alone — it belongs to the separate house-style/clippy-debt cleanup effort. Do NOT edit it here (changing it risks unrelated test churn).
+
 - [ ] **Step 1: Write the failing test** (in `clipboard.rs`'s `#[cfg(test)] mod tests`; drop the receiver so sends fail; use the existing test `Editor` construction):
 
 ```rust
@@ -611,10 +623,11 @@ fn a_dead_clipboard_worker_sets_the_status_notice() {
     drop(clip_rx); // worker is gone: every send now errors
     let (msg_tx, _msg_rx) = std::sync::mpsc::channel::<crate::app::Msg>();
     let mut out: Vec<u8> = Vec::new();
-    let mut ed = /* existing test-editor builder */;
+    let mut ed = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+    let bid = ed.active().id;
 
     // A pending Get with no worker -> notice + None fallback.
-    ed.clipboard_get_pending = Some(/* a PasteIntent{ id, buffer_id } via the existing helper */);
+    ed.clipboard_get_pending = Some(PasteIntent { id: 1, buffer_id: bid });
     drain_clipboard_intents(&mut ed, &mut out, &clip_tx, &msg_tx);
     assert_eq!(ed.status, "clipboard unavailable");
 
@@ -625,6 +638,8 @@ fn a_dead_clipboard_worker_sets_the_status_notice() {
     assert_eq!(ed.status, "clipboard unavailable");
 }
 ```
+
+(`PasteIntent { id: u64, buffer_id: BufferId }` is public at clipboard.rs:14; `Editor.clipboard_sync_request` / `clipboard_get_pending` are at editor.rs:309; `Buffer.id` gives the `BufferId`.)
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -685,6 +700,6 @@ git commit -m "feat(clipboard): surface 'clipboard unavailable' when the worker 
 
 **Type consistency:** `empty_tree(usize) -> BlockTree`, `apply_parse_result(&mut Editor, usize, Result<BlockTree,String>) -> BlockTree`, `dump_all_dirty(&Editor, &Path) -> usize`, `ExitReason`, `Msg::InputThreadDied`, `caught_guard_active() -> bool` — used consistently across tasks and match the real signatures read from source.
 
-**Placeholder scan:** the two `/* existing test-editor builder */` markers are deliberate — the implementer must use the crate's real test constructor (each modifying task already has sibling tests using it); the assertion logic and exact values are fully specified. No logic is left as a placeholder.
+**Placeholder scan:** all test setups are now concrete against verified APIs — `Editor::new_from_text(text, path, area)` (editor.rs:362), `alloc_id`/`install_scratch`/`scratch_id`/`by_id_mut`, public `Editor.buffers` + `Document.version`, and `PasteIntent { id, buffer_id }` (clipboard.rs:14). The `parse_degraded` field is initialized at the single `Editor { … }` literal in `Editor::new_from_text` (editor.rs:369). No placeholders remain.
 
 **Ordering:** 1 → 2 → 3 (3 consumes 1+2); 4 → 5 (5 consumes 4); 6 independent. Each task compiles + tests green on its own.
