@@ -134,10 +134,23 @@ purpose).
 `use super::*` allowed. Mock the filesystem via the `Fs` seam (M3) for durability/fault
 tests. No committed commented-out tests, `dbg!`, debug `println!`, or commented-out code.
 
-## Hardening campaign (in progress, before Effort P)
+## Hardening campaign (minimal-viable spine COMPLETE, before Effort P)
 Plan: `docs/superpowers/plans/2026-06-28-wordcartel-hardening-fuzz-proptest-plan.md`
-(minimal-viable spine M1–M7; the real pre-plugin risk is shell durability/panics/untrusted
-input, not more core fuzzing). Done: M1 (valid-by-construction), M2 (untrusted edit
-boundary `submit_transaction`), BUG-1 (worker panic isolation), BUG-2 (external-mod
-fingerprint). In progress: M3 (IO fault injection). Remaining: M5 (resource caps), M7
-(property/fuzz), M4-rest (filter/transform/dispatch `catch_unwind`).
+(the real pre-plugin risk is shell durability/panics/untrusted input, not more core
+fuzzing). **Done (all merged to main):** M1 (valid-by-construction), M2 (untrusted edit
+boundary `submit_transaction`), M3 (IO fault injection), M5 (resource caps), M4 + M4-rest
+(async/untrusted panic isolation + parse-panic isolation + input-thread supervision), M7
+(core property tests + cargo-fuzz; the F2 oracle found + fixed 7 real incremental-parser
+bugs), M6/BUG-2 (external-mod fingerprint), BUG-1 (worker panic isolation), plus the
+clippy-debt cleanup (zero `clippy::all` + the durable `[workspace.lints.clippy] all = "deny"`
+gate — see the Formatting/GATE notes above).
+
+**Remaining before Effort P (none blocking; sequence by yield):** (1) deep
+incremental-soundness — the F2 fuzz oracle still finds more block-tree `incremental≡full`
+divergences in the tail (nested/loose-list; wrong-tree, not data-loss/panic); (2) M5
+follow-ups — finish the undo louder-hint for buffer-level merges, and bound the last few
+document-sized `fs::read` load paths (recovery content-hash, fingerprint, save
+skip-unchanged); (3) optional — actually upgrade/patch `pulldown-cmark` (M4-rest only
+*isolates* its parse panic). **New candidate:** an e2e/TUI harness (the live `wcartel`
+binary has no end-to-end/interactive test coverage — the campaign's one untouched frontier).
+Deferred product items: clipboard over SSH/tmux; the close-buffer Save/Discard prompt.
