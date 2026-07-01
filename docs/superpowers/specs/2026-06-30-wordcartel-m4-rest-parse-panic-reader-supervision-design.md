@@ -1,6 +1,6 @@
 # M4-rest: parse-panic isolation + input-thread supervision — design
 
-**Status:** approved design (pre-spec-review)
+**Status:** spec-review clean (Codex READY FOR PLANNING, no open findings)
 **Date:** 2026-06-30
 **Effort:** M4-rest (completes the M4 panic-isolation campaign before Effort P)
 
