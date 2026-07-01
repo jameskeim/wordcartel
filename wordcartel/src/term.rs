@@ -106,6 +106,9 @@ pub fn install_panic_hook() {
             // threads are NOT yet guarded — a panic there is a deferred failure mode.
             // No-op here.
             if !should_handle_panic(std::thread::current().id(), main_id) { return; }
+            // A caught main-thread panic (panicx::catch) owns its own failure —
+            // do NOT dump or restore the terminal for it.
+            if crate::panicx::caught_guard_active() { return; }
             // Best-effort emergency dump (try_lock; never deadlock).
             crate::recovery::dump_on_panic();
             // Restore the terminal.
