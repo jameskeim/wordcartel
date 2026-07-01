@@ -321,6 +321,9 @@ mod tests {
         let cs_fwd = ChangeSet::delete(5..7, fwd.len());
 
         let mut rev = TextBuffer::from_str("hello world");
+        // Intentional reversed range: exercises ChangeSet::delete's reversed-range
+        // normalization. Do not "fix" the direction.
+        #[allow(clippy::reversed_empty_ranges)]
         let cs_rev = ChangeSet::delete(7..5, rev.len()); // reversed
 
         // Both changesets must be structurally identical.
@@ -402,6 +405,9 @@ mod tests {
     fn delete_normalizes_reversed_in_bounds_range() {
         use super::*;
         // reversed but in-bounds: 3..1 on doc_len 5 → deletes [1,3)
+        // Intentional reversed range: exercises ChangeSet::delete's reversed-range
+        // normalization. Do not "fix" the direction.
+        #[allow(clippy::reversed_empty_ranges)]
         let cs = ChangeSet::delete(3..1, 5);
         assert_eq!(cs.len_before(), 5);
         assert_eq!(cs.len_after(), 3); // deleted 2 bytes
@@ -634,11 +640,12 @@ mod tests {
             // Shape: Retain(c1)  Delete(d)  Insert(ins)  Retain(c2)
             // len_before = c1 + d + c2 = len
             // len_after  = c1 + ins.len() + c2
-            let mut ops = Vec::new();
-            ops.push(Op::Retain(c1));
-            ops.push(Op::Delete(d));
-            ops.push(Op::Insert(Tendril::from(ins.as_str())));
-            ops.push(Op::Retain(c2));
+            let ops = vec![
+                Op::Retain(c1),
+                Op::Delete(d),
+                Op::Insert(Tendril::from(ins.as_str())),
+                Op::Retain(c2),
+            ];
             let cs = ChangeSet::from_ops(ops, len);
 
             // Sanity: 4-op shape.

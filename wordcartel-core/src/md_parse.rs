@@ -151,7 +151,7 @@ fn is_ws(b: u8) -> bool {
 /// Mutates the per-byte `visible` grid (sets matching prefix bytes to false).
 /// Returns the prefix glyph string for list items, None otherwise.
 fn apply_block_prefix_conceal(
-    visible: &mut Vec<bool>,
+    visible: &mut [bool],
     line: &str,
     role: &BlockRole,
 ) -> Option<String> {
@@ -172,7 +172,7 @@ fn apply_block_prefix_conceal(
                     + start;
                 let level = hash_end - start;
                 // Valid level: 1..=6
-                if level >= 1 && level <= 6 {
+                if (1..=6).contains(&level) {
                     // Valid opener: EOL or followed by space/tab
                     let valid_opener =
                         hash_end == n || is_ws(bytes[hash_end]);
@@ -183,9 +183,7 @@ fn apply_block_prefix_conceal(
                             content_start += 1;
                         }
                         // Conceal opening: indent + hashes + following ws
-                        for b in 0..content_start {
-                            visible[b] = false;
-                        }
+                        visible[..content_start].fill(false);
                         // Empty heading: whole line concealed
                         if content_start >= n {
                             return None;
@@ -214,9 +212,7 @@ fn apply_block_prefix_conceal(
                             }
                             // Conceal cs..n (trailing ws + closing hashes + any
                             // trailing ws already captured in te..n)
-                            for b in cs..n {
-                                visible[b] = false;
-                            }
+                            visible[cs..n].fill(false);
                         }
                         return None;
                     }
@@ -231,9 +227,7 @@ fn apply_block_prefix_conceal(
                 if (first == b'=' || first == b'-')
                     && trimmed.bytes().all(|b| b == first)
                 {
-                    for b in 0..n {
-                        visible[b] = false;
-                    }
+                    visible[..n].fill(false);
                     return None;
                 }
             }
@@ -289,9 +283,7 @@ fn apply_block_prefix_conceal(
                     let ordinal: &str = &line[start..digit_end];
                     let glyph = format!("{}. ", ordinal);
                     // Conceal start..=digit_end+1 (digits + punctuation + space/tab).
-                    for i in start..=digit_end + 1 {
-                        visible[i] = false;
-                    }
+                    visible[start..=digit_end + 1].fill(false);
                     return Some(glyph);
                 }
             }
@@ -313,9 +305,7 @@ fn apply_block_prefix_conceal(
                         + start;
                     if fence_end - start >= 3 {
                         // It's a valid fence opener/closer.
-                        for b in 0..n {
-                            visible[b] = false;
-                        }
+                        visible[..n].fill(false);
                     }
                 }
             }
@@ -324,9 +314,7 @@ fn apply_block_prefix_conceal(
 
         BlockRole::ThematicBreak => {
             // Conceal the whole line.
-            for b in 0..n {
-                visible[b] = false;
-            }
+            visible[..n].fill(false);
             Some("─── ".to_string())
         }
 

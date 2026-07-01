@@ -740,7 +740,7 @@ mod props {
         fn logical_line()(toks in prop::collection::vec(token(), 0..8)) -> String {
             let s: String = toks.concat();
             // strip any accidental newlines (we only handle single logical lines)
-            s.replace('\n', " ").replace('\r', " ")
+            s.replace(['\n', '\r'], " ")
         }
     }
 
