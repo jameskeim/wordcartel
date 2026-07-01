@@ -55,10 +55,13 @@ already public, so it is a thin wrapper).
   This effort extends `panicx` with a **thread-local caught-panic guard** (see the
   panic-hook interaction in Goal 1) so a main-thread caught panic suppresses the
   hook's teardown.
-- `wordcartel/src/recovery.rs:30` — `recovery::dump_on_panic()` — public, zero-arg,
-  NOT tied to panic metadata; invoked by the hook AND callable directly from the
-  main loop on a graceful input-loss shutdown. It dumps `LAST_GOOD` (recorded
-  per-edit at `editor.rs:215`).
+- `wordcartel/src/recovery.rs` — two entries: `dump_on_panic()` (`:30`, best-effort
+  `try_lock` of `LAST_GOOD` — a **single** most-recently-edited snapshot; used by
+  the panic hook, unchanged here) and `write_dump(path, rope, dir) -> io::Result<PathBuf>`
+  (`:18`, writes a 0600 `recovered-*.md` for **an arbitrary buffer's** rope). The
+  input-loss shutdown uses `write_dump` **per dirty buffer** (not `dump_on_panic`,
+  which would persist only one) so no open buffer's unsaved work is lost.
+  `swap::state_dir()` (`swap.rs:31`) gives the dump directory.
 - `wordcartel/src/term.rs:96` — `install_panic_hook()`; `term.rs:80`
   `should_handle_panic(panicking, main) -> bool` (main-thread-gated). Normal
   teardown (terminal restore) is RAII via `TerminalGuard::drop` (`term.rs:65`).
@@ -189,8 +192,15 @@ parse is synchronous, so the `Err` is handled inline in `rebuild`.
    carrying a distinct reason. Introduce a small `ExitReason` { `Normal`,
    `InputLost` } that the loop produces and `run()` returns to `main()`. Sequence
    (ordering matters because `std::process::exit` runs **no** destructors):
-   - On the `InputLost` break, before returning, call `recovery::dump_on_panic()`
-     (persist unsaved work — independent of the terminal).
+   - On the `InputLost` break, before returning, **dump every dirty buffer**
+     (persist unsaved work — independent of the terminal): iterate the editor's
+     open buffers, filter `is_dirty`, and for each write a recovery dump via the
+     existing `recovery::write_dump(buffer.document.path.as_deref(), &rope, &dir)`
+     (`dir = swap::state_dir()`, `rope` = the buffer's rope snapshot). This is a
+     **controlled** main-loop break (not a real panic), so iterating buffers is
+     safe here — unlike the panic hook, whose conservative single best-effort
+     `try_lock` `dump_on_panic` stays as-is (the hook is unchanged by this effort).
+     Factor this into a testable `dump_all_dirty(editor) -> usize` (count dumped).
    - `run()` returns normally so its `TerminalGuard` **drops** (restoring the
      terminal via RAII, `term.rs:65`) — the terminal is sane *before* any exit call.
    - `run()` returns `ExitReason` (its signature widens from `io::Result<()>` to
@@ -227,7 +237,7 @@ no watchdog, no new `Msg`.
 | Failure | Response | Data loss? | Terminal | Process |
 |---|---|---|---|---|
 | Markdown parse panic | deduped status, empty-tree fallback (uniform; hook suppressed via guard) | none (text untouched) | intact | keeps running |
-| Input thread death | terminal restored + recovery dump + stderr reason | none (dump persists work) | restored | exit non-zero |
+| Input thread death | terminal restored + every dirty buffer dumped (`write_dump`) + stderr reason | none (all dirty buffers persisted) | restored | exit non-zero |
 | Clipboard worker death | status "clipboard unavailable" | none | intact | keeps running |
 
 ## Testing
@@ -251,6 +261,11 @@ no watchdog, no new `Msg`.
   channel. Separately, a unit test that the loop given `Msg::InputThreadDied`
   yields `ExitReason::InputLost`, and that `InputLost` drives the dump + non-zero
   exit decision (test the decision function, not real teardown).
+- **All-dirty-buffer dump (deterministic):** build an editor with two dirty
+  buffers and one clean buffer, call `dump_all_dirty(editor)`, assert it returns
+  `2` and that two `recovered-*.md` files were written (the clean buffer skipped),
+  each containing its buffer's text. Reuses `write_dump` (already tested at
+  `recovery.rs`).
 - **Clipboard notice:** drop the clipboard `Receiver`, call the intent drain with
   a `Get` (and a `Set`) intent, assert `editor.status == "clipboard unavailable"`
   and the existing `text: None` fallback still fires.
@@ -264,8 +279,12 @@ no watchdog, no new `Msg`.
    `caught_guard_active()`; confirm the guard is established before `catch_unwind`
    so it is live when the hook runs at the panic site.
 3. `run()`'s current signature/teardown (`TerminalGuard` drop at `term.rs:65`) and
-   the minimal `ExitReason` threading into `main()`; confirm `dump_on_panic()` is
-   called before `run()` returns and `process::exit` only after.
+   the minimal `ExitReason` threading into `main()`; confirm `dump_all_dirty` runs
+   before `run()` returns and `process::exit` only after.
+3a. The editor API to iterate all open buffers and read each one's rope + path for
+   `dump_all_dirty` (buffer list / id iteration; `is_dirty(id)`; the per-buffer
+   rope snapshot and `document.path`) — so the dump touches every dirty buffer, not
+   just the active one.
 4. The exact `Msg` enum derives + the three match sites to update (manual `Debug`
    `app.rs:65–103`; main `match msg` `app.rs:1651–1756`; the pre-modal dispatch
    point so `InputThreadDied` bypasses the overlay `_ => {}` at `app.rs:1403–1442`),
