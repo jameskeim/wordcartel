@@ -124,7 +124,12 @@ impl Buffer {
     /// Mirrors the buffer push in `Editor::new_from_text` exactly.
     pub fn from_text(id: BufferId, text: &str, path: Option<PathBuf>, area: (u16, u16)) -> Buffer {
         let buffer = TextBuffer::from_str(text);
-        let blocks = block_tree::full_parse_rope(&buffer.snapshot());
+        let blocks = match crate::panicx::catch(|| block_tree::full_parse_rope(&buffer.snapshot())) {
+            Ok(t) => t,
+            // No previous tree at construction — fall back to the empty tree so the
+            // buffer still opens instead of crashing on an upstream parse panic.
+            Err(_) => block_tree::empty_tree(text.len()),
+        };
         let document = Document {
             buffer,
             selection: Selection::single(0),
@@ -291,6 +296,9 @@ pub struct Editor {
     // global app state
     pub register: Register,
     pub status: String,
+    /// True while the last block-tree parse panicked (M4-rest). Dedupes the
+    /// status notice so a persistently-panicking document does not spam it.
+    pub parse_degraded: bool,
     pub quit: bool,
     pub prompt: Option<crate::prompt::Prompt>,
     /// Armed by `dispatch_save_then`; consumed by `apply_result` when the save lands.
@@ -368,7 +376,7 @@ impl Editor {
         );
         let mut e = Editor {
             buffers: Vec::new(), active: 0, next_buffer_id: 0,
-            register: Register::default(), status: String::new(), quit: false,
+            register: Register::default(), status: String::new(), parse_degraded: false, quit: false,
             prompt: None, pending_after_save: None, pending_save_as: None, pending_save_overwrite: None,
             pending_write_block: None,
             filter_in_flight: None, transform_in_flight: false, minibuffer: None, pending_export: None,
