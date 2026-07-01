@@ -127,10 +127,13 @@ Refactor it into two phases, gated by **version memoization** (a per-buffer
 - **Parse phase (only when `document.version != blocks_version` — i.e. the text
   actually changed since the tree was built):**
   - if a pending incremental edit is present (`pre_edit_rope`/`last_edit` both
-    `Some`) → incremental update; set the stale flag from its `WidenReason` (§1);
-  - otherwise (a text change with no incremental info — undo/redo, filter/transform
-    apply, paste) → **full parse** (correct, and NOT a per-keystroke hot path);
-    clear the stale flag;
+    `Some`) → incremental update; set the stale flag from its `WidenReason` (§1).
+    This is normal keystrokes AND filter/transform/paste — all route through
+    `Buffer::apply` (`editor.rs:189`), which sets the incremental state (`app.rs:306`
+    filter, `transform.rs:166`, `app.rs:770` paste);
+  - otherwise (a text change with NO incremental info — undo/redo, which bump the
+    version and explicitly clear `pre_edit_rope`/`last_edit` at `editor.rs:222`/`:241`)
+    → **full parse** (correct, and NOT a per-keystroke hot path); clear the stale flag;
   - assign `document.blocks`; set `blocks_version = document.version`.
 - **Downstream phase (always):** given the *current* `document.blocks`, refresh the
   fold view + outline + layout cache. Runs every draw; does NOT reparse.
@@ -168,14 +171,23 @@ is guaranteed byte-equal to `full_parse` (every `NoOverlapFull` return calls
 `Local` is a splice — both must be treated as maybe-stale. So "stale unless
 `NoOverlapFull`" has no hole.
 
-### 2. Reconcile deadline (main loop)
-Mirrors the diagnostics deadline. When the active buffer has been idle (no edit)
-for `RECONCILE_DEBOUNCE_MS` **and** `blocks_maybe_stale` is set **and** no reconcile
-is already in flight for it, dispatch the reconcile job. `RECONCILE_DEBOUNCE_MS` is
-a tunable const (~150 ms — long enough not to fire mid-burst, short enough to feel
-like an instant self-heal); the plan aligns it with the existing debounce consts
-(swap `T_IDLE_MS`, the diagnostics debounce). The deadline folds into the existing
-`next_deadline` computation in `run`.
+### 2. Reconcile deadline (main loop) — self-armed `reconcile_due_at`
+Scheduling is keyed off a per-buffer **`reconcile_due_at`**, NOT `last_edit_at`
+(which the reduce loop updates only for the *active* buffer, `app.rs:1775`, and so
+misses text that lands in *inactive* buffers — scratch append `scratch.rs:21`,
+inactive transform merge `transform.rs:176`, inactive paste `app.rs:776`). Instead,
+**whenever §0's parse phase produces a maybe-stale tree** (an incremental update on
+the now-active buffer — including the parse that runs the first time a
+stale-from-inactive-mutation buffer is drawn after a switch, `workspace.rs:39`), set
+`reconcile_due_at = now + RECONCILE_DEBOUNCE_MS`. Each subsequent such rebuild pushes
+it back (re-debounce). The main loop dispatches the reconcile when `now >=
+reconcile_due_at` **and** `blocks_maybe_stale` **and** no reconcile is already in
+flight for the buffer. This mirrors the diagnostics `DiagStore.recheck_due_at` /
+`in_flight_version` pattern exactly, and — because it is armed by the *parse phase*
+rather than by an active-buffer edit event — it correctly covers staleness whenever
+it is first observed, including at switch time. `RECONCILE_DEBOUNCE_MS` is a tunable
+const (~150 ms), aligned with `swap::T_IDLE_MS` / the diagnostics debounce; the
+deadline folds into the existing `next_deadline` computation in `run` (`app.rs:2089`).
 
 ### 3. Reconcile job — the **Executor** `JobKind::Reparse` path (NOT diagnostics)
 Correction from the spec review: the diagnostics job does NOT use the Executor — it
@@ -265,10 +277,11 @@ The plan should widen that doc comment to say "derived caches included."
    the diagnostics debounce; and folding the reconcile deadline into `next_deadline`
    (`app.rs` ~2089).
 5. Where the new state lives (`Document` vs `Buffer`, `editor.rs:51`/`:95`):
-   `blocks_maybe_stale`, `blocks_version` (the memoization key for §0), and the
-   reconcile in-flight/version state — alongside existing `version`, `blocks`,
-   `last_edit_at`. Confirm nothing already relied on the per-frame full parse for
-   correctness after undo/redo/filter/transform/paste (the version gate must cover
-   every text-changing path).
+   `blocks_maybe_stale`, `blocks_version` (the memoization key for §0),
+   `reconcile_due_at`, and the reconcile `in_flight_version` — alongside existing
+   `version`, `blocks`, `last_edit_at`. Confirm nothing already relied on the
+   per-frame full parse for correctness after undo/redo (the version gate must cover
+   every text-changing path), and that filter/transform/paste indeed set the
+   incremental state via `Buffer::apply` (so they take the incremental branch).
 6. Widen the `JobResult::merge` doc comment (`jobs.rs:43`) to note derived document
    caches (e.g. `document.blocks`) are within scope.
