@@ -1,6 +1,6 @@
 # Clippy-debt cleanup + house-style em-dash + durable clippy gate — design
 
-**Status:** approved design (pre-spec-review)
+**Status:** spec-review clean (Codex READY FOR PLANNING, no open findings)
 **Date:** 2026-06-30
 **Effort:** clippy-debt cleanup (pre-Effort-P housekeeping; user-approved 2026-06-29)
 
