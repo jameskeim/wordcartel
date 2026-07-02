@@ -1,6 +1,6 @@
 # M5 follow-ups: undo-eviction hint + bound the last document-sized reads — design
 
-**Status:** spec-review round 3 folded (core last_evicted reset in undo/redo closes the residual false-positive); re-review pending
+**Status:** spec-review CLEAN (Codex READY FOR PLANNING, round 4)
 **Date:** 2026-07-01
 **Effort:** M5 follow-ups (pre-Effort-P; two small M5 leftovers, one bundled effort)
 
@@ -102,10 +102,13 @@ production edit funnels through exactly one `reduce(...)` call there.
   evicting edit (transform/paste/scratch to a non-active buffer — never consumed by
   the active-buffer check) leaves `last_evicted > 0`; a later switch to that buffer
   followed by an undo/redo (which bump `version` but do not call `evict_to`) would
-  fire a spurious hint. Adding `self.last_evicted = 0;` at the top of `undo` and
-  `redo` makes the field honest and closes that residual false-positive at the root.
-  Breaks no core test (`eviction_keeps_current_consistent_for_undo_redo` asserts
-  `last_evicted > 0` BEFORE its undo/redo, `history.rs:334`).
+  fire a spurious hint. Adding `self.last_evicted = 0;` makes the field honest and
+  closes that residual false-positive at the root. **Placement:** insert it as the
+  VERY FIRST statement of both `undo` and `redo`, BEFORE the `current == 0` /
+  `current >= revisions.len()` early-return guards (`history.rs:100`/`:112`), so even
+  a no-op undo/redo consumes stale eviction state. Breaks no core test
+  (`eviction_keeps_current_consistent_for_undo_redo` asserts `last_evicted > 0`
+  BEFORE its undo/redo, `history.rs:334`).
 
 Rationale for override (not a combined message): uniform hint across all edit
 paths, reuses one string, and eviction (>64 MiB undo history) is rare — the
