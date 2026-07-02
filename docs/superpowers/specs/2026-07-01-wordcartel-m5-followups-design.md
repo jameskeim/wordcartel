@@ -1,6 +1,6 @@
 # M5 follow-ups: undo-eviction hint + bound the last document-sized reads — design
 
-**Status:** spec-review round 1 folded (single-seam hint + fingerprint metadata fallback); re-review pending
+**Status:** spec-review round 2 folded (universal main-loop hint check + fingerprint metadata fallback); re-review pending
 **Date:** 2026-07-01
 **Effort:** M5 follow-ups (pre-Effort-P; two small M5 leftovers, one bundled effort)
 
@@ -49,51 +49,69 @@ amortize the gated-pipeline overhead. **Shell-only; no `wordcartel-core` changes
   the existing safe degradation at each site (see below).
 - No change to the authoritative load path (`file::open` is already bounded).
 
-## Component (a) — undo-eviction hint at a single reduce-level seam
+## Component (a) — undo-eviction hint via one universal main-loop check
 
-**Revised after spec review.** The per-caller approach (wire a helper at each
-`Buffer::apply` call site) is whack-a-mole: beyond filter/transform/paste there
-are at least four more buffer-merge sites (replace-all `app.rs:922`, two
-search-step applies `app.rs:943`/`:977`, scratch-append `scratch.rs:21`), paste
-has no success-status site to hang the call on, and any FUTURE edit path would
-silently miss the hint again — the very bug this fixes. Instead, surface the hint
-ONCE, at the seam every active-buffer edit already funnels through.
+**Revised twice after spec review.** The per-caller approach is whack-a-mole
+(Codex found 7+ `Buffer::apply` sites; a future one would silently miss the hint).
+An in-`reduce` seam does not work either: `reduce` (`app.rs:1091`) captures
+`before` at `:1675` but has many EARLY RETURNS above it (search overlay `:1545`/`:1552`,
+diagnostics quick-fix `:1602`, menu/palette dispatch), so those edit paths never
+reach the `if version != before` block at `:1789`. The clean seam is OUTSIDE
+`reduce`, at its single production call site in the run loop (`app.rs:2149`) — every
+production edit funnels through exactly one `reduce(...)` call there.
 
 - Single-source the hint text as a module-level const in `editor.rs`:
   `const UNDO_EVICTED_HINT: &str = "Undo history full — oldest dropped";` (the exact
   string `Editor::apply` uses today).
-- Add a helper `Editor::note_undo_eviction(&mut self)` that surfaces the hint for
-  the ACTIVE buffer:
+- Add a helper on `Editor`:
   ```
-  if self.active().document.history.last_evicted > 0 {
-      self.status = UNDO_EVICTED_HINT.to_string();
+  /// Surface the undo-eviction hint iff an edit landed on the STILL-active buffer
+  /// this reduce AND it evicted. Consumes `last_evicted` (resets to 0) so a later
+  /// undo/redo/switch — which change `version` without a fresh eviction — do not
+  /// re-fire the stale hint.
+  pub fn note_undo_eviction(&mut self, pre_id: BufferId, pre_version: u64) {
+      let fire = {
+          let b = self.active();
+          b.id == pre_id && b.document.version != pre_version
+              && b.document.history.last_evicted > 0
+      };
+      if fire {
+          self.status = UNDO_EVICTED_HINT.to_string();
+          self.active_mut().document.history.last_evicted = 0;
+      }
   }
   ```
-- **Call it once, in `reduce`'s existing post-edit block** — the `if version != before`
-  block (`app.rs:~1775`, where `last_edit_at` is set / diagnostics are armed). That
-  block runs exactly when the ACTIVE buffer's version changed during this reduce —
-  i.e. an edit landed via ANY path (keystroke, filter, transform, paste, replace-all,
-  search-step, scratch) — and it runs AFTER the command handlers set their outcome
-  status, so the hint OVERRIDES on eviction (matching today's `Editor::apply`
-  behavior). One site covers every current and future active-buffer edit path.
-- **Remove `Editor::apply`'s inline hint** (`editor.rs:646`): it is now redundant
-  (a keystroke edit bumps the version → the reduce block fires). `Editor::apply`
-  becomes a plain delegator, keeping the hint logic in exactly one place.
+- **Wire it at the single run-loop `reduce` call** (`app.rs:2149`): capture the active
+  buffer's `(id, version)` immediately BEFORE `reduce`, call `note_undo_eviction(pre_id,
+  pre_version)` immediately AFTER. It runs after `reduce` set any outcome status, so
+  the hint OVERRIDES on eviction (matching today's `Editor::apply`). Being outside
+  `reduce`, it covers EVERY reduce path — including all early-return command handlers
+  (search-overlay, quick-fix, menu/palette) and job-result merges applied via the
+  end-of-reduce drain — for the active buffer.
+- **Remove `Editor::apply`'s inline hint** (`editor.rs:646`): now redundant (a
+  keystroke edit bumps the active version → the run-loop check fires). `Editor::apply`
+  becomes a plain delegator. Hint logic lives in exactly one place.
 
 Rationale for override (not a combined message): uniform hint across all edit
 paths, reuses one string, and eviction (>64 MiB undo history) is rare — the
 undo-depth-loss warning is the point, and the filter/transform result is visible
 on screen regardless.
 
+**Why the `(id, version)` gate + reset (avoids false positives):**
+- Same-`id` guard: a buffer SWITCH changes `active().id`, so it does not fire (the
+  switched-to buffer's stale `last_evicted` was already consumed when it was active).
+- `version != pre_version` gate: fires only when the active buffer was actually
+  edited this reduce (version is monotonic per buffer).
+- reset-to-0: the evicting commit's hint shows exactly once; a subsequent
+  undo/redo (which bumps version without calling `evict_to`) sees `last_evicted == 0`
+  → no spurious re-fire. `last_evicted` is already a per-commit transient (`evict_to`
+  zeroes it at the start of every commit), so the shell consuming it is consistent.
+
 **Known best-effort gaps (documented, acceptable for a cosmetic hint):**
-- Edits that complete while a MODAL is open are handled in `reduce`'s modal block,
-  which returns early BEFORE the `if version != before` block — so an eviction on a
-  background filter/transform/job completing under a modal will not surface the
-  hint. Rare (eviction + edit-under-modal) and cosmetic; eviction is still enforced
-  in core.
+- An edit AND a buffer-switch in the SAME reduce: the post-reduce active id differs
+  from `pre_id` → no hint. Rare, cosmetic.
 - Edits to an INACTIVE buffer (inactive transform/paste/scratch) do not change
-  `active().version`, so the hint does not fire for them — correct, since that
-  buffer is not on screen.
+  `active().version` → no hint, correct (that buffer is not on screen).
 
 ## Component (b) — bound the three remaining reads
 
@@ -161,11 +179,16 @@ files hash identically (no fingerprint churn).
 
 ## Testing
 
-- **(a):** `last_evicted` is a public `usize` field on `History`, so a test can set
-  it directly (no 64 MiB edit needed): build an `Editor` (`Editor::new_from_text`),
-  set `active_mut().document.history.last_evicted = 1`, call
-  `note_undo_eviction()`, assert `status == UNDO_EVICTED_HINT`; negative case
-  (`last_evicted == 0` → status untouched). Update/relocate the existing
+- **(a):** `last_evicted` is a public `usize` field on `History`, so a test drives
+  `note_undo_eviction(pre_id, pre_version)` directly (no 64 MiB edit needed). Build an
+  `Editor` (`Editor::new_from_text`); record `pre_id = active().id`,
+  `pre_v = active().document.version`; simulate an evicting edit by
+  `active_mut().document.version += 1` and `active_mut().document.history.last_evicted = 1`;
+  call `note_undo_eviction(pre_id, pre_v)` → assert `status == UNDO_EVICTED_HINT` AND
+  `active().document.history.last_evicted == 0` (consumed). Negative/false-positive
+  cases: (i) `version` unchanged (no edit) → no hint; (ii) `last_evicted == 0` → no
+  hint; (iii) a second call after the reset → no re-fire (proves undo/switch won't
+  replay the stale hint). Update/relocate the existing
   `apply_does_not_set_hint_when_no_eviction` (`editor.rs:1079`) to target the helper
   (its assertion — no hint without eviction — still holds; `Editor::apply` no longer
   carries the check).
@@ -183,9 +206,10 @@ files hash identically (no fingerprint churn).
 
 ## Decomposition
 
-- **Task 1 — (a):** `UNDO_EVICTED_HINT` const + `Editor::note_undo_eviction(&mut self)`
-  helper + remove `Editor::apply`'s inline hint + call the helper once in `reduce`'s
-  `if version != before` block + tests.
+- **Task 1 — (a):** `UNDO_EVICTED_HINT` const + `Editor::note_undo_eviction(pre_id,
+  pre_version)` helper (with the `last_evicted` reset) + remove `Editor::apply`'s
+  inline hint + capture `(id, version)` before the run-loop `reduce` call (`app.rs:2149`)
+  and call the helper after + tests.
 - **Task 2 — (b):** `file::bounded_read_opt` helper + convert the recovery-predicate
   and skip-unchanged sites (direct `None`) + convert `fingerprint()` to the
   metadata-fallback shape + tests.
@@ -195,13 +219,13 @@ The clippy deny-gate is already live, so each task keeps `cargo clippy --workspa
 
 ## Plan-confirms (resolve during the implementation plan, against real source)
 
-1. The exact `reduce` `if version != before` block (`app.rs:~1775`) where
-   `note_undo_eviction()` should land: confirm it runs AFTER the command handlers
-   (so the hint overrides the outcome status) and that the modal-block early return
-   is the documented uncovered path. Confirm `editor.status`/`active()` are in scope.
-2. `Buffer.id`/`Editor::by_id` are no longer needed by the helper (it uses
-   `active()`); confirm where `UNDO_EVICTED_HINT` best lives (module-level const in
-   `editor.rs`).
+1. Confirm the run-loop `reduce` call at `app.rs:2149` is the SOLE production reduce
+   call (the others are tests), and that capturing `(active().id, active().document.version)`
+   just before it + calling `note_undo_eviction` just after it runs after `reduce`
+   returns (so it overrides the outcome status) and before the draw. `editor` is a
+   plain local there (mutable), so `active()`/`active_mut()` are in scope.
+2. `Buffer.id` type/accessor (`BufferId`) + `Document.version` (`u64`) for the helper
+   signature; where `UNDO_EVICTED_HINT` best lives (module-level const in `editor.rs`).
 3. Confirm `swap::assess`'s `Prompt` fallback on `current_file_bytes == None`
    (`swap.rs:264`) so the recovery over-cap fallback is genuinely safe.
 4. That `bounded_read_opt` belongs in `file.rs` (it's IO + already imports
