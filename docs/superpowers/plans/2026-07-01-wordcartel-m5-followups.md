@@ -129,7 +129,7 @@ and in `impl Editor`:
     }
 ```
 
-- [ ] **Step 7: Shell — failing tests for the helper** (retarget the existing `apply_does_not_set_hint_when_no_eviction` region ~:1078; KEEP that test as-is — it still passes as a guard that `apply` itself sets no hint — and ADD):
+- [ ] **Step 7: Shell — failing tests for the helper.** KEEP `apply_does_not_set_hint_when_no_eviction` (~:1078) as a guard that `Editor::apply` itself sets no hint — but REFRESH its stale doc comment (editor.rs:1074-1077 describes the old apply-based hint mechanism removed in Step 6; rewrite it to say the hint now lives in `note_undo_eviction`, and this test guards that `apply` is a pure delegator). Then ADD:
 
 ```rust
     #[test]
@@ -240,7 +240,17 @@ Test (beside `save_same_content_returns_unchanged`; use the existing `scratch_pa
 
 - [ ] **Step 4: Convert `fingerprint()` to the metadata fallback + failing tests** (`save.rs:30`):
 
+Write a FRESH doc comment for the reshaped public `fingerprint` (do NOT keep the
+old one verbatim — its "hash and size come from the same read (no TOCTOU)" claim is
+now false, since `size` comes from `meta.len()` (a stat) and `hash` from a separate
+bounded read):
 ```rust
+/// Content-hash fingerprint of `path` for external-modification detection (BUG-2),
+/// capping the content read at `MAX_OPEN_BYTES`. Returns `None` only when `path` is
+/// missing/unstattable; a present file always yields `Some` (over-cap → mtime+size
+/// with a sentinel hash — never `None`, so `stored_fp` can't silently disable the
+/// conflict check). `mtime`/`size` come from `metadata`, `hash` from a separate
+/// bounded read (no single-syscall guarantee across the three fields).
 pub fn fingerprint(path: &Path) -> Option<FileFingerprint> {
     fingerprint_with_limit(path, crate::limits::MAX_OPEN_BYTES)
 }
@@ -291,6 +301,9 @@ Tests (beside `fingerprint_detects_same_size_different_content`; use the existin
 - [ ] **Step 6: Convert the recovery predicate** (`app.rs:1936`):
 
 ```rust
+        // Bounded read: an over-cap document yields None → assess() Prompts (safe).
+        // (Narrow behavior change: a >64 MiB file whose bytes match the swap hash
+        // would previously DiscardSilently; it now Prompts. Safe direction.)
         let file_bytes = editor.active().document.path.as_deref()
             .and_then(|p| crate::file::bounded_read_opt(p, crate::limits::MAX_OPEN_BYTES));
 ```
