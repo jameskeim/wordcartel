@@ -1,6 +1,6 @@
 # Editing responsiveness: cache the draw-path outline work — design
 
-**Status:** spec-review round 1 folded (blocks_generation identity token + heading_level_glyph + missed fold sites); re-review pending
+**Status:** spec-review round 2 folded (Fable5: CRITICAL-1 layout-output invariant + RefCell &self accessor + full nav routing); re-review pending
 **Date:** 2026-07-02
 **Effort:** editing-responsiveness (pre-Effort-P; the safe, always-on per-keystroke wins)
 
@@ -66,11 +66,15 @@ need a key that changes across the reconcile-merge boundary.
 - Add `blocks_generation: u64` on `Document` (next to `blocks`/`version`), bumped on
   **every** write to `document.blocks`: the parse-phase assignment (`derive.rs:135`) and
   the reconcile-merge replacement (inside the `if b.document.blocks != tree` branch,
-  `reconcile.rs:63`). Monotonic; a fresh `Document` starts at 0.
+  `reconcile.rs:66`). Monotonic; a fresh `Document` starts at 0.
 - `blocks_generation` is the tree-identity token for BOTH caches below (replacing
   `blocks_version`). It changes whenever `blocks` changes — including a merge that keeps the
   version — and, because the parse phase reassigns `blocks` on every version change, it also
   changes on every text edit (so it subsumes buffer/text changes for `line_text`).
+- **The parse-phase assignment (`derive.rs:135`) stays UNCONDITIONAL** — no "skip the bump
+  if the new tree equals the old" optimization. Replacing one character with another can
+  yield a byte-identical tree while `line_text` changed; the `line_text`-subsumption argument
+  for both caches depends on the generation bumping on every version change regardless.
 
 ## Component 1 — F3: `role_at` binary search (core)
 
@@ -106,8 +110,20 @@ Today each of ~5–6 sites recomputes the fold view from scratch every draw:
 `FoldView::compute(folds, blocks, buf)` (`fold.rs:76`) is a **pure function of
 `(folds, blocks, buffer)`** — it does NOT read scroll/viewport/selection (confirmed) — so it
 is cacheable by `(blocks_generation, fold_epoch)`. `folds.reconcile` (`fold.rs:37`) prunes
-fold anchors whose heading no longer exists — it only mutates `folded` when the tree
-structure changed.
+fold anchors whose heading no longer exists.
+
+**Complete call-site set (spec-review, folded — the round-1 table undercounted nav).**
+The shell computes a fold view at: `rebuild_downstream` (`derive.rs:170`), the scrollbar
+render (`render.rs:596`), scrollbar mouse (`mouse.rs:157,:222`), and — the big one — the
+free fn `nav::fold_view(editor: &Editor)` (`nav.rs:131`) with **14 callers**: `:325,:329,:378,
+:382` (visual_down/up + debug_asserts), `ensure_visible` `:405,:451,:464,:475`, `rows_before_caret`
+`:545`, `advance_view_top_one_row`/`scroll_up_one` `:560,:587`, `clamp_caret_into_view` `:616`,
+`last_fully_visible_line` `:797`, `offset_at_cell` `:917`. Arrow-key motion and drag-autoscroll
+run through these, so they ARE per-keystroke hot paths — all must be routed to get the win.
+Several (`nav::fold_view` itself, `last_fully_visible_line`, `offset_at_cell`,
+`rows_before_caret`→`screen_pos`) take **`&Editor`**, so the accessor MUST be `&self`
+(interior-mutability cache) — a `&mut self` accessor would force a `&Editor`→`&mut Editor`
+signature ripple across nav.
 
 Design:
 - **`fold_epoch` — robust against missed sites.** Add `fold_epoch: u64` on `FoldState`
@@ -119,29 +135,36 @@ Design:
   - fold commands: `registry.rs:384` toggle, `:397` fold_all, `:411` unfold_all,
     `:509` unfold_ancestors_of;
   - anchor remap in `Buffer::apply`/`undo`/`redo`: `editor.rs:210,:235,:254`;
-  - `reconcile`'s prune: `fold.rs:39` (bump only when `retain` removes an element);
   - session restore: `app.rs:467`;
   - **reload / recovery wholesale replace (spec-review, folded): `save.rs:233,:277`**
     (`editor.active_mut().folds = prev_folds`). Note these run AFTER a full `Buffer`
     replacement, so the fresh `Buffer`'s caches are already `None` (miss → recompute →
     safe); still route the assignment through a helper so `fold_epoch` stays consistent.
-- **Cache on `Buffer`:** `fold_view_cache: Option<(u64 /*blocks_generation*/, u64 /*fold_epoch*/, Rc<FoldView>)>`,
-  initialized `None` at `Buffer` construction (so any `Buffer` replacement is safe by
-  construction).
-- **Accessor `Editor::active_fold_view(&mut self) -> Rc<FoldView>`:** if the cache key
-  `(active blocks_generation, active fold_epoch)` matches, return the `Rc` clone; on a miss,
-  run `folds.reconcile` (which may prune → may bump the epoch), then `FoldView::compute`,
-  store `(blocks_generation, post-reconcile fold_epoch, Rc::new(view))`, and return the
-  `Rc`. Since `reconcile` is a no-op when the tree is unchanged, the next same-key access
-  HITS (no perpetual miss).
-- Route ALL the call sites above through `active_fold_view`. `folds.reconcile` is folded
-  into the miss path — so it stops running every draw and runs only when the tree changed.
-- `Rc<FoldView>` avoids borrow-checker friction (the cache holds the `Rc`; callers clone it
-  cheaply and can then mutate `editor`).
+- **Cache on `Buffer` (interior-mutability, `&self` accessor):**
+  `fold_view_cache: RefCell<Option<(u64 /*blocks_generation*/, u64 /*fold_epoch*/, Rc<FoldView>)>>`,
+  initialized empty at `Buffer` construction (so any `Buffer` replacement is safe by
+  construction). `RefCell` is `Clone`/`Debug`-compatible (`Buffer` derives both) and safe
+  (no `unsafe`); `Buffer` is not `Send` (see plan-confirm), so no `Sync` issue.
+- **Accessor `Editor::active_fold_view(&self) -> Rc<FoldView>`:** borrow the `RefCell`; if the
+  cached key `(active blocks_generation, active fold_epoch)` matches, clone + return the `Rc`;
+  on a miss, compute `FoldView::compute` from the CURRENT `(folds, blocks, buffer)`, store
+  `(blocks_generation, fold_epoch, Rc::new(view))`, drop the borrow, return the `Rc`. This is
+  a **pure** memo (no mutation of editor state) — which is what lets it be `&self` and cover
+  the `&Editor` nav call sites.
+- **`reconcile` is a SEPARATE, generation-gated step (not on the FoldView miss path).**
+  `FoldView::compute` filters `folds.folded` against the CURRENT sections, so a not-yet-pruned
+  stale anchor (heading deleted) simply matches nothing — the FoldView is correct with or
+  without a prune. So `reconcile` (the prune) is housekeeping, not a correctness input to the
+  cache. Run it in `rebuild_downstream` (the `&mut` entry) gated on
+  `blocks_generation != last_reconciled_generation` (a new `Buffer` field) → once per tree
+  change, not every draw, preserving today's pruning behavior; route its `retain` through the
+  epoch-bumping helper. This dissolves the round-1 "reconcile on the miss path / perpetual
+  miss" concern entirely.
+- Route ALL 18 call sites (the table above) through `active_fold_view(&self)`.
 
-Net: **1 `sections`/`heading_starts` walk per (tree-or-fold change)**, not 5–6 per keystroke;
-the `blocks.clone()` (`derive.rs:164`) and `buffer.clone()` (`:165`) done solely to feed
-`reconcile`/`compute` are removed (the accessor borrows directly).
+Net: **1 `sections` walk per (tree-or-fold change)**, not 5–6+ per keystroke (incl. the nav
+hot paths); the `blocks.clone()` (`derive.rs:164`) and `buffer.clone()` (`:165`) done solely
+to feed `reconcile`/`compute` are removed (the reconcile step and the accessor borrow directly).
 
 ## Component 3 — double-rebuild collapse via a computed layout key (shell)
 
@@ -159,14 +182,30 @@ Omitting either would leave a stale/incorrect layout cache with no on-demand ren
 (`line_text` and `role_at` — the buffer/tree inputs — are subsumed by `blocks_generation`,
 which bumps on every text edit and every merge.)
 
+- The work ABOVE the gated loop (`derive.rs:162–199`: fold-view fetch + scroll normalization,
+  `view.scroll = first_line` at `:197`) stays UNCONDITIONAL — only the visible-line loop
+  (`:200–225`) is gated. Capture `LayoutKey.scroll` **post-normalization** (the value the loop
+  actually consumes), so the key reflects the true layout input.
 - Compute that tuple as a `LayoutKey`; store the last one as `Buffer.layout_key: Option<LayoutKey>`.
 - At the top of the layout section: compute the current key; if it equals `layout_key`,
   **skip** the layout loop entirely (`line_layouts` already matches); else run the loop and
   store the new key.
-- Robust **by construction**: the key captures every input to `line_layouts`, so we never
-  skip when anything changed — the "stale layout cache blanks the editing rows" hazard
-  (render has no on-demand fallback) cannot occur. Eliminates the redundant second pass
-  *and* idle-Tick rebuilds.
+- **CRITICAL fix (spec-review, folded) — the gate must hold the OUTPUT invariant, not just
+  the input key.** The "robust by construction" argument assumed the layout loop is the sole
+  writer of `line_layouts`. It is NOT: `line_layouts.clear()` also happens EXTERNALLY at the
+  **Resize handler** (`app.rs:1735`, clears every buffer) and the reload/recovery replace
+  (`save.rs:238,:281`). A spurious same-dimensions `Resize` (tmux pane ops / focus deliver
+  unfiltered SIGWINCH) would clear `line_layouts` while leaving `LayoutKey` unchanged → the
+  gate skips → **blank editing rows, no render fallback** — the exact hazard the gate claims
+  to prevent. Fix: maintain the invariant *"`layout_key == Some(k)` ⟹ `line_layouts` is valid
+  for `k`"* at EVERY writer — introduce `Buffer::invalidate_layout()` that does
+  `line_layouts.clear()` **and** `layout_key = None`, and route all three external clear sites
+  through it (the gated loop's own clear at `derive.rs:208` stays, since it re-stores the key
+  in the same pass). The plan must enumerate every `line_layouts` writer and confirm none
+  clears it without nulling `layout_key`.
+- With that invariant, the gate is genuinely safe: we never skip when either an input changed
+  (key differs) OR the output was externally cleared (`layout_key` was nulled). Eliminates the
+  redundant second pass *and* idle-Tick rebuilds.
 
 Note the fold-reconcile + `FoldView` (Component 2) is separately cached, so a skipped
 layout pass recomputes neither.
@@ -180,8 +219,11 @@ Correctness burden is "same output, faster," so the **existing render/nav/fold/l
 staying green is the primary net** (any regression there = a cache-key bug). Added tests:
 
 - **F3 (core):** a differential property test — new `role_at` ≡ the pre-change linear result
-  over randomized trees × byte positions; plus a test/`debug_assert` that children are
-  ordered + non-overlapping at every level (the invariant it rests on).
+  over byte positions. **The trees MUST be produced via the real producers** (random text →
+  `full_parse`, and incremental-update chains) — NOT an arbitrary/synthetic `Block` tree
+  strategy, which could generate unsorted/overlapping siblings that violate the very invariant
+  the binary search rests on and cause spurious failures. Plus a test/`debug_assert` (outside
+  the hot path) that children are ordered + non-overlapping at every level.
 - **`blocks_generation` (core of the Critical fix):** it bumps on the parse-phase assignment
   AND on a reconcile-merge that replaces `blocks` at the same version — a test that simulates
   the merge (replace `document.blocks` via the merge path) asserts `blocks_generation`
@@ -196,14 +238,20 @@ staying green is the primary net** (any regression there = a cache-key bug). Add
   blocks_generation / fold_epoch / scroll / area / text_width / active_line / mode /
   **heading_level_glyph**; and `line_layouts` is correct (non-empty, right rows) after a
   change. Include an explicit case: flipping `theme.heading_level_glyph` alone invalidates.
+- **CRITICAL-1 regression guard (spec-review, folded):** a **same-dimensions `Resize`**
+  (`invalidate_layout` clears `line_layouts` but the `LayoutKey` inputs are unchanged) must
+  NOT leave the rows blank — assert that after such a Resize + rebuild, `line_layouts` is
+  repopulated (the `layout_key = None` forces the gated pass to run despite the matching key).
 - **Call-count assertions (the proof-of-speedup, zero-dependency, no timing):**
   - `FoldView` reuse: after simulating a keystroke through both the command rebuild and the
     pre-draw rebuild, assert the two `active_fold_view` results are the same `Rc`
     (`Rc::ptr_eq`) — i.e. ≤1 compute per keystroke.
   - Layout-pass count: a `#[cfg(test)]` counter (e.g. `Buffer.layout_runs: u64` behind
     `cfg(test)`, or a test-local atomic incremented where the loop runs) asserts the layout
-    loop runs **0** times on a no-change rebuild / idle Tick and **1** time per keystroke,
-    not 2.
+    loop runs **0** times on a no-change rebuild / idle Tick and **1** time per keystroke.
+    **Use a mid-screen (non-scrolling) keystroke** — if the keystroke scrolls, `ensure_visible`
+    legitimately changes `scroll`, so the pre-draw pass re-runs (key changed) and 2 is correct.
+    The honest invariant is "≤1 layout pass per actual input change," not a raw "always 1."
 
 ## Decomposition (3 tasks, ascending risk)
 
@@ -235,17 +283,28 @@ staying green is the primary net** (any regression there = a cache-key bug). Add
    `Buffer: Send`, fall back to an owned `FoldView` + clone (or `Arc`).
 3. The exact, exhaustive set of `folded`-mutation sites that must bump `fold_epoch` — grep
    for EVERY production write to `folds.folded` / assignment of `folds`; confirm the table
-   above is complete (incl. `save.rs:233,:277`), that all pokes route through the
-   epoch-bumping `FoldState` helpers, and that `reconcile`'s prune bumps only on a real
-   change (else the F2 cache never hits, since `reconcile` runs on the miss path).
-4. `FoldView` is cheap to hold behind `Rc` and its methods used by `ensure_visible`
-   (`normalize_line`, `next_visible`, `prev_visible`, `line_at_ordinal`, `visible_ordinal`,
-   `visible_count`) work unchanged through an `Rc` deref.
+   above is complete (incl. `save.rs:233,:277`) and that all pokes route through the
+   epoch-bumping `FoldState` helpers. (Reconcile is now a separate generation-gated step, not
+   on the FoldView miss path — so no perpetual-miss concern; confirm that restructure.)
+4. The COMPLETE `nav::fold_view` call-site set (the 14 listed + the 4 non-nav sites) is routed
+   through `active_fold_view(&self)`; confirm the `&self` accessor compiles at the `&Editor`
+   sites (`nav::fold_view`, `last_fully_visible_line`, `offset_at_cell`, `rows_before_caret`→
+   `screen_pos`) without a `&mut` ripple, and the `FoldView` methods used
+   (`normalize_line`, `next_visible`, `prev_visible`, `is_hidden`, `line_at_ordinal`,
+   `visible_ordinal`, `visible_count`) work through an `Rc` deref.
 5. The precise `LayoutKey` field list matches every input the layout loop + `layout::layout`
    read — confirm the complete set is `blocks_generation`, `fold_epoch`, `scroll`,
    `scroll_row`, `area`, `text_width`, `active_line`, `mode`, `heading_level_glyph`, and
-   nothing else the loop touches (e.g. any other `theme`/`view`/`config` field feeding
-   `line_text`/`role_at`/`layout::layout`) is omitted.
+   nothing else the loop touches (other `theme`/`view`/`config` field feeding
+   `line_text`/`role_at`/`layout::layout`; confirm `text_left`/gutter, tab width, wrap config
+   are subsumed by `text_width` and don't affect `line_layouts` independently).
 6. `blocks_generation` is bumped at EVERY `document.blocks` writer — confirm exactly two in
    production: the parse-phase assignment (`derive.rs:135`) and the reconcile-merge
-   replacement (`reconcile.rs:63`, inside the `!= tree` branch) — and no third writer exists.
+   replacement (`reconcile.rs:66`, inside the `!= tree` branch) — and no third writer exists.
+7. EVERY `view.line_layouts` writer is enumerated (the gated loop `derive.rs:208`, Resize
+   `app.rs:1735`, reload/recovery `save.rs:238,:281`) and every EXTERNAL clear routes through
+   `Buffer::invalidate_layout()` (clear + `layout_key = None`) — the CRITICAL-1 invariant.
+8. All fold-view CONSUMERS rebuild before consuming (no path reads `active_fold_view` between
+   an edit and the next `rebuild`, which would return a pre-edit cached view) — confirm the
+   command/mouse/theme paths rebuild first (M3), so the cache introduces no transient
+   divergence from today's recompute-each-time behavior.
