@@ -1732,7 +1732,7 @@ pub fn reduce(
         Msg::Input(Event::Resize(w, h)) => {
             for b in editor.buffers.iter_mut() {
                 b.view.area = (w, h);
-                b.view.line_layouts.clear();
+                b.invalidate_layout();
             }
             derive::rebuild(editor);
             crate::nav::ensure_visible(editor);

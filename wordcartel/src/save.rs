@@ -235,7 +235,7 @@ pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
     editor.search = None;
     editor.diag = None;
     // then the existing follow-ups, now on the active buffer:
-    editor.active_mut().view.line_layouts.clear();
+    editor.active_mut().invalidate_layout();
     crate::derive::rebuild(editor); // reconciles folds + normalizes scroll
     // normalize the caret out of any fold the new content created/changed.
     let head = editor.active().document.selection.primary().head;
@@ -278,7 +278,7 @@ pub fn load_recovered(editor: &mut crate::editor::Editor, body: &str) {
     // Clear any stale search/diag overlay — the buffer content has changed wholesale.
     editor.search = None;
     editor.diag = None;
-    editor.active_mut().view.line_layouts.clear();
+    editor.active_mut().invalidate_layout();
     crate::derive::rebuild(editor); // reconciles folds + normalizes scroll
     // normalize the caret out of any fold the new content created/changed.
     let head = editor.active().document.selection.primary().head;

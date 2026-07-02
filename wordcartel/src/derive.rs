@@ -3,11 +3,26 @@ use wordcartel_core::block_tree;
 use wordcartel_core::buffer::TextBuffer;
 use wordcartel_core::layout;
 
-/// Key the visible-line layout cache (`view.line_layouts`) is valid for.
-/// Placeholder for Component 3 (Task 3 fills its fields); present now so the
-/// `Buffer.layout_key` field and `invalidate_layout` compile.
+/// Everything the visible-line layout loop reads. Gate the loop on equality of this
+/// so it re-runs only when an actual input changed. A miss here would blank rows
+/// (render has no on-demand fallback), so the field set must be COMPLETE.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LayoutKey;
+pub struct LayoutKey {
+    pub blocks_generation: u64,
+    pub fold_epoch: u64,
+    pub scroll: usize,              // post-normalization (first_line)
+    pub scroll_row: usize,
+    pub area: (u16, u16),
+    pub text_width: usize,          // vp_width (subsumes wrap/gutter geometry)
+    pub active_line: usize,
+    pub source_mode: bool,          // view.mode != LivePreview
+    pub heading_level_glyph: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub static LAYOUT_RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 // ---------------------------------------------------------------------------
 // Logical-line helpers
@@ -213,11 +228,28 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
     // the later active_mut() calls.
     let vp_width = crate::nav::text_geometry(editor).text_width as usize;
 
+    let key = LayoutKey {
+        blocks_generation: editor.active().document.blocks_generation,
+        fold_epoch: editor.active().folds.epoch,
+        scroll: first_line,
+        scroll_row,
+        area: editor.active().view.area,
+        text_width: vp_width,
+        active_line,
+        source_mode,
+        heading_level_glyph: editor.theme.heading_level_glyph,
+    };
+    if editor.active().layout_key.as_ref() == Some(&key) {
+        return; // line_layouts already valid for this key — skip the pass
+    }
+
     let mut visual_rows_accumulated: usize = 0;
     let overscan_budget = area_height.saturating_add(scroll_row).saturating_add(1);
 
     // Clear the old cache and fill for the visible range.
     editor.active_mut().view.line_layouts.clear();
+    #[cfg(test)]
+    LAYOUT_RUNS.with(|c| c.set(c.get() + 1));
 
     let mut l = first_line;
     while l < total_lines && visual_rows_accumulated < overscan_budget {
@@ -235,6 +267,7 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
         // 5g: jump past any folded body that follows this line.
         l = fold_view.next_visible(l).unwrap_or(total_lines);
     }
+    editor.active_mut().layout_key = Some(key);
 }
 
 // ---------------------------------------------------------------------------
@@ -614,6 +647,173 @@ mod tests {
         crate::derive::rebuild(&mut ed);
         // byte 0 is now "body" — not a heading start — so the fold is gone.
         assert!(!ed.active().folds.folded.contains(&0));
+    }
+
+    // ------------------------------------------------------------------
+    // M4-rest: apply_parse_result state-transition helper
+    // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // Task 3: LayoutKey gate
+    // ------------------------------------------------------------------
+
+    /// Guard: invalidate_layout (same area) followed by rebuild must NOT blank the
+    /// layout cache. This has teeth once the gate is in place: if the gate failed
+    /// to honour the nulled `layout_key` it would skip the loop and line_layouts
+    /// would stay empty.
+    #[test]
+    fn same_dimension_resize_does_not_blank() {
+        let mut e = Editor::new_from_text("# Title\n\nbody\n", None, (80, 24));
+        rebuild(&mut e);
+        assert!(!e.active().view.line_layouts.is_empty(), "initial rebuild must populate");
+        // Simulate Resize at same dimensions: area unchanged, layout_key nulled.
+        e.active_mut().invalidate_layout();
+        rebuild(&mut e);
+        assert!(!e.active().view.line_layouts.is_empty(), "rebuild after invalidate_layout must repopulate");
+    }
+
+    /// The gate skips the loop on the second identical rebuild (no state change).
+    #[test]
+    fn layout_gate_skips_when_unchanged() {
+        let mut e = Editor::new_from_text("# Title\n\nbody\n", None, (80, 24));
+        LAYOUT_RUNS.with(|c| c.set(0));
+        rebuild(&mut e);
+        let after_first = LAYOUT_RUNS.with(|c| c.get());
+        assert_eq!(after_first, 1, "first rebuild should run the loop");
+        rebuild(&mut e); // no state change
+        let after_second = LAYOUT_RUNS.with(|c| c.get());
+        assert_eq!(after_second, 1, "second rebuild with no change should skip the loop");
+    }
+
+    /// Each distinct input to `LayoutKey` causes the loop to re-run.
+    #[test]
+    fn layout_gate_reruns_on_each_input() {
+        let doc = "line0\nline1\nline2\nline3\nline4\n";
+
+        // Helper: reset counter, run once to prime, then make a change and run again;
+        // assert the count incremented.
+        macro_rules! check_reruns {
+            ($label:expr, $setup:expr, $change:expr) => {{
+                let mut e: Editor = $setup;
+                LAYOUT_RUNS.with(|c| c.set(0));
+                rebuild(&mut e);
+                let before = LAYOUT_RUNS.with(|c| c.get());
+                $change(&mut e);
+                rebuild(&mut e);
+                let after = LAYOUT_RUNS.with(|c| c.get());
+                assert!(after > before, "{}: expected layout re-run but count stayed at {}", $label, before);
+            }};
+        }
+
+        // scroll: advance first_line by changing view.scroll + invalidating key
+        check_reruns!(
+            "scroll",
+            Editor::new_from_text(doc, None, (80, 4)),
+            |e: &mut Editor| {
+                e.active_mut().view.scroll = 2;
+                e.active_mut().layout_key = None; // force key mismatch
+            }
+        );
+
+        // area height: simulates a Resize in height
+        check_reruns!(
+            "area",
+            Editor::new_from_text(doc, None, (80, 24)),
+            |e: &mut Editor| {
+                e.active_mut().view.area = (80, 12);
+                e.active_mut().layout_key = None;
+            }
+        );
+
+        // text_width (via area width): gutter+wrap geometry feeds vp_width
+        check_reruns!(
+            "text_width",
+            Editor::new_from_text(doc, None, (80, 24)),
+            |e: &mut Editor| {
+                e.active_mut().view.area = (40, 24);
+                e.active_mut().layout_key = None;
+            }
+        );
+
+        // active_line: move cursor to a different line
+        check_reruns!(
+            "active_line",
+            Editor::new_from_text(doc, None, (80, 24)),
+            |e: &mut Editor| {
+                // "line0\n" is 6 bytes; byte 6 is start of "line1"
+                e.active_mut().document.selection =
+                    wordcartel_core::selection::Selection::single(6);
+                e.active_mut().layout_key = None;
+            }
+        );
+
+        // source_mode: toggle view mode away from LivePreview
+        check_reruns!(
+            "source_mode",
+            Editor::new_from_text(doc, None, (80, 24)),
+            |e: &mut Editor| {
+                e.active_mut().view.mode = crate::editor::RenderMode::SourceHighlighted;
+                e.active_mut().layout_key = None;
+            }
+        );
+
+        // fold toggle: bumps folds.epoch
+        check_reruns!(
+            "fold_epoch",
+            Editor::new_from_text(doc, None, (80, 24)),
+            |e: &mut Editor| { e.active_mut().folds.toggle(0); }
+        );
+
+        // blocks_generation: explicit bump (as if a new parse ran)
+        check_reruns!(
+            "blocks_generation",
+            Editor::new_from_text(doc, None, (80, 24)),
+            |e: &mut Editor| {
+                e.active_mut().document.blocks_generation =
+                    e.active().document.blocks_generation.wrapping_add(1);
+            }
+        );
+
+        // heading_level_glyph: explicit flip, all other inputs held constant
+        check_reruns!(
+            "heading_level_glyph",
+            Editor::new_from_text("# H\nbody\n", None, (80, 24)),
+            |e: &mut Editor| {
+                e.theme.heading_level_glyph = !e.theme.heading_level_glyph;
+            }
+        );
+    }
+
+    /// A single non-scrolling mid-screen insert must produce exactly ONE layout
+    /// run across the post-command rebuild and the subsequent pre-draw rebuild —
+    /// the double-rebuild collapsed.
+    #[test]
+    fn keystroke_runs_layout_once() {
+        // Large enough that inserting at line 1 never scrolls.
+        let doc = "line0\nline1\nline2\nline3\nline4\nline5\nline6\n";
+        let mut e = Editor::new_from_text(doc, None, (80, 24));
+        // Prime the state with an initial rebuild so layout_key is set.
+        rebuild(&mut e);
+
+        // Apply a non-scrolling insert at the start of "line1" (byte 6).
+        let doc_len = e.active().document.buffer.len();
+        let (cs, edit) = crate::commands::build_multi_replace(&[(6, 6, "X".into())], doc_len);
+        let txn = wordcartel_core::history::Transaction::new(cs);
+        struct C; impl wordcartel_core::history::Clock for C { fn now_ms(&self) -> u64 { 0 } }
+        e.active_mut().apply(txn, edit, wordcartel_core::history::EditKind::Other, &C);
+
+        // Reset counter AFTER the apply but BEFORE the rebuilds.
+        LAYOUT_RUNS.with(|c| c.set(0));
+
+        // First rebuild (post-command): parses, builds layout → count = 1.
+        rebuild(&mut e);
+        let after_first = LAYOUT_RUNS.with(|c| c.get());
+        assert_eq!(after_first, 1, "post-command rebuild should run the layout loop exactly once");
+
+        // Second rebuild (pre-draw): same key → gate fires → count stays 1.
+        rebuild(&mut e);
+        let after_second = LAYOUT_RUNS.with(|c| c.get());
+        assert_eq!(after_second, 1, "pre-draw rebuild with no change should skip the layout loop");
     }
 
     // ------------------------------------------------------------------
