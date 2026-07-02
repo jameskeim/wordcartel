@@ -28,18 +28,23 @@ macro_rules! assert_all_paths_agree {
         let new: &str = $new;
         let ot = full_parse(old);
         let full = full_parse(new);
-        let str_inc = incremental_update(&ot, old, edit, new);
-        let rope_inc = incremental_update_rope(
-            &ot,
-            &Rope::from_str(old),
-            edit,
-            &Rope::from_str(new),
+        let str_out = wordcartel_core::block_tree::incremental_update_instrumented(&ot, old, edit, new);
+        // TextSource is impl'd for `&Rope`, so S = &Rope and the generic's `&S` needs `&&Rope`
+        // (mirrors derive.rs:129-132). Bind the ropes to locals, then pass `&&local`.
+        let old_rope = Rope::from_str(old);
+        let new_rope = Rope::from_str(new);
+        let rope_out = wordcartel_core::block_tree::incremental_update_instrumented_src(
+            &ot, &&old_rope, edit, &&new_rope,
         );
-        prop_assert_eq!(&str_inc, &full,
-            "\nstr path != full_parse\nold={:?}\nnew={:?}", old, new);
-        prop_assert_eq!(&rope_inc, &full,
-            "\nrope path != full_parse\nold={:?}\nnew={:?}", old, new);
-        prop_assert_eq!(&rope_inc, &str_inc,
+        prop_assert_eq!(str_out.reason, rope_out.reason,
+            "\nstr reason != rope reason\nold={:?}\nnew={:?}", old, new);
+        if str_out.reason != wordcartel_core::block_tree::WidenReason::BoundedStale {
+            prop_assert_eq!(&str_out.tree, &full,
+                "\nstr path != full_parse\nold={:?}\nnew={:?}", old, new);
+            prop_assert_eq!(&rope_out.tree, &full,
+                "\nrope path != full_parse\nold={:?}\nnew={:?}", old, new);
+        }
+        prop_assert_eq!(&rope_out.tree, &str_out.tree,
             "\nrope path != str path\nold={:?}\nnew={:?}", old, new);
     }};
 }
@@ -58,22 +63,33 @@ macro_rules! assert_chain_paths_agree {
         let mut str_tree = full_parse(initial);
         let mut rope_tree = full_parse_rope(&Rope::from_str(initial));
         for (edit, new_text) in edits {
-            let new_str_tree = incremental_update(&str_tree, &text, edit, new_text);
-            let new_rope_tree = incremental_update_rope(
-                &rope_tree,
-                &Rope::from_str(&text),
-                edit,
-                &Rope::from_str(new_text),
+            let str_out = wordcartel_core::block_tree::incremental_update_instrumented(&str_tree, &text, edit, new_text);
+            // S = &Rope → pass `&&local` (see the single-edit macro).
+            let text_rope = Rope::from_str(&text);
+            let new_rope = Rope::from_str(new_text);
+            let rope_out = wordcartel_core::block_tree::incremental_update_instrumented_src(
+                &rope_tree, &&text_rope, edit, &&new_rope,
             );
             let full = full_parse(new_text);
-            prop_assert_eq!(&new_str_tree, &full,
-                "\nchain: str path != full_parse\nbefore={:?}\nafter={:?}", text, new_text);
-            prop_assert_eq!(&new_rope_tree, &full,
-                "\nchain: rope path != full_parse\nbefore={:?}\nafter={:?}", text, new_text);
-            prop_assert_eq!(&new_rope_tree, &new_str_tree,
+            prop_assert_eq!(str_out.reason, rope_out.reason,
+                "\nchain: str reason != rope reason\nbefore={:?}\nafter={:?}", text, new_text);
+            if str_out.reason != wordcartel_core::block_tree::WidenReason::BoundedStale {
+                prop_assert_eq!(&str_out.tree, &full,
+                    "\nchain: str path != full_parse\nbefore={:?}\nafter={:?}", text, new_text);
+                prop_assert_eq!(&rope_out.tree, &full,
+                    "\nchain: rope path != full_parse\nbefore={:?}\nafter={:?}", text, new_text);
+            }
+            prop_assert_eq!(&rope_out.tree, &str_out.tree,
                 "\nchain: rope path != str path\nbefore={:?}\nafter={:?}", text, new_text);
-            str_tree = new_str_tree;
-            rope_tree = new_rope_tree;
+            // On BoundedStale, reset to full_parse so the NEXT step's `== full` stays meaningful
+            // (a stale carried tree would make every subsequent comparison spurious).
+            if str_out.reason == wordcartel_core::block_tree::WidenReason::BoundedStale {
+                str_tree = full_parse(new_text);
+                rope_tree = full_parse_rope(&Rope::from_str(new_text));
+            } else {
+                str_tree = str_out.tree;
+                rope_tree = rope_out.tree;
+            }
             text = new_text.clone();
         }
     }};
@@ -90,11 +106,13 @@ fn check(old_text: &str, range: std::ops::Range<usize>, replacement: &str) -> Up
     let (new_text, edit) = apply_edit(old_text, range, replacement);
     let outcome = incremental_update_instrumented(&old_tree, old_text, &edit, &new_text);
     let full = full_parse(&new_text);
-    assert_eq!(
-        outcome.tree, full,
-        "\nINCREMENTAL != FULL\nold_text={old_text:?}\nnew_text={new_text:?}\nreason={:?}\nincremental={:#?}\nfull={:#?}",
-        outcome.reason, outcome.tree, full
-    );
+    if outcome.reason != wordcartel_core::block_tree::WidenReason::BoundedStale {
+        assert_eq!(
+            outcome.tree, full,
+            "\nINCREMENTAL != FULL\nold_text={old_text:?}\nnew_text={new_text:?}\nreason={:?}\nincremental={:#?}\nfull={:#?}",
+            outcome.reason, outcome.tree, full
+        );
+    }
     outcome
 }
 
@@ -701,6 +719,8 @@ fn make_multiblock_doc() -> String {
     "# Title\n\nFirst paragraph with some text.\n\n```\ncode block\n```\n\nSecond paragraph.\n".to_string()
 }
 
+// Small fixed doc (< 1 KiB) — never reaches MAX_SYNC_WIDEN_BYTES, never emits BoundedStale;
+// unconditional `== full` is valid here (spec I4 exempt site).
 #[test]
 fn hazard_delete_entire_document_to_empty() {
     let doc = make_multiblock_doc();
@@ -720,6 +740,8 @@ fn hazard_delete_entire_document_to_empty() {
     );
 }
 
+// Small fixed doc (< 1 KiB) — never reaches MAX_SYNC_WIDEN_BYTES, never emits BoundedStale;
+// unconditional `== full` is valid here (spec I4 exempt site).
 #[test]
 fn hazard_delete_to_single_char() {
     let doc = make_multiblock_doc();
@@ -800,6 +822,8 @@ fn regression_inline_link_end_corrupts_list_nesting() {
 
 /// Deterministic (non-proptest) version of the three-way assertion:
 /// str-incremental == rope-incremental == full_parse.
+/// All callers use small fixed docs that never reach MAX_SYNC_WIDEN_BYTES, so BoundedStale is
+/// never emitted here — unconditional `== full` stays valid (spec I4 exempt site).
 fn assert_all_paths_agree_det(old_text: &str, edit: &wordcartel_core::block_tree::Edit, new_text: &str) {
     let ot = full_parse(old_text);
     let full = full_parse(new_text);
