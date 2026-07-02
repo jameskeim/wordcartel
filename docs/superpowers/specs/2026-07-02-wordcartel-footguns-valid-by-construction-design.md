@@ -1,6 +1,6 @@
 # Valid-by-construction cache-key fields (footguns) — design
 
-**Status:** approved design (pre-spec-review)
+**Status:** spec-review round 1 folded (honest blast radius incl. sibling-test reads + test WRITE sites); re-review pending
 **Date:** 2026-07-02
 **Effort:** footguns (valid-by-construction; the first of two — F1 is a later, separate effort)
 
@@ -104,10 +104,36 @@ struct literal, and there are ZERO `FoldState { … }` literals anywhere (all vi
 - **`epoch` reads (both out-of-module → `.epoch()`):** `editor.rs:454` (the `active_fold_view`
   cache-key tuple) and `derive.rs:234` (the `LayoutKey.fold_epoch`).
 
+## Blast radius — production AND tests (spec-review, folded)
+
+The privatization forces the accessor on EVERY out-of-module reference, and sibling-module
+`#[cfg(test)]` blocks are out-of-module too — so the real touch-count is roughly DOUBLE the
+production figure. This is compiler-guided (each unconverted site is a build error), but the
+spec accounts for it so the plan/implementer expect it:
+
+- **`.document.blocks` reads:** ~27 production + ~25 sibling-test (e.g. `render.rs:1274`,
+  `commands.rs:1386/1406/1426`, `nav.rs:1203-1428`, `derive.rs`-tests, `reconcile.rs`-tests,
+  `transform.rs:220`, `mouse.rs:334`, `save.rs:674/681`, `app.rs:4751-4785`) → `.blocks()`.
+- **`folds.folded` reads:** 3 production + ~18 sibling-test → `.folded()`.
+- **`blocks_generation`/`epoch` reads:** the production sites above + any sibling-test hits.
+
+**Direct WRITE sites in tests (must route through the API — the point of the effort):**
+- `document.blocks = …` in tests — `derive.rs:327`, `reconcile.rs:112`, `reconcile.rs:170` →
+  `document.set_blocks(…)`.
+- `folds.folded.insert(…)` in a test — `app.rs:4748` → an existing mutator (`toggle(hb)` to
+  fold one anchor, or `replace_folded(set)` for an exact set).
+
+Converting test writes through `set_blocks`/mutators is a FEATURE, not a workaround: it makes
+the valid-by-construction guarantee hold end-to-end, tests included. Watch for any test that
+asserts a SPECIFIC `blocks_generation`/`epoch` value after such a write — `set_blocks` bumps
+the generation, so such an assertion may need its expected value adjusted (a real behavior of
+the accessor, not a bug).
+
 ## Testing
 
-Behavior-preserving refactor → **the entire existing suite staying green + workspace clippy
-clean is the correctness proof.** Privacy makes a bump-bypassing write a COMPILE error — the
+Behavior-preserving refactor → **the entire existing suite staying green (INCLUDING sibling-test
+compilation, which now routes through the accessors) + workspace clippy clean is the correctness
+proof.** Privacy makes a bump-bypassing write a COMPILE error — the
 type system is the test. No new runtime tests. (Same rationale the clippy-debt effort used:
 suite-green + clippy-0 is sufficient for a mechanical, behavior-preserving change.)
 
@@ -132,12 +158,18 @@ suite-green + clippy-0 is sufficient for a mechanical, behavior-preserving chang
 1. No name collision: `Document` has no existing `blocks`/`blocks_generation`/`set_blocks`
    method, and `FoldState` no existing `folded`/`epoch` method (grep). If `Editor` also has a
    `blocks(...)`-like method, no conflict (different type).
-2. The exact, exhaustive out-of-module read-site lists (Component 1: ~29 `.document.blocks` +
-   ~4 `blocks_generation`; Component 2: 3 `folded` + 2 `epoch`) — re-grep to confirm none
-   missed and that all TEST-module reads (which CAN stay direct if in a `#[cfg(test)]` child
-   of the defining module, but must use the accessor if in another module's tests) compile.
-3. The `reconcile.rs` merge keeps its `!= tree` guard (now `blocks() != &tree`) so the
+2. Re-grep EXHAUSTIVELY for every out-of-module reference (production AND sibling-`#[cfg(test)]`)
+   to `.document.blocks`, `document.blocks_generation`, `.folds.folded`, `.folds.epoch` — both
+   READS (→ accessor) and WRITES (→ `set_blocks`/mutator). In-module refs (incl. the defining
+   module's own `#[cfg(test)]` children — `editor::tests`, `fold::tests`) stay direct. The Blast
+   Radius section lists the known sites; the plan must confirm none are missed (a miss is a
+   build error, but the plan should be complete). Handle the direct test-write sites
+   (`derive.rs:327`, `reconcile.rs:112/170` → `set_blocks`; `app.rs:4748` → a fold mutator).
+3. Any test that asserts a specific `blocks_generation`/`epoch` value AFTER a converted write:
+   `set_blocks` bumps the generation, so adjust the expected value if needed (accessor
+   behavior, not a regression). Confirm none silently changes an assertion's meaning.
+4. The `reconcile.rs` merge keeps its `!= tree` guard (now `blocks() != &tree`) so the
    bump-on-change behavior is byte-identical to today; `derive.rs` parse-phase call is
    unconditional (matches the current unconditional bump).
-4. `active_fold_view` (editor.rs:454) reads `document.blocks_generation` (in-module → direct)
+5. `active_fold_view` (editor.rs:454) reads `document.blocks_generation` (in-module → direct)
    but `folds.epoch` (out-of-module → `.epoch()`) — confirm the mixed access compiles.
