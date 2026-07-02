@@ -48,9 +48,11 @@
 //! Block-tree reconcile runtime (shell): per-buffer store + debounce helper +
 //! the background reparse job dispatch. Mirrors `diagnostics_run.rs`. Gives the
 //! convergence theorem: quiescence ⇒ `document.blocks == full_parse(text)`.
-
-use crate::editor::Editor;
-use crate::jobs::{Executor, Job, JobKind, JobResult, ResultClass};
+//!
+//! NOTE (Task 1): no `use` imports here yet — `ReconcileStore` + `reconcile_due`
+//! reference no external types. Task 3 adds `use crate::editor::Editor;` and
+//! `use crate::jobs::{Executor, Job, JobKind, JobResult, ResultClass};` when it
+//! implements `dispatch_reconcile` (adding them now would be unused → clippy-deny).
 
 /// Debounce before a settled buffer's tree is reconciled to `full_parse`.
 /// ~150 ms — long enough not to fire mid-burst, short enough to feel instant.
@@ -115,6 +117,8 @@ mod tests {
 ```
 
 Initialize it in every `Buffer { … }` construction site (compile errors point to each; `Buffer::from_text` is the main one). `ReconcileStore::default()` is correct as the initial state: `Buffer::from_text` full-parses at construction for version 0, so `blocks_version: 0, maybe_stale: false` matches. Use `reconcile: crate::reconcile::ReconcileStore::default(),`.
+
+**Whole-buffer-replacement paths (Minor, `save.rs:218`/`:259`):** these build a fresh buffer (full-parsed for version 0) then bump `document.version` to a non-zero value. With `blocks_version: 0`, the next `rebuild` would do one redundant full parse (correct, just wasteful — the fresh blocks already match the text). Right after each such version bump, set `<buf>.reconcile.blocks_version = <buf>.document.version;` so the memoization gate skips the redundant reparse.
 
 - [ ] **Step 4: Run + gates + commit**
 
@@ -213,9 +217,14 @@ pub fn rebuild(editor: &mut Editor) {
         let one_behind = version == blocks_version.wrapping_add(1);
         let (new_blocks, stale) = if one_behind {
             if let (Some(old_rope), Some(edit)) = (&maybe_old_rope, &maybe_edit) {
+                // `TextSource` is impl'd for `&Rope`, so `S = &Rope` and the
+                // generic's `&S` needs `&&Rope` (mirror `incremental_update_rope`,
+                // block_tree.rs:521). `old_rope` is already `&Rope` → `&old_rope`;
+                // bind `new_rope` to a ref → `&new_rope_ref`.
+                let new_rope_ref = &new_rope;
                 match crate::panicx::catch(|| {
                     block_tree::incremental_update_instrumented_src(
-                        &editor.active().document.blocks, old_rope, edit, &new_rope,
+                        &editor.active().document.blocks, &old_rope, edit, &new_rope_ref,
                     )
                 }) {
                     Ok(outcome) => {
@@ -225,8 +234,9 @@ pub fn rebuild(editor: &mut Editor) {
                         );
                         (outcome.tree, stale)
                     }
-                    // A parse panic → empty-tree fallback (NOT full_parse) → stale.
-                    Err(_) => (parse_degraded_empty(editor, new_len), true),
+                    // A parse panic → degraded empty-tree fallback (NOT full_parse)
+                    // → stale. Reuse the existing apply_parse_result helper.
+                    Err(msg) => (apply_parse_result(editor, new_len, Err(msg)), true),
                 }
             } else {
                 full_parse_phase(editor, &new_rope, new_len)
@@ -243,29 +253,19 @@ pub fn rebuild(editor: &mut Editor) {
     rebuild_downstream(editor);
 }
 
-/// Full parse for the current rope; returns (tree, stale=false). A panic falls
-/// back to the empty tree (stale=true). Uses the M4-rest degraded-status helper.
+/// Full parse for the current rope; returns (tree, stale). `stale` is true only
+/// on a parse panic (empty-tree fallback); a successful full parse is not stale.
+/// Reuses the existing `apply_parse_result` helper (which sets/clears the degraded
+/// status and returns the empty-tree fallback on Err) — so `apply_parse_result`
+/// and its existing tests are KEPT, not removed.
 fn full_parse_phase(editor: &mut Editor, new_rope: &ropey::Rope, new_len: usize) -> (block_tree::BlockTree, bool) {
-    match crate::panicx::catch(|| block_tree::full_parse_rope(new_rope)) {
-        Ok(tree) => {
-            if editor.parse_degraded { editor.parse_degraded = false; editor.status.clear(); }
-            (tree, false)
-        }
-        Err(_) => (parse_degraded_empty(editor, new_len), true),
-    }
-}
-
-/// Set the degraded status (dedup) and return the empty-tree fallback.
-fn parse_degraded_empty(editor: &mut Editor, new_len: usize) -> block_tree::BlockTree {
-    if !editor.parse_degraded {
-        editor.parse_degraded = true;
-        editor.status = "markdown parse failed — styling may be stale".to_string();
-    }
-    block_tree::empty_tree(new_len)
+    let computed = crate::panicx::catch(|| block_tree::full_parse_rope(new_rope));
+    let stale = computed.is_err();
+    (apply_parse_result(editor, new_len, computed), stale)
 }
 ```
 
-(`apply_parse_result` is now subsumed by `full_parse_phase`/`parse_degraded_empty` — remove it and update its callers, or keep it if other callers exist; the plan-confirm found `rebuild` was its only caller, so remove it.)
+**Keep `apply_parse_result` (derive.rs:189) as-is** — it is reused above and by both the incremental panic branch and existing derive tests. Do NOT remove it.
 
 - [ ] **Step 4: Extract `rebuild_downstream`** — move the fold-reconcile + layout code (the old derive.rs:111–178, everything after the parse) verbatim into:
 
@@ -348,7 +348,7 @@ fn reconcile_converges_a_diverged_tree_to_full_parse() {
     let correct = block_tree::full_parse(&e.active().document.buffer.to_string());
     assert_ne!(e.active().document.blocks, correct, "precondition: tree is diverged");
 
-    let ex = crate::jobs::InlineExecutor::new();
+    let ex = crate::jobs::InlineExecutor::default();
     dispatch_reconcile(&mut e, &ex);
     for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
 
@@ -367,7 +367,7 @@ fn reconcile_discards_when_version_advanced() {
     let planted = block_tree::empty_tree(e.active().document.buffer.len());
     e.active_mut().document.blocks = planted.clone();
 
-    let ex = crate::jobs::InlineExecutor::new();
+    let ex = crate::jobs::InlineExecutor::default();
     dispatch_reconcile(&mut e, &ex); // snapshots the current version
     // an edit lands before the (synchronous, here) merge is applied:
     e.active_mut().document.version += 1;
@@ -378,7 +378,12 @@ fn reconcile_discards_when_version_advanced() {
 }
 ```
 
-- [ ] **Step 4: Implement `dispatch_reconcile`** — `reconcile.rs`:
+- [ ] **Step 4: Implement `dispatch_reconcile`** — first add the imports deferred from Task 1 to the top of `reconcile.rs`:
+```rust
+use crate::editor::Editor;
+use crate::jobs::{Executor, Job, JobKind, JobResult, ResultClass};
+```
+then add:
 
 ```rust
 /// Snapshot the active buffer + dispatch a background full-parse reconcile.
