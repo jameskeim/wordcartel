@@ -64,6 +64,7 @@ pub fn dispatch_reconcile(editor: &mut Editor, ex: &dyn Executor) {
                         if b.document.version == version {
                             if b.document.blocks != tree {
                                 b.document.blocks = tree;
+                                b.document.blocks_generation = b.document.blocks_generation.wrapping_add(1);
                             }
                             b.reconcile.blocks_version = version;
                             b.reconcile.maybe_stale = false;

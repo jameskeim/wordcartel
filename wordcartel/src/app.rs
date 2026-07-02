@@ -464,7 +464,7 @@ pub fn restore_resume(editor: &mut Editor, path: &std::path::Path) {
                     editor.active_mut().document.selection = sel;
                     editor.active_mut().view.scroll = scroll;
                     load_marks_from_entry(editor, entry);
-                    editor.active_mut().folds.folded = entry.folds.iter().copied().collect();
+                    editor.active_mut().folds.replace_folded(entry.folds.iter().copied().collect());
                     let (blocks, buf) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.clone()) };
                     editor.active_mut().folds.reconcile(&blocks, &buf);
                     load_block_from_entry(editor, entry);
@@ -1732,7 +1732,7 @@ pub fn reduce(
         Msg::Input(Event::Resize(w, h)) => {
             for b in editor.buffers.iter_mut() {
                 b.view.area = (w, h);
-                b.view.line_layouts.clear();
+                b.invalidate_layout();
             }
             derive::rebuild(editor);
             crate::nav::ensure_visible(editor);

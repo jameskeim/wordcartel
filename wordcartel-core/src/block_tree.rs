@@ -238,8 +238,12 @@ fn collect_role(block: &Block, byte: usize, best: &mut crate::style::BlockRole) 
             *best = role;
         }
     }
-    // Recurse into children.
-    for child in &block.children {
+    // Children are in document order and non-overlapping, so at most one can
+    // contain `byte`. `partition_point` finds the first child whose span ends
+    // AFTER `byte` in O(log N); we recurse only if it also starts at/before
+    // `byte` (i.e. it actually contains `byte`, not just succeeds it).
+    let idx = block.children.partition_point(|c| c.span.end <= byte);
+    if let Some(child) = block.children.get(idx).filter(|c| c.span.start <= byte) {
         collect_role(child, byte, best);
     }
 }
@@ -1800,5 +1804,74 @@ mod tests {
         // Any byte resolves to the default Paragraph role — no child span to slice.
         assert_eq!(t.role_at(0), crate::style::BlockRole::Paragraph);
         assert_eq!(t.role_at(41), crate::style::BlockRole::Paragraph);
+    }
+
+    // -----------------------------------------------------------------------
+    // F3: role_at binary-search differential + ordering invariant
+    // -----------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    // Reference: the pre-change linear scan. Lives in-module so it can call the
+    // private `kind_to_role`/`role_precedence` without any visibility gymnastics.
+    fn collect_role_linear(block: &Block, byte: usize, best: &mut crate::style::BlockRole) {
+        if !block.span.contains(&byte) { return; }
+        if let Some(role) = kind_to_role(&block.kind) {
+            if role_precedence(&role) < role_precedence(best) { *best = role; }
+        }
+        for child in &block.children { collect_role_linear(child, byte, best); }
+    }
+    fn role_at_linear(t: &BlockTree, byte: usize) -> crate::style::BlockRole {
+        let mut best = crate::style::BlockRole::Paragraph;
+        collect_role_linear(&t.root, byte, &mut best);
+        best
+    }
+    fn assert_ordered_nonoverlapping(b: &Block) {
+        let mut prev_end = 0usize;
+        for c in &b.children {
+            assert!(c.span.start >= prev_end, "siblings ordered + non-overlapping");
+            prev_end = c.span.end.max(prev_end);
+            assert_ordered_nonoverlapping(c);
+        }
+    }
+    fn check_tree(t: &BlockTree, len: usize) {
+        assert_ordered_nonoverlapping(&t.root);
+        for byte in 0..=len {
+            assert_eq!(t.role_at(byte), role_at_linear(t, byte), "role_at divergence @ {byte}");
+        }
+    }
+    // Nested-container markdown snippets — the trees where ordering is least certain.
+    fn doc_strategy() -> impl Strategy<Value = String> {
+        let snippet = prop::sample::select(vec![
+            "# H1\n", "## H2\n", "Setext\n===\n",
+            "- a\n- b\n", "- outer\n  - inner\n", "1. one\n2. two\n",
+            "> quote\n> - qlist\n", "```\ncode\n```\n",
+            "para one two\n", "\n", "text\n",
+        ]);
+        prop::collection::vec(snippet, 0..10).prop_map(|v| v.concat())
+    }
+
+    proptest! {
+        #[test]
+        fn role_at_binary_matches_linear(
+            text in doc_strategy(),
+            inserts in prop::collection::vec(("[a-z#>` \\-\n]{1,4}", 0usize..300), 0..4),
+        ) {
+            let mut cur = text;
+            let mut tree = full_parse(&cur);
+            check_tree(&tree, cur.len());
+            // Incremental chain: apply a few inserts, checking the SPLICED tree each step.
+            for (s, raw) in inserts {
+                let mut pos = raw % (cur.len() + 1);
+                while pos < cur.len() && !cur.is_char_boundary(pos) { pos += 1; }
+                let mut next = String::with_capacity(cur.len() + s.len());
+                next.push_str(&cur[..pos]); next.push_str(&s); next.push_str(&cur[pos..]);
+                let edit = Edit { range: pos..pos, new_len: s.len() };
+                let (old_ref, new_ref): (&str, &str) = (&cur, &next);
+                tree = incremental_update_src(&tree, &old_ref, &edit, &new_ref);
+                check_tree(&tree, next.len());
+                cur = next;
+            }
+        }
     }
 }

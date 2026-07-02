@@ -127,10 +127,10 @@ pub fn screen_pos(editor: &Editor) -> Option<(u16, u16)> {
 // Fold-view helper
 // ---------------------------------------------------------------------------
 
-/// Compute the `FoldView` for the active buffer. Used by fold-aware motion functions.
-fn fold_view(editor: &Editor) -> crate::fold::FoldView {
-    let b = editor.active();
-    crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer)
+/// The shared cached `FoldView` for the active buffer. Used by fold-aware motion
+/// functions; callers use it through `Rc` `Deref` (unchanged).
+fn fold_view(editor: &Editor) -> std::rc::Rc<crate::fold::FoldView> {
+    editor.active_fold_view()
 }
 
 // ---------------------------------------------------------------------------
