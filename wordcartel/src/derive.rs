@@ -705,13 +705,12 @@ mod tests {
             }};
         }
 
-        // scroll: advance first_line by changing view.scroll + invalidating key
+        // scroll: advance first_line by changing view.scroll
         check_reruns!(
             "scroll",
             Editor::new_from_text(doc, None, (80, 4)),
             |e: &mut Editor| {
                 e.active_mut().view.scroll = 2;
-                e.active_mut().layout_key = None; // force key mismatch
             }
         );
 
@@ -721,7 +720,6 @@ mod tests {
             Editor::new_from_text(doc, None, (80, 24)),
             |e: &mut Editor| {
                 e.active_mut().view.area = (80, 12);
-                e.active_mut().layout_key = None;
             }
         );
 
@@ -731,7 +729,6 @@ mod tests {
             Editor::new_from_text(doc, None, (80, 24)),
             |e: &mut Editor| {
                 e.active_mut().view.area = (40, 24);
-                e.active_mut().layout_key = None;
             }
         );
 
@@ -743,7 +740,6 @@ mod tests {
                 // "line0\n" is 6 bytes; byte 6 is start of "line1"
                 e.active_mut().document.selection =
                     wordcartel_core::selection::Selection::single(6);
-                e.active_mut().layout_key = None;
             }
         );
 
@@ -753,7 +749,6 @@ mod tests {
             Editor::new_from_text(doc, None, (80, 24)),
             |e: &mut Editor| {
                 e.active_mut().view.mode = crate::editor::RenderMode::SourceHighlighted;
-                e.active_mut().layout_key = None;
             }
         );
 
