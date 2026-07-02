@@ -1,6 +1,6 @@
 # Valid-by-construction cache-key fields (footguns) — design
 
-**Status:** spec-review round 4 folded (Fable5: residual-vector + save.rs whole-struct->replace_folded + transform.rs:90 + grep recipe); re-verify pending
+**Status:** spec-review CLEAN (Codex GO x4 + Fable5 folded); ready for user review
 **Date:** 2026-07-02
 **Effort:** footguns (valid-by-construction; the first of two — F1 is a later, separate effort)
 
