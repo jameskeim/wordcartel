@@ -215,6 +215,16 @@ fn apply_panic(buffer_id: crate::editor::BufferId, version: u64, kind: crate::jo
             if let Some(b) = editor.by_id_mut(buffer_id) { b.swap_in_flight = false; }
             editor.status = format!("swap failed (internal error: {msg})");
         }
+        JobKind::Reparse => {
+            // A panicked reconcile (upstream pulldown-cmark residual) is deterministic
+            // for this text — clear maybe_stale so we do NOT re-arm and retry every
+            // debounce interval. The next edit re-sets maybe_stale via derive::rebuild,
+            // giving exactly one reconcile attempt per edit.
+            if let Some(b) = editor.by_id_mut(buffer_id) {
+                b.reconcile.in_flight_version = None;
+                b.reconcile.maybe_stale = false;
+            }
+        }
         #[cfg(test)]
         JobKind::CoalesceProbe => { editor.status = format!("job failed (internal error: {msg})"); }
     }
@@ -1765,6 +1775,10 @@ pub fn reduce(
                 let diag_cfg = editor.diag_cfg.clone();
                 crate::diagnostics_run::dispatch_diagnostics(editor, &diag_cfg, ignore_words, msg_tx.clone());
             }
+            // Dispatch a block-tree reconcile if due.
+            if crate::reconcile::reconcile_due(&editor.active().reconcile, now) {
+                crate::reconcile::dispatch_reconcile(editor, ex);
+            }
         }
         Msg::ClipboardPaste { buffer_id, text, .. } => apply_clipboard_paste(editor, buffer_id, text, clock),
         Msg::ClipboardAvailability(ok) => apply_clipboard_availability(editor, ok),
@@ -2106,11 +2120,17 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         } else {
             None
         };
+        let reconcile_deadline = if editor.active().reconcile.in_flight_version.is_none() {
+            editor.active().reconcile.due_at
+        } else {
+            None
+        };
         let deadline = crate::diagnostics_run::next_deadline(&[
             swap_deadline,
             sq_deadline,
             sb_deadline,
             diag_deadline,
+            reconcile_deadline,
         ]);
         let timeout = deadline
             .map(|d| std::time::Duration::from_millis(d.saturating_sub(now)))
@@ -2134,6 +2154,19 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         // text_width) before render consumes it.  render has no on-demand fallback
         // (render.rs:132-140), so a stale cache blanks the editing rows.
         derive::rebuild(&mut editor);
+        // Arm the reconcile debounce when the tree is (possibly) stale. Re-arm only
+        // when the version advanced since the last arm (so idle Ticks don't push the
+        // deadline forever); arm-from-None also covers a switch to a stale buffer.
+        {
+            let now = clock.now_ms();
+            let b = editor.active_mut();
+            if b.reconcile.maybe_stale && b.reconcile.in_flight_version.is_none()
+                && (b.reconcile.due_at.is_none() || b.reconcile.armed_for_version != b.document.version)
+            {
+                b.reconcile.due_at = Some(now.saturating_add(crate::reconcile::RECONCILE_DEBOUNCE_MS));
+                b.reconcile.armed_for_version = b.document.version;
+            }
+        }
         guard.terminal().draw(|f| render::render(f, &mut editor))?;
         // Persist session state when a save just completed (saved_version advanced).
         let sv = editor.active().document.saved_version;
@@ -4950,5 +4983,30 @@ mod tests {
         .join()
         .unwrap();
         assert!(matches!(rx.recv().unwrap(), Msg::InputThreadDied));
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 4: reconcile arm logic unit test
+    // -----------------------------------------------------------------------
+
+    /// The arm block (post-rebuild) sets `due_at` once and does not push the
+    /// deadline on idle Ticks; a new edit (version bump) re-arms the debounce.
+    #[test]
+    fn reconcile_arm_sets_due_once_and_debounces_on_new_edit() {
+        // Simulate the post-rebuild arm block against a ReconcileStore directly.
+        let mut s = crate::reconcile::ReconcileStore { maybe_stale: true, ..Default::default() };
+        let arm = |s: &mut crate::reconcile::ReconcileStore, now: u64, version: u64| {
+            if s.maybe_stale && s.in_flight_version.is_none()
+                && (s.due_at.is_none() || s.armed_for_version != version) {
+                s.due_at = Some(now + crate::reconcile::RECONCILE_DEBOUNCE_MS);
+                s.armed_for_version = version;
+            }
+        };
+        arm(&mut s, 1000, 5);
+        assert_eq!(s.due_at, Some(1000 + crate::reconcile::RECONCILE_DEBOUNCE_MS));
+        arm(&mut s, 1050, 5); // idle Tick, same version → no push
+        assert_eq!(s.due_at, Some(1000 + crate::reconcile::RECONCILE_DEBOUNCE_MS));
+        arm(&mut s, 1100, 6); // new edit → re-debounce
+        assert_eq!(s.due_at, Some(1100 + crate::reconcile::RECONCILE_DEBOUNCE_MS));
     }
 }

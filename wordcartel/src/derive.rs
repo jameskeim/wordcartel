@@ -68,11 +68,18 @@ pub fn line_text(buf: &TextBuffer, line: usize) -> String {
 ///
 /// This is the O(visible)+O(edited) derive step described in Effort 4a Task 3.
 ///
-/// # Block tree
-/// If `editor.last_edit` and `editor.pre_edit_rope` are both `Some` (set by
-/// `apply`), we use the O(region) incremental reparse.  Otherwise (initial
-/// load, undo, redo) we fall back to a full parse.  Either way, we clear
-/// `last_edit` and `pre_edit_rope` before returning so they are not reused.
+/// # Block tree (version-memoized)
+/// The parse phase runs ONLY when `document.version != reconcile.blocks_version`
+/// — i.e. the text changed since the tree was built. When it runs we take an
+/// incremental reparse iff the tree is exactly one version behind AND
+/// `last_edit`/`pre_edit_rope` are both `Some` (a single edit bridging the gap,
+/// set by `apply`); any other case (undo/redo cleared them, a multi-version gap)
+/// falls back to a full parse. When a parse runs it clears `last_edit` and
+/// `pre_edit_rope` (via `.take()`) so they are not reused, records the new
+/// `blocks_version`, and sets `maybe_stale` (true for an incremental
+/// `Local`/`WidenToEnd` result or a parse panic; false for a clean full parse).
+/// When the version is unchanged the parse phase — and thus the `.take()` — is
+/// skipped entirely; only the downstream phase reruns.
 ///
 /// # Visible range + layout cache
 /// We walk logical lines starting at `view.scroll`, accumulating the visual-row
@@ -80,34 +87,74 @@ pub fn line_text(buf: &TextBuffer, line: usize) -> String {
 /// height (+1 row of overscan).  For each visible logical line we call
 /// `layout::layout` and store the result in `view.line_layouts`.
 pub fn rebuild(editor: &mut Editor) {
-    // ------------------------------------------------------------------
-    // 1. Block tree (incremental or full)
-    // ------------------------------------------------------------------
-    let new_rope = editor.active().document.buffer.snapshot(); // O(1) ropey clone
+    let version = editor.active().document.version;
+    let blocks_version = editor.active().reconcile.blocks_version;
 
-    // Take the option values out so we can clear them unconditionally after.
-    let maybe_old_rope = editor.active_mut().pre_edit_rope.take();
-    let maybe_edit = editor.active_mut().last_edit.take();
+    // Parse phase: only when the text actually changed since the tree was built.
+    if version != blocks_version {
+        let new_rope = editor.active().document.buffer.snapshot(); // O(1) ropey clone
+        let new_len = new_rope.len_bytes();
+        let maybe_old_rope = editor.active_mut().pre_edit_rope.take();
+        let maybe_edit = editor.active_mut().last_edit.take();
 
-    let new_len = new_rope.len_bytes();
-    // Guard the parse: an upstream pulldown-cmark panic must not crash the app.
-    // The closure borrows the editor immutably (old blocks) + the taken locals;
-    // panicx::catch returns an owned Result, releasing the borrow before we
-    // mutate the editor below. The main-thread caught-panic guard (panicx) keeps
-    // the panic hook from tearing down the terminal.
-    let computed = crate::panicx::catch(|| match (&maybe_old_rope, &maybe_edit) {
-        (Some(old_rope), Some(edit)) => block_tree::incremental_update_rope(
-            &editor.active().document.blocks,
-            old_rope,
-            edit,
-            &new_rope,
-        ),
-        _ => block_tree::full_parse_rope(&new_rope),
-    });
-    let new_blocks = apply_parse_result(editor, new_len, computed);
-    editor.active_mut().document.blocks = new_blocks;
-    // last_edit and pre_edit_rope were already cleared by .take() above.
+        // Incremental ONLY when the tree is exactly one version behind AND the
+        // pending edit bridges that gap (a single edit since the last parse).
+        // Any gap (undo/redo clear the edit info; multi-edit-before-rebuild) →
+        // a safe full parse.
+        let one_behind = version == blocks_version.wrapping_add(1);
+        let (new_blocks, stale) = if one_behind {
+            if let (Some(old_rope), Some(edit)) = (&maybe_old_rope, &maybe_edit) {
+                // `TextSource` is impl'd for `&Rope`, so `S = &Rope` and the
+                // generic's `&S` needs `&&Rope` (mirror `incremental_update_rope`,
+                // block_tree.rs:521). `old_rope` is already `&Rope` → `&old_rope`;
+                // bind `new_rope` to a ref → `&new_rope_ref`.
+                let new_rope_ref = &new_rope;
+                match crate::panicx::catch(|| {
+                    block_tree::incremental_update_instrumented_src(
+                        &editor.active().document.blocks, &old_rope, edit, &new_rope_ref,
+                    )
+                }) {
+                    Ok(outcome) => {
+                        let stale = matches!(
+                            outcome.reason,
+                            block_tree::WidenReason::Local | block_tree::WidenReason::WidenToEnd
+                        );
+                        (outcome.tree, stale)
+                    }
+                    // A parse panic → degraded empty-tree fallback (NOT full_parse)
+                    // → stale. Reuse the existing apply_parse_result helper.
+                    Err(msg) => (apply_parse_result(editor, new_len, Err(msg)), true),
+                }
+            } else {
+                full_parse_phase(editor, &new_rope, new_len)
+            }
+        } else {
+            full_parse_phase(editor, &new_rope, new_len)
+        };
 
+        editor.active_mut().document.blocks = new_blocks;
+        editor.active_mut().reconcile.blocks_version = version;
+        editor.active_mut().reconcile.maybe_stale = stale;
+    }
+
+    rebuild_downstream(editor);
+}
+
+/// Full parse for the current rope; returns `(tree, stale)`. `stale` is true only
+/// on a parse panic (empty-tree fallback); a successful full parse is not stale.
+/// Reuses the existing `apply_parse_result` helper (which sets/clears the degraded
+/// status and returns the empty-tree fallback on `Err`) — so `apply_parse_result`
+/// and its existing tests are KEPT, not removed.
+fn full_parse_phase(editor: &mut Editor, new_rope: &ropey::Rope, new_len: usize) -> (block_tree::BlockTree, bool) {
+    let computed = crate::panicx::catch(|| block_tree::full_parse_rope(new_rope));
+    let stale = computed.is_err();
+    (apply_parse_result(editor, new_len, computed), stale)
+}
+
+/// The downstream-of-tree phase: reconcile fold anchors + build the `FoldView` +
+/// refresh the visible-line layout cache from the CURRENT `document.blocks`.
+/// Runs every draw and does NOT reparse; also called by the reconcile merge.
+pub(crate) fn rebuild_downstream(editor: &mut Editor) {
     // ------------------------------------------------------------------
     // 5g: Reconcile fold anchors against the fresh block tree, then build
     // a FoldView for the visible-line walk below.
@@ -218,6 +265,61 @@ mod tests {
     use super::*;
     use crate::editor::Editor;
     use wordcartel_core::style::BlockRole;
+
+    // ------------------------------------------------------------------
+    // Task 2: version-memoized two-phase rebuild
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn rebuild_skips_reparse_when_version_unchanged() {
+        use wordcartel_core::block_tree;
+        let mut e = crate::editor::Editor::new_from_text("# H\n\nbody\n", None, (80, 24));
+        // After construction, blocks_version tracks version 0.
+        e.active_mut().reconcile.blocks_version = e.active().document.version;
+        // Plant a sentinel tree that differs from full_parse, with NO pending edit.
+        let sentinel = block_tree::empty_tree(e.active().document.buffer.len());
+        e.active_mut().document.blocks = sentinel.clone();
+        e.active_mut().pre_edit_rope = None;
+        e.active_mut().last_edit = None;
+        crate::derive::rebuild(&mut e);
+        // version == blocks_version → parse phase skipped → sentinel survives.
+        assert_eq!(e.active().document.blocks, sentinel, "non-edit rebuild must not reparse");
+    }
+
+    #[test]
+    fn rebuild_reparses_and_sets_stale_on_incremental_edit() {
+        use wordcartel_core::block_tree;
+        let mut e = crate::editor::Editor::new_from_text("hello\n", None, (80, 24));
+        e.active_mut().reconcile.blocks_version = e.active().document.version;
+        e.active_mut().reconcile.maybe_stale = false;
+        // an ordinary insert (routes through Buffer::apply → sets pre_edit_rope/last_edit, bumps version)
+        let doc_len = e.active().document.buffer.len();
+        let (cs, edit) = crate::commands::build_multi_replace(&[(0, 0, "X".into())], doc_len);
+        let txn = wordcartel_core::history::Transaction::new(cs);
+        struct C; impl wordcartel_core::history::Clock for C { fn now_ms(&self) -> u64 { 0 } }
+        e.active_mut().apply(txn, edit, wordcartel_core::history::EditKind::Other, &C);
+        crate::derive::rebuild(&mut e);
+        assert_eq!(e.active().reconcile.blocks_version, e.active().document.version);
+        // a plain in-paragraph insert is Local → maybe_stale set
+        assert!(e.active().reconcile.maybe_stale, "incremental Local/WidenToEnd → maybe_stale");
+        assert_eq!(e.active().document.blocks, block_tree::full_parse(&e.active().document.buffer.to_string()));
+    }
+
+    #[test]
+    fn rebuild_full_parses_and_clears_stale_on_undo() {
+        let mut e = crate::editor::Editor::new_from_text("abc\n", None, (80, 24));
+        let doc_len = e.active().document.buffer.len();
+        let (cs, edit) = crate::commands::build_multi_replace(&[(0, 0, "Z".into())], doc_len);
+        let txn = wordcartel_core::history::Transaction::new(cs);
+        struct C; impl wordcartel_core::history::Clock for C { fn now_ms(&self) -> u64 { 0 } }
+        e.active_mut().apply(txn, edit, wordcartel_core::history::EditKind::Other, &C);
+        crate::derive::rebuild(&mut e);
+        e.active_mut().undo(); // bumps version, clears pre_edit_rope/last_edit
+        e.active_mut().reconcile.maybe_stale = true; // pretend stale before undo's rebuild
+        crate::derive::rebuild(&mut e);
+        assert!(!e.active().reconcile.maybe_stale, "undo → full parse → maybe_stale cleared");
+        assert_eq!(e.active().reconcile.blocks_version, e.active().document.version);
+    }
 
     // ------------------------------------------------------------------
     // Brief's failing tests (write RED first, then implement GREEN)
@@ -376,14 +478,17 @@ mod tests {
 
     #[test]
     fn rebuild_clears_pre_edit_rope_and_last_edit() {
-        // After any rebuild call the two option fields must be None.
+        // A rebuild that actually parses must consume (clear) the two option fields.
         let mut e = Editor::new_from_text("hello\n", None, (80, 24));
-        // Manually set them to Some to simulate a post-apply state.
+        // Simulate a post-apply state: `apply` sets these fields AND bumps version,
+        // so the parse phase (version != blocks_version) runs and takes them. Bump
+        // the version to keep this simulation faithful to the real edit path.
         e.active_mut().pre_edit_rope = Some(e.active().document.buffer.snapshot());
         e.active_mut().last_edit = Some(wordcartel_core::block_tree::Edit { range: 0..0, new_len: 0 });
+        e.active_mut().document.version += 1;
         rebuild(&mut e);
-        assert!(e.active().pre_edit_rope.is_none(), "pre_edit_rope should be cleared after rebuild");
-        assert!(e.active().last_edit.is_none(), "last_edit should be cleared after rebuild");
+        assert!(e.active().pre_edit_rope.is_none(), "pre_edit_rope should be cleared after a parsing rebuild");
+        assert!(e.active().last_edit.is_none(), "last_edit should be cleared after a parsing rebuild");
     }
 
     // ------------------------------------------------------------------
