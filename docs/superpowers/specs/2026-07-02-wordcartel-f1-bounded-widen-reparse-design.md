@@ -1,6 +1,6 @@
 # F1: bound the synchronous WidenToEnd reparse — design
 
-**Status:** Fable5 folded + Codex fold-verify corrections (I2 reason=NoOverlapFull, I4 +2 sites); re-verify pending
+**Status:** spec-review CLEAN (Codex x6 + Fable5 folded); ready for user review + planning
 **Date:** 2026-07-02
 **Effort:** F1 (responsiveness follow-up; the second of the two deferred from editing-responsiveness — F8 was assessed and shelved: its "bound layout to visible rows" premise is unsafe because `ColMap` consumers need the whole logical line)
 
