@@ -98,7 +98,8 @@ pub fn line_text(buf: &TextBuffer, line: usize) -> String {
 /// falls back to a full parse. When a parse runs it clears `last_edit` and
 /// `pre_edit_rope` (via `.take()`) so they are not reused, records the new
 /// `blocks_version`, and sets `maybe_stale` (true for an incremental
-/// `Local`/`WidenToEnd` result or a parse panic; false for a clean full parse).
+/// `Local`/`WidenToEnd`/`BoundedStale` result or a parse panic; false for a
+/// clean full parse).
 /// When the version is unchanged the parse phase — and thus the `.take()` — is
 /// skipped entirely; only the downstream phase reruns.
 ///
@@ -138,7 +139,9 @@ pub fn rebuild(editor: &mut Editor) {
                     Ok(outcome) => {
                         let stale = matches!(
                             outcome.reason,
-                            block_tree::WidenReason::Local | block_tree::WidenReason::WidenToEnd
+                            block_tree::WidenReason::Local
+                                | block_tree::WidenReason::WidenToEnd
+                                | block_tree::WidenReason::BoundedStale
                         );
                         (outcome.tree, stale)
                     }

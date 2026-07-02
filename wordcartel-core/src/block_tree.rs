@@ -482,6 +482,11 @@ pub enum WidenReason {
     NoOverlapFull,
     /// A hard trigger forced reparsing to end-of-document.
     WidenToEnd,
+    /// The widen EXTENSION to EOF would exceed `MAX_SYNC_WIDEN_BYTES` while the base
+    /// local region is small (Case A). Reparsed only the base local region and left the
+    /// container-wide effect (loose/tight, absorb-to-EOF) STALE; `derive` marks it
+    /// `maybe_stale` and the debounced reconcile converges it to `full_parse` at rest.
+    BoundedStale,
 }
 
 /// Result + instrumentation.
@@ -491,6 +496,13 @@ pub struct UpdateOutcome {
     /// Number of bytes actually reparsed (the slice length).
     pub reparsed_bytes: usize,
 }
+
+/// Synchronous-reparse ceiling for the widen path (F1). When a widen's speculative
+/// extension to end-of-document would exceed this many bytes but the base local region
+/// is smaller, the reparse is bounded to the base region and tagged `BoundedStale`
+/// (the container-wide effect is deferred to the reconcile). A named tunable — validate
+/// the real per-MiB `parse_region` cost and lower if a bounded parse exceeds a frame.
+pub const MAX_SYNC_WIDEN_BYTES: usize = 1 << 20; // 1 MiB
 
 /// Incrementally update `old_tree` for `edit`, producing the new tree.
 /// `&str` wrapper — unchanged public signature; existing callers and the oracle
@@ -539,6 +551,58 @@ pub fn incremental_update_src<S: TextSource>(
     new_src: &S,
 ) -> BlockTree {
     incremental_update_instrumented_src(old_tree, old_src, edit, new_src).tree
+}
+
+/// The Local-path region extension: `+1` slack block, plus (for gap edits) the upstream
+/// blank-delimited-group pull-back. Mutates the candidate region `[start, end)` in place.
+/// Extracted from the `else` branch of the widen decision so the F1 copy-prediction can
+/// apply the SAME rule to a copy.
+fn apply_local_slack<S: TextSource>(
+    tops: &[Block],
+    old_src: &S,
+    start: &mut usize,
+    end: &mut usize,
+    slack_pos: Option<usize>,
+    have_overlap: bool,
+) {
+    if let Some(slack_idx) = slack_pos {
+        if slack_idx + 1 < tops.len() {
+            *end = tops[slack_idx + 1].span.start;
+        } else {
+            *end = old_src.len();
+        }
+    }
+    if !have_overlap {
+        if let Some(b) = tops.iter().rev().find(|b| b.span.end <= *start) {
+            *start = blank_delimited_group_start(old_src, old_src.line_start(b.span.start));
+        }
+    }
+}
+
+/// Straddle repair + trailing-gap coverage on `[start, end)`. Shared by every path;
+/// idempotent (a region already repaired grows no further). Extracted from the code
+/// after the widen decision.
+fn repair_region<S: TextSource>(tops: &[Block], old_src: &S, start: &mut usize, end: &mut usize) {
+    loop {
+        let mut grew = false;
+        for b in tops.iter() {
+            if b.span.start < *start && b.span.end > *start {
+                *start = old_src.line_start(b.span.start);
+                grew = true;
+            }
+            if b.span.start < *end && b.span.end > *end {
+                *end = old_src.line_end(b.span.end);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    let has_after_block = tops.iter().any(|b| b.span.start >= *end && b.span.end > *end);
+    if !has_after_block && *end < old_src.len() {
+        *end = old_src.len();
+    }
 }
 
 /// Generic `incremental_update_instrumented` over any `TextSource`.
@@ -770,99 +834,45 @@ pub fn incremental_update_instrumented_src<S: TextSource>(
         || needs_widen_to_end(old_src, new_src, edit, region_old_start, region_old_end);
     let mut reason;
     if widen {
-        region_old_end = old_src.len();
-        reason = WidenReason::WidenToEnd;
+        // F1: predict the base local region on COPIES (what the Local path would produce),
+        // then bound the widen only when the EXTENSION is the expense (Case A). The copies
+        // apply the same slack/pull-back + straddle/trailing-gap the Local path would; fm_floor
+        // is deliberately NOT applied to the copies, and widen_span uses the un-floored
+        // region_old_start — both conservative: they can only OVER-count (choose BoundedStale
+        // where a floored WidenToEnd would have been ≤ cap), never under-count. A BoundedStale
+        // that "should" have been a cheap WidenToEnd is still correct (valid tree, converged at
+        // rest), so this is safe; do not "fix" it by flooring the copies.
+        let mut base_start = region_old_start;
+        let mut base_end = region_old_end;
+        apply_local_slack(tops, old_src, &mut base_start, &mut base_end, slack_pos, have_overlap);
+        repair_region(tops, old_src, &mut base_start, &mut base_end);
+        // Size in NEW-text bytes — `reparsed_bytes` is `new_region.len()` AFTER `delta` (Codex):
+        // an insertion can push the actual reparse over the cap even when the old base fits.
+        let base_new_end = (base_end as isize + delta) as usize;
+        let base_region_size = base_new_end.saturating_sub(base_start);
+        let widen_span = new_src.len().saturating_sub(region_old_start);
+        if widen_span <= MAX_SYNC_WIDEN_BYTES {
+            // cheap extension → widen fully, exactly as today
+            region_old_end = old_src.len();
+            reason = WidenReason::WidenToEnd;
+        } else if base_region_size <= MAX_SYNC_WIDEN_BYTES {
+            // Case A: expensive extension, small base → install the copied base bounds, defer
+            region_old_start = base_start;
+            region_old_end = base_end;
+            reason = WidenReason::BoundedStale;
+        } else {
+            // Case B: the base local region itself exceeds the cap → widen as today
+            region_old_end = old_src.len();
+            reason = WidenReason::WidenToEnd;
+        }
     } else {
-        // +1 top-level block of slack: extend region_old_end to cover the
-        // first block at or after the current region end (the "slack" block),
-        // plus all gap bytes between that block and the NEXT block.
-        //
-        // Why include the gap bytes? A block's pulldown span can extend into
-        // trailing blank lines that logically "belong" to it (e.g. the blank
-        // lines terminating a loose list). Those blank lines are gap bytes
-        // between the slack block's span.end and the next block's span.start.
-        // If the region stops at line_end(slack_block.span.end), those blank
-        // lines end up neither in the reparse nor in any shifted "after" block,
-        // corrupting the splice.
-        //
-        // Fix: set region_old_end to the span.start of the block AFTER the
-        // slack block (the first true "after" block), so all gap bytes between
-        // the slack block and the next "after" block are inside the region.
-        // If there's no block after the slack, extend to old_src.len().
-        //
-        // This is needed in two cases:
-        // (a) The edit overlapped at least one block (have_overlap=true): the
-        //     block immediately after the region may be affected by context
-        //     changes at the region boundary (setext underlines, lazy
-        //     continuation, etc.).
-        // (b) The edit was entirely in a gap between blocks (have_overlap=false):
-        //     inserting content into the gap can collapse it so that the
-        //     following block merges with the new content — it must be reparsed
-        //     rather than merely shifted.
-        if let Some(slack_idx) = slack_pos {
-            // Extend to the start of the block after the slack block, so that
-            // all gap bytes between the slack block and the next "after" block
-            // are inside the region.
-            if slack_idx + 1 < tops.len() {
-                region_old_end = tops[slack_idx + 1].span.start;
-            } else {
-                // No block after the slack block — include all trailing bytes.
-                region_old_end = old_src.len();
-            }
-        }
-        // When editing in a gap, also include the last block before the region
-        // start: upstream context (e.g. a paragraph immediately before the gap)
-        // may change how the gap and following content parse. Re-apply the
-        // blank-delimited group walk to the pulled-back start: the preceding block
-        // can itself sit in a line group whose head is an unblocked construct (a
-        // link-reference def emits NO block, so `line_start(b.span.start)` lands
-        // BELOW it). Reparsing the block's line in isolation, without that upstream
-        // context, can flip its kind (e.g. a `*` line parses as a List on its own
-        // but stays a Paragraph under a ref-def line) — so widen to the whole group.
-        if !have_overlap {
-            if let Some(b) = tops.iter().rev().find(|b| b.span.end <= region_old_start) {
-                region_old_start = blank_delimited_group_start(old_src, old_src.line_start(b.span.start));
-            }
-        }
+        // +1 slack block + (gap-edit) upstream pull-back — see `apply_local_slack`.
+        apply_local_slack(tops, old_src, &mut region_old_start, &mut region_old_end, slack_pos, have_overlap);
         reason = WidenReason::Local;
     }
 
-    // INVARIANT REPAIR: top-level block spans do not tile the document (there
-    // are gaps for indented-code leading whitespace, ref-def lines, trailing
-    // whitespace). The splice classifies each old block as strictly-before,
-    // strictly-after, or replaced-by-reparse. A block that *straddles* a region
-    // boundary would be silently dropped. So grow the region until every block
-    // is cleanly before/after it.
-    loop {
-        let mut grew = false;
-        for b in tops.iter() {
-            // straddles start?
-            if b.span.start < region_old_start && b.span.end > region_old_start {
-                region_old_start = old_src.line_start(b.span.start);
-                grew = true;
-            }
-            // straddles end?
-            if b.span.start < region_old_end && b.span.end > region_old_end {
-                region_old_end = old_src.line_end(b.span.end);
-                grew = true;
-            }
-        }
-        if !grew {
-            break;
-        }
-    }
-
-    // GAP-BYTE COVERAGE: top-level block spans do not tile the document —
-    // trailing gap bytes (beyond the last block) belong to no block and are
-    // neither included in the reparse region nor captured by a shifted "after"
-    // block. If there are no "after" blocks (no block with span.start >=
-    // region_old_end), those trailing bytes disappear from the splice result.
-    // Extend region_old_end to old_src.len() so they are included in the
-    // reparse when necessary.
-    let has_after_block = tops.iter().any(|b| b.span.start >= region_old_end && b.span.end > region_old_end);
-    if !has_after_block && region_old_end < old_src.len() {
-        region_old_end = old_src.len();
-    }
+    // Straddle repair + trailing-gap coverage — see `repair_region`.
+    repair_region(tops, old_src, &mut region_old_start, &mut region_old_end);
 
     // Gap 3: machine-check the trailing-gap bound. `region_old_end` is now
     // final; verify it never exceeds the document length before we use it to
@@ -920,11 +930,20 @@ pub fn incremental_update_instrumented_src<S: TextSource>(
             ) && last.span.end >= region_new_end
         });
         if tail_absorptive {
-            region_old_end = old_src.len();
-            region_new_end = (region_old_end as isize + delta) as usize;
-            new_region = new_src.slice(region_new_start..region_new_end);
-            reparsed = parse_region(&new_region.as_ref(), 0..new_region.len(), region_new_start);
-            reason = WidenReason::WidenToEnd;
+            // F1: gate the second widen the same three-way way as the first.
+            let widen_span = new_src.len().saturating_sub(region_new_start);
+            let base_new_size = region_new_end.saturating_sub(region_new_start);
+            if widen_span <= MAX_SYNC_WIDEN_BYTES || base_new_size > MAX_SYNC_WIDEN_BYTES {
+                // cheap extension, or Case B (base already > cap) → extend to EOF, as today
+                region_old_end = old_src.len();
+                region_new_end = (region_old_end as isize + delta) as usize;
+                new_region = new_src.slice(region_new_start..region_new_end);
+                reparsed = parse_region(&new_region.as_ref(), 0..new_region.len(), region_new_start);
+                reason = WidenReason::WidenToEnd;
+            } else {
+                // Case A: keep the already-parsed base region (no second parse), defer.
+                reason = WidenReason::BoundedStale;
+            }
         }
     }
     let reparsed_bytes = new_region.len();
@@ -1280,7 +1299,10 @@ pub fn apply_edit(old_text: &str, range: Range<usize>, replacement: &str) -> (St
 #[cfg(any(test, fuzzing))]
 pub fn incremental_equals_full(old: &str, range: std::ops::Range<usize>, repl: &str) -> bool {
     let (new, edit) = apply_edit(old, range, repl);
-    incremental_update(&full_parse(old), old, &edit, &new) == full_parse(&new)
+    let outcome = incremental_update_instrumented(&full_parse(old), old, &edit, &new);
+    // BoundedStale is deliberately != full_parse (converged later by reconcile); it is NOT a
+    // divergence bug, so the oracle treats it as a pass.
+    outcome.reason == WidenReason::BoundedStale || outcome.tree == full_parse(&new)
 }
 
 #[cfg(test)]
@@ -1290,6 +1312,104 @@ mod tests {
     fn kinds(t: &BlockTree) -> Vec<BlockKind> {
         // BlockKind is Clone (not Copy) in the spike — clone, don't move out of &Block.
         t.top_level().iter().map(|b| b.kind.clone()).collect()
+    }
+
+    /// Lightweight, linear structural-validity walk (M1: `check_tree` at block_tree.rs:1837
+    /// is quadratic via its per-byte `role_at`; this is O(nodes)). Root spans the whole doc;
+    /// child spans are ordered + non-overlapping AND contained within their parent at every
+    /// level (gaps between blocks allowed — children do not tile).
+    fn assert_valid_tree(t: &BlockTree, new_len: usize) {
+        assert_eq!(t.root.span, 0..new_len, "root must span [0, new_len)");
+        fn walk(parent: &Block) {
+            let mut prev_end = parent.span.start;
+            for c in &parent.children {
+                assert!(c.span.end >= c.span.start, "span well-formed: {:?}", c.span);
+                assert!(c.span.start >= prev_end, "children ordered/non-overlapping: {:?}", c.span);
+                assert!(c.span.end <= parent.span.end, "child {:?} escapes parent {:?}", c.span, parent.span);
+                prev_end = c.span.end;
+                walk(c);
+            }
+        }
+        walk(&t.root);
+    }
+
+    #[test]
+    fn f1_case_a_small_container_widen_is_bounded() {
+        // ~1.56 MiB of paragraphs; the enclosing block of an edit near the top is small,
+        // but inserting an opening fence fires `needs_widen_to_end` → the extension reaches
+        // EOF (> 1 MiB) → BoundedStale (bounded to the small base region).
+        let doc = "para\n\n".repeat(260_000);
+        assert!(doc.len() > MAX_SYNC_WIDEN_BYTES, "doc must exceed the cap");
+        let (new_text, edit) = apply_edit(&doc, 0..0, "```\n");
+        let old_tree = full_parse(&doc);
+        let outcome = incremental_update_instrumented(&old_tree, &doc, &edit, &new_text);
+        assert_eq!(outcome.reason, WidenReason::BoundedStale, "expected a bounded reparse");
+        assert!(outcome.reparsed_bytes <= MAX_SYNC_WIDEN_BYTES,
+            "reparsed {} bytes, cap {}", outcome.reparsed_bytes, MAX_SYNC_WIDEN_BYTES);
+        assert_valid_tree(&outcome.tree, new_text.len());
+        let full = full_parse(&new_text);
+        assert_ne!(outcome.tree, full, "BoundedStale is deliberately stale vs full_parse");
+        // full_parse is the convergence target the reconcile installs.
+        assert_eq!(full.root.span, 0..new_text.len());
+    }
+
+    #[test]
+    fn f1_bounded_stale_absorptive_tail_not_reextended() {
+        // I1-keep: a first-gate BoundedStale whose bounded base region's LAST reparsed block
+        // is an absorptive container (here a List) reaching the base boundary must STAY
+        // BoundedStale in the second-trigger keep-branch — NOT re-extend to EOF. Shape: a small
+        // list near the top of >1 MiB of paragraphs, immediately followed by a heading (so the
+        // list is the bounded region's tail), edited in the paragraph ABOVE the list so the list
+        // is the (absorptive) slack block → widen fires, base is small, extension reaches EOF.
+        let doc = format!("para0\n\n- a\n# h\n{}", "para\n\n".repeat(260_000));
+        assert!(doc.len() > MAX_SYNC_WIDEN_BYTES);
+        let (new_text, edit) = apply_edit(&doc, 0..0, "x");
+        let outcome = incremental_update_instrumented(&full_parse(&doc), &doc, &edit, &new_text);
+        assert_eq!(outcome.reason, WidenReason::BoundedStale, "keep-branch must stay BoundedStale");
+        // reparsed_bytes small proves the second trigger did NOT re-extend the reparse to EOF.
+        assert!(outcome.reparsed_bytes <= MAX_SYNC_WIDEN_BYTES,
+            "reparsed {} bytes, cap {}", outcome.reparsed_bytes, MAX_SYNC_WIDEN_BYTES);
+        assert_valid_tree(&outcome.tree, new_text.len());
+    }
+
+    #[test]
+    fn f1_small_extension_still_widens_fully() {
+        // Small doc: the widen extension is ≤ cap → WidenToEnd, byte-identical to today.
+        let doc = "- a\n- b\n\npara\n";
+        let (new_text, edit) = apply_edit(doc, 0..0, "```\n");
+        let old_tree = full_parse(doc);
+        let outcome = incremental_update_instrumented(&old_tree, doc, &edit, &new_text);
+        assert_ne!(outcome.reason, WidenReason::BoundedStale, "small docs must not bound");
+        assert_eq!(outcome.tree, full_parse(&new_text), "≤cap path stays == full_parse");
+    }
+
+    #[test]
+    fn f1_case_b_single_huge_container_falls_through() {
+        // A single doc-spanning list (> 1 MiB): the BASE local region is already the whole
+        // container → base > cap → falls through to WidenToEnd (never BoundedStale).
+        let doc = "- item\n".repeat(200_000); // ~1.4 MiB, one list
+        assert!(doc.len() > MAX_SYNC_WIDEN_BYTES);
+        let (new_text, edit) = apply_edit(&doc, 7..7, "- x\n"); // edit inside the list near the top
+        let old_tree = full_parse(&doc);
+        let outcome = incremental_update_instrumented(&old_tree, &doc, &edit, &new_text);
+        assert_ne!(outcome.reason, WidenReason::BoundedStale,
+            "a single >cap container is Case B — not bounded");
+    }
+
+    #[test]
+    fn f1_successive_bounded_stale_edits_no_reset() {
+        // Production feeds a BoundedStale tree into the NEXT incremental_update WITHOUT a
+        // reset (unlike the oracle). Two bounded edits in a row must stay panic-free + valid.
+        let doc = "para\n\n".repeat(260_000);
+        let (t1_text, e1) = apply_edit(&doc, 0..0, "```\n");
+        let o1 = incremental_update_instrumented(&full_parse(&doc), &doc, &e1, &t1_text);
+        assert_eq!(o1.reason, WidenReason::BoundedStale);
+        // Second bounded edit, fed the STALE tree o1.tree (no reset):
+        let (t2_text, e2) = apply_edit(&t1_text, 0..0, "```\n");
+        let o2 = incremental_update_instrumented(&o1.tree, &t1_text, &e2, &t2_text);
+        assert_valid_tree(&o2.tree, t2_text.len()); // no panic + valid
+        // Convergence target exists (what reconcile computes):
+        assert_eq!(full_parse(&t2_text).root.span, 0..t2_text.len());
     }
 
     #[test]
@@ -1327,11 +1447,13 @@ mod tests {
         let (new_text, edit) = apply_edit(old_text, range, replacement);
         let outcome = incremental_update_instrumented(&old_tree, old_text, &edit, &new_text);
         let full = full_parse(&new_text);
-        assert_eq!(
-            outcome.tree, full,
-            "\nINCREMENTAL != FULL\nold_text={old_text:?}\nnew_text={new_text:?}\nreason={:?}\nincremental={:#?}\nfull={:#?}",
-            outcome.reason, outcome.tree, full
-        );
+        if outcome.reason != WidenReason::BoundedStale {
+            assert_eq!(
+                outcome.tree, full,
+                "\nINCREMENTAL != FULL\nold_text={old_text:?}\nnew_text={new_text:?}\nreason={:?}\nincremental={:#?}\nfull={:#?}",
+                outcome.reason, outcome.tree, full
+            );
+        }
         outcome
     }
 
