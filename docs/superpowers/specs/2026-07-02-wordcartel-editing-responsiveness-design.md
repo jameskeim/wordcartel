@@ -1,6 +1,6 @@
 # Editing responsiveness: cache the draw-path outline work — design
 
-**Status:** spec-review round 2 folded (Fable5: CRITICAL-1 layout-output invariant + RefCell &self accessor + full nav routing); re-review pending
+**Status:** spec-review round 3 folded (both models: last_reconciled_generation None-sentinel + stale-text + 2 minors); final confirm pending
 **Date:** 2026-07-02
 **Effort:** editing-responsiveness (pre-Effort-P; the safe, always-on per-keystroke wins)
 
@@ -153,13 +153,22 @@ Design:
   the `&Editor` nav call sites.
 - **`reconcile` is a SEPARATE, generation-gated step (not on the FoldView miss path).**
   `FoldView::compute` filters `folds.folded` against the CURRENT sections, so a not-yet-pruned
-  stale anchor (heading deleted) simply matches nothing — the FoldView is correct with or
-  without a prune. So `reconcile` (the prune) is housekeeping, not a correctness input to the
-  cache. Run it in `rebuild_downstream` (the `&mut` entry) gated on
-  `blocks_generation != last_reconciled_generation` (a new `Buffer` field) → once per tree
-  change, not every draw, preserving today's pruning behavior; route its `retain` through the
-  epoch-bumping helper. This dissolves the round-1 "reconcile on the miss path / perpetual
-  miss" concern entirely.
+  stale anchor (heading deleted) matches nothing in the *rendered fold view*. But `folds.folded`
+  is ALSO read directly (not via `FoldView`) at `render.rs:1034` `fold_marker_for` and
+  `fold.rs:195` `normalize_caret`, so a stale anchor is still user-visible (a spurious "▸ … 0
+  lines" marker) — pruning must preserve today's timing. Run the prune in `rebuild_downstream`
+  (the `&mut` entry) gated on a new `Buffer` field
+  **`last_reconciled_generation: Option<u64>` (init `None`)**: reconcile iff
+  `last_reconciled_generation != Some(blocks_generation)`, then set it; route the `retain`
+  through the epoch-bumping helper.
+- **The `None` sentinel is load-bearing (spec-review, both models).** Reload/recovery
+  (`save.rs`) builds a FRESH `Buffer`, syncs `reconcile.blocks_version = version` (`save.rs:227,:271`)
+  so the next `rebuild` SKIPS the parse phase (no generation bump), then installs `prev_folds`
+  (`:233,:277`) whose anchors may be stale against the new content. With `last_reconciled_generation`
+  starting `None` on every fresh `Buffer`, the first post-replacement `rebuild` always
+  reconciles (`None != Some(gen)`) — matching today's every-draw prune. (Session restore keeps
+  its explicit `folds.reconcile` at `app.rs:469`.) A default of `0` would collide with a fresh
+  document's generation `0` and silently skip that first prune.
 - Route ALL 18 call sites (the table above) through `active_fold_view(&self)`.
 
 Net: **1 `sections` walk per (tree-or-fold change)**, not 5–6+ per keystroke (incl. the nav
@@ -233,6 +242,12 @@ staying green is the primary net** (any regression there = a cache-key bug). Add
   `(blocks_generation, fold_epoch)`; recomputes (new `Rc`) on a generation bump and on a fold
   toggle; still prunes stale fold anchors when headings are removed; and the cached
   `FoldView` equals a fresh `FoldView::compute` for the same state.
+- **Reload prune guard (spec-review, both models):** the existing reload test (`save.rs:671`,
+  "stale ## B fold dropped after reload") must stay green — it exercises exactly the
+  `last_reconciled_generation = None` path (fresh buffer, blocks_version synced so the parse
+  phase is skipped, `prev_folds` installed with a stale anchor → first rebuild must still
+  prune). Confirm it passes; if the harness allows, add a focused assertion that the first
+  post-reload `rebuild` reconciles.
 - **Component 3:** the layout-key gate **skips** when all inputs are unchanged (a second
   `rebuild_downstream` with no state change) and **recomputes** on a change to any of
   blocks_generation / fold_epoch / scroll / area / text_width / active_line / mode /
@@ -259,9 +274,10 @@ staying green is the primary net** (any regression there = a cache-key bug). Add
    lands first.
 2. **F2** — `blocks_generation` (the shared token: field + bump at both `document.blocks`
    writers) + `fold_epoch` on `FoldState` (with epoch-bumping mutation helpers) + the
-   `Rc<FoldView>` cache + `active_fold_view` + route all call sites through it + fold
-   `reconcile` into the miss path + tests (incl. the `Rc::ptr_eq` reuse assertion and the
-   merge-bumps-generation regression guard).
+   `RefCell<…>` `Rc<FoldView>` cache + `active_fold_view(&self)` + route all 18 call sites
+   through it + the SEPARATE generation-gated `reconcile` step (`last_reconciled_generation:
+   Option<u64>`) + tests (incl. the `Rc::ptr_eq` reuse assertion, the merge-bumps-generation
+   regression guard, and the reload-carries-stale-folds prune guard).
 3. **Component 3** — the computed `LayoutKey` gate (keyed on `blocks_generation` +
    `heading_level_glyph` among the full input set) on the layout pass + tests (incl. the
    layout-run counter and the heading_level_glyph-flip invalidation case). Builds on F2's
@@ -308,3 +324,11 @@ staying green is the primary net** (any regression there = a cache-key bug). Add
    an edit and the next `rebuild`, which would return a pre-edit cached view) — confirm the
    command/mouse/theme paths rebuild first (M3), so the cache introduces no transient
    divergence from today's recompute-each-time behavior.
+9. Draw the gate boundary AFTER `vp_width = text_geometry(...)` (`derive.rs:202`) — `text_width`
+   is a `LayoutKey` input, so it must be computed before the key comparison; only the
+   visible-line loop (`:200`-ish onward, post-`vp_width`) is gated.
+10. The two DIRECT `folds.folded` readers outside the FoldView routing — `render.rs:1034`
+    `fold_marker_for` and `fold.rs:195` `normalize_caret` (its own `heading_starts` walk) —
+    are deliberately UNROUTED (correctness-neutral; not among the 18 sites). Note this so no one
+    expects them to hit the cache; `fold_marker_for` is the render surface that made the
+    reload-prune (confirm 8 / the `None` sentinel) user-visible.
