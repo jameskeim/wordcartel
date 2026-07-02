@@ -197,7 +197,7 @@ Expected: PASS (identical behavior — the helpers contain the same logic; no pa
                         );
 ```
 
-- [ ] **Step 9: Add the behavioral tests** in `block_tree.rs`'s `#[cfg(test)] mod tests` (they use the in-module `incremental_update_instrumented` + a local validity walk). Add a shared helper and four tests:
+- [ ] **Step 9: Add the behavioral tests** in `block_tree.rs`'s `#[cfg(test)] mod tests` (they use the in-module `incremental_update_instrumented` + a local validity walk). Add a shared helper and five tests:
 
 ```rust
     /// Lightweight, linear structural-validity walk (M1: the F3 helper is private/quadratic).
@@ -295,7 +295,7 @@ Expected: PASS (identical behavior — the helpers contain the same logic; no pa
 
 - [ ] **Step 10: Run + gates + commit.**
 Run: `cargo test -p wordcartel-core -p wordcartel` (green) and `cargo clippy --workspace --all-targets` (clean).
-Note: the four new tests assert `reason`/validity directly (not `== full_parse`), so they pass WITHOUT the Task-2 carve-out. If `f1_case_a_*` or `f1_case_b_*` does not produce the expected `reason`, adjust the doc construction until the classification holds (the assertion is the spec's contract), then re-run.
+Note: the five new tests assert `reason`/validity directly (not `== full_parse`), so they pass WITHOUT the Task-2 carve-out. If `f1_case_a_*` or `f1_case_b_*` does not produce the expected `reason`, adjust the doc construction until the classification holds (the assertion is the spec's contract), then re-run.
 ```bash
 git add -A
 git commit -m "feat(block_tree): bound the synchronous WidenToEnd reparse (F1 Case A)"   # + trailers
