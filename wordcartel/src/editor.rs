@@ -750,8 +750,10 @@ mod tests {
     fn active_fold_view_recomputes_on_generation_bump() {
         let mut e = Editor::new_from_text("# A\nbody\n", None, (80, 24));
         let v1 = e.active_fold_view();
-        let g = e.active().document.blocks_generation;
-        e.active_mut().document.blocks_generation = g.wrapping_add(1);
+        // Bump the generation via the sole write path (unchanged tree) — exercises
+        // the real accessor, mirroring the sibling derive.rs rerun test.
+        let t = e.active().document.blocks().clone();
+        e.active_mut().document.set_blocks(t);
         let v2 = e.active_fold_view();
         assert!(!std::rc::Rc::ptr_eq(&v1, &v2), "generation bump invalidates the cache");
     }
@@ -789,8 +791,7 @@ mod tests {
             &TextBuffer::from_str("# A\n## B\nbody\n").snapshot());
         {
             let b = e.by_id_mut(id).expect("active buffer by id");
-            b.document.blocks = other_tree;
-            b.document.blocks_generation = b.document.blocks_generation.wrapping_add(1);
+            b.document.set_blocks(other_tree); // adopt the new tree + bump generation, via the sole write path
         }
         let v2 = e.active_fold_view();
         assert!(!std::rc::Rc::ptr_eq(&v1, &v2), "merge generation bump must invalidate the FoldView cache");
