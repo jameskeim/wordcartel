@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Cap the synchronous `WidenToEnd` reparse so a keystroke inside a *small* container whose widen would speculatively reparse to EOF (Case A) stays O(base local block) instead of O(document) — via a size-gated `WidenReason::BoundedStale` that defers the container-wide effect to the existing 150 ms reconcile.
+**Goal:** Cap the synchronous `WidenToEnd` reparse so a keystroke inside a *small* container whose widen would speculatively reparse to EOF (Case A) stays O(#top-level blocks + base local region) instead of O(document bytes) — via a size-gated `WidenReason::BoundedStale` that defers the container-wide effect to the existing 150 ms reconcile. (The per-keystroke `tops` scans are pre-existing; F1 removes the O(document-bytes) reparse, not the O(#blocks) walks — the latter is F4, deferred.)
 
 **Architecture:** Core-only change to `wordcartel-core/src/block_tree.rs`'s `incremental_update_instrumented_src`, plus a 1-line `derive.rs` wiring and an oracle-contract carve-out. The widen decision predicts the base local region on COPIES (via two extracted helpers), classifies three ways (WidenToEnd if the extension ≤ cap; BoundedStale if the extension > cap but the base ≤ cap; WidenToEnd/today if the base itself > cap = Case B), and installs the copied bounds only for BoundedStale — leaving the `WidenToEnd` and `Local` paths byte-identical.
 
@@ -136,7 +136,11 @@ Expected: PASS (identical behavior — the helpers contain the same logic; no pa
         // F1: predict the base local region on COPIES (what the Local path would produce),
         // then bound the widen only when the EXTENSION is the expense (Case A). The copies
         // apply the same slack/pull-back + straddle/trailing-gap the Local path would; fm_floor
-        // is deliberately NOT applied to the copies (conservative — can only misclassify A→B).
+        // is deliberately NOT applied to the copies, and widen_span uses the un-floored
+        // region_old_start — both conservative: they can only OVER-count (choose BoundedStale
+        // where a floored WidenToEnd would have been ≤ cap), never under-count. A BoundedStale
+        // that "should" have been a cheap WidenToEnd is still correct (valid tree, converged at
+        // rest), so this is safe; do not "fix" it by flooring the copies.
         let mut base_start = region_old_start;
         let mut base_end = region_old_end;
         apply_local_slack(tops, old_src, &mut base_start, &mut base_end, slack_pos, have_overlap);
@@ -197,24 +201,26 @@ Expected: PASS (identical behavior — the helpers contain the same logic; no pa
                         );
 ```
 
-- [ ] **Step 9: Add the behavioral tests** in `block_tree.rs`'s `#[cfg(test)] mod tests` (they use the in-module `incremental_update_instrumented` + a local validity walk). Add a shared helper and five tests:
+- [ ] **Step 9: Add the behavioral tests** in `block_tree.rs`'s `#[cfg(test)] mod tests` (they use the in-module `incremental_update_instrumented` + a local validity walk). Add a shared helper and four tests (the reachable second-trigger/seam pins are Step 9b):
 
 ```rust
-    /// Lightweight, linear structural-validity walk (M1: the F3 helper is private/quadratic).
-    /// Root spans the whole doc; child spans are ordered + non-overlapping at every level
-    /// (gaps between blocks allowed — children do not tile).
+    /// Lightweight, linear structural-validity walk (M1: `check_tree` at block_tree.rs:1837
+    /// is quadratic via its per-byte `role_at`; this is O(nodes)). Root spans the whole doc;
+    /// child spans are ordered + non-overlapping AND contained within their parent at every
+    /// level (gaps between blocks allowed — children do not tile).
     fn assert_valid_tree(t: &BlockTree, new_len: usize) {
         assert_eq!(t.root.span, 0..new_len, "root must span [0, new_len)");
-        fn walk(children: &[Block]) {
-            let mut prev_end = 0usize;
-            for c in children {
+        fn walk(parent: &Block) {
+            let mut prev_end = parent.span.start;
+            for c in &parent.children {
                 assert!(c.span.end >= c.span.start, "span well-formed: {:?}", c.span);
                 assert!(c.span.start >= prev_end, "children ordered/non-overlapping: {:?}", c.span);
+                assert!(c.span.end <= parent.span.end, "child {:?} escapes parent {:?}", c.span, parent.span);
                 prev_end = c.span.end;
-                walk(&c.children);
+                walk(c);
             }
         }
-        walk(&t.root.children);
+        walk(&t.root);
     }
 
     #[test]
@@ -262,21 +268,6 @@ Expected: PASS (identical behavior — the helpers contain the same logic; no pa
     }
 
     #[test]
-    fn f1_created_container_local_is_bounded() {
-        // Typing "- " at the top of a big paragraph doc CREATES an absorptive list — the OLD
-        // tree has no container there, so the FIRST gate is Local; the created-container
-        // SECOND trigger would extend to EOF. F1's second-trigger gate must bound it.
-        let doc = "para\n\n".repeat(260_000);
-        assert!(doc.len() > MAX_SYNC_WIDEN_BYTES);
-        let (new_text, edit) = apply_edit(&doc, 0..0, "- ");
-        let outcome = incremental_update_instrumented(&full_parse(&doc), &doc, &edit, &new_text);
-        assert_eq!(outcome.reason, WidenReason::BoundedStale,
-            "a created-container Local edit on a big doc must bound at the second trigger");
-        assert!(outcome.reparsed_bytes <= MAX_SYNC_WIDEN_BYTES);
-        assert_valid_tree(&outcome.tree, new_text.len());
-    }
-
-    #[test]
     fn f1_successive_bounded_stale_edits_no_reset() {
         // Production feeds a BoundedStale tree into the NEXT incremental_update WITHOUT a
         // reset (unlike the oracle). Two bounded edits in a row must stay panic-free + valid.
@@ -293,9 +284,13 @@ Expected: PASS (identical behavior — the helpers contain the same logic; no pa
     }
 ```
 
+- [ ] **Step 9b: Empirically construct pin-tests for the two REACHABLE second-trigger/seam branches (Fable I2 + I1-keep; scope decision C).** These branches cannot be authored blind — build each construction and run it under `cargo test` until it hits the target path; the `reason` assertion is the spec contract. **HARD RULE: never weaken an assertion to make a test pass.** If a construction is verified reachable, keep the test; if you empirically determine it is UNREACHABLE in Case A (e.g. the absorptive-container-reaching-the-base-boundary shape forces the old enclosing block over the cap = Case B), DELETE the test and record the accepted coverage gap in the ledger (`$(git rev-parse --git-path sdd)/progress.md`) with one line naming the branch and why it is unreachable. Do NOT keep a test whose assertion was softened.
+  1. **`f1_bounded_stale_absorptive_tail_not_reextended` (I1-keep):** a first-gate `BoundedStale` whose bounded base region's LAST block is a `List`/`BlockQuote`/`IndentedCode` reaching the base boundary must stay `BoundedStale` (the second-trigger keep-branch), NOT re-extend to EOF. Try: a small container near the top of `>1 MiB` of paragraphs, edited so the widen fires (`absorptive_in_region`/`downstream_container_merge`) with a small base whose tail is the container. Assert `reason == BoundedStale` AND `reparsed_bytes <= MAX_SYNC_WIDEN_BYTES` (proves no EOF re-extension) AND `assert_valid_tree`.
+  2. **`f1_bounded_stale_seam_guard_yields_no_overlap_full` (I2):** a `BoundedStale` splice whose base tail is a Paragraph abutting an absorbable after-block (Paragraph/IndentedCode with no blank-line separator) trips the seam guard (block_tree.rs:975) → the reason becomes `NoOverlapFull` (a correct full parse) and the tree `== full_parse`. Assert `reason == WidenReason::NoOverlapFull` AND `outcome.tree == full_parse(&new_text)`.
+
 - [ ] **Step 10: Run + gates + commit.**
 Run: `cargo test -p wordcartel-core -p wordcartel` (green) and `cargo clippy --workspace --all-targets` (clean).
-Note: the five new tests assert `reason`/validity directly (not `== full_parse`), so they pass WITHOUT the Task-2 carve-out. If `f1_case_a_*` or `f1_case_b_*` does not produce the expected `reason`, adjust the doc construction until the classification holds (the assertion is the spec's contract), then re-run.
+Note: the Step-9 tests assert `reason`/validity directly (not `== full_parse`), so they pass WITHOUT the Task-2 carve-out. If ANY test (Step 9 or 9b) does not produce the asserted `reason`, adjust the DOC CONSTRUCTION until the classification holds — the `reason` assertion is the spec's contract and must not be weakened; if a Step-9b construction proves unreachable, follow the Step-9b delete-and-ledger rule.
 ```bash
 git add -A
 git commit -m "feat(block_tree): bound the synchronous WidenToEnd reparse (F1 Case A)"   # + trailers
@@ -428,10 +423,10 @@ git commit -m "test(block_tree): carve BoundedStale out of the incremental==full
 
 ## Self-Review
 
-**Spec coverage:** `BoundedStale` variant + `MAX_SYNC_WIDEN_BYTES` (T1 S1-2) ✓; predict-on-copies three-way gate via shared helpers (T1 S3-6, spec M2, new-length sizing per Codex) ✓; unified second-trigger three-way gate covering BOTH the I1 first-gate-BoundedStale skip AND the Local-arrival created-container bound (T1 S7 + the `f1_created_container_local_is_bounded` test) ✓; `derive` wiring (T1 S8) ✓; I2 seam-guard → `NoOverlapFull` is automatic (block_tree.rs:975-979, no code change — confirmed in Task 1 review) ✓; oracle carve-out incl. the fuzz F2 oracle (T2, spec I4) ✓; str==rope reason (T2 S2-3, M3) ✓; Case-A/small-ext/Case-B/successive-BoundedStale tests (T1 S9, spec I3) ✓; non-quadratic local validity helper (T1 S9, M1) ✓; documented exemptions (T2 S6) ✓. Reconcile unchanged ✓. M4 (parse-panic enlarged stale) + M6 (cap tunable) are documented tradeoffs, no code.
+**Spec coverage:** `BoundedStale` variant + `MAX_SYNC_WIDEN_BYTES` (T1 S1-2) ✓; predict-on-copies three-way gate via shared helpers (T1 S3-6, spec M2, new-length sizing per Codex) ✓; unified second-trigger three-way gate covering BOTH the I1 first-gate-BoundedStale skip AND the Local-arrival created-container bound (T1 S7) ✓; `derive` wiring (T1 S8) ✓; I2 seam-guard → `NoOverlapFull` is automatic (block_tree.rs:975-979, no code change — confirmed in Task 1 review) ✓; oracle carve-out incl. the fuzz F2 oracle (T2, spec I4) ✓; str==rope reason (T2 S2-3, M3) ✓; Case-A/small-ext/Case-B/successive-BoundedStale tests (T1 S9, spec I3) ✓; the two REACHABLE second-trigger/seam pins empirically constructed (T1 S9b — I1-keep + I2 seam→NoOverlapFull; scope decision C: unreachable ones deleted + ledger-recorded, assertions never weakened) ✓; non-quadratic local validity helper with child-containment (T1 S9, M1/M4) ✓; documented exemptions (T2 S6) ✓. Reconcile unchanged ✓. M4 (parse-panic enlarged stale) + M6 (cap tunable) are documented tradeoffs, no code.
 
 **Placeholder scan:** none — every code step carries complete code. The one runtime-tunable is the doc construction in `f1_case_a_*`/`f1_case_b_*` (T1 S10 notes: adjust the construction if the classification differs — the `reason` assertion is the contract).
 
-**Type consistency:** `apply_local_slack`/`repair_region` take `tops: &[Block]` (matches `top_level() -> &[Block]`) + `&S: TextSource`; `incremental_update_instrumented_src` is generic over str+rope (no separate rope variant); `WidenReason` is `Copy` (assert on `reason` by value); `Block`/`BlockTree` fields are `pub` (the validity walk recurses from the external oracle crate). The gate uses `slack_pos` (block_tree.rs:727) + `have_overlap` (:572), both in scope at :767.
+**Type consistency:** `apply_local_slack`/`repair_region` take `tops: &[Block]` (matches `top_level() -> &[Block]`) + `&S: TextSource`; `incremental_update_instrumented_src` is generic over str+rope (no separate rope variant — the oracle passes `&&Rope`); `WidenReason` is `Copy` (assert on `reason` by value); the Step-9 tests live in `block_tree.rs`'s in-module `#[cfg(test)] mod tests` (they reach `Block`/`BlockTree` fields directly). The gate uses `slack_pos` (block_tree.rs:727) + `have_overlap` (:572), both in scope at :767.
 
 **Ordering:** Task 1 is behavior-preserving for existing suites (its Step 5 checkpoint proves the extraction) and its new tests assert `reason` directly (independent of Task 2). Task 2 only guards equality assertions (no new emission). Either task compiles and tests independently; Task 1 first (it defines the variant Task 2 references).
