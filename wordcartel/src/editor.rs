@@ -52,12 +52,12 @@ pub struct Document {
     pub buffer: TextBuffer,
     pub selection: Selection,
     pub history: History,
-    pub blocks: BlockTree, // derived cache (Task 3 maintains)
+    blocks: BlockTree, // derived cache — write only via set_blocks
     pub version: u64,
-    /// Monotonic id of `blocks`: bumped on EVERY `blocks` write (parse phase +
+    /// Monotonic id of `blocks`: bumped on EVERY `set_blocks` call (parse phase +
     /// reconcile merge). Identifies the current tree across the reconcile-merge
     /// boundary (where `version` is unchanged). Keys the FoldView + layout caches.
-    pub blocks_generation: u64,
+    blocks_generation: u64,
     pub path: Option<PathBuf>,
     /// The document version last written to disk. `None` = never saved
     /// (new/scratch). `dirty()` is derived from this — no separate flag.
@@ -76,6 +76,20 @@ impl Document {
     /// Record that version `v` is now on disk.
     pub fn mark_saved(&mut self, v: u64) {
         self.saved_version = Some(v);
+    }
+
+    /// Read the derived block tree (private field — writes go through `set_blocks`).
+    #[inline]
+    pub fn blocks(&self) -> &wordcartel_core::block_tree::BlockTree { &self.blocks }
+    /// The block-tree identity token; changes on every `set_blocks`. Keys the FoldView + layout caches.
+    #[inline]
+    pub fn blocks_generation(&self) -> u64 { self.blocks_generation }
+    /// The ONLY way to write `blocks` — bumps `blocks_generation` so no writer can bypass the
+    /// cache-identity token (valid-by-construction). Unconditional bump on each call; a caller
+    /// wanting write-on-change guards the CALL (see the reconcile merge), not the bump.
+    pub fn set_blocks(&mut self, blocks: wordcartel_core::block_tree::BlockTree) {
+        self.blocks = blocks;
+        self.blocks_generation = self.blocks_generation.wrapping_add(1);
     }
 }
 

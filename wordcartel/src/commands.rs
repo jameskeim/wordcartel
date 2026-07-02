@@ -167,7 +167,7 @@ pub fn build_range_replace(
 /// Borrows `editor` immutably and returns owned `(usize, usize)`.
 pub fn scope_range_at(editor: &Editor, h: usize, scope: Scope) -> (usize, usize) {
     let buf = &editor.active().document.buffer;
-    let blocks = &editor.active().document.blocks;
+    let blocks = editor.active().document.blocks();
     match scope {
         Scope::Word => {
             let (ps, pe) = nav::paragraph_range_at(blocks, buf, h);
@@ -383,7 +383,7 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             // inside a folded body, for ALL motion directions at once.
             let new_head = {
                 let b = editor.active();
-                crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, new_head)
+                crate::fold::normalize_caret(&b.folds, b.document.blocks(), &b.document.buffer, new_head)
             };
 
             if extend {
@@ -1383,7 +1383,7 @@ mod tests {
         let clk = TestClock(0);
         run(Command::Move { dir: Dir::Right, extend: false }, &mut ed, &clk);
         let head = ed.active().document.selection.primary().head;
-        let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer) };
+        let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, b.document.blocks(), &b.document.buffer) };
         assert!(!fv.is_hidden(ed.active().document.buffer.byte_to_line(head)));
     }
 
@@ -1403,7 +1403,7 @@ mod tests {
         run(Command::Undo, &mut ed, &TestClock(1_000));
 
         let head = ed.active().document.selection.primary().head;
-        let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer) };
+        let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, b.document.blocks(), &b.document.buffer) };
         assert_eq!(head, a);
         assert!(!fv.is_hidden(ed.active().document.buffer.byte_to_line(head)));
     }
@@ -1423,7 +1423,7 @@ mod tests {
         run(Command::ShrinkSelection, &mut ed, &TestClock(0));
 
         let head = ed.active().document.selection.primary().head;
-        let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer) };
+        let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, b.document.blocks(), &b.document.buffer) };
         assert_eq!(head, a);
         assert!(!fv.is_hidden(ed.active().document.buffer.byte_to_line(head)));
     }

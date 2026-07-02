@@ -87,7 +87,7 @@ pub fn region_for_transform(doc: &crate::editor::Document) -> std::ops::Range<us
     if sel.is_empty() {
         0..buf_len
     } else {
-        snap_to_blocks(&doc.blocks, sel.from(), sel.to())
+        snap_to_blocks(doc.blocks(), sel.from(), sel.to())
     }
 }
 
@@ -217,7 +217,7 @@ mod tests {
     use crate::editor::Editor;
 
     fn blocks_of(text: &str) -> wordcartel_core::block_tree::BlockTree {
-        Editor::new_from_text(text, None, (80, 24)).active().document.blocks.clone()
+        Editor::new_from_text(text, None, (80, 24)).active().document.blocks().clone()
     }
 
     // Exact-span discipline (Codex plan review, I-3): assert the snapped range

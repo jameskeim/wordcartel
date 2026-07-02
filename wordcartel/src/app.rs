@@ -465,7 +465,7 @@ pub fn restore_resume(editor: &mut Editor, path: &std::path::Path) {
                     editor.active_mut().view.scroll = scroll;
                     load_marks_from_entry(editor, entry);
                     editor.active_mut().folds.replace_folded(entry.folds.iter().copied().collect());
-                    let (blocks, buf) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.clone()) };
+                    let (blocks, buf) = { let b = editor.active(); (b.document.blocks().clone(), b.document.buffer.clone()) };
                     editor.active_mut().folds.reconcile(&blocks, &buf);
                     load_block_from_entry(editor, entry);
                 }
@@ -1645,7 +1645,7 @@ pub fn reduce(
                             o.query.pop();
                         }
                         let q = editor.outline.as_ref().map(|o| o.query.clone()).unwrap_or_default();
-                        let (blocks, rope) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.snapshot()) };
+                        let (blocks, rope) = { let b = editor.active(); (b.document.blocks().clone(), b.document.buffer.snapshot()) };
                         if let Some(o) = editor.outline.as_mut() {
                             o.set_query(&q, &blocks, &rope);
                         }
@@ -1658,7 +1658,7 @@ pub fn reduce(
                             o.query.push(c);
                         }
                         let q = editor.outline.as_ref().map(|o| o.query.clone()).unwrap_or_default();
-                        let (blocks, rope) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.snapshot()) };
+                        let (blocks, rope) = { let b = editor.active(); (b.document.blocks().clone(), b.document.buffer.snapshot()) };
                         if let Some(o) = editor.outline.as_mut() {
                             o.set_query(&q, &blocks, &rope);
                         }
@@ -4748,7 +4748,7 @@ mod tests {
         editor.active_mut().folds.folded.insert(heading_a);
         {
             let b = editor.active();
-            let blocks = b.document.blocks.clone();
+            let blocks = b.document.blocks().clone();
             let buf = b.document.buffer.clone();
             editor.active_mut().folds.reconcile(&blocks, &buf);
         }
@@ -4757,7 +4757,7 @@ mod tests {
         // This is what the bug looks like: cursor is hidden after resume without the fix.
         {
             let b = editor.active();
-            let fv = FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer);
+            let fv = FoldView::compute(&b.folds, b.document.blocks(), &b.document.buffer);
             let raw_line = b.document.buffer.byte_to_line(cursor_in_body);
             assert!(fv.is_hidden(raw_line),
                 "precondition: without SnapOut the restored cursor sits inside the fold");
@@ -4782,7 +4782,7 @@ mod tests {
             "SnapOut must move the caret from inside-fold body to the '## A' heading");
         {
             let b = editor.active();
-            let fv = FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer);
+            let fv = FoldView::compute(&b.folds, b.document.blocks(), &b.document.buffer);
             let final_line = b.document.buffer.byte_to_line(final_head);
             assert!(!fv.is_hidden(final_line),
                 "caret must not be on a hidden line after resume normalization");

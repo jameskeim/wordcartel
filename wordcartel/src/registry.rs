@@ -375,7 +375,7 @@ impl Registry {
             let caret = c.editor.active().document.selection.primary().head;
             let (blocks, buf) = {
                 let b = c.editor.active();
-                (b.document.blocks.clone(), b.document.buffer.clone())
+                (b.document.blocks().clone(), b.document.buffer.clone())
             };
             let rope = buf.snapshot();
             let hs = wordcartel_core::outline::headings(&blocks, &rope);
@@ -383,7 +383,7 @@ impl Registry {
                 let hb = h.byte;
                 c.editor.active_mut().folds.toggle(hb);
                 let b = c.editor.active();
-                let nc = crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, caret);
+                let nc = crate::fold::normalize_caret(&b.folds, b.document.blocks(), &b.document.buffer, caret);
                 c.editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(nc);
                 crate::derive::rebuild(c.editor);
                 crate::nav::ensure_visible(c.editor);
@@ -393,11 +393,11 @@ impl Registry {
             CommandResult::Handled
         });
         r.register("fold_all", "Fold All Sections", Some(MenuCategory::View), |c| {
-            let (blocks, buf) = { let b = c.editor.active(); (b.document.blocks.clone(), b.document.buffer.clone()) };
+            let (blocks, buf) = { let b = c.editor.active(); (b.document.blocks().clone(), b.document.buffer.clone()) };
             c.editor.active_mut().folds.fold_all(&blocks, &buf);
             let caret = c.editor.active().document.selection.primary().head;
             let b = c.editor.active();
-            let nc = crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, caret);
+            let nc = crate::fold::normalize_caret(&b.folds, b.document.blocks(), &b.document.buffer, caret);
             c.editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(nc);
             crate::derive::rebuild(c.editor);
             crate::nav::ensure_visible(c.editor);
@@ -473,7 +473,7 @@ enum Dirn { Next, Prev, Parent }
 
 fn heading_jump(c: &mut Ctx, dir: Dirn) {
     let caret = c.editor.active().document.selection.primary().head;
-    let (blocks, buf) = { let b = c.editor.active(); (b.document.blocks.clone(), b.document.buffer.clone()) };
+    let (blocks, buf) = { let b = c.editor.active(); (b.document.blocks().clone(), b.document.buffer.clone()) };
     let rope = buf.snapshot();
     let hs = wordcartel_core::outline::headings(&blocks, &rope);
     let target = match dir {
@@ -500,7 +500,7 @@ fn heading_jump(c: &mut Ctx, dir: Dirn) {
 
 /// Unfold every folded heading whose body contains `byte`.
 pub(crate) fn unfold_ancestors_of(editor: &mut crate::editor::Editor, byte: usize) {
-    let (blocks, buf) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.clone()) };
+    let (blocks, buf) = { let b = editor.active(); (b.document.blocks().clone(), b.document.buffer.clone()) };
     let rope = buf.snapshot();
     let anchors: Vec<usize> = editor.active().folds.folded.iter().copied().collect();
     for hb in anchors {
@@ -522,7 +522,7 @@ pub(crate) fn place_caret_visible(editor: &mut crate::editor::Editor, raw: usize
         }
         CaretPlace::SnapOut => {
             let b = editor.active();
-            crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, raw)
+            crate::fold::normalize_caret(&b.folds, b.document.blocks(), &b.document.buffer, raw)
         }
     }
 }

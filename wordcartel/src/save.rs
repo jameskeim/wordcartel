@@ -241,7 +241,7 @@ pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
     let head = editor.active().document.selection.primary().head;
     let nc = {
         let b = editor.active();
-        crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, head)
+        crate::fold::normalize_caret(&b.folds, b.document.blocks(), &b.document.buffer, head)
     };
     editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(nc);
     crate::nav::ensure_visible(editor);
@@ -284,7 +284,7 @@ pub fn load_recovered(editor: &mut crate::editor::Editor, body: &str) {
     let head = editor.active().document.selection.primary().head;
     let nc = {
         let b = editor.active();
-        crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, head)
+        crate::fold::normalize_caret(&b.folds, b.document.blocks(), &b.document.buffer, head)
     };
     editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(nc);
     crate::nav::ensure_visible(editor);
@@ -671,14 +671,14 @@ mod tests {
         assert!(!ed.active().folds.folded.contains(&b_anchor), "stale ## B fold must be dropped");
         let starts: std::collections::BTreeSet<usize> = {
             let b = ed.active();
-            wordcartel_core::outline::heading_starts(&b.document.blocks, &b.document.buffer.snapshot())
+            wordcartel_core::outline::heading_starts(b.document.blocks(), &b.document.buffer.snapshot())
         };
         assert!(ed.active().folds.folded.iter().all(|b| starts.contains(b)),
             "every surviving fold must be a real heading start in the new content");
         // caret is visible (normalize is a no-op because it's already out of folds)
         let head = ed.active().document.selection.primary().head;
         let b = ed.active();
-        assert_eq!(crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, head), head);
+        assert_eq!(crate::fold::normalize_caret(&b.folds, b.document.blocks(), &b.document.buffer, head), head);
     }
 
     // -----------------------------------------------------------------------
