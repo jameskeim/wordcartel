@@ -176,7 +176,8 @@ fn full_parse_phase(editor: &mut Editor, new_rope: &ropey::Rope, new_len: usize)
 
 /// The downstream-of-tree phase: reconcile fold anchors + build the `FoldView` +
 /// refresh the visible-line layout cache from the CURRENT `document.blocks`.
-/// Runs every draw and does NOT reparse; also called by the reconcile merge.
+/// Runs every draw and does NOT reparse. Only `rebuild` calls it (the reconcile
+/// merge just updates `document.blocks`; the pre-draw `rebuild` runs downstream).
 pub(crate) fn rebuild_downstream(editor: &mut Editor) {
     // ------------------------------------------------------------------
     // 5g: Reconcile fold anchors against the fresh block tree, then build
