@@ -11,6 +11,7 @@ use crate::editor::Editor;
 pub enum JobKind {
     Save,      // one-shot, user-initiated: always applies
     SwapWrite, // one-shot housekeeping: always applies (status only)
+    Reparse,   // coalescible background block-tree reconcile; version-checked in merge
     #[cfg(test)]
     CoalesceProbe, // test-only stand-in for a future coalescible kind
 }
@@ -41,8 +42,9 @@ pub struct JobResult {
     pub version: u64,
     pub kind: JobKind,
     /// Applied on the foreground before the next draw. By contract this touches
-    /// only non-document bookkeeping; any document-text change must route
-    /// through `editor.apply`.
+    /// only non-document bookkeeping and DERIVED document caches (e.g.
+    /// `document.blocks`, regenerable from text); any document-TEXT change must
+    /// route through `editor.apply`.
     pub merge: Box<dyn FnOnce(&mut Editor) + Send>,
 }
 
@@ -64,7 +66,7 @@ pub fn is_stale(r: &JobResult, editor: &Editor) -> bool {
                 #[cfg(not(test))]
                 let _ = b;
                 match r.kind {
-                    JobKind::Save | JobKind::SwapWrite => false, // one-shot: never stale
+                    JobKind::Save | JobKind::SwapWrite | JobKind::Reparse => false,
                     #[cfg(test)]
                     JobKind::CoalesceProbe => r.version != b.document.version,
                 }

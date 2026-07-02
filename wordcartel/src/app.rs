@@ -215,6 +215,12 @@ fn apply_panic(buffer_id: crate::editor::BufferId, version: u64, kind: crate::jo
             if let Some(b) = editor.by_id_mut(buffer_id) { b.swap_in_flight = false; }
             editor.status = format!("swap failed (internal error: {msg})");
         }
+        JobKind::Reparse => {
+            // A panicked reparse (e.g. the pulldown residual): drop the round,
+            // leave document.blocks unchanged; clear in-flight so a later
+            // reconcile can re-dispatch. No status noise.
+            if let Some(b) = editor.by_id_mut(buffer_id) { b.reconcile.in_flight_version = None; }
+        }
         #[cfg(test)]
         JobKind::CoalesceProbe => { editor.status = format!("job failed (internal error: {msg})"); }
     }
