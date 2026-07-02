@@ -1,6 +1,6 @@
 # Editing responsiveness: cache the draw-path outline work — design
 
-**Status:** spec-review round 3 folded (both models: last_reconciled_generation None-sentinel + stale-text + 2 minors); final confirm pending
+**Status:** spec-review CLEAN (Codex READY x4 + Fable5 verified-closed x2)
 **Date:** 2026-07-02
 **Effort:** editing-responsiveness (pre-Effort-P; the safe, always-on per-keystroke wins)
 
