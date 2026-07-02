@@ -1,6 +1,6 @@
 # Valid-by-construction cache-key fields (footguns) — design
 
-**Status:** spec-review round 1 folded (honest blast radius incl. sibling-test reads + test WRITE sites); re-review pending
+**Status:** spec-review round 2 folded (5th test-write site derive.rs:768 + read/write count split); re-review pending
 **Date:** 2026-07-02
 **Effort:** footguns (valid-by-construction; the first of two — F1 is a later, separate effort)
 
@@ -111,17 +111,32 @@ The privatization forces the accessor on EVERY out-of-module reference, and sibl
 production figure. This is compiler-guided (each unconverted site is a build error), but the
 spec accounts for it so the plan/implementer expect it:
 
-- **`.document.blocks` reads:** ~27 production + ~25 sibling-test (e.g. `render.rs:1274`,
+- **`.document.blocks` READS:** ~27 production + ~23 sibling-test (e.g. `render.rs:1274`,
   `commands.rs:1386/1406/1426`, `nav.rs:1203-1428`, `derive.rs`-tests, `reconcile.rs`-tests,
   `transform.rs:220`, `mouse.rs:334`, `save.rs:674/681`, `app.rs:4751-4785`) → `.blocks()`.
-- **`folds.folded` reads:** 3 production + ~18 sibling-test → `.folded()`.
-- **`blocks_generation`/`epoch` reads:** the production sites above + any sibling-test hits.
+  (The 3 sibling-test `document.blocks =` and the 1 `blocks_generation =` are WRITES, handled
+  below, not reads.)
+- **`folds.folded` READS:** 3 production + ~17 sibling-test → `.folded()`. (The 1
+  `folds.folded.insert` is a WRITE, below.)
+- **`blocks_generation`/`epoch` READS:** the production sites in the Components above + any
+  sibling-test reads → the getters.
 
-**Direct WRITE sites in tests (must route through the API — the point of the effort):**
-- `document.blocks = …` in tests — `derive.rs:327`, `reconcile.rs:112`, `reconcile.rs:170` →
+**Direct WRITE sites in tests — the COMPLETE set (must route through the API — the point of the
+effort; sibling-`#[cfg(test)]` writes break under privatization, `editor::tests`/`fold::tests`
+child-module writes do not and may stay direct):**
+- `document.blocks = …` — `derive.rs:327`, `reconcile.rs:112`, `reconcile.rs:170` →
   `document.set_blocks(…)`.
-- `folds.folded.insert(…)` in a test — `app.rs:4748` → an existing mutator (`toggle(hb)` to
-  fold one anchor, or `replace_folded(set)` for an exact set).
+- `document.blocks_generation = …wrapping_add(1)` — `derive.rs:768-769` (the layout-gate
+  rerun test's generation-bump sub-case). Migrate to
+  `let t = e.active().document.blocks().clone(); e.active_mut().document.set_blocks(t);` —
+  bumps the generation with UNCHANGED blocks, which is exactly the sub-case's intent (prove a
+  generation change alone re-runs the layout gate).
+- `folds.folded.insert(…)` — `app.rs:4748` → a fold mutator (`toggle(hb)` to fold one anchor,
+  or `replace_folded(set)` for an exact set). This bumps `epoch` where the raw insert did not,
+  but that test has no epoch/fold-view assertion, so no adjustment needed.
+
+(`editor.rs:740,778-779` write `document.blocks`/`blocks_generation` inside `editor::tests`, a
+child of the defining module — permitted by privacy, no change needed.)
 
 Converting test writes through `set_blocks`/mutators is a FEATURE, not a workaround: it makes
 the valid-by-construction guarantee hold end-to-end, tests included. Watch for any test that
