@@ -1,6 +1,6 @@
 # F1: bound the synchronous WidenToEnd reparse — design
 
-**Status:** rescoped to Case A; Codex round 3 folded (predict base region on copies); re-review pending
+**Status:** Codex spec-review CLEAN (round 4, ready for planning); Fable5 pass pending
 **Date:** 2026-07-02
 **Effort:** F1 (responsiveness follow-up; the second of the two deferred from editing-responsiveness — F8 was assessed and shelved: its "bound layout to visible rows" premise is unsafe because `ColMap` consumers need the whole logical line)
 
@@ -129,9 +129,10 @@ an EXPANSION of the already-accepted `maybe_stale`/reconcile eventual-consistenc
   equals that base size (≤ cap in Case A by the gate's check) — the freeze-ceiling property is
   observable. The prediction must include the trailing-gap coverage so a base that would reach
   EOF classifies as Case B (WidenToEnd), never as a `BoundedStale` that then reparses to EOF.
-- The resulting `BoundedStale` tree is a **valid, full-coverage splice** (before-blocks +
-  base-region reparse + verbatim-shifted after-blocks — ordered, non-overlapping, covers
-  `[0, EOF)`, so `role_at`/fold/render stay sound) that is semantically stale beyond the base
+- The resulting `BoundedStale` tree is a **valid splice** (before-blocks + base-region reparse
+  + verbatim-shifted after-blocks) whose ROOT spans `[0, new_len)` with child spans
+  ordered/non-overlapping at every level (gaps between top-level blocks allowed — children do
+  not tile), so `role_at`/fold/render stay sound; it is semantically stale beyond the base
   region.
 
 ## Component 2 — oracle carve-out + wiring
