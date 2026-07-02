@@ -21,22 +21,32 @@ pub struct FileFingerprint {
     pub hash: u64,
 }
 
-/// Fingerprint a path, or `None` if it does not exist / cannot be stat'd.
-///
-/// Reads the full file so the hash and size come from the same data (no
-/// TOCTOU between stat and read). Called on user-initiated save/load only —
-/// not the per-keystroke hot path — so the full read is acceptable for the
-/// ~5 MB document budget.
+/// Content-hash fingerprint of `path` for external-modification detection (BUG-2),
+/// capping the content read at `MAX_OPEN_BYTES`. Returns `None` only when `path` is
+/// missing/unstattable; a present file always yields `Some` (over-cap → mtime+size
+/// with a sentinel hash — never `None`, so `stored_fp` can't silently disable the
+/// conflict check). `mtime`/`size` come from `metadata`, `hash` from a separate
+/// bounded read (no single-syscall guarantee across the three fields).
 pub fn fingerprint(path: &Path) -> Option<FileFingerprint> {
-    let bytes = std::fs::read(path).ok()?;
+    fingerprint_with_limit(path, crate::limits::MAX_OPEN_BYTES)
+}
+
+/// Content-hash fingerprint, capping the content read at `limit`. `meta` failure
+/// (missing/unreadable) → `None`; but a present-but-over-cap file yields a
+/// metadata-only fingerprint (real mtime+size, sentinel hash 0) rather than `None`,
+/// so `stored_fp` never becomes `None` and the external-mod check is not silently
+/// defeated (`None == None`) for files grown beyond the cap.
+fn fingerprint_with_limit(path: &Path, limit: u64) -> Option<FileFingerprint> {
     let meta = std::fs::metadata(path).ok()?;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hasher::write(&mut h, &bytes);
-    Some(FileFingerprint {
-        mtime: meta.modified().ok(),
-        size: bytes.len() as u64,
-        hash: std::hash::Hasher::finish(&h),
-    })
+    let hash = match crate::file::bounded_read_opt(path, limit) {
+        Some(bytes) => {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hasher::write(&mut h, &bytes);
+            std::hash::Hasher::finish(&h)
+        }
+        None => 0, // over-cap (or transient read failure): fall back to mtime+size only
+    };
+    Some(FileFingerprint { mtime: meta.modified().ok(), size: meta.len(), hash })
 }
 
 /// Whether a save job writes the document's own path (Normal) or re-keys the
@@ -674,6 +684,26 @@ mod tests {
     // -----------------------------------------------------------------------
     // BUG-2 regression: content discriminator (hash) catches same-size/same-mtime edits
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn fingerprint_over_cap_falls_back_to_metadata_not_none() {
+        let p = scratch();
+        std::fs::write(&p, b"0123456789").unwrap(); // 10 bytes
+        let fp = fingerprint_with_limit(&p, 4).expect("over-cap present file still yields a fingerprint");
+        assert_eq!(fp.size, 10, "size from metadata");
+        assert_eq!(fp.hash, 0, "over-cap → sentinel hash, NOT None (closes None==None)");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn fingerprint_within_cap_hashes_content_unchanged() {
+        let p = scratch();
+        std::fs::write(&p, b"aaaa").unwrap();
+        let within = fingerprint_with_limit(&p, 1_000_000).expect("fp");
+        assert_ne!(within.hash, 0, "≤cap → real content hash");
+        assert_eq!(within.hash, fingerprint(&p).unwrap().hash, "≤cap path identical to public fingerprint (no churn)");
+        let _ = std::fs::remove_file(&p);
+    }
 
     /// Regression for BUG-2: a same-byte-count external edit that lands within the
     /// same mtime tick must still be detected as a change.  The hash field in
