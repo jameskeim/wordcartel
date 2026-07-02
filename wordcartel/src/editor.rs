@@ -369,6 +369,8 @@ pub struct Editor {
     pub quit_drain_advance: bool,
 }
 
+const UNDO_EVICTED_HINT: &str = "Undo history full — oldest dropped";
+
 impl Editor {
     pub fn new_from_text(text: &str, path: Option<PathBuf>, area: (u16, u16)) -> Editor {
         // Build the workspace, then allocate the buffer's id through the single
@@ -642,16 +644,25 @@ impl Editor {
         crate::nav::ensure_visible(self);
     }
 
+    /// Surface the undo-eviction hint iff an edit landed on the STILL-active buffer
+    /// this reduce AND it evicted. Consumes `last_evicted` (resets to 0) so a later
+    /// undo/redo/switch — which change `version` without a fresh eviction — do not
+    /// replay the stale hint. Called once per reduce from the run loop.
+    pub fn note_undo_eviction(&mut self, pre_id: BufferId, pre_version: u64) {
+        let fire = {
+            let b = self.active();
+            b.id == pre_id && b.document.version != pre_version
+                && b.document.history.last_evicted > 0
+        };
+        if fire {
+            self.status = UNDO_EVICTED_HINT.to_string();
+            self.active_mut().document.history.last_evicted = 0;
+        }
+    }
+
     // Thin delegators — external callers unchanged.
     pub fn apply(&mut self, txn: Transaction, edit: wordcartel_core::block_tree::Edit, kind: EditKind, clock: &dyn Clock) {
         self.active_mut().apply(txn, edit, kind, clock);
-        // Best-effort "louder" eviction hint (M5 Decision 5): only the command/keystroke path
-        // funnels through Editor::apply, so large buffer-level merges (filter/transform/paste,
-        // which call Buffer::apply directly) won't surface it — and they set their own status.
-        // The eviction itself is always enforced in core (History::evict_to); this is cosmetic.
-        if self.active().document.history.last_evicted > 0 {
-            self.status = "Undo history full — oldest dropped".to_string();
-        }
     }
     pub fn undo(&mut self) -> bool { self.active_mut().undo() }
     pub fn redo(&mut self) -> bool { self.active_mut().redo() }
@@ -1071,10 +1082,9 @@ mod tests {
 
     // ── Task 2 (M5): eviction hint wiring ─────────────────────────────────────
 
-    /// Wiring test: a non-evicting edit (well under MAX_UNDO_BYTES) must NOT set the hint.
-    /// The true-eviction branch is covered by the core `eviction_keeps_current_consistent_for_undo_redo`
-    /// test which directly asserts `last_evicted > 0`; forcing a real eviction here would require
-    /// allocating >64 MiB of insert text per revision.
+    /// Guard: `Editor::apply` is a pure delegator — the eviction hint now lives in
+    /// `note_undo_eviction` (wired once per reduce in the run loop). A tiny edit that
+    /// does not evict must leave `status` unchanged regardless of which path set it.
     #[test]
     fn apply_does_not_set_hint_when_no_eviction() {
         use wordcartel_core::change::ChangeSet;
@@ -1088,5 +1098,36 @@ mod tests {
             "Undo history full — oldest dropped",
             "a tiny edit must not set the eviction hint"
         );
+    }
+
+    #[test]
+    fn note_undo_eviction_fires_once_on_active_edit_with_eviction() {
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        let id = e.active().id;
+        let v = e.active().document.version;
+        e.active_mut().document.version += 1;              // simulate an edit
+        e.active_mut().document.history.last_evicted = 1;  // that evicted
+        e.note_undo_eviction(id, v);
+        assert_eq!(e.status, UNDO_EVICTED_HINT);
+        assert_eq!(e.active().document.history.last_evicted, 0, "consumed");
+        // A later version bump (e.g. undo) must NOT replay the stale hint:
+        e.status.clear();
+        let v2 = e.active().document.version;
+        e.active_mut().document.version += 1;
+        e.note_undo_eviction(id, v2);
+        assert_ne!(e.status, UNDO_EVICTED_HINT, "no re-fire after reset");
+    }
+
+    #[test]
+    fn note_undo_eviction_ignores_no_edit_and_switch() {
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        let id = e.active().id;
+        let v = e.active().document.version;
+        e.active_mut().document.history.last_evicted = 1;
+        e.note_undo_eviction(id, v);                       // version unchanged → no edit
+        assert_ne!(e.status, UNDO_EVICTED_HINT, "no edit → no hint");
+        e.active_mut().document.version += 1;
+        e.note_undo_eviction(BufferId(id.0.wrapping_add(999)), v); // id mismatch → switch
+        assert_ne!(e.status, UNDO_EVICTED_HINT, "id mismatch (switch) → no hint");
     }
 }

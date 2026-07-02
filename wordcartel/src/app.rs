@@ -2146,7 +2146,9 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             exit_reason = ExitReason::InputLost;
             break;
         }
+        let (pre_id, pre_version) = { let b = editor.active(); (b.id, b.document.version) };
         let keep = reduce(msg, &mut editor, &reg, &keymap, &executor, &clock, &msg_tx);
+        editor.note_undo_eviction(pre_id, pre_version);
         crate::clipboard::drain_clipboard_intents(&mut editor, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
         reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
         recompute_scrollbar_visible(&mut editor, clock.now_ms());
