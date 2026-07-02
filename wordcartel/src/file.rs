@@ -127,6 +127,17 @@ pub fn open(path: &Path) -> Result<String, OpenError> {
 // save_atomic
 // ---------------------------------------------------------------------------
 
+/// Read `path` fully, capping the allocation at `limit` bytes. Returns `None` if the
+/// file exceeds `limit` OR any open/read error occurs — every caller treats `None` as
+/// its existing safe degradation. Mirrors `open`'s `.take(limit + 1)` + `len > limit`.
+pub fn bounded_read_opt(path: &Path, limit: u64) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    let f = fs::File::open(path).ok()?;
+    Read::read_to_end(&mut f.take(limit + 1), &mut buf).ok()?;
+    if buf.len() as u64 > limit { return None; }
+    Some(buf)
+}
+
 pub fn save_atomic(path: &Path, content: &str) -> Result<SaveOutcome, SaveError> {
     // (1) Symlink refusal — symlink_metadata does NOT follow the link.
     match path.symlink_metadata() {
@@ -134,8 +145,8 @@ pub fn save_atomic(path: &Path, content: &str) -> Result<SaveOutcome, SaveError>
         _ => {}
     }
 
-    // (2) Skip-unchanged — if on-disk bytes equal content bytes, skip the write.
-    if let Ok(existing) = fs::read(path) {
+    // (2) Skip-unchanged — bounded read; over-cap or unreadable → skip the optimization.
+    if let Some(existing) = bounded_read_opt(path, crate::limits::MAX_OPEN_BYTES) {
         if existing == content.as_bytes() {
             return Ok(SaveOutcome::Unchanged);
         }
@@ -210,6 +221,18 @@ mod tests {
         let got = open(&p).expect("open must succeed after save");
         assert_eq!(got, "hello world\n");
         let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn bounded_read_opt_caps_allocation() {
+        let p = scratch_path("bounded");
+        fs::write(&p, b"abc").unwrap();
+        assert_eq!(bounded_read_opt(&p, 4).as_deref(), Some(&b"abc"[..]), "3 ≤ limit 4 → Some");
+        assert_eq!(bounded_read_opt(&p, 3).as_deref(), Some(&b"abc"[..]), "exactly limit → Some");
+        fs::write(&p, b"0123456789").unwrap();
+        assert_eq!(bounded_read_opt(&p, 4), None, "10 > limit 4 → None");
+        let _ = fs::remove_file(&p);
+        assert_eq!(bounded_read_opt(&p, 4), None, "missing path → None");
     }
 
     /// Saving the SAME content again returns Unchanged (by OUTCOME, not mtime).

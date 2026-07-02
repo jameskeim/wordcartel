@@ -1932,8 +1932,11 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // Scratch buffers: their swap is pid-keyed, so look for an orphan from a
     // dead previous session (pre-merge blocker #1).
     if editor.active().document.path.is_some() {
-        // Read F's current bytes once for the predicate.
-        let file_bytes = editor.active().document.path.as_deref().and_then(|p| std::fs::read(p).ok());
+        // Bounded read: an over-cap document yields None → assess() Prompts (safe).
+        // (Narrow behavior change: a >64 MiB file whose bytes match the swap hash
+        // would previously DiscardSilently; it now Prompts. Safe direction.)
+        let file_bytes = editor.active().document.path.as_deref()
+            .and_then(|p| crate::file::bounded_read_opt(p, crate::limits::MAX_OPEN_BYTES));
         match crate::swap::assess(editor.active().document.path.as_deref(), file_bytes.as_deref()) {
             crate::swap::RecoveryDecision::OpenNormally => {}
             crate::swap::RecoveryDecision::DiscardSilently => {
@@ -2146,7 +2149,9 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             exit_reason = ExitReason::InputLost;
             break;
         }
+        let (pre_id, pre_version) = { let b = editor.active(); (b.id, b.document.version) };
         let keep = reduce(msg, &mut editor, &reg, &keymap, &executor, &clock, &msg_tx);
+        editor.note_undo_eviction(pre_id, pre_version);
         crate::clipboard::drain_clipboard_intents(&mut editor, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
         reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
         recompute_scrollbar_visible(&mut editor, clock.now_ms());

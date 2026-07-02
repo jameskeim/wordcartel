@@ -97,6 +97,7 @@ impl History {
     }
 
     pub fn undo(&mut self, buf: &mut TextBuffer) -> Option<Selection> {
+        self.last_evicted = 0; // undo commits nothing — keep the eviction transient honest
         if self.current == 0 {
             return None;
         }
@@ -109,6 +110,7 @@ impl History {
     }
 
     pub fn redo(&mut self, buf: &mut TextBuffer) -> Option<Selection> {
+        self.last_evicted = 0; // redo commits nothing — keep the eviction transient honest
         if self.current >= self.revisions.len() {
             return None;
         }
@@ -339,6 +341,31 @@ mod tests {
         hist.undo(&mut buf);
         hist.redo(&mut buf);
         assert_eq!(buf.to_string(), pre, "undo+redo round-trips after eviction");
+    }
+
+    #[test]
+    fn undo_and_redo_reset_last_evicted() {
+        use crate::buffer::TextBuffer;
+        let mut hist = History::default();
+        let mut buf = TextBuffer::from_str("");
+        let mut sel = Selection::single(0);
+        for _ in 0..3 {
+            let at = buf.len();
+            let cs = ChangeSet::from_ops(vec![Op::Retain(at), Op::Insert("zzz".into())], at);
+            sel = hist.commit(Transaction::new(cs), &mut buf, sel.clone());
+        }
+        hist.evict_to(5);
+        assert!(hist.last_evicted > 0, "precondition: eviction happened");
+        hist.undo(&mut buf);
+        assert_eq!(hist.last_evicted, 0, "undo commits nothing → resets last_evicted");
+        hist.last_evicted = 2; // re-arm the transient by hand
+        hist.redo(&mut buf);
+        assert_eq!(hist.last_evicted, 0, "redo commits nothing → resets last_evicted");
+        // Placement proof: a NO-OP undo (nothing to undo) still resets, because the
+        // reset precedes the `current == 0` early-return guard.
+        let mut h2 = History { last_evicted: 5, ..History::default() };
+        h2.undo(&mut buf);
+        assert_eq!(h2.last_evicted, 0, "no-op undo still consumes stale eviction state");
     }
 
     #[test]
