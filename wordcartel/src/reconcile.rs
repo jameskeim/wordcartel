@@ -124,6 +124,41 @@ mod tests {
         let _ = bid;
     }
 
+    /// A panicked reparse (upstream pulldown-cmark residual) is deterministic for
+    /// the offending text — without this fix, `maybe_stale` stays `true` after
+    /// `apply_panic`, the main-loop arm re-arms `due_at`, and the worker is
+    /// dispatched → panics → re-armed every ~150 ms in an infinite loop.
+    /// Fix: `apply_panic`'s `Reparse` arm must also clear `maybe_stale`.
+    #[test]
+    fn panicked_reparse_clears_maybe_stale_so_no_retry_loop() {
+        let mut e = crate::editor::Editor::new_from_text("para\n", None, (80, 24));
+        let bid = e.active().id;
+        let v = e.active().document.version;
+
+        // Simulate the state just before a panicked reconcile returns:
+        // in-flight (the job was running) and stale (the trigger that caused dispatch).
+        e.active_mut().reconcile.maybe_stale = true;
+        e.active_mut().reconcile.in_flight_version = Some(v);
+
+        // Synthesise a Panicked outcome — no real panic required.
+        let outcome = crate::jobs::JobOutcome::Panicked {
+            buffer_id: bid,
+            version: v,
+            kind: crate::jobs::JobKind::Reparse,
+            msg: "upstream pulldown residual (simulated)".into(),
+        };
+        crate::app::apply_outcome(outcome, &mut e);
+
+        assert!(
+            !e.active().reconcile.maybe_stale,
+            "panicked reparse must clear maybe_stale — otherwise the 150 ms retry loop fires forever"
+        );
+        assert!(
+            e.active().reconcile.in_flight_version.is_none(),
+            "in_flight_version must be cleared on a panicked reparse"
+        );
+    }
+
     #[test]
     fn reconcile_discards_when_version_advanced() {
         use wordcartel_core::block_tree;

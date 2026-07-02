@@ -216,10 +216,14 @@ fn apply_panic(buffer_id: crate::editor::BufferId, version: u64, kind: crate::jo
             editor.status = format!("swap failed (internal error: {msg})");
         }
         JobKind::Reparse => {
-            // A panicked reparse (e.g. the pulldown residual): drop the round,
-            // leave document.blocks unchanged; clear in-flight so a later
-            // reconcile can re-dispatch. No status noise.
-            if let Some(b) = editor.by_id_mut(buffer_id) { b.reconcile.in_flight_version = None; }
+            // A panicked reconcile (upstream pulldown-cmark residual) is deterministic
+            // for this text — clear maybe_stale so we do NOT re-arm and retry every
+            // debounce interval. The next edit re-sets maybe_stale via derive::rebuild,
+            // giving exactly one reconcile attempt per edit.
+            if let Some(b) = editor.by_id_mut(buffer_id) {
+                b.reconcile.in_flight_version = None;
+                b.reconcile.maybe_stale = false;
+            }
         }
         #[cfg(test)]
         JobKind::CoalesceProbe => { editor.status = format!("job failed (internal error: {msg})"); }
