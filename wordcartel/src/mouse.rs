@@ -154,11 +154,7 @@ pub fn handle(
                 let menu_rows = u16::from(editor.menu.is_some());
                 let edit_height = h.saturating_sub(1 + menu_rows) as usize;
                 let erow_in_track = ev.row.saturating_sub(menu_rows) as usize;
-                let fv = crate::fold::FoldView::compute(
-                    &editor.active().folds,
-                    &editor.active().document.blocks,
-                    &editor.active().document.buffer,
-                );
+                let fv = editor.active_fold_view();
                 let vis = fv.visible_count();
                 let max_ord = vis.saturating_sub(1);
                 let new_ord = (erow_in_track * max_ord).checked_div(edit_height).unwrap_or(0).min(max_ord);
@@ -219,11 +215,7 @@ pub fn handle(
                 let menu_rows = u16::from(editor.menu.is_some());
                 let edit_height = h.saturating_sub(1 + menu_rows) as usize;
                 let erow_in_track = ev.row.saturating_sub(menu_rows) as usize;
-                let fv = crate::fold::FoldView::compute(
-                    &editor.active().folds,
-                    &editor.active().document.blocks,
-                    &editor.active().document.buffer,
-                );
+                let fv = editor.active_fold_view();
                 let vis = fv.visible_count();
                 let max_ord = vis.saturating_sub(1);
                 let new_ord = (erow_in_track * max_ord).checked_div(edit_height).unwrap_or(0).min(max_ord);

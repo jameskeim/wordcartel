@@ -593,11 +593,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     // Scrollbar overlay (painted over editing area, rightmost column)
     // -----------------------------------------------------------------------
     if editor.mouse.scrollbar_visible {
-        let fv = crate::fold::FoldView::compute(
-            &editor.active().folds,
-            &editor.active().document.blocks,
-            &editor.active().document.buffer,
-        );
+        let fv = editor.active_fold_view();
         let total = fv.visible_count();
         let scroll_pos = fv.visible_ordinal(editor.active().view.scroll);
         let sb_area = Rect::new(area.x, edit_top, w, edit_height);

@@ -54,6 +54,10 @@ pub struct Document {
     pub history: History,
     pub blocks: BlockTree, // derived cache (Task 3 maintains)
     pub version: u64,
+    /// Monotonic id of `blocks`: bumped on EVERY `blocks` write (parse phase +
+    /// reconcile merge). Identifies the current tree across the reconcile-merge
+    /// boundary (where `version` is unchanged). Keys the FoldView + layout caches.
+    pub blocks_generation: u64,
     pub path: Option<PathBuf>,
     /// The document version last written to disk. `None` = never saved
     /// (new/scratch). `dirty()` is derived from this — no separate flag.
@@ -91,6 +95,10 @@ pub struct View {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MarkedBlock { pub start: usize, pub end: usize, pub hidden: bool }
 
+/// Memoized fold view keyed by `(blocks_generation, folds.epoch)`. Aliased to
+/// preempt `clippy::type_complexity` under the deny gate (no `#[allow]`).
+type FoldViewCache = std::cell::RefCell<Option<(u64, u64, std::rc::Rc<crate::fold::FoldView>)>>;
+
 #[derive(Debug, Clone)]
 pub struct Buffer {
     pub id: BufferId,
@@ -116,6 +124,14 @@ pub struct Buffer {
     pub reconcile: crate::reconcile::ReconcileStore,
     // 5g: per-buffer fold state
     pub folds: crate::fold::FoldState,
+    /// Memoized fold view, keyed by (blocks_generation, folds.epoch). Interior
+    /// mutability so the accessor is `&self` (nav reads via `&Editor`).
+    pub fold_view_cache: FoldViewCache,
+    /// Generation the folded set was last reconciled (pruned) against. `None` on a
+    /// fresh Buffer → the first rebuild always reconciles (covers reload/recovery).
+    pub last_reconciled_generation: Option<u64>,
+    /// Key `view.line_layouts` is currently valid for (Component 3, Task 3).
+    pub layout_key: Option<crate::derive::LayoutKey>,
     // 9a: persistent marked block (half-open [start,end)) + a deferred begin anchor.
     pub marked_block: Option<MarkedBlock>,
     pub pending_block_begin: Option<usize>,
@@ -138,6 +154,7 @@ impl Buffer {
             history: History::default(),
             blocks,
             version: 0,
+            blocks_generation: 0,
             stored_fp: path.as_deref().and_then(crate::save::fingerprint),
             path,
             saved_version: Some(0),
@@ -168,6 +185,9 @@ impl Buffer {
             diagnostics: crate::diagnostics_run::DiagStore::new(),
             reconcile: crate::reconcile::ReconcileStore::default(),
             folds: crate::fold::FoldState::default(),
+            fold_view_cache: std::cell::RefCell::new(None),
+            last_reconciled_generation: None,
+            layout_key: None,
             marked_block: None,
             pending_block_begin: None,
         }
@@ -201,13 +221,7 @@ impl Buffer {
         }
         // 5g: fold anchors are heading STARTS — use Before bias so an insertion
         // at the heading's first byte does not push the anchor into the body.
-        let remapped: std::collections::BTreeSet<usize> = self
-            .folds
-            .folded
-            .iter()
-            .map(|&b| wordcartel_core::change::map_pos_before(b, &cs))
-            .collect();
-        self.folds.folded = remapped;
+        self.folds.remap(&cs);
         // 9A: the marked block follows the text. start uses map_pos, end + pending use
         // map_pos_before → boundary inserts stay outside the half-open [start,end).
         self.pending_block_begin = self.pending_block_begin
@@ -232,7 +246,7 @@ impl Buffer {
                 self.sel_history.clear();
                 // 5g: drop fold anchors now past EOF; rebuild reconciles the rest.
                 let len = self.document.buffer.len();
-                self.folds.folded.retain(|&b| b <= len);
+                self.folds.clamp(len);
                 // 9A: undo/redo bypass apply's mapping → clear the block (acting on stale offsets unsafe).
                 self.marked_block = None;
                 self.pending_block_begin = None;
@@ -251,7 +265,7 @@ impl Buffer {
                 self.sel_history.clear();
                 // 5g: drop fold anchors now past EOF; rebuild reconciles the rest.
                 let len = self.document.buffer.len();
-                self.folds.folded.retain(|&b| b <= len);
+                self.folds.clamp(len);
                 // 9A: undo/redo bypass apply's mapping → clear the block (acting on stale offsets unsafe).
                 self.marked_block = None;
                 self.pending_block_begin = None;
@@ -259,6 +273,14 @@ impl Buffer {
             }
             None => false,
         }
+    }
+
+    /// Clear the visible-line layout cache AND its key — the invariant is
+    /// "layout_key == Some(k) ⟹ line_layouts valid for k". Route every EXTERNAL
+    /// line_layouts clear through this (Resize, reload/recovery).
+    pub fn invalidate_layout(&mut self) {
+        self.view.line_layouts.clear();
+        self.layout_key = None;
     }
 }
 
@@ -424,6 +446,25 @@ impl Editor {
         debug_assert!(!self.buffers.is_empty() && self.active < self.buffers.len(), "len>=1 + active in range");
         let i = self.active; &mut self.buffers[i]
     }
+    /// The active buffer's fold view, memoized by (blocks_generation, folds.epoch).
+    /// Pure: never mutates document/fold state, so it takes `&self` and is usable
+    /// from the `&Editor` nav helpers.
+    pub fn active_fold_view(&self) -> std::rc::Rc<crate::fold::FoldView> {
+        let b = self.active();
+        let key = (b.document.blocks_generation, b.folds.epoch);
+        {
+            let cache = b.fold_view_cache.borrow();
+            match &*cache {
+                Some((g, e, rc)) if *g == key.0 && *e == key.1 => return rc.clone(),
+                _ => {}
+            }
+        } // Ref dropped here, before borrow_mut below
+        let view = std::rc::Rc::new(
+            crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer));
+        *b.fold_view_cache.borrow_mut() = Some((key.0, key.1, view.clone()));
+        view
+    }
+
     pub fn by_id(&self, id: BufferId) -> Option<&Buffer> { self.buffers.iter().find(|b| b.id == id) }
     pub fn by_id_mut(&mut self, id: BufferId) -> Option<&mut Buffer> { self.buffers.iter_mut().find(|b| b.id == id) }
     /// Allocate a fresh, never-reused BufferId.
@@ -677,6 +718,68 @@ mod tests {
     struct TestClock(std::cell::Cell<u64>);
     impl wordcartel_core::history::Clock for TestClock {
         fn now_ms(&self) -> u64 { self.0.get() }
+    }
+
+    // ------------------------------------------------------------------
+    // F2: shared cached FoldView (blocks_generation + folds.epoch key)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn active_fold_view_reuses_rc_when_unchanged() {
+        let e = Editor::new_from_text("# A\nbody\n", None, (80, 24));
+        let v1 = e.active_fold_view();
+        let v2 = e.active_fold_view();
+        assert!(std::rc::Rc::ptr_eq(&v1, &v2), "same state → cached Rc reused");
+    }
+
+    #[test]
+    fn active_fold_view_recomputes_on_generation_bump() {
+        let mut e = Editor::new_from_text("# A\nbody\n", None, (80, 24));
+        let v1 = e.active_fold_view();
+        let g = e.active().document.blocks_generation;
+        e.active_mut().document.blocks_generation = g.wrapping_add(1);
+        let v2 = e.active_fold_view();
+        assert!(!std::rc::Rc::ptr_eq(&v1, &v2), "generation bump invalidates the cache");
+    }
+
+    #[test]
+    fn active_fold_view_recomputes_on_fold_toggle() {
+        let mut e = Editor::new_from_text("# A\nbody\n", None, (80, 24));
+        let v1 = e.active_fold_view();
+        e.active_mut().folds.toggle(0); // fold the "# A" heading at byte 0
+        let v2 = e.active_fold_view();
+        assert!(!std::rc::Rc::ptr_eq(&v1, &v2), "fold epoch bump invalidates the cache");
+    }
+
+    #[test]
+    fn cached_foldview_equals_fresh() {
+        let mut e = Editor::new_from_text("# A\nbody\n", None, (80, 24));
+        e.active_mut().folds.toggle(0);
+        let cached = e.active_fold_view();
+        let fresh = {
+            let b = e.active();
+            crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer)
+        };
+        assert_eq!(*cached, fresh, "cached view is byte-identical to a fresh compute");
+    }
+
+    #[test]
+    fn merge_bumps_generation_invalidates() {
+        // Regression guard: the reconcile merge adopts a new tree WITHOUT bumping
+        // document.version — it bumps blocks_generation instead. The FoldView cache
+        // keys on blocks_generation, so it must still invalidate across the merge.
+        let mut e = Editor::new_from_text("# A\nbody\n", None, (80, 24));
+        let id = e.active().id;
+        let v1 = e.active_fold_view();
+        let other_tree = wordcartel_core::block_tree::full_parse_rope(
+            &TextBuffer::from_str("# A\n## B\nbody\n").snapshot());
+        {
+            let b = e.by_id_mut(id).expect("active buffer by id");
+            b.document.blocks = other_tree;
+            b.document.blocks_generation = b.document.blocks_generation.wrapping_add(1);
+        }
+        let v2 = e.active_fold_view();
+        assert!(!std::rc::Rc::ptr_eq(&v1, &v2), "merge generation bump must invalidate the FoldView cache");
     }
 
     #[test]

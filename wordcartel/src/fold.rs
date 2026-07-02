@@ -11,6 +11,8 @@ use wordcartel_core::outline;
 #[derive(Debug, Clone, Default)]
 pub struct FoldState {
     pub folded: BTreeSet<usize>,
+    /// Bumped whenever `folded` changes — the fold-identity token for the FoldView cache.
+    pub epoch: u64,
 }
 
 impl FoldState {
@@ -22,21 +24,65 @@ impl FoldState {
         if !self.folded.remove(&heading_byte) {
             self.folded.insert(heading_byte);
         }
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     pub fn fold_all(&mut self, blocks: &BlockTree, buf: &TextBuffer) {
         self.folded = outline::heading_starts(blocks, &buf.snapshot());
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     pub fn unfold_all(&mut self) {
-        self.folded.clear();
+        if !self.folded.is_empty() {
+            self.folded.clear();
+            self.epoch = self.epoch.wrapping_add(1);
+        }
+    }
+
+    /// Prune anchors not in `starts` (decoupled reconcile). Bumps only on change.
+    pub fn reconcile_to(&mut self, starts: &BTreeSet<usize>) {
+        let before = self.folded.len();
+        self.folded.retain(|b| starts.contains(b));
+        if self.folded.len() != before {
+            self.epoch = self.epoch.wrapping_add(1);
+        }
+    }
+
+    /// Remove one anchor (unfold_ancestors_of). Bumps on change.
+    pub fn remove(&mut self, byte: usize) {
+        if self.folded.remove(&byte) {
+            self.epoch = self.epoch.wrapping_add(1);
+        }
+    }
+
+    /// Replace the folded set wholesale (session restore). Always bumps.
+    pub fn replace_folded(&mut self, new: BTreeSet<usize>) {
+        self.folded = new;
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// Clamp anchors to `<= len` (undo/redo). Bumps on change.
+    pub fn clamp(&mut self, len: usize) {
+        let before = self.folded.len();
+        self.folded.retain(|&b| b <= len);
+        if self.folded.len() != before {
+            self.epoch = self.epoch.wrapping_add(1);
+        }
+    }
+
+    /// Remap anchors through a ChangeSet (Buffer::apply). Always bumps (spans shift).
+    pub fn remap(&mut self, cs: &wordcartel_core::change::ChangeSet) {
+        self.folded = self.folded.iter()
+            .map(|&b| wordcartel_core::change::map_pos_before(b, cs))
+            .collect();
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     /// Drop anchors that no longer start a heading (validated against
-    /// `outline::heading_starts`). Called after edits/undo/redo/reopen.
+    /// `outline::heading_starts`). Called by session restore (`app.rs`).
     pub fn reconcile(&mut self, blocks: &BlockTree, buf: &TextBuffer) {
         let starts = outline::heading_starts(blocks, &buf.snapshot());
-        self.folded.retain(|b| starts.contains(b));
+        self.reconcile_to(&starts);
     }
 
     /// Hidden body ranges in BYTES. Computed from `outline::sections` in ONE
@@ -56,7 +102,7 @@ impl FoldState {
 }
 
 /// A merged hidden run in LINE space, with the visible heading line that owns it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct HiddenRun {
     lines: Range<usize>, // [start, end) hidden body lines
     owner: usize,        // the visible heading line a caret/scroll snaps to
@@ -66,7 +112,7 @@ struct HiddenRun {
 /// operation that walks lines; every line-space consumer routes through it.
 /// Hidden runs are MERGED (overlapping/adjacent ranges from nested folds are
 /// coalesced) so `visible_count`/ordinals never double-count.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FoldView {
     hidden: Vec<HiddenRun>, // sorted by start, non-overlapping after merge
     total: usize,

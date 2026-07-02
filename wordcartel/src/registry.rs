@@ -506,7 +506,7 @@ pub(crate) fn unfold_ancestors_of(editor: &mut crate::editor::Editor, byte: usiz
     for hb in anchors {
         let body = wordcartel_core::outline::body_range(&blocks, &rope, hb);
         if byte >= body.start && byte < body.end {
-            editor.active_mut().folds.folded.remove(&hb);
+            editor.active_mut().folds.remove(hb);
         }
     }
 }

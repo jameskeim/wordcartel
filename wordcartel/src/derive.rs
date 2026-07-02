@@ -3,6 +3,12 @@ use wordcartel_core::block_tree;
 use wordcartel_core::buffer::TextBuffer;
 use wordcartel_core::layout;
 
+/// Key the visible-line layout cache (`view.line_layouts`) is valid for.
+/// Placeholder for Component 3 (Task 3 fills its fields); present now so the
+/// `Buffer.layout_key` field and `invalidate_layout` compile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutKey;
+
 // ---------------------------------------------------------------------------
 // Logical-line helpers
 // ---------------------------------------------------------------------------
@@ -132,7 +138,9 @@ pub fn rebuild(editor: &mut Editor) {
             full_parse_phase(editor, &new_rope, new_len)
         };
 
+        let next_gen = editor.active().document.blocks_generation.wrapping_add(1);
         editor.active_mut().document.blocks = new_blocks;
+        editor.active_mut().document.blocks_generation = next_gen;
         editor.active_mut().reconcile.blocks_version = version;
         editor.active_mut().reconcile.maybe_stale = stale;
     }
@@ -159,16 +167,20 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
     // 5g: Reconcile fold anchors against the fresh block tree, then build
     // a FoldView for the visible-line walk below.
     // ------------------------------------------------------------------
+    // Generation-gated fold-anchor prune (was every-draw). No per-draw deep clone:
+    // compute heading starts under an immutable borrow, then retain.
     {
-        let b = editor.active_mut();
-        let blocks = b.document.blocks.clone();
-        let buf = b.document.buffer.clone();
-        b.folds.reconcile(&blocks, &buf);
+        let gen = editor.active().document.blocks_generation;
+        if editor.active().last_reconciled_generation != Some(gen) {
+            let starts = {
+                let b = editor.active();
+                wordcartel_core::outline::heading_starts(&b.document.blocks, &b.document.buffer.snapshot())
+            };
+            editor.active_mut().folds.reconcile_to(&starts);
+            editor.active_mut().last_reconciled_generation = Some(gen);
+        }
     }
-    let fold_view = {
-        let b = editor.active();
-        crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer)
-    };
+    let fold_view = editor.active_fold_view();
 
     // ------------------------------------------------------------------
     // 2. Visible range
