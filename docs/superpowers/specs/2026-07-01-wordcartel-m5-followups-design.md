@@ -1,6 +1,6 @@
 # M5 follow-ups: undo-eviction hint + bound the last document-sized reads — design
 
-**Status:** spec-review round 2 folded (universal main-loop hint check + fingerprint metadata fallback); re-review pending
+**Status:** spec-review round 3 folded (core last_evicted reset in undo/redo closes the residual false-positive); re-review pending
 **Date:** 2026-07-01
 **Effort:** M5 follow-ups (pre-Effort-P; two small M5 leftovers, one bundled effort)
 
@@ -8,7 +8,9 @@
 
 M5 (resource caps) left two documented loose ends. This effort closes both. They
 share no code but are both small "finish M5" cleanups, bundled into one branch to
-amortize the gated-pipeline overhead. **Shell-only; no `wordcartel-core` changes.**
+amortize the gated-pipeline overhead. **Almost entirely shell-side; the one
+`wordcartel-core` change is a 2-line correctness tweak in `History::undo`/`redo`
+(reset `last_evicted = 0`) — see Component (a).**
 
 - **(a) Undo-eviction hint is incomplete.** M5 bounds undo history by BYTES
   (`MAX_UNDO_BYTES = 64 MiB`, `history.rs:9`): when the retained revisions exceed
@@ -39,12 +41,15 @@ amortize the gated-pipeline overhead. **Shell-only; no `wordcartel-core` changes
   single-sourcing the hint text.
 - Bound the three remaining document-sized reads at the `MAX_OPEN_BYTES` cap, each
   falling back to its existing safe degradation on over-cap (no user-facing error).
-- No behavior change beyond the hint surfacing + the allocation cap; no core changes.
+- No behavior change beyond the hint surfacing + the allocation cap; the only core
+  change is the `last_evicted` reset in `undo`/`redo` (Component (a)).
 
 ## Non-goals
 
-- No change to the eviction mechanism itself (core `evict_to` is unchanged and
-  already correct on every path) — this is hint surfacing only.
+- No change to the eviction MECHANISM (core `evict_to` and the byte budget are
+  unchanged and already correct on every path). The one core edit is a semantic
+  fix to the `last_evicted` transient: `undo`/`redo` commit nothing, so they now
+  reset it to 0 (see Component (a)).
 - No new user-facing errors for over-cap auxiliary reads; the over-cap fallback is
   the existing safe degradation at each site (see below).
 - No change to the authoritative load path (`file::open` is already bounded).
@@ -91,6 +96,16 @@ production edit funnels through exactly one `reduce(...)` call there.
 - **Remove `Editor::apply`'s inline hint** (`editor.rs:646`): now redundant (a
   keystroke edit bumps the active version → the run-loop check fires). `Editor::apply`
   becomes a plain delegator. Hint logic lives in exactly one place.
+- **Core fix (2 lines): reset `last_evicted` in `History::undo`/`redo`** (`history.rs:99`/`:111`).
+  `last_evicted` means "revisions dropped on the most recent commit"; `undo`/`redo`
+  drop nothing, so it should be 0 afterward. Without this, an INACTIVE-buffer
+  evicting edit (transform/paste/scratch to a non-active buffer — never consumed by
+  the active-buffer check) leaves `last_evicted > 0`; a later switch to that buffer
+  followed by an undo/redo (which bump `version` but do not call `evict_to`) would
+  fire a spurious hint. Adding `self.last_evicted = 0;` at the top of `undo` and
+  `redo` makes the field honest and closes that residual false-positive at the root.
+  Breaks no core test (`eviction_keeps_current_consistent_for_undo_redo` asserts
+  `last_evicted > 0` BEFORE its undo/redo, `history.rs:334`).
 
 Rationale for override (not a combined message): uniform hint across all edit
 paths, reuses one string, and eviction (>64 MiB undo history) is rare — the
@@ -103,15 +118,19 @@ on screen regardless.
 - `version != pre_version` gate: fires only when the active buffer was actually
   edited this reduce (version is monotonic per buffer).
 - reset-to-0: the evicting commit's hint shows exactly once; a subsequent
-  undo/redo (which bumps version without calling `evict_to`) sees `last_evicted == 0`
-  → no spurious re-fire. `last_evicted` is already a per-commit transient (`evict_to`
-  zeroes it at the start of every commit), so the shell consuming it is consistent.
+  undo/redo on the active buffer sees `last_evicted == 0` (the shell consumed it, AND
+  the core fix above zeroes it on undo/redo anyway) → no spurious re-fire.
+  `last_evicted` is a per-commit transient (`evict_to` zeroes it at the start of every
+  commit), so both the shell consuming it and the undo/redo reset are consistent.
 
 **Known best-effort gaps (documented, acceptable for a cosmetic hint):**
 - An edit AND a buffer-switch in the SAME reduce: the post-reduce active id differs
   from `pre_id` → no hint. Rare, cosmetic.
-- Edits to an INACTIVE buffer (inactive transform/paste/scratch) do not change
-  `active().version` → no hint, correct (that buffer is not on screen).
+- Edits to an INACTIVE buffer (inactive transform/paste/scratch) do not surface the
+  hint at edit time (they don't change `active().version`) — correct, that buffer is
+  not on screen. With the core `undo`/`redo` reset, switching to such a buffer and
+  undoing/redoing no longer fires a spurious hint either. The genuine eviction on
+  that buffer simply isn't announced (invisible when it happened); acceptable.
 
 ## Component (b) — bound the three remaining reads
 
@@ -192,6 +211,9 @@ files hash identically (no fingerprint churn).
   `apply_does_not_set_hint_when_no_eviction` (`editor.rs:1079`) to target the helper
   (its assertion — no hint without eviction — still holds; `Editor::apply` no longer
   carries the check).
+- **(a) core reset:** add a `wordcartel-core` test that after an evicting commit
+  (`evict_to` → `last_evicted > 0`), a subsequent `undo` resets `last_evicted == 0`,
+  and likewise `redo` — proving the field is honest after non-committing operations.
 - **(b) `bounded_read_opt`:** takes `limit` as a param → test with a TINY limit (no
   large file): write a 3-byte file with `limit = 4` → `Some`; write a 10-byte file
   with `limit = 4` → `None`; a missing path → `None`.
@@ -206,10 +228,11 @@ files hash identically (no fingerprint churn).
 
 ## Decomposition
 
-- **Task 1 — (a):** `UNDO_EVICTED_HINT` const + `Editor::note_undo_eviction(pre_id,
+- **Task 1 — (a):** the core `last_evicted = 0` reset in `History::undo`/`redo` +
+  its core test; `UNDO_EVICTED_HINT` const + `Editor::note_undo_eviction(pre_id,
   pre_version)` helper (with the `last_evicted` reset) + remove `Editor::apply`'s
   inline hint + capture `(id, version)` before the run-loop `reduce` call (`app.rs:2149`)
-  and call the helper after + tests.
+  and call the helper after + shell tests.
 - **Task 2 — (b):** `file::bounded_read_opt` helper + convert the recovery-predicate
   and skip-unchanged sites (direct `None`) + convert `fingerprint()` to the
   metadata-fallback shape + tests.
