@@ -1095,7 +1095,7 @@ mod tests {
         e.apply(Transaction::new(cs), Edit { range: 0..0, new_len: 1 }, EditKind::Type, &clk);
         assert_ne!(
             e.status,
-            "Undo history full — oldest dropped",
+            UNDO_EVICTED_HINT,
             "a tiny edit must not set the eviction hint"
         );
     }
