@@ -1,6 +1,6 @@
 # F1: bound the synchronous WidenToEnd reparse — design
 
-**Status:** Codex-clean (r4) + Fable5 folded (I1-I4 + M1-M6); re-verify pending
+**Status:** Fable5 folded + Codex fold-verify corrections (I2 reason=NoOverlapFull, I4 +2 sites); re-verify pending
 **Date:** 2026-07-02
 **Effort:** F1 (responsiveness follow-up; the second of the two deferred from editing-responsiveness — F8 was assessed and shelved: its "bound layout to visible rows" premise is unsafe because `ColMap` consumers need the whole logical line)
 
@@ -140,16 +140,21 @@ accepted (M4-rest) behavior whose stale footprint is now larger.
   arrivals at :915 (base ≤ cap, considering a first-time extension), gated the same three-way
   way. Case B (first gate `WidenToEnd`) is unchanged from today.
 - **Seam-guard escape hatch — the freeze ceiling is best-effort, not absolute (Fable I2).**
-  Today's `WidenToEnd` has no "after" blocks, so the post-splice seam-consistency guard
-  (`merge_at`, block_tree.rs:970-982) can never fire. `BoundedStale` CREATES a reparse|after
-  seam, so for specific adjacencies (e.g. the base's last List becomes a Paragraph abutting a
-  shifted `IndentedCode` with no blank line → `paragraph_absorbs_next`) the guard triggers a
-  synchronous `full_parse_src(new_src)` — O(document), i.e. the freeze survives for those rare
-  shapes. This is CORRECT (the full parse is right) but not cheaper. Accepted + documented: the
-  cap is a freeze ceiling for the common Case-A shapes (fences, list/table downstream-merge),
-  not an absolute guarantee for every adjacency. Plan-confirm: when the seam guard fires on a
-  would-be-`BoundedStale`, the result is a full correct parse → tag it `WidenToEnd` (correct,
-  no `maybe_stale`), NOT `BoundedStale` (which would schedule a redundant reconcile pass).
+  Today's `WidenToEnd` has no "after" blocks, so the post-splice seam guard's AFTER-seam
+  (`merge_at` over after-blocks, block_tree.rs:970-982) can never fire for it (the before-seam
+  is still evaluated — Codex). `BoundedStale` CREATES after-blocks, so for specific adjacencies
+  (e.g. the base's last List becomes a Paragraph abutting a shifted `IndentedCode` with no
+  blank line → `paragraph_absorbs_next`) the AFTER-seam triggers a synchronous
+  `full_parse_src(new_src)` — O(document), i.e. the freeze survives for those rare shapes. This
+  is CORRECT (the full parse is right) but not cheaper. Accepted + documented: the cap is a
+  freeze ceiling for the common Case-A shapes (fences, list/table downstream-merge), not an
+  absolute guarantee for every adjacency. **Reason for the seam-tripped case (Codex — corrected):
+  it must be `NoOverlapFull`** — the existing seam-guard `full_parse_src` reason at
+  block_tree.rs:975, which `derive.rs:139` treats as NON-stale (so no redundant reconcile over
+  an already-correct full parse). NOT `BoundedStale` and NOT `WidenToEnd` — both are marked
+  stale by `derive.rs`. Plan-confirm: confirm the seam-guard path already yields `NoOverlapFull`
+  for the bounded case (the reason set earlier is overridden when the guard does the full parse);
+  if not, ensure the guard overrides it.
 - **`reparsed_bytes`** is set from `new_region.len()` at block_tree.rs:930, AFTER all base
   growth. Because `BoundedStale` installs the PREDICTED base bounds (which already include the
   slack/straddle/trailing-gap finalization) and classifies against their size, `reparsed_bytes`
@@ -194,6 +199,8 @@ variant exists or is needed, Codex round 2) to read `outcome.reason`. Then:
     false-positive trap. Skip the `== full` when `reason == BoundedStale`.
   - `assert_all_paths_agree_det` (block_tree_oracle.rs:803-825) and the chained regression body
     in `regression_inline_link_end_corrupts_list_nesting` (:779-794).
+  - the additional unconditional `== full` sites at block_tree_oracle.rs:714 and :731 (Codex —
+    small fixed docs, low risk, but the inventory should be complete).
   - the in-module `check` (block_tree.rs:1325).
 - Note: the proptest/fuzz generators only produce small (KB) docs → never reach the cap →
   never emit `BoundedStale` today, so the existing suites stay green regardless. The carve-out
@@ -255,8 +262,8 @@ convergence theorem already covers it.
 
 1. **Core** — `WidenReason::BoundedStale` + `MAX_SYNC_WIDEN_BYTES` + the three-way size gate
    with copy-prediction (first trigger) + the second-trigger "never extend after a first-gate
-   BoundedStale" rule (I1) + the seam-guard `WidenToEnd` re-tag (I2) + `reparsed_bytes`
-   accounting + the `derive.rs` `maybe_stale` one-liner. Existing tests stay green.
+   BoundedStale" rule (I1) + confirm the seam-tripped case yields `NoOverlapFull` (I2) +
+   `reparsed_bytes` accounting + the `derive.rs` `maybe_stale` one-liner. Existing tests stay green.
 2. **Oracle carve-out + tests** — convert the macros to `incremental_update_instrumented_src`
    (assert `str_reason == rope_reason`); the FULL carve-out inventory (I4:
    `check`/`assert_all_paths_agree!`/chain-reset + `incremental_equals_full` fuzz oracle +
