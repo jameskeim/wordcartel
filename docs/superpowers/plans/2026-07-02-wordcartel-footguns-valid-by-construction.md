@@ -69,7 +69,7 @@ This is a compiler-guided refactor. Per task: (1) add the accessors, (2) drop `p
   - `derive.rs:768-769` (the layout-gate rerun test's `document.blocks_generation = …wrapping_add(1)`) → `let t = e.active().document.blocks().clone(); e.active_mut().document.set_blocks(t);` (bumps generation with UNCHANGED blocks — the sub-case's intent).
   - Convert the sibling-test READS too (compiler-flagged; e.g. `render.rs:1274`, `commands.rs:1386/1406/1426`, `nav.rs:1203-1428`, `transform.rs:220`, `mouse.rs:334`, `save.rs:674/681`, `app.rs:4751-4785`, and the `derive.rs`/`reconcile.rs` test reads). None of these tests assert a specific post-write `blocks_generation` (confirmed in spec review), so no expected-value adjustments — but WATCH for one and adjust if the compiler-fixed site had such an assertion.
 
-- [ ] **Step 6: Verify grep completeness** — `git grep -n '\.blocks\b'` / `'\.blocks_generation\b'` across the crate; confirm every remaining bare-field hit is in-module (`editor.rs` incl. `editor::tests`) or is the accessor definitions themselves. Bare-field grep (not `.document.`) catches alias-binding sites.
+- [ ] **Step 6: Verify grep completeness** — `git grep -n '\.blocks\b'` / `'\.blocks_generation\b'` across the crate; confirm every remaining bare-field hit is in-module (`editor.rs` incl. `editor::tests`) or is the accessor definitions themselves. Bare-field grep (not `.document.`) catches alias-binding sites. Filter comment/doc hits (e.g. jobs.rs, reconcile.rs:3, derive.rs:178) when checking remaining bare-field matches.
 
 - [ ] **Step 7: Run + gates + commit** — `cargo test -p wordcartel -p wordcartel-core` green; `cargo clippy --workspace --all-targets` clean.
 ```bash
@@ -81,7 +81,7 @@ git commit -m "refactor(editor): privatize Document.blocks/blocks_generation beh
 
 ### Task 2: Component 2 — privatize `FoldState.folded` / `epoch`
 
-**Files:** Modify `wordcartel/src/fold.rs` (struct + accessors), and convert reads/writes in `registry.rs`, `render.rs`, `app.rs`, `editor.rs`, `derive.rs`, `save.rs` (+ test modules).
+**Files:** Modify `wordcartel/src/fold.rs` (struct + accessors), and convert reads/writes in `registry.rs`, `render.rs`, `app.rs`, `editor.rs`, `derive.rs`, `save.rs`, `marks.rs` (test `folded` reads at `:173/:221`) (+ test modules).
 
 **Interfaces produced:** `FoldState::folded(&self) -> &BTreeSet<usize>`, `FoldState::epoch(&self) -> u64`. (The 8 bumping mutators already exist.)
 
@@ -111,7 +111,7 @@ Also add a one-line doc note on the mutator block (fold.rs:23-79) that they are 
   - `app.rs:4748` (`folds.folded.insert(hb)`) → `folds.toggle(hb)` (inserts since the anchor is absent). That test consumes fold state via a direct `FoldView::compute` (not the epoch-keyed cache), so the extra epoch bump is inert.
   - Convert the sibling-test `folded`/`epoch` READS the compiler flags → the getters.
 
-- [ ] **Step 6: Verify grep completeness** — `git grep -n '\.folded\b'` / `'\.epoch\b'` (filter to `FoldState`); confirm remaining bare-field hits are in-module (`fold.rs` incl. `fold::tests`) or the accessor defs. Confirm NO production whole-struct `folds =` / `document =` remains that bypasses a bump.
+- [ ] **Step 6: Verify grep completeness** — `git grep -n '\.folded\b'` / `'\.epoch\b'` (filter to `FoldState`); confirm remaining bare-field hits are in-module (`fold.rs` incl. `fold::tests`) or the accessor defs (filter comment/doc hits). Confirm NO production whole-struct `folds =` / `document =` remains that bypasses a bump.
 
 - [ ] **Step 7: Run + gates + commit** — full `cargo test -p wordcartel -p wordcartel-core` green; `cargo clippy --workspace --all-targets` clean.
 ```bash
