@@ -141,8 +141,11 @@ Expected: PASS (identical behavior — the helpers contain the same logic; no pa
         let mut base_end = region_old_end;
         apply_local_slack(tops, old_src, &mut base_start, &mut base_end, slack_pos, have_overlap);
         repair_region(tops, old_src, &mut base_start, &mut base_end);
-        let base_region_size = base_end.saturating_sub(base_start);
-        let widen_span = old_src.len().saturating_sub(region_old_start);
+        // Size in NEW-text bytes — `reparsed_bytes` is `new_region.len()` AFTER `delta` (Codex):
+        // an insertion can push the actual reparse over the cap even when the old base fits.
+        let base_new_end = (base_end as isize + delta) as usize;
+        let base_region_size = base_new_end.saturating_sub(base_start);
+        let widen_span = new_src.len().saturating_sub(region_old_start);
         if widen_span <= MAX_SYNC_WIDEN_BYTES {
             // cheap extension → widen fully, exactly as today
             region_old_end = old_src.len();
@@ -162,15 +165,27 @@ Expected: PASS (identical behavior — the helpers contain the same logic; no pa
 
 (The subsequent shared `repair_region` call from Step 4 runs on the installed BoundedStale bounds idempotently; `fm_floor` at :892 then clamps `region_old_start`, so the actual reparse is ≤ `base_region_size` ≤ cap.)
 
-- [ ] **Step 7: Add the I1 second-trigger guard.** The created-container growth (block_tree.rs:915) must NOT fire for `BoundedStale` (else it re-parses base+extension → ~3×cap). Change:
+- [ ] **Step 7: Size-gate the second (created-container) widen — the SAME three-way logic (I1 + Codex Important-2).** The created-container growth (block_tree.rs:915-929) unconditionally extends to EOF when the reparse's tail is absorptive. Two problems: (a) a first-gate `BoundedStale` would get re-extended to EOF (~3×cap — I1); (b) a `Local` arrival whose edit CREATES an absorptive container reaching the boundary (e.g. typing `- ` at the top of a large doc) still widens to EOF synchronously — an unbounded freeze the spec's second-trigger gate is meant to bound. Note: a first-gate `WidenToEnd` never reaches here (`region_old_end == old_src.len()` already, per the :913 comment), so this block only sees `Local`/`BoundedStale` arrivals. Replace the `if tail_absorptive { ... }` body (block_tree.rs:922-928) with the size gate — keeping the already-parsed `reparsed`/`new_region` (base) when bounding, so NO second parse happens in Case A:
+
 ```rust
-    if region_old_end < old_src.len() {
+        if tail_absorptive {
+            // F1: gate the second widen the same three-way way as the first.
+            let widen_span = new_src.len().saturating_sub(region_new_start);
+            let base_new_size = region_new_end.saturating_sub(region_new_start);
+            if widen_span <= MAX_SYNC_WIDEN_BYTES || base_new_size > MAX_SYNC_WIDEN_BYTES {
+                // cheap extension, or Case B (base already > cap) → extend to EOF, as today
+                region_old_end = old_src.len();
+                region_new_end = (region_old_end as isize + delta) as usize;
+                new_region = new_src.slice(region_new_start..region_new_end);
+                reparsed = parse_region(&new_region.as_ref(), 0..new_region.len(), region_new_start);
+                reason = WidenReason::WidenToEnd;
+            } else {
+                // Case A: keep the already-parsed base region (no second parse), defer.
+                reason = WidenReason::BoundedStale;
+            }
+        }
 ```
-to:
-```rust
-    if region_old_end < old_src.len() && reason != WidenReason::BoundedStale {
-```
-(For `BoundedStale`, `region_old_end` is the base end < EOF, so without this guard the tail-absorptive check could extend to EOF — exactly the freeze F1 avoids. The tail-absorption effect is part of what stays stale and is reconciled.)
+(For a first-gate `BoundedStale` arriving here, `base_new_size ≤ cap` so the `else` keeps it `BoundedStale` with no re-parse — subsuming the I1 skip; for a `Local` arrival with a big absorptive tail, `widen_span > cap` and `base_new_size ≤ cap` → bound it. `reparsed_bytes = new_region.len()` stays the already-parsed base ≤ cap.)
 
 - [ ] **Step 8: Wire `derive.rs`.** In `wordcartel/src/derive.rs:139-142`, add `BoundedStale` to the stale `matches!`:
 ```rust
@@ -247,6 +262,21 @@ to:
     }
 
     #[test]
+    fn f1_created_container_local_is_bounded() {
+        // Typing "- " at the top of a big paragraph doc CREATES an absorptive list — the OLD
+        // tree has no container there, so the FIRST gate is Local; the created-container
+        // SECOND trigger would extend to EOF. F1's second-trigger gate must bound it.
+        let doc = "para\n\n".repeat(260_000);
+        assert!(doc.len() > MAX_SYNC_WIDEN_BYTES);
+        let (new_text, edit) = apply_edit(&doc, 0..0, "- ");
+        let outcome = incremental_update_instrumented(&full_parse(&doc), &doc, &edit, &new_text);
+        assert_eq!(outcome.reason, WidenReason::BoundedStale,
+            "a created-container Local edit on a big doc must bound at the second trigger");
+        assert!(outcome.reparsed_bytes <= MAX_SYNC_WIDEN_BYTES);
+        assert_valid_tree(&outcome.tree, new_text.len());
+    }
+
+    #[test]
     fn f1_successive_bounded_stale_edits_no_reset() {
         // Production feeds a BoundedStale tree into the NEXT incremental_update WITHOUT a
         // reset (unlike the oracle). Two bounded edits in a row must stay panic-free + valid.
@@ -306,8 +336,12 @@ macro_rules! assert_all_paths_agree {
         let ot = full_parse(old);
         let full = full_parse(new);
         let str_out = wordcartel_core::block_tree::incremental_update_instrumented(&ot, old, edit, new);
+        // TextSource is impl'd for `&Rope`, so S = &Rope and the generic's `&S` needs `&&Rope`
+        // (mirrors derive.rs:129-132). Bind the ropes to locals, then pass `&&local`.
+        let old_rope = Rope::from_str(old);
+        let new_rope = Rope::from_str(new);
         let rope_out = wordcartel_core::block_tree::incremental_update_instrumented_src(
-            &ot, &Rope::from_str(old), edit, &Rope::from_str(new),
+            &ot, &&old_rope, edit, &&new_rope,
         );
         prop_assert_eq!(str_out.reason, rope_out.reason,
             "\nstr reason != rope reason\nold={:?}\nnew={:?}", old, new);
@@ -327,8 +361,11 @@ macro_rules! assert_all_paths_agree {
 ```rust
         for (edit, new_text) in edits {
             let str_out = wordcartel_core::block_tree::incremental_update_instrumented(&str_tree, &text, edit, new_text);
+            // S = &Rope → pass `&&local` (see the single-edit macro).
+            let text_rope = Rope::from_str(&text);
+            let new_rope = Rope::from_str(new_text);
             let rope_out = wordcartel_core::block_tree::incremental_update_instrumented_src(
-                &rope_tree, &Rope::from_str(&text), edit, &Rope::from_str(new_text),
+                &rope_tree, &&text_rope, edit, &&new_rope,
             );
             let full = full_parse(new_text);
             prop_assert_eq!(str_out.reason, rope_out.reason,
@@ -391,7 +428,7 @@ git commit -m "test(block_tree): carve BoundedStale out of the incremental==full
 
 ## Self-Review
 
-**Spec coverage:** `BoundedStale` variant + `MAX_SYNC_WIDEN_BYTES` (T1 S1-2) ✓; predict-on-copies three-way gate via shared helpers (T1 S3-6, spec M2) ✓; I1 second-trigger guard (T1 S7) ✓; `derive` wiring (T1 S8) ✓; I2 seam-guard → `NoOverlapFull` is automatic (block_tree.rs:975-979, no code change — confirmed in Task 1 review) ✓; oracle carve-out incl. the fuzz F2 oracle (T2, spec I4) ✓; str==rope reason (T2 S2-3, M3) ✓; Case-A/small-ext/Case-B/successive-BoundedStale tests (T1 S9, spec I3) ✓; non-quadratic local validity helper (T1 S9, M1) ✓; documented exemptions (T2 S6) ✓. Reconcile unchanged ✓. M4 (parse-panic enlarged stale) + M6 (cap tunable) are documented tradeoffs, no code.
+**Spec coverage:** `BoundedStale` variant + `MAX_SYNC_WIDEN_BYTES` (T1 S1-2) ✓; predict-on-copies three-way gate via shared helpers (T1 S3-6, spec M2, new-length sizing per Codex) ✓; unified second-trigger three-way gate covering BOTH the I1 first-gate-BoundedStale skip AND the Local-arrival created-container bound (T1 S7 + the `f1_created_container_local_is_bounded` test) ✓; `derive` wiring (T1 S8) ✓; I2 seam-guard → `NoOverlapFull` is automatic (block_tree.rs:975-979, no code change — confirmed in Task 1 review) ✓; oracle carve-out incl. the fuzz F2 oracle (T2, spec I4) ✓; str==rope reason (T2 S2-3, M3) ✓; Case-A/small-ext/Case-B/successive-BoundedStale tests (T1 S9, spec I3) ✓; non-quadratic local validity helper (T1 S9, M1) ✓; documented exemptions (T2 S6) ✓. Reconcile unchanged ✓. M4 (parse-panic enlarged stale) + M6 (cap tunable) are documented tradeoffs, no code.
 
 **Placeholder scan:** none — every code step carries complete code. The one runtime-tunable is the doc construction in `f1_case_a_*`/`f1_case_b_*` (T1 S10 notes: adjust the construction if the classification differs — the `reason` assertion is the contract).
 
