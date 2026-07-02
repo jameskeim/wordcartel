@@ -1,6 +1,6 @@
 # F1: bound the synchronous WidenToEnd reparse — design
 
-**Status:** approved design, rescoped to Case A after Codex spec-review round 1 (re-review pending)
+**Status:** rescoped to Case A; Codex round 2 folded (gate positioned after base-region computation); re-review pending
 **Date:** 2026-07-02
 **Effort:** F1 (responsiveness follow-up; the second of the two deferred from editing-responsiveness — F8 was assessed and shelved: its "bound layout to visible rows" premise is unsafe because `ColMap` consumers need the whole logical line)
 
@@ -80,50 +80,60 @@ an EXPANSION of the already-accepted `maybe_stale`/reconcile eventual-consistenc
   diverges beyond the base local region."
 - Add `pub const MAX_SYNC_WIDEN_BYTES: usize = 1 << 20;` (1 MiB) — a named tunable, mirroring
   `RECONCILE_DEBOUNCE_MS`.
-- **The three-way gate (the widen decision, block_tree.rs:767-774).** Today:
+- **The three-way gate — positioned AFTER the base local region is computed (Codex round 2).**
+  IMPORTANT: at today's widen decision (block_tree.rs:767) `region_old_end` is NOT yet the
+  Local region — the +1 slack runs later inside the `else` branch (block_tree.rs:802),
+  followed by straddle repair (:830) and the trailing-gap extension (:862, which can itself
+  reach EOF). So `region_old_end - region_old_start` at :767 is the PRE-slack region, not the
+  true Local reparse cost. Measuring `base_region_size` there would misclassify.
+
+  The design therefore **factors the base-local-region-end computation** (the existing slack
+  :802 / straddle-repair :830 / trailing-gap :862 logic) into a step that runs BEFORE the
+  three-way widen decision — call it the "base local region." The gate then classifies against
+  that true size, and only *afterward* extends to EOF (or not):
   ```
-  let widen = absorptive_in_region || slack_is_absorptive || downstream_container_merge
-      || needs_widen_to_end(...);
-  if widen { region_old_end = old_src.len(); reason = WidenReason::WidenToEnd; }
-  else { /* +1 slack sets region_old_end */ reason = WidenReason::Local; }
-  ```
-  At the gate, `region_old_end` is the **base local region** end (enclosing block + slack),
-  before the widen extension. Restructure to bound only when it *helps* — i.e. the extension
-  is expensive AND the base region is small:
-  ```
-  // base_region_size = the fallback (Local) reparse cost; widen_span = the WidenToEnd cost.
+  // 1. compute the base local region end via the existing slack/straddle/gap logic
+  //    (side-effect-free except for the region-end value), giving `region_old_end`.
+  // 2. classify against the FINAL base region:
   let base_region_size = region_old_end.saturating_sub(region_old_start);
   let widen_span       = old_src.len().saturating_sub(region_old_start);
   if widen {
       if widen_span <= MAX_SYNC_WIDEN_BYTES {
-          // extension is cheap → widen fully, exactly as today
-          region_old_end = old_src.len();
+          region_old_end = old_src.len();              // cheap extension → widen fully, as today
           reason = WidenReason::WidenToEnd;
       } else if base_region_size <= MAX_SYNC_WIDEN_BYTES {
-          // Case A: expensive extension, small base → bound to the base region, defer
-          // (leave region_old_end at the base; do NOT extend to EOF)
-          reason = WidenReason::BoundedStale;
+          // Case A: expensive extension, small base → keep the base region, defer
+          reason = WidenReason::BoundedStale;          // region_old_end stays at the base
       } else {
-          // Case B: the base local region itself exceeds the cap → F1 can't help;
-          // do the full widen as today (correct; avoids a redundant reconcile pass)
-          region_old_end = old_src.len();
+          region_old_end = old_src.len();              // Case B: base itself > cap → widen as today
           reason = WidenReason::WidenToEnd;
       }
   } else {
       reason = WidenReason::Local;
   }
   ```
-  The `BoundedStale` branch reuses the existing `Local` region+splice machinery unchanged —
-  the only difference from `Local` is the reason tag. The base local region always contains
-  the edit, so the edit is parsed correctly; only the container-wide effect beyond it is stale.
+  Because the gate runs AFTER all base-region growth (including the :862 trailing-gap that can
+  reach EOF), `base_region_size` is the true Local cost: a base that trailing-gaps to EOF
+  classifies as Case B (falls through to `WidenToEnd`); a small base classifies as Case A.
+  The `BoundedStale` branch then reuses the existing `Local` region+splice unchanged (only the
+  reason tag differs) — the base region always contains the edit, so the edit is parsed
+  correctly; only the container-wide effect beyond it is stale.
+  **Constraint (plan-confirm 1):** factoring the slack/straddle/gap computation to run before
+  the widen extension must preserve `WidenToEnd`'s exact behavior for the ≤ cap path — that
+  logic must be side-effect-free except for the region-end value, which `WidenToEnd` then
+  overwrites with `old_src.len()`.
 - **The second widen trigger (created-container growth, block_tree.rs:~924)** also extends
   `region_old_end = old_src.len()` — but AFTER the base region was already parsed once
   (block_tree.rs:903). Apply the same gate: if the extension would exceed the cap while the
   base region was small, do NOT extend to EOF (skip the expensive SECOND parse) and tag
   `BoundedStale`; the cheap first (base-region) parse already ran. If the base was itself >
   cap (Case B), extend as today.
-- **`reparsed_bytes`** for a `BoundedStale` outcome reflects the BASE region size (≤ cap in
-  Case A), so the freeze-ceiling property is observable in the outcome.
+- **`reparsed_bytes`** is set from `new_region.len()` at block_tree.rs:930, AFTER all base
+  growth. Because `BoundedStale` is classified only once the base region is final (post-slack,
+  post-straddle, post-trailing-gap) and keeps that region, `reparsed_bytes` equals the base
+  size (≤ cap in Case A by the gate's check) — the freeze-ceiling property is observable. The
+  gate must NOT tag `BoundedStale` before the trailing-gap extension could still grow the
+  region to EOF (that ordering is exactly why the gate runs after the base computation).
 - The resulting `BoundedStale` tree is a **valid, full-coverage splice** (before-blocks +
   base-region reparse + verbatim-shifted after-blocks — ordered, non-overlapping, covers
   `[0, EOF)`, so `role_at`/fold/render stay sound) that is semantically stale beyond the base
@@ -138,8 +148,9 @@ an EXPANSION of the already-accepted `maybe_stale`/reconcile eventual-consistenc
 is not equal to `full_parse` by design. The single-edit macros currently call the
 NON-instrumented `incremental_update` / `incremental_update_rope` (block_tree_oracle.rs:31),
 so they cannot see the reason — **convert both single-edit and chain helpers to the
-instrumented variants** (`incremental_update_instrumented_src` / the rope equivalent, both
-public) to read `outcome.reason`. Then:
+instrumented variant** `incremental_update_instrumented_src` (public at block_tree.rs:545;
+its generic signature covers BOTH string and rope sources — no separate rope-instrumented
+variant exists or is needed, Codex round 2) to read `outcome.reason`. Then:
 - **`check()`** — assert `outcome.tree == full` only when `reason != BoundedStale`.
 - **`assert_all_paths_agree!`** — skip the two `== full` assertions for `BoundedStale`, but
   KEEP the str-path-vs-rope-path agreement (`rope_inc == str_inc`) — the bounding logic is
@@ -176,8 +187,10 @@ convergence theorem already covers it.
   (a) `outcome.reason == BoundedStale`;
   (b) `outcome.reparsed_bytes <= MAX_SYNC_WIDEN_BYTES` (freeze ceiling is real — the BASE
       region, not EOF);
-  (c) the tree is structurally valid AND full-coverage (children ordered + non-overlapping at
-      every level, spans cover `[0, new_len)` — reuse the F3 invariant helper);
+  (c) the tree is structurally valid — the ROOT spans `[0, new_len)` and child spans are
+      ordered + non-overlapping at every level (gaps between top-level blocks are allowed;
+      children do NOT tile the document — Codex round 2 — so assert root coverage +
+      ordered/non-overlapping, reusing the F3 invariant helper, not byte tiling);
   (d) it `!=` `full_parse(new_text)` (genuinely bounded/stale, not accidentally correct);
   (e) `full_parse(new_text)` (what reconcile computes) is the correct convergence target.
 - **"Small extension still widens fully":** a small-doc edit that triggers the widen path with
@@ -210,12 +223,15 @@ convergence theorem already covers it.
 
 ## Plan-confirms (resolve during the implementation plan, against real source)
 
-1. **Region-construction ordering (Codex round 1).** Confirm that at the widen decision
-   (block_tree.rs:767) `region_old_end` is genuinely the BASE local region end (enclosing
-   block + slack), and identify whether the local branch's own EOF extensions
-   (block_tree.rs:802 "no later block", :862 trailing-gap) fire BEFORE or AFTER the gate — if
-   before, `base_region_size` must be measured to include/exclude them consistently so the
-   Case-A/Case-B classification and `reparsed_bytes ≤ cap` hold.
+1. **Factor the base-local-region computation before the gate (Codex round 2).** The slack
+   (:802), straddle repair (:830), and trailing-gap (:862) logic currently run INSIDE the
+   `else` (Local) branch, AFTER the :767 widen decision. The plan must factor them into a step
+   that runs before the three-way gate so `base_region_size` is the true Local cost. CRITICAL:
+   this factoring must preserve `WidenToEnd`'s exact ≤-cap behavior — confirm the
+   slack/straddle/gap logic is side-effect-free except for `region_old_end` (which `WidenToEnd`
+   overwrites with EOF), i.e. it does not mutate `region_old_start`, `tops`, or the block set
+   in a way that would change the widen path. If it is not cleanly side-effect-free, define the
+   minimal helper that computes just the base region-end for classification.
 2. The `BoundedStale` branch reuses the EXISTING `Local` +1-slack region/splice unchanged
    (only the reason tag differs) — confirm the base region always contains the edit and the
    resulting splice is structurally valid and full-coverage.
