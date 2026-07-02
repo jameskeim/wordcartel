@@ -1,6 +1,6 @@
 # Valid-by-construction cache-key fields (footguns) — design
 
-**Status:** spec-review round 2 folded (5th test-write site derive.rs:768 + read/write count split); re-review pending
+**Status:** spec-review Codex-clean (READY FOR PLANNING, round 3); Fable5 pass pending
 **Date:** 2026-07-02
 **Effort:** footguns (valid-by-construction; the first of two — F1 is a later, separate effort)
 
@@ -178,8 +178,9 @@ suite-green + clippy-0 is sufficient for a mechanical, behavior-preserving chang
    READS (→ accessor) and WRITES (→ `set_blocks`/mutator). In-module refs (incl. the defining
    module's own `#[cfg(test)]` children — `editor::tests`, `fold::tests`) stay direct. The Blast
    Radius section lists the known sites; the plan must confirm none are missed (a miss is a
-   build error, but the plan should be complete). Handle the direct test-write sites
-   (`derive.rs:327`, `reconcile.rs:112/170` → `set_blocks`; `app.rs:4748` → a fold mutator).
+   build error, but the plan should be complete). Handle the direct test-write sites per the
+   Blast Radius write table: `derive.rs:327`/`reconcile.rs:112`/`reconcile.rs:170` +
+   `derive.rs:768-769` → `set_blocks`; `app.rs:4748` → a fold mutator.
 3. Any test that asserts a specific `blocks_generation`/`epoch` value AFTER a converted write:
    `set_blocks` bumps the generation, so adjust the expected value if needed (accessor
    behavior, not a regression). Confirm none silently changes an assertion's meaning.
