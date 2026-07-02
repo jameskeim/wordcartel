@@ -331,7 +331,7 @@ mod tests {
         let head = crate::nav::head(&e);
         let fv = {
             let b = e.active();
-            crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer)
+            crate::fold::FoldView::compute(&b.folds, b.document.blocks(), &b.document.buffer)
         };
         assert_eq!(head, tail);
         assert!(!fv.is_hidden(e.active().document.buffer.byte_to_line(head)));

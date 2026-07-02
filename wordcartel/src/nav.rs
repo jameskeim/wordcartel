@@ -60,7 +60,7 @@ pub fn caret_line(editor: &Editor) -> usize {
 fn layout_line_on_demand(editor: &Editor, l: usize) -> wordcartel_core::layout::ColMap {
     let buf = &editor.active().document.buffer;
     let text = derive::line_text(buf, l);
-    let role = editor.active().document.blocks.role_at(derive::line_start(buf, l));
+    let role = editor.active().document.blocks().role_at(derive::line_start(buf, l));
     let source_mode = editor.active().view.mode != RenderMode::LivePreview;
     let is_active_effective = (l == caret_line(editor)) || source_mode;
     let vp_width = text_geometry(editor).text_width as usize;
@@ -143,7 +143,7 @@ fn fold_view(editor: &Editor) -> std::rc::Rc<crate::fold::FoldView> {
 fn layout_line_active(editor: &Editor, l: usize) -> wordcartel_core::layout::ColMap {
     let buf = &editor.active().document.buffer;
     let text = derive::line_text(buf, l);
-    let role = editor.active().document.blocks.role_at(derive::line_start(buf, l));
+    let role = editor.active().document.blocks().role_at(derive::line_start(buf, l));
     let vp_width = text_geometry(editor).text_width as usize;
     let (_rows, map) = layout::layout(&text, role, true, vp_width, editor.theme.heading_level_glyph);
     map
@@ -722,7 +722,7 @@ pub fn move_paragraph_down(editor: &mut Editor) -> usize {
     let h = head(editor);
     let result = {
         let buf = &editor.active().document.buffer;
-        let blocks = &editor.active().document.blocks;
+        let blocks = editor.active().document.blocks();
         next_paragraph_start(blocks, buf, h) // next leaf-block start, else buf.len()
     };
     editor.active_mut().desired_col = None;
@@ -733,7 +733,7 @@ pub fn move_paragraph_up(editor: &mut Editor) -> usize {
     let h = head(editor);
     let result = {
         let buf = &editor.active().document.buffer;
-        let blocks = &editor.active().document.blocks;
+        let blocks = editor.active().document.blocks();
         let (from, _to) = paragraph_range_at(blocks, buf, h);
         if from < h { from } else { prev_paragraph_start(blocks, buf, from) }
     };
@@ -751,7 +751,7 @@ pub fn move_doc_end(editor: &mut Editor) -> usize {
     // using `len.saturating_sub(1)` to land inside any trailing hidden body,
     // then return the snap target (or `len` when nothing is folded there).
     let probe = if len > 0 { len - 1 } else { 0 };
-    let snapped = crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, probe);
+    let snapped = crate::fold::normalize_caret(&b.folds, b.document.blocks(), &b.document.buffer, probe);
     if snapped != probe { snapped } else { len }
 }
 
@@ -848,7 +848,7 @@ pub fn move_word_right(editor: &mut Editor) -> usize {
     let h = head(editor);
     let new = {
         let buf = &editor.active().document.buffer;
-        let blocks = &editor.active().document.blocks;
+        let blocks = editor.active().document.blocks();
         let (wstart, wend) = paragraph_range_at(blocks, buf, h);
         let window = buf.slice(wstart..wend);
         let rel = h.saturating_sub(wstart);
@@ -878,7 +878,7 @@ pub fn move_word_left(editor: &mut Editor) -> usize {
     let h = head(editor);
     let new = {
         let buf = &editor.active().document.buffer;
-        let blocks = &editor.active().document.blocks;
+        let blocks = editor.active().document.blocks();
         let (wstart, wend) = paragraph_range_at(blocks, buf, h);
         let window = buf.slice(wstart..wend);
         let rel = h.saturating_sub(wstart);
@@ -1200,7 +1200,7 @@ mod tests {
         let mut e = Editor::new_from_text("- one\n- two\n\nAfter\n", None, (80, 24));
         derive::rebuild(&mut e);
         let buf = &e.active().document.buffer;
-        let blocks = &e.active().document.blocks;
+        let blocks = e.active().document.blocks();
         // pos inside "two" (second list item)
         let pos = 8;
         let (from, to) = super::paragraph_range_at(blocks, buf, pos);
@@ -1217,7 +1217,7 @@ mod tests {
         let mut e = Editor::new_from_text("A\n\nB\n", None, (80, 24));
         derive::rebuild(&mut e);
         let buf = &e.active().document.buffer;
-        let blocks = &e.active().document.blocks;
+        let blocks = e.active().document.blocks();
         let (bf, bt) = super::paragraph_range_at(blocks, buf, 3); // inside "B"
         assert_eq!(buf.slice(bf..bt).trim(), "B");
         // gap: must not panic and must yield a valid (from<=to<=len) range
@@ -1338,7 +1338,7 @@ mod tests {
         crate::nav::ensure_visible(&mut ed);
         let fv = {
             let b = ed.active();
-            crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer)
+            crate::fold::FoldView::compute(&b.folds, b.document.blocks(), &b.document.buffer)
         };
         assert!(!fv.is_hidden(ed.active().view.scroll));
     }
@@ -1365,7 +1365,7 @@ mod tests {
         let top = doc.find("# Top").unwrap();
         ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(top);
         let landed = crate::nav::move_page_down(&mut ed);
-        let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer) };
+        let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, b.document.blocks(), &b.document.buffer) };
         assert!(!fv.is_hidden(ed.active().document.buffer.byte_to_line(landed)));
     }
 
@@ -1379,7 +1379,7 @@ mod tests {
         let t2 = doc.find("t2").unwrap();
         ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(t2);
         crate::nav::ensure_visible(&mut ed);
-        let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer) };
+        let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, b.document.blocks(), &b.document.buffer) };
         assert!(!fv.is_hidden(ed.active().view.scroll));
     }
 
@@ -1425,7 +1425,7 @@ mod tests {
         // Row 3 in the editing area is "## B" — clicking it must resolve into line 5,
         // never a hidden body line.
         let off = crate::nav::offset_at_cell(&ed, 0, 3).unwrap();
-        let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer) };
+        let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, b.document.blocks(), &b.document.buffer) };
         assert!(!fv.is_hidden(ed.active().document.buffer.byte_to_line(off)));
     }
 

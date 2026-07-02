@@ -227,10 +227,10 @@ pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
     new_buf.reconcile.blocks_version = new_buf.document.version;
     let id = editor.active().id;                 // preserve THIS buffer's id
     // 5g: capture folds before replacement so we can carry them forward.
-    let prev_folds = editor.active().folds.clone();
+    let prev_folded = editor.active().folds.folded().clone();
     *editor.active_mut() = crate::editor::Buffer { id, ..new_buf };
     // 5g: carry folds across the reload and reconcile against the new tree.
-    editor.active_mut().folds = prev_folds;
+    editor.active_mut().folds.replace_folded(prev_folded);
     // Clear any stale search/diag overlay — the buffer content has changed wholesale.
     editor.search = None;
     editor.diag = None;
@@ -241,7 +241,7 @@ pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
     let head = editor.active().document.selection.primary().head;
     let nc = {
         let b = editor.active();
-        crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, head)
+        crate::fold::normalize_caret(&b.folds, b.document.blocks(), &b.document.buffer, head)
     };
     editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(nc);
     crate::nav::ensure_visible(editor);
@@ -271,10 +271,10 @@ pub fn load_recovered(editor: &mut crate::editor::Editor, body: &str) {
     new_buf.reconcile.blocks_version = new_buf.document.version;
     let id = editor.active().id;                 // preserve THIS buffer's id
     // 5g: capture folds before replacement so we can carry them forward.
-    let prev_folds = editor.active().folds.clone();
+    let prev_folded = editor.active().folds.folded().clone();
     *editor.active_mut() = crate::editor::Buffer { id, ..new_buf };
     // 5g: carry folds across the recovery and reconcile against the new tree.
-    editor.active_mut().folds = prev_folds;
+    editor.active_mut().folds.replace_folded(prev_folded);
     // Clear any stale search/diag overlay — the buffer content has changed wholesale.
     editor.search = None;
     editor.diag = None;
@@ -284,7 +284,7 @@ pub fn load_recovered(editor: &mut crate::editor::Editor, body: &str) {
     let head = editor.active().document.selection.primary().head;
     let nc = {
         let b = editor.active();
-        crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, head)
+        crate::fold::normalize_caret(&b.folds, b.document.blocks(), &b.document.buffer, head)
     };
     editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(nc);
     crate::nav::ensure_visible(editor);
@@ -665,20 +665,20 @@ mod tests {
         let b_anchor = "## A\nbody\n".len(); // the ## B offset we folded
         crate::save::reload_from_disk(&mut ed);
         // STRONG assertion: ## A is still a heading at byte 0 — its fold must be preserved
-        assert!(ed.active().folds.folded.contains(&0), "## A still exists after reload — its fold must be preserved");
+        assert!(ed.active().folds.folded().contains(&0), "## A still exists after reload — its fold must be preserved");
         // STRONG assertion: the exact stale ## B anchor is gone, and the surviving
         // fold set equals exactly the post-reconcile heading-start set it should be.
-        assert!(!ed.active().folds.folded.contains(&b_anchor), "stale ## B fold must be dropped");
+        assert!(!ed.active().folds.folded().contains(&b_anchor), "stale ## B fold must be dropped");
         let starts: std::collections::BTreeSet<usize> = {
             let b = ed.active();
-            wordcartel_core::outline::heading_starts(&b.document.blocks, &b.document.buffer.snapshot())
+            wordcartel_core::outline::heading_starts(b.document.blocks(), &b.document.buffer.snapshot())
         };
-        assert!(ed.active().folds.folded.iter().all(|b| starts.contains(b)),
+        assert!(ed.active().folds.folded().iter().all(|b| starts.contains(b)),
             "every surviving fold must be a real heading start in the new content");
         // caret is visible (normalize is a no-op because it's already out of folds)
         let head = ed.active().document.selection.primary().head;
         let b = ed.active();
-        assert_eq!(crate::fold::normalize_caret(&b.folds, &b.document.blocks, &b.document.buffer, head), head);
+        assert_eq!(crate::fold::normalize_caret(&b.folds, b.document.blocks(), &b.document.buffer, head), head);
     }
 
     // -----------------------------------------------------------------------

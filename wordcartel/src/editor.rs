@@ -52,12 +52,12 @@ pub struct Document {
     pub buffer: TextBuffer,
     pub selection: Selection,
     pub history: History,
-    pub blocks: BlockTree, // derived cache (Task 3 maintains)
+    blocks: BlockTree, // derived cache — write only via set_blocks
     pub version: u64,
-    /// Monotonic id of `blocks`: bumped on EVERY `blocks` write (parse phase +
+    /// Monotonic id of `blocks`: bumped on EVERY `set_blocks` call (parse phase +
     /// reconcile merge). Identifies the current tree across the reconcile-merge
     /// boundary (where `version` is unchanged). Keys the FoldView + layout caches.
-    pub blocks_generation: u64,
+    blocks_generation: u64,
     pub path: Option<PathBuf>,
     /// The document version last written to disk. `None` = never saved
     /// (new/scratch). `dirty()` is derived from this — no separate flag.
@@ -76,6 +76,20 @@ impl Document {
     /// Record that version `v` is now on disk.
     pub fn mark_saved(&mut self, v: u64) {
         self.saved_version = Some(v);
+    }
+
+    /// Read the derived block tree (private field — writes go through `set_blocks`).
+    #[inline]
+    pub fn blocks(&self) -> &wordcartel_core::block_tree::BlockTree { &self.blocks }
+    /// The block-tree identity token; changes on every `set_blocks`. Keys the FoldView + layout caches.
+    #[inline]
+    pub fn blocks_generation(&self) -> u64 { self.blocks_generation }
+    /// The ONLY way to write `blocks` — bumps `blocks_generation` so no writer can bypass the
+    /// cache-identity token (valid-by-construction). Unconditional bump on each call; a caller
+    /// wanting write-on-change guards the CALL (see the reconcile merge), not the bump.
+    pub fn set_blocks(&mut self, blocks: wordcartel_core::block_tree::BlockTree) {
+        self.blocks = blocks;
+        self.blocks_generation = self.blocks_generation.wrapping_add(1);
     }
 }
 
@@ -451,7 +465,7 @@ impl Editor {
     /// from the `&Editor` nav helpers.
     pub fn active_fold_view(&self) -> std::rc::Rc<crate::fold::FoldView> {
         let b = self.active();
-        let key = (b.document.blocks_generation, b.folds.epoch);
+        let key = (b.document.blocks_generation, b.folds.epoch());
         {
             let cache = b.fold_view_cache.borrow();
             match &*cache {
@@ -736,8 +750,10 @@ mod tests {
     fn active_fold_view_recomputes_on_generation_bump() {
         let mut e = Editor::new_from_text("# A\nbody\n", None, (80, 24));
         let v1 = e.active_fold_view();
-        let g = e.active().document.blocks_generation;
-        e.active_mut().document.blocks_generation = g.wrapping_add(1);
+        // Bump the generation via the sole write path (unchanged tree) — exercises
+        // the real accessor, mirroring the sibling derive.rs rerun test.
+        let t = e.active().document.blocks().clone();
+        e.active_mut().document.set_blocks(t);
         let v2 = e.active_fold_view();
         assert!(!std::rc::Rc::ptr_eq(&v1, &v2), "generation bump invalidates the cache");
     }
@@ -775,8 +791,7 @@ mod tests {
             &TextBuffer::from_str("# A\n## B\nbody\n").snapshot());
         {
             let b = e.by_id_mut(id).expect("active buffer by id");
-            b.document.blocks = other_tree;
-            b.document.blocks_generation = b.document.blocks_generation.wrapping_add(1);
+            b.document.set_blocks(other_tree); // adopt the new tree + bump generation, via the sole write path
         }
         let v2 = e.active_fold_view();
         assert!(!std::rc::Rc::ptr_eq(&v1, &v2), "merge generation bump must invalidate the FoldView cache");
@@ -1025,7 +1040,7 @@ mod tests {
         buf.folds.toggle(b_off);
         apply_insert(buf, 0, "X\n", &clk); // insert above the fold
         // anchor shifts by 2 and still lands on "## B".
-        assert!(buf.folds.folded.contains(&(b_off + 2)));
+        assert!(buf.folds.folded().contains(&(b_off + 2)));
     }
 
     #[test]
@@ -1038,8 +1053,8 @@ mod tests {
         // Before-biased: the anchor stays at 0 (text is now "Z## H"), it is NOT
         // pushed to 1. (Whether 0 is still a heading start is decided later by
         // reconcile in rebuild — Task 5; here we only assert the remap bias.)
-        assert!(buf.folds.folded.contains(&0));
-        assert!(!buf.folds.folded.contains(&1));
+        assert!(buf.folds.folded().contains(&0));
+        assert!(!buf.folds.folded().contains(&1));
     }
 
     #[test]
@@ -1054,7 +1069,7 @@ mod tests {
         // The definitive "deleted-heading fold is dropped" check lives in Task 5
         // (after rebuild's reconcile) — see `undo_then_rebuild_drops_dead_fold`.
         let len = buf.document.buffer.len();
-        assert!(buf.folds.folded.iter().all(|&b| b <= len));
+        assert!(buf.folds.folded().iter().all(|&b| b <= len));
     }
 
     #[test]

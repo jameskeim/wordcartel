@@ -282,7 +282,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     // For Sentence: scope paragraph_range_at first, then sentence_bounds within that window.
     let focus_region: Option<(usize, usize)> = if editor.view_opts.focus {
         let buf = &editor.active().document.buffer;
-        let blocks = &editor.active().document.blocks;
+        let blocks = editor.active().document.blocks();
         let head = nav::head(editor);
         let region = match editor.view_opts.focus_granularity {
             crate::config::FocusGranularity::Paragraph => {
@@ -1031,8 +1031,8 @@ pub fn fold_marker_for(editor: &crate::editor::Editor, l: usize) -> Option<usize
     let b = editor.active();
     let buf = &b.document.buffer;
     // The folded anchor whose heading line is `l`.
-    let hb = b.folds.folded.iter().copied().find(|&hb| buf.byte_to_line(hb) == l)?;
-    Some(crate::fold::hidden_count_lines(&b.document.blocks, buf, hb))
+    let hb = b.folds.folded().iter().copied().find(|&hb| buf.byte_to_line(hb) == l)?;
+    Some(crate::fold::hidden_count_lines(b.document.blocks(), buf, hb))
 }
 
 // ---------------------------------------------------------------------------
@@ -1271,7 +1271,7 @@ mod tests {
         set_caret(&mut e, 12); // inside "Para two."
         derive::rebuild(&mut e);
         // the active region used by render = paragraph_range_at at the caret
-        let buf = &e.active().document.buffer; let blocks = &e.active().document.blocks;
+        let buf = &e.active().document.buffer; let blocks = e.active().document.blocks();
         let (from, to) = crate::nav::paragraph_range_at(blocks, buf, 12);
         assert_eq!(buf.slice(from..to).trim(), "Para two.");
         // a row whose global src span is outside [from,to) is dimmed; inside is bright.

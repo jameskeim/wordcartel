@@ -62,9 +62,8 @@ pub fn dispatch_reconcile(editor: &mut Editor, ex: &dyn Executor) {
                         // Version-check INSIDE the merge (the version-discard): only
                         // adopt the tree if the buffer is still at the job's version.
                         if b.document.version == version {
-                            if b.document.blocks != tree {
-                                b.document.blocks = tree;
-                                b.document.blocks_generation = b.document.blocks_generation.wrapping_add(1);
+                            if b.document.blocks() != &tree {
+                                b.document.set_blocks(tree);
                             }
                             b.reconcile.blocks_version = version;
                             b.reconcile.maybe_stale = false;
@@ -109,17 +108,18 @@ mod tests {
         let v = e.active().document.version;
         // Plant a deliberately-wrong tree at the current version (simulating a
         // diverged incremental result), flagged stale.
-        e.active_mut().document.blocks = block_tree::empty_tree(e.active().document.buffer.len());
+        let t = block_tree::empty_tree(e.active().document.buffer.len());
+        e.active_mut().document.set_blocks(t);
         e.active_mut().reconcile.blocks_version = v;
         e.active_mut().reconcile.maybe_stale = true;
         let correct = block_tree::full_parse(&e.active().document.buffer.to_string());
-        assert_ne!(e.active().document.blocks, correct, "precondition: tree is diverged");
+        assert_ne!(*e.active().document.blocks(), correct, "precondition: tree is diverged");
 
         let ex = crate::jobs::InlineExecutor::default();
         dispatch_reconcile(&mut e, &ex);
         for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
 
-        assert_eq!(e.active().document.blocks, correct, "reconcile converges to full_parse");
+        assert_eq!(*e.active().document.blocks(), correct, "reconcile converges to full_parse");
         assert!(!e.active().reconcile.maybe_stale, "stale cleared");
         assert_eq!(e.active().reconcile.blocks_version, v);
         let _ = bid;
@@ -167,7 +167,7 @@ mod tests {
         e.active_mut().reconcile.maybe_stale = true;
         e.active_mut().reconcile.blocks_version = e.active().document.version;
         let planted = block_tree::empty_tree(e.active().document.buffer.len());
-        e.active_mut().document.blocks = planted.clone();
+        e.active_mut().document.set_blocks(planted.clone());
 
         let ex = crate::jobs::InlineExecutor::default();
         dispatch_reconcile(&mut e, &ex); // snapshots the current version
@@ -175,7 +175,7 @@ mod tests {
         e.active_mut().document.version += 1;
         for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
 
-        assert_eq!(e.active().document.blocks, planted, "stale reconcile did not clobber the newer state");
+        assert_eq!(*e.active().document.blocks(), planted, "stale reconcile did not clobber the newer state");
         assert!(e.active().reconcile.in_flight_version.is_none(), "in-flight cleared even on discard");
     }
 }

@@ -10,15 +10,26 @@ use wordcartel_core::outline;
 /// Per-Buffer fold state: the byte offsets of folded headings.
 #[derive(Debug, Clone, Default)]
 pub struct FoldState {
-    pub folded: BTreeSet<usize>,
+    folded: BTreeSet<usize>,
     /// Bumped whenever `folded` changes — the fold-identity token for the FoldView cache.
-    pub epoch: u64,
+    epoch: u64,
 }
 
 impl FoldState {
     pub fn is_empty(&self) -> bool {
         self.folded.is_empty()
     }
+
+    /// Read the folded-anchor set (private field — all mutations go through the bumping
+    /// mutators: toggle/fold_all/unfold_all/reconcile_to/remove/replace_folded/clamp/remap).
+    #[inline]
+    pub fn folded(&self) -> &std::collections::BTreeSet<usize> { &self.folded }
+
+    /// The fold-identity token; changes on every folded-set mutation. Keys the FoldView cache.
+    #[inline]
+    pub fn epoch(&self) -> u64 { self.epoch }
+
+    // — Mutators — sole write path for `folded`; each bumps `epoch` on change. —
 
     pub fn toggle(&mut self, heading_byte: usize) {
         if !self.folded.remove(&heading_byte) {

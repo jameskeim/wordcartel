@@ -465,7 +465,7 @@ pub fn restore_resume(editor: &mut Editor, path: &std::path::Path) {
                     editor.active_mut().view.scroll = scroll;
                     load_marks_from_entry(editor, entry);
                     editor.active_mut().folds.replace_folded(entry.folds.iter().copied().collect());
-                    let (blocks, buf) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.clone()) };
+                    let (blocks, buf) = { let b = editor.active(); (b.document.blocks().clone(), b.document.buffer.clone()) };
                     editor.active_mut().folds.reconcile(&blocks, &buf);
                     load_block_from_entry(editor, entry);
                 }
@@ -1645,7 +1645,7 @@ pub fn reduce(
                             o.query.pop();
                         }
                         let q = editor.outline.as_ref().map(|o| o.query.clone()).unwrap_or_default();
-                        let (blocks, rope) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.snapshot()) };
+                        let (blocks, rope) = { let b = editor.active(); (b.document.blocks().clone(), b.document.buffer.snapshot()) };
                         if let Some(o) = editor.outline.as_mut() {
                             o.set_query(&q, &blocks, &rope);
                         }
@@ -1658,7 +1658,7 @@ pub fn reduce(
                             o.query.push(c);
                         }
                         let q = editor.outline.as_ref().map(|o| o.query.clone()).unwrap_or_default();
-                        let (blocks, rope) = { let b = editor.active(); (b.document.blocks.clone(), b.document.buffer.snapshot()) };
+                        let (blocks, rope) = { let b = editor.active(); (b.document.blocks().clone(), b.document.buffer.snapshot()) };
                         if let Some(o) = editor.outline.as_mut() {
                             o.set_query(&q, &blocks, &rope);
                         }
@@ -2274,7 +2274,7 @@ fn persist_session(
                     scroll: editor.active().view.scroll,
                     marks: editor.active().marks.iter().map(|(c, &o)| (c.to_string(), o)).collect(),
                     mtime, size, seq,
-                    folds: editor.active().folds.folded.iter().copied().collect(),
+                    folds: editor.active().folds.folded().iter().copied().collect(),
                     block: editor.active().marked_block.map(|b| (b.start, b.end)),
                 };
                 session.record(canon.to_string_lossy().into_owned(), entry, cfg.state.max_entries);
@@ -3325,13 +3325,13 @@ mod tests {
         let h_byte = 0usize;
         e.active_mut().folds.toggle(h_byte);
         crate::derive::rebuild(&mut e);
-        assert!(e.active().folds.folded.contains(&h_byte), "precondition: # H is folded");
+        assert!(e.active().folds.folded().contains(&h_byte), "precondition: # H is folded");
         // goto line 4 ("body two"), which is inside the folded body:
         crate::app::goto_line_submit(&mut e, "4");
         assert_eq!(e.active().document.selection.primary().head, e.active().document.buffer.line_to_byte(3));
         // The section is no longer folded over the target (real fold-state query: the
         // heading anchor is gone from `folds.folded`, so line index 3 is visible again).
-        assert!(!e.active().folds.folded.contains(&h_byte),
+        assert!(!e.active().folds.folded().contains(&h_byte),
             "goto into a folded body must unfold the covering section to reveal the target");
     }
 
@@ -4428,7 +4428,7 @@ mod tests {
         let a1 = doc.find("### A1").unwrap();
         crate::app::outline_jump_to(&mut ed, a1);
         assert_eq!(ed.active().document.selection.primary().head, a1);
-        assert!(!ed.active().folds.folded.contains(&doc.find("## A").unwrap()));
+        assert!(!ed.active().folds.folded().contains(&doc.find("## A").unwrap()));
     }
 
     /// Fix C regression: replace-all with an invalid regex must set status
@@ -4708,7 +4708,7 @@ mod tests {
         let needle_pos = doc.find("needle").unwrap();
         assert_eq!(ed.active().document.selection.primary().from(), needle_pos,
             "caret must be on the 'needle' match");
-        assert!(!ed.active().folds.folded.contains(&a_byte),
+        assert!(!ed.active().folds.folded().contains(&a_byte),
             "## A fold must be cleared when jumping into its body");
     }
 
@@ -4745,10 +4745,10 @@ mod tests {
         editor.active_mut().document.selection =
             wordcartel_core::selection::Selection::single(cursor_in_body);
         // Restore fold on "## A" and reconcile (mirrors app.rs resume block).
-        editor.active_mut().folds.folded.insert(heading_a);
+        editor.active_mut().folds.toggle(heading_a);
         {
             let b = editor.active();
-            let blocks = b.document.blocks.clone();
+            let blocks = b.document.blocks().clone();
             let buf = b.document.buffer.clone();
             editor.active_mut().folds.reconcile(&blocks, &buf);
         }
@@ -4757,7 +4757,7 @@ mod tests {
         // This is what the bug looks like: cursor is hidden after resume without the fix.
         {
             let b = editor.active();
-            let fv = FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer);
+            let fv = FoldView::compute(&b.folds, b.document.blocks(), &b.document.buffer);
             let raw_line = b.document.buffer.byte_to_line(cursor_in_body);
             assert!(fv.is_hidden(raw_line),
                 "precondition: without SnapOut the restored cursor sits inside the fold");
@@ -4782,7 +4782,7 @@ mod tests {
             "SnapOut must move the caret from inside-fold body to the '## A' heading");
         {
             let b = editor.active();
-            let fv = FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer);
+            let fv = FoldView::compute(&b.folds, b.document.blocks(), &b.document.buffer);
             let final_line = b.document.buffer.byte_to_line(final_head);
             assert!(!fv.is_hidden(final_line),
                 "caret must not be on a hidden line after resume normalization");

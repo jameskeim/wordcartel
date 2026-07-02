@@ -132,7 +132,7 @@ pub fn rebuild(editor: &mut Editor) {
                 let new_rope_ref = &new_rope;
                 match crate::panicx::catch(|| {
                     block_tree::incremental_update_instrumented_src(
-                        &editor.active().document.blocks, &old_rope, edit, &new_rope_ref,
+                        editor.active().document.blocks(), &old_rope, edit, &new_rope_ref,
                     )
                 }) {
                     Ok(outcome) => {
@@ -153,9 +153,7 @@ pub fn rebuild(editor: &mut Editor) {
             full_parse_phase(editor, &new_rope, new_len)
         };
 
-        let next_gen = editor.active().document.blocks_generation.wrapping_add(1);
-        editor.active_mut().document.blocks = new_blocks;
-        editor.active_mut().document.blocks_generation = next_gen;
+        editor.active_mut().document.set_blocks(new_blocks);
         editor.active_mut().reconcile.blocks_version = version;
         editor.active_mut().reconcile.maybe_stale = stale;
     }
@@ -186,11 +184,11 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
     // Generation-gated fold-anchor prune (was every-draw). No per-draw deep clone:
     // compute heading starts under an immutable borrow, then retain.
     {
-        let gen = editor.active().document.blocks_generation;
+        let gen = editor.active().document.blocks_generation();
         if editor.active().last_reconciled_generation != Some(gen) {
             let starts = {
                 let b = editor.active();
-                wordcartel_core::outline::heading_starts(&b.document.blocks, &b.document.buffer.snapshot())
+                wordcartel_core::outline::heading_starts(b.document.blocks(), &b.document.buffer.snapshot())
             };
             editor.active_mut().folds.reconcile_to(&starts);
             editor.active_mut().last_reconciled_generation = Some(gen);
@@ -230,8 +228,8 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
     let vp_width = crate::nav::text_geometry(editor).text_width as usize;
 
     let key = LayoutKey {
-        blocks_generation: editor.active().document.blocks_generation,
-        fold_epoch: editor.active().folds.epoch,
+        blocks_generation: editor.active().document.blocks_generation(),
+        fold_epoch: editor.active().folds.epoch(),
         scroll: first_line,
         scroll_row,
         area: editor.active().view.area,
@@ -258,7 +256,7 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
             let b = editor.active();
             let buf = &b.document.buffer;
             let text = line_text(buf, l);
-            let role = b.document.blocks.role_at(line_start(buf, l));
+            let role = b.document.blocks().role_at(line_start(buf, l));
             let is_active_effective = (l == active_line) || source_mode;
             (text, role, is_active_effective)
         };
@@ -324,12 +322,12 @@ mod tests {
         e.active_mut().reconcile.blocks_version = e.active().document.version;
         // Plant a sentinel tree that differs from full_parse, with NO pending edit.
         let sentinel = block_tree::empty_tree(e.active().document.buffer.len());
-        e.active_mut().document.blocks = sentinel.clone();
+        e.active_mut().document.set_blocks(sentinel.clone());
         e.active_mut().pre_edit_rope = None;
         e.active_mut().last_edit = None;
         crate::derive::rebuild(&mut e);
         // version == blocks_version → parse phase skipped → sentinel survives.
-        assert_eq!(e.active().document.blocks, sentinel, "non-edit rebuild must not reparse");
+        assert_eq!(*e.active().document.blocks(), sentinel, "non-edit rebuild must not reparse");
     }
 
     #[test]
@@ -348,7 +346,7 @@ mod tests {
         assert_eq!(e.active().reconcile.blocks_version, e.active().document.version);
         // a plain in-paragraph insert is Local → maybe_stale set
         assert!(e.active().reconcile.maybe_stale, "incremental Local/WidenToEnd → maybe_stale");
-        assert_eq!(e.active().document.blocks, block_tree::full_parse(&e.active().document.buffer.to_string()));
+        assert_eq!(*e.active().document.blocks(), block_tree::full_parse(&e.active().document.buffer.to_string()));
     }
 
     #[test]
@@ -519,7 +517,7 @@ mod tests {
         assert!(e.active().pre_edit_rope.is_none());
         // Block tree must reflect the heading.
         use wordcartel_core::style::BlockRole;
-        assert_eq!(e.active().document.blocks.role_at(0), BlockRole::Heading(1));
+        assert_eq!(e.active().document.blocks().role_at(0), BlockRole::Heading(1));
     }
 
     #[test]
@@ -647,7 +645,7 @@ mod tests {
         ed.active_mut().apply(txn, edit, EditKind::Other, &clk);
         crate::derive::rebuild(&mut ed);
         // byte 0 is now "body" — not a heading start — so the fold is gone.
-        assert!(!ed.active().folds.folded.contains(&0));
+        assert!(!ed.active().folds.folded().contains(&0));
     }
 
     // ------------------------------------------------------------------
@@ -765,8 +763,8 @@ mod tests {
             "blocks_generation",
             Editor::new_from_text(doc, None, (80, 24)),
             |e: &mut Editor| {
-                e.active_mut().document.blocks_generation =
-                    e.active().document.blocks_generation.wrapping_add(1);
+                let t = e.active().document.blocks().clone();
+                e.active_mut().document.set_blocks(t);
             }
         );
 
