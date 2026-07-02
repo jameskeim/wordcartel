@@ -112,6 +112,8 @@ pub struct Buffer {
     pub sel_history: Vec<wordcartel_core::selection::Selection>,
     // 5f: per-buffer diagnostics store
     pub diagnostics: crate::diagnostics_run::DiagStore,
+    /// per-buffer block-tree reconcile store (incremental-soundness effort)
+    pub reconcile: crate::reconcile::ReconcileStore,
     // 5g: per-buffer fold state
     pub folds: crate::fold::FoldState,
     // 9a: persistent marked block (half-open [start,end)) + a deferred begin anchor.
@@ -164,6 +166,7 @@ impl Buffer {
             ring_cursor: 0,
             sel_history: Vec::new(),
             diagnostics: crate::diagnostics_run::DiagStore::new(),
+            reconcile: crate::reconcile::ReconcileStore::default(),
             folds: crate::fold::FoldState::default(),
             marked_block: None,
             pending_block_begin: None,

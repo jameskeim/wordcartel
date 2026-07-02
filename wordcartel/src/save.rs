@@ -212,6 +212,9 @@ pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
     new_buf.document.saved_version = Some(previous_version + 1);
     // Reset the DiagStore so no stale underlines from the old content persist.
     new_buf.diagnostics = crate::diagnostics_run::DiagStore::new();
+    // Fresh buffer is full-parsed for version 0; the version bump above skips
+    // that origin — sync blocks_version so rebuild skips the redundant reparse.
+    new_buf.reconcile.blocks_version = new_buf.document.version;
     let id = editor.active().id;                 // preserve THIS buffer's id
     // 5g: capture folds before replacement so we can carry them forward.
     let prev_folds = editor.active().folds.clone();
@@ -253,6 +256,9 @@ pub fn load_recovered(editor: &mut crate::editor::Editor, body: &str) {
     new_buf.document.saved_version = None; // recovered work is unsaved
     // Reset the DiagStore so no stale underlines from the old content persist.
     new_buf.diagnostics = crate::diagnostics_run::DiagStore::new();
+    // Fresh buffer is full-parsed for version 0; the version bump above skips
+    // that origin — sync blocks_version so rebuild skips the redundant reparse.
+    new_buf.reconcile.blocks_version = new_buf.document.version;
     let id = editor.active().id;                 // preserve THIS buffer's id
     // 5g: capture folds before replacement so we can carry them forward.
     let prev_folds = editor.active().folds.clone();
