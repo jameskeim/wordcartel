@@ -138,7 +138,9 @@ pub fn rebuild(editor: &mut Editor) {
                     Ok(outcome) => {
                         let stale = matches!(
                             outcome.reason,
-                            block_tree::WidenReason::Local | block_tree::WidenReason::WidenToEnd
+                            block_tree::WidenReason::Local
+                                | block_tree::WidenReason::WidenToEnd
+                                | block_tree::WidenReason::BoundedStale
                         );
                         (outcome.tree, stale)
                     }
