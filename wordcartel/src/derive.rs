@@ -229,7 +229,7 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
 
     let key = LayoutKey {
         blocks_generation: editor.active().document.blocks_generation(),
-        fold_epoch: editor.active().folds.epoch,
+        fold_epoch: editor.active().folds.epoch(),
         scroll: first_line,
         scroll_row,
         area: editor.active().view.area,
@@ -645,7 +645,7 @@ mod tests {
         ed.active_mut().apply(txn, edit, EditKind::Other, &clk);
         crate::derive::rebuild(&mut ed);
         // byte 0 is now "body" — not a heading start — so the fold is gone.
-        assert!(!ed.active().folds.folded.contains(&0));
+        assert!(!ed.active().folds.folded().contains(&0));
     }
 
     // ------------------------------------------------------------------

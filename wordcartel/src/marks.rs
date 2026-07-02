@@ -170,7 +170,7 @@ mod tests {
         super::resolve_pending(&mut e, 'a');
 
         assert_eq!(e.active().document.selection.primary().head, target);
-        assert!(!e.active().folds.folded.contains(&a));
+        assert!(!e.active().folds.folded().contains(&a));
     }
 
     #[test]
@@ -218,6 +218,6 @@ mod tests {
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(0);
         assert!(super::jump_char_mark(&mut e, '1'));
         assert_eq!(e.active().document.selection.primary().head, target);
-        assert!(!e.active().folds.folded.contains(&a));
+        assert!(!e.active().folds.folded().contains(&a));
     }
 }

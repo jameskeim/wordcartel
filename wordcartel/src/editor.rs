@@ -465,7 +465,7 @@ impl Editor {
     /// from the `&Editor` nav helpers.
     pub fn active_fold_view(&self) -> std::rc::Rc<crate::fold::FoldView> {
         let b = self.active();
-        let key = (b.document.blocks_generation, b.folds.epoch);
+        let key = (b.document.blocks_generation, b.folds.epoch());
         {
             let cache = b.fold_view_cache.borrow();
             match &*cache {
@@ -1039,7 +1039,7 @@ mod tests {
         buf.folds.toggle(b_off);
         apply_insert(buf, 0, "X\n", &clk); // insert above the fold
         // anchor shifts by 2 and still lands on "## B".
-        assert!(buf.folds.folded.contains(&(b_off + 2)));
+        assert!(buf.folds.folded().contains(&(b_off + 2)));
     }
 
     #[test]
@@ -1052,8 +1052,8 @@ mod tests {
         // Before-biased: the anchor stays at 0 (text is now "Z## H"), it is NOT
         // pushed to 1. (Whether 0 is still a heading start is decided later by
         // reconcile in rebuild — Task 5; here we only assert the remap bias.)
-        assert!(buf.folds.folded.contains(&0));
-        assert!(!buf.folds.folded.contains(&1));
+        assert!(buf.folds.folded().contains(&0));
+        assert!(!buf.folds.folded().contains(&1));
     }
 
     #[test]
@@ -1068,7 +1068,7 @@ mod tests {
         // The definitive "deleted-heading fold is dropped" check lives in Task 5
         // (after rebuild's reconcile) — see `undo_then_rebuild_drops_dead_fold`.
         let len = buf.document.buffer.len();
-        assert!(buf.folds.folded.iter().all(|&b| b <= len));
+        assert!(buf.folds.folded().iter().all(|&b| b <= len));
     }
 
     #[test]

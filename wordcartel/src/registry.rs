@@ -502,7 +502,7 @@ fn heading_jump(c: &mut Ctx, dir: Dirn) {
 pub(crate) fn unfold_ancestors_of(editor: &mut crate::editor::Editor, byte: usize) {
     let (blocks, buf) = { let b = editor.active(); (b.document.blocks().clone(), b.document.buffer.clone()) };
     let rope = buf.snapshot();
-    let anchors: Vec<usize> = editor.active().folds.folded.iter().copied().collect();
+    let anchors: Vec<usize> = editor.active().folds.folded().iter().copied().collect();
     for hb in anchors {
         let body = wordcartel_core::outline::body_range(&blocks, &rope, hb);
         if byte >= body.start && byte < body.end {
@@ -706,7 +706,7 @@ mod tests {
         assert_eq!(ed.active().document.selection.primary().head, bad_byte,
             "diag_next must jump caret to the diagnostic");
         // ## A fold must be cleared.
-        assert!(!ed.active().folds.folded.contains(&a_byte),
+        assert!(!ed.active().folds.folded().contains(&a_byte),
             "## A fold must be cleared when diag_next lands inside its body");
     }
 
@@ -745,7 +745,7 @@ mod tests {
         assert_eq!(ed.active().document.selection.primary().head, bad_byte,
             "diag_prev must jump caret to the diagnostic");
         // ## A fold must be cleared.
-        assert!(!ed.active().folds.folded.contains(&a_byte),
+        assert!(!ed.active().folds.folded().contains(&a_byte),
             "## A fold must be cleared when diag_prev lands inside its body");
     }
 
@@ -769,7 +769,7 @@ mod tests {
         ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(inside);
         dispatch_id(&mut ed, "fold_toggle");
         let a = doc.find("## A").unwrap();
-        assert!(ed.active().folds.folded.contains(&a));
+        assert!(ed.active().folds.folded().contains(&a));
         // caret moved out of the now-hidden body, onto the heading
         assert_eq!(ed.active().document.selection.primary().head, a);
     }
