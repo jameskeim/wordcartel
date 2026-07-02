@@ -1,6 +1,6 @@
 # M5 follow-ups: undo-eviction hint + bound the last document-sized reads — design
 
-**Status:** approved design (pre-spec-review)
+**Status:** spec-review round 1 folded (single-seam hint + fingerprint metadata fallback); re-review pending
 **Date:** 2026-07-01
 **Effort:** M5 follow-ups (pre-Effort-P; two small M5 leftovers, one bundled effort)
 
@@ -18,9 +18,10 @@ amortize the gated-pipeline overhead. **Shell-only; no `wordcartel-core` changes
   core, on every edit path** — this effort does NOT change that. The *hint* to the
   user, however, is surfaced only on the command/keystroke path (`Editor::apply`,
   `editor.rs:646`), which reads `last_evicted` and sets
-  `status = "Undo history full — oldest dropped"`. The large buffer-level merges
-  (filter, transform, paste) go through `Buffer::apply` directly and set their own
-  outcome status, so they never surface the hint. Purely cosmetic gap.
+  `status = "Undo history full — oldest dropped"`. The buffer-level merges
+  (filter, transform, paste, replace-all, search-step, scratch-append) go through
+  `Buffer::apply` directly and set their own outcome status, so they never surface
+  the hint. Purely cosmetic gap.
 - **(b) Three document-sized reads remain unbounded.** M5 bounded the authoritative
   load paths at read time via `File::open` + `Read::take(cap+1)` + a
   `len > cap → refuse` check (against `MAX_OPEN_BYTES = 64 MiB`, `limits.rs:5`; see
@@ -33,8 +34,9 @@ amortize the gated-pipeline overhead. **Shell-only; no `wordcartel-core` changes
 
 ## Goals
 
-- Surface the undo-eviction hint uniformly on ALL edit paths (keystroke AND the
-  filter/transform/paste buffer-merges), single-sourcing the hint text.
+- Surface the undo-eviction hint uniformly on ALL active-buffer edit paths
+  (keystroke AND every buffer-level merge) via a single reduce-level seam,
+  single-sourcing the hint text.
 - Bound the three remaining document-sized reads at the `MAX_OPEN_BYTES` cap, each
   falling back to its existing safe degradation on over-cap (no user-facing error).
 - No behavior change beyond the hint surfacing + the allocation cap; no core changes.
@@ -47,27 +49,51 @@ amortize the gated-pipeline overhead. **Shell-only; no `wordcartel-core` changes
   the existing safe degradation at each site (see below).
 - No change to the authoritative load path (`file::open` is already bounded).
 
-## Component (a) — undo-eviction hint on the buffer-merge paths
+## Component (a) — undo-eviction hint at a single reduce-level seam
 
-- Single-source the hint text as a const (shell side, near `Editor`):
+**Revised after spec review.** The per-caller approach (wire a helper at each
+`Buffer::apply` call site) is whack-a-mole: beyond filter/transform/paste there
+are at least four more buffer-merge sites (replace-all `app.rs:922`, two
+search-step applies `app.rs:943`/`:977`, scratch-append `scratch.rs:21`), paste
+has no success-status site to hang the call on, and any FUTURE edit path would
+silently miss the hint again — the very bug this fixes. Instead, surface the hint
+ONCE, at the seam every active-buffer edit already funnels through.
+
+- Single-source the hint text as a module-level const in `editor.rs`:
   `const UNDO_EVICTED_HINT: &str = "Undo history full — oldest dropped";` (the exact
   string `Editor::apply` uses today).
-- Add a helper `Editor::note_undo_eviction(&mut self, buffer_id: BufferId)`:
+- Add a helper `Editor::note_undo_eviction(&mut self)` that surfaces the hint for
+  the ACTIVE buffer:
   ```
-  if self.by_id(buffer_id).map_or(false, |b| b.document.history.last_evicted > 0) {
+  if self.active().document.history.last_evicted > 0 {
       self.status = UNDO_EVICTED_HINT.to_string();
   }
   ```
-- **Refactor `Editor::apply`** (`editor.rs:646`) to call `self.note_undo_eviction(self.active().id)` instead of its inline check + literal, so the hint text lives in exactly one place (behavior-identical).
-- **Wire the helper at the three buffer-merge sites, AFTER each outcome status is set** (so the hint overrides on eviction — matching `Editor::apply`, which replaces status with the bare hint):
-  - filter merge — after `editor.status = "filter applied".into()` (`app.rs:327`): `editor.note_undo_eviction(buffer_id);`
-  - transform merge — after `editor.status = kind.past_tense().to_string()` (`transform.rs:180`): `editor.note_undo_eviction(buffer_id);`
-  - paste — after the paste's outcome status is set (the caller of the `Buffer::apply` at `app.rs:783`): `editor.note_undo_eviction(buffer_id);` (plan-confirm the exact paste status site + that `buffer_id` is in scope there).
+- **Call it once, in `reduce`'s existing post-edit block** — the `if version != before`
+  block (`app.rs:~1775`, where `last_edit_at` is set / diagnostics are armed). That
+  block runs exactly when the ACTIVE buffer's version changed during this reduce —
+  i.e. an edit landed via ANY path (keystroke, filter, transform, paste, replace-all,
+  search-step, scratch) — and it runs AFTER the command handlers set their outcome
+  status, so the hint OVERRIDES on eviction (matching today's `Editor::apply`
+  behavior). One site covers every current and future active-buffer edit path.
+- **Remove `Editor::apply`'s inline hint** (`editor.rs:646`): it is now redundant
+  (a keystroke edit bumps the version → the reduce block fires). `Editor::apply`
+  becomes a plain delegator, keeping the hint logic in exactly one place.
 
 Rationale for override (not a combined message): uniform hint across all edit
 paths, reuses one string, and eviction (>64 MiB undo history) is rare — the
 undo-depth-loss warning is the point, and the filter/transform result is visible
 on screen regardless.
+
+**Known best-effort gaps (documented, acceptable for a cosmetic hint):**
+- Edits that complete while a MODAL is open are handled in `reduce`'s modal block,
+  which returns early BEFORE the `if version != before` block — so an eviction on a
+  background filter/transform/job completing under a modal will not surface the
+  hint. Rare (eviction + edit-under-modal) and cosmetic; eviction is still enforced
+  in core.
+- Edits to an INACTIVE buffer (inactive transform/paste/scratch) do not change
+  `active().version`, so the hint does not fire for them — correct, since that
+  buffer is not on screen.
 
 ## Component (b) — bound the three remaining reads
 
@@ -86,55 +112,101 @@ on screen regardless.
   ```
   (Mirrors `file::open`'s `.take(limit + 1)` + `len > limit` check; the `+1` lets a
   file of exactly `limit` bytes succeed.)
-- Apply `bounded_read_opt(path, crate::limits::MAX_OPEN_BYTES)` at each site, each
-  landing on its ALREADY-safe fallback:
+- Apply the bound at each site. Two sites use `bounded_read_opt` directly (their
+  `None` fallback is already safe); the fingerprint site needs a different shape
+  (see below) to avoid a data-loss regression flagged in spec review:
 
-| Site | Was | Over-cap fallback (unchanged semantics) |
+| Site | Was | Over-cap handling |
 |---|---|---|
-| `app.rs:1936` recovery predicate | `std::fs::read(p).ok()` → `Option<Vec<u8>>` passed to `swap::assess` | `None` → `assess` returns `RecoveryDecision::Prompt` (prompt the user — safe) |
-| `save.rs:31` `fingerprint()` | `std::fs::read(path).ok()?` | `None` → no fingerprint → `!= stored_fp` → conservative external-mod modal (safe) |
-| `file.rs:138` `save_atomic` skip-unchanged | `if let Ok(existing) = fs::read(path)` | `None` → skip the skip-unchanged optimization → proceed to the atomic write (safe) |
+| `app.rs:1936` recovery predicate | `std::fs::read(p).ok()` → `Option<Vec<u8>>` passed to `swap::assess` | `bounded_read_opt` → `None` → `assess` returns `RecoveryDecision::Prompt` (prompt the user — safe) |
+| `file.rs:138` `save_atomic` skip-unchanged | `if let Ok(existing) = fs::read(path)` | `bounded_read_opt` → `None` → skip the skip-unchanged optimization → proceed to the atomic write (safe) |
+| `save.rs:31` `fingerprint()` | `std::fs::read(path).ok()?` (full-file content hash) | metadata-based fallback — see below (NOT a bare `None`) |
 
-All three are cold paths (startup recovery / save / save). None ever surface an
-error to the user on over-cap — they just lose an optimization or take the
-conservative branch, which is the same thing that happens today when the read
-fails for any other reason.
+The recovery + skip-unchanged sites are cold paths whose `None` (over-cap or
+read-fail) already takes the safe branch — no user-facing error.
+
+### `fingerprint()` over-cap: metadata fallback (not `None`)
+
+**Spec-review finding (Important):** a bare `bounded_read_opt → None` here
+reintroduces a BUG-2-class silent-overwrite for over-cap files. `fingerprint()`
+is called BOTH for the pre-save conflict check (`current_fp != stored_fp`) AND to
+STORE `stored_fp` after a successful save (`save.rs:70`/`:87`). If an over-cap file
+made `fingerprint()` return `None`, then `stored_fp` becomes `None`, and the next
+save computes `current_fp == None` too — `None != None` is FALSE, so the
+external-mod modal never fires and external changes are silently overwritten.
+
+**Fix:** `fingerprint()` must never return `None` for a *present, readable* file
+merely because it is over-cap. Compute the content hash over a bounded read; on
+over-cap, fall back to a metadata-only fingerprint (real `mtime` + `size`, with the
+content `hash` set to a fixed sentinel, e.g. `0`). Shape:
+```
+pub fn fingerprint(path: &Path) -> Option<FileFingerprint> {
+    let meta = std::fs::metadata(path).ok()?;                 // None only if truly unreadable/missing
+    let limit = crate::limits::MAX_OPEN_BYTES;
+    let hash = match crate::file::bounded_read_opt(path, limit) {
+        Some(bytes) => { /* DefaultHasher over bytes, as today */ }
+        None => 0, // over-cap (or transient read failure): sentinel — fall back to mtime+size
+    };
+    Some(FileFingerprint { mtime: meta.modified().ok(), size: meta.len(), hash })
+}
+```
+Then over-cap files are still compared by `mtime + size` (catching truncation,
+growth, and mtime changes — the common external mods); only the same-mtime,
+same-size, different-content tiebreak (BUG-2's within-one-tick hash guard) is
+unavailable for >64 MiB files — a narrow, documented narrowing, and NOT the
+silent `None == None` defeat. Note `size` now comes from `meta.len()` (was
+`bytes.len()`), which is correct for both branches. Plan-confirm the exact
+`DefaultHasher` usage matches today's `fingerprint()` for the ≤cap path so normal
+files hash identically (no fingerprint churn).
 
 ## Testing
 
 - **(a):** `last_evicted` is a public `usize` field on `History`, so a test can set
   it directly (no 64 MiB edit needed): build an `Editor` (`Editor::new_from_text`),
   set `active_mut().document.history.last_evicted = 1`, call
-  `note_undo_eviction(active_id)`, assert `status == UNDO_EVICTED_HINT`; negative
-  case (`last_evicted == 0` → status untouched). The existing
-  `apply_does_not_set_hint_when_no_eviction` (`editor.rs:1079`) stays green (now
-  routed through the helper).
-- **(b):** `bounded_read_opt` takes `limit` as a param → test with a TINY limit (no
+  `note_undo_eviction()`, assert `status == UNDO_EVICTED_HINT`; negative case
+  (`last_evicted == 0` → status untouched). Update/relocate the existing
+  `apply_does_not_set_hint_when_no_eviction` (`editor.rs:1079`) to target the helper
+  (its assertion — no hint without eviction — still holds; `Editor::apply` no longer
+  carries the check).
+- **(b) `bounded_read_opt`:** takes `limit` as a param → test with a TINY limit (no
   large file): write a 3-byte file with `limit = 4` → `Some`; write a 10-byte file
-  with `limit = 4` → `None`; a missing path → `None`. Regression: the existing
-  `fingerprint_*` and `save_same_content_returns_unchanged` tests still pass on
-  normal small files (the helper's normal-size path is byte-identical to the old
-  `fs::read`).
+  with `limit = 4` → `None`; a missing path → `None`.
+- **(b) `fingerprint()` over-cap:** since `fingerprint()` hardcodes `MAX_OPEN_BYTES`,
+  make its bounded read testable — either extract an inner `fingerprint_with_limit(path, limit)`
+  the public fn delegates to, or accept that only the ≤cap path is unit-tested and
+  the over-cap metadata fallback is covered by review. With an injectable limit:
+  write a 10-byte file with `limit = 4` → returns `Some` (metadata fallback:
+  `mtime`/`size` populated, `hash == 0`), NOT `None`; a ≤cap file → `Some` with a
+  real content hash identical to today's. Regression: existing `fingerprint_*` and
+  `save_same_content_returns_unchanged` tests still pass on normal files.
 
 ## Decomposition
 
-- **Task 1 — (a):** `UNDO_EVICTED_HINT` const + `Editor::note_undo_eviction` helper +
-  refactor `Editor::apply` to use it + wire at the 3 buffer-merge sites + tests.
-- **Task 2 — (b):** `file::bounded_read_opt` helper + convert the 3 read sites +
-  tests.
+- **Task 1 — (a):** `UNDO_EVICTED_HINT` const + `Editor::note_undo_eviction(&mut self)`
+  helper + remove `Editor::apply`'s inline hint + call the helper once in `reduce`'s
+  `if version != before` block + tests.
+- **Task 2 — (b):** `file::bounded_read_opt` helper + convert the recovery-predicate
+  and skip-unchanged sites (direct `None`) + convert `fingerprint()` to the
+  metadata-fallback shape + tests.
 
 The clippy deny-gate is already live, so each task keeps `cargo clippy --workspace
 --all-targets` clean; no separate gate task.
 
 ## Plan-confirms (resolve during the implementation plan, against real source)
 
-1. The exact paste outcome-status site (the caller of the `Buffer::apply` at
-   `app.rs:783`) where `note_undo_eviction(buffer_id)` should land, and that
-   `buffer_id` is in scope there (the map noted paste sets status at the caller
-   level, not inside `insert_paste_text`).
-2. `Editor::by_id`/`by_id_mut` + `Buffer.id` accessor names/visibility for the
-   helper; where `UNDO_EVICTED_HINT` best lives (module-level const in `editor.rs`).
+1. The exact `reduce` `if version != before` block (`app.rs:~1775`) where
+   `note_undo_eviction()` should land: confirm it runs AFTER the command handlers
+   (so the hint overrides the outcome status) and that the modal-block early return
+   is the documented uncovered path. Confirm `editor.status`/`active()` are in scope.
+2. `Buffer.id`/`Editor::by_id` are no longer needed by the helper (it uses
+   `active()`); confirm where `UNDO_EVICTED_HINT` best lives (module-level const in
+   `editor.rs`).
 3. Confirm `swap::assess`'s `Prompt` fallback on `current_file_bytes == None`
    (`swap.rs:264`) so the recovery over-cap fallback is genuinely safe.
 4. That `bounded_read_opt` belongs in `file.rs` (it's IO + already imports
    `limits`) and is reachable from `save.rs`/`app.rs` (`crate::file::bounded_read_opt`).
+5. The `fingerprint()` ≤cap path must hash identically to today (same
+   `DefaultHasher` sequence) so normal files produce no fingerprint churn; confirm
+   `FileFingerprint.size` semantics are unchanged when switching from `bytes.len()`
+   to `meta.len()` (equal for a ≤cap file read fully).
