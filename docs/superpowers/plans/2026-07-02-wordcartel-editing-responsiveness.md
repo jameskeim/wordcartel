@@ -42,10 +42,12 @@
 
 **Interfaces:** `role_at`/`collect_role` keep their signatures; only `collect_role`'s child-selection changes. Relies on: `Block.span: Range<usize>`, `Block.children: Vec<Block>` in document order, non-overlapping at every level.
 
-- [ ] **Step 1: Add the differential + invariant tests** (in `block_tree.rs`'s `#[cfg(test)] mod tests`; reuse the oracle's `block_strategy()` random-markdown → `full_parse` approach — see `tests/block_tree_oracle.rs`):
+- [ ] **Step 1: Add the differential + invariant test** (in `block_tree.rs`'s `#[cfg(test)] mod tests`, which has `use super::*` → the private `kind_to_role`/`role_precedence`/`incremental_update_src`/`full_parse`/`Edit` are in scope; `proptest` is a `wordcartel-core` dev-dependency). The trees come from `full_parse` AND incremental-update chains — production `role_at` runs mostly on SPLICED trees, and the ordering invariant is least certain there:
 
 ```rust
-    // Reference: the pre-change linear scan, kept for the differential test.
+    use proptest::prelude::*;
+
+    // Reference: the pre-change linear scan (in-module → can call the private fns).
     fn collect_role_linear(block: &Block, byte: usize, best: &mut crate::style::BlockRole) {
         if !block.span.contains(&byte) { return; }
         if let Some(role) = kind_to_role(&block.kind) {
@@ -58,31 +60,57 @@
         collect_role_linear(&t.root, byte, &mut best);
         best
     }
-    fn assert_children_ordered_nonoverlapping(b: &Block) {
+    fn assert_ordered_nonoverlapping(b: &Block) {
         let mut prev_end = 0usize;
         for c in &b.children {
-            assert!(c.span.start >= prev_end, "children must be ordered + non-overlapping: {:?}", b.span);
+            assert!(c.span.start >= prev_end, "siblings ordered + non-overlapping");
             prev_end = c.span.end.max(prev_end);
-            assert_children_ordered_nonoverlapping(c);
+            assert_ordered_nonoverlapping(c);
         }
     }
+    fn check_tree(t: &BlockTree, len: usize) {
+        assert_ordered_nonoverlapping(&t.root);
+        for byte in 0..=len {
+            assert_eq!(t.role_at(byte), role_at_linear(t, byte), "role_at divergence @ {byte}");
+        }
+    }
+    // Nested-container markdown snippets — the trees where ordering is least certain.
+    fn doc_strategy() -> impl Strategy<Value = String> {
+        let snippet = prop::sample::select(vec![
+            "# H1\n", "## H2\n", "Setext\n===\n",
+            "- a\n- b\n", "- outer\n  - inner\n", "1. one\n2. two\n",
+            "> quote\n> - qlist\n", "```\ncode\n```\n",
+            "para one two\n", "\n", "text\n",
+        ]);
+        prop::collection::vec(snippet, 0..10).prop_map(|v| v.concat())
+    }
 
-    proptest::proptest! {
+    proptest! {
         #[test]
-        fn role_at_binary_matches_linear(text in crate::block_tree::tests::doc_text_strategy()) {
-            let t = full_parse(&text);
-            assert_children_ordered_nonoverlapping(&t.root);
-            let len = text.len();
-            // sample every byte for small docs; strategy keeps them small.
-            for byte in 0..=len {
-                prop_assert_eq!(t.role_at(byte), role_at_linear(&t, byte), "byte {}", byte);
+        fn role_at_binary_matches_linear(
+            text in doc_strategy(),
+            inserts in prop::collection::vec(("[a-z#>` \\-\n]{1,4}", 0usize..300), 0..4),
+        ) {
+            let mut cur = text;
+            let mut tree = full_parse(&cur);
+            check_tree(&tree, cur.len());
+            // Incremental chain: apply a few inserts, checking the SPLICED tree each step.
+            for (s, raw) in inserts {
+                let mut pos = raw % (cur.len() + 1);
+                while pos < cur.len() && !cur.is_char_boundary(pos) { pos += 1; }
+                let mut next = String::with_capacity(cur.len() + s.len());
+                next.push_str(&cur[..pos]); next.push_str(&s); next.push_str(&cur[pos..]);
+                let edit = Edit { range: pos..pos, new_len: s.len() };
+                let (old_ref, new_ref): (&str, &str) = (&cur, &next);
+                tree = incremental_update_src(&tree, &old_ref, &edit, &new_ref);
+                check_tree(&tree, next.len());
+                cur = next;
             }
         }
     }
 ```
-(If a `doc_text_strategy`/`block_strategy` already exists in the oracle/this module, reuse it — the extraction confirms `block_tree_oracle.rs:284` has one; if it lives in the oracle test crate only, add a small local `proptest::collection`-based markdown-ish string strategy here. The point: trees MUST come from `full_parse`, never hand-built.)
 
-- [ ] **Step 2: Run to verify the invariant test + baseline pass** — `cargo test -p wordcartel-core role_at_binary_matches_linear` → PASS (both sides linear today; this guards the refactor).
+- [ ] **Step 2: Run to verify baseline pass** — `cargo test -p wordcartel-core role_at_binary_matches_linear` → PASS (both `role_at` and the linear reference are linear today; this guards the refactor + pins the ordered/non-overlap invariant across incremental splices).
 
 - [ ] **Step 3: Replace `collect_role`'s child loop with a binary-search descent** (`block_tree.rs:231`):
 
@@ -135,14 +163,14 @@ git commit -m "perf(core): role_at binary-search descent (O(log N) per line, not
     /// boundary (where `version` is unchanged). Keys the FoldView + layout caches.
     pub blocks_generation: u64,
 ```
-Init `blocks_generation: 0` in `Buffer::from_text` (`editor.rs:127`, next to the other `document` field inits). Bump at the two writers — `derive.rs:135`:
+Init `blocks_generation: 0` in `Buffer::from_text` (`editor.rs:127`, next to the other `document` field inits). Bump at the two writers — `derive.rs:135` (read the next value into a local first to avoid the read-through-`active()`-while-`active_mut()` cross-borrow):
 ```rust
+        let next_gen = editor.active().document.blocks_generation.wrapping_add(1);
         editor.active_mut().document.blocks = new_blocks;
-        editor.active_mut().document.blocks_generation =
-            editor.active().document.blocks_generation.wrapping_add(1);
+        editor.active_mut().document.blocks_generation = next_gen;
         editor.active_mut().reconcile.blocks_version = version;
 ```
-and `reconcile.rs:64` (inside the `!= tree` branch):
+and `reconcile.rs:65` (inside the `!= tree` branch):
 ```rust
             if b.document.blocks != tree {
                 b.document.blocks = tree;
@@ -151,7 +179,7 @@ and `reconcile.rs:64` (inside the `!= tree` branch):
 ```
 (The parse-phase bump stays UNCONDITIONAL — do not guard it on "tree changed"; a byte-identical tree can accompany changed `line_text`.)
 
-- [ ] **Step 2: `FoldState.epoch` + epoch-bumping mutators** — `fold.rs`. Add the field + convert every mutator to bump on real change:
+- [ ] **Step 2: `FoldState.epoch` + epoch-bumping mutators** — `fold.rs`. Also add `PartialEq, Eq` to the `FoldView` (`fold.rs:69`) AND `HiddenRun` (`fold.rs:59`) derives (currently `Debug, Clone`) so the `cached_foldview_equals_fresh` test's `==` compiles: `#[derive(Debug, Clone, PartialEq, Eq)]` on both. Then add the epoch field + convert every mutator to bump on real change:
 ```rust
 #[derive(Debug, Clone, Default)]
 pub struct FoldState {
@@ -209,19 +237,24 @@ Keep the existing `reconcile(&mut self, blocks, buf)` (used by session restore `
   - `registry.rs` toggle/fold_all/unfold_all already call the methods (now bumping) — no change.
   - `save.rs:233,:277` `folds = prev_folds` (whole `FoldState`, carries its epoch) — leave as-is; the buffer was just replaced so `fold_view_cache` is empty (miss → recompute). The plan-confirm grep must show no OTHER `folds.folded` write.
 
-- [ ] **Step 4: Buffer cache fields + `active_fold_view` + `invalidate_layout` skeleton** — `editor.rs` `Buffer` (after `folds`):
+- [ ] **Step 4: Buffer cache fields + `active_fold_view` (impl Editor) + `invalidate_layout` (impl Buffer).** First a type alias in `editor.rs` (preempts `clippy::type_complexity` under the deny gate — do NOT use `#[allow]`):
+```rust
+type FoldViewCache = std::cell::RefCell<Option<(u64, u64, std::rc::Rc<crate::fold::FoldView>)>>;
+```
+`Buffer` (after `folds`):
 ```rust
     pub folds: crate::fold::FoldState,
     /// Memoized fold view, keyed by (blocks_generation, folds.epoch). Interior
     /// mutability so the accessor is `&self` (nav reads via `&Editor`).
-    pub fold_view_cache: std::cell::RefCell<Option<(u64, u64, std::rc::Rc<crate::fold::FoldView>)>>,
+    pub fold_view_cache: FoldViewCache,
     /// Generation the folded set was last reconciled (pruned) against. `None` on a
     /// fresh Buffer → the first rebuild always reconciles (covers reload/recovery).
     pub last_reconciled_generation: Option<u64>,
     /// Key `view.line_layouts` is currently valid for (Component 3, Task 3).
     pub layout_key: Option<crate::derive::LayoutKey>,
 ```
-Init in `from_text`: `fold_view_cache: std::cell::RefCell::new(None), last_reconciled_generation: None, layout_key: None,`. (`RefCell<Option<..Rc..>>` is `Clone`+`Debug` — `Buffer` keeps `#[derive(Debug, Clone)]`.) Add the accessor on `Editor`:
+Init in `from_text`: `fold_view_cache: std::cell::RefCell::new(None), last_reconciled_generation: None, layout_key: None,`. (`RefCell<Option<..Rc..>>` is `Clone`+`Debug`; `Buffer` keeps `#[derive(Debug, Clone)]` — no `PartialEq`/`Hash` to break.)
+Add the accessor as **`impl Editor`** — use a scoped `match` (NOT a nested `if let { if }`, which trips `clippy::collapsible_if`); the `Ref` borrow drops at the block's `}` before `borrow_mut()`:
 ```rust
     /// The active buffer's fold view, memoized by (blocks_generation, folds.epoch).
     /// Pure: never mutates document/fold state, so it takes `&self` and is usable
@@ -229,16 +262,20 @@ Init in `from_text`: `fold_view_cache: std::cell::RefCell::new(None), last_recon
     pub fn active_fold_view(&self) -> std::rc::Rc<crate::fold::FoldView> {
         let b = self.active();
         let key = (b.document.blocks_generation, b.folds.epoch);
-        if let Some((g, e, rc)) = &*b.fold_view_cache.borrow() {
-            if *g == key.0 && *e == key.1 { return rc.clone(); }
-        }
+        {
+            let cache = b.fold_view_cache.borrow();
+            match &*cache {
+                Some((g, e, rc)) if *g == key.0 && *e == key.1 => return rc.clone(),
+                _ => {}
+            }
+        } // Ref dropped here, before borrow_mut below
         let view = std::rc::Rc::new(
             crate::fold::FoldView::compute(&b.folds, &b.document.blocks, &b.document.buffer));
         *b.fold_view_cache.borrow_mut() = Some((key.0, key.1, view.clone()));
         view
     }
 ```
-And the layout invalidator (used by Task 3, add now):
+Add the layout invalidator as **`impl Buffer`** (Task 3 calls `b.invalidate_layout()` / `editor.active_mut().invalidate_layout()`):
 ```rust
     /// Clear the visible-line layout cache AND its key — the invariant is
     /// "layout_key == Some(k) ⟹ line_layouts valid for k". Route every EXTERNAL
@@ -335,7 +372,7 @@ pub struct LayoutKey {
   - `save.rs:238` (reload) and `save.rs:281` (recovery): replace `editor.active_mut().view.line_layouts.clear();` with `editor.active_mut().invalidate_layout();`.
   - `derive.rs:208`'s own clear stays (inside the gated pass, re-stores the key same pass).
 
-- [ ] **Step 3: Failing test — same-dimension Resize must not blank** (`app.rs`/`derive.rs` tests): drive a buffer to a populated `line_layouts`; call `invalidate_layout()` (simulating the Resize clear) with the SAME `area`; run `derive::rebuild`; assert `line_layouts` is non-empty. (Fails if the gate skips on the matching key without honoring the nulled `layout_key`.)
+- [ ] **Step 3: Regression-guard test — same-dimension Resize must not blank** (`app.rs`/`derive.rs` tests). NOTE: this is a guard, not a red-green pair — before Step 4 there is no gate so `rebuild` always repopulates and it passes; it only has teeth once the gate exists (Step 4), where it proves the gate honors the nulled `layout_key`. Drive a buffer to a populated `line_layouts`; call `invalidate_layout()` (simulating the Resize clear) with the SAME `area`; run `derive::rebuild`; assert `line_layouts` is non-empty.
 
 - [ ] **Step 4: Gate the layout loop** (`derive.rs`, the section from `vp_width` at :202 through the loop at :225). Compute the key AFTER `vp_width`, compare, skip or run:
 ```rust
@@ -397,3 +434,5 @@ git commit -m "perf(shell): gate the visible-line layout pass on a computed Layo
 **Type consistency:** `LayoutKey` (pub, in `derive`) referenced by `Buffer.layout_key: Option<crate::derive::LayoutKey>`; `active_fold_view(&self) -> Rc<FoldView>`; `nav::fold_view -> Rc<FoldView>` (Deref keeps 14 callers unchanged); `FoldState` mutators all bump `epoch`; `blocks_generation: u64` bumped at exactly two writers.
 
 **Ordering:** F3 independent (Task 1). Task 2 introduces `blocks_generation` + `epoch` + `layout_key` field. Task 3's `LayoutKey` consumes them — correct dependency.
+
+**Plan-confirm 8 (consumers-rebuild-first), recorded:** no path reads `active_fold_view` between an edit and the next `rebuild` (which would return a pre-edit cached view) — verified: every edit path routes `apply → derive::rebuild` immediately (commands insert/delete/undo/redo, mouse, registry), and the always-bump `remap` in `Buffer::apply` forces a cache miss after any edit regardless. So the cache introduces no transient divergence from today's recompute-each-time behavior. No code change; recorded per spec plan-confirm 8.
