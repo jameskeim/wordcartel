@@ -186,6 +186,10 @@ impl Registry {
             crate::export::run_export(c.editor, "pdf", &c.msg_tx);
             CommandResult::Handled
         });
+        r.register("export_tex", "Export LaTeX", Some(MenuCategory::Export), |c| {
+            crate::export::run_export(c.editor, "tex", &c.msg_tx);
+            CommandResult::Handled
+        });
 
         // Text object selection — palette-only (Task 7 / Effort 5c).
         r.register("select_word",      "Select Word",      None, |c| run(c, Command::SelectScope(Scope::Word)));

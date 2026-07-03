@@ -38,6 +38,7 @@ pub struct Config {
     pub view: ViewConfig,
     pub diagnostics: DiagnosticsConfig,
     pub theme: ThemeConfig,
+    pub export: ExportConfig,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -85,6 +86,20 @@ impl Default for ViewConfig {
         ViewConfig { typewriter: false, typewriter_anchor: 0.5, focus: false,
             focus_granularity: FocusGranularity::Paragraph, measure: false,
             wrap_column: 80, wrap_guide: false, word_count: false }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportConfig {
+    /// Pandoc PDF engine (`--pdf-engine=…`). Default xelatex (deliberate; see the spec).
+    pub pdf_engine: String,
+    /// Export-time smart punctuation. true → `-f markdown` (pandoc's smart default);
+    /// false → `-f markdown-smart` (strict literal). Applies to all export formats.
+    pub typography: bool,
+}
+impl Default for ExportConfig {
+    fn default() -> Self {
+        ExportConfig { pdf_engine: "xelatex".into(), typography: true }
     }
 }
 
@@ -143,6 +158,7 @@ struct RawConfig {
     view: RawView,
     diagnostics: RawDiagnostics,
     theme: RawTheme,
+    export: RawExport,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, PartialEq)]
@@ -194,6 +210,12 @@ struct RawState {
 #[serde(default)]
 struct RawMouse {
     capture: Option<bool>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawExport {
+    pdf_engine: Option<String>,
+    typography: Option<bool>,
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -307,6 +329,9 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
                 other => warns.push(format!("view.focus_granularity \"{other}\" invalid; using paragraph")),
             }
         }
+        // export: per-field override (omitted field inherits the lower layer).
+        if let Some(v) = raw.export.pdf_engine { cfg.export.pdf_engine = v; }
+        if let Some(v) = raw.export.typography { cfg.export.typography = v; }
         // diagnostics: per-field override + debounce_ms floor validation.
         if let Some(v) = raw.diagnostics.enabled { cfg.diagnostics.enabled = v; }
         if let Some(v) = raw.diagnostics.grammar { cfg.diagnostics.grammar = v; }
@@ -594,6 +619,39 @@ mod tests {
         let (cfg, _w) = load(&[lo, hi]);
         assert!(cfg.theme.styles.contains_key("heading1"));
         assert!(cfg.theme.styles.contains_key("selection"));
+    }
+
+    // -----------------------------------------------------------------------
+    // [export] config layering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn export_config_defaults_when_section_absent() {
+        let (cfg, warns) = load(&[]);
+        assert!(warns.is_empty());
+        assert_eq!(cfg.export.pdf_engine, "xelatex");
+        assert!(cfg.export.typography);
+    }
+
+    #[test]
+    fn export_config_partial_section_inherits_per_field() {
+        let d = tempdir();
+        let p = write(&d, "c.toml", "[export]\ntypography = false\n");
+        let (cfg, warns) = load(&[p]);
+        assert!(warns.is_empty());
+        assert_eq!(cfg.export.pdf_engine, "xelatex", "pdf_engine stays default");
+        assert!(!cfg.export.typography, "typography overridden to false");
+    }
+
+    #[test]
+    fn export_config_two_layers_per_field_inherit() {
+        let d = tempdir();
+        let lo = write(&d, "lo.toml", "[export]\ntypography = false\n");
+        let hi = write(&d, "hi.toml", "[export]\npdf_engine = \"tectonic\"\n");
+        let (cfg, warns) = load(&[lo, hi]);
+        assert!(warns.is_empty());
+        assert_eq!(cfg.export.pdf_engine, "tectonic", "hi set pdf_engine → wins");
+        assert!(!cfg.export.typography, "hi omitted typography → lo's false preserved");
     }
 
     #[test]

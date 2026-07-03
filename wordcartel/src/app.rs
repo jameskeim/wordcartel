@@ -1957,6 +1957,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     editor.view_opts = cfg.view.clone();
     editor.resume_enabled = cfg.state.resume; // gates open_into_current's resume restore (Effort 7)
     editor.diag_cfg = cfg.diagnostics.clone();
+    editor.export_cfg = cfg.export.clone();
     // Resolve and seed the active theme + color depth (once, at startup — §3.6).
     let env = crate::theme_resolve::EnvSnapshot::from_env();
     let resolved = crate::theme_resolve::resolve_theme(&cfg.theme, &env);
