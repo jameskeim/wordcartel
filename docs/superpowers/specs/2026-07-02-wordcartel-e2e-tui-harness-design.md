@@ -1,6 +1,6 @@
 # e2e / TUI test harness — design
 
-**Status:** approved design (pre-spec-review)
+**Status:** Codex round 1 folded (extraction order, test_support lift, fold key, resize dual-update); re-review pending
 **Date:** 2026-07-02
 **Effort:** e2e/TUI harness (the campaign's one untouched frontier — nothing exercises the live `wcartel` binary's `reduce → rebuild → render` pipeline end-to-end)
 
@@ -49,43 +49,59 @@ real-terminal startup, deferred.
 ## Component 1 — extract `advance` from `run()`'s loop body
 
 `run()` (app.rs:1846) has a per-iteration body (~app.rs:2153-2175) that interleaves
-state-affecting steps with terminal I/O. Extract the terminal-INDEPENDENT, state-affecting
-steps into a shared function both `run()` and the harness call:
+state-affecting steps with terminal I/O. Codex-round-1 correction: the real order is
+`reduce → note_undo_eviction → drain_clipboard_intents → reconcile_mouse_capture →
+recompute_scrollbar_visible → derive::rebuild → reconcile-arming → draw` — i.e.
+`note_undo_eviction` runs BEFORE the clipboard/mouse steps, while the other three state steps
+run AFTER them (and are already CONSECUTIVE). So extract ONLY the three consecutive post-mouse
+state steps (moving `note_undo_eviction` into the same function would force reordering the
+state-mutating clipboard/mouse steps):
 
 ```
-pub(crate) fn advance(
-    editor: &mut Editor,
-    clock: &dyn Clock,
-    pre_id: crate::editor::BufferId,
-    pre_version: u64,
-) {
-    editor.note_undo_eviction(pre_id, pre_version);
+pub(crate) fn advance(editor: &mut Editor, clock: &dyn Clock) {
     recompute_scrollbar_visible(editor, clock.now_ms());
     derive::rebuild(editor);
-    // reconcile-debounce arming (the existing `if maybe_stale && … { due_at = now + …}` block)
+    // reconcile-debounce arming (the existing `if b.reconcile.maybe_stale && … {
+    //   b.reconcile.due_at = Some(now + RECONCILE_DEBOUNCE_MS); … }` block — plan-confirm 2)
     …arm reconcile…
 }
 ```
 
-- **Moves into `advance`** (verbatim, same order): `note_undo_eviction(pre_id, pre_version)`,
-  `recompute_scrollbar_visible(editor, clock.now_ms())`, `derive::rebuild(editor)`, and the
-  reconcile-debounce arming block.
-- **Stays in `run()`** (terminal-coupled or loop-control), unchanged, around the `advance`
-  call: the pre-`reduce` `(pre_id, pre_version)` snapshot; `drain_clipboard_intents(…,
-  backend_mut(), …)`; `reconcile_mouse_capture(…, backend_mut(), …)`; `guard.terminal().draw(…)`;
-  the next-iteration `recv_timeout` deadline computation; session persistence on `saved_version`
-  advance.
-- `run()`'s body becomes `snapshot → reduce → advance(editor, &clock, pre_id, pre_version) →
-  [clipboard drain / mouse capture / draw / session]`. **Byte-identical**: the extracted lines
-  move verbatim, called from the same point with the same arguments.
+- **Moves into `advance`** (verbatim, same order — already consecutive at app.rs ~:2160-2174):
+  `recompute_scrollbar_visible(editor, clock.now_ms())`, `derive::rebuild(editor)`, the
+  reconcile-debounce arming block. NO reordering.
+- **Stays in `run()`, unchanged, at their exact current points:** the pre-`reduce`
+  `(pre_id, pre_version)` snapshot; `editor.note_undo_eviction(pre_id, pre_version)` (a direct
+  method call, BEFORE clipboard — NOT moved); `drain_clipboard_intents(…, backend_mut(), …)`;
+  `reconcile_mouse_capture(…, backend_mut(), …)`; then `advance(&mut editor, &clock)`; then
+  `guard.terminal().draw(…)`; the next-iteration `recv_timeout` deadline computation; session
+  persistence.
+- `run()`'s body becomes `snapshot → reduce → note_undo_eviction → clipboard → mouse →
+  advance(editor, &clock) → draw → session`. **Byte-identical**: `advance` is a verbatim move of
+  three already-consecutive lines, called from the same point.
+
+**Harness fidelity boundary (documented):** the harness replays `snapshot → reduce →
+note_undo_eviction → advance → render`, OMITTING the two terminal-output steps
+(`drain_clipboard_intents`, `reconcile_mouse_capture`) that run between `note_undo_eviction`
+and `advance` in `run()`. Those steps mutate only clipboard-sync / drag / `status` state, which
+is ORTHOGONAL to the view rebuild the seed journeys assert — so the harness produces identical
+state for every seed journey. Clipboard/mouse journeys (follow-on, non-goal here) will add
+those steps to the harness with a mock clip channel + TestBackend.
 
 Correctness proof: the existing ~60 `app.rs` tests + the full suite stay green (a pure move).
 
 ## Component 2 — the `Harness` (in `#[cfg(test)] mod e2e`)
 
 A new file `wordcartel/src/e2e.rs`, declared `#[cfg(test)] mod e2e;` in `lib.rs`, so it sees
-`pub(crate)` (incl. `advance`) + reuses the existing test helpers (`InlineExecutor`, the
-key-event builders, `Registry::builtins`, `keymap::build_keymap`, `Msg`).
+`pub(crate)` (incl. `advance`). `InlineExecutor` is already `pub` (jobs.rs:85) → reachable.
+BUT (Codex round 1) `TestClock` + the key-event builders (`key_char`, `press`, …) live inside
+`app.rs`'s PRIVATE `#[cfg(test)] mod tests` — a sibling `#[cfg(test)] mod e2e` cannot see them.
+**Fix: lift them to a shared `#[cfg(test)] pub(crate) mod test_support`** (a new file
+`wordcartel/src/test_support.rs`, `#[cfg(test)] pub(crate) mod test_support;` in `lib.rs`),
+holding `TestClock` + the key-event builders; update `app.rs`'s `mod tests` to import them from
+there (mechanical). The harness uses the PUBLIC `keymap::build_keymap` directly (NOT the
+test-only `cua_keymap`), which returns `(KeyTrie, Vec<String>)` — destructure and drop the
+warnings.
 
 ```
 struct Harness {
@@ -102,18 +118,23 @@ struct Harness {
 
 - **`Harness::new(text: &str, path: Option<PathBuf>, (w, h): (u16, u16)) -> Self`** — build
   `Editor::new_from_text(text, path, (w, h))`, `Registry::builtins()`,
-  `keymap::build_keymap(&KeymapConfig::default(), &reg)`, `InlineExecutor::default()`,
-  `Terminal::new(TestBackend::new(w, h))`, an `mpsc::channel()`; `now = 0`; run the initial
-  `derive::rebuild(&mut editor)` + first `render`.
+  `let (keymap, _warn) = keymap::build_keymap(&KeymapConfig::default(), &reg)` (destructure the
+  `(KeyTrie, Vec<String>)` tuple), `InlineExecutor::default()`, `Terminal::new(TestBackend::new(
+  w, h))`, an `mpsc::channel()`; `now = 0`; run the initial `derive::rebuild(&mut editor)` +
+  first `render`.
 - **`step(&mut self, msg: Msg) -> bool`** — the core primitive, the shared production sequence:
   snapshot `(pre_id, pre_version)` from `editor.active()` → `let keep = reduce(msg, &mut
-  self.editor, &self.reg, &self.keymap, &self.ex, &TestClock(self.now), &self.tx)` → `advance(
-  &mut self.editor, &TestClock(self.now), pre_id, pre_version)` → render to `self.term`. Return
-  `keep`. All input methods are sugar over `step`.
-- **Input sugar:** `type_str(&str)`, `key(char)`, `ctrl(char)`, `alt_shift(char)`,
-  `press(KeyCode, KeyModifiers)`, `resize(u16, u16)` (→ `step(Msg::Input(Event::Resize(w, h)))`),
-  `paste(&str)` (→ `Event::Paste`). Each builds the `KeyEvent`/`Event` via the existing helpers
-  and calls `step`.
+  self.editor, &self.reg, &self.keymap, &self.ex, &TestClock(self.now), &self.tx)` →
+  `self.editor.note_undo_eviction(pre_id, pre_version)` (the direct method call `run()` makes
+  before clipboard/mouse) → `advance(&mut self.editor, &TestClock(self.now))` → render to
+  `self.term`. Return `keep`. All input methods are sugar over `step`.
+- **Input sugar:** `type_str(&str)`, `key(char)`, `ctrl(char)`, `alt(char)`, `alt_shift(char)`,
+  `press(KeyCode, KeyModifiers)`, `paste(&str)` (→ `Event::Paste`). Each builds the
+  `KeyEvent`/`Event` via the `test_support` builders and calls `step`.
+- **`resize(&mut self, w: u16, h: u16)` (Codex round 1 — MUST update both):** call
+  `self.term.backend_mut().resize(w, h)` (so the `TestBackend` cell grid matches) AND
+  `self.step(Msg::Input(Event::Resize(w, h)))` (so the editor's buffer areas update). Omitting
+  either desyncs the editor geometry from the rendered buffer.
 - **Clock / async:** `advance_ms(ms)` bumps `self.now`; `tick()` = `advance_ms(…)` then
   `step(Msg::Tick)` (drives the 150 ms reconcile debounce — `InlineExecutor` runs the reparse
   inline, `reduce`'s trailing `ex.drain()` merges it); `drain_msgs()` — `while let Ok(m) =
@@ -145,9 +166,10 @@ Each a `#[test]` over the `Harness`, asserting on BOTH state and the rendered bu
 6. **quit-dirty modal (no data loss):** `type_str("x")` (dirty); `let keep = ctrl('q')` → assert
    `keep == true` (did NOT quit silently) AND `prompt()` is the dirty-quit modal; drive the
    discard choice → quits; a separate run drives the save choice → file written then quits.
-7. **fold hides lines in render:** a multi-heading doc; fold a heading (the fold key) → assert
-   `folded()` contains the anchor AND the folded body lines are ABSENT from `screen()` while the
-   heading line is present (FoldView through render).
+7. **fold hides lines in render:** a multi-heading doc; fold ONE heading via **Alt+Z**
+   (`fold_toggle`; keymap.rs:305 — NOT Alt+Shift+Z, which is `fold_all`) → assert `folded()`
+   contains the anchor AND the folded body lines are ABSENT from `screen()` while the heading
+   line is present (FoldView through render).
 
 ## Determinism
 
@@ -165,10 +187,11 @@ byte-identical by the existing suite).
 
 ## Decomposition (3 tasks)
 
-1. **Extract `advance`** from `run()` — behavior-preserving; existing ~60 app tests + full suite
-   green (the proof).
-2. **Build the `Harness`** (Component 2) + 2 smoke journeys (type→render, save→reload) proving
-   the driver end-to-end.
+1. **Extract `advance`** (the 3 consecutive post-mouse state steps) from `run()` — behavior-
+   preserving; existing ~60 app tests + full suite green (the proof).
+2. **Lift `TestClock` + the key-event builders to `#[cfg(test)] pub(crate) mod test_support`**
+   (update `app::tests` to import them) + **build the `Harness`** (Component 2) + 2 smoke
+   journeys (type→render, save→reload) proving the driver end-to-end.
 3. **The remaining 5 journeys** (resize-no-blank, reconcile-convergence, undo/redo, quit-dirty,
    fold-in-render).
 
@@ -181,20 +204,20 @@ byte-identical by the existing suite).
 
 ## Plan-confirms (resolve during the implementation plan, against real source)
 
-1. The EXACT loop-body line range to extract (app.rs ~2153-2175): confirm the state-affecting
-   steps (`note_undo_eviction`, `recompute_scrollbar_visible`, `derive::rebuild`, reconcile
-   arming) are contiguous-enough to move verbatim into `advance`, and that the terminal-coupled
-   steps (clipboard drain, mouse capture, draw, session persist) + the deadline computation stay
-   in `run()` without reordering that changes behavior. Confirm `note_undo_eviction`'s signature
-   + that `pre_id`/`pre_version` are the values it needs.
+1. The EXACT lines to extract (app.rs ~:2160-2174): confirm `recompute_scrollbar_visible`,
+   `derive::rebuild`, and the reconcile-arming block are the three CONSECUTIVE post-mouse steps
+   (Codex round 1 confirmed this order), so `advance` is a verbatim move with NO reordering;
+   `note_undo_eviction(pre_id, pre_version)` stays a direct call BEFORE the clipboard/mouse steps.
+   Confirm the deadline computation for the next `recv_timeout` reads `b.reconcile.due_at` AFTER
+   `advance` sets it (so leaving it in `run()` post-`advance` is correct).
 2. Confirm the reconcile-arming block's exact shape (the `if b.reconcile.maybe_stale && … {
    b.reconcile.due_at = Some(now + RECONCILE_DEBOUNCE_MS); … }`) and that moving it into `advance`
    (which computes `now` via `clock.now_ms()`) leaves the deadline computation in `run()` intact.
-3. `reduce`/`render`/`Editor::new_from_text`/`keymap::build_keymap`/`InlineExecutor`/`TestClock`/
-   the key-event builder helpers — confirm exact signatures + visibility from a new
-   `#[cfg(test)] mod e2e` (they're used by the existing `app.rs`/`render.rs` test modules; confirm
-   `e2e.rs` as a sibling `#[cfg(test)] mod` can reach them, or whether any are private to
-   `app::tests` and need lifting to a shared test-support location).
+3. RESOLVED (Codex round 1): `InlineExecutor` is `pub` (jobs.rs:85); `TestClock` + the
+   key-event builders are private to `app::tests` and MUST be lifted to `#[cfg(test)] pub(crate)
+   mod test_support` (Task 2). Confirm the exact set of helpers `app::tests` uses so the lift
+   updates every reference, and that `build_keymap` (public) suffices for the harness keymap
+   (no `cua_keymap` needed).
 4. The fold key + the reconcile-provisional condition for journeys 7 and 4 — confirm the exact
    key (Alt+Shift+Z per the map's fold_toggle/fold_all) and an edit that reliably yields a
    provisional/stale tree that the tick converges (a `Local`-reason edit).
