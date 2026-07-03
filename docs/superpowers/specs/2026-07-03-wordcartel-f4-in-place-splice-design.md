@@ -1,6 +1,6 @@
 # F4: in-place consume-and-splice (kill the per-keystroke splice allocations) — design
 
-**Status:** Codex spec-review CLEAN (round 2, ready for planning); Fable5 pass pending
+**Status:** spec-review CLEAN (Codex x2 + Fable5 folded); ready for user review + planning
 **Date:** 2026-07-03
 **Effort:** F4 (the deferred per-keystroke O(#nodes) splice-clone — the allocation floor F1's Case B bottoms out on; recommended resolution "(f)" from the Fable5 F4 analysis)
 
@@ -66,9 +66,10 @@ span-shift half and/or require re-deriving a fuzz-hardened module — see the F4
   consumed only at the splice.
 - Rewrite the existing `pub fn incremental_update_instrumented_src<S>(old_tree: &BlockTree, …)`
   to delegate: `incremental_update_instrumented_src_owned(old_tree.clone(), old_src, edit, new_src)`.
-  All the other `&`-entry points (`incremental_update` :498, `incremental_update_instrumented`
-  :510, `incremental_update_rope` :525, `incremental_update_src` :535) already funnel through
-  `incremental_update_instrumented_src`, so they transparently exercise the owned path. Tests /
+  All the other `&`-entry points (`incremental_update` :510, `incremental_update_instrumented`
+  :522, `incremental_update_rope` :537, `incremental_update_src` :547) already funnel through
+  `incremental_update_instrumented_src` (Fable verified: oracle `check` + chain + the F2 fuzz target
+  all route through it), so they transparently exercise the owned path. Tests /
   the oracle / the F2 fuzz target keep their `&`-signatures (their clone is irrelevant — not hot)
   and become the free regression net for the owned splice.
 - Optionally add `incremental_update_owned(old_tree, …) -> BlockTree` (`.tree` of the owned
@@ -79,8 +80,12 @@ span-shift half and/or require re-deriving a fuzz-hardened module — see the F4
 
 `tops` is sorted by `span.start` + non-overlapping (straddle repair guarantees it), so the
 current per-element classification (before / overlapping-dropped / after) is a CONTIGUOUS 3-way
-partition. Reproduce it with two `partition_point`s over `&old_tree.root.children` (borrow before
-the move), then edit the moved Vec in place:
+partition. Reproduce it with two `partition_point`s over `&old_tree.root.children`, computed from
+the FINAL `region_old_start`/`region_old_end` — i.e. at the current splice site (:956), AFTER the
+created-container second trigger (:925-948) which can re-widen `region_old_end` to `old_src.len()`
+(Fable I/Minor-3: do NOT hoist the partition_points before that, or `splice_hi` uses a stale
+bound). Then edit the moved Vec in place (the borrow of `&old_tree.root.children` for the
+partition_points ends before the `let mut children = old_tree.root.children` move):
 
 ```
 // borrow phase (before consuming old_tree):
@@ -130,8 +135,11 @@ the region computation.
 
 ## Component 2 — shell wiring + the perf-proof test (`wordcartel/src/derive.rs`, `editor.rs`)
 
-- Add `Document::take_blocks(&mut self) -> BlockTree` (editor.rs, beside `set_blocks` :90).
-  `BlockTree` has NO `Default` (it derives only `Clone/PartialEq/Eq`, block_tree.rs:164), so use
+- Add `pub(crate) fn take_blocks(&mut self) -> BlockTree` on `Document` (Fable Minor-4: `pub(crate)`,
+  same crate as `derive.rs`; doc-comment the TRANSIENT CONTRACT — the caller MUST `set_blocks` on
+  every path, or the document is left with a silently-empty tree behind a stale generation), beside
+  `set_blocks` :90. `BlockTree` has NO `Default` (it derives only `Debug/Clone/PartialEq/Eq`,
+  block_tree.rs:164), so use
   `std::mem::replace(&mut self.blocks, wordcartel_core::block_tree::empty_tree(self.buffer.len()))`
   — returns the current tree, leaves a valid empty tree spanning the doc (block_tree.rs:333). This
   does NOT bump `blocks_generation` (it's a take, not a semantic write; the subsequent `set_blocks`
@@ -151,13 +159,28 @@ the region computation.
 
 ### The perf-proof test (pointer-identity, allocator-free)
 
-Add a `#[cfg(test)]` test (core, block_tree.rs tests) that pins the zero-copy property: build a
-tree with a before-block whose `children` Vec is non-empty; capture that before-block's
-`children.as_ptr()`; run an incremental edit whose region is AFTER that block (so it is a
-"before" block, untouched by the splice); assert the same before-block's `children.as_ptr()` is
-UNCHANGED — proving before-blocks are moved, not deep-cloned. (A deep clone would allocate a new
-child Vec → different pointer.) This guards the win against a future refactor silently
-reintroducing a clone, without a counting global allocator.
+Add a `#[cfg(test)]` test (core, block_tree.rs tests) that pins the zero-copy property. **It MUST
+call `incremental_update_instrumented_src_owned` DIRECTLY** (Fable I-2): the `&`-wrappers begin
+with `old_tree.clone()`, so through any wrapper the pointer always differs and the test would fail
+unconditionally (and risks being "fixed" into something vacuous). Capture the pointer(s) on the
+OWNED input tree, move it into the owned entry, and inspect `outcome.tree`. Use a **`Local` edit**
+(any `NoOverlapFull`/seam-guard/FM fallback full-parses and also fails spuriously — assert
+`outcome.reason == Local`).
+
+Pin BOTH halves (Fable I-1 — the before-block is the easy half; the after-block shift is the
+MOTIVATING half the Context calls out, and a refactor reverting to `shift_block(&child)` would
+restore the pathology while a before-only pin stays green):
+- **Before-block:** a block with a non-empty `children` Vec entirely BEFORE the edit region; capture
+  its `children.as_ptr()`; after the owned update, the corresponding block in `outcome.tree` has the
+  SAME `children.as_ptr()` (moved, not deep-cloned — a `b.clone()` would reallocate → different ptr).
+- **After-block:** a block with a non-empty `children` Vec entirely AFTER the edit region; capture its
+  `children.as_ptr()`; after the update, the corresponding after-block has the SAME `children.as_ptr()`
+  (shifted IN PLACE, not `shift_block`-cloned) AND its spans are correctly shifted by `delta` (byte
+  arithmetic vs the pre-edit spans). This directly guards the motivating allocation storm.
+
+(The reparsed-region blocks' move is not externally pinnable — there's no outside handle to the
+internal parse's allocation; that's acceptable, since owning `reparsed.root.children` makes a
+re-clone there structurally awkward. No counting global allocator needed.)
 
 ## Testing
 
@@ -166,7 +189,9 @@ reintroducing a clone, without a counting global allocator.
   :1300) all assert `incremental == full_parse` (byte-identical trees). Since the `&`-wrappers now
   delegate to the owned path, this entire harness covers the owned splice with ZERO new correctness
   tests. Any classification/shift/seam drift fails an existing oracle assertion.
-- **Perf pin:** the pointer-identity zero-copy test above.
+- **Perf pin:** the pointer-identity zero-copy test above — calling the OWNED entry directly, on a
+  `Local` edit, pinning BOTH a before-block AND an after-block (the motivating half) by
+  `children.as_ptr()` + correct after-block span shift.
 - **Shell:** the existing `derive.rs`/`app.rs` tests + the (new this campaign) e2e journeys stay
   green (the `take_blocks` wiring is behavior-preserving).
 
