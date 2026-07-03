@@ -3,8 +3,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
-// NOTE: `BlockTree`/`full_parse_rope`/`ropey` imports are added in Task 3 (only the Task-3
-// journeys/accessors use them) so Task 2's `--no-run` gate stays warning-free (Fable I-1).
+use wordcartel_core::block_tree::{BlockTree, full_parse_rope};
 
 use crate::app::{self, Msg, reduce};
 use crate::editor::Editor;
@@ -60,16 +59,31 @@ impl Harness {
         self.term.draw(|f| render::render(f, editor)).expect("draw");
     }
 
-    // — input sugar (Task 2 subset — the rest are added in Task 3, so each task's `--no-run`
-    //   gate stays warning-free; Fable I-1) —
+    // — input sugar —
     fn type_str(&mut self, s: &str) { for c in s.chars() { self.step(Msg::Input(Event::Key(key_char(c)))); } }
     fn ctrl(&mut self, c: char) -> bool { self.step(press(KeyCode::Char(c), KeyModifiers::CONTROL)) }
+    fn alt(&mut self, c: char) -> bool { self.step(press(KeyCode::Char(c), KeyModifiers::ALT)) }
+    fn key(&mut self, code: KeyCode) -> bool { self.step(press(code, KeyModifiers::NONE)) }
+    fn resize(&mut self, w: u16, h: u16) {
+        self.term.backend_mut().resize(w, h);         // sync the TestBackend cell grid
+        self.step(Msg::Input(Event::Resize(w, h)));   // update the editor's buffer areas
+    }
 
-    // — state assertions —
+    fn advance_ms(&mut self, ms: u64) { self.now = self.now.saturating_add(ms); }
+    fn tick(&mut self) -> bool { self.step(Msg::Tick) }
+
+    // — state accessors —
     fn doc_text(&self) -> String { self.editor.active().document.buffer.to_string() }
     fn dirty(&self) -> bool { self.editor.active().document.dirty() }
     fn saved_version(&self) -> Option<u64> { self.editor.active().document.saved_version } // Option, not u64 (editor.rs:64)
     fn status(&self) -> &str { &self.editor.status }
+    fn blocks(&self) -> &BlockTree { self.editor.active().document.blocks() }
+    fn folded(&self) -> &std::collections::BTreeSet<usize> { self.editor.active().folds.folded() }
+    fn maybe_stale(&self) -> bool { self.editor.active().reconcile.maybe_stale }
+    fn in_flight(&self) -> Option<u64> { self.editor.active().reconcile.in_flight_version }
+    fn reconcile_blocks_version(&self) -> u64 { self.editor.active().reconcile.blocks_version }
+    fn version(&self) -> u64 { self.editor.active().document.version }
+    fn rope(&self) -> ropey::Rope { self.editor.active().document.buffer.snapshot() }
 
     // — screen assertions —
     fn row(&self, y: u16) -> String {
@@ -110,4 +124,77 @@ fn e2e_save_writes_file_and_reloads() {
     // Reload: a fresh harness opening the same file round-trips.
     let h2 = Harness::new(&std::fs::read_to_string(&path).unwrap(), Some(path.clone()), (80, 24));
     assert_eq!(h2.doc_text(), "hello\n");
+}
+
+#[test]
+fn e2e_resize_does_not_blank_the_screen() {
+    let mut h = Harness::new("hello", None, (80, 24));
+    assert!(h.screen_contains("hello"));
+    h.resize(80, 24);  // SAME dims — the SIGWINCH class that blanked via a stale layout_key
+    assert!(h.screen_contains("hello"), "same-dim resize blanked the screen:\n{:#?}", h.screen());
+    h.resize(100, 30); // different dims
+    assert!(h.screen_contains("hello"), "resize blanked the screen:\n{:#?}", h.screen());
+}
+
+#[test]
+fn e2e_reconcile_converges_a_stale_tree() {
+    let mut h = Harness::new("# A\n\nbody\n", None, (80, 24));
+    // Plant a deliberately-wrong tree + mark stale (mirrors reconcile.rs:104-126).
+    {
+        let b = h.editor.active_mut();
+        // A deliberately-wrong tree (empty), mirroring reconcile.rs:104-126's plant.
+        let len = b.document.buffer.len();
+        b.document.set_blocks(wordcartel_core::block_tree::empty_tree(len));
+        b.reconcile.maybe_stale = true;
+    }
+    // Precondition: genuinely divergent from a full parse of the real text.
+    let want = full_parse_rope(&h.rope());
+    assert_ne!(h.blocks(), &want, "planted tree must differ from full_parse (else vacuous)");
+    // Drive the debounce: one tick to arm (advance sets due_at = now+150), then
+    // advance past the deadline + tick to dispatch.
+    h.tick();                                   // advance arms due_at = now + 150
+    h.advance_ms(crate::reconcile::RECONCILE_DEBOUNCE_MS + 1);
+    h.tick();                                   // now >= due_at → reduce dispatches reparse; InlineExecutor runs it; reduce drains
+    // Machinery ran:
+    assert!(!h.maybe_stale());
+    assert!(h.in_flight().is_none());
+    assert_eq!(h.reconcile_blocks_version(), h.version());
+    // Content converged:
+    assert_eq!(h.blocks(), &full_parse_rope(&h.rope()));
+}
+
+#[test]
+fn e2e_undo_redo() {
+    let mut h = Harness::new("", None, (80, 24));
+    h.type_str("abc");                 // frozen clock → ONE coalesced revision (COALESCE_MS=500)
+    assert_eq!(h.doc_text(), "abc");
+    h.ctrl('z');                       // undo → reverts the whole coalesced insert
+    assert_eq!(h.doc_text(), "");
+    assert!(!h.screen_contains("abc"), "undone text must be gone from the screen");
+    h.ctrl('y');                       // redo
+    assert_eq!(h.doc_text(), "abc");
+}
+
+#[test]
+fn e2e_quit_dirty_raises_modal_not_silent_quit() {
+    let mut h = Harness::new("x", None, (80, 24));
+    h.type_str("y");                   // dirty
+    let keep = h.ctrl('q');
+    assert!(keep, "dirty Ctrl+Q must NOT quit silently");
+    assert!(h.editor.prompt.is_some(), "dirty Ctrl+Q must raise the quit_multi modal");
+    // Discard path: 'r' (review each) → 'd' (discard) quits.
+    h.key(KeyCode::Char('r'));
+    let keep2 = h.key(KeyCode::Char('d'));
+    assert!(!keep2, "review→discard must quit");
+}
+
+#[test]
+fn e2e_fold_hides_body_in_render() {
+    let mut h = Harness::new("# Head\n\nsecret body line\n\n# Other\n", None, (80, 24));
+    assert!(h.screen_contains("secret body line"), "body must render BEFORE folding (else vacuous)");
+    // Cursor is at the top (byte 0, inside "# Head"); Alt+Z folds that section.
+    h.alt('z');
+    assert!(!h.folded().is_empty(), "Alt+Z must fold the heading");
+    assert!(h.screen_contains("Head"), "the heading stays visible");
+    assert!(!h.screen_contains("secret body line"), "the folded body must be hidden:\n{:#?}", h.screen());
 }
