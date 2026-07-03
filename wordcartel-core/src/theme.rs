@@ -229,7 +229,7 @@ pub fn default() -> Theme {
     Theme {
         name: "default".into(),
         base_fg: Color::Default, base_bg: Color::Default,
-        heading_level_glyph: false, monochrome: false,
+        heading_level_glyph: true, monochrome: false,
         faces: ThemeFaces {
             text: Face::default(),
             emphasis: modface(None, false, true, false, false, false),
@@ -285,7 +285,7 @@ pub fn tokyo_night() -> Theme {
         name: "tokyo-night".into(),
         base_fg: FG,
         base_bg: BG,
-        heading_level_glyph: false,
+        heading_level_glyph: true,
         monochrome: false,
         faces: ThemeFaces {
             text: Face::default(),
@@ -346,7 +346,7 @@ pub fn from_base16(name: &str, p: BasePalette) -> Theme {
         name: name.into(),
         base_fg: b[5],
         base_bg: b[0],
-        heading_level_glyph: false,
+        heading_level_glyph: true,
         monochrome: false,
         faces: ThemeFaces {
             text: Face::default(),
@@ -533,7 +533,7 @@ pub fn phosphor(name: &str, hue: Color, flat: bool) -> Theme {
             chrome_muted: Face { fg: Some(shade(hue, 2)), bg: Some(shade(hue, 0)), dim: Some(true), ..Face::default() },
         }
     };
-    Theme { name: name.into(), base_fg: fg, base_bg: bg, heading_level_glyph: flat, monochrome: flat, faces }
+    Theme { name: name.into(), base_fg: fg, base_bg: bg, heading_level_glyph: true, monochrome: flat, faces }
 }
 
 const PHOSPHORS: [(&str, Color); 5] = [
@@ -612,7 +612,7 @@ mod tests {
         assert_eq!(t.base_fg, Color::Default);
         assert_eq!(t.base_bg, Color::Default);
         assert!(!t.monochrome);
-        assert!(!t.heading_level_glyph);
+        assert!(t.heading_level_glyph);
         // headings get NO color today → empty face (centralizing roles is a no-op for Default)
         assert_eq!(t.face(SemanticElement::Heading(1)), Face::default());
         assert_eq!(t.face(SemanticElement::Text), Face::default());
