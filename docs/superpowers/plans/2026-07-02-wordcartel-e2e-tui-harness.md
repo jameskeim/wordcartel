@@ -64,6 +64,10 @@ pub(crate) fn advance(editor: &mut Editor, clock: &dyn Clock) {
         guard.terminal().draw(|f| render::render(f, &mut editor))?;
 ```
 
+**CAUTION (Codex):** replace ONLY the loop-body lines app.rs:2157-2174. Do NOT touch the
+pre-first-draw block near app.rs:2059 — it additionally snaps folded cursor state + calls
+`ensure_visible` and is NOT a duplicate of `advance`; leave it as-is.
+
 - [ ] **Step 3: Run the suite — confirm the extraction is behavior-preserving.**
 Run: `cargo test -p wordcartel` and `cargo clippy --workspace --all-targets`.
 Expected: PASS/clean — a pure move of three consecutive lines; the 127 `app.rs` tests + full suite stay green.
@@ -107,7 +111,9 @@ pub(crate) fn key_char(c: char) -> KeyEvent {
     KeyEvent { code: KeyCode::Char(c), modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE }
 }
 
-/// A `Msg::Input` key press with explicit code + modifiers.
+/// A `Msg::Input` key press with explicit code + modifiers. NOTE (Codex): `press` already
+/// returns `Msg` — the harness sugar passes it straight to `step`; never wrap it as
+/// `Msg::Input(press(...))`.
 pub(crate) fn press(code: KeyCode, mods: KeyModifiers) -> Msg {
     Msg::Input(Event::Key(KeyEvent { code, modifiers: mods, kind: KeyEventKind::Press, state: KeyEventState::NONE }))
 }
@@ -194,7 +200,7 @@ impl Harness {
     // — state assertions —
     fn doc_text(&self) -> String { self.editor.active().document.buffer.to_string() }
     fn dirty(&self) -> bool { self.editor.active().document.dirty() }
-    fn saved_version(&self) -> u64 { self.editor.active().document.saved_version }
+    fn saved_version(&self) -> Option<u64> { self.editor.active().document.saved_version } // Option, not u64 (editor.rs:64)
     fn status(&self) -> &str { &self.editor.status }
     fn blocks(&self) -> &BlockTree { self.editor.active().document.blocks() }
 
@@ -278,7 +284,7 @@ fn e2e_resize_does_not_blank_the_screen() {
     fn in_flight(&self) -> Option<u64> { self.editor.active().reconcile.in_flight_version }
     fn reconcile_blocks_version(&self) -> u64 { self.editor.active().reconcile.blocks_version }
     fn version(&self) -> u64 { self.editor.active().document.version }
-    fn rope(&self) -> wordcartel_core::text::Rope { self.editor.active().document.buffer.snapshot() /* or the real snapshot accessor */ }
+    fn rope(&self) -> ropey::Rope { self.editor.active().document.buffer.snapshot() } // TextBuffer::snapshot() -> ropey::Rope (Codex)
 
 #[test]
 fn e2e_reconcile_converges_a_stale_tree() {
@@ -286,7 +292,9 @@ fn e2e_reconcile_converges_a_stale_tree() {
     // Plant a deliberately-wrong tree + mark stale (mirrors reconcile.rs:104-126).
     {
         let b = h.editor.active_mut();
-        b.document.set_blocks(full_parse_rope(&ropey::Rope::from_str("# WRONG\n")));
+        // A deliberately-wrong tree (empty), mirroring reconcile.rs:104-126's plant.
+        let len = b.document.buffer.len();
+        b.document.set_blocks(wordcartel_core::block_tree::empty_tree(len));
         b.reconcile.maybe_stale = true;
     }
     // Precondition: genuinely divergent from a full parse of the real text.
@@ -315,7 +323,7 @@ fn e2e_undo_redo() {
     assert_eq!(h.doc_text(), "abc");
     h.ctrl('z');                       // undo → reverts the whole coalesced insert
     assert_eq!(h.doc_text(), "");
-    assert!(h.screen_contains(" ") /* blank editing area */ || !h.screen_contains("abc"));
+    assert!(!h.screen_contains("abc"), "undone text must be gone from the screen");
     h.ctrl('y');                       // redo
     assert_eq!(h.doc_text(), "abc");
 }
