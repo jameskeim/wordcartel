@@ -25,7 +25,7 @@
 
 ### Task 1: Core — the owned entry + in-place splice
 
-**Files:** Modify `wordcartel-core/src/block_tree.rs` (the `incremental_update_instrumented_src` signature ~:545; the splice :956-1003; `shift_block`→`shift_in_place` :1269-1275; a new `&`-wrapper + str-owned convenience).
+**Files:** Modify `wordcartel-core/src/block_tree.rs` (the `incremental_update_instrumented_src` signature ~:609; the splice :956-1003; `shift_block`→`shift_in_place` :1269-1275; a new `&`-wrapper + str-owned convenience).
 
 **Interfaces produced:** `pub fn incremental_update_instrumented_src_owned<S: TextSource>(old_tree: BlockTree, old_src: &S, edit: &Edit, new_src: &S) -> UpdateOutcome`; `pub fn incremental_update_instrumented_owned(old_tree: BlockTree, old_text: &str, edit: &Edit, new_text: &str) -> UpdateOutcome` (str convenience for the shell/tests); the `&`-entry `incremental_update_instrumented_src` retains its signature (delegates).
 
@@ -44,7 +44,7 @@ fn shift_in_place(b: &mut Block, delta: isize) {
 ```
 (`shift_block`'s only caller was the splice at :975 — replaced below; grep to confirm before deleting.)
 
-- [ ] **Step 2: Convert the function to owned + add the wrappers.** Rename the existing `pub fn incremental_update_instrumented_src<S: TextSource>(old_tree: &BlockTree, …)` (block_tree.rs:545) to `…_owned` and change the FIRST parameter from `&BlockTree` to `BlockTree` (by value). The body is UNCHANGED except the splice (Step 3) — the region computation still does `let tops = old_tree.top_level();` (borrows the owned tree; auto-ref works). Then add two thin entry points just above it:
+- [ ] **Step 2: Convert the function to owned + add the wrappers.** Rename the existing `pub fn incremental_update_instrumented_src<S: TextSource>(old_tree: &BlockTree, …)` (block_tree.rs:609 — Fable: NOT :545, which is incremental_update_src) to `…_owned` and change the FIRST parameter from `&BlockTree` to `BlockTree` (by value). Update the renamed fn's doc comment to state the OWNERSHIP contract (it consumes the old tree — Fable Minor-3; house rule: doc every pub item). The body is UNCHANGED except the splice (Step 3) — the region computation still does `let tops = old_tree.top_level();` (borrows the owned tree; auto-ref works). Then add two thin entry points just above it:
 
 ```rust
 /// `&`-entry (unchanged public signature; the oracle/fuzz/tests use this). Clones the old
@@ -78,6 +78,11 @@ pub fn incremental_update_instrumented_owned(
     let splice_lo = tops.partition_point(|b| b.span.end <= region_old_start);
     let splice_hi =
         tops.partition_point(|b| !(b.span.start >= region_old_end && b.span.end > region_old_end));
+    // Invariant (Fable Minor-2): documents the ordered/non-overlapping precondition. A tree
+    // that violates it (only hand-buildable — pub fields) would make `Vec::splice` panic here
+    // instead of the current loops' silent wrong output; unreachable from any tree this module
+    // or the shell produces.
+    debug_assert!(splice_lo <= splice_hi, "splice range inverted — old tree not ordered/non-overlapping");
     let reparsed_len = reparsed.root.children.len();
     let before_count = splice_lo;
     let after_seam = splice_lo + reparsed_len;
@@ -167,7 +172,7 @@ git commit -m "perf(block_tree): in-place consume-and-splice — kill the per-ke
                     Err(msg) => (apply_parse_result(editor, new_len, Err(msg)), true),
                 }
 ```
-Panic-safety is preserved: `take_blocks` pulls a tree that is replaced on EVERY path — `set_blocks(new_blocks)` on `Ok` (the existing line after the `match`), or `apply_parse_result(…, Err)` (which returns the degraded empty tree, then flows into `set_blocks`) on a parse panic. The `move` closure captures `old_tree` (moved) + the `&`-refs; `panicx::catch` wraps it in `AssertUnwindSafe` (panicx.rs:31), so it compiles. Confirm `take_blocks`'s `&mut` borrow ends at the `take_blocks()` call (it returns an owned value) so it doesn't conflict with the later `editor` uses.
+(While editing this region, fix the pre-existing stale anchor at derive.rs:131 — it cites "`incremental_update_rope`, block_tree.rs:521"; the real line is :537 — Fable Minor-4. The `&&Rope` explanation itself stays accurate.) Panic-safety is preserved: `take_blocks` pulls a tree that is replaced on EVERY path — `set_blocks(new_blocks)` on `Ok` (the existing line after the `match`), or `apply_parse_result(…, Err)` (which returns the degraded empty tree, then flows into `set_blocks`) on a parse panic. The `move` closure captures `old_tree` (moved) + the `&`-refs; `panicx::catch` wraps it in `AssertUnwindSafe` (panicx.rs:31), so it compiles. Confirm `take_blocks`'s `&mut` borrow ends at the `take_blocks()` call (it returns an owned value) so it doesn't conflict with the later `editor` uses.
 
 - [ ] **Step 3: Add the perf-proof test** in `block_tree.rs`'s `#[cfg(test)] mod tests`. It calls the OWNED entry directly (the `&`-wrappers clone → pointers would always differ) on a `Local` edit, and pins BOTH halves by `children.as_ptr()`:
 
