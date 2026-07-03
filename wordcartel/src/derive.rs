@@ -128,12 +128,13 @@ pub fn rebuild(editor: &mut Editor) {
             if let (Some(old_rope), Some(edit)) = (&maybe_old_rope, &maybe_edit) {
                 // `TextSource` is impl'd for `&Rope`, so `S = &Rope` and the
                 // generic's `&S` needs `&&Rope` (mirror `incremental_update_rope`,
-                // block_tree.rs:521). `old_rope` is already `&Rope` → `&old_rope`;
+                // block_tree.rs:537). `old_rope` is already `&Rope` → `&old_rope`;
                 // bind `new_rope` to a ref → `&new_rope_ref`.
                 let new_rope_ref = &new_rope;
-                match crate::panicx::catch(|| {
-                    block_tree::incremental_update_instrumented_src(
-                        editor.active().document.blocks(), &old_rope, edit, &new_rope_ref,
+                let old_tree = editor.active_mut().document.take_blocks();
+                match crate::panicx::catch(move || {
+                    block_tree::incremental_update_instrumented_src_owned(
+                        old_tree, &old_rope, edit, &new_rope_ref,
                     )
                 }) {
                     Ok(outcome) => {

@@ -605,9 +605,27 @@ fn repair_region<S: TextSource>(tops: &[Block], old_src: &S, start: &mut usize, 
     }
 }
 
-/// Generic `incremental_update_instrumented` over any `TextSource`.
+/// `&`-entry (unchanged public signature; the oracle/fuzz/tests use this). Clones the old
+/// tree and delegates to the owned path — the clone is cold (only tests take it; the shell
+/// uses the owned entry directly).
 pub fn incremental_update_instrumented_src<S: TextSource>(
-    old_tree: &BlockTree,
+    old_tree: &BlockTree, old_src: &S, edit: &Edit, new_src: &S,
+) -> UpdateOutcome {
+    incremental_update_instrumented_src_owned(old_tree.clone(), old_src, edit, new_src)
+}
+
+/// Owned str convenience (mirrors `incremental_update_instrumented`): the shell + the perf
+/// test call this to hand the parser ownership of the old tree.
+pub fn incremental_update_instrumented_owned(
+    old_tree: BlockTree, old_text: &str, edit: &Edit, new_text: &str,
+) -> UpdateOutcome {
+    incremental_update_instrumented_src_owned(old_tree, &old_text, edit, &new_text)
+}
+
+/// Generic `incremental_update_instrumented` over any `TextSource`. Consumes `old_tree` and
+/// edits its owned block-vec in place, avoiding the per-keystroke clone-and-rebuild.
+pub fn incremental_update_instrumented_src_owned<S: TextSource>(
+    old_tree: BlockTree,
     old_src: &S,
     edit: &Edit,
     new_src: &S,
@@ -948,48 +966,39 @@ pub fn incremental_update_instrumented_src<S: TextSource>(
     }
     let reparsed_bytes = new_region.len();
 
-    // Splice driven purely by the final region bounds, so it stays consistent
-    // regardless of how the region was widened/snapped.
-    //   - "before" blocks: entirely before region_old_start (end <= start).
-    //   - "after" blocks: entirely after region_old_end (start >= end).
-    //   - anything overlapping the region is replaced by the reparsed blocks.
-    let mut result_children: Vec<Block> = Vec::new();
-    for b in tops.iter() {
-        if b.span.end <= region_old_start {
-            result_children.push(b.clone());
-        }
-    }
-    let before_count = result_children.len();
-    result_children.extend(reparsed.root.children.iter().cloned());
-    let after_seam = result_children.len(); // index of the first "after" block, once pushed
-    for b in tops.iter() {
-        // "after" blocks lie STRICTLY beyond region_old_end. The extra
-        // `span.end > region_old_end` guard excludes a zero-length block sitting
-        // exactly at region_old_end (e.g. the synthetic trailing empty Paragraph
-        // pulldown-cmark emits at end-of-document after a link-reference def):
-        // its span.end == region_old_end means it is already COVERED by the region
-        // reparse above, so shifting it here too would emit it twice. Straddle
-        // repair guarantees no block crosses region_old_end, so this only ever
-        // filters out such zero-length boundary blocks.
-        if b.span.start >= region_old_end && b.span.end > region_old_end {
-            result_children.push(shift_block(b, delta));
-        }
+    // F4: edit old_tree's owned `children` Vec in place instead of rebuilding it. The two
+    // partition points reproduce the current before/overlap/after classification EXACTLY
+    // (tops sorted by start + non-overlapping): before = span.end <= region_old_start;
+    // after = span.start >= region_old_end && span.end > region_old_end; the dropped middle
+    // is everything else (incl. the zero-length boundary block when region_old_start <
+    // region_old_end). Both predicates are monotone over the sorted blocks.
+    let splice_lo = tops.partition_point(|b| b.span.end <= region_old_start);
+    let splice_hi =
+        tops.partition_point(|b| !(b.span.start >= region_old_end && b.span.end > region_old_end));
+    // Invariant (Fable Minor-2): documents the ordered/non-overlapping precondition. A tree
+    // that violates it (only hand-buildable — pub fields) would make `Vec::splice` panic here
+    // instead of the current loops' silent wrong output; unreachable from any tree this module
+    // or the shell produces.
+    debug_assert!(splice_lo <= splice_hi, "splice range inverted — old tree not ordered/non-overlapping");
+    let reparsed_len = reparsed.root.children.len();
+    let before_count = splice_lo;
+    let after_seam = splice_lo + reparsed_len;
+
+    // Consume old_tree: before-blocks [0, splice_lo) stay put (moved, not cloned); the
+    // overlapping middle [splice_lo, splice_hi) is dropped; the reparsed blocks are MOVED in;
+    // after-blocks (now [after_seam..]) shift IN PLACE (no per-node allocation).
+    let mut children = old_tree.root.children;
+    children.splice(splice_lo..splice_hi, reparsed.root.children);
+    for b in &mut children[after_seam..] {
+        shift_in_place(b, delta);
     }
 
-    // SEAM CONSISTENCY: the splice stitches verbatim "before"/"after" blocks onto
-    // the freshly reparsed region. At each seam an edit can leave a top-level
-    // Paragraph adjacent to a following block that a full parse would FOLD INTO that
-    // paragraph (another Paragraph it merges with, or an indented line it absorbs as
-    // lazy continuation — neither can interrupt a paragraph) with NO blank line
-    // between them. A full parse never produces that arrangement; when the local
-    // splice does, recover with a provably-correct full reparse. Only the two splice
-    // seams (before|reparse, reparse|after) can introduce it, so this is O(1) —
-    // never a document scan. (Both seams collapse to one index when the reparse
-    // emitted no blocks.)
+    // SEAM CONSISTENCY — unchanged (after-blocks already shifted → new coords). before_count
+    // and after_seam reproduce the old seam indices exactly.
     let merge_at = |i: usize| {
         i > 0
-            && i < result_children.len()
-            && paragraph_absorbs_next(new_src, &result_children[i - 1], &result_children[i])
+            && i < children.len()
+            && paragraph_absorbs_next(new_src, &children[i - 1], &children[i])
     };
     if merge_at(before_count) || merge_at(after_seam) {
         let tree = full_parse_src(new_src);
@@ -1000,7 +1009,7 @@ pub fn incremental_update_instrumented_src<S: TextSource>(
         };
     }
 
-    let root = Block { kind: BlockKind::Document, span: 0..new_src.len(), children: result_children };
+    let root = Block { kind: BlockKind::Document, span: 0..new_src.len(), children };
     UpdateOutcome { tree: BlockTree { root }, reason, reparsed_bytes }
 }
 
@@ -1266,11 +1275,13 @@ fn blank_delimited_group_start<S: TextSource>(src: &S, pos: usize) -> usize {
     ls
 }
 
-fn shift_block(b: &Block, delta: isize) -> Block {
-    Block {
-        kind: b.kind.clone(),
-        span: shift_range(&b.span, delta),
-        children: b.children.iter().map(|c| shift_block(c, delta)).collect(),
+/// Shift every span in `b`'s subtree by `delta`, IN PLACE (no allocation) — the in-place
+/// twin of the former `shift_block`. Same arithmetic (`shift_range`), so the shifted subtree
+/// is byte-identical to a `shift_block(&b, delta)` clone.
+fn shift_in_place(b: &mut Block, delta: isize) {
+    b.span = shift_range(&b.span, delta);
+    for c in &mut b.children {
+        shift_in_place(c, delta);
     }
 }
 
@@ -1971,6 +1982,46 @@ mod tests {
             "para one two\n", "\n", "text\n",
         ]);
         prop::collection::vec(snippet, 0..10).prop_map(|v| v.concat())
+    }
+
+    #[test]
+    fn f4_splice_moves_before_and_shifts_after_without_reallocating() {
+        // [list] [paras...] [list] — the edited middle paragraph is flanked by PARAGRAPHS
+        // (not the lists), so its slack/upstream neighbors are paragraphs and the edit stays
+        // Local (Codex: adjacent lists would trigger the container-merge widen). The first
+        // list is a BEFORE block and the last list is an AFTER block, both with non-empty
+        // children.
+        let text = "- a\n- b\n\nlead\n\nmiddle\n\ntail one\n\ntail two\n\n- x\n- y\n";
+        let old = full_parse(text);
+        let before_idx = 0usize;
+        let after_idx = old.root.children.len() - 1;
+        assert!(!old.root.children[before_idx].children.is_empty());
+        assert!(!old.root.children[after_idx].children.is_empty());
+        let before_ptr = old.root.children[before_idx].children.as_ptr();
+        let after_ptr = old.root.children[after_idx].children.as_ptr();
+        let after_span0 = old.root.children[after_idx].span.clone();
+
+        // Insert one char inside "middle" (a Local edit; region is the middle paragraph).
+        let mid = text.find("middle").unwrap() + 3; // inside the word
+        let (new_text, edit) = apply_edit(text, mid..mid, "X");
+        let delta = 1isize;
+
+        let outcome = incremental_update_instrumented_owned(old, text, &edit, &new_text);
+        assert_eq!(outcome.reason, WidenReason::Local, "must stay on the splice path");
+        // Byte-identical to a full parse (the free correctness net, restated locally):
+        assert_eq!(outcome.tree, full_parse(&new_text));
+
+        let t = &outcome.tree;
+        let new_after_idx = t.root.children.len() - 1;
+        // BEFORE block: moved, not deep-cloned → same inner children buffer pointer.
+        assert_eq!(t.root.children[before_idx].children.as_ptr(), before_ptr,
+            "before-block was deep-cloned instead of moved");
+        // AFTER block: shifted IN PLACE, not shift_block-cloned → same pointer + shifted span.
+        assert_eq!(t.root.children[new_after_idx].children.as_ptr(), after_ptr,
+            "after-block was cloned instead of shifted in place");
+        assert_eq!(t.root.children[new_after_idx].span,
+            (after_span0.start + delta as usize)..(after_span0.end + delta as usize),
+            "after-block span not shifted by delta");
     }
 
     proptest! {
