@@ -2310,27 +2310,9 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use crate::editor::Editor;
     use crate::app::Msg;
-    use wordcartel_core::history::Clock;
+    use crate::test_support::{TestClock, key_char, press};
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
-
-    struct TestClock(u64);
-    impl TestClock {
-        fn new(ms: u64) -> Self { TestClock(ms) }
-    }
-    impl Clock for TestClock {
-        fn now_ms(&self) -> u64 { self.0 }
-    }
-
-    /// Build a KeyEvent for a printable character (no modifiers, Press).
-    fn key_char(c: char) -> KeyEvent {
-        KeyEvent {
-            code: KeyCode::Char(c),
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        }
-    }
 
     fn cua_keymap() -> crate::keymap::KeyTrie {
         let (t, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &crate::registry::Registry::builtins());
@@ -2363,11 +2345,6 @@ mod tests {
         crate::app::open_into_current(&mut e, &dir.join("note.md")); // the clean-path the Enter handler takes
         assert_eq!(e.active().document.buffer.to_string(), "loaded\n");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn press(code: crossterm::event::KeyCode, mods: crossterm::event::KeyModifiers) -> Msg {
-        use crossterm::event::{Event, KeyEvent, KeyEventKind, KeyEventState};
-        Msg::Input(Event::Key(KeyEvent { code, modifiers: mods, kind: KeyEventKind::Press, state: KeyEventState::NONE }))
     }
 
     fn f10() -> crossterm::event::Event {
