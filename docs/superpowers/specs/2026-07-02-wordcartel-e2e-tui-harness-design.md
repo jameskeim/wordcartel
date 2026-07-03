@@ -7,7 +7,7 @@
 ## Context
 
 The `wordcartel` shell has extensive unit coverage BELOW the app loop: `app.rs`'s
-`#[cfg(test)]` module (~60 tests) drives `reduce()` with synthetic `crossterm` `KeyEvent`s +
+`#[cfg(test)]` module (127 tests) drives `reduce()` with synthetic `crossterm` `KeyEvent`s +
 a `TestClock` + `InlineExecutor` and asserts on `editor.*` state; `render.rs`'s tests draw to
 a ratatui `TestBackend` and assert on the cell grid. But **nothing combines them** — no test
 runs a real input through the FULL per-iteration loop body (`reduce → note_undo_eviction →
