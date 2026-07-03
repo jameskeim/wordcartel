@@ -1,6 +1,6 @@
 # e2e / TUI test harness — design
 
-**Status:** Codex-clean (r2) + Fable5 folded (I1-I4 + minors); re-verify pending
+**Status:** spec-review CLEAN (Codex x3 + Fable5 folded); ready for user review + planning
 **Date:** 2026-07-02
 **Effort:** e2e/TUI harness (the campaign's one untouched frontier — nothing exercises the live `wcartel` binary's `reduce → rebuild → render` pipeline end-to-end)
 
@@ -136,7 +136,7 @@ struct Harness {
   `Editor::new_from_text(text, path, (w, h))`, `Registry::builtins()`,
   `let (keymap, _warn) = keymap::build_keymap(&KeymapConfig::default(), &reg)` (destructure the
   `(KeyTrie, Vec<String>)` tuple), `InlineExecutor::default()`, `Terminal::new(TestBackend::new(
-  w, h))`, an `mpsc::channel()`; `now = 0`; set `editor.active_mut().diag_cfg.enabled = false`
+  w, h))`, an `mpsc::channel()`; `now = 0`; set `editor.diag_cfg.enabled = false`
   (hermeticity guard 1); run the initial `derive::rebuild(&mut editor)` + first `render`.
   (Fable Minor: the harness is single-buffer — it does NOT `install_scratch()` as production does
   at app.rs:1899. Scratch is never dirty, so `quit_multi`'s dirty-count is unchanged; the only
@@ -235,7 +235,7 @@ config/session/recovery scans).
    clock ≥ 400 ms past an edit + ticks would dispatch diagnostics on a REAL `std::thread::spawn`
    (diagnostics_run.rs:57 — NOT via the `Executor`), triggering harper's dictionary build +
    a nondeterministic `Msg::DiagnosticsDone`. The seed suite only survives because 150 ms < 400 ms
-   — an accident. So `Harness::new` sets `editor.active_mut().diag_cfg.enabled = false` (a journey
+   — an accident. So `Harness::new` sets `editor.diag_cfg.enabled = false` (a journey
    wanting diagnostics opts back in explicitly).
 2. **Stay under the 2 s swap window:** `Msg::Tick` with a dirty buffer and ≥ 2 s virtual idle
    (`swap.rs:47 T_IDLE_MS = 2_000`) dispatches a swap write into the real XDG state dir
