@@ -1,6 +1,6 @@
 # UX quick-wins bundle (A2 + B3 + C1) — design
 
-**Status:** Codex spec-review CLEAN (round 2 residuals were its own wording prescriptions, applied); Fable5 pass pending
+**Status:** Codex-clean (x2) + Fable5 folded (bug CONFIRMED empirically; 2 Important wording/completeness fixes); fold-verify pending
 **Date:** 2026-07-03
 **Effort:** ux-quick-wins — the first effort off `docs/ux-backlog.md`: three settled, small items
 bundled into one branch/pipeline pass. Decisions were resolved with the user 2026-07-03 (backlog
@@ -74,17 +74,20 @@ pdflatex users set `[export] pdf_engine = "pdflatex"`.
 
 ### 1b. The pure argv seam + per-format args + the temp-naming fix
 
-**Temp-naming defect (Codex round 1 — possibly a LATENT BUG in today's docx/pdf exports):**
-the WritesOutput temp is `{target_file_name}.tmp-{pid}` (export.rs:152) — e.g.
-`notes.pdf.tmp-1234`, whose EXTENSION is `.tmp-1234`. Pandoc infers the output format from
-the `-o` extension, so it cannot see `pdf`/`docx`/`tex` there. Fix: **extension-preserving
-temp naming** — `{stem}.tmp-{pid}.{ext}` (e.g. `notes.tmp-1234.pdf`) — which is REQUIRED for
-pdf (PDF output has no `-t pdf`; it is triggered only by the `.pdf` extension) and makes
-tex/docx inference sound too. Belt-and-braces: also pass explicit `-t latex` on the tex path
-(valid there, impossible for pdf). The plan must verify TODAY'S docx/pdf behavior against a
-live pandoc (plan-confirm 6) — if they are broken today, this effort fixes them and the spec's
-"byte-identical html/docx" pin applies to the *corrected* argv/tmp shape, stated explicitly.
-Confirm nothing globs/cleans `*.tmp-*` by the old pattern before renaming (grep).
+**Temp-naming bug — CONFIRMED BROKEN TODAY (Codex round 1 found it; Fable5 verified
+empirically against pandoc 3.9.0.2):** the WritesOutput temp is `{target_file_name}.tmp-{pid}`
+(export.rs:152) — e.g. `notes.pdf.tmp-1234`, whose EXTENSION is `.tmp-1234`. Live run:
+`pandoc -f markdown -o notes.pdf.tmp-1234` warns "Could not deduce format … Defaulting to
+html", **exits 0, and writes an HTML fragment** — which `run_pandoc` (checks only
+`tmp.exists()`, export.rs:181) and `apply_export_done` (app.rs:387-397) then rename and
+report as `"exported notes.pdf"`. **Today's docx/pdf exports silently produce HTML-fragment
+bytes under a .docx/.pdf name with a success status** — the project's worst failure class.
+C1 is therefore a BUG FIX, and the merge report must state it. Fix: **extension-preserving
+temp naming** — `{stem}.tmp-{pid}.{ext}` (e.g. `notes.tmp-1234.pdf`) — REQUIRED for pdf (no
+`-t pdf` exists; PDF is triggered only by the `.pdf` extension) and sound for tex/docx.
+Belt-and-braces: also pass explicit `-t latex` on the tex path. Fixed shape verified live:
+`notes.tmp-1234.docx` → real Word 2007+ file; `notes.tmp-1234.pdf` + `--pdf-engine=xelatex`
+→ real PDF 1.7. Nothing globs/cleans `*.tmp-*` by the old pattern (grep-verified — Fable5).
 
 Extract argv construction into a pure function (unit-testable without spawning pandoc):
 
@@ -104,9 +107,24 @@ where `ExportOpts { typography: bool, pdf_engine: String }`. Rules:
 - `"pdf"`: append `--pdf-engine={engine}` (single `=`-joined arg).
 - html/docx argv otherwise identical to today MODULO the temp-naming fix above.
 
-`run_export` reads `editor.export_cfg` and passes the resolved opts into the `do_export`
-closure → worker thread (extend `run_pandoc`'s signature or carry `ExportOpts`). Status
-strings, TOCTOU guard, probe, and `Msg::ExportDone` handling all unchanged.
+**Opts threading (Fable5 IMPORTANT-2 — TWO call sites, not one):** `do_export` is called by
+`run_export` AND directly by `resolve_prompt`'s `OverwriteExport` arm (app.rs:699 — the
+overwrite-confirmation path bypasses `run_export`). Cleanest shape: **`do_export` reads
+`editor.export_cfg` itself** (it already takes `&mut Editor`), building `ExportOpts` there —
+both callers stay signature-stable and can never diverge. (Semantics are safe either way: no
+runtime config reload exists, so confirm-time config ≡ prompt-time config.) The opts then ride
+the closure into the worker → `run_pandoc`. Status strings, TOCTOU guard, probe, and
+`Msg::ExportDone` handling all unchanged.
+
+**Pandoc CLI semantics — RESOLVED empirically (Fable5, pandoc 3.9.0.2 + TeX Live; formerly
+plan-confirm 6):** `-f markdown-smart` disables smart punctuation on html AND docx, and is the
+COMPLETE story for LaTeX/PDF too (with reader-smart off, the latex writer escapes literal
+`--` as `-\/-` and `'` as `\textquotesingle` — byte-identical to `-t latex-smart`; literal
+hyphens survive TeX ligatures, so typography=false is strict through the whole PDF pipeline).
+`--pdf-engine=xelatex` is accepted; a bad engine exits 6 with a whitelist message → surfaces
+via `FilterError::NonZero` on the status line (config validation delegated to pandoc is
+sound). `-s -t latex` yields a standalone `\documentclass` document that compiles clean under
+xelatex; without `-s`, a fragment.
 
 ### 1c. The command
 
@@ -145,6 +163,15 @@ safe: cue mode still forces `true`; otherwise `cfg_override.unwrap_or(constructo
   those themes may legitimately shift and must be RE-POINTED to the new correct value (never
   weakened); the e2e fold journey is confirmed safe (`screen_contains("Head")` still matches
   `"█ Head"`, e2e.rs:201), and layout.rs:683's prefix-geometry tests (flag-on) stay green.
+- **The sweep is BOUNDED (Fable5 — favorable structural fact):** the glyph placeholder feeds
+  `VisualRow.prefix_glyph` (layout.rs:336), NOT `display` — so `display`-string assertions on
+  inactive headings survive (derive.rs:398, commands.rs:1191/:1201 stay green). What shifts:
+  `Placed.col` (+2), wrap capacity (−2), and rendered buffer row strings. Realistic breakage =
+  the two named tests + at most a handful of exact-row-string/column assertions. Cursor
+  placement is IMMUNE (`screen_pos` uses the caret line's ACTIVE layout, nav.rs:65; inactive
+  layouts key on the same flag for both render and click mapping — no desync class). The
+  active↔inactive 2-cell shift when focus enters/leaves a heading is PRE-EXISTING behavior
+  (conceal already shifts those lines more) — not a new asymmetry.
 - **Two existing tests update to the new expectation:**
   - `theme.rs:615` (`default_base_is_terminal_default`): `assert!(!t.heading_level_glyph)`
     flips to `assert!(t.heading_level_glyph)`.
@@ -173,8 +200,13 @@ smoke check depends on it.
   merely calls `buf.set_style(area, style)` internally, so the direct primitive is the
   reliable choice). Labels render after and overwrite their rects; the open-category label
   keeps `ChromeSelected`.
-- **One new render test:** with the menu open, every cell of row 0 carries the Chrome
-  background style (full-width assertion, not just under labels).
+- **One new render test (Fable5 IMPORTANT-1 — the naive form is IMPOSSIBLE):** "every cell
+  carries Chrome" cannot pass — the menu always has an open category (`menu.open: usize`)
+  whose label renders `ChromeSelected` by design (default theme: Chrome bg=Black vs
+  ChromeSelected bg=White). The correct assertion: **every row-0 cell OUTSIDE the label rects
+  carries the Chrome background, AND no row-0 cell carries the base/unpainted background**
+  (equivalently: full-width Chrome-or-ChromeSelected). Never weaken this into an `any()` probe
+  — it genuinely fails today (gaps + right side are unpainted).
 
 ## Testing
 
@@ -189,7 +221,12 @@ smoke check depends on it.
   sweep — run the full suite after the flip and re-point every legitimately-shifted
   nav/caret/layout/render expectation for inactive headings under the flipped themes (each
   re-point verified as the new CORRECT value, never a weakening).
-- **A2:** the new full-width row-0 style test.
+- **A2:** the new row-0 style test (the corrected gap-cells + no-base-bg form from
+  Component 3 — fails today, passes with the fill).
+- **Manual eyeball pass per theme** (backlog decision #8 requires it): before the merge
+  report, view a headed document under default/tokyo_night/a base16/phosphor(±flat)/no_color
+  and confirm the glyph ramp reads well in each — recorded as a checklist line in the
+  pre-merge report beside the smoke summary.
 - Suite green (`cargo test -p wordcartel-core -p wordcartel`), workspace clippy deny-gate
   clean, build/test-compile warning-free. **PTY smoke suite: mandatory-run, advisory-pass**
   — the pre-merge report quotes `scripts/smoke/run.sh`'s one-line summary verbatim (house
@@ -236,12 +273,14 @@ smoke check depends on it.
    value is geometrically correct (the two-cell prefix), and re-point.
 5. RESOLVED (Codex round 1): the fill primitive is `Buffer::set_style` over the row-0 rect
    (Paragraph delegates to it anyway) — the plan mandates it.
-6. **Live-pandoc verification (the pandoc-CLI claims are not verifiable from source):** with
-   the installed pandoc, verify (a) TODAY'S behavior on a `-o name.pdf.tmp-123` path — is
-   docx/pdf export currently broken/mis-formatted by extension inference (the latent bug)?
-   (b) the extension-preserving temp fix (`name.tmp-123.pdf`) produces correct pdf/docx/tex;
-   (c) `-f markdown-smart` disables smart punctuation; (d) `--pdf-engine=xelatex` is accepted;
-   (e) `-s -t latex` yields a standalone compilable document. Unit tests pin only argv SHAPE;
-   these facts are pinned by the plan-confirm, not by spawning pandoc in tests.
-7. Grep that nothing cleans/globs the old `*.tmp-{pid}` temp pattern (startup cleanup,
-   find_orphan-style scans) before changing the naming.
+6. RESOLVED (Fable5, live pandoc 3.9.0.2 + TeX Live): (a) today's docx/pdf ARE broken —
+   HTML fragments under .docx/.pdf names with success status; (b) the extension-preserving
+   fix produces real docx / PDF 1.7; (c) `markdown-smart` is the complete strictness story
+   incl. the latex writer; (d) `--pdf-engine=xelatex` accepted, bad engines exit 6 →
+   `FilterError::NonZero` status; (e) `-s -t latex` compiles standalone under xelatex.
+   Unit tests pin only argv SHAPE.
+7. RESOLVED (Fable5 grep): nothing cleans/globs the old `*.tmp-{pid}` pattern anywhere in
+   src/ or scripts/.
+8. The `do_export` second call site (app.rs:699, `resolve_prompt`'s `OverwriteExport` arm):
+   confirm the reads-`editor.export_cfg`-itself shape keeps BOTH callers signature-stable
+   (rustc backstops a miss regardless).
