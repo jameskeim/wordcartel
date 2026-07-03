@@ -1,6 +1,6 @@
 # F4: in-place consume-and-splice (kill the per-keystroke splice allocations) — design
 
-**Status:** Codex round 1 folded (take_blocks via mem::replace+empty_tree; zero-length prose qualified; alloc claim softened); re-review pending
+**Status:** Codex spec-review CLEAN (round 2, ready for planning); Fable5 pass pending
 **Date:** 2026-07-03
 **Effort:** F4 (the deferred per-keystroke O(#nodes) splice-clone — the allocation floor F1's Case B bottoms out on; recommended resolution "(f)" from the Fable5 F4 analysis)
 
@@ -193,10 +193,13 @@ reintroducing a clone, without a counting global allocator.
 1. **Partition-point exactness (the load-bearing point).** Confirm the two `partition_point`
    predicates yield the EXACT set the current per-element loop classifies — before = `span.end <=
    region_old_start`; after = `span.start >= region_old_end && span.end > region_old_end`; the
-   dropped middle = everything else INCLUDING the zero-length boundary block. Verify the
+   dropped middle = everything else. A zero-length `p..p` block at `p == region_old_end` is dropped
+   ONLY when `region_old_start < region_old_end`; when `region_old_start == region_old_end == p` it
+   is a BEFORE block (satisfies `span.end <= region_old_start`) under both the current loop and
+   `splice_lo` — the predicates match the loop in BOTH cases (Codex round 1/2). Verify the
    after-predicate is monotone over the sorted `tops` (all-false then all-true) so `partition_point`
    is valid, and that `Vec::splice(splice_lo..splice_hi, reparsed)` drops exactly the current
-   overlapping+zero-length set.
+   overlapping (+ boundary-when-dropped) set.
 2. **The `&`-wrapper delegation** — confirm every current `&`-entry point funnels through
    `incremental_update_instrumented_src`, so rewriting just that one to `…_owned(old.clone(), …)`
    preserves all public signatures + routes the oracle/fuzz through the owned path. Confirm
