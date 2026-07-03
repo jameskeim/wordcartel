@@ -906,6 +906,10 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     if let Some(ref menu) = editor.menu {
         if !menu.groups.is_empty() {
             let menu_area = Rect::new(area.x, area.y, w, h.saturating_sub(1));
+            // Full-width bar background: gaps between labels + the right side carry the
+            // Chrome style; the per-label paints below overwrite their own rects (A2).
+            let bar_row = Rect::new(area.x, area.y, w, 1);
+            frame.buffer_mut().set_style(bar_row, menu_closed_style);
             // Paint the menu bar (one label per category)
             let bar = menu_bar_layout(menu_area, &menu.groups);
             for (i, rect) in &bar {
@@ -2253,5 +2257,28 @@ mod tests {
         crate::workspace::goto_scratch(&mut e);
         let s_scratch = crate::render::status_left_text(&e);
         assert!(s_scratch.contains("*scratch*"), "scratch buffer shows *scratch*: {s_scratch}");
+    }
+
+    /// A2: with the menu open, row 0 is a solid bar — every cell styled Chrome (gaps +
+    /// right side) or ChromeSelected (the open label); no cell keeps the base background.
+    #[test]
+    fn menu_bar_row_is_filled_full_width() {
+        let mut e = Editor::new_from_text("body\n", None, (40, 8));
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        e.menu = Some(crate::menu::build(&reg, &km));
+        derive::rebuild(&mut e);
+        let mut term = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        term.draw(|f| render(f, &mut e)).unwrap();
+        let buf = term.backend().buffer();
+        let chrome = compose::compose(&e.theme, e.depth, &[SE::Chrome]).bg;
+        let selected = compose::compose(&e.theme, e.depth, &[SE::ChromeSelected]).bg;
+        for x in 0u16..40 {
+            let bg = buf[(x, 0u16)].style().bg;
+            assert!(bg == chrome || bg == selected,
+                "row-0 cell {x} not bar-styled: {bg:?} (chrome={chrome:?}, selected={selected:?})");
+        }
+        // And the RIGHT EDGE specifically is Chrome (it is unpainted today — this fails pre-fix).
+        assert_eq!(buf[(39u16, 0u16)].style().bg, chrome, "right edge must carry the Chrome fill");
     }
 }
