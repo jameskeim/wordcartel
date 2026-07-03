@@ -1,6 +1,6 @@
 # UX quick-wins bundle (A2 + B3 + C1) — design
 
-**Status:** Codex round 1 folded (temp-naming fix + latent-bug check; B3 geometry ownership; set_style mandate); re-review pending
+**Status:** Codex spec-review CLEAN (round 2 residuals were its own wording prescriptions, applied); Fable5 pass pending
 **Date:** 2026-07-03
 **Effort:** ux-quick-wins — the first effort off `docs/ux-backlog.md`: three settled, small items
 bundled into one branch/pipeline pass. Decisions were resolved with the user 2026-07-03 (backlog
@@ -178,11 +178,13 @@ smoke check depends on it.
 
 ## Testing
 
-- **C1:** unit tests on the pure `pandoc_argv` — tex gets `-s` + infers `.tex` output via
-  `-o`; pdf gets `--pdf-engine=xelatex` (and a custom engine from config); typography=false
-  flips the input format to `markdown-smart` on BOTH sink paths; html/docx argv otherwise
-  identical to today's (pin the exact vectors). Config-fold tests per the existing section
-  patterns ([export] absent → defaults; partial section → per-field inherit).
+- **C1:** unit tests on the pure `pandoc_argv` — tex asserts `-s -t latex … -o
+  {stem}.tmp-{pid}.tex` (explicit format, extension-preserving temp); pdf gets
+  `--pdf-engine=xelatex` (and a custom engine from config) with a `….tmp-{pid}.pdf` out path;
+  typography=false flips the input format to `markdown-smart` on BOTH sink paths; html/docx
+  argv otherwise identical to today's modulo the corrected temp shape (pin the exact vectors).
+  Config-fold tests per the existing section patterns ([export] absent → defaults; partial
+  section → per-field inherit).
 - **B3:** the two NAMED updated tests + the new default-theme shade test, PLUS the geometry
   sweep — run the full suite after the flip and re-point every legitimately-shifted
   nav/caret/layout/render expectation for inactive headings under the flipped themes (each
@@ -198,7 +200,8 @@ smoke check depends on it.
 1. **C1 export** — `ExportConfig`/`RawExport`/fold + `Editor.export_cfg` seeding + the
    `pandoc_argv` seam + per-format args (`-s` for tex, `--pdf-engine` for pdf, typography
    format string) + the `export_tex` registry entry + argv/config unit tests.
-2. **B3 glyphs** — flip the four constructor defaults (+ `phosphor` `flat`→`monochrome`-only)
+2. **B3 glyphs** — flip the four constructor defaults (in `phosphor`, `flat` keeps controlling
+   face selection (:502-507) + `monochrome`; only its `heading_level_glyph` feed is removed)
    + update the two tests + the new default-theme shade test.
 3. **A2 bar fill** — the full-width Chrome fill + the row-0 style test.
 
@@ -221,10 +224,11 @@ smoke check depends on it.
    `ExportOpts` struct).
 2. The `[export]` fold: exact `RawConfig` field + `load()` fold lines to mirror
    (config.rs:288-309), and where `Editor.export_cfg` defaults in `new_from_text`.
-3. `phosphor`'s `flat` param: confirm its ONLY remaining consumer is `monochrome` after the
-   flip (grep `flat` in theme.rs) and that the flat/non-flat test pair
-   (`phosphor_flat_is_monochrome_single_shade`, `phosphor_shaded_distinguishes_by_shade`)
-   stays green.
+3. `phosphor`'s `flat` param after the flip: it keeps controlling the face-branch selection
+   (theme.rs:502-507) and `monochrome` (:536); only its `heading_level_glyph` feed is removed.
+   Grep `flat` in theme.rs to confirm no additional consumer, and confirm the flat/non-flat
+   test pair (`phosphor_flat_is_monochrome_single_shade`,
+   `phosphor_shaded_distinguishes_by_shade`) stays green.
 4. The exact new expected row-0 string for `renders_concealed_heading_and_cursor_on_active_line`
    after the flip (run the render; likely `"█ Title…"`) — re-point, never weaken. Then the
    BROADER geometry sweep: enumerate every additional failing test after the flip (nav/caret/
