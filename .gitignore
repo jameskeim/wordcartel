@@ -3,3 +3,6 @@ target/
 
 # Harness-created agent worktrees (never track)
 .claude/worktrees/
+
+# PTY smoke suite stability record (scripts/smoke/run.sh)
+scripts/smoke/.history

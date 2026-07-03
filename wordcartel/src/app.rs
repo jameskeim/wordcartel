@@ -1097,6 +1097,23 @@ pub fn reduce(
     clock: &dyn Clock,
     msg_tx: &std::sync::mpsc::Sender<Msg>,
 ) -> bool {
+    // PTY-smoke panic trigger (debug builds only): F12 while WCARTEL_SMOKE_PANIC
+    // is set panics HERE — the first statement of reduce, ahead of every
+    // overlay/modal/minibuffer interception branch, so it fires regardless of
+    // app state; reduce runs on the main thread (the panic hook ignores other
+    // threads). Press-only, matching the app's kind filtering, so key
+    // repeat/release under enhanced keyboard protocols cannot double-fire.
+    // The key-code comparison short-circuits before the env read; release
+    // builds compile the whole check out and the var is inert.
+    #[cfg(debug_assertions)]
+    if let Msg::Input(Event::Key(key)) = &msg {
+        if key.kind == crossterm::event::KeyEventKind::Press
+            && key.code == crossterm::event::KeyCode::F(12)
+            && std::env::var_os("WCARTEL_SMOKE_PANIC").is_some()
+        {
+            panic!("WCARTEL_SMOKE_PANIC: deliberate smoke-test panic");
+        }
+    }
     // pending_mark intercepts the very next key as the mark letter.
     // Non-key messages fall through to normal handling.
     if editor.pending_mark.is_some() {
