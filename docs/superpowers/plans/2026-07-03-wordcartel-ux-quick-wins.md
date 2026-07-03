@@ -120,7 +120,17 @@ fn pandoc_argv(sink: &ExportSink, out: Option<&Path>, opts: &ExportOpts) -> Vec<
 }
 ```
   - `do_export` (:90-112): build `let opts = ExportOpts { typography: editor.export_cfg.typography, pdf_engine: editor.export_cfg.pdf_engine.clone() };` before the spawn; move `opts` into the closure; call `run_pandoc(sink, &stdin, &target, &opts)`.
-  - `run_pandoc` (:123-190): new param `opts: &ExportOpts`. Capture branch: `let argv = pandoc_argv(&sink, None, opts);` (byte-identical to today when typography=true — pin in tests). WritesOutput branch: `let tmp = temp_path_for(&target, &ext, std::process::id());` then `let argv = pandoc_argv(&sink, Some(&tmp), opts);` — this consumes `ext` for real (delete the `let _ = ext;` hack). Note the borrow order: compute `tmp` from the sink's `ext` before passing `&sink` to `pandoc_argv` (destructure carefully or match on a reference — the plan's shape: `match &sink { … }` style or clone `ext` first; implementer picks the compiling form WITHOUT changing the argv).
+  - `run_pandoc` (:123-190): new param `opts: &ExportOpts`. **The restructure shape is
+    PRESCRIBED (Codex Critical — the current `match sink` MOVES `ext` out at :149, so a
+    literal "compute tmp then `pandoc_argv(&sink,…)`" is a use-after-partial-move):**
+    change to **`match &sink { … }`** throughout — the WritesOutput arm binds `ext: &String`,
+    builds `let tmp = temp_path_for(&target, ext, std::process::id());`, then
+    `let argv = pandoc_argv(&sink, Some(&tmp), opts);` (both are shared borrows — fine), runs
+    the subprocess, checks `tmp.exists()`, returns `TempReady(tmp)`. The Capture arm:
+    `let argv = pandoc_argv(&sink, None, opts);` (byte-identical to today when
+    typography=true — pinned in tests). Delete the `let _ = ext;` hack (ext is now used).
+    **DO NOT clone the sink or `ext` to appease the borrow checker** — `match &sink` is the
+    compiling form.
   - Everything else (timeout, max_output, `run_subprocess`, `tmp.exists()` check, `guarded_export`, `Msg::ExportDone`, TOCTOU, status strings) unchanged.
 
 - [ ] **Step 5: The `export_tex` command** (`registry.rs`, after `export_pdf` :185-188):
@@ -204,7 +214,7 @@ git commit -m "feat(export): export_tex + [export] config (xelatex, typography) 
     #[test]
     fn default_theme_renders_heading_shade_prefix() {
         let mut e = Editor::new_from_text("# One\n\n## Two\n\nbody\n", None, (20, 8));
-        set_caret(&mut e, 15); // in "body" — both headings inactive
+        set_caret(&mut e, 15); // byte 15 = the 'b' of "body" (Codex-verified) — both headings inactive
         derive::rebuild(&mut e);
         let mut term = Terminal::new(TestBackend::new(20, 8)).unwrap();
         term.draw(|f| render(f, &mut e)).unwrap();
@@ -214,9 +224,10 @@ git commit -m "feat(export): export_tex + [export] config (xelatex, typography) 
         assert!(row(2).starts_with("▓ Two"), "H2 shade: got {:?}", row(2));
     }
 ```
-    (Plan-confirm the exact row indices for the blank lines in a 20×8 buffer — adjust rows, not the shade assertions. `set_caret` byte must land in "body".)
+    (Rows Codex-verified: H1 row 0, blank row 1, H2 row 2, blank row 3, body row 4 — the
+    assertions above are correct as written.)
 
-- [ ] **Step 4: The bounded sweep.** Run `cargo test -p wordcartel-core -p wordcartel`. Per the spec's bound: `display`-string assertions survive (the glyph feeds `prefix_glyph`, not `display`); expect at most a handful of exact-row-string/column failures under default/tokyo_night/base16 with INACTIVE headings. For EACH failure: verify the new value is exactly the 2-cell prefix shift (or the shade string), then re-point. Record every re-pointed test in the task report. If a failure is NOT explainable by the 2-cell prefix/shade, STOP and report it (that would be a real regression, not the sweep).
+- [ ] **Step 4: The bounded sweep.** Run `cargo test -p wordcartel-core -p wordcartel`. Per the spec's bound: `display`-string assertions survive (the glyph feeds `prefix_glyph`, not `display`); expect at most a handful of exact-row-string/column failures under default/tokyo_night/base16 with INACTIVE headings. **Codex pre-warn list:** definite = render.rs:1147 (Step 2 handles it); monitor-but-likely-green = `nav.rs:955-969` (`heading_glyph_layout_geometry_under_no_color` — no_color, flag already on), `nav.rs:1419-1428` (`offset_at_cell_never_returns_a_hidden_line` — width 80, the 2-cell prefix shouldn't wrap), `derive.rs:398` + `commands.rs:1191/:1201` (display-based, survive). For EACH failure: verify the new value is exactly the 2-cell prefix shift (or the shade string), then re-point. Record every re-pointed test in the task report. If a failure is NOT explainable by the 2-cell prefix/shade, STOP and report it (that would be a real regression, not the sweep).
 
 - [ ] **Step 5: Run + gates + commit.** Suite green; clippy clean; `cargo test --no-run` warning-free.
 ```bash
@@ -290,6 +301,6 @@ git commit -m "feat(render): full-width Chrome fill for the menu bar row (A2)"  
 
 **Placeholder scan:** none — every code step is complete; the flagged plan-confirms (exact rendered strings, row indices, `menu::build` plumbing, `buffer_mut` borrow form) each carry re-point-not-weaken rules.
 
-**Type consistency:** `ExportOpts { typography: bool, pdf_engine: String }` matches `ExportConfig`; `pandoc_argv(&ExportSink, Option<&Path>, &ExportOpts) -> Vec<String>`; `temp_path_for(&Path, &str, u32) -> PathBuf`; `run_pandoc` gains `&ExportOpts`; assert_eq of `Vec<String>` against `vec![&str…]` — use `vec!["…".to_string()…]` or compare via slices if inference complains (implementer picks the compiling form).
+**Type consistency:** `ExportOpts { typography: bool, pdf_engine: String }` matches `ExportConfig`; `pandoc_argv(&ExportSink, Option<&Path>, &ExportOpts) -> Vec<String>`; `temp_path_for(&Path, &str, u32) -> PathBuf`; `run_pandoc` gains `&ExportOpts` + the PRESCRIBED `match &sink` shape (no clones); `assert_eq!(Vec<String>, vec![&str…])` COMPILES as written (Codex: `String: PartialEq<&str>` blanket impl — keep the readable form; tidy only if clippy objects). `ExportConfig: Default` is REQUIRED (Config derives Default at :33 — Codex-confirmed no manual `Config{…}` construction sites break).
 
 **Ordering:** the three tasks are independent (different files except render.rs tests, which T2 and T3 both touch — sequential tasks avoid conflicts); T1 first (largest), then T2 (its sweep wants a quiet baseline), then T3.
