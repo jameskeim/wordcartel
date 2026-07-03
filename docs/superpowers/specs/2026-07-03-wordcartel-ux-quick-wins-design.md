@@ -89,6 +89,13 @@ Belt-and-braces: also pass explicit `-t latex` on the tex path. Fixed shape veri
 `notes.tmp-1234.docx` → real Word 2007+ file; `notes.tmp-1234.pdf` + `--pdf-engine=xelatex`
 → real PDF 1.7. Nothing globs/cleans `*.tmp-*` by the old pattern (grep-verified — Fable5).
 
+**Composition seam (Fable5 plan-review I-1, user decision A):** a thin pure
+`writes_output_invocation(target, ext, pid, opts) -> (PathBuf, Vec<String>)` composes
+`temp_path_for` + `pandoc_argv` on the SAME path; `run_pandoc`'s WritesOutput arm consumes the
+pair, and one test asserts the argv's `-o` element equals the returned tmp (+ the tmp carries
+the format extension). `pandoc_argv` itself still never constructs a path — this guards the
+composition (the exact bug class C1 fixes) without violating that contract.
+
 Extract argv construction into a pure function (unit-testable without spawning pandoc):
 
 ```rust

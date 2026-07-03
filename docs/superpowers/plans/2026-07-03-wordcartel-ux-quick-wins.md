@@ -70,7 +70,7 @@ struct RawExport {
 
 - [ ] **Step 2: Config tests** (in `config.rs`'s test module, mirroring the existing section-fold tests — locate them and match style): (a) no `[export]` section → defaults (`"xelatex"`, `true`); (b) partial section (`[export]\ntypography = false`) → `pdf_engine` stays default, `typography` false; (c) two layers where the higher sets only `pdf_engine = "tectonic"` → typography inherits the lower. Run: `cargo test -p wordcartel config` → PASS.
 
-- [ ] **Step 3: Thread onto Editor.** `editor.rs`: add `pub export_cfg: crate::config::ExportConfig,` to `Editor` and `export_cfg: crate::config::ExportConfig::default(),` in `new_from_text` (beside `diag_cfg`, ~:446). `app.rs` `run()`: `editor.export_cfg = cfg.export.clone();` beside `editor.diag_cfg = …` (~:1959).
+- [ ] **Step 3: Thread onto Editor.** `editor.rs`: add `pub export_cfg: crate::config::ExportConfig,` to `Editor` and `export_cfg: crate::config::ExportConfig::default(),` in `new_from_text` (beside `diag_cfg`, ~:446). `app.rs` `run()`: `editor.export_cfg = cfg.export.clone();` beside `editor.diag_cfg = …` (~:1959). (The seeding line itself is untested — precedent-consistent with `view_opts`/`diag_cfg`, and no dispatch precedes it; record this accepted gap in the ledger — Fable Minor-2.)
 
 - [ ] **Step 4: The export.rs rework.** Add the opts type + the two pure helpers; rewire:
 
@@ -92,8 +92,26 @@ fn temp_path_for(target: &Path, ext: &str, pid: u32) -> PathBuf {
     target.parent().map(|p| p.join(&tmp_name)).unwrap_or_else(|| PathBuf::from(&tmp_name))
 }
 
+/// Compose the WritesOutput invocation: the extension-preserving temp path AND the argv
+/// built from THAT SAME path — one pure function, so the composition (not just the two
+/// halves) is unit-testable. This is the guard against the exact bug class this effort
+/// fixes: a future regression that rebuilds `tmp` differently would break the
+/// composition test, not sail through green piece-tests (Fable plan review I-1, adopted).
+fn writes_output_invocation(
+    target: &Path, ext: &str, pid: u32, opts: &ExportOpts,
+) -> (PathBuf, Vec<String>) {
+    let tmp = temp_path_for(target, ext, pid);
+    let argv = pandoc_argv(
+        &ExportSink::WritesOutput { ext: ext.to_owned() },
+        Some(&tmp),
+        opts,
+    );
+    (tmp, argv)
+}
+
 /// Build the pandoc argv for one export. Pure — the testable seam. `out` is the
-/// ALREADY-DERIVED temp path (None for the Capture/html sink).
+/// ALREADY-DERIVED temp path (None for the Capture/html sink; `pandoc_argv` never
+/// constructs a path — the spec's contract holds).
 fn pandoc_argv(sink: &ExportSink, out: Option<&Path>, opts: &ExportOpts) -> Vec<String> {
     let input = if opts.typography { "markdown" } else { "markdown-smart" };
     let mut argv = vec!["pandoc".to_owned(), "-f".to_owned(), input.to_owned()];
@@ -123,14 +141,19 @@ fn pandoc_argv(sink: &ExportSink, out: Option<&Path>, opts: &ExportOpts) -> Vec<
   - `run_pandoc` (:123-190): new param `opts: &ExportOpts`. **The restructure shape is
     PRESCRIBED (Codex Critical — the current `match sink` MOVES `ext` out at :149, so a
     literal "compute tmp then `pandoc_argv(&sink,…)`" is a use-after-partial-move):**
-    change to **`match &sink { … }`** throughout — the WritesOutput arm binds `ext: &String`,
-    builds `let tmp = temp_path_for(&target, ext, std::process::id());`, then
-    `let argv = pandoc_argv(&sink, Some(&tmp), opts);` (both are shared borrows — fine), runs
-    the subprocess, checks `tmp.exists()`, returns `TempReady(tmp)`. The Capture arm:
+    change to **`match &sink { … }`** throughout — the WritesOutput arm binds `ext: &String`
+    and consumes the COMPOSITION seam:
+    `let (tmp, argv) = writes_output_invocation(&target, ext, std::process::id(), opts);`
+    then runs the subprocess, checks `tmp.exists()`, returns `TempReady(tmp)` — the arm never
+    calls `temp_path_for`/`pandoc_argv` directly, so the tmp fed to `-o` is BY CONSTRUCTION
+    the tmp that is checked and renamed. The Capture arm:
     `let argv = pandoc_argv(&sink, None, opts);` (byte-identical to today when
     typography=true — pinned in tests). Delete the `let _ = ext;` hack (ext is now used).
     **DO NOT clone the sink or `ext` to appease the borrow checker** — `match &sink` is the
     compiling form.
+  - **Stale docs (Fable Minor-1):** update the module doc (`:3` "Three presets: html, docx,
+    pdf" → the four formats), `do_export`'s doc (`:88-89` — it documents the OLD buggy
+    `-o <target>.tmp-<pid>` shape), and tidy the muddled stdin comment block (`:167-170`).
   - Everything else (timeout, max_output, `run_subprocess`, `tmp.exists()` check, `guarded_export`, `Msg::ExportDone`, TOCTOU, status strings) unchanged.
 
 - [ ] **Step 5: The `export_tex` command** (`registry.rs`, after `export_pdf` :185-188):
@@ -179,6 +202,17 @@ fn pandoc_argv(sink: &ExportSink, out: Option<&Path>, opts: &ExportOpts) -> Vec<
     fn temp_path_preserves_the_format_extension() {
         let t = temp_path_for(std::path::Path::new("/a/b/notes.pdf"), "pdf", 123);
         assert_eq!(t, std::path::Path::new("/a/b/notes.tmp-123.pdf"));
+    }
+    #[test]
+    fn writes_output_invocation_composes_tmp_and_argv_coherently() {
+        // The composition guard (Fable I-1): the argv's -o element IS the returned tmp,
+        // and the tmp carries the format extension — a regression that rebuilds either
+        // half differently fails HERE even if the piece-tests stay green.
+        let (tmp, argv) =
+            writes_output_invocation(std::path::Path::new("/a/notes.pdf"), "pdf", 123, &opts(true, "xelatex"));
+        let o_pos = argv.iter().position(|a| a == "-o").expect("-o present");
+        assert_eq!(argv[o_pos + 1], tmp.to_string_lossy(), "argv -o must be the returned tmp");
+        assert!(tmp.extension().is_some_and(|e| e == "pdf"), "tmp must end with the format ext: {tmp:?}");
     }
 ```
 
@@ -248,7 +282,10 @@ git commit -m "feat(theme): heading level glyphs default ON in every theme (B3)"
             let bar_row = Rect::new(area.x, area.y, w, 1);
             frame.buffer_mut().set_style(bar_row, menu_closed_style);
 ```
-    (Plan-confirm: `Frame::buffer_mut()` availability in ratatui 0.30 at this call site — it exists on Frame; if the borrow of `frame` conflicts with the later `render_widget` calls, the fill via `frame.render_widget(Paragraph::new("").style(menu_closed_style), bar_row)` is the equivalent fallback — Paragraph delegates to `set_style` internally. Either way the STYLE fill must cover all `w` cells.)
+    (`Frame::buffer_mut()` exists in ratatui 0.30 and its borrow ends at the statement — no
+    conflict with the later `render_widget` calls (Codex + Fable verified). **`set_style` is
+    the ONLY form** — the spec mandates it; do not substitute a Paragraph (Fable Minor-3
+    removed the dead fallback).)
 
 - [ ] **Step 2: The row test** (render.rs tests). The corrected, non-vacuous form (the open label is ALWAYS `ChromeSelected` — asserting all-Chrome is impossible):
 ```rust
@@ -297,7 +334,7 @@ git commit -m "feat(render): full-width Chrome fill for the menu bar row (A2)"  
 
 ## Self-Review
 
-**Spec coverage:** C1 — ExportConfig/RawExport/fold + Editor threading + `do_export`-reads-itself (both call sites incl. app.rs:696-699) + `pandoc_argv` + extension-preserving `temp_path_for` (the bug fix) + `-s -t latex` + `--pdf-engine=` + typography format string + `export_tex` registry entry + exact-vector tests ✓. B3 — four flips (phosphor keeps `flat`→faces+monochrome) + two re-points + the new default pin + the bounded sweep with stop-on-unexplained rule ✓. A2 — set_style fill (Paragraph fallback) + the corrected non-vacuous row test ✓. Smoke + eyeball + bug-fix statement in the checklist ✓.
+**Spec coverage:** C1 — ExportConfig/RawExport/fold + Editor threading + `do_export`-reads-itself (both call sites incl. app.rs:696-699) + `pandoc_argv` + extension-preserving `temp_path_for` (the bug fix) + the `writes_output_invocation` COMPOSITION seam + test (Fable I-1, user decision A — honors the spec's "pandoc_argv never constructs a path" contract) + `-s -t latex` + `--pdf-engine=` + typography format string + `export_tex` registry entry + exact-vector tests + stale-doc updates ✓. B3 — four flips (phosphor keeps `flat`→faces+monochrome) + two re-points + the new default pin + the bounded sweep with stop-on-unexplained rule ✓. A2 — set_style fill (Paragraph fallback) + the corrected non-vacuous row test ✓. Smoke + eyeball + bug-fix statement in the checklist ✓.
 
 **Placeholder scan:** none — every code step is complete; the flagged plan-confirms (exact rendered strings, row indices, `menu::build` plumbing, `buffer_mut` borrow form) each carry re-point-not-weaken rules.
 
