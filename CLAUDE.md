@@ -92,6 +92,16 @@ before merge.
 - **Workspace clippy clean is a GATE.** The clippy-debt cleanup (2026-06-30) cleared all `clippy::all` warnings and enabled `[workspace.lints.clippy] all = "deny"`. `cargo clippy --workspace --all-targets` MUST pass clean before merge. New warnings fail the clippy run; deliberate exceptions require an item-local `#[allow(clippy::…)]` with a one-line rationale (never a blanket crate/workspace allow).
 - New code matches the surrounding **house style** (see below) by review.
 
+**PTY smoke suite — mandatory-run, advisory-pass (NOT a GATE):** every effort's pre-merge
+report MUST run `scripts/smoke/run.sh` and quote its one-line summary verbatim (e.g.
+`smoke: 8/8 PASS`). A red result NEVER blocks a merge — it is an advisory finding that
+must be surfaced to the human explicitly (e.g. `smoke: FAIL s5 — advisory`). `cargo test`
++ workspace clippy remain the only merge gates. The suite drives the real `wcartel`
+binary in a private per-run tmux server (`scripts/smoke/`, checks S1–S8); a skip on a
+tmux-less machine (`smoke: SKIP — …`) is quoted the same way. Promotion to a gate later
+is an edit to this paragraph, contingent on the stability record accumulating in the
+gitignored `scripts/smoke/.history`.
+
 **Formatting — do NOT run `cargo fmt`.** This repo is hand-formatted in a deliberate dense
 style and has **no `rustfmt.toml`**; `cargo fmt` reformats the whole tree to rustfmt
 defaults (1000+ hunks), destroying the intentional style and blame. `cargo fmt --check` is
@@ -151,6 +161,11 @@ divergences in the tail (nested/loose-list; wrong-tree, not data-loss/panic); (2
 follow-ups — finish the undo louder-hint for buffer-level merges, and bound the last few
 document-sized `fs::read` load paths (recovery content-hash, fingerprint, save
 skip-unchanged); (3) optional — actually upgrade/patch `pulldown-cmark` (M4-rest only
-*isolates* its parse panic). **New candidate:** an e2e/TUI harness (the live `wcartel`
-binary has no end-to-end/interactive test coverage — the campaign's one untouched frontier).
+*isolates* its parse panic). **e2e/TUI frontier — now covered by two layers:** in-process
+journeys drive the real `reduce → advance → render` loop against a `TestBackend`
+(`wordcartel/src/e2e.rs`); the PTY smoke suite (`scripts/smoke/`, mandatory-run /
+advisory-pass — see the Rust-conventions note above) drives the live `wcartel` binary in
+a private tmux server: startup/exit codes, open errors, real-terminal save, dirty-quit
+modal, OSC 52 → tmux buffer, tiny-terminal guard, panic → restore → recovery dump, and
+hard-kill → swap → recovery.
 Deferred product items: clipboard over SSH/tmux; the close-buffer Save/Discard prompt.
