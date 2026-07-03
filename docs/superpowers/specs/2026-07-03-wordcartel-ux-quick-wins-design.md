@@ -1,6 +1,6 @@
 # UX quick-wins bundle (A2 + B3 + C1) — design
 
-**Status:** Codex-clean (x2) + Fable5 folded (bug CONFIRMED empirically; 2 Important wording/completeness fixes); fold-verify pending
+**Status:** spec-review CLEAN (Codex x3 + Fable5 folded, bug confirmed empirically); ready for user review + planning
 **Date:** 2026-07-03
 **Effort:** ux-quick-wins — the first effort off `docs/ux-backlog.md`: three settled, small items
 bundled into one branch/pipeline pass. Decisions were resolved with the user 2026-07-03 (backlog
