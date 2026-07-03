@@ -1,6 +1,6 @@
 # e2e / TUI test harness — design
 
-**Status:** Codex round 1 folded (extraction order, test_support lift, fold key, resize dual-update); re-review pending
+**Status:** Codex spec-review CLEAN (round 2, ready for planning); Fable5 pass pending
 **Date:** 2026-07-02
 **Effort:** e2e/TUI harness (the campaign's one untouched frontier — nothing exercises the live `wcartel` binary's `reduce → rebuild → render` pipeline end-to-end)
 
@@ -83,10 +83,13 @@ pub(crate) fn advance(editor: &mut Editor, clock: &dyn Clock) {
 **Harness fidelity boundary (documented):** the harness replays `snapshot → reduce →
 note_undo_eviction → advance → render`, OMITTING the two terminal-output steps
 (`drain_clipboard_intents`, `reconcile_mouse_capture`) that run between `note_undo_eviction`
-and `advance` in `run()`. Those steps mutate only clipboard-sync / drag / `status` state, which
-is ORTHOGONAL to the view rebuild the seed journeys assert — so the harness produces identical
-state for every seed journey. Clipboard/mouse journeys (follow-on, non-goal here) will add
-those steps to the harness with a mock clip channel + TestBackend.
+and `advance` in `run()`. `reconcile_mouse_capture` mutates only mouse drag/capture bookkeeping
+(app.rs:2222). `drain_clipboard_intents` mutates clipboard-sync state and CAN set
+`editor.status = "clipboard unavailable"` — but ONLY when a pending clipboard intent is drained
+against a closed clip channel (clipboard.rs:40); **none of the 7 seed journeys create a pending
+clipboard intent before an assertion**, so omitting it never changes observed state (incl. the
+save journey's `status()`) for this suite. Clipboard/mouse journeys (follow-on, non-goal here)
+will add those steps to the harness with a mock clip channel + TestBackend.
 
 Correctness proof: the existing ~60 `app.rs` tests + the full suite stay green (a pure move).
 
@@ -152,8 +155,10 @@ Each a `#[test]` over the `Harness`, asserting on BOTH state and the rendered bu
 
 1. **type → render:** `type_str("hello")` → `doc_text() == "hello"` AND `screen_contains("hello")`.
 2. **save → reload (real fs):** `Harness::new("", Some(tmp), (80,24))`; `type_str("hello\n")`;
-   `ctrl('s')` → assert `fs::read_to_string(tmp) == "hello\n"`, `status()` shows saved, `!dirty()`,
-   `saved_version` advanced. Then `Harness::new(open the same file)` → `doc_text() == "hello\n"`.
+   `ctrl('s')` (the save job runs inline under `InlineExecutor`, drained by `reduce` before the
+   step returns — save.rs:71/98, app.rs:1797) → assert `fs::read_to_string(tmp) == "hello\n"`,
+   `status() == "Saved"` (exact string, save.rs:98), `!dirty()`, `saved_version` advanced. Then
+   `Harness::new(open the same file)` → `doc_text() == "hello\n"`.
 3. **resize → no blank (regression):** `type_str("hello")`; `render`; `resize(80, 24)` (SAME
    dims) then `resize(100, 30)` (different) → after each, assert `nonblank_cells() > 0` AND
    `screen_contains("hello")` (pins the SIGWINCH screen-blank class).
