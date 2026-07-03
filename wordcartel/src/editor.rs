@@ -91,6 +91,18 @@ impl Document {
         self.blocks = blocks;
         self.blocks_generation = self.blocks_generation.wrapping_add(1);
     }
+    /// Take the derived block tree out by value, leaving a valid empty placeholder.
+    /// TRANSIENT CONTRACT: the caller MUST write a real tree back (`set_blocks`, or the
+    /// reconcile fallback's `apply_parse_result`) on EVERY path — until then the document
+    /// holds an empty tree behind a stale `blocks_generation`. Does NOT bump the generation
+    /// (only `set_blocks` does). Used by the incremental parse path to hand the parser
+    /// ownership of the old tree (F4 — no clone).
+    pub(crate) fn take_blocks(&mut self) -> wordcartel_core::block_tree::BlockTree {
+        std::mem::replace(
+            &mut self.blocks,
+            wordcartel_core::block_tree::empty_tree(self.buffer.len()),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]

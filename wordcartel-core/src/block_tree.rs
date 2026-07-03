@@ -1984,6 +1984,46 @@ mod tests {
         prop::collection::vec(snippet, 0..10).prop_map(|v| v.concat())
     }
 
+    #[test]
+    fn f4_splice_moves_before_and_shifts_after_without_reallocating() {
+        // [list] [paras...] [list] — the edited middle paragraph is flanked by PARAGRAPHS
+        // (not the lists), so its slack/upstream neighbors are paragraphs and the edit stays
+        // Local (Codex: adjacent lists would trigger the container-merge widen). The first
+        // list is a BEFORE block and the last list is an AFTER block, both with non-empty
+        // children.
+        let text = "- a\n- b\n\nlead\n\nmiddle\n\ntail one\n\ntail two\n\n- x\n- y\n";
+        let old = full_parse(text);
+        let before_idx = 0usize;
+        let after_idx = old.root.children.len() - 1;
+        assert!(!old.root.children[before_idx].children.is_empty());
+        assert!(!old.root.children[after_idx].children.is_empty());
+        let before_ptr = old.root.children[before_idx].children.as_ptr();
+        let after_ptr = old.root.children[after_idx].children.as_ptr();
+        let after_span0 = old.root.children[after_idx].span.clone();
+
+        // Insert one char inside "middle" (a Local edit; region is the middle paragraph).
+        let mid = text.find("middle").unwrap() + 3; // inside the word
+        let (new_text, edit) = apply_edit(text, mid..mid, "X");
+        let delta = 1isize;
+
+        let outcome = incremental_update_instrumented_owned(old, text, &edit, &new_text);
+        assert_eq!(outcome.reason, WidenReason::Local, "must stay on the splice path");
+        // Byte-identical to a full parse (the free correctness net, restated locally):
+        assert_eq!(outcome.tree, full_parse(&new_text));
+
+        let t = &outcome.tree;
+        let new_after_idx = t.root.children.len() - 1;
+        // BEFORE block: moved, not deep-cloned → same inner children buffer pointer.
+        assert_eq!(t.root.children[before_idx].children.as_ptr(), before_ptr,
+            "before-block was deep-cloned instead of moved");
+        // AFTER block: shifted IN PLACE, not shift_block-cloned → same pointer + shifted span.
+        assert_eq!(t.root.children[new_after_idx].children.as_ptr(), after_ptr,
+            "after-block was cloned instead of shifted in place");
+        assert_eq!(t.root.children[new_after_idx].span,
+            (after_span0.start + delta as usize)..(after_span0.end + delta as usize),
+            "after-block span not shifted by delta");
+    }
+
     proptest! {
         #[test]
         fn role_at_binary_matches_linear(
