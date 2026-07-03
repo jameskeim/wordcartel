@@ -1,6 +1,6 @@
 # e2e / TUI test harness — design
 
-**Status:** Codex spec-review CLEAN (round 2, ready for planning); Fable5 pass pending
+**Status:** Codex-clean (r2) + Fable5 folded (I1-I4 + minors); re-verify pending
 **Date:** 2026-07-02
 **Effort:** e2e/TUI harness (the campaign's one untouched frontier — nothing exercises the live `wcartel` binary's `reduce → rebuild → render` pipeline end-to-end)
 
@@ -88,15 +88,28 @@ and `advance` in `run()`. `reconcile_mouse_capture` mutates only mouse drag/capt
 `editor.status = "clipboard unavailable"` — but ONLY when a pending clipboard intent is drained
 against a closed clip channel (clipboard.rs:40); **none of the 7 seed journeys create a pending
 clipboard intent before an assertion**, so omitting it never changes observed state (incl. the
-save journey's `status()`) for this suite. Clipboard/mouse journeys (follow-on, non-goal here)
-will add those steps to the harness with a mock clip channel + TestBackend.
+save journey's `status()`) for this suite. (Anchor: the "clipboard unavailable" writes are
+clipboard.rs:46/:52.) Clipboard/mouse journeys (follow-on, non-goal here) will add those steps
+to the harness with a mock clip channel + TestBackend.
 
-Correctness proof: the existing ~60 `app.rs` tests + the full suite stay green (a pure move).
+**Scheduler boundary (Fable IMPORTANT-2 — explicit):** the harness covers `reduce → advance →
+render` but NOT `run()`'s SCHEDULER — the deadline assembly (app.rs:2106-2140, incl. the
+`reconcile_deadline` gated on `in_flight_version` at :2126-2130), the `recv_timeout`, the
+synthesized `Msg::Tick`, the 5 s save&quit-timeout re-raise (app.rs:2082-2105), and the
+`InputThreadDied` pre-`reduce` intercept (app.rs:2148-2151) are all `run()`-only. The harness
+drives `Msg::Tick` MANUALLY, so a regression that drops `reconcile_deadline` from the deadline
+array (or gates it wrongly — the A3 diag-spin class: the real app wouldn't reconverge until the
+next keypress) would NOT be caught by journey 4. Those scheduler pieces remain covered by the
+existing deadline unit tests (app.rs:4609, :4997); extending the harness to the scheduler is a
+documented boundary, out of scope here.
+
+Correctness proof: the existing `app.rs` test module (127 `#[test]`s) + the full suite stay
+green (a pure move).
 
 ## Component 2 — the `Harness` (in `#[cfg(test)] mod e2e`)
 
 A new file `wordcartel/src/e2e.rs`, declared `#[cfg(test)] mod e2e;` in `lib.rs`, so it sees
-`pub(crate)` (incl. `advance`). `InlineExecutor` is already `pub` (jobs.rs:85) → reachable.
+`pub(crate)` (incl. `advance`). `InlineExecutor` is already `pub` (jobs.rs:88) → reachable.
 BUT (Codex round 1) `TestClock` + the key-event builders (`key_char`, `press`, …) live inside
 `app.rs`'s PRIVATE `#[cfg(test)] mod tests` — a sibling `#[cfg(test)] mod e2e` cannot see them.
 **Fix: lift them to a shared `#[cfg(test)] pub(crate) mod test_support`** (a new file
@@ -123,8 +136,11 @@ struct Harness {
   `Editor::new_from_text(text, path, (w, h))`, `Registry::builtins()`,
   `let (keymap, _warn) = keymap::build_keymap(&KeymapConfig::default(), &reg)` (destructure the
   `(KeyTrie, Vec<String>)` tuple), `InlineExecutor::default()`, `Terminal::new(TestBackend::new(
-  w, h))`, an `mpsc::channel()`; `now = 0`; run the initial `derive::rebuild(&mut editor)` +
-  first `render`.
+  w, h))`, an `mpsc::channel()`; `now = 0`; set `editor.active_mut().diag_cfg.enabled = false`
+  (hermeticity guard 1); run the initial `derive::rebuild(&mut editor)` + first `render`.
+  (Fable Minor: the harness is single-buffer — it does NOT `install_scratch()` as production does
+  at app.rs:1899. Scratch is never dirty, so `quit_multi`'s dirty-count is unchanged; the only
+  divergence is the status bar's `[i/n]` buffer-index text. A documented shape boundary.)
 - **`step(&mut self, msg: Msg) -> bool`** — the core primitive, the shared production sequence:
   snapshot `(pre_id, pre_version)` from `editor.active()` → `let keep = reduce(msg, &mut
   self.editor, &self.reg, &self.keymap, &self.ex, &TestClock(self.now), &self.tx)` →
@@ -154,23 +170,50 @@ struct Harness {
 Each a `#[test]` over the `Harness`, asserting on BOTH state and the rendered buffer:
 
 1. **type → render:** `type_str("hello")` → `doc_text() == "hello"` AND `screen_contains("hello")`.
-2. **save → reload (real fs):** `Harness::new("", Some(tmp), (80,24))`; `type_str("hello\n")`;
-   `ctrl('s')` (the save job runs inline under `InlineExecutor`, drained by `reduce` before the
-   step returns — save.rs:71/98, app.rs:1797) → assert `fs::read_to_string(tmp) == "hello\n"`,
-   `status() == "Saved"` (exact string, save.rs:98), `!dirty()`, `saved_version` advanced. Then
-   `Harness::new(open the same file)` → `doc_text() == "hello\n"`.
+2. **save → reload (real fs):** **Fingerprint lifecycle (Fable IMPORTANT-4):** `dispatch_save`
+   (save.rs:142-151) compares `fingerprint(&path)` to the buffer's `stored_fp` (seeded from the
+   path at `Buffer::from_text`, editor.rs:172) and raises the external-change modal on mismatch
+   instead of saving. So CREATE the (empty) `NamedTempFile` BEFORE `Harness::new` and never touch
+   it between — then `stored_fp = Some(hash-of-empty) == fingerprint(path)` → it saves.
+   (`fingerprint` is content-hash, so no mtime-granularity flake.) `Harness::new("", Some(tmp),
+   (80,24))`; `type_str("hello\n")`; `ctrl('s')` (the save job runs inline under `InlineExecutor`,
+   drained by `reduce` before the step returns — save.rs:71/98, app.rs:1798) → assert
+   `fs::read_to_string(tmp) == "hello\n"`, `status() == "Saved"` (exact, save.rs:98), `!dirty()`,
+   `saved_version` advanced. Then `Harness::new(open the same file)` → `doc_text() == "hello\n"`.
 3. **resize → no blank (regression):** `type_str("hello")`; `render`; `resize(80, 24)` (SAME
-   dims) then `resize(100, 30)` (different) → after each, assert `nonblank_cells() > 0` AND
-   `screen_contains("hello")` (pins the SIGWINCH screen-blank class).
-4. **reconcile convergence:** build a doc + edit that yields a stale (provisional) tree (a
-   `Local`/widen case); assert the tree is provisional; `advance_ms(RECONCILE_DEBOUNCE_MS);
-   tick()` → assert `editor.active().document.blocks() == &full_parse_rope(rope)` (converged)
-   and the render reflects the settled tree.
-5. **undo/redo:** `type_str("abc")`; `ctrl('z')` → `doc_text()` reverts + render matches;
-   `ctrl('y')` → restored.
-6. **quit-dirty modal (no data loss):** `type_str("x")` (dirty); `let keep = ctrl('q')` → assert
-   `keep == true` (did NOT quit silently) AND `prompt()` is the dirty-quit modal; drive the
-   discard choice → quits; a separate run drives the save choice → file written then quits.
+   dims) then `resize(100, 30)` (different) → after each, assert `screen_contains("hello")`
+   (the load-bearing assertion — verified by Fable to reproduce commit `0cdb8f5`'s blank via
+   ratatui's frame-diff writing spaces over the "hello" cells when `line_layouts` is cleared but
+   `layout_key` unchanged). `nonblank_cells() > 0` is near-vacuous (the status line is always
+   non-blank) — keep it only as belt-and-suspenders. NOTE (Fable Minor): one blank class stays
+   invisible in-process — a real emulator clearing the physical screen on SIGWINCH while ratatui's
+   internal buffer still matches (writes nothing) — that is emulator-side, covered by the PTY
+   non-goal, not this journey.
+4. **reconcile convergence (Fable IMPORTANT-1 — must be non-vacuous):** a common `Local` edit's
+   incremental tree already EQUALS `full_parse` (`maybe_stale` is a conservative flag, not a
+   divergence — reconcile.rs:19-20), so asserting `blocks() == full_parse` after a tick would
+   pass even if the tick dispatched NOTHING. Two fixes, use BOTH:
+   (a) **Assert the machinery actually ran.** After the edit: `reconcile.maybe_stale == true` and
+   `reconcile.due_at` armed. Then `advance_ms(RECONCILE_DEBOUNCE_MS); tick()` → assert
+   `!reconcile.maybe_stale && reconcile.in_flight_version.is_none() && reconcile.blocks_version ==
+   document.version` (the reparse dispatched + merged — a dropped dispatch / broken arm /
+   `reconcile_due` arithmetic regression fails this). All `pub` fields, reachable in-crate.
+   (b) **Make the content assertion real via a genuinely divergent tree.** Mirror the reconcile
+   unit test (reconcile.rs:104-126): after the edit, `set_blocks` a deliberately-WRONG tree +
+   set `maybe_stale`, so `blocks() != full_parse_rope(rope)` BEFORE the tick; then `tick()` →
+   `blocks() == full_parse_rope(rope)` (the reparse replaced the wrong tree). This proves the
+   tick did real work, not that the tree happened to already match.
+5. **undo/redo (Fable Minor — coalescing):** with the FROZEN `TestClock`, `type_str("abc")`
+   coalesces into ONE undo revision (`history.rs:7 COALESCE_MS = 500`), so a single `ctrl('z')`
+   reverts to `""` (NOT `"ab"`) → `doc_text() == ""` + render matches; `ctrl('y')` → `"abc"`
+   restored. (To get multi-step undo, a journey would `advance_ms(> 500)` between keystrokes.)
+6. **quit-dirty modal (no data loss) — Fable Minor: the modal is `quit_multi`, not a simple
+   discard.** `type_str("x")` (dirty); `let keep = ctrl('q')` → assert `keep == true` (did NOT
+   quit silently) AND `prompt()` is the `quit_multi(n)` modal (commands.rs:526-532; choices
+   `[A]ll-save / [R]eview-each / [C]ancel`, prompt.rs:64-72). "Discard" is TWO keys: `r` → the
+   per-buffer review prompt (`[S]/[D]/[C]`, prompt.rs:76) → `d` → quits. A separate run drives
+   `a` (all-save) → file written then quits. (There is no top-level discard; `quit_confirm` is
+   only the run-loop save-timeout re-raise, out of the harness's scope.)
 7. **fold hides lines in render:** a multi-heading doc; fold ONE heading via **Alt+Z**
    (`fold_toggle`; keymap.rs:305 — NOT Alt+Shift+Z, which is `fold_all`) → assert `folded()`
    contains the anchor AND the folded body lines are ABSENT from `screen()` while the heading
@@ -178,10 +221,29 @@ Each a `#[test]` over the `Harness`, asserting on BOTH state and the rendered bu
 
 ## Determinism
 
-No real threads / clock / terminal: `InlineExecutor` runs jobs synchronously on `dispatch`;
-the virtual `now` + `TestClock(now)` make the debounce exact; `TestBackend` is a pure cell grid.
-Saves use `tempfile`. Every journey is fully deterministic and hermetic (except the real-fs
-tempfile, which is isolated per test).
+No real threads / clock / terminal: `InlineExecutor` runs Save + Reparse jobs synchronously on
+`dispatch` (the trailing `ex.drain()` at app.rs:1798 merges within the same `step`); the virtual
+`now` + `TestClock(now)` make the debounce exact; `TestBackend` is a pure cell grid. No stray
+wall-clock reads on the exercised paths (`Instant::now` is only in filter.rs:168-199 — no seed
+journey runs a filter; `SystemTime::now` is only inside `SystemClock`, `run()`-only). Saves use
+per-test unique `tempfile` paths (parallel-safe; `Harness::new` never runs `run()`'s
+config/session/recovery scans).
+
+**Two hermeticity guards `Harness::new` MUST apply (Fable IMPORTANT-3 — else NOT hermetic):**
+1. **Disable diagnostics:** `Editor::new_from_text` seeds `diag_cfg = DiagnosticsConfig::default()`
+   = `enabled: true, debounce_ms: 400` (config.rs:65). Any journey that advances the virtual
+   clock ≥ 400 ms past an edit + ticks would dispatch diagnostics on a REAL `std::thread::spawn`
+   (diagnostics_run.rs:57 — NOT via the `Executor`), triggering harper's dictionary build +
+   a nondeterministic `Msg::DiagnosticsDone`. The seed suite only survives because 150 ms < 400 ms
+   — an accident. So `Harness::new` sets `editor.active_mut().diag_cfg.enabled = false` (a journey
+   wanting diagnostics opts back in explicitly).
+2. **Stay under the 2 s swap window:** `Msg::Tick` with a dirty buffer and ≥ 2 s virtual idle
+   (`swap.rs:47 T_IDLE_MS = 2_000`) dispatches a swap write into the real XDG state dir
+   (`~/.local/state/wordcartel`, which `state_dir()` also CREATES). The seed journeys keep virtual
+   idle < 2 s while dirty — a documented harness invariant. (Journey 2's post-save `swap::delete`
+   is a no-op remove of a nonexistent path — tolerable, as the existing save tests already are.)
+
+With those two guards, every journey is deterministic and hermetic (except the per-test tempfile).
 
 ## Testing
 
@@ -223,8 +285,11 @@ byte-identical by the existing suite).
    mod test_support` (Task 2). Confirm the exact set of helpers `app::tests` uses so the lift
    updates every reference, and that `build_keymap` (public) suffices for the harness keymap
    (no `cua_keymap` needed).
-4. The fold key + the reconcile-provisional condition for journeys 7 and 4 — confirm the exact
-   key (Alt+Shift+Z per the map's fold_toggle/fold_all) and an edit that reliably yields a
-   provisional/stale tree that the tick converges (a `Local`-reason edit).
+4. Fold journey 7 uses **Alt+Z** (`fold_toggle`, keymap.rs:305 — confirmed; Alt+Shift+Z is
+   `fold_all`). Journey 4 must be NON-VACUOUS (Fable IMPORTANT-1): confirm the machinery-ran
+   assertion fields (`reconcile.maybe_stale`/`due_at`/`in_flight_version`/`blocks_version` — all
+   `pub`) and the divergent-tree plant (mirror reconcile.rs:104-126: `set_blocks` a wrong tree +
+   `maybe_stale` so `blocks() != full_parse` BEFORE the tick). A plain `Local` edit does NOT
+   force divergence (its incremental tree already equals `full_parse`).
 5. `Registry`/`KeyTrie`/`KeymapConfig`/`Msg`/`BufferId` import paths + whether `render::render`
    and `advance` are reachable un-`pub`-ified from `e2e.rs` (same crate).
