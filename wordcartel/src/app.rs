@@ -1837,6 +1837,34 @@ impl Clock for SystemClock {
 }
 
 // ---------------------------------------------------------------------------
+// advance — shared per-iteration state steps (run loop + e2e harness)
+// ---------------------------------------------------------------------------
+
+/// The state-affecting per-iteration steps shared by `run()`'s loop and the e2e harness
+/// (everything between the clipboard/mouse terminal steps and the draw). Extracted so the
+/// harness exercises the REAL loop body, not a re-implementation.
+pub(crate) fn advance(editor: &mut Editor, clock: &dyn Clock) {
+    recompute_scrollbar_visible(editor, clock.now_ms());
+    // Pre-draw rebuild: ensure the layout cache matches the final (scroll,
+    // text_width) before render consumes it.  render has no on-demand fallback
+    // (render.rs:132-140), so a stale cache blanks the editing rows.
+    derive::rebuild(editor);
+    // Arm the reconcile debounce when the tree is (possibly) stale. Re-arm only
+    // when the version advanced since the last arm (so idle Ticks don't push the
+    // deadline forever); arm-from-None also covers a switch to a stale buffer.
+    {
+        let now = clock.now_ms();
+        let b = editor.active_mut();
+        if b.reconcile.maybe_stale && b.reconcile.in_flight_version.is_none()
+            && (b.reconcile.due_at.is_none() || b.reconcile.armed_for_version != b.document.version)
+        {
+            b.reconcile.due_at = Some(now.saturating_add(crate::reconcile::RECONCILE_DEBOUNCE_MS));
+            b.reconcile.armed_for_version = b.document.version;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // run — the real terminal loop; terminal IO lives entirely here
 // ---------------------------------------------------------------------------
 
@@ -2154,24 +2182,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         editor.note_undo_eviction(pre_id, pre_version);
         crate::clipboard::drain_clipboard_intents(&mut editor, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
         reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
-        recompute_scrollbar_visible(&mut editor, clock.now_ms());
-        // Pre-draw rebuild: ensure the layout cache matches the final (scroll,
-        // text_width) before render consumes it.  render has no on-demand fallback
-        // (render.rs:132-140), so a stale cache blanks the editing rows.
-        derive::rebuild(&mut editor);
-        // Arm the reconcile debounce when the tree is (possibly) stale. Re-arm only
-        // when the version advanced since the last arm (so idle Ticks don't push the
-        // deadline forever); arm-from-None also covers a switch to a stale buffer.
-        {
-            let now = clock.now_ms();
-            let b = editor.active_mut();
-            if b.reconcile.maybe_stale && b.reconcile.in_flight_version.is_none()
-                && (b.reconcile.due_at.is_none() || b.reconcile.armed_for_version != b.document.version)
-            {
-                b.reconcile.due_at = Some(now.saturating_add(crate::reconcile::RECONCILE_DEBOUNCE_MS));
-                b.reconcile.armed_for_version = b.document.version;
-            }
-        }
+        advance(&mut editor, &clock);
         guard.terminal().draw(|f| render::render(f, &mut editor))?;
         // Persist session state when a save just completed (saved_version advanced).
         let sv = editor.active().document.saved_version;
