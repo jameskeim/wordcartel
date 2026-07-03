@@ -70,7 +70,7 @@ pre-first-draw block near app.rs:2059 — it additionally snaps folded cursor st
 
 - [ ] **Step 3: Run the suite — confirm the extraction is behavior-preserving.**
 Run: `cargo test -p wordcartel` and `cargo clippy --workspace --all-targets`.
-Expected: PASS/clean — a pure move of three consecutive lines; the 127 `app.rs` tests + full suite stay green.
+Expected: PASS/clean — a pure move of three consecutive lines; the 127 `app.rs` tests + full suite stay green. (Fable M-1: the moved comment's "render.rs:132-140" anchor is pre-existing stale — leave it verbatim; ledger it, don't "fix" it in the move.)
 
 - [ ] **Step 4: Commit.**
 ```bash
@@ -133,7 +133,8 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
-use wordcartel_core::block_tree::{BlockTree, full_parse_rope};
+// NOTE: `BlockTree`/`full_parse_rope`/`ropey` imports are added in Task 3 (only the Task-3
+// journeys/accessors use them) so Task 2's `--no-run` gate stays warning-free (Fable I-1).
 
 use crate::app::{self, Msg, reduce};
 use crate::editor::Editor;
@@ -155,6 +156,10 @@ struct Harness {
 }
 
 impl Harness {
+    /// NOTE (Fable M-4): the first frame here is NOT identical to production's first frame for
+    /// buffers with restored fold/scroll state — `run()` runs an extra pre-first-draw block
+    /// (app.rs:2059: folded-cursor SnapOut + `ensure_visible`) that this omits. Harmless for the
+    /// seed journeys (fresh buffer, cursor 0, no folds); revisit if a journey restores fold/scroll.
     fn new(text: &str, path: Option<PathBuf>, size: (u16, u16)) -> Self {
         let mut editor = Editor::new_from_text(text, path, size);
         editor.diag_cfg.enabled = false; // hermeticity: no real diagnostics thread (spec I3)
@@ -185,24 +190,16 @@ impl Harness {
         self.term.draw(|f| render::render(f, editor)).expect("draw");
     }
 
-    // — input sugar —
+    // — input sugar (Task 2 subset — the rest are added in Task 3, so each task's `--no-run`
+    //   gate stays warning-free; Fable I-1) —
     fn type_str(&mut self, s: &str) { for c in s.chars() { self.step(Msg::Input(Event::Key(key_char(c)))); } }
     fn ctrl(&mut self, c: char) -> bool { self.step(press(KeyCode::Char(c), KeyModifiers::CONTROL)) }
-    fn alt(&mut self, c: char) -> bool { self.step(press(KeyCode::Char(c), KeyModifiers::ALT)) }
-    fn key(&mut self, code: KeyCode) -> bool { self.step(press(code, KeyModifiers::NONE)) }
-    fn resize(&mut self, w: u16, h: u16) {
-        self.term.backend_mut().resize(w, h);              // sync the TestBackend cell grid
-        self.step(Msg::Input(Event::Resize(w, h)));        // update the editor's buffer areas
-    }
-    fn advance_ms(&mut self, ms: u64) { self.now = self.now.saturating_add(ms); }
-    fn tick(&mut self) -> bool { self.step(Msg::Tick) }
 
     // — state assertions —
     fn doc_text(&self) -> String { self.editor.active().document.buffer.to_string() }
     fn dirty(&self) -> bool { self.editor.active().document.dirty() }
     fn saved_version(&self) -> Option<u64> { self.editor.active().document.saved_version } // Option, not u64 (editor.rs:64)
     fn status(&self) -> &str { &self.editor.status }
-    fn blocks(&self) -> &BlockTree { self.editor.active().document.blocks() }
 
     // — screen assertions —
     fn row(&self, y: u16) -> String {
@@ -244,12 +241,15 @@ fn e2e_save_writes_file_and_reloads() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
     assert_eq!(h.status(), "Saved");
     assert!(!h.dirty());
+    assert!(h.saved_version().is_some(), "saved_version set after a successful save");
+    // (Fable M-5: the post-save swap::delete touches state_dir() which create_dir_all's the real
+    //  XDG state dir — empty, nothing written; negligible + matches the existing save tests.)
     // Reload: a fresh harness opening the same file round-trips.
     let h2 = Harness::new(&std::fs::read_to_string(&path).unwrap(), Some(path.clone()), (80, 24));
     assert_eq!(h2.doc_text(), "hello\n");
 }
 ```
-(Plan-confirm: the exact save trigger — `ctrl('s')` maps to the save command in the CUA keymap — and the exact `"Saved"` string, save.rs:98. If `Harness::new` from a file needs the text read separately, adjust the reload construction; the round-trip assertion is the contract.)
+(Plan-confirm: the exact save trigger — `ctrl('s')` maps to the save command in the CUA keymap — and the exact `"Saved"` string, save.rs:99. If `Harness::new` from a file needs the text read separately, adjust the reload construction; the round-trip assertion is the contract.)
 
 - [ ] **Step 6: Run + gates + commit.**
 Run: `cargo test -p wordcartel` (green, incl. the 2 new journeys) + `cargo clippy --workspace --all-targets` (clean).
@@ -262,7 +262,34 @@ git commit -m "test(e2e): test_support lift + Harness + type/save smoke journeys
 
 ### Task 3: The remaining 5 seed journeys
 
-**Files:** Modify `wordcartel/src/e2e.rs` (add 5 `#[test]`s; add any assertion helpers they need — `cursor()`, `folded()`, `reconcile` field accessors).
+**Files:** Modify `wordcartel/src/e2e.rs` (extend the `Harness` with the Task-3 methods + imports; add 5 `#[test]`s).
+
+- [ ] **Step 0: Extend the `Harness` with the Task-3 methods + imports** (defined HERE, not in Task 2, so each task's `--no-run` gate stays warning-free — Fable I-1). Add the imports and `impl Harness` methods; each is used by a journey below:
+```rust
+// add to e2e.rs imports:
+use wordcartel_core::block_tree::{BlockTree, full_parse_rope};
+// (ropey is a direct dep; reference as ropey::Rope)
+
+impl Harness {
+    // input sugar used by Task-3 journeys
+    fn alt(&mut self, c: char) -> bool { self.step(press(KeyCode::Char(c), KeyModifiers::ALT)) }
+    fn key(&mut self, code: KeyCode) -> bool { self.step(press(code, KeyModifiers::NONE)) }
+    fn resize(&mut self, w: u16, h: u16) {
+        self.term.backend_mut().resize(w, h);              // sync the TestBackend cell grid
+        self.step(Msg::Input(Event::Resize(w, h)));        // update the editor's buffer areas
+    }
+    fn advance_ms(&mut self, ms: u64) { self.now = self.now.saturating_add(ms); }
+    fn tick(&mut self) -> bool { self.step(Msg::Tick) }
+    // state accessors used by Task-3 journeys
+    fn blocks(&self) -> &BlockTree { self.editor.active().document.blocks() }
+    fn folded(&self) -> &std::collections::BTreeSet<usize> { self.editor.active().folds.folded() }
+    fn maybe_stale(&self) -> bool { self.editor.active().reconcile.maybe_stale }
+    fn in_flight(&self) -> Option<u64> { self.editor.active().reconcile.in_flight_version }
+    fn reconcile_blocks_version(&self) -> u64 { self.editor.active().reconcile.blocks_version }
+    fn version(&self) -> u64 { self.editor.active().document.version }
+    fn rope(&self) -> ropey::Rope { self.editor.active().document.buffer.snapshot() } // TextBuffer::snapshot() -> ropey::Rope
+}
+```
 
 - [ ] **Step 1: Journey — resize → no blank (the regression).**
 ```rust
@@ -277,15 +304,8 @@ fn e2e_resize_does_not_blank_the_screen() {
 }
 ```
 
-- [ ] **Step 2: Journey — reconcile convergence (non-vacuous: machinery ran + divergent tree).** Add reconcile-field accessors to `Harness`, plant a wrong tree, and assert both the machinery-ran flags AND the content converged:
+- [ ] **Step 2: Journey — reconcile convergence (non-vacuous: machinery ran + divergent tree).** Using the Step-0 accessors, plant a wrong tree, and assert both the machinery-ran flags AND the content converged:
 ```rust
-    // helpers on Harness:
-    fn maybe_stale(&self) -> bool { self.editor.active().reconcile.maybe_stale }
-    fn in_flight(&self) -> Option<u64> { self.editor.active().reconcile.in_flight_version }
-    fn reconcile_blocks_version(&self) -> u64 { self.editor.active().reconcile.blocks_version }
-    fn version(&self) -> u64 { self.editor.active().document.version }
-    fn rope(&self) -> ropey::Rope { self.editor.active().document.buffer.snapshot() } // TextBuffer::snapshot() -> ropey::Rope (Codex)
-
 #[test]
 fn e2e_reconcile_converges_a_stale_tree() {
     let mut h = Harness::new("# A\n\nbody\n", None, (80, 24));
@@ -347,14 +367,12 @@ fn e2e_quit_dirty_raises_modal_not_silent_quit() {
 ```
 (Plan-confirm 6 — EMPIRICAL: the exact modal choice keys — `quit_multi` is `[A]ll-save / [R]eview-each / [C]ancel` (prompt.rs:66), review is `[S]/[D]/[C]` (prompt.rs:78). Verify `r` then `d` drives discard-and-quit; verify `editor.prompt` is the right field. A separate test can drive `a` (all-save) → asserts the file written then quits, if a path-backed buffer is used.)
 
-- [ ] **Step 5: Journey — fold hides lines in render.**
+- [ ] **Step 5: Journey — fold hides lines in render** (uses the Step-0 `folded()` accessor).
 ```rust
-    // helper on Harness:
-    fn folded(&self) -> &std::collections::BTreeSet<usize> { self.editor.active().folds.folded() }
-
 #[test]
 fn e2e_fold_hides_body_in_render() {
     let mut h = Harness::new("# Head\n\nsecret body line\n\n# Other\n", None, (80, 24));
+    assert!(h.screen_contains("secret body line"), "body must render BEFORE folding (else vacuous)"); // Fable M-3
     // Cursor is at the top (byte 0, inside "# Head"); Alt+Z folds that section.
     h.alt('z');
     assert!(!h.folded().is_empty(), "Alt+Z must fold the heading");
@@ -381,4 +399,4 @@ git commit -m "test(e2e): resize/reconcile/undo/quit/fold seed journeys"   # + t
 
 **Type consistency:** `advance(&mut Editor, &dyn Clock)`; `reduce(...) -> bool`; `TestClock(pub(crate) u64)`; `key_char(char) -> KeyEvent`, `press(KeyCode, KeyModifiers) -> Msg`; `build_keymap(...) -> (KeyTrie, Vec<String>)` destructured; `InlineExecutor::default()`; `full_parse_rope(&Rope) -> BlockTree` + `BlockTree: PartialEq`; `set_blocks` (editor.rs:90); `editor.diag_cfg.enabled` (on Editor, not the buffer). `TestBackend::resize`/`backend_mut()`/`buffer()[(x,y)].symbol()` per ratatui 0.30.
 
-**Ordering:** T1 (extraction) is independent + behavior-preserving (its checkpoint proves it); T2 needs T1's `advance` + the lifted helpers; T3 needs T2's `Harness`. Each task ends green + clippy-clean.
+**Ordering:** T1 (extraction) is independent + behavior-preserving (its checkpoint proves it); T2 needs T1's `advance` + the lifted helpers; T3 extends T2's `Harness`. **Warning-free per task (Fable I-1/I-2):** every `Harness` method is DEFINED in the task that first uses it — Task 2 holds only what the type/save journeys call (incl. `saved_version`, now asserted in the save journey); the Task-3-only methods + the `BlockTree`/`full_parse_rope`/`ropey` imports are added in Task 3 Step 0 — so no `dead_code` warning trips either task's `--no-run` gate.
