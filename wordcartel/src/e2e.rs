@@ -44,6 +44,9 @@ impl Harness {
     }
 
     /// The shared production sequence: snapshot → reduce → note_undo_eviction → advance → render.
+    /// NOTE: `run()` additionally runs `drain_clipboard_intents` + `reconcile_mouse_capture`
+    /// between `note_undo_eviction` and `advance`; the harness omits them (terminal-output only,
+    /// state-orthogonal for the seed journeys). A clipboard/mouse journey must add them.
     fn step(&mut self, msg: Msg) -> bool {
         let (pre_id, pre_version) = { let b = self.editor.active(); (b.id, b.document.version) };
         let clock = TestClock(self.now);
