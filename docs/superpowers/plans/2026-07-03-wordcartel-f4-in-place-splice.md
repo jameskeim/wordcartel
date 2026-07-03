@@ -174,10 +174,12 @@ Panic-safety is preserved: `take_blocks` pulls a tree that is replaced on EVERY 
 ```rust
     #[test]
     fn f4_splice_moves_before_and_shifts_after_without_reallocating() {
-        // [list] [paragraph] [list] — edit inside the middle paragraph is Local, so the
-        // first list is a BEFORE block and the last list is an AFTER block, both with
-        // non-empty children.
-        let text = "- a\n- b\n\nmiddle\n\n- x\n- y\n";
+        // [list] [paras...] [list] — the edited middle paragraph is flanked by PARAGRAPHS
+        // (not the lists), so its slack/upstream neighbors are paragraphs and the edit stays
+        // Local (Codex: adjacent lists would trigger the container-merge widen). The first
+        // list is a BEFORE block and the last list is an AFTER block, both with non-empty
+        // children.
+        let text = "- a\n- b\n\nlead\n\nmiddle\n\ntail one\n\ntail two\n\n- x\n- y\n";
         let old = full_parse(text);
         let before_idx = 0usize;
         let after_idx = old.root.children.len() - 1;
@@ -210,7 +212,7 @@ Panic-safety is preserved: `take_blocks` pulls a tree that is replaced on EVERY 
             "after-block span not shifted by delta");
     }
 ```
-(Plan-confirm: verify the fixture produces exactly `[List, Paragraph, List]` at top level and that inserting inside "middle" is classified `Local` — adjust the fixture/edit position until it is; the pointer + `reason == Local` + `== full_parse` assertions are the contract and must NOT be weakened. `apply_edit`/`full_parse` are the existing in-lib test helpers.)
+(Plan-confirm: verify the fixture's top level is `[List, Para, Para, Para, Para, List]` (first + last are Lists with non-empty children) and that inserting inside "middle" classifies `Local` (Codex-corrected fixture) — the top-level block COUNT must be unchanged by the char-insert so `before_idx=0` and `new_after_idx=last` still index the two lists. Adjust the fixture/edit position until `reason == Local`, `== full_parse`, and the two pointer asserts hold; the assertions are the contract and must NOT be weakened. `apply_edit`/`full_parse` are the existing in-lib test helpers.)
 
 - [ ] **Step 4: Run + gates + commit.**
 Run: `cargo test -p wordcartel-core -p wordcartel` (green — the oracle net + the perf test + the shell suite incl. the e2e journeys) + `cargo clippy --workspace --all-targets` (clean).
