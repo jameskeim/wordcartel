@@ -1,6 +1,6 @@
 # UX quick-wins bundle (A2 + B3 + C1) — design
 
-**Status:** approved design (pre-spec-review)
+**Status:** Codex round 1 folded (temp-naming fix + latent-bug check; B3 geometry ownership; set_style mandate); re-review pending
 **Date:** 2026-07-03
 **Effort:** ux-quick-wins — the first effort off `docs/ux-backlog.md`: three settled, small items
 bundled into one branch/pipeline pass. Decisions were resolved with the user 2026-07-03 (backlog
@@ -61,7 +61,10 @@ pub struct ExportConfig {
 
 Plus the `RawExport` deserialize counterpart (all fields `Option<T>`, `#[serde(default)]` —
 the RawView pattern, config.rs:200-209) and per-field folding in `load()` (config.rs:288-309
-pattern). `Config` (config.rs:33-41) gains `pub export: ExportConfig`; TOML section `[export]`.
+pattern). Export uses SIMPLE per-field override folding — none of the accumulation semantics
+the keymap (patch lists) or theme (file/name discrimination) sections carry (Codex round 1).
+`Config` (config.rs:33-41; currently exactly six sections — export is the seventh) gains
+`pub export: ExportConfig`; TOML section `[export]`.
 `Editor` gains `pub export_cfg: crate::config::ExportConfig` (default in `new_from_text`),
 seeded in `run()` beside `view_opts`/`diag_cfg`.
 
@@ -69,28 +72,41 @@ NOTE (default choice, flagged at design review): `pdf_engine` defaults to `"xela
 deliberate behavior change from pandoc's pdflatex default, per the resolved backlog decision;
 pdflatex users set `[export] pdf_engine = "pdflatex"`.
 
-### 1b. The pure argv seam + per-format args
+### 1b. The pure argv seam + per-format args + the temp-naming fix
+
+**Temp-naming defect (Codex round 1 — possibly a LATENT BUG in today's docx/pdf exports):**
+the WritesOutput temp is `{target_file_name}.tmp-{pid}` (export.rs:152) — e.g.
+`notes.pdf.tmp-1234`, whose EXTENSION is `.tmp-1234`. Pandoc infers the output format from
+the `-o` extension, so it cannot see `pdf`/`docx`/`tex` there. Fix: **extension-preserving
+temp naming** — `{stem}.tmp-{pid}.{ext}` (e.g. `notes.tmp-1234.pdf`) — which is REQUIRED for
+pdf (PDF output has no `-t pdf`; it is triggered only by the `.pdf` extension) and makes
+tex/docx inference sound too. Belt-and-braces: also pass explicit `-t latex` on the tex path
+(valid there, impossible for pdf). The plan must verify TODAY'S docx/pdf behavior against a
+live pandoc (plan-confirm 6) — if they are broken today, this effort fixes them and the spec's
+"byte-identical html/docx" pin applies to the *corrected* argv/tmp shape, stated explicitly.
+Confirm nothing globs/cleans `*.tmp-*` by the old pattern before renaming (grep).
 
 Extract argv construction into a pure function (unit-testable without spawning pandoc):
 
 ```rust
-/// Build the pandoc argv for one export. Pure — the testable seam.
-fn pandoc_argv(sink: &ExportSink, out: Option<&Path>, cfg: &ExportOpts) -> Vec<String>
+/// Build the pandoc argv for one export. Pure — the testable seam. `out` is the
+/// ALREADY-DERIVED temp path (None for the Capture/html sink); the temp path is
+/// constructed by the caller, not inside this function (Codex round 1).
+fn pandoc_argv(sink: &ExportSink, out: Option<&Path>, opts: &ExportOpts) -> Vec<String>
 ```
 
-where `ExportOpts { typography: bool, pdf_engine: String }` (or the two fields threaded
-directly — plan's choice). Rules:
+where `ExportOpts { typography: bool, pdf_engine: String }`. Rules:
 - Input format: `-f markdown` when `typography`, `-f markdown-smart` when not — BOTH argv
   sites (Capture html + WritesOutput).
 - `"tex"`: append `-s` (`--standalone`) — without it pandoc emits a body fragment, not a
-  compilable document. Other formats unchanged (no `-s`).
+  compilable document — plus `-t latex` (explicit, no reliance on inference). Other formats:
+  no `-s`.
 - `"pdf"`: append `--pdf-engine={engine}` (single `=`-joined arg).
-- html/docx argv otherwise byte-identical to today.
+- html/docx argv otherwise identical to today MODULO the temp-naming fix above.
 
 `run_export` reads `editor.export_cfg` and passes the resolved opts into the `do_export`
 closure → worker thread (extend `run_pandoc`'s signature or carry `ExportOpts`). Status
-strings, TOCTOU guard, temp naming (`name.tex.tmp-{pid}`), probe, and `Msg::ExportDone`
-handling all unchanged.
+strings, TOCTOU guard, probe, and `Msg::ExportDone` handling all unchanged.
 
 ### 1c. The command
 
@@ -113,8 +129,22 @@ flip `default()` (:232), `tokyo_night()` (:288), `from_base16()` (:349), and `ph
 safe: cue mode still forces `true`; otherwise `cfg_override.unwrap_or(constructor)` — so
 `[theme] heading_level_glyph = false` still wins after the flip.
 
-- Set `heading_level_glyph: true` in all four constructors. In `phosphor`, the `flat` param
-  then feeds ONLY `monochrome` (confirm no other `flat` consumers — plan-confirm).
+- Set `heading_level_glyph: true` in all four constructors. In `phosphor`, `flat` keeps its
+  OTHER consumers (the face-branch selection at theme.rs:502-507 and `monochrome`) — only its
+  feed into `heading_level_glyph` is removed (Codex round 1 corrected the earlier
+  "only monochrome" wording).
+- **This is a GEOMETRY change, not render-only (Codex round 1 — owned as part of the decided
+  behavior change):** `heading_level_glyph` also drives core layout — inactive headings get
+  `prefix_width = 2` when the flag is true (layout.rs:250-255) — and it is threaded through
+  the `LayoutKey` cache key (derive.rs:19, :243-267) and nav's layout calls (nav.rs:67, :148).
+  Flipping the default therefore shifts wrap positions, caret columns, and click mapping for
+  inactive headings under default/tokyo_night/base16 — inherent to showing a two-cell glyph,
+  and exactly what was decided. The cache key already contains the flag, so no staleness
+  class is introduced. Consequence for the plan: the test sweep is BROADER than the two named
+  tests — every nav/caret/layout/render expectation that renders an inactive heading under
+  those themes may legitimately shift and must be RE-POINTED to the new correct value (never
+  weakened); the e2e fold journey is confirmed safe (`screen_contains("Head")` still matches
+  `"█ Head"`, e2e.rs:201), and layout.rs:683's prefix-geometry tests (flag-on) stay green.
 - **Two existing tests update to the new expectation:**
   - `theme.rs:615` (`default_base_is_terminal_default`): `assert!(!t.heading_level_glyph)`
     flips to `assert!(t.heading_level_glyph)`.
@@ -138,9 +168,11 @@ interact with A1's future modes. No existing test reads the bar row; no e2e jour
 smoke check depends on it.
 
 - Before the per-label loop, paint the full row —
-  `Rect::new(area.x, area.y, w, 1)` — with `menu_closed_style` (a styled empty `Paragraph`
-  or `buffer.set_style`; plan-confirm which fills the background reliably). Labels render
-  after and overwrite their rects; the open-category label keeps `ChromeSelected`.
+  `Rect::new(area.x, area.y, w, 1)` — with `menu_closed_style`, using
+  **`Buffer::set_style` over the rect** (MANDATED — Codex round 1: ratatui 0.30's `Paragraph`
+  merely calls `buf.set_style(area, style)` internally, so the direct primitive is the
+  reliable choice). Labels render after and overwrite their rects; the open-category label
+  keeps `ChromeSelected`.
 - **One new render test:** with the menu open, every cell of row 0 carries the Chrome
   background style (full-width assertion, not just under labels).
 
@@ -151,7 +183,10 @@ smoke check depends on it.
   flips the input format to `markdown-smart` on BOTH sink paths; html/docx argv otherwise
   identical to today's (pin the exact vectors). Config-fold tests per the existing section
   patterns ([export] absent → defaults; partial section → per-field inherit).
-- **B3:** the two updated tests + the new default-theme shade test.
+- **B3:** the two NAMED updated tests + the new default-theme shade test, PLUS the geometry
+  sweep — run the full suite after the flip and re-point every legitimately-shifted
+  nav/caret/layout/render expectation for inactive headings under the flipped themes (each
+  re-point verified as the new CORRECT value, never a weakening).
 - **A2:** the new full-width row-0 style test.
 - Suite green (`cargo test -p wordcartel-core -p wordcartel`), workspace clippy deny-gate
   clean, build/test-compile warning-free. **PTY smoke suite: mandatory-run, advisory-pass**
@@ -172,8 +207,11 @@ smoke check depends on it.
 - `cargo test -p wordcartel-core -p wordcartel` green; workspace clippy **deny** gate clean;
   no `cargo fmt`; house style (em-dash `—`); `#![forbid(unsafe_code)]` untouched.
 - Smoke suite run + verbatim summary in the pre-merge report (advisory, never a merge gate).
-- Behavior changes are exactly the three decided ones (glyph defaults, pdf engine default,
-  the bar fill); everything else byte-identical — the argv unit tests pin html/docx.
+- Behavior changes are exactly the decided ones (glyph defaults INCLUDING their inherent
+  two-cell geometry shift for inactive headings, pdf engine default, the bar fill) plus the
+  temp-naming CORRECTION if today's docx/pdf inference proves broken (a bug fix, stated in
+  the merge report); everything else identical — the argv unit tests pin html/docx against
+  the corrected shape.
 
 ## Plan-confirms (resolve during the implementation plan, against real source)
 
@@ -188,9 +226,18 @@ smoke check depends on it.
    (`phosphor_flat_is_monochrome_single_shade`, `phosphor_shaded_distinguishes_by_shade`)
    stays green.
 4. The exact new expected row-0 string for `renders_concealed_heading_and_cursor_on_active_line`
-   after the flip (run the render; likely `"█ Title…"`) — re-point, never weaken.
-5. The reliable full-width fill primitive in ratatui 0.30 (styled empty `Paragraph` vs
-   `Buffer::set_style` over the rect) — whichever demonstrably sets bg on all cells.
-6. Confirm `-f markdown-smart` is valid pandoc syntax for disabling smart on the markdown
-   reader (it is per the pandoc manual; verify the flag lands in the right argv position for
-   both sinks).
+   after the flip (run the render; likely `"█ Title…"`) — re-point, never weaken. Then the
+   BROADER geometry sweep: enumerate every additional failing test after the flip (nav/caret/
+   layout/render under default/tokyo_night/base16 with inactive headings), verify each new
+   value is geometrically correct (the two-cell prefix), and re-point.
+5. RESOLVED (Codex round 1): the fill primitive is `Buffer::set_style` over the row-0 rect
+   (Paragraph delegates to it anyway) — the plan mandates it.
+6. **Live-pandoc verification (the pandoc-CLI claims are not verifiable from source):** with
+   the installed pandoc, verify (a) TODAY'S behavior on a `-o name.pdf.tmp-123` path — is
+   docx/pdf export currently broken/mis-formatted by extension inference (the latent bug)?
+   (b) the extension-preserving temp fix (`name.tmp-123.pdf`) produces correct pdf/docx/tex;
+   (c) `-f markdown-smart` disables smart punctuation; (d) `--pdf-engine=xelatex` is accepted;
+   (e) `-s -t latex` yields a standalone compilable document. Unit tests pin only argv SHAPE;
+   these facts are pinned by the plan-confirm, not by spawning pandoc in tests.
+7. Grep that nothing cleans/globs the old `*.tmp-{pid}` temp pattern (startup cleanup,
+   find_orphan-style scans) before changing the naming.
