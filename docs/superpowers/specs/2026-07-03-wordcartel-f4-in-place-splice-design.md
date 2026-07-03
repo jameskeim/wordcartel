@@ -1,6 +1,6 @@
 # F4: in-place consume-and-splice (kill the per-keystroke splice allocations) — design
 
-**Status:** approved design (pre-spec-review)
+**Status:** Codex round 1 folded (take_blocks via mem::replace+empty_tree; zero-length prose qualified; alloc claim softened); re-review pending
 **Date:** 2026-07-03
 **Effort:** F4 (the deferred per-keystroke O(#nodes) splice-clone — the allocation floor F1's Case B bottoms out on; recommended resolution "(f)" from the Fable5 F4 analysis)
 
@@ -98,13 +98,18 @@ for b in &mut children[after_seam..] { shift_in_place(b, delta); }
 - `splice_lo` = number of before-blocks (`span.end <= region_old_start`). Monotone: before-blocks
   form the true-prefix.
 - `splice_hi` = number of non-after blocks; the after-predicate `span.start >= region_old_end &&
-  span.end > region_old_end` is monotone-false-then-true over the sorted blocks, and the
-  zero-length boundary block (`:974` carve-out: `span.start == span.end == region_old_end`) is
-  `false` → lands in the dropped `[splice_lo, splice_hi)` middle, **identical to today**.
+  span.end > region_old_end` is monotone-false-then-true over the sorted blocks. The zero-length
+  boundary block (`:974` carve-out: `span.start == span.end == p == region_old_end`) is `false` for
+  the after-predicate → dropped in the `[splice_lo, splice_hi)` middle, **when `region_old_start <
+  region_old_end`**. (Codex round 1 qualification: if `region_old_start == region_old_end == p`, a
+  `p..p` block satisfies `span.end <= region_old_start` → it is a BEFORE block under both the
+  current loop AND `splice_lo` — so the predicates still match the current per-element loop exactly;
+  only the "always dropped" prose was overbroad.)
 - `shift_in_place(b: &mut Block, delta: isize)` mutates `b.span` (`start`/`end` by `delta`, same
   arithmetic as `shift_block` :1270-1272) and recurses over `&mut b.children` — same O(after-nodes)
-  time, ZERO allocations. Replaces `shift_block` (delete it, or keep only if another caller uses
-  it — grep; the splice is the sole caller).
+  time, NO per-node allocation. Replaces `shift_block` (delete it; the splice is the sole caller —
+  plan-confirm). (The outer `children` Vec may reallocate ONCE if the reparsed replacement changes
+  its length beyond capacity — bounded/amortized, not the per-node O(#nodes) allocation of today.)
 
 ### Seam consistency — unchanged, same order
 
@@ -125,16 +130,19 @@ the region computation.
 
 ## Component 2 — shell wiring + the perf-proof test (`wordcartel/src/derive.rs`, `editor.rs`)
 
-- Add `Document::take_blocks(&mut self) -> BlockTree` (editor.rs, beside `set_blocks` :90):
-  `std::mem::take(&mut self.blocks)` — returns the current tree, leaves `BlockTree::default()`
-  (an empty Document tree; confirm `BlockTree: Default` or construct an empty one). This does NOT
-  bump `blocks_generation` (it's a take, not a semantic write; the subsequent `set_blocks` bumps).
-- In `derive.rs`'s incremental branch (~:126-159), replace the `&`-call. Today it passes
-  `editor.active().document.blocks()` (a borrow) into the `panicx::catch` closure. New: BEFORE the
-  closure, `let old = editor.active_mut().document.take_blocks();` then move `old` into the closure
-  calling `incremental_update_instrumented_src_owned(old, &old_rope, edit, &new_rope_ref)`; on `Ok`
-  → `set_blocks(outcome.tree)` (as today), on `Err` → the existing `apply_parse_result(Err(msg))`
-  degraded-empty-tree fallback (as today).
+- Add `Document::take_blocks(&mut self) -> BlockTree` (editor.rs, beside `set_blocks` :90).
+  `BlockTree` has NO `Default` (it derives only `Clone/PartialEq/Eq`, block_tree.rs:164), so use
+  `std::mem::replace(&mut self.blocks, wordcartel_core::block_tree::empty_tree(self.buffer.len()))`
+  — returns the current tree, leaves a valid empty tree spanning the doc (block_tree.rs:333). This
+  does NOT bump `blocks_generation` (it's a take, not a semantic write; the subsequent `set_blocks`
+  bumps). The placeholder is held only between `take_blocks` and the merge — never read.
+- In `derive.rs`'s incremental branch, replace the `&`-call. Today it passes
+  `editor.active().document.blocks()` (a borrow) into the `panicx::catch` closure (derive.rs:134;
+  `catch` wraps the `FnOnce` in `AssertUnwindSafe`, panicx.rs:27, so moving the owned tree in
+  compiles). New: BEFORE the closure, `let old = editor.active_mut().document.take_blocks();` then
+  move `old` into the closure calling `incremental_update_instrumented_src_owned(old, &old_rope,
+  edit, &new_rope_ref)`; on `Ok` → `set_blocks(outcome.tree)` (as today), on `Err` → the existing
+  `apply_parse_result(editor, new_len, Err(msg))` degraded-empty-tree fallback (derive.rs:283).
 - **Panic-safety (behavior-identical):** `take_blocks` pulls out a tree that is about to be
   replaced regardless — by `set_blocks(outcome.tree)` on success, or by the empty-tree fallback on
   a parse panic. So a mid-splice panic loses nothing the current code wouldn't (the current code
@@ -176,8 +184,9 @@ reintroducing a clone, without a counting global allocator.
 - `#![forbid(unsafe_code)]` in core intact; no new dependency; no `Block`/`BlockTree` repr change.
 - `cargo test -p wordcartel-core -p wordcartel` green (the oracle is the correctness net);
   workspace clippy **deny** gate clean; no `cargo fmt`; house style (em-dash `—`).
-- Hot path: the splice becomes O(after-nodes) TIME with ZERO allocations (was O(#nodes)
-  allocations). No new O(document) work; the sibling scans are unchanged (out of scope).
+- Hot path: the splice becomes O(after-nodes) TIME while removing the per-node/deep-clone
+  allocations (was O(#nodes) allocations); the outer children Vec may reallocate at most once on a
+  net length change (bounded). No new O(document) work; the sibling scans are unchanged (out of scope).
 
 ## Plan-confirms (resolve during the implementation plan, against real source)
 
@@ -195,12 +204,14 @@ reintroducing a clone, without a counting global allocator.
 3. **`shift_block` sole caller** — grep; confirm the splice is the only caller so replacing it with
    `shift_in_place` (or keeping both) is clean. Confirm `shift_in_place`'s span arithmetic +
    recursion matches `shift_block` exactly (byte-identical shifted tree).
-4. **`take_blocks` + `BlockTree::default`** — confirm `BlockTree` derives/implements `Default` (or
-   the empty-tree construction), that `take_blocks` leaves a valid empty tree, and that it does NOT
-   bump `blocks_generation` (only `set_blocks` does).
-5. **The exact `derive.rs` incremental branch shape** (~:126-159) — the `panicx::catch` closure,
-   the `Ok`→`set_blocks` / `Err`→`apply_parse_result` arms — confirm moving `take_blocks()`'s result
-   into the closure compiles (ownership) and the panic-safety argument holds.
+4. **`take_blocks` via `mem::replace` + `empty_tree`** (Codex round 1: `BlockTree` has no `Default`,
+   block_tree.rs:164) — confirm `empty_tree(self.buffer.len())` (block_tree.rs:333) is the right
+   placeholder + import path, that `take_blocks` returns the real tree + leaves a valid empty one,
+   and that it does NOT bump `blocks_generation` (only `set_blocks` does, editor.rs:90).
+5. **The exact `derive.rs` incremental branch shape** — the `panicx::catch` closure (derive.rs:134,
+   `AssertUnwindSafe`), the `Ok`→`set_blocks` / `Err`→`apply_parse_result` (derive.rs:283) arms —
+   confirm moving `take_blocks()`'s owned result into the closure compiles (ownership) and the
+   panic-safety argument holds (the taken tree was about to be replaced regardless).
 6. **Seam order** — confirm the current code shifts after-blocks (:975) BEFORE the seam check
    (:989), so the in-place version must shift-then-seam-check to preserve `paragraph_absorbs_next`
    reading new-coordinate spans.
