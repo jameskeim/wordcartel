@@ -25,6 +25,8 @@ pub struct Palette {
     pub kind: PaletteKind,
     /// Unfiltered rows for the `Buffers` kind. Empty for `Commands`.
     pub source_rows: Vec<PaletteRow>,
+    /// First visible row of the windowed list (A6). Maintained by keep_visible.
+    pub scroll_top: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +86,7 @@ pub fn rebuild_rows(p: &mut Palette, reg: &Registry, keymap: &KeyTrie) {
         }
     }
     if p.selected >= p.rows.len() { p.selected = p.rows.len().saturating_sub(1); }
+    p.scroll_top = p.scroll_top.min(p.rows.len().saturating_sub(1));
 }
 
 #[cfg(test)]

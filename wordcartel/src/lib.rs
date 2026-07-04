@@ -45,5 +45,6 @@ pub mod blocks_marked;
 pub mod scratch;
 pub mod transact;
 pub mod workspace;
+pub(crate) mod list_window;
 #[cfg(test)] pub(crate) mod test_support;
 #[cfg(test)] mod e2e;

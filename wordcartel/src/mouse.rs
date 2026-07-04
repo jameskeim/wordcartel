@@ -120,6 +120,20 @@ pub fn handle(
     let (w, h) = editor.active().view.area;
     let area = ratatui::layout::Rect::new(0, 0, w, h);
     if editor.palette.is_some() {
+        // `if matches!` — a `match` with a lone arm + `_ => {}` trips
+        // clippy::single_match under the deny gate (Codex plan r1).
+        if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+            let ah = editor.active().view.area.1;
+            if let Some(p) = editor.palette.as_mut() {
+                if matches!(ev.kind, MouseEventKind::ScrollDown) {
+                    p.selected = (p.selected + 1).min(p.rows.len().saturating_sub(1));
+                } else {
+                    p.selected = p.selected.saturating_sub(1);
+                }
+                crate::app::keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
+            }
+            return;
+        }
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
             // scoped borrow → owned Option<CommandId>
             let hit_id: Option<crate::registry::CommandId> = {
@@ -452,6 +466,8 @@ mod tests {
         e.palette = Some(crate::palette::Palette::default());
         let (reg, ex, clk, tx, km) = ctx();
         crate::app::hydrate_overlays(&mut e, &reg, &km); // fill rows (5b helper)
+        // A6 precondition: scroll_top must be 0 for this test's geometry to hold.
+        assert_eq!(e.palette.as_ref().unwrap().scroll_top, 0);
         let rows = &e.palette.as_ref().unwrap().rows;
         let idx = rows.iter().position(|r| r.id == crate::registry::CommandId("move_right")).unwrap();
         let area = ratatui::layout::Rect::new(0, 0, 80, 24);
@@ -462,6 +478,65 @@ mod tests {
         assert!(e.palette.is_none(), "palette closed after click");
         // move_right from offset 0 → caret at 1 proves the command was dispatched
         assert_eq!(crate::nav::head(&e), 1, "clicked move_right dispatched");
+    }
+
+    /// A6: clicking the first visible row when scroll_top > 0 must dispatch the
+    /// row at `rows[scroll_top]`, not `rows[0]`. The contract: the absolute row
+    /// index returned by `palette_row_at` accounts for `scroll_top`.
+    ///
+    /// rows[0] = move_left, rows[6] = select_left (registration order). With
+    /// selected=20, list_h=15 on an 80×24 terminal, keep_overlay_visible sets
+    /// scroll_top=6. From caret 1, select_left yields a non-empty selection
+    /// ([0,1]); move_left would leave an empty selection (caret at 0). This
+    /// distinguishes which row was actually dispatched.
+    #[test]
+    fn scrolled_click_maps_to_absolute_row() {
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        // Seed caret at 1 so select_left (rows[6]) is distinguishable from move_left (rows[0]).
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);
+        let (reg, ex, clk, tx, km) = ctx();
+        let mut p = crate::palette::Palette::default();
+        crate::palette::rebuild_rows(&mut p, &reg, &km);
+        p.selected = 20;
+        crate::app::keep_overlay_visible(24, p.selected, p.rows.len(), &mut p.scroll_top);
+        let scroll_top = p.scroll_top;
+        assert!(scroll_top > 0, "scroll_top must be non-zero for this test to be meaningful");
+        e.palette = Some(p);
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let rect = crate::render::palette_overlay_rect(area, e.palette.as_ref().unwrap().rows.len());
+        // Click the FIRST visible list row (visual row 0, absolute row scroll_top).
+        let click_row = rect.y + 2; // ov_y + 2 = first list entry
+        let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        assert!(e.palette.is_none(), "palette closed after click");
+        // select_left from caret 1 → non-empty selection [0,1].
+        // move_left from caret 1 → caret 0, selection empty.
+        // Non-empty selection proves rows[scroll_top] was dispatched, not rows[0].
+        assert!(!e.active().document.selection.primary().is_empty(),
+            "dispatched rows[scroll_top] (select_left), not rows[0] (move_left)");
+    }
+
+    /// A6: 20 ScrollDown wheel events move selected to 20 and scroll the window
+    /// so the selection stays visible.
+    #[test]
+    fn wheel_moves_selection_and_window() {
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        let (reg, ex, clk, tx, km) = ctx();
+        let mut p = crate::palette::Palette::default();
+        crate::palette::rebuild_rows(&mut p, &reg, &km);
+        e.palette = Some(p);
+        // 20 scroll-downs.
+        let scroll_down = MouseEvent { kind: MouseEventKind::ScrollDown, column: 40, row: 12, modifiers: KeyModifiers::NONE };
+        for _ in 0..20 {
+            handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx);
+        }
+        let p = e.palette.as_ref().expect("palette still open after wheel");
+        assert_eq!(p.selected, 20, "selected moved to 20");
+        let lh = crate::list_window::list_h_for(p.rows.len(), 24);
+        assert!(p.selected.saturating_sub(p.scroll_top) < lh,
+            "selection is within the visible window (selected - scroll_top < list_h)");
     }
 
     #[test]

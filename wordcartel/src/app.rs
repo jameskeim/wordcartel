@@ -812,6 +812,15 @@ fn apply_clipboard_availability(editor: &mut Editor, ok: bool) {
     }
 }
 
+/// Re-window an overlay list after a selection/rows change (A6). `area_h` is the
+/// CALLER's read of the active buffer's area height (the same source the mouse
+/// path uses); render re-heals against the live frame each draw, so a transient
+/// divergence (a key racing a resize) lasts at most one frame.
+pub(crate) fn keep_overlay_visible(area_h: u16, selected: usize, row_count: usize, scroll_top: &mut usize) {
+    let lh = crate::list_window::list_h_for(row_count, area_h);
+    crate::list_window::keep_visible(selected, row_count, lh, scroll_top);
+}
+
 /// Fill rows for a freshly-opened palette (empty rows + empty query → rebuild).
 /// Called immediately after any command dispatch and after dispatch_overlay_command
 /// so a just-opened overlay has content before the first render.
@@ -1205,12 +1214,12 @@ pub fn reduce(
             return !editor.quit;
         }
         if let Msg::Input(Event::Paste(text)) = msg {
+            let ah = editor.active().view.area.1;
             if let Some(p) = editor.palette.as_mut() {
                 p.query.insert_str(p.cursor, &text);
                 p.cursor += text.len();
                 crate::palette::rebuild_rows(p, reg, keymap);
-                let max = p.rows.len().saturating_sub(1);
-                if p.selected > max { p.selected = max; }
+                keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
             }
             for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
@@ -1238,17 +1247,52 @@ pub fn reduce(
                         }
                     }
                     crossterm::event::KeyCode::Up => {
+                        let ah = editor.active().view.area.1;
                         if let Some(p) = editor.palette.as_mut() {
                             p.selected = p.selected.saturating_sub(1);
+                            keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
                         }
                     }
                     crossterm::event::KeyCode::Down => {
+                        let ah = editor.active().view.area.1;
                         if let Some(p) = editor.palette.as_mut() {
                             let max = p.rows.len().saturating_sub(1);
                             p.selected = (p.selected + 1).min(max);
+                            keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
+                        }
+                    }
+                    crossterm::event::KeyCode::PageDown => {
+                        let ah = editor.active().view.area.1;
+                        if let Some(p) = editor.palette.as_mut() {
+                            let lh = crate::list_window::list_h_for(p.rows.len(), ah);
+                            p.selected = (p.selected + lh.max(1)).min(p.rows.len().saturating_sub(1));
+                            keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
+                        }
+                    }
+                    crossterm::event::KeyCode::PageUp => {
+                        let ah = editor.active().view.area.1;
+                        if let Some(p) = editor.palette.as_mut() {
+                            let lh = crate::list_window::list_h_for(p.rows.len(), ah);
+                            p.selected = p.selected.saturating_sub(lh.max(1));
+                            keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
+                        }
+                    }
+                    crossterm::event::KeyCode::Home => {
+                        let ah = editor.active().view.area.1;
+                        if let Some(p) = editor.palette.as_mut() {
+                            p.selected = 0;
+                            keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
+                        }
+                    }
+                    crossterm::event::KeyCode::End => {
+                        let ah = editor.active().view.area.1;
+                        if let Some(p) = editor.palette.as_mut() {
+                            p.selected = p.rows.len().saturating_sub(1);
+                            keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
                         }
                     }
                     crossterm::event::KeyCode::Backspace => {
+                        let ah = editor.active().view.area.1;
                         if let Some(p) = editor.palette.as_mut() {
                             if p.cursor > 0 {
                                 // remove the char before cursor (byte-safe for ASCII labels)
@@ -1257,6 +1301,7 @@ pub fn reduce(
                                 p.cursor = byte_pos;
                             }
                             crate::palette::rebuild_rows(p, reg, keymap);
+                            keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
                         }
                     }
                     crossterm::event::KeyCode::Left => {
@@ -1278,10 +1323,12 @@ pub fn reduce(
                         if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
                             && !k.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
                     {
+                        let ah = editor.active().view.area.1;
                         if let Some(p) = editor.palette.as_mut() {
                             p.query.insert(p.cursor, c);
                             p.cursor += c.len_utf8();
                             crate::palette::rebuild_rows(p, reg, keymap);
+                            keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
                         }
                     }
                     _ => {}
@@ -5149,6 +5196,162 @@ mod tests {
         let max_hl = open_group.1.len().saturating_sub(1);
         assert!(menu.highlighted <= max_hl,
             "highlighted {} must be clamped to max {max_hl}", menu.highlighted);
+    }
+
+    // -----------------------------------------------------------------------
+    // A6 Task 1: palette windowed scrolling
+    // -----------------------------------------------------------------------
+
+    /// A6: entering a command past the 15-row cap via Down keys keeps the
+    /// selection inside the visible window, and pressing Enter dispatches that
+    /// command's observable effect. Uses `toggle_word_count` (past index 15,
+    /// benign, observable via `view_opts.word_count`).
+    ///
+    /// TDD RED: with `scroll_top` field added but `keep_overlay_visible` not yet
+    /// wired into the key arms, `p.selected - p.scroll_top < 15` would FAIL (selected
+    /// would advance but scroll_top would stay 0). After wiring (Step 3) → GREEN.
+    #[test]
+    fn palette_hazard_pin_enter_dispatches_visible_row() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let reg = Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
+        // Seed a Commands palette (NOT the buffer-switcher idiom).
+        let mut p = crate::palette::Palette::default();
+        crate::palette::rebuild_rows(&mut p, &reg, &km);
+        e.palette = Some(p);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let press_key = |c: KeyCode| Msg::Input(Event::Key(KeyEvent {
+            code: c, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE,
+        }));
+        // Find toggle_word_count's index in registration order (empty-query → all commands).
+        let twc_idx = e.palette.as_ref().unwrap().rows.iter()
+            .position(|r| r.id == crate::registry::CommandId("toggle_word_count"))
+            .expect("toggle_word_count must be in the palette");
+        assert!(twc_idx > 15, "toggle_word_count must be past the 15-row visible cap");
+        // Drive Down to toggle_word_count's row.
+        for _ in 0..twc_idx {
+            crate::app::reduce(press_key(KeyCode::Down), &mut e, &reg, &km, &ex, &clk, &tx);
+        }
+        // Assert the windowing invariant: the selected row is within the visible window.
+        let p = e.palette.as_ref().unwrap();
+        assert_eq!(p.selected, twc_idx, "selected landed on toggle_word_count");
+        let lh = crate::list_window::list_h_for(p.rows.len(), 24);
+        assert!(p.selected.saturating_sub(p.scroll_top) < lh,
+            "selected must be within the visible window (selected={}, scroll_top={}, lh={})",
+            p.selected, p.scroll_top, lh);
+        // Dispatch: Enter → toggle_word_count runs → word_count flips.
+        let word_count_before = e.view_opts.word_count;
+        crate::app::reduce(press_key(KeyCode::Enter), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.palette.is_none(), "Enter closes the palette");
+        assert_ne!(e.view_opts.word_count, word_count_before, "toggle_word_count was dispatched");
+    }
+
+    /// A6: PageDown jumps a full window page; Home/End land at the boundaries;
+    /// the window invariant holds at all positions.
+    #[test]
+    fn palette_pgdn_home_end_land_exactly() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let reg = Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let mut e = Editor::new_from_text("", None, (80, 24));
+        let mut p = crate::palette::Palette::default();
+        crate::palette::rebuild_rows(&mut p, &reg, &km);
+        e.palette = Some(p);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let press_key = |c: KeyCode| Msg::Input(Event::Key(KeyEvent {
+            code: c, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE,
+        }));
+        let total = e.palette.as_ref().unwrap().rows.len();
+        // End — lands at the last row.
+        crate::app::reduce(press_key(KeyCode::End), &mut e, &reg, &km, &ex, &clk, &tx);
+        let p = e.palette.as_ref().unwrap();
+        assert_eq!(p.selected, total.saturating_sub(1), "End lands on last row");
+        let lh = crate::list_window::list_h_for(p.rows.len(), 24);
+        assert!(p.selected.saturating_sub(p.scroll_top) < lh, "End: selection visible");
+        // Home — lands at row 0.
+        crate::app::reduce(press_key(KeyCode::Home), &mut e, &reg, &km, &ex, &clk, &tx);
+        let p = e.palette.as_ref().unwrap();
+        assert_eq!(p.selected, 0, "Home lands on first row");
+        assert_eq!(p.scroll_top, 0, "Home: scroll_top resets to 0");
+        // PageDown from 0 — jumps by lh.
+        crate::app::reduce(press_key(KeyCode::PageDown), &mut e, &reg, &km, &ex, &clk, &tx);
+        let p = e.palette.as_ref().unwrap();
+        let lh2 = crate::list_window::list_h_for(p.rows.len(), 24);
+        assert!(p.selected > 0, "PageDown moved past first row");
+        assert!(p.selected.saturating_sub(p.scroll_top) < lh2, "PageDown: selection visible");
+    }
+
+    /// A6: typing a narrowing filter query re-clamps scroll_top so the selection
+    /// is visible even when the previous scroll position is past the new row count.
+    #[test]
+    fn palette_filter_shrink_reclamps_window() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let reg = Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let mut e = Editor::new_from_text("", None, (80, 24));
+        let mut p = crate::palette::Palette::default();
+        crate::palette::rebuild_rows(&mut p, &reg, &km);
+        e.palette = Some(p);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let press_key = |c: KeyCode| Msg::Input(Event::Key(KeyEvent {
+            code: c, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE,
+        }));
+        let press_char = |c: char| Msg::Input(Event::Key(KeyEvent {
+            code: KeyCode::Char(c), modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE,
+        }));
+        // Navigate deep via End.
+        crate::app::reduce(press_key(KeyCode::End), &mut e, &reg, &km, &ex, &clk, &tx);
+        let deep_scroll_top = e.palette.as_ref().unwrap().scroll_top;
+        assert!(deep_scroll_top > 0, "scroll_top must be > 0 after End");
+        // Type a narrowing query — filter shrinks the row set.
+        // Use 's' + 'a' + 'v' + 'e' which matches 'save', 'save_as', etc. — a small result set.
+        for ch in "save".chars() {
+            crate::app::reduce(press_char(ch), &mut e, &reg, &km, &ex, &clk, &tx);
+        }
+        let p = e.palette.as_ref().unwrap();
+        let lh = crate::list_window::list_h_for(p.rows.len(), 24);
+        assert!(p.selected.saturating_sub(p.scroll_top) < lh.max(1),
+            "after filter shrink: selected must be within the visible window \
+            (selected={}, scroll_top={}, lh={})", p.selected, p.scroll_top, lh);
+    }
+
+    /// A6 (Buffers palette variant): seed 20 buffers, open the switcher, PageDown →
+    /// the selection lands within the visible window.
+    #[test]
+    fn palette_buffers_pgdn_lands_visible() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let reg = Registry::builtins();
+        let km = cua_keymap();
+        // Seed 20 buffers by opening scratch + creating extra ones.
+        let mut e = Editor::new_from_text("buf0\n", None, (80, 24));
+        e.install_scratch();
+        for i in 1..20usize {
+            // install_scratch already added a scratch buffer; add extra by pushing directly.
+            let id = crate::editor::BufferId(100 + i as u64);
+            let buf = crate::editor::Buffer::from_text(id, &format!("buf{i}\n"), None, (80, 24));
+            e.buffers.push(buf);
+        }
+        e.open_buffer_switcher();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let press_key = |c: KeyCode| Msg::Input(Event::Key(KeyEvent {
+            code: c, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE,
+        }));
+        crate::app::reduce(press_key(KeyCode::PageDown), &mut e, &reg, &km, &ex, &clk, &tx);
+        let p = e.palette.as_ref().unwrap();
+        let lh = crate::list_window::list_h_for(p.rows.len(), 24);
+        assert!(lh > 0, "list_h must be > 0 for a 24-row terminal");
+        assert!(p.selected.saturating_sub(p.scroll_top) < lh,
+            "Buffers palette: PageDown selection visible (selected={}, scroll_top={}, lh={})",
+            p.selected, p.scroll_top, lh);
     }
 
     /// The arm block (post-rebuild) sets `due_at` once and does not push the
