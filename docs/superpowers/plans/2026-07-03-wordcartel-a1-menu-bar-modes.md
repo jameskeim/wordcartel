@@ -208,8 +208,11 @@ fn page_step(editor: &Editor) -> usize {
     }
 ```
   (The line-index idiom is `buffer.byte_to_line(off)` — Codex-verified against nav.rs:1369;
-  `editor_line_of`/`line_of_offset` do NOT exist. The ASSERTED VALUES are the contract —
-  do not weaken the `7` / `row < edit_height` expectations.)
+  `editor_line_of`/`line_of_offset` do NOT exist. IMPORT NOTE (Fable M3): nav.rs's tests mod
+  uses a SELECTIVE import (`use super::{ensure_visible, move_down, …};` at :944), not
+  `use super::*` — add `move_page_down`/`screen_pos` to that list (or qualify as
+  `crate::nav::…`, the existing idiom). The ASSERTED VALUES are the contract — do not
+  weaken the `7` / `row < edit_height` expectations.)
 
 - [ ] **Step 8: Run + gates + commit.** `cargo test -p wordcartel-core -p wordcartel` green;
   clippy clean; `cargo test --no-run` warning-free.
@@ -327,7 +330,7 @@ pub(crate) fn menu_bar_layout(area: Rect, groups: &[(crate::registry::MenuCatego
         }
     }
 ```
-  (Move the existing loop/dropdown code into the `Some(...)` arm unchanged. NOTE the
+  (Move the existing loop/dropdown code into the `Some(...)` arm unchanged. Drop the now-obsolete `#[allow(dead_code)]` on MENU_ORDER (registry.rs:41) once T2 uses it — the deny gate would flag it as an unfulfilled allow. NOTE the
   unbuilt-placeholder case intentionally falls to the inactive branch — between a click and
   the hydrate call it never renders, but the total function stays panic-free for any state.
   Confirm `MENU_ORDER`'s type — if it's `[MenuCategory; 5]`, pass `&MENU_ORDER[..]`.)
@@ -413,7 +416,7 @@ pub(crate) fn menu_bar_layout(area: Rect, groups: &[(crate::registry::MenuCatego
         let mut h = Harness::new("hello world\n", None, (40, 8));
         h.editor.menu_bar_mode = crate::config::MenuBarMode::Hidden;
         h.mouse_move(5, 0);
-        h.advance_ms(crate::mouse::MENU_DWELL_MS + 1);
+        h.advance_ms(250 + 1); // literal until T3 defines MENU_DWELL_MS (T3 Step 7 flips this)
         h.tick();
         assert!(!h.editor.mouse.menu_bar_revealed, "Hidden mode must never arm/reveal");
         assert!(h.row(0).contains("hello"), "row 0 is still text");
@@ -508,6 +511,12 @@ pub(crate) const MENU_LEAVE_GRACE_MS: u64 = 400;
 /// Auto — a stale due must never fire in Pinned/Hidden (spec M2).
 pub fn recompute_menu_bar(editor: &mut crate::editor::Editor, now_ms: u64) {
     if editor.menu_bar_mode != crate::config::MenuBarMode::Auto {
+        // Defense-in-depth (Fable plan-review M5): dues arm only in Auto and every
+        // mode transition clears them, so this state is unreachable — but CLEARING
+        // (never firing) here makes the deadline-array no-spin invariant
+        // unconditional instead of resting on the transition-clears.
+        editor.mouse.menu_reveal_due = None;
+        editor.mouse.menu_hide_due = None;
         return;
     }
     if editor.mouse.menu_reveal_due.is_some_and(|d| now_ms >= d) {
@@ -545,8 +554,10 @@ pub fn recompute_menu_bar(editor: &mut crate::editor::Editor, now_ms: u64) {
   1. `dwell_arms_on_row0_rest`: Moved(5,0) at t=0 → `menu_reveal_due == Some(MENU_DWELL_MS)`.
   2. `dwell_rearm_tracks_last_motion` (the asymmetry, side 1): Moved(5,0)@0, Moved(6,0)@100
      → due == Some(100 + MENU_DWELL_MS).
-  3. `dwell_never_arms_during_drag_or_overlay`: dragging=true → no arm; palette open → no
-     arm; dropdown open → no arm (each case).
+  3. `dwell_never_arms_during_drag_or_overlay`: EACH of these alone blocks arming (Fable
+     plan-review I1 — the full widened gate, so dropping any single condition fails a case):
+     dragging=true; scrollbar_dragging=true; palette open; **theme_picker open**;
+     **file_browser open**; dropdown open; and mode=Pinned (the arm's mode gate, arm-side).
   4. `leave_arms_grace_once` (the asymmetry, side 2): revealed=true; Moved(5,5)@0 → hide ==
      Some(MENU_LEAVE_GRACE_MS); Moved(6,5)@100 → hide UNCHANGED (still Some(GRACE), not 100+GRACE).
   5. `reentry_cancels_grace`: revealed=true, Moved(5,5)@0 (hide armed), Moved(5,0)@100 →
@@ -554,10 +565,13 @@ pub fn recompute_menu_bar(editor: &mut crate::editor::Editor, now_ms: u64) {
   6. `leave_bookkeeping_runs_while_dropdown_open` (the I1 pin): revealed=true + menu open;
      Moved(5,5) → hide armed (the arm sits before the overlay return).
   7. `recompute_fires_and_is_mode_gated` (app tests): reveal due in the past + Auto →
-     revealed; same + Pinned → untouched; hide due past + Auto → unrevealed.
+     revealed; same + Pinned → **due CLEARED, revealed NOT set** (recompute clears — never
+     fires — in non-Auto; see Step 3); hide due past + Auto → unrevealed.
   8. `capture_disable_clears_menu_bar_state` (app tests): revealed + a pending due →
      `reconcile_mouse_capture` with `mouse_capture=false` over a `Vec<u8>` backend → all
      three cleared.
+  9. `wheel_never_arms` (Fable M4 — pins the `Moved`-kind gate a refactor could loosen):
+     `ScrollUp` at (5, 0) → `menu_reveal_due` stays None.
 
 - [ ] **Step 7: e2e journeys 1, 2, 5** (e2e.rs):
 ```rust
