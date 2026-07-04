@@ -151,13 +151,14 @@ they STAY), while the goto family splits (`goto_line_jumps_…` :3545 goes throu
 No numeric quota — the rule plus the per-test pass decides; stayed tests that name moved
 fns get path rewrites as their only edit.
 
-**Shared helpers promote to `test_support.rs`** (already home to
-`TestClock`/`key_char`/`press`): `cua_keymap()` (:2565 — used by tests of every seam),
-`quit_tmp()` + its `static SEQ: AtomicU32` (:3050/:2563), `f10()` (:2598), `build_km()`
-(:5289). They become `#[cfg(test)]`-gated `pub(crate)` items so app.rs and the four new
-modules share one copy. (test_support.rs is itself `#[cfg(test)]`-only via lib.rs — the
-plan verifies the gating compiles for cross-module test use before committing to the
-exact attribute shape.)
+**No helper promotion (user decision 2026-07-04, on Fable I2).** The shared test
+helpers — `cua_keymap()` (:2565), `quit_tmp()` (:3050), `f10()` (:2598), `build_km()`
+(:5289) — and the `static SEQ: AtomicU32` (:2563, used directly by six tests, not only
+by `quit_tmp`) all STAY in `app.rs::tests`: Fable I2 intersected every helper-use line
+(92 of them) against the tests that move under the rule above — zero overlap; every
+consumer is a reduce-driven, quit-drain, or spanner test that stays. Moving tests need
+only `TestClock`/std (already in test_support.rs). If a future effort moves a test that
+needs one of these helpers, that effort promotes exactly what it needs.
 
 No new tests are required (a mechanical refactor is verified by the existing 975), and
 no test may be weakened, deleted, or have assertions altered — renamed imports
