@@ -3,6 +3,11 @@ use crossterm::event::{MouseEvent, MouseEventKind, MouseButton, KeyModifiers};
 use crate::editor::Editor;
 use crate::registry::{place_caret_visible, CaretPlace};
 
+/// Pointer must REST on row 0 this long before the auto-mode bar reveals.
+pub(crate) const MENU_DWELL_MS: u64 = 250;
+/// A revealed bar survives leaving row 0 this long (aim-wobble forgiveness).
+pub(crate) const MENU_LEAVE_GRACE_MS: u64 = 400;
+
 /// Classification of a terminal cell hit relative to the editing layout.
 #[derive(Clone, Copy)]
 pub enum CellHit {
@@ -16,7 +21,7 @@ pub enum CellHit {
 /// Classify a terminal cell `(col, row)` into the editing layout regions.
 pub fn editing_cell(editor: &Editor, col: u16, row: u16) -> CellHit {
     let (w, h) = editor.active().view.area;
-    let menu_rows: u16 = u16::from(editor.menu.is_some());
+    let menu_rows: u16 = editor.menu_bar_rows();
     if h == 0 {
         return CellHit::Outside;
     }
@@ -86,6 +91,32 @@ pub fn handle(
         editor.mouse.dragging = false;
         editor.mouse.scrollbar_dragging = false;
     }
+    // A1 auto-mode dwell tracking. Runs on every motion frame — keep it trivial
+    // (integer compares + stores only; the reveal/hide fire later in advance()).
+    // The two timers are deliberately ASYMMETRIC: the dwell re-arms on every
+    // row-0 motion (reveal after REST), the grace arms ONCE on the first leave.
+    if editor.menu_bar_mode == crate::config::MenuBarMode::Auto {
+        if let MouseEventKind::Moved = ev.kind {
+            if ev.row > 0 {
+                editor.mouse.menu_reveal_due = None;
+                if editor.mouse.menu_bar_revealed && editor.mouse.menu_hide_due.is_none() {
+                    editor.mouse.menu_hide_due = Some(clock.now_ms() + MENU_LEAVE_GRACE_MS);
+                }
+            } else {
+                editor.mouse.menu_hide_due = None; // re-entry cancels a pending hide
+                if editor.menu.is_none()
+                    && editor.palette.is_none()
+                    && editor.theme_picker.is_none()
+                    && editor.file_browser.is_none()
+                    && !editor.mouse.dragging
+                    && !editor.mouse.scrollbar_dragging
+                    && !editor.mouse.menu_bar_revealed
+                {
+                    editor.mouse.menu_reveal_due = Some(clock.now_ms() + MENU_DWELL_MS);
+                }
+            }
+        }
+    }
     let (w, h) = editor.active().view.area;
     let area = ratatui::layout::Rect::new(0, 0, w, h);
     if editor.palette.is_some() {
@@ -149,9 +180,20 @@ pub fn handle(
     match ev.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let hit = editing_cell(editor, ev.column, ev.row);
-            if let CellHit::Scrollbar = hit {
+            if let CellHit::MenuBar = hit {
+                // Inactive bar: open the dropdown AT the clicked category (hydrated
+                // by reduce's post-handle hydrate_overlays call).
+                let cats_hit = crate::render::menu_bar_layout_cats(area, &crate::registry::MENU_ORDER)
+                    .into_iter()
+                    .find(|(_, r)| ev.column >= r.x && ev.column < r.x + r.width && ev.row == r.y)
+                    .map(|(i, _)| i);
+                if let Some(order_idx) = cats_hit {
+                    editor.menu = Some(crate::menu::empty_at(order_idx));
+                }
+                // A row-0 click OFF the labels does nothing (the fill area is inert).
+            } else if let CellHit::Scrollbar = hit {
                 let (_w, h) = editor.active().view.area;
-                let menu_rows = u16::from(editor.menu.is_some());
+                let menu_rows = editor.menu_bar_rows();
                 let edit_height = h.saturating_sub(1 + menu_rows) as usize;
                 let erow_in_track = ev.row.saturating_sub(menu_rows) as usize;
                 let fv = editor.active_fold_view();
@@ -212,7 +254,7 @@ pub fn handle(
         MouseEventKind::Drag(MouseButton::Left) => {
             if editor.mouse.scrollbar_dragging {
                 let (_w, h) = editor.active().view.area;
-                let menu_rows = u16::from(editor.menu.is_some());
+                let menu_rows = editor.menu_bar_rows();
                 let edit_height = h.saturating_sub(1 + menu_rows) as usize;
                 let erow_in_track = ev.row.saturating_sub(menu_rows) as usize;
                 let fv = editor.active_fold_view();
@@ -225,7 +267,7 @@ pub fn handle(
             }
             if !editor.mouse.dragging { return; }
             let (_w, h) = editor.active().view.area;
-            let menu_rows = u16::from(editor.menu.is_some());
+            let menu_rows = editor.menu_bar_rows();
             let edit_top = menu_rows;
             let edit_bottom = h.saturating_sub(1); // status row excluded
             // edge auto-scroll
@@ -457,6 +499,60 @@ mod tests {
         assert!(e.theme_picker.is_some(), "theme picker must remain open after click");
     }
 
+    // -----------------------------------------------------------------------
+    // A1 Task 2: CellHit::MenuBar + click-to-open
+    // -----------------------------------------------------------------------
+
+    /// row 0 in Pinned mode (menu None) → MenuBar; in Hidden mode → NOT MenuBar.
+    #[test]
+    fn editing_cell_row0_is_menubar_only_when_bar_visible() {
+        use crate::config::MenuBarMode;
+        let mut e = Editor::new_from_text("hello\n", None, (40, 8));
+
+        // Pinned: menu_bar_rows() == 1 → row 0 is MenuBar.
+        e.menu_bar_mode = MenuBarMode::Pinned;
+        e.menu = None;
+        assert!(matches!(editing_cell(&e, 0, 0), CellHit::MenuBar), "Pinned + menu None → MenuBar");
+
+        // Hidden: menu_bar_rows() == 0 → row 0 is NOT MenuBar.
+        e.menu_bar_mode = MenuBarMode::Hidden;
+        e.menu = None;
+        assert!(!matches!(editing_cell(&e, 0, 0), CellHit::MenuBar), "Hidden + menu None → not MenuBar");
+    }
+
+    /// A click on the inactive bar (Pinned, menu None) at the Format label column
+    /// opens a placeholder with open == MENU_ORDER index of Format (== 2).
+    #[test]
+    fn click_on_inactive_bar_opens_that_category() {
+        use crate::config::MenuBarMode;
+        let mut e = Editor::new_from_text("hello\n", None, (80, 8));
+        crate::derive::rebuild(&mut e);
+        e.menu_bar_mode = MenuBarMode::Pinned;
+        e.menu = None;
+        let (reg, ex, clk, tx, km) = ctx();
+        // Compute the Format label column dynamically (MENU_ORDER[2] = Format).
+        let (w, h) = e.active().view.area;
+        let area = ratatui::layout::Rect::new(0, 0, w, h);
+        let menu_area = ratatui::layout::Rect::new(area.x, area.y, w, h.saturating_sub(1));
+        let bar = crate::render::menu_bar_layout_cats(menu_area, &crate::registry::MENU_ORDER);
+        let (_, format_rect) = bar.iter().find(|(i, _)| *i == 2).expect("Format at index 2");
+        let col = format_rect.x + 1; // somewhere inside the label
+
+        // Click on the Format label while the bar is inactive (menu None).
+        handle(&mut e, down(col, 0), &reg, &km, &ex, &clk, &tx);
+        let menu = e.menu.as_ref().expect("click must set editor.menu to Some placeholder");
+        assert!(!menu.built, "placeholder must not be built (hydration happens in reduce)");
+        assert_eq!(menu.open, 2, "placeholder open must be the MENU_ORDER index of Format");
+
+        // After hydrate_overlays: built and mapped to the correct group.
+        crate::app::hydrate_overlays(&mut e, &reg, &km);
+        let menu = e.menu.as_ref().unwrap();
+        assert!(menu.built, "hydrated menu must be built");
+        let format_pos = menu.groups.iter().position(|(cat, _)| *cat == crate::registry::MenuCategory::Format)
+            .expect("Format group must exist after build");
+        assert_eq!(menu.open, format_pos, "hydrated open must map to Format's group position");
+    }
+
     /// Finding 2 regression: if the palette (or menu) is open while a text or
     /// scrollbar drag is in flight and the user releases the mouse button, the
     /// Up(Left) event is consumed by the overlay branch — but drag state must
@@ -482,5 +578,137 @@ mod tests {
         handle(&mut e, up, &reg, &km, &ex, &clk, &tx);
         assert!(!e.mouse.dragging, "dragging must be cleared when Up(Left) arrives during overlay");
         assert!(!e.mouse.scrollbar_dragging, "scrollbar_dragging must be cleared when Up(Left) arrives during overlay");
+    }
+
+    // -----------------------------------------------------------------------
+    // A1 Task 3: auto-mode dwell/grace predicate table
+    // -----------------------------------------------------------------------
+
+    fn moved(col: u16, row: u16) -> MouseEvent {
+        MouseEvent { kind: MouseEventKind::Moved, column: col, row, modifiers: KeyModifiers::NONE }
+    }
+
+    /// Case 1: a Moved onto row 0 arms the reveal deadline at now + DWELL.
+    #[test]
+    fn dwell_arms_on_row0_rest() {
+        let mut e = Editor::new_from_text("hello\n", None, (40, 8));
+        crate::derive::rebuild(&mut e);
+        let (reg, ex, _, tx, km) = ctx();
+        e.menu_bar_mode = crate::config::MenuBarMode::Auto;
+        handle(&mut e, moved(5, 0), &reg, &km, &ex, &TestClock(0), &tx);
+        assert_eq!(e.mouse.menu_reveal_due, Some(MENU_DWELL_MS),
+            "Moved onto row 0 must arm reveal at now + DWELL_MS");
+    }
+
+    /// Case 2 (asymmetry side 1): each row-0 motion re-arms; the deadline tracks
+    /// the LAST motion — reveal fires only after the pointer RESTS.
+    #[test]
+    fn dwell_rearm_tracks_last_motion() {
+        let mut e = Editor::new_from_text("hello\n", None, (40, 8));
+        crate::derive::rebuild(&mut e);
+        let (reg, ex, _, tx, km) = ctx();
+        e.menu_bar_mode = crate::config::MenuBarMode::Auto;
+        handle(&mut e, moved(5, 0), &reg, &km, &ex, &TestClock(0), &tx);
+        handle(&mut e, moved(6, 0), &reg, &km, &ex, &TestClock(100), &tx);
+        assert_eq!(e.mouse.menu_reveal_due, Some(100 + MENU_DWELL_MS),
+            "second row-0 motion must re-arm the deadline to the LAST motion time");
+    }
+
+    /// Case 3: EACH gate condition alone blocks the dwell arm.
+    #[test]
+    fn dwell_never_arms_during_drag_or_overlay() {
+        // Helper: fresh Auto editor at row 0, Moved dispatched at t=0.
+        // Returns the menu_reveal_due after the move.
+        let fire = |setup: &dyn Fn(&mut Editor)| -> Option<u64> {
+            let mut e = Editor::new_from_text("hello\n", None, (40, 8));
+            crate::derive::rebuild(&mut e);
+            e.menu_bar_mode = crate::config::MenuBarMode::Auto;
+            setup(&mut e);
+            let (reg, ex, _, tx, km) = ctx();
+            handle(&mut e, moved(5, 0), &reg, &km, &ex, &TestClock(0), &tx);
+            e.mouse.menu_reveal_due
+        };
+        assert!(fire(&|e| { e.mouse.dragging = true; }).is_none(),
+            "dragging=true must block arming");
+        assert!(fire(&|e| { e.mouse.scrollbar_dragging = true; }).is_none(),
+            "scrollbar_dragging=true must block arming");
+        assert!(fire(&|e| { e.palette = Some(crate::palette::Palette::default()); }).is_none(),
+            "palette open must block arming");
+        assert!(fire(&|e| { e.open_theme_picker(); }).is_none(),
+            "theme_picker open must block arming");
+        assert!(fire(&|e| { e.file_browser = Some(crate::file_browser::FileBrowser {
+            dir: std::path::PathBuf::from("."), query: String::new(),
+            entries: vec![], selected: 0,
+        }); }).is_none(), "file_browser open must block arming");
+        assert!(fire(&|e| { e.menu = Some(crate::menu::empty_at(0)); }).is_none(),
+            "dropdown open must block arming");
+        assert!(fire(&|e| { e.menu_bar_mode = crate::config::MenuBarMode::Pinned; }).is_none(),
+            "mode=Pinned must block arming (arm-side mode gate)");
+    }
+
+    /// Case 4 (asymmetry side 2): the grace arms ONCE on the first leave; a
+    /// second leave motion must NOT re-arm (that would defer the hide forever).
+    #[test]
+    fn leave_arms_grace_once() {
+        let mut e = Editor::new_from_text("hello\n", None, (40, 8));
+        crate::derive::rebuild(&mut e);
+        let (reg, ex, _, tx, km) = ctx();
+        e.menu_bar_mode = crate::config::MenuBarMode::Auto;
+        e.mouse.menu_bar_revealed = true;
+        handle(&mut e, moved(5, 5), &reg, &km, &ex, &TestClock(0), &tx);
+        assert_eq!(e.mouse.menu_hide_due, Some(MENU_LEAVE_GRACE_MS),
+            "first leave motion must arm the grace deadline");
+        handle(&mut e, moved(6, 5), &reg, &km, &ex, &TestClock(100), &tx);
+        assert_eq!(e.mouse.menu_hide_due, Some(MENU_LEAVE_GRACE_MS),
+            "second leave motion must NOT re-arm — grace must stay at the FIRST leave time");
+    }
+
+    /// Case 5: re-entering row 0 cancels a pending hide; the bar stays revealed.
+    #[test]
+    fn reentry_cancels_grace() {
+        let mut e = Editor::new_from_text("hello\n", None, (40, 8));
+        crate::derive::rebuild(&mut e);
+        let (reg, ex, _, tx, km) = ctx();
+        e.menu_bar_mode = crate::config::MenuBarMode::Auto;
+        e.mouse.menu_bar_revealed = true;
+        handle(&mut e, moved(5, 5), &reg, &km, &ex, &TestClock(0), &tx);
+        assert!(e.mouse.menu_hide_due.is_some(), "precondition: grace must be armed");
+        handle(&mut e, moved(5, 0), &reg, &km, &ex, &TestClock(100), &tx);
+        assert!(e.mouse.menu_hide_due.is_none(), "re-entry must cancel the pending hide");
+        assert!(e.mouse.menu_bar_revealed, "bar must still be revealed after re-entry");
+    }
+
+    /// Case 6: leave-bookkeeping runs even while the dropdown is open (the arm
+    /// sits before the overlay return — spec I1).
+    #[test]
+    fn leave_bookkeeping_runs_while_dropdown_open() {
+        let mut e = Editor::new_from_text("hello\n", None, (40, 8));
+        crate::derive::rebuild(&mut e);
+        let (reg, ex, _, tx, km) = ctx();
+        e.menu_bar_mode = crate::config::MenuBarMode::Auto;
+        e.mouse.menu_bar_revealed = true;
+        e.menu = Some(crate::menu::empty_at(0)); // dropdown open
+        handle(&mut e, moved(5, 5), &reg, &km, &ex, &TestClock(0), &tx);
+        assert_eq!(e.mouse.menu_hide_due, Some(MENU_LEAVE_GRACE_MS),
+            "leave-bookkeeping must run even with the dropdown open");
+    }
+
+    /// Case 9: a wheel event (ScrollUp) at row 0 must never arm the dwell —
+    /// the arm is gated on Moved only (pins a refactor that could loosen the kind gate).
+    #[test]
+    fn wheel_never_arms() {
+        let mut e = Editor::new_from_text("hello\n", None, (40, 8));
+        crate::derive::rebuild(&mut e);
+        let (reg, ex, clk, tx, km) = ctx();
+        e.menu_bar_mode = crate::config::MenuBarMode::Auto;
+        let wheel_up = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 5,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle(&mut e, wheel_up, &reg, &km, &ex, &clk, &tx);
+        assert!(e.mouse.menu_reveal_due.is_none(),
+            "ScrollUp at row 0 must not arm the dwell (Moved-kind gate)");
     }
 }

@@ -84,10 +84,10 @@ pub fn screen_pos(editor: &Editor) -> Option<(u16, u16)> {
     let buf = &editor.active().document.buffer;
     let scroll = editor.active().view.scroll;
     let scroll_row = editor.active().view.scroll_row;
-    // Editing area excludes the bottom status row (render reserves frame_h - 1),
-    // so nav must reserve it too — else a caret on the last row is deemed visible
-    // but never painted/cursor-placed. view.area is the FULL terminal size.
-    let area_height = (editor.active().view.area.1 as usize).saturating_sub(1);
+    // Editing area excludes the bottom status row (render reserves frame_h - 1) AND
+    // the menu bar row when visible — reserves the status row AND the menu bar row when visible.
+    // view.area is the FULL terminal size.
+    let area_height = (editor.active().view.area.1 as usize).saturating_sub(1 + editor.menu_bar_rows() as usize);
     let h = head(editor);
     let l = caret_line(editor);
 
@@ -400,7 +400,7 @@ pub fn move_up(editor: &mut Editor) -> usize {
 /// - Clamp scroll to `[0, total_logical_lines - 1]`.
 pub fn ensure_visible(editor: &mut Editor) {
     if editor.view_opts.typewriter {
-        let edit_height = (editor.active().view.area.1 as usize).saturating_sub(1);
+        let edit_height = (editor.active().view.area.1 as usize).saturating_sub(1 + editor.menu_bar_rows() as usize);
         if edit_height == 0 { return; }
         let fv = fold_view(editor);
         let anchor = editor.view_opts.typewriter_anchor.clamp(0.0, 1.0);
@@ -431,10 +431,9 @@ pub fn ensure_visible(editor: &mut Editor) {
     }
     let l = caret_line(editor);
     let total = derive::total_logical_lines(&editor.active().document.buffer);
-    // Editing area excludes the bottom status row (render reserves frame_h - 1),
-    // so nav must reserve it too — else a caret on the last row is deemed visible
-    // but never painted/cursor-placed. view.area is the FULL terminal size.
-    let area_height = (editor.active().view.area.1 as usize).saturating_sub(1);
+    // Editing area excludes the bottom status row (render reserves frame_h - 1) AND
+    // the menu bar row when visible. view.area is the FULL terminal size.
+    let area_height = (editor.active().view.area.1 as usize).saturating_sub(1 + editor.menu_bar_rows() as usize);
 
     // Clamp scroll to valid range first
     let max_scroll = total.saturating_sub(1);
@@ -756,9 +755,11 @@ pub fn move_doc_end(editor: &mut Editor) -> usize {
 }
 
 /// Page step: editing_height − 1 for one row of context overlap.
-/// `editing_height = area.1 - 1` (the status row is reserved — matches nav.rs:62).
+/// `editing_height` reserves the status row and the menu bar row when visible
+/// (matches screen_pos/ensure_visible/last_fully_visible_line).
 fn page_step(editor: &Editor) -> usize {
-    let editing_height = (editor.active().view.area.1 as usize).saturating_sub(1);
+    let editing_height = (editor.active().view.area.1 as usize)
+        .saturating_sub(1 + editor.menu_bar_rows() as usize);
     editing_height.saturating_sub(1).max(1)
 }
 
@@ -791,8 +792,8 @@ pub fn move_page_up(editor: &mut Editor) -> usize {
 pub(crate) fn last_fully_visible_line(editor: &Editor) -> usize {
     let (top, skip) = { let v = &editor.active().view; (v.scroll, v.scroll_row) };
     // view.area is (width, height); the editing region reserves one row for the
-    // status bar (matches nav.rs:90/403/page_step).
-    let height = (editor.active().view.area.1 as usize).saturating_sub(1);
+    // status bar and the menu bar row when visible (matches screen_pos/ensure_visible/page_step).
+    let height = (editor.active().view.area.1 as usize).saturating_sub(1 + editor.menu_bar_rows() as usize);
     if height == 0 { return top; }
     let fv = fold_view(editor);
     let mut line = top;
@@ -941,7 +942,7 @@ pub fn offset_at_cell(editor: &Editor, col: u16, row: u16) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_visible, move_down, move_up, move_home, move_end, move_left, move_right, screen_pos};
+    use super::{ensure_visible, move_down, move_up, move_home, move_end, move_left, move_right, screen_pos, move_page_down};
     use crate::derive;
     use crate::editor::Editor;
     use wordcartel_core::selection::Selection;
@@ -1604,5 +1605,38 @@ mod tests {
             e.active().view.scroll_row,
             e.active().document.buffer.byte_to_line(e.active().document.selection.primary().head),
         );
+    }
+
+    #[test]
+    fn ensure_visible_accounts_for_menu_bar_row() {
+        // 20x10 frame: status row + OPEN MENU -> edit_height 8. Pre-fix nav used 9,
+        // under-scrolling by one: the caret's screen row landed AT edit_height and
+        // render's `row < edit_height` guard left the cursor unpainted.
+        let mut e = crate::editor::Editor::new_from_text(&"line\n".repeat(20), None, (20, 10));
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        e.menu = Some(crate::menu::build(&reg, &km));
+        let end = e.active().document.buffer.len();
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(end);
+        crate::derive::rebuild(&mut e);
+        ensure_visible(&mut e);
+        crate::derive::rebuild(&mut e);
+        let (_, row) = screen_pos(&e).expect("caret must be visible after ensure_visible");
+        let edit_height = 10u16 - 1 - 1;
+        assert!(row < edit_height, "caret row {row} must fit the menu-adjusted viewport (h={edit_height})");
+    }
+
+    #[test]
+    fn page_step_accounts_for_menu_bar_row() {
+        // 20x10 + open menu: editing_height 8 -> step 7. Pre-fix: height 9 -> step 8.
+        let mut e = crate::editor::Editor::new_from_text(&"line\n".repeat(30), None, (20, 10));
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        e.menu = Some(crate::menu::build(&reg, &km));
+        crate::derive::rebuild(&mut e);
+        let off = move_page_down(&mut e);
+        let line = e.active().document.buffer.byte_to_line(off); // the local idiom (nav.rs:1369) —
+                                        // Codex-verified; editor_line_of/line_of_offset do NOT exist.
+        assert_eq!(line, 7, "PageDown from line 0 with the bar visible steps 7 (8-row viewport, 1 overlap)");
     }
 }

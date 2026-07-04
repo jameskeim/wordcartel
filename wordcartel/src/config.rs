@@ -39,6 +39,7 @@ pub struct Config {
     pub diagnostics: DiagnosticsConfig,
     pub theme: ThemeConfig,
     pub export: ExportConfig,
+    pub menu: MenuConfig,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -69,6 +70,19 @@ impl Default for DiagnosticsConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusGranularity { Paragraph, Sentence }
+
+/// Menu bar visibility mode (`[menu] bar`). Auto reveals on a pointer dwell at
+/// the top row and hides after a leave-grace; Pinned keeps the bar always
+/// visible-inactive; Hidden shows it only while the dropdown is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuBarMode { Hidden, Auto, Pinned }
+
+/// Menu bar configuration section.
+#[derive(Debug, Clone)]
+pub struct MenuConfig { pub bar: MenuBarMode }
+impl Default for MenuConfig {
+    fn default() -> Self { MenuConfig { bar: MenuBarMode::Auto } }
+}
 
 #[derive(Debug, Clone)]
 pub struct ViewConfig {
@@ -159,6 +173,7 @@ struct RawConfig {
     diagnostics: RawDiagnostics,
     theme: RawTheme,
     export: RawExport,
+    menu: RawMenu,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, PartialEq)]
@@ -216,6 +231,11 @@ struct RawMouse {
 struct RawExport {
     pdf_engine: Option<String>,
     typography: Option<bool>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawMenu {
+    bar: Option<String>,
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -327,6 +347,15 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
                 "paragraph" => cfg.view.focus_granularity = FocusGranularity::Paragraph,
                 "sentence"  => cfg.view.focus_granularity = FocusGranularity::Sentence,
                 other => warns.push(format!("view.focus_granularity \"{other}\" invalid; using paragraph")),
+            }
+        }
+        // menu: per-field override; enum-valued string with a warning on unknowns.
+        if let Some(b) = raw.menu.bar {
+            match b.as_str() {
+                "hidden" => cfg.menu.bar = MenuBarMode::Hidden,
+                "auto"   => cfg.menu.bar = MenuBarMode::Auto,
+                "pinned" => cfg.menu.bar = MenuBarMode::Pinned,
+                other => warns.push(format!("menu.bar \"{other}\" invalid; using auto")),
             }
         }
         // export: per-field override (omitted field inherits the lower layer).
@@ -662,6 +691,38 @@ mod tests {
         assert!(cfg.view.typewriter);
         assert!(cfg.theme.name.is_none() && cfg.theme.file.is_none());
         assert!(warns.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // [menu] config layering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn menu_bar_absent_defaults_to_auto() {
+        let (cfg, warns) = load(&[]);
+        assert!(warns.is_empty());
+        assert_eq!(cfg.menu.bar, MenuBarMode::Auto, "absent [menu] → Auto");
+    }
+
+    #[test]
+    fn menu_bar_each_valid_string_folds_to_its_variant() {
+        for (s, want) in [("hidden", MenuBarMode::Hidden), ("auto", MenuBarMode::Auto), ("pinned", MenuBarMode::Pinned)] {
+            let d = tempdir();
+            let p = write(&d, "c.toml", &format!("[menu]\nbar = \"{s}\"\n"));
+            let (cfg, warns) = load(&[p]);
+            assert!(warns.is_empty(), "no warnings for valid variant \"{s}\"");
+            assert_eq!(cfg.menu.bar, want, "\"{}\" → {:?}", s, want);
+        }
+    }
+
+    #[test]
+    fn menu_bar_bogus_string_stays_auto_with_warning() {
+        let d = tempdir();
+        let p = write(&d, "c.toml", "[menu]\nbar = \"bogus\"\n");
+        let (cfg, warns) = load(&[p]);
+        assert_eq!(cfg.menu.bar, MenuBarMode::Auto, "bogus value → stays Auto");
+        assert!(warns.iter().any(|w| w.contains("menu.bar")),
+            "must warn containing 'menu.bar'; got: {warns:?}");
     }
 
 }

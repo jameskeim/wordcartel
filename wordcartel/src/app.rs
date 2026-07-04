@@ -821,8 +821,21 @@ pub(crate) fn hydrate_overlays(editor: &mut Editor, reg: &crate::registry::Regis
             crate::palette::rebuild_rows(p, reg, keymap);
         }
     }
-    if editor.menu.as_ref().is_some_and(|v| !v.built) {
-        editor.menu = Some(crate::menu::build(reg, keymap));
+    if let Some(v) = editor.menu.as_ref().filter(|v| !v.built) {
+        let want_open = v.open;
+        let want_hl = v.highlighted;
+        let mut built = crate::menu::build(reg, keymap);
+        // The placeholder's `open` indexes MENU_ORDER; map it to the built groups'
+        // position for that category (robust even if a category has no commands).
+        if let Some(cat) = crate::registry::MENU_ORDER.get(want_open) {
+            if let Some(pos) = built.groups.iter().position(|g| g.0 == *cat) {
+                built.open = pos;
+            }
+        }
+        built.highlighted = want_hl.min(
+            built.groups.get(built.open).map_or(0, |g| g.1.len().saturating_sub(1)),
+        );
+        editor.menu = Some(built);
     }
 }
 
@@ -1756,6 +1769,9 @@ pub fn reduce(
         }
         Msg::Input(Event::Mouse(ev)) => {
             crate::mouse::handle(editor, ev, reg, keymap, ex, clock, msg_tx);
+            // A click-opened menu placeholder must be built before the next render —
+            // the key-dispatch path hydrates; the mouse path must too (A1 spec C1).
+            hydrate_overlays(editor, reg, keymap);
         }
         Msg::Input(_) => {}
         Msg::JobDone(o) => apply_job_outcome(o, editor, ex, clock, msg_tx),
@@ -1862,6 +1878,7 @@ impl Clock for SystemClock {
 /// harness exercises the REAL loop body, not a re-implementation.
 pub(crate) fn advance(editor: &mut Editor, clock: &dyn Clock) {
     recompute_scrollbar_visible(editor, clock.now_ms());
+    recompute_menu_bar(editor, clock.now_ms());
     // Pre-draw rebuild: ensure the layout cache matches the final (scroll,
     // text_width) before render consumes it.  render has no on-demand fallback
     // (render.rs:132-140), so a stale cache blanks the editing rows.
@@ -1958,6 +1975,12 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     editor.resume_enabled = cfg.state.resume; // gates open_into_current's resume restore (Effort 7)
     editor.diag_cfg = cfg.diagnostics.clone();
     editor.export_cfg = cfg.export.clone();
+    editor.menu_bar_mode = cfg.menu.bar;
+    editor.menu_bar_unpinned_mode = if cfg.menu.bar == crate::config::MenuBarMode::Pinned {
+        crate::config::MenuBarMode::Auto // unpin target when config itself pins
+    } else {
+        cfg.menu.bar
+    };
     // Resolve and seed the active theme + color depth (once, at startup — §3.6).
     let env = crate::theme_resolve::EnvSnapshot::from_env();
     let resolved = crate::theme_resolve::resolve_theme(&cfg.theme, &env);
@@ -2158,6 +2181,10 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         } else {
             None
         };
+        // Menu-bar dwell/grace: at most one is Some by construction (the Moved arm
+        // clears the other side); recompute_menu_bar clears a fired due, so a past
+        // deadline cannot persist and spin the loop.
+        let menu_deadline = editor.mouse.menu_reveal_due.or(editor.mouse.menu_hide_due);
         // Fix A3: include the diagnostics deadline ONLY when no check is in
         // flight.  When a check is in flight, recheck_due_at may be a past
         // timestamp (armed before the check started), which would drive
@@ -2178,6 +2205,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             swap_deadline,
             sq_deadline,
             sb_deadline,
+            menu_deadline,
             diag_deadline,
             reconcile_deadline,
         ]);
@@ -2243,6 +2271,28 @@ pub fn recompute_scrollbar_visible(editor: &mut crate::editor::Editor, now_ms: u
     editor.mouse.scrollbar_visible = now_ms < editor.mouse.scrollbar_until_ms;
 }
 
+/// Fire the auto-mode menu-bar deadlines (armed by the mouse Moved arm). Gated on
+/// Auto — a stale due must never fire in Pinned/Hidden (spec M2).
+pub fn recompute_menu_bar(editor: &mut crate::editor::Editor, now_ms: u64) {
+    if editor.menu_bar_mode != crate::config::MenuBarMode::Auto {
+        // Defense-in-depth (Fable plan-review M5): dues arm only in Auto and every
+        // mode transition clears them, so this state is unreachable — but CLEARING
+        // (never firing) here makes the deadline-array no-spin invariant
+        // unconditional instead of resting on the transition-clears.
+        editor.mouse.menu_reveal_due = None;
+        editor.mouse.menu_hide_due = None;
+        return;
+    }
+    if editor.mouse.menu_reveal_due.is_some_and(|d| now_ms >= d) {
+        editor.mouse.menu_reveal_due = None;
+        editor.mouse.menu_bar_revealed = true;
+    }
+    if editor.mouse.menu_hide_due.is_some_and(|d| now_ms >= d) {
+        editor.mouse.menu_hide_due = None;
+        editor.mouse.menu_bar_revealed = false;
+    }
+}
+
 /// Reconcile the terminal's mouse-capture state with `editor.mouse_capture`.
 ///
 /// Enables or disables mouse capture on the backend when the desired state
@@ -2260,6 +2310,9 @@ pub fn reconcile_mouse_capture<W: std::io::Write>(editor: &mut crate::editor::Ed
             editor.mouse.dragging = false;
             editor.mouse.scrollbar_dragging = false;
             editor.mouse.anchor = None;
+            editor.mouse.menu_reveal_due = None;
+            editor.mouse.menu_hide_due = None;
+            editor.mouse.menu_bar_revealed = false;
             if crossterm::execute!(backend, crossterm::event::DisableMouseCapture).is_ok() {
                 *applied = editor.mouse_capture;
             }
@@ -4156,6 +4209,58 @@ mod tests {
         assert!(!e.mouse.scrollbar_visible);
     }
 
+    // A1 Task 3 — cases 7 + 8 (app-level: recompute_menu_bar / reconcile)
+
+    /// Case 7: recompute fires in Auto; in non-Auto it clears without firing.
+    #[test]
+    fn recompute_fires_and_is_mode_gated() {
+        use crate::editor::Editor;
+        use crate::config::MenuBarMode;
+
+        // Auto: past reveal deadline → revealed = true.
+        let mut e = Editor::new_from_text("x\n", None, (40, 8));
+        e.menu_bar_mode = MenuBarMode::Auto;
+        e.mouse.menu_reveal_due = Some(100);
+        crate::app::recompute_menu_bar(&mut e, 101);
+        assert!(e.mouse.menu_bar_revealed, "Auto: past reveal due must fire");
+        assert!(e.mouse.menu_reveal_due.is_none(), "reveal due cleared after firing");
+
+        // Pinned: past reveal deadline → cleared WITHOUT firing (defense-in-depth).
+        let mut e2 = Editor::new_from_text("x\n", None, (40, 8));
+        e2.menu_bar_mode = MenuBarMode::Pinned;
+        e2.mouse.menu_reveal_due = Some(100);
+        crate::app::recompute_menu_bar(&mut e2, 101);
+        assert!(!e2.mouse.menu_bar_revealed, "Pinned: due CLEARED, revealed NOT set");
+        assert!(e2.mouse.menu_reveal_due.is_none(), "due cleared in Pinned");
+
+        // Auto: past hide deadline → revealed = false.
+        let mut e3 = Editor::new_from_text("x\n", None, (40, 8));
+        e3.menu_bar_mode = MenuBarMode::Auto;
+        e3.mouse.menu_bar_revealed = true;
+        e3.mouse.menu_hide_due = Some(200);
+        crate::app::recompute_menu_bar(&mut e3, 201);
+        assert!(!e3.mouse.menu_bar_revealed, "Auto: past hide due must fire → unrevealed");
+        assert!(e3.mouse.menu_hide_due.is_none(), "hide due cleared after firing");
+    }
+
+    /// Case 8: capture-off clears all three menu-bar fields.
+    #[test]
+    fn capture_disable_clears_menu_bar_state() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("x\n", None, (40, 8));
+        e.mouse_capture = true;
+        e.mouse.menu_bar_revealed = true;
+        e.mouse.menu_reveal_due = Some(500);
+        e.mouse.menu_hide_due = Some(900);
+        let mut buf = Vec::<u8>::new();
+        let mut applied = true;
+        e.mouse_capture = false;
+        crate::app::reconcile_mouse_capture(&mut e, &mut buf, &mut applied);
+        assert!(!e.mouse.menu_bar_revealed, "revealed cleared on capture disable");
+        assert!(e.mouse.menu_reveal_due.is_none(), "menu_reveal_due cleared on capture disable");
+        assert!(e.mouse.menu_hide_due.is_none(), "menu_hide_due cleared on capture disable");
+    }
+
     /// Finding 1 regression: wheel event sets scrollbar_until_ms; recomputing
     /// immediately after (now == t, t < t+1200) must yield visible == true.
     /// A later recompute at t+1300 must yield false (bar fades after deadline).
@@ -4999,6 +5104,52 @@ mod tests {
     // -----------------------------------------------------------------------
     // Task 4: reconcile arm logic unit test
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // A1 Task 2: hydrate_overlays preserves and maps the placeholder's open index.
+    // -----------------------------------------------------------------------
+
+    fn build_km() -> crate::keymap::KeyTrie {
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        km
+    }
+
+    /// hydrate_overlays maps a placeholder's MENU_ORDER index to the built groups'
+    /// position by category (Format = index 2 in MENU_ORDER).
+    #[test]
+    fn hydrate_preserves_and_maps_open() {
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        let reg = crate::registry::Registry::builtins();
+        let km = build_km();
+        // MENU_ORDER[2] = Format
+        e.menu = Some(crate::menu::empty_at(2));
+        crate::app::hydrate_overlays(&mut e, &reg, &km);
+        let menu = e.menu.as_ref().expect("menu must be Some after hydration");
+        assert!(menu.built, "menu must be marked built after hydration");
+        // locate Format in the built groups
+        let format_pos = menu.groups.iter().position(|(cat, _)| *cat == crate::registry::MenuCategory::Format)
+            .expect("Format category must be in built groups");
+        assert_eq!(menu.open, format_pos, "open must map to Format's position in built groups");
+    }
+
+    /// hydrate_overlays clamps highlighted to the last item in the open group.
+    #[test]
+    fn hydrate_clamps_highlighted() {
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        let reg = crate::registry::Registry::builtins();
+        let km = build_km();
+        // MENU_ORDER[2] = Format; seed highlighted at an absurd index
+        let mut placeholder = crate::menu::empty_at(2);
+        placeholder.highlighted = 999;
+        e.menu = Some(placeholder);
+        crate::app::hydrate_overlays(&mut e, &reg, &km);
+        let menu = e.menu.as_ref().unwrap();
+        let open_group = menu.groups.get(menu.open).expect("open group must exist");
+        let max_hl = open_group.1.len().saturating_sub(1);
+        assert!(menu.highlighted <= max_hl,
+            "highlighted {} must be clamped to max {max_hl}", menu.highlighted);
+    }
 
     /// The arm block (post-rebuild) sets `due_at` once and does not push the
     /// deadline on idle Ticks; a new edit (version bump) re-arms the debounce.

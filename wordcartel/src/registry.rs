@@ -38,7 +38,6 @@ pub type Handler = fn(&mut Ctx) -> CommandResult;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MenuCategory { File, Edit, Format, View, Export }
 
-#[allow(dead_code)] // wired in Task 3/4
 pub const MENU_ORDER: [MenuCategory; 5] =
     [MenuCategory::File, MenuCategory::Edit, MenuCategory::Format, MenuCategory::View, MenuCategory::Export];
 
@@ -419,6 +418,20 @@ impl Registry {
         });
         r.register("outline", "Outline\u{2026}", Some(MenuCategory::View), |c| {
             c.editor.open_outline();
+            CommandResult::Handled
+        });
+        r.register("menu_bar_pin", "Pin Menu Bar", Some(MenuCategory::View), |c| {
+            use crate::config::MenuBarMode;
+            if c.editor.menu_bar_mode == MenuBarMode::Pinned {
+                c.editor.menu_bar_mode = c.editor.menu_bar_unpinned_mode;
+            } else {
+                c.editor.menu_bar_unpinned_mode = c.editor.menu_bar_mode;
+                c.editor.menu_bar_mode = MenuBarMode::Pinned;
+            }
+            // Mode-transition hygiene: stale auto-state must not survive (spec M2).
+            c.editor.mouse.menu_reveal_due = None;
+            c.editor.mouse.menu_hide_due = None;
+            c.editor.mouse.menu_bar_revealed = false;
             CommandResult::Handled
         });
 
@@ -806,5 +819,35 @@ mod tests {
         dispatch_id(&mut ed, "heading_prev");
         assert_eq!(ed.active().document.selection.primary().head, doc.find("### A1").unwrap());
         assert!(ed.active().jump_ring.contains(&b));
+    }
+
+    // -----------------------------------------------------------------------
+    // A1 Task 2: menu_bar_pin round-trips mode and clears auto-mode state.
+    // -----------------------------------------------------------------------
+
+    /// Pinning from Auto sets Pinned and clears all three auto fields;
+    /// a second dispatch restores Auto.
+    #[test]
+    fn pin_toggle_round_trips_and_clears_auto_state() {
+        use crate::config::MenuBarMode;
+        let mut ed = Editor::new_from_text("x\n", None, (80, 24));
+        // Start in Auto mode with stale auto-state.
+        ed.menu_bar_mode = MenuBarMode::Auto;
+        ed.mouse.menu_bar_revealed = true;
+        ed.mouse.menu_reveal_due = Some(9999);
+        ed.mouse.menu_hide_due = Some(9999);
+
+        // First dispatch: Auto → Pinned, all auto-state cleared.
+        dispatch_id(&mut ed, "menu_bar_pin");
+        assert_eq!(ed.menu_bar_mode, MenuBarMode::Pinned);
+        assert!(!ed.mouse.menu_bar_revealed, "menu_bar_revealed must be cleared on pin");
+        assert!(ed.mouse.menu_reveal_due.is_none(), "menu_reveal_due must be cleared on pin");
+        assert!(ed.mouse.menu_hide_due.is_none(), "menu_hide_due must be cleared on pin");
+        // unpinned_mode must have captured Auto so it can be restored.
+        assert_eq!(ed.menu_bar_unpinned_mode, MenuBarMode::Auto);
+
+        // Second dispatch: Pinned → Auto restored.
+        dispatch_id(&mut ed, "menu_bar_pin");
+        assert_eq!(ed.menu_bar_mode, MenuBarMode::Auto, "second pin must restore Auto");
     }
 }

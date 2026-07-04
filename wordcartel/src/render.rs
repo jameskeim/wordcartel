@@ -104,17 +104,26 @@ fn prefix_element(role: wordcartel_core::style::BlockRole) -> SE {
     }
 }
 
-// Shared geometry — render AND mouse (Task 7) both call these.
-pub(crate) fn menu_bar_layout(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)]) -> Vec<(usize, Rect)> {
+// Shared geometry — render AND mouse both call these.
+
+/// Compute bar label rects from a raw category slice (static MENU_ORDER or dynamic group list).
+/// Returns `(index_into_cats, rect)` for each category.
+pub(crate) fn menu_bar_layout_cats(area: Rect, cats: &[crate::registry::MenuCategory]) -> Vec<(usize, Rect)> {
     let mut out = Vec::new();
     let mut x = area.x;
-    for (i, (cat, _)) in groups.iter().enumerate() {
+    for (i, cat) in cats.iter().enumerate() {
         let label = crate::menu::category_label_pub(*cat);
         let wgt = label.chars().count() as u16 + 2; // 1 space padding each side
         out.push((i, Rect::new(x, area.y, wgt, 1)));
         x = x.saturating_add(wgt);
     }
     out
+}
+
+/// Compute bar label rects from the built groups list.  Thin wrapper over `menu_bar_layout_cats`.
+pub(crate) fn menu_bar_layout(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)]) -> Vec<(usize, Rect)> {
+    let cats: Vec<crate::registry::MenuCategory> = groups.iter().map(|g| g.0).collect();
+    menu_bar_layout_cats(area, &cats)
 }
 
 pub(crate) fn menu_dropdown_rect(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)], open: usize) -> Option<Rect> {
@@ -245,7 +254,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         return;
     }
 
-    let menu_rows = u16::from(editor.menu.is_some());
+    let menu_rows = editor.menu_bar_rows();
     let edit_height = h.saturating_sub(1 + menu_rows); // rows available for editing content
     let edit_top = area.y + menu_rows;
     let status_row = area.y + h - 1;
@@ -903,43 +912,53 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         }
     }
 
-    if let Some(ref menu) = editor.menu {
-        if !menu.groups.is_empty() {
-            let menu_area = Rect::new(area.x, area.y, w, h.saturating_sub(1));
-            // Full-width bar background: gaps between labels + the right side carry the
-            // Chrome style; the per-label paints below overwrite their own rects (A2).
-            let bar_row = Rect::new(area.x, area.y, w, 1);
-            frame.buffer_mut().set_style(bar_row, menu_closed_style);
-            // Paint the menu bar (one label per category)
-            let bar = menu_bar_layout(menu_area, &menu.groups);
-            for (i, rect) in &bar {
-                let cat = menu.groups[*i].0;
-                let label = crate::menu::category_label_pub(cat);
-                let text = format!(" {label} ");
-                let style = if *i == menu.open {
-                    menu_open_style
-                } else {
-                    menu_closed_style
-                };
-                frame.render_widget(Paragraph::new(text).style(style), *rect);
+    if editor.menu_bar_rows() == 1 {
+        let menu_area = Rect::new(area.x, area.y, w, h.saturating_sub(1));
+        // Full-width bar background: gaps between labels + the right side carry the
+        // Chrome style; the per-label paints below overwrite their own rects (A2).
+        let bar_row = Rect::new(area.x, area.y, w, 1);
+        frame.buffer_mut().set_style(bar_row, menu_closed_style);
+        match editor.menu {
+            Some(ref menu) if !menu.groups.is_empty() => {
+                // Paint the menu bar (one label per category)
+                let bar = menu_bar_layout(menu_area, &menu.groups);
+                for (i, rect) in &bar {
+                    let cat = menu.groups[*i].0;
+                    let label = crate::menu::category_label_pub(cat);
+                    let text = format!(" {label} ");
+                    let style = if *i == menu.open {
+                        menu_open_style
+                    } else {
+                        menu_closed_style
+                    };
+                    frame.render_widget(Paragraph::new(text).style(style), *rect);
+                }
+                // Paint the dropdown for the open category
+                if let Some(drop_rect) = menu_dropdown_rect(menu_area, &menu.groups, menu.open) {
+                    frame.render_widget(Clear, drop_rect);
+                    let leaves = &menu.groups[menu.open].1;
+                    let items: Vec<ListItem> = leaves
+                        .iter()
+                        .enumerate()
+                        .map(|(row, (label, _))| {
+                            let style = if row == menu.highlighted {
+                                menu_sel_style
+                            } else {
+                                menu_norm_style
+                            };
+                            ListItem::new(format!(" {label} ")).style(style)
+                        })
+                        .collect();
+                    frame.render_widget(List::new(items), drop_rect);
+                }
             }
-            // Paint the dropdown for the open category
-            if let Some(drop_rect) = menu_dropdown_rect(menu_area, &menu.groups, menu.open) {
-                frame.render_widget(Clear, drop_rect);
-                let leaves = &menu.groups[menu.open].1;
-                let items: Vec<ListItem> = leaves
-                    .iter()
-                    .enumerate()
-                    .map(|(row, (label, _))| {
-                        let style = if row == menu.highlighted {
-                            menu_sel_style
-                        } else {
-                            menu_norm_style
-                        };
-                        ListItem::new(format!(" {label} ")).style(style)
-                    })
-                    .collect();
-                frame.render_widget(List::new(items), drop_rect);
+            _ => {
+                // Inactive bar (pinned / auto-revealed / unbuilt placeholder): static
+                // labels, all closed-style, no dropdown, no highlight.
+                for (i, rect) in &menu_bar_layout_cats(menu_area, &crate::registry::MENU_ORDER) {
+                    let label = crate::menu::category_label_pub(crate::registry::MENU_ORDER[*i]);
+                    frame.render_widget(Paragraph::new(format!(" {label} ")).style(menu_closed_style), *rect);
+                }
             }
         }
     }
@@ -2257,6 +2276,30 @@ mod tests {
         crate::workspace::goto_scratch(&mut e);
         let s_scratch = crate::render::status_left_text(&e);
         assert!(s_scratch.contains("*scratch*"), "scratch buffer shows *scratch*: {s_scratch}");
+    }
+
+    // -----------------------------------------------------------------------
+    // A1 Task 2: inactive bar renders static labels in Pinned mode.
+    // -----------------------------------------------------------------------
+
+    /// Pinned mode + menu None → row 0 shows static labels (" File ", " Edit ", …)
+    /// in Chrome style; row 1 has no dropdown (contains the document text).
+    #[test]
+    fn render_paints_inactive_bar_labels() {
+        let mut e = Editor::new_from_text("hello\n", None, (40, 8));
+        e.menu_bar_mode = crate::config::MenuBarMode::Pinned;
+        e.menu = None;
+        derive::rebuild(&mut e);
+        let buf = render_to_buffer(&mut e, 40, 8);
+        let row0 = row_string(&buf, 0);
+        assert!(row0.contains(" File "),   "inactive bar must show ' File '");
+        assert!(row0.contains(" Edit "),   "inactive bar must show ' Edit '");
+        assert!(row0.contains(" Format "), "inactive bar must show ' Format '");
+        assert!(row0.contains(" View "),   "inactive bar must show ' View '");
+        assert!(row0.contains(" Export "), "inactive bar must show ' Export '");
+        // Row 1 must have the document text (not a dropdown).
+        let row1 = row_string(&buf, 1);
+        assert!(row1.contains("hello"), "row 1 must show document text, not a dropdown");
     }
 
     /// A2: with the menu open, row 0 is a solid bar — every cell styled Chrome (gaps +

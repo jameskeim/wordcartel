@@ -74,6 +74,18 @@ impl Harness {
 
     fn advance_ms(&mut self, ms: u64) { self.now = self.now.saturating_add(ms); }
     fn tick(&mut self) -> bool { self.step(Msg::Tick) }
+    fn mouse_move(&mut self, col: u16, row: u16) {
+        self.step(Msg::Input(Event::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: col, row, modifiers: KeyModifiers::NONE,
+        })));
+    }
+    fn mouse_down(&mut self, col: u16, row: u16) {
+        self.step(Msg::Input(Event::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col, row, modifiers: KeyModifiers::NONE,
+        })));
+    }
 
     // — state accessors —
     fn doc_text(&self) -> String { self.editor.active().document.buffer.to_string() }
@@ -200,4 +212,90 @@ fn e2e_fold_hides_body_in_render() {
     assert!(!h.folded().is_empty(), "Alt+Z must fold the heading");
     assert!(h.screen_contains("Head"), "the heading stays visible");
     assert!(!h.screen_contains("secret body line"), "the folded body must be hidden:\n{:#?}", h.screen());
+}
+
+// ---------------------------------------------------------------------------
+// A1 journeys 3 + 4: pinned mode and hidden mode dwell gate.
+// ---------------------------------------------------------------------------
+
+/// A1 journey 3: pinned — the bar is always there; Esc closes the dropdown ONLY.
+#[test]
+fn journey_pinned_bar_persists_across_dropdown_close() {
+    let mut h = Harness::new("hello world\n", None, (40, 8));
+    h.editor.menu_bar_mode = crate::config::MenuBarMode::Pinned;
+    h.tick(); // render with the mode applied
+    assert!(h.row(0).contains(" File "), "pinned bar visible before any menu use");
+    assert!(h.row(1).contains("hello"), "text shifted below the bar");
+    h.key(KeyCode::F(10));
+    assert!(h.editor.menu.is_some(), "F10 opens the dropdown");
+    h.key(KeyCode::Esc);
+    assert!(h.editor.menu.is_none(), "Esc closes the dropdown");
+    assert!(h.row(0).contains(" File "), "the bar PERSISTS after Esc (the state split)");
+}
+
+/// A1 journey 4: hidden — the dwell is mode-gated (non-vacuous form, spec M4).
+#[test]
+fn journey_hidden_never_reveals_on_dwell() {
+    let mut h = Harness::new("hello world\n", None, (40, 8));
+    h.editor.menu_bar_mode = crate::config::MenuBarMode::Hidden;
+    h.mouse_move(5, 0);
+    h.advance_ms(crate::mouse::MENU_DWELL_MS + 1);
+    h.tick();
+    assert!(!h.editor.mouse.menu_bar_revealed, "Hidden mode must never arm/reveal");
+    assert!(h.row(0).contains("hello"), "row 0 is still text");
+    h.key(KeyCode::F(10));
+    assert!(h.row(0).contains(" File "), "F10 still opens");
+    h.key(KeyCode::Esc);
+    assert!(h.row(0).contains("hello"), "Esc closes FULLY in hidden mode");
+}
+
+/// A1 journey 1: dwell-reveal (rest), grace-hide (leave), and grace-cancel (return).
+#[test]
+fn journey_auto_dwell_reveal_and_grace_hide() {
+    let mut h = Harness::new("hello world\n", None, (40, 8));
+    // default mode is Auto; row 0 is text while unrevealed
+    assert!(h.row(0).contains("hello"));
+    h.mouse_move(5, 0);
+    h.advance_ms(crate::mouse::MENU_DWELL_MS + 1);
+    h.tick();
+    assert!(h.row(0).contains(" File "), "bar revealed after the dwell");
+    assert!(h.row(1).contains("hello"), "text reserved down one row");
+    // leave: grace, not instant
+    h.mouse_move(5, 5);
+    assert!(h.row(0).contains(" File "), "still revealed during the grace");
+    h.advance_ms(crate::mouse::MENU_LEAVE_GRACE_MS + 1);
+    h.tick();
+    assert!(h.row(0).contains("hello"), "hidden after the grace; text back on row 0");
+    // reveal again, then leave-and-return WITHIN the grace: the bar survives
+    h.mouse_move(5, 0);
+    h.advance_ms(crate::mouse::MENU_DWELL_MS + 1);
+    h.tick();
+    h.mouse_move(5, 5);
+    h.advance_ms(100); // < grace
+    h.mouse_move(5, 0);
+    h.advance_ms(crate::mouse::MENU_LEAVE_GRACE_MS + 1);
+    h.tick();
+    assert!(h.row(0).contains(" File "), "return within the grace keeps the bar");
+}
+
+/// A1 journey 2: a drag across row 0 never arms the dwell.
+#[test]
+fn journey_drag_never_reveals() {
+    let mut h = Harness::new("hello world\nmore text here\n", None, (40, 8));
+    h.mouse_down(2, 1);            // start a text drag (dragging = true)
+    h.mouse_move(2, 0);            // motion onto row 0 mid-drag
+    h.advance_ms(crate::mouse::MENU_DWELL_MS + 10);
+    h.tick();
+    assert!(!h.editor.mouse.menu_bar_revealed, "drag must not arm the dwell");
+    assert!(h.row(0).contains("hello"), "row 0 stays text");
+}
+
+/// A1 journey 5: a row-0 click while unrevealed is a TEXT click.
+#[test]
+fn journey_row0_click_unrevealed_edits_text() {
+    let mut h = Harness::new("hello world\n", None, (40, 8));
+    h.mouse_down(4, 0);
+    assert!(h.editor.menu.is_none(), "no menu opened");
+    assert_eq!(h.editor.active().document.selection.primary().head, 4,
+        "the click placed the caret in the text");
 }

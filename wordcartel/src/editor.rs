@@ -333,6 +333,14 @@ pub struct MouseState {
     pub scrollbar_until_ms: u64,
     /// Whether the scrollbar overlay is currently visible.
     pub scrollbar_visible: bool,
+    /// Deadline (ms) at which the auto-mode menu bar reveals (armed by a pointer
+    /// dwell on row 0; re-armed on every row-0 motion — reveal fires after REST).
+    pub menu_reveal_due: Option<u64>,
+    /// Deadline (ms) at which a revealed auto-mode bar hides (armed ONCE on the
+    /// first pointer-leave; cancelled by re-entering row 0 — the leave grace).
+    pub menu_hide_due: Option<u64>,
+    /// Whether the auto-mode bar is currently revealed (meaningless in other modes).
+    pub menu_bar_revealed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -375,6 +383,10 @@ pub struct Editor {
     /// Whether mouse capture is currently requested (toggled by `toggle_mouse_capture`).
     /// Seeded from config at startup; defaults to `true` in test/scratch contexts.
     pub mouse_capture: bool,
+    /// Menu bar visibility mode (seeded from `[menu] bar`; mutated only by menu_bar_pin).
+    pub menu_bar_mode: crate::config::MenuBarMode,
+    /// The mode menu_bar_pin restores on unpin (registry handlers cannot see Config).
+    pub menu_bar_unpinned_mode: crate::config::MenuBarMode,
     /// Transient mouse gesture state; cleared by `reconcile_mouse_capture` on disable.
     pub mouse: MouseState,
     /// View/focus/writing-experience flags. Seeded from config; toggled by the 5 toggle_ commands.
@@ -442,6 +454,8 @@ impl Editor {
             palette: None,
             menu: None,
             mouse_capture: true,
+            menu_bar_mode: crate::config::MenuBarMode::Auto,
+            menu_bar_unpinned_mode: crate::config::MenuBarMode::Auto,
             mouse: MouseState::default(),
             view_opts: crate::config::ViewConfig::default(),
             search: None,
@@ -498,6 +512,19 @@ impl Editor {
     pub fn by_id_mut(&mut self, id: BufferId) -> Option<&mut Buffer> { self.buffers.iter_mut().find(|b| b.id == id) }
     /// Allocate a fresh, never-reused BufferId.
     pub fn alloc_id(&mut self) -> BufferId { let id = BufferId(self.next_buffer_id); self.next_buffer_id += 1; id }
+
+    /// Rows reserved by the menu bar at the top of the frame (0 or 1). THE single
+    /// source of row-0 geometry truth — render/mouse/nav read this, never
+    /// `menu.is_some()` directly (the dropdown-open checks in overlay routing are
+    /// the deliberate exception: they mean "dropdown open", not geometry).
+    pub fn menu_bar_rows(&self) -> u16 {
+        let bar = match self.menu_bar_mode {
+            crate::config::MenuBarMode::Pinned => true,
+            crate::config::MenuBarMode::Auto => self.mouse.menu_bar_revealed,
+            crate::config::MenuBarMode::Hidden => false,
+        };
+        u16::from(bar || self.menu.is_some())
+    }
 
     /// Effort 6: create the permanent *scratch* buffer and record its id.
     /// Appended AFTER the launch buffer so the launch buffer stays at index 0
@@ -1262,5 +1289,21 @@ mod tests {
         e.active_mut().document.version += 1;
         e.note_undo_eviction(BufferId(id.0.wrapping_add(999)), v); // id mismatch → switch
         assert_ne!(e.status, UNDO_EVICTED_HINT, "id mismatch (switch) → no hint");
+    }
+
+    #[test]
+    fn menu_bar_rows_truth_table() {
+        use crate::config::MenuBarMode as M;
+        let mut e = Editor::new_from_text("x\n", None, (20, 6));
+        for (mode, revealed, open, want) in [
+            (M::Hidden, false, false, 0u16), (M::Hidden, true, false, 0), (M::Hidden, false, true, 1),
+            (M::Auto, false, false, 0), (M::Auto, true, false, 1), (M::Auto, false, true, 1),
+            (M::Pinned, false, false, 1), (M::Pinned, true, true, 1),
+        ] {
+            e.menu_bar_mode = mode;
+            e.mouse.menu_bar_revealed = revealed;
+            e.menu = if open { Some(crate::menu::empty()) } else { None };
+            assert_eq!(e.menu_bar_rows(), want, "mode={mode:?} revealed={revealed} open={open}");
+        }
     }
 }
