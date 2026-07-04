@@ -147,7 +147,7 @@ use crate::app::Msg;
 use wordcartel_core::history::Clock;
 ```
 
-In lib.rs, add `pub mod prompts;` immediately after the existing `pub mod prompt;` line (lib.rs:12).
+In lib.rs, add `pub mod prompts;` immediately after the existing `pub mod prompt;` line (lib.rs:13).
 
 - [ ] **Step 2: cut the production span.** One contiguous cut, branch-base app.rs **:530-:767** (238 lines — locate by the doc line `/// Execute the action chosen in a modal prompt…` at :530; NOTE this stray doc semantically describes `resolve_prompt` but is physically attached to `open_save_as` — it moves verbatim, do NOT relocate or reword it): `open_save_as` (doc :530-:531), `expand_path` (doc :539-:540), `save_as_submit` (doc :549-:550), `block_write_submit` (doc :572-:574), `perform_block_write`, `perform_save_as`, `request_new` (doc :608), `resolve_prompt` (no doc; its :641/:653 `crate::jobs_apply::drive_quit_drain` calls were rewritten in Task 1 and move as-is), `submit_filter_line` (doc :723-:727), `goto_line_submit` (doc :749-:750).
 
