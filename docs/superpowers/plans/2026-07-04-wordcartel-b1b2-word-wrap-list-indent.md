@@ -177,7 +177,7 @@ And the `use` line at the top of layout.rs's import block: none needed (the help
 
     #[test]
     fn word_wrap_long_url_falls_back() {
-        // One unbroken URL token: no interior opportunity — grapheme fallback rows.
+        // A long URL token: rows must fit regardless of what break points UAX #14 exposes.
         let (rows, _) = layout("https://example.com/aaaa", BlockRole::Paragraph, false, 8, false);
         assert!(rows.len() >= 3);
         assert!(rows.iter().all(|r| r.width <= 8));
@@ -607,10 +607,8 @@ break at VG 6 (`b`) → row 1 = `beta` at cols 4-7.)
   committing. Run multi-test filters as separate invocations (cargo test takes one
   positional filter).
 - Spec-coverage delegations (Fable plan M-4): the long-URL fallback and a layout-level
-  CJK mixed-script wrap pin ride in Task 1's unit tests (add
-  `word_wrap_long_url_falls_back` and `word_wrap_cjk_mixed_script` as two more cases in
-  Step 6, same shape as the existing five — the implementer derives expectations from
-  the helper's probe-verified vectors); ship-time bookkeeping (backlog B1+B2 SHIPPED
+  CJK mixed-script wrap pin are PRESENT in Task 1 Step 6
+  (`word_wrap_long_url_falls_back`, `word_wrap_cjk_mixed_script`); ship-time bookkeeping (backlog B1+B2 SHIPPED
   entries incl. the CodeBlock exception and the unicode-linebreak dependency/wart notes,
   memory working-order advance) is the CONTROLLER's merge-time step, not a task.
 - The spec's "unchanged" pins really unchanged: `active_line_identity_and_wrap`, both nav wrap tests, `wrapped_list_item_continuation_row_aligns_text_and_caret`, derive's two, the four md_parse unindented list tests, `markerless_listitem_continuation_keeps_indent_no_glyph`.
