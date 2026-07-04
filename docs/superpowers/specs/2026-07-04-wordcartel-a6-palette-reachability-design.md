@@ -1,6 +1,6 @@
 # A6: overlay list reachability — windowed scrolling for palette + siblings — design
 
-**Status:** Codex round 1 folded (fb Enter hazard named; buffer-switcher coverage explicit; the deliberate area read); re-verify pending
+**Status:** Codex rounds 1-2 folded (r2 caught a silently-failed fold + the render area-source wording + the :1388 anchor); re-verify pending
 **Date:** 2026-07-04
 **Effort:** a6-palette-reachability — slot 1 of the recorded working order (`docs/ux-backlog.md`).
 User decisions: scope = ALL FOUR diseased overlays (fork 1 = B); wheel moves the SELECTION
@@ -14,7 +14,7 @@ struct has no scroll state (palette.rs:19-28), render slices only the first
 :150-159), while Up/Down move `selected` over the FULL row set (app.rs:1240-1249). Past the
 window the highlight VANISHES (ratatui gets a window-relative-impossible index) and **Enter
 still dispatches the invisible selection** — a silent-wrong-action hazard shared by the
-palette (app.rs:1225-1226 reads the absolute index) AND the file browser (app.rs:1387,
+palette (app.rs:1225-1226 reads the absolute index) AND the file browser (app.rs:1388,
 `fb.entries.get(fb.selected)` — Codex round 1: the identical hazard, named explicitly; the
 outline's is partially pre-empted by its opened_version guard but live for fresh documents). PgUp/PgDn/Home/End are consumed by the wildcard arm (:1287) and
 do nothing. The palette mouse block returns early for ALL events (mouse.rs:122-145) — wheel
@@ -102,9 +102,11 @@ file browser :1421-1428; outline :1648-1657):
   (app.rs:1086-1091) on every selection-changing path — the previewed theme is always the
   visibly-highlighted one.
 - `list_h` inside key handlers derives from `list_h_for(rows.len(), area_h)` where
-  `area_h` is read from **`editor.active().view.area`** — the SAME source render (:720) and
-  mouse (:120) use. **The overlay key blocks read no area today (Codex round 1) — this read
-  is a deliberate addition**, giving key handlers the same numbers render will use that frame.
+  `area_h` is read from **`editor.active().view.area`** — the same source MOUSE uses
+  (mouse.rs:120). Render reads `frame.area()` (render.rs:241), a different SOURCE carrying
+  the same dimensions (`view.area` is updated on every Resize event) — Codex round 2
+  wording fix. **The overlay key blocks read no area today (Codex round 1) — this read is a
+  deliberate addition**, giving key handlers the same numbers render will use that frame.
 - Enter semantics UNCHANGED (absolute `rows.get(selected)`) — safe by the always-visible
   invariant. Outline's `opened_version` guard (app.rs:1660-1667) untouched.
 
@@ -154,7 +156,11 @@ file browser :1421-1428; outline :1648-1657):
   (c) PgDn/PgUp/Home/End land where specified; (d) a filter change re-clamps selection AND
   window; (e) ThemePicker: after Down past the window, the PREVIEWED theme equals the
   visibly-highlighted row (fails today once >15 themes — pin with an artificially extended
-  row list, not by adding themes); (f) FileBrowser/Outline equivalents of (a)-(c).
+  row list, not by adding themes); (f) FileBrowser/Outline equivalents of (a)-(c),
+  INCLUDING the file browser's own Enter-dispatches-visible hazard pin (its absolute read at
+  app.rs:1388); (g) a `PaletteKind::Buffers` scroll case — the buffer switcher
+  (editor.rs:687, kind set :708) rides the same palette windowing; make the coverage
+  explicit, not accidental (Codex round 1).
 - **Unit — mouse:** the adjusted visible-click test + the new scrolled-click test; wheel
   moves selection and the window follows (palette, theme picker, file browser).
 - **Render:** a scrolled palette shows `rows[scroll_top..]` content (assert a row string at
