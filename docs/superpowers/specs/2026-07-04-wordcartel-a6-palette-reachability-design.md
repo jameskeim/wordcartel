@@ -1,6 +1,6 @@
 # A6: overlay list reachability — windowed scrolling for palette + siblings — design
 
-**Status:** Codex rounds 1-2 folded (r2 caught a silently-failed fold + the render area-source wording + the :1388 anchor); re-verify pending
+**Status:** Codex spec-review CLEAN (x3); Fable5 pass pending
 **Date:** 2026-07-04
 **Effort:** a6-palette-reachability — slot 1 of the recorded working order (`docs/ux-backlog.md`).
 User decisions: scope = ALL FOUR diseased overlays (fork 1 = B); wheel moves the SELECTION
