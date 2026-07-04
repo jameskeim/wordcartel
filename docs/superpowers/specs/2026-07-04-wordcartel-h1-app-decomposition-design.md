@@ -131,10 +131,12 @@ the search_ui seam, which moves); `reduce` (:1114, ~900 lines); `step`/`SystemCl
 
 **The rule:** a test moves with the module whose functions it calls **directly**; a test
 that reaches the moved code only through `reduce(...)` stays in app.rs — it is a reducer
-test regardless of which seam it exercises. **The spanner exception (Codex r1,
-generalized per Fable I1): any test that directly calls functions of TWO OR MORE
-extracted modules stays in app.rs as a flow-integration test, with path rewrites as its
-only edit.** Known members: the quit-drain family — its tests directly call
+test regardless of which seam it exercises. **The spanner exception (Codex r1 + Fable
+I1/N1, two-pronged): (a) the QUIT-DRAIN FAMILY stays in app.rs IN ITS ENTIRETY —
+enumerated below, including its members that direct-call only prompts fns; (b) outside
+that family, any test that directly calls functions of TWO OR MORE extracted modules
+stays in app.rs as a flow-integration test. Stayers get path rewrites as their only
+edit.** The quit-drain family's direct calls:
 `resolve_prompt` (app.rs:3087/:3114/:3117/:3139/:3174/:3196), `apply_job_outcome`
 (:3093/:3175), and `save_as_submit` (:3201; Codex-enumerated — the plan's per-test
 pass remains the authoritative rewrite checklist) — plus the two Fable-found spanners
@@ -153,8 +155,8 @@ fns get path rewrites as their only edit.
 
 **No helper promotion (user decision 2026-07-04, on Fable I2).** The shared test
 helpers — `cua_keymap()` (:2565), `quit_tmp()` (:3050), `f10()` (:2598), `build_km()`
-(:5289) — and the `static SEQ: AtomicU32` (:2563, used directly by six tests, not only
-by `quit_tmp`) all STAY in `app.rs::tests`: Fable I2 intersected every helper-use line
+(:5289) — and the `static SEQ: AtomicU32` (:2563; six use sites — five tests at :2997/
+:3614/:3665/:3712/:3755 plus the `quit_tmp` body :3053) all STAY in `app.rs::tests`: Fable I2 intersected every helper-use line
 (92 of them) against the tests that move under the rule above — zero overlap; every
 consumer is a reduce-driven, quit-drain, or spanner test that stays. Moving tests need
 only `TestClock`/std (already in test_support.rs). If a future effort moves a test that
@@ -168,11 +170,14 @@ no test may be weakened, deleted, or have assertions altered — renamed imports
 
 - **One commit per module extraction**, in dependency order: (1) `jobs_apply.rs`,
   (2) `session_restore.rs`, (3) `prompts.rs` (its `resolve_prompt` needs jobs_apply
-  already in place), (4) `search_ui.rs`, (5) a final polish commit: the four editor.rs
+  already in place), (4) `search_ui.rs`, (5) a final polish commit: the
   doc-comment references to moved fns gain the new module names — editor.rs:26
   (`drive_quit_drain`)/:34/:363/:418/:429, workspace.rs:206/:216 (`open_into_current`),
-  transform.rs:99 (`resolve_prompt`) and :139 ("`apply_transform_done` in app.rs")
-  (Codex r1 + Fable M2; criterion: any comment naming a moved fn or its app.rs home), lib.rs `mod` ordering matches its existing grouping,
+  transform.rs:99 (`resolve_prompt`) and :139 ("`apply_transform_done` in app.rs"),
+  editor.rs:430 (`apply_job_result`), editor.rs:642 (`diag_apply_selected`),
+  reconcile.rs:130/:132 (`apply_panic`), save.rs:61 (`perform_save_as`), and the
+  residual app.rs:23 section header ("Msg, apply_result, reduce" — goes stale)
+  (Codex r1 + Fable M2/N3; criterion: any comment naming a moved fn or its app.rs home), lib.rs `mod` ordering matches its existing grouping,
   and the backlog/ledger bookkeeping. Blame recovery is `git blame -C -C` (a split is a
   content copy, not a rename; `--follow` alone won't track it — the backlog line
   claiming otherwise is corrected at ship time).
