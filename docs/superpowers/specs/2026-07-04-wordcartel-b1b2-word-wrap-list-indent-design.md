@@ -1,6 +1,8 @@
 # B1+B2 — word-boundary wrap + nested-list indent (one document-text-rendering effort)
 
-**Status:** draft — pending Codex + Fable spec review
+**Status:** CLEAN — Codex spec review ×3 (r3 CLEAN) + Fable5 ×2 (r2 READY; its r1 included
+an EMPIRICAL probe of the vendored unicode-linebreak crate — the C1/I1/I2 findings rest on
+compiled-and-run evidence, not reading), 2026-07-04.
 **Effort:** B1 (word-boundary wrap, `Larger`) + B2 (sub-list bullet indent + hanging indent,
 `Medium-small`) — **combined by user decision 2026-07-04**: document text rendering updates
 in one effort, not two.
@@ -199,8 +201,8 @@ property being tested):**
   and the break lands at the current VG, reproducing today's rows byte-identically);
   keep it as a pin that word wrap preserves this geometry.
 - nav.rs `typewriter_rows_prefix_aware` (:1487, `"- \taaaa"` @ 8 — MISSING from the
-  original enumeration, Fable M6): assertions survive (2 rows before and after; the tab
-  hangs and the break follows it) but its doc-comment column arithmetic (:1484-1485)
+  original enumeration, Fable M6): assertions survive (2 rows before and after; the break
+  follows the tab) but its doc-comment column arithmetic (:1484-1485)
   goes stale — update the comment.
 - nav.rs `screen_pos_wrapped_line_second_visual_row` (:1097) and
   `caret_in_tall_wrapped_line_stays_visible` (:1112): no break opportunities in their
