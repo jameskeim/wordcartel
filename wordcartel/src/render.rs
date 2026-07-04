@@ -906,6 +906,10 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     if let Some(ref menu) = editor.menu {
         if !menu.groups.is_empty() {
             let menu_area = Rect::new(area.x, area.y, w, h.saturating_sub(1));
+            // Full-width bar background: gaps between labels + the right side carry the
+            // Chrome style; the per-label paints below overwrite their own rects (A2).
+            let bar_row = Rect::new(area.x, area.y, w, 1);
+            frame.buffer_mut().set_style(bar_row, menu_closed_style);
             // Paint the menu bar (one label per category)
             let bar = menu_bar_layout(menu_area, &menu.groups);
             for (i, rect) in &bar {
@@ -1133,7 +1137,7 @@ mod tests {
         assert_ne!(x, "Find: ".len() + s.needle.len(), "char count must differ from byte count for multibyte input");
     }
 
-    /// Row 0 of a heading with caret on a later line must show "Title" (concealed "# ").
+    /// Row 0 of a heading with caret on a later line must show "█ Title" (shade prefix + concealed "# ").
     #[test]
     fn renders_concealed_heading_and_cursor_on_active_line() {
         let mut e = Editor::new_from_text("# Title\n\nbody\n", None, (20, 6));
@@ -1142,9 +1146,23 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(20, 6)).unwrap();
         term.draw(|f| render(f, &mut e)).unwrap();
         let buf = term.backend().buffer();
-        // row 0 shows "Title" (concealed "# "), not "# Title"
+        // row 0 shows "█ Title" (shade prefix + concealed "# "), not "Title"
         let row0: String = (0u16..20).map(|x| buf[(x, 0u16)].symbol().chars().next().unwrap_or(' ')).collect();
-        assert!(row0.starts_with("Title"), "expected 'Title...' got {:?}", row0);
+        assert!(row0.starts_with("█ Title"), "expected '█ Title...' got {:?}", row0);
+    }
+
+    /// The flipped default: colored themes now render the heading shade ramp (B3).
+    #[test]
+    fn default_theme_renders_heading_shade_prefix() {
+        let mut e = Editor::new_from_text("# One\n\n## Two\n\nbody\n", None, (20, 8));
+        set_caret(&mut e, 15); // byte 15 = the 'b' of "body" (Codex-verified) — both headings inactive
+        derive::rebuild(&mut e);
+        let mut term = Terminal::new(TestBackend::new(20, 8)).unwrap();
+        term.draw(|f| render(f, &mut e)).unwrap();
+        let buf = term.backend().buffer();
+        let row = |y: u16| -> String { (0u16..20).map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' ')).collect() };
+        assert!(row(0).starts_with("█ One"), "H1 shade: got {:?}", row(0));
+        assert!(row(2).starts_with("▓ Two"), "H2 shade: got {:?}", row(2));
     }
 
     /// `style_to_ratatui(Style::Strong)` must have BOLD modifier.
@@ -2239,5 +2257,28 @@ mod tests {
         crate::workspace::goto_scratch(&mut e);
         let s_scratch = crate::render::status_left_text(&e);
         assert!(s_scratch.contains("*scratch*"), "scratch buffer shows *scratch*: {s_scratch}");
+    }
+
+    /// A2: with the menu open, row 0 is a solid bar — every cell styled Chrome (gaps +
+    /// right side) or ChromeSelected (the open label); no cell keeps the base background.
+    #[test]
+    fn menu_bar_row_is_filled_full_width() {
+        let mut e = Editor::new_from_text("body\n", None, (40, 8));
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        e.menu = Some(crate::menu::build(&reg, &km));
+        derive::rebuild(&mut e);
+        let mut term = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        term.draw(|f| render(f, &mut e)).unwrap();
+        let buf = term.backend().buffer();
+        let chrome = compose::compose(&e.theme, e.depth, &[SE::Chrome]).bg;
+        let selected = compose::compose(&e.theme, e.depth, &[SE::ChromeSelected]).bg;
+        for x in 0u16..40 {
+            let bg = buf[(x, 0u16)].style().bg;
+            assert!(bg == chrome || bg == selected,
+                "row-0 cell {x} not bar-styled: {bg:?} (chrome={chrome:?}, selected={selected:?})");
+        }
+        // And the RIGHT EDGE specifically is Chrome (it is unpainted today — this fails pre-fix).
+        assert_eq!(buf[(39u16, 0u16)].style().bg, chrome, "right edge must carry the Chrome fill");
     }
 }

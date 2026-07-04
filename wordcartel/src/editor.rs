@@ -383,6 +383,8 @@ pub struct Editor {
     pub search: Option<crate::search_overlay::SearchState>,
     /// Diagnostics configuration. Seeded from config at startup.
     pub diag_cfg: crate::config::DiagnosticsConfig,
+    /// Export configuration (pdf engine, typography). Seeded from config at startup.
+    pub export_cfg: crate::config::ExportConfig,
     /// Personal dictionary loaded from `diag_cfg.dictionary` at startup.
     pub dictionary: std::collections::HashSet<String>,
     /// Session-level words to ignore (added via ignore-word command).
@@ -444,6 +446,7 @@ impl Editor {
             view_opts: crate::config::ViewConfig::default(),
             search: None,
             diag_cfg: crate::config::DiagnosticsConfig::default(),
+            export_cfg: crate::config::ExportConfig::default(),
             dictionary: std::collections::HashSet::new(),
             session_ignores: std::collections::HashSet::new(),
             diag: None,
