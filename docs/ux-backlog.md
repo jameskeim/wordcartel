@@ -39,7 +39,7 @@ keyboard path (the palette guarantee makes this cheap to honor).
 
 ## Theme A — command-surface architecture
 
-### A1. Menu bar states + mouse reveal — `settled-design` · Medium
+### A1. Menu bar states + mouse reveal — `SHIPPED` 2026-07-04 (7273327) — hidden|auto|pinned, dwell+grace, click-to-open, menu_bar_pin; ALSO fixed the pre-existing nav menu-row geometry bug
 
 **Facts:** F10 is the only activation (`keymap.rs:243`); the menu opens straight to
 pulled-down (first dropdown visible — `menu::empty()` + hydrate, `app.rs:824-826`); there is
