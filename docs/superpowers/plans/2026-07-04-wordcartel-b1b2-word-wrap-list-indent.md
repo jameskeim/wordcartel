@@ -176,6 +176,25 @@ And the `use` line at the top of layout.rs's import block: none needed (the help
     }
 
     #[test]
+    fn word_wrap_repeat_zero_width_head_no_overwide_row() {
+        // Probe-confirmed spec-D2 repeat case: a zero-width head means the tail
+        // re-place frees ZERO columns — the current VG must wrap again, never
+        // producing an over-wide multi-grapheme row (Law 3).
+        let (rows, _) = layout("\u{200b}ab", BlockRole::Paragraph, false, 1, false);
+        assert!(rows.iter().all(|r| r.width <= 1 || r.display.chars().count() == 1),
+            "no over-wide multi-grapheme row: {rows:?}");
+    }
+
+    #[test]
+    fn word_wrap_codeblock_space_wraps_not_hangs() {
+        // CodeBlock: the hang rule is OFF — a space at the edge wraps greedily,
+        // byte-identical to today (spec D2 as amended).
+        let (rows, _) = layout("abcd x", BlockRole::CodeBlock, false, 4, false);
+        assert_eq!(rows[0].display, "abcd");
+        assert_eq!(rows[1].display, " x");
+    }
+
+    #[test]
     fn word_wrap_break_at_row_start_falls_back() {
         // The only opportunity coincides with the row start (guard row_start_vg < break):
         // " abcdefgh" at vw 4 — opportunity at VG 1 only; rows after the first break
@@ -187,7 +206,7 @@ And the `use` line at the top of layout.rs's import block: none needed (the help
 
 - [ ] **Step 7: run to verify RED.** `cargo test -p wordcartel-core word_wrap` — the space-break, break-at-row-start (and possibly others) fail against the greedy loop (`hello wi`/`de`; CodeBlock is identical today so that one may pass — confirm which fail and record it).
 
-- [ ] **Step 8: rework the loop.** Replace layout.rs:260-292 (quoted in full in the spec and below as modified) with:
+- [ ] **Step 8: rework the loop.** Replace layout.rs:260-294 — through and INCLUDING the existing `row_end_col.push(col); let rows = row + 1;` tail, which the snippet re-supplies (Fable plan M-1: stopping at :292 duplicates those two lines) — with:
 
 ```rust
     // Word-boundary soft-wrap (UAX #14; spec D1/D2). CodeBlock keeps grapheme wrap.
@@ -209,7 +228,15 @@ And the `use` line at the top of layout.rs's import block: none needed (the help
             continue;
         }
         let is_ws = vg.text == " " || vg.text == "\t";
-        if !is_ws && col + vg.width > vw && col > prefix_width {
+        // The hang rule is scoped OFF for CodeBlock (spec D2 as amended: in code a
+        // space/tab is data — byte-identical wrap preserved).
+        let hang = is_ws && !matches!(role, BlockRole::CodeBlock);
+        // The overflow decision REPEATS until the current VG fits (spec D2 as amended,
+        // user-ratified from a probe-confirmed Fable Critical): a tail re-placement can
+        // leave the current VG still over-wide (zero-width head; no-break-before tail).
+        // Each pass either advances the break point strictly or falls back at the row
+        // start, where the single-grapheme guard ends the loop — termination guaranteed.
+        while !hang && col + vg.width > vw && col > prefix_width {
             // Largest legal break k with row_start_vg < k <= i (breaks is ascending):
             // stateless O(log n) lookup — a per-row cursor that resets on re-placement
             // silently DROPS breaks between the chosen one and i (a W1 violation).
@@ -280,7 +307,7 @@ Notes the implementer must honor: whitespace VGs (`is_ws`) bypass the overflow t
 
 Add law W1 as a new proptest beside it (over the same strategy), asserting for every non-CodeBlock row boundary with first VG index `j`: `breaks.contains(&j) || !breaks.iter().any(|&k| row_start < k && k <= j)` — recompute `breaks` in the test via `visible_break_indices` on the laid-out line's VG texts (expose the VG texts by re-deriving them from `map.placed` in row order: their `text` fields ARE the VG texts). Extend `token()` (layout.rs:715-736) with the bare combining-mark token `Just("\u{301}".to_string())` (spec C1).
 
-- [ ] **Step 11: verify the neighbors.** Run the full core suite plus: `cargo test -p wordcartel screen_pos_wrapped_line_second_visual_row caret_in_tall_wrapped_line_stays_visible long_line_wraps_at_small_width rebuild_fills_editing_rows` — ALL must pass UNCHANGED (their corpora have no break opportunities; if one fails, STOP — that is a real geometry bug, not a test to update). Then the full gates.
+- [ ] **Step 11: verify the neighbors.** Run the full core suite plus: each of `cargo test -p wordcartel screen_pos_wrapped_line_second_visual_row`, `… caret_in_tall_wrapped_line_stays_visible`, `… long_line_wraps_at_small_width`, `… rebuild_fills_editing_rows` (separate runs — cargo test takes one positional filter; Fable plan M-3) — ALL must pass UNCHANGED (their corpora have no break opportunities; if one fails, STOP — that is a real geometry bug, not a test to update). Then the full gates.
 
 - [ ] **Step 12: commit** — `feat(b1): word-boundary wrap — UAX #14 break engine, whitespace hang, grapheme fallback, CodeBlock exemption; Law 3 composable + W1`.
 
@@ -406,7 +433,7 @@ Add law W1 as a new proptest beside it (over the same strategy), asserting for e
             let (rows, map) = layout(line, BlockRole::ListItem, false, 20, false);
             assert_eq!(map.prefix_width, indent_w + marker_w, "{line:?}");
             assert!(map.placed.iter().all(|p| p.col >= map.prefix_width), "{line:?}");
-            assert_eq!(rows[0].prefix_glyph.as_deref().map(|g| g.len() > 0), Some(true));
+            assert_eq!(rows[0].prefix_glyph.as_deref().map(|g| !g.is_empty()), Some(true));
         }
     }
 ```
@@ -541,7 +568,10 @@ break at VG 6 (`b`) → row 1 = `beta` at cols 4-7.)
 
 - [ ] **Step 5: e2e journeys** (e2e.rs, Harness idiom):
   - `journey_typing_never_breaks_midword`: open a narrow-width doc, type `the quick brown fox jumps over` past the edge → assert via `screen_contains` that no rendered row ends mid-word (check the specific expected rows), caret visible; End/Home/up/down navigate across the wrap without panic and land where `screen_pos` says.
-  - `journey_nested_list_wraps_hanging`: type `  - ` then enough words to wrap → bullet at indent col, continuation under text (assert the two specific expected screen rows).
+  - `journey_nested_list_wraps_hanging`: type `  - ` then enough words to wrap, THEN
+    move the caret off the item line (Enter or Down — the ACTIVE line renders raw with
+    no glyph, Fable plan I-2) → bullet at indent col, continuation under text (assert
+    the two specific expected screen rows).
 
 - [ ] **Step 6: the stale comment.** nav.rs:1484-1485 (`typewriter_rows_prefix_aware`'s doc comment): update its column arithmetic to the new geometry (the break follows the tab; assertions themselves survive — spec M6). Verify that test passes unmodified apart from the comment.
 
@@ -553,7 +583,20 @@ break at VG 6 (`b`) → row 1 = `beta` at cols 4-7.)
 
 ## Verification appendix (final whole-branch review charge)
 
-- Laws: 3 (composable form), 4, 5, W1, W2 all green under the extended strategy (bare `\u{301}` token present); run the law suite with a raised case count once (`PROPTEST_CASES=2048 cargo test -p wordcartel-core law_ w1 w2 -- --nocapture` or the suite's env idiom) and quote the result.
+- Laws: 3 (composable form), 4, 5, W1 (test name MUST contain `law_w1`), W2 all green
+  under the extended strategy (bare `\u{301}` token present). For the raised-count run:
+  the suite pins `cases: 512` in `proptest_config` (layout.rs:752-755), which OVERRIDES
+  the env var (Fable plan M-3) — temporarily edit the config to 2048, run
+  `cargo test -p wordcartel-core law_`, quote the result, and REVERT the edit before
+  committing. Run multi-test filters as separate invocations (cargo test takes one
+  positional filter).
+- Spec-coverage delegations (Fable plan M-4): the long-URL fallback and a layout-level
+  CJK mixed-script wrap pin ride in Task 1's unit tests (add
+  `word_wrap_long_url_falls_back` and `word_wrap_cjk_mixed_script` as two more cases in
+  Step 6, same shape as the existing five — the implementer derives expectations from
+  the helper's probe-verified vectors); ship-time bookkeeping (backlog B1+B2 SHIPPED
+  entries incl. the CodeBlock exception and the unicode-linebreak dependency/wart notes,
+  memory working-order advance) is the CONTROLLER's merge-time step, not a task.
 - The spec's "unchanged" pins really unchanged: `active_line_identity_and_wrap`, both nav wrap tests, `wrapped_list_item_continuation_row_aligns_text_and_caret`, derive's two, the four md_parse unindented list tests, `markerless_listitem_continuation_keeps_indent_no_glyph`.
 - Hot path: no new work on lines that don't overflow beyond the linebreaks pass + concat (O(visible)); LayoutKey cache untouched.
 - Grep: no `#[allow]` added; no `unsafe`; `unicode-linebreak` appears only in wordcartel-core.

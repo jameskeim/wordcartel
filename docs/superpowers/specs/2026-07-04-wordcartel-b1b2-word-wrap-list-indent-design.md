@@ -74,10 +74,13 @@ State added to the loop: `row_start_vg` (index of the first VG on the current ro
 `last_break` (the most recent legal break index ≤ current VG, maintained by advancing a
 cursor over the D1 vector — O(1) amortized). The overflow branch becomes:
 
-- **Whitespace never triggers a wrap.** If the current VG's text is ASCII space or tab, it
-  is placed at the current col even when `col + width > vw` — trailing whitespace hangs
-  past the edge (standard word-processor behavior; a continuation row never starts with
-  the space the user just typed). Law 3 is amended accordingly (see Invariants).
+- **Whitespace never triggers a wrap — except in CodeBlock lines** (Fable plan review:
+  the unscoped rule contradicted this spec's own "CodeBlock byte-identical" claim; in
+  code, a space/tab is data and wraps greedily like any grapheme). Elsewhere: if the
+  current VG's text is ASCII space or tab, it is placed at the current col even when
+  `col + width > vw` — trailing whitespace hangs past the edge (standard word-processor
+  behavior; a continuation row never starts with the space the user just typed). Law 3
+  is amended accordingly (see Invariants).
   **Cursor rule for hung cells (Codex r1): rows paint into a clipped Rect of
   `text_width` (render.rs) and the terminal cursor is set at `text_left + col`
   (render.rs:717) — a caret logically on/after a hung whitespace cell would paint outside
@@ -104,7 +107,16 @@ cursor over the D1 vector — O(1) amortized). The overflow branch becomes:
     to the existing grapheme break (the current VG opens the new row). The existing
     single-grapheme guard (`col > prefix_width`) is unchanged — a grapheme wider than
     `vw - prefix_width` still places alone on its row.
-- CodeBlock lines never consult breaks (D1 skipped) — behavior byte-identical to today.
+- **The overflow decision REPEATS until the current VG fits (amended 2026-07-04, user-
+  ratified, from a probe-confirmed Fable plan-review Critical):** a tail re-placement can
+  leave the current VG still over-wide — e.g. a zero-width head makes the "freed" columns
+  zero, or an em-dash head with a no-break-before tail (CL-class `。`) — and pushing it
+  unchecked violates Law 3 on strategy-generable input. Each repeat either advances the
+  break point strictly (b increases) or falls back at the row start (where the single-
+  grapheme guard applies), so the loop terminates. W1 and Law 3 hold as stated under the
+  repeat.
+- CodeBlock lines never consult breaks (D1 skipped) and never hang whitespace — behavior
+  byte-identical to today.
 
 Zero-width VGs keep today's handling (placed at current col, no overflow test,
 layout.rs:266-273). The `desired_col`/`snap_to_stop`/`enter_from_*` machinery is untouched
