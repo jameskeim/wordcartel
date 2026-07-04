@@ -1,6 +1,6 @@
 # A1: menu bar modes (hidden | auto | pinned) + dwell reveal — design
 
-**Status:** Codex x2 + Fable5 folded incl. I3 resolution (leave-grace, user decision A — MENU_LEAVE_GRACE_MS + menu_hide_due + the asymmetric-timers rule); fold-verify pending
+**Status:** spec-review CLEAN (Codex x3 + Fable5; r3 residual — the pin toggle REQUIRES Editor.menu_bar_unpinned_mode, Ctx has no Config — folded); ready for user review + planning
 **Date:** 2026-07-03
 **Effort:** a1-menu-bar-modes — the second effort off `docs/ux-backlog.md` (A1; design settled at
 the 2026-07-03 triage, `auto` default confirmed; the one open fork — reveal geometry — resolved
@@ -159,12 +159,16 @@ Replace every `editor.menu.is_some()`-as-geometry read with `menu_bar_rows()`:
   visibility flows from the mode, not from `menu.is_some()`. F10 with the dropdown closed
   still opens via the `"menu"` command (registry.rs:210-227, unchanged toggle semantics).
 - **The `menu_bar_pin` command** ("Pin Menu Bar", `MenuCategory::View`, also in the palette by
-  the three-surface contract): toggles `menu_bar_mode` between `Pinned` and the non-pinned
-  mode **computed from config (Fable — the simpler form: the pin toggle is the ONLY runtime
-  mode mutator, so the remembered mode always equals the config value; when config itself says
-  `pinned`, unpin falls back to `Auto`)**. No extra Editor field. The toggle clears both auto
-  fields on every transition (see Component 3 hygiene). Session-scoped; D1 persists it later;
-  E2 makes it checkable.
+  the three-surface contract): toggles `menu_bar_mode` between `Pinned` and the remembered
+  non-pinned mode, stored as **`Editor.menu_bar_unpinned_mode: MenuBarMode`** — seeded at
+  startup from config (`cfg.menu.bar`, with `Auto` as the fallback when config itself says
+  `pinned`). **The Editor field is REQUIRED, not optional (Codex fold-verify r3): registry
+  handlers receive only `Ctx { editor, clock, executor, msg_tx }` (registry.rs:26) — no
+  `Config` — so a fieldless "compute from config" cannot recover the pre-pin mode at unpin
+  time.** Toggle logic: `Pinned` → restore `unpinned_mode`; otherwise remember the current
+  mode into `unpinned_mode` and set `Pinned`. The toggle clears all three auto fields on
+  every transition (see Component 3 hygiene). Session-scoped; D1 persists it later; E2 makes
+  it checkable.
 
 ## Component 3 — auto mode: the dwell machinery
 
@@ -318,8 +322,10 @@ if editor.menu_bar_mode == MenuBarMode::Auto && kind == MouseEventKind::Moved {
    slice) such that mouse hit-testing and render share it in BOTH bar states.
 4. `empty_at(open_idx)` + hydrate `open`/`highlighted` preservation — the minimal diff to
    `menu.rs`/`hydrate_overlays`.
-5. The `menu_bar_pin` remembered-mode shape (where `menu_bar_unpinned_mode` lives; Editor
-   field vs computing from config — pick the minimal correct form).
+5. RESOLVED (Codex fold-verify r3): `Editor.menu_bar_unpinned_mode` is REQUIRED — registry
+   handlers see only `Ctx { editor, … }` (registry.rs:26), no `Config`, so a fieldless
+   compute-from-config cannot recover the pre-pin mode. Seeded from `cfg.menu.bar` at
+   startup (Auto fallback when config = pinned); toggle logic pinned in Component 2.
 6. The deadline-array insertion (app.rs:2152-2183) + confirm `recompute_menu_bar`'s
    placement in `advance()` keeps the harness-drivable property (the e2e `step` calls
    `advance`).
