@@ -25,7 +25,7 @@
 ### Task 1: `list_window.rs` + the full palette fix
 
 **Files:**
-- Create: `wordcartel/src/list_window.rs` (+ `mod list_window;` in main.rs/lib wiring beside the other modules).
+- Create: `wordcartel/src/list_window.rs` (+ `mod list_window;` in **`wordcartel/src/lib.rs`** — the module declarations live at lib.rs:3-47; main.rs is the binary entry only — Codex plan r1).
 - Modify: `wordcartel/src/palette.rs` (field + rebuild tail), `wordcartel/src/app.rs` (palette key arms :1218-1292), `wordcartel/src/render.rs` (:150-174 helpers, :720-777 painter), `wordcartel/src/mouse.rs` (:122-145 wheel + the click-test), `wordcartel/src/e2e.rs` (the journey).
 
 **Interfaces produced:** `list_window::{list_h_for, keep_visible}`; `Palette.scroll_top`; the windowed-painter pattern Task 2 replicates.
@@ -181,8 +181,10 @@ pub(crate) fn keep_overlay_visible(area_h: u16, selected: usize, row_count: usiz
 ```
   (Backspace/Char: after `crate::palette::rebuild_rows(p, reg, keymap);` add
   `keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);` — with the `ah`
-  read hoisted above the `as_mut` borrow exactly as in the arms above. Esc/Enter/Left/Right
-  UNCHANGED.)
+  read hoisted above the `as_mut` borrow exactly as in the arms above. **AND the Tier-2
+  PASTE intercept (app.rs:1207-1216) — it also calls `rebuild_rows` (Codex plan r1: a
+  paste-filter shrink would otherwise leave a stale window): same re-window after its
+  rebuild, same hoisted-`ah` shape.** Esc/Enter/Left/Right UNCHANGED.)
 
 - [ ] **Step 4: render — helpers + the windowed painter + the indicator.**
   - `palette_overlay_rect` (:150-159): replace the inline computation with
@@ -232,20 +234,19 @@ pub(crate) fn keep_overlay_visible(area_h: u16, selected: usize, row_count: usiz
 - [ ] **Step 5: mouse — wheel + the click tests** (mouse.rs :122-145). Inside the palette
   block, BEFORE the `if let MouseEventKind::Down` (the block's unconditional return stays):
 ```rust
-        match ev.kind {
-            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
-                let ah = editor.active().view.area.1;
-                if let Some(p) = editor.palette.as_mut() {
-                    if matches!(ev.kind, MouseEventKind::ScrollDown) {
-                        p.selected = (p.selected + 1).min(p.rows.len().saturating_sub(1));
-                    } else {
-                        p.selected = p.selected.saturating_sub(1);
-                    }
-                    crate::app::keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
+        // `if matches!` — a `match` with a lone arm + `_ => {}` trips
+        // clippy::single_match under the deny gate (Codex plan r1).
+        if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+            let ah = editor.active().view.area.1;
+            if let Some(p) = editor.palette.as_mut() {
+                if matches!(ev.kind, MouseEventKind::ScrollDown) {
+                    p.selected = (p.selected + 1).min(p.rows.len().saturating_sub(1));
+                } else {
+                    p.selected = p.selected.saturating_sub(1);
                 }
-                return;
+                crate::app::keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
             }
-            _ => {}
+            return;
         }
 ```
   The existing click test (`click_palette_row_dispatches_and_closes`, :446-465) gains an
@@ -258,8 +259,11 @@ pub(crate) fn keep_overlay_visible(area_h: u16, selected: usize, row_count: usiz
     `selected - scroll_top < 15`, still open.
 
 - [ ] **Step 6: unit + render + e2e tests.**
-  - app tests: `palette_hazard_pin_enter_dispatches_visible_row` — open the palette
-    (~110 rows, 80×24), drive `selected` to 50 via Down×50 (or End then Up×N), assert at
+  - app tests: `palette_hazard_pin_enter_dispatches_visible_row` — seed a COMMANDS
+    palette via the app.rs:3759 idiom (`Palette::default()` → `rebuild_rows(&mut p, &reg,
+    &km)` → `editor.palette = Some(p)`; NOT the :2468 idiom, which seeds a Buffers palette
+    — Codex plan r1), ~110 rows at 80×24, drive `selected` to 50 via Down×50 (or End then
+    Up×N), assert at
     dispatch time `p.selected == 50`, `p.selected - p.scroll_top < 15` (RED after the field
     lands / before keep_visible wiring — the honest state per the spec), then Enter and
     assert the dispatched command is `rows[50]`'s. Also `palette_pgdn_home_end_land_exactly`
@@ -343,21 +347,17 @@ git commit -m "feat(palette): windowed scrolling — full-list reach, wheel, pos
 - [ ] **Step 4: mouse — tp/fb wheel** (mouse.rs:174-179): each bare-return block becomes:
 ```rust
     if editor.theme_picker.is_some() {
-        match ev.kind {
-            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
-                let ah = editor.active().view.area.1;
-                if let Some(tp) = editor.theme_picker.as_mut() {
-                    if matches!(ev.kind, MouseEventKind::ScrollDown) {
-                        tp.selected = (tp.selected + 1).min(tp.rows.len().saturating_sub(1));
-                    } else {
-                        tp.selected = tp.selected.saturating_sub(1);
-                    }
-                    crate::app::keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
+        if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+            let ah = editor.active().view.area.1;
+            if let Some(tp) = editor.theme_picker.as_mut() {
+                if matches!(ev.kind, MouseEventKind::ScrollDown) {
+                    tp.selected = (tp.selected + 1).min(tp.rows.len().saturating_sub(1));
+                } else {
+                    tp.selected = tp.selected.saturating_sub(1);
                 }
-                crate::app::preview_selected_theme_pub(editor); // see note below
-                return;
+                crate::app::keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
             }
-            _ => {}
+            crate::app::preview_selected_theme_pub(editor); // see note below
         }
         return;
     }
@@ -382,7 +382,10 @@ git commit -m "feat(palette): windowed scrolling — full-list reach, wheel, pos
     `tp.selected - tp.scroll_top < list_h` (RED before the ordering/keep_visible wiring).
   - tp/fb wheel tests (mouse mod): wheel moves selection + window; tp wheel also previews
     the visible row.
-  - One sibling render check: outline windowed slice shows scrolled rows (mirror of T1's).
+  - Sibling render checks for ALL THREE (Codex plan r1 — spec Component 3 applies to every
+    overlay): each of outline/theme-picker/file-browser gets (i) a windowed-slice check
+    (scrolled content visible, not rows[0..]) and (ii) the indicator present-when-scrollable
+    / absent-when-fits pair (mirror T1's palette forms).
 
 - [ ] **Step 6: run + gates + commit.**
 ```bash
