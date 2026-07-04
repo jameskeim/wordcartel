@@ -1,6 +1,6 @@
 # A1: menu bar modes (hidden | auto | pinned) + dwell reveal — design
 
-**Status:** Codex x2 clean; Fable5 folded (C1 mouse-path hydration, I1 arm-before-ALL-overlays, I2 capture-strand clear, M1-M6) — I3 leave-grace fork PENDING USER DECISION; re-verify after
+**Status:** Codex x2 + Fable5 folded incl. I3 resolution (leave-grace, user decision A — MENU_LEAVE_GRACE_MS + menu_hide_due + the asymmetric-timers rule); fold-verify pending
 **Date:** 2026-07-03
 **Effort:** a1-menu-bar-modes — the second effort off `docs/ux-backlog.md` (A1; design settled at
 the 2026-07-03 triage, `auto` default confirmed; the one open fork — reveal geometry — resolved
@@ -31,7 +31,7 @@ Two map findings shape the design:
 ## Goals
 
 - `[menu] bar = "hidden" | "auto" | "pinned"` (default **auto**): `hidden` = today; `auto` =
-  bar appears when the pointer RESTS on row 0 for a dwell, hides on leave; `pinned` = bar
+  bar appears when the pointer RESTS on row 0 for a dwell, hides after a short leave-grace (user decision A); `pinned` = bar
   always visible-inactive.
 - **Reserve uniformly** (resolved fork): bar visible ⇒ row 0 reserved — one signal through all
   geometry; the one-row shift is the same one F10 already causes today.
@@ -44,7 +44,7 @@ Two map findings shape the design:
 
 - No accelerators (A4 dropped), no right-edge bar content (E1), no persistence of the pin
   toggle (D1 carries that), no bar-focused-without-dropdown state, no hover-highlight of bar
-  labels while inactive. Dwell/grace are CONSTS, not config (tunables if terminals prove
+  labels while inactive. Dwell + leave-grace are CONSTS (MENU_DWELL_MS, MENU_LEAVE_GRACE_MS), not config (tunables if terminals prove
   jittery). PTY smoke cannot inject motion (documented boundary; the suite still runs verbatim
   pre-merge).
 
@@ -72,8 +72,9 @@ warning on unknown values (mirroring config.rs:325-330). TOML section `[menu]`.
 - `Editor.menu_bar_mode: MenuBarMode` — default in `new_from_text`, seeded in `run()` beside
   `view_opts`/`diag_cfg`/`export_cfg`.
 - `MouseState` (editor.rs:322-336) gains, beside its scrollbar twins:
-  `menu_reveal_due: Option<u64>` (the dwell deadline) and `menu_bar_revealed: bool` (the
-  auto-mode transient; meaningless in other modes).
+  `menu_reveal_due: Option<u64>` (the dwell deadline), `menu_hide_due: Option<u64>` (the
+  leave-grace deadline — I3 decision A), and `menu_bar_revealed: bool` (the auto-mode
+  transient; all three meaningless in other modes and cleared on mode transitions).
 - `editor.menu: Option<MenuView>` KEEPS its exact meaning: dropdown open. No write site's
   semantics change (the NINE `open_*` overlay closers — minibuffer, prompt, palette, search,
   diag, outline, theme picker, buffer switcher, file browser (Codex round 1 corrected the
@@ -170,7 +171,11 @@ Replace every `editor.menu.is_some()`-as-geometry read with `menu_bar_rows()`:
 Mirrors the scrollbar transient-chrome pattern (`scrollbar_until_ms` +
 `recompute_scrollbar_visible` in `advance()`, app.rs:2242-2244 + :1864):
 
-- **`pub const MENU_DWELL_MS: u64 = 250;`** (a named tunable const).
+- **`pub const MENU_DWELL_MS: u64 = 250;`** and **`pub const MENU_LEAVE_GRACE_MS: u64 = 400;`**
+  (named tunable consts — the grace honors the backlog's settled "hides after a grace period";
+  user decision A, 2026-07-03: a one-row aiming wobble must not kill the bar and reset the
+  dwell). `MouseState` accordingly gains a THIRD field, `menu_hide_due: Option<u64>`, beside
+  the other two.
 - **The `Moved` arm** (mouse.rs — placed **beside the universal Up-clear at mouse.rs:85-88,
   BEFORE ALL overlay branches**; Fable I1 generalized Codex round 2's finding: the palette
   (:91-114), theme-picker (:143-145), and file-browser (:146-148) blocks ALL return
@@ -189,22 +194,38 @@ Mirrors the scrollbar transient-chrome pattern (`scrollbar_until_ms` +
 ```rust
 if editor.menu_bar_mode == MenuBarMode::Auto && kind == MouseEventKind::Moved {
     if ev.row > 0 {
-        // Leave: disarm + hide — runs regardless of dropdown state, so a bar
-        // revealed before the dropdown opened clears promptly after it closes.
+        // Leave: disarm the dwell; arm the hide-grace ONCE (first leave only) —
+        // runs regardless of dropdown/overlay state (Fable I1), so a bar revealed
+        // before an overlay opened still clears after the grace.
         editor.mouse.menu_reveal_due = None;
-        editor.mouse.menu_bar_revealed = false;
-    } else if editor.menu.is_none()
-        && editor.palette.is_none()
-        && editor.theme_picker.is_none()
-        && editor.file_browser.is_none()
-        && !editor.mouse.dragging
-        && !editor.mouse.scrollbar_dragging
-        && !editor.mouse.menu_bar_revealed
-    {
-        editor.mouse.menu_reveal_due = Some(clock.now_ms() + MENU_DWELL_MS);
+        if editor.mouse.menu_bar_revealed && editor.mouse.menu_hide_due.is_none() {
+            editor.mouse.menu_hide_due = Some(clock.now_ms() + MENU_LEAVE_GRACE_MS);
+        }
+    } else {
+        // Back on row 0: a pending hide is cancelled (the grace's whole point).
+        editor.mouse.menu_hide_due = None;
+        if editor.menu.is_none()
+            && editor.palette.is_none()
+            && editor.theme_picker.is_none()
+            && editor.file_browser.is_none()
+            && !editor.mouse.dragging
+            && !editor.mouse.scrollbar_dragging
+            && !editor.mouse.menu_bar_revealed
+        {
+            editor.mouse.menu_reveal_due = Some(clock.now_ms() + MENU_DWELL_MS);
+        }
     }
 }
 ```
+
+  **The two timers are deliberately ASYMMETRIC (I3 resolution, user decision A —
+  grace per the backlog):** the DWELL re-arms on every row-0 motion (deadline tracks the
+  LAST motion — reveal after the pointer RESTS), but the GRACE arms ONCE on the FIRST
+  leave (`hide_due.is_none()` guard — re-arming per frame would push the hide forward
+  forever while the pointer keeps moving below). Predicate unit cases pin BOTH: two row-0
+  Moves 100 ms apart → reveal due = second + DWELL; two row-5 Moves 100 ms apart (while
+  revealed) → hide due = FIRST + GRACE, unchanged by the second. A leave-then-return
+  within the grace keeps the bar (hide cancelled).
 
   **The re-arm IS the rest semantics (Fable M1 — deliberate, do NOT "optimize"):** each row-0
   Moved pushes the deadline to `now + MENU_DWELL_MS`, so a pointer SLIDING ALONG row 0 keeps
@@ -216,12 +237,16 @@ if editor.menu_bar_mode == MenuBarMode::Auto && kind == MouseEventKind::Moved {
   (the sb_deadline pattern), so arm-then-park reveals correctly. (One factual note: real
   terminals report button-held motion as `Drag`, not `Moved` — the `!dragging` guards are
   belt-and-braces for lost-Up cases, not the primary drag defense.)
-- **The reveal fires via the deadline machinery:** `menu_reveal_due` joins the run-loop
-  deadline array (app.rs:2152-2183, beside `sb_deadline`) so a sleeping app wakes exactly on
-  time; `recompute_menu_reveal(editor, now_ms)` sits beside `recompute_scrollbar_visible` in
-  the shared `advance()` — when `now >= due`, set `menu_bar_revealed = true`, clear the due.
-  Because it lives in `advance()`, the e2e harness drives the whole flow with the virtual
-  clock (inject `Moved`, `advance_ms(MENU_DWELL_MS + 1)`, `tick()`).
+- **Both timers fire via the deadline machinery:** `menu_reveal_due` AND `menu_hide_due` join
+  the run-loop deadline array (app.rs:2152-2183, beside `sb_deadline`) so a sleeping app wakes
+  exactly on time; `recompute_menu_bar(editor, now_ms)` (handles both — reveal due fires →
+  `revealed = true`, clear; hide due fires → `revealed = false`, clear; **gated on
+  `mode == Auto`**, Fable M2) sits beside `recompute_scrollbar_visible` in the shared
+  `advance()`. Because it lives in `advance()`, the e2e harness drives the whole flow with
+  the virtual clock (inject `Moved`, `advance_ms(MENU_DWELL_MS + 1)`, `tick()`; leave-hide:
+  `Moved(row 5)` + `advance_ms(MENU_LEAVE_GRACE_MS + 1)` + `tick()`). A hide firing while the
+  dropdown is OPEN is harmless by construction (`menu.is_some()` keeps the row reserved; the
+  bar simply doesn't linger after close).
 - **Wheel events never arm** (separate `ScrollUp/Down` kinds). **A row-0 click while
   unrevealed is a text click** by construction (`menu_bar_rows() == 0` → row 0 is text).
 - **Degradation:** `mouse_capture == false` (mouse.rs:76-78 early-return) or a terminal
@@ -230,9 +255,9 @@ if editor.menu_bar_mode == MenuBarMode::Auto && kind == MouseEventKind::Moved {
   DISABLE branch (app.rs:2251-2267) clears only the drag flags today — with a bar revealed
   (or a deadline pending) at the moment capture turns off, no Moved can ever hide it and the
   pending due could reveal it AFTER capture is gone. The disable branch additionally clears
-  `menu_reveal_due` + `menu_bar_revealed` (beside the drag clears) — one line + a unit test.
-- **Mode-transition hygiene (Fable M2):** the `menu_bar_pin` toggle clears BOTH auto fields
-  on every transition, and `recompute_menu_reveal` is gated on `mode == Auto` (a pending due
+  ALL THREE menu-bar fields (`menu_reveal_due`, `menu_hide_due`, `menu_bar_revealed`) beside the drag clears — one line + a unit test.
+- **Mode-transition hygiene (Fable M2):** the `menu_bar_pin` toggle clears ALL THREE auto fields
+  on every transition, and `recompute_menu_bar` is gated on `mode == Auto` (a pending due
   must not fire in Pinned/Hidden).
 - **Reveal/hide does NOT re-scroll (Fable M3 — explicit chosen behavior):** hover must not
   move the document, so no `ensure_visible` runs on reveal. Accepted consequence: a caret
@@ -241,15 +266,15 @@ if editor.menu_bar_mode == MenuBarMode::Auto && kind == MouseEventKind::Moved {
   keystroke (a one-row jump). Documented, not a defect.
 - Dropdown-close in auto: after Esc/click-away, `menu_bar_revealed` reflects the pointer —
   if it still rests at the top the bar stays revealed until leave (recomputed on the next
-  Moved); otherwise the next Moved below row 0 hides it.
+  Moved); otherwise the leave-grace (armed by the first below-row-0 Moved) hides it MENU_LEAVE_GRACE_MS later.
 
 ## Testing
 
-- **e2e journeys** (the dwell flow is fully virtual-clock-drivable — `recompute_menu_reveal`
+- **e2e journeys** (the dwell flow is fully virtual-clock-drivable — `recompute_menu_bar`
   lives in the shared `advance()`):
   1. dwell-reveal: `Moved(row 0)` → `advance_ms(MENU_DWELL_MS + 1)` → `tick()` → bar labels
      render on row 0 AND the text shifted one row (`edit_top` moved — assert both); then
-     `Moved(row 5)` → bar hidden, text back.
+     `Moved(row 5)` + `advance_ms(MENU_LEAVE_GRACE_MS + 1)` + `tick()` → bar hidden, text back; AND the grace case — leave then re-enter row 0 WITHIN the grace → the bar stays (hide cancelled).
   2. drag-suppression: `Down(Left)` held + `Moved(row 0)` → never arms (no reveal after the
      dwell elapses).
   3. pinned: config/mode Pinned → bar visible at first render; F10 opens the dropdown; **Esc
@@ -279,7 +304,7 @@ if editor.menu_bar_mode == MenuBarMode::Auto && kind == MouseEventKind::Moved {
    `menu_bar_layout` label refactor, click-to-open with `empty_at`/hydrate `open`-preservation,
    the Esc/F10 nuance verification, the `menu_bar_pin` command; pinned + hidden e2e journeys.
 3. **Auto dwell** — the `Moved` arm, `MENU_DWELL_MS`, the deadline-array slot,
-   `recompute_menu_reveal` in `advance()`, degradation; the dwell/drag/row-0-click journeys.
+   `recompute_menu_bar` in `advance()`, degradation; the dwell/grace/drag/row-0-click journeys.
 
 ## Plan-confirms (resolve during the implementation plan, against real source)
 
@@ -295,7 +320,7 @@ if editor.menu_bar_mode == MenuBarMode::Auto && kind == MouseEventKind::Moved {
    `menu.rs`/`hydrate_overlays`.
 5. The `menu_bar_pin` remembered-mode shape (where `menu_bar_unpinned_mode` lives; Editor
    field vs computing from config — pick the minimal correct form).
-6. The deadline-array insertion (app.rs:2152-2183) + confirm `recompute_menu_reveal`'s
+6. The deadline-array insertion (app.rs:2152-2183) + confirm `recompute_menu_bar`'s
    placement in `advance()` keeps the harness-drivable property (the e2e `step` calls
    `advance`).
 7. RESOLVED (Codex rounds 1-2): the predicate is pinned in Component 3 verbatim (leave-
