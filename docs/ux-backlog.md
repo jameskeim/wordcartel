@@ -80,7 +80,7 @@ a dwell trigger, slotting into the run loop's existing `recv_timeout` deadline a
 events already flow through the mouse path (currently ignored). Dwell duration is an
 implementation tunable, not a design fork.
 
-### A2. Full-width menu bar + right-edge content — `settled-design` · Trivial
+### A2. Full-width menu bar + right-edge content — `SHIPPED` 2026-07-03 (097dcae)
 
 **Facts:** only the label rects get the Chrome style (`render.rs:108-118`, `:915-920`); gaps
 and the right side are unstyled — no full-width fill.
@@ -151,7 +151,7 @@ ordered-list markers get the same treatment. **Companion:** hanging indent — w
 continuation lines of a list item align under the item's text, not the bullet (interacts with
 B1; consider shipping together).
 
-### B3. Heading glyphs in colored themes — `settled-design` (+ `available-today`) · Trivial
+### B3. Heading glyphs in colored themes — `SHIPPED` 2026-07-03 (097dcae): default ON in every theme
 
 **Facts:** `Theme.heading_level_glyph: bool` (`theme.rs:119`); shade ramp `█ ▓ ▒ ░ ▏ ·`
 H1→H6 (`render.rs:16-18`, gate at `:412-421`). ON for `no_color` + the phosphor-*flat*
@@ -172,7 +172,7 @@ eyeball pass (colored themes already style headings; the glyph is a deliberate s
 
 ## Theme C — document workflow
 
-### C1. LaTeX export + xelatex PDF + export typography — `settled-design` · Small
+### C1. LaTeX export + xelatex PDF + export typography — `SHIPPED` 2026-07-03 (097dcae) — and it was a BUG FIX (docx/pdf silently exported HTML fragments; confirmed + fixed)
 
 **Facts:** export is already PANDOC-based and async (`export.rs`; html captures stdout,
 docx/pdf via temp+rename, `Msg::ExportDone`, pandoc probed via OnceLock). **`export_pdf`
