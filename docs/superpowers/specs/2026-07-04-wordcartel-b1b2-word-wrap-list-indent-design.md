@@ -40,8 +40,13 @@ exists** — B2's job is to make `prefix_width` tell the truth for nested items.
 Break positions are computed on the **visible text** — concealment changes adjacency
 (`"**bold**text"` renders `boldtext`; a break legal in the raw string may be illegal in the
 rendered one and vice versa). Mechanically, after the `vgs: Vec<VG>` vector is built
-(layout.rs:218-238): concatenate `vg.text` in order (this equals the rendered row content
-by construction), run `unicode_linebreak::linebreaks(&visible)` once (linear, one small
+(layout.rs:218-238): concatenate `vg.text` in order. **This is the RAW visible grapheme
+text, not the rendered display string (Codex r1): `VG.text` holds `g.to_string()`
+(layout.rs:232) — a tab stays `"\t"`; display expansion to TAB_WIDTH happens later when
+`VisualRow.display`/segs are built (:302/:307), and tab WIDTH enters the wrap loop via
+`VG.width`, not via the text.** That is correct input for break analysis — UAX #14
+classifies the tab character itself (a break-after opportunity); no class depends on
+visual expansion. Run `unicode_linebreak::linebreaks(&visible)` once (linear, one small
 state machine — same complexity class as the segmentation pass already done per line), and
 map each returned byte offset to the VG index whose text starts at that offset (offsets
 from `linebreaks` fall on grapheme starts of the concatenation; collect into a
@@ -62,13 +67,26 @@ cursor over the D1 vector — O(1) amortized). The overflow branch becomes:
   is placed at the current col even when `col + width > vw` — trailing whitespace hangs
   past the edge (standard word-processor behavior; a continuation row never starts with
   the space the user just typed). Law 3 is amended accordingly (see Invariants).
+  **Cursor rule for hung cells (Codex r1): rows paint into a clipped Rect of
+  `text_width` (render.rs) and the terminal cursor is set at `text_left + col`
+  (render.rs:717) — a caret logically on/after a hung whitespace cell would paint outside
+  the rect. The DISPLAY column therefore clamps: the painted caret col is
+  `min(col, text_width - 1)` (pinned at the edge, the standard editor behavior); the
+  LOGICAL mapping (`ColMap`, `screen_pos`'s returned vcol consumers) is unchanged, and
+  `visual_to_source` already clamps click cols to the row end. The clamp lives at the
+  render cursor-set site, not in ColMap.**
 - Otherwise, on `col + vg.width > vw && col > prefix_width`:
   - if a legal break exists with `row_start_vg < break ≤ current index`: the row ends at
     the break — VGs from the break to the current index (exclusive) are RE-PLACED onto the
     new row starting at `prefix_width` (their already-pushed `Placed` entries are moved:
-    row += 1, cols recomputed from `prefix_width`). The re-placement is bounded by the row
-    width (≤ vw cells), preserving the hot path's O(visible) class — each VG moves at most
-    once per row boundary.
+    row += 1, cols recomputed from `prefix_width`). **Bookkeeping (Codex r1): the broken
+    row's `row_end_col` entry is pushed AT THE BREAK — its value is the col after the last
+    VG that stays on the row (including hanging whitespace), NOT the col the loop had
+    reached; `rows` derives from the final row counter as today (:293). `VisualRow`s,
+    `display`, `segs`, and `src_span` are built from `placed` AFTER the loop (:296-…), so
+    re-placement needs no display/seg repair — only `placed` rows/cols and `row_end_col`.**
+    The re-placement is bounded by the row width (≤ vw cells), preserving the hot path's
+    O(visible) class — each VG moves at most once per row boundary.
   - if no legal break exists on the row (one unbroken token wider than the row): fall back
     to the existing grapheme break (the current VG opens the new row). The existing
     single-grapheme guard (`col > prefix_width`) is unchanged — a grapheme wider than
@@ -81,9 +99,10 @@ layout.rs:266-273). The `desired_col`/`snap_to_stop`/`enter_from_*` machinery is
 
 ### D3. B2 — nested-list indent conceal (md_parse.rs:252-291, ListItem arm ONLY)
 
-Today: `start` = count of leading space bytes; marker bytes concealed; positions
-`0..start` stay VISIBLE. New: positions `0..start` are ALSO concealed, and the prefix
-glyph becomes **indent + marker**:
+Today: `start` = count of leading SPACE bytes ONLY — the scan at md_parse.rs:253 is not
+tab-aware, so a tab-indented item is not recognized as indented at all (Codex r1). New:
+**the `start` scan itself extends to spaces AND tabs**; positions `0..start` are then
+ALSO concealed, and the prefix glyph becomes **indent + marker**:
 
 - unordered: `format!("{}• ", indent_str)` where `indent_str` reproduces the leading
   whitespace's display width — spaces copied as-is; a leading TAB contributes
@@ -121,9 +140,17 @@ visible — md_parse.rs:239-250 untouched); headings/code/thematic breaks untouc
 is geometry-agnostic; consumers verified to handle arbitrary row-break positions:
 `screen_pos` (nav.rs:83-124), `ensure_visible` (:401-483), `offset_at_cell` (:909-937),
 `move_home/end/up/down/left/right`, `last_fully_visible_line` (:792-816), scrollbar and
-selection painting. `typewriter_rows_of_line` (nav.rs:500-522) stays sound: its early exit
-fires on `content_len + prefix_width <= text_width`, and word wrap never produces MORE
-rows than grapheme wrap for content that fits on one row. `visual_to_source`'s
+selection painting. `typewriter_rows_of_line` (nav.rs:500-522) is a HEURISTIC (typewriter scroll anchoring
+only) and its status is stated honestly (Codex r1): its early exit fires on BYTE length
+`content_len + prefix_width <= text_width`, with `prefix_width` read from the cache and
+approximated as 0 for uncached lines. (a) For space-indented B2 items the change is
+exactly compensating — indent bytes leave the visible text as the same width enters the
+glyph. (b) The byte-length test is ALREADY unsound for tabs TODAY (a tab is 1 byte but
+4 display cells — pre-existing, not a B1/B2 regression); tab-indented items inherit that
+known limitation. (c) The uncached prefix≈0 approximation makes the exit fire more
+often; a wrong exit mis-anchors typewriter scroll by a row — cosmetic, self-correcting
+on the next cached frame. Word wrap itself never adds rows to content whose VISIBLE
+width fits one row, so the exit's soundness class is unchanged. `visual_to_source`'s
 end-of-row clamping already models short rows. The render row loop (render.rs:381-612)
 consumes `VisualRow`/`prefix_width` unchanged. Folds, focus mode, centered measure, wrap
 guide: orthogonal (the guide remains cosmetic at `wrap_column`).
