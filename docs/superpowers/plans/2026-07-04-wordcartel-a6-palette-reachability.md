@@ -120,10 +120,10 @@ mod tests {
 - [ ] **Step 3: the palette key arms** (app.rs :1218-1292). A small local helper FIRST (place
   it beside `hydrate_overlays`, app.rs ~:818 — Task 2 reuses it for all four overlays):
 ```rust
-/// Re-window an overlay list after a selection/rows change (A6). Reads the
-/// active buffer's area height — the same source the mouse path uses; render
-/// re-heals against the live frame each draw, so a transient divergence
-/// (a key racing a resize) lasts at most one frame.
+/// Re-window an overlay list after a selection/rows change (A6). `area_h` is the
+/// CALLER's read of the active buffer's area height (the same source the mouse
+/// path uses); render re-heals against the live frame each draw, so a transient
+/// divergence (a key racing a resize) lasts at most one frame.
 pub(crate) fn keep_overlay_visible(area_h: u16, selected: usize, row_count: usize, scroll_top: &mut usize) {
     let lh = crate::list_window::list_h_for(row_count, area_h);
     crate::list_window::keep_visible(selected, row_count, lh, scroll_top);
@@ -198,9 +198,13 @@ pub(crate) fn keep_overlay_visible(area_h: u16, selected: usize, row_count: usiz
     // A6 self-heal: the window must respect the LIVE frame's geometry (resize
     // has no overlay hook; render is the one place that always sees the truth).
     if let Some(p) = editor.palette.as_mut() {
-        let lh = crate::list_window::list_h_for(p.rows.len(), h);
-        crate::list_window::keep_visible(p.selected, p.rows.len(), lh, &mut p.scroll_top);
+        crate::app::keep_overlay_visible(h, p.selected, p.rows.len(), &mut p.scroll_top);
     }
+    // (Fable plan M-4: the pre-pass IS keep_overlay_visible — don't long-hand the two
+    // calls; the same one-liner form at all four painters. Likewise the indicator: one
+    // shared render helper, e.g.
+    //   fn windowed_indicator(block: Block, selected: usize, total: usize, list_h: usize) -> Block
+    // applied at all four sites instead of four copies.)
 ```
     Inside the block: `let list_h = crate::list_window::list_h_for(palette.rows.len(), h) as u16;`
     (replacing the inline mirror at :730); the block construction gains the indicator:
@@ -254,7 +258,10 @@ pub(crate) fn keep_overlay_visible(area_h: u16, selected: usize, row_count: usiz
   dispatch pinned — not weakened). NEW tests (mouse tests mod, the local `ctx()` idiom):
   - `scrolled_click_maps_to_absolute_row`: seed a Commands palette, set
     `selected = 20` + `keep_overlay_visible` (scroll_top 6), click the FIRST visible list
-    row → the dispatched id is `rows[6]`'s (compute the cell from `palette_overlay_rect`).
+    row → the dispatched id is `rows[6]`'s (compute the cell from `palette_overlay_rect`;
+    **Fable plan M-2: `rows[6]` is `select_left`, a no-op at caret 0 — seed the caret past 0
+    or assert the dispatched ID via a selection/status observable; the identity
+    `dispatched == rows[scroll_top]` is the contract**).
   - `wheel_moves_selection_and_window`: 20 ScrollDowns → `selected == 20`,
     `selected - scroll_top < 15`, still open.
 
@@ -263,27 +270,30 @@ pub(crate) fn keep_overlay_visible(area_h: u16, selected: usize, row_count: usiz
     palette via the app.rs:3759 idiom (`Palette::default()` → `rebuild_rows(&mut p, &reg,
     &km)` → `editor.palette = Some(p)`; NOT the :2468 idiom, which seeds a Buffers palette
     — Codex plan r1), ~110 rows at 80×24, drive `selected` to 50 via Down×50 (or End then
-    Up×N), assert at
-    dispatch time `p.selected == 50`, `p.selected - p.scroll_top < 15` (RED after the field
-    lands / before keep_visible wiring — the honest state per the spec), then Enter and
-    assert the dispatched command is `rows[50]`'s. Also `palette_pgdn_home_end_land_exactly`
+    Up×N) — **target a NAMED benign observable command past index 15, not a fixed 50
+    (Fable plan M-2): `rows[50]` in registration order is `export_html` (side-effectful);
+    drive `selected` to e.g. `toggle_word_count`'s index and assert `view_opts.word_count`
+    flipped** — assert `p.selected - p.scroll_top < 15` at dispatch time (RED after the
+    field lands / before keep_visible wiring — the honest state per the spec), then Enter
+    and assert the command's observable effect. Also `palette_pgdn_home_end_land_exactly`
     and `palette_filter_shrink_reclamps_window` (PgDn deep, type a narrowing char →
     `scroll_top` re-clamped, selection visible). Also the Buffers case (g):
     seed 20 buffers via the switcher path, PgDn → highlight visible.
   - render tests: `palette_windowed_slice_shows_scrolled_rows` (set selected=50 +
     heal via a draw; assert a row string matches `rows[scroll_top]`'s label, NOT rows[0]'s);
     `palette_indicator_only_when_scrollable` (31 rows, selected=12 → the bottom border
-    contains ` 13/31 `; 3 rows → NO indicator text in the bottom border);
+    contains ` 13/31 `; 3 rows → NO indicator digits WITHIN THE OVERLAY'S COLUMNS on the
+    bottom-border row (Fable plan M-3: the terminal row also carries document cells outside
+    ov_w — scope the assertion to the overlay rect or use a digit-free document));
     `palette_resize_self_heal_no_panic` (selected=50, scroll_top=36 seeded manually, draw
     into an 80×10 backend → no panic, and after the draw `selected - scroll_top < list_h_for(rows, 10)`);
     the h=4 degenerate draw (no panic, no rows painted).
   - e2e journey (`journey_palette_end_reaches_last_command`): `ctrl('p')` → `key(End)` →
     assert the highlight visible (`selected - scroll_top < 15`) and the LAST row's label on
-    screen → `key(Enter)` → the dispatched command ran (pick a benign last-registered
-    command to assert on — verify what the registry's last command is and assert its
-    observable effect or use `screen_contains` on the closed palette + status; the
-    implementer picks the cleanest observable, the reach-without-typing property is the
-    contract).
+    screen → `key(Enter)` → the dispatched command ran. **The last registered command is
+    `scroll_line_down` (Fable-verified) — benign and observable: on a tall document,
+    `view.scroll` advances by one; assert that.** The reach-without-typing property is the
+    contract.
 
 - [ ] **Step 7: run + gates + commit.**
 ```bash
@@ -307,8 +317,10 @@ git commit -m "feat(palette): windowed scrolling — full-list reach, wheel, pos
   `OutlineOverlay` (outline_overlay.rs:14-22), `ThemePicker` (theme_picker.rs:7-13),
   `FileBrowser` (file_browser.rs:14-19). Struct-literal sites gain `scroll_top: 0`:
   editor.rs:675-678 (theme picker open), :725-727 (file browser open),
-  theme_picker.rs:33-34 (test), file_browser.rs:64 (test), and any outline construction
-  site (find via the compiler — OutlineOverlay's ctor path). The `rebuild_rows`
+  theme_picker.rs:33-34 (test), file_browser.rs:64 (test), **mouse.rs:639-642 (the
+  `dwell_never_arms_during_drag_or_overlay` test's FileBrowser literal — Fable plan M-1)**,
+  and OutlineOverlay's sole ctor `open()` (outline_overlay.rs:34 — its private `all` field
+  means no other construction path exists). The `rebuild_rows`
   (theme_picker.rs:17-24), `rebuild_entries` (file_browser.rs:23), and `set_query`
   (outline_overlay.rs:45-50) tails each gain the same over-scroll floor as palette's:
   `x.scroll_top = x.scroll_top.min(x.rows.len().saturating_sub(1));` (entries for fb).
@@ -317,10 +329,15 @@ git commit -m "feat(palette): windowed scrolling — full-list reach, wheel, pos
   - Theme picker (app.rs:1316-1360): Up/Down gain `keep_overlay_visible` INSIDE the
     `as_mut` scope, **BEFORE the `preview_selected_theme(editor)` call that follows the
     scope** (the ordering pin — the previewed row must be the visible one); Backspace/Char
-    likewise re-window after `rebuild_rows` and before preview; new
-    PageDown/PageUp/Home/End arms (each ending with `preview_selected_theme(editor);`).
+    likewise re-window after `rebuild_rows` and before preview; **the tp PASTE intercept
+    (app.rs:1307-1314 — it rebuilds AND previews) gets the same re-window before its
+    preview (Fable plan I-1: the spec's Char/Backspace/PASTE rule applies to every overlay,
+    exactly as Codex r1 fixed at the palette)**; new PageDown/PageUp/Home/End arms (each
+    ending with `preview_selected_theme(editor);`).
   - File browser (app.rs:1379-1450): Up/Down + re-window; new PgUp/PgDn/Home/End;
-    Backspace/Char re-window after `rebuild_entries`; **THE DESCEND RESET (spec C1)** — in
+    Backspace/Char re-window after `rebuild_entries`; **the fb PASTE intercept
+    (app.rs:1371-1377) re-windows after its rebuild too (Fable plan I-1; outline has NO
+    paste intercept — paste falls through to the document there, correctly untouched)**; **THE DESCEND RESET (spec C1)** — in
     the Enter arm's directory branch:
 ```rust
                                         if let Some(fb) = editor.file_browser.as_mut() {
@@ -372,9 +389,13 @@ git commit -m "feat(palette): windowed scrolling — full-list reach, wheel, pos
     (tempdir) — Down past the window keeps `selected - scroll_top < list_h`; PgDn/Home/End
     land exactly; **the fb Enter-dispatches-visible pin** (selected deep → the opened path
     is `entries[selected]`'s, visible at dispatch).
-  - **The scrolled-descend pin (spec C1, panic-class):** fb over a 25-entry tempdir, PgDn
-    (scroll_top > 0), Enter on a subdirectory containing 2 entries → no panic, `selected == 0`,
-    `scroll_top == 0`, render draws clean.
+  - **The scrolled-descend pin (spec C1, panic-class) — construction matters (Fable plan
+    I-2):** `rebuild_entries` sorts DIRECTORIES before files, so a lone subdir in a
+    file-heavy tempdir sits at index 1 (after `..`) — inside the first window; PgDn would
+    land Enter on a FILE (opening it, closing the browser — failing for the wrong reason).
+    Construct 25 SUBDIRECTORIES (`d00`..`d24`, two small files inside `d14`); PgDn →
+    `selected == 15` (= `d14`, after `..` at index 0) with `scroll_top > 0`; Enter → no
+    panic, `selected == 0`, `scroll_top == 0`, entries are `d14`'s, render draws clean.
   - **The theme-picker preview pin (spec I4 construction):** pad `tp.rows` with REPEATED
     REAL builtin names to 30 rows (e.g. cycling `Theme::builtin_names()`), drive with
     NAVIGATION ONLY (Down×20 — no Char/Backspace, which would rebuild and wipe the padding),
