@@ -130,10 +130,19 @@ NOT move here — it is overlay glue (decision 2).
 
 **The rule:** a test moves with the module whose functions it calls **directly**; a test
 that reaches the moved code only through `reduce(...)` stays in app.rs — it is a reducer
-test regardless of which seam it exercises. By this rule the quit-drain family (the
-seam-1+3 spanners driving `resolve_prompt`/`drive_quit_drain` through `reduce`) stays in
-app.rs. The implementation plan classifies each of the 139 tests explicitly; the
-expected outcome is roughly 60-70 moving, the reducer/run-loop/overlay majority staying.
+test regardless of which seam it exercises. **One explicit exception (Codex r1):** the
+quit-drain family SPANS two extracted modules — several of its tests directly call
+`resolve_prompt` (app.rs:3087/:3114/:3174/:3196), `apply_job_outcome` (:3093), and
+`save_as_submit` (:3201) — and a spanner has no single home under the rule. The family
+stays in app.rs as flow-integration tests, with its direct calls rewritten to the new
+paths (`crate::prompts::resolve_prompt`, `crate::jobs_apply::apply_job_outcome`, …).
+The implementation plan classifies each of the 139 tests explicitly BY READING ITS BODY,
+not by name-family — Codex r1 confirmed families are mixed: `replace_all_*` and
+`invalid_regex_replace_all_*` reach search code only through `reduce` (:4513, :4725 —
+they STAY), while the goto family splits (`goto_line_jumps_…` :3545 goes through
+`reduce` and stays; the tests at :3566/:3578 call `goto_line_submit` directly and MOVE).
+No numeric quota — the rule plus the per-test pass decides; stayed tests that name moved
+fns get path rewrites as their only edit.
 
 **Shared helpers promote to `test_support.rs`** (already home to
 `TestClock`/`key_char`/`press`): `cua_keymap()` (:2565 — used by tests of every seam),
@@ -153,7 +162,8 @@ no test may be weakened, deleted, or have assertions altered — renamed imports
   (2) `session_restore.rs`, (3) `prompts.rs` (its `resolve_prompt` needs jobs_apply
   already in place), (4) `search_ui.rs`, (5) a final polish commit: the four editor.rs
   doc-comment references to `apply_result`/`open_into_current` (editor.rs:34/:363/:418/
-  :429) gain the new module names, lib.rs `mod` ordering matches its existing grouping,
+  :429) and the transform.rs:139 comment naming "`apply_transform_done` in app.rs"
+  (Codex r1) gain the new module names, lib.rs `mod` ordering matches its existing grouping,
   and the backlog/ledger bookkeeping. Blame recovery is `git blame -C -C` (a split is a
   content copy, not a rename; `--follow` alone won't track it — the backlog line
   claiming otherwise is corrected at ship time).
