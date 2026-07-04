@@ -5,7 +5,10 @@ themes, each fact-checked against the real source (anchors below are as of `63f9
 drift). Each item graduates to the standard gated pipeline (brainstorm → spec → Codex/Fable
 review → plan → subagent build) when picked up — this document is the durable triage, not a
 spec. **The open-questions ledger was resolved with the user on 2026-07-03** — see "Resolved
-decisions" at the end; decisions are folded into each item below.
+decisions" at the end; decisions are folded into each item below. **A second niggle batch
+landed 2026-07-04** (fact-checked at `bd3b72c`): A6 palette reachability (which ANSWERS A3's
+open "why did the palette read as a subset" question), E3 chrome theming coherence, E4
+bundled-themes research.
 
 **Status legend:** `settled-design` (direction agreed, ready to spec) · `needs-design`
 (direction sketched, forks remain) · `available-today` (config-only, no code) ·
@@ -93,13 +96,14 @@ defaulted piecemeal now. Labels truncate before any future content on narrow ter
 ### A3. Palette completeness follow-ups + the menu item pass — `fact-checked` · Small
 
 The user's impression ("only a small subset") was inverted — the palette is already
-exhaustive; the MENU is the subset. Follow-ups: (a) verify the palette shows binding hints
-(menu is built with keymap access; palette unverified); (b) investigate why the palette read
-as a subset (filter UX? discoverability?); (c) **apply the adopted curation principle** (see
-the contract section) item-by-item to the ~58-command menu set, bringing only the judgment
-calls back for approval. Add a permanent **palette-completeness invariant test** ("every
-non-hidden registry command appears") — the contract as a regression net (the `palette.rs:138`
-test is close; formalize).
+exhaustive in DATA; the MENU is the subset. Follow-ups: (a) verify the palette shows binding
+hints (menu is built with keymap access; palette unverified); (b) **ANSWERED 2026-07-04:**
+the subset impression was real in REACH — the palette cannot scroll past its initially
+visible rows without typing (see A6, which fixes it); (c) **apply the adopted curation
+principle** (see the contract section) item-by-item to the ~58-command menu set, bringing
+only the judgment calls back for approval. Add a permanent **palette-completeness invariant
+test** ("every non-hidden registry command appears") — the contract as a regression net (the
+`palette.rs:138` test is close; formalize).
 
 ### A4. Menu accelerators (Alt+F/Alt+E…) — `dropped` (2026-07-03)
 
@@ -119,6 +123,32 @@ path; no switch command; presets = cua, wordstar. **Direction:** a `keymap_prese
 the trie is borrowed by `reduce`); menu hints stay fresh automatically (menu rebuilds on every
 open); palette hints must re-resolve. Persistence rides on D1 — these two ship together.
 Checkable/radio menu items (E2) show the active preset.
+### A6. Palette reachability: full-list scrolling + wheel + click dead zones — `needs-design` · Small-Medium
+
+*(Added 2026-07-04; answers A3(b). Facts as of `bd3b72c`.)*
+
+**Facts:** the `Palette` struct has NO scroll field (palette.rs:19-28); render slices only the
+FIRST `list_h` rows into the ratatui `List` (`rows.iter().take(list_h)`, render.rs:760-777)
+with `list_h = min(row_count, 15, h-4)` (`palette_overlay_rect`, render.rs:150-159). Arrow
+keys move `selected` over the FULL row set (app.rs:1240-1249, max = rows.len()-1 = ~125) but
+ratatui can only scroll items it received — so past row 15 the highlight simply VANISHES,
+and **Enter still dispatches the invisible selection** (a silent-wrong-action hazard, worse
+than mere unreachability). PgUp/PgDn: no key arms at all. Mouse wheel: the palette overlay
+block returns early for ALL mouse events (mouse.rs:122-145) — ScrollUp/Down never reach the
+scroll arms. Click: CORRECT for visible list rows (`palette_row_at` matches the render
+layout exactly, render.rs:163-174; test-pinned) — but clicks on the query row and border
+cells are swallowed silently (inside the overlay → neither dispatch nor close), the likely
+source of the "can't click" report.
+
+**Direction:** add a scroll offset (`scroll_top`) to `Palette`; render slices
+`[scroll_top .. scroll_top+list_h]`; selection movement scrolls the window to follow
+(standard follow-the-cursor windowing); PgUp/PgDn arms; wheel events route to palette
+scrolling while it's open (the overlay block handles them instead of swallowing); decide the
+dead-zone behavior (query-row/border clicks: no-op is acceptable, but must not eat the
+event silently if a better affordance is cheap). Kills the invisible-dispatch hazard by
+construction (selection always visible). Same windowing likely wanted for outline/theme
+picker/file browser (they share the pattern — verify in-effort and fix uniformly if cheap).
+
 
 ---
 
@@ -266,6 +296,65 @@ items** (✓/radio for toggles + the active keymap preset — the menu model mus
 display), a consistent styling language. Goal: the full-chrome mode looks *designed*, not
 assembled.
 
+### E3. Chrome theming coherence — one chrome family + a full|zen axis + phosphor restructure — `needs-design` · Medium-Large
+
+*(Added 2026-07-04. Facts as of `bd3b72c`. SHOULD PRECEDE E1/E2's preset work and E4 —
+presets and new themes should build on a coherent chrome model, not before it.)*
+
+**The user's reports, all grounded as real:** modal text doesn't follow theme colors; modals
+aren't consistent with the menu bar; the menu bar and status bar don't match each other.
+
+**Facts — the per-surface style inventory (render.rs:712-717 + :629/:646):** there are exactly
+FOUR chrome faces (`Chrome`, `ChromeReverse`, `ChromeSelected`, `ChromeMuted` —
+wordcartel-core theme.rs:35-38; no overlay-specific faces). Their use is inconsistent:
+- Overlay UNSELECTED rows (palette/outline/theme-picker/file-browser/diag):
+  `RStyle::default()` — literally UNTHEMED (terminal default fg/bg after a `Clear` reset);
+  in tokyo_night the row interior shows the terminal bg, not the theme's panel bg.
+- Overlay query lines: `SE::Text` = `Face::default()` in every built-in — also unthemed.
+- Overlay borders: `SE::Chrome` (themed) — so borders match the bar but interiors don't.
+- Status bar + search/minibuffer/prompt: `SE::ChromeReverse` — a MODIFIER-ONLY reverse
+  (ambient-dependent), while the menu bar uses explicit `SE::Chrome` colors. In tokyo_night
+  the status row visibly does NOT match the menu bar's `PANEL_BG` — exactly the reported
+  mismatch. There is no distinction between normal-status and active-prompt states.
+- tokyo_night's liked "dark menus" = simply `chrome.bg = PANEL_BG (#16161e)` vs
+  `base_bg (#1a1b26)` (theme.rs:322-325) — the subtle-dark chrome treatment to generalize.
+
+**Direction (user-driven, 2026-07-04):**
+1. **One chrome family, applied to EVERY chrome surface** — menu bar, dropdowns, all modal
+   overlays (bg/rows/query), and the status bar draw from the same per-theme chrome palette
+   (likely: overlay interiors get `Chrome`-family bg, rows get explicit styling instead of
+   `RStyle::default()`, the status bar moves off modifier-only `ChromeReverse` onto explicit
+   Chrome colors; whether four faces suffice or one or two are added is the design's call).
+2. **A chrome DISPOSITION axis, proposed as config rather than name proliferation** —
+   `[theme] chrome = "full" | "zen"`: `full` extends the theme's colors through all chrome
+   (the new main tokyo-night); `zen` turns all chrome down to the subtle dark treatment
+   (today's tokyo-night menus, generalized to every theme). Implementation is cheap by
+   construction: a post-selection face patch in `resolve_theme` (the `override_face`
+   mechanism already exists — theme_resolve.rs:84-138). AXIS-VS-VARIANT-NAMES is proposed,
+   not yet user-confirmed — confirm at the E3 brainstorm.
+3. **Phosphor restructure (user decisions 2026-07-04):** the `-flat` variants are REMOVED
+   (their inversion — hue chrome over untinted text — defeats the point; two small sites:
+   `builtin()` + `builtin_names()`, theme.rs:144-170; config naming them warns + falls back).
+   The main phosphor themes already tint all text (`text: shade(hue,3)` — user-confirmed the
+   full-illusion text side works); E3 completes the "one-color monitor" simulation by
+   extending the hue through ALL chrome surfaces. The zen axis gives phosphor-text-over-
+   subdued-chrome — what `-flat` should have been.
+4. **tokyo-night full** — the main theme extends its palette through the menu bar, menus,
+   modals, and status bar; today's subdued look becomes its `zen` disposition.
+
+### E4. Bundled themes research — `research note` · Small (research), lands AFTER E3
+
+*(Added 2026-07-04, user request.)* Research additional out-of-the-box full-color themes.
+Selection bar: **demonstrated markdown-colorizing strength** first; then portability into the
+face model (base16-style mappings are cheap — `from_base16` exists), licensing, and terminal
+ubiquity. Starting points supplied by the user:
+- https://www.tabnine.com/blog/top-themes-for-sublime-text-editor/
+- https://terminalroot.com/top-8-best-color-themes-for-your-vim-neovim/
+Obvious candidates the research should weigh: Gruvbox, Catppuccin, Nord, Dracula, Solarized,
+Everforest, Rosé Pine. Deliverable: a shortlist with per-theme markdown-rendering evidence +
+face-model mapping notes, for the user to pick from. New themes land into E3's restructured
+chrome model (hence the ordering).
+
 ---
 
 ## Cross-cutting notes
@@ -304,12 +393,16 @@ assembled.
 
 ## Sizing summary
 
-- **Config-only today:** B3 heading glyphs (per-user, pre-default-flip).
-- **Trivial:** A2 bar fill · B3 default flip · C1 `--pdf-engine=xelatex`.
-- **Small:** C1 `export_tex` + typography config · A3 palette follow-ups + invariant test +
-  the menu item pass.
-- **Medium:** A1 menu bar modes + dwell (mouse comes free) · A5 keymap switch + D1 write-back
-  (one effort) · B2 sub-list indent (+ hanging indent) · C2 transform scope (block-under-caret
-  defaults + deepest-block snapping).
-- **Larger:** B1 word-boundary wrap · E1/E2 chrome presets + polish pass (after A1/A2;
-  includes the transient status line).
+*(SHIPPED so far: the quick-wins bundle A2+B3+C1 @ 097dcae; A1 menu-bar modes @ 7273327 —
+both carrying bug fixes.)*
+
+- **Small:** A3 palette follow-ups (hints verification + invariant test + the menu item
+  pass) · E4 themes research (the research itself).
+- **Small-Medium:** A6 palette reachability (scrolling window + wheel + dead zones — also
+  kills the invisible-dispatch hazard).
+- **Medium:** A5 keymap switch + D1 write-back (one effort) · B2 sub-list indent (+ hanging
+  indent) · C2 transform scope (block-under-caret defaults + deepest-block snapping).
+- **Medium-Large:** E3 chrome theming coherence (one chrome family + the full|zen axis +
+  the phosphor restructure — precedes E1/E2 and E4's landings).
+- **Larger:** B1 word-boundary wrap · E1/E2 chrome presets + polish pass (after A1/A2 and
+  E3; includes the transient status line).
