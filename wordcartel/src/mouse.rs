@@ -135,11 +135,14 @@ pub fn handle(
             return;
         }
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            // scoped borrow → owned Option<CommandId>
-            let hit_id: Option<crate::registry::CommandId> = {
+            // scoped borrow → owned hit values (id + optional buffer) — mirrors
+            // the keyboard Enter arm (app.rs) which checks row.buffer first so
+            // that Buffers-kind rows switch buffers rather than dispatching their
+            // sentinel CommandId("palette").
+            let hit: Option<(crate::registry::CommandId, Option<crate::editor::BufferId>)> = {
                 let p = editor.palette.as_ref().unwrap();
                 crate::render::palette_row_at(area, p, ev.column, ev.row)
-                    .and_then(|idx| p.rows.get(idx).map(|r| r.id))
+                    .and_then(|idx| p.rows.get(idx).map(|r| (r.id, r.buffer)))
             };
             // was the click inside the overlay rect at all?
             let inside = {
@@ -147,8 +150,19 @@ pub fn handle(
                 let r = crate::render::palette_overlay_rect(area, row_count);
                 ev.column >= r.x && ev.column < r.x + r.width && ev.row >= r.y && ev.row < r.y + r.height
             };
-            if let Some(id) = hit_id {
-                crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
+            if let Some((id, buffer)) = hit {
+                if let Some(bid) = buffer {
+                    // Buffer-switcher row: dismiss palette, jump to buffer — same
+                    // path as the keyboard Enter arm. Pre-existing bug: the old
+                    // code dispatched CommandId("palette") for every buffer row,
+                    // reopening the picker instead of switching.
+                    editor.palette = None;
+                    if let Some(idx) = editor.buffers.iter().position(|b| b.id == bid) {
+                        crate::workspace::switch_to(editor, idx);
+                    }
+                } else {
+                    crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
+                }
             } else if !inside {
                 editor.palette = None; // click outside closes
                 editor.search = None;
@@ -890,5 +904,44 @@ mod tests {
         // Verify the file browser is still open (unconditional return preserved).
         assert!(e.file_browser.is_some(), "file browser must still be open after wheel");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pre-existing bug (aligned here): clicking a Buffers-kind palette row must
+    /// switch to that buffer and close the palette — not dispatch
+    /// CommandId("palette") which reopens the picker. The mouse path is aligned
+    /// with the keyboard Enter arm (app.rs ~1238) that checks row.buffer first.
+    ///
+    /// Unscrolled click (2 buffers — doc + scratch): the list fits in the window
+    /// without scrolling. A scrolled variant is not needed here — the abs-row
+    /// mapping for scrolled clicks is already covered by
+    /// `scrolled_click_maps_to_absolute_row`; the bug is in the dispatch branch,
+    /// not in the hit-test, so an unscrolled click exercises the full fix path.
+    #[test]
+    fn click_buffers_palette_row_switches_buffer_not_reopens() {
+        let mut e = Editor::new_from_text(
+            "doc\n", Some(std::path::PathBuf::from("/tmp/a.md")), (80, 24));
+        e.install_scratch();
+        // buffers[0] = doc (active), buffers[1] = scratch.
+        let scratch_id = e.scratch_id.unwrap();
+        assert_eq!(e.active, 0, "precondition: doc is active before the click");
+        e.open_buffer_switcher();
+        // rows[0] = doc (MRU front), rows[1] = scratch — both carry buffer: Some(id).
+        assert_eq!(e.palette.as_ref().unwrap().rows.len(), 2,
+            "precondition: exactly 2 rows in the Buffers palette");
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let rect = crate::render::palette_overlay_rect(area, 2);
+        // Click the second list row (rows[1] = scratch) at ov_y + 2 + 1.
+        let click_row = rect.y + 2 + 1;
+        let d = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 1,
+            row: click_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let (reg, ex, clk, tx, km) = ctx();
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        assert!(e.palette.is_none(), "palette must close after clicking a buffer row");
+        assert_eq!(e.active().id, scratch_id,
+            "click must switch to the clicked row's buffer (scratch), not reopen the palette");
     }
 }
