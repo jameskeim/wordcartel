@@ -1,6 +1,6 @@
 # A1: menu bar modes (hidden | auto | pinned) + dwell reveal — design
 
-**Status:** Codex round 1 folded (scrollbar-click geometry site; typewriter branch; page_step overlap preservation; MENU_ORDER visibility; the RESOLVED Moved predicate; nine open_* sites); re-review pending
+**Status:** Codex spec-review CLEAN (2 rounds; r2 pinned the Moved-arm placement BEFORE the overlay block); Fable5 pass pending
 **Date:** 2026-07-03
 **Effort:** a1-menu-bar-modes — the second effort off `docs/ux-backlog.md` (A1; design settled at
 the 2026-07-03 triage, `auto` default confirmed; the one open fork — reveal geometry — resolved
@@ -157,8 +157,10 @@ Mirrors the scrollbar transient-chrome pattern (`scrollbar_until_ms` +
 `recompute_scrollbar_visible` in `advance()`, app.rs:2242-2244 + :1864):
 
 - **`pub const MENU_DWELL_MS: u64 = 250;`** (a named tunable const).
-- **The `Moved` arm** (mouse.rs, before the `_ => {}` catch-all at :258) — deliberately
-  trivial (it runs on every motion frame; integer compares + stores ONLY, no rebuild/redraw).
+- **The `Moved` arm** (mouse.rs — placed **BEFORE the `if editor.menu.is_some()` overlay
+  block**, which returns unconditionally for every mouse event while the dropdown is open,
+  mouse.rs:141; Codex round 2) — deliberately trivial (it runs on every motion frame; integer
+  compares + stores ONLY, no rebuild/redraw).
   **The predicate is RESOLVED (Codex round 1, replacing plan-confirm 7)** — the key insight:
   leave-bookkeeping must run EVEN WHILE the dropdown is open, so closing the dropdown never
   strands a stale revealed bar; arming, by contrast, only happens with the dropdown closed:
@@ -249,11 +251,13 @@ if editor.menu_bar_mode == MenuBarMode::Auto && kind == MouseEventKind::Moved {
 6. The deadline-array insertion (app.rs:2152-2183) + confirm `recompute_menu_reveal`'s
    placement in `advance()` keeps the harness-drivable property (the e2e `step` calls
    `advance`).
-7. RESOLVED (Codex round 1): the predicate is pinned in Component 3 verbatim (leave-
+7. RESOLVED (Codex rounds 1-2): the predicate is pinned in Component 3 verbatim (leave-
    bookkeeping runs even while the dropdown is open; arming requires dropdown-closed +
-   no-drag + not-revealed). Remaining plan detail: the arm's PLACEMENT — it must run BEFORE
-   the overlay block's `return` (the overlay block early-returns on Down(Left) only, but
-   confirm Moved events reach the arm when the dropdown is open) — and a unit test pinning
-   the predicate table.
+   no-drag + not-revealed). **PLACEMENT is also pinned (Codex round 2): the arm goes BEFORE
+   the `if editor.menu.is_some()` overlay block** — that block returns UNCONDITIONALLY at
+   mouse.rs:141 for every mouse event while the dropdown is open (not just Down(Left)), so
+   an arm placed after it would never see Moved events mid-dropdown and the leave-bookkeeping
+   would silently not run. Remaining plan detail: a unit test pinning the predicate table
+   (including the dropdown-open leave case).
 8. e2e `Moved` injection shape (`Msg::Input(Event::Mouse(MouseEvent { kind: Moved, … }))`) —
    confirm the harness needs no new sugar beyond a `mouse_move(col, row)` helper.
