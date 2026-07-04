@@ -380,7 +380,7 @@ chrome model (hence the ordering).
 
 ## Theme H — code health
 
-### H1. app.rs decomposition — `SHIPPED` 2026-07-04 — app.rs 4,349 lines (from 5,740); new modules jobs_apply.rs 496, session_restore.rs 309, prompts.rs 414, search_ui.rs 211
+### H1. app.rs decomposition — `SHIPPED` 2026-07-04 — app.rs 4,346 lines (from 5,740); new modules jobs_apply.rs 496, session_restore.rs 309, prompts.rs 414, search_ui.rs 211
 
 *(Added 2026-07-04 from a module-size audit. "H" to avoid colliding with the hardening
 campaign's F-numbering.)*
