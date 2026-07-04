@@ -1092,7 +1092,8 @@ fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_core::history
 }
 
 /// Apply the theme-picker's currently-selected built-in as a live preview.
-fn preview_selected_theme(editor: &mut crate::editor::Editor) {
+/// `pub(crate)` so mouse.rs can call it after a wheel-scroll selection change.
+pub(crate) fn preview_selected_theme(editor: &mut crate::editor::Editor) {
     let name = editor.theme_picker.as_ref().and_then(|tp| tp.rows.get(tp.selected).cloned());
     if let Some(name) = name {
         if let Some(theme) = wordcartel_core::theme::Theme::builtin(&name) { editor.apply_theme(theme); }
@@ -1352,9 +1353,11 @@ pub fn reduce(
             return !editor.quit;
         }
         if let Msg::Input(Event::Paste(text)) = &msg {
+            let ah = editor.active().view.area.1;
             if let Some(tp) = editor.theme_picker.as_mut() {
                 tp.query.push_str(text);
                 crate::theme_picker::rebuild_rows(tp);
+                keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
             }
             preview_selected_theme(editor);
             for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
@@ -1370,20 +1373,62 @@ pub fn reduce(
                     }
                     KeyCode::Enter => { editor.theme_picker = None; } // keep current preview
                     KeyCode::Up => {
-                        if let Some(tp) = editor.theme_picker.as_mut() { tp.selected = tp.selected.saturating_sub(1); }
+                        let ah = editor.active().view.area.1;
+                        if let Some(tp) = editor.theme_picker.as_mut() {
+                            tp.selected = tp.selected.saturating_sub(1);
+                            keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
+                        }
                         preview_selected_theme(editor);
                     }
                     KeyCode::Down => {
+                        let ah = editor.active().view.area.1;
                         if let Some(tp) = editor.theme_picker.as_mut() {
                             let max = tp.rows.len().saturating_sub(1);
                             tp.selected = (tp.selected + 1).min(max);
+                            keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
+                        }
+                        preview_selected_theme(editor);
+                    }
+                    KeyCode::PageDown => {
+                        let ah = editor.active().view.area.1;
+                        if let Some(tp) = editor.theme_picker.as_mut() {
+                            let lh = crate::list_window::list_h_for(tp.rows.len(), ah);
+                            tp.selected = (tp.selected + lh.max(1)).min(tp.rows.len().saturating_sub(1));
+                            keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
+                        }
+                        preview_selected_theme(editor);
+                    }
+                    KeyCode::PageUp => {
+                        let ah = editor.active().view.area.1;
+                        if let Some(tp) = editor.theme_picker.as_mut() {
+                            let lh = crate::list_window::list_h_for(tp.rows.len(), ah);
+                            tp.selected = tp.selected.saturating_sub(lh.max(1));
+                            keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
+                        }
+                        preview_selected_theme(editor);
+                    }
+                    KeyCode::Home => {
+                        let ah = editor.active().view.area.1;
+                        if let Some(tp) = editor.theme_picker.as_mut() {
+                            tp.selected = 0;
+                            keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
+                        }
+                        preview_selected_theme(editor);
+                    }
+                    KeyCode::End => {
+                        let ah = editor.active().view.area.1;
+                        if let Some(tp) = editor.theme_picker.as_mut() {
+                            tp.selected = tp.rows.len().saturating_sub(1);
+                            keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
                         }
                         preview_selected_theme(editor);
                     }
                     KeyCode::Backspace => {
+                        let ah = editor.active().view.area.1;
                         if let Some(tp) = editor.theme_picker.as_mut() {
                             tp.query.pop();
                             crate::theme_picker::rebuild_rows(tp);
+                            keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
                         }
                         preview_selected_theme(editor);
                     }
@@ -1391,9 +1436,11 @@ pub fn reduce(
                         if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
                             && !k.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
                     {
+                        let ah = editor.active().view.area.1;
                         if let Some(tp) = editor.theme_picker.as_mut() {
                             tp.query.push(c);
                             crate::theme_picker::rebuild_rows(tp);
+                            keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
                         }
                         preview_selected_theme(editor);
                     }
@@ -1416,9 +1463,11 @@ pub fn reduce(
             return !editor.quit;
         }
         if let Msg::Input(Event::Paste(text)) = &msg {
+            let ah = editor.active().view.area.1;
             if let Some(fb) = editor.file_browser.as_mut() {
                 fb.query.push_str(text);
                 crate::file_browser::rebuild_entries(fb);
+                keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
             }
             for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
@@ -1451,6 +1500,9 @@ pub fn reduce(
                                             fb.dir = target;
                                             fb.query.clear();
                                             fb.selected = 0;
+                                            fb.scroll_top = 0; // A6: a stale window over a
+                                            // smaller entry set would make the render slice
+                                            // out-of-order (panic-class) — reset with selected.
                                             crate::file_browser::rebuild_entries(fb);
                                         }
                                     } else {
@@ -1466,27 +1518,67 @@ pub fn reduce(
                         }
                     }
                     KeyCode::Up => {
-                        if let Some(fb) = editor.file_browser.as_mut() { fb.selected = fb.selected.saturating_sub(1); }
+                        let ah = editor.active().view.area.1;
+                        if let Some(fb) = editor.file_browser.as_mut() {
+                            fb.selected = fb.selected.saturating_sub(1);
+                            keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+                        }
                     }
                     KeyCode::Down => {
+                        let ah = editor.active().view.area.1;
                         if let Some(fb) = editor.file_browser.as_mut() {
                             let max = fb.entries.len().saturating_sub(1);
                             fb.selected = (fb.selected + 1).min(max);
+                            keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+                        }
+                    }
+                    KeyCode::PageDown => {
+                        let ah = editor.active().view.area.1;
+                        if let Some(fb) = editor.file_browser.as_mut() {
+                            let lh = crate::list_window::list_h_for(fb.entries.len(), ah);
+                            fb.selected = (fb.selected + lh.max(1)).min(fb.entries.len().saturating_sub(1));
+                            keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        let ah = editor.active().view.area.1;
+                        if let Some(fb) = editor.file_browser.as_mut() {
+                            let lh = crate::list_window::list_h_for(fb.entries.len(), ah);
+                            fb.selected = fb.selected.saturating_sub(lh.max(1));
+                            keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+                        }
+                    }
+                    KeyCode::Home => {
+                        let ah = editor.active().view.area.1;
+                        if let Some(fb) = editor.file_browser.as_mut() {
+                            fb.selected = 0;
+                            keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+                        }
+                    }
+                    KeyCode::End => {
+                        let ah = editor.active().view.area.1;
+                        if let Some(fb) = editor.file_browser.as_mut() {
+                            fb.selected = fb.entries.len().saturating_sub(1);
+                            keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
                         }
                     }
                     KeyCode::Backspace => {
+                        let ah = editor.active().view.area.1;
                         if let Some(fb) = editor.file_browser.as_mut() {
                             fb.query.pop();
                             crate::file_browser::rebuild_entries(fb);
+                            keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
                         }
                     }
                     KeyCode::Char(c)
                         if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
                             && !k.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
                     {
+                        let ah = editor.active().view.area.1;
                         if let Some(fb) = editor.file_browser.as_mut() {
                             fb.query.push(c);
                             crate::file_browser::rebuild_entries(fb);
+                            keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
                         }
                     }
                     _ => {}
@@ -1693,14 +1785,48 @@ pub fn reduce(
                 match k.code {
                     KeyCode::Esc => { editor.outline = None; }
                     KeyCode::Up => {
+                        let ah = editor.active().view.area.1;
                         if let Some(o) = editor.outline.as_mut() {
                             o.selected = o.selected.saturating_sub(1);
+                            keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
                         }
                     }
                     KeyCode::Down => {
+                        let ah = editor.active().view.area.1;
                         if let Some(o) = editor.outline.as_mut() {
                             let max = o.rows.len().saturating_sub(1);
                             o.selected = (o.selected + 1).min(max);
+                            keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
+                        }
+                    }
+                    KeyCode::PageDown => {
+                        let ah = editor.active().view.area.1;
+                        if let Some(o) = editor.outline.as_mut() {
+                            let lh = crate::list_window::list_h_for(o.rows.len(), ah);
+                            o.selected = (o.selected + lh.max(1)).min(o.rows.len().saturating_sub(1));
+                            keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        let ah = editor.active().view.area.1;
+                        if let Some(o) = editor.outline.as_mut() {
+                            let lh = crate::list_window::list_h_for(o.rows.len(), ah);
+                            o.selected = o.selected.saturating_sub(lh.max(1));
+                            keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
+                        }
+                    }
+                    KeyCode::Home => {
+                        let ah = editor.active().view.area.1;
+                        if let Some(o) = editor.outline.as_mut() {
+                            o.selected = 0;
+                            keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
+                        }
+                    }
+                    KeyCode::End => {
+                        let ah = editor.active().view.area.1;
+                        if let Some(o) = editor.outline.as_mut() {
+                            o.selected = o.rows.len().saturating_sub(1);
+                            keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
                         }
                     }
                     KeyCode::Enter => {
@@ -1718,6 +1844,7 @@ pub fn reduce(
                         }
                     }
                     KeyCode::Backspace => {
+                        let ah = editor.active().view.area.1;
                         if let Some(o) = editor.outline.as_mut() {
                             o.query.pop();
                         }
@@ -1725,12 +1852,14 @@ pub fn reduce(
                         let (blocks, rope) = { let b = editor.active(); (b.document.blocks().clone(), b.document.buffer.snapshot()) };
                         if let Some(o) = editor.outline.as_mut() {
                             o.set_query(&q, &blocks, &rope);
+                            keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
                         }
                     }
                     KeyCode::Char(c)
                         if !k.modifiers.contains(KeyModifiers::CONTROL)
                             && !k.modifiers.contains(KeyModifiers::ALT) =>
                     {
+                        let ah = editor.active().view.area.1;
                         if let Some(o) = editor.outline.as_mut() {
                             o.query.push(c);
                         }
@@ -1738,6 +1867,7 @@ pub fn reduce(
                         let (blocks, rope) = { let b = editor.active(); (b.document.blocks().clone(), b.document.buffer.snapshot()) };
                         if let Some(o) = editor.outline.as_mut() {
                             o.set_query(&q, &blocks, &rope);
+                            keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
                         }
                     }
                     _ => {}
@@ -5352,6 +5482,239 @@ mod tests {
         assert!(p.selected.saturating_sub(p.scroll_top) < lh,
             "Buffers palette: PageDown selection visible (selected={}, scroll_top={}, lh={})",
             p.selected, p.scroll_top, lh);
+    }
+
+    // -----------------------------------------------------------------------
+    // A6 Task 2: sibling overlay windowed scrolling
+    // -----------------------------------------------------------------------
+
+    /// A6 (outline): 25 headings, pressing Down past the 15-row window cap keeps
+    /// `selected - scroll_top < list_h`; PgDn/Home/End land at the expected positions.
+    ///
+    /// TDD RED: without `keep_overlay_visible` in the Up/Down arms, `scroll_top`
+    /// stays 0 so `selected - scroll_top < list_h` fails when selected > 14.
+    #[test]
+    fn outline_pgdn_home_end_land_exactly() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        // Build a document with 25 headings so the outline exceeds the 15-row window.
+        let doc: String = (0..25).map(|i| format!("# Heading {i:02}\n\n")).collect();
+        let mut e = Editor::new_from_text(&doc, None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_outline();
+        assert_eq!(e.outline.as_ref().unwrap().rows.len(), 25, "precondition: 25 headings");
+        let reg = Registry::builtins();
+        let km = cua_keymap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let press_key = |c: KeyCode| Msg::Input(Event::Key(KeyEvent {
+            code: c, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE,
+        }));
+        let lh = crate::list_window::list_h_for(25, 24);
+        assert_eq!(lh, 15, "list_h must be 15 for a 24-row terminal with 25 rows");
+        // Down ×20 — crosses the 15-row window.
+        for _ in 0..20 {
+            crate::app::reduce(press_key(KeyCode::Down), &mut e, &reg, &km, &ex, &clk, &tx);
+        }
+        let o = e.outline.as_ref().unwrap();
+        assert_eq!(o.selected, 20);
+        assert!(o.selected.saturating_sub(o.scroll_top) < lh,
+            "Down×20: selected={} scroll_top={} lh={} — selection must be visible",
+            o.selected, o.scroll_top, lh);
+        // End — lands at the last heading.
+        crate::app::reduce(press_key(KeyCode::End), &mut e, &reg, &km, &ex, &clk, &tx);
+        let o = e.outline.as_ref().unwrap();
+        assert_eq!(o.selected, 24, "End must land on last row");
+        assert!(o.selected.saturating_sub(o.scroll_top) < lh, "End: selection visible");
+        // Home — lands at 0, scroll_top resets.
+        crate::app::reduce(press_key(KeyCode::Home), &mut e, &reg, &km, &ex, &clk, &tx);
+        let o = e.outline.as_ref().unwrap();
+        assert_eq!(o.selected, 0, "Home must land on first row");
+        assert_eq!(o.scroll_top, 0, "Home: scroll_top must reset to 0");
+        // PageDown from 0 — jumps by lh.
+        crate::app::reduce(press_key(KeyCode::PageDown), &mut e, &reg, &km, &ex, &clk, &tx);
+        let o = e.outline.as_ref().unwrap();
+        assert!(o.selected > 0, "PageDown must move past first row");
+        assert!(o.selected.saturating_sub(o.scroll_top) < lh, "PageDown: selection visible");
+    }
+
+    /// A6 (file browser): 25 entries in a tempdir, Down past window keeps the
+    /// selection visible; PgDn/Home/End land correctly; Enter dispatches the
+    /// visible row, not the out-of-window rows[0].
+    ///
+    /// TDD RED: without `keep_overlay_visible` in the key arms, scroll_top stays 0
+    /// so the visible-row assertion fails after Down×20.
+    #[test]
+    fn file_browser_pgdn_home_end_and_enter_dispatches_visible() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        // Create a tempdir with 24 subdirectories → 25 entries (.., d00..d23).
+        let dir = std::env::temp_dir().join(format!("wc-a6-fb-nav-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..24usize {
+            std::fs::create_dir(dir.join(format!("d{i:02}"))).unwrap();
+        }
+        let mut e = Editor::new_from_text("", None, (80, 24));
+        e.open_file_browser(dir.clone());
+        assert_eq!(e.file_browser.as_ref().unwrap().entries.len(), 25,
+            "precondition: 25 entries (.., d00..d23)");
+        let reg = Registry::builtins();
+        let km = cua_keymap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let press_key = |c: KeyCode| Msg::Input(Event::Key(KeyEvent {
+            code: c, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE,
+        }));
+        let lh = crate::list_window::list_h_for(25, 24);
+        assert_eq!(lh, 15);
+        // Down ×20 — crosses the 15-row window.
+        for _ in 0..20 {
+            crate::app::reduce(press_key(KeyCode::Down), &mut e, &reg, &km, &ex, &clk, &tx);
+        }
+        let fb = e.file_browser.as_ref().unwrap();
+        assert_eq!(fb.selected, 20);
+        assert!(fb.selected.saturating_sub(fb.scroll_top) < lh,
+            "Down×20: selected={} scroll_top={} lh={} — selection must be visible",
+            fb.selected, fb.scroll_top, lh);
+        // End — last row.
+        crate::app::reduce(press_key(KeyCode::End), &mut e, &reg, &km, &ex, &clk, &tx);
+        let fb = e.file_browser.as_ref().unwrap();
+        assert_eq!(fb.selected, 24, "End must land on last row");
+        assert!(fb.selected.saturating_sub(fb.scroll_top) < lh, "End: selection visible");
+        // Home — row 0.
+        crate::app::reduce(press_key(KeyCode::Home), &mut e, &reg, &km, &ex, &clk, &tx);
+        let fb = e.file_browser.as_ref().unwrap();
+        assert_eq!(fb.selected, 0); assert_eq!(fb.scroll_top, 0);
+        // PageDown from 0.
+        crate::app::reduce(press_key(KeyCode::PageDown), &mut e, &reg, &km, &ex, &clk, &tx);
+        let fb = e.file_browser.as_ref().unwrap();
+        assert!(fb.selected > 0);
+        assert!(fb.selected.saturating_sub(fb.scroll_top) < lh, "PageDown: selection visible");
+        // Enter-dispatches-visible: navigate to a deep selection, Enter opens that entry.
+        // Navigate to the last entry (index 24 = d23 directory), scroll_top > 0.
+        crate::app::reduce(press_key(KeyCode::End), &mut e, &reg, &km, &ex, &clk, &tx);
+        let selected_entry = e.file_browser.as_ref().unwrap()
+            .entries[e.file_browser.as_ref().unwrap().selected].name.clone();
+        // The selected entry's scroll_top must be > 0 (we're at the end of a 25-entry list).
+        assert!(e.file_browser.as_ref().unwrap().scroll_top > 0,
+            "precondition for visible-row dispatch: scroll_top must be > 0");
+        // Enter on a directory — descend (selected entry is d23 directory).
+        crate::app::reduce(press_key(KeyCode::Enter), &mut e, &reg, &km, &ex, &clk, &tx);
+        // After descend into a directory: selected==0, scroll_top==0.
+        if let Some(fb) = e.file_browser.as_ref() {
+            // We descended into the dir named `selected_entry`.
+            assert!(fb.dir.ends_with(&selected_entry),
+                "must have descended into {selected_entry:?}, dir={:?}", fb.dir);
+            assert_eq!(fb.selected, 0, "after descend: selected must reset to 0");
+            assert_eq!(fb.scroll_top, 0, "after descend: scroll_top must reset to 0");
+        } else {
+            // If the dir was empty (unlikely), the browser closed — not a failure of the test goal.
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A6 (file browser descend pin, panic-class C1): a tempdir with 25 subdirectories
+    /// (`d00`..`d24`); PgDn lands on index 15 (= `d14`, after `..` at index 0) with
+    /// `scroll_top > 0`; Enter resets `scroll_top = 0` and `selected = 0` — a stale
+    /// window over a smaller-or-different entry set would cause an out-of-bounds slice
+    /// (panic class) on the next render.
+    ///
+    /// TDD RED: without `fb.scroll_top = 0` in the Enter descend arm, `scroll_top`
+    /// stays at its pre-descend value; if the new directory has fewer entries the
+    /// render slice `entries[scroll_top..end]` panics (or shows stale content).
+    #[test]
+    fn file_browser_scrolled_descend_resets_window() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        // 25 subdirs (d00..d24) at the top; two small files INSIDE d14 so it's non-empty
+        // but the browser list from d14 is smaller (just ".." + 2 files = 3 entries).
+        let parent = std::env::temp_dir().join(format!("wc-a6-descend-{}", std::process::id()));
+        std::fs::create_dir_all(&parent).unwrap();
+        for i in 0..25usize {
+            std::fs::create_dir(parent.join(format!("d{i:02}"))).unwrap();
+        }
+        std::fs::write(parent.join("d14").join("file_a.md"), "x").unwrap();
+        std::fs::write(parent.join("d14").join("file_b.md"), "x").unwrap();
+        let mut e = Editor::new_from_text("", None, (80, 24));
+        e.open_file_browser(parent.clone());
+        // rebuild_entries sorts dirs before files; ".." is index 0, d00..d24 follow.
+        // 26 entries total (.., d00..d24).
+        assert_eq!(e.file_browser.as_ref().unwrap().entries.len(), 26,
+            "precondition: 26 entries (.., d00..d24)");
+        let reg = Registry::builtins();
+        let km = cua_keymap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let press_key = |c: KeyCode| Msg::Input(Event::Key(KeyEvent {
+            code: c, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE,
+        }));
+        // PgDn from 0: selected = min(0 + 15, 25) = 15 (= d14, after ".." + d00..d13).
+        crate::app::reduce(press_key(KeyCode::PageDown), &mut e, &reg, &km, &ex, &clk, &tx);
+        let fb = e.file_browser.as_ref().unwrap();
+        assert_eq!(fb.selected, 15, "PgDn must land on index 15 (d14)");
+        assert!(fb.scroll_top > 0, "PgDn must advance scroll_top past 0");
+        assert_eq!(fb.entries[fb.selected].name, "d14", "selected entry must be d14");
+        assert!(fb.entries[fb.selected].is_dir, "d14 must be a directory");
+        // Enter → descend into d14. No panic, selected and scroll_top reset.
+        crate::app::reduce(press_key(KeyCode::Enter), &mut e, &reg, &km, &ex, &clk, &tx);
+        let fb = e.file_browser.as_ref().expect("file browser must remain open after descend into dir");
+        assert_eq!(fb.selected, 0, "after descend: selected must reset to 0");
+        assert_eq!(fb.scroll_top, 0, "after descend: scroll_top must reset to 0");
+        // Entries from d14: "..", file_a.md, file_b.md.
+        assert!(fb.entries.len() >= 2, "d14 has at least 2 entries (.. + files)");
+        // Render must not panic — invoke the painter indirectly by checking slice validity.
+        let lh = crate::list_window::list_h_for(fb.entries.len(), 24);
+        let end = (fb.scroll_top + lh).min(fb.entries.len());
+        let _slice = &fb.entries[fb.scroll_top..end]; // panics if stale scroll_top
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// A6 (theme picker preview pin): pad `tp.rows` to 30 rows using repeated
+    /// real builtin names (cycling), drive with Down×20 (navigation only — no
+    /// Char/Backspace which would rebuild and wipe the padding), then assert:
+    /// (a) the applied theme's name equals `tp.rows[tp.selected]` (correct preview)
+    /// (b) `tp.selected - tp.scroll_top < list_h` (the selection is visible).
+    ///
+    /// TDD RED: without `keep_overlay_visible` in the Down arm (ordering pin), the
+    /// scroll_top stays 0 so assertion (b) fails with selected=20, scroll_top=0, lh=15.
+    #[test]
+    fn theme_picker_preview_pin_visible_row() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("# Heading\n\nhello\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_theme_picker(); // populates rows from builtin_names
+        let reg = Registry::builtins(); let km = cua_keymap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        // Pad tp.rows to 30 by cycling real builtin names — navigation-only,
+        // no Char/Backspace which would call rebuild_rows and wipe the padding.
+        {
+            let names = wordcartel_core::theme::Theme::builtin_names();
+            let tp = e.theme_picker.as_mut().unwrap();
+            tp.rows.clear();
+            for i in 0..30 { tp.rows.push(names[i % names.len()].to_string()); }
+        }
+        assert_eq!(e.theme_picker.as_ref().unwrap().rows.len(), 30);
+        let press_key = |c: KeyCode| Msg::Input(Event::Key(KeyEvent {
+            code: c, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE,
+        }));
+        // Drive Down ×20.
+        for _ in 0..20 {
+            crate::app::reduce(press_key(KeyCode::Down), &mut e, &reg, &km, &ex, &clk, &tx);
+        }
+        let tp = e.theme_picker.as_ref().unwrap();
+        assert_eq!(tp.selected, 20, "selected must be 20 after Down×20");
+        let lh = crate::list_window::list_h_for(tp.rows.len(), 24);
+        assert_eq!(lh, 15, "list_h must be 15 for 30 rows on 24-row terminal");
+        // (b) visible invariant.
+        assert!(tp.selected.saturating_sub(tp.scroll_top) < lh,
+            "preview pin: selected={} scroll_top={} lh={} — selection must be visible",
+            tp.selected, tp.scroll_top, lh);
+        // (a) the applied theme's name must equal tp.rows[tp.selected].
+        let expected_name = tp.rows[tp.selected].clone();
+        assert_eq!(e.theme.name, expected_name,
+            "applied theme must equal tp.rows[selected]={expected_name:?}, got {:?}", e.theme.name);
     }
 
     /// The arm block (post-rebuild) sets `due_at` once and does not push the

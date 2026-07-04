@@ -674,7 +674,7 @@ impl Editor {
         self.file_browser = None;
         self.theme_picker = Some(crate::theme_picker::ThemePicker {
             query: String::new(), selected: 0, rows: Vec::new(),
-            original: self.theme.clone(),
+            scroll_top: 0, original: self.theme.clone(),
         });
         if let Some(tp) = self.theme_picker.as_mut() { crate::theme_picker::rebuild_rows(tp); }
     }
@@ -723,7 +723,7 @@ impl Editor {
         self.pending_keys.clear(); self.pending_mark = None;
         self.search = None; self.diag = None; self.outline = None; self.theme_picker = None;
         self.file_browser = Some(crate::file_browser::FileBrowser {
-            dir, query: String::new(), entries: Vec::new(), selected: 0,
+            dir, query: String::new(), entries: Vec::new(), selected: 0, scroll_top: 0,
         });
         if let Some(fb) = self.file_browser.as_mut() { crate::file_browser::rebuild_entries(fb); }
     }

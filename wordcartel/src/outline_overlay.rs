@@ -18,6 +18,8 @@ pub struct OutlineOverlay {
     pub cursor: usize,
     pub rows: Vec<OutlineRow>,
     pub selected: usize,
+    /// First visible row index — drives the windowed painter (A6).
+    pub scroll_top: usize,
     all: Vec<OutlineRow>,
 }
 
@@ -38,6 +40,7 @@ impl OutlineOverlay {
             cursor: 0,
             rows: all.clone(),
             selected: 0,
+            scroll_top: 0,
             all,
         }
     }
@@ -47,6 +50,7 @@ impl OutlineOverlay {
         self.cursor = self.query.len();
         self.rows = crate::palette::fuzzy_filter(&self.all, q, |r| &r.text);
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+        self.scroll_top = self.scroll_top.min(self.rows.len().saturating_sub(1));
     }
 }
 

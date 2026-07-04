@@ -123,31 +123,22 @@ path; no switch command; presets = cua, wordstar. **Direction:** a `keymap_prese
 the trie is borrowed by `reduce`); menu hints stay fresh automatically (menu rebuilds on every
 open); palette hints must re-resolve. Persistence rides on D1 — these two ship together.
 Checkable/radio menu items (E2) show the active preset.
-### A6. Palette reachability: full-list scrolling + wheel + click dead zones — `needs-design` · Small-Medium
+### A6. Palette reachability: full-list scrolling + wheel + click dead zones — `SHIPPED` 2026-07-04 (A6 T1+T2)
 
 *(Added 2026-07-04; answers A3(b). Facts as of `bd3b72c`.)*
 
-**Facts:** the `Palette` struct has NO scroll field (palette.rs:19-28); render slices only the
-FIRST `list_h` rows into the ratatui `List` (`rows.iter().take(list_h)`, render.rs:760-777)
-with `list_h = min(row_count, 15, h-4)` (`palette_overlay_rect`, render.rs:150-159). Arrow
-keys move `selected` over the FULL row set (app.rs:1240-1249, max = rows.len()-1 = ~125) but
-ratatui can only scroll items it received — so past row 15 the highlight simply VANISHES,
-and **Enter still dispatches the invisible selection** (a silent-wrong-action hazard, worse
-than mere unreachability). PgUp/PgDn: no key arms at all. Mouse wheel: the palette overlay
-block returns early for ALL mouse events (mouse.rs:122-145) — ScrollUp/Down never reach the
-scroll arms. Click: CORRECT for visible list rows (`palette_row_at` matches the render
-layout exactly, render.rs:163-174; test-pinned) — but clicks on the query row and border
-cells are swallowed silently (inside the overlay → neither dispatch nor close), the likely
-source of the "can't click" report.
+**Shipped:** `scroll_top` added to all four overlays (Palette, OutlineOverlay, ThemePicker,
+FileBrowser); shared `list_h_for` / `keep_visible` module (`list_window.rs`); render painters
+self-heal on every frame (resize-safe); key arms re-window after every selection change; mouse
+wheel arms for palette/theme-picker/file-browser (tp wheel also previews correct row); PgUp/PgDn/
+Home/End for all four overlays; scrolled-descend reset (panic-class C1 fixed); `windowed_indicator`
+helper in render.rs replaces inline copies across all four painters.
 
-**Direction:** add a scroll offset (`scroll_top`) to `Palette`; render slices
-`[scroll_top .. scroll_top+list_h]`; selection movement scrolls the window to follow
-(standard follow-the-cursor windowing); PgUp/PgDn arms; wheel events route to palette
-scrolling while it's open (the overlay block handles them instead of swallowing); decide the
-dead-zone behavior (query-row/border clicks: no-op is acceptable, but must not eat the
-event silently if a better affordance is cheap). Kills the invisible-dispatch hazard by
-construction (selection always visible). Same windowing likely wanted for outline/theme
-picker/file browser (they share the pattern — verify in-effort and fix uniformly if cheap).
+**Remaining follow-up (overlay mouse parity) — `needs-design` · Small:** click-to-select for
+theme picker and file browser list rows (the same `palette_row_at` pattern, not yet wired); an
+outline mouse block (currently the outline overlay swallows ALL mouse events — no click-to-jump);
+A3 curation pass (reduced — the "subset impression" was reachability, now fixed). Promote to a
+full effort when prioritized.
 
 
 ---

@@ -186,9 +186,32 @@ pub fn handle(
         return;
     }
     if editor.theme_picker.is_some() {
+        if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+            let ah = editor.active().view.area.1;
+            if let Some(tp) = editor.theme_picker.as_mut() {
+                if matches!(ev.kind, MouseEventKind::ScrollDown) {
+                    tp.selected = (tp.selected + 1).min(tp.rows.len().saturating_sub(1));
+                } else {
+                    tp.selected = tp.selected.saturating_sub(1);
+                }
+                crate::app::keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
+            }
+            crate::app::preview_selected_theme(editor);
+        }
         return;
     }
     if editor.file_browser.is_some() {
+        if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+            let ah = editor.active().view.area.1;
+            if let Some(fb) = editor.file_browser.as_mut() {
+                if matches!(ev.kind, MouseEventKind::ScrollDown) {
+                    fb.selected = (fb.selected + 1).min(fb.entries.len().saturating_sub(1));
+                } else {
+                    fb.selected = fb.selected.saturating_sub(1);
+                }
+                crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+            }
+        }
         return;
     }
     match ev.kind {
@@ -713,7 +736,7 @@ mod tests {
             "theme_picker open must block arming");
         assert!(fire(&|e| { e.file_browser = Some(crate::file_browser::FileBrowser {
             dir: std::path::PathBuf::from("."), query: String::new(),
-            entries: vec![], selected: 0,
+            entries: vec![], selected: 0, scroll_top: 0,
         }); }).is_none(), "file_browser open must block arming");
         assert!(fire(&|e| { e.menu = Some(crate::menu::empty_at(0)); }).is_none(),
             "dropdown open must block arming");
@@ -785,5 +808,87 @@ mod tests {
         handle(&mut e, wheel_up, &reg, &km, &ex, &clk, &tx);
         assert!(e.mouse.menu_reveal_due.is_none(),
             "ScrollUp at row 0 must not arm the dwell (Moved-kind gate)");
+    }
+
+    // -----------------------------------------------------------------------
+    // A6 Task 2: tp/fb mouse wheel
+    // -----------------------------------------------------------------------
+
+    /// A6: ScrollDown wheel on the theme picker moves selected, keeps the window
+    /// visible, and previews the correct row (ordering pin).
+    ///
+    /// TDD RED: without the wheel block (just `return`), selected stays 0 and
+    /// the theme is not previewed.
+    #[test]
+    fn tp_wheel_scroll_moves_selection_and_previews() {
+        let mut e = Editor::new_from_text("# Hello\n\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_theme_picker();
+        // There are only 13 builtins — pad to 20 by cycling real builtin names so
+        // the list exceeds the 15-row window cap. Navigation-only (no Char/Backspace)
+        // so rebuild_rows is never called and the padding stays in place.
+        {
+            let names = wordcartel_core::theme::Theme::builtin_names();
+            let tp = e.theme_picker.as_mut().unwrap();
+            tp.rows.clear();
+            for i in 0..20 { tp.rows.push(names[i % names.len()].to_string()); }
+        }
+        assert_eq!(e.theme_picker.as_ref().unwrap().rows.len(), 20);
+        let lh = crate::list_window::list_h_for(20, 24);
+        assert_eq!(lh, 15, "list_h = 15 for 20 rows on 24-row terminal");
+        let (reg, ex, clk, tx, km) = ctx();
+        let scroll_down = MouseEvent {
+            kind: MouseEventKind::ScrollDown, column: 40, row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        // 16 scroll-downs — pushes past the 15-row window.
+        for _ in 0..16 {
+            handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx);
+        }
+        let tp = e.theme_picker.as_ref().expect("picker must remain open");
+        assert_eq!(tp.selected, 16, "selected must be 16 after 16 scroll-downs");
+        assert!(tp.selected.saturating_sub(tp.scroll_top) < lh,
+            "tp wheel: selection visible (selected={}, scroll_top={}, lh={})",
+            tp.selected, tp.scroll_top, lh);
+        // The applied theme must equal tp.rows[tp.selected] (wheel previews correct row).
+        let expected_name = tp.rows[tp.selected].clone();
+        assert_eq!(e.theme.name, expected_name,
+            "tp wheel: applied theme={:?} must equal tp.rows[selected]={expected_name:?}",
+            e.theme.name);
+    }
+
+    /// A6: ScrollDown wheel on the file browser moves selected and keeps the window
+    /// visible. The unconditional `return` still prevents text-area events.
+    ///
+    /// TDD RED: without the wheel block (just `return`), selected stays 0.
+    #[test]
+    fn fb_wheel_scroll_moves_selection() {
+        // 20 directories → 21 entries (.., d00..d19).
+        let dir = std::env::temp_dir().join(format!("wc-a6-fbwheel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..20usize {
+            std::fs::create_dir(dir.join(format!("d{i:02}"))).unwrap();
+        }
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        e.open_file_browser(dir.clone());
+        let total = e.file_browser.as_ref().unwrap().entries.len();
+        assert_eq!(total, 21, "precondition: 21 entries");
+        let (reg, ex, clk, tx, km) = ctx();
+        let scroll_down = MouseEvent {
+            kind: MouseEventKind::ScrollDown, column: 40, row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        for _ in 0..20 {
+            handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx);
+        }
+        let fb = e.file_browser.as_ref().expect("browser must remain open");
+        assert_eq!(fb.selected, 20, "selected must be 20 after 20 scroll-downs");
+        let lh = crate::list_window::list_h_for(fb.entries.len(), 24);
+        assert!(fb.selected.saturating_sub(fb.scroll_top) < lh,
+            "fb wheel: selection visible (selected={}, scroll_top={}, lh={})",
+            fb.selected, fb.scroll_top, lh);
+        // Verify the file browser is still open (unconditional return preserved).
+        assert!(e.file_browser.is_some(), "file browser must still be open after wheel");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

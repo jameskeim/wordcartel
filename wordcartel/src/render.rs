@@ -144,6 +144,18 @@ pub(crate) fn menu_dropdown_row_at(area: Rect, groups: &[(crate::registry::MenuC
     } else { None }
 }
 
+/// Indicator title for a windowed overlay list — `" {n}/{total} "` right-aligned when
+/// the list is taller than the visible window; `None` when everything fits (A6).
+fn windowed_indicator(selected: usize, total: usize, list_h: usize)
+    -> Option<ratatui::text::Line<'static>>
+{
+    if total > list_h {
+        Some(ratatui::text::Line::from(format!(" {}/{} ", selected + 1, total)).right_aligned())
+    } else {
+        None
+    }
+}
+
 /// Compute the palette overlay bounding rect for a given terminal area and row count.
 /// The overlay height is sized to the actual number of palette rows (capped at 15).
 /// Both the render code and mouse hit-testing call this to share geometry.
@@ -740,11 +752,8 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         // Draw the border (FIX-3: themed with Chrome so the frame matches the panel bg).
         let mut block = Block::default().borders(Borders::ALL).title(" Command Palette ")
             .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
-        if palette.rows.len() > list_h as usize {
-            block = block.title_bottom(
-                ratatui::text::Line::from(format!(" {}/{} ", palette.selected + 1, palette.rows.len()))
-                    .right_aligned(),
-            );
+        if let Some(ind) = windowed_indicator(palette.selected, palette.rows.len(), list_h as usize) {
+            block = block.title_bottom(ind);
         }
         frame.render_widget(block, ov_rect);
 
@@ -793,17 +802,25 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         );
     }
 
+    // A6 self-heal: the window must respect the LIVE frame's geometry (resize
+    // has no overlay hook; render is the one place that always sees the truth).
+    if let Some(o) = editor.outline.as_mut() {
+        crate::app::keep_overlay_visible(h, o.selected, o.rows.len(), &mut o.scroll_top);
+    }
     if let Some(ref outline) = editor.outline {
         let ov_rect = palette_overlay_rect(area, outline.rows.len());
         let ov_x = ov_rect.x;
         let ov_y = ov_rect.y;
         let ov_w = ov_rect.width;
         let ov_h = ov_rect.height;
-        let list_h = (outline.rows.len() as u16).min(15).min(h.saturating_sub(4));
+        let list_h = crate::list_window::list_h_for(outline.rows.len(), h);
 
         frame.render_widget(Clear, ov_rect);
-        let block = Block::default().borders(Borders::ALL).title(" Outline ")
+        let mut block = Block::default().borders(Borders::ALL).title(" Outline ")
             .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
+        if let Some(ind) = windowed_indicator(outline.selected, outline.rows.len(), list_h) {
+            block = block.title_bottom(ind);
+        }
         frame.render_widget(block, ov_rect);
 
         if ov_h >= 3 {
@@ -816,16 +833,22 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             );
 
             if ov_h >= 4 && list_h > 0 {
-                let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h);
+                let list_h_u16 = list_h as u16;
+                let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h_u16);
                 let highlight_style = ov_highlight_style;
-                let items: Vec<ListItem> = outline.rows.iter().take(list_h as usize).map(|row| {
+                let end = (outline.scroll_top + list_h).min(outline.rows.len());
+                let items: Vec<ListItem> = outline.rows[outline.scroll_top..end].iter().map(|row| {
                     let mut text = format!("{}{}", " ".repeat(row.indent.saturating_mul(2)), row.text);
                     text = text.chars().take(list_area.width as usize).collect();
                     ListItem::new(Line::from(text))
                 }).collect();
 
                 let mut list_state = ListState::default();
-                list_state.select(if outline.rows.is_empty() { None } else { Some(outline.selected) });
+                list_state.select(if outline.rows.is_empty() {
+                    None
+                } else {
+                    Some(outline.selected.saturating_sub(outline.scroll_top))
+                });
 
                 frame.render_stateful_widget(
                     List::new(items).highlight_style(highlight_style),
@@ -839,17 +862,25 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     // -----------------------------------------------------------------------
     // Theme picker overlay (drawn on top of everything else)
     // -----------------------------------------------------------------------
+    // A6 self-heal: the window must respect the LIVE frame's geometry (resize
+    // has no overlay hook; render is the one place that always sees the truth).
+    if let Some(tp) = editor.theme_picker.as_mut() {
+        crate::app::keep_overlay_visible(h, tp.selected, tp.rows.len(), &mut tp.scroll_top);
+    }
     if let Some(ref tp) = editor.theme_picker {
         let ov_rect = palette_overlay_rect(area, tp.rows.len());
         let ov_x = ov_rect.x;
         let ov_y = ov_rect.y;
         let ov_w = ov_rect.width;
         let ov_h = ov_rect.height;
-        let list_h = (tp.rows.len() as u16).min(15).min(h.saturating_sub(4));
+        let list_h = crate::list_window::list_h_for(tp.rows.len(), h);
 
         frame.render_widget(Clear, ov_rect);
-        let block = Block::default().borders(Borders::ALL).title(" Select Theme ")
+        let mut block = Block::default().borders(Borders::ALL).title(" Select Theme ")
             .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
+        if let Some(ind) = windowed_indicator(tp.selected, tp.rows.len(), list_h) {
+            block = block.title_bottom(ind);
+        }
         frame.render_widget(block, ov_rect);
 
         if ov_h >= 3 {
@@ -862,15 +893,21 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             );
 
             if ov_h >= 4 && list_h > 0 {
-                let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h);
+                let list_h_u16 = list_h as u16;
+                let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h_u16);
                 let highlight_style = ov_highlight_style;
-                let items: Vec<ListItem> = tp.rows.iter().take(list_h as usize).map(|name| {
+                let end = (tp.scroll_top + list_h).min(tp.rows.len());
+                let items: Vec<ListItem> = tp.rows[tp.scroll_top..end].iter().map(|name| {
                     let truncated: String = name.chars().take(list_area.width as usize).collect();
                     ListItem::new(Line::from(truncated))
                 }).collect();
 
                 let mut list_state = ListState::default();
-                list_state.select(if tp.rows.is_empty() { None } else { Some(tp.selected) });
+                list_state.select(if tp.rows.is_empty() {
+                    None
+                } else {
+                    Some(tp.selected.saturating_sub(tp.scroll_top))
+                });
 
                 frame.render_stateful_widget(
                     List::new(items).highlight_style(highlight_style),
@@ -884,18 +921,27 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     // -----------------------------------------------------------------------
     // File browser overlay (drawn on top of everything else)
     // -----------------------------------------------------------------------
+    // A6 self-heal: the window must respect the LIVE frame's geometry (resize
+    // has no overlay hook; render is the one place that always sees the truth).
+    if let Some(fb) = editor.file_browser.as_mut() {
+        crate::app::keep_overlay_visible(h, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+    }
     if let Some(ref fb) = editor.file_browser {
         let ov_rect = palette_overlay_rect(area, fb.entries.len());
         let ov_x = ov_rect.x;
         let ov_y = ov_rect.y;
         let ov_w = ov_rect.width;
         let ov_h = ov_rect.height;
-        let list_h = (fb.entries.len() as u16).min(15).min(h.saturating_sub(4));
+        let list_h = crate::list_window::list_h_for(fb.entries.len(), h);
 
         frame.render_widget(Clear, ov_rect);
         let title = format!(" Open: {} ", fb.dir.display());
-        let block = Block::default().borders(Borders::ALL).title(title)
+        let mut block = Block::default().borders(Borders::ALL).title(title)
             .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
+        // Indicator composes with the existing dynamic title (file browser already uses top title).
+        if let Some(ind) = windowed_indicator(fb.selected, fb.entries.len(), list_h) {
+            block = block.title_bottom(ind);
+        }
         frame.render_widget(block, ov_rect);
 
         if ov_h >= 3 {
@@ -908,16 +954,22 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             );
 
             if ov_h >= 4 && list_h > 0 {
-                let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h);
+                let list_h_u16 = list_h as u16;
+                let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h_u16);
                 let highlight_style = ov_highlight_style;
-                let items: Vec<ListItem> = fb.entries.iter().take(list_h as usize).map(|e| {
+                let end = (fb.scroll_top + list_h).min(fb.entries.len());
+                let items: Vec<ListItem> = fb.entries[fb.scroll_top..end].iter().map(|e| {
                     let label = if e.is_dir { format!("{}/", e.name) } else { e.name.clone() };
                     let truncated: String = label.chars().take(list_area.width as usize).collect();
                     ListItem::new(Line::from(truncated))
                 }).collect();
 
                 let mut list_state = ListState::default();
-                list_state.select(if fb.entries.is_empty() { None } else { Some(fb.selected) });
+                list_state.select(if fb.entries.is_empty() {
+                    None
+                } else {
+                    Some(fb.selected.saturating_sub(fb.scroll_top))
+                });
 
                 frame.render_stateful_widget(
                     List::new(items).highlight_style(highlight_style),
@@ -2131,6 +2183,162 @@ mod tests {
         let buf = render_to_buffer(&mut ed, 60, 16);
         let text: String = (0..16).map(|r| row_string(&buf, r)).collect();
         assert!(text.contains("tokyo-night"), "picker lists built-in themes");
+    }
+
+    // -----------------------------------------------------------------------
+    // A6 Task 2: sibling overlay windowed render checks
+    // -----------------------------------------------------------------------
+
+    /// A6 (outline): a scrolled outline shows rows[scroll_top], not rows[0];
+    /// the indicator appears when scrollable and is absent when all rows fit.
+    #[test]
+    fn outline_windowed_slice_and_indicator() {
+        // 20 headings so the list exceeds the 15-row window cap on a 24-row terminal.
+        let doc: String = (0..20).map(|i| format!("# Heading {i:02}\n\n")).collect();
+        let mut e = Editor::new_from_text(&doc, None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_outline();
+        let total = e.outline.as_ref().unwrap().rows.len();
+        assert_eq!(total, 20, "precondition: 20 headings");
+        // Force a non-zero scroll_top — render's self-heal will validate/keep it.
+        e.outline.as_mut().unwrap().selected = 18;
+        e.outline.as_mut().unwrap().scroll_top = 5; // render self-heal will adjust if needed
+        let buf = render_to_buffer(&mut e, 80, 24);
+        // After render the self-heal has run: read the live scroll_top.
+        let scroll_top = e.outline.as_ref().unwrap().scroll_top;
+        assert!(scroll_top > 0, "scroll_top must be > 0 after seeding selected=18");
+        // First list row (ov_y+2) must show rows[scroll_top], not rows[0].
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let rect = palette_overlay_rect(area, total);
+        let first_list_row = rect.y + 2;
+        let row_text = row_string(&buf, first_list_row);
+        let expected_label = &e.outline.as_ref().unwrap().rows[scroll_top].text;
+        assert!(row_text.contains(expected_label.as_str()),
+            "first visible row must be rows[{scroll_top}] = {expected_label:?}, got: {row_text:?}");
+        // Indicator present (20 rows > 15 window).
+        let bottom_row = rect.y + rect.height - 1;
+        let bottom_text = row_string(&buf, bottom_row);
+        let selected = e.outline.as_ref().unwrap().selected;
+        assert!(bottom_text.contains(&format!(" {}/", selected + 1)),
+            "outline: indicator must show selected+1/{total}, got: {bottom_text:?}");
+        // Non-scrollable: 3 headings, all fit — no indicator digits.
+        let doc2 = "# A\n\n# B\n\n# C\n\n";
+        let mut e2 = Editor::new_from_text(doc2, None, (80, 24));
+        crate::derive::rebuild(&mut e2);
+        e2.open_outline();
+        assert_eq!(e2.outline.as_ref().unwrap().rows.len(), 3);
+        let buf2 = render_to_buffer(&mut e2, 80, 24);
+        let rect2 = palette_overlay_rect(ratatui::layout::Rect::new(0, 0, 80, 24), 3);
+        let bottom2 = rect2.y + rect2.height - 1;
+        let bottom2_text: String = (rect2.x..rect2.x + rect2.width)
+            .map(|x| buf2[(x, bottom2)].symbol().to_string())
+            .collect();
+        assert!(!bottom2_text.chars().any(|c| c.is_ascii_digit()),
+            "non-scrollable outline: no indicator digits in bottom border, got: {bottom2_text:?}");
+    }
+
+    /// A6 (theme picker): scrolled picker shows rows[scroll_top], not rows[0];
+    /// indicator appears when scrollable, absent when all rows fit.
+    #[test]
+    fn theme_picker_windowed_slice_and_indicator() {
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.open_theme_picker();
+        // Only 13 builtins — pad to 20 by cycling real names so the list exceeds
+        // the 15-row window cap. Directly assigned; no rebuild_rows called.
+        {
+            let names = wordcartel_core::theme::Theme::builtin_names();
+            let tp = e.theme_picker.as_mut().unwrap();
+            tp.rows.clear();
+            for i in 0..20 { tp.rows.push(names[i % names.len()].to_string()); }
+        }
+        let total = 20usize;
+        // Seed a scroll — render's self-heal will validate it.
+        e.theme_picker.as_mut().unwrap().selected = 17;
+        e.theme_picker.as_mut().unwrap().scroll_top = 5;
+        let buf = render_to_buffer(&mut e, 80, 24);
+        let scroll_top = e.theme_picker.as_ref().unwrap().scroll_top;
+        assert!(scroll_top > 0, "scroll_top must be > 0 after seeding selected=17");
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let rect = palette_overlay_rect(area, total);
+        let first_list_row = rect.y + 2;
+        let row_text = row_string(&buf, first_list_row);
+        let expected = &e.theme_picker.as_ref().unwrap().rows[scroll_top];
+        assert!(row_text.contains(expected.as_str()),
+            "first visible row must be rows[{scroll_top}] = {expected:?}, got: {row_text:?}");
+        // Indicator present (20 rows > 15 window).
+        let selected = e.theme_picker.as_ref().unwrap().selected;
+        let bottom_row = rect.y + rect.height - 1;
+        let bottom_text = row_string(&buf, bottom_row);
+        assert!(bottom_text.contains(&format!(" {}/", selected + 1)),
+            "theme picker: indicator must show {}/{total}, got: {bottom_text:?}", selected + 1);
+        // Non-scrollable: 1 row fits — no indicator.
+        let mut e2 = Editor::new_from_text("x\n", None, (80, 24));
+        e2.open_theme_picker();
+        {
+            let tp = e2.theme_picker.as_mut().unwrap();
+            tp.rows = vec!["default".to_string()]; // exactly 1 row
+        }
+        let buf2 = render_to_buffer(&mut e2, 80, 24);
+        let rect2 = palette_overlay_rect(ratatui::layout::Rect::new(0, 0, 80, 24), 1);
+        let bottom2 = rect2.y + rect2.height - 1;
+        let bottom2_text: String = (rect2.x..rect2.x + rect2.width)
+            .map(|x| buf2[(x, bottom2)].symbol().to_string())
+            .collect();
+        assert!(!bottom2_text.chars().any(|c| c.is_ascii_digit()),
+            "non-scrollable theme picker: no indicator digits, got: {bottom2_text:?}");
+    }
+
+    /// A6 (file browser): scrolled browser shows entries[scroll_top], not entries[0];
+    /// indicator appears when scrollable, absent when all rows fit.
+    #[test]
+    fn file_browser_windowed_slice_and_indicator() {
+        // 20 directories → 21 entries (.., d00..d19).
+        let dir = std::env::temp_dir().join(format!("wc-a6-fbrender-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..20usize {
+            std::fs::create_dir(dir.join(format!("d{i:02}"))).unwrap();
+        }
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.open_file_browser(dir.clone());
+        let total = e.file_browser.as_ref().unwrap().entries.len();
+        assert_eq!(total, 21, "precondition: 21 entries (.., d00..d19)");
+        // Seed selected deep — render self-heal will compute scroll_top.
+        e.file_browser.as_mut().unwrap().selected = 18;
+        e.file_browser.as_mut().unwrap().scroll_top = 4;
+        let buf = render_to_buffer(&mut e, 80, 24);
+        let scroll_top = e.file_browser.as_ref().unwrap().scroll_top;
+        assert!(scroll_top > 0, "scroll_top must be > 0 after seeding selected=18");
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let rect = palette_overlay_rect(area, total);
+        let first_list_row = rect.y + 2;
+        let row_text = row_string(&buf, first_list_row);
+        let entry = &e.file_browser.as_ref().unwrap().entries[scroll_top];
+        let expected = if entry.is_dir { format!("{}/", entry.name) } else { entry.name.clone() };
+        assert!(row_text.contains(expected.as_str()),
+            "first visible row must be entries[{scroll_top}] = {expected:?}, got: {row_text:?}");
+        // Indicator present.
+        let selected = e.file_browser.as_ref().unwrap().selected;
+        let bottom_row = rect.y + rect.height - 1;
+        let bottom_text = row_string(&buf, bottom_row);
+        assert!(bottom_text.contains(&format!(" {}/", selected + 1)),
+            "file browser: indicator must show {}/{total}, got: {bottom_text:?}", selected + 1);
+        // Non-scrollable: just 2 entries — no indicator.
+        let small_dir = std::env::temp_dir().join(format!("wc-a6-fbrender-small-{}", std::process::id()));
+        std::fs::create_dir_all(&small_dir).unwrap();
+        std::fs::write(small_dir.join("foo.md"), "x").unwrap();
+        let mut e2 = Editor::new_from_text("x\n", None, (80, 24));
+        e2.open_file_browser(small_dir.clone());
+        let buf2 = render_to_buffer(&mut e2, 80, 24);
+        let total2 = e2.file_browser.as_ref().unwrap().entries.len();
+        let rect2 = palette_overlay_rect(ratatui::layout::Rect::new(0, 0, 80, 24), total2);
+        let bottom2 = rect2.y + rect2.height - 1;
+        let bottom2_text: String = (rect2.x..rect2.x + rect2.width)
+            .map(|x| buf2[(x, bottom2)].symbol().to_string())
+            .collect();
+        assert!(!bottom2_text.chars().any(|c| c.is_ascii_digit()),
+            "non-scrollable file browser: no indicator digits, got: {bottom2_text:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&small_dir);
     }
 
     // -----------------------------------------------------------------------
