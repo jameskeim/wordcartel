@@ -202,14 +202,14 @@ fn page_step(editor: &Editor) -> usize {
         e.menu = Some(crate::menu::build(&reg, &km));
         crate::derive::rebuild(&mut e);
         let off = move_page_down(&mut e);
-        let line = editor_line_of(&e, off); // use the existing line-of helper in this mod, or
-                                            // derive::line_of_offset — match local test idiom.
+        let line = e.active().document.buffer.byte_to_line(off); // the local idiom (nav.rs:1369) —
+                                            // Codex-verified; editor_line_of/line_of_offset do NOT exist.
         assert_eq!(line, 7, "PageDown from line 0 with the bar visible steps 7 (8-row viewport, 1 overlap)");
     }
 ```
-  (Adapt helper names to the local test idiom in nav.rs's test mod — the ASSERTED VALUES
-  are the contract. If `line_of_offset` isn't the local name, find the mod's existing
-  line-index helper; do not weaken the `7` / `row < edit_height` expectations.)
+  (The line-index idiom is `buffer.byte_to_line(off)` — Codex-verified against nav.rs:1369;
+  `editor_line_of`/`line_of_offset` do NOT exist. The ASSERTED VALUES are the contract —
+  do not weaken the `7` / `row < edit_height` expectations.)
 
 - [ ] **Step 8: Run + gates + commit.** `cargo test -p wordcartel-core -p wordcartel` green;
   clippy clean; `cargo test --no-run` warning-free.
@@ -319,7 +319,7 @@ pub(crate) fn menu_bar_layout(area: Rect, groups: &[(crate::registry::MenuCatego
             _ => {
                 // Inactive bar (pinned / auto-revealed / unbuilt placeholder): static
                 // labels, all closed-style, no dropdown, no highlight.
-                for (i, rect) in &menu_bar_layout_cats(menu_area, crate::registry::MENU_ORDER) {
+                for (i, rect) in &menu_bar_layout_cats(menu_area, &crate::registry::MENU_ORDER) {
                     let label = crate::menu::category_label_pub(crate::registry::MENU_ORDER[*i]);
                     frame.render_widget(Paragraph::new(format!(" {label} ")).style(menu_closed_style), *rect);
                 }
@@ -340,7 +340,7 @@ pub(crate) fn menu_bar_layout(area: Rect, groups: &[(crate::registry::MenuCatego
             if let CellHit::MenuBar = hit {
                 // Inactive bar: open the dropdown AT the clicked category (hydrated
                 // by reduce's post-handle hydrate_overlays call).
-                let cats_hit = crate::render::menu_bar_layout_cats(area, crate::registry::MENU_ORDER)
+                let cats_hit = crate::render::menu_bar_layout_cats(area, &crate::registry::MENU_ORDER)
                     .into_iter()
                     .find(|(_, r)| ev.column >= r.x && ev.column < r.x + r.width && ev.row == r.y)
                     .map(|(i, _)| i);
@@ -608,14 +608,15 @@ pub fn recompute_menu_bar(editor: &mut crate::editor::Editor, now_ms: u64) {
         let mut h = Harness::new("hello world\n", None, (40, 8));
         h.mouse_down(4, 0);
         assert!(h.editor.menu.is_none(), "no menu opened");
-        assert_eq!(h.editor.active().document.selection.primary().head(), 4,
+        assert_eq!(h.editor.active().document.selection.primary().head, 4,
             "the click placed the caret in the text");
     }
 ```
   (Journey 2 note: real terminals send `Drag` while a button is held; the journey pins the
   belt-and-braces `!dragging` guard for lost-Up cases — construct it exactly as written.
-  Adapt the `head()` accessor to the Selection API's real name — `head()`/`.head` per
-  selection.rs; the asserted OFFSET 4 is the contract. Also flip Task 2's journey-4 literal
+  `head` is a FIELD on the `Range` returned by `primary()` (selection.rs:10 —
+  Codex-verified), NOT a method — journey 5's assertion uses `.primary().head`; the
+  asserted OFFSET 4 is the contract. Also flip Task 2's journey-4 literal
   to the consts now that they exist, and confirm in the report that its dwell-injection
   assertion is now load-bearing.)
 
@@ -664,8 +665,9 @@ away; everything else is complete code.
 `empty_at(usize)`; `menu_bar_layout_cats(Rect, &[MenuCategory]) -> Vec<(usize, Rect)>`
 (the wrapper keeps the old signature); consts are `pub(crate)` in mouse.rs (the spec says
 `pub` — `pub(crate)` satisfies the intent, all consumers are in-crate; e2e.rs references
-them as `crate::mouse::MENU_DWELL_MS`). `Selection::primary().head()` — confirm the real
-accessor name at implementation time (the offset contract is fixed).
+them as `crate::mouse::MENU_DWELL_MS`). `primary().head` is FIELD access (Range.head,
+selection.rs:10 — Codex-verified). `MENU_ORDER` is `[MenuCategory; 5]` (registry.rs:42) —
+`menu_bar_layout_cats` call sites pass `&crate::registry::MENU_ORDER`.
 
 **Ordering:** T1 (pure state/geometry, behavior-identical except the bug fix) → T2 (pinned +
 render + commands; journey 4's dwell line inert until T3) → T3 (the dwell + journeys,
