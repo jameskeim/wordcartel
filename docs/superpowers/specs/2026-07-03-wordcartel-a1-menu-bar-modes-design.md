@@ -1,6 +1,6 @@
 # A1: menu bar modes (hidden | auto | pinned) + dwell reveal — design
 
-**Status:** Codex spec-review CLEAN (2 rounds; r2 pinned the Moved-arm placement BEFORE the overlay block); Fable5 pass pending
+**Status:** Codex x2 clean; Fable5 folded (C1 mouse-path hydration, I1 arm-before-ALL-overlays, I2 capture-strand clear, M1-M6) — I3 leave-grace fork PENDING USER DECISION; re-verify after
 **Date:** 2026-07-03
 **Effort:** a1-menu-bar-modes — the second effort off `docs/ux-backlog.md` (A1; design settled at
 the 2026-07-03 triage, `auto` default confirmed; the one open fork — reveal geometry — resolved
@@ -105,15 +105,19 @@ Replace every `editor.menu.is_some()`-as-geometry read with `menu_bar_rows()`:
   edge-scroll), **and :154-156 — the scrollbar CLICK path (Codex round 1: it computes
   `menu_rows`/`edit_height`/`erow_in_track` from `menu.is_some()` too; missing it would desync
   scrollbar hit mapping under a pinned/revealed bar).**
-- **nav.rs:90/:403/:761/:795 — the bug fix:** these currently use `area.1 - 1` with NO menu
-  subtraction; they switch to a `menu_bar_rows()`-derived editing height (each has `editor` in
-  scope — Codex-confirmed). Two Codex round-1 refinements: (a) `ensure_visible`'s **typewriter
-  branch** uses the bad height too — the fix covers it (typewriter anchoring is part of the
-  bug); (b) `page_step` currently steps `editing_height.saturating_sub(1).max(1)` (a one-row
-  context overlap) — the fix corrects the HEIGHT input and **preserves the
-  `.saturating_sub(1).max(1)` overlap semantics verbatim** (no paging-semantics change). Pins:
-  caret visible at the bottom edge with the bar shown; `page_step` = its current overlap
-  formula over the corrected height; `ensure_visible` (plain AND typewriter) scrolls fully.
+- **nav.rs — the bug fix, FIVE line-level reads (Fable M6):** `screen_pos` :90,
+  `ensure_visible` :403 (typewriter branch) AND :437 (the plain branch is a SEPARATE read —
+  list it explicitly or it gets missed), `page_step` :761, `last_fully_visible_line` :795.
+  All currently use `area.1 - 1` with NO menu subtraction; they switch to a
+  `menu_bar_rows()`-derived editing height (each has `editor` in scope — Codex-confirmed).
+  Refinements: (a) typewriter anchoring is part of the bug (Codex r1); (b) `page_step`
+  currently steps `editing_height.saturating_sub(1).max(1)` (a one-row context overlap) —
+  the fix corrects the HEIGHT input, **preserves the `.saturating_sub(1).max(1)` overlap
+  semantics verbatim**, and updates its now-stale doc comment (nav.rs:759 "matches
+  nav.rs:62"). Pins: caret visible at the bottom edge with the bar shown; `page_step` = its
+  current overlap formula over the corrected height; `ensure_visible` (plain AND typewriter)
+  scrolls fully. **No existing test opens the menu and asserts geometry (Fable-swept) — no
+  B3-style re-point sweep is expected.**
 - **The split is two-sided (Codex-confirmed):** OVERLAY-state reads (`mouse.rs:115`,
   `app.rs:1137`, `registry.rs:221`) keep reading `menu.is_some()` — they mean "dropdown open,"
   not geometry, and must NOT switch.
@@ -127,10 +131,9 @@ Replace every `editor.menu.is_some()`-as-geometry read with `menu_bar_rows()`:
 - **Inactive-bar rendering** (render.rs, the same top-row block): when `menu_bar_rows() == 1`
   but `editor.menu.is_none()`, paint the A2 full-width Chrome fill + the category labels in
   `menu_closed_style` — NO dropdown, NO ChromeSelected highlight. Labels come from the STATIC
-  category list — **visibility note (Codex round 1): `MENU_ORDER` is imported privately inside
-  menu.rs; render.rs can already call `category_label_pub` but needs either a direct
-  `crate::registry::MENU_ORDER` import or a small menu.rs helper (e.g.
-  `menu::bar_labels() -> impl Iterator<Item=&'static str>`) — plan-confirm the cleanest form.**
+  category list — **visibility (corrected by Fable M5): `MENU_ORDER` is already `pub`
+  (registry.rs:42) — render.rs simply adds `use crate::registry::MENU_ORDER` (a
+  `menu::bar_labels()` helper remains an acceptable alternative if it reads better).**
   The label-width claim is Codex-verified: `menu_bar_layout` widths depend only on category
   labels, never group contents — so `menu_bar_layout` refactors to take the label list (or the
   helper) and hit-testing + painting share geometry in BOTH bar states.
@@ -140,16 +143,27 @@ Replace every `editor.menu.is_some()`-as-geometry read with `menu_bar_rows()`:
   **Hydration must PRESERVE `open`/`highlighted`** when replacing the placeholder
   (`hydrate_overlays`, app.rs:818-827 — today `build()` resets `open: 0`; carry the
   placeholder's values over, **clamped to the built group/item bounds** — Codex round 1).
-  Click-away and dropdown-row dispatch stay as they are.
+  **CRITICAL wiring (Fable C1): the MOUSE path never hydrates today** — `hydrate_overlays`
+  has exactly two production call sites (key dispatch app.rs:1716, `dispatch_overlay_command`
+  app.rs:848); the `Msg::Input(Event::Mouse)` arm calls `mouse::handle` and returns without
+  hydrating, so a placeholder set from a click would STRAND unbuilt: render skips the whole
+  menu block on empty groups (render.rs:907 — row 0 reserved but painted empty, the A2 fill
+  is inside that guard) and the next click hit-tests empty groups → silently closes. **The
+  reduce Mouse arm gains a `hydrate_overlays` call after `mouse::handle`** (mirroring the
+  key-dispatch site; alternative — building directly at the click site — rejected: it would
+  need reg/keymap threaded into mouse and duplicate hydrate's job). Click-away and
+  dropdown-row dispatch stay as they are.
 - **Esc/F10 nuance:** the close arm (app.rs:1153-1154) stays `editor.menu = None` — it closes
   the DROPDOWN; in `pinned` (or `auto`-while-pointer-still-at-top) the bar persists because
   visibility flows from the mode, not from `menu.is_some()`. F10 with the dropdown closed
   still opens via the `"menu"` command (registry.rs:210-227, unchanged toggle semantics).
 - **The `menu_bar_pin` command** ("Pin Menu Bar", `MenuCategory::View`, also in the palette by
-  the three-surface contract): toggles `menu_bar_mode` between `Pinned` and the remembered
-  non-pinned mode (a small `menu_bar_unpinned_mode: MenuBarMode` remembered on Editor when
-  pinning; defaults to the config value — plan-confirm the minimal shape). Session-scoped;
-  D1 persists it later; E2 makes it checkable.
+  the three-surface contract): toggles `menu_bar_mode` between `Pinned` and the non-pinned
+  mode **computed from config (Fable — the simpler form: the pin toggle is the ONLY runtime
+  mode mutator, so the remembered mode always equals the config value; when config itself says
+  `pinned`, unpin falls back to `Auto`)**. No extra Editor field. The toggle clears both auto
+  fields on every transition (see Component 3 hygiene). Session-scoped; D1 persists it later;
+  E2 makes it checkable.
 
 ## Component 3 — auto mode: the dwell machinery
 
@@ -157,10 +171,17 @@ Mirrors the scrollbar transient-chrome pattern (`scrollbar_until_ms` +
 `recompute_scrollbar_visible` in `advance()`, app.rs:2242-2244 + :1864):
 
 - **`pub const MENU_DWELL_MS: u64 = 250;`** (a named tunable const).
-- **The `Moved` arm** (mouse.rs — placed **BEFORE the `if editor.menu.is_some()` overlay
-  block**, which returns unconditionally for every mouse event while the dropdown is open,
-  mouse.rs:141; Codex round 2) — deliberately trivial (it runs on every motion frame; integer
-  compares + stores ONLY, no rebuild/redraw).
+- **The `Moved` arm** (mouse.rs — placed **beside the universal Up-clear at mouse.rs:85-88,
+  BEFORE ALL overlay branches**; Fable I1 generalized Codex round 2's finding: the palette
+  (:91-114), theme-picker (:143-145), and file-browser (:146-148) blocks ALL return
+  unconditionally for every mouse event, exactly like the menu block (:115-142) — an arm
+  placed after any of them never sees Moved events while that overlay is open, so
+  leave-bookkeeping would strand a pre-revealed bar and a pending deadline could reveal the
+  bar MID-OVERLAY with the pointer nowhere near row 0) — deliberately trivial (it runs on
+  every motion frame; integer compares + stores ONLY, no rebuild/redraw). **Arming
+  additionally requires the mouse-intercepting overlays closed** (palette, theme-picker,
+  file-browser — symmetry with the dropdown gate; Fable I1); leave-bookkeeping stays
+  unconditional.
   **The predicate is RESOLVED (Codex round 1, replacing plan-confirm 7)** — the key insight:
   leave-bookkeeping must run EVEN WHILE the dropdown is open, so closing the dropdown never
   strands a stale revealed bar; arming, by contrast, only happens with the dropdown closed:
@@ -173,6 +194,9 @@ if editor.menu_bar_mode == MenuBarMode::Auto && kind == MouseEventKind::Moved {
         editor.mouse.menu_reveal_due = None;
         editor.mouse.menu_bar_revealed = false;
     } else if editor.menu.is_none()
+        && editor.palette.is_none()
+        && editor.theme_picker.is_none()
+        && editor.file_browser.is_none()
         && !editor.mouse.dragging
         && !editor.mouse.scrollbar_dragging
         && !editor.mouse.menu_bar_revealed
@@ -182,9 +206,16 @@ if editor.menu_bar_mode == MenuBarMode::Auto && kind == MouseEventKind::Moved {
 }
 ```
 
-  (Re-arming on consecutive resting frames is prevented by the `!menu_bar_revealed` guard
-  post-reveal and is harmless pre-reveal — same deadline value. Leaving the TOP row is an
-  unambiguous done-signal; a leave-grace becomes a tunable only if real terminals jitter.)
+  **The re-arm IS the rest semantics (Fable M1 — deliberate, do NOT "optimize"):** each row-0
+  Moved pushes the deadline to `now + MENU_DWELL_MS`, so a pointer SLIDING ALONG row 0 keeps
+  deferring the reveal and the bar appears 250 ms after the LAST motion — i.e. after the
+  pointer RESTS, which is exactly the settled backlog semantics. Arming only when
+  `due.is_none()` would silently change this to reveal-while-moving; a predicate unit case
+  pins it (two row-0 Moves 100 ms apart → due = second + DWELL). A pointer that arms and then
+  PARKS generates no further events — the deadline array still wakes the loop exactly on time
+  (the sb_deadline pattern), so arm-then-park reveals correctly. (One factual note: real
+  terminals report button-held motion as `Drag`, not `Moved` — the `!dragging` guards are
+  belt-and-braces for lost-Up cases, not the primary drag defense.)
 - **The reveal fires via the deadline machinery:** `menu_reveal_due` joins the run-loop
   deadline array (app.rs:2152-2183, beside `sb_deadline`) so a sleeping app wakes exactly on
   time; `recompute_menu_reveal(editor, now_ms)` sits beside `recompute_scrollbar_visible` in
@@ -195,7 +226,19 @@ if editor.menu_bar_mode == MenuBarMode::Auto && kind == MouseEventKind::Moved {
   unrevealed is a text click** by construction (`menu_bar_rows() == 0` → row 0 is text).
 - **Degradation:** `mouse_capture == false` (mouse.rs:76-78 early-return) or a terminal
   without mode-1003 motion reporting → the arm never fires; `auto` behaves exactly as
-  `hidden`; F10 intact. No silent breakage.
+  `hidden`; F10 intact. **Capture-toggle stranding (Fable I2):** `reconcile_mouse_capture`'s
+  DISABLE branch (app.rs:2251-2267) clears only the drag flags today — with a bar revealed
+  (or a deadline pending) at the moment capture turns off, no Moved can ever hide it and the
+  pending due could reveal it AFTER capture is gone. The disable branch additionally clears
+  `menu_reveal_due` + `menu_bar_revealed` (beside the drag clears) — one line + a unit test.
+- **Mode-transition hygiene (Fable M2):** the `menu_bar_pin` toggle clears BOTH auto fields
+  on every transition, and `recompute_menu_reveal` is gated on `mode == Auto` (a pending due
+  must not fire in Pinned/Hidden).
+- **Reveal/hide does NOT re-scroll (Fable M3 — explicit chosen behavior):** hover must not
+  move the document, so no `ensure_visible` runs on reveal. Accepted consequence: a caret
+  sitting on the last text row may be unpainted while the bar is revealed (render's
+  `row < edit_height` guard) until the next command; typewriter re-anchors on the next
+  keystroke (a one-row jump). Documented, not a defect.
 - Dropdown-close in auto: after Esc/click-away, `menu_bar_revealed` reflects the pointer —
   if it still rests at the top the bar stays revealed until leave (recomputed on the next
   Moved); otherwise the next Moved below row 0 hides it.
@@ -211,7 +254,11 @@ if editor.menu_bar_mode == MenuBarMode::Auto && kind == MouseEventKind::Moved {
      dwell elapses).
   3. pinned: config/mode Pinned → bar visible at first render; F10 opens the dropdown; **Esc
      closes the dropdown, the bar persists** (the state-split pin).
-  4. hidden: byte-identical-to-today regression pin (no bar until F10; closes fully on Esc).
+  4. hidden: byte-identical-to-today regression pin — **non-vacuous form (Fable M4):** with
+     `mode == Hidden`, inject `Moved(row 0)` + `advance_ms(MENU_DWELL_MS + 1)` + `tick()` and
+     assert NO reveal (this pins the arm's mode gate — without the injection the journey
+     passes under default Auto-unrevealed too and pins nothing); plus no bar until F10,
+     closes fully on Esc.
   5. row-0 click while unrevealed (auto) edits TEXT (caret moves; no menu).
 - **Unit tests:** the config fold (absent → Auto; each of the three strings; unknown →
   warning); the `menu_bar_rows()` truth table (mode × revealed × open); hydrate preserving
