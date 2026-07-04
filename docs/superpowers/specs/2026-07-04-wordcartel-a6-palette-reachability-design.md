@@ -1,6 +1,6 @@
 # A6: overlay list reachability — windowed scrolling for palette + siblings — design
 
-**Status:** Codex x3 clean; Fable5 folded (C1 descend-reset, I3 saturating, I4 preview-pin construction, M5 literals, M6 wordings) — C2 RESIZE RULE pending user decision
+**Status:** Codex x3 + Fable5 folded incl. C2 resolution (render self-heal, user decision A); fold-verify pending
 **Date:** 2026-07-04
 **Effort:** a6-palette-reachability — slot 1 of the recorded working order (`docs/ux-backlog.md`).
 User decisions: scope = ALL FOUR diseased overlays (fork 1 = B); wheel moves the SELECTION
@@ -127,9 +127,17 @@ file browser :1421-1428; outline :1648-1657):
 - Items become `rows[scroll_top .. min(scroll_top + list_h, rows.len())]`;
   `list_state.select(Some(selected - scroll_top))` (window-relative). Sites: palette
   render.rs:760-777, outline :805-818, theme picker :851-864, file browser :897-910.
-  A `debug_assert!(selected >= scroll_top && selected < scroll_top + list_h.max(1) || rows.is_empty())`
-  documents the invariant at the render boundary (unreachable when the Component-2 discipline
-  holds).
+  **RENDER SELF-HEALS (Fable C2, user decision A — enforcement, not assertion):** each
+  overlay painter runs `keep_visible(selected, rows.len(), list_h, &mut scroll_top)` with the
+  LIVE frame's `list_h` immediately before slicing. Render already takes `&mut Editor`
+  explicitly for stateful overlay widgets (render.rs:230-232) and is the one place that
+  always sees true geometry — so the invariant survives RESIZE (nothing else re-clamps on
+  a terminal shrink; app.rs:1762-1769 touches no overlay state and stays untouched) and any
+  FUTURE geometry-change source by construction, including the `h=4 → list_h == 0`
+  degenerate (`keep_visible` no-ops there; the slice range is empty-safe). There is NO
+  debug_assert — the heal replaces it. Division of labor: the key/mouse layer keeps the
+  window following the SELECTION (Component 2); render keeps the window inside the
+  GEOMETRY.
 - **The position indicator (user-approved):** the overlay's BOTTOM border row shows a
   right-aligned `{selected+1}/{total}` (e.g. `12/110`) whenever `rows.len() > list_h`;
   hidden when everything fits (no noise on short lists). Styled with the border's existing
@@ -178,7 +186,11 @@ file browser :1421-1428; outline :1648-1657):
   INCLUDING the file browser's own Enter-dispatches-visible hazard pin (its absolute read at
   app.rs:1388); (g) a `PaletteKind::Buffers` scroll case — the buffer switcher
   (editor.rs:687, kind set :708) rides the same palette windowing; make the coverage
-  explicit, not accidental (Codex round 1).
+  explicit, not accidental (Codex round 1); (h) **the resize self-heal pins (Fable C2):**
+  palette open with a deep selection + a harness `resize()` shrink → the next frame keeps
+  the highlight visible (no panic, no invisible selection); plus the degenerate h=4
+  (`list_h == 0`) frame renders panic-free; plus the file browser's scrolled-descend case
+  (PgDn in a big directory, Enter into a small subdirectory → no panic, window reset).
 - **Unit — mouse:** the adjusted visible-click test + the new scrolled-click test; wheel
   moves selection and the window follows (palette, theme picker, file browser).
 - **Render:** a scrolled palette shows `rows[scroll_top..]` content (assert a row string at
