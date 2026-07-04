@@ -13,6 +13,12 @@ pub fn empty() -> MenuView {
     MenuView { groups: Vec::new(), open: 0, highlighted: 0, built: false }
 }
 
+/// A placeholder opened AT a specific category (an index into `MENU_ORDER`);
+/// hydration maps it to the built groups' position for that category.
+pub fn empty_at(order_idx: usize) -> MenuView {
+    MenuView { groups: Vec::new(), open: order_idx, highlighted: 0, built: false }
+}
+
 pub fn build(reg: &Registry, keymap: &KeyTrie) -> MenuView {
     MenuView { groups: grouped_commands(reg, keymap), open: 0, highlighted: 0, built: true }
 }

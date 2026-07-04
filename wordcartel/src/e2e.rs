@@ -74,6 +74,20 @@ impl Harness {
 
     fn advance_ms(&mut self, ms: u64) { self.now = self.now.saturating_add(ms); }
     fn tick(&mut self) -> bool { self.step(Msg::Tick) }
+    fn mouse_move(&mut self, col: u16, row: u16) {
+        self.step(Msg::Input(Event::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: col, row, modifiers: KeyModifiers::NONE,
+        })));
+    }
+    // Provided for completeness alongside mouse_move; wired in later journeys.
+    #[allow(dead_code)]
+    fn mouse_down(&mut self, col: u16, row: u16) {
+        self.step(Msg::Input(Event::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col, row, modifiers: KeyModifiers::NONE,
+        })));
+    }
 
     // — state accessors —
     fn doc_text(&self) -> String { self.editor.active().document.buffer.to_string() }
@@ -200,4 +214,39 @@ fn e2e_fold_hides_body_in_render() {
     assert!(!h.folded().is_empty(), "Alt+Z must fold the heading");
     assert!(h.screen_contains("Head"), "the heading stays visible");
     assert!(!h.screen_contains("secret body line"), "the folded body must be hidden:\n{:#?}", h.screen());
+}
+
+// ---------------------------------------------------------------------------
+// A1 journeys 3 + 4: pinned mode and hidden mode dwell gate.
+// ---------------------------------------------------------------------------
+
+/// A1 journey 3: pinned — the bar is always there; Esc closes the dropdown ONLY.
+#[test]
+fn journey_pinned_bar_persists_across_dropdown_close() {
+    let mut h = Harness::new("hello world\n", None, (40, 8));
+    h.editor.menu_bar_mode = crate::config::MenuBarMode::Pinned;
+    h.tick(); // render with the mode applied
+    assert!(h.row(0).contains(" File "), "pinned bar visible before any menu use");
+    assert!(h.row(1).contains("hello"), "text shifted below the bar");
+    h.key(KeyCode::F(10));
+    assert!(h.editor.menu.is_some(), "F10 opens the dropdown");
+    h.key(KeyCode::Esc);
+    assert!(h.editor.menu.is_none(), "Esc closes the dropdown");
+    assert!(h.row(0).contains(" File "), "the bar PERSISTS after Esc (the state split)");
+}
+
+/// A1 journey 4: hidden — the dwell is mode-gated (non-vacuous form, spec M4).
+#[test]
+fn journey_hidden_never_reveals_on_dwell() {
+    let mut h = Harness::new("hello world\n", None, (40, 8));
+    h.editor.menu_bar_mode = crate::config::MenuBarMode::Hidden;
+    h.mouse_move(5, 0);
+    h.advance_ms(250 + 1); // literal until T3 defines MENU_DWELL_MS (T3 Step 7 flips this)
+    h.tick();
+    assert!(!h.editor.mouse.menu_bar_revealed, "Hidden mode must never arm/reveal");
+    assert!(h.row(0).contains("hello"), "row 0 is still text");
+    h.key(KeyCode::F(10));
+    assert!(h.row(0).contains(" File "), "F10 still opens");
+    h.key(KeyCode::Esc);
+    assert!(h.row(0).contains("hello"), "Esc closes FULLY in hidden mode");
 }

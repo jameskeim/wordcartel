@@ -821,8 +821,21 @@ pub(crate) fn hydrate_overlays(editor: &mut Editor, reg: &crate::registry::Regis
             crate::palette::rebuild_rows(p, reg, keymap);
         }
     }
-    if editor.menu.as_ref().is_some_and(|v| !v.built) {
-        editor.menu = Some(crate::menu::build(reg, keymap));
+    if let Some(v) = editor.menu.as_ref().filter(|v| !v.built) {
+        let want_open = v.open;
+        let want_hl = v.highlighted;
+        let mut built = crate::menu::build(reg, keymap);
+        // The placeholder's `open` indexes MENU_ORDER; map it to the built groups'
+        // position for that category (robust even if a category has no commands).
+        if let Some(cat) = crate::registry::MENU_ORDER.get(want_open) {
+            if let Some(pos) = built.groups.iter().position(|g| g.0 == *cat) {
+                built.open = pos;
+            }
+        }
+        built.highlighted = want_hl.min(
+            built.groups.get(built.open).map_or(0, |g| g.1.len().saturating_sub(1)),
+        );
+        editor.menu = Some(built);
     }
 }
 
@@ -1756,6 +1769,9 @@ pub fn reduce(
         }
         Msg::Input(Event::Mouse(ev)) => {
             crate::mouse::handle(editor, ev, reg, keymap, ex, clock, msg_tx);
+            // A click-opened menu placeholder must be built before the next render —
+            // the key-dispatch path hydrates; the mouse path must too (A1 spec C1).
+            hydrate_overlays(editor, reg, keymap);
         }
         Msg::Input(_) => {}
         Msg::JobDone(o) => apply_job_outcome(o, editor, ex, clock, msg_tx),
@@ -5005,6 +5021,52 @@ mod tests {
     // -----------------------------------------------------------------------
     // Task 4: reconcile arm logic unit test
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // A1 Task 2: hydrate_overlays preserves and maps the placeholder's open index.
+    // -----------------------------------------------------------------------
+
+    fn build_km() -> crate::keymap::KeyTrie {
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        km
+    }
+
+    /// hydrate_overlays maps a placeholder's MENU_ORDER index to the built groups'
+    /// position by category (Format = index 2 in MENU_ORDER).
+    #[test]
+    fn hydrate_preserves_and_maps_open() {
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        let reg = crate::registry::Registry::builtins();
+        let km = build_km();
+        // MENU_ORDER[2] = Format
+        e.menu = Some(crate::menu::empty_at(2));
+        crate::app::hydrate_overlays(&mut e, &reg, &km);
+        let menu = e.menu.as_ref().expect("menu must be Some after hydration");
+        assert!(menu.built, "menu must be marked built after hydration");
+        // locate Format in the built groups
+        let format_pos = menu.groups.iter().position(|(cat, _)| *cat == crate::registry::MenuCategory::Format)
+            .expect("Format category must be in built groups");
+        assert_eq!(menu.open, format_pos, "open must map to Format's position in built groups");
+    }
+
+    /// hydrate_overlays clamps highlighted to the last item in the open group.
+    #[test]
+    fn hydrate_clamps_highlighted() {
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        let reg = crate::registry::Registry::builtins();
+        let km = build_km();
+        // MENU_ORDER[2] = Format; seed highlighted at an absurd index
+        let mut placeholder = crate::menu::empty_at(2);
+        placeholder.highlighted = 999;
+        e.menu = Some(placeholder);
+        crate::app::hydrate_overlays(&mut e, &reg, &km);
+        let menu = e.menu.as_ref().unwrap();
+        let open_group = menu.groups.get(menu.open).expect("open group must exist");
+        let max_hl = open_group.1.len().saturating_sub(1);
+        assert!(menu.highlighted <= max_hl,
+            "highlighted {} must be clamped to max {max_hl}", menu.highlighted);
+    }
 
     /// The arm block (post-rebuild) sets `due_at` once and does not push the
     /// deadline on idle Ticks; a new edit (version bump) re-arms the debounce.

@@ -149,7 +149,18 @@ pub fn handle(
     match ev.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let hit = editing_cell(editor, ev.column, ev.row);
-            if let CellHit::Scrollbar = hit {
+            if let CellHit::MenuBar = hit {
+                // Inactive bar: open the dropdown AT the clicked category (hydrated
+                // by reduce's post-handle hydrate_overlays call).
+                let cats_hit = crate::render::menu_bar_layout_cats(area, &crate::registry::MENU_ORDER)
+                    .into_iter()
+                    .find(|(_, r)| ev.column >= r.x && ev.column < r.x + r.width && ev.row == r.y)
+                    .map(|(i, _)| i);
+                if let Some(order_idx) = cats_hit {
+                    editor.menu = Some(crate::menu::empty_at(order_idx));
+                }
+                // A row-0 click OFF the labels does nothing (the fill area is inert).
+            } else if let CellHit::Scrollbar = hit {
                 let (_w, h) = editor.active().view.area;
                 let menu_rows = editor.menu_bar_rows();
                 let edit_height = h.saturating_sub(1 + menu_rows) as usize;
@@ -455,6 +466,60 @@ mod tests {
         handle(&mut e, down(1, 0), &reg, &km, &ex, &clk, &tx);
         assert_eq!(crate::nav::head(&e), 0, "click absorbed by theme picker — caret must not move");
         assert!(e.theme_picker.is_some(), "theme picker must remain open after click");
+    }
+
+    // -----------------------------------------------------------------------
+    // A1 Task 2: CellHit::MenuBar + click-to-open
+    // -----------------------------------------------------------------------
+
+    /// row 0 in Pinned mode (menu None) → MenuBar; in Hidden mode → NOT MenuBar.
+    #[test]
+    fn editing_cell_row0_is_menubar_only_when_bar_visible() {
+        use crate::config::MenuBarMode;
+        let mut e = Editor::new_from_text("hello\n", None, (40, 8));
+
+        // Pinned: menu_bar_rows() == 1 → row 0 is MenuBar.
+        e.menu_bar_mode = MenuBarMode::Pinned;
+        e.menu = None;
+        assert!(matches!(editing_cell(&e, 0, 0), CellHit::MenuBar), "Pinned + menu None → MenuBar");
+
+        // Hidden: menu_bar_rows() == 0 → row 0 is NOT MenuBar.
+        e.menu_bar_mode = MenuBarMode::Hidden;
+        e.menu = None;
+        assert!(!matches!(editing_cell(&e, 0, 0), CellHit::MenuBar), "Hidden + menu None → not MenuBar");
+    }
+
+    /// A click on the inactive bar (Pinned, menu None) at the Format label column
+    /// opens a placeholder with open == MENU_ORDER index of Format (== 2).
+    #[test]
+    fn click_on_inactive_bar_opens_that_category() {
+        use crate::config::MenuBarMode;
+        let mut e = Editor::new_from_text("hello\n", None, (80, 8));
+        crate::derive::rebuild(&mut e);
+        e.menu_bar_mode = MenuBarMode::Pinned;
+        e.menu = None;
+        let (reg, ex, clk, tx, km) = ctx();
+        // Compute the Format label column dynamically (MENU_ORDER[2] = Format).
+        let (w, h) = e.active().view.area;
+        let area = ratatui::layout::Rect::new(0, 0, w, h);
+        let menu_area = ratatui::layout::Rect::new(area.x, area.y, w, h.saturating_sub(1));
+        let bar = crate::render::menu_bar_layout_cats(menu_area, &crate::registry::MENU_ORDER);
+        let (_, format_rect) = bar.iter().find(|(i, _)| *i == 2).expect("Format at index 2");
+        let col = format_rect.x + 1; // somewhere inside the label
+
+        // Click on the Format label while the bar is inactive (menu None).
+        handle(&mut e, down(col, 0), &reg, &km, &ex, &clk, &tx);
+        let menu = e.menu.as_ref().expect("click must set editor.menu to Some placeholder");
+        assert!(!menu.built, "placeholder must not be built (hydration happens in reduce)");
+        assert_eq!(menu.open, 2, "placeholder open must be the MENU_ORDER index of Format");
+
+        // After hydrate_overlays: built and mapped to the correct group.
+        crate::app::hydrate_overlays(&mut e, &reg, &km);
+        let menu = e.menu.as_ref().unwrap();
+        assert!(menu.built, "hydrated menu must be built");
+        let format_pos = menu.groups.iter().position(|(cat, _)| *cat == crate::registry::MenuCategory::Format)
+            .expect("Format group must exist after build");
+        assert_eq!(menu.open, format_pos, "hydrated open must map to Format's group position");
     }
 
     /// Finding 2 regression: if the palette (or menu) is open while a text or
