@@ -72,7 +72,7 @@ pub fn active_is_reusable_throwaway(editor: &Editor) -> bool {
 /// Open `path` additively: reuse a throwaway active buffer in-place, else push a new buffer and switch.
 pub fn open_as_new_buffer(editor: &mut Editor, path: &std::path::Path) {
     if active_is_reusable_throwaway(editor) {
-        crate::app::open_into_current(editor, path); // replace-in-place seam
+        crate::session_restore::open_into_current(editor, path); // replace-in-place seam
         return;
     }
     let id = editor.alloc_id();
@@ -82,7 +82,7 @@ pub fn open_as_new_buffer(editor: &mut Editor, path: &std::path::Path) {
             editor.buffers.push(b);
             let idx = editor.buffers.len() - 1;
             editor.switch_to_index(idx);
-            if editor.resume_enabled { crate::app::restore_resume(editor, path); }
+            if editor.resume_enabled { crate::session_restore::restore_resume(editor, path); }
             crate::derive::rebuild(editor);
             crate::nav::ensure_visible(editor);
             editor.status = String::new();
