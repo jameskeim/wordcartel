@@ -1878,6 +1878,7 @@ impl Clock for SystemClock {
 /// harness exercises the REAL loop body, not a re-implementation.
 pub(crate) fn advance(editor: &mut Editor, clock: &dyn Clock) {
     recompute_scrollbar_visible(editor, clock.now_ms());
+    recompute_menu_bar(editor, clock.now_ms());
     // Pre-draw rebuild: ensure the layout cache matches the final (scroll,
     // text_width) before render consumes it.  render has no on-demand fallback
     // (render.rs:132-140), so a stale cache blanks the editing rows.
@@ -2180,6 +2181,10 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         } else {
             None
         };
+        // Menu-bar dwell/grace: at most one is Some by construction (the Moved arm
+        // clears the other side); recompute_menu_bar clears a fired due, so a past
+        // deadline cannot persist and spin the loop.
+        let menu_deadline = editor.mouse.menu_reveal_due.or(editor.mouse.menu_hide_due);
         // Fix A3: include the diagnostics deadline ONLY when no check is in
         // flight.  When a check is in flight, recheck_due_at may be a past
         // timestamp (armed before the check started), which would drive
@@ -2200,6 +2205,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             swap_deadline,
             sq_deadline,
             sb_deadline,
+            menu_deadline,
             diag_deadline,
             reconcile_deadline,
         ]);
@@ -2265,6 +2271,28 @@ pub fn recompute_scrollbar_visible(editor: &mut crate::editor::Editor, now_ms: u
     editor.mouse.scrollbar_visible = now_ms < editor.mouse.scrollbar_until_ms;
 }
 
+/// Fire the auto-mode menu-bar deadlines (armed by the mouse Moved arm). Gated on
+/// Auto — a stale due must never fire in Pinned/Hidden (spec M2).
+pub fn recompute_menu_bar(editor: &mut crate::editor::Editor, now_ms: u64) {
+    if editor.menu_bar_mode != crate::config::MenuBarMode::Auto {
+        // Defense-in-depth (Fable plan-review M5): dues arm only in Auto and every
+        // mode transition clears them, so this state is unreachable — but CLEARING
+        // (never firing) here makes the deadline-array no-spin invariant
+        // unconditional instead of resting on the transition-clears.
+        editor.mouse.menu_reveal_due = None;
+        editor.mouse.menu_hide_due = None;
+        return;
+    }
+    if editor.mouse.menu_reveal_due.is_some_and(|d| now_ms >= d) {
+        editor.mouse.menu_reveal_due = None;
+        editor.mouse.menu_bar_revealed = true;
+    }
+    if editor.mouse.menu_hide_due.is_some_and(|d| now_ms >= d) {
+        editor.mouse.menu_hide_due = None;
+        editor.mouse.menu_bar_revealed = false;
+    }
+}
+
 /// Reconcile the terminal's mouse-capture state with `editor.mouse_capture`.
 ///
 /// Enables or disables mouse capture on the backend when the desired state
@@ -2282,6 +2310,9 @@ pub fn reconcile_mouse_capture<W: std::io::Write>(editor: &mut crate::editor::Ed
             editor.mouse.dragging = false;
             editor.mouse.scrollbar_dragging = false;
             editor.mouse.anchor = None;
+            editor.mouse.menu_reveal_due = None;
+            editor.mouse.menu_hide_due = None;
+            editor.mouse.menu_bar_revealed = false;
             if crossterm::execute!(backend, crossterm::event::DisableMouseCapture).is_ok() {
                 *applied = editor.mouse_capture;
             }
@@ -4176,6 +4207,58 @@ mod tests {
         assert!(e.mouse.scrollbar_visible);
         crate::app::recompute_scrollbar_visible(&mut e, 1200); // after
         assert!(!e.mouse.scrollbar_visible);
+    }
+
+    // A1 Task 3 — cases 7 + 8 (app-level: recompute_menu_bar / reconcile)
+
+    /// Case 7: recompute fires in Auto; in non-Auto it clears without firing.
+    #[test]
+    fn recompute_fires_and_is_mode_gated() {
+        use crate::editor::Editor;
+        use crate::config::MenuBarMode;
+
+        // Auto: past reveal deadline → revealed = true.
+        let mut e = Editor::new_from_text("x\n", None, (40, 8));
+        e.menu_bar_mode = MenuBarMode::Auto;
+        e.mouse.menu_reveal_due = Some(100);
+        crate::app::recompute_menu_bar(&mut e, 101);
+        assert!(e.mouse.menu_bar_revealed, "Auto: past reveal due must fire");
+        assert!(e.mouse.menu_reveal_due.is_none(), "reveal due cleared after firing");
+
+        // Pinned: past reveal deadline → cleared WITHOUT firing (defense-in-depth).
+        let mut e2 = Editor::new_from_text("x\n", None, (40, 8));
+        e2.menu_bar_mode = MenuBarMode::Pinned;
+        e2.mouse.menu_reveal_due = Some(100);
+        crate::app::recompute_menu_bar(&mut e2, 101);
+        assert!(!e2.mouse.menu_bar_revealed, "Pinned: due CLEARED, revealed NOT set");
+        assert!(e2.mouse.menu_reveal_due.is_none(), "due cleared in Pinned");
+
+        // Auto: past hide deadline → revealed = false.
+        let mut e3 = Editor::new_from_text("x\n", None, (40, 8));
+        e3.menu_bar_mode = MenuBarMode::Auto;
+        e3.mouse.menu_bar_revealed = true;
+        e3.mouse.menu_hide_due = Some(200);
+        crate::app::recompute_menu_bar(&mut e3, 201);
+        assert!(!e3.mouse.menu_bar_revealed, "Auto: past hide due must fire → unrevealed");
+        assert!(e3.mouse.menu_hide_due.is_none(), "hide due cleared after firing");
+    }
+
+    /// Case 8: capture-off clears all three menu-bar fields.
+    #[test]
+    fn capture_disable_clears_menu_bar_state() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("x\n", None, (40, 8));
+        e.mouse_capture = true;
+        e.mouse.menu_bar_revealed = true;
+        e.mouse.menu_reveal_due = Some(500);
+        e.mouse.menu_hide_due = Some(900);
+        let mut buf = Vec::<u8>::new();
+        let mut applied = true;
+        e.mouse_capture = false;
+        crate::app::reconcile_mouse_capture(&mut e, &mut buf, &mut applied);
+        assert!(!e.mouse.menu_bar_revealed, "revealed cleared on capture disable");
+        assert!(e.mouse.menu_reveal_due.is_none(), "menu_reveal_due cleared on capture disable");
+        assert!(e.mouse.menu_hide_due.is_none(), "menu_hide_due cleared on capture disable");
     }
 
     /// Finding 1 regression: wheel event sets scrollbar_until_ms; recomputing
