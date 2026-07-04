@@ -143,9 +143,11 @@ is geometry-agnostic; consumers verified to handle arbitrary row-break positions
 selection painting. `typewriter_rows_of_line` (nav.rs:500-522) is a HEURISTIC (typewriter scroll anchoring
 only) and its status is stated honestly (Codex r1): its early exit fires on BYTE length
 `content_len + prefix_width <= text_width`, with `prefix_width` read from the cache and
-approximated as 0 for uncached lines. (a) For space-indented B2 items the change is
-exactly compensating — indent bytes leave the visible text as the same width enters the
-glyph. (b) The byte-length test is ALREADY unsound for tabs TODAY (a tab is 1 byte but
+approximated as 0 for uncached lines. (a) For space-indented B2 items the LAYOUT compensation is exact — indent
+bytes leave the visible text as the same width enters the glyph (`"  - x"`: 4 bytes
+concealed, glyph `"  • "` width 4) — while the BYTE heuristic itself becomes strictly
+more conservative for cached items (raw `content_len` still counts the concealed bytes
+AND the cached `prefix_width` grows): it fires less often, never wrongly (Codex r2). (b) The byte-length test is ALREADY unsound for tabs TODAY (a tab is 1 byte but
 4 display cells — pre-existing, not a B1/B2 regression); tab-indented items inherit that
 known limitation. (c) The uncached prefix≈0 approximation makes the exit fire more
 often; a wrong exit mis-anchors typewriter scroll by a row — cosmetic, self-correcting
