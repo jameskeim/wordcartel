@@ -456,6 +456,36 @@ stability there; restructure only if a B-strong-class parser replacement ever ha
 - D1-a vs D1-b write-back (D1-b favored, not yet committed — settle at D1's brainstorm).
 - Dwell duration and reveal/grace timings (implementation tunables, not design forks).
 
+## Working order (recorded 2026-07-04 — dependency-derived, user-approved)
+
+Hard edges: E3 → E1/E2/E4; D1 carries A5; E2 rides E1; H1 before Effort P. Soft edges: H1
+relocates what C4/D1/A5/E1 touch (split early = every later effort lands in focused files);
+B2's hanging indent is a wrap-policy feature (travels inside B1); A3's palette parts share
+A6's territory; E2's checkable items serve A5/E1; C2 and C3 are islands.
+
+1. **A6** palette reachability — folds in A3(a) hints-verification + the palette-completeness
+   invariant test (same territory). Kills the invisible-dispatch hazard first.
+2. **H1** app.rs decomposition — immediately after the small win; everything behind it lands
+   in focused files.
+3. **B1 + B2** word-boundary wrap + list indent, ONE effort (bullet indent + hanging indent
+   inside the wrap work). The user's highest-value rendering fix; the E-arc then gets judged
+   on correctly wrapped text.
+4. **C4** close-buffer prompt — lands in the post-H1 prompts.rs, reuses the quit machinery.
+5. **C2** transform scope — settled, independent.
+6. **D1 + A5** settings write-back + keymap switch — the persistence rail BEFORE the settings
+   that ride it (E3's chrome axis, E1's presets).
+7. **E3** chrome theming coherence (+ the render.rs split; **E4's research kicks off in
+   parallel** — pure reading, no code dependency).
+8. **E1 + E2** density presets + polish — the convergence point (+ E4's theme landings +
+   A3's menu-curation pass, done while the menu is being polished anyway).
+9. **C3** SSH/tmux clipboard — genuinely independent; last by cost shape (a terminal × tmux ×
+   SSH test matrix), not by value; pull it forward whenever the pain bites.
+
+Then **Effort P**, landing on a decomposed app.rs, a coherent chrome model, and a settings
+rail. FLAGGED JUDGMENT: B1 sits before the D/E arc on value; pure dependency logic permits
+swapping blocks 3 and 6-8 if the visual-consistency wins should bank first — B1 is
+dependency-free in both directions.
+
 ## Sizing summary
 
 *(SHIPPED so far: the quick-wins bundle A2+B3+C1 @ 097dcae; A1 menu-bar modes @ 7273327 —
