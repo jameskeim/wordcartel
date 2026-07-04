@@ -237,6 +237,32 @@ BUFFER (`0..buf_len`).
    scope (they already handle lists at whole-list scope — adjacent machinery).
    May stage: defaults first, deepest-snap second, within one effort.
 
+### C3. Cross-app clipboard over SSH/tmux — `needs-design` · Medium (pre-triage deferred, pulled in 2026-07-04)
+
+*(Diagnosed 2026-06-28 against `wordcartel/src/clipboard.rs`; predates the niggle triage.)*
+Cross-application copy/paste (wordcartel → local app, or vice versa) does NOT work inside an
+SSH/tmux session; within-session copy→paste works (the in-process `Register` is the source of
+truth). **Copy-out:** we emit a *bare* OSC 52 set-sequence + the arboard worker — bare OSC 52
+is swallowed by tmux unless `set-clipboard on`, and some setups need the DCS passthrough
+wrapper (`\ePtmux;\e…\e\\`); we do NOT detect `$TMUX` and wrap. (The PTY smoke suite's S5 now
+verifies OSC 52 lands in a tmux buffer in the harness config — partial live coverage of the
+happy path.) **Paste-in:** `arboard` `get()` targets the *remote* (empty) display over SSH;
+OSC 52 read is refused by most terminals — the robust path is the terminal's own bracketed
+paste arriving as input. **Direction (agreed 2026-06-28):** its own effort — `$TMUX` detection
++ passthrough wrapping, a `.tmux.conf` doc note, bracketed-paste handling, tested across
+terminal × tmux × SSH combos. Kept separate from multi-buffer work deliberately.
+
+### C4. Close-buffer Save/Discard/Cancel prompt — `needs-design` · Small-Medium (pre-triage deferred, pulled in 2026-07-04)
+
+*(Effort 6 spec-conformance gap, deferral agreed 2026-06-28.)* `workspace::close_buffer`
+REFUSES to close a dirty buffer (status: `"unsaved changes — save or discard first"` — safe,
+never loses work) instead of the interactive **Save / Discard / Cancel** prompt the Effort 6
+spec called for (Task 7 deferred it "to Task 8"; Task 8 built only the quit state machine).
+**Direction (agreed):** a small standalone effort — add a `Prompt::close_confirm` + resolve
+arm that REUSES the quit machinery's per-buffer save-on-close path (the same
+`dispatch_save_then` + `pending_after_save` flow used by `ContinueQuitDrain`); `close_buffer`
+raises it when the active buffer is dirty.
+
 ---
 
 ## Theme D — configuration & persistence
@@ -399,9 +425,11 @@ both carrying bug fixes.)*
 - **Small:** A3 palette follow-ups (hints verification + invariant test + the menu item
   pass) · E4 themes research (the research itself).
 - **Small-Medium:** A6 palette reachability (scrolling window + wheel + dead zones — also
-  kills the invisible-dispatch hazard).
+  kills the invisible-dispatch hazard) · C4 close-buffer Save/Discard/Cancel prompt (reuses
+  the quit machinery).
 - **Medium:** A5 keymap switch + D1 write-back (one effort) · B2 sub-list indent (+ hanging
-  indent) · C2 transform scope (block-under-caret defaults + deepest-block snapping).
+  indent) · C2 transform scope (block-under-caret defaults + deepest-block snapping) ·
+  C3 clipboard over SSH/tmux (the terminal × tmux × SSH test matrix is the real cost).
 - **Medium-Large:** E3 chrome theming coherence (one chrome family + the full|zen axis +
   the phosphor restructure — precedes E1/E2 and E4's landings).
 - **Larger:** B1 word-boundary wrap · E1/E2 chrome presets + polish pass (after A1/A2 and
