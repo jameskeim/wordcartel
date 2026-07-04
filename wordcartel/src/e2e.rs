@@ -299,3 +299,39 @@ fn journey_row0_click_unrevealed_edits_text() {
     assert_eq!(h.editor.active().document.selection.primary().head, 4,
         "the click placed the caret in the text");
 }
+
+/// A6 journey: opening the palette and pressing End reaches the LAST registered
+/// command without filtering, and Enter dispatches it.
+///
+/// The last command is `scroll_line_down` (Fable-verified) — benign and
+/// observable: on a tall document the viewport advances by one logical line.
+/// The reach-without-typing property is the contract; selected must be within
+/// the visible window (selected - scroll_top < 15) before Enter.
+#[test]
+fn journey_palette_end_reaches_last_command() {
+    // Tall document so scroll_line_down has somewhere to go.
+    let text: String = (0..50).map(|i| format!("line {i}\n")).collect();
+    let mut h = Harness::new(&text, None, (80, 24));
+    h.ctrl('p'); // open the Command Palette
+    assert!(h.editor.palette.is_some(), "ctrl-p must open the palette");
+    h.key(KeyCode::End); // jump to the last row
+    let p = h.editor.palette.as_ref().unwrap();
+    let total = p.rows.len();
+    let last_idx = total.saturating_sub(1);
+    assert_eq!(p.selected, last_idx, "End must land on the last row (idx={last_idx})");
+    // Windowing invariant: selection is within the visible window.
+    assert!(p.selected.saturating_sub(p.scroll_top) < 15,
+        "End: selected={} scroll_top={} must be within the 15-row window",
+        p.selected, p.scroll_top);
+    // Last label on screen — confirms the window shows the tail.
+    let last_label = p.rows[last_idx].label.clone();
+    assert!(h.screen_contains(&last_label),
+        "last command label {last_label:?} must be visible on screen after End");
+    // Enter dispatches scroll_line_down → viewport advances by one logical line.
+    let scroll_before = h.editor.active().view.scroll;
+    h.key(KeyCode::Enter);
+    assert!(h.editor.palette.is_none(), "Enter closes the palette");
+    let scroll_after = h.editor.active().view.scroll;
+    assert!(scroll_after > scroll_before,
+        "scroll_line_down must advance the viewport (before={scroll_before}, after={scroll_after})");
+}

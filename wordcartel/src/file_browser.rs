@@ -16,6 +16,8 @@ pub struct FileBrowser {
     pub query: String,
     pub entries: Vec<FileEntry>,
     pub selected: usize,
+    /// First visible row index — drives the windowed painter (A6).
+    pub scroll_top: usize,
 }
 
 /// Rebuild `entries` from `dir`: synthetic ".." first (unless at root), then directories,
@@ -49,6 +51,7 @@ pub fn rebuild_entries(fb: &mut FileBrowser) {
     if fb.selected >= fb.entries.len() {
         fb.selected = fb.entries.len().saturating_sub(1);
     }
+    fb.scroll_top = fb.scroll_top.min(fb.entries.len().saturating_sub(1));
 }
 
 #[cfg(test)]
@@ -61,7 +64,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("alpha.md"), "x").unwrap();
         std::fs::write(dir.join("beta.txt"), "x").unwrap();
-        let mut fb = FileBrowser { dir: dir.clone(), query: String::new(), entries: vec![], selected: 0 };
+        let mut fb = FileBrowser { dir: dir.clone(), query: String::new(), entries: vec![], selected: 0, scroll_top: 0 };
         rebuild_entries(&mut fb);
         assert_eq!(fb.entries[0].name, "..", "parent first");
         let names: Vec<_> = fb.entries.iter().map(|e| e.name.as_str()).collect();

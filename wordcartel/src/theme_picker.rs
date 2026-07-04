@@ -8,6 +8,8 @@ pub struct ThemePicker {
     pub query: String,
     pub selected: usize,
     pub rows: Vec<String>,
+    /// First visible row index — drives the windowed painter (A6).
+    pub scroll_top: usize,
     /// The theme active when the picker opened — restored on Esc (preview cancel).
     pub original: Theme,
 }
@@ -21,6 +23,7 @@ pub fn rebuild_rows(tp: &mut ThemePicker) {
         .map(|n| n.to_string())
         .collect();
     if tp.selected >= tp.rows.len() { tp.selected = tp.rows.len().saturating_sub(1); }
+    tp.scroll_top = tp.scroll_top.min(tp.rows.len().saturating_sub(1));
 }
 
 #[cfg(test)]
@@ -31,7 +34,7 @@ mod tests {
     #[test]
     fn rebuild_rows_filters_builtins() {
         let mut tp = ThemePicker { query: String::new(), selected: 0, rows: vec![],
-            original: wordcartel_core::theme::default() };
+            scroll_top: 0, original: wordcartel_core::theme::default() };
         rebuild_rows(&mut tp);
         assert!(tp.rows.iter().any(|r| r == "tokyo-night"));
         assert!(tp.rows.len() >= 13);

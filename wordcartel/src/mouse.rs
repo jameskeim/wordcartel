@@ -120,12 +120,29 @@ pub fn handle(
     let (w, h) = editor.active().view.area;
     let area = ratatui::layout::Rect::new(0, 0, w, h);
     if editor.palette.is_some() {
+        // `if matches!` — a `match` with a lone arm + `_ => {}` trips
+        // clippy::single_match under the deny gate (Codex plan r1).
+        if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+            let ah = editor.active().view.area.1;
+            if let Some(p) = editor.palette.as_mut() {
+                if matches!(ev.kind, MouseEventKind::ScrollDown) {
+                    p.selected = (p.selected + 1).min(p.rows.len().saturating_sub(1));
+                } else {
+                    p.selected = p.selected.saturating_sub(1);
+                }
+                crate::app::keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
+            }
+            return;
+        }
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            // scoped borrow → owned Option<CommandId>
-            let hit_id: Option<crate::registry::CommandId> = {
+            // scoped borrow → owned hit values (id + optional buffer) — mirrors
+            // the keyboard Enter arm (app.rs) which checks row.buffer first so
+            // that Buffers-kind rows switch buffers rather than dispatching their
+            // sentinel CommandId("palette").
+            let hit: Option<(crate::registry::CommandId, Option<crate::editor::BufferId>)> = {
                 let p = editor.palette.as_ref().unwrap();
                 crate::render::palette_row_at(area, p, ev.column, ev.row)
-                    .and_then(|idx| p.rows.get(idx).map(|r| r.id))
+                    .and_then(|idx| p.rows.get(idx).map(|r| (r.id, r.buffer)))
             };
             // was the click inside the overlay rect at all?
             let inside = {
@@ -133,8 +150,19 @@ pub fn handle(
                 let r = crate::render::palette_overlay_rect(area, row_count);
                 ev.column >= r.x && ev.column < r.x + r.width && ev.row >= r.y && ev.row < r.y + r.height
             };
-            if let Some(id) = hit_id {
-                crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
+            if let Some((id, buffer)) = hit {
+                if let Some(bid) = buffer {
+                    // Buffer-switcher row: dismiss palette, jump to buffer — same
+                    // path as the keyboard Enter arm. Pre-existing bug: the old
+                    // code dispatched CommandId("palette") for every buffer row,
+                    // reopening the picker instead of switching.
+                    editor.palette = None;
+                    if let Some(idx) = editor.buffers.iter().position(|b| b.id == bid) {
+                        crate::workspace::switch_to(editor, idx);
+                    }
+                } else {
+                    crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
+                }
             } else if !inside {
                 editor.palette = None; // click outside closes
                 editor.search = None;
@@ -172,9 +200,32 @@ pub fn handle(
         return;
     }
     if editor.theme_picker.is_some() {
+        if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+            let ah = editor.active().view.area.1;
+            if let Some(tp) = editor.theme_picker.as_mut() {
+                if matches!(ev.kind, MouseEventKind::ScrollDown) {
+                    tp.selected = (tp.selected + 1).min(tp.rows.len().saturating_sub(1));
+                } else {
+                    tp.selected = tp.selected.saturating_sub(1);
+                }
+                crate::app::keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
+            }
+            crate::app::preview_selected_theme(editor);
+        }
         return;
     }
     if editor.file_browser.is_some() {
+        if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+            let ah = editor.active().view.area.1;
+            if let Some(fb) = editor.file_browser.as_mut() {
+                if matches!(ev.kind, MouseEventKind::ScrollDown) {
+                    fb.selected = (fb.selected + 1).min(fb.entries.len().saturating_sub(1));
+                } else {
+                    fb.selected = fb.selected.saturating_sub(1);
+                }
+                crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+            }
+        }
         return;
     }
     match ev.kind {
@@ -452,6 +503,8 @@ mod tests {
         e.palette = Some(crate::palette::Palette::default());
         let (reg, ex, clk, tx, km) = ctx();
         crate::app::hydrate_overlays(&mut e, &reg, &km); // fill rows (5b helper)
+        // A6 precondition: scroll_top must be 0 for this test's geometry to hold.
+        assert_eq!(e.palette.as_ref().unwrap().scroll_top, 0);
         let rows = &e.palette.as_ref().unwrap().rows;
         let idx = rows.iter().position(|r| r.id == crate::registry::CommandId("move_right")).unwrap();
         let area = ratatui::layout::Rect::new(0, 0, 80, 24);
@@ -462,6 +515,65 @@ mod tests {
         assert!(e.palette.is_none(), "palette closed after click");
         // move_right from offset 0 → caret at 1 proves the command was dispatched
         assert_eq!(crate::nav::head(&e), 1, "clicked move_right dispatched");
+    }
+
+    /// A6: clicking the first visible row when scroll_top > 0 must dispatch the
+    /// row at `rows[scroll_top]`, not `rows[0]`. The contract: the absolute row
+    /// index returned by `palette_row_at` accounts for `scroll_top`.
+    ///
+    /// rows[0] = move_left, rows[6] = select_left (registration order). With
+    /// selected=20, list_h=15 on an 80×24 terminal, keep_overlay_visible sets
+    /// scroll_top=6. From caret 1, select_left yields a non-empty selection
+    /// ([0,1]); move_left would leave an empty selection (caret at 0). This
+    /// distinguishes which row was actually dispatched.
+    #[test]
+    fn scrolled_click_maps_to_absolute_row() {
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        // Seed caret at 1 so select_left (rows[6]) is distinguishable from move_left (rows[0]).
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);
+        let (reg, ex, clk, tx, km) = ctx();
+        let mut p = crate::palette::Palette::default();
+        crate::palette::rebuild_rows(&mut p, &reg, &km);
+        p.selected = 20;
+        crate::app::keep_overlay_visible(24, p.selected, p.rows.len(), &mut p.scroll_top);
+        let scroll_top = p.scroll_top;
+        assert!(scroll_top > 0, "scroll_top must be non-zero for this test to be meaningful");
+        e.palette = Some(p);
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let rect = crate::render::palette_overlay_rect(area, e.palette.as_ref().unwrap().rows.len());
+        // Click the FIRST visible list row (visual row 0, absolute row scroll_top).
+        let click_row = rect.y + 2; // ov_y + 2 = first list entry
+        let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        assert!(e.palette.is_none(), "palette closed after click");
+        // select_left from caret 1 → non-empty selection [0,1].
+        // move_left from caret 1 → caret 0, selection empty.
+        // Non-empty selection proves rows[scroll_top] was dispatched, not rows[0].
+        assert!(!e.active().document.selection.primary().is_empty(),
+            "dispatched rows[scroll_top] (select_left), not rows[0] (move_left)");
+    }
+
+    /// A6: 20 ScrollDown wheel events move selected to 20 and scroll the window
+    /// so the selection stays visible.
+    #[test]
+    fn wheel_moves_selection_and_window() {
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        let (reg, ex, clk, tx, km) = ctx();
+        let mut p = crate::palette::Palette::default();
+        crate::palette::rebuild_rows(&mut p, &reg, &km);
+        e.palette = Some(p);
+        // 20 scroll-downs.
+        let scroll_down = MouseEvent { kind: MouseEventKind::ScrollDown, column: 40, row: 12, modifiers: KeyModifiers::NONE };
+        for _ in 0..20 {
+            handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx);
+        }
+        let p = e.palette.as_ref().expect("palette still open after wheel");
+        assert_eq!(p.selected, 20, "selected moved to 20");
+        let lh = crate::list_window::list_h_for(p.rows.len(), 24);
+        assert!(p.selected.saturating_sub(p.scroll_top) < lh,
+            "selection is within the visible window (selected - scroll_top < list_h)");
     }
 
     #[test]
@@ -638,7 +750,7 @@ mod tests {
             "theme_picker open must block arming");
         assert!(fire(&|e| { e.file_browser = Some(crate::file_browser::FileBrowser {
             dir: std::path::PathBuf::from("."), query: String::new(),
-            entries: vec![], selected: 0,
+            entries: vec![], selected: 0, scroll_top: 0,
         }); }).is_none(), "file_browser open must block arming");
         assert!(fire(&|e| { e.menu = Some(crate::menu::empty_at(0)); }).is_none(),
             "dropdown open must block arming");
@@ -710,5 +822,126 @@ mod tests {
         handle(&mut e, wheel_up, &reg, &km, &ex, &clk, &tx);
         assert!(e.mouse.menu_reveal_due.is_none(),
             "ScrollUp at row 0 must not arm the dwell (Moved-kind gate)");
+    }
+
+    // -----------------------------------------------------------------------
+    // A6 Task 2: tp/fb mouse wheel
+    // -----------------------------------------------------------------------
+
+    /// A6: ScrollDown wheel on the theme picker moves selected, keeps the window
+    /// visible, and previews the correct row (ordering pin).
+    ///
+    /// TDD RED: without the wheel block (just `return`), selected stays 0 and
+    /// the theme is not previewed.
+    #[test]
+    fn tp_wheel_scroll_moves_selection_and_previews() {
+        let mut e = Editor::new_from_text("# Hello\n\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_theme_picker();
+        // There are only 13 builtins — pad to 20 by cycling real builtin names so
+        // the list exceeds the 15-row window cap. Navigation-only (no Char/Backspace)
+        // so rebuild_rows is never called and the padding stays in place.
+        {
+            let names = wordcartel_core::theme::Theme::builtin_names();
+            let tp = e.theme_picker.as_mut().unwrap();
+            tp.rows.clear();
+            for i in 0..20 { tp.rows.push(names[i % names.len()].to_string()); }
+        }
+        assert_eq!(e.theme_picker.as_ref().unwrap().rows.len(), 20);
+        let lh = crate::list_window::list_h_for(20, 24);
+        assert_eq!(lh, 15, "list_h = 15 for 20 rows on 24-row terminal");
+        let (reg, ex, clk, tx, km) = ctx();
+        let scroll_down = MouseEvent {
+            kind: MouseEventKind::ScrollDown, column: 40, row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        // 16 scroll-downs — pushes past the 15-row window.
+        for _ in 0..16 {
+            handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx);
+        }
+        let tp = e.theme_picker.as_ref().expect("picker must remain open");
+        assert_eq!(tp.selected, 16, "selected must be 16 after 16 scroll-downs");
+        assert!(tp.selected.saturating_sub(tp.scroll_top) < lh,
+            "tp wheel: selection visible (selected={}, scroll_top={}, lh={})",
+            tp.selected, tp.scroll_top, lh);
+        // The applied theme must equal tp.rows[tp.selected] (wheel previews correct row).
+        let expected_name = tp.rows[tp.selected].clone();
+        assert_eq!(e.theme.name, expected_name,
+            "tp wheel: applied theme={:?} must equal tp.rows[selected]={expected_name:?}",
+            e.theme.name);
+    }
+
+    /// A6: ScrollDown wheel on the file browser moves selected and keeps the window
+    /// visible. The unconditional `return` still prevents text-area events.
+    ///
+    /// TDD RED: without the wheel block (just `return`), selected stays 0.
+    #[test]
+    fn fb_wheel_scroll_moves_selection() {
+        // 20 directories → 21 entries (.., d00..d19).
+        let dir = std::env::temp_dir().join(format!("wc-a6-fbwheel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..20usize {
+            std::fs::create_dir(dir.join(format!("d{i:02}"))).unwrap();
+        }
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        e.open_file_browser(dir.clone());
+        let total = e.file_browser.as_ref().unwrap().entries.len();
+        assert_eq!(total, 21, "precondition: 21 entries");
+        let (reg, ex, clk, tx, km) = ctx();
+        let scroll_down = MouseEvent {
+            kind: MouseEventKind::ScrollDown, column: 40, row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        for _ in 0..20 {
+            handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx);
+        }
+        let fb = e.file_browser.as_ref().expect("browser must remain open");
+        assert_eq!(fb.selected, 20, "selected must be 20 after 20 scroll-downs");
+        let lh = crate::list_window::list_h_for(fb.entries.len(), 24);
+        assert!(fb.selected.saturating_sub(fb.scroll_top) < lh,
+            "fb wheel: selection visible (selected={}, scroll_top={}, lh={})",
+            fb.selected, fb.scroll_top, lh);
+        // Verify the file browser is still open (unconditional return preserved).
+        assert!(e.file_browser.is_some(), "file browser must still be open after wheel");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pre-existing bug (aligned here): clicking a Buffers-kind palette row must
+    /// switch to that buffer and close the palette — not dispatch
+    /// CommandId("palette") which reopens the picker. The mouse path is aligned
+    /// with the keyboard Enter arm (app.rs ~1238) that checks row.buffer first.
+    ///
+    /// Unscrolled click (2 buffers — doc + scratch): the list fits in the window
+    /// without scrolling. A scrolled variant is not needed here — the abs-row
+    /// mapping for scrolled clicks is already covered by
+    /// `scrolled_click_maps_to_absolute_row`; the bug is in the dispatch branch,
+    /// not in the hit-test, so an unscrolled click exercises the full fix path.
+    #[test]
+    fn click_buffers_palette_row_switches_buffer_not_reopens() {
+        let mut e = Editor::new_from_text(
+            "doc\n", Some(std::path::PathBuf::from("/tmp/a.md")), (80, 24));
+        e.install_scratch();
+        // buffers[0] = doc (active), buffers[1] = scratch.
+        let scratch_id = e.scratch_id.unwrap();
+        assert_eq!(e.active, 0, "precondition: doc is active before the click");
+        e.open_buffer_switcher();
+        // rows[0] = doc (MRU front), rows[1] = scratch — both carry buffer: Some(id).
+        assert_eq!(e.palette.as_ref().unwrap().rows.len(), 2,
+            "precondition: exactly 2 rows in the Buffers palette");
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let rect = crate::render::palette_overlay_rect(area, 2);
+        // Click the second list row (rows[1] = scratch) at ov_y + 2 + 1.
+        let click_row = rect.y + 2 + 1;
+        let d = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 1,
+            row: click_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let (reg, ex, clk, tx, km) = ctx();
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        assert!(e.palette.is_none(), "palette must close after clicking a buffer row");
+        assert_eq!(e.active().id, scratch_id,
+            "click must switch to the clicked row's buffer (scratch), not reopen the palette");
     }
 }
