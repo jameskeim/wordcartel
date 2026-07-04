@@ -1,6 +1,6 @@
 # A6: overlay list reachability — windowed scrolling for palette + siblings — design
 
-**Status:** approved design (pre-spec-review)
+**Status:** Codex round 1 folded (fb Enter hazard named; buffer-switcher coverage explicit; the deliberate area read); re-verify pending
 **Date:** 2026-07-04
 **Effort:** a6-palette-reachability — slot 1 of the recorded working order (`docs/ux-backlog.md`).
 User decisions: scope = ALL FOUR diseased overlays (fork 1 = B); wheel moves the SELECTION
@@ -13,8 +13,10 @@ struct has no scroll state (palette.rs:19-28), render slices only the first
 `list_h = min(rows, 15, h-4)` rows into the ratatui `List` (render.rs:760-777, height logic
 :150-159), while Up/Down move `selected` over the FULL row set (app.rs:1240-1249). Past the
 window the highlight VANISHES (ratatui gets a window-relative-impossible index) and **Enter
-still dispatches the invisible selection** (app.rs:1225-1226 reads the absolute index) — a
-silent-wrong-action hazard. PgUp/PgDn/Home/End are consumed by the wildcard arm (:1287) and
+still dispatches the invisible selection** — a silent-wrong-action hazard shared by the
+palette (app.rs:1225-1226 reads the absolute index) AND the file browser (app.rs:1387,
+`fb.entries.get(fb.selected)` — Codex round 1: the identical hazard, named explicitly; the
+outline's is partially pre-empted by its opened_version guard but live for fresh documents). PgUp/PgDn/Home/End are consumed by the wildcard arm (:1287) and
 do nothing. The palette mouse block returns early for ALL events (mouse.rs:122-145) — wheel
 never reaches the scroll arms. Clicks on visible rows work (`palette_row_at`, render.rs:163-174,
 test-pinned); query-row/border clicks are silent no-ops (deliberate, kept).
@@ -23,7 +25,7 @@ test-pinned); query-row/border clicks are silent no-ops (deliberate, kept).
 
 | Overlay | scroll field | slices `take(list_h)` | selection escapes | wheel | notes |
 |---|---|---|---|---|---|
-| Palette | none | yes (:760) | YES (~110 cmds) | swallowed | click works on visible rows |
+| Palette | none | yes (:760) | YES (~110 cmds; ALSO PaletteKind::Buffers — the buffer switcher, editor.rs:687, exceeds 15 on large sessions and is cured by the same fix) | swallowed | click works on visible rows |
 | Outline | none | yes (:805) | YES (16+ headings) | falls through to the DOC | no mouse block at all |
 | ThemePicker | none | yes (:851) | LATENT (13 themes; breaks at 16 — E4 adds themes) | swallowed | live PREVIEW follows the invisible selection (app.rs:1086-1091) |
 | FileBrowser | none | yes (:897) | YES (16+ dir entries) | swallowed | clicks swallowed entirely |
@@ -99,8 +101,10 @@ file browser :1421-1428; outline :1648-1657):
 - **ThemePicker ordering pin:** `keep_visible` runs BEFORE `preview_selected_theme`
   (app.rs:1086-1091) on every selection-changing path — the previewed theme is always the
   visibly-highlighted one.
-- `list_h` inside key handlers derives from `list_h_for(rows.len(), editor area height)` —
-  the same numbers render will use that frame.
+- `list_h` inside key handlers derives from `list_h_for(rows.len(), area_h)` where
+  `area_h` is read from **`editor.active().view.area`** — the SAME source render (:720) and
+  mouse (:120) use. **The overlay key blocks read no area today (Codex round 1) — this read
+  is a deliberate addition**, giving key handlers the same numbers render will use that frame.
 - Enter semantics UNCHANGED (absolute `rows.get(selected)`) — safe by the always-visible
   invariant. Outline's `opened_version` guard (app.rs:1660-1667) untouched.
 
