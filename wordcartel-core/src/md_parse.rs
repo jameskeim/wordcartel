@@ -250,11 +250,19 @@ fn apply_block_prefix_conceal(
         }
 
         BlockRole::ListItem => {
-            // Skip optional leading spaces.
-            let start = bytes.iter().take_while(|&&b| b == b' ').count();
+            // Skip leading indent: spaces AND tabs (spec D3 — the scan is tab-aware).
+            let start = bytes.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
             if start >= n {
                 return None;
             }
+            // The glyph reproduces the indent's display width: space as-is, tab as
+            // TAB_WIDTH spaces (matches layout's tab policy) — so the bullet paints
+            // at its indent level and continuation rows hang under the item text.
+            // TAB_WIDTH = 4 (layout.rs tab policy)
+            let indent_str: String = bytes[..start]
+                .iter()
+                .map(|&b| if b == b'\t' { "    " } else { " " })
+                .collect();
             let b0 = bytes[start];
 
             // Unordered marker: `[-*+]` followed by space or tab
@@ -262,9 +270,12 @@ fn apply_block_prefix_conceal(
                 && start + 1 < n
                 && is_ws(bytes[start + 1])
             {
+                // Conceal indent + marker + its whitespace (marker-conditional: the
+                // no-marker path below conceals NOTHING — spec I4).
+                visible[..start].fill(false);
                 visible[start] = false;
                 visible[start + 1] = false;
-                return Some("• ".to_string());
+                return Some(format!("{indent_str}• "));
             }
 
             // Ordered marker: `<digits>[.)]` followed by space or tab
@@ -279,10 +290,9 @@ fn apply_block_prefix_conceal(
                     && digit_end + 1 < n
                     && is_ws(bytes[digit_end + 1])
                 {
-                    // Parse the ordinal number.
                     let ordinal: &str = &line[start..digit_end];
-                    let glyph = format!("{}. ", ordinal);
-                    // Conceal start..=digit_end+1 (digits + punctuation + space/tab).
+                    let glyph = format!("{indent_str}{ordinal}. ");
+                    visible[..start].fill(false);
                     visible[start..=digit_end + 1].fill(false);
                     return Some(glyph);
                 }
@@ -643,6 +653,40 @@ mod tests {
     fn inline_html_non_comment_tag_is_not_comment() {
         let a = analyze("a <span>x</span> b", BlockRole::Paragraph, false);
         assert!(a.styles.iter().all(|s| s.style != Style::Comment), "a <span> is not a comment");
+    }
+
+    // --- Task B2: nested-list indent conceal ---
+
+    #[test]
+    fn nested_unordered_indent_concealed_into_glyph() {
+        let a = analyze("  - sub", BlockRole::ListItem, false);
+        assert_eq!(visible(&a, "  - sub"), "sub");
+        assert_eq!(a.prefix_glyph.as_deref(), Some("  • "));
+    }
+
+    #[test]
+    fn tab_indented_item_recognized_and_expanded() {
+        // A leading tab is indent (spec D3: the scan is now tab-aware) and expands
+        // to TAB_WIDTH spaces in the glyph so widths match the old visual layout.
+        let a = analyze("\t- sub", BlockRole::ListItem, false);
+        assert_eq!(visible(&a, "\t- sub"), "sub");
+        assert_eq!(a.prefix_glyph.as_deref(), Some("    • "));
+    }
+
+    #[test]
+    fn nested_ordered_indent_concealed_into_glyph() {
+        let a = analyze("   2. x", BlockRole::ListItem, false);
+        assert_eq!(visible(&a, "   2. x"), "x");
+        assert_eq!(a.prefix_glyph.as_deref(), Some("   2. "));
+    }
+
+    #[test]
+    fn markerless_listitem_continuation_keeps_indent_no_glyph() {
+        // Continuation lines of a multi-line item carry ListItem role with no marker
+        // (spec I4): indent must stay VISIBLE and no glyph appear — else invisible text.
+        let a = analyze("  second", BlockRole::ListItem, false);
+        assert_eq!(visible(&a, "  second"), "  second");
+        assert_eq!(a.prefix_glyph, None);
     }
 
     // --- Regressions ---

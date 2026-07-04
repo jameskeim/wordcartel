@@ -899,6 +899,19 @@ mod tests {
         let (_r, m) = layout("para", BlockRole::Paragraph, false, 40, true);
         assert_eq!(m.prefix_width, 0);
     }
+
+    #[test]
+    fn law_w2_nested_prefix_alignment_inactive() {
+        for (line, marker_w) in [("- x", 2), ("  - x", 2), ("    - x", 2), ("\t- x", 2),
+                                 ("1. x", 3), ("   12. x", 4)] {
+            let indent_w = line.bytes().take_while(|&b| b == b' ' || b == b'\t')
+                .map(|b| if b == b'\t' { 4 } else { 1 }).sum::<usize>();
+            let (rows, map) = layout(line, BlockRole::ListItem, false, 20, false);
+            assert_eq!(map.prefix_width, indent_w + marker_w, "{line:?}");
+            assert!(map.placed.iter().all(|p| p.col >= map.prefix_width), "{line:?}");
+            assert_eq!(rows[0].prefix_glyph.as_deref().map(|g| !g.is_empty()), Some(true));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
