@@ -19,7 +19,8 @@ use wordcartel_core::history::Clock;
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Msg, apply_result, reduce — unified message type and reducer
+// Msg, the overlay glue, reduce, and the run loop — job/session/prompt/search
+// handlers live in jobs_apply / session_restore / prompts / search_ui.
 // ---------------------------------------------------------------------------
 
 pub enum Msg {

@@ -380,7 +380,7 @@ chrome model (hence the ordering).
 
 ## Theme H — code health
 
-### H1. app.rs decomposition — `settled-direction` · Medium (mechanical; do BEFORE Effort P)
+### H1. app.rs decomposition — `SHIPPED` 2026-07-04 — app.rs 4,349 lines (from 5,740); new modules jobs_apply.rs 496, session_restore.rs 309, prompts.rs 414, search_ui.rs 211
 
 *(Added 2026-07-04 from a module-size audit. "H" to avoid colliding with the hardening
 campaign's F-numbering.)*
@@ -400,8 +400,9 @@ implementer subagents to hold.
 **Direction:** a mechanical, behavior-preserving split along those seams — `jobs_apply.rs`,
 `session_restore.rs`, `prompts.rs`, `search_ui.rs`, with `reduce` + the run-loop machinery
 remaining as the residual `app.rs`. Pure `pub(crate)` moves, NO logic changes; tests move
-with their subjects; suite green + clippy deny are the gates; `git log --follow` preserves
-blame across moves. **Timing:** before Effort P — the plugin event-hook dispatch seam lands
+with their subjects; suite green + clippy deny are the gates; `git blame -C -C` preserves
+blame across moves (a split is a copy, not a rename — `git log --follow` does not apply).
+**Timing:** before Effort P — the plugin event-hook dispatch seam lands
 in exactly `reduce`/registry territory, and P's diff should land in a file whose main content
 IS `reduce`, not line 1,104 of a six-topic file.
 

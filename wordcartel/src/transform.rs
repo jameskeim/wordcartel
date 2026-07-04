@@ -136,7 +136,7 @@ pub fn dispatch_transform(
 }
 
 /// Shared merge body used by BOTH the sync path and the async path (via
-/// `apply_transform_done` in app.rs). Targets `buffer_id` (not necessarily
+/// `apply_transform_done` in `jobs_apply.rs`). Targets `buffer_id` (not necessarily
 /// active) so both callers route correctly.
 ///
 /// Active-buffer guard: `derive::rebuild` and `nav::ensure_visible` operate on
