@@ -141,7 +141,7 @@ fn do_save(ctx: &mut Ctx) {
 /// Registry `"save"` handler: external-mod check then dispatch a background save.
 pub fn dispatch_save(ctx: &mut Ctx) -> CommandResult {
     let path = match &ctx.editor.active().document.path {
-        None => { crate::app::open_save_as(ctx.editor); return CommandResult::Handled; }
+        None => { crate::prompts::open_save_as(ctx.editor); return CommandResult::Handled; }
         Some(p) => p.clone(),
     };
 

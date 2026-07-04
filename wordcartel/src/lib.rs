@@ -11,6 +11,7 @@ pub mod render;
 pub mod term;
 pub mod panicx;
 pub mod prompt;
+pub mod prompts;
 pub mod file;
 pub mod limits;
 pub mod fsx;

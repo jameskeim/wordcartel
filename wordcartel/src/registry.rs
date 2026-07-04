@@ -143,7 +143,7 @@ impl Registry {
 
         // File menu.
         r.register("new", "New", Some(MenuCategory::File), |c| {
-            crate::app::request_new(c.editor, c.executor, c.clock, &c.msg_tx);
+            crate::prompts::request_new(c.editor, c.executor, c.clock, &c.msg_tx);
             CommandResult::Handled
         });
         r.register("open", "Open…", Some(MenuCategory::File), |c| {
@@ -156,7 +156,7 @@ impl Registry {
         });
         r.register("save", "Save", Some(MenuCategory::File), crate::save::dispatch_save);
         r.register("save_as", "Save As…", Some(MenuCategory::File), |c| {
-            crate::app::open_save_as(c.editor);
+            crate::prompts::open_save_as(c.editor);
             CommandResult::Handled
         });
         r.register("save_and_quit", "Save and Quit", Some(MenuCategory::File), |c| {
