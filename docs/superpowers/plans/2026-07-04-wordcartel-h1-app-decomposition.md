@@ -14,6 +14,14 @@
 - **Gates after EVERY commit:** `cargo test -p wordcartel-core -p wordcartel` green (975 tests), `cargo clippy --workspace --all-targets` clean (deny gate LIVE), `cargo build` warning-free. NO `cargo fmt` — the repo is hand-formatted; moved code keeps its bytes.
 - **Line numbers in this plan are BRANCH-BASE references** (the file state when the task begins for Task 1; earlier tasks shift later numbers). Locate every cut by the quoted signature/doc text and verify the extent (line count) matches; do the cuts within a task from the BOTTOM of the file upward so the listed numbers stay valid while you work. After cuts, make path edits by string match, not line number.
 - Moved test bodies call `crate::app::<fn>` today (grep-verified, no bare-name calls). A MOVING test rewrites those calls to bare names under its new `use super::*`; a STAYING test swaps only the module segment (`crate::app::` → `crate::prompts::` etc.). No other test edits of any kind — never weaken, rename, or reorder a test.
+- **The four new lib.rs declarations are `pub mod <name>;`** — every existing declaration
+  in lib.rs is `pub mod`, and a private `mod` would silently remove formerly-public API
+  (`wordcartel::app::apply_outcome` etc. were public through `pub mod app`), violating the
+  spec's no-tightening rule (Fable plan I1).
+- **Blank-line seams (Fable plan M1):** each production cut absorbs ONE adjacent blank
+  separator line so the residual file keeps single-blank separations (clause-(a)-adjacent
+  motion; the whole-branch verbatim check should expect exactly this). In each new file:
+  one blank line between the use block and the first fn, and between paste blocks.
 - House style: `—` em-dash in prose comments; no emoji; match neighbors by hand.
 - Every commit message ends with the trailers, verbatim (use `git commit -F -` with a quoted heredoc — `!` breaks zsh inside double-quoted `-m`):
   ```
@@ -47,9 +55,9 @@ use crate::app::Msg;
 use wordcartel_core::history::Clock;
 ```
 
-(The bodies reach everything else via full paths — `crate::jobs::JobOutcome`, `crate::workspace::*`, `crate::save::*`, `wordcartel_core::*`, `std::*` — which need no `use`. `apply_panic` carries its own in-body `use crate::jobs::JobKind;` that moves verbatim with it.) In `wordcartel/src/lib.rs`, add `mod jobs_apply;` on its own line immediately after the existing `mod jobs;` declaration (match the surrounding grouping style exactly).
+(The bodies reach everything else via full paths — `crate::jobs::JobOutcome`, `crate::workspace::*`, `crate::save::*`, `wordcartel_core::*`, `std::*` — which need no `use`. `apply_panic` carries its own in-body `use crate::jobs::JobKind;` that moves verbatim with it.) In `wordcartel/src/lib.rs`, add `pub mod jobs_apply;` on its own line immediately after the existing `pub mod jobs;` declaration (lib.rs:17).
 
-- [ ] **Step 2: cut the production code (bottom-up).** Two cuts from app.rs, pasted into jobs_apply.rs BELOW the use block, in source order (117-block first, clipboard trio after it):
+- [ ] **Step 2: cut the production code (bottom-up).** Two cuts from app.rs — cut the clipboard trio first (it sits lower), hold it aside, then cut the 117-block; paste both into jobs_apply.rs BELOW the use block in SOURCE order (117-block first, clipboard trio after it):
   1. Cut app.rs **:769-:813** (45 lines) — `insert_paste_text` (no doc), `apply_clipboard_paste`, `apply_clipboard_availability`.
   2. Cut app.rs **:117-:403** (287 lines) — from the `///` doc line above `pub fn apply_result` (:117) through the closing brace of `apply_export_done` (:403): `apply_result`, `apply_job_result` (doc :177-:179), `apply_outcome` (doc :188-:189), `apply_panic`, `apply_job_outcome` (doc :233-:235), `drive_quit_drain` (doc :244-:247), `apply_filter_done` (`//` comment :284-:285 + `#[allow(clippy::too_many_arguments)]` :286 — both move), `apply_transform_done`, `apply_export_done`.
 
@@ -59,6 +67,7 @@ use wordcartel_core::history::Clock;
   - `apply_job_outcome(` at :868 (inside `dispatch_overlay_command`, which stays) and at reduce's 24 sites :1151 :1164 :1168 :1201 :1214 :1225 :1338 :1352 :1363 :1450 :1462 :1472 :1587 :1621 :1640 :1688 :1714 :1725 :1750 :1771 :1836 :1876 :1954 :2009.
   - `apply_filter_done(` :1623 :1956; `apply_export_done(` :1626 :1959; `apply_transform_done(` :1629 :1962; `apply_clipboard_paste(` :1634 :1993; `apply_clipboard_availability(` :1635 :1994; `insert_paste_text(` :1934.
   - **The clause-(c) transient:** inside `resolve_prompt` (still in app.rs until Task 3), `drive_quit_drain(` at :641 and :653 → `crate::jobs_apply::drive_quit_drain(`. This line moves again with `resolve_prompt` in Task 3 — expected and spec-sanctioned.
+  - **Prune app.rs's own use block (clause (a); Fable plan C1 — the gate FAILS without this):** app.rs:13 `use crate::jobs::{is_stale, Executor, JobOutcome, JobResult};` shrinks to `use crate::jobs::{Executor, JobOutcome};` — `is_stale`'s only user (:119) moves, and every residual `JobResult` mention is inside a T1 mover test carrying its own function-local import.
 
 - [ ] **Step 5: external call-site renames.** `crate::app::apply_outcome` → `crate::jobs_apply::apply_outcome` at exactly 14 sites: save.rs:329 :348 :369 :393 :424 :433 :487 :770, reconcile.rs:120 :151 :176, swap.rs:567 :583, file.rs:315. Verify with `grep -rn "crate::app::apply_outcome" wordcartel/src/` → zero remaining.
 
@@ -100,7 +109,7 @@ mod tests {
 use crate::editor::Editor;
 ```
 
-(Only `Editor` appears bare; everything else is full-path in the bodies.) In lib.rs, add `mod session_restore;` beside the state/session-related declarations — immediately after the existing `mod state;` line (match grouping).
+(Only `Editor` appears bare; everything else is full-path in the bodies.) In lib.rs, add `pub mod session_restore;` immediately after the existing `pub mod state;` line (lib.rs:29).
 
 - [ ] **Step 2: cut the production span.** One contiguous cut, branch-base app.rs **:405-:528** (124 lines; after Task 1 it sits ~287 lines higher — locate by the `///` doc above `pub fn apply_resume`): `apply_resume` (doc :405-:406), `load_marks_from_entry` (doc :418-:420), `load_block_from_entry` (doc :430-:440), `restore_resume` (doc :451-:454), `restore_scratch` (doc :477-:480), `open_into_current` (doc :501-:504). Paste below the use block. ZERO visibility edits in this task.
 
@@ -138,13 +147,13 @@ use crate::app::Msg;
 use wordcartel_core::history::Clock;
 ```
 
-In lib.rs, add `mod prompts;` immediately after the existing `mod prompt;` line.
+In lib.rs, add `pub mod prompts;` immediately after the existing `pub mod prompt;` line (lib.rs:12).
 
 - [ ] **Step 2: cut the production span.** One contiguous cut, branch-base app.rs **:530-:767** (238 lines — locate by the doc line `/// Execute the action chosen in a modal prompt…` at :530; NOTE this stray doc semantically describes `resolve_prompt` but is physically attached to `open_save_as` — it moves verbatim, do NOT relocate or reword it): `open_save_as` (doc :530-:531), `expand_path` (doc :539-:540), `save_as_submit` (doc :549-:550), `block_write_submit` (doc :572-:574), `perform_block_write`, `perform_save_as`, `request_new` (doc :608), `resolve_prompt` (no doc; its :641/:653 `crate::jobs_apply::drive_quit_drain` calls were rewritten in Task 1 and move as-is), `submit_filter_line` (doc :723-:727), `goto_line_submit` (doc :749-:750).
 
 - [ ] **Step 3: the single visibility escalation:** `submit_filter_line` changes `fn` → `pub(crate) fn`. (`goto_line_submit` is already `pub(crate)`; `perform_block_write`/`perform_save_as` stay private — all their callers moved with them.)
 
-- [ ] **Step 4: path edits.** Residual app.rs (reduce's modal + minibuffer-Enter arms): `resolve_prompt(` :1616, `submit_filter_line(` :1679, `goto_line_submit(` :1680, `save_as_submit(` :1681, `block_write_submit(` :1682 gain `crate::prompts::`. External: registry.rs:146 `crate::app::request_new` → `crate::prompts::request_new`; registry.rs:159 and save.rs:144 `crate::app::open_save_as` → `crate::prompts::open_save_as`.
+- [ ] **Step 4: path edits.** Residual app.rs (reduce's modal + minibuffer-Enter arms): `resolve_prompt(` :1616, `submit_filter_line(` :1679, `goto_line_submit(` :1680, `save_as_submit(` :1681, `block_write_submit(` :1682 gain `crate::prompts::`. External: registry.rs:146 `crate::app::request_new` → `crate::prompts::request_new`; registry.rs:159 and save.rs:144 `crate::app::open_save_as` → `crate::prompts::open_save_as`. **Prune app.rs's use block (clause (a); Fable plan C1):** delete app.rs:15 `use crate::prompt::PromptAction;` — its only production user (`resolve_prompt`) moves, and every staying-test use has a function-local import.
 
 - [ ] **Step 5: move the ten tests** (bottom-up) into a new test module with the same header shape as Task 1's (`use super::*;` plus `use crate::test_support::TestClock;` — six of the ten movers name `TestClock`): :5197-:5207 `block_write_existing_target_raises_overwrite`; :5182-:5195 `block_write_writes_block_text_only_doc_unchanged`; :5159-:5176 `new_additive_preserves_all_existing_buffers`; :5146-:5157 `new_on_dirty_buffer_is_additive_no_modal`; :5133-:5144 `new_on_any_buffer_adds_empty_untitled`; :5113-:5127 `save_as_existing_target_raises_overwrite_prompt` (its `crate::app::save_as_submit` call at :5122 becomes bare — Codex plan r1 caught this test dropped from the list); :3574-:3586 `goto_line_clamps_and_rejects_garbage`; :3554-:3572 `goto_line_into_folded_body_unfolds_to_reveal_target`; :3491-:3510 `recover_loads_body_and_deletes_orphan_swap_file`; :3226-:3241 `save_and_quit_on_unnamed_buffer_does_not_arm_pending_after_save`. Rewrite the movers' `crate::app::{resolve_prompt, save_as_submit, block_write_submit, request_new, goto_line_submit}` calls to bare names. None uses an app.rs test helper (grounding-verified).
 
@@ -175,7 +184,7 @@ In lib.rs, add `mod prompts;` immediately after the existing `mod prompt;` line.
 use crate::{derive, editor::Editor};
 ```
 
-In lib.rs, add `mod search_ui;` immediately after the existing `mod search_overlay;` line (or, if declarations sit elsewhere, beside `mod search;` — match the file's grouping).
+In lib.rs, add `pub mod search_ui;` immediately after the existing `pub mod search_overlay;` line (lib.rs:34; Fable plan M2 dropped the nonexistent `mod search;` fallback).
 
 - [ ] **Step 2: cut the production span.** One contiguous cut, branch-base app.rs **:887-:1092** (206 lines — locate by `fn search_sync`; the span ends at `diag_apply_selected`'s closing brace, :1092; the overlay glue at :819-:885 ABOVE and `preview_selected_theme` at :1094 BELOW both STAY): `search_sync`, `search_step`, `search_cancel`, `type SearchReplacePlan` (:916), `search_replace_all`, `search_step_apply`, `search_step_skip`, `search_step_rest`, `search_pin`, `diag_apply_selected` (doc :1012-:1013).
 
