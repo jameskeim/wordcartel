@@ -131,9 +131,11 @@ NOT move here — it is overlay glue (decision 2).
 **The rule:** a test moves with the module whose functions it calls **directly**; a test
 that reaches the moved code only through `reduce(...)` stays in app.rs — it is a reducer
 test regardless of which seam it exercises. **One explicit exception (Codex r1):** the
-quit-drain family SPANS two extracted modules — several of its tests directly call
-`resolve_prompt` (app.rs:3087/:3114/:3174/:3196), `apply_job_outcome` (:3093), and
-`save_as_submit` (:3201) — and a spanner has no single home under the rule. The family
+quit-drain family SPANS two extracted modules — its tests directly call
+`resolve_prompt` (app.rs:3087/:3114/:3117/:3139/:3174/:3196), `apply_job_outcome`
+(:3093/:3175), and `save_as_submit` (:3201; Codex-enumerated — the plan's per-test
+pass remains the authoritative rewrite checklist) — and a spanner has no single home
+under the rule. The family
 stays in app.rs as flow-integration tests, with its direct calls rewritten to the new
 paths (`crate::prompts::resolve_prompt`, `crate::jobs_apply::apply_job_outcome`, …).
 The implementation plan classifies each of the 139 tests explicitly BY READING ITS BODY,
