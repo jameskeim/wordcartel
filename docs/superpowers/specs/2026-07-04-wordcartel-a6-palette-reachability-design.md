@@ -1,6 +1,6 @@
 # A6: overlay list reachability — windowed scrolling for palette + siblings — design
 
-**Status:** Codex x3 + Fable5 folded incl. C2 resolution (render self-heal, user decision A); fold-verify pending
+**Status:** spec-review CLEAN (Codex x4 + Fable5; three user decisions: scope B, wheel A, resize self-heal A); ready for user review + planning
 **Date:** 2026-07-04
 **Effort:** a6-palette-reachability — slot 1 of the recorded working order (`docs/ux-backlog.md`).
 User decisions: scope = ALL FOUR diseased overlays (fork 1 = B); wheel moves the SELECTION
@@ -106,8 +106,11 @@ file browser :1421-1428; outline :1648-1657):
   (which also re-clamps `scroll_top` after the row set shrinks).
 - **The file browser's DIRECTORY-NAVIGATION rebuild (Fable C1 — panic-class if missed):**
   Enter-descend (and `..`) sets `fb.selected = 0` and calls `rebuild_entries`
-  (app.rs:1403-1407) — NOT a filter path, and grep-verified the only rebuild site outside
-  the Char/Backspace/Paste arms. It must reset `scroll_top = 0` beside `selected = 0`
+  (app.rs:1403-1407) — NOT a filter path, and the only rebuild site **within the
+  file-browser KEY-EVENT block** outside its Char/Backspace/Paste arms (Codex r4 scoping:
+  `rebuild_entries` also fires on the hydration/OPEN paths — app.rs:819, editor.rs:679/
+  :716/:728 — but those construct/refresh FRESH state where `scroll_top` is 0 by default;
+  only the descend path carries a stale window). It must reset `scroll_top = 0` beside `selected = 0`
   (or run `keep_visible` after the rebuild): a stale scroll_top over a smaller entry set
   makes the windowed slice `rows[5..2]` — an out-of-order range that PANICS in all builds.
 - **ThemePicker ordering pin:** `keep_visible` runs BEFORE `preview_selected_theme`
@@ -241,8 +244,10 @@ file browser :1421-1428; outline :1648-1657):
    return; the palette block's structure at mouse.rs:122-145).
 5. Each overlay's key-arm wildcard behavior (the plan must add arms WITHOUT disturbing each
    block's paste/char handling; the palette's three-tier intercept at app.rs:1200-1292).
-6. The area-height source for `list_h_for` inside key handlers (the same `view.area` the
-   renderer uses — confirm no resize-race between a key event and the next frame matters,
-   since keep_visible re-runs on every selection change and render re-derives list_h).
+6. RESOLVED by the C2 decision + Codex r4 wording fix: key handlers read
+   `editor.active().view.area` (the mouse's source); render reads `frame.area()` — a
+   different source, same dimensions. Any transient divergence (a key event racing a
+   resize) is healed by render's own `keep_visible` pass the very next frame — no
+   race matters by construction.
 7. The e2e journey's harness needs (key() covers PgDn/End? — KeyCode::PageDown/End exist;
    confirm the palette opens via the ctrl-p binding in the harness keymap).
