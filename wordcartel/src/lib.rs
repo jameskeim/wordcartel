@@ -35,6 +35,7 @@ pub mod menu;
 pub mod marks;
 pub mod mouse;
 pub mod search_overlay;
+pub mod search_ui;
 pub mod diagnostics_run;
 pub mod reconcile;
 pub mod diag_overlay;
