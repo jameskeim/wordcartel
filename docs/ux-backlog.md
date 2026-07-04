@@ -325,7 +325,11 @@ assembled.
 ### E3. Chrome theming coherence — one chrome family + a full|zen axis + phosphor restructure — `needs-design` · Medium-Large
 
 *(Added 2026-07-04. Facts as of `bd3b72c`. SHOULD PRECEDE E1/E2's preset work and E4 —
-presets and new themes should build on a coherent chrome model, not before it.)*
+presets and new themes should build on a coherent chrome model, not before it. **This effort
+also CARRIES the render.rs split** (1,064 prod lines — one draw path + a painter per overlay
++ shared geometry): E3 touches every overlay painter anyway, so it carves render into
+canvas/chrome/overlay-painter modules in the same pass rather than paying the churn twice —
+from the 2026-07-04 module-size audit, see Theme H.)*
 
 **The user's reports, all grounded as real:** modal text doesn't follow theme colors; modals
 aren't consistent with the menu bar; the menu bar and status bar don't match each other.
@@ -383,6 +387,41 @@ chrome model (hence the ordering).
 
 ---
 
+## Theme H — code health
+
+### H1. app.rs decomposition — `settled-direction` · Medium (mechanical; do BEFORE Effort P)
+
+*(Added 2026-07-04 from a module-size audit. "H" to avoid colliding with the hardening
+campaign's F-numbering.)*
+
+**Facts (as of `9d55a96`):** `wordcartel/src/app.rs` is 5,174 lines (~2,380 production,
+188 fns) — six distinguishable modules wearing one name, with clean seams visible in its own
+layout: (1) job/message application — the `apply_*` family, :118-:460; (2) session/resume
+restoration — `apply_resume`/`load_*_from_entry`/`restore_*`/`open_into_current`, :407-:530;
+(3) prompt submits & file dialogs — save-as, block-write, the 110-line `resolve_prompt`,
+goto-line, :532-:767; (4) search-and-replace UI driving — nine `search_*` fns +
+`diag_apply_selected`, :878-:1090; (5) `reduce` itself (~750 lines, :1104-:1836); (6) the run
+loop machinery — `step`/`run`/`advance`/the deadline array/`recompute_*`/
+`reconcile_mouse_capture`, :1850-:2380. Every 2026-07 effort (export, themes, menu modes) had
+to edit it — the standing merge-conflict hotspot, and the hardest file for reviewers and
+implementer subagents to hold.
+
+**Direction:** a mechanical, behavior-preserving split along those seams — `jobs_apply.rs`,
+`session_restore.rs`, `prompts.rs`, `search_ui.rs`, with `reduce` + the run-loop machinery
+remaining as the residual `app.rs`. Pure `pub(crate)` moves, NO logic changes; tests move
+with their subjects; suite green + clippy deny are the gates; `git log --follow` preserves
+blame across moves. **Timing:** before Effort P — the plugin event-hook dispatch seam lands
+in exactly `reduce`/registry territory, and P's diff should land in a file whose main content
+IS `reduce`, not line 1,104 of a six-topic file.
+
+**Deliberate non-splits from the same audit:** `block_tree.rs` (1,318 prod, the second-
+largest) stays WHOLE — it is the fuzz-hardened, oracle-anchored highest-bug-surface module;
+the splice/widen/full-parse are one algorithm and the campaign's value is partly blame
+stability there; restructure only if a B-strong-class parser replacement ever happens.
+`nav.rs` (942) and `editor.rs` (767) are coherent — fine as-is.
+
+---
+
 ## Cross-cutting notes
 
 - **Testing synergy:** every item lands with e2e `Harness` journeys (menu state machine,
@@ -429,7 +468,8 @@ both carrying bug fixes.)*
   the quit machinery).
 - **Medium:** A5 keymap switch + D1 write-back (one effort) · B2 sub-list indent (+ hanging
   indent) · C2 transform scope (block-under-caret defaults + deepest-block snapping) ·
-  C3 clipboard over SSH/tmux (the terminal × tmux × SSH test matrix is the real cost).
+  C3 clipboard over SSH/tmux (the terminal × tmux × SSH test matrix is the real cost) ·
+  H1 app.rs decomposition (mechanical; before Effort P).
 - **Medium-Large:** E3 chrome theming coherence (one chrome family + the full|zen axis +
   the phosphor restructure — precedes E1/E2 and E4's landings).
 - **Larger:** B1 word-boundary wrap · E1/E2 chrome presets + polish pass (after A1/A2 and
