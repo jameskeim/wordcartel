@@ -117,7 +117,7 @@ mod tests {
 
         let ex = crate::jobs::InlineExecutor::default();
         dispatch_reconcile(&mut e, &ex);
-        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
 
         assert_eq!(*e.active().document.blocks(), correct, "reconcile converges to full_parse");
         assert!(!e.active().reconcile.maybe_stale, "stale cleared");
@@ -148,7 +148,7 @@ mod tests {
             kind: crate::jobs::JobKind::Reparse,
             msg: "upstream pulldown residual (simulated)".into(),
         };
-        crate::app::apply_outcome(outcome, &mut e);
+        crate::jobs_apply::apply_outcome(outcome, &mut e);
 
         assert!(
             !e.active().reconcile.maybe_stale,
@@ -173,7 +173,7 @@ mod tests {
         dispatch_reconcile(&mut e, &ex); // snapshots the current version
         // an edit lands before the (synchronous, here) merge is applied:
         e.active_mut().document.version += 1;
-        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
 
         assert_eq!(*e.active().document.blocks(), planted, "stale reconcile did not clobber the newer state");
         assert!(e.active().reconcile.in_flight_version.is_none(), "in-flight cleared even on discard");

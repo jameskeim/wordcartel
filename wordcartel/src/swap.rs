@@ -564,7 +564,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
           dispatch_swap_write(&mut ctx); }
-        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert_eq!(e.active().last_swap_at, Some(123), "merge records last_swap_at");
         let sp = swap_path(Some(&doc_path)).unwrap();
         let (h, body) = parse(&std::fs::read_to_string(&sp).unwrap()).unwrap();
@@ -580,7 +580,7 @@ mod tests {
         let mut e = Editor::new_from_text("x\n", Some(p.clone()), (80, 24));
         let id = e.active().id;
         e.active_mut().swap_in_flight = true;
-        crate::app::apply_outcome(
+        crate::jobs_apply::apply_outcome(
             crate::jobs::JobOutcome::Panicked {
                 buffer_id: id, version: 1, kind: crate::jobs::JobKind::SwapWrite, msg: "boom".into() },
             &mut e);

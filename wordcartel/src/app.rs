@@ -10,9 +10,8 @@ use crossterm::event::KeyEvent;
 use crate::{commands, config, derive, editor::Editor, file, keymap, render, term};
 #[cfg(test)]
 use crate::input;
-use crate::jobs::{is_stale, Executor, JobOutcome, JobResult};
+use crate::jobs::{Executor, JobOutcome};
 use crate::registry::{Ctx, Registry};
-use crate::prompt::PromptAction;
 use wordcartel_core::history::Clock;
 
 // ---------------------------------------------------------------------------
@@ -20,7 +19,8 @@ use wordcartel_core::history::Clock;
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Msg, apply_result, reduce — unified message type and reducer
+// Msg, the overlay glue, reduce, and the run loop — job/session/prompt/search
+// handlers live in jobs_apply / session_restore / prompts / search_ui.
 // ---------------------------------------------------------------------------
 
 pub enum Msg {
@@ -114,704 +114,6 @@ impl std::fmt::Debug for Msg {
     }
 }
 
-/// Merge a finished job's effect on the foreground, honoring staleness (§10.3).
-pub fn apply_result(r: JobResult, editor: &mut Editor) {
-    if is_stale(&r, editor) {
-        return; // buffer-local merge for a closed buffer, or a stale coalescible
-    }
-    let (kind, version, buffer_id, class) = (r.kind, r.version, r.buffer_id, r.class);
-    // Mechanical-routing assertion (spec §3.4): a buffer-local merge must resolve
-    // to a live buffer here; durability merges may target a now-missing buffer.
-    debug_assert!(
-        class == crate::jobs::ResultClass::Durability || editor.by_id(buffer_id).is_some(),
-        "buffer-local result for a missing buffer slipped past is_stale"
-    );
-    (r.merge)(editor);
-    // Post-save dispatch: fire the pending action when its awaited save lands.
-    // Only Quit remains — Open/New are now additive (no save-then-act needed).
-    if kind == crate::jobs::JobKind::Save {
-        let fire = editor.pending_after_save.as_ref()
-            .map(|p| p.buffer_id == buffer_id && p.version == version)
-            .unwrap_or(false);
-        if fire {
-            let action = editor.pending_after_save.as_ref().unwrap().action.clone();
-            let saved_this = editor.by_id(buffer_id).map(|b| b.document.saved_version) == Some(Some(version));
-            match action {
-                crate::editor::PostSaveAction::Quit => {
-                    if saved_this {
-                        editor.pending_after_save = None;
-                        if !editor.is_dirty(buffer_id) {
-                            editor.quit = true;
-                        } else {
-                            // Saved, but the user typed during the in-flight save → buffer
-                            // dirty again. Do NOT quit (would lose those edits). User
-                            // re-issues quit when ready.
-                            editor.status = "edited during save — quit cancelled".into();
-                        }
-                    }
-                }
-                crate::editor::PostSaveAction::ContinueQuitDrain => {
-                    editor.pending_after_save = None;
-                    if saved_this && !editor.is_dirty(buffer_id) {
-                        // Saved clean: drop this buffer from the queue and advance.
-                        if let Some(d) = editor.quit_drain.as_mut() { d.queue.pop_front(); }
-                        editor.quit_drain_advance = true; // apply_job_result re-drives with ctx
-                    } else if saved_this {
-                        // Codex C-new: the user typed DURING the in-flight save → this buffer
-                        // is dirty again. Do NOT pop/skip it (that would silently lose the new
-                        // edits). Re-drive WITHOUT popping → drive_quit_drain re-saves the newer
-                        // version of the same front buffer. Converges once the user stops typing.
-                        editor.quit_drain_advance = true;
-                    } else {
-                        // Save failed (Codex 8d): abort the drain so it can't linger with no
-                        // in-flight save and no re-drive. The merge's error status stands.
-                        editor.quit_drain = None;
-                        editor.quit_drain_advance = false;
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Apply a finished job's result, then advance a multi-buffer quit drain if one
-/// is waiting on this completion. The single funnel for all JobDone handling so
-/// the re-drive cannot be skipped on an early-returning reduce branch (Codex C1).
-pub fn apply_job_result(r: JobResult, editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock, msg_tx: &std::sync::mpsc::Sender<Msg>) {
-    apply_result(r, editor);
-    if editor.quit_drain_advance {
-        editor.quit_drain_advance = false;
-        drive_quit_drain(editor, ex, clock, msg_tx);
-    }
-}
-
-/// Apply a job outcome: a normal Done routes to the existing apply_result; a Panicked outcome
-/// runs that kind's explicit failure cleanup (a panic is a failed completion).
-pub fn apply_outcome(outcome: crate::jobs::JobOutcome, editor: &mut Editor) {
-    match outcome {
-        crate::jobs::JobOutcome::Done(r) => apply_result(r, editor),
-        crate::jobs::JobOutcome::Panicked { buffer_id, version, kind, msg } =>
-            apply_panic(buffer_id, version, kind, &msg, editor),
-    }
-}
-
-fn apply_panic(buffer_id: crate::editor::BufferId, version: u64, kind: crate::jobs::JobKind, msg: &str, editor: &mut Editor) {
-    use crate::jobs::JobKind;
-    match kind {
-        JobKind::Save => {
-            // The merge never ran, so saved_version is untouched (buffer stays dirty). A panicked
-            // save must NOT quit/strand: clear any awaited-quit state explicitly (the failed-save
-            // Quit path leaves pending_after_save armed — we must not).
-            let awaited = editor.pending_after_save.as_ref()
-                .map(|p| p.buffer_id == buffer_id && p.version == version).unwrap_or(false);
-            if awaited {
-                editor.pending_after_save = None;
-                editor.quit_drain = None;
-                editor.quit_drain_advance = false;
-            }
-            editor.status = format!("save failed (internal error: {msg})");
-        }
-        JobKind::SwapWrite => {
-            if let Some(b) = editor.by_id_mut(buffer_id) { b.swap_in_flight = false; }
-            editor.status = format!("swap failed (internal error: {msg})");
-        }
-        JobKind::Reparse => {
-            // A panicked reconcile (upstream pulldown-cmark residual) is deterministic
-            // for this text — clear maybe_stale so we do NOT re-arm and retry every
-            // debounce interval. The next edit re-sets maybe_stale via derive::rebuild,
-            // giving exactly one reconcile attempt per edit.
-            if let Some(b) = editor.by_id_mut(buffer_id) {
-                b.reconcile.in_flight_version = None;
-                b.reconcile.maybe_stale = false;
-            }
-        }
-        #[cfg(test)]
-        JobKind::CoalesceProbe => { editor.status = format!("job failed (internal error: {msg})"); }
-    }
-}
-
-/// Apply a finished job outcome, then advance a multi-buffer quit drain if one
-/// is waiting on this completion. The single funnel for all JobDone handling so
-/// the re-drive cannot be skipped on an early-returning reduce branch (Codex C1).
-pub fn apply_job_outcome(outcome: crate::jobs::JobOutcome, editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock, msg_tx: &std::sync::mpsc::Sender<Msg>) {
-    apply_outcome(outcome, editor);
-    if editor.quit_drain_advance {
-        editor.quit_drain_advance = false;
-        drive_quit_drain(editor, ex, clock, msg_tx);
-    }
-}
-
-/// Advance the quit drain by one step: pick the next dirty buffer, switch to it,
-/// and either dispatch its save (SaveAll) or raise the per-buffer review prompt
-/// (ReviewEach). When the queue is empty, quit. Re-driven by save completion
-/// (apply_result sets `quit_drain_advance`) and by review-prompt resolution.
-pub fn drive_quit_drain(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock, msg_tx: &std::sync::mpsc::Sender<Msg>) {
-    loop {
-        if editor.quit_drain.is_none() { return; }
-        // Pop already-clean / vanished buffers off the front. Each iteration uses a
-        // SHORT immutable borrow to read the front id (Codex I-new-1: never hold a
-        // `quit_drain` borrow across an `editor.is_dirty`/`switch_to`/method call),
-        // then mutates the queue in a SEPARATE borrow.
-        let front = editor.quit_drain.as_ref().and_then(|d| d.queue.front().copied());
-        let Some(id) = front else {
-            editor.quit_drain = None;
-            editor.quit = true;
-            return;
-        };
-        let gone = editor.buffers.iter().all(|b| b.id != id);
-        if gone || !editor.is_dirty(id) {
-            if let Some(d) = editor.quit_drain.as_mut() { d.queue.pop_front(); }
-            continue;
-        }
-        let idx = editor.buffers.iter().position(|b| b.id == id).unwrap();
-        crate::workspace::switch_to(editor, idx); // show the buffer in question
-        let mode = editor.quit_drain.as_ref().unwrap().mode;
-        match mode {
-            crate::editor::QuitMode::SaveAll => {
-                let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
-                crate::save::dispatch_save_then(&mut ctx, crate::editor::PostSaveAction::ContinueQuitDrain);
-                return; // wait for the save (named) or Save-As (unnamed) to complete
-            }
-            crate::editor::QuitMode::ReviewEach => {
-                let name = crate::workspace::buffer_display_name(editor, id);
-                editor.open_prompt(crate::prompt::Prompt::quit_review_buffer(&name));
-                return; // wait for ReviewSave/ReviewDiscard/Cancel
-            }
-        }
-    }
-}
-
-// 8 args mirror Msg::FilterDone's fields 1:1; an args-struct would just duplicate
-// that variant. Called from only the two FilterDone match arms.
-#[allow(clippy::too_many_arguments)]
-fn apply_filter_done(
-    editor: &mut crate::editor::Editor,
-    buffer_id: crate::editor::BufferId,
-    version: u64,
-    range: std::ops::Range<usize>,
-    cursor: usize,
-    disposition: crate::filter::Disposition,
-    outcome: crate::filter::RunResult,
-    clock: &dyn wordcartel_core::history::Clock,
-) {
-    // Clears the single in-flight slot unconditionally. Correct under the current
-    // single-in-flight invariant (one filter at a time across the whole editor);
-    // would need per-buffer tracking if multi-buffer concurrent filters land (Effort 6).
-    editor.filter_in_flight = None;
-    let stale = editor.by_id(buffer_id).map(|b| b.document.version) != Some(version);
-    match outcome {
-        _ if stale => {
-            editor.status = "filter discarded - buffer changed".into();
-        }
-        crate::filter::RunResult::Err(err) => {
-            editor.status = crate::filter::describe_error(&err);
-        }
-        crate::filter::RunResult::Stdout(text) => {
-            let apply_result = if let Some(b) = editor.by_id_mut(buffer_id) {
-                let doc_len = b.document.buffer.len();
-                let (from, to, at) = match disposition {
-                    crate::filter::Disposition::Filter => (range.start, range.end, range.start),
-                    crate::filter::Disposition::Insert => (cursor, cursor, cursor),
-                };
-                let (cs, edit) = crate::commands::build_range_replace(from, to, &text, doc_len);
-                let txn = wordcartel_core::history::Transaction::new(cs)
-                    .with_selection(wordcartel_core::selection::Selection::single(at + text.len()));
-                b.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
-                true
-            } else {
-                false
-            };
-            if apply_result {
-                crate::derive::rebuild(editor);
-                crate::nav::ensure_visible(editor);
-                editor.status = "filter applied".into();
-            }
-        }
-    }
-}
-
-fn apply_transform_done(
-    editor: &mut crate::editor::Editor,
-    buffer_id: crate::editor::BufferId,
-    version: u64,
-    range: std::ops::Range<usize>,
-    kind: crate::transform::TransformKind,
-    result: Result<String, crate::transform::TransformError>,
-    clock: &dyn wordcartel_core::history::Clock,
-) {
-    editor.transform_in_flight = false;
-    let stale = editor.by_id(buffer_id).map(|b| b.document.version) != Some(version);
-    if stale {
-        editor.status = "transform discarded — buffer changed".into();
-        return;
-    }
-    crate::transform::merge_transform_into(editor, buffer_id, kind, range, result, clock);
-}
-
-fn apply_export_done(
-    editor: &mut crate::editor::Editor,
-    target: std::path::PathBuf,
-    result: Result<crate::export::ExportResult, crate::filter::FilterError>,
-    overwrite_confirmed: bool,
-) {
-    // TOCTOU guard (Codex pre-merge gate): run_export only prompts for overwrite
-    // if the target existed at check time.  When it did not (overwrite_confirmed
-    // == false) but the target has since appeared, refuse to clobber it silently
-    // — the user never agreed to replace it.  (A pre-existing target always went
-    // through the OverwriteExport prompt, so overwrite_confirmed is true there.)
-    // The residual check-to-write window is microseconds vs. the whole pandoc
-    // run; an unsafe-free atomic no-replace rename is unavailable under
-    // #![forbid(unsafe_code)].
-    if !overwrite_confirmed && target.exists() {
-        if let Ok(crate::export::ExportResult::TempReady(tmp)) = &result {
-            let _ = std::fs::remove_file(tmp);
-        }
-        editor.status = format!(
-            "export target {} appeared — re-run export to overwrite",
-            target.display()
-        );
-        return;
-    }
-    match result {
-        Ok(crate::export::ExportResult::Bytes(bytes)) => {
-            match file::save_atomic_bytes(&target, &bytes) {
-                Ok(()) => {
-                    let status = format!("exported {}", target.display());
-                    editor.status = status;
-                }
-                Err(e) => {
-                    editor.status = format!("export write failed: {e}");
-                }
-            }
-        }
-        Ok(crate::export::ExportResult::TempReady(tmp)) => {
-            match std::fs::rename(&tmp, &target) {
-                Ok(()) => {
-                    let status = format!("exported {}", target.display());
-                    editor.status = status;
-                }
-                Err(e) => {
-                    let _ = std::fs::remove_file(&tmp);
-                    editor.status = format!("export rename failed: {e}");
-                }
-            }
-        }
-        Err(e) => {
-            editor.status = crate::filter::describe_error(&e);
-        }
-    }
-}
-
-/// Decide the resume position: restore (cursor clamped to doc_len) only if the
-/// stored mtime+size identity matches the current file. Mismatch → None (stale).
-pub fn apply_resume(
-    e: &crate::state::StateEntry,
-    current: (i64, u64),
-    doc_len: usize,
-) -> Option<(usize, usize)> {
-    if (e.mtime, e.size) != current {
-        return None;
-    }
-    Some((e.cursor.min(doc_len), e.scroll))
-}
-
-/// Populate the active buffer's marks from a session entry (string→char keys),
-/// clamped+grapheme-snapped. Call only when the staleness guard has accepted
-/// the entry (mirrors cursor/scroll restore).
-pub fn load_marks_from_entry(editor: &mut Editor, entry: &crate::state::StateEntry) {
-    for (k, &raw) in &entry.marks {
-        if let Some(ch) = k.chars().next() {
-            let off = crate::nav::clamp_snap(editor, raw);
-            editor.active_mut().marks.insert(ch, off);
-        }
-    }
-}
-
-/// Restore the persisted marked block from a session entry into the active buffer.
-/// Call only when the staleness guard has accepted the entry (mirrors cursor/marks).
-///
-/// Both endpoints are clamped+grapheme-snapped via `clamp_snap` (the SAME treatment
-/// marks get). This is load-bearing: `persist_session` records the block from the
-/// in-memory buffer, but the staleness guard keys on on-disk mtime+size. A dirty
-/// buffer longer than the on-disk file can persist a block whose `end` exceeds the
-/// on-disk length; on a dirty-quit + reopen-unchanged-file cycle the buffer reloads
-/// SHORTER yet the guard still passes, so a raw restore would hand `block_*` ops an
-/// out-of-range range and `buffer.slice()` would assert/panic. Clamping prevents that;
-/// a block that collapses to empty after clamping is dropped.
-pub fn load_block_from_entry(editor: &mut Editor, entry: &crate::state::StateEntry) {
-    if let Some((s, en)) = entry.block {
-        let s = crate::nav::clamp_snap(editor, s);
-        let en = crate::nav::clamp_snap(editor, en);
-        if s < en {
-            editor.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: s, end: en, hidden: false });
-        }
-    }
-}
-
-/// Restore session-resume state (cursor, scroll, marks, folds) for `path` into the
-/// active buffer. Factored verbatim from run()'s launch resume block so launch and
-/// `open_into_current` share one code path. Reloads `state::load()` itself so it works
-/// with only `&mut Editor`. No-op if there is no matching/non-stale session entry.
-pub fn restore_resume(editor: &mut Editor, path: &std::path::Path) {
-    let session = crate::state::load();
-    if let Ok(canon) = std::fs::canonicalize(path) {
-        let key = canon.to_string_lossy().into_owned();
-        if let Some(entry) = session.entries.get(&key) {
-            if let Some(identity) = crate::state::file_identity(path) {
-                let doc_len = editor.active().document.buffer.len();
-                if let Some((cur, scroll)) = apply_resume(entry, identity, doc_len) {
-                    let sel = wordcartel_core::selection::Selection::single(cur);
-                    editor.active_mut().document.selection = sel;
-                    editor.active_mut().view.scroll = scroll;
-                    load_marks_from_entry(editor, entry);
-                    editor.active_mut().folds.replace_folded(entry.folds.iter().copied().collect());
-                    let (blocks, buf) = { let b = editor.active(); (b.document.blocks().clone(), b.document.buffer.clone()) };
-                    editor.active_mut().folds.reconcile(&blocks, &buf);
-                    load_block_from_entry(editor, entry);
-                }
-            }
-        }
-    }
-}
-
-/// Effort 6: load persisted scratch content into the scratch buffer. Replaces the
-/// scratch Buffer in place (fresh id so any stale job no-ops), then clamp-snaps the
-/// cursor into `[0, len]` on a char boundary (mirrors 9A's clamp discipline so a
-/// stale offset never panics a later `slice()`). No-op if no scratch installed.
-pub fn restore_scratch(editor: &mut Editor, st: &crate::state::ScratchState) {
-    let Some(sid) = editor.scratch_id else { return; };
-    let Some(idx) = editor.buffers.iter().position(|b| b.id == sid) else { return; };
-    let area = editor.buffers[idx].view.area;
-    let id = editor.alloc_id();
-    editor.buffers[idx] = crate::editor::Buffer::from_text(id, &st.text, None, area);
-    editor.scratch_id = Some(id);
-    // Update MRU id mapping (old scratch id → new).
-    for m in editor.mru.iter_mut() { if *m == sid { *m = id; } }
-    // Char-boundary clamp via `nav::clamp_snap` (Codex I3: TextBuffer has NO
-    // `snap_to_boundary`; clamp_snap at nav.rs:164 operates on the ACTIVE buffer).
-    // restore_scratch runs at startup; briefly make scratch active to clamp, then
-    // restore the prior active index.
-    let prev_active = editor.active;
-    editor.active = idx;
-    let cur = crate::nav::clamp_snap(editor, st.cursor);
-    editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(cur);
-    editor.active = prev_active;
-}
-
-/// Open `path` into the active buffer slot (the buffer-load seam reused by Tasks 2/4/5).
-/// Allocates a FRESH id so an in-flight save/swap job for the replaced buffer merges via
-/// `by_id_mut(old_id)` → `None` (harmless no-op). On OpenError: set status, do NOT replace
-/// (keep the user's work).
-pub fn open_into_current(editor: &mut Editor, path: &std::path::Path) {
-    let old_id = editor.active().id; // capture BEFORE alloc so MRU can replace old→new
-    let id = editor.alloc_id(); // FRESH id → an in-flight job for the old buffer no-ops via by_id_mut(old_id)=None
-    let area = editor.active().view.area;
-    match crate::editor::Buffer::from_file(id, path, area) {
-        Ok(b) => {
-            let a = editor.active;
-            editor.buffers[a] = b;
-            // Keep MRU consistent: remove the ghost old id and put the new id at front.
-            // Mirrors the close_buffer / restore_scratch patterns (workspace.rs, app.rs).
-            editor.mru.retain(|&x| x != old_id);
-            editor.touch_mru(id);
-            if editor.resume_enabled {
-                restore_resume(editor, path);
-            }
-            crate::derive::rebuild(editor);
-            crate::nav::ensure_visible(editor);
-            editor.status = String::new();
-        }
-        Err(e) => {
-            editor.status = e.to_string();
-        }
-    }
-}
-
-/// Execute the action chosen in a modal prompt, then clear the prompt.
-/// Open the Save-As minibuffer pre-filled with the active doc's directory.
-pub fn open_save_as(editor: &mut crate::editor::Editor) {
-    let pre = editor.active().document.path.as_ref()
-        .and_then(|p| p.parent()).map(|d| format!("{}/", d.display())).unwrap_or_default();
-    editor.open_minibuffer("Save as: ", crate::minibuffer::MinibufferKind::SaveAs);
-    if let Some(mb) = editor.minibuffer.as_mut() { mb.cursor = pre.len(); mb.text = pre; }
-}
-
-/// Expand a user-typed path: `~/` prefix → home dir; relative → joined onto cwd.
-/// Mirrors the `~` handling used by the dictionary/config path loaders.
-pub fn expand_path(text: &str) -> std::path::PathBuf {
-    let expanded = if let Some(rest) = text.strip_prefix("~/") {
-        dirs::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| std::path::PathBuf::from(text))
-    } else { std::path::PathBuf::from(text) };
-    if expanded.is_absolute() { expanded }
-    else { std::env::current_dir().map(|d| d.join(&expanded)).unwrap_or(expanded) }
-}
-
-/// Submit the Save-As minibuffer line: expand the path, raise an overwrite
-/// confirmation if the target exists, else perform the save-as immediately.
-pub fn save_as_submit(editor: &mut crate::editor::Editor, text: &str,
-                      executor: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
-                      msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
-    let t = text.trim();
-    if t.is_empty() {
-        editor.status = "save-as: empty path".into();
-        editor.pending_save_as = None;
-        // Effort 6 (Codex C2): backing out of a drain's Save-As aborts the quit.
-        editor.quit_drain = None;
-        editor.quit_drain_advance = false;
-        return;
-    }
-    let target = expand_path(t);
-    if target.exists() {
-        editor.pending_save_overwrite = Some(target.clone());
-        editor.open_prompt(crate::prompt::Prompt::save_overwrite(&target));
-        return;
-    }
-    perform_save_as(editor, target, executor, clock, msg_tx);
-}
-
-/// Submit the Write-Block minibuffer line: expand the path, raise an overwrite
-/// confirmation if the target exists, else write the block text immediately.
-/// Synchronous: uses `file::save_atomic` directly; does NOT touch document state.
-pub fn block_write_submit(editor: &mut crate::editor::Editor, text: &str) {
-    let Some(b) = editor.active().marked_block else { editor.status = "no marked block".into(); return; };
-    let t = text.trim();
-    if t.is_empty() { editor.status = "write block: empty path".into(); return; }
-    let target = expand_path(t);
-    if target.exists() {
-        editor.pending_write_block = Some(target.clone());
-        editor.open_prompt(crate::prompt::Prompt::write_block_overwrite(&target));
-        return;
-    }
-    perform_block_write(editor, &target, b.start, b.end);
-}
-
-fn perform_block_write(editor: &mut crate::editor::Editor, target: &std::path::Path, start: usize, end: usize) {
-    let text = editor.active().document.buffer.slice(start..end);
-    match crate::file::save_atomic(target, &text) {
-        Ok(_)  => editor.status = format!("wrote block to {}", target.display()),
-        Err(e) => editor.status = e.to_string(),
-    }
-}
-
-fn perform_save_as(editor: &mut crate::editor::Editor, target: std::path::PathBuf,
-                   executor: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
-                   msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
-    let v = editor.active().document.version;
-    let buffer_id = editor.active().id;
-    { let mut ctx = crate::registry::Ctx { editor, clock, executor, msg_tx: msg_tx.clone() };
-      crate::save::do_save_to(&mut ctx, target, crate::save::SaveMode::SaveAs); }
-    if let Some(action) = editor.pending_save_as.take() {
-        editor.pending_after_save = Some(crate::editor::PendingAfterSave { buffer_id, version: v, action, at_ms: clock.now_ms() });
-    }
-}
-
-/// Request a new empty untitled buffer additively (never raises a dirty-guard modal).
-pub fn request_new(
-    editor: &mut Editor,
-    _ex: &dyn Executor,
-    _clock: &dyn Clock,
-    _msg_tx: &std::sync::mpsc::Sender<Msg>,
-) {
-    crate::workspace::new_empty_buffer(editor);
-}
-
-pub fn resolve_prompt(
-    action: PromptAction,
-    editor: &mut Editor,
-    ex: &dyn Executor,
-    clock: &dyn Clock,
-    msg_tx: &std::sync::mpsc::Sender<Msg>,
-) {
-    match action {
-        PromptAction::Cancel => {
-            editor.pending_export = None;
-            editor.pending_save_overwrite = None;
-            editor.pending_save_as = None;
-            editor.pending_write_block = None;
-            // Effort 6: abort an in-progress multi-buffer quit (no data loss; the
-            // user backed out). Leave `quit` false.
-            editor.quit_drain = None;
-            editor.quit_drain_advance = false;
-        }
-        PromptAction::QuitSaveAll | PromptAction::QuitReviewEach => {
-            editor.prompt = None;
-            let mode = if matches!(action, PromptAction::QuitSaveAll) { crate::editor::QuitMode::SaveAll } else { crate::editor::QuitMode::ReviewEach };
-            let queue: std::collections::VecDeque<_> = editor.buffers.iter().filter(|b| editor.is_dirty(b.id)).map(|b| b.id).collect();
-            editor.quit_drain = Some(crate::editor::QuitDrain { queue, mode });
-            drive_quit_drain(editor, ex, clock, msg_tx);
-            return;
-        }
-        PromptAction::ReviewSave => {
-            editor.prompt = None;
-            let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
-            crate::save::dispatch_save_then(&mut ctx, crate::editor::PostSaveAction::ContinueQuitDrain);
-            return;
-        }
-        PromptAction::ReviewDiscard => {
-            editor.prompt = None;
-            if let Some(d) = editor.quit_drain.as_mut() { d.queue.pop_front(); }
-            drive_quit_drain(editor, ex, clock, msg_tx);
-            return;
-        }
-        PromptAction::QuitAnyway => { editor.quit = true; }
-        PromptAction::SaveAndQuit => {
-            editor.prompt = None; // dismiss the quit-confirm modal first
-            let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
-            crate::save::dispatch_save_and_quit(&mut ctx);
-            return; // prompt handled; must NOT clear an external-mod modal
-        }
-        PromptAction::Reload => crate::save::reload_from_disk(editor),
-        PromptAction::Overwrite => {
-            let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
-            crate::save::overwrite_save(&mut ctx);
-        }
-        PromptAction::Recover => {
-            // Capture body + orphan path BEFORE load_recovered, which replaces the
-            // whole active Buffer and would reset pending_swap_path to None (4r moved
-            // these fields onto Buffer). Then clean up the orphan after loading.
-            let staged = {
-                let b = editor.active_mut();
-                b.pending_swap_body
-                    .take()
-                    .map(|body| (body, b.pending_swap_path.take()))
-            };
-            if let Some((body, orphan)) = staged {
-                crate::save::load_recovered(editor, &body);
-                if let Some(p) = orphan {
-                    let _ = std::fs::remove_file(p);
-                }
-            }
-        }
-        PromptAction::DiscardSwap => {
-            if let Some(p) = editor.active_mut().pending_swap_path.take() {
-                let _ = std::fs::remove_file(p);
-            } else {
-                crate::swap::delete(editor.active().document.path.as_deref());
-            }
-        }
-        PromptAction::OpenOriginal => {
-            editor.active_mut().pending_swap_body = None;
-            editor.active_mut().pending_swap_path = None;
-        }
-        PromptAction::OverwriteExport => {
-            if let Some(pe) = editor.pending_export.take() {
-                // User explicitly confirmed clobbering the existing target.
-                crate::export::do_export(editor, &pe.ext, &pe.target, msg_tx, true);
-            }
-        }
-        PromptAction::OverwriteSaveAs => {
-            if let Some(t) = editor.pending_save_overwrite.take() {
-                perform_save_as(editor, t, ex, clock, msg_tx);
-            }
-        }
-        PromptAction::OverwriteWriteBlock => {
-            if let Some(t) = editor.pending_write_block.take() {
-                if let Some(b) = editor.active().marked_block {
-                    perform_block_write(editor, &t, b.start, b.end);
-                } else {
-                    editor.status = "no marked block".into();
-                }
-            }
-        }
-        PromptAction::Transform(kind) => {
-            crate::transform::dispatch_transform(editor, kind, clock, msg_tx);
-        }
-    }
-    editor.prompt = None;
-}
-
-/// Submit a minibuffer line as a filter command.
-///
-/// Splits the line on whitespace to build the argv (no shell, no quoting —
-/// `shell: false` is the security default; shell invocation is opt-in only).
-/// An empty line sets a status message and returns without dispatching.
-fn submit_filter_line(
-    editor: &mut Editor,
-    line: &str,
-    msg_tx: &std::sync::mpsc::Sender<Msg>,
-) {
-    let argv: Vec<String> = line.split_whitespace().map(String::from).collect();
-    if argv.is_empty() {
-        editor.status = "filter: no command given".into();
-        return;
-    }
-    let spec = crate::filter::FilterSpec {
-        argv,
-        shell: false,
-        disposition: crate::filter::Disposition::Filter,
-        input: crate::filter::Input::SelectionElseBuffer,
-        timeout: std::time::Duration::from_secs(10),
-        max_output: crate::limits::MAX_FILTER_OUTPUT,
-    };
-    crate::filter::dispatch_filter(editor, spec, msg_tx.clone());
-}
-
-/// Submit a minibuffer line as a go-to-line target (Effort 8). 1-based, clamped;
-/// records a jump origin (jump-back), unfolds to the target, lands at column 1.
-pub(crate) fn goto_line_submit(editor: &mut crate::editor::Editor, text: &str) {
-    let n: usize = match text.trim().parse() {
-        Ok(n) => n,
-        Err(_) => { editor.status = "not a line number".to_string(); return; }
-    };
-    let total = crate::derive::total_logical_lines(&editor.active().document.buffer);
-    let line_index = n.max(1).min(total) - 1;            // 1-based clamp → 0-based index
-    let pre = crate::nav::head(editor);
-    crate::marks::record_jump(editor.active_mut(), pre); // jump-back support
-    let target = editor.active().document.buffer.line_to_byte(line_index);
-    let caret = crate::registry::place_caret_visible(editor, target, crate::registry::CaretPlace::UnfoldTo);
-    editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(caret);
-    editor.active_mut().desired_col = None;
-    editor.active_mut().sel_history.clear();
-    crate::derive::rebuild(editor);   // UnfoldTo can change fold state → relayout (mirrors registry.rs:409 / app.rs:680)
-    crate::nav::ensure_visible(editor);
-}
-
-fn insert_paste_text(editor: &mut Editor, buffer_id: crate::editor::BufferId, text: &str, clock: &dyn Clock) -> bool {
-    if text.len() > crate::clipboard::PASTE_MAX_BYTES {
-        editor.status = format!("paste too large ({} MiB) — skipped", text.len() / (1 << 20));
-        return false;
-    }
-    let active_id = editor.active().id;
-    {
-        let Some(b) = editor.by_id_mut(buffer_id) else { return false; };
-        let sel = b.document.selection.primary();
-        let (from, to) = (sel.from(), sel.to());
-        let doc_len = b.document.buffer.len();
-        let (cs, edit) = crate::commands::build_range_replace(from, to, text, doc_len);
-        let txn = wordcartel_core::history::Transaction::new(cs)
-            .with_selection(wordcartel_core::selection::Selection::single(from + text.len()));
-        b.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
-        b.desired_col = None;
-    }
-    if buffer_id == active_id {
-        crate::derive::rebuild(editor);
-        crate::nav::ensure_visible(editor);
-    }
-    true
-}
-
-fn apply_clipboard_paste(editor: &mut Editor, buffer_id: crate::editor::BufferId, text: Option<String>, clock: &dyn Clock) {
-    match text {
-        Some(t) if !t.is_empty() => {
-            if insert_paste_text(editor, buffer_id, &t, clock) {
-                editor.register.set(t);
-            }
-        }
-        _ => {
-            if let Some(t) = editor.register.get().map(str::to_owned) {
-                insert_paste_text(editor, buffer_id, &t, clock);
-            }
-        }
-    }
-}
-
-fn apply_clipboard_availability(editor: &mut Editor, ok: bool) {
-    if !ok && !editor.clipboard_notice_shown {
-        editor.status = "system clipboard unavailable — copy/paste work in-editor; using OSC 52 for terminal sync".into();
-        editor.clipboard_notice_shown = true;
-    }
-}
-
 /// Re-window an overlay list after a selection/rows change (A6). `area_h` is the
 /// CALLER's read of the active buffer's area height (the same source the mouse
 /// path uses); render re-heals against the live frame each draw, so a transient
@@ -865,7 +167,7 @@ pub(crate) fn dispatch_overlay_command(
     editor.file_browser = None;
     let mut ctx = crate::registry::Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
     reg.dispatch(id, &mut ctx);
-    for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+    for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
     // Hydrate any overlay the dispatched command may have opened (Codex 3c).
     hydrate_overlays(editor, reg, keymap);
 }
@@ -882,213 +184,6 @@ pub fn menu_select_for_test(
     editor.menu = None;
     let (keymap, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), reg);
     dispatch_overlay_command(editor, reg, &keymap, ex, clock, msg_tx, id);
-}
-
-fn search_sync(editor: &mut Editor) {
-    let (rope, version) = { let d = &editor.active().document; (d.buffer.snapshot(), d.version) };
-    if let Some(s) = editor.search.as_mut() { s.recompute(&rope, version); }
-    if let Some(m) = editor.search.as_ref().and_then(|s| s.current()) {
-        crate::registry::unfold_ancestors_of(editor, m.start);
-        editor.active_mut().document.selection = wordcartel_core::selection::Selection::range(m.start, m.end);
-        derive::rebuild(editor);
-        crate::nav::ensure_visible(editor);
-    }
-}
-
-fn search_step(editor: &mut Editor, forward: bool) {
-    if let Some(s) = editor.search.as_mut() { if forward { s.next(); } else { s.prev(); } }
-    if let Some(m) = editor.search.as_ref().and_then(|s| s.current()) {
-        crate::registry::unfold_ancestors_of(editor, m.start);
-        editor.active_mut().document.selection = wordcartel_core::selection::Selection::range(m.start, m.end);
-        derive::rebuild(editor);
-        crate::nav::ensure_visible(editor);
-    }
-}
-
-fn search_cancel(editor: &mut Editor) {
-    let origin = editor.search.as_ref().map(|s| s.origin).unwrap_or(0);
-    editor.search = None;
-    editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(origin);
-    derive::rebuild(editor);
-    crate::nav::ensure_visible(editor);
-}
-
-type SearchReplacePlan = Option<(Vec<(usize, usize, String)>, usize, usize)>;
-
-fn search_replace_all(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
-    search_sync(editor); // ensure cache is current
-    // §8: invalid regex → distinct status, no mutation.
-    if editor.search.as_ref().is_some_and(|s| s.error.is_some()) {
-        editor.status = "invalid regex".into();
-        return;
-    }
-    let plan: SearchReplacePlan = editor.search.as_ref().and_then(|s| {
-        let m = s.matcher()?;
-        if s.matches().is_empty() { return None; }
-        let rope = editor.active().document.buffer.snapshot();
-        let edits: Vec<(usize, usize, String)> = s.matches().iter().map(|mm| {
-            (mm.start, mm.end, wordcartel_core::search::expand_replacement(&rope, m, mm, &s.template, s.mode))
-        }).collect();
-        Some((edits, rope.len_bytes(), s.origin))
-    });
-    let Some((edits, doc_len, origin)) = plan else {
-        editor.status = "No matches".into();
-        return;
-    };
-    let n = edits.len();
-    let (cs, edit) = crate::commands::build_multi_replace(&edits, doc_len);
-    // remap origin through this changeset BEFORE moving it into the transaction
-    let new_origin = wordcartel_core::change::map_pos(origin, &cs);
-    let txn = wordcartel_core::history::Transaction::new(cs)
-        .with_selection(wordcartel_core::selection::Selection::single(new_origin));
-    editor.active_mut().apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
-    if let Some(s) = editor.search.as_mut() { s.origin = new_origin; }
-    editor.status = format!("Replaced {n} occurrences");
-    editor.search = None; // close after replace-all
-    derive::rebuild(editor);
-    crate::nav::ensure_visible(editor);
-}
-
-fn search_step_apply(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
-    let plan = editor.search.as_ref().and_then(|s| {
-        let m = s.matcher()?; let cur = s.current()?;
-        let rope = editor.active().document.buffer.snapshot();
-        let text = wordcartel_core::search::expand_replacement(&rope, m, &cur, &s.template, s.mode);
-        Some((cur, text, rope.len_bytes(), s.origin))
-    });
-    let Some((cur, text, doc_len, origin)) = plan else { editor.search = None; return; };
-    let (cs, edit) = crate::commands::build_range_replace(cur.start, cur.end, &text, doc_len);
-    let new_origin = wordcartel_core::change::map_pos(origin, &cs);
-    let caret = cur.start + text.len();
-    let txn = wordcartel_core::history::Transaction::new(cs)
-        .with_selection(wordcartel_core::selection::Selection::single(caret));
-    editor.active_mut().apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
-    // Re-find the next match on the MUTATED rope, and remap origin.
-    let (rope, version) = { let d = &editor.active().document; (d.buffer.snapshot(), d.version) };
-    if let Some(s) = editor.search.as_mut() {
-        s.origin = new_origin;
-        s.cache_invalidate();                 // force recompute against mutated rope
-        s.recompute(&rope, version);
-        s.set_current_at_or_after(caret);     // park on next match at/after the just-edited spot
-    }
-    search_pin(editor);
-    if editor.search.as_ref().is_some_and(|s| s.current().is_none()) { editor.search = None; } // done
-}
-
-fn search_step_skip(editor: &mut Editor) {
-    if let Some(s) = editor.search.as_mut() { s.next(); }
-    search_pin(editor);
-    if editor.search.as_ref().is_some_and(|s| s.wrapped) { editor.search = None; } // walked off the end
-}
-
-fn search_step_rest(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
-    // Replace current + all remaining (from current.start onward) as one unit.
-    let plan = editor.search.as_ref().and_then(|s| {
-        let m = s.matcher()?; let cur = s.current()?;
-        let rope = editor.active().document.buffer.snapshot();
-        let edits: Vec<(usize, usize, String)> = s.matches().iter().filter(|mm| mm.start >= cur.start)
-            .map(|mm| (mm.start, mm.end, wordcartel_core::search::expand_replacement(&rope, m, mm, &s.template, s.mode)))
-            .collect();
-        Some((edits, rope.len_bytes()))
-    });
-    let Some((edits, doc_len)) = plan else { editor.search = None; return; };
-    if edits.is_empty() { editor.search = None; return; }
-    let (cs, edit) = crate::commands::build_multi_replace(&edits, doc_len);
-    let txn = wordcartel_core::history::Transaction::new(cs)
-        .with_selection(wordcartel_core::selection::Selection::single(edits[0].0));
-    editor.active_mut().apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
-    editor.search = None;
-    derive::rebuild(editor); crate::nav::ensure_visible(editor);
-}
-
-fn search_pin(editor: &mut Editor) {
-    if let Some(m) = editor.search.as_ref().and_then(|s| s.current()) {
-        crate::registry::unfold_ancestors_of(editor, m.start);
-        editor.active_mut().document.selection = wordcartel_core::selection::Selection::range(m.start, m.end);
-        derive::rebuild(editor); crate::nav::ensure_visible(editor);
-    }
-}
-
-/// Accept, ignore, or add-to-dict based on the overlay's current selection.
-/// Clears `editor.diag` when done (regardless of outcome).
-fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
-    // Clone what we need out of the overlay before mutating editor.
-    let overlay_info = editor.diag.as_ref().map(|ov| {
-        let is_ignore = ov.is_ignore();
-        let is_add_dict = ov.is_add_dict();
-        let suggestion = ov.chosen_suggestion().cloned();
-        (ov.anchor.range.start, ov.anchor.range.end, is_ignore, is_add_dict, suggestion, ov.opened_version)
-    });
-    let Some((raw_a, raw_b, is_ignore, is_add_dict, suggestion, opened_version)) = overlay_info else { return; };
-
-    // Fix A4: if the buffer was mutated while the overlay was open, the anchor
-    // ranges are stale.  Refuse to apply — a stale range can cause a panic on
-    // multibyte boundaries or silently apply at wrong offsets.
-    if editor.active().document.version != opened_version {
-        editor.status = "document changed; re-open".into();
-        editor.diag = None;
-        return;
-    }
-
-    // Clamp the stale/oversized anchor range to the current doc length so a
-    // multibyte/shrink race can never cause buffer.slice or build_range_replace
-    // to panic (defense-in-depth even when the command-handler validity gate fires).
-    let doc_len = editor.active().document.buffer.len();
-    let a = raw_a.min(doc_len);
-    let b = raw_b.min(doc_len);
-
-    if is_ignore {
-        // Add the surface word to session_ignores, close, re-arm a recheck.
-        let word = editor.active().document.buffer.slice(a..b).to_string();
-        editor.session_ignores.insert(word);
-        editor.diag = None;
-        if editor.diag_cfg.enabled {
-            let debounce_ms = editor.diag_cfg.debounce_ms;
-            editor.active_mut().diagnostics.arm(clock.now_ms(), debounce_ms);
-        }
-    } else if is_add_dict {
-        // Append word to dictionary file + in-memory set, close, re-arm.
-        let word = editor.active().document.buffer.slice(a..b).to_string();
-        if let Some(ref dict_path) = editor.diag_cfg.dictionary.clone() {
-            match crate::diagnostics_run::append_word_to_dict(dict_path, &word) {
-                Ok(()) => { editor.dictionary.insert(word); }
-                Err(e) => { editor.status = format!("add to dictionary failed: {e}"); }
-            }
-        } else {
-            editor.status = "no dictionary path configured".into();
-        }
-        editor.diag = None;
-        if editor.diag_cfg.enabled {
-            let debounce_ms = editor.diag_cfg.debounce_ms;
-            editor.active_mut().diagnostics.arm(clock.now_ms(), debounce_ms);
-        }
-    } else if let Some(s) = suggestion {
-        // Apply the suggestion as an undoable edit, then close.
-        let (cs, edit) = match &s {
-            wordcartel_core::diagnostics::Suggestion::ReplaceWith(t) =>
-                crate::commands::build_range_replace(a, b, t, doc_len),
-            wordcartel_core::diagnostics::Suggestion::InsertAfter(t) =>
-                crate::commands::build_range_replace(b, b, t, doc_len),
-            wordcartel_core::diagnostics::Suggestion::Remove =>
-                crate::commands::build_range_replace(a, b, "", doc_len),
-        };
-        // Determine cursor position: for ReplaceWith/InsertAfter place after inserted text;
-        // for Remove place at a (start of deleted region).
-        let new_cursor = match &s {
-            wordcartel_core::diagnostics::Suggestion::ReplaceWith(t) => a + t.len(),
-            wordcartel_core::diagnostics::Suggestion::InsertAfter(t) => b + t.len(),
-            wordcartel_core::diagnostics::Suggestion::Remove => a,
-        };
-        let txn = wordcartel_core::history::Transaction::new(cs)
-            .with_selection(wordcartel_core::selection::Selection::single(new_cursor));
-        editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
-        derive::rebuild(editor);
-        crate::registry::unfold_ancestors_of(editor, new_cursor);
-        derive::rebuild(editor);
-        crate::nav::ensure_visible(editor);
-        editor.diag = None;
-    }
-    // else: no suggestion and not ignore/add_dict — unreachable (selected is always in range).
 }
 
 /// Apply the theme-picker's currently-selected built-in as a live preview.
@@ -1148,7 +243,7 @@ pub fn reduce(
                     _ => { editor.pending_mark = None; } // non-name key cancels
                 }
             }
-            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         // non-key message: fall through to normal handling
@@ -1161,11 +256,11 @@ pub fn reduce(
         if matches!(&msg, Msg::ClipboardPaste { .. }) {
             // Drop an async clipboard-paste result that arrives while the menu is
             // open — it must not land in the document behind the overlay.
-            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Paste(_)) = &msg {
-            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Key(k)) = &msg {
@@ -1198,7 +293,7 @@ pub fn reduce(
                     }
                 }
             }
-            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         // Non-key msg falls through to normal handling while menu stays open.
@@ -1211,7 +306,7 @@ pub fn reduce(
         if matches!(&msg, Msg::ClipboardPaste { .. }) {
             // Drop an async clipboard-paste result that arrives while the palette is
             // open — it must not land in the document behind the overlay.
-            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Paste(text)) = msg {
@@ -1222,7 +317,7 @@ pub fn reduce(
                 crate::palette::rebuild_rows(p, reg, keymap);
                 keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
             }
-            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Key(k)) = &msg {
@@ -1335,7 +430,7 @@ pub fn reduce(
                     _ => {}
                 }
             }
-            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         // Non-key msg falls through to normal handling while palette stays open.
@@ -1349,7 +444,7 @@ pub fn reduce(
         if matches!(&msg, Msg::ClipboardPaste { .. }) {
             // Drop an async clipboard-paste result that arrives while the theme picker is
             // open — it must not land in the document behind the overlay.
-            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Paste(text)) = &msg {
@@ -1360,7 +455,7 @@ pub fn reduce(
                 keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
             }
             preview_selected_theme(editor);
-            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Key(k)) = &msg {
@@ -1447,7 +542,7 @@ pub fn reduce(
                     _ => {}
                 }
             }
-            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         // Non-key msg falls through to normal handling while picker stays open.
@@ -1459,7 +554,7 @@ pub fn reduce(
         // Drop an async clipboard-paste result that arrives while the browser is open —
         // it must not land in the document behind the overlay (Codex I6, mirror palette).
         if matches!(&msg, Msg::ClipboardPaste { .. }) {
-            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Paste(text)) = &msg {
@@ -1469,7 +564,7 @@ pub fn reduce(
                 crate::file_browser::rebuild_entries(fb);
                 keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
             }
-            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         if let Msg::Input(Event::Key(k)) = &msg {
@@ -1584,7 +679,7 @@ pub fn reduce(
                     _ => {}
                 }
             }
-            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         // Non-key msg falls through to normal handling while the browser stays open.
@@ -1613,31 +708,31 @@ pub fn reduce(
                     }
                 } else if let crossterm::event::KeyCode::Char(ch) = key.code {
                     if let Some(action) = editor.prompt.as_ref().unwrap().action_for(ch) {
-                        resolve_prompt(action, editor, ex, clock, msg_tx);
+                        crate::prompts::resolve_prompt(action, editor, ex, clock, msg_tx);
                     }
                 }
             }
             // Merge a directly-delivered background result even under a modal.
-            Msg::JobDone(o) => apply_job_outcome(o, editor, ex, clock, msg_tx),
+            Msg::JobDone(o) => crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx),
             Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {
-                apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, clock);
+                crate::jobs_apply::apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, clock);
             }
             Msg::ExportDone { target, result, overwrite_confirmed, .. } => {
-                apply_export_done(editor, target, result, overwrite_confirmed);
+                crate::jobs_apply::apply_export_done(editor, target, result, overwrite_confirmed);
             }
             Msg::TransformDone { buffer_id, version, range, kind, result } => {
-                apply_transform_done(editor, buffer_id, version, range, kind, result, clock);
+                crate::jobs_apply::apply_transform_done(editor, buffer_id, version, range, kind, result, clock);
             }
             Msg::DiagnosticsDone { buffer_id, version, diagnostics } => {
                 crate::diagnostics_run::apply_diagnostics_done(editor, buffer_id, version, diagnostics);
             }
-            Msg::ClipboardPaste { buffer_id, text, .. } => apply_clipboard_paste(editor, buffer_id, text, clock),
-            Msg::ClipboardAvailability(ok) => apply_clipboard_availability(editor, ok),
+            Msg::ClipboardPaste { buffer_id, text, .. } => crate::jobs_apply::apply_clipboard_paste(editor, buffer_id, text, clock),
+            Msg::ClipboardAvailability(ok) => crate::jobs_apply::apply_clipboard_availability(editor, ok),
             // Resize/Tick/other input: ignored for the modal, but results still drain below.
             _ => {}
         }
         // Always drain ready results (merges the awaited save&quit result).
-        for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+        for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
         return !editor.quit;
     }
 
@@ -1676,16 +771,16 @@ pub fn reduce(
                     crossterm::event::KeyCode::Enter => {
                         let mb = editor.minibuffer.take().unwrap();
                         match mb.kind {
-                            crate::minibuffer::MinibufferKind::Filter     => submit_filter_line(editor, &mb.text, msg_tx),
-                            crate::minibuffer::MinibufferKind::GotoLine   => goto_line_submit(editor, &mb.text),
-                            crate::minibuffer::MinibufferKind::SaveAs     => save_as_submit(editor, &mb.text, ex, clock, msg_tx),
-                            crate::minibuffer::MinibufferKind::WriteBlock => block_write_submit(editor, &mb.text),
+                            crate::minibuffer::MinibufferKind::Filter     => crate::prompts::submit_filter_line(editor, &mb.text, msg_tx),
+                            crate::minibuffer::MinibufferKind::GotoLine   => crate::prompts::goto_line_submit(editor, &mb.text),
+                            crate::minibuffer::MinibufferKind::SaveAs     => crate::prompts::save_as_submit(editor, &mb.text, ex, clock, msg_tx),
+                            crate::minibuffer::MinibufferKind::WriteBlock => crate::prompts::block_write_submit(editor, &mb.text),
                         }
                     }
                     _ => {}
                 }
             }
-            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         // non-key (FilterDone/JobDone/Tick/Resize/ClipboardPaste/ClipboardAvailability) falls through to the normal match below
@@ -1705,30 +800,30 @@ pub fn reduce(
                 // Stepping phase: y/n/!/q intercepted BEFORE the text-insert arm.
                 if editor.search.as_ref().map(|s| s.phase) == Some(crate::search_overlay::Phase::Stepping) {
                     match k.code {
-                        KeyCode::Char('y') => { search_step_apply(editor, clock); }
-                        KeyCode::Char('n') => { search_step_skip(editor); }
-                        KeyCode::Char('!') => { search_step_rest(editor, clock); }
+                        KeyCode::Char('y') => { crate::search_ui::search_step_apply(editor, clock); }
+                        KeyCode::Char('n') => { crate::search_ui::search_step_skip(editor); }
+                        KeyCode::Char('!') => { crate::search_ui::search_step_rest(editor, clock); }
                         KeyCode::Char('q') | KeyCode::Esc => { editor.search = None; }
                         _ => {}
                     }
-                    for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+                    for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
                     return !editor.quit;
                 }
                 match k.code {
-                    KeyCode::Esc => { search_cancel(editor); return !editor.quit; }
+                    KeyCode::Esc => { crate::search_ui::search_cancel(editor); return !editor.quit; }
                     KeyCode::Char('r') if alt => { editor.search.as_mut().unwrap().toggle_mode(); }
                     KeyCode::Char('c') if alt => { editor.search.as_mut().unwrap().cycle_case(); }
-                    KeyCode::Char('a') if alt => { search_replace_all(editor, clock); return !editor.quit; }
+                    KeyCode::Char('a') if alt => { crate::search_ui::search_replace_all(editor, clock); return !editor.quit; }
                     KeyCode::Enter if alt => {
                         if let Some(s) = editor.search.as_mut() { s.phase = crate::search_overlay::Phase::Stepping; }
-                        search_sync(editor); // park on first match
-                        for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+                        crate::search_ui::search_sync(editor); // park on first match
+                        for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
                         return !editor.quit;
                     }
-                    KeyCode::Enter if shift => { search_step(editor, false); }
-                    KeyCode::F(3) if shift   => { search_step(editor, false); }
-                    KeyCode::Enter           => { search_step(editor, true); }
-                    KeyCode::F(3)            => { search_step(editor, true); }
+                    KeyCode::Enter if shift => { crate::search_ui::search_step(editor, false); }
+                    KeyCode::F(3) if shift   => { crate::search_ui::search_step(editor, false); }
+                    KeyCode::Enter           => { crate::search_ui::search_step(editor, true); }
+                    KeyCode::F(3)            => { crate::search_ui::search_step(editor, true); }
                     KeyCode::Tab => {
                         if let Some(s) = editor.search.as_mut() {
                             s.field = match s.field {
@@ -1745,9 +840,9 @@ pub fn reduce(
                     _ => {}
                 }
                 // Recompute against the live buffer and pin the current match.
-                search_sync(editor);
+                crate::search_ui::search_sync(editor);
             }
-            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit; // return ONLY for key events (including non-Press)
         }
         // Non-key messages (FilterDone/ExportDone/TransformDone/JobDone/Tick/…)
@@ -1764,11 +859,11 @@ pub fn reduce(
                     crossterm::event::KeyCode::Up   => { editor.diag.as_mut().unwrap().up(); }
                     crossterm::event::KeyCode::Down => { editor.diag.as_mut().unwrap().down(); }
                     crossterm::event::KeyCode::Esc  => { editor.diag = None; }
-                    crossterm::event::KeyCode::Enter => { diag_apply_selected(editor, clock); }
+                    crossterm::event::KeyCode::Enter => { crate::search_ui::diag_apply_selected(editor, clock); }
                     _ => {} // bare Ctrl+key or anything else: no-op, consumed
                 }
             }
-            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit; // return ONLY for key events (including non-Press)
         }
         // Non-key messages fall through to normal handlers below.
@@ -1833,7 +928,7 @@ pub fn reduce(
                         if editor.outline.as_ref().map(|o| o.opened_version) != Some(editor.active().document.version) {
                             editor.status = "document changed; outline closed".into();
                             editor.outline = None;
-                            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+                            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
                             return !editor.quit;
                         }
                         let target = editor.outline.as_ref()
@@ -1873,7 +968,7 @@ pub fn reduce(
                     _ => {}
                 }
             }
-            for o in ex.drain() { apply_job_outcome(o, editor, ex, clock, msg_tx); }
+            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
             return !editor.quit;
         }
         // Non-key messages fall through to normal handlers below.
@@ -1931,7 +1026,7 @@ pub fn reduce(
                 for ch in text.chars() { mb.insert(ch); }
             } else if !text.is_empty() {
                 let bid = editor.active().id;
-                if insert_paste_text(editor, bid, &text, clock) {
+                if crate::jobs_apply::insert_paste_text(editor, bid, &text, clock) {
                     editor.register.set(text);
                 }
             }
@@ -1951,15 +1046,15 @@ pub fn reduce(
             hydrate_overlays(editor, reg, keymap);
         }
         Msg::Input(_) => {}
-        Msg::JobDone(o) => apply_job_outcome(o, editor, ex, clock, msg_tx),
+        Msg::JobDone(o) => crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx),
         Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {
-            apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, clock);
+            crate::jobs_apply::apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, clock);
         }
         Msg::ExportDone { target, result, overwrite_confirmed, .. } => {
-            apply_export_done(editor, target, result, overwrite_confirmed);
+            crate::jobs_apply::apply_export_done(editor, target, result, overwrite_confirmed);
         }
         Msg::TransformDone { buffer_id, version, range, kind, result } => {
-            apply_transform_done(editor, buffer_id, version, range, kind, result, clock);
+            crate::jobs_apply::apply_transform_done(editor, buffer_id, version, range, kind, result, clock);
         }
         Msg::DiagnosticsDone { buffer_id, version, diagnostics } => {
             crate::diagnostics_run::apply_diagnostics_done(editor, buffer_id, version, diagnostics);
@@ -1990,8 +1085,8 @@ pub fn reduce(
                 crate::reconcile::dispatch_reconcile(editor, ex);
             }
         }
-        Msg::ClipboardPaste { buffer_id, text, .. } => apply_clipboard_paste(editor, buffer_id, text, clock),
-        Msg::ClipboardAvailability(ok) => apply_clipboard_availability(editor, ok),
+        Msg::ClipboardPaste { buffer_id, text, .. } => crate::jobs_apply::apply_clipboard_paste(editor, buffer_id, text, clock),
+        Msg::ClipboardAvailability(ok) => crate::jobs_apply::apply_clipboard_availability(editor, ok),
         // Intercepted in the run loop before `reduce` (see run()); unreachable here.
         // Arm required only for exhaustiveness. Do not process the shutdown here.
         Msg::InputThreadDied => {}
@@ -2006,7 +1101,7 @@ pub fn reduce(
     }
     // Fold any other results that became ready while handling this message.
     for o in ex.drain() {
-        apply_job_outcome(o, editor, ex, clock, msg_tx);
+        crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx);
     }
     !editor.quit
 }
@@ -2142,7 +1237,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     {
         let saved = crate::state::load();
         if let Some(st) = saved.scratch.as_ref() {
-            restore_scratch(&mut editor, st);
+            crate::session_restore::restore_scratch(&mut editor, st);
         }
     }
 
@@ -2292,7 +1387,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // restore_resume → apply_resume.
     if cfg.state.resume {
         if let Some(raw_path) = editor.active().document.path.clone() {
-            restore_resume(&mut editor, &raw_path);
+            crate::session_restore::restore_resume(&mut editor, &raw_path);
         }
     }
 
@@ -2565,34 +1660,6 @@ mod tests {
     fn cua_keymap() -> crate::keymap::KeyTrie {
         let (t, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &crate::registry::Registry::builtins());
         t
-    }
-
-    #[test]
-    fn open_into_current_replaces_with_fresh_id_and_clean() {
-        use crate::editor::Editor;
-        let p = std::env::temp_dir().join(format!("wc-oic-{}.md", std::process::id()));
-        std::fs::write(&p, "opened\n").unwrap();
-        let mut e = Editor::new_from_text("scratch\n", None, (80, 24));
-        let old_id = e.active().id;
-        crate::app::open_into_current(&mut e, &p);
-        assert_ne!(e.active().id, old_id, "fresh id → stale in-flight jobs for old buffer are ignored");
-        assert_eq!(e.active().document.buffer.to_string(), "opened\n");
-        assert!(!e.active().document.dirty());
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn file_browser_enter_on_file_opens_it_when_clean() {
-        use crate::editor::Editor;
-        let dir = std::env::temp_dir().join(format!("wc-fbopen-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("note.md"), "loaded\n").unwrap();
-        let mut e = Editor::new_from_text("clean\n", None, (80, 24)); // clean
-        e.open_file_browser(dir.clone());
-        // select "note.md" and simulate Enter via the browser's open path:
-        crate::app::open_into_current(&mut e, &dir.join("note.md")); // the clean-path the Enter handler takes
-        assert_eq!(e.active().document.buffer.to_string(), "loaded\n");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn f10() -> crossterm::event::Event {
@@ -3084,13 +2151,13 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::app::resolve_prompt(PromptAction::QuitSaveAll, &mut e, &ex, &clk, &tx);
+        crate::prompts::resolve_prompt(PromptAction::QuitSaveAll, &mut e, &ex, &clk, &tx);
         // Drive the drain to completion: each save result re-drives via apply_job_result.
         let mut guard = 0;
         while !e.quit {
             let rs = ex.drain();
             if rs.is_empty() { break; }
-            for o in rs { crate::app::apply_job_outcome(o, &mut e, &ex, &clk, &tx); }
+            for o in rs { crate::jobs_apply::apply_job_outcome(o, &mut e, &ex, &clk, &tx); }
             guard += 1; assert!(guard < 16, "drain did not converge");
         }
         assert!(e.quit, "Save-All drains both dirty buffers then quits");
@@ -3111,10 +2178,10 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::app::resolve_prompt(PromptAction::QuitReviewEach, &mut e, &ex, &clk, &tx);
+        crate::prompts::resolve_prompt(PromptAction::QuitReviewEach, &mut e, &ex, &clk, &tx);
         assert!(e.quit_drain.is_some(), "drain started");
         assert!(e.prompt.is_some(), "per-buffer review prompt raised");
-        crate::app::resolve_prompt(PromptAction::Cancel, &mut e, &ex, &clk, &tx);
+        crate::prompts::resolve_prompt(PromptAction::Cancel, &mut e, &ex, &clk, &tx);
         assert!(e.quit_drain.is_none(), "cancel aborts the drain");
         assert!(!e.quit, "not quitting after cancel");
     }
@@ -3136,7 +2203,7 @@ mod tests {
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
         // Start a ReviewEach quit drain — drive_quit_drain raises the per-buffer prompt.
-        crate::app::resolve_prompt(PromptAction::QuitReviewEach, &mut e, &ex, &clk, &tx);
+        crate::prompts::resolve_prompt(PromptAction::QuitReviewEach, &mut e, &ex, &clk, &tx);
         assert!(e.quit_drain.is_some(), "drain started");
         assert!(e.prompt.is_some(), "per-buffer review prompt raised by drive_quit_drain");
         // Simulate Esc on the review prompt via the real reduce path.
@@ -3171,8 +2238,8 @@ mod tests {
             let ex = InlineExecutor::default();
             let clk = TestClock(0);
             let (tx, _rx) = std::sync::mpsc::channel();
-            crate::app::resolve_prompt(PromptAction::QuitSaveAll, &mut e, &ex, &clk, &tx);
-            for o in ex.drain() { crate::app::apply_job_outcome(o, &mut e, &ex, &clk, &tx); }
+            crate::prompts::resolve_prompt(PromptAction::QuitSaveAll, &mut e, &ex, &clk, &tx);
+            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, &mut e, &ex, &clk, &tx); }
             assert!(e.quit_drain.is_none(), "failed save aborts the drain");
             assert!(!e.quit, "a failed save must not quit (no data loss)");
             assert!(e.status.to_lowercase().contains("symlink"), "error status surfaced");
@@ -3193,12 +2260,12 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::app::resolve_prompt(PromptAction::QuitSaveAll, &mut e, &ex, &clk, &tx);
+        crate::prompts::resolve_prompt(PromptAction::QuitSaveAll, &mut e, &ex, &clk, &tx);
         assert_eq!(e.minibuffer.as_ref().map(|m| m.kind), Some(crate::minibuffer::MinibufferKind::SaveAs),
             "unnamed dirty buffer in the drain opens the Save-As minibuffer");
         assert!(e.quit_drain.is_some(), "drain still pending while Save-As is open");
         // Dismiss via empty submit.
-        crate::app::save_as_submit(&mut e, "", &ex, &clk, &tx);
+        crate::prompts::save_as_submit(&mut e, "", &ex, &clk, &tx);
         assert!(e.quit_drain.is_none(), "dismissing the Save-As aborts the drain");
         assert!(!e.quit, "backing out of Save-As must not quit");
     }
@@ -3215,52 +2282,10 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::app::resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk, &tx);
+        crate::prompts::resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk, &tx);
         assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::Quit, .. })));
         assert!(!e.quit, "not yet — waiting for the save result");
-        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
-        assert!(e.quit, "matching save result triggers quit");
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn save_and_quit_on_unnamed_buffer_does_not_arm_pending_after_save() {
-        // No path → dispatch_save dispatches NO job. pending_after_save must stay None,
-        // or the app would wait forever for a result that never comes (Codex #4).
-        use crate::editor::Editor;
-        use crate::jobs::InlineExecutor;
-        use crate::prompt::PromptAction;
-        let mut e = Editor::new_from_text("scratch\n", None, (80, 24));
-        e.active_mut().document.version = 1;
-        let ex = InlineExecutor::default();
-        let clk = TestClock(0);
-        let (tx, _rx) = std::sync::mpsc::channel();
-        crate::app::resolve_prompt(PromptAction::SaveAndQuit, &mut e, &ex, &clk, &tx);
-        assert!(e.pending_after_save.is_none(), "no job dispatched → do not arm pending_after_save");
-        assert!(!e.quit);
-    }
-
-    #[test]
-    fn save_and_quit_command_arms_pending_after_save_like_prompt() {
-        // The save_and_quit registry command must reach the SAME armed state as the
-        // PromptAction::SaveAndQuit path (proves the DRY factor).
-        use crate::editor::{Editor, PostSaveAction};
-        use crate::jobs::{Executor, InlineExecutor};
-        let p = std::env::temp_dir().join(format!("wc-savequit-cmd-{}.md", std::process::id()));
-        std::fs::write(&p, "old\n").unwrap();
-        let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
-        e.active_mut().document.saved_version = None; e.active_mut().document.version = 1;
-        let ex = InlineExecutor::default();
-        let clk = TestClock(0);
-        let (tx, _rx) = std::sync::mpsc::channel();
-        {
-            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
-            crate::save::dispatch_save_and_quit(&mut ctx);
-        }
-        assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::Quit, .. })),
-            "command path arms pending_after_save{{Quit}}");
-        assert!(!e.quit, "not yet — waiting for the save result");
-        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert!(e.quit, "matching save result triggers quit");
         let _ = std::fs::remove_file(&p);
     }
@@ -3280,114 +2305,6 @@ mod tests {
         }
         assert_eq!(e.pending_after_save, None, "no path → not armed");
         assert!(!e.quit);
-    }
-
-    #[test]
-    fn save_and_quit_arms_pending_after_save_quit_and_exits() {
-        use crate::editor::{Editor, PostSaveAction};
-        use crate::jobs::{Executor, InlineExecutor};
-        let p = std::env::temp_dir().join(format!("wc-pas-{}.md", std::process::id()));
-        std::fs::write(&p, "old\n").unwrap();
-        let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
-        e.active_mut().document.saved_version = None; e.active_mut().document.version = 1;
-        let ex = InlineExecutor::default();
-        let clk = TestClock(0);
-        let (tx, _rx) = std::sync::mpsc::channel();
-        {
-            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
-            crate::save::dispatch_save_and_quit(&mut ctx);
-        }
-        assert!(matches!(e.pending_after_save, Some(crate::editor::PendingAfterSave { version: 1, action: PostSaveAction::Quit, .. })));
-        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
-        assert!(e.quit, "matching save result triggers quit");
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn quit_after_save_cancelled_when_edited_during_flight() {
-        // Regression (Codex gate Finding 1): if the user types DURING a single-buffer
-        // save-and-quit's in-flight save, the save result fires (saved_this=true) but
-        // the buffer is dirty again. The app must NOT quit and must not lose those edits.
-        use crate::editor::{Editor, PostSaveAction};
-        use crate::jobs::{JobResult, JobKind, ResultClass};
-        let p = std::env::temp_dir().join(format!("wc-sqflight-{}.md", std::process::id()));
-        std::fs::write(&p, "old\n").unwrap();
-        let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
-        let id = e.active().id;
-        // Arm pending_after_save{Quit} at version=1 (what dispatch_save_and_quit would set).
-        e.active_mut().document.version = 1;
-        e.active_mut().document.saved_version = None; // dirty
-        e.pending_after_save = Some(crate::editor::PendingAfterSave {
-            buffer_id: id,
-            version: 1,
-            action: PostSaveAction::Quit,
-            at_ms: 0,
-        });
-        // Simulate typing during the in-flight save: version advances to 2, buffer dirty.
-        e.active_mut().document.version = 2;
-        // Deliver the in-flight save result for version=1. The merge sets
-        // saved_version=Some(1), but document.version==2 → still dirty.
-        let save_result = JobResult {
-            buffer_id: id,
-            class: ResultClass::Durability,
-            version: 1,
-            kind: JobKind::Save,
-            merge: Box::new(move |editor: &mut Editor| {
-                if let Some(b) = editor.by_id_mut(id) {
-                    b.document.saved_version = Some(1);
-                }
-            }),
-        };
-        crate::app::apply_result(save_result, &mut e);
-        assert!(!e.quit, "must NOT quit — buffer is dirty again from edits typed during the save");
-        assert!(e.active().document.dirty(), "buffer still holds the newer edits");
-        assert!(e.pending_after_save.is_none(), "pending_after_save consumed on save match");
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn apply_result_merges_fresh_and_drops_stale() {
-        use crate::editor::Editor;
-        use crate::jobs::{JobResult, JobKind, ResultClass};
-        let mut e = Editor::new_from_text("\n", None, (80, 24));
-        let id = e.active().id;
-        e.active_mut().document.version = 5;
-        // Fresh one-shot (Save is never stale): merges.
-        crate::app::apply_result(JobResult { buffer_id: id, class: ResultClass::Durability, version: 3, kind: JobKind::Save,
-            merge: Box::new(|ed: &mut Editor| ed.status = "saved".into()) }, &mut e);
-        assert_eq!(e.status, "saved");
-        // Stale coalescible: dropped.
-        crate::app::apply_result(JobResult { buffer_id: id, class: ResultClass::BufferLocal, version: 3, kind: JobKind::CoalesceProbe,
-            merge: Box::new(|ed: &mut Editor| ed.status = "STALE".into()) }, &mut e);
-        assert_eq!(e.status, "saved", "stale coalescible result must be dropped");
-    }
-
-    #[test]
-    fn buffer_local_result_for_missing_buffer_is_dropped() {
-        use crate::editor::{Editor, BufferId};
-        use crate::jobs::{JobResult, JobKind, ResultClass};
-        let mut e = Editor::new_from_text("\n", None, (80, 24));
-        // A buffer-local merge for a non-existent buffer must NOT run.
-        crate::app::apply_result(JobResult {
-            buffer_id: BufferId(999), class: ResultClass::BufferLocal,
-            version: 1, kind: JobKind::Save,
-            merge: Box::new(|ed: &mut Editor| ed.status = "SHOULD NOT RUN".into()),
-        }, &mut e);
-        assert_ne!(e.status, "SHOULD NOT RUN", "buffer-local merge for a missing buffer is dropped");
-    }
-
-    #[test]
-    fn buffer_local_result_for_live_buffer_merges() {
-        use crate::editor::Editor;
-        use crate::jobs::{JobResult, JobKind, ResultClass};
-        let mut e = Editor::new_from_text("\n", None, (80, 24));
-        let id = e.active().id;
-        crate::app::apply_result(JobResult {
-            buffer_id: id, class: ResultClass::BufferLocal,
-            version: 1, kind: JobKind::Save,
-            merge: Box::new(|ed: &mut Editor| ed.status = "merged".into()),
-        }, &mut e);
-        assert_eq!(e.status, "merged");
     }
 
     // Effort 6 additive open: open_as_new_buffer adds a buffer and switches to it,
@@ -3489,27 +2406,6 @@ mod tests {
     }
 
     #[test]
-    fn recover_loads_body_and_deletes_orphan_swap_file() {
-        use crate::editor::Editor;
-        use crate::jobs::InlineExecutor;
-        use crate::prompt::PromptAction;
-        // An orphan swap file on disk + a buffer staged for recovery.
-        let p = std::env::temp_dir().join(format!("wc-recover-orphan-{}.swp", std::process::id()));
-        std::fs::write(&p, "stub").unwrap();
-        let mut e = Editor::new_from_text("\n", None, (80, 24));
-        e.active_mut().pending_swap_body = Some("recovered body\n".into());
-        e.active_mut().pending_swap_path = Some(p.clone());
-        let ex = InlineExecutor::default();
-        let clk = TestClock(0);
-        let (tx, _rx) = std::sync::mpsc::channel();
-        crate::app::resolve_prompt(PromptAction::Recover, &mut e, &ex, &clk, &tx);
-        assert_eq!(e.active().document.buffer.to_string(), "recovered body\n",
-            "recovered content loaded into the active buffer");
-        assert!(!p.exists(), "orphan swap file must be deleted on Recover");
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
     fn minibuffer_routing_and_submit_dispatches_filter() {
         use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
@@ -3549,40 +2445,6 @@ mod tests {
         assert!(e.minibuffer.is_none(), "submit closes the minibuffer");
         // jump-back: the origin (end) was recorded so the user can return.
         assert!(e.active().jump_ring.contains(&end), "goto recorded the origin for jump-back");
-    }
-
-    #[test]
-    fn goto_line_into_folded_body_unfolds_to_reveal_target() {
-        // Spec §2 / Codex: a goto target inside a folded body must UNFOLD, not land hidden.
-        let mut e = Editor::new_from_text("# H\n\nbody one\nbody two\nbody three\n", None, (40, 12));
-        crate::derive::rebuild(&mut e);
-        // Fold the "# H" section via the real fold API (mirrors the 5g fold tests:
-        // `folds.toggle(heading_byte)` + rebuild — the heading anchor is byte 0).
-        let h_byte = 0usize;
-        e.active_mut().folds.toggle(h_byte);
-        crate::derive::rebuild(&mut e);
-        assert!(e.active().folds.folded().contains(&h_byte), "precondition: # H is folded");
-        // goto line 4 ("body two"), which is inside the folded body:
-        crate::app::goto_line_submit(&mut e, "4");
-        assert_eq!(e.active().document.selection.primary().head, e.active().document.buffer.line_to_byte(3));
-        // The section is no longer folded over the target (real fold-state query: the
-        // heading anchor is gone from `folds.folded`, so line index 3 is visible again).
-        assert!(!e.active().folds.folded().contains(&h_byte),
-            "goto into a folded body must unfold the covering section to reveal the target");
-    }
-
-    #[test]
-    fn goto_line_clamps_and_rejects_garbage() {
-        let mut e = Editor::new_from_text("a\nb\nc\n", None, (40, 10));
-        crate::derive::rebuild(&mut e);
-        crate::app::goto_line_submit(&mut e, "999");          // clamp-high → last line
-        let total = crate::derive::total_logical_lines(&e.active().document.buffer);
-        assert_eq!(e.active().document.selection.primary().head, e.active().document.buffer.line_to_byte(total - 1));
-        crate::app::goto_line_submit(&mut e, "0");            // clamp-low → line 1
-        assert_eq!(e.active().document.selection.primary().head, 0);
-        crate::app::goto_line_submit(&mut e, "xyz");          // garbage → status, no move
-        assert_eq!(e.active().document.selection.primary().head, 0);
-        assert_eq!(e.status, "not a line number");           // rejected input sets the status
     }
 
     #[test]
@@ -4043,20 +2905,6 @@ mod tests {
         assert_eq!(e.register.get(), Some("keep"), "empty paste must NOT clear the register");
     }
 
-    #[test]
-    fn durability_result_for_missing_buffer_still_runs() {
-        use crate::editor::{Editor, BufferId};
-        use crate::jobs::{JobResult, JobKind, ResultClass};
-        let mut e = Editor::new_from_text("\n", None, (80, 24));
-        // A durability completion runs even though its buffer is gone (e.g. closed).
-        crate::app::apply_result(JobResult {
-            buffer_id: BufferId(999), class: ResultClass::Durability,
-            version: 1, kind: JobKind::SwapWrite,
-            merge: Box::new(|ed: &mut Editor| ed.status = "durability ran".into()),
-        }, &mut e);
-        assert_eq!(e.status, "durability ran");
-    }
-
     // -------------------------------------------------------------------------
     // Task 4: keymap integration tests
     // -------------------------------------------------------------------------
@@ -4138,19 +2986,6 @@ mod tests {
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         crate::app::reduce(press(KeyCode::Char('h'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "h", "unbound printable inserts literally");
-    }
-
-    #[test]
-    fn resume_restores_when_identity_matches_and_clamps_when_not() {
-        // unit-test the resume decision helper directly (no TTY):
-        // apply_resume(entry, current_identity, doc_len) -> Option<(cursor,scroll)>
-        use crate::state::StateEntry;
-        let e = StateEntry { cursor: 4, scroll: 2, marks: Default::default(), mtime: 10, size: 20, seq: 0, folds: vec![], block: None };
-        // identity match → restore (clamped to doc_len)
-        assert_eq!(crate::app::apply_resume(&e, (10,20), 100), Some((4,2)));
-        assert_eq!(crate::app::apply_resume(&e, (10,20), 3), Some((3,2)), "cursor clamped to doc_len");
-        // identity mismatch → discard
-        assert_eq!(crate::app::apply_resume(&e, (11,20), 100), None);
     }
 
     #[test]
@@ -4238,127 +3073,6 @@ mod tests {
         crate::app::reduce(Msg::Input(esc), &mut e, &reg, &km, &ex, &clk, &tx);
         assert_eq!(e.pending_mark, None);
         assert!(e.active().marks.is_empty());
-    }
-
-    #[test]
-    fn load_marks_from_entry_populates_clamped() {
-        use std::collections::BTreeMap;
-        // No trailing newline so clamp_snap(999) == buffer.len() == 11.
-        let mut e = Editor::new_from_text("hello world", None, (80, 24));
-        let mut marks = BTreeMap::new();
-        marks.insert("a".to_string(), 6usize);
-        marks.insert("b".to_string(), 999usize); // past EOF → clamped to len
-        let entry = crate::state::StateEntry { cursor: 0, scroll: 0, marks, mtime: 0, size: 0, seq: 1, folds: vec![], block: None };
-        crate::app::load_marks_from_entry(&mut e, &entry);
-        assert_eq!(e.active().marks.get(&'a'), Some(&6));
-        assert_eq!(e.active().marks.get(&'b'), Some(&e.active().document.buffer.len()));
-    }
-
-    /// Task 5 (9A): marked block persists and restores across sessions.
-    /// Mirrors `load_marks_from_entry_populates_clamped` — tests the restore code path
-    /// directly (analogous to how marks/folds restore tests work).
-    #[test]
-    fn marked_block_persists_and_restores_under_matching_identity() {
-        use crate::editor::{Editor, MarkedBlock};
-        use crate::state::StateEntry;
-
-        // Construct an entry with a block — compile fails until StateEntry has `block`.
-        let entry = StateEntry {
-            cursor: 0, scroll: 0, marks: Default::default(),
-            mtime: 10, size: 20, seq: 1, folds: vec![],
-            block: Some((3, 8)),
-        };
-
-        // ── matching identity: guard passes → block restores with hidden=false ──
-        let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
-        let doc_len = e.active().document.buffer.len();
-        assert!(
-            crate::app::apply_resume(&entry, (10, 20), doc_len).is_some(),
-            "identity match → guard passes"
-        );
-        // Simulate what restore_resume does after the staleness guard:
-        if let Some((s, en)) = entry.block {
-            e.active_mut().marked_block = Some(MarkedBlock { start: s, end: en, hidden: false });
-        }
-        assert_eq!(
-            e.active().marked_block,
-            Some(MarkedBlock { start: 3, end: 8, hidden: false }),
-            "block restores with hidden=false under matching identity"
-        );
-
-        // ── mismatching identity: guard rejects → block NOT restored ──
-        //
-        // Previously vacuous: e2 was a fresh Editor and `marked_block` was never
-        // set, so the final assert was trivially true regardless of the guard.
-        //
-        // Hardened: we now drive the same conditional-restore path that
-        // restore_resume uses (apply_resume as gate → block only if Some).
-        // The block-application code IS present; the staleness guard (mtime 99 ≠
-        // stored 10) stops it.  If apply_resume were made to ignore mismatches
-        // (always return Some), the final assert would flip to RED.
-        let mut e2 = Editor::new_from_text("hello world\n", None, (80, 24));
-        let doc_len2 = e2.active().document.buffer.len();
-        let guard = crate::app::apply_resume(&entry, (99, 20), doc_len2);
-        assert!(guard.is_none(), "identity mismatch → guard rejects");
-        // Mirror restore_resume: set block only when guard passes.
-        if guard.is_some() {
-            if let Some((s, en)) = entry.block {
-                e2.active_mut().marked_block =
-                    Some(MarkedBlock { start: s, end: en, hidden: false });
-            }
-        }
-        // Non-vacuous: restore code is present above; guard prevented it from running.
-        assert!(e2.active().marked_block.is_none(), "block discarded on mismatch — guard blocked restore");
-    }
-
-    /// Task 5 (9A) regression: an out-of-range persisted block (dirty-quit → reopen
-    /// shorter file, guard still passes) must NOT reach `buffer.slice()` and panic.
-    /// Drives the REAL restore helper (`load_block_from_entry`, the exact code
-    /// `restore_resume` uses). Pre-fix this restored `end=8 > len=4` and the
-    /// `block_copy`/`block_delete` below asserted in `slice()` → panic.
-    #[test]
-    fn restore_clamps_out_of_range_block_no_slice_panic() {
-        use crate::editor::Editor;
-        use crate::state::StateEntry;
-
-        // Short buffer (len 4) but the persisted block end (8) is past EOF.
-        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
-        let len = e.active().document.buffer.len();
-        assert_eq!(len, 4);
-        let entry = StateEntry {
-            cursor: 0, scroll: 0, marks: Default::default(),
-            mtime: 10, size: 20, seq: 1, folds: vec![],
-            block: Some((4, 8)), // start at EOF, end beyond EOF
-        };
-
-        // Real production restore path (post-staleness-guard).
-        crate::app::load_block_from_entry(&mut e, &entry);
-
-        // Clamped to <= len, or dropped entirely — never out of range.
-        if let Some(b) = e.active().marked_block {
-            assert!(b.end <= len, "restored block end clamped to buffer len");
-            assert!(b.start <= b.end, "restored block normalized");
-        }
-        // (4,8) clamps to (4,4) which collapses → dropped.
-        assert!(e.active().marked_block.is_none(), "collapsed block dropped");
-
-        // The KEY assertion: block ops do not panic in slice() with the restored state.
-        crate::blocks_marked::block_copy(&mut e, &TestClock(0));
-        crate::blocks_marked::block_delete(&mut e, &TestClock(0));
-
-        // And a genuinely out-of-range END that does NOT collapse is still clamped.
-        let mut e2 = Editor::new_from_text("abc\n", None, (80, 24));
-        let entry2 = StateEntry {
-            cursor: 0, scroll: 0, marks: Default::default(),
-            mtime: 10, size: 20, seq: 1, folds: vec![],
-            block: Some((1, 99)), // start in-range, end far past EOF
-        };
-        crate::app::load_block_from_entry(&mut e2, &entry2);
-        let b = e2.active().marked_block.expect("non-collapsing block restored");
-        assert!(b.end <= e2.active().document.buffer.len(), "end clamped to len");
-        // Must not panic:
-        crate::blocks_marked::block_copy(&mut e2, &TestClock(0));
-        crate::blocks_marked::block_delete(&mut e2, &TestClock(0));
     }
 
     #[test]
@@ -5089,8 +3803,8 @@ mod tests {
         e.active_mut().document.version = 1; e.active_mut().document.saved_version = None;
         let ex = InlineExecutor::default(); let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::app::save_as_submit(&mut e, p.to_str().unwrap(), &ex, &clk, &tx);
-        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
+        crate::prompts::save_as_submit(&mut e, p.to_str().unwrap(), &ex, &clk, &tx);
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "content\n", "file written");
         assert_eq!(e.active().document.path.as_deref(), Some(p.as_path()), "path re-keyed");
         assert!(!e.active().document.dirty(), "clean after save-as");
@@ -5110,117 +3824,9 @@ mod tests {
             Some(crate::minibuffer::MinibufferKind::SaveAs)), "unnamed save opens the SaveAs minibuffer");
     }
 
-    #[test]
-    fn save_as_existing_target_raises_overwrite_prompt() {
-        use crate::editor::Editor;
-        use crate::jobs::InlineExecutor;
-        let p = std::env::temp_dir().join(format!("wc-ow-{}.md", std::process::id()));
-        std::fs::write(&p, "old\n").unwrap();
-        let mut e = Editor::new_from_text("new\n", None, (80, 24));
-        let ex = InlineExecutor::default(); let clk = TestClock(0);
-        let (tx, _rx) = std::sync::mpsc::channel();
-        crate::app::save_as_submit(&mut e, p.to_str().unwrap(), &ex, &clk, &tx);
-        assert!(e.prompt.is_some(), "existing target → confirm modal");
-        assert_eq!(e.prompt.as_ref().unwrap().action_for('o'), Some(crate::prompt::PromptAction::OverwriteSaveAs));
-        assert_ne!(crate::prompt::PromptAction::OverwriteSaveAs, crate::prompt::PromptAction::Overwrite);
-        let _ = std::fs::remove_file(&p);
-    }
-
-    // -------------------------------------------------------------------------
-    // Task 4 / Effort 6: New command — now additive (no dirty-guard modal)
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn new_on_any_buffer_adds_empty_untitled() {
-        use crate::editor::Editor;
-        let mut e = Editor::new_from_text("kept\n", None, (80, 24));
-        let orig_id = e.active().id;
-        let (ex, clk, tx) = (crate::jobs::InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
-        crate::app::request_new(&mut e, &ex, &clk, &tx);
-        assert_eq!(e.active().document.buffer.to_string(), "\n", "additive new: active is empty untitled");
-        assert!(e.active().document.path.is_none(), "new buffer has no path");
-        assert!(e.prompt.is_none(), "additive new never raises a guard modal");
-        assert!(e.buffers.iter().any(|b| b.id == orig_id), "original buffer still present");
-    }
-
-    #[test]
-    fn new_on_dirty_buffer_is_additive_no_modal() {
-        use crate::editor::Editor;
-        let mut e = Editor::new_from_text("draft\n", None, (80, 24));
-        let orig_id = e.active().id;
-        e.active_mut().document.version = 1; // dirty
-        let (ex, clk, tx) = (crate::jobs::InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
-        crate::app::request_new(&mut e, &ex, &clk, &tx);
-        assert!(e.prompt.is_none(), "additive new: no dirty-guard modal even for dirty buffer");
-        assert_eq!(e.active().document.buffer.to_string(), "\n", "new empty buffer is active");
-        assert!(e.buffers.iter().any(|b| b.id == orig_id), "dirty buffer still present in the list");
-    }
-
-    #[test]
-    fn new_additive_preserves_all_existing_buffers() {
-        use crate::editor::Editor;
-        // request_new is additive: calling it on a dirty buffer adds a new buffer
-        // without destroying the original, which remains accessible by switching.
-        let mut e = Editor::new_from_text("draft\n", None, (80, 24));
-        let orig_id = e.active().id;
-        e.active_mut().document.version = 1; // dirty
-        let (ex, clk, tx) = (crate::jobs::InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
-        crate::app::request_new(&mut e, &ex, &clk, &tx);
-        assert_eq!(e.active().document.buffer.to_string(), "\n", "new empty buffer active");
-        assert!(e.pending_save_as.is_none(), "no pending_save_as: additive new sets none");
-        assert!(e.prompt.is_none(), "no modal");
-        // Switch back to the original to verify it's still there.
-        let idx = e.buffers.iter().position(|b| b.id == orig_id).expect("original buffer must still exist");
-        e.switch_to_index(idx);
-        assert_eq!(e.active().document.buffer.to_string(), "draft\n", "original dirty buffer intact");
-    }
-
-    // -------------------------------------------------------------------------
-    // Task 4 (Effort 9A): ^KW block_write — write block text to file
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn block_write_writes_block_text_only_doc_unchanged() {
-        use crate::editor::Editor;
-        let p = std::env::temp_dir().join(format!("wc-blkw-{}.md", std::process::id()));
-        let _ = std::fs::remove_file(&p);
-        let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
-        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false }); // "hello"
-        let before_doc = e.active().document.buffer.to_string();
-        crate::app::block_write_submit(&mut e, p.to_str().unwrap());
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hello", "block text written");
-        assert_eq!(e.active().document.buffer.to_string(), before_doc, "document unchanged");
-        assert!(e.active().marked_block.is_some(), "block stays after write");
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn block_write_existing_target_raises_overwrite() {
-        use crate::editor::Editor;
-        let p = std::env::temp_dir().join(format!("wc-blkw-ow-{}.md", std::process::id()));
-        std::fs::write(&p, "old").unwrap();
-        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
-        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 3, hidden: false });
-        crate::app::block_write_submit(&mut e, p.to_str().unwrap());
-        assert_eq!(e.prompt.as_ref().unwrap().action_for('o'), Some(crate::prompt::PromptAction::OverwriteWriteBlock));
-        let _ = std::fs::remove_file(&p);
-    }
-
     // -------------------------------------------------------------------------
     // Effort 6, Task 2: scratch persistence
     // -------------------------------------------------------------------------
-
-    #[test]
-    fn restore_scratch_loads_text_and_clamps_cursor() {
-        let mut e = crate::editor::Editor::new_from_text("doc\n", None, (40, 10));
-        e.install_scratch();
-        let st = crate::state::ScratchState { text: "hello".into(), cursor: 999 }; // out of range
-        crate::app::restore_scratch(&mut e, &st);
-        let sid = e.scratch_id.unwrap();
-        let sb = e.by_id(sid).unwrap();
-        assert_eq!(sb.document.buffer.to_string(), "hello");
-        assert_eq!(sb.document.selection.primary().head, 5, "cursor clamped to len");
-    }
 
     #[test]
     fn persist_session_captures_scratch_even_when_active_unnamed() {

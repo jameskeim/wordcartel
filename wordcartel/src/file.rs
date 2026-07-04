@@ -312,7 +312,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
           crate::save::dispatch_save(&mut ctx); }
-        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert!(!e.active().document.dirty(), "dirty must be cleared after a successful background save");
         let _ = fs::remove_file(&p);
     }
