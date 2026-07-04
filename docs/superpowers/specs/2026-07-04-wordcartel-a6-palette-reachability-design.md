@@ -1,6 +1,6 @@
 # A6: overlay list reachability — windowed scrolling for palette + siblings — design
 
-**Status:** Codex spec-review CLEAN (x3); Fable5 pass pending
+**Status:** Codex x3 clean; Fable5 folded (C1 descend-reset, I3 saturating, I4 preview-pin construction, M5 literals, M6 wordings) — C2 RESIZE RULE pending user decision
 **Date:** 2026-07-04
 **Effort:** a6-palette-reachability — slot 1 of the recorded working order (`docs/ux-backlog.md`).
 User decisions: scope = ALL FOUR diseased overlays (fork 1 = B); wheel moves the SELECTION
@@ -16,7 +16,8 @@ window the highlight VANISHES (ratatui gets a window-relative-impossible index) 
 still dispatches the invisible selection** — a silent-wrong-action hazard shared by the
 palette (app.rs:1225-1226 reads the absolute index) AND the file browser (app.rs:1388,
 `fb.entries.get(fb.selected)` — Codex round 1: the identical hazard, named explicitly; the
-outline's is partially pre-empted by its opened_version guard but live for fresh documents). PgUp/PgDn/Home/End are consumed by the wildcard arm (:1287) and
+outline's opened_version guard only trips when the document CHANGED since open — the hazard
+is live for any unmodified-since-open document, i.e. the common case — Fable M6). PgUp/PgDn/Home/End are consumed by the wildcard arm (:1287) and
 do nothing. The palette mouse block returns early for ALL events (mouse.rs:122-145) — wheel
 never reaches the scroll arms. Clicks on visible rows work (`palette_row_at`, render.rs:163-174,
 test-pinned); query-row/border clicks are silent no-ops (deliberate, kept).
@@ -92,12 +93,23 @@ file browser :1421-1428; outline :1648-1657):
 
 - **Up/Down:** existing selection moves, THEN `keep_visible(...)`.
 - **NEW PgUp/PgDn:** `selected` moves by one window (`saturating_sub(list_h)` /
-  `+list_h` clamped to `rows-1`), then `keep_visible`. (Today these keys are silently
-  consumed by each block's wildcard arm — adding arms changes no other behavior.)
-- **NEW Home/End:** `selected = 0` / `rows.len()-1`, then `keep_visible`.
+  `(selected + list_h).min(rows.len().saturating_sub(1))`), then `keep_visible`. (Today
+  these keys are silently consumed by each block's wildcard arm — adding arms changes no
+  other behavior.)
+- **NEW Home/End:** `selected = 0` / `selected = rows.len().saturating_sub(1)`, then
+  `keep_visible`. **SATURATING forms are mandatory (Fable I3):** an empty row set is
+  trivially reachable (a no-match query — pinned at palette.rs:153-155), and a bare
+  `rows.len()-1` underflows — the exact M2 integer-overflow class this project already
+  patched once. Every existing arm uses `saturating_sub`; match them.
 - **After every filter/query rebuild** (Char/Backspace/Paste paths that call
   `rebuild_rows`/equivalents): the existing selected-clamp is followed by `keep_visible`
   (which also re-clamps `scroll_top` after the row set shrinks).
+- **The file browser's DIRECTORY-NAVIGATION rebuild (Fable C1 — panic-class if missed):**
+  Enter-descend (and `..`) sets `fb.selected = 0` and calls `rebuild_entries`
+  (app.rs:1403-1407) — NOT a filter path, and grep-verified the only rebuild site outside
+  the Char/Backspace/Paste arms. It must reset `scroll_top = 0` beside `selected = 0`
+  (or run `keep_visible` after the rebuild): a stale scroll_top over a smaller entry set
+  makes the windowed slice `rows[5..2]` — an out-of-order range that PANICS in all builds.
 - **ThemePicker ordering pin:** `keep_visible` runs BEFORE `preview_selected_theme`
   (app.rs:1086-1091) on every selection-changing path — the previewed theme is always the
   visibly-highlighted one.
@@ -152,11 +164,17 @@ file browser :1421-1428; outline :1648-1657):
   (`selected - scroll_top < list_h` after every step); (b) **the hazard pin:** walk
   `selected` to an off-first-window index (e.g. 50 in the palette) and assert BOTH that
   Enter dispatches `rows[50]`'s command AND that row 50 was within the visible window at
-  dispatch time — this test FAILS today (the highlight vanishes; the window shows 0-14);
+  dispatch time — honest TDD red state (Fable M6): visibility is asserted via `scroll_top`,
+  which doesn't exist yet, so the pin goes red AFTER the field lands and BEFORE
+  `keep_visible` is wired (the vanishing-highlight behavior it kills is today's);
   (c) PgDn/PgUp/Home/End land where specified; (d) a filter change re-clamps selection AND
   window; (e) ThemePicker: after Down past the window, the PREVIEWED theme equals the
-  visibly-highlighted row (fails today once >15 themes — pin with an artificially extended
-  row list, not by adding themes); (f) FileBrowser/Outline equivalents of (a)-(c),
+  visibly-highlighted row. **Construction constraints (Fable I4 — the naive form is
+  IMPOSSIBLE):** `preview_selected_theme` resolves via `Theme::builtin(&name)` and silently
+  no-ops on unknown names, so fake padding rows can never drive a preview — pad
+  `tp.rows` (pub, seedable) with REPEATED REAL builtin names (13 exist), and drive the test
+  with NAVIGATION ONLY (any Char/Backspace calls `theme_picker::rebuild_rows`, which
+  regenerates from `builtin_names` and wipes the artificial list); (f) FileBrowser/Outline equivalents of (a)-(c),
   INCLUDING the file browser's own Enter-dispatches-visible hazard pin (its absolute read at
   app.rs:1388); (g) a `PaletteKind::Buffers` scroll case — the buffer switcher
   (editor.rs:687, kind set :708) rides the same palette windowing; make the coverage
@@ -170,7 +188,10 @@ file browser :1421-1428; outline :1648-1657):
   stepping), assert the highlight is visible at each checkpoint and Enter dispatches the
   highlighted command — the "reach everything without typing" journey, impossible today.
 - **Existing tests kept honest:** palette.rs:133 (completeness + chords) gains only the
-  `scroll_top: 0` default; render.rs:1294 (overlay rect) unaffected; app.rs palette tests
+  `scroll_top: 0` default (`Palette` derives Default). **Struct-literal sites that gain the
+  field explicitly (Fable M5 — compiler-caught, enumerated for the plan):** `ThemePicker`
+  (no Default) at editor.rs:675-678 + theme_picker.rs:33-34; `FileBrowser` at
+  editor.rs:725-727 + file_browser.rs:64; render.rs:1294 (overlay rect) unaffected; app.rs palette tests
   (:2468, :3756, :3809, :3980, :4001) unaffected (small indices / no scrolling).
 - Suite green (`cargo test -p wordcartel-core -p wordcartel`); workspace clippy deny-gate
   clean; warning-free builds; **smoke run quoted verbatim** in the pre-merge report.
