@@ -95,7 +95,8 @@ NOT move here — it is overlay glue (decision 2).
 ### Residual `app.rs` (~1,800 prod lines, one topic: the event core)
 
 `Msg` (:26) + `impl Debug for Msg` (:75) + `ExitReason` (:70); the A6 overlay glue
-(:819-:1111); `reduce` (:1114, ~900 lines); `step`/`SystemClock`/`advance`/`run`/
+(two disjoint ranges: :819-:885 and :1094-:1111 — the :887-:1092 span between them is
+the search_ui seam, which moves); `reduce` (:1114, ~900 lines); `step`/`SystemClock`/`advance`/`run`/
 `recompute_scrollbar_visible`/`recompute_menu_bar`/`reconcile_mouse_capture`/
 `persist_session`(+`_for_test`) (:2027-:2553); the reducer-level test module (below).
 
@@ -130,13 +131,17 @@ NOT move here — it is overlay glue (decision 2).
 
 **The rule:** a test moves with the module whose functions it calls **directly**; a test
 that reaches the moved code only through `reduce(...)` stays in app.rs — it is a reducer
-test regardless of which seam it exercises. **One explicit exception (Codex r1):** the
-quit-drain family SPANS two extracted modules — its tests directly call
+test regardless of which seam it exercises. **The spanner exception (Codex r1,
+generalized per Fable I1): any test that directly calls functions of TWO OR MORE
+extracted modules stays in app.rs as a flow-integration test, with path rewrites as its
+only edit.** Known members: the quit-drain family — its tests directly call
 `resolve_prompt` (app.rs:3087/:3114/:3117/:3139/:3174/:3196), `apply_job_outcome`
 (:3093/:3175), and `save_as_submit` (:3201; Codex-enumerated — the plan's per-test
-pass remains the authoritative rewrite checklist) — and a spanner has no single home
-under the rule. The family
-stays in app.rs as flow-integration tests, with its direct calls rewritten to the new
+pass remains the authoritative rewrite checklist) — plus the two Fable-found spanners
+outside that family: `save_and_quit_sets_pending_after_save_and_exits_on_matching_result`
+(app.rs:3207 — calls `resolve_prompt` :3218 AND `apply_outcome` :3221) and
+`save_as_writes_new_path_and_rekeys` (app.rs:5081 — calls `save_as_submit` :5092 AND
+`apply_outcome` :5093). All stay in app.rs with their direct calls rewritten to the new
 paths (`crate::prompts::resolve_prompt`, `crate::jobs_apply::apply_job_outcome`, …).
 The implementation plan classifies each of the 139 tests explicitly BY READING ITS BODY,
 not by name-family — Codex r1 confirmed families are mixed: `replace_all_*` and
@@ -163,9 +168,10 @@ no test may be weakened, deleted, or have assertions altered — renamed imports
 - **One commit per module extraction**, in dependency order: (1) `jobs_apply.rs`,
   (2) `session_restore.rs`, (3) `prompts.rs` (its `resolve_prompt` needs jobs_apply
   already in place), (4) `search_ui.rs`, (5) a final polish commit: the four editor.rs
-  doc-comment references to `apply_result`/`open_into_current` (editor.rs:34/:363/:418/
-  :429) and the transform.rs:139 comment naming "`apply_transform_done` in app.rs"
-  (Codex r1) gain the new module names, lib.rs `mod` ordering matches its existing grouping,
+  doc-comment references to moved fns gain the new module names — editor.rs:26
+  (`drive_quit_drain`)/:34/:363/:418/:429, workspace.rs:206/:216 (`open_into_current`),
+  transform.rs:99 (`resolve_prompt`) and :139 ("`apply_transform_done` in app.rs")
+  (Codex r1 + Fable M2; criterion: any comment naming a moved fn or its app.rs home), lib.rs `mod` ordering matches its existing grouping,
   and the backlog/ledger bookkeeping. Blame recovery is `git blame -C -C` (a split is a
   content copy, not a rename; `--follow` alone won't track it — the backlog line
   claiming otherwise is corrected at ship time).
@@ -174,8 +180,10 @@ no test may be weakened, deleted, or have assertions altered — renamed imports
   NO `cargo fmt`; moved code keeps its hand formatting byte-for-byte.
 - Pre-merge: the standard two final gates (opus whole-branch + Codex GO/NO-GO), plus
   `scripts/smoke/run.sh` quoted verbatim (advisory). The whole-branch reviewer's special
-  charge here: verify the moves are verbatim (e.g. `git diff` of extracted ranges against
-  the pre-move file) and that no logic line changed anywhere in the branch.
+  charge here: verify the moves are verbatim — checked PER COMMIT against its parent,
+  modulo the clause (a)-(d) permitted changes (Fable M3: `resolve_prompt` legitimately
+  differs from branch base at :641/:653 — edited under clause (c) in commit 1, moved in
+  commit 3) — and that no logic line changed anywhere in the branch.
 
 ## Non-goals (explicit)
 
