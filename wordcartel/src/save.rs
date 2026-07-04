@@ -326,7 +326,7 @@ mod tests {
         }
         assert_eq!(e.status, "Saving\u{2026}", "status set before dispatch (§3.9)");
         // InlineExecutor already ran the job; apply the buffered merge.
-        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert!(!e.active().document.dirty(), "version==saved_version after save → clean");
         assert_eq!(e.status, "Saved");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "new\n");
@@ -345,7 +345,7 @@ mod tests {
         { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
         // User edits on to version 2 BEFORE the merge applies.
         e.active_mut().document.version = 2;
-        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         // saved_version recorded v1, but the buffer is at v2 → still dirty.
         assert_eq!(e.active().document.saved_version, Some(1));
         assert!(e.active().document.dirty(), "edited-on buffer stays dirty after a stale-version save");
@@ -366,7 +366,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
-        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert!(e.active().document.dirty(), "failed save must leave the buffer dirty");
         assert!(e.active().document.saved_version.is_none());
         assert!(e.status.to_lowercase().contains("symlink"));
@@ -390,7 +390,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
-        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
 
         assert!(e.active().document.dirty(), "failed save must leave the buffer dirty");
         assert!(e.active().document.saved_version.is_none());
@@ -421,7 +421,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
-        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert!(!e.active().document.dirty());
         assert!(!sp.exists(), "a save that leaves the buffer clean deletes the swap");
 
@@ -430,7 +430,7 @@ mod tests {
         e.active_mut().document.version = 2;
         { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
         e.active_mut().document.version = 3; // edited on
-        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert!(e.active().document.dirty());
         assert!(sp.exists(), "a stale-version save must NOT delete the swap");
         let _ = std::fs::remove_file(&sp); let _ = std::fs::remove_file(&p);
@@ -484,7 +484,7 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = Z;
         { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; overwrite_save(&mut ctx); }
-        for o in ex.drain() { crate::app::apply_outcome(o, &mut e); }
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "mine\n", "overwrite wins");
         assert!(!e.active().document.dirty());
         assert_eq!(e.active().document.stored_fp, crate::save::fingerprint(&p), "overwrite refreshes stored_fp");
@@ -767,7 +767,7 @@ mod tests {
         e.quit_drain = Some(crate::editor::QuitDrain {
             queue: std::collections::VecDeque::new(), mode: crate::editor::QuitMode::SaveAll });
         e.quit_drain_advance = true;
-        crate::app::apply_outcome(
+        crate::jobs_apply::apply_outcome(
             crate::jobs::JobOutcome::Panicked {
                 buffer_id: id, version: 1, kind: crate::jobs::JobKind::Save, msg: "boom".into() },
             &mut e);
