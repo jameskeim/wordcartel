@@ -272,8 +272,8 @@ pub(crate) fn keep_overlay_visible(area_h: u16, selected: usize, row_count: usiz
     seed 20 buffers via the switcher path, PgDn → highlight visible.
   - render tests: `palette_windowed_slice_shows_scrolled_rows` (set selected=50 +
     heal via a draw; assert a row string matches `rows[scroll_top]`'s label, NOT rows[0]'s);
-    `palette_indicator_only_when_scrollable` (31 rows → bottom border contains "51/…"?? —
-    use selected=12 → ` 13/31 `; 3 rows → NO indicator text in the bottom border);
+    `palette_indicator_only_when_scrollable` (31 rows, selected=12 → the bottom border
+    contains ` 13/31 `; 3 rows → NO indicator text in the bottom border);
     `palette_resize_self_heal_no_panic` (selected=50, scroll_top=36 seeded manually, draw
     into an 80×10 backend → no panic, and after the draw `selected - scroll_top < list_h_for(rows, 10)`);
     the h=4 degenerate draw (no panic, no rows painted).
