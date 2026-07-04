@@ -1,6 +1,12 @@
 # H1 — app.rs decomposition (mechanical module split)
 
-**Status:** draft — pending Codex + Fable spec review
+**Status:** CLEAN — Codex spec review ×3 (r3 CLEAN) + Fable5 ×3 (r3 READY), 2026-07-04.
+Plan-writer notes from the final Fable pass: (1) the polish-commit ENUMERATED LIST is the
+operative checklist — the prose criterion also matches location-free mentions in the
+residual app.rs/staying tests that rightly need no edit; (2)
+`quit_after_save_cancelled_when_edited_during_flight` (app.rs:3307) is not in the family
+list and calls only `apply_result` — it moves to jobs_apply.rs under the rule, and either
+disposition compiles; the per-body pass decides.
 **Effort:** H1 (backlog Theme H; `settled-direction`, sized Medium)
 **Date:** 2026-07-04 · **Facts as of:** `e2c7667` (post-A6 merge; app.rs = 5,740 lines,
 ~2,000 production + 3,185 test)
