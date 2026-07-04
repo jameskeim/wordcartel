@@ -16,7 +16,7 @@ pub enum CellHit {
 /// Classify a terminal cell `(col, row)` into the editing layout regions.
 pub fn editing_cell(editor: &Editor, col: u16, row: u16) -> CellHit {
     let (w, h) = editor.active().view.area;
-    let menu_rows: u16 = u16::from(editor.menu.is_some());
+    let menu_rows: u16 = editor.menu_bar_rows();
     if h == 0 {
         return CellHit::Outside;
     }
@@ -151,7 +151,7 @@ pub fn handle(
             let hit = editing_cell(editor, ev.column, ev.row);
             if let CellHit::Scrollbar = hit {
                 let (_w, h) = editor.active().view.area;
-                let menu_rows = u16::from(editor.menu.is_some());
+                let menu_rows = editor.menu_bar_rows();
                 let edit_height = h.saturating_sub(1 + menu_rows) as usize;
                 let erow_in_track = ev.row.saturating_sub(menu_rows) as usize;
                 let fv = editor.active_fold_view();
@@ -212,7 +212,7 @@ pub fn handle(
         MouseEventKind::Drag(MouseButton::Left) => {
             if editor.mouse.scrollbar_dragging {
                 let (_w, h) = editor.active().view.area;
-                let menu_rows = u16::from(editor.menu.is_some());
+                let menu_rows = editor.menu_bar_rows();
                 let edit_height = h.saturating_sub(1 + menu_rows) as usize;
                 let erow_in_track = ev.row.saturating_sub(menu_rows) as usize;
                 let fv = editor.active_fold_view();
@@ -225,7 +225,7 @@ pub fn handle(
             }
             if !editor.mouse.dragging { return; }
             let (_w, h) = editor.active().view.area;
-            let menu_rows = u16::from(editor.menu.is_some());
+            let menu_rows = editor.menu_bar_rows();
             let edit_top = menu_rows;
             let edit_bottom = h.saturating_sub(1); // status row excluded
             // edge auto-scroll

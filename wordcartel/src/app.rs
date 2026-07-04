@@ -1958,6 +1958,12 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     editor.resume_enabled = cfg.state.resume; // gates open_into_current's resume restore (Effort 7)
     editor.diag_cfg = cfg.diagnostics.clone();
     editor.export_cfg = cfg.export.clone();
+    editor.menu_bar_mode = cfg.menu.bar;
+    editor.menu_bar_unpinned_mode = if cfg.menu.bar == crate::config::MenuBarMode::Pinned {
+        crate::config::MenuBarMode::Auto // unpin target when config itself pins
+    } else {
+        cfg.menu.bar
+    };
     // Resolve and seed the active theme + color depth (once, at startup — §3.6).
     let env = crate::theme_resolve::EnvSnapshot::from_env();
     let resolved = crate::theme_resolve::resolve_theme(&cfg.theme, &env);

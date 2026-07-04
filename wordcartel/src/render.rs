@@ -245,7 +245,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         return;
     }
 
-    let menu_rows = u16::from(editor.menu.is_some());
+    let menu_rows = editor.menu_bar_rows();
     let edit_height = h.saturating_sub(1 + menu_rows); // rows available for editing content
     let edit_top = area.y + menu_rows;
     let status_row = area.y + h - 1;
