@@ -23,14 +23,18 @@
 
 ---
 
-### Task 1: the break-opportunity helper (pure, unit-tested)
+### Task 1: the break engine — helper + word-wrap loop + laws (ONE commit)
 
 **Files:**
-- Modify: `wordcartel-core/Cargo.toml` (one dependency line), `wordcartel-core/src/layout.rs` (hoist `VG` + add helper + tests)
+- Modify: `wordcartel-core/Cargo.toml` (one dependency line), `wordcartel-core/src/layout.rs` (hoist `VG`, add helper, rework the loop, laws + tests); verify-only: `wordcartel/src/nav.rs` tests, `wordcartel/src/derive.rs` tests
 
 **Interfaces:**
 - Consumes: nothing new.
-- Produces: `fn visible_break_indices(vg_texts: &[&str]) -> Vec<usize>` (private to layout.rs) — Task 2's loop consumes it. Also hoists `struct VG` from inside `layout()` to file scope (private, unchanged fields) so helpers can name it.
+- Produces: the new wrap geometry every later task and consumer sees (`layout()`'s API unchanged); internally `fn visible_break_indices(vg_texts: &[&str]) -> Vec<usize>` + the hoisted file-scope `VG`.
+
+**Why one commit (Codex plan r1):** the helper alone is dead code until the loop consumes
+it — a separate T1 commit fails the warning-free gate. Helper and loop land together;
+the TDD stages below are sequenced inside the task.
 
 - [ ] **Step 1: add the dependency.** In `wordcartel-core/Cargo.toml` under `[dependencies]`, beside the existing `unicode-segmentation`/`unicode-width` lines:
 
@@ -130,22 +134,9 @@ fn visible_break_indices(vg_texts: &[&str]) -> Vec<usize> {
 
 And the `use` line at the top of layout.rs's import block: none needed (the helper names the crate via full path `unicode_linebreak::linebreaks`).
 
-- [ ] **Step 5: run to verify GREEN.** `cargo test -p wordcartel-core break_indices` — all 6 pass. Then the full gates.
+- [ ] **Step 5: run to verify the helper tests GREEN.** `cargo test -p wordcartel-core break_indices` — all 6 pass. (The build may warn dead_code at THIS stage — expected mid-task; the loop lands before the commit.)
 
-- [ ] **Step 6: commit** — `feat(b1): UAX #14 break-opportunity helper with mid-cluster drop rule (unicode-linebreak dep)`.
-
----
-
-### Task 2: the word-wrap loop + laws + wrap-test updates
-
-**Files:**
-- Modify: `wordcartel-core/src/layout.rs` (the loop :260-:294 + tests + proptest laws/strategy), verify-only: `wordcartel/src/nav.rs` tests, `wordcartel/src/derive.rs` tests
-
-**Interfaces:**
-- Consumes: `visible_break_indices`, the hoisted `VG` (Task 1).
-- Produces: the new wrap geometry every later task and consumer sees. No signature changes — `layout()`'s API is untouched.
-
-- [ ] **Step 1: write the failing unit tests** (layout.rs tests; names exact):
+- [ ] **Step 6: write the failing wrap-loop tests** (layout.rs tests; names exact):
 
 ```rust
     #[test]
@@ -194,9 +185,9 @@ And the `use` line at the top of layout.rs's import block: none needed (the help
     }
 ```
 
-- [ ] **Step 2: run to verify RED.** `cargo test -p wordcartel-core word_wrap` — the first, fourth and fifth fail against the greedy loop (`hello wi`/`de`; CodeBlock is identical today so that one may pass — confirm which fail and record it).
+- [ ] **Step 7: run to verify RED.** `cargo test -p wordcartel-core word_wrap` — the space-break, break-at-row-start (and possibly others) fail against the greedy loop (`hello wi`/`de`; CodeBlock is identical today so that one may pass — confirm which fail and record it).
 
-- [ ] **Step 3: rework the loop.** Replace layout.rs:260-292 (quoted in full in the spec and below as modified) with:
+- [ ] **Step 8: rework the loop.** Replace layout.rs:260-292 (quoted in full in the spec and below as modified) with:
 
 ```rust
     // Word-boundary soft-wrap (UAX #14; spec D1/D2). CodeBlock keeps grapheme wrap.
@@ -225,6 +216,16 @@ And the `use` line at the top of layout.rs's import block: none needed (the help
             let cut = breaks.partition_point(|&k| k <= i);
             let cand = breaks[..cut].last().copied().filter(|&k| k > row_start_vg);
             match cand {
+                // The break is exactly the CURRENT (unpushed) VG: the row ends here
+                // with NO tail to re-place — placed[i] does not exist yet (Codex plan
+                // r1 Critical: indexing it panics on e.g. "- aaaa bbbb" @ 6, where the
+                // break before 'bbbb' meets the overflow at 'b').
+                Some(b) if b == i => {
+                    row_end_col.push(col);
+                    row += 1;
+                    col = prefix_width;
+                    row_start_vg = i;
+                }
                 // A legal break strictly inside this row: end the row there and
                 // re-place the tail (break..i) onto the new row (spec D2). `placed`
                 // has exactly one entry per VG (zero-widths included), so the break
@@ -259,9 +260,9 @@ And the `use` line at the top of layout.rs's import block: none needed (the help
 
 Notes the implementer must honor: whitespace VGs (`is_ws`) bypass the overflow test entirely — they hang (spec D2); zero-width VGs at/after the break travel with the tail (they sit in `placed[b..]` by index — `placed` is index-parallel to `vgs`); `row_end_col` for the broken row is `placed[b].col` (the col after the last staying VG — hanging whitespace included, it was placed before the overflow). Everything after the loop (:293-:346, the `visual_rows` build) is UNCHANGED.
 
-- [ ] **Step 4: run to verify GREEN** — `cargo test -p wordcartel-core word_wrap`, then the wrap-sensitive existing tests: `active_line_identity_and_wrap` must pass UNCHANGED (no opportunity in `abcdef`; add the one-line comment `// no UAX #14 opportunity — pins the grapheme fallback` above it); `prefix_reduces_wrap_capacity` UPDATE per spec: `"- aaaa bbbb"` @ 6 → row 0 displays `aaaa ` (space hanging, end col 7), row 1 `bbbb` at col 2 — rewrite its assertions to exactly that.
+- [ ] **Step 9: run to verify GREEN** — `cargo test -p wordcartel-core word_wrap` (and the break_indices six stay green; the dead_code warning gone now the loop consumes the helper), then the wrap-sensitive existing tests: `active_line_identity_and_wrap` must pass UNCHANGED (no opportunity in `abcdef`; add the one-line comment `// no UAX #14 opportunity — pins the grapheme fallback` above it); `prefix_reduces_wrap_capacity` UPDATE per spec: `"- aaaa bbbb"` @ 6 → row 0 displays `aaaa ` (space hanging, end col 7), row 1 `bbbb` at col 2 — rewrite its assertions to exactly that.
 
-- [ ] **Step 5: amend Law 3, add W1, extend the strategy.** In `law3_softwrap_fidelity` (layout.rs:838-882), replace the width assertion with the composable form (spec D4/I3):
+- [ ] **Step 10: amend Law 3, add W1, extend the strategy.** In `law3_softwrap_fidelity` (layout.rs:838-882), replace the width assertion with the composable form (spec D4/I3). **The real law body's locals are `sum`, `row`, `ri`, `on_row` (:860-868) and proptest bodies use `prop_assert!` — adapt this LOGIC to those exact names and macros; the snippet below is the logic, not a drop-in (Codex plan r1):**
 
 ```rust
             // Composable width bound (spec Law 3): row width MINUS trailing-whitespace
@@ -270,28 +271,28 @@ Notes the implementer must honor: whitespace VGs (`is_ws`) bypass the overflow t
                 .take_while(|p| p.text == " " || p.text == "\t")
                 .map(|p| p.width).sum();
             let non_ws_count = on_row.iter().filter(|p| !(p.text == " " || p.text == "\t")).count();
-            let content_width = row_width - trailing_ws;
-            assert!(
+            let content_width = sum - trailing_ws; // `sum` = the row's total width in the real body
+            prop_assert!(
                 content_width <= w || non_ws_count == 1,
-                "row {r}: content {content_width} > vw {w} with {non_ws_count} non-ws graphemes"
+                "row {}: content {} > vw {} with {} non-ws graphemes", ri, content_width, w, non_ws_count
             );
 ```
 
 Add law W1 as a new proptest beside it (over the same strategy), asserting for every non-CodeBlock row boundary with first VG index `j`: `breaks.contains(&j) || !breaks.iter().any(|&k| row_start < k && k <= j)` — recompute `breaks` in the test via `visible_break_indices` on the laid-out line's VG texts (expose the VG texts by re-deriving them from `map.placed` in row order: their `text` fields ARE the VG texts). Extend `token()` (layout.rs:715-736) with the bare combining-mark token `Just("\u{301}".to_string())` (spec C1).
 
-- [ ] **Step 6: verify the neighbors.** Run the full core suite plus: `cargo test -p wordcartel screen_pos_wrapped_line_second_visual_row caret_in_tall_wrapped_line_stays_visible long_line_wraps_at_small_width rebuild_fills_editing_rows` — ALL must pass UNCHANGED (their corpora have no break opportunities; if one fails, STOP — that is a real geometry bug, not a test to update). Then the full gates.
+- [ ] **Step 11: verify the neighbors.** Run the full core suite plus: `cargo test -p wordcartel screen_pos_wrapped_line_second_visual_row caret_in_tall_wrapped_line_stays_visible long_line_wraps_at_small_width rebuild_fills_editing_rows` — ALL must pass UNCHANGED (their corpora have no break opportunities; if one fails, STOP — that is a real geometry bug, not a test to update). Then the full gates.
 
-- [ ] **Step 7: commit** — `feat(b1): word-boundary wrap — UAX #14 breaks, whitespace hang, grapheme fallback, CodeBlock exemption; Law 3 composable + W1`.
+- [ ] **Step 12: commit** — `feat(b1): word-boundary wrap — UAX #14 break engine, whitespace hang, grapheme fallback, CodeBlock exemption; Law 3 composable + W1`.
 
 ---
 
-### Task 3: B2 — tab-aware, marker-conditional list-indent conceal
+### Task 2: B2 — tab-aware, marker-conditional list-indent conceal
 
 **Files:**
 - Modify: `wordcartel-core/src/md_parse.rs` (the ListItem arm :252-:292 + tests), `wordcartel-core/src/layout.rs` (W2 test only)
 
 **Interfaces:**
-- Consumes: nothing from T1/T2 (independent change; sequenced after so wrap geometry is settled when its tests pin hanging indent).
+- Consumes: nothing from Task 1 (independent change; sequenced after so wrap geometry is settled when its tests pin hanging indent).
 - Produces: nested-list glyphs `"<indent>• "` / `"<indent><ordinal>. "`; `prefix_width` now includes indent for nested items.
 
 - [ ] **Step 1: write the failing tests** (md_parse.rs tests; names exact):
@@ -330,7 +331,7 @@ Add law W1 as a new proptest beside it (over the same strategy), asserting for e
     }
 ```
 
-(`visible_text` is the existing test helper in that module — reuse it; if it has another name, use the module's established idiom for reconstructing visible bytes.)
+(The module's real helper is named `visible` (md_parse.rs:369-374, Codex plan r1) — use it; the test code above writes `visible_text` for readability, substitute the real name.)
 
 - [ ] **Step 2: run to verify RED.** `cargo test -p wordcartel-core nested_ tab_indented markerless_` — the first three fail (glyph `"• "`, indent visible); the fourth passes today — keep it as the guard pin and note that in the report.
 
@@ -416,13 +417,13 @@ Add law W1 as a new proptest beside it (over the same strategy), asserting for e
 
 ---
 
-### Task 4: render caret clamp, composition pins, e2e journeys
+### Task 3: render caret clamp, composition pins, e2e journeys
 
 **Files:**
 - Modify: `wordcartel/src/render.rs` (the cursor-set site :714-:718 + tests), `wordcartel/src/nav.rs` (one stale doc comment :1484-:1485), `wordcartel/src/e2e.rs` (journeys)
 
 **Interfaces:**
-- Consumes: T2's geometry, T3's glyphs.
+- Consumes: Task 1's geometry, Task 2's glyphs.
 - Produces: the shipped behavior; no API changes.
 
 - [ ] **Step 1: write the failing render test** (render.rs tests, TestBackend idiom of the neighbors):
@@ -437,9 +438,17 @@ cursor read:
         let backend = ratatui::backend::TestBackend::new(w, h);
         let mut term = ratatui::Terminal::new(backend).unwrap();
         term.draw(|f| /* the same draw call render_to_buffer makes */).unwrap();
-        term.backend_mut().get_cursor_position().ok().map(|p| (p.x, p.y))
+        // TestBackend's INHERENT cursor_position() — no Backend trait import needed
+        // (Codex plan r1; the trait method get_cursor_position would need `use
+        // ratatui::backend::Backend`, which the test module does not import).
+        let p = term.backend().cursor_position();
+        Some((p.x, p.y))
     }
 ```
+
+(If the inherent method's exact name differs in the vendored ratatui, check
+TestBackend's inherent API — it exists per ratatui-core test.rs:112-118 — and do NOT
+import the Backend trait.)
 
 Then the pin:
 
@@ -456,15 +465,14 @@ Then the pin:
         let (col, _row) = crate::nav::screen_pos(&e).expect("caret on screen");
         assert!(col as usize >= 4, "precondition: logical col past the rect, got {col}");
         let cur = render_capturing_cursor(&mut e, 4, 8);
-        let (x, _y) = cur.expect("cursor must be SET, not suppressed");
+        let (x, _y) = cur.expect("helper returns Some; suppression shows as (0,0)");
         assert_eq!(x, 3, "pinned at text_width-1 (text_left is 0 here)");
     }
 ```
 
-RED expectation: today the guard suppresses the cursor entirely, so
-`cur` is the backend's untouched default — the `expect`/`assert_eq` fails. (If the
-backend's default cursor is (0,0) rather than None, assert `x == 3` still fails — note
-which failure shape you saw in the report.)
+RED expectation: TestBackend initializes the cursor at (0,0) and today's guard never
+sets it — so `x == 0`, and the `assert_eq!(x, 3)` fails (Codex plan r1: the position
+always reads back; it is the VALUE that discriminates, not Some/None).
 
 - [ ] **Step 2: implement the clamp.** At render.rs:714-718, replace:
 
