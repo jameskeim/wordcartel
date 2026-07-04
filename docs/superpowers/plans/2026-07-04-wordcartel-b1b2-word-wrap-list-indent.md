@@ -176,6 +176,22 @@ And the `use` line at the top of layout.rs's import block: none needed (the help
     }
 
     #[test]
+    fn word_wrap_long_url_falls_back() {
+        // One unbroken URL token: no interior opportunity — grapheme fallback rows.
+        let (rows, _) = layout("https://example.com/aaaa", BlockRole::Paragraph, false, 8, false);
+        assert!(rows.len() >= 3);
+        assert!(rows.iter().all(|r| r.width <= 8));
+    }
+
+    #[test]
+    fn word_wrap_cjk_mixed_script() {
+        // Layout-level CJK: breaks between ideographs — no mid-ideograph splits, rows fit.
+        let (rows, _) = layout("中文混排English", BlockRole::Paragraph, false, 6, false);
+        assert!(rows.iter().all(|r| r.width <= 6), "{rows:?}");
+        assert!(rows.len() >= 2);
+    }
+
+    #[test]
     fn word_wrap_repeat_zero_width_head_no_overwide_row() {
         // Probe-confirmed spec-D2 repeat case: a zero-width head means the tail
         // re-place frees ZERO columns — the current VG must wrap again, never
@@ -285,7 +301,7 @@ And the `use` line at the top of layout.rs's import block: none needed (the help
     let rows = row + 1;
 ```
 
-Notes the implementer must honor: whitespace VGs (`is_ws`) bypass the overflow test entirely — they hang (spec D2); zero-width VGs at/after the break travel with the tail (they sit in `placed[b..]` by index — `placed` is index-parallel to `vgs`); `row_end_col` for the broken row is `placed[b].col` in the tail-re-place arm, and the current `col` in both the b==i and fallback arms (in every case: the col after the last VG that stays — hanging whitespace included). Everything after the loop (:293-:346, the `visual_rows` build) is UNCHANGED.
+Notes the implementer must honor: whitespace VGs (`is_ws`) bypass the overflow test entirely — they hang (spec D2); zero-width VGs at/after the break travel with the tail (they sit in `placed[b..]` by index — `placed` is index-parallel to `vgs`); `row_end_col` for the broken row is `placed[b].col` in the tail-re-place arm, and the current `col` in both the b==i and fallback arms (in every case: the col after the last VG that stays — hanging whitespace included). Everything after the replaced range (:296-:346, the `visual_rows` build) is UNCHANGED.
 
 - [ ] **Step 9: run to verify GREEN** — `cargo test -p wordcartel-core word_wrap` (and the break_indices six stay green; the dead_code warning gone now the loop consumes the helper), then the wrap-sensitive existing tests: `active_line_identity_and_wrap` must pass UNCHANGED (no opportunity in `abcdef`; add the one-line comment `// no UAX #14 opportunity — pins the grapheme fallback` above it); `prefix_reduces_wrap_capacity` UPDATE per spec: `"- aaaa bbbb"` @ 6 → row 0 displays `aaaa ` (space hanging, end col 7), row 1 `bbbb` at col 2 — rewrite its assertions to exactly that.
 
