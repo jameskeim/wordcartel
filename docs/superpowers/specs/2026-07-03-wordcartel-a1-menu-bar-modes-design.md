@@ -1,6 +1,6 @@
 # A1: menu bar modes (hidden | auto | pinned) + dwell reveal — design
 
-**Status:** approved design (pre-spec-review)
+**Status:** Codex round 1 folded (scrollbar-click geometry site; typewriter branch; page_step overlap preservation; MENU_ORDER visibility; the RESOLVED Moved predicate; nine open_* sites); re-review pending
 **Date:** 2026-07-03
 **Effort:** a1-menu-bar-modes — the second effort off `docs/ux-backlog.md` (A1; design settled at
 the 2026-07-03 triage, `auto` default confirmed; the one open fork — reveal geometry — resolved
@@ -21,11 +21,12 @@ Two map findings shape the design:
    `mouse::handle` and die in the `_ => {}` catch-all (mouse.rs:258). Dwell detection is a new
    arm, not new plumbing.
 2. **A pre-existing geometry bug.** Four nav.rs sites compute edit-height as `area.1 - 1`
-   WITHOUT subtracting the menu row (`screen_pos` :90, `ensure_visible` :403, `page_step` :761,
-   `last_fully_visible_line` :795): with the menu open TODAY the caret can become invisible at
-   the bottom edge, `ensure_visible` under-scrolls, and PageUp/Down overstep by one row.
-   Transient today; PERMANENT under a pinned bar. A1 fixes it via the single geometry accessor
-   — a behavior fix the merge report must state.
+   WITHOUT subtracting the menu row (`screen_pos` :90, `ensure_visible` :403 — INCLUDING its
+   typewriter branch, `page_step` :761, `last_fully_visible_line` :795): with the menu open
+   TODAY the caret can become invisible at the bottom edge, `ensure_visible` under-scrolls
+   (plain and typewriter anchoring), and PageUp/Down overstep by one row. Transient today;
+   PERMANENT under a pinned bar. A1 fixes it via the single geometry accessor — a behavior
+   fix the merge report must state.
 
 ## Goals
 
@@ -74,8 +75,10 @@ warning on unknown values (mirroring config.rs:325-330). TOML section `[menu]`.
   `menu_reveal_due: Option<u64>` (the dwell deadline) and `menu_bar_revealed: bool` (the
   auto-mode transient; meaningless in other modes).
 - `editor.menu: Option<MenuView>` KEEPS its exact meaning: dropdown open. No write site's
-  semantics change (the ten `open_*` overlay closers, `dispatch_overlay_command`, the Esc/F10
-  arm all still mean "close the dropdown").
+  semantics change (the NINE `open_*` overlay closers — minibuffer, prompt, palette, search,
+  diag, outline, theme picker, buffer switcher, file browser (Codex round 1 corrected the
+  count) — plus `dispatch_overlay_command`, `menu_select_for_test`, the registry `"menu"`
+  toggle, and the Esc/F10 arm all still mean "close the dropdown").
 
 ### The single geometry source
 
@@ -99,28 +102,45 @@ Replace every `editor.menu.is_some()`-as-geometry read with `menu_bar_rows()`:
 - render.rs:248 (`menu_rows` → `edit_top`/`edit_height`).
 - mouse.rs:19 (`editing_cell` — row 0 hits `CellHit::MenuBar` only when `menu_bar_rows() == 1`,
   which by construction makes a row-0 click while unrevealed a TEXT click), :216/:229 (drag
-  edge-scroll).
+  edge-scroll), **and :154-156 — the scrollbar CLICK path (Codex round 1: it computes
+  `menu_rows`/`edit_height`/`erow_in_track` from `menu.is_some()` too; missing it would desync
+  scrollbar hit mapping under a pinned/revealed bar).**
 - **nav.rs:90/:403/:761/:795 — the bug fix:** these currently use `area.1 - 1` with NO menu
-  subtraction; they become `area.1 - 1 - menu_bar_rows()` (each has `editor` in scope —
-  plan-confirm signatures). Pins: caret visible at the bottom edge with the bar shown;
-  `page_step` steps exactly `edit_height`; `ensure_visible` scrolls fully.
+  subtraction; they switch to a `menu_bar_rows()`-derived editing height (each has `editor` in
+  scope — Codex-confirmed). Two Codex round-1 refinements: (a) `ensure_visible`'s **typewriter
+  branch** uses the bad height too — the fix covers it (typewriter anchoring is part of the
+  bug); (b) `page_step` currently steps `editing_height.saturating_sub(1).max(1)` (a one-row
+  context overlap) — the fix corrects the HEIGHT input and **preserves the
+  `.saturating_sub(1).max(1)` overlap semantics verbatim** (no paging-semantics change). Pins:
+  caret visible at the bottom edge with the bar shown; `page_step` = its current overlap
+  formula over the corrected height; `ensure_visible` (plain AND typewriter) scrolls fully.
+- **The split is two-sided (Codex-confirmed):** OVERLAY-state reads (`mouse.rs:115`,
+  `app.rs:1137`, `registry.rs:221`) keep reading `menu.is_some()` — they mean "dropdown open,"
+  not geometry, and must NOT switch.
 - derive.rs:212 stays as-is (lays out one extra hidden row — harmless overdraw, documented).
+- **Overlay collision — verified non-issue (Codex round 1):** palette/outline/theme-picker/
+  file-browser/diag are centered rects drawn on top; search/minibuffer/prompt live on the
+  status row — a pinned bar collides with none of them.
 
 ## Component 2 — pinned mode, inactive-bar rendering, commands, Esc nuance
 
 - **Inactive-bar rendering** (render.rs, the same top-row block): when `menu_bar_rows() == 1`
   but `editor.menu.is_none()`, paint the A2 full-width Chrome fill + the category labels in
   `menu_closed_style` — NO dropdown, NO ChromeSelected highlight. Labels come from the STATIC
-  category list (`MENU_ORDER` + `category_label`) — no registry/keymap access in render, no
-  plumbing change. `menu_bar_layout` is refactored to take the label list (or a lightweight
-  equivalent) so hit-testing and painting share geometry in both states (plan-confirm the
-  cleanest signature).
+  category list — **visibility note (Codex round 1): `MENU_ORDER` is imported privately inside
+  menu.rs; render.rs can already call `category_label_pub` but needs either a direct
+  `crate::registry::MENU_ORDER` import or a small menu.rs helper (e.g.
+  `menu::bar_labels() -> impl Iterator<Item=&'static str>`) — plan-confirm the cleanest form.**
+  The label-width claim is Codex-verified: `menu_bar_layout` widths depend only on category
+  labels, never group contents — so `menu_bar_layout` refactors to take the label list (or the
+  helper) and hit-testing + painting share geometry in BOTH bar states.
 - **Click-to-open on the inactive bar** (mouse.rs): a `Down(Left)` on row 0 with the bar
   visible-inactive opens the dropdown AT the clicked category:
   `editor.menu = Some(menu::empty_at(cat_idx))` (an `empty()` variant carrying `open`).
   **Hydration must PRESERVE `open`/`highlighted`** when replacing the placeholder
   (`hydrate_overlays`, app.rs:818-827 — today `build()` resets `open: 0`; carry the
-  placeholder's values over). Click-away and dropdown-row dispatch stay as they are.
+  placeholder's values over, **clamped to the built group/item bounds** — Codex round 1).
+  Click-away and dropdown-row dispatch stay as they are.
 - **Esc/F10 nuance:** the close arm (app.rs:1153-1154) stays `editor.menu = None` — it closes
   the DROPDOWN; in `pinned` (or `auto`-while-pointer-still-at-top) the bar persists because
   visibility flows from the mode, not from `menu.is_some()`. F10 with the dropdown closed
@@ -138,14 +158,31 @@ Mirrors the scrollbar transient-chrome pattern (`scrollbar_until_ms` +
 
 - **`pub const MENU_DWELL_MS: u64 = 250;`** (a named tunable const).
 - **The `Moved` arm** (mouse.rs, before the `_ => {}` catch-all at :258) — deliberately
-  trivial (it runs on every motion frame; integer compares + stores ONLY, no rebuild/redraw):
-  - mode == Auto, pointer row == 0 (frame row, not edit row), no drag
-    (`dragging || scrollbar_dragging`), not already revealed, dropdown closed →
-    `menu_reveal_due = Some(now + MENU_DWELL_MS)` (arm once; re-arming on every frame while
-    resting is acceptable — same deadline).
-  - pointer row > 0 → `menu_reveal_due = None`; and if `menu_bar_revealed && menu.is_none()`
-    → `menu_bar_revealed = false` (immediate hide-on-leave; leaving the TOP row is an
-    unambiguous done-signal — a leave-grace becomes a tunable only if real terminals jitter).
+  trivial (it runs on every motion frame; integer compares + stores ONLY, no rebuild/redraw).
+  **The predicate is RESOLVED (Codex round 1, replacing plan-confirm 7)** — the key insight:
+  leave-bookkeeping must run EVEN WHILE the dropdown is open, so closing the dropdown never
+  strands a stale revealed bar; arming, by contrast, only happens with the dropdown closed:
+
+```rust
+if editor.menu_bar_mode == MenuBarMode::Auto && kind == MouseEventKind::Moved {
+    if ev.row > 0 {
+        // Leave: disarm + hide — runs regardless of dropdown state, so a bar
+        // revealed before the dropdown opened clears promptly after it closes.
+        editor.mouse.menu_reveal_due = None;
+        editor.mouse.menu_bar_revealed = false;
+    } else if editor.menu.is_none()
+        && !editor.mouse.dragging
+        && !editor.mouse.scrollbar_dragging
+        && !editor.mouse.menu_bar_revealed
+    {
+        editor.mouse.menu_reveal_due = Some(clock.now_ms() + MENU_DWELL_MS);
+    }
+}
+```
+
+  (Re-arming on consecutive resting frames is prevented by the `!menu_bar_revealed` guard
+  post-reveal and is harmless pre-reveal — same deadline value. Leaving the TOP row is an
+  unambiguous done-signal; a leave-grace becomes a tunable only if real terminals jitter.)
 - **The reveal fires via the deadline machinery:** `menu_reveal_due` joins the run-loop
   deadline array (app.rs:2152-2183, beside `sb_deadline`) so a sleeping app wakes exactly on
   time; `recompute_menu_reveal(editor, now_ms)` sits beside `recompute_scrollbar_visible` in
@@ -200,7 +237,7 @@ Mirrors the scrollbar transient-chrome pattern (`scrollbar_until_ms` +
 1. Fresh anchors for every touched site (the map's lines are as of `fb10892` and will drift):
    render.rs:248/:906-945, mouse.rs:19/:76-78/:115-142/:216/:229/:258, nav.rs:90/:403/:761/:795,
    app.rs:818-827/:1153-1154/:1774-1798/:2152-2183/:2242-2244/:1864, registry.rs:210-227,
-   editor.rs:322-336/:374/:444 + the ten `open_*` sites, keymap.rs:243, menu.rs:4-45.
+   editor.rs:322-336/:374/:444 + the nine `open_*` sites, keymap.rs:243, mouse.rs:154-156, menu.rs:4-45.
 2. The nav.rs functions' signatures — confirm each of the four has `editor` (or can cheaply
    receive the row count) in scope for `menu_bar_rows()`.
 3. The `menu_bar_layout` refactor shape for label-only rendering (groups vs a static label
@@ -212,9 +249,11 @@ Mirrors the scrollbar transient-chrome pattern (`scrollbar_until_ms` +
 6. The deadline-array insertion (app.rs:2152-2183) + confirm `recompute_menu_reveal`'s
    placement in `advance()` keeps the harness-drivable property (the e2e `step` calls
    `advance`).
-7. The `Moved` arm's exact placement in mouse.rs's match (before `_ => {}`, after the overlay
-   block? — it must run even while the dropdown is OPEN only if we want leave-tracking then;
-   spec says the arm no-ops when `menu.is_some()` except the leave bookkeeping — pick the
-   minimal correct predicate set and pin it in a unit test).
+7. RESOLVED (Codex round 1): the predicate is pinned in Component 3 verbatim (leave-
+   bookkeeping runs even while the dropdown is open; arming requires dropdown-closed +
+   no-drag + not-revealed). Remaining plan detail: the arm's PLACEMENT — it must run BEFORE
+   the overlay block's `return` (the overlay block early-returns on Down(Left) only, but
+   confirm Moved events reach the arm when the dropdown is open) — and a unit test pinning
+   the predicate table.
 8. e2e `Moved` injection shape (`Msg::Input(Event::Mouse(MouseEvent { kind: Moved, … }))`) —
    confirm the harness needs no new sugar beyond a `mouse_move(col, row)` helper.
