@@ -188,6 +188,45 @@ impl ColMap {
     }
 }
 
+/// One visible grapheme after concealment (see layout()).
+struct VG {
+    src: Range<usize>,
+    text: String,
+    width: usize,
+    style: Style,
+}
+
+/// UAX #14 break opportunities over the VISIBLE grapheme sequence, as indices
+/// into the VG vector: index `i` means "a row may end before VG i". Offsets
+/// that do not land on a VG start are DROPPED (UAX #14 and UAX #29 disagree at
+/// e.g. space+combining-mark — one cluster to the segmenter, a break point to
+/// the line breaker; dropping is conservative, never splitting a cluster). The
+/// end-of-text entry is dropped likewise. Mid-line Mandatory entries (U+2028
+/// et al. survive inside a logical line) are treated exactly like Allowed.
+fn visible_break_indices(vg_texts: &[&str]) -> Vec<usize> {
+    let mut concat = String::new();
+    let mut starts: Vec<usize> = Vec::with_capacity(vg_texts.len());
+    for t in vg_texts {
+        starts.push(concat.len());
+        concat.push_str(t);
+    }
+    let mut out: Vec<usize> = Vec::new();
+    let mut cursor = 0usize; // starts[] is ascending; resume the scan per offset
+    for (off, _op) in unicode_linebreak::linebreaks(&concat) {
+        if off >= concat.len() {
+            continue; // the end-of-text entry
+        }
+        while cursor < starts.len() && starts[cursor] < off {
+            cursor += 1;
+        }
+        if cursor < starts.len() && starts[cursor] == off {
+            out.push(cursor); // lands on a VG start — keep
+        }
+        // else: mid-VG offset — dropped (spec C1)
+    }
+    out
+}
+
 /// Display width of a single grapheme, applying our tab policy.
 fn grapheme_width(g: &str) -> usize {
     if g == "\t" {
@@ -208,12 +247,6 @@ pub fn layout(
     let vw = viewport_width.max(1);
     let analysis = crate::md_parse::analyze(line, role, is_active);
 
-    struct VG {
-        src: Range<usize>,
-        text: String,
-        width: usize,
-        style: Style,
-    }
     let mut vgs: Vec<VG> = Vec::new();
     for run in &analysis.runs {
         if !run.visible {
@@ -257,37 +290,76 @@ pub fn layout(
             None
         };
 
-    // Greedy soft-wrap.
+    // Word-boundary soft-wrap (UAX #14; spec D1/D2). CodeBlock keeps grapheme wrap.
+    let breaks: Vec<usize> = if matches!(role, BlockRole::CodeBlock) {
+        Vec::new()
+    } else {
+        let texts: Vec<&str> = vgs.iter().map(|v| v.text.as_str()).collect();
+        visible_break_indices(&texts)
+    };
     let mut placed: Vec<Placed> = Vec::new();
     let mut row = 0usize;
     let mut col = prefix_width;
     let mut row_end_col: Vec<usize> = Vec::new();
+    let mut row_start_vg = 0usize; // first VG index on the current row
 
-    for vg in &vgs {
+    for (i, vg) in vgs.iter().enumerate() {
         if vg.width == 0 {
-            placed.push(Placed {
-                src: vg.src.clone(),
-                row,
-                col,
-                width: 0,
-                text: vg.text.clone(),
-                style: vg.style,
-            });
+            placed.push(Placed { src: vg.src.clone(), row, col, width: 0, text: vg.text.clone(), style: vg.style });
             continue;
         }
-        if col + vg.width > vw && col > prefix_width {
-            row_end_col.push(col);
-            row += 1;
-            col = prefix_width;
+        let is_ws = vg.text == " " || vg.text == "\t";
+        // The hang rule is scoped OFF for CodeBlock (spec D2 as amended: in code a
+        // space/tab is data — byte-identical wrap preserved).
+        let hang = is_ws && !matches!(role, BlockRole::CodeBlock);
+        // The overflow decision REPEATS until the current VG fits (spec D2 as amended,
+        // user-ratified from a probe-confirmed Fable Critical): a tail re-placement can
+        // leave the current VG still over-wide (zero-width head; no-break-before tail).
+        // Each pass either advances the break point strictly or falls back at the row
+        // start, where the single-grapheme guard ends the loop — termination guaranteed.
+        while !hang && col + vg.width > vw && col > prefix_width {
+            // Largest legal break k with row_start_vg < k <= i (breaks is ascending):
+            // stateless O(log n) lookup — a per-row cursor that resets on re-placement
+            // silently DROPS breaks between the chosen one and i (a W1 violation).
+            let cut = breaks.partition_point(|&k| k <= i);
+            let cand = breaks[..cut].last().copied().filter(|&k| k > row_start_vg);
+            match cand {
+                // The break is exactly the CURRENT (unpushed) VG: the row ends here
+                // with NO tail to re-place — placed[i] does not exist yet (Codex plan
+                // r1 Critical: indexing it panics on e.g. "- aaaa bbbb" @ 6, where the
+                // break before 'bbbb' meets the overflow at 'b').
+                Some(b) if b == i => {
+                    row_end_col.push(col);
+                    row += 1;
+                    col = prefix_width;
+                    row_start_vg = i;
+                }
+                // A legal break strictly inside this row: end the row there and
+                // re-place the tail (break..i) onto the new row (spec D2). `placed`
+                // has exactly one entry per VG (zero-widths included), so the break
+                // VG's placed index IS its VG index.
+                Some(b) => {
+                    row_end_col.push(placed[b].col);
+                    row += 1;
+                    let mut c = prefix_width;
+                    for p in placed[b..].iter_mut() {
+                        p.row = row;
+                        p.col = c;
+                        c += p.width;
+                    }
+                    col = c;
+                    row_start_vg = b;
+                }
+                // No interior opportunity: grapheme fallback (today's behavior).
+                None => {
+                    row_end_col.push(col);
+                    row += 1;
+                    col = prefix_width;
+                    row_start_vg = i;
+                }
+            }
         }
-        placed.push(Placed {
-            src: vg.src.clone(),
-            row,
-            col,
-            width: vg.width,
-            text: vg.text.clone(),
-            style: vg.style,
-        });
+        placed.push(Placed { src: vg.src.clone(), row, col, width: vg.width, text: vg.text.clone(), style: vg.style });
         col += vg.width;
     }
     row_end_col.push(col);
@@ -510,6 +582,134 @@ mod tests {
     use super::*;
 
     #[test]
+    fn break_indices_space_hyphen_emdash() {
+        // "ab cd" → graphemes a,b,' ',c,d — opportunity BEFORE c (index 3, after the space run)
+        assert_eq!(visible_break_indices(&["a", "b", " ", "c", "d"]), vec![3]);
+        // hyphen inside a word: break after '-', i.e. before 'r' (index 5)
+        assert_eq!(visible_break_indices(&["s", "e", "l", "f", "-", "r", "e", "f"]), vec![5]);
+        // em-dash prose: " — " yields an opportunity after the trailing space (before 'b')
+        assert_eq!(visible_break_indices(&["a", " ", "—", " ", "b"]), vec![2, 4]);
+    }
+
+    #[test]
+    fn break_indices_nbsp_never_breaks() {
+        assert_eq!(visible_break_indices(&["a", "\u{a0}", "b"]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn break_indices_flag_pins_unicode_15_0_behavior() {
+        // unicode-linebreak 0.1.5 = Unicode 15.0.0 (pre-LB20a): a word-initial hyphen
+        // ALLOWS a break after it — "-flag" may wrap after '-'. Accepted wart (spec I1).
+        assert_eq!(visible_break_indices(&["x", " ", "-", "f", "g"]), vec![2, 3]);
+    }
+
+    #[test]
+    fn break_indices_drop_mid_cluster_offsets() {
+        // Spec C1: " \u{301}" is ONE grapheme cluster to UAX #29 but UAX #14 puts a
+        // break offset at the combining mark — mid-VG. The offset must be DROPPED.
+        assert_eq!(visible_break_indices(&["a", " \u{301}", "b"]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn break_indices_mandatory_midline_treated_as_allowed_and_eot_dropped() {
+        // U+2028 survives inside a logical line (spec I2): its Mandatory break maps
+        // like any Allowed one (offset lands on the VG after the separator)…
+        assert_eq!(visible_break_indices(&["a", "\u{2028}", "b"]), vec![2]);
+        // …and the end-of-text entry never appears.
+        assert_eq!(visible_break_indices(&["a", "b"]), Vec::<usize>::new());
+        assert_eq!(visible_break_indices(&[]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn break_indices_cjk_between_ideographs() {
+        // Mixed script: opportunities between ideographs and at the script seam.
+        let v = visible_break_indices(&["中", "文", "E", "n"]);
+        assert!(v.contains(&1), "between ideographs: {v:?}");
+        assert!(v.contains(&2), "ideograph→latin seam: {v:?}");
+    }
+
+    #[test]
+    fn word_wrap_breaks_at_space_not_midword() {
+        // vw 8, no prefix: "hello wide" → "hello " / "wide" (space hangs? fits at col 5)
+        let (rows, _) = layout("hello wide", BlockRole::Paragraph, false, 8, false);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].display, "hello ");
+        assert_eq!(rows[1].display, "wide");
+    }
+
+    #[test]
+    fn word_wrap_trailing_whitespace_hangs_past_edge() {
+        // vw 4: "abcd " — the space lands at col 4 (== vw) and HANGS; one row.
+        let (rows, map) = layout("abcd ", BlockRole::Paragraph, false, 4, false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(map.row_end_col[0], 5, "hang: end col past vw");
+        // Law 4: the space is PLACED, never dropped.
+        assert_eq!(map.placed.len(), 5);
+    }
+
+    #[test]
+    fn word_wrap_fallback_when_no_opportunity() {
+        // Unbroken token: byte-identical to the old greedy wrap.
+        let (rows, _) = layout("abcdef", BlockRole::Paragraph, false, 4, false);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].display, "abcd");
+        assert_eq!(rows[1].display, "ef");
+    }
+
+    #[test]
+    fn word_wrap_codeblock_keeps_grapheme_wrap() {
+        // Same text, CodeBlock role: spaces do NOT become break points.
+        let (rows, _) = layout("let x = 1;", BlockRole::CodeBlock, false, 4, false);
+        assert_eq!(rows[0].display, "let ", "greedy fill, mid-token break allowed");
+        assert_eq!(rows[1].display, "x = ");
+    }
+
+    #[test]
+    fn word_wrap_long_url_falls_back() {
+        // A long URL token: rows must fit regardless of what break points UAX #14 exposes.
+        let (rows, _) = layout("https://example.com/aaaa", BlockRole::Paragraph, false, 8, false);
+        assert!(rows.len() >= 3);
+        assert!(rows.iter().all(|r| r.width <= 8));
+    }
+
+    #[test]
+    fn word_wrap_cjk_mixed_script() {
+        // Layout-level CJK: breaks between ideographs — no mid-ideograph splits, rows fit.
+        let (rows, _) = layout("中文混排English", BlockRole::Paragraph, false, 6, false);
+        assert!(rows.iter().all(|r| r.width <= 6), "{rows:?}");
+        assert!(rows.len() >= 2);
+    }
+
+    #[test]
+    fn word_wrap_repeat_zero_width_head_no_overwide_row() {
+        // Probe-confirmed spec-D2 repeat case: a zero-width head means the tail
+        // re-place frees ZERO columns — the current VG must wrap again, never
+        // producing an over-wide multi-grapheme row (Law 3).
+        let (rows, _) = layout("\u{200b}ab", BlockRole::Paragraph, false, 1, false);
+        assert!(rows.iter().all(|r| r.width <= 1 || r.display.chars().count() == 1),
+            "no over-wide multi-grapheme row: {rows:?}");
+    }
+
+    #[test]
+    fn word_wrap_codeblock_space_wraps_not_hangs() {
+        // CodeBlock: the hang rule is OFF — a space at the edge wraps greedily,
+        // byte-identical to today (spec D2 as amended).
+        let (rows, _) = layout("abcd x", BlockRole::CodeBlock, false, 4, false);
+        assert_eq!(rows[0].display, "abcd");
+        assert_eq!(rows[1].display, " x");
+    }
+
+    #[test]
+    fn word_wrap_break_at_row_start_falls_back() {
+        // The only opportunity coincides with the row start (guard row_start_vg < break):
+        // " abcdefgh" at vw 4 — opportunity at VG 1 only; rows after the first break
+        // have no interior opportunity → grapheme fallback, no infinite loop.
+        let (rows, _) = layout(" abcdefgh", BlockRole::Paragraph, false, 4, false);
+        assert!(rows.len() >= 3, "must terminate and cover: {rows:?}");
+    }
+
+    #[test]
+    // no UAX #14 opportunity — pins the grapheme fallback
     fn active_line_identity_and_wrap() {
         // Active: raw, identity-ish. "abcdef" width 4 -> rows ["abcd","ef"].
         let (rows, map) = layout("abcdef", BlockRole::Paragraph, true, 4, false);
@@ -661,10 +861,15 @@ mod tests {
 
     #[test]
     fn prefix_reduces_wrap_capacity() {
-        // width-6 viewport, prefix width 2 → text wraps after 4 cols, continuation indented to col 2.
-        let (_rows, map) = layout("- aaaa bbbb", BlockRole::ListItem, false, 6, false);
-        assert!(map.rows >= 2, "should wrap");
-        // A glyph on row 1 starts at col == prefix_width (hanging indent).
+        // width-6 viewport, prefix width 2 (bullet "• ") → text capacity is 4 cols.
+        // "aaaa bbbb": the space after "aaaa" hangs at col 6 (end col 7), and the
+        // word break sends "bbbb" to row 1 indented to prefix_width (col 2).
+        let (rows, map) = layout("- aaaa bbbb", BlockRole::ListItem, false, 6, false);
+        assert_eq!(map.rows, 2, "word-wraps into two rows");
+        assert_eq!(rows[0].display, "aaaa ", "space hangs on row 0");
+        assert_eq!(map.row_end_col[0], 7, "hang: end col past vw");
+        assert_eq!(rows[1].display, "bbbb");
+        // The continuation word starts at col == prefix_width (hanging indent).
         let first_row1 = map.placed.iter().find(|p| p.row == 1 && p.width > 0).unwrap();
         assert_eq!(first_row1.col, 2, "continuation indented to prefix_width");
     }
@@ -727,6 +932,7 @@ mod props {
             Just("e\u{0301}".to_string()),           // e + combining acute: one grapheme, width 1
             Just("\u{200b}".to_string()),             // zero-width space: width 0
             Just("🤦🏼\u{200d}♂\u{fe0f}".to_string()), // ZWJ emoji: one grapheme, width 2
+            Just("\u{301}".to_string()),              // bare combining acute (spec C1: UAX #14 vs #29)
             // concealed markdown constructs (well-formed)
             "[a-z]{1,5}".prop_map(|s| format!("**{}**", s)),
             "[a-z]{1,5}".prop_map(|s| format!("*{}*", s)),
@@ -866,11 +1072,20 @@ mod props {
                 let on_row: Vec<_> = map.placed.iter()
                     .filter(|p| p.row == ri && p.width > 0)
                     .collect();
-                if row.width > w {
-                    prop_assert_eq!(on_row.len(), 1,
-                        "row {} width {} > vw {} but has {} graphemes",
-                        ri, row.width, w, on_row.len());
-                }
+                // Composable width bound (spec Law 3): row width MINUS trailing-
+                // whitespace width must fit, unless the non-whitespace content is
+                // one over-wide grapheme (which may carry hanging trailing ws).
+                let trailing_ws: usize = on_row.iter().rev()
+                    .take_while(|p| p.text == " " || p.text == "\t")
+                    .map(|p| p.width).sum();
+                let non_ws_count = on_row.iter()
+                    .filter(|p| !(p.text == " " || p.text == "\t")).count();
+                let content_width = sum - trailing_ws; // `sum` = the row's total width
+                prop_assert!(
+                    content_width <= w || non_ws_count == 1,
+                    "row {}: content {} > vw {} with {} non-ws graphemes",
+                    ri, content_width, w, non_ws_count
+                );
             }
 
             // (d) placed grapheme row indices form a contiguous range 0..rows
@@ -878,6 +1093,37 @@ mod props {
             for p in &map.placed { max_row = max_row.max(p.row); }
             if !map.placed.is_empty() {
                 prop_assert_eq!(max_row + 1, map.rows.min(max_row + 1));
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // LAW W1: No needless mid-word break (spec D4). Stated over the MAPPED
+        // VG-index break vector. For every non-CodeBlock row boundary whose first
+        // VG index is `j`, either `j` is a mapped break opportunity, or no mapped
+        // opportunity `k` satisfies `row_start < k <= j` (grapheme fallback), or
+        // the boundary is the logical line start (row 0, skipped below).
+        // `placed` is index-parallel to the VG vector (pushed in source order,
+        // re-placement only mutates row/col), so each Placed.text IS its VG text
+        // and each placed index IS its VG index.
+        // -------------------------------------------------------------------
+        #[test]
+        fn law_w1_no_needless_midword_break(
+            line in logical_line(),
+            w in widths(),
+            active in any::<bool>()
+        ) {
+            let (_rows, map) = layout(&line, BlockRole::Paragraph, active, w, false);
+            let texts: Vec<&str> = map.placed.iter().map(|p| p.text.as_str()).collect();
+            let breaks = visible_break_indices(&texts);
+            for r in 1..map.rows {
+                let j = map.placed.iter().position(|p| p.row == r);
+                let row_start = map.placed.iter().position(|p| p.row == r - 1);
+                let (Some(j), Some(row_start)) = (j, row_start) else { continue };
+                let honored = breaks.contains(&j)
+                    || !breaks.iter().any(|&k| row_start < k && k <= j);
+                prop_assert!(honored,
+                    "row {} boundary at VG {} broke a word (row_start {}, breaks {:?})",
+                    r, j, row_start, breaks);
             }
         }
 

@@ -12,6 +12,7 @@ smartstring = "1"
 smallvec = "1"
 unicode-segmentation = "1"
 unicode-width = "0.1"
+unicode-linebreak = "0.1"
 regex-cursor = { version = "0.1", features = ["ropey"] }
 regex-automata = "0.4"
 regex-syntax = "0.8"
