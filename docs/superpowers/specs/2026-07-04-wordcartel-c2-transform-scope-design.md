@@ -37,9 +37,10 @@ ENTIRE list (top-level snap reaches the `List` container, not the `ListItem`).
 - **The fragment landmine:** feeding `run_transform` a mid-item FRAGMENT (continuation
   lines without their marker) makes repar classify them as prose and reflow away the
   hanging indent. Every region handed to `run_transform` must therefore be a union of
-  WHOLE block spans — the design guarantees this structurally (D2's endpoint snap and
-  D1's block spans are always whole `Block.span`s; `ListItem.span` covers marker +
-  continuation lines).
+  WHOLE block spans OR carry a raw GAP endpoint (blank-line territory outside any leaf
+  block — harmless to repar, which sees complete blocks plus surrounding blanks; Codex
+  r1 M-1's wording fix). D2's endpoint snap and D1's block spans deliver exactly that;
+  `ListItem.span` covers marker + continuation lines.
 - `BlockTree`/`Block` (block_tree.rs:155-173): containers (`List`, `ListItem`,
   `BlockQuote`, …) carry nested children with spans; `top_level()` = root children.
 - The only caller of `region_for_transform` is `dispatch_transform` (transform.rs:110);
@@ -163,7 +164,8 @@ The chooser's prompt string is also unchanged.
   `caret_region_at_end_of_buffer_clamps` (the `buf_len` caret).
 - Behavior: `caret_reflow_inside_item_preserves_siblings` (three-item list, caret in
   item 2, reflow → items 1 and 3 byte-identical, item 2 rewrapped with marker + hanging
-  indent intact); `caret_reflow_on_blank_line_noops_with_status` ("already …");
+  indent intact); `caret_reflow_on_blank_line_noops_with_status` (status `"nothing to transform"` — the
+  existing empty-range guard);
   `caret_reflow_in_fence_noops` (verbatim pass-through); `buffer_variants_act_whole_buffer`
   (one of the three suffices for region proof + the registry test extends to six
   commands); the fragment-safety invariant is structural, pinned indirectly by the
