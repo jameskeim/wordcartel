@@ -254,6 +254,11 @@ pub(crate) fn close_buffer_now(editor: &mut Editor, id: BufferId) {
     `close_not_performed_on_save_failure` (the symlink-target trick verbatim from `quit_drain_aborts_on_save_failure`, `#[cfg(unix)]` guarded → buffer stays, `pending_after_save` is None, error status contains "symlink");
     `close_result_for_wrong_buffer_is_stale_noop` (arm for buffer A, deliver a matching-versioned result for buffer B → nothing closes; keys off the `fire` predicate);
     `close_after_save_last_ordinary_while_scratch_active` (**the Fable C1 corruption pin**: `[X, scratch]`, CloseSave{X}, `goto_scratch` during the flight, apply the result → scratch INTACT — `scratch_id` still valid, scratch content untouched — and a fresh untitled sits in X's slot);
+    `close_after_save_last_ordinary_recheck` (**the spec's flight-time recheck, distinct
+    from the scratch pin — Codex plan r1**: THREE buffers `[X, Y, scratch]`, CloseSave{X},
+    then `close_buffer_now(&mut e, y_id)` during the flight (Y clean), apply X's result →
+    the ordinary count re-read at APPLY time is 1, so the last-ordinary path fires:
+    a fresh untitled replaces X's slot rather than a bare remove);
     `close_save_on_conflicted_file_raises_external_mod_and_does_not_arm` (arrange the external-mod state the way `dispatch_save`'s conflict tests do — see save.rs's external-mod test family for the fingerprint idiom — → `prompt.is_some()`, `pending_after_save.is_none()`).
   Run each family as separate single-filter invocations; then the full gates.
 
@@ -275,10 +280,15 @@ pub(crate) fn close_buffer_now(editor: &mut Editor, id: BufferId) {
 ```rust
     #[test]
     fn close_save_timeout_cancels_with_status() {
-        // Arrange a CloseBuffer pending armed at t=0; tick past SAVE_QUIT_TIMEOUT_MS
-        // → pending cleared, status "save timed out — close cancelled", buffer open,
-        // NO prompt re-raise (unlike the Quit variant's re-prompt).
-        …arrange per the sibling timeout test's fixture; assert all four…
+        // Drives the EXTRACTED helper directly (Codex plan r1: the timeout lives in
+        // run(), unreachable via reduce). Arrange a CloseBuffer pending at t=0; call
+        // save_timeout_tick(&mut e, SAVE_QUIT_TIMEOUT_MS + 1) → pending cleared,
+        // status "save timed out — close cancelled", buffer open, NO prompt.
+        // Also pin the extraction is faithful: a Quit-variant pending re-raises
+        // quit_confirm through the same helper.
+        …arrange a dirty named buffer; arm pending_after_save manually with
+        action CloseBuffer{id}, at_ms: 0; call the helper; assert the four
+        conditions; then re-arm with Quit and assert the re-prompt…
     }
 
     #[test]
@@ -315,18 +325,48 @@ app.rs:1376) rather than importing the fn-local const. RED: the first two fail �
 timeout falls into the generic "try again" else-branch, and quit leaves the pending
 armed.)
 
-- [ ] **Step 2: the timeout branch.** In the tick arm (app.rs:1423-1445), add a third flag beside the two existing `matches!` lines and a branch before the final `else`:
+- [ ] **Step 2: the timeout branch — via an extracted seam (Codex plan r1: the timeout
+  block lives in `run()`, app.rs:1419-1444, NOT in reduce's `Msg::Tick` arm — no test can
+  reach it through `reduce`).** Extract the existing block into a module-level helper,
+  behavior-preserving:
 
 ```rust
-                let timed_out_close = matches!(&p.action, crate::editor::PostSaveAction::CloseBuffer { .. });
+/// Save-timeout disposition (extracted from run()'s tick so it is testable — C4).
+/// Returns without effect while no pending save is overdue.
+pub(crate) fn save_timeout_tick(editor: &mut Editor, now: u64) {
+    if let Some(p) = &editor.pending_after_save {
+        let waited = now.saturating_sub(p.at_ms);
+        if waited > SAVE_QUIT_TIMEOUT_MS {
+            let timed_out_drain = matches!(&p.action, crate::editor::PostSaveAction::ContinueQuitDrain);
+            let timed_out_quit  = matches!(&p.action, crate::editor::PostSaveAction::Quit);
+            let timed_out_close = matches!(&p.action, crate::editor::PostSaveAction::CloseBuffer { .. });
+            editor.pending_after_save = None;
+            if timed_out_quit {
+                editor.open_prompt(crate::prompt::Prompt::quit_confirm());
+                editor.status = "Save still running — choose again".into();
+            } else if timed_out_drain {
+                editor.quit_drain = None;
+                editor.quit_drain_advance = false;
+                editor.status = "save timed out — quit cancelled".into();
+            } else if timed_out_close {
+                // C4: a close is not a session-ending action the user is
+                // waiting on — cancel without re-prompting (spec D3).
+                editor.status = "save timed out — close cancelled".into();
+            }
+        }
+    }
+}
 ```
-```rust
-                } else if timed_out_close {
-                    // C4: a close is not a session-ending action the user is
-                    // waiting on — cancel without re-prompting (spec D3).
-                    editor.status = "save timed out — close cancelled".into();
-                } else {
-```
+
+  The `run()` site (app.rs:1423-1445) becomes `save_timeout_tick(&mut editor, now);` —
+  move the existing comments INTO the helper (they document the Quit/drain branches);
+  `SAVE_QUIT_TIMEOUT_MS` moves from run()-local (app.rs:1376) to module scope (same
+  value, `const SAVE_QUIT_TIMEOUT_MS: u64 = 5_000;` above the helper) — the `sq_deadline`
+  reference at app.rs:1448 keeps working. NOTE the pre-existing final `else`
+  ("Save still running — try again") becomes UNREACHABLE once all three variants have
+  branches — drop it, and record in the report that the three-variant match is now
+  exhaustive-by-construction (a deliberate, behavior-identical simplification; if clippy
+  flags anything, prefer a `match &p.action` over the flag trio).
 
 - [ ] **Step 3: the quit-supersedes clear.** At the TOP of `Command::Quit`'s arm (commands.rs:526, before `any_dirty`):
 
@@ -336,10 +376,10 @@ armed.)
             // leaves no ghost close armed to fire on the next manual save.
             // Foreign quit/drain pendings are the existing flow's business.
             if editor.pending_after_save.as_ref()
-                .is_some_and(|p| matches!(p.action, crate::editor::PostSaveAction::CloseBuffer { .. })) {
+                .is_some_and(|p| matches!(&p.action, crate::editor::PostSaveAction::CloseBuffer { .. })) {
                 editor.pending_after_save = None;
             }
-            if matches!(editor.pending_save_as, Some(crate::editor::PostSaveAction::CloseBuffer { .. })) {
+            if matches!(&editor.pending_save_as, Some(crate::editor::PostSaveAction::CloseBuffer { .. })) {
                 editor.pending_save_as = None;
             }
 ```
