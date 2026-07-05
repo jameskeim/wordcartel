@@ -1,5 +1,11 @@
 # D1+A5 Settings Write-back + Keymap Switching Implementation Plan
 
+> Plan status: CLEAN — Codex GO ×4 (r2 empty re-checks) + Fable READY (33 toml/diff-law
+> probes + palette-filter probes pass on locked deps; the rebuild helper survives both
+> adversarial scenario walks; the --config insertion index placement-verified after the
+> underflow fix), 2026-07-05. User ratification during the loop: the extracted
+> rebuild_keymap_if_requested helper with the conditional pending-status clear (C1+I4 A).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** runtime keymap switching (cua ⇄ wordstar) with preset-scoped patches, and an explicit Save Settings command persisting runtime settings to a machine-owned overrides file under the contradiction-only-removal diff law.
