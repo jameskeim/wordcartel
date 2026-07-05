@@ -468,6 +468,10 @@ impl Registry {
             switch_keymap_preset(c.editor, "wordstar");
             CommandResult::Handled
         });
+        r.register("set_wrap_column", "Set Wrap Column\u{2026}", Some(MenuCategory::Settings), |c| {
+            c.editor.open_minibuffer("Wrap column: ", crate::minibuffer::MinibufferKind::WrapColumn);
+            CommandResult::Handled
+        });
         r.register("save_settings", "Save Settings", Some(MenuCategory::Settings), |c| {
             c.editor.settings_save_requested = true;
             CommandResult::Handled
@@ -717,9 +721,10 @@ mod tests {
     fn settings_commands_registered_in_settings_category() {
         let reg = Registry::builtins();
         for (id, label) in [
-            ("keymap_cua",      "Keymap: CUA"),
-            ("keymap_wordstar", "Keymap: WordStar"),
-            ("save_settings",   "Save Settings"),
+            ("keymap_cua",       "Keymap: CUA"),
+            ("keymap_wordstar",  "Keymap: WordStar"),
+            ("set_wrap_column",  "Set Wrap Column\u{2026}"),
+            ("save_settings",    "Save Settings"),
         ] {
             let m = reg.meta(CommandId(id)).unwrap_or_else(|| panic!("missing {id}"));
             assert_eq!(m.label, label, "label mismatch for {id}");

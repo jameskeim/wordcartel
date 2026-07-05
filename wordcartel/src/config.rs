@@ -99,7 +99,7 @@ impl Default for ViewConfig {
     fn default() -> Self {
         ViewConfig { typewriter: false, typewriter_anchor: 0.5, focus: false,
             focus_granularity: FocusGranularity::Paragraph, measure: false,
-            wrap_column: 80, wrap_guide: false, word_count: false }
+            wrap_column: 72, wrap_guide: false, word_count: false }
     }
 }
 
@@ -363,9 +363,13 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
                    warns.push(format!("view.typewriter_anchor {a} out of 0.0..=1.0; clamped")); }
         }
         if let Some(c) = raw.view.wrap_column {
-            if c >= 20 { cfg.view.wrap_column = c; }
-            else { cfg.view.wrap_column = 20;
-                   warns.push(format!("view.wrap_column {c} below min 20; clamped to 20")); }
+            if c < 20 { cfg.view.wrap_column = 20;
+                        warns.push(format!("view.wrap_column {c} below min 20; clamped to 20")); }
+            else if c > 9999 { cfg.view.wrap_column = 9999;
+                        // repar's frozen parse ceiling (NUMERIC_PARSE_MAX) — a larger
+                        // persisted value would make every transform fail cryptically.
+                        warns.push(format!("view.wrap_column {c} above max 9999; clamped to 9999")); }
+            else { cfg.view.wrap_column = c; }
         }
         if let Some(g) = raw.view.focus_granularity {
             match g.as_str() {
@@ -526,6 +530,12 @@ mod tests {
         assert_eq!(cfg.view.typewriter_anchor, 1.0, "anchor clamped to <=1.0");
         assert_eq!(cfg.view.focus_granularity, FocusGranularity::Paragraph, "bad granularity -> default");
         assert!(warnings.iter().any(|w| w.contains("wrap_column")));
+        // The symmetric upper clamp (repar's parse ceiling — Fable whole-branch I-1).
+        let d2 = tempdir();
+        let hi = write(&d2, "hi.toml", "[view]\nwrap_column = 12000\n");
+        let (cfg2, warns2) = load(&[hi]);
+        assert_eq!(cfg2.view.wrap_column, 9999, "wrap_column clamped to max 9999");
+        assert!(warns2.iter().any(|w| w.contains("above max 9999")));
         assert!(warnings.iter().any(|w| w.contains("focus_granularity")));
     }
 
@@ -821,19 +831,21 @@ mod tests {
         let baseline_resolved = crate::theme_resolve::resolve_theme(&baseline_cfg.theme, &env);
         let baseline = snapshot_of(&baseline_cfg, &baseline_resolved.theme.name);
 
-        // Runtime snapshot: five divergences — keymap → wordstar, typewriter on,
-        // bar → pinned, mouse capture off, theme → tokyo-night (spec Testing:
-        // the round-trip covers [mouse] capture and [theme] name too — Fable m-wb-1).
+        // Runtime snapshot: six divergences — keymap → wordstar, typewriter on,
+        // bar → pinned, mouse capture off, theme → tokyo-night, wrap_column → 100
+        // (spec Testing: the round-trip covers [mouse] capture and [theme] name too —
+        // Fable m-wb-1; wrap_column 100 is distinct from the default 72 and above min).
         let runtime = SettingsSnapshot {
-            keymap_preset:  "wordstar".to_string(),
-            theme_identity: ThemeIdentity::Builtin("tokyo-night".to_string()),
+            keymap_preset:   "wordstar".to_string(),
+            theme_identity:  ThemeIdentity::Builtin("tokyo-night".to_string()),
             view_typewriter: true,
-            view_focus:     false,
-            view_measure:   false,
+            view_focus:      false,
+            view_measure:    false,
             view_wrap_guide: false,
             view_word_count: false,
-            menu_bar:       crate::config::MenuBarMode::Pinned,
-            mouse_capture:  false,
+            view_wrap_column: 100,
+            menu_bar:        crate::config::MenuBarMode::Pinned,
+            mouse_capture:   false,
         };
 
         let of = compute_overrides(&runtime, &baseline, &OverridesFile::default(), &OverridesFile::default());
@@ -849,6 +861,8 @@ mod tests {
         assert!(!cfg.mouse.mouse_capture, "mouse capture must round-trip to false");
         assert_eq!(cfg.theme.name.as_deref(), Some("tokyo-night"),
             "theme name must round-trip");
+        assert_eq!(cfg.view.wrap_column, 100,
+            "view.wrap_column must round-trip to 100");
     }
 
 }

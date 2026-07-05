@@ -37,6 +37,7 @@ pub struct SettingsSnapshot {
     pub view_measure: bool,
     pub view_wrap_guide: bool,
     pub view_word_count: bool,
+    pub view_wrap_column: u16,
     pub menu_bar: crate::config::MenuBarMode,
     pub mouse_capture: bool,
 }
@@ -86,11 +87,12 @@ pub struct OTheme {
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OView {
-    #[serde(skip_serializing_if = "Option::is_none")] pub typewriter: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")] pub focus:      Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")] pub measure:    Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")] pub wrap_guide: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")] pub word_count: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub typewriter:  Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub focus:       Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub measure:     Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub wrap_guide:  Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub word_count:  Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub wrap_column: Option<u16>,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -134,6 +136,7 @@ pub fn snapshot_of(cfg: &crate::config::Config, resolved_theme_name: &str) -> Se
         view_measure:    cfg.view.measure,
         view_wrap_guide: cfg.view.wrap_guide,
         view_word_count: cfg.view.word_count,
+        view_wrap_column: cfg.view.wrap_column,
         menu_bar:        cfg.menu.bar,
         mouse_capture:   cfg.mouse.mouse_capture,
     }
@@ -149,6 +152,7 @@ pub fn runtime_snapshot(editor: &crate::editor::Editor) -> SettingsSnapshot {
         view_measure:    editor.view_opts.measure,
         view_wrap_guide: editor.view_opts.wrap_guide,
         view_word_count: editor.view_opts.word_count,
+        view_wrap_column: editor.view_opts.wrap_column,
         menu_bar:        editor.menu_bar_mode,
         mouse_capture:   editor.mouse_capture,
     }
@@ -161,7 +165,15 @@ pub fn runtime_snapshot(editor: &crate::editor::Editor) -> SettingsSnapshot {
 /// Parse an overrides file. A corrupt or empty file returns the default (all absent).
 /// Matches load()'s corruption-tolerance: a bad machine file must not brick the app.
 pub fn parse_overrides(bytes: &str) -> OverridesFile {
-    toml::from_str::<OverridesFile>(bytes).unwrap_or_default()
+    let mut of = toml::from_str::<OverridesFile>(bytes).unwrap_or_default();
+    // Normalize wrap_column into the valid range at the snapshot boundary — a
+    // hand-edited or legacy out-of-range value would otherwise ride the diff law's
+    // KEEP arms back to disk unclamped (Codex pre-merge; runtime is always safe via
+    // the load clamp, this keeps the FILE honest too). Bounds mirror config::load.
+    if let Some(v) = of.view.as_mut().and_then(|view| view.wrap_column.as_mut()) {
+        *v = (*v).clamp(20, 9999);
+    }
+    of
 }
 
 /// Parse the `--config` layer as an overrides MASK. Identical to `parse_overrides`
@@ -293,9 +305,14 @@ pub fn compute_overrides(
         ex_view.and_then(|v| v.word_count.as_ref()),
         mk_view.and_then(|v| v.word_count).is_some(),
     );
+    let wrap_column = diff_key(
+        &runtime.view_wrap_column, &baseline.view_wrap_column,
+        ex_view.and_then(|v| v.wrap_column.as_ref()),
+        mk_view.and_then(|v| v.wrap_column).is_some(),
+    );
     let any_view = typewriter.is_some() || focus.is_some() || measure.is_some()
-        || wrap_guide.is_some() || word_count.is_some();
-    let view = some_if(OView { typewriter, focus, measure, wrap_guide, word_count }, any_view);
+        || wrap_guide.is_some() || word_count.is_some() || wrap_column.is_some();
+    let view = some_if(OView { typewriter, focus, measure, wrap_guide, word_count, wrap_column }, any_view);
 
     // --- menu — per-key mask predicate ---
     let rt_bar   = menu_bar_str(runtime.menu_bar).to_string();
@@ -426,7 +443,7 @@ mod tests {
     fn snap(preset: &str, theme: ThemeIdentity, tw: bool) -> SettingsSnapshot {
         SettingsSnapshot { keymap_preset: preset.into(), theme_identity: theme,
             view_typewriter: tw, view_focus: false, view_measure: false,
-            view_wrap_guide: false, view_word_count: false,
+            view_wrap_guide: false, view_word_count: false, view_wrap_column: 72,
             menu_bar: crate::config::MenuBarMode::Auto, mouse_capture: true }
     }
 
@@ -550,6 +567,24 @@ mod tests {
         // focus: present in mask → rule 3 guard fires, keeps existing verbatim
         assert_eq!(of2.view.as_ref().and_then(|v| v.focus), Some(true),
             "focus must be kept verbatim when present in mask; got {:?}", of2.view);
+    }
+
+    #[test]
+    fn oversized_wrap_column_in_overrides_normalizes_at_parse() {
+        // Codex pre-merge: a hand-edited [view] wrap_column=12000 must not survive
+        // the KEEP arms back to disk — the snapshot clamps at the parse boundary.
+        let of = parse_overrides("[view]\nwrap_column = 12000\n");
+        assert_eq!(of.view.as_ref().unwrap().wrap_column, Some(9999));
+        let of_low = parse_overrides("[view]\nwrap_column = 5\n");
+        assert_eq!(of_low.view.as_ref().unwrap().wrap_column, Some(20));
+        // The masked-keep path now writes the clamped value (runtime 72 == baseline,
+        // existing 9999 contradicts, mask present → KEEP 9999, never 12000).
+        let rt = snap("cua", ThemeIdentity::Builtin("default".into()), false);
+        let base = snap("cua", ThemeIdentity::Builtin("default".into()), false);
+        let existing = parse_overrides("[view]\nwrap_column = 12000\n");
+        let mask = parse_mask("[view]\nwrap_column = 50\n");
+        let out = compute_overrides(&rt, &base, &existing, &mask);
+        assert_eq!(out.view.as_ref().unwrap().wrap_column, Some(9999), "masked keep is clamped");
     }
 
     #[test]
@@ -699,5 +734,39 @@ mod tests {
         assert!(path.is_file(), "overrides file must be written");
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(parse_overrides(&text), of, "written file must round-trip");
+    }
+
+    #[test]
+    fn wrap_column_persists_through_the_diff_law() {
+        let mut rt = snap("cua", ThemeIdentity::Builtin("default".into()), false);
+        rt.view_wrap_column = 60;                          // diverged
+        let base = snap("cua", ThemeIdentity::Builtin("default".into()), false);
+        let of = compute_overrides(&rt, &base, &OverridesFile::default(), &OverridesFile::default());
+        assert_eq!(of.view.as_ref().unwrap().wrap_column, Some(60), "rule 1 writes");
+        // rule 3 + mask-guard arms:
+        let rt2 = snap("cua", ThemeIdentity::Builtin("default".into()), false);
+        let existing = parse_overrides("[view]\nwrap_column=60\n");
+        let of2 = compute_overrides(&rt2, &base, &existing, &OverridesFile::default());
+        assert!(of2.view.is_none(), "rule 3 removes the contradicted key");
+        let mask = parse_mask("[view]\nwrap_column=90\n");
+        let of3 = compute_overrides(&rt2, &base, &existing, &mask);
+        assert_eq!(of3.view.as_ref().unwrap().wrap_column, Some(60), "mask-guard keeps");
+    }
+
+    #[test]
+    fn set_wrap_column_then_save_writes_the_key() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("a\n", None, (40, 10));
+        crate::prompts::wrap_column_submit(&mut e, "40");
+        assert_eq!(e.view_opts.wrap_column, 40, "precondition: the setter took");
+        let d = tempdir();
+        let path = d.join("settings-overrides.toml");
+        let base = snap("cua", ThemeIdentity::Builtin("default".into()), false); // baseline wrap 72
+        let of = perform_settings_save(&mut e, false, Some(&path),
+            &base, &OverridesFile::default(), &OverridesFile::default(), &crate::fsx::RealFs);
+        assert!(of.is_some(), "save succeeds: {}", e.status);
+        assert_eq!(e.status, "settings saved");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("wrap_column = 40"), "the file carries the key: {text}");
     }
 }

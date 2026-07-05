@@ -60,8 +60,9 @@ integration deliberately).
   all fixups and overrides earlier tokens, later tokens re-add (options.rs:273/:292);
   `"prose"` = Compat::PROSE (:298), `"markdown"` = Compat::MARKDOWN (:299). The
   `--fixups=` vocabulary is frozen additive-only; the library surface is pinned
-  (public_surface_pin_v1). Width: parse-time ceiling `WIDTH_PARSE_MAX` (huge;
-  options.rs:500/:563); the format-time floor `ParError::WidthTooSmall` is RELATIVE —
+  (public_surface_pin_v1). Width: parse-time ceiling `WIDTH_PARSE_MAX` = `NUMERIC_PARSE_MAX` = **9999**
+  (options.rs:497-500/:563 — par's frozen `strtoudec` bound; the earlier "huge" reading
+  was FALSE — Fable whole-branch I-1, corrected 2026-07-05); the format-time floor `ParError::WidthTooSmall` is RELATIVE —
   `width <= prefix + suffix` (driver.rs:128-140 — the real checks at :132/:139;
   error.rs:28), and `prose` suppresses only
   inferred SUFFIX (segment.rs:465), so a width of 20 can still fail on input whose
@@ -113,9 +114,14 @@ integration deliberately).
   app.rs:806's minibuffer match, and the parse/submit fns live in prompts.rs — e.g.
   `goto_line_submit` at prompts.rs:243): a new `MinibufferKind::WrapColumn` arm in
   app.rs's dispatch + a new `prompts::wrap_column_submit(editor, text)`.
-  Semantics: parse `u16`; non-numeric → status "wrap column: not a number"; below 20 →
-  clamp to 20 with status "wrap column: 20 (minimum)"; success → set + status
-  "wrap column: {n}". DELIBERATE divergences from the goto_line family, chosen not
+  Semantics: parse `u16`; non-numeric (incl. u16 overflow) → status
+  "wrap column: not a number"; below 20 → clamp to 20 with status
+  "wrap column: 20 (minimum)"; ABOVE 9999 → clamp to 9999 with status
+  "wrap column: 9999 (maximum)" (user-ratified A, 2026-07-05, Fable whole-branch I-1:
+  repar's parse ceiling is 9999 — an accepted-and-persisted 10000-65535 value left every
+  transform failing with a cryptic persistent error); success → set + status
+  "wrap column: {n}". The config LOAD clamp gains the symmetric upper bound (>9999 →
+  9999 with a warning, mirroring the ≥20 arm). DELIBERATE divergences from the goto_line family, chosen not
   inherited (Codex r1 I-4): goto_line says "not a line number" and clamps SILENTLY —
   this command names its own noun and surfaces the clamp, because a silently-moved
   formatting width is a surprise-diff class and a silently-moved scroll target is not.
