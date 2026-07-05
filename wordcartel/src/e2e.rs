@@ -306,13 +306,13 @@ fn journey_row0_click_unrevealed_edits_text() {
 /// A6 journey: opening the palette and pressing End reaches the LAST registered
 /// command without filtering, and Enter dispatches it.
 ///
-/// The last command is `scroll_line_down` (Fable-verified) — benign and
-/// observable: on a tall document the viewport advances by one logical line.
+/// The last command is `keymap_wordstar` (D1+A5 registration order) — benign and
+/// observable: dispatch flips active_keymap_preset and sets the switch status.
 /// The reach-without-typing property is the contract; selected must be within
 /// the visible window (selected - scroll_top < 15) before Enter.
 #[test]
 fn journey_palette_end_reaches_last_command() {
-    // Tall document so scroll_line_down has somewhere to go.
+    // A tall document keeps the palette's row math honest under scrolling.
     let text: String = (0..50).map(|i| format!("line {i}\n")).collect();
     let mut h = Harness::new(&text, None, (80, 24));
     h.ctrl('p'); // open the Command Palette
