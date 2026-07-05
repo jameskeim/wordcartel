@@ -1,5 +1,9 @@
 # C2 Transform Scope Implementation Plan
 
+> Plan status: CLEAN — Codex GO ×1 + Fable READY ×2 (every hardcoded span probe-verified
+> against the locked pulldown-cmark 0.13.4; the mid-tab degradation user-ratified and
+> pinned; the degraded-parse root exclusion probe-confirmed), 2026-07-05.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** empty-selection transforms act on the transform unit under the caret (never the whole buffer); selection snapping goes endpoint-deepest via the same unit lookup; explicit `reflow_buffer`/`unwrap_buffer`/`ventilate_buffer` commands carry whole-document intent.
