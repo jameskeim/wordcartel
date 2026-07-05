@@ -200,6 +200,19 @@ config.rs (:102): `wrap_column: 80,` → `wrap_column: 72,` (fork 1a-A — the w
         assert_eq!(e.view_opts.wrap_column, 55);
         assert_eq!(e.status, "wrap column: 55");
     }
+
+    #[test]
+    fn wrap_column_minibuffer_cancel_leaves_value_unchanged() {
+        // Spec D4's "cancel" pin: Esc dismisses the minibuffer generically (app.rs's
+        // Esc arm) and no submit ever runs — pin the observable at the editor level.
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("a\n", None, (40, 10));
+        let initial = e.view_opts.wrap_column;
+        e.open_minibuffer("Wrap column: ", crate::minibuffer::MinibufferKind::WrapColumn);
+        assert!(e.minibuffer.is_some());
+        e.minibuffer = None; // the Esc arm's effect — dismiss without submit
+        assert_eq!(e.view_opts.wrap_column, initial, "cancel must not touch the value");
+    }
 ```
 
 Registry: extend `settings_commands_registered_in_settings_category` (registry.rs:716-728) with `("set_wrap_column", "Set Wrap Column\u{2026}")` — note the label's `…` must match the register call's form (grounding shows goto_line uses `\u{2026}` in the label literal; match that convention). Settings: a diff-law pin (the `rule1…` shape, settings.rs:433-442):
@@ -248,7 +261,10 @@ snapshots; home: settings.rs tests, which can reach prompts and perform_settings
 
 (`runtime_snapshot` inside `perform_settings_save` reads the editor's live 40 vs the
 baseline's 72 → rule-1 write. Reuse the settings test module's existing `tempdir` idiom.)
-RED: none of the fields/fns exist.
+RED: none of the fields/fns exist — NOTE (Fable plan M-3): the settings/config pins
+reference `view_wrap_column`/`OView.wrap_column`, so the whole wordcartel test target is
+compile-RED from Step 1 until Step 3 lands; do not expect a green checkpoint after
+Step 2 alone — the gates are commit-time.
 
 - [ ] **Step 2: implement the setter.** minibuffer.rs: add `WrapColumn,` to `MinibufferKind` (:7-15 — doc comment `/// Numeric input for Set Wrap Column.`). app.rs (:812): add the arm `crate::minibuffer::MinibufferKind::WrapColumn => crate::prompts::wrap_column_submit(editor, &mb.text),` (the match is exhaustive — the compiler confirms this is the only site; grounding surprise 3 verified no other exhaustive match exists). prompts.rs (beside goto_line_submit):
 
@@ -273,7 +289,12 @@ pub(crate) fn wrap_column_submit(editor: &mut crate::editor::Editor, text: &str)
 }
 ```
 
-registry.rs (after save_settings, :474):
+registry.rs — register `set_wrap_column` **BEFORE `save_settings`** (between
+keymap_wordstar's registration and save_settings', i.e. before :471 — Fable plan I-1:
+`journey_palette_end_reaches_last_command` (e2e.rs:313-338) asserts the LAST registered
+command dispatches on End+Enter and currently pins `save_settings`; registering the new
+command after it would break the journey and force implementer improvisation. Keeping
+Save Settings last is also the better menu order — the commit action closes the section):
 
 ```rust
         r.register("set_wrap_column", "Set Wrap Column\u{2026}", Some(MenuCategory::Settings), |c| {
@@ -281,6 +302,9 @@ registry.rs (after save_settings, :474):
             CommandResult::Handled
         });
 ```
+
+After Step 2, run the journey (`cargo test -p wordcartel journey_palette_end`) and confirm
+it still passes — the pin that save_settings remains last.
 
 - [ ] **Step 3: the persistence extension** (the per-field pattern — grounding §A settings.rs, every site enumerated): `SettingsSnapshot` gains `pub view_wrap_column: u16,` (:39); `OView` gains `#[serde(skip_serializing_if = "Option::is_none")] pub wrap_column: Option<u16>,` (:93); `snapshot_of` gains `view_wrap_column: cfg.view.wrap_column,` (:136); `runtime_snapshot` gains `view_wrap_column: editor.view_opts.wrap_column,` (:151); the view diff block gains (byte-parallel to the bool siblings — `Option<u16>` is Copy, so the mask predicate is `mk_view.and_then(|v| v.wrap_column).is_some()` and the existing arg `ex_view.and_then(|v| v.wrap_column.as_ref())`):
 
@@ -312,4 +336,4 @@ with `wrap_column.is_some()` OR'd into `any_view` and the field added to the `OV
   predicted byte-identity, the suite proves it); no test asserts the old default 80.
 - The upstream-report candidates (CJK trailing spaces → markdown hard-break; prefix-inference anaphora mangling) are recorded in the spec's Deferred — surface them in the ship report for the user's par-command work.
 - Pre-merge: smoke verbatim + a live tmux sanity (set wrap column 40 via the Settings menu → reflow a paragraph → verify 40-column output and the measure column narrows when measure is on; Save Settings → `[view] wrap_column = 40` in the overrides file).
-- Ship-time bookkeeping: backlog — record the repar10 effort (not a lettered backlog item; note it under the transforms/C2 lineage), update the E1 chrome table's wrap_column row, working order still points at E3 next.
+- Ship-time bookkeeping: backlog — record the repar10 effort (not a lettered backlog item; note it under the transforms/C2 lineage), ADD a wrap_column row to the E1 chrome table (docs/ux-backlog.md:361-369 — no such row exists yet; Fable plan M-2), working order still points at E3 next.
