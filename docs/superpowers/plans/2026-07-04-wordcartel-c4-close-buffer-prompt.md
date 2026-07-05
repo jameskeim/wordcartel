@@ -317,13 +317,11 @@ pub(crate) fn close_buffer_now(editor: &mut Editor, id: BufferId) {
 ```
 
 (The `…` bodies follow the named sibling idioms exactly — the implementer locates each
-cited fixture and mirrors it; every assertion listed is required. If NO existing timeout
-test drives the tick arm, construct directly: arm `pending_after_save` with
-`at_ms: 0`, then `reduce(Msg::Tick, …)` with a `TestClock(SAVE_QUIT_TIMEOUT_MS + 1)` —
-the tick arm reads `clock.now_ms()` against `p.at_ms`; verify the const's value (5_000,
-app.rs:1376) rather than importing the fn-local const. RED: the first two fail — the
-timeout falls into the generic "try again" else-branch, and quit leaves the pending
-armed.)
+cited fixture and mirrors it; every assertion listed is required. The timeout test
+drives the EXTRACTED `save_timeout_tick` helper from Step 2 directly — the block lives
+in `run()` and is unreachable through `reduce` (Codex plan r1/r2); do NOT attempt a
+`reduce(Msg::Tick)` route. RED: the first two fail — the CloseBuffer variant has no
+timeout branch yet, and quit leaves the pending armed.)
 
 - [ ] **Step 2: the timeout branch — via an extracted seam (Codex plan r1: the timeout
   block lives in `run()`, app.rs:1419-1444, NOT in reduce's `Msg::Tick` arm — no test can
@@ -337,21 +335,25 @@ pub(crate) fn save_timeout_tick(editor: &mut Editor, now: u64) {
     if let Some(p) = &editor.pending_after_save {
         let waited = now.saturating_sub(p.at_ms);
         if waited > SAVE_QUIT_TIMEOUT_MS {
-            let timed_out_drain = matches!(&p.action, crate::editor::PostSaveAction::ContinueQuitDrain);
-            let timed_out_quit  = matches!(&p.action, crate::editor::PostSaveAction::Quit);
-            let timed_out_close = matches!(&p.action, crate::editor::PostSaveAction::CloseBuffer { .. });
+            // Compiler-exhaustive on purpose (Codex plan r2): a future
+            // PostSaveAction variant must NOT compile silently past this helper.
+            let action = p.action.clone();
             editor.pending_after_save = None;
-            if timed_out_quit {
-                editor.open_prompt(crate::prompt::Prompt::quit_confirm());
-                editor.status = "Save still running — choose again".into();
-            } else if timed_out_drain {
-                editor.quit_drain = None;
-                editor.quit_drain_advance = false;
-                editor.status = "save timed out — quit cancelled".into();
-            } else if timed_out_close {
-                // C4: a close is not a session-ending action the user is
-                // waiting on — cancel without re-prompting (spec D3).
-                editor.status = "save timed out — close cancelled".into();
+            match action {
+                crate::editor::PostSaveAction::Quit => {
+                    editor.open_prompt(crate::prompt::Prompt::quit_confirm());
+                    editor.status = "Save still running — choose again".into();
+                }
+                crate::editor::PostSaveAction::ContinueQuitDrain => {
+                    editor.quit_drain = None;
+                    editor.quit_drain_advance = false;
+                    editor.status = "save timed out — quit cancelled".into();
+                }
+                crate::editor::PostSaveAction::CloseBuffer { .. } => {
+                    // C4: a close is not a session-ending action the user is
+                    // waiting on — cancel without re-prompting (spec D3).
+                    editor.status = "save timed out — close cancelled".into();
+                }
             }
         }
     }
@@ -362,11 +364,11 @@ pub(crate) fn save_timeout_tick(editor: &mut Editor, now: u64) {
   move the existing comments INTO the helper (they document the Quit/drain branches);
   `SAVE_QUIT_TIMEOUT_MS` moves from run()-local (app.rs:1376) to module scope (same
   value, `const SAVE_QUIT_TIMEOUT_MS: u64 = 5_000;` above the helper) — the `sq_deadline`
-  reference at app.rs:1448 keeps working. NOTE the pre-existing final `else`
-  ("Save still running — try again") becomes UNREACHABLE once all three variants have
-  branches — drop it, and record in the report that the three-variant match is now
-  exhaustive-by-construction (a deliberate, behavior-identical simplification; if clippy
-  flags anything, prefer a `match &p.action` over the flag trio).
+  reference at app.rs:1448 keeps working. The pre-existing final `else`
+  ("Save still running — try again") was ALREADY dead code (both existing variants have
+  branches — Codex r2 confirmed) and is dropped; the helper uses a compiler-exhaustive
+  `match` (not the flag trio) so a future `PostSaveAction` variant cannot compile
+  silently past it. Record both facts in the report.
 
 - [ ] **Step 3: the quit-supersedes clear.** At the TOP of `Command::Quit`'s arm (commands.rs:526, before `any_dirty`):
 
