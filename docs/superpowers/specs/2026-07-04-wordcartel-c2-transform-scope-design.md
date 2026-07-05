@@ -262,6 +262,11 @@ performed by hand at a narrow width).
 - No `wrap_column`-aware reflow width (pre-existing decoupling stands; a future effort
   may revisit).
 - No multi-cursor/secondary-selection semantics (transforms already use the primary only).
+- Mid-tab span degradation, accepted and pinned (user-ratified 2026-07-05, from a plan-
+  review probe): when pulldown cannot split a tab byte, a nested item's span starts at
+  the PREVIOUS line's newline, so the line-start-extended unit degrades to the OUTER
+  item (whole, marker included — safe, just wider). Not special-cased; one pin records
+  the shape (`"- x\n\t- a\n"` → the outer item's unit).
 - No change to loose-item/fence/table pass-through behavior inside repar. HtmlBlock/
   HtmlComment units reflow as prose (probe-verified) — the identical pre-existing
   behavior at whole-document scope; not "fixed" here (Fable M3).

@@ -56,7 +56,7 @@
 
     #[test]
     fn transform_unit_in_item_body_is_the_item_not_the_paragraph() {
-        // Loose item: the body sits in a Paragraph CHILD (2..12) — the unit must be
+        // Loose item: the body sits in a Paragraph CHILD (2..13, probe) — the unit must be
         // the ITEM (0..14, trailing blank included per anatomy), never the paragraph.
         let text = "- alpha item\n\n- beta item\n";
         let bt = blocks_of(text);
@@ -112,6 +112,10 @@
         // (a) first-nested indent (§B.5: bytes 8-9 → inner item 10..18 → unit 8..18);
         let text = "- outer\n  - inner\n";
         let bt = blocks_of(text);
+        let inner_first = &bt.top_level()[0].children[0]
+            .children.iter().find(|c| matches!(c.kind, wordcartel_core::block_tree::BlockKind::List))
+            .and_then(|l| l.children.first()).expect("nested item").span;
+        assert_eq!(*inner_first, 10..18, "precondition (probe-verified)");
         let u = transform_unit_at(text, &bt, 8).expect("indent byte");
         assert_eq!(u, 8..18, "the INNER item, line-start-extended");
         // (b) space-indented TOP-LEVEL item " - a" (precondition-assert it parses as a list);
@@ -121,18 +125,25 @@
             "precondition: 1-space indent still a list");
         let item = bt2.top_level()[0].children[0].span.clone();
         assert_eq!(transform_unit_at(text2, &bt2, 0), Some(0..item.end));
-        // (c) TAB-indented NESTED item (grounding surprise: a BARE top-level "\t- a" is
-        // IndentedCode, so the tab shape must be nested — precondition-assert it).
-        let text3 = "- x\n\t- a\n";
+        // (c) TAB-indented NESTED item — probe-verified corpus (Fable plan C1: for
+        // "- x\n\t- a\n" pulldown starts the inner span at the PREVIOUS newline —
+        // mid-tab, unsplittable — so THAT shape degrades; use the ordered-outer form
+        // whose inner span starts on the tab line).
+        let text3 = "1. x\n\t- a\n";
         let bt3 = blocks_of(text3);
         let outer3 = &bt3.top_level()[0].children[0];
-        // Inline descendant-ListItem check (Codex plan r1: define before use, no forward ref).
-        fn has_descendant_item(b: &wordcartel_core::block_tree::Block) -> bool {
-            b.children.iter().any(|c| matches!(c.kind, wordcartel_core::block_tree::BlockKind::ListItem) || has_descendant_item(c))
-        }
-        assert!(has_descendant_item(outer3), "precondition: the tab-indented line parses as a nested ListItem — if this fails, choose a corpus pulldown accepts and record it");
-        let u3 = transform_unit_at(text3, &bt3, 4).expect("tab indent byte");
-        assert!(u3.start == 4, "line-start-extended nested item: {u3:?}");
+        let inner3 = outer3.children.iter().find(|c| matches!(c.kind, wordcartel_core::block_tree::BlockKind::List))
+            .and_then(|l| l.children.first()).expect("nested item exists");
+        assert_eq!(inner3.span.start, 5, "precondition: inner span starts ON the tab line");
+        let u3 = transform_unit_at(text3, &bt3, 5).expect("tab indent byte");
+        assert_eq!(u3, 5..inner3.span.end, "the nested item, line-start-extended");
+        // (d) The DEGRADATION pin (user-ratified 2026-07-05): the mid-tab shape's
+        // inner span starts at the previous newline → the unit is the OUTER item.
+        let text4 = "- x\n\t- a\n";
+        let bt4 = blocks_of(text4);
+        let outer4 = bt4.top_level()[0].children[0].span.clone();
+        let u4 = transform_unit_at(text4, &bt4, 4).expect("tab byte");
+        assert_eq!(u4, 0..outer4.end, "mid-tab span shape degrades to the outer item — accepted");
     }
 
     #[test]
@@ -151,6 +162,22 @@
     }
 
     #[test]
+    fn degraded_parse_caret_is_nothing_to_transform() {
+        // Fable plan C2: a childless Document root (the M4-rest panic fallback's
+        // empty_tree shape) must yield None — never the whole buffer. Build the
+        // degenerate tree by hand (Block fields are pub).
+        let text = "some text here ok\n";
+        let bt = wordcartel_core::block_tree::BlockTree {
+            root: wordcartel_core::block_tree::Block {
+                kind: wordcartel_core::block_tree::BlockKind::Document,
+                span: 0..text.len(),
+                children: Vec::new(),
+            },
+        };
+        assert_eq!(transform_unit_at(text, &bt, 5), None, "degraded parse: no unit, the guard says nothing-to-transform");
+    }
+
+    #[test]
     fn caret_region_at_end_of_buffer_clamps() {
         let text = "only para\n";
         let bt = blocks_of(text);
@@ -162,7 +189,7 @@
     }
 ```
 
-Run: `cargo test -p wordcartel transform_unit caret_` — FAIL to compile (`transform_unit_at` doesn't exist): the recorded RED.
+Run: `cargo test -p wordcartel -- transform_unit caret_` (multiple filters OR-match after `--`; Fable plan M1) — FAIL to compile (`transform_unit_at` doesn't exist): the recorded RED.
 
 - [ ] **Step 2: implement the lookup.** In transform.rs, above `snap_to_blocks`, add (complete):
 
@@ -216,7 +243,14 @@ fn transform_unit_at(
         }
     }
     let last = *path.last().expect("path is never empty");
-    let in_leaf = last.children.is_empty() && pos >= last.span.start && pos < last.span.end;
+    // The ROOT is never a leaf: the degraded-parse fallback (empty_tree,
+    // block_tree.rs:333-335) yields a childless Document root — treating it as a
+    // leaf would return 0..len, the whole-buffer transform this effort kills
+    // (Fable plan C2; the container branch correctly yields None instead).
+    let in_leaf = path.len() > 1
+        && last.children.is_empty()
+        && pos >= last.span.start
+        && pos < last.span.end;
     let nearest = |kind_test: fn(&wordcartel_core::block_tree::BlockKind) -> bool| {
         path.iter().rev().find(|b| kind_test(&b.kind)).map(|b| b.span.clone())
     };
@@ -370,6 +404,7 @@ pub fn region_for_transform(doc: &crate::editor::Document) -> std::ops::Range<us
 - The four snap tests updated as enumerated; the three app.rs transform tests' fates exactly as the spec states (two survive unchanged, one rehomed with the multi-block sibling added); the chooser tests and `ctrl-t` untouched.
 - The fragment landmine unreachable: every unit is line-start-extended and marker-inclusive (the nested-item behavior pin proves the round trip).
 - The `[verify]`-marked corpus facts were precondition-asserted in tests, not assumed (tab-nested shape, loose-item Paragraph child, quote spans).
+- Flagged spec-name/home deviations (Fable plan M3, recorded): `caret_region_in_gap_is_empty` → `caret_region_in_gap_is_none_and_blankline_gaps`; the loose-marker pin homed as a transform.rs unit test; the rehomed reflow_buffer test dispatches `Some(0..len)` directly — the registered closures' `0..len` construction is exercised by the T3 palette journey.
 - `deepest_block_at`/`paragraph_range_at` (nav.rs) untouched; no core changes; no new deps; no `#[allow]`; no `unsafe`.
 - Pre-merge: smoke verbatim + a live tmux sanity (three-item list, caret in item 2, ctrl-t r → one item changes; palette Reflow Buffer → all change).
 - Controller merge-time bookkeeping: backlog C2 → SHIPPED (the gap-caret no-op convention, chooser-means-block, the N5 refinement); working order advances to D1+A5.
