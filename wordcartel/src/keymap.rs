@@ -211,8 +211,9 @@ pub fn preset_bindings(name: &str) -> Option<&'static [(&'static str, &'static s
 }
 
 /// Resolve a raw preset string to a known base ("cua" | "wordstar"); unknown → "cua".
-/// Shared by build_keymap (base + scoped selection) and run()'s seeding so the two
-/// can never disagree about what an unknown preset fell back to.
+/// Shared by build_keymap (scoped-table selection — base selection keeps its own
+/// warning-emitting fallback arm) and run()'s seeding so the two can never disagree
+/// about what an unknown preset fell back to.
 pub fn resolve_preset(name: &str) -> &'static str {
     match name { "wordstar" => "wordstar", _ => "cua" }
 }
