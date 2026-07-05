@@ -29,6 +29,7 @@
 **Files:**
 - Modify: `wordcartel/src/transform.rs` (width capture, fixups swap, const removal, four new pins)
 - Modify: `wordcartel/src/config.rs` (default 80 → 72 only)
+- Modify: `wordcartel/src/app.rs` (the two dispatch-level pins in the test module — Codex plan r1 m-1)
 
 **Interfaces:**
 - Consumes: `editor.view_opts.wrap_column: u16` (exists); repar 1.0.0 (`Options::new().width(u32) -> PResult<Options>`, `apply_fixups(&str)`, verbs `"--reflow"`/`"--unwrap"`/`"--ventilate"`).
@@ -136,7 +137,7 @@ And in app.rs's test module (beside the existing transform behavior tests), the 
     }
 ```
 
-- [ ] **Step 2: record the RED.** Run `cargo test -p wordcartel -- ventilate_then_reflow fixups_stack reflow_multibyte transform_width dispatch_uses async_dispatch`. Expected: `ventilate_then_reflow_respects_sentence_boundaries` FAILS (detector 2 and 3 — the probe-recorded artifact: `" ."` padding and period count 6); `fixups_stack_is_actually_applied` FAILS (d3 literal mismatch — prose absent); `dispatch_uses_wrap_column_for_width` FAILS (dispatch still uses 72); the multibyte pin FAILS on the trailing-space/prose shape. Quote the failures in the report — this is the strongest RED this campaign has had (probe-predicted failure modes).
+- [ ] **Step 2: record the RED — honest accounting (Codex plan r1 F1).** Run `cargo test -p wordcartel -- ventilate_then_reflow fixups_stack reflow_multibyte transform_width dispatch_uses async_dispatch`. Expected RED (exactly three): `ventilate_then_reflow_respects_sentence_boundaries` FAILS (detectors 2+3 — the probe-recorded artifact: `" ."` padding, period count 6≠5 — THE prose-RED); `dispatch_uses_wrap_column_for_width` and `async_dispatch_uses_wrap_column_for_width` FAIL (both dispatch arms still hardcode 72). Expected GREEN-FROM-BIRTH (contract pins, not feature tests): `fixups_stack_is_actually_applied`, `reflow_multibyte_corpus_is_stable`, `transform_width_follows_wrap_column` — the current stack (`Options::new()` already carries `all`; `"markdown"` is additive) produces identical output on these corpora, and `run_transform` already takes the width parameter; these pins guard REGRESSION, they do not drive the change. Quote the three failures verbatim in the report; if a green-from-birth pin unexpectedly fails, STOP and report BLOCKED (a literal transcription error or a repar drift).
 
 - [ ] **Step 3: implement.** transform.rs: DELETE `pub const DEFAULT_REFLOW_WIDTH: u32 = 72;` (:4). In `dispatch_transform`, after the `range.is_empty()` guard (post-:218), insert:
 
@@ -170,7 +171,11 @@ config.rs (:102): `wrap_column: 80,` → `wrap_column: 72,` (fork 1a-A — the w
 - Modify: `wordcartel/src/minibuffer.rs` (the variant), `wordcartel/src/app.rs` (one match arm), `wordcartel/src/prompts.rs` (submit fn + tests), `wordcartel/src/registry.rs` (command + membership test), `wordcartel/src/settings.rs` (per-field extension + pin), `wordcartel/src/config.rs` (round-trip additions)
 
 **Interfaces:**
-- Consumes: T1 (transforms now honor the field the setter mutates).
+- Consumes: T1 — INCLUDING its config default flip to 72 (Codex plan r1 F3: `snap()` gains
+  `view_wrap_column: 72`, which must equal `ViewConfig::default().wrap_column` or the
+  existing `save_success_sets_status_and_returns_snapshot` sees a phantom divergence
+  between a real Editor's runtime snapshot and the snap-built expectation; T2 is
+  sequenced strictly after T1, and the implementer verifies the default is already 72).
 - Produces: command `set_wrap_column` ("Set Wrap Column…", `MenuCategory::Settings`); `MinibufferKind::WrapColumn`; `prompts::wrap_column_submit`; `SettingsSnapshot.view_wrap_column: u16` + `OView.wrap_column: Option<u16>`.
 
 - [ ] **Step 1: failing setter tests** (prompts.rs test module, the `goto_line_clamps_and_rejects_garbage` idiom at prompts.rs:324-336):
@@ -178,6 +183,7 @@ config.rs (:102): `wrap_column: 80,` → `wrap_column: 72,` (fork 1a-A — the w
 ```rust
     #[test]
     fn wrap_column_submit_parses_clamps_and_rejects() {
+        use crate::editor::Editor; // the prompts test module has only `use super::*` (Codex plan r1 F2)
         let mut e = Editor::new_from_text("a\n", None, (40, 10));
         crate::derive::rebuild(&mut e);
         let initial = e.view_opts.wrap_column;
@@ -217,6 +223,31 @@ Registry: extend `settings_commands_registered_in_settings_category` (registry.r
     }
 ```
 
+Plus the LIVE-PATH persistence pin (Codex plan r1 F4 — spec D4's "set → save → the file
+carries [view] wrap_column" through the real setter + save pipeline, not synthetic
+snapshots; home: settings.rs tests, which can reach prompts and perform_settings_save):
+
+```rust
+    #[test]
+    fn set_wrap_column_then_save_writes_the_key() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("a\n", None, (40, 10));
+        crate::prompts::wrap_column_submit(&mut e, "40");
+        assert_eq!(e.view_opts.wrap_column, 40, "precondition: the setter took");
+        let d = tempdir();
+        let path = d.join("settings-overrides.toml");
+        let base = snap("cua", ThemeIdentity::Builtin("default".into()), false); // baseline wrap 72
+        let of = perform_settings_save(&mut e, false, Some(&path),
+            &base, &OverridesFile::default(), &OverridesFile::default(), &crate::fsx::RealFs);
+        assert!(of.is_some(), "save succeeds: {}", e.status);
+        assert_eq!(e.status, "settings saved");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("wrap_column = 40"), "the file carries the key: {text}");
+    }
+```
+
+(`runtime_snapshot` inside `perform_settings_save` reads the editor's live 40 vs the
+baseline's 72 → rule-1 write. Reuse the settings test module's existing `tempdir` idiom.)
 RED: none of the fields/fns exist.
 
 - [ ] **Step 2: implement the setter.** minibuffer.rs: add `WrapColumn,` to `MinibufferKind` (:7-15 — doc comment `/// Numeric input for Set Wrap Column.`). app.rs (:812): add the arm `crate::minibuffer::MinibufferKind::WrapColumn => crate::prompts::wrap_column_submit(editor, &mb.text),` (the match is exhaustive — the compiler confirms this is the only site; grounding surprise 3 verified no other exhaustive match exists). prompts.rs (beside goto_line_submit):
@@ -276,7 +307,9 @@ with `wrap_column.is_some()` OR'd into `any_view` and the field added to the `OV
 - The four ratified forks hold: one knob (transforms + guide + measure agree); default 72 (transform-output-invisible); minibuffer setter with the distinguished input semantics (parse failure = unchanged; below-min = clamped SET with rebuild); the pinned `none,all,prose,markdown` baseline.
 - The contract pins are probe-true (grounding §B literals) and carry their mandated comments: the trailing-space artifact named as repar's (never trimmed), the distinct-openings constraint, the decomposed-accent requirement.
 - `dispatch_transform`'s signature unchanged — all 6 callers byte-identical; `DEFAULT_REFLOW_WIDTH` gone from the tree.
-- The five pre-existing repar corpora pass unchanged (probe-verified identical under the new stack); no test asserts the old default 80.
+- The five pre-existing repar corpora pass unchanged — enforced by the suite itself
+  (they are existing tests that must stay green through T1's stack swap; the probe
+  predicted byte-identity, the suite proves it); no test asserts the old default 80.
 - The upstream-report candidates (CJK trailing spaces → markdown hard-break; prefix-inference anaphora mangling) are recorded in the spec's Deferred — surface them in the ship report for the user's par-command work.
 - Pre-merge: smoke verbatim + a live tmux sanity (set wrap column 40 via the Settings menu → reflow a paragraph → verify 40-column output and the measure column narrows when measure is on; Save Settings → `[view] wrap_column = 40` in the overrides file).
 - Ship-time bookkeeping: backlog — record the repar10 effort (not a lettered backlog item; note it under the transforms/C2 lineage), update the E1 chrome table's wrap_column row, working order still points at E3 next.
