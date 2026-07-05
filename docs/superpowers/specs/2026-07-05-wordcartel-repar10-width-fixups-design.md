@@ -1,6 +1,10 @@
 # Repar 1.0 integration — width wiring, fixups baseline, contract pins (design)
 
-Status: DRAFT (user-approved design 2026-07-05; four forks resolved one at a time)
+Status: CLEAN — Codex ×4 ("ready for planning") + Fable ×2 (READY; empirical probes
+against the real repar 1.0.0: the detached-period corruption reproduced-and-prose-fixed,
+the width floor mapped, the CJK trailing-space artifact discovered, the D1/D3
+contradiction adjudicated), 2026-07-05. Four user-ratified forks (one-knob width, default
+72, minibuffer setter + persistence, pinned none,all,prose,markdown baseline).
 Effort: user-directed insertion ahead of E3 in the working order (reconstructs the
 repar-integration intent from the par-command session of 2026-07-04, which this session
 never received). Companion context: repar 1.0.0 landed on disk mid-D1+A5 (the T1
