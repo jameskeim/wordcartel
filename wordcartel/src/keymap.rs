@@ -202,6 +202,11 @@ impl KeyTrie {
 // ---------------------------------------------------------------------------
 
 /// Return the static binding table for a named preset, or `None` for unknown names.
+/// The known preset names — the single list preset-wide pins iterate. Keep in
+/// sync with preset_bindings' arms (the surface pin unwraps preset_bindings for
+/// every entry, so a PRESETS name without a bindings arm fails loudly).
+pub const PRESETS: &[&str] = &["cua", "wordstar"];
+
 pub fn preset_bindings(name: &str) -> Option<&'static [(&'static str, &'static str)]> {
     match name {
         "cua"      => Some(CUA),
@@ -830,6 +835,12 @@ mod tests {
         assert_eq!(resolve_preset("wordstar"), "wordstar");
         assert_eq!(resolve_preset("cua"), "cua");
         assert_eq!(resolve_preset("dvorak"), "cua");
+        // PRESETS is the single source preset-wide pins iterate — every entry must
+        // have bindings and resolve to itself (a new preset missing either fails here).
+        for p in PRESETS {
+            assert!(preset_bindings(p).is_some(), "{p} must have a bindings table");
+            assert_eq!(resolve_preset(p), *p, "{p} must resolve to itself");
+        }
     }
 
     #[test]
@@ -892,7 +903,7 @@ mod tests {
         // D1+A5 live-sanity finding: with runtime switching, a preset without any
         // keyboard route to the menu or palette strands keyboard-only users (no
         // switch-back). Every preset must bind at least one of "menu" / "palette".
-        for preset in ["cua", "wordstar"] {
+        for preset in PRESETS {
             let surfaced = preset_bindings(preset).unwrap().iter()
                 .any(|(_, id)| *id == "menu" || *id == "palette");
             assert!(surfaced, "{preset} must reach a command surface by keyboard");
@@ -902,7 +913,7 @@ mod tests {
     #[test]
     fn close_buffer_is_unbound_in_both_presets_by_design() {
         // C4 closure (spec D5): per-preset patches are the supported binding path.
-        for preset in ["cua", "wordstar"] {
+        for preset in PRESETS {
             for (_, id) in preset_bindings(preset).unwrap() {
                 assert_ne!(*id, "close_buffer", "{preset} must not bind close_buffer");
             }
