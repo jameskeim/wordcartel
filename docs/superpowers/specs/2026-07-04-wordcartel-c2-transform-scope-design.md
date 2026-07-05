@@ -62,11 +62,14 @@ ENTIRE list (top-level snap reaches the `List` container, not the `ListItem`).
   `caret` (the primary head, clamped to `buf_len.saturating_sub(1)` for the end-of-buffer
   caret — `deepest_block_at` uses a half-open `pos < span.end` test); if found, return
   its span. If NO block contains the caret (a blank-line gap): return the EMPTY range
-  `caret..caret` — the transform then no-ops via the existing identical-output path with
-  the "already …" status. (Rationale: a caret on a blank line has no block intent; doing
-  nothing loudly beats guessing. This diverges from `paragraph_range_at`'s gap-run
-  fallback deliberately — that fallback serves text-object selection, where selecting a
-  blank run is meaningful; transforming one is not.)
+  `caret..caret` — `dispatch_transform` ALREADY guards empty ranges and returns the
+  status `"nothing to transform"` before `run_transform` runs (transform.rs:110 — Codex
+  r1 corrected the original claim, which cited the identical-output "already …" path;
+  NO new code, the existing guard is the no-op). (Rationale: a caret on a blank line has
+  no block intent; doing nothing loudly beats guessing. This diverges from
+  `paragraph_range_at`'s gap-run fallback deliberately — that fallback serves
+  text-object selection, where selecting a blank run is meaningful; transforming one
+  is not.)
 
 A caret inside a code fence returns the fence's span; repar passes fences through
 verbatim, so the result is the honest "already reflowed" no-op — acceptable and pinned.
@@ -81,6 +84,15 @@ block, the interior stays.
   gap, `start = from` (raw, today's fallback behavior).
 - `end` = the deepest block containing `to.saturating_sub(1)` (the last selected byte —
   `to` is exclusive) → its `span.end`; gap → `end = to`.
+- **"Gap" includes CONTAINER-INTERIOR blanks (Codex r1 I-3):** `deepest_block_at`
+  returns the parent container when a byte falls between its children (e.g. the blank
+  line between loose-list items lies inside `List.span` but inside no `ListItem`). If
+  the deepest node found is a container whose children do not contain the byte, the
+  endpoint is treated as a GAP (raw endpoint) — NOT snapped to the container's span.
+  Otherwise a selection from item 1 into an inter-item blank would silently pull in
+  every later item (the surprise-diff class decision 1 exists to kill). Concretely: the
+  lookup snaps only when the found block is a LEAF (no children) or the byte lies
+  within a leaf descendant. Pinned by a dedicated loose-list test.
 - Return `start..end`. Degenerate guard: if the computed range is empty or inverted
   (unreachable with a non-empty selection, but SATURATING discipline applies), return
   `from..to`.
@@ -100,7 +112,9 @@ ids `reflow_buffer` / `unwrap_buffer` / `ventilate_buffer`. They dispatch throug
 `dispatch_transform_buffer(editor, kind, clock, msg_tx)` (or an explicit-region parameter
 on the existing dispatch — the plan picks the smaller diff) whose region is `0..buf_len`
 unconditionally. Everything downstream (async threshold, guard, merge, staleness) is the
-shared path — the 1 MiB async route now belongs to the `_buffer` variants in practice.
+shared path. The 1 MiB async route remains reachable from BOTH scopes — any single
+block ≥ 1 MiB routes async under the caret default (Codex r1) — the `_buffer` variants
+merely make it the common case.
 
 **The ctrl-t chooser is UNCHANGED** (prompt.rs:115-130: `r`/`u`/`v`): its keys now mean
 block scope, which IS the new default — the least input produces the proportionate
@@ -128,16 +142,21 @@ The chooser's prompt string is also unchanged.
 - `transform_with_identical_output_makes_no_edit` (app.rs:2715) → unchanged assertions;
   its single-block corpus means the caret default reaches the same region (verify, note
   in the report).
-- `large_buffer_routes_async_and_delivers_transformdone` (app.rs:2767) → drives
-  `reflow_buffer` (the empty-selection default no longer reaches 1 MiB); same async
-  assertions.
+- `large_buffer_routes_async_and_delivers_transformdone` (app.rs:2767) → UNCHANGED
+  (Codex r1 corrected the original claim: its corpus is one giant no-newline paragraph
+  — `"word ".repeat(300_000)` — so the caret default's deepest block IS the ≥1 MiB
+  region and the async route fires exactly as today; the test becomes a pin that
+  single-huge-block caret transforms still route async). A NEW small test additionally
+  pins that `reflow_buffer` reaches the async path on the same corpus shape.
 - The four `snap_*` tests (transform.rs:230-281) → updated to endpoint-deepest semantics
   (the mid-paragraph and fence cases assert the SAME spans as today — paragraphs and
   fences are leaf blocks at top level; only the multi-block case's phrasing and a NEW
   nested case change expectations).
 
 **New pins:**
-- transform.rs unit: `snap_inside_one_list_item_touches_only_that_item`;
+- transform.rs unit: `snap_endpoint_on_loose_list_blank_is_gap_not_container` (the I-3
+  rule: selection from mid-item-1 to an inter-item blank → end stays raw, later items
+  untouched); `snap_inside_one_list_item_touches_only_that_item`;
   `snap_across_three_items_touches_exactly_those`; `snap_paragraph_into_list_unions_endpoints`;
   `snap_selection_wholly_in_gap_returns_input`; `caret_region_is_deepest_block`
   (item + nested-item + paragraph cases); `caret_region_in_gap_is_empty`;
