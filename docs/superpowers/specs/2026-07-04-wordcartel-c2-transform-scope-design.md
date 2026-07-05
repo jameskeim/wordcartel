@@ -55,14 +55,23 @@ ENTIRE list (top-level snap reaches the `List` container, not the `ListItem`).
 `region_for_transform`'s empty-selection branch (transform.rs:87-88) stops returning
 `0..buf_len`. New behavior: the deepest block containing the caret —
 
-- Hoist `deepest_block_at` from nav.rs private scope to a shared `pub(crate)` home the
-  design leaves to the plan (either `pub(crate)` in nav.rs consumed via
-  `crate::nav::deepest_block_at`, or moved beside `snap_to_blocks` — one copy, no
-  duplication; `paragraph_range_at` keeps using the same fn).
-- `region_for_transform(doc)` with an empty selection: find the deepest block containing
-  `caret` (the primary head, clamped to `buf_len.saturating_sub(1)` for the end-of-buffer
-  caret — `deepest_block_at` uses a half-open `pos < span.end` test); if found, return
-  its span. If NO block contains the caret (a blank-line gap): return the EMPTY range
+- **The lookup is TRANSFORM-SPECIFIC — `deepest_block_at` alone is insufficient (Codex
+  r2):** the block tree nests `Paragraph` leaves INSIDE `ListItem`s (block_tree.rs:261/
+  :405), so the deepest leaf under a caret in item-body text is the marker-LESS
+  paragraph span — feeding it to repar IS the fragment landmine. New
+  `fn transform_unit_at(blocks: &BlockTree, pos: usize) -> Option<Range<usize>>` in
+  transform.rs: descend recording the path (root → deepest node containing `pos`, the
+  same half-open `pos < span.end` test); the unit is the span of the NEAREST `ListItem`
+  ancestor of the deepest leaf (for nested lists this is the DEEPEST ListItem on the
+  path — a caret in a sub-item transforms the sub-item, per decision 2); if no ListItem
+  is on the path, the deepest LEAF's span. `deepest_block_at` in nav.rs stays untouched
+  (text-objects keep their semantics); no hoist needed. **Plan-phase grounding check:**
+  verify whether `Paragraph` children inside a `BlockQuote` carry the `> ` prefixes in
+  their spans; if NOT, `BlockQuote` joins `ListItem` in the ancestor-preference set
+  (same rule, one more kind).
+- `region_for_transform(doc)` with an empty selection: `transform_unit_at(blocks, caret)`
+  (the primary head, clamped to `buf_len.saturating_sub(1)` for the end-of-buffer
+  caret); if found, return its span. If NO block contains the caret (a blank-line gap): return the EMPTY range
   `caret..caret` — `dispatch_transform` ALREADY guards empty ranges and returns the
   status `"nothing to transform"` before `run_transform` runs (transform.rs:110 — Codex
   r1 corrected the original claim, which cited the identical-output "already …" path;
@@ -81,19 +90,22 @@ verbatim, so the result is the honest "already reflowed" no-op — acceptable an
 semantics — the four `snap_*` tests update): each ENDPOINT snaps to its deepest enclosing
 block, the interior stays.
 
-- `start` = the deepest block containing `from` → its `span.start`; if `from` sits in a
-  gap, `start = from` (raw, today's fallback behavior).
-- `end` = the deepest block containing `to.saturating_sub(1)` (the last selected byte —
+- `start` = `transform_unit_at(blocks, from)` → its `span.start` (the SAME unit lookup
+  as D1 — nearest-ListItem-ancestor-else-leaf; Codex r2); if `from` sits in a gap,
+  `start = from` (raw, today's fallback behavior).
+- `end` = `transform_unit_at(blocks, to.saturating_sub(1))` (the last selected byte —
   `to` is exclusive) → its `span.end`; gap → `end = to`.
-- **"Gap" includes CONTAINER-INTERIOR blanks (Codex r1 I-3):** `deepest_block_at`
-  returns the parent container when a byte falls between its children (e.g. the blank
-  line between loose-list items lies inside `List.span` but inside no `ListItem`). If
-  the deepest node found is a container whose children do not contain the byte, the
-  endpoint is treated as a GAP (raw endpoint) — NOT snapped to the container's span.
-  Otherwise a selection from item 1 into an inter-item blank would silently pull in
-  every later item (the surprise-diff class decision 1 exists to kill). Concretely: the
-  lookup snaps only when the found block is a LEAF (no children) or the byte lies
-  within a leaf descendant. Pinned by a dedicated loose-list test.
+- **"Gap" includes CONTAINER-INTERIOR blanks (Codex r1 I-3, lookup-shape note per r2):**
+  when the descent's deepest node containing the byte is a CONTAINER whose children do
+  not contain it (e.g. the blank line between loose-list items lies inside `List.span`
+  but inside no `ListItem` — detectable during the path walk: the final node has
+  children but none matched), `transform_unit_at` returns None → the endpoint is a GAP
+  (raw endpoint), NEVER the container's span. Otherwise a selection from item 1 into an
+  inter-item blank would silently pull in every later item (the surprise-diff class
+  decision 1 exists to kill). EXCEPTION consistent with the unit rule: if a `ListItem`
+  ancestor sits on the path ABOVE the gap-container… impossible — a List's interior
+  blank has no ListItem ancestor below the List; the None return is unconditional for
+  container-interior bytes. Pinned by a dedicated loose-list test.
 - Return `start..end`. Degenerate guard: if the computed range is empty or inverted
   (unreachable with a non-empty selection, but SATURATING discipline applies), return
   `from..to`.
@@ -155,7 +167,11 @@ The chooser's prompt string is also unchanged.
   nested case change expectations).
 
 **New pins:**
-- transform.rs unit: `snap_endpoint_on_loose_list_blank_is_gap_not_container` (the I-3
+- transform.rs unit: `transform_unit_in_item_body_is_the_item_not_the_paragraph` (**the
+  Codex r2 pin — the marker rides along**: caret in item-body text → the ListItem span
+  including the marker, NOT the nested Paragraph leaf); `transform_unit_in_nested_item_is_the_deepest_item`
+  (a sub-item's caret → the sub-ListItem, not the outer item);
+  `snap_endpoint_on_loose_list_blank_is_gap_not_container` (the I-3
   rule: selection from mid-item-1 to an inter-item blank → end stays raw, later items
   untouched); `snap_inside_one_list_item_touches_only_that_item`;
   `snap_across_three_items_touches_exactly_those`; `snap_paragraph_into_list_unions_endpoints`;
