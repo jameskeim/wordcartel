@@ -1,6 +1,9 @@
 # C2 — transform scope: block-under-caret default + deepest-block snapping + `_buffer` variants
 
-**Status:** draft — pending Codex + Fable spec review
+**Status:** CLEAN — Codex spec review ×4 (r4 CLEAN) + Fable5 ×4 (r8 READY; its rounds
+compiled probes against the locked pulldown/repar rlibs and corrected the span anatomy,
+the gap rule, and the unit refinement's wording — three user ratifications along the
+way), 2026-07-04.
 **Effort:** C2 (backlog Theme C; `settled-design` · Medium — both decisions user-resolved
 2026-07-03, design approved 2026-07-04)
 **Date:** 2026-07-04 · **Facts as of:** `d1608d7` (post-C4 merge)
@@ -91,7 +94,8 @@ ENTIRE list (top-level snap reaches the `List` container, not the `ListItem`).
     its nested list; a top-level quote's own `> ` prefix bytes) → the SAME preference
     set as the leaf branch (Fable r6 N2): nearest `ListItem` on the path, else nearest
     `BlockQuote`, else None — **with ONE refinement (Fable r6 N5, user-ratified A; wording line-keyed per r7
-    P1): if the first non-space content of the byte's LINE begins a `ListItem` block —
+    P1): if the first non-WHITESPACE content of the byte's LINE begins a `ListItem` block
+    (Fable r8 Q1 — tab-indented items count) —
     at ANY depth beneath the descent's final node (the first nested item's indent ends
     the descent at the OUTER Item, where the target is a grandchild; List spans exclude
     leading indent too) — the unit is THAT ListItem. Home-then-transform acts on the
@@ -233,8 +237,8 @@ The chooser's prompt string is also unchanged.
   and `caret_in_tight_item_lead_text_transforms_the_item` (**Fable C2's content-not-gap
   pins**); `caret_in_nested_item_indent_transforms_the_child_item` (**the r6 N5
   refinement's pin**: Home on a `  - inner` line → the INNER item's unit — corpus must
-  include the FIRST-nested-item shape, the r7 P1 case, plus a space-indented TOP-LEVEL
-  item `" - a"` which the line-keyed rule also resolves to the item, r7 P4); `caret_reflow_on_blank_line_noops_with_status` (status `"nothing to transform"` — the
+  include the FIRST-nested-item shape, the r7 P1 case, a space-indented TOP-LEVEL
+  item `" - a"`, and a TAB-indented item (r8 Q1) — all resolving to the item); `caret_reflow_on_blank_line_noops_with_status` (status `"nothing to transform"` — the
   existing empty-range guard);
   `caret_reflow_in_fence_noops` (verbatim pass-through); `buffer_variants_act_whole_buffer`
   (one of the three suffices for region proof + the registry test extends to six
