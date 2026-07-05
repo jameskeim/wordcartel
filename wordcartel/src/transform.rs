@@ -62,9 +62,10 @@ fn extend_to_line_start(text: impl TextSource, span: std::ops::Range<usize>) -> 
     text.line_start(span.start)..span.end
 }
 
-/// The deepest ListItem beneath `node` whose span STARTS exactly at `at` — the
-/// N5 line-keyed refinement's target (the line's first non-whitespace content
-/// begins this item; List spans start at the same byte, so descend through them).
+/// The ListItem beneath `node` whose span STARTS exactly at `at` — the N5
+/// line-keyed refinement's target. An item's marker byte precedes any descendant's
+/// start, so first-match in the descent is always the item the line begins
+/// (List spans start at the same byte — descend through them).
 fn item_starting_at(node: &wordcartel_core::block_tree::Block, at: usize) -> Option<&wordcartel_core::block_tree::Block> {
     for c in &node.children {
         if at >= c.span.start && at < c.span.end {
@@ -136,17 +137,42 @@ fn transform_unit_at(
         .map(|span| extend_to_line_start(text, span))
 }
 
+/// Fallback for a `snap_to_blocks` endpoint when its unit lookup returns None:
+/// if the endpoint's line is NON-blank, widen to its line boundary — `line_start`
+/// when `toward_start`, `line_end` otherwise (spec C2 D2, F1 whole-line-widening
+/// rule — prevents repar from seeing a mid-line fragment on uncovered content lines
+/// such as link-reference-definitions). Blank-line gaps return `raw` unchanged.
+fn snap_none_fallback(
+    text: impl TextSource,
+    pos: usize,
+    raw: usize,
+    toward_start: bool,
+) -> usize {
+    let ls = text.line_start(pos);
+    let le = text.line_end(pos);
+    if text.slice(ls..le).trim().is_empty() { raw }
+    else if toward_start               { ls }
+    else                               { le }
+}
+
 /// Snap a non-empty selection's ENDPOINTS to their transform units (spec C2 D2):
 /// start = the unit at `from` (its extended start), end = the unit at the last
-/// selected byte (its end); gap endpoints stay raw. The interior rides between.
+/// selected byte (its end). Gap endpoints stay raw; non-blank uncovered lines
+/// widen to their line boundary (F1 whole-line-widening rule). The interior rides
+/// between.
 pub fn snap_to_blocks(
     text: impl TextSource + Copy,
     blocks: &wordcartel_core::block_tree::BlockTree,
     from: usize,
     to: usize,
 ) -> std::ops::Range<usize> {
-    let start = transform_unit_at(text, blocks, from).map(|u| u.start).unwrap_or(from);
-    let end = transform_unit_at(text, blocks, to.saturating_sub(1)).map(|u| u.end).unwrap_or(to);
+    let start = transform_unit_at(text, blocks, from)
+        .map(|u| u.start)
+        .unwrap_or_else(|| snap_none_fallback(text, from, from, true));
+    let end_pos = to.saturating_sub(1);
+    let end = transform_unit_at(text, blocks, end_pos)
+        .map(|u| u.end)
+        .unwrap_or_else(|| snap_none_fallback(text, end_pos, to, false));
     if start < end { start..end } else { from..to }
 }
 
@@ -672,6 +698,55 @@ mod tests {
         assert_eq!(r.start, item1.start, "start snaps to item 1 start");
         assert_eq!(r.end, 14, "blank endpoint stays raw");
         assert!(r.end <= item2.start, "item 2 not pulled in");
+    }
+
+    // ---------------------------------------------------------------------------
+    // F1 whole-line-widening rule — non-blank uncovered lines (spec C2 D2 §F1)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn snap_endpoint_on_linkdef_line_widens_to_whole_line() {
+        // Link-reference-definition lines get NO block from the parser — a raw
+        // endpoint mid-def-line would feed repar a fragment. The F1 rule widens it.
+        let text = "para one\n\n[foo]: http://example.com\npara two\n";
+        let bt = blocks_of(text);
+        // Precondition: byte 20 (mid-def-line) must not be inside ANY top-level block.
+        let byte20_covered = bt.top_level().iter().any(|b| b.span.start <= 20 && 20 < b.span.end);
+        assert!(!byte20_covered,
+            "precondition FAILED — parser covers byte 20; F1 fix is untestable; BLOCKED");
+        let def_line_start = text.find("[foo]").unwrap(); // 10
+        assert_eq!(def_line_start, 10, "precondition: def line starts at byte 10");
+        // snap: from=20 (mid-def-line, non-blank, no unit) must widen to line start;
+        //        to=40  (inside "para two") → its span end.
+        let r = snap_to_blocks(text, &bt, 20, 40);
+        assert_eq!(r.start, 10,
+            "non-blank uncovered start endpoint must widen to line start (NOT raw 20)");
+        let para_two = bt.top_level().iter()
+            .find(|b| b.span.start <= 39 && 39 < b.span.end)
+            .expect("para two block must exist");
+        assert_eq!(r.end, para_two.span.end,
+            "end snaps to the trailing paragraph's block span end");
+        assert!(text[r].starts_with("[foo]"),
+            "region must start at the def line — no mid-line fragment");
+    }
+
+    #[test]
+    fn caret_on_linkdef_line_is_nothing_to_transform() {
+        // Caret on an uncovered non-blank line: transform_unit_at → None → empty
+        // range → "nothing to transform" (unchanged caret-default semantics).
+        let text = "para one\n\n[foo]: http://example.com\npara two\n";
+        let bt = blocks_of(text);
+        assert_eq!(transform_unit_at(text, &bt, 20), None,
+            "caret on def line: no unit — dispatch guard says nothing-to-transform");
+        // A selection wholly inside the def line widens to the whole def line.
+        let def_line_start = text.find("[foo]").unwrap(); // 10
+        let def_line_end = text[def_line_start..]
+            .find('\n').map(|o| def_line_start + o + 1).unwrap(); // 36
+        let r = snap_to_blocks(text, &bt, 12, 20);
+        assert_eq!(r.start, def_line_start,
+            "wholly-in-def-line selection: start widens to line start");
+        assert_eq!(r.end, def_line_end,
+            "wholly-in-def-line selection: end widens to line end");
     }
 
     #[test]
