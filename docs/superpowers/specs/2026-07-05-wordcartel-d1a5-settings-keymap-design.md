@@ -1,6 +1,10 @@
 # D1+A5 — settings write-back + runtime keymap switching (design)
 
-Status: DRAFT (user-approved design 2026-07-05; forks resolved one at a time)
+Status: CLEAN — Codex ×3 ("ready for planning") + Fable ×3 (READY; probe-verified TOML
+schema, wiring, reachability; the diff law adversarially walked incl. cross-project and
+--config-mask scenarios), 2026-07-05. Three user ratifications: contradiction-only-removal
+diff law (I-2 A), rule-3 mask-guard (N-1 A), plus the seven design forks resolved one at a
+time during brainstorm.
 Effort: D1 (save settings from the session) + A5 (switch keybind system from the menu),
 one effort per the backlog working order. Also closes C4's deferred close-buffer binding.
 
@@ -188,7 +192,11 @@ apply) — the same helper D2 mandates, so base and scoped application cannot di
   above the overrides, so a mask manufactures the coincidence+contradiction with no user
   action — while K is masked, rule 3 never fires; rule 1 still applies, so a GENUINE
   mid-masked-session change writes). Requires a third per-key snapshot of the `--config`
-  layer's inventory values (`MaskSnapshot`, sibling of the other two);
+  layer's inventory values (`MaskSnapshot`, sibling of the other two). For the THEME key
+  the mask predicate is PROVENANCE-based (Fable N-4): `--config` setting EITHER
+  `[theme] name` OR `[theme] file` masks the `[theme] name` override (a later layer's
+  `file` clears `name` in the merge, so a file-mask erases the pick by the same
+  mechanism);
   (4) otherwise → absent.
   The overrides layer is already parsed in the chain; the loop keeps its raw inventory
   values (an `OverridesSnapshot`, sibling of the baseline snapshot). The result
@@ -324,7 +332,8 @@ Exactly the runtime-mutable set, keyed to their config sections:
   un-diverged never-saved builtin writes nothing); the diff-law matrix (rules 1-4:
   write-on-divergence, keep-on-coincidence — the cross-project walkthrough with two
   baselines, remove-on-contradiction, absent-otherwise; the mask-guard: a --config layer
-  setting K → masked save keeps the override verbatim, and a genuine masked-session
+  setting K → masked save keeps the override verbatim; the theme FILE-mask arm — a
+  --config `[theme] file` also guards the `name` override; and a genuine masked-session
   divergence still writes).
 - **Behavior (app.rs):** switch command rebuilds the trie — the same chord (`ctrl-w`)
   resolves to `expand_selection` under cua and `scroll_line_up` after `keymap_wordstar`
