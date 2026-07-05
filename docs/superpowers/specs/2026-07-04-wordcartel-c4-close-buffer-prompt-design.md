@@ -35,11 +35,11 @@ async-save staleness discipline is inherited, not reinvented.
 
 New constructor in the house idiom (beside `quit_review_buffer`, prompt.rs):
 
-- `Prompt::close_confirm(name: &str)` — message
+- `Prompt::close_confirm(name: &str, id: BufferId)` — message
   `format!("Close {name}: unsaved changes — [S]ave & close  [D]iscard  [C]ancel")`
   (exact copy tuned at implementation to match the sibling constructors' style), choices:
-  - `('s', "Save & close", PromptAction::CloseSave)`
-  - `('d', "Discard", PromptAction::CloseDiscard)`
+  - `('s', "Save & close", PromptAction::CloseSave { id })`
+  - `('d', "Discard", PromptAction::CloseDiscard { id })`
   - `('c', "Cancel", PromptAction::Cancel)`
 
 Two new `PromptAction` variants, BOTH CARRYING THE TARGET:
@@ -53,8 +53,8 @@ argument. Key routing (`action_for`, case-insensitive) and status-row rendering
 (render.rs:653-655) need no changes.
 
 **The prompt is NOT a fully-sealed window (Codex r1 Critical).** Key and mouse input are
-intercepted (the `editor.prompt.is_some()` guard, app.rs:692-737; mouse returns early at
-:731) — but BACKGROUND RESULTS still process under the prompt (`Msg::JobDone` drains at
+intercepted (the `editor.prompt.is_some()` guard, app.rs:692-737; mouse is dropped by the prompt
+guard's fall-through, app.rs:731/:735) — but BACKGROUND RESULTS still process under the prompt (`Msg::JobDone` drains at
 :715/:734), and a quit-drain save landing mid-prompt calls `drive_quit_drain`, which
 SWITCHES the active buffer (jobs_apply.rs:160). `active()` at resolve time is therefore
 unreliable. Two defenses, both required:
@@ -139,8 +139,9 @@ D3's post-save arm.
   `"save timed out — close cancelled"` (mirrors `ContinueQuitDrain`'s wording with
   "close"; no modal re-raise — unlike the `Quit` variant's re-prompt, a close is not a
   session-ending action the user is waiting on).
-- **`apply_panic`** (jobs_apply.rs:92-125) already clears `pending_after_save`
-  unconditionally — the new variant is covered with zero changes; verify, don't modify.
+- **`apply_panic`** (jobs_apply.rs:92-125) clears a MATCHING awaited save's
+  `pending_after_save` action-agnostically (jobs_apply.rs:92/:99) — the new variant is
+  covered with zero changes; verify, don't modify.
 
 ### D4. No keybinding (decision 2 revised)
 
@@ -203,7 +204,8 @@ swap file still present.
 
 **Gates:** the standard set — suite green (1,000 + the new tests), workspace clippy deny
 clean, warning-free; smoke quoted verbatim pre-merge (advisory) + a live tmux sanity
-(dirty buffer, ctrl-w, watch the prompt, press each of s/d/c across three runs).
+(dirty buffer, dispatch Close Buffer via the palette, watch the prompt, press each of
+s/d/c across three runs).
 
 ## Non-goals (explicit)
 
