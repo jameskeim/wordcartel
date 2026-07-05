@@ -652,7 +652,7 @@ mod tests {
     #[test]
     fn both_presets_resolve_against_builtins() {
         let reg = Registry::builtins();
-        for preset in ["cua", "wordstar"] {
+        for preset in PRESETS {
             for (chord, id) in preset_bindings(preset).unwrap() {
                 assert!(parse_seq(chord).is_some(), "preset {preset} bad chord {chord}");
                 assert!(reg.resolve_name(id).is_some(), "preset {preset} id {id} not in registry");
