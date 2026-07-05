@@ -339,7 +339,7 @@ pub fn region_for_transform(doc: &crate::editor::Document) -> std::ops::Range<us
 
 - [ ] **Step 1: the signature + call-site migration.** Per the grounding's smallest-diff shape: add the `region: Option<std::ops::Range<usize>>` parameter THIRD; the body's only change is
   `let range = region.unwrap_or_else(|| region_for_transform(&editor.active().document));`
-  replacing the direct call — both guards stay exactly where they are (the in-flight guard FIRST, then the region resolution, then the empty guard; Fable I3's requirement). Migrate all seven call sites (prompts.rs:209, registry.rs:286/:290/:294, app.rs:2706/:2723/:2774) to pass `None`.
+  replacing the direct call — both guards stay exactly where they are (the in-flight guard FIRST, then the region resolution, then the empty guard; Fable I3's requirement). Migrate all seven call sites (prompts.rs:209, registry.rs:286/:290/:294, app.rs:2706/:2723/:2774) to pass `None`, and update the stale signature comment at app.rs:2705 ("dispatch_transform takes (editor, kind, clock, msg_tx)" — Fable plan M5).
 
 - [ ] **Step 2: the three `_buffer` registrations** (registry.rs, immediately after `ventilate`'s):
 
