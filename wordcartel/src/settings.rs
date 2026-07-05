@@ -227,17 +227,22 @@ fn some_if<T>(t: T, any: bool) -> Option<T> {
 /// `runtime` = live editor state; `baseline` = config layer active at startup;
 /// `existing` = the current machine overrides (may be empty/corrupt);
 /// `mask` = the `--config` layer (parsed with `parse_mask`).
+///
+/// Rule-3 mask-guard is PER INVENTORY KEY — a section header alone in the mask
+/// does not shield sibling keys. Exception: the `[theme]` guard is
+/// PROVENANCE-TYPED (section-level) because `parse_mask` collapses file- and
+/// name-provenance into a single sentinel at parse time (spec N-4).
 pub fn compute_overrides(
     runtime:  &SettingsSnapshot,
     baseline: &SettingsSnapshot,
     existing: &OverridesFile,
     mask:     &OverridesFile,
 ) -> OverridesFile {
-    // --- keymap ---
+    // --- keymap — per-key mask predicate ---
     let preset = diff_key(
         &runtime.keymap_preset, &baseline.keymap_preset,
         existing.keymap.as_ref().and_then(|k| k.preset.as_ref()),
-        mask.keymap.is_some(),
+        mask.keymap.as_ref().and_then(|k| k.preset.as_ref()).is_some(),
     );
     let has_preset = preset.is_some();
     let keymap = some_if(OKeymap { preset }, has_preset);
@@ -260,54 +265,54 @@ pub fn compute_overrides(
     let has_theme = theme_name.is_some();
     let theme = some_if(OTheme { name: theme_name }, has_theme);
 
-    // --- view ---
-    let ex_view    = existing.view.as_ref();
-    let view_masked = mask.view.is_some();
+    // --- view — per-key mask predicates ---
+    let ex_view = existing.view.as_ref();
+    let mk_view = mask.view.as_ref();
     let typewriter = diff_key(
         &runtime.view_typewriter, &baseline.view_typewriter,
         ex_view.and_then(|v| v.typewriter.as_ref()),
-        view_masked,
+        mk_view.and_then(|v| v.typewriter).is_some(),
     );
     let focus = diff_key(
         &runtime.view_focus, &baseline.view_focus,
         ex_view.and_then(|v| v.focus.as_ref()),
-        view_masked,
+        mk_view.and_then(|v| v.focus).is_some(),
     );
     let measure = diff_key(
         &runtime.view_measure, &baseline.view_measure,
         ex_view.and_then(|v| v.measure.as_ref()),
-        view_masked,
+        mk_view.and_then(|v| v.measure).is_some(),
     );
     let wrap_guide = diff_key(
         &runtime.view_wrap_guide, &baseline.view_wrap_guide,
         ex_view.and_then(|v| v.wrap_guide.as_ref()),
-        view_masked,
+        mk_view.and_then(|v| v.wrap_guide).is_some(),
     );
     let word_count = diff_key(
         &runtime.view_word_count, &baseline.view_word_count,
         ex_view.and_then(|v| v.word_count.as_ref()),
-        view_masked,
+        mk_view.and_then(|v| v.word_count).is_some(),
     );
     let any_view = typewriter.is_some() || focus.is_some() || measure.is_some()
         || wrap_guide.is_some() || word_count.is_some();
     let view = some_if(OView { typewriter, focus, measure, wrap_guide, word_count }, any_view);
 
-    // --- menu ---
+    // --- menu — per-key mask predicate ---
     let rt_bar   = menu_bar_str(runtime.menu_bar).to_string();
     let base_bar = menu_bar_str(baseline.menu_bar).to_string();
     let bar = diff_key(
         &rt_bar, &base_bar,
         existing.menu.as_ref().and_then(|m| m.bar.as_ref()),
-        mask.menu.is_some(),
+        mask.menu.as_ref().and_then(|m| m.bar.as_ref()).is_some(),
     );
     let has_bar = bar.is_some();
     let menu = some_if(OMenu { bar }, has_bar);
 
-    // --- mouse ---
+    // --- mouse — per-key mask predicate ---
     let capture = diff_key(
         &runtime.mouse_capture, &baseline.mouse_capture,
         existing.mouse.as_ref().and_then(|m| m.capture.as_ref()),
-        mask.mouse.is_some(),
+        mask.mouse.as_ref().and_then(|m| m.capture).is_some(),
     );
     // Option<bool>: Copy — no move conflict on the struct literal below.
     let any_mouse = capture.is_some();
@@ -513,6 +518,38 @@ mod tests {
         let mask = parse_overrides("[view]\ntypewriter=false\n");
         let of = compute_overrides(&rt, &base, &OverridesFile::default(), &mask);
         assert_eq!(of.view.as_ref().unwrap().typewriter, Some(true), "explicit change wins through the mask");
+    }
+
+    #[test]
+    fn mask_guard_is_per_key_not_per_section() {
+        // (a) A [keymap] section present in the mask but containing ONLY bind/unbind (no
+        //     preset key) must NOT guard a contradicted saved preset — the section header
+        //     alone must not shield sibling keys (Codex pre-merge C-1).
+        let rt   = snap("cua", ThemeIdentity::Builtin("default".into()), false);
+        let base = snap("cua", ThemeIdentity::Builtin("default".into()), false);
+        let existing = parse_overrides("[keymap]\npreset='wordstar'\n");
+        // mask: [keymap] section exists but only bind — preset key absent in the mask
+        let mask = parse_mask("[keymap]\nbind = {}\n");
+        let of = compute_overrides(&rt, &base, &existing, &mask);
+        // rule 3 must fire: runtime(cua)==baseline(cua), saved(wordstar) contradicts → remove
+        assert!(of.keymap.as_ref().and_then(|k| k.preset.as_deref()).is_none(),
+            "bind-only mask section must not guard a contradicted preset; got {:?}", of.keymap);
+
+        // (b) A [view] section in the mask with focus-only must NOT guard a contradicted
+        //     saved typewriter (rule 3 removes it) while a contradicted saved focus IS kept.
+        let rt2   = snap("cua", ThemeIdentity::Builtin("default".into()), true); // typewriter=true, focus=false
+        let base2 = snap("cua", ThemeIdentity::Builtin("default".into()), true); // typewriter=true, focus=false
+        // existing: typewriter=false contradicts runtime(true); focus=true contradicts runtime(false)
+        let existing2 = parse_overrides("[view]\ntypewriter=false\nfocus=true\n");
+        // mask: only focus key present — typewriter absent, focus present
+        let mask2 = parse_mask("[view]\nfocus=false\n");
+        let of2 = compute_overrides(&rt2, &base2, &existing2, &mask2);
+        // typewriter: not in mask → rule 3 removes the contradiction
+        assert!(of2.view.as_ref().and_then(|v| v.typewriter).is_none(),
+            "typewriter must be removed when absent from mask but contradicted; got {:?}", of2.view);
+        // focus: present in mask → rule 3 guard fires, keeps existing verbatim
+        assert_eq!(of2.view.as_ref().and_then(|v| v.focus), Some(true),
+            "focus must be kept verbatim when present in mask; got {:?}", of2.view);
     }
 
     #[test]
