@@ -379,6 +379,11 @@ pub struct Editor {
     pub clipboard_notice_shown: bool,
     pub pending_keys: Vec<crate::keymap::KeyChord>,
     pub keymap: crate::keymap::KeyTrie,
+    /// The resolved preset name currently driving the loop-local keymap trie ("cua" or "wordstar").
+    /// Seeded from config at startup; mutated by keymap_cua/keymap_wordstar commands.
+    pub active_keymap_preset: String,
+    /// Set by keymap switch commands; consumed by rebuild_keymap_if_requested after each reduce.
+    pub keymap_rebuild: bool,
     pub palette: Option<crate::palette::Palette>,
     pub menu: Option<crate::menu::MenuView>,
     /// Whether mouse capture is currently requested (toggled by `toggle_mouse_capture`).
@@ -452,6 +457,8 @@ impl Editor {
             clipboard_sync_request: None, clipboard_get_pending: None, clipboard_notice_shown: false,
             pending_keys: Vec::new(),
             keymap,
+            active_keymap_preset: "cua".into(),
+            keymap_rebuild: false,
             palette: None,
             menu: None,
             mouse_capture: true,

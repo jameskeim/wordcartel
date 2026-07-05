@@ -186,6 +186,29 @@ pub fn menu_select_for_test(
     dispatch_overlay_command(editor, reg, &keymap, ex, clock, msg_tx, id);
 }
 
+/// Honor a requested keymap rebuild (spec D2). Returns the new trie for the caller to
+/// swap into its loop-local. A half-typed prefix must not complete against the new base
+/// (spec I-3): the buffer drops, and the status clears ONLY when it is the pending "…"
+/// prompt — a switch status set in the same reduce must survive to the draw.
+pub(crate) fn rebuild_keymap_if_requested(
+    editor: &mut crate::editor::Editor,
+    patches: &[crate::config::KeymapPatch],
+    reg: &crate::registry::Registry,
+) -> Option<crate::keymap::KeyTrie> {
+    if !editor.keymap_rebuild { return None; }
+    editor.keymap_rebuild = false;
+    let (trie, kw) = crate::keymap::build_keymap(&crate::config::KeymapConfig {
+        preset: editor.active_keymap_preset.clone(),
+        patches: patches.to_vec(),
+    }, reg);
+    if !editor.pending_keys.is_empty() {
+        editor.pending_keys.clear();
+        if editor.status.ends_with('…') { editor.status.clear(); }
+    }
+    if let Some(w) = kw.first() { editor.status = w.clone(); }
+    Some(trie)
+}
+
 /// Apply the theme-picker's currently-selected built-in as a live preview.
 /// `pub(crate)` so mouse.rs can call it after a wheel-scroll selection change.
 pub(crate) fn preview_selected_theme(editor: &mut crate::editor::Editor) {
@@ -1253,6 +1276,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     } else {
         cfg.menu.bar
     };
+    editor.active_keymap_preset = keymap::resolve_preset(&cfg.keymap.preset).to_string();
     // Resolve and seed the active theme + color depth (once, at startup — §3.6).
     let env = crate::theme_resolve::EnvSnapshot::from_env();
     let resolved = crate::theme_resolve::resolve_theme(&cfg.theme, &env);
@@ -1330,8 +1354,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     }
     // Take the keymap out of editor into a loop-local to avoid a simultaneous
     // &mut editor / &editor.keymap borrow conflict when calling reduce.
-    // (The keymap doesn't change during the loop in v1.)
-    let keymap = std::mem::take(&mut editor.keymap);
+    let mut keymap = std::mem::take(&mut editor.keymap);
     let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Msg>();
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
     let executor = crate::jobs::ThreadExecutor::new(wake_tx);
@@ -1471,6 +1494,9 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         }
         let (pre_id, pre_version) = { let b = editor.active(); (b.id, b.document.version) };
         let keep = reduce(msg, &mut editor, &reg, &keymap, &executor, &clock, &msg_tx);
+        if let Some(t) = rebuild_keymap_if_requested(&mut editor, &cfg.keymap.patches, &reg) {
+            keymap = t;
+        }
         editor.note_undo_eviction(pre_id, pre_version);
         crate::clipboard::drain_clipboard_intents(&mut editor, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
         reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
@@ -4702,5 +4728,93 @@ mod tests {
 
         assert_eq!(e.status, "can't close the scratch buffer");
         assert!(e.prompt.is_none(), "scratch guard must NOT raise a prompt");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 2 (D1+A5): runtime keymap switching
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn keymap_switch_command_sets_preset_and_rebuild_flag() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::{Registry, CommandId};
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        reg.dispatch(CommandId("keymap_wordstar"), &mut ctx);
+        assert_eq!(e.active_keymap_preset, "wordstar");
+        assert!(e.keymap_rebuild, "switch requests a rebuild");
+        assert_eq!(e.status, "keymap: wordstar");
+    }
+
+    #[test]
+    fn keymap_switch_is_idempotent_with_status() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::{Registry, CommandId};
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        reg.dispatch(CommandId("keymap_cua"), &mut ctx); // cua is already active
+        assert!(!e.keymap_rebuild, "idempotent switch must not request a rebuild");
+        assert_eq!(e.status, "keymap: cua (already active)");
+    }
+
+    #[test]
+    fn switch_status_survives_the_rebuild() {
+        // Fable plan C1: the rebuild must NOT wipe the switch status set in the same
+        // reduce (no pending prefix in play → status untouched by the helper).
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        let reg = crate::registry::Registry::builtins();
+        e.active_keymap_preset = "wordstar".into();
+        e.keymap_rebuild = true;
+        e.status = "keymap: wordstar".into();
+        let t = crate::app::rebuild_keymap_if_requested(&mut e, &[], &reg);
+        assert!(t.is_some());
+        assert_eq!(e.status, "keymap: wordstar", "the pinned switch copy reaches the draw");
+    }
+
+    #[test]
+    fn patches_survive_the_switch() {
+        // Fable plan I3(c): a GLOBAL patch bind holds under both bases through the
+        // real helper (the same patch slice run() passes from cfg.keymap.patches).
+        use crate::keymap::{parse_seq, Resolution};
+        let patches = vec![crate::config::KeymapPatch {
+            bind: [("ctrl-g".to_string(), "copy".to_string())].into(),
+            ..Default::default() }];
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        let reg = crate::registry::Registry::builtins();
+        e.active_keymap_preset = "wordstar".into();
+        e.keymap_rebuild = true;
+        let t = crate::app::rebuild_keymap_if_requested(&mut e, &patches, &reg).unwrap();
+        let g = parse_seq("ctrl-g").unwrap();
+        assert!(matches!(t.resolve(&g), Resolution::Command(crate::registry::CommandId("copy"))),
+            "the global patch rides onto the new base");
+    }
+
+    #[test]
+    fn rebuild_seam_swaps_the_trie_and_clears_pending() {
+        // Manual seam: seed pending_keys with ctrl-k (Pending under BOTH presets), set the
+        // flag via dispatch, then run the same rebuild the loop runs; assert ctrl-w resolves
+        // to scroll_line_up afterward and pending_keys is EMPTY (spec I-3).
+        use crate::keymap::{parse_seq, Resolution};
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        let reg = crate::registry::Registry::builtins();
+        e.pending_keys = parse_seq("ctrl-k").unwrap();
+        e.status = "ctrl-k \u{2026}".into();
+        e.active_keymap_preset = "wordstar".into();
+        e.keymap_rebuild = true;
+        // The REAL production helper — the test proves run()'s code, not a copy (Fable I4).
+        let mut keymap = cua_keymap();
+        if let Some(t) = crate::app::rebuild_keymap_if_requested(&mut e, &[], &reg) {
+            keymap = t;
+        }
+        assert!(e.pending_keys.is_empty(), "pending prefix must not survive the rebuild");
+        assert!(e.status.is_empty(), "the pending '…' prompt is cleared");
+        let cw = parse_seq("ctrl-w").unwrap();
+        assert!(matches!(keymap.resolve(&cw), Resolution::Command(crate::registry::CommandId("scroll_line_up"))));
     }
 }

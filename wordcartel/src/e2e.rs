@@ -51,6 +51,9 @@ impl Harness {
         let (pre_id, pre_version) = { let b = self.editor.active(); (b.id, b.document.version) };
         let clock = TestClock(self.now);
         let keep = reduce(msg, &mut self.editor, &self.reg, &self.keymap, &self.ex, &clock, &self.tx);
+        if let Some(t) = app::rebuild_keymap_if_requested(&mut self.editor, &[], &self.reg) {
+            self.keymap = t;
+        }
         self.editor.note_undo_eviction(pre_id, pre_version);
         app::advance(&mut self.editor, &clock);
         self.render();
@@ -327,13 +330,14 @@ fn journey_palette_end_reaches_last_command() {
     let last_label = p.rows[last_idx].label.clone();
     assert!(h.screen_contains(&last_label),
         "last command label {last_label:?} must be visible on screen after End");
-    // Enter dispatches scroll_line_down → viewport advances by one logical line.
-    let scroll_before = h.editor.active().view.scroll;
+    // Enter dispatches keymap_wordstar (last registered command) → keymap switches,
+    // status is set, palette closes. Verifies the end-of-list dispatch path (spec I4).
     h.key(KeyCode::Enter);
     assert!(h.editor.palette.is_none(), "Enter closes the palette");
-    let scroll_after = h.editor.active().view.scroll;
-    assert!(scroll_after > scroll_before,
-        "scroll_line_down must advance the viewport (before={scroll_before}, after={scroll_after})");
+    assert_eq!(h.editor.active_keymap_preset, "wordstar",
+        "keymap_wordstar must be dispatched and set the active preset");
+    assert_eq!(h.editor.status, "keymap: wordstar",
+        "the switch status must survive through the rebuild");
 }
 
 // ---------------------------------------------------------------------------

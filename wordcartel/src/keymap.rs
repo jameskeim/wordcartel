@@ -884,6 +884,16 @@ mod tests {
     }
 
     #[test]
+    fn close_buffer_is_unbound_in_both_presets_by_design() {
+        // C4 closure (spec D5): per-preset patches are the supported binding path.
+        for preset in ["cua", "wordstar"] {
+            for (_, id) in preset_bindings(preset).unwrap() {
+                assert_ne!(*id, "close_buffer", "{preset} must not bind close_buffer");
+            }
+        }
+    }
+
+    #[test]
     fn wordstar_has_no_chord_collisions_or_prefix_shadows() {
         let rows = preset_bindings("wordstar").unwrap();
         // (a) no duplicate chord maps to two ids

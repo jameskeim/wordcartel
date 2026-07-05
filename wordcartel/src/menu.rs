@@ -63,6 +63,7 @@ fn category_label(cat: MenuCategory) -> &'static str {
         MenuCategory::Edit => "Edit",
         MenuCategory::Format => "Format",
         MenuCategory::View => "View",
+        MenuCategory::Settings => "Settings",
         MenuCategory::Export => "Export",
     }
 }
