@@ -245,6 +245,20 @@ personality; (c) **Decided (2026-07-03): export-time typography adopted** as
 documented); `false` appends `-smart` to the pandoc source format for strict literal output.
 In-editor source remains untouched — fully compatible with source-as-is.
 
+### C2b. Repar 1.0 integration (width + fixups) — **SHIPPED 2026-07-05** (merged @ c9b64d8)
+
+User-directed insertion (reconstructed from the par-command session's lost BTW questions).
+Transforms format to `view.wrap_column` (default 72; the hardcoded width died; clamped
+20..=9999 — repar's REAL parse ceiling, probe-discovered after the spec's "huge" reading
+was falsified); "Set Wrap Column…" minibuffer setter (Settings menu, live measure rebuild,
+persisted via Save Settings with parse-boundary normalization); the pinned
+`none,all,prose,markdown` fixups baseline — `prose` fixed REAL ventilate→reflow
+corruption (periods eaten at default width). Six contract pins freeze repar-1.0 behavior,
+incl. the deliberate CJK trailing-space artifact. TWO UPSTREAM repar report candidates
+recorded in the spec's Deferred: (1) one trailing space per double-width char per line
+(markdown hard-break injection for CJK/emoji); (2) common-prefix inference mangles
+anaphoric ventilated prose under every stack.
+
 ### C2. Transform scope (Reflow/Unwrap/Ventilate) — **SHIPPED 2026-07-05** (merged @ 642290b)
 
 Both decided rules landed, deepened by eight spec-review rounds into the TRANSFORM-UNIT rule:
@@ -367,6 +381,7 @@ individual toggles (each remains individually overridable). Chrome inventory (fa
 | Centered measure | off/on | `toggle_measure` | `view.measure` |
 | Word count | off/on | `toggle_word_count` | `view.word_count` |
 | Heading glyphs | per-theme | none | `[theme] heading_level_glyph` (default → ON, B3) |
+| Wrap column | 72; guide + measure + TRANSFORM width (repar10) | `set_wrap_column` | `view.wrap_column` (persisted, 20..=9999) |
 
 **Decided (2026-07-03): the status line becomes transient chrome in full-zen** — the
 established pattern (scrollbar on activity, menu bar on dwell): the row sits empty/hidden
