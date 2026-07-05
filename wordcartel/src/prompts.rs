@@ -206,7 +206,7 @@ pub fn resolve_prompt(
             }
         }
         PromptAction::Transform(kind) => {
-            crate::transform::dispatch_transform(editor, kind, clock, msg_tx);
+            crate::transform::dispatch_transform(editor, kind, None, clock, msg_tx);
         }
     }
     editor.prompt = None;

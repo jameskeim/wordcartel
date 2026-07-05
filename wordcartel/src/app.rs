@@ -2696,14 +2696,15 @@ mod tests {
     }
 
     #[test]
-    fn reflow_whole_buffer_applies_one_undoable_edit() {
+    fn reflow_buffer_applies_one_undoable_edit() {
         use crate::editor::Editor;
         use crate::transform::TransformKind;
         let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau\n";
         let mut e = Editor::new_from_text(long, None, (80, 24));
+        let len = e.active().document.buffer.len();
         let (tx, _rx) = std::sync::mpsc::channel();
-        // dispatch_transform takes (editor, kind, clock, msg_tx) — see Task 3 Step 6.
-        crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, &TestClock(0), &tx);
+        // dispatch_transform(editor, kind, region, clock, msg_tx)
+        crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, Some(0..len), &TestClock(0), &tx);
         let after = e.active().document.buffer.to_string();
         assert_ne!(after, long, "reflow should rewrap the long line");
         // exactly one undo restores the original
@@ -2720,7 +2721,7 @@ mod tests {
         let mut e = Editor::new_from_text(text, None, (80, 24));
         let v0 = e.active().document.version;
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::transform::dispatch_transform(&mut e, TransformKind::Ventilate, &TestClock(0), &tx);
+        crate::transform::dispatch_transform(&mut e, TransformKind::Ventilate, None, &TestClock(0), &tx);
         assert_eq!(e.active().document.buffer.to_string(), text);
         assert_eq!(e.active().document.version, v0, "no-op transform must not bump version");
         assert!(e.status.contains("already"));
@@ -2771,11 +2772,192 @@ mod tests {
         let big = "word ".repeat(300_000); // ~1.5 MB
         let mut e = Editor::new_from_text(&big, None, (80, 24));
         let (tx, rx) = std::sync::mpsc::channel::<Msg>();
-        crate::transform::dispatch_transform(&mut e, TransformKind::Unwrap, &TestClock(0), &tx);
+        crate::transform::dispatch_transform(&mut e, TransformKind::Unwrap, None, &TestClock(0), &tx);
         assert!(e.transform_in_flight, "async dispatch sets the in-flight guard");
         let msg = rx.recv().expect("TransformDone must arrive");
         match msg { Msg::TransformDone { kind: TransformKind::Unwrap, result: Ok(_), .. } => {}
                     other => panic!("expected TransformDone Ok, got {other:?}") }
+    }
+
+    #[test]
+    fn buffer_variant_rejected_while_in_flight() {
+        use crate::editor::Editor;
+        use crate::transform::TransformKind;
+        let mut e = Editor::new_from_text("some text here to test\n", None, (80, 24));
+        e.transform_in_flight = true;
+        let len = e.active().document.buffer.len();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, Some(0..len), &TestClock(0), &tx);
+        assert!(e.status.contains("already running"), "in-flight guard fires for _buffer variant: {:?}", e.status);
+    }
+
+    #[test]
+    fn buffer_variant_on_empty_buffer_says_nothing_to_transform() {
+        use crate::editor::Editor;
+        use crate::transform::TransformKind;
+        let mut e = Editor::new_from_text("", None, (80, 24));
+        let len = e.active().document.buffer.len(); // 0 → Some(0..0) is empty
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, Some(0..len), &TestClock(0), &tx);
+        assert!(e.status.contains("nothing to transform"), "empty-range guard fires: {:?}", e.status);
+    }
+
+    #[test]
+    fn caret_reflow_acts_on_caret_block_only() {
+        use crate::editor::Editor;
+        use crate::transform::TransformKind;
+        // Two paragraphs each well over 72 chars — caret in paragraph 1 only.
+        let para1 = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau\n";
+        let para2 = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen\n";
+        let text = format!("{para1}\n{para2}");
+        let mut e = Editor::new_from_text(&text, None, (80, 24));
+        // Caret at byte 5 — inside paragraph 1.
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(5);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, None, &TestClock(0), &tx);
+        let after = e.active().document.buffer.to_string();
+        assert_ne!(after, text, "paragraph 1 should have been reflowed");
+        // Paragraph 2 is byte-identical — at the end of the buffer after the blank line.
+        assert!(after.ends_with(para2), "paragraph 2 bytes unchanged: {after:?}");
+        // One undo restores.
+        e.active_mut().undo();
+        assert_eq!(e.active().document.buffer.to_string(), text);
+    }
+
+    // ---------------------------------------------------------------------------
+    // C2 behavior pins: sibling-preservation + nested-item indent invariant
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn caret_reflow_inside_item_preserves_siblings() {
+        use crate::editor::Editor;
+        use crate::transform::TransformKind;
+        // Three-item tight list; item 2's text is long enough to genuinely rewrap
+        // at 72 cols — items 1 and 3 must be byte-identical after the caret reflow.
+        let item1 = "- item one short\n";
+        let item2 = "- item two is a long line that must be reflowed because it exceeds seventy-two columns width okay\n";
+        let item3 = "- item three short\n";
+        let text = format!("{item1}{item2}{item3}");
+        let mut e = Editor::new_from_text(&text, None, (80, 24));
+        // Precondition: three items in a tight list.
+        {
+            let bt = e.active().document.blocks().clone();
+            let list = &bt.top_level()[0];
+            assert_eq!(list.children.len(), 3, "precondition: three tight list items");
+        }
+        // Precondition: item 2 is over 72 chars so reflow actually wraps it.
+        assert!(item2.trim_end_matches('\n').len() > 72,
+            "precondition: item 2 exceeds 72 cols ({} chars)", item2.trim_end_matches('\n').len());
+        // Caret inside item 2's body.
+        let item2_start = item1.len();
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(item2_start + 10);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, None, &TestClock(0), &tx);
+        let after = e.active().document.buffer.to_string();
+        assert_ne!(after, text, "item 2 must have been reflowed");
+        // Items 1 and 3 are byte-identical (exact prefix/suffix slices).
+        assert!(after.starts_with(item1), "item 1 byte-identical:\n{after:?}");
+        assert!(after.ends_with(item3), "item 3 byte-identical:\n{after:?}");
+        // Item 2's reflowed region still begins "- " (marker preserved).
+        let after_item2_region = &after[item1.len()..];
+        assert!(after_item2_region.starts_with("- "),
+            "item 2 still begins '- ':\n{after_item2_region:?}");
+        // One undo restores the original exactly.
+        e.active_mut().undo();
+        assert_eq!(e.active().document.buffer.to_string(), text);
+    }
+
+    #[test]
+    fn caret_reflow_inside_nested_item_preserves_indent() {
+        use crate::editor::Editor;
+        use crate::transform::TransformKind;
+        // Nested list: outer tight item + inner item whose text is long enough to
+        // rewrap at 72 cols — the Fable r5 C1 behavior pin. Assert the marker/
+        // indent INVARIANTS, not the exact wrap layout.
+        let outer_line = "- outer one\n";
+        let inner_text = "  - inner text that is genuinely long enough to force a reflow at seventy two columns so words wrap here\n    continuation words appended after that\n";
+        let text = format!("{outer_line}{inner_text}");
+        let mut e = Editor::new_from_text(&text, None, (80, 24));
+        // Precondition: inner item first line exceeds 72 columns.
+        let inner_first_line = inner_text.lines().next().unwrap();
+        assert!(inner_first_line.len() > 72,
+            "precondition: inner item line is over 72 cols ({} chars)", inner_first_line.len());
+        // Caret inside the inner item's body — lands in "  - inner text…".
+        let inner_caret = outer_line.len() + 10;
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(inner_caret);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, None, &TestClock(0), &tx);
+        let after = e.active().document.buffer.to_string();
+        assert_ne!(after, text, "inner item must have been reflowed");
+        // Outer item's first line ("- outer one\n") is byte-identical.
+        assert!(after.starts_with(outer_line),
+            "outer item line 1 byte-identical:\n{after:?}");
+        // The inner section (everything after the outer item line) begins "  - "
+        // (2-space indent + marker).
+        let inner_section = &after[outer_line.len()..];
+        let mut lines = inner_section.lines();
+        let first_inner = lines.next().expect("inner section has at least one line");
+        assert!(first_inner.starts_with("  - "),
+            "inner item first line begins '  - ': {first_inner:?}");
+        // Every continuation line of the reflowed inner item begins with exactly
+        // 4 spaces (the hanging-indent invariant for a 2-space-nested list item).
+        for ln in lines {
+            assert!(ln.starts_with("    "),
+                "continuation line must have 4-space indent: {ln:?}");
+        }
+        // One undo restores the original exactly.
+        e.active_mut().undo();
+        assert_eq!(e.active().document.buffer.to_string(), text);
+    }
+
+    #[test]
+    fn reflow_buffer_routes_async_on_giant_buffer() {
+        use crate::editor::Editor;
+        use crate::transform::TransformKind;
+        let big = "word ".repeat(300_000); // ~1.5 MB
+        let mut e = Editor::new_from_text(&big, None, (80, 24));
+        let len = e.active().document.buffer.len();
+        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+        crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, Some(0..len), &TestClock(0), &tx);
+        assert!(e.transform_in_flight, "async dispatch sets the in-flight guard");
+        let msg = rx.recv().expect("TransformDone must arrive");
+        match msg { Msg::TransformDone { kind: TransformKind::Reflow, result: Ok(_), .. } => {}
+                    other => panic!("expected TransformDone Ok, got {other:?}") }
+    }
+
+    #[test]
+    fn caret_reflow_on_blank_line_noops_with_status() {
+        use crate::editor::Editor;
+        use crate::transform::TransformKind;
+        // Two paragraphs with a blank between; caret ON the blank line (byte 14).
+        let text = "para one here\n\npara two here\n";
+        let mut e = Editor::new_from_text(text, None, (80, 24));
+        let v0 = e.active().document.version;
+        // byte 14 is '\n' — the blank line between the paragraphs.
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(14);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, None, &TestClock(0), &tx);
+        assert_eq!(e.active().document.buffer.to_string(), text, "buffer unchanged");
+        assert_eq!(e.active().document.version, v0, "version unchanged");
+        assert!(e.status.contains("nothing to transform"), "status: {:?}", e.status);
+    }
+
+    #[test]
+    fn caret_reflow_in_fence_noops() {
+        use crate::editor::Editor;
+        use crate::transform::TransformKind;
+        // A fenced block with a long code line; caret inside the fence.
+        let long_code = "let x = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;";
+        let text = format!("```\n{long_code}\n```\n");
+        let mut e = Editor::new_from_text(&text, None, (80, 24));
+        // Caret inside the long code line — the transform unit is the whole fence block.
+        let caret = text.find(long_code).unwrap() + 5;
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(caret);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, None, &TestClock(0), &tx);
+        // Fence passes through repar verbatim — output identical → "already reflowed".
+        assert_eq!(e.active().document.buffer.to_string(), text, "fenced code unchanged");
+        assert!(e.status.contains("already"), "status: {}", e.status);
     }
 
     #[test]

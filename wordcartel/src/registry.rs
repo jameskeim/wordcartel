@@ -283,15 +283,30 @@ impl Registry {
 
         // Format menu — discrete transform commands (Task 1 / Effort 5b).
         r.register("reflow", "Reflow", Some(MenuCategory::Format), |c| {
-            crate::transform::dispatch_transform(c.editor, crate::transform::TransformKind::Reflow, c.clock, &c.msg_tx);
+            crate::transform::dispatch_transform(c.editor, crate::transform::TransformKind::Reflow, None, c.clock, &c.msg_tx);
             CommandResult::Handled
         });
         r.register("unwrap", "Unwrap", Some(MenuCategory::Format), |c| {
-            crate::transform::dispatch_transform(c.editor, crate::transform::TransformKind::Unwrap, c.clock, &c.msg_tx);
+            crate::transform::dispatch_transform(c.editor, crate::transform::TransformKind::Unwrap, None, c.clock, &c.msg_tx);
             CommandResult::Handled
         });
         r.register("ventilate", "Ventilate", Some(MenuCategory::Format), |c| {
-            crate::transform::dispatch_transform(c.editor, crate::transform::TransformKind::Ventilate, c.clock, &c.msg_tx);
+            crate::transform::dispatch_transform(c.editor, crate::transform::TransformKind::Ventilate, None, c.clock, &c.msg_tx);
+            CommandResult::Handled
+        });
+        r.register("reflow_buffer", "Reflow Buffer", Some(MenuCategory::Format), |c| {
+            let len = c.editor.active().document.buffer.len();
+            crate::transform::dispatch_transform(c.editor, crate::transform::TransformKind::Reflow, Some(0..len), c.clock, &c.msg_tx);
+            CommandResult::Handled
+        });
+        r.register("unwrap_buffer", "Unwrap Buffer", Some(MenuCategory::Format), |c| {
+            let len = c.editor.active().document.buffer.len();
+            crate::transform::dispatch_transform(c.editor, crate::transform::TransformKind::Unwrap, Some(0..len), c.clock, &c.msg_tx);
+            CommandResult::Handled
+        });
+        r.register("ventilate_buffer", "Ventilate Buffer", Some(MenuCategory::Format), |c| {
+            let len = c.editor.active().document.buffer.len();
+            crate::transform::dispatch_transform(c.editor, crate::transform::TransformKind::Ventilate, Some(0..len), c.clock, &c.msg_tx);
             CommandResult::Handled
         });
 
@@ -572,10 +587,17 @@ mod tests {
     #[test]
     fn transforms_are_registered_commands_in_format_category() {
         let reg = Registry::builtins();
-        for (id, cat) in [("reflow","Reflow"), ("unwrap","Unwrap"), ("ventilate","Ventilate")] {
+        for (id, label) in [
+            ("reflow",           "Reflow"),
+            ("unwrap",           "Unwrap"),
+            ("ventilate",        "Ventilate"),
+            ("reflow_buffer",    "Reflow Buffer"),
+            ("unwrap_buffer",    "Unwrap Buffer"),
+            ("ventilate_buffer", "Ventilate Buffer"),
+        ] {
             let m = reg.meta(CommandId(id)).unwrap_or_else(|| panic!("missing {id}"));
             assert_eq!(m.menu, Some(MenuCategory::Format));
-            assert_eq!(m.label, cat);
+            assert_eq!(m.label, label);
             assert!(reg.resolve_name(id).is_some());
         }
     }

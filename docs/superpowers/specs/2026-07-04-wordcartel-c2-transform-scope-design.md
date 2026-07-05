@@ -131,9 +131,12 @@ block, the interior stays.
 
 - `start` = `transform_unit_at(text, blocks, from)` → its `span.start` (the SAME unit
   lookup as D1, all rules included — ancestor preference, line-blank gaps, line-start
-  extension); if `from` sits in a gap, `start = from` (raw, today's fallback behavior).
+  extension); if `from` sits in a gap: BLANK line → `start = from` (raw, today's fallback
+  behavior); NON-blank line with no unit → `start = line_start(from)` (whole-line widening
+  — see the F1 rule below).
 - `end` = `transform_unit_at(text, blocks, to.saturating_sub(1))` (the last selected
-  byte — `to` is exclusive) → its `span.end`; gap → `end = to`.
+  byte — `to` is exclusive) → its `span.end`; gap: BLANK line → `end = to` (raw);
+  NON-blank line with no unit → `end = line_end(to - 1)` (whole-line widening).
 - **"Gap" = container-interior BLANK-LINE bytes (r1 I-3 → r3 → corrected by Fable r5's
   anatomy):** the probe-true shapes: a loose item's trailing blank lives INSIDE that
   item's span (the descent still ends at the Item container; the BLANK line makes it a
@@ -156,9 +159,22 @@ Consequences, each pinned by a test: a selection inside one item → that item's
 selection spanning items 1-3 of one list → exactly items 1-3 (interior item 2 rides
 between the snapped endpoints); a selection from a paragraph into a list → the paragraph's
 start through the touched item's end; a selection wholly inside a gap → unchanged
-(`from..to`, today's fallback). Every region is a union of whole TRANSFORM-UNIT spans
-plus raw gap endpoints (Codex r3 wording — the fragment landmine is unreachable: gap
-bytes are blank-line territory, not partial blocks).
+(`from..to`, today's fallback).
+
+**The F1 whole-line-widening rule (user-ratified A, 2026-07-05, from the Fable whole-branch
+gate):** the original "gap bytes are blank-line territory, not partial blocks" claim was
+probe-FALSE — link-reference-definition lines (`[foo]: http://example.com`) get NO block
+from the parser, so a raw endpoint could land MID-LINE inside real content and feed repar
+a fragment (probe: `"para one\n\n[foo]: http…\npara two\n"` leaves bytes 10..36
+uncovered; old main never fragmented that line — a regression class). The rule: when the
+endpoint's unit lookup returns None AND the endpoint's line is NON-blank, the raw endpoint
+widens to its line boundary (`line_start(from)` / `line_end(to-1)`). Blank-line gaps keep
+their exact raw semantics. The restored invariant, now TRUE by construction: every region
+is a union of whole transform-unit spans, raw BLANK-gap endpoints, and WHOLE uncovered
+lines — repar never sees a mid-line fragment. The caret-default consequence is unchanged
+(caret on an uncovered non-blank line → the empty `caret..caret` region → "nothing to
+transform", the spec's degraded-parse convention). Pinned by a def-line snap test and a
+def-line caret test.
 
 ### D3. The `_buffer` variants (registry.rs + transform.rs)
 
