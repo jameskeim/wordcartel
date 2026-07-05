@@ -84,7 +84,12 @@ integration deliberately).
   sync arm passes it to `run_transform`; the async arm moves it into the worker closure
   (like the region). `run_transform`'s signature is unchanged.
 - Default change (user-ratified fork 1a-A): `ViewConfig::default().wrap_column` becomes
-  **72** (from 80). Default-config transforms stay byte-identical to today. Two
+  **72** (from 80). THE WIDTH default change is output-invisible (same 72 in and out);
+  the only default-visible transform delta is D3's prose ADDITION — which Fable's probes
+  showed is a CORRECTNESS fix, not a style change (today's stack corrupts
+  ventilate→reflow output at width 72: inferred-suffix stripping eats periods and
+  mangles words; the new stack yields sane text). Do NOT transcribe this bullet into a
+  byte-identity pin (Fable I-1 — D4's ventilate pin would break it). Two
   default-visible shifts, both honest (Codex r1 I-1): the wrap guide's position (guide
   defaults off) and the CENTERED MEASURE column narrows 80 → 72 for `measure = true`
   users who never set `wrap_column` (measure also defaults off; users who set the key
@@ -141,14 +146,27 @@ New transform.rs tests (corpora chosen at implementation, probe-verified):
 - `reflow_multibyte_corpus_is_stable`: a UTF-8 corpus (é / 中 / 🙂 — the house multibyte
   convention the transform battery currently lacks) reflowed at a fixed width; expected
   output asserted byte-exact. This is the pin that makes the next repar bump's drift
-  loud.
+  loud. KNOWN repar-1.0 artifact, pinned deliberately (Fable I-2, fixup-independent):
+  reflow emits ONE TRAILING SPACE PER DOUBLE-WIDTH CHAR on each line containing
+  CJK/emoji — in markdown, ≥2 trailing spaces is a hard `<br>`, so reflowing CJK prose
+  injects hard breaks. Pre-existing (not this effort's regression); the pin captures the
+  CURRENT bytes with a comment naming the artifact as repar's; recorded below as an
+  UPSTREAM-REPORT candidate. The implementer must not silently trim, and the reviewer
+  must not flag the pinned trailing whitespace as a test bug.
 - `ventilate_then_reflow_respects_sentence_boundaries`: the user-found bug class — after
   ventilate → reflow at a width chosen to tempt the old artifact, assert no period is
-  DETACHED from its word (the observed 0.9.x artifact was punctuation pushed to the far
-  right column separated from its sentence): no output line begins with `.`, and no `.`
-  is preceded by a space. Assert the invariant, not exact layout.
+  DETACHED from its word (probe-confirmed: the artifact reproduces under today's stack
+  at EVERY width incl. 72 — space-padded periods, periods LOST — and vanishes under the
+  D3 stack): no output line begins with `.`, no `.` preceded by a space, AND the output
+  period count equals the input sentence count (the loss detector). CORPUS CONSTRAINT
+  (Fable I-3): sentences must have DISTINCT OPENINGS — par's common-PREFIX inference is
+  deliberately untouched by prose (driver comment), and anaphoric corpora ("We will
+  fight on…" ×3) lose/reorder words under BOTH stacks. That sibling hazard is
+  pre-existing par semantics, recorded in Deferred, out of this effort's scope.
 - `fixups_stack_is_actually_applied`: a corpus whose reflow output DIFFERS between the
-  D3 baseline and `"none"` (e.g. a zero-width or accented-measure case); assert the two
+  D3 baseline and `"none"` — the corpus MUST use DECOMPOSED accents (e + U+0301) or ZWJ
+  emoji sequences (Fable m-1: precomposed é and bare CJK are byte-identical under both
+  stacks — double-width breaking is not compat-gated); assert the two
   differ and the baseline output is the expected one — proves the stack reaches repar.
 - `transform_width_follows_wrap_column`: `view_opts.wrap_column = 40` → dispatch (sync
   arm) reflows at 40 (no output line exceeds 40 columns; precondition: the corpus would
@@ -163,15 +181,28 @@ New transform.rs tests (corpora chosen at implementation, probe-verified):
 
 ## Error handling
 
+- Below-threshold markdown units degrade to a SILENT no-wrap passthrough, not an error
+  (Fable m-2 probe: nested `  - ` at width ≤15 returns input unchanged with Ok — the
+  user sees a success status and zero effect). Unreachable at the clamp floor 20 for
+  one-level nesting; reachable for deeper indents. CHOSEN behavior: accept (the status
+  quo of repar's contract); no wordcartel-side detection in this effort.
+
 - Setter input semantics, distinguished (Codex r3): PARSE FAILURES (non-numeric, u16
   overflow) → status only, `wrap_column` UNCHANGED; below-minimum values (< 20) → a
   SUCCESSFUL CLAMPED SET (wrap_column = 20, "wrap column: 20 (minimum)", rebuild fires).
 - repar errors: unchanged path (`TransformError` → status; guarded_transform panic
-  isolation intact).
+  isolation intact). Note: `ParError` Display strings end with `\n` (par fidelity) — a
+  status message may carry an embedded trailing newline; pre-existing, harmless in the
+  current renderer (Fable m-3, note only).
 - No new IO, no new refusal states; Save Settings semantics inherit D1+A5's shipped
   behavior with one more key.
 
 ## Deferred (recorded)
+
+- UPSTREAM repar report candidates (Fable probes, both pre-existing): (1) reflow emits
+  one trailing space per double-width char per line (markdown hard-break injection for
+  CJK/emoji prose); (2) common-PREFIX inference mangles anaphoric ventilated prose
+  (word loss/reorder) under every fixup stack — prose zeroes only the suffix side.
 
 - Exposing further repar knobs (prefix/suffix/hang, strict mode) — on demand.
 - Soft-wrap/measure interaction with wrap_column — E1.
