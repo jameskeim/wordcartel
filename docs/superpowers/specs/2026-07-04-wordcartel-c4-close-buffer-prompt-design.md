@@ -1,6 +1,8 @@
 # C4 — close-buffer Save/Discard/Cancel prompt
 
-**Status:** draft — pending Codex + Fable spec review
+**Status:** CLEAN — Codex spec review ×3 (r3 CLEAN) + Fable5 ×2 (r2 READY; its r1 found
+the by-id scratch-corruption Critical and the quit-supersedes design gap, both
+user-ratified into D2/D3), 2026-07-04.
 **Effort:** C4 (backlog Theme C; `needs-design` → designed, Small-Medium; the Effort 6
 spec-conformance gap deferred 2026-06-28, pulled into the backlog 2026-07-04)
 **Date:** 2026-07-04 · **Facts as of:** `43fcedf` (post-B1+B2 merge)
@@ -77,7 +79,7 @@ refusal status, it calls
 the buffer's display name (the same name source `quit_review_buffer`'s callers use) and
 `id` the active buffer's id at raise time — AFTER the busy guard (D1) passes. The
 scratch guard (:101) stays FIRST and unchanged — the scratch buffer never closes, dirty
-or not. The clean path is extracted, not changed:
+or not. The clean path is extracted, with per-case by-id semantics:
 
 - New `pub(crate) fn close_buffer_now(editor: &mut Editor, id: BufferId)` — the existing
   clean-path mechanics (:103-122) generalized to work BY ID. **NOT a verbatim move: the
@@ -93,7 +95,10 @@ or not. The clean path is extracted, not changed:
   - **X NOT active:** the user is looking at another buffer and MUST NOT be yanked.
     Last-ordinary case (`[X, scratch]` with scratch active): replace `buffers[i]` — X's
     OWN slot, never `buffers[editor.active]` (which would overwrite the scratch and
-    dangle `scratch_id`) — with the fresh untitled, prune/touch MRU, NO `switch_to`.
+    dangle `scratch_id`) — with the fresh untitled; prune the old id from MRU and push
+    the fresh untitled's id to the BACK of MRU (it is an untouched buffer, not
+    most-recent — fronting it would break the weak MRU-front == active convention while
+    the user views scratch; Fable nit, decided); NO `switch_to`.
     Normal case: `mru.retain`, `buffers.remove(i)`, then FIX UP `editor.active` by the
     previously-active buffer's ID (its index shifts down when `i < active`); NO
     `switch_to`, no rebuild of the viewed buffer needed.
@@ -143,8 +148,9 @@ D3's post-save arm.
     jobs_apply.rs:37) — only the Save-As divergence separates the two, and the
     `buffer_id` misreading closes a still-dirty buffer (Fable M1).**
     After the close, the apply arm sets status `"saved — closed"` (Fable M3:
-    `close_buffer_now`'s verbatim tail blanks the status, which would silently eat the
-    merge's "Saved" — the user gets explicit completion feedback instead).
+    `close_buffer_now` keeps the existing clean-path `status = ""` tail — preserving
+    today's behavior for direct clean closes — which would silently eat the merge's
+    "Saved"; the apply arm overwrites it with explicit completion feedback).
   - `saved_this` but dirty again (edited during flight) → clear `pending_after_save`;
     status `"edited during save — close cancelled"` (the Quit arm's convention verbatim,
     with "close" for "quit"); do NOT close.
@@ -186,7 +192,9 @@ No keymap changes in this effort — `ctrl-w` is taken (`expand_selection` CUA /
 
 - The registry entry (id/label/menu) — the three-surface contract needs nothing.
 - The quit machinery: `QuitDrain`, `drive_quit_drain`, the Quit/ContinueQuitDrain arms,
-  and all their tests are untouched. C4 only ADDS a sibling variant + arms.
+  and all their tests are untouched — EXCEPT `Command::Quit`'s dispatch, which gains the
+  close-pending clear (D3/I1, user-ratified). C4 otherwise only ADDS a sibling variant
+  + arms.
 - `dispatch_save_then` itself: it is already action-agnostic (takes `PostSaveAction`).
 - Swap lifecycle: save deletes the swap on success (save.rs:100) exactly as today; the
   discard path leaves it (decision 1) — no swap code changes at all.
@@ -253,8 +261,9 @@ s/d/c across three runs).
 
 ## Non-goals (explicit)
 
-- No change to quit behavior or its prompts; no drain for multi-buffer close (close is
-  single-buffer by definition).
+- No change to quit behavior or its prompts BEYOND the D3/I1 close-pending clear at
+  Command::Quit's dispatch; no drain for multi-buffer close (close is single-buffer by
+  definition).
 - No close-buffer mouse affordance (rides the overlay-mouse-parity follow-up).
 - No keybinding at all (decision 2 revised — A5 territory; ctrl-w is taken in both
   presets).
