@@ -2696,14 +2696,15 @@ mod tests {
     }
 
     #[test]
-    fn reflow_whole_buffer_applies_one_undoable_edit() {
+    fn reflow_buffer_applies_one_undoable_edit() {
         use crate::editor::Editor;
         use crate::transform::TransformKind;
         let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau\n";
         let mut e = Editor::new_from_text(long, None, (80, 24));
+        let len = e.active().document.buffer.len();
         let (tx, _rx) = std::sync::mpsc::channel();
-        // dispatch_transform takes (editor, kind, clock, msg_tx) — see Task 3 Step 6.
-        crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, &TestClock(0), &tx);
+        // dispatch_transform(editor, kind, region, clock, msg_tx)
+        crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, Some(0..len), &TestClock(0), &tx);
         let after = e.active().document.buffer.to_string();
         assert_ne!(after, long, "reflow should rewrap the long line");
         // exactly one undo restores the original
@@ -2720,7 +2721,7 @@ mod tests {
         let mut e = Editor::new_from_text(text, None, (80, 24));
         let v0 = e.active().document.version;
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::transform::dispatch_transform(&mut e, TransformKind::Ventilate, &TestClock(0), &tx);
+        crate::transform::dispatch_transform(&mut e, TransformKind::Ventilate, None, &TestClock(0), &tx);
         assert_eq!(e.active().document.buffer.to_string(), text);
         assert_eq!(e.active().document.version, v0, "no-op transform must not bump version");
         assert!(e.status.contains("already"));
@@ -2771,11 +2772,106 @@ mod tests {
         let big = "word ".repeat(300_000); // ~1.5 MB
         let mut e = Editor::new_from_text(&big, None, (80, 24));
         let (tx, rx) = std::sync::mpsc::channel::<Msg>();
-        crate::transform::dispatch_transform(&mut e, TransformKind::Unwrap, &TestClock(0), &tx);
+        crate::transform::dispatch_transform(&mut e, TransformKind::Unwrap, None, &TestClock(0), &tx);
         assert!(e.transform_in_flight, "async dispatch sets the in-flight guard");
         let msg = rx.recv().expect("TransformDone must arrive");
         match msg { Msg::TransformDone { kind: TransformKind::Unwrap, result: Ok(_), .. } => {}
                     other => panic!("expected TransformDone Ok, got {other:?}") }
+    }
+
+    #[test]
+    fn buffer_variant_rejected_while_in_flight() {
+        use crate::editor::Editor;
+        use crate::transform::TransformKind;
+        let mut e = Editor::new_from_text("some text here to test\n", None, (80, 24));
+        e.transform_in_flight = true;
+        let len = e.active().document.buffer.len();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, Some(0..len), &TestClock(0), &tx);
+        assert!(e.status.contains("already running"), "in-flight guard fires for _buffer variant: {:?}", e.status);
+    }
+
+    #[test]
+    fn buffer_variant_on_empty_buffer_says_nothing_to_transform() {
+        use crate::editor::Editor;
+        use crate::transform::TransformKind;
+        let mut e = Editor::new_from_text("", None, (80, 24));
+        let len = e.active().document.buffer.len(); // 0 → Some(0..0) is empty
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, Some(0..len), &TestClock(0), &tx);
+        assert!(e.status.contains("nothing to transform"), "empty-range guard fires: {:?}", e.status);
+    }
+
+    #[test]
+    fn caret_reflow_acts_on_caret_block_only() {
+        use crate::editor::Editor;
+        use crate::transform::TransformKind;
+        // Two paragraphs each well over 72 chars — caret in paragraph 1 only.
+        let para1 = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau\n";
+        let para2 = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen\n";
+        let text = format!("{para1}\n{para2}");
+        let mut e = Editor::new_from_text(&text, None, (80, 24));
+        // Caret at byte 5 — inside paragraph 1.
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(5);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, None, &TestClock(0), &tx);
+        let after = e.active().document.buffer.to_string();
+        assert_ne!(after, text, "paragraph 1 should have been reflowed");
+        // Paragraph 2 is byte-identical — at the end of the buffer after the blank line.
+        assert!(after.ends_with(para2), "paragraph 2 bytes unchanged: {after:?}");
+        // One undo restores.
+        e.active_mut().undo();
+        assert_eq!(e.active().document.buffer.to_string(), text);
+    }
+
+    #[test]
+    fn reflow_buffer_routes_async_on_giant_buffer() {
+        use crate::editor::Editor;
+        use crate::transform::TransformKind;
+        let big = "word ".repeat(300_000); // ~1.5 MB
+        let mut e = Editor::new_from_text(&big, None, (80, 24));
+        let len = e.active().document.buffer.len();
+        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+        crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, Some(0..len), &TestClock(0), &tx);
+        assert!(e.transform_in_flight, "async dispatch sets the in-flight guard");
+        let msg = rx.recv().expect("TransformDone must arrive");
+        match msg { Msg::TransformDone { kind: TransformKind::Reflow, result: Ok(_), .. } => {}
+                    other => panic!("expected TransformDone Ok, got {other:?}") }
+    }
+
+    #[test]
+    fn caret_reflow_on_blank_line_noops_with_status() {
+        use crate::editor::Editor;
+        use crate::transform::TransformKind;
+        // Two paragraphs with a blank between; caret ON the blank line (byte 14).
+        let text = "para one here\n\npara two here\n";
+        let mut e = Editor::new_from_text(text, None, (80, 24));
+        let v0 = e.active().document.version;
+        // byte 14 is '\n' — the blank line between the paragraphs.
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(14);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, None, &TestClock(0), &tx);
+        assert_eq!(e.active().document.buffer.to_string(), text, "buffer unchanged");
+        assert_eq!(e.active().document.version, v0, "version unchanged");
+        assert!(e.status.contains("nothing to transform"), "status: {:?}", e.status);
+    }
+
+    #[test]
+    fn caret_reflow_in_fence_noops() {
+        use crate::editor::Editor;
+        use crate::transform::TransformKind;
+        // A fenced block with a long code line; caret inside the fence.
+        let long_code = "let x = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;";
+        let text = format!("```\n{long_code}\n```\n");
+        let mut e = Editor::new_from_text(&text, None, (80, 24));
+        // Caret inside the long code line — the transform unit is the whole fence block.
+        let caret = text.find(long_code).unwrap() + 5;
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(caret);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, None, &TestClock(0), &tx);
+        // Fence passes through repar verbatim — output identical → "already reflowed".
+        assert_eq!(e.active().document.buffer.to_string(), text, "fenced code unchanged");
+        assert!(e.status.contains("already"), "status: {}", e.status);
     }
 
     #[test]

@@ -171,10 +171,13 @@ use std::ops::Range;
 /// Run a transform over the active buffer's resolved region.
 /// For regions >= TRANSFORM_ASYNC_THRESHOLD bytes, runs off the keystroke thread
 /// and sends Msg::TransformDone; smaller regions run synchronously.
+/// `region` overrides the default caret/selection scope (`None` = caret default);
+/// `Some(0..len)` is the whole-buffer scope used by the `_buffer` commands.
 /// `clock` is the same &dyn Clock that resolve_prompt receives.
 pub fn dispatch_transform(
     editor: &mut crate::editor::Editor,
     kind: TransformKind,
+    region: Option<std::ops::Range<usize>>,
     clock: &dyn wordcartel_core::history::Clock,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
 ) {
@@ -182,7 +185,7 @@ pub fn dispatch_transform(
         editor.status = "a transform is already running".into();
         return;
     }
-    let range = region_for_transform(&editor.active().document);
+    let range = region.unwrap_or_else(|| region_for_transform(&editor.active().document));
     if range.is_empty() {
         editor.status = "nothing to transform".into();
         return;
