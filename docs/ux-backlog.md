@@ -232,9 +232,23 @@ personality; (c) **Decided (2026-07-03): export-time typography adopted** as
 documented); `false` appends `-smart` to the pandoc source format for strict literal output.
 In-editor source remains untouched — fully compatible with source-as-is.
 
-### C2. Transform scope (Reflow/Unwrap/Ventilate) — `settled-design` · Medium
+### C2. Transform scope (Reflow/Unwrap/Ventilate) — **SHIPPED 2026-07-05** (merged @ 642290b)
 
-**Facts:** all three share `region_for_transform` (`transform.rs:84-92`): WITH a selection →
+Both decided rules landed, deepened by eight spec-review rounds into the TRANSFORM-UNIT rule:
+the caret acts on the nearest ListItem (marker + indent included, deepest for nested), else the
+nearest BlockQuote, else the leaf block; blank-line caret → "nothing to transform" (gaps never
+snap to containers); selection endpoints snap unit-deep with raw blank-gap endpoints. Explicit
+`reflow_buffer`/`unwrap_buffer`/`ventilate_buffer` (Format menu + palette) carry whole-document
+intent through the same guards; the ctrl-t chooser is unchanged (keys mean unit scope).
+Conventions worth knowing: every unit span extends to its line start (repar reflows at the
+right content column); uncovered NON-blank lines (link-reference definitions get no block from
+the parser — found by a gate probe as a fragment-mangling regression and fixed) widen selection
+endpoints to whole lines, so repar never sees a mid-line fragment; the mid-tab nested-item
+shape (`"- x\n\t- a"`) degrades to the OUTER item (pulldown can't split a tab byte —
+ratified accept-and-pin). Suite 1,048; both final gates GO/READY; smoke 8/8; live two-scope
+tmux sanity.
+
+**Original facts:** all three share `region_for_transform` (`transform.rs:84-92`): WITH a selection →
 snapped OUTWARD to whole TOP-LEVEL blocks intersecting it; WITHOUT a selection → the FULL
 BUFFER (`0..buf_len`).
 
@@ -497,8 +511,8 @@ relocates what C4/D1/A5/E1 touch (split early = every later effort lands in focu
 B2's hanging indent is a wrap-policy feature (travels inside B1); A3's palette parts share
 A6's territory; E2's checkable items serve A5/E1; C2 and C3 are islands.
 
-*(Progress: 1 A6 ✓ · 2 H1 ✓ · 3 B1+B2 ✓ · 4 C4 ✓ — all shipped 2026-07-04 —
-**next: 5, C2 transform scope**.)*
+*(Progress: 1 A6 ✓ · 2 H1 ✓ · 3 B1+B2 ✓ · 4 C4 ✓ (2026-07-04) · 5 C2 ✓ (2026-07-05) —
+**next: 6, D1+A5**.)*
 
 1. **A6** palette reachability — folds in A3(a) hints-verification + the palette-completeness
    invariant test (same territory). Kills the invisible-dispatch hazard first.
@@ -508,7 +522,7 @@ A6's territory; E2's checkable items serve A5/E1; C2 and C3 are islands.
    inside the wrap work). The user's highest-value rendering fix; the E-arc then gets judged
    on correctly wrapped text.
 4. **C4** close-buffer prompt — lands in the post-H1 prompts.rs, reuses the quit machinery.
-5. **C2** transform scope — settled, independent.
+5. **C2** transform scope — SHIPPED 2026-07-05.
 6. **D1 + A5** settings write-back + keymap switch — the persistence rail BEFORE the settings
    that ride it (E3's chrome axis, E1's presets).
 7. **E3** chrome theming coherence (+ the render.rs split; **E4's research kicks off in
