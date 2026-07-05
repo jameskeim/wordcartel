@@ -317,7 +317,8 @@ pub fn layout(
         // leave the current VG still over-wide (zero-width head; no-break-before tail).
         // Each pass either advances the break point strictly or falls back at the row
         // start, where the single-grapheme guard ends the loop — termination guaranteed.
-        while !hang && col + vg.width > vw && col > prefix_width {
+        // Worst-case re-place cost per over-wide VG is bounded by vw (a row's worth), so the hot path stays O(visible) for real viewports.
+        while !hang && col.saturating_add(vg.width) > vw && col > prefix_width {
             // Largest legal break k with row_start_vg < k <= i (breaks is ascending):
             // stateless O(log n) lookup — a per-row cursor that resets on re-placement
             // silently DROPS breaks between the chosen one and i (a W1 violation).
@@ -345,7 +346,7 @@ pub fn layout(
                     for p in placed[b..].iter_mut() {
                         p.row = row;
                         p.col = c;
-                        c += p.width;
+                        c = c.saturating_add(p.width);
                     }
                     col = c;
                     row_start_vg = b;
@@ -360,7 +361,7 @@ pub fn layout(
             }
         }
         placed.push(Placed { src: vg.src.clone(), row, col, width: vg.width, text: vg.text.clone(), style: vg.style });
-        col += vg.width;
+        col = col.saturating_add(vg.width);
     }
     row_end_col.push(col);
     let rows = row + 1;
