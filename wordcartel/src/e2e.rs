@@ -306,10 +306,10 @@ fn journey_row0_click_unrevealed_edits_text() {
 /// A6 journey: opening the palette and pressing End reaches the LAST registered
 /// command without filtering, and Enter dispatches it.
 ///
-/// The last command is `keymap_wordstar` (D1+A5 registration order) — benign and
-/// observable: dispatch flips active_keymap_preset and sets the switch status.
-/// The reach-without-typing property is the contract; selected must be within
-/// the visible window (selected - scroll_top < 15) before Enter.
+/// The last command is `save_settings` (D1+A5 T3 registration order) — benign and
+/// observable: dispatch sets `settings_save_requested = true`. The reach-without-typing
+/// property is the contract; selected must be within the visible window
+/// (selected - scroll_top < 15) before Enter.
 #[test]
 fn journey_palette_end_reaches_last_command() {
     // A tall document keeps the palette's row math honest under scrolling.
@@ -330,14 +330,12 @@ fn journey_palette_end_reaches_last_command() {
     let last_label = p.rows[last_idx].label.clone();
     assert!(h.screen_contains(&last_label),
         "last command label {last_label:?} must be visible on screen after End");
-    // Enter dispatches keymap_wordstar (last registered command) → keymap switches,
-    // status is set, palette closes. Verifies the end-of-list dispatch path (spec I4).
+    // Enter dispatches save_settings (last registered command) → settings_save_requested
+    // is set, palette closes. Verifies the end-of-list dispatch path (spec I4).
     h.key(KeyCode::Enter);
     assert!(h.editor.palette.is_none(), "Enter closes the palette");
-    assert_eq!(h.editor.active_keymap_preset, "wordstar",
-        "keymap_wordstar must be dispatched and set the active preset");
-    assert_eq!(h.editor.status, "keymap: wordstar",
-        "the switch status must survive through the rebuild");
+    assert!(h.editor.settings_save_requested,
+        "save_settings must be dispatched and set settings_save_requested");
 }
 
 // ---------------------------------------------------------------------------

@@ -468,6 +468,10 @@ impl Registry {
             switch_keymap_preset(c.editor, "wordstar");
             CommandResult::Handled
         });
+        r.register("save_settings", "Save Settings", Some(MenuCategory::Settings), |c| {
+            c.editor.settings_save_requested = true;
+            CommandResult::Handled
+        });
 
         r
     }
@@ -715,6 +719,7 @@ mod tests {
         for (id, label) in [
             ("keymap_cua",      "Keymap: CUA"),
             ("keymap_wordstar", "Keymap: WordStar"),
+            ("save_settings",   "Save Settings"),
         ] {
             let m = reg.meta(CommandId(id)).unwrap_or_else(|| panic!("missing {id}"));
             assert_eq!(m.label, label, "label mismatch for {id}");

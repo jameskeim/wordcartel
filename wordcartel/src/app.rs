@@ -209,12 +209,18 @@ pub(crate) fn rebuild_keymap_if_requested(
     Some(trie)
 }
 
-/// Apply the theme-picker's currently-selected built-in as a live preview.
+/// Apply the theme-picker's currently-selected built-in as a live preview and
+/// record the name in `tp.previewed` — the single funnel for identity threading.
 /// `pub(crate)` so mouse.rs can call it after a wheel-scroll selection change.
 pub(crate) fn preview_selected_theme(editor: &mut crate::editor::Editor) {
+    // Read the name first (drops the borrow), then apply, then set the field.
     let name = editor.theme_picker.as_ref().and_then(|tp| tp.rows.get(tp.selected).cloned());
     if let Some(name) = name {
-        if let Some(theme) = wordcartel_core::theme::Theme::builtin(&name) { editor.apply_theme(theme); }
+        if let Some(theme) = wordcartel_core::theme::Theme::builtin(&name) {
+            editor.apply_theme(theme);
+            // name still owned — `theme` did not borrow it; safe to re-borrow tp.
+            if let Some(tp) = editor.theme_picker.as_mut() { tp.previewed = Some(name); }
+        }
     }
 }
 
@@ -489,7 +495,13 @@ pub fn reduce(
                         // cancel preview → restore the theme active when we opened.
                         if let Some(tp) = editor.theme_picker.take() { editor.apply_theme(tp.original); }
                     }
-                    KeyCode::Enter => { editor.theme_picker = None; } // keep current preview
+                    KeyCode::Enter => {
+                        if let Some(tp) = editor.theme_picker.take() {
+                            if let Some(n) = tp.previewed {
+                                editor.theme_identity = crate::settings::ThemeIdentity::Builtin(n);
+                            } // untouched open→Enter: no preview applied, identity unchanged (spec I-1)
+                        }
+                    }
                     KeyCode::Up => {
                         let ah = editor.active().view.area.1;
                         if let Some(tp) = editor.theme_picker.as_mut() {
@@ -4546,6 +4558,60 @@ mod tests {
         let expected_name = tp.rows[tp.selected].clone();
         assert_eq!(e.theme.name, expected_name,
             "applied theme must equal tp.rows[selected]={expected_name:?}, got {:?}", e.theme.name);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 3 (D1+A5): picker Enter commits theme_identity; untouched picker does not
+    // -----------------------------------------------------------------------
+
+    /// Open the picker via the `theme` command dispatch, immediately Enter without
+    /// sending any navigation keys — no preview fired, so `previewed` is None;
+    /// `theme_identity` must stay at the initial Builtin("default").
+    #[test]
+    fn untouched_picker_enter_leaves_theme_identity_unchanged() {
+        use crate::registry::{Registry, CommandId, Ctx};
+        use crate::jobs::InlineExecutor;
+        use wordcartel_core::history::Clock;
+        struct Z; impl Clock for Z { fn now_ms(&self) -> u64 { 0 } }
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        let reg = Registry::builtins(); let km = cua_keymap();
+        let ex = InlineExecutor::default(); let clk = Z;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        // Open via the `theme` command dispatch — same path as the real menu.
+        { let tx2 = tx.clone(); let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx2 };
+          reg.dispatch(CommandId("theme"), &mut ctx); }
+        assert!(e.theme_picker.is_some(), "precondition: picker must be open");
+        // Enter immediately — no Down/Up, so previewed is None.
+        crate::app::reduce(press(KeyCode::Enter, KeyModifiers::NONE), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.theme_picker.is_none(), "picker must be closed after Enter");
+        assert_eq!(e.theme_identity,
+            crate::settings::ThemeIdentity::Builtin("default".into()),
+            "untouched Enter must leave theme_identity unchanged (spec I-1)");
+    }
+
+    /// Open the picker, send Down once through reduce (preview funnel fires for
+    /// rows[1]), then Enter — `theme_identity` must become `Builtin(rows[1])`.
+    #[test]
+    fn previewed_picker_enter_sets_builtin_identity() {
+        use crate::registry::Registry;
+        use crate::jobs::InlineExecutor;
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_theme_picker();
+        let reg = Registry::builtins(); let km = cua_keymap();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        // Down once: selected moves from 0 → 1; preview funnel fires for rows[1].
+        crate::app::reduce(press(KeyCode::Down, KeyModifiers::NONE), &mut e, &reg, &km, &ex, &clk, &tx);
+        // Capture the name that was previewed before Enter closes the picker.
+        let second_row = e.theme_picker.as_ref().unwrap().rows[1].clone();
+        // Enter: consumes previewed, sets theme_identity.
+        crate::app::reduce(press(KeyCode::Enter, KeyModifiers::NONE), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.theme_picker.is_none(), "picker closed after Enter");
+        assert_eq!(e.theme_identity,
+            crate::settings::ThemeIdentity::Builtin(second_row.clone()),
+            "Enter must commit Builtin({second_row:?}) from the previewed row");
     }
 
     /// The arm block (post-rebuild) sets `due_at` once and does not push the
