@@ -90,11 +90,13 @@ ENTIRE list (top-level snap reaches the `List` container, not the `ListItem`).
     line is NON-blank (a loose item's own marker bytes; a tight item's lead text before
     its nested list; a top-level quote's own `> ` prefix bytes) → the SAME preference
     set as the leaf branch (Fable r6 N2): nearest `ListItem` on the path, else nearest
-    `BlockQuote`, else None — **with ONE refinement (Fable r6 N5, user-ratified A): if
-    the byte sits in the LEADING INDENT of a line whose first content begins a CHILD
-    `ListItem` (the two spaces before a nested item's marker), the unit is THAT CHILD —
-    Home-then-transform acts on the item the eye is on, per decision 2's deepest-item
-    principle, not the outer item the indent structurally belongs to.** (The
+    `BlockQuote`, else None — **with ONE refinement (Fable r6 N5, user-ratified A; wording line-keyed per r7
+    P1): if the first non-space content of the byte's LINE begins a `ListItem` block —
+    at ANY depth beneath the descent's final node (the first nested item's indent ends
+    the descent at the OUTER Item, where the target is a grandchild; List spans exclude
+    leading indent too) — the unit is THAT ListItem. Home-then-transform acts on the
+    item the eye is on, per decision 2's deepest-item principle, not the outer item the
+    indent structurally belongs to.** (The
     degraded-parse derivation in Non-goals stays exact: the childless root has no
     ListItem, no BlockQuote, no child on the line → None.)
   - **Every returned unit span extends to `line_start(span.start)`** (Fable r5 C1:
@@ -229,7 +231,9 @@ The chooser's prompt string is also unchanged.
   4-column continuations survive the round trip); `caret_on_loose_item_marker_transforms_the_item`
   and `caret_in_tight_item_lead_text_transforms_the_item` (**Fable C2's content-not-gap
   pins**); `caret_in_nested_item_indent_transforms_the_child_item` (**the r6 N5
-  refinement's pin**: Home on a `  - inner` line → the INNER item's unit); `caret_reflow_on_blank_line_noops_with_status` (status `"nothing to transform"` — the
+  refinement's pin**: Home on a `  - inner` line → the INNER item's unit — corpus must
+  include the FIRST-nested-item shape, the r7 P1 case, plus a space-indented TOP-LEVEL
+  item `" - a"` which the line-keyed rule also resolves to the item, r7 P4); `caret_reflow_on_blank_line_noops_with_status` (status `"nothing to transform"` — the
   existing empty-range guard);
   `caret_reflow_in_fence_noops` (verbatim pass-through); `buffer_variants_act_whole_buffer`
   (one of the three suffices for region proof + the registry test extends to six
@@ -237,6 +241,9 @@ The chooser's prompt string is also unchanged.
   sibling-preservation test.
 - registry.rs: `transforms_are_registered_commands_in_format_category` (registry.rs:573)
   extends to the six ids/labels.
+- The D3 guard pins (Fable r7 P3, named here so the plan's enumeration carries them):
+  `buffer_variant_rejected_while_in_flight`;
+  `buffer_variant_on_empty_buffer_says_nothing_to_transform`.
 - e2e journey: a three-item list document, caret into item 2, ctrl-t → `r` → only item 2
   changes on screen; then palette-dispatch `Reflow Buffer` → the whole document rewraps.
 
