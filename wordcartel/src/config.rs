@@ -145,6 +145,17 @@ impl Default for KeymapConfig {
 pub struct KeymapPatch {
     pub bind: BTreeMap<String, String>,
     pub unbind: Vec<String>,
+    pub cua: Option<ScopedPatch>,
+    pub wordstar: Option<ScopedPatch>,
+}
+
+/// Per-preset binding overrides, captured from a `[keymap.<preset>]` sub-table.
+/// Within a patch layer, these are applied AFTER the layer's global `bind`/`unbind`,
+/// so a scoped entry beats a global entry in the same layer ("specific wins").
+#[derive(Debug, Clone, Default)]
+pub struct ScopedPatch {
+    pub bind: BTreeMap<String, String>,
+    pub unbind: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +223,18 @@ struct RawDiagnostics {
 #[serde(default)]
 struct RawKeymap {
     preset: Option<String>,
+    bind: BTreeMap<String, String>,
+    unbind: Vec<String>,
+    /// NOTE: once a [keymap.cua] header appears, [keymap]-intended keys typed below it
+    /// silently belong to the scoped table (TOML section semantics).
+    cua: Option<RawScoped>,
+    /// NOTE: once a [keymap.wordstar] header appears, [keymap]-intended keys typed below it
+    /// silently belong to the scoped table (TOML section semantics).
+    wordstar: Option<RawScoped>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawScoped {
     bind: BTreeMap<String, String>,
     unbind: Vec<String>,
 }
@@ -314,6 +337,8 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
         cfg.keymap.patches.push(KeymapPatch {
             bind: raw.keymap.bind,
             unbind: raw.keymap.unbind,
+            cua: raw.keymap.cua.map(|s| ScopedPatch { bind: s.bind, unbind: s.unbind }),
+            wordstar: raw.keymap.wordstar.map(|s| ScopedPatch { bind: s.bind, unbind: s.unbind }),
         });
         // state: per-field override (omitted field inherits the lower layer).
         if let Some(r) = raw.state.resume {
@@ -723,6 +748,31 @@ mod tests {
         assert_eq!(cfg.menu.bar, MenuBarMode::Auto, "bogus value → stays Auto");
         assert!(warns.iter().any(|w| w.contains("menu.bar")),
             "must warn containing 'menu.bar'; got: {warns:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 1 (D1+A5): preset-scoped keymap patches
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scoped_keymap_tables_parse_into_named_fields() {
+        let d = tempdir();
+        let p = write(&d, "s.toml",
+            "[keymap]\npreset='cua'\nbind={ \"ctrl-g\"='goto_line' }\n[keymap.cua]\nbind={ \"ctrl-w\"='close_buffer' }\n[keymap.wordstar]\nunbind=[\"ctrl-q ctrl-q\"]\n");
+        let (cfg, warns) = load(&[p]);
+        assert!(warns.is_empty());
+        let patch = &cfg.keymap.patches[0];
+        assert!(patch.bind.contains_key("ctrl-g"), "global bind unchanged");
+        assert_eq!(patch.cua.as_ref().unwrap().bind.get("ctrl-w").unwrap(), "close_buffer");
+        assert_eq!(patch.wordstar.as_ref().unwrap().unbind[0], "ctrl-q ctrl-q");
+    }
+
+    #[test]
+    fn global_only_configs_leave_scoped_fields_none() {
+        let d = tempdir();
+        let p = write(&d, "g.toml", "[keymap]\nbind={ \"ctrl-g\"='goto_line' }\n");
+        let (cfg, _) = load(&[p]);
+        assert!(cfg.keymap.patches[0].cua.is_none() && cfg.keymap.patches[0].wordstar.is_none());
     }
 
 }

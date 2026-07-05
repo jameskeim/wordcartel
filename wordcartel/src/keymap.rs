@@ -210,6 +210,13 @@ pub fn preset_bindings(name: &str) -> Option<&'static [(&'static str, &'static s
     }
 }
 
+/// Resolve a raw preset string to a known base ("cua" | "wordstar"); unknown → "cua".
+/// Shared by build_keymap (base + scoped selection) and run()'s seeding so the two
+/// can never disagree about what an unknown preset fell back to.
+pub fn resolve_preset(name: &str) -> &'static str {
+    match name { "wordstar" => "wordstar", _ => "cua" }
+}
+
 /// CUA preset — mirrors every named-command binding in `input::key_to_command_id`.
 ///
 /// Excluded (no CommandId): printable `Char(c)` without ctrl/alt — those are
@@ -421,7 +428,6 @@ static WORDSTAR: &[(&str, &str)] = &[
 /// Unknown preset name → warning + fall back to `"cua"`.
 /// Bad chord string or unknown command-id in a patch → warning + skip.
 /// Preset base entries never warn (integrity guaranteed by `both_presets_resolve_against_builtins`).
-#[allow(dead_code)] // wired in Task 4/5
 pub fn build_keymap(km: &crate::config::KeymapConfig, reg: &Registry) -> (KeyTrie, Vec<String>) {
     let mut warns: Vec<String> = Vec::new();
     let mut trie = KeyTrie::default();
@@ -445,47 +451,70 @@ pub fn build_keymap(km: &crate::config::KeymapConfig, reg: &Registry) -> (KeyTri
     }
 
     // 2) Apply patch layers in order (lowest → highest precedence).
-    //    Within each patch, binds come before unbinds so a same-patch unbind
-    //    can remove a just-added bind; across patches a later patch's bind
-    //    overrides any earlier patch's unbind.
+    //    Within each patch: global tables first, then the active preset's scoped table —
+    //    "later file wins; within a file, specific wins" (spec D1).
     for patch in &km.patches {
-        for (chord_str, id_str) in &patch.bind {
-            let seq = match parse_seq(chord_str) {
-                Some(s) => s,
-                None => {
-                    warns.push(format!("config: bad chord '{chord_str}'"));
-                    continue;
-                }
-            };
-            // Esc is reserved for cancel/dismiss in v1: the reducer special-cases
-            // KeyCode::Esc before routing to the keymap, so any config binding whose
-            // first chord is Esc (any modifiers) would be a silent dead binding.
-            if seq.first().map(|c| c.code == KeyCode::Esc).unwrap_or(false) {
-                warns.push(format!(
-                    "config: '{chord_str}' cannot be bound — Esc is reserved for cancel/dismiss"
-                ));
-                continue;
-            }
-            let id = match reg.resolve_name(id_str) {
-                Some(i) => i,
-                None => {
-                    warns.push(format!(
-                        "config: '{chord_str}' → unknown command '{id_str}'"
-                    ));
-                    continue;
-                }
-            };
-            trie.bind(seq, id);
-        }
-        for chord_str in &patch.unbind {
-            match parse_seq(chord_str) {
-                Some(seq) => trie.unbind(&seq),
-                None => warns.push(format!("config: bad unbind chord '{chord_str}'")),
-            }
+        // 2a) Global bind/unbind tables.
+        apply_patch_tables(&mut trie, &mut warns, reg, &patch.bind, &patch.unbind);
+
+        // 2b) The active preset's scoped table, after the layer's global tables —
+        //     "later file wins; within a file, specific wins" (spec D1).
+        let scoped = match resolve_preset(&km.preset) {
+            "wordstar" => patch.wordstar.as_ref(),
+            _ => patch.cua.as_ref(),
+        };
+        if let Some(s) = scoped {
+            apply_patch_tables(&mut trie, &mut warns, reg, &s.bind, &s.unbind);
         }
     }
 
     (trie, warns)
+}
+
+/// Apply a bind map and unbind list to `trie`, pushing warnings for bad chords /
+/// unknown commands.  Shared by the global and scoped application paths so the
+/// warning strings stay in one place with no duplication.
+fn apply_patch_tables(
+    trie: &mut KeyTrie,
+    warns: &mut Vec<String>,
+    reg: &Registry,
+    bind: &std::collections::BTreeMap<String, String>,
+    unbind: &[String],
+) {
+    for (chord_str, id_str) in bind {
+        let seq = match parse_seq(chord_str) {
+            Some(s) => s,
+            None => {
+                warns.push(format!("config: bad chord '{chord_str}'"));
+                continue;
+            }
+        };
+        // Esc is reserved for cancel/dismiss in v1: the reducer special-cases
+        // KeyCode::Esc before routing to the keymap, so any config binding whose
+        // first chord is Esc (any modifiers) would be a silent dead binding.
+        if seq.first().map(|c| c.code == KeyCode::Esc).unwrap_or(false) {
+            warns.push(format!(
+                "config: '{chord_str}' cannot be bound — Esc is reserved for cancel/dismiss"
+            ));
+            continue;
+        }
+        let id = match reg.resolve_name(id_str) {
+            Some(i) => i,
+            None => {
+                warns.push(format!(
+                    "config: '{chord_str}' → unknown command '{id_str}'"
+                ));
+                continue;
+            }
+        };
+        trie.bind(seq, id);
+    }
+    for chord_str in unbind {
+        match parse_seq(chord_str) {
+            Some(seq) => trie.unbind(&seq),
+            None => warns.push(format!("config: bad unbind chord '{chord_str}'")),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -504,6 +533,7 @@ mod tests {
             patches: vec![crate::config::KeymapPatch {
                 bind: bind.iter().map(|(k,v)| (k.to_string(), v.to_string())).collect(),
                 unbind: unbind.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
             }],
         };
         build_keymap(&cfg, &Registry::builtins())
@@ -515,8 +545,8 @@ mod tests {
         let cfg = crate::config::KeymapConfig {
             preset: "cua".into(),
             patches: vec![
-                crate::config::KeymapPatch { bind: Default::default(), unbind: vec!["ctrl-c".into()] }, // low
-                crate::config::KeymapPatch { bind: [("ctrl-c".to_string(), "copy".to_string())].into_iter().collect(), unbind: vec![] }, // high
+                crate::config::KeymapPatch { bind: Default::default(), unbind: vec!["ctrl-c".into()], ..Default::default() }, // low
+                crate::config::KeymapPatch { bind: [("ctrl-c".to_string(), "copy".to_string())].into_iter().collect(), unbind: vec![], ..Default::default() }, // high
             ],
         };
         let (t, _) = build_keymap(&cfg, &Registry::builtins());
@@ -784,6 +814,72 @@ mod tests {
         assert!(w.is_empty(), "no wordstar warnings: {w:?}");
         let (_t, w) = km(&[], &[], Some("cua"));
         assert!(w.is_empty(), "no cua warnings: {w:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 1 (D1+A5): resolve_preset + preset-scoped keymap patches
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_preset_falls_back_to_cua() {
+        assert_eq!(resolve_preset("wordstar"), "wordstar");
+        assert_eq!(resolve_preset("cua"), "cua");
+        assert_eq!(resolve_preset("dvorak"), "cua");
+    }
+
+    #[test]
+    fn scoped_patch_applies_only_under_its_preset() {
+        // cua-scoped rebind of ctrl-w: applies under cua, not under wordstar.
+        let scoped = crate::config::ScopedPatch {
+            bind: [("ctrl-w".to_string(), "close_buffer".to_string())].into(), unbind: vec![] };
+        let mk = |preset: &str| crate::config::KeymapConfig {
+            preset: preset.into(),
+            patches: vec![crate::config::KeymapPatch { cua: Some(scoped.clone()), ..Default::default() }],
+        };
+        let reg = Registry::builtins();
+        let (cua_trie, w1) = build_keymap(&mk("cua"), &reg);
+        let (ws_trie, w2) = build_keymap(&mk("wordstar"), &reg);
+        assert!(w1.is_empty() && w2.is_empty());
+        let cw = parse_seq("ctrl-w").unwrap();
+        assert!(matches!(cua_trie.resolve(&cw), Resolution::Command(CommandId("close_buffer"))));
+        assert!(matches!(ws_trie.resolve(&cw), Resolution::Command(CommandId("scroll_line_up"))),
+            "wordstar keeps its own ctrl-w — the scoped patch must not leak");
+    }
+
+    #[test]
+    fn specific_wins_within_a_layer_and_later_layer_wins_across() {
+        // Layer 1: global ctrl-g -> goto_line, cua-scoped ctrl-g -> copy (specific wins in layer 1).
+        // Layer 2: global ctrl-g -> paste (later layer's GLOBAL beats earlier layer's SCOPED).
+        let l1 = crate::config::KeymapPatch {
+            bind: [("ctrl-g".to_string(), "goto_line".to_string())].into(),
+            cua: Some(crate::config::ScopedPatch {
+                bind: [("ctrl-g".to_string(), "copy".to_string())].into(), unbind: vec![] }),
+            ..Default::default() };
+        let l2 = crate::config::KeymapPatch {
+            bind: [("ctrl-g".to_string(), "paste".to_string())].into(), ..Default::default() };
+        let reg = Registry::builtins();
+        let (one, _) = build_keymap(&crate::config::KeymapConfig {
+            preset: "cua".into(), patches: vec![l1.clone()] }, &reg);
+        let g = parse_seq("ctrl-g").unwrap();
+        assert!(matches!(one.resolve(&g), Resolution::Command(CommandId("copy"))), "specific wins within the layer");
+        let (two, _) = build_keymap(&crate::config::KeymapConfig {
+            preset: "cua".into(), patches: vec![l1, l2] }, &reg);
+        assert!(matches!(two.resolve(&g), Resolution::Command(CommandId("paste"))), "later layer wins outright");
+    }
+
+    #[test]
+    fn scoped_tables_key_off_the_resolved_preset() {
+        // preset="dvorak" resolves to cua → [keymap.cua] applies (spec M-5).
+        let cfgk = crate::config::KeymapConfig {
+            preset: "dvorak".into(),
+            patches: vec![crate::config::KeymapPatch {
+                cua: Some(crate::config::ScopedPatch {
+                    bind: [("ctrl-w".to_string(), "close_buffer".to_string())].into(), unbind: vec![] }),
+                ..Default::default() }],
+        };
+        let (t, warns) = build_keymap(&cfgk, &Registry::builtins());
+        assert!(warns.iter().any(|w| w.contains("unknown keymap.preset")), "fallback still warns");
+        assert!(matches!(t.resolve(&parse_seq("ctrl-w").unwrap()), Resolution::Command(CommandId("close_buffer"))));
     }
 
     #[test]

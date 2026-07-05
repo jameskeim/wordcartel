@@ -3126,7 +3126,7 @@ mod tests {
         // bind a 2-key save sequence
         let cfg = crate::config::KeymapConfig { preset: "cua".into(),
             patches: vec![crate::config::KeymapPatch {
-                bind: [("ctrl-k ctrl-s".to_string(), "save".to_string())].into_iter().collect(), unbind: vec![] }] };
+                bind: [("ctrl-k ctrl-s".to_string(), "save".to_string())].into_iter().collect(), unbind: vec![], ..Default::default() }] };
         let (km, _) = crate::keymap::build_keymap(&cfg, &Registry::builtins());
         let mut e = Editor::new_from_text("x\n", Some("/tmp/wc-kmtest.md".into()), (80, 24));
         let (tx,_rx)=std::sync::mpsc::channel();
@@ -3145,7 +3145,7 @@ mod tests {
         use crossterm::event::{KeyCode, KeyModifiers};
         let cfg = crate::config::KeymapConfig { preset: "cua".into(),
             patches: vec![crate::config::KeymapPatch {
-                bind: [("ctrl-k ctrl-s".to_string(), "save".to_string())].into_iter().collect(), unbind: vec![] }] };
+                bind: [("ctrl-k ctrl-s".to_string(), "save".to_string())].into_iter().collect(), unbind: vec![], ..Default::default() }] };
         let (km, _) = crate::keymap::build_keymap(&cfg, &Registry::builtins());
         let mut e = Editor::new_from_text("abc\n", None, (80, 24));
         let before = e.active().document.buffer.to_string();
@@ -3167,6 +3167,7 @@ mod tests {
             patches: vec![crate::config::KeymapPatch {
                 bind: [("ctrl-g".to_string(), "move_line_start".to_string())].into_iter().collect(),
                 unbind: vec![],
+                ..Default::default()
             }],
         };
         let (km, warns) = crate::keymap::build_keymap(&cfg, &crate::registry::Registry::builtins());
