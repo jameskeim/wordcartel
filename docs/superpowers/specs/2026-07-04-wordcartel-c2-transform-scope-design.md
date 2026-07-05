@@ -140,9 +140,10 @@ block, the interior stays.
   BLANK, `transform_unit_at` returns None → raw endpoint, never a container span
   (otherwise a selection into structural blank territory pulls in whole containers —
   the surprise-diff class decision 1 exists to kill). When the line is NON-blank (Fable
-  C2's marker-bytes / lead-text shapes), the nearest `ListItem` on the path is the unit.
-  Gap-means-gap applies to BLANKS regardless of ancestors; content always finds its
-  item. Pinned by loose-list, nested-list blank, marker-byte, and lead-text tests.
+  C2's marker-bytes / lead-text shapes), D1's container branch governs IN FULL — the
+  preference set plus the N5 line-keyed refinement; this bullet is a pointer, not a
+  divergent endpoint rule (Fable r7 P2). Gap-means-gap applies to BLANKS regardless of
+  ancestors; content always finds its unit. Pinned by loose-list, nested-list blank, marker-byte, and lead-text tests.
 - Return `start..end`. Degenerate guard: if the computed range is empty or inverted
   (unreachable with a non-empty selection, but SATURATING discipline applies), return
   `from..to`.
