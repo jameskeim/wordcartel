@@ -126,8 +126,11 @@
         let text3 = "- x\n\t- a\n";
         let bt3 = blocks_of(text3);
         let outer3 = &bt3.top_level()[0].children[0];
-        let has_nested_item = fn_has_descendant_item(outer3); // helper below, or inline the check
-        assert!(has_nested_item, "precondition: the tab-indented line parses as a nested ListItem — if this fails, choose a corpus pulldown accepts and record it");
+        // Inline descendant-ListItem check (Codex plan r1: define before use, no forward ref).
+        fn has_descendant_item(b: &wordcartel_core::block_tree::Block) -> bool {
+            b.children.iter().any(|c| matches!(c.kind, wordcartel_core::block_tree::BlockKind::ListItem) || has_descendant_item(c))
+        }
+        assert!(has_descendant_item(outer3), "precondition: the tab-indented line parses as a nested ListItem — if this fails, choose a corpus pulldown accepts and record it");
         let u3 = transform_unit_at(text3, &bt3, 4).expect("tab indent byte");
         assert!(u3.start == 4, "line-start-extended nested item: {u3:?}");
     }
@@ -159,7 +162,7 @@
     }
 ```
 
-(`fn_has_descendant_item` — write a three-line recursive helper in the test module, or inline the check; keep it test-local.) Run: `cargo test -p wordcartel transform_unit caret_` — FAIL to compile (`transform_unit_at` doesn't exist): the recorded RED.
+Run: `cargo test -p wordcartel transform_unit caret_` — FAIL to compile (`transform_unit_at` doesn't exist): the recorded RED.
 
 - [ ] **Step 2: implement the lookup.** In transform.rs, above `snap_to_blocks`, add (complete):
 
