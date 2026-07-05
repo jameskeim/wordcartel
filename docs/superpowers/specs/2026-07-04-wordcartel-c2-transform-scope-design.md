@@ -67,19 +67,32 @@ ENTIRE list (top-level snap reaches the `List` container, not the `ListItem`).
 `0..buf_len`. New behavior: the deepest block containing the caret —
 
 - **The lookup is TRANSFORM-SPECIFIC — `deepest_block_at` alone is insufficient (Codex
-  r2):** the block tree nests `Paragraph` leaves INSIDE `ListItem`s (block_tree.rs:261/
-  :405), so the deepest leaf under a caret in item-body text is the marker-LESS
-  paragraph span — feeding it to repar IS the fragment landmine. New
-  `fn transform_unit_at(blocks: &BlockTree, pos: usize) -> Option<Range<usize>>` in
-  transform.rs: descend recording the path (root → deepest node containing `pos`, the
-  same half-open `pos < span.end` test); the unit is the span of the NEAREST `ListItem`
-  ancestor of the deepest leaf (for nested lists this is the DEEPEST ListItem on the
-  path — a caret in a sub-item transforms the sub-item, per decision 2); if no ListItem
-  is on the path, the deepest LEAF's span. `deepest_block_at` in nav.rs stays untouched
-  (text-objects keep their semantics); no hoist needed. **Plan-phase grounding check:**
-  verify whether `Paragraph` children inside a `BlockQuote` carry the `> ` prefixes in
-  their spans; if NOT, `BlockQuote` joins `ListItem` in the ancestor-preference set
-  (same rule, one more kind).
+  r2; mechanics corrected by Fable r5 probes):** the block tree nests `Paragraph`
+  leaves INSIDE `ListItem`s (block_tree.rs:261/:405), so the deepest leaf under a caret
+  in item-body text is the marker-LESS paragraph span — feeding it to repar IS the
+  fragment landmine. New
+  `fn transform_unit_at(text, blocks: &BlockTree, pos: usize) -> Option<Range<usize>>`
+  in transform.rs (it needs line-start access — the signature carries whatever text/
+  line-index handle the plan grounds; `TextSource::line_start` exists,
+  block_tree.rs:19-21): descend recording the path (root → deepest node containing
+  `pos`, the half-open `pos < span.end` test), then:
+  - **A leaf contains the byte:** the unit is the NEAREST `ListItem` ancestor of that
+    leaf (the DEEPEST ListItem on the path — a caret in a sub-item transforms the
+    sub-item, per decision 2); if no ListItem is on the path but a `BlockQuote` is, the
+    nearest BlockQuote (Fable I2/r5 probe — quote-paragraph spans start after the first
+    `> ` but include it on continuations, so a bare paragraph slice mixes prefixes and
+    silently no-ops; **ListItem anywhere on the path BEATS BlockQuote**); else the leaf
+    itself.
+  - **The descent ends at a CONTAINER (no child contains the byte):** discriminate by
+    LINE BLANKNESS (Fable r5 C2 — container-interior bytes include real content): if
+    the byte's LINE is blank → None (gap; preserves every approved gap outcome); if the
+    line is NON-blank (a loose item's own marker bytes; a tight item's lead text before
+    its nested list) → the nearest `ListItem` on the path is the unit — that content
+    belongs to the item.
+  - **Every returned unit span extends to `line_start(span.start)`** (Fable r5 C1:
+    nested-item and quote spans EXCLUDE leading indent/prefix bytes; without the
+    extension the slice starts mid-line and repar reflows at the wrong content column).
+  `deepest_block_at` in nav.rs stays untouched (text-objects keep their semantics).
 - `region_for_transform(doc)` with an empty selection: `transform_unit_at(blocks, caret)`
   (the primary head, clamped to `buf_len.saturating_sub(1)` for the end-of-buffer
   caret); if found, return its span. If `transform_unit_at` returns None (a top-level
