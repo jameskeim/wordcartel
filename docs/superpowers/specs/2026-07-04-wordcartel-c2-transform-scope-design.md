@@ -27,8 +27,19 @@ ENTIRE list (top-level snap reaches the `List` container, not the `ListItem`).
 
 - **The deepest lookup exists:** `deepest_block_at(block, pos) -> Option<&Block>`
   (nav.rs:641-651, currently private) recursively prefers the deepest child containing
-  `pos`; `paragraph_range_at` (nav.rs:656-700) already uses it for text-objects, with a
+  `pos`; `paragraph_range_at` (nav.rs:656-686) already uses it for text-objects, with a
   blank-line-gap fallback when no block contains `pos`.
+- **Span anatomy, probe-verified (Fable r5, compiled against the locked pulldown/repar
+  rlibs):** (a) NESTED `ListItem` spans EXCLUDE their leading indent (`"  - inner…"`
+  spans from the `-`, not the line start) — a unit slice must be extended to
+  `line_start(span.start)` or repar reflows at the wrong content column; (b) loose-list
+  inter-item blanks live INSIDE the PRECEDING item's span (unit spans may carry trailing
+  blank lines — harmless, repar round-trips them; tests must expect it); (c) container-
+  interior bytes include NON-BLANK content: a loose item's own marker bytes sit outside
+  its Paragraph child, and a tight item's lead text before a nested list has no child at
+  all; (d) `Paragraph` children inside `BlockQuote` start after the first `> ` but
+  INCLUDE `> ` on continuation lines — a bare quote-paragraph slice mixes prefixes and
+  repar passes it through unchanged (a false "already" status).
 - **Item-scope marker handling exists:** repar's markdown driver routes list segments to
   `handle_list`/`reflow_item`, which strip the marker/indent, reflow the body at
   `width - content_col`, and re-emit the VERBATIM marker + space-indent continuations.
@@ -74,7 +85,7 @@ ENTIRE list (top-level snap reaches the `List` container, not the `ListItem`).
   caret); if found, return its span. If `transform_unit_at` returns None (a top-level
   blank-line gap OR a container-interior gap — Codex r3 wording): return the EMPTY range
   `caret..caret` — `dispatch_transform` ALREADY guards empty ranges and returns the
-  status `"nothing to transform"` before `run_transform` runs (transform.rs:110 — Codex
+  status `"nothing to transform"` before `run_transform` runs (transform.rs:111-113 — Codex
   r1 corrected the original claim, which cited the identical-output "already …" path;
   NO new code, the existing guard is the no-op). (Rationale: a caret on a blank line has
   no block intent; doing nothing loudly beats guessing. This diverges from
@@ -96,20 +107,17 @@ block, the interior stays.
   `start = from` (raw, today's fallback behavior).
 - `end` = `transform_unit_at(blocks, to.saturating_sub(1))` (the last selected byte —
   `to` is exclusive) → its `span.end`; gap → `end = to`.
-- **"Gap" includes CONTAINER-INTERIOR blanks (Codex r1 I-3, lookup-shape note per r2):**
-  when the descent's deepest node containing the byte is a CONTAINER whose children do
-  not contain it (e.g. the blank line between loose-list items lies inside `List.span`
-  but inside no `ListItem` — detectable during the path walk: the final node has
-  children but none matched), `transform_unit_at` returns None → the endpoint is a GAP
-  (raw endpoint), NEVER the container's span. Otherwise a selection from item 1 into an
-  inter-item blank would silently pull in every later item (the surprise-diff class
-  decision 1 exists to kill). **The None is UNCONDITIONAL for container-interior bytes
-  — even when a `ListItem` ancestor sits on the path above the gap-container (Codex r3:
-  nested lists produce exactly that shape — `Document → List → ListItem → nested List`
-  with the nested list's inter-item blank inside the OUTER item). Snapping such a blank
-  to the outer item would pull the whole outer item in; gap-means-gap wins over the
-  ancestor preference, which applies only when a leaf CONTAINS the byte.** Pinned by
-  dedicated loose-list AND nested-list inter-item-blank tests.
+- **"Gap" = container-interior BLANK-LINE bytes (r1 I-3 → r3 → corrected by Fable r5's
+  anatomy):** the probe-true shapes: a loose item's trailing blank lives INSIDE that
+  item's span (so an endpoint there resolves to the item — fine, whole span); the
+  genuinely container-interior bytes are the next marker's leading indent and true
+  inter-structure blanks. When the descent ends at a container and the byte's line is
+  BLANK, `transform_unit_at` returns None → raw endpoint, never a container span
+  (otherwise a selection into structural blank territory pulls in whole containers —
+  the surprise-diff class decision 1 exists to kill). When the line is NON-blank (Fable
+  C2's marker-bytes / lead-text shapes), the nearest `ListItem` on the path is the unit.
+  Gap-means-gap applies to BLANKS regardless of ancestors; content always finds its
+  item. Pinned by loose-list, nested-list blank, marker-byte, and lead-text tests.
 - Return `start..end`. Degenerate guard: if the computed range is empty or inverted
   (unreachable with a non-empty selection, but SATURATING discipline applies), return
   `from..to`.
@@ -126,15 +134,17 @@ bytes are blank-line territory, not partial blocks).
 
 Three new registry entries beside the existing three (registry.rs:285-295), same
 `MenuCategory::Format`, labels `Reflow Buffer` / `Unwrap Buffer` / `Ventilate Buffer`,
-ids `reflow_buffer` / `unwrap_buffer` / `ventilate_buffer`. They dispatch through a new
-`dispatch_transform_buffer(editor, kind, clock, msg_tx)` (or an explicit-region parameter
-on the existing dispatch — the plan picks the smaller diff) whose region is `0..buf_len`
-unconditionally. Everything downstream (async threshold, guard, merge, staleness) is the
+ids `reflow_buffer` / `unwrap_buffer` / `ventilate_buffer`. They dispatch through an
+EXPLICIT-REGION parameter on the existing `dispatch_transform` (Fable I3 — the
+`transform_in_flight` and empty-range guards live UPSTREAM in that fn, transform.rs:
+106-113; a fresh sibling fn would bypass both, double-dispatching async transforms and
+mis-reporting empty buffers) whose region is `0..buf_len` unconditionally. Both guards
+apply identically to both scopes — pinned. Everything downstream (async threshold, guard, merge, staleness) is the
 shared path. The 1 MiB async route remains reachable from BOTH scopes — any single
 block ≥ 1 MiB routes async under the caret default (Codex r1) — the `_buffer` variants
 merely make it the common case.
 
-**The ctrl-t chooser is UNCHANGED** (prompt.rs:115-130: `r`/`u`/`v`): its keys now mean
+**The ctrl-t chooser is UNCHANGED** (prompt.rs:115-125: `r`/`u`/`v`): its keys now mean
 block scope, which IS the new default — the least input produces the proportionate
 effect. Buffer scope is a deliberate, named palette/menu action (per decision 1's text).
 The chooser's prompt string is also unchanged.
@@ -146,8 +156,8 @@ The chooser's prompt string is also unchanged.
   the async threshold and staleness discipline, `MAX_TRANSFORM_OUTPUT`.
 - `DEFAULT_REFLOW_WIDTH = 72` stays decoupled from `wrap_column` (a pre-existing quirk,
   recorded as out of scope).
-- `paragraph_range_at` and every text-object consumer of `deepest_block_at` — behavior
-  identical (the hoist is visibility-only).
+- `paragraph_range_at` and every text-object consumer of `deepest_block_at` — untouched
+  (no hoist; `transform_unit_at` is a separate transform-owned walk).
 - No keybindings; no core (`wordcartel-core`) changes — `Block`/`BlockTree` already
   expose everything needed.
 
@@ -155,8 +165,10 @@ The chooser's prompt string is also unchanged.
 
 **Existing tests whose meaning changes (sanctioned, enumerate-and-say-loudly):**
 - `reflow_whole_buffer_applies_one_undoable_edit` (app.rs:2699) → becomes the
-  `reflow_buffer`-variant test (same assertions, driven by the new command), and a NEW
-  sibling pins the ctrl-t default acting on the caret block only.
+  `reflow_buffer`-variant test (same assertions, driven by the new command; its
+  single-paragraph corpus would pass unchanged either way — Fable M6), and a NEW
+  sibling with a MULTI-BLOCK corpus pins the ctrl-t default acting on the caret block
+  only (a single-block corpus cannot discriminate).
 - `transform_with_identical_output_makes_no_edit` (app.rs:2715) → unchanged assertions;
   its single-block corpus means the caret default reaches the same region (verify, note
   in the report).
@@ -182,12 +194,17 @@ The chooser's prompt string is also unchanged.
   blank between a NESTED list's items — inside the outer ListItem — stays raw, the
   outer item is NOT pulled in); `snap_inside_one_list_item_touches_only_that_item`;
   `snap_across_three_items_touches_exactly_those`; `snap_paragraph_into_list_unions_endpoints`;
-  `snap_selection_wholly_in_gap_returns_input`; `caret_region_is_deepest_block`
-  (item + nested-item + paragraph cases); `caret_region_in_gap_is_empty`;
+  `snap_selection_wholly_in_gap_returns_input`; `caret_region_is_the_transform_unit`
+  (item + nested-item + paragraph cases — deliberately NOT the deepest block for item
+  bodies; Fable M5); `caret_region_in_gap_is_empty`;
   `caret_region_at_end_of_buffer_clamps` (the `buf_len` caret).
 - Behavior: `caret_reflow_inside_item_preserves_siblings` (three-item list, caret in
   item 2, reflow → items 1 and 3 byte-identical, item 2 rewrapped with marker + hanging
-  indent intact); `caret_reflow_on_blank_line_noops_with_status` (status `"nothing to transform"` — the
+  indent intact); `caret_reflow_inside_NESTED_item_preserves_indent` (**Fable C1's
+  behavior pin**: the unit extends to line start; the nested marker's indent and the
+  4-column continuations survive the round trip); `caret_on_loose_item_marker_transforms_the_item`
+  and `caret_in_tight_item_lead_text_transforms_the_item` (**Fable C2's content-not-gap
+  pins**); `caret_reflow_on_blank_line_noops_with_status` (status `"nothing to transform"` — the
   existing empty-range guard);
   `caret_reflow_in_fence_noops` (verbatim pass-through); `buffer_variants_act_whole_buffer`
   (one of the three suffices for region proof + the registry test extends to six
@@ -208,7 +225,14 @@ performed by hand at a narrow width).
 - No `wrap_column`-aware reflow width (pre-existing decoupling stands; a future effort
   may revisit).
 - No multi-cursor/secondary-selection semantics (transforms already use the primary only).
-- No change to loose-item/fence/table pass-through behavior inside repar.
+- No change to loose-item/fence/table pass-through behavior inside repar. HtmlBlock/
+  HtmlComment units reflow as prose (probe-verified) — the identical pre-existing
+  behavior at whole-document scope; not "fixed" here (Fable M3).
+- Degraded-parse regression, accepted and stated (Fable M2): under the `empty_tree`
+  fallback (block_tree.rs:333-335, childless root) every caret byte is container-
+  interior on a non-blank line with NO ListItem → None → "nothing to transform" (today:
+  whole-buffer transform). Acceptable — a degraded parse should not gate a
+  whole-document rewrite on one keypress; the `_buffer` variants remain available.
 
 ## Ship-time bookkeeping
 
