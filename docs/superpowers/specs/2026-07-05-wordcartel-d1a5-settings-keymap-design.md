@@ -29,7 +29,7 @@ one effort per the backlog working order. Also closes C4's deferred close-buffer
 - `session.toml` (state store) is untouched: settings = user intent → overrides file;
   state = machine bookkeeping (cursor/marks/folds/scratch) → session store, as today.
 
-## Grounded facts (verified against 2551463; re-verified by Codex r1 at 278da3e)
+## Grounded facts (grounded at 2551463; fold-verified by Codex r1+r2 — line anchors may drift with fold commits)
 
 - `Config` (config.rs) is consumed at startup: `run()` seeds parallel `Editor` fields
   (app.rs:1244-1261 — `view_opts`, `diag_cfg`, `export_cfg`, `menu_bar_mode`,
@@ -93,11 +93,9 @@ bind = { "ctrl-k ctrl-o" = 'close_buffer' }
   m-4; RawConfig has no deny_unknown_fields, so unknown sub-tables were already tolerated
   — the named-field shape keeps parsing strict where it matters). RawKeymap mirrors the
   same two optional sub-tables. Each layer still contributes exactly one `KeymapPatch`.
-  Unknown-preset detection: any OTHER sub-table under `[keymap]` is invisible to serde
-  (tolerated-unknown, as today); the "unknown preset warns" rule therefore applies to a
-  FUTURE preset list change, implemented as: the warning fires when a scoped table exists
-  for a preset name not in the known set — with named fields this is structurally
-  impossible, so the warning clause is DROPPED from D1 (simpler; nothing to warn about).
+  Unknown sub-tables under `[keymap]` are invisible to serde (tolerated-unknown, exactly
+  as today) — there is no unknown-preset warning because, with named fields, the case is
+  structurally impossible.
 - **Merge law — "later file wins; within a file, specific wins":** `build_keymap` applies,
   for each layer lowest→highest: the layer's GLOBAL bind/unbind, then the layer's
   scoped table for the ACTIVE preset only. (Consequence, documented: a scoped bind in an
@@ -168,12 +166,15 @@ off that same field. Signature unchanged.
   the CURRENT runtime values (D4 inventory) from the Editor, diffs against the baseline
   snapshot, serializes ONLY the differing values via `toml::to_string` of a serde struct
   mirroring the config sections, and writes atomically through the `Fs` seam (below).
-  Status line: "settings saved" / "settings: <error>" on failure — no silent UI.
+  Status line: "settings saved" / "settings: <io error>" on failure (`write_overrides`
+  returns `std::io::Result<()>` from atomic_replace — no SaveError wrapper; the io::Error
+  Display is the message body). No silent UI.
 - **Write seam (Codex I-5):** `file::save_atomic_bytes` hardcodes `RealFs` (file.rs:176)
   and `FaultFs` is private to fsx tests (fsx.rs:369). The settings writer is therefore a
   function parameterized over the seam — `write_overrides(fs: &dyn crate::fsx::Fs, path,
-  bytes)` calling `fsx::atomic_replace(fs, …)` directly (mode Preserve, dir_fsync true,
-  matching save_atomic_bytes' opts); production passes `&RealFs`; the failure test passes
+  bytes)` calling `fsx::atomic_replace(fs, …)` directly (mode `Fixed(0o600)`, dir_fsync true —
+  the exact opts `save_atomic_bytes` uses today, file.rs:176/fsx.rs:181: a machine-owned
+  file like session.toml, not a user document); production passes `&RealFs`; the failure test passes
   a small test-local failing `Fs` impl (no need to expose FaultFs).
 - **Directory creation (Codex I-2):** nothing creates `<config_dir>/wordcartel` today
   (config_layer_paths only reads; state.rs works because swap::state_dir creates its own
@@ -200,7 +201,7 @@ Exactly the runtime-mutable set, keyed to their config sections:
 | Runtime value (Editor field) | Overrides key |
 |---|---|
 | `active_keymap_preset` | `[keymap] preset` |
-| `theme.name` (builtin picks only — the picker lists builtins only) | `[theme] name` |
+| `theme_identity` (provenance — `Builtin(name)` written; `File` never) | `[theme] name` |
 | `view_opts.typewriter/focus/measure/wrap_guide/word_count` | `[view] *` (the five) |
 | `menu_bar_mode` | `[menu] bar` |
 | `mouse_capture` | `[mouse] capture` (RawMouse field is `capture` — config.rs:226; Codex I-3) |
@@ -244,13 +245,15 @@ Exactly the runtime-mutable set, keyed to their config sections:
 - Overrides file unreadable/corrupt at load: same policy as any config layer today (parse
   error → warning, layer skipped) — verify and pin; a corrupt machine file must not brick
   startup.
-- `save_settings` write failure: `SaveError` → status line, settings remain live in
-  session (nothing lost), no partial file (atomic replace).
+- `save_settings` write failure: the `io::Error` → status line ("settings: <error>"),
+  settings remain live in session (nothing lost), no partial file (atomic replace).
 - Unknown scoped sub-tables under `[keymap]`: invisible to serde, tolerated as today
   (named-field schema — D1); nothing to warn.
-- `save_settings` while a modal/prompt is open: unreachable via menu/palette (they close);
-  direct dispatch honors the same guards as other commands (plan verifies against the
-  registry Ctx path — no special casing expected).
+- `save_settings` while a modal/prompt is open: via keys it is unreachable (modal guards
+  live in reduce's input routing — app.rs:688; menu/palette close before dispatching —
+  app.rs:153). `reg.dispatch` itself has NO modal guards (registry.rs:466) — and needs
+  none here: the handler only sets the request flag; the loop does the IO. Intentionally
+  unrestricted (single statement of D3's reachability rule; no contradiction).
 
 ## Testing
 
