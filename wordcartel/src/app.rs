@@ -4954,4 +4954,42 @@ mod tests {
         assert!(e.settings_save_requested,
             "save_settings must set settings_save_requested");
     }
+
+    // -------------------------------------------------------------------------
+    // repar10 D1: dispatch_transform uses wrap_column for width
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn dispatch_uses_wrap_column_for_width() {
+        use crate::editor::Editor;
+        use crate::transform::TransformKind;
+        let text = "The quick brown fox jumps over the lazy dog while seven bright birds sing above.\n";
+        let mut e = Editor::new_from_text(text, None, (80, 24));
+        e.view_opts.wrap_column = 40;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, None, &TestClock(0), &tx);
+        let after = e.active().document.buffer.to_string();
+        assert!(after.lines().all(|l| l.len() <= 40), "reflow must honor wrap_column=40: {after:?}");
+        assert!(after.lines().count() >= 2, "the corpus must actually have wrapped");
+    }
+
+    #[test]
+    fn async_dispatch_uses_wrap_column_for_width() {
+        use crate::editor::Editor;
+        use crate::transform::TransformKind;
+        // >1 MiB forces the async branch; the width must ride into the worker
+        // (Msg::TransformDone carries only the result text — spec m-3 observable).
+        let big = "word ".repeat(300_000);
+        let mut e = Editor::new_from_text(&big, None, (80, 24));
+        e.view_opts.wrap_column = 40;
+        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+        crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, None, &TestClock(0), &tx);
+        assert!(e.transform_in_flight);
+        match rx.recv().expect("TransformDone must arrive") {
+            Msg::TransformDone { result: Ok(out), .. } =>
+                assert!(out.lines().all(|l| repar::display_width(l, 0, 8, repar::Compat::empty()) <= 40),
+                    "worker must reflow at wrap_column=40"),
+            other => panic!("expected TransformDone Ok, got {other:?}"),
+        }
+    }
 }

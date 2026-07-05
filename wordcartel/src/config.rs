@@ -99,7 +99,7 @@ impl Default for ViewConfig {
     fn default() -> Self {
         ViewConfig { typewriter: false, typewriter_anchor: 0.5, focus: false,
             focus_granularity: FocusGranularity::Paragraph, measure: false,
-            wrap_column: 80, wrap_guide: false, word_count: false }
+            wrap_column: 72, wrap_guide: false, word_count: false }
     }
 }
 

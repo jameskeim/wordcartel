@@ -1,7 +1,6 @@
 //! In-process repar transforms (Reflow / Unwrap / Ventilate). The typed wrapper
 //! `run_transform` is the ONLY place that touches repar's stringly public API.
 
-pub const DEFAULT_REFLOW_WIDTH: u32 = 72;
 /// Regions at or above this byte length run off the keystroke thread (§5.2).
 pub const TRANSFORM_ASYNC_THRESHOLD: usize = 1 << 20; // 1 MiB
 
@@ -216,6 +215,10 @@ pub fn dispatch_transform(
         editor.status = "nothing to transform".into();
         return;
     }
+    // The one width knob (spec repar10 D1): transforms format to the same column the
+    // wrap guide and the centered measure use. Captured as a Copy local so the async
+    // worker closure moves a u32, never a borrow of editor.
+    let width = u32::from(editor.view_opts.wrap_column);
     if range.len() >= TRANSFORM_ASYNC_THRESHOLD {
         let buffer_id = editor.active().id;
         let version = editor.active().document.version;
@@ -226,7 +229,7 @@ pub fn dispatch_transform(
         let msg_tx = msg_tx.clone();
         std::thread::spawn(move || {
             let input = snapshot.byte_slice(range_c.clone()).to_string();
-            let result = guarded_transform(|| run_transform(kind, &input, DEFAULT_REFLOW_WIDTH));
+            let result = guarded_transform(|| run_transform(kind, &input, width));
             let _ = msg_tx.send(crate::app::Msg::TransformDone {
                 buffer_id, version, range: range_c, kind, result,
             });
@@ -235,7 +238,7 @@ pub fn dispatch_transform(
     }
     // Sync branch: region is small enough to run on the keystroke thread.
     let input = editor.active().document.buffer.slice(range.clone()).to_string();
-    let result = guarded_transform(|| run_transform(kind, &input, DEFAULT_REFLOW_WIDTH));
+    let result = guarded_transform(|| run_transform(kind, &input, width));
     apply_transform_result(editor, kind, range, result, clock);
 }
 
@@ -310,7 +313,10 @@ pub fn run_transform(kind: TransformKind, input: &str, width: u32) -> Result<Str
     // repar ≥1.0: the builder chain returns Result<Options,ParError>; unwrap before calling methods.
     let mut opts = repar::Options::new().width(width).map_err(TransformError::from_repar)?;
     opts.apply_par_args([kind.verb()]).map_err(TransformError::from_repar)?;
-    opts.apply_fixups("markdown").map_err(TransformError::from_repar)?; // Compat::MARKDOWN
+    // The pinned fixups baseline (spec repar10 D3, the repar-nvim embedding pattern):
+    // "none" first makes the stack independent of Options::new()'s defaults — repar
+    // upgrades change wordcartel's output only when THIS string changes.
+    opts.apply_fixups("none,all,prose,markdown").map_err(TransformError::from_repar)?;
     let out = opts.format(input).map_err(TransformError::from_repar)?;
     check_output_size(out)
 }
@@ -446,6 +452,70 @@ mod tests {
         assert!(matches!(r, Err(TransformError::Panicked(ref m)) if m == "kaboom"));
         let ok = guarded_transform(|| Ok("hi".to_string()));
         assert_eq!(ok.unwrap(), "hi");
+    }
+
+    // ---------------------------------------------------------------------------
+    // repar-1.0 contract pins (spec repar10 I-2, I-3, D1, D3)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn ventilate_then_reflow_respects_sentence_boundaries() {
+        // The user-found 0.9.x bug class, probe-reproduced at width 40 under the OLD
+        // stack (periods detached + space-padded to the column, and one EXTRA period
+        // fabricated: count 6 != 5). Corpus constraint (spec I-3): DISTINCT sentence
+        // openings — par's common-PREFIX inference is untouched by prose and mangles
+        // anaphoric corpora under every stack (recorded upstream candidate).
+        let para = "Alpha wolves roam the northern ridge. Bright lanterns lit the harbor at dusk. Careful readers noticed the missing comma. Distant thunder rolled across the plain. Every morning she brewed strong coffee.\n";
+        let ventilated = run_transform(TransformKind::Ventilate, para, 72).unwrap();
+        assert_eq!(ventilated.lines().filter(|l| !l.trim().is_empty()).count(), 5,
+            "precondition: one sentence per line");
+        let reflowed = run_transform(TransformKind::Reflow, &ventilated, 40).unwrap();
+        // Detector 1: no line-initial detached period.
+        assert!(reflowed.lines().all(|l| !l.trim_start().starts_with('.')),
+            "line-initial detached period: {reflowed:?}");
+        // Detector 2: no space-before-period (the padding artifact).
+        assert!(!reflowed.contains(" ."), "space-padded period: {reflowed:?}");
+        // Detector 3 (the loss detector): period count == sentence count.
+        assert_eq!(reflowed.matches('.').count(), 5, "periods lost or fabricated: {reflowed:?}");
+    }
+
+    #[test]
+    fn fixups_stack_is_actually_applied() {
+        // DECOMPOSED e + U+0301 (spec m-1: precomposed é and bare CJK are byte-identical
+        // under both stacks — only zero-width handling differentiates). The D3 stack
+        // zero-widths the combining mark; "none" counts it → earlier wrap.
+        let input = "cafe\u{301} au lait cafe\u{301} noir cafe\u{301} creme cafe\u{301} latte cafe\u{301} mocha cafe\u{301} flat white here done.\n";
+        let d3 = run_transform(TransformKind::Reflow, input, 40).unwrap();
+        assert_eq!(d3, "cafe\u{301} au lait cafe\u{301} noir cafe\u{301} creme cafe\u{301}\nlatte cafe\u{301} mocha cafe\u{301} flat white here\ndone.\n");
+        // Prove the stack reaches repar: "none" must produce a DIFFERENT wrap. This
+        // arm needs a raw-repar comparison, not run_transform (which owns the stack):
+        let mut none_opts = repar::Options::new().width(40).unwrap();
+        none_opts.apply_par_args(["--reflow"]).unwrap();
+        none_opts.apply_fixups("none").unwrap();
+        let none_out = none_opts.format(input).unwrap();
+        assert_ne!(d3, none_out, "the fixups stack must change behavior vs none");
+    }
+
+    #[test]
+    fn reflow_multibyte_corpus_is_stable() {
+        // Contract pin: byte-exact repar-1.0 output for mixed-width text at width 40.
+        // KNOWN repar-1.0 artifact, pinned DELIBERATELY (spec I-2, upstream candidate):
+        // one trailing space per double-width char per line (中文 → 2, 🙂 → 1). In
+        // markdown, two-plus trailing spaces is a hard <br> — pre-existing repar
+        // behavior, NOT this effort's bug. Do not trim; do not "fix" the literal.
+        let input = "caf\u{e9} serves th\u{e9} while \u{4e2d}\u{6587} characters and \u{1f642} emoji flow together in one long prose paragraph that must wrap somewhere around forty columns wide here now.\n";
+        let out = run_transform(TransformKind::Reflow, input, 40).unwrap();
+        assert_eq!(out, "caf\u{e9} serves th\u{e9} while \u{4e2d}\u{6587} characters  \nand \u{1f642} emoji flow together in one long \nprose paragraph that must wrap somewhere\naround forty columns wide here now.\n");
+    }
+
+    #[test]
+    fn transform_width_follows_wrap_column() {
+        // run_transform-level width proof at 40 (the dispatch-level proof is below).
+        let input = "The quick brown fox jumps over the lazy dog while seven bright birds sing above.\n";
+        let at72 = run_transform(TransformKind::Reflow, input, 72).unwrap();
+        assert!(at72.lines().next().unwrap().len() > 40, "precondition: 72-width line exceeds 40");
+        let at40 = run_transform(TransformKind::Reflow, input, 40).unwrap();
+        assert_eq!(at40, "The quick brown fox jumps over the lazy\ndog while seven bright birds sing above.\n");
     }
 
     // ---------------------------------------------------------------------------
