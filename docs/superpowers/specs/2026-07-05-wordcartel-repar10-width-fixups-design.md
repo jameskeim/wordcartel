@@ -38,8 +38,10 @@ integration deliberately).
   `apply_fixups("markdown")`, `format(input)`; errors ride `TransformError::from_repar`
   → the status line.
 - `view.wrap_column: u16` (config.rs:94, default 80 at :102, RawView Option at :271,
-  load clamp ≥20 with warning at :365-368). Sole consumer: the wrap-guide x-position
-  (render.rs:288, gated on `view_opts.wrap_guide`, default off). NOT persisted by D1+A5
+  load clamp ≥20 with warning at :365-368). TWO consumers (Codex r1 I-1): the wrap-guide
+  x-position (render.rs:282-288, gated on `wrap_guide`, default off) AND
+  `nav::text_geometry` (nav.rs:25) — when `measure = true` it sets the centered column's
+  `text_left`/`text_width` (pinned by existing tests at nav.rs:978 with wrap_column=40). NOT persisted by D1+A5
   (the spec's NEVER list cites "no runtime mutator exists" — this effort dissolves that
   rationale; the shipped D1+A5 spec text stays as history).
 - repar 1.0.0 (path dep `../../par-command/repar`, Cargo.lock pins 1.0.0): the contract
@@ -49,13 +51,17 @@ integration deliberately).
   `"prose"` = Compat::PROSE (:298), `"markdown"` = Compat::MARKDOWN (:299). The
   `--fixups=` vocabulary is frozen additive-only; the library surface is pinned
   (public_surface_pin_v1). Width: parse-time ceiling `WIDTH_PARSE_MAX` (huge;
-  options.rs:500/:563), format-time floor via `ParError::WidthTooSmall` (driver.rs:133)
-  — our ≥20 clamp clears it. The repar-nvim plugin pins `--fixups=none,<list>` precisely
+  options.rs:500/:563); the format-time floor `ParError::WidthTooSmall` is RELATIVE —
+  `width <= prefix + suffix` (driver.rs:128, error.rs:28), and `prose` suppresses only
+  inferred SUFFIX (segment.rs:465), so a width of 20 can still fail on input whose
+  inferred/explicit affixes total ≥20 (Codex r1 I-2). The clamp makes the error unlikely,
+  not unreachable — the error path is REQUIRED, not belt-and-braces. The repar-nvim plugin pins `--fixups=none,<list>` precisely
   so editor behavior is independent of default flips (CHANGELOG 1.0.0) — the embedding
   pattern D3 adopts.
 - Consequence already live but unpinned: wordcartel's transforms inherited `all` at the
-  lock sync (multibyte width handling changed vs 0.9.x); the ASCII-only transform test
-  corpus never noticed. This effort pins the post-1.0 behavior.
+  lock sync (multibyte width handling changed vs 0.9.x); the transform INPUT corpus is
+  ASCII-only (transform.rs:386/:402/:412 area — Codex r1 m-2 precision) so no test
+  noticed. This effort pins the post-1.0 behavior.
 - Minibuffer precedent: `goto_line` (registry.rs:424-425) opens
   `open_minibuffer("Go to line: ", MinibufferKind::GotoLine)`.
 - Save Settings machinery (D1+A5, shipped @ 4670eaf): `settings.rs` — `SettingsSnapshot`,
@@ -70,12 +76,15 @@ integration deliberately).
   sync arm passes it to `run_transform`; the async arm moves it into the worker closure
   (like the region). `run_transform`'s signature is unchanged.
 - Default change (user-ratified fork 1a-A): `ViewConfig::default().wrap_column` becomes
-  **72** (from 80). Default-config transforms stay byte-identical to today; the only
-  default-visible shift is the wrap guide's position, and the guide defaults off. The
-  clamp floor (20) and its warning are unchanged.
-- Belt-and-braces: repar width errors (unreachable via the clamp, reachable if repar's
-  floor ever rises) surface through the existing `TransformError` status path — no new
-  error handling.
+  **72** (from 80). Default-config transforms stay byte-identical to today. Two
+  default-visible shifts, both honest (Codex r1 I-1): the wrap guide's position (guide
+  defaults off) and the CENTERED MEASURE column narrows 80 → 72 for `measure = true`
+  users who never set `wrap_column` (measure also defaults off; users who set the key
+  keep their value). The clamp floor (20) and its warning are unchanged.
+- repar width errors are REACHABLE (the floor is `width <= prefix + suffix` — affix
+  inference on exotic input can exceed a small width; Codex r1 I-2) and surface through
+  the existing `TransformError` status path — no new error handling, but the spec treats
+  this as a live path, not belt-and-braces.
 - The wrap guide keeps reading the same field — one knob, two honest consumers.
 
 ## D2. The setter + persistence
@@ -83,17 +92,27 @@ integration deliberately).
 - Command `set_wrap_column`, label "Set Wrap Column…", `MenuCategory::Settings` (beside
   the keymap commands). Handler opens the minibuffer:
   `open_minibuffer("Wrap column: ", MinibufferKind::WrapColumn)` (new kind).
-- Accept path (the GotoLine arm's shape): parse `u16`; non-numeric → status
-  "wrap column: not a number" (copy pinned by plan against the goto_line copy family);
-  below 20 → clamp to 20 with the SAME message shape load() uses ("wrap_column {n} below
-  min 20; clamped to 20" adapted to status casing — plan pins exact copy); success →
-  `view_opts.wrap_column = n` + status "wrap column: {n}". Esc cancels (minibuffer
-  default behavior, nothing to add).
+- Accept path — TWO real modification sites (Codex r1 I-3: Enter dispatch lives in
+  app.rs:806's minibuffer match, and the parse/submit fns live in prompts.rs — e.g.
+  `goto_line_submit` at prompts.rs:243): a new `MinibufferKind::WrapColumn` arm in
+  app.rs's dispatch + a new `prompts::wrap_column_submit(editor, text)`.
+  Semantics: parse `u16`; non-numeric → status "wrap column: not a number"; below 20 →
+  clamp to 20 with status "wrap column: 20 (minimum)"; success → set + status
+  "wrap column: {n}". DELIBERATE divergences from the goto_line family, chosen not
+  inherited (Codex r1 I-4): goto_line says "not a line number" and clamps SILENTLY —
+  this command names its own noun and surfaces the clamp, because a silently-moved
+  formatting width is a surprise-diff class and a silently-moved scroll target is not.
+  On ANY successful set the handler also triggers `derive::rebuild` (Codex r1 I-5:
+  wrap_column feeds nav::text_geometry when measure is on — a bare field write would
+  leave stale layout until the next edit). Esc cancels (minibuffer default).
 - **Persistence (user-ratified fork 2-A):** `wrap_column` joins the persisted inventory —
   `SettingsSnapshot` gains `view_wrap_column: u16`; `OView` gains
-  `wrap_column: Option<u16>` (serde skip-if-none like its siblings); `snapshot_of`/
-  `runtime_snapshot`/`compute_overrides`' view section/the per-key mask predicate extend
-  with the same `diff_key` shape; the config.rs round-trip test gains the key. The
+  `wrap_column: Option<u16>` (serde skip-if-none like its siblings); the extension FOLLOWS THE SAME PER-FIELD PATTERN (not "generic" — Codex r1 m-1
+  enumerates the real edits): `SettingsSnapshot` (settings.rs:32), `OView`
+  (settings.rs:88), `snapshot_of` (:128), `runtime_snapshot` (:143), the view diff block
+  + `any_view` (:268), the per-key mask predicate, every hand-built `SettingsSnapshot`
+  literal in tests (e.g. config.rs:827), and the config.rs round-trip test gains the
+  key. `diff_key<T: PartialEq + Clone>` handles u16 as-is. The
   D1+A5 NEVER-persisted list shrinks by exactly this entry (rationale dissolved: a
   runtime mutator now exists).
 
@@ -125,9 +144,10 @@ New transform.rs tests (corpora chosen at implementation, probe-verified):
   differ and the baseline output is the expected one — proves the stack reaches repar.
 - `transform_width_follows_wrap_column`: `view_opts.wrap_column = 40` → dispatch (sync
   arm) reflows at 40 (no output line exceeds 40 columns; precondition: the corpus would
-  exceed 40 under the old 72). An async sibling asserts the worker receives the same
-  width (the 1.5 MB corpus shape from the existing async test, wrap_column asserted in
-  the TransformDone output shape or via a narrower honest observable — plan grounds it).
+  exceed 40 under the old 72). An async sibling asserts the width reached the worker by observing the RETURNED
+  TEXT's line widths in `Msg::TransformDone` (the message carries only the result text —
+  transform.rs:230, Codex r1 m-3; assert no output line exceeds the set width on a
+  corpus that would exceed it under the old default).
 - Setter pins: parse/clamp/cancel/status per D2; registry membership (Settings, label).
 - Persistence pins: set → save → the overrides file carries `[view] wrap_column`;
   reload round-trips through the real `config::load`; the diff-law matrix gains the key
