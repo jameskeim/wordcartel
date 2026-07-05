@@ -51,7 +51,8 @@ ENTIRE list (top-level snap reaches the `List` container, not the `ListItem`).
   WHOLE block spans OR carry a raw GAP endpoint (blank-line territory outside any leaf
   block — harmless to repar, which sees complete blocks plus surrounding blanks; Codex
   r1 M-1's wording fix). D2's endpoint snap and D1's block spans deliver exactly that;
-  `ListItem.span` covers marker + continuation lines.
+  `ListItem.span` covers marker + continuation lines (but NOT the leading indent of
+  nested items — see the span-anatomy bullet and the line-start extension).
 - `BlockTree`/`Block` (block_tree.rs:155-173): containers (`List`, `ListItem`,
   `BlockQuote`, …) carry nested children with spans; `top_level()` = root children.
 - The only caller of `region_for_transform` is `dispatch_transform` (transform.rs:110);
@@ -87,13 +88,15 @@ ENTIRE list (top-level snap reaches the `List` container, not the `ListItem`).
     LINE BLANKNESS (Fable r5 C2 — container-interior bytes include real content): if
     the byte's LINE is blank → None (gap; preserves every approved gap outcome); if the
     line is NON-blank (a loose item's own marker bytes; a tight item's lead text before
-    its nested list) → the nearest `ListItem` on the path is the unit — that content
-    belongs to the item.
+    its nested list; a top-level quote's own `> ` prefix bytes) → the SAME preference
+    set as the leaf branch (Fable r6 N2): nearest `ListItem` on the path, else nearest
+    `BlockQuote`, else None. (This makes the degraded-parse derivation in Non-goals
+    exact: the childless root has neither → None.)
   - **Every returned unit span extends to `line_start(span.start)`** (Fable r5 C1:
     nested-item and quote spans EXCLUDE leading indent/prefix bytes; without the
     extension the slice starts mid-line and repar reflows at the wrong content column).
   `deepest_block_at` in nav.rs stays untouched (text-objects keep their semantics).
-- `region_for_transform(doc)` with an empty selection: `transform_unit_at(blocks, caret)`
+- `region_for_transform(doc)` with an empty selection: `transform_unit_at(text, blocks, caret)`
   (the primary head, clamped to `buf_len.saturating_sub(1)` for the end-of-buffer
   caret); if found, return its span. If `transform_unit_at` returns None (a top-level
   blank-line gap OR a container-interior gap — Codex r3 wording): return the EMPTY range
@@ -115,14 +118,16 @@ verbatim, so the result is the honest "already reflowed" no-op — acceptable an
 semantics — the four `snap_*` tests update): each ENDPOINT snaps to its deepest enclosing
 block, the interior stays.
 
-- `start` = `transform_unit_at(blocks, from)` → its `span.start` (the SAME unit lookup
-  as D1 — nearest-ListItem-ancestor-else-leaf; Codex r2); if `from` sits in a gap,
-  `start = from` (raw, today's fallback behavior).
-- `end` = `transform_unit_at(blocks, to.saturating_sub(1))` (the last selected byte —
-  `to` is exclusive) → its `span.end`; gap → `end = to`.
+- `start` = `transform_unit_at(text, blocks, from)` → its `span.start` (the SAME unit
+  lookup as D1, all rules included — ancestor preference, line-blank gaps, line-start
+  extension); if `from` sits in a gap, `start = from` (raw, today's fallback behavior).
+- `end` = `transform_unit_at(text, blocks, to.saturating_sub(1))` (the last selected
+  byte — `to` is exclusive) → its `span.end`; gap → `end = to`.
 - **"Gap" = container-interior BLANK-LINE bytes (r1 I-3 → r3 → corrected by Fable r5's
   anatomy):** the probe-true shapes: a loose item's trailing blank lives INSIDE that
-  item's span (so an endpoint there resolves to the item — fine, whole span); the
+  item's span (the descent still ends at the Item container; the BLANK line makes it a
+  gap → raw endpoint, which coincides with the item's span end in the single-blank
+  shape — one rule, one implementation; Fable r6 N1); the
   genuinely container-interior bytes are the next marker's leading indent and true
   inter-structure blanks. When the descent ends at a container and the byte's line is
   BLANK, `transform_unit_at` returns None → raw endpoint, never a container span
@@ -152,7 +157,8 @@ EXPLICIT-REGION parameter on the existing `dispatch_transform` (Fable I3 — the
 `transform_in_flight` and empty-range guards live UPSTREAM in that fn, transform.rs:
 106-113; a fresh sibling fn would bypass both, double-dispatching async transforms and
 mis-reporting empty buffers) whose region is `0..buf_len` unconditionally. Both guards
-apply identically to both scopes — pinned. Everything downstream (async threshold, guard, merge, staleness) is the
+apply identically to both scopes — pinned by `buffer_variant_rejected_while_in_flight`
+and `buffer_variant_on_empty_buffer_says_nothing_to_transform` (Fable r6 N6). Everything downstream (async threshold, guard, merge, staleness) is the
 shared path. The 1 MiB async route remains reachable from BOTH scopes — any single
 block ≥ 1 MiB routes async under the caret default (Codex r1) — the `_buffer` variants
 merely make it the common case.
