@@ -775,4 +775,75 @@ mod tests {
         assert!(cfg.keymap.patches[0].cua.is_none() && cfg.keymap.patches[0].wordstar.is_none());
     }
 
+    // D1+A5 Task 4 — baseline vs. production config separation pins ----------
+
+    #[test]
+    fn baseline_excludes_overrides_layer() {
+        // Spec pin: baseline = load(&[hand]) does NOT include the overrides file;
+        // production = load(&[hand, overrides]) does include it.
+        let d = tempdir();
+        let hand_path = write(&d, "hand.toml", "[keymap]\npreset = 'wordstar'\n");
+        let overrides_path = write(&d, "settings-overrides.toml",
+            "# managed by wcartel\n[view]\ntypewriter = true\n");
+
+        let (baseline, _) = load(std::slice::from_ref(&hand_path));   // WITHOUT overrides
+        let (production, _) = load(&[hand_path, overrides_path]); // WITH overrides
+
+        // Both share the hand-layer keymap.preset value.
+        assert_eq!(baseline.keymap.preset, "wordstar", "hand layer keymap.preset in baseline");
+        assert_eq!(production.keymap.preset, "wordstar", "hand layer keymap.preset in production");
+        // The overrides-only key must differ: baseline lacks it.
+        assert!(!baseline.view.typewriter,
+            "baseline must NOT include the overrides layer typewriter=true");
+        assert!(production.view.typewriter,
+            "production must include the overrides layer typewriter=true");
+    }
+
+    #[test]
+    fn save_reload_roundtrip_restores_settings() {
+        // Unit-level pin of the full pipeline without run():
+        // 1. Build a runtime snapshot with three divergences from the default baseline.
+        // 2. compute_overrides + save_overrides to a tempdir file.
+        // 3. config::load(&[overrides_file]) and assert the merged config reflects them.
+        use crate::settings::{
+            SettingsSnapshot, ThemeIdentity, OverridesFile,
+            compute_overrides, save_overrides, snapshot_of,
+        };
+
+        let d = tempdir();
+        let overrides_path = d.join("settings-overrides.toml");
+
+        // Baseline: defaults (empty layer list — no hand config, no overrides).
+        let (baseline_cfg, _) = load(&[]);
+        // Use the default resolved theme name (tests run without a real env, so
+        // resolve_theme falls back to the default theme — name = "default").
+        let env = crate::theme_resolve::EnvSnapshot::from_env();
+        let baseline_resolved = crate::theme_resolve::resolve_theme(&baseline_cfg.theme, &env);
+        let baseline = snapshot_of(&baseline_cfg, &baseline_resolved.theme.name);
+
+        // Runtime snapshot: three divergences — keymap → wordstar, typewriter on, bar → pinned.
+        let runtime = SettingsSnapshot {
+            keymap_preset:  "wordstar".to_string(),
+            theme_identity: ThemeIdentity::Builtin(baseline_resolved.theme.name.clone()),
+            view_typewriter: true,
+            view_focus:     false,
+            view_measure:   false,
+            view_wrap_guide: false,
+            view_word_count: false,
+            menu_bar:       crate::config::MenuBarMode::Pinned,
+            mouse_capture:  true,
+        };
+
+        let of = compute_overrides(&runtime, &baseline, &OverridesFile::default(), &OverridesFile::default());
+        save_overrides(&crate::fsx::RealFs, &overrides_path, &of).unwrap();
+
+        // Reload through the REAL config::load and assert the values round-tripped.
+        let (cfg, _) = load(&[overrides_path]);
+        assert_eq!(cfg.keymap.preset, "wordstar",
+            "keymap.preset must round-trip to 'wordstar'");
+        assert!(cfg.view.typewriter, "view.typewriter must round-trip to true");
+        assert_eq!(cfg.menu.bar, crate::config::MenuBarMode::Pinned,
+            "menu.bar must round-trip to Pinned");
+    }
+
 }

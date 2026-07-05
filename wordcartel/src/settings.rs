@@ -324,7 +324,6 @@ pub fn compute_overrides(
 /// needed. chmod 0700 is applied to the parent ONLY if it did not already exist
 /// (the config dir also holds hand-owned files — a save must not tighten the user's
 /// own 0755 directory, unlike the swap dir which is machine-only).
-#[allow(dead_code)] // wired in Task 4's perform_settings_save; pub(crate) hides from dead-code exemption
 pub(crate) fn save_overrides(
     fs:   &dyn crate::fsx::Fs,
     path: &std::path::Path,
@@ -354,7 +353,6 @@ pub(crate) fn save_overrides(
 
 /// Write pre-serialized bytes to `path` via the Fs seam (0600, dir-fsynced).
 /// Called by `save_overrides`; exported for Task 4's direct-write path.
-#[allow(dead_code)] // wired in Task 4; pub(crate) hides from dead-code exemption
 pub(crate) fn write_overrides(
     fs:   &dyn crate::fsx::Fs,
     path: &std::path::Path,
@@ -364,6 +362,39 @@ pub(crate) fn write_overrides(
         mode: crate::fsx::ModePolicy::Fixed(0o600),
         dir_fsync: true,
     })
+}
+
+// ---------------------------------------------------------------------------
+// perform_settings_save — the run()-loop's save gate (D1+A5 Task 4)
+// ---------------------------------------------------------------------------
+
+/// Perform a requested settings save: refusals first, then diff + atomic write.
+/// Returns the new overrides snapshot on success (the caller replaces its copy so
+/// rules 2/3 stay correct for a second save in the same session). Sets editor.status
+/// in every arm — no silent UI.
+pub(crate) fn perform_settings_save(
+    editor:        &mut crate::editor::Editor,
+    no_config:     bool,
+    overrides_path: Option<&std::path::Path>,
+    baseline:      &SettingsSnapshot,
+    existing:      &OverridesFile,
+    mask:          &OverridesFile,
+    fs:            &dyn crate::fsx::Fs,
+) -> Option<OverridesFile> {
+    if no_config {
+        editor.status = "settings: disabled by --no-config".into();
+        return None;
+    }
+    let Some(path) = overrides_path else {
+        editor.status = "settings: no config directory".into();
+        return None;
+    };
+    let runtime = runtime_snapshot(editor);
+    let of = compute_overrides(&runtime, baseline, existing, mask);
+    match save_overrides(fs, path, &of) {
+        Ok(()) => { editor.status = "settings saved".into(); Some(of) }
+        Err(e) => { editor.status = format!("settings: {e}"); None }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -538,5 +569,98 @@ mod tests {
         let path = d.join("nested").join("settings-overrides.toml");
         save_overrides(&crate::fsx::RealFs, &path, &OverridesFile::default()).unwrap();
         assert!(path.is_file());
+    }
+
+    // D1+A5 Task 4 — perform_settings_save behavior pins -----------------------
+
+    // Thin Editor-like helper: only the fields perform_settings_save reads.
+    fn test_editor() -> crate::editor::Editor {
+        crate::editor::Editor::new_from_text("doc\n", None, (80, 24))
+    }
+    fn empty_snap() -> SettingsSnapshot {
+        snap("cua", ThemeIdentity::Builtin("default".into()), false)
+    }
+
+    #[test]
+    fn save_refused_under_no_config() {
+        // --no-config → status "settings: disabled by --no-config"; no file written.
+        let d = tempdir();
+        let path = d.join("o.toml");
+        let mut e = test_editor();
+        let result = perform_settings_save(
+            &mut e, true, Some(&path),
+            &empty_snap(), &OverridesFile::default(), &OverridesFile::default(),
+            &crate::fsx::RealFs,
+        );
+        assert!(result.is_none(), "must return None on --no-config refusal");
+        assert_eq!(e.status, "settings: disabled by --no-config");
+        assert!(!path.exists(), "no file must be written on --no-config refusal");
+    }
+
+    #[test]
+    fn save_refused_without_config_dir() {
+        // overrides_path = None (config_dir() returned None) → status "settings: no config directory".
+        let mut e = test_editor();
+        let result = perform_settings_save(
+            &mut e, false, None,
+            &empty_snap(), &OverridesFile::default(), &OverridesFile::default(),
+            &crate::fsx::RealFs,
+        );
+        assert!(result.is_none(), "must return None when overrides_path is None");
+        assert_eq!(e.status, "settings: no config directory");
+    }
+
+    #[test]
+    fn save_failure_surfaces_io_error() {
+        // A FailFs → status starts "settings: " and includes the IO error string.
+        struct FailFs;
+        impl crate::fsx::Fs for FailFs {
+            fn create_excl(&self, _: &std::path::Path, _: u32) -> std::io::Result<Box<dyn crate::fsx::WriteSync>> {
+                Err(std::io::Error::other("boom"))
+            }
+            fn existing_mode(&self, _: &std::path::Path) -> Option<u32> { None }
+            fn rename(&self, _: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
+            fn sync_dir(&self, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
+            fn remove_file(&self, _: &std::path::Path) -> std::io::Result<()> { Ok(()) }
+        }
+        let d = tempdir();
+        let path = d.join("o.toml");
+        let mut e = test_editor();
+        let result = perform_settings_save(
+            &mut e, false, Some(&path),
+            &empty_snap(), &OverridesFile::default(), &OverridesFile::default(),
+            &FailFs,
+        );
+        assert!(result.is_none(), "must return None on IO error");
+        assert!(e.status.starts_with("settings: "),
+            "status must start with 'settings: ': {:?}", e.status);
+        assert!(e.status.contains("boom"),
+            "status must include the IO error string: {:?}", e.status);
+    }
+
+    #[test]
+    fn save_success_sets_status_and_returns_snapshot() {
+        // A successful save → status "settings saved"; returned OverridesFile == computed.
+        let d = tempdir();
+        let path = d.join("o.toml");
+        // Runtime diverges from baseline on keymap.preset → the override must appear.
+        let runtime_snap = snap("wordstar", ThemeIdentity::Builtin("default".into()), false);
+        let baseline_snap = snap("cua", ThemeIdentity::Builtin("default".into()), false);
+        let mut e = test_editor();
+        e.active_keymap_preset = "wordstar".into();
+        let result = perform_settings_save(
+            &mut e, false, Some(&path),
+            &baseline_snap, &OverridesFile::default(), &OverridesFile::default(),
+            &crate::fsx::RealFs,
+        );
+        assert!(result.is_some(), "must return Some on success");
+        assert_eq!(e.status, "settings saved");
+        let of = result.unwrap();
+        let expected = compute_overrides(&runtime_snap, &baseline_snap, &OverridesFile::default(), &OverridesFile::default());
+        assert_eq!(of, expected, "returned OverridesFile must equal compute_overrides result");
+        // The file must exist and round-trip.
+        assert!(path.is_file(), "overrides file must be written");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(parse_overrides(&text), of, "written file must round-trip");
     }
 }

@@ -490,6 +490,76 @@ fn journey_close_dirty_discard_leaves_file_and_swap() {
 // C2 journey: caret reflow vs. Reflow Buffer scope separation
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// D1+A5 journey: keymap-switch ctrl-w scopes
+// ---------------------------------------------------------------------------
+
+/// D1+A5 journey: ctrl-w changes meaning when the keymap preset switches. Both
+/// directions of the flip are pinned — neither observation is vacuous.
+///
+/// CUA ctrl-w = expand_selection (the selection grows from an empty caret).
+/// WordStar ctrl-w = scroll_line_up (scroll decrements; selection stays empty).
+#[test]
+fn journey_keymap_switch_scopes() {
+    // Build a 40-line doc so a caret placed at line 30 sets scroll > 0.
+    let text: String = "line\n".repeat(40);
+    let mut h = Harness::new(&text, None, (80, 24));
+
+    // Place the caret at the start of line 30 (byte 150 = 30 × 5).
+    // A direct selection write does NOT scroll — ensure_visible adjusts the
+    // viewport (review-mandated: nothing in the harness path calls it for us).
+    h.editor.active_mut().document.selection =
+        wordcartel_core::selection::Selection::single(150);
+    crate::nav::ensure_visible(&mut h.editor);
+    h.render();
+
+    // Precondition: the viewport has scrolled past line 0.
+    let scroll_after_move = h.editor.active().view.scroll;
+    assert!(scroll_after_move > 0,
+        "scroll must be > 0 after moving caret to line 30 (got {scroll_after_move})");
+
+    // Precondition: the selection is a collapsed caret before CUA ctrl-w.
+    assert!(h.editor.active().document.selection.primary().is_empty(),
+        "selection must be empty before CUA ctrl-w");
+
+    // CUA ctrl-w = expand_selection: the selection must grow from the caret.
+    h.ctrl('w');
+    assert!(!h.editor.active().document.selection.primary().is_empty(),
+        "CUA ctrl-w must expand the selection from a collapsed caret");
+
+    // Collapse the selection back to a caret (head position) so the post-switch
+    // assertion starts from an empty selection — a clean baseline.
+    let head = h.editor.active().document.selection.primary().head;
+    h.editor.active_mut().document.selection =
+        wordcartel_core::selection::Selection::single(head);
+
+    // Switch to WordStar via the Command Palette.
+    h.ctrl('p');
+    assert!(h.editor.palette.is_some(), "ctrl-p must open the palette");
+    h.type_str("keymap: wordstar");
+    // Precondition: the palette top row must be "Keymap: WordStar".
+    {
+        let p = h.editor.palette.as_ref().unwrap();
+        assert!(!p.rows.is_empty(), "'keymap: wordstar' must match at least one command");
+        assert_eq!(p.rows[0].label, "Keymap: WordStar",
+            "top palette row must be 'Keymap: WordStar': {:?}",
+            p.rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>());
+    }
+    h.key(KeyCode::Enter);
+    assert!(h.status().contains("keymap: wordstar"),
+        "status must confirm the preset switch: {:?}", h.status());
+
+    // WordStar ctrl-w = scroll_line_up: selection stays empty; scroll decrements by 1.
+    let scroll_before = h.editor.active().view.scroll;
+    assert!(scroll_before > 0,
+        "scroll must still be > 0 before WordStar ctrl-w (got {scroll_before})");
+    h.ctrl('w');
+    assert!(h.editor.active().document.selection.primary().is_empty(),
+        "WordStar ctrl-w must leave the selection empty");
+    assert_eq!(h.editor.active().view.scroll, scroll_before - 1,
+        "WordStar ctrl-w must decrement scroll by exactly 1 (was {scroll_before})");
+}
+
 /// C2 journey — caret reflow only transforms the item under the caret; Reflow
 /// Buffer (via the Command Palette) transforms the whole document.
 #[test]

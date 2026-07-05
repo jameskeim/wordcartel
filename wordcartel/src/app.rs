@@ -7,7 +7,7 @@ use crossterm::event::Event;
 #[cfg(test)]
 use crossterm::event::KeyEvent;
 
-use crate::{commands, config, derive, editor::Editor, file, keymap, render, term};
+use crate::{commands, config, derive, editor::Editor, file, keymap, render, settings, term};
 #[cfg(test)]
 use crate::input;
 use crate::jobs::{Executor, JobOutcome};
@@ -1221,8 +1221,25 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
     let xdg = dirs::config_dir();
-    let paths = config::config_layer_paths(&cli, xdg.as_deref(), &anchor);
-    let (cfg, mut warns) = config::load(&paths);
+    let hand_paths = config::config_layer_paths(&cli, xdg.as_deref(), &anchor);
+    // The overrides layer: ABOVE the hand chain, BELOW --config (spec D3). --no-config
+    // empties hand_paths and skips the overrides too (config_layer_paths returned early).
+    let overrides_path = xdg.as_ref()
+        .map(|x| x.join("wordcartel").join("settings-overrides.toml"));
+    let mut all_paths = hand_paths.clone();
+    if !cli.no_config {
+        if let Some(op) = overrides_path.as_ref().filter(|p| p.is_file()) {
+            // Race-free: derive from what config_layer_paths ACTUALLY pushed, not a re-stat
+            // (Fable plan M3). The is_some() guard kills the None == None arm — an EMPTY
+            // hand chain (no XDG config, no project file, no --config: the headline
+            // save-once-then-relaunch flow) must append, not underflow (Fable r2 Critical).
+            let has_cli_cfg = cli.config_path.is_some() && hand_paths.last() == cli.config_path.as_ref();
+            let idx = if has_cli_cfg { all_paths.len() - 1 } else { all_paths.len() };
+            all_paths.insert(idx, op.clone());
+        }
+    }
+    let (baseline_cfg, _baseline_warns) = config::load(&hand_paths); // WITHOUT overrides
+    let (cfg, mut warns) = config::load(&all_paths);                  // production config
     if let Some(c) = &cli.config_path {
         if !c.is_file() {
             warns.push(format!("config: --config path not found: {}", c.display()));
@@ -1296,6 +1313,30 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     editor.depth = resolved.depth;
     editor.heading_glyph_cfg = cfg.theme.heading_level_glyph; // for runtime picker switches (Task 7)
     warns.extend(resolved.warnings); // join the existing startup warning stream
+
+    // D1+A5 Task 4: baseline resolve (WITHOUT the overrides layer) + three snapshots.
+    // baseline_cfg was loaded above from hand_paths only; the overrides file is NOT in it.
+    let baseline_resolved = crate::theme_resolve::resolve_theme(&baseline_cfg.theme, &env);
+    let baseline_snapshot = settings::snapshot_of(&baseline_cfg, &baseline_resolved.theme.name);
+    // Overrides snapshot: the current machine-owned file (all-absent when the file doesn't exist).
+    let mut overrides_snapshot = overrides_path.as_ref()
+        .filter(|p| p.is_file())
+        .map(|p| std::fs::read_to_string(p)
+            .map(|s| settings::parse_overrides(&s))
+            .unwrap_or_default())
+        .unwrap_or_default();
+    // Mask snapshot: parse the --config layer via parse_mask so theme provenance is
+    // collapsed at load time (file vs name are indistinguishable for the guard).
+    let mask_snapshot = cli.config_path.as_ref()
+        .filter(|c| c.is_file())
+        .map(|c| std::fs::read_to_string(c)
+            .map(|s| settings::parse_mask(&s))
+            .unwrap_or_default())
+        .unwrap_or_default();
+    // Seed theme_identity from the MERGED config's provenance — an overrides/hand `name`
+    // wins over `file` per theme_identity_of's rule; use editor.theme.name since resolved.theme
+    // was already moved into the editor above.
+    editor.theme_identity = settings::theme_identity_of(&cfg.theme, &editor.theme.name);
 
     // Load the personal dictionary from disk (missing/unreadable → empty; no abort).
     if let Some(dict_path) = &cfg.diagnostics.dictionary {
@@ -1508,6 +1549,15 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         let keep = reduce(msg, &mut editor, &reg, &keymap, &executor, &clock, &msg_tx);
         if let Some(t) = rebuild_keymap_if_requested(&mut editor, &cfg.keymap.patches, &reg) {
             keymap = t;
+        }
+        if editor.settings_save_requested {
+            editor.settings_save_requested = false;
+            if let Some(of) = settings::perform_settings_save(
+                &mut editor, cli.no_config, overrides_path.as_deref(),
+                &baseline_snapshot, &overrides_snapshot, &mask_snapshot, &crate::fsx::RealFs)
+            {
+                overrides_snapshot = of; // second-save correctness — replace our copy
+            }
         }
         editor.note_undo_eviction(pre_id, pre_version);
         crate::clipboard::drain_clipboard_intents(&mut editor, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
@@ -4882,5 +4932,26 @@ mod tests {
         assert!(e.status.is_empty(), "the pending '…' prompt is cleared");
         let cw = parse_seq("ctrl-w").unwrap();
         assert!(matches!(keymap.resolve(&cw), Resolution::Command(crate::registry::CommandId("scroll_line_up"))));
+    }
+
+    // D1+A5 Task 4 — save_settings command sets the request flag -----------------
+
+    #[test]
+    fn save_settings_command_sets_the_request_flag() {
+        // Dispatch save_settings through the real registry and assert the flag is set.
+        // (The actual write happens in perform_settings_save; this pin guards the flag path.)
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::{Registry, CommandId};
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        assert!(!e.settings_save_requested, "flag must start false");
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        {
+            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+            reg.dispatch(CommandId("save_settings"), &mut ctx);
+        }
+        assert!(e.settings_save_requested,
+            "save_settings must set settings_save_requested");
     }
 }
