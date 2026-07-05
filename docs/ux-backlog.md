@@ -115,9 +115,22 @@ for a layer nobody has asked to use. **Revisit trigger:** actual user demand. Th
 middle path — within-menu mnemonics while a menu is open — is recorded as an optional A1
 garnish (see A1), not a commitment.
 
-### A5. Switch keybind system from the menu — `needs-design` · Medium (ships with D1)
+### A5. Switch keybind system from the menu — **SHIPPED 2026-07-05** (with D1, merged @ 4670eaf)
 
-**Facts:** `build_keymap` runs exactly once at startup (`app.rs:2029`); no runtime rebuild
+`keymap_cua`/`keymap_wordstar` commands (new **Settings** menu category, palette-searchable);
+the trie rebuilds between reduces via `rebuild_keymap_if_requested` (one source of truth used
+by run(), the e2e Harness, and the seam test); a half-typed chord prefix never completes
+against the new base; the switch status survives the rebuild; hints stay fresh (palette
+recomputes, menu rebuilds per open). Preset-scoped patches (`[keymap.cua]`/`[keymap.wordstar]`)
+ride on top of every base — "later file wins; within a file, specific wins"; `keymap::PRESETS`
+is the single preset list the pins iterate. **WordStar now binds `f10 → menu`** — the live
+sanity caught that the preset bound NO command surface, making runtime switching a keyboard
+trap (palette/menu were CUA-only; no switch-back without a mouse). Persistence rides D1.
+E2's radio marks get `editor.active_keymap_preset` as their hook. C4 closure recorded:
+`close_buffer` stays unbound by design in both presets (pinned); scoped patches are the
+supported user binding path.
+
+**Original facts:** `build_keymap` runs exactly once at startup (`app.rs:2029`); no runtime rebuild
 path; no switch command; presets = cua, wordstar. **Direction:** a `keymap_preset` command
 (menu: View or a Settings home) → rebuild the trie between reduces in `run()` (flag/Msg-driven;
 the trie is borrowed by `reduce`); menu hints stay fresh automatically (menu rebuilds on every
@@ -304,9 +317,23 @@ raises it when the active buffer is dirty.
 
 ## Theme D — configuration & persistence
 
-### D1. Save settings from the session — `needs-design` · Medium
+### D1. Save settings from the session — **SHIPPED 2026-07-05** (with A5, merged @ 4670eaf)
 
-**Facts:** NO config write-back exists (config is read-only at startup; `config.rs` has only
+"Save Settings" (Settings menu) writes a machine-owned `settings-overrides.toml` (XDG config
+dir; header-commented, atomic 0600, wholesale rewrite) layered ABOVE hand files and BELOW
+`--config` — hand-written files are never touched. The diff against a pre-overrides BASELINE
+follows the **contradiction-only-removal law** (both user-ratified): a key is written on
+divergence, KEPT when a project baseline merely coincides with it (cross-project saves can't
+erase each other), and removed only when the user actively changed the value back — with a
+per-key `--config` mask-guard (a masking layer can never manufacture an un-save; the theme
+key's mask is provenance-typed: `name` OR `file`). Theme identity is provenance-based
+(`File` vs `Builtin(name)`; picker Enter commits only if a preview actually applied — scheme-
+name collisions can't drop a pick). Persisted inventory: preset, theme name, five view
+toggles, `menu.bar`, `mouse.capture` — never patches, never state. Refusals: `--no-config`
+and missing config dir (status-line copy pinned). Settings-vs-state line: settings = user
+intent → overrides; state = machine bookkeeping → session.toml, unchanged.
+
+**Original facts:** NO config write-back exists (config is read-only at startup; `config.rs` has only
 `load()` + layer discovery). The session store (`state.rs:80-101`) writes STATE (cursor,
 marks, folds, scratch) to `$XDG_STATE_HOME/wordcartel/session.toml` — not settings.
 
@@ -511,8 +538,8 @@ relocates what C4/D1/A5/E1 touch (split early = every later effort lands in focu
 B2's hanging indent is a wrap-policy feature (travels inside B1); A3's palette parts share
 A6's territory; E2's checkable items serve A5/E1; C2 and C3 are islands.
 
-*(Progress: 1 A6 ✓ · 2 H1 ✓ · 3 B1+B2 ✓ · 4 C4 ✓ (2026-07-04) · 5 C2 ✓ (2026-07-05) —
-**next: 6, D1+A5**.)*
+*(Progress: 1 A6 ✓ · 2 H1 ✓ · 3 B1+B2 ✓ · 4 C4 ✓ (2026-07-04) · 5 C2 ✓ · 6 D1+A5 ✓
+(2026-07-05) — **next: 7, E3 (+E4 research in parallel)**.)*
 
 1. **A6** palette reachability — folds in A3(a) hints-verification + the palette-completeness
    invariant test (same territory). Kills the invisible-dispatch hazard first.
@@ -523,8 +550,7 @@ A6's territory; E2's checkable items serve A5/E1; C2 and C3 are islands.
    on correctly wrapped text.
 4. **C4** close-buffer prompt — lands in the post-H1 prompts.rs, reuses the quit machinery.
 5. **C2** transform scope — SHIPPED 2026-07-05.
-6. **D1 + A5** settings write-back + keymap switch — the persistence rail BEFORE the settings
-   that ride it (E3's chrome axis, E1's presets).
+6. **D1 + A5** settings write-back + keymap switch — SHIPPED 2026-07-05.
 7. **E3** chrome theming coherence (+ the render.rs split; **E4's research kicks off in
    parallel** — pure reading, no code dependency).
 8. **E1 + E2** density presets + polish — the convergence point (+ E4's theme landings +
