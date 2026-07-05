@@ -63,6 +63,26 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
                         editor.quit_drain_advance = false;
                     }
                 }
+                crate::editor::PostSaveAction::CloseBuffer { id } => {
+                    editor.pending_after_save = None;
+                    if saved_this && !editor.is_dirty(id) {
+                        // is_dirty on the ACTION's id, not the result's buffer_id —
+                        // only the Save-As divergence separates them, and the
+                        // buffer_id misreading would close a still-dirty buffer
+                        // (spec D3). close_buffer_now re-reads counts at apply time.
+                        crate::workspace::close_buffer_now(editor, id);
+                        editor.status = "saved — closed".into();
+                    } else if saved_this {
+                        // Edited during the in-flight save: do NOT close.
+                        editor.status = "edited during save — close cancelled".into();
+                    }
+                    // !saved_this: no close; the merge's own status stands (error
+                    // text, or empty for a vanished target) — mirrors
+                    // ContinueQuitDrain's abort, NOT Quit's leave-armed (an armed
+                    // close would fire on the user's next manual save). (The
+                    // saved-branch's "saved — closed" harmlessly shadows the
+                    // vanished-id status — unreachable for the pending's own id.)
+                }
             }
         }
     }
@@ -346,6 +366,14 @@ pub(crate) fn apply_clipboard_availability(editor: &mut Editor, ok: bool) {
 mod tests {
     use super::*;
     use crate::test_support::TestClock;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+
+    fn quit_tmp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "wc-c4-{}-{}-{}.md",
+            tag, std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)))
+    }
 
     #[test]
     fn save_and_quit_command_arms_pending_after_save_like_prompt() {
@@ -492,5 +520,271 @@ mod tests {
             merge: Box::new(|ed: &mut Editor| ed.status = "durability ran".into()),
         }, &mut e);
         assert_eq!(e.status, "durability ran");
+    }
+
+    // -----------------------------------------------------------------------
+    // C4: close-buffer Save/Discard/Cancel state-machine battery
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn close_after_save_closes_on_matching_result() {
+        // CloseSave on a dirty named buffer → drain → buffer count drops, correct neighbor
+        // active by ID, file on disk updated, status "saved — closed".
+        use crate::editor::{Editor, Buffer};
+        use crate::jobs::{Executor, InlineExecutor};
+        use crate::prompt::PromptAction;
+        let p = quit_tmp("close-match");
+        std::fs::write(&p, "old\n").unwrap();
+        let mut e = Editor::new_from_text("new content\n", Some(p.clone()), (80, 24));
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = None; // dirty
+        let x_id = e.active().id;
+        // Add a neighbor so we can check which becomes active after close.
+        let y_id = e.alloc_id();
+        let area = e.active().view.area;
+        e.buffers.push(Buffer::from_text(y_id, "neighbor\n", None, area));
+        e.install_scratch();
+        e.mru = vec![x_id, y_id, e.scratch_id.unwrap()];
+        e.active = 0; // x_id active
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::prompts::resolve_prompt(PromptAction::CloseSave { id: x_id }, &mut e, &ex, &clk, &tx);
+        assert!(e.pending_after_save.is_some(), "pending armed");
+        let pre_count = e.buffers.len();
+        for o in ex.drain() { apply_outcome(o, &mut e); }
+        assert!(e.by_id(x_id).is_none(), "closed buffer gone");
+        assert!(e.buffers.len() < pre_count, "buffer count drops");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "new content\n", "file updated");
+        assert_eq!(e.status, "saved — closed");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn close_cancelled_when_edited_during_flight() {
+        // Buffer edited during the in-flight save: result fires (saved_this=true) but buffer
+        // is dirty again → do NOT close; status verbatim "edited during save — close cancelled".
+        use crate::editor::{Editor, PostSaveAction};
+        use crate::jobs::{JobResult, JobKind, ResultClass};
+        let p = quit_tmp("flight");
+        std::fs::write(&p, "old\n").unwrap();
+        let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
+        let id = e.active().id;
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = None; // dirty at dispatch time
+        e.pending_after_save = Some(crate::editor::PendingAfterSave {
+            buffer_id: id, version: 1,
+            action: PostSaveAction::CloseBuffer { id },
+            at_ms: 0,
+        });
+        // Simulate edit during the in-flight save: version advances
+        e.active_mut().document.version = 2;
+        // Deliver the save result for version=1 (sets saved_version=1, but version=2 → dirty)
+        let save_result = JobResult {
+            buffer_id: id,
+            class: ResultClass::Durability,
+            version: 1,
+            kind: JobKind::Save,
+            merge: Box::new(move |editor: &mut Editor| {
+                if let Some(b) = editor.by_id_mut(id) { b.document.saved_version = Some(1); }
+            }),
+        };
+        apply_result(save_result, &mut e);
+        assert!(e.by_id(id).is_some(), "buffer NOT closed — still dirty");
+        assert_eq!(e.status, "edited during save — close cancelled");
+        assert!(e.pending_after_save.is_none(), "pending consumed");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn close_not_performed_on_save_failure() {
+        #[cfg(not(unix))] { return; }
+        #[cfg(unix)]
+        {
+            // Symlink-target trick: the save fails → buffer stays, pending cleared,
+            // error status contains "symlink".
+            use crate::jobs::{Executor, InlineExecutor};
+            use crate::prompt::PromptAction;
+            let real = quit_tmp("real");
+            std::fs::write(&real, "real\n").unwrap();
+            let link = quit_tmp("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let mut e = Editor::new_from_text("x\n", Some(link.clone()), (80, 24));
+            e.active_mut().document.saved_version = None;
+            e.active_mut().document.version = 1; // dirty
+            let id = e.active().id;
+            e.install_scratch();
+            let ex = InlineExecutor::default();
+            let clk = TestClock(0);
+            let (tx, _rx) = std::sync::mpsc::channel();
+            crate::prompts::resolve_prompt(PromptAction::CloseSave { id }, &mut e, &ex, &clk, &tx);
+            for o in ex.drain() { apply_outcome(o, &mut e); }
+            assert!(e.by_id(id).is_some(), "buffer NOT closed — save failed");
+            assert!(e.pending_after_save.is_none(), "pending cleared on save failure");
+            assert!(e.status.to_lowercase().contains("symlink"), "error status: {:?}", e.status);
+            let _ = std::fs::remove_file(&link);
+            let _ = std::fs::remove_file(&real);
+        }
+    }
+
+    #[test]
+    fn close_result_for_wrong_buffer_is_stale_noop() {
+        // Arm for buffer A, deliver a matching-versioned result for buffer B → nothing closes;
+        // the fire predicate checks buffer_id AND version — a mismatched buffer_id → fire=false.
+        use crate::editor::{Editor, PostSaveAction, Buffer};
+        use crate::jobs::{JobResult, JobKind, ResultClass};
+        let p_a = quit_tmp("wrong-a");
+        std::fs::write(&p_a, "a\n").unwrap();
+        let mut e = Editor::new_from_text("new_a\n", Some(p_a.clone()), (80, 24));
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = None;
+        let a_id = e.active().id;
+        let b_id = e.alloc_id();
+        let area = e.active().view.area;
+        e.buffers.push(Buffer::from_text(b_id, "b\n", None, area));
+        // Arm pending_after_save for A
+        e.pending_after_save = Some(crate::editor::PendingAfterSave {
+            buffer_id: a_id, version: 1,
+            action: PostSaveAction::CloseBuffer { id: a_id },
+            at_ms: 0,
+        });
+        // Deliver a save result for B (not A) at version 1
+        let save_result = JobResult {
+            buffer_id: b_id,
+            class: ResultClass::Durability,
+            version: 1,
+            kind: JobKind::Save,
+            merge: Box::new(move |editor: &mut Editor| {
+                if let Some(b) = editor.by_id_mut(b_id) { b.document.saved_version = Some(1); }
+            }),
+        };
+        apply_result(save_result, &mut e);
+        // A must still be present (fire=false because buffer_id mismatch)
+        assert!(e.by_id(a_id).is_some(), "A not closed — wrong buffer in result");
+        assert!(e.pending_after_save.is_some(), "pending still armed — not consumed by wrong result");
+        let _ = std::fs::remove_file(&p_a);
+    }
+
+    #[test]
+    fn close_after_save_last_ordinary_while_scratch_active() {
+        // Fable C1 corruption pin: last-ordinary close while scratch is active must NOT
+        // overwrite scratch. D2 MRU pin: fresh untitled at BACK, scratch stays at FRONT.
+        use crate::editor::{Editor, PostSaveAction};
+        use crate::jobs::{JobResult, JobKind, ResultClass};
+        let p = quit_tmp("c1-scratch");
+        std::fs::write(&p, "old\n").unwrap();
+        let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = None; // X dirty
+        let x_id = e.active().id;
+        e.install_scratch();
+        let scratch_id = e.scratch_id.unwrap();
+        let scratch_content = e.by_id(scratch_id).unwrap().document.buffer.to_string();
+        // Arm pending_after_save for CloseBuffer{X}
+        e.pending_after_save = Some(crate::editor::PendingAfterSave {
+            buffer_id: x_id, version: 1,
+            action: PostSaveAction::CloseBuffer { id: x_id },
+            at_ms: 0,
+        });
+        // Switch to scratch during the in-flight save (C1 scenario)
+        crate::workspace::goto_scratch(&mut e);
+        assert_eq!(e.active().id, scratch_id, "precondition: scratch active");
+        // Apply X's save result (marks X clean so close_buffer_now will close it)
+        let save_result = JobResult {
+            buffer_id: x_id,
+            class: ResultClass::Durability,
+            version: 1,
+            kind: JobKind::Save,
+            merge: Box::new(move |editor: &mut Editor| {
+                if let Some(b) = editor.by_id_mut(x_id) { b.document.saved_version = Some(1); }
+            }),
+        };
+        apply_result(save_result, &mut e);
+        // Scratch must be intact
+        assert!(e.scratch_id.is_some(), "scratch_id still valid");
+        let scratch = e.by_id(scratch_id).expect("scratch buffer still present");
+        assert_eq!(scratch.document.buffer.to_string(), scratch_content, "scratch content untouched");
+        // X is gone; a fresh untitled replaced its slot
+        assert!(e.by_id(x_id).is_none(), "X closed");
+        assert_eq!(e.buffers.len(), 2, "[fresh_untitled, scratch]");
+        // D2 MRU: scratch at FRONT, fresh at BACK
+        let fresh_id = e.buffers.iter().find(|b| !e.is_scratch(b.id)).map(|b| b.id).expect("fresh untitled");
+        assert_eq!(e.mru.first(), Some(&scratch_id), "scratch at MRU front");
+        assert_eq!(e.mru.last(), Some(&fresh_id), "fresh untitled at MRU back");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn close_after_save_last_ordinary_recheck() {
+        // Codex plan r1: ordinary count re-read at APPLY time. [X, Y, scratch], CloseSave{X},
+        // Y closed during flight → count=1 at apply → last-ordinary path fires (fresh untitled).
+        use crate::editor::{Editor, PostSaveAction, Buffer};
+        use crate::jobs::{JobResult, JobKind, ResultClass};
+        let p0 = quit_tmp("recheck-x");
+        std::fs::write(&p0, "x\n").unwrap();
+        let p1 = quit_tmp("recheck-y");
+        std::fs::write(&p1, "y\n").unwrap();
+        let mut e = Editor::new_from_text("new_x\n", Some(p0.clone()), (80, 24));
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = None; // X dirty
+        let x_id = e.active().id;
+        let y_id = e.alloc_id();
+        let area = e.active().view.area;
+        e.buffers.push(Buffer::from_text(y_id, "y\n", Some(p1.clone()), area)); // Y clean
+        e.install_scratch();
+        // Arm CloseBuffer{X}
+        e.pending_after_save = Some(crate::editor::PendingAfterSave {
+            buffer_id: x_id, version: 1,
+            action: PostSaveAction::CloseBuffer { id: x_id },
+            at_ms: 0,
+        });
+        // Close Y during the flight (Y is clean)
+        crate::workspace::close_buffer_now(&mut e, y_id);
+        assert!(e.by_id(y_id).is_none(), "Y closed during flight");
+        // Now [X, scratch] — ordinary count = 1 at apply time
+        let save_result = JobResult {
+            buffer_id: x_id,
+            class: ResultClass::Durability,
+            version: 1,
+            kind: JobKind::Save,
+            merge: Box::new(move |editor: &mut Editor| {
+                if let Some(b) = editor.by_id_mut(x_id) { b.document.saved_version = Some(1); }
+            }),
+        };
+        apply_result(save_result, &mut e);
+        // X was the last ordinary buffer at apply time → last-ordinary path fires
+        assert!(e.by_id(x_id).is_none(), "X closed");
+        assert_eq!(e.buffers.len(), 2, "fresh untitled + scratch");
+        assert!(e.buffers.iter().any(|b| b.document.path.is_none() && !e.is_scratch(b.id)),
+            "fresh untitled present in X's slot");
+        assert_eq!(e.status, "saved — closed");
+        let _ = std::fs::remove_file(&p0);
+        let _ = std::fs::remove_file(&p1);
+    }
+
+    #[test]
+    fn close_save_on_conflicted_file_raises_external_mod_and_does_not_arm() {
+        // dispatch_save_then skips arming pending_after_save when the external-mod
+        // modal is raised (dispatch_save_then's guard: prompt.is_some() → no arm).
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::prompt::PromptAction;
+        let p = quit_tmp("conflict");
+        std::fs::write(&p, "v0\n").unwrap();
+        let mut e = Editor::new_from_text("edited\n", Some(p.clone()), (80, 24));
+        // stored_fp captured at construction = fingerprint of "v0\n"
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = None; // dirty
+        let id = e.active().id;
+        // External change (different size → guaranteed fingerprint divergence)
+        std::fs::write(&p, "external change — much longer content here\n").unwrap();
+        e.install_scratch();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::prompts::resolve_prompt(PromptAction::CloseSave { id }, &mut e, &ex, &clk, &tx);
+        assert!(e.prompt.is_some(), "external-mod conflict raises the modal");
+        assert!(e.pending_after_save.is_none(), "pending_after_save NOT armed on conflict");
+        let _ = std::fs::remove_file(&p);
     }
 }

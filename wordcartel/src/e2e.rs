@@ -391,3 +391,95 @@ fn journey_nested_list_wraps_hanging() {
     assert!(h.screen_contains("    beta"),
         "continuation at col 4 on row 1:\n{:#?}", h.screen());
 }
+
+// ---------------------------------------------------------------------------
+// C4 journeys: close-buffer with dirty-confirm prompt
+// ---------------------------------------------------------------------------
+
+/// C4 journey — Save & close path: a dirty named buffer with a scratch neighbor is
+/// palette-dispatched through close_buffer → close_confirm prompt → 's' → save +
+/// close. The file on disk receives the typed text; the buffer is gone; the status
+/// row reads "saved — closed".
+///
+/// Arrange: a real tempfile (created empty so stored_fp matches the on-disk
+/// fingerprint — else dispatch_save raises the external-change modal). A scratch
+/// buffer is installed as the neighbor so close has somewhere to go after the last
+/// ordinary buffer is replaced.
+#[test]
+fn journey_close_dirty_save_and_close() {
+    // Create the empty tempfile BEFORE Harness::new so stored_fp == fingerprint(path)
+    // (else dispatch_save raises the external-change modal instead of saving — spec I4).
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    let mut h = Harness::new("", Some(path.clone()), (80, 24));
+    // Scratch provides a neighbor so close_buffer_now's last-ordinary branch runs
+    // (replaces the named slot with a fresh untitled — buffer count stays at 2).
+    h.editor.install_scratch();
+    let orig_id = h.editor.active().id;
+    // Dirty the named buffer.
+    h.type_str("hello");
+    assert!(h.dirty(), "buffer must be dirty before close");
+    // Palette-dispatch close_buffer: ctrl-p → type "close" → Enter.
+    // "close" uniquely fuzzy-matches "Close Buffer" (case-insensitive; only one hit).
+    // dispatch_overlay_command closes the palette, runs close_buffer → dirty → open_prompt.
+    h.ctrl('p');
+    assert!(h.editor.palette.is_some(), "ctrl-p must open the palette");
+    h.type_str("close");
+    h.key(KeyCode::Enter);
+    assert!(h.editor.prompt.is_some(),
+        "close_buffer on a dirty named buffer must open the close-confirm prompt");
+    assert!(h.screen_contains("[S]ave & close"),
+        "close-confirm message must appear on the status row:\n{:#?}", h.screen());
+    // 's' → CloseSave: dispatch_save_then dispatches a save job; InlineExecutor runs
+    // it inline (within reduce); the merge calls close_buffer_now then "saved — closed".
+    h.key(KeyCode::Char('s'));
+    assert!(h.editor.by_id(orig_id).is_none(),
+        "named buffer must be gone after Save & close");
+    assert!(h.editor.active().id != orig_id, "a neighbor is active after close");
+    // The neighbor (a fresh untitled in the last-ordinary slot) is what renders now:
+    // the closed buffer's typed text must no longer be on screen.
+    assert!(!h.screen_contains("hello"),
+        "closed buffer's text must be gone from the screen:\n{:#?}", h.screen());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello",
+        "typed text must have been written to disk");
+    assert_eq!(h.status(), "saved — closed",
+        "status must confirm save and close");
+}
+
+/// C4 journey — Discard path: same arrange plus a real swap file written via the
+/// swap API. After 'd', the buffer is closed, the file on disk is UNCHANGED, and
+/// the swap file still exists (decision 1 pin: Discard does not delete the swap).
+#[test]
+fn journey_close_dirty_discard_leaves_file_and_swap() {
+    // File with original content. Created before Harness::new so stored_fp is consistent.
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    std::fs::write(&path, "original\n").unwrap();
+    let mut h = Harness::new("original\n", Some(path.clone()), (80, 24));
+    h.editor.install_scratch();
+    // Dirty the buffer: type at the start so the buffer diverges from disk.
+    h.type_str("draft");
+    assert!(h.dirty(), "buffer must be dirty before close");
+    // Write a stub swap file (simulates the auto-swap writer having fired).
+    let sp = crate::swap::swap_path(Some(&path)).unwrap();
+    crate::swap::write_atomic(&sp, "stub swap").unwrap();
+    assert!(sp.exists(), "precondition: swap file must exist before close");
+    let orig_id = h.editor.active().id;
+    // Palette-dispatch close_buffer → close-confirm prompt.
+    h.ctrl('p');
+    assert!(h.editor.palette.is_some(), "ctrl-p must open the palette");
+    h.type_str("close");
+    h.key(KeyCode::Enter);
+    assert!(h.editor.prompt.is_some(),
+        "close_buffer on a dirty named buffer must open the close-confirm prompt");
+    assert!(h.screen_contains("[D]iscard"),
+        "close-confirm message must appear on the status row:\n{:#?}", h.screen());
+    // 'd' → CloseDiscard: close_buffer_now runs immediately, swap NOT deleted.
+    h.key(KeyCode::Char('d'));
+    assert!(h.editor.by_id(orig_id).is_none(),
+        "named buffer must be gone after Discard");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "original\n",
+        "disk file must be UNCHANGED after Discard");
+    assert!(sp.exists(), "swap file must survive Discard (decision 1 pin)");
+    let _ = std::fs::remove_file(&sp);
+}
