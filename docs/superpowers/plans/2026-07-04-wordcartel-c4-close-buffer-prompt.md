@@ -239,7 +239,9 @@ pub(crate) fn close_buffer_now(editor: &mut Editor, id: BufferId) {
                     // !saved_this: no close; the merge's own status stands (error
                     // text, or empty for a vanished target) — mirrors
                     // ContinueQuitDrain's abort, NOT Quit's leave-armed (an armed
-                    // close would fire on the user's next manual save).
+                    // close would fire on the user's next manual save). (The
+                    // saved-branch's "saved — closed" harmlessly shadows the
+                    // vanished-id status — unreachable for the pending's own id.)
                 }
 ```
 
@@ -248,12 +250,15 @@ pub(crate) fn close_buffer_now(editor: &mut Editor, id: BufferId) {
 - [ ] **Step 7: the state-machine test battery.** Add, using the grounding idioms (quit_tmp/SEQ for temp files, `InlineExecutor::default()` + `ex.drain()` + `apply_job_outcome` for saves, the version/saved_version dirty idiom, `resolve_prompt(...)` direct calls):
   - workspace.rs: `close_buffer_now_by_id_closes_inactive_buffer` (three buffers incl. scratch; close a NON-active id → viewed buffer still active by ID, count drops); `close_buffer_now_nonactive_normal_keeps_view` (arrange the removed index BELOW the active one → `editor.active` re-pointed, `active().id` unchanged); `close_buffer_now_vanished_id_is_noop_with_status`.
   - prompts.rs: `close_save_arms_pending_after_save_with_close_variant` (dirty named buffer, `resolve_prompt(CloseSave { id })` → `pending_after_save` is `Some` with `action == CloseBuffer { id }`, matching buffer_id/version); `close_discard_closes_immediately_and_leaves_swap` (write a real swap via `crate::swap::swap_path(Some(&p))` + `crate::swap::write_atomic(&sp, "stub")`, resolve `CloseDiscard { id }` → buffer gone AND `sp.exists()` — decision 1's pin); `close_save_on_unnamed_buffer_opens_save_as_with_carry` (unnamed dirty → `pending_save_as == Some(CloseBuffer { .. })`, minibuffer open).
-  - jobs_apply.rs (the drain-loop template from `quit_save_all_drains_named_dirty_then_quits`):
-    `close_after_save_closes_on_matching_result` (CloseSave on a dirty named buffer → drain → buffer count drops, file on disk updated, status `"saved — closed"`);
+  - jobs_apply.rs (the drain-loop template from `quit_save_all_drains_named_dirty_then_quits`
+    — NOTE the template, `quit_tmp`, and `SEQ` live in APP.RS's test module (~:2117-:2250,
+    SEQ ~:1658) and are module-private: transcribe `quit_tmp`/`SEQ` locally into
+    jobs_apply.rs's test module; Fable plan r3):
+    `close_after_save_closes_on_matching_result` (CloseSave on a dirty named buffer → drain → buffer count drops, the correct NEIGHBOR is active by ID, file on disk updated, status `"saved — closed"`);
     `close_cancelled_when_edited_during_flight` (arm via `resolve_prompt(CloseSave{id})` with a REAL executor deferral — or arm `pending_after_save` manually as the quit sibling `quit_after_save_cancelled_when_edited_during_flight` does — then dirty the buffer again before applying the result → buffer stays, status verbatim);
     `close_not_performed_on_save_failure` (the symlink-target trick verbatim from `quit_drain_aborts_on_save_failure`, `#[cfg(unix)]` guarded → buffer stays, `pending_after_save` is None, error status contains "symlink");
     `close_result_for_wrong_buffer_is_stale_noop` (arm for buffer A, deliver a matching-versioned result for buffer B → nothing closes; keys off the `fire` predicate);
-    `close_after_save_last_ordinary_while_scratch_active` (**the Fable C1 corruption pin**: `[X, scratch]`, CloseSave{X}, `goto_scratch` during the flight, apply the result → scratch INTACT — `scratch_id` still valid, scratch content untouched — and a fresh untitled sits in X's slot);
+    `close_after_save_last_ordinary_while_scratch_active` (**the Fable C1 corruption pin**: `[X, scratch]`, CloseSave{X}, `goto_scratch` during the flight, apply the result → scratch INTACT — `scratch_id` still valid, scratch content untouched — a fresh untitled sits in X's slot, AND the fresh id is at the BACK of the MRU with scratch still at the front — the D2 MRU decision's pin, Fable plan r3);
     `close_after_save_last_ordinary_recheck` (**the spec's flight-time recheck, distinct
     from the scratch pin — Codex plan r1**: THREE buffers `[X, Y, scratch]`, CloseSave{X},
     then `close_buffer_now(&mut e, y_id)` during the flight (Y clean), apply X's result →
@@ -275,7 +280,10 @@ pub(crate) fn close_buffer_now(editor: &mut Editor, id: BufferId) {
 - Consumes: Task 1's `PostSaveAction::CloseBuffer`.
 - Produces: complete behavioral coverage; nothing new for Task 3.
 
-- [ ] **Step 1: failing tests first** (app.rs test module, the tick/timeout idioms of the existing `save_and_quit` timeout tests — find the sibling that drives `Msg::Tick` past `SAVE_QUIT_TIMEOUT_MS` and copy its shape):
+- [ ] **Step 1: failing tests first** (app.rs test module; the timeout test drives the
+  extracted `save_timeout_tick` helper from Step 2 directly — NO sibling timeout test
+  exists anywhere and the run()-local block is unreachable from `reduce`; Fable plan r3
+  confirmed by grep):
 
 ```rust
     #[test]
@@ -415,6 +423,9 @@ pub(crate) fn save_timeout_tick(editor: &mut Editor, now: u64) {
 - The three user decisions hold: a real swap survives Discard (the T1 pin); NO keymap.rs changes anywhere in the branch; the quit-clear fires only on `CloseBuffer`-carrying pendings.
 - The sanctioned pin reversal is the ONLY meaning-change to an existing test; the workspace clean-path family (:261-314) passes unmodified.
 - The Fable C1 corruption pin (`close_after_save_last_ordinary_while_scratch_active`) passes, and `close_buffer_now`'s non-active arms are exercised by tests, not just written.
+- `apply_panic` remains action-agnostic and UNTOUCHED (spec D3's verify-don't-modify —
+  it keys only on buffer_id/version, jobs_apply.rs:99-105, so the new variant is covered
+  with zero changes).
 - `PromptAction` still derives `Copy`; no new `#[allow]`; no `unsafe`; registry.rs untouched.
 - Pre-merge: smoke verbatim + a live tmux sanity (dirty buffer, palette-dispatch Close Buffer, exercise s/d/c across three runs).
 - Controller merge-time bookkeeping: backlog C4 → SHIPPED (no binding — deferred to A5; swap-survives-discard convention), working order advances to C2, memory tick.
