@@ -90,8 +90,13 @@ ENTIRE list (top-level snap reaches the `List` container, not the `ListItem`).
     line is NON-blank (a loose item's own marker bytes; a tight item's lead text before
     its nested list; a top-level quote's own `> ` prefix bytes) → the SAME preference
     set as the leaf branch (Fable r6 N2): nearest `ListItem` on the path, else nearest
-    `BlockQuote`, else None. (This makes the degraded-parse derivation in Non-goals
-    exact: the childless root has neither → None.)
+    `BlockQuote`, else None — **with ONE refinement (Fable r6 N5, user-ratified A): if
+    the byte sits in the LEADING INDENT of a line whose first content begins a CHILD
+    `ListItem` (the two spaces before a nested item's marker), the unit is THAT CHILD —
+    Home-then-transform acts on the item the eye is on, per decision 2's deepest-item
+    principle, not the outer item the indent structurally belongs to.** (The
+    degraded-parse derivation in Non-goals stays exact: the childless root has no
+    ListItem, no BlockQuote, no child on the line → None.)
   - **Every returned unit span extends to `line_start(span.start)`** (Fable r5 C1:
     nested-item and quote spans EXCLUDE leading indent/prefix bytes; without the
     extension the slice starts mid-line and repar reflows at the wrong content column).
@@ -223,7 +228,8 @@ The chooser's prompt string is also unchanged.
   behavior pin**: the unit extends to line start; the nested marker's indent and the
   4-column continuations survive the round trip); `caret_on_loose_item_marker_transforms_the_item`
   and `caret_in_tight_item_lead_text_transforms_the_item` (**Fable C2's content-not-gap
-  pins**); `caret_reflow_on_blank_line_noops_with_status` (status `"nothing to transform"` — the
+  pins**); `caret_in_nested_item_indent_transforms_the_child_item` (**the r6 N5
+  refinement's pin**: Home on a `  - inner` line → the INNER item's unit); `caret_reflow_on_blank_line_noops_with_status` (status `"nothing to transform"` — the
   existing empty-range guard);
   `caret_reflow_in_fence_noops` (verbatim pass-through); `buffer_variants_act_whole_buffer`
   (one of the three suffices for region proof + the registry test extends to six
