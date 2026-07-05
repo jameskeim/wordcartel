@@ -126,7 +126,7 @@
 
 Run: `cargo test -p wordcartel -- scoped resolve_preset specific_wins` — FAIL to compile (fields/fn don't exist): the RED.
 
-- [ ] **Step 2: config.rs schema.** Per grounding §B.1 exactly: add `ScopedPatch` (pub, `#[derive(Debug, Clone, Default)]`) below `KeymapPatch` (config.rs:144-148); add the two pub fields to `KeymapPatch`; add `RawScoped` (`#[derive(Debug, Default, Deserialize)] #[serde(default)]`, private, `bind`/`unbind`) below `RawKeymap` (config.rs:211-217); add `cua: Option<RawScoped>, wordstar: Option<RawScoped>` to `RawKeymap`; the patch push (config.rs:314-317) maps both via `.map(|s| ScopedPatch { bind: s.bind, unbind: s.unbind })`.
+- [ ] **Step 2: config.rs schema.** Per grounding §B.1 exactly: add `ScopedPatch` (pub, `#[derive(Debug, Clone, Default)]`) below `KeymapPatch` (config.rs:144-148); add the two pub fields to `KeymapPatch`; add `RawScoped` (`#[derive(Debug, Default, Deserialize)] #[serde(default)]`, private, `bind`/`unbind`) below `RawKeymap` (config.rs:211-217); add `cua: Option<RawScoped>, wordstar: Option<RawScoped>` to `RawKeymap` — with the footgun doc-comment on the fields (the spec's config-docs sentence has no other home, Fable plan M1: `/// NOTE: once a [keymap.cua] header appears, [keymap]-intended keys typed below it silently belong to the scoped table (TOML section semantics).`); the patch push (config.rs:314-317) maps both via `.map(|s| ScopedPatch { bind: s.bind, unbind: s.unbind })`.
 
 - [ ] **Step 3: keymap.rs.** Add beside `preset_bindings` (keymap.rs:205):
 
@@ -190,9 +190,48 @@ Drop the stale `#[allow(dead_code)] // wired in Task 4/5` on `build_keymap` whil
 
     #[test]
     fn keymap_switch_is_idempotent_with_status() {
-        // dispatch keymap_cua while cua is active → status only, NO rebuild flag.
-        // (same Arrange as above; e.active_keymap_preset starts "cua")
-        // assert!(!e.keymap_rebuild); assert_eq!(e.status, "keymap: cua (already active)");
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::{Registry, CommandId};
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        reg.dispatch(CommandId("keymap_cua"), &mut ctx); // cua is already active
+        assert!(!e.keymap_rebuild, "idempotent switch must not request a rebuild");
+        assert_eq!(e.status, "keymap: cua (already active)");
+    }
+
+    #[test]
+    fn switch_status_survives_the_rebuild() {
+        // Fable plan C1: the rebuild must NOT wipe the switch status set in the same
+        // reduce (no pending prefix in play → status untouched by the helper).
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        let reg = crate::registry::Registry::builtins();
+        e.active_keymap_preset = "wordstar".into();
+        e.keymap_rebuild = true;
+        e.status = "keymap: wordstar".into();
+        let t = crate::app::rebuild_keymap_if_requested(&mut e, &[], &reg);
+        assert!(t.is_some());
+        assert_eq!(e.status, "keymap: wordstar", "the pinned switch copy reaches the draw");
+    }
+
+    #[test]
+    fn patches_survive_the_switch() {
+        // Fable plan I3(c): a GLOBAL patch bind holds under both bases through the
+        // real helper (the same patch slice run() passes from cfg.keymap.patches).
+        use crate::keymap::{parse_seq, Resolution};
+        let patches = vec![crate::config::KeymapPatch {
+            bind: [("ctrl-g".to_string(), "copy".to_string())].into(),
+            ..Default::default() }];
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        let reg = crate::registry::Registry::builtins();
+        e.active_keymap_preset = "wordstar".into();
+        e.keymap_rebuild = true;
+        let t = crate::app::rebuild_keymap_if_requested(&mut e, &patches, &reg).unwrap();
+        let g = parse_seq("ctrl-g").unwrap();
+        assert!(matches!(t.resolve(&g), Resolution::Command(crate::registry::CommandId("copy"))),
+            "the global patch rides onto the new base");
     }
 
     #[test]
@@ -207,18 +246,13 @@ Drop the stale `#[allow(dead_code)] // wired in Task 4/5` on `build_keymap` whil
         e.status = "ctrl-k …".into();
         e.active_keymap_preset = "wordstar".into();
         e.keymap_rebuild = true;
-        // — the seam, verbatim shape of run()'s block —
+        // The REAL production helper — the test proves run()'s code, not a copy (Fable I4).
         let mut keymap = cua_keymap();
-        if e.keymap_rebuild {
-            e.keymap_rebuild = false;
-            let (t, kw) = build_keymap(&crate::config::KeymapConfig {
-                preset: e.active_keymap_preset.clone(), patches: Vec::new() }, &reg);
+        if let Some(t) = crate::app::rebuild_keymap_if_requested(&mut e, &[], &reg) {
             keymap = t;
-            e.pending_keys.clear();
-            e.status.clear();
-            if let Some(w) = kw.first() { e.status = w.clone(); }
         }
         assert!(e.pending_keys.is_empty(), "pending prefix must not survive the rebuild");
+        assert!(e.status.is_empty(), "the pending '…' prompt is cleared");
         let cw = parse_seq("ctrl-w").unwrap();
         assert!(matches!(keymap.resolve(&cw), Resolution::Command(crate::registry::CommandId("scroll_line_up"))));
     }
@@ -272,9 +306,48 @@ fn switch_keymap_preset(editor: &mut crate::editor::Editor, preset: &str) {
 }
 ```
 
-- [ ] **Step 4: run() wiring.** Seeding block (app.rs:1244-1262) gains `editor.active_keymap_preset = keymap::resolve_preset(&cfg.keymap.preset).to_string();`. The loop-local becomes `let mut keymap = std::mem::take(&mut editor.keymap);` (app.rs:1334) and its stale comment drops the "doesn't change during the loop in v1" clause. Immediately after `let keep = reduce(...);` (app.rs:1473) insert the rebuild block (grounding §B.6, verbatim — including `editor.pending_keys.clear(); editor.status.clear();` before the warning surface). `cfg.keymap.patches.clone()` is the patch source.
+- [ ] **Step 4: run() wiring.** Seeding block (app.rs:1244-1262) gains `editor.active_keymap_preset = keymap::resolve_preset(&cfg.keymap.preset).to_string();`. The loop-local becomes `let mut keymap = std::mem::take(&mut editor.keymap);` (app.rs:1334) and its stale comment drops the "doesn't change during the loop in v1" clause. Add the extracted helper (user-ratified A, Fable plan C1+I4 — ONE source of truth consumed by run(), the Harness, and the seam test; the unconditional status.clear() of the earlier draft wiped the switch status before the draw) as a pub(crate) fn in app.rs near `preview_selected_theme`:
 
-- [ ] **Step 5: e2e Harness.** In `step` (e2e.rs:50-58), after `reduce` returns and before `advance`: the same block against `self.keymap`/`self.reg` (patches: `Vec::new()` — the harness has no config chain).
+```rust
+/// Honor a requested keymap rebuild (spec D2). Returns the new trie for the caller to
+/// swap into its loop-local. A half-typed prefix must not complete against the new base
+/// (spec I-3): the buffer drops, and the status clears ONLY when it is the pending "…"
+/// prompt — a switch status set in the same reduce must survive to the draw.
+pub(crate) fn rebuild_keymap_if_requested(
+    editor: &mut crate::editor::Editor,
+    patches: &[crate::config::KeymapPatch],
+    reg: &crate::registry::Registry,
+) -> Option<crate::keymap::KeyTrie> {
+    if !editor.keymap_rebuild { return None; }
+    editor.keymap_rebuild = false;
+    let (trie, kw) = crate::keymap::build_keymap(&crate::config::KeymapConfig {
+        preset: editor.active_keymap_preset.clone(),
+        patches: patches.to_vec(),
+    }, reg);
+    if !editor.pending_keys.is_empty() {
+        editor.pending_keys.clear();
+        if editor.status.ends_with('…') { editor.status.clear(); }
+    }
+    if let Some(w) = kw.first() { editor.status = w.clone(); }
+    Some(trie)
+}
+```
+
+Immediately after `let keep = reduce(...);` (app.rs:1473):
+
+```rust
+        if let Some(t) = rebuild_keymap_if_requested(&mut editor, &cfg.keymap.patches, &reg) {
+            keymap = t;
+        }
+```
+
+- [ ] **Step 5: e2e Harness.** In `step` (e2e.rs:50-58), after `reduce` returns and before `advance`:
+
+```rust
+        if let Some(t) = app::rebuild_keymap_if_requested(&mut self.editor, &[], &self.reg) {
+            self.keymap = t;
+        }
+```
 
 - [ ] **Step 6: GREEN + gates.** Also verify by hand-inspection that `hydrate_overlays`/menu/palette take the keymap parameter (grounding-verified — no `editor.keymap` reads in the loop) and note it in the report.
 
@@ -407,6 +480,33 @@ Failing tests (settings.rs `#[cfg(test)]`; corpus-driven, no run loop needed):
     }
 
     #[test]
+    fn theme_collision_pick_over_file_theme_writes_name() {
+        // Fable plan I3(a): runtime Builtin(n) vs baseline File → rule 1 WRITES the name
+        // even when n collides with the file theme's scheme name (the I-4 bug class).
+        let rt = snap("cua", ThemeIdentity::Builtin("gruvbox".into()), false);
+        let base = snap("cua", ThemeIdentity::File, false);
+        let of = compute_overrides(&rt, &base, &OverridesFile::default(), &OverridesFile::default());
+        assert_eq!(of.theme.as_ref().unwrap().name.as_deref(), Some("gruvbox"));
+    }
+
+    #[test]
+    fn genuine_masked_session_divergence_still_writes() {
+        // Fable plan I3(b): the mask-guard protects rule 3 only — rule 1 is untouched.
+        let rt = snap("cua", ThemeIdentity::Builtin("default".into()), true);
+        let base = snap("cua", ThemeIdentity::Builtin("default".into()), false);
+        let mask = parse_overrides("[view]\ntypewriter=false\n");
+        let of = compute_overrides(&rt, &base, &OverridesFile::default(), &mask);
+        assert_eq!(of.view.as_ref().unwrap().typewriter, Some(true), "explicit change wins through the mask");
+    }
+
+    #[test]
+    fn corrupt_overrides_parse_to_an_empty_layer() {
+        // Fable plan I3(d) / spec Error handling: a corrupt machine file must not brick.
+        assert_eq!(parse_overrides("not [valid toml"), OverridesFile::default());
+        assert_eq!(parse_mask("also ["), OverridesFile::default());
+    }
+
+    #[test]
     fn save_overrides_roundtrips_and_headers() {
         let d = tempdir(); // reuse the config.rs idiom: a small local tempdir helper
         let path = d.join("settings-overrides.toml");
@@ -429,7 +529,7 @@ Failing tests (settings.rs `#[cfg(test)]`; corpus-driven, no run loop needed):
         struct FailFs;
         impl crate::fsx::Fs for FailFs {
             fn create_excl(&self, _: &std::path::Path, _: u32) -> std::io::Result<Box<dyn crate::fsx::WriteSync>> {
-                Err(std::io::Error::new(std::io::ErrorKind::Other, "boom"))
+                Err(std::io::Error::other("boom")) // io_other_error is deny — the repo idiom (fsx.rs:394+)
             }
             fn existing_mode(&self, _: &std::path::Path) -> Option<u32> { None }
             fn rename(&self, _: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
@@ -483,7 +583,7 @@ Callers map each inventory key into its section (strings for preset/menu-bar via
     };
 ```
 
-Sections become `Some(...)` only when they hold at least one `Some` key (a tiny `fn some_if<T>(t: T, any: bool) -> Option<T>` or per-section construction — implementer's judgment). `save_overrides`: `std::fs::create_dir_all(parent)` + Unix 0700 permissions on the created dir (the swap.rs:31-43 shape), `toml::to_string(of)` (map the toml error into `io::Error::new(InvalidData, e)`), prepend `OVERRIDES_HEADER`, then `write_overrides(fs, path, bytes)` = `fsx::atomic_replace(fs, path, bytes, WriteOpts { mode: ModePolicy::Fixed(0o600), dir_fsync: true })`. `parse_overrides`: `toml::from_str::<OverridesFile>(bytes).unwrap_or_default()` (corrupt → empty layer, matching load()'s tolerance). `theme_identity_of(theme_cfg, resolved_name)`: `if theme_cfg.file.is_some() && theme_cfg.name.is_none() { File } else { Builtin(resolved_name.to_string()) }`. `snapshot_of(cfg)` uses `resolve_preset(&cfg.keymap.preset)` and needs the resolved theme name — give it the signature `snapshot_of(cfg: &Config, resolved_theme_name: &str)` so T4 passes the baseline's own `resolve_theme` result (do NOT resolve inside — resolve_theme takes an EnvSnapshot). `runtime_snapshot(editor)` reads the Editor fields directly (`editor.theme_identity.clone()` for the theme).
+Sections become `Some(...)` only when they hold at least one `Some` key (a tiny `fn some_if<T>(t: T, any: bool) -> Option<T>` or per-section construction — implementer's judgment). `save_overrides`: `std::fs::create_dir_all(parent)`, with Unix 0700 permissions applied ONLY when the dir did not already exist (`let existed = parent.exists();` first — Fable plan M2: `<config_dir>/wordcartel` also holds the hand-owned config.toml; a save must not silently tighten a user's 0755 dir, unlike swap's machine-only state dir), `toml::to_string(of)` (map the toml error into `io::Error::new(InvalidData, e)`), prepend `OVERRIDES_HEADER`, then `write_overrides(fs, path, bytes)` = `fsx::atomic_replace(fs, path, bytes, WriteOpts { mode: ModePolicy::Fixed(0o600), dir_fsync: true })`. `parse_overrides`: `toml::from_str::<OverridesFile>(bytes).unwrap_or_default()` (corrupt → empty layer, matching load()'s tolerance). `theme_identity_of(theme_cfg, resolved_name)`: `if theme_cfg.file.is_some() && theme_cfg.name.is_none() { File } else { Builtin(resolved_name.to_string()) }`. `snapshot_of(cfg)` uses `resolve_preset(&cfg.keymap.preset)` and needs the resolved theme name — give it the signature `snapshot_of(cfg: &Config, resolved_theme_name: &str)` so T4 passes the baseline's own `resolve_theme` result (do NOT resolve inside — resolve_theme takes an EnvSnapshot). `runtime_snapshot(editor)` reads the Editor fields directly (`editor.theme_identity.clone()` for the theme).
 
 - [ ] **Step 3: Editor + picker threading.** Editor fields (beside T2's): `pub settings_save_requested: bool` (init false) + `pub theme_identity: crate::settings::ThemeIdentity` (init `Builtin("default".into())` — matches `theme: default()`). `ThemePicker` gains `pub previewed: Option<String>` (theme_picker.rs:6-15); init `None` at BOTH construction sites (editor.rs:676-679 `open_theme_picker` and the test literal theme_picker.rs:36-37). `preview_selected_theme` (app.rs:191-196) sets `tp.previewed = Some(name.clone())` when it applies a builtin (restructure to set the field via `editor.theme_picker.as_mut()` before/after `apply_theme` — mind the borrow: read the name, apply, then set the field). The Enter arm (app.rs:469) becomes:
 
@@ -533,7 +633,9 @@ Extend the T2 registry pin to all three Settings commands. Picker pins (app.rs t
     let mut all_paths = hand_paths.clone();
     if !cli.no_config {
         if let Some(op) = overrides_path.as_ref().filter(|p| p.is_file()) {
-            let has_cli_cfg = cli.config_path.as_ref().map(|c| c.is_file()).unwrap_or(false);
+            // Race-free: derive from what config_layer_paths ACTUALLY pushed, not a re-stat
+            // (Fable plan M3 — a fs race would mis-index and len-1 could underflow).
+            let has_cli_cfg = hand_paths.last() == cli.config_path.as_ref();
             let idx = if has_cli_cfg { all_paths.len() - 1 } else { all_paths.len() };
             all_paths.insert(idx, op.clone());
         }
@@ -593,7 +695,7 @@ run()'s block, beside T2's rebuild arm after `reduce`:
 
 - [ ] **Step 3: behavior pins.** In settings.rs (driving `perform_settings_save` directly — the honest homes Codex plan I2 demanded): `save_refused_under_no_config` (no_config=true → status "settings: disabled by --no-config", returns None, no file); `save_refused_without_config_dir` (overrides_path=None → "settings: no config directory"); `save_failure_surfaces_io_error` (the FailFs → status starts "settings: " and contains "boom"); `save_success_sets_status_and_returns_snapshot` (tempdir → "settings saved", returned OverridesFile == computed). In app.rs: `save_settings_command_sets_the_request_flag` (dispatch through the registry, assert the flag); `baseline_excludes_overrides_layer` (config.rs test home: load(&[hand]) vs load(&[hand, overrides_file]) differ on an overridden key — the spec's baseline pin); `save_reload_roundtrip_restores_settings` — a UNIT-level pin of the full pipeline without run(): build a `SettingsSnapshot` runtime with three divergences, `compute_overrides` + `save_overrides` to a tempdir file, then `config::load(&[hand_layer, overrides_file])` and assert the merged Config reflects the saved values (preset via patches? no — assert `cfg.keymap.preset == "wordstar"`, `cfg.view.typewriter`, `cfg.menu.bar == Pinned` — proving the written strings parse back through the REAL loader).
 
-- [ ] **Step 4: e2e journey** (`journey_keymap_switch_scopes`, §C idioms). Codex plan I1: `scroll_line_up` only decrements when `view.scroll > 0` (nav.rs:623 — source tests seed scroll 4-5 first), so the corpus must make BOTH observables non-vacuous: build a 40-line doc (`"line\n".repeat(40)`), move the caret deep (`Selection::single` into line ~30) so the view scrolls (precondition-assert `h.editor.active().view.scroll > 0` — locate the real scroll field via nav.rs's own tests and precondition-assert it, adjusting the accessor if the field path differs); under CUA assert ctrl-w EXPANDS the selection (`!h.editor.active().document.selection.primary().is_empty()` after ctrl-w, from an empty caret — precondition-assert empty before); collapse the selection; dispatch `keymap_wordstar` via the palette (`h.ctrl('p')`, `h.type_str("keymap: wordstar")`, precondition-assert the top row's label == "Keymap: WordStar", Enter; assert `h.status()` contains "keymap: wordstar"); then ctrl-w again: assert the selection STAYS empty AND `view.scroll` decremented by 1 (both directions of the flip pinned, neither vacuous).
+- [ ] **Step 4: e2e journey** (`journey_keymap_switch_scopes`, §C idioms). Codex plan I1: `scroll_line_up` only decrements when `view.scroll > 0` (nav.rs:623 — source tests seed scroll 4-5 first), so the corpus must make BOTH observables non-vacuous: build a 40-line doc (`"line\n".repeat(40)`), move the caret deep (`Selection::single` into line ~30) **then call `crate::nav::ensure_visible(&mut h.editor);`** (Fable plan I1: a direct selection write does NOT scroll — nothing in the harness path calls ensure_visible for it; nav.rs owns the scroll adjustment) and precondition-assert `h.editor.active().view.scroll > 0` (View.scroll is pub — editor.rs:110); under CUA assert ctrl-w EXPANDS the selection (`!h.editor.active().document.selection.primary().is_empty()` after ctrl-w, from an empty caret — precondition-assert empty before); collapse the selection; dispatch `keymap_wordstar` via the palette (`h.ctrl('p')`, `h.type_str("keymap: wordstar")`, precondition-assert the top row's label == "Keymap: WordStar", Enter; assert `h.status()` contains "keymap: wordstar"); then ctrl-w again: assert the selection STAYS empty AND `view.scroll` decremented by 1 (both directions of the flip pinned, neither vacuous).
 
 - [ ] **Step 5: full gates + smoke.** Run `scripts/smoke/run.sh` once; quote the one-line summary VERBATIM in the report (advisory).
 
