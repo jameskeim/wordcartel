@@ -165,7 +165,15 @@ pub fn runtime_snapshot(editor: &crate::editor::Editor) -> SettingsSnapshot {
 /// Parse an overrides file. A corrupt or empty file returns the default (all absent).
 /// Matches load()'s corruption-tolerance: a bad machine file must not brick the app.
 pub fn parse_overrides(bytes: &str) -> OverridesFile {
-    toml::from_str::<OverridesFile>(bytes).unwrap_or_default()
+    let mut of = toml::from_str::<OverridesFile>(bytes).unwrap_or_default();
+    // Normalize wrap_column into the valid range at the snapshot boundary — a
+    // hand-edited or legacy out-of-range value would otherwise ride the diff law's
+    // KEEP arms back to disk unclamped (Codex pre-merge; runtime is always safe via
+    // the load clamp, this keeps the FILE honest too). Bounds mirror config::load.
+    if let Some(v) = of.view.as_mut().and_then(|view| view.wrap_column.as_mut()) {
+        *v = (*v).clamp(20, 9999);
+    }
+    of
 }
 
 /// Parse the `--config` layer as an overrides MASK. Identical to `parse_overrides`
@@ -559,6 +567,24 @@ mod tests {
         // focus: present in mask → rule 3 guard fires, keeps existing verbatim
         assert_eq!(of2.view.as_ref().and_then(|v| v.focus), Some(true),
             "focus must be kept verbatim when present in mask; got {:?}", of2.view);
+    }
+
+    #[test]
+    fn oversized_wrap_column_in_overrides_normalizes_at_parse() {
+        // Codex pre-merge: a hand-edited [view] wrap_column=12000 must not survive
+        // the KEEP arms back to disk — the snapshot clamps at the parse boundary.
+        let of = parse_overrides("[view]\nwrap_column = 12000\n");
+        assert_eq!(of.view.as_ref().unwrap().wrap_column, Some(9999));
+        let of_low = parse_overrides("[view]\nwrap_column = 5\n");
+        assert_eq!(of_low.view.as_ref().unwrap().wrap_column, Some(20));
+        // The masked-keep path now writes the clamped value (runtime 72 == baseline,
+        // existing 9999 contradicts, mask present → KEEP 9999, never 12000).
+        let rt = snap("cua", ThemeIdentity::Builtin("default".into()), false);
+        let base = snap("cua", ThemeIdentity::Builtin("default".into()), false);
+        let existing = parse_overrides("[view]\nwrap_column = 12000\n");
+        let mask = parse_mask("[view]\nwrap_column = 50\n");
+        let out = compute_overrides(&rt, &base, &existing, &mask);
+        assert_eq!(out.view.as_ref().unwrap().wrap_column, Some(9999), "masked keep is clamped");
     }
 
     #[test]
