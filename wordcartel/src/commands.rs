@@ -524,6 +524,17 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         }
 
         Command::Quit => {
+            // C4/I1 (user-ratified): quit supersedes — and cancels — a pending
+            // close. Clear CloseBuffer-carrying pendings so a cancelled quit
+            // leaves no ghost close armed to fire on the next manual save.
+            // Foreign quit/drain pendings are the existing flow's business.
+            if editor.pending_after_save.as_ref()
+                .is_some_and(|p| matches!(&p.action, crate::editor::PostSaveAction::CloseBuffer { .. })) {
+                editor.pending_after_save = None;
+            }
+            if matches!(&editor.pending_save_as, Some(crate::editor::PostSaveAction::CloseBuffer { .. })) {
+                editor.pending_save_as = None;
+            }
             // Effort 6: quit considers the WHOLE workspace, not just the active
             // buffer. Scratch is never dirty (is_dirty excludes it).
             let any_dirty = editor.buffers.iter().any(|b| editor.is_dirty(b.id));

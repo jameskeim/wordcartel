@@ -1373,7 +1373,6 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     }
 
     let clock = SystemClock;
-    const SAVE_QUIT_TIMEOUT_MS: u64 = 5_000;
 
     // Load the session store once at startup (corrupt/missing → empty, no abort).
     let mut session = crate::state::load();
@@ -1418,32 +1417,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     let mut exit_reason = ExitReason::Normal;
     loop {
         let now = clock.now_ms();
-        // Bounded save&quit: if waiting for an in-flight save to complete and
-        // 5 s have elapsed since the last edit, re-raise the quit-confirm modal.
-        if let Some(p) = &editor.pending_after_save {
-            let waited = now.saturating_sub(p.at_ms);
-            if waited > SAVE_QUIT_TIMEOUT_MS {
-                // Codex I-new-4: match on &p.action via `matches!` BEFORE clearing
-                // pending_after_save (decide the action, then mutate — avoids moving
-                // out of the borrowed `pending_after_save`).
-                let timed_out_drain = matches!(&p.action, crate::editor::PostSaveAction::ContinueQuitDrain);
-                let timed_out_quit  = matches!(&p.action, crate::editor::PostSaveAction::Quit);
-                editor.pending_after_save = None;
-                if timed_out_quit {
-                    // Re-raise the quit-confirm modal so the user can choose again.
-                    editor.open_prompt(crate::prompt::Prompt::quit_confirm());
-                    editor.status = "Save still running — choose again".into();
-                } else if timed_out_drain {
-                    // Codex C3: a stranded drain (no in-flight save, no re-drive) would
-                    // hang the quit. Abort the whole quit rather than silently clearing.
-                    editor.quit_drain = None;
-                    editor.quit_drain_advance = false;
-                    editor.status = "save timed out — quit cancelled".into();
-                } else {
-                    editor.status = "Save still running — try again".into();
-                }
-            }
-        }
+        save_timeout_tick(&mut editor, now);
         let swap_deadline = crate::swap::next_deadline_ms(now, editor.active().last_edit_at, editor.active().last_swap_at);
         let sq_deadline = editor.pending_after_save.as_ref().map(|p| p.at_ms.saturating_add(SAVE_QUIT_TIMEOUT_MS));
         // Include scrollbar_until_ms in the deadline so the loop wakes when the
@@ -1642,6 +1616,48 @@ fn persist_session(
 #[cfg(test)]
 pub fn persist_session_for_test(s: &mut crate::state::SessionState, e: &Editor, cfg: &config::Config, seq: u64) {
     persist_session(s, e, cfg, seq);
+}
+
+// ---------------------------------------------------------------------------
+// Save-timeout seam (extracted from run() so it is testable — C4 Task 2)
+// ---------------------------------------------------------------------------
+
+/// Milliseconds before a pending save-then-act is considered overdue. Moved
+/// from run()-local to module scope so `save_timeout_tick` can reference it
+/// and tests can drive it without magic literals (C4 r2).
+pub(crate) const SAVE_QUIT_TIMEOUT_MS: u64 = 5_000;
+
+/// Save-timeout disposition (extracted from run()'s tick so it is testable — C4).
+/// Returns without effect while no pending save is overdue.
+pub(crate) fn save_timeout_tick(editor: &mut Editor, now: u64) {
+    if let Some(p) = &editor.pending_after_save {
+        let waited = now.saturating_sub(p.at_ms);
+        if waited > SAVE_QUIT_TIMEOUT_MS {
+            // Compiler-exhaustive on purpose (Codex plan r2): a future
+            // PostSaveAction variant must NOT compile silently past this helper.
+            let action = p.action.clone();
+            editor.pending_after_save = None;
+            match action {
+                crate::editor::PostSaveAction::Quit => {
+                    // Re-raise the quit-confirm modal so the user can choose again.
+                    editor.open_prompt(crate::prompt::Prompt::quit_confirm());
+                    editor.status = "Save still running — choose again".into();
+                }
+                crate::editor::PostSaveAction::ContinueQuitDrain => {
+                    // Codex C3: a stranded drain (no in-flight save, no re-drive) would
+                    // hang the quit. Abort the whole quit rather than silently clearing.
+                    editor.quit_drain = None;
+                    editor.quit_drain_advance = false;
+                    editor.status = "save timed out — quit cancelled".into();
+                }
+                crate::editor::PostSaveAction::CloseBuffer { .. } => {
+                    // C4: a close is not a session-ending action the user is
+                    // waiting on — cancel without re-prompting (spec D3).
+                    editor.status = "save timed out — close cancelled".into();
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4342,5 +4358,166 @@ mod tests {
         assert_eq!(s.due_at, Some(1000 + crate::reconcile::RECONCILE_DEBOUNCE_MS));
         arm(&mut s, 1100, 6); // new edit → re-debounce
         assert_eq!(s.due_at, Some(1100 + crate::reconcile::RECONCILE_DEBOUNCE_MS));
+    }
+
+    // -----------------------------------------------------------------------
+    // C4 Task 2: save_timeout_tick seam + quit-supersedes-close
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn close_save_timeout_cancels_with_status() {
+        // Drives the EXTRACTED helper directly (the timeout block lives in run(),
+        // unreachable via reduce). Arrange a CloseBuffer pending at t=0; call
+        // save_timeout_tick at SAVE_QUIT_TIMEOUT_MS+1 → pending cleared, status
+        // "save timed out — close cancelled", buffer open, NO prompt.
+        // Also pins the extraction is faithful: a Quit-variant pending re-raises
+        // quit_confirm through the same helper.
+        use crate::editor::{Editor, PostSaveAction, PendingAfterSave};
+        let p = std::env::temp_dir().join(format!("wc-c4t2-timeout-{}.md", std::process::id()));
+        std::fs::write(&p, "old\n").unwrap();
+        let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = None; // dirty
+        let id = e.active().id;
+
+        // Arm pending for a CloseBuffer action at t=0.
+        e.pending_after_save = Some(PendingAfterSave {
+            buffer_id: id, version: 1,
+            action: PostSaveAction::CloseBuffer { id },
+            at_ms: 0,
+        });
+
+        // Call the extracted helper at a time past the timeout.
+        crate::app::save_timeout_tick(&mut e, crate::app::SAVE_QUIT_TIMEOUT_MS + 1);
+
+        assert!(e.pending_after_save.is_none(), "pending cleared on CloseBuffer timeout");
+        assert_eq!(e.status, "save timed out — close cancelled");
+        assert!(e.by_id(id).is_some(), "buffer NOT closed — timeout only cancels");
+        assert!(e.prompt.is_none(), "no re-prompt for a close timeout (spec D3)");
+
+        // Fidelity pin: Quit-variant pending re-raises quit_confirm through the same helper.
+        e.pending_after_save = Some(PendingAfterSave {
+            buffer_id: id, version: 1,
+            action: PostSaveAction::Quit,
+            at_ms: 0,
+        });
+        crate::app::save_timeout_tick(&mut e, crate::app::SAVE_QUIT_TIMEOUT_MS + 1);
+        assert!(e.pending_after_save.is_none(), "quit pending cleared");
+        assert!(e.prompt.is_some(), "Quit timeout re-raises quit_confirm prompt");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn quit_dispatch_cancels_pending_close() {
+        // Arm pending_after_save = CloseBuffer{X} (manually), dispatch quit →
+        // pending_after_save is None BEFORE the quit prompt raises; cancel the
+        // quit → still None. Repeat with pending_save_as = Some(CloseBuffer{X}).
+        use crate::editor::{Editor, PostSaveAction, PendingAfterSave};
+        let p = std::env::temp_dir().join(format!("wc-c4t2-quit-{}.md", std::process::id()));
+        std::fs::write(&p, "old\n").unwrap();
+        let mut e = Editor::new_from_text("dirty\n", Some(p.clone()), (80, 24));
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = None; // dirty so quit raises prompt
+        let id = e.active().id;
+        e.install_scratch();
+        let clk = TestClock(0);
+
+        // --- pending_after_save slot ---
+        e.pending_after_save = Some(PendingAfterSave {
+            buffer_id: id, version: 1,
+            action: PostSaveAction::CloseBuffer { id },
+            at_ms: 0,
+        });
+        // Dispatch Quit — the quit-supersedes clear runs at the top of Command::Quit.
+        let r = crate::commands::run(crate::commands::Command::Quit, &mut e, &clk);
+        assert!(e.pending_after_save.is_none(), "quit must clear CloseBuffer pending_after_save");
+        assert!(e.prompt.is_some(), "dirty buffer → quit modal raised");
+        assert!(matches!(r, crate::commands::CommandResult::Handled));
+
+        // Cancel the quit (resolve Cancel action without an executor for simplicity).
+        e.prompt = None;
+        assert!(e.pending_after_save.is_none(), "still None after cancel");
+
+        // A matching save result now closes nothing (pending was wiped).
+        // Deliver a save result that would have matched the wiped pending.
+        let save_result = crate::jobs::JobResult {
+            buffer_id: id,
+            class: crate::jobs::ResultClass::Durability,
+            version: 1,
+            kind: crate::jobs::JobKind::Save,
+            merge: Box::new(move |editor: &mut Editor| {
+                if let Some(b) = editor.by_id_mut(id) { b.document.saved_version = Some(1); }
+            }),
+        };
+        crate::jobs_apply::apply_result(save_result, &mut e);
+        assert!(e.by_id(id).is_some(), "buffer NOT closed — pending was nil when result arrived");
+
+        // --- pending_save_as slot ---
+        e.pending_save_as = Some(PostSaveAction::CloseBuffer { id });
+        let _ = crate::commands::run(crate::commands::Command::Quit, &mut e, &clk);
+        assert!(e.pending_save_as.is_none(), "quit must clear CloseBuffer pending_save_as");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn esc_on_close_prompt_cancels_cleanly() {
+        // Raise the close prompt via close_buffer on a dirty buffer; send Esc
+        // through reduce → prompt None, buffer open, pending_* all None.
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let p = std::env::temp_dir().join(format!("wc-c4t2-esc-{}.md", std::process::id()));
+        std::fs::write(&p, "old\n").unwrap();
+        let mut e = Editor::new_from_text("dirty\n", Some(p.clone()), (80, 24));
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = None; // dirty
+        let id = e.active().id;
+
+        // Raise the close-confirm prompt.
+        crate::workspace::close_buffer(&mut e);
+        assert!(e.prompt.is_some(), "precondition: close prompt raised");
+        assert!(e.pending_after_save.is_none(), "no pending yet — save not chosen");
+
+        // Send Esc through reduce to cancel.
+        let reg = Registry::builtins();
+        let km = cua_keymap();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let esc = Msg::Input(Event::Key(KeyEvent {
+            code: KeyCode::Esc, modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE,
+        }));
+        crate::app::reduce(esc, &mut e, &reg, &km, &ex, &clk, &tx);
+
+        assert!(e.prompt.is_none(), "prompt dismissed by Esc");
+        assert!(e.by_id(id).is_some(), "buffer still open");
+        assert!(e.pending_after_save.is_none(), "pending_after_save remains None");
+        assert!(e.pending_save_as.is_none(), "pending_save_as remains None");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn close_dirty_scratch_still_refuses_via_scratch_guard() {
+        // Make the SCRATCH buffer the active one, "dirty" it (bump version), then
+        // close_buffer → scratch-guard status, NO prompt (guard order pin: the is_scratch
+        // check fires before any dirty check).
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        e.install_scratch();
+        crate::workspace::goto_scratch(&mut e);
+        let sid = e.scratch_id.unwrap();
+        assert_eq!(e.active().id, sid, "precondition: scratch is active");
+        // Bump version to make scratch appear dirty (is_scratch still fires first).
+        e.active_mut().document.version = 99;
+
+        crate::workspace::close_buffer(&mut e);
+
+        assert_eq!(e.status, "can't close the scratch buffer");
+        assert!(e.prompt.is_none(), "scratch guard must NOT raise a prompt");
     }
 }
