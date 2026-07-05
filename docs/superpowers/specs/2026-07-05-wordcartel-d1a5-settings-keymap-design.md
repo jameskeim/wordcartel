@@ -102,10 +102,16 @@ bind = { "ctrl-k ctrl-o" = 'close_buffer' }
   earlier layer can be beaten by a global bind in a later layer — layer precedence stays
   the single outer law.)
 - Back-compat: configs with only global keys behave byte-identically (empty scoped maps).
+- Hand-edit footgun, documented (Fable M-7, probe P1c): once a `[keymap.cua]` header
+  appears, any `[keymap]`-intended key typed BELOW it silently belongs to the scoped
+  table (TOML section semantics) and is tolerated-unknown-ignored — e.g. a trailing
+  `preset = "wordstar"` vanishes. One sentence in the config docs; scoped tables make
+  `[keymap]` multi-part for the first time.
 
-`build_keymap`'s signature grows the active-preset input only if needed — it already
-receives `&KeymapConfig` whose `preset` field IS the active base; scoped application keys
-off that same field. Signature unchanged.
+`build_keymap`'s signature is unchanged — it already receives `&KeymapConfig`. Scoped
+application keys off `resolve_preset(km.preset)` — the RESOLVED base, not the raw string
+(Fable M-5: with `preset = "dvorak"` the base falls back to cua, so `[keymap.cua]` must
+apply) — the same helper D2 mandates, so base and scoped application cannot disagree.
 
 ## D2. Runtime keymap switch (A5)
 
@@ -125,8 +131,11 @@ off that same field. Signature unchanged.
   ("keymap: wordstar"). The RUN LOOP, after `reduce` returns and before the next input
   wait, checks the flag: rebuilds via `build_keymap(&KeymapConfig { preset:
   editor.active_keymap_preset.clone(), patches: <the startup layer patches> }, &reg)`,
-  reassigns the loop-local trie, clears the flag, surfaces any (unlikely) new warnings to
-  the status line. The startup `cfg.keymap.patches` remain in scope in `run()` for exactly
+  reassigns the loop-local trie, clears the flag, CLEARS `editor.pending_keys` and its
+  "… " pending status (Fable I-3: a half-typed prefix like `ctrl-k` can survive into the
+  rebuild via the mouse-menu path — mouse.rs:242 opens the menu without clearing the
+  buffer — and would complete against the NEW preset, misfiring e.g. `[ctrl-k, q]` →
+  quit under WordStar), and surfaces any (unlikely) new warnings to the status line. The startup `cfg.keymap.patches` remain in scope in `run()` for exactly
   this (as `cfg` already stays alive for `max_entries`). Compile surface (Codex m-2): the
   loop-local becomes `let mut keymap = std::mem::take(&mut editor.keymap);`
   (app.rs:1334) — the single production `reduce` call site (app.rs:1473) is unchanged;
@@ -163,9 +172,23 @@ off that same field. Signature unchanged.
   handler sets `editor.settings_save_requested = true` + returns; the RUN LOOP, which
   owns the baseline snapshot and the overrides path, performs the save after `reduce`
   returns — the SAME between-reduces pattern as `keymap_rebuild` (D2). The loop collects
-  the CURRENT runtime values (D4 inventory) from the Editor, diffs against the baseline
-  snapshot, serializes ONLY the differing values via `toml::to_string` of a serde struct
-  mirroring the config sections, and writes atomically through the `Fs` seam (below).
+  the CURRENT runtime values (D4 inventory) from the Editor and computes the new file
+  content by the **contradiction-only-removal diff law (user-ratified A, 2026-07-05,
+  Fable I-2 — the baseline includes the anchor-dependent project layer, so a global file
+  diffed naively against it lets saves from different directories erase each other's
+  keys):** for each inventory key K —
+  (1) runtime ≠ baseline → WRITE the runtime value (a new or updated override);
+  (2) runtime == baseline AND the existing overrides layer has K with the SAME value →
+  KEEP it (saved intent persists even where a project baseline coincides with it);
+  (3) runtime == baseline AND the existing overrides layer has K with a DIFFERENT value →
+  REMOVE it (the user actively changed the value back — the only un-save path);
+  (4) otherwise → absent.
+  The overrides layer is already parsed in the chain; the loop keeps its raw inventory
+  values (an `OverridesSnapshot`, sibling of the baseline snapshot). The result
+  serializes via `toml::to_string` of a serde struct mirroring the config sections and
+  writes atomically through the `Fs` seam (below). Synchronous fsync'd IO on the run
+  loop matches the `persist_session` precedent (app.rs:1483) — tiny file, explicit
+  command.
   Status line: "settings saved" / "settings: <io error>" on failure (`write_overrides`
   returns `std::io::Result<()>` from atomic_replace — no SaveError wrapper; the io::Error
   Display is the message body). No silent UI.
@@ -176,21 +199,33 @@ off that same field. Signature unchanged.
   the exact opts `save_atomic_bytes` uses today, file.rs:176/fsx.rs:181: a machine-owned
   file like session.toml, not a user document); production passes `&RealFs`; the failure test passes
   a small test-local failing `Fs` impl (no need to expose FaultFs).
-- **Directory creation (Codex I-2):** nothing creates `<config_dir>/wordcartel` today
+- **Refusals (Fable I-4/M-1):** under `--no-config` the baseline is a fiction (empty
+  chain) and the session promised no config — `save_settings` is REFUSED with status
+  "settings: disabled by --no-config". When `dirs::config_dir()` is None (odd/headless
+  env; the load side already tolerates it — app.rs:1188) the save is refused with
+  "settings: no config directory". Both pinned by test.
+- **Directory creation (Codex I-2, shape per Fable M-6):** nothing creates `<config_dir>/wordcartel` today
   (config_layer_paths only reads; state.rs works because swap::state_dir creates its own
-  dir — swap.rs:31). The save path runs `create_dir_all` on the parent (0700 on Unix,
-  mirroring state_dir's policy) BEFORE the atomic write; failure surfaces as the same
-  status-line error.
+  dir — swap.rs:31). The save path runs `std::fs::create_dir_all` on the parent
+  (0700 on Unix, mirroring the swap::state_dir precedent — swap.rs:31-40) BEFORE the
+  atomic write, OUTSIDE the `Fs` seam (the trait stays create/write/rename/sync-only —
+  Fable M-6); creation failure surfaces as the same status-line error. The
+  write-failure fault test injects through the seam; the dir-creation test uses a real
+  tempdir.
 - **Reachability (Codex I-6, intentional):** modal guards live in reduce()'s input
   routing (app.rs:688) and overlay dispatch clears overlays before dispatching
   (app.rs:153) — so via keys the command is unreachable while a modal is open, and
   menu/palette close themselves. A programmatic `reg.dispatch` during a modal would only
   set the request flag (the loop does the IO) — harmless by construction. Stated as
   intentionally unrestricted; no special casing.
-- Consequences (all pinned): idempotent (save twice → identical file); self-healing
-  (delete the file → next session = hand config exactly); minimal (un-diverged values
-  never appear, so later hand-config edits to those values shine through); un-divergence
-  removes the key (change a toggle back to the baseline value, save → key absent).
+- Consequences (all pinned): idempotent within AND across sessions/projects (save twice
+  → identical file; re-save from a project whose baseline coincides with a saved key →
+  key preserved, rule 2); self-healing (delete the file → next session = hand config
+  exactly); minimal in the common case (values never saved and never diverged don't
+  appear, so hand-config edits shine through); un-saving is explicit (rule 3 — change the
+  value back and save); `--config` can MASK a saved key (overrides sit below it): the
+  save still reports "settings saved" and the key simply has no effect while that
+  `--config` is passed — recorded consequence, no warning in v1 (Fable M-4).
 - Empty diff → the file is written with the header ONLY (never deleted — one write path,
   deterministic; an all-comments TOML parses to an empty layer, a no-op). Pinned by test.
 
@@ -213,19 +248,30 @@ Exactly the runtime-mutable set, keyed to their config sections:
   `Builtin(name)`. The baseline's identity comes from the baseline config (`file` set →
   `File`; else `name`/default → `Builtin`). The Editor tracks the RUNTIME identity in a
   new `theme_identity` field: seeded at startup from the MERGED config's provenance
-  (an overrides/hand `name` outranking `file` → `Builtin`); a theme-picker COMMIT sets it
-  to `Builtin(picked name)` (preview/Esc-restore does not). The diff writes
+  (an overrides/hand `name` outranking `file` → `Builtin`); the theme picker sets it to
+  `Builtin(previewed name)` on Enter ONLY IF a preview was actually applied during that
+  open (Fable I-1: the real picker has NO commit-apply — Enter keeps the last preview,
+  app.rs:469; an untouched open→Enter applies nothing and must leave the identity
+  unchanged, else it would persist `rows[0]` the user never saw, or a file theme's
+  scheme name as a fake Builtin). Mechanically: `ThemePicker` gains
+  `previewed: Option<String>`, set by every `preview_selected_theme` application,
+  consumed by Enter; Esc-restore clears it and restores `original`. The diff writes
   `[theme] name` iff runtime identity is `Builtin(n)` AND baseline identity !=
   `Builtin(n)` — so a picker pick over a file theme persists even when the names collide,
   and a never-touched file theme never writes. Idempotent across sessions by
   construction (next session: runtime identity `Builtin(n)` from the overrides layer,
   baseline still `File` → key persists on re-save).
-- NEVER persisted: keymap patches, `theme.styles`/`file`/`depth` structures, diagnostics,
+- NEVER persisted: `cycle_render_mode`'s per-buffer `RenderMode` (registry.rs:169 →
+  `active().view.mode`, editor.rs:114 — runtime-mutable but PER-BUFFER state with no
+  config key; recorded exclusion, Fable M-3), keymap patches, `theme.styles`/`file`/`depth` structures, diagnostics,
   export (no runtime mutator exists for them — nothing to diff), state (session.toml's
   domain), `view_opts.typewriter_anchor`/`focus_granularity`/`wrap_column` (no runtime
   mutator; the five TOGGLES only).
 - `MenuBarMode` persists the CURRENT mode: if the user pinned the bar (`menu_bar_pin`),
-  the pinned mode is what saves (by-design: "save what I'm looking at").
+  the pinned mode is what saves (by-design: "save what I'm looking at"). Accepted loss
+  (Fable M-2): `menu_bar_unpinned_mode` is NOT persisted — after a save-while-pinned,
+  the next session's unpin target is Auto (app.rs:1251-1255) even if the pre-pin mode
+  was Hidden. Recorded; persisting the unpin target is E2-adjacent polish.
 
 ## D5. Settings menu category + C4 closure
 
@@ -264,12 +310,17 @@ Exactly the runtime-mutable set, keyed to their config sections:
   RawMouse field name); baseline excludes the overrides layer (load a chain WITH an
   overrides file, assert baseline ≠ merged); theme-identity diff matrix (picker pick over
   a file theme with a COLLIDING name persists; untouched file theme writes nothing;
-  un-diverged builtin writes nothing).
+  un-diverged never-saved builtin writes nothing); the diff-law matrix (rules 1-4:
+  write-on-divergence, keep-on-coincidence — the cross-project walkthrough with two
+  baselines, remove-on-contradiction, absent-otherwise).
 - **Behavior (app.rs):** switch command rebuilds the trie — the same chord (`ctrl-w`)
   resolves to `expand_selection` under cua and `scroll_line_up` after `keymap_wordstar`
   dispatch (through the real run-loop flag path or its testable seam); patches survive the
   switch (a global patch bind present under both bases; a scoped patch present only under
-  its base); switch idempotence (re-dispatch active preset → status, no rebuild); dirty
+  its base); switch idempotence (re-dispatch active preset → status, no rebuild); the rebuild
+  clears a pending chord prefix (seed pending_keys, request rebuild, assert cleared);
+  untouched picker open→Enter leaves theme_identity unchanged; save refused under
+  --no-config and under config_dir()==None (status pins); dirty
   settings save→reload round-trip (save with the Fs-seam mock or a tempdir, re-load the
   chain, assert the runtime values restore); save failure surfaces on the status line
   (a test-local failing `Fs` impl through the `write_overrides` seam); first save creates
