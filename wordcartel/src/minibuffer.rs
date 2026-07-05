@@ -12,6 +12,8 @@ pub enum MinibufferKind {
     SaveAs,
     /// File-name input for Write Block (^KW).
     WriteBlock,
+    /// Numeric input for Set Wrap Column.
+    WrapColumn,
 }
 
 #[derive(Debug, Clone)]

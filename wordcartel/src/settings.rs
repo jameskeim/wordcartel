@@ -37,6 +37,7 @@ pub struct SettingsSnapshot {
     pub view_measure: bool,
     pub view_wrap_guide: bool,
     pub view_word_count: bool,
+    pub view_wrap_column: u16,
     pub menu_bar: crate::config::MenuBarMode,
     pub mouse_capture: bool,
 }
@@ -86,11 +87,12 @@ pub struct OTheme {
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OView {
-    #[serde(skip_serializing_if = "Option::is_none")] pub typewriter: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")] pub focus:      Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")] pub measure:    Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")] pub wrap_guide: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")] pub word_count: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub typewriter:  Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub focus:       Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub measure:     Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub wrap_guide:  Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub word_count:  Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub wrap_column: Option<u16>,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -134,6 +136,7 @@ pub fn snapshot_of(cfg: &crate::config::Config, resolved_theme_name: &str) -> Se
         view_measure:    cfg.view.measure,
         view_wrap_guide: cfg.view.wrap_guide,
         view_word_count: cfg.view.word_count,
+        view_wrap_column: cfg.view.wrap_column,
         menu_bar:        cfg.menu.bar,
         mouse_capture:   cfg.mouse.mouse_capture,
     }
@@ -149,6 +152,7 @@ pub fn runtime_snapshot(editor: &crate::editor::Editor) -> SettingsSnapshot {
         view_measure:    editor.view_opts.measure,
         view_wrap_guide: editor.view_opts.wrap_guide,
         view_word_count: editor.view_opts.word_count,
+        view_wrap_column: editor.view_opts.wrap_column,
         menu_bar:        editor.menu_bar_mode,
         mouse_capture:   editor.mouse_capture,
     }
@@ -293,9 +297,14 @@ pub fn compute_overrides(
         ex_view.and_then(|v| v.word_count.as_ref()),
         mk_view.and_then(|v| v.word_count).is_some(),
     );
+    let wrap_column = diff_key(
+        &runtime.view_wrap_column, &baseline.view_wrap_column,
+        ex_view.and_then(|v| v.wrap_column.as_ref()),
+        mk_view.and_then(|v| v.wrap_column).is_some(),
+    );
     let any_view = typewriter.is_some() || focus.is_some() || measure.is_some()
-        || wrap_guide.is_some() || word_count.is_some();
-    let view = some_if(OView { typewriter, focus, measure, wrap_guide, word_count }, any_view);
+        || wrap_guide.is_some() || word_count.is_some() || wrap_column.is_some();
+    let view = some_if(OView { typewriter, focus, measure, wrap_guide, word_count, wrap_column }, any_view);
 
     // --- menu — per-key mask predicate ---
     let rt_bar   = menu_bar_str(runtime.menu_bar).to_string();
@@ -426,7 +435,7 @@ mod tests {
     fn snap(preset: &str, theme: ThemeIdentity, tw: bool) -> SettingsSnapshot {
         SettingsSnapshot { keymap_preset: preset.into(), theme_identity: theme,
             view_typewriter: tw, view_focus: false, view_measure: false,
-            view_wrap_guide: false, view_word_count: false,
+            view_wrap_guide: false, view_word_count: false, view_wrap_column: 72,
             menu_bar: crate::config::MenuBarMode::Auto, mouse_capture: true }
     }
 
@@ -699,5 +708,39 @@ mod tests {
         assert!(path.is_file(), "overrides file must be written");
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(parse_overrides(&text), of, "written file must round-trip");
+    }
+
+    #[test]
+    fn wrap_column_persists_through_the_diff_law() {
+        let mut rt = snap("cua", ThemeIdentity::Builtin("default".into()), false);
+        rt.view_wrap_column = 60;                          // diverged
+        let base = snap("cua", ThemeIdentity::Builtin("default".into()), false);
+        let of = compute_overrides(&rt, &base, &OverridesFile::default(), &OverridesFile::default());
+        assert_eq!(of.view.as_ref().unwrap().wrap_column, Some(60), "rule 1 writes");
+        // rule 3 + mask-guard arms:
+        let rt2 = snap("cua", ThemeIdentity::Builtin("default".into()), false);
+        let existing = parse_overrides("[view]\nwrap_column=60\n");
+        let of2 = compute_overrides(&rt2, &base, &existing, &OverridesFile::default());
+        assert!(of2.view.is_none(), "rule 3 removes the contradicted key");
+        let mask = parse_mask("[view]\nwrap_column=90\n");
+        let of3 = compute_overrides(&rt2, &base, &existing, &mask);
+        assert_eq!(of3.view.as_ref().unwrap().wrap_column, Some(60), "mask-guard keeps");
+    }
+
+    #[test]
+    fn set_wrap_column_then_save_writes_the_key() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("a\n", None, (40, 10));
+        crate::prompts::wrap_column_submit(&mut e, "40");
+        assert_eq!(e.view_opts.wrap_column, 40, "precondition: the setter took");
+        let d = tempdir();
+        let path = d.join("settings-overrides.toml");
+        let base = snap("cua", ThemeIdentity::Builtin("default".into()), false); // baseline wrap 72
+        let of = perform_settings_save(&mut e, false, Some(&path),
+            &base, &OverridesFile::default(), &OverridesFile::default(), &crate::fsx::RealFs);
+        assert!(of.is_some(), "save succeeds: {}", e.status);
+        assert_eq!(e.status, "settings saved");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("wrap_column = 40"), "the file carries the key: {text}");
     }
 }

@@ -810,6 +810,7 @@ pub fn reduce(
                             crate::minibuffer::MinibufferKind::GotoLine   => crate::prompts::goto_line_submit(editor, &mb.text),
                             crate::minibuffer::MinibufferKind::SaveAs     => crate::prompts::save_as_submit(editor, &mb.text, ex, clock, msg_tx),
                             crate::minibuffer::MinibufferKind::WriteBlock => crate::prompts::block_write_submit(editor, &mb.text),
+                            crate::minibuffer::MinibufferKind::WrapColumn => crate::prompts::wrap_column_submit(editor, &mb.text),
                         }
                     }
                     _ => {}

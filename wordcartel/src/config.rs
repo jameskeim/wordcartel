@@ -821,19 +821,21 @@ mod tests {
         let baseline_resolved = crate::theme_resolve::resolve_theme(&baseline_cfg.theme, &env);
         let baseline = snapshot_of(&baseline_cfg, &baseline_resolved.theme.name);
 
-        // Runtime snapshot: five divergences — keymap → wordstar, typewriter on,
-        // bar → pinned, mouse capture off, theme → tokyo-night (spec Testing:
-        // the round-trip covers [mouse] capture and [theme] name too — Fable m-wb-1).
+        // Runtime snapshot: six divergences — keymap → wordstar, typewriter on,
+        // bar → pinned, mouse capture off, theme → tokyo-night, wrap_column → 100
+        // (spec Testing: the round-trip covers [mouse] capture and [theme] name too —
+        // Fable m-wb-1; wrap_column 100 is distinct from the default 72 and above min).
         let runtime = SettingsSnapshot {
-            keymap_preset:  "wordstar".to_string(),
-            theme_identity: ThemeIdentity::Builtin("tokyo-night".to_string()),
+            keymap_preset:   "wordstar".to_string(),
+            theme_identity:  ThemeIdentity::Builtin("tokyo-night".to_string()),
             view_typewriter: true,
-            view_focus:     false,
-            view_measure:   false,
+            view_focus:      false,
+            view_measure:    false,
             view_wrap_guide: false,
             view_word_count: false,
-            menu_bar:       crate::config::MenuBarMode::Pinned,
-            mouse_capture:  false,
+            view_wrap_column: 100,
+            menu_bar:        crate::config::MenuBarMode::Pinned,
+            mouse_capture:   false,
         };
 
         let of = compute_overrides(&runtime, &baseline, &OverridesFile::default(), &OverridesFile::default());
@@ -849,6 +851,8 @@ mod tests {
         assert!(!cfg.mouse.mouse_capture, "mouse capture must round-trip to false");
         assert_eq!(cfg.theme.name.as_deref(), Some("tokyo-night"),
             "theme name must round-trip");
+        assert_eq!(cfg.view.wrap_column, 100,
+            "view.wrap_column must round-trip to 100");
     }
 
 }

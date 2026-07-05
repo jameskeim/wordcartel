@@ -238,6 +238,25 @@ pub(crate) fn submit_filter_line(
     crate::filter::dispatch_filter(editor, spec, msg_tx.clone());
 }
 
+/// Submit handler for Set Wrap Column (spec repar10 D2). Deliberate divergences from
+/// the goto_line family: this command names its own noun and SURFACES the clamp — a
+/// silently-moved formatting width is a surprise-diff class; a moved scroll target is
+/// not. Parse failure leaves wrap_column unchanged; below-minimum is a SUCCESSFUL
+/// clamped set. Any successful set rebuilds layout — wrap_column drives the centered
+/// measure geometry, and a bare field write would leave stale layout until the next edit.
+pub(crate) fn wrap_column_submit(editor: &mut crate::editor::Editor, text: &str) {
+    let n: u16 = match text.trim().parse() {
+        Ok(n) => n,
+        Err(_) => { editor.status = "wrap column: not a number".to_string(); return; }
+    };
+    let (value, msg) = if n < 20 { (20, "wrap column: 20 (minimum)".to_string()) }
+                       else { (n, format!("wrap column: {n}")) };
+    editor.view_opts.wrap_column = value;
+    editor.status = msg;
+    crate::derive::rebuild(editor);
+    crate::nav::ensure_visible(editor);
+}
+
 /// Submit a minibuffer line as a go-to-line target (Effort 8). 1-based, clamped;
 /// records a jump origin (jump-back), unfolds to the target, lands at column 1.
 pub(crate) fn goto_line_submit(editor: &mut crate::editor::Editor, text: &str) {
@@ -299,6 +318,39 @@ mod tests {
             "recovered content loaded into the active buffer");
         assert!(!p.exists(), "orphan swap file must be deleted on Recover");
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn wrap_column_submit_parses_clamps_and_rejects() {
+        use crate::editor::Editor; // the prompts test module has only `use super::*` (Codex plan r1 F2)
+        let mut e = Editor::new_from_text("a\n", None, (40, 10));
+        crate::derive::rebuild(&mut e);
+        let initial = e.view_opts.wrap_column;
+        wrap_column_submit(&mut e, "xyz");                 // parse failure → UNCHANGED
+        assert_eq!(e.view_opts.wrap_column, initial);
+        assert_eq!(e.status, "wrap column: not a number");
+        wrap_column_submit(&mut e, "99999");               // u16 overflow → UNCHANGED
+        assert_eq!(e.view_opts.wrap_column, initial);
+        assert_eq!(e.status, "wrap column: not a number");
+        wrap_column_submit(&mut e, "15");                  // below min → CLAMPED SET
+        assert_eq!(e.view_opts.wrap_column, 20);
+        assert_eq!(e.status, "wrap column: 20 (minimum)");
+        wrap_column_submit(&mut e, "55");                  // success
+        assert_eq!(e.view_opts.wrap_column, 55);
+        assert_eq!(e.status, "wrap column: 55");
+    }
+
+    #[test]
+    fn wrap_column_minibuffer_cancel_leaves_value_unchanged() {
+        // Spec D4's "cancel" pin: Esc dismisses the minibuffer generically (app.rs's
+        // Esc arm) and no submit ever runs — pin the observable at the editor level.
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("a\n", None, (40, 10));
+        let initial = e.view_opts.wrap_column;
+        e.open_minibuffer("Wrap column: ", crate::minibuffer::MinibufferKind::WrapColumn);
+        assert!(e.minibuffer.is_some());
+        e.minibuffer = None; // the Esc arm's effect — dismiss without submit
+        assert_eq!(e.view_opts.wrap_column, initial, "cancel must not touch the value");
     }
 
     #[test]
