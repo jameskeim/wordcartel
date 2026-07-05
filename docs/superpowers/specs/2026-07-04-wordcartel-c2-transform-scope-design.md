@@ -71,7 +71,8 @@ ENTIRE list (top-level snap reaches the `List` container, not the `ListItem`).
   (same rule, one more kind).
 - `region_for_transform(doc)` with an empty selection: `transform_unit_at(blocks, caret)`
   (the primary head, clamped to `buf_len.saturating_sub(1)` for the end-of-buffer
-  caret); if found, return its span. If NO block contains the caret (a blank-line gap): return the EMPTY range
+  caret); if found, return its span. If `transform_unit_at` returns None (a top-level
+  blank-line gap OR a container-interior gap — Codex r3 wording): return the EMPTY range
   `caret..caret` — `dispatch_transform` ALREADY guards empty ranges and returns the
   status `"nothing to transform"` before `run_transform` runs (transform.rs:110 — Codex
   r1 corrected the original claim, which cited the identical-output "already …" path;
@@ -102,10 +103,13 @@ block, the interior stays.
   children but none matched), `transform_unit_at` returns None → the endpoint is a GAP
   (raw endpoint), NEVER the container's span. Otherwise a selection from item 1 into an
   inter-item blank would silently pull in every later item (the surprise-diff class
-  decision 1 exists to kill). EXCEPTION consistent with the unit rule: if a `ListItem`
-  ancestor sits on the path ABOVE the gap-container… impossible — a List's interior
-  blank has no ListItem ancestor below the List; the None return is unconditional for
-  container-interior bytes. Pinned by a dedicated loose-list test.
+  decision 1 exists to kill). **The None is UNCONDITIONAL for container-interior bytes
+  — even when a `ListItem` ancestor sits on the path above the gap-container (Codex r3:
+  nested lists produce exactly that shape — `Document → List → ListItem → nested List`
+  with the nested list's inter-item blank inside the OUTER item). Snapping such a blank
+  to the outer item would pull the whole outer item in; gap-means-gap wins over the
+  ancestor preference, which applies only when a leaf CONTAINS the byte.** Pinned by
+  dedicated loose-list AND nested-list inter-item-blank tests.
 - Return `start..end`. Degenerate guard: if the computed range is empty or inverted
   (unreachable with a non-empty selection, but SATURATING discipline applies), return
   `from..to`.
@@ -114,8 +118,9 @@ Consequences, each pinned by a test: a selection inside one item → that item's
 selection spanning items 1-3 of one list → exactly items 1-3 (interior item 2 rides
 between the snapped endpoints); a selection from a paragraph into a list → the paragraph's
 start through the touched item's end; a selection wholly inside a gap → unchanged
-(`from..to`, today's fallback). Whole-span endpoints keep every region a union of whole
-block spans (the fragment landmine is unreachable).
+(`from..to`, today's fallback). Every region is a union of whole TRANSFORM-UNIT spans
+plus raw gap endpoints (Codex r3 wording — the fragment landmine is unreachable: gap
+bytes are blank-line territory, not partial blocks).
 
 ### D3. The `_buffer` variants (registry.rs + transform.rs)
 
@@ -173,7 +178,9 @@ The chooser's prompt string is also unchanged.
   (a sub-item's caret → the sub-ListItem, not the outer item);
   `snap_endpoint_on_loose_list_blank_is_gap_not_container` (the I-3
   rule: selection from mid-item-1 to an inter-item blank → end stays raw, later items
-  untouched); `snap_inside_one_list_item_touches_only_that_item`;
+  untouched); `snap_endpoint_on_nested_list_interitem_blank_is_gap` (the r3 shape: the
+  blank between a NESTED list's items — inside the outer ListItem — stays raw, the
+  outer item is NOT pulled in); `snap_inside_one_list_item_touches_only_that_item`;
   `snap_across_three_items_touches_exactly_those`; `snap_paragraph_into_list_unions_endpoints`;
   `snap_selection_wholly_in_gap_returns_input`; `caret_region_is_deepest_block`
   (item + nested-item + paragraph cases); `caret_region_in_gap_is_empty`;
