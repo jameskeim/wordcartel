@@ -483,3 +483,62 @@ fn journey_close_dirty_discard_leaves_file_and_swap() {
     assert!(sp.exists(), "swap file must survive Discard (decision 1 pin)");
     let _ = std::fs::remove_file(&sp);
 }
+
+// ---------------------------------------------------------------------------
+// C2 journey: caret reflow vs. Reflow Buffer scope separation
+// ---------------------------------------------------------------------------
+
+/// C2 journey — caret reflow only transforms the item under the caret; Reflow
+/// Buffer (via the Command Palette) transforms the whole document.
+#[test]
+fn journey_transform_scopes() {
+    // Three-item tight list — all items long enough to genuinely rewrap at 72 cols.
+    let item1 = "- first item here with text that is long enough to be reflowed at seventy two character width indeed\n";
+    let item2 = "- second item here with text that is long enough to be reflowed at seventy two character width indeed\n";
+    let item3 = "- third item here with text that is long enough to be reflowed at seventy two character width indeed\n";
+    let text = format!("{item1}{item2}{item3}");
+    let mut h = Harness::new(&text, None, (80, 24));
+
+    // Place the caret inside item 2's body (past "- second item here").
+    let item2_start = item1.len();
+    h.editor.active_mut().document.selection =
+        wordcartel_core::selection::Selection::single(item2_start + 10);
+
+    // Ctrl+T opens the transform chooser.
+    h.ctrl('t');
+    assert!(h.editor.prompt.is_some(), "Ctrl+T must open the transform chooser");
+    assert!(h.screen_contains("[r]eflow"),
+        "transform chooser message must appear on screen:\n{:#?}", h.screen());
+
+    // 'r' — reflow the transform unit under the caret (item 2 only).
+    h.key(KeyCode::Char('r'));
+    let after_item2 = h.doc_text();
+    assert_ne!(after_item2, text, "item 2 must have been reflowed by caret reflow");
+    assert!(after_item2.starts_with(item1),
+        "item 1 must be verbatim after caret reflow:\n{after_item2:?}");
+    assert!(after_item2.ends_with(item3),
+        "item 3 must be verbatim after caret reflow:\n{after_item2:?}");
+
+    // Reflow Buffer via the Command Palette — transforms the whole document.
+    h.ctrl('p');
+    assert!(h.editor.palette.is_some(), "Ctrl+P must open the palette");
+    h.type_str("reflow buffer");
+    // Precondition: "reflow buffer" filters the palette to the Reflow Buffer row.
+    {
+        let p = h.editor.palette.as_ref().unwrap();
+        assert!(!p.rows.is_empty(), "palette must have at least one match for 'reflow buffer'");
+        assert_eq!(p.rows[0].label, "Reflow Buffer",
+            "first match must be Reflow Buffer: {:?}",
+            p.rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>());
+    }
+    h.key(KeyCode::Enter);
+    let after_all = h.doc_text();
+    assert_ne!(after_all, after_item2,
+        "Reflow Buffer must change the document (items 1 and 3 still have long single lines)");
+    // Items 1 and 3 were still long single lines after the caret reflow —
+    // Reflow Buffer must have reflowed them (they are no longer verbatim).
+    assert!(!after_all.contains(item1),
+        "item 1 must be reflowed by Reflow Buffer (original long line gone):\n{after_all:?}");
+    assert!(!after_all.contains(item3),
+        "item 3 must be reflowed by Reflow Buffer (original long line gone):\n{after_all:?}");
+}
