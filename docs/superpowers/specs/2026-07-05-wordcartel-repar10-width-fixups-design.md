@@ -21,8 +21,13 @@ integration deliberately).
 
 ## Non-goals
 
-- Soft-wrap stays display-driven — B1 untouched; `wrap_column` does NOT drive visual
-  wrap (E1 territory; user-ratified fork 1 rejected the "auto" window-tracking mode).
+- No NEW visual-wrap coupling — B1 untouched; this effort adds no auto/window-tracking
+  wrap mode (user-ratified fork 1 rejected it). NOTE the existing behavior it PRESERVES
+  (Codex r2): with `measure = true`, `wrap_column` already IS the visual wrapping
+  viewport (nav::text_geometry nav.rs:25-33 → derive::rebuild derive.rs:232-267 →
+  layout.rs:240-247) — measure-on users already see soft wrap at this column, which
+  makes the one-knob wiring MORE coherent, not less: measure display, guide, and
+  formatting all agree.
 - No separate `[transform]` config section (fork 1 rejected the two-knob split).
 - No exposure of further repar options (`strict_par`, prefix/suffix/hang, `--width=auto`
   semantics are CLI-only concerns; the library always receives an explicit width).
@@ -46,13 +51,15 @@ integration deliberately).
   rationale; the shipped D1+A5 spec text stays as history).
 - repar 1.0.0 (path dep `../../par-command/repar`, Cargo.lock pins 1.0.0): the contract
   release. `Options::new()` now carries the `all` fixups bundle (UNICODE_CLASSES |
-  REAL_ZERO_WIDTH — options.rs:293); fixup tokens are additive OR-flags; `"none"` CLEARS
+  REAL_ZERO_WIDTH — options.rs:541-543; the `all` TOKEN mapping is options.rs:293);
+  fixup tokens are additive OR-flags; `"none"` CLEARS
   all fixups and overrides earlier tokens, later tokens re-add (options.rs:273/:292);
   `"prose"` = Compat::PROSE (:298), `"markdown"` = Compat::MARKDOWN (:299). The
   `--fixups=` vocabulary is frozen additive-only; the library surface is pinned
   (public_surface_pin_v1). Width: parse-time ceiling `WIDTH_PARSE_MAX` (huge;
   options.rs:500/:563); the format-time floor `ParError::WidthTooSmall` is RELATIVE —
-  `width <= prefix + suffix` (driver.rs:128, error.rs:28), and `prose` suppresses only
+  `width <= prefix + suffix` (driver.rs:128-140 — the real checks at :132/:139;
+  error.rs:28), and `prose` suppresses only
   inferred SUFFIX (segment.rs:465), so a width of 20 can still fail on input whose
   inferred/explicit affixes total ≥20 (Codex r1 I-2). The clamp makes the error unlikely,
   not unreachable — the error path is REQUIRED, not belt-and-braces. The repar-nvim plugin pins `--fixups=none,<list>` precisely
@@ -67,7 +74,8 @@ integration deliberately).
 - Save Settings machinery (D1+A5, shipped @ 4670eaf): `settings.rs` — `SettingsSnapshot`,
   `OView` (five Option<bool> toggles), `snapshot_of`/`runtime_snapshot`,
   `compute_overrides` (the four-rule diff law + per-key mask-guard), round-trip test in
-  config.rs. All extend per-key generically.
+  config.rs. The pattern repeats per tracked key; each new key needs explicit snapshot, serde,
+  diff, mask, and test-literal edits (enumerated in D2).
 
 ## D1. Width wiring
 
