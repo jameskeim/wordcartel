@@ -80,14 +80,25 @@ scratch guard (:101) stays FIRST and unchanged — the scratch buffer never clos
 or not. The clean path is extracted, not changed:
 
 - New `pub(crate) fn close_buffer_now(editor: &mut Editor, id: BufferId)` — the existing
-  clean-path mechanics (:103-122) generalized to work BY ID rather than on the active
-  buffer: locate the buffer's index by id (if the id no longer exists, set a status and
-  return — the vanished-buffer case); the last-ordinary-buffer check
-  (`ordinary <= 1` → replace in place with a fresh untitled, prune MRU, rebuild,
-  ensure_visible) and the normal path (`mru.retain`, `buffers.remove`,
-  `new_idx = a.min(len-1)`, `switch_to`) move here verbatim-modulo-the-id-lookup.
+  clean-path mechanics (:103-122) generalized to work BY ID. **NOT a verbatim move: the
+  real code is active-index-based (`let a = editor.active; buffers[a] = …`,
+  workspace.rs:108-109/:117-121) and the by-id cases differ (Fable C1 — the naive
+  generalization DESTROYS THE SCRATCH BUFFER in one reachable case). Per-case semantics:**
+  - Locate `i` = the index of `id`; if absent, set a status and return (vanished-buffer
+    case — reachable, e.g. via the Save-As divergence).
+  - **X active (`i == editor.active`):** today's semantics exactly — last-ordinary check
+    (`ordinary <= 1` → replace `buffers[i]` in place with a fresh untitled, prune MRU,
+    touch MRU, rebuild, ensure_visible) or the normal path (`mru.retain`,
+    `buffers.remove(i)`, `new_idx = i.min(len-1)`, `switch_to`).
+  - **X NOT active:** the user is looking at another buffer and MUST NOT be yanked.
+    Last-ordinary case (`[X, scratch]` with scratch active): replace `buffers[i]` — X's
+    OWN slot, never `buffers[editor.active]` (which would overwrite the scratch and
+    dangle `scratch_id`) — with the fresh untitled, prune/touch MRU, NO `switch_to`.
+    Normal case: `mru.retain`, `buffers.remove(i)`, then FIX UP `editor.active` by the
+    previously-active buffer's ID (its index shifts down when `i < active`); NO
+    `switch_to`, no rebuild of the viewed buffer needed.
   The last-ordinary count is computed AT CALL TIME — never cached from prompt-raise time
-  (the user may have closed other buffers while a save was in flight).
+  (buffers can close while a save is in flight).
 - `close_buffer`'s clean path becomes `close_buffer_now(editor, active_id)`.
 
 Three callers of `close_buffer_now`: the clean path above, D4's `CloseDiscard` arm, and
@@ -116,19 +127,30 @@ D3's post-save arm.
     than the action's captured `id`. No data loss is possible: the apply arm checks
     `is_dirty(id)` on the ACTION's id, and a still-dirty original takes the
     close-cancelled branch. (The wrong-buffer-saved exposure is the quit flow's
-    pre-existing Save-As semantics, unchanged by C4.)
+    pre-existing Save-As semantics, unchanged by C4.) **External-mod conflict (Fable
+    M2): when `dispatch_save` raises the external-mod modal, `dispatch_save_then` does
+    NOT arm (save.rs:179 `prompt.is_none()` gate) — Save & close on a conflicted file
+    becomes just the conflict modal, and the user re-issues close after resolving.
+    Inherited, correct, now stated and tested.**
   - `CloseDiscard { id }` → clear the prompt;
     `crate::workspace::close_buffer_now(editor, id)` with the variant's id. No executor
     needed. The swap file is NOT deleted (decision 1).
 - **`apply_result` gains a third `pending_after_save` arm** (jobs_apply.rs:26-68, beside
   the `Quit` and `ContinueQuitDrain` arms, same `saved_this` discipline):
   - `saved_this && !is_dirty(id)` → clear `pending_after_save`;
-    `crate::workspace::close_buffer_now(editor, id)`.
+    `crate::workspace::close_buffer_now(editor, id)`. **`is_dirty` on the ACTION's `id`,
+    not the result's `buffer_id` (unlike the Quit arm, which keys on `buffer_id`,
+    jobs_apply.rs:37) — only the Save-As divergence separates the two, and the
+    `buffer_id` misreading closes a still-dirty buffer (Fable M1).**
+    After the close, the apply arm sets status `"saved — closed"` (Fable M3:
+    `close_buffer_now`'s verbatim tail blanks the status, which would silently eat the
+    merge's "Saved" — the user gets explicit completion feedback instead).
   - `saved_this` but dirty again (edited during flight) → clear `pending_after_save`;
     status `"edited during save — close cancelled"` (the Quit arm's convention verbatim,
     with "close" for "quit"); do NOT close.
   - `!saved_this` (save failed) → clear `pending_after_save`; do NOT close; the save
-    merge's own error status stands. **Attribution corrected (Codex r1 Minor): this
+    merge's own status stands (its ERROR text in the failure case; the empty string in
+    the vanished-target case, save.rs:91-127 — Fable M4's wording alignment). **Attribution corrected (Codex r1 Minor): this
     mirrors `ContinueQuitDrain`'s abort-on-failure, NOT the `Quit` arm — `Quit` acts only
     inside `saved_this` and leaves `pending_after_save` armed on failure (jobs_apply.rs:34,
     :96), relying on the timeout. Close must NOT do that: an armed close surviving a
@@ -139,6 +161,18 @@ D3's post-save arm.
   `"save timed out — close cancelled"` (mirrors `ContinueQuitDrain`'s wording with
   "close"; no modal re-raise — unlike the `Quit` variant's re-prompt, a close is not a
   session-ending action the user is waiting on).
+- **Quit supersedes — and CANCELS — a pending close (Fable I1, user-ratified
+  2026-07-04):** the quit flow has no busy guard (deliberately — quit is the exit hatch
+  and must never be refused), so quit dispatched while a close save is in flight (the
+  mouse→menu route reaches it, app.rs:153) would clobber the single
+  `pending_after_save`/`pending_save_as` slots with ASYMMETRIC leftovers (a cancelled
+  quit drops an unnamed close but leaves a named close ARMED to fire on the next manual
+  save). Policy: the quit command's dispatch path (commands.rs:526-538), BEFORE raising
+  its prompt/drain, clears `pending_after_save` and `pending_save_as` IF their action is
+  `CloseBuffer { .. }` (foreign quit/drain pendings are left alone — quit-over-quit is
+  the existing flow's business). One convention both ways: invoking quit evaporates the
+  close intent; cancelling the quit leaves a clean slate, no ghost close. The quit flow
+  itself disposes of the buffer's dirtiness, so nothing is lost but the convenience.
 - **`apply_panic`** (jobs_apply.rs:92-125) clears a MATCHING awaited save's
   `pending_after_save` action-agnostically (jobs_apply.rs:92/:99) — the new variant is
   covered with zero changes; verify, don't modify.
@@ -194,7 +228,17 @@ existing test whose meaning changes.
   guard fires FIRST even when scratch is dirty — no prompt).
 - workspace.rs: `close_dirty_refuses_while_flow_pending` (the busy guard — arm
   `pending_after_save` manually, call `close_buffer` on a dirty buffer → status refusal,
-  NO prompt).
+  NO prompt); `close_buffer_now_nonactive_normal_keeps_view` (three buffers, close a
+  non-active id → viewed buffer unchanged AND `editor.active` re-pointed correctly when
+  the removed index was below it).
+- jobs_apply.rs (Fable C1's corruption pin):
+  `close_after_save_last_ordinary_while_scratch_active` — arrange `[X, scratch]`,
+  CloseSave{X}, `goto_scratch` during the flight, land the save → scratch INTACT
+  (`scratch_id` valid, content untouched), a fresh untitled in X's slot.
+- commands/app (Fable I1's policy pin): `quit_dispatch_cancels_pending_close` — arm
+  `pending_after_save = CloseBuffer{X}` (and separately `pending_save_as`), dispatch
+  quit, cancel it → both slots None, no close fires on a later manual save.
+- save/prompts (Fable M2): `close_save_on_conflicted_file_raises_external_mod_and_does_not_arm`.
 
 **e2e journey** (e2e.rs Harness): dirty named buffer → dispatch `close_buffer` via the
 COMMAND PALETTE (ctrl-p, type "close", Enter — no keybinding exists, decision 2) →
