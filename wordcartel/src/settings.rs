@@ -509,6 +509,10 @@ mod tests {
         save_overrides(&crate::fsx::RealFs, &path, &OverridesFile::default()).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), OVERRIDES_HEADER);
         // idempotence: same input twice → identical bytes
+        save_overrides(&crate::fsx::RealFs, &path, &of).unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+        save_overrides(&crate::fsx::RealFs, &path, &of).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first, "byte-identical re-save");
     }
 
     #[test]
