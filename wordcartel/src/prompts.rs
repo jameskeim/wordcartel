@@ -250,6 +250,7 @@ pub(crate) fn wrap_column_submit(editor: &mut crate::editor::Editor, text: &str)
         Err(_) => { editor.status = "wrap column: not a number".to_string(); return; }
     };
     let (value, msg) = if n < 20 { (20, "wrap column: 20 (minimum)".to_string()) }
+                       else if n > 9999 { (9999, "wrap column: 9999 (maximum)".to_string()) }
                        else { (n, format!("wrap column: {n}")) };
     editor.view_opts.wrap_column = value;
     editor.status = msg;
@@ -338,6 +339,12 @@ mod tests {
         wrap_column_submit(&mut e, "55");                  // success
         assert_eq!(e.view_opts.wrap_column, 55);
         assert_eq!(e.status, "wrap column: 55");
+        wrap_column_submit(&mut e, "12000");               // above repar's ceiling → CLAMPED SET
+        assert_eq!(e.view_opts.wrap_column, 9999);
+        assert_eq!(e.status, "wrap column: 9999 (maximum)");
+        wrap_column_submit(&mut e, "65535");               // u16-max, still above ceiling
+        assert_eq!(e.view_opts.wrap_column, 9999);
+        assert_eq!(e.status, "wrap column: 9999 (maximum)");
     }
 
     #[test]
