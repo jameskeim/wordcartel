@@ -29,7 +29,7 @@ one effort per the backlog working order. Also closes C4's deferred close-buffer
 - `session.toml` (state store) is untouched: settings = user intent → overrides file;
   state = machine bookkeeping (cursor/marks/folds/scratch) → session store, as today.
 
-## Grounded facts (verified against HEAD 2551463)
+## Grounded facts (verified against 2551463; re-verified by Codex r1 at 278da3e)
 
 - `Config` (config.rs) is consumed at startup: `run()` seeds parallel `Editor` fields
   (app.rs:1244-1261 — `view_opts`, `diag_cfg`, `export_cfg`, `menu_bar_mode`,
@@ -87,16 +87,22 @@ unbind = []
 bind = { "ctrl-k ctrl-o" = 'close_buffer' }
 ```
 
-- `KeymapPatch` gains `scoped: BTreeMap<String, ScopedPatch>` (or equivalent — plan pins
-  the exact shape against RawConfig's serde derive), where `ScopedPatch` is the same
-  `bind`/`unbind` pair. Each layer still contributes exactly one `KeymapPatch`.
+- `KeymapPatch` gains two EXPLICIT optional named fields — `cua: Option<ScopedPatch>`,
+  `wordstar: Option<ScopedPatch>` (`ScopedPatch` = the same `bind`/`unbind` pair) — NOT a
+  flattened map, so future scalar keys in `[keymap]` can't be silently absorbed (Codex
+  m-4; RawConfig has no deny_unknown_fields, so unknown sub-tables were already tolerated
+  — the named-field shape keeps parsing strict where it matters). RawKeymap mirrors the
+  same two optional sub-tables. Each layer still contributes exactly one `KeymapPatch`.
+  Unknown-preset detection: any OTHER sub-table under `[keymap]` is invisible to serde
+  (tolerated-unknown, as today); the "unknown preset warns" rule therefore applies to a
+  FUTURE preset list change, implemented as: the warning fires when a scoped table exists
+  for a preset name not in the known set — with named fields this is structurally
+  impossible, so the warning clause is DROPPED from D1 (simpler; nothing to warn about).
 - **Merge law — "later file wins; within a file, specific wins":** `build_keymap` applies,
   for each layer lowest→highest: the layer's GLOBAL bind/unbind, then the layer's
   scoped table for the ACTIVE preset only. (Consequence, documented: a scoped bind in an
   earlier layer can be beaten by a global bind in a later layer — layer precedence stays
   the single outer law.)
-- A scoped table naming an unknown preset (not `cua`/`wordstar`) → one warning through the
-  existing warnings vec, table skipped. Same treatment as unknown chords/commands today.
 - Back-compat: configs with only global keys behave byte-identically (empty scoped maps).
 
 `build_keymap`'s signature grows the active-preset input only if needed — it already
@@ -110,10 +116,12 @@ off that same field. Signature unchanged.
   preset is a no-op with a status message ("keymap: cua (already active)" or similar —
   plan pins copy).
 - `Editor` gains:
-  - `active_keymap_preset: String` — seeded in `run()` from the RESOLVED preset (after
-    unknown-preset fallback, i.e. what `build_keymap` actually used; the fallback
-    resolution becomes a small shared helper so run() and build_keymap can't disagree).
-    Read by: the switch commands (idempotence + diff), `save_settings` (D3), E2 later.
+  - `active_keymap_preset: String` — seeded in `run()` from the RESOLVED preset via a
+    new `pub fn resolve_preset(&str) -> &'static str` in keymap.rs (returns "cua" or
+    "wordstar", falls back to "cua"), used by BOTH `build_keymap` internally and run()'s
+    seeding so they cannot disagree (Codex m-3: build_keymap's return type doesn't expose
+    the fallback today — the shared helper is REQUIRED, not optional). Read by: the
+    switch commands (idempotence + diff), `save_settings` (D3), E2 later.
   - `keymap_rebuild: bool` — the rebuild request flag.
 - Dispatch sets `active_keymap_preset` + `keymap_rebuild = true` + a status message
   ("keymap: wordstar"). The RUN LOOP, after `reduce` returns and before the next input
@@ -121,7 +129,10 @@ off that same field. Signature unchanged.
   editor.active_keymap_preset.clone(), patches: <the startup layer patches> }, &reg)`,
   reassigns the loop-local trie, clears the flag, surfaces any (unlikely) new warnings to
   the status line. The startup `cfg.keymap.patches` remain in scope in `run()` for exactly
-  this (as `cfg` already stays alive for `max_entries`).
+  this (as `cfg` already stays alive for `max_entries`). Compile surface (Codex m-2): the
+  loop-local becomes `let mut keymap = std::mem::take(&mut editor.keymap);`
+  (app.rs:1334) — the single production `reduce` call site (app.rs:1473) is unchanged;
+  nothing holds `&keymap` across iterations (Codex-verified).
 - Patches survive the switch by construction (same patch chain, new base; scoped tables
   re-key off the new preset). Pinned by test.
 - Hints: no new machinery — palette `rebuild_rows` and menu-open rebuilds pick up the new
@@ -148,12 +159,33 @@ off that same field. Signature unchanged.
   two-pass or snapshot mechanics against load()'s accumulator loop). `run()` keeps the
   baseline's settings-relevant values (a small `SettingsSnapshot` struct) alive alongside
   `cfg`.
-- **`save_settings`** (command "Save Settings", `MenuCategory::Settings`): collects the
-  CURRENT runtime values (D4 inventory) from the Editor, diffs against the baseline
+- **`save_settings`** (command "Save Settings", `MenuCategory::Settings`) — dispatch
+  shape (Codex I-1: registry handlers are plain fns over `Ctx{editor, clock, executor,
+  msg_tx}` — registry.rs:23/:58/:466 — and CANNOT reach run()-local baseline/paths): the
+  handler sets `editor.settings_save_requested = true` + returns; the RUN LOOP, which
+  owns the baseline snapshot and the overrides path, performs the save after `reduce`
+  returns — the SAME between-reduces pattern as `keymap_rebuild` (D2). The loop collects
+  the CURRENT runtime values (D4 inventory) from the Editor, diffs against the baseline
   snapshot, serializes ONLY the differing values via `toml::to_string` of a serde struct
-  mirroring the config sections, writes via `file::save_atomic_bytes` (the M3 seam —
-  mode-preserving atomic replace, dir fsync). Status line: "settings saved" /
-  "settings: <SaveError>" on failure — no silent UI, like every save.
+  mirroring the config sections, and writes atomically through the `Fs` seam (below).
+  Status line: "settings saved" / "settings: <error>" on failure — no silent UI.
+- **Write seam (Codex I-5):** `file::save_atomic_bytes` hardcodes `RealFs` (file.rs:176)
+  and `FaultFs` is private to fsx tests (fsx.rs:369). The settings writer is therefore a
+  function parameterized over the seam — `write_overrides(fs: &dyn crate::fsx::Fs, path,
+  bytes)` calling `fsx::atomic_replace(fs, …)` directly (mode Preserve, dir_fsync true,
+  matching save_atomic_bytes' opts); production passes `&RealFs`; the failure test passes
+  a small test-local failing `Fs` impl (no need to expose FaultFs).
+- **Directory creation (Codex I-2):** nothing creates `<config_dir>/wordcartel` today
+  (config_layer_paths only reads; state.rs works because swap::state_dir creates its own
+  dir — swap.rs:31). The save path runs `create_dir_all` on the parent (0700 on Unix,
+  mirroring state_dir's policy) BEFORE the atomic write; failure surfaces as the same
+  status-line error.
+- **Reachability (Codex I-6, intentional):** modal guards live in reduce()'s input
+  routing (app.rs:688) and overlay dispatch clears overlays before dispatching
+  (app.rs:153) — so via keys the command is unreachable while a modal is open, and
+  menu/palette close themselves. A programmatic `reg.dispatch` during a modal would only
+  set the request flag (the loop does the IO) — harmless by construction. Stated as
+  intentionally unrestricted; no special casing.
 - Consequences (all pinned): idempotent (save twice → identical file); self-healing
   (delete the file → next session = hand config exactly); minimal (un-diverged values
   never appear, so later hand-config edits to those values shine through); un-divergence
@@ -171,12 +203,22 @@ Exactly the runtime-mutable set, keyed to their config sections:
 | `theme.name` (builtin picks only — the picker lists builtins only) | `[theme] name` |
 | `view_opts.typewriter/focus/measure/wrap_guide/word_count` | `[view] *` (the five) |
 | `menu_bar_mode` | `[menu] bar` |
-| `mouse_capture` | `[mouse] mouse_capture` |
+| `mouse_capture` | `[mouse] capture` (RawMouse field is `capture` — config.rs:226; Codex I-3) |
 
-- Theme nuance: if the session theme came from `theme.file` and was never changed, the
-  runtime name equals the baseline's resolved name → no diff → nothing written. A picker
-  pick always yields a builtin name → diffs → `[theme] name` written (which then outranks
-  the hand `file=` at load, correctly — the user's last explicit choice wins).
+- Theme identity is PROVENANCE-based, not name-string-based (Codex I-4: a file theme's
+  runtime name derives from its Base16 scheme name — theme_resolve.rs:100 — and can
+  COLLIDE with a builtin name, so raw name-diffing can silently drop a picker pick).
+  Definition: an identity is `File` (baseline resolved from `theme.file`) or
+  `Builtin(name)`. The baseline's identity comes from the baseline config (`file` set →
+  `File`; else `name`/default → `Builtin`). The Editor tracks the RUNTIME identity in a
+  new `theme_identity` field: seeded at startup from the MERGED config's provenance
+  (an overrides/hand `name` outranking `file` → `Builtin`); a theme-picker COMMIT sets it
+  to `Builtin(picked name)` (preview/Esc-restore does not). The diff writes
+  `[theme] name` iff runtime identity is `Builtin(n)` AND baseline identity !=
+  `Builtin(n)` — so a picker pick over a file theme persists even when the names collide,
+  and a never-touched file theme never writes. Idempotent across sessions by
+  construction (next session: runtime identity `Builtin(n)` from the overrides layer,
+  baseline still `File` → key persists on re-save).
 - NEVER persisted: keymap patches, `theme.styles`/`file`/`depth` structures, diagnostics,
   export (no runtime mutator exists for them — nothing to diff), state (session.toml's
   domain), `view_opts.typewriter_anchor`/`focus_granularity`/`wrap_column` (no runtime
@@ -186,8 +228,10 @@ Exactly the runtime-mutable set, keyed to their config sections:
 
 ## D5. Settings menu category + C4 closure
 
-- `MenuCategory::Settings` added (registry.rs enum + `MENU_ORDER` between View and
-  Export + `category_label` arm "Settings"). Holds exactly three commands: `keymap_cua`,
+- `MenuCategory::Settings` added — the complete compile surface (Codex m-5): the enum
+  (registry.rs:38), `MENU_ORDER` between View and Export (registry.rs:41-42), the
+  `category_label` arm "Settings" (menu.rs:60-68), plus any exhaustive matches over
+  `MenuCategory` the compiler surfaces (house rule: no catch-all arms). Holds exactly three commands: `keymap_cua`,
   `keymap_wordstar`, `save_settings`. No existing items move (A3 curation's job).
 - C4 closure (recorded decision): `close_buffer` remains unbound in both presets BY
   DESIGN. Rationale: `ctrl-w` is load-bearing in both presets; modified-F-keys are
@@ -202,7 +246,8 @@ Exactly the runtime-mutable set, keyed to their config sections:
   startup.
 - `save_settings` write failure: `SaveError` → status line, settings remain live in
   session (nothing lost), no partial file (atomic replace).
-- Unknown preset in a scoped table: warn + skip (D1).
+- Unknown scoped sub-tables under `[keymap]`: invisible to serde, tolerated as today
+  (named-field schema — D1); nothing to warn.
 - `save_settings` while a modal/prompt is open: unreachable via menu/palette (they close);
   direct dispatch honors the same guards as other commands (plan verifies against the
   registry Ctx path — no special casing expected).
@@ -211,9 +256,12 @@ Exactly the runtime-mutable set, keyed to their config sections:
 
 - **Unit (config.rs/keymap.rs):** scoped-patch merge matrix — global-only layer
   (back-compat byte-identical), scoped beats global within a layer, later layer's global
-  beats earlier layer's scoped, scoped table keys off active preset only, unknown-preset
-  scoped table warns + skips; round-trip of the overrides serialization; baseline excludes
-  the overrides layer (load a chain WITH an overrides file, assert baseline ≠ merged).
+  beats earlier layer's scoped, scoped table keys off active preset only; `resolve_preset`
+  fallback pin; round-trip of the overrides serialization (incl. `[mouse] capture` — the
+  RawMouse field name); baseline excludes the overrides layer (load a chain WITH an
+  overrides file, assert baseline ≠ merged); theme-identity diff matrix (picker pick over
+  a file theme with a COLLIDING name persists; untouched file theme writes nothing;
+  un-diverged builtin writes nothing).
 - **Behavior (app.rs):** switch command rebuilds the trie — the same chord (`ctrl-w`)
   resolves to `expand_selection` under cua and `scroll_line_up` after `keymap_wordstar`
   dispatch (through the real run-loop flag path or its testable seam); patches survive the
@@ -221,7 +269,8 @@ Exactly the runtime-mutable set, keyed to their config sections:
   its base); switch idempotence (re-dispatch active preset → status, no rebuild); dirty
   settings save→reload round-trip (save with the Fs-seam mock or a tempdir, re-load the
   chain, assert the runtime values restore); save failure surfaces on the status line
-  (fault-injected via the M3 FaultFs); diff minimality (toggle one setting, save → file
+  (a test-local failing `Fs` impl through the `write_overrides` seam); first save creates
+  `<config_dir>/wordcartel` when absent; diff minimality (toggle one setting, save → file
   contains exactly that key; toggle it back, save → key gone); `close_buffer` unbound in
   both presets (a pin that fails if someone binds it).
 - **e2e (e2e.rs):** one journey — switch preset via menu/palette, assert a
