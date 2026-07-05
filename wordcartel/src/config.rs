@@ -821,17 +821,19 @@ mod tests {
         let baseline_resolved = crate::theme_resolve::resolve_theme(&baseline_cfg.theme, &env);
         let baseline = snapshot_of(&baseline_cfg, &baseline_resolved.theme.name);
 
-        // Runtime snapshot: three divergences — keymap → wordstar, typewriter on, bar → pinned.
+        // Runtime snapshot: five divergences — keymap → wordstar, typewriter on,
+        // bar → pinned, mouse capture off, theme → tokyo-night (spec Testing:
+        // the round-trip covers [mouse] capture and [theme] name too — Fable m-wb-1).
         let runtime = SettingsSnapshot {
             keymap_preset:  "wordstar".to_string(),
-            theme_identity: ThemeIdentity::Builtin(baseline_resolved.theme.name.clone()),
+            theme_identity: ThemeIdentity::Builtin("tokyo-night".to_string()),
             view_typewriter: true,
             view_focus:     false,
             view_measure:   false,
             view_wrap_guide: false,
             view_word_count: false,
             menu_bar:       crate::config::MenuBarMode::Pinned,
-            mouse_capture:  true,
+            mouse_capture:  false,
         };
 
         let of = compute_overrides(&runtime, &baseline, &OverridesFile::default(), &OverridesFile::default());
@@ -844,6 +846,9 @@ mod tests {
         assert!(cfg.view.typewriter, "view.typewriter must round-trip to true");
         assert_eq!(cfg.menu.bar, crate::config::MenuBarMode::Pinned,
             "menu.bar must round-trip to Pinned");
+        assert!(!cfg.mouse.mouse_capture, "mouse capture must round-trip to false");
+        assert_eq!(cfg.theme.name.as_deref(), Some("tokyo-night"),
+            "theme name must round-trip");
     }
 
 }
