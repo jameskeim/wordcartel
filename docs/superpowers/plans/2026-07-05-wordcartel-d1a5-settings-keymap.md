@@ -153,7 +153,7 @@ In `build_keymap` (keymap.rs:424-489): keep the existing unknown-preset warning;
     }
 ```
 
-Drop the stale `#[allow(dead_code)] // wired in Task 4/5` on `build_keymap` while editing it. Update the existing `km` test helper (keymap.rs:500-510) construction with `..Default::default()` if it uses a struct literal.
+Drop the stale `#[allow(dead_code)] // wired in Task 4/5` on `build_keymap` while editing it. **Migrate EVERY existing `KeymapPatch` struct literal (Codex plan C1 — the new fields break them all):** config.rs:314 (the push — gains the two mapped fields), keymap.rs:504 and :518-519 (the `km` helper + the cross-layer test), app.rs:3128/:3147/:3167 (three test literals — add `..Default::default()`). Grep `KeymapPatch {` across wordcartel/src to confirm no other site before committing.
 
 - [ ] **Step 4: GREEN + gates.** Full two-crate suite; back-compat is proven by the untouched existing keymap/config tests passing verbatim.
 
@@ -290,7 +290,7 @@ fn switch_keymap_preset(editor: &mut crate::editor::Editor, preset: &str) {
 
 **Interfaces:**
 - Consumes: T2's `MenuCategory::Settings`; T1's `resolve_preset` (via callers).
-- Produces (all in `settings.rs`, consumed by T4): `pub enum ThemeIdentity { File, Builtin(String) }` (derive `Debug, Clone, PartialEq, Eq`); `pub struct SettingsSnapshot { pub keymap_preset: String, pub theme_identity: ThemeIdentity, pub view_typewriter: bool, pub view_focus: bool, pub view_measure: bool, pub view_wrap_guide: bool, pub view_word_count: bool, pub menu_bar: crate::config::MenuBarMode, pub mouse_capture: bool }`; `pub struct OverridesFile` (serde mirror); `pub fn snapshot_of(cfg: &crate::config::Config) -> SettingsSnapshot`; `pub fn runtime_snapshot(editor: &crate::editor::Editor) -> SettingsSnapshot`; `pub fn theme_identity_of(theme_cfg: &crate::config::ThemeConfig, resolved_name: &str) -> ThemeIdentity`; `pub fn parse_overrides(bytes: &str) -> OverridesFile`; `pub fn compute_overrides(runtime: &SettingsSnapshot, baseline: &SettingsSnapshot, existing: &OverridesFile, mask: &OverridesFile) -> OverridesFile`; `pub fn save_overrides(fs: &dyn crate::fsx::Fs, path: &std::path::Path, of: &OverridesFile) -> std::io::Result<()>`; `Editor.settings_save_requested: bool` + `Editor.theme_identity: ThemeIdentity`.
+- Produces (all in `settings.rs`, consumed by T4): `pub enum ThemeIdentity { File, Builtin(String) }` (derive `Debug, Clone, PartialEq, Eq`); `pub struct SettingsSnapshot { pub keymap_preset: String, pub theme_identity: ThemeIdentity, pub view_typewriter: bool, pub view_focus: bool, pub view_measure: bool, pub view_wrap_guide: bool, pub view_word_count: bool, pub menu_bar: crate::config::MenuBarMode, pub mouse_capture: bool }`; `pub struct OverridesFile` (serde mirror); `pub fn snapshot_of(cfg: &crate::config::Config, resolved_theme_name: &str) -> SettingsSnapshot`; `pub fn runtime_snapshot(editor: &crate::editor::Editor) -> SettingsSnapshot`; `pub fn theme_identity_of(theme_cfg: &crate::config::ThemeConfig, resolved_name: &str) -> ThemeIdentity`; `pub fn parse_overrides(bytes: &str) -> OverridesFile`; `pub fn compute_overrides(runtime: &SettingsSnapshot, baseline: &SettingsSnapshot, existing: &OverridesFile, mask: &OverridesFile) -> OverridesFile`; `pub(crate) fn save_overrides(fs: &dyn crate::fsx::Fs, path: &std::path::Path, of: &OverridesFile) -> std::io::Result<()>` — **pub(crate), NOT pub (Codex plan C2): `Fs`/`WriteSync`/`RealFs`/`atomic_replace` are all pub(crate) in fsx.rs (:15/:24/:39/:181), and a `pub` fn cannot expose a pub(crate) trait; `write_overrides` and the run()-facing save helper are pub(crate) for the same reason (the module itself stays `pub mod settings`)**; `Editor.settings_save_requested: bool` + `Editor.theme_identity: ThemeIdentity`.
 
 - [ ] **Step 1: the module skeleton + failing unit tests.** `settings.rs` opens with `use serde::{Serialize, Deserialize};`. The mirror (grounding §B.5, sections wrapped `Option` so an all-empty file serializes to NOTHING — the header-only file):
 
@@ -544,31 +544,56 @@ Extend the T2 registry pin to all three Settings commands. Picker pins (app.rs t
 
 Then, after the theme resolve in the seeding block: resolve the BASELINE theme too (`resolve_theme(&baseline_cfg.theme, &env)`) and build the three snapshots — `let baseline_snapshot = settings::snapshot_of(&baseline_cfg, &baseline_resolved.theme.name);` (the resolved `Theme.name`), `let mut overrides_snapshot = overrides_path.as_ref().filter(|p| p.is_file()).map(|p| std::fs::read_to_string(p).map(|s| settings::parse_overrides(&s)).unwrap_or_default()).unwrap_or_default();`, `let mask_snapshot = cli.config_path.as_ref().filter(|c| c.is_file()).map(|c| std::fs::read_to_string(c).map(|s| settings::parse_mask(&s)).unwrap_or_default()).unwrap_or_default();`. Seed `editor.theme_identity = settings::theme_identity_of(&cfg.theme, &resolved.theme.name);` (the MERGED config's provenance — an overrides/hand `name` wins over `file` per `theme_identity_of`'s rule).
 
-- [ ] **Step 2: the save block**, second arm beside T2's rebuild block after `reduce` (complete; note `cli.no_config` is in scope):
+- [ ] **Step 2: the save helper + block.** To make the refusals and statuses honestly unit-testable (Codex plan I2/I3 — run() calls `dirs::config_dir()` directly with no seam), the block's BODY is a pub(crate) fn in settings.rs:
+
+```rust
+/// Perform a requested settings save: refusals first, then diff + atomic write.
+/// Returns the new overrides snapshot on success (the caller replaces its copy so
+/// rules 2/3 stay correct for a second save in the same session). Sets editor.status
+/// in every arm — no silent UI.
+pub(crate) fn perform_settings_save(
+    editor: &mut crate::editor::Editor,
+    no_config: bool,
+    overrides_path: Option<&std::path::Path>,
+    baseline: &SettingsSnapshot,
+    existing: &OverridesFile,
+    mask: &OverridesFile,
+    fs: &dyn crate::fsx::Fs,
+) -> Option<OverridesFile> {
+    if no_config {
+        editor.status = "settings: disabled by --no-config".into();
+        return None;
+    }
+    let Some(path) = overrides_path else {
+        editor.status = "settings: no config directory".into();
+        return None;
+    };
+    let runtime = runtime_snapshot(editor);
+    let of = compute_overrides(&runtime, baseline, existing, mask);
+    match save_overrides(fs, path, &of) {
+        Ok(()) => { editor.status = "settings saved".into(); Some(of) }
+        Err(e) => { editor.status = format!("settings: {e}"); None }
+    }
+}
+```
+
+run()'s block, beside T2's rebuild arm after `reduce`:
 
 ```rust
         if editor.settings_save_requested {
             editor.settings_save_requested = false;
-            if cli.no_config {
-                editor.status = "settings: disabled by --no-config".into();
-            } else if let Some(path) = overrides_path.as_ref() {
-                let runtime = settings::runtime_snapshot(&editor);
-                let of = settings::compute_overrides(&runtime, &baseline_snapshot, &overrides_snapshot, &mask_snapshot);
-                match settings::save_overrides(&crate::fsx::RealFs, path, &of) {
-                    Ok(()) => { editor.status = "settings saved".into(); overrides_snapshot = of; }
-                    Err(e) => { editor.status = format!("settings: {e}"); }
-                }
-            } else {
-                editor.status = "settings: no config directory".into();
+            if let Some(of) = settings::perform_settings_save(
+                &mut editor, cli.no_config, overrides_path.as_deref(),
+                &baseline_snapshot, &overrides_snapshot, &mask_snapshot, &crate::fsx::RealFs)
+            {
+                overrides_snapshot = of;
             }
         }
 ```
 
-(Updating `overrides_snapshot` after a successful save keeps rules 2/3 correct for a SECOND save in the same session — say so in a comment.)
+- [ ] **Step 3: behavior pins.** In settings.rs (driving `perform_settings_save` directly — the honest homes Codex plan I2 demanded): `save_refused_under_no_config` (no_config=true → status "settings: disabled by --no-config", returns None, no file); `save_refused_without_config_dir` (overrides_path=None → "settings: no config directory"); `save_failure_surfaces_io_error` (the FailFs → status starts "settings: " and contains "boom"); `save_success_sets_status_and_returns_snapshot` (tempdir → "settings saved", returned OverridesFile == computed). In app.rs: `save_settings_command_sets_the_request_flag` (dispatch through the registry, assert the flag); `baseline_excludes_overrides_layer` (config.rs test home: load(&[hand]) vs load(&[hand, overrides_file]) differ on an overridden key — the spec's baseline pin); `save_reload_roundtrip_restores_settings` — a UNIT-level pin of the full pipeline without run(): build a `SettingsSnapshot` runtime with three divergences, `compute_overrides` + `save_overrides` to a tempdir file, then `config::load(&[hand_layer, overrides_file])` and assert the merged Config reflects the saved values (preset via patches? no — assert `cfg.keymap.preset == "wordstar"`, `cfg.view.typewriter`, `cfg.menu.bar == Pinned` — proving the written strings parse back through the REAL loader).
 
-- [ ] **Step 3: behavior pins** (app.rs tests): `save_settings_command_sets_the_request_flag` (dispatch through the registry, assert the flag — the loop block itself is exercised by the settings.rs unit battery + the two-stage seam below); `save_reload_roundtrip_restores_settings` — a UNIT-level pin of the full pipeline without run(): build a `SettingsSnapshot` runtime with three divergences, `compute_overrides` + `save_overrides` to a tempdir file, then `config::load(&[hand_layer, overrides_file])` and assert the merged Config reflects the saved values (preset via patches? no — assert `cfg.keymap.preset == "wordstar"`, `cfg.view.typewriter`, `cfg.menu.bar == Pinned` — proving the written strings parse back through the REAL loader).
-
-- [ ] **Step 4: e2e journey** (`journey_keymap_switch_scopes`, §C idioms): `Harness::new("doc\n", None, (80,24))`; assert ctrl-w initially expands selection (or simply that resolve maps to expand via typing: select a word — use the reduce-visible effect: `h.editor.active().document.selection` grows after ctrl-w); dispatch `keymap_wordstar` via the palette (`h.ctrl('p')`, `h.type_str("keymap: wordstar")`, precondition-assert the top row's label, Enter); the step-seam rebuild fires inside `h.step`; then assert ctrl-w now scrolls instead of expanding (selection unchanged, `scroll` offset moved — read the harness's visible state; pin whichever observable the implementer verifies, with a precondition assert). Also assert `h.status()` contains "keymap: wordstar" right after the Enter step.
+- [ ] **Step 4: e2e journey** (`journey_keymap_switch_scopes`, §C idioms). Codex plan I1: `scroll_line_up` only decrements when `view.scroll > 0` (nav.rs:623 — source tests seed scroll 4-5 first), so the corpus must make BOTH observables non-vacuous: build a 40-line doc (`"line\n".repeat(40)`), move the caret deep (`Selection::single` into line ~30) so the view scrolls (precondition-assert `h.editor.active().view.scroll > 0` — locate the real scroll field via nav.rs's own tests and precondition-assert it, adjusting the accessor if the field path differs); under CUA assert ctrl-w EXPANDS the selection (`!h.editor.active().document.selection.primary().is_empty()` after ctrl-w, from an empty caret — precondition-assert empty before); collapse the selection; dispatch `keymap_wordstar` via the palette (`h.ctrl('p')`, `h.type_str("keymap: wordstar")`, precondition-assert the top row's label == "Keymap: WordStar", Enter; assert `h.status()` contains "keymap: wordstar"); then ctrl-w again: assert the selection STAYS empty AND `view.scroll` decremented by 1 (both directions of the flip pinned, neither vacuous).
 
 - [ ] **Step 5: full gates + smoke.** Run `scripts/smoke/run.sh` once; quote the one-line summary VERBATIM in the report (advisory).
 
