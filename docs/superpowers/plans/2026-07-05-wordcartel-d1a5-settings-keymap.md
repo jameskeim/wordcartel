@@ -634,8 +634,10 @@ Extend the T2 registry pin to all three Settings commands. Picker pins (app.rs t
     if !cli.no_config {
         if let Some(op) = overrides_path.as_ref().filter(|p| p.is_file()) {
             // Race-free: derive from what config_layer_paths ACTUALLY pushed, not a re-stat
-            // (Fable plan M3 — a fs race would mis-index and len-1 could underflow).
-            let has_cli_cfg = hand_paths.last() == cli.config_path.as_ref();
+            // (Fable plan M3). The is_some() guard kills the None == None arm — an EMPTY
+            // hand chain (no XDG config, no project file, no --config: the headline
+            // save-once-then-relaunch flow) must append, not underflow (Fable r2 Critical).
+            let has_cli_cfg = cli.config_path.is_some() && hand_paths.last() == cli.config_path.as_ref();
             let idx = if has_cli_cfg { all_paths.len() - 1 } else { all_paths.len() };
             all_paths.insert(idx, op.clone());
         }
