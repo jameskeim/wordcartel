@@ -22,9 +22,11 @@ async-save staleness discipline is inherited, not reinvented.
    successful save, save.rs:100-113, and explicit recovery-discard, prompts.rs:170); close
    matches. One discard convention: a Discard keypress is never irreversible — reopening
    the file offers the discarded changes back.
-2. **`ctrl-w` binds to `close_buffer`** (fork 2 = A): the near-universal close key, unbound
-   today (keymap.rs grep-verified). Menu/palette hints re-derive automatically per the
-   three-surface contract (registry = truth); the registry entry itself (registry.rs:282 —
+2. **NO keybinding in this effort** (fork 2 REVISED = A, 2026-07-04, after Codex r1
+   falsified the original premise: `ctrl-w` is NOT free — it is `expand_selection` in CUA
+   (keymap.rs:283) and deliberately `scroll_line_up` in WordStar (keymap.rs:337)). Close
+   Buffer stays menu/palette-reachable; the binding question moves to the A5 keymap
+   effort, where per-preset key ownership belongs. The registry entry (registry.rs:282 —
    id `close_buffer`, label `Close Buffer`, `MenuCategory::File`) is unchanged.
 
 ## Design
@@ -40,25 +42,40 @@ New constructor in the house idiom (beside `quit_review_buffer`, prompt.rs):
   - `('d', "Discard", PromptAction::CloseDiscard)`
   - `('c', "Cancel", PromptAction::Cancel)`
 
-Two new `PromptAction` variants: `CloseSave`, `CloseDiscard` (prompt.rs:6-27 enum).
+Two new `PromptAction` variants, BOTH CARRYING THE TARGET:
+`CloseSave { id: BufferId }`, `CloseDiscard { id: BufferId }` (prompt.rs:6-27 enum — the
+enum already carries data, `Transform(TransformKind)`). The id is captured AT RAISE TIME
+in `close_confirm(name, id)` (Codex r1 Critical — see the modal correction below).
 `Cancel` is reused — its existing resolve arm clears `pending_export`/`pending_save_*`/
 `quit_drain` (prompts.rs), all `None` in the close flow, so it is a harmless superset.
 Esc routes through the existing prompt-Esc arm (app.rs:705-708) — same harmless-superset
 argument. Key routing (`action_for`, case-insensitive) and status-row rendering
 (render.rs:653-655) need no changes.
 
-Because prompts are modal (the `editor.prompt.is_some()` guard intercepts ALL key input,
-app.rs:692-737, and `open_prompt` clears every other overlay, editor.rs:592-604), the
-active buffer cannot change between raise and resolve — `active()` at resolve time is the
-buffer that raised the prompt. The ASYNC window opens only after `CloseSave` dispatches
-the save; that window is handled by D3's explicit id capture.
+**The prompt is NOT a fully-sealed window (Codex r1 Critical).** Key and mouse input are
+intercepted (the `editor.prompt.is_some()` guard, app.rs:692-737; mouse returns early at
+:731) — but BACKGROUND RESULTS still process under the prompt (`Msg::JobDone` drains at
+:715/:734), and a quit-drain save landing mid-prompt calls `drive_quit_drain`, which
+SWITCHES the active buffer (jobs_apply.rs:160). `active()` at resolve time is therefore
+unreliable. Two defenses, both required:
+1. The target id rides IN the PromptAction variants, captured when `close_buffer` raises
+   the prompt — resolve arms never read `active()`.
+2. A BUSY GUARD (also fixes Codex r1 I2): `close_buffer`'s dirty path refuses with status
+   `"another save or quit is in progress — try again"` when
+   `pending_after_save.is_some() || pending_save_as.is_some() || quit_drain.is_some()` —
+   raising a close prompt over another flow's pending state would otherwise let the shared
+   `Cancel`/Esc arms silently clobber that flow (the Cancel arm clears
+   `pending_save_as`/`quit_drain` etc., prompts.rs:107; menu dispatch can invoke commands
+   while a minibuffer is open, app.rs:153, so the pending states are genuinely reachable
+   here). With the guard, the `Cancel`-reuse claim becomes true by construction.
 
 ### D2. The trigger + the shared close mechanics (workspace.rs)
 
 `close_buffer` (:99-123) changes ONLY its dirty guard (:102): instead of setting the
 refusal status, it calls
-`editor.open_prompt(crate::prompt::Prompt::close_confirm(&name))` where `name` is the
-buffer's display name (the same name source `quit_review_buffer`'s callers use). The
+`editor.open_prompt(crate::prompt::Prompt::close_confirm(&name, id))` where `name` is
+the buffer's display name (the same name source `quit_review_buffer`'s callers use) and
+`id` the active buffer's id at raise time — AFTER the busy guard (D1) passes. The
 scratch guard (:101) stays FIRST and unchanged — the scratch buffer never closes, dirty
 or not. The clean path is extracted, not changed:
 
@@ -85,9 +102,12 @@ D3's post-save arm.
   `buffer_id` + `version`, editor.rs:36-41 — the variant's id is for the CLOSE action;
   the staleness match keys on the existing fields exactly as the Quit arm does.)
 - **`resolve_prompt` gains two arms** (prompts.rs, beside `ReviewSave`/`ReviewDiscard`):
-  - `CloseSave` → clear the prompt; capture `id = active buffer id`;
+  - `CloseSave { id }` → clear the prompt;
     `crate::save::dispatch_save_then(ctx, PostSaveAction::CloseBuffer { id })` — exactly
-    `ReviewSave`'s shape. The unnamed-buffer case rides the EXISTING carry:
+    `ReviewSave`'s shape, with the variant's raise-time id (never `active()`). NOTE:
+    `dispatch_save_then` saves the ACTIVE buffer; the busy guard + key-modal window mean
+    active == id at resolve time (background switches require in-flight pending state,
+    which the guard excluded). The unnamed-buffer case rides the EXISTING carry:
     `dispatch_save_then` sets `pending_save_as = Some(action)` when Save-As opens
     (save.rs:169-184), and `perform_save_as` arms `pending_after_save` from it
     (prompts.rs:84-86) — no new code, the variant flows through. **Save-As divergence
@@ -97,9 +117,9 @@ D3's post-save arm.
     `is_dirty(id)` on the ACTION's id, and a still-dirty original takes the
     close-cancelled branch. (The wrong-buffer-saved exposure is the quit flow's
     pre-existing Save-As semantics, unchanged by C4.)
-  - `CloseDiscard` → clear the prompt; `crate::workspace::close_buffer_now(editor, id)`
-    (active id — modal window, per D1). No executor needed. The swap file is NOT deleted
-    (decision 1).
+  - `CloseDiscard { id }` → clear the prompt;
+    `crate::workspace::close_buffer_now(editor, id)` with the variant's id. No executor
+    needed. The swap file is NOT deleted (decision 1).
 - **`apply_result` gains a third `pending_after_save` arm** (jobs_apply.rs:26-68, beside
   the `Quit` and `ContinueQuitDrain` arms, same `saved_this` discipline):
   - `saved_this && !is_dirty(id)` → clear `pending_after_save`;
@@ -108,7 +128,12 @@ D3's post-save arm.
     status `"edited during save — close cancelled"` (the Quit arm's convention verbatim,
     with "close" for "quit"); do NOT close.
   - `!saved_this` (save failed) → clear `pending_after_save`; do NOT close; the save
-    merge's own error status stands (the Quit arm's failure convention).
+    merge's own error status stands. **Attribution corrected (Codex r1 Minor): this
+    mirrors `ContinueQuitDrain`'s abort-on-failure, NOT the `Quit` arm — `Quit` acts only
+    inside `saved_this` and leaves `pending_after_save` armed on failure (jobs_apply.rs:34,
+    :96), relying on the timeout. Close must NOT do that: an armed close surviving a
+    failed save would fire on the user's NEXT successful manual save — a surprise
+    buffer-close. Abort-on-failure is the correct convention here.**
 - **The timeout tick arm** (app.rs:1423-1444, `SAVE_QUIT_TIMEOUT_MS`) gains the
   `CloseBuffer` disposition: clear `pending_after_save`, status
   `"save timed out — close cancelled"` (mirrors `ContinueQuitDrain`'s wording with
@@ -117,11 +142,10 @@ D3's post-save arm.
 - **`apply_panic`** (jobs_apply.rs:92-125) already clears `pending_after_save`
   unconditionally — the new variant is covered with zero changes; verify, don't modify.
 
-### D4. The keybinding (keymap.rs)
+### D4. No keybinding (decision 2 revised)
 
-`ctrl-w` → `close_buffer` in the default binds. If the keymap has per-preset tables
-(cua/wordstar), bind in the DEFAULT/cua table only; the wordstar preset question is out
-of scope (`ctrl-w` may carry legacy meaning there — D1/A5 territory). Hints re-derive.
+No keymap changes in this effort — `ctrl-w` is taken (`expand_selection` CUA /
+`scroll_line_up` WordStar); the binding decision moves to A5. keymap.rs is untouched.
 
 ## What does NOT change
 
@@ -163,14 +187,19 @@ existing test whose meaning changes.
   (staleness keying); `close_after_save_last_ordinary_recheck` (arrange: two buffers,
   CloseSave on one, close the OTHER during flight via `close_buffer_now`, land the save
   → the last-ordinary path must fire at APPLY time, leaving a fresh untitled).
-- app.rs (tick family): `close_save_timeout_cancels_with_status`.
-- keymap: `ctrl_w_dispatches_close_buffer` (the binding exists and routes; the
-  keymap test idiom).
+- app.rs (tick family): `close_save_timeout_cancels_with_status`; plus (Codex r1
+  Minor) `esc_on_close_prompt_cancels_cleanly` (Esc → prompt gone, buffer open, no
+  pending state) and `close_dirty_scratch_still_refuses_via_scratch_guard` (the scratch
+  guard fires FIRST even when scratch is dirty — no prompt).
+- workspace.rs: `close_dirty_refuses_while_flow_pending` (the busy guard — arm
+  `pending_after_save` manually, call `close_buffer` on a dirty buffer → status refusal,
+  NO prompt).
 
-**e2e journey** (e2e.rs Harness): dirty named buffer → `ctrl('w')` → prompt text on the
-status row (`screen_contains`) → `key('s')` → save lands (InlineExecutor drain via the
-harness's advance) → buffer closed, neighbor visible; and the `d` variant → buffer
-closed, file on disk UNCHANGED, swap file still present.
+**e2e journey** (e2e.rs Harness): dirty named buffer → dispatch `close_buffer` via the
+COMMAND PALETTE (ctrl-p, type "close", Enter — no keybinding exists, decision 2) →
+prompt text on the status row (`screen_contains`) → `key('s')` → save lands → buffer
+closed, neighbor visible; and the `d` variant → buffer closed, file on disk UNCHANGED,
+swap file still present.
 
 **Gates:** the standard set — suite green (1,000 + the new tests), workspace clippy deny
 clean, warning-free; smoke quoted verbatim pre-merge (advisory) + a live tmux sanity
@@ -181,12 +210,13 @@ clean, warning-free; smoke quoted verbatim pre-merge (advisory) + a live tmux sa
 - No change to quit behavior or its prompts; no drain for multi-buffer close (close is
   single-buffer by definition).
 - No close-buffer mouse affordance (rides the overlay-mouse-parity follow-up).
-- No wordstar-preset binding decision (D1/A5 territory).
+- No keybinding at all (decision 2 revised — A5 territory; ctrl-w is taken in both
+  presets).
 - The `close_buffer` command stays scratch-refusing.
 - No swap-lifecycle changes.
 
 ## Ship-time bookkeeping
 
-Backlog: C4 → SHIPPED (note the ctrl-w binding and the swap-survives-discard
-convention); working order advances (next = C2 transform scope). Memory: working-order
-tick. Ledger: standard per-task lines.
+Backlog: C4 → SHIPPED (note NO binding — deferred to A5 with the ctrl-w-is-taken facts —
+and the swap-survives-discard convention); working order advances (next = C2 transform
+scope). Memory: working-order tick. Ledger: standard per-task lines.
