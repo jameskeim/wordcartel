@@ -163,7 +163,9 @@ New transform.rs tests (corpora chosen at implementation, probe-verified):
 
 ## Error handling
 
-- Non-numeric / out-of-range minibuffer input: status line, buffer unchanged (D2).
+- Setter input semantics, distinguished (Codex r3): PARSE FAILURES (non-numeric, u16
+  overflow) → status only, `wrap_column` UNCHANGED; below-minimum values (< 20) → a
+  SUCCESSFUL CLAMPED SET (wrap_column = 20, "wrap column: 20 (minimum)", rebuild fires).
 - repar errors: unchanged path (`TransformError` → status; guarded_transform panic
   isolation intact).
 - No new IO, no new refusal states; Save Settings semantics inherit D1+A5's shipped
