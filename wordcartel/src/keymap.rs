@@ -413,6 +413,10 @@ static WORDSTAR: &[(&str, &str)] = &[
     ("shift-down",  "select_down"),
     ("shift-home",  "select_line_start"),
     ("shift-end",   "select_line_end"),
+    // Command-surface escape hatch (D1+A5 live-sanity finding): WordStar's control
+    // plane never used F-keys, and without this the preset is a keyboard trap once
+    // runtime switching exists — no palette, no menu, no way back without a mouse.
+    ("f10", "menu"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -881,6 +885,18 @@ mod tests {
         let (t, warns) = build_keymap(&cfgk, &Registry::builtins());
         assert!(warns.iter().any(|w| w.contains("unknown keymap.preset")), "fallback still warns");
         assert!(matches!(t.resolve(&parse_seq("ctrl-w").unwrap()), Resolution::Command(CommandId("close_buffer"))));
+    }
+
+    #[test]
+    fn every_preset_reaches_a_command_surface_by_keyboard() {
+        // D1+A5 live-sanity finding: with runtime switching, a preset without any
+        // keyboard route to the menu or palette strands keyboard-only users (no
+        // switch-back). Every preset must bind at least one of "menu" / "palette".
+        for preset in ["cua", "wordstar"] {
+            let surfaced = preset_bindings(preset).unwrap().iter()
+                .any(|(_, id)| *id == "menu" || *id == "palette");
+            assert!(surfaced, "{preset} must reach a command surface by keyboard");
+        }
     }
 
     #[test]
