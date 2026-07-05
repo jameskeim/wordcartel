@@ -4,7 +4,7 @@
 
 **Goal:** transforms format to `view.wrap_column` (default 72, the hardcode dies), the fixups baseline becomes the pinned `none,all,prose,markdown` stack, a Set Wrap Column minibuffer setter makes the width live and persisted, and contract pins freeze repar-1.0 behavior.
 
-**Architecture:** T1 rewires transform.rs (width capture before the branch, the fixups swap, the config default flip) and lands the four probe-grounded contract pins — with genuine RED evidence, since the ventilate and differentiation pins FAIL under today's stack. T2 adds the setter (one new `MinibufferKind` arm + one prompts submit fn + one registry command) and threads `wrap_column` through the Save Settings machinery per-field.
+**Architecture:** T1 rewires transform.rs (width capture before the branch, the fixups swap, the config default flip) and lands the probe-grounded pin battery — three genuinely RED (the ventilate prose-fix pin and both dispatch width pins) plus three green-from-birth contract pins guarding regression. T2 adds the setter (one new `MinibufferKind` arm + one prompts submit fn + one registry command) and threads `wrap_column` through the Save Settings machinery per-field.
 
 **Tech Stack:** Rust; shell crate only; repar 1.0.0 path dep (already locked); no new dependencies; no core changes.
 
@@ -35,7 +35,7 @@
 - Consumes: `editor.view_opts.wrap_column: u16` (exists); repar 1.0.0 (`Options::new().width(u32) -> PResult<Options>`, `apply_fixups(&str)`, verbs `"--reflow"`/`"--unwrap"`/`"--ventilate"`).
 - Produces: `dispatch_transform` reads the width internally — signature UNCHANGED, all 6 callers untouched; `run_transform(kind, input, width)` unchanged; `DEFAULT_REFLOW_WIDTH` GONE (T2 consumes nothing from T1).
 
-- [ ] **Step 1: the failing pins (genuine RED).** Add to transform.rs's test module (grounding §B literals verbatim — every expected string was probe-generated against the locked repar 1.0.0):
+- [ ] **Step 1: the pin battery (3 RED + 3 green-from-birth — Step 2 has the authoritative accounting).** Add to transform.rs's test module (grounding §B literals verbatim — every expected string was probe-generated against the locked repar 1.0.0):
 
 ```rust
     #[test]
