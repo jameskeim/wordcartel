@@ -13,8 +13,9 @@ pub struct BufferId(pub u64);
 /// What to do once a pending save completes successfully.
 /// `Quit` is the single-buffer save-then-quit; `ContinueQuitDrain` advances the
 /// multi-buffer quit state machine (Effort 6) after each buffer's save lands.
+/// `CloseBuffer { id }` closes the target buffer (C4 close-confirm path).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PostSaveAction { Quit, ContinueQuitDrain }
+pub enum PostSaveAction { Quit, ContinueQuitDrain, CloseBuffer { id: BufferId } }
 
 /// Effort 6 multi-buffer quit: how the drain disposes of each dirty buffer.
 /// `Copy` so `let mode = drain.mode;` copies out without holding a borrow on

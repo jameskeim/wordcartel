@@ -24,6 +24,12 @@ pub enum PromptAction {
     ReviewSave,
     /// Effort 6 review-each: discard the buffer under review, then continue the drain.
     ReviewDiscard,
+    /// C4 close-buffer: save the target, then close it. The id is captured at
+    /// raise time — background results can switch the active buffer under the
+    /// prompt, so resolve must never read active().
+    CloseSave { id: crate::editor::BufferId },
+    /// C4 close-buffer: close the target without saving (the swap survives).
+    CloseDiscard { id: crate::editor::BufferId },
 }
 
 #[derive(Clone, Debug)]
@@ -147,6 +153,18 @@ impl Prompt {
             ],
         }
     }
+
+    /// C4 close-confirm, raised when closing a dirty buffer (spec D1).
+    pub fn close_confirm(name: &str, id: crate::editor::BufferId) -> Prompt {
+        Prompt {
+            message: format!("close {name}: [S]ave & close · [D]iscard · [C]ancel"),
+            choices: vec![
+                Choice { key: 's', label: "Save & close", action: PromptAction::CloseSave { id } },
+                Choice { key: 'd', label: "Discard",      action: PromptAction::CloseDiscard { id } },
+                Choice { key: 'c', label: "Cancel",       action: PromptAction::Cancel },
+            ],
+        }
+    }
 }
 
 #[cfg(test)]
@@ -183,5 +201,15 @@ mod tests {
         assert_eq!(p.action_for('r'), Some(PromptAction::Recover));
         assert_eq!(p.action_for('d'), Some(PromptAction::DiscardSwap));
         assert_eq!(p.action_for('o'), Some(PromptAction::OpenOriginal));
+    }
+
+    #[test]
+    fn close_confirm_routes_keys_case_insensitively() {
+        let id = crate::editor::BufferId(7);
+        let p = Prompt::close_confirm("*a.md", id);
+        assert_eq!(p.action_for('S'), Some(PromptAction::CloseSave { id }));
+        assert_eq!(p.action_for('d'), Some(PromptAction::CloseDiscard { id }));
+        assert_eq!(p.action_for('C'), Some(PromptAction::Cancel));
+        assert_eq!(p.action_for('x'), None);
     }
 }

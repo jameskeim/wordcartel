@@ -91,34 +91,73 @@ pub fn open_as_new_buffer(editor: &mut Editor, path: &std::path::Path) {
     }
 }
 
-/// Close the active buffer. Scratch → no-op (status set). Dirty → REFUSED with a
-/// status (`"unsaved changes — save or discard first"`); the buffer is not closed and
-/// no interactive prompt is shown (a Save/Discard/Cancel-on-close flow is a planned
-/// follow-up, not yet implemented). Last ordinary buffer → replace with a fresh empty
-/// untitled. New active = same-index neighbor.
+/// Close the active buffer. Scratch → no-op (status set). Dirty → raise the
+/// Save/Discard/Cancel close-confirm prompt (C4) — unless another save/quit
+/// flow has pending state, in which case refuse with a status (the shared
+/// Cancel/Esc arms would clobber that flow's pendings — spec D1 busy guard).
+/// Clean → close immediately. Last ordinary buffer → replaced with a fresh
+/// empty untitled. New active = same-index neighbor.
 pub fn close_buffer(editor: &mut Editor) {
     let id = editor.active().id;
     if editor.is_scratch(id) { editor.status = "can't close the scratch buffer".into(); return; }
-    if editor.is_dirty(id) { editor.status = "unsaved changes — save or discard first".into(); return; }
+    if editor.is_dirty(id) {
+        if editor.pending_after_save.is_some() || editor.pending_save_as.is_some() || editor.quit_drain.is_some() {
+            editor.status = "another save or quit is in progress — try again".into();
+            return;
+        }
+        let name = buffer_display_name(editor, id);
+        editor.open_prompt(crate::prompt::Prompt::close_confirm(&name, id));
+        return;
+    }
+    close_buffer_now(editor, id);
+}
+
+/// Close `id` unconditionally (no dirty check) — the shared mechanics behind
+/// the clean-path close, the Discard arm, and the post-save close (spec D2).
+/// Per-case BY DESIGN: when `id` is not active, the viewer must not be yanked
+/// (no switch_to), and the last-ordinary replacement targets id's OWN slot —
+/// never buffers[active], which would overwrite the scratch and dangle
+/// scratch_id.
+pub(crate) fn close_buffer_now(editor: &mut Editor, id: BufferId) {
+    let Some(i) = editor.buffers.iter().position(|b| b.id == id) else {
+        editor.status = "buffer already closed".into();
+        return;
+    };
     let ordinary = editor.buffers.iter().filter(|b| !editor.is_scratch(b.id)).count();
     if ordinary <= 1 {
-        // Last ordinary buffer: replace in place with a fresh empty untitled.
+        // Last ordinary buffer: replace id's own slot with a fresh empty untitled.
         let nid = editor.alloc_id();
-        let area = editor.active().view.area;
-        let a = editor.active;
-        editor.buffers[a] = crate::editor::Buffer::from_text(nid, "\n", None, area);
+        let area = editor.buffers[i].view.area;
+        let was_active = i == editor.active;
+        editor.buffers[i] = crate::editor::Buffer::from_text(nid, "\n", None, area);
         editor.mru.retain(|&x| x != id);
-        editor.touch_mru(nid);
-        crate::derive::rebuild(editor);
-        crate::nav::ensure_visible(editor);
+        if was_active {
+            editor.touch_mru(nid);
+            crate::derive::rebuild(editor);
+            crate::nav::ensure_visible(editor);
+        } else {
+            // Untouched fresh buffer: back of the MRU, not most-recent (spec D2 —
+            // fronting it would break the weak MRU-front == active convention).
+            editor.mru.push(nid);
+        }
         editor.status = String::new();
         return;
     }
-    let a = editor.active;
-    editor.mru.retain(|&x| x != id);
-    editor.buffers.remove(a);
-    let new_idx = a.min(editor.buffers.len() - 1);
-    switch_to(editor, new_idx);
+    if i == editor.active {
+        editor.mru.retain(|&x| x != id);
+        editor.buffers.remove(i);
+        let new_idx = i.min(editor.buffers.len() - 1);
+        switch_to(editor, new_idx);
+    } else {
+        // The viewer stays put: remove id's slot, then re-point `active` by the
+        // previously-active buffer's ID (its index shifts down when i < active).
+        let active_id = editor.active().id;
+        editor.mru.retain(|&x| x != id);
+        editor.buffers.remove(i);
+        if let Some(na) = editor.buffers.iter().position(|b| b.id == active_id) {
+            editor.active = na;
+        }
+    }
     editor.status = String::new();
 }
 
@@ -314,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn close_refuses_dirty_buffer() {
+    fn close_dirty_raises_prompt() {
         use wordcartel_core::history::Clock;
         struct C(u64); impl Clock for C { fn now_ms(&self) -> u64 { self.0 } }
         let mut e = Editor::new_from_text("x\n", Some(std::path::PathBuf::from("/tmp/a.md")), (40, 10));
@@ -324,7 +363,78 @@ mod tests {
         let txn = wordcartel_core::history::Transaction::new(cs).with_selection(wordcartel_core::selection::Selection::single(1));
         e.by_id_mut(aid).unwrap().apply(txn, edit, wordcartel_core::history::EditKind::Other, &C(0));
         close_buffer(&mut e);
-        assert!(e.by_id(aid).is_some(), "dirty buffer not closed");
-        assert!(e.status.to_lowercase().contains("unsaved") || e.status.to_lowercase().contains("save"));
+        assert!(e.by_id(aid).is_some(), "dirty buffer not closed by the prompt raise");
+        let p = e.prompt.as_ref().expect("close-confirm prompt raised");
+        assert_eq!(p.action_for('s'), Some(crate::prompt::PromptAction::CloseSave { id: aid }));
+        assert_eq!(p.action_for('d'), Some(crate::prompt::PromptAction::CloseDiscard { id: aid }));
+        assert_eq!(p.action_for('c'), Some(crate::prompt::PromptAction::Cancel));
+    }
+
+    #[test]
+    fn close_dirty_refuses_while_flow_pending() {
+        use wordcartel_core::history::Clock;
+        struct C(u64); impl Clock for C { fn now_ms(&self) -> u64 { self.0 } }
+        let mut e = Editor::new_from_text("x\n", Some(std::path::PathBuf::from("/tmp/a.md")), (40, 10));
+        e.install_scratch();
+        let aid = e.active().id;
+        let (cs, edit) = crate::commands::build_multi_replace(&[(0, 0, "z".into())], 2);
+        let txn = wordcartel_core::history::Transaction::new(cs).with_selection(wordcartel_core::selection::Selection::single(1));
+        e.by_id_mut(aid).unwrap().apply(txn, edit, wordcartel_core::history::EditKind::Other, &C(0));
+        e.pending_after_save = Some(crate::editor::PendingAfterSave {
+            buffer_id: aid, version: 1, action: crate::editor::PostSaveAction::Quit, at_ms: 0,
+        });
+        close_buffer(&mut e);
+        assert!(e.prompt.is_none(), "busy guard: no prompt over pending state");
+        assert!(e.status.contains("in progress"), "refusal status set: {:?}", e.status);
+    }
+
+    #[test]
+    fn close_buffer_now_by_id_closes_inactive_buffer() {
+        // Three buffers incl. scratch; close a NON-active id → viewed buffer still active by ID, count drops.
+        let mut e = Editor::new_from_text("doc0\n", None, (40, 10));
+        e.install_scratch(); // [doc0(0), scratch(1)]
+        let doc0_id = e.buffers[0].id;
+        let doc1_id = e.alloc_id();
+        let area = e.active().view.area;
+        e.buffers.push(crate::editor::Buffer::from_text(doc1_id, "doc1\n", None, area)); // [doc0(0), scratch(1), doc1(2)]
+        e.mru.push(doc1_id);
+        assert_eq!(e.active().id, doc0_id, "precondition: doc0 active");
+        let before_id = e.active().id;
+        // Close doc1 (non-active, index 2)
+        close_buffer_now(&mut e, doc1_id);
+        assert_eq!(e.active().id, before_id, "viewed buffer still doc0 by id");
+        assert!(e.by_id(doc1_id).is_none(), "doc1 removed");
+        assert_eq!(e.buffers.len(), 2, "count drops");
+    }
+
+    #[test]
+    fn close_buffer_now_nonactive_normal_keeps_view() {
+        // Removing a slot BELOW the active index: editor.active re-pointed by id, viewed buffer unchanged.
+        let mut e = Editor::new_from_text("a\n", None, (40, 10));
+        e.install_scratch(); // [a(0), scratch(1)]
+        let a_id = e.buffers[0].id;
+        let b_id = e.alloc_id();
+        let area = e.active().view.area;
+        e.buffers.push(crate::editor::Buffer::from_text(b_id, "b\n", None, area)); // [a(0), scratch(1), b(2)]
+        e.mru.push(b_id);
+        e.active = 2; // view b
+        assert_eq!(e.active().id, b_id, "precondition: B is active");
+        // Close A (index 0, which is below the active index 2)
+        close_buffer_now(&mut e, a_id);
+        // After: [scratch(0), b(1)], active re-pointed to b's new index
+        assert_eq!(e.active().id, b_id, "viewed buffer unchanged by id");
+        assert!(e.by_id(a_id).is_none(), "A removed");
+        assert_eq!(e.buffers.len(), 2);
+    }
+
+    #[test]
+    fn close_buffer_now_vanished_id_is_noop_with_status() {
+        use crate::editor::BufferId;
+        let mut e = Editor::new_from_text("doc\n", None, (40, 10));
+        e.install_scratch();
+        let phantom = BufferId(9999);
+        close_buffer_now(&mut e, phantom);
+        assert_eq!(e.status, "buffer already closed");
+        assert_eq!(e.buffers.len(), 2, "buffer count unchanged");
     }
 }

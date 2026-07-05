@@ -134,6 +134,17 @@ pub fn resolve_prompt(
             crate::jobs_apply::drive_quit_drain(editor, ex, clock, msg_tx);
             return;
         }
+        PromptAction::CloseSave { id } => {
+            editor.prompt = None;
+            let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
+            crate::save::dispatch_save_then(&mut ctx, crate::editor::PostSaveAction::CloseBuffer { id });
+            return;
+        }
+        PromptAction::CloseDiscard { id } => {
+            editor.prompt = None;
+            crate::workspace::close_buffer_now(editor, id);
+            return;
+        }
         PromptAction::QuitAnyway => { editor.quit = true; }
         PromptAction::SaveAndQuit => {
             editor.prompt = None; // dismiss the quit-confirm modal first
@@ -410,5 +421,75 @@ mod tests {
         block_write_submit(&mut e, p.to_str().unwrap());
         assert_eq!(e.prompt.as_ref().unwrap().action_for('o'), Some(crate::prompt::PromptAction::OverwriteWriteBlock));
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn close_save_arms_pending_after_save_with_close_variant() {
+        // CloseSave for a named dirty buffer → pending_after_save armed with CloseBuffer{id}.
+        use crate::editor::{Editor, PostSaveAction};
+        use crate::jobs::InlineExecutor;
+        let p = std::env::temp_dir().join(format!("wc-close-save-{}.md", std::process::id()));
+        std::fs::write(&p, "old\n").unwrap();
+        let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = None; // dirty
+        let id = e.active().id;
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        resolve_prompt(crate::prompt::PromptAction::CloseSave { id }, &mut e, &ex, &clk, &tx);
+        let pas = e.pending_after_save.as_ref().expect("pending_after_save must be armed");
+        assert_eq!(pas.buffer_id, id);
+        assert_eq!(pas.version, 1);
+        assert!(matches!(pas.action, PostSaveAction::CloseBuffer { id: i } if i == id),
+            "action must be CloseBuffer{{id}}");
+        assert!(e.prompt.is_none(), "prompt dismissed");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn close_discard_closes_immediately_and_leaves_swap() {
+        // Decision 1 pin: Discard closes the buffer immediately, leaving the swap file intact.
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        let p = std::env::temp_dir().join(format!("wc-close-discard-{}.md", std::process::id()));
+        std::fs::write(&p, "on disk\n").unwrap();
+        let sp = crate::swap::swap_path(Some(p.as_path())).expect("swap path ok");
+        crate::swap::write_atomic(&sp, "stub swap content").expect("write stub swap");
+        assert!(sp.exists(), "precondition: swap file exists");
+        let mut e = Editor::new_from_text("draft\n", Some(p.clone()), (80, 24));
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = None; // dirty
+        let id = e.active().id;
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        resolve_prompt(crate::prompt::PromptAction::CloseDiscard { id }, &mut e, &ex, &clk, &tx);
+        // Buffer is gone (last ordinary → slot replaced with fresh untitled, old id absent)
+        assert!(e.by_id(id).is_none(), "discarded buffer is gone");
+        // Swap file must NOT be deleted by Discard (decision 1)
+        assert!(sp.exists(), "swap file survives Discard");
+        let _ = std::fs::remove_file(&sp);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn close_save_on_unnamed_buffer_opens_save_as_with_carry() {
+        // Unnamed dirty buffer: CloseSave opens the Save-As minibuffer and carries
+        // CloseBuffer into pending_save_as.
+        use crate::editor::{Editor, PostSaveAction};
+        use crate::jobs::InlineExecutor;
+        let mut e = Editor::new_from_text("draft\n", None, (80, 24));
+        e.active_mut().document.version = 1; // dirty
+        let id = e.active().id;
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        resolve_prompt(crate::prompt::PromptAction::CloseSave { id }, &mut e, &ex, &clk, &tx);
+        assert_eq!(e.minibuffer.as_ref().map(|m| m.kind),
+            Some(crate::minibuffer::MinibufferKind::SaveAs),
+            "Save-As minibuffer must open for unnamed buffer");
+        assert!(matches!(e.pending_save_as, Some(PostSaveAction::CloseBuffer { .. })),
+            "pending_save_as must carry CloseBuffer");
     }
 }
