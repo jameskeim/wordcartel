@@ -712,8 +712,10 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             frame.set_cursor_position(Position { x: area.x + caret_col, y: status_row });
         }
     } else if let Some((col, row)) = nav::screen_pos(editor) {
-        // Guard: only set if within the editing area (not into the status line).
-        if row < edit_height && col < tg.text_width {
+        // Guard rows; clamp cols — a caret on/after hung trailing whitespace sits
+        // logically past the text rect and pins at the edge (spec D2 clamp).
+        if row < edit_height && tg.text_width > 0 {
+            let col = col.min((tg.text_width as usize).saturating_sub(1) as u16);
             frame.set_cursor_position(Position { x: area.x + tg.text_left + col, y: edit_top + row });
         }
     }
@@ -1151,6 +1153,20 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| super::render(f, editor)).unwrap();
         term.backend().buffer().clone()
+    }
+
+    /// Same shape as render_to_buffer, but reads the backend cursor after draw.
+    /// Returns Some((x, y)) always — suppression shows as (0, 0) (the TestBackend
+    /// default), not as None.
+    fn render_capturing_cursor(e: &mut Editor, w: u16, h: u16) -> Option<(u16, u16)> {
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| super::render(f, e)).unwrap();
+        // TestBackend's INHERENT cursor_position() — no Backend trait import needed
+        // (Codex plan r1; the trait method get_cursor_position would need
+        // `use ratatui::backend::Backend`, which the test module does not import).
+        let p = term.backend().cursor_position();
+        Some((p.x, p.y))
     }
 
     fn row_string(buf: &ratatui::buffer::Buffer, row: u16) -> String {
@@ -1961,6 +1977,56 @@ mod tests {
             12,
             "click on the continuation glyph's painted cell selects that glyph"
         );
+    }
+
+    /// D2 clamp: a caret positioned after hung trailing whitespace (logical col ≥
+    /// text_width) must be pinned at text_width−1, not suppressed (which leaves the
+    /// terminal cursor at the TestBackend default (0, 0)).
+    #[test]
+    fn hung_trailing_space_caret_pins_at_edge() {
+        // vw 4: "abcd " hangs its trailing space (placed at col 4 == vw); the caret
+        // AFTER the space (byte 5, eol) maps to logical col 5 — past the text rect.
+        // Today's `col < text_width` guard suppresses the cursor entirely (invisible
+        // caret while typing "word "); the clamp pins it at text_width-1 (spec D2).
+        let mut e = Editor::new_from_text("abcd \n", None, (4, 8));
+        set_caret(&mut e, 5); // eol, after the hung space (active line — layout raw)
+        derive::rebuild(&mut e);
+        let (col, _row) = crate::nav::screen_pos(&e).expect("caret on screen");
+        assert!(col as usize >= 4, "precondition: logical col past the rect, got {col}");
+        let cur = render_capturing_cursor(&mut e, 4, 8);
+        let (x, _y) = cur.expect("helper returns Some; suppression shows as (0,0)");
+        assert_eq!(x, 3, "pinned at text_width-1 (text_left is 0 here)");
+    }
+
+    /// B1 × B2 headline composition: a two-level nested list item ("  - alpha beta")
+    /// in a 12-wide viewport renders with the bullet at the indent column and the
+    /// continuation row's text hanging under the text column, not the marker.
+    #[test]
+    fn wrapped_nested_item_bullet_column_and_hanging_indent() {
+        // The effort's headline composition (B1 × B2). 12-wide, "  - alpha beta":
+        // glyph "  • " (indent 2 + bullet 2 = prefix_width 4);
+        //   row 0: "  • alpha "  (bullet at col 2, text from col 4, space hangs ok)
+        //   row 1: "    beta"    (spacer cols 0..4, text at col 4 — under TEXT)
+        let mut e = Editor::new_from_text("  - alpha beta\nmore\n", None, (12, 8));
+        set_caret(&mut e, 17); // on "more" so line 0 is INACTIVE (conceal active)
+        derive::rebuild(&mut e);
+        {
+            let (_rows, map) = &e.active().view.line_layouts[&0];
+            assert_eq!(map.prefix_width, 4, "indent(2) + bullet(2)");
+            assert!(map.rows >= 2, "must wrap");
+        }
+        let buf = render_to_buffer(&mut e, 12, 8);
+        assert_eq!(buf[(2u16, 0u16)].symbol(), "\u{2022}", "bullet at indent col 2");
+        assert_eq!(buf[(4u16, 0u16)].symbol(), "a", "item text at col 4");
+        for c in 0..4u16 {
+            assert_eq!(buf[(c, 1u16)].symbol(), " ", "continuation spacer col {c}");
+        }
+        assert_eq!(buf[(4u16, 1u16)].symbol(), "b", "continuation hangs under TEXT");
+        // Round-trip on the continuation row: "beta" starts at byte 10 in the line.
+        let (_rows, map) = &e.active().view.line_layouts[&0];
+        let (vrow, vcol) = map.source_to_visual(10);
+        assert_eq!((vrow, vcol), (1, 4));
+        assert_eq!(map.visual_to_source(1, 4), 10);
     }
 
     /// Golden: fold marker `▸` glyph has DarkGray fg under Default theme.

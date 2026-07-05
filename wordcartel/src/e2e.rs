@@ -335,3 +335,59 @@ fn journey_palette_end_reaches_last_command() {
     assert!(scroll_after > scroll_before,
         "scroll_line_down must advance the viewport (before={scroll_before}, after={scroll_after})");
 }
+
+// ---------------------------------------------------------------------------
+// B1+B2 word-wrap journeys
+// ---------------------------------------------------------------------------
+
+/// B1 journey: typing past the viewport edge wraps at word boundaries — no
+/// row ends mid-word. End/Home/Up/Down navigate across the wrap without panic.
+#[test]
+fn journey_typing_never_breaks_midword() {
+    // 12-wide viewport; "the quick brown fox jumps over" wraps to 3 screen rows.
+    // With word-wrap: row 0 = "the quick " (10), row 1 = "brown fox " (10),
+    // row 2 = "jumps over" (10). The trailing spaces on rows 0-1 are the
+    // original inter-word spaces, not padding — "quick" and "brown" are on
+    // different rows, so "quick b" never appears as a contiguous run.
+    let mut h = Harness::new("", None, (12, 8));
+    h.type_str("the quick brown fox jumps over");
+    assert!(h.screen_contains("the quick"), "first two words on same row");
+    assert!(h.screen_contains("brown fox"), "second pair on same row");
+    assert!(h.screen_contains("jumps over"), "last pair on same row");
+    assert!(!h.screen_contains("quick b"), "quick and brown are NOT on the same row");
+
+    // Caret is on screen (on the last row, end of text).
+    let pos = crate::nav::screen_pos(&h.editor);
+    assert!(pos.is_some(), "caret must be on screen after typing");
+
+    // End/Home/Up/Down across the wrap — must not panic.
+    h.key(KeyCode::End);
+    h.key(KeyCode::Home);
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Down);
+    // Text still intact on screen after navigation.
+    assert!(h.screen_contains("the quick"), "text intact after navigation");
+}
+
+/// B1+B2 journey: a two-level nested list item that wraps renders the bullet at
+/// the indent column and the continuation text under the text column (hanging-indent).
+/// The ACTIVE line renders raw with no glyph (Fable plan I-2); the caret must be
+/// moved OFF the item line before asserting the bullet — Down navigates there.
+#[test]
+fn journey_nested_list_wraps_hanging() {
+    // 12-wide; "  - alpha beta" → prefix_width 4, "alpha" at col 4, "beta" wraps.
+    //   row 0: "  • alpha   " (bullet '•' at col 2, text col 4, space hangs)
+    //   row 1: "    beta    " (continuation: spacer cols 0..4, "beta" at col 4)
+    // Harness::new does a full parse → correct block tree; caret starts at byte 0
+    // (line 0, ACTIVE). Two Down presses cross the two visual rows of line 0 and
+    // land on "more" (line 1, active) → line 0 is now INACTIVE → glyph renders.
+    let mut h = Harness::new("  - alpha beta\nmore\n", None, (12, 8));
+    h.key(KeyCode::Down); // visual row 0 → visual row 1 (beta continuation)
+    h.key(KeyCode::Down); // visual row 1 → line 1 ("more")
+    // Bullet must appear at indent col 2 on the first screen row.
+    assert!(h.screen_contains("\u{2022} alpha"),
+        "bullet + item text on row 0:\n{:#?}", h.screen());
+    // Continuation row: four-space spacer then "beta" (text under text column).
+    assert!(h.screen_contains("    beta"),
+        "continuation at col 4 on row 1:\n{:#?}", h.screen());
+}

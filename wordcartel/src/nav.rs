@@ -1481,8 +1481,8 @@ mod tests {
     /// (active, caret there). text_width=8.
     ///   content_len("- \taaaa") = 7  →  7 ≤ 8  →  old shortcut fires, returns 1
     ///   content_len + prefix_width = 9 > 8  →  new check falls through to rows_of_line
-    ///   actual layout: prefix at cols 0-1, \t fills cols 2-5, "aaa" at 6-8 then
-    ///   the 4th 'a' wraps  →  2 rows
+    ///   actual layout: prefix at cols 0-1, \t fills cols 2-5; "aaaa" (4 wide)
+    ///   does not fit in the 2 remaining cols — word break follows the tab → 2 rows
     #[test]
     fn typewriter_rows_prefix_aware() {
         // Line 0: inactive list item with a tab that causes a real wrap.
