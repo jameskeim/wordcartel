@@ -265,7 +265,17 @@ paste arriving as input. **Direction (agreed 2026-06-28):** its own effort — `
 + passthrough wrapping, a `.tmux.conf` doc note, bracketed-paste handling, tested across
 terminal × tmux × SSH combos. Kept separate from multi-buffer work deliberately.
 
-### C4. Close-buffer Save/Discard/Cancel prompt — `needs-design` · Small-Medium (pre-triage deferred, pulled in 2026-07-04)
+### C4. Close-buffer Save/Discard/Cancel prompt — `SHIPPED` 2026-07-04
+
+**Shipped:** closing a dirty buffer raises `[S]ave & close · [D]iscard · [C]ancel` (the
+Effort 6 gap closed). Id-carrying prompt actions + `PostSaveAction::CloseBuffer{id}` ride
+the quit save machinery with its staleness discipline; a busy guard isolates the prompt
+from other flows' pending state; quit supersedes — and cancels — a pending close.
+**Conventions (user-ratified):** Discard LEAVES the swap (one discard convention with
+quit — reopening offers recovery); NO keybinding — ctrl-w is taken (`expand_selection`
+CUA / `scroll_line_up` WS), the binding decision moves to A5.
+
+*(Original entry below is historical.)*
 
 *(Effort 6 spec-conformance gap, deferral agreed 2026-06-28.)* `workspace::close_buffer`
 REFUSES to close a dirty buffer (status: `"unsaved changes — save or discard first"` — safe,
@@ -487,8 +497,8 @@ relocates what C4/D1/A5/E1 touch (split early = every later effort lands in focu
 B2's hanging indent is a wrap-policy feature (travels inside B1); A3's palette parts share
 A6's territory; E2's checkable items serve A5/E1; C2 and C3 are islands.
 
-*(Progress: 1 A6 ✓ shipped 2026-07-04 · 2 H1 ✓ shipped 2026-07-04 · 3 B1+B2 ✓ shipped
-2026-07-04 — **next: 4, C4**.)*
+*(Progress: 1 A6 ✓ · 2 H1 ✓ · 3 B1+B2 ✓ · 4 C4 ✓ — all shipped 2026-07-04 —
+**next: 5, C2 transform scope**.)*
 
 1. **A6** palette reachability — folds in A3(a) hints-verification + the palette-completeness
    invariant test (same territory). Kills the invisible-dispatch hazard first.
