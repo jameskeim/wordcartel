@@ -158,8 +158,9 @@ apply) — the same helper D2 mandates, so base and scoped application cannot di
 - **Layering:** inserted into `config_layer_paths` ABOVE the hand-written chain (XDG
   config, `.wordcartel.toml`) and BELOW `--config`. `--no-config` skips it like everything
   else. It contributes a layer like any other (including, in principle, a keymap patch —
-  but save_settings never writes one; only hand edits could put one there, and the file
-  header discourages hand edits).
+  but save_settings never writes one; only hand edits could put one there, the header
+  discourages hand edits, and a hand-added non-inventory key survives only until the
+  next save: the wholesale inventory-only rewrite drops it — Fable N-2).
 - **Baseline:** `load()` additionally returns (or exposes) the merged config WITHOUT the
   overrides layer — the baseline. Implementation shape: build the merge in two stages
   (hand chain + `--config` staged around the overrides layer — plan pins the exact
@@ -181,7 +182,13 @@ apply) — the same helper D2 mandates, so base and scoped application cannot di
   (2) runtime == baseline AND the existing overrides layer has K with the SAME value →
   KEEP it (saved intent persists even where a project baseline coincides with it);
   (3) runtime == baseline AND the existing overrides layer has K with a DIFFERENT value →
-  REMOVE it (the user actively changed the value back — the only un-save path);
+  REMOVE it (the user actively changed the value back — the only un-save path) — UNLESS
+  the `--config` layer itself sets K: then KEEP the existing override verbatim
+  (**mask-guard, user-ratified A, 2026-07-05, Fable N-1**: `--config` is the one layer
+  above the overrides, so a mask manufactures the coincidence+contradiction with no user
+  action — while K is masked, rule 3 never fires; rule 1 still applies, so a GENUINE
+  mid-masked-session change writes). Requires a third per-key snapshot of the `--config`
+  layer's inventory values (`MaskSnapshot`, sibling of the other two);
   (4) otherwise → absent.
   The overrides layer is already parsed in the chain; the loop keeps its raw inventory
   values (an `OverridesSnapshot`, sibling of the baseline snapshot). The result
@@ -224,8 +231,9 @@ apply) — the same helper D2 mandates, so base and scoped application cannot di
   exactly); minimal in the common case (values never saved and never diverged don't
   appear, so hand-config edits shine through); un-saving is explicit (rule 3 — change the
   value back and save); `--config` can MASK a saved key (overrides sit below it): the
-  save still reports "settings saved" and the key simply has no effect while that
-  `--config` is passed — recorded consequence, no warning in v1 (Fable M-4).
+  save still reports "settings saved", the key has no effect while that `--config` is
+  passed, and a masked save never removes it (rule 3's mask-guard) — recorded
+  consequence, no warning in v1 (Fable M-4/N-1).
 - Empty diff → the file is written with the header ONLY (never deleted — one write path,
   deterministic; an all-comments TOML parses to an empty layer, a no-op). Pinned by test.
 
@@ -258,7 +266,10 @@ Exactly the runtime-mutable set, keyed to their config sections:
   consumed by Enter; Esc-restore clears it and restores `original`. The diff writes
   `[theme] name` iff runtime identity is `Builtin(n)` AND baseline identity !=
   `Builtin(n)` — so a picker pick over a file theme persists even when the names collide,
-  and a never-touched file theme never writes. Idempotent across sessions by
+  and a never-touched file theme never writes. Rules 2/3 compare the provenance-typed key
+  the same way (Fable N-3): rule 2 KEEPS `[theme] name = n` iff the runtime identity is
+  `Builtin(n)`; an override name contradicting the runtime identity is rule-3-removed
+  (subject to the mask-guard). Idempotent across sessions by
   construction (next session: runtime identity `Builtin(n)` from the overrides layer,
   baseline still `File` → key persists on re-save).
 - NEVER persisted: `cycle_render_mode`'s per-buffer `RenderMode` (registry.rs:169 →
@@ -312,7 +323,9 @@ Exactly the runtime-mutable set, keyed to their config sections:
   a file theme with a COLLIDING name persists; untouched file theme writes nothing;
   un-diverged never-saved builtin writes nothing); the diff-law matrix (rules 1-4:
   write-on-divergence, keep-on-coincidence — the cross-project walkthrough with two
-  baselines, remove-on-contradiction, absent-otherwise).
+  baselines, remove-on-contradiction, absent-otherwise; the mask-guard: a --config layer
+  setting K → masked save keeps the override verbatim, and a genuine masked-session
+  divergence still writes).
 - **Behavior (app.rs):** switch command rebuilds the trie — the same chord (`ctrl-w`)
   resolves to `expand_selection` under cua and `scroll_line_up` after `keymap_wordstar`
   dispatch (through the real run-loop flag path or its testable seam); patches survive the
