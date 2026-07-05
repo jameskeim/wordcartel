@@ -145,9 +145,22 @@ full effort when prioritized.
 
 ## Theme B — rendering fidelity
 
-### B1. Word-boundary wrap — `needs-design` · Larger (highest-value rendering fix)
+### B1. Word-boundary wrap — `SHIPPED` 2026-07-04 (with B2, one effort)
 
-**Facts:** the soft-wrap is greedy PER-GRAPHEME (`layout.rs:261-292`): when
+**Shipped:** UAX #14 word-boundary soft-wrap (`unicode-linebreak` 0.1.5, wordcartel-core
+only): breaks computed on the VISIBLE grapheme sequence (mid-cluster offsets dropped);
+tail re-placement under a repeating overflow guard with grapheme fallback; trailing
+whitespace hangs at the edge (render caret clamps to the last text column); **fenced code
+blocks keep grapheme wrap byte-identical** (role exception, user decision — no config key).
+Laws: 3 amended composably, new W1/W2; strategy gained a bare combining-mark token.
+**Known accepted wart:** the crate implements Unicode 15.0 (pre-LB20a) — a word-initial
+hyphen (`-flag`) may wrap after the `-`; upstream is maintenance-only, revisit if it bites.
+
+*(Original facts/direction below are historical.)*
+
+**Facts (historical):**
+
+the soft-wrap was greedy PER-GRAPHEME (`layout.rs:261-292`): when
 `col + vg.width > vw` the overflowing grapheme moves to the next row — no word-boundary
 lookback/lookahead of any kind. Words break mid-word at the viewport edge.
 
@@ -158,7 +171,16 @@ bound-to-visible-rows rejection, it changes row break positions only). Should tr
 hanging indent (B2's companion). CJK/no-space text falls back to grapheme wrap. Pin with e2e
 Harness journeys (wrap + caret round-trip).
 
-### B2. Sub-list bullet indent (+ hanging indent) — `needs-design` · Medium-small
+### B2. Sub-list bullet indent (+ hanging indent) — `SHIPPED` 2026-07-04 (with B1)
+
+**Shipped:** the ListItem indent scan is tab-aware (spaces AND tabs) and MARKER-CONDITIONAL
+(continuation lines keep visible indent, no glyph); the indent conceals into the prefix
+glyph (`"  • "`, `"   2. "`, tab = 4 cols) so bullets paint at their indent level and
+wrapped items hang under their TEXT via the existing prefix-width reset — zero render
+changes. Blockquotes deliberately untouched. Bullet columns mirror SOURCE indent
+(CommonMark treats ≤3 spaces as the same level — deliberate source-faithfulness).
+
+*(Original facts below are historical.)*
 
 **Facts:** for `"  - sub"`, `apply_block_prefix_conceal` (`md_parse.rs:252-289`) conceals the
 marker + its space but the LEADING SPACES SURVIVE as visible graphemes, while the `"• "`
@@ -448,12 +470,25 @@ stability there; restructure only if a B-strong-class parser replacement ever ha
 - D1-a vs D1-b write-back (D1-b favored, not yet committed — settle at D1's brainstorm).
 - Dwell duration and reveal/grace timings (implementation tunables, not design forks).
 
+### H2. active_line clamps to the last content line at end-of-buffer — `noted` · Small
+
+*(Discovered during B1+B2's e2e work, 2026-07-04; pre-existing, verified at source.)*
+`derive.rs:217` computes the active line from `caret_byte.min(buf.len()-1)` — with a
+trailing newline and the caret at `buf.len()`, the LAST CONTENT line stays active (renders
+raw: no conceal, no glyph) even though the caret conceptually sits on the phantom line past
+the newline. Latent UX quirk (the just-typed final list item never shows its bullet until
+the caret moves up); orthogonal to wrap. Fix shape when picked up: treat caret==buf.len()
+after a trailing newline as "past the last line" for active-line purposes.
+
 ## Working order (recorded 2026-07-04 — dependency-derived, user-approved)
 
 Hard edges: E3 → E1/E2/E4; D1 carries A5; E2 rides E1; H1 before Effort P. Soft edges: H1
 relocates what C4/D1/A5/E1 touch (split early = every later effort lands in focused files);
 B2's hanging indent is a wrap-policy feature (travels inside B1); A3's palette parts share
 A6's territory; E2's checkable items serve A5/E1; C2 and C3 are islands.
+
+*(Progress: 1 A6 ✓ shipped 2026-07-04 · 2 H1 ✓ shipped 2026-07-04 · 3 B1+B2 ✓ shipped
+2026-07-04 — **next: 4, C4**.)*
 
 1. **A6** palette reachability — folds in A3(a) hints-verification + the palette-completeness
    invariant test (same territory). Kills the invisible-dispatch hazard first.
