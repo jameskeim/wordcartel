@@ -12,6 +12,11 @@ pub struct ThemePicker {
     pub scroll_top: usize,
     /// The theme active when the picker opened — restored on Esc (preview cancel).
     pub original: Theme,
+    /// The builtin name most recently applied via preview_selected_theme — the
+    /// single funnel for the identity threading. `None` until a preview fires;
+    /// consumed (take()) by the Enter arm to commit the identity; drops with the
+    /// picker struct on Esc (restoring the original already clears it implicitly).
+    pub previewed: Option<String>,
 }
 
 /// Rebuild rows from the built-in theme list, filtered by `query` (case-insensitive
@@ -34,7 +39,7 @@ mod tests {
     #[test]
     fn rebuild_rows_filters_builtins() {
         let mut tp = ThemePicker { query: String::new(), selected: 0, rows: vec![],
-            scroll_top: 0, original: wordcartel_core::theme::default() };
+            scroll_top: 0, original: wordcartel_core::theme::default(), previewed: None };
         rebuild_rows(&mut tp);
         assert!(tp.rows.iter().any(|r| r == "tokyo-night"));
         assert!(tp.rows.len() >= 13);

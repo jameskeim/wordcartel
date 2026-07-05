@@ -7,7 +7,7 @@ use crossterm::event::Event;
 #[cfg(test)]
 use crossterm::event::KeyEvent;
 
-use crate::{commands, config, derive, editor::Editor, file, keymap, render, term};
+use crate::{commands, config, derive, editor::Editor, file, keymap, render, settings, term};
 #[cfg(test)]
 use crate::input;
 use crate::jobs::{Executor, JobOutcome};
@@ -186,12 +186,41 @@ pub fn menu_select_for_test(
     dispatch_overlay_command(editor, reg, &keymap, ex, clock, msg_tx, id);
 }
 
-/// Apply the theme-picker's currently-selected built-in as a live preview.
+/// Honor a requested keymap rebuild (spec D2). Returns the new trie for the caller to
+/// swap into its loop-local. A half-typed prefix must not complete against the new base
+/// (spec I-3): the buffer drops, and the status clears ONLY when it is the pending "…"
+/// prompt — a switch status set in the same reduce must survive to the draw.
+pub(crate) fn rebuild_keymap_if_requested(
+    editor: &mut crate::editor::Editor,
+    patches: &[crate::config::KeymapPatch],
+    reg: &crate::registry::Registry,
+) -> Option<crate::keymap::KeyTrie> {
+    if !editor.keymap_rebuild { return None; }
+    editor.keymap_rebuild = false;
+    let (trie, kw) = crate::keymap::build_keymap(&crate::config::KeymapConfig {
+        preset: editor.active_keymap_preset.clone(),
+        patches: patches.to_vec(),
+    }, reg);
+    if !editor.pending_keys.is_empty() {
+        editor.pending_keys.clear();
+        if editor.status.ends_with('…') { editor.status.clear(); }
+    }
+    if let Some(w) = kw.first() { editor.status = w.clone(); }
+    Some(trie)
+}
+
+/// Apply the theme-picker's currently-selected built-in as a live preview and
+/// record the name in `tp.previewed` — the single funnel for identity threading.
 /// `pub(crate)` so mouse.rs can call it after a wheel-scroll selection change.
 pub(crate) fn preview_selected_theme(editor: &mut crate::editor::Editor) {
+    // Read the name first (drops the borrow), then apply, then set the field.
     let name = editor.theme_picker.as_ref().and_then(|tp| tp.rows.get(tp.selected).cloned());
     if let Some(name) = name {
-        if let Some(theme) = wordcartel_core::theme::Theme::builtin(&name) { editor.apply_theme(theme); }
+        if let Some(theme) = wordcartel_core::theme::Theme::builtin(&name) {
+            editor.apply_theme(theme);
+            // name still owned — `theme` did not borrow it; safe to re-borrow tp.
+            if let Some(tp) = editor.theme_picker.as_mut() { tp.previewed = Some(name); }
+        }
     }
 }
 
@@ -466,7 +495,13 @@ pub fn reduce(
                         // cancel preview → restore the theme active when we opened.
                         if let Some(tp) = editor.theme_picker.take() { editor.apply_theme(tp.original); }
                     }
-                    KeyCode::Enter => { editor.theme_picker = None; } // keep current preview
+                    KeyCode::Enter => {
+                        if let Some(tp) = editor.theme_picker.take() {
+                            if let Some(n) = tp.previewed {
+                                editor.theme_identity = crate::settings::ThemeIdentity::Builtin(n);
+                            } // untouched open→Enter: no preview applied, identity unchanged (spec I-1)
+                        }
+                    }
                     KeyCode::Up => {
                         let ah = editor.active().view.area.1;
                         if let Some(tp) = editor.theme_picker.as_mut() {
@@ -1186,8 +1221,25 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
     let xdg = dirs::config_dir();
-    let paths = config::config_layer_paths(&cli, xdg.as_deref(), &anchor);
-    let (cfg, mut warns) = config::load(&paths);
+    let hand_paths = config::config_layer_paths(&cli, xdg.as_deref(), &anchor);
+    // The overrides layer: ABOVE the hand chain, BELOW --config (spec D3). --no-config
+    // empties hand_paths and skips the overrides too (config_layer_paths returned early).
+    let overrides_path = xdg.as_ref()
+        .map(|x| x.join("wordcartel").join("settings-overrides.toml"));
+    let mut all_paths = hand_paths.clone();
+    if !cli.no_config {
+        if let Some(op) = overrides_path.as_ref().filter(|p| p.is_file()) {
+            // Race-free: derive from what config_layer_paths ACTUALLY pushed, not a re-stat
+            // (Fable plan M3). The is_some() guard kills the None == None arm — an EMPTY
+            // hand chain (no XDG config, no project file, no --config: the headline
+            // save-once-then-relaunch flow) must append, not underflow (Fable r2 Critical).
+            let has_cli_cfg = cli.config_path.is_some() && hand_paths.last() == cli.config_path.as_ref();
+            let idx = if has_cli_cfg { all_paths.len() - 1 } else { all_paths.len() };
+            all_paths.insert(idx, op.clone());
+        }
+    }
+    let (baseline_cfg, _baseline_warns) = config::load(&hand_paths); // WITHOUT overrides
+    let (cfg, mut warns) = config::load(&all_paths);                  // production config
     if let Some(c) = &cli.config_path {
         if !c.is_file() {
             warns.push(format!("config: --config path not found: {}", c.display()));
@@ -1253,6 +1305,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     } else {
         cfg.menu.bar
     };
+    editor.active_keymap_preset = keymap::resolve_preset(&cfg.keymap.preset).to_string();
     // Resolve and seed the active theme + color depth (once, at startup — §3.6).
     let env = crate::theme_resolve::EnvSnapshot::from_env();
     let resolved = crate::theme_resolve::resolve_theme(&cfg.theme, &env);
@@ -1260,6 +1313,30 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     editor.depth = resolved.depth;
     editor.heading_glyph_cfg = cfg.theme.heading_level_glyph; // for runtime picker switches (Task 7)
     warns.extend(resolved.warnings); // join the existing startup warning stream
+
+    // D1+A5 Task 4: baseline resolve (WITHOUT the overrides layer) + three snapshots.
+    // baseline_cfg was loaded above from hand_paths only; the overrides file is NOT in it.
+    let baseline_resolved = crate::theme_resolve::resolve_theme(&baseline_cfg.theme, &env);
+    let baseline_snapshot = settings::snapshot_of(&baseline_cfg, &baseline_resolved.theme.name);
+    // Overrides snapshot: the current machine-owned file (all-absent when the file doesn't exist).
+    let mut overrides_snapshot = overrides_path.as_ref()
+        .filter(|p| p.is_file())
+        .map(|p| std::fs::read_to_string(p)
+            .map(|s| settings::parse_overrides(&s))
+            .unwrap_or_default())
+        .unwrap_or_default();
+    // Mask snapshot: parse the --config layer via parse_mask so theme provenance is
+    // collapsed at load time (file vs name are indistinguishable for the guard).
+    let mask_snapshot = cli.config_path.as_ref()
+        .filter(|c| c.is_file())
+        .map(|c| std::fs::read_to_string(c)
+            .map(|s| settings::parse_mask(&s))
+            .unwrap_or_default())
+        .unwrap_or_default();
+    // Seed theme_identity from the MERGED config's provenance — an overrides/hand `name`
+    // wins over `file` per theme_identity_of's rule; use editor.theme.name since resolved.theme
+    // was already moved into the editor above.
+    editor.theme_identity = settings::theme_identity_of(&cfg.theme, &editor.theme.name);
 
     // Load the personal dictionary from disk (missing/unreadable → empty; no abort).
     if let Some(dict_path) = &cfg.diagnostics.dictionary {
@@ -1330,8 +1407,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     }
     // Take the keymap out of editor into a loop-local to avoid a simultaneous
     // &mut editor / &editor.keymap borrow conflict when calling reduce.
-    // (The keymap doesn't change during the loop in v1.)
-    let keymap = std::mem::take(&mut editor.keymap);
+    let mut keymap = std::mem::take(&mut editor.keymap);
     let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Msg>();
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
     let executor = crate::jobs::ThreadExecutor::new(wake_tx);
@@ -1471,6 +1547,18 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         }
         let (pre_id, pre_version) = { let b = editor.active(); (b.id, b.document.version) };
         let keep = reduce(msg, &mut editor, &reg, &keymap, &executor, &clock, &msg_tx);
+        if let Some(t) = rebuild_keymap_if_requested(&mut editor, &cfg.keymap.patches, &reg) {
+            keymap = t;
+        }
+        if editor.settings_save_requested {
+            editor.settings_save_requested = false;
+            if let Some(of) = settings::perform_settings_save(
+                &mut editor, cli.no_config, overrides_path.as_deref(),
+                &baseline_snapshot, &overrides_snapshot, &mask_snapshot, &crate::fsx::RealFs)
+            {
+                overrides_snapshot = of; // second-save correctness — replace our copy
+            }
+        }
         editor.note_undo_eviction(pre_id, pre_version);
         crate::clipboard::drain_clipboard_intents(&mut editor, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
         reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
@@ -3126,7 +3214,7 @@ mod tests {
         // bind a 2-key save sequence
         let cfg = crate::config::KeymapConfig { preset: "cua".into(),
             patches: vec![crate::config::KeymapPatch {
-                bind: [("ctrl-k ctrl-s".to_string(), "save".to_string())].into_iter().collect(), unbind: vec![] }] };
+                bind: [("ctrl-k ctrl-s".to_string(), "save".to_string())].into_iter().collect(), unbind: vec![], ..Default::default() }] };
         let (km, _) = crate::keymap::build_keymap(&cfg, &Registry::builtins());
         let mut e = Editor::new_from_text("x\n", Some("/tmp/wc-kmtest.md".into()), (80, 24));
         let (tx,_rx)=std::sync::mpsc::channel();
@@ -3145,7 +3233,7 @@ mod tests {
         use crossterm::event::{KeyCode, KeyModifiers};
         let cfg = crate::config::KeymapConfig { preset: "cua".into(),
             patches: vec![crate::config::KeymapPatch {
-                bind: [("ctrl-k ctrl-s".to_string(), "save".to_string())].into_iter().collect(), unbind: vec![] }] };
+                bind: [("ctrl-k ctrl-s".to_string(), "save".to_string())].into_iter().collect(), unbind: vec![], ..Default::default() }] };
         let (km, _) = crate::keymap::build_keymap(&cfg, &Registry::builtins());
         let mut e = Editor::new_from_text("abc\n", None, (80, 24));
         let before = e.active().document.buffer.to_string();
@@ -3167,6 +3255,7 @@ mod tests {
             patches: vec![crate::config::KeymapPatch {
                 bind: [("ctrl-g".to_string(), "move_line_start".to_string())].into_iter().collect(),
                 unbind: vec![],
+                ..Default::default()
             }],
         };
         let (km, warns) = crate::keymap::build_keymap(&cfg, &crate::registry::Registry::builtins());
@@ -4521,6 +4610,60 @@ mod tests {
             "applied theme must equal tp.rows[selected]={expected_name:?}, got {:?}", e.theme.name);
     }
 
+    // -----------------------------------------------------------------------
+    // Task 3 (D1+A5): picker Enter commits theme_identity; untouched picker does not
+    // -----------------------------------------------------------------------
+
+    /// Open the picker via the `theme` command dispatch, immediately Enter without
+    /// sending any navigation keys — no preview fired, so `previewed` is None;
+    /// `theme_identity` must stay at the initial Builtin("default").
+    #[test]
+    fn untouched_picker_enter_leaves_theme_identity_unchanged() {
+        use crate::registry::{Registry, CommandId, Ctx};
+        use crate::jobs::InlineExecutor;
+        use wordcartel_core::history::Clock;
+        struct Z; impl Clock for Z { fn now_ms(&self) -> u64 { 0 } }
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        let reg = Registry::builtins(); let km = cua_keymap();
+        let ex = InlineExecutor::default(); let clk = Z;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        // Open via the `theme` command dispatch — same path as the real menu.
+        { let tx2 = tx.clone(); let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx2 };
+          reg.dispatch(CommandId("theme"), &mut ctx); }
+        assert!(e.theme_picker.is_some(), "precondition: picker must be open");
+        // Enter immediately — no Down/Up, so previewed is None.
+        crate::app::reduce(press(KeyCode::Enter, KeyModifiers::NONE), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.theme_picker.is_none(), "picker must be closed after Enter");
+        assert_eq!(e.theme_identity,
+            crate::settings::ThemeIdentity::Builtin("default".into()),
+            "untouched Enter must leave theme_identity unchanged (spec I-1)");
+    }
+
+    /// Open the picker, send Down once through reduce (preview funnel fires for
+    /// rows[1]), then Enter — `theme_identity` must become `Builtin(rows[1])`.
+    #[test]
+    fn previewed_picker_enter_sets_builtin_identity() {
+        use crate::registry::Registry;
+        use crate::jobs::InlineExecutor;
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_theme_picker();
+        let reg = Registry::builtins(); let km = cua_keymap();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        // Down once: selected moves from 0 → 1; preview funnel fires for rows[1].
+        crate::app::reduce(press(KeyCode::Down, KeyModifiers::NONE), &mut e, &reg, &km, &ex, &clk, &tx);
+        // Capture the name that was previewed before Enter closes the picker.
+        let second_row = e.theme_picker.as_ref().unwrap().rows[1].clone();
+        // Enter: consumes previewed, sets theme_identity.
+        crate::app::reduce(press(KeyCode::Enter, KeyModifiers::NONE), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.theme_picker.is_none(), "picker closed after Enter");
+        assert_eq!(e.theme_identity,
+            crate::settings::ThemeIdentity::Builtin(second_row.clone()),
+            "Enter must commit Builtin({second_row:?}) from the previewed row");
+    }
+
     /// The arm block (post-rebuild) sets `due_at` once and does not push the
     /// deadline on idle Ticks; a new edit (version bump) re-arms the debounce.
     #[test]
@@ -4701,5 +4844,114 @@ mod tests {
 
         assert_eq!(e.status, "can't close the scratch buffer");
         assert!(e.prompt.is_none(), "scratch guard must NOT raise a prompt");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 2 (D1+A5): runtime keymap switching
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn keymap_switch_command_sets_preset_and_rebuild_flag() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::{Registry, CommandId};
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        reg.dispatch(CommandId("keymap_wordstar"), &mut ctx);
+        assert_eq!(e.active_keymap_preset, "wordstar");
+        assert!(e.keymap_rebuild, "switch requests a rebuild");
+        assert_eq!(e.status, "keymap: wordstar");
+    }
+
+    #[test]
+    fn keymap_switch_is_idempotent_with_status() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::{Registry, CommandId};
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        reg.dispatch(CommandId("keymap_cua"), &mut ctx); // cua is already active
+        assert!(!e.keymap_rebuild, "idempotent switch must not request a rebuild");
+        assert_eq!(e.status, "keymap: cua (already active)");
+    }
+
+    #[test]
+    fn switch_status_survives_the_rebuild() {
+        // Fable plan C1: the rebuild must NOT wipe the switch status set in the same
+        // reduce (no pending prefix in play → status untouched by the helper).
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        let reg = crate::registry::Registry::builtins();
+        e.active_keymap_preset = "wordstar".into();
+        e.keymap_rebuild = true;
+        e.status = "keymap: wordstar".into();
+        let t = crate::app::rebuild_keymap_if_requested(&mut e, &[], &reg);
+        assert!(t.is_some());
+        assert_eq!(e.status, "keymap: wordstar", "the pinned switch copy reaches the draw");
+    }
+
+    #[test]
+    fn patches_survive_the_switch() {
+        // Fable plan I3(c): a GLOBAL patch bind holds under both bases through the
+        // real helper (the same patch slice run() passes from cfg.keymap.patches).
+        use crate::keymap::{parse_seq, Resolution};
+        let patches = vec![crate::config::KeymapPatch {
+            bind: [("ctrl-g".to_string(), "copy".to_string())].into(),
+            ..Default::default() }];
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        let reg = crate::registry::Registry::builtins();
+        e.active_keymap_preset = "wordstar".into();
+        e.keymap_rebuild = true;
+        let t = crate::app::rebuild_keymap_if_requested(&mut e, &patches, &reg).unwrap();
+        let g = parse_seq("ctrl-g").unwrap();
+        assert!(matches!(t.resolve(&g), Resolution::Command(crate::registry::CommandId("copy"))),
+            "the global patch rides onto the new base");
+    }
+
+    #[test]
+    fn rebuild_seam_swaps_the_trie_and_clears_pending() {
+        // Manual seam: seed pending_keys with ctrl-k (Pending under BOTH presets), set the
+        // flag via dispatch, then run the same rebuild the loop runs; assert ctrl-w resolves
+        // to scroll_line_up afterward and pending_keys is EMPTY (spec I-3).
+        use crate::keymap::{parse_seq, Resolution};
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        let reg = crate::registry::Registry::builtins();
+        e.pending_keys = parse_seq("ctrl-k").unwrap();
+        e.status = "ctrl-k \u{2026}".into();
+        e.active_keymap_preset = "wordstar".into();
+        e.keymap_rebuild = true;
+        // The REAL production helper — the test proves run()'s code, not a copy (Fable I4).
+        let mut keymap = cua_keymap();
+        if let Some(t) = crate::app::rebuild_keymap_if_requested(&mut e, &[], &reg) {
+            keymap = t;
+        }
+        assert!(e.pending_keys.is_empty(), "pending prefix must not survive the rebuild");
+        assert!(e.status.is_empty(), "the pending '…' prompt is cleared");
+        let cw = parse_seq("ctrl-w").unwrap();
+        assert!(matches!(keymap.resolve(&cw), Resolution::Command(crate::registry::CommandId("scroll_line_up"))));
+    }
+
+    // D1+A5 Task 4 — save_settings command sets the request flag -----------------
+
+    #[test]
+    fn save_settings_command_sets_the_request_flag() {
+        // Dispatch save_settings through the real registry and assert the flag is set.
+        // (The actual write happens in perform_settings_save; this pin guards the flag path.)
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::registry::{Registry, CommandId};
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        assert!(!e.settings_save_requested, "flag must start false");
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        {
+            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+            reg.dispatch(CommandId("save_settings"), &mut ctx);
+        }
+        assert!(e.settings_save_requested,
+            "save_settings must set settings_save_requested");
     }
 }

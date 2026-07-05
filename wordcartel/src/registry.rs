@@ -36,10 +36,10 @@ pub type Handler = fn(&mut Ctx) -> CommandResult;
 // ── Command metadata ──────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MenuCategory { File, Edit, Format, View, Export }
+pub enum MenuCategory { File, Edit, Format, View, Settings, Export }
 
-pub const MENU_ORDER: [MenuCategory; 5] =
-    [MenuCategory::File, MenuCategory::Edit, MenuCategory::Format, MenuCategory::View, MenuCategory::Export];
+pub const MENU_ORDER: [MenuCategory; 6] =
+    [MenuCategory::File, MenuCategory::Edit, MenuCategory::Format, MenuCategory::View, MenuCategory::Settings, MenuCategory::Export];
 
 #[derive(Clone, Copy)]
 pub struct CommandMeta {
@@ -459,6 +459,20 @@ impl Registry {
         r.register("scroll_line_up",   "Scroll Line Up",   None, |c| { crate::nav::scroll_line_up(c.editor);   CommandResult::Handled });
         r.register("scroll_line_down", "Scroll Line Down", None, |c| { crate::nav::scroll_line_down(c.editor); CommandResult::Handled });
 
+        // Settings menu — runtime keymap preset switching (D1+A5).
+        r.register("keymap_cua", "Keymap: CUA", Some(MenuCategory::Settings), |c| {
+            switch_keymap_preset(c.editor, "cua");
+            CommandResult::Handled
+        });
+        r.register("keymap_wordstar", "Keymap: WordStar", Some(MenuCategory::Settings), |c| {
+            switch_keymap_preset(c.editor, "wordstar");
+            CommandResult::Handled
+        });
+        r.register("save_settings", "Save Settings", Some(MenuCategory::Settings), |c| {
+            c.editor.settings_save_requested = true;
+            CommandResult::Handled
+        });
+
         r
     }
 
@@ -492,6 +506,18 @@ impl Registry {
     pub fn commands(&self) -> impl Iterator<Item = (CommandId, &CommandMeta)> {
         self.entries.iter().map(|e| (e.id, &e.meta))
     }
+}
+
+/// Request a keymap preset switch: no-op with a status when already active; else set the
+/// preset and the rebuild flag — the run loop swaps the trie between reduces (spec D2).
+fn switch_keymap_preset(editor: &mut crate::editor::Editor, preset: &str) {
+    if editor.active_keymap_preset == preset {
+        editor.status = format!("keymap: {preset} (already active)");
+        return;
+    }
+    editor.active_keymap_preset = preset.to_string();
+    editor.keymap_rebuild = true;
+    editor.status = format!("keymap: {preset}");
 }
 
 /// Thin adapter: run a built-in `Command` against the Ctx's editor+clock.
@@ -680,6 +706,24 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for (id, _) in reg.commands() {
             assert!(seen.insert(id.0), "duplicate command id: {}", id.0);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 2 (D1+A5): Settings menu keymap commands
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn settings_commands_registered_in_settings_category() {
+        let reg = Registry::builtins();
+        for (id, label) in [
+            ("keymap_cua",      "Keymap: CUA"),
+            ("keymap_wordstar", "Keymap: WordStar"),
+            ("save_settings",   "Save Settings"),
+        ] {
+            let m = reg.meta(CommandId(id)).unwrap_or_else(|| panic!("missing {id}"));
+            assert_eq!(m.label, label, "label mismatch for {id}");
+            assert_eq!(m.menu, Some(MenuCategory::Settings), "menu category mismatch for {id}");
         }
     }
 

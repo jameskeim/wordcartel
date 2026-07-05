@@ -307,8 +307,8 @@ fn check_output_size(out: String) -> Result<String, TransformError> {
 
 /// Run a repar transform over `input`, markdown-aware. Pure (no IO).
 pub fn run_transform(kind: TransformKind, input: &str, width: u32) -> Result<String, TransformError> {
-    let mut opts = repar::Options::new().width(width);
-    // apply_par_args takes &mut self and returns PResult<()> — not chainable.
+    // repar ≥1.0: the builder chain returns Result<Options,ParError>; unwrap before calling methods.
+    let mut opts = repar::Options::new().width(width).map_err(TransformError::from_repar)?;
     opts.apply_par_args([kind.verb()]).map_err(TransformError::from_repar)?;
     opts.apply_fixups("markdown").map_err(TransformError::from_repar)?; // Compat::MARKDOWN
     let out = opts.format(input).map_err(TransformError::from_repar)?;

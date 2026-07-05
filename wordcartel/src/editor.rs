@@ -379,6 +379,11 @@ pub struct Editor {
     pub clipboard_notice_shown: bool,
     pub pending_keys: Vec<crate::keymap::KeyChord>,
     pub keymap: crate::keymap::KeyTrie,
+    /// The resolved preset name currently driving the loop-local keymap trie ("cua" or "wordstar").
+    /// Seeded from config at startup; mutated by keymap_cua/keymap_wordstar commands.
+    pub active_keymap_preset: String,
+    /// Set by keymap switch commands; consumed by rebuild_keymap_if_requested after each reduce.
+    pub keymap_rebuild: bool,
     pub palette: Option<crate::palette::Palette>,
     pub menu: Option<crate::menu::MenuView>,
     /// Whether mouse capture is currently requested (toggled by `toggle_mouse_capture`).
@@ -430,6 +435,14 @@ pub struct Editor {
     /// Effort 6: set by `apply_result`'s ContinueQuitDrain arm to ask the JobDone
     /// funnel (`apply_job_result`) to re-drive the drain once the save merge lands.
     pub quit_drain_advance: bool,
+    /// Set by the `save_settings` command; consumed by Task 4's perform_settings_save
+    /// hook in the run loop. Cleared after processing.
+    pub settings_save_requested: bool,
+    /// Provenance of the currently-active theme. Seeded from the default theme at
+    /// startup; updated by the theme picker's Enter arm on confirmed selection, and
+    /// by the run() startup path after theme resolution. Used by the diff law's
+    /// rule-1 comparison (spec N-3: Builtin vs File is always a divergence).
+    pub theme_identity: crate::settings::ThemeIdentity,
 }
 
 const UNDO_EVICTED_HINT: &str = "Undo history full — oldest dropped";
@@ -452,6 +465,8 @@ impl Editor {
             clipboard_sync_request: None, clipboard_get_pending: None, clipboard_notice_shown: false,
             pending_keys: Vec::new(),
             keymap,
+            active_keymap_preset: "cua".into(),
+            keymap_rebuild: false,
             palette: None,
             menu: None,
             mouse_capture: true,
@@ -476,6 +491,8 @@ impl Editor {
             mru: Vec::new(),
             quit_drain: None,
             quit_drain_advance: false,
+            settings_save_requested: false,
+            theme_identity: crate::settings::ThemeIdentity::Builtin("default".into()),
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer::from_text(id, text, path, area));
@@ -675,7 +692,7 @@ impl Editor {
         self.file_browser = None;
         self.theme_picker = Some(crate::theme_picker::ThemePicker {
             query: String::new(), selected: 0, rows: Vec::new(),
-            scroll_top: 0, original: self.theme.clone(),
+            scroll_top: 0, original: self.theme.clone(), previewed: None,
         });
         if let Some(tp) = self.theme_picker.as_mut() { crate::theme_picker::rebuild_rows(tp); }
     }

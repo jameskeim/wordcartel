@@ -145,6 +145,17 @@ impl Default for KeymapConfig {
 pub struct KeymapPatch {
     pub bind: BTreeMap<String, String>,
     pub unbind: Vec<String>,
+    pub cua: Option<ScopedPatch>,
+    pub wordstar: Option<ScopedPatch>,
+}
+
+/// Per-preset binding overrides, captured from a `[keymap.<preset>]` sub-table.
+/// Within a patch layer, these are applied AFTER the layer's global `bind`/`unbind`,
+/// so a scoped entry beats a global entry in the same layer ("specific wins").
+#[derive(Debug, Clone, Default)]
+pub struct ScopedPatch {
+    pub bind: BTreeMap<String, String>,
+    pub unbind: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +223,18 @@ struct RawDiagnostics {
 #[serde(default)]
 struct RawKeymap {
     preset: Option<String>,
+    bind: BTreeMap<String, String>,
+    unbind: Vec<String>,
+    /// NOTE: once a [keymap.cua] header appears, [keymap]-intended keys typed below it
+    /// silently belong to the scoped table (TOML section semantics).
+    cua: Option<RawScoped>,
+    /// NOTE: once a [keymap.wordstar] header appears, [keymap]-intended keys typed below it
+    /// silently belong to the scoped table (TOML section semantics).
+    wordstar: Option<RawScoped>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawScoped {
     bind: BTreeMap<String, String>,
     unbind: Vec<String>,
 }
@@ -314,6 +337,8 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
         cfg.keymap.patches.push(KeymapPatch {
             bind: raw.keymap.bind,
             unbind: raw.keymap.unbind,
+            cua: raw.keymap.cua.map(|s| ScopedPatch { bind: s.bind, unbind: s.unbind }),
+            wordstar: raw.keymap.wordstar.map(|s| ScopedPatch { bind: s.bind, unbind: s.unbind }),
         });
         // state: per-field override (omitted field inherits the lower layer).
         if let Some(r) = raw.state.resume {
@@ -723,6 +748,107 @@ mod tests {
         assert_eq!(cfg.menu.bar, MenuBarMode::Auto, "bogus value → stays Auto");
         assert!(warns.iter().any(|w| w.contains("menu.bar")),
             "must warn containing 'menu.bar'; got: {warns:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 1 (D1+A5): preset-scoped keymap patches
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scoped_keymap_tables_parse_into_named_fields() {
+        let d = tempdir();
+        let p = write(&d, "s.toml",
+            "[keymap]\npreset='cua'\nbind={ \"ctrl-g\"='goto_line' }\n[keymap.cua]\nbind={ \"ctrl-w\"='close_buffer' }\n[keymap.wordstar]\nunbind=[\"ctrl-q ctrl-q\"]\n");
+        let (cfg, warns) = load(&[p]);
+        assert!(warns.is_empty());
+        let patch = &cfg.keymap.patches[0];
+        assert!(patch.bind.contains_key("ctrl-g"), "global bind unchanged");
+        assert_eq!(patch.cua.as_ref().unwrap().bind.get("ctrl-w").unwrap(), "close_buffer");
+        assert_eq!(patch.wordstar.as_ref().unwrap().unbind[0], "ctrl-q ctrl-q");
+    }
+
+    #[test]
+    fn global_only_configs_leave_scoped_fields_none() {
+        let d = tempdir();
+        let p = write(&d, "g.toml", "[keymap]\nbind={ \"ctrl-g\"='goto_line' }\n");
+        let (cfg, _) = load(&[p]);
+        assert!(cfg.keymap.patches[0].cua.is_none() && cfg.keymap.patches[0].wordstar.is_none());
+    }
+
+    // D1+A5 Task 4 — baseline vs. production config separation pins ----------
+
+    #[test]
+    fn baseline_excludes_overrides_layer() {
+        // Spec pin: baseline = load(&[hand]) does NOT include the overrides file;
+        // production = load(&[hand, overrides]) does include it.
+        let d = tempdir();
+        let hand_path = write(&d, "hand.toml", "[keymap]\npreset = 'wordstar'\n");
+        let overrides_path = write(&d, "settings-overrides.toml",
+            "# managed by wcartel\n[view]\ntypewriter = true\n");
+
+        let (baseline, _) = load(std::slice::from_ref(&hand_path));   // WITHOUT overrides
+        let (production, _) = load(&[hand_path, overrides_path]); // WITH overrides
+
+        // Both share the hand-layer keymap.preset value.
+        assert_eq!(baseline.keymap.preset, "wordstar", "hand layer keymap.preset in baseline");
+        assert_eq!(production.keymap.preset, "wordstar", "hand layer keymap.preset in production");
+        // The overrides-only key must differ: baseline lacks it.
+        assert!(!baseline.view.typewriter,
+            "baseline must NOT include the overrides layer typewriter=true");
+        assert!(production.view.typewriter,
+            "production must include the overrides layer typewriter=true");
+    }
+
+    #[test]
+    fn save_reload_roundtrip_restores_settings() {
+        // Unit-level pin of the full pipeline without run():
+        // 1. Build a runtime snapshot with three divergences from the default baseline.
+        // 2. compute_overrides + save_overrides to a tempdir file.
+        // 3. config::load(&[overrides_file]) and assert the merged config reflects them.
+        use crate::settings::{
+            SettingsSnapshot, ThemeIdentity, OverridesFile,
+            compute_overrides, save_overrides, snapshot_of,
+        };
+
+        let d = tempdir();
+        let overrides_path = d.join("settings-overrides.toml");
+
+        // Baseline: defaults (empty layer list — no hand config, no overrides).
+        let (baseline_cfg, _) = load(&[]);
+        // Use the default resolved theme name (tests run without a real env, so
+        // resolve_theme falls back to the default theme — name = "default").
+        let env = crate::theme_resolve::EnvSnapshot::from_env();
+        let baseline_resolved = crate::theme_resolve::resolve_theme(&baseline_cfg.theme, &env);
+        let baseline = snapshot_of(&baseline_cfg, &baseline_resolved.theme.name);
+
+        // Runtime snapshot: five divergences — keymap → wordstar, typewriter on,
+        // bar → pinned, mouse capture off, theme → tokyo-night (spec Testing:
+        // the round-trip covers [mouse] capture and [theme] name too — Fable m-wb-1).
+        let runtime = SettingsSnapshot {
+            keymap_preset:  "wordstar".to_string(),
+            theme_identity: ThemeIdentity::Builtin("tokyo-night".to_string()),
+            view_typewriter: true,
+            view_focus:     false,
+            view_measure:   false,
+            view_wrap_guide: false,
+            view_word_count: false,
+            menu_bar:       crate::config::MenuBarMode::Pinned,
+            mouse_capture:  false,
+        };
+
+        let of = compute_overrides(&runtime, &baseline, &OverridesFile::default(), &OverridesFile::default());
+        save_overrides(&crate::fsx::RealFs, &overrides_path, &of).unwrap();
+
+        // Reload through the REAL config::load and assert the values round-tripped.
+        let (cfg, _) = load(&[overrides_path]);
+        assert_eq!(cfg.keymap.preset, "wordstar",
+            "keymap.preset must round-trip to 'wordstar'");
+        assert!(cfg.view.typewriter, "view.typewriter must round-trip to true");
+        assert_eq!(cfg.menu.bar, crate::config::MenuBarMode::Pinned,
+            "menu.bar must round-trip to Pinned");
+        assert!(!cfg.mouse.mouse_capture, "mouse capture must round-trip to false");
+        assert_eq!(cfg.theme.name.as_deref(), Some("tokyo-night"),
+            "theme name must round-trip");
     }
 
 }
