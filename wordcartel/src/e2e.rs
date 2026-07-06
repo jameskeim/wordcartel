@@ -655,6 +655,7 @@ fn journey_chrome_zen_toggle() {
     // for the palette overlay; themed interior owned by T5's render pin).
     h.ctrl('p');
     assert!(h.editor.palette.is_some(), "ctrl-p must open the palette");
+    assert!(!h.editor.palette.as_ref().unwrap().rows.is_empty(), "unfiltered palette must have rows");
     {
         // row[0] of the unfiltered palette is the first registered command — assert
         // it appears on screen as the text observable for the palette overlay.
