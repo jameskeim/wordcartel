@@ -1377,10 +1377,10 @@ mod tests {
         let want = compose::compose(&ed.theme, ed.depth, &[SE::Chrome]);
         // The status row carries the derived phosphor Chrome bg (Rgb, hue-tinted toward black).
         assert!(want.bg.is_some(), "phosphor Chrome must have a derived bg after derive_chrome");
+        assert!(want.fg.is_some(), "phosphor Chrome must have a derived fg after derive_chrome");
         assert!((0..40u16).any(|x| {
             let cell = buf[(x, 3u16)].style();
-            (want.bg.is_none() || cell.bg == want.bg)
-                && (want.fg.is_none() || cell.fg == want.fg)
+            cell.bg == want.bg && cell.fg == want.fg
         }), "status row must carry the derived phosphor Chrome face");
     }
 
