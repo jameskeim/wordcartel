@@ -1,6 +1,6 @@
 # Chrome Density Presets + Overlay/Mouse Completeness — Design
 
-**Status:** design, pending Codex spec review.
+**Status:** design; Codex spec gate round 1 folded (3 fixups + 1 wording), re-review pending.
 **Effort:** `effort-chrome-density-overlays` (branch off `main`).
 **Supersedes backlog items:** E1 (chrome/density presets), E2 (visual polish), plus the
 overlay/mouse-completeness and menu-windowing gaps surfaced 2026-07-06.
@@ -68,13 +68,18 @@ crossterm). No new dependencies.
   `palette_overlay_rect` (`render.rs:184`, used by all list overlays), the outlier
   `menu_dropdown_rect` (`render.rs:151`, raw leaf count, no window).
 - Overlay structs + mouse: `mouse.rs::handle` (`mouse.rs:72`) has branches for palette
-  (scroll+click+click-away), menu (click only), theme_picker (scroll only), file_browser
-  (scroll only), each `return`-consuming; **`prompt`/`minibuffer`/`outline`/`diag`/`search`
-  have NO branch → mouse falls through to the editor match (`mouse.rs:231`).** Structs with a
+  (scroll+click+click-away), menu (**consumes every event via `return` at `mouse.rs:174-200`;
+  only left-click currently acts — §4 adds a scroll arm, this is NOT a leak fix**), theme_picker
+  (scroll only), file_browser (scroll only), each `return`-consuming; **`prompt`/`minibuffer`/
+  `outline`/`diag`/`search` have NO branch → mouse falls through to the editor match
+  (`mouse.rs:231`).** Ordering caveat: the menu-bar dwell-arming block (`mouse.rs:94-119`) runs
+  BEFORE these branches and its exclusion gate (`mouse.rs:107-110`) lists only
+  menu/palette/theme_picker/file_browser — see Part 3's ordering requirement. Structs with a
   `scroll_top`: `Palette` (`palette.rs:18`), `ThemePicker` (`theme_picker.rs:6`), `FileBrowser`
   (`file_browser.rs:13`), `OutlineOverlay` (`outline_overlay.rs`). Without: `MenuView`,
   `Prompt` (`prompt.rs:43`, key-driven status-row choices), `Minibuffer` (`minibuffer.rs:19`),
-  `DiagOverlay` (`diag_overlay.rs`, windows via inline `.min(15)`).
+  `DiagOverlay` (`diag_overlay.rs`, windows via inline `.min(15)` at `render_overlays.rs:364-370`
+  → gains a real `scroll_top`, Part 3).
 - Persistence pattern (6 steps): config field + default → `Raw*` fold w/ validation → runtime
   field → command → `SettingsSnapshot`/`O*` mirror + `diff_key` block (`settings.rs:252`) →
   startup seed in `app.rs::run`.
@@ -164,9 +169,16 @@ Deferred. Full mode's top bar is the elevated pinned bar with a themed-but-empty
 `apply_bundle` sets the preset's defaults; an explicit user config key overrides that element
 and persists (the existing diff-law, `settings.rs:252`). Re-selecting a preset re-applies its
 bundle over unsaved runtime state. New persisted fields: `scrollbar` mode and `status_line`
-mode each follow the 6-step new-key pattern (config field + `Raw*` fold + runtime field +
-`SettingsSnapshot`/`O*` mirror + `diff_key`). The menu-bar/measure/word-count keys already
-persist. `chrome` disposition already round-trips under `[theme]`.
+mode each follow the 6-step new-key pattern (config field + `Raw*` fold at `config.rs:251-277` +
+runtime field + command + `SettingsSnapshot`/`O*` mirror at `settings.rs:142-175` + `diff_key`
+block at `settings.rs:252-259` + startup seed at `app.rs:1346-1358`). **TOML schema (Codex spec
+gate — pinned):** both new keys live under `[view]`, matching the existing visibility toggles
+(`measure`/`wrap_guide`/`word_count`): `[view] scrollbar = "auto" | "on" | "off"` and
+`[view] status_line = "auto" | "on"`. `status_line` accepts only `auto`/`on` — a config `off` is
+rejected by the parser (coerced to `auto` with a status warning) to honor no-silent-UI; the
+shared `TransientMode::Off` exists solely for the scrollbar, which can be fully suppressed. The
+menu-bar/measure/word-count keys already persist (`[menu] bar`, `[view]`). `chrome` disposition
+already round-trips under `[theme]`.
 
 ---
 
@@ -205,10 +217,25 @@ Both reuse the identical chrome faces (`ChromeSelected` highlight, elevation, `w
 overlay layer — never fall through to the editor match (`mouse.rs:231`). Add consuming branches
 for `prompt`, `minibuffer`, `outline`, `diag`, `search` (today absent).
 
+**Ordering requirement (Codex spec gate).** The overlay guard / dwell-suppression must run
+*before* the menu-bar dwell-arming block (`mouse.rs:94-119`), not after. Today the dwell gate at
+`mouse.rs:107-110` excludes only `menu`/`palette`/`theme_picker`/`file_browser`; a row-0 pointer
+move over `prompt`/`minibuffer`/`search`/`diag`/`outline` would otherwise still arm/reveal the
+menu bar before any late-added consuming branch fires. The plan MUST place a single "any overlay
+open → suppress dwell + consume" guard ahead of the dwell-arming block (preferred over an
+enumerated exclusion gate that a future overlay can forget to join).
+
 **List overlays → palette standard.** Theme picker and file browser gain click-to-commit +
 click-away (they already scroll). `outline` and `diag` gain the full set (scroll + click +
 click-away; they have no mouse today). All reuse the palette's row-hit-test + click-away pattern
 (`palette_row_at` analog per overlay).
+
+**`DiagOverlay` gains real `scroll_top` (Codex spec gate).** Diag today windows via an inline
+`.min(15)` cap (`render_overlays.rs:364-370`) with no scroll state, so wheel/click would run past
+the rendered rows and the hit-test could not match the visible window. Diag therefore gets a real
+`scroll_top: usize` (like `Palette`/`ThemePicker`/`FileBrowser`) plus `list_window::{list_h_for,
+keep_visible}` windowing — the same treatment Part 4 gives the menu — replacing the inline cap.
+This closes diag's latent tall-list truncation too, consistent with the effort's completeness goal.
 
 **Click = commit, uniformly.** One click on a row applies it: theme picker → apply theme, file
 browser → open file / enter directory, outline → jump, diag → apply/goto. Matches the shipped
@@ -232,7 +259,8 @@ Give the menu the windowing every other list overlay already has:
   scrolls rather than truncating.
 - Keyboard ↑/↓ in the dropdown calls `list_window::keep_visible(highlighted, len, list_h,
   &mut scroll_top)` — the highlight is always dragged into view.
-- `mouse.rs` menu branch gains a `ScrollUp/Down` arm (today click-only).
+- `mouse.rs` menu branch gains a `ScrollUp/Down` arm (today it consumes all events but only
+  left-click acts — the scroll arm adds behavior, it is not a leak fix).
 - The `windowed_indicator` `" n/total "` renders on the dropdown's bottom row (the attached
   filled panel per §2.2) when the category overflows the window.
 
