@@ -368,7 +368,7 @@ Grounded facts). Working order: the E3 slot.
 
 - Sentinel contract pins (core): a second derive_chrome call is a no-op (byte-equal
   faces); tokyo-night PANEL_BG survives derivation (phosphor keeps NO chrome overrides after
-  I4-A — nothing to survive); terminal-plain/ansi/no-color byte-untouched;
+  I4-A — nothing to survive);
   a base16/E4 theme's unset chrome derives fully (no all-None face remains on Rgb
   themes); non-Rgb themes (terminal-plain/ansi, no-color) byte-untouched by the call.
 - ANSI16 CHROME POLICY (Fable I7, completed per round-2 N1 — the fallback must be its
