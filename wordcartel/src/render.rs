@@ -2795,10 +2795,11 @@ mod tests {
         assert_eq!(buf[(39u16, 0u16)].style().bg, chrome, "right edge must carry the Chrome fill");
     }
 
-    /// Whole-branch gate regression: base16 themes and tokyo-night had `text: Face::default()`
+    /// Whole-branch gate regression: base16 themes and tokyo-night have `text: Face::default()`
     /// (no fg), so plain body-text cells rendered with terminal-default fg over base_bg — a
-    /// visible readability defect once the opaque canvas paints base_bg. The fix sets
-    /// `text.fg = Some(base_fg)` in `from_base16` and `tokyo_night`, matching phosphor.
+    /// visible readability defect once the opaque canvas paints base_bg. The fix applies a
+    /// render-time `text_fg_or_base` fallback: body spans with no composed fg fall back to
+    /// base_fg, while headings/colored roles (fg already set) are untouched.
     ///
     /// Must FAIL before the fix (text fg is None) and PASS after (text fg == base_fg).
     #[test]
