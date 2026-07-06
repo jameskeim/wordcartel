@@ -82,8 +82,14 @@ Rewrites `derive_chrome`'s background derivation (split → unified elevation + 
 the foreground contrast-derivation. E3's split-ladder decision (I1-A) is superseded. **Unchanged in
 structure:** the five all-None sentinel faces + the sentinel rule, the `[theme] chrome = full|zen` axis
 + `toggle_chrome` + persistence, the `[theme] canvas = opaque|transparent` axis, the Ansi16 fixed-table
-policy, the render `ChromeStyles` mapping. **Regenerated:** every derived-chrome hex value E3 pinned is
-recomputed under the new derivation (probe-driven). **Preserved invariants:** status line matches the
+policy, the render `ChromeStyles` mapping. **Regenerated / rewritten:** every derived-chrome hex value E3 pinned is recomputed
+under the new derivation (probe-driven) — AND the E3 tests that pin the *old direction* as a semantic
+invariant are **rewritten** as new elevation/floor invariants, not merely re-hexed (Codex spec r1):
+`derive_split_ladder_directions` (bar DARKER than canvas → now bar ELEVATED from canvas, direction
+polarity-dependent; theme.rs:1363), the zen `bar <= canvas` assertion (→ zen floored-but-distinct;
+theme.rs:1414), `derive_saturation_split` (sunken-vs-raised rungs → the unified-elevation rungs;
+theme.rs:1433), and the low-contrast clamp flooring to canvas (→ the separation-floor behavior;
+theme.rs:1495). **Preserved invariants:** status line matches the
 menu bar; overlay interiors themed; the canvas effort's body-text `base_fg` fallback + opaque/transparent
 behavior untouched.
 
@@ -114,24 +120,43 @@ a distinct **hue** for polychrome themes (base16) OR a distinct **shade of the o
 themes (phosphor). The rule never requires multiple hues, so phosphor stays all-green/all-amber; it just
 gains a proper bright-to-dim shade hierarchy.
 
+**Scope — LIVE PREVIEW only (Codex spec r1):** the colored-per-level heading text is the *live-preview*
+rendering. **Source mode** (the raw-markdown view) composes only `SE::Text` (+ optional `FocusDim`) —
+never `role_element`/`style_element` (render.rs:552/628) — so with `SE::Text` empty, source-mode text
+falls through the `base_fg` fallback to a **uniform `base_fg`** with no semantic color. That is the
+correct, unchanged behavior for a raw-source view (a heading line shows its raw `# ` markup in plain
+body color). Part C's colored-per-level claim applies to live preview; source mode stays uniform.
+
 ---
 
 ## Part B — The theme-completeness standard + conformance test
 
 **The standard (written contract in the spec, enforced by a test):** a *complete* theme distinguishes
 every semantic role via a **distinct foreground** — satisfiable by a distinct hue (polychrome) OR a
-distinct shade of the theme's hue (monochrome). Concretely, strictness level **(b) "colored where base16
-colors"**: every face the `from_base16` template gives a palette *color* MUST carry an explicit `fg` in
-every RGB builtin. The bg/modifier-primary faces (`selection`, `marked_block`, `search_*`) keep their
-bg/modifier requirement; `SE::Text` is intentionally empty per Part C (body text = `base_fg` fallback);
-the terminal-* / no-color themes are exempt (non-Rgb `base_bg`); the a11y cue rule still governs cue
-mode.
+distinct shade of the theme's hue (monochrome). Strictness level **(b) "styled where base16 styles"** —
+but the requirement is **per-face by TYPE**, not a blanket `fg` (Codex spec r1: base16 styles some roles
+via `underline_color` or `bg`, not `fg`). The contract, derived from the `from_base16` template, assigns
+each face a requirement:
+- **fg-required** (text-color roles): `emphasis`, `strong`, `strong_emphasis`, `code`, `strikethrough`,
+  `link`, `heading[0..6]`, `block_quote`, `code_block`, `list_marker`, `thematic_break`, `front_matter`,
+  `comment`, `focus_dim`, `fold_marker`, `wrap_guide` — each MUST carry an explicit non-default `fg` (a
+  distinct hue for polychrome themes, a distinct shade for monochrome).
+- **underline_color-required** (diagnostics): `diag_spelling`, `diag_grammar` — MUST carry
+  `underline_color` (base16/tokyo style these via underline, not fg; so tokyo's `diag_grammar` with no
+  `fg` is CORRECT under the standard).
+- **bg-required**: `selection`, `marked_block`, `search_match` — MUST carry a `bg`.
+- **modifier-required**: `search_current` (reverse) — MUST carry ≥1 modifier.
+- **intentionally empty**: `SE::Text` (Part C — body text via the `base_fg` fallback).
+- **derived** (exempt from the per-face list; supplied by the elevation ladder): the six chrome faces.
+The terminal-* / no-color themes are exempt entirely (non-Rgb `base_bg`); the a11y cue rule still governs
+cue mode. The exact list above is the load-bearing contract; grounding confirms it against the real
+`from_base16` template and every RGB builtin (each must already pass or be a documented Part D/E fix).
 
-**Conformance test** (extends the existing `builtin_names_final_nineteen` loop, `theme.rs:1053`): for
-every RGB builtin, assert every face in the "must be colored" set carries an explicit non-default `fg`;
-assert `SE::Text` is empty (the uniform rule); assert the a11y cue contract still holds. This is the
-"stronger spec" guardrail — a new theme that leaves a role uncolored fails the build. The exact
-must-be-colored face list is enumerated during grounding from the `from_base16` template (§Calibration).
+**Conformance test** (extends the existing `builtin_names_final_nineteen` loop, `theme.rs:1053`): over
+the **16 RGB builtins** (tokyo + 5 phosphor + 10 base16; the 3 terminal-*/no-color themes are exempt),
+assert each face satisfies **its** requirement type from the contract above (fg / underline_color / bg /
+modifier); assert `SE::Text` is empty; assert the a11y cue contract still holds. This is the "stronger
+spec" guardrail — a new theme that leaves a required role unstyled fails the build.
 
 ---
 
@@ -150,6 +175,7 @@ present at `theme.rs:444-456`), keeping tokyo bespoke (Codex advised against a b
 | `front_matter` | `fg: DARK3` | `fg: ORANGE`, italic |
 | `diag_grammar` | `underline_color: YELLOW` | `underline_color: BLUE` |
 | `wrap_guide` | `fg: DARK3` | `fg: SEL_BG` |
+| `selection` | `bg: SEL_BG` (#283457) | `bg: SEL_BG` — **align the `SEL_BG` constant → #292e42** (Folke `bg_highlight`; source-verified — our #283457 matches no documented Folke color; the constant feeds `selection` + `wrap_guide`) |
 | `chrome` / `chrome_selected` / `chrome_muted` | explicit `PANEL_BG` | **`Face::default()` sentinels** — derived by Part A's elevation ladder (user decision: PANEL_BG was a direction, not a standard) |
 | `text` | already `Face::default()` | unchanged (Part C rule) |
 
@@ -166,8 +192,11 @@ H1/H2 (`s(5)`) and links (`shade(hue,5)`) render near-white instead of phosphor-
 
 **Fix: cap the ramp's lightness ceiling** (0.92 → a probe-calibrated ~0.78) so the brightest shade stays
 clearly hued. This fixes headings and links together in one change, uniformly across all five phosphor
-variants (they share the constructor). Combined with Part C (emptying phosphor's `text`), phosphor's
-headings render in these corrected bright shades — the authentic dim→bright monochrome CRT hierarchy.
+variants (they share the constructor). The cap also incidentally shifts the other `shade(hue,5)` uses —
+`selection.fg` (theme.rs:855) and `diag_spelling.underline_color` (theme.rs:861/865) — which the grounding
+pins as intended, not just headings/links (Codex spec r1). Combined with Part C (emptying phosphor's
+`text`), phosphor's headings render in these corrected bright shades — the authentic dim→bright monochrome
+CRT hierarchy.
 
 ---
 
