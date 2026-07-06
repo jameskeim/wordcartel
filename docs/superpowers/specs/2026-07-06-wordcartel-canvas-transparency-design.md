@@ -25,9 +25,9 @@ effort extends a correct full-area canvas paint to both modes under one toggle.
 
 `compose::base_canvas(theme, depth)` returns `{fg: base_fg, bg: base_bg}` at the depth. For the
 terminal-* themes (`terminal-plain`, `terminal-ansi`, `no-color`) `base_bg` is `Color::Default`,
-which resolves to `Reset` — so those themes have **no canvas to paint** and are inherently
-transparent. The toggle only bites on RGB-based themes, exactly mirroring how E3 gates Rgb vs
-non-Rgb.
+which resolves to `Reset` (terminal-default) — so those themes have **no canvas to paint**. The
+implementation skips the fill whenever the canvas bg is `Reset` (avoiding a no-op paint), so the
+toggle only bites on RGB-based themes, exactly mirroring how E3 gates Rgb vs non-Rgb.
 
 ## D1 — Semantics
 
@@ -78,9 +78,12 @@ threading); the render reads the runtime flag directly.
 
 ## D3 — Toggle command, runtime flag, honest arms
 
-- `Editor.canvas: CanvasMode` field (`editor.rs`, beside `chrome_disposition` at `:423`), seeded in
-  `run()` from `parse_canvas(&cfg.theme.canvas)` (like `chrome_disposition` at `settings.rs:138` /
-  seeded in `app.rs`), init `Opaque` in `new_from_text` (`editor.rs:494`).
+- `Editor.canvas: CanvasMode` field (`editor.rs`, beside `chrome_disposition` at `:423`), init
+  `Opaque` in `new_from_text` (`editor.rs:494`). Seeded from `parse_canvas(&cfg.theme.canvas)` at
+  BOTH chrome's seed sites (Codex spec r1 Important-3): the startup seed (`app.rs:1361-1365`) and
+  the baseline-snapshot construction (`app.rs:1373-1375`) — the latter so the initial mode is the
+  persistence baseline. The `settings.rs` `snapshot_of` (`:138`) / `runtime_snapshot` (`:167`) also
+  carry it (D5).
 - `toggle_canvas` command, registered in the **Settings** category (registry) **before**
   `save_settings` (which must stay the final registration — the `journey_palette_end` invariant),
   label `"Canvas: Opaque/Transparent"`. Handler flips `editor.canvas` and sets the status; a plain
@@ -96,8 +99,11 @@ threading); the render reads the runtime flag directly.
 One full-area canvas paint in `render()`, replacing the source-mode per-span `base_canvas`
 special-casing:
 
-1. Compute the editing-viewport rect (the document area, excluding the bar rows — the existing
-   geometry).
+1. Compute the **full edit band** — the same band the scrollbar fills (`render.rs:685`), spanning
+   the whole editing area including the left/right centered-measure margins and the rows below the
+   last line — NOT just the text column (`tg.text_left`/`tg.text_width`, `nav.rs:25`). The per-row
+   text Paragraphs paint into `tg.text_width`; the canvas fill must cover the whole band so margins
+   and blank/below-content rows are painted (Codex spec r1 Important-1).
 2. If `editor.canvas == Opaque` **and** `base_canvas(theme, depth)` carries a real background
    (i.e. `base_bg` is Rgb / not `Reset` — the RGB-theme + non-`None`-depth condition), then
    `frame.buffer_mut().set_style(viewport, <canvas-bg-only style>)` **before** the line Paragraphs
@@ -108,9 +114,12 @@ special-casing:
    the full-area paint now covers source mode too (and fixes its blank-line/padding gap, which the
    per-span approach never painted). Source-mode text spans become fg-only like live-preview.
 
-**Overlay/bar interaction (transparent mode):** `ov_fill` (in `ChromeStyles::build`,
-`render.rs:676`) becomes a no-op style (`RStyle::default()`) when `editor.canvas == Transparent`,
-so overlay interiors show the `Clear`'s terminal-default cells. Bars are unchanged (they always
+**Overlay/bar interaction (transparent mode):** `ChromeStyles::build` (`render.rs:276`/`:676`)
+today takes only `(theme, depth)` and derives `ov_fill` from them — it has NO canvas hook. The plan
+adds a `CanvasMode` parameter to `build` (or post-processes `cs.ov_fill` at the `render.rs:676`
+call site): when `Transparent`, `ov_fill` is `RStyle::default()` (a no-op), so overlay interiors
+show the `Clear`'s terminal-default cells (Codex spec r1 Important-2). `ChromeStyles` is rebuilt
+every frame, so this takes effect immediately with no cache to invalidate. Bars are unchanged (they always
 `set_style` their own chrome bg). Content-highlight and border styling are unchanged.
 
 **Depth:** at `Ansi16` the canvas paints the quantized named background (via `base_canvas`'s
@@ -141,9 +150,12 @@ The E3 per-field pattern, verbatim shape:
 - **Non-RGB inertness:** terminal-plain in both modes → editing-area cells `Reset` (no visible
   difference); the toggle persists but renders identically.
 - **Unification:** source-mode rendering under opaque still paints the canvas (now via the
-  full-area fill), including blank-line/padding cells the per-span approach missed; the existing
-  source-mode canvas tests continue to pass (adjusted to the new mechanism where they asserted the
-  per-span shape).
+  full-area fill), including blank-line/padding cells the per-span approach missed. The existing
+  source-mode canvas tests `source_mode_tints_canvas_for_phosphor_but_not_default` (`render.rs:2228`)
+  and `source_mode_dimmed_row_keeps_phosphor_canvas` (`render.rs:2252`) are **rewritten** to assert
+  the full-area-fill mechanism (the per-span `base_canvas` they were built around is removed) — they
+  must still show phosphor source cells carrying the RGB canvas bg, now sourced from the band fill
+  (Codex spec r1 Minor).
 - **Toggle + persistence:** `toggle_canvas` flips `editor.canvas` and the honest status arms
   (RGB vs non-RGB) are byte-exact; the config round-trip carries `canvas = "transparent"`; the
   diff-law battery covers the canvas key beside name/chrome (contradiction-only removal, per-key
