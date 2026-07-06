@@ -34,7 +34,14 @@ Grounded facts). Working order: the E3 slot.
   (base fg/bg = Default — never an opinionated page color) while its CHROME keeps
   today's legacy named-ANSI family (White/Black bars, DarkGray muted — the pre-theming
   look is its contract); no-color is pure-modifier everywhere. Both are exempt from
-  derivation by the Rgb-bases rule (D1).
+  derivation by the Rgb-bases rule (D1). terminal-plain's ChromeOverlay stays
+  `Face::default()` DELIBERATELY (Fable I5, resolved by identity): its canvas IS the
+  terminal default, so a terminal-default modal interior EQUALS the canvas — the
+  "slightly off" mismatch class is vacuous there by construction; the thin border
+  carries the separation (the zen expression, natively). terminal-ansi gets an explicit
+  named-ANSI ChromeOverlay (its table in the plan). Goal 2's "every full-color theme"
+  reads accordingly: every RGB theme paints; the two terminal-identity themes inherit
+  by contract.
 - `theme::default()` — the CODE fn — keeps returning the plain table (renamed in `name`
   only): error-path fallbacks stay minimal-safe and the existing render-test corpus keeps
   its meaning. Only `resolve_theme`'s no-config arm changes to the launch default.
@@ -53,8 +60,13 @@ Grounded facts). Working order: the E3 slot.
   (:458) preserves H/S, maps level to lightness 0.08..0.92, so phosphor canvases are
   hue-tinted near-black; the ladder inherits the tint by construction (lightness-only
   steps). `-flat` = mono_faces + hue chrome (the inversion the user rejected).
-  `from_base16` (:339) maps base00/05 to bg/fg + a panel guess; its chrome mapping is
-  SUPERSEDED by derivation. `default()` (:228): markdown coloring is ONLY code=Cyan +
+  `from_base16` (:339) maps base00/05 to bg/fg + a panel guess; the CONCRETE EDIT
+  (Fable I3 — load-bearing): its four chrome-face initializers (theme.rs:383-386) become
+  all-None sentinels so derivation fills them — otherwise the sentinel rule reads them as
+  intentional overrides and the zen axis dies for every E4/file theme and the launch
+  default. Acknowledged side-effect: the base16 base01 panel slot (the palette author's
+  own panel pick) is discarded in favor of the ladder — catppuccin's mantle is honored
+  anyway by the split ladder's sunken bars (I1-A). `default()` (:228): markdown coloring is ONLY code=Cyan +
   link=Yellow (+DarkGray markers); headings/quote/emphasis are modifier/glyph-carried —
   the user's "essentially no-color for markdown" observation, driving the `terminal-ansi`
   fork. `mono_faces` (:469): modifier-only chrome (kept for cue mode).
@@ -80,7 +92,11 @@ Grounded facts). Working order: the E3 slot.
   `default_status_line_still_reversed` (render.rs:1630) pins REVERSED on the status row —
   MEANING CHANGES (the status moves to explicit colors; the pin becomes
   "status row carries the Chrome face" with a terminal-plain reverse exception — see D2).
-  e2e is text-only (chrome-color-safe).
+  e2e is text-only (chrome-color-safe). theme_resolve.rs breakage (Fable M5):
+  `resolve_unknown_name_falls_back_with_warning` pins `name == "default"`
+  (theme_resolve.rs:206) and sibling tests pass `name: Some("default")` (which now
+  aliases with a warning) — both update; EVERY resolve_theme call site and test gains
+  the disposition parameter.
 - Settings (D1+A5): OTheme mirror carries `name` only; SettingsSnapshot.theme_identity
   provenance-typed; per-field extension pattern established (wrap_column precedent).
 - Config: RawTheme { name, file, depth, heading_level_glyph, styles } — `chrome` lands
@@ -151,13 +167,15 @@ Grounded facts). Working order: the E3 slot.
   (explicit chrome faces set where the theme wants overrides; all-None sentinels
   elsewhere) → `derive_chrome` fills the all-None faces per the disposition → user
   `styles.*` → cue-mode glyph forcing. tokyo-night keeps PANEL_BG by setting it in the
-  constructor. PHOSPHOR (Codex r3 I-3, explicit): the constructor sets a chrome face
-  ONLY for roles the implementer's probes show derived-differs-visibly-from-today, and
-  leaves the rest all-None to derive — under the sentinel any set face never derives, so
-  "keep the smaller override set" means literally deleting constructor lines for roles
-  where derivation reproduces today's look. `no-color`/cue mode: mono modifier faces —
-  monochrome themes' faces are all SET (modifiers), so derivation naturally skips them;
-  plus the non-Rgb base rule makes it doubly inert.
+  constructor. PHOSPHOR (user-ratified I4-A, 2026-07-05 — superseding the earlier
+  keep-if-different rule): the phosphor constructors DELETE their chrome-face
+  initializers entirely — all chrome derives. Probe evidence: today's phosphor chrome
+  fails readability (fg-on-panel 3.9:1) while the derived ladder gives 7.5:1 with the
+  same hue carried through; deletion is what makes phosphor-zen (D4's promise) possible
+  at all, since constructor-set faces are disposition-independent. This is a RATIFIED
+  visible change to phosphor's current chrome look. `no-color`/cue mode: protected by the non-Rgb base
+  rule (Fable M1: mono_faces' chrome is Face::default() — the all-set claim was false;
+  the single protection is the base rule, and it suffices).
 
 ## D2. The six-face family + render rewiring
 
@@ -183,7 +201,9 @@ Grounded facts). Working order: the E3 slot.
     terminal-default "slightly off" hover) and the thin border alone carries the
     separation (border-as-separator, the calm expression). ratatui mechanics verified (Codex r1 m-2): Cell::set_style PATCHES
     fields, so a bg-None border style leaves the fill's bg intact — the rule is sound;
-    tests must cover BORDER and TITLE cells explicitly, not just interiors. Pins:
+    tests must cover BORDER and TITLE cells explicitly, not just interiors. Pins
+    (asserted at Depth::Truecolor — Fable M2: 256/16 quantization can legally collapse
+    zen rungs; the border-carries-separation contract covers collapsed depths):
     border-cell bg == interior bg under phosphor-green (the halo regression, both
     dispositions); full → interior bg == ChromeOverlay bg ≠ canvas; zen → interior bg
     within the collapsed step of canvas.
@@ -195,6 +215,9 @@ Grounded facts). Working order: the E3 slot.
   - Menu bar/dropdowns: face ROLES unchanged (Chrome bar, ChromeSelected open/highlight,
     ChromeMuted dropdown-normal) — values now derived.
   - Scrollbar/wrap-guide/fold/prefix: roles unchanged.
+- ChromeAccent's SHAPE (Fable M3): accent-colored FOREGROUND on the panel background
+  (+bold) — NEVER an accent background fill (a vim-style accent bar would violate the
+  research's no-large-fills discipline the spec itself adopts).
 - Accent discipline (research-mandated, spec-enforced list): ChromeAccent is legal ONLY
   for the active-prompt status state and (future) focus marks. The dirty-buffer marker is
   DEFERRED (Codex r1 I-5: status_left_text returns one string rendered as a single span —
@@ -307,6 +330,11 @@ Grounded facts). Working order: the E3 slot.
 - base16 file failures: unchanged (warn + plain fallback).
 - toggle_chrome under a monochrome/cue theme: no-op with status "chrome: n/a (cue mode)"
   — zen has no meaning without a ladder; pinned.
+- toggle_chrome under a NON-Rgb, non-monochrome theme (terminal-plain/terminal-ansi —
+  Fable I6: derivation no-ops but the theme is NOT cue-mode, and a bare "chrome: zen"
+  would be silent-no-change UI): the disposition still flips and persists (it matters
+  after a theme switch), and the status says so honestly:
+  "chrome: zen (no effect: terminal-plain has fixed chrome)". Pinned.
 - No new IO. The toggle's re-derivation is a cold path (one keypress).
 
 ## Testing
@@ -315,7 +343,16 @@ Grounded facts). Working order: the E3 slot.
   faces); tokyo-night PANEL_BG and each phosphor's kept overrides survive derivation;
   a base16/E4 theme's unset chrome derives fully (no all-None face remains on Rgb
   themes); non-Rgb themes (terminal-plain/ansi, no-color) byte-untouched by the call.
-- Ladder unit battery (core): direction by luminance (dark lightens, light darkens);
+- ANSI16 CHROME POLICY (Fable I7 — probe: flexoki-dark's rungs ALL quantize to Black at
+  Ansi16, turning the launch default's bars canvas-colored on TERM=xterm, a first-launch
+  regression; catppuccin's overlay quantizes to a Blue fill): at `Depth::Ansi16`,
+  ladder-DERIVED chrome is replaced by the legacy named-ANSI chrome family
+  (terminal-plain's White/Black table) — visible bars guaranteed on 16-color terminals;
+  explicit constructor chrome (tokyo, terminal-*) quantizes as today. Applied in
+  resolve after depth detection; pinned (flexoki-dark at Ansi16 → status bar bg Black,
+  fg White, ≠ canvas).
+- Ladder unit battery (core): direction by pole (bars toward black on all themes;
+  overlays toward white on dark, deeper black on light);
   zen steps strictly smaller than full; hue/saturation preserved through steps (the
   phosphor-tint pin); every derived face fully explicit (no None fg/bg on color themes);
   the contrast invariant (primary fg vs the LIGHTEST chrome face ≥ a pinned readable
@@ -330,8 +367,11 @@ Grounded facts). Working order: the E3 slot.
   fill bg (the lighter-green halo regression), asserted in both dispositions. The rewritten status pin (D2). The prompt-active accent pin
   (open a minibuffer → status face == ChromeAccent). Menu fill + scrollbar goldens
   updated where values moved (compose-relative comparisons survive by construction).
-  a11y cue-mode modifier coverage re-pinned for the new faces (ChromeOverlay/ChromeAccent
-  must carry modifiers under no-color).
+  a11y cue-mode coverage (Fable M4, deliberate choice): ChromeAccent carries
+  reverse+bold under no-color (a glyph-bearing face — testable); ChromeOverlay is
+  EXEMPTED from the modifier requirement with rationale — it is a fill face with no
+  glyphs of its own (dim on a blank fill is vacuous; reverse inverts the whole modal),
+  and under no-color it stays Face::default() (borders carry separation).
 - Toggle/persistence: the established per-field battery (idempotent toggle status;
   chrome joins OTheme round-trip through the REAL loader; diff-law arms incl. the split
   theme mask predicates; save→reload lands the disposition).
@@ -342,6 +382,16 @@ Grounded facts). Working order: the E3 slot.
 - Split conservation: moved-code commits byte-verified (H1's discipline; the whole-branch
   review charges it).
 - Smoke: advisory run + verbatim quote (no new smoke checks).
+
+## Plan advisory (Fable M6)
+
+The effort spans ~18-25 tasks. Decompose along the four clean seams, in order:
+(1) D1+D4 core (derivation + sentinel + phosphor/from_base16 edits + core pins);
+(2) D2+D6 render (faces through every painter + the split);
+(3) D3 axis (config/resolve signature/toggle/persistence);
+(4) D5 lineup (renames, terminal-ansi, the ten E4 tables, launch default, picker/test
+    count updates). Each seam gates green independently; the two new SemanticElement
+    variants ripple through every exhaustive match (ALL_ELEMENTS 32→34) in seam 1.
 
 ## Deferred (recorded)
 
