@@ -45,6 +45,13 @@ pub enum SemanticElement {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ChromeDisposition { Full, Zen }
 
+/// Whether the theme's canvas (`base_bg`) is painted across the editing area.
+/// `Opaque` (default) = paint it — RGB themes own the page. `Transparent` = skip it and
+/// the modal-interior fill, so a see-through terminal shows through. Render-only; never
+/// affects derivation. Non-Rgb `base_bg` (terminal-* themes) has nothing to paint.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CanvasMode { Opaque, Transparent }
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Depth { Truecolor, Indexed256, Ansi16, None }
 

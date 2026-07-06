@@ -48,6 +48,7 @@ pub struct ThemeConfig {
     pub file: Option<PathBuf>,           // ~-expanded, resolved relative to declaring config
     pub depth: Option<String>,           // "truecolor"|"256"|"16"|"none"
     pub chrome: Option<String>,          // "full"|"zen" — parsed at resolve
+    pub canvas: Option<String>,          // "opaque"|"transparent" — parsed at resolve
     pub heading_level_glyph: Option<bool>,
     pub styles: BTreeMap<String, RawFace>,
 }
@@ -209,6 +210,7 @@ struct RawTheme {
     file: Option<String>,
     depth: Option<String>,
     chrome: Option<String>,
+    canvas: Option<String>,
     heading_level_glyph: Option<bool>,
     styles: BTreeMap<String, RawFace>,
 }
@@ -448,6 +450,7 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
         }
         if let Some(d) = rt.depth { cfg.theme.depth = Some(d); }
         if let Some(c) = rt.chrome { cfg.theme.chrome = Some(c); }
+        if let Some(c) = rt.canvas { cfg.theme.canvas = Some(c); }
         if let Some(h) = rt.heading_level_glyph { cfg.theme.heading_level_glyph = Some(h); }
         for (k, v) in rt.styles { cfg.theme.styles.insert(k, v); } // accumulate across layers
     }
