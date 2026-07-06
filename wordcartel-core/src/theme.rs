@@ -827,8 +827,8 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
 fn shade(hue: Color, level: u8) -> Color {
     let Color::Rgb { r, g, b } = hue else { return hue };
     let (h, s, _l) = rgb_to_hsl(r, g, b);
-    // map level 0..=5 to lightness 0.08..=0.92 (widened from 0.18..=0.92 for floor test)
-    let l = 0.08 + (level.min(5) as f32 / 5.0) * (0.92 - 0.08);
+    // map level 0..=5 to lightness 0.08..=0.78 (ceiling lowered from 0.92 — Part E, §II.6)
+    let l = 0.08 + (level.min(5) as f32 / 5.0) * (0.78 - 0.08);
     let (r, g, b) = hsl_to_rgb(h, s, l);
     Color::Rgb { r, g, b }
 }
@@ -1077,6 +1077,29 @@ mod tests {
         // both share the hue family but differ in lightness (bright is lighter)
         let lum = |c: Color| if let Color::Rgb{r,g,b}=c { r as u32+g as u32+b as u32 } else { 0 };
         assert!(lum(bright) > lum(dark), "ramp must brighten");
+    }
+    #[test]
+    fn phosphor_shade_ceiling_keeps_bright_shades_hued() {
+        // §II.6: after the 0.78 ceiling, s(5) has a wide channel spread (hued), not near-white.
+        let hues = [
+            ("green",  Color::Rgb{r:0x33,g:0xff,b:0x33}, Color::Rgb{r:0x8f,g:0xff,b:0x8f}),
+            ("amber",  Color::Rgb{r:0xff,g:0xb0,b:0x00}, Color::Rgb{r:0xff,g:0xdc,b:0x8f}),
+            ("red",    Color::Rgb{r:0xff,g:0x55,b:0x55}, Color::Rgb{r:0xff,g:0x8f,b:0x8f}),
+            ("blue",   Color::Rgb{r:0x55,g:0x99,b:0xff}, Color::Rgb{r:0x8f,g:0xbc,b:0xff}),
+            ("purple", Color::Rgb{r:0xcc,g:0x99,b:0xff}, Color::Rgb{r:0xc7,g:0x8f,b:0xff}),
+        ];
+        for (name, hue, s5) in hues {
+            assert_eq!(shade(hue, 5), s5, "{name} s(5) = §II.6 pin");   // [verify]
+            // "hued": the max-min channel spread is wide (≥ 96), i.e. NOT washed to near-white.
+            if let Color::Rgb { r, g, b } = shade(hue, 5) {
+                let spread = r.max(g).max(b) - r.min(g).min(b);
+                assert!(spread >= 96, "{name} s(5) must stay hued: spread={spread}");
+            } else { panic!("non-Rgb"); }
+        }
+        // base_bg (s0) unchanged by the ceiling; base_fg (s3) shifts to §II.6.
+        let green = Color::Rgb{r:0x33,g:0xff,b:0x33};
+        assert_eq!(shade(green, 0), Color::Rgb{r:0x00,g:0x29,b:0x00}, "green s0 unchanged");
+        assert_eq!(shade(green, 3), Color::Rgb{r:0x00,g:0xff,b:0x00}, "green s3 (base_fg) shifts");
     }
     #[test]
     fn phosphor_shaded_distinguishes_by_shade() {
@@ -1662,15 +1685,18 @@ mod tests {
     #[test]
     fn derive_preserves_hue_angle() {
         // phosphor-green post-derivation: every derived bg rung has the same hue family as the canvas.
-        // §II.5 phosphor-green FULL bg pins — the canvas is shade(hue,0) (ceiling-invariant), so
-        // these bg rungs are stable at T1. The chrome FGs derive from base_fg = shade(hue,3), which
-        // the Part E ceiling change (0.92→0.78) reshapes in T4 — so we assert only that each fg is
-        // Some and green-dominant here, NOT its exact hex.
+        // §II.5 phosphor-green FULL pins (T4-finalized: fg pins now exact — base_fg = shade(hue,3)
+        // settled at 0.78 ceiling, so Chrome/Muted/Overlay fgs are stable).
         let mut t = phosphor_green_theme();
         t.derive_chrome(ChromeDisposition::Full);
         assert_eq!(t.face(SemanticElement::Chrome).bg,        Some(rgb(0x00,0x40,0x00)), "phosphor chrome bg");
+        assert_eq!(t.face(SemanticElement::Chrome).fg,        Some(rgb(0x00,0xff,0x00)), "phosphor chrome fg");
         assert_eq!(t.face(SemanticElement::ChromeMuted).bg,   Some(rgb(0x00,0x54,0x00)), "phosphor muted bg");
+        assert_eq!(t.face(SemanticElement::ChromeMuted).fg,   Some(rgb(0x54,0xcd,0x54)), "phosphor muted fg");
         assert_eq!(t.face(SemanticElement::ChromeOverlay).bg, Some(rgb(0x00,0x68,0x00)), "phosphor overlay bg");
+        assert_eq!(t.face(SemanticElement::ChromeOverlay).fg, Some(rgb(0x00,0xff,0x00)), "phosphor overlay fg");
+        assert_eq!(t.face(SemanticElement::ChromeAccent).bg,  Some(rgb(0x00,0x40,0x00)), "phosphor accent bg");
+        assert_eq!(t.face(SemanticElement::ChromeAccent).fg,  Some(rgb(0xbb,0xf3,0xbb)), "phosphor accent fg");
         // hue angle: all bg rungs share the green hue family (r ≈ b, g dominates); fgs likewise green.
         for el in [SemanticElement::Chrome, SemanticElement::ChromeOverlay, SemanticElement::ChromeMuted] {
             let bg = t.face(el).bg.unwrap();
