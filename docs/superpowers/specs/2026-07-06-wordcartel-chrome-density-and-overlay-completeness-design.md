@@ -1,6 +1,6 @@
 # Chrome Density Presets + Overlay/Mouse Completeness — Design
 
-**Status:** design; Codex spec gate round 1 folded (3 fixups + 1 wording), re-review pending.
+**Status:** design; Codex spec gate rounds 1-2 folded, round 3 re-review pending.
 **Effort:** `effort-chrome-density-overlays` (branch off `main`).
 **Supersedes backlog items:** E1 (chrome/density presets), E2 (visual polish), plus the
 overlay/mouse-completeness and menu-windowing gaps surfaced 2026-07-06.
@@ -175,8 +175,10 @@ block at `settings.rs:252-259` + startup seed at `app.rs:1346-1358`). **TOML sch
 gate — pinned):** both new keys live under `[view]`, matching the existing visibility toggles
 (`measure`/`wrap_guide`/`word_count`): `[view] scrollbar = "auto" | "on" | "off"` and
 `[view] status_line = "auto" | "on"`. `status_line` accepts only `auto`/`on` — a config `off` is
-rejected by the parser (coerced to `auto` with a status warning) to honor no-silent-UI; the
-shared `TransientMode::Off` exists solely for the scrollbar, which can be fully suppressed. The
+rejected (coerced to `auto`, with the mismatch accumulated as a config warning surfaced via the
+startup status line at `app.rs:1463-1465`, matching how other config warnings already surface) to
+honor no-silent-UI; the shared `TransientMode::Off` exists solely for the scrollbar, which can be
+fully suppressed. The
 menu-bar/measure/word-count keys already persist (`[menu] bar`, `[view]`). `chrome` disposition
 already round-trips under `[theme]`.
 
@@ -217,13 +219,18 @@ Both reuse the identical chrome faces (`ChromeSelected` highlight, elevation, `w
 overlay layer — never fall through to the editor match (`mouse.rs:231`). Add consuming branches
 for `prompt`, `minibuffer`, `outline`, `diag`, `search` (today absent).
 
-**Ordering requirement (Codex spec gate).** The overlay guard / dwell-suppression must run
-*before* the menu-bar dwell-arming block (`mouse.rs:94-119`), not after. Today the dwell gate at
-`mouse.rs:107-110` excludes only `menu`/`palette`/`theme_picker`/`file_browser`; a row-0 pointer
-move over `prompt`/`minibuffer`/`search`/`diag`/`outline` would otherwise still arm/reveal the
-menu bar before any late-added consuming branch fires. The plan MUST place a single "any overlay
-open → suppress dwell + consume" guard ahead of the dwell-arming block (preferred over an
-enumerated exclusion gate that a future overlay can forget to join).
+**Ordering requirement (Codex spec gate).** The overlay routing must run *before* the menu-bar
+dwell-arming block (`mouse.rs:94-119`), not after. Today the dwell gate at `mouse.rs:107-110`
+excludes only `menu`/`palette`/`theme_picker`/`file_browser`; a row-0 pointer move over
+`prompt`/`minibuffer`/`search`/`diag`/`outline` would otherwise still arm/reveal the menu bar
+before any late-added consuming branch fires. **Precise wording — NOT a blanket early return:**
+when any overlay is open, route the mouse event to the overlay layer *before* dwell tracking; the
+overlay handler then applies its overlay-specific behavior (scroll/click/click-away for list
+overlays, consume-only for text-input modals) and returns. This suppresses menu dwell for every
+modal while PRESERVING the existing palette/menu/theme-picker/file-browser mouse behavior that
+today lives after dwell (`mouse.rs:122-229`) — those branches move ahead of dwell, they are not
+bypassed. A single overlay-open route is preferred over an enumerated dwell-exclusion gate that a
+future overlay can forget to join.
 
 **List overlays → palette standard.** Theme picker and file browser gain click-to-commit +
 click-away (they already scroll). `outline` and `diag` gain the full set (scroll + click +
