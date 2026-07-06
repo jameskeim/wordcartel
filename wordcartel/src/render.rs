@@ -239,6 +239,69 @@ pub(crate) fn word_count_segment(editor: &Editor) -> Option<String> {
     ))
 }
 
+/// Pre-computed ratatui styles for all chrome surfaces — built once per frame
+/// from the current theme and depth, then passed by reference to the overlay
+/// and menu painters.
+///
+/// T4 values are behavior-identical to the inline composes they replace.
+/// T5 will update individual fields (`ov_fill` → [ChromeOverlay]; `ov_accent` →
+/// per-arm [ChromeAccent]; `overlay_selected` → [ChromeSelected]) without
+/// touching wiring or painter locations.
+pub(crate) struct ChromeStyles {
+    /// Selected row in overlays (T4: [ChromeReverse]; T5: [ChromeSelected]).
+    pub overlay_selected: RStyle,
+    /// Overlay query-bar text style (T4: [Text]; T5: [ChromeOverlay]).
+    pub ov_query: RStyle,
+    /// Menu bar: open (active) category label.
+    pub menu_open: RStyle,
+    /// Menu bar: closed (inactive) label + full-width bar fill.
+    pub menu_closed: RStyle,
+    /// Menu dropdown: selected / highlighted item.
+    pub menu_sel: RStyle,
+    /// Menu dropdown: normal item.
+    pub menu_norm: RStyle,
+    /// Scrollbar track (dim background channel).
+    pub scrollbar_track: RStyle,
+    /// Scrollbar thumb (active indicator).
+    pub scrollbar_thumb: RStyle,
+    /// Overlay interior fill (T4: `RStyle::default()`; T5: [ChromeOverlay]).
+    pub ov_fill: RStyle,
+    /// Status-line style for search/minibuffer/prompt arms
+    /// (T4: [ChromeReverse] for all four arms; T5: [ChromeAccent] for active arms).
+    pub ov_accent: RStyle,
+    /// Overlay border style (T4: full Chrome fg+bg — behavior-identical with old inline
+    /// composes; T5: fg-only so the ChromeOverlay fill bg is preserved under
+    /// ratatui's `Cell::set_style` patch semantics).
+    pub overlay_border: RStyle,
+}
+
+impl ChromeStyles {
+    /// Build the full chrome style set from the current theme and depth.
+    /// Called once per frame in `render()`, before the scrollbar and status
+    /// sections; all downstream painters borrow this struct by reference.
+    pub(crate) fn build(
+        theme: &wordcartel_core::theme::Theme,
+        depth: wordcartel_core::theme::Depth,
+    ) -> Self {
+        // T4: overlay_border carries the full Chrome style (fg+bg — behavior-identical with
+        // the old inline composes). T5 will strip .bg to preserve the ChromeOverlay fill under
+        // ratatui's Cell::set_style patch semantics.
+        ChromeStyles {
+            overlay_selected: compose::compose(theme, depth, &[SE::ChromeReverse]),
+            ov_query:         compose::compose(theme, depth, &[SE::Text]),
+            menu_open:        compose::compose(theme, depth, &[SE::ChromeSelected]),
+            menu_closed:      compose::compose(theme, depth, &[SE::Chrome]),
+            menu_sel:         compose::compose(theme, depth, &[SE::ChromeSelected]),
+            menu_norm:        compose::compose(theme, depth, &[SE::ChromeMuted]),
+            scrollbar_track:  compose::compose(theme, depth, &[SE::ChromeMuted]),
+            scrollbar_thumb:  compose::compose(theme, depth, &[SE::Chrome]),
+            ov_fill:          RStyle::default(),
+            ov_accent:        compose::compose(theme, depth, &[SE::ChromeReverse]),
+            overlay_border:   compose::compose(theme, depth, &[SE::Chrome]),
+        }
+    }
+}
+
 /// Paint the viewport + status line to `frame` using `editor` state.
 ///
 /// The editor is borrowed mutably so stateful overlay widgets can update their
@@ -612,6 +675,12 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     }
 
     // -----------------------------------------------------------------------
+    // Chrome styles — built once here so the scrollbar, status line, and all
+    // overlay/menu painters below can borrow editor fields freely.
+    // -----------------------------------------------------------------------
+    let cs = ChromeStyles::build(&editor.theme, editor.depth);
+
+    // -----------------------------------------------------------------------
     // Scrollbar overlay (painted over editing area, rightmost column)
     // -----------------------------------------------------------------------
     if editor.mouse.scrollbar_visible {
@@ -620,12 +689,10 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         let scroll_pos = fv.visible_ordinal(editor.active().view.scroll);
         let sb_area = Rect::new(area.x, edit_top, w, edit_height);
         let mut sb_state = ScrollbarState::new(total).position(scroll_pos);
-        let sb_track_style = compose::compose(&editor.theme, editor.depth, &[SE::ChromeMuted]);
-        let sb_thumb_style = compose::compose(&editor.theme, editor.depth, &[SE::Chrome]);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .track_style(sb_track_style)
-                .thumb_style(sb_thumb_style),
+                .track_style(cs.scrollbar_track)
+                .thumb_style(cs.scrollbar_thumb),
             sb_area,
             &mut sb_state,
         );
@@ -639,24 +706,23 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         // When a modal prompt is active, render its message instead of the normal
         // status text, using a distinct style so it stands out.
         // When the minibuffer is open, render <prompt><text> on the status row.
-        let chrome_reverse_style = compose::compose(&editor.theme, editor.depth, &[SE::ChromeReverse]);
         let (status_text, status_style) = if let Some(ref s) = editor.search {
             (
                 format_search_bar(s),
-                chrome_reverse_style,
+                cs.ov_accent,
             )
         } else if let Some(ref mb) = editor.minibuffer {
             (
                 format!("{}{}", mb.prompt, mb.text),
-                chrome_reverse_style,
+                cs.ov_accent,
             )
         } else if let Some(ref prompt) = editor.prompt {
             (
                 prompt.message.clone(),
-                chrome_reverse_style,
+                cs.ov_accent,
             )
         } else {
-            (status_left_text(editor), chrome_reverse_style)
+            (status_left_text(editor), cs.ov_accent)
         };
 
         // Compose the status line.
@@ -721,17 +787,6 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     }
 
     // -----------------------------------------------------------------------
-    // Precompute chrome styles for overlays and menu (computed here once so
-    // the individual if-let blocks can borrow editor fields freely).
-    // -----------------------------------------------------------------------
-    let ov_highlight_style = compose::compose(&editor.theme, editor.depth, &[SE::ChromeReverse]);
-    let ov_query_style     = compose::compose(&editor.theme, editor.depth, &[SE::Text]);
-    let menu_open_style    = compose::compose(&editor.theme, editor.depth, &[SE::ChromeSelected]);
-    let menu_closed_style  = compose::compose(&editor.theme, editor.depth, &[SE::Chrome]);
-    let menu_sel_style     = compose::compose(&editor.theme, editor.depth, &[SE::ChromeSelected]);
-    let menu_norm_style    = compose::compose(&editor.theme, editor.depth, &[SE::ChromeMuted]);
-
-    // -----------------------------------------------------------------------
     // Command palette overlay (drawn on top of everything else)
     // -----------------------------------------------------------------------
     // A6 self-heal: the window must respect the LIVE frame's geometry (resize
@@ -748,12 +803,13 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         let ov_h = ov_rect.height;
         let list_h = crate::list_window::list_h_for(palette.rows.len(), h) as u16;
 
-        // Clear the overlay area.
+        // Clear the overlay area; then apply the fill style (T4: no-op default; T5: ChromeOverlay bg).
         frame.render_widget(Clear, ov_rect);
+        frame.buffer_mut().set_style(ov_rect, cs.ov_fill);
 
         // Draw the border (FIX-3: themed with Chrome so the frame matches the panel bg).
         let mut block = Block::default().borders(Borders::ALL).title(" Command Palette ")
-            .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
+            .border_style(cs.overlay_border);
         if let Some(ind) = windowed_indicator(palette.selected, palette.rows.len(), list_h as usize) {
             block = block.title_bottom(ind);
         }
@@ -768,7 +824,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         let query_display = format!("> {}", palette.query);
         let truncated_q: String = query_display.chars().take(query_area.width as usize).collect();
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(truncated_q, ov_query_style))),
+            Paragraph::new(Line::from(Span::styled(truncated_q, cs.ov_query))),
             query_area,
         );
 
@@ -778,7 +834,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
 
         // List of rows (below query, inside border) — windowed by scroll_top.
         let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h);
-        let highlight_style = ov_highlight_style;
+        let highlight_style = cs.overlay_selected;
         let end = (palette.scroll_top + list_h as usize).min(palette.rows.len());
         let items: Vec<ListItem> = palette.rows[palette.scroll_top..end].iter().map(|row| {
             // Left: label; right-aligned: chord.
@@ -818,8 +874,9 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         let list_h = crate::list_window::list_h_for(outline.rows.len(), h);
 
         frame.render_widget(Clear, ov_rect);
+        frame.buffer_mut().set_style(ov_rect, cs.ov_fill);
         let mut block = Block::default().borders(Borders::ALL).title(" Outline ")
-            .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
+            .border_style(cs.overlay_border);
         if let Some(ind) = windowed_indicator(outline.selected, outline.rows.len(), list_h) {
             block = block.title_bottom(ind);
         }
@@ -830,14 +887,14 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             let query_display = format!("> {}", outline.query);
             let truncated_q: String = query_display.chars().take(query_area.width as usize).collect();
             frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(truncated_q, ov_query_style))),
+                Paragraph::new(Line::from(Span::styled(truncated_q, cs.ov_query))),
                 query_area,
             );
 
             if ov_h >= 4 && list_h > 0 {
                 let list_h_u16 = list_h as u16;
                 let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h_u16);
-                let highlight_style = ov_highlight_style;
+                let highlight_style = cs.overlay_selected;
                 let end = (outline.scroll_top + list_h).min(outline.rows.len());
                 let items: Vec<ListItem> = outline.rows[outline.scroll_top..end].iter().map(|row| {
                     let mut text = format!("{}{}", " ".repeat(row.indent.saturating_mul(2)), row.text);
@@ -878,8 +935,9 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         let list_h = crate::list_window::list_h_for(tp.rows.len(), h);
 
         frame.render_widget(Clear, ov_rect);
+        frame.buffer_mut().set_style(ov_rect, cs.ov_fill);
         let mut block = Block::default().borders(Borders::ALL).title(" Select Theme ")
-            .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
+            .border_style(cs.overlay_border);
         if let Some(ind) = windowed_indicator(tp.selected, tp.rows.len(), list_h) {
             block = block.title_bottom(ind);
         }
@@ -890,14 +948,14 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             let query_display = format!("> {}", tp.query);
             let truncated_q: String = query_display.chars().take(query_area.width as usize).collect();
             frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(truncated_q, ov_query_style))),
+                Paragraph::new(Line::from(Span::styled(truncated_q, cs.ov_query))),
                 query_area,
             );
 
             if ov_h >= 4 && list_h > 0 {
                 let list_h_u16 = list_h as u16;
                 let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h_u16);
-                let highlight_style = ov_highlight_style;
+                let highlight_style = cs.overlay_selected;
                 let end = (tp.scroll_top + list_h).min(tp.rows.len());
                 let items: Vec<ListItem> = tp.rows[tp.scroll_top..end].iter().map(|name| {
                     let truncated: String = name.chars().take(list_area.width as usize).collect();
@@ -937,9 +995,10 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         let list_h = crate::list_window::list_h_for(fb.entries.len(), h);
 
         frame.render_widget(Clear, ov_rect);
+        frame.buffer_mut().set_style(ov_rect, cs.ov_fill);
         let title = format!(" Open: {} ", fb.dir.display());
         let mut block = Block::default().borders(Borders::ALL).title(title)
-            .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
+            .border_style(cs.overlay_border);
         // Indicator composes with the existing dynamic title (file browser already uses top title).
         if let Some(ind) = windowed_indicator(fb.selected, fb.entries.len(), list_h) {
             block = block.title_bottom(ind);
@@ -951,14 +1010,14 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             let query_display = format!("> {}", fb.query);
             let truncated_q: String = query_display.chars().take(query_area.width as usize).collect();
             frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(truncated_q, ov_query_style))),
+                Paragraph::new(Line::from(Span::styled(truncated_q, cs.ov_query))),
                 query_area,
             );
 
             if ov_h >= 4 && list_h > 0 {
                 let list_h_u16 = list_h as u16;
                 let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h_u16);
-                let highlight_style = ov_highlight_style;
+                let highlight_style = cs.overlay_selected;
                 let end = (fb.scroll_top + list_h).min(fb.entries.len());
                 let items: Vec<ListItem> = fb.entries[fb.scroll_top..end].iter().map(|e| {
                     let label = if e.is_dir { format!("{}/", e.name) } else { e.name.clone() };
@@ -987,7 +1046,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         // Full-width bar background: gaps between labels + the right side carry the
         // Chrome style; the per-label paints below overwrite their own rects (A2).
         let bar_row = Rect::new(area.x, area.y, w, 1);
-        frame.buffer_mut().set_style(bar_row, menu_closed_style);
+        frame.buffer_mut().set_style(bar_row, cs.menu_closed);
         match editor.menu {
             Some(ref menu) if !menu.groups.is_empty() => {
                 // Paint the menu bar (one label per category)
@@ -997,9 +1056,9 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                     let label = crate::menu::category_label_pub(cat);
                     let text = format!(" {label} ");
                     let style = if *i == menu.open {
-                        menu_open_style
+                        cs.menu_open
                     } else {
-                        menu_closed_style
+                        cs.menu_closed
                     };
                     frame.render_widget(Paragraph::new(text).style(style), *rect);
                 }
@@ -1012,9 +1071,9 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                         .enumerate()
                         .map(|(row, (label, _))| {
                             let style = if row == menu.highlighted {
-                                menu_sel_style
+                                cs.menu_sel
                             } else {
-                                menu_norm_style
+                                cs.menu_norm
                             };
                             ListItem::new(format!(" {label} ")).style(style)
                         })
@@ -1027,7 +1086,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 // labels, all closed-style, no dropdown, no highlight.
                 for (i, rect) in &menu_bar_layout_cats(menu_area, &crate::registry::MENU_ORDER) {
                     let label = crate::menu::category_label_pub(crate::registry::MENU_ORDER[*i]);
-                    frame.render_widget(Paragraph::new(format!(" {label} ")).style(menu_closed_style), *rect);
+                    frame.render_widget(Paragraph::new(format!(" {label} ")).style(cs.menu_closed), *rect);
                 }
             }
         }
@@ -1045,16 +1104,17 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         let ov_h = ov_rect.height;
 
         frame.render_widget(Clear, ov_rect);
+        frame.buffer_mut().set_style(ov_rect, cs.ov_fill);
 
         let title = format!(" {} ", diag_ov.anchor.message);
         let block = Block::default().borders(Borders::ALL).title(title)
-            .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
+            .border_style(cs.overlay_border);
         frame.render_widget(block, ov_rect);
 
         if ov_h >= 3 {
             let list_h = (row_count as u16).min(15).min(ov_h.saturating_sub(2));
             let list_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), list_h);
-            let highlight_style = ov_highlight_style;
+            let highlight_style = cs.overlay_selected;
 
             let n_sugg = diag_ov.anchor.suggestions.len();
             let items: Vec<ListItem> = (0..row_count).take(list_h as usize).map(|i| {
