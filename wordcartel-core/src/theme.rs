@@ -548,9 +548,11 @@ pub fn tokyo_night() -> Theme {
     }
 }
 
-/// ANSI-named theme — explicit named-color chrome ladder (§C terminal-ansi table).
-/// `base_fg/bg = Color::Default`; NOT monochrome; chrome faces fully explicit (unlike
-/// terminal-plain whose overlay stays exempt). [verify at implementation: named-hue choices]
+/// ANSI-named theme — the user's terminal palette with the FULL markdown colorization and a
+/// polished chrome ladder. `base_fg/bg = Color::Default` (defers to the terminal bg); NOT
+/// monochrome; every fg-required role carries a named ANSI hue (see the completeness test), and
+/// chrome faces are fully explicit (unlike terminal-plain, whose overlay stays exempt). This is
+/// the "keep my terminal colors, lose nothing else" theme.
 pub fn terminal_ansi() -> Theme {
     let m = |fg: Option<Color>, bold: bool, italic: bool, underline: bool, strike: bool, reverse: bool| Face {
         fg, bold: bold.then_some(true), italic: italic.then_some(true),
@@ -563,11 +565,13 @@ pub fn terminal_ansi() -> Theme {
         heading_level_glyph: true, monochrome: false,
         faces: ThemeFaces {
             text: Face::default(),
-            emphasis: m(None, false, true, false, false, false),
-            strong: m(None, true, false, false, false, false),
-            strong_emphasis: m(None, true, true, false, false, false),
+            // Inline emphasis carries a named hue AND its modifier — the same full colorization the
+            // RGB themes give (tokyo: MAGENTA/YELLOW/ORANGE/COMMENT), mapped to the ANSI-16 palette.
+            emphasis: m(Some(Color::Magenta), false, true, false, false, false),
+            strong: m(Some(Color::Yellow), true, false, false, false, false),
+            strong_emphasis: m(Some(Color::LightRed), true, true, false, false, false),
             code: m(Some(Color::Green), false, false, false, false, false),
-            strikethrough: m(None, false, false, false, true, false),
+            strikethrough: m(Some(Color::DarkGray), false, false, false, true, false),
             link: m(Some(Color::Blue), false, false, true, false, false),
             heading: [
                 m(Some(Color::Cyan),    true, false, false, false, false), // h1
@@ -592,14 +596,18 @@ pub fn terminal_ansi() -> Theme {
             focus_dim: Face { fg: Some(Color::DarkGray), ..Face::default() },
             fold_marker: Face { fg: Some(Color::DarkGray), ..Face::default() },
             wrap_guide: Face { fg: Some(Color::DarkGray), ..Face::default() },
-            // Explicit named-ANSI chrome ladder (§C terminal-ansi table; D2 — unlike terminal-plain
-            // whose overlay is exempt, terminal-ansi makes ChromeOverlay explicit).
-            chrome:          Face { fg: Some(Color::White),    bg: Some(Color::Black),   ..Face::default() },
+            // Explicit named-ANSI chrome ladder, mirroring the Ansi16 dark-arm policy: DarkGray
+            // elevated over the unknown terminal canvas (visible on a black OR white terminal),
+            // bar/dropdown/modal sharing that tone with the dropdown set apart by `dim`. This makes
+            // the modal share the dropdown tone (Overlay.bg == Muted.bg) and renders the menus as
+            // nicely as the RGB themes do at 16-color depth. (terminal-plain keeps its frameless
+            // Black bar — its scrollbar reuses Chrome vs ChromeMuted for thumb-vs-track contrast.)
+            chrome:          Face { fg: Some(Color::White),    bg: Some(Color::DarkGray), ..Face::default() },
             chrome_reverse:  Face { reverse: Some(true), ..Face::default() },
             chrome_overlay:  Face { fg: Some(Color::White),    bg: Some(Color::DarkGray), ..Face::default() },
             chrome_selected: Face { fg: Some(Color::Black),    bg: Some(Color::White),   ..Face::default() },
-            chrome_muted:    Face { fg: Some(Color::Gray),     bg: Some(Color::Black), dim: Some(true), ..Face::default() },
-            chrome_accent:   Face { fg: Some(Color::LightCyan), bg: Some(Color::Black), bold: Some(true), ..Face::default() },
+            chrome_muted:    Face { fg: Some(Color::White),    bg: Some(Color::DarkGray), dim: Some(true), ..Face::default() },
+            chrome_accent:   Face { fg: Some(Color::LightCyan), bg: Some(Color::DarkGray), bold: Some(true), ..Face::default() },
         },
     }
 }
@@ -1293,10 +1301,12 @@ mod tests {
         assert_eq!(t.base_fg, Color::Default, "terminal-ansi base_fg = Default");
         assert_eq!(t.base_bg, Color::Default, "terminal-ansi base_bg = Default");
         assert!(!t.monochrome, "terminal-ansi NOT monochrome");
-        // Chrome faces must use named ANSI colors (not Rgb) — spot check
+        // Chrome faces must use named ANSI colors (not Rgb) — spot check. The ladder mirrors the
+        // Ansi16 dark-arm policy (DarkGray elevated over the unknown terminal canvas) so the menus
+        // render as nicely as the RGB themes do at 16-color depth.
         let chrome = t.face(SemanticElement::Chrome);
-        assert_eq!(chrome.fg, Some(Color::White),  "chrome fg White");
-        assert_eq!(chrome.bg, Some(Color::Black),  "chrome bg Black");
+        assert_eq!(chrome.fg, Some(Color::White),    "chrome fg White");
+        assert_eq!(chrome.bg, Some(Color::DarkGray), "chrome bg DarkGray");
         let ov = t.face(SemanticElement::ChromeOverlay);
         assert_eq!(ov.fg, Some(Color::White),    "overlay fg White");
         assert_eq!(ov.bg, Some(Color::DarkGray), "overlay bg DarkGray");
@@ -1305,7 +1315,7 @@ mod tests {
         assert_eq!(sel.bg, Some(Color::White), "selected bg White");
         let acc = t.face(SemanticElement::ChromeAccent);
         assert_eq!(acc.fg, Some(Color::LightCyan), "accent fg LightCyan");
-        assert_eq!(acc.bg, Some(Color::Black),     "accent bg Black");
+        assert_eq!(acc.bg, Some(Color::DarkGray),  "accent bg DarkGray");
         assert_eq!(acc.bold, Some(true),            "accent bold");
         // All text/chrome elements: no Rgb face values (named ANSI or modifier-only or Default)
         for el in ALL_ELEMENTS {
@@ -1314,6 +1324,50 @@ mod tests {
                 assert!(!matches!(c, Color::Rgb{..}), "terminal-ansi/{el:?} must not use Rgb; got {c:?}");
             }
         }
+    }
+
+    #[test]
+    fn terminal_ansi_is_fully_colored_and_chrome_coherent() {
+        // terminal-ansi honors the user's ANSI palette (named colors) while providing the SAME
+        // completeness as the RGB builtins: every fg-required role carries a real named color, and
+        // the chrome ladder honors the modal-shares-dropdown invariant (Overlay.bg == Muted.bg).
+        let t = terminal_ansi();
+        // (1) The four inline faces that used to be modifier-only now carry a hue AND keep their
+        // modifier — the flat-emphasis look that read as half-baked is gone.
+        let emph = t.face(SemanticElement::Emphasis);
+        assert_eq!(emph.fg, Some(Color::Magenta), "emphasis fg Magenta");
+        assert_eq!(emph.italic, Some(true), "emphasis keeps italic");
+        let strong = t.face(SemanticElement::Strong);
+        assert_eq!(strong.fg, Some(Color::Yellow), "strong fg Yellow");
+        assert_eq!(strong.bold, Some(true), "strong keeps bold");
+        let se = t.face(SemanticElement::StrongEmphasis);
+        assert_eq!(se.fg, Some(Color::LightRed), "strong_emphasis fg LightRed (warm orange proxy)");
+        assert_eq!(se.bold, Some(true), "strong_emphasis keeps bold");
+        assert_eq!(se.italic, Some(true), "strong_emphasis keeps italic");
+        let strike = t.face(SemanticElement::Strikethrough);
+        assert_eq!(strike.fg, Some(Color::DarkGray), "strikethrough fg DarkGray (matches comment tone)");
+        assert_eq!(strike.strike, Some(true), "strikethrough keeps strike");
+        // (2) Full completeness — every fg-required role has a real (non-Default) color, exactly the
+        // contract the 16 RGB builtins satisfy. Reuses the Part B `face_requirement` classifier.
+        for el in ALL_ELEMENTS {
+            if face_requirement(el) == FaceReq::FgRequired {
+                let f = t.face(el);
+                assert!(f.fg.is_some() && f.fg != Some(Color::Default),
+                    "terminal-ansi {el:?}: fg-required face has no explicit color");
+            }
+        }
+        // (3) Chrome coherence: the ladder mirrors the Ansi16 dark-arm policy (DarkGray elevated
+        // over the unknown terminal canvas), and the modal shares the dropdown tone.
+        let bar   = t.face(SemanticElement::Chrome);
+        let drop  = t.face(SemanticElement::ChromeMuted);
+        let modal = t.face(SemanticElement::ChromeOverlay);
+        assert_eq!(bar.bg, Some(Color::DarkGray),
+            "bar bg DarkGray — elevated, visible on a black OR white terminal");
+        assert_eq!(modal.bg, drop.bg,
+            "Overlay.bg == Muted.bg (modal shares the dropdown tone)");
+        assert_eq!(drop.bg, Some(Color::DarkGray), "dropdown bg DarkGray");
+        assert_eq!(drop.dim, Some(true),
+            "dropdown distinguished from the bar by its dim fg");
     }
 
     #[test]
