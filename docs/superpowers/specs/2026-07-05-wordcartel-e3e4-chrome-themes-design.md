@@ -29,16 +29,19 @@ Grounded facts). Working order: the E3 slot.
 - Focus-dim / typewriter (writing modes, not chrome).
 - No theme-picker redesign (18+ rows already handled by A6 windowing); no config
   `include`; no OSC 12 cursor-color control (deferred note).
-- `terminal-plain` (ex-default) and `no-color` keep their identities: terminal-inherited
-  minimalism and pure-modifier cue mode respectively — they participate in the ladder's
-  STRUCTURE but never paint opinionated backgrounds (user-ratified).
+- `terminal-plain` (ex-default) and `no-color` keep their identities (user-ratified),
+  stated precisely (Codex r1 I-6): terminal-plain's CANVAS stays terminal-inherited
+  (base fg/bg = Default — never an opinionated page color) while its CHROME keeps
+  today's legacy named-ANSI family (White/Black bars, DarkGray muted — the pre-theming
+  look is its contract); no-color is pure-modifier everywhere. Both are exempt from
+  derivation by the Rgb-bases rule (D1).
 - `theme::default()` — the CODE fn — keeps returning the plain table (renamed in `name`
   only): error-path fallbacks stay minimal-safe and the existing render-test corpus keeps
   its meaning. Only `resolve_theme`'s no-config arm changes to the launch default.
 
 ## Grounded facts
 
-### Code (Explore map, HEAD 8b15f3d)
+### Code (Explore map at 8b15f3d; fold-verified at 35e785d — anchors may drift)
 - SemanticElement (theme.rs:29): 27 variants; FOUR chrome faces — `Chrome` (panel),
   `ChromeReverse` (modifier-only reverse), `ChromeSelected`, `ChromeMuted`. `Face`
   (theme.rs:18): all-Option fg/bg/underline_color + bold/italic/underline/strike/reverse/
@@ -57,8 +60,9 @@ Grounded facts). Working order: the E3 slot.
   fork. `mono_faces` (:469): modifier-only chrome (kept for cue mode).
 - resolve_theme (theme_resolve.rs:84-138): depth detect → base pick (file → base16;
   name → builtin; else default) → user `styles.*` override loop (monochrome color-scrub)
-  → `apply_cue_mode_glyph`. The disposition applies AFTER cue-glyph (the map's insertion
-  point). EnvSnapshot = NO_COLOR/COLORTERM/TERM.
+  → `apply_cue_mode_glyph`. The disposition applies IN the derivation step (before
+  theme/user overrides); cue-glyph remains LAST (the earlier "after cue-glyph" note was
+  the map's suggestion for a patch-style axis — superseded by derivation, Codex r1 I-7). EnvSnapshot = NO_COLOR/COLORTERM/TERM.
 - Render inventory (render.rs, 1,134 prod lines; full site list in the map): overlay
   UNSELECTED rows + backdrop gaps = ratatui List defaults after Clear (UNTHEMED — the
   reported bug); overlay query lines = SE::Text (unthemed in every builtin); overlay
@@ -107,9 +111,13 @@ Grounded facts). Working order: the E3 slot.
 
 ## D1. The derived chrome ladder (core theme.rs)
 
-- New: `pub enum ChromeDisposition { Full, Zen }` (core) and
-  `fn derive_chrome(base_bg: Color, base_fg: Color, accent: Option<Color>, disp: ChromeDisposition) -> ChromeFaces`
-  (a small struct of the six faces, folded into ThemeFaces). Mechanics:
+- New: `pub enum ChromeDisposition { Full, Zen }` (CORE — the shell's config parse maps
+  the string to the core enum; dependency direction sound) and a PUBLIC core method
+  `Theme::rederive_chrome(&mut self, disp: ChromeDisposition)` (Codex r1 I-1: ThemeFaces
+  is private — a free fn returning a private struct is uncallable from the shell; the
+  method mutates the six chrome faces in place). Builtin constructors call it with Full;
+  resolve_theme calls it with the configured disposition BEFORE applying overrides.
+  Mechanics:
   - Steps are LIGHTNESS-ONLY moves in HSL (the existing rgb_to_hsl/hsl_to_rgb; hue and
     saturation pass through — phosphor/tokyo tints carry into chrome by construction).
   - Direction by base luminance: dark base (L < 0.5) steps LIGHTER ("lit from the
@@ -124,10 +132,12 @@ Grounded facts). Working order: the E3 slot.
   - Zen: the SAME derivation with collapsed step sizes (panel ≈ canvas + a minimal
     visible step, overlay = one subtle step, muted dimmer, accent retained but fainter).
     Zen never changes hue.
-  - `Color::Default` bases (terminal-plain, terminal-ansi): the ladder cannot compute
-    lightness — these themes provide EXPLICIT chrome faces (terminal-plain keeps today's
-    White/Black family; terminal-ansi uses named-ANSI steps) and are exempt from
-    derivation (a theme-table property, not a special case in derive_chrome).
+  - Exemption rule, CONCRETE (Codex r1 I-2 — no new field needed): derivation applies
+    ONLY when both bases are `Color::Rgb`; `rederive_chrome` is a NO-OP otherwise (named/
+    Default bases have no computable lightness — Codex m-4 made explicit). terminal-plain,
+    terminal-ansi, and no-color therefore keep their EXPLICIT face tables untouched by
+    construction; base16/file themes and all E4 bundles are Rgb and derive. Derivation
+    runs PRE-quantize (depth downconversion applies to the derived values as to any).
 - Order of application: derive (from the theme's declared bases + disposition) → the
   theme's own explicit face overrides (tokyo-night's PANEL_BG chrome; phosphor's
   hue-shade chrome KEPT ONLY where probes show the derived values differ visibly from
@@ -157,9 +167,12 @@ Grounded facts). Working order: the E3 slot.
     and fill read as one raised material (the research's tonal-separation default); in
     ZEN the interior collapses toward the canvas (the blend the user expected — no more
     terminal-default "slightly off" hover) and the thin border alone carries the
-    separation (border-as-separator, the calm expression). Pins: border-cell bg ==
-    interior bg under phosphor-green (the halo regression); full → interior bg ==
-    ChromeOverlay bg ≠ canvas; zen → interior bg within the collapsed step of canvas.
+    separation (border-as-separator, the calm expression). ratatui mechanics verified (Codex r1 m-2): Cell::set_style PATCHES
+    fields, so a bg-None border style leaves the fill's bg intact — the rule is sound;
+    tests must cover BORDER and TITLE cells explicitly, not just interiors. Pins:
+    border-cell bg == interior bg under phosphor-green (the halo regression, both
+    dispositions); full → interior bg == ChromeOverlay bg ≠ canvas; zen → interior bg
+    within the collapsed step of canvas.
   - Status line: normal state composes [Chrome] (explicit — matches the menu bar at
     last); ACTIVE states (search / minibuffer / prompt) compose [ChromeAccent] — the
     first honest "the editor is asking you something" distinction. terminal-plain's
@@ -169,8 +182,10 @@ Grounded facts). Working order: the E3 slot.
     ChromeMuted dropdown-normal) — values now derived.
   - Scrollbar/wrap-guide/fold/prefix: roles unchanged.
 - Accent discipline (research-mandated, spec-enforced list): ChromeAccent is legal ONLY
-  for the active-prompt status state, the dirty-buffer indicator in the status text
-  region, and (future) focus marks. Reviewers flag any other use.
+  for the active-prompt status state and (future) focus marks. The dirty-buffer marker is
+  DEFERRED (Codex r1 I-5: status_left_text returns one string rendered as a single span —
+  render.rs:196/:683; accenting the marker needs span-level status surgery, which rides
+  E2's status work). Reviewers flag any other accent use.
 - `default_status_line_still_reversed` (render.rs:1630) is REWRITTEN to the new contract:
   under terminal-plain the status row carries Chrome's explicit White/Black (or the
   reverse-modifier expression terminal-plain declares); under tokyo-night the status row
@@ -184,10 +199,17 @@ Grounded facts). Working order: the E3 slot.
 - resolve_theme applies the disposition in the derivation call (D1's order). The
   ChromeDisposition reaches apply_theme so the picker/preview path re-derives correctly.
 - `toggle_chrome` command ("Chrome: Full/Zen", MenuCategory::Settings, registered BEFORE
-  save_settings — the journey-preservation rule): flips `editor.chrome_disposition`
-  (new Editor field, seeded from the resolved config), re-derives the CURRENT theme's
-  chrome (an apply_theme-shaped path: re-resolve chrome faces + derive::rebuild +
-  ensure_visible), status "chrome: zen" / "chrome: full".
+  save_settings — the journey-preservation rule). SOURCE OF TRUTH (Codex r1 Critical:
+  resolve_theme destructively folds user styles into the Theme — theme_resolve.rs:122 —
+  so re-deriving from `editor.theme` would smear or lose overrides): the toggle uses the
+  ESTABLISHED request-flag → run-loop pattern (keymap_rebuild / settings_save precedent).
+  The handler flips `editor.chrome_disposition` (new Editor field, seeded from the
+  resolved config) + sets `editor.theme_rederive: bool` + status "chrome: zen"/"chrome:
+  full". The RUN LOOP — which owns `cfg.theme` (the full ThemeConfig incl. user styles)
+  and the EnvSnapshot — re-runs the COMPLETE resolve pipeline (base pick → derive with
+  the new disposition → theme overrides → user styles → cue glyph) and applies via
+  apply_theme; derive::rebuild + ensure_visible ride the existing apply path. Full
+  fidelity by construction — no state reconstruction from a folded Theme.
 - Persistence: the disposition joins the Save Settings inventory per-field.
   `SettingsSnapshot` gains `chrome_disposition`; `OTheme` gains
   `chrome: Option<String>` ("full"/"zen") beside `name`. The diff arm is a PLAIN string
@@ -195,10 +217,19 @@ Grounded facts). Working order: the E3 slot.
   its own per-key mask predicate
   (`mask.theme.as_ref().and_then(|t| t.chrome.as_ref()).is_some()`). NOTE this splits the
   theme mask handling: `name` keeps the provenance-collapsed sentinel (D1+A5's N-4 rule),
-  `chrome` gets the ordinary per-key predicate; the plan pins both and their interaction
-  (a --config masking `file` guards `name` but NOT `chrome`).
-- The picker previews themes under the CURRENT disposition (preview calls the same
-  derivation) — no picker UI change.
+  `chrome` gets the ordinary per-key predicate. The UPDATE SET named in full (Codex r1
+  I-3 — parse_mask today recognizes only name/file and collapses to the sentinel,
+  settings.rs:186): `OTheme` gains `chrome: Option<String>`; parse_mask's private
+  MaskTheme gains `chrome`; parse_mask sets the name-sentinel from name|file AND passes
+  chrome through as its own key; the bespoke theme diff section gains a plain diff_key
+  string arm for chrome beside the provenance arm. Interaction pinned: a --config masking
+  `file` guards `name` but NOT `chrome`.
+- The picker previews themes under the CURRENT disposition: `apply_theme` gains the
+  derivation call (`theme.rederive_chrome(self.chrome_disposition)` before install —
+  Codex r1 I-4: the preview path calls `Theme::builtin` + `apply_theme` directly,
+  bypassing resolve). KNOWN pre-existing approximation, recorded not fixed: the preview
+  path also bypasses user `styles.*` today (a previewed-then-committed theme lacks user
+  overrides until the next full resolve) — out of scope, noted in Deferred.
 
 ## D4. Phosphor restructure
 
@@ -238,6 +269,9 @@ Grounded facts). Working order: the E3 slot.
 
 - `render.rs` keeps: the draw path (tiny-guard, canvas/text rows, scrollbar, status
   line), the shared geometry helpers (pub(crate); mouse.rs untouched), compose glue.
+- Geometry helpers (palette_overlay_rect, menu_bar_layout, menu_dropdown_row_at, etc.)
+  STAY in render.rs as pub(crate) — mouse.rs's `crate::render::…` imports (mouse.rs:144/
+  :180/:186) remain valid unchanged (Codex r1 m-3).
 - NEW `render_overlays.rs`: the five overlay painters + the menu painter + the diag
   overlay, receiving a `ChromeStyles` struct (the precompute block's six styles + the two
   new faces) built once in render.rs. Byte-identical moves where code doesn't otherwise
