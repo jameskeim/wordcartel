@@ -421,6 +421,9 @@ pub struct Editor {
     /// Chrome disposition (Full/Zen). Seeded from `[theme] chrome` at startup; toggled at
     /// runtime by the `toggle_chrome` command (T7). Passed to `resolve_theme` on re-derive.
     pub chrome_disposition: wordcartel_core::theme::ChromeDisposition,
+    /// Canvas opacity (Opaque/Transparent). Seeded from `[theme] canvas` at startup; toggled at
+    /// runtime by `toggle_canvas`. Render-only — never re-derives the theme.
+    pub canvas: wordcartel_core::theme::CanvasMode,
     /// Request flag: `toggle_chrome` command sets this; the run-loop re-derives and clears it.
     /// Mirrors the `settings_save_requested` pattern (grounding A.8).
     pub theme_rederive: bool,
@@ -492,6 +495,7 @@ impl Editor {
             theme: wordcartel_core::theme::default(),
             depth: wordcartel_core::theme::Depth::Truecolor,
             chrome_disposition: wordcartel_core::theme::ChromeDisposition::Full,
+            canvas: wordcartel_core::theme::CanvasMode::Opaque,
             theme_rederive: false,
             heading_glyph_cfg: None,
             resume_enabled: false,

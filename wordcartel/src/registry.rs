@@ -472,8 +472,13 @@ impl Registry {
             c.editor.open_minibuffer("Wrap column: ", crate::minibuffer::MinibufferKind::WrapColumn);
             CommandResult::Handled
         });
-        // toggle_chrome MUST be registered BEFORE save_settings (journey_palette_end relies on
-        // save_settings being the last command dispatched from End+Enter — spec D3 / A.7).
+        // toggle_canvas and toggle_chrome MUST be registered BEFORE save_settings
+        // (journey_palette_end relies on save_settings being the last command dispatched
+        // from End+Enter — spec D3 / A.7).
+        r.register("toggle_canvas", "Canvas: Opaque/Transparent", Some(MenuCategory::Settings), |c| {
+            toggle_canvas(c.editor);
+            CommandResult::Handled
+        });
         r.register("toggle_chrome", "Chrome: Full/Zen", Some(MenuCategory::Settings), |c| {
             toggle_chrome(c.editor);
             CommandResult::Handled
@@ -569,6 +574,28 @@ fn toggle_chrome(editor: &mut crate::editor::Editor) {
     }
     // Normal arm: derived Rgb theme at Truecolor/256; the rederive will visibly change chrome.
     editor.status = format!("chrome: {label}");
+}
+
+/// Flip the canvas opacity. Render-only — no re-derive. The flip always persists (canvas is a
+/// user preference that outlives the current theme); the status is honest about visibility:
+///   • Rgb theme at a color depth: "canvas: opaque"/"canvas: transparent".
+///   • non-Rgb base_bg, or Depth::None: flips + persists, "no effect: {name} has no canvas".
+fn toggle_canvas(editor: &mut crate::editor::Editor) {
+    use wordcartel_core::theme::{CanvasMode, Color, Depth};
+    let new_mode = match editor.canvas {
+        CanvasMode::Opaque      => CanvasMode::Transparent,
+        CanvasMode::Transparent => CanvasMode::Opaque,
+    };
+    editor.canvas = new_mode;
+    let label = match new_mode { CanvasMode::Opaque => "opaque", CanvasMode::Transparent => "transparent" };
+    // No canvas to paint: non-Rgb base_bg (terminal-* themes) or the None (cue) depth.
+    let has_canvas = matches!(editor.theme.base_bg, Color::Rgb { .. }) && editor.depth != Depth::None;
+    if !has_canvas {
+        let name = editor.theme.name.clone();
+        editor.status = format!("canvas: {label} (no effect: {name} has no canvas)");
+        return;
+    }
+    editor.status = format!("canvas: {label}");
 }
 
 /// Thin adapter: run a built-in `Command` against the Ctx's editor+clock.
@@ -778,6 +805,37 @@ mod tests {
             assert_eq!(m.label, label, "label mismatch for {id}");
             assert_eq!(m.menu, Some(MenuCategory::Settings), "menu category mismatch for {id}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 2 (canvas-transparency): toggle_canvas — honest arms
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn toggle_canvas_flips_and_reports() {
+        use wordcartel_core::theme::{CanvasMode, Depth};
+        // RGB theme at a color depth: flips + plain status.
+        let mut ed = crate::editor::Editor::new_from_text("x", None, (40, 4));
+        ed.theme = wordcartel_core::theme::Theme::builtin("flexoki-dark").unwrap();
+        ed.depth = Depth::Truecolor;
+        assert_eq!(ed.canvas, CanvasMode::Opaque);
+        toggle_canvas(&mut ed);
+        assert_eq!(ed.canvas, CanvasMode::Transparent);
+        assert_eq!(ed.status, "canvas: transparent");
+        // Non-Rgb theme: flips + persists, honest "no effect".
+        let mut ed2 = crate::editor::Editor::new_from_text("x", None, (40, 4));
+        ed2.theme = wordcartel_core::theme::Theme::builtin("terminal-plain").unwrap();
+        ed2.depth = Depth::Truecolor;
+        toggle_canvas(&mut ed2);
+        assert_eq!(ed2.canvas, CanvasMode::Transparent, "flip persists even when inert");
+        assert_eq!(ed2.status, "canvas: transparent (no effect: terminal-plain has no canvas)");
+        // Depth::None (cue) on an Rgb theme: also "no effect" (no color to paint).
+        let mut ed3 = crate::editor::Editor::new_from_text("x", None, (40, 4));
+        ed3.theme = wordcartel_core::theme::Theme::builtin("flexoki-dark").unwrap();
+        ed3.depth = Depth::None;
+        toggle_canvas(&mut ed3);
+        assert_eq!(ed3.canvas, CanvasMode::Transparent);
+        assert_eq!(ed3.status, "canvas: transparent (no effect: flexoki-dark has no canvas)");
     }
 
     // -----------------------------------------------------------------------

@@ -1362,6 +1362,9 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     let (chrome_disp, chrome_warn) = crate::theme_resolve::parse_chrome(&cfg.theme.chrome);
     if let Some(w) = chrome_warn { warns.push(w); }
     editor.chrome_disposition = chrome_disp;
+    let (canvas_mode, canvas_warn) = crate::theme_resolve::parse_canvas(&cfg.theme.canvas);
+    if let Some(w) = canvas_warn { warns.push(w); }
+    editor.canvas = canvas_mode;
     let resolved = crate::theme_resolve::resolve_theme(&cfg.theme, &env, chrome_disp);
     editor.theme = resolved.theme;
     editor.depth = resolved.depth;
