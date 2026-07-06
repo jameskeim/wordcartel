@@ -91,6 +91,8 @@ pub struct OTheme {
     /// Chrome disposition persisted as "full"/"zen". Persisted per-field — independent of
     /// the name/file provenance logic (spec D3).
     #[serde(skip_serializing_if = "Option::is_none")] pub chrome: Option<String>,
+    /// Canvas opacity persisted as "opaque"/"transparent". Persisted per-field — independent of
+    /// the name/file provenance logic and of chrome (spec D5).
     #[serde(skip_serializing_if = "Option::is_none")] pub canvas: Option<String>,
 }
 
