@@ -481,8 +481,7 @@ pub fn tokyo_night() -> Theme {
     const YELLOW:    Color = rgb(0xe0, 0xaf, 0x68); // #e0af68
     const COMMENT:   Color = rgb(0x56, 0x5f, 0x89); // #565f89
     const DARK3:     Color = rgb(0x54, 0x5c, 0x7e); // #545c7e
-    const SEL_BG:    Color = rgb(0x28, 0x34, 0x57); // #283457
-    const PANEL_BG:  Color = rgb(0x16, 0x16, 0x1e); // #16161e
+    const SEL_BG:    Color = rgb(0x29, 0x2e, 0x42); // #292e42 (Folke bg_highlight)
 
     Theme {
         name: "tokyo-night".into(),
@@ -492,11 +491,11 @@ pub fn tokyo_night() -> Theme {
         monochrome: false,
         faces: ThemeFaces {
             text: Face::default(),
-            emphasis: Face { italic: Some(true), ..Face::default() },
-            strong: Face { bold: Some(true), ..Face::default() },
-            strong_emphasis: Face { bold: Some(true), italic: Some(true), ..Face::default() },
+            emphasis: Face { fg: Some(MAGENTA), italic: Some(true), ..Face::default() },
+            strong: Face { fg: Some(YELLOW), bold: Some(true), ..Face::default() },
+            strong_emphasis: Face { fg: Some(ORANGE), bold: Some(true), italic: Some(true), ..Face::default() },
             code: Face { fg: Some(GREEN), ..Face::default() },
-            strikethrough: Face { strike: Some(true), ..Face::default() },
+            strikethrough: Face { fg: Some(COMMENT), strike: Some(true), ..Face::default() },
             link: Face { fg: Some(BLUE), underline: Some(true), ..Face::default() },
             heading: [
                 Face { fg: Some(MAGENTA), bold: Some(true), ..Face::default() }, // h1
@@ -510,24 +509,24 @@ pub fn tokyo_night() -> Theme {
             code_block: Face { fg: Some(GREEN), ..Face::default() },
             list_marker: Face { fg: Some(BLUE), ..Face::default() },
             thematic_break: Face { fg: Some(DARK3), ..Face::default() },
-            front_matter: Face { fg: Some(DARK3), ..Face::default() },
+            front_matter: Face { fg: Some(ORANGE), italic: Some(true), ..Face::default() },
             comment: Face { fg: Some(COMMENT), italic: Some(true), dim: Some(true), ..Face::default() },
             selection: Face { bg: Some(SEL_BG), ..Face::default() },
             // §13.2 marked block: lighter-than-selection bg + reverse+bold+underline.
             marked_block: Face { bg: Some(DARK3), reverse: Some(true), bold: Some(true), underline: Some(true), ..Face::default() },
-            search_match: Face { bg: Some(SEL_BG), ..Face::default() },
+            search_match: Face { bg: Some(YELLOW), fg: Some(BG), ..Face::default() },
             search_current: Face { reverse: Some(true), ..Face::default() },
             diag_spelling: Face { underline: Some(true), underline_color: Some(RED), ..Face::default() },
-            diag_grammar:  Face { underline: Some(true), underline_color: Some(YELLOW), ..Face::default() },
+            diag_grammar:  Face { underline: Some(true), underline_color: Some(BLUE), ..Face::default() },
             focus_dim: Face { fg: Some(COMMENT), dim: Some(true), ..Face::default() },
             fold_marker: Face { fg: Some(DARK3), ..Face::default() },
-            wrap_guide: Face { fg: Some(DARK3), ..Face::default() },
-            chrome: Face { fg: Some(FG), bg: Some(PANEL_BG), ..Face::default() },
+            wrap_guide: Face { fg: Some(SEL_BG), ..Face::default() },
+            // All five chrome derived faces are sentinels — derive_chrome fills all from the
+            // elevation ladder (unified model, T1). chrome_reverse is kept (never derived).
+            chrome: Face::default(),
             chrome_reverse: Face { reverse: Some(true), ..Face::default() },
-            chrome_selected: Face { fg: Some(BG), bg: Some(FG), ..Face::default() },
-            chrome_muted: Face { fg: Some(DARK3), dim: Some(true), ..Face::default() },
-            // ChromeOverlay + ChromeAccent: all-None sentinels — derive_chrome fills them.
-            // Chrome (PANEL_BG) is kept; the sentinel rule skips any non-all-None face.
+            chrome_selected: Face::default(),
+            chrome_muted: Face::default(),
             chrome_overlay: Face::default(),
             chrome_accent: Face::default(),
         },
@@ -1494,41 +1493,76 @@ mod tests {
 
     #[test]
     fn derive_fills_only_unset_faces() {
-        // tokyo-night: chrome/chrome_selected/chrome_muted are explicitly set (non-sentinel).
-        // only chrome_overlay + chrome_accent (all-None sentinels) should be derived.
+        // Part D: tokyo-night is now ALL-sentinel on chrome/chrome_selected/chrome_muted/
+        // chrome_overlay/chrome_accent — all five derive. chrome_reverse is never derived.
         let mut t = tokyo_night();
-        let chrome_before    = t.face(SemanticElement::Chrome);
-        let selected_before  = t.face(SemanticElement::ChromeSelected);
-        let muted_before     = t.face(SemanticElement::ChromeMuted);
-        let reverse_before   = t.face(SemanticElement::ChromeReverse);
-        let overlay_before   = t.face(SemanticElement::ChromeOverlay);
-        let accent_before    = t.face(SemanticElement::ChromeAccent);
-        assert!(overlay_before == Face::default(), "overlay must start as sentinel");
-        assert!(accent_before == Face::default(), "accent must start as sentinel");
+        // confirm all five are sentinels pre-derive
+        for el in [
+            SemanticElement::Chrome, SemanticElement::ChromeSelected,
+            SemanticElement::ChromeMuted, SemanticElement::ChromeOverlay,
+            SemanticElement::ChromeAccent,
+        ] {
+            assert_eq!(t.face(el), Face::default(), "{el:?} must be sentinel pre-derive");
+        }
+        let reverse_before = t.face(SemanticElement::ChromeReverse);
 
         t.derive_chrome(ChromeDisposition::Full);
 
-        // the four explicitly-set faces survive unchanged
-        assert_eq!(t.face(SemanticElement::Chrome),         chrome_before,   "chrome kept");
-        assert_eq!(t.face(SemanticElement::ChromeSelected), selected_before, "selected kept");
-        assert_eq!(t.face(SemanticElement::ChromeMuted),    muted_before,    "muted kept");
-        assert_eq!(t.face(SemanticElement::ChromeReverse),  reverse_before,  "reverse kept — never derived");
-        // the two new faces are now derived (non-sentinel)
-        assert_ne!(t.face(SemanticElement::ChromeOverlay), Face::default(), "overlay derived");
-        assert_ne!(t.face(SemanticElement::ChromeAccent),  Face::default(), "accent derived");
-        // tokyo pins — chrome is STILL explicit at T1, so overlay derives from the explicit
-        // chrome.bg (#16161e). This overlay is a T1 INTERMEDIATE (Part D makes tokyo all-sentinel
-        // in T3, at which point overlay finalizes to §II.5 #4e5071). Accent is unchanged.
+        // chrome_reverse is never derived — kept as-is
+        assert_eq!(t.face(SemanticElement::ChromeReverse), reverse_before, "reverse kept — never derived");
+        // all five chrome faces are now non-sentinel (derived)
+        for el in [
+            SemanticElement::Chrome, SemanticElement::ChromeSelected,
+            SemanticElement::ChromeMuted, SemanticElement::ChromeOverlay,
+            SemanticElement::ChromeAccent,
+        ] {
+            assert_ne!(t.face(el), Face::default(), "{el:?} must be derived (non-sentinel)");
+        }
+        // §II.5 tokyo FULL pins (byte-exact from the probe) — all five chrome faces
+        assert_face_bg_fg(t.face(SemanticElement::Chrome),
+            (0x2d,0x2f,0x42), (0xc0,0xca,0xf5), "tokyo Chrome FULL (§II.5)");
+        assert_face_bg_fg(t.face(SemanticElement::ChromeMuted),
+            (0x3d,0x40,0x5a), (0xa8,0xad,0xc4), "tokyo ChromeMuted FULL (§II.5)");
         assert_face_bg_fg(t.face(SemanticElement::ChromeOverlay),
-            (0x2a,0x2c,0x3e), (0xc0,0xca,0xf5), "tokyo overlay FULL (T1 intermediate)");
+            (0x4e,0x50,0x71), (0xc0,0xca,0xf5), "tokyo ChromeOverlay FULL (§II.5)");
+        assert_face_bg_fg(t.face(SemanticElement::ChromeSelected),
+            (0xc0,0xca,0xf5), (0x1a,0x1b,0x26), "tokyo ChromeSelected FULL (§II.5)");
         assert_face_bg_fg(t.face(SemanticElement::ChromeAccent),
-            (0x16,0x16,0x1e), (0x8f,0xa3,0xce), "tokyo accent FULL");
+            (0x2d,0x2f,0x42), (0x8f,0xa3,0xce), "tokyo ChromeAccent FULL (§II.5)");
         assert_eq!(t.face(SemanticElement::ChromeAccent).bold, Some(true), "accent bold");
 
         // second call is a no-op (idempotency — sentinel rule)
         let snap = t.clone();
         t.derive_chrome(ChromeDisposition::Full);
         assert_eq!(t.faces, snap.faces, "second derive is no-op");
+    }
+
+    #[test]
+    fn tokyo_standardized_faces() {
+        use SemanticElement::*;
+        let t = tokyo_night();
+        let magenta = Color::Rgb{r:0xbb,g:0x9a,b:0xf7};
+        let yellow  = Color::Rgb{r:0xe0,g:0xaf,b:0x68};
+        let orange  = Color::Rgb{r:0xff,g:0x9e,b:0x64};
+        let comment = Color::Rgb{r:0x56,g:0x5f,b:0x89};
+        let blue    = Color::Rgb{r:0x7a,g:0xa2,b:0xf7};
+        let bg      = Color::Rgb{r:0x1a,g:0x1b,b:0x26};
+        let sel_bg  = Color::Rgb{r:0x29,g:0x2e,b:0x42};   // aligned #292e42
+        assert_eq!(t.face(Emphasis).fg, Some(magenta));   assert_eq!(t.face(Emphasis).italic, Some(true));
+        assert_eq!(t.face(Strong).fg, Some(yellow));      assert_eq!(t.face(Strong).bold, Some(true));
+        assert_eq!(t.face(StrongEmphasis).fg, Some(orange));
+        assert_eq!(t.face(StrongEmphasis).bold, Some(true)); assert_eq!(t.face(StrongEmphasis).italic, Some(true));
+        assert_eq!(t.face(Strikethrough).fg, Some(comment)); assert_eq!(t.face(Strikethrough).strike, Some(true));
+        assert_eq!(t.face(SearchMatch).bg, Some(yellow));  assert_eq!(t.face(SearchMatch).fg, Some(bg));
+        assert_eq!(t.face(FrontMatter).fg, Some(orange));  assert_eq!(t.face(FrontMatter).italic, Some(true));
+        assert_eq!(t.face(DiagGrammar).underline_color, Some(blue));
+        assert_eq!(t.face(WrapGuide).fg, Some(sel_bg));
+        assert_eq!(t.face(Selection).bg, Some(sel_bg));
+        // chrome faces are now all-None sentinels (pre-derive).
+        for el in [Chrome, ChromeSelected, ChromeMuted, ChromeOverlay, ChromeAccent] {
+            assert_eq!(t.face(el), Face::default(), "{el:?} sentinel");
+        }
+        assert_eq!(t.face(ChromeReverse).reverse, Some(true), "chrome_reverse kept");
     }
 
     #[test]

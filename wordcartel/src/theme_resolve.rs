@@ -456,33 +456,25 @@ mod tests {
             "Ansi16 light-canvas policy: ChromeSelected bg must be Black");
 
         // tokyo-night @ Ansi16: canvas #1a1b26 → Black → DarkGray arm.
-        // Chrome/selected/muted are explicit in the constructor (not sentinels) → left to
-        // quantize at render time (PANEL_BG → Black, FG → Gray).
-        // ChromeOverlay + ChromeAccent are sentinels → filled by the dark-arm table.
+        // Part D (T3): ALL chrome faces are now sentinels → the dark-arm fixed-table policy
+        // applies to all of them (same as flexoki-dark above). Chrome bg = DarkGray, fg = White.
         let tc3 = ThemeConfig {
             name: Some("tokyo-night".into()),
             depth: Some("16".into()),
             ..Default::default()
         };
         let r3 = resolve_theme(&tc3, &env(false), ChromeDisposition::Full);
-        // Explicit Chrome face (PANEL_BG = #16161e) stays as Rgb; quantize gives Black.
-        assert_eq!(
-            theme::quantize(r3.theme.face(SemanticElement::Chrome).bg.unwrap(), Depth::Ansi16),
-            Color::Black,
-            "tokyo Chrome bg (PANEL_BG) quantizes to Black — policy leaves explicit faces alone"
-        );
-        // FG (#c0caf5) is closest to Gray at Ansi16.
-        assert_eq!(
-            theme::quantize(r3.theme.face(SemanticElement::Chrome).fg.unwrap(), Depth::Ansi16),
-            Color::Gray,
-            "tokyo Chrome fg (FG) quantizes to Gray at Ansi16"
-        );
-        // Sentinel ChromeOverlay gets the dark-arm table value (named colors, not Rgb).
+        // Chrome is now a sentinel → dark-arm table applies (like flexoki-dark case above).
+        assert_eq!(r3.theme.face(SemanticElement::Chrome).bg, Some(Color::DarkGray),
+            "tokyo Chrome (sentinel) → dark-arm DarkGray bg at Ansi16");
+        assert_eq!(r3.theme.face(SemanticElement::Chrome).fg, Some(Color::White),
+            "tokyo Chrome (sentinel) → dark-arm White fg at Ansi16");
+        // ChromeOverlay gets the dark-arm table value (named colors, not Rgb).
         assert_eq!(r3.theme.face(SemanticElement::ChromeOverlay).bg, Some(Color::DarkGray),
             "tokyo ChromeOverlay (sentinel) → dark-arm DarkGray bg");
         assert_eq!(r3.theme.face(SemanticElement::ChromeOverlay).fg, Some(Color::White),
             "tokyo ChromeOverlay (sentinel) → dark-arm White fg");
-        // Sentinel ChromeAccent gets the dark-arm table value.
+        // ChromeAccent gets the dark-arm table value.
         assert_eq!(r3.theme.face(SemanticElement::ChromeAccent).fg, Some(Color::White),
             "tokyo ChromeAccent (sentinel) → dark-arm White fg");
         assert_eq!(r3.theme.face(SemanticElement::ChromeAccent).bold, Some(true),

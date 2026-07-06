@@ -1442,7 +1442,8 @@ mod tests {
 
     /// THE reported bug (D2): under tokyo-night, the status row bg and the menu bar bg
     /// were different (status=[ChromeReverse] had no bg; menu=[Chrome]=PANEL_BG).
-    /// After T5 both use [Chrome] → same bg = PANEL_BG `#16161e`.
+    /// After T5 both use [Chrome] → same bg. Part D (T3): tokyo chrome is now a sentinel,
+    /// so derived FULL Chrome bg = #2d2f42 (§II.5).
     #[test]
     fn tokyo_status_matches_menu_bar() {
         use wordcartel_core::theme::{ChromeDisposition, Depth};
@@ -1465,9 +1466,9 @@ mod tests {
             assert_eq!(status_bg, menu_bg,
                 "status cell x={x} bg must equal menu bar bg; status={status_bg:?}, menu={menu_bg:?}");
         }
-        // Both must be PANEL_BG #16161e (the kept Chrome face).
-        assert_eq!(menu_bg, Some(Color::Rgb(0x16, 0x16, 0x1e)),
-            "chrome bg must be PANEL_BG #16161e, got {menu_bg:?}");
+        // Both must be the derived FULL Chrome bg = #2d2f42 (§II.5 tokyo pin).
+        assert_eq!(menu_bg, Some(Color::Rgb(0x2d, 0x2f, 0x42)),
+            "chrome bg must be derived FULL Chrome #2d2f42, got {menu_bg:?}");
     }
 
     /// D2: opening a minibuffer switches the status style to [ChromeAccent];
@@ -2704,10 +2705,9 @@ mod tests {
         let buf = render_to_buffer(&mut ed, 80, 20);
 
         let fill_bg = compose::compose(&ed.theme, ed.depth, &[SE::ChromeOverlay]).bg;
-        // tokyo FULL ChromeOverlay — T1 INTERMEDIATE (#2a2c3e): chrome is still explicit at T1,
-        // so overlay derives from it via the new elevation ladder; finalizes to §II.5 #4e5071 in T3.
-        assert_eq!(fill_bg, Some(Color::Rgb(0x2a, 0x2c, 0x3e)),
-            "tokyo-night FULL ChromeOverlay (T1 intermediate) must be #2a2c3e");
+        // §II.5 pin: tokyo FULL ChromeOverlay bg = #4e5071 (all-sentinel → derives from canvas).
+        assert_eq!(fill_bg, Some(Color::Rgb(0x4e, 0x50, 0x71)),
+            "tokyo-night FULL ChromeOverlay (§II.5 pin) must be #4e5071");
 
         let n_rows = ed.palette.as_ref().unwrap().rows.len();
         let ov_rect = palette_overlay_rect(ratatui::layout::Rect::new(0, 0, 80, 20), n_rows);

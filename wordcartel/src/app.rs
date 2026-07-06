@@ -5147,11 +5147,9 @@ mod tests {
         assert_eq!(editor.theme.name, "tokyo-night",
             "rederive must apply the picker-committed identity, not the config name");
         let full_overlay_bg = editor.theme.face(SemanticElement::ChromeOverlay).bg;
-        // tokyo-night FULL ChromeOverlay — T1 INTERMEDIATE: chrome is still explicit (#16161e),
-        // so overlay derives from it via the new elevation ladder. Part D (T3) makes tokyo
-        // all-sentinel, at which point this finalizes to §II.5 #4e5071.
-        assert_eq!(full_overlay_bg, Some(Color::Rgb { r: 0x2a, g: 0x2c, b: 0x3e }),
-            "tokyo-night Full ChromeOverlay bg (T1 intermediate): got {full_overlay_bg:?}");
+        // §II.5 pin: tokyo FULL ChromeOverlay bg = #4e5071 (all-sentinel → derives from canvas).
+        assert_eq!(full_overlay_bg, Some(Color::Rgb { r: 0x4e, g: 0x50, b: 0x71 }),
+            "tokyo-night Full ChromeOverlay bg (§II.5 final): got {full_overlay_bg:?}");
 
         // Zen disposition rederive: same identity, overlay should collapse.
         editor.chrome_disposition = ChromeDisposition::Zen;
@@ -5160,10 +5158,9 @@ mod tests {
         assert!(did2, "Zen rederive must return true");
         assert_eq!(editor.theme.name, "tokyo-night", "identity preserved across disposition change");
         let zen_overlay_bg = editor.theme.face(SemanticElement::ChromeOverlay).bg;
-        // tokyo-night ZEN ChromeOverlay — T1 INTERMEDIATE (derives from explicit chrome #16161e);
-        // finalized in T3 to §II.5 #33354a once tokyo is all-sentinel.
-        assert_eq!(zen_overlay_bg, Some(Color::Rgb { r: 0x1f, g: 0x21, b: 0x2e }),
-            "tokyo-night Zen ChromeOverlay bg (T1 intermediate): got {zen_overlay_bg:?}");
+        // §II.5 pin: tokyo ZEN ChromeOverlay bg = #33354a (all-sentinel → derives from canvas).
+        assert_eq!(zen_overlay_bg, Some(Color::Rgb { r: 0x33, g: 0x35, b: 0x4a }),
+            "tokyo-night Zen ChromeOverlay bg (§II.5 final): got {zen_overlay_bg:?}");
     }
 
     /// Finding 2 (pre-merge gate): preview_selected_theme must apply the Ansi16 sentinel-fill
