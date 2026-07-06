@@ -1089,9 +1089,10 @@ mod tests {
             ("purple", Color::Rgb{r:0xcc,g:0x99,b:0xff}, Color::Rgb{r:0xc7,g:0x8f,b:0xff}),
         ];
         for (name, hue, s5) in hues {
-            assert_eq!(shade(hue, 5), s5, "{name} s(5) = §II.6 pin");   // [verify]
+            let actual = shade(hue, 5);
+            assert_eq!(actual, s5, "{name} s(5) = §II.6 pin");   // [verify]
             // "hued": the max-min channel spread is wide (≥ 96), i.e. NOT washed to near-white.
-            if let Color::Rgb { r, g, b } = shade(hue, 5) {
+            if let Color::Rgb { r, g, b } = actual {
                 let spread = r.max(g).max(b) - r.min(g).min(b);
                 assert!(spread >= 96, "{name} s(5) must stay hued: spread={spread}");
             } else { panic!("non-Rgb"); }
