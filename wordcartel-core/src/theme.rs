@@ -37,7 +37,7 @@ pub enum SemanticElement {
     ChromeSelected, // explicit fg/bg selection (menu item — today Black-on-White, NOT reverse)
     ChromeMuted,    // dim secondary chrome (menu dropdown normal item, scrollbar track)
     ChromeOverlay,  // modal interior fill (palette/outline/picker overlay bg)
-    ChromeAccent,   // accent fg on panel bg (prompt-active status, dirty marker)
+    ChromeAccent,   // accent fg on panel bg (active-prompt status + future focus marks)
 }
 
 /// Controls how aggressively the derived chrome ladder steps away from the canvas.

@@ -1580,10 +1580,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Golden tests: lock Default-theme styles for 4 render sites
+    // Golden tests: lock terminal-plain styles for 4 render sites
     // -----------------------------------------------------------------------
 
-    /// Golden: scrollbar track = White/DarkGray, thumb = White/Black under Default theme.
+    /// Golden: scrollbar track = White/DarkGray, thumb = White/Black under terminal-plain.
     ///
     /// Creates a doc tall enough to overflow a short viewport, enables the scrollbar,
     /// and asserts that the rightmost column carries the expected track and thumb styles.
@@ -1621,7 +1621,7 @@ mod tests {
         assert!(has_scrollbar_cell, "expected at least one styled scrollbar cell in rightmost column (col {rightmost})");
     }
 
-    /// Golden: list bullet prefix glyph has DarkGray fg and DIM modifier under Default theme.
+    /// Golden: list bullet prefix glyph has DarkGray fg and DIM modifier under terminal-plain.
     ///
     /// Two-line doc `"- item\nmore\n"` with caret on line 1 (so line 0 is non-active
     /// and the bullet on row 0 uses the non-dim path with an explicit DIM modifier).
@@ -1803,7 +1803,7 @@ mod tests {
         assert_eq!(map.visual_to_source(1, 4), 10);
     }
 
-    /// Golden: fold marker `▸` glyph has DarkGray fg under Default theme.
+    /// Golden: fold marker `▸` glyph has DarkGray fg under terminal-plain.
     ///
     /// Creates a doc with a heading + body, folds the heading, renders, and
     /// asserts the `▸` glyph cell has DarkGray fg.
@@ -1831,7 +1831,7 @@ mod tests {
         );
     }
 
-    /// Golden: wrap guide `│` glyph has DarkGray fg under Default theme.
+    /// Golden: wrap guide `│` glyph has DarkGray fg under terminal-plain.
     ///
     /// Enables the wrap guide at column 10 in a 40-wide viewport and asserts
     /// the guide column cell on row 0 has DarkGray fg.
