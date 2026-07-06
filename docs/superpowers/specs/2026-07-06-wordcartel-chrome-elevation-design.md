@@ -144,7 +144,11 @@ each face a requirement:
 - **underline_color-required** (diagnostics): `diag_spelling`, `diag_grammar` — MUST carry
   `underline_color` (base16/tokyo style these via underline, not fg; so tokyo's `diag_grammar` with no
   `fg` is CORRECT under the standard).
-- **bg-required**: `selection`, `marked_block`, `search_match` — MUST carry a `bg`.
+- **highlight-required**: `selection`, `marked_block`, `search_match` — MUST carry a `bg` **OR** a
+  highlight modifier (`reverse`). Polychrome themes (base16, tokyo) use a `bg` color; **phosphor uses
+  `reverse` (+ underline), which is valid and monochrome-consistent** — the same "distinguish by color
+  OR modifier" principle as the a11y cue rule, so phosphor's `bg: None` selection PASSES the standard
+  (Codex spec r2).
 - **modifier-required**: `search_current` (reverse) — MUST carry ≥1 modifier.
 - **intentionally empty**: `SE::Text` (Part C — body text via the `base_fg` fallback).
 - **derived** (exempt from the per-face list; supplied by the elevation ladder): the six chrome faces.
@@ -175,7 +179,9 @@ present at `theme.rs:444-456`), keeping tokyo bespoke (Codex advised against a b
 | `front_matter` | `fg: DARK3` | `fg: ORANGE`, italic |
 | `diag_grammar` | `underline_color: YELLOW` | `underline_color: BLUE` |
 | `wrap_guide` | `fg: DARK3` | `fg: SEL_BG` |
-| `selection` | `bg: SEL_BG` (#283457) | `bg: SEL_BG` — **align the `SEL_BG` constant → #292e42** (Folke `bg_highlight`; source-verified — our #283457 matches no documented Folke color; the constant feeds `selection` + `wrap_guide`) |
+| `selection` | `bg: SEL_BG` (#283457) | `bg: SEL_BG` — **align the `SEL_BG` constant → #292e42** (Folke `bg_highlight`; source-verified — our #283457 matches no documented Folke color; the `SEL_BG` constant currently feeds `selection.bg` (theme.rs:486) + `search_match.bg` (theme.rs:489); AFTER
+Part D it feeds `selection.bg` + `wrap_guide.fg` — `search_match` moves to `bg: YELLOW` — so aligning the
+constant hits all its live consumers, Codex spec r2) |
 | `chrome` / `chrome_selected` / `chrome_muted` | explicit `PANEL_BG` | **`Face::default()` sentinels** — derived by Part A's elevation ladder (user decision: PANEL_BG was a direction, not a standard) |
 | `text` | already `Face::default()` | unchanged (Part C rule) |
 
