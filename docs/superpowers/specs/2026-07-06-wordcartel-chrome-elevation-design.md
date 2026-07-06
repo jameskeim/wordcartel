@@ -44,11 +44,17 @@ identical to body text.
 Replace the split ladder with one rule: **every derived chrome surface elevates away from the canvas
 toward the pole with headroom** — lighter on dark themes (`is_dark = rel_lum(bg) < 0.5`), darker on
 light — i.e. the overlay's existing `ov_pole` logic applied to *all* chrome layers. Successive layers
-elevate more, producing a strictly ordered, always-distinct stack:
+elevate more, producing a strictly ordered, always-distinct stack of **three tones** (user decision
+2026-07-06 — the dropdown and the modal overlay are co-transient "work" surfaces, essentially never
+co-visible, so they SHARE a tone; only the persistent bar is separately elevated):
 ```
-canvas (base_bg)  <  bar (Chrome)  <  dropdown (ChromeMuted)  <  overlay (ChromeOverlay)
+canvas (base_bg)  <  bar (Chrome, level 1)  <  dropdown = modal (ChromeMuted level 2 bg)
 ```
-Face → level mapping reuses E3's existing chrome faces unchanged in identity. `ChromeSelected`
+So **`ChromeOverlay.bg == ChromeMuted.bg`** (the modal shares the dropdown's background — a testable
+invariant), while `ChromeOverlay.fg` stays its OWN readable contrast-derived foreground (NOT the
+dropdown's dim `MUTED_FG_BLEND` fg — modal content is primary text). The overlay is distinguished from
+the document by its border + the `Clear` beneath it, not by extra luminance elevation. Face → level
+mapping reuses E3's existing chrome faces unchanged in identity. `ChromeSelected`
 (inverted highlight), `ChromeAccent` (status prompt — reads `chrome.bg`, which now elevates),
 scrollbar track/thumb, and `ChromeReverse` (cue, never derived) keep their roles on top.
 **Hue-preserving:** the elevation shifts lightness while preserving the canvas hue+saturation (a tinted
@@ -58,7 +64,8 @@ so E3's C1-A HSL caution (on derived *foregrounds*) does not apply.
 ### A-D2 — Separation floor (the guarantee)
 Each layer has a calibrated default step, **clamped *up*** until its background clears a **minimum
 separation** (probe-calibrated luminance delta / modest contrast, well below the 4.5:1 text threshold)
-from the layer beneath (canvas for bar, bar for dropdown, dropdown for overlay). This is a **new**
+from the layer beneath (canvas for bar, bar for dropdown; the overlay/modal is NOT a separate floored
+layer — it adopts the dropdown bg, so it inherits the dropdown's separation). This is a **new**
 clamp — opposite in direction to E3's existing legibility clamp (which *shrinks*). They coexist: grow
 to the separation floor; if that pushes the foreground under its legibility floor, re-derive the
 foreground (A-D3) rather than shrink the surface back. The floor is what makes distinctness hold *by
@@ -209,7 +216,8 @@ CRT hierarchy.
 ## Testing (unified)
 
 - **Chrome conformance** (Part A): every RGB builtin, every color depth — stack strictly ordered and
-  floored (`canvas → bar → dropdown → overlay` each clear the separation floor); each chrome foreground
+  floored (`canvas → bar → dropdown` each clear the separation floor; **`overlay.bg == dropdown.bg`**
+  asserted as an invariant for every RGB theme); each chrome foreground
   clears its legibility floor against its own panel; `full ≠ zen` measurably. Reported-bug pins: bar fg
   distinguishable from body text; dropdown bg distinct from bar bg; `full ≠ zen`.
 - **Completeness conformance** (Part B): every RGB builtin — every must-be-colored face has an explicit
