@@ -1414,8 +1414,8 @@ mod tests {
     }
 
     // True when the three ladder-panel faces (Chrome/Muted/Overlay) all start as sentinels,
-    // i.e. the theme's whole chrome bg stack is derived. Tokyo carries an EXPLICIT chrome/muted
-    // at T1 (becomes sentinel in T3), so the all-builtins ladder invariants skip it.
+    // i.e. the theme's whole chrome bg stack is derived. Every RGB builtin (Tokyo included, since
+    // Part D made its chrome all-sentinel) satisfies this — the ladder invariants cover them all.
     fn chrome_ladder_is_sentinel(t: &Theme) -> bool {
         t.face(SemanticElement::Chrome) == Face::default()
             && t.face(SemanticElement::ChromeMuted) == Face::default()
@@ -1537,7 +1537,7 @@ mod tests {
         for name in Theme::builtin_names() {
             let base = Theme::builtin(name).unwrap();
             if !matches!(base.base_bg, Color::Rgb { .. }) { continue; } // skip terminal-*/no-color
-            if !chrome_ladder_is_sentinel(&base) { continue; } // skip explicit chrome (tokyo at T1)
+            if !chrome_ladder_is_sentinel(&base) { continue; } // defensive: skip any explicit-chrome theme (all current RGB builtins are all-sentinel)
             for (disp, target) in [(ChromeDisposition::Full, 1.30_f32), (ChromeDisposition::Zen, 1.12)] {
                 let mut t = Theme::builtin(name).unwrap();
                 t.derive_chrome(disp);
@@ -1561,7 +1561,7 @@ mod tests {
         for name in Theme::builtin_names() {
             let base = Theme::builtin(name).unwrap();
             if !matches!(base.base_bg, Color::Rgb { .. }) { continue; }
-            if !chrome_ladder_is_sentinel(&base) { continue; } // skip explicit chrome (tokyo at T1)
+            if !chrome_ladder_is_sentinel(&base) { continue; } // defensive: skip any explicit-chrome theme (all current RGB builtins are all-sentinel)
             let mut f = Theme::builtin(name).unwrap(); f.derive_chrome(ChromeDisposition::Full);
             let mut z = Theme::builtin(name).unwrap(); z.derive_chrome(ChromeDisposition::Zen);
             let fb = f.face(SemanticElement::Chrome).bg.unwrap();
@@ -1577,7 +1577,7 @@ mod tests {
         for name in Theme::builtin_names() {
             let base = Theme::builtin(name).unwrap();
             if !matches!(base.base_bg, Color::Rgb { .. }) { continue; }
-            if !chrome_ladder_is_sentinel(&base) { continue; } // skip explicit chrome (tokyo at T1)
+            if !chrome_ladder_is_sentinel(&base) { continue; } // defensive: skip any explicit-chrome theme (all current RGB builtins are all-sentinel)
             for disp in [ChromeDisposition::Full, ChromeDisposition::Zen] {
                 let mut t = Theme::builtin(name).unwrap();
                 t.derive_chrome(disp);

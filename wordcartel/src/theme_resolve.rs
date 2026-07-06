@@ -124,11 +124,11 @@ pub(crate) fn apply_ansi16_chrome_policy(theme: &mut Theme, depth: Depth) {
     let canvas_q = theme::quantize(theme.base_bg, Depth::Ansi16);
     let (chrome_bg, selected_fg, selected_bg) = if canvas_q == Color::Black {
         // Dark canvas arm: Chrome/Overlay → DarkGray bg White fg; Selected → Black/White;
-        // Muted → White dim; Accent → White bold.
+        // Muted → White dim on chrome_bg (shares the overlay/modal tone); Accent → White bold.
         (Color::DarkGray, Color::Black, Color::White)
     } else {
         // Light canvas arm: Chrome/Overlay → Black bg White fg; Selected → White/Black;
-        // Muted → White dim; Accent → White bold.
+        // Muted → White dim on chrome_bg (shares the overlay/modal tone); Accent → White bold.
         (Color::Black, Color::White, Color::Black)
     };
     if theme.face(SemanticElement::Chrome) == Face::default() {
@@ -144,8 +144,11 @@ pub(crate) fn apply_ansi16_chrome_policy(theme: &mut Theme, depth: Depth) {
             Face { fg: Some(selected_fg), bg: Some(selected_bg), ..Face::default() });
     }
     if theme.face(SemanticElement::ChromeMuted) == Face::default() {
+        // Muted (dropdown) shares the overlay/modal bg — the truecolor `Overlay.bg == Muted.bg`
+        // invariant, honored on the quantized 16-color axis too. Distinguished from the bar by
+        // its `dim` fg (16 colors can't give bar and dropdown distinct bg tones).
         theme.override_face(SemanticElement::ChromeMuted,
-            Face { fg: Some(Color::White), dim: Some(true), ..Face::default() });
+            Face { fg: Some(Color::White), bg: Some(chrome_bg), dim: Some(true), ..Face::default() });
     }
     if theme.face(SemanticElement::ChromeAccent) == Face::default() {
         theme.override_face(SemanticElement::ChromeAccent,
@@ -479,6 +482,15 @@ mod tests {
             "tokyo ChromeAccent (sentinel) → dark-arm White fg");
         assert_eq!(r3.theme.face(SemanticElement::ChromeAccent).bold, Some(true),
             "tokyo ChromeAccent (sentinel) → dark-arm bold");
+        // Modal-shares-dropdown invariant (`Overlay.bg == Muted.bg`) holds on the Ansi16 axis:
+        // Muted gets the same chrome_bg as Overlay, distinguished only by its `dim` fg.
+        assert_eq!(r3.theme.face(SemanticElement::ChromeMuted).bg, Some(Color::DarkGray),
+            "tokyo ChromeMuted (dropdown) shares the overlay/modal DarkGray bg at Ansi16");
+        assert_eq!(r3.theme.face(SemanticElement::ChromeMuted).dim, Some(true),
+            "tokyo ChromeMuted keeps its dim fg to distinguish the dropdown from the bar");
+        assert_eq!(r3.theme.face(SemanticElement::ChromeMuted).bg,
+            r3.theme.face(SemanticElement::ChromeOverlay).bg,
+            "Ansi16: Overlay.bg == Muted.bg (modal shares the dropdown tone)");
     }
 
     #[test]
