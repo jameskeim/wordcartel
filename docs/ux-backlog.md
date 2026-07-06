@@ -412,7 +412,7 @@ precompute + render_overlays.rs painters); overlay interiors/query lines fully t
 borders (the phosphor halo fix); the status row a full-width bar matching the menu bar, with an
 accent face for prompt-active states. All three original reports pinned by regression tests.
 
-**Follow-ups recorded at ship (from the final gates):** (1) **the unpainted canvas** — document
+**Follow-ups recorded at ship (from the final gates):** (1) **the unpainted canvas** — SHIPPED (canvas effort, merge 4090c47, 2026-07-06: opaque/transparent toggle) — — document
 cells/blank rows carry the TERMINAL's bg, not `base_bg`; the whole ladder renders relative to the
 terminal background, and flexoki-dark as launch default means a light terminal gets light-on-light
 (pre-existing, human decision: paint base_canvas across the frame vs OSC default colors vs document
