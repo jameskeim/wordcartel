@@ -875,7 +875,7 @@ pub fn phosphor(name: &str, hue: Color) -> Theme {
     let fg = shade(hue, 3);           // mid-bright hue
     let s = |n| Face { fg: Some(shade(hue, n)), ..Face::default() };
     let faces = ThemeFaces {
-        text: s(3),
+        text: Face::default(),   // Part C: empty Text so heading role fg is not clobbered
         emphasis: Face { fg: Some(shade(hue, 3)), italic: Some(true), ..Face::default() },
         strong:   Face { fg: Some(shade(hue, 4)), bold: Some(true), ..Face::default() },
         strong_emphasis: Face { fg: Some(shade(hue, 4)), bold: Some(true), italic: Some(true), ..Face::default() },

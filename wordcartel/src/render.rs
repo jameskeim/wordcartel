@@ -1540,6 +1540,41 @@ mod tests {
     }
 
     #[test]
+    fn heading_text_carries_role_fg_base16_and_phosphor() {
+        use crate::editor::RenderMode;
+        // Each: (theme, label). base16 (flexoki-dark) already colours headings; phosphor does so
+        // ONLY after Part C empties its `text` face (currently text = shade(3) clobbers the role).
+        for (theme, label) in [
+            (wordcartel_core::theme::flexoki_dark(), "flexoki-dark"),
+            (wordcartel_core::theme::Theme::builtin("phosphor-green").unwrap(), "phosphor-green"),
+        ] {
+            let mut ed = Editor::new_from_text("# Title\nbody\n", None, (40, 6));
+            ed.theme = theme;
+            ed.active_mut().view.mode = RenderMode::LivePreview;
+            derive::rebuild(&mut ed);
+            let buf = render_to_buffer(&mut ed, 40, 6);
+
+            let role_fg = compose::compose(&ed.theme, ed.depth, &[SE::Text, SE::Heading(1)]).fg;
+            let base_fg = compose::base_canvas(&ed.theme, ed.depth).fg;
+            assert!(role_fg.is_some() && role_fg != base_fg,
+                "{label}: heading role fg must be coloured and distinct from base_fg");
+            // heading row (0) carries the role fg — shaded heading colour in live preview.
+            assert!((0..40).any(|x| buf[(x, 0u16)].style().fg == role_fg),
+                "{label}: live-preview heading must carry the role fg");
+            // body row (1) carries base_fg via the empty-Text fallback.
+            assert!((0..40).any(|x| buf[(x, 1u16)].style().fg == base_fg),
+                "{label}: body text must carry base_fg");
+
+            // source mode: uniform base_fg, no heading colour (compose [SE::Text] only).
+            ed.active_mut().view.mode = RenderMode::SourcePlain;
+            derive::rebuild(&mut ed);
+            let src = render_to_buffer(&mut ed, 40, 6);
+            assert!(!(0..40).any(|x| src[(x, 0u16)].style().fg == role_fg),
+                "{label}: source mode must NOT carry the heading role fg");
+        }
+    }
+
+    #[test]
     fn default_search_and_diag_unchanged() {
         // search highlight still yellow-bg/reverse; diagnostics still underline red/blue.
         // Mirror the existing search/diag tests — they must keep passing under Default.
