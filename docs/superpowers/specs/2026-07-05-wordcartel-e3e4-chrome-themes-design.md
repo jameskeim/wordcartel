@@ -153,14 +153,22 @@ Grounded facts). Working order: the E3 slot.
     every theme (dark: the tokyo/catppuccin-mantle sunken look, generalized; light: the
     latte-official darker panel). OVERLAYS/MODALS = the raised pole: dark themes blend
     toward WHITE; light themes blend FURTHER toward black (paper bases have no lighter
-    headroom — a deeper second rung, catppuccin-crust-style). Calibration targets for
-    the plan's probes: tokyo's hand-tuned panel delta + catppuccin's official
-    mantle/crust deltas — tokyo-class subtlety, never ansi-blocky.
+    headroom — a deeper second rung, catppuccin-crust-style). Calibration is PER-POLARITY (Fable r2 N3 —
+    the solved fractions differ ~5×): DARK themes calibrate to tokyo's panel delta +
+    mocha's mantle/crust (probe-solved ≈18-20% / ≈43% toward black for bar/deep rungs);
+    LIGHT themes calibrate to latte's mantle/crust (≈3-7%). Near-black bases (flexoki
+    #100f0f) may clamp at the pure-black pole — blessed (probe: still tokyo-class
+    separation). Always tokyo-class subtlety, never ansi-blocky.
   - CONTRAST CLAMP: after deriving, if primary fg vs any derived rung falls below the
-    pinned readable threshold, the step shrinks until it passes (enforced IN derivation,
-    not merely tested). The threshold uses a small sRGB-linearized relative-luminance
-    helper the plan adds (probe-verified: HSL-L deltas are a bad proxy — solarized
-    "passed" a large ΔL while failing WCAG at 2.1:1).
+    threshold, the step shrinks until it passes — with DEFINED TERMINATION (Fable r2
+    N2): the floor is step 0 (rung == canvas), and the threshold is THEME-RELATIVE —
+    `min(pinned threshold, the theme's own fg-vs-canvas contrast)` — so palettes that
+    are low-contrast BY IDENTITY (solarized-light's own body text is 4.13:1) degrade
+    gracefully to flat chrome instead of an unsatisfiable loop. The threshold uses a
+    small sRGB-linearized relative-luminance helper the plan adds (probe-verified:
+    HSL-L deltas are a bad proxy — solarized "passed" a large ΔL while failing WCAG at
+    2.1:1). Recorded consequence (round-2 probe): solarized-dark's raised rung clamps
+    to near-invisible (#052f3a-class) — graceful, ratified; the border carries.
   - Fg family (user-ratified with C1-A; Fable I2): derived by RGB INTERPOLATION toward
     base_bg (probe: reproduces the hand-tuned muted character; HSL stepping left
     saturation vivid). chrome fg = base_fg; muted fg = base_fg blended toward base_bg;
@@ -170,9 +178,9 @@ Grounded facts). Working order: the E3 slot.
     Accent is used ONLY per D2's discipline list.
   - Derivation fills the FIVE color faces (Chrome, ChromeOverlay, ChromeSelected,
     ChromeMuted, ChromeAccent); ChromeReverse is never derived (cue/mono territory).
-  - Zen: the SAME derivation with collapsed step sizes (panel ≈ canvas + a minimal
-    visible step, overlay = one subtle step, muted dimmer, accent retained but fainter).
-    Zen never changes hue.
+  - Zen: the SAME derivation with collapsed step sizes (each rung takes a minimal step
+    toward ITS OWN pole — bars a hair below canvas, overlays a hair toward theirs; muted
+    dimmer, accent retained but fainter; Fable r2 N6 wording). Zen never changes hue.
   - Exemption rule, CONCRETE (Codex r1 I-2 — no new field needed): derivation applies
     ONLY when both bases are `Color::Rgb`; `derive_chrome` skips them (the sentinel rule composes: non-Rgb bases simply never fill) (named/
     Default bases have no computable lightness — Codex m-4 made explicit). terminal-plain,
@@ -351,27 +359,35 @@ Grounded facts). Working order: the E3 slot.
   Fable I6: derivation no-ops but the theme is NOT cue-mode, and a bare "chrome: zen"
   would be silent-no-change UI): the disposition still flips and persists (it matters
   after a theme switch), and the status says so honestly:
-  "chrome: zen (no effect: terminal-plain has fixed chrome)". Pinned.
+  "chrome: zen (no effect: terminal-plain has fixed chrome)". Pinned. The SAME honest
+  arm covers `Depth::Ansi16` for Rgb themes (Fable r2 N7 — the fixed named table makes
+  the toggle invisible there): "chrome: zen (no effect at 16-color depth)". Pinned.
 - No new IO. The toggle's re-derivation is a cold path (one keypress).
 
 ## Testing
 
 - Sentinel contract pins (core): a second derive_chrome call is a no-op (byte-equal
-  faces); tokyo-night PANEL_BG and each phosphor's kept overrides survive derivation;
+  faces); tokyo-night PANEL_BG survives derivation (phosphor keeps NO chrome overrides after
+  I4-A — nothing to survive); terminal-plain/ansi/no-color byte-untouched;
   a base16/E4 theme's unset chrome derives fully (no all-None face remains on Rgb
   themes); non-Rgb themes (terminal-plain/ansi, no-color) byte-untouched by the call.
-- ANSI16 CHROME POLICY (Fable I7 — probe: flexoki-dark's rungs ALL quantize to Black at
-  Ansi16, turning the launch default's bars canvas-colored on TERM=xterm, a first-launch
-  regression; catppuccin's overlay quantizes to a Blue fill): at `Depth::Ansi16`,
-  ladder-DERIVED chrome is replaced by the legacy named-ANSI chrome family
-  (terminal-plain's White/Black table) — visible bars guaranteed on 16-color terminals;
-  explicit constructor chrome (tokyo, terminal-*) quantizes as today. Applied in
-  resolve after depth detection; pinned (flexoki-dark at Ansi16 → status bar bg Black,
-  fg White, ≠ canvas).
+- ANSI16 CHROME POLICY (Fable I7, completed per round-2 N1 — the fallback must be its
+  own COMPLETE six-face table chosen against the QUANTIZED CANVAS, because every dark
+  E4 canvas quantizes to Black and a Black legacy bar on a Black-painted canvas is the
+  exact invisibility being fixed; and terminal-plain's Face::default() overlay cannot
+  serve, since its vacuous-by-identity argument requires canvas == terminal default,
+  false for Rgb themes at Ansi16): at `Depth::Ansi16`, ladder-derived chrome is replaced
+  by a fixed named-ANSI six-face table keyed on the quantized canvas — canvas
+  quantizes Black → bars AND overlay interiors bg DarkGray / fg White, selected
+  Black-on-White, muted dim; canvas quantizes light → bars/overlays bg Black / fg White.
+  Explicit constructor chrome (tokyo, terminal-*) quantizes as today. Applied in resolve
+  after depth detection; pinned CORRECTLY: flexoki-dark at Ansi16 → status bar bg
+  DarkGray, fg White, ≠ the Black canvas.
 - Ladder unit battery (core): direction by pole (bars toward black on all themes;
   overlays toward white on dark, deeper black on light);
-  zen steps strictly smaller than full; hue/saturation preserved through steps (the
-  phosphor-tint pin); every derived face fully explicit (no None fg/bg on color themes);
+  zen steps strictly smaller than full; hue angle preserved through steps; saturation preserved on SUNKEN rungs and decaying
+  monotonically on RAISED rungs (Fable r2 N5 — toward-white blends desaturate: mocha
+  0.211→0.117; the phosphor-tint pin asserts hue only); every derived face fully explicit (no None fg/bg on color themes);
   the contrast invariant (primary fg vs the LIGHTEST chrome face ≥ a pinned readable
   delta — exact metric pinned by plan probes); accent desaturation bound.
 - Theme lineup: builtin_names == 19 + each new theme resolves at all three depths without
