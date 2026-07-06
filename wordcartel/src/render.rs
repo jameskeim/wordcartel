@@ -1441,7 +1441,7 @@ mod tests {
     }
 
     /// THE reported bug (D2): under tokyo-night, the status row bg and the menu bar bg
-    /// were different (status=[ChromeReverse] had no bg; menu=[Chrome]=PANEL_BG).
+    /// were different (status=[ChromeReverse] had no bg; menu=[Chrome]=explicit #16161e).
     /// After T5 both use [Chrome] → same bg. Part D (T3): tokyo chrome is now a sentinel,
     /// so derived FULL Chrome bg = #2d2f42 (§II.5).
     #[test]
