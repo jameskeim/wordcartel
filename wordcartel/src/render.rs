@@ -1543,10 +1543,10 @@ mod tests {
     fn heading_text_carries_role_fg_base16_and_phosphor() {
         use crate::editor::RenderMode;
         // Each: (theme, label). base16 (flexoki-dark) already colours headings; phosphor does so
-        // ONLY after Part C empties its `text` face (currently text = shade(3) clobbers the role).
+        // ONLY after Part C empties its `text` face (before this, text = shade(3) clobbered the role).
         for (theme, label) in [
             (wordcartel_core::theme::flexoki_dark(), "flexoki-dark"),
-            (wordcartel_core::theme::Theme::builtin("phosphor-green").unwrap(), "phosphor-green"),
+            (wordcartel_core::theme::Theme::builtin("phosphor-green").expect("phosphor-green is a builtin"), "phosphor-green"),
         ] {
             let mut ed = Editor::new_from_text("# Title\nbody\n", None, (40, 6));
             ed.theme = theme;
