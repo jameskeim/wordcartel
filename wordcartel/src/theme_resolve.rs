@@ -103,8 +103,9 @@ fn apply_cue_mode_glyph(theme: &mut Theme, depth: Depth, cfg_override: Option<bo
 /// explicitly-set constructor faces are left untouched and quantize at render time.
 ///
 /// Called by `resolve_theme` (where it was originally inlined) and by
-/// `preview_selected_theme` after `derive_chrome` — so previews in Ansi16 terminals
-/// apply the same policy as the full resolution path.
+/// `preview_selected_theme` — in BOTH cases INSTEAD of `derive_chrome` on the
+/// Ansi16+Rgb branch (the policy fills sentinel faces; deriving first would set
+/// them) — so previews apply the same policy as the full resolution path.
 pub(crate) fn apply_ansi16_chrome_policy(theme: &mut Theme, depth: Depth) {
     if depth != Depth::Ansi16 || !matches!(theme.base_bg, Color::Rgb { .. }) { return; }
     let canvas_q = theme::quantize(theme.base_bg, Depth::Ansi16);

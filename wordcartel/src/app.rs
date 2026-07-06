@@ -248,8 +248,9 @@ pub(crate) fn rederive_theme_if_requested(
 /// record the name in `tp.previewed` — the single funnel for identity threading.
 /// `pub(crate)` so mouse.rs can call it after a wheel-scroll selection change.
 /// Calls `derive_chrome` before `apply_theme` so the preview respects the active
-/// chrome disposition (grounding A.9 D3). Calls `apply_ansi16_chrome_policy` after
-/// `derive_chrome` so previews in Ansi16 terminals apply the sentinel-fill table
+/// chrome disposition (grounding A.9 D3) — except at `Depth::Ansi16` on Rgb themes,
+/// where `apply_ansi16_chrome_policy` runs INSTEAD of derivation (the policy checks
+/// sentinels; deriving first would fill them) so previews apply the sentinel-fill table
 /// rather than quantized derived values (Finding 2, pre-merge gate).
 pub(crate) fn preview_selected_theme(editor: &mut crate::editor::Editor) {
     // Read the name first (drops the borrow), then apply, then set the field.
