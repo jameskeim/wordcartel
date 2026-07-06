@@ -144,6 +144,13 @@ fn toggle_canvas_flips_and_reports() {
     toggle_canvas(&mut ed2);
     assert_eq!(ed2.canvas, CanvasMode::Transparent, "flip persists even when inert");
     assert_eq!(ed2.status, "canvas: transparent (no effect: terminal-plain has no canvas)");
+    // Depth::None (cue) on an Rgb theme: also "no effect" (no color to paint).
+    let mut ed3 = crate::editor::Editor::new_from_text("x", None, (40, 4));
+    ed3.theme = wordcartel_core::theme::Theme::builtin("flexoki-dark").unwrap();
+    ed3.depth = Depth::None;
+    toggle_canvas(&mut ed3);
+    assert_eq!(ed3.canvas, CanvasMode::Transparent);
+    assert_eq!(ed3.status, "canvas: transparent (no effect: flexoki-dark has no canvas)");
 }
 ```
 - [ ] **Step 2: Run — expect FAIL** (no `Editor.canvas`, no `toggle_canvas`).
@@ -302,29 +309,50 @@ fn transparent_canvas_leaves_edit_band_reset() {
                     };
 ```
 - [ ] **Step 5: Add the `CanvasMode` hook to `ChromeStyles::build`** so transparent suppresses the
-  modal-interior fill. Change the signature (:276) and `ov_fill` (:293):
+  modal-interior fill AND the query-bar bg (Codex plan r1 Important — `ov_query` is also an
+  overlay interior element). The selected-row highlight and fg-only border stay so the modal
+  remains usable. Add `canvas: CanvasMode` as the third param (:276) and restructure the body:
 ```rust
     pub(crate) fn build(
         theme: &wordcartel_core::theme::Theme,
         depth: wordcartel_core::theme::Depth,
         canvas: wordcartel_core::theme::CanvasMode,
     ) -> Self {
-```
-  and:
-```rust
-            ov_fill: match canvas {
-                wordcartel_core::theme::CanvasMode::Opaque =>
-                    compose::compose(theme, depth, &[SE::ChromeOverlay]),
-                wordcartel_core::theme::CanvasMode::Transparent => RStyle::default(),
-            },
+        let transparent = canvas == wordcartel_core::theme::CanvasMode::Transparent;
+        // overlay_border: fg-only Chrome — .bg cleared so the fill bg shows through.
+        let mut border = compose::compose(theme, depth, &[SE::Chrome]);
+        border.bg = None;
+        // Overlay interior fills go see-through in transparent mode: ov_fill becomes a no-op and
+        // the query bar renders fg-only. overlay_selected keeps its bg (selection stays visible).
+        let mut ov_query = compose::compose(theme, depth, &[SE::ChromeOverlay]);
+        if transparent { ov_query.bg = None; }
+        let ov_fill = if transparent {
+            RStyle::default()
+        } else {
+            compose::compose(theme, depth, &[SE::ChromeOverlay])
+        };
+        ChromeStyles {
+            overlay_selected: compose::compose(theme, depth, &[SE::ChromeSelected]),
+            ov_query,
+            menu_open:        compose::compose(theme, depth, &[SE::ChromeSelected]),
+            menu_closed:      compose::compose(theme, depth, &[SE::Chrome]),
+            menu_sel:         compose::compose(theme, depth, &[SE::ChromeSelected]),
+            menu_norm:        compose::compose(theme, depth, &[SE::ChromeMuted]),
+            scrollbar_track:  compose::compose(theme, depth, &[SE::ChromeMuted]),
+            scrollbar_thumb:  compose::compose(theme, depth, &[SE::Chrome]),
+            ov_fill,
+            ov_accent:        compose::compose(theme, depth, &[SE::ChromeAccent]),
+            overlay_border:   border,
+        }
+    }
 ```
   Update the call site (:676): `let cs = ChromeStyles::build(&editor.theme, editor.depth, editor.canvas);`.
 - [ ] **Step 6: Overlay-fill hook, content-highlight, bars, non-Rgb tests.** Add:
 ```rust
 #[test]
-fn transparent_suppresses_overlay_fill() {
-    // The modal-interior mechanism: ov_fill is a real ChromeOverlay bg when Opaque, a no-op
-    // Style::default() when Transparent (so the overlay Clear's terminal-default shows through).
+fn transparent_suppresses_overlay_interior() {
+    // Modal interiors go see-through in transparent mode: ov_fill is a no-op and the query bar
+    // renders fg-only (bg stripped). The selected-row highlight keeps its bg (stays visible).
     // Tested directly on the hook — no palette/registry setup needed.
     use wordcartel_core::theme::{Theme, Depth, CanvasMode, ChromeDisposition};
     let mut theme = Theme::builtin("flexoki-dark").unwrap();
@@ -333,6 +361,9 @@ fn transparent_suppresses_overlay_fill() {
     let transp = ChromeStyles::build(&theme, Depth::Truecolor, CanvasMode::Transparent);
     assert!(opaque.ov_fill.bg.is_some(), "opaque overlay fill carries a ChromeOverlay bg");
     assert_eq!(transp.ov_fill, RStyle::default(), "transparent overlay fill is a no-op");
+    assert!(opaque.ov_query.bg.is_some(), "opaque query bar carries a bg");
+    assert!(transp.ov_query.bg.is_none(), "transparent query bar bg is stripped (fg-only)");
+    assert!(transp.overlay_selected.bg.is_some(), "selected-row highlight stays visible in transparent");
 }
 
 #[test]
@@ -383,6 +414,33 @@ fn non_rgb_theme_canvas_moot_both_modes() {
         assert!(bg.is_none() || bg == Some(ratatui::style::Color::Reset),
             "terminal-plain has no canvas — {mode:?} editing cell stays terminal-default; got {bg:?}");
     }
+}
+
+#[test]
+fn opaque_canvas_at_ansi16_paints_quantized_bg() {
+    use wordcartel_core::theme::{Theme, Depth};
+    let mut ed = Editor::new_from_text("hi\n", None, (40, 6));
+    ed.theme = Theme::builtin("flexoki-dark").unwrap();
+    ed.depth = Depth::Ansi16;
+    derive::rebuild(&mut ed);
+    let buf = render_to_buffer(&mut ed, 40, 6);
+    let want = compose::base_canvas(&ed.theme, Depth::Ansi16).bg;
+    assert!(want.is_some() && want != Some(ratatui::style::Color::Reset),
+        "flexoki base_bg quantizes to a named Ansi16 color; got {want:?}");
+    assert_eq!(buf[(20u16, 0u16)].style().bg, want, "opaque Ansi16 paints the quantized canvas bg");
+}
+
+#[test]
+fn opaque_canvas_at_depth_none_paints_nothing() {
+    use wordcartel_core::theme::{Theme, Depth};
+    let mut ed = Editor::new_from_text("hi\n", None, (40, 6));
+    ed.theme = Theme::builtin("flexoki-dark").unwrap();
+    ed.depth = Depth::None;                       // cue/monochrome — base_canvas has no color
+    derive::rebuild(&mut ed);
+    let buf = render_to_buffer(&mut ed, 40, 6);
+    let bg = buf[(20u16, 0u16)].style().bg;
+    assert!(bg.is_none() || bg == Some(ratatui::style::Color::Reset),
+        "Depth::None: band guard skips the fill; got {bg:?}");
 }
 ```
 - [ ] **Step 7: Re-verify the two source-mode tests.** `source_mode_tints_canvas_for_phosphor_but_not_default`
@@ -494,10 +552,38 @@ fn canvas_persists_through_the_diff_law() {
     let has_theme = theme_name.is_some() || chrome.is_some() || canvas.is_some();
     let theme = some_if(OTheme { name: theme_name, chrome, canvas }, has_theme);
 ```
-- [ ] **Step 6: Update every other `SettingsSnapshot` constructor** the compiler flags — at minimum
-  the `snap` test helper (:482, add `canvas: CanvasMode::Opaque` — import `CanvasMode` in the test
-  module) and the `config.rs` round-trip literal (:842-854, add `canvas: CanvasMode::Transparent`).
-  Extend the round-trip: after the `chrome` assertion (:872) add
+- [ ] **Step 5b: Fix the name-mask independence** (Codex plan r1 Critical — a latent E3 bug the
+  canvas key would widen). The name provenance guard at `settings.rs:287` is
+  `let theme_masked = mask.theme.is_some();` — but `parse_mask` populates `mask.theme` for a
+  chrome-only OR canvas-only mask too, so ANY interior-key mask wrongly shields the theme NAME
+  from Rule-3 removal. Narrow the guard to the name sentinel (parse_mask sets `name: Some("")` for
+  name/file masks, `None` for interior-only ones):
+```rust
+    // Name/file provenance only — a chrome/canvas-only --config mask must NOT shield the name
+    // (each interior key guards itself via its own diff_key predicate below).
+    let theme_masked = mask.theme.as_ref().and_then(|t| t.name.as_ref()).is_some();
+```
+  Update the stale comment at :283-286 accordingly. Add the independence test:
+```rust
+#[test]
+fn interior_key_mask_does_not_shield_name() {
+    // A canvas-only (or chrome-only) --config mask must NOT protect a contradicted name key.
+    let rt = snap("cua", ThemeIdentity::Builtin("terminal-plain".into()), false);
+    let base = snap("cua", ThemeIdentity::Builtin("terminal-plain".into()), false);
+    let existing = parse_overrides("[theme]\nname='tokyo-night'\n"); // stale, now contradicted
+    let mask = parse_mask("[theme]\ncanvas='transparent'\n");        // canvas-only mask
+    let of = compute_overrides(&rt, &base, &existing, &mask);
+    assert!(of.theme.as_ref().and_then(|t| t.name.as_ref()).is_none(),
+        "canvas-only mask must not shield the contradicted name key");
+}
+```
+- [ ] **Step 6: Update every other `SettingsSnapshot` constructor** the compiler flags (Codex plan
+  r1 Important — do NOT rely on the list being complete; `cargo build` enumerates them). The known
+  sites: the `snap` test helper (settings.rs:482, add `canvas: CanvasMode::Opaque`); the
+  `config.rs` round-trip literal (:842-854, add `canvas: CanvasMode::Transparent` AND a
+  `use wordcartel_core::theme::CanvasMode;` in that test — currently absent); and the **e2e.rs
+  `SettingsSnapshot` literal (e2e.rs:701)** which HEAD also has. Import `CanvasMode` in each test
+  module that names it. Extend the config round-trip: after the `chrome` assertion (:872) add
   `assert_eq!(cfg.theme.canvas.as_deref(), Some("transparent"), "[theme] canvas must round-trip");`.
 - [ ] **Step 7: Run — expect PASS.** `cargo test -p wordcartel -- canvas_persists_through_the_diff_law save_reload_roundtrip_restores_settings`; then full gates.
 - [ ] **Step 8: Commit** — `feat(canvas): per-field persistence — SettingsSnapshot/OTheme/MaskTheme/diff arm + round-trip`.
