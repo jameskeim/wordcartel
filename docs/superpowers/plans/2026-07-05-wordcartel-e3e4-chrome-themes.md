@@ -29,7 +29,7 @@
 - Modify: `wordcartel-core/src/theme.rs` only.
 
 **Interfaces:**
-- Produces: `pub enum ChromeDisposition { Full, Zen }` (derive Debug/Clone/Copy/PartialEq/Eq); `SemanticElement::{ChromeOverlay, ChromeAccent}`; `ThemeFaces.{chrome_overlay, chrome_accent}: Face`; `pub fn Theme::derive_chrome(&mut self, disp: ChromeDisposition)` (fills only all-None chrome faces; Rgb-bases-only; five color faces, never chrome_reverse); a private sRGB relative-luminance helper + `contrast_ratio` (pub(crate) or test-reachable); `element_from_key` gains `"chrome_overlay"`/`"chrome_accent"`. T2-T8 consume all of it.
+- Produces: `pub enum ChromeDisposition { Full, Zen }` (derive Debug/Clone/Copy/PartialEq/Eq); `SemanticElement::{ChromeOverlay, ChromeAccent}`; `ThemeFaces.{chrome_overlay, chrome_accent}: Face`; `pub fn Theme::derive_chrome(&mut self, disp: ChromeDisposition)` (fills only all-None chrome faces; Rgb-bases-only; five color faces, never chrome_reverse); a private sRGB relative-luminance helper + `contrast_ratio` (pub(crate) or test-reachable); `element_from_key` gains `"chrome_overlay"`/`"chrome_accent"`. T2-T7 consume all of it.
 
 - [ ] **Step 1: the failing core battery.** Transcribe the derivation reference from grounding §B.2 into test expectations FIRST (tests in theme.rs's module; the `assert_face` idiom from grounding §D). The battery (expected hex from §B.3, byte-for-byte):
   - `derive_fills_only_unset_faces` — tokyo-night: all four EXISTING chrome faces byte-identical after `derive_chrome(Full)`; the two NEW faces (chrome_overlay/chrome_accent) now Some with §B.3's tokyo values. Second call → byte-equal everything (the sentinel no-op pin).
