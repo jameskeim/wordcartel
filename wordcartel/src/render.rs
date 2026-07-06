@@ -242,19 +242,15 @@ pub(crate) fn word_count_segment(editor: &Editor) -> Option<String> {
 /// Pre-computed ratatui styles for all chrome surfaces — built once per frame
 /// from the current theme and depth, then passed by reference to the overlay
 /// and menu painters.
-///
-/// T4 values are behavior-identical to the inline composes they replace.
-/// T5 will update individual fields (`ov_fill` → [ChromeOverlay]; `ov_accent` →
-/// per-arm [ChromeAccent]; `overlay_selected` → [ChromeSelected]) without
-/// touching wiring or painter locations.
 pub(crate) struct ChromeStyles {
-    /// Selected row in overlays (T4: [ChromeReverse]; T5: [ChromeSelected]).
+    /// Selected row in overlays — [ChromeSelected] (explicit fg/bg selection).
     pub overlay_selected: RStyle,
-    /// Overlay query-bar text style (T4: [Text]; T5: [ChromeOverlay]).
+    /// Overlay query-bar text style — [ChromeOverlay] (interior fill face; bg preserved).
     pub ov_query: RStyle,
     /// Menu bar: open (active) category label.
     pub menu_open: RStyle,
-    /// Menu bar: closed (inactive) label + full-width bar fill.
+    /// Menu bar: closed (inactive) label + full-width bar fill — [Chrome].
+    /// Also used for the normal-state status line (panel bg, same face).
     pub menu_closed: RStyle,
     /// Menu dropdown: selected / highlighted item.
     pub menu_sel: RStyle,
@@ -264,14 +260,12 @@ pub(crate) struct ChromeStyles {
     pub scrollbar_track: RStyle,
     /// Scrollbar thumb (active indicator).
     pub scrollbar_thumb: RStyle,
-    /// Overlay interior fill (T4: `RStyle::default()`; T5: [ChromeOverlay]).
+    /// Overlay interior fill — [ChromeOverlay] bg applied via `set_style` after Clear.
     pub ov_fill: RStyle,
-    /// Status-line style for search/minibuffer/prompt arms
-    /// (T4: [ChromeReverse] for all four arms; T5: [ChromeAccent] for active arms).
+    /// Active status-line style (search / minibuffer / prompt) — [ChromeAccent].
     pub ov_accent: RStyle,
-    /// Overlay border style (T4: full Chrome fg+bg — behavior-identical with old inline
-    /// composes; T5: fg-only so the ChromeOverlay fill bg is preserved under
-    /// ratatui's `Cell::set_style` patch semantics).
+    /// Overlay border — fg-only Chrome (bg stripped) so the ChromeOverlay fill
+    /// bg shows through under ratatui's `Cell::set_style` patch semantics.
     pub overlay_border: RStyle,
 }
 
@@ -283,21 +277,22 @@ impl ChromeStyles {
         theme: &wordcartel_core::theme::Theme,
         depth: wordcartel_core::theme::Depth,
     ) -> Self {
-        // T4: overlay_border carries the full Chrome style (fg+bg — behavior-identical with
-        // the old inline composes). T5 will strip .bg to preserve the ChromeOverlay fill under
-        // ratatui's Cell::set_style patch semantics.
+        // overlay_border: fg-only Chrome — .bg cleared so the ChromeOverlay fill bg is
+        // preserved under ratatui's Cell::set_style patch semantics (D2 defect-1 fix).
+        let mut border = compose::compose(theme, depth, &[SE::Chrome]);
+        border.bg = None;
         ChromeStyles {
-            overlay_selected: compose::compose(theme, depth, &[SE::ChromeReverse]),
-            ov_query:         compose::compose(theme, depth, &[SE::Text]),
+            overlay_selected: compose::compose(theme, depth, &[SE::ChromeSelected]),
+            ov_query:         compose::compose(theme, depth, &[SE::ChromeOverlay]),
             menu_open:        compose::compose(theme, depth, &[SE::ChromeSelected]),
             menu_closed:      compose::compose(theme, depth, &[SE::Chrome]),
             menu_sel:         compose::compose(theme, depth, &[SE::ChromeSelected]),
             menu_norm:        compose::compose(theme, depth, &[SE::ChromeMuted]),
             scrollbar_track:  compose::compose(theme, depth, &[SE::ChromeMuted]),
             scrollbar_thumb:  compose::compose(theme, depth, &[SE::Chrome]),
-            ov_fill:          RStyle::default(),
-            ov_accent:        compose::compose(theme, depth, &[SE::ChromeReverse]),
-            overlay_border:   compose::compose(theme, depth, &[SE::Chrome]),
+            ov_fill:          compose::compose(theme, depth, &[SE::ChromeOverlay]),
+            ov_accent:        compose::compose(theme, depth, &[SE::ChromeAccent]),
+            overlay_border:   border,
         }
     }
 }
@@ -722,7 +717,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 cs.ov_accent,
             )
         } else {
-            (status_left_text(editor), cs.ov_accent)
+            (status_left_text(editor), cs.menu_closed)  // normal state: [Chrome] panel bg
         };
 
         // Compose the status line.
@@ -1335,11 +1330,15 @@ mod tests {
     }
 
     #[test]
-    fn default_status_line_still_reversed() {
+    fn terminal_plain_status_carries_chrome_face() {
+        // D2: normal status uses [Chrome] — terminal-plain Chrome = White fg / Black bg
+        // (not REVERSED). The status row must carry the Chrome bg, not a reverse modifier.
         let mut ed = Editor::new_from_text("x", None, (40, 4));
         let buf = render_to_buffer(&mut ed, 40, 4);
         let last = 3u16;
-        assert!((0..40).any(|x| buf[(x,last)].style().add_modifier.contains(Modifier::REVERSED)));
+        // terminal-plain Chrome: fg=White, bg=Black — explicit color, not reverse.
+        assert!((0..40u16).any(|x| buf[(x, last)].style().bg == Some(Color::Black)),
+                "terminal-plain normal status must carry Chrome face (bg=Black, not REVERSED)");
     }
 
     #[test]
@@ -1367,21 +1366,88 @@ mod tests {
 
     #[test]
     fn phosphor_status_line_carries_hue() {
+        // D2: normal status uses [Chrome] — phosphor Chrome bg is a derived hue-tinted Rgb.
+        // After derive_chrome, Chrome.bg is an Rgb step toward black preserving the hue.
+        use wordcartel_core::theme::ChromeDisposition;
         let mut ed = Editor::new_from_text("x", None, (40, 4));
-        ed.theme = wordcartel_core::theme::Theme::builtin("phosphor-amber").unwrap();
+        let mut theme = wordcartel_core::theme::Theme::builtin("phosphor-amber").unwrap();
+        theme.derive_chrome(ChromeDisposition::Full);
+        ed.theme = theme;
         let buf = render_to_buffer(&mut ed, 40, 4);
-        let want = compose::compose(&ed.theme, ed.depth, &[wordcartel_core::theme::SemanticElement::ChromeReverse]);
-        // the status row picks up the themed chrome-reverse style, not a hardcoded REVERSED.
-        // ratatui's test buffer normalizes unset colors to Reset in rendered cells, so compare
-        // the meaningful modifier bits and any explicit fg/bg from want.
-        assert!((0..40).any(|x| {
-            let cell = buf[(x,3)].style();
-            // modifiers must match exactly
-            cell.add_modifier == want.add_modifier
-            // any fg set by want must appear in the cell (Reset == None for our purposes)
-            && (want.fg.is_none() || cell.fg == want.fg)
-            && (want.bg.is_none() || cell.bg == want.bg)
-        }));
+        let want = compose::compose(&ed.theme, ed.depth, &[SE::Chrome]);
+        // The status row carries the derived phosphor Chrome bg (Rgb, hue-tinted toward black).
+        assert!(want.bg.is_some(), "phosphor Chrome must have a derived bg after derive_chrome");
+        assert!((0..40u16).any(|x| {
+            let cell = buf[(x, 3u16)].style();
+            (want.bg.is_none() || cell.bg == want.bg)
+                && (want.fg.is_none() || cell.fg == want.fg)
+        }), "status row must carry the derived phosphor Chrome face");
+    }
+
+    /// THE reported bug (D2): under tokyo-night, the status row bg and the menu bar bg
+    /// were different (status=[ChromeReverse] had no bg; menu=[Chrome]=PANEL_BG).
+    /// After T5 both use [Chrome] → same bg = PANEL_BG `#16161e`.
+    #[test]
+    fn tokyo_status_matches_menu_bar() {
+        use wordcartel_core::theme::{ChromeDisposition, Depth};
+        let mut ed = Editor::new_from_text("x", None, (40, 6));
+        // Enable pinned menu bar so row 0 carries the menu Chrome bg.
+        ed.menu_bar_mode = crate::config::MenuBarMode::Pinned;
+        let mut theme = wordcartel_core::theme::tokyo_night();
+        theme.derive_chrome(ChromeDisposition::Full);
+        ed.theme = theme;
+        ed.depth = Depth::Truecolor;
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+        // Status is the last row (row 5); menu bar is row 0.
+        let status_bg = buf[(0u16, 5u16)].style().bg;
+        let menu_bg   = buf[(0u16, 0u16)].style().bg;
+        assert_eq!(status_bg, menu_bg,
+            "status bg must equal menu bar bg under tokyo-night; status={status_bg:?}, menu={menu_bg:?}");
+        // Both must be PANEL_BG #16161e (the kept Chrome face).
+        assert_eq!(status_bg, Some(Color::Rgb(0x16, 0x16, 0x1e)),
+            "chrome bg must be PANEL_BG #16161e, got {status_bg:?}");
+    }
+
+    /// D2: opening a minibuffer switches the status style to [ChromeAccent];
+    /// normal state uses [Chrome]. Both are verified under terminal-plain.
+    #[test]
+    fn prompt_active_status_uses_accent() {
+        let mut ed = Editor::new_from_text("x", None, (40, 4));
+
+        // Normal state: status carries Chrome face (bg=Black under terminal-plain).
+        let buf_normal = render_to_buffer(&mut ed, 40, 4);
+        let want_chrome = compose::compose(&ed.theme, ed.depth, &[SE::Chrome]);
+        assert_eq!(want_chrome.bg, Some(Color::Black), "terminal-plain Chrome bg must be Black");
+        assert!((0..40u16).any(|x| buf_normal[(x, 3u16)].style().bg == want_chrome.bg),
+            "normal status must carry Chrome bg (Black)");
+
+        // Active state (minibuffer): status carries ChromeAccent (reverse+bold under terminal-plain).
+        ed.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter);
+        derive::rebuild(&mut ed);
+        let buf_active = render_to_buffer(&mut ed, 40, 4);
+        let want_accent = compose::compose(&ed.theme, ed.depth, &[SE::ChromeAccent]);
+        assert!((0..40u16).any(|x| {
+            let cell = buf_active[(x, 3u16)].style();
+            cell.add_modifier == want_accent.add_modifier
+        }), "minibuffer-active status must carry ChromeAccent modifiers");
+    }
+
+    /// I4 pin: terminal-plain ChromeAccent = reverse+bold. When a minibuffer is open
+    /// under terminal-plain, the status row must carry REVERSED + BOLD.
+    #[test]
+    fn terminal_plain_prompt_status_reverse_bold() {
+        let mut ed = Editor::new_from_text("x", None, (40, 4));
+        ed.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter);
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 4);
+        // terminal-plain ChromeAccent = modface(None, bold=true, reverse=true) → BOLD | REVERSED.
+        let any_accent_cell = (0..40u16).any(|x| {
+            let m = buf[(x, 3u16)].style().add_modifier;
+            m.contains(Modifier::REVERSED) && m.contains(Modifier::BOLD)
+        });
+        assert!(any_accent_cell,
+            "terminal-plain prompt-active status must carry REVERSED+BOLD (ChromeAccent = reverse+bold)");
     }
 
     #[test]
@@ -1854,10 +1920,11 @@ mod tests {
         //   SearchMatch=reverse, SearchCurrent=reverse+bold,
         //   DiagSpelling=bold+underline, DiagGrammar=bold+underline (distinct face).
         // Transient overlay + chrome elements with modifier cues:
-        //   FocusDim=dim, ChromeReverse=reverse, ChromeSelected=reverse, ChromeMuted=dim.
+        //   FocusDim=dim, ChromeReverse=reverse, ChromeSelected=reverse, ChromeMuted=dim,
+        //   ChromeAccent=reverse+bold (glyph-bearing prompt-active status — I3/D2).
         let cued = [Emphasis, Strong, StrongEmphasis, Code, CodeBlock, Link, Strikethrough,
                     Comment, FrontMatter, Selection, SearchMatch, SearchCurrent, DiagSpelling, DiagGrammar,
-                    FocusDim, ChromeReverse, ChromeSelected, ChromeMuted];
+                    FocusDim, ChromeReverse, ChromeSelected, ChromeMuted, ChromeAccent];
         for t in cue_themes() {
             for el in cued {
                 let f = t.face(el);
@@ -1870,6 +1937,10 @@ mod tests {
         // region (status bar, menu bar, overlay frames) which is structurally distinct from
         // text content; it never needs a modifier to distinguish it from text elements.
         // Proven by the chrome render tests (status-line, palette, outline overlay fixtures).
+        // §13.2: ChromeOverlay is exempt from the modifier requirement (M4 a11y) — it is a
+        //   fill face with no glyph; the overlay's accessibility is provided by the surrounding
+        //   border frame glyphs and placement cue. Its mono_faces() entry is Face::default()
+        //   deliberately; proven by the overlay-frame and interior test fixtures.
         // §13.2: FoldMarker is glyph-cued (▸ + "… N lines"); proven by the fold fixture:
         //   `fold_marker_glyph_prefix_is_rendered` — deferred to plan-③ test pass for the
         //   full §8.3 row (requires outline-folded Editor state, which is elaborate scaffolding).
@@ -2349,9 +2420,10 @@ mod tests {
         assert_eq!(pick(&live), pick(&src), "Ln,Col identical across views\nlive: {live}\nsrc:  {src}");
     }
 
-    /// FIX-3: Overlay frames must use the Chrome face (not terminal-default).
-    /// Under phosphor-amber (a fully-themed phosphor variant), the theme-picker overlay
-    /// border cells must carry themed RGB colors from the Chrome face — not Reset/None.
+    /// FIX-3 + T5: Overlay borders use Chrome fg only; bg == ChromeOverlay fill.
+    /// Under phosphor-amber, the theme-picker overlay border cells must carry Chrome
+    /// RGB fg; and the border cell bg must equal the ChromeOverlay fill bg — not
+    /// Chrome's own bg (which would create a visible "halo" around the overlay).
     #[test]
     fn phosphor_overlay_frame_border_uses_chrome_style() {
         use wordcartel_core::theme::{ChromeDisposition, Theme, Depth};
@@ -2372,19 +2444,89 @@ mod tests {
         assert!(border_cell.is_some(), "FIX-3: expected box-drawing border cells in theme-picker overlay");
         let (bx, by) = border_cell.unwrap();
         let cs = buf[(bx, by)].style();
-        // phosphor-amber Chrome face: derived from canvas via derive_chrome — both fg and bg are RGB.
-        // Before fix: border cell has fg/bg from terminal default (None or Reset).
-        // After fix: border cell carries Chrome face (RGB fg and bg).
+        // T5: border is fg-only — fg carries Chrome RGB, bg comes from the ChromeOverlay fill.
+        // Before T5: border bg = Chrome.bg (distinct from ChromeOverlay bg → halo).
+        // After T5: border bg = ChromeOverlay bg (fg-only border, fill shows through).
+        let fill_bg = compose::compose(&ed.theme, ed.depth, &[SE::ChromeOverlay]).bg;
         assert!(
             matches!(cs.fg, Some(ratatui::style::Color::Rgb(..))),
             "FIX-3: phosphor overlay border must carry Chrome RGB fg; got {:?} at ({bx},{by})",
             cs.fg
         );
-        assert!(
-            matches!(cs.bg, Some(ratatui::style::Color::Rgb(..))),
-            "FIX-3: phosphor overlay border must carry Chrome RGB bg; got {:?} at ({bx},{by})",
-            cs.bg
+        assert_eq!(
+            cs.bg, fill_bg,
+            "T5: border bg must equal ChromeOverlay fill bg (fg-only border — no halo); \
+             got {:?}, expected fill {:?} at ({bx},{by})", cs.bg, fill_bg
         );
+    }
+
+    /// D2: under tokyo-night with the palette open, every interior cell (not on the
+    /// border perimeter, not the selected row) must carry the ChromeOverlay bg (#2f303a).
+    /// No cell inside the overlay should have the terminal-default bg.
+    #[test]
+    fn tokyo_overlay_interior_is_themed() {
+        use wordcartel_core::theme::{ChromeDisposition, Depth};
+        let mut ed = Editor::new_from_text("x", None, (80, 20));
+        let mut theme = wordcartel_core::theme::tokyo_night();
+        theme.derive_chrome(ChromeDisposition::Full);
+        ed.theme = theme;
+        ed.depth = Depth::Truecolor;
+        commands_palette(&mut ed);
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 80, 20);
+
+        let fill_bg = compose::compose(&ed.theme, ed.depth, &[SE::ChromeOverlay]).bg;
+        // §B.3 pin: tokyo FULL ChromeOverlay = #2f303a.
+        assert_eq!(fill_bg, Some(Color::Rgb(0x2f, 0x30, 0x3a)),
+            "tokyo-night FULL ChromeOverlay must be #2f303a");
+
+        let n_rows = ed.palette.as_ref().unwrap().rows.len();
+        let ov_rect = palette_overlay_rect(ratatui::layout::Rect::new(0, 0, 80, 20), n_rows);
+        // query row = ov_y+1; list items start at ov_y+2; selected (index 0) is at ov_y+2.
+        let selected_y = ov_rect.y + 2;
+
+        for y in (ov_rect.y + 1)..(ov_rect.y + ov_rect.height - 1) {
+            if y == selected_y { continue; } // selected row carries ChromeSelected — skip
+            for x in (ov_rect.x + 1)..(ov_rect.x + ov_rect.width - 1) {
+                let cell_bg = buf[(x, y)].style().bg;
+                assert_eq!(cell_bg, fill_bg,
+                    "interior ({x},{y}) must have ChromeOverlay bg={fill_bg:?}, got {cell_bg:?}");
+            }
+        }
+    }
+
+    /// THE halo bug fix (D2 defect-1): under phosphor-green, overlay border cells must NOT
+    /// carry Chrome's own bg — the fg-only border rule leaves the ChromeOverlay fill's bg
+    /// intact on border cells. Tested for both Full and Zen dispositions.
+    #[test]
+    fn phosphor_border_cells_carry_no_own_bg() {
+        use wordcartel_core::theme::{ChromeDisposition, Depth};
+        for disp in [ChromeDisposition::Full, ChromeDisposition::Zen] {
+            let mut ed = Editor::new_from_text("x", None, (80, 20));
+            let mut theme = wordcartel_core::theme::Theme::builtin("phosphor-green").unwrap();
+            theme.derive_chrome(disp);
+            ed.theme = theme;
+            ed.depth = Depth::Truecolor;
+            ed.open_theme_picker();
+            derive::rebuild(&mut ed);
+            let buf = render_to_buffer(&mut ed, 80, 20);
+
+            let fill_bg = compose::compose(&ed.theme, ed.depth, &[SE::ChromeOverlay]).bg;
+            assert!(fill_bg.is_some(), "phosphor ChromeOverlay must have an Rgb bg after derive_chrome");
+
+            // Find any border glyph cell.
+            let border_cell = (0..80u16).flat_map(|x| (0..20u16).map(move |y| (x, y))).find(|&(x, y)| {
+                let s = buf[(x, y)].symbol();
+                s == "─" || s == "│" || s == "┌" || s == "┐" || s == "└" || s == "┘"
+            });
+            assert!(border_cell.is_some(),
+                "expected border cells in theme-picker overlay (disp={disp:?})");
+            let (bx, by) = border_cell.unwrap();
+            let cell_bg = buf[(bx, by)].style().bg;
+            assert_eq!(cell_bg, fill_bg,
+                "border cell bg must equal fill bg (no halo) under phosphor-green \
+                 ({disp:?}); bg={cell_bg:?}, fill={fill_bg:?} at ({bx},{by})");
+        }
     }
 
     // -----------------------------------------------------------------------
