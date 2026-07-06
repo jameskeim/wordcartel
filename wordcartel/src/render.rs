@@ -743,6 +743,10 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         let truncated: String = composed.chars().take(w as usize).collect();
         let status_line = Line::from(Span::styled(truncated, status_style));
         let status_area = Rect::new(area.x, status_row, w, 1);
+        // Fill the WHOLE row with the state's chrome style first — the Paragraph
+        // styles only the text span, and a partial bar next to the full-width menu
+        // bar was the reported-mismatch class (Fable whole-branch I-2).
+        frame.buffer_mut().set_style(status_area, status_style);
         frame.render_widget(Paragraph::new(status_line), status_area);
     }
 
@@ -1399,14 +1403,19 @@ mod tests {
         ed.depth = Depth::Truecolor;
         derive::rebuild(&mut ed);
         let buf = render_to_buffer(&mut ed, 40, 6);
-        // Status is the last row (row 5); menu bar is row 0.
-        let status_bg = buf[(0u16, 5u16)].style().bg;
-        let menu_bg   = buf[(0u16, 0u16)].style().bg;
-        assert_eq!(status_bg, menu_bg,
-            "status bg must equal menu bar bg under tokyo-night; status={status_bg:?}, menu={menu_bg:?}");
+        // Status is the last row (row 5); menu bar is row 0. FULL-ROW parity
+        // (Fable whole-branch I-2): every status cell carries the bar bg — a
+        // partial text-span bar next to the full-width menu bar was the reported
+        // mismatch class.
+        let menu_bg = buf[(0u16, 0u16)].style().bg;
+        for x in 0..40u16 {
+            let status_bg = buf[(x, 5u16)].style().bg;
+            assert_eq!(status_bg, menu_bg,
+                "status cell x={x} bg must equal menu bar bg; status={status_bg:?}, menu={menu_bg:?}");
+        }
         // Both must be PANEL_BG #16161e (the kept Chrome face).
-        assert_eq!(status_bg, Some(Color::Rgb(0x16, 0x16, 0x1e)),
-            "chrome bg must be PANEL_BG #16161e, got {status_bg:?}");
+        assert_eq!(menu_bg, Some(Color::Rgb(0x16, 0x16, 0x1e)),
+            "chrome bg must be PANEL_BG #16161e, got {menu_bg:?}");
     }
 
     /// D2: opening a minibuffer switches the status style to [ChromeAccent];
