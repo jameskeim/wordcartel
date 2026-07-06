@@ -5147,8 +5147,9 @@ mod tests {
         assert_eq!(editor.theme.name, "tokyo-night",
             "rederive must apply the picker-committed identity, not the config name");
         let full_overlay_bg = editor.theme.face(SemanticElement::ChromeOverlay).bg;
-        // §II.5 pin: tokyo FULL ChromeOverlay bg = #4e5071 (all-sentinel → derives from canvas).
-        assert_eq!(full_overlay_bg, Some(Color::Rgb { r: 0x4e, g: 0x50, b: 0x71 }),
+        // §II.5 pin: tokyo FULL ChromeOverlay bg = #3d405a — the modal shares the dropdown
+        // (ChromeMuted) level-2 tone (3-tone ladder, user decision 2026-07-06).
+        assert_eq!(full_overlay_bg, Some(Color::Rgb { r: 0x3d, g: 0x40, b: 0x5a }),
             "tokyo-night Full ChromeOverlay bg (§II.5 final): got {full_overlay_bg:?}");
 
         // Zen disposition rederive: same identity, overlay should collapse.
@@ -5158,8 +5159,8 @@ mod tests {
         assert!(did2, "Zen rederive must return true");
         assert_eq!(editor.theme.name, "tokyo-night", "identity preserved across disposition change");
         let zen_overlay_bg = editor.theme.face(SemanticElement::ChromeOverlay).bg;
-        // §II.5 pin: tokyo ZEN ChromeOverlay bg = #33354a (all-sentinel → derives from canvas).
-        assert_eq!(zen_overlay_bg, Some(Color::Rgb { r: 0x33, g: 0x35, b: 0x4a }),
+        // §II.5 pin: tokyo ZEN ChromeOverlay bg = #2c2d40 (= ZEN ChromeMuted bg — 3-tone ladder).
+        assert_eq!(zen_overlay_bg, Some(Color::Rgb { r: 0x2c, g: 0x2d, b: 0x40 }),
             "tokyo-night Zen ChromeOverlay bg (§II.5 final): got {zen_overlay_bg:?}");
     }
 

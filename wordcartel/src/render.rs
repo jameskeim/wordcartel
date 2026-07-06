@@ -2705,9 +2705,10 @@ mod tests {
         let buf = render_to_buffer(&mut ed, 80, 20);
 
         let fill_bg = compose::compose(&ed.theme, ed.depth, &[SE::ChromeOverlay]).bg;
-        // §II.5 pin: tokyo FULL ChromeOverlay bg = #4e5071 (all-sentinel → derives from canvas).
-        assert_eq!(fill_bg, Some(Color::Rgb(0x4e, 0x50, 0x71)),
-            "tokyo-night FULL ChromeOverlay (§II.5 pin) must be #4e5071");
+        // §II.5 pin: tokyo FULL ChromeOverlay bg = #3d405a — the modal shares the dropdown
+        // (ChromeMuted) level-2 tone (3-tone ladder, user decision 2026-07-06).
+        assert_eq!(fill_bg, Some(Color::Rgb(0x3d, 0x40, 0x5a)),
+            "tokyo-night FULL ChromeOverlay (§II.5 pin) must be #3d405a (= ChromeMuted bg)");
 
         let n_rows = ed.palette.as_ref().unwrap().rows.len();
         let ov_rect = palette_overlay_rect(ratatui::layout::Rect::new(0, 0, 80, 20), n_rows);
