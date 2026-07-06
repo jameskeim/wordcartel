@@ -59,7 +59,8 @@ rewrites.)*
 
 **Files:**
 - Modify: `wordcartel-core/src/theme.rs`, `wordcartel/src/theme_picker.rs`,
-  `wordcartel/src/render.rs` (tests only), `wordcartel/src/theme_resolve.rs` (tests only).
+  `wordcartel/src/render.rs` (tests only), `wordcartel/src/theme_resolve.rs` (tests only),
+  `wordcartel/src/editor.rs` (tests only — the "default" name pin at :1138; Codex r2).
 
 **Interfaces:**
 - Consumes: T1. Produces: phosphor constructors with NO chrome initializers (I4-A);
@@ -103,7 +104,10 @@ completes the wiring.
   render.rs phosphor border tests (:2623-2647) → construct phosphor + derive_chrome(Full)
   and pin the DERIVED border values (§B.3); theme_resolve.rs name pins →
   "terminal-plain" expectations (the alias warning itself lands in T3 — these tests only
-  need the fallback NAME fixed).
+  need the fallback NAME fixed); editor.rs:1138 and theme_picker.rs:84 — the two
+  remaining `"default"`-name pins (Codex r2 grep) → "terminal-plain". After the rewrites,
+  grep `"default"` and `-flat` and `builtin_names` across wordcartel/src (incl. e2e.rs)
+  and confirm zero stale references in the report.
 
 - [ ] **Step 4: GREEN + gates + commit** — `feat(e3e4): the 19-theme lineup — phosphor derives (I4-A), from_base16 sentinels, terminal-plain + terminal-ansi, the ten E4 builtins`.
 
@@ -131,7 +135,7 @@ completes the wiring.
 - Create: `wordcartel/src/render_overlays.rs`; Modify: `wordcartel/src/render.rs`, `wordcartel/src/lib.rs` (mod line).
 
 **Interfaces:**
-- Produces: `pub(crate) struct ChromeStyles` — the FULL final field set T5 needs (grounding's feasible shape: the six existing precomputed styles + ov_fill, ov_accent, overlay_border, overlay_selected, scrollbar track/thumb — built once in render.rs; T5 must not need a field T4 didn't add; Codex plan r1 minor); `pub(crate) fn render_overlays::paint(frame, editor, &ChromeStyles)` containing the five overlay painters + menu + diag, code MOVED byte-identical except the mechanical style-struct threading. Geometry helpers STAY in render.rs pub(crate) (mouse.rs imports unchanged — grounding A.10).
+- Produces: `pub(crate) struct ChromeStyles` — the FULL final field set T5 needs (grounding's feasible shape: the six existing precomputed styles + ov_fill, ov_accent, overlay_border, overlay_selected, scrollbar track/thumb — built once in render.rs; T5 must not need a field T4 didn't add). DEAD-CODE DISCIPLINE for T4's intermediate state (Codex r2 T4): every field T4 adds is READ in T4 — the mechanical move threads the six existing styles through their painters AND immediately re-homes the scrollbar pair (its two compose calls move into the struct build) and wires ov_fill/ov_accent/overlay_border/overlay_selected into the painters at their CURRENT values (ov_fill/border = today's compose results — behavior-identical) so no field is unused and no #[allow] is needed; T5 then changes the VALUES/faces, not the wiring; `pub(crate) fn render_overlays::paint(frame, editor, &ChromeStyles)` containing the five overlay painters + menu + diag, code MOVED byte-identical except the mechanical style-struct threading. Geometry helpers STAY in render.rs pub(crate) (mouse.rs imports unchanged — grounding A.10).
 
 - [ ] **Step 1:** build `ChromeStyles` in render.rs replacing the six locals (grounding A.3's precompute block; the two new slots compose the T1 faces); move the painter block (:739-1081 region) into render_overlays.rs with ONLY the mechanical renames (locals → struct fields). TWO commits: (a) the struct introduction in place, (b) the move — so the move commit diffs byte-identical-modulo-mechanical and review can verify conservation (H1 discipline; the whole-branch review charges it).
 - [ ] **Step 2:** full suite green UNCHANGED (no behavior change; render tests pass as-is). Gates. Commits — `refactor(e3e4): ChromeStyles precompute struct` / `refactor(e3e4): render_overlays.rs — the painters move (byte-identical modulo threading)`.
@@ -176,11 +180,12 @@ completes the wiring.
 ### Task 7: e2e + ship polish
 
 **Files:**
-- Modify: `wordcartel/src/e2e.rs`, `wordcartel/src/theme_picker.rs` (>= count), `wordcartel/src/app.rs` (preview derivation).
+- Modify: `wordcartel/src/e2e.rs`, `wordcartel/src/app.rs` (preview derivation),
+  `wordcartel/src/theme_picker.rs` (the preview-derives pin only — the count rewrite is T2's).
 
 **Interfaces:** consumes everything.
 
-- [ ] **Step 1:** `preview_selected_theme` gains the derivation on the fresh builtin (`theme.derive_chrome(editor.chrome_disposition)` before apply — grounding A.9; apply_theme itself UNTOUCHED); picker pins: `rebuild_rows` count `>= 13` → `>= 19`; a preview-derives pin (open picker under zen, Down to flexoki-dark, the LIVE theme's bar == §B.3's zen hex).
+- [ ] **Step 1:** `preview_selected_theme` gains the derivation on the fresh builtin (`theme.derive_chrome(editor.chrome_disposition)` before apply — grounding A.9; apply_theme itself UNTOUCHED); a preview-derives pin (open picker under zen, Down to flexoki-dark, the LIVE theme's bar == §B.3's zen hex). (The picker count rewrite lives in T2 — no duplicate ownership; Codex r2.)
 - [ ] **Step 2: the journey** (`journey_chrome_zen_toggle`): under tokyo-night (Harness with the resolved theme — grounding §D's harness idiom), open the palette → assert a themed interior cell via the harness buffer (or delegate to T6's render pin and assert text presence); dispatch toggle_chrome via palette → status "chrome: zen"; Save Settings → the file carries `[theme] chrome = "zen"`.
 - [ ] **Step 3: full gates + smoke** (`scripts/smoke/run.sh`, quote VERBATIM — advisory).
 - [ ] **Step 4: commit** — `feat(e3e4): preview derivation, 19-theme picker, the zen journey`.
