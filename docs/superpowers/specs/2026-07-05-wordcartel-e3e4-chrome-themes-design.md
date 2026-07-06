@@ -144,9 +144,22 @@ Grounded facts). Working order: the E3 slot.
   - Overlay interiors: the overlay RECT is filled with the ChromeOverlay face (a
     set_style after Clear — no terminal-default gaps between rows), unselected rows
     inherit it, query lines compose [ChromeOverlay] (+ the query text keeps its content
-    styling), borders stay Chrome, selected rows stay ChromeSelected (dropping
-    ChromeReverse). Applies to all five: palette, outline, theme picker, file browser,
-    diag quick-fix.
+    styling), selected rows stay ChromeSelected (dropping ChromeReverse). Applies to all
+    five: palette, outline, theme picker, file browser, diag quick-fix.
+  - **The border/fill rule (user-reported, 2026-07-05, two defects):**
+    (1) BORDERS NEVER PAINT THEIR OWN BACKGROUND — today's border composes SE::Chrome,
+    whose PANEL bg (phosphor: `shade(hue,1)`, lighter than the `shade(hue,0)` canvas)
+    puts a one-cell halo of lighter hue around every modal (the reported lighter-green
+    strip). Border styles become FG-ONLY from the ladder (bg None); border cells inherit
+    the fill beneath them. Draw order: fill the rect, then fg-only lines.
+    (2) THE FILL IS DISPOSITION-HONEST: in FULL the interior is the overlay rung (an
+    intentional tone above the canvas) and the border fg is a muted same-hue step — frame
+    and fill read as one raised material (the research's tonal-separation default); in
+    ZEN the interior collapses toward the canvas (the blend the user expected — no more
+    terminal-default "slightly off" hover) and the thin border alone carries the
+    separation (border-as-separator, the calm expression). Pins: border-cell bg ==
+    interior bg under phosphor-green (the halo regression); full → interior bg ==
+    ChromeOverlay bg ≠ canvas; zen → interior bg within the collapsed step of canvas.
   - Status line: normal state composes [Chrome] (explicit — matches the menu bar at
     last); ACTIVE states (search / minibuffer / prompt) compose [ChromeAccent] — the
     first honest "the editor is asking you something" distinction. terminal-plain's
@@ -252,7 +265,8 @@ Grounded facts). Working order: the E3 slot.
   terminal-ansi markdown faces all named-ANSI (no Rgb values — a property pin).
 - Render: the reported-bug regression pins — under tokyo-night: status bg == menu bar bg;
   palette unselected-row bg == ChromeOverlay bg; overlay backdrop has NO terminal-default
-  cells inside the rect. The rewritten status pin (D2). The prompt-active accent pin
+  cells inside the rect; under phosphor-green: EVERY border cell's bg == the interior
+  fill bg (the lighter-green halo regression), asserted in both dispositions. The rewritten status pin (D2). The prompt-active accent pin
   (open a minibuffer → status face == ChromeAccent). Menu fill + scrollbar goldens
   updated where values moved (compose-relative comparisons survive by construction).
   a11y cue-mode modifier coverage re-pinned for the new faces (ChromeOverlay/ChromeAccent
