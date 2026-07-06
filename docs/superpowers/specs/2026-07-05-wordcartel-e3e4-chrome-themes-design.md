@@ -58,8 +58,9 @@ Grounded facts). Working order: the E3 slot.
   `-flat`). tokyo_night chrome: `fg FG / bg PANEL_BG(#16161e)` vs base `#1a1b26` —
   hand-tuned, KEPT as an override. phosphor (:499): `base_bg = shade(hue,0)` — `shade`
   (:458) preserves H/S, maps level to lightness 0.08..0.92, so phosphor canvases are
-  hue-tinted near-black; the ladder inherits the tint by construction (lightness-only
-  steps). `-flat` = mono_faces + hue chrome (the inversion the user rejected).
+  hue-tinted near-black; the CURRENT shade() machinery is HSL-lightness-based — a fact about
+  the existing phosphor code, NOT the new ladder (which is RGB pre-blend, D1; the tint
+  still carries because pre-blends preserve hue proportionally). `-flat` = mono_faces + hue chrome (the inversion the user rejected).
   `from_base16` (:339) maps base00/05 to bg/fg + a panel guess; the CONCRETE EDIT
   (Fable I3 — load-bearing): its four chrome-face initializers (theme.rs:383-386) become
   all-None sentinels so derivation fills them — otherwise the sentinel rule reads them as
@@ -219,8 +220,9 @@ Grounded facts). Working order: the E3 slot.
     puts a one-cell halo of lighter hue around every modal (the reported lighter-green
     strip). Border styles become FG-ONLY from the ladder (bg None); border cells inherit
     the fill beneath them. Draw order: fill the rect, then fg-only lines.
-    (2) THE FILL IS DISPOSITION-HONEST: in FULL the interior is the overlay rung (an
-    intentional tone above the canvas) and the border fg is a muted same-hue step — frame
+    (2) THE FILL IS DISPOSITION-HONEST: in FULL the interior is the RAISED overlay rung
+    (an intentional tone toward the overlay pole — lighter on dark themes, deeper on
+    light ones) and the border fg is a muted same-hue step — frame
     and fill read as one raised material (the research's tonal-separation default); in
     ZEN the interior collapses toward the canvas (the blend the user expected — no more
     terminal-default "slightly off" hover) and the thin border alone carries the
@@ -307,9 +309,11 @@ Grounded facts). Working order: the E3 slot.
 - The five `-flat` names are REMOVED from `builtin()`/`builtin_names()`; a config naming
   one warns ("theme 'phosphor-X-flat' removed; using 'phosphor-X'") and falls back to the
   base phosphor (resolve-layer mapping, not a builtin alias).
-- Main phosphors: derivation over the tinted `shade(hue,0)` base reproduces hue-shaded
-  chrome by construction; explicit overrides are kept ONLY where probed-different from
-  today (D1's rule). Phosphor-zen = the subdued same-hue chrome `-flat` should have been.
+- Main phosphors: the constructors DELETE their chrome-face initializers entirely
+  (user-ratified I4-A — D1's phosphor paragraph GOVERNS; today's theme.rs:530
+  initializers go away); derivation over the tinted `shade(hue,0)` base yields hue-shaded
+  chrome with better contrast (probe: 7.5:1 vs today's 3.9:1). Phosphor-zen = the
+  subdued same-hue chrome `-flat` should have been.
 - Test updates: `all_thirteen_builtins_total` → the new total (see D5: 19);
   `phosphor_16color_floor` drops flat iteration; the a11y cue test replaces
   `phosphor-amber-flat` with `no-color` + a zen-phosphor case; picker `>= 13` → `>= 19`.
@@ -382,7 +386,9 @@ Grounded facts). Working order: the E3 slot.
   Black-canvas arm — Chrome/ChromeOverlay bg DarkGray fg White, ChromeSelected
   Black-on-White, ChromeMuted White dim, ChromeAccent White bold; else arm —
   Chrome/ChromeOverlay bg Black fg White, ChromeSelected White-on-Black, ChromeMuted
-  White dim, ChromeAccent White bold.
+  White dim, ChromeAccent White bold. ChromeReverse is deliberately EXCLUDED from the
+  table (consistent with D1: it is never derived and no full-color path composes it —
+  its reverse-modifier default stands untouched at every depth).
   Explicit constructor chrome (tokyo, terminal-*) quantizes as today. Applied in resolve
   after depth detection; pinned CORRECTLY: flexoki-dark at Ansi16 → status bar bg
   DarkGray, fg White, ≠ the Black canvas.
