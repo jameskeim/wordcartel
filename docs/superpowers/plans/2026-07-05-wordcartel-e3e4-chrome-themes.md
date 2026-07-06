@@ -1,5 +1,11 @@
 # E3+E4 Chrome Ladder + Theme Lineup Implementation Plan
 
+> Plan status: CLEAN — Codex GO ×7 (r1: the 19-at-once restructure; r2: the missed
+> "default" pins + T4 dead-code discipline; r3: confirmed) + Fable READY (all 76 §B.3
+> literals independently re-derived byte-exact; the three derivation conventions pinned;
+> the §B.5 quantize correction; the two property pins probe-corrected; empty final
+> findings), 2026-07-05.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** every chrome cell derives from a coherent tonal ladder (RGB pre-blend, split directions, contrast-clamped); a `full|zen` axis with a live toggle and persistence; the 19-theme lineup (rename + terminal-ansi + ten E4 bundles + flexoki-dark launch default, phosphor `-flat` gone); the render.rs split.
