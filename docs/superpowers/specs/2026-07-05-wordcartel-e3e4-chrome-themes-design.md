@@ -142,17 +142,34 @@ Grounded facts). Working order: the E3 slot.
   rule, never a re-derivation, so toggling re-resolves from scratch (D3's pattern) rather
   than mutating a live theme. resolve_theme calls it with the ACTIVE disposition before
   applying overrides. Mechanics:
-  - Steps are LIGHTNESS-ONLY moves in HSL (the existing rgb_to_hsl/hsl_to_rgb; hue and
-    saturation pass through — phosphor/tokyo tints carry into chrome by construction).
-  - Direction by base luminance: dark base (L < 0.5) steps LIGHTER ("lit from the
-    front"); light base steps DARKER. Full step sizes: panel = 1 step, overlay = 2 steps
-    (exact deltas pinned by the plan against probes; targets ≈ the Material 7%/14%
-    pre-blend feel and must reproduce tokyo-night-class subtlety, not ansi-blocky jumps).
-  - Fg family: chrome fg = base_fg; muted fg = base_fg stepped toward base_bg
-    (secondary emphasis); selected = explicit base_bg-on-base_fg (today's convention).
-  - Accent: a theme-supplied seed color, desaturated toward the research's calm range;
-    when the theme supplies none, a brightness-distinct tone of base_fg (same hue, offset
-    lightness) — the plan pins the exact desaturation/offset math against probes. Accent is used ONLY per D2's discipline list.
+  - Steps are RGB PRE-BLENDS toward a pole (user-ratified C1-A, 2026-07-05 — Fable's
+    probes falsified the HSL-lightness sketch: HSL S≈1.0 on near-black/near-white bases
+    like solarized/flexoki-paper amplifies hue, yielding yellow chrome and unsatisfiable
+    contrast). `blend(base, pole, pct)` per channel — Material's real overlay mechanism,
+    already cited in Grounded facts; hue character carries proportionally
+    (phosphor/tokyo tints flow into chrome by construction).
+  - THE SPLIT LADDER (user-ratified I1-A — the treatment the user LIKES is the sunken
+    direction): BARS/PANELS (menu bar, dropdowns, status) = one step toward BLACK on
+    every theme (dark: the tokyo/catppuccin-mantle sunken look, generalized; light: the
+    latte-official darker panel). OVERLAYS/MODALS = the raised pole: dark themes blend
+    toward WHITE; light themes blend FURTHER toward black (paper bases have no lighter
+    headroom — a deeper second rung, catppuccin-crust-style). Calibration targets for
+    the plan's probes: tokyo's hand-tuned panel delta + catppuccin's official
+    mantle/crust deltas — tokyo-class subtlety, never ansi-blocky.
+  - CONTRAST CLAMP: after deriving, if primary fg vs any derived rung falls below the
+    pinned readable threshold, the step shrinks until it passes (enforced IN derivation,
+    not merely tested). The threshold uses a small sRGB-linearized relative-luminance
+    helper the plan adds (probe-verified: HSL-L deltas are a bad proxy — solarized
+    "passed" a large ΔL while failing WCAG at 2.1:1).
+  - Fg family (user-ratified with C1-A; Fable I2): derived by RGB INTERPOLATION toward
+    base_bg (probe: reproduces the hand-tuned muted character; HSL stepping left
+    saturation vivid). chrome fg = base_fg; muted fg = base_fg blended toward base_bg;
+    selected = explicit base_bg-on-base_fg (today's convention).
+  - Accent: the theme seed (or base_fg when absent) desaturated via RGB blend toward the
+    gray of equal luminance — the plan pins the exact blend fraction against probes.
+    Accent is used ONLY per D2's discipline list.
+  - Derivation fills the FIVE color faces (Chrome, ChromeOverlay, ChromeSelected,
+    ChromeMuted, ChromeAccent); ChromeReverse is never derived (cue/mono territory).
   - Zen: the SAME derivation with collapsed step sizes (panel ≈ canvas + a minimal
     visible step, overlay = one subtle step, muted dimmer, accent retained but fainter).
     Zen never changes hue.
