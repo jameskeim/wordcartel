@@ -41,7 +41,12 @@ impl std::fmt::Display for TransformError {
 }
 
 impl TransformError {
-    fn from_repar(e: repar::ParError) -> TransformError { TransformError::Repar(e.to_string()) }
+    // repar's ParError Display is newline-terminated (par's errmsg[] convention — see
+    // repar docs/editor-integration.md). Trim it so the status line does not gain a trailing
+    // blank line when the error is rendered.
+    fn from_repar(e: repar::ParError) -> TransformError {
+        TransformError::Repar(e.to_string().trim_end().to_string())
+    }
 }
 
 /// Run a transform body, mapping a panic in untrusted (`repar`) code to a recoverable error.
@@ -308,15 +313,24 @@ fn check_output_size(out: String) -> Result<String, TransformError> {
     } else { Ok(out) }
 }
 
+/// repar's documented "blessed editor stack" (repar 1.1 docs/editor-integration.md — the doc repar
+/// wrote FROM the wordcartel integration). Leading `none` clears any ambient `REPAR_FIXUPS`/default
+/// so our output changes only when THIS string changes; `all` = the Unicode corrections;
+/// `prose` cures the suffix trap; `prose-prefix` cures the anaphora trap (jointly necessary with
+/// `prose`); `markdown` protects structure (and keeps `prose-prefix` from eating `> ` quotes);
+/// `no-trailing-pad` strips par's wide-char trailing-space padding (a hard-`<br>` hazard in
+/// markdown for CJK/emoji prose — a no-op on plain ASCII).
+const FIXUPS_STACK: &str = "--fixups=none,all,prose,prose-prefix,markdown,no-trailing-pad";
+
 /// Run a repar transform over `input`, markdown-aware. Pure (no IO).
 pub fn run_transform(kind: TransformKind, input: &str, width: u32) -> Result<String, TransformError> {
-    // repar ≥1.0: the builder chain returns Result<Options,ParError>; unwrap before calling methods.
-    let mut opts = repar::Options::new().width(width).map_err(TransformError::from_repar)?;
-    opts.apply_par_args([kind.verb()]).map_err(TransformError::from_repar)?;
-    // The pinned fixups baseline (spec repar10 D3, the repar-nvim embedding pattern):
-    // "none" first makes the stack independent of Options::new()'s defaults — repar
-    // upgrades change wordcartel's output only when THIS string changes.
-    opts.apply_fixups("none,all,prose,markdown").map_err(TransformError::from_repar)?;
+    // Build entirely on repar's SemVer-frozen `from_par_args` surface (the `public_surface_pin_v1`
+    // contract), rather than `Options::new()` + the non-frozen `apply_*` mutators — one construction
+    // that layers width, the transform verb, and the blessed fixups stack, matching how the binary
+    // parses argv. Width < 10000 (repar's parse ceiling); wrap_column is bounded 20..=9999 upstream.
+    let width_arg = format!("--width={width}");
+    let opts = repar::Options::from_par_args([width_arg.as_str(), kind.verb(), FIXUPS_STACK])
+        .map_err(TransformError::from_repar)?;
     let out = opts.format(input).map_err(TransformError::from_repar)?;
     check_output_size(out)
 }
@@ -462,9 +476,9 @@ mod tests {
     fn ventilate_then_reflow_respects_sentence_boundaries() {
         // The user-found 0.9.x bug class, probe-reproduced at width 40 under the OLD
         // stack (periods detached + space-padded to the column, and one EXTRA period
-        // fabricated: count 6 != 5). Corpus constraint (spec I-3): DISTINCT sentence
-        // openings — par's common-PREFIX inference is untouched by prose and mangles
-        // anaphoric corpora under every stack (recorded upstream candidate).
+        // fabricated: count 6 != 5) — cured by `prose`. Distinct sentence openings here;
+        // the anaphoric (repeated-opening) case is covered separately by
+        // `anaphoric_ventilate_reflow_preserves_word_order` (fixed by `prose-prefix`).
         let para = "Alpha wolves roam the northern ridge. Bright lanterns lit the harbor at dusk. Careful readers noticed the missing comma. Distant thunder rolled across the plain. Every morning she brewed strong coffee.\n";
         let ventilated = run_transform(TransformKind::Ventilate, para, 72).unwrap();
         assert_eq!(ventilated.lines().filter(|l| !l.trim().is_empty()).count(), 5,
@@ -477,6 +491,42 @@ mod tests {
         assert!(!reflowed.contains(" ."), "space-padded period: {reflowed:?}");
         // Detector 3 (the loss detector): period count == sentence count.
         assert_eq!(reflowed.matches('.').count(), 5, "periods lost or fabricated: {reflowed:?}");
+    }
+
+    #[test]
+    fn anaphoric_ventilate_reflow_preserves_word_order() {
+        // The anaphora trap: repeated sentence openings ("We will fight …") make par infer a
+        // common PREFIX and relocate it, scrambling word order on any leg that joins lines. Under
+        // the OLD stack this reflow produced "…beaches. on the landing / We will fight grounds. …"
+        // `prose-prefix` (repar 1.1 R26, jointly necessary with `prose`) caps the inferred prefix
+        // at the common leading WHITESPACE, so every word survives in order.
+        let para = "We will fight on the beaches. We will fight on the landing grounds. We will fight in the fields.\n";
+        let ventilated = run_transform(TransformKind::Ventilate, para, 72).unwrap();
+        assert_eq!(ventilated.lines().filter(|l| !l.trim().is_empty()).count(), 3,
+            "precondition: one anaphoric sentence per line");
+        let reflowed = run_transform(TransformKind::Reflow, &ventilated, 50).unwrap();
+        // Word multiset preserved — no scramble, no loss, no fabrication.
+        let mut got: Vec<&str> = reflowed.split_whitespace().collect();
+        let mut want: Vec<&str> = para.split_whitespace().collect();
+        got.sort_unstable(); want.sort_unstable();
+        assert_eq!(got, want, "anaphoric reflow must preserve every word: {reflowed:?}");
+        // And the specific corruption signature is absent: "We will fight" stays intact.
+        assert_eq!(reflowed.matches("We will fight").count(), 3,
+            "each anaphoric opening must survive whole: {reflowed:?}");
+    }
+
+    #[test]
+    fn markdown_blockquote_reflow_preserves_quote_marker() {
+        // The prose-prefix caveat ("> becomes body on raw quoted text") does NOT bite in our
+        // stack: `markdown` handles blockquotes structurally — strips the `> ` marker, reflows the
+        // body (with prose-prefix), re-applies `> `. Every emitted line keeps its quote marker.
+        let quote = "> We will fight on the beaches. We will fight on the landing grounds. We will fight in the fields.\n";
+        let out = run_transform(TransformKind::Reflow, quote, 50).unwrap();
+        assert!(out.lines().filter(|l| !l.trim().is_empty()).all(|l| l.starts_with("> ")),
+            "every reflowed blockquote line must keep its '> ' marker: {out:?}");
+        // Word order preserved inside the quote too (prose-prefix + markdown compose correctly).
+        assert_eq!(out.matches("We will fight").count(), 3,
+            "anaphora inside the quote must survive: {out:?}");
     }
 
     #[test]
@@ -498,14 +548,18 @@ mod tests {
 
     #[test]
     fn reflow_multibyte_corpus_is_stable() {
-        // Contract pin: byte-exact repar-1.0 output for mixed-width text at width 40.
-        // KNOWN repar-1.0 artifact, pinned DELIBERATELY (spec I-2, upstream candidate):
-        // one trailing space per double-width char per line (中文 → 2, 🙂 → 1). In
-        // markdown, two-plus trailing spaces is a hard <br> — pre-existing repar
-        // behavior, NOT this effort's bug. Do not trim; do not "fix" the literal.
+        // Contract pin: byte-exact output for mixed-width text at width 40 under the blessed
+        // stack. par pads one trailing space per double-width char per line (中文 → 2, 🙂 → 1);
+        // in markdown two-plus trailing spaces is a hard <br>, so reflowing CJK/emoji prose used
+        // to inject breaks that were not in the source. `no-trailing-pad` (repar 1.1 R25, added
+        // FROM this integration) strips that padding — the "upstream candidate" is now fixed, not
+        // preserved. The literal below carries NO trailing pad.
         let input = "caf\u{e9} serves th\u{e9} while \u{4e2d}\u{6587} characters and \u{1f642} emoji flow together in one long prose paragraph that must wrap somewhere around forty columns wide here now.\n";
         let out = run_transform(TransformKind::Reflow, input, 40).unwrap();
-        assert_eq!(out, "caf\u{e9} serves th\u{e9} while \u{4e2d}\u{6587} characters  \nand \u{1f642} emoji flow together in one long \nprose paragraph that must wrap somewhere\naround forty columns wide here now.\n");
+        assert_eq!(out, "caf\u{e9} serves th\u{e9} while \u{4e2d}\u{6587} characters\nand \u{1f642} emoji flow together in one long\nprose paragraph that must wrap somewhere\naround forty columns wide here now.\n");
+        // The property that matters: no reflowed line ends in whitespace → no hard-<br> injected.
+        assert!(out.lines().all(|l| l == l.trim_end()),
+            "no line may carry trailing pad (a markdown hard-break hazard): {out:?}");
     }
 
     #[test]
