@@ -1,147 +1,201 @@
-# Chrome elevation recalibration — design
+# Theme rendering quality — chrome elevation + completeness standard — design
 
 **Status:** brainstorm-approved 2026-07-06. Facts cross-checked against real source at HEAD of
-`main` (post canvas-transparency merge). Branch `effort-chrome-elevation`. Gating: Codex is the
-sole spec/plan gate (loop until clean); Fable reviews the whole branch only.
+`main` (post canvas-transparency merge). Branch `effort-chrome-elevation`. Gating: Codex is the sole
+spec/plan gate (loop until clean); Fable reviews the whole branch only.
 
 ## Goal
 
-Make every chrome surface — menu bar, status line, menu dropdown, overlays — read as a distinct,
-elevated layer, clearly separated from the document content and from each other, on all 19 themes
-(dark and light). This fixes three related, user-reported failures that share one root cause:
+One "theme rendering quality" effort with five tightly-related parts, all raising the bar on how
+themes render:
 
-1. **Chrome text mistaken for document text** — the menu bar / status line render `base_fg` (the
-   exact body-text color) on a background only ~18% darker than the canvas, so they blend into the
-   document.
-2. **Dropdown not clearly distinct from the menu bar.**
-3. **`full` and `zen` chrome not visually distinct from each other.**
+- **A. Chrome elevation recalibration** — every chrome surface reads as a distinct, elevated layer,
+  separated from content and from each other, on all 19 themes.
+- **B. A theme-completeness standard + conformance test** — codify what a "complete" theme must
+  define, enforced so it can't silently drift again.
+- **C. The heading-text-color rule** — resolve the cross-theme inconsistency via a uniform rule.
+- **D. Tokyo brought to the standard** — colored roles + chrome → derived.
+- **E. Phosphor shade fix** — bright shades stay hued, and phosphor's tonal hierarchy is restored.
 
-## Background — why the current ladder fails
+All five stay in one effort (they touch the same surface and share the conformance test).
 
+---
+
+## Part A — Chrome elevation recalibration
+
+### A-Goal
+Make the menu bar, status line, menu dropdown, and overlays each read as a distinct elevated layer,
+clearly separated from the document and from each other, on every theme. Fixes three user-reported
+failures with one root cause: (1) chrome text mistaken for body text; (2) dropdown not distinct from
+the bar; (3) `full` and `zen` chrome not distinct from each other.
+
+### A-Background — why the current ladder fails
 E3's `derive_chrome` (`wordcartel-core/src/theme.rs:222`) uses a **split ladder**: bars sink toward
 black (`chrome bg = clamp_blend(bar_pct, black)`, `CHROME_BAR_PCT_DARK = 0.18`), while overlays
-already elevate toward the *headroom* pole (`ov_pole = white on dark`). The bar direction is the
-bug. On a dark theme the canvas is near-black (flexoki-dark `base_bg = #100f0f`, relative luminance
-~0.015): there is almost no luminance room *below* it, so an 18%-toward-black step is a tiny
-absolute change (`#100f0f → #0d0c0c`, three levels) and the bar never becomes its own surface. The
-existing `clamp_blend` only *shrinks* the step to preserve `base_fg`-vs-rung legibility — it never
-enforces separation *from the canvas* — so nothing rescues the near-black case. `zen` scales the
-already-tiny step by `ZEN_COLLAPSE = 0.35`, so `full` (~18%) and `zen` (~6%) of a near-black range
-differ imperceptibly. And the bar foreground is `base_fg`, identical to body text.
+already elevate toward the *headroom* pole (`ov_pole = white on dark`). The bar direction is the bug.
+On a dark theme the canvas is near-black (flexoki-dark `base_bg = #100f0f`, rel-lum ~0.015): there is
+almost no luminance room *below* it, so an 18%-toward-black step is a tiny change (`#100f0f → #0d0c0c`)
+and the bar never becomes its own surface. The existing `clamp_blend` only *shrinks* the step to keep
+`base_fg`-vs-rung legible — it never enforces separation *from the canvas*. `zen` scales the tiny step
+by `ZEN_COLLAPSE = 0.35`, so `full` and `zen` differ imperceptibly. And the bar foreground is `base_fg`,
+identical to body text.
 
-The room on a dark theme is *upward* (toward white); on a light theme it is *downward*. Overlays
-already exploit this. The fix generalizes that to every chrome layer and adds a separation floor.
-
-## D1 — Unified elevation ladder
-
-Replace the split ladder with one rule: **every derived chrome surface elevates away from the
-canvas toward the pole with headroom** — lighter on dark themes (`is_dark = rel_lum(bg) < 0.5`),
-darker on light themes — i.e. the overlay's existing `ov_pole` logic applied to *all* chrome
-layers, not just overlays. Successive layers elevate by increasing amounts, producing a strictly
-ordered, always-distinct stack:
-
+### A-D1 — Unified elevation ladder
+Replace the split ladder with one rule: **every derived chrome surface elevates away from the canvas
+toward the pole with headroom** — lighter on dark themes (`is_dark = rel_lum(bg) < 0.5`), darker on
+light — i.e. the overlay's existing `ov_pole` logic applied to *all* chrome layers. Successive layers
+elevate more, producing a strictly ordered, always-distinct stack:
 ```
 canvas (base_bg)  <  bar (Chrome)  <  dropdown (ChromeMuted)  <  overlay (ChromeOverlay)
-        level 0            level 1              level 2                    level 3
 ```
+Face → level mapping reuses E3's existing chrome faces unchanged in identity. `ChromeSelected`
+(inverted highlight), `ChromeAccent` (status prompt — reads `chrome.bg`, which now elevates),
+scrollbar track/thumb, and `ChromeReverse` (cue, never derived) keep their roles on top.
+**Hue-preserving:** the elevation shifts lightness while preserving the canvas hue+saturation (a tinted
+panel, not a gray strip); mechanism probe-calibrated (§Calibration), applied to the **background only**
+so E3's C1-A HSL caution (on derived *foregrounds*) does not apply.
 
-(`<` = "further from the canvas toward the headroom pole.") The face → level mapping reuses E3's
-existing chrome faces unchanged in identity — this is a re-derivation, not a new face set.
-`ChromeSelected` (inverted highlight), `ChromeAccent` (status prompt/active state), the scrollbar
-track/thumb, and `ChromeReverse` (cue, never derived) keep their roles and compose on top.
+### A-D2 — Separation floor (the guarantee)
+Each layer has a calibrated default step, **clamped *up*** until its background clears a **minimum
+separation** (probe-calibrated luminance delta / modest contrast, well below the 4.5:1 text threshold)
+from the layer beneath (canvas for bar, bar for dropdown, dropdown for overlay). This is a **new**
+clamp — opposite in direction to E3's existing legibility clamp (which *shrinks*). They coexist: grow
+to the separation floor; if that pushes the foreground under its legibility floor, re-derive the
+foreground (A-D3) rather than shrink the surface back. The floor is what makes distinctness hold *by
+construction* on near-black / near-white canvases.
 
-**Hue-preserving.** The elevation shifts lightness while preserving the canvas's hue and
-saturation, so each panel is a *tinted* member of the theme (a warm theme's bars stay warm, a cool
-theme's stay cool) rather than a desaturated gray strip. The exact mechanism is probe-calibrated
-(§Calibration) — an HSL-lightness shift on the background is the candidate, applied to the
-**background only** so E3's C1-A caution (HSL math misbehaving on *derived foregrounds*, the
-"yellow chrome" failure) does not apply here.
+### A-D3 — Foreground appropriate to each panel
+Each chrome layer's foreground **starts from `base_fg` but is contrast-derived against that layer's own
+(elevated) background**: if elevation dropped it under a legibility floor, it's nudged toward the
+opposite pole until it clears. Result: text always legible on its own panel and distinct from document
+text (which sits on the un-elevated canvas). The dropdown's muted secondary fg (`MUTED_FG_BLEND`) and
+the status `ChromeAccent` state keep their roles, re-derived against their panels.
 
-## D2 — Separation floor (the guarantee)
+### A-D4 — `full` vs `zen`, made distinct
+`zen` collapses the elevation toward the canvas **but not below the separation floor** → *minimal but
+present* chrome. `full` = a calibrated step *clearly above* the floor → *pronounced* chrome. Because
+both are real floored elevations, the gap is real on every theme. **"`full` and `zen` visibly
+distinct" is an explicit calibration target and a conformance pin.**
 
-Each layer has a **calibrated default elevation step** (like E3's per-layer fractions), but the
-step is **clamped *up*** — increased — until the layer's background clears a **minimum separation**
-from the layer beneath it (canvas for the bar, bar for the dropdown, dropdown for the overlay).
-Separation is a probe-calibrated target: a minimum luminance delta / modest contrast ratio.
-Surfaces need only be *noticeably* distinct, not text-legible-distinct, so the floor sits well
-below the 4.5:1 text threshold. This is a **new** clamp, opposite in direction to E3's existing
-`clamp_blend` (which *shrinks* a step to keep the foreground legible): here we *grow* the step to
-guarantee inter-surface separation. Both clamps coexist — grow to the separation floor, then, if
-that would push the foreground under its legibility floor, the foreground is re-derived (D3) rather
-than shrinking the surface back.
+### A-D5 — Reconciliation with E3
+Rewrites `derive_chrome`'s background derivation (split → unified elevation + separation floor) and adds
+the foreground contrast-derivation. E3's split-ladder decision (I1-A) is superseded. **Unchanged in
+structure:** the five all-None sentinel faces + the sentinel rule, the `[theme] chrome = full|zen` axis
++ `toggle_chrome` + persistence, the `[theme] canvas = opaque|transparent` axis, the Ansi16 fixed-table
+policy, the render `ChromeStyles` mapping. **Regenerated:** every derived-chrome hex value E3 pinned is
+recomputed under the new derivation (probe-driven). **Preserved invariants:** status line matches the
+menu bar; overlay interiors themed; the canvas effort's body-text `base_fg` fallback + opaque/transparent
+behavior untouched.
 
-The floor is what makes distinctness hold *by construction* on the extremes — a near-black canvas
-forces the bar upward far enough to be seen; a near-white canvas forces it down.
+---
 
-## D3 — Foreground appropriate to each panel
+## Part C — The heading-text-color rule (resolved first; it frames B, D, E)
 
-Once a dark theme's bar elevates toward lighter, a light `base_fg` on it can *lose* contrast — so
-the chrome foreground can no longer be blindly reused from `base_fg`. Each chrome layer's
-foreground **starts from `base_fg` but is contrast-derived against that layer's own (elevated)
-background**: if the elevation dropped the foreground below a legibility floor, it is nudged toward
-the opposite pole until it clears. The result is text that is always legible on its own panel and
-distinct from document text (which sits on the un-elevated canvas). The dropdown's muted secondary
-foreground (`MUTED_FG_BLEND`) and the status line's `ChromeAccent` (prompt) state keep their roles,
-re-derived against their panels the same way.
+**Decision: colored per-level heading text, everywhere, via a uniform `SE::Text`-empty rule.**
 
-## D4 — `full` vs `zen`, made distinct
+Today heading text is inconsistent: tokyo + base16 color it per level (magenta H1, blue H2, …) because
+their `text` face is empty and the heading role shows through; phosphor renders heading text in `base_fg`
+because its `text = shade(hue,3)` overrides the heading role (the compose stack is `[Text, role,
+style_element(Plain)=Text]`, and a non-empty trailing `Text` clobbers the role fg).
 
-`zen` collapses the elevation toward the canvas as today — **but not below the separation floor**.
-So `zen` = *minimal but present* chrome (every layer still clears its floor), and `full` = a
-calibrated step *clearly above* the floor (pronounced chrome). Because both are now real, floored
-elevations, the gap between them is real on every theme: toggling `chrome = full|zen` produces a
-visible change. **"`full` and `zen` must be visibly distinct" is an explicit calibration target**
-(the full step exceeds the zen floor by a perceptible margin) **and a conformance pin**. This also
-sharpens the dispositions' meaning: `zen` = "minimal present chrome," `full` = "pronounced chrome"
-— cleaner than E3's "collapse toward the canvas."
+**The rule:** `SE::Text` is **empty (`Face::default()`) in every theme.** Body text is then supplied
+uniformly by the render `base_fg` fallback (shipped in the canvas effort: a span with no composed fg
+falls back to `base_fg`). Every colored role (heading, emphasis, …) carries its own fg, which the empty
+`Text` no longer clobbers. This:
+- makes heading text colored per-level in **every** theme (the role fg survives),
+- fixes phosphor's inconsistency: emptying its `text` (currently `shade(3)` == `base_fg`) leaves body
+  text unchanged (fallback → `base_fg` == `shade(3)`) but frees headings to render their brighter
+  shades (`s(5)/s(4)/s(3)`) — restoring phosphor's real tonal hierarchy (dim comments, mid body, bright
+  headings), which today collapses to flat `base_fg`,
+- removes phosphor's `Text`-face special case entirely.
 
-## D5 — Reconciliation with E3
+**Monochrome preserved by construction:** "colored per-level" means a distinct *foreground* per level —
+a distinct **hue** for polychrome themes (base16) OR a distinct **shade of the one hue** for monochrome
+themes (phosphor). The rule never requires multiple hues, so phosphor stays all-green/all-amber; it just
+gains a proper bright-to-dim shade hierarchy.
 
-- Rewrites `derive_chrome`'s background derivation (split ladder → unified elevation + separation
-  floor) and adds the foreground contrast-derivation. E3's split-ladder decision (I1-A) is
-  **superseded** by the elevation model.
-- **Unchanged in structure:** the five all-None sentinel faces + the sentinel rule (explicit
-  constructor chrome still survives; only sentinels derive), the `[theme] chrome = full|zen` axis +
-  `toggle_chrome` + persistence, the `[theme] canvas = opaque|transparent` axis, the Ansi16
-  fixed-table policy, and the render `ChromeStyles` mapping.
-- **Regenerated:** every derived-chrome hex value E3 pinned in its tests is recomputed under the new
-  derivation — probe-driven, exactly as E3 calibrated its originals. The spec/plan grounding carries
-  the new expected values.
-- **Preserved invariants:** the status line still matches the menu bar (both `Chrome`); overlay
-  interiors stay themed; the canvas effort's body-text `base_fg` fallback and the opaque/transparent
-  behavior are untouched.
+---
 
-## Testing
+## Part B — The theme-completeness standard + conformance test
 
-A conformance test over **every RGB builtin at every color depth** asserts:
-- the stack is strictly ordered and floored — `canvas → bar → dropdown → overlay`, each clearing the
-  separation floor from the layer beneath;
-- each chrome foreground clears its legibility floor against its own panel background;
-- `full` and `zen` produce measurably distinct bar tones.
+**The standard (written contract in the spec, enforced by a test):** a *complete* theme distinguishes
+every semantic role via a **distinct foreground** — satisfiable by a distinct hue (polychrome) OR a
+distinct shade of the theme's hue (monochrome). Concretely, strictness level **(b) "colored where base16
+colors"**: every face the `from_base16` template gives a palette *color* MUST carry an explicit `fg` in
+every RGB builtin. The bg/modifier-primary faces (`selection`, `marked_block`, `search_*`) keep their
+bg/modifier requirement; `SE::Text` is intentionally empty per Part C (body text = `base_fg` fallback);
+the terminal-* / no-color themes are exempt (non-Rgb `base_bg`); the a11y cue rule still governs cue
+mode.
 
-Plus the reported-bug pins (representative themes, probe-true hex): the bar foreground is
-distinguishable from body text; the dropdown background is distinct from the bar; `full ≠ zen`. The
-E3 reported-bug pins that still hold (`tokyo_status_matches_menu_bar` — status == bar) are retargeted
-to the new derived values.
+**Conformance test** (extends the existing `builtin_names_final_nineteen` loop, `theme.rs:1053`): for
+every RGB builtin, assert every face in the "must be colored" set carries an explicit non-default `fg`;
+assert `SE::Text` is empty (the uniform rule); assert the a11y cue contract still holds. This is the
+"stronger spec" guardrail — a new theme that leaves a role uncolored fails the build. The exact
+must-be-colored face list is enumerated during grounding from the `from_base16` template (§Calibration).
+
+---
+
+## Part D — Tokyo brought to the standard
+
+Fix the gaps Codex's field-by-field comparison found (using tokyo's own palette constants, all confirmed
+present at `theme.rs:444-456`), keeping tokyo bespoke (Codex advised against a base16 conversion):
+
+| Face | Current | Standardized |
+|---|---|---|
+| `emphasis` | italic only | `fg: MAGENTA`, italic |
+| `strong` | bold only | `fg: YELLOW`, bold |
+| `strong_emphasis` | bold+italic | `fg: ORANGE`, bold, italic |
+| `strikethrough` | strike only | `fg: COMMENT`, strike |
+| `search_match` | `bg: SEL_BG` only | `bg: YELLOW`, `fg: BG` (contrast) |
+| `front_matter` | `fg: DARK3` | `fg: ORANGE`, italic |
+| `diag_grammar` | `underline_color: YELLOW` | `underline_color: BLUE` |
+| `wrap_guide` | `fg: DARK3` | `fg: SEL_BG` |
+| `chrome` / `chrome_selected` / `chrome_muted` | explicit `PANEL_BG` | **`Face::default()` sentinels** — derived by Part A's elevation ladder (user decision: PANEL_BG was a direction, not a standard) |
+| `text` | already `Face::default()` | unchanged (Part C rule) |
+
+Tokyo's headings already color per-level and its palette is otherwise complete; after this it passes
+Part B's conformance test and picks up Part A's elevated chrome automatically.
+
+---
+
+## Part E — Phosphor shade fix
+
+`phosphor()` (`theme.rs:844`) builds all faces from `shade(hue, level)`, where `shade` maps level 0–5 to
+HSL lightness **0.08–0.92** (`theme.rs:799`). Level 5 (lightness 0.92) washes any hue to near-white, so
+H1/H2 (`s(5)`) and links (`shade(hue,5)`) render near-white instead of phosphor-colored.
+
+**Fix: cap the ramp's lightness ceiling** (0.92 → a probe-calibrated ~0.78) so the brightest shade stays
+clearly hued. This fixes headings and links together in one change, uniformly across all five phosphor
+variants (they share the constructor). Combined with Part C (emptying phosphor's `text`), phosphor's
+headings render in these corrected bright shades — the authentic dim→bright monochrome CRT hierarchy.
+
+---
+
+## Testing (unified)
+
+- **Chrome conformance** (Part A): every RGB builtin, every color depth — stack strictly ordered and
+  floored (`canvas → bar → dropdown → overlay` each clear the separation floor); each chrome foreground
+  clears its legibility floor against its own panel; `full ≠ zen` measurably. Reported-bug pins: bar fg
+  distinguishable from body text; dropdown bg distinct from bar bg; `full ≠ zen`.
+- **Completeness conformance** (Part B): every RGB builtin — every must-be-colored face has an explicit
+  fg; `SE::Text` empty; a11y cue contract holds.
+- **Heading pins** (Part C): a base16 theme AND phosphor render heading text in the *role* fg (colored /
+  shaded), not `base_fg`; phosphor body text stays `base_fg`.
+- **Tokyo pins** (Part D): the eight face changes render their new values; tokyo passes conformance;
+  tokyo's chrome is now derived (elevated), status == bar still holds.
+- **Phosphor pins** (Part E): `s(5)` is hued (not near-white) after the cap; heading/link shades pinned.
+- Regenerated E3 chrome hex pins throughout.
 
 ## Calibration (probe-driven, resolved in grounding/plan — as E3's fractions were)
 
-The exact values are determined by probes during grounding, then pinned:
-- the **separation floor** (luminance delta / contrast target between adjacent layers);
-- the per-layer **default elevation steps** for `full`;
-- the **hue-preserving mechanism** (HSL-lightness shift vs a modest hue-preserving RGB approach —
-  chosen by which keeps the tint without washing out, validated across all 19 themes);
-- the **foreground legibility floor** and the re-derivation nudge;
-- the **`full`-vs-`zen` margin**;
-- the full set of **regenerated expected hex pins** for the derived chrome faces across the pinned
-  themes and both dispositions.
+Determined by probes during grounding, then pinned: the **separation floor**; the per-layer **default
+elevation steps** (`full`); the **hue-preserving mechanism** (HSL-lightness vs modest hue-preserving RGB,
+chosen by which keeps tint without washing out, validated across all 19 themes); the **foreground
+legibility floor** + re-derivation nudge; the **`full`-vs-`zen` margin**; the **phosphor lightness
+ceiling** (~0.78); the **must-be-colored face list** (from the `from_base16` template); and the full set
+of **regenerated expected hex pins** for the derived chrome faces + the tokyo/phosphor face values.
 
-## Non-goals / deferred (the follow-on theme-standardization effort)
+## Non-goals / deferred
 
-- **Theme-face completeness** (colored emphasis/strong/etc.; the completeness standard + conformance
-  test).
-- **Tokyo chrome → derived** — tokyo's explicit `PANEL_BG` chrome becomes a sentinel there and picks
-  up this elevation derivation automatically.
-- **Phosphor near-white headings/links** (the shade-ceiling fix).
-- **The heading-text-color consistency decision.**
-- These ride the next effort; this one is purely the chrome-ladder recalibration.
+- No new themes; no new config axes (chrome/canvas axes unchanged).
+- E1+E2 density presets, R1 responsiveness, the repar re-plumb — separate efforts per the working order.
