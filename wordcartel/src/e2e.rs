@@ -710,6 +710,7 @@ fn journey_chrome_zen_toggle() {
         menu_bar:           crate::config::MenuBarMode::Auto,
         mouse_capture:      true,
         chrome_disposition: ChromeDisposition::Full,
+        canvas:             wordcartel_core::theme::CanvasMode::Opaque,
     };
     // Mirror the run-loop pattern: clear the flag, then write the file.
     h.editor.settings_save_requested = false;

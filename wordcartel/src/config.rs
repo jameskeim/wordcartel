@@ -838,10 +838,12 @@ mod tests {
             &baseline_cfg.theme, &env, wordcartel_core::theme::ChromeDisposition::Full);
         let baseline = snapshot_of(&baseline_cfg, &baseline_resolved.theme.name);
 
-        // Runtime snapshot: seven divergences — keymap → wordstar, typewriter on,
+        // Runtime snapshot: eight divergences — keymap → wordstar, typewriter on,
         // bar → pinned, mouse capture off, theme → tokyo-night, wrap_column → 100,
-        // chrome → Zen (spec Testing: the round-trip covers [mouse] capture and [theme]
-        // name + chrome too — Fable m-wb-1; wrap_column 100 is distinct from default 72).
+        // chrome → Zen, canvas → Transparent (spec Testing: the round-trip covers
+        // [mouse] capture and [theme] name + chrome + canvas too — Fable m-wb-1;
+        // wrap_column 100 is distinct from default 72).
+        use wordcartel_core::theme::CanvasMode;
         let runtime = SettingsSnapshot {
             keymap_preset:   "wordstar".to_string(),
             theme_identity:  ThemeIdentity::Builtin("tokyo-night".to_string()),
@@ -854,6 +856,7 @@ mod tests {
             menu_bar:        crate::config::MenuBarMode::Pinned,
             mouse_capture:   false,
             chrome_disposition: wordcartel_core::theme::ChromeDisposition::Zen,
+            canvas: CanvasMode::Transparent,
         };
 
         let of = compute_overrides(&runtime, &baseline, &OverridesFile::default(), &OverridesFile::default());
@@ -873,6 +876,8 @@ mod tests {
             "view.wrap_column must round-trip to 100");
         assert_eq!(cfg.theme.chrome.as_deref(), Some("zen"),
             "[theme] chrome must round-trip to 'zen'");
+        assert_eq!(cfg.theme.canvas.as_deref(), Some("transparent"),
+            "[theme] canvas must round-trip");
     }
 
 }
