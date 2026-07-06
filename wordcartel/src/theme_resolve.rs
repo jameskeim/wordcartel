@@ -124,11 +124,11 @@ pub(crate) fn apply_ansi16_chrome_policy(theme: &mut Theme, depth: Depth) {
     let canvas_q = theme::quantize(theme.base_bg, Depth::Ansi16);
     let (chrome_bg, selected_fg, selected_bg) = if canvas_q == Color::Black {
         // Dark canvas arm: Chrome/Overlay → DarkGray bg White fg; Selected → Black/White;
-        // Muted → White dim; Accent → White bold.
+        // Muted → White dim on chrome_bg (shares the overlay/modal tone); Accent → White bold.
         (Color::DarkGray, Color::Black, Color::White)
     } else {
         // Light canvas arm: Chrome/Overlay → Black bg White fg; Selected → White/Black;
-        // Muted → White dim; Accent → White bold.
+        // Muted → White dim on chrome_bg (shares the overlay/modal tone); Accent → White bold.
         (Color::Black, Color::White, Color::Black)
     };
     if theme.face(SemanticElement::Chrome) == Face::default() {
@@ -144,8 +144,11 @@ pub(crate) fn apply_ansi16_chrome_policy(theme: &mut Theme, depth: Depth) {
             Face { fg: Some(selected_fg), bg: Some(selected_bg), ..Face::default() });
     }
     if theme.face(SemanticElement::ChromeMuted) == Face::default() {
+        // Muted (dropdown) shares the overlay/modal bg — the truecolor `Overlay.bg == Muted.bg`
+        // invariant, honored on the quantized 16-color axis too. Distinguished from the bar by
+        // its `dim` fg (16 colors can't give bar and dropdown distinct bg tones).
         theme.override_face(SemanticElement::ChromeMuted,
-            Face { fg: Some(Color::White), dim: Some(true), ..Face::default() });
+            Face { fg: Some(Color::White), bg: Some(chrome_bg), dim: Some(true), ..Face::default() });
     }
     if theme.face(SemanticElement::ChromeAccent) == Face::default() {
         theme.override_face(SemanticElement::ChromeAccent,
@@ -404,10 +407,10 @@ mod tests {
 
         let tc = ThemeConfig { name: Some("flexoki-dark".into()), ..Default::default() };
         let r = resolve_theme(&tc, &env(false), disp);
-        // §B.3 ZEN flexoki-dark Chrome bg = #0f0e0e
+        // §II.5 ZEN flexoki-dark Chrome bg = #1e1c1c (unified elevation ladder; flexoki is stable)
         assert_eq!(r.theme.face(SemanticElement::Chrome).bg,
-            Some(Color::Rgb { r:0x0f, g:0x0e, b:0x0e }),
-            "flexoki-dark Zen Chrome bg must match §B.3 probe value");
+            Some(Color::Rgb { r:0x1e, g:0x1c, b:0x1c }),
+            "flexoki-dark Zen Chrome bg must match §II.5 probe value");
     }
 
     #[test]
@@ -454,39 +457,50 @@ mod tests {
             "Ansi16 light-canvas policy: ChromeSelected fg must be White");
         assert_eq!(r2.theme.face(SemanticElement::ChromeSelected).bg, Some(Color::Black),
             "Ansi16 light-canvas policy: ChromeSelected bg must be Black");
+        // Modal-shares-dropdown invariant on the LIGHT arm too (dark arm is pinned in the tokyo
+        // r3 block below): Muted (dropdown) shares Overlay's (modal) chrome_bg = Black, kept
+        // distinct from the bar only by its dim fg.
+        assert_eq!(r2.theme.face(SemanticElement::ChromeMuted).bg, Some(Color::Black),
+            "Ansi16 light-canvas policy: ChromeMuted (dropdown) bg must be Black (shares overlay tone)");
+        assert_eq!(r2.theme.face(SemanticElement::ChromeMuted).bg,
+            r2.theme.face(SemanticElement::ChromeOverlay).bg,
+            "Ansi16 light arm: Overlay.bg == Muted.bg (modal shares the dropdown tone)");
+        assert_eq!(r2.theme.face(SemanticElement::ChromeMuted).dim, Some(true),
+            "Ansi16 light arm: ChromeMuted keeps its dim fg to distinguish the dropdown from the bar");
 
         // tokyo-night @ Ansi16: canvas #1a1b26 → Black → DarkGray arm.
-        // Chrome/selected/muted are explicit in the constructor (not sentinels) → left to
-        // quantize at render time (PANEL_BG → Black, FG → Gray).
-        // ChromeOverlay + ChromeAccent are sentinels → filled by the dark-arm table.
+        // Part D (T3): ALL chrome faces are now sentinels → the dark-arm fixed-table policy
+        // applies to all of them (same as flexoki-dark above). Chrome bg = DarkGray, fg = White.
         let tc3 = ThemeConfig {
             name: Some("tokyo-night".into()),
             depth: Some("16".into()),
             ..Default::default()
         };
         let r3 = resolve_theme(&tc3, &env(false), ChromeDisposition::Full);
-        // Explicit Chrome face (PANEL_BG = #16161e) stays as Rgb; quantize gives Black.
-        assert_eq!(
-            theme::quantize(r3.theme.face(SemanticElement::Chrome).bg.unwrap(), Depth::Ansi16),
-            Color::Black,
-            "tokyo Chrome bg (PANEL_BG) quantizes to Black — policy leaves explicit faces alone"
-        );
-        // FG (#c0caf5) is closest to Gray at Ansi16.
-        assert_eq!(
-            theme::quantize(r3.theme.face(SemanticElement::Chrome).fg.unwrap(), Depth::Ansi16),
-            Color::Gray,
-            "tokyo Chrome fg (FG) quantizes to Gray at Ansi16"
-        );
-        // Sentinel ChromeOverlay gets the dark-arm table value (named colors, not Rgb).
+        // Chrome is now a sentinel → dark-arm table applies (like flexoki-dark case above).
+        assert_eq!(r3.theme.face(SemanticElement::Chrome).bg, Some(Color::DarkGray),
+            "tokyo Chrome (sentinel) → dark-arm DarkGray bg at Ansi16");
+        assert_eq!(r3.theme.face(SemanticElement::Chrome).fg, Some(Color::White),
+            "tokyo Chrome (sentinel) → dark-arm White fg at Ansi16");
+        // ChromeOverlay gets the dark-arm table value (named colors, not Rgb).
         assert_eq!(r3.theme.face(SemanticElement::ChromeOverlay).bg, Some(Color::DarkGray),
             "tokyo ChromeOverlay (sentinel) → dark-arm DarkGray bg");
         assert_eq!(r3.theme.face(SemanticElement::ChromeOverlay).fg, Some(Color::White),
             "tokyo ChromeOverlay (sentinel) → dark-arm White fg");
-        // Sentinel ChromeAccent gets the dark-arm table value.
+        // ChromeAccent gets the dark-arm table value.
         assert_eq!(r3.theme.face(SemanticElement::ChromeAccent).fg, Some(Color::White),
             "tokyo ChromeAccent (sentinel) → dark-arm White fg");
         assert_eq!(r3.theme.face(SemanticElement::ChromeAccent).bold, Some(true),
             "tokyo ChromeAccent (sentinel) → dark-arm bold");
+        // Modal-shares-dropdown invariant (`Overlay.bg == Muted.bg`) holds on the Ansi16 axis:
+        // Muted gets the same chrome_bg as Overlay, distinguished only by its `dim` fg.
+        assert_eq!(r3.theme.face(SemanticElement::ChromeMuted).bg, Some(Color::DarkGray),
+            "tokyo ChromeMuted (dropdown) shares the overlay/modal DarkGray bg at Ansi16");
+        assert_eq!(r3.theme.face(SemanticElement::ChromeMuted).dim, Some(true),
+            "tokyo ChromeMuted keeps its dim fg to distinguish the dropdown from the bar");
+        assert_eq!(r3.theme.face(SemanticElement::ChromeMuted).bg,
+            r3.theme.face(SemanticElement::ChromeOverlay).bg,
+            "Ansi16: Overlay.bg == Muted.bg (modal shares the dropdown tone)");
     }
 
     #[test]

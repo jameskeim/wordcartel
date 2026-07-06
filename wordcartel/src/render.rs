@@ -1441,8 +1441,9 @@ mod tests {
     }
 
     /// THE reported bug (D2): under tokyo-night, the status row bg and the menu bar bg
-    /// were different (status=[ChromeReverse] had no bg; menu=[Chrome]=PANEL_BG).
-    /// After T5 both use [Chrome] → same bg = PANEL_BG `#16161e`.
+    /// were different (status=[ChromeReverse] had no bg; menu=[Chrome]=explicit #16161e).
+    /// After T5 both use [Chrome] → same bg. Part D (T3): tokyo chrome is now a sentinel,
+    /// so derived FULL Chrome bg = #2d2f42 (§II.5).
     #[test]
     fn tokyo_status_matches_menu_bar() {
         use wordcartel_core::theme::{ChromeDisposition, Depth};
@@ -1465,9 +1466,9 @@ mod tests {
             assert_eq!(status_bg, menu_bg,
                 "status cell x={x} bg must equal menu bar bg; status={status_bg:?}, menu={menu_bg:?}");
         }
-        // Both must be PANEL_BG #16161e (the kept Chrome face).
-        assert_eq!(menu_bg, Some(Color::Rgb(0x16, 0x16, 0x1e)),
-            "chrome bg must be PANEL_BG #16161e, got {menu_bg:?}");
+        // Both must be the derived FULL Chrome bg = #2d2f42 (§II.5 tokyo pin).
+        assert_eq!(menu_bg, Some(Color::Rgb(0x2d, 0x2f, 0x42)),
+            "chrome bg must be derived FULL Chrome #2d2f42, got {menu_bg:?}");
     }
 
     /// D2: opening a minibuffer switches the status style to [ChromeAccent];
@@ -1537,6 +1538,41 @@ mod tests {
         let buf_source = render_to_buffer(&mut ed, 40, 4);
         let source_has_heading_fg = (0..40).any(|x| buf_source[(x,0)].style().fg == want && want.is_some());
         assert!(!source_has_heading_fg, "SourcePlain must not carry heading fg (base canvas only)");
+    }
+
+    #[test]
+    fn heading_text_carries_role_fg_base16_and_phosphor() {
+        use crate::editor::RenderMode;
+        // Each: (theme, label). base16 (flexoki-dark) already colours headings; phosphor does so
+        // ONLY after Part C empties its `text` face (before this, text = shade(3) clobbered the role).
+        for (theme, label) in [
+            (wordcartel_core::theme::flexoki_dark(), "flexoki-dark"),
+            (wordcartel_core::theme::Theme::builtin("phosphor-green").expect("phosphor-green is a builtin"), "phosphor-green"),
+        ] {
+            let mut ed = Editor::new_from_text("# Title\nbody\n", None, (40, 6));
+            ed.theme = theme;
+            ed.active_mut().view.mode = RenderMode::LivePreview;
+            derive::rebuild(&mut ed);
+            let buf = render_to_buffer(&mut ed, 40, 6);
+
+            let role_fg = compose::compose(&ed.theme, ed.depth, &[SE::Text, SE::Heading(1)]).fg;
+            let base_fg = compose::base_canvas(&ed.theme, ed.depth).fg;
+            assert!(role_fg.is_some() && role_fg != base_fg,
+                "{label}: heading role fg must be coloured and distinct from base_fg");
+            // heading row (0) carries the role fg — shaded heading colour in live preview.
+            assert!((0..40).any(|x| buf[(x, 0u16)].style().fg == role_fg),
+                "{label}: live-preview heading must carry the role fg");
+            // body row (1) carries base_fg via the empty-Text fallback.
+            assert!((0..40).any(|x| buf[(x, 1u16)].style().fg == base_fg),
+                "{label}: body text must carry base_fg");
+
+            // source mode: uniform base_fg, no heading colour (compose [SE::Text] only).
+            ed.active_mut().view.mode = RenderMode::SourcePlain;
+            derive::rebuild(&mut ed);
+            let src = render_to_buffer(&mut ed, 40, 6);
+            assert!(!(0..40).any(|x| src[(x, 0u16)].style().fg == role_fg),
+                "{label}: source mode must NOT carry the heading role fg");
+        }
     }
 
     #[test]
@@ -2654,7 +2690,7 @@ mod tests {
     }
 
     /// D2: under tokyo-night with the palette open, every interior cell (not on the
-    /// border perimeter, not the selected row) must carry the ChromeOverlay bg (#2f303a).
+    /// border perimeter, not the selected row) must carry the ChromeOverlay bg.
     /// No cell inside the overlay should have the terminal-default bg.
     #[test]
     fn tokyo_overlay_interior_is_themed() {
@@ -2669,9 +2705,10 @@ mod tests {
         let buf = render_to_buffer(&mut ed, 80, 20);
 
         let fill_bg = compose::compose(&ed.theme, ed.depth, &[SE::ChromeOverlay]).bg;
-        // §B.3 pin: tokyo FULL ChromeOverlay = #2f303a.
-        assert_eq!(fill_bg, Some(Color::Rgb(0x2f, 0x30, 0x3a)),
-            "tokyo-night FULL ChromeOverlay must be #2f303a");
+        // §II.5 pin: tokyo FULL ChromeOverlay bg = #3d405a — the modal shares the dropdown
+        // (ChromeMuted) level-2 tone (3-tone ladder, user decision 2026-07-06).
+        assert_eq!(fill_bg, Some(Color::Rgb(0x3d, 0x40, 0x5a)),
+            "tokyo-night FULL ChromeOverlay (§II.5 pin) must be #3d405a (= ChromeMuted bg)");
 
         let n_rows = ed.palette.as_ref().unwrap().rows.len();
         let ov_rect = palette_overlay_rect(ratatui::layout::Rect::new(0, 0, 80, 20), n_rows);
