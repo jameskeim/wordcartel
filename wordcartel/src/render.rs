@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Position, Rect},
     style::{Color, Modifier, Style as RStyle},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 use wordcartel_core::style::Style;
@@ -146,7 +146,7 @@ pub(crate) fn menu_dropdown_row_at(area: Rect, groups: &[(crate::registry::MenuC
 
 /// Indicator title for a windowed overlay list — `" {n}/{total} "` right-aligned when
 /// the list is taller than the visible window; `None` when everything fits (A6).
-fn windowed_indicator(selected: usize, total: usize, list_h: usize)
+pub(crate) fn windowed_indicator(selected: usize, total: usize, list_h: usize)
     -> Option<ratatui::text::Line<'static>>
 {
     if total > list_h {
@@ -237,6 +237,64 @@ pub(crate) fn word_count_segment(editor: &Editor) -> Option<String> {
         count::word_count(&text),
         count::char_count(&text)
     ))
+}
+
+/// Pre-computed ratatui styles for all chrome surfaces — built once per frame
+/// from the current theme and depth, then passed by reference to the overlay
+/// and menu painters.
+pub(crate) struct ChromeStyles {
+    /// Selected row in overlays — [ChromeSelected] (explicit fg/bg selection).
+    pub overlay_selected: RStyle,
+    /// Overlay query-bar text style — [ChromeOverlay] (interior fill face; bg preserved).
+    pub ov_query: RStyle,
+    /// Menu bar: open (active) category label.
+    pub menu_open: RStyle,
+    /// Menu bar: closed (inactive) label + full-width bar fill — [Chrome].
+    /// Also used for the normal-state status line (panel bg, same face).
+    pub menu_closed: RStyle,
+    /// Menu dropdown: selected / highlighted item.
+    pub menu_sel: RStyle,
+    /// Menu dropdown: normal item.
+    pub menu_norm: RStyle,
+    /// Scrollbar track (dim background channel).
+    pub scrollbar_track: RStyle,
+    /// Scrollbar thumb (active indicator).
+    pub scrollbar_thumb: RStyle,
+    /// Overlay interior fill — [ChromeOverlay] bg applied via `set_style` after Clear.
+    pub ov_fill: RStyle,
+    /// Active status-line style (search / minibuffer / prompt) — [ChromeAccent].
+    pub ov_accent: RStyle,
+    /// Overlay border — fg-only Chrome (bg stripped) so the ChromeOverlay fill
+    /// bg shows through under ratatui's `Cell::set_style` patch semantics.
+    pub overlay_border: RStyle,
+}
+
+impl ChromeStyles {
+    /// Build the full chrome style set from the current theme and depth.
+    /// Called once per frame in `render()`, before the scrollbar and status
+    /// sections; all downstream painters borrow this struct by reference.
+    pub(crate) fn build(
+        theme: &wordcartel_core::theme::Theme,
+        depth: wordcartel_core::theme::Depth,
+    ) -> Self {
+        // overlay_border: fg-only Chrome — .bg cleared so the ChromeOverlay fill bg is
+        // preserved under ratatui's Cell::set_style patch semantics (D2 defect-1 fix).
+        let mut border = compose::compose(theme, depth, &[SE::Chrome]);
+        border.bg = None;
+        ChromeStyles {
+            overlay_selected: compose::compose(theme, depth, &[SE::ChromeSelected]),
+            ov_query:         compose::compose(theme, depth, &[SE::ChromeOverlay]),
+            menu_open:        compose::compose(theme, depth, &[SE::ChromeSelected]),
+            menu_closed:      compose::compose(theme, depth, &[SE::Chrome]),
+            menu_sel:         compose::compose(theme, depth, &[SE::ChromeSelected]),
+            menu_norm:        compose::compose(theme, depth, &[SE::ChromeMuted]),
+            scrollbar_track:  compose::compose(theme, depth, &[SE::ChromeMuted]),
+            scrollbar_thumb:  compose::compose(theme, depth, &[SE::Chrome]),
+            ov_fill:          compose::compose(theme, depth, &[SE::ChromeOverlay]),
+            ov_accent:        compose::compose(theme, depth, &[SE::ChromeAccent]),
+            overlay_border:   border,
+        }
+    }
 }
 
 /// Paint the viewport + status line to `frame` using `editor` state.
@@ -612,6 +670,12 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     }
 
     // -----------------------------------------------------------------------
+    // Chrome styles — built once here so the scrollbar, status line, and all
+    // overlay/menu painters below can borrow editor fields freely.
+    // -----------------------------------------------------------------------
+    let cs = ChromeStyles::build(&editor.theme, editor.depth);
+
+    // -----------------------------------------------------------------------
     // Scrollbar overlay (painted over editing area, rightmost column)
     // -----------------------------------------------------------------------
     if editor.mouse.scrollbar_visible {
@@ -620,12 +684,10 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         let scroll_pos = fv.visible_ordinal(editor.active().view.scroll);
         let sb_area = Rect::new(area.x, edit_top, w, edit_height);
         let mut sb_state = ScrollbarState::new(total).position(scroll_pos);
-        let sb_track_style = compose::compose(&editor.theme, editor.depth, &[SE::ChromeMuted]);
-        let sb_thumb_style = compose::compose(&editor.theme, editor.depth, &[SE::Chrome]);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .track_style(sb_track_style)
-                .thumb_style(sb_thumb_style),
+                .track_style(cs.scrollbar_track)
+                .thumb_style(cs.scrollbar_thumb),
             sb_area,
             &mut sb_state,
         );
@@ -639,24 +701,23 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         // When a modal prompt is active, render its message instead of the normal
         // status text, using a distinct style so it stands out.
         // When the minibuffer is open, render <prompt><text> on the status row.
-        let chrome_reverse_style = compose::compose(&editor.theme, editor.depth, &[SE::ChromeReverse]);
         let (status_text, status_style) = if let Some(ref s) = editor.search {
             (
                 format_search_bar(s),
-                chrome_reverse_style,
+                cs.ov_accent,
             )
         } else if let Some(ref mb) = editor.minibuffer {
             (
                 format!("{}{}", mb.prompt, mb.text),
-                chrome_reverse_style,
+                cs.ov_accent,
             )
         } else if let Some(ref prompt) = editor.prompt {
             (
                 prompt.message.clone(),
-                chrome_reverse_style,
+                cs.ov_accent,
             )
         } else {
-            (status_left_text(editor), chrome_reverse_style)
+            (status_left_text(editor), cs.menu_closed)  // normal state: [Chrome] panel bg
         };
 
         // Compose the status line.
@@ -682,6 +743,10 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         let truncated: String = composed.chars().take(w as usize).collect();
         let status_line = Line::from(Span::styled(truncated, status_style));
         let status_area = Rect::new(area.x, status_row, w, 1);
+        // Fill the WHOLE row with the state's chrome style first — the Paragraph
+        // styles only the text span, and a partial bar next to the full-width menu
+        // bar was the reported-mismatch class (Fable whole-branch I-2).
+        frame.buffer_mut().set_style(status_area, status_style);
         frame.render_widget(Paragraph::new(status_line), status_area);
     }
 
@@ -720,365 +785,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Precompute chrome styles for overlays and menu (computed here once so
-    // the individual if-let blocks can borrow editor fields freely).
-    // -----------------------------------------------------------------------
-    let ov_highlight_style = compose::compose(&editor.theme, editor.depth, &[SE::ChromeReverse]);
-    let ov_query_style     = compose::compose(&editor.theme, editor.depth, &[SE::Text]);
-    let menu_open_style    = compose::compose(&editor.theme, editor.depth, &[SE::ChromeSelected]);
-    let menu_closed_style  = compose::compose(&editor.theme, editor.depth, &[SE::Chrome]);
-    let menu_sel_style     = compose::compose(&editor.theme, editor.depth, &[SE::ChromeSelected]);
-    let menu_norm_style    = compose::compose(&editor.theme, editor.depth, &[SE::ChromeMuted]);
-
-    // -----------------------------------------------------------------------
-    // Command palette overlay (drawn on top of everything else)
-    // -----------------------------------------------------------------------
-    // A6 self-heal: the window must respect the LIVE frame's geometry (resize
-    // has no overlay hook; render is the one place that always sees the truth).
-    if let Some(p) = editor.palette.as_mut() {
-        crate::app::keep_overlay_visible(h, p.selected, p.rows.len(), &mut p.scroll_top);
-    }
-    if let Some(ref palette) = editor.palette {
-        // Overlay dimensions — shared with mouse hit-testing via palette_overlay_rect.
-        let ov_rect = palette_overlay_rect(area, palette.rows.len());
-        let ov_x = ov_rect.x;
-        let ov_y = ov_rect.y;
-        let ov_w = ov_rect.width;
-        let ov_h = ov_rect.height;
-        let list_h = crate::list_window::list_h_for(palette.rows.len(), h) as u16;
-
-        // Clear the overlay area.
-        frame.render_widget(Clear, ov_rect);
-
-        // Draw the border (FIX-3: themed with Chrome so the frame matches the panel bg).
-        let mut block = Block::default().borders(Borders::ALL).title(" Command Palette ")
-            .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
-        if let Some(ind) = windowed_indicator(palette.selected, palette.rows.len(), list_h as usize) {
-            block = block.title_bottom(ind);
-        }
-        frame.render_widget(block, ov_rect);
-
-        if ov_h < 3 {
-            return; // too small to render query + any rows
-        }
-
-        // Query row (just inside top border).
-        let query_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), 1);
-        let query_display = format!("> {}", palette.query);
-        let truncated_q: String = query_display.chars().take(query_area.width as usize).collect();
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(truncated_q, ov_query_style))),
-            query_area,
-        );
-
-        if ov_h < 4 || list_h == 0 {
-            return;
-        }
-
-        // List of rows (below query, inside border) — windowed by scroll_top.
-        let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h);
-        let highlight_style = ov_highlight_style;
-        let end = (palette.scroll_top + list_h as usize).min(palette.rows.len());
-        let items: Vec<ListItem> = palette.rows[palette.scroll_top..end].iter().map(|row| {
-            // Left: label; right-aligned: chord.
-            let chord_w = row.chord.chars().count() as u16;
-            let label_w = list_area.width.saturating_sub(chord_w + 1) as usize;
-            let label: String = row.label.chars().take(label_w).collect();
-            let padding = " ".repeat(list_area.width.saturating_sub(label.chars().count() as u16 + chord_w) as usize);
-            let text = format!("{label}{padding}{}", row.chord);
-            ListItem::new(Line::from(text))
-        }).collect();
-
-        let mut list_state = ListState::default();
-        list_state.select(if palette.rows.is_empty() {
-            None
-        } else {
-            Some(palette.selected.saturating_sub(palette.scroll_top))
-        });
-
-        frame.render_stateful_widget(
-            List::new(items).highlight_style(highlight_style),
-            list_area,
-            &mut list_state,
-        );
-    }
-
-    // A6 self-heal: the window must respect the LIVE frame's geometry (resize
-    // has no overlay hook; render is the one place that always sees the truth).
-    if let Some(o) = editor.outline.as_mut() {
-        crate::app::keep_overlay_visible(h, o.selected, o.rows.len(), &mut o.scroll_top);
-    }
-    if let Some(ref outline) = editor.outline {
-        let ov_rect = palette_overlay_rect(area, outline.rows.len());
-        let ov_x = ov_rect.x;
-        let ov_y = ov_rect.y;
-        let ov_w = ov_rect.width;
-        let ov_h = ov_rect.height;
-        let list_h = crate::list_window::list_h_for(outline.rows.len(), h);
-
-        frame.render_widget(Clear, ov_rect);
-        let mut block = Block::default().borders(Borders::ALL).title(" Outline ")
-            .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
-        if let Some(ind) = windowed_indicator(outline.selected, outline.rows.len(), list_h) {
-            block = block.title_bottom(ind);
-        }
-        frame.render_widget(block, ov_rect);
-
-        if ov_h >= 3 {
-            let query_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), 1);
-            let query_display = format!("> {}", outline.query);
-            let truncated_q: String = query_display.chars().take(query_area.width as usize).collect();
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(truncated_q, ov_query_style))),
-                query_area,
-            );
-
-            if ov_h >= 4 && list_h > 0 {
-                let list_h_u16 = list_h as u16;
-                let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h_u16);
-                let highlight_style = ov_highlight_style;
-                let end = (outline.scroll_top + list_h).min(outline.rows.len());
-                let items: Vec<ListItem> = outline.rows[outline.scroll_top..end].iter().map(|row| {
-                    let mut text = format!("{}{}", " ".repeat(row.indent.saturating_mul(2)), row.text);
-                    text = text.chars().take(list_area.width as usize).collect();
-                    ListItem::new(Line::from(text))
-                }).collect();
-
-                let mut list_state = ListState::default();
-                list_state.select(if outline.rows.is_empty() {
-                    None
-                } else {
-                    Some(outline.selected.saturating_sub(outline.scroll_top))
-                });
-
-                frame.render_stateful_widget(
-                    List::new(items).highlight_style(highlight_style),
-                    list_area,
-                    &mut list_state,
-                );
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Theme picker overlay (drawn on top of everything else)
-    // -----------------------------------------------------------------------
-    // A6 self-heal: the window must respect the LIVE frame's geometry (resize
-    // has no overlay hook; render is the one place that always sees the truth).
-    if let Some(tp) = editor.theme_picker.as_mut() {
-        crate::app::keep_overlay_visible(h, tp.selected, tp.rows.len(), &mut tp.scroll_top);
-    }
-    if let Some(ref tp) = editor.theme_picker {
-        let ov_rect = palette_overlay_rect(area, tp.rows.len());
-        let ov_x = ov_rect.x;
-        let ov_y = ov_rect.y;
-        let ov_w = ov_rect.width;
-        let ov_h = ov_rect.height;
-        let list_h = crate::list_window::list_h_for(tp.rows.len(), h);
-
-        frame.render_widget(Clear, ov_rect);
-        let mut block = Block::default().borders(Borders::ALL).title(" Select Theme ")
-            .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
-        if let Some(ind) = windowed_indicator(tp.selected, tp.rows.len(), list_h) {
-            block = block.title_bottom(ind);
-        }
-        frame.render_widget(block, ov_rect);
-
-        if ov_h >= 3 {
-            let query_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), 1);
-            let query_display = format!("> {}", tp.query);
-            let truncated_q: String = query_display.chars().take(query_area.width as usize).collect();
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(truncated_q, ov_query_style))),
-                query_area,
-            );
-
-            if ov_h >= 4 && list_h > 0 {
-                let list_h_u16 = list_h as u16;
-                let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h_u16);
-                let highlight_style = ov_highlight_style;
-                let end = (tp.scroll_top + list_h).min(tp.rows.len());
-                let items: Vec<ListItem> = tp.rows[tp.scroll_top..end].iter().map(|name| {
-                    let truncated: String = name.chars().take(list_area.width as usize).collect();
-                    ListItem::new(Line::from(truncated))
-                }).collect();
-
-                let mut list_state = ListState::default();
-                list_state.select(if tp.rows.is_empty() {
-                    None
-                } else {
-                    Some(tp.selected.saturating_sub(tp.scroll_top))
-                });
-
-                frame.render_stateful_widget(
-                    List::new(items).highlight_style(highlight_style),
-                    list_area,
-                    &mut list_state,
-                );
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // File browser overlay (drawn on top of everything else)
-    // -----------------------------------------------------------------------
-    // A6 self-heal: the window must respect the LIVE frame's geometry (resize
-    // has no overlay hook; render is the one place that always sees the truth).
-    if let Some(fb) = editor.file_browser.as_mut() {
-        crate::app::keep_overlay_visible(h, fb.selected, fb.entries.len(), &mut fb.scroll_top);
-    }
-    if let Some(ref fb) = editor.file_browser {
-        let ov_rect = palette_overlay_rect(area, fb.entries.len());
-        let ov_x = ov_rect.x;
-        let ov_y = ov_rect.y;
-        let ov_w = ov_rect.width;
-        let ov_h = ov_rect.height;
-        let list_h = crate::list_window::list_h_for(fb.entries.len(), h);
-
-        frame.render_widget(Clear, ov_rect);
-        let title = format!(" Open: {} ", fb.dir.display());
-        let mut block = Block::default().borders(Borders::ALL).title(title)
-            .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
-        // Indicator composes with the existing dynamic title (file browser already uses top title).
-        if let Some(ind) = windowed_indicator(fb.selected, fb.entries.len(), list_h) {
-            block = block.title_bottom(ind);
-        }
-        frame.render_widget(block, ov_rect);
-
-        if ov_h >= 3 {
-            let query_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), 1);
-            let query_display = format!("> {}", fb.query);
-            let truncated_q: String = query_display.chars().take(query_area.width as usize).collect();
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(truncated_q, ov_query_style))),
-                query_area,
-            );
-
-            if ov_h >= 4 && list_h > 0 {
-                let list_h_u16 = list_h as u16;
-                let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h_u16);
-                let highlight_style = ov_highlight_style;
-                let end = (fb.scroll_top + list_h).min(fb.entries.len());
-                let items: Vec<ListItem> = fb.entries[fb.scroll_top..end].iter().map(|e| {
-                    let label = if e.is_dir { format!("{}/", e.name) } else { e.name.clone() };
-                    let truncated: String = label.chars().take(list_area.width as usize).collect();
-                    ListItem::new(Line::from(truncated))
-                }).collect();
-
-                let mut list_state = ListState::default();
-                list_state.select(if fb.entries.is_empty() {
-                    None
-                } else {
-                    Some(fb.selected.saturating_sub(fb.scroll_top))
-                });
-
-                frame.render_stateful_widget(
-                    List::new(items).highlight_style(highlight_style),
-                    list_area,
-                    &mut list_state,
-                );
-            }
-        }
-    }
-
-    if editor.menu_bar_rows() == 1 {
-        let menu_area = Rect::new(area.x, area.y, w, h.saturating_sub(1));
-        // Full-width bar background: gaps between labels + the right side carry the
-        // Chrome style; the per-label paints below overwrite their own rects (A2).
-        let bar_row = Rect::new(area.x, area.y, w, 1);
-        frame.buffer_mut().set_style(bar_row, menu_closed_style);
-        match editor.menu {
-            Some(ref menu) if !menu.groups.is_empty() => {
-                // Paint the menu bar (one label per category)
-                let bar = menu_bar_layout(menu_area, &menu.groups);
-                for (i, rect) in &bar {
-                    let cat = menu.groups[*i].0;
-                    let label = crate::menu::category_label_pub(cat);
-                    let text = format!(" {label} ");
-                    let style = if *i == menu.open {
-                        menu_open_style
-                    } else {
-                        menu_closed_style
-                    };
-                    frame.render_widget(Paragraph::new(text).style(style), *rect);
-                }
-                // Paint the dropdown for the open category
-                if let Some(drop_rect) = menu_dropdown_rect(menu_area, &menu.groups, menu.open) {
-                    frame.render_widget(Clear, drop_rect);
-                    let leaves = &menu.groups[menu.open].1;
-                    let items: Vec<ListItem> = leaves
-                        .iter()
-                        .enumerate()
-                        .map(|(row, (label, _))| {
-                            let style = if row == menu.highlighted {
-                                menu_sel_style
-                            } else {
-                                menu_norm_style
-                            };
-                            ListItem::new(format!(" {label} ")).style(style)
-                        })
-                        .collect();
-                    frame.render_widget(List::new(items), drop_rect);
-                }
-            }
-            _ => {
-                // Inactive bar (pinned / auto-revealed / unbuilt placeholder): static
-                // labels, all closed-style, no dropdown, no highlight.
-                for (i, rect) in &menu_bar_layout_cats(menu_area, &crate::registry::MENU_ORDER) {
-                    let label = crate::menu::category_label_pub(crate::registry::MENU_ORDER[*i]);
-                    frame.render_widget(Paragraph::new(format!(" {label} ")).style(menu_closed_style), *rect);
-                }
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Diagnostic quick-fix overlay (drawn on top of everything else)
-    // -----------------------------------------------------------------------
-    if let Some(ref diag_ov) = editor.diag {
-        let row_count = diag_ov.row_count();
-        let ov_rect = palette_overlay_rect(area, row_count);
-        let ov_x = ov_rect.x;
-        let ov_y = ov_rect.y;
-        let ov_w = ov_rect.width;
-        let ov_h = ov_rect.height;
-
-        frame.render_widget(Clear, ov_rect);
-
-        let title = format!(" {} ", diag_ov.anchor.message);
-        let block = Block::default().borders(Borders::ALL).title(title)
-            .border_style(compose::compose(&editor.theme, editor.depth, &[SE::Chrome]));
-        frame.render_widget(block, ov_rect);
-
-        if ov_h >= 3 {
-            let list_h = (row_count as u16).min(15).min(ov_h.saturating_sub(2));
-            let list_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), list_h);
-            let highlight_style = ov_highlight_style;
-
-            let n_sugg = diag_ov.anchor.suggestions.len();
-            let items: Vec<ListItem> = (0..row_count).take(list_h as usize).map(|i| {
-                let label = if i < n_sugg {
-                    crate::diag_overlay::suggestion_label(&diag_ov.anchor.suggestions[i])
-                } else if i == n_sugg {
-                    "Ignore once".to_string()
-                } else {
-                    "Add to dictionary".to_string()
-                };
-                let truncated: String = label.chars().take(list_area.width as usize).collect();
-                ListItem::new(Line::from(truncated))
-            }).collect();
-
-            let mut list_state = ListState::default();
-            list_state.select(if row_count == 0 { None } else { Some(diag_ov.selected) });
-
-            frame.render_stateful_widget(
-                List::new(items).highlight_style(highlight_style),
-                list_area,
-                &mut list_state,
-            );
-        }
-    }
+    crate::render_overlays::paint(frame, editor, &cs);
 }
 
 // ---------------------------------------------------------------------------
@@ -1627,11 +1334,15 @@ mod tests {
     }
 
     #[test]
-    fn default_status_line_still_reversed() {
+    fn terminal_plain_status_carries_chrome_face() {
+        // D2: normal status uses [Chrome] — terminal-plain Chrome = White fg / Black bg
+        // (not REVERSED). The status row must carry the Chrome bg, not a reverse modifier.
         let mut ed = Editor::new_from_text("x", None, (40, 4));
         let buf = render_to_buffer(&mut ed, 40, 4);
         let last = 3u16;
-        assert!((0..40).any(|x| buf[(x,last)].style().add_modifier.contains(Modifier::REVERSED)));
+        // terminal-plain Chrome: fg=White, bg=Black — explicit color, not reverse.
+        assert!((0..40u16).any(|x| buf[(x, last)].style().bg == Some(Color::Black)),
+                "terminal-plain normal status must carry Chrome face (bg=Black, not REVERSED)");
     }
 
     #[test]
@@ -1659,21 +1370,93 @@ mod tests {
 
     #[test]
     fn phosphor_status_line_carries_hue() {
+        // D2: normal status uses [Chrome] — phosphor Chrome bg is a derived hue-tinted Rgb.
+        // After derive_chrome, Chrome.bg is an Rgb step toward black preserving the hue.
+        use wordcartel_core::theme::ChromeDisposition;
         let mut ed = Editor::new_from_text("x", None, (40, 4));
-        ed.theme = wordcartel_core::theme::Theme::builtin("phosphor-amber").unwrap();
+        let mut theme = wordcartel_core::theme::Theme::builtin("phosphor-amber").unwrap();
+        theme.derive_chrome(ChromeDisposition::Full);
+        ed.theme = theme;
         let buf = render_to_buffer(&mut ed, 40, 4);
-        let want = compose::compose(&ed.theme, ed.depth, &[wordcartel_core::theme::SemanticElement::ChromeReverse]);
-        // the status row picks up the themed chrome-reverse style, not a hardcoded REVERSED.
-        // ratatui's test buffer normalizes unset colors to Reset in rendered cells, so compare
-        // the meaningful modifier bits and any explicit fg/bg from want.
-        assert!((0..40).any(|x| {
-            let cell = buf[(x,3)].style();
-            // modifiers must match exactly
-            cell.add_modifier == want.add_modifier
-            // any fg set by want must appear in the cell (Reset == None for our purposes)
-            && (want.fg.is_none() || cell.fg == want.fg)
-            && (want.bg.is_none() || cell.bg == want.bg)
-        }));
+        let want = compose::compose(&ed.theme, ed.depth, &[SE::Chrome]);
+        // The status row carries the derived phosphor Chrome bg (Rgb, hue-tinted toward black).
+        assert!(want.bg.is_some(), "phosphor Chrome must have a derived bg after derive_chrome");
+        assert!(want.fg.is_some(), "phosphor Chrome must have a derived fg after derive_chrome");
+        assert!((0..40u16).any(|x| {
+            let cell = buf[(x, 3u16)].style();
+            cell.bg == want.bg && cell.fg == want.fg
+        }), "status row must carry the derived phosphor Chrome face");
+    }
+
+    /// THE reported bug (D2): under tokyo-night, the status row bg and the menu bar bg
+    /// were different (status=[ChromeReverse] had no bg; menu=[Chrome]=PANEL_BG).
+    /// After T5 both use [Chrome] → same bg = PANEL_BG `#16161e`.
+    #[test]
+    fn tokyo_status_matches_menu_bar() {
+        use wordcartel_core::theme::{ChromeDisposition, Depth};
+        let mut ed = Editor::new_from_text("x", None, (40, 6));
+        // Enable pinned menu bar so row 0 carries the menu Chrome bg.
+        ed.menu_bar_mode = crate::config::MenuBarMode::Pinned;
+        let mut theme = wordcartel_core::theme::tokyo_night();
+        theme.derive_chrome(ChromeDisposition::Full);
+        ed.theme = theme;
+        ed.depth = Depth::Truecolor;
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+        // Status is the last row (row 5); menu bar is row 0. FULL-ROW parity
+        // (Fable whole-branch I-2): every status cell carries the bar bg — a
+        // partial text-span bar next to the full-width menu bar was the reported
+        // mismatch class.
+        let menu_bg = buf[(0u16, 0u16)].style().bg;
+        for x in 0..40u16 {
+            let status_bg = buf[(x, 5u16)].style().bg;
+            assert_eq!(status_bg, menu_bg,
+                "status cell x={x} bg must equal menu bar bg; status={status_bg:?}, menu={menu_bg:?}");
+        }
+        // Both must be PANEL_BG #16161e (the kept Chrome face).
+        assert_eq!(menu_bg, Some(Color::Rgb(0x16, 0x16, 0x1e)),
+            "chrome bg must be PANEL_BG #16161e, got {menu_bg:?}");
+    }
+
+    /// D2: opening a minibuffer switches the status style to [ChromeAccent];
+    /// normal state uses [Chrome]. Both are verified under terminal-plain.
+    #[test]
+    fn prompt_active_status_uses_accent() {
+        let mut ed = Editor::new_from_text("x", None, (40, 4));
+
+        // Normal state: status carries Chrome face (bg=Black under terminal-plain).
+        let buf_normal = render_to_buffer(&mut ed, 40, 4);
+        let want_chrome = compose::compose(&ed.theme, ed.depth, &[SE::Chrome]);
+        assert_eq!(want_chrome.bg, Some(Color::Black), "terminal-plain Chrome bg must be Black");
+        assert!((0..40u16).any(|x| buf_normal[(x, 3u16)].style().bg == want_chrome.bg),
+            "normal status must carry Chrome bg (Black)");
+
+        // Active state (minibuffer): status carries ChromeAccent (reverse+bold under terminal-plain).
+        ed.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter);
+        derive::rebuild(&mut ed);
+        let buf_active = render_to_buffer(&mut ed, 40, 4);
+        let want_accent = compose::compose(&ed.theme, ed.depth, &[SE::ChromeAccent]);
+        assert!((0..40u16).any(|x| {
+            let cell = buf_active[(x, 3u16)].style();
+            cell.add_modifier == want_accent.add_modifier
+        }), "minibuffer-active status must carry ChromeAccent modifiers");
+    }
+
+    /// I4 pin: terminal-plain ChromeAccent = reverse+bold. When a minibuffer is open
+    /// under terminal-plain, the status row must carry REVERSED + BOLD.
+    #[test]
+    fn terminal_plain_prompt_status_reverse_bold() {
+        let mut ed = Editor::new_from_text("x", None, (40, 4));
+        ed.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter);
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 4);
+        // terminal-plain ChromeAccent = modface(None, bold=true, reverse=true) → BOLD | REVERSED.
+        let any_accent_cell = (0..40u16).any(|x| {
+            let m = buf[(x, 3u16)].style().add_modifier;
+            m.contains(Modifier::REVERSED) && m.contains(Modifier::BOLD)
+        });
+        assert!(any_accent_cell,
+            "terminal-plain prompt-active status must carry REVERSED+BOLD (ChromeAccent = reverse+bold)");
     }
 
     #[test]
@@ -1806,10 +1589,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Golden tests: lock Default-theme styles for 4 render sites
+    // Golden tests: lock terminal-plain styles for 4 render sites
     // -----------------------------------------------------------------------
 
-    /// Golden: scrollbar track = White/DarkGray, thumb = White/Black under Default theme.
+    /// Golden: scrollbar track = White/DarkGray, thumb = White/Black under terminal-plain.
     ///
     /// Creates a doc tall enough to overflow a short viewport, enables the scrollbar,
     /// and asserts that the rightmost column carries the expected track and thumb styles.
@@ -1847,7 +1630,7 @@ mod tests {
         assert!(has_scrollbar_cell, "expected at least one styled scrollbar cell in rightmost column (col {rightmost})");
     }
 
-    /// Golden: list bullet prefix glyph has DarkGray fg and DIM modifier under Default theme.
+    /// Golden: list bullet prefix glyph has DarkGray fg and DIM modifier under terminal-plain.
     ///
     /// Two-line doc `"- item\nmore\n"` with caret on line 1 (so line 0 is non-active
     /// and the bullet on row 0 uses the non-dim path with an explicit DIM modifier).
@@ -2029,7 +1812,7 @@ mod tests {
         assert_eq!(map.visual_to_source(1, 4), 10);
     }
 
-    /// Golden: fold marker `▸` glyph has DarkGray fg under Default theme.
+    /// Golden: fold marker `▸` glyph has DarkGray fg under terminal-plain.
     ///
     /// Creates a doc with a heading + body, folds the heading, renders, and
     /// asserts the `▸` glyph cell has DarkGray fg.
@@ -2057,7 +1840,7 @@ mod tests {
         );
     }
 
-    /// Golden: wrap guide `│` glyph has DarkGray fg under Default theme.
+    /// Golden: wrap guide `│` glyph has DarkGray fg under terminal-plain.
     ///
     /// Enables the wrap guide at column 10 in a 40-wide viewport and asserts
     /// the guide column cell on row 0 has DarkGray fg.
@@ -2126,9 +1909,12 @@ mod tests {
     // §13.2 accessibility coverage proof tests
     // -----------------------------------------------------------------------
 
-    fn cue_themes() -> [wordcartel_core::theme::Theme; 2] {
-        [wordcartel_core::theme::no_color(),
-         wordcartel_core::theme::Theme::builtin("phosphor-amber-flat").unwrap()]
+    // cue_themes: the modifier-battery test set — no_color() only.
+    // A derived zen-phosphor is NOT a cue theme: its ChromeSelected is explicit fg/bg with
+    // NO modifier, so it fails the cued-array assertion. The phosphor case gets its own
+    // scoped assertion below (zen_phosphor_chrome_is_fully_colored).
+    fn cue_themes() -> [wordcartel_core::theme::Theme; 1] {
+        [wordcartel_core::theme::no_color()]
     }
 
     /// §13.2: Every Face-cued SemanticElement carries >=1 non-color modifier in cue mode.
@@ -2143,10 +1929,11 @@ mod tests {
         //   SearchMatch=reverse, SearchCurrent=reverse+bold,
         //   DiagSpelling=bold+underline, DiagGrammar=bold+underline (distinct face).
         // Transient overlay + chrome elements with modifier cues:
-        //   FocusDim=dim, ChromeReverse=reverse, ChromeSelected=reverse, ChromeMuted=dim.
+        //   FocusDim=dim, ChromeReverse=reverse, ChromeSelected=reverse, ChromeMuted=dim,
+        //   ChromeAccent=reverse+bold (glyph-bearing prompt-active status — I3/D2).
         let cued = [Emphasis, Strong, StrongEmphasis, Code, CodeBlock, Link, Strikethrough,
                     Comment, FrontMatter, Selection, SearchMatch, SearchCurrent, DiagSpelling, DiagGrammar,
-                    FocusDim, ChromeReverse, ChromeSelected, ChromeMuted];
+                    FocusDim, ChromeReverse, ChromeSelected, ChromeMuted, ChromeAccent];
         for t in cue_themes() {
             for el in cued {
                 let f = t.face(el);
@@ -2159,6 +1946,10 @@ mod tests {
         // region (status bar, menu bar, overlay frames) which is structurally distinct from
         // text content; it never needs a modifier to distinguish it from text elements.
         // Proven by the chrome render tests (status-line, palette, outline overlay fixtures).
+        // §13.2: ChromeOverlay is exempt from the modifier requirement (M4 a11y) — it is a
+        //   fill face with no glyph; the overlay's accessibility is provided by the surrounding
+        //   border frame glyphs and placement cue. Its mono_faces() entry is Face::default()
+        //   deliberately; proven by the overlay-frame and interior test fixtures.
         // §13.2: FoldMarker is glyph-cued (▸ + "… N lines"); proven by the fold fixture:
         //   `fold_marker_glyph_prefix_is_rendered` — deferred to plan-③ test pass for the
         //   full §8.3 row (requires outline-folded Editor state, which is elaborate scaffolding).
@@ -2181,6 +1972,28 @@ mod tests {
             assert_ne!(t.face(Emphasis), t.face(Strong), "{}: Emphasis vs Strong", t.name);
             assert_ne!(t.face(Strong), t.face(StrongEmphasis), "{}: Strong vs StrongEmphasis", t.name);
             assert_ne!(t.face(Emphasis), t.face(StrongEmphasis), "{}: Emphasis vs StrongEmphasis", t.name);
+        }
+    }
+
+    /// Derived zen-phosphor chrome faces are fully colored (Rgb) and hue-preserving.
+    /// This is a SEPARATE assertion from the modifier battery — zen-phosphor is NOT a cue theme
+    /// (ChromeSelected is explicit fg/bg with no modifier), but its chrome IS visually complete.
+    #[test]
+    fn zen_phosphor_chrome_is_fully_colored() {
+        use wordcartel_core::theme::{ChromeDisposition, SemanticElement as SE, Color};
+        let mut t = wordcartel_core::theme::Theme::builtin("phosphor-green").unwrap();
+        t.derive_chrome(ChromeDisposition::Zen);
+        // All chrome bg rungs carry Rgb — fully colored, not sentinel
+        for el in [SE::Chrome, SE::ChromeOverlay, SE::ChromeMuted, SE::ChromeAccent] {
+            let f = t.face(el);
+            assert!(matches!(f.bg, Some(Color::Rgb{..})) || matches!(f.fg, Some(Color::Rgb{..})),
+                "{el:?} must have Rgb color after zen derive");
+        }
+        // Hue carried: chrome/overlay/muted bg are green-dominant (G ≥ R and G ≥ B)
+        for el in [SE::Chrome, SE::ChromeOverlay, SE::ChromeMuted] {
+            if let Some(Color::Rgb { r, g, b }) = t.face(el).bg {
+                assert!(g >= r && g >= b, "{el:?} bg must be green-dominant r={r} g={g} b={b}");
+            }
         }
     }
 
@@ -2309,7 +2122,7 @@ mod tests {
     fn theme_picker_windowed_slice_and_indicator() {
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         e.open_theme_picker();
-        // Only 13 builtins — pad to 20 by cycling real names so the list exceeds
+        // 19 builtins — pad to 20 by cycling real names so the list exceeds
         // the 15-row window cap. Directly assigned; no rebuild_rows called.
         {
             let names = wordcartel_core::theme::Theme::builtin_names();
@@ -2616,14 +2429,18 @@ mod tests {
         assert_eq!(pick(&live), pick(&src), "Ln,Col identical across views\nlive: {live}\nsrc:  {src}");
     }
 
-    /// FIX-3: Overlay frames must use the Chrome face (not terminal-default).
-    /// Under phosphor-amber (a fully-themed phosphor variant), the theme-picker overlay
-    /// border cells must carry themed RGB colors from the Chrome face — not Reset/None.
+    /// FIX-3 + T5: Overlay borders use Chrome fg only; bg == ChromeOverlay fill.
+    /// Under phosphor-amber, the theme-picker overlay border cells must carry Chrome
+    /// RGB fg; and the border cell bg must equal the ChromeOverlay fill bg — not
+    /// Chrome's own bg (which would create a visible "halo" around the overlay).
     #[test]
     fn phosphor_overlay_frame_border_uses_chrome_style() {
-        use wordcartel_core::theme::{Theme, Depth};
+        use wordcartel_core::theme::{ChromeDisposition, Theme, Depth};
         let mut ed = Editor::new_from_text("x\n", None, (60, 16));
-        ed.theme = Theme::builtin("phosphor-amber").unwrap();
+        let mut theme = Theme::builtin("phosphor-amber").unwrap();
+        // I4-A: phosphor chrome is now a sentinel filled by derive_chrome (not set in constructor).
+        theme.derive_chrome(ChromeDisposition::Full);
+        ed.theme = theme;
         ed.depth = Depth::Truecolor;
         ed.open_theme_picker();
         derive::rebuild(&mut ed);
@@ -2636,19 +2453,89 @@ mod tests {
         assert!(border_cell.is_some(), "FIX-3: expected box-drawing border cells in theme-picker overlay");
         let (bx, by) = border_cell.unwrap();
         let cs = buf[(bx, by)].style();
-        // phosphor-amber Chrome face: { fg: shade(4), bg: shade(1) } — both RGB.
-        // Before fix: border cell has fg/bg from terminal default (None or Reset).
-        // After fix: border cell carries Chrome face (RGB fg and bg).
+        // T5: border is fg-only — fg carries Chrome RGB, bg comes from the ChromeOverlay fill.
+        // Before T5: border bg = Chrome.bg (distinct from ChromeOverlay bg → halo).
+        // After T5: border bg = ChromeOverlay bg (fg-only border, fill shows through).
+        let fill_bg = compose::compose(&ed.theme, ed.depth, &[SE::ChromeOverlay]).bg;
         assert!(
             matches!(cs.fg, Some(ratatui::style::Color::Rgb(..))),
             "FIX-3: phosphor overlay border must carry Chrome RGB fg; got {:?} at ({bx},{by})",
             cs.fg
         );
-        assert!(
-            matches!(cs.bg, Some(ratatui::style::Color::Rgb(..))),
-            "FIX-3: phosphor overlay border must carry Chrome RGB bg; got {:?} at ({bx},{by})",
-            cs.bg
+        assert_eq!(
+            cs.bg, fill_bg,
+            "T5: border bg must equal ChromeOverlay fill bg (fg-only border — no halo); \
+             got {:?}, expected fill {:?} at ({bx},{by})", cs.bg, fill_bg
         );
+    }
+
+    /// D2: under tokyo-night with the palette open, every interior cell (not on the
+    /// border perimeter, not the selected row) must carry the ChromeOverlay bg (#2f303a).
+    /// No cell inside the overlay should have the terminal-default bg.
+    #[test]
+    fn tokyo_overlay_interior_is_themed() {
+        use wordcartel_core::theme::{ChromeDisposition, Depth};
+        let mut ed = Editor::new_from_text("x", None, (80, 20));
+        let mut theme = wordcartel_core::theme::tokyo_night();
+        theme.derive_chrome(ChromeDisposition::Full);
+        ed.theme = theme;
+        ed.depth = Depth::Truecolor;
+        commands_palette(&mut ed);
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 80, 20);
+
+        let fill_bg = compose::compose(&ed.theme, ed.depth, &[SE::ChromeOverlay]).bg;
+        // §B.3 pin: tokyo FULL ChromeOverlay = #2f303a.
+        assert_eq!(fill_bg, Some(Color::Rgb(0x2f, 0x30, 0x3a)),
+            "tokyo-night FULL ChromeOverlay must be #2f303a");
+
+        let n_rows = ed.palette.as_ref().unwrap().rows.len();
+        let ov_rect = palette_overlay_rect(ratatui::layout::Rect::new(0, 0, 80, 20), n_rows);
+        // query row = ov_y+1; list items start at ov_y+2; selected (index 0) is at ov_y+2.
+        let selected_y = ov_rect.y + 2;
+
+        for y in (ov_rect.y + 1)..(ov_rect.y + ov_rect.height - 1) {
+            if y == selected_y { continue; } // selected row carries ChromeSelected — skip
+            for x in (ov_rect.x + 1)..(ov_rect.x + ov_rect.width - 1) {
+                let cell_bg = buf[(x, y)].style().bg;
+                assert_eq!(cell_bg, fill_bg,
+                    "interior ({x},{y}) must have ChromeOverlay bg={fill_bg:?}, got {cell_bg:?}");
+            }
+        }
+    }
+
+    /// THE halo bug fix (D2 defect-1): under phosphor-green, overlay border cells must NOT
+    /// carry Chrome's own bg — the fg-only border rule leaves the ChromeOverlay fill's bg
+    /// intact on border cells. Tested for both Full and Zen dispositions.
+    #[test]
+    fn phosphor_border_cells_carry_no_own_bg() {
+        use wordcartel_core::theme::{ChromeDisposition, Depth};
+        for disp in [ChromeDisposition::Full, ChromeDisposition::Zen] {
+            let mut ed = Editor::new_from_text("x", None, (80, 20));
+            let mut theme = wordcartel_core::theme::Theme::builtin("phosphor-green").unwrap();
+            theme.derive_chrome(disp);
+            ed.theme = theme;
+            ed.depth = Depth::Truecolor;
+            ed.open_theme_picker();
+            derive::rebuild(&mut ed);
+            let buf = render_to_buffer(&mut ed, 80, 20);
+
+            let fill_bg = compose::compose(&ed.theme, ed.depth, &[SE::ChromeOverlay]).bg;
+            assert!(fill_bg.is_some(), "phosphor ChromeOverlay must have an Rgb bg after derive_chrome");
+
+            // Find any border glyph cell.
+            let border_cell = (0..80u16).flat_map(|x| (0..20u16).map(move |y| (x, y))).find(|&(x, y)| {
+                let s = buf[(x, y)].symbol();
+                s == "─" || s == "│" || s == "┌" || s == "┐" || s == "└" || s == "┘"
+            });
+            assert!(border_cell.is_some(),
+                "expected border cells in theme-picker overlay (disp={disp:?})");
+            let (bx, by) = border_cell.unwrap();
+            let cell_bg = buf[(bx, by)].style().bg;
+            assert_eq!(cell_bg, fill_bg,
+                "border cell bg must equal fill bg (no halo) under phosphor-green \
+                 ({disp:?}); bg={cell_bg:?}, fill={fill_bg:?} at ({bx},{by})");
+        }
     }
 
     // -----------------------------------------------------------------------

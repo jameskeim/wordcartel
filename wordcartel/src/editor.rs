@@ -418,6 +418,12 @@ pub struct Editor {
     /// Active theme + terminal color depth. Seeded at startup (real depth detection: plan ③).
     pub theme: wordcartel_core::theme::Theme,
     pub depth: wordcartel_core::theme::Depth,
+    /// Chrome disposition (Full/Zen). Seeded from `[theme] chrome` at startup; toggled at
+    /// runtime by the `toggle_chrome` command (T7). Passed to `resolve_theme` on re-derive.
+    pub chrome_disposition: wordcartel_core::theme::ChromeDisposition,
+    /// Request flag: `toggle_chrome` command sets this; the run-loop re-derives and clears it.
+    /// Mirrors the `settings_save_requested` pattern (grounding A.8).
+    pub theme_rederive: bool,
     /// Heading-level glyph toggle from config (seeded at startup; used by runtime picker — Task 7).
     pub heading_glyph_cfg: Option<bool>,
     /// Whether session-resume restore is enabled (seeded from `cfg.state.resume` in run()).
@@ -485,6 +491,8 @@ impl Editor {
             file_browser: None,
             theme: wordcartel_core::theme::default(),
             depth: wordcartel_core::theme::Depth::Truecolor,
+            chrome_disposition: wordcartel_core::theme::ChromeDisposition::Full,
+            theme_rederive: false,
             heading_glyph_cfg: None,
             resume_enabled: false,
             scratch_id: None,
@@ -492,7 +500,7 @@ impl Editor {
             quit_drain: None,
             quit_drain_advance: false,
             settings_save_requested: false,
-            theme_identity: crate::settings::ThemeIdentity::Builtin("default".into()),
+            theme_identity: crate::settings::ThemeIdentity::Builtin("terminal-plain".into()),
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer::from_text(id, text, path, area));
@@ -1135,7 +1143,7 @@ mod tests {
     #[test]
     fn editor_seeds_default_theme_truecolor() {
         let ed = Editor::new_from_text("x", None, (80, 24));
-        assert_eq!(ed.theme.name, "default");
+        assert_eq!(ed.theme.name, "terminal-plain"); // default() now named terminal-plain (D5)
         assert_eq!(ed.depth, wordcartel_core::theme::Depth::Truecolor);
     }
 

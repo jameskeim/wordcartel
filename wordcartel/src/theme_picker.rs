@@ -42,12 +42,12 @@ mod tests {
             scroll_top: 0, original: wordcartel_core::theme::default(), previewed: None };
         rebuild_rows(&mut tp);
         assert!(tp.rows.iter().any(|r| r == "tokyo-night"));
-        assert!(tp.rows.len() >= 13);
+        assert!(tp.rows.len() >= 19, "expected >= 19 builtins, got {}", tp.rows.len());
         tp.query = "phosphor-amber".into();
         rebuild_rows(&mut tp);
         assert!(tp.rows.iter().all(|r| r.contains("phosphor-amber")));
         assert!(tp.rows.contains(&"phosphor-amber".to_string()));
-        assert!(tp.rows.contains(&"phosphor-amber-flat".to_string()));
+        // phosphor-amber-flat removed in D4 — no flat variants in builtin_names()
     }
 
     #[test]
@@ -81,7 +81,7 @@ mod tests {
         crate::derive::rebuild(&mut ed);
         // default theme is A
         let default_name = ed.theme.name.clone();
-        assert_eq!(default_name, "default");
+        assert_eq!(default_name, "terminal-plain");
         ed.open_theme_picker();
         let original = ed.theme_picker.as_ref().unwrap().original.clone();
         assert_eq!(original.name, default_name, "picker must capture the original theme");
@@ -102,5 +102,39 @@ mod tests {
         ed.open_outline();
         assert!(ed.theme_picker.is_none(), "opening the outline must clear the theme picker (XOR)");
         assert!(ed.outline.is_some());
+    }
+
+    /// T7 pin: `preview_selected_theme` derives chrome using `editor.chrome_disposition`
+    /// before `apply_theme` (grounding A.9 / D3). Under Zen disposition, flexoki-dark's
+    /// Chrome bg must equal the §B.3 probe-generated ZEN Chrome bg (#0f0e0e).
+    ///
+    /// The >= 19 count pin lives in `rebuild_rows_filters_builtins` (T2 — not duplicated here).
+    #[test]
+    fn preview_derives_zen_chrome_bg_on_flexoki_dark() {
+        use wordcartel_core::theme::{ChromeDisposition, Color, SemanticElement};
+        let mut ed = Editor::new_from_text("x\n", None, (40, 12));
+        ed.chrome_disposition = ChromeDisposition::Zen;
+        ed.open_theme_picker();
+        // D5 builtin_names order (19 entries, 0-based):
+        //   terminal-plain[0] terminal-ansi[1] no-color[2] tokyo-night[3]
+        //   phosphor-green[4] phosphor-amber[5] phosphor-red[6] phosphor-blue[7] phosphor-purple[8]
+        //   catppuccin-mocha[9] catppuccin-latte[10] flexoki-dark[11] …
+        assert_eq!(
+            ed.theme_picker.as_ref().unwrap().rows.get(11).map(|s| s.as_str()),
+            Some("flexoki-dark"),
+            "row 11 must be flexoki-dark in the 19-theme D5 lineup; rows: {:?}",
+            ed.theme_picker.as_ref().unwrap().rows,
+        );
+        ed.theme_picker.as_mut().unwrap().selected = 11;
+        // preview_selected_theme is the single funnel (A.9): derives before apply_theme.
+        crate::app::preview_selected_theme(&mut ed);
+        // §B.3 probe-generated: flexoki-dark ZEN Chrome bg = #0f0e0e.
+        let chrome_bg = ed.theme.face(SemanticElement::Chrome).bg;
+        assert_eq!(
+            chrome_bg,
+            Some(Color::Rgb { r: 0x0f, g: 0x0e, b: 0x0e }),
+            "preview under Zen must install ZEN Chrome bg #0f0e0e for flexoki-dark (§B.3); got {:?}",
+            chrome_bg,
+        );
     }
 }

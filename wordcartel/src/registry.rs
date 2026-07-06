@@ -472,6 +472,12 @@ impl Registry {
             c.editor.open_minibuffer("Wrap column: ", crate::minibuffer::MinibufferKind::WrapColumn);
             CommandResult::Handled
         });
+        // toggle_chrome MUST be registered BEFORE save_settings (journey_palette_end relies on
+        // save_settings being the last command dispatched from End+Enter — spec D3 / A.7).
+        r.register("toggle_chrome", "Chrome: Full/Zen", Some(MenuCategory::Settings), |c| {
+            toggle_chrome(c.editor);
+            CommandResult::Handled
+        });
         r.register("save_settings", "Save Settings", Some(MenuCategory::Settings), |c| {
             c.editor.settings_save_requested = true;
             CommandResult::Handled
@@ -522,6 +528,47 @@ fn switch_keymap_preset(editor: &mut crate::editor::Editor, preset: &str) {
     editor.active_keymap_preset = preset.to_string();
     editor.keymap_rebuild = true;
     editor.status = format!("keymap: {preset}");
+}
+
+/// Toggle the chrome disposition (Full ⇄ Zen). Mirrors `switch_keymap_preset` in structure:
+/// sets the flag and gives an honest status. Four arms (spec D3 / grounding A.7):
+///   • monochrome/cue theme: NO flip (derivation always skips on monochrome).
+///   • non-Rgb bases (terminal-plain, terminal-ansi): flips + persists, warns "no effect".
+///   • Rgb bases at Ansi16 depth: flips + persists, warns "no effect at 16-color depth".
+///   • normal: flips + "chrome: full"/"chrome: zen".
+fn toggle_chrome(editor: &mut crate::editor::Editor) {
+    use wordcartel_core::theme::{ChromeDisposition, Color, Depth};
+    // Arm 1 — cue/monochrome theme: disposition flip has no visible effect (derive_chrome
+    // is a no-op on monochrome themes); inform the user without changing state.
+    if editor.theme.monochrome {
+        editor.status = "chrome: n/a (cue mode)".into();
+        return;
+    }
+    // Flip the disposition and request a full re-derive in the between-reduces arm.
+    let new_disp = match editor.chrome_disposition {
+        ChromeDisposition::Full => ChromeDisposition::Zen,
+        ChromeDisposition::Zen  => ChromeDisposition::Full,
+    };
+    editor.chrome_disposition = new_disp;
+    editor.theme_rederive = true;
+    let label = match new_disp { ChromeDisposition::Full => "full", ChromeDisposition::Zen => "zen" };
+    // Arm 2 — non-Rgb bases: derive_chrome early-returns on non-Rgb (Color::Default /
+    // named colors). The flip is recorded and persists, but the visible chrome is unchanged.
+    let rgb_bases = matches!(editor.theme.base_bg, Color::Rgb { .. })
+        && matches!(editor.theme.base_fg, Color::Rgb { .. });
+    if !rgb_bases {
+        let name = editor.theme.name.clone();
+        editor.status = format!("chrome: {label} (no effect: {name} has fixed chrome)");
+        return;
+    }
+    // Arm 3 — Rgb theme at Ansi16 depth: the fixed 5-face Ansi16 policy applied by
+    // resolve_theme overrides the derived faces; toggling disposition has no visible effect.
+    if editor.depth == Depth::Ansi16 {
+        editor.status = format!("chrome: {label} (no effect at 16-color depth)");
+        return;
+    }
+    // Normal arm: derived Rgb theme at Truecolor/256; the rederive will visibly change chrome.
+    editor.status = format!("chrome: {label}");
 }
 
 /// Thin adapter: run a built-in `Command` against the Ctx's editor+clock.
@@ -724,12 +771,75 @@ mod tests {
             ("keymap_cua",       "Keymap: CUA"),
             ("keymap_wordstar",  "Keymap: WordStar"),
             ("set_wrap_column",  "Set Wrap Column\u{2026}"),
+            ("toggle_chrome",    "Chrome: Full/Zen"),
             ("save_settings",    "Save Settings"),
         ] {
             let m = reg.meta(CommandId(id)).unwrap_or_else(|| panic!("missing {id}"));
             assert_eq!(m.label, label, "label mismatch for {id}");
             assert_eq!(m.menu, Some(MenuCategory::Settings), "menu category mismatch for {id}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 6 (E3+E4): toggle_chrome — honest arms + rederive flag
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn toggle_chrome_flips_and_requests_rederive() {
+        use wordcartel_core::theme::ChromeDisposition;
+        let mut ed = Editor::new_from_text("x", None, (80, 24));
+        assert_eq!(ed.chrome_disposition, ChromeDisposition::Full, "precondition: Full");
+        dispatch_id(&mut ed, "toggle_chrome");
+        assert_eq!(ed.chrome_disposition, ChromeDisposition::Zen, "disposition must flip to Zen");
+        assert!(ed.theme_rederive, "rederive flag must be set");
+        assert!(ed.status.contains("chrome: zen"), "status must say 'chrome: zen': {:?}", ed.status);
+        // Second toggle flips back to Full.
+        dispatch_id(&mut ed, "toggle_chrome");
+        assert_eq!(ed.chrome_disposition, ChromeDisposition::Full, "second toggle → Full");
+        assert!(ed.status.contains("chrome: full"), "status: {:?}", ed.status);
+    }
+
+    #[test]
+    fn toggle_chrome_cue_mode_arm_no_flip() {
+        // Arm 1: monochrome/cue theme — no flip, status "chrome: n/a (cue mode)".
+        use wordcartel_core::theme::ChromeDisposition;
+        let mut ed = Editor::new_from_text("x", None, (80, 24));
+        ed.theme.monochrome = true;
+        dispatch_id(&mut ed, "toggle_chrome");
+        assert_eq!(ed.chrome_disposition, ChromeDisposition::Full, "cue mode: disposition must NOT flip");
+        assert!(!ed.theme_rederive, "cue mode: rederive flag must NOT be set");
+        assert_eq!(ed.status, "chrome: n/a (cue mode)", "cue mode status: {:?}", ed.status);
+    }
+
+    #[test]
+    fn toggle_chrome_fixed_chrome_arm_flips_but_warns() {
+        // Arm 2: non-Rgb bases (terminal-plain) — flips + persists, warns "no effect: {name}".
+        use wordcartel_core::theme::{ChromeDisposition, Color};
+        let mut ed = Editor::new_from_text("x", None, (80, 24));
+        // new_from_text seeds terminal-plain (default()), which has non-Rgb bases.
+        assert!(!matches!(ed.theme.base_bg, Color::Rgb { .. }), "precondition: non-Rgb base_bg");
+        assert!(!ed.theme.monochrome, "precondition: not monochrome");
+        dispatch_id(&mut ed, "toggle_chrome");
+        assert_eq!(ed.chrome_disposition, ChromeDisposition::Zen, "fixed-chrome arm: disposition flips");
+        assert!(ed.theme_rederive, "rederive flag set (though rederive is a no-op on non-Rgb)");
+        assert!(ed.status.contains("no effect:"), "must warn 'no effect': {:?}", ed.status);
+        assert!(ed.status.contains("has fixed chrome"), "must say 'has fixed chrome': {:?}", ed.status);
+    }
+
+    #[test]
+    fn toggle_chrome_ansi16_arm_flips_but_warns() {
+        // Arm 3: Rgb theme at Ansi16 depth — flips + persists, warns "no effect at 16-color depth".
+        use wordcartel_core::theme::{ChromeDisposition, Depth};
+        let mut ed = Editor::new_from_text("x", None, (80, 24));
+        // Install an Rgb theme (flexoki-dark) and set depth to Ansi16.
+        let theme = wordcartel_core::theme::Theme::builtin("flexoki-dark").unwrap();
+        ed.apply_theme(theme);
+        ed.depth = Depth::Ansi16;
+        dispatch_id(&mut ed, "toggle_chrome");
+        assert_eq!(ed.chrome_disposition, ChromeDisposition::Zen, "Ansi16 arm: disposition flips");
+        assert!(ed.theme_rederive, "rederive flag must be set");
+        assert!(ed.status.contains("no effect at 16-color depth"),
+            "must warn 16-color: {:?}", ed.status);
     }
 
     #[test]

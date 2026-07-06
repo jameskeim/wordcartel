@@ -47,6 +47,7 @@ pub struct ThemeConfig {
     pub name: Option<String>,
     pub file: Option<PathBuf>,           // ~-expanded, resolved relative to declaring config
     pub depth: Option<String>,           // "truecolor"|"256"|"16"|"none"
+    pub chrome: Option<String>,          // "full"|"zen" — parsed at resolve
     pub heading_level_glyph: Option<bool>,
     pub styles: BTreeMap<String, RawFace>,
 }
@@ -207,6 +208,7 @@ struct RawTheme {
     name: Option<String>,
     file: Option<String>,
     depth: Option<String>,
+    chrome: Option<String>,
     heading_level_glyph: Option<bool>,
     styles: BTreeMap<String, RawFace>,
 }
@@ -445,6 +447,7 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
             (None, None) => {} // neither set this layer → inherit accumulated
         }
         if let Some(d) = rt.depth { cfg.theme.depth = Some(d); }
+        if let Some(c) = rt.chrome { cfg.theme.chrome = Some(c); }
         if let Some(h) = rt.heading_level_glyph { cfg.theme.heading_level_glyph = Some(h); }
         for (k, v) in rt.styles { cfg.theme.styles.insert(k, v); } // accumulate across layers
     }
@@ -826,15 +829,16 @@ mod tests {
         // Baseline: defaults (empty layer list — no hand config, no overrides).
         let (baseline_cfg, _) = load(&[]);
         // Use the default resolved theme name (tests run without a real env, so
-        // resolve_theme falls back to the default theme — name = "default").
+        // resolve_theme falls back to the default theme — name = "terminal-plain").
         let env = crate::theme_resolve::EnvSnapshot::from_env();
-        let baseline_resolved = crate::theme_resolve::resolve_theme(&baseline_cfg.theme, &env);
+        let baseline_resolved = crate::theme_resolve::resolve_theme(
+            &baseline_cfg.theme, &env, wordcartel_core::theme::ChromeDisposition::Full);
         let baseline = snapshot_of(&baseline_cfg, &baseline_resolved.theme.name);
 
-        // Runtime snapshot: six divergences — keymap → wordstar, typewriter on,
-        // bar → pinned, mouse capture off, theme → tokyo-night, wrap_column → 100
-        // (spec Testing: the round-trip covers [mouse] capture and [theme] name too —
-        // Fable m-wb-1; wrap_column 100 is distinct from the default 72 and above min).
+        // Runtime snapshot: seven divergences — keymap → wordstar, typewriter on,
+        // bar → pinned, mouse capture off, theme → tokyo-night, wrap_column → 100,
+        // chrome → Zen (spec Testing: the round-trip covers [mouse] capture and [theme]
+        // name + chrome too — Fable m-wb-1; wrap_column 100 is distinct from default 72).
         let runtime = SettingsSnapshot {
             keymap_preset:   "wordstar".to_string(),
             theme_identity:  ThemeIdentity::Builtin("tokyo-night".to_string()),
@@ -846,6 +850,7 @@ mod tests {
             view_wrap_column: 100,
             menu_bar:        crate::config::MenuBarMode::Pinned,
             mouse_capture:   false,
+            chrome_disposition: wordcartel_core::theme::ChromeDisposition::Zen,
         };
 
         let of = compute_overrides(&runtime, &baseline, &OverridesFile::default(), &OverridesFile::default());
@@ -863,6 +868,8 @@ mod tests {
             "theme name must round-trip");
         assert_eq!(cfg.view.wrap_column, 100,
             "view.wrap_column must round-trip to 100");
+        assert_eq!(cfg.theme.chrome.as_deref(), Some("zen"),
+            "[theme] chrome must round-trip to 'zen'");
     }
 
 }
