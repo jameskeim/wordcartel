@@ -532,6 +532,116 @@ stability there; restructure only if a B-strong-class parser replacement ever ha
 
 ---
 
+## Theme R — editing responsiveness (the project's #1 invariant: instant typing)
+
+### R1. Typing latency + double-Return / line-jump — full investigation record — `in-brainstorm` (2026-07-06) · Medium
+
+*(Facts as of `86db660`. This is the durable record of the diagnostic work — theories tried,
+refuted, and confirmed — for three symptoms the user reported while writing in wcartel. It is
+NOT yet a spec; a tight-scope effort is being brainstormed off it. Gating note: per the
+2026-07-06 work-style change, Codex is the sole spec/plan gate; Fable reviews the whole branch
+only.)*
+
+**The three reported symptoms (user, 2026-07-06):**
+1. **Double-Return** — "after some lines I need to hit Return twice to create a line break."
+2. **Line-jump** — "starting a line immediately under the line above jumps the second line
+   below the preceding line."
+3. **Typing jerk** — rendering "halts / catches / jerks" as it types into the buffer.
+Plus a high-value diagnostic clue: 1-3 appear right after a buffer is **first opened** and
+after a **theme change**, but largely disappear when the user toggles **centered view**
+(measure mode) in and out.
+
+**Empirical anchor — the 50-Return test (real `wcartel` via tmux, both paced ~80 ms and fast
+burst):** typed N Returns into a fresh empty buffer, saved, counted newlines. Result is
+perfectly linear `N -> N+1` (0->1, 1->2, 3->4, 50->51; the +1 is the trailing newline of an
+empty doc), **identical paced vs burst.** Conclusion: NO keystrokes are dropped, the buffer is
+always correct, and there is **no data-loss risk** — the double-Return is a *rendering/timing*
+effect (the newline IS inserted; the frame just doesn't show it, so the user presses again and
+actually inserts a second newline — documents quietly accumulate extra blank lines).
+
+**Theory ladder — what we tried, in order, with verdicts:**
+
+- **T0 — "no hot-path latency by construction" (initial read).** INCOMPLETE, later corrected.
+  Verified the reduce-loop input guards and the compose/render *styling* path stay O(1)/O(visible)
+  after E3+E4. Did NOT audit the two places a per-keystroke O(document) cost hides: the
+  incremental parse-on-edit *downstream reconcile* and the render diff. That blind spot is exactly
+  where the real bug lives (T4).
+- **T1 — stale width-keyed layout cache (from the measure-toggle clue).** REFUTED. `LayoutKey`
+  (`wordcartel/src/derive.rs:9-20`) is nine fields incl. `blocks_generation` (content) and
+  `heading_level_glyph` (theme) — not width-only. `toggle_measure` performs no reparse (parse is
+  version-gated at `derive.rs:116`; the toggle only flips `view_opts.measure` at
+  `registry.rs:387`). An in->out measure toggle returns every key field to its prior value, so it
+  is net-zero on the layout cache and cannot "repair" it. A probe of 11 common edits found
+  `incremental == full` (the known F2-oracle divergences are tail nested/loose-list shapes, not
+  ordinary typing).
+- **T2 — markdown soft-break / editing-model (raw-source vs rendered-view).** REFUTED by live
+  repro: opening a file `AAA\nBBB` (single newline) renders AAA and BBB on **separate rows** — a
+  single newline IS a visible line break at rest. wcartel does not collapse soft breaks the way
+  raw CommonMark would, so the double-Return is not a semantics effect.
+- **T3 — active-line reveal/conceal reflow (caret line shows raw markdown, others conceal).**
+  NOT REPRODUCED for the tested case: a line with a long link renders raw whether the caret is on
+  it or moved away, and the line below does not move. Remains a *possible* contributor for other
+  markdown (headings/glyphs) but not the demonstrated cause.
+- **T4 — per-keystroke O(document) fold/outline walks.** PROVEN — the root of symptom 3, and the
+  likely upstream cause of 1-2 as lag. See mechanism below.
+- **T5 — startup first-frame staleness.** CONFIRMED as the one genuinely separate correctness
+  bug, but narrow (startup only — see below).
+
+**Live visual repro findings (read-only, real binary):** (a) single newline renders as a line
+break at rest; (b) typing "AAA" / Enter / "BBB" with settle-pauses renders each step correctly —
+the double-Return is NOT reproducible once frames settle, i.e. it is transient/lag; (c) no
+link-conceal reflow. **Net: symptoms 1-2 are transient lag artifacts, not a rendering-correctness
+bug** — everything renders correctly the moment the app catches up, and the measure-toggle relief
+is a full-repaint flushing transient on-screen state (NOT a cache repair).
+
+**PROVEN mechanism (symptom 3 = T4).** `derive::rebuild_downstream`
+(`wordcartel/src/derive.rs:183-274`) runs on EVERY keystroke and does two O(document) walks even
+when zero folds are open:
+- **Fold-anchor reconcile** (`derive.rs:193-196`): `outline::heading_starts`
+  (`wordcartel-core/src/outline.rs:92`) builds the full `Vec<Heading>` via
+  `ordered`->`headings`->`heading_title`, **allocating a `String` title per heading**
+  (`outline.rs:24-62`), then keeps only the byte offsets and throws the titles away. Gated on
+  `last_reconciled_generation != gen`, but `blocks_generation` bumps on every edit
+  (`Editor::set_blocks`, `editor.rs:91-94`, unconditional), so the gate misses every keystroke.
+- **Fold-view compute** (`derive.rs:201`): `Editor::active_fold_view` (`editor.rs:521-535`) is
+  memoized on `(blocks_generation, folds.epoch())` — but generation bumps every edit, so
+  `FoldView::compute` (`fold.rs:133`) walks `outline::sections` (another full-tree +
+  String-per-heading pass) every keystroke.
+Cost grows with document size -> "worse after some lines." The run loop has **no input
+coalescing** (`app.rs:1592`/`:1624` — one `reduce` + one `draw` per message), so a fast typist
+outruns the draws and the queue drains in bursts -> the catch/jerk feel.
+
+**CONFIRMED narrow bug (T5 = startup staleness).** The sequence `rebuild -> ensure_visible ->
+draw` at startup (`app.rs:1536-1547`) has NO rebuild between `ensure_visible` and the first draw.
+`ensure_visible` (`nav.rs:401`, returns `()` today) mutates `view.scroll`/`view.scroll_row` but
+does not refresh `line_layouts`, and render has no on-demand layout fallback — so if the caret is
+off-screen on open, the first frame is built for the wrong visible range. Grounding showed this is
+the ONLY genuine gap: everywhere reached through the reduce loop, `advance()` runs a pre-draw
+`derive::rebuild` (`app.rs:1242`/`:1623`) that repairs scroll every keystroke — so theme-change
+and active typing are already repaired, and their perceived jank is T4 (slowdown), not T5.
+
+**Fix directions (grounded):**
+- **Fix #1 (T4, the anchor):** guard both walks on "no folds active" (`FoldState::is_empty`,
+  `fold.rs:19`) — the overwhelmingly common case does zero walks; and add a non-allocating
+  byte-only `heading_starts` for when folds DO exist (skip the per-heading `String`). Likely
+  resolves all three symptoms (jerk directly; 1-2 as lag downstream).
+- **Fix #2 (T5):** have `ensure_visible` report whether it moved scroll; re-run `derive::rebuild`
+  when it did, at the startup site (and defensively any draw path outside the reduce loop).
+- **Latency probe (greenfield — no criterion/benches today):** a before/after wall-clock measure
+  of the per-keystroke cycle at several document sizes, plus a deterministic regression guard
+  extending the existing `LAYOUT_RUNS`-style instrumentation (`derive.rs:23-25`) to assert zero
+  O(document) walks per keystroke when no folds are open.
+
+**Proposed scope (tight, pending user confirmation):** Fix #1 + Fix #2 + the probe.
+**Deferred** (recorded, not in this effort): (a) **input coalescing** in the run loop — smooths
+bursts but touches the input loop + the no-silent-UI invariant, revisit only if typing still feels
+bursty after Fix #1; (b) the **`area_height` inconsistency** (`derive.rs:212` uses full terminal
+height; `ensure_visible` at `nav.rs:436` subtracts `1 + menu_bar_rows`) and `LayoutKey` omitting
+`menu_bar_rows` — real but *over*-caches (harmless direction), not the bug.
+
+**Recommended sequencing:** before Effort P — the plugin system only adds hot-path pressure, and a
+latency probe is worth having in place before then.
+
 ## Cross-cutting notes
 
 - **Testing synergy:** every item lands with e2e `Harness` journeys (menu state machine,
@@ -585,6 +695,10 @@ A6's territory; E2's checkable items serve A5/E1; C2 and C3 are islands.
 
 *(Progress: 1 A6 ✓ · 2 H1 ✓ · 3 B1+B2 ✓ · 4 C4 ✓ (2026-07-04) · 5 C2 ✓ · 6 D1+A5 ✓
 (2026-07-05) · 7 E3+E4 ✓ (2026-07-06, shipped together) — **next: 8, E1+E2 (+A3 curation)**.)*
+
+*(NEW 2026-07-06: **R1 editing-responsiveness** entered brainstorm mid-stream — a
+tight-scope perf/correctness fix (Theme R). Dependency-free; recommended to slot BEFORE Effort P.
+May preempt or run alongside E1+E2 at the user's call.)*
 
 1. **A6** palette reachability — folds in A3(a) hints-verification + the palette-completeness
    invariant test (same territory). Kills the invisible-dispatch hazard first.
