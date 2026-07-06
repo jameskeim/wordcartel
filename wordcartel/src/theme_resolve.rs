@@ -1,7 +1,7 @@
 //! Shell theme resolution: env depth detection + `resolve_theme` (Task 5).
 //! Core stays IO-free; this is where env/file reading happens.
 
-use wordcartel_core::theme::{self, Color, Depth, Face, Theme};
+use wordcartel_core::theme::{self, Color, Depth, Face, Theme, ChromeDisposition, SemanticElement};
 use crate::config::{ThemeConfig, RawFace};
 
 /// Detect color depth from environment values. Case-insensitive.
@@ -55,6 +55,19 @@ impl EnvSnapshot {
 
 pub struct ResolvedTheme { pub theme: Theme, pub depth: Depth, pub warnings: Vec<String> }
 
+/// Parse a `[theme] chrome` config string into a `ChromeDisposition`.
+///
+/// Returns the disposition and an optional warning string.
+/// `"full"` or `None` → `Full` (silent). `"zen"` → `Zen`. Unknown value → `Full` + warning.
+pub fn parse_chrome(s: &Option<String>) -> (ChromeDisposition, Option<String>) {
+    match s.as_deref() {
+        None | Some("full") => (ChromeDisposition::Full, None),
+        Some("zen") => (ChromeDisposition::Zen, None),
+        Some(other) => (ChromeDisposition::Full,
+            Some(format!("theme.chrome: unknown value `{other}` — using full"))),
+    }
+}
+
 /// Convert a config `RawFace` (hex strings) to a core `Face`; push a warning per bad hex.
 fn raw_face_to_face(key: &str, rf: &RawFace, warnings: &mut Vec<String>) -> Face {
     let mut hex = |s: &Option<String>, field: &str| -> Option<Color> {
@@ -81,7 +94,9 @@ fn apply_cue_mode_glyph(theme: &mut Theme, depth: Depth, cfg_override: Option<bo
     theme.heading_level_glyph = if cue { true } else { cfg_override.unwrap_or(theme.heading_level_glyph) };
 }
 
-pub fn resolve_theme(tc: &ThemeConfig, env: &EnvSnapshot) -> ResolvedTheme {
+/// Resolve order (D1+D5): base pick/construct → derive_chrome(disp) → Ansi16 policy →
+/// user styles → cue glyph. User chrome overrides land LAST, over the depth policy.
+pub fn resolve_theme(tc: &ThemeConfig, env: &EnvSnapshot, disp: ChromeDisposition) -> ResolvedTheme {
     let mut warnings = Vec::new();
 
     let detected = detect_depth(env.no_color, env.colorterm.as_deref(), env.term.as_deref());
@@ -91,7 +106,9 @@ pub fn resolve_theme(tc: &ThemeConfig, env: &EnvSnapshot) -> ResolvedTheme {
     });
     let depth = effective_depth(env.no_color, explicit, detected);
 
-    // Base theme: depth==None → no_color(); else file > name > default.
+    // Base theme: depth==None → no_color(); else file > name > launch-default (flexoki-dark).
+    // Aliases resolved HERE (not in builtin): "default" → terminal-plain (warn);
+    // "phosphor-X-flat" → "phosphor-X" (warn). Error fallbacks → theme::default().
     let mut t = if depth == Depth::None {
         theme::no_color()
     } else if let Some(path) = &tc.file {
@@ -106,19 +123,74 @@ pub fn resolve_theme(tc: &ThemeConfig, env: &EnvSnapshot) -> ResolvedTheme {
             Err(e) => { warnings.push(format!("theme file {}: {e} — using default", path.display())); theme::default() }
         }
     } else if let Some(name) = &tc.name {
-        match Theme::builtin(name) {   // ASSOCIATED method (impl Theme), NOT a free fn (Codex C3)
+        // Resolve "default" alias and "-flat" fallbacks at the resolve layer (with warnings),
+        // keeping builtin() itself clean (plan §D5, T2 review Important).
+        let resolved_name = if name == "default" {
+            warnings.push("theme 'default' renamed 'terminal-plain' — update your config".to_string());
+            "terminal-plain".to_string()
+        } else if let Some(base) = name.strip_suffix("-flat") {
+            warnings.push(format!("theme '{name}' removed; using '{base}'"));
+            base.to_string()
+        } else {
+            name.clone()
+        };
+        match Theme::builtin(&resolved_name) {   // ASSOCIATED method (impl Theme), NOT a free fn
             Some(th) => th,
             None => { warnings.push(format!("theme: unknown name `{name}` — using default")); theme::default() }
         }
     } else {
-        theme::default()
+        // No name, no file: launch default is flexoki-dark (D5). Depth::None already handled above.
+        Theme::builtin("flexoki-dark").expect("flexoki-dark is a bundled builtin")
     };
 
-    // Per-element style overrides. On a MONOCHROME theme (cue mode by theme), color
-    // fields are dropped (modifiers still apply) so an override can't defeat the §4
-    // cue discipline (Codex C2). Note: depth==None always yields a monochrome theme
+    // D1 resolve order step 1: derive chrome ladder from Rgb bases.
+    // No-op for non-Rgb themes (terminal-plain, terminal-ansi, no-color, error fallbacks).
+    t.derive_chrome(disp);
+
+    // D1 resolve order step 2: Ansi16 fixed chrome policy.
+    // At Depth::Ansi16 on an Rgb-based theme, overwrite the five color faces with the
+    // named-ANSI table keyed on the binary predicate: quantize(canvas) == Black → DarkGray
+    // arm (dark themes); else → Black arm (light themes). ChromeReverse is EXCLUDED
+    // (never derived; reverse-modifier default stands at all depths). §C, B.4.
+    if depth == Depth::Ansi16 {
+        if let Color::Rgb { .. } = t.base_bg {
+            let canvas_q = theme::quantize(t.base_bg, Depth::Ansi16);
+            if canvas_q == Color::Black {
+                // Dark canvas arm: Chrome/Overlay → DarkGray bg White fg; Selected → Black/White;
+                // Muted → White dim; Accent → White bold.
+                t.override_face(SemanticElement::Chrome,
+                    Face { fg: Some(Color::White), bg: Some(Color::DarkGray), ..Face::default() });
+                t.override_face(SemanticElement::ChromeOverlay,
+                    Face { fg: Some(Color::White), bg: Some(Color::DarkGray), ..Face::default() });
+                t.override_face(SemanticElement::ChromeSelected,
+                    Face { fg: Some(Color::Black), bg: Some(Color::White), ..Face::default() });
+                t.override_face(SemanticElement::ChromeMuted,
+                    Face { fg: Some(Color::White), dim: Some(true), ..Face::default() });
+                t.override_face(SemanticElement::ChromeAccent,
+                    Face { fg: Some(Color::White), bold: Some(true), ..Face::default() });
+            } else {
+                // Light canvas arm: Chrome/Overlay → Black bg White fg; Selected → White/Black;
+                // Muted → White dim; Accent → White bold.
+                t.override_face(SemanticElement::Chrome,
+                    Face { fg: Some(Color::White), bg: Some(Color::Black), ..Face::default() });
+                t.override_face(SemanticElement::ChromeOverlay,
+                    Face { fg: Some(Color::White), bg: Some(Color::Black), ..Face::default() });
+                t.override_face(SemanticElement::ChromeSelected,
+                    Face { fg: Some(Color::Black), bg: Some(Color::White), ..Face::default() });
+                t.override_face(SemanticElement::ChromeMuted,
+                    Face { fg: Some(Color::White), dim: Some(true), ..Face::default() });
+                t.override_face(SemanticElement::ChromeAccent,
+                    Face { fg: Some(Color::White), bold: Some(true), ..Face::default() });
+            }
+        }
+    }
+
+    // D1 resolve order step 3: per-element style overrides. On a MONOCHROME theme (cue mode
+    // by theme), color fields are dropped (modifiers still apply) so an override can't defeat
+    // the §4 cue discipline (Codex C2). Note: depth==None always yields a monochrome theme
     // via no_color(), so the C2 scrub ALSO covers that path (doubly protected) —
     // do NOT remove this check. A non-monochrome theme keeps colors.
+    // User chrome overrides land LAST — over the Ansi16 depth policy (Codex plan r1 I1).
     for (key, rf) in &tc.styles {
         match theme::element_from_key(key) {
             Some(el) => {
@@ -140,7 +212,7 @@ pub fn resolve_theme(tc: &ThemeConfig, env: &EnvSnapshot) -> ResolvedTheme {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wordcartel_core::theme::Depth;
+    use wordcartel_core::theme::{Depth, ChromeDisposition};
 
     #[test]
     fn detect_depth_rules() {
@@ -193,7 +265,7 @@ mod tests {
     #[test]
     fn resolve_builtin_name() {
         let tc = ThemeConfig { name: Some("tokyo-night".into()), ..Default::default() };
-        let r = resolve_theme(&tc, &env(false));
+        let r = resolve_theme(&tc, &env(false), ChromeDisposition::Full);
         assert_eq!(r.theme.name, "tokyo-night");
         assert_eq!(r.depth, Depth::Truecolor);
         assert!(r.warnings.is_empty());
@@ -202,8 +274,8 @@ mod tests {
     #[test]
     fn resolve_unknown_name_falls_back_with_warning() {
         let tc = ThemeConfig { name: Some("nope".into()), ..Default::default() };
-        let r = resolve_theme(&tc, &env(false));
-        // fallback calls theme::default() whose name is now "terminal-plain" (D5)
+        let r = resolve_theme(&tc, &env(false), ChromeDisposition::Full);
+        // fallback calls theme::default() whose name is "terminal-plain" (D5)
         assert_eq!(r.theme.name, "terminal-plain");
         assert!(r.warnings.iter().any(|w| w.contains("nope")));
     }
@@ -211,7 +283,7 @@ mod tests {
     #[test]
     fn no_color_forces_no_color_theme_and_none_depth() {
         let tc = ThemeConfig { name: Some("tokyo-night".into()), ..Default::default() };
-        let r = resolve_theme(&tc, &env(true)); // NO_COLOR set
+        let r = resolve_theme(&tc, &env(true), ChromeDisposition::Full); // NO_COLOR set
         assert_eq!(r.depth, Depth::None);
         assert_eq!(r.theme.name, "no-color");
         assert!(r.theme.monochrome);
@@ -225,29 +297,154 @@ mod tests {
         styles.insert("heading1".to_string(), RawFace { fg: Some("not-a-color".into()), bold: Some(true), ..Default::default() });
         styles.insert("bogus_key".to_string(), RawFace { fg: Some("#ffffff".into()), ..Default::default() });
         let tc = ThemeConfig { name: Some("default".into()), styles, ..Default::default() };
-        let r = resolve_theme(&tc, &env(false));
+        let r = resolve_theme(&tc, &env(false), ChromeDisposition::Full);
         // good override applied
         assert_eq!(r.theme.face(SemanticElement::Selection).bg, Some(Color::Rgb { r:0x28, g:0x34, b:0x57 }));
         // partial: bold applied even though fg was bad
         assert_eq!(r.theme.face(SemanticElement::Heading(1)).bold, Some(true));
-        // warnings for the bad hex AND the unknown key
+        // warnings for the bad hex AND the unknown key (and the "default" alias)
         assert!(r.warnings.iter().any(|w| w.contains("not-a-color") || w.contains("heading1")));
         assert!(r.warnings.iter().any(|w| w.contains("bogus_key")));
     }
 
     // C2 invariant: monochrome theme must strip color overrides and keep modifiers.
-    // This test FAILS if the scrub block (lines ~127-130 in resolve_theme) is removed
-    // or the condition is inverted.
+    // This test FAILS if the scrub block in resolve_theme is removed or the condition is inverted.
     #[test]
     fn monochrome_theme_strips_color_overrides_but_keeps_modifiers() {
         let mut styles = std::collections::BTreeMap::new();
         styles.insert("heading1".to_string(),
             RawFace { fg: Some("#ff0000".into()), bold: Some(true), ..Default::default() });
         let tc = ThemeConfig { styles, ..Default::default() };
-        let r = resolve_theme(&tc, &env(true)); // NO_COLOR → no_color() → monochrome
+        let r = resolve_theme(&tc, &env(true), ChromeDisposition::Full); // NO_COLOR → no_color() → monochrome
         assert!(r.theme.monochrome);
         assert_eq!(r.theme.face(SemanticElement::Heading(1)).fg, None, "color stripped in cue mode");
         assert_eq!(r.theme.face(SemanticElement::Heading(1)).bold, Some(true), "modifier preserved");
         assert!(r.warnings.iter().any(|w| w.contains("heading1")), "cue-mode strip warning emitted");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 3: chrome axis — disposition, Ansi16 policy, aliases, launch default
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn no_config_resolves_flexoki_dark() {
+        // Empty ThemeConfig (no name, no file) → launch default = flexoki-dark (D5).
+        let r = resolve_theme(&ThemeConfig::default(), &env(false), ChromeDisposition::Full);
+        assert_eq!(r.theme.name, "flexoki-dark");
+    }
+
+    #[test]
+    fn no_color_env_still_wins() {
+        // NO_COLOR + empty config → no-color theme (Depth::None wins over the launch default).
+        let r = resolve_theme(&ThemeConfig::default(), &env(true), ChromeDisposition::Full);
+        assert_eq!(r.theme.name, "no-color");
+        assert_eq!(r.depth, Depth::None);
+    }
+
+    #[test]
+    fn default_name_aliases_with_warning() {
+        // name="default" → alias to "terminal-plain" + warning containing "default".
+        let tc = ThemeConfig { name: Some("default".into()), ..Default::default() };
+        let r = resolve_theme(&tc, &env(false), ChromeDisposition::Full);
+        assert_eq!(r.theme.name, "terminal-plain");
+        assert!(r.warnings.iter().any(|w| w.contains("default")),
+            "warning about 'default' alias must be emitted");
+    }
+
+    #[test]
+    fn flat_name_falls_back_with_warning() {
+        // name="phosphor-amber-flat" → removed; falls back to "phosphor-amber" + warning.
+        let tc = ThemeConfig { name: Some("phosphor-amber-flat".into()), ..Default::default() };
+        let r = resolve_theme(&tc, &env(false), ChromeDisposition::Full);
+        assert_eq!(r.theme.name, "phosphor-amber",
+            "phosphor-amber-flat must resolve to phosphor-amber base");
+        assert!(r.warnings.iter().any(|w| w.contains("flat")),
+            "warning about removed flat name must be emitted");
+    }
+
+    #[test]
+    fn chrome_key_parses_and_derives() {
+        // parse_chrome: "zen" → Zen; the Zen flexoki-dark Chrome bg matches §B.3.
+        let (disp, warn) = parse_chrome(&Some("zen".into()));
+        assert_eq!(disp, ChromeDisposition::Zen);
+        assert!(warn.is_none(), "known key 'zen' must not warn");
+
+        let tc = ThemeConfig { name: Some("flexoki-dark".into()), ..Default::default() };
+        let r = resolve_theme(&tc, &env(false), disp);
+        // §B.3 ZEN flexoki-dark Chrome bg = #0f0e0e
+        assert_eq!(r.theme.face(SemanticElement::Chrome).bg,
+            Some(Color::Rgb { r:0x0f, g:0x0e, b:0x0e }),
+            "flexoki-dark Zen Chrome bg must match §B.3 probe value");
+    }
+
+    #[test]
+    fn unknown_chrome_warns_full() {
+        // Unknown chrome string → Full disposition + warning.
+        let (disp, warn) = parse_chrome(&Some("invalid".into()));
+        assert_eq!(disp, ChromeDisposition::Full);
+        let w = warn.expect("unknown chrome value must produce a warning");
+        assert!(w.contains("invalid"), "warning must name the unknown value");
+    }
+
+    #[test]
+    fn ansi16_policy_replaces_derived_chrome() {
+        // flexoki-dark @ Ansi16: canvas #100f0f → Black → DarkGray arm.
+        // Chrome bg = DarkGray, fg = White (≠ canvas Black).
+        let tc = ThemeConfig {
+            name: Some("flexoki-dark".into()),
+            depth: Some("16".into()),
+            ..Default::default()
+        };
+        let r = resolve_theme(&tc, &env(false), ChromeDisposition::Full);
+        assert_eq!(r.depth, Depth::Ansi16);
+        assert_eq!(r.theme.face(SemanticElement::Chrome).bg, Some(Color::DarkGray),
+            "Ansi16 dark-canvas policy: Chrome bg must be DarkGray");
+        assert_eq!(r.theme.face(SemanticElement::Chrome).fg, Some(Color::White),
+            "Ansi16 dark-canvas policy: Chrome fg must be White");
+        // Canvas itself is Black (not DarkGray) — the separation is the policy's purpose.
+        assert_eq!(theme::quantize(r.theme.base_bg, Depth::Ansi16), Color::Black,
+            "flexoki-dark canvas quantizes to Black at Ansi16");
+
+        // flexoki-light @ Ansi16: canvas #fffcf0 → White → Black arm.
+        let tc2 = ThemeConfig {
+            name: Some("flexoki-light".into()),
+            depth: Some("16".into()),
+            ..Default::default()
+        };
+        let r2 = resolve_theme(&tc2, &env(false), ChromeDisposition::Full);
+        assert_eq!(r2.theme.face(SemanticElement::Chrome).bg, Some(Color::Black),
+            "Ansi16 light-canvas policy: Chrome bg must be Black");
+        assert_eq!(r2.theme.face(SemanticElement::Chrome).fg, Some(Color::White),
+            "Ansi16 light-canvas policy: Chrome fg must be White");
+
+        // tokyo-night @ Ansi16: canvas #1a1b26 → Black → DarkGray arm.
+        // The explicit PANEL_BG #16161e is overwritten by the Ansi16 policy.
+        let tc3 = ThemeConfig {
+            name: Some("tokyo-night".into()),
+            depth: Some("16".into()),
+            ..Default::default()
+        };
+        let r3 = resolve_theme(&tc3, &env(false), ChromeDisposition::Full);
+        assert_eq!(r3.theme.face(SemanticElement::Chrome).bg, Some(Color::DarkGray),
+            "Ansi16 policy overwrites tokyo's explicit PANEL_BG with DarkGray");
+    }
+
+    #[test]
+    fn user_styles_override_ansi16_policy() {
+        // User [theme.styles] chrome override lands AFTER the Ansi16 policy — order pin.
+        let mut styles = std::collections::BTreeMap::new();
+        styles.insert("chrome".to_string(),
+            RawFace { bg: Some("#ff0000".into()), ..Default::default() });
+        let tc = ThemeConfig {
+            name: Some("flexoki-dark".into()),
+            depth: Some("16".into()),
+            styles,
+            ..Default::default()
+        };
+        let r = resolve_theme(&tc, &env(false), ChromeDisposition::Full);
+        // Policy would set Chrome bg to DarkGray, but user override replaces it with #ff0000.
+        assert_eq!(r.theme.face(SemanticElement::Chrome).bg,
+            Some(Color::Rgb { r:0xff, g:0x00, b:0x00 }),
+            "user chrome style override must land after the Ansi16 policy");
     }
 }

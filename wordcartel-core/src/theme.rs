@@ -152,7 +152,7 @@ impl Theme {
     }
     pub fn builtin(name: &str) -> Option<Theme> {
         match name {
-            "terminal-plain" | "default" => Some(default()), // "default" alias — warn in T3
+            "terminal-plain" => Some(default()),
             "terminal-ansi" => Some(terminal_ansi()),
             "no-color" => Some(no_color()),
             "tokyo-night" => Some(tokyo_night()),
@@ -1185,12 +1185,9 @@ mod tests {
         assert!(!t.monochrome);
         assert_eq!(t.face(SemanticElement::Chrome).fg, Some(Color::White));
         assert_eq!(t.face(SemanticElement::Chrome).bg, Some(Color::Black));
-        // builtin("terminal-plain") and builtin("default") both return terminal-plain
+        // builtin("terminal-plain") returns terminal-plain; "default" alias lives in resolve_theme (T3).
         let b1 = Theme::builtin("terminal-plain").unwrap();
-        let b2 = Theme::builtin("default").unwrap();
         assert_eq!(b1.name, "terminal-plain");
-        assert_eq!(b2.name, "terminal-plain");
-        assert_eq!(b1.faces, b2.faces, "alias produces identical theme");
         // non-Rgb bases → derive is a no-op (derive_skips_non_rgb_bases also covers this)
         let before = t.faces.clone();
         let mut t2 = t;

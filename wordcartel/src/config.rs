@@ -47,6 +47,7 @@ pub struct ThemeConfig {
     pub name: Option<String>,
     pub file: Option<PathBuf>,           // ~-expanded, resolved relative to declaring config
     pub depth: Option<String>,           // "truecolor"|"256"|"16"|"none"
+    pub chrome: Option<String>,          // "full"|"zen" — parsed at resolve
     pub heading_level_glyph: Option<bool>,
     pub styles: BTreeMap<String, RawFace>,
 }
@@ -207,6 +208,7 @@ struct RawTheme {
     name: Option<String>,
     file: Option<String>,
     depth: Option<String>,
+    chrome: Option<String>,
     heading_level_glyph: Option<bool>,
     styles: BTreeMap<String, RawFace>,
 }
@@ -445,6 +447,7 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
             (None, None) => {} // neither set this layer → inherit accumulated
         }
         if let Some(d) = rt.depth { cfg.theme.depth = Some(d); }
+        if let Some(c) = rt.chrome { cfg.theme.chrome = Some(c); }
         if let Some(h) = rt.heading_level_glyph { cfg.theme.heading_level_glyph = Some(h); }
         for (k, v) in rt.styles { cfg.theme.styles.insert(k, v); } // accumulate across layers
     }
@@ -828,7 +831,8 @@ mod tests {
         // Use the default resolved theme name (tests run without a real env, so
         // resolve_theme falls back to the default theme — name = "terminal-plain").
         let env = crate::theme_resolve::EnvSnapshot::from_env();
-        let baseline_resolved = crate::theme_resolve::resolve_theme(&baseline_cfg.theme, &env);
+        let baseline_resolved = crate::theme_resolve::resolve_theme(
+            &baseline_cfg.theme, &env, wordcartel_core::theme::ChromeDisposition::Full);
         let baseline = snapshot_of(&baseline_cfg, &baseline_resolved.theme.name);
 
         // Runtime snapshot: six divergences — keymap → wordstar, typewriter on,

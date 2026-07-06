@@ -1309,7 +1309,11 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     editor.active_keymap_preset = keymap::resolve_preset(&cfg.keymap.preset).to_string();
     // Resolve and seed the active theme + color depth (once, at startup — §3.6).
     let env = crate::theme_resolve::EnvSnapshot::from_env();
-    let resolved = crate::theme_resolve::resolve_theme(&cfg.theme, &env);
+    // Parse the chrome disposition from config; seed editor field; pass to resolve.
+    let (chrome_disp, chrome_warn) = crate::theme_resolve::parse_chrome(&cfg.theme.chrome);
+    if let Some(w) = chrome_warn { warns.push(w); }
+    editor.chrome_disposition = chrome_disp;
+    let resolved = crate::theme_resolve::resolve_theme(&cfg.theme, &env, chrome_disp);
     editor.theme = resolved.theme;
     editor.depth = resolved.depth;
     editor.heading_glyph_cfg = cfg.theme.heading_level_glyph; // for runtime picker switches (Task 7)
@@ -1317,7 +1321,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
 
     // D1+A5 Task 4: baseline resolve (WITHOUT the overrides layer) + three snapshots.
     // baseline_cfg was loaded above from hand_paths only; the overrides file is NOT in it.
-    let baseline_resolved = crate::theme_resolve::resolve_theme(&baseline_cfg.theme, &env);
+    let baseline_resolved = crate::theme_resolve::resolve_theme(
+        &baseline_cfg.theme, &env, wordcartel_core::theme::ChromeDisposition::Full);
     let baseline_snapshot = settings::snapshot_of(&baseline_cfg, &baseline_resolved.theme.name);
     // Overrides snapshot: the current machine-owned file (all-absent when the file doesn't exist).
     let mut overrides_snapshot = overrides_path.as_ref()
