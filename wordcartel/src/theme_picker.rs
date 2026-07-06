@@ -106,7 +106,7 @@ mod tests {
 
     /// T7 pin: `preview_selected_theme` derives chrome using `editor.chrome_disposition`
     /// before `apply_theme` (grounding A.9 / D3). Under Zen disposition, flexoki-dark's
-    /// Chrome bg must equal the §B.3 probe-generated ZEN Chrome bg (#0f0e0e).
+    /// Chrome bg must equal the §II.5 probe-generated ZEN Chrome bg (#1e1c1c).
     ///
     /// The >= 19 count pin lives in `rebuild_rows_filters_builtins` (T2 — not duplicated here).
     #[test]
@@ -128,12 +128,12 @@ mod tests {
         ed.theme_picker.as_mut().unwrap().selected = 11;
         // preview_selected_theme is the single funnel (A.9): derives before apply_theme.
         crate::app::preview_selected_theme(&mut ed);
-        // §B.3 probe-generated: flexoki-dark ZEN Chrome bg = #0f0e0e.
+        // §II.5 probe-generated: flexoki-dark ZEN Chrome bg = #1e1c1c.
         let chrome_bg = ed.theme.face(SemanticElement::Chrome).bg;
         assert_eq!(
             chrome_bg,
-            Some(Color::Rgb { r: 0x0f, g: 0x0e, b: 0x0e }),
-            "preview under Zen must install ZEN Chrome bg #0f0e0e for flexoki-dark (§B.3); got {:?}",
+            Some(Color::Rgb { r: 0x1e, g: 0x1c, b: 0x1c }),
+            "preview under Zen must install ZEN Chrome bg #1e1c1c for flexoki-dark (§II.5); got {:?}",
             chrome_bg,
         );
     }

@@ -2654,7 +2654,7 @@ mod tests {
     }
 
     /// D2: under tokyo-night with the palette open, every interior cell (not on the
-    /// border perimeter, not the selected row) must carry the ChromeOverlay bg (#2f303a).
+    /// border perimeter, not the selected row) must carry the ChromeOverlay bg.
     /// No cell inside the overlay should have the terminal-default bg.
     #[test]
     fn tokyo_overlay_interior_is_themed() {
@@ -2669,9 +2669,10 @@ mod tests {
         let buf = render_to_buffer(&mut ed, 80, 20);
 
         let fill_bg = compose::compose(&ed.theme, ed.depth, &[SE::ChromeOverlay]).bg;
-        // §B.3 pin: tokyo FULL ChromeOverlay = #2f303a.
-        assert_eq!(fill_bg, Some(Color::Rgb(0x2f, 0x30, 0x3a)),
-            "tokyo-night FULL ChromeOverlay must be #2f303a");
+        // tokyo FULL ChromeOverlay — T1 INTERMEDIATE (#2a2c3e): chrome is still explicit at T1,
+        // so overlay derives from it via the new elevation ladder; finalizes to §II.5 #4e5071 in T3.
+        assert_eq!(fill_bg, Some(Color::Rgb(0x2a, 0x2c, 0x3e)),
+            "tokyo-night FULL ChromeOverlay (T1 intermediate) must be #2a2c3e");
 
         let n_rows = ed.palette.as_ref().unwrap().rows.len();
         let ov_rect = palette_overlay_rect(ratatui::layout::Rect::new(0, 0, 80, 20), n_rows);

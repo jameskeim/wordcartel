@@ -215,6 +215,14 @@ impl Theme {
     /// sentinel): `chrome`, `chrome_selected`, `chrome_muted`, `chrome_overlay`, `chrome_accent`.
     /// `chrome_reverse` is **never** derived — it stays the reverse-modifier default.
     ///
+    /// The bg stack is a unified HSL-lightness **elevation** ladder: each panel keeps the canvas
+    /// hue (and saturation, capped only on light canvases) and grows its lightness from the layer
+    /// beneath toward the headroom pole (white on dark themes, black on light) until it clears the
+    /// adjacent-layer WCAG contrast target — `FULL_STEP_CR` at full, `SEP_FLOOR_CR` at zen. The
+    /// stack is strictly ordered `canvas < bar < dropdown < overlay` by construction. Each chrome
+    /// fg is re-derived via a legibility floor (`FG_FLOOR`, pole-capped): the body-text color is
+    /// kept when it already clears the floor, else nudged toward the headroom pole.
+    ///
     /// Early-returns without change if either base is not `Color::Rgb`. Callers should call on a
     /// fresh theme instance before applying user overrides (resolve order: base → derive → styles).
     /// A second call on an already-derived theme is a no-op (non-sentinel faces are skipped).
@@ -228,70 +236,90 @@ impl Theme {
         let base_fg = Color::Rgb { r: fgr, g: fgg, b: fgb };
 
         let is_dark = rel_lum(bgr, bgg, bgb) < 0.5;
-        let z = match disp { ChromeDisposition::Full => 1.0f32, ChromeDisposition::Zen => ZEN_COLLAPSE };
+        // Elevate toward the pole with headroom: white on dark canvases, black on light.
+        let pole = if is_dark { (255u8, 255u8, 255u8) } else { (0u8, 0u8, 0u8) };
+        let headroom = Color::Rgb { r: pole.0, g: pole.1, b: pole.2 };
+        // Panels preserve the canvas hue; saturation is capped on LIGHT canvases ONLY — a
+        // uniform cap would wash out phosphor/solarized-dark tint (grounding §II.7).
+        let (canvas_h, canvas_s, _canvas_l) = rgb_to_hsl(bgr, bgg, bgb);
+        let panel_s = if is_dark { canvas_s } else { canvas_s.min(CHROME_PANEL_S_CAP) };
+        // full vs zen = the same algorithm, different adjacent-layer CR target.
+        let target = match disp {
+            ChromeDisposition::Full => FULL_STEP_CR,
+            ChromeDisposition::Zen  => SEP_FLOOR_CR,
+        };
 
-        let bar_pct     = if is_dark { CHROME_BAR_PCT_DARK  } else { CHROME_BAR_PCT_LIGHT  } * z;
-        let overlay_pct = if is_dark { CHROME_OVERLAY_PCT_DARK } else { CHROME_OVERLAY_PCT_LIGHT } * z;
-        let deep_pct    = if is_dark { CHROME_DEEP_PCT_DARK } else { CHROME_DEEP_PCT_LIGHT } * z;
-
-        let black = (0u8, 0u8, 0u8);
-        let white = (255u8, 255u8, 255u8);
-        let ov_pole = if is_dark { white } else { black };
-
-        // contrast threshold: WCAG AA 4.5, capped by the theme's own fg-vs-canvas ratio
-        let own_cr = contrast_ratio(base_fg, base_bg);
-        let threshold = own_cr.min(4.5_f32);
-
-        // clamp_blend: shrink pct by 0.005 per step until contrast >= threshold - 0.001 (tolerance)
-        let clamp_blend = |initial_pct: f32, pole: (u8, u8, u8)| -> Color {
-            let mut pct = initial_pct;
+        // next_layer — grow a panel from the LIGHTNESS of the layer beneath toward the
+        // headroom pole (preserving canvas H and the possibly-capped panel S) until it
+        // clears `target` WCAG contrast against that layer. Any step finer than one u8 of
+        // lightness lands on the first u8-quantized panel clearing the target (§II.5 pins).
+        let next_layer = |beneath: Color, target: f32| -> Color {
+            let start_l = match beneath {
+                Color::Rgb { r, g, b } => rgb_to_hsl(r, g, b).2,
+                _ => return beneath,
+            };
+            let mut extra = 0.0f32;
             loop {
-                if pct <= 0.0 { return base_bg; }
-                let rung = blend(base_bg, pole, pct);
-                if contrast_ratio(base_fg, rung) >= threshold - 0.001 { return rung; }
-                pct -= 0.005;
+                let l = if is_dark { (start_l + extra).min(1.0) } else { (start_l - extra).max(0.0) };
+                let (r, g, b) = hsl_to_rgb(canvas_h, panel_s, l);
+                let cand = Color::Rgb { r, g, b };
+                if contrast_ratio(cand, beneath) >= target - CR_TOL { return cand; }
+                if (is_dark && l >= 1.0) || (!is_dark && l <= 0.0) { return cand; }
+                extra += LAYER_L_STEP;
             }
         };
 
-        // ── Chrome ──────────────────────────────────────────────────────────────────
+        // derive_fg — legibility floor (A-D3). Returns `seed` unchanged when it already
+        // clears the floor (the common case — chrome text keeps body-text identity); else
+        // nudges toward the headroom pole. The floor is capped by the pole-vs-panel max CR
+        // so a mid-luminance panel always terminates (at the pole in the worst case).
+        let derive_fg = |seed: Color, panel: Color| -> Color {
+            let floor = FG_FLOOR.min(contrast_ratio(headroom, panel));
+            if contrast_ratio(seed, panel) >= floor - CR_TOL { return seed; }
+            let mut pct = 0.0f32;
+            loop {
+                pct += FG_NUDGE_STEP;
+                let cand = blend(seed, pole, pct);
+                if contrast_ratio(cand, panel) >= floor - CR_TOL || pct >= 1.0 { return cand; }
+            }
+        };
+
+        // ── Chrome (bar — elevated from the canvas) ──────────────────────────────────
         if self.faces.chrome == Face::default() {
-            let bg = clamp_blend(bar_pct, black);
-            self.faces.chrome = Face { fg: Some(base_fg), bg: Some(bg), ..Face::default() };
+            let bg = next_layer(base_bg, target);
+            self.faces.chrome = Face { fg: Some(derive_fg(base_fg, bg)), bg: Some(bg), ..Face::default() };
         }
+        let bar_bg = self.faces.chrome.bg.unwrap_or(base_bg);
 
-        // ── ChromeOverlay ───────────────────────────────────────────────────────────
+        // ── ChromeMuted (dropdown — elevated from the bar) ───────────────────────────
+        if self.faces.chrome_muted == Face::default() {
+            let bg = next_layer(bar_bg, target);
+            let muted_seed = blend(base_fg, (bgr, bgg, bgb), MUTED_FG_BLEND);
+            self.faces.chrome_muted = Face {
+                fg: Some(derive_fg(muted_seed, bg)), bg: Some(bg), dim: Some(true), ..Face::default()
+            };
+        }
+        let drop_bg = self.faces.chrome_muted.bg.unwrap_or(bar_bg);
+
+        // ── ChromeOverlay (overlay — elevated from the dropdown) ─────────────────────
         if self.faces.chrome_overlay == Face::default() {
-            let bg = clamp_blend(overlay_pct, ov_pole);
-            self.faces.chrome_overlay = Face { fg: Some(base_fg), bg: Some(bg), ..Face::default() };
+            let bg = next_layer(drop_bg, target);
+            self.faces.chrome_overlay = Face { fg: Some(derive_fg(base_fg, bg)), bg: Some(bg), ..Face::default() };
         }
 
-        // ── ChromeSelected ──────────────────────────────────────────────────────────
+        // ── ChromeSelected (inverted highlight — unchanged) ──────────────────────────
         if self.faces.chrome_selected == Face::default() {
             self.faces.chrome_selected = Face { fg: Some(base_bg), bg: Some(base_fg), ..Face::default() };
         }
 
-        // ── ChromeMuted ─────────────────────────────────────────────────────────────
-        if self.faces.chrome_muted == Face::default() {
-            let bg = clamp_blend(deep_pct, black);
-            let muted_fg = blend(base_fg, (bgr, bgg, bgb), MUTED_FG_BLEND);
-            self.faces.chrome_muted = Face {
-                fg: Some(muted_fg), bg: Some(bg), dim: Some(true), ..Face::default()
-            };
-        }
-
-        // ── ChromeAccent ────────────────────────────────────────────────────────────
-        // bg = Chrome.bg (read the now-resolved chrome face); fg = seed desaturated toward equal-lum gray.
-        // seed = link fg (colored on every base16 + tokyo); fallback = base_fg.
+        // ── ChromeAccent (accent fg on the elevated bar bg — fg path unchanged from E3) ─
         if self.faces.chrome_accent == Face::default() {
             let accent_bg = self.faces.chrome.bg.unwrap_or(base_bg);
             let seed = self.faces.link.fg.unwrap_or(base_fg);
-            // The gray is derived once from the seed; both the initial desat and the zen
-            // extra blend use the SAME gray target (equal_lum_gray of the original seed).
             let gray = equal_lum_gray(seed);
             let mut accent_fg = blend(seed, gray, ACCENT_DESAT);
-            // zen: extra 0.40 blend toward the same seed-derived gray (convention 3)
             if disp == ChromeDisposition::Zen {
-                accent_fg = blend(accent_fg, gray, 0.40);
+                accent_fg = blend(accent_fg, gray, ZEN_ACCENT_EXTRA);
             }
             self.faces.chrome_accent = Face {
                 fg: Some(accent_fg), bg: Some(accent_bg), bold: Some(true), ..Face::default()
@@ -331,18 +359,19 @@ fn modface(fg: Option<Color>, bold: bool, italic: bool, underline: bool, strike:
            reverse: reverse.then_some(true), ..Face::default() }
 }
 
-// ── Chrome derivation — fraction constants ────────────────────────────────────────────────────
-// Calibrated against: tokyo #16161e≈18% toward black, mocha mantle ≈20%, latte mantle ≈3.2%,
-// mocha crust ≈43%, latte crust ≈11%. One probe-solved set; see grounding §B.1.
-const CHROME_BAR_PCT_DARK:     f32 = 0.18;
-const CHROME_BAR_PCT_LIGHT:    f32 = 0.035;
-const CHROME_OVERLAY_PCT_DARK: f32 = 0.09;
-const CHROME_OVERLAY_PCT_LIGHT: f32 = 0.075;
-const CHROME_DEEP_PCT_DARK:    f32 = 0.43;
-const CHROME_DEEP_PCT_LIGHT:   f32 = 0.11;
-const MUTED_FG_BLEND: f32 = 0.35;   // muted fg = blend(base_fg, base_bg, 0.35)
+// ── Chrome derivation — elevation constants (grounding §II.2, probe-calibrated) ──────
+// full and zen are the SAME elevation algorithm with different adjacent-layer CR targets —
+// guaranteeing full ≠ zen on every theme.
+const SEP_FLOOR_CR:  f32 = 1.12;  // zen  — each layer clears CR ≥ 1.12 vs the layer beneath
+const FULL_STEP_CR:  f32 = 1.30;  // full — each layer clears CR ≥ 1.30 vs the layer beneath
+const FG_FLOOR:      f32 = 4.5;   // each chrome fg clears 4.5 vs its own panel (pole-capped)
+const CHROME_PANEL_S_CAP: f32 = 0.35; // elevated-panel S = min(canvas_S, 0.35); LIGHT canvases only
+const LAYER_L_STEP:  f32 = 0.002; // panel-lightness search granularity (matches the §II calibration probe)
+const FG_NUDGE_STEP: f32 = 0.01;  // fg legibility-nudge granularity (matches the §II calibration probe)
+const CR_TOL:        f32 = 0.0005; // adjacent-CR / fg-floor acceptance tolerance (calibration probe)
+const MUTED_FG_BLEND: f32 = 0.35;   // muted fg seed = blend(base_fg, base_bg, 0.35), then nudged
 const ACCENT_DESAT:   f32 = 0.50;   // accent fg = blend(seed, equal_lum_gray(seed), 0.50)
-const ZEN_COLLAPSE:   f32 = 0.35;   // zen multiplies each bg step; accent gets +0.40 extra
+const ZEN_ACCENT_EXTRA: f32 = 0.40; // zen: extra blend of the accent fg toward the same gray
 
 /// Per-channel linear interpolation toward `pole` at fraction `pct`.
 /// `blend(base, pole, 0.0) == base`; `blend(base, pole, 1.0) == pole (rgb)`.
@@ -889,6 +918,16 @@ const PHOSPHORS: [(&str, Color); 5] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Test-only type aliases (keep the chrome-pin tables readable; satisfy clippy::type_complexity).
+    type Rgb8 = (u8, u8, u8);
+    // One row of the §II.5 chrome-pin table: constructor, disposition, then bg/fg for
+    // Chrome / ChromeMuted / ChromeOverlay / ChromeSelected / ChromeAccent, plus a label.
+    type ChromePinRow = (fn() -> Theme, ChromeDisposition,
+                         Rgb8, Rgb8, Rgb8, Rgb8, Rgb8, Rgb8, Rgb8, Rgb8, Rgb8, Rgb8, &'static str);
+    // One row of the Indexed256 rung table: constructor, label, canvas/chrome/muted/overlay indices.
+    type RungRow = (fn() -> Theme, &'static str, u8, u8, u8, u8);
+
     #[test]
     fn face_default_is_all_none() {
         let f = Face::default();
@@ -1080,37 +1119,32 @@ mod tests {
 
     #[test]
     fn derived_rungs_distinct_at_256() {
-        // §B.5 corrected indices. flexoki-dark: Chrome+Muted collapse on canvas; only Overlay distinct.
-        let mut t = from_base16("flexoki-dark", flexoki_dark_palette());
-        t.derive_chrome(ChromeDisposition::Full);
-        let canvas  = quantize(t.base_bg, Depth::Indexed256);
-        let chrome  = quantize(t.face(SemanticElement::Chrome).bg.unwrap(),        Depth::Indexed256);
-        let overlay = quantize(t.face(SemanticElement::ChromeOverlay).bg.unwrap(), Depth::Indexed256);
-        let muted   = quantize(t.face(SemanticElement::ChromeMuted).bg.unwrap(),   Depth::Indexed256);
-        assert_eq!(canvas,  Color::Indexed(232), "flexoki-dark canvas → 232");
-        assert_eq!(chrome,  Color::Indexed(232), "flexoki-dark chrome collapses onto canvas at 256");
-        assert_eq!(overlay, Color::Indexed(234), "flexoki-dark overlay distinct at 256");
-        assert_eq!(muted,   Color::Indexed(232), "flexoki-dark muted collapses onto canvas at 256");
-
-        // catppuccin-mocha: Chrome collapses onto canvas; Overlay distinct.
-        let mut t2 = from_base16("mocha", mocha_palette());
-        t2.derive_chrome(ChromeDisposition::Full);
-        let canvas2  = quantize(t2.base_bg, Depth::Indexed256);
-        let chrome2  = quantize(t2.face(SemanticElement::Chrome).bg.unwrap(),        Depth::Indexed256);
-        let overlay2 = quantize(t2.face(SemanticElement::ChromeOverlay).bg.unwrap(), Depth::Indexed256);
-        assert_eq!(canvas2,  Color::Indexed(234), "mocha canvas → 234");
-        assert_eq!(chrome2,  Color::Indexed(234), "mocha chrome collapses onto canvas at 256");
-        assert_eq!(overlay2, Color::Indexed(236), "mocha overlay distinct at 256");
-
-        // gruvbox-dark: Chrome distinct from canvas at 256 (grounding §B.5 row 3).
-        let mut t3 = from_base16("gruvbox-dark", sample_base16());
-        t3.derive_chrome(ChromeDisposition::Full);
-        let canvas3  = quantize(t3.base_bg, Depth::Indexed256);
-        let chrome3  = quantize(t3.face(SemanticElement::Chrome).bg.unwrap(),        Depth::Indexed256);
-        let overlay3 = quantize(t3.face(SemanticElement::ChromeOverlay).bg.unwrap(), Depth::Indexed256);
-        assert_eq!(canvas3,  Color::Indexed(235), "gruvbox-dark canvas → 235");
-        assert_eq!(chrome3,  Color::Indexed(234), "gruvbox-dark chrome → 234 (distinct from canvas)");
-        assert_eq!(overlay3, Color::Indexed(237), "gruvbox-dark overlay → 237");
+        // New model: elevated rungs do NOT collapse onto the canvas index — each is distinct and
+        // ordered toward the headroom pole. Indices regenerated by quantizing the shipped truecolor
+        // rungs at Depth::Indexed256 (probe). Uses the REAL constructors so the pinned indices match
+        // §II.5's themes.
+        let expect: &[RungRow] = &[
+            (flexoki_dark,     "flexoki-dark", 232, 235, 237, 238),
+            (catppuccin_mocha, "mocha",        234, 236, 238,  60),
+            (gruvbox_dark,     "gruvbox-dark", 235, 237, 238,  59),
+        ];
+        for &(ctor, label, ci, chi, mi, oi) in expect {
+            let mut t = ctor();
+            t.derive_chrome(ChromeDisposition::Full);
+            let q = |c: Color| quantize(c, Depth::Indexed256);
+            let canvas  = q(t.base_bg);
+            let chrome  = q(t.face(SemanticElement::Chrome).bg.unwrap());
+            let muted   = q(t.face(SemanticElement::ChromeMuted).bg.unwrap());
+            let overlay = q(t.face(SemanticElement::ChromeOverlay).bg.unwrap());
+            assert_ne!(chrome,  canvas,  "{label}: chrome distinct from canvas at 256 (elevated)");
+            assert_ne!(muted,   chrome,  "{label}: dropdown distinct from bar at 256");
+            assert_ne!(overlay, muted,   "{label}: overlay distinct from dropdown at 256");
+            // exact regenerated indices (probe output):
+            assert_eq!(canvas,  Color::Indexed(ci),  "{label} canvas index");
+            assert_eq!(chrome,  Color::Indexed(chi), "{label} chrome index");
+            assert_eq!(muted,   Color::Indexed(mi),  "{label} muted index");
+            assert_eq!(overlay, Color::Indexed(oi),  "{label} overlay index");
+        }
     }
 
     #[test]
@@ -1286,6 +1320,15 @@ mod tests {
         assert_eq!(face.fg, Some(Color::Rgb { r:fg.0, g:fg.1, b:fg.2 }), "{label} fg");
     }
 
+    // True when the three ladder-panel faces (Chrome/Muted/Overlay) all start as sentinels,
+    // i.e. the theme's whole chrome bg stack is derived. Tokyo carries an EXPLICIT chrome/muted
+    // at T1 (becomes sentinel in T3), so the all-builtins ladder invariants skip it.
+    fn chrome_ladder_is_sentinel(t: &Theme) -> bool {
+        t.face(SemanticElement::Chrome) == Face::default()
+            && t.face(SemanticElement::ChromeMuted) == Face::default()
+            && t.face(SemanticElement::ChromeOverlay) == Face::default()
+    }
+
     // flexoki-dark palette (grounding §C)
     fn flexoki_dark_palette() -> BasePalette {
         base16_palette([
@@ -1296,30 +1339,157 @@ mod tests {
         ])
     }
 
-    // flexoki-light palette (grounding §C)
-    fn flexoki_light_palette() -> BasePalette {
-        base16_palette([
-            (0xff,0xfc,0xf0),(0xf2,0xf0,0xe5),(0xe6,0xe4,0xd9),(0xb7,0xb5,0xac),
-            (0x6f,0x6e,0x69),(0x10,0x0f,0x0f),(0x1c,0x1b,0x1a),(0x28,0x27,0x26),
-            (0xaf,0x30,0x29),(0xbc,0x52,0x15),(0xad,0x83,0x01),(0x66,0x80,0x0b),
-            (0x24,0x83,0x7b),(0x20,0x5e,0xa6),(0x5e,0x40,0x9d),(0xa0,0x2f,0x6f),
-        ])
-    }
-
-    // catppuccin-mocha palette (grounding §C)
-    fn mocha_palette() -> BasePalette {
-        base16_palette([
-            (0x1e,0x1e,0x2e),(0x18,0x18,0x25),(0x31,0x32,0x44),(0x45,0x47,0x5a),
-            (0x58,0x5b,0x70),(0xcd,0xd6,0xf4),(0xf5,0xe0,0xdc),(0xb4,0xbe,0xfe),
-            (0xf3,0x8b,0xa8),(0xfa,0xb3,0x87),(0xf9,0xe2,0xaf),(0xa6,0xe3,0xa1),
-            (0x94,0xe2,0xd5),(0x89,0xb4,0xfa),(0xcb,0xa6,0xf7),(0xf2,0xcd,0xcd),
-        ])
-    }
-
     // phosphor-green bases: canvas=shade(hue,0), fg=shade(hue,3), link=shade(hue,5)
     fn phosphor_green_theme() -> Theme {
         let hue = Color::Rgb { r:0x33, g:0xff, b:0x33 };
         phosphor("phosphor-green", hue)
+    }
+
+    #[test]
+    fn derive_chrome_base16_pins() {
+        // §II.5 — the base16 sentinel-derived chrome, FULL + ZEN, byte-exact.
+        // Bases are stable across the branch, so these pins are final at T1.
+        // Columns: Chrome bg,fg · ChromeMuted bg,fg · ChromeOverlay bg,fg · ChromeSelected bg,fg
+        //          · ChromeAccent bg,fg · label.
+        let cases: &[ChromePinRow] = &[
+            (flexoki_dark, ChromeDisposition::Full,
+             (0x2a,0x28,0x28),(0xce,0xcd,0xc3), (0x3e,0x3a,0x3a),(0xa5,0xa5,0x9f),
+             (0x50,0x4b,0x4b),(0xce,0xcd,0xc3), (0xce,0xcd,0xc3),(0x10,0x0f,0x0f),
+             (0x2a,0x28,0x28),(0x62,0x83,0xa0), "flexoki-dark FULL"),
+            (flexoki_dark, ChromeDisposition::Zen,
+             (0x1e,0x1c,0x1c),(0xce,0xcd,0xc3), (0x28,0x26,0x26),(0x8e,0x8d,0x86),
+             (0x32,0x2f,0x2f),(0xce,0xcd,0xc3), (0xce,0xcd,0xc3),(0x10,0x0f,0x0f),
+             (0x1e,0x1c,0x1c),(0x6e,0x82,0x94), "flexoki-dark ZEN"),
+            (flexoki_light, ChromeDisposition::Full,
+             (0xe5,0xdf,0xc8),(0x10,0x0f,0x0f), (0xcf,0xc4,0x9b),(0x53,0x51,0x4e),
+             (0xba,0xac,0x70),(0x10,0x0f,0x0f), (0x10,0x0f,0x0f),(0xff,0xfc,0xf0),
+             (0xe5,0xdf,0xc8),(0x3f,0x5e,0x82), "flexoki-light FULL"),
+            (flexoki_light, ChromeDisposition::Zen,
+             (0xf2,0xef,0xe4),(0x10,0x0f,0x0f), (0xe7,0xe2,0xce),(0x64,0x62,0x5e),
+             (0xde,0xd6,0xba),(0x10,0x0f,0x0f), (0x10,0x0f,0x0f),(0xff,0xfc,0xf0),
+             (0xf2,0xef,0xe4),(0x4b,0x5e,0x74), "flexoki-light ZEN"),
+            (catppuccin_mocha, ChromeDisposition::Full,
+             (0x31,0x31,0x4a),(0xcd,0xd6,0xf4), (0x42,0x42,0x65),(0xae,0xb2,0xc5),
+             (0x52,0x52,0x7d),(0xcd,0xd6,0xf4), (0xcd,0xd6,0xf4),(0x1e,0x1e,0x2e),
+             (0x31,0x31,0x4a),(0x9e,0xb4,0xd7), "mocha FULL"),
+            (catppuccin_mocha, ChromeDisposition::Zen,
+             (0x27,0x27,0x3c),(0xcd,0xd6,0xf4), (0x2f,0x2f,0x48),(0x92,0x98,0xb1),
+             (0x37,0x37,0x54),(0xcd,0xd6,0xf4), (0xcd,0xd6,0xf4),(0x1e,0x1e,0x2e),
+             (0x27,0x27,0x3c),(0xa6,0xb4,0xc9), "mocha ZEN"),
+            (gruvbox_dark, ChromeDisposition::Full,
+             (0x3b,0x3b,0x3b),(0xd5,0xc4,0xa1), (0x4c,0x4c,0x4c),(0xc2,0xbc,0xaf),
+             (0x5d,0x5d,0x5d),(0xe1,0xd5,0xbb), (0xd5,0xc4,0xa1),(0x28,0x28,0x28),
+             (0x3b,0x3b,0x3b),(0x91,0xa2,0x9b), "gruvbox-dark FULL"),
+            (gruvbox_dark, ChromeDisposition::Zen,
+             (0x31,0x31,0x31),(0xd5,0xc4,0xa1), (0x39,0x39,0x39),(0xab,0xa2,0x8f),
+             (0x41,0x41,0x41),(0xd5,0xc4,0xa1), (0xd5,0xc4,0xa1),(0x28,0x28,0x28),
+             (0x31,0x31,0x31),(0x96,0xa0,0x9c), "gruvbox-dark ZEN"),
+            (solarized_dark, ChromeDisposition::Full,
+             (0x00,0x3f,0x50),(0x97,0xa5,0xa5), (0x00,0x52,0x66),(0xb1,0xbd,0xbf),
+             (0x00,0x64,0x7d),(0xce,0xd5,0xd5), (0x93,0xa1,0xa1),(0x00,0x2b,0x36),
+             (0x00,0x3f,0x50),(0x56,0x89,0xac), "solarized-dark FULL"),
+            (solarized_dark, ChromeDisposition::Zen,
+             (0x00,0x34,0x41),(0x93,0xa1,0xa1), (0x00,0x3d,0x4c),(0x93,0xa3,0xa6),
+             (0x00,0x45,0x56),(0xa0,0xac,0xac), (0x93,0xa1,0xa1),(0x00,0x2b,0x36),
+             (0x00,0x34,0x41),(0x69,0x88,0x9d), "solarized-dark ZEN"),
+            (solarized_light, ChromeDisposition::Full,
+             (0xe2,0xd9,0xc2),(0x4e,0x62,0x68), (0xcd,0xbe,0x97),(0x49,0x4f,0x4e),
+             (0xba,0xa6,0x70),(0x32,0x3f,0x43), (0x58,0x6e,0x75),(0xfd,0xf6,0xe3),
+             (0xe2,0xd9,0xc2),(0x56,0x89,0xac), "solarized-light FULL"),
+            (solarized_light, ChromeDisposition::Zen,
+             (0xee,0xe9,0xdc),(0x57,0x6d,0x74), (0xe4,0xdc,0xc7),(0x5b,0x62,0x61),
+             (0xdb,0xd0,0xb4),(0x4a,0x5c,0x62), (0x58,0x6e,0x75),(0xfd,0xf6,0xe3),
+             (0xee,0xe9,0xdc),(0x69,0x88,0x9d), "solarized-light ZEN"),
+            // gruvbox-light + rosepine-dawn (the other two S-capped light themes; §II.5).
+            (gruvbox_light, ChromeDisposition::Full,
+             (0xdc,0xd5,0xb6),(0x50,0x49,0x45), (0xc7,0xbb,0x8b),(0x4e,0x4a,0x40),
+             (0xb3,0xa3,0x61),(0x3e,0x39,0x36), (0x50,0x49,0x45),(0xfb,0xf1,0xc7),
+             (0xdc,0xd5,0xb6),(0x32,0x62,0x6b), "gruvbox-light FULL"),
+            (gruvbox_light, ChromeDisposition::Zen,
+             (0xe9,0xe4,0xd1),(0x50,0x49,0x45), (0xdf,0xd8,0xbc),(0x63,0x5e,0x52),
+             (0xd5,0xcc,0xa8),(0x50,0x49,0x45), (0x50,0x49,0x45),(0xfb,0xf1,0xc7),
+             (0xe9,0xe4,0xd1),(0x43,0x60,0x65), "gruvbox-light ZEN"),
+            (rosepine_dawn, ChromeDisposition::Full,
+             (0xe4,0xd6,0xc6),(0x57,0x52,0x79), (0xd1,0xbb,0xa0),(0x4f,0x4c,0x59),
+             (0xc0,0xa1,0x7d),(0x3d,0x39,0x55), (0x57,0x52,0x79),(0xfa,0xf4,0xed),
+             (0xe4,0xd6,0xc6),(0x8a,0x7f,0x97), "rosepine-dawn FULL"),
+            (rosepine_dawn, ChromeDisposition::Zen,
+             (0xef,0xe7,0xde),(0x57,0x52,0x79), (0xe6,0xda,0xcc),(0x62,0x5f,0x6e),
+             (0xde,0xcd,0xba),(0x57,0x52,0x79), (0x57,0x52,0x79),(0xfa,0xf4,0xed),
+             (0xef,0xe7,0xde),(0x88,0x81,0x8f), "rosepine-dawn ZEN"),
+        ];
+        for &(ctor, disp,
+               c_bg, c_fg, m_bg, m_fg, o_bg, o_fg, s_bg, s_fg, a_bg, a_fg, label) in cases {
+            let mut t = ctor();
+            t.derive_chrome(disp);
+            assert_face_bg_fg(t.face(SemanticElement::Chrome),         c_bg, c_fg, label);
+            assert_face_bg_fg(t.face(SemanticElement::ChromeMuted),    m_bg, m_fg, label);
+            assert_face_bg_fg(t.face(SemanticElement::ChromeOverlay),  o_bg, o_fg, label);
+            assert_face_bg_fg(t.face(SemanticElement::ChromeSelected), s_bg, s_fg, label);
+            assert_face_bg_fg(t.face(SemanticElement::ChromeAccent),   a_bg, a_fg, label);
+            assert_eq!(t.face(SemanticElement::ChromeMuted).dim, Some(true), "{label} muted dim");
+            assert_eq!(t.face(SemanticElement::ChromeAccent).bold, Some(true), "{label} accent bold");
+        }
+    }
+
+    #[test]
+    fn derive_stack_ordered_and_floored_all_rgb_builtins() {
+        // (a)+(b): for every RGB builtin, at FULL and ZEN, the four-layer stack is strictly
+        // ordered toward the headroom pole AND each adjacent pair clears its CR target.
+        for name in Theme::builtin_names() {
+            let base = Theme::builtin(name).unwrap();
+            if !matches!(base.base_bg, Color::Rgb { .. }) { continue; } // skip terminal-*/no-color
+            if !chrome_ladder_is_sentinel(&base) { continue; } // skip explicit chrome (tokyo at T1)
+            for (disp, target) in [(ChromeDisposition::Full, 1.30_f32), (ChromeDisposition::Zen, 1.12)] {
+                let mut t = Theme::builtin(name).unwrap();
+                t.derive_chrome(disp);
+                let canvas = t.base_bg;
+                let bar  = t.face(SemanticElement::Chrome).bg.unwrap();
+                let drop = t.face(SemanticElement::ChromeMuted).bg.unwrap();
+                let ov   = t.face(SemanticElement::ChromeOverlay).bg.unwrap();
+                for (below, above, lbl) in [(canvas, bar, "canvas→bar"), (bar, drop, "bar→dropdown"),
+                                            (drop, ov, "dropdown→overlay")] {
+                    assert!(contrast_ratio(above, below) >= target - 0.01,
+                        "{name} {disp:?} {lbl}: CR {} < target {target}",
+                        contrast_ratio(above, below));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn derive_full_distinct_from_zen_all_rgb_builtins() {
+        // (d): the FULL bar tone and the ZEN bar tone are perceptibly distinct (CR ≥ ~1.14).
+        for name in Theme::builtin_names() {
+            let base = Theme::builtin(name).unwrap();
+            if !matches!(base.base_bg, Color::Rgb { .. }) { continue; }
+            if !chrome_ladder_is_sentinel(&base) { continue; } // skip explicit chrome (tokyo at T1)
+            let mut f = Theme::builtin(name).unwrap(); f.derive_chrome(ChromeDisposition::Full);
+            let mut z = Theme::builtin(name).unwrap(); z.derive_chrome(ChromeDisposition::Zen);
+            let fb = f.face(SemanticElement::Chrome).bg.unwrap();
+            let zb = z.face(SemanticElement::Chrome).bg.unwrap();
+            assert!(contrast_ratio(fb, zb) >= 1.14,
+                "{name}: full≠zen bar CR {} too small", contrast_ratio(fb, zb));
+        }
+    }
+
+    #[test]
+    fn derive_every_chrome_fg_clears_legibility_floor() {
+        // (c): every derived chrome fg clears 4.5 vs its own panel, on all RGB builtins.
+        for name in Theme::builtin_names() {
+            let base = Theme::builtin(name).unwrap();
+            if !matches!(base.base_bg, Color::Rgb { .. }) { continue; }
+            if !chrome_ladder_is_sentinel(&base) { continue; } // skip explicit chrome (tokyo at T1)
+            for disp in [ChromeDisposition::Full, ChromeDisposition::Zen] {
+                let mut t = Theme::builtin(name).unwrap();
+                t.derive_chrome(disp);
+                for el in [SemanticElement::Chrome, SemanticElement::ChromeMuted, SemanticElement::ChromeOverlay] {
+                    let f = t.face(el);
+                    assert!(contrast_ratio(f.fg.unwrap(), f.bg.unwrap()) >= 4.5 - 0.05,
+                        "{name} {disp:?} {el:?} fg CR {} < 4.5", contrast_ratio(f.fg.unwrap(), f.bg.unwrap()));
+                }
+            }
+        }
     }
 
     #[test]
@@ -1346,9 +1516,11 @@ mod tests {
         // the two new faces are now derived (non-sentinel)
         assert_ne!(t.face(SemanticElement::ChromeOverlay), Face::default(), "overlay derived");
         assert_ne!(t.face(SemanticElement::ChromeAccent),  Face::default(), "accent derived");
-        // tokyo §B.3 pins
+        // tokyo pins — chrome is STILL explicit at T1, so overlay derives from the explicit
+        // chrome.bg (#16161e). This overlay is a T1 INTERMEDIATE (Part D makes tokyo all-sentinel
+        // in T3, at which point overlay finalizes to §II.5 #4e5071). Accent is unchanged.
         assert_face_bg_fg(t.face(SemanticElement::ChromeOverlay),
-            (0x2f,0x30,0x3a), (0xc0,0xca,0xf5), "tokyo overlay FULL");
+            (0x2a,0x2c,0x3e), (0xc0,0xca,0xf5), "tokyo overlay FULL (T1 intermediate)");
         assert_face_bg_fg(t.face(SemanticElement::ChromeAccent),
             (0x16,0x16,0x1e), (0x8f,0xa3,0xce), "tokyo accent FULL");
         assert_eq!(t.face(SemanticElement::ChromeAccent).bold, Some(true), "accent bold");
@@ -1360,97 +1532,82 @@ mod tests {
     }
 
     #[test]
-    fn derive_split_ladder_directions() {
-        // flexoki-dark: bar darker than canvas (toward black), overlay LIGHTER (toward white)
-        let mut td = from_base16("flexoki-dark", flexoki_dark_palette());
+    fn derive_elevation_ladder_directions() {
+        // Unified elevation: every derived chrome bg elevates from the canvas toward the
+        // headroom pole (LIGHTER on dark themes, DARKER on light), strictly ordered
+        // canvas < bar < dropdown < overlay by luminance-toward-pole. §II.5 pins.
+        let mut td = flexoki_dark();
         td.derive_chrome(ChromeDisposition::Full);
-        // §B.3 flexoki-dark FULL pins
+        let lum = |c: Color| { if let Color::Rgb{r,g,b} = c { rel_lum(r,g,b) } else { 0.0 } };
+        let canvas = lum(Color::Rgb{r:0x10,g:0x0f,b:0x0f});
+        let bar  = lum(td.face(SemanticElement::Chrome).bg.unwrap());
+        let drop = lum(td.face(SemanticElement::ChromeMuted).bg.unwrap());
+        let ov   = lum(td.face(SemanticElement::ChromeOverlay).bg.unwrap());
+        assert!(canvas < bar && bar < drop && drop < ov,
+            "dark theme: canvas < bar < dropdown < overlay by luminance; \
+             canvas={canvas} bar={bar} drop={drop} ov={ov}");
+        // exact §II.5 pins (redundant with derive_chrome_base16_pins but keeps this self-contained)
         assert_face_bg_fg(td.face(SemanticElement::Chrome),
-            (0x0d,0x0c,0x0c), (0xce,0xcd,0xc3), "fd chrome bg/fg");
-        assert_face_bg_fg(td.face(SemanticElement::ChromeOverlay),
-            (0x26,0x25,0x25), (0xce,0xcd,0xc3), "fd overlay bg/fg");
-        assert_face_bg_fg(td.face(SemanticElement::ChromeSelected),
-            (0xce,0xcd,0xc3), (0x10,0x0f,0x0f), "fd selected bg/fg");
-        assert_face_bg_fg(td.face(SemanticElement::ChromeMuted),
-            (0x09,0x09,0x09), (0x8c,0x8b,0x84), "fd muted bg/fg");
-        assert_eq!(td.face(SemanticElement::ChromeMuted).dim, Some(true), "fd muted dim");
-        assert_face_bg_fg(td.face(SemanticElement::ChromeAccent),
-            (0x0d,0x0c,0x0c), (0x62,0x83,0xa0), "fd accent bg/fg");
-        assert_eq!(td.face(SemanticElement::ChromeAccent).bold, Some(true), "fd accent bold");
+            (0x2a,0x28,0x28), (0xce,0xcd,0xc3), "fd chrome");
 
-        // flexoki-light: bar darker than canvas (toward black), overlay DEEPER black
-        let mut tl = from_base16("flexoki-light", flexoki_light_palette());
+        // light polarity: elevation goes DARKER (toward black), still strictly ordered.
+        let mut tl = flexoki_light();
         tl.derive_chrome(ChromeDisposition::Full);
-        // §B.3 flexoki-light FULL pins
+        let canvas_l = lum(Color::Rgb{r:0xff,g:0xfc,b:0xf0});
+        let bar_l  = lum(tl.face(SemanticElement::Chrome).bg.unwrap());
+        let drop_l = lum(tl.face(SemanticElement::ChromeMuted).bg.unwrap());
+        let ov_l   = lum(tl.face(SemanticElement::ChromeOverlay).bg.unwrap());
+        assert!(canvas_l > bar_l && bar_l > drop_l && drop_l > ov_l,
+            "light theme: canvas > bar > dropdown > overlay by luminance");
         assert_face_bg_fg(tl.face(SemanticElement::Chrome),
-            (0xf6,0xf3,0xe8), (0x10,0x0f,0x0f), "fl chrome bg/fg");
-        assert_face_bg_fg(tl.face(SemanticElement::ChromeOverlay),
-            (0xec,0xe9,0xde), (0x10,0x0f,0x0f), "fl overlay bg/fg");
-        assert_face_bg_fg(tl.face(SemanticElement::ChromeSelected),
-            (0x10,0x0f,0x0f), (0xff,0xfc,0xf0), "fl selected bg/fg");
-        assert_face_bg_fg(tl.face(SemanticElement::ChromeMuted),
-            (0xe3,0xe0,0xd6), (0x64,0x62,0x5e), "fl muted bg/fg");
-        assert_face_bg_fg(tl.face(SemanticElement::ChromeAccent),
-            (0xf6,0xf3,0xe8), (0x3f,0x5e,0x82), "fl accent bg/fg");
+            (0xe5,0xdf,0xc8), (0x10,0x0f,0x0f), "fl chrome");  // §II.5 (S-capped)
     }
 
     #[test]
-    fn derive_zen_collapses_toward_poles() {
-        let mut td_full = from_base16("flexoki-dark", flexoki_dark_palette());
+    fn derive_zen_floored_but_distinct_on_pole_side() {
+        let mut td_full = flexoki_dark();
         td_full.derive_chrome(ChromeDisposition::Full);
-        let mut td_zen = from_base16("flexoki-dark", flexoki_dark_palette());
+        let mut td_zen = flexoki_dark();
         td_zen.derive_chrome(ChromeDisposition::Zen);
 
-        // Zen §B.3 pins (flexoki-dark ZEN)
+        // Zen §II.5 pins (flexoki-dark ZEN)
         assert_face_bg_fg(td_zen.face(SemanticElement::Chrome),
-            (0x0f,0x0e,0x0e), (0xce,0xcd,0xc3), "fd zen chrome");
+            (0x1e,0x1c,0x1c), (0xce,0xcd,0xc3), "fd zen chrome");
         assert_face_bg_fg(td_zen.face(SemanticElement::ChromeOverlay),
-            (0x18,0x17,0x17), (0xce,0xcd,0xc3), "fd zen overlay");
+            (0x32,0x2f,0x2f), (0xce,0xcd,0xc3), "fd zen overlay");
         assert_face_bg_fg(td_zen.face(SemanticElement::ChromeMuted),
-            (0x0e,0x0d,0x0d), (0x8c,0x8b,0x84), "fd zen muted");
+            (0x28,0x26,0x26), (0x8e,0x8d,0x86), "fd zen muted");
         assert_face_bg_fg(td_zen.face(SemanticElement::ChromeAccent),
-            (0x0f,0x0e,0x0e), (0x6e,0x82,0x94), "fd zen accent");
+            (0x1e,0x1c,0x1c), (0x6e,0x82,0x94), "fd zen accent");
 
-        // zen bg rungs are strictly between canvas and the full rungs (each toward its own pole)
-        // canvas = #100f0f; chrome full bg = #0d0c0c (darker); zen bg = #0f0e0e (less dark → closer to canvas)
-        let canvas_r = 0x10u8;
-        let full_chr_r  = td_full.face(SemanticElement::Chrome).bg.unwrap();
-        let zen_chr_r   = td_zen.face(SemanticElement::Chrome).bg.unwrap();
-        if let (Color::Rgb{r:fr,..}, Color::Rgb{r:zr,..}) = (full_chr_r, zen_chr_r) {
-            // full goes darker (fr ≤ canvas), zen is less dark (zr ≥ fr)
-            assert!(zr >= fr, "zen chrome closer to canvas than full: zen={zr} full={fr}");
-            assert!(zr <= canvas_r, "zen ≤ canvas for bar (dark→black)");
-        } else { panic!("non-Rgb chrome bg"); }
-        // overlay: full goes lighter (#262525, overlay_r=0x26), zen = #181717 (less light, still above canvas)
-        let full_ov = td_full.face(SemanticElement::ChromeOverlay).bg.unwrap();
-        let zen_ov  = td_zen.face(SemanticElement::ChromeOverlay).bg.unwrap();
-        if let (Color::Rgb{r:fr,..}, Color::Rgb{r:zr,..}) = (full_ov, zen_ov) {
-            assert!(fr >= canvas_r, "full overlay lighter than canvas for dark theme");
-            assert!(zr >= canvas_r && zr <= fr, "zen overlay between canvas and full");
-        } else { panic!("non-Rgb overlay bg"); }
+        // zen bar is strictly between canvas and the full bar, on the pole side (dark → white).
+        let lum = |c: Color| { if let Color::Rgb{r,g,b} = c { rel_lum(r,g,b) } else { 0.0 } };
+        let full_bar = lum(td_full.face(SemanticElement::Chrome).bg.unwrap());
+        let zen_bar  = lum(td_zen.face(SemanticElement::Chrome).bg.unwrap());
+        let canvas   = lum(Color::Rgb{r:0x10,g:0x0f,b:0x0f});
+        assert!(canvas < zen_bar && zen_bar < full_bar,
+            "dark: canvas < zen bar < full bar; canvas={canvas} zen={zen_bar} full={full_bar}");
+        // overlay is likewise elevated above the canvas at zen, and below the full overlay.
+        let full_ov = lum(td_full.face(SemanticElement::ChromeOverlay).bg.unwrap());
+        let zen_ov  = lum(td_zen.face(SemanticElement::ChromeOverlay).bg.unwrap());
+        assert!(canvas < zen_ov && zen_ov < full_ov,
+            "dark: canvas < zen overlay < full overlay");
     }
 
     #[test]
-    fn derive_saturation_split() {
-        // Dark themes only (polarity-scoped per Fable r2). Mocha §B.3 pins.
-        // sunken rung (Chrome/Muted, toward black) S ≈ canvas S within rounding epsilon.
-        // raised rung (Overlay, toward white) S strictly < canvas S.
-        let mut t = from_base16("mocha", mocha_palette());
+    fn derive_rungs_preserve_canvas_saturation() {
+        // Unified elevation: every rung moves toward the SAME pole and keeps the canvas H,S.
+        // No sunken/raised split — each rung's HSL-S ≈ canvas S on dark/uncapped themes.
+        let mut t = catppuccin_mocha();          // dark, uncapped, canvas S ≈ 0.21
         t.derive_chrome(ChromeDisposition::Full);
-        let canvas_s = { let (_,s,_) = rgb_to_hsl(0x1e, 0x1e, 0x2e); s };
-        let overlay = t.face(SemanticElement::ChromeOverlay).bg.unwrap();
-        if let Color::Rgb { r, g, b } = overlay {
-            let (_,s,_) = rgb_to_hsl(r, g, b);
-            assert!(s < canvas_s, "raised overlay S < canvas S (mocha): overlay_s={s:.4} canvas_s={canvas_s:.4}");
-        } else { panic!("non-Rgb overlay"); }
-        // Chrome bg for mocha = #191926; S should be close to canvas S
-        let chrome_bg = t.face(SemanticElement::Chrome).bg.unwrap();
-        if let Color::Rgb { r, g, b } = chrome_bg {
-            let (_,s,_) = rgb_to_hsl(r, g, b);
-            // sunken rung S preserved: within ~0.01 of canvas S
-            assert!((s - canvas_s).abs() < 0.012,
-                "sunken chrome S ≈ canvas S (mocha): chrome_s={s:.4} canvas_s={canvas_s:.4}");
-        } else { panic!("non-Rgb chrome"); }
+        let (_, canvas_s, _) = rgb_to_hsl(0x1e, 0x1e, 0x2e);
+        for el in [SemanticElement::Chrome, SemanticElement::ChromeMuted, SemanticElement::ChromeOverlay] {
+            if let Color::Rgb { r, g, b } = t.face(el).bg.unwrap() {
+                let (_, s, _) = rgb_to_hsl(r, g, b);
+                assert!((s - canvas_s).abs() < 0.02,
+                    "{el:?} preserves canvas S: rung_s={s:.4} canvas_s={canvas_s:.4}");
+            } else { panic!("non-Rgb rung"); }
+        }
     }
 
     #[test]
@@ -1471,32 +1628,35 @@ mod tests {
     #[test]
     fn derive_preserves_hue_angle() {
         // phosphor-green post-derivation: every derived bg rung has the same hue family as the canvas.
-        // §B.3 phosphor-green FULL pins.
+        // §II.5 phosphor-green FULL bg pins — the canvas is shade(hue,0) (ceiling-invariant), so
+        // these bg rungs are stable at T1. The chrome FGs derive from base_fg = shade(hue,3), which
+        // the Part E ceiling change (0.92→0.78) reshapes in T4 — so we assert only that each fg is
+        // Some and green-dominant here, NOT its exact hex.
         let mut t = phosphor_green_theme();
         t.derive_chrome(ChromeDisposition::Full);
-        assert_face_bg_fg(t.face(SemanticElement::Chrome),
-            (0x00,0x22,0x00), (0x2b,0xff,0x2b), "phosphor chrome bg/fg");
-        assert_face_bg_fg(t.face(SemanticElement::ChromeOverlay),
-            (0x17,0x3c,0x17), (0x2b,0xff,0x2b), "phosphor overlay bg/fg");
-        assert_face_bg_fg(t.face(SemanticElement::ChromeMuted),
-            (0x00,0x17,0x00), (0x1c,0xb4,0x1c), "phosphor muted bg/fg");
-        assert_face_bg_fg(t.face(SemanticElement::ChromeAccent),
-            (0x00,0x22,0x00), (0xe6,0xfa,0xe6), "phosphor accent bg/fg");
-        // hue angle: all bg rungs share the green hue family (r ≈ b, g dominates)
+        assert_eq!(t.face(SemanticElement::Chrome).bg,        Some(rgb(0x00,0x40,0x00)), "phosphor chrome bg");
+        assert_eq!(t.face(SemanticElement::ChromeMuted).bg,   Some(rgb(0x00,0x54,0x00)), "phosphor muted bg");
+        assert_eq!(t.face(SemanticElement::ChromeOverlay).bg, Some(rgb(0x00,0x68,0x00)), "phosphor overlay bg");
+        // hue angle: all bg rungs share the green hue family (r ≈ b, g dominates); fgs likewise green.
         for el in [SemanticElement::Chrome, SemanticElement::ChromeOverlay, SemanticElement::ChromeMuted] {
             let bg = t.face(el).bg.unwrap();
             if let Color::Rgb { r, g, b } = bg {
                 assert!(g >= r && g >= b, "{el:?} bg must be green-dominant r={r} g={g} b={b}");
             } else { panic!("{el:?} non-Rgb bg"); }
+            let fg = t.face(el).fg;
+            assert!(fg.is_some(), "{el:?} fg is Some");
+            if let Some(Color::Rgb { r, g, b }) = fg {
+                assert!(g >= r && g >= b, "{el:?} fg green-dominant r={r} g={g} b={b}");
+            } else { panic!("{el:?} non-Rgb fg"); }
         }
     }
 
     #[test]
-    fn derive_contrast_clamp_floors_at_zero() {
-        // Synthetic LIGHT-polarity theme where fg-vs-canvas contrast is below 4.5,
-        // so all three bg rungs (toward black) shrink until contrast ≥ threshold - 0.001.
-        // Using a very-low-contrast LIGHT palette: white BG, near-white FG → contrast ≈ 1.24.
-        // All rungs will floor at pct=0 (= canvas), no panic, no infinite loop.
+    fn derive_separation_floor_grows_low_contrast_theme() {
+        // Synthetic LIGHT-polarity theme with a near-white fg (bg #f8f8f8, fg/link #e0e0e0) —
+        // originally fg-vs-canvas contrast is far below 4.5. Under unified elevation there is no
+        // shrink-to-canvas: the separation floor GROWS each rung (toward black, ordered) and
+        // derive_fg re-derives every chrome fg to clear 4.5. §II.5a pins.
         let white_bg = Color::Rgb { r:0xf8, g:0xf8, b:0xf8 };
         let near_white_fg = Color::Rgb { r:0xe0, g:0xe0, b:0xe0 };
         let mut t = Theme {
@@ -1521,15 +1681,22 @@ mod tests {
                 chrome_overlay: Face::default(), chrome_accent: Face::default(),
             },
         };
-        // should not panic; all rungs floor to canvas
         t.derive_chrome(ChromeDisposition::Full);
-        // derived chrome bg = canvas (floored) or very close
-        let chrome_bg = t.face(SemanticElement::Chrome).bg.unwrap_or(white_bg);
-        assert_eq!(chrome_bg, white_bg, "low-contrast chrome floors to canvas");
-        let overlay_bg = t.face(SemanticElement::ChromeOverlay).bg.unwrap_or(white_bg);
-        assert_eq!(overlay_bg, white_bg, "low-contrast overlay floors to canvas");
-        let muted_bg = t.face(SemanticElement::ChromeMuted).bg.unwrap_or(white_bg);
-        assert_eq!(muted_bg, white_bg, "low-contrast muted floors to canvas");
+        // §II.5a FULL pins (synthetic bg #f8f8f8, fg/link #e0e0e0):
+        assert_face_bg_fg(t.face(SemanticElement::Chrome),
+            (0xdb,0xdb,0xdb), (0x60,0x60,0x60), "synthetic chrome");
+        assert_face_bg_fg(t.face(SemanticElement::ChromeMuted),
+            (0xc1,0xc1,0xc1), (0x4f,0x4f,0x4f), "synthetic muted");
+        assert_face_bg_fg(t.face(SemanticElement::ChromeOverlay),
+            (0xa9,0xa9,0xa9), (0x3c,0x3c,0x3c), "synthetic overlay");
+        // rungs are DISTINCT from canvas (elevated toward black), and every fg clears 4.5.
+        let canvas = Color::Rgb{r:0xf8,g:0xf8,b:0xf8};
+        for el in [SemanticElement::Chrome, SemanticElement::ChromeMuted, SemanticElement::ChromeOverlay] {
+            let f = t.face(el);
+            assert_ne!(f.bg.unwrap(), canvas, "{el:?} must be distinct from canvas");
+            assert!(contrast_ratio(f.fg.unwrap(), f.bg.unwrap()) >= 4.5 - 0.01,
+                "{el:?} fg clears the legibility floor");
+        }
     }
 
     #[test]

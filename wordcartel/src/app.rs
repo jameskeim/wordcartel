@@ -5090,9 +5090,9 @@ mod tests {
         assert!(did, "flag was set — must return true");
         assert!(!editor.theme_rederive, "flag must be cleared after rederive");
         let full_bg = editor.theme.face(SemanticElement::Chrome).bg;
-        // §B.3 flexoki-dark FULL Chrome bg = #0d0c0c
-        assert_eq!(full_bg, Some(Color::Rgb { r: 0x0d, g: 0x0c, b: 0x0c }),
-            "flexoki-dark Full Chrome bg must match §B.3: got {full_bg:?}");
+        // §II.5 flexoki-dark FULL Chrome bg = #2a2828 (unified elevation ladder; flexoki is stable)
+        assert_eq!(full_bg, Some(Color::Rgb { r: 0x2a, g: 0x28, b: 0x28 }),
+            "flexoki-dark Full Chrome bg must match §II.5: got {full_bg:?}");
 
         // Now switch to Zen and rederive.
         editor.chrome_disposition = ChromeDisposition::Zen;
@@ -5101,9 +5101,9 @@ mod tests {
         assert!(did2, "Zen rederive must return true");
         assert!(!editor.theme_rederive, "flag must be cleared");
         let zen_bg = editor.theme.face(SemanticElement::Chrome).bg;
-        // §B.3 flexoki-dark ZEN Chrome bg = #0f0e0e
-        assert_eq!(zen_bg, Some(Color::Rgb { r: 0x0f, g: 0x0e, b: 0x0e }),
-            "flexoki-dark Zen Chrome bg must match §B.3: got {zen_bg:?}");
+        // §II.5 flexoki-dark ZEN Chrome bg = #1e1c1c (unified elevation ladder; flexoki is stable)
+        assert_eq!(zen_bg, Some(Color::Rgb { r: 0x1e, g: 0x1c, b: 0x1c }),
+            "flexoki-dark Zen Chrome bg must match §II.5: got {zen_bg:?}");
 
         // No-op when flag is not set.
         editor.theme_rederive = false;
@@ -5147,9 +5147,11 @@ mod tests {
         assert_eq!(editor.theme.name, "tokyo-night",
             "rederive must apply the picker-committed identity, not the config name");
         let full_overlay_bg = editor.theme.face(SemanticElement::ChromeOverlay).bg;
-        // §B.3 tokyo-night FULL ChromeOverlay bg = #2f303a
-        assert_eq!(full_overlay_bg, Some(Color::Rgb { r: 0x2f, g: 0x30, b: 0x3a }),
-            "tokyo-night Full ChromeOverlay bg must match §B.3: got {full_overlay_bg:?}");
+        // tokyo-night FULL ChromeOverlay — T1 INTERMEDIATE: chrome is still explicit (#16161e),
+        // so overlay derives from it via the new elevation ladder. Part D (T3) makes tokyo
+        // all-sentinel, at which point this finalizes to §II.5 #4e5071.
+        assert_eq!(full_overlay_bg, Some(Color::Rgb { r: 0x2a, g: 0x2c, b: 0x3e }),
+            "tokyo-night Full ChromeOverlay bg (T1 intermediate): got {full_overlay_bg:?}");
 
         // Zen disposition rederive: same identity, overlay should collapse.
         editor.chrome_disposition = ChromeDisposition::Zen;
@@ -5158,9 +5160,10 @@ mod tests {
         assert!(did2, "Zen rederive must return true");
         assert_eq!(editor.theme.name, "tokyo-night", "identity preserved across disposition change");
         let zen_overlay_bg = editor.theme.face(SemanticElement::ChromeOverlay).bg;
-        // §B.3 tokyo-night ZEN ChromeOverlay bg = #21222d
-        assert_eq!(zen_overlay_bg, Some(Color::Rgb { r: 0x21, g: 0x22, b: 0x2d }),
-            "tokyo-night Zen ChromeOverlay bg must match §B.3: got {zen_overlay_bg:?}");
+        // tokyo-night ZEN ChromeOverlay — T1 INTERMEDIATE (derives from explicit chrome #16161e);
+        // finalized in T3 to §II.5 #33354a once tokyo is all-sentinel.
+        assert_eq!(zen_overlay_bg, Some(Color::Rgb { r: 0x1f, g: 0x21, b: 0x2e }),
+            "tokyo-night Zen ChromeOverlay bg (T1 intermediate): got {zen_overlay_bg:?}");
     }
 
     /// Finding 2 (pre-merge gate): preview_selected_theme must apply the Ansi16 sentinel-fill

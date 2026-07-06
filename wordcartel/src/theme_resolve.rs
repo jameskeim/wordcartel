@@ -404,10 +404,10 @@ mod tests {
 
         let tc = ThemeConfig { name: Some("flexoki-dark".into()), ..Default::default() };
         let r = resolve_theme(&tc, &env(false), disp);
-        // §B.3 ZEN flexoki-dark Chrome bg = #0f0e0e
+        // §II.5 ZEN flexoki-dark Chrome bg = #1e1c1c (unified elevation ladder; flexoki is stable)
         assert_eq!(r.theme.face(SemanticElement::Chrome).bg,
-            Some(Color::Rgb { r:0x0f, g:0x0e, b:0x0e }),
-            "flexoki-dark Zen Chrome bg must match §B.3 probe value");
+            Some(Color::Rgb { r:0x1e, g:0x1c, b:0x1c }),
+            "flexoki-dark Zen Chrome bg must match §II.5 probe value");
     }
 
     #[test]
