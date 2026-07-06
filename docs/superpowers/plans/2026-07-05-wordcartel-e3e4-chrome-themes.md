@@ -42,10 +42,14 @@
   - `derive_fills_only_unset_faces` — tokyo-night: all four EXISTING chrome faces byte-identical after `derive_chrome(Full)`; the two NEW faces (chrome_overlay/chrome_accent) now Some with §B.3's tokyo values. Second call → byte-equal everything (the sentinel no-op pin).
   - `derive_split_ladder_directions` — flexoki-dark full: bar bg DARKER than canvas (toward black), overlay bg LIGHTER (toward white), exact §B.3 hex; flexoki-light: bar darker, overlay DEEPER darker, exact hex.
   - `derive_zen_collapses_toward_poles` — flexoki-dark zen rungs strictly between canvas and the full rungs (each toward its own pole), exact §B.3 zen hex.
-  - `derive_saturation_split` — saturation preserved on SUNKEN rungs, decaying
-    monotonically on RAISED rungs (the ratified N5 property; mocha 0.211→0.117 is the
-    anchor pair) — and `derive_accent_desaturation_bound` (the accent's saturation ≤ the
-    seed's × (1 − ACCENT_DESAT) + epsilon; Fable plan I5).
+  - `derive_saturation_split` — DARK themes only (Fable fold-verify: light sunken rungs
+    change S sharply — the property is polarity-scoped): sunken rung S ≈ canvas S within
+    rounding epsilon (mocha 0.2105→0.2063), raised rung S strictly < canvas S (mocha
+    Overlay #323241 → S 0.130; the earlier 0.117 literal was stale). And
+    `derive_accent_desaturation_bound` as STRICT DECREASE (accent S < seed S — the
+    ACCENT_DESAT-scaled bound is geometrically false for 4/7 seeds since a
+    luminance-gray RGB blend does not halve HSL-S; exact accent values are §B.3-pinned
+    anyway; Fable fold-verify).
   - `derive_preserves_hue_angle` — phosphor-green post-derivation (T2 deletes the initializers; HERE construct a synthetic all-None-chrome theme with phosphor's bases): every derived bg has the base's hue angle (via the probe's hsl check reimplemented test-side, or compare against §B.3's phosphor hex directly — the literals ARE the pin).
   - `derive_contrast_clamp_floors_at_zero` — a SYNTHETIC LIGHT-polarity low-contrast theme (fg/bg below 4.5 by construction; LIGHT because all three bg rungs then step toward the dark fg and all floor — on a dark synthetic the bars/muted step AWAY from fg and would NOT floor, Fable plan M4): derived rungs equal canvas, no panic, no loop.
   - `derive_skips_non_rgb_bases` — a theme with `Color::Default` bases: byte-untouched by the call.
