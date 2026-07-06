@@ -94,7 +94,7 @@ fn apply_cue_mode_glyph(theme: &mut Theme, depth: Depth, cfg_override: Option<bo
     theme.heading_level_glyph = if cue { true } else { cfg_override.unwrap_or(theme.heading_level_glyph) };
 }
 
-/// Resolve order (D1+D5): base pick/construct → derive_chrome(disp) → Ansi16 policy →
+/// Resolve order (D1+D5): base pick/construct → [Ansi16 sentinel-fill | derive_chrome(disp)] →
 /// user styles → cue glyph. User chrome overrides land LAST, over the depth policy.
 pub fn resolve_theme(tc: &ThemeConfig, env: &EnvSnapshot, disp: ChromeDisposition) -> ResolvedTheme {
     let mut warnings = Vec::new();
@@ -143,46 +143,49 @@ pub fn resolve_theme(tc: &ThemeConfig, env: &EnvSnapshot, disp: ChromeDispositio
         Theme::builtin("flexoki-dark").expect("flexoki-dark is a bundled builtin")
     };
 
-    // D1 resolve order step 1: derive chrome ladder from Rgb bases.
-    // No-op for non-Rgb themes (terminal-plain, terminal-ansi, no-color, error fallbacks).
-    t.derive_chrome(disp);
-
-    // D1 resolve order step 2: Ansi16 fixed chrome policy.
-    // At Depth::Ansi16 on an Rgb-based theme, overwrite the five color faces with the
-    // named-ANSI table keyed on the binary predicate: quantize(canvas) == Black → DarkGray
-    // arm (dark themes); else → Black arm (light themes). ChromeReverse is EXCLUDED
-    // (never derived; reverse-modifier default stands at all depths). §C, B.4.
-    if depth == Depth::Ansi16 {
-        if let Color::Rgb { .. } = t.base_bg {
-            let canvas_q = theme::quantize(t.base_bg, Depth::Ansi16);
-            if canvas_q == Color::Black {
-                // Dark canvas arm: Chrome/Overlay → DarkGray bg White fg; Selected → Black/White;
-                // Muted → White dim; Accent → White bold.
-                t.override_face(SemanticElement::Chrome,
-                    Face { fg: Some(Color::White), bg: Some(Color::DarkGray), ..Face::default() });
-                t.override_face(SemanticElement::ChromeOverlay,
-                    Face { fg: Some(Color::White), bg: Some(Color::DarkGray), ..Face::default() });
-                t.override_face(SemanticElement::ChromeSelected,
-                    Face { fg: Some(Color::Black), bg: Some(Color::White), ..Face::default() });
-                t.override_face(SemanticElement::ChromeMuted,
-                    Face { fg: Some(Color::White), dim: Some(true), ..Face::default() });
-                t.override_face(SemanticElement::ChromeAccent,
-                    Face { fg: Some(Color::White), bold: Some(true), ..Face::default() });
-            } else {
-                // Light canvas arm: Chrome/Overlay → Black bg White fg; Selected → White/Black;
-                // Muted → White dim; Accent → White bold.
-                t.override_face(SemanticElement::Chrome,
-                    Face { fg: Some(Color::White), bg: Some(Color::Black), ..Face::default() });
-                t.override_face(SemanticElement::ChromeOverlay,
-                    Face { fg: Some(Color::White), bg: Some(Color::Black), ..Face::default() });
-                t.override_face(SemanticElement::ChromeSelected,
-                    Face { fg: Some(Color::Black), bg: Some(Color::White), ..Face::default() });
-                t.override_face(SemanticElement::ChromeMuted,
-                    Face { fg: Some(Color::White), dim: Some(true), ..Face::default() });
-                t.override_face(SemanticElement::ChromeAccent,
-                    Face { fg: Some(Color::White), bold: Some(true), ..Face::default() });
-            }
+    // D1 resolve order step 1: derive chrome ladder from Rgb bases, or — at Ansi16 on an
+    // Rgb-based theme — apply the §C fixed table to sentinel faces IN PLACE OF derivation.
+    // Non-Rgb themes (terminal-plain, terminal-ansi, no-color, error fallbacks): no-op in
+    // derive_chrome regardless.
+    if depth == Depth::Ansi16 && matches!(t.base_bg, Color::Rgb { .. }) {
+        // §C Ansi16 policy: the table replaces DERIVATION, not explicit chrome — sentinel
+        // faces only; explicit constructor faces quantize as today (spec Ansi16 policy).
+        // We skip derive_chrome; faces set by the constructor remain as Rgb and quantize
+        // at render time. ChromeReverse is never derived; reverse-modifier default stands.
+        let canvas_q = theme::quantize(t.base_bg, Depth::Ansi16);
+        let (chrome_bg, selected_fg, selected_bg) = if canvas_q == Color::Black {
+            // Dark canvas arm: Chrome/Overlay → DarkGray bg White fg; Selected → Black/White;
+            // Muted → White dim; Accent → White bold.
+            (Color::DarkGray, Color::Black, Color::White)
+        } else {
+            // Light canvas arm: Chrome/Overlay → Black bg White fg; Selected → White/Black;
+            // Muted → White dim; Accent → White bold.
+            (Color::Black, Color::White, Color::Black)
+        };
+        if t.face(SemanticElement::Chrome) == Face::default() {
+            t.override_face(SemanticElement::Chrome,
+                Face { fg: Some(Color::White), bg: Some(chrome_bg), ..Face::default() });
         }
+        if t.face(SemanticElement::ChromeOverlay) == Face::default() {
+            t.override_face(SemanticElement::ChromeOverlay,
+                Face { fg: Some(Color::White), bg: Some(chrome_bg), ..Face::default() });
+        }
+        if t.face(SemanticElement::ChromeSelected) == Face::default() {
+            t.override_face(SemanticElement::ChromeSelected,
+                Face { fg: Some(selected_fg), bg: Some(selected_bg), ..Face::default() });
+        }
+        if t.face(SemanticElement::ChromeMuted) == Face::default() {
+            t.override_face(SemanticElement::ChromeMuted,
+                Face { fg: Some(Color::White), dim: Some(true), ..Face::default() });
+        }
+        if t.face(SemanticElement::ChromeAccent) == Face::default() {
+            t.override_face(SemanticElement::ChromeAccent,
+                Face { fg: Some(Color::White), bold: Some(true), ..Face::default() });
+        }
+    } else {
+        // Rgb non-Ansi16 paths: derive the full Rgb chrome ladder.
+        // Non-Rgb themes: no-op in derive_chrome.
+        t.derive_chrome(disp);
     }
 
     // D1 resolve order step 3: per-element style overrides. On a MONOCHROME theme (cue mode
@@ -416,17 +419,44 @@ mod tests {
             "Ansi16 light-canvas policy: Chrome bg must be Black");
         assert_eq!(r2.theme.face(SemanticElement::Chrome).fg, Some(Color::White),
             "Ansi16 light-canvas policy: Chrome fg must be White");
+        // §C light-arm ChromeSelected: fg White, bg Black (White-on-Black).
+        assert_eq!(r2.theme.face(SemanticElement::ChromeSelected).fg, Some(Color::White),
+            "Ansi16 light-canvas policy: ChromeSelected fg must be White");
+        assert_eq!(r2.theme.face(SemanticElement::ChromeSelected).bg, Some(Color::Black),
+            "Ansi16 light-canvas policy: ChromeSelected bg must be Black");
 
         // tokyo-night @ Ansi16: canvas #1a1b26 → Black → DarkGray arm.
-        // The explicit PANEL_BG #16161e is overwritten by the Ansi16 policy.
+        // Chrome/selected/muted are explicit in the constructor (not sentinels) → left to
+        // quantize at render time (PANEL_BG → Black, FG → Gray).
+        // ChromeOverlay + ChromeAccent are sentinels → filled by the dark-arm table.
         let tc3 = ThemeConfig {
             name: Some("tokyo-night".into()),
             depth: Some("16".into()),
             ..Default::default()
         };
         let r3 = resolve_theme(&tc3, &env(false), ChromeDisposition::Full);
-        assert_eq!(r3.theme.face(SemanticElement::Chrome).bg, Some(Color::DarkGray),
-            "Ansi16 policy overwrites tokyo's explicit PANEL_BG with DarkGray");
+        // Explicit Chrome face (PANEL_BG = #16161e) stays as Rgb; quantize gives Black.
+        assert_eq!(
+            theme::quantize(r3.theme.face(SemanticElement::Chrome).bg.unwrap(), Depth::Ansi16),
+            Color::Black,
+            "tokyo Chrome bg (PANEL_BG) quantizes to Black — policy leaves explicit faces alone"
+        );
+        // FG (#c0caf5) is closest to Gray at Ansi16.
+        assert_eq!(
+            theme::quantize(r3.theme.face(SemanticElement::Chrome).fg.unwrap(), Depth::Ansi16),
+            Color::Gray,
+            "tokyo Chrome fg (FG) quantizes to Gray at Ansi16"
+        );
+        // Sentinel ChromeOverlay gets the dark-arm table value (named colors, not Rgb).
+        assert_eq!(r3.theme.face(SemanticElement::ChromeOverlay).bg, Some(Color::DarkGray),
+            "tokyo ChromeOverlay (sentinel) → dark-arm DarkGray bg");
+        assert_eq!(r3.theme.face(SemanticElement::ChromeOverlay).fg, Some(Color::White),
+            "tokyo ChromeOverlay (sentinel) → dark-arm White fg");
+        // Sentinel ChromeAccent gets the dark-arm table value.
+        assert_eq!(r3.theme.face(SemanticElement::ChromeAccent).fg, Some(Color::White),
+            "tokyo ChromeAccent (sentinel) → dark-arm White fg");
+        assert_eq!(r3.theme.face(SemanticElement::ChromeAccent).bold, Some(true),
+            "tokyo ChromeAccent (sentinel) → dark-arm bold");
     }
 
     #[test]
