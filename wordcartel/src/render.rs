@@ -2621,9 +2621,12 @@ mod tests {
     /// border cells must carry themed RGB colors from the Chrome face — not Reset/None.
     #[test]
     fn phosphor_overlay_frame_border_uses_chrome_style() {
-        use wordcartel_core::theme::{Theme, Depth};
+        use wordcartel_core::theme::{ChromeDisposition, Theme, Depth};
         let mut ed = Editor::new_from_text("x\n", None, (60, 16));
-        ed.theme = Theme::builtin("phosphor-amber").unwrap();
+        let mut theme = Theme::builtin("phosphor-amber").unwrap();
+        // I4-A: phosphor chrome is now a sentinel filled by derive_chrome (not set in constructor).
+        theme.derive_chrome(ChromeDisposition::Full);
+        ed.theme = theme;
         ed.depth = Depth::Truecolor;
         ed.open_theme_picker();
         derive::rebuild(&mut ed);
@@ -2636,7 +2639,7 @@ mod tests {
         assert!(border_cell.is_some(), "FIX-3: expected box-drawing border cells in theme-picker overlay");
         let (bx, by) = border_cell.unwrap();
         let cs = buf[(bx, by)].style();
-        // phosphor-amber Chrome face: { fg: shade(4), bg: shade(1) } — both RGB.
+        // phosphor-amber Chrome face: derived from canvas via derive_chrome — both fg and bg are RGB.
         // Before fix: border cell has fg/bg from terminal default (None or Reset).
         // After fix: border cell carries Chrome face (RGB fg and bg).
         assert!(
