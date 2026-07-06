@@ -1135,6 +1135,65 @@ mod tests {
         assert!(!Theme::builtin_names().iter().any(|n| n.contains("-flat")), "no flat variants");
     }
 
+    // ── Part B — completeness conformance ───────────────────────────────────────────────────────
+
+    /// Per-face requirement type for the Part B completeness contract.
+    /// Derived from the `from_base16` template — each semantic role has exactly one
+    /// requirement class; any new SemanticElement variant forces an update here (exhaustive match).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum FaceReq { FgRequired, UnderlineColorRequired, Highlight, Modifier, Empty, Exempt }
+
+    fn face_requirement(el: SemanticElement) -> FaceReq {
+        use SemanticElement::*;
+        use FaceReq::*;
+        match el {
+            Text                                                               => Empty,
+            Emphasis | Strong | StrongEmphasis | Code | Strikethrough | Link
+            | Heading(_) | BlockQuote | CodeBlock | ListMarker | ThematicBreak
+            | FrontMatter | Comment | FocusDim | FoldMarker | WrapGuide      => FgRequired,
+            DiagSpelling | DiagGrammar                                        => UnderlineColorRequired,
+            Selection | MarkedBlock | SearchMatch                             => Highlight,
+            SearchCurrent                                                     => Modifier,
+            Chrome | ChromeReverse | ChromeSelected | ChromeMuted | ChromeOverlay
+            | ChromeAccent                                                     => Exempt,
+        }
+    }
+
+    #[test]
+    fn every_rgb_builtin_satisfies_the_completeness_contract() {
+        // Part B — over the 16 RGB builtins (terminal-plain/terminal-ansi/no-color are non-Rgb
+        // and exempt), every face satisfies ITS requirement type from the spec Part B contract.
+        // Retrospective guardrail: T2/T3/T4 already brought every theme to standard, so this
+        // test passes immediately — but it prevents future themes from silently omitting a
+        // required role. Confirmed REAL (RED-then-GREEN): with tokyo emphasis.fg temporarily
+        // cleared the test failed as "tokyo-night Emphasis: fg-required face has no explicit fg".
+        for name in Theme::builtin_names() {
+            let t = Theme::builtin(name).unwrap();
+            if !matches!(t.base_bg, Color::Rgb { .. }) { continue; }   // skip the 3 non-Rgb themes
+            for el in ALL_ELEMENTS {
+                let f = t.face(el);
+                match face_requirement(el) {
+                    FaceReq::FgRequired => assert!(
+                        f.fg.is_some() && f.fg != Some(Color::Default),
+                        "{name} {el:?}: fg-required face has no explicit fg"),
+                    FaceReq::UnderlineColorRequired => assert!(
+                        f.underline_color.is_some(),
+                        "{name} {el:?}: underline_color-required face has none"),
+                    FaceReq::Highlight => assert!(
+                        f.bg.is_some() || f.reverse == Some(true),
+                        "{name} {el:?}: highlight face needs a bg OR reverse"),
+                    FaceReq::Modifier => assert!(
+                        [f.bold, f.italic, f.underline, f.strike, f.reverse, f.dim]
+                            .contains(&Some(true)),
+                        "{name} {el:?}: modifier-required face has no modifier"),
+                    FaceReq::Empty => assert_eq!(
+                        f, Face::default(), "{name} {el:?}: SE::Text must be empty (Part C)"),
+                    FaceReq::Exempt => {} // chrome — supplied by the elevation ladder
+                }
+            }
+        }
+    }
+
     #[test]
     fn every_builtin_resolves_at_all_depths() {
         // 19 builtins × 3 depths — every quantize call completes without panic.
