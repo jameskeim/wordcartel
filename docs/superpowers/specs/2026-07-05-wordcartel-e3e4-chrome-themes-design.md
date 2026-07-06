@@ -112,12 +112,20 @@ Grounded facts). Working order: the E3 slot.
 ## D1. The derived chrome ladder (core theme.rs)
 
 - New: `pub enum ChromeDisposition { Full, Zen }` (CORE — the shell's config parse maps
-  the string to the core enum; dependency direction sound) and a PUBLIC core method
-  `Theme::rederive_chrome(&mut self, disp: ChromeDisposition)` (Codex r1 I-1: ThemeFaces
-  is private — a free fn returning a private struct is uncallable from the shell; the
-  method mutates the six chrome faces in place). Builtin constructors call it with Full;
-  resolve_theme calls it with the configured disposition BEFORE applying overrides.
-  Mechanics:
+  the string to the core enum) and a PUBLIC core method
+  `Theme::derive_chrome(&mut self, disp: ChromeDisposition)` (Codex r1 I-1: ThemeFaces is
+  private; the method mutates chrome faces in place). OVERRIDE DURABILITY (Codex r2 I-1
+  — constructor-baked chrome like tokyo-night's PANEL_BG or phosphor's shades has no
+  separate representation): derive_chrome fills ONLY chrome faces that are ENTIRELY
+  UNSET (all-None Face — the natural sentinel in the all-Option model); a theme wanting
+  explicit chrome simply sets those faces in its constructor (exactly what tokyo-night/
+  phosphor/terminal-* do today) and derivation flows around them. E4/base16 themes leave
+  chrome unset → fully derived. FRESH-INSTANCE DISCIPLINE, documented on the method:
+  derivation runs on freshly-constructed Themes only (resolve and preview both construct
+  anew before deriving) — a second derive on the same instance is a no-op by the sentinel
+  rule, never a re-derivation, so toggling re-resolves from scratch (D3's pattern) rather
+  than mutating a live theme. resolve_theme calls it with the ACTIVE disposition before
+  applying overrides. Mechanics:
   - Steps are LIGHTNESS-ONLY moves in HSL (the existing rgb_to_hsl/hsl_to_rgb; hue and
     saturation pass through — phosphor/tokyo tints carry into chrome by construction).
   - Direction by base luminance: dark base (L < 0.5) steps LIGHTER ("lit from the
@@ -133,7 +141,7 @@ Grounded facts). Working order: the E3 slot.
     visible step, overlay = one subtle step, muted dimmer, accent retained but fainter).
     Zen never changes hue.
   - Exemption rule, CONCRETE (Codex r1 I-2 — no new field needed): derivation applies
-    ONLY when both bases are `Color::Rgb`; `rederive_chrome` is a NO-OP otherwise (named/
+    ONLY when both bases are `Color::Rgb`; `derive_chrome` skips them (the sentinel rule composes: non-Rgb bases simply never fill) (named/
     Default bases have no computable lightness — Codex m-4 made explicit). terminal-plain,
     terminal-ansi, and no-color therefore keep their EXPLICIT face tables untouched by
     construction; base16/file themes and all E4 bundles are Rgb and derive. Derivation
@@ -206,10 +214,16 @@ Grounded facts). Working order: the E3 slot.
   The handler flips `editor.chrome_disposition` (new Editor field, seeded from the
   resolved config) + sets `editor.theme_rederive: bool` + status "chrome: zen"/"chrome:
   full". The RUN LOOP — which owns `cfg.theme` (the full ThemeConfig incl. user styles)
-  and the EnvSnapshot — re-runs the COMPLETE resolve pipeline (base pick → derive with
-  the new disposition → theme overrides → user styles → cue glyph) and applies via
-  apply_theme; derive::rebuild + ensure_visible ride the existing apply path. Full
-  fidelity by construction — no state reconstruction from a folded Theme.
+  and the EnvSnapshot — re-runs the COMPLETE resolve pipeline (base pick → derive →
+  theme overrides → user styles → cue glyph) and applies via apply_theme (which never
+  derives — the pipeline already did); derive::rebuild + ensure_visible ride the
+  existing apply path. THE DISPOSITION INPUT is explicit (Codex r2 I-2):
+  `resolve_theme`'s signature gains it —
+  `resolve_theme(tc, env, disp: ChromeDisposition)` — startup passes the config-parsed
+  value (and seeds `editor.chrome_disposition` from it); the toggle's loop call passes
+  the editor's CURRENT value. The runtime field wins for the session; `[theme] chrome`
+  remains the persisted source of truth via Save Settings. Full fidelity by
+  construction — no state reconstruction from a folded Theme.
 - Persistence: the disposition joins the Save Settings inventory per-field.
   `SettingsSnapshot` gains `chrome_disposition`; `OTheme` gains
   `chrome: Option<String>` ("full"/"zen") beside `name`. The diff arm is a PLAIN string
@@ -224,12 +238,14 @@ Grounded facts). Working order: the E3 slot.
   chrome through as its own key; the bespoke theme diff section gains a plain diff_key
   string arm for chrome beside the provenance arm. Interaction pinned: a --config masking
   `file` guards `name` but NOT `chrome`.
-- The picker previews themes under the CURRENT disposition: `apply_theme` gains the
-  derivation call (`theme.rederive_chrome(self.chrome_disposition)` before install —
-  Codex r1 I-4: the preview path calls `Theme::builtin` + `apply_theme` directly,
-  bypassing resolve). KNOWN pre-existing approximation, recorded not fixed: the preview
-  path also bypasses user `styles.*` today (a previewed-then-committed theme lacks user
-  overrides until the next full resolve) — out of scope, noted in Deferred.
+- The picker previews themes under the CURRENT disposition — derivation lives in the
+  PREVIEW path, NOT in apply_theme (Codex r2 Critical: apply_theme is the shared install
+  path for already-RESOLVED themes too; an unconditional derive there would run after
+  resolve's user-style folding and smear resolved chrome). `preview_selected_theme`
+  derives on the freshly-built builtin (`theme.derive_chrome(editor.chrome_disposition)`)
+  BEFORE calling apply_theme; apply_theme itself never derives. KNOWN pre-existing
+  approximation, recorded not fixed: the preview path also bypasses user `styles.*`
+  today — out of scope, noted in Deferred.
 
 ## D4. Phosphor restructure
 
