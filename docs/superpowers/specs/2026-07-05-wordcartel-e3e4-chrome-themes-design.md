@@ -221,8 +221,8 @@ Grounded facts). Working order: the E3 slot.
   The handler flips `editor.chrome_disposition` (new Editor field, seeded from the
   resolved config) + sets `editor.theme_rederive: bool` + status "chrome: zen"/"chrome:
   full". The RUN LOOP — which owns `cfg.theme` (the full ThemeConfig incl. user styles)
-  and the EnvSnapshot — re-runs the COMPLETE resolve pipeline (base pick → derive →
-  theme overrides → user styles → cue glyph) and applies via apply_theme (which never
+  and the EnvSnapshot — re-runs the COMPLETE resolve pipeline (base pick/construct →
+  derive fills sentinels → user styles → cue glyph) and applies via apply_theme (which never
   derives — the pipeline already did); derive::rebuild + ensure_visible ride the
   existing apply path. THE DISPOSITION INPUT is explicit (Codex r2 I-2):
   `resolve_theme`'s signature gains it —
