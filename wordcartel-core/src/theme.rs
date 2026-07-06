@@ -1030,6 +1030,7 @@ mod tests {
         let chrome_before    = t.face(SemanticElement::Chrome);
         let selected_before  = t.face(SemanticElement::ChromeSelected);
         let muted_before     = t.face(SemanticElement::ChromeMuted);
+        let reverse_before   = t.face(SemanticElement::ChromeReverse);
         let overlay_before   = t.face(SemanticElement::ChromeOverlay);
         let accent_before    = t.face(SemanticElement::ChromeAccent);
         assert!(overlay_before == Face::default(), "overlay must start as sentinel");
@@ -1041,6 +1042,7 @@ mod tests {
         assert_eq!(t.face(SemanticElement::Chrome),         chrome_before,   "chrome kept");
         assert_eq!(t.face(SemanticElement::ChromeSelected), selected_before, "selected kept");
         assert_eq!(t.face(SemanticElement::ChromeMuted),    muted_before,    "muted kept");
+        assert_eq!(t.face(SemanticElement::ChromeReverse),  reverse_before,  "reverse kept — never derived");
         // the two new faces are now derived (non-sentinel)
         assert_ne!(t.face(SemanticElement::ChromeOverlay), Face::default(), "overlay derived");
         assert_ne!(t.face(SemanticElement::ChromeAccent),  Face::default(), "accent derived");
@@ -1117,7 +1119,7 @@ mod tests {
         if let (Color::Rgb{r:fr,..}, Color::Rgb{r:zr,..}) = (full_chr_r, zen_chr_r) {
             // full goes darker (fr ≤ canvas), zen is less dark (zr ≥ fr)
             assert!(zr >= fr, "zen chrome closer to canvas than full: zen={zr} full={fr}");
-            assert!(zr <= canvas_r || zr == canvas_r, "zen ≤ canvas for bar (dark→black)");
+            assert!(zr <= canvas_r, "zen ≤ canvas for bar (dark→black)");
         } else { panic!("non-Rgb chrome bg"); }
         // overlay: full goes lighter (#262525, overlay_r=0x26), zen = #181717 (less light, still above canvas)
         let full_ov = td_full.face(SemanticElement::ChromeOverlay).bg.unwrap();
@@ -1193,7 +1195,7 @@ mod tests {
     fn derive_contrast_clamp_floors_at_zero() {
         // Synthetic LIGHT-polarity theme where fg-vs-canvas contrast is below 4.5,
         // so all three bg rungs (toward black) shrink until contrast ≥ threshold - 0.001.
-        // Using a very-low-contrast LIGHT palette: white BG, near-white FG → contrast ≈ 1.2.
+        // Using a very-low-contrast LIGHT palette: white BG, near-white FG → contrast ≈ 1.24.
         // All rungs will floor at pct=0 (= canvas), no panic, no infinite loop.
         let white_bg = Color::Rgb { r:0xf8, g:0xf8, b:0xf8 };
         let near_white_fg = Color::Rgb { r:0xe0, g:0xe0, b:0xe0 };
