@@ -1,6 +1,6 @@
 # Chrome Density Presets + Overlay/Mouse Completeness — Design
 
-**Status:** design; Codex spec gate rounds 1-2 folded, round 3 re-review pending.
+**Status:** design; Codex spec gate CLEAN (round 3, zero findings) — READY for implementation planning.
 **Effort:** `effort-chrome-density-overlays` (branch off `main`).
 **Supersedes backlog items:** E1 (chrome/density presets), E2 (visual polish), plus the
 overlay/mouse-completeness and menu-windowing gaps surfaced 2026-07-06.
