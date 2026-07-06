@@ -146,12 +146,18 @@ Grounded facts). Working order: the E3 slot.
     terminal-ansi, and no-color therefore keep their EXPLICIT face tables untouched by
     construction; base16/file themes and all E4 bundles are Rgb and derive. Derivation
     runs PRE-quantize (depth downconversion applies to the derived values as to any).
-- Order of application: derive (from the theme's declared bases + disposition) → the
-  theme's own explicit face overrides (tokyo-night's PANEL_BG chrome; phosphor's
-  hue-shade chrome KEPT ONLY where probes show the derived values differ visibly from
-  today's — the implementer probes both and keeps the smaller override set that preserves
-  today's look) → user `styles.*` → cue-mode glyph forcing. `no-color`/cue mode: mono
-  modifier faces, untouched by derivation (monochrome themes skip it entirely).
+- Order of application, SENTINEL-CORRECT (Codex r3 I-2 — explicit faces are not a
+  post-derive patch; they simply cause derivation to SKIP them): construct the theme
+  (explicit chrome faces set where the theme wants overrides; all-None sentinels
+  elsewhere) → `derive_chrome` fills the all-None faces per the disposition → user
+  `styles.*` → cue-mode glyph forcing. tokyo-night keeps PANEL_BG by setting it in the
+  constructor. PHOSPHOR (Codex r3 I-3, explicit): the constructor sets a chrome face
+  ONLY for roles the implementer's probes show derived-differs-visibly-from-today, and
+  leaves the rest all-None to derive — under the sentinel any set face never derives, so
+  "keep the smaller override set" means literally deleting constructor lines for roles
+  where derivation reproduces today's look. `no-color`/cue mode: mono modifier faces —
+  monochrome themes' faces are all SET (modifiers), so derivation naturally skips them;
+  plus the non-Rgb base rule makes it doubly inert.
 
 ## D2. The six-face family + render rewiring
 
@@ -204,8 +210,9 @@ Grounded facts). Working order: the E3 slot.
 - Config: `[theme] chrome = "full" | "zen"` (RawTheme + ThemeConfig
   `Option<ChromeDisposition>`; parsed at resolve like depth; unknown → warn + Full;
   default Full).
-- resolve_theme applies the disposition in the derivation call (D1's order). The
-  ChromeDisposition reaches apply_theme so the picker/preview path re-derives correctly.
+- resolve_theme applies the disposition in the derivation call (D1's order); apply_theme
+  is a pure INSTALL path (never derives) — the preview path derives on its fresh builtin
+  before calling it (D3's preview bullet).
 - `toggle_chrome` command ("Chrome: Full/Zen", MenuCategory::Settings, registered BEFORE
   save_settings — the journey-preservation rule). SOURCE OF TRUTH (Codex r1 Critical:
   resolve_theme destructively folds user styles into the Theme — theme_resolve.rs:122 —
@@ -304,6 +311,10 @@ Grounded facts). Working order: the E3 slot.
 
 ## Testing
 
+- Sentinel contract pins (core): a second derive_chrome call is a no-op (byte-equal
+  faces); tokyo-night PANEL_BG and each phosphor's kept overrides survive derivation;
+  a base16/E4 theme's unset chrome derives fully (no all-None face remains on Rgb
+  themes); non-Rgb themes (terminal-plain/ansi, no-color) byte-untouched by the call.
 - Ladder unit battery (core): direction by luminance (dark lightens, light darkens);
   zen steps strictly smaller than full; hue/saturation preserved through steps (the
   phosphor-tint pin); every derived face fully explicit (no None fg/bg on color themes);
