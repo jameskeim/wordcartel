@@ -132,7 +132,7 @@ the Indexed256 rung test — GAP note 4), AND updates the cross-crate pins in `w
 that assert old derived-chrome hexes through the real rederive path.
 
 **Files:**
-- Modify: `wordcartel-core/src/theme.rs`, `wordcartel/src/app.rs` (tests only), `wordcartel/src/theme_resolve.rs` (tests only — the `chrome_key_parses_and_derives` Zen pin; Codex plan r2).
+- Modify: `wordcartel-core/src/theme.rs`, `wordcartel/src/app.rs` (tests only), `wordcartel/src/theme_resolve.rs` (tests only — `chrome_key_parses_and_derives`; Codex plan r2), `wordcartel/src/theme_picker.rs` (tests only — `preview_derives_zen_chrome_bg_on_flexoki_dark`; Codex plan r3).
 
 **Interfaces:**
 - Rewrites the body of `pub fn Theme::derive_chrome(&mut self, disp: ChromeDisposition)`
@@ -422,6 +422,9 @@ that assert old derived-chrome hexes through the real rederive path.
   - **`chrome_key_parses_and_derives`** (`theme_resolve.rs:399`; the Zen flexoki-dark Chrome pin at
     ~:409): `#0f0e0e → #1e1c1c` (§II.5 final — flexoki-dark is stable across T1) `[verify]`; update the
     `// §B.3 …` comment (Codex plan r2 — this cross-crate site was unowned).
+  - **`preview_derives_zen_chrome_bg_on_flexoki_dark`** (`theme_picker.rs:107` and `:131`): the Zen
+    flexoki-dark Chrome pin `#0f0e0e → #1e1c1c` at BOTH sites (§II.5 final) `[verify]`; update the
+    assertion/comment text (Codex plan r3 — the last unowned flexoki-dark chrome pin site).
 
   Run: `cargo test -p wordcartel-core -p wordcartel -- derive_ derived_rungs_distinct_at_256 rederive_`
   → RED (the tests reference the new invariants / pin values the old code does not produce; the base16
