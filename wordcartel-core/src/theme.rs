@@ -462,7 +462,7 @@ pub fn tokyo_night() -> Theme {
         heading_level_glyph: true,
         monochrome: false,
         faces: ThemeFaces {
-            text: Face::default(),
+            text: Face { fg: Some(FG), ..Face::default() },
             emphasis: Face { italic: Some(true), ..Face::default() },
             strong: Face { bold: Some(true), ..Face::default() },
             strong_emphasis: Face { bold: Some(true), italic: Some(true), ..Face::default() },
@@ -685,7 +685,7 @@ pub fn from_base16(name: &str, p: BasePalette) -> Theme {
         heading_level_glyph: true,
         monochrome: false,
         faces: ThemeFaces {
-            text: Face::default(),
+            text: Face { fg: Some(b[5]), ..Face::default() },
             emphasis: Face { italic: Some(true), fg: Some(b[0xE]), ..Face::default() },
             strong: Face { bold: Some(true), fg: Some(b[0xA]), ..Face::default() },
             strong_emphasis: Face { bold: Some(true), italic: Some(true), fg: Some(b[0x9]), ..Face::default() },

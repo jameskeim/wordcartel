@@ -1346,13 +1346,24 @@ mod tests {
     }
 
     #[test]
-    fn tokyo_night_heading_row_carries_heading_fg() {
+    fn tokyo_night_heading_row_carries_heading_bold() {
+        // After the text-face base_fg fix, heading text carries base_fg (not heading-role MAGENTA)
+        // — the plain inline style element (SE::Text) comes last in the compose stack and overrides
+        // the role fg with base_fg. Headings remain visually distinct through BOLD (and the dimmed
+        // prefix glyph, which still uses the heading-role fg via prefix_element). This test was
+        // previously named `tokyo_night_heading_row_carries_heading_fg` and was asserting the old
+        // behavior where heading fg fell through because SE::Text had fg=None — that was the bug.
         let mut ed = Editor::new_from_text("# Title\n", None, (40, 4));
         ed.theme = wordcartel_core::theme::tokyo_night();
         derive::rebuild(&mut ed);
         let buf = render_to_buffer(&mut ed, 40, 4);
-        let want = crate::compose::compose(&ed.theme, ed.depth, &[wordcartel_core::theme::SemanticElement::Text, wordcartel_core::theme::SemanticElement::Heading(1)]).fg;
-        assert!((0..40).any(|x| buf[(x,0)].style().fg == want && want.is_some()), "heading fg applied");
+        // Heading text must carry base_fg (SE::Text last in stack) and BOLD (from heading face).
+        let base_fg = compose::base_canvas(&ed.theme, ed.depth).fg;
+        assert!(base_fg.is_some(), "tokyo-night base_fg must be Some(Rgb)");
+        assert!((0..40).any(|x| buf[(x,0)].style().fg == base_fg),
+                "heading text must carry base_fg after fix");
+        assert!((0..40).any(|x| buf[(x,0)].style().add_modifier.contains(Modifier::BOLD)),
+                "heading text must carry BOLD");
     }
 
     #[test]
@@ -1482,30 +1493,34 @@ mod tests {
     }
 
     #[test]
-    fn source_mode_no_heading_fg_live_preview_has_heading_fg() {
-        // In SourcePlain under Tokyo Night, a heading row must NOT carry the heading fg.
-        // In LivePreview it must.
+    fn source_mode_no_heading_bold_live_preview_has_heading_bold() {
+        // After the text-face base_fg fix, heading text under Tokyo Night carries base_fg in
+        // BOTH modes (SE::Text last in the LivePreview compose stack overrides the role fg).
+        // The remaining distinction between modes is BOLD: LivePreview applies the heading face
+        // (bold=Some(true)); SourcePlain uses only [SE::Text] (no bold). This test was previously
+        // named `source_mode_no_heading_fg_live_preview_has_heading_fg` and asserted a heading-fg
+        // distinction that no longer holds — updated to assert the BOLD distinction instead.
         use crate::editor::RenderMode;
         let mut ed = Editor::new_from_text("# Heading\n", None, (40, 4));
         ed.theme = wordcartel_core::theme::tokyo_night();
 
-        // LivePreview first: heading fg should appear.
+        // LivePreview: heading text carries BOLD (heading face applied) and base_fg.
         ed.active_mut().view.mode = RenderMode::LivePreview;
         crate::derive::rebuild(&mut ed);
         let buf_preview = render_to_buffer(&mut ed, 40, 4);
-        let want = crate::compose::compose(&ed.theme, ed.depth, &[
-            wordcartel_core::theme::SemanticElement::Text,
-            wordcartel_core::theme::SemanticElement::Heading(1),
-        ]).fg;
-        let preview_has_heading_fg = (0..40).any(|x| buf_preview[(x,0)].style().fg == want && want.is_some());
-        assert!(preview_has_heading_fg, "LivePreview heading must carry heading fg");
+        let base_fg = compose::base_canvas(&ed.theme, ed.depth).fg;
+        assert!(base_fg.is_some(), "tokyo-night base_fg must be Some(Rgb)");
+        let preview_has_bold = (0..40u16).any(|x| buf_preview[(x,0)].style().add_modifier.contains(Modifier::BOLD));
+        let preview_has_base_fg = (0..40u16).any(|x| buf_preview[(x,0)].style().fg == base_fg);
+        assert!(preview_has_bold, "LivePreview heading must carry BOLD");
+        assert!(preview_has_base_fg, "LivePreview heading must carry base_fg (SE::Text last in stack)");
 
-        // SourcePlain: base canvas only, no heading fg.
+        // SourcePlain: base canvas only — no BOLD, no heading role applied.
         ed.active_mut().view.mode = RenderMode::SourcePlain;
         crate::derive::rebuild(&mut ed);
         let buf_source = render_to_buffer(&mut ed, 40, 4);
-        let source_has_heading_fg = (0..40).any(|x| buf_source[(x,0)].style().fg == want && want.is_some());
-        assert!(!source_has_heading_fg, "SourcePlain must not carry heading fg (base canvas only)");
+        let source_has_bold = (0..40u16).any(|x| buf_source[(x,0)].style().add_modifier.contains(Modifier::BOLD));
+        assert!(!source_has_bold, "SourcePlain must not carry heading BOLD (base canvas only)");
     }
 
     #[test]
@@ -2762,5 +2777,50 @@ mod tests {
         }
         // And the RIGHT EDGE specifically is Chrome (it is unpainted today — this fails pre-fix).
         assert_eq!(buf[(39u16, 0u16)].style().bg, chrome, "right edge must carry the Chrome fill");
+    }
+
+    /// Whole-branch gate regression: base16 themes and tokyo-night had `text: Face::default()`
+    /// (no fg), so plain body-text cells rendered with terminal-default fg over base_bg — a
+    /// visible readability defect once the opaque canvas paints base_bg. The fix sets
+    /// `text.fg = Some(base_fg)` in `from_base16` and `tokyo_night`, matching phosphor.
+    ///
+    /// Must FAIL before the fix (text fg is None) and PASS after (text fg == base_fg).
+    #[test]
+    fn body_text_carries_theme_fg() {
+        use crate::editor::RenderMode;
+
+        // flexoki-dark (a base16 theme) — plain body-text cells must carry base_fg.
+        {
+            let mut ed = Editor::new_from_text("Hello\n", None, (40, 4));
+            ed.theme = wordcartel_core::theme::flexoki_dark();
+            ed.active_mut().view.mode = RenderMode::LivePreview;
+            derive::rebuild(&mut ed);
+            let buf = render_to_buffer(&mut ed, 40, 4);
+            let want = compose::base_canvas(&ed.theme, ed.depth).fg;
+            assert!(want.is_some(), "flexoki-dark base_fg must be Some(Rgb)");
+            assert!(
+                (0..40u16).any(|x| buf[(x, 0u16)].style().fg == want),
+                "flexoki-dark: body text must carry base_fg {:?} — row-0 fgs: {:?}",
+                want,
+                (0..40u16).map(|x| buf[(x, 0u16)].style().fg).collect::<Vec<_>>(),
+            );
+        }
+
+        // tokyo-night — plain body-text cells must carry base_fg.
+        {
+            let mut ed = Editor::new_from_text("Hello\n", None, (40, 4));
+            ed.theme = wordcartel_core::theme::tokyo_night();
+            ed.active_mut().view.mode = RenderMode::LivePreview;
+            derive::rebuild(&mut ed);
+            let buf = render_to_buffer(&mut ed, 40, 4);
+            let want = compose::base_canvas(&ed.theme, ed.depth).fg;
+            assert!(want.is_some(), "tokyo-night base_fg must be Some(Rgb)");
+            assert!(
+                (0..40u16).any(|x| buf[(x, 0u16)].style().fg == want),
+                "tokyo-night: body text must carry base_fg {:?} — row-0 fgs: {:?}",
+                want,
+                (0..40u16).map(|x| buf[(x, 0u16)].style().fg).collect::<Vec<_>>(),
+            );
+        }
     }
 }
