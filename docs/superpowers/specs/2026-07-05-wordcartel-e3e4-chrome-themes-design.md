@@ -1,6 +1,11 @@
 # E3+E4 — derived chrome ladder, full|zen axis, theme lineup restructure (design)
 
-Status: DRAFT (user-approved design 2026-07-05; seven forks resolved one at a time)
+Status: CLEAN — Codex ×8 ("ready for planning") + Fable ×3 (READY; the ladder math
+probe-falsified and re-ratified as RGB pre-blend with the split ladder and contrast
+clamp; all round-2 failures verified dead; the Ansi16 policy canvas-keyed), 2026-07-05.
+Ten user ratifications across the loop: the seven brainstorm forks + C1-A (pre-blend +
+clamp), I1-A (split ladder — sunken bars, raised overlays), I4-A (phosphor chrome
+deleted).
 Effort: E3 (chrome theming coherence + the render.rs split, per the backlog) + E4 (bundled
 themes) as ONE effort, E4's research executed first (deliverables:
 `.superpowers/sdd/e4-themes-research.md` + the deep-research findings summarized in
