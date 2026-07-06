@@ -377,9 +377,12 @@ Grounded facts). Working order: the E3 slot.
   exact invisibility being fixed; and terminal-plain's Face::default() overlay cannot
   serve, since its vacuous-by-identity argument requires canvas == terminal default,
   false for Rgb themes at Ansi16): at `Depth::Ansi16`, ladder-derived chrome is replaced
-  by a fixed named-ANSI six-face table keyed on the quantized canvas — canvas
-  quantizes Black → bars AND overlay interiors bg DarkGray / fg White, selected
-  Black-on-White, muted dim; canvas quantizes light → bars/overlays bg Black / fg White.
+  by a fixed named-ANSI SIX-face table keyed on a BINARY predicate (quantized canvas ==
+  Black vs everything else — a colored 16-quantized canvas takes the "else" arm):
+  Black-canvas arm — Chrome/ChromeOverlay bg DarkGray fg White, ChromeSelected
+  Black-on-White, ChromeMuted White dim, ChromeAccent White bold; else arm —
+  Chrome/ChromeOverlay bg Black fg White, ChromeSelected White-on-Black, ChromeMuted
+  White dim, ChromeAccent White bold.
   Explicit constructor chrome (tokyo, terminal-*) quantizes as today. Applied in resolve
   after depth detection; pinned CORRECTLY: flexoki-dark at Ansi16 → status bar bg
   DarkGray, fg White, ≠ the Black canvas.
@@ -388,8 +391,9 @@ Grounded facts). Working order: the E3 slot.
   zen steps strictly smaller than full; hue angle preserved through steps; saturation preserved on SUNKEN rungs and decaying
   monotonically on RAISED rungs (Fable r2 N5 — toward-white blends desaturate: mocha
   0.211→0.117; the phosphor-tint pin asserts hue only); every derived face fully explicit (no None fg/bg on color themes);
-  the contrast invariant (primary fg vs the LIGHTEST chrome face ≥ a pinned readable
-  delta — exact metric pinned by plan probes); accent desaturation bound.
+  the contrast invariant, THEME-RELATIVE per the D1 clamp (primary fg vs every derived
+  rung ≥ min(pinned threshold, the theme's own fg-vs-canvas) — solarized-light cannot
+  reach an absolute 4.5, N2's forcing case; exact pinned threshold set by plan probes); accent desaturation bound.
 - Theme lineup: builtin_names == 19 + each new theme resolves at all three depths without
   panic (quantize sweep); "default"-alias + "-flat"-fallback warnings pinned;
   flexoki-dark launch-default pin (resolve with empty ThemeConfig → name == "flexoki-dark");
