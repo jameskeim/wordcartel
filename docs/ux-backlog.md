@@ -401,7 +401,29 @@ items** (✓/radio for toggles + the active keymap preset — the menu model mus
 display), a consistent styling language. Goal: the full-chrome mode looks *designed*, not
 assembled.
 
-### E3. Chrome theming coherence — one chrome family + a full|zen axis + phosphor restructure — `needs-design` · Medium-Large
+### E3. Chrome theming coherence — `SHIPPED` 2026-07-06 (merge eb9cfd1, with E4)
+
+**Shipped as one effort with E4:** the six-face chrome family (`Chrome`, `ChromeReverse` cue-only,
+`ChromeSelected`, `ChromeMuted`, + NEW `ChromeOverlay`/`ChromeAccent`); `Theme::derive_chrome`
+(split-direction RGB pre-blend ladder — bars sink toward black, overlays raise; contrast-clamped;
+sentinel-fill so explicit constructor faces survive); the `[theme] chrome = full|zen` axis +
+`toggle_chrome` with honest no-effect arms + per-field persistence; the render split (ChromeStyles
+precompute + render_overlays.rs painters); overlay interiors/query lines fully themed; fg-only
+borders (the phosphor halo fix); the status row a full-width bar matching the menu bar, with an
+accent face for prompt-active states. All three original reports pinned by regression tests.
+
+**Follow-ups recorded at ship (from the final gates):** (1) **the unpainted canvas** — document
+cells/blank rows carry the TERMINAL's bg, not `base_bg`; the whole ladder renders relative to the
+terminal background, and flexoki-dark as launch default means a light terminal gets light-on-light
+(pre-existing, human decision: paint base_canvas across the frame vs OSC default colors vs document
+the assumption); (2) Ansi16 light-arm ChromeSelected is color-identical to the fill (selection
+color-invisible at 16-color on light canvases — follow-up: e.g. DarkGray selected bg); (3)
+rosepine-dawn base02 ships the base16-YAML `#f2e9de` vs canonical `#f2e9e1` (selection/wrap-guide
+only).
+
+*(Original design notes preserved below for provenance.)*
+
+#### E3 original notes — `needs-design` (superseded by the shipped design doc)
 
 *(Added 2026-07-04. Facts as of `bd3b72c`. SHOULD PRECEDE E1/E2's preset work and E4 —
 presets and new themes should build on a coherent chrome model, not before it. **This effort
@@ -451,7 +473,15 @@ wordcartel-core theme.rs:35-38; no overlay-specific faces). Their use is inconsi
 4. **tokyo-night full** — the main theme extends its palette through the menu bar, menus,
    modals, and status bar; today's subdued look becomes its `zen` disposition.
 
-### E4. Bundled themes research — `research note` · Small (research), lands AFTER E3
+### E4. Bundled themes research — `SHIPPED` 2026-07-06 (merge eb9cfd1, with E3)
+
+**Shipped:** ten bundled themes (catppuccin-mocha/latte, flexoki-dark/light, gruvbox-dark/light,
+rosepine-moon/dawn, solarized-dark/light — all MIT, source URLs in theme.rs), `terminal-ansi`
+(named-ANSI markdown colorization), `default` renamed `terminal-plain` (alias + warning at
+resolve), phosphor `-flat` variants removed (chrome now derives), **flexoki-dark = the launch
+default** (no-config arm; `Depth::None` still wins). 19 builtins total.
+
+#### E4 original notes (provenance)
 
 *(Added 2026-07-04, user request.)* Research additional out-of-the-box full-color themes.
 Selection bar: **demonstrated markdown-colorizing strength** first; then portability into the
@@ -554,7 +584,7 @@ B2's hanging indent is a wrap-policy feature (travels inside B1); A3's palette p
 A6's territory; E2's checkable items serve A5/E1; C2 and C3 are islands.
 
 *(Progress: 1 A6 ✓ · 2 H1 ✓ · 3 B1+B2 ✓ · 4 C4 ✓ (2026-07-04) · 5 C2 ✓ · 6 D1+A5 ✓
-(2026-07-05) — **next: 7, E3 (+E4 research in parallel)**.)*
+(2026-07-05) · 7 E3+E4 ✓ (2026-07-06, shipped together) — **next: 8, E1+E2 (+A3 curation)**.)*
 
 1. **A6** palette reachability — folds in A3(a) hints-verification + the palette-completeness
    invariant test (same territory). Kills the invisible-dispatch hazard first.
