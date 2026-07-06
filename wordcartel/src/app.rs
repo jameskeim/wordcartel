@@ -4617,7 +4617,7 @@ mod tests {
 
     /// Open the picker via the `theme` command dispatch, immediately Enter without
     /// sending any navigation keys — no preview fired, so `previewed` is None;
-    /// `theme_identity` must stay at the initial Builtin("default").
+    /// `theme_identity` must stay at the initial Builtin("terminal-plain").
     #[test]
     fn untouched_picker_enter_leaves_theme_identity_unchanged() {
         use crate::registry::{Registry, CommandId, Ctx};
@@ -4637,7 +4637,7 @@ mod tests {
         crate::app::reduce(press(KeyCode::Enter, KeyModifiers::NONE), &mut e, &reg, &km, &ex, &clk, &tx);
         assert!(e.theme_picker.is_none(), "picker must be closed after Enter");
         assert_eq!(e.theme_identity,
-            crate::settings::ThemeIdentity::Builtin("default".into()),
+            crate::settings::ThemeIdentity::Builtin("terminal-plain".into()),
             "untouched Enter must leave theme_identity unchanged (spec I-1)");
     }
 

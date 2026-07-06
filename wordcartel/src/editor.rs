@@ -492,7 +492,7 @@ impl Editor {
             quit_drain: None,
             quit_drain_advance: false,
             settings_save_requested: false,
-            theme_identity: crate::settings::ThemeIdentity::Builtin("default".into()),
+            theme_identity: crate::settings::ThemeIdentity::Builtin("terminal-plain".into()),
         };
         let id = e.alloc_id(); // -> BufferId(0); next_buffer_id becomes 1
         e.buffers.push(Buffer::from_text(id, text, path, area));
@@ -1135,7 +1135,7 @@ mod tests {
     #[test]
     fn editor_seeds_default_theme_truecolor() {
         let ed = Editor::new_from_text("x", None, (80, 24));
-        assert_eq!(ed.theme.name, "default");
+        assert_eq!(ed.theme.name, "terminal-plain"); // default() now named terminal-plain (D5)
         assert_eq!(ed.depth, wordcartel_core::theme::Depth::Truecolor);
     }
 

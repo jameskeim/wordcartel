@@ -152,30 +152,38 @@ impl Theme {
     }
     pub fn builtin(name: &str) -> Option<Theme> {
         match name {
-            "default" => Some(default()),
+            "terminal-plain" | "default" => Some(default()), // "default" alias — warn in T3
+            "terminal-ansi" => Some(terminal_ansi()),
             "no-color" => Some(no_color()),
             "tokyo-night" => Some(tokyo_night()),
+            "catppuccin-mocha"  => Some(catppuccin_mocha()),
+            "catppuccin-latte"  => Some(catppuccin_latte()),
+            "flexoki-dark"      => Some(flexoki_dark()),
+            "flexoki-light"     => Some(flexoki_light()),
+            "gruvbox-dark"      => Some(gruvbox_dark()),
+            "gruvbox-light"     => Some(gruvbox_light()),
+            "rosepine-moon"     => Some(rosepine_moon()),
+            "rosepine-dawn"     => Some(rosepine_dawn()),
+            "solarized-dark"    => Some(solarized_dark()),
+            "solarized-light"   => Some(solarized_light()),
             _ => {
-                // "phosphor-<hue>" or "phosphor-<hue>-flat"
+                // "phosphor-<hue>" — flat suffix removed (D4); resolve layer maps stale aliases (T3).
                 let rest = name.strip_prefix("phosphor-")?;
-                let (hue_name, flat) = if let Some(h) = rest.strip_suffix("-flat") {
-                    (h, true)
-                } else {
-                    (rest, false)
-                };
-                let hue = PHOSPHORS.iter().find(|(n, _)| *n == hue_name)?.1;
-                Some(phosphor(name, hue, flat))
+                let hue = PHOSPHORS.iter().find(|(n, _)| *n == rest)?.1;
+                Some(phosphor(name, hue))
             }
         }
     }
     pub fn builtin_names() -> &'static [&'static str] {
+        // D5 order: terminal variants → no-color → tokyo → phosphors → 10 E4 themes
         &[
-            "default", "no-color", "tokyo-night",
-            "phosphor-green", "phosphor-green-flat",
-            "phosphor-amber", "phosphor-amber-flat",
-            "phosphor-red",   "phosphor-red-flat",
-            "phosphor-blue",  "phosphor-blue-flat",
-            "phosphor-purple","phosphor-purple-flat",
+            "terminal-plain", "terminal-ansi", "no-color", "tokyo-night",
+            "phosphor-green", "phosphor-amber", "phosphor-red", "phosphor-blue", "phosphor-purple",
+            "catppuccin-mocha", "catppuccin-latte",
+            "flexoki-dark",  "flexoki-light",
+            "gruvbox-dark",  "gruvbox-light",
+            "rosepine-moon", "rosepine-dawn",
+            "solarized-dark", "solarized-light",
         ]
     }
 
@@ -382,7 +390,7 @@ pub fn no_color() -> Theme {
 
 pub fn default() -> Theme {
     Theme {
-        name: "default".into(),
+        name: "terminal-plain".into(),
         base_fg: Color::Default, base_bg: Color::Default,
         heading_level_glyph: true, monochrome: false,
         faces: ThemeFaces {
@@ -488,6 +496,164 @@ pub fn tokyo_night() -> Theme {
             chrome_accent: Face::default(),
         },
     }
+}
+
+/// ANSI-named theme — explicit named-color chrome ladder (§C terminal-ansi table).
+/// `base_fg/bg = Color::Default`; NOT monochrome; chrome faces fully explicit (unlike
+/// terminal-plain whose overlay stays exempt). [verify at implementation: named-hue choices]
+pub fn terminal_ansi() -> Theme {
+    let m = |fg: Option<Color>, bold: bool, italic: bool, underline: bool, strike: bool, reverse: bool| Face {
+        fg, bold: bold.then_some(true), italic: italic.then_some(true),
+        underline: underline.then_some(true), strike: strike.then_some(true),
+        reverse: reverse.then_some(true), ..Face::default()
+    };
+    Theme {
+        name: "terminal-ansi".into(),
+        base_fg: Color::Default, base_bg: Color::Default,
+        heading_level_glyph: true, monochrome: false,
+        faces: ThemeFaces {
+            text: Face::default(),
+            emphasis: m(None, false, true, false, false, false),
+            strong: m(None, true, false, false, false, false),
+            strong_emphasis: m(None, true, true, false, false, false),
+            code: m(Some(Color::Green), false, false, false, false, false),
+            strikethrough: m(None, false, false, false, true, false),
+            link: m(Some(Color::Blue), false, false, true, false, false),
+            heading: [
+                m(Some(Color::Cyan),    true, false, false, false, false), // h1
+                m(Some(Color::Blue),    true, false, false, false, false), // h2
+                m(Some(Color::Green),   true, false, false, false, false), // h3
+                m(Some(Color::Yellow),  true, false, false, false, false), // h4
+                m(Some(Color::Magenta), true, false, false, false, false), // h5
+                m(Some(Color::Red),     true, false, false, false, false), // h6
+            ],
+            block_quote: Face { fg: Some(Color::Cyan), italic: Some(true), ..Face::default() },
+            code_block: m(Some(Color::Green), false, false, false, false, false),
+            list_marker: m(Some(Color::Yellow), false, false, false, false, false),
+            thematic_break: Face { fg: Some(Color::DarkGray), ..Face::default() },
+            front_matter: Face { fg: Some(Color::Magenta), italic: Some(true), ..Face::default() },
+            comment: Face { fg: Some(Color::DarkGray), italic: Some(true), dim: Some(true), ..Face::default() },
+            selection: Face { reverse: Some(true), ..Face::default() },
+            marked_block: Face { bg: Some(Color::DarkGray), reverse: Some(true), bold: Some(true), underline: Some(true), ..Face::default() },
+            search_match: Face { bg: Some(Color::Yellow), fg: Some(Color::Black), ..Face::default() },
+            search_current: Face { reverse: Some(true), bold: Some(true), ..Face::default() },
+            diag_spelling: Face { underline: Some(true), underline_color: Some(Color::Red), ..Face::default() },
+            diag_grammar:  Face { underline: Some(true), underline_color: Some(Color::Blue), ..Face::default() },
+            focus_dim: Face { fg: Some(Color::DarkGray), ..Face::default() },
+            fold_marker: Face { fg: Some(Color::DarkGray), ..Face::default() },
+            wrap_guide: Face { fg: Some(Color::DarkGray), ..Face::default() },
+            // Explicit named-ANSI chrome ladder (§C terminal-ansi table; D2 — unlike terminal-plain
+            // whose overlay is exempt, terminal-ansi makes ChromeOverlay explicit).
+            chrome:          Face { fg: Some(Color::White),    bg: Some(Color::Black),   ..Face::default() },
+            chrome_reverse:  Face { reverse: Some(true), ..Face::default() },
+            chrome_overlay:  Face { fg: Some(Color::White),    bg: Some(Color::DarkGray), ..Face::default() },
+            chrome_selected: Face { fg: Some(Color::Black),    bg: Some(Color::White),   ..Face::default() },
+            chrome_muted:    Face { fg: Some(Color::Gray),     bg: Some(Color::Black), dim: Some(true), ..Face::default() },
+            chrome_accent:   Face { fg: Some(Color::LightCyan), bg: Some(Color::Black), bold: Some(true), ..Face::default() },
+        },
+    }
+}
+
+// ── E4 bundled themes — ten base16 palettes, chrome all-sentinel (derive_chrome fills them) ──
+
+/// Catppuccin Mocha — src: tinted-theming/schemes base16/catppuccin-mocha.yaml; catppuccin.com/palette
+pub fn catppuccin_mocha() -> Theme {
+    from_base16("catppuccin-mocha", BasePalette { base: [
+        rgb(0x1e,0x1e,0x2e), rgb(0x18,0x18,0x25), rgb(0x31,0x32,0x44), rgb(0x45,0x47,0x5a), // 00-03
+        rgb(0x58,0x5b,0x70), rgb(0xcd,0xd6,0xf4), rgb(0xf5,0xe0,0xdc), rgb(0xb4,0xbe,0xfe), // 04-07
+        rgb(0xf3,0x8b,0xa8), rgb(0xfa,0xb3,0x87), rgb(0xf9,0xe2,0xaf), rgb(0xa6,0xe3,0xa1), // 08-0B
+        rgb(0x94,0xe2,0xd5), rgb(0x89,0xb4,0xfa), rgb(0xcb,0xa6,0xf7), rgb(0xf2,0xcd,0xcd), // 0C-0F
+    ], extra: None })
+}
+
+/// Catppuccin Latte — src: tinted-theming/schemes base16/catppuccin-latte.yaml; catppuccin.com/palette
+pub fn catppuccin_latte() -> Theme {
+    from_base16("catppuccin-latte", BasePalette { base: [
+        rgb(0xef,0xf1,0xf5), rgb(0xe6,0xe9,0xef), rgb(0xcc,0xd0,0xda), rgb(0xbc,0xc0,0xcc), // 00-03
+        rgb(0xac,0xb0,0xbe), rgb(0x4c,0x4f,0x69), rgb(0xdc,0x8a,0x78), rgb(0x72,0x87,0xfd), // 04-07
+        rgb(0xd2,0x0f,0x39), rgb(0xfe,0x64,0x0b), rgb(0xdf,0x8e,0x1d), rgb(0x40,0xa0,0x2b), // 08-0B
+        rgb(0x17,0x92,0x99), rgb(0x1e,0x66,0xf5), rgb(0x88,0x39,0xef), rgb(0xdd,0x78,0x78), // 0C-0F
+    ], extra: None })
+}
+
+/// Flexoki Dark — src: kepano/flexoki, stephango.com/flexoki — tones CONFIRMED; base16 = derived mapping
+pub fn flexoki_dark() -> Theme {
+    from_base16("flexoki-dark", BasePalette { base: [
+        rgb(0x10,0x0f,0x0f), rgb(0x1c,0x1b,0x1a), rgb(0x28,0x27,0x26), rgb(0x57,0x56,0x53), // 00-03
+        rgb(0x87,0x85,0x80), rgb(0xce,0xcd,0xc3), rgb(0xda,0xd8,0xce), rgb(0xe6,0xe4,0xd9), // 04-07
+        rgb(0xd1,0x4d,0x41), rgb(0xda,0x70,0x2c), rgb(0xd0,0xa2,0x15), rgb(0x87,0x9a,0x39), // 08-0B
+        rgb(0x3a,0xa9,0x9f), rgb(0x43,0x85,0xbe), rgb(0x8b,0x7e,0xc8), rgb(0xce,0x5d,0x97), // 0C-0F
+    ], extra: None })
+}
+
+/// Flexoki Light — src: kepano/flexoki, stephango.com/flexoki — 600-step accents for on-light
+pub fn flexoki_light() -> Theme {
+    from_base16("flexoki-light", BasePalette { base: [
+        rgb(0xff,0xfc,0xf0), rgb(0xf2,0xf0,0xe5), rgb(0xe6,0xe4,0xd9), rgb(0xb7,0xb5,0xac), // 00-03
+        rgb(0x6f,0x6e,0x69), rgb(0x10,0x0f,0x0f), rgb(0x1c,0x1b,0x1a), rgb(0x28,0x27,0x26), // 04-07
+        rgb(0xaf,0x30,0x29), rgb(0xbc,0x52,0x15), rgb(0xad,0x83,0x01), rgb(0x66,0x80,0x0b), // 08-0B
+        rgb(0x24,0x83,0x7b), rgb(0x20,0x5e,0xa6), rgb(0x5e,0x40,0x9d), rgb(0xa0,0x2f,0x6f), // 0C-0F
+    ], extra: None })
+}
+
+/// Gruvbox Dark (medium) — src: tinted-theming base16/gruvbox-dark-medium.yaml; morhetz/gruvbox
+pub fn gruvbox_dark() -> Theme {
+    from_base16("gruvbox-dark", BasePalette { base: [
+        rgb(0x28,0x28,0x28), rgb(0x3c,0x38,0x36), rgb(0x50,0x49,0x45), rgb(0x66,0x5c,0x54), // 00-03
+        rgb(0xbd,0xae,0x93), rgb(0xd5,0xc4,0xa1), rgb(0xeb,0xdb,0xb2), rgb(0xfb,0xf1,0xc7), // 04-07
+        rgb(0xfb,0x49,0x34), rgb(0xfe,0x80,0x19), rgb(0xfa,0xbd,0x2f), rgb(0xb8,0xbb,0x26), // 08-0B
+        rgb(0x8e,0xc0,0x7c), rgb(0x83,0xa5,0x98), rgb(0xd3,0x86,0x9b), rgb(0xd6,0x5d,0x0e), // 0C-0F
+    ], extra: None })
+}
+
+/// Gruvbox Light (medium) — src: tinted-theming base16/gruvbox-light-medium.yaml; morhetz/gruvbox
+pub fn gruvbox_light() -> Theme {
+    from_base16("gruvbox-light", BasePalette { base: [
+        rgb(0xfb,0xf1,0xc7), rgb(0xeb,0xdb,0xb2), rgb(0xd5,0xc4,0xa1), rgb(0xbd,0xae,0x93), // 00-03
+        rgb(0x66,0x5c,0x54), rgb(0x50,0x49,0x45), rgb(0x3c,0x38,0x36), rgb(0x28,0x28,0x28), // 04-07
+        rgb(0x9d,0x00,0x06), rgb(0xaf,0x3a,0x03), rgb(0xb5,0x76,0x14), rgb(0x79,0x74,0x0e), // 08-0B
+        rgb(0x42,0x7b,0x58), rgb(0x07,0x66,0x78), rgb(0x8f,0x3f,0x71), rgb(0xd6,0x5d,0x0e), // 0C-0F
+    ], extra: None })
+}
+
+/// Rosé Pine Moon — src: base16/rose-pine-moon.yaml; rosepinetheme.com/palette
+pub fn rosepine_moon() -> Theme {
+    from_base16("rosepine-moon", BasePalette { base: [
+        rgb(0x23,0x21,0x36), rgb(0x2a,0x27,0x3f), rgb(0x39,0x35,0x52), rgb(0x6e,0x6a,0x86), // 00-03
+        rgb(0x90,0x8c,0xaa), rgb(0xe0,0xde,0xf4), rgb(0xe0,0xde,0xf4), rgb(0x56,0x52,0x6e), // 04-07
+        rgb(0xeb,0x6f,0x92), rgb(0xf6,0xc1,0x77), rgb(0xea,0x9a,0x97), rgb(0x3e,0x8f,0xb0), // 08-0B
+        rgb(0x9c,0xcf,0xd8), rgb(0xc4,0xa7,0xe7), rgb(0xf6,0xc1,0x77), rgb(0x56,0x52,0x6e), // 0C-0F
+    ], extra: None })
+}
+
+/// Rosé Pine Dawn — src: base16/rose-pine-dawn.yaml; rosepinetheme.com
+pub fn rosepine_dawn() -> Theme {
+    from_base16("rosepine-dawn", BasePalette { base: [
+        rgb(0xfa,0xf4,0xed), rgb(0xff,0xfa,0xf3), rgb(0xf2,0xe9,0xde), rgb(0x98,0x93,0xa5), // 00-03
+        rgb(0x79,0x75,0x93), rgb(0x57,0x52,0x79), rgb(0x57,0x52,0x79), rgb(0xce,0xca,0xcd), // 04-07
+        rgb(0xb4,0x63,0x7a), rgb(0xea,0x9d,0x34), rgb(0xd7,0x82,0x7e), rgb(0x28,0x69,0x83), // 08-0B
+        rgb(0x56,0x94,0x9f), rgb(0x90,0x7a,0xa9), rgb(0xea,0x9d,0x34), rgb(0xce,0xca,0xcd), // 0C-0F
+    ], extra: None })
+}
+
+/// Solarized Dark — src: base16/solarized-dark.yaml; ethanschoonover.com/solarized
+pub fn solarized_dark() -> Theme {
+    from_base16("solarized-dark", BasePalette { base: [
+        rgb(0x00,0x2b,0x36), rgb(0x07,0x36,0x42), rgb(0x58,0x6e,0x75), rgb(0x65,0x7b,0x83), // 00-03
+        rgb(0x83,0x94,0x96), rgb(0x93,0xa1,0xa1), rgb(0xee,0xe8,0xd5), rgb(0xfd,0xf6,0xe3), // 04-07
+        rgb(0xdc,0x32,0x2f), rgb(0xcb,0x4b,0x16), rgb(0xb5,0x89,0x00), rgb(0x85,0x99,0x00), // 08-0B
+        rgb(0x2a,0xa1,0x98), rgb(0x26,0x8b,0xd2), rgb(0x6c,0x71,0xc4), rgb(0xd3,0x36,0x82), // 0C-0F
+    ], extra: None })
+}
+
+/// Solarized Light — src: base16/solarized-light.yaml; ethanschoonover.com/solarized
+pub fn solarized_light() -> Theme {
+    from_base16("solarized-light", BasePalette { base: [
+        rgb(0xfd,0xf6,0xe3), rgb(0xee,0xe8,0xd5), rgb(0x93,0xa1,0xa1), rgb(0x83,0x94,0x96), // 00-03
+        rgb(0x65,0x7b,0x83), rgb(0x58,0x6e,0x75), rgb(0x07,0x36,0x42), rgb(0x00,0x2b,0x36), // 04-07
+        rgb(0xdc,0x32,0x2f), rgb(0xcb,0x4b,0x16), rgb(0xb5,0x89,0x00), rgb(0x85,0x99,0x00), // 08-0B
+        rgb(0x2a,0xa1,0x98), rgb(0x26,0x8b,0xd2), rgb(0x6c,0x71,0xc4), rgb(0xd3,0x36,0x82), // 0C-0F
+    ], extra: None })
 }
 
 /// A base16 (or base24) palette: 16 canonical slots, optional 8 extra (base10..base17).
@@ -632,8 +798,8 @@ fn shade(hue: Color, level: u8) -> Color {
     Color::Rgb { r, g, b }
 }
 
-/// The monochrome (modifier-cue) face set, shared by `no_color()` and phosphor-flat
-/// so the §4 cue discipline lives in one place.
+/// The monochrome (modifier-cue) face set for `no_color()`.
+/// §4-layer-1 discipline: every Face-cued element carries ≥1 non-color modifier.
 fn mono_faces() -> ThemeFaces {
     let m = |bold, italic, underline, strike, reverse| modface(None, bold, italic, underline, strike, reverse);
     ThemeFaces {
@@ -668,48 +834,41 @@ fn mono_faces() -> ThemeFaces {
     }
 }
 
-pub fn phosphor(name: &str, hue: Color, flat: bool) -> Theme {
+pub fn phosphor(name: &str, hue: Color) -> Theme {
     let bg = shade(hue, 0);           // near-black hue
     let fg = shade(hue, 3);           // mid-bright hue
-    let faces = if flat {
-        let mut f = mono_faces();
-        f.chrome = Face { fg: Some(shade(hue, 4)), bg: Some(shade(hue, 1)), ..Face::default() };
-        f.chrome_muted = Face { fg: Some(shade(hue, 2)), bg: Some(shade(hue, 0)), dim: Some(true), ..Face::default() };
-        f
-    } else {
-        let s = |n| Face { fg: Some(shade(hue, n)), ..Face::default() };
-        ThemeFaces {
-            text: s(3),
-            emphasis: Face { fg: Some(shade(hue, 3)), italic: Some(true), ..Face::default() },
-            strong:   Face { fg: Some(shade(hue, 4)), bold: Some(true), ..Face::default() },
-            strong_emphasis: Face { fg: Some(shade(hue, 4)), bold: Some(true), italic: Some(true), ..Face::default() },
-            code: Face { fg: Some(shade(hue, 2)), reverse: Some(true), ..Face::default() },
-            strikethrough: Face { fg: Some(shade(hue, 2)), strike: Some(true), ..Face::default() },
-            link: Face { fg: Some(shade(hue, 5)), underline: Some(true), ..Face::default() },
-            heading: [s(5), s(5), s(4), s(4), s(3), s(3)],
-            block_quote: s(2), code_block: Face { fg: Some(shade(hue, 2)), reverse: Some(true), ..Face::default() },
-            list_marker: s(2), thematic_break: s(1),
-            front_matter: Face { fg: Some(shade(hue, 2)), italic: Some(true), ..Face::default() },
-            comment: Face { fg: Some(shade(hue, 1)), italic: Some(true), ..Face::default() },
-            selection: Face { fg: Some(shade(hue, 5)), reverse: Some(true), underline: Some(true), ..Face::default() },
-            marked_block: Face { bg: Some(shade(hue, 2)), reverse: Some(true), bold: Some(true), underline: Some(true), ..Face::default() },
-            search_match: Face { bg: Some(shade(hue, 2)), fg: Some(shade(hue, 0)), ..Face::default() },
-            search_current: Face { reverse: Some(true), bold: Some(true), ..Face::default() },
-            diag_spelling: Face { underline: Some(true), underline_color: Some(shade(hue, 5)), ..Face::default() },
-            diag_grammar:  Face { underline: Some(true), underline_color: Some(shade(hue, 4)), ..Face::default() },
-            focus_dim: Face { fg: Some(shade(hue, 1)), dim: Some(true), ..Face::default() },
-            fold_marker: s(1), wrap_guide: s(1),
-            // chrome/selected/muted: all-None sentinels — derive_chrome fills them (I4-A).
-            // chrome_reverse: kept reverse-modifier default (never derived — D1 contract).
-            chrome: Face::default(),
-            chrome_reverse: Face { reverse: Some(true), ..Face::default() },
-            chrome_selected: Face::default(),
-            chrome_muted: Face::default(),
-            chrome_overlay: Face::default(),
-            chrome_accent: Face::default(),
-        }
+    let s = |n| Face { fg: Some(shade(hue, n)), ..Face::default() };
+    let faces = ThemeFaces {
+        text: s(3),
+        emphasis: Face { fg: Some(shade(hue, 3)), italic: Some(true), ..Face::default() },
+        strong:   Face { fg: Some(shade(hue, 4)), bold: Some(true), ..Face::default() },
+        strong_emphasis: Face { fg: Some(shade(hue, 4)), bold: Some(true), italic: Some(true), ..Face::default() },
+        code: Face { fg: Some(shade(hue, 2)), reverse: Some(true), ..Face::default() },
+        strikethrough: Face { fg: Some(shade(hue, 2)), strike: Some(true), ..Face::default() },
+        link: Face { fg: Some(shade(hue, 5)), underline: Some(true), ..Face::default() },
+        heading: [s(5), s(5), s(4), s(4), s(3), s(3)],
+        block_quote: s(2), code_block: Face { fg: Some(shade(hue, 2)), reverse: Some(true), ..Face::default() },
+        list_marker: s(2), thematic_break: s(1),
+        front_matter: Face { fg: Some(shade(hue, 2)), italic: Some(true), ..Face::default() },
+        comment: Face { fg: Some(shade(hue, 1)), italic: Some(true), ..Face::default() },
+        selection: Face { fg: Some(shade(hue, 5)), reverse: Some(true), underline: Some(true), ..Face::default() },
+        marked_block: Face { bg: Some(shade(hue, 2)), reverse: Some(true), bold: Some(true), underline: Some(true), ..Face::default() },
+        search_match: Face { bg: Some(shade(hue, 2)), fg: Some(shade(hue, 0)), ..Face::default() },
+        search_current: Face { reverse: Some(true), bold: Some(true), ..Face::default() },
+        diag_spelling: Face { underline: Some(true), underline_color: Some(shade(hue, 5)), ..Face::default() },
+        diag_grammar:  Face { underline: Some(true), underline_color: Some(shade(hue, 4)), ..Face::default() },
+        focus_dim: Face { fg: Some(shade(hue, 1)), dim: Some(true), ..Face::default() },
+        fold_marker: s(1), wrap_guide: s(1),
+        // chrome/selected/muted/overlay/accent: all-None sentinels — derive_chrome fills them (I4-A).
+        // chrome_reverse: kept reverse-modifier default (never derived — D1 contract).
+        chrome: Face::default(),
+        chrome_reverse: Face { reverse: Some(true), ..Face::default() },
+        chrome_selected: Face::default(),
+        chrome_muted: Face::default(),
+        chrome_overlay: Face::default(),
+        chrome_accent: Face::default(),
     };
-    Theme { name: name.into(), base_fg: fg, base_bg: bg, heading_level_glyph: true, monochrome: flat, faces }
+    Theme { name: name.into(), base_fg: fg, base_bg: bg, heading_level_glyph: true, monochrome: false, faces }
 }
 
 const PHOSPHORS: [(&str, Color); 5] = [
@@ -875,31 +1034,168 @@ mod tests {
         assert!(lum(bright) > lum(dark), "ramp must brighten");
     }
     #[test]
-    fn phosphor_flat_is_monochrome_single_shade() {
-        let amber = Color::Rgb { r: 255, g: 176, b: 0 };
-        let t = phosphor("phosphor-amber-flat", amber, true);
-        assert!(t.monochrome);
-        // every text element shares base_fg (flat); distinctions are modifiers
-        for el in [SemanticElement::Strong, SemanticElement::Code, SemanticElement::Link, SemanticElement::Text] {
-            assert_eq!(t.face(el).fg.unwrap_or(t.base_fg), t.base_fg, "{el:?} flat = base_fg");
-        }
-        // chrome is the hue, not gray
-        assert!(matches!(t.face(SemanticElement::Chrome).bg, Some(Color::Rgb{..})));
-    }
-    #[test]
     fn phosphor_shaded_distinguishes_by_shade() {
         let amber = Color::Rgb { r: 255, g: 176, b: 0 };
-        let t = phosphor("phosphor-amber", amber, false);
+        let t = phosphor("phosphor-amber", amber);
         assert!(!t.monochrome);
         assert_ne!(t.face(SemanticElement::Heading(1)).fg, t.face(SemanticElement::Comment).fg);
+        // chrome faces are all-None sentinels (I4-A) — derive_chrome fills them
+        assert_eq!(t.face(SemanticElement::Chrome), Face::default(), "chrome sentinel pre-derive");
+        assert_eq!(t.face(SemanticElement::ChromeMuted), Face::default(), "muted sentinel pre-derive");
     }
     #[test]
-    fn all_thirteen_builtins_total() {
+    fn builtin_names_final_nineteen() {
+        // Every name resolves; every face is total; count is exactly 19; no -flat names.
         for name in Theme::builtin_names() {
-            let t = Theme::builtin(name).unwrap();
+            let t = Theme::builtin(name).expect(name);
             for el in ALL_ELEMENTS { let _ = t.face(el); }
         }
-        assert_eq!(Theme::builtin_names().len(), 13); // default,no-color,tokyo-night, + 10 phosphor
+        assert_eq!(Theme::builtin_names().len(), 19);
+        assert_eq!(Theme::builtin_names()[0], "terminal-plain"); // D5 first entry
+        assert_eq!(Theme::builtin_names()[1], "terminal-ansi");  // D5 second entry
+        assert!(!Theme::builtin_names().iter().any(|n| n.contains("-flat")), "no flat variants");
+    }
+
+    #[test]
+    fn every_builtin_resolves_at_all_depths() {
+        // 19 builtins × 3 depths — every quantize call completes without panic.
+        for name in Theme::builtin_names() {
+            let t = Theme::builtin(name).expect(name);
+            for depth in [Depth::Truecolor, Depth::Indexed256, Depth::Ansi16] {
+                for el in ALL_ELEMENTS {
+                    let f = t.face(el);
+                    let _ = quantize(f.fg.unwrap_or(Color::Default), depth);
+                    let _ = quantize(f.bg.unwrap_or(Color::Default), depth);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn derived_rungs_distinct_at_256() {
+        // §B.5 corrected indices. flexoki-dark: Chrome+Muted collapse on canvas; only Overlay distinct.
+        let mut t = from_base16("flexoki-dark", flexoki_dark_palette());
+        t.derive_chrome(ChromeDisposition::Full);
+        let canvas  = quantize(t.base_bg, Depth::Indexed256);
+        let chrome  = quantize(t.face(SemanticElement::Chrome).bg.unwrap(),        Depth::Indexed256);
+        let overlay = quantize(t.face(SemanticElement::ChromeOverlay).bg.unwrap(), Depth::Indexed256);
+        let muted   = quantize(t.face(SemanticElement::ChromeMuted).bg.unwrap(),   Depth::Indexed256);
+        assert_eq!(canvas,  Color::Indexed(232), "flexoki-dark canvas → 232");
+        assert_eq!(chrome,  Color::Indexed(232), "flexoki-dark chrome collapses onto canvas at 256");
+        assert_eq!(overlay, Color::Indexed(234), "flexoki-dark overlay distinct at 256");
+        assert_eq!(muted,   Color::Indexed(232), "flexoki-dark muted collapses onto canvas at 256");
+
+        // catppuccin-mocha: Chrome collapses onto canvas; Overlay distinct.
+        let mut t2 = from_base16("mocha", mocha_palette());
+        t2.derive_chrome(ChromeDisposition::Full);
+        let canvas2  = quantize(t2.base_bg, Depth::Indexed256);
+        let chrome2  = quantize(t2.face(SemanticElement::Chrome).bg.unwrap(),        Depth::Indexed256);
+        let overlay2 = quantize(t2.face(SemanticElement::ChromeOverlay).bg.unwrap(), Depth::Indexed256);
+        assert_eq!(canvas2,  Color::Indexed(234), "mocha canvas → 234");
+        assert_eq!(chrome2,  Color::Indexed(234), "mocha chrome collapses onto canvas at 256");
+        assert_eq!(overlay2, Color::Indexed(236), "mocha overlay distinct at 256");
+
+        // gruvbox-dark: Chrome distinct from canvas at 256 (grounding §B.5 row 3).
+        let mut t3 = from_base16("gruvbox-dark", sample_base16());
+        t3.derive_chrome(ChromeDisposition::Full);
+        let canvas3  = quantize(t3.base_bg, Depth::Indexed256);
+        let chrome3  = quantize(t3.face(SemanticElement::Chrome).bg.unwrap(),        Depth::Indexed256);
+        let overlay3 = quantize(t3.face(SemanticElement::ChromeOverlay).bg.unwrap(), Depth::Indexed256);
+        assert_eq!(canvas3,  Color::Indexed(235), "gruvbox-dark canvas → 235");
+        assert_eq!(chrome3,  Color::Indexed(234), "gruvbox-dark chrome → 234 (distinct from canvas)");
+        assert_eq!(overlay3, Color::Indexed(237), "gruvbox-dark overlay → 237");
+    }
+
+    #[test]
+    fn all_color_themes_fully_explicit_after_derive() {
+        // Every Rgb-based builtin: after derive_chrome(Full) no chrome face is all-None.
+        // terminal-plain, terminal-ansi, no-color: Color::Default bases → derive skips → excluded.
+        let color_chrome = [
+            SemanticElement::Chrome, SemanticElement::ChromeSelected,
+            SemanticElement::ChromeMuted, SemanticElement::ChromeOverlay, SemanticElement::ChromeAccent,
+        ];
+        for name in Theme::builtin_names() {
+            let mut t = Theme::builtin(name).expect(name);
+            if t.base_bg == Color::Default { continue; } // skip non-Rgb themes
+            t.derive_chrome(ChromeDisposition::Full);
+            for el in color_chrome {
+                let f = t.face(el);
+                assert!(f.fg.is_some() || f.bg.is_some(),
+                    "{name}/{el:?}: chrome face must not be all-None after derive_chrome(Full)");
+            }
+        }
+    }
+
+    #[test]
+    fn exemplar_spot_pins_mocha_and_flexoki_light() {
+        // catppuccin-mocha §C — base_bg, base_fg, h1 (base0D blue, bold)
+        let mocha = catppuccin_mocha();
+        assert_eq!(mocha.base_bg, rgb(0x1e, 0x1e, 0x2e), "mocha base_bg");
+        assert_eq!(mocha.base_fg, rgb(0xcd, 0xd6, 0xf4), "mocha base_fg");
+        let h1m = mocha.face(SemanticElement::Heading(1));
+        assert_eq!(h1m.fg, Some(rgb(0x89, 0xb4, 0xfa)), "mocha h1 = blue base0D");
+        assert_eq!(h1m.bold, Some(true), "mocha h1 bold");
+
+        // flexoki-light §C — base_bg, base_fg, h1 (base0D blue 205ea6, bold)
+        let fl = flexoki_light();
+        assert_eq!(fl.base_bg, rgb(0xff, 0xfc, 0xf0), "flexoki-light base_bg");
+        assert_eq!(fl.base_fg, rgb(0x10, 0x0f, 0x0f), "flexoki-light base_fg");
+        let h1f = fl.face(SemanticElement::Heading(1));
+        assert_eq!(h1f.fg, Some(rgb(0x20, 0x5e, 0xa6)), "flexoki-light h1 = blue base0D");
+        assert_eq!(h1f.bold, Some(true), "flexoki-light h1 bold");
+    }
+
+    #[test]
+    fn terminal_ansi_all_named_colors() {
+        // terminal-ansi: base Default, NOT monochrome, every chrome face named-ANSI or modifier-only.
+        let t = terminal_ansi();
+        assert_eq!(t.base_fg, Color::Default, "terminal-ansi base_fg = Default");
+        assert_eq!(t.base_bg, Color::Default, "terminal-ansi base_bg = Default");
+        assert!(!t.monochrome, "terminal-ansi NOT monochrome");
+        // Chrome faces must use named ANSI colors (not Rgb) — spot check
+        let chrome = t.face(SemanticElement::Chrome);
+        assert_eq!(chrome.fg, Some(Color::White),  "chrome fg White");
+        assert_eq!(chrome.bg, Some(Color::Black),  "chrome bg Black");
+        let ov = t.face(SemanticElement::ChromeOverlay);
+        assert_eq!(ov.fg, Some(Color::White),    "overlay fg White");
+        assert_eq!(ov.bg, Some(Color::DarkGray), "overlay bg DarkGray");
+        let sel = t.face(SemanticElement::ChromeSelected);
+        assert_eq!(sel.fg, Some(Color::Black), "selected fg Black");
+        assert_eq!(sel.bg, Some(Color::White), "selected bg White");
+        let acc = t.face(SemanticElement::ChromeAccent);
+        assert_eq!(acc.fg, Some(Color::LightCyan), "accent fg LightCyan");
+        assert_eq!(acc.bg, Some(Color::Black),     "accent bg Black");
+        assert_eq!(acc.bold, Some(true),            "accent bold");
+        // All text/chrome elements: no Rgb face values (named ANSI or modifier-only or Default)
+        for el in ALL_ELEMENTS {
+            let f = t.face(el);
+            for c in [f.fg, f.bg, f.underline_color].into_iter().flatten() {
+                assert!(!matches!(c, Color::Rgb{..}), "terminal-ansi/{el:?} must not use Rgb; got {c:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_plain_name_and_faces() {
+        // default() returns name "terminal-plain"; chrome explicitly non-Rgb; derive is no-op.
+        let t = default();
+        assert_eq!(t.name, "terminal-plain", "name field");
+        assert_eq!(t.base_fg, Color::Default);
+        assert_eq!(t.base_bg, Color::Default);
+        assert!(!t.monochrome);
+        assert_eq!(t.face(SemanticElement::Chrome).fg, Some(Color::White));
+        assert_eq!(t.face(SemanticElement::Chrome).bg, Some(Color::Black));
+        // builtin("terminal-plain") and builtin("default") both return terminal-plain
+        let b1 = Theme::builtin("terminal-plain").unwrap();
+        let b2 = Theme::builtin("default").unwrap();
+        assert_eq!(b1.name, "terminal-plain");
+        assert_eq!(b2.name, "terminal-plain");
+        assert_eq!(b1.faces, b2.faces, "alias produces identical theme");
+        // non-Rgb bases → derive is a no-op (derive_skips_non_rgb_bases also covers this)
+        let before = t.faces.clone();
+        let mut t2 = t;
+        t2.derive_chrome(ChromeDisposition::Full);
+        assert_eq!(t2.faces, before, "terminal-plain: derive no-op on Default bases");
     }
     #[test]
     fn phosphor_16color_floor() {
@@ -1019,7 +1315,7 @@ mod tests {
     // phosphor-green bases: canvas=shade(hue,0), fg=shade(hue,3), link=shade(hue,5)
     fn phosphor_green_theme() -> Theme {
         let hue = Color::Rgb { r:0x33, g:0xff, b:0x33 };
-        phosphor("phosphor-green", hue, false)
+        phosphor("phosphor-green", hue)
     }
 
     #[test]

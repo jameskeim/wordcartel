@@ -838,7 +838,7 @@ mod tests {
         let mut e = Editor::new_from_text("# Hello\n\n", None, (80, 24));
         crate::derive::rebuild(&mut e);
         e.open_theme_picker();
-        // There are only 13 builtins — pad to 20 by cycling real builtin names so
+        // There are 19 builtins — pad to 20 by cycling real builtin names so
         // the list exceeds the 15-row window cap. Navigation-only (no Char/Backspace)
         // so rebuild_rows is never called and the padding stays in place.
         {

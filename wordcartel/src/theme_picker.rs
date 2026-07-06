@@ -42,12 +42,12 @@ mod tests {
             scroll_top: 0, original: wordcartel_core::theme::default(), previewed: None };
         rebuild_rows(&mut tp);
         assert!(tp.rows.iter().any(|r| r == "tokyo-night"));
-        assert!(tp.rows.len() >= 13);
+        assert!(tp.rows.len() >= 19, "expected >= 19 builtins, got {}", tp.rows.len());
         tp.query = "phosphor-amber".into();
         rebuild_rows(&mut tp);
         assert!(tp.rows.iter().all(|r| r.contains("phosphor-amber")));
         assert!(tp.rows.contains(&"phosphor-amber".to_string()));
-        assert!(tp.rows.contains(&"phosphor-amber-flat".to_string()));
+        // phosphor-amber-flat removed in D4 — no flat variants in builtin_names()
     }
 
     #[test]
@@ -81,7 +81,7 @@ mod tests {
         crate::derive::rebuild(&mut ed);
         // default theme is A
         let default_name = ed.theme.name.clone();
-        assert_eq!(default_name, "default");
+        assert_eq!(default_name, "terminal-plain");
         ed.open_theme_picker();
         let original = ed.theme_picker.as_ref().unwrap().original.clone();
         assert_eq!(original.name, default_name, "picker must capture the original theme");

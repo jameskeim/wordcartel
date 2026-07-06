@@ -716,8 +716,9 @@ mod tests {
         let d = tempdir();
         let path = d.join("o.toml");
         // Runtime diverges from baseline on keymap.preset → the override must appear.
-        let runtime_snap = snap("wordstar", ThemeIdentity::Builtin("default".into()), false);
-        let baseline_snap = snap("cua", ThemeIdentity::Builtin("default".into()), false);
+        // Both snapshots use "terminal-plain" (D5 rename) so only keymap diverges.
+        let runtime_snap = snap("wordstar", ThemeIdentity::Builtin("terminal-plain".into()), false);
+        let baseline_snap = snap("cua", ThemeIdentity::Builtin("terminal-plain".into()), false);
         let mut e = test_editor();
         e.active_keymap_preset = "wordstar".into();
         let result = perform_settings_save(

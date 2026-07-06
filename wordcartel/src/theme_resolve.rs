@@ -203,7 +203,8 @@ mod tests {
     fn resolve_unknown_name_falls_back_with_warning() {
         let tc = ThemeConfig { name: Some("nope".into()), ..Default::default() };
         let r = resolve_theme(&tc, &env(false));
-        assert_eq!(r.theme.name, "default");
+        // fallback calls theme::default() whose name is now "terminal-plain" (D5)
+        assert_eq!(r.theme.name, "terminal-plain");
         assert!(r.warnings.iter().any(|w| w.contains("nope")));
     }
 

@@ -826,7 +826,7 @@ mod tests {
         // Baseline: defaults (empty layer list — no hand config, no overrides).
         let (baseline_cfg, _) = load(&[]);
         // Use the default resolved theme name (tests run without a real env, so
-        // resolve_theme falls back to the default theme — name = "default").
+        // resolve_theme falls back to the default theme — name = "terminal-plain").
         let env = crate::theme_resolve::EnvSnapshot::from_env();
         let baseline_resolved = crate::theme_resolve::resolve_theme(&baseline_cfg.theme, &env);
         let baseline = snapshot_of(&baseline_cfg, &baseline_resolved.theme.name);

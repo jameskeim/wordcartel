@@ -2126,9 +2126,12 @@ mod tests {
     // §13.2 accessibility coverage proof tests
     // -----------------------------------------------------------------------
 
-    fn cue_themes() -> [wordcartel_core::theme::Theme; 2] {
-        [wordcartel_core::theme::no_color(),
-         wordcartel_core::theme::Theme::builtin("phosphor-amber-flat").unwrap()]
+    // cue_themes: the modifier-battery test set — no_color() only.
+    // A derived zen-phosphor is NOT a cue theme: its ChromeSelected is explicit fg/bg with
+    // NO modifier, so it fails the cued-array assertion. The phosphor case gets its own
+    // scoped assertion below (zen_phosphor_chrome_is_fully_colored).
+    fn cue_themes() -> [wordcartel_core::theme::Theme; 1] {
+        [wordcartel_core::theme::no_color()]
     }
 
     /// §13.2: Every Face-cued SemanticElement carries >=1 non-color modifier in cue mode.
@@ -2181,6 +2184,28 @@ mod tests {
             assert_ne!(t.face(Emphasis), t.face(Strong), "{}: Emphasis vs Strong", t.name);
             assert_ne!(t.face(Strong), t.face(StrongEmphasis), "{}: Strong vs StrongEmphasis", t.name);
             assert_ne!(t.face(Emphasis), t.face(StrongEmphasis), "{}: Emphasis vs StrongEmphasis", t.name);
+        }
+    }
+
+    /// Derived zen-phosphor chrome faces are fully colored (Rgb) and hue-preserving.
+    /// This is a SEPARATE assertion from the modifier battery — zen-phosphor is NOT a cue theme
+    /// (ChromeSelected is explicit fg/bg with no modifier), but its chrome IS visually complete.
+    #[test]
+    fn zen_phosphor_chrome_is_fully_colored() {
+        use wordcartel_core::theme::{ChromeDisposition, SemanticElement as SE, Color};
+        let mut t = wordcartel_core::theme::Theme::builtin("phosphor-green").unwrap();
+        t.derive_chrome(ChromeDisposition::Zen);
+        // All chrome bg rungs carry Rgb — fully colored, not sentinel
+        for el in [SE::Chrome, SE::ChromeOverlay, SE::ChromeMuted, SE::ChromeAccent] {
+            let f = t.face(el);
+            assert!(matches!(f.bg, Some(Color::Rgb{..})) || matches!(f.fg, Some(Color::Rgb{..})),
+                "{el:?} must have Rgb color after zen derive");
+        }
+        // Hue carried: chrome/overlay/muted bg are green-dominant (G ≥ R and G ≥ B)
+        for el in [SE::Chrome, SE::ChromeOverlay, SE::ChromeMuted] {
+            if let Some(Color::Rgb { r, g, b }) = t.face(el).bg {
+                assert!(g >= r && g >= b, "{el:?} bg must be green-dominant r={r} g={g} b={b}");
+            }
         }
     }
 
@@ -2309,7 +2334,7 @@ mod tests {
     fn theme_picker_windowed_slice_and_indicator() {
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         e.open_theme_picker();
-        // Only 13 builtins — pad to 20 by cycling real names so the list exceeds
+        // 19 builtins — pad to 20 by cycling real names so the list exceeds
         // the 15-row window cap. Directly assigned; no rebuild_rows called.
         {
             let names = wordcartel_core::theme::Theme::builtin_names();
