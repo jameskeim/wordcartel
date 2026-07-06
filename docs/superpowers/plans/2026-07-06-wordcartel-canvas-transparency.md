@@ -15,6 +15,8 @@ the toggle needs no re-derivation.
 **Tech Stack:** Rust; wordcartel-core (theme enum) + wordcartel shell (config/resolve/render/
 settings/registry); ratatui 0.30. No new dependencies.
 
+> Plan status: CLEAN — Codex plan gate r1 (T3/T4 NO-GO: name-mask Critical + Importants folded) → r2 (GO x4, empty findings), 2026-07-06. Final gate before merge: Fable whole-branch review (per the 2026-07-06 gating change).
+
 ## Global Constraints
 
 - Spec: `docs/superpowers/specs/2026-07-06-wordcartel-canvas-transparency-design.md` (CLEAN —
@@ -579,7 +581,7 @@ fn interior_key_mask_does_not_shield_name() {
 ```
 - [ ] **Step 6: Update every other `SettingsSnapshot` constructor** the compiler flags (Codex plan
   r1 Important — do NOT rely on the list being complete; `cargo build` enumerates them). The known
-  sites: the `snap` test helper (settings.rs:482, add `canvas: CanvasMode::Opaque`); the
+  sites: the `snap` and `empty_snap` test helpers (settings.rs — add `canvas: CanvasMode::Opaque`); the
   `config.rs` round-trip literal (:842-854, add `canvas: CanvasMode::Transparent` AND a
   `use wordcartel_core::theme::CanvasMode;` in that test — currently absent); and the **e2e.rs
   `SettingsSnapshot` literal (e2e.rs:701)** which HEAD also has. Import `CanvasMode` in each test
