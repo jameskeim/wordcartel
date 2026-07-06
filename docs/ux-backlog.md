@@ -722,6 +722,23 @@ rail. FLAGGED JUDGMENT: B1 sits before the D/E arc on value; pure dependency log
 swapping blocks 3 and 6-8 if the visual-consistency wins should bank first — B1 is
 dependency-free in both directions.
 
+### Pre-Effort-P checklist (must clear before P)
+
+- **repar re-plumb check** (`needs-verify`, added 2026-07-06). `repar` is a PATH dependency
+  (`repar = { path = "../../par-command/repar" }`, wordcartel/Cargo.toml:12), so it builds
+  against whatever the user has locally — the Cargo.lock pin (1.1.0) drifts every build. repar
+  has been updated AGAIN; before P, re-examine the integration against the current local repar:
+  (1) the ONLY API surface is `transform.rs::run_transform`
+  (`repar::Options::new().width(width).map_err(...)`, transform.rs:314 — the builder-returns-
+  `Result` shape from repar ≥1.0); verify the API still matches and no new required options were
+  added. (2) The wrap_column width knob (repar10) still wires through. (3) Re-check the six
+  repar-1.0 contract pins (change.rs / transform tests, backlog C2 area ~:256) — a new repar may
+  fix or shift the deliberately-frozen behavior (incl. the CJK trailing-space artifact). (4) The
+  TWO upstream repar report candidates (CJK trailing-space→hard-`<br>`; prefix-inference anaphora
+  mangling, ~:257) — did the update address them? (5) Decide whether to take a deliberate version
+  bump + lock sync (vs the current always-drifting path pin). Isolated + low-risk, but P builds
+  a plugin system ON this substrate, so it must be confirmed clean first.
+
 ## Sizing summary
 
 *(SHIPPED so far: the quick-wins bundle A2+B3+C1 @ 097dcae; A1 menu-bar modes @ 7273327 —
