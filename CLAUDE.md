@@ -30,19 +30,25 @@ ONLY when explicitly asked.
    TASK (TDD: failing test → impl → green → commit), then a per-task reviewer subagent
    returning TWO verdicts — spec compliance AND code quality. Critical/Important findings →
    fix subagent → re-review; Minor → record in the ledger for the final pass.
-5. **Two final gates (both must pass).** An opus whole-branch review (cross-task invariants
-   no single task could see) AND a Codex pre-merge gate (independent GO/NO-GO). Re-run after
-   fixes until clean/GO.
+5. **Two final gates (both must pass).** A Fable whole-branch review (cross-task invariants
+   no single task could see; Fable compiles scratch probes against the real branch — reserved
+   for THIS gate, NOT run at spec/plan) AND a Codex pre-merge gate (independent GO/NO-GO).
+   Re-run after fixes until clean/GO.
 6. **Merge** (`superpowers:finishing-a-development-branch`, `--no-ff` to the trunk). Verify
    tests on the merged result; delete the branch. Push only when asked.
 
 ### Review layers (the point — different reviewers catch different things)
 - **Codex** = external static cross-check. It reads the actual code adversarially and
   catches "spec says X, code is Y," missing accessors, overflow/edge panics, and unsound
-  steps. Highest-yield gate — use it on EVERY spec and plan.
+  steps. Highest-yield gate and the SOLE spec/plan gate — use it on EVERY spec and plan,
+  looping until clean.
 - **Per-task reviewer** = focused gate on one diff (spec + quality).
-- **Opus whole-branch review** = synthesis across tasks (invariants, regressions,
-  data-loss/panic classes). Use the most capable model here.
+- **Fable whole-branch review** = synthesis across tasks (invariants, regressions,
+  data-loss/panic classes), compiling probes against the real branch. Fable gates ONLY here —
+  the entire effort before merge — NOT during spec or plan development (decided 2026-07-06, to
+  cut per-effort gate latency). Residual duty: when a spec/plan fork leans on math or a claim
+  that can't be verified by reading — exactly what Fable's early pass used to backstop — flag
+  it to the human explicitly rather than letting it ride to the branch gate.
 - Re-running until clean is mandatory: each round the reviewer reads the REVISED code, so a
   fix that introduces a new problem is caught.
 
