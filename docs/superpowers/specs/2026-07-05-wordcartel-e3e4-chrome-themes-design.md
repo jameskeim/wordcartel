@@ -62,8 +62,10 @@ Grounded facts). Working order: the E3 slot.
   the existing phosphor code, NOT the new ladder (which is RGB pre-blend, D1; the tint
   still carries because pre-blends preserve hue proportionally). `-flat` = mono_faces + hue chrome (the inversion the user rejected).
   `from_base16` (:339) maps base00/05 to bg/fg + a panel guess; the CONCRETE EDIT
-  (Fable I3 — load-bearing): its four chrome-face initializers (theme.rs:383-386) become
-  all-None sentinels so derivation fills them — otherwise the sentinel rule reads them as
+  (Fable I3 — load-bearing): its DERIVABLE chrome initializers (chrome/chrome_selected/chrome_muted — three of the
+  four at theme.rs:383-386) become all-None sentinels so derivation fills them, while
+  chrome_reverse KEEPS its reverse-modifier default (ChromeReverse is never derived —
+  D1's contract; setting it None would leave it unset forever) — otherwise the sentinel rule reads them as
   intentional overrides and the zen axis dies for every E4/file theme and the launch
   default. Acknowledged side-effect: the base16 base01 panel slot (the palette author's
   own panel pick) is discarded in favor of the ladder — catppuccin's mantle is honored
@@ -381,7 +383,8 @@ Grounded facts). Working order: the E3 slot.
   exact invisibility being fixed; and terminal-plain's Face::default() overlay cannot
   serve, since its vacuous-by-identity argument requires canvas == terminal default,
   false for Rgb themes at Ansi16): at `Depth::Ansi16`, ladder-derived chrome is replaced
-  by a fixed named-ANSI SIX-face table keyed on a BINARY predicate (quantized canvas ==
+  by a fixed named-ANSI FIVE-color-face table (the six-face family minus ChromeReverse,
+  excluded below) keyed on a BINARY predicate (quantized canvas ==
   Black vs everything else — a colored 16-quantized canvas takes the "else" arm):
   Black-canvas arm — Chrome/ChromeOverlay bg DarkGray fg White, ChromeSelected
   Black-on-White, ChromeMuted White dim, ChromeAccent White bold; else arm —
