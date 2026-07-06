@@ -1,6 +1,6 @@
 # Theme rendering quality — chrome elevation + completeness standard — design
 
-**Status:** brainstorm-approved 2026-07-06. Facts cross-checked against real source at HEAD of
+**Status:** CLEAN — Codex spec gate r1→r2→r3 (READY, empty findings), 2026-07-06. Brainstorm-approved. Facts cross-checked against real source at HEAD of
 `main` (post canvas-transparency merge). Branch `effort-chrome-elevation`. Gating: Codex is the sole
 spec/plan gate (loop until clean); Fable reviews the whole branch only.
 
