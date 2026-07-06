@@ -156,7 +156,7 @@ completes the wiring.
   - `phosphor_border_cells_carry_no_own_bg` (THE halo: under phosphor-green with the palette open, every border glyph cell's bg == the interior fill bg — both dispositions).
   - `prompt_active_status_uses_accent` (open a minibuffer → status fg == ChromeAccent fg + bold; normal → Chrome).
   - REWRITE `default_status_line_still_reversed` → `terminal_plain_status_carries_chrome_face` (grounding E.4: White/Black explicit, not REVERSED).
-  - Update the a11y test (drop phosphor-amber-flat; add ChromeAccent-carries-modifiers under no-color; ChromeOverlay exempted with the rationale comment).
+  - Update the a11y test (the phosphor-amber-flat removal already landed in T2; HERE add ChromeAccent-carries-modifiers under no-color; ChromeOverlay exempted with the rationale comment).
   - Goldens (scrollbar/menu-fill) survive by compose-relative construction — verify and say so.
 - [ ] **Step 2: rewire** per spec D2 + grounding A.3: overlay rect fill (set_style ChromeOverlay after Clear) + rows/query compose [ChromeOverlay]; borders fg-only (strip the bg from the border style — the fill shows through, ratatui patch semantics verified); selected rows ChromeSelected; status explicit Chrome + the accent state split; menu/scrollbar roles unchanged (values now derived).
 - [ ] **Step 3: GREEN + gates + commit** — `feat(e3e4): every chrome cell themed — overlay fills, fg-only borders, explicit status with accent prompt state`.
