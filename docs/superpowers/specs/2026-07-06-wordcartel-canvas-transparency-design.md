@@ -1,6 +1,6 @@
 # Opaque canvas + transparency toggle — design
 
-**Status:** brainstorm-approved 2026-07-06 (user approved the design and both judgment calls).
+**Status:** CLEAN — Codex spec gate r1 (READY, 3 Important folded) → r2 (empty findings), 2026-07-06. Brainstorm-approved (user approved the design and both judgment calls).
 Facts cross-checked against real source at `ada0245` (branch `effort-canvas-transparency` off
 `main`). Gating: per the 2026-07-06 work-style change, **Codex is the sole spec/plan gate**
 (loop until clean); Fable reviews the whole branch only.
