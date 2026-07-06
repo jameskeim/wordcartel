@@ -12,6 +12,13 @@
 
 - Spec: `docs/superpowers/specs/2026-07-05-wordcartel-e3e4-chrome-themes-design.md` (CLEAN — Codex ×8 + Fable ×3; ten user ratifications: the seven brainstorm forks + C1-A pre-blend/clamp + I1-A split ladder + I4-A phosphor deletion). Grounding (verbatim sites + probe-generated expected values + the theme tables): `.superpowers/sdd/e3e4-grounding.md` — **§B/§C hex literals are probe/source truth; transcribe byte-for-byte; a failing pin means transcription error first, then BLOCKED with evidence — never adjust a literal to pass. Tables marked `[verify]` get a precondition assert or an implementation-time probe, per the established discipline.**
 - **The pinned fractions (grounding §B.1, probe-calibrated — these are THE constants):** `BAR_PCT` dark 0.18 / light 0.035; `OVERLAY_PCT` dark 0.09 / light 0.075; `DEEP_PCT` dark 0.43 / light 0.11; `MUTED_FG_BLEND` 0.35; `ACCENT_DESAT` 0.50; `ZEN_COLLAPSE` 0.35; contrast threshold `min(4.5, own fg-vs-canvas)`.
+- **The three derivation CONVENTIONS (Fable plan review C2 — §B.3's literals reproduce ONLY under these; two independent probes confirmed 0/76 mismatches with them, 2-14 without):**
+  (1) the clamp loop shrinks `pct -= 0.005` per iteration, floor 0 (tolerance: pass when
+  contrast ≥ threshold − 0.001);
+  (2) the equal-luminance gray = the SMALLEST integer g with rel_lum(g,g,g) ≥ the seed's
+  rel_lum (lower-bound search, NOT nearest);
+  (3) zen scales the BG percentages only (×ZEN_COLLAPSE) — the muted-fg blend is NOT
+  zen-scaled, and the zen ACCENT gets an EXTRA `blend(accent, its-gray, 0.40)` on top.
 - **Gates after EVERY commit:** `cargo test -p wordcartel-core -p wordcartel` green; `cargo clippy --workspace --all-targets` clean (deny LIVE); `cargo build` warning-free. NO `cargo fmt`; `—` em-dash prose comments; no emoji in code (multibyte test corpora exempt); no catch-all `_` arms on `SemanticElement`/`ChromeDisposition` matches.
 - Status copy byte-exact (spec): `"chrome: zen"` / `"chrome: full"` / `"chrome: n/a (cue mode)"` / `"chrome: zen (no effect: {name} has fixed chrome)"` / `"chrome: zen (no effect at 16-color depth)"` (and the `full` twins).
 - Line anchors are HEAD (`e9675da`) references from the grounding; locate by quoted code after drift.
@@ -35,15 +42,19 @@
   - `derive_fills_only_unset_faces` — tokyo-night: all four EXISTING chrome faces byte-identical after `derive_chrome(Full)`; the two NEW faces (chrome_overlay/chrome_accent) now Some with §B.3's tokyo values. Second call → byte-equal everything (the sentinel no-op pin).
   - `derive_split_ladder_directions` — flexoki-dark full: bar bg DARKER than canvas (toward black), overlay bg LIGHTER (toward white), exact §B.3 hex; flexoki-light: bar darker, overlay DEEPER darker, exact hex.
   - `derive_zen_collapses_toward_poles` — flexoki-dark zen rungs strictly between canvas and the full rungs (each toward its own pole), exact §B.3 zen hex.
+  - `derive_saturation_split` — saturation preserved on SUNKEN rungs, decaying
+    monotonically on RAISED rungs (the ratified N5 property; mocha 0.211→0.117 is the
+    anchor pair) — and `derive_accent_desaturation_bound` (the accent's saturation ≤ the
+    seed's × (1 − ACCENT_DESAT) + epsilon; Fable plan I5).
   - `derive_preserves_hue_angle` — phosphor-green post-derivation (T2 deletes the initializers; HERE construct a synthetic all-None-chrome theme with phosphor's bases): every derived bg has the base's hue angle (via the probe's hsl check reimplemented test-side, or compare against §B.3's phosphor hex directly — the literals ARE the pin).
-  - `derive_contrast_clamp_floors_at_zero` — a SYNTHETIC low-contrast theme (fg/bg pair below 4.5 by construction — grounding E.3: no bundled theme trips the min() branch, so the pin is synthetic): derived rungs equal canvas (step floored), no panic, no loop.
+  - `derive_contrast_clamp_floors_at_zero` — a SYNTHETIC LIGHT-polarity low-contrast theme (fg/bg below 4.5 by construction; LIGHT because all three bg rungs then step toward the dark fg and all floor — on a dark synthetic the bars/muted step AWAY from fg and would NOT floor, Fable plan M4): derived rungs equal canvas, no panic, no loop.
   - `derive_skips_non_rgb_bases` — a theme with `Color::Default` bases: byte-untouched by the call.
   - `contrast_ratio_matches_wcag` — the luminance helper against two known WCAG pairs (white/black = 21.0 ± epsilon; §B.3's solarized-light fg/canvas = 4.99 ± 0.02).
   Run: `cargo test -p wordcartel-core -- derive_ contrast_ratio` → FAIL to compile (nothing exists): the RED.
 
-- [ ] **Step 2: the enum + faces + ripple set.** Add the two `SemanticElement` variants (with the spec's role doc comments). THE COMPLETE RIPPLE SET (grounding E.1 — the compiler forces each; NO catch-alls): `ThemeFaces` two fields; `face()` two arms; `face_mut()`/`override_face` dispatch (grounding A.1's face_mut match); `element_from_key` two keys; the ALL_ELEMENTS-style test list (32 → 34); `mono_faces()` gains `chrome_overlay: Face::default(), chrome_accent: modface(None, true, false, false, false, true)` (reverse+bold — the a11y-testable cue shape; ChromeOverlay stays default per the spec's a11y exemption); every OTHER constructor (default/tokyo/phosphor/from_base16) gains the two fields as `Face::default()` sentinels — they DERIVE.
+- [ ] **Step 2: the enum + faces + ripple set.** Add the two `SemanticElement` variants (with the spec's role doc comments). THE COMPLETE RIPPLE SET (grounding E.1 — the compiler forces each; NO catch-alls): `ThemeFaces` two fields; `face()` two arms; `face_mut()`/`override_face` dispatch (grounding A.1's face_mut match); `element_from_key` two keys; the ALL_ELEMENTS-style test list (32 → 34); `mono_faces()` gains `chrome_overlay: Face::default(), chrome_accent: modface(None, true, false, false, false, true)` (reverse+bold — the a11y-testable cue shape; ChromeOverlay stays default per the spec's a11y exemption); constructors gain the two fields: tokyo/phosphor/from_base16 as `Face::default()` sentinels (they DERIVE); `default()` (terminal-plain) gets `chrome_overlay: Face::default()` (the I5 by-identity exemption) but `chrome_accent: modface(None, true, false, false, false, true)` EXPLICIT reverse+bold (Fable plan I4: non-Rgb bases never derive, so a sentinel accent would compose EMPTY forever, violating spec D2's terminal-plain accent contract; grounding A.1 spells the face out) — plus a terminal-plain accent pin in T5's battery (prompt-active status under terminal-plain carries reverse+bold).
 
-- [ ] **Step 3: the derivation.** Transcribe grounding §B.2 verbatim into theme.rs: the fraction consts (Global Constraints values, named `CHROME_BAR_PCT_DARK` etc. with the calibration comment citing tokyo/mocha/latte); `fn blend(base: Color, pole: (u8,u8,u8), pct: f32) -> Color` (Rgb-only per-channel lerp); `fn srgb_luminance`/`fn contrast_ratio`; `pub fn derive_chrome(&mut self, disp: ChromeDisposition)` — early-return unless both bases Rgb; polarity by canvas luminance (< 0.5 = dark); per-face: skip if not all-None; bars toward black both polarities, overlay toward white (dark) / deeper black (light), muted fg = fg blended toward bg at MUTED_FG_BLEND, selected = bg-on-fg explicit, accent = fg desaturated toward equal-luminance gray at ACCENT_DESAT with bold; zen multiplies every pct by ZEN_COLLAPSE; the clamp loop (shrink pct toward 0 while contrast_ratio(fg, rung) < min(4.5, contrast_ratio(fg, canvas))). Doc comments carry the spec's fresh-instance discipline and the never-derives-chrome_reverse contract.
+- [ ] **Step 3: the derivation.** Transcribe grounding §B.2 verbatim into theme.rs: the fraction consts (Global Constraints values, named `CHROME_BAR_PCT_DARK` etc. with the calibration comment citing tokyo/mocha/latte); `fn blend(base: Color, pole: (u8,u8,u8), pct: f32) -> Color` (Rgb-only per-channel lerp); `fn srgb_luminance`/`fn contrast_ratio`; `pub fn derive_chrome(&mut self, disp: ChromeDisposition)` — early-return unless both bases Rgb; polarity by canvas luminance (< 0.5 = dark); per-face: skip if not all-None; bars toward black both polarities, overlay toward white (dark) / deeper black (light), muted fg = fg blended toward bg at MUTED_FG_BLEND, selected = bg-on-fg explicit, accent = fg desaturated toward equal-luminance gray at ACCENT_DESAT with bold; zen scales the BG pcts by ZEN_COLLAPSE (the muted-fg blend UNSCALED; the zen accent gains the extra 0.40 gray blend — Global Constraints convention 3); the clamp loop per convention 1 (pct -= 0.005, floor 0, tolerance −0.001) while contrast_ratio(fg, rung) < min(4.5, contrast_ratio(fg, canvas)); the gray helper per convention 2 (lower-bound integer search). Doc comments carry the spec's fresh-instance discipline and the never-derives-chrome_reverse contract.
 
 - [ ] **Step 4: GREEN + gates + commit** — `feat(e3e4): derived chrome ladder — split-direction RGB pre-blend with contrast clamp; ChromeOverlay + ChromeAccent`.
 
@@ -96,18 +107,25 @@ completes the wiring.
 - [ ] **Step 2: implement core.** Delete phosphor's four chrome initializers; flip
   from_base16's three to sentinels; rename default()'s name string; add terminal_ansi()
   (grounding §C verbatim); add the ten E4 constructors (grounding §C verbatim); update
-  builtin()/builtin_names(); fix phosphor_16color_floor (no flat iteration).
+  builtin()/builtin_names(); fix phosphor_16color_floor (no flat iteration); `phosphor_flat_is_monochrome_single_shade` (theme.rs:702) and `phosphor_shaded_distinguishes_by_shade` (:714) call `phosphor(…, flat)` directly — the first is DELETED with the flat variants, the second drops the flat argument (Fable plan M2).
 
 - [ ] **Step 3: the dependent shell-test rewrites (same gate).**
-  theme_picker.rs:45/:50 → `>= 19` and a non-flat name; render.rs a11y test → replace
-  phosphor-amber-flat with no-color + a derived zen-phosphor case (construct + derive);
+  theme_picker.rs:45/:50 → `>= 19` and a non-flat name; render.rs a11y test → `cue_themes()` becomes `[no_color()]` ONLY (Fable plan I3: a
+  derived zen-phosphor is NOT a cue theme — derived ChromeSelected is explicit fg/bg
+  with no modifier and would flunk the cued-array assertion at render.rs:2147-2155);
+  the "zen-phosphor case" becomes a SEPARATE assertion scoped to what it promises
+  (derived chrome faces fully colored, hue carried) — not membership in the modifier
+  battery;
   render.rs phosphor border tests (:2623-2647) → construct phosphor + derive_chrome(Full)
   and pin the DERIVED border values (§B.3); theme_resolve.rs name pins →
   "terminal-plain" expectations (the alias warning itself lands in T3 — these tests only
   need the fallback NAME fixed); editor.rs:1138 and theme_picker.rs:84 — the two
   remaining `"default"`-name pins (Codex r2 grep) → "terminal-plain". After the rewrites,
   grep `"default"` and `-flat` and `builtin_names` across wordcartel/src (incl. e2e.rs)
-  and confirm zero stale references in the report.
+  and confirm zero stale references in the report — EXPECTED survivors to disposition
+  explicitly (Fable plan M5): mouse.rs:841's "only 13 builtins" comment (update the
+  number, logic survives) and editor.rs:495's `ThemeIdentity::Builtin("default")` init
+  literal (→ "terminal-plain"; runtime overwrites at startup, no test breaks).
 
 - [ ] **Step 4: GREEN + gates + commit** — `feat(e3e4): the 19-theme lineup — phosphor derives (I4-A), from_base16 sentinels, terminal-plain + terminal-ansi, the ten E4 builtins`.
 
@@ -135,7 +153,7 @@ completes the wiring.
 - Create: `wordcartel/src/render_overlays.rs`; Modify: `wordcartel/src/render.rs`, `wordcartel/src/lib.rs` (mod line).
 
 **Interfaces:**
-- Produces: `pub(crate) struct ChromeStyles` — the FULL final field set T5 needs (grounding's feasible shape: the six existing precomputed styles + ov_fill, ov_accent, overlay_border, overlay_selected, scrollbar track/thumb — built once in render.rs; T5 must not need a field T4 didn't add). DEAD-CODE DISCIPLINE for T4's intermediate state (Codex r2 T4): every field T4 adds is READ in T4 — the mechanical move threads the six existing styles through their painters AND immediately re-homes the scrollbar pair (its two compose calls move into the struct build) and wires ov_fill/ov_accent/overlay_border/overlay_selected into the painters at their CURRENT values (ov_fill/border = today's compose results — behavior-identical) so no field is unused and no #[allow] is needed; T5 then changes the VALUES/faces, not the wiring; `pub(crate) fn render_overlays::paint(frame, editor, &ChromeStyles)` containing the five overlay painters + menu + diag, code MOVED byte-identical except the mechanical style-struct threading. Geometry helpers STAY in render.rs pub(crate) (mouse.rs imports unchanged — grounding A.10).
+- Produces: `pub(crate) struct ChromeStyles` — the FULL final field set T5 needs (grounding's feasible shape: the six existing precomputed styles + ov_fill, ov_accent, overlay_border, overlay_selected, scrollbar track/thumb — built once in render.rs; T5 must not need a field T4 didn't add). DEAD-CODE DISCIPLINE for T4's intermediate state, made concrete (Fable plan review I1): the ChromeStyles build HOISTS ABOVE render.rs:617 (the scrollbar composes live at :617-624, above today's precompute block — re-homing them requires it); `ov_fill = RStyle::default()` in T4 (there IS no fill today — an all-None patch is the only behavior-identical value; T5 swaps it to compose([ChromeOverlay])); `overlay_selected` is a RENAME of today's ov_highlight (same [ChromeReverse] value — NOT a duplicate field; grounding E.8's shape); `ov_accent` is read by THREADING THE STATUS ARMS through the struct at today's compose([ChromeReverse]) value for all four states (the status block stays in render.rs but reads the struct; T5 changes the VALUES per state, not the wiring); overlay_border wired at today's compose([SE::Chrome]). Every field read, no #[allow], behavior byte-identical; `pub(crate) fn render_overlays::paint(frame, editor, &ChromeStyles)` containing the five overlay painters + menu + diag, code MOVED byte-identical except the mechanical style-struct threading. Geometry helpers STAY in render.rs pub(crate) (mouse.rs imports unchanged — grounding A.10).
 
 - [ ] **Step 1:** build `ChromeStyles` in render.rs replacing the six locals (grounding A.3's precompute block; the two new slots compose the T1 faces); move the painter block (:739-1081 region) into render_overlays.rs with ONLY the mechanical renames (locals → struct fields). TWO commits: (a) the struct introduction in place, (b) the move — so the move commit diffs byte-identical-modulo-mechanical and review can verify conservation (H1 discipline; the whole-branch review charges it).
 - [ ] **Step 2:** full suite green UNCHANGED (no behavior change; render tests pass as-is). Gates. Commits — `refactor(e3e4): ChromeStyles precompute struct` / `refactor(e3e4): render_overlays.rs — the painters move (byte-identical modulo threading)`.
@@ -156,6 +174,7 @@ completes the wiring.
   - `phosphor_border_cells_carry_no_own_bg` (THE halo: under phosphor-green with the palette open, every border glyph cell's bg == the interior fill bg — both dispositions).
   - `prompt_active_status_uses_accent` (open a minibuffer → status fg == ChromeAccent fg + bold; normal → Chrome).
   - REWRITE `default_status_line_still_reversed` → `terminal_plain_status_carries_chrome_face` (grounding E.4: White/Black explicit, not REVERSED).
+  - REWRITE `phosphor_status_line_carries_hue` (render.rs:1660-1677 — Fable plan I2: it asserts compose([ChromeReverse])'s REVERSED modifier on the status row, which T5's explicit-Chrome status kills): recompose against [Chrome] and assert the DERIVED phosphor hue bg on the status cells.
   - Update the a11y test (the phosphor-amber-flat removal already landed in T2; HERE add ChromeAccent-carries-modifiers under no-color; ChromeOverlay exempted with the rationale comment).
   - Goldens (scrollbar/menu-fill) survive by compose-relative construction — verify and say so.
 - [ ] **Step 2: rewire** per spec D2 + grounding A.3: overlay rect fill (set_style ChromeOverlay after Clear) + rows/query compose [ChromeOverlay]; borders fg-only (strip the bg from the border style — the fill shows through, ratatui patch semantics verified); selected rows ChromeSelected; status explicit Chrome + the accent state split; menu/scrollbar roles unchanged (values now derived).
@@ -186,7 +205,7 @@ completes the wiring.
 **Interfaces:** consumes everything.
 
 - [ ] **Step 1:** `preview_selected_theme` gains the derivation on the fresh builtin (`theme.derive_chrome(editor.chrome_disposition)` before apply — grounding A.9; apply_theme itself UNTOUCHED); a preview-derives pin (open picker under zen, Down to flexoki-dark, the LIVE theme's bar == §B.3's zen hex). (The picker count rewrite lives in T2 — no duplicate ownership; Codex r2.)
-- [ ] **Step 2: the journey** (`journey_chrome_zen_toggle`): under tokyo-night (Harness with the resolved theme — grounding §D's harness idiom), open the palette → assert a themed interior cell via the harness buffer (or delegate to T6's render pin and assert text presence); dispatch toggle_chrome via palette → status "chrome: zen"; Save Settings → the file carries `[theme] chrome = "zen"`.
+- [ ] **Step 2: the journey** (`journey_chrome_zen_toggle`): under tokyo-night (Harness with the resolved theme — grounding §D's harness idiom), open the palette → assert a themed interior cell via the harness buffer (or delegate to T5's `tokyo_overlay_interior_is_themed` render pin and assert text presence); dispatch toggle_chrome via palette → status "chrome: zen"; Save Settings → the file carries `[theme] chrome = "zen"`.
 - [ ] **Step 3: full gates + smoke** (`scripts/smoke/run.sh`, quote VERBATIM — advisory).
 - [ ] **Step 4: commit** — `feat(e3e4): preview derivation, 19-theme picker, the zen journey`.
 
