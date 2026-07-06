@@ -1,7 +1,7 @@
 //! Shell theme resolution: env depth detection + `resolve_theme` (Task 5).
 //! Core stays IO-free; this is where env/file reading happens.
 
-use wordcartel_core::theme::{self, Color, Depth, Face, Theme, ChromeDisposition, SemanticElement};
+use wordcartel_core::theme::{self, Color, Depth, Face, Theme, CanvasMode, ChromeDisposition, SemanticElement};
 use crate::config::{ThemeConfig, RawFace};
 
 /// Detect color depth from environment values. Case-insensitive.
@@ -65,6 +65,19 @@ pub fn parse_chrome(s: &Option<String>) -> (ChromeDisposition, Option<String>) {
         Some("zen") => (ChromeDisposition::Zen, None),
         Some(other) => (ChromeDisposition::Full,
             Some(format!("theme.chrome: unknown value `{other}` — using full"))),
+    }
+}
+
+/// Parse a `[theme] canvas` config string into a `CanvasMode`.
+///
+/// `"opaque"` or `None` → `Opaque` (silent). `"transparent"` → `Transparent`.
+/// Unknown value → `Opaque` + warning.
+pub fn parse_canvas(s: &Option<String>) -> (CanvasMode, Option<String>) {
+    match s.as_deref() {
+        None | Some("opaque") => (CanvasMode::Opaque, None),
+        Some("transparent") => (CanvasMode::Transparent, None),
+        Some(other) => (CanvasMode::Opaque,
+            Some(format!("theme.canvas: unknown value `{other}` — using opaque"))),
     }
 }
 
@@ -493,5 +506,16 @@ mod tests {
         assert_eq!(r.theme.face(SemanticElement::Chrome).bg,
             Some(Color::Rgb { r:0xff, g:0x00, b:0x00 }),
             "user chrome style override must land after the Ansi16 policy");
+    }
+
+    #[test]
+    fn parse_canvas_maps_values() {
+        use wordcartel_core::theme::CanvasMode;
+        assert_eq!(parse_canvas(&None), (CanvasMode::Opaque, None));
+        assert_eq!(parse_canvas(&Some("opaque".into())), (CanvasMode::Opaque, None));
+        assert_eq!(parse_canvas(&Some("transparent".into())), (CanvasMode::Transparent, None));
+        let (m, w) = parse_canvas(&Some("bogus".into()));
+        assert_eq!(m, CanvasMode::Opaque);
+        assert_eq!(w.as_deref(), Some("theme.canvas: unknown value `bogus` — using opaque"));
     }
 }

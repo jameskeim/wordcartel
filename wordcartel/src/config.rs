@@ -48,6 +48,7 @@ pub struct ThemeConfig {
     pub file: Option<PathBuf>,           // ~-expanded, resolved relative to declaring config
     pub depth: Option<String>,           // "truecolor"|"256"|"16"|"none"
     pub chrome: Option<String>,          // "full"|"zen" — parsed at resolve
+    pub canvas: Option<String>,          // "opaque"|"transparent" — parsed at resolve
     pub heading_level_glyph: Option<bool>,
     pub styles: BTreeMap<String, RawFace>,
 }
@@ -209,6 +210,7 @@ struct RawTheme {
     file: Option<String>,
     depth: Option<String>,
     chrome: Option<String>,
+    canvas: Option<String>,
     heading_level_glyph: Option<bool>,
     styles: BTreeMap<String, RawFace>,
 }
@@ -448,6 +450,7 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
         }
         if let Some(d) = rt.depth { cfg.theme.depth = Some(d); }
         if let Some(c) = rt.chrome { cfg.theme.chrome = Some(c); }
+        if let Some(c) = rt.canvas { cfg.theme.canvas = Some(c); }
         if let Some(h) = rt.heading_level_glyph { cfg.theme.heading_level_glyph = Some(h); }
         for (k, v) in rt.styles { cfg.theme.styles.insert(k, v); } // accumulate across layers
     }
@@ -835,10 +838,12 @@ mod tests {
             &baseline_cfg.theme, &env, wordcartel_core::theme::ChromeDisposition::Full);
         let baseline = snapshot_of(&baseline_cfg, &baseline_resolved.theme.name);
 
-        // Runtime snapshot: seven divergences — keymap → wordstar, typewriter on,
+        // Runtime snapshot: eight divergences — keymap → wordstar, typewriter on,
         // bar → pinned, mouse capture off, theme → tokyo-night, wrap_column → 100,
-        // chrome → Zen (spec Testing: the round-trip covers [mouse] capture and [theme]
-        // name + chrome too — Fable m-wb-1; wrap_column 100 is distinct from default 72).
+        // chrome → Zen, canvas → Transparent (spec Testing: the round-trip covers
+        // [mouse] capture and [theme] name + chrome + canvas too — Fable m-wb-1;
+        // wrap_column 100 is distinct from default 72).
+        use wordcartel_core::theme::CanvasMode;
         let runtime = SettingsSnapshot {
             keymap_preset:   "wordstar".to_string(),
             theme_identity:  ThemeIdentity::Builtin("tokyo-night".to_string()),
@@ -851,6 +856,7 @@ mod tests {
             menu_bar:        crate::config::MenuBarMode::Pinned,
             mouse_capture:   false,
             chrome_disposition: wordcartel_core::theme::ChromeDisposition::Zen,
+            canvas: CanvasMode::Transparent,
         };
 
         let of = compute_overrides(&runtime, &baseline, &OverridesFile::default(), &OverridesFile::default());
@@ -870,6 +876,8 @@ mod tests {
             "view.wrap_column must round-trip to 100");
         assert_eq!(cfg.theme.chrome.as_deref(), Some("zen"),
             "[theme] chrome must round-trip to 'zen'");
+        assert_eq!(cfg.theme.canvas.as_deref(), Some("transparent"),
+            "[theme] canvas must round-trip");
     }
 
 }

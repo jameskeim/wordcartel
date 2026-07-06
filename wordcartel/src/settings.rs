@@ -6,7 +6,7 @@
 //! can distinguish "user switched from a file-theme to a builtin" from a coincidence.
 
 use serde::{Serialize, Deserialize};
-use wordcartel_core::theme::ChromeDisposition;
+use wordcartel_core::theme::{CanvasMode, ChromeDisposition};
 
 // ---------------------------------------------------------------------------
 // ThemeIdentity — provenance tag for the active theme
@@ -44,6 +44,8 @@ pub struct SettingsSnapshot {
     /// Chrome disposition: `Full` (calibrated steps) or `Zen` (collapsed). Seeded from
     /// `cfg.theme.chrome` at startup; updated by `toggle_chrome` at runtime.
     pub chrome_disposition: ChromeDisposition,
+    /// Canvas opacity persisted as "opaque"/"transparent". Per-field — independent of name/chrome.
+    pub canvas: CanvasMode,
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +91,9 @@ pub struct OTheme {
     /// Chrome disposition persisted as "full"/"zen". Persisted per-field — independent of
     /// the name/file provenance logic (spec D3).
     #[serde(skip_serializing_if = "Option::is_none")] pub chrome: Option<String>,
+    /// Canvas opacity persisted as "opaque"/"transparent". Persisted per-field — independent of
+    /// the name/file provenance logic and of chrome (spec D5).
+    #[serde(skip_serializing_if = "Option::is_none")] pub canvas: Option<String>,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -148,6 +153,7 @@ pub fn snapshot_of(cfg: &crate::config::Config, resolved_theme_name: &str) -> Se
         menu_bar:        cfg.menu.bar,
         mouse_capture:   cfg.mouse.mouse_capture,
         chrome_disposition,
+        canvas: crate::theme_resolve::parse_canvas(&cfg.theme.canvas).0,
     }
 }
 
@@ -165,6 +171,7 @@ pub fn runtime_snapshot(editor: &crate::editor::Editor) -> SettingsSnapshot {
         menu_bar:        editor.menu_bar_mode,
         mouse_capture:   editor.mouse_capture,
         chrome_disposition: editor.chrome_disposition,
+        canvas: editor.canvas,
     }
 }
 
@@ -211,18 +218,22 @@ pub fn parse_mask(bytes: &str) -> OverridesFile {
         /// chrome passes through as its OWN per-key predicate — independent of the
         /// name/file provenance sentinel (spec D3 / grounding A.6).
         chrome: Option<String>,
+        canvas: Option<String>,
     }
 
     let mask: MaskFile = toml::from_str(bytes).unwrap_or_default();
     // Collapse theme provenance: name OR file → presence sentinel (empty name string).
-    // chrome passes through independently beside that sentinel.
+    // chrome and canvas pass through independently beside that sentinel as their own
+    // per-key predicates.
     let theme = mask.theme.and_then(|t| {
         let name_file = t.name.is_some() || t.file.is_some();
         let chrome = t.chrome;
-        if name_file || chrome.is_some() {
+        let canvas = t.canvas;
+        if name_file || chrome.is_some() || canvas.is_some() {
             Some(OTheme {
                 name: if name_file { Some(String::new()) } else { None },
                 chrome,
+                canvas,
             })
         } else {
             None
@@ -280,11 +291,10 @@ pub fn compute_overrides(
 
     // --- theme (bespoke provenance logic — spec N-3/N-4) ---
     //
-    // `mask.theme.is_some()` is the provenance-collapsed sentinel: T4 calls
-    // `parse_mask` on the --config layer, which sets theme presence when EITHER
-    // `name` OR `file` is present (file-mask arm), so the guard fires correctly
-    // for both name- and file-configured --config themes.
-    let theme_masked = mask.theme.is_some();
+    // Name/file provenance only — a chrome/canvas-only --config mask must NOT shield the name
+    // (each interior key guards itself via its own diff_key predicate below).
+    // parse_mask sets `name: Some("")` for name/file masks, `None` for interior-only ones.
+    let theme_masked = mask.theme.as_ref().and_then(|t| t.name.as_ref()).is_some();
     let theme_name: Option<String> = match (&runtime.theme_identity, &baseline.theme_identity) {
         (ThemeIdentity::Builtin(n), b) if *b != ThemeIdentity::Builtin(n.clone()) => Some(n.clone()),
         (rt, _) => match existing.theme.as_ref().and_then(|t| t.name.as_ref()) {
@@ -308,8 +318,23 @@ pub fn compute_overrides(
         existing.theme.as_ref().and_then(|t| t.chrome.as_ref()),
         mask.theme.as_ref().and_then(|t| t.chrome.as_ref()).is_some(),
     );
-    let has_theme = theme_name.is_some() || chrome.is_some();
-    let theme = some_if(OTheme { name: theme_name, chrome }, has_theme);
+    // canvas: plain string diff, own per-key mask predicate — independent of the
+    // name/file provenance sentinel. Converts canvas enum → "opaque"/"transparent" strings.
+    let rt_canvas = match runtime.canvas {
+        CanvasMode::Opaque      => "opaque".to_string(),
+        CanvasMode::Transparent => "transparent".to_string(),
+    };
+    let base_canvas_s = match baseline.canvas {
+        CanvasMode::Opaque      => "opaque".to_string(),
+        CanvasMode::Transparent => "transparent".to_string(),
+    };
+    let canvas = diff_key(
+        &rt_canvas, &base_canvas_s,
+        existing.theme.as_ref().and_then(|t| t.canvas.as_ref()),
+        mask.theme.as_ref().and_then(|t| t.canvas.as_ref()).is_some(),
+    );
+    let has_theme = theme_name.is_some() || chrome.is_some() || canvas.is_some();
+    let theme = some_if(OTheme { name: theme_name, chrome, canvas }, has_theme);
 
     // --- view — per-key mask predicates ---
     let ex_view = existing.view.as_ref();
@@ -479,7 +504,8 @@ mod tests {
             view_typewriter: tw, view_focus: false, view_measure: false,
             view_wrap_guide: false, view_word_count: false, view_wrap_column: 72,
             menu_bar: crate::config::MenuBarMode::Auto, mouse_capture: true,
-            chrome_disposition: ChromeDisposition::Full }
+            chrome_disposition: ChromeDisposition::Full,
+            canvas: CanvasMode::Opaque }
     }
 
     #[test]
@@ -809,6 +835,41 @@ mod tests {
         let of3 = compute_overrides(&rt2, &base, &existing, &mask);
         assert_eq!(of3.theme.as_ref().and_then(|t| t.chrome.as_deref()), Some("zen"),
             "mask-guard keeps verbatim when chrome key present in mask");
+    }
+
+    #[test]
+    fn canvas_persists_through_the_diff_law() {
+        use wordcartel_core::theme::CanvasMode;
+        // Rule 1: runtime Transparent vs baseline Opaque → diff writes "transparent".
+        let mut rt = snap("cua", ThemeIdentity::Builtin("default".into()), false);
+        rt.canvas = CanvasMode::Transparent;
+        let base = snap("cua", ThemeIdentity::Builtin("default".into()), false);
+        let of = compute_overrides(&rt, &base, &OverridesFile::default(), &OverridesFile::default());
+        assert_eq!(of.theme.as_ref().and_then(|t| t.canvas.as_deref()), Some("transparent"),
+            "rule 1 writes canvas=transparent on divergence");
+        // Rule 3: runtime back to Opaque, existing has "transparent" → removes (contradiction, unmasked).
+        let rt2 = snap("cua", ThemeIdentity::Builtin("default".into()), false); // Opaque
+        let existing = parse_overrides("[theme]\ncanvas='transparent'\n");
+        let of2 = compute_overrides(&rt2, &base, &existing, &OverridesFile::default());
+        assert!(of2.theme.as_ref().and_then(|t| t.canvas.as_ref()).is_none(),
+            "rule 3 removes the contradicted canvas key");
+        // Mask-guard: --config [theme] canvas=... guards the key independently.
+        let mask = parse_mask("[theme]\ncanvas='transparent'\n");
+        let of3 = compute_overrides(&rt2, &base, &existing, &mask);
+        assert_eq!(of3.theme.as_ref().and_then(|t| t.canvas.as_deref()), Some("transparent"),
+            "mask-guard keeps verbatim when canvas key present in mask");
+    }
+
+    #[test]
+    fn interior_key_mask_does_not_shield_name() {
+        // A canvas-only (or chrome-only) --config mask must NOT protect a contradicted name key.
+        let rt = snap("cua", ThemeIdentity::Builtin("terminal-plain".into()), false);
+        let base = snap("cua", ThemeIdentity::Builtin("terminal-plain".into()), false);
+        let existing = parse_overrides("[theme]\nname='tokyo-night'\n"); // stale, now contradicted
+        let mask = parse_mask("[theme]\ncanvas='transparent'\n");        // canvas-only mask
+        let of = compute_overrides(&rt, &base, &existing, &mask);
+        assert!(of.theme.as_ref().and_then(|t| t.name.as_ref()).is_none(),
+            "canvas-only mask must not shield the contradicted name key");
     }
 
     #[test]

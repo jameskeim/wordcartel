@@ -104,6 +104,28 @@ fn prefix_element(role: wordcartel_core::style::BlockRole) -> SE {
     }
 }
 
+/// Apply a base_fg fallback to editing-area text spans.
+///
+/// If `style.fg` is already `Some` — set by a heading role, link, code, or any
+/// inline colour — the style is returned unchanged. If it is `None` and the
+/// theme's canvas fg maps to a real colour at this depth (i.e. not `Reset`;
+/// terminal-default themes map `base_fg → Reset` and are left untouched),
+/// the fallback is applied so plain body text renders the theme foreground over
+/// the opaque canvas rather than the terminal default.
+fn text_fg_or_base(
+    style: RStyle,
+    theme: &wordcartel_core::theme::Theme,
+    depth: wordcartel_core::theme::Depth,
+) -> RStyle {
+    if style.fg.is_some() {
+        return style;
+    }
+    match compose::base_canvas(theme, depth).fg {
+        Some(Color::Reset) | None => style,
+        Some(c)                   => style.fg(c),
+    }
+}
+
 // Shared geometry — render AND mouse both call these.
 
 /// Compute bar label rects from a raw category slice (static MENU_ORDER or dynamic group list).
@@ -270,27 +292,38 @@ pub(crate) struct ChromeStyles {
 }
 
 impl ChromeStyles {
-    /// Build the full chrome style set from the current theme and depth.
+    /// Build the full chrome style set from the current theme, depth, and canvas mode.
     /// Called once per frame in `render()`, before the scrollbar and status
     /// sections; all downstream painters borrow this struct by reference.
     pub(crate) fn build(
         theme: &wordcartel_core::theme::Theme,
         depth: wordcartel_core::theme::Depth,
+        canvas: wordcartel_core::theme::CanvasMode,
     ) -> Self {
+        let transparent = canvas == wordcartel_core::theme::CanvasMode::Transparent;
         // overlay_border: fg-only Chrome — .bg cleared so the ChromeOverlay fill bg is
         // preserved under ratatui's Cell::set_style patch semantics (D2 defect-1 fix).
         let mut border = compose::compose(theme, depth, &[SE::Chrome]);
         border.bg = None;
+        // Overlay interior fills go see-through in transparent mode: ov_fill becomes a no-op and
+        // the query bar renders fg-only. overlay_selected keeps its bg (selection stays visible).
+        let mut ov_query = compose::compose(theme, depth, &[SE::ChromeOverlay]);
+        if transparent { ov_query.bg = None; }
+        let ov_fill = if transparent {
+            RStyle::default()
+        } else {
+            compose::compose(theme, depth, &[SE::ChromeOverlay])
+        };
         ChromeStyles {
             overlay_selected: compose::compose(theme, depth, &[SE::ChromeSelected]),
-            ov_query:         compose::compose(theme, depth, &[SE::ChromeOverlay]),
+            ov_query,
             menu_open:        compose::compose(theme, depth, &[SE::ChromeSelected]),
             menu_closed:      compose::compose(theme, depth, &[SE::Chrome]),
             menu_sel:         compose::compose(theme, depth, &[SE::ChromeSelected]),
             menu_norm:        compose::compose(theme, depth, &[SE::ChromeMuted]),
             scrollbar_track:  compose::compose(theme, depth, &[SE::ChromeMuted]),
             scrollbar_thumb:  compose::compose(theme, depth, &[SE::Chrome]),
-            ov_fill:          compose::compose(theme, depth, &[SE::ChromeOverlay]),
+            ov_fill,
             ov_accent:        compose::compose(theme, depth, &[SE::ChromeAccent]),
             overlay_border:   border,
         }
@@ -338,6 +371,19 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
 
     // Centered-measure geometry: ONE call here so paint + cursor never desync.
     let tg = crate::nav::text_geometry(editor);
+
+    // Opaque canvas: fill the whole edit band (margins + blank/below-content rows) with base_bg
+    // BEFORE the per-row text Paragraphs — fg-only text preserves it (Cell::set_style patch
+    // semantics, same as fg-only borders). Skipped in Transparent mode and when the theme has no
+    // canvas to paint (base_bg → Reset, or Depth::None → no color).
+    if editor.canvas == wordcartel_core::theme::CanvasMode::Opaque {
+        let mut cbg = compose::base_canvas(&editor.theme, editor.depth);
+        cbg.fg = None; // bg-only fill
+        if cbg.bg.is_some() && cbg.bg != Some(Color::Reset) {
+            let band = Rect::new(area.x, edit_top, w, edit_height);
+            frame.buffer_mut().set_style(band, cbg);
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Wrap-guide line (painted BEFORE the text-row loop so text overwrites it)
@@ -506,18 +552,18 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 for seg in &vr.segs {
                     let style = if row_dim {
                         if source_mode {
-                            compose::base_canvas(&editor.theme, editor.depth)
-                                .patch(compose::compose(&editor.theme, editor.depth, &[SE::FocusDim]))
+                            compose::compose(&editor.theme, editor.depth, &[SE::Text, SE::FocusDim])
                         } else {
                             // §13.2 FIX-1: compose FocusDim OVER the semantic stack so heading
                             // bold, comment italic, etc. are preserved on dim rows (§3.4 intent).
                             compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(seg.style), SE::FocusDim])
                         }
                     } else if source_mode {
-                        compose::base_canvas(&editor.theme, editor.depth)
+                        compose::compose(&editor.theme, editor.depth, &[SE::Text])
                     } else {
                         compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(seg.style)])
                     };
+                    let style = text_fg_or_base(style, &editor.theme, editor.depth);
                     segs_spans.push(Span::styled(seg.text.clone(), style));
                 }
                 segs_spans
@@ -581,15 +627,14 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
 
                     let mut style = if row_dim {
                         if source_mode {
-                            compose::base_canvas(&editor.theme, editor.depth)
-                                .patch(compose::compose(&editor.theme, editor.depth, &[SE::FocusDim]))
+                            compose::compose(&editor.theme, editor.depth, &[SE::Text, SE::FocusDim])
                         } else {
                             // §13.2 FIX-1: compose FocusDim OVER the semantic stack so heading
                             // bold, comment italic, etc. are preserved on dim rows (§3.4 intent).
                             compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(p.style), SE::FocusDim])
                         }
                     } else if source_mode {
-                        compose::base_canvas(&editor.theme, editor.depth)
+                        compose::compose(&editor.theme, editor.depth, &[SE::Text])
                     } else {
                         compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(p.style)])
                     };
@@ -638,6 +683,10 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                         }
                     }
 
+                    // Apply base_fg fallback BEFORE the run-accumulation comparison
+                    // so runs of plain body text share one span rather than splitting.
+                    let style = text_fg_or_base(style, &editor.theme, editor.depth);
+
                     // Flush the accumulated run when the style changes.
                     if run_style != Some(style) && !run.is_empty() {
                         hl_spans.push(Span::styled(std::mem::take(&mut run), run_style.unwrap()));
@@ -673,7 +722,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     // Chrome styles — built once here so the scrollbar, status line, and all
     // overlay/menu painters below can borrow editor fields freely.
     // -----------------------------------------------------------------------
-    let cs = ChromeStyles::build(&editor.theme, editor.depth);
+    let cs = ChromeStyles::build(&editor.theme, editor.depth, editor.canvas);
 
     // -----------------------------------------------------------------------
     // Scrollbar overlay (painted over editing area, rightmost column)
@@ -1325,6 +1374,9 @@ mod tests {
 
     #[test]
     fn tokyo_night_heading_row_carries_heading_fg() {
+        // Heading rows in Tokyo Night LivePreview must carry the heading-role fg (MAGENTA for H1).
+        // The render-time base_fg fallback (text_fg_or_base) is skipped when the composed style
+        // already has a fg — which it does for headings via the Heading role in the compose stack.
         let mut ed = Editor::new_from_text("# Title\n", None, (40, 4));
         ed.theme = wordcartel_core::theme::tokyo_night();
         derive::rebuild(&mut ed);
@@ -1462,7 +1514,8 @@ mod tests {
     #[test]
     fn source_mode_no_heading_fg_live_preview_has_heading_fg() {
         // In SourcePlain under Tokyo Night, a heading row must NOT carry the heading fg.
-        // In LivePreview it must.
+        // In LivePreview it must — the render-time base_fg fallback is skipped when the composed
+        // style already has a fg (heading role sets it), so the heading colour is preserved.
         use crate::editor::RenderMode;
         let mut ed = Editor::new_from_text("# Heading\n", None, (40, 4));
         ed.theme = wordcartel_core::theme::tokyo_night();
@@ -2272,6 +2325,137 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Task 3: full-edit-band canvas fill + transparent modal interiors (RED first)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn opaque_canvas_paints_edit_band() {
+        use wordcartel_core::theme::{Theme, Depth};
+        let mut ed = Editor::new_from_text("hi\n", None, (40, 6));
+        ed.theme = Theme::builtin("flexoki-dark").unwrap();
+        ed.depth = Depth::Truecolor;
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+        let want = compose::base_canvas(&ed.theme, ed.depth).bg;   // flexoki-dark base_bg (Rgb)
+        assert!(matches!(want, Some(ratatui::style::Color::Rgb(..))), "flexoki base_bg is Rgb");
+        // A cell to the RIGHT of the text (col 20, row 0) — never covered by the per-row Paragraph —
+        // carries the canvas bg (the blank-area gap the old per-span paint missed).
+        assert_eq!(buf[(20u16, 0u16)].style().bg, want, "blank editing cell must carry canvas bg");
+        // A below-content editing row (row 3) too.
+        assert_eq!(buf[(5u16, 3u16)].style().bg, want, "below-content cell must carry canvas bg");
+    }
+
+    #[test]
+    fn transparent_canvas_leaves_edit_band_reset() {
+        use wordcartel_core::theme::{Theme, Depth, CanvasMode};
+        let mut ed = Editor::new_from_text("hi\n", None, (40, 6));
+        ed.theme = Theme::builtin("flexoki-dark").unwrap();
+        ed.depth = Depth::Truecolor;
+        ed.canvas = CanvasMode::Transparent;
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+        let bg = buf[(20u16, 0u16)].style().bg;
+        assert!(bg.is_none() || bg == Some(ratatui::style::Color::Reset),
+            "transparent: blank editing cell stays terminal-default; got {bg:?}");
+    }
+
+    #[test]
+    fn transparent_suppresses_overlay_interior() {
+        // Modal interiors go see-through in transparent mode: ov_fill is a no-op and the query bar
+        // renders fg-only (bg stripped). The selected-row highlight keeps its bg (stays visible).
+        // Tested directly on the hook — no palette/registry setup needed.
+        use wordcartel_core::theme::{Theme, Depth, CanvasMode, ChromeDisposition};
+        let mut theme = Theme::builtin("flexoki-dark").unwrap();
+        theme.derive_chrome(ChromeDisposition::Full);
+        let opaque = ChromeStyles::build(&theme, Depth::Truecolor, CanvasMode::Opaque);
+        let transp = ChromeStyles::build(&theme, Depth::Truecolor, CanvasMode::Transparent);
+        assert!(opaque.ov_fill.bg.is_some(), "opaque overlay fill carries a ChromeOverlay bg");
+        assert_eq!(transp.ov_fill, RStyle::default(), "transparent overlay fill is a no-op");
+        assert!(opaque.ov_query.bg.is_some(), "opaque query bar carries a bg");
+        assert!(transp.ov_query.bg.is_none(), "transparent query bar bg is stripped (fg-only)");
+        assert!(transp.overlay_selected.bg.is_some(), "selected-row highlight stays visible in transparent");
+    }
+
+    #[test]
+    fn transparent_keeps_content_highlights() {
+        // Content highlights (selection/search/code/diagnostics) keep their explicit bg in
+        // transparent mode — canvas mode only touches the band fill + ov_fill, never content
+        // composition. A transparent selection would be an invisible selection (spec D1 boundary).
+        use wordcartel_core::theme::{Theme, Depth, CanvasMode};
+        use wordcartel_core::selection::Selection;
+        let mut ed = Editor::new_from_text("hi\n", None, (40, 6));
+        ed.theme = Theme::builtin("flexoki-dark").unwrap();
+        ed.depth = Depth::Truecolor;
+        ed.canvas = CanvasMode::Transparent;
+        ed.active_mut().document.selection = Selection::range(0, 2); // select "hi"
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+        let bg = buf[(0u16, 0u16)].style().bg;
+        assert!(matches!(bg, Some(ratatui::style::Color::Rgb(..))),
+            "selection highlight must survive transparent canvas; got {bg:?}");
+    }
+
+    #[test]
+    fn transparent_keeps_bars_painted() {
+        use wordcartel_core::theme::{Theme, Depth, CanvasMode, ChromeDisposition};
+        let mut ed = Editor::new_from_text("hi\n", None, (40, 6));
+        ed.menu_bar_mode = crate::config::MenuBarMode::Pinned;
+        let mut theme = Theme::builtin("flexoki-dark").unwrap();
+        theme.derive_chrome(ChromeDisposition::Full);
+        ed.theme = theme;
+        ed.depth = Depth::Truecolor;
+        ed.canvas = CanvasMode::Transparent;
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+        let menu = compose::compose(&ed.theme, ed.depth, &[SE::Chrome]).bg;
+        assert_eq!(buf[(0u16, 0u16)].style().bg, menu, "menu bar stays painted in transparent mode");
+        assert_eq!(buf[(0u16, 5u16)].style().bg, menu, "status bar stays painted in transparent mode");
+    }
+
+    #[test]
+    fn non_rgb_theme_canvas_moot_both_modes() {
+        use wordcartel_core::theme::{Theme, Depth, CanvasMode};
+        for mode in [CanvasMode::Opaque, CanvasMode::Transparent] {
+            let mut ed = Editor::new_from_text("hi\n", None, (40, 6));
+            ed.theme = Theme::builtin("terminal-plain").unwrap();
+            ed.depth = Depth::Truecolor;
+            ed.canvas = mode;
+            derive::rebuild(&mut ed);
+            let buf = render_to_buffer(&mut ed, 40, 6);
+            let bg = buf[(20u16, 0u16)].style().bg;
+            assert!(bg.is_none() || bg == Some(ratatui::style::Color::Reset),
+                "terminal-plain has no canvas — {mode:?} editing cell stays terminal-default; got {bg:?}");
+        }
+    }
+
+    #[test]
+    fn opaque_canvas_at_ansi16_paints_quantized_bg() {
+        use wordcartel_core::theme::{Theme, Depth};
+        let mut ed = Editor::new_from_text("hi\n", None, (40, 6));
+        ed.theme = Theme::builtin("flexoki-dark").unwrap();
+        ed.depth = Depth::Ansi16;
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+        let want = compose::base_canvas(&ed.theme, Depth::Ansi16).bg;
+        assert!(want.is_some() && want != Some(ratatui::style::Color::Reset),
+            "flexoki base_bg quantizes to a named Ansi16 color; got {want:?}");
+        assert_eq!(buf[(20u16, 0u16)].style().bg, want, "opaque Ansi16 paints the quantized canvas bg");
+    }
+
+    #[test]
+    fn opaque_canvas_at_depth_none_paints_nothing() {
+        use wordcartel_core::theme::{Theme, Depth};
+        let mut ed = Editor::new_from_text("hi\n", None, (40, 6));
+        ed.theme = Theme::builtin("flexoki-dark").unwrap();
+        ed.depth = Depth::None;                       // cue/monochrome — base_canvas has no color
+        derive::rebuild(&mut ed);
+        let buf = render_to_buffer(&mut ed, 40, 6);
+        let bg = buf[(20u16, 0u16)].style().bg;
+        assert!(bg.is_none() || bg == Some(ratatui::style::Color::Reset),
+            "Depth::None: band guard skips the fill; got {bg:?}");
+    }
+
+    // -----------------------------------------------------------------------
     // Branch-review fixes (RED tests written before implementation — TDD)
     // -----------------------------------------------------------------------
 
@@ -2609,5 +2793,51 @@ mod tests {
         }
         // And the RIGHT EDGE specifically is Chrome (it is unpainted today — this fails pre-fix).
         assert_eq!(buf[(39u16, 0u16)].style().bg, chrome, "right edge must carry the Chrome fill");
+    }
+
+    /// Whole-branch gate regression: base16 themes and tokyo-night have `text: Face::default()`
+    /// (no fg), so plain body-text cells rendered with terminal-default fg over base_bg — a
+    /// visible readability defect once the opaque canvas paints base_bg. The fix applies a
+    /// render-time `text_fg_or_base` fallback: body spans with no composed fg fall back to
+    /// base_fg, while headings/colored roles (fg already set) are untouched.
+    ///
+    /// Must FAIL before the fix (text fg is None) and PASS after (text fg == base_fg).
+    #[test]
+    fn body_text_carries_theme_fg() {
+        use crate::editor::RenderMode;
+
+        // flexoki-dark (a base16 theme) — plain body-text cells must carry base_fg.
+        {
+            let mut ed = Editor::new_from_text("Hello\n", None, (40, 4));
+            ed.theme = wordcartel_core::theme::flexoki_dark();
+            ed.active_mut().view.mode = RenderMode::LivePreview;
+            derive::rebuild(&mut ed);
+            let buf = render_to_buffer(&mut ed, 40, 4);
+            let want = compose::base_canvas(&ed.theme, ed.depth).fg;
+            assert!(want.is_some(), "flexoki-dark base_fg must be Some(Rgb)");
+            assert!(
+                (0..40u16).any(|x| buf[(x, 0u16)].style().fg == want),
+                "flexoki-dark: body text must carry base_fg {:?} — row-0 fgs: {:?}",
+                want,
+                (0..40u16).map(|x| buf[(x, 0u16)].style().fg).collect::<Vec<_>>(),
+            );
+        }
+
+        // tokyo-night — plain body-text cells must carry base_fg.
+        {
+            let mut ed = Editor::new_from_text("Hello\n", None, (40, 4));
+            ed.theme = wordcartel_core::theme::tokyo_night();
+            ed.active_mut().view.mode = RenderMode::LivePreview;
+            derive::rebuild(&mut ed);
+            let buf = render_to_buffer(&mut ed, 40, 4);
+            let want = compose::base_canvas(&ed.theme, ed.depth).fg;
+            assert!(want.is_some(), "tokyo-night base_fg must be Some(Rgb)");
+            assert!(
+                (0..40u16).any(|x| buf[(x, 0u16)].style().fg == want),
+                "tokyo-night: body text must carry base_fg {:?} — row-0 fgs: {:?}",
+                want,
+                (0..40u16).map(|x| buf[(x, 0u16)].style().fg).collect::<Vec<_>>(),
+            );
+        }
     }
 }
