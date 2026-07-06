@@ -378,7 +378,12 @@ const FG_FLOOR:      f32 = 4.5;   // each chrome fg clears 4.5 vs its own panel 
 const CHROME_PANEL_S_CAP: f32 = 0.35; // elevated-panel S = min(canvas_S, 0.35); LIGHT canvases only
 const LAYER_L_STEP:  f32 = 0.002; // panel-lightness search granularity (matches the §II calibration probe)
 const FG_NUDGE_STEP: f32 = 0.01;  // fg legibility-nudge granularity (matches the §II calibration probe)
-const CR_TOL:        f32 = 0.0005; // adjacent-CR / fg-floor acceptance tolerance (calibration probe)
+// Acceptance slack for the adjacent-layer / fg-floor contrast searches. The CR targets are
+// evaluated in f32 against candidates that will be quantized to u8 channels; a bare `>= target`
+// would reject a candidate whose true CR sits a hair below the target only through f32 rounding at
+// the quantization boundary, over-shooting to the next (visibly identical) rung. 0.0005 absorbs
+// that jitter — calibrated against the §II.5 probe so every pin reproduces byte-exact.
+const CR_TOL:        f32 = 0.0005;
 const MUTED_FG_BLEND: f32 = 0.35;   // muted fg seed = blend(base_fg, base_bg, 0.35), then nudged
 const ACCENT_DESAT:   f32 = 0.50;   // accent fg = blend(seed, equal_lum_gray(seed), 0.50)
 const ZEN_ACCENT_EXTRA: f32 = 0.40; // zen: extra blend of the accent fg toward the same gray
@@ -1177,8 +1182,10 @@ mod tests {
                         f.fg.is_some() && f.fg != Some(Color::Default),
                         "{name} {el:?}: fg-required face has no explicit fg"),
                     FaceReq::UnderlineColorRequired => assert!(
-                        f.underline_color.is_some(),
-                        "{name} {el:?}: underline_color-required face has none"),
+                        f.underline_color.is_some() && f.underline == Some(true),
+                        "{name} {el:?}: diagnostic face needs BOTH underline_color AND the \
+                         underline modifier — a colored underline with no underline draws nothing \
+                         (a11y cue would be invisible)"),
                     FaceReq::Highlight => assert!(
                         f.bg.is_some() || f.reverse == Some(true),
                         "{name} {el:?}: highlight face needs a bg OR reverse"),

@@ -457,6 +457,16 @@ mod tests {
             "Ansi16 light-canvas policy: ChromeSelected fg must be White");
         assert_eq!(r2.theme.face(SemanticElement::ChromeSelected).bg, Some(Color::Black),
             "Ansi16 light-canvas policy: ChromeSelected bg must be Black");
+        // Modal-shares-dropdown invariant on the LIGHT arm too (dark arm is pinned in the tokyo
+        // r3 block below): Muted (dropdown) shares Overlay's (modal) chrome_bg = Black, kept
+        // distinct from the bar only by its dim fg.
+        assert_eq!(r2.theme.face(SemanticElement::ChromeMuted).bg, Some(Color::Black),
+            "Ansi16 light-canvas policy: ChromeMuted (dropdown) bg must be Black (shares overlay tone)");
+        assert_eq!(r2.theme.face(SemanticElement::ChromeMuted).bg,
+            r2.theme.face(SemanticElement::ChromeOverlay).bg,
+            "Ansi16 light arm: Overlay.bg == Muted.bg (modal shares the dropdown tone)");
+        assert_eq!(r2.theme.face(SemanticElement::ChromeMuted).dim, Some(true),
+            "Ansi16 light arm: ChromeMuted keeps its dim fg to distinguish the dropdown from the bar");
 
         // tokyo-night @ Ansi16: canvas #1a1b26 → Black → DarkGray arm.
         // Part D (T3): ALL chrome faces are now sentinels → the dark-arm fixed-table policy
