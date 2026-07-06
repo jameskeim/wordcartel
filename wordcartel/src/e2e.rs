@@ -614,3 +614,117 @@ fn journey_transform_scopes() {
     assert!(!after_all.contains(item3),
         "item 3 must be reflowed by Reflow Buffer (original long line gone):\n{after_all:?}");
 }
+
+// ---------------------------------------------------------------------------
+// E3+E4 chrome journey
+// ---------------------------------------------------------------------------
+
+/// E3+E4 journey: toggle chrome to Zen via the Command Palette under tokyo-night,
+/// then persist the disposition via Save Settings.
+///
+/// Step 1: Install resolved tokyo-night (Rgb bases, Truecolor depth — the toggle's
+///   normal arm fires and sets an exact "chrome: zen" status).
+/// Step 2: Open the palette; assert palette rows render on screen (text-only harness;
+///   themed-interior cell styling owned by T5's `tokyo_overlay_interior_is_themed`
+///   render pin — delegated, noted here).
+/// Step 3: Dispatch `toggle_chrome` via the palette → status == "chrome: zen" exactly.
+/// Step 4: Assert the overrides file carries `[theme] chrome = "zen"` after calling
+///   `perform_settings_save` directly — the harness has no save-loop arm, so the
+///   D1+A5-era live-path shape is used: palette dispatch sets the flag; we clear
+///   the flag and call the helper directly with a temp-dir path.
+#[test]
+fn journey_chrome_zen_toggle() {
+    use wordcartel_core::theme::ChromeDisposition;
+
+    let mut h = Harness::new("hello world\n", None, (80, 24));
+
+    // Step 1: install resolved tokyo-night.
+    // derive_chrome before apply so chrome faces are fully resolved (grounding A.9/D3).
+    {
+        let mut theme = wordcartel_core::theme::tokyo_night();
+        theme.derive_chrome(ChromeDisposition::Full);
+        h.editor.apply_theme(theme);
+        h.editor.theme_identity =
+            crate::settings::ThemeIdentity::Builtin("tokyo-night".into());
+        h.render();
+    }
+    // Precondition: document text on screen (theme change must not blank the frame).
+    assert!(h.screen_contains("hello world"), "text must be visible after theme set:\n{:#?}", h.screen());
+
+    // Step 2: open the palette; assert it renders rows on screen (text-only proxy
+    // for the palette overlay; themed interior owned by T5's render pin).
+    h.ctrl('p');
+    assert!(h.editor.palette.is_some(), "ctrl-p must open the palette");
+    {
+        // row[0] of the unfiltered palette is the first registered command — assert
+        // it appears on screen as the text observable for the palette overlay.
+        let row0 = h.editor.palette.as_ref().unwrap().rows[0].label.clone();
+        assert!(h.screen_contains(&row0),
+            "palette row 0 label {row0:?} must render on screen:\n{:#?}", h.screen());
+    }
+
+    // Step 3: filter to "chrome" → top row must be "Chrome: Full/Zen"; Enter dispatches.
+    h.type_str("chrome");
+    {
+        let p = h.editor.palette.as_ref().unwrap();
+        assert!(!p.rows.is_empty(), "'chrome' must match at least one command");
+        assert_eq!(p.rows[0].label, "Chrome: Full/Zen",
+            "top row must be 'Chrome: Full/Zen': {:?}",
+            p.rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>());
+    }
+    h.key(KeyCode::Enter);
+    // tokyo-night: Rgb bases, Truecolor depth → normal toggle arm → exact status.
+    assert_eq!(h.status(), "chrome: zen",
+        "toggle under tokyo-night must set status to 'chrome: zen'");
+    assert_eq!(h.editor.chrome_disposition, ChromeDisposition::Zen,
+        "chrome_disposition must be Zen after toggle");
+
+    // Step 4: dispatch "Save Settings" via the palette (sets settings_save_requested),
+    // then drive perform_settings_save directly (harness has no save-loop arm).
+    h.ctrl('p');
+    assert!(h.editor.palette.is_some(), "ctrl-p must open the palette");
+    h.type_str("save settings");
+    {
+        let p = h.editor.palette.as_ref().unwrap();
+        assert!(!p.rows.is_empty(), "'save settings' must match at least one command");
+        assert_eq!(p.rows[0].label, "Save Settings",
+            "top palette row must be 'Save Settings': {:?}",
+            p.rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>());
+    }
+    h.key(KeyCode::Enter); // dispatches save_settings → sets settings_save_requested = true
+    assert!(h.editor.settings_save_requested,
+        "save_settings must set settings_save_requested");
+
+    // Build a baseline snapshot representing the no-chrome-config startup state.
+    // baseline.chrome_disposition = Full → diff against runtime Zen → writes "zen".
+    let baseline = crate::settings::SettingsSnapshot {
+        keymap_preset:      "cua".into(),
+        theme_identity:     crate::settings::ThemeIdentity::Builtin("terminal-plain".into()),
+        view_typewriter:    false,
+        view_focus:         false,
+        view_measure:       false,
+        view_wrap_guide:    false,
+        view_word_count:    false,
+        view_wrap_column:   72,
+        menu_bar:           crate::config::MenuBarMode::Auto,
+        mouse_capture:      true,
+        chrome_disposition: ChromeDisposition::Full,
+    };
+    // Mirror the run-loop pattern: clear the flag, then write the file.
+    h.editor.settings_save_requested = false;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("settings-overrides.toml");
+    let of = crate::settings::perform_settings_save(
+        &mut h.editor,
+        false,
+        Some(&path),
+        &baseline,
+        &crate::settings::OverridesFile::default(),
+        &crate::settings::OverridesFile::default(),
+        &crate::fsx::RealFs,
+    );
+    assert!(of.is_some(), "perform_settings_save must succeed");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("chrome = \"zen\""),
+        "overrides file must carry '[theme] chrome = \"zen\"';\ngot:\n{text}");
+}
