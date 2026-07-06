@@ -209,14 +209,36 @@ pub(crate) fn rebuild_keymap_if_requested(
     Some(trie)
 }
 
+/// Re-derive the active theme when `toggle_chrome` sets the request flag. Called from the
+/// run-loop between-reduces region, BEFORE the settings-save arm (a same-cycle toggle+save
+/// must persist the post-rederive state — plan-mandated order, grounding A.9). Runs the
+/// COMPLETE resolve pipeline (base → derive_chrome → Ansi16 policy → user styles → cue
+/// glyph) so user overrides are not smeared (Codex r1 Critical). Returns `true` when a
+/// rederive occurred; `false` when the flag was not set.
+pub(crate) fn rederive_theme_if_requested(
+    editor: &mut crate::editor::Editor,
+    theme_cfg: &crate::config::ThemeConfig,
+    env: &crate::theme_resolve::EnvSnapshot,
+) -> bool {
+    if !editor.theme_rederive { return false; }
+    editor.theme_rederive = false;
+    let resolved = crate::theme_resolve::resolve_theme(theme_cfg, env, editor.chrome_disposition);
+    editor.depth = resolved.depth; // re-seed depth (cheap; cold path)
+    editor.apply_theme(resolved.theme);
+    true
+}
+
 /// Apply the theme-picker's currently-selected built-in as a live preview and
 /// record the name in `tp.previewed` — the single funnel for identity threading.
 /// `pub(crate)` so mouse.rs can call it after a wheel-scroll selection change.
+/// Calls `derive_chrome` before `apply_theme` so the preview respects the active
+/// chrome disposition (grounding A.9 D3).
 pub(crate) fn preview_selected_theme(editor: &mut crate::editor::Editor) {
     // Read the name first (drops the borrow), then apply, then set the field.
     let name = editor.theme_picker.as_ref().and_then(|tp| tp.rows.get(tp.selected).cloned());
     if let Some(name) = name {
-        if let Some(theme) = wordcartel_core::theme::Theme::builtin(&name) {
+        if let Some(mut theme) = wordcartel_core::theme::Theme::builtin(&name) {
+            theme.derive_chrome(editor.chrome_disposition); // derive before apply (D3)
             editor.apply_theme(theme);
             // name still owned — `theme` did not borrow it; safe to re-borrow tp.
             if let Some(tp) = editor.theme_picker.as_mut() { tp.previewed = Some(name); }
@@ -1556,6 +1578,9 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         if let Some(t) = rebuild_keymap_if_requested(&mut editor, &cfg.keymap.patches, &reg) {
             keymap = t;
         }
+        // Rederive arm: BEFORE settings_save so a same-cycle toggle+save persists
+        // the post-rederive state (plan-mandated order — grounding A.9).
+        rederive_theme_if_requested(&mut editor, &cfg.theme, &env);
         if editor.settings_save_requested {
             editor.settings_save_requested = false;
             if let Some(of) = settings::perform_settings_save(
@@ -4997,5 +5022,59 @@ mod tests {
                     "worker must reflow at wrap_column=40"),
             other => panic!("expected TransformDone Ok, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 6 (E3+E4): rederive_theme_if_requested seam test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rederive_arm_reresolves() {
+        // Seam test calling the REAL helper: toggling chrome_disposition + setting the flag,
+        // then calling rederive_theme_if_requested, flips the bar face between the §B.3
+        // full and zen Chrome bg hexes for flexoki-dark.
+        use wordcartel_core::theme::{ChromeDisposition, Color, SemanticElement};
+        use crate::theme_resolve::EnvSnapshot;
+        use crate::app::rederive_theme_if_requested;
+
+        let tc = crate::config::ThemeConfig {
+            name: Some("flexoki-dark".into()),
+            ..Default::default()
+        };
+        // Simulate a truecolor terminal so derive_chrome produces Rgb values.
+        let env = EnvSnapshot {
+            no_color: false,
+            colorterm: Some("truecolor".into()),
+            term: Some("xterm-256color".into()),
+        };
+
+        let mut editor = Editor::new_from_text("x", None, (80, 24));
+
+        // Install flexoki-dark at Full via the real rederive path.
+        editor.chrome_disposition = ChromeDisposition::Full;
+        editor.theme_rederive = true;
+        let did = rederive_theme_if_requested(&mut editor, &tc, &env);
+        assert!(did, "flag was set — must return true");
+        assert!(!editor.theme_rederive, "flag must be cleared after rederive");
+        let full_bg = editor.theme.face(SemanticElement::Chrome).bg;
+        // §B.3 flexoki-dark FULL Chrome bg = #0d0c0c
+        assert_eq!(full_bg, Some(Color::Rgb { r: 0x0d, g: 0x0c, b: 0x0c }),
+            "flexoki-dark Full Chrome bg must match §B.3: got {full_bg:?}");
+
+        // Now switch to Zen and rederive.
+        editor.chrome_disposition = ChromeDisposition::Zen;
+        editor.theme_rederive = true;
+        let did2 = rederive_theme_if_requested(&mut editor, &tc, &env);
+        assert!(did2, "Zen rederive must return true");
+        assert!(!editor.theme_rederive, "flag must be cleared");
+        let zen_bg = editor.theme.face(SemanticElement::Chrome).bg;
+        // §B.3 flexoki-dark ZEN Chrome bg = #0f0e0e
+        assert_eq!(zen_bg, Some(Color::Rgb { r: 0x0f, g: 0x0e, b: 0x0e }),
+            "flexoki-dark Zen Chrome bg must match §B.3: got {zen_bg:?}");
+
+        // No-op when flag is not set.
+        editor.theme_rederive = false;
+        let did3 = rederive_theme_if_requested(&mut editor, &tc, &env);
+        assert!(!did3, "must return false when flag is not set");
     }
 }

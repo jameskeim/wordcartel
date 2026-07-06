@@ -6,6 +6,7 @@
 //! can distinguish "user switched from a file-theme to a builtin" from a coincidence.
 
 use serde::{Serialize, Deserialize};
+use wordcartel_core::theme::ChromeDisposition;
 
 // ---------------------------------------------------------------------------
 // ThemeIdentity — provenance tag for the active theme
@@ -40,6 +41,9 @@ pub struct SettingsSnapshot {
     pub view_wrap_column: u16,
     pub menu_bar: crate::config::MenuBarMode,
     pub mouse_capture: bool,
+    /// Chrome disposition: `Full` (calibrated steps) or `Zen` (collapsed). Seeded from
+    /// `cfg.theme.chrome` at startup; updated by `toggle_chrome` at runtime.
+    pub chrome_disposition: ChromeDisposition,
 }
 
 // ---------------------------------------------------------------------------
@@ -82,6 +86,9 @@ pub struct OKeymap {
 #[serde(default)]
 pub struct OTheme {
     #[serde(skip_serializing_if = "Option::is_none")] pub name: Option<String>,
+    /// Chrome disposition persisted as "full"/"zen". Persisted per-field — independent of
+    /// the name/file provenance logic (spec D3).
+    #[serde(skip_serializing_if = "Option::is_none")] pub chrome: Option<String>,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -128,6 +135,7 @@ pub fn theme_identity_of(
 /// theme name — `resolve_theme` takes an `EnvSnapshot` so MUST run before this call;
 /// do NOT resolve inside. Preset is resolved via `keymap::resolve_preset`.
 pub fn snapshot_of(cfg: &crate::config::Config, resolved_theme_name: &str) -> SettingsSnapshot {
+    let (chrome_disposition, _) = crate::theme_resolve::parse_chrome(&cfg.theme.chrome);
     SettingsSnapshot {
         keymap_preset: crate::keymap::resolve_preset(&cfg.keymap.preset).to_string(),
         theme_identity: theme_identity_of(&cfg.theme, resolved_theme_name),
@@ -139,6 +147,7 @@ pub fn snapshot_of(cfg: &crate::config::Config, resolved_theme_name: &str) -> Se
         view_wrap_column: cfg.view.wrap_column,
         menu_bar:        cfg.menu.bar,
         mouse_capture:   cfg.mouse.mouse_capture,
+        chrome_disposition,
     }
 }
 
@@ -155,6 +164,7 @@ pub fn runtime_snapshot(editor: &crate::editor::Editor) -> SettingsSnapshot {
         view_wrap_column: editor.view_opts.wrap_column,
         menu_bar:        editor.menu_bar_mode,
         mouse_capture:   editor.mouse_capture,
+        chrome_disposition: editor.chrome_disposition,
     }
 }
 
@@ -198,13 +208,22 @@ pub fn parse_mask(bytes: &str) -> OverridesFile {
     struct MaskTheme {
         name: Option<String>,
         file: Option<String>,
+        /// chrome passes through as its OWN per-key predicate — independent of the
+        /// name/file provenance sentinel (spec D3 / grounding A.6).
+        chrome: Option<String>,
     }
 
     let mask: MaskFile = toml::from_str(bytes).unwrap_or_default();
     // Collapse theme provenance: name OR file → presence sentinel (empty name string).
+    // chrome passes through independently beside that sentinel.
     let theme = mask.theme.and_then(|t| {
-        if t.name.is_some() || t.file.is_some() {
-            Some(OTheme { name: Some(String::new()) })
+        let name_file = t.name.is_some() || t.file.is_some();
+        let chrome = t.chrome;
+        if name_file || chrome.is_some() {
+            Some(OTheme {
+                name: if name_file { Some(String::new()) } else { None },
+                chrome,
+            })
         } else {
             None
         }
@@ -274,8 +293,23 @@ pub fn compute_overrides(
             Some(_) | None => None,
         },
     };
-    let has_theme = theme_name.is_some();
-    let theme = some_if(OTheme { name: theme_name }, has_theme);
+    // chrome: plain string diff, own per-key mask predicate — independent of the
+    // name/file provenance sentinel. Converts disposition enum → "full"/"zen" strings.
+    let rt_chrome = match runtime.chrome_disposition {
+        ChromeDisposition::Full => "full".to_string(),
+        ChromeDisposition::Zen  => "zen".to_string(),
+    };
+    let base_chrome = match baseline.chrome_disposition {
+        ChromeDisposition::Full => "full".to_string(),
+        ChromeDisposition::Zen  => "zen".to_string(),
+    };
+    let chrome = diff_key(
+        &rt_chrome, &base_chrome,
+        existing.theme.as_ref().and_then(|t| t.chrome.as_ref()),
+        mask.theme.as_ref().and_then(|t| t.chrome.as_ref()).is_some(),
+    );
+    let has_theme = theme_name.is_some() || chrome.is_some();
+    let theme = some_if(OTheme { name: theme_name, chrome }, has_theme);
 
     // --- view — per-key mask predicates ---
     let ex_view = existing.view.as_ref();
@@ -444,7 +478,8 @@ mod tests {
         SettingsSnapshot { keymap_preset: preset.into(), theme_identity: theme,
             view_typewriter: tw, view_focus: false, view_measure: false,
             view_wrap_guide: false, view_word_count: false, view_wrap_column: 72,
-            menu_bar: crate::config::MenuBarMode::Auto, mouse_capture: true }
+            menu_bar: crate::config::MenuBarMode::Auto, mouse_capture: true,
+            chrome_disposition: ChromeDisposition::Full }
     }
 
     #[test]
@@ -752,6 +787,28 @@ mod tests {
         let mask = parse_mask("[view]\nwrap_column=90\n");
         let of3 = compute_overrides(&rt2, &base, &existing, &mask);
         assert_eq!(of3.view.as_ref().unwrap().wrap_column, Some(60), "mask-guard keeps");
+    }
+
+    #[test]
+    fn chrome_persists_through_the_diff_law() {
+        // Rule 1: runtime Zen vs baseline Full → diff writes "zen".
+        let mut rt = snap("cua", ThemeIdentity::Builtin("default".into()), false);
+        rt.chrome_disposition = ChromeDisposition::Zen;
+        let base = snap("cua", ThemeIdentity::Builtin("default".into()), false);
+        let of = compute_overrides(&rt, &base, &OverridesFile::default(), &OverridesFile::default());
+        assert_eq!(of.theme.as_ref().and_then(|t| t.chrome.as_deref()), Some("zen"),
+            "rule 1 writes chrome=zen on divergence");
+        // Rule 3: runtime back to Full, existing has "zen" → removes (contradiction, unmasked).
+        let rt2 = snap("cua", ThemeIdentity::Builtin("default".into()), false); // Full
+        let existing = parse_overrides("[theme]\nchrome='zen'\n");
+        let of2 = compute_overrides(&rt2, &base, &existing, &OverridesFile::default());
+        assert!(of2.theme.as_ref().and_then(|t| t.chrome.as_ref()).is_none(),
+            "rule 3 removes the contradicted chrome key");
+        // Mask-guard: --config [theme] chrome=... guards the chrome key independently.
+        let mask = parse_mask("[theme]\nchrome='zen'\n");
+        let of3 = compute_overrides(&rt2, &base, &existing, &mask);
+        assert_eq!(of3.theme.as_ref().and_then(|t| t.chrome.as_deref()), Some("zen"),
+            "mask-guard keeps verbatim when chrome key present in mask");
     }
 
     #[test]
