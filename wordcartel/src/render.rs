@@ -104,6 +104,28 @@ fn prefix_element(role: wordcartel_core::style::BlockRole) -> SE {
     }
 }
 
+/// Apply a base_fg fallback to editing-area text spans.
+///
+/// If `style.fg` is already `Some` — set by a heading role, link, code, or any
+/// inline colour — the style is returned unchanged. If it is `None` and the
+/// theme's canvas fg maps to a real colour at this depth (i.e. not `Reset`;
+/// terminal-default themes map `base_fg → Reset` and are left untouched),
+/// the fallback is applied so plain body text renders the theme foreground over
+/// the opaque canvas rather than the terminal default.
+fn text_fg_or_base(
+    style: RStyle,
+    theme: &wordcartel_core::theme::Theme,
+    depth: wordcartel_core::theme::Depth,
+) -> RStyle {
+    if style.fg.is_some() {
+        return style;
+    }
+    match compose::base_canvas(theme, depth).fg {
+        Some(Color::Reset) | None => style,
+        Some(c)                   => style.fg(c),
+    }
+}
+
 // Shared geometry — render AND mouse both call these.
 
 /// Compute bar label rects from a raw category slice (static MENU_ORDER or dynamic group list).
@@ -541,6 +563,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                     } else {
                         compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(seg.style)])
                     };
+                    let style = text_fg_or_base(style, &editor.theme, editor.depth);
                     segs_spans.push(Span::styled(seg.text.clone(), style));
                 }
                 segs_spans
@@ -659,6 +682,10 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                             style = style.underline_color(uc);
                         }
                     }
+
+                    // Apply base_fg fallback BEFORE the run-accumulation comparison
+                    // so runs of plain body text share one span rather than splitting.
+                    let style = text_fg_or_base(style, &editor.theme, editor.depth);
 
                     // Flush the accumulated run when the style changes.
                     if run_style != Some(style) && !run.is_empty() {
@@ -1346,24 +1373,16 @@ mod tests {
     }
 
     #[test]
-    fn tokyo_night_heading_row_carries_heading_bold() {
-        // After the text-face base_fg fix, heading text carries base_fg (not heading-role MAGENTA)
-        // — the plain inline style element (SE::Text) comes last in the compose stack and overrides
-        // the role fg with base_fg. Headings remain visually distinct through BOLD (and the dimmed
-        // prefix glyph, which still uses the heading-role fg via prefix_element). This test was
-        // previously named `tokyo_night_heading_row_carries_heading_fg` and was asserting the old
-        // behavior where heading fg fell through because SE::Text had fg=None — that was the bug.
+    fn tokyo_night_heading_row_carries_heading_fg() {
+        // Heading rows in Tokyo Night LivePreview must carry the heading-role fg (MAGENTA for H1).
+        // The render-time base_fg fallback (text_fg_or_base) is skipped when the composed style
+        // already has a fg — which it does for headings via the Heading role in the compose stack.
         let mut ed = Editor::new_from_text("# Title\n", None, (40, 4));
         ed.theme = wordcartel_core::theme::tokyo_night();
         derive::rebuild(&mut ed);
         let buf = render_to_buffer(&mut ed, 40, 4);
-        // Heading text must carry base_fg (SE::Text last in stack) and BOLD (from heading face).
-        let base_fg = compose::base_canvas(&ed.theme, ed.depth).fg;
-        assert!(base_fg.is_some(), "tokyo-night base_fg must be Some(Rgb)");
-        assert!((0..40).any(|x| buf[(x,0)].style().fg == base_fg),
-                "heading text must carry base_fg after fix");
-        assert!((0..40).any(|x| buf[(x,0)].style().add_modifier.contains(Modifier::BOLD)),
-                "heading text must carry BOLD");
+        let want = crate::compose::compose(&ed.theme, ed.depth, &[wordcartel_core::theme::SemanticElement::Text, wordcartel_core::theme::SemanticElement::Heading(1)]).fg;
+        assert!((0..40).any(|x| buf[(x,0)].style().fg == want && want.is_some()), "heading fg applied");
     }
 
     #[test]
@@ -1493,34 +1512,31 @@ mod tests {
     }
 
     #[test]
-    fn source_mode_no_heading_bold_live_preview_has_heading_bold() {
-        // After the text-face base_fg fix, heading text under Tokyo Night carries base_fg in
-        // BOTH modes (SE::Text last in the LivePreview compose stack overrides the role fg).
-        // The remaining distinction between modes is BOLD: LivePreview applies the heading face
-        // (bold=Some(true)); SourcePlain uses only [SE::Text] (no bold). This test was previously
-        // named `source_mode_no_heading_fg_live_preview_has_heading_fg` and asserted a heading-fg
-        // distinction that no longer holds — updated to assert the BOLD distinction instead.
+    fn source_mode_no_heading_fg_live_preview_has_heading_fg() {
+        // In SourcePlain under Tokyo Night, a heading row must NOT carry the heading fg.
+        // In LivePreview it must — the render-time base_fg fallback is skipped when the composed
+        // style already has a fg (heading role sets it), so the heading colour is preserved.
         use crate::editor::RenderMode;
         let mut ed = Editor::new_from_text("# Heading\n", None, (40, 4));
         ed.theme = wordcartel_core::theme::tokyo_night();
 
-        // LivePreview: heading text carries BOLD (heading face applied) and base_fg.
+        // LivePreview first: heading fg should appear.
         ed.active_mut().view.mode = RenderMode::LivePreview;
         crate::derive::rebuild(&mut ed);
         let buf_preview = render_to_buffer(&mut ed, 40, 4);
-        let base_fg = compose::base_canvas(&ed.theme, ed.depth).fg;
-        assert!(base_fg.is_some(), "tokyo-night base_fg must be Some(Rgb)");
-        let preview_has_bold = (0..40u16).any(|x| buf_preview[(x,0)].style().add_modifier.contains(Modifier::BOLD));
-        let preview_has_base_fg = (0..40u16).any(|x| buf_preview[(x,0)].style().fg == base_fg);
-        assert!(preview_has_bold, "LivePreview heading must carry BOLD");
-        assert!(preview_has_base_fg, "LivePreview heading must carry base_fg (SE::Text last in stack)");
+        let want = crate::compose::compose(&ed.theme, ed.depth, &[
+            wordcartel_core::theme::SemanticElement::Text,
+            wordcartel_core::theme::SemanticElement::Heading(1),
+        ]).fg;
+        let preview_has_heading_fg = (0..40).any(|x| buf_preview[(x,0)].style().fg == want && want.is_some());
+        assert!(preview_has_heading_fg, "LivePreview heading must carry heading fg");
 
-        // SourcePlain: base canvas only — no BOLD, no heading role applied.
+        // SourcePlain: base canvas only, no heading fg.
         ed.active_mut().view.mode = RenderMode::SourcePlain;
         crate::derive::rebuild(&mut ed);
         let buf_source = render_to_buffer(&mut ed, 40, 4);
-        let source_has_bold = (0..40u16).any(|x| buf_source[(x,0)].style().add_modifier.contains(Modifier::BOLD));
-        assert!(!source_has_bold, "SourcePlain must not carry heading BOLD (base canvas only)");
+        let source_has_heading_fg = (0..40).any(|x| buf_source[(x,0)].style().fg == want && want.is_some());
+        assert!(!source_has_heading_fg, "SourcePlain must not carry heading fg (base canvas only)");
     }
 
     #[test]
