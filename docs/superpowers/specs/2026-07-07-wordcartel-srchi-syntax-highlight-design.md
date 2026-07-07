@@ -1,6 +1,6 @@
 # SRC-HI Syntax Highlighting — Design
 
-**Status:** design, pending Codex spec review.
+**Status:** design; Codex spec gate GO (no Critical; 2 plan-directives folded — placed-path required, LayoutKey required) — ready for planning.
 **Effort:** `effort-srchi-highlight` (branch off `main`).
 **Fixes backlog item:** B4 (`docs/ux-backlog.md`) — `SourceHighlighted` (SRC-HI) renders identically to `SourcePlain`.
 
@@ -84,10 +84,15 @@ Notes:
   new *logic*; it lives entirely in core `analyze` and only in the `RawStyled` branch, so it cannot
   perturb `Concealed`/`RawPlain`.
 
-Render side: extend the seg-styling branch (`render.rs:676-692`, and the placed path if it has the
-same `source_mode` gate) so `RawStyled` composes `[SE::Text, role_element(vr.role),
-style_element(seg.style)]` (like LivePreview) rather than `[SE::Text]`, while `RawPlain` keeps
-`[SE::Text]`.
+Render side — **BOTH paint paths (Codex spec gate: confirmed required, not optional).** The
+`source_mode` color gate appears in TWO render paths that must both get the 3-way treatment:
+- the **segs path** (`render.rs:676-692`, styling `seg.style`), and
+- the **placed path** (`render.rs:746-763`, styling `p.style` — used when a search / diagnostic /
+  selection / visible marked-block is active).
+For `RawStyled` both compose `[SE::Text, role_element(vr.role), style_element(<style>)]` (like
+LivePreview); for `RawPlain` both keep `[SE::Text]`. Each also has a `row_dim` (FocusDim) sub-branch
+that, for `RawStyled`, must compose `SE::FocusDim` OVER the semantic stack (mirroring LivePreview's
+`[SE::Text, role_element, style_element, SE::FocusDim]`), not `[SE::Text, SE::FocusDim]`.
 
 ---
 
@@ -161,8 +166,14 @@ style_element(seg.style)]` (like LivePreview) rather than `[SE::Text]`, while `R
    `derive.rs` maps `RenderMode`+active-ness → descriptor.
 2. The exact `analyze` mechanism for styling inline delimiter ranges in `RawStyled` (push style
    spans over the marker ranges using the current nesting style), without touching the `Concealed`
-   path.
+   path. **First verify the pulldown-cmark offset ranges for `Start`/`End` inline-tag events
+   (marker range vs whole-span) before deciding how to cover opening/closing delimiter spans**
+   (Codex spec gate — today `Start(...)` conceals the marker range and only `Event::Text`/code
+   inner ranges are styled, `md_parse.rs:43-89`, so raw-delimiter styling is genuinely new logic).
 3. Whether the nav path passes `RawPlain` or a dedicated "geometry-only" value (it ignores color).
-4. The `LayoutKey` field (store `RenderMode`, or the descriptor set) that makes SH/SP distinct.
-5. The render seg-styling branch shape (3-way) + whether the *placed* path shares the same
-   `source_mode` gate and needs the same treatment.
+4. The `LayoutKey` field (store `RenderMode`, or the descriptor set) that makes SH/SP distinct —
+   a REQUIRED task (Codex spec gate confirmed SH/SP share cache identity today and can reuse stale
+   `VisualRow.segs`/`ColMap` after a mode switch without it).
+
+(The placed-vs-segs render-path question — former open-question #5 — is resolved in "The two color
+loci" above: BOTH paths are required.)
