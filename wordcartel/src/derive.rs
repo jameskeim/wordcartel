@@ -39,6 +39,33 @@ thread_local! {
     pub static LAYOUT_RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// R1 typing-latency bench instrumentation (test-only). Fine-grained phase spans
+/// recorded at the hot lines in `rebuild`/`rebuild_downstream` (`parse`,
+/// `heading_starts`, `foldview`, `layout_fill`), drained per keystroke by the
+/// `e2e_bench` harness. STRICTLY `#[cfg(test)]` — the recording calls and their
+/// `Instant::now()` timers are cfg'd out entirely, so production/release builds
+/// carry ZERO cost from this module.
+#[cfg(test)]
+pub(crate) mod bench_spans {
+    use std::cell::RefCell;
+    use std::time::Duration;
+
+    thread_local! {
+        pub static PHASE_SPANS: RefCell<Vec<(&'static str, Duration)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    /// Append one phase span for the current keystroke/tick.
+    pub(crate) fn record(label: &'static str, dur: Duration) {
+        PHASE_SPANS.with(|s| s.borrow_mut().push((label, dur)));
+    }
+
+    /// Take and clear all spans recorded since the last drain.
+    pub(crate) fn drain() -> Vec<(&'static str, Duration)> {
+        PHASE_SPANS.with(|s| s.borrow_mut().drain(..).collect())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Logical-line helpers
 // ---------------------------------------------------------------------------
@@ -129,6 +156,8 @@ pub fn rebuild(editor: &mut Editor) {
 
     // Parse phase: only when the text actually changed since the tree was built.
     if version != blocks_version {
+        #[cfg(test)]
+        let bench_parse_t0 = std::time::Instant::now();
         let new_rope = editor.active().document.buffer.snapshot(); // O(1) ropey clone
         let new_len = new_rope.len_bytes();
         let maybe_old_rope = editor.active_mut().pre_edit_rope.take();
@@ -175,6 +204,8 @@ pub fn rebuild(editor: &mut Editor) {
         editor.active_mut().document.set_blocks(new_blocks);
         editor.active_mut().reconcile.blocks_version = version;
         editor.active_mut().reconcile.maybe_stale = stale;
+        #[cfg(test)]
+        crate::derive::bench_spans::record("parse", bench_parse_t0.elapsed());
     }
 
     rebuild_downstream(editor);
@@ -205,15 +236,23 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
     {
         let gen = editor.active().document.blocks_generation();
         if editor.active().last_reconciled_generation != Some(gen) {
+            #[cfg(test)]
+            let bench_hs_t0 = std::time::Instant::now();
             let starts = {
                 let b = editor.active();
                 wordcartel_core::outline::heading_starts(b.document.blocks(), &b.document.buffer.snapshot())
             };
+            #[cfg(test)]
+            crate::derive::bench_spans::record("heading_starts", bench_hs_t0.elapsed());
             editor.active_mut().folds.reconcile_to(&starts);
             editor.active_mut().last_reconciled_generation = Some(gen);
         }
     }
+    #[cfg(test)]
+    let bench_fv_t0 = std::time::Instant::now();
     let fold_view = editor.active_fold_view();
+    #[cfg(test)]
+    crate::derive::bench_spans::record("foldview", bench_fv_t0.elapsed());
 
     // ------------------------------------------------------------------
     // 2. Visible range
@@ -261,6 +300,8 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
         return; // line_layouts already valid for this key — skip the pass
     }
 
+    #[cfg(test)]
+    let bench_lf_t0 = std::time::Instant::now();
     let mut visual_rows_accumulated: usize = 0;
     let overscan_budget = area_height.saturating_add(scroll_row).saturating_add(1);
 
@@ -286,6 +327,8 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
         l = fold_view.next_visible(l).unwrap_or(total_lines);
     }
     editor.active_mut().layout_key = Some(key);
+    #[cfg(test)]
+    crate::derive::bench_spans::record("layout_fill", bench_lf_t0.elapsed());
 }
 
 // ---------------------------------------------------------------------------

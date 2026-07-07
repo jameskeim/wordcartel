@@ -7,17 +7,52 @@ use wordcartel_core::block_tree::{BlockTree, full_parse_rope};
 
 use crate::app::{self, Msg, reduce};
 use crate::editor::Editor;
-use crate::jobs::InlineExecutor;
+use crate::jobs::{Executor, InlineExecutor, Job, JobOutcome, ThreadExecutor};
 use crate::keymap::{self, KeyTrie};
 use crate::registry::Registry;
 use crate::render;
 use crate::test_support::{TestClock, key_char, press};
 
+/// The e2e Harness runs the deterministic `InlineExecutor` by default (all seed
+/// journeys). The R1 bench also needs the REAL threaded executor to measure the
+/// off-thread reconcile merge, so the executor is an enum that dispatches to
+/// either backend. `&self.ex` still coerces to `&dyn Executor` for `reduce`.
+enum BenchExecutor {
+    Inline(InlineExecutor),
+    Thread(ThreadExecutor),
+}
+
+impl Executor for BenchExecutor {
+    fn dispatch(&self, job: Job) {
+        match self {
+            BenchExecutor::Inline(e) => e.dispatch(job),
+            BenchExecutor::Thread(e) => e.dispatch(job),
+        }
+    }
+    fn drain(&self) -> Vec<JobOutcome> {
+        match self {
+            BenchExecutor::Inline(e) => e.drain(),
+            BenchExecutor::Thread(e) => e.drain(),
+        }
+    }
+}
+
+/// Coarse per-stage timings for one `step_timed` call, plus the fine-grained
+/// derive spans drained after `advance`. The bench sums `spans` by label to get
+/// per-keystroke `parse`/`heading_starts`/`foldview`/`layout_fill`; `total` is
+/// `t_reduce + t_advance + t_render`.
+struct PhaseTimes {
+    t_reduce: std::time::Duration,
+    t_advance: std::time::Duration,
+    t_render: std::time::Duration,
+    spans: Vec<(&'static str, std::time::Duration)>,
+}
+
 struct Harness {
     editor: Editor,
     reg: Registry,
     keymap: KeyTrie,
-    ex: InlineExecutor,
+    ex: BenchExecutor,
     term: Terminal<TestBackend>,
     tx: Sender<Msg>,
     _rx: Receiver<Msg>,
@@ -34,7 +69,22 @@ impl Harness {
         editor.diag_cfg.enabled = false; // hermeticity: no real diagnostics thread (spec I3)
         let reg = Registry::builtins();
         let (keymap, _warn) = keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
-        let ex = InlineExecutor::default();
+        let ex = BenchExecutor::Inline(InlineExecutor::default());
+        let term = Terminal::new(TestBackend::new(size.0, size.1)).expect("test terminal");
+        let (tx, _rx) = mpsc::channel();
+        let mut h = Harness { editor, reg, keymap, ex, term, tx, _rx, now: 0 };
+        crate::derive::rebuild(&mut h.editor);
+        h.render();
+        h
+    }
+
+    /// Construct a harness backed by the given executor (R1 bench: threaded runs
+    /// exercise the real off-thread reconcile merge). Mirrors `new` otherwise.
+    fn new_with(text: &str, path: Option<PathBuf>, size: (u16, u16), ex: BenchExecutor) -> Self {
+        let mut editor = Editor::new_from_text(text, path, size);
+        editor.diag_cfg.enabled = false;
+        let reg = Registry::builtins();
+        let (keymap, _warn) = keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
         let term = Terminal::new(TestBackend::new(size.0, size.1)).expect("test terminal");
         let (tx, _rx) = mpsc::channel();
         let mut h = Harness { editor, reg, keymap, ex, term, tx, _rx, now: 0 };
@@ -58,6 +108,36 @@ impl Harness {
         app::advance(&mut self.editor, &clock);
         self.render();
         keep
+    }
+
+    /// Timed mirror of `step` for the R1 bench: identical production sequence
+    /// (reduce → note_undo_eviction → advance → render) but each coarse stage is
+    /// wrapped in `Instant::now()/elapsed()`, and the fine-grained derive spans
+    /// (`parse`/`heading_starts`/`foldview`/`layout_fill`) recorded inside
+    /// `derive::rebuild` are drained after `advance`. Spans accumulate across BOTH
+    /// the post-command rebuild (in `reduce`) and the pre-draw rebuild (in
+    /// `advance`); the caller sums them per label to get the true per-keystroke
+    /// derive cost (the second rebuild is memoized, so only cache-hit residue).
+    fn step_timed(&mut self, msg: Msg) -> PhaseTimes {
+        let (pre_id, pre_version) = { let b = self.editor.active(); (b.id, b.document.version) };
+        let clock = TestClock(self.now);
+        // Clear any residue so this step's spans are attributable to this step.
+        let _ = crate::derive::bench_spans::drain();
+        let t0 = std::time::Instant::now();
+        let _keep = reduce(msg, &mut self.editor, &self.reg, &self.keymap, &self.ex, &clock, &self.tx);
+        let t_reduce = t0.elapsed();
+        if let Some(t) = app::rebuild_keymap_if_requested(&mut self.editor, &[], &self.reg) {
+            self.keymap = t;
+        }
+        self.editor.note_undo_eviction(pre_id, pre_version);
+        let t1 = std::time::Instant::now();
+        app::advance(&mut self.editor, &clock);
+        let t_advance = t1.elapsed();
+        let spans = crate::derive::bench_spans::drain();
+        let t2 = std::time::Instant::now();
+        self.render();
+        let t_render = t2.elapsed();
+        PhaseTimes { t_reduce, t_advance, t_render, spans }
     }
 
     fn render(&mut self) {
@@ -732,4 +812,556 @@ fn journey_chrome_zen_toggle() {
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.contains("chrome = \"zen\""),
         "overrides file must carry '[theme] chrome = \"zen\"';\ngot:\n{text}");
+}
+
+// ===========================================================================
+// R1 typing-latency bench (exploratory measurement — NOT a correctness gate).
+//
+// Drives the REAL reduce → advance(derive::rebuild) → render loop through the
+// e2e Harness's timed `step_timed`, across a scenario matrix (N × structure ×
+// edit-class × executor), with a realistic-cadence burst driver that lets the
+// 150ms reconcile debounce fire BETWEEN keystrokes. Decomposes per-keystroke
+// tail latency by phase (reduce | parse | heading_starts | foldview |
+// layout_fill | render | total) and fits log-log slopes vs N to localize the
+// O(document) typing cost.
+//
+// Run: cargo test --release e2e_bench -- --nocapture --test-threads=1
+// (Debug Instant timing is meaningless — release is mandatory.)
+// ===========================================================================
+#[cfg(test)]
+mod e2e_bench {
+    use super::{BenchExecutor, Harness, PhaseTimes};
+    use crate::app::Msg;
+    use crate::jobs::ThreadExecutor;
+    use crate::test_support::{key_char, press};
+    use crossterm::event::{Event, KeyCode, KeyModifiers};
+    use std::collections::BTreeMap;
+
+    // -- configuration -------------------------------------------------------
+    const N_VALUES: &[usize] = &[1_000, 4_000, 16_000, 64_000, 256_000, 1_000_000];
+    const VIEWPORT: (u16, u16) = (100, 40);
+    const CADENCE_GAP_MS: u64 = 180; // ~5-6 cps inter-key gap
+    const FRAME_MS: u64 = 16; // ~60Hz tick granularity between keystrokes
+    const PHASES: &[&str] =
+        &["reduce", "parse", "heading_starts", "foldview", "layout_fill", "render", "total"];
+
+    /// Reps per N — capped at high N so wall time stays bounded (logged in caps).
+    fn reps_for(n: usize) -> usize {
+        match n {
+            x if x <= 16_000 => 5,
+            x if x <= 64_000 => 4,
+            x if x <= 256_000 => 3,
+            _ => 2,
+        }
+    }
+    /// Spread-edit repeats shrink at high N (each rebuild is O(doc)).
+    fn spread_reps_for(n: usize) -> usize { if n >= 256_000 { 10 } else { 20 } }
+    /// Sustained-burst char count (slightly shorter at 1M).
+    fn sustained_chars_for(n: usize) -> usize { if n >= 1_000_000 { 30 } else { 40 } }
+
+    // -- fixture generators (tile a structure template to ~target bytes) ------
+    fn gen_flat_prose(target: usize) -> String {
+        const W: &[&str] = &[
+            "the", "quick", "brown", "fox", "jumps", "over", "a", "lazy", "dog", "while",
+            "clouds", "drift", "slowly", "across", "the", "calm", "autumn", "sky", "above",
+            "distant", "hills", "where", "rivers", "wind", "through", "quiet", "green", "valleys",
+        ];
+        let mut s = String::with_capacity(target + 256);
+        let mut wi = 0usize;
+        while s.len() < target {
+            for _ in 0..5 {
+                let mut col = 0usize;
+                loop {
+                    let w = W[wi % W.len()];
+                    if col > 0 && col + 1 + w.len() > 80 { break; }
+                    if col > 0 { s.push(' '); col += 1; }
+                    s.push_str(w);
+                    col += w.len();
+                    wi += 1;
+                }
+                s.push('\n');
+            }
+            s.push('\n');
+        }
+        s
+    }
+    fn gen_nested_list(target: usize) -> String {
+        let mut s = String::with_capacity(target + 256);
+        let mut i = 0usize;
+        while s.len() < target {
+            s.push_str(&format!("- item {i} at top level with some descriptive text here\n\n"));
+            s.push_str(&format!("  - nested child {i} carrying a bit more text to fill the line\n\n"));
+            s.push_str(&format!("    - deep grandchild {i} with yet more words for real width\n\n"));
+            i += 1;
+        }
+        s
+    }
+    fn gen_heading_dense(target: usize) -> String {
+        let mut s = String::with_capacity(target + 256);
+        let mut i = 0usize;
+        while s.len() < target {
+            s.push_str(&format!("## Section {i}\n\n"));
+            for l in 0..4 {
+                s.push_str(&format!("Body line {i}.{l} with a reasonable amount of prose to pad it.\n"));
+            }
+            s.push('\n');
+            i += 1;
+        }
+        s
+    }
+    fn gen_code_heavy(target: usize) -> String {
+        let mut s = String::with_capacity(target + 256);
+        let mut i = 0usize;
+        while s.len() < target {
+            s.push_str(&format!("Paragraph {i} introducing the code block below.\n\n"));
+            s.push_str("```rust\n");
+            for l in 0..6 {
+                s.push_str(&format!("    let value_{i}_{l} = compute(item, {l}); // note\n"));
+            }
+            s.push_str("```\n\n");
+            i += 1;
+        }
+        s
+    }
+    fn gen_giant_table(target: usize) -> String {
+        let mut s = String::with_capacity(target + 256);
+        s.push_str("| id | name | description | value |\n");
+        s.push_str("|----|------|-------------|-------|\n");
+        let mut i = 0usize;
+        while s.len() < target {
+            s.push_str(&format!("| {i} | row {i} | a description cell for row {i} here | {} |\n", i * 7));
+            i += 1;
+        }
+        s
+    }
+    type FixtureGen = fn(usize) -> String;
+    fn structures() -> Vec<(&'static str, FixtureGen)> {
+        vec![
+            ("flat-prose", gen_flat_prose as FixtureGen),
+            ("nested-loose-list", gen_nested_list),
+            ("heading-dense", gen_heading_dense),
+            ("code-heavy", gen_code_heavy),
+            ("giant-table", gen_giant_table),
+        ]
+    }
+    fn heading_count(text: &str) -> usize {
+        text.lines().filter(|l| l.trim_start().starts_with('#')).count()
+    }
+
+    // -- sample store --------------------------------------------------------
+    #[derive(Default)]
+    struct Samples {
+        // (n_bytes, n_headings, structure, edit_class, phase) -> micros samples
+        map: BTreeMap<(usize, usize, &'static str, &'static str, &'static str), Vec<u128>>,
+    }
+    impl Samples {
+        fn push(&mut self, n: usize, hd: usize, st: &'static str, ec: &'static str, ph: &'static str, us: u128) {
+            self.map.entry((n, hd, st, ec, ph)).or_default().push(us);
+        }
+        /// Record one timed step: coarse reduce/render + summed derive spans + total.
+        fn record(&mut self, n: usize, hd: usize, st: &'static str, ec: &'static str, pt: &PhaseTimes) {
+            let mut by: BTreeMap<&'static str, u128> = BTreeMap::new();
+            for (lbl, d) in &pt.spans { *by.entry(lbl).or_insert(0) += d.as_micros(); }
+            self.push(n, hd, st, ec, "reduce", pt.t_reduce.as_micros());
+            for lbl in ["parse", "heading_starts", "foldview", "layout_fill"] {
+                self.push(n, hd, st, ec, lbl, *by.get(lbl).unwrap_or(&0));
+            }
+            self.push(n, hd, st, ec, "render", pt.t_render.as_micros());
+            let total = pt.t_reduce.as_micros() + pt.t_advance.as_micros() + pt.t_render.as_micros();
+            self.push(n, hd, st, ec, "total", total);
+        }
+        fn p99(&self, n: usize, st: &str, ec: &str, ph: &str) -> Option<u128> {
+            self.stat(n, st, ec, ph).map(|(_, _, p99, _)| p99)
+        }
+        /// (p50, p95, p99, max) for the first cell matching (n, st, ec, ph).
+        fn stat(&self, n: usize, st: &str, ec: &str, ph: &str) -> Option<(u128, u128, u128, u128)> {
+            for ((kn, _hd, kst, kec, kph), v) in &self.map {
+                if *kn == n && *kst == st && *kec == ec && *kph == ph {
+                    let mut s = v.clone();
+                    s.sort_unstable();
+                    return Some((pct(&s, 50.0), pct(&s, 95.0), pct(&s, 99.0), *s.last().unwrap_or(&0)));
+                }
+            }
+            None
+        }
+        fn to_csv(&self) -> String {
+            let mut out = String::new();
+            out.push_str("n_bytes,n_headings,structure,edit_class,phase,samples,p50_us,p95_us,p99_us,max_us,overshoot_120,overshoot_60\n");
+            for ((n, hd, st, ec, ph), v) in &self.map {
+                let mut s = v.clone();
+                s.sort_unstable();
+                let (p50, p95, p99, mx) = (pct(&s, 50.0), pct(&s, 95.0), pct(&s, 99.0), *s.last().unwrap_or(&0));
+                let (o120, o60) = if *ph == "total" {
+                    (if p99 > 8000 { "1" } else { "0" }, if p99 > 16000 { "1" } else { "0" })
+                } else {
+                    ("", "")
+                };
+                out.push_str(&format!(
+                    "{n},{hd},{st},{ec},{ph},{},{p50},{p95},{p99},{mx},{o120},{o60}\n",
+                    s.len()
+                ));
+            }
+            out
+        }
+    }
+
+    fn pct(sorted: &[u128], p: f64) -> u128 {
+        if sorted.is_empty() { return 0; }
+        let idx = ((p / 100.0) * (sorted.len() as f64 - 1.0)).round() as usize;
+        sorted[idx.min(sorted.len() - 1)]
+    }
+
+    /// Least-squares slope of ln(y) on ln(x) over points with y > 0.
+    fn loglog_slope(points: &[(f64, f64)]) -> f64 {
+        let pts: Vec<(f64, f64)> =
+            points.iter().filter(|(_, y)| *y > 0.0).map(|(x, y)| (x.ln(), y.ln())).collect();
+        if pts.len() < 2 { return 0.0; }
+        let n = pts.len() as f64;
+        let sx: f64 = pts.iter().map(|p| p.0).sum();
+        let sy: f64 = pts.iter().map(|p| p.1).sum();
+        let sxx: f64 = pts.iter().map(|p| p.0 * p.0).sum();
+        let sxy: f64 = pts.iter().map(|p| p.0 * p.1).sum();
+        let denom = n * sxx - sx * sx;
+        if denom.abs() < 1e-9 { return 0.0; }
+        (n * sxy - sx * sy) / denom
+    }
+    fn slope_label(sl: f64) -> &'static str {
+        if sl < 0.3 { "flat" } else if sl >= 0.7 { "linear" } else { "sub-linear" }
+    }
+
+    // -- burst drivers -------------------------------------------------------
+    fn char_boundary(text: &str, mut b: usize) -> usize {
+        while b < text.len() && !text.is_char_boundary(b) { b += 1; }
+        b.min(text.len())
+    }
+    fn midpoint(text: &str) -> usize {
+        let mut m = char_boundary(text, text.len() / 2);
+        while m < text.len() && text.as_bytes()[m] == b'\n' {
+            m = char_boundary(text, m + 1);
+        }
+        m
+    }
+    /// Move the caret to `byte` (clamped) and scroll it into view — an unmeasured
+    /// seek (mirrors the direct-selection pattern in the seed journeys).
+    fn seek(h: &mut Harness, byte: usize) {
+        let len = h.editor.active().document.buffer.len();
+        let b = byte.min(len);
+        h.editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(b);
+        crate::nav::ensure_visible(&mut h.editor);
+        h.render();
+    }
+    /// One matrix cell's fixed context, threaded through the burst drivers so
+    /// each driver stays within the argument budget.
+    struct Cell<'a> {
+        n: usize,
+        hd: usize,
+        st: &'static str,
+        ec: &'static str,      // edit_class tag for Input frames
+        ec_tick: &'static str, // edit_class tag for the reconcile-tick frames
+        text: &'a str,
+    }
+
+    /// Advance the clock to the next keystroke in 16ms frames, ticking each frame
+    /// so the 150ms reconcile debounce fires BETWEEN keystrokes as in production.
+    /// Tick-frame phase times are recorded under the reconcile-tick edit_class.
+    fn cadence_gap(h: &mut Harness, s: &mut Samples, c: &Cell) {
+        let mut elapsed = 0u64;
+        while elapsed < CADENCE_GAP_MS {
+            h.advance_ms(FRAME_MS);
+            elapsed += FRAME_MS;
+            let pt = h.step_timed(Msg::Tick);
+            s.record(c.n, c.hd, c.st, c.ec_tick, &pt);
+        }
+    }
+
+    fn drive_sustained(h: &mut Harness, s: &mut Samples, c: &Cell) {
+        seek(h, midpoint(c.text));
+        for i in 0..sustained_chars_for(c.n) {
+            let ch = (b'a' + (i as u8 % 26)) as char;
+            let pt = h.step_timed(Msg::Input(Event::Key(key_char(ch))));
+            s.record(c.n, c.hd, c.st, c.ec, &pt);
+            cadence_gap(h, s, c);
+        }
+    }
+    fn drive_enter(h: &mut Harness, s: &mut Samples, c: &Cell, double: bool) {
+        let reps = spread_reps_for(c.n);
+        for k in 0..reps {
+            let approx = ((k + 1) * c.text.len()) / (reps + 1);
+            // paragraph end = the next newline at/after the spread point.
+            let end = c.text[approx.min(c.text.len())..].find('\n').map(|o| approx + o).unwrap_or(c.text.len());
+            seek(h, end);
+            let pt = h.step_timed(press(KeyCode::Enter, KeyModifiers::NONE));
+            s.record(c.n, c.hd, c.st, c.ec, &pt);
+            if double {
+                let pt2 = h.step_timed(press(KeyCode::Enter, KeyModifiers::NONE));
+                s.record(c.n, c.hd, c.st, c.ec, &pt2);
+            }
+            cadence_gap(h, s, c);
+        }
+    }
+    fn drive_heading(h: &mut Harness, s: &mut Samples, c: &Cell) {
+        let reps = spread_reps_for(c.n);
+        for k in 0..reps {
+            let approx = ((k + 1) * c.text.len()) / (reps + 1);
+            let ls = c.text[..approx.min(c.text.len())].rfind('\n').map(|o| o + 1).unwrap_or(0);
+            seek(h, ls);
+            for ch in "# Head".chars() {
+                let pt = h.step_timed(Msg::Input(Event::Key(key_char(ch))));
+                s.record(c.n, c.hd, c.st, c.ec, &pt);
+                cadence_gap(h, s, c);
+            }
+        }
+    }
+
+    fn make_harness(text: &str, threaded: bool) -> Harness {
+        if threaded {
+            let (wtx, _wrx) = std::sync::mpsc::channel::<()>();
+            Harness::new_with(text, None, VIEWPORT, BenchExecutor::Thread(ThreadExecutor::new(wtx)))
+        } else {
+            Harness::new(text, None, VIEWPORT)
+        }
+    }
+    fn run_cell(s: &mut Samples, c: &Cell, kind: &str, threaded: bool) {
+        for _ in 0..reps_for(c.n) {
+            let mut h = make_harness(c.text, threaded);
+            match kind {
+                "sustained-char-burst" => drive_sustained(&mut h, s, c),
+                "enter-at-paragraph-end" => drive_enter(&mut h, s, c, false),
+                "double-enter" => drive_enter(&mut h, s, c, true),
+                "heading-edit" => drive_heading(&mut h, s, c),
+                other => panic!("unknown edit-class kind {other}"),
+            }
+        }
+    }
+
+    // -- diagnostics-landing probe (secondary) -------------------------------
+    fn make_diags(text: &str) -> Vec<wordcartel_core::diagnostics::Diagnostic> {
+        use wordcartel_core::diagnostics::{Diagnostic, DiagnosticKind};
+        let mut v = Vec::new();
+        let mut off = char_boundary(text, midpoint(text).saturating_sub(1000));
+        for _ in 0..200 {
+            let end = char_boundary(text, (off + 3).min(text.len()));
+            if off >= end { break; }
+            v.push(Diagnostic { range: off..end, kind: DiagnosticKind::Spelling, message: "x".into(), suggestions: vec![] });
+            off = char_boundary(text, end + 7);
+            if off >= text.len() { break; }
+        }
+        v
+    }
+    fn diagnostics_probe(s: &mut Samples) {
+        for &n in N_VALUES {
+            let text = gen_flat_prose(n);
+            let hd = heading_count(&text);
+            for _ in 0..reps_for(n) {
+                let mut h = make_harness(&text, false);
+                seek(&mut h, midpoint(&text));
+                // Baseline render (no active diagnostics).
+                let base = h.step_timed(Msg::Tick);
+                s.push(n, hd, "flat-prose", "diagnostics-landing-baseline", "render", base.t_render.as_micros());
+                // Inject diagnostics for the current version → placed render path arms.
+                let bid = h.editor.active().id;
+                let ver = h.version();
+                let diags = make_diags(&text);
+                let land = h.step_timed(Msg::DiagnosticsDone { buffer_id: bid, version: ver, diagnostics: diags });
+                s.push(n, hd, "flat-prose", "diagnostics-landing", "render", land.t_render.as_micros());
+                let nxt = h.step_timed(Msg::Tick);
+                s.push(n, hd, "flat-prose", "diagnostics-landing-next", "render", nxt.t_render.as_micros());
+            }
+        }
+    }
+
+    // -- reporting -----------------------------------------------------------
+    fn cell(s: &Samples, st: &str, ec: &str, ph: &str) -> String {
+        let mut pts = Vec::new();
+        for &n in N_VALUES {
+            if let Some(p) = s.p99(n, st, ec, ph) { pts.push((n as f64, p as f64)); }
+        }
+        let sl = loglog_slope(&pts);
+        format!("{sl:.2} {}", slope_label(sl))
+    }
+
+    fn build_slope_table(s: &Samples, caps: &[String]) -> String {
+        let sts = structures();
+        let mut md = String::new();
+        md.push_str("# R1 typing-latency bench — slope table (log-log p99 vs N)\n\n");
+        md.push_str("Viewport 100x40. Cursor seeks the doc MIDPOINT. Realistic ~180ms cadence; the 150ms reconcile debounce fires between keystrokes. `flat` = slope < 0.3; `linear` = slope >= 0.7.\n\n");
+
+        // Headline: sustained-char-burst, phase x structure.
+        md.push_str("## Headline — sustained-char-burst (Input frames)\n\n");
+        md.push_str("| phase |");
+        for (name, _) in &sts { md.push_str(&format!(" {name} |")); }
+        md.push('\n');
+        md.push_str("|-------|");
+        for _ in &sts { md.push_str("------|"); }
+        md.push('\n');
+        for ph in PHASES {
+            md.push_str(&format!("| {ph} |"));
+            for (name, _) in &sts {
+                md.push_str(&format!(" {} |", cell(s, name, "sustained-char-burst", ph)));
+            }
+            md.push('\n');
+        }
+        md.push_str("\nOffending sites when linear: `heading_starts` = derive.rs `rebuild_downstream` `outline::heading_starts` (whole-doc block-tree walk, gated on `blocks_generation` which bumps every edit); `foldview` = `active_fold_view` -> editor.rs:554 -> `fold::FoldView::compute` (whole-doc walk, same defeated gate); `parse` = derive.rs `rebuild` parse phase (incremental widen / full_parse). Positive control: `layout_fill` (derive.rs visible-line loop, O(visible)) and `render` MUST be flat.\n\n");
+
+        // parse slope per structure under enter / double-enter (assertion 3).
+        md.push_str("## parse slope by structure (widen / gap-materialization edit classes)\n\n");
+        md.push_str("| structure | sustained-char-burst | enter-at-paragraph-end | double-enter | heading-edit |\n");
+        md.push_str("|-----------|----------------------|------------------------|--------------|--------------|\n");
+        for (name, _) in &sts {
+            md.push_str(&format!("| {name} | {} | {} | {} | {} |\n",
+                cell(s, name, "sustained-char-burst", "parse"),
+                cell(s, name, "enter-at-paragraph-end", "parse"),
+                cell(s, name, "double-enter", "parse"),
+                cell(s, name, "heading-edit", "parse")));
+        }
+        md.push('\n');
+
+        // Reconcile-tick (threaded executor): p99/max of the merge-landing Tick vs N.
+        md.push_str("## Reconcile-tick hitch — threaded executor (total per Tick, us)\n\n");
+        md.push_str("edit_class = sustained-char-burst[threaded]+reconcile-tick. The merge (tree-eq compare + set_blocks + downstream rebuild) lands on a Tick between keystrokes.\n\n");
+        md.push_str("| structure |");
+        for &n in N_VALUES { md.push_str(&format!(" {} p99/max |", nk(n))); }
+        md.push('\n');
+        md.push_str("|-----------|");
+        for _ in N_VALUES { md.push_str("-----------|"); }
+        md.push('\n');
+        for (name, _) in &sts {
+            md.push_str(&format!("| {name} |"));
+            for &n in N_VALUES {
+                match s.stat(n, name, "sustained-char-burst[threaded]+reconcile-tick", "total") {
+                    Some((_, _, p99, mx)) => md.push_str(&format!(" {p99}/{mx} |")),
+                    None => md.push_str(" -/- |"),
+                }
+            }
+            md.push('\n');
+        }
+        md.push_str("\nInline (upper-bound) reconcile-tick totals for comparison (full_parse runs on the Tick's reduce):\n\n");
+        md.push_str("| structure |");
+        for &n in N_VALUES { md.push_str(&format!(" {} p99/max |", nk(n))); }
+        md.push('\n');
+        md.push_str("|-----------|");
+        for _ in N_VALUES { md.push_str("-----------|"); }
+        md.push('\n');
+        for (name, _) in &sts {
+            md.push_str(&format!("| {name} |"));
+            for &n in N_VALUES {
+                match s.stat(n, name, "sustained-char-burst+reconcile-tick", "total") {
+                    Some((_, _, p99, mx)) => md.push_str(&format!(" {p99}/{mx} |")),
+                    None => md.push_str(" -/- |"),
+                }
+            }
+            md.push('\n');
+        }
+
+        // Diagnostics-landing render deltas.
+        md.push_str("\n## Diagnostics-landing render (flat-prose, us p99)\n\n");
+        md.push_str("| N | baseline render | landing render | next render |\n");
+        md.push_str("|---|-----------------|----------------|-------------|\n");
+        for &n in N_VALUES {
+            let b = s.p99(n, "flat-prose", "diagnostics-landing-baseline", "render").unwrap_or(0);
+            let l = s.p99(n, "flat-prose", "diagnostics-landing", "render").unwrap_or(0);
+            let x = s.p99(n, "flat-prose", "diagnostics-landing-next", "render").unwrap_or(0);
+            md.push_str(&format!("| {} | {b} | {l} | {x} |\n", nk(n)));
+        }
+
+        md.push_str("\n## Caps / scoping (no silent truncation)\n\n");
+        for c in caps { md.push_str(&format!("- {c}\n")); }
+        md
+    }
+    fn nk(n: usize) -> String {
+        if n >= 1_000_000 { format!("{}M", n / 1_000_000) } else { format!("{}K", n / 1_000) }
+    }
+
+    fn write_outputs(csv: &str, slopes: &str) {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join(".superpowers")
+            .join("sdd");
+        let _ = std::fs::create_dir_all(&base);
+        let _ = std::fs::write(base.join("r1-bench.csv"), csv);
+        let _ = std::fs::write(base.join("r1-bench-slopes.md"), slopes);
+    }
+
+    #[test]
+    fn r1_typing_latency_bench() {
+        let mut s = Samples::default();
+        let sts = structures();
+        let edit_classes: &[(&'static str, &'static str, &'static str)] = &[
+            ("sustained-char-burst", "sustained-char-burst", "sustained-char-burst+reconcile-tick"),
+            ("enter-at-paragraph-end", "enter-at-paragraph-end", "enter-at-paragraph-end+reconcile-tick"),
+            ("double-enter", "double-enter", "double-enter+reconcile-tick"),
+            ("heading-edit", "heading-edit", "heading-edit+reconcile-tick"),
+        ];
+
+        // Inline matrix — full cross product (derive phases are executor-independent;
+        // the inline reconcile-tick row is the upper bound with full_parse on-thread).
+        for &n in N_VALUES {
+            for (st, gen) in &sts {
+                let text = gen(n);
+                let hd = heading_count(&text);
+                eprintln!("[bench] inline  N={:>8} struct={:<18} bytes={} headings={}", n, st, text.len(), hd);
+                for (kind, ec, ec_tick) in edit_classes {
+                    let c = Cell { n, hd, st, ec, ec_tick, text: &text };
+                    run_cell(&mut s, &c, kind, false);
+                }
+            }
+        }
+        // Threaded matrix — sustained-char-burst only (the true off-thread reconcile
+        // merge hitch); distinct edit_class so it does not collide with inline rows.
+        for &n in N_VALUES {
+            for (st, gen) in &sts {
+                let text = gen(n);
+                let hd = heading_count(&text);
+                eprintln!("[bench] thread  N={:>8} struct={:<18} bytes={}", n, st, text.len());
+                let c = Cell {
+                    n, hd, st,
+                    ec: "sustained-char-burst[threaded]",
+                    ec_tick: "sustained-char-burst[threaded]+reconcile-tick",
+                    text: &text,
+                };
+                run_cell(&mut s, &c, "sustained-char-burst", true);
+            }
+        }
+        // Diagnostics-landing probe.
+        eprintln!("[bench] diagnostics-landing probe");
+        diagnostics_probe(&mut s);
+
+        let caps = vec![
+            "reps per N: N<=16K -> 5, 64K -> 4, 256K -> 3, 1M -> 2".to_string(),
+            "spread-edit reps (enter/double-enter/heading-edit): N>=256K -> 10, else 20".to_string(),
+            "sustained-char-burst chars: N=1M -> 30, else 40".to_string(),
+            "threaded-executor matrix limited to sustained-char-burst (reconcile-tick focus); all other edit classes measured inline only".to_string(),
+            "diagnostics-landing probe: flat-prose only, 200 spelling diagnostics near the midpoint".to_string(),
+        ];
+
+        let csv = s.to_csv();
+        let slopes = build_slope_table(&s, &caps);
+
+        // Report-only invariant checks (NEVER panic — we WANT to see the slopes).
+        let hs = loglog_from(&s, "flat-prose", "sustained-char-burst", "heading_starts");
+        let fv = loglog_from(&s, "flat-prose", "sustained-char-burst", "foldview");
+        let lf = loglog_from(&s, "flat-prose", "sustained-char-burst", "layout_fill");
+        let rd = loglog_from(&s, "flat-prose", "sustained-char-burst", "render");
+        eprintln!("[bench] HEADLINE flat-prose sustained-char-burst slopes:");
+        eprintln!("  heading_starts = {hs:.2} ({})", slope_label(hs));
+        eprintln!("  foldview       = {fv:.2} ({})", slope_label(fv));
+        eprintln!("  layout_fill    = {lf:.2} ({})  [positive control — must be flat]", slope_label(lf));
+        eprintln!("  render         = {rd:.2} ({})  [positive control — must be flat]", slope_label(rd));
+        if lf >= 0.3 || rd >= 0.3 {
+            eprintln!("[bench] WARNING: positive control NOT flat (layout_fill={lf:.2}, render={rd:.2}) — harness may be mis-measuring.");
+        }
+
+        println!("{csv}");
+        println!("{slopes}");
+        write_outputs(&csv, &slopes);
+    }
+
+    fn loglog_from(s: &Samples, st: &str, ec: &str, ph: &str) -> f64 {
+        let mut pts = Vec::new();
+        for &n in N_VALUES {
+            if let Some(p) = s.p99(n, st, ec, ph) { pts.push((n as f64, p as f64)); }
+        }
+        loglog_slope(&pts)
+    }
 }
