@@ -60,22 +60,11 @@ pub fn bundle_names() -> [&'static str; 2] { ["zen", "full"] }
 /// that so the flip + re-derive stay a single honest transition.
 pub fn apply_bundle(editor: &mut Editor, bundle: &ChromeBundle) {
     editor.chrome_disposition = bundle.chrome_disposition;
-    editor.menu_bar_mode     = bundle.menu_bar;
-    editor.status_line_mode  = bundle.status_line;
-    editor.scrollbar_mode    = bundle.scrollbar;
+    editor.set_menu_bar_mode(bundle.menu_bar);
+    editor.set_status_line_mode(bundle.status_line);
+    editor.set_scrollbar_mode(bundle.scrollbar);
     editor.view_opts.measure    = bundle.measure;
     editor.view_opts.word_count = bundle.word_count;
-    // Mode-transition hygiene: stale auto-state must not survive a preset change
-    // (mirrors menu_bar_pin at registry.rs:446).
-    editor.mouse.menu_reveal_due    = None;
-    editor.mouse.menu_hide_due      = None;
-    editor.mouse.menu_bar_revealed  = false;
-    editor.mouse.scrollbar_reveal_due  = None;
-    editor.mouse.scrollbar_hide_due    = None;
-    editor.mouse.scrollbar_revealed    = false;
-    editor.mouse.status_reveal_due  = None;
-    editor.mouse.status_hide_due    = None;
-    editor.mouse.status_revealed    = false;
 }
 
 #[cfg(test)]

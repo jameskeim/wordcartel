@@ -464,16 +464,10 @@ impl Registry {
             }),
             |c| {
                 use crate::config::MenuBarMode;
-                if c.editor.menu_bar_mode == MenuBarMode::Pinned {
-                    c.editor.menu_bar_mode = c.editor.menu_bar_unpinned_mode;
-                } else {
-                    c.editor.menu_bar_unpinned_mode = c.editor.menu_bar_mode;
-                    c.editor.menu_bar_mode = MenuBarMode::Pinned;
-                }
-                // Mode-transition hygiene: stale auto-state must not survive (spec M2).
-                c.editor.mouse.menu_reveal_due = None;
-                c.editor.mouse.menu_hide_due = None;
-                c.editor.mouse.menu_bar_revealed = false;
+                let target = if c.editor.menu_bar_mode == MenuBarMode::Pinned {
+                    c.editor.menu_bar_unpinned_mode
+                } else { MenuBarMode::Pinned };
+                c.editor.set_menu_bar_mode(target);
                 CommandResult::Handled
             });
 
