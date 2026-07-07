@@ -144,6 +144,23 @@ mod tests {
         assert_eq!(cut.chord, "ctrl-x"); // its CUA chord
     }
 
+    // -----------------------------------------------------------------------
+    // LAW 3 (command-surface contract): palette is exhaustive over the registry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn palette_is_exhaustive_over_the_registry() {
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let mut p = Palette::default();
+        rebuild_rows(&mut p, &reg, &km);
+        let ids: std::collections::HashSet<_> = p.rows.iter().map(|r| r.id).collect();
+        for (id, _) in reg.commands() {
+            assert!(ids.contains(&id), "palette missing registered command {}", id.0);
+        }
+        assert_eq!(p.rows.len(), reg.commands().count(), "row count == registry command count");
+    }
+
     #[test]
     fn rebuild_rows_fuzzy_filters_and_ranks() {
         let reg = crate::registry::Registry::builtins();

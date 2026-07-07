@@ -29,6 +29,10 @@ pub enum ThemeIdentity {
 
 /// A frozen view of every setting the diff law tracks. Passed to
 /// `compute_overrides` as `runtime` (live editor) or `baseline` (config layer).
+///
+/// LAW 2 (command-surface contract): every persisted field here MUST be changeable via a
+/// command / command-surface. Adding a field REQUIRES adding a line to
+/// `every_persisted_setting_has_a_command`.
 #[derive(Debug, Clone)]
 pub struct SettingsSnapshot {
     pub keymap_preset: String,
@@ -933,5 +937,31 @@ mod tests {
         // No divergence → no keys written.
         let of2 = compute_overrides(&base, &base, &OverridesFile::default(), &OverridesFile::default());
         assert!(of2.view.is_none() || of2.view.as_ref().unwrap().scrollbar.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // LAW 2 (command-surface contract): every SettingsSnapshot field reachable
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn every_persisted_setting_has_a_command() {
+        let reg = crate::registry::Registry::builtins();
+        // resolve_name accepts &str (CommandId wraps &'static str, so we use the registry lookup).
+        let has = |id: &str| reg.resolve_name(id).is_some();
+        // SettingsSnapshot field → a command / command-surface that changes it:
+        assert!(has("keymap_next"), "keymap_preset");
+        assert!(has("theme"), "theme_identity (picker surface)");
+        assert!(has("toggle_typewriter"), "view_typewriter");
+        assert!(has("toggle_focus"), "view_focus");
+        assert!(has("toggle_measure"), "view_measure");
+        assert!(has("toggle_wrap_guide"), "view_wrap_guide");
+        assert!(has("toggle_word_count"), "view_word_count");
+        assert!(has("set_wrap_column"), "view_wrap_column");
+        assert!(has("cycle_scrollbar") && has("scrollbar_auto"), "view_scrollbar");
+        assert!(has("toggle_status_line") && has("status_line_auto"), "view_status_line");
+        assert!(has("menu_bar_pin") && has("menu_bar_auto"), "menu_bar");
+        assert!(has("toggle_mouse_capture"), "mouse_capture");
+        assert!(has("toggle_chrome"), "chrome_disposition");
+        assert!(has("toggle_canvas"), "canvas");
     }
 }

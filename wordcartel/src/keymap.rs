@@ -959,6 +959,25 @@ mod tests {
         assert_eq!(base.chord_for(crate::registry::CommandId("cut")).as_deref(), Some("ctrl-x"));
     }
 
+    // -----------------------------------------------------------------------
+    // LAW 7 (command-surface contract): hints re-resolve on preset switch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hints_reresolve_on_preset_switch() {
+        let reg = crate::registry::Registry::builtins();
+        let cfg = |p: &str| crate::config::KeymapConfig { preset: p.into(), patches: vec![] };
+        let (cua, _) = build_keymap(&cfg("cua"), &reg);
+        let (ws, _)  = build_keymap(&cfg("wordstar"), &reg);
+        // save: CUA = `ctrl-s` (shortest, 6 chars); WordStar binds save ONLY under ctrl-k combos
+        // (`ctrl-k s` / `ctrl-k d` / ctrl-held forms — all 8+ chars). The two presets' save
+        // hints genuinely differ.
+        // (Do NOT use move_up: WordStar binds BOTH `ctrl-e` AND `up` to it, so chord_for returns
+        //  "up" for both presets — a vacuous assert_ne.)
+        assert_ne!(cua.chord_for(crate::registry::CommandId("save")),
+                   ws.chord_for(crate::registry::CommandId("save")));
+    }
+
     #[test]
     fn wordstar_has_no_chord_collisions_or_prefix_shadows() {
         let rows = preset_bindings("wordstar").unwrap();

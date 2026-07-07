@@ -150,4 +150,31 @@ mod tests {
         assert!(view.1.iter().any(|(label, _)| label.starts_with("Word Count: On")),
             "stateful toggle renders 'Word Count: On', got {:?}", view.1);
     }
+
+    // -----------------------------------------------------------------------
+    // LAW 7 (command-surface contract): custom binding surfaces in menu + palette
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn custom_bind_surfaces_in_menu_and_palette() {
+        let reg = crate::registry::Registry::builtins();
+        let patch = crate::config::KeymapPatch {
+            bind: [("ctrl-alt-c".to_string(), "cut".to_string())].into_iter().collect(),
+            unbind: vec![], cua: None, wordstar: None,
+        };
+        let (km, _) = crate::keymap::build_keymap(
+            &crate::config::KeymapConfig { preset: "cua".into(), patches: vec![patch] }, &reg);
+        let ed = crate::editor::Editor::new_from_text("x\n", None, (40, 8));
+        // Menu bakes chord_for into the leaf label — the user's explicit binding must win.
+        let groups = build(&reg, &km, &ed).groups;
+        assert!(groups.iter().any(|(_, ls)| ls.iter().any(|(label, id)|
+            *id == crate::registry::CommandId("cut") && label.contains("ctrl-alt-c"))),
+            "menu hint must contain 'ctrl-alt-c' for cut");
+        // Palette row.chord must also reflect the user's explicit binding.
+        let mut p = crate::palette::Palette::default();
+        crate::palette::rebuild_rows(&mut p, &reg, &km);
+        assert!(p.rows.iter().any(|r|
+            r.id == crate::registry::CommandId("cut") && r.chord == "ctrl-alt-c"),
+            "palette hint must be 'ctrl-alt-c' for cut");
+    }
 }
