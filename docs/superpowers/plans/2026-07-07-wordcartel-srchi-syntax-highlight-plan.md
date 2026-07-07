@@ -24,7 +24,7 @@
 
 - `wordcartel-core/src/style.rs` — add `pub enum LineRender`.
 - `wordcartel-core/src/md_parse.rs` — `analyze` takes `LineRender`; add the `RawStyled` branch (no conceal + whole-construct delimiter styling).
-- `wordcartel-core/src/layout.rs` — `layout`/`visible_width`/`visible_source` take `LineRender`; change per-grapheme style resolution to **last-match-wins**; `VisualRow.is_active` semantics preserved as "raw (not concealed)".
+- `wordcartel-core/src/layout.rs` — `layout`/`visible_width`/`visible_source` take `LineRender`; change per-grapheme style resolution to **last-match-wins**; `ColMap.is_active` semantics preserved as "raw (not concealed)".
 - `wordcartel/src/derive.rs` — map `RenderMode` + per-line active-ness → `LineRender` (shared helper); `LayoutKey` carries the mode.
 - `wordcartel/src/nav.rs` — pass `LineRender` via the shared helper (geometry-only; conceal must match render).
 - `wordcartel/src/render.rs` — flip the color gate from `source_mode` (`mode != LivePreview`) to `plain_source` (`mode == SourcePlain`) in BOTH the segs and placed paint paths.
@@ -64,13 +64,13 @@ fn raw_styled_reveals_all_markers_and_styles_delimiters_and_content() {
 
 #[test]
 fn raw_styled_nested_delimiters_take_position_style() {
-    // "**_x_**": the outer ** = Strong, the inner _ and x = Strong+Em (StrongEm).
+    // "**_x_**": the outer ** = Strong, the inner _ and x = Strong+Em (StrongEmphasis).
     let a = analyze("**_x_**", BlockRole::Paragraph, LineRender::RawStyled);
     let at = |b: usize| a.styles.iter().filter(|s| s.src.contains(&b)).last().map(|s| s.style);
     assert_eq!(at(0), Some(Style::Strong), "opening ** is Strong");
     let ux = "**_x_**".find("_x_").unwrap();
-    assert_eq!(at(ux), Some(Style::StrongEm), "inner _ is Strong+Em");        // '_'
-    assert_eq!(at(ux + 1), Some(Style::StrongEm), "x is Strong+Em");          // 'x'
+    assert_eq!(at(ux), Some(Style::StrongEmphasis), "inner _ is Strong+Em");        // '_'
+    assert_eq!(at(ux + 1), Some(Style::StrongEmphasis), "x is Strong+Em");          // 'x'
 }
 
 #[test]
@@ -82,7 +82,7 @@ fn concealed_and_rawplain_unchanged() {
     assert!(p.runs.iter().all(|r| r.visible) && p.styles.is_empty(), "RawPlain = raw, no styles");
 }
 ```
-(`Style::StrongEm` — use whatever `current_style(strong, em, …)` returns for strong+em; read `style.rs`'s `Style` variants and `current_style` at `md_parse.rs` and name the real variant. If the combined variant is named differently, adjust the assertion to the real name.)
+(`Style::StrongEmphasis` — use whatever `current_style(strong, em, …)` returns for strong+em; read `style.rs`'s `Style` variants and `current_style` at `md_parse.rs` and name the real variant. If the combined variant is named differently, adjust the assertion to the real name.)
 
 `layout.rs` test (last-match-wins is a no-op for the existing non-overlapping spans):
 ```rust
@@ -174,7 +174,7 @@ For `Event::Text`: unchanged (content styling — still pushed; with last-match-
                 .unwrap_or(Style::Plain);
 ```
 Thread `LineRender` through `layout`/`visible_width`/`visible_source` signatures (replace `is_active: bool`), pass `render` to `analyze`, and update the two internal `is_active` uses:
-- `VisualRow.is_active` field + its set at `layout.rs:416`: keep the field but set it to `matches!(render, LineRender::RawPlain | LineRender::RawStyled)` (its meaning is "raw / not concealed" — preserved for any downstream reader).
+- `ColMap.is_active` field (`layout.rs:72`) + its set at `layout.rs:416`: keep the field but set it to `matches!(render, LineRender::RawPlain | LineRender::RawStyled)` (its meaning is "raw / not concealed" — preserved for any downstream reader).
 - The heading-glyph-placeholder gate `layout.rs:286` (`… && !is_active && …`): becomes `… && render == LineRender::Concealed && …` (the shade placeholder is a concealed-view affordance only).
 
 - [ ] **Step 4: Run — PASS.** `cargo test -p wordcartel-core` green (existing `md_parse`/`layout` tests updated to pass `LineRender::Concealed`/`RawPlain` instead of `false`/`true` — mechanical).
@@ -239,7 +239,7 @@ Replace the layout call at `derive.rs:259-267`:
 ```
 (capture `b.view.mode` into `b_mode` in the same borrow block that reads `active_line`, `derive.rs:208-224`; drop the now-unused `source_mode` local.)
 
-`LayoutKey` (`derive.rs:10-18`, built `:234-244`): replace `pub source_mode: bool` with `pub mode: crate::editor::RenderMode` and set `mode: b.view.mode` in the constructor. (`RenderMode` derives `PartialEq, Eq, Hash`? — confirm; if not, add `#[derive(...)]` on the enum at `editor.rs:45`. It's `Copy` already per its use.)
+`LayoutKey` (`derive.rs:10-18`, built `:234-244`): replace `pub source_mode: bool` with `pub mode: crate::editor::RenderMode` and set `mode: b.view.mode` in the constructor. (`LayoutKey` is compared with `==` at `derive.rs:245` — `derive(PartialEq, Eq)`, not hashed — and `RenderMode` already derives `Clone, Copy, PartialEq, Eq, Debug` (`editor.rs:44`), so NO new derive is needed on either.)
 
 `nav.rs` (`:64-67`, `:148`) — use the shared mapping so nav's concealment matches render exactly (geometry alignment):
 ```rust
@@ -320,6 +320,6 @@ Update the `:1658` test `source_mode_no_heading_fg_live_preview_has_heading_fg`:
 
 ## Notes for the executor
 
-- `current_style(strong, em, strike, link)` and the `Style` variant names are in `md_parse.rs`/`style.rs` — use the REAL names in the RawStyled pushes and tests (the plan's `Style::StrongEm` is illustrative).
-- Confirm `RenderMode` derives `Hash`+`Eq` before putting it in `LayoutKey`; add the derive on `editor.rs:45` if missing.
+- `current_style(strong, em, strike, link)` and the `Style` variant names are in `md_parse.rs`/`style.rs` — use the REAL names in the RawStyled pushes and tests (the plan's `Style::StrongEmphasis` is illustrative).
+- `LayoutKey` is compared via `==` (`derive(PartialEq, Eq)`, NOT hashed — `derive.rs:245`), so `mode: RenderMode` needs only `PartialEq, Eq`, which `RenderMode` already derives (`editor.rs:44`: Clone, Copy, PartialEq, Eq, Debug). **No derive change needed.**
 - `visible_width`/`visible_source` are used only by core layout + tests (per the grounding) — the signature change is contained; update their test call sites (`layout.rs:1024,1068,1155`, `md_parse.rs:393+`) from the bool to the descriptor.
