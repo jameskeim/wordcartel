@@ -403,12 +403,29 @@ pub fn reduce(
                     if let Some(menu) = editor.menu.as_mut() {   // borrow scoped to this block
                         let ncat = menu.groups.len();
                         match k.code {
-                            KeyCode::Left if ncat > 0 => { menu.open = (menu.open + ncat - 1) % ncat; menu.highlighted = 0; }
-                            KeyCode::Right if ncat > 0 => { menu.open = (menu.open + 1) % ncat; menu.highlighted = 0; }
-                            KeyCode::Up if ncat > 0 => { menu.highlighted = menu.highlighted.saturating_sub(1); }
+                            KeyCode::Left if ncat > 0 => {
+                                menu.open = (menu.open + ncat - 1) % ncat;
+                                menu.highlighted = 0;
+                                menu.scroll_top = 0; // reset window on category switch
+                            }
+                            KeyCode::Right if ncat > 0 => {
+                                menu.open = (menu.open + 1) % ncat;
+                                menu.highlighted = 0;
+                                menu.scroll_top = 0; // reset window on category switch
+                            }
+                            KeyCode::Up if ncat > 0 => {
+                                menu.highlighted = menu.highlighted.saturating_sub(1);
+                                let n = menu.groups[menu.open].1.len();
+                                let list_h = n.min(15);
+                                crate::list_window::keep_visible(menu.highlighted, n, list_h, &mut menu.scroll_top);
+                            }
                             KeyCode::Down if ncat > 0 => {
                                 let n = menu.groups[menu.open].1.len();
-                                if n > 0 { menu.highlighted = (menu.highlighted + 1).min(n - 1); }
+                                if n > 0 {
+                                    menu.highlighted = (menu.highlighted + 1).min(n - 1);
+                                    let list_h = n.min(15);
+                                    crate::list_window::keep_visible(menu.highlighted, n, list_h, &mut menu.scroll_top);
+                                }
                             }
                             KeyCode::Enter if ncat > 0 => {
                                 if let Some((_, id)) = menu.groups[menu.open].1.get(menu.highlighted) { selected = Some(*id); }

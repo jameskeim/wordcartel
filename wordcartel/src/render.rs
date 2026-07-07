@@ -154,15 +154,18 @@ pub(crate) fn menu_dropdown_rect(area: Rect, groups: &[(crate::registry::MenuCat
     let leaves = &groups.get(open)?.1;
     if leaves.is_empty() { return None; }
     let width = leaves.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0) as u16 + 2;
-    let height = leaves.len() as u16;
-    Some(Rect::new(label_rect.x, area.y + 1, width.min(area.width.saturating_sub(label_rect.x.saturating_sub(area.x))), height.min(area.height.saturating_sub(1))))
+    let avail_below = area.height.saturating_sub(1) as usize; // rows under the bar
+    let list_h = leaves.len().min(15).min(avail_below);
+    if list_h == 0 { return None; } // cramped terminal: no room — never paint past the boundary
+    Some(Rect::new(label_rect.x, area.y + 1,
+        width.min(area.width.saturating_sub(label_rect.x.saturating_sub(area.x))),
+        list_h as u16))
 }
 
-#[allow(dead_code)] // used by Task 7 (mouse hit-testing)
-pub(crate) fn menu_dropdown_row_at(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)], open: usize, col: u16, row: u16) -> Option<usize> {
+pub(crate) fn menu_dropdown_row_at(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)], open: usize, scroll_top: usize, col: u16, row: u16) -> Option<usize> {
     let r = menu_dropdown_rect(area, groups, open)?;
     if col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height {
-        Some((row - r.y) as usize)
+        Some((row - r.y) as usize + scroll_top)
     } else { None }
 }
 
@@ -3088,5 +3091,75 @@ mod tests {
         let bg_at = |x: u16, y: u16| buf[(x, y)].style().bg;
         assert_eq!(bg_at(drop_x, drop_bottom), panel_bg,
             "dropdown paints a filled panel to its bottom row (no unfilled gap)");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 14: dropdown windowing + indicator
+    // -----------------------------------------------------------------------
+
+    /// Build a synthetic groups list: one category (Edit) with `n` leaves.
+    #[cfg(test)]
+    fn tall_menu_groups(n: usize)
+        -> Vec<(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)>
+    {
+        let leaves: Vec<(String, crate::registry::CommandId)> = (0..n)
+            .map(|i| (format!("item{i}"), crate::registry::CommandId("move_right")))
+            .collect();
+        vec![(crate::registry::MenuCategory::Edit, leaves)]
+    }
+
+    /// T14-a: dropdown height is `leaves.min(15).min(avail_below)`, NOT the raw leaf count.
+    /// avail_below = area.height - 1 (rows under the bar, no border/query chrome).
+    #[test]
+    fn menu_dropdown_windows_a_tall_category() {
+        let area = Rect::new(0, 0, 80, 8);       // avail_below = height - 1 = 7
+        let groups = tall_menu_groups(20);       // helper: a category with 20 leaves
+        let rect = menu_dropdown_rect(area, &groups, 0).expect("dropdown rect");
+        let avail_below = (area.height - 1) as usize;
+        let n_leaves: usize = 20;
+        let expected = n_leaves.min(15).min(avail_below); // = 7 here (NOT list_h_for's h-4 = 4)
+        assert_eq!(rect.height as usize, expected,
+            "dropdown height = leaves.min(15).min(avail_below), not the raw leaf count (20)");
+    }
+
+    /// T14-b carry-forward from Task 8: when the dropdown OVERFLOWS the window, the
+    /// indicator/pad row at drop_bottom is a non-item row — the explicit `set_style`
+    /// fill is its ONLY source of panel bg.  This test probes that row after a render.
+    #[test]
+    fn dropdown_indicator_row_carries_panel_bg() {
+        let reg = crate::registry::Registry::builtins();
+        let (_km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        // Short terminal (h=8) so avail_below=7; categories with many items overflow the window.
+        let mut e = Editor::new_from_text("x\n", None, (80, 8));
+        // Build menu with a synthetic tall category so the dropdown overflows the 7-row window.
+        let leaves: Vec<(String, crate::registry::CommandId)> = (0..20)
+            .map(|i| (format!("item{i:02}       "), crate::registry::CommandId("move_right")))
+            .collect();
+        e.menu = Some(crate::menu::MenuView {
+            groups: vec![(crate::registry::MenuCategory::Edit, leaves)],
+            open: 0, highlighted: 0, built: true, scroll_top: 0,
+        });
+        derive::rebuild(&mut e);
+
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        let panel_bg = cs.menu_norm.bg;
+
+        let area      = Rect::new(0, 0, 80, 8);
+        let h         = area.height;
+        let menu_area = Rect::new(area.x, area.y, area.width, h.saturating_sub(1));
+        let groups    = e.menu.as_ref().unwrap().groups.clone();
+        let open      = e.menu.as_ref().unwrap().open;
+        let drop_rect = menu_dropdown_rect(menu_area, &groups, open)
+            .expect("tall category must produce a dropdown rect");
+        let drop_x      = drop_rect.x;
+        let drop_bottom = drop_rect.y + drop_rect.height - 1;
+
+        let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        term.draw(|f| render(f, &mut e)).unwrap();
+        let buf = term.backend().buffer();
+
+        let bg_at = |x: u16, y: u16| buf[(x, y)].style().bg;
+        assert_eq!(bg_at(drop_x, drop_bottom), panel_bg,
+            "indicator/pad row at drop_bottom must carry panel bg — only source is the explicit fill");
     }
 }

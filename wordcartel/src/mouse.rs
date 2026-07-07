@@ -140,8 +140,27 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
         return;
     }
     if editor.menu.is_some() {
+        if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+            if let Some(m) = editor.menu.as_mut() {
+                let n = m.groups.get(m.open).map(|g| g.1.len()).unwrap_or(0);
+                if n > 0 {
+                    if matches!(ev.kind, MouseEventKind::ScrollDown) {
+                        m.highlighted = (m.highlighted + 1).min(n - 1);
+                    } else {
+                        m.highlighted = m.highlighted.saturating_sub(1);
+                    }
+                    // Use the actual dropdown window height (avail_below = rows under the bar)
+                    // so keep_visible scrolls at the same boundary the dropdown rect uses.
+                    let avail_below = area.height.saturating_sub(1) as usize;
+                    let list_h = n.min(15).min(avail_below);
+                    crate::list_window::keep_visible(m.highlighted, n, list_h, &mut m.scroll_top);
+                }
+            }
+            return;
+        }
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
             let open = editor.menu.as_ref().unwrap().open;
+            let scroll_top = editor.menu.as_ref().unwrap().scroll_top;
             // scoped borrows → owned hit results
             let bar_hit: Option<usize> = {
                 let groups = &editor.menu.as_ref().unwrap().groups;
@@ -151,12 +170,14 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
             };
             let row_id: Option<crate::registry::CommandId> = {
                 let groups = &editor.menu.as_ref().unwrap().groups;
-                crate::render::menu_dropdown_row_at(area, groups, open, ev.column, ev.row)
+                crate::render::menu_dropdown_row_at(area, groups, open, scroll_top, ev.column, ev.row)
                     .and_then(|row| groups.get(open).and_then(|g| g.1.get(row)).map(|(_, id)| *id))
             };
             // all borrows dropped — now mutate/dispatch/clear
             if let Some(cat) = bar_hit {
-                let m = editor.menu.as_mut().unwrap(); m.open = cat; m.highlighted = 0;
+                // category switch — reset scroll_top so stale window never carries into shorter category
+                let m = editor.menu.as_mut().unwrap();
+                m.open = cat; m.highlighted = 0; m.scroll_top = 0;
             } else if let Some(id) = row_id {
                 crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
             } else {
@@ -1550,5 +1571,30 @@ mod tests {
         assert!(e.file_browser.as_ref().is_some_and(|fb| fb.dir == sub),
             "click on dir must descend into it; dir={:?}", e.file_browser.as_ref().map(|fb| &fb.dir));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 14: menu dropdown wheel scroll
+    // -----------------------------------------------------------------------
+
+    /// T14: ScrollDown on an open menu moves the highlight and scrolls the window
+    /// once the highlight passes the visible rows (avail_below = 7 for h=8).
+    #[test]
+    fn menu_wheel_scrolls_dropdown() {
+        let mut e = Editor::new_from_text("x\n", None, (80, 8)); // avail_below = 7
+        crate::derive::rebuild(&mut e);
+        // Synthetic 20-leaf category so the dropdown overflows the 7-row window and
+        // scroll_top must advance (Codex plan gate round 2 — prove windowing, not just highlight).
+        let leaves: Vec<(String, crate::registry::CommandId)> =
+            (0..20).map(|i| (format!("item{i}"), crate::registry::CommandId("move_right"))).collect();
+        e.menu = Some(crate::menu::MenuView {
+            groups: vec![(crate::registry::MenuCategory::Edit, leaves)],
+            open: 0, highlighted: 0, built: true, scroll_top: 0 });
+        let (reg, ex, clk, tx, km) = ctx();
+        let wheel = MouseEvent { kind: MouseEventKind::ScrollDown, column: 2, row: 3, modifiers: KeyModifiers::NONE };
+        for _ in 0..10 { handle(&mut e, wheel, &reg, &km, &ex, &clk, &tx); }
+        let m = e.menu.as_ref().unwrap();
+        assert!(m.highlighted > 0, "wheel moves the highlight");
+        assert!(m.scroll_top > 0, "wheel scrolls the window once the highlight passes the visible rows");
     }
 }

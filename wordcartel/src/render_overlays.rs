@@ -314,16 +314,36 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
                 }
                 // Paint the dropdown for the open category
                 if let Some(drop_rect) = menu_dropdown_rect(menu_area, &menu.groups, menu.open) {
+                    // Two-layer windowing invariant: re-window against the live frame geometry
+                    // every render so a resize without an event hook is self-correcting.
+                    let scroll_top = {
+                        let m = editor.menu.as_mut().unwrap();
+                        let leaves_len = m.groups[m.open].1.len();
+                        let list_h = drop_rect.height as usize;
+                        crate::list_window::keep_visible(m.highlighted, leaves_len, list_h, &mut m.scroll_top);
+                        m.scroll_top
+                    };
                     frame.render_widget(Clear, drop_rect);
                     // Attached filled panel: fill the whole rect with the Muted panel bg so
                     // the dropdown reads as one elevated surface extending from the bar (no box).
                     frame.buffer_mut().set_style(drop_rect, cs.menu_norm);
-                    let leaves = &menu.groups[menu.open].1;
-                    let items: Vec<ListItem> = leaves
+                    let (highlighted, leaves_len) = {
+                        let m = editor.menu.as_ref().unwrap();
+                        (m.highlighted, m.groups[m.open].1.len())
+                    };
+                    let list_h = drop_rect.height as usize;
+                    // Determine how many rows are available for items: if the dropdown overflows,
+                    // reserve the bottom row for the n/total indicator.
+                    let overflows = leaves_len > list_h;
+                    let item_rows = if overflows { list_h.saturating_sub(1) } else { list_h };
+                    let end = (scroll_top + item_rows).min(leaves_len);
+                    let leaves = &editor.menu.as_ref().unwrap().groups[editor.menu.as_ref().unwrap().open].1;
+                    let items: Vec<ListItem> = leaves[scroll_top..end]
                         .iter()
                         .enumerate()
-                        .map(|(row, (label, _))| {
-                            let style = if row == menu.highlighted {
+                        .map(|(row_in_window, (label, _))| {
+                            let abs_row = scroll_top + row_in_window;
+                            let style = if abs_row == highlighted {
                                 cs.menu_sel
                             } else {
                                 cs.menu_norm
@@ -331,7 +351,24 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
                             ListItem::new(format!(" {label} ")).style(style)
                         })
                         .collect();
-                    frame.render_widget(List::new(items), drop_rect);
+                    // Render items in a sub-rect (leaving the bottom row for the indicator when needed).
+                    let item_rect = if overflows && list_h > 0 {
+                        Rect::new(drop_rect.x, drop_rect.y, drop_rect.width, item_rows as u16)
+                    } else {
+                        drop_rect
+                    };
+                    frame.render_widget(List::new(items), item_rect);
+                    // Render n/total indicator on the bottom row of the dropdown when it overflows.
+                    if overflows && list_h > 0 {
+                        if let Some(ind) = windowed_indicator(highlighted, leaves_len, list_h) {
+                            let ind_y = drop_rect.y + drop_rect.height - 1;
+                            let ind_rect = Rect::new(drop_rect.x, ind_y, drop_rect.width, 1);
+                            frame.render_widget(
+                                Paragraph::new(ind).style(cs.menu_norm),
+                                ind_rect,
+                            );
+                        }
+                    }
                 }
             }
             _ => {
