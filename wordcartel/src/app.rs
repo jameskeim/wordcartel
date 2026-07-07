@@ -1567,6 +1567,9 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         // clears the other side); recompute_menu_bar clears a fired due, so a past
         // deadline cannot persist and spin the loop.
         let menu_deadline = editor.mouse.menu_reveal_due.or(editor.mouse.menu_hide_due);
+        // Scrollbar/status-line dwell deadlines — armed by the right-edge Moved arm.
+        let sb_dwell_deadline = editor.mouse.scrollbar_reveal_due.or(editor.mouse.scrollbar_hide_due);
+        let status_dwell_deadline = editor.mouse.status_reveal_due.or(editor.mouse.status_hide_due);
         // Fix A3: include the diagnostics deadline ONLY when no check is in
         // flight.  When a check is in flight, recheck_due_at may be a past
         // timestamp (armed before the check started), which would drive
@@ -1588,6 +1591,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             sq_deadline,
             sb_deadline,
             menu_deadline,
+            sb_dwell_deadline,
+            status_dwell_deadline,
             diag_deadline,
             reconcile_deadline,
         ]);
@@ -1659,13 +1664,40 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     Ok(exit_reason)
 }
 
-/// Recompute `editor.mouse.scrollbar_visible` from the clock.
+/// Recompute `editor.mouse.scrollbar_visible` from the clock, honoring the mode.
 ///
 /// Must be called at the top of the run loop (with `clock.now_ms()`) so that
-/// the scrollbar fades exactly when `scrollbar_until_ms` expires, driven by
-/// the loop's `deadline` (not an idle Tick).
+/// the scrollbar fades exactly when `scrollbar_until_ms` or a dwell deadline
+/// expires, driven by the loop's `deadline` (not an idle Tick).
+///
+/// **Fire order is load-bearing:** dwell/grace deadlines are fired FIRST so that
+/// a deadline landing exactly on `now_ms` flips `scrollbar_revealed` before we
+/// read it to compute `scrollbar_visible`.
 pub fn recompute_scrollbar_visible(editor: &mut crate::editor::Editor, now_ms: u64) {
-    editor.mouse.scrollbar_visible = now_ms < editor.mouse.scrollbar_until_ms;
+    use crate::config::TransientMode;
+    // Fire the Auto dwell/grace deadlines FIRST (armed by the mouse Moved arm), so a
+    // deadline landing exactly on `now_ms` flips `scrollbar_revealed` BEFORE we read it.
+    if editor.scrollbar_mode == TransientMode::Auto {
+        if editor.mouse.scrollbar_reveal_due.is_some_and(|d| now_ms >= d) {
+            editor.mouse.scrollbar_reveal_due = None;
+            editor.mouse.scrollbar_revealed = true;
+        }
+        if editor.mouse.scrollbar_hide_due.is_some_and(|d| now_ms >= d) {
+            editor.mouse.scrollbar_hide_due = None;
+            editor.mouse.scrollbar_revealed = false;
+        }
+    } else {
+        editor.mouse.scrollbar_reveal_due = None;
+        editor.mouse.scrollbar_hide_due = None;
+        editor.mouse.scrollbar_revealed = false;
+    }
+    editor.mouse.scrollbar_visible = match editor.scrollbar_mode {
+        TransientMode::On  => true,
+        TransientMode::Off => false,
+        // Auto: scroll activity (the existing channel) OR a live right-edge dwell.
+        TransientMode::Auto => now_ms < editor.mouse.scrollbar_until_ms
+            || editor.mouse.scrollbar_revealed,
+    };
 }
 
 /// Fire the auto-mode menu-bar deadlines (armed by the mouse Moved arm). Gated on
@@ -3448,6 +3480,33 @@ mod tests {
         assert!(e.mouse.scrollbar_visible);
         crate::app::recompute_scrollbar_visible(&mut e, 1200); // after
         assert!(!e.mouse.scrollbar_visible);
+    }
+
+    #[test]
+    fn scrollbar_visible_respects_mode() {
+        use crate::config::TransientMode;
+        use crate::app::recompute_scrollbar_visible;
+        let mut e = Editor::new_from_text("x\n", None, (40, 8));
+        // On: always visible regardless of activity/dwell.
+        e.scrollbar_mode = TransientMode::On;
+        recompute_scrollbar_visible(&mut e, 10_000);
+        assert!(e.mouse.scrollbar_visible, "On → always visible");
+        // Off: never visible even with fresh activity.
+        e.scrollbar_mode = TransientMode::Off;
+        e.mouse.scrollbar_until_ms = 20_000;
+        recompute_scrollbar_visible(&mut e, 10_000);
+        assert!(!e.mouse.scrollbar_visible, "Off → never visible");
+        // Auto: visible while activity OR dwell holds; hidden once both lapse.
+        e.scrollbar_mode = TransientMode::Auto;
+        e.mouse.scrollbar_until_ms = 20_000; e.mouse.scrollbar_revealed = false;
+        recompute_scrollbar_visible(&mut e, 10_000);
+        assert!(e.mouse.scrollbar_visible, "Auto + activity → visible");
+        e.mouse.scrollbar_until_ms = 0; e.mouse.scrollbar_revealed = true;
+        recompute_scrollbar_visible(&mut e, 10_000);
+        assert!(e.mouse.scrollbar_visible, "Auto + dwell-revealed → visible");
+        e.mouse.scrollbar_revealed = false;
+        recompute_scrollbar_visible(&mut e, 10_000);
+        assert!(!e.mouse.scrollbar_visible, "Auto + neither → hidden");
     }
 
     // A1 Task 3 — cases 7 + 8 (app-level: recompute_menu_bar / reconcile)

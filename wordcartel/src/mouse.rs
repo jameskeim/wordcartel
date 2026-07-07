@@ -69,6 +69,13 @@ fn visible_doc_end(editor: &mut Editor) -> usize {
     if snapped != probe { snapped } else { len }
 }
 
+/// True when NO overlay/modal is open — the shared predicate for dwell suppression.
+fn no_overlay_open(editor: &Editor) -> bool {
+    editor.menu.is_none() && editor.palette.is_none() && editor.theme_picker.is_none()
+        && editor.file_browser.is_none() && editor.outline.is_none() && editor.diag.is_none()
+        && editor.prompt.is_none() && editor.minibuffer.is_none() && editor.search.is_none()
+}
+
 pub fn handle(
     editor: &mut Editor,
     ev: MouseEvent,
@@ -104,15 +111,34 @@ pub fn handle(
                 }
             } else {
                 editor.mouse.menu_hide_due = None; // re-entry cancels a pending hide
-                if editor.menu.is_none()
-                    && editor.palette.is_none()
-                    && editor.theme_picker.is_none()
-                    && editor.file_browser.is_none()
+                if no_overlay_open(editor)
                     && !editor.mouse.dragging
                     && !editor.mouse.scrollbar_dragging
                     && !editor.mouse.menu_bar_revealed
                 {
                     editor.mouse.menu_reveal_due = Some(clock.now_ms() + MENU_DWELL_MS);
+                }
+            }
+        }
+    }
+    // Scrollbar right-edge dwell (mirror of the menu-bar dwell; col w-1 is the track).
+    if editor.scrollbar_mode == crate::config::TransientMode::Auto {
+        if let MouseEventKind::Moved = ev.kind {
+            let w = editor.active().view.area.0;
+            let at_right_edge = ev.column == w.saturating_sub(1);
+            if at_right_edge {
+                editor.mouse.scrollbar_hide_due = None;
+                if !editor.mouse.scrollbar_revealed
+                    && editor.mouse.scrollbar_reveal_due.is_none()
+                    && no_overlay_open(editor)
+                    && !editor.mouse.dragging && !editor.mouse.scrollbar_dragging
+                {
+                    editor.mouse.scrollbar_reveal_due = Some(clock.now_ms() + MENU_DWELL_MS);
+                }
+            } else {
+                editor.mouse.scrollbar_reveal_due = None;
+                if editor.mouse.scrollbar_revealed && editor.mouse.scrollbar_hide_due.is_none() {
+                    editor.mouse.scrollbar_hide_due = Some(clock.now_ms() + MENU_LEAVE_GRACE_MS);
                 }
             }
         }
@@ -803,6 +829,16 @@ mod tests {
         handle(&mut e, moved(5, 5), &reg, &km, &ex, &TestClock(0), &tx);
         assert_eq!(e.mouse.menu_hide_due, Some(MENU_LEAVE_GRACE_MS),
             "leave-bookkeeping must run even with the dropdown open");
+    }
+
+    #[test]
+    fn scrollbar_dwell_arms_on_right_edge_rest() {
+        let mut e = Editor::new_from_text("hello\n", None, (40, 8));
+        crate::derive::rebuild(&mut e);
+        e.scrollbar_mode = crate::config::TransientMode::Auto;
+        let (reg, ex, _, tx, km) = ctx();
+        handle(&mut e, moved(39, 4), &reg, &km, &ex, &TestClock(0), &tx); // col w-1 = 39
+        assert_eq!(e.mouse.scrollbar_reveal_due, Some(MENU_DWELL_MS));
     }
 
     /// Case 9: a wheel event (ScrollUp) at row 0 must never arm the dwell —
