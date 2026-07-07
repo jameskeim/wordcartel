@@ -1,6 +1,6 @@
 # A3 — Option Reachability + Preset-Aware Hints — Design
 
-**Status:** design; Codex spec gate round 1 folded (3 Important + 2 Minor; incl. a contract shape-rule-8 refinement), re-review pending.
+**Status:** design; spec gate previously READY (round 3). Part 4 (menu chord right-justification) folded in 2026-07-07 per user decision to keep the effort whole — re-review pending.
 **Effort:** `effort-a3-option-reachability` (branch off `main`).
 **Fixes backlog item:** A3.
 
@@ -13,6 +13,8 @@ This effort **implements and enforces** the contract; conformance is its whole p
   new commands to share one setter per option.
 - **Law 7 (hints track the active keymap; prefer the user's explicit binding):** changes `chord_for` to
   prefer a config-patch-sourced binding over an inherited default; adds the hint-verification tests.
+  ALSO (Part 4) right-justifies the menu's chord hints to match the palette — presentation only, same
+  `chord_for` value.
 - **Law 3 (palette exhaustive):** formalizes the palette-completeness invariant test.
 - **Shape rule 8 (set-value primitives + a stateful menu representative):** the new commands follow
   it — set-per-state primitives (palette-only) + a stateful menu representative (a toggle for the
@@ -145,6 +147,42 @@ active preset, so switching preset changes which user-explicit binds exist.
    command differ per preset (re-resolution). (b) apply a config patch binding a command to a custom
    chord; assert `chord_for` returns the custom chord (user-explicit preferred) and that it surfaces
    in both `grouped_commands` (menu) and `rebuild_rows` (palette).
+
+---
+
+## Part 4 — Menu chord right-justification (folded in 2026-07-07, user decision)
+
+**Problem.** The menu bakes the chord into the leaf as `format!("{label}    {chord}")` — a fixed
+4-space gap (`menu.rs:75` `leaf_label`) — so menu chords are **ragged** (each sits a fixed gap after
+its own label), not aligned to a common right edge. The **palette** already right-aligns its chord to
+the panel's right edge (`render_overlays.rs:90-95`, separate `label`/`chord` fields padded to
+`list_area.width`). The menu should match — chords flush-right within the dropdown.
+
+**Design (least-invasive — keep the leaf tuple, pad at build time).** The menu's data model is
+*pre-rendered label strings* (`MenuView.groups: Vec<(MenuCategory, Vec<(String, CommandId)>)>`,
+`menu.rs:6`) — state-in-label (E2) is already baked into the label by `menu_leaf_label`. Right-justify
+is done in the same place, per dropdown group:
+- Split the chord back out of leaf composition: a `menu_leaf_base(meta, editor)` returns the base text
+  (state-in-label, NO chord — `menu.rs:61-71`); the chord stays `keymap.chord_for(id)`.
+- `grouped_commands` collects `(base, Option<chord>, id)` intermediates for the group, computes a
+  common target width = `max(base_width + GAP + chord_width)` over the group, then rebuilds each leaf
+  label as `base + pad + chord` where `pad` right-aligns the chord flush to the target (leaves with no
+  chord render as their base). `leaf_label` (the fixed-4-spaces fn) is replaced by this pass.
+- The leaf tuple stays `(String, CommandId)` — **no change** to the dropdown painter
+  (`render_overlays.rs:345`), hit-testing (`mouse.rs:145/171`), or `menu_dropdown_rect` width (still
+  derived from the max leaf width, now uniform → the dropdown sizes to the aligned width). Consistent
+  with the menu's existing baked-label model (vs the palette's structured fields — the two surfaces
+  legitimately differ in representation).
+
+**Contract note (law 7 — hint presentation).** The chord shown is unchanged (still `chord_for`:
+active-keymap, explicit-binding-preferred); only its *alignment* changes. The palette already
+right-justifies (untouched). Because the chord remains inside the leaf label string, **Part 3's
+custom-bind-surfaces-in-the-menu test is unaffected** (`label.contains(chord)` still holds) — this
+part is purely additive.
+
+**Test.** A dropdown group with ≥2 leaves whose (label, chord) widths differ → every chord ends at the
+same column (flush-right); a no-chord leaf renders its base with no trailing chord. (Update any
+existing menu test that pins the old fixed-4-space format, e.g. `menu.rs:125`.)
 
 ---
 
