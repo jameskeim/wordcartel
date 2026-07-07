@@ -881,24 +881,31 @@ whole-document walks now live at `derive.rs:208-211` (`heading_starts`) and `der
 `Editor::set_blocks` bumps every edit (`editor.rs:91-93`) → the memoization is defeated on every
 keystroke. Confirmed as a real O(document) per-keystroke tax, worst in large/heading-dense docs — the
 "all three symptoms" baseline. Two mechanisms the earlier record did NOT isolate:
-- **Reconcile debounce mistiming (NEW — the sustained-sentence hitch).** The reconcile debounce is
-  **150 ms** (`reconcile.rs:10`), *shorter* than a ~180 ms/key human cadence, so it fires BETWEEN
-  keystrokes mid-burst, running `full_parse_rope` O(document) plus a main-thread whole-tree equality
-  compare (`reconcile.rs:65`) + the following `derive::rebuild`. This is a distinct async-landing hitch
-  on fast typing, separate from the O(document) walks (and distinct from the deferred input-coalescing
-  item). Candidate fix: raise the debounce above human cadence and/or make the merge avoid the
-  O(document) main-thread compare.
+- **Reconcile debounce mistiming (NEW — but MEASUREMENT DOWNGRADED it).** The reconcile debounce is
+  **150 ms** (`reconcile.rs:10`), shorter than a ~180 ms/key cadence, so it fires between keystrokes.
+  The code-read feared a main-thread O(document) hitch — but the bench REFUTES that for production: with
+  the real threaded `Executor`, `full_parse_rope` runs off-thread and the merge Tick stays **flat
+  ~78–146 µs** vs N (the tree-eq compare short-circuits / is cheap). The O(document) ~3.7 ms@1M cost
+  appears ONLY on the `InlineExecutor` (test-seam) path. Net: **not a production hot-path problem**;
+  deprioritized. (Retiming the debounce above cadence is still a cheap tidy-up, not a fix.)
 - **Block-tree widen/gap-materialization (NEW — the paragraph-end spike).** An Enter/blank-line near an
   absorptive container (list/quote/indented-code) far upstream makes the incremental update materialize
   the inter-block gap line-by-line (`block_tree.rs:719-723`) or `WidenToEnd` to EOF (`:875`) — O(document)
   on that single structural keystroke. Pins symptom 2 (paragraph endings) to a concrete mechanism rather
   than "lag downstream of T4."
 
-**Quantification in progress:** the greenfield latency probe the record called for is now being built as
-a **burst-based** bench on the e2e seam (N × structure × edit-class, cadence-aware so the 150 ms/400 ms
-debounces fire between keystrokes, p99/max per phase, log-log slope vs N). Expected result: `heading_starts`
-and `foldview` slope ~1.0 (the O(document) bug quantified); `layout_fill`/`render` flat (positive control).
-Branch `effort-r1-typing-latency`.
+**QUANTIFIED (burst-based bench, 2026-07-07, branch `effort-r1-typing-latency`, `6669e73`; release, e2e
+seam, N×structure×edit-class, p99 log-log slope vs N).** The O(document) bug is CONFIRMED — and the model
+sharpened: the walks are linear in **block/heading COUNT, not raw bytes**, so the clean linear slope shows
+on **heading-dense (`heading_starts` 0.99 / `foldview` 1.03), nested-list (1.33 / 1.20), code-heavy (1.31 /
+1.31)** — and reads FLAT on flat-prose (few big blocks) and giant-table (1 block) at the µs floor. The walk
+fired on **200/200 Input frames** (memoization defeat proven directly). **Positive control HELD:**
+`layout_fill` (0.05–0.14; ~300 µs, the largest phase, correctly O(visible)) and `render` (0.02–0.10) are
+flat — the harness is valid. `parse` is linear on nested-list (0.87) / giant-table (0.93) — the
+paragraph-end widen/gap finding, confirmed. **Bounding caveat:** at ≤1 MB NO cell breaches the 8 ms (120 Hz)
+budget (worst total p99 ~6.3 ms @1M giant-table), so this is a **scaling risk + burst-backlog contributor**
+(per-keystroke cost stacking faster than 16 ms frames drain, given no input coalescing), not a single-key
+stall at present doc sizes. Raw CSV + slope table in `.superpowers/sdd/r1-bench{.csv,-slopes.md}` (gitignored).
 
 **Cross-reference (2026-07-07 fuzz sweep):** `block_tree.rs`'s incremental machinery is a shared hotspot —
 it underlies both R1's paragraph-end widen cost AND the still-open incremental≡full soundness divergences
