@@ -258,6 +258,29 @@ pub(crate) fn diag_row_at(area: Rect, diag: &crate::diag_overlay::DiagOverlay, c
     } else { None }
 }
 
+/// Map a click on the status row to a prompt choice by locating each choice's
+/// `[K]` marker in the rendered message. Returns the `PromptAction` when the click
+/// column falls within a choice's marker+label span — from the `[K]` marker up to
+/// (but not including) the next `·` separator, or the end of the message. `None`
+/// when the click is on a different row, or not over any marker span.
+pub(crate) fn prompt_choice_at(area: Rect, prompt: &crate::prompt::Prompt, col: u16, row: u16)
+    -> Option<crate::prompt::PromptAction> {
+    if row != area.y + area.height.saturating_sub(1) { return None; } // status row only
+    let rel = col.saturating_sub(area.x); // message renders at column area.x
+    let msg = &prompt.message;
+    for choice in &prompt.choices {
+        let marker = format!("[{}]", choice.key.to_ascii_uppercase());
+        if let Some(byte_idx) = msg.find(&marker) {
+            let start = byte_idx as u16; // ASCII markers → byte index == column offset
+            // span = marker + trailing label up to the next '·' separator (or end).
+            let rest = &msg[byte_idx..];
+            let span_len = rest.find('·').unwrap_or(rest.len()) as u16;
+            if rel >= start && rel < start + span_len { return Some(choice.action); }
+        }
+    }
+    None
+}
+
 /// Assemble the left-hand portion of the normal status line (no overlay active).
 ///
 /// Format: `[i/n] <name> [<mode>]` (plus optional status message and BLK indicator).

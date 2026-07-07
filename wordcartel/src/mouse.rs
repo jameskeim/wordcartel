@@ -344,8 +344,21 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
         }
         return;
     }
-    // Task 13: prompt choice clicks — placeholder consume for now.
-    if editor.prompt.is_some() { return; }
+    // Task 13: prompt choice clicks — on Down(Left) over a `[K]` marker, dispatch
+    // via the shared keyboard resolver; all other events (including off-marker
+    // clicks) are consumed so the prompt stays open and nothing leaks to the editor.
+    if editor.prompt.is_some() {
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            // Scoped borrow → owned action (PromptAction: Copy) before mutable dispatch.
+            let action: Option<crate::prompt::PromptAction> = editor.prompt.as_ref()
+                .and_then(|p| crate::render::prompt_choice_at(area, p, ev.column, ev.row));
+            if let Some(action) = action {
+                // resolve_prompt clears editor.prompt in its arms — do NOT clear it here.
+                crate::prompts::resolve_prompt(action, editor, ex, clock, msg_tx);
+            }
+        }
+        return;
+    }
     // Text-input modals: consume, no row action (you type). Tail branch — the fn
     // ends here, so an empty body suffices (no `return` needed).
     if editor.minibuffer.is_some() || editor.search.is_some() {}
@@ -1391,6 +1404,28 @@ mod tests {
         assert!(e.diag.is_none(), "click-away closes the diag overlay");
         assert_eq!(e.active().document.buffer.to_string(), buf_before,
             "buffer unchanged on click-away");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 13: prompt choice clicks
+    // -----------------------------------------------------------------------
+
+    /// Clicking a choice marker on the status row while a prompt is open dispatches
+    /// its action via `resolve_prompt` — the keyboard path is untouched.
+    #[test]
+    fn click_prompt_choice_dispatches_action() {
+        let mut e = Editor::new_from_text("x\n", None, (80, 8));
+        crate::derive::rebuild(&mut e);
+        e.prompt = Some(crate::prompt::Prompt::quit_confirm());
+        let area = ratatui::layout::Rect::new(0, 0, 80, 8);
+        // Locate the '[Q]' marker column in the rendered status text.
+        let msg = e.prompt.as_ref().unwrap().message.clone();
+        let q_col = msg.find("[Q]").expect("quit marker present") as u16;
+        let status_row = area.y + area.height - 1; // = 7 for this geometry
+        let (reg, ex, clk, tx, km) = ctx();
+        let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: q_col + 1, row: status_row, modifiers: KeyModifiers::NONE };
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        assert!(e.quit, "clicking [Q]uit anyway must trigger the QuitAnyway action");
     }
 
     /// A click on a directory entry in the file browser descends into that directory.
