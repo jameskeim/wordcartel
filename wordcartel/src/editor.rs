@@ -390,6 +390,12 @@ pub struct Editor {
     pub clipboard_sync_request: Option<String>,
     pub clipboard_get_pending: Option<crate::clipboard::PasteIntent>,
     pub clipboard_notice_shown: bool,
+    /// Active clipboard provider selection (seeded from `[clipboard] provider`; changed by
+    /// the `clipboard_provider_*` commands). Drives `resolve_provider`.
+    pub clipboard_provider: crate::config::ClipboardProvider,
+    /// Set when the provider changed at runtime and the worker must rebuild its Layer-1
+    /// backend; consumed (and cleared) by `drain_clipboard_intents`.
+    pub clipboard_provider_dirty: bool,
     pub pending_keys: Vec<crate::keymap::KeyChord>,
     pub keymap: crate::keymap::KeyTrie,
     /// The resolved preset name currently driving the loop-local keymap trie ("cua" or "wordstar").
@@ -489,6 +495,8 @@ impl Editor {
             filter_in_flight: None, transform_in_flight: false, minibuffer: None, pending_export: None,
             pending_mark: None,
             clipboard_sync_request: None, clipboard_get_pending: None, clipboard_notice_shown: false,
+            clipboard_provider: crate::config::ClipboardProvider::Auto,
+            clipboard_provider_dirty: false,
             pending_keys: Vec::new(),
             keymap,
             active_keymap_preset: "cua".into(),
@@ -852,6 +860,19 @@ impl Editor {
         self.mouse.menu_reveal_due = None;
         self.mouse.menu_hide_due = None;
         self.mouse.menu_bar_revealed = false;
+    }
+
+    /// Set the clipboard provider and mark the worker for a Layer-1 rebuild. The single setter
+    /// the `clipboard_provider_*` commands AND startup seeding call (contract law 6). Startup
+    /// clears the dirty flag after seeding (the worker already holds the correct initial backend).
+    pub fn set_clipboard_provider(&mut self, provider: crate::config::ClipboardProvider) {
+        self.clipboard_provider = provider;
+        self.clipboard_provider_dirty = true;
+    }
+
+    /// Clear the provider-dirty flag without a rebuild (startup seeding path).
+    pub fn clear_clipboard_provider_dirty(&mut self) {
+        self.clipboard_provider_dirty = false;
     }
 }
 
@@ -1458,6 +1479,18 @@ mod tests {
         assert_eq!(e.menu_bar_unpinned_mode, MenuBarMode::Auto, "Pinned set → remembers prior non-Pinned");
         e.set_menu_bar_mode(MenuBarMode::Hidden);
         assert_eq!(e.menu_bar_unpinned_mode, MenuBarMode::Hidden);
+    }
+
+    #[test]
+    fn set_clipboard_provider_sets_field_and_dirty() {
+        // Real Editor constructor: new_from_text(text, path, area) (editor.rs:477).
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.clipboard_provider_dirty = false;
+        e.set_clipboard_provider(crate::config::ClipboardProvider::Osc52);
+        assert_eq!(e.clipboard_provider, crate::config::ClipboardProvider::Osc52);
+        assert!(e.clipboard_provider_dirty, "setter raises the dirty flag");
+        e.clear_clipboard_provider_dirty();
+        assert!(!e.clipboard_provider_dirty, "explicit clear resets it");
     }
 
     #[test]
