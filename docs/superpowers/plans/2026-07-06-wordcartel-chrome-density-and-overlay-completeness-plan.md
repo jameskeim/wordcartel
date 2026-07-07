@@ -1303,7 +1303,7 @@ Prompt arm in `route_overlay`: on Down(Left), `if let Some(action) = crate::rend
 - Test: inline in `render.rs` + `mouse.rs`
 
 **Interfaces:**
-- Consumes: `list_window::{list_h_for, keep_visible}`, `windowed_indicator` (`render.rs:171`).
+- Consumes: `list_window::keep_visible` (via `keep_overlay_visible` in the paint layer), `windowed_indicator` (`render.rs:171`). Note: the dropdown-rect height uses the direct `leaves.len().min(15).min(avail_below)` budget (NOT `list_h_for`'s `h-4`) — see the impl below.
 - Produces: `MenuView.scroll_top: usize`; `menu_dropdown_rect` windows height via `list_h_for` against the space below the label; the dropdown scrolls rather than truncating.
 
 **Design note:** lands AFTER Task 8 — re-read the filled-panel dropdown paint. The indicator `" n/total "` renders on the dropdown's bottom row when the open category overflows the window.
