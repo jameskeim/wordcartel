@@ -642,6 +642,220 @@ height; `ensure_visible` at `nav.rs:436` subtracts `1 + menu_bar_rows`) and `Lay
 **Recommended sequencing:** before Effort P — the plugin system only adds hot-path pressure, and a
 latency probe is worth having in place before then.
 
+## Theme S — manuscript structure (the "TUI corkboard")
+
+**Origin:** 2026-07-07 design chat, prompted by the beloved-features report
+(`~/projects/wordprocessing/beloved-features-report.md`). The report's biggest gap for
+wordcartel vs the process-centric studios (Scrivener/Ulysses/Longform) is
+**manuscript-as-rearrangeable-fragments** — the corkboard/binder. Two ways to deliver it in a
+TUI, at two different zoom levels. **Key framing:** in markdown the *headings ARE the binder* —
+no separate data model to build or desync (a real Scrivener failure mode). S1 and S2 are the
+same verb (rearrange fragments) at intra-document vs inter-document scale; S2 can reuse S1's
+list/drag interaction surface with files-as-items instead of headings-as-items.
+
+**Prior art (checked 2026-07-07):** the core operations are proven and beloved in the terminal,
+but a *prose-first, markdown-native TUI corkboard as a coherent product does not appear to
+exist* — the corkboard tools (Scrivener, Manuskript) are all GUI. So we're combining proven
+primitives into an unoccupied niche, not inventing risky mechanics.
+- **S1 engine — Emacs org-mode Structure Editing** is the canonical prior art: `M-↑`/`M-↓` move
+  a subtree (level-preserving sibling swap), `M-←`/`M-→` promote/demote — a clean precedent that
+  *reorder* and *re-parent* are SEPARATE commands (answers our normalize-vs-preserve fork:
+  keep sibling-reorder level-preserving; make promote/demote explicit). Emacs **markdown-mode**
+  does exactly this for markdown (`C-c ↑`/`C-c ↓` = `markdown-move-up/down`, subtree moves).
+  These live inside general editors, not a prose word processor — that's our differentiation.
+- **S1 view surface** — `aerial.nvim` / `outline.nvim` (tree outline sidebars) and **treemd**
+  (TUI dual-pane markdown outline+render viewer) prove the TUI structure-view layout, but for
+  *navigation only*, not reorder. `vim-markdown-folding` proves fold-by-section (approach B).
+- **S2 model** — directory + ordered manifest + compile exists as build tools (**mdBook**'s
+  `SUMMARY.md` — Rust; Quarto; Bookdown; Leanpub) and as a GUI plugin (**Obsidian Longform**),
+  but NOT as an interactive TUI binder. Manuskript (GUI, FOSS) is the closest Scrivener-clone
+  sibling.
+
+### S1. Rearrangeable outline / heading-subtree corkboard — `needs-design` · Medium
+
+**What:** promote the transient outline overlay into a dwellable "structure mode" (or an
+in-place folded-reorder in the main buffer — the two surfaces of the same primitive). The
+foundational operation is a **heading-subtree move**: take a heading + everything under it up to
+the next heading of the *same-or-higher* level (deeper headings are part of the subtree — the
+same boundary `folds` already compute via `outline::heading_starts`), cut that byte range,
+reinsert elsewhere. One atomic edit through `submit_transaction`/`ChangeSet` (valid-by-
+construction, single undo step, no half-apply — stays inside the no-data-loss invariant). Mouse
+drag-to-reorder is now cheap (mouse completeness shipped). Reuses: block tree, `outline`, folds,
+transactions, marks — all already core.
+
+**Core/plugin: CORE (pre-Effort-P).** It's structural *editing* on the data-integrity path — a
+subtree move is a valid-by-construction transaction; a bad one corrupts the manuscript
+(worst-case = data loss → must be core). The move primitive + the default structure-mode view
+are core; a fancier card-grid view (approach C) could later be a plugin layered on the core
+command. Feasible now — the machinery exists.
+
+**Design forks (for the brainstorm):**
+1. **Primary surface:** (A) enhanced outline "structure mode" (rich, dwellable, drag-reorder)
+   vs (B) in-place folded reorder in the main buffer (minimal, no mode switch) vs both.
+2. **Reorder vs re-parent:** level-preserving sibling swap as the common path; promote/demote as
+   a separate explicit command (org-mode precedent). On a cross-level move, `normalize-on-drop`
+   (shift the whole subtree's `#`-depth by the delta, clamp at H6, skip fenced code — the block
+   tree knows code spans) vs `preserve-level`.
+3. **Card "synopsis":** derived (heading + first non-empty line) by default — zero storage, pure
+   markdown; optional `> blockquote`-under-heading convention as an authored synopsis.
+4. **Edge cases:** content before the first heading; headings-inside-code-fences; a doc with no
+   headings (degrade gracefully to "no cards").
+
+### S2. Directory-as-binder (project/manuscript over many files) — `needs-design` · Larger
+
+**What:** treat a *directory of `.md` files* as a manuscript — each file a scene/chapter
+("card"), plus an **ordered manifest** (filesystem order ≠ manuscript order) and a **compile**
+step to concatenate for export/reading. Reuses the existing multi-buffer system for
+open/switch. This turns wordcartel from a *document editor* into a *project editor*.
+
+**Core/plugin: PLUGIN (post-Effort-P) — and strategically so.** It's an opt-in project/workflow
+layer that only *orchestrates* existing ops (open via multi-buffer, write via save, compile via
+a transform-like step); worst case from a bug is a wrong *export*, not lost source → plugin-safe.
+Three reasons: (1) prior art agrees — Obsidian Longform is a plugin; (2) identity — an opinionated
+workflow shouldn't be baked into the core's single-plain-text-file minimalism; (3) it's the ideal
+**first real plugin / API driver** — building it forces P's API to expose buffer/file/command/job
+access. Waits for Effort P.
+
+**Different beast from S1 (recorded so we don't conflate them):** S1 = intra-document (move
+text ranges, no new data model, one file stays one file); S2 = inter-document (reorder a
+manifest, needs a compile step, the "document" becomes a convention over a directory). S2
+reintroduces exactly the two frictions the report flags — a structure that can desync, and a
+compile step ("the most complained-about feature in any writing software"). Justified only at
+book scale (isolation, per-scene git history, per-scene notes, true binder feel). **They
+compose:** a book = a manifest (S2) of chapter files, each with rearrangeable scene-headings
+(S1). Sequence S2 *after* S1; S2 can reuse S1's rearrange UI with files as items.
+
+**Design forks (deferred until S1 lands / the writing-unit question is answered):** manifest
+format (own file? frontmatter? mdBook-style `SUMMARY.md`?); compile semantics (heading-level
+offset per file? separators?); how it coexists with single-file mode; whether it's core or a
+post-Effort-P Lua plugin (a strong plugin candidate — it's a project *layer* over the editor).
+
+**Open question for the human:** the S1-vs-S2 priority hinges on writing unit — single long
+document reshaped internally (→ S1 is the whole answer) vs book-as-many-files (→ S2 on top of
+S1). Not yet decided.
+
+### S3. Snapshots — named, durable revision checkpoints ("fearless editing") — `needs-design` · Small–Medium
+
+**What:** Scrivener-style snapshots — capture the document at a point in time (named/
+timestamped), list them, **compare (diff)** against current, and **restore** with one action.
+The report's "fearless-revision insurance." **This is the lowest-risk, highest-architecture-fit
+of the three manuscript gaps** — it is essentially the user-facing surface of the existing
+durability spine (feasibility checked 2026-07-07).
+
+**Enablers already present (the expensive parts):**
+- **O(1) content capture** — `TextBuffer::snapshot() -> ropey::Rope` (`buffer.rs:99`; ropey is
+  copy-on-write, so N snapshots of a lightly-edited doc share memory). Already used live:
+  `recovery.rs:8` keeps `LAST_GOOD: Mutex<Option<(path, Rope)>>` as a retained point-in-time
+  snapshot for crash recovery — the exact pattern in production.
+- **Safe restore** — `change.rs` (*"ChangeSet: reversible byte-diff"*) + `history.rs`
+  (`History { revisions }`, apply/undo/redo, M5 budget eviction). Restore = one **replace-all**
+  ChangeSet through the transaction path → atomic, single undo step, no half-apply (inside the
+  no-data-loss invariant). Restore does NOT need a display diff.
+- **Durable persistence** — `save_atomic`/`save_atomic_bytes` (`file.rs`) over the M3 `Fs` seam;
+  snapshots can be plain `.md` files in a sidecar dir (keeps "file over app" — you can `cat`
+  your history).
+- **Dedup / labels** — `swap.rs` FNV-1a `content_hash` + `version` (skip identical snapshots;
+  timestamp/version labels).
+
+**The one genuine net-new algorithm:** a **display diff** (line/word compare for the "what
+changed vs this snapshot" view). None exists today — the settings *diff-law* and the ChangeSet
+*reversible byte-diff* are both unrelated (a settings merge and a transaction, not a text
+compare-for-display). Pragmatic: add the `similar` crate, or a small Myers impl. Pure-core,
+well-understood; the ONLY new capability. (First cut could ship capture+list+restore WITHOUT
+the diff and add the compare view second.)
+
+**Also net-new (additive):** a snapshot store (per-buffer `Vec<Snapshot { rope, taken_at,
+label, version, hash }>` + on-disk format) and a snapshots overlay + commands (take / list /
+preview / diff / restore) reusing the overlay + `list_window` + mouse + palette/menu framework.
+
+**Design forks:** snapshot granularity (whole buffer vs per-heading-subtree — composes with
+S1); retention policy (keep all / cap N / user-prune — undo already has M5 budget eviction as a
+precedent); on-disk format + location; whether the diff view is line- or word-level.
+
+**Distinction to keep explicit:** Snapshots ≠ undo. Undo (`history.rs`) is fine-grained,
+automatic, ephemeral, in-session, budget-evicted. Snapshots are coarse, deliberate, named,
+durable across sessions. Different layer; a restore lands as one undoable revision but snapshots
+neither replace nor depend on the undo stack.
+
+**Core/plugin: CORE (pre-Effort-P), policy tunable.** Restore is a data-mutating transaction and
+persistence uses the atomic writer — both are integrity/durability territory (worst-case = losing
+current work), and the feature's *whole value is data safety*, so it belongs to the layer that owns
+"no data loss." The safety-critical spine (snapshot store, restore-transaction, snapshot-write) is
+core; *policy* (auto-snapshot triggers, retention count, line-vs-word diff) can be config- or
+plugin-tunable via hooks. Feasible now.
+
+## Theme P — plugin candidates from the beloved-features report
+
+**Origin:** 2026-07-07, same design chat as Theme S. A pass over the whole report
+(`~/projects/wordprocessing/beloved-features-report.md`) for *unimplemented* beloved features
+that are better delivered as opt-in Lua plugins (Effort P) than baked into core. **Key
+principle:** several of these are features the report is openly *ambivalent* about (goals "bleed
+the joy," Hemingway-fails-Hemingway, AI's "uninvited co-author") — making them opt-in plugins is
+the *correct* resolution of the minimalism-vs-features tension, not a compromise. Boundary test:
+off-hot-path + worst-case-is-wrong-output-not-lost-data + prescribes-a-workflow → plugin. **All
+items here are POST-Effort-P** (they need the plugin API). None is committed scope; this is the
+durable candidate list + a de-facto requirements probe for the P API.
+
+### P-A. Analysis / policy plugins — cleanest fit, high infra reuse
+
+- **Writing goals / targets / streaks** — motivation layer computed on save/idle; opt-in matches
+  the "goals bleed the joy" counter-literature. Reuses word count + status line + a sidecar file.
+- **Readability / style lens** (Hemingway-style: long sentences, adverbs, passive) — an analysis
+  *job* whose findings surface as dismissible marks; opt-in matches the anti-prescriptivist
+  evidence (Hemingway rated "Bad"). **Highest infra reuse:** the diagnostics + quick-fix overlay
+  already exist, plus the config `linters` catalog and the job substrate. (Custom style linters =
+  a natural sub-case feeding the existing diagnostics catalog.)
+- **Direct-to-CMS publishing** (WordPress/Medium/Ghost) — command + background job + API keys.
+  Reuses export/job substrate + config. Classic plugin.
+- **Backlinks / wiki-links** (zettelkasten) — `[[link]]` index on the worker substrate + a
+  backlink/follow overlay; composes with S2's directory model. Reuses outline-overlay-style list.
+
+These are the sweet spot: *command + event hook + job + optional overlay/status*, none can
+corrupt source (worst case = wrong count / failed publish).
+
+### P-B. Custom-markup plugins — high value, cluster on ONE hard API need
+
+All three want the same capability — **plugins contributing custom inline/markup rendering** —
+which is the trickiest P-API surface (rendering is core + per-frame, hot-path-adjacent). This
+likely argues for a core **"markup-extension" mechanism** plugins register *into* (declare a
+syntax + a face), rather than plugins rendering raw. Design deliberately in P.
+
+- **Track Changes via CriticMarkup** (`{++ins++}`/`{--del--}`/`{>>comment<<}`) — THE feature
+  keeping pros tethered to Word, in its plain-text-native form; pandoc already maps CriticMarkup
+  ↔ docx tracked changes. Bridges wordcartel into the editorial `.docx` substrate the report
+  calls unavoidable. Needs: inline span styling + accept/reject transforms + an export hook.
+  **Highest-value P-B item and the best forcing function for the markup-extension API.**
+- **Fountain screenplay** (scene headings, cues, dialogue) — purely plain-text genre support that
+  fits the identity (the report holds Fountain up as the ideal). Needs custom line/inline
+  rendering + a pandoc/afterwriting export path.
+- **Wiki-link rendering** — the visual half of the P-A backlinks plugin.
+
+### P-C. Lower-fit / niche / principled
+
+- **AI continuation** — plugin-*only, on principle*. The report's evidence: the complaint isn't
+  AI, it's *unavoidability* ("uninvited co-author"). Opt-in plugin is the only defensible stance.
+- **One-click book design (Vellum-like)** — at most a thin plugin shelling to a pandoc/epub
+  template; real book design is a GUI product, mostly out of scope.
+- **Genre benchmarking (AutoCrit)** — needs a comparison corpus; heavy, niche. Plugin at most.
+- **Ulysses sheet-library (no filenames)** — mild tension with "file over app" transparency (it
+  *hides* filenames); a workflow plugin if ever, low priority.
+
+### Not plugins (recorded for completeness)
+
+- **Split-view / research-beside-writing pane** — window layout is a core rendering concern; a
+  plugin could fill a pane's *content*, not create the split.
+- **WYSIWYG fonts** — N/A on a terminal (themed rendering instead).
+
+### P-API requirements this list implies (a checklist for Effort P)
+
+The candidates collectively require the P API to expose: **event hooks** (save/edit/idle/open);
+**buffer + metadata read** (content, word count, active doc); **safe edits via transaction**
+(accept/reject, apply-fix); **jobs** on the worker substrate (analysis, network); **UI
+contributions** — status-line (goals), list overlay (backlinks/findings, reuse diagnostics), and
+the hard one, **inline markup rendering** (CriticMarkup/Fountain/wikilinks); **sidecar file +
+network I/O** (streaks, caches, CMS). CriticMarkup is the item that most stresses — and therefore
+best validates — the markup-rendering capability; treat it as a P design anchor.
+
 ## Cross-cutting notes
 
 - **Testing synergy:** every item lands with e2e `Harness` journeys (menu state machine,
