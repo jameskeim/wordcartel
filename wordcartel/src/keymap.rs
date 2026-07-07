@@ -161,6 +161,9 @@ pub enum Resolution {
 #[derive(Debug, Clone, Default)]
 pub struct KeyTrie {
     map: HashMap<Vec<KeyChord>, CommandId>,
+    /// Sequences bound by a config patch (user-explicit), as opposed to the preset base.
+    /// `chord_for` prefers these so a user's binding wins over an inherited default (contract law 7).
+    user_bound: std::collections::HashSet<Vec<KeyChord>>,
 }
 
 impl KeyTrie {
@@ -169,18 +172,37 @@ impl KeyTrie {
         self.map.insert(seq, id);
     }
 
+    /// Bind `seq` to `id` AND mark it user-explicit (a config patch binding).
+    ///
+    /// Used by `apply_patch_tables` so that `chord_for` can prefer a user's
+    /// explicit binding over an inherited preset default (contract law 7).
+    pub fn bind_user(&mut self, seq: Vec<KeyChord>, id: CommandId) {
+        self.user_bound.insert(seq.clone());
+        self.map.insert(seq, id);
+    }
+
     /// Remove any binding for `seq` (no-op if absent).
     pub fn unbind(&mut self, seq: &[KeyChord]) {
         self.map.remove(seq);
+        self.user_bound.remove(seq);
     }
 
     /// Reverse-lookup: a display chord bound to `id`, or None if unbound.
-    /// Shortest sequence wins; ties broken by the rendered string (KeyChord isn't Ord).
-    #[allow(dead_code)] // wired in Task 3
+    ///
+    /// Prefers user-explicit bindings (set via `bind_user`) over preset defaults.
+    /// Among the winning pool, shortest sequence wins; ties broken alphabetically.
     pub fn chord_for(&self, id: CommandId) -> Option<String> {
-        self.map.iter()
+        let all: Vec<&Vec<KeyChord>> = self.map.iter()
             .filter(|(_, v)| **v == id)
-            .map(|(seq, _)| chords_display(seq))
+            .map(|(s, _)| s)
+            .collect();
+        let user: Vec<&Vec<KeyChord>> = all.iter()
+            .copied()
+            .filter(|s| self.user_bound.contains(*s))
+            .collect();
+        let pool = if user.is_empty() { all } else { user };
+        pool.into_iter()
+            .map(|seq| chords_display(seq))
             .min_by(|a, b| a.chars().count().cmp(&b.chars().count()).then_with(|| a.cmp(b)))
     }
 
@@ -517,7 +539,7 @@ fn apply_patch_tables(
                 continue;
             }
         };
-        trie.bind(seq, id);
+        trie.bind_user(seq, id);
     }
     for chord_str in unbind {
         match parse_seq(chord_str) {
@@ -918,6 +940,23 @@ mod tests {
                 assert_ne!(*id, "close_buffer", "{preset} must not bind close_buffer");
             }
         }
+    }
+
+    #[test]
+    fn chord_for_prefers_user_bound_over_shortest_default() {
+        let reg = crate::registry::Registry::builtins();
+        // cut has the default CUA binding ctrl-x; add a LONGER custom binding via a patch.
+        let patch = crate::config::KeymapPatch {
+            bind: [("ctrl-alt-c".to_string(), "cut".to_string())].into_iter().collect(),
+            unbind: vec![], cua: None, wordstar: None };
+        let cfg = crate::config::KeymapConfig { preset: "cua".into(), patches: vec![patch] };
+        let (km, warns) = build_keymap(&cfg, &reg);
+        assert!(warns.is_empty(), "{warns:?}");
+        // Without the fix chord_for returns the shorter ctrl-x; with it, the user's ctrl-alt-c.
+        assert_eq!(km.chord_for(crate::registry::CommandId("cut")).as_deref(), Some("ctrl-alt-c"));
+        // No custom binding → unchanged (shortest default).
+        let (base, _) = build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        assert_eq!(base.chord_for(crate::registry::CommandId("cut")).as_deref(), Some("ctrl-x"));
     }
 
     #[test]
