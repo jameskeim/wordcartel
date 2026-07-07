@@ -2945,6 +2945,14 @@ mod tests {
     /// the way to its bottom row — no unfilled gap cells.  The fill is applied via an explicit
     /// `set_style(drop_rect, cs.menu_norm)` after Clear and before the per-item List render so
     /// that the entire rect reads as one elevated surface regardless of item-row coverage.
+    ///
+    /// SCOPE NOTE — this is a FORWARD regression pin, not a present-day failure detector.
+    /// Today `menu_dropdown_rect` height == `leaves.len()`, so every row (incl. `drop_bottom`)
+    /// is an item row that ratatui's `List` already styles with `cs.menu_norm` — the explicit
+    /// fill is idempotent and this assertion passes with or without it.  When Task 14 extends
+    /// the dropdown height (windowing + the `n/total` indicator row), `drop_bottom` becomes a
+    /// NON-item row and the explicit fill is its only source of panel bg — Task 14 MUST add a
+    /// test that probes that non-item row directly (this test does not cover it).
     #[test]
     fn dropdown_fills_whole_rect_with_muted_panel_bg() {
         let reg = crate::registry::Registry::builtins();
