@@ -41,10 +41,18 @@ pub enum MenuCategory { File, Edit, Format, View, Settings, Export }
 pub const MENU_ORDER: [MenuCategory; 6] =
     [MenuCategory::File, MenuCategory::Edit, MenuCategory::Format, MenuCategory::View, MenuCategory::Settings, MenuCategory::Export];
 
+/// The live-state mark a stateful menu command interpolates into its row label.
+/// Exhaustive — adding a variant here is intentional and must be handled in every match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuMark { OnOff(bool), Value(&'static str) }
+
 #[derive(Clone, Copy)]
 pub struct CommandMeta {
     pub label: &'static str,
     pub menu: Option<MenuCategory>,
+    /// Optional live-state provider — evaluated at menu-build time against `&Editor`.
+    /// `None` for stateless commands (their static label renders unchanged).
+    pub state: Option<fn(&crate::editor::Editor) -> MenuMark>,
 }
 
 // ── Registry ──────────────────────────────────────────────────────────────────
@@ -64,7 +72,14 @@ impl Registry {
     fn register(&mut self, id: &'static str, label: &'static str, menu: Option<MenuCategory>, handler: Handler) {
         let cid = CommandId(id);
         self.index.insert(cid, self.entries.len());
-        self.entries.push(CommandEntry { id: cid, handler, meta: CommandMeta { label, menu } });
+        self.entries.push(CommandEntry { id: cid, handler, meta: CommandMeta { label, menu, state: None } });
+    }
+
+    fn register_stateful(&mut self, id: &'static str, label: &'static str, menu: Option<MenuCategory>,
+                         state: fn(&crate::editor::Editor) -> MenuMark, handler: Handler) {
+        let cid = CommandId(id);
+        self.index.insert(cid, self.entries.len());
+        self.entries.push(CommandEntry { id: cid, handler, meta: CommandMeta { label, menu, state: Some(state) } });
     }
 
     pub fn builtins() -> Registry {
@@ -384,9 +399,15 @@ impl Registry {
         // View menu — writing-experience toggles (Task 2 / Effort 5d).
         r.register("toggle_typewriter", "Toggle Typewriter", Some(MenuCategory::View), |c| { c.editor.view_opts.typewriter = !c.editor.view_opts.typewriter; CommandResult::Handled });
         r.register("toggle_focus",      "Toggle Focus Mode", Some(MenuCategory::View), |c| { c.editor.view_opts.focus = !c.editor.view_opts.focus; CommandResult::Handled });
-        r.register("toggle_measure",    "Toggle Centered Measure", Some(MenuCategory::View), |c| { c.editor.view_opts.measure = !c.editor.view_opts.measure; crate::derive::rebuild(c.editor); CommandResult::Handled });
-        r.register("toggle_wrap_guide", "Toggle Wrap Guide", Some(MenuCategory::View), |c| { c.editor.view_opts.wrap_guide = !c.editor.view_opts.wrap_guide; CommandResult::Handled });
-        r.register("toggle_word_count", "Toggle Word Count", Some(MenuCategory::View), |c| { c.editor.view_opts.word_count = !c.editor.view_opts.word_count; CommandResult::Handled });
+        r.register_stateful("toggle_measure", "Toggle Centered Measure", Some(MenuCategory::View),
+            |e| MenuMark::OnOff(e.view_opts.measure),
+            |c| { c.editor.view_opts.measure = !c.editor.view_opts.measure; crate::derive::rebuild(c.editor); CommandResult::Handled });
+        r.register_stateful("toggle_wrap_guide", "Toggle Wrap Guide", Some(MenuCategory::View),
+            |e| MenuMark::OnOff(e.view_opts.wrap_guide),
+            |c| { c.editor.view_opts.wrap_guide = !c.editor.view_opts.wrap_guide; CommandResult::Handled });
+        r.register_stateful("toggle_word_count", "Toggle Word Count", Some(MenuCategory::View),
+            |e| MenuMark::OnOff(e.view_opts.word_count),
+            |c| { c.editor.view_opts.word_count = !c.editor.view_opts.word_count; CommandResult::Handled });
 
         // View menu — section folding (Task 10 / Effort 5g).
         r.register("fold_toggle", "Fold/Unfold Section", Some(MenuCategory::View), |c| {
@@ -435,20 +456,26 @@ impl Registry {
             c.editor.open_outline();
             CommandResult::Handled
         });
-        r.register("menu_bar_pin", "Pin Menu Bar", Some(MenuCategory::View), |c| {
-            use crate::config::MenuBarMode;
-            if c.editor.menu_bar_mode == MenuBarMode::Pinned {
-                c.editor.menu_bar_mode = c.editor.menu_bar_unpinned_mode;
-            } else {
-                c.editor.menu_bar_unpinned_mode = c.editor.menu_bar_mode;
-                c.editor.menu_bar_mode = MenuBarMode::Pinned;
-            }
-            // Mode-transition hygiene: stale auto-state must not survive (spec M2).
-            c.editor.mouse.menu_reveal_due = None;
-            c.editor.mouse.menu_hide_due = None;
-            c.editor.mouse.menu_bar_revealed = false;
-            CommandResult::Handled
-        });
+        r.register_stateful("menu_bar_pin", "Pin Menu Bar", Some(MenuCategory::View),
+            |e| MenuMark::Value(match e.menu_bar_mode {
+                crate::config::MenuBarMode::Pinned => "Pinned",
+                crate::config::MenuBarMode::Auto   => "Auto",
+                crate::config::MenuBarMode::Hidden => "Hidden",
+            }),
+            |c| {
+                use crate::config::MenuBarMode;
+                if c.editor.menu_bar_mode == MenuBarMode::Pinned {
+                    c.editor.menu_bar_mode = c.editor.menu_bar_unpinned_mode;
+                } else {
+                    c.editor.menu_bar_unpinned_mode = c.editor.menu_bar_mode;
+                    c.editor.menu_bar_mode = MenuBarMode::Pinned;
+                }
+                // Mode-transition hygiene: stale auto-state must not survive (spec M2).
+                c.editor.mouse.menu_reveal_due = None;
+                c.editor.mouse.menu_hide_due = None;
+                c.editor.mouse.menu_bar_revealed = false;
+                CommandResult::Handled
+            });
 
         // Heading navigation motions (Task 10 / Effort 5g).
         r.register("heading_next",   "Next Heading",   None, |c| { heading_jump(c, Dirn::Next);   CommandResult::Handled });
@@ -460,14 +487,23 @@ impl Registry {
         r.register("scroll_line_down", "Scroll Line Down", None, |c| { crate::nav::scroll_line_down(c.editor); CommandResult::Handled });
 
         // Settings menu — runtime keymap preset switching (D1+A5).
-        r.register("keymap_cua", "Keymap: CUA", Some(MenuCategory::Settings), |c| {
+        // keymap_cua/keymap_wordstar are palette-only (menu: None); the menu shows one
+        // cycle row (keymap_next) whose label reflects the active preset.
+        r.register("keymap_cua", "Keymap: CUA", None, |c| {
             switch_keymap_preset(c.editor, "cua");
             CommandResult::Handled
         });
-        r.register("keymap_wordstar", "Keymap: WordStar", Some(MenuCategory::Settings), |c| {
+        r.register("keymap_wordstar", "Keymap: WordStar", None, |c| {
             switch_keymap_preset(c.editor, "wordstar");
             CommandResult::Handled
         });
+        r.register_stateful("keymap_next", "Keymap", Some(MenuCategory::Settings),
+            |e| MenuMark::Value(if e.active_keymap_preset == "wordstar" { "WordStar" } else { "CUA" }),
+            |c| {
+                let next = if c.editor.active_keymap_preset == "cua" { "wordstar" } else { "cua" };
+                switch_keymap_preset(c.editor, next);
+                CommandResult::Handled
+            });
         r.register("set_wrap_column", "Set Wrap Column\u{2026}", Some(MenuCategory::Settings), |c| {
             c.editor.open_minibuffer("Wrap column: ", crate::minibuffer::MinibufferKind::WrapColumn);
             CommandResult::Handled
@@ -475,14 +511,18 @@ impl Registry {
         // toggle_canvas and toggle_chrome MUST be registered BEFORE save_settings
         // (journey_palette_end relies on save_settings being the last command dispatched
         // from End+Enter — spec D3 / A.7).
-        r.register("toggle_canvas", "Canvas: Opaque/Transparent", Some(MenuCategory::Settings), |c| {
-            toggle_canvas(c.editor);
-            CommandResult::Handled
-        });
-        r.register("toggle_chrome", "Chrome: Full/Zen", Some(MenuCategory::Settings), |c| {
-            toggle_chrome(c.editor);
-            CommandResult::Handled
-        });
+        r.register_stateful("toggle_canvas", "Canvas: Opaque/Transparent", Some(MenuCategory::Settings),
+            |e| MenuMark::Value(match e.canvas {
+                wordcartel_core::theme::CanvasMode::Opaque       => "Opaque",
+                wordcartel_core::theme::CanvasMode::Transparent  => "Transparent",
+            }),
+            |c| { toggle_canvas(c.editor); CommandResult::Handled });
+        r.register_stateful("toggle_chrome", "Chrome: Full/Zen", Some(MenuCategory::Settings),
+            |e| MenuMark::Value(match e.chrome_disposition {
+                wordcartel_core::theme::ChromeDisposition::Full => "Full",
+                wordcartel_core::theme::ChromeDisposition::Zen  => "Zen",
+            }),
+            |c| { toggle_chrome(c.editor); CommandResult::Handled });
         r.register("save_settings", "Save Settings", Some(MenuCategory::Settings), |c| {
             c.editor.settings_save_requested = true;
             CommandResult::Handled
@@ -554,8 +594,12 @@ fn toggle_chrome(editor: &mut crate::editor::Editor) {
         ChromeDisposition::Full => ChromeDisposition::Zen,
         ChromeDisposition::Zen  => ChromeDisposition::Full,
     };
-    editor.chrome_disposition = new_disp;
+    // Apply the whole density bundle for the new disposition (color + visibility),
+    // then request the re-derive. Re-selecting a preset re-applies its bundle over
+    // unsaved runtime state (spec §1.5 — runtime-clobber). rebuild for measure.
+    crate::density::apply_bundle(editor, crate::density::bundle_for(new_disp));
     editor.theme_rederive = true;
+    crate::derive::rebuild(editor); // measure change affects layout
     let label = match new_disp { ChromeDisposition::Full => "full", ChromeDisposition::Zen => "zen" };
     // Arm 2 — non-Rgb bases: derive_chrome early-returns on non-Rgb (Color::Default /
     // named colors). The flip is recorded and persists, but the visible chrome is unchanged.
@@ -794,9 +838,9 @@ mod tests {
     #[test]
     fn settings_commands_registered_in_settings_category() {
         let reg = Registry::builtins();
+        // keymap_cua/keymap_wordstar are palette-only now; keymap_next is the single cycle row.
         for (id, label) in [
-            ("keymap_cua",       "Keymap: CUA"),
-            ("keymap_wordstar",  "Keymap: WordStar"),
+            ("keymap_next",      "Keymap"),
             ("set_wrap_column",  "Set Wrap Column\u{2026}"),
             ("toggle_chrome",    "Chrome: Full/Zen"),
             ("save_settings",    "Save Settings"),
@@ -805,6 +849,9 @@ mod tests {
             assert_eq!(m.label, label, "label mismatch for {id}");
             assert_eq!(m.menu, Some(MenuCategory::Settings), "menu category mismatch for {id}");
         }
+        // Confirm demotion.
+        assert_eq!(reg.meta(CommandId("keymap_cua")).unwrap().menu, None, "keymap_cua must be palette-only");
+        assert_eq!(reg.meta(CommandId("keymap_wordstar")).unwrap().menu, None, "keymap_wordstar must be palette-only");
     }
 
     // -----------------------------------------------------------------------
@@ -1003,6 +1050,34 @@ mod tests {
         // ## A fold must be cleared.
         assert!(!ed.active().folds.folded().contains(&a_byte),
             "## A fold must be cleared when diag_prev lands inside its body");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 7: state-in-label menu items (MenuMark + CommandMeta.state)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stateful_commands_report_live_state() {
+        let reg = Registry::builtins();
+        let mut ed = crate::editor::Editor::new_from_text("x\n", None, (40, 8));
+        ed.view_opts.word_count = false;
+        let m = reg.meta(CommandId("toggle_word_count")).unwrap();
+        let f = m.state.expect("toggle_word_count has a state fn");
+        assert!(matches!(f(&ed), MenuMark::OnOff(false)));
+        ed.view_opts.word_count = true;
+        assert!(matches!(f(&ed), MenuMark::OnOff(true)));
+        // Chrome is a Value mark.
+        let cm = reg.meta(CommandId("toggle_chrome")).unwrap().state.unwrap();
+        ed.chrome_disposition = wordcartel_core::theme::ChromeDisposition::Zen;
+        assert!(matches!(cm(&ed), MenuMark::Value("Zen")));
+    }
+
+    #[test]
+    fn keymap_group_collapses_to_one_cycle_row() {
+        let reg = Registry::builtins();
+        // keymap_cua/keymap_wordstar are palette-only now (menu: None).
+        assert_eq!(reg.meta(CommandId("keymap_cua")).unwrap().menu, None);
+        assert_eq!(reg.meta(CommandId("keymap_next")).unwrap().menu, Some(MenuCategory::Settings));
     }
 
     // Helper: build a Ctx and dispatch a command id against the given Editor.

@@ -154,16 +154,41 @@ pub(crate) fn menu_dropdown_rect(area: Rect, groups: &[(crate::registry::MenuCat
     let leaves = &groups.get(open)?.1;
     if leaves.is_empty() { return None; }
     let width = leaves.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0) as u16 + 2;
-    let height = leaves.len() as u16;
-    Some(Rect::new(label_rect.x, area.y + 1, width.min(area.width.saturating_sub(label_rect.x.saturating_sub(area.x))), height.min(area.height.saturating_sub(1))))
+    let avail_below = area.height.saturating_sub(1) as usize; // rows under the bar
+    let list_h = leaves.len().min(15).min(avail_below);
+    if list_h == 0 { return None; } // cramped terminal: no room — never paint past the boundary
+    Some(Rect::new(label_rect.x, area.y + 1,
+        width.min(area.width.saturating_sub(label_rect.x.saturating_sub(area.x))),
+        list_h as u16))
 }
 
-#[allow(dead_code)] // used by Task 7 (mouse hit-testing)
-pub(crate) fn menu_dropdown_row_at(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)], open: usize, col: u16, row: u16) -> Option<usize> {
+pub(crate) fn menu_dropdown_row_at(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)], open: usize, scroll_top: usize, col: u16, row: u16) -> Option<usize> {
     let r = menu_dropdown_rect(area, groups, open)?;
-    if col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height {
-        Some((row - r.y) as usize)
+    let leaves_len = groups.get(open).map(|g| g.1.len()).unwrap_or(0);
+    let list_h = r.height as usize;
+    // Mirror the paint's overflows condition exactly (render_overlays.rs):
+    // when the category overflows the window the bottom row is reserved for the n/total
+    // indicator — a click there must NOT dispatch a hidden off-screen command.
+    let overflows = leaves_len > list_h;
+    let item_rows = if overflows { list_h.saturating_sub(1) } else { list_h };
+    if col >= r.x && col < r.x + r.width && row >= r.y {
+        let row_in_window = (row - r.y) as usize;
+        if row_in_window < item_rows {
+            let abs = scroll_top + row_in_window;
+            // Defensive guard — keep_visible clamps scroll_top, but never dispatch a
+            // non-existent row if geometry and state are somehow mismatched.
+            if abs < leaves_len { Some(abs) } else { None }
+        } else { None }
     } else { None }
+}
+
+/// The area the menu bar and dropdown are laid out against: the frame area with the
+/// reserved status row excluded.  Both the painter (`render_overlays::paint`) and the
+/// mouse hit-test path (`mouse::route_overlay`) MUST derive dropdown geometry through
+/// this helper — so `avail_below` in `menu_dropdown_rect` evaluates against the same
+/// height in both call sites and the two windows can never drift (Fable whole-branch fix).
+pub(crate) fn menu_area(area: Rect) -> Rect {
+    Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1))
 }
 
 /// Indicator title for a windowed overlay list — `" {n}/{total} "` right-aligned when
@@ -206,6 +231,105 @@ pub(crate) fn palette_row_at(area: Rect, palette: &crate::palette::Palette, col:
     } else {
         None
     }
+}
+
+/// Return the absolute list-row index that `(col, row)` hits in the theme picker,
+/// or `None` when the click is outside the list interior. Mirrors `palette_row_at`.
+pub(crate) fn theme_picker_row_at(area: Rect, tp: &crate::theme_picker::ThemePicker, col: u16, row: u16) -> Option<usize> {
+    let r = palette_overlay_rect(area, tp.rows.len());
+    let list_top = r.y.saturating_add(2);
+    let list_h = crate::list_window::list_h_for(tp.rows.len(), area.height) as u16;
+    if col >= r.x.saturating_add(1) && col < r.x.saturating_add(r.width).saturating_sub(1)
+        && row >= list_top && row < list_top.saturating_add(list_h) {
+        Some((row - list_top) as usize + tp.scroll_top)
+    } else { None }
+}
+
+/// Return the absolute list-row index that `(col, row)` hits in the file browser,
+/// or `None` when the click is outside the list interior. Mirrors `palette_row_at`.
+pub(crate) fn file_browser_row_at(area: Rect, fb: &crate::file_browser::FileBrowser, col: u16, row: u16) -> Option<usize> {
+    let r = palette_overlay_rect(area, fb.entries.len());
+    let list_top = r.y.saturating_add(2);
+    let list_h = crate::list_window::list_h_for(fb.entries.len(), area.height) as u16;
+    if col >= r.x.saturating_add(1) && col < r.x.saturating_add(r.width).saturating_sub(1)
+        && row >= list_top && row < list_top.saturating_add(list_h) {
+        Some((row - list_top) as usize + fb.scroll_top)
+    } else { None }
+}
+
+/// Return the absolute list-row index that `(col, row)` hits in the outline overlay,
+/// or `None` when the click is outside the list interior. Mirrors `palette_row_at`.
+pub(crate) fn outline_row_at(area: Rect, outline: &crate::outline_overlay::OutlineOverlay, col: u16, row: u16) -> Option<usize> {
+    let r = palette_overlay_rect(area, outline.rows.len());
+    let list_top = r.y.saturating_add(2);
+    let list_h = crate::list_window::list_h_for(outline.rows.len(), area.height) as u16;
+    if col >= r.x.saturating_add(1) && col < r.x.saturating_add(r.width).saturating_sub(1)
+        && row >= list_top && row < list_top.saturating_add(list_h) {
+        Some((row - list_top) as usize + outline.scroll_top)
+    } else { None }
+}
+
+/// Return the absolute list-row index that `(col, row)` hits in the diagnostic
+/// quick-fix overlay, or `None` when the click is outside the list interior.
+/// Mirrors `palette_row_at` — note the list starts at `ov_y + 1` (no query row).
+pub(crate) fn diag_row_at(area: Rect, diag: &crate::diag_overlay::DiagOverlay, col: u16, row: u16) -> Option<usize> {
+    let row_count = diag.row_count();
+    let r = palette_overlay_rect(area, row_count);
+    let list_top = r.y.saturating_add(1);
+    let list_h = crate::list_window::list_h_for(row_count, area.height) as u16;
+    if col >= r.x.saturating_add(1) && col < r.x.saturating_add(r.width).saturating_sub(1)
+        && row >= list_top && row < list_top.saturating_add(list_h) {
+        Some((row - list_top) as usize + diag.scroll_top)
+    } else { None }
+}
+
+/// Map a click on the status row to a prompt choice.
+///
+/// Column-based, case-insensitive, marker-to-next-marker span model:
+/// — chars are iterated and each is counted as 1 display column (width-1 assumption;
+///   prompt messages are ASCII-mostly — `·` U+00B7 is 1 terminal column, matching
+///   the assumption; `unicode-width` is not a direct dependency of this crate);
+/// — each choice's `[K]` marker is found case-insensitively (`[k]` and `[K]` both
+///   match), so prompts like `transform_chooser` with lowercase markers are clickable;
+/// — the clickable span for choice i runs from its marker's start column to the start
+///   column of the NEXT choice's marker (or end-of-message), making the hit-test
+///   separator-agnostic: `·`, double-space, or any separator all work uniformly;
+/// — returns `None` when the row is not the status row, or the click falls before the
+///   first marker.
+pub(crate) fn prompt_choice_at(area: Rect, prompt: &crate::prompt::Prompt, col: u16, row: u16)
+    -> Option<crate::prompt::PromptAction> {
+    if row != area.y + area.height.saturating_sub(1) { return None; } // status row only
+    let rel = col.saturating_sub(area.x) as usize;
+    let msg = &prompt.message;
+
+    // Collect chars once — char index == column offset (width-1 assumption).
+    let chars: Vec<char> = msg.chars().collect();
+
+    // Build (start_col, action) for each choice by sliding a 3-char window.
+    let mut spans: Vec<(usize, crate::prompt::PromptAction)> = Vec::new();
+    for choice in &prompt.choices {
+        let key_lc = choice.key.to_ascii_lowercase();
+        let key_uc = choice.key.to_ascii_uppercase();
+        for (col_idx, window) in chars.windows(3).enumerate() {
+            if window[0] == '[' && (window[1] == key_lc || window[1] == key_uc) && window[2] == ']' {
+                spans.push((col_idx, choice.action));
+                break;
+            }
+        }
+    }
+
+    // Sort by column so spans are in message order.
+    spans.sort_by_key(|s| s.0);
+
+    // Span i runs from its start column to the next span's start column (or message end).
+    for (i, &(start, action)) in spans.iter().enumerate() {
+        let end = spans.get(i + 1).map(|s| s.0).unwrap_or(usize::MAX);
+        if rel >= start && rel < end {
+            return Some(action);
+        }
+    }
+
+    None
 }
 
 /// Assemble the left-hand portion of the normal status line (no overlay active).
@@ -766,14 +890,26 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 cs.ov_accent,
             )
         } else {
-            (status_left_text(editor), cs.menu_closed)  // normal state: [Chrome] panel bg
+            // Normal state. Under zen/Auto idle with no message, the reserved row renders
+            // as calm canvas (base bg); visible reveal via On / dwell / message force.
+            if crate::app::status_line_visible(editor) {
+                (status_left_text(editor), cs.menu_closed) // visible: [Chrome] panel bg
+            } else {
+                // Calm canvas: the same bg-only fill the edit band uses — NOT chrome.
+                let mut calm = compose::base_canvas(&editor.theme, editor.depth);
+                calm.fg = None;
+                (String::new(), calm)
+            }
         };
 
         // Compose the status line.
         // When in the normal branch (no prompt/minibuffer/search) and word_count is on,
         // flush the count segment to the right and truncate the left (path/mode) to fit.
+        // When the status row is calm-hidden (Auto idle, no message), suppress the word-count
+        // segment so Ln/Col · words does not paint over the calm canvas row.
         let has_overlay = editor.search.is_some() || editor.minibuffer.is_some() || editor.prompt.is_some() || editor.diag.is_some() || editor.outline.is_some();
-        let composed = if !has_overlay {
+        let status_hidden = !has_overlay && !crate::app::status_line_visible(editor);
+        let composed = if !has_overlay && !status_hidden {
             if let Some(wc) = word_count_segment(editor) {
                 let caret = crate::nav::head(editor);
                 let (l, c) = editor.active().document.buffer.caret_line_col(caret);
@@ -1390,6 +1526,7 @@ mod tests {
         // D2: normal status uses [Chrome] — terminal-plain Chrome = White fg / Black bg
         // (not REVERSED). The status row must carry the Chrome bg, not a reverse modifier.
         let mut ed = Editor::new_from_text("x", None, (40, 4));
+        ed.status_line_mode = crate::config::TransientMode::On; // test chrome face, not calm mode
         let buf = render_to_buffer(&mut ed, 40, 4);
         let last = 3u16;
         // terminal-plain Chrome: fg=White, bg=Black — explicit color, not reverse.
@@ -1400,6 +1537,7 @@ mod tests {
     #[test]
     fn marked_block_paints_and_status_shows_blk() {
         let mut e = Editor::new_from_text("hello world\n", None, (60, 6));
+        e.status_line_mode = crate::config::TransientMode::On; // test chrome status content, not calm mode
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false });
         crate::derive::rebuild(&mut e);
         let buf = render_to_buffer(&mut e, 60, 6);
@@ -1412,6 +1550,7 @@ mod tests {
     #[test]
     fn hidden_block_status_reads_blk_hidden_and_not_painted() {
         let mut e = Editor::new_from_text("hello\n", None, (60, 6));
+        e.status_line_mode = crate::config::TransientMode::On; // test chrome status content, not calm mode
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: true });
         crate::derive::rebuild(&mut e);
         let buf = render_to_buffer(&mut e, 60, 6);
@@ -1426,6 +1565,7 @@ mod tests {
         // After derive_chrome, Chrome.bg is an Rgb step toward black preserving the hue.
         use wordcartel_core::theme::ChromeDisposition;
         let mut ed = Editor::new_from_text("x", None, (40, 4));
+        ed.status_line_mode = crate::config::TransientMode::On; // test chrome face, not calm mode
         let mut theme = wordcartel_core::theme::Theme::builtin("phosphor-amber").unwrap();
         theme.derive_chrome(ChromeDisposition::Full);
         ed.theme = theme;
@@ -1450,6 +1590,7 @@ mod tests {
         let mut ed = Editor::new_from_text("x", None, (40, 6));
         // Enable pinned menu bar so row 0 carries the menu Chrome bg.
         ed.menu_bar_mode = crate::config::MenuBarMode::Pinned;
+        ed.status_line_mode = crate::config::TransientMode::On; // test chrome parity, not calm mode
         let mut theme = wordcartel_core::theme::tokyo_night();
         theme.derive_chrome(ChromeDisposition::Full);
         ed.theme = theme;
@@ -1476,6 +1617,7 @@ mod tests {
     #[test]
     fn prompt_active_status_uses_accent() {
         let mut ed = Editor::new_from_text("x", None, (40, 4));
+        ed.status_line_mode = crate::config::TransientMode::On; // test chrome face, not calm mode
 
         // Normal state: status carries Chrome face (bg=Black under terminal-plain).
         let buf_normal = render_to_buffer(&mut ed, 40, 4);
@@ -2436,6 +2578,7 @@ mod tests {
         use wordcartel_core::theme::{Theme, Depth, CanvasMode, ChromeDisposition};
         let mut ed = Editor::new_from_text("hi\n", None, (40, 6));
         ed.menu_bar_mode = crate::config::MenuBarMode::Pinned;
+        ed.status_line_mode = crate::config::TransientMode::On; // test chrome paint, not calm mode
         let mut theme = Theme::builtin("flexoki-dark").unwrap();
         theme.derive_chrome(ChromeDisposition::Full);
         ed.theme = theme;
@@ -2611,6 +2754,7 @@ mod tests {
         // "hello\nworld\n": byte 8 = 'r' in "world" → line 2, col 3 ("wo|rld")
         // Line 2 starts at byte 6; bytes 6='w', 7='o' → 2 graphemes before caret → col 3
         let mut e = Editor::new_from_text("hello\nworld\n", None, (60, 6));
+        e.status_line_mode = crate::config::TransientMode::On; // test Ln/Col content, not calm mode
         e.view_opts.word_count = true;
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(8);
         crate::derive::rebuild(&mut e);
@@ -2636,6 +2780,7 @@ mod tests {
         // before caret → col 4.  Ln,Col must be identical in LivePreview and SourcePlain.
         let mk = |mode| {
             let mut e = Editor::new_from_text("# Heading\n\n**bold** text\n", None, (60, 8));
+            e.status_line_mode = crate::config::TransientMode::On; // test Ln/Col content, not calm mode
             e.view_opts.word_count = true;
             e.active_mut().view.mode = mode;
             e.active_mut().document.selection = wordcartel_core::selection::Selection::single(14);
@@ -2816,7 +2961,7 @@ mod tests {
         let mut e = Editor::new_from_text("body\n", None, (40, 8));
         let reg = crate::registry::Registry::builtins();
         let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
-        e.menu = Some(crate::menu::build(&reg, &km));
+        e.menu = Some(crate::menu::build(&reg, &km, &e));
         derive::rebuild(&mut e);
         let mut term = Terminal::new(TestBackend::new(40, 8)).unwrap();
         term.draw(|f| render(f, &mut e)).unwrap();
@@ -2876,5 +3021,283 @@ mod tests {
                 (0..40u16).map(|x| buf[(x, 0u16)].style().fg).collect::<Vec<_>>(),
             );
         }
+    }
+
+    // Task 4 — status-line Auto-mode calm / visible render
+
+    /// Under Auto mode with no message and no dwell-reveal, the bottom row must be
+    /// blank (calm canvas — NOT the info-line text). Under On mode the info line shows.
+    #[test]
+    fn auto_idle_hides_status_line_on_mode_paints_it() {
+        use crate::config::TransientMode;
+
+        // Auto + no message + not revealed → bottom row must be blank / calm.
+        {
+            let mut ed = Editor::new_from_text("hello\n", None, (40, 6));
+            ed.status_line_mode = TransientMode::Auto;
+            ed.mouse.status_revealed = false;
+            ed.status.clear();
+            derive::rebuild(&mut ed);
+            let buf = render_to_buffer(&mut ed, 40, 6);
+            let bottom = row_string(&buf, 5);
+            assert!(
+                bottom.trim().is_empty(),
+                "Auto idle: bottom row must be calm/blank, got: {:?}",
+                bottom
+            );
+        }
+
+        // On mode → bottom row must show the info line (non-empty, contains buffer name
+        // or mode indicator).
+        {
+            let mut ed = Editor::new_from_text("hello\n", None, (40, 6));
+            ed.status_line_mode = TransientMode::On;
+            ed.mouse.status_revealed = false;
+            ed.status.clear();
+            derive::rebuild(&mut ed);
+            let buf = render_to_buffer(&mut ed, 40, 6);
+            let bottom = row_string(&buf, 5);
+            assert!(
+                !bottom.trim().is_empty(),
+                "On mode: bottom row must show info line (non-empty), got: {:?}",
+                bottom
+            );
+        }
+    }
+
+    /// T8 (two-archetype styling): the dropdown rect is filled with the Muted panel bg all
+    /// the way to its bottom row — no unfilled gap cells.  The fill is applied via an explicit
+    /// `set_style(drop_rect, cs.menu_norm)` after Clear and before the per-item List render so
+    /// that the entire rect reads as one elevated surface regardless of item-row coverage.
+    ///
+    /// SCOPE NOTE — this is a FORWARD regression pin, not a present-day failure detector.
+    /// Today `menu_dropdown_rect` height == `leaves.len()`, so every row (incl. `drop_bottom`)
+    /// is an item row that ratatui's `List` already styles with `cs.menu_norm` — the explicit
+    /// fill is idempotent and this assertion passes with or without it.  When Task 14 extends
+    /// the dropdown height (windowing + the `n/total` indicator row), `drop_bottom` becomes a
+    /// NON-item row and the explicit fill is its only source of panel bg — Task 14 MUST add a
+    /// test that probes that non-item row directly (this test does not cover it).
+    #[test]
+    fn dropdown_fills_whole_rect_with_muted_panel_bg() {
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        // Terminal is 80 wide × 24 tall; the menu bar occupies row 0 and the dropdown
+        // starts at row 1 — wide enough to fit all category labels.
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        let menu = crate::menu::build(&reg, &km, &e);
+        e.menu = Some(menu);
+        derive::rebuild(&mut e);
+
+        // Derive the expected panel bg from the same ChromeStyles path that paint() uses.
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        let panel_bg = cs.menu_norm.bg;
+
+        // Compute drop_rect before rendering so we can look up coordinates.
+        // mirror render_overlays::paint: menu_area = full area minus the bottom status row.
+        let area  = Rect::new(0, 0, 80, 24);
+        let h     = area.height;
+        let menu_area = Rect::new(area.x, area.y, area.width, h.saturating_sub(1));
+        let open  = e.menu.as_ref().unwrap().open;
+        let groups = e.menu.as_ref().unwrap().groups.clone();
+        let drop_rect = menu_dropdown_rect(menu_area, &groups, open)
+            .expect("builtins menu must have at least one non-empty group");
+
+        // x of the leftmost column; y of the very last row of the dropdown rect.
+        let drop_x      = drop_rect.x;
+        let drop_bottom = drop_rect.y + drop_rect.height - 1;
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(f, &mut e)).unwrap();
+        let buf = term.backend().buffer();
+
+        let bg_at = |x: u16, y: u16| buf[(x, y)].style().bg;
+        assert_eq!(bg_at(drop_x, drop_bottom), panel_bg,
+            "dropdown paints a filled panel to its bottom row (no unfilled gap)");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 14: dropdown windowing + indicator
+    // -----------------------------------------------------------------------
+
+    /// Build a synthetic groups list: one category (Edit) with `n` leaves.
+    #[cfg(test)]
+    fn tall_menu_groups(n: usize)
+        -> Vec<(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)>
+    {
+        let leaves: Vec<(String, crate::registry::CommandId)> = (0..n)
+            .map(|i| (format!("item{i}"), crate::registry::CommandId("move_right")))
+            .collect();
+        vec![(crate::registry::MenuCategory::Edit, leaves)]
+    }
+
+    /// T14-a: dropdown height is `leaves.min(15).min(avail_below)`, NOT the raw leaf count.
+    /// avail_below = area.height - 1 (rows under the bar, no border/query chrome).
+    #[test]
+    fn menu_dropdown_windows_a_tall_category() {
+        let area = Rect::new(0, 0, 80, 8);       // avail_below = height - 1 = 7
+        let groups = tall_menu_groups(20);       // helper: a category with 20 leaves
+        let rect = menu_dropdown_rect(area, &groups, 0).expect("dropdown rect");
+        let avail_below = (area.height - 1) as usize;
+        let n_leaves: usize = 20;
+        let expected = n_leaves.min(15).min(avail_below); // = 7 here (NOT list_h_for's h-4 = 4)
+        assert_eq!(rect.height as usize, expected,
+            "dropdown height = leaves.min(15).min(avail_below), not the raw leaf count (20)");
+    }
+
+    /// T14-b carry-forward from Task 8: when the dropdown OVERFLOWS the window, the
+    /// indicator/pad row at drop_bottom is a non-item row — the explicit `set_style`
+    /// fill is its ONLY source of panel bg.  This test probes that row after a render.
+    #[test]
+    fn dropdown_indicator_row_carries_panel_bg() {
+        let reg = crate::registry::Registry::builtins();
+        let (_km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        // Short terminal (h=8) so avail_below=7; categories with many items overflow the window.
+        let mut e = Editor::new_from_text("x\n", None, (80, 8));
+        // Build menu with a synthetic tall category so the dropdown overflows the 7-row window.
+        let leaves: Vec<(String, crate::registry::CommandId)> = (0..20)
+            .map(|i| (format!("item{i:02}       "), crate::registry::CommandId("move_right")))
+            .collect();
+        e.menu = Some(crate::menu::MenuView {
+            groups: vec![(crate::registry::MenuCategory::Edit, leaves)],
+            open: 0, highlighted: 0, built: true, scroll_top: 0,
+        });
+        derive::rebuild(&mut e);
+
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        let panel_bg = cs.menu_norm.bg;
+
+        let area      = Rect::new(0, 0, 80, 8);
+        let h         = area.height;
+        let menu_area = Rect::new(area.x, area.y, area.width, h.saturating_sub(1));
+        let groups    = e.menu.as_ref().unwrap().groups.clone();
+        let open      = e.menu.as_ref().unwrap().open;
+        let drop_rect = menu_dropdown_rect(menu_area, &groups, open)
+            .expect("tall category must produce a dropdown rect");
+        let drop_x      = drop_rect.x;
+        let drop_bottom = drop_rect.y + drop_rect.height - 1;
+
+        let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        term.draw(|f| render(f, &mut e)).unwrap();
+        let buf = term.backend().buffer();
+
+        let bg_at = |x: u16, y: u16| buf[(x, y)].style().bg;
+        assert_eq!(bg_at(drop_x, drop_bottom), panel_bg,
+            "indicator/pad row at drop_bottom must carry panel bg — only source is the explicit fill");
+    }
+
+    /// T14-c (C1 regression): the highlighted item must ALWAYS be within the rendered
+    /// item rows — never hidden behind the n/total indicator row.
+    ///
+    /// Geometry: 80×8 terminal, 20-leaf category.  drop_rect.height = min(20,15,7) = 7.
+    /// item_rows = 6 (one row reserved for the indicator).  The bug: keep_visible was
+    /// called with list_h=7, so highlighted=6 satisfied the invariant yet mapped to the
+    /// indicator row (only items 0-5 were painted).  The fix: keep_visible is called with
+    /// keep_h=6 — the paint then adjusts scroll_top so highlighted ∈ [scroll_top,
+    /// scroll_top+6), which is always within the rendered item rows.
+    #[test]
+    fn dropdown_highlight_never_hidden_in_overflow() {
+        // 80×8 terminal: avail_below = 7, drop_rect.height = 7, item_rows = 6.
+        let mut e = Editor::new_from_text("x\n", None, (80, 8));
+        let leaves: Vec<(String, crate::registry::CommandId)> = (0..20)
+            .map(|i| (format!("item{i:02}"), crate::registry::CommandId("move_right")))
+            .collect();
+        // Place the highlight at the position that was hidden under the old code:
+        // highlighted=6, scroll_top=0.  With list_h=7 (old) keep_visible accepts this
+        // (6 < 0+7), but item_rows=6 means only rows 0-5 are painted — row 6 is the
+        // indicator.  With keep_h=6 (fix) keep_visible adjusts scroll_top to 1,
+        // putting highlighted at visual row 5 — within item_rows.
+        e.menu = Some(crate::menu::MenuView {
+            groups: vec![(crate::registry::MenuCategory::Edit, leaves)],
+            open: 0, highlighted: 6, built: true, scroll_top: 0,
+        });
+        derive::rebuild(&mut e);
+
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+
+        let area      = Rect::new(0, 0, 80, 8);
+        let menu_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+        let groups    = e.menu.as_ref().unwrap().groups.clone();
+        let open      = e.menu.as_ref().unwrap().open;
+        let drop_rect = menu_dropdown_rect(menu_area, &groups, open)
+            .expect("tall category must produce a dropdown rect");
+        let list_h    = drop_rect.height as usize;         // = 7
+        let item_rows = list_h.saturating_sub(1);          // = 6
+
+        let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        term.draw(|f| render(f, &mut e)).unwrap();
+
+        // After render, keep_visible has been applied — read back the updated window state.
+        let m          = e.menu.as_ref().unwrap();
+        let scroll_top = m.scroll_top;
+        let highlighted = m.highlighted;
+
+        // Arithmetic invariant: the highlight must be within the item rows, not hidden.
+        assert!(
+            highlighted - scroll_top < item_rows,
+            "highlight must be in item rows: highlighted={highlighted}, scroll_top={scroll_top}, item_rows={item_rows} — highlighted-scroll_top={} must be < {item_rows}",
+            highlighted - scroll_top,
+        );
+
+        // Visual invariant: the rendered row at the highlight position must carry
+        // menu_sel style, and the indicator row must NOT carry menu_sel.
+        let visual_row    = (highlighted - scroll_top) as u16;
+        let sel_y         = drop_rect.y + visual_row;
+        let indicator_y   = drop_rect.y + drop_rect.height - 1;
+        let buf           = term.backend().buffer();
+        let fg_at         = |x: u16, y: u16| buf[(x, y)].style().fg;
+        let sel_fg        = cs.menu_sel.fg;
+        let norm_fg       = cs.menu_norm.fg;
+        let col           = drop_rect.x + 1; // first text column inside the item
+        assert_eq!(fg_at(col, sel_y), sel_fg,
+            "rendered item at visual row {visual_row} (y={sel_y}) must carry menu_sel fg");
+        assert_ne!(fg_at(col, indicator_y), sel_fg,
+            "indicator row (y={indicator_y}) must not carry menu_sel fg — it should be norm ({norm_fg:?})");
+    }
+
+    /// T14-d: clicking the reserved indicator row of an overflowing dropdown must return
+    /// `None` — not the index of a hidden off-screen item the user cannot see.
+    ///
+    /// Geometry: 80×8 terminal, 20-leaf category.  avail_below = 7, drop_rect.height = 7,
+    /// item_rows = 6.  The bottom row (drop_rect.y + 6) is the indicator row.  Under the
+    /// old code `menu_dropdown_row_at` returned `Some(scroll_top + 6)` — dispatching the
+    /// 7th item (index 6) which is hidden behind the indicator.  After the fix it returns
+    /// `None`, so the click-outside arm closes the menu instead.
+    #[test]
+    fn dropdown_indicator_row_hit_test_returns_none() {
+        // 80×8 terminal: avail_below=7, drop_rect.height=7, item_rows=6.
+        let area      = Rect::new(0, 0, 80, 8);
+        let menu_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+        let groups    = tall_menu_groups(20);
+
+        let drop_rect = menu_dropdown_rect(menu_area, &groups, 0)
+            .expect("tall category must produce a dropdown rect");
+        // list_h=7, item_rows=6 — the indicator row is at the bottom of drop_rect.
+        let list_h   = drop_rect.height as usize;
+        let item_rows = list_h.saturating_sub(1); // = 6
+        let indicator_row = drop_rect.y + drop_rect.height - 1;
+        let col = drop_rect.x;    // any column within the dropdown
+        let scroll_top = 0usize;
+
+        // A click on the indicator row must return None — no hidden command dispatched.
+        assert_eq!(
+            menu_dropdown_row_at(menu_area, &groups, 0, scroll_top, col, indicator_row),
+            None,
+            "indicator row click must return None (the reserved row is not a visible item)",
+        );
+
+        // A click on the last real item row must return the correct absolute index.
+        let last_item_row = drop_rect.y + (item_rows as u16 - 1);
+        assert_eq!(
+            menu_dropdown_row_at(menu_area, &groups, 0, scroll_top, col, last_item_row),
+            Some(scroll_top + item_rows - 1),
+            "last real item row must return the correct absolute index",
+        );
+
+        // A click on the first item row must also work correctly.
+        assert_eq!(
+            menu_dropdown_row_at(menu_area, &groups, 0, scroll_top, col, drop_rect.y),
+            Some(scroll_top),
+            "first item row must return scroll_top",
+        );
     }
 }

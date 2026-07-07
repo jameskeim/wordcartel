@@ -79,6 +79,16 @@ pub enum FocusGranularity { Paragraph, Sentence }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuBarMode { Hidden, Auto, Pinned }
 
+/// Reveal policy for a transient chrome element (status line, scrollbar; the menu
+/// bar keeps its own `MenuBarMode` mapped onto this). `Off` = never shown, `On` =
+/// always shown, `Auto` = revealed on pointer dwell near the element plus a
+/// context trigger (scroll activity / a status message), hidden after a leave grace.
+///
+/// The status line has no true `Off`: a message force-reveals it even under `Auto`
+/// (no-silent-UI). Only the scrollbar uses `Off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransientMode { Off, Auto, On }
+
 /// Menu bar configuration section.
 #[derive(Debug, Clone)]
 pub struct MenuConfig { pub bar: MenuBarMode }
@@ -96,12 +106,17 @@ pub struct ViewConfig {
     pub wrap_column: u16,
     pub wrap_guide: bool,
     pub word_count: bool,
+    pub scrollbar: TransientMode,
+    pub status_line: TransientMode,
 }
 impl Default for ViewConfig {
     fn default() -> Self {
         ViewConfig { typewriter: false, typewriter_anchor: 0.5, focus: false,
             focus_granularity: FocusGranularity::Paragraph, measure: false,
-            wrap_column: 72, wrap_guide: false, word_count: false }
+            wrap_column: 72, wrap_guide: false, word_count: false,
+            // status_line defaults On (idle info line always shown out of the box —
+            // preserves the pre-density behavior); Zen (chrome = zen) flips it to Auto.
+            scrollbar: TransientMode::Auto, status_line: TransientMode::On }
     }
 }
 
@@ -275,6 +290,8 @@ struct RawView {
     wrap_column: Option<u16>,
     wrap_guide: Option<bool>,
     word_count: Option<bool>,
+    scrollbar: Option<String>,
+    status_line: Option<String>,
 }
 
 /// Ordered existing config files, lowest→highest precedence. Empty when --no-config.
@@ -382,6 +399,24 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
                 other => warns.push(format!("view.focus_granularity \"{other}\" invalid; using paragraph")),
             }
         }
+        if let Some(s) = raw.view.scrollbar {
+            match s.as_str() {
+                "off"  => cfg.view.scrollbar = TransientMode::Off,
+                "auto" => cfg.view.scrollbar = TransientMode::Auto,
+                "on"   => cfg.view.scrollbar = TransientMode::On,
+                other => warns.push(format!("view.scrollbar \"{other}\" invalid; using auto")),
+            }
+        }
+        if let Some(s) = raw.view.status_line {
+            match s.as_str() {
+                // No true Off: reject "off" (coerce to Auto) so a message can always paint.
+                "off"  => { cfg.view.status_line = TransientMode::Auto;
+                            warns.push("view.status_line \"off\" not allowed (no-silent-UI); using auto".to_string()); }
+                "auto" => cfg.view.status_line = TransientMode::Auto,
+                "on"   => cfg.view.status_line = TransientMode::On,
+                other => warns.push(format!("view.status_line \"{other}\" invalid; using auto")),
+            }
+        }
         // menu: per-field override; enum-valued string with a warning on unknowns.
         if let Some(b) = raw.menu.bar {
             match b.as_str() {
@@ -455,6 +490,11 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
         for (k, v) in rt.styles { cfg.theme.styles.insert(k, v); } // accumulate across layers
     }
     (cfg, warns)
+}
+
+/// "off"/"auto"/"on" — round-trips `TransientMode` for the overrides mirror.
+pub fn transient_mode_str(m: TransientMode) -> &'static str {
+    match m { TransientMode::Off => "off", TransientMode::Auto => "auto", TransientMode::On => "on" }
 }
 
 #[cfg(test)]
@@ -816,6 +856,31 @@ mod tests {
     }
 
     #[test]
+    fn view_transient_keys_parse_and_status_off_coerces() {
+        // scrollbar accepts off/auto/on verbatim.
+        let d1 = tempdir();
+        let p = write(&d1, "c.toml", "[view]\nscrollbar = \"on\"\nstatus_line = \"auto\"\n");
+        let (cfg, warns) = load(&[p]);
+        assert_eq!(cfg.view.scrollbar, TransientMode::On);
+        assert_eq!(cfg.view.status_line, TransientMode::Auto);
+        assert!(warns.is_empty());
+        // status_line = "off" is rejected → coerced to Auto, with a warning (no-silent-UI).
+        let d2 = tempdir();
+        let p2 = write(&d2, "c.toml", "[view]\nstatus_line = \"off\"\n");
+        let (cfg2, warns2) = load(&[p2]);
+        assert_eq!(cfg2.view.status_line, TransientMode::Auto,
+            "status_line off must coerce to auto to preserve no-silent-UI");
+        assert!(warns2.iter().any(|w| w.contains("status_line")),
+            "coercion must warn, got {warns2:?}");
+        // bogus value → default + warning.
+        let d3 = tempdir();
+        let p3 = write(&d3, "c.toml", "[view]\nscrollbar = \"bogus\"\n");
+        let (cfg3, warns3) = load(&[p3]);
+        assert_eq!(cfg3.view.scrollbar, TransientMode::Auto, "bogus → default auto");
+        assert!(warns3.iter().any(|w| w.contains("scrollbar")));
+    }
+
+    #[test]
     fn save_reload_roundtrip_restores_settings() {
         // Unit-level pin of the full pipeline without run():
         // 1. Build a runtime snapshot with three divergences from the default baseline.
@@ -853,6 +918,8 @@ mod tests {
             view_wrap_guide: false,
             view_word_count: false,
             view_wrap_column: 100,
+            view_scrollbar:  crate::config::TransientMode::Auto,
+            view_status_line: crate::config::TransientMode::On,
             menu_bar:        crate::config::MenuBarMode::Pinned,
             mouse_capture:   false,
             chrome_disposition: wordcartel_core::theme::ChromeDisposition::Zen,

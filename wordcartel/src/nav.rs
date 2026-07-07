@@ -1615,7 +1615,7 @@ mod tests {
         let mut e = crate::editor::Editor::new_from_text(&"line\n".repeat(20), None, (20, 10));
         let reg = crate::registry::Registry::builtins();
         let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
-        e.menu = Some(crate::menu::build(&reg, &km));
+        e.menu = Some(crate::menu::build(&reg, &km, &e));
         let end = e.active().document.buffer.len();
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(end);
         crate::derive::rebuild(&mut e);
@@ -1632,7 +1632,7 @@ mod tests {
         let mut e = crate::editor::Editor::new_from_text(&"line\n".repeat(30), None, (20, 10));
         let reg = crate::registry::Registry::builtins();
         let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
-        e.menu = Some(crate::menu::build(&reg, &km));
+        e.menu = Some(crate::menu::build(&reg, &km, &e));
         crate::derive::rebuild(&mut e);
         let off = move_page_down(&mut e);
         let line = e.active().document.buffer.byte_to_line(off); // the local idiom (nav.rs:1369) —

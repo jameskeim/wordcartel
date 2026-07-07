@@ -132,10 +132,10 @@ pub(crate) fn hydrate_overlays(editor: &mut Editor, reg: &crate::registry::Regis
             crate::palette::rebuild_rows(p, reg, keymap);
         }
     }
-    if let Some(v) = editor.menu.as_ref().filter(|v| !v.built) {
-        let want_open = v.open;
-        let want_hl = v.highlighted;
-        let mut built = crate::menu::build(reg, keymap);
+    if editor.menu.as_ref().is_some_and(|v| !v.built) {
+        // Extract open/highlighted before borrowing editor for build — avoids borrow conflict.
+        let (want_open, want_hl) = { let v = editor.menu.as_ref().unwrap(); (v.open, v.highlighted) };
+        let mut built = crate::menu::build(reg, keymap, editor);
         // The placeholder's `open` indexes MENU_ORDER; map it to the built groups'
         // position for that category (robust even if a category has no commands).
         if let Some(cat) = crate::registry::MENU_ORDER.get(want_open) {
@@ -273,6 +273,56 @@ pub(crate) fn preview_selected_theme(editor: &mut crate::editor::Editor) {
     }
 }
 
+/// Commit the theme picker — the shared commit path for the keyboard Enter arm
+/// and the mouse click-to-commit arm. Closes the picker and, when a theme was
+/// previewed, records its name in `theme_identity`.
+pub(crate) fn commit_theme_picker(editor: &mut crate::editor::Editor) {
+    if let Some(tp) = editor.theme_picker.take() {
+        if let Some(n) = tp.previewed {
+            editor.theme_identity = crate::settings::ThemeIdentity::Builtin(n);
+        } // untouched open→commit: no preview applied, identity unchanged (spec I-1)
+    }
+}
+
+/// Execute the selected file-browser entry — the shared Enter path for the keyboard
+/// Enter arm and the mouse click-to-commit arm. Descends into a directory (incl. ".."),
+/// guarding against unreadable targets, or opens a file through the dirty-guard path.
+pub(crate) fn file_browser_enter(editor: &mut crate::editor::Editor) {
+    let chosen = editor.file_browser.as_ref().and_then(|fb| {
+        fb.entries.get(fb.selected).map(|e| (e.name.clone(), e.is_dir))
+    });
+    if let Some((name, is_dir)) = chosen {
+        if is_dir {
+            let target = editor.file_browser.as_ref().map(|fb| {
+                if name == ".." {
+                    fb.dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| fb.dir.clone())
+                } else {
+                    fb.dir.join(&name)
+                }
+            });
+            if let Some(target) = target {
+                // §3: check readability BEFORE committing fb.dir.
+                if std::fs::read_dir(&target).is_ok() {
+                    if let Some(fb) = editor.file_browser.as_mut() {
+                        fb.dir = target;
+                        fb.query.clear();
+                        fb.selected = 0;
+                        fb.scroll_top = 0; // A6: reset with selected to avoid out-of-order slice
+                        crate::file_browser::rebuild_entries(fb);
+                    }
+                } else {
+                    editor.status = format!("cannot read directory: {}", target.display());
+                    // stay in prior dir — do NOT mutate fb.dir
+                }
+            }
+        } else {
+            let path = editor.file_browser.as_ref().unwrap().dir.join(&name);
+            editor.file_browser = None;
+            crate::workspace::open_as_new_buffer(editor, &path);
+        }
+    }
+}
+
 pub fn outline_jump_to(editor: &mut Editor, byte: usize) {
     let origin = editor.active().document.selection.primary().head;
     crate::marks::record_jump(editor.active_mut(), origin);
@@ -353,12 +403,35 @@ pub fn reduce(
                     if let Some(menu) = editor.menu.as_mut() {   // borrow scoped to this block
                         let ncat = menu.groups.len();
                         match k.code {
-                            KeyCode::Left if ncat > 0 => { menu.open = (menu.open + ncat - 1) % ncat; menu.highlighted = 0; }
-                            KeyCode::Right if ncat > 0 => { menu.open = (menu.open + 1) % ncat; menu.highlighted = 0; }
-                            KeyCode::Up if ncat > 0 => { menu.highlighted = menu.highlighted.saturating_sub(1); }
+                            KeyCode::Left if ncat > 0 => {
+                                menu.open = (menu.open + ncat - 1) % ncat;
+                                menu.highlighted = 0;
+                                menu.scroll_top = 0; // reset window on category switch
+                            }
+                            KeyCode::Right if ncat > 0 => {
+                                menu.open = (menu.open + 1) % ncat;
+                                menu.highlighted = 0;
+                                menu.scroll_top = 0; // reset window on category switch
+                            }
+                            KeyCode::Up if ncat > 0 => {
+                                menu.highlighted = menu.highlighted.saturating_sub(1);
+                                let n = menu.groups[menu.open].1.len();
+                                // Coarse follow-the-selection layer — the paint re-windows against
+                                // the true item-row budget every frame (list_window two-layer
+                                // invariant), so this estimate need not reserve the indicator row.
+                                let list_h = n.min(15);
+                                crate::list_window::keep_visible(menu.highlighted, n, list_h, &mut menu.scroll_top);
+                            }
                             KeyCode::Down if ncat > 0 => {
                                 let n = menu.groups[menu.open].1.len();
-                                if n > 0 { menu.highlighted = (menu.highlighted + 1).min(n - 1); }
+                                if n > 0 {
+                                    menu.highlighted = (menu.highlighted + 1).min(n - 1);
+                                    // Coarse follow-the-selection layer — the paint re-windows against
+                                    // the true item-row budget every frame (list_window two-layer
+                                    // invariant), so this estimate need not reserve the indicator row.
+                                    let list_h = n.min(15);
+                                    crate::list_window::keep_visible(menu.highlighted, n, list_h, &mut menu.scroll_top);
+                                }
                             }
                             KeyCode::Enter if ncat > 0 => {
                                 if let Some((_, id)) = menu.groups[menu.open].1.get(menu.highlighted) { selected = Some(*id); }
@@ -544,13 +617,7 @@ pub fn reduce(
                         // cancel preview → restore the theme active when we opened.
                         if let Some(tp) = editor.theme_picker.take() { editor.apply_theme(tp.original); }
                     }
-                    KeyCode::Enter => {
-                        if let Some(tp) = editor.theme_picker.take() {
-                            if let Some(n) = tp.previewed {
-                                editor.theme_identity = crate::settings::ThemeIdentity::Builtin(n);
-                            } // untouched open→Enter: no preview applied, identity unchanged (spec I-1)
-                        }
-                    }
+                    KeyCode::Enter => { commit_theme_picker(editor); }
                     KeyCode::Up => {
                         let ah = editor.active().view.area.1;
                         if let Some(tp) = editor.theme_picker.as_mut() {
@@ -656,46 +723,7 @@ pub fn reduce(
                 use crossterm::event::KeyCode;
                 match k.code {
                     KeyCode::Esc => { editor.file_browser = None; }
-                    KeyCode::Enter => {
-                        // Resolve the selected entry: descend into a directory (incl. ".."),
-                        // or open a file through the Task-4 dirty-guard.
-                        let chosen = editor.file_browser.as_ref().and_then(|fb| {
-                            fb.entries.get(fb.selected).map(|e| (e.name.clone(), e.is_dir))
-                        });
-                        if let Some((name, is_dir)) = chosen {
-                            if is_dir {
-                                // Compute the target directory without mutating fb yet.
-                                let target = editor.file_browser.as_ref().map(|fb| {
-                                    if name == ".." {
-                                        fb.dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| fb.dir.clone())
-                                    } else {
-                                        fb.dir.join(&name)
-                                    }
-                                });
-                                if let Some(target) = target {
-                                    // §3: check readability BEFORE committing fb.dir.
-                                    if std::fs::read_dir(&target).is_ok() {
-                                        if let Some(fb) = editor.file_browser.as_mut() {
-                                            fb.dir = target;
-                                            fb.query.clear();
-                                            fb.selected = 0;
-                                            fb.scroll_top = 0; // A6: a stale window over a
-                                            // smaller entry set would make the render slice
-                                            // out-of-order (panic-class) — reset with selected.
-                                            crate::file_browser::rebuild_entries(fb);
-                                        }
-                                    } else {
-                                        editor.status = format!("cannot read directory: {}", target.display());
-                                        // stay in prior dir — do NOT mutate fb.dir
-                                    }
-                                }
-                            } else {
-                                let path = editor.file_browser.as_ref().unwrap().dir.join(&name);
-                                editor.file_browser = None;
-                                crate::workspace::open_as_new_buffer(editor, &path);
-                            }
-                        }
-                    }
+                    KeyCode::Enter => { file_browser_enter(editor); }
                     KeyCode::Up => {
                         let ah = editor.active().view.area.1;
                         if let Some(fb) = editor.file_browser.as_mut() {
@@ -1236,6 +1264,7 @@ impl Clock for SystemClock {
 pub(crate) fn advance(editor: &mut Editor, clock: &dyn Clock) {
     recompute_scrollbar_visible(editor, clock.now_ms());
     recompute_menu_bar(editor, clock.now_ms());
+    recompute_status_line(editor, clock.now_ms());
     // Pre-draw rebuild: ensure the layout cache matches the final (scroll,
     // text_width) before render consumes it.  render has no on-demand fallback
     // (render.rs:132-140), so a stale cache blanks the editing rows.
@@ -1346,6 +1375,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // Seed mouse_capture from config (default true; may be overridden by config layers).
     editor.mouse_capture = cfg.mouse.mouse_capture;
     editor.view_opts = cfg.view.clone();
+    editor.scrollbar_mode = cfg.view.scrollbar;
+    editor.status_line_mode = cfg.view.status_line;
     editor.resume_enabled = cfg.state.resume; // gates open_into_current's resume restore (Effort 7)
     editor.diag_cfg = cfg.diagnostics.clone();
     editor.export_cfg = cfg.export.clone();
@@ -1531,6 +1562,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
 
     recompute_scrollbar_visible(&mut editor, clock.now_ms());
+    recompute_status_line(&mut editor, clock.now_ms());
     // After a potential session-resume the scroll may have changed; re-clamp/re-pin
     // and rebuild the layout cache so the very first frame is always correct.
     // Order: rebuild (reconciles folds + layout) → SnapOut restored caret → ensure_visible.
@@ -1565,6 +1597,9 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         // clears the other side); recompute_menu_bar clears a fired due, so a past
         // deadline cannot persist and spin the loop.
         let menu_deadline = editor.mouse.menu_reveal_due.or(editor.mouse.menu_hide_due);
+        // Scrollbar/status-line dwell deadlines — armed by the right-edge Moved arm.
+        let sb_dwell_deadline = editor.mouse.scrollbar_reveal_due.or(editor.mouse.scrollbar_hide_due);
+        let status_dwell_deadline = editor.mouse.status_reveal_due.or(editor.mouse.status_hide_due);
         // Fix A3: include the diagnostics deadline ONLY when no check is in
         // flight.  When a check is in flight, recheck_due_at may be a past
         // timestamp (armed before the check started), which would drive
@@ -1586,6 +1621,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             sq_deadline,
             sb_deadline,
             menu_deadline,
+            sb_dwell_deadline,
+            status_dwell_deadline,
             diag_deadline,
             reconcile_deadline,
         ]);
@@ -1657,13 +1694,40 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     Ok(exit_reason)
 }
 
-/// Recompute `editor.mouse.scrollbar_visible` from the clock.
+/// Recompute `editor.mouse.scrollbar_visible` from the clock, honoring the mode.
 ///
 /// Must be called at the top of the run loop (with `clock.now_ms()`) so that
-/// the scrollbar fades exactly when `scrollbar_until_ms` expires, driven by
-/// the loop's `deadline` (not an idle Tick).
+/// the scrollbar fades exactly when `scrollbar_until_ms` or a dwell deadline
+/// expires, driven by the loop's `deadline` (not an idle Tick).
+///
+/// **Fire order is load-bearing:** dwell/grace deadlines are fired FIRST so that
+/// a deadline landing exactly on `now_ms` flips `scrollbar_revealed` before we
+/// read it to compute `scrollbar_visible`.
 pub fn recompute_scrollbar_visible(editor: &mut crate::editor::Editor, now_ms: u64) {
-    editor.mouse.scrollbar_visible = now_ms < editor.mouse.scrollbar_until_ms;
+    use crate::config::TransientMode;
+    // Fire the Auto dwell/grace deadlines FIRST (armed by the mouse Moved arm), so a
+    // deadline landing exactly on `now_ms` flips `scrollbar_revealed` BEFORE we read it.
+    if editor.scrollbar_mode == TransientMode::Auto {
+        if editor.mouse.scrollbar_reveal_due.is_some_and(|d| now_ms >= d) {
+            editor.mouse.scrollbar_reveal_due = None;
+            editor.mouse.scrollbar_revealed = true;
+        }
+        if editor.mouse.scrollbar_hide_due.is_some_and(|d| now_ms >= d) {
+            editor.mouse.scrollbar_hide_due = None;
+            editor.mouse.scrollbar_revealed = false;
+        }
+    } else {
+        editor.mouse.scrollbar_reveal_due = None;
+        editor.mouse.scrollbar_hide_due = None;
+        editor.mouse.scrollbar_revealed = false;
+    }
+    editor.mouse.scrollbar_visible = match editor.scrollbar_mode {
+        TransientMode::On  => true,
+        TransientMode::Off => false,
+        // Auto: scroll activity (the existing channel) OR a live right-edge dwell.
+        TransientMode::Auto => now_ms < editor.mouse.scrollbar_until_ms
+            || editor.mouse.scrollbar_revealed,
+    };
 }
 
 /// Fire the auto-mode menu-bar deadlines (armed by the mouse Moved arm). Gated on
@@ -1685,6 +1749,41 @@ pub fn recompute_menu_bar(editor: &mut crate::editor::Editor, now_ms: u64) {
     if editor.mouse.menu_hide_due.is_some_and(|d| now_ms >= d) {
         editor.mouse.menu_hide_due = None;
         editor.mouse.menu_bar_revealed = false;
+    }
+}
+
+/// Whether the NORMAL idle status info line should paint. A message / prompt /
+/// search / minibuffer force it regardless of mode (no-silent-UI) — those are
+/// handled in render.rs before this is consulted; this governs only the idle line.
+pub fn status_line_visible(editor: &crate::editor::Editor) -> bool {
+    use crate::config::TransientMode;
+    match editor.status_line_mode {
+        TransientMode::On  => true,
+        // Off is never assigned to status (coerced to Auto at parse); treat defensively as Auto.
+        TransientMode::Off | TransientMode::Auto =>
+            !editor.status.is_empty()
+                || editor.mouse.status_revealed
+                || editor.prompt.is_some()
+                || editor.search.is_some()
+                || editor.minibuffer.is_some(),
+    }
+}
+
+/// Fire the Auto-mode status dwell/grace deadlines (armed by the mouse Moved arm).
+pub fn recompute_status_line(editor: &mut crate::editor::Editor, now_ms: u64) {
+    use crate::config::TransientMode;
+    if editor.status_line_mode != TransientMode::Auto {
+        editor.mouse.status_reveal_due = None;
+        editor.mouse.status_hide_due = None;
+        return;
+    }
+    if editor.mouse.status_reveal_due.is_some_and(|d| now_ms >= d) {
+        editor.mouse.status_reveal_due = None;
+        editor.mouse.status_revealed = true;
+    }
+    if editor.mouse.status_hide_due.is_some_and(|d| now_ms >= d) {
+        editor.mouse.status_hide_due = None;
+        editor.mouse.status_revealed = false;
     }
 }
 
@@ -3448,6 +3547,33 @@ mod tests {
         assert!(!e.mouse.scrollbar_visible);
     }
 
+    #[test]
+    fn scrollbar_visible_respects_mode() {
+        use crate::config::TransientMode;
+        use crate::app::recompute_scrollbar_visible;
+        let mut e = Editor::new_from_text("x\n", None, (40, 8));
+        // On: always visible regardless of activity/dwell.
+        e.scrollbar_mode = TransientMode::On;
+        recompute_scrollbar_visible(&mut e, 10_000);
+        assert!(e.mouse.scrollbar_visible, "On → always visible");
+        // Off: never visible even with fresh activity.
+        e.scrollbar_mode = TransientMode::Off;
+        e.mouse.scrollbar_until_ms = 20_000;
+        recompute_scrollbar_visible(&mut e, 10_000);
+        assert!(!e.mouse.scrollbar_visible, "Off → never visible");
+        // Auto: visible while activity OR dwell holds; hidden once both lapse.
+        e.scrollbar_mode = TransientMode::Auto;
+        e.mouse.scrollbar_until_ms = 20_000; e.mouse.scrollbar_revealed = false;
+        recompute_scrollbar_visible(&mut e, 10_000);
+        assert!(e.mouse.scrollbar_visible, "Auto + activity → visible");
+        e.mouse.scrollbar_until_ms = 0; e.mouse.scrollbar_revealed = true;
+        recompute_scrollbar_visible(&mut e, 10_000);
+        assert!(e.mouse.scrollbar_visible, "Auto + dwell-revealed → visible");
+        e.mouse.scrollbar_revealed = false;
+        recompute_scrollbar_visible(&mut e, 10_000);
+        assert!(!e.mouse.scrollbar_visible, "Auto + neither → hidden");
+    }
+
     // A1 Task 3 — cases 7 + 8 (app-level: recompute_menu_bar / reconcile)
 
     /// Case 7: recompute fires in Auto; in non-Auto it clears without firing.
@@ -5162,6 +5288,28 @@ mod tests {
         // §II.5 pin: tokyo ZEN ChromeOverlay bg = #2c2d40 (= ZEN ChromeMuted bg — 3-tone ladder).
         assert_eq!(zen_overlay_bg, Some(Color::Rgb { r: 0x2c, g: 0x2d, b: 0x40 }),
             "tokyo-night Zen ChromeOverlay bg (§II.5 final): got {zen_overlay_bg:?}");
+    }
+
+    // Task 4 — status_line_visible
+
+    /// `status_line_visible` must return false under Auto with no message/reveal,
+    /// force-true on a non-empty status message (no-silent-UI), and true under On always.
+    #[test]
+    fn status_line_visible_forces_on_message_even_in_auto() {
+        use crate::config::TransientMode;
+        let mut e = Editor::new_from_text("x\n", None, (40, 8));
+        e.status_line_mode = TransientMode::Auto;
+        e.mouse.status_revealed = false;
+        e.status.clear();
+        assert!(!crate::app::status_line_visible(&e), "Auto idle + no message → info line hidden (calm)");
+        e.status = "saved".into();
+        assert!(crate::app::status_line_visible(&e), "a message force-reveals even under Auto (no-silent-UI)");
+        e.status.clear();
+        e.mouse.status_revealed = true;
+        assert!(crate::app::status_line_visible(&e), "Auto + dwell-revealed → visible");
+        e.status_line_mode = TransientMode::On;
+        e.mouse.status_revealed = false;
+        assert!(crate::app::status_line_visible(&e), "On → always visible");
     }
 
     /// Finding 2 (pre-merge gate): preview_selected_theme must apply the Ansi16 sentinel-fill
