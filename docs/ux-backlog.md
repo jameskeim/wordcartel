@@ -438,7 +438,19 @@ persistence.
 
 ## Theme E — product identity: minimalist by default, complete on demand
 
-### E1. Chrome/density presets — `needs-design` · Larger (the umbrella)
+### E1. Chrome/density presets — `SHIPPED` 2026-07-07 (merge f7b7b10): zen|full data-driven density presets
+
+**SHIPPED 2026-07-07**, merged `--no-ff` @ f7b7b10 (branch effort-chrome-density-overlays) as a
+FOLDED effort delivering **E1 + E2 + overlay/mouse completeness + menu windowing** (spec
+`2026-07-06-wordcartel-chrome-density-and-overlay-completeness-design.md`). E1 part: `chrome =
+zen|full` now drives a **data-driven density preset** (`ChromeBundle`/`apply_bundle` — no `if zen`
+branching) that sets the menu bar, transient status line + scrollbar (new `TransientMode {Off,Auto,
+On}`), centered measure, and word count; individual config keys override a preset per-element and
+persist; the two new `[view]` keys round-trip via the diff-law. **Default status_line = On** (user
+decision — preserve the always-shown idle line; Zen opts into Auto). Both final gates GO (Codex
+pre-merge + Fable whole-branch, each catching a real cross-task bug — hidden-command dropdown click,
+paint/hit-test menu_area drift). See [[wordcartel-chrome-density-overlays]] /
+[[wordcartel-chrome-density-defaults]]. The original design notes below are retained for history.
 
 One coherent concept instead of N toggles: `chrome = "zen" | "full"` presets that SET the
 individual toggles (each remains individually overridable). Chrome inventory (facts):
@@ -465,12 +477,21 @@ visibility chrome — they don't belong to the zen/full axis. Zen = `auto` menu 
 status + minimal chrome; full = `pinned` bar + scrollbar + guide/measure/word-count +
 right-edge bar content (designed here) — "a complete word processing system in one gesture."
 
-### E2. Visual polish pass — `needs-design` · rides E1
+### E2. Visual polish pass — `SHIPPED` 2026-07-07 (merge f7b7b10, with E1)
 
-Full-width bar fill (A2), dropdown borders/styling, palette styling, **checkable/stateful menu
-items** (✓/radio for toggles + the active keymap preset — the menu model must support state
-display), a consistent styling language. Goal: the full-chrome mode looks *designed*, not
-assembled.
+**SHIPPED 2026-07-07** with E1 (merge f7b7b10). Delivered: **state-in-label menu rows** (`Word
+Count: On` / `Chrome: Zen` / `Keymap: CUA` — text, no glyphs; the ✓/radio idea was rejected as a
+GUI import that ports awkwardly to a TUI; the keymap radio collapsed to a single `keymap_next`
+cycle row) and the **two-archetype styling language** (attached filled-panel dropdown vs bordered
+floating overlays, reusing the shipped six-face chrome family). Also folded in from the 2026-07-06
+gaps: overlay/mouse completeness (click-to-commit + click-away on every list overlay, no mouse leak,
+stale-guards on click-apply, diag windowing) and menu dropdown windowing. Residual: the A3
+palette-completeness invariant test + item-by-item menu-curation pass is NOT part of this (see A3).
+
+Original triage (retained): Full-width bar fill (A2), dropdown borders/styling, palette styling,
+**checkable/stateful menu items** (✓/radio for toggles + the active keymap preset — the menu model
+must support state display), a consistent styling language. Goal: the full-chrome mode looks
+*designed*, not assembled.
 
 ### E3. Chrome theming coherence — `SHIPPED` 2026-07-06 (merge eb9cfd1, with E4)
 
@@ -978,8 +999,10 @@ relocates what C4/D1/A5/E1 touch (split early = every later effort lands in focu
 B2's hanging indent is a wrap-policy feature (travels inside B1); A3's palette parts share
 A6's territory; E2's checkable items serve A5/E1; C2 and C3 are islands.
 
-*(Progress: 1 A6 ✓ · 2 H1 ✓ · 3 B1+B2 ✓ · 4 C4 ✓ (2026-07-04) · 5 C2 ✓ · 6 D1+A5 ✓
-(2026-07-05) · 7 E3+E4 ✓ (2026-07-06, shipped together) — **next: 8, E1+E2 (+A3 curation)**.)*
+*(Progress: 1 A6 ✓ · 2 H1 ✓ · 3 B1+B2 ✓ · 4 C4 ✓ · 5 C2 ✓ · 6 D1+A5 ✓ · 7 E3+E4 ✓ · **8 E1+E2 ✓**
+(2026-07-07 @ f7b7b10 — folded effort: E1 + E2 + overlay/mouse completeness + menu windowing) ·
+**B4 SRC-HI ✓** (2026-07-07 @ 1bbd82b) — **next: C3, R1 (in-brainstorm), or Theme S/P; then Effort
+P**. A3's palette-completeness invariant + item-by-item menu-curation pass remains open.)*
 
 *(NEW 2026-07-06: **R1 editing-responsiveness** entered brainstorm mid-stream — a
 tight-scope perf/correctness fix (Theme R). Dependency-free; recommended to slot BEFORE Effort P.
@@ -997,8 +1020,9 @@ May preempt or run alongside E1+E2 at the user's call.)*
 6. **D1 + A5** settings write-back + keymap switch — SHIPPED 2026-07-05.
 7. **E3** chrome theming coherence (+ the render.rs split; **E4's research kicks off in
    parallel** — pure reading, no code dependency).
-8. **E1 + E2** density presets + polish — the convergence point (+ E4's theme landings +
-   A3's menu-curation pass, done while the menu is being polished anyway).
+8. **E1 + E2** density presets + polish — **SHIPPED 2026-07-07 @ f7b7b10** (folded effort:
+   E1 density presets + E2 polish + overlay/mouse completeness + menu windowing). A3's
+   menu-curation pass was NOT folded in — remains open.
 9. **C3** SSH/tmux clipboard — genuinely independent; last by cost shape (a terminal × tmux ×
    SSH test matrix), not by value; pull it forward whenever the pain bites.
 
@@ -1009,7 +1033,14 @@ dependency-free in both directions.
 
 ### Pre-Effort-P checklist (must clear before P)
 
-- **repar re-plumb check** (`needs-verify`, added 2026-07-06). `repar` is a PATH dependency
+- **repar re-plumb check** — `DONE` 2026-07-06 (merge 10a5a05, pushed). Adopted repar 1.1's
+  documented "blessed editor stack" (`none,all,prose,prose-prefix,markdown,no-trailing-pad`); the
+  two "upstream candidates" were NOT bugs — repar 1.1 released them as opt-in fixups
+  (`no-trailing-pad` for CJK trailing-space→hard-`<br>`, `prose-prefix` for the anaphora trap),
+  both proven load-bearing by Fable probes. Migrated `run_transform` onto repar's SemVer-frozen
+  `from_par_args` surface; Cargo.lock pinned 1.1.0 (a REAL pin — the tokens require it, not drift).
+  Codex + Fable both GO. See [[wordcartel-repar-integration]]. Original checklist retained below
+  for history. `repar` is a PATH dependency
   (`repar = { path = "../../par-command/repar" }`, wordcartel/Cargo.toml:12), so it builds
   against whatever the user has locally — the Cargo.lock pin (1.1.0) drifts every build. repar
   has been updated AGAIN; before P, re-examine the integration against the current local repar:
@@ -1026,19 +1057,18 @@ dependency-free in both directions.
 
 ## Sizing summary
 
-*(SHIPPED so far: the quick-wins bundle A2+B3+C1 @ 097dcae; A1 menu-bar modes @ 7273327 —
-both carrying bug fixes.)*
+**SHIPPED** (see each item's header for the commit): A1, A2, A5, A6, B1, B2, B3, B4, C1, C2, C4,
+D1, E1, E2, E3, E4, H1 — plus the repar re-plumb check. (A4 dropped.) The remaining open work,
+by size:
 
-- **Small:** A3 palette follow-ups (hints verification + invariant test + the menu item
-  pass) · E4 themes research (the research itself).
-- **Small-Medium:** A6 palette reachability (scrolling window + wheel + dead zones — also
-  kills the invisible-dispatch hazard) · C4 close-buffer Save/Discard/Cancel prompt (reuses
-  the quit machinery).
-- **Medium:** A5 keymap switch + D1 write-back (one effort) · B2 sub-list indent (+ hanging
-  indent) · C2 transform scope (block-under-caret defaults + deepest-block snapping) ·
-  C3 clipboard over SSH/tmux (the terminal × tmux × SSH test matrix is the real cost) ·
-  H1 app.rs decomposition (mechanical; before Effort P).
-- **Medium-Large:** E3 chrome theming coherence (one chrome family + the full|zen axis +
-  the phosphor restructure — precedes E1/E2 and E4's landings).
-- **Larger:** B1 word-boundary wrap · E1/E2 chrome presets + polish pass (after A1/A2 and
-  E3; includes the transient status line).
+- **Small:** A3 palette-completeness invariant test + the item-by-item menu-curation pass (the
+  state-in-label half shipped with E2; the curation pass did not).
+- **Small-Medium:** S3 Snapshots (Theme S — capture/restore/persist reuse existing machinery;
+  the one net-new algorithm is a display diff).
+- **Medium:** C3 clipboard over SSH/tmux (the terminal × tmux × SSH test matrix is the real cost) ·
+  R1 editing-responsiveness (Theme R, in-brainstorm) · S1 rearrangeable outline / corkboard.
+- **Larger:** S2 directory-as-binder (post-Effort-P plugin) · Theme P plugin candidates (all
+  post-P — goals/streaks, style lens, CMS publish, backlinks, CriticMarkup/Fountain/wikilinks).
+- **Noted (not scheduled):** H2 active_line eof-clamp.
+
+Then **Effort P** (the in-process Lua plugin system) — the 1.0 capstone.
