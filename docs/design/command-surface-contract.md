@@ -77,7 +77,8 @@ Everything above is mechanical. The single per-command judgment is *where a comm
   (clipboard/undo), Format (transforms), View (toggles), Export, Settings; plus anything whose
   discoverability matters.
 - **Palette-only** — motions & navigation, internal plumbing, keystroke-native ops, and the
-  **set-per-state primitives** (their cycle command stands in for them in the menu).
+  **set-per-state primitives** (their stateful menu representative — toggle or cycle — stands in for
+  them in the menu).
 
 The item-by-item application of this guideline across the command set is tracked as backlog A3b.
 
@@ -86,7 +87,7 @@ The item-by-item application of this guideline across the command set is tracked
 ## Decision procedure (drop-in for any new feature or option)
 
 1. **Runtime-changeable?** → it must be a command (law 2).
-2. **Multi-state?** → set-per-state commands + one cycle (rule 8).
+2. **Multi-state?** → set-per-state commands + a stateful menu representative, toggle or cycle (rule 8).
 3. **Does a profile set it?** → the profile calls the same setter as the command (law 6).
 4. **Browse-for-by-category, or not?** → menu vs palette-only (the one judgment).
 

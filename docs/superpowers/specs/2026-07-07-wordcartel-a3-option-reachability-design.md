@@ -83,7 +83,7 @@ home. After this, `apply_bundle` sets the preset's owned modes THROUGH these set
 profile and command can't drift. `menu_bar_pin` reduces to `set_menu_bar_mode(editor, if pinned {
 unpinned_mode } else { Pinned })`.
 
-### 1.2 The commands (shape rule 8: set-per-state primitives + a cycle)
+### 1.2 The commands (shape rule 8: set-per-state primitives + a stateful menu representative)
 
 Per the contract, each multi-state option gets deterministic **set-per-state** commands (`menu:
 None` → palette-only) plus **one menu representative** (a cycle or the existing stateful toggle, with
@@ -163,7 +163,7 @@ active preset, so switching preset changes which user-explicit binds exist.
 - Persisted settings: `SettingsSnapshot` `settings.rs:33-50`.
 - Existing option commands: `toggle_*` `registry.rs:400-410`, `menu_bar_pin` `registry.rs:459-478`,
   `toggle_mouse_capture` `registry.rs:329`, `toggle_chrome`/`toggle_canvas` `registry.rs:514-525`,
-  `set_wrap_column` `registry.rs:471`, keymap commands `registry.rs:492-506`.
+  `set_wrap_column` `registry.rs:507`, keymap commands `registry.rs:492-506`.
 - Command registration: `register`/`register_stateful` `registry.rs:64-83`; `MenuMark`/state-in-label
   `registry.rs:44-55`.
 - Profile setter (to refactor): `density::apply_bundle` `density.rs:61-79`.
