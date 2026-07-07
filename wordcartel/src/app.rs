@@ -132,10 +132,10 @@ pub(crate) fn hydrate_overlays(editor: &mut Editor, reg: &crate::registry::Regis
             crate::palette::rebuild_rows(p, reg, keymap);
         }
     }
-    if let Some(v) = editor.menu.as_ref().filter(|v| !v.built) {
-        let want_open = v.open;
-        let want_hl = v.highlighted;
-        let mut built = crate::menu::build(reg, keymap);
+    if editor.menu.as_ref().is_some_and(|v| !v.built) {
+        // Extract open/highlighted before borrowing editor for build — avoids borrow conflict.
+        let (want_open, want_hl) = { let v = editor.menu.as_ref().unwrap(); (v.open, v.highlighted) };
+        let mut built = crate::menu::build(reg, keymap, editor);
         // The placeholder's `open` indexes MENU_ORDER; map it to the built groups'
         // position for that category (robust even if a category has no commands).
         if let Some(cat) = crate::registry::MENU_ORDER.get(want_open) {

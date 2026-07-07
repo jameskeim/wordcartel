@@ -2837,7 +2837,7 @@ mod tests {
         let mut e = Editor::new_from_text("body\n", None, (40, 8));
         let reg = crate::registry::Registry::builtins();
         let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
-        e.menu = Some(crate::menu::build(&reg, &km));
+        e.menu = Some(crate::menu::build(&reg, &km, &e));
         derive::rebuild(&mut e);
         let mut term = Terminal::new(TestBackend::new(40, 8)).unwrap();
         term.draw(|f| render(f, &mut e)).unwrap();
