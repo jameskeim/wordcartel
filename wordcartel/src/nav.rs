@@ -5,7 +5,7 @@
 //! are for copy/delete range bounds (Task 9), not for caret placement.
 
 use crate::derive;
-use crate::editor::{Editor, RenderMode};
+use crate::editor::Editor;
 use wordcartel_core::block_tree::{Block, BlockTree};
 use wordcartel_core::buffer::TextBuffer;
 use wordcartel_core::layout;
@@ -61,10 +61,9 @@ fn layout_line_on_demand(editor: &Editor, l: usize) -> wordcartel_core::layout::
     let buf = &editor.active().document.buffer;
     let text = derive::line_text(buf, l);
     let role = editor.active().document.blocks().role_at(derive::line_start(buf, l));
-    let source_mode = editor.active().view.mode != RenderMode::LivePreview;
-    let is_active_effective = (l == caret_line(editor)) || source_mode;
+    let render = crate::derive::line_render_for(editor.active().view.mode, l == caret_line(editor));
     let vp_width = text_geometry(editor).text_width as usize;
-    let (_rows, map) = layout::layout(&text, role, is_active_effective, vp_width, editor.theme.heading_level_glyph);
+    let (_rows, map) = layout::layout(&text, role, render, vp_width, editor.theme.heading_level_glyph);
     map
 }
 
@@ -145,7 +144,7 @@ fn layout_line_active(editor: &Editor, l: usize) -> wordcartel_core::layout::Col
     let text = derive::line_text(buf, l);
     let role = editor.active().document.blocks().role_at(derive::line_start(buf, l));
     let vp_width = text_geometry(editor).text_width as usize;
-    let (_rows, map) = layout::layout(&text, role, true, vp_width, editor.theme.heading_level_glyph);
+    let (_rows, map) = layout::layout(&text, role, wordcartel_core::style::LineRender::RawPlain, vp_width, editor.theme.heading_level_glyph);
     map
 }
 

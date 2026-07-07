@@ -1,4 +1,4 @@
-use crate::editor::{Editor, RenderMode};
+use crate::editor::Editor;
 use wordcartel_core::block_tree;
 use wordcartel_core::buffer::TextBuffer;
 use wordcartel_core::layout;
@@ -15,8 +15,23 @@ pub struct LayoutKey {
     pub area: (u16, u16),
     pub text_width: usize,          // vp_width (subsumes wrap/gutter geometry)
     pub active_line: usize,
-    pub source_mode: bool,          // view.mode != LivePreview
+    pub mode: crate::editor::RenderMode, // view.mode — drives per-line LineRender
     pub heading_level_glyph: bool,
+}
+
+/// Map the view's render mode + whether this is the caret line → LineRender.
+/// LivePreview conceals inactive lines and shows the active line raw+plain;
+/// SourceHighlighted styles every line raw; SourcePlain shows every line raw+plain.
+pub(crate) fn line_render_for(mode: crate::editor::RenderMode, is_active_line: bool)
+    -> wordcartel_core::style::LineRender
+{
+    use crate::editor::RenderMode::*;
+    use wordcartel_core::style::LineRender::*;
+    match mode {
+        LivePreview       => if is_active_line { RawPlain } else { Concealed },
+        SourceHighlighted => RawStyled,
+        SourcePlain       => RawPlain,
+    }
 }
 
 #[cfg(test)]
@@ -205,7 +220,7 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
     // ------------------------------------------------------------------
     // Snapshot all read-only scalar values from the active buffer before any
     // mutable borrow, so the borrow checker sees no overlap.
-    let (total_lines, active_line, area_height, first_line, source_mode, scroll_row) = {
+    let (total_lines, active_line, area_height, first_line, b_mode, scroll_row) = {
         let b = editor.active();
         let buf = &b.document.buffer;
         let total_lines = total_logical_lines(buf);
@@ -219,9 +234,9 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
         // 5g: normalize scroll to the nearest visible line before the walk.
         let raw_scroll = b.view.scroll.min(total_lines.saturating_sub(1));
         let first_line = fold_view.normalize_line(raw_scroll);
-        let source_mode = b.view.mode != RenderMode::LivePreview;
+        let b_mode = b.view.mode;
         let scroll_row = b.view.scroll_row;
-        (total_lines, active_line, area_height, first_line, source_mode, scroll_row)
+        (total_lines, active_line, area_height, first_line, b_mode, scroll_row)
     };
     // Persist the normalized scroll so consumers agree.
     editor.active_mut().view.scroll = first_line;
@@ -239,7 +254,7 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
         area: editor.active().view.area,
         text_width: vp_width,
         active_line,
-        source_mode,
+        mode: b_mode,
         heading_level_glyph: editor.theme.heading_level_glyph,
     };
     if editor.active().layout_key.as_ref() == Some(&key) {
@@ -256,15 +271,15 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
 
     let mut l = first_line;
     while l < total_lines && visual_rows_accumulated < overscan_budget {
-        let (text, role, is_active_effective) = {
+        let (text, role) = {
             let b = editor.active();
             let buf = &b.document.buffer;
             let text = line_text(buf, l);
             let role = b.document.blocks().role_at(line_start(buf, l));
-            let is_active_effective = (l == active_line) || source_mode;
-            (text, role, is_active_effective)
+            (text, role)
         };
-        let (rows, map) = layout::layout(&text, role, is_active_effective, vp_width, editor.theme.heading_level_glyph);
+        let render = line_render_for(b_mode, l == active_line);
+        let (rows, map) = layout::layout(&text, role, render, vp_width, editor.theme.heading_level_glyph);
         visual_rows_accumulated += rows.len();
         editor.active_mut().view.line_layouts.insert(l, (rows, map));
         // 5g: jump past any folded body that follows this line.
@@ -817,6 +832,24 @@ mod tests {
     // ------------------------------------------------------------------
     // M4-rest: apply_parse_result state-transition helper
     // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // Task 2 (SRC-HI): cache must distinguish SourceHighlighted from SourcePlain
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn layout_cache_distinguishes_srchi_from_source() {
+        let mut e = Editor::new_from_text("**bold**\n", None, (40, 6));
+        e.active_mut().view.mode = crate::editor::RenderMode::SourceHighlighted;
+        crate::derive::rebuild(&mut e);
+        let sh_segs: String = e.active().view.line_layouts[&0].0.iter()
+            .flat_map(|r| r.segs.iter()).map(|s| format!("{:?}", s.style)).collect();
+        e.active_mut().view.mode = crate::editor::RenderMode::SourcePlain;
+        crate::derive::rebuild(&mut e);
+        let sp_segs: String = e.active().view.line_layouts[&0].0.iter()
+            .flat_map(|r| r.segs.iter()).map(|s| format!("{:?}", s.style)).collect();
+        assert_ne!(sh_segs, sp_segs, "SH must re-layout with styles; SP stays Plain (cache must not alias)");
+    }
 
     #[test]
     fn apply_parse_result_err_installs_empty_tree_and_sets_degraded_once() {
