@@ -40,6 +40,7 @@ pub struct Config {
     pub theme: ThemeConfig,
     pub export: ExportConfig,
     pub menu: MenuConfig,
+    pub clipboard: ClipboardConfig,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -100,6 +101,13 @@ pub enum ClipboardProvider { Auto, Native, Osc52, Off }
 pub struct MenuConfig { pub bar: MenuBarMode }
 impl Default for MenuConfig {
     fn default() -> Self { MenuConfig { bar: MenuBarMode::Auto } }
+}
+
+/// Clipboard configuration section (`[clipboard]`).
+#[derive(Debug, Clone)]
+pub struct ClipboardConfig { pub provider: ClipboardProvider }
+impl Default for ClipboardConfig {
+    fn default() -> Self { ClipboardConfig { provider: ClipboardProvider::Auto } }
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +216,7 @@ struct RawConfig {
     theme: RawTheme,
     export: RawExport,
     menu: RawMenu,
+    clipboard: RawClipboard,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, PartialEq)]
@@ -284,6 +293,11 @@ struct RawExport {
 #[serde(default)]
 struct RawMenu {
     bar: Option<String>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawClipboard {
+    provider: Option<String>,
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -432,6 +446,16 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
                 other => warns.push(format!("menu.bar \"{other}\" invalid; using auto")),
             }
         }
+        // clipboard: per-field override; enum-valued string with a warning on unknowns.
+        if let Some(p) = raw.clipboard.provider {
+            match p.as_str() {
+                "auto"   => cfg.clipboard.provider = ClipboardProvider::Auto,
+                "native" => cfg.clipboard.provider = ClipboardProvider::Native,
+                "osc52"  => cfg.clipboard.provider = ClipboardProvider::Osc52,
+                "off"    => cfg.clipboard.provider = ClipboardProvider::Off,
+                other => warns.push(format!("clipboard.provider \"{other}\" invalid; using auto")),
+            }
+        }
         // export: per-field override (omitted field inherits the lower layer).
         if let Some(v) = raw.export.pdf_engine { cfg.export.pdf_engine = v; }
         if let Some(v) = raw.export.typography { cfg.export.typography = v; }
@@ -501,6 +525,16 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
 /// "off"/"auto"/"on" — round-trips `TransientMode` for the overrides mirror.
 pub fn transient_mode_str(m: TransientMode) -> &'static str {
     match m { TransientMode::Off => "off", TransientMode::Auto => "auto", TransientMode::On => "on" }
+}
+
+/// "auto"/"native"/"osc52"/"off" — round-trips `ClipboardProvider` for the overrides mirror.
+pub fn clipboard_provider_str(p: ClipboardProvider) -> &'static str {
+    match p {
+        ClipboardProvider::Auto => "auto",
+        ClipboardProvider::Native => "native",
+        ClipboardProvider::Osc52 => "osc52",
+        ClipboardProvider::Off => "off",
+    }
 }
 
 #[cfg(test)]
@@ -951,6 +985,48 @@ mod tests {
             "[theme] chrome must round-trip to 'zen'");
         assert_eq!(cfg.theme.canvas.as_deref(), Some("transparent"),
             "[theme] canvas must round-trip");
+    }
+
+    // -----------------------------------------------------------------------
+    // [clipboard] provider config (C3 Task 4)
+    // -----------------------------------------------------------------------
+
+    fn load_clip(name: &str, body: &str) -> (Config, Vec<String>) {
+        let p = std::env::temp_dir().join(format!("wcartel-cfg-{}-{name}.toml", std::process::id()));
+        std::fs::write(&p, body).unwrap();
+        let out = load(std::slice::from_ref(&p));
+        let _ = std::fs::remove_file(&p);
+        out
+    }
+
+    #[test]
+    fn clipboard_provider_parses_all_values() {
+        for (s, want) in [("auto", ClipboardProvider::Auto), ("native", ClipboardProvider::Native),
+                          ("osc52", ClipboardProvider::Osc52), ("off", ClipboardProvider::Off)] {
+            let (cfg, _warns) = load_clip(s, &format!("[clipboard]\nprovider = \"{s}\"\n"));
+            assert_eq!(cfg.clipboard.provider, want, "value {s}");
+        }
+    }
+
+    #[test]
+    fn clipboard_provider_unknown_warns_and_defaults_auto() {
+        let (cfg, warns) = load_clip("unknown", "[clipboard]\nprovider = \"telepathy\"\n");
+        assert_eq!(cfg.clipboard.provider, ClipboardProvider::Auto);
+        assert!(warns.iter().any(|w| w.contains("clipboard.provider")));
+    }
+
+    #[test]
+    fn clipboard_provider_default_is_auto() {
+        let (cfg, _) = load(&[]); // no config file → defaults
+        assert_eq!(cfg.clipboard.provider, ClipboardProvider::Auto);
+    }
+
+    #[test]
+    fn clipboard_provider_str_roundtrips() {
+        assert_eq!(clipboard_provider_str(ClipboardProvider::Auto), "auto");
+        assert_eq!(clipboard_provider_str(ClipboardProvider::Native), "native");
+        assert_eq!(clipboard_provider_str(ClipboardProvider::Osc52), "osc52");
+        assert_eq!(clipboard_provider_str(ClipboardProvider::Off), "off");
     }
 
 }
