@@ -1,6 +1,7 @@
 //! System-clipboard sync around the in-process Register. The Register is always
 //! source of truth; everything here is best-effort and must never block the loop.
 
+use std::io::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
@@ -242,6 +243,80 @@ impl ClipboardBackend for NullBackend {
     fn set(&mut self, _text: &str) {}
     fn get(&mut self) -> Option<String> {
         None
+    }
+}
+
+/// A Layer-1 backend that shells out to an external clipboard helper. `set` writes the
+/// text to the child's stdin and reaps it (helpers self-background, so the foreground
+/// child exits promptly). `get` reads stdout; `None` get_argv means set-only (e.g. clip.exe),
+/// so paste falls back to the register.
+pub struct CommandBackend {
+    set_argv: Vec<String>,
+    get_argv: Option<Vec<String>>,
+}
+
+impl CommandBackend {
+    pub fn wl_copy() -> Self {
+        CommandBackend { set_argv: vec!["wl-copy".into()],
+                         get_argv: Some(vec!["wl-paste".into(), "--no-newline".into()]) }
+    }
+    pub fn xclip() -> Self {
+        CommandBackend { set_argv: vec!["xclip".into(), "-selection".into(), "clipboard".into()],
+                         get_argv: Some(vec!["xclip".into(), "-selection".into(), "clipboard".into(), "-o".into()]) }
+    }
+    pub fn xsel() -> Self {
+        CommandBackend { set_argv: vec!["xsel".into(), "-b".into(), "-i".into()],
+                         get_argv: Some(vec!["xsel".into(), "-b".into(), "-o".into()]) }
+    }
+    pub fn win_yank() -> Self {
+        CommandBackend { set_argv: vec!["win32yank.exe".into(), "-i".into(), "--crlf".into()],
+                         get_argv: Some(vec!["win32yank.exe".into(), "-o".into(), "--lf".into()]) }
+    }
+    pub fn clip_exe() -> Self {
+        CommandBackend { set_argv: vec!["clip.exe".into()], get_argv: None }
+    }
+}
+
+impl ClipboardBackend for CommandBackend {
+    fn set(&mut self, text: &str) {
+        use std::process::{Command, Stdio};
+        let Some((bin, args)) = self.set_argv.split_first() else { return };
+        let child = Command::new(bin).args(args)
+            .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+        if let Ok(mut ch) = child {
+            if let Some(mut stdin) = ch.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+                // drop stdin → EOF so the helper commits and its foreground child exits.
+            }
+            let _ = ch.wait(); // reap the (promptly-exiting) foreground child.
+        }
+    }
+    fn get(&mut self) -> Option<String> {
+        use std::process::{Command, Stdio};
+        let argv = self.get_argv.as_ref()?;
+        let (bin, args) = argv.split_first()?;
+        let out = Command::new(bin).args(args)
+            .stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+        if !out.status.success() { return None; }
+        let s = String::from_utf8_lossy(&out.stdout).into_owned();
+        if s.is_empty() { None } else { Some(s) }
+    }
+}
+
+/// Map a resolved Layer-1 choice to a boxed backend. `Arboard`/`Null` reuse the existing
+/// backends; helpers use `CommandBackend`. arboard init failure degrades to `NullBackend`.
+pub fn backend_for(choice: Layer1Choice) -> Box<dyn ClipboardBackend> {
+    match choice {
+        Layer1Choice::WlCopy  => Box::new(CommandBackend::wl_copy()),
+        Layer1Choice::Xclip   => Box::new(CommandBackend::xclip()),
+        Layer1Choice::Xsel    => Box::new(CommandBackend::xsel()),
+        Layer1Choice::WinYank => Box::new(CommandBackend::win_yank()),
+        Layer1Choice::ClipExe => Box::new(CommandBackend::clip_exe()),
+        Layer1Choice::Arboard => match ArboardBackend::try_new() {
+            Some(b) => Box::new(b),
+            None => Box::new(NullBackend),
+        },
+        Layer1Choice::Null => Box::new(NullBackend),
     }
 }
 
@@ -516,6 +591,46 @@ mod tests {
             Ok(crate::app::Msg::ClipboardPaste { text: None, buffer_id, .. }) => assert_eq!(buffer_id, bid),
             o => panic!("{o:?}"),
         }
+    }
+
+    #[test]
+    fn command_backend_argv_constructors() {
+        assert_eq!(CommandBackend::wl_copy().set_argv, vec!["wl-copy".to_string()]);
+        assert_eq!(CommandBackend::wl_copy().get_argv,
+                   Some(vec!["wl-paste".to_string(), "--no-newline".to_string()]));
+        assert_eq!(CommandBackend::xclip().set_argv,
+                   ["xclip", "-selection", "clipboard"].iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(CommandBackend::xsel().set_argv,
+                   ["xsel", "-b", "-i"].iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(CommandBackend::win_yank().get_argv,
+                   Some(vec!["win32yank.exe".to_string(), "-o".to_string(), "--lf".to_string()]));
+        assert!(CommandBackend::clip_exe().get_argv.is_none()); // set-only
+    }
+
+    #[test]
+    fn backend_for_maps_choices() {
+        // Smoke: mapping does not panic and Null yields an inert backend.
+        let mut null = backend_for(Layer1Choice::Null);
+        null.set("x");
+        assert_eq!(null.get(), None);
+    }
+
+    #[test]
+    fn command_backend_roundtrips_via_cat_like_helper() {
+        // Use a POSIX shell to emulate a clipboard: set writes to a temp file, get reads it.
+        // Skips cleanly where /bin/sh is unavailable (non-unix CI).
+        if !std::path::Path::new("/bin/sh").exists() { return; }
+        let dir = std::env::temp_dir().join(format!("wcartel-clip-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let slot = dir.join("slot");
+        let slot_s = slot.to_string_lossy().to_string();
+        let mut b = CommandBackend {
+            set_argv: vec!["/bin/sh".into(), "-c".into(), format!("cat > {slot_s}")],
+            get_argv: Some(vec!["/bin/sh".into(), "-c".into(), format!("cat {slot_s}")]),
+        };
+        b.set("hello");
+        assert_eq!(b.get().as_deref(), Some("hello"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
