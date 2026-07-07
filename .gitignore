@@ -6,3 +6,6 @@ target/
 
 # PTY smoke suite stability record (scripts/smoke/run.sh)
 scripts/smoke/.history
+
+# SDD subagent-driven-development scratch (briefs, reports, review packages)
+.superpowers/
