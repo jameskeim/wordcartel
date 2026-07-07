@@ -149,27 +149,30 @@ pub fn next_paste_id() -> u64 {
 }
 
 /// Called by run() after reduce, before the frame draw. `env` is the process clipboard
-/// environment (cached at startup). Sends a provider rebuild BEFORE any queued Set/Get so a
-/// same-frame provider change takes effect immediately; emits OSC 52 only when the resolved
-/// plan calls for it, wrapped for the environment. Never blocks (unbounded channel).
+/// environment (cached at startup); `plan` is the cached resolved plan, recomputed here ONLY
+/// on a provider change (the env snapshot is immutable, so the plan is otherwise stable —
+/// this keeps the PATH-probing resolve off the per-keystroke hot path). Sends a provider
+/// rebuild BEFORE any queued Set/Get so a same-frame provider change takes effect
+/// immediately; emits OSC 52 only when the resolved plan calls for it, wrapped for the
+/// environment. Never blocks (unbounded channel).
 pub fn drain_clipboard_intents(
     editor: &mut crate::editor::Editor,
     env: &ClipEnv,
+    plan: &mut ProviderPlan,
     out: &mut impl std::io::Write,
     clip_tx: &Sender<ClipReq>,
     msg_tx: &Sender<crate::app::Msg>,
 ) {
-    let plan = resolve_provider(env, editor.clipboard_provider);
-
-    // Runtime provider change → rebuild the worker's Layer-1 backend FIRST. Surface a dead
-    // worker (never silently drop the change): set the status notice on send failure.
+    // Recompute the plan ONLY on a provider change — the env snapshot is immutable, so the
+    // plan is otherwise stable. This keeps resolve_provider (which PATH-probes for helper
+    // binaries under Auto) off the per-keystroke hot path.
     if editor.clipboard_provider_dirty {
+        *plan = resolve_provider(env, editor.clipboard_provider);
         if clip_tx.send(ClipReq::SelectProvider(plan.layer1)).is_err() {
             editor.status = "clipboard unavailable".to_string();
         }
         editor.clear_clipboard_provider_dirty();
     }
-
     if let Some(text) = editor.clipboard_sync_request.take() {
         if let Some(wrap) = plan.osc52 {
             if let Some(bytes) = osc52_set(&text, wrap) {
@@ -433,7 +436,8 @@ mod tests {
         let (clip_tx, _clip_rx) = std::sync::mpsc::channel();
         let (msg_tx, _msg_rx) = std::sync::mpsc::channel();
         let mut out: Vec<u8> = Vec::new();
-        drain_clipboard_intents(&mut e, &env, &mut out, &clip_tx, &msg_tx);
+        let mut plan = resolve_provider(&env, e.clipboard_provider);
+        drain_clipboard_intents(&mut e, &env, &mut plan, &mut out, &clip_tx, &msg_tx);
         assert_eq!(out, b"\x1bPtmux;\x1b\x1b]52;c;aGk=\x1b\x1b\\\x1b\\".to_vec());
     }
 
@@ -448,7 +452,8 @@ mod tests {
         let (clip_tx, _clip_rx) = std::sync::mpsc::channel();
         let (msg_tx, _msg_rx) = std::sync::mpsc::channel();
         let mut out: Vec<u8> = Vec::new();
-        drain_clipboard_intents(&mut e, &env, &mut out, &clip_tx, &msg_tx);
+        let mut plan = resolve_provider(&env, e.clipboard_provider);
+        drain_clipboard_intents(&mut e, &env, &mut plan, &mut out, &clip_tx, &msg_tx);
         assert!(out.is_empty(), "osc52 suppressed → nothing written to the terminal");
     }
 
@@ -463,7 +468,8 @@ mod tests {
         let (clip_tx, clip_rx) = std::sync::mpsc::channel();
         let (msg_tx, _msg_rx) = std::sync::mpsc::channel();
         let mut out: Vec<u8> = Vec::new();
-        drain_clipboard_intents(&mut e, &env, &mut out, &clip_tx, &msg_tx);
+        let mut plan = resolve_provider(&env, e.clipboard_provider);
+        drain_clipboard_intents(&mut e, &env, &mut plan, &mut out, &clip_tx, &msg_tx);
         // First message is the provider rebuild, THEN the Set.
         match clip_rx.recv().unwrap() { ClipReq::SelectProvider(_) => {}, o => panic!("want SelectProvider first, got {o:?}") }
         match clip_rx.recv().unwrap() { ClipReq::Set(s) => assert_eq!(s, "hi"), o => panic!("want Set, got {o:?}") }
@@ -621,7 +627,8 @@ mod tests {
         let (clip_tx, clip_rx) = std::sync::mpsc::channel();
         let (msg_tx, _msg_rx) = std::sync::mpsc::channel();
         let mut out: Vec<u8> = Vec::new();
-        drain_clipboard_intents(&mut e, &bare_env(), &mut out, &clip_tx, &msg_tx);
+        let mut plan = resolve_provider(&bare_env(), e.clipboard_provider);
+        drain_clipboard_intents(&mut e, &bare_env(), &mut plan, &mut out, &clip_tx, &msg_tx);
         assert_eq!(out, b"\x1b]52;c;aGk=\x1b\\".to_vec(), "OSC 52 written to the terminal writer");
         match clip_rx.try_recv() { Ok(ClipReq::Set(s)) => assert_eq!(s, "hi"), o => panic!("{o:?}") }
         assert!(e.clipboard_sync_request.is_none(), "intent cleared");
@@ -636,7 +643,8 @@ mod tests {
         let (clip_tx, clip_rx) = std::sync::mpsc::channel();
         let (msg_tx, _msg_rx) = std::sync::mpsc::channel();
         let mut out: Vec<u8> = Vec::new();
-        drain_clipboard_intents(&mut e, &bare_env(), &mut out, &clip_tx, &msg_tx);
+        let mut plan = resolve_provider(&bare_env(), e.clipboard_provider);
+        drain_clipboard_intents(&mut e, &bare_env(), &mut plan, &mut out, &clip_tx, &msg_tx);
         match clip_rx.try_recv() {
             Ok(ClipReq::Get { id, buffer_id }) => { assert_eq!(id, 7); assert_eq!(buffer_id, bid); }
             o => panic!("{o:?}"),
@@ -654,7 +662,8 @@ mod tests {
         drop(clip_rx); // worker gone → send fails
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
         let mut out: Vec<u8> = Vec::new();
-        drain_clipboard_intents(&mut e, &bare_env(), &mut out, &clip_tx, &msg_tx);
+        let mut plan = resolve_provider(&bare_env(), e.clipboard_provider);
+        drain_clipboard_intents(&mut e, &bare_env(), &mut plan, &mut out, &clip_tx, &msg_tx);
         match msg_rx.try_recv() {
             Ok(crate::app::Msg::ClipboardPaste { text: None, buffer_id, .. }) => assert_eq!(buffer_id, bid),
             o => panic!("{o:?}"),
@@ -709,16 +718,17 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let mut ed = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
         let bid = ed.active().id;
+        let mut plan = resolve_provider(&bare_env(), ed.clipboard_provider);
 
         // A pending Get with no worker -> notice + None fallback.
         ed.clipboard_get_pending = Some(PasteIntent { id: 1, buffer_id: bid });
-        drain_clipboard_intents(&mut ed, &bare_env(), &mut out, &clip_tx, &msg_tx);
+        drain_clipboard_intents(&mut ed, &bare_env(), &mut plan, &mut out, &clip_tx, &msg_tx);
         assert_eq!(ed.status, "clipboard unavailable");
 
         // A pending Set with no worker -> notice.
         ed.status.clear();
         ed.clipboard_sync_request = Some("hello".to_string());
-        drain_clipboard_intents(&mut ed, &bare_env(), &mut out, &clip_tx, &msg_tx);
+        drain_clipboard_intents(&mut ed, &bare_env(), &mut plan, &mut out, &clip_tx, &msg_tx);
         assert_eq!(ed.status, "clipboard unavailable");
     }
 

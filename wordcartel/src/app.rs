@@ -1508,6 +1508,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     let clip_env = crate::clipboard::clip_env_from_process();
     let initial_plan = crate::clipboard::resolve_provider(&clip_env, editor.clipboard_provider);
     let clip_tx = crate::clipboard::spawn_worker(msg_tx.clone(), initial_plan);
+    let mut clip_plan = initial_plan;
 
     // Worker → loop wake relay: each result nudges the loop to drain. reduce()'s
     // trailing ex.drain() does the actual merge, so Msg::Tick is the nudge.
@@ -1665,7 +1666,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             }
         }
         editor.note_undo_eviction(pre_id, pre_version);
-        crate::clipboard::drain_clipboard_intents(&mut editor, &clip_env, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
+        crate::clipboard::drain_clipboard_intents(&mut editor, &clip_env, &mut clip_plan, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
         reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
         advance(&mut editor, &clock);
         guard.terminal().draw(|f| render::render(f, &mut editor))?;

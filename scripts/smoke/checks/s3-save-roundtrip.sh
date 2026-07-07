@@ -1,9 +1,10 @@
 #!/bin/sh
 # s3-save-roundtrip.sh — S3: type into a fresh file, dirty marker appears,
-# C-s saves ('Saved' is race-free only AFTER the notice barrier, which
-# start_wcartel already enforced), marker gone (asserted POSITIVELY via the
-# undirtied head), file on disk contains the sentence (containment, not
-# equality — exact EOL policy is the app's concern).
+# C-s saves ('Saved' is race-free after the '[1/' buffer-indicator barrier that
+# start_wcartel enforced — on the headless available path no async status write
+# follows startup), marker gone (asserted POSITIVELY via the undirtied head),
+# file on disk contains the sentence (containment, not equality — exact EOL
+# policy is the app's concern).
 set -eu
 CHECK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$CHECK_DIR/../../.." && pwd)

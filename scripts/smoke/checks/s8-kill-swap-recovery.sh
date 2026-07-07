@@ -6,8 +6,8 @@
 # and the swap survives. Relaunch on the SAME path → the open-time
 # swap-recovery prompt appears on a real screen → 'r' recovers the sentence.
 # The relaunch uses --no-barrier: the modal prompt replaces the status row, so
-# the clipboard notice cannot appear until the prompt resolves — the prompt
-# wait below is this launch's barrier.
+# the '[1/' buffer-indicator barrier cannot appear until the prompt resolves —
+# the prompt wait below is this launch's own, stronger barrier.
 set -eu
 CHECK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$CHECK_DIR/../../.." && pwd)
