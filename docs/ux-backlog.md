@@ -96,7 +96,27 @@ and the right side are unstyled — no full-width fill.
 buffer name + dirty marker) is designed once, deliberately, inside E1's full-chrome work — not
 defaulted piecemeal now. Labels truncate before any future content on narrow terminals.
 
-### A3. Option reachability + preset-aware hints (three-surface integrity) — `settled-design` · Medium
+### A3. Option reachability + preset-aware hints (three-surface integrity) — `SHIPPED` 2026-07-07 (merge d7a5494)
+
+**SHIPPED 2026-07-07** (merge `d7a5494`, branch effort-a3-option-reachability). Delivered: shared
+`Editor` setters (`set_scrollbar_mode`/`set_status_line_mode`/`set_menu_bar_mode`) with `apply_bundle`,
+`menu_bar_pin`, the new commands, AND app.rs startup all routed through them (law 6); the 10
+option-reachability commands (scrollbar/status_line/menu_bar set-per-state palette-only +
+`cycle_scrollbar`/`toggle_status_line` View representatives — closing the ZEN/FULL law-2 orphans);
+`chord_for` prefers a user's config-patch binding over the shortest preset default (law 7,
+`KeyTrie.user_bound`); the three law regression tests (recurrence guard with a compile-time
+`SettingsSnapshot` field-binding, palette-completeness, preset-aware hints); a contract shape-rule-8
+refinement (menu representative = toggle OR cycle). **Menu chord right-justification (folded in as
+Part 4, user decision)** also shipped — dropdown chords now align flush-right like the palette.
+Gates: full suite green (888 + 278 + integration), clippy clean, smoke 8/8; Codex spec+plan+pre-merge
+GO (pre-merge caught a real startup law-6 bypass + a missing recurrence-guard binding); Fable
+whole-branch PASS (14 execution probes). Residual polish (non-blocking, deferred): `toggle_status_line`
+`_ => "Auto"` catch-all → make exhaustive; `user_bound` fully-qualified `HashSet` path; a
+palette count-assert overlap; asymmetric setter-test asserts; latent `chars().count()` vs display-width
+in `right_justify_leaves`/`menu_dropdown_rect` (CJK-width — matches existing convention). The
+original settled-design notes below are retained for history.
+
+
 
 **Design ratified 2026-07-07** (brainstorm). Refocused from the original "palette follow-ups +
 menu item pass": the ZEN/FULL density decision (E1) added options — `status_line` mode and
