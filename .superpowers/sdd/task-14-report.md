@@ -85,3 +85,56 @@ FAILED: highlighted=6, scroll_top=1, item_rows=5 — highlighted-scroll_top=5 mu
 - `cargo test -p wordcartel --lib`: 870 passed, 0 failed.
 - `cargo build -p wordcartel`: warning-free.
 - `cargo clippy -p wordcartel --all-targets`: clean.
+
+---
+
+## T14-e fix: hit-test excludes reserved indicator row (Codex pre-merge gate finding)
+
+### Bug (Codex cross-task finding)
+`menu_dropdown_row_at` mapped EVERY row inside `drop_rect` to `scroll_top + (row - r.y)`,
+including the bottom row reserved for the n/total indicator when a category overflows the
+window.  A mouse click on that indicator row returned `Some(scroll_top + (list_h - 1))` —
+dispatching the item at that index, which the user could not see.
+
+### Fix (`render.rs` — `menu_dropdown_row_at`)
+Added the same `overflows`/`item_rows` computation used by the paint, guarding the hit-test
+so clicks outside the actual item rows return `None`:
+
+```rust
+let leaves_len = groups.get(open).map(|g| g.1.len()).unwrap_or(0);
+let list_h = r.height as usize;
+let overflows = leaves_len > list_h;   // identical to render_overlays.rs line 342
+let item_rows = if overflows { list_h.saturating_sub(1) } else { list_h };
+if col >= r.x && col < r.x + r.width && row >= r.y {
+    let row_in_window = (row - r.y) as usize;
+    if row_in_window < item_rows {
+        let abs = scroll_top + row_in_window;
+        if abs < leaves_len { Some(abs) } else { None }
+    } else { None }
+} else { None }
+```
+
+The non-overflow case is unchanged: `item_rows == list_h`, every rendered row is clickable.
+
+### Call-site sanity-check (`mouse.rs` ~173)
+When `menu_dropdown_row_at` returns `None` for an indicator-row click, `row_id` is `None`.
+Neither `bar_hit` nor `row_id` is Some, so the else arm fires: `editor.menu = None` (close
+menu). This is acceptable — clicking the indicator (a scroll position display, not a button)
+closes the menu, which is the same as clicking anywhere outside.
+
+### Regression test added (`render.rs` — `dropdown_indicator_row_hit_test_returns_none`)
+80×8 terminal, 20-leaf category (`drop_rect.height = 7`, `item_rows = 6`).  Three assertions:
+1. Click on indicator row (`drop_rect.y + 6`) → `None` (was `Some(6)` under old code — FAIL).
+2. Click on last real item row (`drop_rect.y + 5`) → `Some(5)` — PASS.
+3. Click on first item row (`drop_rect.y`) → `Some(0)` — PASS.
+
+**Confirmed FAILS under old code**: the indicator-row click returned `Some(6)` instead of `None`.
+**PASSES under fix**: `test render::tests::dropdown_indicator_row_hit_test_returns_none ... ok`.
+
+### Final gates (post T14-e fix)
+- `cargo test -p wordcartel --lib`: 871 passed, 0 failed.
+- `cargo build -p wordcartel`: warning-free.
+- `cargo clippy -p wordcartel --all-targets`: clean.
+- All named prior menu tests pass: `menu_dropdown_windows_a_tall_category`,
+  `menu_wheel_scrolls_dropdown`, `dropdown_indicator_row_carries_panel_bg`,
+  `dropdown_highlight_never_hidden_in_overflow`, `click_on_inactive_bar_opens_that_category`.

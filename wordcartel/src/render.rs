@@ -164,8 +164,21 @@ pub(crate) fn menu_dropdown_rect(area: Rect, groups: &[(crate::registry::MenuCat
 
 pub(crate) fn menu_dropdown_row_at(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)], open: usize, scroll_top: usize, col: u16, row: u16) -> Option<usize> {
     let r = menu_dropdown_rect(area, groups, open)?;
-    if col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height {
-        Some((row - r.y) as usize + scroll_top)
+    let leaves_len = groups.get(open).map(|g| g.1.len()).unwrap_or(0);
+    let list_h = r.height as usize;
+    // Mirror the paint's overflows condition exactly (render_overlays.rs):
+    // when the category overflows the window the bottom row is reserved for the n/total
+    // indicator — a click there must NOT dispatch a hidden off-screen command.
+    let overflows = leaves_len > list_h;
+    let item_rows = if overflows { list_h.saturating_sub(1) } else { list_h };
+    if col >= r.x && col < r.x + r.width && row >= r.y {
+        let row_in_window = (row - r.y) as usize;
+        if row_in_window < item_rows {
+            let abs = scroll_top + row_in_window;
+            // Defensive guard — keep_visible clamps scroll_top, but never dispatch a
+            // non-existent row if geometry and state are somehow mismatched.
+            if abs < leaves_len { Some(abs) } else { None }
+        } else { None }
     } else { None }
 }
 
@@ -3230,5 +3243,52 @@ mod tests {
             "rendered item at visual row {visual_row} (y={sel_y}) must carry menu_sel fg");
         assert_ne!(fg_at(col, indicator_y), sel_fg,
             "indicator row (y={indicator_y}) must not carry menu_sel fg — it should be norm ({norm_fg:?})");
+    }
+
+    /// T14-d: clicking the reserved indicator row of an overflowing dropdown must return
+    /// `None` — not the index of a hidden off-screen item the user cannot see.
+    ///
+    /// Geometry: 80×8 terminal, 20-leaf category.  avail_below = 7, drop_rect.height = 7,
+    /// item_rows = 6.  The bottom row (drop_rect.y + 6) is the indicator row.  Under the
+    /// old code `menu_dropdown_row_at` returned `Some(scroll_top + 6)` — dispatching the
+    /// 7th item (index 6) which is hidden behind the indicator.  After the fix it returns
+    /// `None`, so the click-outside arm closes the menu instead.
+    #[test]
+    fn dropdown_indicator_row_hit_test_returns_none() {
+        // 80×8 terminal: avail_below=7, drop_rect.height=7, item_rows=6.
+        let area      = Rect::new(0, 0, 80, 8);
+        let menu_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+        let groups    = tall_menu_groups(20);
+
+        let drop_rect = menu_dropdown_rect(menu_area, &groups, 0)
+            .expect("tall category must produce a dropdown rect");
+        // list_h=7, item_rows=6 — the indicator row is at the bottom of drop_rect.
+        let list_h   = drop_rect.height as usize;
+        let item_rows = list_h.saturating_sub(1); // = 6
+        let indicator_row = drop_rect.y + drop_rect.height - 1;
+        let col = drop_rect.x;    // any column within the dropdown
+        let scroll_top = 0usize;
+
+        // A click on the indicator row must return None — no hidden command dispatched.
+        assert_eq!(
+            menu_dropdown_row_at(menu_area, &groups, 0, scroll_top, col, indicator_row),
+            None,
+            "indicator row click must return None (the reserved row is not a visible item)",
+        );
+
+        // A click on the last real item row must return the correct absolute index.
+        let last_item_row = drop_rect.y + (item_rows as u16 - 1);
+        assert_eq!(
+            menu_dropdown_row_at(menu_area, &groups, 0, scroll_top, col, last_item_row),
+            Some(scroll_top + item_rows - 1),
+            "last real item row must return the correct absolute index",
+        );
+
+        // A click on the first item row must also work correctly.
+        assert_eq!(
+            menu_dropdown_row_at(menu_area, &groups, 0, scroll_top, col, drop_rect.y),
+            Some(scroll_top),
+            "first item row must return scroll_top",
+        );
     }
 }
