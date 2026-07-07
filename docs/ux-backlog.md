@@ -427,7 +427,29 @@ BUFFER (`0..buf_len`).
    scope (they already handle lists at whole-list scope — adjacent machinery).
    May stage: defaults first, deepest-snap second, within one effort.
 
-### C3. Cross-app clipboard over SSH/tmux — `needs-design` · Small (minimal fix) / Small–Medium (robust provider model) — reassessed 2026-07-07
+### C3. Cross-app clipboard over SSH/tmux — `SHIPPED` 2026-07-07 (16457f9)
+
+**Shipped:** the full works-everywhere provider/fallback chain (design D). One pure
+`resolve_provider(ClipEnv, forced) -> ProviderPlan{layer1, osc52}` drives: register (source of
+truth) → local owner (`CommandBackend` shelling to wl-copy/xclip/xsel/win32yank/clip.exe, arboard
+native on mac/Windows + Linux fallback, Null) → OSC 52 with tmux/screen DCS wrapping for the
+remote/multiplexer path (bare sequences were being swallowed by tmux `set-clipboard=external`). A
+`clipboard.provider` option (`Auto`/`Native`/`Osc52`/`Off`) conforms to the command-surface contract
+(4 palette-only set primitives + a Settings cycle, one shared setter, Save-Settings round-trip). The
+plan is cached off the per-keystroke hot path (recomputed only on a provider change). Gated: Codex
+spec 3 rounds + Codex plan 3 rounds; 9 TDD tasks (each two-verdict reviewed); Codex pre-merge GO +
+Fable whole-branch GO (2,304-combo `resolve_provider` sweep + cached-plan-coherence + byte-exact
+OSC 52 probes). 918+278+42 tests green, clippy `--workspace` clean, smoke 8/8 PASS. Behavior change
+(latent-bug fix): a bare-headless terminal now reports the clipboard *available* and emits bare
+OSC 52 (old code cried "unavailable" while silently emitting OSC 52). **Deferred follow-up Minors
+(non-blocking):** (1) forced-`Native` headless silent degrade — a worker-side degrade notice would
+honor no-silent-UI more fully (spec-documented tail; forced = user's explicit choice); (2) `Off`↔`Osc52`
+flips send a harmless redundant `SelectProvider(Null)` rebuild. **PRIMARY selection and OSC 52 read
+remain deferred** (nice-to-have). Detailed design/plan: `docs/superpowers/{specs,plans}/2026-07-07-*c3*`.
+
+<details><summary>Original diagnosis + provider-model framing (pre-ship, 2026-06-28 → 2026-07-07)</summary>
+
+**Reassessed 2026-07-07** · Small (minimal fix) / Small–Medium (robust provider model)
 
 **UPDATE 2026-07-07 (re-grounded):** the paste-IN half already shipped since the original diagnosis.
 Bracketed paste is enabled (`term.rs:42` `EnableBracketedPaste`) and `Event::Paste(text)` is handled in
@@ -491,6 +513,8 @@ happy path.) **Paste-in [now SHIPPED — see UPDATE above]:** `arboard` `get()` 
 own bracketed paste arriving as input. **Direction (agreed 2026-06-28):** its own effort — `$TMUX`
 detection + passthrough wrapping, a `.tmux.conf` doc note, bracketed-paste handling [done], tested
 across terminal × tmux × SSH combos. Kept separate from multi-buffer work deliberately.
+
+</details>
 
 ### C4. Close-buffer Save/Discard/Cancel prompt — `SHIPPED` 2026-07-04
 
@@ -1116,8 +1140,9 @@ A6's territory; E2's checkable items serve A5/E1; C2 and C3 are islands.
 
 *(Progress: 1 A6 ✓ · 2 H1 ✓ · 3 B1+B2 ✓ · 4 C4 ✓ · 5 C2 ✓ · 6 D1+A5 ✓ · 7 E3+E4 ✓ · **8 E1+E2 ✓**
 (2026-07-07 @ f7b7b10 — folded effort: E1 + E2 + overlay/mouse completeness + menu windowing) ·
-**B4 SRC-HI ✓** (2026-07-07 @ 1bbd82b) — **next: C3, R1 (in-brainstorm), or Theme S/P; then Effort
-P**. A3's palette-completeness invariant + item-by-item menu-curation pass remains open.)*
+**B4 SRC-HI ✓** (2026-07-07 @ 1bbd82b) · **C3 clipboard provider-chain ✓** (2026-07-07 @ 16457f9) —
+**next: R1 (in-brainstorm), Theme S/P, or A3b menu-curation; then Effort P**. A3's palette-completeness
+invariant + item-by-item menu-curation pass remains open.)*
 
 *(NEW 2026-07-06: **R1 editing-responsiveness** entered brainstorm mid-stream — a
 tight-scope perf/correctness fix (Theme R). Dependency-free; recommended to slot BEFORE Effort P.
@@ -1138,8 +1163,8 @@ May preempt or run alongside E1+E2 at the user's call.)*
 8. **E1 + E2** density presets + polish — **SHIPPED 2026-07-07 @ f7b7b10** (folded effort:
    E1 density presets + E2 polish + overlay/mouse completeness + menu windowing). A3's
    menu-curation pass was NOT folded in — remains open.
-9. **C3** SSH/tmux clipboard — genuinely independent; last by cost shape (a terminal × tmux ×
-   SSH test matrix), not by value; pull it forward whenever the pain bites.
+9. **C3** SSH/tmux clipboard — **SHIPPED 2026-07-07 @ 16457f9** (full works-everywhere provider
+   chain; both final gates GO; smoke 8/8).
 
 Then **Effort P**, landing on a decomposed app.rs, a coherent chrome model, and a settings
 rail. FLAGGED JUDGMENT: B1 sits before the D/E arc on value; pure dependency logic permits
