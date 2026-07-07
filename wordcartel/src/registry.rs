@@ -499,6 +499,24 @@ impl Registry {
         r.register("menu_bar_auto",   "Menu Bar: Auto",   None, |c| { c.editor.set_menu_bar_mode(MenuBarMode::Auto);   CommandResult::Handled });
         r.register("menu_bar_pinned", "Menu Bar: Pinned", None, |c| { c.editor.set_menu_bar_mode(MenuBarMode::Pinned); CommandResult::Handled });
 
+        // Clipboard provider: set-per-state (palette-only) + 4-state cycle representative
+        // (Settings, state-in-label). C3 command-surface conformance.
+        use crate::config::ClipboardProvider;
+        r.register("clipboard_provider_auto",   "Clipboard: Auto",   None, |c| { c.editor.set_clipboard_provider(ClipboardProvider::Auto);   CommandResult::Handled });
+        r.register("clipboard_provider_native", "Clipboard: Native", None, |c| { c.editor.set_clipboard_provider(ClipboardProvider::Native); CommandResult::Handled });
+        r.register("clipboard_provider_osc52",  "Clipboard: OSC 52", None, |c| { c.editor.set_clipboard_provider(ClipboardProvider::Osc52);  CommandResult::Handled });
+        r.register("clipboard_provider_off",    "Clipboard: Off",    None, |c| { c.editor.set_clipboard_provider(ClipboardProvider::Off);    CommandResult::Handled });
+        r.register_stateful("clipboard_provider_cycle", "Clipboard", Some(MenuCategory::Settings),
+            |e| MenuMark::Value(match e.clipboard_provider {
+                ClipboardProvider::Auto => "Auto", ClipboardProvider::Native => "Native",
+                ClipboardProvider::Osc52 => "OSC 52", ClipboardProvider::Off => "Off" }),
+            |c| { let next = match c.editor.clipboard_provider {
+                      ClipboardProvider::Auto => ClipboardProvider::Native,
+                      ClipboardProvider::Native => ClipboardProvider::Osc52,
+                      ClipboardProvider::Osc52 => ClipboardProvider::Off,
+                      ClipboardProvider::Off => ClipboardProvider::Auto };
+                  c.editor.set_clipboard_provider(next); CommandResult::Handled });
+
         // Heading navigation motions (Task 10 / Effort 5g).
         r.register("heading_next",   "Next Heading",   None, |c| { heading_jump(c, Dirn::Next);   CommandResult::Handled });
         r.register("heading_prev",   "Previous Heading", None, |c| { heading_jump(c, Dirn::Prev); CommandResult::Handled });
@@ -777,6 +795,21 @@ mod tests {
         let reg = Registry::builtins();
         assert_eq!(reg.resolve_name("save"), Some(CommandId("save")));
         assert_eq!(reg.resolve_name("nope"), None);
+    }
+
+    #[test]
+    fn clipboard_provider_commands_registered_with_correct_menu_tags() {
+        // Real accessors: resolve_name(&str) -> Option<CommandId> (registry.rs:571);
+        // meta(CommandId) -> Option<&CommandMeta> (registry.rs:577). CommandEntry is private.
+        let reg = Registry::builtins();
+        let meta = |id: &str| reg.meta(reg.resolve_name(id).expect(id)).expect(id);
+        for id in ["clipboard_provider_auto", "clipboard_provider_native",
+                   "clipboard_provider_osc52", "clipboard_provider_off"] {
+            assert_eq!(meta(id).menu, None, "{id} is palette-only");
+        }
+        let cyc = meta("clipboard_provider_cycle");
+        assert_eq!(cyc.menu, Some(MenuCategory::Settings), "cycle is the Settings menu representative");
+        assert!(cyc.state.is_some(), "cycle carries state-in-label");
     }
 
     #[test]
