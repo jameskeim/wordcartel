@@ -338,7 +338,7 @@ fn osc52_oversize_returns_none_for_every_wrap() {
 }
 ```
 
-- [ ] **Step 2: Delete/replace the old `osc52_frames_with_st_terminator` test** if it calls the old one-arg signature (it asserts `osc52_set("hi")`); `osc52_bare_frames_with_st` above supersedes it. Remove the stale test to avoid a compile error.
+- [ ] **Step 2: Remove the two existing one-arg `osc52_set` tests** that no longer compile: `osc52_frames_with_st_terminator` (clipboard.rs ~197, asserts `osc52_set("hi")`) and `osc52_skips_oversize_payload` (clipboard.rs:203, asserts `osc52_set(&big)`). The new `osc52_bare_frames_with_st` and `osc52_oversize_returns_none_for_every_wrap` above supersede them. Deleting them avoids arity compile errors.
 
 - [ ] **Step 3: Run tests to verify they fail**
 
@@ -579,25 +579,35 @@ git commit -m "feat(c3): CommandBackend external-helper Layer-1 + backend_for"
 - [ ] **Step 1: Write the failing tests** (in config.rs test module — follow the existing config-parse test style):
 
 ```rust
+// The real parser is `pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>)` (config.rs:336).
+// Tests write a temp TOML file and load it; `load(&[])` yields defaults. Helper:
+fn load_clip(name: &str, body: &str) -> (Config, Vec<String>) {
+    let p = std::env::temp_dir().join(format!("wcartel-cfg-{}-{name}.toml", std::process::id()));
+    std::fs::write(&p, body).unwrap();
+    let out = load(std::slice::from_ref(&p));
+    let _ = std::fs::remove_file(&p);
+    out
+}
+
 #[test]
 fn clipboard_provider_parses_all_values() {
     for (s, want) in [("auto", ClipboardProvider::Auto), ("native", ClipboardProvider::Native),
                       ("osc52", ClipboardProvider::Osc52), ("off", ClipboardProvider::Off)] {
-        let (cfg, _warns) = Config::from_toml_str(&format!("[clipboard]\nprovider = \"{s}\"\n"));
+        let (cfg, _warns) = load_clip(s, &format!("[clipboard]\nprovider = \"{s}\"\n"));
         assert_eq!(cfg.clipboard.provider, want, "value {s}");
     }
 }
 
 #[test]
 fn clipboard_provider_unknown_warns_and_defaults_auto() {
-    let (cfg, warns) = Config::from_toml_str("[clipboard]\nprovider = \"telepathy\"\n");
+    let (cfg, warns) = load_clip("unknown", "[clipboard]\nprovider = \"telepathy\"\n");
     assert_eq!(cfg.clipboard.provider, ClipboardProvider::Auto);
     assert!(warns.iter().any(|w| w.contains("clipboard.provider")));
 }
 
 #[test]
 fn clipboard_provider_default_is_auto() {
-    let (cfg, _) = Config::from_toml_str("");
+    let (cfg, _) = load(&[]); // no config file → defaults
     assert_eq!(cfg.clipboard.provider, ClipboardProvider::Auto);
 }
 
@@ -609,10 +619,6 @@ fn clipboard_provider_str_roundtrips() {
     assert_eq!(clipboard_provider_str(ClipboardProvider::Off), "off");
 }
 ```
-
-> **Anchor check:** confirm the real constructor used by config tests — the extraction shows parse
-> returns `(Config, warns)`. If the crate's test constructor is named differently (e.g.
-> `Config::parse_str`/`load_from_str`), use that exact name; the assertions are otherwise unchanged.
 
 - [ ] **Step 2: Run to verify fail**
 
@@ -708,7 +714,8 @@ git commit -m "feat(c3): [clipboard] provider config parse + serialize helper"
 ```rust
 #[test]
 fn set_clipboard_provider_sets_field_and_dirty() {
-    let mut e = Editor::empty_for_test(); // use the crate's existing test constructor
+    // Real Editor constructor: new_from_text(text, path, area) (editor.rs:477).
+    let mut e = Editor::new_from_text("x\n", None, (80, 24));
     e.clipboard_provider_dirty = false;
     e.set_clipboard_provider(crate::config::ClipboardProvider::Osc52);
     assert_eq!(e.clipboard_provider, crate::config::ClipboardProvider::Osc52);
@@ -717,9 +724,6 @@ fn set_clipboard_provider_sets_field_and_dirty() {
     assert!(!e.clipboard_provider_dirty, "explicit clear resets it");
 }
 ```
-
-> Use whatever the crate's real `Editor` test constructor is (the A3 setter tests used one —
-> e.g. `Editor::empty_for_test()` or similar). Match it exactly.
 
 - [ ] **Step 2: Run to verify fail**
 
@@ -789,21 +793,19 @@ git commit -m "feat(c3): editor clipboard_provider field + shared setter"
 ```rust
 #[test]
 fn clipboard_provider_commands_registered_with_correct_menu_tags() {
+    // Real accessors: resolve_name(&str) -> Option<CommandId> (registry.rs:571);
+    // meta(CommandId) -> Option<&CommandMeta> (registry.rs:577). CommandEntry is private.
     let reg = Registry::builtins();
+    let meta = |id: &str| reg.meta(reg.resolve_name(id).expect(id)).expect(id);
     for id in ["clipboard_provider_auto", "clipboard_provider_native",
                "clipboard_provider_osc52", "clipboard_provider_off"] {
-        let e = reg.entry(id).expect(id);
-        assert_eq!(e.meta.menu, None, "{id} is palette-only");
+        assert_eq!(meta(id).menu, None, "{id} is palette-only");
     }
-    let cyc = reg.entry("clipboard_provider_cycle").expect("cycle");
-    assert_eq!(cyc.meta.menu, Some(MenuCategory::Settings), "cycle is the Settings menu representative");
-    assert!(cyc.meta.state.is_some(), "cycle carries state-in-label");
+    let cyc = meta("clipboard_provider_cycle");
+    assert_eq!(cyc.menu, Some(MenuCategory::Settings), "cycle is the Settings menu representative");
+    assert!(cyc.state.is_some(), "cycle carries state-in-label");
 }
 ```
-
-> Use the registry's real lookup accessor (the every-option test uses `reg.resolve_name(id)`;
-> the extraction shows entries carry `meta`). If there is no `entry(id) -> &CommandEntry`
-> accessor, assert via `resolve_name`/the existing meta accessor used elsewhere in registry tests.
 
 - [ ] **Step 2: Run to verify fail**
 
@@ -850,7 +852,8 @@ git commit -m "feat(c3): clipboard.provider commands (4 sets + Settings cycle)"
 ### Task 7: Settings persistence — snapshot field + overrides round-trip
 
 **Files:**
-- Modify: `wordcartel/src/settings.rs` — `SettingsSnapshot` field (:37) + field-guard arm + law assertion (:950/:960); `OClipboard` in `OverridesFile` (:79); `parse_mask` (:215); `snapshot_of`/`runtime_snapshot` (:150/:170); `compute_overrides` (:289).
+- Modify: `wordcartel/src/settings.rs` — `SettingsSnapshot` field (:37) + field-guard arm + law assertion (:950/:960); `OClipboard` in `OverridesFile` (:79); `parse_mask` (:215); `snapshot_of`/`runtime_snapshot` (:150/:170); `compute_overrides` (:289); plus the `snap()` test-helper literal (settings.rs:527).
+- Modify: `wordcartel/src/config.rs:912` and `wordcartel/src/e2e.rs:701` — existing `SettingsSnapshot` test-fixture literals that must gain the new field or they won't compile.
 
 **Interfaces:**
 - Consumes: `ClipboardProvider`, `clipboard_provider_str` (config); `editor.clipboard_provider`; `diff_key`/`some_if` (existing settings helpers); the `clipboard_provider_cycle`/`clipboard_provider_auto` commands (Task 6, for the law test).
@@ -933,6 +936,13 @@ let clipboard = some_if(OClipboard { provider }, has_provider);
 
 …and add `clipboard` to the final `OverridesFile { … }` the function returns.
 
+Update the three existing `SettingsSnapshot` literals so they compile with the new field — add `clipboard_provider: crate::config::ClipboardProvider::Auto,` to each:
+- `settings.rs:527` — the `snap()` test helper (after `chrome_disposition`/`canvas`).
+- `config.rs:912` — the `runtime` fixture in the overrides round-trip test.
+- `e2e.rs:701` — the `baseline` fixture in the save-settings e2e.
+
+(These are static baseline/fixture snapshots, so `Auto` — the default — is the correct value; it keeps each test's existing intent unchanged.)
+
 Add the field-guard arm (settings.rs:950 destructure) and the law assertion (settings.rs:960):
 
 ```rust
@@ -997,23 +1007,25 @@ fn spawn_worker_reports_unavailable_for_null_no_osc52() {
 }
 
 #[test]
-fn select_provider_rebuilds_backend_to_null_then_get_is_none() {
+fn select_provider_is_consumed_and_worker_keeps_serving() {
+    // Proves the SelectProvider arm executes and the loop survives it: a Get issued AFTER the
+    // rebuild still gets a response (a broken/absent arm would fail the exhaustive match at compile
+    // time or wedge the loop). The value-level choice→backend swap itself is unit-covered by
+    // `backend_for_maps_choices` (Task 3), which needs no worker or external binary.
     let (tx, rx) = std::sync::mpsc::channel::<crate::app::Msg>();
-    // start with a Null owner (deterministic, no real system clipboard dependency).
     let clip = spawn_worker(tx, ProviderPlan { layer1: Layer1Choice::Null, osc52: None });
     let _ = rx.recv(); // availability
-    let _ = clip.send(ClipReq::SelectProvider(Layer1Choice::Null));
+    clip.send(ClipReq::SelectProvider(Layer1Choice::Arboard)).unwrap();
     clip.send(ClipReq::Get { id: 7, buffer_id: crate::editor::BufferId(0) }).unwrap();
-    match rx.recv().expect("paste msg") {
-        crate::app::Msg::ClipboardPaste { id, text, .. } => { assert_eq!(id, 7); assert_eq!(text, None); }
+    match rx.recv().expect("paste msg after rebuild") {
+        crate::app::Msg::ClipboardPaste { id, .. } => assert_eq!(id, 7, "worker still serves post-rebuild"),
         other => panic!("expected paste, got {other:?}"),
     }
     let _ = clip.send(ClipReq::Shutdown);
 }
 ```
 
-> Use the crate's real `BufferId` constructor (the extraction shows `crate::editor::BufferId`; match
-> its real tuple/newtype form).
+> `BufferId` is `pub struct BufferId(pub u64)` (editor.rs:11), so `BufferId(0)` is correct.
 
 - [ ] **Step 2: Run to verify fail**
 
@@ -1166,9 +1178,12 @@ pub fn drain_clipboard_intents(
 ) {
     let plan = resolve_provider(env, editor.clipboard_provider);
 
-    // Runtime provider change → rebuild the worker's Layer-1 backend FIRST.
+    // Runtime provider change → rebuild the worker's Layer-1 backend FIRST. Surface a dead
+    // worker (never silently drop the change): set the status notice on send failure.
     if editor.clipboard_provider_dirty {
-        let _ = clip_tx.send(ClipReq::SelectProvider(plan.layer1));
+        if clip_tx.send(ClipReq::SelectProvider(plan.layer1)).is_err() {
+            editor.status = "clipboard unavailable".to_string();
+        }
         editor.clear_clipboard_provider_dirty();
     }
 
@@ -1194,7 +1209,20 @@ pub fn drain_clipboard_intents(
 }
 ```
 
-- [ ] **Step 4: Wire startup in app.rs.** Near the config→editor seeding (app.rs:1378, beside the A3 setters) add:
+- [ ] **Step 4: Migrate the five existing drain tests** in `clipboard.rs` (call sites at :232, :247, :265, :283, :289) to the new 5-arg signature. Add a module-level test helper and thread `&bare_env()` in as the second argument to every existing `drain_clipboard_intents(...)` call:
+
+```rust
+// A NeedsOsc52 environment (plain SSH, no display) → plan.osc52 == Some(Bare). Keeps the
+// existing "copy emits bare OSC 52" assertion valid under the new plan-gated emission.
+fn bare_env() -> ClipEnv {
+    ClipEnv { tmux: false, screen: false, ssh: true, wayland: false, x11: false,
+              wsl: false, os: Os::Linux, present: |_| false }
+}
+```
+
+For each existing call, e.g. `drain_clipboard_intents(&mut e, &mut out, &clip_tx, &msg_tx)` becomes `drain_clipboard_intents(&mut e, &bare_env(), &mut out, &clip_tx, &msg_tx)`. The `drain_copy_emits_osc52_and_set_request` byte assertion (`\x1b]52;c;aGk=\x1b\\`) still holds because `bare_env()` (Auto provider, SSH) resolves to `Some(Bare)`. The dead-worker and paste tests are unaffected by the env. Run `cargo test -p wordcartel --lib drain_ 2>&1 | tail -20` after — all green.
+
+- [ ] **Step 5: Wire startup in app.rs.** Near the config→editor seeding (app.rs:1378, beside the A3 setters) add:
 
 ```rust
     editor.set_clipboard_provider(cfg.clipboard.provider);
@@ -1218,14 +1246,14 @@ Update the drain call (app.rs:1664) to pass the cached env:
 > `clip_env` is `Copy` (all fields are `Copy`, `present` is a `fn` pointer), so passing `&clip_env`
 > each frame is free and it stays owned by the run loop.
 
-- [ ] **Step 5: Run the full shell suite + clippy + smoke**
+- [ ] **Step 6: Run the full shell suite + clippy + smoke**
 
 Run: `cargo test -p wordcartel --lib drain_ 2>&1 | tail -20` → PASS.
 Run: `cargo test -p wordcartel-core -p wordcartel 2>&1 | tail -15` → all green.
 Run: `cargo clippy --workspace --all-targets 2>&1 | tail -5` → clean.
 Run: `bash scripts/smoke/run.sh 2>&1 | tail -3` → quote the one-line summary (mandatory-run/advisory-pass; a red S5 is advisory, not a blocker).
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add wordcartel/src/clipboard.rs wordcartel/src/app.rs
@@ -1238,5 +1266,5 @@ git commit -m "feat(c3): wire live provider chain — plan-driven drain + startu
 
 - **Spec coverage:** §2 layers → Tasks 1/3/8/9; §3 detection → Task 1; §4 wrapping → Task 2; §5 override+setter+persistence → Tasks 4/5/6/7; §6 backends → Task 3; §7 degradation (`Null`/status) → Tasks 8/9; §8 testing → per-task tests + Task 9 smoke; §9 file map → matches the task file lists.
 - **Type consistency:** `ProviderPlan`, `Layer1Choice`, `Osc52Wrap`, `ClipEnv`, `resolve_provider`, `backend_for`, `spawn_worker(msg_tx, ProviderPlan)`, `drain_clipboard_intents(editor, &ClipEnv, out, clip_tx, msg_tx)`, `set_clipboard_provider`/`clear_clipboard_provider_dirty`, `clipboard_provider_str`, `OClipboard.provider` — used identically across tasks.
-- **Anchors the implementer must confirm against real source (noted inline):** the `Config` test constructor name (Task 4), the `Editor` test constructor name (Tasks 5/8/9), the registry entry accessor (Task 6), the `BufferId` constructor form (Task 8), and the exact `compute_overrides` arg order (Task 7). Each is called out in-task.
+- **Anchors resolved to real source (Codex plan-gate round 1):** config parser `load(&[PathBuf]) -> (Config, Vec<String>)` (config.rs:336); `Editor::new_from_text(text, path, area)` (editor.rs:477); registry `resolve_name`/`meta(CommandId)` (registry.rs:571/577); `BufferId(pub u64)` (editor.rs:11); `compute_overrides(&runtime, &baseline, &existing, &mask)` (settings.rs:289). Migration sites folded: the two one-arg `osc52_set` tests (Task 2), the five existing drain tests (Task 9 Step 4), and the three external `SettingsSnapshot` literals config.rs:912 / e2e.rs:701 / settings.rs:527 (Task 7).
 - **Open items carried from spec §10 (documented, not silently unsolved):** GNU screen large-payload (>~768 byte) chunking is NOT implemented — screen wrap is byte-correct for typical selections only; nested tmux needs the outer tmux at `set-clipboard on`; per-terminal OSC 52 size caps below 100k may truncate. These are documented limitations, not tasks. If the screen chunking must be pinned, the implementer flags it to the human rather than guessing (per the gating rule on unverifiable claims).
