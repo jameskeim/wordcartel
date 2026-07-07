@@ -14,7 +14,7 @@ This effort **implements** `docs/design/command-surface-contract.md`: fixes law-
 
 ## Global Constraints
 
-- **`Concealed`/`LivePreview`/`SourcePlain` and every existing option command keep today's behavior** — `menu_bar_pin`, `toggle_chrome`, `apply_bundle` must be behavior-identical (now routed through the shared setters). The density tests stay green.
+- **Existing option commands + the profile keep today's behavior, with ONE intentional fix.** `menu_bar_pin` and `toggle_chrome` are behavior-identical (now routed through the shared setters). `apply_bundle` is behavior-preserving for its 6 owned fields + the 9 dwell-clears AND now additionally keeps `menu_bar_unpinned_mode` consistent — an **intentional** change (spec-accepted; previously `apply_bundle` set `menu_bar_mode` directly and left `menu_bar_unpinned_mode` stale). The density tests stay green (they assert the owned fields + `menu_bar_revealed`, not `unpinned_mode`).
 - **Status has no true Off** — `set_status_line_mode(Off)` coerces to `Auto`.
 - **Nullary commands** (rule 10); no argument model.
 - **House style / GATEs:** `cargo test -p wordcartel-core -p wordcartel` green; `cargo clippy --workspace --all-targets` clean; build/`--no-run` warning-free; no `cargo fmt`; em-dash prose comments; exhaustive matches on `TransientMode`/`MenuBarMode`; smoke mandatory-run. Doc-comment new public items.
@@ -39,9 +39,15 @@ fn setters_set_field_and_clear_dwell() {
     e.set_scrollbar_mode(TransientMode::On);
     assert_eq!(e.scrollbar_mode, TransientMode::On);
     assert!(!e.mouse.scrollbar_revealed && e.mouse.scrollbar_reveal_due.is_none());
-    // status: Off coerces to Auto (no true Off)
+    // status: Off coerces to Auto (no true Off) + status dwell cleared
+    e.mouse.status_revealed = true; e.mouse.status_hide_due = Some(7);
     e.set_status_line_mode(TransientMode::Off);
     assert_eq!(e.status_line_mode, TransientMode::Auto);
+    assert!(!e.mouse.status_revealed && e.mouse.status_hide_due.is_none());
+    // menu: dwell cleared
+    e.mouse.menu_bar_revealed = true; e.mouse.menu_reveal_due = Some(3);
+    e.set_menu_bar_mode(MenuBarMode::Auto);
+    assert!(!e.mouse.menu_bar_revealed && e.mouse.menu_reveal_due.is_none());
 }
 
 #[test]
@@ -55,6 +61,19 @@ fn set_menu_bar_mode_keeps_unpinned_mode_consistent() {
     assert_eq!(e.menu_bar_unpinned_mode, MenuBarMode::Auto, "Pinned set → remembers prior non-Pinned");
     e.set_menu_bar_mode(MenuBarMode::Hidden);
     assert_eq!(e.menu_bar_unpinned_mode, MenuBarMode::Hidden);
+}
+
+#[test]
+fn apply_bundle_keeps_menu_bar_unpinned_mode_consistent() {
+    // INTENTIONAL change (spec-accepted): apply_bundle now routes menu_bar through
+    // set_menu_bar_mode, so FULL (Pinned) remembers the prior non-Pinned mode as the unpin
+    // target; previously apply_bundle left menu_bar_unpinned_mode stale.
+    use crate::config::MenuBarMode;
+    let mut e = Editor::new_from_text("x\n", None, (40, 8));
+    e.set_menu_bar_mode(MenuBarMode::Hidden); // prior non-Pinned mode = Hidden
+    crate::density::apply_bundle(&mut e, &crate::density::FULL); // FULL sets Pinned
+    assert_eq!(e.menu_bar_mode, MenuBarMode::Pinned);
+    assert_eq!(e.menu_bar_unpinned_mode, MenuBarMode::Hidden, "FULL remembers the prior mode as unpin target");
 }
 ```
 
@@ -325,9 +344,13 @@ fn hints_reresolve_on_preset_switch() {
     let cfg = |p: &str| crate::config::KeymapConfig { preset: p.into(), patches: vec![] };
     let (cua, _) = build_keymap(&cfg("cua"), &reg);
     let (ws, _)  = build_keymap(&cfg("wordstar"), &reg);
-    // move_up: CUA = an arrow key; WordStar = ctrl-e. The hint must differ by preset.
-    assert_ne!(cua.chord_for(crate::registry::CommandId("move_up")),
-               ws.chord_for(crate::registry::CommandId("move_up")));
+    // save: CUA = `ctrl-s` (keymap.rs:249, shortest); WordStar binds save ONLY under ctrl-k combos
+    // (`ctrl-k s` / `ctrl-k ctrl-s` / …, keymap.rs:376 — all longer), and `ctrl-s` is move_left in
+    // WordStar. So the two presets' save hints genuinely differ.
+    // (Do NOT use move_up: WordStar binds BOTH `ctrl-e` AND `up` to it, so chord_for returns "up"
+    //  for both presets — a vacuous assert_ne.)
+    assert_ne!(cua.chord_for(crate::registry::CommandId("save")),
+               ws.chord_for(crate::registry::CommandId("save")));
 }
 
 #[test]
@@ -366,4 +389,4 @@ fn custom_bind_surfaces_in_menu_and_palette() {
 
 - Verify `dispatch_id` (registry test helper), `menu_leaf_label` composition ("Scrollbar" + Value("Auto") → "Scrollbar: Auto"), and the exact `KeymapConfig`/`KeymapPatch` field names (`bind: BTreeMap<String,String>`, `unbind: Vec<String>`, `cua`/`wordstar: Option<ScopedPatch>`) against the real source before writing the tests.
 - If any View menu-list assertion (registry.rs ~801) enumerates View commands, add `cycle_scrollbar`/`toggle_status_line`.
-- Pick a genuinely preset-differing command for `hints_reresolve_on_preset_switch` by reading the CUA vs WORDSTAR tables (keymap.rs) — do not assume `move_up`.
+- `hints_reresolve_on_preset_switch` uses `save` (verified preset-differing: CUA `ctrl-s` at keymap.rs:249 vs WordStar's `ctrl-k` combos at keymap.rs:376; `move_up` is NOT usable — WordStar binds both `ctrl-e` and `up` to it).
