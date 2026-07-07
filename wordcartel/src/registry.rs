@@ -554,8 +554,12 @@ fn toggle_chrome(editor: &mut crate::editor::Editor) {
         ChromeDisposition::Full => ChromeDisposition::Zen,
         ChromeDisposition::Zen  => ChromeDisposition::Full,
     };
-    editor.chrome_disposition = new_disp;
+    // Apply the whole density bundle for the new disposition (color + visibility),
+    // then request the re-derive. Re-selecting a preset re-applies its bundle over
+    // unsaved runtime state (spec §1.5 — runtime-clobber). rebuild for measure.
+    crate::density::apply_bundle(editor, crate::density::bundle_for(new_disp));
     editor.theme_rederive = true;
+    crate::derive::rebuild(editor); // measure change affects layout
     let label = match new_disp { ChromeDisposition::Full => "full", ChromeDisposition::Zen => "zen" };
     // Arm 2 — non-Rgb bases: derive_chrome early-returns on non-Rgb (Color::Default /
     // named colors). The flip is recorded and persists, but the visible chrome is unchanged.
