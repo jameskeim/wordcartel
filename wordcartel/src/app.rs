@@ -1503,7 +1503,13 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Msg>();
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
     let executor = crate::jobs::ThreadExecutor::new(wake_tx);
-    let clip_tx = crate::clipboard::spawn_worker(msg_tx.clone());
+    let clip_tx = crate::clipboard::spawn_worker(
+        msg_tx.clone(),
+        crate::clipboard::ProviderPlan {
+            layer1: crate::clipboard::Layer1Choice::Null,
+            osc52: None,
+        },
+    );
 
     // Worker → loop wake relay: each result nudges the loop to drain. reduce()'s
     // trailing ex.drain() does the actual merge, so Msg::Tick is the nudge.

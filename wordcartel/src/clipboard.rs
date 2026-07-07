@@ -138,6 +138,7 @@ pub struct PasteIntent {
 pub enum ClipReq {
     Set(String),
     Get { id: u64, buffer_id: crate::editor::BufferId },
+    SelectProvider(Layer1Choice),
     Shutdown,
 }
 
@@ -177,23 +178,18 @@ pub fn drain_clipboard_intents(
     }
 }
 
-/// Spawn the long-lived clipboard worker. arboard is initialized INSIDE the worker
-/// (off the startup path); availability is reported once via Msg::ClipboardAvailability.
-pub fn spawn_worker(msg_tx: Sender<crate::app::Msg>) -> Sender<ClipReq> {
+/// Spawn the long-lived clipboard worker with an initial resolved plan. The Layer-1
+/// backend is built from `initial.layer1`; availability reflects the whole plan
+/// (`layer1 != Null || osc52.is_some()`), so a plain-SSH plan (Null + OSC 52) reports
+/// available. `SelectProvider` rebuilds the backend live on a runtime provider change.
+pub fn spawn_worker(msg_tx: Sender<crate::app::Msg>, initial: ProviderPlan) -> Sender<ClipReq> {
     let (tx, rx) = std::sync::mpsc::channel::<ClipReq>();
     std::thread::Builder::new()
         .name("wcartel-clipboard".into())
         .spawn(move || {
-            let mut backend: Box<dyn ClipboardBackend> = match ArboardBackend::try_new() {
-                Some(b) => {
-                    let _ = msg_tx.send(crate::app::Msg::ClipboardAvailability(true));
-                    Box::new(b)
-                }
-                None => {
-                    let _ = msg_tx.send(crate::app::Msg::ClipboardAvailability(false));
-                    Box::new(NullBackend)
-                }
-            };
+            let available = initial.layer1 != Layer1Choice::Null || initial.osc52.is_some();
+            let _ = msg_tx.send(crate::app::Msg::ClipboardAvailability(available));
+            let mut backend: Box<dyn ClipboardBackend> = backend_for(initial.layer1);
             while let Ok(req) = rx.recv() {
                 match req {
                     ClipReq::Set(s) => backend.set(&s),
@@ -201,6 +197,7 @@ pub fn spawn_worker(msg_tx: Sender<crate::app::Msg>) -> Sender<ClipReq> {
                         let text = backend.get().filter(|s| !s.is_empty());
                         let _ = msg_tx.send(crate::app::Msg::ClipboardPaste { id, buffer_id, text });
                     }
+                    ClipReq::SelectProvider(choice) => { backend = backend_for(choice); }
                     ClipReq::Shutdown => break,
                 }
             }
@@ -652,5 +649,47 @@ mod tests {
         ed.clipboard_sync_request = Some("hello".to_string());
         drain_clipboard_intents(&mut ed, &mut out, &clip_tx, &msg_tx);
         assert_eq!(ed.status, "clipboard unavailable");
+    }
+
+    #[test]
+    fn spawn_worker_reports_available_for_null_plus_osc52() {
+        // plain-SSH plan: Null layer1 but OSC 52 enabled → available == true.
+        let (tx, rx) = std::sync::mpsc::channel::<crate::app::Msg>();
+        let plan = ProviderPlan { layer1: Layer1Choice::Null, osc52: Some(Osc52Wrap::Bare) };
+        let clip = spawn_worker(tx, plan);
+        match rx.recv().expect("availability msg") {
+            crate::app::Msg::ClipboardAvailability(a) => assert!(a, "Null+OSC52 is available"),
+            other => panic!("expected availability, got {other:?}"),
+        }
+        let _ = clip.send(ClipReq::Shutdown);
+    }
+
+    #[test]
+    fn spawn_worker_reports_unavailable_for_null_no_osc52() {
+        let (tx, rx) = std::sync::mpsc::channel::<crate::app::Msg>();
+        let plan = ProviderPlan { layer1: Layer1Choice::Null, osc52: None };
+        let clip = spawn_worker(tx, plan);
+        match rx.recv().expect("availability msg") {
+            crate::app::Msg::ClipboardAvailability(a) => assert!(!a, "Null+no-OSC52 is unavailable"),
+            other => panic!("expected availability, got {other:?}"),
+        }
+        let _ = clip.send(ClipReq::Shutdown);
+    }
+
+    #[test]
+    fn select_provider_is_consumed_and_worker_keeps_serving() {
+        // Loop-continuity coverage: after a SelectProvider, the worker still answers a Get (a panicking
+        // arm or a broken loop would hang or fail this). This does NOT by itself prove the backend value
+        // swapped — that is unit-covered by `backend_for_maps_choices` (Task 3), which needs no worker.
+        let (tx, rx) = std::sync::mpsc::channel::<crate::app::Msg>();
+        let clip = spawn_worker(tx, ProviderPlan { layer1: Layer1Choice::Null, osc52: None });
+        let _ = rx.recv(); // availability
+        clip.send(ClipReq::SelectProvider(Layer1Choice::Arboard)).unwrap();
+        clip.send(ClipReq::Get { id: 7, buffer_id: crate::editor::BufferId(0) }).unwrap();
+        match rx.recv().expect("paste msg after rebuild") {
+            crate::app::Msg::ClipboardPaste { id, .. } => assert_eq!(id, 7, "worker still serves post-rebuild"),
+            other => panic!("expected paste, got {other:?}"),
+        }
+        let _ = clip.send(ClipReq::Shutdown);
     }
 }
