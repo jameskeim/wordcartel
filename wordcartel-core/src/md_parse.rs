@@ -1,16 +1,18 @@
 //! Inline markdown conceal + style analysis for one logical line.
 //! Conceal-grid technique adapted from the validated layout spike.
-use crate::style::{BlockRole, LineAnalysis, Run, Style, StyleSpan};
+use crate::style::{BlockRole, LineAnalysis, LineRender, Run, Style, StyleSpan};
 use std::ops::Range;
 
 /// Analyze a logical line into visible/concealed runs and style spans.
 ///
-/// If `is_active` is true (the cursor line), return the full source as one
-/// visible run with no styles — the editor shows raw markdown for the active
-/// line.  Otherwise, parse with pulldown-cmark and compute conceal + styles.
-pub fn analyze(line: &str, role: BlockRole, is_active: bool) -> LineAnalysis {
-    // Active line: show raw source.
-    if is_active || line.is_empty() {
+/// The `render` descriptor selects among three modes:
+/// - `RawPlain`: show raw source with no styles (cursor/active line, SourcePlain).
+/// - `Concealed`: hide markdown markers and style content (LivePreview inactive).
+/// - `RawStyled`: show raw source with every construct styled — delimiters,
+///   block prefixes, and content all carry their element face (SourceHighlighted).
+pub fn analyze(line: &str, role: BlockRole, render: LineRender) -> LineAnalysis {
+    // RawPlain: show raw source, no styles (the old is_active=true path).
+    if render == LineRender::RawPlain || line.is_empty() {
         return LineAnalysis {
             runs: vec![Run { src: 0..line.len(), visible: true }],
             styles: vec![],
@@ -18,6 +20,7 @@ pub fn analyze(line: &str, role: BlockRole, is_active: bool) -> LineAnalysis {
             prefix_glyph: None,
         };
     }
+    let raw_styled = render == LineRender::RawStyled;
 
     use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
@@ -41,59 +44,75 @@ pub fn analyze(line: &str, role: BlockRole, is_active: bool) -> LineAnalysis {
     for (ev, range) in parser {
         match ev {
             Event::Start(Tag::Strong) => {
-                conceal.push(range);
                 strong += 1;
+                // RawStyled: push a whole-span style for the delimiter + content;
+                // Concealed: add to the conceal list (content revealed by Text event).
+                if raw_styled { styles.push(StyleSpan { src: range, style: current_style(strong, em, strike, link) }); }
+                else { conceal.push(range); }
             }
             Event::End(TagEnd::Strong) => {
                 strong = strong.saturating_sub(1);
             }
             Event::Start(Tag::Emphasis) => {
-                conceal.push(range);
                 em += 1;
+                if raw_styled { styles.push(StyleSpan { src: range, style: current_style(strong, em, strike, link) }); }
+                else { conceal.push(range); }
             }
             Event::End(TagEnd::Emphasis) => {
                 em = em.saturating_sub(1);
             }
             Event::Start(Tag::Strikethrough) => {
-                conceal.push(range);
                 strike += 1;
+                if raw_styled { styles.push(StyleSpan { src: range, style: current_style(strong, em, strike, link) }); }
+                else { conceal.push(range); }
             }
             Event::End(TagEnd::Strikethrough) => {
                 strike = strike.saturating_sub(1);
             }
             Event::Start(Tag::Link { .. }) => {
-                conceal.push(range);
                 link += 1;
+                if raw_styled { styles.push(StyleSpan { src: range, style: current_style(strong, em, strike, link) }); }
+                else { conceal.push(range); }
             }
             Event::End(TagEnd::Link) => {
                 link = link.saturating_sub(1);
             }
             Event::Text(_) => {
-                reveal.push(range.clone());
+                // In Concealed mode the text must be re-revealed (the whole span was
+                // concealed by the Start event). In RawStyled every byte is already
+                // visible — no reveal needed. Either way, push a content style span.
+                if !raw_styled { reveal.push(range.clone()); }
                 let style = current_style(strong, em, strike, link);
                 if style != Style::Plain {
                     styles.push(StyleSpan { src: range, style });
                 }
             }
             Event::Code(_) => {
-                // Conceal the leading and trailing backtick fence; reveal the
-                // inner content and mark it as Code.
-                let bytes = &line.as_bytes()[range.clone()];
-                let lead = bytes.iter().take_while(|&&b| b == b'`').count();
-                let trail = bytes.iter().rev().take_while(|&&b| b == b'`').count();
-                conceal.push(range.start..range.start + lead);
-                conceal.push(range.end - trail..range.end);
-                let inner = range.start + lead..range.end - trail;
-                reveal.push(inner.clone());
-                if !inner.is_empty() {
-                    styles.push(StyleSpan { src: inner, style: Style::Code });
+                if raw_styled {
+                    // Style the whole span (backticks + inner) as Code — no fence conceal.
+                    styles.push(StyleSpan { src: range.clone(), style: Style::Code });
+                } else {
+                    // Conceal the leading and trailing backtick fence; reveal the
+                    // inner content and mark it as Code.
+                    let bytes = &line.as_bytes()[range.clone()];
+                    let lead = bytes.iter().take_while(|&&b| b == b'`').count();
+                    let trail = bytes.iter().rev().take_while(|&&b| b == b'`').count();
+                    conceal.push(range.start..range.start + lead);
+                    conceal.push(range.end - trail..range.end);
+                    let inner = range.start + lead..range.end - trail;
+                    reveal.push(inner.clone());
+                    if !inner.is_empty() {
+                        styles.push(StyleSpan { src: inner, style: Style::Code });
+                    }
                 }
             }
             Event::InlineHtml(_) => {
                 // Style a `<!-- … -->` inline comment; leave other inline HTML (<span> etc.) Plain.
                 let s = &line[range.clone()];
                 if s.starts_with("<!--") && s.ends_with("-->") {
-                    reveal.push(range.clone());          // keep the comment visible
+                    // In Concealed mode the comment bytes may have been hidden by a wrapping
+                    // construct — re-reveal them. In RawStyled all bytes are already visible.
+                    if !raw_styled { reveal.push(range.clone()); }
                     styles.push(StyleSpan { src: range, style: Style::Comment });
                 }
             }
@@ -101,39 +120,46 @@ pub fn analyze(line: &str, role: BlockRole, is_active: bool) -> LineAnalysis {
         }
     }
 
-    // Apply conceal then reveal (reveal wins over conceal).
-    for r in conceal {
-        for b in r {
-            if b < n {
-                visible[b] = false;
+    // Apply conceal/reveal, escapes, and block-prefix conceal only for Concealed mode.
+    // RawStyled reveals all bytes — no mutations to the visibility grid needed.
+    let prefix_glyph = if !raw_styled {
+        // Apply conceal then reveal (reveal wins over conceal).
+        for r in conceal {
+            for b in r {
+                if b < n {
+                    visible[b] = false;
+                }
             }
         }
-    }
-    for r in reveal {
-        for b in r {
-            if b < n {
-                visible[b] = true;
+        for r in reveal {
+            for b in r {
+                if b < n {
+                    visible[b] = true;
+                }
             }
         }
-    }
 
-    // Escapes: hide the backslash in `\<punctuation>` sequences.
-    // Do this after the conceal/reveal pass so it overrides the grid
-    // independently of how pulldown-cmark handles escape events.
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    while i + 1 < n {
-        if bytes[i] == b'\\' && bytes[i + 1].is_ascii_punctuation() {
-            visible[i] = false;
+        // Escapes: hide the backslash in `\<punctuation>` sequences.
+        // Do this after the conceal/reveal pass so it overrides the grid
+        // independently of how pulldown-cmark handles escape events.
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i + 1 < n {
+            if bytes[i] == b'\\' && bytes[i + 1].is_ascii_punctuation() {
+                visible[i] = false;
+            }
+            i += 1;
         }
-        i += 1;
-    }
 
-    // Block-prefix conceal: LAST grid mutation before collapse_runs.
-    // This runs AFTER inline conceal/reveal/escape so # markers cannot be
-    // re-revealed by the inline reveal pass (e.g. "## **bold**" hides both
-    // "## " and "**", leaving "bold" styled Strong).
-    let prefix_glyph = apply_block_prefix_conceal(&mut visible, line, &role);
+        // Block-prefix conceal: LAST grid mutation before collapse_runs.
+        // This runs AFTER inline conceal/reveal/escape so # markers cannot be
+        // re-revealed by the inline reveal pass (e.g. "## **bold**" hides both
+        // "## " and "**", leaving "bold" styled Strong).
+        apply_block_prefix_conceal(&mut visible, line, &role)
+    } else {
+        // RawStyled: all bytes remain visible; block prefixes show in raw source.
+        None
+    };
 
     // Collapse the visible grid to Run slices.
     let runs = collapse_runs(&visible, n);
@@ -390,7 +416,7 @@ mod tests {
     #[test]
     fn active_line_is_raw() {
         let line = "a **b** c";
-        let a = analyze(line, BlockRole::Paragraph, true);
+        let a = analyze(line, BlockRole::Paragraph, LineRender::RawPlain);
         assert_eq!(a.runs, vec![Run { src: 0..line.len(), visible: true }]);
         assert!(a.styles.is_empty());
     }
@@ -399,7 +425,7 @@ mod tests {
     fn strong_conceals_markers_keeps_text_with_style() {
         // bytes: a=0 ' '=1 *=2 *=3 b=4 o=5 l=6 d=7 *=8 *=9 ' '=10 c=11
         let line = "a **bold** c";
-        let a = analyze(line, BlockRole::Paragraph, false);
+        let a = analyze(line, BlockRole::Paragraph, LineRender::Concealed);
         assert_eq!(visible(&a, line), "a bold c"); // ** hidden
         assert_eq!(style_at(&a, 4), Some(Style::Strong)); // 'b' of bold at byte 4
         assert_eq!(style_at(&a, 7), Some(Style::Strong)); // 'd' of bold, still Strong
@@ -409,14 +435,14 @@ mod tests {
     fn escaped_marker_shows_literal() {
         // backslash escapes the asterisk: the '*' is literal text, the '\' is hidden.
         let line = r"a \* b"; // bytes: a=0 ' '=1 \=2 *=3 ' '=4 b=5
-        let a = analyze(line, BlockRole::Paragraph, false);
+        let a = analyze(line, BlockRole::Paragraph, LineRender::Concealed);
         assert_eq!(visible(&a, line), "a * b"); // backslash concealed, * literal
     }
 
     #[test]
     fn emphasis_and_code_and_strike() {
         let line = "*i* `c` ~~s~~";
-        let a = analyze(line, BlockRole::Paragraph, false);
+        let a = analyze(line, BlockRole::Paragraph, LineRender::Concealed);
         assert_eq!(visible(&a, line), "i c s");
         assert_eq!(style_at(&a, 1), Some(Style::Emphasis));   // 'i'
         assert_eq!(style_at(&a, 5), Some(Style::Code));       // 'c'
@@ -426,7 +452,7 @@ mod tests {
     #[test]
     fn link_hides_target_keeps_text() {
         let line = "see [docs](http://x.io) now";
-        let a = analyze(line, BlockRole::Paragraph, false);
+        let a = analyze(line, BlockRole::Paragraph, LineRender::Concealed);
         assert_eq!(visible(&a, line), "see docs now");
         // 'd' of docs is at byte 5
         assert_eq!(style_at(&a, 5), Some(Style::Link));
@@ -435,7 +461,7 @@ mod tests {
     #[test]
     fn bold_italic_is_strong_emphasis() {
         let line = "***x***"; // 'x' at byte 3
-        let a = analyze(line, BlockRole::Paragraph, false);
+        let a = analyze(line, BlockRole::Paragraph, LineRender::Concealed);
         assert_eq!(visible(&a, line), "x");
         assert_eq!(style_at(&a, 3), Some(Style::StrongEmphasis));
     }
@@ -444,45 +470,45 @@ mod tests {
 
     #[test]
     fn heading_prefix_concealed() {
-        let a = analyze("## Title", BlockRole::Heading(2), false);
+        let a = analyze("## Title", BlockRole::Heading(2), LineRender::Concealed);
         assert_eq!(visible(&a, "## Title"), "Title"); // "## " hidden
     }
 
     #[test]
     fn blockquote_prefix_concealed() {
-        let a = analyze("> quoted", BlockRole::BlockQuote, false);
+        let a = analyze("> quoted", BlockRole::BlockQuote, LineRender::Concealed);
         assert_eq!(visible(&a, "> quoted"), "quoted");
     }
 
     #[test]
     fn blockquote_has_bar_glyph() {
-        let a = analyze("> quoted", BlockRole::BlockQuote, false);
+        let a = analyze("> quoted", BlockRole::BlockQuote, LineRender::Concealed);
         assert_eq!(a.prefix_glyph.as_deref(), Some("▎ "));
         assert_eq!(visible(&a, "> quoted"), "quoted"); // existing conceal still holds
     }
 
     #[test]
     fn thematic_break_has_rule_glyph() {
-        let a = analyze("---", BlockRole::ThematicBreak, false);
+        let a = analyze("---", BlockRole::ThematicBreak, LineRender::Concealed);
         assert_eq!(a.prefix_glyph.as_deref(), Some("─── "));
     }
 
     #[test]
     fn list_marker_becomes_bullet_glyph() {
-        let a = analyze("- item", BlockRole::ListItem, false);
+        let a = analyze("- item", BlockRole::ListItem, LineRender::Concealed);
         assert_eq!(visible(&a, "- item"), "item");
         assert_eq!(a.prefix_glyph.as_deref(), Some("• "));
     }
 
     #[test]
     fn fence_line_concealed() {
-        let a = analyze("```rust", BlockRole::CodeBlock, false);
+        let a = analyze("```rust", BlockRole::CodeBlock, LineRender::Concealed);
         assert_eq!(visible(&a, "```rust"), ""); // fence line hidden
     }
 
     #[test]
     fn active_line_keeps_block_prefix_raw() {
-        let a = analyze("## Title", BlockRole::Heading(2), true);
+        let a = analyze("## Title", BlockRole::Heading(2), LineRender::RawPlain);
         assert_eq!(visible(&a, "## Title"), "## Title"); // raw on cursor line
         assert!(a.prefix_glyph.is_none());
     }
@@ -491,7 +517,7 @@ mod tests {
     fn heading_prefix_composes_with_inline_style() {
         // "## **bold**" -> "## " AND "**" hidden, leaving "bold" as Strong.
         let line = "## **bold**";
-        let a = analyze(line, BlockRole::Heading(2), false);
+        let a = analyze(line, BlockRole::Heading(2), LineRender::Concealed);
         assert_eq!(visible(&a, line), "bold");
         // 'b' is at byte 5 in "## **bold**"
         assert_eq!(style_at(&a, 5), Some(Style::Strong));
@@ -500,7 +526,7 @@ mod tests {
     #[test]
     fn list_marker_composes_with_inline_style() {
         let line = "- **item**";
-        let a = analyze(line, BlockRole::ListItem, false);
+        let a = analyze(line, BlockRole::ListItem, LineRender::Concealed);
         assert_eq!(visible(&a, line), "item");
         assert_eq!(a.prefix_glyph.as_deref(), Some("• "));
     }
@@ -508,7 +534,7 @@ mod tests {
     #[test]
     fn setext_underline_concealed() {
         // role_at returns Heading for the underline line; conceal the whole "---".
-        let a = analyze("---", BlockRole::Heading(1), false);
+        let a = analyze("---", BlockRole::Heading(1), LineRender::Concealed);
         assert_eq!(visible(&a, "---"), "");
     }
 
@@ -516,7 +542,7 @@ mod tests {
     fn setext_underline_rejects_embedded_spaces() {
         // "- - -" is NOT a setext underline (embedded spaces); with role Heading it
         // must NOT be concealed as an underline — its content stays visible.
-        let a = analyze("- - -", BlockRole::Heading(1), false);
+        let a = analyze("- - -", BlockRole::Heading(1), LineRender::Concealed);
         assert_eq!(visible(&a, "- - -"), "- - -");
     }
 
@@ -525,14 +551,14 @@ mod tests {
     #[test]
     fn heading_tab_after_hash() {
         let line = "#\tTitle";
-        let a = analyze(line, BlockRole::Heading(1), false);
+        let a = analyze(line, BlockRole::Heading(1), LineRender::Concealed);
         assert_eq!(visible(&a, line), "Title");
     }
 
     #[test]
     fn list_unordered_tab_after_marker() {
         let line = "-\titem";
-        let a = analyze(line, BlockRole::ListItem, false);
+        let a = analyze(line, BlockRole::ListItem, LineRender::Concealed);
         assert_eq!(visible(&a, line), "item");
         assert_eq!(a.prefix_glyph.as_deref(), Some("• "));
     }
@@ -540,7 +566,7 @@ mod tests {
     #[test]
     fn list_ordered_tab_after_marker() {
         let line = "1.\titem";
-        let a = analyze(line, BlockRole::ListItem, false);
+        let a = analyze(line, BlockRole::ListItem, LineRender::Concealed);
         assert_eq!(visible(&a, line), "item");
         assert_eq!(a.prefix_glyph.as_deref(), Some("1. "));
     }
@@ -548,7 +574,7 @@ mod tests {
     #[test]
     fn blockquote_tab_after_angle() {
         let line = ">\tq";
-        let a = analyze(line, BlockRole::BlockQuote, false);
+        let a = analyze(line, BlockRole::BlockQuote, LineRender::Concealed);
         assert_eq!(visible(&a, line), "q");
     }
 
@@ -557,21 +583,21 @@ mod tests {
     #[test]
     fn heading_empty_atx_single_hash() {
         let line = "#";
-        let a = analyze(line, BlockRole::Heading(1), false);
+        let a = analyze(line, BlockRole::Heading(1), LineRender::Concealed);
         assert_eq!(visible(&a, line), "");
     }
 
     #[test]
     fn heading_empty_atx_triple_hash() {
         let line = "###";
-        let a = analyze(line, BlockRole::Heading(3), false);
+        let a = analyze(line, BlockRole::Heading(3), LineRender::Concealed);
         assert_eq!(visible(&a, line), "");
     }
 
     #[test]
     fn heading_empty_atx_trailing_spaces() {
         let line = "#  ";
-        let a = analyze(line, BlockRole::Heading(1), false);
+        let a = analyze(line, BlockRole::Heading(1), LineRender::Concealed);
         assert_eq!(visible(&a, line), "");
     }
 
@@ -580,21 +606,21 @@ mod tests {
     #[test]
     fn heading_closing_atx_single_hash() {
         let line = "# Title #";
-        let a = analyze(line, BlockRole::Heading(1), false);
+        let a = analyze(line, BlockRole::Heading(1), LineRender::Concealed);
         assert_eq!(visible(&a, line), "Title");
     }
 
     #[test]
     fn heading_closing_atx_multiple_hashes() {
         let line = "## Title ###";
-        let a = analyze(line, BlockRole::Heading(2), false);
+        let a = analyze(line, BlockRole::Heading(2), LineRender::Concealed);
         assert_eq!(visible(&a, line), "Title");
     }
 
     #[test]
     fn heading_closing_atx_trailing_spaces() {
         let line = "# Title #  ";
-        let a = analyze(line, BlockRole::Heading(1), false);
+        let a = analyze(line, BlockRole::Heading(1), LineRender::Concealed);
         assert_eq!(visible(&a, line), "Title");
     }
 
@@ -602,7 +628,7 @@ mod tests {
     fn heading_closing_atx_content_is_just_hashes() {
         // "## #" -> content is empty after the closing hash is stripped
         let line = "## #";
-        let a = analyze(line, BlockRole::Heading(2), false);
+        let a = analyze(line, BlockRole::Heading(2), LineRender::Concealed);
         assert_eq!(visible(&a, line), "");
     }
 
@@ -610,7 +636,7 @@ mod tests {
     fn heading_closing_not_sequence_no_preceding_ws() {
         // "# Title#" — trailing # not preceded by ws, so it's literal content
         let line = "# Title#";
-        let a = analyze(line, BlockRole::Heading(1), false);
+        let a = analyze(line, BlockRole::Heading(1), LineRender::Concealed);
         assert_eq!(visible(&a, line), "Title#");
     }
 
@@ -618,7 +644,7 @@ mod tests {
     fn heading_closing_not_sequence_mid_content_hash() {
         // "# a #b" — the "#b" run is interrupted by 'b', so not a closing sequence.
         let line = "# a #b";
-        let a = analyze(line, BlockRole::Heading(1), false);
+        let a = analyze(line, BlockRole::Heading(1), LineRender::Concealed);
         assert_eq!(visible(&a, line), "a #b");
     }
 
@@ -627,7 +653,7 @@ mod tests {
         // "# 中 #" — closing # stripped, multibyte content survives intact
         // (the right-to-left # scan must not split or misfire on UTF-8 bytes).
         let line = "# 中 #";
-        let a = analyze(line, BlockRole::Heading(1), false);
+        let a = analyze(line, BlockRole::Heading(1), LineRender::Concealed);
         assert_eq!(visible(&a, line), "中");
     }
 
@@ -635,7 +661,7 @@ mod tests {
     fn heading_empty_atx_trailing_tab() {
         // "#\t" — hash followed by a tab then nothing → empty heading, whole line hidden.
         let line = "#\t";
-        let a = analyze(line, BlockRole::Heading(1), false);
+        let a = analyze(line, BlockRole::Heading(1), LineRender::Concealed);
         assert_eq!(visible(&a, line), "");
     }
 
@@ -643,7 +669,7 @@ mod tests {
 
     #[test]
     fn inline_html_comment_is_styled_comment() {
-        let a = analyze("text <!-- note --> more", BlockRole::Paragraph, false);
+        let a = analyze("text <!-- note --> more", BlockRole::Paragraph, LineRender::Concealed);
         let cmt = a.styles.iter().find(|s| s.style == Style::Comment).expect("comment span");
         // span covers the `<!-- note -->`
         assert_eq!(&"text <!-- note --> more"[cmt.src.clone()], "<!-- note -->");
@@ -651,7 +677,7 @@ mod tests {
 
     #[test]
     fn inline_html_non_comment_tag_is_not_comment() {
-        let a = analyze("a <span>x</span> b", BlockRole::Paragraph, false);
+        let a = analyze("a <span>x</span> b", BlockRole::Paragraph, LineRender::Concealed);
         assert!(a.styles.iter().all(|s| s.style != Style::Comment), "a <span> is not a comment");
     }
 
@@ -659,7 +685,7 @@ mod tests {
 
     #[test]
     fn nested_unordered_indent_concealed_into_glyph() {
-        let a = analyze("  - sub", BlockRole::ListItem, false);
+        let a = analyze("  - sub", BlockRole::ListItem, LineRender::Concealed);
         assert_eq!(visible(&a, "  - sub"), "sub");
         assert_eq!(a.prefix_glyph.as_deref(), Some("  • "));
     }
@@ -668,14 +694,14 @@ mod tests {
     fn tab_indented_item_recognized_and_expanded() {
         // A leading tab is indent (spec D3: the scan is now tab-aware) and expands
         // to TAB_WIDTH spaces in the glyph so widths match the old visual layout.
-        let a = analyze("\t- sub", BlockRole::ListItem, false);
+        let a = analyze("\t- sub", BlockRole::ListItem, LineRender::Concealed);
         assert_eq!(visible(&a, "\t- sub"), "sub");
         assert_eq!(a.prefix_glyph.as_deref(), Some("    • "));
     }
 
     #[test]
     fn nested_ordered_indent_concealed_into_glyph() {
-        let a = analyze("   2. x", BlockRole::ListItem, false);
+        let a = analyze("   2. x", BlockRole::ListItem, LineRender::Concealed);
         assert_eq!(visible(&a, "   2. x"), "x");
         assert_eq!(a.prefix_glyph.as_deref(), Some("   2. "));
     }
@@ -684,7 +710,7 @@ mod tests {
     fn markerless_listitem_continuation_keeps_indent_no_glyph() {
         // Continuation lines of a multi-line item carry ListItem role with no marker
         // (spec I4): indent must stay VISIBLE and no glyph appear — else invisible text.
-        let a = analyze("  second", BlockRole::ListItem, false);
+        let a = analyze("  second", BlockRole::ListItem, LineRender::Concealed);
         assert_eq!(visible(&a, "  second"), "  second");
         assert_eq!(a.prefix_glyph, None);
     }
@@ -694,14 +720,14 @@ mod tests {
     #[test]
     fn heading_regression_no_closing() {
         let line = "## Title";
-        let a = analyze(line, BlockRole::Heading(2), false);
+        let a = analyze(line, BlockRole::Heading(2), LineRender::Concealed);
         assert_eq!(visible(&a, line), "Title");
     }
 
     #[test]
     fn heading_regression_compose_bold() {
         let line = "## **bold**";
-        let a = analyze(line, BlockRole::Heading(2), false);
+        let a = analyze(line, BlockRole::Heading(2), LineRender::Concealed);
         assert_eq!(visible(&a, line), "bold");
         // 'b' is at byte 5 in "## **bold**"
         assert_eq!(style_at(&a, 5), Some(Style::Strong));
@@ -710,8 +736,43 @@ mod tests {
     #[test]
     fn heading_regression_active_line_raw() {
         let line = "## Title";
-        let a = analyze(line, BlockRole::Heading(2), true);
+        let a = analyze(line, BlockRole::Heading(2), LineRender::RawPlain);
         assert_eq!(visible(&a, line), "## Title");
         assert!(a.prefix_glyph.is_none());
+    }
+
+    // --- Task 1: RawStyled branch tests ---
+
+    #[test]
+    fn raw_styled_reveals_all_markers_and_styles_delimiters_and_content() {
+        // "**bold**": RawStyled reveals every byte (no conceal) AND styles the whole
+        // construct (delimiters + content) Strong.
+        let a = analyze("**bold**", BlockRole::Paragraph, LineRender::RawStyled);
+        assert!(a.runs.iter().all(|r| r.visible), "RawStyled conceals nothing");
+        // every byte of "**bold**" resolves to Strong (delimiters included)
+        for b in 0.."**bold**".len() {
+            let s = a.styles.iter().rfind(|s| s.src.contains(&b)).map(|s| s.style);
+            assert_eq!(s, Some(Style::Strong), "byte {b} of **bold** must be Strong");
+        }
+    }
+
+    #[test]
+    fn raw_styled_nested_delimiters_take_position_style() {
+        // "**_x_**": the outer ** = Strong, the inner _ and x = StrongEmphasis.
+        let a = analyze("**_x_**", BlockRole::Paragraph, LineRender::RawStyled);
+        let at = |b: usize| a.styles.iter().rfind(|s| s.src.contains(&b)).map(|s| s.style);
+        assert_eq!(at(0), Some(Style::Strong), "opening ** is Strong");
+        let ux = "**_x_**".find("_x_").unwrap();
+        assert_eq!(at(ux), Some(Style::StrongEmphasis), "inner _ is Strong+Em");        // '_'
+        assert_eq!(at(ux + 1), Some(Style::StrongEmphasis), "x is Strong+Em");          // 'x'
+    }
+
+    #[test]
+    fn concealed_and_rawplain_unchanged() {
+        // Concealed == old is_active=false; RawPlain == old is_active=true.
+        let c = analyze("**bold**", BlockRole::Paragraph, LineRender::Concealed);
+        assert!(c.runs.iter().any(|r| !r.visible), "Concealed still hides the ** markers");
+        let p = analyze("**bold**", BlockRole::Paragraph, LineRender::RawPlain);
+        assert!(p.runs.iter().all(|r| r.visible) && p.styles.is_empty(), "RawPlain = raw, no styles");
     }
 }

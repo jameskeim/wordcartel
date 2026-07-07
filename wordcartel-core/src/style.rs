@@ -21,6 +21,16 @@ pub struct LineAnalysis {
     pub prefix_glyph: Option<String>,
 }
 
+/// How one logical line is rendered into visual rows. Replaces the old
+/// `is_active: bool`. `Concealed` hides markdown markers and styles content
+/// (LivePreview inactive lines). `RawPlain` shows raw source with no styles
+/// (the LivePreview active/caret line and all SourcePlain lines). `RawStyled`
+/// shows raw source with every construct — delimiters, block prefixes, and
+/// content — styled in its element face (SourceHighlighted). Concealment
+/// (hence geometry) is identical for `RawPlain` and `RawStyled`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineRender { Concealed, RawPlain, RawStyled }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,5 +60,9 @@ mod tests {
             super::BlockRole::BlockQuote=>2, super::BlockRole::ListItem=>3,
             super::BlockRole::CodeBlock=>4, super::BlockRole::ThematicBreak=>5,
             super::BlockRole::FrontMatter=>6, super::BlockRole::Comment=>7 } }
+        // compile-guard: every LineRender variant must be named (exhaustive match).
+        fn _exhaustive_line_render(r: super::LineRender) -> u8 { match r {
+            super::LineRender::Concealed=>0, super::LineRender::RawPlain=>1,
+            super::LineRender::RawStyled=>2 } }
     }
 }

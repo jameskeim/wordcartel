@@ -3,7 +3,7 @@
 //! roles/glyphs are correct.
 use wordcartel_core::block_tree::full_parse;
 use wordcartel_core::layout::layout;
-use wordcartel_core::style::BlockRole;
+use wordcartel_core::style::{BlockRole, LineRender};
 
 #[test]
 fn multi_block_doc_renders_with_roles() {
@@ -16,7 +16,7 @@ fn multi_block_doc_renders_with_roles() {
         let trimmed = line.strip_suffix('\n').unwrap_or(line);
         if !trimmed.is_empty() {
             let role = tree.role_at(offset);
-            let (rows, _m) = layout(trimmed, role, false, 80, false);
+            let (rows, _m) = layout(trimmed, role, LineRender::Concealed, 80, false);
             let display: String = rows.iter().map(|r| r.display.clone()).collect();
             got.push((role, display, rows[0].prefix_glyph.clone()));
         }
