@@ -1375,17 +1375,20 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // Seed mouse_capture from config (default true; may be overridden by config layers).
     editor.mouse_capture = cfg.mouse.mouse_capture;
     editor.view_opts = cfg.view.clone();
-    editor.scrollbar_mode = cfg.view.scrollbar;
-    editor.status_line_mode = cfg.view.status_line;
+    // Seed the option modes through the shared setters (contract law 6 — no direct field writes;
+    // set_status_line_mode also enforces the no-true-Off invariant). Dwell-clears are no-ops at
+    // startup (no dwell pending yet).
+    editor.set_scrollbar_mode(cfg.view.scrollbar);
+    editor.set_status_line_mode(cfg.view.status_line);
     editor.resume_enabled = cfg.state.resume; // gates open_into_current's resume restore (Effort 7)
     editor.diag_cfg = cfg.diagnostics.clone();
     editor.export_cfg = cfg.export.clone();
-    editor.menu_bar_mode = cfg.menu.bar;
-    editor.menu_bar_unpinned_mode = if cfg.menu.bar == crate::config::MenuBarMode::Pinned {
-        crate::config::MenuBarMode::Auto // unpin target when config itself pins
-    } else {
-        cfg.menu.bar
-    };
+    editor.set_menu_bar_mode(cfg.menu.bar);
+    // Startup unpin-target policy: when config itself pins the bar, unpin returns to Auto — override
+    // the setter's generic remember-current (the pre-seed mode is not meaningful here).
+    if cfg.menu.bar == crate::config::MenuBarMode::Pinned {
+        editor.menu_bar_unpinned_mode = crate::config::MenuBarMode::Auto;
+    }
     editor.active_keymap_preset = keymap::resolve_preset(&cfg.keymap.preset).to_string();
     // Resolve and seed the active theme + color depth (once, at startup — §3.6).
     let env = crate::theme_resolve::EnvSnapshot::from_env();

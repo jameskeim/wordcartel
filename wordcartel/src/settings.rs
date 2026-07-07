@@ -945,6 +945,18 @@ mod tests {
 
     #[test]
     fn every_persisted_setting_has_a_command() {
+        // Compile-time structural guard: destructuring every field (no `..`) means ADDING a
+        // SettingsSnapshot field fails to compile here until it gets an assertion below (law 2).
+        fn field_guard(s: &SettingsSnapshot) {
+            let SettingsSnapshot {
+                keymap_preset: _, theme_identity: _, view_typewriter: _, view_focus: _,
+                view_measure: _, view_wrap_guide: _, view_word_count: _, view_wrap_column: _,
+                view_scrollbar: _, view_status_line: _, menu_bar: _, mouse_capture: _,
+                chrome_disposition: _, canvas: _,
+            } = s;
+        }
+        let _ = field_guard; // reference it so the guard compiles (no dead_code allow needed)
+
         let reg = crate::registry::Registry::builtins();
         // resolve_name accepts &str (CommandId wraps &'static str, so we use the registry lookup).
         let has = |id: &str| reg.resolve_name(id).is_some();
