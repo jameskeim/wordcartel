@@ -76,96 +76,17 @@ fn no_overlay_open(editor: &Editor) -> bool {
         && editor.prompt.is_none() && editor.minibuffer.is_none() && editor.search.is_none()
 }
 
-pub fn handle(
-    editor: &mut Editor,
-    ev: MouseEvent,
-    reg: &crate::registry::Registry,
-    keymap: &crate::keymap::KeyTrie,
-    ex: &dyn crate::jobs::Executor,
-    clock: &dyn wordcartel_core::history::Clock,
-    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
-) {
-    if editor.pending_mark.is_some() || !editor.mouse_capture {
-        return;
-    }
-    // Universal drag clear: a button release always ends any drag, regardless of
-    // whether an overlay is open. This prevents stale drag state if the user opens
-    // the palette/menu via keyboard while a drag is in flight, then releases the
-    // button — the Up would otherwise be consumed by the overlay branch without
-    // clearing `dragging`/`scrollbar_dragging`. Fall through so normal Up handling
-    // (which redundantly clears the same fields) still runs in the non-overlay path.
-    if let MouseEventKind::Up(MouseButton::Left) = ev.kind {
-        editor.mouse.dragging = false;
-        editor.mouse.scrollbar_dragging = false;
-    }
-    // A1 auto-mode dwell tracking. Runs on every motion frame — keep it trivial
-    // (integer compares + stores only; the reveal/hide fire later in advance()).
-    // The two timers are deliberately ASYMMETRIC: the dwell re-arms on every
-    // row-0 motion (reveal after REST), the grace arms ONCE on the first leave.
-    if editor.menu_bar_mode == crate::config::MenuBarMode::Auto {
-        if let MouseEventKind::Moved = ev.kind {
-            if ev.row > 0 {
-                editor.mouse.menu_reveal_due = None;
-                if editor.mouse.menu_bar_revealed && editor.mouse.menu_hide_due.is_none() {
-                    editor.mouse.menu_hide_due = Some(clock.now_ms() + MENU_LEAVE_GRACE_MS);
-                }
-            } else {
-                editor.mouse.menu_hide_due = None; // re-entry cancels a pending hide
-                if no_overlay_open(editor)
-                    && !editor.mouse.dragging
-                    && !editor.mouse.scrollbar_dragging
-                    && !editor.mouse.menu_bar_revealed
-                {
-                    editor.mouse.menu_reveal_due = Some(clock.now_ms() + MENU_DWELL_MS);
-                }
-            }
-        }
-    }
-    // Scrollbar right-edge dwell (mirror of the menu-bar dwell; col w-1 is the track).
-    if editor.scrollbar_mode == crate::config::TransientMode::Auto {
-        if let MouseEventKind::Moved = ev.kind {
-            let w = editor.active().view.area.0;
-            let at_right_edge = ev.column == w.saturating_sub(1);
-            if at_right_edge {
-                editor.mouse.scrollbar_hide_due = None;
-                if !editor.mouse.scrollbar_revealed
-                    && editor.mouse.scrollbar_reveal_due.is_none()
-                    && no_overlay_open(editor)
-                    && !editor.mouse.dragging && !editor.mouse.scrollbar_dragging
-                {
-                    editor.mouse.scrollbar_reveal_due = Some(clock.now_ms() + MENU_DWELL_MS);
-                }
-            } else {
-                editor.mouse.scrollbar_reveal_due = None;
-                if editor.mouse.scrollbar_revealed && editor.mouse.scrollbar_hide_due.is_none() {
-                    editor.mouse.scrollbar_hide_due = Some(clock.now_ms() + MENU_LEAVE_GRACE_MS);
-                }
-            }
-        }
-    }
-    // Status-line bottom-row dwell (mirror of scrollbar dwell; row h-1 is the reserved row).
-    if editor.status_line_mode == crate::config::TransientMode::Auto {
-        if let MouseEventKind::Moved = ev.kind {
-            let h = editor.active().view.area.1;
-            let at_bottom = h > 0 && ev.row == h - 1;
-            if at_bottom {
-                editor.mouse.status_hide_due = None;
-                if !editor.mouse.status_revealed
-                    && editor.mouse.status_reveal_due.is_none()
-                    && no_overlay_open(editor)
-                {
-                    editor.mouse.status_reveal_due = Some(clock.now_ms() + MENU_DWELL_MS);
-                }
-            } else {
-                editor.mouse.status_reveal_due = None;
-                if editor.mouse.status_revealed && editor.mouse.status_hide_due.is_none() {
-                    editor.mouse.status_hide_due = Some(clock.now_ms() + MENU_LEAVE_GRACE_MS);
-                }
-            }
-        }
-    }
-    let (w, h) = editor.active().view.area;
-    let area = ratatui::layout::Rect::new(0, 0, w, h);
+/// Route a mouse event to the open overlay layer. PRECONDITION: at least one overlay
+/// is open (`!no_overlay_open`). Consumes the event (the caller returns unconditionally
+/// after this). Text-input modals (minibuffer/search/prompt for non-choice clicks)
+/// consume without acting; list overlays scroll/click/click-away (Tasks 10-13).
+// 8 args mirror `handle`'s dispatch context (reg/keymap/ex/clock/msg_tx) plus the
+// precomputed overlay `area`; an args-struct would just duplicate `handle`'s params.
+#[allow(clippy::too_many_arguments)]
+fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rect,
+                 reg: &crate::registry::Registry, keymap: &crate::keymap::KeyTrie,
+                 ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
+                 msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
     if editor.palette.is_some() {
         // `if matches!` — a `match` with a lone arm + `_ => {}` trips
         // clippy::single_match under the deny gate (Codex plan r1).
@@ -274,6 +195,116 @@ pub fn handle(
             }
         }
         return;
+    }
+    // Task 11: outline row scroll/click — placeholder consume for now.
+    if editor.outline.is_some() { return; }
+    // Task 12: diagnostics-overlay clicks — placeholder consume for now.
+    if editor.diag.is_some() { return; }
+    // Task 13: prompt choice clicks — placeholder consume for now.
+    if editor.prompt.is_some() { return; }
+    // Text-input modals: consume, no row action (you type). Tail branch — the fn
+    // ends here, so an empty body suffices (no `return` needed).
+    if editor.minibuffer.is_some() || editor.search.is_some() {}
+}
+
+pub fn handle(
+    editor: &mut Editor,
+    ev: MouseEvent,
+    reg: &crate::registry::Registry,
+    keymap: &crate::keymap::KeyTrie,
+    ex: &dyn crate::jobs::Executor,
+    clock: &dyn wordcartel_core::history::Clock,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+) {
+    if editor.pending_mark.is_some() || !editor.mouse_capture {
+        return;
+    }
+    // Universal drag clear: a button release always ends any drag, regardless of
+    // whether an overlay is open. This prevents stale drag state if the user opens
+    // the palette/menu via keyboard while a drag is in flight, then releases the
+    // button — the Up would otherwise be consumed by the overlay branch without
+    // clearing `dragging`/`scrollbar_dragging`. Fall through so normal Up handling
+    // (which redundantly clears the same fields) still runs in the non-overlay path.
+    if let MouseEventKind::Up(MouseButton::Left) = ev.kind {
+        editor.mouse.dragging = false;
+        editor.mouse.scrollbar_dragging = false;
+    }
+    // Overlay routing runs BEFORE the dwell-arming block: while any modal is open
+    // the event is consumed by route_overlay and nothing leaks to the dwell timers
+    // or the editor. The dwell block + editor match below therefore run ONLY when
+    // no overlay is open.
+    let (w, h) = editor.active().view.area;
+    let area = ratatui::layout::Rect::new(0, 0, w, h);
+    if !no_overlay_open(editor) {
+        route_overlay(editor, ev, area, reg, keymap, ex, clock, msg_tx);
+        return;
+    }
+    // ── from here down: no overlay open — dwell arming + editor gestures ──
+    // A1 auto-mode dwell tracking. Runs on every motion frame — keep it trivial
+    // (integer compares + stores only; the reveal/hide fire later in advance()).
+    // The two timers are deliberately ASYMMETRIC: the dwell re-arms on every
+    // row-0 motion (reveal after REST), the grace arms ONCE on the first leave.
+    if editor.menu_bar_mode == crate::config::MenuBarMode::Auto {
+        if let MouseEventKind::Moved = ev.kind {
+            if ev.row > 0 {
+                editor.mouse.menu_reveal_due = None;
+                if editor.mouse.menu_bar_revealed && editor.mouse.menu_hide_due.is_none() {
+                    editor.mouse.menu_hide_due = Some(clock.now_ms() + MENU_LEAVE_GRACE_MS);
+                }
+            } else {
+                editor.mouse.menu_hide_due = None; // re-entry cancels a pending hide
+                if no_overlay_open(editor)
+                    && !editor.mouse.dragging
+                    && !editor.mouse.scrollbar_dragging
+                    && !editor.mouse.menu_bar_revealed
+                {
+                    editor.mouse.menu_reveal_due = Some(clock.now_ms() + MENU_DWELL_MS);
+                }
+            }
+        }
+    }
+    // Scrollbar right-edge dwell (mirror of the menu-bar dwell; col w-1 is the track).
+    if editor.scrollbar_mode == crate::config::TransientMode::Auto {
+        if let MouseEventKind::Moved = ev.kind {
+            let w = editor.active().view.area.0;
+            let at_right_edge = ev.column == w.saturating_sub(1);
+            if at_right_edge {
+                editor.mouse.scrollbar_hide_due = None;
+                if !editor.mouse.scrollbar_revealed
+                    && editor.mouse.scrollbar_reveal_due.is_none()
+                    && no_overlay_open(editor)
+                    && !editor.mouse.dragging && !editor.mouse.scrollbar_dragging
+                {
+                    editor.mouse.scrollbar_reveal_due = Some(clock.now_ms() + MENU_DWELL_MS);
+                }
+            } else {
+                editor.mouse.scrollbar_reveal_due = None;
+                if editor.mouse.scrollbar_revealed && editor.mouse.scrollbar_hide_due.is_none() {
+                    editor.mouse.scrollbar_hide_due = Some(clock.now_ms() + MENU_LEAVE_GRACE_MS);
+                }
+            }
+        }
+    }
+    // Status-line bottom-row dwell (mirror of scrollbar dwell; row h-1 is the reserved row).
+    if editor.status_line_mode == crate::config::TransientMode::Auto {
+        if let MouseEventKind::Moved = ev.kind {
+            let h = editor.active().view.area.1;
+            let at_bottom = h > 0 && ev.row == h - 1;
+            if at_bottom {
+                editor.mouse.status_hide_due = None;
+                if !editor.mouse.status_revealed
+                    && editor.mouse.status_reveal_due.is_none()
+                    && no_overlay_open(editor)
+                {
+                    editor.mouse.status_reveal_due = Some(clock.now_ms() + MENU_DWELL_MS);
+                }
+            } else {
+                editor.mouse.status_reveal_due = None;
+                if editor.mouse.status_revealed && editor.mouse.status_hide_due.is_none() {
+                    editor.mouse.status_hide_due = Some(clock.now_ms() + MENU_LEAVE_GRACE_MS);
+                }
+            }
+        }
     }
     match ev.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -837,19 +868,19 @@ mod tests {
         assert!(e.mouse.menu_bar_revealed, "bar must still be revealed after re-entry");
     }
 
-    /// Case 6: leave-bookkeeping runs even while the dropdown is open (the arm
-    /// sits before the overlay return — spec I1).
+    /// New invariant (overlay-route-before-dwell): leave-bookkeeping does NOT run while
+    /// the dropdown is open — dwell is suppressed for every open overlay (no-leak guard).
     #[test]
-    fn leave_bookkeeping_runs_while_dropdown_open() {
+    fn dwell_suppressed_while_dropdown_open() {
         let mut e = Editor::new_from_text("hello\n", None, (40, 8));
         crate::derive::rebuild(&mut e);
-        let (reg, ex, _, tx, km) = ctx();
         e.menu_bar_mode = crate::config::MenuBarMode::Auto;
         e.mouse.menu_bar_revealed = true;
         e.menu = Some(crate::menu::empty_at(0)); // dropdown open
+        let (reg, ex, _, tx, km) = ctx();
         handle(&mut e, moved(5, 5), &reg, &km, &ex, &TestClock(0), &tx);
-        assert_eq!(e.mouse.menu_hide_due, Some(MENU_LEAVE_GRACE_MS),
-            "leave-bookkeeping must run even with the dropdown open");
+        assert!(e.mouse.menu_hide_due.is_none(),
+            "dwell (incl. leave-bookkeeping) must not run while an overlay is open");
     }
 
     #[test]
@@ -1000,5 +1031,53 @@ mod tests {
         assert!(e.palette.is_none(), "palette must close after clicking a buffer row");
         assert_eq!(e.active().id, scratch_id,
             "click must switch to the clicked row's buffer (scratch), not reopen the palette");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 9: universal no-leak guard + dwell ordering
+    // -----------------------------------------------------------------------
+
+    /// Dwell must never arm the menu-bar reveal while ANY modal is open — the
+    /// overlay route sits before the dwell-arming block, so no modal can leak a
+    /// motion event into the dwell timers.
+    #[test]
+    // A table of (label, setup) pairs — the tuple type is intentionally literal here.
+    #[allow(clippy::type_complexity)]
+    fn dwell_never_arms_under_any_modal() {
+        let modal_setups: Vec<(&str, fn(&mut Editor))> = vec![
+            ("prompt", |e| e.prompt = Some(crate::prompt::Prompt::quit_confirm())),
+            ("minibuffer", |e| e.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter)),
+            ("search", |e| e.search = Some(crate::search_overlay::SearchState::open(
+                crate::search_overlay::Phase::Find, 0, crate::editor::BufferId(1)))),
+            ("outline", |e| e.open_outline()),
+            ("diag", |e| {
+                let d = wordcartel_core::diagnostics::Diagnostic {
+                    range: 0..1, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                    message: "x".into(), suggestions: vec![] };
+                let (id, ver) = (e.active().id, e.active().document.version);
+                e.diag = Some(crate::diag_overlay::DiagOverlay::new(d, id, ver));
+            }),
+        ];
+        for (name, setup) in modal_setups {
+            let mut e = Editor::new_from_text("hello\n", None, (40, 8));
+            crate::derive::rebuild(&mut e);
+            e.menu_bar_mode = crate::config::MenuBarMode::Auto;
+            setup(&mut e);
+            let (reg, ex, _, tx, km) = ctx();
+            handle(&mut e, moved(5, 0), &reg, &km, &ex, &TestClock(0), &tx);
+            assert!(e.mouse.menu_reveal_due.is_none(), "{name}: modal open must suppress menu dwell");
+        }
+    }
+
+    /// A click while a prompt is open must be consumed by the overlay route and
+    /// never leak to the editor (the caret must not move).
+    #[test]
+    fn click_under_prompt_is_consumed_not_leaked_to_editor() {
+        let mut e = Editor::new_from_text("abcdef\n", None, (40, 8));
+        crate::derive::rebuild(&mut e);
+        e.prompt = Some(crate::prompt::Prompt::quit_confirm());
+        let (reg, ex, clk, tx, km) = ctx();
+        handle(&mut e, down(3, 4), &reg, &km, &ex, &clk, &tx);
+        assert_eq!(crate::nav::head(&e), 0, "click must not move the caret while a prompt is open");
     }
 }
