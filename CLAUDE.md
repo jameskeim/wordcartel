@@ -61,6 +61,19 @@ ONLY when explicitly asked.
   fix that changes an approved design.
 - Never tell a reviewer what not to flag or pre-rate a severity.
 
+### Command-surface contract (conformance is explicit in every spec & plan)
+The **command-surface contract** — `docs/design/command-surface-contract.md` — is the authoritative
+App law for how commands, the palette, the menu, and keybinding hints relate (registry = single
+source of truth; every user-settable option IS a command; palette exhaustive; menu ⊆ palette; one
+shared setter per option that profiles also call; hints track the active keymap and prefer the
+user's explicit binding; multi-state options = set-per-state primitives + a cycle; commands are the
+Effort-P plugin/automation spine). Any effort that touches commands, user-settable options, the
+palette, the menu, or keybinding hints MUST conform: the **spec AND the plan each state how they
+honor it** (or explicitly "N/A — does not touch the command surface"), and the contract's invariant
+tests (palette-completeness, every-option-has-a-command, hint re-resolution) are merge GATEs.
+Amending the contract is a deliberate act recorded in that doc's History — not a silent per-effort
+deviation.
+
 ### Machinery (keeps the controller's context clean)
 - The controller curates exactly what each subagent needs and hands artifacts as FILES
   (`scripts/task-brief`, `scripts/review-package`, per-task report files) — never paste bulk

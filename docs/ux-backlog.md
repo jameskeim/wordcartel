@@ -16,27 +16,30 @@ bundled-themes research.
 
 ---
 
-## Governing principle — the three-surface contract (adopted)
+## Governing principle — the command-surface contract
 
-wordcartel has three command surfaces. The contract that keeps them coherent:
+**The authoritative App law lives in `docs/design/command-surface-contract.md`** (a governing
+contract, not backlog triage) and is a conformance gate on every spec + plan (`CLAUDE.md` →
+Development process). The laws, in brief (each has an enforcing test — a violation is a bug):
 
-1. **The registry is the single source of truth** (already true — everything routes through it).
-2. **The palette is exhaustive** — every registered command appears unless explicitly flagged
-   internal. *Already implemented:* `palette.rs:66-86` iterates the whole registry (~126
-   commands); a pinned test asserts "empty query → all commands" (`palette.rs:138`).
-3. **The menu is curated** — the ~58 commands tagged `menu: Some(category)` in `CommandMeta`
-   (`registry.rs:45-48`; five categories File/Edit/Format/View/Export, tree built dynamically
-   by `menu::grouped_commands`). Menu ⊆ palette, always. **Curation principle (adopted
-   2026-07-03):** the menu carries every command a word-processor user would go looking for by
-   category — file ops, clipboard/undo, transforms, view toggles, export — plus anything whose
-   discoverability matters; palette-only is for motions/navigation, internal plumbing, and
-   keystroke-native commands; every toggle shown in the menu displays its state (E2 checkable
-   items). The item-by-item pass applying this rule happens in the A3 effort.
-4. **Both surfaces show live keybinding hints**, resolved against the *active* keymap (matters
-   once presets switch at runtime — A5).
+1. **The registry is the single source of truth** (`palette.rs:66-86` iterates the whole registry;
+   the pinned test at `palette.rs:138` asserts "empty query → all commands").
+2. **Every user-settable option IS a command** (a persisted setting → a command changes it).
+3. **The palette is exhaustive** (every non-internal command appears).
+4. **The menu is a curated subset** (menu ⊆ palette; ~58 commands tagged `menu: Some(category)` in
+   `CommandMeta`, `registry.rs:45-48`, tree built by `menu::grouped_commands`).
+5. **Every mouse affordance has a keyboard path** (falls out of law 3).
+6. **One shared setter per option; profiles call it too** (no bypass — profile can't drift from the
+   command).
+7. **Hints track the active keymap** (re-resolved on preset switch — A5; prefer the user's explicit
+   binding over the shortest default).
 
-Deviations from this contract are treated as bugs. Corollary: every mouse affordance keeps a
-keyboard path (the palette guarantee makes this cheap to honor).
+Shape rules: multi-state option = set-per-state primitives (palette-only) + a cycle (menu, state-in-
+label); a preset is a convenience over primitives, never the only door; commands are the Effort-P
+plugin/automation spine. **The one judgment call** — menu (browse-by-category) vs palette-only
+(motions, plumbing, keystroke-native, set-per-state primitives) — is applied item-by-item in **A3b**.
+A3 fixes the contract *violation* the ZEN/FULL density gap opened (orphaned `status_line`/`scrollbar`
+options) + locks the hint plumbing; the state-in-label display shipped with E2.
 
 ---
 
