@@ -60,16 +60,18 @@ start() {
 # The ONLY way checks launch the app. Hermetic launch env:
 #   -u TMUX                        — no leakage to any outer tmux server
 #   -u DISPLAY -u WAYLAND_DISPLAY  — arboard init fails deterministically, so
-#                                    the once-only headless notice always fires
+#                                    the app runs the OSC-52 fallback path
 #   XDG_STATE_HOME=$SMOKE_STATE_HOME — swap/recovery land in a per-check tempdir
 # plus --no-config (checks assert against the DEFAULT keymap). Forwards
-# WCARTEL_SMOKE_PANIC when the caller has it set (S7). Blocks on the notice
-# barrier before returning; after it, no async status writer remains and
+# WCARTEL_SMOKE_PANIC when the caller has it set (S7). Blocks on the buffer
+# indicator '[1/' barrier before returning — the status bar's launch-invariant
+# chrome, present on the first frame of EVERY launch (no-arg and doc) regardless
+# of clipboard behavior. On this headless path the app reports the clipboard
+# AVAILABLE (Null Layer-1 + bare OSC 52), so no async status write follows, and
 # dispatch-set statuses (Saved/Copied) are race-free. --no-barrier exists for
 # exactly ONE launch in the suite — S8's relaunch, where the swap-recovery
-# modal replaces the status row (render.rs status branch) so the notice cannot
-# appear until the prompt resolves; that check's wait-for on the prompt text
-# is its own, stronger barrier.
+# modal replaces the status row (render.rs status branch); that check's wait-for
+# on the prompt text is its own, stronger barrier.
 start_wcartel() {
     _sess=$1; shift
     : "${WCARTEL_BIN:?WCARTEL_BIN must be set}"
@@ -101,7 +103,7 @@ start_wcartel() {
                 "$WCARTEL_BIN" --no-config "$@"
     fi
     if [ "$_barrier" = yes ]; then
-        wait_for "$_sess" 'system clipboard unavailable'
+        wait_for "$_sess" '\[1/'
     fi
 }
 

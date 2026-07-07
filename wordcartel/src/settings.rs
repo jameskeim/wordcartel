@@ -52,6 +52,8 @@ pub struct SettingsSnapshot {
     pub chrome_disposition: ChromeDisposition,
     /// Canvas opacity persisted as "opaque"/"transparent". Per-field — independent of name/chrome.
     pub canvas: CanvasMode,
+    /// Clipboard provider selection persisted as "auto"/"native"/"osc52"/"off".
+    pub clipboard_provider: crate::config::ClipboardProvider,
 }
 
 // ---------------------------------------------------------------------------
@@ -82,6 +84,7 @@ pub struct OverridesFile {
     #[serde(skip_serializing_if = "Option::is_none")] pub view:   Option<OView>,
     #[serde(skip_serializing_if = "Option::is_none")] pub menu:   Option<OMenu>,
     #[serde(skip_serializing_if = "Option::is_none")] pub mouse:  Option<OMouse>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub clipboard: Option<OClipboard>,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -127,6 +130,12 @@ pub struct OMouse {
     #[serde(skip_serializing_if = "Option::is_none")] pub capture: Option<bool>,
 }
 
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OClipboard {
+    #[serde(skip_serializing_if = "Option::is_none")] pub provider: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot builders
 // ---------------------------------------------------------------------------
@@ -164,6 +173,7 @@ pub fn snapshot_of(cfg: &crate::config::Config, resolved_theme_name: &str) -> Se
         mouse_capture:   cfg.mouse.mouse_capture,
         chrome_disposition,
         canvas: crate::theme_resolve::parse_canvas(&cfg.theme.canvas).0,
+        clipboard_provider: cfg.clipboard.provider,
     }
 }
 
@@ -184,6 +194,7 @@ pub fn runtime_snapshot(editor: &crate::editor::Editor) -> SettingsSnapshot {
         mouse_capture:   editor.mouse_capture,
         chrome_disposition: editor.chrome_disposition,
         canvas: editor.canvas,
+        clipboard_provider: editor.clipboard_provider,
     }
 }
 
@@ -221,6 +232,7 @@ pub fn parse_mask(bytes: &str) -> OverridesFile {
         view:   Option<OView>,
         menu:   Option<OMenu>,
         mouse:  Option<OMouse>,
+        clipboard: Option<OClipboard>,
     }
     #[derive(Default, Deserialize)]
     #[serde(default)]
@@ -251,7 +263,8 @@ pub fn parse_mask(bytes: &str) -> OverridesFile {
             None
         }
     });
-    OverridesFile { keymap: mask.keymap, theme, view: mask.view, menu: mask.menu, mouse: mask.mouse }
+    OverridesFile { keymap: mask.keymap, theme, view: mask.view, menu: mask.menu, mouse: mask.mouse,
+        clipboard: mask.clipboard }
 }
 
 // ---------------------------------------------------------------------------
@@ -419,7 +432,18 @@ pub fn compute_overrides(
     let any_mouse = capture.is_some();
     let mouse = some_if(OMouse { capture }, any_mouse);
 
-    OverridesFile { keymap, theme, view, menu, mouse }
+    // --- clipboard — per-key mask predicate ---
+    let rt_cp   = crate::config::clipboard_provider_str(runtime.clipboard_provider).to_string();
+    let base_cp = crate::config::clipboard_provider_str(baseline.clipboard_provider).to_string();
+    let provider = diff_key(
+        &rt_cp, &base_cp,
+        existing.clipboard.as_ref().and_then(|c| c.provider.as_ref()),
+        mask.clipboard.as_ref().and_then(|c| c.provider.as_ref()).is_some(),
+    );
+    let has_provider = provider.is_some();
+    let clipboard = some_if(OClipboard { provider }, has_provider);
+
+    OverridesFile { keymap, theme, view, menu, mouse, clipboard }
 }
 
 // ---------------------------------------------------------------------------
@@ -532,7 +556,8 @@ mod tests {
             view_status_line: crate::config::TransientMode::On,
             menu_bar: crate::config::MenuBarMode::Auto, mouse_capture: true,
             chrome_disposition: ChromeDisposition::Full,
-            canvas: CanvasMode::Opaque }
+            canvas: CanvasMode::Opaque,
+            clipboard_provider: crate::config::ClipboardProvider::Auto }
     }
 
     fn snap_with<F: FnOnce(&mut SettingsSnapshot)>(f: F) -> SettingsSnapshot {
@@ -939,6 +964,24 @@ mod tests {
         assert!(of2.view.is_none() || of2.view.as_ref().unwrap().scrollbar.is_none());
     }
 
+    #[test]
+    fn clipboard_provider_round_trips_through_overrides() {
+        // A runtime value differing from baseline appears in the computed overrides.
+        let baseline = snapshot_of(&crate::config::Config::default(), "tokyo-night");
+        let mut runtime = baseline.clone();
+        runtime.clipboard_provider = crate::config::ClipboardProvider::Osc52;
+        let ov = compute_overrides(&runtime, &baseline, &OverridesFile::default(), &OverridesFile::default());
+        assert_eq!(ov.clipboard.and_then(|c| c.provider).as_deref(), Some("osc52"));
+    }
+
+    #[test]
+    fn clipboard_provider_matching_baseline_is_omitted() {
+        let baseline = snapshot_of(&crate::config::Config::default(), "tokyo-night");
+        let runtime = baseline.clone(); // provider == Auto == default
+        let ov = compute_overrides(&runtime, &baseline, &OverridesFile::default(), &OverridesFile::default());
+        assert!(ov.clipboard.is_none(), "unchanged provider writes no [clipboard] section");
+    }
+
     // -----------------------------------------------------------------------
     // LAW 2 (command-surface contract): every SettingsSnapshot field reachable
     // -----------------------------------------------------------------------
@@ -952,7 +995,7 @@ mod tests {
                 keymap_preset: _, theme_identity: _, view_typewriter: _, view_focus: _,
                 view_measure: _, view_wrap_guide: _, view_word_count: _, view_wrap_column: _,
                 view_scrollbar: _, view_status_line: _, menu_bar: _, mouse_capture: _,
-                chrome_disposition: _, canvas: _,
+                chrome_disposition: _, canvas: _, clipboard_provider: _,
             } = s;
         }
         let _ = field_guard; // reference it so the guard compiles (no dead_code allow needed)
@@ -975,5 +1018,6 @@ mod tests {
         assert!(has("toggle_mouse_capture"), "mouse_capture");
         assert!(has("toggle_chrome"), "chrome_disposition");
         assert!(has("toggle_canvas"), "canvas");
+        assert!(has("clipboard_provider_cycle") && has("clipboard_provider_auto"), "clipboard_provider");
     }
 }

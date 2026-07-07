@@ -1,8 +1,8 @@
 #!/bin/sh
 # s2-open-errors.sh — S2: open-error handling asserts DURABLE status-head
-# strings only. Startup-time status messages ('new file', permission errors)
-# are asynchronously overwritten by the clipboard notice and MUST NOT be
-# asserted (spec Robustness rule 1).
+# strings only. Transient startup-time status messages ('new file', permission
+# errors) can be overwritten and MUST NOT be asserted (spec Robustness rule 1);
+# the durable '[PREVIEW]' / buffer-indicator head is what we assert.
 #   (a) nonexistent path → opened-as-new: [1/2] <basename> [PREVIEW]; alive.
 #   (b) chmod-000 file → open fails; the app continues on the unnamed LAUNCH
 #       buffer: [1/2] *untitled*; alive. Skipped when the file is still

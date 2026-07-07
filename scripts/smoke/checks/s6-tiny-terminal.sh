@@ -23,8 +23,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# 60 cols is safe for the barrier: head '[1/2] *untitled* [PREVIEW] ' (27
-# chars) + 'system clipboard unavailable' (28 chars) ends at column 55.
+# 60 cols is safe for the barrier: the '[1/' buffer indicator leads the status
+# head '[1/2] *untitled* [PREVIEW]' (27 chars), well within 60 columns.
 start_wcartel "$S" --cols 60 --rows 15
 type_text "$S" "resize survivor"
 wait_for "$S" 'resize survivor'

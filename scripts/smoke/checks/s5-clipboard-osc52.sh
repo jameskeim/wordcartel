@@ -1,7 +1,8 @@
 #!/bin/sh
-# s5-clipboard-osc52.sh — S5: the forced-headless launch env guarantees the
-# once-only 'system clipboard unavailable' notice (start_wcartel's barrier IS
-# that assertion). Then: type a sentence, select it with default-layer
+# s5-clipboard-osc52.sh — S5: on the forced-headless launch env the app reports
+# the clipboard AVAILABLE (Null Layer-1 + bare OSC 52) and emits bare OSC 52 —
+# start_wcartel's barrier is now the launch-invariant '[1/' buffer indicator,
+# not a clipboard notice. Then: type a sentence, select it with default-layer
 # shift-arrow extension (Copy no-ops on an empty selection), C-c → 'Copied'
 # AND the OSC 52 payload lands in the run-private tmux paste buffer
 # (set-clipboard on), asserted with show-buffer equality.

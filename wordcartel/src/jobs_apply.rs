@@ -357,7 +357,7 @@ pub(crate) fn apply_clipboard_paste(editor: &mut Editor, buffer_id: crate::edito
 
 pub(crate) fn apply_clipboard_availability(editor: &mut Editor, ok: bool) {
     if !ok && !editor.clipboard_notice_shown {
-        editor.status = "system clipboard unavailable — copy/paste work in-editor; using OSC 52 for terminal sync".into();
+        editor.status = "system clipboard unavailable — copy/paste work in-editor (register only)".into();
         editor.clipboard_notice_shown = true;
     }
 }
