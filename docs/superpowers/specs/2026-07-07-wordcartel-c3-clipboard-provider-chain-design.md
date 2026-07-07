@@ -18,8 +18,11 @@ command-surface contract (`docs/design/command-surface-contract.md`). How it hon
 - **One shared setter:** all paths (the five commands, config load, profile/startup seeding) route
   through a single `Editor::set_clipboard_provider`. No direct field writes.
 - **Palette exhaustive / menu ⊆ palette:** all five commands are registered and therefore appear in
-  the palette; the palette-completeness invariant test gates this. A menu entry (a Clipboard submenu,
-  or under Edit) is OPTIONAL and, if added, is a strict subset of the palette.
+  the palette; the palette-completeness invariant test gates this. Per shape rule 8, the four
+  set-per-state primitives are tagged `menu: None` (palette-only), and the **cycle
+  (`clipboard_provider_cycle`) is the stateful menu representative** — carried in the menu (Settings
+  category) with state-in-label (e.g. "Clipboard: Auto"). It is NOT optional; a multi-state option
+  must have exactly one stateful menu representative.
 - **Hints track the active keymap:** the commands carry no default binding (clipboard-provider
   switching is a rare, palette-driven action); hint re-resolution therefore has nothing keymap-specific
   to display, which the hint-re-resolution invariant test tolerates (a command may have no binding).
@@ -196,15 +199,32 @@ behavior (a documented footgun for naive emitters).
   **live, no restart**; the main side recomputes `plan.osc52` from the cached `ClipEnv` + the current
   field each drain (cheap — copies are rare). Startup and profiles seed *through* the setter (the A3
   pattern); no direct field writes anywhere.
+- **Drain ordering (fixes a stale-backend window):** within a single `drain_clipboard_intents` pass,
+  the `clipboard_provider_dirty` `ClipReq::SelectProvider` is sent **before** any queued
+  `ClipReq::Set`/`Get`, so a copy/paste issued in the same frame as a provider change hits the *new*
+  backend, never the old one.
 - **Commands:** `clipboard_provider_auto`, `clipboard_provider_native`, `clipboard_provider_osc52`,
-  `clipboard_provider_off` (set-value primitives) + `clipboard_provider_cycle` (the stateful
-  representative). Registered in `registry.rs`; each routes through `set_clipboard_provider`.
+  `clipboard_provider_off` (set-value primitives, `menu: None`) + `clipboard_provider_cycle` (the
+  stateful menu representative, `menu: Some(Settings)`, state-in-label). Registered in `registry.rs`;
+  each routes through `set_clipboard_provider`.
 - **Value semantics:** `Auto` = the detection chain; `Native` = force arboard (crate); `Osc52` = force
   the terminal path (screen-sharing / capable-but-undetected terminal); `Off` = disable the system
   clipboard entirely (register-only — a genuine privacy choice).
 - **Worker rebuild:** the worker's `ClipReq::SelectProvider(Layer1Choice)` drops its current backend and
-  builds the new one (`WlCopyBackend`/`XclipBackend`/…/`ArboardBackend`/`NullBackend`). Rebuild is cheap
+  builds the new one (`CommandBackend` variant / `ArboardBackend` / `NullBackend`). Rebuild is cheap
   and off the hot path.
+- **Startup availability (fixes the init-order gap):** `spawn_worker` gains an initial-plan parameter —
+  `spawn_worker(msg_tx, initial: Layer1Choice)`. At startup the resolved config is run through
+  `resolve_provider` to compute the initial `Layer1Choice`, which `spawn_worker` uses to build the
+  first backend, so the one-shot `Msg::ClipboardAvailability` reflects the *selected* provider (not an
+  unconditional arboard probe). `editor.clipboard_provider` is seeded via `set_clipboard_provider` for
+  the main-side `osc52` plan; because the worker already holds the correct initial backend, the
+  startup seeding does not need to drive an immediate `SelectProvider`.
+- **Persistence (Save Settings round-trip):** `clipboard.provider` participates in the settings
+  override machinery like every other option — `SettingsSnapshot` gains the field (+ field-guard arm),
+  and `OverridesFile`, `parse_mask`, and `compute_overrides` gain a `[clipboard]` section so the value
+  serializes back out through Save Settings. The current override sections are keymap/theme/view/menu/
+  mouse (settings.rs:79); clipboard joins them.
 
 ---
 
@@ -217,9 +237,11 @@ The `ClipboardBackend` trait is unchanged (`set(&mut self, &str)`, `get(&mut sel
   ```rust
   struct CommandBackend { set_argv: Vec<String>, get_argv: Option<Vec<String>> }
   ```
-  `set` spawns `set_argv`, writes `text` to the child stdin, does **not** wait on the daemonizing helper
-  (wl-copy/xclip fork a server that persists). `get` spawns `get_argv` and reads stdout, or returns
-  `None` when `get_argv` is `None` (e.g. `clip.exe`, which is set-only → paste falls back to register).
+  `set` spawns `set_argv`, writes `text` to the child stdin, closes it, and **`wait()`s to reap the
+  direct child** — the helper self-backgrounds (wl-copy/xclip fork a persisting server and the
+  foreground child exits promptly), so the wait returns fast and no zombie accumulates. `get` spawns
+  `get_argv`, reads stdout to completion, and reaps; returns `None` when `get_argv` is `None` (e.g.
+  `clip.exe`, which is set-only → paste falls back to register).
   Constructors: `wl_copy()` (`wl-copy` / `wl-paste --no-newline`), `xclip()`
   (`xclip -selection clipboard` / `-o`), `xsel()` (`xsel -b -i` / `-b -o`), `win_yank()`
   (`win32yank.exe -i --crlf` / `-o --lf`), `clip_exe()` (`clip.exe`, no get).
@@ -280,20 +302,28 @@ spot-checks; the PTY smoke S5 already covers OSC 52 → tmux (happy path).
 
 - `wordcartel/src/clipboard.rs` — `Layer1Choice`, `Osc52Wrap`, `ProviderPlan`, `ClipEnv`,
   `resolve_provider`, `CommandBackend` (+ constructors), `osc52_set(text, wrap)`,
-  `ClipReq::SelectProvider`, worker rebuild; keep `ArboardBackend`/`NullBackend`/`FakeBackend`.
+  `ClipReq::SelectProvider`, `spawn_worker(msg_tx, initial: Layer1Choice)` signature change + worker
+  rebuild; keep `ArboardBackend`/`NullBackend`/`FakeBackend`.
 - `wordcartel/src/config.rs` — `ClipboardProvider`, `ClipboardConfig`, `Config.clipboard`,
-  `RawConfig` parse of `[clipboard] provider`.
+  `RawConfig` parse of `[clipboard] provider` (hand-matched string enum with unknown→warn→`Auto`, per
+  the `menu.bar`/`view.scrollbar` precedent at config.rs:402/420).
 - `wordcartel/src/editor.rs` — `clipboard_provider` field, `clipboard_provider_dirty` flag,
-  `set_clipboard_provider` setter.
-- `wordcartel/src/registry.rs` — the five commands, each via the setter.
-- `wordcartel/src/settings.rs` — `SettingsSnapshot.clipboard_provider` + field-guard arm + the
-  every-option law test coverage.
-- `wordcartel/src/palette.rs` / `menu.rs` — palette carries the commands automatically; optional menu
-  entry (menu ⊆ palette).
-- `wordcartel/src/app.rs` — `drain_clipboard_intents` recompute + dirty-flag send; startup seeds via
-  setter.
+  `set_clipboard_provider` setter (beside the A3 setters at editor.rs:825).
+- `wordcartel/src/registry.rs` — the five commands (four sets `menu: None`, the cycle
+  `menu: Some(Settings)` with state-in-label), each via the setter (beside the scrollbar/status/menu
+  families at registry.rs:459–498).
+- `wordcartel/src/settings.rs` — `SettingsSnapshot.clipboard_provider` (+ field-guard arm at
+  settings.rs:950 + the every-option law test at :960) **and the persistence plumbing**: `OverridesFile`,
+  `parse_mask`, `compute_overrides`, and serialization each gain a `[clipboard]` section so the value
+  round-trips through Save Settings (current sections keymap/theme/view/menu/mouse at settings.rs:79).
+- `wordcartel/src/palette.rs` / `menu.rs` — palette carries all five commands automatically
+  (palette-completeness gate); the cycle is the menu representative (menu ⊆ palette holds — only the
+  cycle appears in the menu, the four sets do not).
+- `wordcartel/src/app.rs` — `spawn_worker` call (app.rs:1506) passes the startup-resolved initial
+  `Layer1Choice`; `drain_clipboard_intents` (app.rs:1664) recompute + ordered dirty-flag send; startup
+  config→editor seeding via `set_clipboard_provider` (beside the A3 seeding at app.rs:1378).
 - No `Cargo.toml` change — arboard stays `= { version = "3", default-features = false,
-  features = ["wayland-data-control"] }`; no new crates.
+  features = ["wayland-data-control"] }`; helper backends use only `std::process`; no new crates.
 
 ---
 
