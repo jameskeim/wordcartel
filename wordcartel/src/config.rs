@@ -964,6 +964,7 @@ mod tests {
             mouse_capture:   false,
             chrome_disposition: wordcartel_core::theme::ChromeDisposition::Zen,
             canvas: CanvasMode::Transparent,
+            clipboard_provider: crate::config::ClipboardProvider::Auto,
         };
 
         let of = compute_overrides(&runtime, &baseline, &OverridesFile::default(), &OverridesFile::default());
