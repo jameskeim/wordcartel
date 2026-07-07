@@ -269,6 +269,14 @@ layout (a second manifestation of the same bug) — the key needs the real mode 
 differ even after the render fix; (d) add a real **SH ≠ SP regression test** (the missing
 coverage that hid this — `commands.rs:1212` only pins "SH shows raw markers," which SP also does).
 
+**Theming (directive, 2026-07-07): SRC-HI uses the CURRENT THEME — automatically.** The `styles`
+spans are `Style` enum values composed against the active theme's faces at paint time (the same
+faces LivePreview paints), so SRC-HI tracks the theme for free — no separate syntax palette.
+Sub-choice this surfaces: `styles` cover the CONTENT ranges; the MARKERS (`#`/`**`/backticks) are
+in the separate `conceal` list, so the free result is **content themed, markers plain** ("delimiters
+dimmed" look). Tinting the markers themselves would need a new punctuation/dim face (none exists
+today) — default to plain markers unless a marker face is added.
+
 **Product fork:** keep the LivePreview ACTIVE line plain (current "edit-this-line" look) while
 SRC-HI colors every line uniformly — i.e. SRC-HI is its own treatment, not "every line is a
 preview-active line." **Alternative (cheaper):** drop SH entirely (2 modes PREVIEW+SOURCE —
