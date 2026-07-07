@@ -239,13 +239,43 @@ concealment) and there is no branch that applies token/syntax coloring to distin
 effectively dead — a labelled third mode that renders as SOURCE. (A test at `commands.rs:1212`
 only pins "SH shows raw markers," which SP also does, so it never caught the collapse.)
 
+**Deeper root cause (styling engine):** the collapse bottoms out in `md_parse::analyze(line,
+role, is_active)` (`md_parse.rs:11`), which short-circuits when `is_active` is true —
+`if is_active || line.is_empty()` returns the full raw source as one run with `styles: vec![]`
+(`md_parse.rs:8-16`). `source_mode` forces `is_active_effective = true` for every line
+(`derive.rs:264`), so both SH and SP get raw text with NO styles. There is no "raw + styled"
+path today.
+
 **Intended distinction:** LivePreview = concealed markers + theme colors (WYSIWYG-ish);
 **SRC-HI = raw markers VISIBLE *plus* markdown tokens colored** (code-editor-style syntax
-highlight); SOURCE = raw markers, no color (monochrome plain). The fix promotes `source_mode`
-(bool) to a three-way decision so SH keeps the LivePreview coloring pass but *without* marker
-concealment, while SP stays uncolored. **Fork:** or drop SH entirely (2 modes) if the
-highlighted-source view isn't wanted — decide before implementing. Add a real regression test
-that asserts SH ≠ SP output (the missing coverage that hid this).
+highlight); SOURCE = raw markers, no color (monochrome plain).
+
+**Sizing: SMALL and contained** (fact-checked 2026-07-07) — two de-riskers:
+1. **The color data already exists independent of concealment.** In `analyze`'s non-active path,
+   `conceal: Vec<Range>` and `styles: Vec<StyleSpan>` are *separate* lists (`md_parse.rs:26-141`;
+   styles carry source-byte ranges). "Raw + colored" = apply the `styles` spans *without*
+   applying the conceal grid — the data is already computed; nothing new to parse.
+2. **SRC-HI geometry ≡ SourcePlain.** SH conceals nothing (like SOURCE), so its cursor/wrap/
+   fold/ColMap math is IDENTICAL to SP — color is a pure visual overlay on the same grid. The
+   entire geometry layer (`visible_to_source`, cursor stops, soft-wrap, the ColMap) is UNTOUCHED
+   (that's the part that would make it Medium+; it's off the table).
+
+**Fix steps:** (a) replace `is_active: bool` with a 3-way mode (conceal+color / raw+color /
+raw+plain) threaded through `analyze` → `layout::layout` → `visible_width`/`visible_source` →
+`derive.rs`; (b) add the "styled-but-not-concealed" branch in `analyze` (run the parse, keep
+`styles`, skip conceal) — the ONLY real logic change; (c) **fix the layout cache key** —
+`LayoutKey` carries `source_mode: bool` (`derive.rs:242`), so SH and SP currently share a cached
+layout (a second manifestation of the same bug) — the key needs the real mode or SH/SP won't
+differ even after the render fix; (d) add a real **SH ≠ SP regression test** (the missing
+coverage that hid this — `commands.rs:1212` only pins "SH shows raw markers," which SP also does).
+
+**Product fork:** keep the LivePreview ACTIVE line plain (current "edit-this-line" look) while
+SRC-HI colors every line uniformly — i.e. SRC-HI is its own treatment, not "every line is a
+preview-active line." **Alternative (cheaper):** drop SH entirely (2 modes PREVIEW+SOURCE —
+delete the variant, fix the cycle at `commands.rs:482` + label) if the highlighted-source view
+isn't wanted. **Recommendation: FIX, don't drop** — the styles are already computed and the
+geometry is already correct, so a genuine colored-markdown-source view is near-free; one of the
+better effort-to-payoff ratios on the list.
 
 ---
 
