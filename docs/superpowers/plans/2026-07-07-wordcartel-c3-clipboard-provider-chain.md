@@ -963,7 +963,7 @@ Run: `cargo clippy -p wordcartel --all-targets 2>&1 | tail -5` → clean.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add wordcartel/src/settings.rs
+git add wordcartel/src/settings.rs wordcartel/src/config.rs wordcartel/src/e2e.rs
 git commit -m "feat(c3): persist clipboard.provider through Save Settings overrides"
 ```
 
@@ -1008,10 +1008,9 @@ fn spawn_worker_reports_unavailable_for_null_no_osc52() {
 
 #[test]
 fn select_provider_is_consumed_and_worker_keeps_serving() {
-    // Proves the SelectProvider arm executes and the loop survives it: a Get issued AFTER the
-    // rebuild still gets a response (a broken/absent arm would fail the exhaustive match at compile
-    // time or wedge the loop). The value-level choice→backend swap itself is unit-covered by
-    // `backend_for_maps_choices` (Task 3), which needs no worker or external binary.
+    // Loop-continuity coverage: after a SelectProvider, the worker still answers a Get (a panicking
+    // arm or a broken loop would hang or fail this). This does NOT by itself prove the backend value
+    // swapped — that is unit-covered by `backend_for_maps_choices` (Task 3), which needs no worker.
     let (tx, rx) = std::sync::mpsc::channel::<crate::app::Msg>();
     let clip = spawn_worker(tx, ProviderPlan { layer1: Layer1Choice::Null, osc52: None });
     let _ = rx.recv(); // availability
@@ -1075,18 +1074,25 @@ pub fn spawn_worker(msg_tx: Sender<crate::app::Msg>, initial: ProviderPlan) -> S
 }
 ```
 
-- [ ] **Step 4: Run tests + clippy**
+- [ ] **Step 4: Update the call site (temporary — required for THIS task to compile).** Changing `spawn_worker`'s arity breaks its only caller (app.rs:1506). Update it now to a placeholder plan so the tree compiles; Task 9 replaces it with the real startup-resolved plan:
+
+```rust
+    let clip_tx = crate::clipboard::spawn_worker(
+        msg_tx.clone(),
+        crate::clipboard::ProviderPlan {
+            layer1: crate::clipboard::Layer1Choice::Null,
+            osc52: None,
+        },
+    );
+```
+
+- [ ] **Step 5: Run tests + clippy** (now compiles with the call site updated):
 
 Run: `cargo test -p wordcartel --lib spawn_worker 2>&1 | tail -20` → PASS.
 Run: `cargo test -p wordcartel --lib select_provider 2>&1 | tail -10` → PASS.
 Run: `cargo clippy -p wordcartel --all-targets 2>&1 | tail -5` → clean.
 
-> **Expected breakage:** `spawn_worker`'s call site (app.rs:1506) now fails to compile (arity). That is
-> fixed in Task 9. To keep THIS task's commit green in isolation, temporarily update the call site to
-> `spawn_worker(msg_tx.clone(), crate::clipboard::ProviderPlan { layer1: crate::clipboard::Layer1Choice::Null, osc52: None })`
-> — Task 9 replaces it with the real startup-resolved plan.
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add wordcartel/src/clipboard.rs wordcartel/src/app.rs
@@ -1111,7 +1117,7 @@ git commit -m "feat(c3): worker takes initial ProviderPlan + SelectProvider rebu
 #[test]
 fn drain_emits_wrapped_osc52_when_plan_says_so() {
     // Env: tmux + Null layer1 → plan.osc52 == Some(Tmux). A copy emits the tmux-wrapped bytes.
-    let mut e = crate::editor::Editor::empty_for_test();
+    let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
     e.clipboard_provider = crate::config::ClipboardProvider::Osc52; // forces Null + wrap
     e.clipboard_sync_request = Some("hi".into());
     let env = ClipEnv { tmux: true, screen: false, ssh: false, wayland: false, x11: false,
@@ -1126,7 +1132,7 @@ fn drain_emits_wrapped_osc52_when_plan_says_so() {
 #[test]
 fn drain_suppresses_osc52_when_plan_none() {
     // Native forces layer1 Arboard, osc52 None → no terminal write.
-    let mut e = crate::editor::Editor::empty_for_test();
+    let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
     e.clipboard_provider = crate::config::ClipboardProvider::Native;
     e.clipboard_sync_request = Some("hi".into());
     let env = ClipEnv { tmux: false, screen: false, ssh: false, wayland: false, x11: true,
@@ -1140,7 +1146,7 @@ fn drain_suppresses_osc52_when_plan_none() {
 
 #[test]
 fn drain_sends_select_provider_before_set_when_dirty() {
-    let mut e = crate::editor::Editor::empty_for_test();
+    let mut e = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
     e.clipboard_provider = crate::config::ClipboardProvider::Native;
     e.clipboard_provider_dirty = true;
     e.clipboard_sync_request = Some("hi".into());
