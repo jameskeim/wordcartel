@@ -49,31 +49,34 @@
 
 - [ ] **Step 1: Write the failing test** — parse + coercion + str round-trip.
 
-Add to `config.rs` tests:
+Add to `config.rs` tests, using the **existing** test helpers `tempdir()` + `write(dir, name, body)` (Codex plan gate — there is no `write_cfg`; the real helpers are at the top of `config.rs::tests`, used e.g. by `malformed_toml_warns_and_skips_layer` at `config.rs:514`):
 ```rust
 #[test]
 fn view_transient_keys_parse_and_status_off_coerces() {
     // scrollbar accepts off/auto/on verbatim.
-    let p = write_cfg("[view]\nscrollbar = \"on\"\nstatus_line = \"auto\"\n");
+    let d1 = tempdir();
+    let p = write(&d1, "c.toml", "[view]\nscrollbar = \"on\"\nstatus_line = \"auto\"\n");
     let (cfg, warns) = load(&[p]);
     assert_eq!(cfg.view.scrollbar, TransientMode::On);
     assert_eq!(cfg.view.status_line, TransientMode::Auto);
     assert!(warns.is_empty());
     // status_line = "off" is rejected → coerced to Auto, with a warning (no-silent-UI).
-    let p2 = write_cfg("[view]\nstatus_line = \"off\"\n");
+    let d2 = tempdir();
+    let p2 = write(&d2, "c.toml", "[view]\nstatus_line = \"off\"\n");
     let (cfg2, warns2) = load(&[p2]);
     assert_eq!(cfg2.view.status_line, TransientMode::Auto,
         "status_line off must coerce to auto to preserve no-silent-UI");
     assert!(warns2.iter().any(|w| w.contains("status_line")),
         "coercion must warn, got {warns2:?}");
     // bogus value → default + warning.
-    let p3 = write_cfg("[view]\nscrollbar = \"bogus\"\n");
+    let d3 = tempdir();
+    let p3 = write(&d3, "c.toml", "[view]\nscrollbar = \"bogus\"\n");
     let (cfg3, warns3) = load(&[p3]);
     assert_eq!(cfg3.view.scrollbar, TransientMode::Auto, "bogus → default auto");
     assert!(warns3.iter().any(|w| w.contains("scrollbar")));
 }
 ```
-`write_cfg` helper: use the existing test's file-writing pattern (see `malformed_toml_warns_and_skips_layer` at `config.rs:514` — it writes a temp file and returns its path; reuse that helper's approach, naming it `write_cfg` if not already present).
+(Confirm the exact `tempdir()`/`write` signatures against `config.rs::tests` when implementing — match whatever the neighbors use verbatim; the `d1`/`d2`/`d3` bindings keep each `TempDir` alive for its `load`.)
 
 - [ ] **Step 2: Run it to verify it fails** — `cargo test -p wordcartel --lib config::tests::view_transient_keys_parse_and_status_off_coerces` → FAIL (`TransientMode` undefined).
 
@@ -254,18 +257,12 @@ fn scrollbar_visible_respects_mode() {
 
 - [ ] **Step 3: Implement.**
 
-Replace `recompute_scrollbar_visible` (`app.rs:1665`):
+Replace `recompute_scrollbar_visible` (`app.rs:1665`). **Fire the dwell deadlines FIRST, then compute `scrollbar_visible`** (Codex plan gate Critical — computing visibility before firing the deadline delays a reveal that lands exactly on `now_ms` by a frame):
 ```rust
 pub fn recompute_scrollbar_visible(editor: &mut crate::editor::Editor, now_ms: u64) {
     use crate::config::TransientMode;
-    editor.mouse.scrollbar_visible = match editor.scrollbar_mode {
-        TransientMode::On  => true,
-        TransientMode::Off => false,
-        // Auto: scroll activity (the existing channel) OR a live right-edge dwell.
-        TransientMode::Auto => now_ms < editor.mouse.scrollbar_until_ms
-            || editor.mouse.scrollbar_revealed,
-    };
-    // Fire the Auto dwell/grace deadlines (armed by the mouse Moved arm), like the menu bar.
+    // Fire the Auto dwell/grace deadlines FIRST (armed by the mouse Moved arm), so a
+    // deadline landing exactly on `now_ms` flips `scrollbar_revealed` BEFORE we read it.
     if editor.scrollbar_mode == TransientMode::Auto {
         if editor.mouse.scrollbar_reveal_due.is_some_and(|d| now_ms >= d) {
             editor.mouse.scrollbar_reveal_due = None;
@@ -280,8 +277,22 @@ pub fn recompute_scrollbar_visible(editor: &mut crate::editor::Editor, now_ms: u
         editor.mouse.scrollbar_hide_due = None;
         editor.mouse.scrollbar_revealed = false;
     }
+    editor.mouse.scrollbar_visible = match editor.scrollbar_mode {
+        TransientMode::On  => true,
+        TransientMode::Off => false,
+        // Auto: scroll activity (the existing channel) OR a live right-edge dwell.
+        TransientMode::Auto => now_ms < editor.mouse.scrollbar_until_ms
+            || editor.mouse.scrollbar_revealed,
+    };
 }
 ```
+
+**Deadline-array wake-up (Codex plan gate Critical — shared with Task 4).** The run loop's deadline computation (`app.rs:1557-1567`) currently mins only `scrollbar_until_ms` (`sb_deadline`) and `menu_reveal_due.or(menu_hide_due)` (`menu_deadline`). The new dwell timers must also wake the loop, or a reveal/hide never fires until an unrelated event. Add to that block:
+```rust
+        let sb_dwell_deadline = editor.mouse.scrollbar_reveal_due.or(editor.mouse.scrollbar_hide_due);
+        let status_dwell_deadline = editor.mouse.status_reveal_due.or(editor.mouse.status_hide_due);
+```
+and fold `sb_dwell_deadline` and `status_dwell_deadline` into the same `min`-of-`Some` reduction the loop already applies to `sb_deadline`/`menu_deadline` (match the existing combinator at `app.rs:~1568-1580` — grep the line that mins the deadlines into the `poll` timeout).
 Add the right-edge dwell arm in `mouse.rs`, in the `Moved` handling. Extend the existing dwell block (`mouse.rs:98-119`) with a sibling arm gated on `scrollbar_mode == Auto`. Place it **after** the menu-bar arm, inside the same `if let MouseEventKind::Moved = ev.kind` (restructure the menu arm to share the Moved guard). Concretely, after the menu-bar `if editor.menu_bar_mode == …Auto { … }` block, add:
 ```rust
     // Scrollbar right-edge dwell (mirror of the menu-bar dwell; col w-1 is the track).
@@ -415,7 +426,7 @@ pub fn recompute_status_line(editor: &mut crate::editor::Editor, now_ms: u64) {
     }
 }
 ```
-Wire `recompute_status_line(editor, now_ms)` at the same call site(s) as `recompute_scrollbar_visible`/`recompute_menu_bar` (grep `recompute_menu_bar(` in `app.rs` run loop and add the sibling call).
+Wire `recompute_status_line(editor, now_ms)` at BOTH recompute sites: beside `recompute_menu_bar` at `app.rs:1238` (reduce), and beside `recompute_scrollbar_visible` at the startup call `app.rs:1533` (that startup path currently calls only `recompute_scrollbar_visible` — add `recompute_status_line` there so the first frame's status state is correct).
 
 Bottom-row dwell arm in `mouse.rs` (mirror Task 3, gated on `status_line_mode == Auto`; `at_bottom = ev.row == h-1`):
 ```rust
@@ -441,16 +452,33 @@ Bottom-row dwell arm in `mouse.rs` (mirror Task 3, gated on `status_line_mode ==
     }
 ```
 
-Render idle-calm branch (`render.rs:753-799`): the existing chain picks `(status_text, status_style)` from search / minibuffer / prompt / normal (`:769`). Change the final `else` (normal-state) so that when `!crate::app::status_line_visible(editor)`, it paints calm canvas instead of the info line:
+Render idle-calm branch (`render.rs:753-799`). The chain picks `(status_text, status_style)` from search / minibuffer / prompt / normal (`:769`), then composes a right-aligned word-count segment in the `!has_overlay` branch (`:776-787`). **Two changes (Codex plan gate Critical — the calm branch must use a base-canvas style, NOT `cs.menu_closed` chrome, and must suppress the word-count segment too):**
+
+1. Replace the final `else` (normal-state, `:768-770`) to pick a calm base-canvas style when hidden:
 ```rust
-        } else if crate::app::status_line_visible(editor) {
-            (status_left_text(editor), cs.menu_closed) // normal visible: [Chrome] panel bg
         } else {
-            // Zen idle: the reserved row renders as calm canvas (base bg), zero layout shift.
-            (String::new(), cs.menu_closed)
+            // Normal state. Under zen/Auto idle with no message, the reserved row renders
+            // as calm canvas (base bg); visible reveal via On / dwell / message force.
+            if crate::app::status_line_visible(editor) {
+                (status_left_text(editor), cs.menu_closed) // visible: [Chrome] panel bg
+            } else {
+                // Calm canvas: the same bg-only fill the edit band uses — NOT chrome.
+                let mut calm = compose::base_canvas(&editor.theme, editor.depth);
+                calm.fg = None;
+                (String::new(), calm)
+            }
         };
 ```
-(The reserved row still gets its `set_style` fill; an empty string paints blank over the panel bg. `edit_height` is untouched — no reflow.)
+2. Suppress the word-count composer when hidden, so `Ln/Col · words` does not paint over the calm row. Gate the composer (`:776`):
+```rust
+        let status_hidden = !has_overlay && !crate::app::status_line_visible(editor);
+        let composed = if !has_overlay && !status_hidden {
+            /* existing word_count_segment compose block, unchanged */
+        } else {
+            status_text.chars().take(w as usize).collect()
+        };
+```
+`compose::base_canvas` is the same helper the opaque edit band uses at `render.rs:380`. `edit_height` (`render.rs:362`) is untouched — the row stays reserved; only its paint changes (zero reflow).
 
 - [ ] **Step 4: Run tests to verify pass** — new tests PASS; add a render test asserting the idle row is blank under Auto with no message but the info line shows under On (drive `render()` against a `TestBackend`, read the bottom row string — mirror `renders_active_prompt_on_status_row` at `render.rs:1051`).
 
@@ -961,6 +989,8 @@ fn dwell_never_arms_under_any_modal() {
         ("minibuffer", |e| e.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter)),
         ("search", |e| e.search = Some(crate::search_overlay::SearchState::open(
             crate::search_overlay::Phase::Find, 0, crate::editor::BufferId(1)))),
+        ("outline", |e| e.open_outline()),
+        // diag: construct a DiagOverlay directly (mirror diag_overlay.rs tests).
     ];
     for (name, setup) in modal_setups {
         let mut e = Editor::new_from_text("hello\n", None, (40, 8));
@@ -1019,9 +1049,27 @@ In `handle`, after the Up(Left) drag-clear (`:93`) and BEFORE the dwell block (`
 ```
 Delete the now-migrated overlay branches (`:122-230`) and the duplicate `let (w, h) …; let area …;` at `:120-121`. The dwell block (`:98-119`) and the editor match (`:231`) now run only when `no_overlay_open`. This lets Task 3/4's `no_overlay_open()` gate in the dwell arms simplify (they're now only reached when no overlay is open — but keep the `no_overlay_open` guard in those arms as defense-in-depth; it's cheap and keeps them correct if the ordering ever changes). NOTE: preserve the universal Up(Left) drag-clear at `:90` ABOVE the overlay route so `overlay_open_mid_drag_up_clears_drag_state` (`:673`) still passes.
 
-- [ ] **Step 4: Run tests to verify pass** — new tests PASS; the ENTIRE existing `mouse::tests` suite green (palette dispatch, buffer-switch, theme-picker/file-browser wheel, drag-clear, dwell table — all must still pass; this is a pure restructure of existing behavior plus consume-only new arms).
+- [ ] **Step 4: Update the one intentionally-changed dwell test.** Moving overlay routing before the dwell block changes ONE existing invariant (Codex plan gate Critical): `leave_bookkeeping_runs_while_dropdown_open` (Case 6, `mouse.rs:796-806`) asserts the menu-bar leave-grace arms *while the dropdown is open*. Under the new ordering, dwell does NOT run while any overlay (incl. the dropdown) is open — that is exactly the no-leak guarantee, and it self-heals (closing the dropdown re-enables dwell; the next row>0 move arms the grace). **Replace** Case 6 with an assertion of the NEW invariant:
+```rust
+/// New invariant (overlay-route-before-dwell): leave-bookkeeping does NOT run while
+/// the dropdown is open — dwell is suppressed for every open overlay (no-leak guard).
+#[test]
+fn dwell_suppressed_while_dropdown_open() {
+    let mut e = Editor::new_from_text("hello\n", None, (40, 8));
+    crate::derive::rebuild(&mut e);
+    e.menu_bar_mode = crate::config::MenuBarMode::Auto;
+    e.mouse.menu_bar_revealed = true;
+    e.menu = Some(crate::menu::empty_at(0)); // dropdown open
+    let (reg, ex, _, tx, km) = ctx();
+    handle(&mut e, moved(5, 5), &reg, &km, &ex, &TestClock(0), &tx);
+    assert!(e.mouse.menu_hide_due.is_none(),
+        "dwell (incl. leave-bookkeeping) must not run while an overlay is open");
+}
+```
 
-- [ ] **Step 5: Commit** — `refactor(mouse): overlay route before dwell; consume-guard all modals (no leak)`.
+- [ ] **Step 5: Run tests to verify pass** — the new Task 9 tests PASS; the REST of `mouse::tests` green (palette dispatch, buffer-switch, theme-picker/file-browser wheel, drag-clear, and the rest of the dwell table — Cases 1-5 + 9 are unaffected because they exercise the no-overlay-open path; only Case 6 changes, updated above). `overlay_open_mid_drag_up_clears_drag_state` (`mouse.rs:673`) MUST still pass — the universal Up(Left) drag-clear stays ABOVE the overlay route.
+
+- [ ] **Step 6: Commit** — `refactor(mouse): overlay route before dwell; consume-guard all modals (no leak)`.
 
 ---
 
@@ -1059,7 +1107,7 @@ fn click_theme_row_applies_and_closes() {
 
 - [ ] **Step 2: Run to verify fail** — FAIL (theme_picker arm is scroll-only).
 
-- [ ] **Step 3: Implement.** Add hit-tests in `render.rs` (mirror `palette_row_at`):
+- [ ] **Step 3: Implement.** Theme picker + file browser ALREADY have `scroll_top` + windowed render (`render_overlays.rs:158`/`:230` — Codex plan gate) — this task is **hit-test + mouse-arm only**, no render groundwork. Add hit-tests in `render.rs` (mirror `palette_row_at`):
 ```rust
 pub(crate) fn theme_picker_row_at(area: Rect, tp: &crate::theme_picker::ThemePicker, col: u16, row: u16) -> Option<usize> {
     let r = palette_overlay_rect(area, tp.rows.len());
@@ -1113,7 +1161,7 @@ fn click_outline_row_jumps_and_closes() {
 
 - [ ] **Step 2: Run to verify fail** — FAIL (outline has no mouse arm).
 
-- [ ] **Step 3: Implement.** `outline_row_at` in `render.rs` (same shape over `outline.rows.len()`/`outline.scroll_top`). Outline arm in `route_overlay`: ScrollUp/Down (move `selected`, `keep_overlay_visible`), Down(Left) inside → set `selected`, dispatch the outline jump exactly as the keyboard Enter arm (grep the outline Enter handler in `app.rs` — it jumps to `rows[selected].byte` with the stale-version guard `opened_version`), then close; Down(Left) outside → close.
+- [ ] **Step 3: Implement.** Outline ALREADY has `scroll_top` + windowed render (`render_overlays.rs:118`) — this task is **mouse-only** (no render groundwork). Add `outline_row_at` in `render.rs` (same shape over `outline.rows.len()`/`outline.scroll_top`). Outline arm in `route_overlay`: ScrollUp/Down (move `selected`, `keep_overlay_visible`), Down(Left) inside → set `selected`, then jump via `crate::app::outline_jump_to(editor, byte)` (`app.rs:276`). **`outline_jump_to` does NOT itself version-guard** (Codex plan gate) — replicate the keyboard Enter arm's stale guard (`app.rs:~1013`, compares `outline.opened_version` to the live `document.version` and refuses if changed) BEFORE calling `outline_jump_to`; then close. Down(Left) outside → close.
 
 - [ ] **Step 4: Run tests to verify pass** — new test + a wheel test PASS.
 
@@ -1149,7 +1197,7 @@ fn diag_down_keeps_selection_in_window() {
 
 - [ ] **Step 2: Run to verify fail** — FAIL (`scroll_top` undefined).
 
-- [ ] **Step 3: Implement.** Add `scroll_top: usize` to `DiagOverlay` (`:10`) + its constructor (`:21`). In the diag paint (`render_overlays.rs:364`), call `crate::app::keep_overlay_visible(h, diag_ov.selected, row_count, &mut diag_ov.scroll_top)` at the top of the diag block (requires `editor.diag` as `&mut` — the `paint` fn already takes `&mut Editor`, mirror the palette arm at `:45`), replace the inline `.min(15)` list slice with a windowed slice `[scroll_top..end]` (mirror the palette slice at `render_overlays.rs:88`), and set `ListState` select to `selected - scroll_top`. `diag_row_at` in `render.rs` mirrors `palette_row_at`. Diag arm in `route_overlay`: ScrollUp/Down (move `selected`, `keep_overlay_visible`), Down(Left) inside → set `selected`, dispatch the diag apply/goto exactly as the keyboard Enter arm (grep the diag Enter handler — it applies a suggestion / ignore / add-dict with the `opened_version` stale guard), close; outside → close.
+- [ ] **Step 3: Implement.** Diag is the ONE list overlay that still lacks `scroll_top` + windowing (outline/theme/file already window — Codex plan gate). Add `scroll_top: usize` to `DiagOverlay` (`:10`) + its constructor (`:21`). In the diag paint (`render_overlays.rs:364`), call `crate::app::keep_overlay_visible(h, diag_ov.selected, row_count, &mut diag_ov.scroll_top)` at the top of the diag block (requires `editor.diag` as `&mut` — the `paint` fn already takes `&mut Editor`; mirror the palette arm at `:45`), replace the inline `.min(15)` list slice with a windowed slice `[scroll_top..end]` (mirror the palette slice at `render_overlays.rs:88`), and set `ListState` select to `selected - scroll_top`. `diag_row_at` in `render.rs` mirrors `palette_row_at`. Diag arm in `route_overlay`: ScrollUp/Down (move `selected`, `keep_overlay_visible`), Down(Left) inside → set `selected`, then apply via `crate::search_ui::diag_apply_selected(editor, clock)` (`search_ui.rs:133` — it ALREADY contains the `opened_version` stale guard tested at `app.rs:4029`; reuse it directly, do NOT reimplement); outside → close.
 
 - [ ] **Step 4: Run tests to verify pass** — new tests PASS; existing diag apply tests green.
 
@@ -1199,15 +1247,16 @@ fn click_prompt_choice_dispatches_action() {
 pub(crate) fn prompt_choice_at(area: Rect, prompt: &crate::prompt::Prompt, col: u16, row: u16)
     -> Option<crate::prompt::PromptAction> {
     if row != area.y + area.height.saturating_sub(1) { return None; } // status row only
+    let rel = col.saturating_sub(area.x); // message renders at column area.x (Codex plan gate)
     let msg = &prompt.message;
     for choice in &prompt.choices {
         let marker = format!("[{}]", choice.key.to_ascii_uppercase());
         if let Some(byte_idx) = msg.find(&marker) {
-            let start = byte_idx as u16;
+            let start = byte_idx as u16; // ASCII markers → byte index == column offset
             // span = the marker plus its trailing label word up to the next '·' separator.
             let rest = &msg[byte_idx..];
             let span_len = rest.find('·').unwrap_or(rest.len()) as u16;
-            if col >= start && col < start + span_len { return Some(choice.action); }
+            if rel >= start && rel < start + span_len { return Some(choice.action); }
         }
     }
     None
@@ -1290,7 +1339,7 @@ fn menu_wheel_scrolls_dropdown() {
 
 Dropdown paint (`render_overlays.rs:316`, post-Task-8): call `crate::list_window::keep_visible(menu.highlighted, leaves.len(), drop_rect.height as usize, &mut scroll_top)` (needs `editor.menu` as `&mut` in the paint — the fn already has `&mut Editor`; take the `scroll_top` mutably like the palette does), slice `leaves[scroll_top..end]`, and render the indicator via `windowed_indicator(menu.highlighted, leaves.len(), drop_rect.height as usize)` on the dropdown's bottom row when it overflows.
 
-Menu arm in `route_overlay` (`mouse.rs`): add `ScrollUp/Down` → move `highlighted` within `[0, leaves_len)` and `keep_visible`; keyboard ↑/↓ handlers in `app.rs` (grep the menu-highlight up/down key handlers) call `list_window::keep_visible(highlighted, len, list_h, &mut menu.scroll_top)` after moving — so the highlight is dragged into view. (For `list_h` in the keyboard path where no frame geometry is known, use `leaves.len().min(15)` as the budget, consistent with the paint's clamp; the paint re-windows against the true frame `list_h` every frame — the `list_window` two-layer invariant.)
+Menu arm in `route_overlay` (`mouse.rs`): add `ScrollUp/Down` → move `highlighted` within `[0, leaves_len)` and `keep_visible`. Keyboard handlers in `app.rs`: the Up/Down arms (`app.rs:358-361`) call `list_window::keep_visible(highlighted, len, len.min(15), &mut menu.scroll_top)` after moving — so the highlight is dragged into view. The **Left/Right category-change arms (`app.rs:356-357`) must ALSO reset `menu.scroll_top = 0`** (not just `highlighted = 0`), or a stale scroll window carries into a shorter category (Codex plan gate). (For `list_h` in the keyboard path where no frame geometry is known, use `leaves.len().min(15)` as the budget, consistent with the paint's clamp; the paint re-windows against the true frame `list_h` every frame — the `list_window` two-layer invariant.)
 
 - [ ] **Step 4: Run tests to verify pass** — new tests PASS; existing menu tests (`click_on_inactive_bar_opens_that_category`, dropdown dispatch) green.
 
@@ -1301,6 +1350,7 @@ Menu arm in `route_overlay` (`mouse.rs`): add `ScrollUp/Down` → move `highligh
 ## Testing & gates (whole-effort)
 
 - Per-task: the TDD tests above (Arrange-Act-Assert), each committed with its task.
+- **New local test helpers.** Names used in the task sketches — `tall_menu_groups(n)`, `tall_diag(n)`, `panel_bg`/`drop_x`/`drop_bottom` geometry locals — do NOT exist yet; each is a small `#[cfg(test)]` helper the implementer adds in the same module (Codex plan gate). Match the existing test helper style in that file.
 - Cross-cutting regression tests to confirm before the final review:
   - **No-silent-UI:** a status message reveals the reserved row even under zen/`Auto` (Task 4 test covers `status_line_visible`; add an `e2e.rs` journey asserting a save message paints on the bottom row in zen).
   - **No-jank:** `edit_height` is byte-identical before/after — assert `render.rs:362` is unchanged in the final review (no task edits it).
@@ -1315,6 +1365,6 @@ These are the concrete functions/sites the mouse arms and recompute calls reuse.
 1. **Prompt resolver (Task 13):** `crate::prompts::resolve_prompt(action, editor, ex, clock, msg_tx)` (`prompts.rs:99`, signature `(PromptAction, &mut Editor, &dyn Executor, &dyn Clock, &Sender<Msg>)`). The mouse prompt arm calls this with the hit `PromptAction`, then clears `editor.prompt`.
 2. **Outline jump (Task 11):** `crate::app::outline_jump_to(editor, byte)` (`app.rs:276`) — the mouse arm sets `selected`, reads `rows[selected].byte`, calls `outline_jump_to`, closes the overlay. (The `opened_version` stale guard lives in the keyboard Enter path; if `outline_jump_to` does not itself re-check version, replicate the guard the keyboard arm uses.)
 3. **Theme-picker Enter commit (Task 10):** the keyboard arm at `app.rs:~540-560` takes `theme_picker`, on Esc applies `tp.original`, on commit consumes `tp.previewed` to set `theme_identity`. The mouse commit arm must run `preview_selected_theme` then the SAME `previewed`-consume identity commit; extract that inline commit into a small helper (e.g. `commit_theme_picker(editor)`) and call it from both the keyboard Enter arm and the mouse arm.
-4. **File-browser Enter (Task 10) & diag apply (Task 12):** these live inline in the reduce Enter match arm (not yet factored). The executor must extract each into a reusable helper (`file_browser_enter(editor, …)`, `diag_apply_selected(editor, …)` incl. the `opened_version` guard tested at `app.rs:4029`) and call it from BOTH the keyboard arm and the new mouse arm — the plan forbids copying the fs/apply logic.
+4. **Diag apply (Task 12):** `crate::search_ui::diag_apply_selected(editor, clock)` (`search_ui.rs:133`) ALREADY exists and includes the `opened_version` stale guard (tested at `app.rs:4029`) — the mouse arm sets `selected` then calls it directly. Do NOT reimplement. **File-browser Enter (Task 10):** the file-browser open/descend logic (incl. the unreadable-dir guard tested at `file_browser.rs:84`) lives in the reduce Enter arm; if it is not already a named fn, extract a `file_browser_enter(editor, …)` helper and call it from BOTH the keyboard arm and the mouse arm — the plan forbids copying the fs logic.
 5. **Menu highlight ↑/↓ (Task 14):** the keyboard handler is at `app.rs:358-361` (Up = `highlighted.saturating_sub(1)`, Down = `(highlighted+1).min(n-1)`). Add `crate::list_window::keep_visible(menu.highlighted, n, n.min(15), &mut menu.scroll_top)` right after each move (inside the scoped `menu` borrow).
 6. **Recompute sites (Tasks 3, 4):** `recompute_scrollbar_visible` + `recompute_menu_bar` are called together at `app.rs:1237-1238` (reduce) and `recompute_scrollbar_visible` again at `app.rs:1533` (run loop). Add `recompute_status_line(editor, clock.now_ms())` beside `recompute_menu_bar` at `:1238`, and beside the `:1533` call. (Scrollbar already recomputes at both — Task 3 only changes its body.)
