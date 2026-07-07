@@ -302,8 +302,48 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
         }
         return;
     }
-    // Task 12: diagnostics-overlay clicks — placeholder consume for now.
-    if editor.diag.is_some() { return; }
+    if editor.diag.is_some() {
+        if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+            let ah = editor.active().view.area.1;
+            if let Some(d) = editor.diag.as_mut() {
+                let rc = d.row_count();
+                if matches!(ev.kind, MouseEventKind::ScrollDown) {
+                    d.selected = (d.selected + 1).min(rc.saturating_sub(1));
+                } else {
+                    d.selected = d.selected.saturating_sub(1);
+                }
+                crate::app::keep_overlay_visible(ah, d.selected, rc, &mut d.scroll_top);
+            }
+            return;
+        }
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            // Scoped borrows → owned hit values before any mutation.
+            let row_idx: Option<usize> = {
+                let d = editor.diag.as_ref().unwrap();
+                crate::render::diag_row_at(area, d, ev.column, ev.row)
+            };
+            let inside = {
+                let d = editor.diag.as_ref().unwrap();
+                let r = crate::render::palette_overlay_rect(area, d.row_count());
+                ev.column >= r.x && ev.column < r.x + r.width
+                    && ev.row >= r.y && ev.row < r.y + r.height
+            };
+            if let Some(idx) = row_idx {
+                // Set selected to the clicked row, then apply — reuse
+                // diag_apply_selected which owns the stale-version guard.
+                let ah = editor.active().view.area.1;
+                if let Some(d) = editor.diag.as_mut() {
+                    let rc = d.row_count();
+                    d.selected = idx;
+                    crate::app::keep_overlay_visible(ah, idx, rc, &mut d.scroll_top);
+                }
+                crate::search_ui::diag_apply_selected(editor, clock);
+            } else if !inside {
+                editor.diag = None; // click-away closes
+            }
+        }
+        return;
+    }
     // Task 13: prompt choice clicks — placeholder consume for now.
     if editor.prompt.is_some() { return; }
     // Text-input modals: consume, no row action (you type). Tail branch — the fn
@@ -1285,6 +1325,72 @@ mod tests {
         handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
         assert!(e.outline.is_none(), "click-away closes the outline");
         assert_eq!(crate::nav::head(&e), before, "caret unchanged on click-away");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 12: diag overlay — scroll + click-apply + click-away
+    // -----------------------------------------------------------------------
+
+    /// A mouse click on a suggestion row applies it and closes the overlay.
+    /// The click-apply path reuses `diag_apply_selected` (with its stale guard).
+    #[test]
+    fn diag_click_applies_selected_row() {
+        let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        let v = e.active().document.version;
+        e.diag = Some(crate::diag_overlay::DiagOverlay::new(
+            wordcartel_core::diagnostics::Diagnostic {
+                range: 0..3,
+                kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                message: "misspelled".into(),
+                suggestions: vec![
+                    wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into()),
+                ],
+            },
+            e.active().id,
+            v,
+        ));
+        let (reg, ex, clk, tx, km) = ctx();
+        // Diag list starts at ov_y + 1 (no query row). Click first row (index 0 = "the").
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let r = crate::render::palette_overlay_rect(area, e.diag.as_ref().unwrap().row_count());
+        let d = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: r.x + 1,
+            row: r.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        assert!(e.diag.is_none(), "overlay closed after click-apply");
+        assert_eq!(e.active().document.buffer.to_string(), "the cat\n",
+            "first suggestion was applied via click");
+    }
+
+    /// A click outside the diag overlay closes it without applying.
+    #[test]
+    fn click_outside_diag_closes() {
+        let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        let v = e.active().document.version;
+        e.diag = Some(crate::diag_overlay::DiagOverlay::new(
+            wordcartel_core::diagnostics::Diagnostic {
+                range: 0..3,
+                kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                message: "m".into(),
+                suggestions: vec![
+                    wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into()),
+                ],
+            },
+            e.active().id,
+            v,
+        ));
+        let buf_before = e.active().document.buffer.to_string();
+        let (reg, ex, clk, tx, km) = ctx();
+        // (0, 0) is outside the centered overlay.
+        handle(&mut e, down(0, 0), &reg, &km, &ex, &clk, &tx);
+        assert!(e.diag.is_none(), "click-away closes the diag overlay");
+        assert_eq!(e.active().document.buffer.to_string(), buf_before,
+            "buffer unchanged on click-away");
     }
 
     /// A click on a directory entry in the file browser descends into that directory.

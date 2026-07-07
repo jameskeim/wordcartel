@@ -244,6 +244,20 @@ pub(crate) fn outline_row_at(area: Rect, outline: &crate::outline_overlay::Outli
     } else { None }
 }
 
+/// Return the absolute list-row index that `(col, row)` hits in the diagnostic
+/// quick-fix overlay, or `None` when the click is outside the list interior.
+/// Mirrors `palette_row_at` — note the list starts at `ov_y + 1` (no query row).
+pub(crate) fn diag_row_at(area: Rect, diag: &crate::diag_overlay::DiagOverlay, col: u16, row: u16) -> Option<usize> {
+    let row_count = diag.row_count();
+    let r = palette_overlay_rect(area, row_count);
+    let list_top = r.y.saturating_add(1);
+    let list_h = crate::list_window::list_h_for(row_count, area.height) as u16;
+    if col >= r.x.saturating_add(1) && col < r.x.saturating_add(r.width).saturating_sub(1)
+        && row >= list_top && row < list_top.saturating_add(list_h) {
+        Some((row - list_top) as usize + diag.scroll_top)
+    } else { None }
+}
+
 /// Assemble the left-hand portion of the normal status line (no overlay active).
 ///
 /// Format: `[i/n] <name> [<mode>]` (plus optional status message and BLK indicator).

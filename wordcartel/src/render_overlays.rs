@@ -348,6 +348,11 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
     // -----------------------------------------------------------------------
     // Diagnostic quick-fix overlay (drawn on top of everything else)
     // -----------------------------------------------------------------------
+    // A6 self-heal: the window must respect the LIVE frame's geometry (resize
+    // has no overlay hook; render is the one place that always sees the truth).
+    if let Some(d) = editor.diag.as_mut() {
+        crate::app::keep_overlay_visible(h, d.selected, d.row_count(), &mut d.scroll_top);
+    }
     if let Some(ref diag_ov) = editor.diag {
         let row_count = diag_ov.row_count();
         let ov_rect = palette_overlay_rect(area, row_count);
@@ -355,22 +360,28 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
         let ov_y = ov_rect.y;
         let ov_w = ov_rect.width;
         let ov_h = ov_rect.height;
+        let list_h = crate::list_window::list_h_for(row_count, h);
 
         frame.render_widget(Clear, ov_rect);
         frame.buffer_mut().set_style(ov_rect, cs.ov_fill);
 
         let title = format!(" {} ", diag_ov.anchor.message);
-        let block = Block::default().borders(Borders::ALL).title(title)
+        let mut block = Block::default().borders(Borders::ALL).title(title)
             .border_style(cs.overlay_border);
+        if let Some(ind) = windowed_indicator(diag_ov.selected, row_count, list_h) {
+            block = block.title_bottom(ind);
+        }
         frame.render_widget(block, ov_rect);
 
-        if ov_h >= 3 {
-            let list_h = (row_count as u16).min(15).min(ov_h.saturating_sub(2));
-            let list_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), list_h);
+        if ov_h >= 3 && list_h > 0 {
+            let list_h_u16 = list_h as u16;
+            let list_area = Rect::new(ov_x + 1, ov_y + 1, ov_w.saturating_sub(2), list_h_u16);
             let highlight_style = cs.overlay_selected;
+            let scroll_top = diag_ov.scroll_top;
+            let end = (scroll_top + list_h).min(row_count);
 
             let n_sugg = diag_ov.anchor.suggestions.len();
-            let items: Vec<ListItem> = (0..row_count).take(list_h as usize).map(|i| {
+            let items: Vec<ListItem> = (scroll_top..end).map(|i| {
                 let label = if i < n_sugg {
                     crate::diag_overlay::suggestion_label(&diag_ov.anchor.suggestions[i])
                 } else if i == n_sugg {
@@ -383,7 +394,11 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
             }).collect();
 
             let mut list_state = ListState::default();
-            list_state.select(if row_count == 0 { None } else { Some(diag_ov.selected) });
+            list_state.select(if row_count == 0 {
+                None
+            } else {
+                Some(diag_ov.selected.saturating_sub(scroll_top))
+            });
 
             frame.render_stateful_widget(
                 List::new(items).highlight_style(highlight_style),
