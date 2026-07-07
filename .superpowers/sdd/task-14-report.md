@@ -138,3 +138,73 @@ closes the menu, which is the same as clicking anywhere outside.
 - All named prior menu tests pass: `menu_dropdown_windows_a_tall_category`,
   `menu_wheel_scrolls_dropdown`, `dropdown_indicator_row_carries_panel_bg`,
   `dropdown_highlight_never_hidden_in_overflow`, `click_on_inactive_bar_opens_that_category`.
+
+---
+
+## Fable whole-branch blocker fix: `menu_area` shared helper (cross-caller geometry drift)
+
+### Bug (Fable probe — demonstrated on 30×10, 9-leaf category)
+
+The dropdown painter (`render_overlays.rs`) derived its rect from
+`menu_area = Rect::new(area.x, area.y, area.width, h.saturating_sub(1))` — frame minus the
+status row.  The mouse hit-test path passed the full-height `area` directly to
+`menu_bar_layout` and `menu_dropdown_row_at`.  Since `menu_dropdown_rect`'s
+`avail_below = area.height.saturating_sub(1)`, the painter's budget was `h-2` rows and the
+hit-test's budget was `h-1` rows — one row taller.
+
+On a short terminal (h ≤ 16) with a category whose leaf count fits in the hit-test window
+but overflows the paint window, a click on the painted indicator row (or one row below the
+painted dropdown) dispatched a hidden off-screen leaf.  Fable demonstrated this at 30×10,
+9-leaf category: painter gave list_h=8, overflows=true, indicator at row 8; mouse gave
+list_h=9, overflows=false, all 9 rows dispatachable — click row 8 → dispatched leaf 7 via
+`move_right`, caret 0→1.
+
+### Fix
+
+Added a shared helper in `render.rs`:
+
+```rust
+/// The area the menu bar and dropdown are laid out against: the frame area with the
+/// reserved status row excluded.  Both the painter (`render_overlays::paint`) and the
+/// mouse hit-test path (`mouse::route_overlay`) MUST derive dropdown geometry through
+/// this helper — so `avail_below` in `menu_dropdown_rect` evaluates against the same
+/// height in both call sites and the two windows can never drift (Fable whole-branch fix).
+pub(crate) fn menu_area(area: Rect) -> Rect {
+    Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1))
+}
+```
+
+### Every menu-geometry call site routed through `menu_area`
+
+1. `render_overlays.rs:295` — painter's `menu_area` local (replaced inline `Rect::new`)
+2. `mouse.rs` scroll arm — `avail_below` for coarse `keep_visible` (was `area.height.saturating_sub(1)`)
+3. `mouse.rs` click arm — `hit_area` passed to `menu_bar_layout` (was `area`)
+4. `mouse.rs` click arm — `hit_area` passed to `menu_dropdown_row_at` (was `area`)
+
+### Regression tests (Fable probes, mouse.rs)
+
+30×10 terminal, 9-leaf category (overflows the 8-row paint window; indicator at row 8).
+Leaves all map to `move_right` so dispatch is detectable via caret position (0→1).
+
+| Test | Old result | New result |
+|------|------------|------------|
+| `menu_click_on_painted_indicator_row_does_not_dispatch` — click row 8 | FAIL (caret moved 0→1) | PASS |
+| `menu_click_below_painted_dropdown_does_not_dispatch` — click row 9 | FAIL (caret moved 0→1) | PASS |
+
+A third paint-truth test (`fable_menu_paint_truth_indicator_on_row8_item7_not_visible`)
+verifies the geometric foundation: indicator text appears at row 8, label "item07" absent.
+
+**Confirmed FAIL under old code (temporary revert to `hit_area = area`):**
+```
+test result: FAILED. 0 passed; 2 failed
+    mouse::tests::menu_click_on_painted_indicator_row_does_not_dispatch
+    mouse::tests::menu_click_below_painted_dropdown_does_not_dispatch
+```
+
+### Final gates (post Fable blocker fix)
+- `cargo build -p wordcartel`: warning-free.
+- `cargo clippy -p wordcartel --all-targets`: clean.
+- `cargo test -p wordcartel --lib`: **874 passed, 0 failed** (3 new tests added).
+- All named prior menu tests pass: `click_on_inactive_bar_opens_that_category`,
+  `dropdown_indicator_row_hit_test_returns_none`, `menu_dropdown_windows_a_tall_category`,
+  `menu_wheel_scrolls_dropdown`, `dropdown_highlight_never_hidden_in_overflow`.

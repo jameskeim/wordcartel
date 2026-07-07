@@ -151,9 +151,9 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
                     }
                     // Coarse follow-the-selection layer — the paint re-windows against the true
                     // item-row budget every frame (list_window two-layer invariant), so this
-                    // estimate need not reserve the indicator row.  Use avail_below so
-                    // keep_visible scrolls at the same boundary the dropdown rect uses.
-                    let avail_below = area.height.saturating_sub(1) as usize;
+                    // estimate need not reserve the indicator row.  Derive from menu_area so
+                    // keep_visible scrolls at the same boundary the dropdown rect and painter use.
+                    let avail_below = crate::render::menu_area(area).height.saturating_sub(1) as usize;
                     let list_h = n.min(15).min(avail_below);
                     crate::list_window::keep_visible(m.highlighted, n, list_h, &mut m.scroll_top);
                 }
@@ -163,16 +163,19 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
             let open = editor.menu.as_ref().unwrap().open;
             let scroll_top = editor.menu.as_ref().unwrap().scroll_top;
+            // Both bar and dropdown hit-tests must use menu_area (frame minus the status row)
+            // so the dropdown windowing (avail_below) is identical to the painter's — no drift.
+            let hit_area = crate::render::menu_area(area);
             // scoped borrows → owned hit results
             let bar_hit: Option<usize> = {
                 let groups = &editor.menu.as_ref().unwrap().groups;
-                crate::render::menu_bar_layout(area, groups).into_iter()
+                crate::render::menu_bar_layout(hit_area, groups).into_iter()
                     .find(|(_, r)| ev.column >= r.x && ev.column < r.x + r.width && ev.row == r.y)
                     .map(|(cat, _)| cat)
             };
             let row_id: Option<crate::registry::CommandId> = {
                 let groups = &editor.menu.as_ref().unwrap().groups;
-                crate::render::menu_dropdown_row_at(area, groups, open, scroll_top, ev.column, ev.row)
+                crate::render::menu_dropdown_row_at(hit_area, groups, open, scroll_top, ev.column, ev.row)
                     .and_then(|row| groups.get(open).and_then(|g| g.1.get(row)).map(|(_, id)| *id))
             };
             // all borrows dropped — now mutate/dispatch/clear
@@ -1598,5 +1601,106 @@ mod tests {
         let m = e.menu.as_ref().unwrap();
         assert!(m.highlighted > 0, "wheel moves the highlight");
         assert!(m.scroll_top > 0, "wheel scrolls the window once the highlight passes the visible rows");
+    }
+
+    // -----------------------------------------------------------------------
+    // Fable whole-branch regression: menu_area drift fix (Task 14 blocker)
+    // -----------------------------------------------------------------------
+
+    /// Geometry for the two Fable probes: 30×10 terminal, 9-leaf category so the
+    /// dropdown overflows the paint window (avail_below = menu_area.height - 1 = 8
+    /// after the fix → list_h = 8, item_rows = 7, indicator at row 8).
+    ///
+    /// Under the OLD code the mouse path passed the full-height area (h=10) to
+    /// menu_dropdown_row_at, giving avail_below=9, list_h=9, overflows=false,
+    /// item_rows=9 — so click row 8 (the PAINTED indicator) dispatched leaf 7.
+    ///
+    /// Helper: build a 9-leaf Edit groups vec and return the rendered terminal.
+    #[cfg(test)]
+    fn fable_menu_setup() -> (Editor, crate::registry::Registry, crate::keymap::KeyTrie,
+                              InlineExecutor, TestClock,
+                              std::sync::mpsc::Sender<crate::app::Msg>,
+                              ratatui::Terminal<ratatui::backend::TestBackend>) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use crate::render::render;
+
+        let leaves: Vec<(String, crate::registry::CommandId)> =
+            (0..9).map(|i| (format!("item{i:02}      "), crate::registry::CommandId("move_right"))).collect();
+        let mut e = Editor::new_from_text("abc\n", None, (30, 10));
+        crate::derive::rebuild(&mut e);
+        e.menu = Some(crate::menu::MenuView {
+            groups: vec![(crate::registry::MenuCategory::Edit, leaves)],
+            open: 0, highlighted: 0, built: true, scroll_top: 0,
+        });
+
+        let (reg, ex, clk, tx, km) = ctx();
+
+        let mut term = Terminal::new(TestBackend::new(30, 10)).unwrap();
+        term.draw(|f| render(f, &mut e)).unwrap();
+        (e, reg, km, ex, clk, tx, term)
+    }
+
+    /// Paint-truth: confirm the indicator row IS on the screen and the off-screen
+    /// leaf label is NOT — so the two dispatch assertions below have a solid
+    /// geometric foundation.
+    ///
+    /// 30×10, 9 leaves: menu_area.height = 9, avail_below = 8 → list_h = 8,
+    /// item_rows = 7, indicator at row 1+7 = 8.  item 7 ("item07") is NOT painted.
+    #[test]
+    fn fable_menu_paint_truth_indicator_on_row8_item7_not_visible() {
+        let (e, _, _, _, _, _, term) = fable_menu_setup();
+        let buf = term.backend().buffer();
+        // Indicator row (row 8) must not be blank — it carries "n/total" text.
+        // We check the area.height-1 guard: row 9 is the status line, row 8 is the indicator.
+        let row8_text: String = (0..30u16).map(|x| buf[(x, 8)].symbol().chars().next().unwrap_or(' ')).collect();
+        assert!(row8_text.trim().contains('/'), "indicator row 8 must contain '/' from the n/total widget: got {row8_text:?}");
+        // item07 label must NOT appear anywhere in the painted buffer.
+        let all_text: String = (0..10u16).flat_map(|y| (0..30u16).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().chars().next().unwrap_or(' ')).collect();
+        assert!(!all_text.contains("item07"), "item07 is off-screen and must not be painted: buf={all_text:?}");
+        // Suppress unused-variable warning from destructuring — drop the editor.
+        let _ = e;
+    }
+
+    /// Fable regression 1 — click the PAINTED indicator row must NOT dispatch.
+    ///
+    /// Row 8 is the n/total indicator (not an item).  Before the fix the mouse path
+    /// used the full-height area (h=10 → list_h=9, overflows=false, item_rows=9) and
+    /// dispatched the 8th leaf (move_right → caret 0→1).  After the fix both paths
+    /// use menu_area (h=9 → list_h=8, overflows=true, item_rows=7) → None → close.
+    #[test]
+    fn menu_click_on_painted_indicator_row_does_not_dispatch() {
+        let (mut e, reg, km, ex, clk, tx, _term) = fable_menu_setup();
+        let caret_before = crate::nav::head(&e);
+        // Drop column — inside the dropdown (x=0 is within the Edit label / dropdown area).
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1, row: 8, // row 8 = painted indicator row
+            modifiers: KeyModifiers::NONE,
+        };
+        handle(&mut e, click, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(caret_before, crate::nav::head(&e),
+            "click on painted indicator row (row 8) must NOT dispatch move_right — caret must not advance");
+    }
+
+    /// Fable regression 2 — click ONE ROW BELOW the painted dropdown must NOT dispatch.
+    ///
+    /// Row 9 is below the 8-row painted dropdown.  Before the fix the mouse path's
+    /// hit-test used a 9-row drop_rect (full-height area) and dispatched leaf 8
+    /// (abs = scroll_top + 8 = 8 → move_right → caret 0→1).  After the fix the
+    /// hit-test uses the same 8-row rect as the painter and returns None → close.
+    #[test]
+    fn menu_click_below_painted_dropdown_does_not_dispatch() {
+        let (mut e, reg, km, ex, clk, tx, _term) = fable_menu_setup();
+        let caret_before = crate::nav::head(&e);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1, row: 9, // row 9 = one below the 8-row painted dropdown
+            modifiers: KeyModifiers::NONE,
+        };
+        handle(&mut e, click, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(caret_before, crate::nav::head(&e),
+            "click below painted dropdown (row 9) must NOT dispatch move_right — caret must not advance");
     }
 }

@@ -292,7 +292,7 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
     }
 
     if editor.menu_bar_rows() == 1 {
-        let menu_area = Rect::new(area.x, area.y, area.width, h.saturating_sub(1));
+        let menu_area = crate::render::menu_area(area);
         // Full-width bar background: gaps between labels + the right side carry the
         // Chrome style; the per-label paints below overwrite their own rects (A2).
         let bar_row = Rect::new(area.x, area.y, area.width, 1);

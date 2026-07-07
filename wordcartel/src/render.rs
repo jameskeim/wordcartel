@@ -182,6 +182,15 @@ pub(crate) fn menu_dropdown_row_at(area: Rect, groups: &[(crate::registry::MenuC
     } else { None }
 }
 
+/// The area the menu bar and dropdown are laid out against: the frame area with the
+/// reserved status row excluded.  Both the painter (`render_overlays::paint`) and the
+/// mouse hit-test path (`mouse::route_overlay`) MUST derive dropdown geometry through
+/// this helper — so `avail_below` in `menu_dropdown_rect` evaluates against the same
+/// height in both call sites and the two windows can never drift (Fable whole-branch fix).
+pub(crate) fn menu_area(area: Rect) -> Rect {
+    Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1))
+}
+
 /// Indicator title for a windowed overlay list — `" {n}/{total} "` right-aligned when
 /// the list is taller than the visible window; `None` when everything fits (A6).
 pub(crate) fn windowed_indicator(selected: usize, total: usize, list_h: usize)
