@@ -1380,6 +1380,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // startup (no dwell pending yet).
     editor.set_scrollbar_mode(cfg.view.scrollbar);
     editor.set_status_line_mode(cfg.view.status_line);
+    editor.set_clipboard_provider(cfg.clipboard.provider);
+    editor.clear_clipboard_provider_dirty(); // worker gets the initial plan below; no redundant rebuild
     editor.resume_enabled = cfg.state.resume; // gates open_into_current's resume restore (Effort 7)
     editor.diag_cfg = cfg.diagnostics.clone();
     editor.export_cfg = cfg.export.clone();
@@ -1503,13 +1505,9 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Msg>();
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
     let executor = crate::jobs::ThreadExecutor::new(wake_tx);
-    let clip_tx = crate::clipboard::spawn_worker(
-        msg_tx.clone(),
-        crate::clipboard::ProviderPlan {
-            layer1: crate::clipboard::Layer1Choice::Null,
-            osc52: None,
-        },
-    );
+    let clip_env = crate::clipboard::clip_env_from_process();
+    let initial_plan = crate::clipboard::resolve_provider(&clip_env, editor.clipboard_provider);
+    let clip_tx = crate::clipboard::spawn_worker(msg_tx.clone(), initial_plan);
 
     // Worker → loop wake relay: each result nudges the loop to drain. reduce()'s
     // trailing ex.drain() does the actual merge, so Msg::Tick is the nudge.
@@ -1667,7 +1665,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             }
         }
         editor.note_undo_eviction(pre_id, pre_version);
-        crate::clipboard::drain_clipboard_intents(&mut editor, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
+        crate::clipboard::drain_clipboard_intents(&mut editor, &clip_env, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
         reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
         advance(&mut editor, &clock);
         guard.terminal().draw(|f| render::render(f, &mut editor))?;
