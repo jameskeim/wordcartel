@@ -602,9 +602,10 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     // visible block forces the placed path even with no selection/search/diag.
     let use_placed = !hl_window.is_empty() || diag_active || has_sel || has_block;
 
-    // Source-mode branch: in source modes (any mode other than LivePreview) the
-    // stack is [Text] only — base canvas, no role or inline semantic styling.
-    let source_mode = editor.active().view.mode != crate::editor::RenderMode::LivePreview;
+    // SourcePlain is the only mode with no semantic colour; LivePreview and
+    // SourceHighlighted both paint role + inline styles (SH's raw markers carry
+    // their construct's style from layout, so they colour too).
+    let plain_source = editor.active().view.mode == crate::editor::RenderMode::SourcePlain;
 
     'outer: for &l in &sorted_lines {
         if l < scroll {
@@ -675,14 +676,14 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 }
                 for seg in &vr.segs {
                     let style = if row_dim {
-                        if source_mode {
+                        if plain_source {
                             compose::compose(&editor.theme, editor.depth, &[SE::Text, SE::FocusDim])
                         } else {
                             // §13.2 FIX-1: compose FocusDim OVER the semantic stack so heading
                             // bold, comment italic, etc. are preserved on dim rows (§3.4 intent).
                             compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(seg.style), SE::FocusDim])
                         }
-                    } else if source_mode {
+                    } else if plain_source {
                         compose::compose(&editor.theme, editor.depth, &[SE::Text])
                     } else {
                         compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(seg.style)])
@@ -750,14 +751,14 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                     let is_match = !is_current && hl_window.iter().any(|m| overlaps(g_from, g_to, m.start, m.end));
 
                     let mut style = if row_dim {
-                        if source_mode {
+                        if plain_source {
                             compose::compose(&editor.theme, editor.depth, &[SE::Text, SE::FocusDim])
                         } else {
                             // §13.2 FIX-1: compose FocusDim OVER the semantic stack so heading
                             // bold, comment italic, etc. are preserved on dim rows (§3.4 intent).
                             compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(p.style), SE::FocusDim])
                         }
-                    } else if source_mode {
+                    } else if plain_source {
                         compose::compose(&editor.theme, editor.depth, &[SE::Text])
                     } else {
                         compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(p.style)])
@@ -1680,6 +1681,94 @@ mod tests {
         let buf_source = render_to_buffer(&mut ed, 40, 4);
         let source_has_heading_fg = (0..40).any(|x| buf_source[(x,0)].style().fg == want && want.is_some());
         assert!(!source_has_heading_fg, "SourcePlain must not carry heading fg (base canvas only)");
+
+        // SourceHighlighted: heading fg present — raw markers visible, role colour applied.
+        ed.active_mut().view.mode = RenderMode::SourceHighlighted;
+        crate::derive::rebuild(&mut ed);
+        let buf_sh = render_to_buffer(&mut ed, 40, 4);
+        let sh_has_heading_fg = (0..40).any(|x| buf_sh[(x,0)].style().fg == want && want.is_some());
+        assert!(sh_has_heading_fg, "SourceHighlighted must carry heading fg (raw markers, role colour)");
+    }
+
+    #[test]
+    fn srchi_colors_delimiters_and_content_source_stays_plain() {
+        // SH paints raw markdown with construct faces (Strong/Code/Link/Heading).
+        // SP shows the same raw text monochrome at base_fg.
+        // Core SH≠SP pin (whole-effort T3); also exercises the RawStyled
+        // Code+Link whole-span styling end-to-end (Task 1 carry-forward).
+        use crate::editor::RenderMode;
+        // Doc: paragraph with bold, code span, link; then a heading.
+        let mut ed = Editor::new_from_text("**bold** `x` [t](u)\n# H\n", None, (40, 5));
+        ed.theme = wordcartel_core::theme::tokyo_night();
+
+        let strong_fg  = crate::compose::compose(&ed.theme, ed.depth, &[SE::Strong]).fg;
+        let heading_fg = crate::compose::compose(&ed.theme, ed.depth, &[SE::Text, SE::Heading(1)]).fg;
+        let code_fg    = crate::compose::compose(&ed.theme, ed.depth, &[SE::Code]).fg;
+        let link_fg    = crate::compose::compose(&ed.theme, ed.depth, &[SE::Link]).fg;
+        let base_fg    = crate::compose::base_canvas(&ed.theme, ed.depth).fg;
+
+        // Sanity: all face fgs must differ from base_fg for assertions to be meaningful.
+        assert!(strong_fg.is_some()  && strong_fg  != base_fg, "tokyo-night Strong fg must differ from base_fg");
+        assert!(heading_fg.is_some() && heading_fg != base_fg, "tokyo-night Heading(1) fg must differ from base_fg");
+        assert!(code_fg.is_some()    && code_fg    != base_fg, "tokyo-night Code fg must differ from base_fg");
+        assert!(link_fg.is_some()    && link_fg    != base_fg, "tokyo-night Link fg must differ from base_fg");
+
+        // --- SourceHighlighted: delimiters + content carry construct faces ---
+        ed.active_mut().view.mode = RenderMode::SourceHighlighted;
+        crate::derive::rebuild(&mut ed);
+        let buf_sh = render_to_buffer(&mut ed, 40, 5);
+
+        // Row 0 col 0: first '*' of **bold** → Strong fg.
+        assert_eq!(buf_sh[(0u16, 0u16)].style().fg, strong_fg,
+            "SH: first '*' must carry Strong fg, got {:?}", buf_sh[(0u16, 0u16)].style().fg);
+        // Row 0 col 9: opening backtick of `x` → Code fg.
+        assert_eq!(buf_sh[(9u16, 0u16)].style().fg, code_fg,
+            "SH: opening backtick must carry Code fg, got {:?}", buf_sh[(9u16, 0u16)].style().fg);
+        // Row 0 col 13: '[' of [t](u) → Link fg.
+        assert_eq!(buf_sh[(13u16, 0u16)].style().fg, link_fg,
+            "SH: '[' must carry Link fg, got {:?}", buf_sh[(13u16, 0u16)].style().fg);
+        // Row 1 col 0: '#' of '# H' → Heading(1) fg.
+        assert_eq!(buf_sh[(0u16, 1u16)].style().fg, heading_fg,
+            "SH: '#' must carry Heading(1) fg, got {:?}", buf_sh[(0u16, 1u16)].style().fg);
+
+        // --- SourcePlain: same cells are monochrome base_fg ---
+        ed.active_mut().view.mode = RenderMode::SourcePlain;
+        crate::derive::rebuild(&mut ed);
+        let buf_sp = render_to_buffer(&mut ed, 40, 5);
+
+        // Row 0 col 0: '*' → base_fg (no construct styling in SP).
+        assert_eq!(buf_sp[(0u16, 0u16)].style().fg, base_fg,
+            "SP: first '*' must be base_fg, got {:?}", buf_sp[(0u16, 0u16)].style().fg);
+        // Row 1 col 0: '#' → base_fg.
+        assert_eq!(buf_sp[(0u16, 1u16)].style().fg, base_fg,
+            "SP: '#' must be base_fg, got {:?}", buf_sp[(0u16, 1u16)].style().fg);
+    }
+
+    #[test]
+    fn live_preview_and_source_plain_render_unchanged() {
+        // Regression pin: SRC-HI effort must not change LivePreview or SourcePlain behaviour.
+        // LP: conceals markers, colours content (heading fg present).
+        // SP: raw source, monochrome base canvas (no heading fg).
+        use crate::editor::RenderMode;
+        let mut ed = Editor::new_from_text("# Heading\n", None, (40, 4));
+        ed.theme = wordcartel_core::theme::tokyo_night();
+        let heading_fg = crate::compose::compose(&ed.theme, ed.depth, &[
+            SE::Text, SE::Heading(1),
+        ]).fg;
+
+        // LivePreview: heading fg present (markers concealed, role colour applied).
+        ed.active_mut().view.mode = RenderMode::LivePreview;
+        crate::derive::rebuild(&mut ed);
+        let buf_lp = render_to_buffer(&mut ed, 40, 4);
+        assert!((0..40u16).any(|x| buf_lp[(x, 0u16)].style().fg == heading_fg && heading_fg.is_some()),
+            "LP: heading row must carry heading fg (unchanged from pre-effort)");
+
+        // SourcePlain: base canvas only — no heading fg.
+        ed.active_mut().view.mode = RenderMode::SourcePlain;
+        crate::derive::rebuild(&mut ed);
+        let buf_sp = render_to_buffer(&mut ed, 40, 4);
+        assert!(!(0..40u16).any(|x| buf_sp[(x, 0u16)].style().fg == heading_fg && heading_fg.is_some()),
+            "SP: heading row must NOT carry heading fg (base canvas only, unchanged from pre-effort)");
     }
 
     #[test]
