@@ -89,6 +89,12 @@ pub enum MenuBarMode { Hidden, Auto, Pinned }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransientMode { Off, Auto, On }
 
+/// Clipboard provider selection (`[clipboard] provider`). `Auto` runs the detection
+/// chain; `Native` forces arboard; `Osc52` forces the terminal path; `Off` disables
+/// the system clipboard (in-process register only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardProvider { Auto, Native, Osc52, Off }
+
 /// Menu bar configuration section.
 #[derive(Debug, Clone)]
 pub struct MenuConfig { pub bar: MenuBarMode }

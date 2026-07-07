@@ -7,6 +7,123 @@ use std::sync::mpsc::Sender;
 pub use crate::limits::{OSC52_MAX_ENCODED, PASTE_MAX_BYTES};
 
 // ---------------------------------------------------------------------------
+// Provider detection: types + resolve_provider
+// ---------------------------------------------------------------------------
+
+/// Who owns the LOCAL system clipboard (Layer 1). Selected once at worker init and on a
+/// runtime provider change; `Null` = register-only (no system clipboard).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layer1Choice { WlCopy, Xclip, Xsel, WinYank, ClipExe, Arboard, Null }
+
+/// OSC 52 framing (Layer 2). `Bare` outside a multiplexer; `Tmux`/`Screen` wrap the bare
+/// sequence in the multiplexer's DCS passthrough.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Osc52Wrap { Bare, Tmux, Screen }
+
+/// The resolved plan: Layer-1 owner + whether/how to also emit OSC 52. `osc52 == None`
+/// means a local owner persists the clipboard, so we suppress the redundant terminal write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderPlan { pub layer1: Layer1Choice, pub osc52: Option<Osc52Wrap> }
+
+/// Compile-time target OS class (drives arboard-native vs helper selection).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Os { Linux, MacOs, Windows }
+
+/// Environment snapshot for provider detection. `present` probes `$PATH` for a helper
+/// binary; injected so tests need no real env and no spawning.
+#[derive(Clone, Copy)]
+pub struct ClipEnv {
+    pub tmux: bool,    // $TMUX
+    pub screen: bool,  // $STY
+    pub ssh: bool,     // $SSH_TTY || $SSH_CONNECTION
+    pub wayland: bool, // $WAYLAND_DISPLAY
+    pub x11: bool,     // $DISPLAY
+    pub wsl: bool,     // $WSL_DISTRO_NAME
+    pub os: Os,
+    pub present: fn(&str) -> bool,
+}
+
+/// Multiplexer wrap for the current environment (tmux beats screen beats bare).
+fn wrap_for(env: &ClipEnv) -> Osc52Wrap {
+    if env.tmux { Osc52Wrap::Tmux } else if env.screen { Osc52Wrap::Screen } else { Osc52Wrap::Bare }
+}
+
+/// Pick the Layer-1 owner under `Auto` (first match wins).
+fn auto_layer1(env: &ClipEnv) -> Layer1Choice {
+    if env.wsl {
+        return if (env.present)("win32yank.exe") { Layer1Choice::WinYank } else { Layer1Choice::ClipExe };
+    }
+    if env.wayland {
+        return if (env.present)("wl-copy") { Layer1Choice::WlCopy } else { Layer1Choice::Arboard };
+    }
+    if env.x11 {
+        return if (env.present)("xclip") { Layer1Choice::Xclip }
+               else if (env.present)("xsel") { Layer1Choice::Xsel }
+               else { Layer1Choice::Arboard };
+    }
+    match env.os {
+        Os::MacOs | Os::Windows => Layer1Choice::Arboard,
+        Os::Linux => Layer1Choice::Null,
+    }
+}
+
+/// Whether the chosen Layer-1 owner persists the clipboard locally on its own.
+fn is_local_persisting(layer1: Layer1Choice, env: &ClipEnv) -> bool {
+    match layer1 {
+        Layer1Choice::WlCopy | Layer1Choice::Xclip | Layer1Choice::Xsel
+        | Layer1Choice::WinYank | Layer1Choice::ClipExe => true,
+        // arboard persists natively only where the OS owns the clipboard.
+        Layer1Choice::Arboard => matches!(env.os, Os::MacOs | Os::Windows),
+        Layer1Choice::Null => false,
+    }
+}
+
+/// Resolve the environment (+ any override) into a concrete plan. Pure.
+pub fn resolve_provider(env: &ClipEnv, forced: crate::config::ClipboardProvider) -> ProviderPlan {
+    use crate::config::ClipboardProvider as P;
+    match forced {
+        P::Native => ProviderPlan { layer1: Layer1Choice::Arboard, osc52: None },
+        P::Osc52  => ProviderPlan { layer1: Layer1Choice::Null, osc52: Some(wrap_for(env)) },
+        P::Off    => ProviderPlan { layer1: Layer1Choice::Null, osc52: None },
+        P::Auto => {
+            let layer1 = auto_layer1(env);
+            // Precedence: multiplexer/SSH forces OSC 52 (rule 1); else a persisting local
+            // owner suppresses it (rule 2); else emit (rule 3).
+            let osc52 = if env.tmux || env.screen || env.ssh {
+                Some(wrap_for(env))
+            } else if is_local_persisting(layer1, env) {
+                None
+            } else {
+                Some(wrap_for(env))
+            };
+            ProviderPlan { layer1, osc52 }
+        }
+    }
+}
+
+/// Build a `ClipEnv` from the real process environment.
+pub fn clip_env_from_process() -> ClipEnv {
+    fn var_set(k: &str) -> bool { std::env::var_os(k).is_some_and(|v| !v.is_empty()) }
+    fn on_path(bin: &str) -> bool {
+        let Some(paths) = std::env::var_os("PATH") else { return false };
+        std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file())
+    }
+    let os = if cfg!(target_os = "macos") { Os::MacOs }
+             else if cfg!(target_os = "windows") { Os::Windows }
+             else { Os::Linux };
+    ClipEnv {
+        tmux: var_set("TMUX"),
+        screen: var_set("STY"),
+        ssh: var_set("SSH_TTY") || var_set("SSH_CONNECTION"),
+        wayland: var_set("WAYLAND_DISPLAY"),
+        x11: var_set("DISPLAY"),
+        wsl: var_set("WSL_DISTRO_NAME"),
+        os,
+        present: on_path,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PasteIntent, ClipReq, next_paste_id
 // ---------------------------------------------------------------------------
 
@@ -184,6 +301,97 @@ pub fn osc52_set(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_forced_native_is_arboard_no_osc52() {
+        let env = ClipEnv { tmux: false, screen: false, ssh: false, wayland: true, x11: false,
+                            wsl: false, os: Os::Linux, present: |_| true };
+        assert_eq!(resolve_provider(&env, crate::config::ClipboardProvider::Native),
+                   ProviderPlan { layer1: Layer1Choice::Arboard, osc52: None });
+    }
+
+    #[test]
+    fn resolve_forced_osc52_is_null_plus_wrapped() {
+        let env = ClipEnv { tmux: true, screen: false, ssh: false, wayland: true, x11: false,
+                            wsl: false, os: Os::Linux, present: |_| true };
+        assert_eq!(resolve_provider(&env, crate::config::ClipboardProvider::Osc52),
+                   ProviderPlan { layer1: Layer1Choice::Null, osc52: Some(Osc52Wrap::Tmux) });
+    }
+
+    #[test]
+    fn resolve_forced_off_is_register_only() {
+        let env = ClipEnv { tmux: false, screen: false, ssh: false, wayland: false, x11: true,
+                            wsl: false, os: Os::Linux, present: |_| true };
+        assert_eq!(resolve_provider(&env, crate::config::ClipboardProvider::Off),
+                   ProviderPlan { layer1: Layer1Choice::Null, osc52: None });
+    }
+
+    #[test]
+    fn resolve_auto_local_wayland_with_helper_suppresses_osc52() {
+        let env = ClipEnv { tmux: false, screen: false, ssh: false, wayland: true, x11: false,
+                            wsl: false, os: Os::Linux, present: |b| b == "wl-copy" };
+        assert_eq!(resolve_provider(&env, crate::config::ClipboardProvider::Auto),
+                   ProviderPlan { layer1: Layer1Choice::WlCopy, osc52: None });
+    }
+
+    #[test]
+    fn resolve_auto_wayland_no_helper_falls_to_arboard_and_emits_osc52() {
+        let env = ClipEnv { tmux: false, screen: false, ssh: false, wayland: true, x11: false,
+                            wsl: false, os: Os::Linux, present: |_| false };
+        assert_eq!(resolve_provider(&env, crate::config::ClipboardProvider::Auto),
+                   ProviderPlan { layer1: Layer1Choice::Arboard, osc52: Some(Osc52Wrap::Bare) });
+    }
+
+    #[test]
+    fn resolve_auto_x11_prefers_xclip_then_xsel() {
+        let both = ClipEnv { tmux: false, screen: false, ssh: false, wayland: false, x11: true,
+                             wsl: false, os: Os::Linux, present: |b| b == "xclip" || b == "xsel" };
+        assert_eq!(resolve_provider(&both, crate::config::ClipboardProvider::Auto).layer1, Layer1Choice::Xclip);
+        let only_xsel = ClipEnv { present: |b| b == "xsel", ..both };
+        assert_eq!(resolve_provider(&only_xsel, crate::config::ClipboardProvider::Auto).layer1, Layer1Choice::Xsel);
+    }
+
+    #[test]
+    fn resolve_auto_tmux_forces_osc52_even_with_local_helper() {
+        let env = ClipEnv { tmux: true, screen: false, ssh: false, wayland: true, x11: false,
+                            wsl: false, os: Os::Linux, present: |_| true };
+        // helper present (would persist) but multiplexer wins: emit, tmux-wrapped.
+        let plan = resolve_provider(&env, crate::config::ClipboardProvider::Auto);
+        assert_eq!(plan.layer1, Layer1Choice::WlCopy);
+        assert_eq!(plan.osc52, Some(Osc52Wrap::Tmux));
+    }
+
+    #[test]
+    fn resolve_auto_ssh_no_display_is_null_plus_bare_osc52() {
+        let env = ClipEnv { tmux: false, screen: false, ssh: true, wayland: false, x11: false,
+                            wsl: false, os: Os::Linux, present: |_| false };
+        assert_eq!(resolve_provider(&env, crate::config::ClipboardProvider::Auto),
+                   ProviderPlan { layer1: Layer1Choice::Null, osc52: Some(Osc52Wrap::Bare) });
+    }
+
+    #[test]
+    fn resolve_auto_macos_is_arboard_no_osc52() {
+        let env = ClipEnv { tmux: false, screen: false, ssh: false, wayland: false, x11: false,
+                            wsl: false, os: Os::MacOs, present: |_| false };
+        assert_eq!(resolve_provider(&env, crate::config::ClipboardProvider::Auto),
+                   ProviderPlan { layer1: Layer1Choice::Arboard, osc52: None });
+    }
+
+    #[test]
+    fn resolve_auto_wsl_prefers_win32yank_then_clip_exe() {
+        let yank = ClipEnv { tmux: false, screen: false, ssh: false, wayland: false, x11: false,
+                             wsl: true, os: Os::Linux, present: |b| b == "win32yank.exe" };
+        assert_eq!(resolve_provider(&yank, crate::config::ClipboardProvider::Auto).layer1, Layer1Choice::WinYank);
+        let clip = ClipEnv { present: |_| false, ..yank };
+        assert_eq!(resolve_provider(&clip, crate::config::ClipboardProvider::Auto).layer1, Layer1Choice::ClipExe);
+    }
+
+    #[test]
+    fn resolve_auto_screen_wraps_screen() {
+        let env = ClipEnv { tmux: false, screen: true, ssh: false, wayland: false, x11: false,
+                            wsl: false, os: Os::Linux, present: |_| false };
+        assert_eq!(resolve_provider(&env, crate::config::ClipboardProvider::Auto).osc52, Some(Osc52Wrap::Screen));
+    }
 
     #[test]
     fn base64_known_vectors() {
