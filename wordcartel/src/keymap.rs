@@ -6,7 +6,7 @@
 //! The trie is a flat `HashMap<Vec<KeyChord>, CommandId>` with a prefix scan
 //! for `Pending` — efficient enough for v1's small keymap (< 100 entries).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::registry::{Registry, CommandId};
 
@@ -163,7 +163,7 @@ pub struct KeyTrie {
     map: HashMap<Vec<KeyChord>, CommandId>,
     /// Sequences bound by a config patch (user-explicit), as opposed to the preset base.
     /// `chord_for` prefers these so a user's binding wins over an inherited default (contract law 7).
-    user_bound: std::collections::HashSet<Vec<KeyChord>>,
+    user_bound: HashSet<Vec<KeyChord>>,
 }
 
 impl KeyTrie {
