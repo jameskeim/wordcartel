@@ -114,7 +114,9 @@ impl Default for ViewConfig {
         ViewConfig { typewriter: false, typewriter_anchor: 0.5, focus: false,
             focus_granularity: FocusGranularity::Paragraph, measure: false,
             wrap_column: 72, wrap_guide: false, word_count: false,
-            scrollbar: TransientMode::Auto, status_line: TransientMode::Auto }
+            // status_line defaults On (idle info line always shown out of the box —
+            // preserves the pre-density behavior); Zen (chrome = zen) flips it to Auto.
+            scrollbar: TransientMode::Auto, status_line: TransientMode::On }
     }
 }
 

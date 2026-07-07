@@ -499,7 +499,9 @@ impl Editor {
             menu_bar_mode: crate::config::MenuBarMode::Auto,
             menu_bar_unpinned_mode: crate::config::MenuBarMode::Auto,
             scrollbar_mode: crate::config::TransientMode::Auto,
-            status_line_mode: crate::config::TransientMode::Auto,
+            // Status line defaults On — the idle info line is always shown out of the box
+            // (preserves the pre-density behavior); Zen (chrome = zen) flips it to Auto.
+            status_line_mode: crate::config::TransientMode::On,
             mouse: MouseState::default(),
             view_opts: crate::config::ViewConfig::default(),
             search: None,
@@ -833,7 +835,7 @@ mod tests {
     fn editor_seeds_transient_modes_and_mouse_dwell_defaults() {
         let e = Editor::new_from_text("x\n", None, (40, 8));
         assert_eq!(e.scrollbar_mode, crate::config::TransientMode::Auto);
-        assert_eq!(e.status_line_mode, crate::config::TransientMode::Auto);
+        assert_eq!(e.status_line_mode, crate::config::TransientMode::On);
         assert_eq!(e.mouse.scrollbar_reveal_due, None);
         assert!(!e.mouse.status_revealed);
     }
