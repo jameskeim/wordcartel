@@ -873,6 +873,38 @@ height; `ensure_visible` at `nav.rs:436` subtracts `1 + menu_bar_rows`) and `Lay
 **Recommended sequencing:** before Effort P — the plugin system only adds hot-path pressure, and a
 latency probe is worth having in place before then.
 
+**ADDENDUM 2026-07-07 (independent re-confirmation + two new mechanisms).** A fresh multi-agent
+code-map of the per-keystroke path (5 module mappers + synthesis) independently re-derived T4 and it
+was verified against the CURRENT source (line numbers have drifted since `86db660`): the two
+whole-document walks now live at `derive.rs:208-211` (`heading_starts`) and `derive.rs:216`
+(`active_fold_view` → `outline::sections`), both still gated on `blocks_generation` which
+`Editor::set_blocks` bumps every edit (`editor.rs:91-93`) → the memoization is defeated on every
+keystroke. Confirmed as a real O(document) per-keystroke tax, worst in large/heading-dense docs — the
+"all three symptoms" baseline. Two mechanisms the earlier record did NOT isolate:
+- **Reconcile debounce mistiming (NEW — the sustained-sentence hitch).** The reconcile debounce is
+  **150 ms** (`reconcile.rs:10`), *shorter* than a ~180 ms/key human cadence, so it fires BETWEEN
+  keystrokes mid-burst, running `full_parse_rope` O(document) plus a main-thread whole-tree equality
+  compare (`reconcile.rs:65`) + the following `derive::rebuild`. This is a distinct async-landing hitch
+  on fast typing, separate from the O(document) walks (and distinct from the deferred input-coalescing
+  item). Candidate fix: raise the debounce above human cadence and/or make the merge avoid the
+  O(document) main-thread compare.
+- **Block-tree widen/gap-materialization (NEW — the paragraph-end spike).** An Enter/blank-line near an
+  absorptive container (list/quote/indented-code) far upstream makes the incremental update materialize
+  the inter-block gap line-by-line (`block_tree.rs:719-723`) or `WidenToEnd` to EOF (`:875`) — O(document)
+  on that single structural keystroke. Pins symptom 2 (paragraph endings) to a concrete mechanism rather
+  than "lag downstream of T4."
+
+**Quantification in progress:** the greenfield latency probe the record called for is now being built as
+a **burst-based** bench on the e2e seam (N × structure × edit-class, cadence-aware so the 150 ms/400 ms
+debounces fire between keystrokes, p99/max per phase, log-log slope vs N). Expected result: `heading_starts`
+and `foldview` slope ~1.0 (the O(document) bug quantified); `layout_fill`/`render` flat (positive control).
+Branch `effort-r1-typing-latency`.
+
+**Cross-reference (2026-07-07 fuzz sweep):** `block_tree.rs`'s incremental machinery is a shared hotspot —
+it underlies both R1's paragraph-end widen cost AND the still-open incremental≡full soundness divergences
+(a ~43 M-exec sweep re-found the latter with fresh minimized repros in `fuzz/artifacts/block_tree/`; that
+same sweep found **no** pulldown-cmark panic, so the M4-rest `catch_unwind` isolation is belt-and-suspenders).
+
 ## Theme S — manuscript structure (the "TUI corkboard")
 
 **Origin:** 2026-07-07 design chat, prompted by the beloved-features report
