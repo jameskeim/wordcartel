@@ -224,7 +224,17 @@ becomes part of wordcartel's visual identity everywhere, rendered in each theme'
 color; `heading_level_glyph = false` remains the one-line opt-out. One line per theme plus an
 eyeball pass (colored themes already style headings; the glyph is a deliberate second signal).
 
-### B4. `SourceHighlighted` (SRC-HI) mode is a no-op — renders identically to `SourcePlain` — `bug` · Small (reported 2026-07-07)
+### B4. `SourceHighlighted` (SRC-HI) mode is a no-op — renders identically to `SourcePlain` — `SHIPPED` 2026-07-07 (merge 1bbd82b): uniform per-construct coloring in the current theme's faces
+
+**SHIPPED** as `effort-srchi-highlight` (merged `--no-ff` @ 1bbd82b, pushed). SRC-HI now shows raw
+markdown with every construct — inline delimiters, block prefixes, content — colored in the current
+theme's element faces (uniform per-construct, no new faces); SourcePlain stays monochrome,
+LivePreview untouched. `LineRender {Concealed,RawPlain,RawStyled}` replaced the `is_active` bool;
+`analyze` RawStyled branch styles whole spans (delimiters included); `layout` last-match (`.rfind`);
+`LayoutKey` mode-aware; render `plain_source` gate in both paint paths. Geometry ≡ SourcePlain
+(no cursor change). Both final gates GO (Codex pre-merge + Fable 9/9 execution probes). Follow-ups
+recorded in the effort ledger (all follow-up-ok): RawStyled Code/comment/link core test, SP-side
+base_fg coverage, stale nav doc comments. The original triage below is retained for history.
 
 **Symptom (user-reported):** cycling to the `SRC-HI` render mode looks the same as `SOURCE` —
 no syntax highlighting of the raw markdown.
