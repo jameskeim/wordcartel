@@ -315,6 +315,9 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
                 // Paint the dropdown for the open category
                 if let Some(drop_rect) = menu_dropdown_rect(menu_area, &menu.groups, menu.open) {
                     frame.render_widget(Clear, drop_rect);
+                    // Attached filled panel: fill the whole rect with the Muted panel bg so
+                    // the dropdown reads as one elevated surface extending from the bar (no box).
+                    frame.buffer_mut().set_style(drop_rect, cs.menu_norm);
                     let leaves = &menu.groups[menu.open].1;
                     let items: Vec<ListItem> = leaves
                         .iter()

@@ -2940,4 +2940,46 @@ mod tests {
             );
         }
     }
+
+    /// T8 (two-archetype styling): the dropdown rect is filled with the Muted panel bg all
+    /// the way to its bottom row — no unfilled gap cells.  The fill is applied via an explicit
+    /// `set_style(drop_rect, cs.menu_norm)` after Clear and before the per-item List render so
+    /// that the entire rect reads as one elevated surface regardless of item-row coverage.
+    #[test]
+    fn dropdown_fills_whole_rect_with_muted_panel_bg() {
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        // Terminal is 80 wide × 24 tall; the menu bar occupies row 0 and the dropdown
+        // starts at row 1 — wide enough to fit all category labels.
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        let menu = crate::menu::build(&reg, &km, &e);
+        e.menu = Some(menu);
+        derive::rebuild(&mut e);
+
+        // Derive the expected panel bg from the same ChromeStyles path that paint() uses.
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+        let panel_bg = cs.menu_norm.bg;
+
+        // Compute drop_rect before rendering so we can look up coordinates.
+        // mirror render_overlays::paint: menu_area = full area minus the bottom status row.
+        let area  = Rect::new(0, 0, 80, 24);
+        let h     = area.height;
+        let menu_area = Rect::new(area.x, area.y, area.width, h.saturating_sub(1));
+        let open  = e.menu.as_ref().unwrap().open;
+        let groups = e.menu.as_ref().unwrap().groups.clone();
+        let drop_rect = menu_dropdown_rect(menu_area, &groups, open)
+            .expect("builtins menu must have at least one non-empty group");
+
+        // x of the leftmost column; y of the very last row of the dropdown rect.
+        let drop_x      = drop_rect.x;
+        let drop_bottom = drop_rect.y + drop_rect.height - 1;
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(f, &mut e)).unwrap();
+        let buf = term.backend().buffer();
+
+        let bg_at = |x: u16, y: u16| buf[(x, y)].style().bg;
+        assert_eq!(bg_at(drop_x, drop_bottom), panel_bg,
+            "dropdown paints a filled panel to its bottom row (no unfilled gap)");
+    }
 }
