@@ -110,11 +110,15 @@ refinement (menu representative = toggle OR cycle). **Menu chord right-justifica
 Part 4, user decision)** also shipped — dropdown chords now align flush-right like the palette.
 Gates: full suite green (888 + 278 + integration), clippy clean, smoke 8/8; Codex spec+plan+pre-merge
 GO (pre-merge caught a real startup law-6 bypass + a missing recurrence-guard binding); Fable
-whole-branch PASS (14 execution probes). Residual polish (non-blocking, deferred): `toggle_status_line`
-`_ => "Auto"` catch-all → make exhaustive; `user_bound` fully-qualified `HashSet` path; a
-palette count-assert overlap; asymmetric setter-test asserts; latent `chars().count()` vs display-width
-in `right_justify_leaves`/`menu_dropdown_rect` (CJK-width — matches existing convention). The
-original settled-design notes below are retained for history.
+whole-branch PASS (14 execution probes). Residual polish — RESOLVED in a follow-up pass 2026-07-07: (fixed) `toggle_status_line`
+catch-all now exhaustive (`Auto | Off => "Auto"`); `user_bound` import tidied (`HashSet` via the
+`use`); the setter test made symmetric (both dwell timers + the mode asserted per surface). (Kept by
+design) the palette-completeness count-assert stays — it guards against duplicate/extra rows and keeps
+the law test self-contained; the `chars().count()` measure in `right_justify_leaves`/`menu_dropdown_rect`
+matches the codebase's existing menu-measurement convention (menu labels are English command names, so
+CJK display-width is theoretical) — changing only the new code would break alignment consistency, so
+it's left as a codebase-wide note, not a per-effort fix. The original settled-design notes below are
+retained for history.
 
 
 

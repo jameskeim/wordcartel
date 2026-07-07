@@ -489,7 +489,7 @@ impl Registry {
         r.register("status_line_auto", "Status Line: Auto", None, |c| { c.editor.set_status_line_mode(TransientMode::Auto); CommandResult::Handled });
         r.register("status_line_on",   "Status Line: On",   None, |c| { c.editor.set_status_line_mode(TransientMode::On);   CommandResult::Handled });
         r.register_stateful("toggle_status_line", "Status Line", Some(MenuCategory::View),
-            |e| MenuMark::Value(match e.status_line_mode { TransientMode::On => "On", _ => "Auto" }),
+            |e| MenuMark::Value(match e.status_line_mode { TransientMode::On => "On", TransientMode::Auto | TransientMode::Off => "Auto" }),
             |c| { let next = if c.editor.status_line_mode == TransientMode::On { TransientMode::Auto } else { TransientMode::On };
                   c.editor.set_status_line_mode(next); CommandResult::Handled });
 

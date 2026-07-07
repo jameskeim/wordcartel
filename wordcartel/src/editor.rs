@@ -1418,19 +1418,33 @@ mod tests {
     fn setters_set_field_and_clear_dwell() {
         use crate::config::{TransientMode, MenuBarMode};
         let mut e = Editor::new_from_text("x\n", None, (40, 8));
-        e.mouse.scrollbar_revealed = true; e.mouse.scrollbar_reveal_due = Some(9);
+        // scrollbar: mode set + BOTH dwell timers and the revealed flag cleared.
+        e.mouse.scrollbar_revealed = true;
+        e.mouse.scrollbar_reveal_due = Some(9);
+        e.mouse.scrollbar_hide_due = Some(9);
         e.set_scrollbar_mode(TransientMode::On);
         assert_eq!(e.scrollbar_mode, TransientMode::On);
-        assert!(!e.mouse.scrollbar_revealed && e.mouse.scrollbar_reveal_due.is_none());
-        // status: Off coerces to Auto (no true Off) + status dwell cleared
-        e.mouse.status_revealed = true; e.mouse.status_hide_due = Some(7);
+        assert!(!e.mouse.scrollbar_revealed
+            && e.mouse.scrollbar_reveal_due.is_none()
+            && e.mouse.scrollbar_hide_due.is_none());
+        // status: Off coerces to Auto (no true Off) + all status dwell cleared.
+        e.mouse.status_revealed = true;
+        e.mouse.status_reveal_due = Some(7);
+        e.mouse.status_hide_due = Some(7);
         e.set_status_line_mode(TransientMode::Off);
         assert_eq!(e.status_line_mode, TransientMode::Auto);
-        assert!(!e.mouse.status_revealed && e.mouse.status_hide_due.is_none());
-        // menu: dwell cleared
-        e.mouse.menu_bar_revealed = true; e.mouse.menu_reveal_due = Some(3);
+        assert!(!e.mouse.status_revealed
+            && e.mouse.status_reveal_due.is_none()
+            && e.mouse.status_hide_due.is_none());
+        // menu: mode set + all menu dwell cleared.
+        e.mouse.menu_bar_revealed = true;
+        e.mouse.menu_reveal_due = Some(3);
+        e.mouse.menu_hide_due = Some(3);
         e.set_menu_bar_mode(MenuBarMode::Auto);
-        assert!(!e.mouse.menu_bar_revealed && e.mouse.menu_reveal_due.is_none());
+        assert_eq!(e.menu_bar_mode, MenuBarMode::Auto);
+        assert!(!e.mouse.menu_bar_revealed
+            && e.mouse.menu_reveal_due.is_none()
+            && e.mouse.menu_hide_due.is_none());
     }
 
     #[test]
