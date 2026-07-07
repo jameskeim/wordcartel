@@ -224,6 +224,29 @@ becomes part of wordcartel's visual identity everywhere, rendered in each theme'
 color; `heading_level_glyph = false` remains the one-line opt-out. One line per theme plus an
 eyeball pass (colored themes already style headings; the glyph is a deliberate second signal).
 
+### B4. `SourceHighlighted` (SRC-HI) mode is a no-op — renders identically to `SourcePlain` — `bug` · Small (reported 2026-07-07)
+
+**Symptom (user-reported):** cycling to the `SRC-HI` render mode looks the same as `SOURCE` —
+no syntax highlighting of the raw markdown.
+
+**Root cause (fact-checked 2026-07-07):** `RenderMode` has three variants (`editor.rs:45-48`:
+`LivePreview`/`SourceHighlighted`/`SourcePlain`) and the cycle/status/label all treat them as
+three (`commands.rs:482-484` cycles LP→SH→SP; `render.rs:348-350` labels PREVIEW/SRC-HI/SOURCE).
+BUT every place rendering actually decides behaviour reduces the enum to a **binary**
+`source_mode = view.mode != LivePreview` — `derive.rs:222`, `render.rs:607`, `nav.rs:64`. So
+`SourceHighlighted` and `SourcePlain` take the IDENTICAL path (raw markers, no
+concealment) and there is no branch that applies token/syntax coloring to distinguish SH. SH is
+effectively dead — a labelled third mode that renders as SOURCE. (A test at `commands.rs:1212`
+only pins "SH shows raw markers," which SP also does, so it never caught the collapse.)
+
+**Intended distinction:** LivePreview = concealed markers + theme colors (WYSIWYG-ish);
+**SRC-HI = raw markers VISIBLE *plus* markdown tokens colored** (code-editor-style syntax
+highlight); SOURCE = raw markers, no color (monochrome plain). The fix promotes `source_mode`
+(bool) to a three-way decision so SH keeps the LivePreview coloring pass but *without* marker
+concealment, while SP stays uncolored. **Fork:** or drop SH entirely (2 modes) if the
+highlighted-source view isn't wanted — decide before implementing. Add a real regression test
+that asserts SH ≠ SP output (the missing coverage that hid this).
+
 ---
 
 ## Theme C — document workflow
