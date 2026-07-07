@@ -39,6 +39,8 @@ pub struct SettingsSnapshot {
     pub view_wrap_guide: bool,
     pub view_word_count: bool,
     pub view_wrap_column: u16,
+    pub view_scrollbar: crate::config::TransientMode,
+    pub view_status_line: crate::config::TransientMode,
     pub menu_bar: crate::config::MenuBarMode,
     pub mouse_capture: bool,
     /// Chrome disposition: `Full` (calibrated steps) or `Zen` (collapsed). Seeded from
@@ -105,6 +107,8 @@ pub struct OView {
     #[serde(skip_serializing_if = "Option::is_none")] pub wrap_guide:  Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")] pub word_count:  Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")] pub wrap_column: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub scrollbar:   Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub status_line: Option<String>,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -150,6 +154,8 @@ pub fn snapshot_of(cfg: &crate::config::Config, resolved_theme_name: &str) -> Se
         view_wrap_guide: cfg.view.wrap_guide,
         view_word_count: cfg.view.word_count,
         view_wrap_column: cfg.view.wrap_column,
+        view_scrollbar:  cfg.view.scrollbar,
+        view_status_line: cfg.view.status_line,
         menu_bar:        cfg.menu.bar,
         mouse_capture:   cfg.mouse.mouse_capture,
         chrome_disposition,
@@ -168,6 +174,8 @@ pub fn runtime_snapshot(editor: &crate::editor::Editor) -> SettingsSnapshot {
         view_wrap_guide: editor.view_opts.wrap_guide,
         view_word_count: editor.view_opts.word_count,
         view_wrap_column: editor.view_opts.wrap_column,
+        view_scrollbar:  editor.scrollbar_mode,
+        view_status_line: editor.status_line_mode,
         menu_bar:        editor.menu_bar_mode,
         mouse_capture:   editor.mouse_capture,
         chrome_disposition: editor.chrome_disposition,
@@ -369,9 +377,22 @@ pub fn compute_overrides(
         ex_view.and_then(|v| v.wrap_column.as_ref()),
         mk_view.and_then(|v| v.wrap_column).is_some(),
     );
+    let rt_sb   = crate::config::transient_mode_str(runtime.view_scrollbar).to_string();
+    let base_sb = crate::config::transient_mode_str(baseline.view_scrollbar).to_string();
+    let scrollbar = diff_key(&rt_sb, &base_sb,
+        ex_view.and_then(|v| v.scrollbar.as_ref()),
+        mk_view.and_then(|v| v.scrollbar.as_ref()).is_some(),
+    );
+    let rt_sl   = crate::config::transient_mode_str(runtime.view_status_line).to_string();
+    let base_sl = crate::config::transient_mode_str(baseline.view_status_line).to_string();
+    let status_line = diff_key(&rt_sl, &base_sl,
+        ex_view.and_then(|v| v.status_line.as_ref()),
+        mk_view.and_then(|v| v.status_line.as_ref()).is_some(),
+    );
     let any_view = typewriter.is_some() || focus.is_some() || measure.is_some()
-        || wrap_guide.is_some() || word_count.is_some() || wrap_column.is_some();
-    let view = some_if(OView { typewriter, focus, measure, wrap_guide, word_count, wrap_column }, any_view);
+        || wrap_guide.is_some() || word_count.is_some() || wrap_column.is_some()
+        || scrollbar.is_some() || status_line.is_some();
+    let view = some_if(OView { typewriter, focus, measure, wrap_guide, word_count, wrap_column, scrollbar, status_line }, any_view);
 
     // --- menu — per-key mask predicate ---
     let rt_bar   = menu_bar_str(runtime.menu_bar).to_string();
@@ -503,9 +524,17 @@ mod tests {
         SettingsSnapshot { keymap_preset: preset.into(), theme_identity: theme,
             view_typewriter: tw, view_focus: false, view_measure: false,
             view_wrap_guide: false, view_word_count: false, view_wrap_column: 72,
+            view_scrollbar: crate::config::TransientMode::Auto,
+            view_status_line: crate::config::TransientMode::On,
             menu_bar: crate::config::MenuBarMode::Auto, mouse_capture: true,
             chrome_disposition: ChromeDisposition::Full,
             canvas: CanvasMode::Opaque }
+    }
+
+    fn snap_with<F: FnOnce(&mut SettingsSnapshot)>(f: F) -> SettingsSnapshot {
+        let mut s = snap("cua", ThemeIdentity::Builtin("default".into()), false);
+        f(&mut s);
+        s
     }
 
     #[test]
@@ -887,5 +916,22 @@ mod tests {
         assert_eq!(e.status, "settings saved");
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("wrap_column = 40"), "the file carries the key: {text}");
+    }
+
+    #[test]
+    fn scrollbar_status_line_round_trip_via_diff_law() {
+        use crate::config::TransientMode;
+        let base = snap_with(|s| { s.view_scrollbar = TransientMode::Auto; s.view_status_line = TransientMode::Auto; });
+        // Runtime diverges: scrollbar → On, status_line → On.
+        let mut rt = base.clone();
+        rt.view_scrollbar = TransientMode::On;
+        rt.view_status_line = TransientMode::On;
+        let of = compute_overrides(&rt, &base, &OverridesFile::default(), &OverridesFile::default());
+        let v = of.view.expect("view section present");
+        assert_eq!(v.scrollbar.as_deref(), Some("on"));
+        assert_eq!(v.status_line.as_deref(), Some("on"));
+        // No divergence → no keys written.
+        let of2 = compute_overrides(&base, &base, &OverridesFile::default(), &OverridesFile::default());
+        assert!(of2.view.is_none() || of2.view.as_ref().unwrap().scrollbar.is_none());
     }
 }

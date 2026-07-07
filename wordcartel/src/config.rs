@@ -918,6 +918,8 @@ mod tests {
             view_wrap_guide: false,
             view_word_count: false,
             view_wrap_column: 100,
+            view_scrollbar:  crate::config::TransientMode::Auto,
+            view_status_line: crate::config::TransientMode::On,
             menu_bar:        crate::config::MenuBarMode::Pinned,
             mouse_capture:   false,
             chrome_disposition: wordcartel_core::theme::ChromeDisposition::Zen,

@@ -707,6 +707,8 @@ fn journey_chrome_zen_toggle() {
         view_wrap_guide:    false,
         view_word_count:    false,
         view_wrap_column:   72,
+        view_scrollbar:     crate::config::TransientMode::Auto,
+        view_status_line:   crate::config::TransientMode::On,
         menu_bar:           crate::config::MenuBarMode::Auto,
         mouse_capture:      true,
         chrome_disposition: ChromeDisposition::Full,
