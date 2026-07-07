@@ -3162,4 +3162,73 @@ mod tests {
         assert_eq!(bg_at(drop_x, drop_bottom), panel_bg,
             "indicator/pad row at drop_bottom must carry panel bg — only source is the explicit fill");
     }
+
+    /// T14-c (C1 regression): the highlighted item must ALWAYS be within the rendered
+    /// item rows — never hidden behind the n/total indicator row.
+    ///
+    /// Geometry: 80×8 terminal, 20-leaf category.  drop_rect.height = min(20,15,7) = 7.
+    /// item_rows = 6 (one row reserved for the indicator).  The bug: keep_visible was
+    /// called with list_h=7, so highlighted=6 satisfied the invariant yet mapped to the
+    /// indicator row (only items 0-5 were painted).  The fix: keep_visible is called with
+    /// keep_h=6 — the paint then adjusts scroll_top so highlighted ∈ [scroll_top,
+    /// scroll_top+6), which is always within the rendered item rows.
+    #[test]
+    fn dropdown_highlight_never_hidden_in_overflow() {
+        // 80×8 terminal: avail_below = 7, drop_rect.height = 7, item_rows = 6.
+        let mut e = Editor::new_from_text("x\n", None, (80, 8));
+        let leaves: Vec<(String, crate::registry::CommandId)> = (0..20)
+            .map(|i| (format!("item{i:02}"), crate::registry::CommandId("move_right")))
+            .collect();
+        // Place the highlight at the position that was hidden under the old code:
+        // highlighted=6, scroll_top=0.  With list_h=7 (old) keep_visible accepts this
+        // (6 < 0+7), but item_rows=6 means only rows 0-5 are painted — row 6 is the
+        // indicator.  With keep_h=6 (fix) keep_visible adjusts scroll_top to 1,
+        // putting highlighted at visual row 5 — within item_rows.
+        e.menu = Some(crate::menu::MenuView {
+            groups: vec![(crate::registry::MenuCategory::Edit, leaves)],
+            open: 0, highlighted: 6, built: true, scroll_top: 0,
+        });
+        derive::rebuild(&mut e);
+
+        let cs = ChromeStyles::build(&e.theme, e.depth, e.canvas);
+
+        let area      = Rect::new(0, 0, 80, 8);
+        let menu_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+        let groups    = e.menu.as_ref().unwrap().groups.clone();
+        let open      = e.menu.as_ref().unwrap().open;
+        let drop_rect = menu_dropdown_rect(menu_area, &groups, open)
+            .expect("tall category must produce a dropdown rect");
+        let list_h    = drop_rect.height as usize;         // = 7
+        let item_rows = list_h.saturating_sub(1);          // = 6
+
+        let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        term.draw(|f| render(f, &mut e)).unwrap();
+
+        // After render, keep_visible has been applied — read back the updated window state.
+        let m          = e.menu.as_ref().unwrap();
+        let scroll_top = m.scroll_top;
+        let highlighted = m.highlighted;
+
+        // Arithmetic invariant: the highlight must be within the item rows, not hidden.
+        assert!(
+            highlighted - scroll_top < item_rows,
+            "highlight must be in item rows: highlighted={highlighted}, scroll_top={scroll_top}, item_rows={item_rows} — highlighted-scroll_top={} must be < {item_rows}",
+            highlighted - scroll_top,
+        );
+
+        // Visual invariant: the rendered row at the highlight position must carry
+        // menu_sel style, and the indicator row must NOT carry menu_sel.
+        let visual_row    = (highlighted - scroll_top) as u16;
+        let sel_y         = drop_rect.y + visual_row;
+        let indicator_y   = drop_rect.y + drop_rect.height - 1;
+        let buf           = term.backend().buffer();
+        let fg_at         = |x: u16, y: u16| buf[(x, y)].style().fg;
+        let sel_fg        = cs.menu_sel.fg;
+        let norm_fg       = cs.menu_norm.fg;
+        let col           = drop_rect.x + 1; // first text column inside the item
+        assert_eq!(fg_at(col, sel_y), sel_fg,
+            "rendered item at visual row {visual_row} (y={sel_y}) must carry menu_sel fg");
+        assert_ne!(fg_at(col, indicator_y), sel_fg,
+            "indicator row (y={indicator_y}) must not carry menu_sel fg — it should be norm ({norm_fg:?})");
+    }
 }

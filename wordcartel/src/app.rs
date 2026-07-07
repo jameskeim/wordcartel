@@ -416,6 +416,9 @@ pub fn reduce(
                             KeyCode::Up if ncat > 0 => {
                                 menu.highlighted = menu.highlighted.saturating_sub(1);
                                 let n = menu.groups[menu.open].1.len();
+                                // Coarse follow-the-selection layer — the paint re-windows against
+                                // the true item-row budget every frame (list_window two-layer
+                                // invariant), so this estimate need not reserve the indicator row.
                                 let list_h = n.min(15);
                                 crate::list_window::keep_visible(menu.highlighted, n, list_h, &mut menu.scroll_top);
                             }
@@ -423,6 +426,9 @@ pub fn reduce(
                                 let n = menu.groups[menu.open].1.len();
                                 if n > 0 {
                                     menu.highlighted = (menu.highlighted + 1).min(n - 1);
+                                    // Coarse follow-the-selection layer — the paint re-windows against
+                                    // the true item-row budget every frame (list_window two-layer
+                                    // invariant), so this estimate need not reserve the indicator row.
                                     let list_h = n.min(15);
                                     crate::list_window::keep_visible(menu.highlighted, n, list_h, &mut menu.scroll_top);
                                 }

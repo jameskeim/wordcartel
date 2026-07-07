@@ -149,8 +149,10 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
                     } else {
                         m.highlighted = m.highlighted.saturating_sub(1);
                     }
-                    // Use the actual dropdown window height (avail_below = rows under the bar)
-                    // so keep_visible scrolls at the same boundary the dropdown rect uses.
+                    // Coarse follow-the-selection layer — the paint re-windows against the true
+                    // item-row budget every frame (list_window two-layer invariant), so this
+                    // estimate need not reserve the indicator row.  Use avail_below so
+                    // keep_visible scrolls at the same boundary the dropdown rect uses.
                     let avail_below = area.height.saturating_sub(1) as usize;
                     let list_h = n.min(15).min(avail_below);
                     crate::list_window::keep_visible(m.highlighted, n, list_h, &mut m.scroll_top);

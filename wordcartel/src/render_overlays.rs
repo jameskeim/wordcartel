@@ -320,7 +320,12 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
                         let m = editor.menu.as_mut().unwrap();
                         let leaves_len = m.groups[m.open].1.len();
                         let list_h = drop_rect.height as usize;
-                        crate::list_window::keep_visible(m.highlighted, leaves_len, list_h, &mut m.scroll_top);
+                        // Reserve the bottom row for the n/total indicator when the category
+                        // overflows, so keep_visible guarantees the highlight is within the
+                        // rendered item rows — not hidden behind the indicator row.
+                        let overflows = leaves_len > list_h;
+                        let keep_h = if overflows { list_h.saturating_sub(1) } else { list_h };
+                        crate::list_window::keep_visible(m.highlighted, leaves_len, keep_h, &mut m.scroll_top);
                         m.scroll_top
                     };
                     frame.render_widget(Clear, drop_rect);
