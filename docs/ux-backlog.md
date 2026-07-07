@@ -93,17 +93,55 @@ and the right side are unstyled — no full-width fill.
 buffer name + dirty marker) is designed once, deliberately, inside E1's full-chrome work — not
 defaulted piecemeal now. Labels truncate before any future content on narrow terminals.
 
-### A3. Palette completeness follow-ups + the menu item pass — `fact-checked` · Small
+### A3. Option reachability + preset-aware hints (three-surface integrity) — `settled-design` · Medium
 
-The user's impression ("only a small subset") was inverted — the palette is already
-exhaustive in DATA; the MENU is the subset. Follow-ups: (a) verify the palette shows binding
-hints (menu is built with keymap access; palette unverified); (b) **ANSWERED 2026-07-04:**
-the subset impression was real in REACH — the palette cannot scroll past its initially
-visible rows without typing (see A6, which fixes it); (c) **apply the adopted curation
-principle** (see the contract section) item-by-item to the ~58-command menu set, bringing
-only the judgment calls back for approval. Add a permanent **palette-completeness invariant
-test** ("every non-hidden registry command appears") — the contract as a regression net (the
-`palette.rs:138` test is close; formalize).
+**Design ratified 2026-07-07** (brainstorm). Refocused from the original "palette follow-ups +
+menu item pass": the ZEN/FULL density decision (E1) added options — `status_line` mode and
+`scrollbar` mode — that have NO individual command, so they're reachable ONLY via the `toggle_chrome`
+profile or by hand-editing config. That VIOLATES the three-surface contract (palette is exhaustive;
+deviations are bugs) — and, because the command registry is the spine of the future Lua plugin
+system (Effort P), a command-less option is also **plugin-uncontrollable** (a plugin mutates state by
+dispatching commands). A3 closes that gap and locks the hint plumbing. **The broad item-by-item
+menu-curation pass split out → A3b.**
+
+**Decided:**
+1. **Option-reachability — the keymap-pattern shape.** Every preset-owned option gets explicit
+   **set-per-state** commands (deterministic — a plugin/script needs "set to X," not "cycle and
+   hope"; tagged `menu: None` → palette-only, like `keymap_cua`/`keymap_wordstar`) **plus a cycle**
+   command (in the menu, state-in-label — the human convenience, like `keymap_next`). New commands:
+   `scrollbar` (Off/Auto/On), `status_line` (Auto/On — no true Off), `menu_bar` (Hidden/Auto/Pinned,
+   a real 3-way alongside the existing `menu_bar_pin`). **Set-handlers and `apply_bundle` call ONE
+   shared setter per option** (e.g. `set_scrollbar_mode(editor, mode)`) so the profile and the
+   commands cannot drift — the profile becomes "a batch of the same setters a plugin could call."
+2. **Recurrence guard test:** assert every persisted setting (each `SettingsSnapshot` field / config
+   key) is changeable through *some* command / command-surface — so a future option can't ship
+   command-less.
+3. **Hint display policy:** `chord_for` (`keymap.rs:180`) must **prefer the user's explicit
+   (patch-bound) binding over the shortest inherited default** (today it returns shortest-then-
+   alphabetical, which mis-shows a command that has an added custom binding beside its default).
+4. **Hints-verification tests:** pin that (a) menu + palette hints re-resolve after a CUA↔WordStar
+   switch (A5 wired the trie rebuild; UNTESTED), and (b) a custom bind surfaces in BOTH surfaces.
+5. **Palette-completeness invariant test** ("every non-hidden registry command appears in the
+   palette") — formalize the near-miss at `palette.rs:138`.
+6. **Plugin-forward posture:** commands stay NULLARY now; parameterized commands (`set_scrollbar("off")`)
+   are deferred to Effort P (which will define the plugin API) — but keep the set-value semantics clean
+   so P can later collapse the N explicit-set commands into one parameterized command without breaking
+   the contract. See [[wordcartel-plugin-roadmap]].
+
+Grounding (already TRUE, retained): both surfaces show active-keymap chords via `chord_for` (menu
+bakes it into `leaf_label`; palette sets `row.chord`); A5 rebuilds the trie on preset switch; custom
+`[keymap]`/`[keymap.cua]`/`[keymap.wordstar]` patches fold into the trie via `build_keymap` and so
+into both surfaces (scoped patches are preset-aware). Palette is exhaustive in DATA; the MENU is the
+curated subset (A3b). A6 fixed the palette-reach ("only a subset" impression).
+
+### A3b. Item-by-item menu-curation pass — `settled-principle` · Small (split from A3, 2026-07-07)
+
+Apply the adopted curation principle (see the three-surface contract section) item-by-item across the
+~126 registry commands / ~58 menu set: decide per command whether it belongs in the *menu* (by
+category — the commands a word-processor user goes looking for) vs *palette-only* (motions,
+navigation, internal plumbing, keystroke-native), bringing only the genuine judgment calls back for
+approval. Lower-risk polish; rides whenever. Independent of A3 (A3 fixes the contract-*violation*;
+A3b is the contract-*application* sweep). The state-in-label display (E2) is already done.
 
 ### A4. Menu accelerators (Alt+F/Alt+E…) — `dropped` (2026-07-03)
 
