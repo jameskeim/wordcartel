@@ -19,7 +19,7 @@ This effort **implements** `docs/design/command-surface-contract.md`: fixes law-
 - **Nullary commands** (rule 10); no argument model.
 - **House style / GATEs:** `cargo test -p wordcartel-core -p wordcartel` green; `cargo clippy --workspace --all-targets` clean; build/`--no-run` warning-free; no `cargo fmt`; em-dash prose comments; exhaustive matches on `TransientMode`/`MenuBarMode`; smoke mandatory-run. Doc-comment new public items.
 
-**Task order:** 1 (setters + refactor) → 2 (commands) → 3 (chord_for provenance) → 4 (law tests).
+**Task order:** 1 (setters + refactor) → 2 (commands) → 3 (chord_for provenance) → 4 (law tests) → 5 (menu chord right-justify, spec Part 4 — independent of 1-4). 
 
 ---
 
@@ -376,6 +376,110 @@ fn custom_bind_surfaces_in_menu_and_palette() {
 - [ ] **Step 4: Run — PASS.** Full `cargo test -p wordcartel-core -p wordcartel` green; `cargo clippy --workspace --all-targets` clean; build/`--no-run` warning-free; run `scripts/smoke/run.sh` and quote the summary.
 
 - [ ] **Step 5: Commit** — `test(a3): law tests — recurrence guard, palette-completeness, preset-aware hints`.
+
+---
+
+## Task 5: Menu chord right-justification (spec Part 4)
+
+**Files:** Modify `wordcartel/src/menu.rs` (`grouped_commands` :31-53, split `menu_leaf_label` :58-73, remove `leaf_label` :75-80). Test: inline in `menu.rs`. NO changes to `render_overlays.rs`/`mouse.rs` (the `(String, CommandId)` leaf tuple is unchanged).
+
+**Interfaces:** `menu_leaf_base(meta, editor) -> String` (base text, no chord); `right_justify_leaves(Vec<(String, Option<String>, CommandId)>) -> Vec<(String, CommandId)>`.
+
+- [ ] **Step 1: Failing test.**
+```rust
+#[test]
+fn menu_chords_are_right_justified_within_a_group() {
+    // Leaves of differing label+chord widths → every chord ends at the same column (flush-right).
+    let raw = vec![
+        ("Cut".to_string(), Some("ctrl-x".to_string()), CommandId("cut")),
+        ("Copy As Something Long".to_string(), Some("ctrl-c".to_string()), CommandId("copy")),
+        ("No Chord Item".to_string(), None, CommandId("noop")),
+    ];
+    let leaves = right_justify_leaves(raw);
+    assert!(leaves[0].0.ends_with("ctrl-x"));
+    assert!(leaves[1].0.ends_with("ctrl-c"));
+    // Chorded leaves share the target width, so their chords are flush-right at the same column.
+    assert_eq!(leaves[0].0.chars().count(), leaves[1].0.chars().count());
+    // A no-chord leaf renders as its base — no trailing padding/chord.
+    assert_eq!(leaves[2].0, "No Chord Item");
+}
+```
+
+- [ ] **Step 2: Run — FAIL** (`right_justify_leaves` undefined).
+
+- [ ] **Step 3: Implement.** In `menu.rs`, rewrite `grouped_commands` to keep the chord separate per group, split `menu_leaf_label` into `menu_leaf_base`, and add `right_justify_leaves`:
+```rust
+fn grouped_commands(reg: &Registry, keymap: &KeyTrie, editor: &crate::editor::Editor)
+    -> Vec<(MenuCategory, Vec<(String, CommandId)>)> {
+    let mut groups = Vec::new();
+    for cat in MENU_ORDER {
+        // (base text, chord, id) intermediates — chord kept separate so the group right-justifies.
+        let mut raw: Vec<(String, Option<String>, CommandId)> = reg
+            .commands()
+            .filter_map(|(id, meta)| {
+                if meta.menu == Some(cat) && id != CommandId("palette") {
+                    Some((menu_leaf_base(meta, editor), keymap.chord_for(id), id))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if cat == MenuCategory::View && reg.meta(CommandId("palette")).is_some() {
+            raw.push(("Command Palette...".to_string(), keymap.chord_for(CommandId("palette")), CommandId("palette")));
+        }
+        if !raw.is_empty() {
+            groups.push((cat, right_justify_leaves(raw)));
+        }
+    }
+    groups
+}
+
+/// Base menu leaf text (state-in-label for stateful commands), WITHOUT the chord.
+/// Stateless → static label. Stateful → `"{base}: {value}"` (base strips a leading
+/// "Toggle " and any "…: variants" suffix).
+fn menu_leaf_base(meta: &crate::registry::CommandMeta, editor: &crate::editor::Editor) -> String {
+    use crate::registry::MenuMark;
+    match meta.state {
+        None => meta.label.to_string(),
+        Some(f) => {
+            let base = meta.label.strip_prefix("Toggle ").unwrap_or(meta.label);
+            let base = base.split(':').next().unwrap_or(base).trim();
+            match f(editor) {
+                MenuMark::OnOff(b) => format!("{base}: {}", if b { "On" } else { "Off" }),
+                MenuMark::Value(v) => format!("{base}: {v}"),
+            }
+        }
+    }
+}
+
+/// Right-justify chord hints within a dropdown group: pad each leaf so all chords end at a
+/// common right column (flush-right), matching the command palette. Leaves with no chord render
+/// as their base text. `GAP` is the minimum gap between the widest label and its chord.
+fn right_justify_leaves(raw: Vec<(String, Option<String>, CommandId)>) -> Vec<(String, CommandId)> {
+    const GAP: usize = 4;
+    let width = |base: &str, chord: &Option<String>| {
+        base.chars().count() + chord.as_ref().map_or(0, |c| GAP + c.chars().count())
+    };
+    let target = raw.iter().map(|(b, c, _)| width(b, c)).max().unwrap_or(0);
+    raw.into_iter()
+        .map(|(base, chord, id)| {
+            let label = match &chord {
+                Some(c) => {
+                    let pad = target.saturating_sub(base.chars().count() + c.chars().count());
+                    format!("{base}{}{c}", " ".repeat(pad))
+                }
+                None => base,
+            };
+            (label, id)
+        })
+        .collect()
+}
+```
+Delete the now-unused `leaf_label` fn (`menu.rs:75-80`).
+
+- [ ] **Step 4: Run — PASS.** Full `cargo test -p wordcartel --lib` green — including the existing `build_groups_by_category_in_order_with_chords_and_palette_entry` (menu.rs:125; it checks `starts_with("Reflow")` + category + palette id, NOT the exact space count, so it stays green) and Task 4's `custom_bind_surfaces_in_menu_and_palette` (chord still inside the label string). `cargo clippy --workspace --all-targets` clean.
+
+- [ ] **Step 5: Commit** — `feat(menu): right-justify chord hints in dropdowns (match the palette)`.
 
 ---
 
