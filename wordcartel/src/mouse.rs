@@ -1418,14 +1418,115 @@ mod tests {
         crate::derive::rebuild(&mut e);
         e.prompt = Some(crate::prompt::Prompt::quit_confirm());
         let area = ratatui::layout::Rect::new(0, 0, 80, 8);
-        // Locate the '[Q]' marker column in the rendered status text.
+        // Locate the `[Q]` marker by counting CHARS, not bytes. quit_confirm contains
+        // `·` (U+00B7, 2 UTF-8 bytes, 1 terminal column) before `[Q]`, so the byte
+        // offset overestimates the column by 1. Using char index = column (width-1)
+        // ensures clicking exactly ON the `[` glyph, catching a byte-vs-column regression.
         let msg = e.prompt.as_ref().unwrap().message.clone();
-        let q_col = msg.find("[Q]").expect("quit marker present") as u16;
+        let chars: Vec<char> = msg.chars().collect();
+        let q_col = chars.windows(3)
+            .position(|w| w[0] == '[' && w[1] == 'Q' && w[2] == ']')
+            .expect("quit marker present") as u16;
         let status_row = area.y + area.height - 1; // = 7 for this geometry
         let (reg, ex, clk, tx, km) = ctx();
+        // Click at q_col + 1 — the `Q` glyph, inside the [Q]uit span.
         let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: q_col + 1, row: status_row, modifiers: KeyModifiers::NONE };
         handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
         assert!(e.quit, "clicking [Q]uit anyway must trigger the QuitAnyway action");
+    }
+
+    /// transform_chooser uses lowercase markers `[r]/[u]/[v]` and double-space
+    /// separators. The old hit-test searched only for `[U]` and split on `·`, so the
+    /// transform prompt was entirely non-clickable. After the fix, clicking [u]nwrap
+    /// resolves via `resolve_prompt` and closes the prompt.
+    #[test]
+    fn click_transform_prompt_choice_dispatches() {
+        let mut e = Editor::new_from_text("hello world\n", None, (80, 8));
+        crate::derive::rebuild(&mut e);
+        e.prompt = Some(crate::prompt::Prompt::transform_chooser());
+        let area = ratatui::layout::Rect::new(0, 0, 80, 8);
+        let msg = e.prompt.as_ref().unwrap().message.clone();
+        // Compute the char-column of the `[u]nwrap` marker (width-1; message is ASCII).
+        let chars: Vec<char> = msg.chars().collect();
+        let u_col = chars.windows(3)
+            .position(|w| w[0] == '[' && w[1] == 'u' && w[2] == ']')
+            .expect("must find [u] in transform_chooser message") as u16;
+        let status_row = area.y + area.height - 1;
+        let (reg, ex, clk, tx, km) = ctx();
+        // Click at u_col + 1 — the `u` glyph, inside the [u]nwrap span.
+        let d = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: u_col + 1,
+            row: status_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        // resolve_prompt(Transform(Unwrap)) falls through to `editor.prompt = None` —
+        // prompt dismissed confirms the click hit a valid choice.
+        assert!(e.prompt.is_none(),
+            "clicking [u]nwrap in transform_chooser must dismiss the prompt via resolve_prompt");
+    }
+
+    /// A click on the status row at a column with no marker span is consumed
+    /// (the prompt overlay `return`s) — the prompt stays open, no action fires,
+    /// and the caret does not move.
+    #[test]
+    fn click_off_marker_keeps_prompt_open() {
+        let mut e = Editor::new_from_text("abc\n", None, (80, 8));
+        crate::derive::rebuild(&mut e);
+        e.prompt = Some(crate::prompt::Prompt::quit_confirm());
+        let caret_before = crate::nav::head(&e);
+        let area = ratatui::layout::Rect::new(0, 0, 80, 8);
+        let status_row = area.y + area.height - 1;
+        let (reg, ex, clk, tx, km) = ctx();
+        // Column 0 is before all marker spans in quit_confirm → no-op click.
+        let d = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: status_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        assert!(e.prompt.is_some(), "click before first marker must keep the prompt open");
+        assert_eq!(crate::nav::head(&e), caret_before,
+            "click on status row while prompt open must not move the caret");
+    }
+
+    /// `·` (U+00B7) is 2 UTF-8 bytes but 1 terminal column. The old byte-offset
+    /// hit-test introduced a 1-column dead zone after each separator. This test pins
+    /// the char-based (width-1) fix: clicking at the CHAR column of `[Q]` (34) must
+    /// fire QuitAnyway, while the BYTE offset (35) differs — proving the regression
+    /// would be caught if byte offsets crept back in.
+    #[test]
+    fn click_prompt_choice_with_dot_separator_second_choice() {
+        let mut e = Editor::new_from_text("x\n", None, (80, 8));
+        crate::derive::rebuild(&mut e);
+        e.prompt = Some(crate::prompt::Prompt::quit_confirm());
+        let area = ratatui::layout::Rect::new(0, 0, 80, 8);
+        let msg = e.prompt.as_ref().unwrap().message.clone();
+        // Char-column of `[Q]` (34 for this message; byte offset is 35 due to `·`).
+        let chars: Vec<char> = msg.chars().collect();
+        let q_char_col = chars.windows(3)
+            .position(|w| w[0] == '[' && w[1] == 'Q' && w[2] == ']')
+            .expect("must find [Q] in quit_confirm message") as u16;
+        let q_byte_col = msg.find("[Q]").expect("must find [Q] by str::find") as u16;
+        // Precondition: `·` makes the byte offset exceed the char column.
+        assert!(q_byte_col > q_char_col,
+            "precondition: byte offset ({q_byte_col}) must exceed char col ({q_char_col}) — \
+             `·` before [Q] is 2 bytes but 1 column");
+        let status_row = area.y + area.height - 1;
+        let (reg, ex, clk, tx, km) = ctx();
+        // Click at the true char column — must hit [Q]uit anyway.
+        let d = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: q_char_col,
+            row: status_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        assert!(e.quit,
+            "clicking at char col of [Q] (col {q_char_col}) must trigger QuitAnyway; \
+             byte-offset col ({q_byte_col}) would miss the span start");
     }
 
     /// A click on a directory entry in the file browser descends into that directory.

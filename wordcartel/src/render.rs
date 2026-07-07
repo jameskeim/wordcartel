@@ -258,26 +258,52 @@ pub(crate) fn diag_row_at(area: Rect, diag: &crate::diag_overlay::DiagOverlay, c
     } else { None }
 }
 
-/// Map a click on the status row to a prompt choice by locating each choice's
-/// `[K]` marker in the rendered message. Returns the `PromptAction` when the click
-/// column falls within a choice's marker+label span — from the `[K]` marker up to
-/// (but not including) the next `·` separator, or the end of the message. `None`
-/// when the click is on a different row, or not over any marker span.
+/// Map a click on the status row to a prompt choice.
+///
+/// Column-based, case-insensitive, marker-to-next-marker span model:
+/// — chars are iterated and each is counted as 1 display column (width-1 assumption;
+///   prompt messages are ASCII-mostly — `·` U+00B7 is 1 terminal column, matching
+///   the assumption; `unicode-width` is not a direct dependency of this crate);
+/// — each choice's `[K]` marker is found case-insensitively (`[k]` and `[K]` both
+///   match), so prompts like `transform_chooser` with lowercase markers are clickable;
+/// — the clickable span for choice i runs from its marker's start column to the start
+///   column of the NEXT choice's marker (or end-of-message), making the hit-test
+///   separator-agnostic: `·`, double-space, or any separator all work uniformly;
+/// — returns `None` when the row is not the status row, or the click falls before the
+///   first marker.
 pub(crate) fn prompt_choice_at(area: Rect, prompt: &crate::prompt::Prompt, col: u16, row: u16)
     -> Option<crate::prompt::PromptAction> {
     if row != area.y + area.height.saturating_sub(1) { return None; } // status row only
-    let rel = col.saturating_sub(area.x); // message renders at column area.x
+    let rel = col.saturating_sub(area.x) as usize;
     let msg = &prompt.message;
+
+    // Collect chars once — char index == column offset (width-1 assumption).
+    let chars: Vec<char> = msg.chars().collect();
+
+    // Build (start_col, action) for each choice by sliding a 3-char window.
+    let mut spans: Vec<(usize, crate::prompt::PromptAction)> = Vec::new();
     for choice in &prompt.choices {
-        let marker = format!("[{}]", choice.key.to_ascii_uppercase());
-        if let Some(byte_idx) = msg.find(&marker) {
-            let start = byte_idx as u16; // ASCII markers → byte index == column offset
-            // span = marker + trailing label up to the next '·' separator (or end).
-            let rest = &msg[byte_idx..];
-            let span_len = rest.find('·').unwrap_or(rest.len()) as u16;
-            if rel >= start && rel < start + span_len { return Some(choice.action); }
+        let key_lc = choice.key.to_ascii_lowercase();
+        let key_uc = choice.key.to_ascii_uppercase();
+        for (col_idx, window) in chars.windows(3).enumerate() {
+            if window[0] == '[' && (window[1] == key_lc || window[1] == key_uc) && window[2] == ']' {
+                spans.push((col_idx, choice.action));
+                break;
+            }
         }
     }
+
+    // Sort by column so spans are in message order.
+    spans.sort_by_key(|s| s.0);
+
+    // Span i runs from its start column to the next span's start column (or message end).
+    for (i, &(start, action)) in spans.iter().enumerate() {
+        let end = spans.get(i + 1).map(|s| s.0).unwrap_or(usize::MAX);
+        if rel >= start && rel < end {
+            return Some(action);
+        }
+    }
+
     None
 }
 
