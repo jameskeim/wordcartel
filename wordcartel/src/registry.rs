@@ -471,6 +471,34 @@ impl Registry {
                 CommandResult::Handled
             });
 
+        // Chrome density — scrollbar, status-line, menu-bar set-per-state + representatives (A3).
+        // Scrollbar: set-per-state (palette-only) + 3-state cycle representative (View, state-in-label).
+        use crate::config::TransientMode;
+        r.register("scrollbar_off",  "Scrollbar: Off",  None, |c| { c.editor.set_scrollbar_mode(TransientMode::Off);  CommandResult::Handled });
+        r.register("scrollbar_auto", "Scrollbar: Auto", None, |c| { c.editor.set_scrollbar_mode(TransientMode::Auto); CommandResult::Handled });
+        r.register("scrollbar_on",   "Scrollbar: On",   None, |c| { c.editor.set_scrollbar_mode(TransientMode::On);   CommandResult::Handled });
+        r.register_stateful("cycle_scrollbar", "Scrollbar", Some(MenuCategory::View),
+            |e| MenuMark::Value(match e.scrollbar_mode {
+                TransientMode::Off => "Off", TransientMode::Auto => "Auto", TransientMode::On => "On" }),
+            |c| { let next = match c.editor.scrollbar_mode {
+                      TransientMode::Off => TransientMode::Auto, TransientMode::Auto => TransientMode::On,
+                      TransientMode::On  => TransientMode::Off };
+                  c.editor.set_scrollbar_mode(next); CommandResult::Handled });
+
+        // Status line: set-per-state (palette-only) + 2-state toggle representative (View, state-in-label).
+        r.register("status_line_auto", "Status Line: Auto", None, |c| { c.editor.set_status_line_mode(TransientMode::Auto); CommandResult::Handled });
+        r.register("status_line_on",   "Status Line: On",   None, |c| { c.editor.set_status_line_mode(TransientMode::On);   CommandResult::Handled });
+        r.register_stateful("toggle_status_line", "Status Line", Some(MenuCategory::View),
+            |e| MenuMark::Value(match e.status_line_mode { TransientMode::On => "On", _ => "Auto" }),
+            |c| { let next = if c.editor.status_line_mode == TransientMode::On { TransientMode::Auto } else { TransientMode::On };
+                  c.editor.set_status_line_mode(next); CommandResult::Handled });
+
+        // Menu bar: deterministic set-per-state (palette-only). menu_bar_pin remains the View representative.
+        use crate::config::MenuBarMode;
+        r.register("menu_bar_hidden", "Menu Bar: Hidden", None, |c| { c.editor.set_menu_bar_mode(MenuBarMode::Hidden); CommandResult::Handled });
+        r.register("menu_bar_auto",   "Menu Bar: Auto",   None, |c| { c.editor.set_menu_bar_mode(MenuBarMode::Auto);   CommandResult::Handled });
+        r.register("menu_bar_pinned", "Menu Bar: Pinned", None, |c| { c.editor.set_menu_bar_mode(MenuBarMode::Pinned); CommandResult::Handled });
+
         // Heading navigation motions (Task 10 / Effort 5g).
         r.register("heading_next",   "Next Heading",   None, |c| { heading_jump(c, Dirn::Next);   CommandResult::Handled });
         r.register("heading_prev",   "Previous Heading", None, |c| { heading_jump(c, Dirn::Prev); CommandResult::Handled });
@@ -1157,5 +1185,35 @@ mod tests {
         // Second dispatch: Pinned → Auto restored.
         dispatch_id(&mut ed, "menu_bar_pin");
         assert_eq!(ed.menu_bar_mode, MenuBarMode::Auto, "second pin must restore Auto");
+    }
+
+    // -----------------------------------------------------------------------
+    // A3 Task 2: scrollbar/status_line/menu_bar option-reachability commands
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scrollbar_commands_set_and_cycle() {
+        use crate::config::TransientMode;
+        let reg = Registry::builtins();
+        let mut ed = crate::editor::Editor::new_from_text("x\n", None, (40, 8));
+        dispatch_id(&mut ed, "scrollbar_off"); assert_eq!(ed.scrollbar_mode, TransientMode::Off);
+        dispatch_id(&mut ed, "cycle_scrollbar"); assert_eq!(ed.scrollbar_mode, TransientMode::Auto); // Off→Auto
+        dispatch_id(&mut ed, "cycle_scrollbar"); assert_eq!(ed.scrollbar_mode, TransientMode::On);   // Auto→On
+        // palette-only: the set commands are not in the menu
+        assert_eq!(reg.meta(CommandId("scrollbar_off")).unwrap().menu, None);
+        // the representative is a View menu command with state-in-label
+        assert_eq!(reg.meta(CommandId("cycle_scrollbar")).unwrap().menu, Some(MenuCategory::View));
+    }
+
+    #[test]
+    fn status_line_toggle_and_menu_bar_sets() {
+        use crate::config::{TransientMode, MenuBarMode};
+        let reg = Registry::builtins();
+        let mut ed = crate::editor::Editor::new_from_text("x\n", None, (40, 8));
+        ed.set_status_line_mode(TransientMode::Auto);
+        dispatch_id(&mut ed, "toggle_status_line"); assert_eq!(ed.status_line_mode, TransientMode::On);
+        dispatch_id(&mut ed, "toggle_status_line"); assert_eq!(ed.status_line_mode, TransientMode::Auto);
+        dispatch_id(&mut ed, "menu_bar_hidden"); assert_eq!(ed.menu_bar_mode, MenuBarMode::Hidden);
+        assert_eq!(reg.meta(CommandId("menu_bar_hidden")).unwrap().menu, None);
     }
 }
