@@ -1236,6 +1236,7 @@ impl Clock for SystemClock {
 pub(crate) fn advance(editor: &mut Editor, clock: &dyn Clock) {
     recompute_scrollbar_visible(editor, clock.now_ms());
     recompute_menu_bar(editor, clock.now_ms());
+    recompute_status_line(editor, clock.now_ms());
     // Pre-draw rebuild: ensure the layout cache matches the final (scroll,
     // text_width) before render consumes it.  render has no on-demand fallback
     // (render.rs:132-140), so a stale cache blanks the editing rows.
@@ -1533,6 +1534,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
 
     recompute_scrollbar_visible(&mut editor, clock.now_ms());
+    recompute_status_line(&mut editor, clock.now_ms());
     // After a potential session-resume the scroll may have changed; re-clamp/re-pin
     // and rebuild the layout cache so the very first frame is always correct.
     // Order: rebuild (reconciles folds + layout) → SnapOut restored caret → ensure_visible.
@@ -1719,6 +1721,41 @@ pub fn recompute_menu_bar(editor: &mut crate::editor::Editor, now_ms: u64) {
     if editor.mouse.menu_hide_due.is_some_and(|d| now_ms >= d) {
         editor.mouse.menu_hide_due = None;
         editor.mouse.menu_bar_revealed = false;
+    }
+}
+
+/// Whether the NORMAL idle status info line should paint. A message / prompt /
+/// search / minibuffer force it regardless of mode (no-silent-UI) — those are
+/// handled in render.rs before this is consulted; this governs only the idle line.
+pub fn status_line_visible(editor: &crate::editor::Editor) -> bool {
+    use crate::config::TransientMode;
+    match editor.status_line_mode {
+        TransientMode::On  => true,
+        // Off is never assigned to status (coerced to Auto at parse); treat defensively as Auto.
+        TransientMode::Off | TransientMode::Auto =>
+            !editor.status.is_empty()
+                || editor.mouse.status_revealed
+                || editor.prompt.is_some()
+                || editor.search.is_some()
+                || editor.minibuffer.is_some(),
+    }
+}
+
+/// Fire the Auto-mode status dwell/grace deadlines (armed by the mouse Moved arm).
+pub fn recompute_status_line(editor: &mut crate::editor::Editor, now_ms: u64) {
+    use crate::config::TransientMode;
+    if editor.status_line_mode != TransientMode::Auto {
+        editor.mouse.status_reveal_due = None;
+        editor.mouse.status_hide_due = None;
+        return;
+    }
+    if editor.mouse.status_reveal_due.is_some_and(|d| now_ms >= d) {
+        editor.mouse.status_reveal_due = None;
+        editor.mouse.status_revealed = true;
+    }
+    if editor.mouse.status_hide_due.is_some_and(|d| now_ms >= d) {
+        editor.mouse.status_hide_due = None;
+        editor.mouse.status_revealed = false;
     }
 }
 
@@ -5223,6 +5260,28 @@ mod tests {
         // §II.5 pin: tokyo ZEN ChromeOverlay bg = #2c2d40 (= ZEN ChromeMuted bg — 3-tone ladder).
         assert_eq!(zen_overlay_bg, Some(Color::Rgb { r: 0x2c, g: 0x2d, b: 0x40 }),
             "tokyo-night Zen ChromeOverlay bg (§II.5 final): got {zen_overlay_bg:?}");
+    }
+
+    // Task 4 — status_line_visible
+
+    /// `status_line_visible` must return false under Auto with no message/reveal,
+    /// force-true on a non-empty status message (no-silent-UI), and true under On always.
+    #[test]
+    fn status_line_visible_forces_on_message_even_in_auto() {
+        use crate::config::TransientMode;
+        let mut e = Editor::new_from_text("x\n", None, (40, 8));
+        e.status_line_mode = TransientMode::Auto;
+        e.mouse.status_revealed = false;
+        e.status.clear();
+        assert!(!crate::app::status_line_visible(&e), "Auto idle + no message → info line hidden (calm)");
+        e.status = "saved".into();
+        assert!(crate::app::status_line_visible(&e), "a message force-reveals even under Auto (no-silent-UI)");
+        e.status.clear();
+        e.mouse.status_revealed = true;
+        assert!(crate::app::status_line_visible(&e), "Auto + dwell-revealed → visible");
+        e.status_line_mode = TransientMode::On;
+        e.mouse.status_revealed = false;
+        assert!(crate::app::status_line_visible(&e), "On → always visible");
     }
 
     /// Finding 2 (pre-merge gate): preview_selected_theme must apply the Ansi16 sentinel-fill

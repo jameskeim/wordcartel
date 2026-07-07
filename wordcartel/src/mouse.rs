@@ -143,6 +143,27 @@ pub fn handle(
             }
         }
     }
+    // Status-line bottom-row dwell (mirror of scrollbar dwell; row h-1 is the reserved row).
+    if editor.status_line_mode == crate::config::TransientMode::Auto {
+        if let MouseEventKind::Moved = ev.kind {
+            let h = editor.active().view.area.1;
+            let at_bottom = h > 0 && ev.row == h - 1;
+            if at_bottom {
+                editor.mouse.status_hide_due = None;
+                if !editor.mouse.status_revealed
+                    && editor.mouse.status_reveal_due.is_none()
+                    && no_overlay_open(editor)
+                {
+                    editor.mouse.status_reveal_due = Some(clock.now_ms() + MENU_DWELL_MS);
+                }
+            } else {
+                editor.mouse.status_reveal_due = None;
+                if editor.mouse.status_revealed && editor.mouse.status_hide_due.is_none() {
+                    editor.mouse.status_hide_due = Some(clock.now_ms() + MENU_LEAVE_GRACE_MS);
+                }
+            }
+        }
+    }
     let (w, h) = editor.active().view.area;
     let area = ratatui::layout::Rect::new(0, 0, w, h);
     if editor.palette.is_some() {

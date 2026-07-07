@@ -766,14 +766,26 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 cs.ov_accent,
             )
         } else {
-            (status_left_text(editor), cs.menu_closed)  // normal state: [Chrome] panel bg
+            // Normal state. Under zen/Auto idle with no message, the reserved row renders
+            // as calm canvas (base bg); visible reveal via On / dwell / message force.
+            if crate::app::status_line_visible(editor) {
+                (status_left_text(editor), cs.menu_closed) // visible: [Chrome] panel bg
+            } else {
+                // Calm canvas: the same bg-only fill the edit band uses — NOT chrome.
+                let mut calm = compose::base_canvas(&editor.theme, editor.depth);
+                calm.fg = None;
+                (String::new(), calm)
+            }
         };
 
         // Compose the status line.
         // When in the normal branch (no prompt/minibuffer/search) and word_count is on,
         // flush the count segment to the right and truncate the left (path/mode) to fit.
+        // When the status row is calm-hidden (Auto idle, no message), suppress the word-count
+        // segment so Ln/Col · words does not paint over the calm canvas row.
         let has_overlay = editor.search.is_some() || editor.minibuffer.is_some() || editor.prompt.is_some() || editor.diag.is_some() || editor.outline.is_some();
-        let composed = if !has_overlay {
+        let status_hidden = !has_overlay && !crate::app::status_line_visible(editor);
+        let composed = if !has_overlay && !status_hidden {
             if let Some(wc) = word_count_segment(editor) {
                 let caret = crate::nav::head(editor);
                 let (l, c) = editor.active().document.buffer.caret_line_col(caret);
@@ -1390,6 +1402,7 @@ mod tests {
         // D2: normal status uses [Chrome] — terminal-plain Chrome = White fg / Black bg
         // (not REVERSED). The status row must carry the Chrome bg, not a reverse modifier.
         let mut ed = Editor::new_from_text("x", None, (40, 4));
+        ed.status_line_mode = crate::config::TransientMode::On; // test chrome face, not calm mode
         let buf = render_to_buffer(&mut ed, 40, 4);
         let last = 3u16;
         // terminal-plain Chrome: fg=White, bg=Black — explicit color, not reverse.
@@ -1400,6 +1413,7 @@ mod tests {
     #[test]
     fn marked_block_paints_and_status_shows_blk() {
         let mut e = Editor::new_from_text("hello world\n", None, (60, 6));
+        e.status_line_mode = crate::config::TransientMode::On; // test chrome status content, not calm mode
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false });
         crate::derive::rebuild(&mut e);
         let buf = render_to_buffer(&mut e, 60, 6);
@@ -1412,6 +1426,7 @@ mod tests {
     #[test]
     fn hidden_block_status_reads_blk_hidden_and_not_painted() {
         let mut e = Editor::new_from_text("hello\n", None, (60, 6));
+        e.status_line_mode = crate::config::TransientMode::On; // test chrome status content, not calm mode
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: true });
         crate::derive::rebuild(&mut e);
         let buf = render_to_buffer(&mut e, 60, 6);
@@ -1426,6 +1441,7 @@ mod tests {
         // After derive_chrome, Chrome.bg is an Rgb step toward black preserving the hue.
         use wordcartel_core::theme::ChromeDisposition;
         let mut ed = Editor::new_from_text("x", None, (40, 4));
+        ed.status_line_mode = crate::config::TransientMode::On; // test chrome face, not calm mode
         let mut theme = wordcartel_core::theme::Theme::builtin("phosphor-amber").unwrap();
         theme.derive_chrome(ChromeDisposition::Full);
         ed.theme = theme;
@@ -1450,6 +1466,7 @@ mod tests {
         let mut ed = Editor::new_from_text("x", None, (40, 6));
         // Enable pinned menu bar so row 0 carries the menu Chrome bg.
         ed.menu_bar_mode = crate::config::MenuBarMode::Pinned;
+        ed.status_line_mode = crate::config::TransientMode::On; // test chrome parity, not calm mode
         let mut theme = wordcartel_core::theme::tokyo_night();
         theme.derive_chrome(ChromeDisposition::Full);
         ed.theme = theme;
@@ -1476,6 +1493,7 @@ mod tests {
     #[test]
     fn prompt_active_status_uses_accent() {
         let mut ed = Editor::new_from_text("x", None, (40, 4));
+        ed.status_line_mode = crate::config::TransientMode::On; // test chrome face, not calm mode
 
         // Normal state: status carries Chrome face (bg=Black under terminal-plain).
         let buf_normal = render_to_buffer(&mut ed, 40, 4);
@@ -2436,6 +2454,7 @@ mod tests {
         use wordcartel_core::theme::{Theme, Depth, CanvasMode, ChromeDisposition};
         let mut ed = Editor::new_from_text("hi\n", None, (40, 6));
         ed.menu_bar_mode = crate::config::MenuBarMode::Pinned;
+        ed.status_line_mode = crate::config::TransientMode::On; // test chrome paint, not calm mode
         let mut theme = Theme::builtin("flexoki-dark").unwrap();
         theme.derive_chrome(ChromeDisposition::Full);
         ed.theme = theme;
@@ -2611,6 +2630,7 @@ mod tests {
         // "hello\nworld\n": byte 8 = 'r' in "world" → line 2, col 3 ("wo|rld")
         // Line 2 starts at byte 6; bytes 6='w', 7='o' → 2 graphemes before caret → col 3
         let mut e = Editor::new_from_text("hello\nworld\n", None, (60, 6));
+        e.status_line_mode = crate::config::TransientMode::On; // test Ln/Col content, not calm mode
         e.view_opts.word_count = true;
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(8);
         crate::derive::rebuild(&mut e);
@@ -2636,6 +2656,7 @@ mod tests {
         // before caret → col 4.  Ln,Col must be identical in LivePreview and SourcePlain.
         let mk = |mode| {
             let mut e = Editor::new_from_text("# Heading\n\n**bold** text\n", None, (60, 8));
+            e.status_line_mode = crate::config::TransientMode::On; // test Ln/Col content, not calm mode
             e.view_opts.word_count = true;
             e.active_mut().view.mode = mode;
             e.active_mut().document.selection = wordcartel_core::selection::Selection::single(14);
@@ -2874,6 +2895,48 @@ mod tests {
                 "tokyo-night: body text must carry base_fg {:?} — row-0 fgs: {:?}",
                 want,
                 (0..40u16).map(|x| buf[(x, 0u16)].style().fg).collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    // Task 4 — status-line Auto-mode calm / visible render
+
+    /// Under Auto mode with no message and no dwell-reveal, the bottom row must be
+    /// blank (calm canvas — NOT the info-line text). Under On mode the info line shows.
+    #[test]
+    fn auto_idle_hides_status_line_on_mode_paints_it() {
+        use crate::config::TransientMode;
+
+        // Auto + no message + not revealed → bottom row must be blank / calm.
+        {
+            let mut ed = Editor::new_from_text("hello\n", None, (40, 6));
+            ed.status_line_mode = TransientMode::Auto;
+            ed.mouse.status_revealed = false;
+            ed.status.clear();
+            derive::rebuild(&mut ed);
+            let buf = render_to_buffer(&mut ed, 40, 6);
+            let bottom = row_string(&buf, 5);
+            assert!(
+                bottom.trim().is_empty(),
+                "Auto idle: bottom row must be calm/blank, got: {:?}",
+                bottom
+            );
+        }
+
+        // On mode → bottom row must show the info line (non-empty, contains buffer name
+        // or mode indicator).
+        {
+            let mut ed = Editor::new_from_text("hello\n", None, (40, 6));
+            ed.status_line_mode = TransientMode::On;
+            ed.mouse.status_revealed = false;
+            ed.status.clear();
+            derive::rebuild(&mut ed);
+            let buf = render_to_buffer(&mut ed, 40, 6);
+            let bottom = row_string(&buf, 5);
+            assert!(
+                !bottom.trim().is_empty(),
+                "On mode: bottom row must show info line (non-empty), got: {:?}",
+                bottom
             );
         }
     }
