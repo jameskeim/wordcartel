@@ -427,20 +427,31 @@ BUFFER (`0..buf_len`).
    scope (they already handle lists at whole-list scope — adjacent machinery).
    May stage: defaults first, deepest-snap second, within one effort.
 
-### C3. Cross-app clipboard over SSH/tmux — `needs-design` · Medium (pre-triage deferred, pulled in 2026-07-04)
+### C3. Cross-app clipboard over SSH/tmux — `needs-design` · Small (reassessed 2026-07-07; was Medium)
 
-*(Diagnosed 2026-06-28 against `wordcartel/src/clipboard.rs`; predates the niggle triage.)*
+**UPDATE 2026-07-07 (re-grounded):** the paste-IN half already shipped since the original diagnosis.
+Bracketed paste is enabled (`term.rs:42` `EnableBracketedPaste`) and `Event::Paste(text)` is handled in
+four input contexts (`app.rs:390/463/601/711` — editor / prompt / palette / search), so pasting INTO
+wordcartel over SSH already uses the robust path the diagnosis prescribed. **Remaining work is copy-OUT
+only:** `$TMUX` detection + DCS passthrough wrapping of the OSC 52 emit in `clipboard.rs::osc52_set`
+(still a *bare* sequence today — no `$TMUX`/wrap), a `.tmux.conf` doc note (`set-clipboard on`), and
+manual verification across the terminal × tmux × SSH matrix. Net: essentially ONE small pure-function
+task (the DCS wrap — unit-testable) + a doc note + spot-checks; the S5 PTY smoke check already covers
+OSC 52 → tmux buffer. Design is basically settled — a short brainstorm, not a full one. Pasted text is
+untrusted input, but the M2 `submit_transaction` boundary already covers it.
+
+*(Original diagnosis 2026-06-28 against `wordcartel/src/clipboard.rs`; predates the niggle triage.)*
 Cross-application copy/paste (wordcartel → local app, or vice versa) does NOT work inside an
 SSH/tmux session; within-session copy→paste works (the in-process `Register` is the source of
 truth). **Copy-out:** we emit a *bare* OSC 52 set-sequence + the arboard worker — bare OSC 52
 is swallowed by tmux unless `set-clipboard on`, and some setups need the DCS passthrough
 wrapper (`\ePtmux;\e…\e\\`); we do NOT detect `$TMUX` and wrap. (The PTY smoke suite's S5 now
 verifies OSC 52 lands in a tmux buffer in the harness config — partial live coverage of the
-happy path.) **Paste-in:** `arboard` `get()` targets the *remote* (empty) display over SSH;
-OSC 52 read is refused by most terminals — the robust path is the terminal's own bracketed
-paste arriving as input. **Direction (agreed 2026-06-28):** its own effort — `$TMUX` detection
-+ passthrough wrapping, a `.tmux.conf` doc note, bracketed-paste handling, tested across
-terminal × tmux × SSH combos. Kept separate from multi-buffer work deliberately.
+happy path.) **Paste-in [now SHIPPED — see UPDATE above]:** `arboard` `get()` targets the *remote*
+(empty) display over SSH; OSC 52 read is refused by most terminals — the robust path is the terminal's
+own bracketed paste arriving as input. **Direction (agreed 2026-06-28):** its own effort — `$TMUX`
+detection + passthrough wrapping, a `.tmux.conf` doc note, bracketed-paste handling [done], tested
+across terminal × tmux × SSH combos. Kept separate from multi-buffer work deliberately.
 
 ### C4. Close-buffer Save/Discard/Cancel prompt — `SHIPPED` 2026-07-04
 
@@ -1126,12 +1137,12 @@ dependency-free in both directions.
 D1, E1, E2, E3, E4, H1 — plus the repar re-plumb check. (A4 dropped.) The remaining open work,
 by size:
 
-- **Small:** A3 palette-completeness invariant test + the item-by-item menu-curation pass (the
-  state-in-label half shipped with E2; the curation pass did not).
+- **Small:** A3b item-by-item menu-curation pass (A3 itself shipped; the state-in-label half
+  shipped with E2) · C3 clipboard over SSH/tmux (reassessed 2026-07-07 — paste-in already shipped;
+  only the copy-out tmux DCS-wrap + a `.tmux.conf` doc note + manual spot-checks remain).
 - **Small-Medium:** S3 Snapshots (Theme S — capture/restore/persist reuse existing machinery;
   the one net-new algorithm is a display diff).
-- **Medium:** C3 clipboard over SSH/tmux (the terminal × tmux × SSH test matrix is the real cost) ·
-  R1 editing-responsiveness (Theme R, in-brainstorm) · S1 rearrangeable outline / corkboard.
+- **Medium:** R1 editing-responsiveness (Theme R, in-brainstorm) · S1 rearrangeable outline / corkboard.
 - **Larger:** S2 directory-as-binder (post-Effort-P plugin) · Theme P plugin candidates (all
   post-P — goals/streaks, style lens, CMS publish, backlinks, CriticMarkup/Fountain/wikilinks).
 - **Noted (not scheduled):** H2 active_line eof-clamp.
