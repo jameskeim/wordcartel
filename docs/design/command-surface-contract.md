@@ -53,10 +53,13 @@ act.
 
 ## Shape rules (how a command is built)
 
-8. **Multi-state option = set-value primitive + cycle convenience.** Provide explicit **set-per-state**
-   commands (deterministic — automation needs "set to X," not "cycle and hope"; tag them
-   `menu: None` → palette-only) **plus one cycle** command (in the menu, state-in-label — the human
-   convenience). Precedent: `keymap_cua`/`keymap_wordstar` (explicit sets) + `keymap_next` (cycle).
+8. **Multi-state option = set-value primitives + a stateful menu representative.** Provide explicit
+   **set-per-state** commands (deterministic — automation needs "set to X," not "cycle and hope"; tag
+   them `menu: None` → palette-only) **plus one stateful menu representative** — a **toggle** for a
+   2-state option, a **cycle** for a 3+-state one — carried in the menu with state-in-label. The menu
+   representative is a convenience: it need NOT expose every state directly (the palette does, via the
+   set-per-state commands). Precedents: `toggle_chrome`/`toggle_canvas` (2-state toggles), `keymap_next`
+   (cycle), `menu_bar_pin` (a 2-way pin toggle over a 3-state option), each beside explicit sets.
 9. **A preset is a convenience over primitives — never the only door** to an option.
 10. **Commands are the plugin/automation spine.** The test for "does this need a command?" is
     *"should a plugin ever be able to do this?"* — if yes, it's a command. Commands stay **nullary**
@@ -74,7 +77,8 @@ Everything above is mechanical. The single per-command judgment is *where a comm
   (clipboard/undo), Format (transforms), View (toggles), Export, Settings; plus anything whose
   discoverability matters.
 - **Palette-only** — motions & navigation, internal plumbing, keystroke-native ops, and the
-  **set-per-state primitives** (their cycle command stands in for them in the menu).
+  **set-per-state primitives** (their stateful menu representative — toggle or cycle — stands in for
+  them in the menu).
 
 The item-by-item application of this guideline across the command set is tracked as backlog A3b.
 
@@ -83,7 +87,7 @@ The item-by-item application of this guideline across the command set is tracked
 ## Decision procedure (drop-in for any new feature or option)
 
 1. **Runtime-changeable?** → it must be a command (law 2).
-2. **Multi-state?** → set-per-state commands + one cycle (rule 8).
+2. **Multi-state?** → set-per-state commands + a stateful menu representative, toggle or cycle (rule 8).
 3. **Does a profile set it?** → the profile calls the same setter as the command (law 6).
 4. **Browse-for-by-category, or not?** → menu vs palette-only (the one judgment).
 
@@ -105,6 +109,10 @@ a test. A spec/plan touching this surface states which of these it exercises.
 
 - 2026-07-06: the three-surface contract adopted (registry = truth; palette exhaustive; menu curated;
   live hints) — recorded in `docs/ux-backlog.md`'s governing-principle section.
+- 2026-07-07 (A3 spec review): refined shape rule 8 — the menu representative is a *toggle or cycle*
+  (not strictly "a cycle"), and it need not expose every state in the menu (the palette does). This
+  reflects the existing `toggle_chrome`/`toggle_canvas` 2-state toggles and keeps `menu_bar_pin`
+  compliant as menu_bar's representative.
 - 2026-07-07: hardened into this contract after the ZEN/FULL density gap and the plugin-spine
   analysis (A3 brainstorm) — added law 2 (every option is a command), law 6 (shared setter), law 7's
   explicit-binding preference, and shape rules 8-10. This file is now the authoritative home; the

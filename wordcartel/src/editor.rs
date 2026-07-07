@@ -814,6 +814,45 @@ impl Editor {
     }
     pub fn undo(&mut self) -> bool { self.active_mut().undo() }
     pub fn redo(&mut self) -> bool { self.active_mut().redo() }
+
+    // ------------------------------------------------------------------
+    // Shared option setters (contract law 6 — single setter per user-settable option).
+    // Every write path (individual commands + density::apply_bundle) routes through these.
+    // ------------------------------------------------------------------
+
+    /// Set the scrollbar transient mode and clear its stale dwell state. The single
+    /// setter both the `scrollbar_*` commands and `density::apply_bundle` call (contract law 6).
+    pub fn set_scrollbar_mode(&mut self, mode: crate::config::TransientMode) {
+        self.scrollbar_mode = mode;
+        self.mouse.scrollbar_reveal_due = None;
+        self.mouse.scrollbar_hide_due = None;
+        self.mouse.scrollbar_revealed = false;
+    }
+
+    /// Set the status-line transient mode (Off coerces to Auto — status has no true Off,
+    /// no-silent-UI) and clear its stale dwell state.
+    pub fn set_status_line_mode(&mut self, mode: crate::config::TransientMode) {
+        use crate::config::TransientMode;
+        self.status_line_mode = if mode == TransientMode::Off { TransientMode::Auto } else { mode };
+        self.mouse.status_reveal_due = None;
+        self.mouse.status_hide_due = None;
+        self.mouse.status_revealed = false;
+    }
+
+    /// Set the menu-bar mode, keeping `menu_bar_unpinned_mode` (the mode `menu_bar_pin`
+    /// restores on unpin) consistent, and clear menu dwell state. Generalizes menu_bar_pin.
+    pub fn set_menu_bar_mode(&mut self, mode: crate::config::MenuBarMode) {
+        use crate::config::MenuBarMode;
+        if mode == MenuBarMode::Pinned {
+            if self.menu_bar_mode != MenuBarMode::Pinned { self.menu_bar_unpinned_mode = self.menu_bar_mode; }
+        } else {
+            self.menu_bar_unpinned_mode = mode;
+        }
+        self.menu_bar_mode = mode;
+        self.mouse.menu_reveal_due = None;
+        self.mouse.menu_hide_due = None;
+        self.mouse.menu_bar_revealed = false;
+    }
 }
 
 #[cfg(test)]
@@ -1369,5 +1408,54 @@ mod tests {
             e.menu = if open { Some(crate::menu::empty()) } else { None };
             assert_eq!(e.menu_bar_rows(), want, "mode={mode:?} revealed={revealed} open={open}");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Task 1 (A3): shared option setters
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn setters_set_field_and_clear_dwell() {
+        use crate::config::{TransientMode, MenuBarMode};
+        let mut e = Editor::new_from_text("x\n", None, (40, 8));
+        e.mouse.scrollbar_revealed = true; e.mouse.scrollbar_reveal_due = Some(9);
+        e.set_scrollbar_mode(TransientMode::On);
+        assert_eq!(e.scrollbar_mode, TransientMode::On);
+        assert!(!e.mouse.scrollbar_revealed && e.mouse.scrollbar_reveal_due.is_none());
+        // status: Off coerces to Auto (no true Off) + status dwell cleared
+        e.mouse.status_revealed = true; e.mouse.status_hide_due = Some(7);
+        e.set_status_line_mode(TransientMode::Off);
+        assert_eq!(e.status_line_mode, TransientMode::Auto);
+        assert!(!e.mouse.status_revealed && e.mouse.status_hide_due.is_none());
+        // menu: dwell cleared
+        e.mouse.menu_bar_revealed = true; e.mouse.menu_reveal_due = Some(3);
+        e.set_menu_bar_mode(MenuBarMode::Auto);
+        assert!(!e.mouse.menu_bar_revealed && e.mouse.menu_reveal_due.is_none());
+    }
+
+    #[test]
+    fn set_menu_bar_mode_keeps_unpinned_mode_consistent() {
+        use crate::config::MenuBarMode;
+        let mut e = Editor::new_from_text("x\n", None, (40, 8));
+        e.set_menu_bar_mode(MenuBarMode::Auto);
+        assert_eq!(e.menu_bar_mode, MenuBarMode::Auto);
+        assert_eq!(e.menu_bar_unpinned_mode, MenuBarMode::Auto, "non-Pinned set → remembered");
+        e.set_menu_bar_mode(MenuBarMode::Pinned);
+        assert_eq!(e.menu_bar_unpinned_mode, MenuBarMode::Auto, "Pinned set → remembers prior non-Pinned");
+        e.set_menu_bar_mode(MenuBarMode::Hidden);
+        assert_eq!(e.menu_bar_unpinned_mode, MenuBarMode::Hidden);
+    }
+
+    #[test]
+    fn apply_bundle_keeps_menu_bar_unpinned_mode_consistent() {
+        // INTENTIONAL change (spec-accepted): apply_bundle now routes menu_bar through
+        // set_menu_bar_mode, so FULL (Pinned) remembers the prior non-Pinned mode as the unpin
+        // target; previously apply_bundle left menu_bar_unpinned_mode stale.
+        use crate::config::MenuBarMode;
+        let mut e = Editor::new_from_text("x\n", None, (40, 8));
+        e.set_menu_bar_mode(MenuBarMode::Hidden); // prior non-Pinned mode = Hidden
+        crate::density::apply_bundle(&mut e, &crate::density::FULL); // FULL sets Pinned
+        assert_eq!(e.menu_bar_mode, MenuBarMode::Pinned);
+        assert_eq!(e.menu_bar_unpinned_mode, MenuBarMode::Hidden, "FULL remembers the prior mode as unpin target");
     }
 }
