@@ -213,18 +213,24 @@ behavior (a documented footgun for naive emitters).
 - **Worker rebuild:** the worker's `ClipReq::SelectProvider(Layer1Choice)` drops its current backend and
   builds the new one (`CommandBackend` variant / `ArboardBackend` / `NullBackend`). Rebuild is cheap
   and off the hot path.
-- **Startup availability (fixes the init-order gap):** `spawn_worker` gains an initial-plan parameter —
-  `spawn_worker(msg_tx, initial: Layer1Choice)`. At startup the resolved config is run through
-  `resolve_provider` to compute the initial `Layer1Choice`, which `spawn_worker` uses to build the
-  first backend, so the one-shot `Msg::ClipboardAvailability` reflects the *selected* provider (not an
-  unconditional arboard probe). `editor.clipboard_provider` is seeded via `set_clipboard_provider` for
-  the main-side `osc52` plan; because the worker already holds the correct initial backend, the
-  startup seeding does not need to drive an immediate `SelectProvider`.
+- **Startup availability (fixes the init-order gap):** `spawn_worker` gains a **full initial plan**
+  parameter — `spawn_worker(msg_tx, initial: ProviderPlan)` (not just `Layer1Choice`). The worker
+  builds its first backend from `initial.layer1` and reports `Msg::ClipboardAvailability(available)`
+  where `available = initial.layer1 != Null || initial.osc52.is_some()` — so a `Null` local owner with
+  OSC 52 enabled (e.g. plain SSH) still reports *available*, which `Layer1Choice` alone could not
+  express. At startup the resolved config is run through `resolve_provider` to compute `initial`.
+- **Startup seeding without a redundant rebuild (fixes the dirty-flag race):** `editor.clipboard_provider`
+  is seeded via `set_clipboard_provider` (for the main-side `osc52` plan), which raises the dirty flag
+  as usual — but because the worker already holds the correct initial backend from `spawn_worker`,
+  startup **clears `clipboard_provider_dirty` after seeding** so the first `drain_clipboard_intents`
+  does not issue a redundant `SelectProvider`. (Only a *runtime* provider change leaves the flag set.)
 - **Persistence (Save Settings round-trip):** `clipboard.provider` participates in the settings
   override machinery like every other option — `SettingsSnapshot` gains the field (+ field-guard arm),
-  and `OverridesFile`, `parse_mask`, and `compute_overrides` gain a `[clipboard]` section so the value
-  serializes back out through Save Settings. The current override sections are keymap/theme/view/menu/
-  mouse (settings.rs:79); clipboard joins them.
+  and `OverridesFile`, `parse_mask`, and `compute_overrides` gain a `[clipboard]` section. A small
+  `clipboard_provider_str(ClipboardProvider) -> &'static str` helper (beside `transient_mode_str` /
+  `menu_bar_str` at config.rs:495) yields the stable `"auto"|"native"|"osc52"|"off"` tokens that
+  `compute_overrides` serializes. The current override sections are keymap/theme/view/menu/mouse
+  (settings.rs:79); clipboard joins them.
 
 ---
 
@@ -302,11 +308,12 @@ spot-checks; the PTY smoke S5 already covers OSC 52 → tmux (happy path).
 
 - `wordcartel/src/clipboard.rs` — `Layer1Choice`, `Osc52Wrap`, `ProviderPlan`, `ClipEnv`,
   `resolve_provider`, `CommandBackend` (+ constructors), `osc52_set(text, wrap)`,
-  `ClipReq::SelectProvider`, `spawn_worker(msg_tx, initial: Layer1Choice)` signature change + worker
-  rebuild; keep `ArboardBackend`/`NullBackend`/`FakeBackend`.
+  `ClipReq::SelectProvider`, `spawn_worker(msg_tx, initial: ProviderPlan)` signature change (worker
+  reports availability from the plan) + worker rebuild; keep `ArboardBackend`/`NullBackend`/`FakeBackend`.
 - `wordcartel/src/config.rs` — `ClipboardProvider`, `ClipboardConfig`, `Config.clipboard`,
   `RawConfig` parse of `[clipboard] provider` (hand-matched string enum with unknown→warn→`Auto`, per
-  the `menu.bar`/`view.scrollbar` precedent at config.rs:402/420).
+  the `menu.bar`/`view.scrollbar` precedent at config.rs:402/420), and a `clipboard_provider_str`
+  serialization helper beside `transient_mode_str`/`menu_bar_str` (config.rs:495).
 - `wordcartel/src/editor.rs` — `clipboard_provider` field, `clipboard_provider_dirty` flag,
   `set_clipboard_provider` setter (beside the A3 setters at editor.rs:825).
 - `wordcartel/src/registry.rs` — the five commands (four sets `menu: None`, the cycle
@@ -320,8 +327,9 @@ spot-checks; the PTY smoke S5 already covers OSC 52 → tmux (happy path).
   (palette-completeness gate); the cycle is the menu representative (menu ⊆ palette holds — only the
   cycle appears in the menu, the four sets do not).
 - `wordcartel/src/app.rs` — `spawn_worker` call (app.rs:1506) passes the startup-resolved initial
-  `Layer1Choice`; `drain_clipboard_intents` (app.rs:1664) recompute + ordered dirty-flag send; startup
-  config→editor seeding via `set_clipboard_provider` (beside the A3 seeding at app.rs:1378).
+  `ProviderPlan`; `drain_clipboard_intents` (app.rs:1664) recompute + ordered dirty-flag send; startup
+  config→editor seeding via `set_clipboard_provider` then clear `clipboard_provider_dirty` (beside the
+  A3 seeding at app.rs:1378).
 - No `Cargo.toml` change — arboard stays `= { version = "3", default-features = false,
   features = ["wayland-data-control"] }`; helper backends use only `std::process`; no new crates.
 
