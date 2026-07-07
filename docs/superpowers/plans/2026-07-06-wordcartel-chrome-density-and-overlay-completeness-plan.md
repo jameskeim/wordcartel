@@ -990,7 +990,13 @@ fn dwell_never_arms_under_any_modal() {
         ("search", |e| e.search = Some(crate::search_overlay::SearchState::open(
             crate::search_overlay::Phase::Find, 0, crate::editor::BufferId(1)))),
         ("outline", |e| e.open_outline()),
-        // diag: construct a DiagOverlay directly (mirror diag_overlay.rs tests).
+        ("diag", |e| {
+            let d = wordcartel_core::diagnostics::Diagnostic {
+                range: 0..1, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                message: "x".into(), suggestions: vec![] };
+            let (id, ver) = (e.active().id, e.active().document.version);
+            e.diag = Some(crate::diag_overlay::DiagOverlay::new(d, id, ver));
+        }),
     ];
     for (name, setup) in modal_setups {
         let mut e = Editor::new_from_text("hello\n", None, (40, 8));
@@ -1183,17 +1189,32 @@ fn click_outline_row_jumps_and_closes() {
 
 - [ ] **Step 1: Write the failing tests** — a tall diag scrolls (selection stays visible) and a click applies the row.
 ```rust
-// diag_overlay.rs
+// diag_overlay.rs — helper builds a 30-row overlay (28 suggestions + ignore + add-dict).
+fn tall_diag() -> DiagOverlay {
+    let suggestions = (0..28).map(|i|
+        wordcartel_core::diagnostics::Suggestion::ReplaceWith(format!("s{i}"))).collect();
+    let d = wordcartel_core::diagnostics::Diagnostic {
+        range: 0..1, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+        message: "m".into(), suggestions };
+    DiagOverlay::new(d, crate::editor::BufferId(1), 0)
+}
+
 #[test]
-fn diag_down_keeps_selection_in_window() {
-    let mut d = tall_diag(30); // helper: a Diagnostic with 28 suggestions → 30 rows
-    d.scroll_top = 0;
-    for _ in 0..20 { d.down(24); } // down(area_h) keeps window
-    assert!(d.selected.saturating_sub(d.scroll_top) < crate::list_window::list_h_for(d.row_count(), 24),
-        "selection stays inside the window after scrolling");
+fn diag_window_follows_selection() {
+    // `down()` takes NO arg (diag_overlay.rs:33); windowing is applied by the mouse/paint
+    // layer via keep_overlay_visible (the two-layer list_window invariant) — drive both.
+    let mut d = tall_diag();
+    assert_eq!(d.row_count(), 30);
+    for _ in 0..20 {
+        d.down();
+        crate::app::keep_overlay_visible(24, d.selected, d.row_count(), &mut d.scroll_top);
+    }
+    let lh = crate::list_window::list_h_for(d.row_count(), 24);
+    assert!(d.selected.saturating_sub(d.scroll_top) < lh,
+        "selection stays inside the window (selected={}, scroll_top={}, lh={lh})", d.selected, d.scroll_top);
 }
 ```
-(Note: change `up`/`down` to take `area_h` and call `keep_visible`, OR keep them arg-free and window in the paint + mouse layer via `keep_overlay_visible`. The cleaner choice — matching the other overlays — is to window in the paint/mouse layer via `keep_overlay_visible`, leaving `up`/`down` unchanged. Adopt THAT: no signature change to `up`/`down`; the paint calls `keep_overlay_visible(h, selected, row_count, &mut scroll_top)` like the palette does at `render_overlays.rs:45`. Rewrite the test accordingly to drive the paint or `keep_overlay_visible` directly.)
+(`up`/`down` stay arg-free — no signature change; windowing lives in the paint/mouse layer via `keep_overlay_visible`, matching the other overlays. The diag paint calls `keep_overlay_visible(h, selected, row_count, &mut scroll_top)` like the palette does at `render_overlays.rs:45`.)
 
 - [ ] **Step 2: Run to verify fail** — FAIL (`scroll_top` undefined).
 
@@ -1292,29 +1313,35 @@ Prompt arm in `route_overlay`: on Down(Left), `if let Some(action) = crate::rend
 // render.rs
 #[test]
 fn menu_dropdown_windows_a_tall_category() {
-    // Build groups where one category has > available height leaves.
-    let area = Rect::new(0, 0, 80, 8); // h-1 status, h-... → small window
-    let groups = tall_menu_groups(20); // helper: a category with 20 leaves
+    let area = Rect::new(0, 0, 80, 8);       // avail_below = height - 1 = 7
+    let groups = tall_menu_groups(20);       // helper: a category with 20 leaves
     let rect = menu_dropdown_rect(area, &groups, 0).expect("dropdown rect");
-    let avail = crate::list_window::list_h_for(20, area.height);
-    assert_eq!(rect.height as usize, avail.min(20),
-        "dropdown height is windowed by list_h_for, not the raw leaf count");
+    let avail_below = (area.height - 1) as usize;
+    let expected = 20usize.min(15).min(avail_below); // = 7 here (NOT list_h_for's h-4 = 4)
+    assert_eq!(rect.height as usize, expected,
+        "dropdown height = leaves.min(15).min(avail_below), not the raw leaf count (20)");
 }
 ```
+(The dropdown budget is `avail_below = height - 1`, NOT `list_window::list_h_for`'s `h - 4` — the `-4` is the palette's query-bar/border chrome, which the borderless dropdown does not have. Codex plan gate round 2.)
 ```rust
 // mouse.rs
 #[test]
 fn menu_wheel_scrolls_dropdown() {
-    let mut e = Editor::new_from_text("x\n", None, (80, 8));
+    let mut e = Editor::new_from_text("x\n", None, (80, 8)); // avail_below = 7
     crate::derive::rebuild(&mut e);
-    e.menu = Some(crate::menu::empty_at(4)); // a category with many leaves (Settings)
+    // Synthetic 20-leaf category so the dropdown overflows the 7-row window and
+    // scroll_top must advance (Codex plan gate round 2 — prove windowing, not just highlight).
+    let leaves: Vec<(String, crate::registry::CommandId)> =
+        (0..20).map(|i| (format!("item{i}"), crate::registry::CommandId("move_right"))).collect();
+    e.menu = Some(crate::menu::MenuView {
+        groups: vec![(crate::registry::MenuCategory::Edit, leaves)],
+        open: 0, highlighted: 0, built: true, scroll_top: 0 });
     let (reg, ex, clk, tx, km) = ctx();
-    crate::app::hydrate_overlays(&mut e, &reg, &km);
-    let before = e.menu.as_ref().unwrap().scroll_top;
     let wheel = MouseEvent { kind: MouseEventKind::ScrollDown, column: 2, row: 3, modifiers: KeyModifiers::NONE };
     for _ in 0..10 { handle(&mut e, wheel, &reg, &km, &ex, &clk, &tx); }
-    assert!(e.menu.as_ref().unwrap().highlighted > 0, "wheel moves the highlight");
-    let _ = before;
+    let m = e.menu.as_ref().unwrap();
+    assert!(m.highlighted > 0, "wheel moves the highlight");
+    assert!(m.scroll_top > 0, "wheel scrolls the window once the highlight passes the visible rows");
 }
 ```
 
@@ -1339,7 +1366,7 @@ fn menu_wheel_scrolls_dropdown() {
 
 Dropdown paint (`render_overlays.rs:316`, post-Task-8): call `crate::list_window::keep_visible(menu.highlighted, leaves.len(), drop_rect.height as usize, &mut scroll_top)` (needs `editor.menu` as `&mut` in the paint — the fn already has `&mut Editor`; take the `scroll_top` mutably like the palette does), slice `leaves[scroll_top..end]`, and render the indicator via `windowed_indicator(menu.highlighted, leaves.len(), drop_rect.height as usize)` on the dropdown's bottom row when it overflows.
 
-Menu arm in `route_overlay` (`mouse.rs`): add `ScrollUp/Down` → move `highlighted` within `[0, leaves_len)` and `keep_visible`. Keyboard handlers in `app.rs`: the Up/Down arms (`app.rs:358-361`) call `list_window::keep_visible(highlighted, len, len.min(15), &mut menu.scroll_top)` after moving — so the highlight is dragged into view. The **Left/Right category-change arms (`app.rs:356-357`) must ALSO reset `menu.scroll_top = 0`** (not just `highlighted = 0`), or a stale scroll window carries into a shorter category (Codex plan gate). (For `list_h` in the keyboard path where no frame geometry is known, use `leaves.len().min(15)` as the budget, consistent with the paint's clamp; the paint re-windows against the true frame `list_h` every frame — the `list_window` two-layer invariant.)
+Menu arm in `route_overlay` (`mouse.rs`): add `ScrollUp/Down` → move `highlighted` within `[0, leaves_len)` and `keep_visible`. **The mouse category-switch (`bar_hit` at `mouse.rs:190-191`, which sets `m.open` + `m.highlighted = 0`) must ALSO set `m.scroll_top = 0`** (Codex plan gate round 2 — same stale-window hazard as the keyboard Left/Right). Keyboard handlers in `app.rs`: the Up/Down arms (`app.rs:358-361`) call `list_window::keep_visible(highlighted, len, len.min(15), &mut menu.scroll_top)` after moving — so the highlight is dragged into view. The **Left/Right category-change arms (`app.rs:356-357`) must ALSO reset `menu.scroll_top = 0`** (not just `highlighted = 0`), or a stale scroll window carries into a shorter category (Codex plan gate). (For `list_h` in the keyboard path where no frame geometry is known, use `leaves.len().min(15)` as the budget, consistent with the paint's clamp; the paint re-windows against the true frame `list_h` every frame — the `list_window` two-layer invariant.)
 
 - [ ] **Step 4: Run tests to verify pass** — new tests PASS; existing menu tests (`click_on_inactive_bar_opens_that_category`, dropdown dispatch) green.
 
@@ -1362,7 +1389,7 @@ Menu arm in `route_overlay` (`mouse.rs`): add `ScrollUp/Down` → move `highligh
 
 These are the concrete functions/sites the mouse arms and recompute calls reuse. Verified against the branch:
 
-1. **Prompt resolver (Task 13):** `crate::prompts::resolve_prompt(action, editor, ex, clock, msg_tx)` (`prompts.rs:99`, signature `(PromptAction, &mut Editor, &dyn Executor, &dyn Clock, &Sender<Msg>)`). The mouse prompt arm calls this with the hit `PromptAction`, then clears `editor.prompt`.
+1. **Prompt resolver (Task 13):** `crate::prompts::resolve_prompt(action, editor, ex, clock, msg_tx)` (`prompts.rs:99`, signature `(PromptAction, &mut Editor, &dyn Executor, &dyn Clock, &Sender<Msg>)`). The mouse prompt arm calls this with the hit `PromptAction` and does **NOT** itself clear `editor.prompt` — `resolve_prompt` already owns prompt clearing; double-clearing could break a follow-up modal arm (Codex plan gate round 2).
 2. **Outline jump (Task 11):** `crate::app::outline_jump_to(editor, byte)` (`app.rs:276`) — the mouse arm sets `selected`, reads `rows[selected].byte`, calls `outline_jump_to`, closes the overlay. (The `opened_version` stale guard lives in the keyboard Enter path; if `outline_jump_to` does not itself re-check version, replicate the guard the keyboard arm uses.)
 3. **Theme-picker Enter commit (Task 10):** the keyboard arm at `app.rs:~540-560` takes `theme_picker`, on Esc applies `tp.original`, on commit consumes `tp.previewed` to set `theme_identity`. The mouse commit arm must run `preview_selected_theme` then the SAME `previewed`-consume identity commit; extract that inline commit into a small helper (e.g. `commit_theme_picker(editor)`) and call it from both the keyboard Enter arm and the mouse arm.
 4. **Diag apply (Task 12):** `crate::search_ui::diag_apply_selected(editor, clock)` (`search_ui.rs:133`) ALREADY exists and includes the `opened_version` stale guard (tested at `app.rs:4029`) — the mouse arm sets `selected` then calls it directly. Do NOT reimplement. **File-browser Enter (Task 10):** the file-browser open/descend logic (incl. the unreadable-dir guard tested at `file_browser.rs:84`) lives in the reduce Enter arm; if it is not already a named fn, extract a `file_browser_enter(editor, …)` helper and call it from BOTH the keyboard arm and the mouse arm — the plan forbids copying the fs logic.
