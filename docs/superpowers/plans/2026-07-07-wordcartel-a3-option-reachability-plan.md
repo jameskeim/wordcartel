@@ -371,7 +371,7 @@ fn custom_bind_surfaces_in_menu_and_palette() {
         "palette hint");
 }
 ```
-(Verify the real chord CUA binds to `move_up` — if `move_up` isn't preset-differing, pick a command that is, e.g. one bound to an arrow in CUA and a `ctrl-` chord in WordStar. Grep the preset tables.)
+(The re-resolution test uses `save` — verified preset-differing: CUA `ctrl-s` (keymap.rs:249) vs WordStar's `ctrl-k` combos (keymap.rs:376). Do NOT use `move_up`: WordStar binds both `ctrl-e` and `up` to it, so `chord_for` returns `up` for both presets — vacuous.)
 
 - [ ] **Step 4: Run — PASS.** Full `cargo test -p wordcartel-core -p wordcartel` green; `cargo clippy --workspace --all-targets` clean; build/`--no-run` warning-free; run `scripts/smoke/run.sh` and quote the summary.
 
@@ -381,7 +381,7 @@ fn custom_bind_surfaces_in_menu_and_palette() {
 
 ## Testing & gates (whole-effort)
 
-- Per-task TDD tests + the three law tests. Cross-cutting: the density `apply_bundle`/`toggle_chrome`/`menu_bar_pin` tests stay green (behavior preserved through the setters).
+- Per-task TDD tests + the three law tests. Cross-cutting: the existing density/`toggle_chrome`/`menu_bar_pin` tests stay green (their asserted behavior is unchanged), and the ONE intentional `apply_bundle` change — routing menu_bar through `set_menu_bar_mode` now keeps `menu_bar_unpinned_mode` consistent — is covered by the new `apply_bundle_keeps_menu_bar_unpinned_mode_consistent` test.
 - GATEs: `cargo test -p wordcartel-core -p wordcartel` green; `cargo clippy --workspace --all-targets` clean; build/`--no-run` warning-free; smoke mandatory-run.
 - Pipeline gates: Codex plan review (loop clean) → subagent execution → Codex pre-merge + Fable whole-branch → merge.
 
