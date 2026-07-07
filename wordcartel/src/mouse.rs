@@ -180,6 +180,35 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
             }
             crate::app::preview_selected_theme(editor);
         }
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            // Scoped borrows → owned hit values before any mutation.
+            let row_idx: Option<usize> = {
+                let tp = editor.theme_picker.as_ref().unwrap();
+                crate::render::theme_picker_row_at(area, tp, ev.column, ev.row)
+            };
+            let inside = {
+                let tp = editor.theme_picker.as_ref().unwrap();
+                let r = crate::render::palette_overlay_rect(area, tp.rows.len());
+                ev.column >= r.x && ev.column < r.x + r.width
+                    && ev.row >= r.y && ev.row < r.y + r.height
+            };
+            if let Some(idx) = row_idx {
+                // Set selected to the clicked row, preview, then commit — same
+                // identity logic as the keyboard Enter arm (via shared helper).
+                let ah = editor.active().view.area.1;
+                if let Some(tp) = editor.theme_picker.as_mut() {
+                    tp.selected = idx;
+                    crate::app::keep_overlay_visible(ah, idx, tp.rows.len(), &mut tp.scroll_top);
+                }
+                crate::app::preview_selected_theme(editor);
+                crate::app::commit_theme_picker(editor);
+            } else if !inside {
+                // Click-away: restore the original theme and close — same as Esc.
+                if let Some(tp) = editor.theme_picker.take() {
+                    editor.apply_theme(tp.original);
+                }
+            }
+        }
         return;
     }
     if editor.file_browser.is_some() {
@@ -192,6 +221,31 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
                     fb.selected = fb.selected.saturating_sub(1);
                 }
                 crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+            }
+        }
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            // Scoped borrows → owned hit values before any mutation.
+            let row_idx: Option<usize> = {
+                let fb = editor.file_browser.as_ref().unwrap();
+                crate::render::file_browser_row_at(area, fb, ev.column, ev.row)
+            };
+            let inside = {
+                let fb = editor.file_browser.as_ref().unwrap();
+                let r = crate::render::palette_overlay_rect(area, fb.entries.len());
+                ev.column >= r.x && ev.column < r.x + r.width
+                    && ev.row >= r.y && ev.row < r.y + r.height
+            };
+            if let Some(idx) = row_idx {
+                // Set selected to the clicked row, then execute — same
+                // dir/file logic as the keyboard Enter arm (via shared helper).
+                let ah = editor.active().view.area.1;
+                if let Some(fb) = editor.file_browser.as_mut() {
+                    fb.selected = idx;
+                    crate::app::keep_overlay_visible(ah, idx, fb.entries.len(), &mut fb.scroll_top);
+                }
+                crate::app::file_browser_enter(editor);
+            } else if !inside {
+                editor.file_browser = None; // click-away closes
             }
         }
         return;
@@ -684,9 +738,11 @@ mod tests {
         e.open_theme_picker();
         assert!(e.theme_picker.is_some());
         let (reg, ex, clk, tx, km) = ctx();
+        // (1, 0) is outside the overlay rect — click-away closes the picker and
+        // restores the original theme; the caret must not move regardless.
         handle(&mut e, down(1, 0), &reg, &km, &ex, &clk, &tx);
         assert_eq!(crate::nav::head(&e), 0, "click absorbed by theme picker — caret must not move");
-        assert!(e.theme_picker.is_some(), "theme picker must remain open after click");
+        assert!(e.theme_picker.is_none(), "click-away closes the theme picker");
     }
 
     // -----------------------------------------------------------------------
@@ -1079,5 +1135,65 @@ mod tests {
         let (reg, ex, clk, tx, km) = ctx();
         handle(&mut e, down(3, 4), &reg, &km, &ex, &clk, &tx);
         assert_eq!(crate::nav::head(&e), 0, "click must not move the caret while a prompt is open");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 10: theme-picker + file-browser click-to-commit + click-away
+    // -----------------------------------------------------------------------
+
+    /// A click on a visible theme-picker row applies that theme and closes the picker.
+    #[test]
+    fn click_theme_row_applies_and_closes() {
+        let mut e = Editor::new_from_text("# H\n\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_theme_picker();
+        let names = wordcartel_core::theme::Theme::builtin_names();
+        let target = names.iter().position(|n| *n == "tokyo-night").unwrap();
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let rect = crate::render::palette_overlay_rect(area, e.theme_picker.as_ref().unwrap().rows.len());
+        let click_row = rect.y + 2 + target as u16; // list starts ov_y+2 (scroll_top 0)
+        let (reg, ex, clk, tx, km) = ctx();
+        let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        assert!(e.theme_picker.is_none(), "picker closes on row click");
+        assert_eq!(e.theme.name, "tokyo-night", "clicked theme applied");
+    }
+
+    /// A click outside the theme-picker overlay closes it and restores the original theme.
+    #[test]
+    fn click_outside_theme_picker_closes() {
+        let mut e = Editor::new_from_text("# H\n\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_theme_picker();
+        let original_name = e.theme.name.clone();
+        let (reg, ex, clk, tx, km) = ctx();
+        // (0, 0) is well outside the centered overlay — click-away.
+        let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 0, row: 0, modifiers: KeyModifiers::NONE };
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        assert!(e.theme_picker.is_none(), "click-away closes the picker");
+        assert_eq!(e.theme.name, original_name, "click-away restores the original theme");
+    }
+
+    /// A click on a directory entry in the file browser descends into that directory.
+    #[test]
+    fn click_dir_enters() {
+        let dir = std::env::temp_dir().join(format!("wc-t10-fbclick-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sub = dir.join("subdir");
+        std::fs::create_dir(&sub).unwrap();
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        e.open_file_browser(dir.clone());
+        let idx = e.file_browser.as_ref().unwrap().entries.iter()
+            .position(|en| en.name == "subdir" && en.is_dir)
+            .expect("subdir must appear in entries");
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let rect = crate::render::palette_overlay_rect(area, e.file_browser.as_ref().unwrap().entries.len());
+        let click_row = rect.y + 2 + idx as u16; // scroll_top is 0
+        let (reg, ex, clk, tx, km) = ctx();
+        let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        assert!(e.file_browser.as_ref().is_some_and(|fb| fb.dir == sub),
+            "click on dir must descend into it; dir={:?}", e.file_browser.as_ref().map(|fb| &fb.dir));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

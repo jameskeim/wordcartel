@@ -273,6 +273,56 @@ pub(crate) fn preview_selected_theme(editor: &mut crate::editor::Editor) {
     }
 }
 
+/// Commit the theme picker — the shared commit path for the keyboard Enter arm
+/// and the mouse click-to-commit arm. Closes the picker and, when a theme was
+/// previewed, records its name in `theme_identity`.
+pub(crate) fn commit_theme_picker(editor: &mut crate::editor::Editor) {
+    if let Some(tp) = editor.theme_picker.take() {
+        if let Some(n) = tp.previewed {
+            editor.theme_identity = crate::settings::ThemeIdentity::Builtin(n);
+        } // untouched open→commit: no preview applied, identity unchanged (spec I-1)
+    }
+}
+
+/// Execute the selected file-browser entry — the shared Enter path for the keyboard
+/// Enter arm and the mouse click-to-commit arm. Descends into a directory (incl. ".."),
+/// guarding against unreadable targets, or opens a file through the dirty-guard path.
+pub(crate) fn file_browser_enter(editor: &mut crate::editor::Editor) {
+    let chosen = editor.file_browser.as_ref().and_then(|fb| {
+        fb.entries.get(fb.selected).map(|e| (e.name.clone(), e.is_dir))
+    });
+    if let Some((name, is_dir)) = chosen {
+        if is_dir {
+            let target = editor.file_browser.as_ref().map(|fb| {
+                if name == ".." {
+                    fb.dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| fb.dir.clone())
+                } else {
+                    fb.dir.join(&name)
+                }
+            });
+            if let Some(target) = target {
+                // §3: check readability BEFORE committing fb.dir.
+                if std::fs::read_dir(&target).is_ok() {
+                    if let Some(fb) = editor.file_browser.as_mut() {
+                        fb.dir = target;
+                        fb.query.clear();
+                        fb.selected = 0;
+                        fb.scroll_top = 0; // A6: reset with selected to avoid out-of-order slice
+                        crate::file_browser::rebuild_entries(fb);
+                    }
+                } else {
+                    editor.status = format!("cannot read directory: {}", target.display());
+                    // stay in prior dir — do NOT mutate fb.dir
+                }
+            }
+        } else {
+            let path = editor.file_browser.as_ref().unwrap().dir.join(&name);
+            editor.file_browser = None;
+            crate::workspace::open_as_new_buffer(editor, &path);
+        }
+    }
+}
+
 pub fn outline_jump_to(editor: &mut Editor, byte: usize) {
     let origin = editor.active().document.selection.primary().head;
     crate::marks::record_jump(editor.active_mut(), origin);
@@ -544,13 +594,7 @@ pub fn reduce(
                         // cancel preview → restore the theme active when we opened.
                         if let Some(tp) = editor.theme_picker.take() { editor.apply_theme(tp.original); }
                     }
-                    KeyCode::Enter => {
-                        if let Some(tp) = editor.theme_picker.take() {
-                            if let Some(n) = tp.previewed {
-                                editor.theme_identity = crate::settings::ThemeIdentity::Builtin(n);
-                            } // untouched open→Enter: no preview applied, identity unchanged (spec I-1)
-                        }
-                    }
+                    KeyCode::Enter => { commit_theme_picker(editor); }
                     KeyCode::Up => {
                         let ah = editor.active().view.area.1;
                         if let Some(tp) = editor.theme_picker.as_mut() {
@@ -656,46 +700,7 @@ pub fn reduce(
                 use crossterm::event::KeyCode;
                 match k.code {
                     KeyCode::Esc => { editor.file_browser = None; }
-                    KeyCode::Enter => {
-                        // Resolve the selected entry: descend into a directory (incl. ".."),
-                        // or open a file through the Task-4 dirty-guard.
-                        let chosen = editor.file_browser.as_ref().and_then(|fb| {
-                            fb.entries.get(fb.selected).map(|e| (e.name.clone(), e.is_dir))
-                        });
-                        if let Some((name, is_dir)) = chosen {
-                            if is_dir {
-                                // Compute the target directory without mutating fb yet.
-                                let target = editor.file_browser.as_ref().map(|fb| {
-                                    if name == ".." {
-                                        fb.dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| fb.dir.clone())
-                                    } else {
-                                        fb.dir.join(&name)
-                                    }
-                                });
-                                if let Some(target) = target {
-                                    // §3: check readability BEFORE committing fb.dir.
-                                    if std::fs::read_dir(&target).is_ok() {
-                                        if let Some(fb) = editor.file_browser.as_mut() {
-                                            fb.dir = target;
-                                            fb.query.clear();
-                                            fb.selected = 0;
-                                            fb.scroll_top = 0; // A6: a stale window over a
-                                            // smaller entry set would make the render slice
-                                            // out-of-order (panic-class) — reset with selected.
-                                            crate::file_browser::rebuild_entries(fb);
-                                        }
-                                    } else {
-                                        editor.status = format!("cannot read directory: {}", target.display());
-                                        // stay in prior dir — do NOT mutate fb.dir
-                                    }
-                                }
-                            } else {
-                                let path = editor.file_browser.as_ref().unwrap().dir.join(&name);
-                                editor.file_browser = None;
-                                crate::workspace::open_as_new_buffer(editor, &path);
-                            }
-                        }
-                    }
+                    KeyCode::Enter => { file_browser_enter(editor); }
                     KeyCode::Up => {
                         let ah = editor.active().view.area.1;
                         if let Some(fb) = editor.file_browser.as_mut() {
