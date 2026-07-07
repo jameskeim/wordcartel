@@ -232,6 +232,18 @@ pub(crate) fn file_browser_row_at(area: Rect, fb: &crate::file_browser::FileBrow
     } else { None }
 }
 
+/// Return the absolute list-row index that `(col, row)` hits in the outline overlay,
+/// or `None` when the click is outside the list interior. Mirrors `palette_row_at`.
+pub(crate) fn outline_row_at(area: Rect, outline: &crate::outline_overlay::OutlineOverlay, col: u16, row: u16) -> Option<usize> {
+    let r = palette_overlay_rect(area, outline.rows.len());
+    let list_top = r.y.saturating_add(2);
+    let list_h = crate::list_window::list_h_for(outline.rows.len(), area.height) as u16;
+    if col >= r.x.saturating_add(1) && col < r.x.saturating_add(r.width).saturating_sub(1)
+        && row >= list_top && row < list_top.saturating_add(list_h) {
+        Some((row - list_top) as usize + outline.scroll_top)
+    } else { None }
+}
+
 /// Assemble the left-hand portion of the normal status line (no overlay active).
 ///
 /// Format: `[i/n] <name> [<mode>]` (plus optional status message and BLK indicator).

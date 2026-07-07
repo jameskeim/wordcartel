@@ -250,8 +250,58 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
         }
         return;
     }
-    // Task 11: outline row scroll/click — placeholder consume for now.
-    if editor.outline.is_some() { return; }
+    if editor.outline.is_some() {
+        if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+            let ah = editor.active().view.area.1;
+            if let Some(o) = editor.outline.as_mut() {
+                if matches!(ev.kind, MouseEventKind::ScrollDown) {
+                    o.selected = (o.selected + 1).min(o.rows.len().saturating_sub(1));
+                } else {
+                    o.selected = o.selected.saturating_sub(1);
+                }
+                crate::app::keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
+            }
+            return;
+        }
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            // Scoped borrows → owned hit values before any mutation.
+            let row_idx: Option<usize> = {
+                let o = editor.outline.as_ref().unwrap();
+                crate::render::outline_row_at(area, o, ev.column, ev.row)
+            };
+            let inside = {
+                let o = editor.outline.as_ref().unwrap();
+                let r = crate::render::palette_overlay_rect(area, o.rows.len());
+                ev.column >= r.x && ev.column < r.x + r.width
+                    && ev.row >= r.y && ev.row < r.y + r.height
+            };
+            if let Some(idx) = row_idx {
+                let ah = editor.active().view.area.1;
+                if let Some(o) = editor.outline.as_mut() {
+                    o.selected = idx;
+                    crate::app::keep_overlay_visible(ah, idx, o.rows.len(), &mut o.scroll_top);
+                }
+                // Stale-version guard — mirrors the keyboard Enter arm (app.rs:1018):
+                // refuse a jump when the outline was opened against an older document version.
+                if editor.outline.as_ref().map(|o| o.opened_version)
+                    != Some(editor.active().document.version)
+                {
+                    editor.status = "document changed; outline closed".into();
+                    editor.outline = None;
+                    return;
+                }
+                let target = editor.outline.as_ref()
+                    .and_then(|o| o.rows.get(o.selected))
+                    .map(|r| r.byte);
+                if let Some(byte) = target {
+                    crate::app::outline_jump_to(editor, byte);
+                }
+            } else if !inside {
+                editor.outline = None; // click-away closes
+            }
+        }
+        return;
+    }
     // Task 12: diagnostics-overlay clicks — placeholder consume for now.
     if editor.diag.is_some() { return; }
     // Task 13: prompt choice clicks — placeholder consume for now.
@@ -1172,6 +1222,69 @@ mod tests {
         handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
         assert!(e.theme_picker.is_none(), "click-away closes the picker");
         assert_eq!(e.theme.name, original_name, "click-away restores the original theme");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 11: outline scroll + click-to-jump + click-away
+    // -----------------------------------------------------------------------
+
+    /// A click on an outline row jumps the caret to that heading and closes the
+    /// overlay. The stale-version guard is NOT tested here (see the keyboard test
+    /// `outline_jump_refused_after_background_edit` in app.rs — mouse reuses the
+    /// same guard).
+    #[test]
+    fn click_outline_row_jumps_and_closes() {
+        let mut e = Editor::new_from_text("# A\n\n## B\n\nbody\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_outline();
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let rows_len = e.outline.as_ref().unwrap().rows.len();
+        let rect = crate::render::palette_overlay_rect(area, rows_len);
+        let click_row = rect.y + 2 + 1; // second heading "## B"
+        let target_byte = e.outline.as_ref().unwrap().rows[1].byte;
+        let (reg, ex, clk, tx, km) = ctx();
+        let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        assert!(e.outline.is_none(), "outline closes on click");
+        assert_eq!(crate::nav::head(&e), target_byte, "caret jumps to the clicked heading");
+    }
+
+    /// A wheel event on the outline moves `selected` and keeps the window visible.
+    #[test]
+    fn outline_wheel_scroll_moves_selection() {
+        let text: String = (0..20).map(|i| format!("# H{i}\n\n")).collect();
+        let mut e = Editor::new_from_text(&text, None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_outline();
+        let (reg, ex, clk, tx, km) = ctx();
+        let scroll_down = MouseEvent {
+            kind: MouseEventKind::ScrollDown, column: 40, row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        for _ in 0..10 {
+            handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx);
+        }
+        let o = e.outline.as_ref().expect("outline must remain open after wheel");
+        assert_eq!(o.selected, 10, "selected must be 10 after 10 scroll-downs");
+        let lh = crate::list_window::list_h_for(o.rows.len(), 24);
+        assert!(o.selected.saturating_sub(o.scroll_top) < lh,
+            "outline wheel: selection visible (selected={}, scroll_top={}, lh={})",
+            o.selected, o.scroll_top, lh);
+    }
+
+    /// A click outside the outline overlay closes it without jumping.
+    #[test]
+    fn click_outside_outline_closes() {
+        let mut e = Editor::new_from_text("# A\n\n## B\n\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_outline();
+        let before = crate::nav::head(&e);
+        let (reg, ex, clk, tx, km) = ctx();
+        // (0, 0) is well outside the centered overlay.
+        let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 0, row: 0, modifiers: KeyModifiers::NONE };
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        assert!(e.outline.is_none(), "click-away closes the outline");
+        assert_eq!(crate::nav::head(&e), before, "caret unchanged on click-away");
     }
 
     /// A click on a directory entry in the file browser descends into that directory.
