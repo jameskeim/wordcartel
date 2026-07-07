@@ -1346,6 +1346,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // Seed mouse_capture from config (default true; may be overridden by config layers).
     editor.mouse_capture = cfg.mouse.mouse_capture;
     editor.view_opts = cfg.view.clone();
+    editor.scrollbar_mode = cfg.view.scrollbar;
+    editor.status_line_mode = cfg.view.status_line;
     editor.resume_enabled = cfg.state.resume; // gates open_into_current's resume restore (Effort 7)
     editor.diag_cfg = cfg.diagnostics.clone();
     editor.export_cfg = cfg.export.clone();

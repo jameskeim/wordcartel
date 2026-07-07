@@ -342,6 +342,19 @@ pub struct MouseState {
     pub menu_hide_due: Option<u64>,
     /// Whether the auto-mode bar is currently revealed (meaningless in other modes).
     pub menu_bar_revealed: bool,
+    /// Right-edge dwell deadline for the Auto-mode scrollbar (armed on rest at col w-1).
+    pub scrollbar_reveal_due: Option<u64>,
+    /// Leave-grace deadline for the Auto-mode scrollbar (armed once on leave).
+    pub scrollbar_hide_due: Option<u64>,
+    /// Whether the Auto-mode scrollbar is currently dwell-revealed (independent of
+    /// `scrollbar_until_ms`, which is the scroll-activity channel).
+    pub scrollbar_revealed: bool,
+    /// Bottom-row dwell deadline for the Auto-mode status line.
+    pub status_reveal_due: Option<u64>,
+    /// Leave-grace deadline for the Auto-mode status line.
+    pub status_hide_due: Option<u64>,
+    /// Whether the Auto-mode status line is currently dwell-revealed.
+    pub status_revealed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,6 +406,10 @@ pub struct Editor {
     pub menu_bar_mode: crate::config::MenuBarMode,
     /// The mode menu_bar_pin restores on unpin (registry handlers cannot see Config).
     pub menu_bar_unpinned_mode: crate::config::MenuBarMode,
+    /// Scrollbar visibility mode (seeded from `[view] scrollbar`; mutated at runtime).
+    pub scrollbar_mode: crate::config::TransientMode,
+    /// Status-line visibility mode (seeded from `[view] status_line`; mutated at runtime).
+    pub status_line_mode: crate::config::TransientMode,
     /// Transient mouse gesture state; cleared by `reconcile_mouse_capture` on disable.
     pub mouse: MouseState,
     /// View/focus/writing-experience flags. Seeded from config; toggled by the 5 toggle_ commands.
@@ -481,6 +498,8 @@ impl Editor {
             mouse_capture: true,
             menu_bar_mode: crate::config::MenuBarMode::Auto,
             menu_bar_unpinned_mode: crate::config::MenuBarMode::Auto,
+            scrollbar_mode: crate::config::TransientMode::Auto,
+            status_line_mode: crate::config::TransientMode::Auto,
             mouse: MouseState::default(),
             view_opts: crate::config::ViewConfig::default(),
             search: None,
@@ -804,6 +823,19 @@ mod tests {
     struct TestClock(std::cell::Cell<u64>);
     impl wordcartel_core::history::Clock for TestClock {
         fn now_ms(&self) -> u64 { self.0.get() }
+    }
+
+    // ------------------------------------------------------------------
+    // Task 2: TransientMode fields + dwell-timer defaults
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn editor_seeds_transient_modes_and_mouse_dwell_defaults() {
+        let e = Editor::new_from_text("x\n", None, (40, 8));
+        assert_eq!(e.scrollbar_mode, crate::config::TransientMode::Auto);
+        assert_eq!(e.status_line_mode, crate::config::TransientMode::Auto);
+        assert_eq!(e.mouse.scrollbar_reveal_due, None);
+        assert!(!e.mouse.status_revealed);
     }
 
     // ------------------------------------------------------------------
