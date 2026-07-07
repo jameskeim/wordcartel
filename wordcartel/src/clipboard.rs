@@ -155,7 +155,7 @@ pub fn drain_clipboard_intents(
     msg_tx: &Sender<crate::app::Msg>,
 ) {
     if let Some(text) = editor.clipboard_sync_request.take() {
-        if let Some(bytes) = osc52_set(&text) {
+        if let Some(bytes) = osc52_set(&text, Osc52Wrap::Bare) {
             let _ = out.write_all(&bytes);
             let _ = out.flush();
         }
@@ -284,18 +284,43 @@ pub(crate) fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-/// OSC 52 "set clipboard" sequence (ST-terminated). None when over the encoded cap.
-#[allow(dead_code)] // wired in Task 4
-pub fn osc52_set(text: &str) -> Option<Vec<u8>> {
+/// OSC 52 "set clipboard" sequence for `text`, framed per `wrap`. `None` when the
+/// base64 payload exceeds `OSC52_MAX_ENCODED` (caller skips emission; Layer 1 still copies).
+///
+/// - `Bare`:   ESC ] 52 ; c ; <b64> ESC \
+/// - `Tmux`:   ESC P tmux; <bare, every 0x1B doubled> ESC \   (tmux DCS passthrough)
+/// - `Screen`: ESC P <bare> ESC \                              (screen DCS passthrough)
+pub fn osc52_set(text: &str, wrap: Osc52Wrap) -> Option<Vec<u8>> {
     let b64 = base64_encode(text.as_bytes());
     if b64.len() > OSC52_MAX_ENCODED {
         return None;
     }
-    let mut v = Vec::with_capacity(b64.len() + 9);
-    v.extend_from_slice(b"\x1b]52;c;");
-    v.extend_from_slice(b64.as_bytes());
-    v.extend_from_slice(b"\x1b\\");
-    Some(v)
+    let mut bare = Vec::with_capacity(b64.len() + 9);
+    bare.extend_from_slice(b"\x1b]52;c;");
+    bare.extend_from_slice(b64.as_bytes());
+    bare.extend_from_slice(b"\x1b\\");
+    let framed = match wrap {
+        Osc52Wrap::Bare => bare,
+        Osc52Wrap::Tmux => {
+            // Double every ESC (0x1B) in the inner sequence, then wrap.
+            let mut v = Vec::with_capacity(bare.len() + 16);
+            v.extend_from_slice(b"\x1bPtmux;");
+            for &byte in &bare {
+                if byte == 0x1b { v.push(0x1b); }
+                v.push(byte);
+            }
+            v.extend_from_slice(b"\x1b\\");
+            v
+        }
+        Osc52Wrap::Screen => {
+            let mut v = Vec::with_capacity(bare.len() + 4);
+            v.extend_from_slice(b"\x1bP");
+            v.extend_from_slice(&bare);
+            v.extend_from_slice(b"\x1b\\");
+            v
+        }
+    };
+    Some(framed)
 }
 
 #[cfg(test)]
@@ -403,15 +428,31 @@ mod tests {
     }
 
     #[test]
-    fn osc52_frames_with_st_terminator() {
-        assert_eq!(osc52_set("hi").unwrap(), b"\x1b]52;c;aGk=\x1b\\".to_vec());
+    fn osc52_bare_frames_with_st() {
+        // "hi" → base64 "aGk="
+        assert_eq!(osc52_set("hi", Osc52Wrap::Bare).unwrap(), b"\x1b]52;c;aGk=\x1b\\".to_vec());
     }
 
     #[test]
-    fn osc52_skips_oversize_payload() {
-        // A raw string whose base64 exceeds the cap → None (skip OSC 52).
-        let big = "a".repeat(OSC52_MAX_ENCODED); // base64 ~4/3 larger → over cap
-        assert!(osc52_set(&big).is_none());
+    fn osc52_tmux_wraps_and_doubles_inner_esc() {
+        // tmux DCS passthrough: ESC P tmux; <inner with every 0x1b doubled> ESC \
+        let got = osc52_set("hi", Osc52Wrap::Tmux).unwrap();
+        assert_eq!(got, b"\x1bPtmux;\x1b\x1b]52;c;aGk=\x1b\x1b\\\x1b\\".to_vec());
+    }
+
+    #[test]
+    fn osc52_screen_wraps_without_doubling() {
+        // screen DCS passthrough: ESC P <inner> ESC \  (no ESC-doubling)
+        let got = osc52_set("hi", Osc52Wrap::Screen).unwrap();
+        assert_eq!(got, b"\x1bP\x1b]52;c;aGk=\x1b\\\x1b\\".to_vec());
+    }
+
+    #[test]
+    fn osc52_oversize_returns_none_for_every_wrap() {
+        let big = "a".repeat(OSC52_MAX_ENCODED); // base64 grows it beyond the cap
+        assert!(osc52_set(&big, Osc52Wrap::Bare).is_none());
+        assert!(osc52_set(&big, Osc52Wrap::Tmux).is_none());
+        assert!(osc52_set(&big, Osc52Wrap::Screen).is_none());
     }
 
     #[test]
