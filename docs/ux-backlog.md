@@ -427,7 +427,7 @@ BUFFER (`0..buf_len`).
    scope (they already handle lists at whole-list scope — adjacent machinery).
    May stage: defaults first, deepest-snap second, within one effort.
 
-### C3. Cross-app clipboard over SSH/tmux — `needs-design` · Small (reassessed 2026-07-07; was Medium)
+### C3. Cross-app clipboard over SSH/tmux — `needs-design` · Small (minimal fix) / Small–Medium (robust provider model) — reassessed 2026-07-07
 
 **UPDATE 2026-07-07 (re-grounded):** the paste-IN half already shipped since the original diagnosis.
 Bracketed paste is enabled (`term.rs:42` `EnableBracketedPaste`) and `Event::Paste(text)` is handled in
@@ -439,6 +439,45 @@ manual verification across the terminal × tmux × SSH matrix. Net: essentially 
 task (the DCS wrap — unit-testable) + a doc note + spot-checks; the S5 PTY smoke check already covers
 OSC 52 → tmux buffer. Design is basically settled — a short brainstorm, not a full one. Pasted text is
 untrusted input, but the M2 `submit_transaction` boundary already covers it.
+
+**Provider-model framing (2026-07-07 research).** "Robust for a word processor" ⇒ do NOT hard-code one
+mechanism — adopt the **provider/fallback chain** the mature editors converged on. wordcartel is well
+positioned: `clipboard.rs` ALREADY has the `ClipboardBackend` trait seam (`ArboardBackend`/`NullBackend`/
+`FakeBackend`) + the in-process `Register` (source of truth) + bracketed paste. So this is an EXTENSION
+of an existing abstraction, not a rewrite.
+
+- **The matrix to plan for (axes, and the nasty combos):** (1) local vs remote/SSH (OS clipboard vs
+  terminal-only); (2) multiplexer — tmux AND GNU screen, each with its OWN passthrough wrap (tmux
+  `\ePtmux;…\e\\`, screen `\eP…\e\\`; nested tmux double-wraps); (3) Linux display server — X11 vs
+  Wayland, plus the **persistence-on-exit gotcha** (the selection is served by the source process, so a
+  short-lived TUI can LOSE the copied data on exit unless a helper / clip-manager persists it) and X11's
+  **two selections** (PRIMARY vs CLIPBOARD); (4) **Windows + WSL** (`clip.exe` / `win32yank`, WSLg); (5)
+  uneven terminal OSC 52 — most support WRITE (copy) but REFUSE READ (paste) for security, some do none,
+  and there are **size caps** (tmux + terminals truncate large payloads); (6) headless / no-`$DISPLAY` →
+  degrade to register-only.
+- **Prior art (reference is Neovim):** Neovim ships no clipboard — it auto-detects and delegates to a
+  provider (`wl-copy`/`xclip`/`xsel`/`pbcopy`/`win32yank`/`tmux`), and **0.10 added a built-in OSC 52
+  provider** that detects tmux/screen and wraps — exactly the C3 shape. Helix = `clipboard-provider`
+  (wayland / OSC 52 termcode / pipe); Kakoune + Emacs delegate to xsel/xclip/pbcopy/wl-copy; tmux's own
+  `set-clipboard on` + `Ms` capability is the user-config route. Universal lesson: provider chain +
+  detection + fallback, register as source of truth (done), bracketed paste for remote paste-in (done).
+- **Crates:** `arboard` (current local base — X11/Wayland/mac/Windows, images; persistence caveat
+  applies) · `copypasta` / **`copypasta-ext`** (Alacritty's; ext adds X11 **fork-to-persist** + an OSC 52
+  provider — the most directly relevant prior art for the persistence fix) · `wl-clipboard-rs` (fine
+  Wayland control) · `x11-clipboard` (PRIMARY+CLIPBOARD). OSC 52 itself is small enough to keep
+  hand-rolled (we do); no crate helps paste-over-SSH — that's bracketed paste (done).
+- **The wordcartel plan (extend `ClipboardBackend` into a chain):** copy-out = `Register` (always) →
+  arboard (local) → OSC 52 with `$TMUX`/`$STY`-aware tmux+screen wrapping (remote; detect
+  `$SSH_TTY`/`$SSH_CONNECTION`). **Wayland persistence decision:** OSC 52 SIDESTEPS it (the terminal owns
+  + persists the clipboard after wcartel exits), so preferring OSC 52 in more cases — or pulling in
+  copypasta-ext's fork-persist — are the two options to weigh in the brainstorm. WSL is covered by OSC 52
+  (Windows Terminal supports it) or a `clip.exe`/`win32yank` backend. Degrade headless → register-only
+  (status already says "clipboard unavailable"); keep the `OSC52_MAX_ENCODED` cap + warn on truncation.
+  **PRIMARY selection scoped OUT of v1** (nice-to-have).
+- **Sizing:** the MINIMAL remaining fix (tmux/screen copy-out wrap + doc) is still Small; the ROBUST
+  provider-chain version is Small–Medium — an extension of the existing seam, gated as ever by the
+  terminal × tmux × SSH (× Wayland/X11 × WSL) verification matrix, which is mostly manual spot-checks
+  (the OSC 52 wrap + detection are unit-testable; S5 smoke covers OSC 52 → tmux).
 
 *(Original diagnosis 2026-06-28 against `wordcartel/src/clipboard.rs`; predates the niggle triage.)*
 Cross-application copy/paste (wordcartel → local app, or vice versa) does NOT work inside an
@@ -1139,7 +1178,8 @@ by size:
 
 - **Small:** A3b item-by-item menu-curation pass (A3 itself shipped; the state-in-label half
   shipped with E2) · C3 clipboard over SSH/tmux (reassessed 2026-07-07 — paste-in already shipped;
-  only the copy-out tmux DCS-wrap + a `.tmux.conf` doc note + manual spot-checks remain).
+  minimal remaining fix = copy-out tmux/screen wrap + doc; the ROBUST provider-model version is
+  Small–Medium — extend the existing `ClipboardBackend` seam into a detect+fallback chain, see entry).
 - **Small-Medium:** S3 Snapshots (Theme S — capture/restore/persist reuse existing machinery;
   the one net-new algorithm is a display diff).
 - **Medium:** R1 editing-responsiveness (Theme R, in-brainstorm) · S1 rearrangeable outline / corkboard.
