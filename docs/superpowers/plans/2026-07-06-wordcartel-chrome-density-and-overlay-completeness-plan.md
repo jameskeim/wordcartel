@@ -1351,16 +1351,15 @@ fn menu_wheel_scrolls_dropdown() {
 
 `MenuView` (`menu.rs:4`): add `pub scroll_top: usize`; set `scroll_top: 0` in `empty`/`empty_at`/`build` literals.
 
-`menu_dropdown_rect` (`render.rs:151`): window the height. Replace `let height = leaves.len() as u16;` and the `Rect::new(...)` height term with a `list_h_for`-based height against the space below the label (`area.height - 1` rows are available below row 0; the dropdown starts at `area.y + 1`):
+`menu_dropdown_rect` (`render.rs:151`): window the height. Replace `let height = leaves.len() as u16;` and the `Rect::new(...)` height term. The dropdown budget is `avail_below = area.height - 1` (rows under the bar) — NOT `list_window::list_h_for`'s `h - 4` (that `-4` is the palette's query-bar/border chrome, which the borderless dropdown does not have). **Return `None` when there is no room below the bar** (Codex plan gate round 3 — a `.max(1)` floor would paint the dropdown into the status row at terminal height 2, matching the old function's `saturating_sub(1)` clamp at `render.rs:158`):
 ```rust
-    let avail_below = area.height.saturating_sub(1); // rows under the bar
-    let list_h = crate::list_window::list_h_for(leaves.len(), area.height.saturating_add(4)).min(avail_below as usize) as u16;
-    let height = list_h.max(1);
+    let avail_below = area.height.saturating_sub(1) as usize; // rows under the bar
+    let list_h = leaves.len().min(15).min(avail_below);
+    if list_h == 0 { return None; } // cramped terminal: no room — never paint past the boundary
     Some(Rect::new(label_rect.x, area.y + 1,
         width.min(area.width.saturating_sub(label_rect.x.saturating_sub(area.x))),
-        height))
+        list_h as u16))
 ```
-(Adjust the `+4` fudge: `list_h_for` subtracts 4 for palette chrome; the dropdown has no query bar, so pass an `area_h` that yields `min(leaves, 15, avail_below)`. Concretely define a local `list_h = leaves.len().min(15).min(avail_below as usize)` — do NOT reuse `list_h_for`'s `-4` here; the dropdown budget is `avail_below`, not `h-4`. Use `leaves.len().min(15).min(avail_below as usize)`.)
 
 `menu_dropdown_row_at` (`render.rs:162`): return an ABSOLUTE index accounting for `scroll_top` — it needs the `scroll_top`, so change its signature to accept it: `menu_dropdown_row_at(area, groups, open, scroll_top, col, row)` → `Some((row - r.y) as usize + scroll_top)`. Update the caller in `mouse.rs:186`.
 
