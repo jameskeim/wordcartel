@@ -24,6 +24,8 @@ optdepends=(
   'libx11: native X11 clipboard (dlopened at runtime)'
   'wl-clipboard: wl-copy external clipboard provider (fallback chain)'
   'xclip: xclip external clipboard provider (fallback chain)'
+  'pandoc-cli: markdown export to html/docx/pdf (shells out to pandoc)'
+  'texlive-xetex: PDF export via pandoc --pdf-engine=xelatex'
 )
 provides=('wcartel')
 # The release-dist profile already strips the binary; skip makepkg's strip/debug stages.
