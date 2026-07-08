@@ -67,6 +67,19 @@ pub fn next_deadline_ms(now: u64, last_edit_at: Option<u64>, last_swap_at: Optio
     Some(idle_at.min(max_at).max(now))
 }
 
+/// True iff the buffer holds unsaved content whose version is not yet captured in the swap
+/// file — the real "swap work pending" signal. This, NOT "an edit ever happened", gates both
+/// the main-loop wake-up and the Tick dispatch. `last_edit_at` is monotonic (set on every edit,
+/// never cleared or advanced by a swap), so basing the wake on it made `next_deadline_ms` return
+/// a permanently past-due instant. The measured effect once idle: while DIRTY the swap file was
+/// rewritten on every loop wake (continuous disk I/O + fsyncs, at ~0% userspace CPU — an SSD-wear /
+/// no-idle-heat pathology); while SAVED-and-idle the loop kept waking on the past-due deadline with
+/// no work to do. `swapped_version` is set to the written version when a swap succeeds, so once the
+/// current version is on disk (or the buffer is clean) this is `false` and the loop can block.
+pub fn pending(dirty: bool, version: u64, swapped_version: Option<u64>) -> bool {
+    dirty && swapped_version != Some(version)
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SwapHeader {
     pub realpath: Option<String>,
@@ -297,7 +310,20 @@ pub fn dispatch_swap_write(ctx: &mut Ctx) {
                     // target the originating buffer even after a buffer switch (multi-buffer, Effort 6).
                     if let Some(b) = editor.by_id_mut(buffer_id) {
                         b.swap_in_flight = false;
-                        if ok { b.last_swap_at = Some(ts); }
+                        // Path-aware latch (Codex pre-merge): only claim "this version is on disk"
+                        // if the file we wrote (`path`) is STILL this buffer's current swap file. A
+                        // SaveAs that rekeyed the buffer's path while this write was in flight makes
+                        // `path` stale (written under the old key) — latching it would wrongly
+                        // suppress a fresh swap at the new path. On a mismatch, skip the latch so the
+                        // new path recheckpoints on the next idle tick. We deliberately do NOT delete
+                        // the stale file: the workspace permits the same path open in multiple
+                        // buffers, so a co-open buffer may legitimately own this `swap_path` (Codex).
+                        // Leaving one stale swap is harmless (at worst a misleading recovery prompt
+                        // for the old path); deleting a live buffer's swap would be data loss.
+                        if ok && swap_path(b.document.path.as_deref()).ok().as_ref() == Some(&path) {
+                            b.last_swap_at = Some(ts);
+                            b.swapped_version = Some(version);
+                        }
                     }
                     if !ok { editor.status = "swap write failed".to_string(); } // status global
                 }),
@@ -325,6 +351,32 @@ mod tests {
     fn fnv_is_stable_and_distinguishes() {
         assert_eq!(fnv1a64(b"abc"), fnv1a64(b"abc"));
         assert_ne!(fnv1a64(b"/a/notes.md"), fnv1a64(b"/b/notes.md"));
+    }
+
+    /// Regression — idle 100% CPU spin. The main loop wakes on the swap deadline; basing
+    /// that deadline on `last_edit_at` alone (a monotonic, never-cleared timestamp) returns a
+    /// permanently past-due instant once any edit has happened, so `recv_timeout` got a 0-length
+    /// timeout forever and the loop busy-spun. The real "swap work pending" signal is
+    /// `pending()`: unsaved content whose version is not yet in the swap file. The loop and the
+    /// Tick dispatch gate on it, so a settled or clean buffer schedules NO wake and the loop blocks.
+    #[test]
+    fn settled_buffer_is_not_pending_so_the_loop_can_block() {
+        let now = 100 * T_MAX_MS; // long past any idle/max deadline
+
+        // The raw deadline IS permanently past-due once last_edit_at is set — the spin source
+        // the gate must suppress:
+        assert_eq!(next_deadline_ms(now, Some(0), None), Some(now),
+            "raw swap deadline is past-due forever off a monotonic last_edit_at");
+
+        // (a) clean buffer (e.g. just saved) with a stale last_edit_at → no swap work.
+        assert!(!pending(false, 7, Some(3)), "clean buffer → nothing to swap");
+        // (b) dirty but the current version is already in the swap file → no swap work.
+        assert!(!pending(true, 7, Some(7)), "current version already swapped → nothing to swap");
+        // (c) genuinely pending: edited to a new version not yet swapped → wake is scheduled.
+        assert!(pending(true, 8, Some(7)), "unsaved new version → pending");
+        assert!(pending(true, 1, None), "first edit, never swapped → pending");
+        assert!(next_deadline_ms(now, Some(now), None).is_some(),
+            "pending work still schedules a wake so the swap actually gets written");
     }
 
     #[test]
@@ -572,6 +624,47 @@ mod tests {
         assert_eq!(h.version, 3);
         let _ = std::fs::remove_file(&sp);
         let _ = std::fs::remove_file(&doc_path);
+    }
+
+    /// SaveAs-in-flight stale-path race (Codex pre-merge): a SwapWrite dispatched under the OLD
+    /// path must NOT set the latch once the buffer has been rekeyed to a new path — otherwise
+    /// `pending()` would read "already swapped" and suppress a fresh swap at the NEW path, leaving
+    /// unsaved content with no recovery file. The stale file under the old path is left in place
+    /// (a co-open buffer could own it) and cleaned up by this test.
+    #[test]
+    fn stale_path_swap_does_not_relatch_after_rekey() {
+        use crate::editor::Editor;
+        use crate::jobs::{Executor, InlineExecutor};
+        use crate::registry::Ctx;
+        use wordcartel_core::history::Clock;
+        struct Z; impl Clock for Z { fn now_ms(&self) -> u64 { 77 } }
+
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let old_path = std::env::temp_dir().join(format!("wc-rekey-old-{}-{}.md", std::process::id(), seq));
+        let new_path = std::env::temp_dir().join(format!("wc-rekey-new-{}-{}.md", std::process::id(), seq));
+        let mut e = Editor::new_from_text("unsaved body\n", Some(old_path.clone()), (80, 24));
+        e.active_mut().document.version = 5; // dirty, edited
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        // Dispatch a swap — it captures the OLD path.
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+          dispatch_swap_write(&mut ctx); }
+        // Simulate a SaveAs rekey landing before this swap's merge drains: the buffer's path is now
+        // the NEW file, and the save-side clear reset the latch.
+        e.active_mut().document.path = Some(new_path.clone());
+        e.active_mut().swapped_version = None;
+        // Now the stale (old-path) swap outcome merges.
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
+
+        assert!(e.active().swapped_version.is_none(),
+            "a swap written under the OLD path must NOT relatch after the buffer was rekeyed");
+        // The stale swap under the old path is intentionally NOT deleted (a co-open buffer could
+        // legitimately own that swap_path); clean it up here in the test.
+        let _ = std::fs::remove_file(swap_path(Some(&old_path)).unwrap());
+        let _ = std::fs::remove_file(swap_path(Some(&new_path)).unwrap());
+        let _ = std::fs::remove_file(&old_path);
+        let _ = std::fs::remove_file(&new_path);
     }
 
     #[test]

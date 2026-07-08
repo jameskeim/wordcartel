@@ -137,6 +137,10 @@ pub struct Buffer {
     pub last_edit: Option<wordcartel_core::block_tree::Edit>,
     pub last_edit_at: Option<u64>,
     pub last_swap_at: Option<u64>,
+    /// The document version whose content is currently written to the swap file. Gates the
+    /// swap wake-up so a settled buffer schedules no deadline (no idle busy-spin — see
+    /// `swap::pending`). `None` until the first successful swap write.
+    pub swapped_version: Option<u64>,
     pub swap_in_flight: bool,
     pub pending_swap_body: Option<String>,
     pub pending_swap_path: Option<PathBuf>,
@@ -202,6 +206,7 @@ impl Buffer {
             last_edit: None,
             last_edit_at: None,
             last_swap_at: None,
+            swapped_version: None,
             swap_in_flight: false,
             pending_swap_body: None,
             pending_swap_path: None,

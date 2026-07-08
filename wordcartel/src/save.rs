@@ -95,6 +95,13 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: std::path::PathBuf, mode: SaveMo
                                 if matches!(mode, SaveMode::SaveAs) { b.document.path = Some(target.clone()); }
                                 b.document.saved_version = Some(v);
                                 b.document.stored_fp = new_fp;
+                                // The swap latch (`swapped_version`) asserts "this version's content
+                                // is in the swap file". A successful save deletes/rekeys that swap
+                                // (below), so clear the latch — otherwise a later same-version dirty
+                                // state would read as "already swapped" and skip writing a fresh swap
+                                // (Codex pre-merge). Clearing errs toward writing a swap (durability-safe)
+                                // and re-arms the expedited SaveAs-still-editing checkpoint.
+                                b.swapped_version = None;
                                 if b.document.version == v {
                                     status = "Saved".to_string();
                                     crate::swap::delete(b.document.path.as_deref());

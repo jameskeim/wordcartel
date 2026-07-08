@@ -1174,7 +1174,9 @@ pub fn reduce(
         }
         Msg::Tick => {
             let now = clock.now_ms();
-            if editor.active().document.dirty()
+            if crate::swap::pending(
+                editor.active().document.dirty(), editor.active().document.version, editor.active().swapped_version,
+            )
                 && !editor.active().swap_in_flight
                 && crate::swap::due(now, editor.active().last_edit_at, editor.active().last_swap_at)
             {
@@ -1602,7 +1604,17 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     loop {
         let now = clock.now_ms();
         save_timeout_tick(&mut editor, now);
-        let swap_deadline = crate::swap::next_deadline_ms(now, editor.active().last_edit_at, editor.active().last_swap_at);
+        // Only arm the swap wake-up when a swap is actually pending (unsaved content not yet on
+        // disk) and none is in flight. Arming it off last_edit_at alone left a permanently past-due
+        // deadline, so an idle buffer kept waking the loop to rewrite its swap file — continuous
+        // disk I/O, not a CPU spin (see swap::pending).
+        let swap_deadline = if crate::swap::pending(
+            editor.active().document.dirty(), editor.active().document.version, editor.active().swapped_version,
+        ) && !editor.active().swap_in_flight {
+            crate::swap::next_deadline_ms(now, editor.active().last_edit_at, editor.active().last_swap_at)
+        } else {
+            None
+        };
         let sq_deadline = editor.pending_after_save.as_ref().map(|p| p.at_ms.saturating_add(SAVE_QUIT_TIMEOUT_MS));
         // Include scrollbar_until_ms in the deadline so the loop wakes when the
         // bar should fade (avoids relying on the idle 1-hour Tick).
@@ -1988,6 +2000,134 @@ mod tests {
         crate::app::reduce(crate::app::Msg::Input(key('d')), &mut e, &reg, &km, &ex, &clk, &tx);
         assert!(e.quit, "discarding the last dirty buffer quits");
         assert_eq!(e.active().document.buffer.to_string(), "hi\n");
+    }
+
+    // -------------------------------------------------------------------------
+    // SSD-wear guardrail: background recovery writes must scale with EDITS, not
+    // with idle time or loop wakes. Fences the disk-write budget from both sides —
+    // idle must not thrash (below), and long editing must still checkpoint but stay
+    // bounded (the continuous test). Regression these lock out: the swap scheduler
+    // re-dispatched a write on every idle Tick (level-triggered off a never-cleared
+    // last_edit_at with no swapped-version latch), rewriting the swap file ~10+/sec
+    // forever while idle — wearing the writer's SSD and keeping the machine hot.
+    // -------------------------------------------------------------------------
+
+    /// Counts `SwapWrite` job DISPATCHES (each = one swap-file write) while delegating real
+    /// execution to `InlineExecutor`. Counting dispatches — not drained outcomes — is required
+    /// because `reduce` drains and applies outcomes internally (app.rs:1218), so an external
+    /// `drain()` sees nothing.
+    struct CountingSwapExecutor { inner: crate::jobs::InlineExecutor, swaps: std::cell::Cell<usize> }
+    impl CountingSwapExecutor {
+        fn new() -> Self { Self { inner: crate::jobs::InlineExecutor::default(), swaps: std::cell::Cell::new(0) } }
+        fn swaps(&self) -> usize { self.swaps.get() }
+    }
+    impl crate::jobs::Executor for CountingSwapExecutor {
+        fn dispatch(&self, job: crate::jobs::Job) {
+            if job.kind == crate::jobs::JobKind::SwapWrite { self.swaps.set(self.swaps.get() + 1); }
+            self.inner.dispatch(job);
+        }
+        fn drain(&self) -> Vec<crate::jobs::JobOutcome> { self.inner.drain() }
+    }
+
+    /// One edit, then five simulated minutes of pure idle: the recovery swap file must be
+    /// written AT MOST ONCE. Rewriting identical content on every loop wake is the bug.
+    #[test]
+    fn idle_buffer_does_not_thrash_the_swap_file() {
+        use crate::registry::Registry;
+        let reg = Registry::builtins();
+        let km = cua_keymap();
+        let ex = CountingSwapExecutor::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        // A named doc so the swap file is per-path; deleted at the end.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let mut e = Editor::new_from_text("# H\n\nbody\n", Some(path.clone()), (80, 24));
+
+        // One edit → dirty, last_edit_at armed (reduce drains/applies its own job outcomes).
+        crate::app::reduce(press(KeyCode::Char('x'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &TestClock(0), &tx);
+        assert!(e.active().document.dirty(), "precondition: the edit made the buffer dirty");
+
+        // Five simulated minutes of idle: a Tick each second, clock advancing, no edits.
+        for sec in 1..=300u64 {
+            crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &km, &ex, &TestClock(sec * 1000), &tx);
+        }
+        crate::swap::delete(Some(&path)); // clean the state-dir swap file this test wrote
+
+        // Sanity: the swap machinery actually ran (a real 1, not a vacuous 0) …
+        assert!(e.active().last_swap_at.is_some(), "the buffer WAS checkpointed at least once");
+        // … and idle did not thrash it.
+        assert!(ex.swaps() <= 1,
+            "idle buffer thrashed the swap file: {} writes across 5 min idle after ONE edit \
+             (expected ≤ 1 — background recovery writes must scale with edits, not idle time)", ex.swaps());
+    }
+
+    /// Continuous editing for five simulated minutes: recovery MUST still checkpoint (no
+    /// data-loss window) but stay bounded to the max-cap cadence (~once / T_MAX), never
+    /// once-per-edit. Guards the opposite failure — a fix that over-suppresses and stops
+    /// swapping during long writing sessions.
+    #[test]
+    fn continuous_editing_checkpoints_but_stays_bounded() {
+        use crate::registry::Registry;
+        let reg = Registry::builtins();
+        let km = cua_keymap();
+        let ex = CountingSwapExecutor::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let mut e = Editor::new_from_text("start\n", Some(path.clone()), (80, 24));
+
+        // Realistic session: an edit, then a >2s pause so the first checkpoint lands (real writing
+        // pauses constantly — to read, to think, between sentences). This seeds last_swap_at.
+        crate::app::reduce(press(KeyCode::Char('a'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &TestClock(0), &tx);
+        crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &km, &ex, &TestClock(3_000), &tx); // 3s idle → first checkpoint
+        // Then edit every simulated second for five minutes — content genuinely changes each
+        // second, so the max-cap (T_MAX = 30s since the last checkpoint) is the correct cadence.
+        for sec in 4..=304u64 {
+            crate::app::reduce(press(KeyCode::Char('a'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &TestClock(sec * 1000), &tx);
+            crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &km, &ex, &TestClock(sec * 1000), &tx);
+        }
+        crate::swap::delete(Some(&path));
+
+        // 1 initial checkpoint + ~10 max-cap checkpoints (300s / 30s). Bounded (not ~300, one-per-edit) …
+        assert!(ex.swaps() <= 12,
+            "continuous editing wrote the swap file {} times in 5 min — expected the initial \
+             checkpoint plus the max-cap cadence (~1 / 30s ≈ 11 total), not one-per-edit", ex.swaps());
+        // … but recovery is NOT starved: a long writing session keeps getting checkpointed.
+        assert!(ex.swaps() >= 2, "a long editing session must keep checkpointing (durability), not swap only once");
+    }
+
+    /// After a save (which deletes the swap file), the swap latch must be cleared so a later edit
+    /// gets a FRESH swap — the latch means "this version's content is in the swap file", and saving
+    /// removes that file. Regression guard for the Codex pre-merge durability finding: a stale
+    /// latch must never suppress a needed recovery write.
+    #[test]
+    fn save_clears_the_swap_latch_so_later_edits_recheckpoint() {
+        use crate::registry::Registry;
+        let reg = Registry::builtins();
+        let km = cua_keymap();
+        let ex = CountingSwapExecutor::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let mut e = Editor::new_from_text("start\n", Some(path.clone()), (80, 24));
+
+        // Edit → idle → first checkpoint; the latch is now set.
+        crate::app::reduce(press(KeyCode::Char('x'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &TestClock(0), &tx);
+        crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &km, &ex, &TestClock(2_000), &tx);
+        assert_eq!(ex.swaps(), 1, "first edit is checkpointed");
+        assert!(e.active().swapped_version.is_some(), "latch set after the swap");
+
+        // Save → deletes the swap file, clears the latch, buffer becomes clean.
+        crate::app::reduce(press(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut e, &reg, &km, &ex, &TestClock(2_500), &tx);
+        assert!(!e.active().document.dirty(), "save made the buffer clean");
+        assert!(e.active().swapped_version.is_none(),
+            "save must clear the swap latch (the swap file it referenced was deleted)");
+
+        // Edit again → idle → a FRESH swap must be written, not suppressed by a stale latch.
+        crate::app::reduce(press(KeyCode::Char('y'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &TestClock(3_000), &tx);
+        crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &km, &ex, &TestClock(5_000), &tx);
+        crate::swap::delete(Some(&path));
+        assert_eq!(ex.swaps(), 2, "post-save edit must be re-checkpointed (latch was cleared)");
     }
 
     #[test]
