@@ -626,7 +626,8 @@ Chrome *fg*, re-pin it.
   in Task 5; the four brainstorm forks are baked into Tasks 3/4/6/1.
 - **Placeholders:** none. E5's pin RGB values are intentionally observed-then-pinned (regression pins for
   an intentional derivation change) — the acceptance test (ladder + dim) is the real TDD criterion and is
-  fully specified; the `ctors` list is explicitly flagged for cross-check against `builtin_names()`.
+  fully specified; it iterates `Theme::builtin_names()`/`Theme::builtin(name)` (no hand-maintained
+  constructor list), so it needs no per-name cross-check.
 - **Type consistency:** `right_justify_leaves`'s new 4-tuple signature is used consistently in
   `grouped_commands`, the palette push, and both updated tests. `menu_leaf_parts` returns
   `(String, Option<String>)`. `MenuMark::Value(&'static str)` → `.to_string()`.
