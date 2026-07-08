@@ -1,0 +1,19 @@
+pkgbase = wordcartel
+	pkgdesc = Markdown-first terminal word processor (wcartel) — optimized release-dist build
+	pkgver = 0.0.0.r1052.g2818f55
+	pkgrel = 1
+	url = https://github.com/jameskeim/wordcartel
+	arch = x86_64
+	license = MIT
+	depends = glibc
+	depends = gcc-libs
+	optdepends = wayland: native Wayland clipboard (dlopened at runtime)
+	optdepends = libxcb: native X11 clipboard (dlopened at runtime)
+	optdepends = libx11: native X11 clipboard (dlopened at runtime)
+	optdepends = wl-clipboard: wl-copy external clipboard provider (fallback chain)
+	optdepends = xclip: xclip external clipboard provider (fallback chain)
+	provides = wcartel
+	options = !strip
+	options = !debug
+
+pkgname = wordcartel

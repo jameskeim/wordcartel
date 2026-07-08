@@ -1,0 +1,51 @@
+# Maintainer: James Keim <email@jameskeim.com>
+#
+# Binary package for the optimized `release-dist` build of wordcartel (binary: wcartel).
+#
+# Why a binary package (not build-from-source): the crate has an out-of-repo path
+# dependency (../../par-command/repar) that lives outside this git tree, so it cannot be
+# built inside makepkg's sandboxed $srcdir. Instead, build the optimized binary once from
+# the full workspace, then package it:
+#
+#   cargo build --profile release-dist -p wordcartel --bin wcartel
+#   cd packaging/arch && makepkg -f
+#
+pkgname=wordcartel
+pkgver=0.0.0.r1052.g2818f55
+pkgrel=1
+pkgdesc='Markdown-first terminal word processor (wcartel) — optimized release-dist build'
+arch=('x86_64')
+url='https://github.com/jameskeim/wordcartel'
+license=('MIT')
+depends=('glibc' 'gcc-libs')
+optdepends=(
+  'wayland: native Wayland clipboard (dlopened at runtime)'
+  'libxcb: native X11 clipboard (dlopened at runtime)'
+  'libx11: native X11 clipboard (dlopened at runtime)'
+  'wl-clipboard: wl-copy external clipboard provider (fallback chain)'
+  'xclip: xclip external clipboard provider (fallback chain)'
+)
+provides=('wcartel')
+# The release-dist profile already strips the binary; skip makepkg's strip/debug stages.
+options=('!strip' '!debug')
+
+# Absolute path to the workspace root (this PKGBUILD lives in packaging/arch/).
+_root() { realpath "$startdir/../.."; }
+
+pkgver() {
+  local root; root="$(_root)"
+  cd "$root"
+  printf '0.0.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+package() {
+  local root; root="$(_root)"
+  local bin="$root/target/release-dist/wcartel"
+  if [[ ! -x "$bin" ]]; then
+    error 'release-dist binary not found: %s' "$bin"
+    plainerror 'Build it first: cargo build --profile release-dist -p wordcartel --bin wcartel'
+    return 1
+  fi
+  install -Dm755 "$bin" "$pkgdir/usr/bin/wcartel"
+  install -Dm644 "$root/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

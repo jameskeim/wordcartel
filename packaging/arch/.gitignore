@@ -1,0 +1,6 @@
+# makepkg build artifacts — keep only PKGBUILD and .SRCINFO under version control
+pkg/
+src/
+*.pkg.tar.zst
+*.pkg.tar.*
+*.log
