@@ -375,8 +375,14 @@ assertion that no-color / terminal-plain / terminal-ansi `Chrome` faces carry `d
   assertion (`:1731`).
 - Standalone Chrome-fg pins — the spec's original list `:1854` (tokyo FULL), `:1917` (flexoki-dark),
   `:1930` (flexoki-light) **plus the three Codex found**: `:1941` (zen pin), `:2003` (phosphor pin),
-  `:2056` (synthetic light pin). `ChromeOverlay` fg pins (`:1858`, etc.) stay `base_fg` — confirmed
-  unchanged (overlay still `derive_fg(base_fg,bg)` at `:323`).
+  `:2056` (synthetic light pin). Note (Codex): most of these currently equal that theme's `base_fg`
+  because `derive_fg` passed it through unchanged, BUT `:2056` already carries a **floor-nudged** value
+  `#606060` (its base_fg is `#e0e0e0`, which failed the floor on that panel so `derive_fg` nudged it
+  toward black) — it is NOT `base_fg`. All of these are re-pinned regardless: E5 changes the seed
+  (`blend` then `derive_fg`), so every Chrome-fg pin gets a new value whether or not it equaled `base_fg`
+  before. Do NOT assume "equals base_fg" as the re-pin trigger — the trigger is simply "it's a Chrome-fg
+  pin." `ChromeOverlay` fg pins (`:1858`, etc.) stay `base_fg`-derived — confirmed unchanged (overlay
+  still `derive_fg(base_fg,bg)` at `:323`).
 - Grep for any other exact Chrome-fg assertion (blue-jeans `exemplar_spot_pins_blue_jeans`, any
   `derive_chrome_zen_*`) and re-pin only the Chrome fg — the grep is authoritative; the enumerated
   line numbers are a floor, not a ceiling.
