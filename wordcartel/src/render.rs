@@ -2381,7 +2381,8 @@ mod tests {
         ed.open_theme_picker();
         let buf = render_to_buffer(&mut ed, 60, 16);
         let text: String = (0..16).map(|r| row_string(&buf, r)).collect();
-        assert!(text.contains("tokyo-night"), "picker lists built-in themes");
+        // Rows are alphabetized; catppuccin-latte sorts first, so it is visible at the top.
+        assert!(text.contains("catppuccin-latte"), "picker lists built-in themes (alphabetized)");
     }
 
     // -----------------------------------------------------------------------

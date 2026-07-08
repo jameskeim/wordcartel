@@ -7,3 +7,19 @@ all = "deny"
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+# Distribution profile: slow to build, fastest to run. Inherits the stock
+# `release` profile (opt-level 3) and layers whole-program optimization on top.
+# `release` itself is left untouched so `cargo test --release`, the smoke suite,
+# and the release benches keep their fast incremental compile.
+#   Build with: cargo build --profile release-dist -p wordcartel --bin wcartel
+# panic = "unwind" is kept DELIBERATELY: the shell's panic isolation
+# (worker-panic catch_unwind, panic -> restore -> recovery-dump) requires
+# unwinding. panic = "abort" would silently defeat it and turn a recoverable
+# worker panic into a process kill with data loss — never set it here.
+[profile.release-dist]
+inherits = "release"
+lto = "fat"           # whole-program cross-crate inlining/DCE
+codegen-units = 1     # one unit — best optimization, no parallelism at link
+panic = "unwind"      # REQUIRED — see note above; do not change to "abort"
+strip = true          # drop symbols; smaller binary (backtraces still name-mangled)

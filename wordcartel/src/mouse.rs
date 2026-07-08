@@ -1276,8 +1276,11 @@ mod tests {
         let mut e = Editor::new_from_text("# H\n\n", None, (80, 24));
         crate::derive::rebuild(&mut e);
         e.open_theme_picker();
-        let names = wordcartel_core::theme::Theme::builtin_names();
-        let target = names.iter().position(|n| *n == "tokyo-night").unwrap();
+        // Rows are displayed alphabetically; locate the target in the DISPLAYED rows (not the
+        // registration order) and pick one inside the initial 15-row window. forever-blue-jeans-dark
+        // sorts near the top, so it is visible at scroll_top 0.
+        let target = e.theme_picker.as_ref().unwrap().rows.iter()
+            .position(|n| n == "forever-blue-jeans-dark").unwrap();
         let area = ratatui::layout::Rect::new(0, 0, 80, 24);
         let rect = crate::render::palette_overlay_rect(area, e.theme_picker.as_ref().unwrap().rows.len());
         let click_row = rect.y + 2 + target as u16; // list starts ov_y+2 (scroll_top 0)
@@ -1285,7 +1288,7 @@ mod tests {
         let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };
         handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
         assert!(e.theme_picker.is_none(), "picker closes on row click");
-        assert_eq!(e.theme.name, "tokyo-night", "clicked theme applied");
+        assert_eq!(e.theme.name, "forever-blue-jeans-dark", "clicked theme applied");
     }
 
     /// A click outside the theme-picker overlay closes it and restores the original theme.
