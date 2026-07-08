@@ -39,6 +39,40 @@ thread_local! {
     pub static LAYOUT_RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Counts `outline::heading_starts` reconcile walks in `rebuild_downstream`. A
+    /// no-folds keystroke must not increment this (R1 invariant guard).
+    pub static HEADING_STARTS_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// R1 typing-latency bench instrumentation (test-only). Fine-grained phase spans
+/// recorded at the hot lines in `rebuild`/`rebuild_downstream` (`parse`,
+/// `heading_starts`, `foldview`, `layout_fill`), drained per keystroke by the
+/// `e2e_bench` harness. STRICTLY `#[cfg(test)]` — the recording calls and their
+/// `Instant::now()` timers are cfg'd out entirely, so production/release builds
+/// carry ZERO cost from this module.
+#[cfg(test)]
+pub(crate) mod bench_spans {
+    use std::cell::RefCell;
+    use std::time::Duration;
+
+    thread_local! {
+        pub static PHASE_SPANS: RefCell<Vec<(&'static str, Duration)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    /// Append one phase span for the current keystroke/tick.
+    pub(crate) fn record(label: &'static str, dur: Duration) {
+        PHASE_SPANS.with(|s| s.borrow_mut().push((label, dur)));
+    }
+
+    /// Take and clear all spans recorded since the last drain.
+    pub(crate) fn drain() -> Vec<(&'static str, Duration)> {
+        PHASE_SPANS.with(|s| s.borrow_mut().drain(..).collect())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Logical-line helpers
 // ---------------------------------------------------------------------------
@@ -129,6 +163,8 @@ pub fn rebuild(editor: &mut Editor) {
 
     // Parse phase: only when the text actually changed since the tree was built.
     if version != blocks_version {
+        #[cfg(test)]
+        let bench_parse_t0 = std::time::Instant::now();
         let new_rope = editor.active().document.buffer.snapshot(); // O(1) ropey clone
         let new_len = new_rope.len_bytes();
         let maybe_old_rope = editor.active_mut().pre_edit_rope.take();
@@ -175,6 +211,8 @@ pub fn rebuild(editor: &mut Editor) {
         editor.active_mut().document.set_blocks(new_blocks);
         editor.active_mut().reconcile.blocks_version = version;
         editor.active_mut().reconcile.maybe_stale = stale;
+        #[cfg(test)]
+        crate::derive::bench_spans::record("parse", bench_parse_t0.elapsed());
     }
 
     rebuild_downstream(editor);
@@ -204,16 +242,28 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
     // compute heading starts under an immutable borrow, then retain.
     {
         let gen = editor.active().document.blocks_generation();
-        if editor.active().last_reconciled_generation != Some(gen) {
+        if !editor.active().folds.is_empty()
+            && editor.active().last_reconciled_generation != Some(gen)
+        {
+            #[cfg(test)]
+            HEADING_STARTS_WALKS.with(|c| c.set(c.get() + 1));
+            #[cfg(test)]
+            let bench_hs_t0 = std::time::Instant::now();
             let starts = {
                 let b = editor.active();
                 wordcartel_core::outline::heading_starts(b.document.blocks(), &b.document.buffer.snapshot())
             };
+            #[cfg(test)]
+            crate::derive::bench_spans::record("heading_starts", bench_hs_t0.elapsed());
             editor.active_mut().folds.reconcile_to(&starts);
             editor.active_mut().last_reconciled_generation = Some(gen);
         }
     }
+    #[cfg(test)]
+    let bench_fv_t0 = std::time::Instant::now();
     let fold_view = editor.active_fold_view();
+    #[cfg(test)]
+    crate::derive::bench_spans::record("foldview", bench_fv_t0.elapsed());
 
     // ------------------------------------------------------------------
     // 2. Visible range
@@ -261,6 +311,8 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
         return; // line_layouts already valid for this key — skip the pass
     }
 
+    #[cfg(test)]
+    let bench_lf_t0 = std::time::Instant::now();
     let mut visual_rows_accumulated: usize = 0;
     let overscan_budget = area_height.saturating_add(scroll_row).saturating_add(1);
 
@@ -286,6 +338,8 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
         l = fold_view.next_visible(l).unwrap_or(total_lines);
     }
     editor.active_mut().layout_key = Some(key);
+    #[cfg(test)]
+    crate::derive::bench_spans::record("layout_fill", bench_lf_t0.elapsed());
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +382,37 @@ mod tests {
     use super::*;
     use crate::editor::Editor;
     use wordcartel_core::style::BlockRole;
+
+    // ------------------------------------------------------------------
+    // R1 Task 2: no-folds fast path — skip the heading-starts reconcile walk
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn no_folds_downstream_skips_heading_starts_walk() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("# H1\n\npara\n\n## H2\n\nbody\n", None, (80, 24));
+        crate::derive::rebuild(&mut e); // settle: last_reconciled_generation == current gen
+        // Simulate a keystroke's tree bump WITHOUT reparsing: re-set the same blocks so
+        // blocks_generation advances (set_blocks bumps unconditionally), reopening the gate.
+        let tree = e.active().document.blocks().clone();
+        e.active_mut().document.set_blocks(tree);
+        HEADING_STARTS_WALKS.with(|c| c.set(0));
+        crate::derive::rebuild_downstream(&mut e);
+        assert_eq!(HEADING_STARTS_WALKS.with(|c| c.get()), 0, "no folds → no reconcile walk");
+    }
+
+    #[test]
+    fn folds_active_downstream_runs_heading_starts_walk() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("# H1\n\npara\n\n## H2\n\nbody\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.active_mut().folds.toggle(0); // fold H1 (FoldState::toggle, fold.rs:34)
+        let tree = e.active().document.blocks().clone();
+        e.active_mut().document.set_blocks(tree);
+        HEADING_STARTS_WALKS.with(|c| c.set(0));
+        crate::derive::rebuild_downstream(&mut e);
+        assert!(HEADING_STARTS_WALKS.with(|c| c.get()) >= 1, "folds active → the walk DOES run");
+    }
 
     // ------------------------------------------------------------------
     // Task 2: version-memoized two-phase rebuild

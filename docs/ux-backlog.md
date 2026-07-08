@@ -873,6 +873,45 @@ height; `ensure_visible` at `nav.rs:436` subtracts `1 + menu_bar_rows`) and `Lay
 **Recommended sequencing:** before Effort P — the plugin system only adds hot-path pressure, and a
 latency probe is worth having in place before then.
 
+**ADDENDUM 2026-07-07 (independent re-confirmation + two new mechanisms).** A fresh multi-agent
+code-map of the per-keystroke path (5 module mappers + synthesis) independently re-derived T4 and it
+was verified against the CURRENT source (line numbers have drifted since `86db660`): the two
+whole-document walks now live at `derive.rs:208-211` (`heading_starts`) and `derive.rs:216`
+(`active_fold_view` → `outline::sections`), both still gated on `blocks_generation` which
+`Editor::set_blocks` bumps every edit (`editor.rs:91-93`) → the memoization is defeated on every
+keystroke. Confirmed as a real O(document) per-keystroke tax, worst in large/heading-dense docs — the
+"all three symptoms" baseline. Two mechanisms the earlier record did NOT isolate:
+- **Reconcile debounce mistiming (NEW — but MEASUREMENT DOWNGRADED it).** The reconcile debounce is
+  **150 ms** (`reconcile.rs:10`), shorter than a ~180 ms/key cadence, so it fires between keystrokes.
+  The code-read feared a main-thread O(document) hitch — but the bench REFUTES that for production: with
+  the real threaded `Executor`, `full_parse_rope` runs off-thread and the merge Tick stays **flat
+  ~78–146 µs** vs N (the tree-eq compare short-circuits / is cheap). The O(document) ~3.7 ms@1M cost
+  appears ONLY on the `InlineExecutor` (test-seam) path. Net: **not a production hot-path problem**;
+  deprioritized. (Retiming the debounce above cadence is still a cheap tidy-up, not a fix.)
+- **Block-tree widen/gap-materialization (NEW — the paragraph-end spike).** An Enter/blank-line near an
+  absorptive container (list/quote/indented-code) far upstream makes the incremental update materialize
+  the inter-block gap line-by-line (`block_tree.rs:719-723`) or `WidenToEnd` to EOF (`:875`) — O(document)
+  on that single structural keystroke. Pins symptom 2 (paragraph endings) to a concrete mechanism rather
+  than "lag downstream of T4."
+
+**QUANTIFIED (burst-based bench, 2026-07-07, branch `effort-r1-typing-latency`, `6669e73`; release, e2e
+seam, N×structure×edit-class, p99 log-log slope vs N).** The O(document) bug is CONFIRMED — and the model
+sharpened: the walks are linear in **block/heading COUNT, not raw bytes**, so the clean linear slope shows
+on **heading-dense (`heading_starts` 0.99 / `foldview` 1.03), nested-list (1.33 / 1.20), code-heavy (1.31 /
+1.31)** — and reads FLAT on flat-prose (few big blocks) and giant-table (1 block) at the µs floor. The walk
+fired on **200/200 Input frames** (memoization defeat proven directly). **Positive control HELD:**
+`layout_fill` (0.05–0.14; ~300 µs, the largest phase, correctly O(visible)) and `render` (0.02–0.10) are
+flat — the harness is valid. `parse` is linear on nested-list (0.87) / giant-table (0.93) — the
+paragraph-end widen/gap finding, confirmed. **Bounding caveat:** at ≤1 MB NO cell breaches the 8 ms (120 Hz)
+budget (worst total p99 ~6.3 ms @1M giant-table), so this is a **scaling risk + burst-backlog contributor**
+(per-keystroke cost stacking faster than 16 ms frames drain, given no input coalescing), not a single-key
+stall at present doc sizes. Raw CSV + slope table in `.superpowers/sdd/r1-bench{.csv,-slopes.md}` (gitignored).
+
+**Cross-reference (2026-07-07 fuzz sweep):** `block_tree.rs`'s incremental machinery is a shared hotspot —
+it underlies both R1's paragraph-end widen cost AND the still-open incremental≡full soundness divergences
+(a ~43 M-exec sweep re-found the latter with fresh minimized repros in `fuzz/artifacts/block_tree/`; that
+same sweep found **no** pulldown-cmark panic, so the M4-rest `catch_unwind` isolation is belt-and-suspenders).
+
 ## Theme S — manuscript structure (the "TUI corkboard")
 
 **Origin:** 2026-07-07 design chat, prompted by the beloved-features report

@@ -1284,6 +1284,16 @@ pub(crate) fn advance(editor: &mut Editor, clock: &dyn Clock) {
     }
 }
 
+/// Prepare the editor for the FIRST frame drawn OUTSIDE the reduce loop (startup /
+/// session-resume): pin the caret's viewport, then rebuild so the layout cache matches
+/// the possibly-moved scroll. The reduce loop's `advance` does this per keystroke; the
+/// one-off startup draw must call this or the first frame can render a stale range (T5).
+pub(crate) fn first_frame_settle(editor: &mut Editor) {
+    crate::nav::ensure_visible(editor);
+    derive::rebuild(editor); // T5: refresh the layout cache for the (possibly moved) scroll.
+                             // LayoutKey-gated → a cheap no-op when scroll did not move.
+}
+
 // ---------------------------------------------------------------------------
 // run — the real terminal loop; terminal IO lives entirely here
 // ---------------------------------------------------------------------------
@@ -1586,7 +1596,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
                 wordcartel_core::selection::Selection::single(nh);
         }
     }
-    crate::nav::ensure_visible(&mut editor);
+    first_frame_settle(&mut editor);
     guard.terminal().draw(|f| render::render(f, &mut editor))?;
     let mut exit_reason = ExitReason::Normal;
     loop {
@@ -5343,5 +5353,27 @@ mod tests {
         // Dark canvas arm: Chrome bg must be DarkGray (fixed table), not a quantized derived value.
         assert_eq!(chrome_bg, Some(Color::DarkGray),
             "Ansi16 preview must apply sentinel-fill policy: Chrome bg = DarkGray, got {chrome_bg:?}");
+    }
+
+    #[test]
+    fn first_frame_settle_refreshes_layout_for_offscreen_caret() {
+        use crate::editor::Editor;
+        // A doc taller than the 10-row viewport; caret near the end, scroll pinned at top.
+        let src = "line\n".repeat(200);
+        let mut e = Editor::new_from_text(&src, None, (80, 10));
+        let caret = e.active().document.buffer.len().saturating_sub(1);
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(caret);
+        // BytePos is `pub type BytePos = usize` (lib.rs:29), so `caret` (usize) is passed directly.
+        e.active_mut().view.scroll = 0;
+        e.active_mut().view.scroll_row = 0;
+        crate::derive::rebuild(&mut e); // builds layout for scroll = 0
+        crate::app::first_frame_settle(&mut e); // ensure_visible + rebuild — the T5 unit under test
+        let scroll_after = e.active().view.scroll;
+        assert!(scroll_after > 0, "precondition: ensure_visible moved the viewport");
+        assert_eq!(
+            e.active().layout_key.as_ref().map(|k| k.scroll),
+            Some(scroll_after),
+            "layout cache must be rebuilt for the post-ensure_visible scroll (T5)"
+        );
     }
 }
