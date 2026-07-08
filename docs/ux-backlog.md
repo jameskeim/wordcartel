@@ -14,6 +14,10 @@ bundled-themes research.
 (direction sketched, forks remain) · `available-today` (config-only, no code) ·
 `fact-checked` (behavior pinned) · `dropped` (decided against, trigger recorded).
 
+**Related:** engineering-health / architecture-debt triage (module size, dependency weight,
+incremental-parser posture) lives in [`docs/engineering-health.md`](engineering-health.md)
+(2026-07-07 whole-app eval) — that is the home for non-UX structural work.
+
 ---
 
 ## Governing principle — the command-surface contract
