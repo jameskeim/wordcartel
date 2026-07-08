@@ -228,10 +228,12 @@ impl Theme {
     /// zen. The persistent bar (Chrome) and the dropdown (ChromeMuted) are two elevated tones;
     /// the modal overlay SHARES the dropdown tone (`ChromeOverlay.bg == ChromeMuted.bg`) rather than
     /// growing a third layer, so the stack is `canvas < bar < dropdown == overlay` by construction.
-    /// Each chrome fg is re-derived via a legibility floor (`FG_FLOOR`, pole-capped): the body-text
-    /// color is kept when it already clears the floor, else nudged toward the headroom pole. The
-    /// overlay fg is derived from `base_fg` (readable primary text), distinct from the dropdown's
-    /// dim `MUTED_FG_BLEND` fg, so the two shared-bg panels still differ in foreground.
+    /// Each chrome fg is re-derived via a legibility floor (`FG_FLOOR`, pole-capped): a seed color is
+    /// kept when it already clears the floor, else nudged toward the headroom pole. The bar (Chrome) fg
+    /// additionally recedes below body text — its seed is `blend(base_fg, canvas, CHROME_BAR_FG_BLEND)`
+    /// plus a DIM modifier (E5) — so the bars read as chrome, not content. The overlay fg is derived
+    /// straight from `base_fg` (readable primary text), distinct from the dropdown's dim
+    /// `MUTED_FG_BLEND` fg, so the two shared-bg panels still differ in foreground.
     ///
     /// Early-returns without change if either base is not `Color::Rgb`. Callers should call on a
     /// fresh theme instance before applying user overrides (resolve order: base → derive → styles).
