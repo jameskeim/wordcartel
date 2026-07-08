@@ -173,6 +173,9 @@ impl Theme {
             "rosepine-dawn"     => Some(rosepine_dawn()),
             "solarized-dark"    => Some(solarized_dark()),
             "solarized-light"   => Some(solarized_light()),
+            "forever-blue-jeans-dark"  => Some(blue_jeans_dark()),
+            "forever-blue-jeans-dusk"  => Some(blue_jeans_dusk()),
+            "forever-blue-jeans-paper" => Some(blue_jeans_paper()),
             _ => {
                 // "phosphor-<hue>" — flat suffix removed (D4); resolve layer maps stale aliases (T3).
                 let rest = name.strip_prefix("phosphor-")?;
@@ -182,7 +185,9 @@ impl Theme {
         }
     }
     pub fn builtin_names() -> &'static [&'static str] {
-        // D5 order: terminal variants → no-color → tokyo → phosphors → 10 E4 themes
+        // Registration order (NOT display order — the theme picker sorts rows alphabetically):
+        // D5 order → 10 E4 themes → the Blue Jeans family. Kept append-only so index-based
+        // callers/tests stay stable; user-facing ordering lives in theme_picker::rebuild_rows.
         &[
             "terminal-plain", "terminal-ansi", "no-color", "tokyo-night",
             "phosphor-green", "phosphor-amber", "phosphor-red", "phosphor-blue", "phosphor-purple",
@@ -191,6 +196,7 @@ impl Theme {
             "gruvbox-dark",  "gruvbox-light",
             "rosepine-moon", "rosepine-dawn",
             "solarized-dark", "solarized-light",
+            "forever-blue-jeans-dark", "forever-blue-jeans-dusk", "forever-blue-jeans-paper",
         ]
     }
 
@@ -714,6 +720,116 @@ pub fn solarized_light() -> Theme {
     ], extra: None })
 }
 
+// ── Blue Jeans family — three hand-authored variants (faded denim / brass / leather / cotton) ──
+// Source: James Keim's "Blue Jeans" theme package (palette + markdown role map). Unlike the ten
+// base16 bundles, these honor the designer's EXACT markdown role→color map (brass H1, leather H2,
+// denim links, brass list markers, boxed code) rather than the base16 hue rainbow. Chrome is
+// all-sentinel — `derive_chrome` builds the panel/menu ladder from `base_bg`/`base_fg` as usual.
+
+/// Final per-role colors for one Blue Jeans variant. Fields are the resolved foreground (or
+/// highlight-bg) each semantic role paints — already ADAPTED per variant, so the builder below is
+/// purely mechanical. The paper (light) variant substitutes readable dark accents for the roles the
+/// dark CSS assigned to a light neutral (canvas): `emphasis`, `heading[3]` (H4), and `block_quote`.
+struct BjRoles {
+    bg: Color, fg: Color,
+    heading: [Color; 6],
+    emphasis: Color, strong: Color, strong_emphasis: Color,
+    code_fg: Color, code_bg: Color, code_block_fg: Color, code_block_bg: Color,
+    link: Color, strike: Color, block_quote: Color,
+    list_marker: Color, thematic_break: Color, front_matter: Color, comment: Color,
+    selection_bg: Color, mark_bg: Color, search_bg: Color,
+    diag_spell: Color, diag_grammar: Color, focus_dim: Color, fold_marker: Color, wrap_guide: Color,
+}
+
+/// Build a Blue Jeans variant from its resolved role colors. Every fg-required role carries an
+/// explicit fg (Part B completeness); Text stays empty; chrome faces are sentinels for derivation.
+fn blue_jeans(name: &str, r: BjRoles) -> Theme {
+    let h = |c: Color| Face { fg: Some(c), bold: Some(true), ..Face::default() };
+    Theme {
+        name: name.into(),
+        base_fg: r.fg, base_bg: r.bg,
+        heading_level_glyph: true, monochrome: false,
+        faces: ThemeFaces {
+            text: Face::default(),
+            emphasis: Face { fg: Some(r.emphasis), italic: Some(true), ..Face::default() },
+            strong: Face { fg: Some(r.strong), bold: Some(true), ..Face::default() },
+            strong_emphasis: Face { fg: Some(r.strong_emphasis), bold: Some(true), italic: Some(true), ..Face::default() },
+            // Inline code keeps the designed "boxed" look: cotton/denim fg on a raised-surface bg.
+            code: Face { fg: Some(r.code_fg), bg: Some(r.code_bg), ..Face::default() },
+            strikethrough: Face { fg: Some(r.strike), strike: Some(true), ..Face::default() },
+            link: Face { fg: Some(r.link), underline: Some(true), ..Face::default() },
+            heading: [h(r.heading[0]), h(r.heading[1]), h(r.heading[2]), h(r.heading[3]), h(r.heading[4]), h(r.heading[5])],
+            block_quote: Face { fg: Some(r.block_quote), italic: Some(true), ..Face::default() },
+            code_block: Face { fg: Some(r.code_block_fg), bg: Some(r.code_block_bg), ..Face::default() },
+            list_marker: Face { fg: Some(r.list_marker), ..Face::default() },
+            thematic_break: Face { fg: Some(r.thematic_break), ..Face::default() },
+            front_matter: Face { fg: Some(r.front_matter), italic: Some(true), ..Face::default() },
+            comment: Face { fg: Some(r.comment), italic: Some(true), dim: Some(true), ..Face::default() },
+            selection: Face { bg: Some(r.selection_bg), ..Face::default() },
+            // §13.2 marked block: warm mark-bg + reverse+bold+underline (distinct from selection).
+            marked_block: Face { bg: Some(r.mark_bg), reverse: Some(true), bold: Some(true), underline: Some(true), ..Face::default() },
+            search_match: Face { bg: Some(r.search_bg), fg: Some(r.bg), ..Face::default() },
+            search_current: Face { reverse: Some(true), ..Face::default() },
+            diag_spelling: Face { underline: Some(true), underline_color: Some(r.diag_spell), ..Face::default() },
+            diag_grammar:  Face { underline: Some(true), underline_color: Some(r.diag_grammar), ..Face::default() },
+            focus_dim: Face { fg: Some(r.focus_dim), dim: Some(true), ..Face::default() },
+            fold_marker: Face { fg: Some(r.fold_marker), ..Face::default() },
+            wrap_guide: Face { fg: Some(r.wrap_guide), ..Face::default() },
+            // chrome/selected/muted/overlay/accent: all-None sentinels — derive_chrome fills them.
+            chrome: Face::default(),
+            chrome_reverse: Face { reverse: Some(true), ..Face::default() },
+            chrome_selected: Face::default(),
+            chrome_muted: Face::default(),
+            chrome_overlay: Face::default(),
+            chrome_accent: Face::default(),
+        },
+    }
+}
+
+/// Blue Jeans Dark — deep worn indigo, warm cotton text, brass/leather accents.
+pub fn blue_jeans_dark() -> Theme {
+    blue_jeans("forever-blue-jeans-dark", BjRoles {
+        bg: rgb(0x20,0x28,0x33), fg: rgb(0xF2,0xE9,0xDA),
+        heading: [rgb(0xC7,0x9A,0x44), rgb(0xA1,0x75,0x4E), rgb(0x8C,0xA4,0xBF), rgb(0xD5,0xCA,0xB7), rgb(0xD5,0xB0,0x5C), rgb(0xB3,0xAA,0xA0)],
+        emphasis: rgb(0xD5,0xCA,0xB7), strong: rgb(0xFA,0xF7,0xF2), strong_emphasis: rgb(0xFA,0xF7,0xF2),
+        code_fg: rgb(0xFA,0xF7,0xF2), code_bg: rgb(0x2B,0x35,0x42), code_block_fg: rgb(0xF2,0xE9,0xDA), code_block_bg: rgb(0x24,0x2D,0x38),
+        link: rgb(0x8C,0xA4,0xBF), strike: rgb(0x87,0x91,0x9D), block_quote: rgb(0xD5,0xCA,0xB7),
+        list_marker: rgb(0xC7,0x9A,0x44), thematic_break: rgb(0x3A,0x46,0x54), front_matter: rgb(0xA0,0x8A,0xAD), comment: rgb(0x87,0x91,0x9D),
+        selection_bg: rgb(0x3A,0x4D,0x62), mark_bg: rgb(0xD5,0xB0,0x5C), search_bg: rgb(0xD5,0xB0,0x5C),
+        diag_spell: rgb(0xE0,0x6C,0x63), diag_grammar: rgb(0x7A,0xA9,0xBA), focus_dim: rgb(0x87,0x91,0x9D), fold_marker: rgb(0x87,0x91,0x9D), wrap_guide: rgb(0x3A,0x46,0x54),
+    })
+}
+
+/// Blue Jeans Dusk — softer evening denim, lower-glare surfaces for long sessions.
+pub fn blue_jeans_dusk() -> Theme {
+    blue_jeans("forever-blue-jeans-dusk", BjRoles {
+        bg: rgb(0x29,0x32,0x40), fg: rgb(0xEF,0xE4,0xD3),
+        heading: [rgb(0xD0,0xA2,0x53), rgb(0xB1,0x80,0x58), rgb(0x9C,0xB3,0xCB), rgb(0xDC,0xCF,0xB9), rgb(0xDD,0xBB,0x6B), rgb(0xBE,0xB2,0xA2)],
+        emphasis: rgb(0xDC,0xCF,0xB9), strong: rgb(0xFA,0xF4,0xEA), strong_emphasis: rgb(0xFA,0xF4,0xEA),
+        code_fg: rgb(0xFA,0xF4,0xEA), code_bg: rgb(0x37,0x43,0x53), code_block_fg: rgb(0xEF,0xE4,0xD3), code_block_bg: rgb(0x30,0x3A,0x49),
+        link: rgb(0x9C,0xB3,0xCB), strike: rgb(0x96,0xA0,0xAA), block_quote: rgb(0xDC,0xCF,0xB9),
+        list_marker: rgb(0xD0,0xA2,0x53), thematic_break: rgb(0x47,0x54,0x66), front_matter: rgb(0xAB,0x95,0xB8), comment: rgb(0x96,0xA0,0xAA),
+        selection_bg: rgb(0x48,0x5D,0x72), mark_bg: rgb(0xDD,0xBB,0x6B), search_bg: rgb(0xDD,0xBB,0x6B),
+        diag_spell: rgb(0xE8,0x83,0x79), diag_grammar: rgb(0x88,0xB3,0xC3), focus_dim: rgb(0x96,0xA0,0xAA), fold_marker: rgb(0x96,0xA0,0xAA), wrap_guide: rgb(0x47,0x54,0x66),
+    })
+}
+
+/// Blue Jeans Paper — cream paper, denim text, warm ledger borders, brass headings.
+/// Light variant: `emphasis`/H4/`block_quote` use readable dark accents (leather/river/denim)
+/// where the dark CSS used the light `canvas` neutral — which would be near-invisible on cream.
+pub fn blue_jeans_paper() -> Theme {
+    blue_jeans("forever-blue-jeans-paper", BjRoles {
+        bg: rgb(0xF2,0xE9,0xDA), fg: rgb(0x26,0x32,0x40),
+        heading: [rgb(0x7E,0x57,0x0F), rgb(0x67,0x47,0x2D), rgb(0x36,0x5F,0x85), rgb(0x39,0x70,0x83), rgb(0x8F,0x66,0x1E), rgb(0x5F,0x5A,0x54)],
+        emphasis: rgb(0x67,0x47,0x2D), strong: rgb(0x17,0x21,0x2D), strong_emphasis: rgb(0x17,0x21,0x2D),
+        code_fg: rgb(0x22,0x3B,0x56), code_bg: rgb(0xDD,0xD0,0xBB), code_block_fg: rgb(0x26,0x32,0x40), code_block_bg: rgb(0xE8,0xDD,0xCB),
+        link: rgb(0x36,0x5F,0x85), strike: rgb(0x65,0x5F,0x57), block_quote: rgb(0x2F,0x57,0x7D),
+        list_marker: rgb(0x7E,0x57,0x0F), thematic_break: rgb(0xC9,0xBD,0xAA), front_matter: rgb(0x66,0x50,0x7B), comment: rgb(0x65,0x5F,0x57),
+        selection_bg: rgb(0xD1,0xDB,0xE5), mark_bg: rgb(0x8F,0x66,0x1E), search_bg: rgb(0x8F,0x66,0x1E),
+        diag_spell: rgb(0x8F,0x2F,0x2B), diag_grammar: rgb(0x39,0x70,0x83), focus_dim: rgb(0x65,0x5F,0x57), fold_marker: rgb(0x65,0x5F,0x57), wrap_guide: rgb(0xC9,0xBD,0xAA),
+    })
+}
+
 /// A base16 (or base24) palette: 16 canonical slots, optional 8 extra (base10..base17).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BasePalette {
@@ -1136,16 +1252,44 @@ mod tests {
         assert_eq!(t.face(SemanticElement::ChromeMuted), Face::default(), "muted sentinel pre-derive");
     }
     #[test]
-    fn builtin_names_final_nineteen() {
-        // Every name resolves; every face is total; count is exactly 19; no -flat names.
+    fn builtin_names_registry_total() {
+        // Every name resolves; every face is total; count is exactly 22 (19 + Blue Jeans ×3);
+        // no -flat names. Registration head is stable (index-based callers rely on it).
         for name in Theme::builtin_names() {
             let t = Theme::builtin(name).expect(name);
             for el in ALL_ELEMENTS { let _ = t.face(el); }
         }
-        assert_eq!(Theme::builtin_names().len(), 19);
+        assert_eq!(Theme::builtin_names().len(), 22);
         assert_eq!(Theme::builtin_names()[0], "terminal-plain"); // D5 first entry
         assert_eq!(Theme::builtin_names()[1], "terminal-ansi");  // D5 second entry
         assert!(!Theme::builtin_names().iter().any(|n| n.contains("-flat")), "no flat variants");
+        // Blue Jeans family present and resolvable.
+        for n in ["forever-blue-jeans-dark", "forever-blue-jeans-dusk", "forever-blue-jeans-paper"] {
+            assert!(Theme::builtin_names().contains(&n), "missing builtin {n}");
+        }
+    }
+
+    #[test]
+    fn exemplar_spot_pins_blue_jeans() {
+        // Blue Jeans honors the designer's markdown role map (NOT the base16 rainbow):
+        // dark H1 = brass, H2 = leather, links = denim-soft; list marker = brass. Inline code is
+        // "boxed" (fg + raised-surface bg). Paper (light) adapts the canvas-neutral roles.
+        let d = blue_jeans_dark();
+        assert_eq!(d.base_bg, rgb(0x20, 0x28, 0x33), "dark base_bg = background");
+        assert_eq!(d.base_fg, rgb(0xF2, 0xE9, 0xDA), "dark base_fg = foreground");
+        assert_eq!(d.face(SemanticElement::Heading(1)).fg, Some(rgb(0xC7, 0x9A, 0x44)), "dark H1 = brass");
+        assert_eq!(d.face(SemanticElement::Heading(1)).bold, Some(true), "dark H1 bold");
+        assert_eq!(d.face(SemanticElement::Heading(2)).fg, Some(rgb(0xA1, 0x75, 0x4E)), "dark H2 = leather");
+        assert_eq!(d.face(SemanticElement::Link).fg, Some(rgb(0x8C, 0xA4, 0xBF)), "dark link = denim-soft");
+        assert_eq!(d.face(SemanticElement::ListMarker).fg, Some(rgb(0xC7, 0x9A, 0x44)), "dark list marker = brass");
+        let code = d.face(SemanticElement::Code);
+        assert_eq!(code.fg, Some(rgb(0xFA, 0xF7, 0xF2)), "dark inline code fg = cotton");
+        assert_eq!(code.bg, Some(rgb(0x2B, 0x35, 0x42)), "dark inline code bg = raised surface (boxed)");
+        // Paper is a light theme; its canvas-neutral roles are adapted to readable dark accents.
+        let p = blue_jeans_paper();
+        assert_eq!(p.base_bg, rgb(0xF2, 0xE9, 0xDA), "paper base_bg = cream");
+        assert_eq!(p.face(SemanticElement::Emphasis).fg, Some(rgb(0x67, 0x47, 0x2D)), "paper em adapted → leather");
+        assert_eq!(p.face(SemanticElement::Heading(4)).fg, Some(rgb(0x39, 0x70, 0x83)), "paper H4 adapted → river");
     }
 
     // ── Part B — completeness conformance ───────────────────────────────────────────────────────

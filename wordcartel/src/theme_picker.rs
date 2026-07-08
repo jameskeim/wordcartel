@@ -20,13 +20,15 @@ pub struct ThemePicker {
 }
 
 /// Rebuild rows from the built-in theme list, filtered by `query` (case-insensitive
-/// substring). Empty query → all built-ins in registration order. `selected` clamped.
+/// substring) and sorted alphabetically for display (the selector is A→Z regardless of
+/// registration order). `selected` clamped.
 pub fn rebuild_rows(tp: &mut ThemePicker) {
     let q = tp.query.to_ascii_lowercase();
     tp.rows = Theme::builtin_names().iter()   // associated method (Codex C3)
         .filter(|n| q.is_empty() || n.to_ascii_lowercase().contains(&q))
         .map(|n| n.to_string())
         .collect();
+    tp.rows.sort();                            // alphabetical display order (case-sensitive ASCII)
     if tp.selected >= tp.rows.len() { tp.selected = tp.rows.len().saturating_sub(1); }
     tp.scroll_top = tp.scroll_top.min(tp.rows.len().saturating_sub(1));
 }
@@ -42,7 +44,11 @@ mod tests {
             scroll_top: 0, original: wordcartel_core::theme::default(), previewed: None };
         rebuild_rows(&mut tp);
         assert!(tp.rows.iter().any(|r| r == "tokyo-night"));
-        assert!(tp.rows.len() >= 19, "expected >= 19 builtins, got {}", tp.rows.len());
+        assert!(tp.rows.len() >= 22, "expected >= 22 builtins, got {}", tp.rows.len());
+        // Selector rows are displayed alphabetically (rebuild_rows sorts).
+        let mut sorted = tp.rows.clone(); sorted.sort();
+        assert_eq!(tp.rows, sorted, "rows must be alphabetized for display");
+        assert!(tp.rows.iter().any(|r| r == "forever-blue-jeans-dark"), "Blue Jeans dark listed");
         tp.query = "phosphor-amber".into();
         rebuild_rows(&mut tp);
         assert!(tp.rows.iter().all(|r| r.contains("phosphor-amber")));
@@ -115,17 +121,13 @@ mod tests {
         let mut ed = Editor::new_from_text("x\n", None, (40, 12));
         ed.chrome_disposition = ChromeDisposition::Zen;
         ed.open_theme_picker();
-        // D5 builtin_names order (19 entries, 0-based):
-        //   terminal-plain[0] terminal-ansi[1] no-color[2] tokyo-night[3]
-        //   phosphor-green[4] phosphor-amber[5] phosphor-red[6] phosphor-blue[7] phosphor-purple[8]
-        //   catppuccin-mocha[9] catppuccin-latte[10] flexoki-dark[11] …
-        assert_eq!(
-            ed.theme_picker.as_ref().unwrap().rows.get(11).map(|s| s.as_str()),
-            Some("flexoki-dark"),
-            "row 11 must be flexoki-dark in the 19-theme D5 lineup; rows: {:?}",
-            ed.theme_picker.as_ref().unwrap().rows,
-        );
-        ed.theme_picker.as_mut().unwrap().selected = 11;
+        // Rows are alphabetized (rebuild_rows sorts), so locate flexoki-dark by position
+        // rather than a fixed index.
+        let idx = ed.theme_picker.as_ref().unwrap().rows.iter()
+            .position(|r| r == "flexoki-dark")
+            .unwrap_or_else(|| panic!("flexoki-dark must be listed; rows: {:?}",
+                ed.theme_picker.as_ref().unwrap().rows));
+        ed.theme_picker.as_mut().unwrap().selected = idx;
         // preview_selected_theme is the single funnel (A.9): derives before apply_theme.
         crate::app::preview_selected_theme(&mut ed);
         // §II.5 probe-generated: flexoki-dark ZEN Chrome bg = #1e1c1c.
