@@ -7,6 +7,13 @@ use wordcartel_core::block_tree::BlockTree;
 use wordcartel_core::buffer::TextBuffer;
 use wordcartel_core::outline;
 
+#[cfg(test)]
+thread_local! {
+    /// Counts full `outline::sections` walks in `FoldView::compute` — the expensive
+    /// path. A no-folds keystroke must not increment this (R1 invariant guard).
+    pub static SECTIONS_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Per-Buffer fold state: the byte offsets of folded headings.
 #[derive(Debug, Clone, Default)]
 pub struct FoldState {
@@ -133,6 +140,14 @@ impl FoldView {
     pub fn compute(folds: &FoldState, blocks: &BlockTree, buf: &TextBuffer) -> FoldView {
         let rope = buf.snapshot();
         let total = rope.len_lines();
+        // R1: no folds → nothing hidden. Skip the O(document) sections() walk entirely;
+        // the full path would filter every section out anyway (empty `folded`), so this is
+        // behavior-identical. Fixes every caller (derive + nav) at once.
+        if folds.is_empty() {
+            return FoldView { hidden: Vec::new(), total };
+        }
+        #[cfg(test)]
+        SECTIONS_WALKS.with(|c| c.set(c.get() + 1)); // now behind the guard: only the expensive path counts
         // ONE sections pass; owner is the heading's OWN line (correct for setext,
         // where the heading is two lines and the body starts after the underline).
         let mut runs: Vec<HiddenRun> = outline::sections(blocks, &rope)
@@ -295,6 +310,34 @@ mod tests {
         let buf = TextBuffer::from_str(doc);
         let blocks = full_parse_rope(&buf.snapshot());
         (blocks, buf)
+    }
+
+    // Build a (BlockTree, TextBuffer) from markdown source for fold tests.
+    fn doc(src: &str) -> (wordcartel_core::block_tree::BlockTree, wordcartel_core::buffer::TextBuffer) {
+        let buf = wordcartel_core::buffer::TextBuffer::from_str(src);
+        let tree = wordcartel_core::block_tree::full_parse(src);
+        (tree, buf)
+    }
+
+    #[test]
+    fn foldview_compute_skips_sections_walk_when_no_folds() {
+        let (blocks, buf) = doc("# H1\n\npara one\n\n## H2\n\nbody two\n");
+        let folds = FoldState::default(); // empty
+        SECTIONS_WALKS.with(|c| c.set(0));
+        let v = FoldView::compute(&folds, &blocks, &buf);
+        assert_eq!(SECTIONS_WALKS.with(|c| c.get()), 0, "no sections walk when no folds");
+        // Behavior-identical to a computed-empty view: nothing hidden, total = line count.
+        assert_eq!(v, FoldView { hidden: Vec::new(), total: buf.snapshot().len_lines() });
+    }
+
+    #[test]
+    fn foldview_compute_runs_sections_walk_when_folds_active() {
+        let (blocks, buf) = doc("# H1\n\npara one\n\n## H2\n\nbody two\n");
+        let mut folds = FoldState::default();
+        folds.toggle(0); // fold the H1 at byte 0 (FoldState::toggle, fold.rs:34)
+        SECTIONS_WALKS.with(|c| c.set(0));
+        let _ = FoldView::compute(&folds, &blocks, &buf);
+        assert!(SECTIONS_WALKS.with(|c| c.get()) >= 1, "folds active → the walk DOES run");
     }
 
     const DOC: &str = "# Top\nintro\n## A\nbody1\nbody2\n## B\ntail\n";
