@@ -89,7 +89,8 @@ git commit  # message: "packaging(arch): declare pandoc-cli + texlive-xetex optd
 - Consumes: `TextBuffer::len()` (`buffer.rs:18`, = `rope.len_bytes()`), `TextBuffer::byte_to_line()`
   (`buffer.rs:78`), `TextBuffer::is_empty()` (`buffer.rs:22`). `b.document.selection.primary().head`
   is the caret byte.
-- Produces: unchanged `active_line: usize` (used only in equality at `derive.rs:333`).
+- Produces: unchanged `active_line: usize` — stored as the `LayoutKey { active_line }` field
+  (`derive.rs:306`) and used only in an equality compare (`derive.rs:333`), never as a slice/index.
 
 - [ ] **Step 1: Write the failing test.** Add to the `derive.rs` tests module:
 
@@ -144,8 +145,8 @@ Expected: PASS, including `active_line_renders_raw` (caret at 0 → raw, unchang
 - [ ] **Step 5: Confirm no other `active_line` consumer indexes with it.**
 
 Run: `grep -n active_line wordcartel/src/derive.rs`
-Expected: only equality/struct-field uses (`:306` tuple, `:333` `l == active_line`); no slicing/indexing.
-Note the result in the report.
+Expected: only the `LayoutKey { active_line }` field (`:306`) and the `l == active_line` equality
+(`:333`); no slicing/indexing. Note the result in the report.
 
 - [ ] **Step 6: Commit.** `git commit` — "fix(derive): caret past trailing newline conceals last line (ux-H2)"
 
@@ -173,8 +174,12 @@ indexing is unchanged; only the glyph table changes.
 - [ ] **Step 2: Confirm the migration set is complete.**
 
 Run: `grep -nE '█|▓|▒|░|▏|·' wordcartel/src/render.rs`
-Expected: every hit is either the `SHADES` const (`:18`, about to change) or one of the sites updated in
-Step 1. If a NEW site appears, update it too and note it.
+The grep also matches UNRELATED hits that must NOT change: a `·` separator in status/word-count text
+(`:357, :382, :917`) and H1-only `█` assertions (`:1136` — H1 stays `█` in the new ramp). The
+heading-shade migration set is exactly `:18` (the const), `:1161` (H2 `▓`→`▆`), `:2344` (H3 `▒`→`▅`),
+`:2351-2356` (doc map), `:2370-2375` (no-color goldens). Classify each grep hit: heading-shade gutter
+→ migrate; separator/status `·` or H1-only `█` → leave. If a NEW heading-shade site appears, update it
+and note it.
 
 - [ ] **Step 3: Change the const.** At `wordcartel/src/render.rs:18`:
 
@@ -378,8 +383,9 @@ fn right_justify_leaves(raw: Vec<(String, Option<String>, Option<String>, Comman
 - [ ] **Step 6: Run — verify PASS.**
 
 Run: `cargo test -p wordcartel --lib menu::`
-Expected: PASS, including `custom_bind_surfaces_in_menu_and_palette` (`:184` — chord still baked into the
-label via `chord_for`; `label.contains("ctrl-alt-c")` still holds).
+Expected: PASS, including `custom_bind_surfaces_in_menu_and_palette` (`:190` — chord still baked into the
+label via `chord_for` at `keymap.rs:194`, user binding preferred at `:199`; `label.contains("ctrl-alt-c")`
+still holds).
 
 - [ ] **Step 7: Clippy the crate.**
 
@@ -497,44 +503,43 @@ Expected: PASS (behavior is identical for all in-cap valid dictionaries).
 
 ```rust
     #[test]
-    fn e5_chrome_bar_fg_recedes_below_body_on_every_theme() {
+    fn e5_chrome_bar_fg_recedes_below_body_on_every_rgb_theme() {
         use SemanticElement::*;
-        // Every RGB builtin, FULL disposition. The bar (Chrome) fg must recede below what body text
-        // would be on the same panel, sit above the dropdown, stay legible (≥ floor), and carry DIM.
-        let ctors: &[fn() -> Theme] = &[
-            flexoki_dark, flexoki_light, catppuccin_mocha, catppuccin_latte, gruvbox_dark,
-            gruvbox_light, solarized_dark, solarized_light, rosepine, rosepine_dawn, tokyo_night,
-            nord, dracula, phosphor, blue_jeans_dark, blue_jeans_dusk, blue_jeans_paper,
-        ]; // NOTE: use the ACTUAL builtin ctor list — cross-check builtin_names(); drop any non-RGB.
-        for &ctor in ctors {
-            let mut t = ctor();
-            let (base_fg, _) = (t.base_fg, t.base_bg);
+        // Iterate EVERY builtin (avoids constructor-name drift + auto-covers all phosphor variants and
+        // the blue-jeans family). Skip non-RGB bases (terminal-plain/ansi/no-color have Color::Default,
+        // so derive_chrome no-ops on them). Bar (Chrome) fg must recede below what body text would be on
+        // the same panel, sit above the dropdown, stay ≥ floor, and carry DIM.
+        for name in Theme::builtin_names() {
+            let mut t = Theme::builtin(name).expect("builtin name resolves");
+            let base_fg = t.base_fg;
+            if !matches!(base_fg, Color::Rgb { .. }) { continue; } // non-RGB → derive_chrome skips
             t.derive_chrome(ChromeDisposition::Full);
             let chrome = t.face(Chrome);
             let muted = t.face(ChromeMuted);
-            let cbg = chrome.bg.unwrap();
-            let cfg = chrome.fg.unwrap();
+            let cbg = chrome.bg.expect("derived chrome bg");
+            let cfg = chrome.fg.expect("derived chrome fg");
             let cr = |a: Color, b: Color| contrast_ratio(a, b);
-            assert!(cr(cfg, cbg) < cr(base_fg, cbg),
-                "{}: chrome fg must recede below body fg on the bar panel", t.name);
-            assert!(cr(cfg, cbg) > cr(muted.fg.unwrap(), muted.bg.unwrap()),
-                "{}: chrome fg must sit above the dropdown", t.name);
-            assert!(cr(cfg, cbg) >= FG_FLOOR - CR_TOL, "{}: chrome fg must clear the floor", t.name);
-            assert_eq!(chrome.dim, Some(true), "{}: chrome must carry DIM", t.name);
+            assert!(cr(cfg, cbg) < cr(base_fg, cbg), "{name}: chrome fg must recede below body fg on the bar panel");
+            assert!(cr(cfg, cbg) > cr(muted.fg.unwrap(), muted.bg.unwrap()), "{name}: chrome fg must sit above the dropdown");
+            assert!(cr(cfg, cbg) >= FG_FLOOR - CR_TOL, "{name}: chrome fg must clear the floor");
+            assert_eq!(chrome.dim, Some(true), "{name}: chrome must carry DIM");
         }
     }
 
     #[test]
     fn e5_non_rgb_chrome_carries_dim() {
         use SemanticElement::*;
+        // default() = terminal-plain; terminal_ansi(); no_color() are the three non-RGB builtins.
         for t in [default(), terminal_ansi(), no_color()] {
             assert_eq!(t.face(Chrome).dim, Some(true), "{} chrome must carry DIM", t.name);
         }
     }
 ```
 
-  The implementer MUST replace the `ctors` list with the real builtin constructors (cross-check
-  `builtin_names()`/`builtin()` at `theme.rs:163-192`) and drop any whose base is non-RGB.
+  This uses `Theme::builtin_names()` (`theme.rs:187`, `&'static [&'static str]`) + `Theme::builtin(name)`
+  (`theme.rs:160`, `Option<Theme>`) so it needs NO hand-maintained constructor list. `CR_TOL` is the
+  existing tolerance const used by `derive_fg` (`:288/:293`). `default()`/`terminal_ansi()`/`no_color()`
+  are real zero-arg constructors.
 
 - [ ] **Step 2: Run — verify FAIL.**
 
