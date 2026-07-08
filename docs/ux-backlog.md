@@ -765,7 +765,21 @@ stability there; restructure only if a B-strong-class parser replacement ever ha
 
 ## Theme R — editing responsiveness (the project's #1 invariant: instant typing)
 
-### R1. Typing latency + double-Return / line-jump — full investigation record — `in-brainstorm` (2026-07-06) · Medium
+### R1. Typing latency + double-Return / line-jump — `SHIPPED` 2026-07-07 (merge 02ac906) — full investigation record + fix
+
+**Shipped:** the three per-keystroke/per-caret-move O(document) outline/fold walks are guarded on
+`FoldState::is_empty()` (behavior-identical — skips only provably-empty work): `FoldView::compute` trivial
+early-return, `rebuild_downstream`'s reconcile gate (`!folds.is_empty()`), and `fold::normalize_caret`
+(Component 4, the caret-navigation walk = symptom 2, folded in post-Fable). Plus `first_frame_settle` (a
+`LayoutKey`-gated rebuild after `ensure_visible`) fixing the T5 first-frame startup staleness. Three
+`#[cfg(test)]` walk counters lock the invariant in. Root cause: `blocks_generation` conflated
+text-change with structure-change, defeating the outline/fold memoization. Measurement-driven (5-agent
+code-map → burst bench quantifying the O(block-count) slope → fuzz sweep confirming no pulldown panic);
+both final gates GO (Fable proved no navigation regression byte-for-byte vs the pre-guard baseline); 925
+shell + 278 core + 42 oracle green, clippy clean, smoke 8/8. The investigation record below is retained.
+**Deferred (recorded):** input coalescing (bench-supported burst contributor; touches the input loop +
+no-silent-UI); the reconcile-debounce retiming (measurement showed it's off-thread in production — moot).
+
 
 *(Facts as of `86db660`. This is the durable record of the diagnostic work — theories tried,
 refuted, and confirmed — for three symptoms the user reported while writing in wcartel. It is
