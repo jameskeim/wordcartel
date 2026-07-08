@@ -14,8 +14,10 @@ use wordcartel_core::style::Style;
 use wordcartel_core::theme::SemanticElement as SE;
 
 /// Heading-level shade glyphs used in cue mode and when `heading_level_glyph` is on.
-/// Index 0 = H1 (`█`), …, index 5 = H6 (`·`). Density decreases with level.
-const SHADES: [&str; 6] = ["█", "▓", "▒", "░", "▏", "·"];
+/// Index 0 = H1 (`█`), …, index 5 = H6 (`▂`). Single-axis lower-block height ramp.
+// Heading gutter ramp: a single-axis lower-block height ramp (decreasing solid mass), collision-free
+// with the blockquote bar (▎) and list bullet (•). U+2588 2586 2585 2584 2583 2582.
+const SHADES: [&str; 6] = ["█", "▆", "▅", "▄", "▃", "▂"];
 
 /// Half-open interval intersection: is the row's global byte range active?
 ///
@@ -1158,7 +1160,7 @@ mod tests {
         let buf = term.backend().buffer();
         let row = |y: u16| -> String { (0u16..20).map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' ')).collect() };
         assert!(row(0).starts_with("█ One"), "H1 shade: got {:?}", row(0));
-        assert!(row(2).starts_with("▓ Two"), "H2 shade: got {:?}", row(2));
+        assert!(row(2).starts_with("▆ Two"), "H2 shade: got {:?}", row(2));
     }
 
     /// `style_to_ratatui(Style::Strong)` must have BOLD modifier.
@@ -2341,19 +2343,19 @@ mod tests {
         assert!(text.contains('▎'), "blockquote bar");
         assert!(text.contains('─'), "thematic rule");
         assert!(text.contains('•'), "list bullet glyph under no_color");
-        assert!(text.contains('▒'), "H3 heading shade glyph (▒ = SHADES[2])");
+        assert!(text.contains('▅'), "H3 heading shade glyph (▅ = SHADES[2])");
     }
 
     /// §13.2 §8.3 completeness: All six heading levels render their distinct shade glyphs
-    /// (`█▓▒░▏·`) under No-color so H1–H6 are distinguishable without color.
+    /// (`█▆▅▄▃▂`) under No-color so H1–H6 are distinguishable without color.
     ///
     /// Document: "# H1\n## H2\n### H3\n#### H4\n##### H5\n###### H6\n\n"
     ///   bytes  0- 4: "# H1\n"    (H1 — SHADES[0] = '█')
-    ///   bytes  5-10: "## H2\n"   (H2 — SHADES[1] = '▓')
-    ///   bytes 11-17: "### H3\n"  (H3 — SHADES[2] = '▒')
-    ///   bytes 18-25: "#### H4\n" (H4 — SHADES[3] = '░')
-    ///   bytes 26-34: "##### H5\n"(H5 — SHADES[4] = '▏')
-    ///   bytes 35-44: "###### H6\n"(H6 — SHADES[5] = '·')
+    ///   bytes  5-10: "## H2\n"   (H2 — SHADES[1] = '▆')
+    ///   bytes 11-17: "### H3\n"  (H3 — SHADES[2] = '▅')
+    ///   bytes 18-25: "#### H4\n" (H4 — SHADES[3] = '▄')
+    ///   bytes 26-34: "##### H5\n"(H5 — SHADES[4] = '▃')
+    ///   bytes 35-44: "###### H6\n"(H6 — SHADES[5] = '▂')
     ///   byte  45:    "\n"        (blank line — caret placed here so ALL headings INACTIVE)
     #[test]
     fn a11y_all_six_heading_shades_render_in_no_color() {
@@ -2368,11 +2370,11 @@ mod tests {
         crate::derive::rebuild(&mut ed);
         let text = (0..10).map(|r| row_string(&render_to_buffer(&mut ed, 40, 10), r)).collect::<String>();
         assert!(text.contains('█'), "H1 shade glyph (█ = SHADES[0]) missing in no_color");
-        assert!(text.contains('▓'), "H2 shade glyph (▓ = SHADES[1]) missing in no_color");
-        assert!(text.contains('▒'), "H3 shade glyph (▒ = SHADES[2]) missing in no_color");
-        assert!(text.contains('░'), "H4 shade glyph (░ = SHADES[3]) missing in no_color");
-        assert!(text.contains('▏'), "H5 shade glyph (▏ = SHADES[4]) missing in no_color");
-        assert!(text.contains('·'), "H6 shade glyph (· = SHADES[5]) missing in no_color");
+        assert!(text.contains('▆'), "H2 shade glyph (▆ = SHADES[1]) missing in no_color");
+        assert!(text.contains('▅'), "H3 shade glyph (▅ = SHADES[2]) missing in no_color");
+        assert!(text.contains('▄'), "H4 shade glyph (▄ = SHADES[3]) missing in no_color");
+        assert!(text.contains('▃'), "H5 shade glyph (▃ = SHADES[4]) missing in no_color");
+        assert!(text.contains('▂'), "H6 shade glyph (▂ = SHADES[5]) missing in no_color");
     }
 
     #[test]
