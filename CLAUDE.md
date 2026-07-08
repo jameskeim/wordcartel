@@ -190,9 +190,13 @@ gate — see the Formatting/GATE notes above).
 **Remaining before Effort P (none blocking; sequence by yield):** (1) deep
 incremental-soundness — the F2 fuzz oracle still finds more block-tree `incremental≡full`
 divergences in the tail (nested/loose-list; wrong-tree, not data-loss/panic); (2) M5
-follow-ups — finish the undo louder-hint for buffer-level merges, and bound the last few
-document-sized `fs::read` load paths (recovery content-hash, fingerprint, save
-skip-unchanged); (3) optional — actually upgrade/patch `pulldown-cmark` (M4-rest only
+follow-ups — finish the undo louder-hint for buffer-level merges. (The document-sized
+`fs::read` load paths flagged earlier — recovery content-hash, fingerprint, save
+skip-unchanged, and the swap read — are already capped via `bounded_read_opt`/
+`read_swap_capped`; the personal-dictionary read is now capped too, so **no document-class
+unbounded `fs::read` remains**. Small config/theme reads — `config.rs`, startup
+overrides/mask in `app.rs`, `theme_resolve.rs` — are deliberately unbounded config-class
+files, out of scope.) (3) optional — actually upgrade/patch `pulldown-cmark` (M4-rest only
 *isolates* its parse panic). **e2e/TUI frontier — now covered by two layers:** in-process
 journeys drive the real `reduce → advance → render` loop against a `TestBackend`
 (`wordcartel/src/e2e.rs`); the PTY smoke suite (`scripts/smoke/`, mandatory-run /
