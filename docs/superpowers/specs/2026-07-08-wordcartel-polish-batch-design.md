@@ -357,16 +357,30 @@ as a `dim` modifier on the explicit `Chrome` face in each affected constructor:
   derived; add `dim: Some(true)` there so no-color bars recede too. Confirm `mono_faces()` is used ONLY
   by `no_color()` before editing (grep) so the DIM does not leak into another theme.
 
-**Acceptance test (new, TDD — write first, red before the code):** iterate **all RGB builtin themes**
-(Codex: don't tune to tokyo alone — the ladder must hold everywhere), each derived FULL (and spot-check
-ZEN), asserting the intensity ladder per theme:
-`contrast_ratio(chrome.fg, chrome.bg) < contrast_ratio(base_fg, chrome.bg)` (chrome text recedes below
-what body text would be on the same panel) AND `contrast_ratio(chrome.fg, chrome.bg) >
-contrast_ratio(chrome_muted.fg, chrome_muted.bg)` (bar sits above the dropdown) AND
-`chrome.fg` still clears `FG_FLOOR` against `chrome.bg` AND `chrome.dim == Some(true)`. This all-themes
-loop IS the tuning constraint for `CHROME_BAR_FG_BLEND` (below) — the invariant near the 4.5 floor is
-fragile (Codex), so the test proves it holds on every theme rather than assuming it. Add a separate
-assertion that no-color / terminal-plain / terminal-ansi `Chrome` faces carry `dim == Some(true)`.
+**Acceptance test (new, TDD — write first, red before the code) — FLOOR-AWARE (revised after an SDD
+finding, human decision 2026-07-08 "Option A"):** iterate **all RGB builtin themes** derived FULL, and
+assert:
+- **Mechanism (every RGB theme):** `chrome.dim == Some(true)` — the DIM modifier is the always-present
+  recede signal.
+- **Ladder (only where there is contrast headroom):** *when* `contrast_ratio(base_fg, chrome.bg) >=
+  FG_FLOOR`, assert `contrast_ratio(chrome.fg, chrome.bg) <= contrast_ratio(base_fg, chrome.bg) + CR_TOL`
+  (chrome text does not out-contrast body text on the bar panel — it recedes) AND
+  `contrast_ratio(chrome.fg, chrome.bg) + CR_TOL >= contrast_ratio(chrome_muted.fg, chrome_muted.bg)`
+  (bar sits at/above the dropdown).
+- Plus the separate `e5_non_rgb_chrome_carries_dim` test (terminal-plain / terminal-ansi / no-color).
+
+**Why floor-aware (the SDD finding):** the original test demanded the recede ladder on *every* theme.
+That is **mathematically unsatisfiable on 5 of 19 RGB builtins** (`phosphor-red/blue/purple`,
+`solarized-dark/light`): on those, body text's own contrast against the *elevated bar panel* is already
+**below** `FG_FLOOR` (measured 2.43–4.30). `derive_fg`'s floor guard lifts *any* chrome fg to the
+(pole-capped) floor for legibility, so the derived chrome fg is necessarily *more* contrasty than
+body-on-panel there — the recede invariant and the pre-existing `FG_FLOOR` legibility invariant
+genuinely collide, and legibility (the hard constraint) must win. On those 5 themes the blend barely
+moves the fg (the floor already dominated pre-E5), so **DIM carries the visual recede** — exactly the
+graceful-degradation reason we chose blend+DIM. Where body-on-panel *does* clear the floor (the other
+14 themes), the full ladder holds and is asserted. `CHROME_BAR_FG_BLEND` stays `0.18` — the failure was
+structural, not blend-sensitive, so no per-theme tuning (and none is permitted — a per-theme fudge would
+mask the real invariant).
 
 **Pin updates (regression guards — update to the new derived values after the code lands):**
 - The `derive_chrome_base16_pins` table (`theme.rs:1655-1721`, 16 rows): update the **`c_fg`** column

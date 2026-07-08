@@ -503,12 +503,13 @@ Expected: PASS (behavior is identical for all in-cap valid dictionaries).
 
 ```rust
     #[test]
-    fn e5_chrome_bar_fg_recedes_below_body_on_every_rgb_theme() {
+    fn e5_chrome_bar_fg_recedes_and_dims() {
         use SemanticElement::*;
-        // Iterate EVERY builtin (avoids constructor-name drift + auto-covers all phosphor variants and
-        // the blue-jeans family). Skip non-RGB bases (terminal-plain/ansi/no-color have Color::Default,
-        // so derive_chrome no-ops on them). Bar (Chrome) fg must recede below what body text would be on
-        // the same panel, sit above the dropdown, stay ≥ floor, and carry DIM.
+        // FLOOR-AWARE (human decision 2026-07-08 "Option A"). Iterate EVERY builtin (auto-covers all
+        // phosphor variants + blue-jeans; no hand-maintained list). Skip non-RGB bases (derive_chrome
+        // no-ops on them). DIM is the always-present recede signal; the CR ladder only holds where body
+        // text itself clears the legibility floor on the bar panel — on the ~5 low-contrast themes the
+        // pre-existing FG_FLOOR guard legitimately dominates and DIM carries the recede.
         for name in Theme::builtin_names() {
             let mut t = Theme::builtin(name).expect("builtin name resolves");
             let base_fg = t.base_fg;
@@ -519,10 +520,16 @@ Expected: PASS (behavior is identical for all in-cap valid dictionaries).
             let cbg = chrome.bg.expect("derived chrome bg");
             let cfg = chrome.fg.expect("derived chrome fg");
             let cr = |a: Color, b: Color| contrast_ratio(a, b);
-            assert!(cr(cfg, cbg) < cr(base_fg, cbg), "{name}: chrome fg must recede below body fg on the bar panel");
-            assert!(cr(cfg, cbg) > cr(muted.fg.unwrap(), muted.bg.unwrap()), "{name}: chrome fg must sit above the dropdown");
-            assert!(cr(cfg, cbg) >= FG_FLOOR - CR_TOL, "{name}: chrome fg must clear the floor");
+            // Mechanism — holds on EVERY RGB theme.
             assert_eq!(chrome.dim, Some(true), "{name}: chrome must carry DIM");
+            // Ladder — only where the bar panel has contrast headroom for body text.
+            let body_on_bar = cr(base_fg, cbg);
+            if body_on_bar >= FG_FLOOR {
+                assert!(cr(cfg, cbg) <= body_on_bar + CR_TOL,
+                    "{name}: chrome fg must not out-contrast body text on the bar panel (recede)");
+                assert!(cr(cfg, cbg) + CR_TOL >= cr(muted.fg.unwrap(), muted.bg.unwrap()),
+                    "{name}: chrome fg must sit at/above the dropdown");
+            }
         }
     }
 
@@ -539,7 +546,9 @@ Expected: PASS (behavior is identical for all in-cap valid dictionaries).
   This uses `Theme::builtin_names()` (`theme.rs:187`, `&'static [&'static str]`) + `Theme::builtin(name)`
   (`theme.rs:160`, `Option<Theme>`) so it needs NO hand-maintained constructor list. `CR_TOL` is the
   existing tolerance const used by `derive_fg` (`:288/:293`). `default()`/`terminal_ansi()`/`no_color()`
-  are real zero-arg constructors.
+  are real zero-arg constructors. The floor-aware gating is deliberate — see the spec's E5 "Why
+  floor-aware" note: demanding the ladder on all themes is mathematically unsatisfiable where body text
+  is itself sub-floor on the bar panel, and legibility (`FG_FLOOR`) is the hard constraint that wins.
 
 - [ ] **Step 2: Run — verify FAIL.**
 
@@ -588,10 +597,11 @@ with:
 - [ ] **Step 6: Run the acceptance test — verify PASS (and tune the const if needed).**
 
 Run: `cargo test -p wordcartel-core --lib theme::tests::e5_`
-Expected: PASS. If the ladder fails on a specific theme (chrome fg pinned to the floor equals or exceeds
-body fg, or drops below the dropdown), tune `CHROME_BAR_FG_BLEND` within ~[0.12, 0.22]. If NO value
-satisfies every theme, STOP and raise it (the floor-vs-recede band is too tight on some theme) rather
-than tuning per-theme.
+Expected: PASS. `CHROME_BAR_FG_BLEND` stays `0.18` — the floor-aware test already accounts for the
+low-contrast themes (the earlier all-themes ladder was mathematically unsatisfiable there; that finding
+is resolved by the floor-aware gating, NOT by tuning). Do NOT tune per-theme. If the floor-aware test
+fails on a HEADROOM theme (one where `body_on_bar >= FG_FLOOR`), STOP and report — that would be a real
+regression, not a floor-domination case.
 
 - [ ] **Step 7: Re-pin the chrome-fg regression pins to the observed values.** The intentional
   derivation change makes the OLD `Chrome` fg pins stale. Run the pin test to see the actual new values:
