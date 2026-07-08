@@ -82,7 +82,8 @@ stays `1` by convention. `.SRCINFO`'s `pkgver` will reflect whatever `git descri
 regeneration time.
 
 **Tests:** none (packaging). Verification: `makepkg --printsrcinfo` parses clean and shows the two new
-optdepends; `.SRCINFO` matches the PKGBUILD.
+optdepends; `.SRCINFO` matches the PKGBUILD. (Codex noted `.SRCINFO` is already slightly stale vs the
+PKGBUILD; regenerating it here also resolves that pre-existing drift.)
 
 **Command-surface contract:** N/A — does not touch commands, options, palette, menu, or hints.
 
@@ -108,29 +109,39 @@ line as active. In LivePreview the active line renders raw (`derive::line_render
 `derive.rs:31` — active line = `RawPlain`, others `Concealed`), so the just-typed final list item never
 shows its bullet / a final heading never shows its shade glyph until the caret moves up.
 
-**Fix:** when the caret sits on the phantom line (caret `== buf.len()` AND the buffer ends in `\n`),
-report the active line as the phantom line index (`buf.byte_to_line(buf.len())`) rather than clamping
-into the last content line. Preserve the empty-buffer case (`0`) and every mid-buffer case unchanged.
+**Fix:** the `-1` in `buf.len().saturating_sub(1)` is the whole bug — it drags a caret sitting past a
+trailing newline back onto the last content line. Clamp to `buf.len()` instead (which
+`TextBuffer::byte_to_line` accepts and `is_char_boundary` documents as always a valid boundary). This
+handles BOTH cases uniformly with no explicit trailing-newline test:
 
 ```rust
 let caret_byte = b.document.selection.primary().head;
 let active_line = if buf.is_empty() {
     0
-} else if caret_byte >= buf.len() && buf.ends_with('\n') {
-    // Caret on the phantom line past the trailing newline: it is NOT on the last
-    // content line, so that line must conceal like any other inactive line (ux-H2).
-    buf.byte_to_line(buf.len())
 } else {
-    buf.byte_to_line(caret_byte.min(buf.len().saturating_sub(1)))
+    // Clamp to `len`, NOT `len-1`: a caret on the phantom line past a trailing newline must
+    // map to the phantom line so the last CONTENT line conceals like any inactive line (ux-H2),
+    // instead of staying "active" and rendering raw. `len` is always a char boundary.
+    buf.byte_to_line(caret_byte.min(buf.len()))
 };
 ```
 
-**Interface note:** `buf` is `&ropey::Rope` (`b.document.buffer`). Confirm the exact rope accessors
-during implementation — `Rope::len_bytes()` vs a project `buf.len()` wrapper, and the
-`ends_with('\n')` form (may be `buf.byte(buf.len_bytes()-1) == b'\n'` or a slice check). Match the
-accessor style already used at `derive.rs:276-282` (`buf.is_empty()`, `buf.len()`, `buf.byte_to_line`).
-`total_logical_lines(buf)` (`:276`) already accounts for the phantom line, so `byte_to_line(buf.len())`
-returns a valid in-range line index for a newline-terminated buffer.
+Verification of the two cases (ropey `byte_to_line` counts newlines before the byte): `"a\n"`, caret at
+`len=2` → `byte_to_line(2) = 1` (phantom line — the content line `"a"` now conceals). `"hello"` (no
+trailing `\n`), caret at `len=5` → `byte_to_line(5) = 0` (last content line stays active — no
+regression). Mid-buffer carets are `< len`, so the `min` is a no-op and behavior is byte-identical to
+today.
+
+**Interface note (Codex-corrected):** `buf` is `&wordcartel_core::buffer::TextBuffer` (a `ropey::Rope`
+wrapper), **not** `ropey::Rope`. Confirmed accessors: `len()` = `rope.len_bytes()` (`buffer.rs:18`),
+`is_empty()` (`buffer.rs:22`), `byte_to_line()` (`buffer.rs:78`). `TextBuffer` has **no** `ends_with`,
+and `slice()` returns `String` and asserts char boundaries (`buffer.rs:64-76`) — so the earlier
+`slice(len-1..len)` idea is rejected (it would panic on a buffer ending in a multibyte char). The
+clamp-to-`len` fix needs none of that. `active_line` is used ONLY in an equality comparison
+(`l == active_line`, `derive.rs:333`; stored in the tuple at `:306`), never as a slice/index, so a
+phantom-line value that exceeds the rendered range is harmless — it simply matches no rendered line
+(exactly the desired "nothing is active" for the phantom line). The plan must confirm no other
+`active_line` consumer indexes with it.
 
 **Test (new, `derive.rs` `#[cfg(test)]`):** build a buffer ending in `\n` (e.g. a one-item list
 `- alpha\n`), put the caret at `buf.len()`, drive the active-line computation, and assert the last
@@ -169,7 +180,13 @@ segs and placed) — unchanged; only the glyph table changes.
 - No-color golden assertions `:2370-2375`: update each expected glyph (`█`,`▆`,`▅`,`▄`,`▃`,`▂`).
 - The `text.contains('▒')` H3 assertion at `:2344` → `▅` (new H3).
 - The doc-comment level→glyph map at `:2351-2356`.
-- Any other assertion referencing an old SHADE glyph (grep `▓ ▒ ░ ▏ ·` in `render.rs` before finishing).
+- **`render.rs:1161` (Codex-found)** — a default-theme H2 test asserting the gutter `"▓ Two"` must become
+  `"▆ Two"` (new H2).
+- Any other assertion referencing an old SHADE glyph — grep `█ ▓ ▒ ░ ▏ ·` across `render.rs` before
+  finishing and update every hit (the named sites are `:1161, :2344, :2351-2356, :2370-2375`).
+- Codex noted there is no dedicated glyph-WIDTH guard test; the no-color golden already exercises that
+  `▆▅▄▃▂` render as single cells in the 2-cell gutter, so no new width test is required — but if any
+  golden shows a column shift, that is the signal to investigate width.
 
 **Command-surface contract:** N/A — glyph rendering only.
 
@@ -212,6 +229,10 @@ right-aligned columns.
   right edge aligns within the group; (b) every chord's right edge aligns within the group (unchanged
   from today); (c) a row with neither renders as bare base; (d) stateless rows are byte-identical to
   today when the group has no stateful rows.
+- **The both-columns case (value AND chord on one row) is a first-class requirement, not hypothetical
+  (Codex).** No *default* keybinding today lands on a stateful command, but a user-customized binding
+  via `chord_for()` (`keymap.rs:200`) can put a chord on a stateful row — so the layout must render
+  `[base] … [value] … [chord]` correctly with both columns present, and a test must cover it.
 
 **Preserve:** `GAP` spacing semantics; the palette entry special-case (`:46-47`); the state-in-label
 CONTENT (the value is still shown — it just moves to a column). The user's explicit binding still wins
@@ -276,9 +297,13 @@ unit-testable in isolation, add the assertion at the `bounded_read_opt` seam ana
 
 **CLAUDE.md correction:** in the "Remaining before Effort P" paragraph, item (2), replace the claim that
 the recovery content-hash / fingerprint / save skip-unchanged reads are unbounded with the accurate
-status: those are already capped via `bounded_read_opt`/`read_swap_capped`; the dictionary read is now
-capped too; no document-class unbounded `fs::read` remains. Keep the other item-(2) sub-point (the undo
-louder-hint for buffer-level merges) if still accurate — verify before editing.
+status: those are already capped via `bounded_read_opt`/`read_swap_capped`, and the dictionary read is
+now capped too — **no document-class** unbounded `fs::read` remains. Word it precisely as
+"document-class": Codex correctly notes that small **config/theme-class** reads remain unbounded
+(`config.rs:360`, `app.rs:1430/1438` startup overrides/mask, `theme_resolve.rs:177`) — these are
+deliberately out of scope (bounded-by-nature config files, read once), so the note must NOT overstate
+"no unbounded reads anywhere." Keep the other item-(2) sub-point (the undo louder-hint for buffer-level
+merges) if still accurate — verify before editing.
 
 **Command-surface contract:** N/A — startup IO only.
 
@@ -332,32 +357,40 @@ as a `dim` modifier on the explicit `Chrome` face in each affected constructor:
   derived; add `dim: Some(true)` there so no-color bars recede too. Confirm `mono_faces()` is used ONLY
   by `no_color()` before editing (grep) so the DIM does not leak into another theme.
 
-**Acceptance test (new, TDD — write first, red before the code):** on a representative RGB theme
-(`tokyo_night`, derived FULL), assert the intensity ladder:
+**Acceptance test (new, TDD — write first, red before the code):** iterate **all RGB builtin themes**
+(Codex: don't tune to tokyo alone — the ladder must hold everywhere), each derived FULL (and spot-check
+ZEN), asserting the intensity ladder per theme:
 `contrast_ratio(chrome.fg, chrome.bg) < contrast_ratio(base_fg, chrome.bg)` (chrome text recedes below
 what body text would be on the same panel) AND `contrast_ratio(chrome.fg, chrome.bg) >
-contrast_ratio(chrome_muted.fg, chrome_muted.bg)` (bar sits above the dropdown), AND
-`chrome.dim == Some(true)`. Also assert `chrome.fg` still clears `FG_FLOOR` against `chrome.bg`.
+contrast_ratio(chrome_muted.fg, chrome_muted.bg)` (bar sits above the dropdown) AND
+`chrome.fg` still clears `FG_FLOOR` against `chrome.bg` AND `chrome.dim == Some(true)`. This all-themes
+loop IS the tuning constraint for `CHROME_BAR_FG_BLEND` (below) — the invariant near the 4.5 floor is
+fragile (Codex), so the test proves it holds on every theme rather than assuming it. Add a separate
+assertion that no-color / terminal-plain / terminal-ansi `Chrome` faces carry `dim == Some(true)`.
 
 **Pin updates (regression guards — update to the new derived values after the code lands):**
 - The `derive_chrome_base16_pins` table (`theme.rs:1655-1721`, 16 rows): update the **`c_fg`** column
   (Chrome fg) on every row to the new receded value; all other columns (bg + the other four faces) stay
   byte-identical. Add `assert_eq!(t.face(Chrome).dim, Some(true), ...)` alongside the existing muted-dim
   assertion (`:1731`).
-- Standalone Chrome-fg pins: `:1854` (tokyo FULL), `:1917` (flexoki-dark), `:1930` (flexoki-light).
-  `ChromeOverlay` fg pins (`:1858`, etc.) stay `base_fg` — unchanged.
-- Grep for any other exact Chrome-fg assertion (blue-jeans `exemplar_spot_pins_blue_jeans`,
-  `derive_chrome_zen_*`, etc.) and re-pin only the Chrome fg.
+- Standalone Chrome-fg pins — the spec's original list `:1854` (tokyo FULL), `:1917` (flexoki-dark),
+  `:1930` (flexoki-light) **plus the three Codex found**: `:1941` (zen pin), `:2003` (phosphor pin),
+  `:2056` (synthetic light pin). `ChromeOverlay` fg pins (`:1858`, etc.) stay `base_fg` — confirmed
+  unchanged (overlay still `derive_fg(base_fg,bg)` at `:323`).
+- Grep for any other exact Chrome-fg assertion (blue-jeans `exemplar_spot_pins_blue_jeans`, any
+  `derive_chrome_zen_*`) and re-pin only the Chrome fg — the grep is authoritative; the enumerated
+  line numbers are a floor, not a ceiling.
 - Shell `render.rs` chrome tests assert Chrome **bg** (`:1611` #2d2f42) and `.is_some()` — bg unchanged,
   so they hold; verify none assert an exact Chrome **fg**. `terminal_plain_status_carries_chrome_face`
   (`:1526`) asserts bg=Black (not reverse) — DIM is orthogonal; confirm it still passes.
 
 **Method for the new pin values:** these are regression pins for an intentional derivation change — after
 implementing, run the test, read the actual receded `c_fg` values, and update the table to match. The
-NEW property test (ladder ordering + dim) is the real acceptance criterion; the table is the guard
-against future accidental drift. The `CHROME_BAR_FG_BLEND` constant may be tuned within ~[0.12, 0.22]
-during implementation so every theme stays ≥ floor and strictly ordered Text > bar > dropdown; the
-final value is whatever satisfies the ladder test on all builtins.
+NEW all-themes property test (ladder ordering + dim) is the real acceptance criterion; the pin table is
+the guard against future accidental drift. Choose `CHROME_BAR_FG_BLEND` (start ~0.18, tune within
+~[0.12, 0.22]) as whatever value satisfies the all-themes ladder test; if no single value clears the
+ladder on every builtin, that is a finding to raise (it would mean the floor-vs-recede band is too
+tight on some theme) rather than silently tuning per-theme.
 
 **Command-surface contract:** N/A — theme foreground derivation only.
 
