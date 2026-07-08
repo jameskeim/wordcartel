@@ -67,6 +67,18 @@ pub fn next_deadline_ms(now: u64, last_edit_at: Option<u64>, last_swap_at: Optio
     Some(idle_at.min(max_at).max(now))
 }
 
+/// True iff the buffer holds unsaved content whose version is not yet captured in the swap
+/// file — the real "swap work pending" signal. This, NOT "an edit ever happened", gates both
+/// the main-loop wake-up and the Tick dispatch. `last_edit_at` is monotonic (set on every edit,
+/// never cleared or advanced by a swap), so basing the wake on it made `next_deadline_ms` return
+/// a permanently past-due instant, and the loop busy-spun at 100% CPU once idle — whether the
+/// doc was clean (dispatch skipped) or dirty (swap rewritten every iteration). `swapped_version`
+/// is set to the written version when a swap succeeds, so once the current version is on disk (or
+/// the buffer is clean) this is `false` and the loop can block.
+pub fn pending(dirty: bool, version: u64, swapped_version: Option<u64>) -> bool {
+    dirty && swapped_version != Some(version)
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SwapHeader {
     pub realpath: Option<String>,
@@ -297,7 +309,12 @@ pub fn dispatch_swap_write(ctx: &mut Ctx) {
                     // target the originating buffer even after a buffer switch (multi-buffer, Effort 6).
                     if let Some(b) = editor.by_id_mut(buffer_id) {
                         b.swap_in_flight = false;
-                        if ok { b.last_swap_at = Some(ts); }
+                        if ok {
+                            b.last_swap_at = Some(ts);
+                            // Latch the version now on disk so the wake-up settles (no idle spin);
+                            // a later edit bumps the version and re-arms `swap::pending`.
+                            b.swapped_version = Some(version);
+                        }
                     }
                     if !ok { editor.status = "swap write failed".to_string(); } // status global
                 }),
@@ -325,6 +342,32 @@ mod tests {
     fn fnv_is_stable_and_distinguishes() {
         assert_eq!(fnv1a64(b"abc"), fnv1a64(b"abc"));
         assert_ne!(fnv1a64(b"/a/notes.md"), fnv1a64(b"/b/notes.md"));
+    }
+
+    /// Regression — idle 100% CPU spin. The main loop wakes on the swap deadline; basing
+    /// that deadline on `last_edit_at` alone (a monotonic, never-cleared timestamp) returns a
+    /// permanently past-due instant once any edit has happened, so `recv_timeout` got a 0-length
+    /// timeout forever and the loop busy-spun. The real "swap work pending" signal is
+    /// `pending()`: unsaved content whose version is not yet in the swap file. The loop and the
+    /// Tick dispatch gate on it, so a settled or clean buffer schedules NO wake and the loop blocks.
+    #[test]
+    fn settled_buffer_is_not_pending_so_the_loop_can_block() {
+        let now = 100 * T_MAX_MS; // long past any idle/max deadline
+
+        // The raw deadline IS permanently past-due once last_edit_at is set — the spin source
+        // the gate must suppress:
+        assert_eq!(next_deadline_ms(now, Some(0), None), Some(now),
+            "raw swap deadline is past-due forever off a monotonic last_edit_at");
+
+        // (a) clean buffer (e.g. just saved) with a stale last_edit_at → no swap work.
+        assert!(!pending(false, 7, Some(3)), "clean buffer → nothing to swap");
+        // (b) dirty but the current version is already in the swap file → no swap work.
+        assert!(!pending(true, 7, Some(7)), "current version already swapped → nothing to swap");
+        // (c) genuinely pending: edited to a new version not yet swapped → wake is scheduled.
+        assert!(pending(true, 8, Some(7)), "unsaved new version → pending");
+        assert!(pending(true, 1, None), "first edit, never swapped → pending");
+        assert!(next_deadline_ms(now, Some(now), None).is_some(),
+            "pending work still schedules a wake so the swap actually gets written");
     }
 
     #[test]
