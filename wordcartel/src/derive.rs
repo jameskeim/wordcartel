@@ -279,7 +279,10 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
         let active_line = if buf.is_empty() {
             0
         } else {
-            buf.byte_to_line(caret_byte.min(buf.len().saturating_sub(1)))
+            // Clamp to `len`, NOT `len-1`: a caret on the phantom line past a trailing newline
+            // must map to the phantom line so the last CONTENT line conceals like any inactive
+            // line (ux-H2), instead of staying "active" and rendering raw. `len` is a boundary.
+            buf.byte_to_line(caret_byte.min(buf.len()))
         };
         // 5g: normalize scroll to the nearest visible line before the walk.
         let raw_scroll = b.view.scroll.min(total_lines.saturating_sub(1));
@@ -507,6 +510,18 @@ mod tests {
         rebuild(&mut e);
         let (rows0, _) = &e.active().view.line_layouts[&0];
         assert_eq!(rows0[0].display, "# Title");
+    }
+
+    /// ux-H2: with the caret on the phantom line past a trailing newline, the last CONTENT
+    /// line must conceal (show "Title"), not stay active and render raw ("# Title").
+    #[test]
+    fn caret_on_phantom_line_conceals_last_content_line() {
+        let mut e = Editor::new_from_text("# Title\n", None, (80, 24));
+        // Caret at buf.len() = 8 — the phantom line past the trailing '\n', NOT on line 0.
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(8);
+        rebuild(&mut e);
+        let (rows0, _) = &e.active().view.line_layouts[&0];
+        assert_eq!(rows0[0].display, "Title", "last content line must conceal when caret is past the newline");
     }
 
     // ------------------------------------------------------------------

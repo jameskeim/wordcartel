@@ -235,6 +235,21 @@ mod tests {
         assert_eq!(bounded_read_opt(&p, 4), None, "missing path → None");
     }
 
+    /// The personal-dictionary load (app.rs) now routes through bounded_read_opt + from_utf8.
+    #[test]
+    fn dictionary_style_read_is_bounded_and_utf8_guarded() {
+        let p = scratch_path("dict-cap");
+        std::fs::write(&p, "alpha\nbeta\n").unwrap();
+        // In-cap valid file → Some(bytes) → valid UTF-8 → words parse.
+        let text = bounded_read_opt(&p, crate::limits::MAX_OPEN_BYTES)
+            .and_then(|b| String::from_utf8(b).ok());
+        assert_eq!(text.as_deref(), Some("alpha\nbeta\n"));
+        // Over-cap file → None → empty dictionary (no slurp, no panic).
+        std::fs::write(&p, "x".repeat(10)).unwrap();
+        assert_eq!(bounded_read_opt(&p, 4), None, "over-cap → None → empty dict degradation");
+        let _ = fs::remove_file(&p);
+    }
+
     /// Saving the SAME content again returns Unchanged (by OUTCOME, not mtime).
     #[test]
     fn save_same_content_returns_unchanged() {

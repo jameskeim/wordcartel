@@ -32,19 +32,21 @@ fn grouped_commands(reg: &Registry, keymap: &KeyTrie, editor: &crate::editor::Ed
     -> Vec<(MenuCategory, Vec<(String, CommandId)>)> {
     let mut groups = Vec::new();
     for cat in MENU_ORDER {
-        // (base text, chord, id) intermediates — chord kept separate so the group right-justifies.
-        let mut raw: Vec<(String, Option<String>, CommandId)> = reg
+        // (base text, value, chord, id) intermediates — value and chord kept separate so the
+        // group right-justifies into independent columns.
+        let mut raw: Vec<(String, Option<String>, Option<String>, CommandId)> = reg
             .commands()
             .filter_map(|(id, meta)| {
                 if meta.menu == Some(cat) && id != CommandId("palette") {
-                    Some((menu_leaf_base(meta, editor), keymap.chord_for(id), id))
+                    let (base, value) = menu_leaf_parts(meta, editor);
+                    Some((base, value, keymap.chord_for(id), id))
                 } else {
                     None
                 }
             })
             .collect();
         if cat == MenuCategory::View && reg.meta(CommandId("palette")).is_some() {
-            raw.push(("Command Palette...".to_string(), keymap.chord_for(CommandId("palette")), CommandId("palette")));
+            raw.push(("Command Palette...".to_string(), None, keymap.chord_for(CommandId("palette")), CommandId("palette")));
         }
         if !raw.is_empty() {
             groups.push((cat, right_justify_leaves(raw)));
@@ -53,41 +55,64 @@ fn grouped_commands(reg: &Registry, keymap: &KeyTrie, editor: &crate::editor::Ed
     groups
 }
 
-/// Base menu leaf text (state-in-label for stateful commands), WITHOUT the chord.
-/// Stateless → static label. Stateful → `"{base}: {value}"` (base strips a leading
-/// "Toggle " prefix and any "…: variants" suffix).
-fn menu_leaf_base(meta: &crate::registry::CommandMeta, editor: &crate::editor::Editor) -> String {
+/// Base menu leaf text and optional state value, split. Stateless → `(label, None)`.
+/// Stateful → `(base, Some(value))` where `base` strips a leading "Toggle " and any ": variants".
+fn menu_leaf_parts(meta: &crate::registry::CommandMeta, editor: &crate::editor::Editor)
+    -> (String, Option<String>)
+{
     use crate::registry::MenuMark;
     match meta.state {
-        None => meta.label.to_string(),
+        None => (meta.label.to_string(), None),
         Some(f) => {
             let base = meta.label.strip_prefix("Toggle ").unwrap_or(meta.label);
-            let base = base.split(':').next().unwrap_or(base).trim();
-            match f(editor) {
-                MenuMark::OnOff(b) => format!("{base}: {}", if b { "On" } else { "Off" }),
-                MenuMark::Value(v) => format!("{base}: {v}"),
-            }
+            let base = base.split(':').next().unwrap_or(base).trim().to_string();
+            let value = match f(editor) {
+                MenuMark::OnOff(b) => if b { "On" } else { "Off" }.to_string(),
+                MenuMark::Value(v) => v.to_string(),
+            };
+            (base, Some(value))
         }
     }
 }
 
-/// Right-justify chord hints within a dropdown group: pad each leaf so all chords end at a
-/// common right column (flush-right), matching the command palette. Leaves with no chord render
-/// as their base text. `GAP` is the minimum gap between the widest base label and its chord.
-fn right_justify_leaves(raw: Vec<(String, Option<String>, CommandId)>) -> Vec<(String, CommandId)> {
+/// Lay out a dropdown group into two independent right-aligned columns: an optional VALUE column
+/// (stateful rows) and the CHORD column, matching the palette. `[base] … [value] … [chord]`.
+/// A group with no stateful rows renders byte-identically to the chord-only layout. `GAP` is the
+/// min gap before the chord; `VGAP` the gap between the base name and the value column.
+fn right_justify_leaves(raw: Vec<(String, Option<String>, Option<String>, CommandId)>)
+    -> Vec<(String, CommandId)>
+{
     const GAP: usize = 4;
-    let width = |base: &str, chord: &Option<String>| {
-        base.chars().count() + chord.as_ref().map_or(0, |c| GAP + c.chars().count())
+    const VGAP: usize = 2;
+    let cc = |s: &str| s.chars().count();
+    let max_base = raw.iter().map(|(b, _, _, _)| cc(b)).max().unwrap_or(0);
+    let max_val = raw.iter().filter_map(|(_, v, _, _)| v.as_deref().map(cc)).max().unwrap_or(0);
+    let has_values = max_val > 0;
+    // Left block: base name + (optional) right-aligned value column.
+    let left_of = |base: &str, value: &Option<String>| -> String {
+        if !has_values {
+            base.to_string()
+        } else {
+            match value {
+                Some(v) => format!("{:<mb$}{}{:>mv$}", base, " ".repeat(VGAP), v, mb = max_base, mv = max_val),
+                None => format!("{:<w$}", base, w = max_base + VGAP + max_val),
+            }
+        }
     };
-    let target = raw.iter().map(|(b, c, _)| width(b, c)).max().unwrap_or(0);
+    // Chord column: right-justify to the widest (left-block + GAP + chord) over the group.
+    let target = raw.iter()
+        .map(|(b, v, c, _)| cc(&left_of(b, v)) + c.as_ref().map_or(0, |c| GAP + cc(c)))
+        .max().unwrap_or(0);
     raw.into_iter()
-        .map(|(base, chord, id)| {
-            let label = match &chord {
-                Some(c) => {
-                    let pad = target.saturating_sub(base.chars().count() + c.chars().count());
-                    format!("{base}{}{c}", " ".repeat(pad))
+        .map(|(base, value, chord, id)| {
+            let label = match (&value, &chord) {
+                (_, Some(c)) => {
+                    let left = left_of(&base, &value);
+                    let pad = target.saturating_sub(cc(&left) + cc(c));
+                    format!("{left}{}{c}", " ".repeat(pad))
                 }
-                None => base,
+                (Some(_), None) => left_of(&base, &value), // value column is last — no trailing pad
+                (None, None) => base,                      // bare
             };
             (label, id)
         })
@@ -162,8 +187,10 @@ mod tests {
         ed.view_opts.word_count = true;
         let groups = grouped_commands(&reg, &km, &ed);
         let view = groups.iter().find(|(c, _)| *c == crate::registry::MenuCategory::View).unwrap();
-        assert!(view.1.iter().any(|(label, _)| label.starts_with("Word Count: On")),
-            "stateful toggle renders 'Word Count: On', got {:?}", view.1);
+        // A7: base name and value shown, value in its own column — the glued "Word Count: On" is gone.
+        assert!(view.1.iter().any(|(label, _)|
+            label.starts_with("Word Count") && label.contains("On") && !label.contains("Word Count: On")),
+            "stateful toggle shows 'Word Count' + 'On' in a column, got {:?}", view.1);
     }
 
     // -----------------------------------------------------------------------
@@ -172,19 +199,39 @@ mod tests {
 
     #[test]
     fn menu_chords_are_right_justified_within_a_group() {
-        // Leaves of differing label+chord widths → every chord ends at the same column (flush-right).
+        // 4-tuple: (base, value, chord, id). Chords still flush-right; values (when present) share a column.
         let raw = vec![
-            ("Cut".to_string(), Some("ctrl-x".to_string()), CommandId("cut")),
-            ("Copy As Something Long".to_string(), Some("ctrl-c".to_string()), CommandId("copy")),
-            ("No Chord Item".to_string(), None, CommandId("noop")),
+            ("Cut".to_string(), None, Some("ctrl-x".to_string()), CommandId("cut")),
+            ("Copy As Something Long".to_string(), None, Some("ctrl-c".to_string()), CommandId("copy")),
+            ("No Chord Item".to_string(), None, None, CommandId("noop")),
         ];
         let leaves = right_justify_leaves(raw);
         assert!(leaves[0].0.ends_with("ctrl-x"));
         assert!(leaves[1].0.ends_with("ctrl-c"));
-        // Chorded leaves share the target width, so their chords are flush-right at the same column.
         assert_eq!(leaves[0].0.chars().count(), leaves[1].0.chars().count());
-        // A no-chord leaf renders as its base — no trailing padding/chord.
-        assert_eq!(leaves[2].0, "No Chord Item");
+        assert_eq!(leaves[2].0, "No Chord Item", "no value + no chord → bare base, no trailing pad");
+    }
+
+    #[test]
+    fn menu_values_share_a_right_aligned_column() {
+        // Differing base widths, values of differing widths → all value right-edges align. One row
+        // carries BOTH a value and a chord (the user-customized-binding case).
+        let raw = vec![
+            ("Clipboard".to_string(), Some("Auto".to_string()), None, CommandId("a")),
+            ("Keymap".to_string(), Some("CUA".to_string()), Some("ctrl-k".to_string()), CommandId("b")),
+            ("Word Count".to_string(), Some("Off".to_string()), None, CommandId("c")),
+            ("Plain Item".to_string(), None, None, CommandId("d")),
+        ];
+        let leaves = right_justify_leaves(raw);
+        // The value-column right edge is common: the char index just past each value aligns.
+        let val_end = |s: &str, v: &str| s.find(v).map(|i| i + v.chars().count());
+        let e_clip = val_end(&leaves[0].0, "Auto").unwrap();
+        let e_wc   = val_end(&leaves[2].0, "Off").unwrap();
+        assert_eq!(e_clip, e_wc, "value right edges must align: {:?}", leaves);
+        // The both-columns row keeps the chord flush-right after the value column.
+        assert!(leaves[1].0.contains("CUA") && leaves[1].0.ends_with("ctrl-k"));
+        // A plain row with neither is bare.
+        assert_eq!(leaves[3].0, "Plain Item");
     }
 
     #[test]

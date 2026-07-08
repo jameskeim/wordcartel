@@ -1444,9 +1444,11 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // was already moved into the editor above.
     editor.theme_identity = settings::theme_identity_of(&cfg.theme, &editor.theme.name);
 
-    // Load the personal dictionary from disk (missing/unreadable → empty; no abort).
+    // Load the personal dictionary from disk (missing/unreadable/over-cap/invalid-UTF-8 → empty; no abort).
     if let Some(dict_path) = &cfg.diagnostics.dictionary {
-        if let Ok(text) = std::fs::read_to_string(dict_path) {
+        if let Some(text) = crate::file::bounded_read_opt(dict_path, crate::limits::MAX_OPEN_BYTES)
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+        {
             editor.dictionary = text.lines().map(|l| l.trim().to_string()).filter(|s| !s.is_empty()).collect();
         }
     }

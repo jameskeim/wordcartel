@@ -1,6 +1,6 @@
 pkgbase = wordcartel
 	pkgdesc = Markdown-first terminal word processor (wcartel) — optimized release-dist build
-	pkgver = 0.0.0.r1052.g2818f55
+	pkgver = 0.0.0.r1058.g0a34a15
 	pkgrel = 1
 	url = https://github.com/jameskeim/wordcartel
 	arch = x86_64
@@ -12,6 +12,8 @@ pkgbase = wordcartel
 	optdepends = libx11: native X11 clipboard (dlopened at runtime)
 	optdepends = wl-clipboard: wl-copy external clipboard provider (fallback chain)
 	optdepends = xclip: xclip external clipboard provider (fallback chain)
+	optdepends = pandoc-cli: markdown export to html/docx/pdf (shells out to pandoc)
+	optdepends = texlive-xetex: PDF export via pandoc --pdf-engine=xelatex
 	provides = wcartel
 	options = !strip
 	options = !debug
