@@ -71,10 +71,11 @@ pub fn next_deadline_ms(now: u64, last_edit_at: Option<u64>, last_swap_at: Optio
 /// file — the real "swap work pending" signal. This, NOT "an edit ever happened", gates both
 /// the main-loop wake-up and the Tick dispatch. `last_edit_at` is monotonic (set on every edit,
 /// never cleared or advanced by a swap), so basing the wake on it made `next_deadline_ms` return
-/// a permanently past-due instant, and the loop busy-spun at 100% CPU once idle — whether the
-/// doc was clean (dispatch skipped) or dirty (swap rewritten every iteration). `swapped_version`
-/// is set to the written version when a swap succeeds, so once the current version is on disk (or
-/// the buffer is clean) this is `false` and the loop can block.
+/// a permanently past-due instant. The measured effect once idle: while DIRTY the swap file was
+/// rewritten on every loop wake (continuous disk I/O + fsyncs, at ~0% userspace CPU — an SSD-wear /
+/// no-idle-heat pathology); while SAVED-and-idle the loop kept waking on the past-due deadline with
+/// no work to do. `swapped_version` is set to the written version when a swap succeeds, so once the
+/// current version is on disk (or the buffer is clean) this is `false` and the loop can block.
 pub fn pending(dirty: bool, version: u64, swapped_version: Option<u64>) -> bool {
     dirty && swapped_version != Some(version)
 }

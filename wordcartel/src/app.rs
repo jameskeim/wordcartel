@@ -1605,8 +1605,9 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         let now = clock.now_ms();
         save_timeout_tick(&mut editor, now);
         // Only arm the swap wake-up when a swap is actually pending (unsaved content not yet on
-        // disk) and none is in flight. Arming it off last_edit_at alone left a permanently
-        // past-due deadline that spun the loop at 100% CPU when idle (see swap::pending).
+        // disk) and none is in flight. Arming it off last_edit_at alone left a permanently past-due
+        // deadline, so an idle buffer kept waking the loop to rewrite its swap file — continuous
+        // disk I/O, not a CPU spin (see swap::pending).
         let swap_deadline = if crate::swap::pending(
             editor.active().document.dirty(), editor.active().document.version, editor.active().swapped_version,
         ) && !editor.active().swap_in_flight {
@@ -2093,6 +2094,40 @@ mod tests {
              checkpoint plus the max-cap cadence (~1 / 30s ≈ 11 total), not one-per-edit", ex.swaps());
         // … but recovery is NOT starved: a long writing session keeps getting checkpointed.
         assert!(ex.swaps() >= 2, "a long editing session must keep checkpointing (durability), not swap only once");
+    }
+
+    /// After a save (which deletes the swap file), the swap latch must be cleared so a later edit
+    /// gets a FRESH swap — the latch means "this version's content is in the swap file", and saving
+    /// removes that file. Regression guard for the Codex pre-merge durability finding: a stale
+    /// latch must never suppress a needed recovery write.
+    #[test]
+    fn save_clears_the_swap_latch_so_later_edits_recheckpoint() {
+        use crate::registry::Registry;
+        let reg = Registry::builtins();
+        let km = cua_keymap();
+        let ex = CountingSwapExecutor::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let mut e = Editor::new_from_text("start\n", Some(path.clone()), (80, 24));
+
+        // Edit → idle → first checkpoint; the latch is now set.
+        crate::app::reduce(press(KeyCode::Char('x'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &TestClock(0), &tx);
+        crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &km, &ex, &TestClock(2_000), &tx);
+        assert_eq!(ex.swaps(), 1, "first edit is checkpointed");
+        assert!(e.active().swapped_version.is_some(), "latch set after the swap");
+
+        // Save → deletes the swap file, clears the latch, buffer becomes clean.
+        crate::app::reduce(press(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut e, &reg, &km, &ex, &TestClock(2_500), &tx);
+        assert!(!e.active().document.dirty(), "save made the buffer clean");
+        assert!(e.active().swapped_version.is_none(),
+            "save must clear the swap latch (the swap file it referenced was deleted)");
+
+        // Edit again → idle → a FRESH swap must be written, not suppressed by a stale latch.
+        crate::app::reduce(press(KeyCode::Char('y'), KeyModifiers::NONE), &mut e, &reg, &km, &ex, &TestClock(3_000), &tx);
+        crate::app::reduce(crate::app::Msg::Tick, &mut e, &reg, &km, &ex, &TestClock(5_000), &tx);
+        crate::swap::delete(Some(&path));
+        assert_eq!(ex.swaps(), 2, "post-save edit must be re-checkpointed (latch was cleared)");
     }
 
     #[test]
