@@ -26,21 +26,52 @@ that catches real bugs — is the real asset.
 
 ---
 
-## H1 — Decompose the two god-objects (`app.rs`, `render.rs`) · `needs-design`
+## H1 — Decompose the two god-objects (`app.rs`, `render.rs`) · `needs-design` · deferred (see "When")
 
-`app.rs` is **5,379 lines** and `render.rs` **3,393** — past the point where one person holds them
-in context, and `app.rs` mixes the reduce loop, startup/session-resume, and many concerns at once.
-This is the clearest structural debt, and it bites hardest right before **Effort P**: `app.rs` is
-where plugin/automation integration will land, so a plugin surface bolted onto a 5k-line reducer is
-a comprehension and review hazard.
+`app.rs` is **5,519 lines** and `render.rs` **3,393** — past the point where one person holds them in
+context. This is the clearest structural debt, and it bites hardest right before **Effort P**: `app.rs`
+is where plugin/automation wiring lands, so a plugin surface bolted onto a 5k-line reducer is a
+comprehension and review hazard.
 
-**Direction (sketch):** carve `app.rs` along seams that already exist — the reduce/message dispatch,
-startup+recovery, and the per-overlay handlers — into focused modules with explicit interfaces.
-Precedent for deliberate *non*-splits exists (the `ux-backlog.md` audit kept `block_tree.rs` whole
-on purpose), so this is a targeted split, not a tree-wide reformat. TDD-safe: behavior-identical,
-guarded by the existing e2e + reduce-loop tests.
+**Real surface (2026-07-08 measurement — most of the line count is co-located tests):**
+- `app.rs`: **~1,946 production** lines (~3,573 tests). The mass is two hubs — `reduce` (~900 lines) and
+  `run` (the event loop, ~430) — plus ~25 small helpers.
+- `render.rs`: **~1,028 production** (~2,365 tests), 26 paint fns. → **~3,000 production lines total**, not ~9k.
 
-**When:** before Effort P (highest leverage there). Not urgent for correctness.
+**Why it regrew (this drives the design).** The prior H1 pass (2026-07-04/05, commits `4e12212`…
+`5c908f3`, all "verbatim move") extracted cohesive *leaves* — `jobs_apply.rs`, `session_restore.rs`,
+`prompts.rs`, `search_ui.rs` — but deliberately left the two **hubs** (`reduce`, `run`) behind. Those
+are exactly what every new interactive feature must touch, so app.rs grew **+814 lines in ~3 days**
+(4,705 → 5,519) as D1/A5, E3/E4, the scrollbar/menu/status/mouse chrome, C3, R1, and the swap fix each
+landed the same three shapes into the hubs: (1) a new `Msg` variant → a new `reduce` match arm; (2) a
+new timed feature → a new `*_deadline` term in `run`'s loop (now **8** deadlines) + a `recompute_*`/
+`*_tick` helper; (3) co-located tests. Not sloppiness — structural: the wiring belongs at the hub, and
+the hub was left monolithic. **Effort P will do the same (plugin message-arms + hooks).**
+
+**Direction — the durable fix is a SEAM, not more leaf extraction** (leaves alone regrew once already):
+- **`run`'s deadline loop → a registry of timed subsystems** — each contributes its own deadline + tick,
+  so a new timed feature registers a subsystem instead of editing the loop. Must preserve fire-order
+  (dwell/grace first), the per-subsystem in-flight/pending gating, and the never-spin / idle-is-free
+  invariant. Keep subsystems as free fns over `&mut Editor` (as today) to avoid borrow-checker friction.
+- **`reduce`'s ~900-line match → per-domain handler modules** — keep the skeleton (prologue capture →
+  modal/minibuffer/overlay interception chain → dispatch → epilogue: version-change hook + drain-fold);
+  lift out the per-`Msg` handler bodies. The interception layering + shared epilogue are the careful
+  part (ordering bugs here shift behavior).
+- Finish the remaining **leaf extractions** (theme-cmds, chrome-`recompute_*`, session-persist, overlay
+  dispatch) and split **render.rs** by paint surface — these are the easy, verbatim-move tasks.
+
+**Difficulty: focused Medium.** Leaf extraction is trivial/low-risk. The two hubs are the real work —
+`reduce`'s interception layering (harder) and `run`'s deadline-registry (invariant + borrow care).
+Correctness risk is **low** (behavior-identical; caught by compiler + ~925 shell tests + the e2e
+`reduce→advance→render` journeys + PTY smoke) — the cost is iteration-to-green, not debugging. The one
+genuine risk is a **subtle emergent regression in the hub that no test covers** (exactly the swap-thrash
+class), so it needs: a whole-branch review gate AND a new guardrail asserting the refactored `run` loop
+still **blocks when idle** (the resource-behavior invariant).
+
+**When (decision 2026-07-08): DEFERRED until Fable credits are back.** A hub refactor of the dispatch/
+event loop is precisely the case Fable's executable whole-branch probes are worth spending on (the
+subtle-emergent-behavior risk above); the user chose not to attempt it until then. Still gated **before
+Effort P**. Not urgent for correctness.
 
 ## H2 — Interrogate the `burn`/`harper` dependency weight · `needs-design`
 
