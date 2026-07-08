@@ -12,6 +12,9 @@ thread_local! {
     /// Counts full `outline::sections` walks in `FoldView::compute` — the expensive
     /// path. A no-folds keystroke must not increment this (R1 invariant guard).
     pub static SECTIONS_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Counts `outline::heading_starts` walks in `normalize_caret` — the expensive path.
+    /// A no-folds caret move must not increment this (R1 invariant guard).
+    pub static NORMALIZE_CARET_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Per-Buffer fold state: the byte offsets of folded headings.
@@ -270,7 +273,14 @@ pub fn normalize_caret(
     buf: &TextBuffer,
     byte: usize,
 ) -> usize {
+    // R1: no folds → the caret is never inside a folded body; skip the O(document)
+    // heading_starts walk. Behavior-identical (the loop over `folds.folded` is empty).
+    if folds.is_empty() {
+        return byte;
+    }
     let rope = buf.snapshot();
+    #[cfg(test)]
+    NORMALIZE_CARET_WALKS.with(|c| c.set(c.get() + 1));
     let starts = outline::heading_starts(blocks, &rope);
     for &hb in &folds.folded {
         if !starts.contains(&hb) {
@@ -338,6 +348,32 @@ mod tests {
         SECTIONS_WALKS.with(|c| c.set(0));
         let _ = FoldView::compute(&folds, &blocks, &buf);
         assert!(SECTIONS_WALKS.with(|c| c.get()) >= 1, "folds active → the walk DOES run");
+    }
+
+    #[test]
+    fn normalize_caret_skips_walk_when_no_folds() {
+        let (blocks, buf) = doc("# H1\n\npara one\n\n## H2\n\nbody two\n");
+        let folds = FoldState::default(); // empty
+        NORMALIZE_CARET_WALKS.with(|c| c.set(0));
+        let out = normalize_caret(&folds, &blocks, &buf, 5); // caret mid-doc
+        assert_eq!(NORMALIZE_CARET_WALKS.with(|c| c.get()), 0, "no walk when no folds");
+        assert_eq!(out, 5, "no folds → caret returned unchanged");
+    }
+
+    #[test]
+    fn normalize_caret_runs_walk_and_snaps_when_folds_active() {
+        let (blocks, buf) = doc("# H1\n\npara one\n\n## H2\n\nbody two\n");
+        let mut folds = FoldState::default();
+        folds.toggle(0); // fold H1 → its body becomes hidden
+        NORMALIZE_CARET_WALKS.with(|c| c.set(0));
+        // Byte 8 is within "para one", which lies in H1's folded body_range (H1 at level 1
+        // owns the tail up to the next level<=1 heading or EOF), so it snaps to the H1 start.
+        let inside_body = 8;
+        let body = outline::body_range(&blocks, &buf.snapshot(), 0);
+        assert!(inside_body >= body.start && inside_body < body.end, "byte 8 is in H1's body");
+        let out = normalize_caret(&folds, &blocks, &buf, inside_body);
+        assert!(NORMALIZE_CARET_WALKS.with(|c| c.get()) >= 1, "folds active → the walk runs");
+        assert_eq!(out, 0, "caret in a folded body snaps to the owning heading start");
     }
 
     const DOC: &str = "# Top\nintro\n## A\nbody1\nbody2\n## B\ntail\n";
