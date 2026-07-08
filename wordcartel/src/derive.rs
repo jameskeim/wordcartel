@@ -39,6 +39,13 @@ thread_local! {
     pub static LAYOUT_RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Counts `outline::heading_starts` reconcile walks in `rebuild_downstream`. A
+    /// no-folds keystroke must not increment this (R1 invariant guard).
+    pub static HEADING_STARTS_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// R1 typing-latency bench instrumentation (test-only). Fine-grained phase spans
 /// recorded at the hot lines in `rebuild`/`rebuild_downstream` (`parse`,
 /// `heading_starts`, `foldview`, `layout_fill`), drained per keystroke by the
@@ -235,7 +242,11 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
     // compute heading starts under an immutable borrow, then retain.
     {
         let gen = editor.active().document.blocks_generation();
-        if editor.active().last_reconciled_generation != Some(gen) {
+        if !editor.active().folds.is_empty()
+            && editor.active().last_reconciled_generation != Some(gen)
+        {
+            #[cfg(test)]
+            HEADING_STARTS_WALKS.with(|c| c.set(c.get() + 1));
             #[cfg(test)]
             let bench_hs_t0 = std::time::Instant::now();
             let starts = {
@@ -371,6 +382,37 @@ mod tests {
     use super::*;
     use crate::editor::Editor;
     use wordcartel_core::style::BlockRole;
+
+    // ------------------------------------------------------------------
+    // R1 Task 2: no-folds fast path — skip the heading-starts reconcile walk
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn no_folds_downstream_skips_heading_starts_walk() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("# H1\n\npara\n\n## H2\n\nbody\n", None, (80, 24));
+        crate::derive::rebuild(&mut e); // settle: last_reconciled_generation == current gen
+        // Simulate a keystroke's tree bump WITHOUT reparsing: re-set the same blocks so
+        // blocks_generation advances (set_blocks bumps unconditionally), reopening the gate.
+        let tree = e.active().document.blocks().clone();
+        e.active_mut().document.set_blocks(tree);
+        HEADING_STARTS_WALKS.with(|c| c.set(0));
+        crate::derive::rebuild_downstream(&mut e);
+        assert_eq!(HEADING_STARTS_WALKS.with(|c| c.get()), 0, "no folds → no reconcile walk");
+    }
+
+    #[test]
+    fn folds_active_downstream_runs_heading_starts_walk() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("# H1\n\npara\n\n## H2\n\nbody\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.active_mut().folds.toggle(0); // fold H1 (FoldState::toggle, fold.rs:34)
+        let tree = e.active().document.blocks().clone();
+        e.active_mut().document.set_blocks(tree);
+        HEADING_STARTS_WALKS.with(|c| c.set(0));
+        crate::derive::rebuild_downstream(&mut e);
+        assert!(HEADING_STARTS_WALKS.with(|c| c.get()) >= 1, "folds active → the walk DOES run");
+    }
 
     // ------------------------------------------------------------------
     // Task 2: version-memoized two-phase rebuild
