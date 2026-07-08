@@ -251,8 +251,8 @@ fn first_frame_settle_refreshes_layout_for_offscreen_caret() {
     let src = "line\n".repeat(200);
     let mut e = Editor::new_from_text(&src, None, (80, 10));
     let caret = e.active().document.buffer.len().saturating_sub(1);
-    e.active_mut().document.selection = wordcartel_core::selection::Selection::single(
-        wordcartel_core::selection::BytePos(caret)); // confirm the BytePos path/ctor
+    e.active_mut().document.selection = wordcartel_core::selection::Selection::single(caret);
+    // BytePos is `pub type BytePos = usize` (lib.rs:29), so `caret` (usize) is passed directly.
     e.active_mut().view.scroll = 0;
     e.active_mut().view.scroll_row = 0;
     crate::derive::rebuild(&mut e); // builds layout for scroll = 0
@@ -267,9 +267,9 @@ fn first_frame_settle_refreshes_layout_for_offscreen_caret() {
 }
 ```
 
-> **Anchor confirmations:** (a) the `BytePos` path/constructor — grep `pub struct BytePos` /
-> `Selection::single` in `wordcartel-core/src/selection.rs` and use the real form (`BytePos(caret)` or a
-> `BytePos::new`/`from`); (b) `Buffer.layout_key` + `LayoutKey.scroll` are pub (confirmed) — if the
+> **Anchor confirmations:** (a) `BytePos` is `pub type BytePos = usize` (lib.rs:29) — a plain `usize` is
+> passed to `Selection::single` (matching app.rs:2709/3211); no wrapper; (b) `Buffer.layout_key` +
+> `LayoutKey.scroll` are pub (confirmed) — if the
 > `LayoutKey` type itself is not nameable from app.rs, assert instead on
 > `e.active().view.line_layouts.contains_key(&scroll_after)` (the `BTreeMap<usize, _>` visible-range
 > cache covers the new top line).
@@ -333,8 +333,8 @@ git commit -m "fix(r1): first_frame_settle rebuilds after ensure_visible at star
   (buffer.rs:14) + `snapshot().len_lines()`; `BlockTree: Clone` (block_tree.rs:164); `Document::set_blocks`
   (editor.rs:91); `FoldView` `PartialEq`/`Eq`, fields private → literal only inside `fold.rs` tests
   (fold.rs:126); `LayoutKey.scroll` pub (derive.rs:13) + `Buffer.layout_key` pub (editor.rs:161);
-  `Selection::single(BytePos)` (selection.rs:43) — the only still-flagged anchor is the exact `BytePos`
-  constructor path (Task 3 Step 1). TDD Red is now genuine: each counter is instrumented on the CURRENT
-  expensive path in Step 1, so the skip test fails before the guard lands.
+  `Selection::single(caret: usize)` (`BytePos` is `pub type = usize`, lib.rs:29 — no wrapper). All
+  anchors resolved. TDD Red is now genuine: each counter is instrumented on the CURRENT expensive path in
+  Step 1, so the skip test fails before the guard lands.
 - **Behavior-identical:** Tasks 1-2 change no output — the guards skip only empty-by-construction work; the full shell suite staying green (Task 2 Step 5) is the regression proof. Task 3 is `LayoutKey`-gated (no-op when scroll unchanged).
 - **Out of scope (per spec §6):** reconcile-debounce retiming, structural-generation, input coalescing, the incremental-soundness divergences — none appear as tasks.
