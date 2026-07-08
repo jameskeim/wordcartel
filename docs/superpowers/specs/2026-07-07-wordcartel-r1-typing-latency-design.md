@@ -164,6 +164,22 @@ is unchanged and a correct refresh when `ensure_visible` moved the viewport.
   instrumentation seam).
 - No `wordcartel-core` change; no `Cargo.toml` change; no new crates.
 
+## 5b. Component 4 — `normalize_caret` guard (folded in 2026-07-07, post-Fable)
+
+The Fable whole-branch gate found a THIRD instance of the same walk, outside `rebuild_downstream`:
+`fold::normalize_caret` (fold.rs:267) calls `outline::heading_starts` **unconditionally**, and it sits on
+the per-keystroke path for **caret navigation** — every arrow key (`Command::Move` central normalize),
+undo/redo/shrink (`place_caret_visible` SnapOut), mouse click, and `move_doc_end`. So a no-folds document
+still pays an O(document) walk on caret movement — which maps to the user's **line-jump (symptom 2)**, not
+just the typing jerk. **Folded into this effort (human decision 2026-07-07)** because it is the identical
+bug and an identical, behavior-identical fix.
+
+**Fix:** add `if folds.is_empty() { return byte; }` at the top of `normalize_caret` (fold.rs:273), before
+the `heading_starts` walk. Behavior-identical: with an empty `folded` set the existing loop over
+`folds.folded` never executes and returns `byte` unchanged, so the guard produces the same result while
+skipping the walk. Plus a `#[cfg(test)]` counter (mirroring Tasks 1-2) asserting zero walks on the
+no-folds path and ≥1 when a fold is active. (Plan Task 4.)
+
 ## 6. Out of scope (recorded, deliberate)
 
 - **Reconcile-debounce retiming** — the bench proved the reconcile full-parse runs off-thread in
