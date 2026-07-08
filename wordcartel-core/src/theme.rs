@@ -297,7 +297,11 @@ impl Theme {
         // ── Chrome (bar — elevated from the canvas) ──────────────────────────────────
         if self.faces.chrome == Face::default() {
             let bg = next_layer(base_bg, target);
-            self.faces.chrome = Face { fg: Some(derive_fg(base_fg, bg)), bg: Some(bg), ..Face::default() };
+            // E5: recede the bar/status fg toward its panel (still floor-guarded by derive_fg) + DIM,
+            // so the bars read as chrome, not body text. Only Chrome changes; bg and every other face
+            // are untouched, so the elevation ladder and all other pins are stable.
+            let recede = blend(base_fg, (bgr, bgg, bgb), CHROME_BAR_FG_BLEND);
+            self.faces.chrome = Face { fg: Some(derive_fg(recede, bg)), bg: Some(bg), dim: Some(true), ..Face::default() };
         }
         let bar_bg = self.faces.chrome.bg.unwrap_or(base_bg);
 
@@ -391,6 +395,8 @@ const FG_NUDGE_STEP: f32 = 0.01;  // fg legibility-nudge granularity (matches th
 // that jitter — calibrated against the §II.5 probe so every pin reproduces byte-exact.
 const CR_TOL:        f32 = 0.0005;
 const MUTED_FG_BLEND: f32 = 0.35;   // muted fg seed = blend(base_fg, base_bg, 0.35), then nudged
+const CHROME_BAR_FG_BLEND: f32 = 0.18;  // bar/status fg recedes toward its panel bg — gentler than the
+                                        // dropdown's 0.35 so the ladder stays Text > bar > dropdown.
 const ACCENT_DESAT:   f32 = 0.50;   // accent fg = blend(seed, equal_lum_gray(seed), 0.50)
 const ZEN_ACCENT_EXTRA: f32 = 0.40; // zen: extra blend of the accent fg toward the same gray
 
@@ -475,7 +481,7 @@ pub fn default() -> Theme {
             wrap_guide: Face { fg: Some(Color::DarkGray), ..Face::default() },
             // chrome today: frame/menu-closed = white/black; status & overlay-selected = REVERSED;
             // menu-selected = explicit Black-on-White (NOT reverse); dropdown-normal = white/dark-gray.
-            chrome: Face { fg: Some(Color::White), bg: Some(Color::Black), ..Face::default() },
+            chrome: Face { fg: Some(Color::White), bg: Some(Color::Black), dim: Some(true), ..Face::default() },
             chrome_reverse: modface(None, false, false, false, false, true),
             chrome_selected: Face { fg: Some(Color::Black), bg: Some(Color::White), ..Face::default() },
             chrome_muted: Face { fg: Some(Color::White), bg: Some(Color::DarkGray), ..Face::default() },
@@ -608,7 +614,7 @@ pub fn terminal_ansi() -> Theme {
             // the modal share the dropdown tone (Overlay.bg == Muted.bg) and renders the menus as
             // nicely as the RGB themes do at 16-color depth. (terminal-plain keeps its frameless
             // Black bar — its scrollbar reuses Chrome vs ChromeMuted for thumb-vs-track contrast.)
-            chrome:          Face { fg: Some(Color::White),    bg: Some(Color::DarkGray), ..Face::default() },
+            chrome:          Face { fg: Some(Color::White),    bg: Some(Color::DarkGray), dim: Some(true), ..Face::default() },
             chrome_reverse:  Face { reverse: Some(true), ..Face::default() },
             chrome_overlay:  Face { fg: Some(Color::White),    bg: Some(Color::DarkGray), ..Face::default() },
             chrome_selected: Face { fg: Some(Color::Black),    bg: Some(Color::White),   ..Face::default() },
@@ -997,7 +1003,7 @@ fn mono_faces() -> ThemeFaces {
         diag_grammar:  m(false, true, true, false, false),        // italic+underline (I7: distinct from spelling)
         focus_dim: Face { dim: Some(true), ..Face::default() },
         fold_marker: Face::default(), wrap_guide: Face::default(),
-        chrome: Face::default(),
+        chrome: Face { dim: Some(true), ..Face::default() },
         chrome_reverse: m(false, false, false, false, true),
         chrome_selected: m(false, false, false, false, true),
         chrome_muted: Face { dim: Some(true), ..Face::default() },
@@ -1654,68 +1660,68 @@ mod tests {
         //          · ChromeAccent bg,fg · label.
         let cases: &[ChromePinRow] = &[
             (flexoki_dark, ChromeDisposition::Full,
-             (0x2a,0x28,0x28),(0xce,0xcd,0xc3), (0x3e,0x3a,0x3a),(0xa5,0xa5,0x9f),
+             (0x2a,0x28,0x28),(0xac,0xab,0xa3), (0x3e,0x3a,0x3a),(0xa5,0xa5,0x9f),
              (0x3e,0x3a,0x3a),(0xce,0xcd,0xc3), (0xce,0xcd,0xc3),(0x10,0x0f,0x0f),
              (0x2a,0x28,0x28),(0x62,0x83,0xa0), "flexoki-dark FULL"),
             (flexoki_dark, ChromeDisposition::Zen,
-             (0x1e,0x1c,0x1c),(0xce,0xcd,0xc3), (0x28,0x26,0x26),(0x8e,0x8d,0x86),
+             (0x1e,0x1c,0x1c),(0xac,0xab,0xa3), (0x28,0x26,0x26),(0x8e,0x8d,0x86),
              (0x28,0x26,0x26),(0xce,0xcd,0xc3), (0xce,0xcd,0xc3),(0x10,0x0f,0x0f),
              (0x1e,0x1c,0x1c),(0x6e,0x82,0x94), "flexoki-dark ZEN"),
             (flexoki_light, ChromeDisposition::Full,
-             (0xe5,0xdf,0xc8),(0x10,0x0f,0x0f), (0xcf,0xc4,0x9b),(0x53,0x51,0x4e),
+             (0xe5,0xdf,0xc8),(0x3b,0x3a,0x38), (0xcf,0xc4,0x9b),(0x53,0x51,0x4e),
              (0xcf,0xc4,0x9b),(0x10,0x0f,0x0f), (0x10,0x0f,0x0f),(0xff,0xfc,0xf0),
              (0xe5,0xdf,0xc8),(0x3f,0x5e,0x82), "flexoki-light FULL"),
             (flexoki_light, ChromeDisposition::Zen,
-             (0xf2,0xef,0xe4),(0x10,0x0f,0x0f), (0xe7,0xe2,0xce),(0x64,0x62,0x5e),
+             (0xf2,0xef,0xe4),(0x3b,0x3a,0x38), (0xe7,0xe2,0xce),(0x64,0x62,0x5e),
              (0xe7,0xe2,0xce),(0x10,0x0f,0x0f), (0x10,0x0f,0x0f),(0xff,0xfc,0xf0),
              (0xf2,0xef,0xe4),(0x4b,0x5e,0x74), "flexoki-light ZEN"),
             (catppuccin_mocha, ChromeDisposition::Full,
-             (0x31,0x31,0x4a),(0xcd,0xd6,0xf4), (0x42,0x42,0x65),(0xae,0xb2,0xc5),
+             (0x31,0x31,0x4a),(0xae,0xb5,0xd0), (0x42,0x42,0x65),(0xae,0xb2,0xc5),
              (0x42,0x42,0x65),(0xcd,0xd6,0xf4), (0xcd,0xd6,0xf4),(0x1e,0x1e,0x2e),
              (0x31,0x31,0x4a),(0x9e,0xb4,0xd7), "mocha FULL"),
             (catppuccin_mocha, ChromeDisposition::Zen,
-             (0x27,0x27,0x3c),(0xcd,0xd6,0xf4), (0x2f,0x2f,0x48),(0x92,0x98,0xb1),
+             (0x27,0x27,0x3c),(0xae,0xb5,0xd0), (0x2f,0x2f,0x48),(0x92,0x98,0xb1),
              (0x2f,0x2f,0x48),(0xcd,0xd6,0xf4), (0xcd,0xd6,0xf4),(0x1e,0x1e,0x2e),
              (0x27,0x27,0x3c),(0xa6,0xb4,0xc9), "mocha ZEN"),
             (gruvbox_dark, ChromeDisposition::Full,
-             (0x3b,0x3b,0x3b),(0xd5,0xc4,0xa1), (0x4c,0x4c,0x4c),(0xc2,0xbc,0xaf),
+             (0x3b,0x3b,0x3b),(0xb6,0xa8,0x8b), (0x4c,0x4c,0x4c),(0xc2,0xbc,0xaf),
              (0x4c,0x4c,0x4c),(0xd5,0xc4,0xa1), (0xd5,0xc4,0xa1),(0x28,0x28,0x28),
              (0x3b,0x3b,0x3b),(0x91,0xa2,0x9b), "gruvbox-dark FULL"),
             (gruvbox_dark, ChromeDisposition::Zen,
-             (0x31,0x31,0x31),(0xd5,0xc4,0xa1), (0x39,0x39,0x39),(0xab,0xa2,0x8f),
+             (0x31,0x31,0x31),(0xb6,0xa8,0x8b), (0x39,0x39,0x39),(0xab,0xa2,0x8f),
              (0x39,0x39,0x39),(0xd5,0xc4,0xa1), (0xd5,0xc4,0xa1),(0x28,0x28,0x28),
              (0x31,0x31,0x31),(0x96,0xa0,0x9c), "gruvbox-dark ZEN"),
             (solarized_dark, ChromeDisposition::Full,
-             (0x00,0x3f,0x50),(0x97,0xa5,0xa5), (0x00,0x52,0x66),(0xb1,0xbd,0xbf),
+             (0x00,0x3f,0x50),(0x96,0xa5,0xa7), (0x00,0x52,0x66),(0xb1,0xbd,0xbf),
              (0x00,0x52,0x66),(0xb2,0xbc,0xbc), (0x93,0xa1,0xa1),(0x00,0x2b,0x36),
              (0x00,0x3f,0x50),(0x56,0x89,0xac), "solarized-dark FULL"),
             (solarized_dark, ChromeDisposition::Zen,
-             (0x00,0x34,0x41),(0x93,0xa1,0xa1), (0x00,0x3d,0x4c),(0x93,0xa3,0xa6),
+             (0x00,0x34,0x41),(0x88,0x99,0x9a), (0x00,0x3d,0x4c),(0x93,0xa3,0xa6),
              (0x00,0x3d,0x4c),(0x95,0xa3,0xa3), (0x93,0xa1,0xa1),(0x00,0x2b,0x36),
              (0x00,0x34,0x41),(0x69,0x88,0x9d), "solarized-dark ZEN"),
             (solarized_light, ChromeDisposition::Full,
-             (0xe2,0xd9,0xc2),(0x4e,0x62,0x68), (0xcd,0xbe,0x97),(0x49,0x4f,0x4e),
+             (0xe2,0xd9,0xc2),(0x55,0x60,0x63), (0xcd,0xbe,0x97),(0x49,0x4f,0x4e),
              (0xcd,0xbe,0x97),(0x40,0x50,0x55), (0x58,0x6e,0x75),(0xfd,0xf6,0xe3),
              (0xe2,0xd9,0xc2),(0x56,0x89,0xac), "solarized-light FULL"),
             (solarized_light, ChromeDisposition::Zen,
-             (0xee,0xe9,0xdc),(0x57,0x6d,0x74), (0xe4,0xdc,0xc7),(0x5b,0x62,0x61),
+             (0xee,0xe9,0xdc),(0x5e,0x6b,0x6e), (0xe4,0xdc,0xc7),(0x5b,0x62,0x61),
              (0xe4,0xdc,0xc7),(0x50,0x64,0x6a), (0x58,0x6e,0x75),(0xfd,0xf6,0xe3),
              (0xee,0xe9,0xdc),(0x69,0x88,0x9d), "solarized-light ZEN"),
             // gruvbox-light + rosepine-dawn (the other two S-capped light themes; §II.5).
             (gruvbox_light, ChromeDisposition::Full,
-             (0xdc,0xd5,0xb6),(0x50,0x49,0x45), (0xc7,0xbb,0x8b),(0x4e,0x4a,0x40),
+             (0xdc,0xd5,0xb6),(0x62,0x5b,0x51), (0xc7,0xbb,0x8b),(0x4e,0x4a,0x40),
              (0xc7,0xbb,0x8b),(0x50,0x49,0x45), (0x50,0x49,0x45),(0xfb,0xf1,0xc7),
              (0xdc,0xd5,0xb6),(0x32,0x62,0x6b), "gruvbox-light FULL"),
             (gruvbox_light, ChromeDisposition::Zen,
-             (0xe9,0xe4,0xd1),(0x50,0x49,0x45), (0xdf,0xd8,0xbc),(0x63,0x5e,0x52),
+             (0xe9,0xe4,0xd1),(0x6d,0x65,0x5a), (0xdf,0xd8,0xbc),(0x63,0x5e,0x52),
              (0xdf,0xd8,0xbc),(0x50,0x49,0x45), (0x50,0x49,0x45),(0xfb,0xf1,0xc7),
              (0xe9,0xe4,0xd1),(0x43,0x60,0x65), "gruvbox-light ZEN"),
             (rosepine_dawn, ChromeDisposition::Full,
-             (0xe4,0xd6,0xc6),(0x57,0x52,0x79), (0xd1,0xbb,0xa0),(0x4f,0x4c,0x59),
+             (0xe4,0xd6,0xc6),(0x5f,0x5b,0x74), (0xd1,0xbb,0xa0),(0x4f,0x4c,0x59),
              (0xd1,0xbb,0xa0),(0x4d,0x49,0x6c), (0x57,0x52,0x79),(0xfa,0xf4,0xed),
              (0xe4,0xd6,0xc6),(0x8a,0x7f,0x97), "rosepine-dawn FULL"),
             (rosepine_dawn, ChromeDisposition::Zen,
-             (0xef,0xe7,0xde),(0x57,0x52,0x79), (0xe6,0xda,0xcc),(0x62,0x5f,0x6e),
+             (0xef,0xe7,0xde),(0x6a,0x65,0x81), (0xe6,0xda,0xcc),(0x62,0x5f,0x6e),
              (0xe6,0xda,0xcc),(0x57,0x52,0x79), (0x57,0x52,0x79),(0xfa,0xf4,0xed),
              (0xef,0xe7,0xde),(0x88,0x81,0x8f), "rosepine-dawn ZEN"),
         ];
@@ -1729,6 +1735,7 @@ mod tests {
             assert_face_bg_fg(t.face(SemanticElement::ChromeSelected), s_bg, s_fg, label);
             assert_face_bg_fg(t.face(SemanticElement::ChromeAccent),   a_bg, a_fg, label);
             assert_eq!(t.face(SemanticElement::ChromeMuted).dim, Some(true), "{label} muted dim");
+            assert_eq!(t.face(SemanticElement::Chrome).dim, Some(true), "{label} chrome dim");
             assert_eq!(t.face(SemanticElement::ChromeAccent).bold, Some(true), "{label} accent bold");
         }
     }
@@ -1851,7 +1858,7 @@ mod tests {
         }
         // §II.5 tokyo FULL pins (byte-exact from the probe) — all five chrome faces
         assert_face_bg_fg(t.face(SemanticElement::Chrome),
-            (0x2d,0x2f,0x42), (0xc0,0xca,0xf5), "tokyo Chrome FULL (§II.5)");
+            (0x2d,0x2f,0x42), (0xa2,0xab,0xd0), "tokyo Chrome FULL (§II.5)");
         assert_face_bg_fg(t.face(SemanticElement::ChromeMuted),
             (0x3d,0x40,0x5a), (0xa8,0xad,0xc4), "tokyo ChromeMuted FULL (§II.5)");
         assert_face_bg_fg(t.face(SemanticElement::ChromeOverlay),
@@ -1914,7 +1921,7 @@ mod tests {
             "dark theme: overlay bg shares the dropdown bg (3-tone ladder)");
         // exact §II.5 pins (redundant with derive_chrome_base16_pins but keeps this self-contained)
         assert_face_bg_fg(td.face(SemanticElement::Chrome),
-            (0x2a,0x28,0x28), (0xce,0xcd,0xc3), "fd chrome");
+            (0x2a,0x28,0x28), (0xac,0xab,0xa3), "fd chrome");
 
         // light polarity: elevation goes DARKER (toward black), still strictly ordered.
         let mut tl = flexoki_light();
@@ -1927,7 +1934,7 @@ mod tests {
         assert_eq!(tl.face(SemanticElement::ChromeOverlay).bg, tl.face(SemanticElement::ChromeMuted).bg,
             "light theme: overlay bg shares the dropdown bg (3-tone ladder)");
         assert_face_bg_fg(tl.face(SemanticElement::Chrome),
-            (0xe5,0xdf,0xc8), (0x10,0x0f,0x0f), "fl chrome");  // §II.5 (S-capped)
+            (0xe5,0xdf,0xc8), (0x3b,0x3a,0x38), "fl chrome");  // §II.5 (S-capped)
     }
 
     #[test]
@@ -1939,7 +1946,7 @@ mod tests {
 
         // Zen §II.5 pins (flexoki-dark ZEN)
         assert_face_bg_fg(td_zen.face(SemanticElement::Chrome),
-            (0x1e,0x1c,0x1c), (0xce,0xcd,0xc3), "fd zen chrome");
+            (0x1e,0x1c,0x1c), (0xac,0xab,0xa3), "fd zen chrome");
         assert_face_bg_fg(td_zen.face(SemanticElement::ChromeOverlay),
             (0x28,0x26,0x26), (0xce,0xcd,0xc3), "fd zen overlay (= zen dropdown bg)");
         assert_face_bg_fg(td_zen.face(SemanticElement::ChromeMuted),
@@ -2000,7 +2007,7 @@ mod tests {
         let mut t = phosphor_green_theme();
         t.derive_chrome(ChromeDisposition::Full);
         assert_eq!(t.face(SemanticElement::Chrome).bg,        Some(rgb(0x00,0x40,0x00)), "phosphor chrome bg");
-        assert_eq!(t.face(SemanticElement::Chrome).fg,        Some(rgb(0x00,0xff,0x00)), "phosphor chrome fg");
+        assert_eq!(t.face(SemanticElement::Chrome).fg,        Some(rgb(0x00,0xd8,0x00)), "phosphor chrome fg");
         assert_eq!(t.face(SemanticElement::ChromeMuted).bg,   Some(rgb(0x00,0x54,0x00)), "phosphor muted bg");
         assert_eq!(t.face(SemanticElement::ChromeMuted).fg,   Some(rgb(0x54,0xcd,0x54)), "phosphor muted fg");
         assert_eq!(t.face(SemanticElement::ChromeOverlay).bg, Some(rgb(0x00,0x54,0x00)), "phosphor overlay bg (= dropdown bg)");
@@ -2091,5 +2098,39 @@ mod tests {
         let bg = Color::Rgb { r:0xfd, g:0xf6, b:0xe3 };
         let cr2 = contrast_ratio(fg, bg);
         assert!((cr2 - 4.99).abs() < 0.02, "solarized-light fg/canvas CR should be ≈4.99, got {cr2}");
+    }
+
+    #[test]
+    fn e5_chrome_bar_fg_recedes_and_dims() {
+        use SemanticElement::*;
+        // FLOOR-AWARE. DIM is the always-present recede signal on every RGB theme; the recede CR check
+        // only holds where body text itself clears the legibility floor on the bar panel — on the
+        // low-contrast themes (phosphor-red/blue/purple, solarized-dark/light) the pre-existing FG_FLOOR
+        // guard legitimately dominates and DIM carries the recede.
+        for name in Theme::builtin_names() {
+            let mut t = Theme::builtin(name).expect("builtin name resolves");
+            let base_fg = t.base_fg;
+            if !matches!(base_fg, Color::Rgb { .. }) { continue; } // non-RGB → derive_chrome skips
+            t.derive_chrome(ChromeDisposition::Full);
+            let chrome = t.face(Chrome);
+            let cbg = chrome.bg.expect("derived chrome bg");
+            let cfg = chrome.fg.expect("derived chrome fg");
+            let cr = |a: Color, b: Color| contrast_ratio(a, b);
+            assert_eq!(chrome.dim, Some(true), "{name}: chrome must carry DIM");
+            let body_on_bar = cr(base_fg, cbg);
+            if body_on_bar >= FG_FLOOR {
+                assert!(cr(cfg, cbg) <= body_on_bar + CR_TOL,
+                    "{name}: chrome fg must not out-contrast body text on the bar panel (recede)");
+            }
+        }
+    }
+
+    #[test]
+    fn e5_non_rgb_chrome_carries_dim() {
+        use SemanticElement::*;
+        // default() = terminal-plain; terminal_ansi(); no_color() are the three non-RGB builtins.
+        for t in [default(), terminal_ansi(), no_color()] {
+            assert_eq!(t.face(Chrome).dim, Some(true), "{} chrome must carry DIM", t.name);
+        }
     }
 }
