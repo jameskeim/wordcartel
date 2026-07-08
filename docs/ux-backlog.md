@@ -174,6 +174,11 @@ navigation, internal plumbing, keystroke-native), bringing only the genuine judg
 approval. Lower-risk polish; rides whenever. Independent of A3 (A3 fixes the contract-*violation*;
 A3b is the contract-*application* sweep). The state-in-label display (E2) is already done.
 
+**Concrete question to resolve in this pass (user-reported 2026-07-08):** should **`filter`**
+(`Filter…`, currently `MenuCategory::Edit` — `registry.rs:140`) move to the **Format** menu? Format
+already holds the text transforms (reflow/unwrap/ventilate, `registry.rs:300+`), and a shell filter is
+arguably a text-shaping op. Weigh Edit (buffer mutation, like cut/paste) vs Format (text shaping).
+
 ### A4. Menu accelerators (Alt+F/Alt+E…) — `dropped` (2026-07-03)
 
 **Decided: no global Alt accelerators.** With the settled A1 model, any category is two
@@ -205,6 +210,20 @@ path; no switch command; presets = cua, wordstar. **Direction:** a `keymap_prese
 the trie is borrowed by `reduce`); menu hints stay fresh automatically (menu rebuilds on every
 open); palette hints must re-resolve. Persistence rides on D1 — these two ship together.
 Checkable/radio menu items (E2) show the active preset.
+### A7. Right-justify the state VALUE in stateful menu rows — `needs-design` (user-reported 2026-07-08)
+
+**Observation (user):** in the Settings menu, stateful rows like `Clipboard: Auto` and `Keymap: CUA`
+should have the value (`Auto`, `CUA`) **right-justified**, not run inline after the colon.
+
+**Grounded (may drift):** stateful leaves render today as one left-aligned string `"{base}: {value}"`
+(`menu.rs:~57`, `leaf_text`, from `MenuMark::Value` / `registry.rs:47`). The dropdown ALREADY
+right-justifies a different field — the chord hint — to a common flush-right column (`right_justify`,
+`menu.rs:~74`, matching the palette). So the ask is to extend that flush-right treatment to the state
+value: render `Clipboard        Auto   <chord>` (base left, value in a right-aligned column) instead of
+`Clipboard: Auto   <chord>`. Direction: split stateful leaves into base + value and align the value
+column, coexisting with the existing chord column and leaving stateless rows unchanged. Anchors:
+`menu.rs` (`leaf_text` state-in-label + `right_justify`), `MenuMark::Value` (`registry.rs:47`).
+
 ### A6. Palette reachability: full-list scrolling + wheel + click dead zones — `SHIPPED` 2026-07-04 (A6 T1+T2)
 
 *(Added 2026-07-04; answers A3(b). Facts as of `bd3b72c`.)*
@@ -363,6 +382,35 @@ delete the variant, fix the cycle at `commands.rs:482` + label) if the highlight
 isn't wanted. **Recommendation: FIX, don't drop** — the styles are already computed and the
 geometry is already correct, so a genuine colored-markdown-source view is near-free; one of the
 better effort-to-payoff ratios on the list.
+
+---
+
+### B5. Low heading-level glyphs (H5/H6) collide with the blockquote/list prefixes — `needs-design` (user-reported 2026-07-08)
+
+**Observation (user):** the **heading-level glyph** (the B3 prefix marker, not the color) for H5/H6
+looks like other constructs' prefixes — **H6's glyph is literally a bullet point** (reads as a list
+item) and **H5's glyph is basically the vertical bar drawn in front of a blockquote**.
+
+**Grounded — confirmed, this is a real glyph collision (may drift):** the heading glyphs are a single
+shade ramp, `SHADES = ["█", "▓", "▒", "░", "▏", "·"]` (`wordcartel/src/render.rs:18`, used both in
+cue/no-color mode and when `heading_level_glyph` is on). The ramp reads as "heading intensity" for
+H1–H4 (`█▓▒░`, solid→light blocks), but its low end lands on shapes other prefixes already own:
+- **H5 = `▏`** (U+258F LEFT ONE EIGHTH BLOCK) vs the **blockquote prefix `▎`** (U+258E LEFT ONE QUARTER
+  BLOCK, `render.rs:~2003`) — *adjacent codepoints*, both thin left-edge vertical bars; near
+  indistinguishable at a glance.
+- **H6 = `·`** (U+00B7 MIDDLE DOT) vs the **list bullet `•`** (U+2022, `render.rs:~1968`) — both dots;
+  H6 reads as a bullet.
+
+**Compounding (secondary):** for H6 the color aliases too — in every `from_base16` theme H6 fg and
+`list_marker` fg are the same slot `b[0x8]`, so an H6 is *both* a dot glyph AND the list-marker hue →
+doubly list-like. (Color is the smaller issue; the glyph is the reported one.)
+
+**Direction (forks remain):** pick H5/H6 glyphs that stay in the "heading" visual family yet are
+distinct from `▎` (blockquote) and `•`/`·` (list) — e.g. rework the ramp's low end so it doesn't
+decay into a bar and a dot, or use a different heading-marker idiom for the deep levels. Must hold in
+cue/no-color mode (SHADES drives that path too) and reserve the same 2-col prefix width
+(`layout.rs:894`). Anchors: `SHADES` (`render.rs:18`), the blockquote glyph `▎` + list bullet `•`
+(`render.rs`), B3 (heading glyphs default on).
 
 ---
 
@@ -728,6 +776,34 @@ Obvious candidates the research should weigh: Gruvbox, Catppuccin, Nord, Dracula
 Everforest, Rosé Pine. Deliverable: a shortlist with per-theme markdown-rendering evidence +
 face-model mapping notes, for the user to pick from. New themes land into E3's restructured
 chrome model (hence the ordering).
+
+---
+
+### E5. Chrome text intensity — distinguish menu/status bars from document text — `needs-design` (user-reported 2026-07-08)
+
+**Observation (user):** the menu bar and status bar are visually distinct panels, but their **text is
+the same color and intensity as the document body text**, so the *type* on the bars doesn't read as
+chrome. Consider stepping the foreground intensity down on both so the bars are clearly not content.
+
+**Grounded (may drift):** `Theme::derive_chrome` (`wordcartel-core/src/theme.rs:239`) builds the
+chrome fg from `derive_fg(base_fg, bg)` (`:300`, `:323`) — it seeds from **`base_fg` (the document
+body-text color)** and only nudges it enough to clear the `FG_FLOOR` = 4.5 legibility floor
+(`:383`) against the *elevated panel background*. So the elevation currently lives entirely in the
+BACKGROUND ladder (bar/dropdown/overlay step away from the canvas), while the chrome TEXT stays at
+body-text hue/weight. On themes where the bg step is subtle, the bars read as same-weight text on a
+faint panel. (terminal-plain/terminal-ansi use a reverse/explicit-named treatment instead — separate
+path; no-color uses modifiers.)
+
+**Direction (forks remain):** give chrome foreground a deliberate "recede" step below document
+`Text` — e.g. a dim/lower-contrast target (still ≥ the 4.5 floor), or a muted-fg tone — so menu/status
+type is legibly secondary. Note there is already a precedent: `ChromeMuted` (dropdown/secondary) is
+dim; this would extend a similar intent to the primary bar/status fg. Constraints: stay ≥ the
+legibility floor `derive_chrome` enforces; compose with density presets (E1, zen/full), the active-
+prompt accent (`ChromeAccent`), the Ansi16 fixed policy, and no-color/mono (no hue to dim → needs a
+modifier like DIM). Extends the **already-shipped** E3 chrome model (`derive_chrome`) — specifically
+its fg-derivation step, which today seeds chrome text from body `base_fg`. Anchors:
+`derive_chrome`/`derive_fg`/`FG_FLOOR` (`wordcartel-core/src/theme.rs`), the six chrome
+`SemanticElement`s, E1.
 
 ---
 

@@ -84,3 +84,32 @@ yield" list only as a **yield** item (chase the tail further only if a real user
 appears, or as a side effect of a future B-style investment). It should **not** be re-raised as
 open correctness debt. `block_tree.rs` remains the shared hotspot for both this and the R1
 paragraph-end widen cost, so any future work there touches both.
+
+## H4 — Arch package should declare pandoc (+ a TeX engine) as optdepends · `needs-design` (user-reported 2026-07-08)
+
+The Arch `PKGBUILD` (`packaging/arch/PKGBUILD`) lists optdepends for clipboard (wayland/libxcb/libx11/
+wl-clipboard/xclip) but **not pandoc**, even though export shells out to it: `wordcartel/src/export.rs`
+runs pandoc for html/docx/pdf export. It is genuinely *optional* — `probe_pandoc()` is cached and
+returns false when pandoc is absent, and callers gate on it and show a status instead of failing — so
+the right declaration is an **optdepend**, not a hard `depends`: `pandoc: markdown export (html/docx/pdf)`.
+The **PDF** path additionally needs a TeX engine — the pandoc `--pdf-engine` defaults to xelatex
+(`config.rs:139`) — so a second optdepend is likely warranted (e.g. `texlive-xetex: PDF export via
+pandoc --pdf-engine=xelatex`). Direction: add both to the PKGBUILD optdepends when next touched; confirm
+the exact Arch package names for the TeX engine. Anchors: `packaging/arch/PKGBUILD`,
+`wordcartel/src/export.rs`, `wordcartel/src/config.rs:139`.
+
+## H5 — App-managed cleanup of swap files / state-dir debris? · `needs-design` (user-reported 2026-07-08)
+
+**Question (user):** should there be an in-app way to clean up swap files and other filesystem debris,
+or is that something the user does outside the program?
+
+**Grounded (may drift):** the app writes crash-recovery + session state under the XDG state dir
+(`~/.local/state/wordcartel`, `swap::state_dir`): per-doc `*.swp` (hashed path), scratch
+`scratch-{pid}.swp`, `session.toml`, and — as the swap durability work surfaced — occasional orphaned
+atomic-write `*.tmp` files and stale swaps (e.g. the intentionally-left stale swap after a SaveAs
+rekey, or scratch swaps from crashed sessions). `swap::find_orphan_scratch_swap` already scans for
+crashed-scratch orphans on launch (for *recovery*), but nothing *prunes* accumulated debris. Forks to
+weigh: (a) auto-prune on launch (delete swaps whose owning pid is dead AND whose doc is clean/unchanged);
+(b) an explicit command (`Clean recovery files…`); (c) leave it to the user + document the dir. Ties to
+the swap durability model (memory: `wordcartel-swap-idle-thrash`). Anchors: `wordcartel/src/swap.rs`
+(`state_dir`, `swap_path`, `find_orphan_scratch_swap`), `recovery.rs`.
