@@ -1283,7 +1283,11 @@ mod e2e_bench {
         let _ = std::fs::write(base.join("r1-bench-slopes.md"), slopes);
     }
 
+    // Release-only bench — Debug Instant timing is meaningless, and running it in the
+    // default `cargo test` suite adds minutes and overwrites the recorded release CSV.
+    // Run explicitly: `cargo test -p wordcartel --release e2e_bench -- --ignored --nocapture --test-threads=1`.
     #[test]
+    #[ignore = "release-only bench; run with --release --ignored (see comment)"]
     fn r1_typing_latency_bench() {
         let mut s = Samples::default();
         let sts = structures();
