@@ -152,6 +152,19 @@ known). DRY; no dead code; no technical debt.
 substrate (worker results are `Send`, version-discarded on staleness). Never block the input
 loop.
 
+**Resource behavior — proportional to work, free at rest.** A well-behaved editor spends
+resources in proportion to what the user is doing and ~nothing at rest. **Idle is free:** with
+no input and nothing animating, the input loop BLOCKS — no CPU spin, no polling, no background
+disk writes. Background/periodic work (swap, reconcile, diagnostics, autosave) is **edge-triggered
+by a real content/state change, never level-triggered off wall-clock or a monotonic timestamp**
+(the class behind the 2026-07-08 swap-thrash bug — a swap file rewritten every idle wake because
+`due` keyed off a never-cleared `last_edit_at`). **Disk writes track saves/edits, never idle
+duration** (a settled buffer writes its recovery swap at most once per edit-version — SSD
+endurance). **Memory** ≈ fixed baseline + `O(content held)` + bounded undo, released on buffer
+close, capped (M5) — not 1:1 with file size. Back these with guardrail tests where practical (the
+swap SSD-wear guardrails are the first instance): idle/settled states asserted to do no background
+work.
+
 **Pattern matching:** prefer exhaustive matches; avoid catch-all `_` where it would silently
 absorb a new variant (the theme `SemanticElement` constructors use exhaustive literals on
 purpose).
