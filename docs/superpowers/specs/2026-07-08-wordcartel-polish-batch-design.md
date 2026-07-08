@@ -362,12 +362,18 @@ finding, human decision 2026-07-08 "Option A"):** iterate **all RGB builtin them
 assert:
 - **Mechanism (every RGB theme):** `chrome.dim == Some(true)` — the DIM modifier is the always-present
   recede signal.
-- **Ladder (only where there is contrast headroom):** *when* `contrast_ratio(base_fg, chrome.bg) >=
+- **Recede (only where there is contrast headroom):** *when* `contrast_ratio(base_fg, chrome.bg) >=
   FG_FLOOR`, assert `contrast_ratio(chrome.fg, chrome.bg) <= contrast_ratio(base_fg, chrome.bg) + CR_TOL`
-  (chrome text does not out-contrast body text on the bar panel — it recedes) AND
-  `contrast_ratio(chrome.fg, chrome.bg) + CR_TOL >= contrast_ratio(chrome_muted.fg, chrome_muted.bg)`
-  (bar sits at/above the dropdown).
+  (chrome text does not out-contrast body text on the bar panel — it recedes).
 - Plus the separate `e5_non_rgb_chrome_carries_dim` test (terminal-plain / terminal-ansi / no-color).
+
+**Dropped clause (2nd SDD finding, human decision 2026-07-08):** an earlier draft also asserted the bar
+sits at/above the dropdown (`CR(chrome.fg,chrome.bg) >= CR(muted.fg,muted.bg)`). Removed — it is NOT
+E5's goal (that is *recede below body text*), and it is not a sound test: it compares each face's
+contrast against its *own, different* panel bg, so it does not measure relative prominence. It failed on
+catppuccin-latte (chrome 4.552 vs dropdown 4.622 — a 0.07 direction-arbitrary inversion when both hug the
+floor on their respective panels). The bar and dropdown are distinguished by bg elevation + both carry
+DIM regardless.
 
 **Why floor-aware (the SDD finding):** the original test demanded the recede ladder on *every* theme.
 That is **mathematically unsatisfiable on 5 of 19 RGB builtins** (`phosphor-red/blue/purple`,

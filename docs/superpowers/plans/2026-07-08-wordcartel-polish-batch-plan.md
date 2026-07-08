@@ -516,19 +516,16 @@ Expected: PASS (behavior is identical for all in-cap valid dictionaries).
             if !matches!(base_fg, Color::Rgb { .. }) { continue; } // non-RGB → derive_chrome skips
             t.derive_chrome(ChromeDisposition::Full);
             let chrome = t.face(Chrome);
-            let muted = t.face(ChromeMuted);
             let cbg = chrome.bg.expect("derived chrome bg");
             let cfg = chrome.fg.expect("derived chrome fg");
             let cr = |a: Color, b: Color| contrast_ratio(a, b);
             // Mechanism — holds on EVERY RGB theme.
             assert_eq!(chrome.dim, Some(true), "{name}: chrome must carry DIM");
-            // Ladder — only where the bar panel has contrast headroom for body text.
+            // Recede — only where the bar panel has contrast headroom for body text.
             let body_on_bar = cr(base_fg, cbg);
             if body_on_bar >= FG_FLOOR {
                 assert!(cr(cfg, cbg) <= body_on_bar + CR_TOL,
                     "{name}: chrome fg must not out-contrast body text on the bar panel (recede)");
-                assert!(cr(cfg, cbg) + CR_TOL >= cr(muted.fg.unwrap(), muted.bg.unwrap()),
-                    "{name}: chrome fg must sit at/above the dropdown");
             }
         }
     }
