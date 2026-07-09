@@ -144,3 +144,31 @@ weigh: (a) auto-prune on launch (delete swaps whose owning pid is dead AND whose
 (b) an explicit command (`Clean recovery files…`); (c) leave it to the user + document the dir. Ties to
 the swap durability model (memory: `wordcartel-swap-idle-thrash`). Anchors: `wordcartel/src/swap.rs`
 (`state_dir`, `swap_path`, `find_orphan_scratch_swap`), `recovery.rs`.
+
+## H6 — Decide a point-release version scheme + release process · `needs-design` (user-reported 2026-07-09)
+
+**Question (user):** decide on a point-release and versioning SYSTEM for the app.
+
+**Grounded (may drift):** there is NO semantic version today — the Cargo crates are `version = "0.0.0"` and
+the Arch `PKGBUILD` uses a VCS-style `pkgver()` = `0.0.0.r<commits>.g<hash>` (`packaging/arch/PKGBUILD:37`),
+so every build is a git-describe snapshot with no human-meaningful release points. A point-release system
+means choosing: (a) a scheme (SemVer `0.x`→`1.0` aligned to the Effort-P 1.0 capstone? CalVer?); (b) the
+canonical home for the version (Cargo workspace `version`, a `VERSION` file, or git tags); (c) how the
+PKGBUILD `pkgver()` derives from it (tag-based `git describe` instead of a raw commit count); (d) a
+tag/changelog/release ritual. Ties to the 1.0 framing (Effort P = the 1.0 capstone per CLAUDE.md) and the
+H4 packaging work. Anchors: `Cargo.toml` (`version`), `packaging/arch/PKGBUILD` (`pkgver()` :37), git tags
+(none today).
+
+## H7 — Audit `.unwrap()` usage across the tree · `needs-design` (user-reported 2026-07-09)
+
+**Question (user):** audit and consider `.unwrap()` usage.
+
+**Grounded (may drift):** the policy already exists — "no `.unwrap()` on fallible/external paths; a guarded
+unwrap immediately after establishing the invariant is acceptable, but prefer `.expect(\"…invariant…\")`"
+(CLAUDE.md Rust conventions) — and the 2026-07-07 eval measured ~35 real-runtime `.unwrap()`s across ~18k
+production LOC (the raw grep of ~740 is ~96% co-located tests + the e2e harness; see this doc's Snapshot).
+This item = a deliberate sweep of those ~35: classify each as guarded-invariant (→ convert to `.expect` with
+a message) vs genuinely-fallible (→ typed error to the status line), and confirm none sit on an
+untrusted/IO/async path that M2/M3/M4 didn't already cover. Low-risk, mechanical, high-confidence — a good
+fold into a future hardening pass. Anchors: CLAUDE.md (unwrap policy), this doc's Snapshot (the ~35 count),
+the M2/M3/M4 boundaries.

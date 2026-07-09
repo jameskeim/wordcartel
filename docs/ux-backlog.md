@@ -242,6 +242,90 @@ A3 curation pass (reduced — the "subset impression" was reachability, now fixe
 full effort when prioritized.
 
 
+### A8. A menu listing the open documents to switch between — `needs-design` (user-reported 2026-07-09)
+
+**Idea (user):** a dynamic menu that lists the currently-open documents so you can switch between them
+(a "Window" / "Buffers" / "Documents" menu that auto-populates from the open buffers).
+
+**Grounded (may drift):** menu categories are a FIXED enum `MenuCategory = [File, Edit, Format, View,
+Settings, Export]` (`registry.rs:39-42`) with statically-registered commands — there is no buffer switcher
+today. A per-buffer menu is a NEW menu shape: entries generated from the LIVE buffer list at open time, not
+from the static registry. Command-surface implications: the registry is the single source of truth, so a
+dynamic menu needs either per-buffer commands registered on open, or a menu-population hook the contract
+doesn't have yet. Open Qs: naming (Window vs Buffers vs Documents); ordering (MRU vs open order); does it
+also appear in the palette; interaction with C4 (close-buffer prompt). Anchors: `registry.rs`
+(`MenuCategory`, `MENU_ORDER`), the menu builder (`menu.rs`), the editor's buffer list, existing next/prev-
+buffer commands.
+
+### A9. "Set Wrap Column…" → "Wrap Column: <value>" (state-in-label) — `needs-design` (user-reported 2026-07-09)
+
+**Idea (user):** rename "Set Wrap Column…" to "Wrap Column" and show the CURRENT wrap-column value in the
+label, like the other stateful options.
+
+**Grounded (may drift):** `set_wrap_column` is a STATELESS command in the **Settings** menu (`registry.rs:547`,
+label "Set Wrap Column…") that opens a minibuffer (`MinibufferKind::WrapColumn`). (Note: you said "View" —
+it's actually Settings.) Showing the value means converting it to STATEFUL (`register_stateful` +
+`MenuMark::Value(current)`), mirroring `cycle_scrollbar` / `clipboard_provider` (`registry.rs:480-510`). The
+"…" convention means "opens a prompt" — decide whether the stateful label keeps that affordance (e.g. "Wrap
+Column: 80…") or separates show-vs-set. Command-surface contract: a stateful option needs its state fn + the
+shared setter; the minibuffer flow stays. Anchors: `registry.rs:547` (`set_wrap_column`), `registry.rs:899`,
+the state-in-label rule.
+
+### A10. A dedicated "Block" menu for the marked-block commands — `needs-design` (user-reported 2026-07-09)
+
+**Idea (user):** the existing marked-block commands (mark / move / save a block, etc.) may deserve their OWN
+menu, separate from Edit — block-level manipulation is a slightly different mental model than character-level
+editing. This is purely a menu-ORGANIZATION question about EXISTING commands — NOT new behaviour and NOT
+operation scope (scope is A11).
+
+**Grounded (may drift):** there is already a coherent "marked block" command family (`blocks_marked` module),
+today all under **Edit** except one under **File**: `block_begin`/`block_end` ("Set Block Begin/End"),
+`mark_block_from_selection`, `block_copy`/`block_move`/`block_delete`, `block_jump_begin`/`block_jump_end`,
+`block_toggle_hidden`, `block_clear`, `copy_block_to_scratch`/`move_block_to_scratch`
+(`registry.rs:273-290`), plus `block_write` "Write Block to File…" in **File** (`registry.rs:286`). A "marked
+block" is a persistent begin/end region distinct from a character selection. A new `MenuCategory::Block` is a
+command-surface change: add the enum variant + a `MENU_ORDER` slot, repoint each command's `menu`, keep every
+command in the palette (menu ⊆ palette). Open Qs: menu name/position; whether `block_write` also moves (or is
+dual-listed); whether the scratch pair belongs here or with scratch; does anything stay in Edit. Anchors:
+`registry.rs:273-290` (the block family), `blocks_marked`, `MenuCategory`/`MENU_ORDER` (`registry.rs:39-42`),
+the menu⊆palette contract rule.
+
+### A11. Filter + transform SCOPE: whole-buffer vs marked-block vs selection (+ filter docs) — `needs-design` (user-reported 2026-07-09)
+
+**Questions (user):** (1) does `Filter` operate on the whole buffer, or can it be scoped to a block/selection?
+(2) should the transforms (Reflow/Unwrap/Ventilate) operate on a block? (3) settle a STANDARD "block vs
+selection" scope so every scope-taking command agrees. (4) does Filter need user-facing DOCUMENTATION /
+example filters (and does it work with an arbitrary filter)?
+
+**Grounded (may drift):** `Filter…` (Edit, `registry.rs:140`) opens `MinibufferKind::Filter`; `Transform…`
+(View, `registry.rs:185`) and the discrete `Reflow`/`Unwrap`/`Ventilate` (Format, `registry.rs:300-309`) call
+`transform::dispatch_transform(..., None, …)` — the `None` is the range/scope arg. **C2 ("Transform scope")
+SHIPPED 2026-07-05** decided the TRANSFORM-UNIT rule for Reflow/Unwrap/Ventilate — start there; it likely
+answers (2) and constrains (3). The open piece is FILTER's scope + a UNIFIED block-vs-selection convention
+shared by filter, transforms, and the marked-block model (A10 / `blocks_marked`): decide whether "scope" =
+character selection, the persistent marked block, or the structural block at the caret, and make all
+scope-taking commands agree. Also confirm what Filter does today (whole buffer?) and whether it needs
+docs/examples. Anchors: `filter` (`registry.rs:140`), `MinibufferKind::Filter`, `transform::dispatch_transform`,
+C2 (SHIPPED), `blocks_marked` (marked-block model).
+
+### A12. Scratch buffer = a dedicated TOGGLE, not a cyclable buffer — `needs-design` (user-reported 2026-07-09)
+
+**Idea (user):** reaching the scratch buffer should be a single TOGGLE command that flips between the current
+buffer and the scratch buffer (and back) — bindable to a hotkey. The scratch buffer should NOT be reachable
+by cycling (next/prev) or the buffer switcher; it is a special side surface, toggle-only.
+
+**Grounded (may drift):** today scratch is reached ONE-WAY via `goto_scratch` "Go to Scratch Buffer" (View,
+`registry.rs:295` → `workspace::goto_scratch`), and it appears to be an ordinary workspace buffer — so it is
+ALSO reachable through `next_buffer`/`prev_buffer` (View, `registry.rs:293-294`) and `switch_buffer` "Switch
+Buffer…" (`registry.rs:296`, the switcher). The ask: (1) add a `toggle_scratch` command that remembers the
+prior buffer and returns to it when invoked from scratch (round-trip), suitable for a hotkey; (2) EXCLUDE the
+scratch buffer from the next/prev cycle, the switcher, and the open-documents menu (A8) — making scratch a
+dedicated toggle target, not a document in the rotation. Open Qs: keep `goto_scratch` or replace it with the
+toggle; what "previous buffer" means if that buffer was closed; one global scratch or per-session. Anchors:
+`goto_scratch` / `next_buffer` / `prev_buffer` / `switch_buffer` (`registry.rs:293-296`),
+`workspace::goto_scratch`, the workspace buffer list; relates to A8 (switcher — scratch excluded) and the
+block→scratch commands (`scratch.rs`).
+
 ---
 
 ## Theme B — rendering fidelity
@@ -411,6 +495,68 @@ decay into a bar and a dot, or use a different heading-marker idiom for the deep
 cue/no-color mode (SHADES drives that path too) and reserve the same 2-col prefix width
 (`layout.rs:894`). Anchors: `SHADES` (`render.rs:18`), the blockquote glyph `▎` + list bullet `•`
 (`render.rs`), B3 (heading glyphs default on).
+
+*(B5 SHIPPED 2026-07-08 in the polish batch — `SHADES` is now the single-axis ramp `█▆▅▄▃▂`
+(`render.rs:20`); this entry's "grounded" section shows the pre-fix ramp.)*
+
+### B6. Heading-glyph STYLE toggle — shades / Nerd numerals / inverted numerals — `needs-design` (user-reported 2026-07-09)
+
+**Idea (user):** offer the heading-level glyph as a selectable STYLE, cycling among three looks:
+(1) the current shade ramp; (2) Nerd Font numeric-box glyphs `󰬺 󰬻 󰬼 󰬽 󰬾 󰬿` (U+F0B3A–F, Material-Design
+"numeric-N-box"); (3) inverted numerals — a reverse-video digit `1`–`6`.
+
+**Pinned design (from the 2026-07-09 exploration):** all three fit the CURRENT 2-cell gutter
+(`glyph + space`, `prefix_width = 2`, `layout.rs:289`) — the cheap tier, no layout/caret/wrap change.
+Render just picks a glyph table + whether to add a `reverse` modifier on the glyph (NOT the space):
+- **Shades** — `█ ▆ ▅ ▄ ▃ ▂` (current, `render.rs:20`), dim, no reverse. Font-universal.
+- **Nerd** — reversed `󰬺`..`󰬿` + a normal space. Single-width (`wcwidth=1`; but `east_asian_width=A`,
+  ambiguous — may render 2-wide on wide-ambiguous terminals). Requires a Nerd Font (tofu otherwise).
+- **Inverted numeral** — reversed `1`..`6` + a normal space. Font-universal.
+The reversed box's fill = the heading level's fg colour, so per-level heading colours tint the box.
+
+**Open forks (for the brainstorm):**
+- On/off model: fold the existing `heading_level_glyph` bool (`theme.rs:119`) into the style enum as an
+  `Off` state (one 4-way control) vs keep on/off separate from the 3-way style.
+- Where it lives: a runtime user cycle command (palette/menu/keybind, persisted — command-surface tax,
+  templated on `cycle_scrollbar` / `clipboard_provider`, `registry.rs:480-510`) vs a theme-only property.
+- Default MUST stay **Shades** (universal); Nerd is opt-in (font dependency). The minimal themes
+  (no-color / terminal-plain / terminal-ansi) should not default to Nerd.
+
+**Difficulty:** Small–Medium, one effort, templated. Cost = the command-surface invariant-test gates +
+heading golden/pin churn across three styles. Anchors: `SHADES` (`render.rs:20`), heading paint sites
+(`render.rs:~665,~730`), `prefix_width` (`layout.rs:289`), `heading_level_glyph` (`theme.rs:119`),
+multi-state-option template (`registry.rs:480-510`).
+
+### B7. Selected menu-item text too light / less legible — `potential-bug` (user-reported 2026-07-09)
+
+**Observation (user):** the text of the HIGHLIGHTED (selected) menu item is too light. It "used to be dark"
+(more legible); the user suspects the E5 dimming treated all menu text uniformly, hurting the selected
+item's legibility, and asks whether the selected item should get a distinct highlight color.
+
+**Grounded (may drift) — filed as a POTENTIAL BUG (possible regression from E5, shipped this session):** the
+selected menu item uses the `ChromeSelected` face — "explicit fg/bg selection (menu item — today
+Black-on-White, NOT reverse)" (`theme.rs:37`), and `derive_chrome` marks it "inverted highlight —
+UNCHANGED" (`theme.rs:332`). On paper E5 (which receded/dimmed the `Chrome` BAR face, `5e1c2ea`) did NOT
+touch `ChromeSelected` — so if the selected text really went dark→light, the cause is subtler than a direct
+E5 edit and needs investigation. Candidates: the dropdown NORMAL items use `ChromeMuted` + DIM, and the
+selection may be drawn as a bg change that leaves the dim fg in place rather than swapping to
+`ChromeSelected`'s dark fg; or a compose-order interaction. Two directions the user raised: (a) give the
+selected item a dedicated highlight fg color; (b) at minimum restore dark, legible selected-item text.
+Anchors: `ChromeSelected` (`theme.rs:37,332`), the dropdown/selected-item render path (`render.rs` menu
+paint), `ChromeMuted` (dropdown normal), E5 (`derive_chrome` recede, `5e1c2ea`).
+
+### B8. Configurable terminal text-caret shape / colour — `needs-design` (user-reported 2026-07-09)
+
+**Idea (user):** let the user choose the colour and size/style of the terminal text caret (block vs beam vs
+underline, blink, colour) — "some people have opinions on the caret they use/see."
+
+**Grounded (may drift):** the app does NOT set the terminal cursor shape today (no `DECSCUSR` /
+`SetCursorStyle` / OSC-cursor-colour emission in the tree) — it leaves the caret to the terminal default.
+Adding it means emitting `DECSCUSR` (`CSI Ps SP q`: 1/2 block, 3/4 underline, 5/6 bar; blink vs steady) on
+startup/focus and restoring on exit, and optionally OSC 12 cursor-colour set/reset — plus a user-settable,
+persisted style option (command-surface). Caveats: terminal support varies; tmux passthrough; MUST restore
+the caret on exit/suspend/panic (mirror the panic→restore path). Anchors: crossterm cursor APIs, terminal
+setup/teardown (raw-mode enter/leave + the panic-restore hook), the command-surface option pattern.
 
 ---
 
@@ -804,6 +950,20 @@ modifier like DIM). Extends the **already-shipped** E3 chrome model (`derive_chr
 its fg-derivation step, which today seeds chrome text from body `base_fg`. Anchors:
 `derive_chrome`/`derive_fg`/`FG_FLOOR` (`wordcartel-core/src/theme.rs`), the six chrome
 `SemanticElement`s, E1.
+
+### E6. Splash / start screen with app name + info — `needs-design` (user-reported 2026-07-09)
+
+**Idea (user):** a splash / start screen showing the app name and information (version, quick help, maybe
+recent files).
+
+**Grounded (may drift) — tension with Theme E's ethos to reconcile:** Theme E is "minimalist by default,
+complete on demand," so a splash must fit that — most likely shown ONLY on an empty/no-file launch,
+dismissed on the first keystroke, never blocking instant typing (à la Vim's intro), OR gated behind a
+setting. Content candidates: app name/tagline (see the naming lore), version (`pkgver`), a few key bindings,
+open/recent affordances. Open Qs: empty/scratch launches only vs always; static vs interactive (recent-files
+list); replace vs overlay the empty canvas. Must vanish the instant the user acts. Anchors: the
+empty-canvas / no-buffer startup render path (`render.rs`), the app name/tagline (memory:
+`wordcartel-tagline`), the version string.
 
 ---
 
