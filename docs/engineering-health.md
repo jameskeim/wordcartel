@@ -116,7 +116,7 @@ appears, or as a side effect of a future B-style investment). It should **not** 
 open correctness debt. `block_tree.rs` remains the shared hotspot for both this and the R1
 paragraph-end widen cost, so any future work there touches both.
 
-## H4 — Arch package should declare pandoc (+ a TeX engine) as optdepends · `needs-design` (user-reported 2026-07-08)
+## H4 — Arch package should declare pandoc (+ a TeX engine) as optdepends · `SHIPPED` 2026-07-08 (polish batch, a0912df: `pandoc-cli` + `texlive-xetex` optdepends)
 
 The Arch `PKGBUILD` (`packaging/arch/PKGBUILD`) lists optdepends for clipboard (wayland/libxcb/libx11/
 wl-clipboard/xclip) but **not pandoc**, even though export shells out to it: `wordcartel/src/export.rs`

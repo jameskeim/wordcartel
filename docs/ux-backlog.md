@@ -210,7 +210,7 @@ path; no switch command; presets = cua, wordstar. **Direction:** a `keymap_prese
 the trie is borrowed by `reduce`); menu hints stay fresh automatically (menu rebuilds on every
 open); palette hints must re-resolve. Persistence rides on D1 — these two ship together.
 Checkable/radio menu items (E2) show the active preset.
-### A7. Right-justify the state VALUE in stateful menu rows — `needs-design` (user-reported 2026-07-08)
+### A7. Right-justify the state VALUE in stateful menu rows — `SHIPPED` 2026-07-08 (polish batch, 535aae2)
 
 **Observation (user):** in the Settings menu, stateful rows like `Clipboard: Auto` and `Keymap: CUA`
 should have the value (`Auto`, `CUA`) **right-justified**, not run inline after the colon.
@@ -247,9 +247,11 @@ full effort when prioritized.
 **Idea (user):** a dynamic menu that lists the currently-open documents so you can switch between them
 (a "Window" / "Buffers" / "Documents" menu that auto-populates from the open buffers).
 
-**Grounded (may drift):** menu categories are a FIXED enum `MenuCategory = [File, Edit, Format, View,
-Settings, Export]` (`registry.rs:39-42`) with statically-registered commands — there is no buffer switcher
-today. A per-buffer menu is a NEW menu shape: entries generated from the LIVE buffer list at open time, not
+**Grounded (may drift):** a buffer SWITCHER already exists — `switch_buffer` "Switch Buffer…" (View,
+`registry.rs:296`, opens `open_buffer_switcher`), plus `next_buffer`/`prev_buffer` — but that is an OVERLAY,
+not a menu. This item is the MENU form. Menu categories are a FIXED enum `MenuCategory = [File, Edit, Format,
+View, Settings, Export]` (`registry.rs:39-42`) with statically-registered commands. A per-buffer menu is a
+NEW menu shape: entries generated from the LIVE buffer list at open time, not
 from the static registry. Command-surface implications: the registry is the single source of truth, so a
 dynamic menu needs either per-buffer commands registered on open, or a menu-population hook the contract
 doesn't have yet. Open Qs: naming (Window vs Buffers vs Documents); ordering (MRU vs open order); does it
@@ -469,7 +471,7 @@ better effort-to-payoff ratios on the list.
 
 ---
 
-### B5. Low heading-level glyphs (H5/H6) collide with the blockquote/list prefixes — `needs-design` (user-reported 2026-07-08)
+### B5. Low heading-level glyphs (H5/H6) collide with the blockquote/list prefixes — `SHIPPED` 2026-07-08 (polish batch, 673bfcc: ramp → `█▆▅▄▃▂`). SUPERSEDED 2026-07-09 (24d87bb): heading glyphs switched to inverted Nerd numerals `󰬺-󰬿` — see B6 for the style toggle.
 
 **Observation (user):** the **heading-level glyph** (the B3 prefix marker, not the color) for H5/H6
 looks like other constructs' prefixes — **H6's glyph is literally a bullet point** (reads as a list
@@ -508,9 +510,11 @@ cue/no-color mode (SHADES drives that path too) and reserve the same 2-col prefi
 **Pinned design (from the 2026-07-09 exploration):** all three fit the CURRENT 2-cell gutter
 (`glyph + space`, `prefix_width = 2`, `layout.rs:289`) — the cheap tier, no layout/caret/wrap change.
 Render just picks a glyph table + whether to add a `reverse` modifier on the glyph (NOT the space):
-- **Shades** — `█ ▆ ▅ ▄ ▃ ▂` (current, `render.rs:20`), dim, no reverse. Font-universal.
-- **Nerd** — reversed `󰬺`..`󰬿` + a normal space. Single-width (`wcwidth=1`; but `east_asian_width=A`,
-  ambiguous — may render 2-wide on wide-ambiguous terminals). Requires a Nerd Font (tofu otherwise).
+- **Nerd** — reversed `󰬺`..`󰬿` + a normal space. **This is the CURRENT default** (shipped 24d87bb,
+  `render.rs:25`). Single-width (`wcwidth=1`; but `east_asian_width=A`, ambiguous — may render 2-wide on
+  wide-ambiguous terminals). Requires a Nerd Font (tofu otherwise) — so the toggle must offer a universal
+  fallback.
+- **Shades** — `█ ▆ ▅ ▄ ▃ ▂` (the pre-24d87bb B5 ramp), dim, no reverse. Font-universal.
 - **Inverted numeral** — reversed `1`..`6` + a normal space. Font-universal.
 The reversed box's fill = the heading level's fg colour, so per-level heading colours tint the box.
 
@@ -925,7 +929,7 @@ chrome model (hence the ordering).
 
 ---
 
-### E5. Chrome text intensity — distinguish menu/status bars from document text — `needs-design` (user-reported 2026-07-08)
+### E5. Chrome text intensity — distinguish menu/status bars from document text — `SHIPPED` 2026-07-08 (polish batch, 5e1c2ea: floor-aware fg recede + DIM). NOTE: renders correctly (probe-verified) but the recede can be imperceptible under tmux (truecolor quantization / weak DIM) — see B7.
 
 **Observation (user):** the menu bar and status bar are visually distinct panels, but their **text is
 the same color and intensity as the document body text**, so the *type* on the bars doesn't read as
@@ -1414,7 +1418,7 @@ best validates — the markup-rendering capability; treat it as a P design ancho
 - D1-a vs D1-b write-back (D1-b favored, not yet committed — settle at D1's brainstorm).
 - Dwell duration and reveal/grace timings (implementation tunables, not design forks).
 
-### H2. active_line clamps to the last content line at end-of-buffer — `noted` · Small
+### H2. active_line clamps to the last content line at end-of-buffer — `SHIPPED` 2026-07-08 (polish batch, 0573eec: clamp to `len()` not `len-1`)
 
 *(Discovered during B1+B2's e2e work, 2026-07-04; pre-existing, verified at source.)*
 `derive.rs:217` computes the active line from `caret_byte.min(buf.len()-1)` — with a
