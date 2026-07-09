@@ -54,6 +54,16 @@ impl OutlineOverlay {
     }
 }
 
+pub fn outline_jump_to(editor: &mut crate::editor::Editor, byte: usize) {
+    let origin = editor.active().document.selection.primary().head;
+    crate::marks::record_jump(editor.active_mut(), origin);
+    crate::registry::unfold_ancestors_of(editor, byte);
+    editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(byte);
+    editor.outline = None;
+    crate::derive::rebuild(editor);
+    crate::nav::ensure_visible(editor);
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

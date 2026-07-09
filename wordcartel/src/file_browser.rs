@@ -54,6 +54,45 @@ pub fn rebuild_entries(fb: &mut FileBrowser) {
     fb.scroll_top = fb.scroll_top.min(fb.entries.len().saturating_sub(1));
 }
 
+/// Execute the selected file-browser entry — the shared Enter path for the keyboard
+/// Enter arm and the mouse click-to-commit arm. Descends into a directory (incl. ".."),
+/// guarding against unreadable targets, or opens a file through the dirty-guard path.
+pub(crate) fn file_browser_enter(editor: &mut crate::editor::Editor) {
+    let chosen = editor.file_browser.as_ref().and_then(|fb| {
+        fb.entries.get(fb.selected).map(|e| (e.name.clone(), e.is_dir))
+    });
+    if let Some((name, is_dir)) = chosen {
+        if is_dir {
+            let target = editor.file_browser.as_ref().map(|fb| {
+                if name == ".." {
+                    fb.dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| fb.dir.clone())
+                } else {
+                    fb.dir.join(&name)
+                }
+            });
+            if let Some(target) = target {
+                // §3: check readability BEFORE committing fb.dir.
+                if std::fs::read_dir(&target).is_ok() {
+                    if let Some(fb) = editor.file_browser.as_mut() {
+                        fb.dir = target;
+                        fb.query.clear();
+                        fb.selected = 0;
+                        fb.scroll_top = 0; // A6: reset with selected to avoid out-of-order slice
+                        crate::file_browser::rebuild_entries(fb);
+                    }
+                } else {
+                    editor.status = format!("cannot read directory: {}", target.display());
+                    // stay in prior dir — do NOT mutate fb.dir
+                }
+            }
+        } else {
+            let path = editor.file_browser.as_ref().unwrap().dir.join(&name);
+            editor.file_browser = None;
+            crate::workspace::open_as_new_buffer(editor, &path);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

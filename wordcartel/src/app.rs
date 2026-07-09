@@ -186,55 +186,6 @@ pub fn menu_select_for_test(
     dispatch_overlay_command(editor, reg, &keymap, ex, clock, msg_tx, id);
 }
 
-/// Execute the selected file-browser entry — the shared Enter path for the keyboard
-/// Enter arm and the mouse click-to-commit arm. Descends into a directory (incl. ".."),
-/// guarding against unreadable targets, or opens a file through the dirty-guard path.
-pub(crate) fn file_browser_enter(editor: &mut crate::editor::Editor) {
-    let chosen = editor.file_browser.as_ref().and_then(|fb| {
-        fb.entries.get(fb.selected).map(|e| (e.name.clone(), e.is_dir))
-    });
-    if let Some((name, is_dir)) = chosen {
-        if is_dir {
-            let target = editor.file_browser.as_ref().map(|fb| {
-                if name == ".." {
-                    fb.dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| fb.dir.clone())
-                } else {
-                    fb.dir.join(&name)
-                }
-            });
-            if let Some(target) = target {
-                // §3: check readability BEFORE committing fb.dir.
-                if std::fs::read_dir(&target).is_ok() {
-                    if let Some(fb) = editor.file_browser.as_mut() {
-                        fb.dir = target;
-                        fb.query.clear();
-                        fb.selected = 0;
-                        fb.scroll_top = 0; // A6: reset with selected to avoid out-of-order slice
-                        crate::file_browser::rebuild_entries(fb);
-                    }
-                } else {
-                    editor.status = format!("cannot read directory: {}", target.display());
-                    // stay in prior dir — do NOT mutate fb.dir
-                }
-            }
-        } else {
-            let path = editor.file_browser.as_ref().unwrap().dir.join(&name);
-            editor.file_browser = None;
-            crate::workspace::open_as_new_buffer(editor, &path);
-        }
-    }
-}
-
-pub fn outline_jump_to(editor: &mut Editor, byte: usize) {
-    let origin = editor.active().document.selection.primary().head;
-    crate::marks::record_jump(editor.active_mut(), origin);
-    crate::registry::unfold_ancestors_of(editor, byte);
-    editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(byte);
-    editor.outline = None;
-    derive::rebuild(editor);
-    crate::nav::ensure_visible(editor);
-}
-
 /// Process one message. Returns true while the app should keep running.
 pub fn reduce(
     msg: Msg,
@@ -625,7 +576,7 @@ pub fn reduce(
                 use crossterm::event::KeyCode;
                 match k.code {
                     KeyCode::Esc => { editor.file_browser = None; }
-                    KeyCode::Enter => { file_browser_enter(editor); }
+                    KeyCode::Enter => { crate::file_browser::file_browser_enter(editor); }
                     KeyCode::Up => {
                         let ah = editor.active().view.area.1;
                         if let Some(fb) = editor.file_browser.as_mut() {
@@ -950,7 +901,7 @@ pub fn reduce(
                             .and_then(|o| o.rows.get(o.selected))
                             .map(|r| r.byte);
                         if let Some(target) = target {
-                            outline_jump_to(editor, target);
+                            crate::outline_overlay::outline_jump_to(editor, target);
                         }
                     }
                     KeyCode::Backspace => {
@@ -1600,7 +1551,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         let sv = editor.active().document.saved_version;
         if sv != last_persisted_saved {
             session_seq += 1;
-            persist_session(&mut session, &editor, &cfg, session_seq);
+            crate::session_restore::persist_session(&mut session, &editor, &cfg, session_seq);
             last_persisted_saved = sv;
         }
         if !keep { break; }
@@ -1617,7 +1568,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
 
     // On clean quit: persist once more (cursor may have moved since the last save).
     session_seq += 1;
-    persist_session(&mut session, &editor, &cfg, session_seq);
+    crate::session_restore::persist_session(&mut session, &editor, &cfg, session_seq);
 
     // Restore the terminal BEFORE the executor drops: ThreadExecutor::drop joins
     // the worker, which may still be completing an in-flight save_atomic on a slow
@@ -1626,58 +1577,6 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // is the "never lose work" behavior). The 5 s save&quit guard above bounds the wait.
     drop(guard);
     Ok(exit_reason)
-}
-
-/// Record the active buffer's position into the session store and flush to disk.
-/// Scratch content is always captured; per-file entry only for named buffers.
-/// A write failure → status warning only (never blocks quit or loses the document).
-fn persist_session(
-    session: &mut crate::state::SessionState,
-    editor: &Editor,
-    cfg: &config::Config,
-    seq: u64,
-) {
-    // Effort 6: capture scratch content first, independent of the active buffer.
-    // M5: guard on byte length — never materialize a huge String for persistence.
-    if let Some(sid) = editor.scratch_id {
-        if let Some(sb) = editor.by_id(sid) {
-            if sb.document.buffer.len() <= crate::limits::MAX_SESSION_BYTES {
-                session.scratch = Some(crate::state::ScratchState {
-                    text: sb.document.buffer.to_string(),
-                    cursor: sb.document.selection.primary().head,
-                });
-            } else {
-                // Oversized: skip persisting the live scratch — and CLEAR any stale scratch
-                // loaded from disk, so an old session's scratch is not resurrected. The live
-                // buffer is untouched; only its cross-session persistence is dropped.
-                session.scratch = None;
-            }
-        }
-    }
-    // Per-file entry for the active buffer (unchanged): only when it has a real,
-    // canonicalizable path. Scratch/new buffers contribute no per-file entry.
-    if let Some(raw_path) = editor.active().document.path.as_deref() {
-        if let Ok(canon) = std::fs::canonicalize(raw_path) {
-            if let Some((mtime, size)) = crate::state::file_identity(raw_path) {
-                let entry = crate::state::StateEntry {
-                    cursor: editor.active().document.selection.primary().head,
-                    scroll: editor.active().view.scroll,
-                    marks: editor.active().marks.iter().map(|(c, &o)| (c.to_string(), o)).collect(),
-                    mtime, size, seq,
-                    folds: editor.active().folds.folded().iter().copied().collect(),
-                    block: editor.active().marked_block.map(|b| (b.start, b.end)),
-                };
-                session.record(canon.to_string_lossy().into_owned(), entry, cfg.state.max_entries);
-            }
-        }
-    }
-    // Always flush — scratch durability does not depend on the active buffer.
-    let _ = session.save();
-}
-
-#[cfg(test)]
-pub fn persist_session_for_test(s: &mut crate::state::SessionState, e: &Editor, cfg: &config::Config, seq: u64) {
-    persist_session(s, e, cfg, seq);
 }
 
 // ---------------------------------------------------------------------------
@@ -3720,7 +3619,7 @@ mod tests {
         ed.active_mut().folds.toggle(doc.find("## A").unwrap());
         crate::derive::rebuild(&mut ed);
         let a1 = doc.find("### A1").unwrap();
-        crate::app::outline_jump_to(&mut ed, a1);
+        crate::outline_overlay::outline_jump_to(&mut ed, a1);
         assert_eq!(ed.active().document.selection.primary().head, a1);
         assert!(!ed.active().folds.folded().contains(&doc.find("## A").unwrap()));
     }
@@ -4114,50 +4013,6 @@ mod tests {
         crate::save::dispatch_save(&mut ctx); // no path → opens Save-As, NOT the dead stub
         assert!(matches!(e.minibuffer.as_ref().map(|m| m.kind),
             Some(crate::minibuffer::MinibufferKind::SaveAs)), "unnamed save opens the SaveAs minibuffer");
-    }
-
-    // -------------------------------------------------------------------------
-    // Effort 6, Task 2: scratch persistence
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn persist_session_captures_scratch_even_when_active_unnamed() {
-        use wordcartel_core::history::Clock;
-        struct C(u64); impl Clock for C { fn now_ms(&self) -> u64 { self.0 } }
-        let mut e = crate::editor::Editor::new_from_text("\n", None, (40, 10)); // active unnamed
-        e.install_scratch();
-        let sid = e.scratch_id.unwrap();
-        let (cs, edit) = crate::commands::build_multi_replace(&[(0, 0, "stash".into())], 0);
-        let txn = wordcartel_core::history::Transaction::new(cs)
-            .with_selection(wordcartel_core::selection::Selection::single(5));
-        e.by_id_mut(sid).unwrap().apply(txn, edit, wordcartel_core::history::EditKind::Other, &C(0));
-        let mut session = crate::state::SessionState::default();
-        let cfg = crate::config::Config::default();
-        crate::app::persist_session_for_test(&mut session, &e, &cfg, 1);
-        assert_eq!(session.scratch.as_ref().unwrap().text, "stash");
-    }
-
-    #[test]
-    fn persist_session_clears_stale_scratch_when_oversized() {
-        use wordcartel_core::history::Clock;
-        struct C(u64); impl Clock for C { fn now_ms(&self) -> u64 { self.0 } }
-        let mut e = crate::editor::Editor::new_from_text("\n", None, (40, 10));
-        e.install_scratch();
-        let sid = e.scratch_id.unwrap();
-        // Make the live scratch buffer oversized (> MAX_SESSION_BYTES).
-        let big = "x".repeat(crate::limits::MAX_SESSION_BYTES + 1);
-        let (cs, edit) = crate::commands::build_multi_replace(&[(0, 0, big)], 0);
-        let txn = wordcartel_core::history::Transaction::new(cs);
-        e.by_id_mut(sid).unwrap().apply(txn, edit, wordcartel_core::history::EditKind::Other, &C(0));
-        // Session carries a STALE scratch loaded from a previous launch.
-        let mut session = crate::state::SessionState {
-            scratch: Some(crate::state::ScratchState { text: "old stale".into(), cursor: 0 }),
-            ..Default::default()
-        };
-        let cfg = crate::config::Config::default();
-        crate::app::persist_session_for_test(&mut session, &e, &cfg, 1);
-        assert!(session.scratch.is_none(),
-            "oversized live scratch must CLEAR the stale loaded scratch, not resurrect it");
     }
 
     #[test]

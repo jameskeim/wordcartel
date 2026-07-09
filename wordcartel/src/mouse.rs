@@ -269,7 +269,7 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
                     fb.selected = idx;
                     crate::app::keep_overlay_visible(ah, idx, fb.entries.len(), &mut fb.scroll_top);
                 }
-                crate::app::file_browser_enter(editor);
+                crate::file_browser::file_browser_enter(editor);
             } else if !inside {
                 editor.file_browser = None; // click-away closes
             }
@@ -320,7 +320,7 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
                     .and_then(|o| o.rows.get(o.selected))
                     .map(|r| r.byte);
                 if let Some(byte) = target {
-                    crate::app::outline_jump_to(editor, byte);
+                    crate::outline_overlay::outline_jump_to(editor, byte);
                 }
             } else if !inside {
                 editor.outline = None; // click-away closes
