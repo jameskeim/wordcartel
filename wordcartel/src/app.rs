@@ -5518,4 +5518,125 @@ mod tests {
             "layout cache must be rebuilt for the post-ensure_visible scroll (T5)"
         );
     }
+
+    /// §8.1-A guardrail: a command dispatched via the palette stage returns through the
+    /// stage micro-epilogue (app.rs:584) and SKIPS the version-change hook (app.rs:1209),
+    /// so the edit bumps `document.version` WITHOUT setting `last_edit_at`. Do not unify
+    /// the stage return with the main epilogue — this asymmetry is behavior.
+    #[test]
+    fn palette_dispatched_edit_skips_version_hook() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("alpha\nbeta\n", None, (80, 24));
+        e.active_mut().diagnostics = crate::diagnostics_run::DiagStore::new(); // clean debounce baseline
+        let before_ver = e.active().document.version;
+        assert!(e.active().last_edit_at.is_none(), "precondition: no prior edit timestamp");
+        // One deterministic palette row for the synchronous `delete_line` editing command.
+        e.palette = Some(crate::palette::Palette::default());
+        {
+            let p = e.palette.as_mut().unwrap();
+            p.rows = vec![crate::palette::PaletteRow {
+                id: crate::registry::CommandId("delete_line"),
+                label: "Delete Line".into(),
+                chord: String::new(),
+                buffer: None,
+            }];
+            p.selected = 0;
+        }
+        let reg = Registry::builtins(); let km = cua_keymap();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let enter = Event::Key(KeyEvent { code: KeyCode::Enter, modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.palette.is_none(), "palette dispatch closes the overlay");
+        assert_ne!(e.active().document.version, before_ver, "delete_line must bump the version");
+        assert!(e.active().last_edit_at.is_none(),
+            "palette-dispatched edit must NOT set last_edit_at (skipped version hook — §8.1-A)");
+    }
+
+    /// §8.1-C guardrail: the search stage's Esc arm (app.rs:926) returns WITHOUT draining
+    /// the executor, unlike the text-edit arms (app.rs:958). fold_and_continue (T7) must be
+    /// applied ONLY to sites that drain today — never retrofit a drain onto Esc/Alt+a.
+    #[test]
+    fn search_esc_does_not_drain_executor() {
+        use crate::editor::Editor; use crate::jobs::{Executor, InlineExecutor, Job, JobOutcome};
+        use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        struct DrainSpy { inner: InlineExecutor, drains: std::cell::Cell<usize> }
+        impl Executor for DrainSpy {
+            fn dispatch(&self, job: Job) { self.inner.dispatch(job); }
+            fn drain(&self) -> Vec<JobOutcome> { self.drains.set(self.drains.get() + 1); self.inner.drain() }
+        }
+        let ex = DrainSpy { inner: InlineExecutor::default(), drains: std::cell::Cell::new(0) };
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        e.open_search(crate::search_overlay::Phase::Find, 0);
+        let reg = Registry::builtins(); let km = cua_keymap(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mk = |code: KeyCode| Event::Key(KeyEvent { code, modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        // A text-insert key DOES drain (app.rs:958) — establishes the spy works.
+        crate::app::reduce(Msg::Input(mk(KeyCode::Char('a'))), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(ex.drains.get(), 1, "a search text-insert key drains once");
+        // Esc returns WITHOUT draining (app.rs:926) — the count must not advance.
+        crate::app::reduce(Msg::Input(mk(KeyCode::Esc)), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(ex.drains.get(), 1, "search Esc must NOT drain the executor (§8.1-C)");
+        assert!(e.search.is_none(), "Esc cancels the search overlay");
+    }
+
+    /// §8.1-E guardrail: a clean, settled, no-overlay editor arms NO timed deadline — the
+    /// run loop blocks on the 3600 s fallback (idle is free). Expressed against the current
+    /// per-term gates; T8 re-expresses it as timers::next_wake(&e, now) == None.
+    #[test]
+    fn settled_editor_arms_no_deadline() {
+        use crate::editor::Editor;
+        let e = Editor::new_from_text("hello\n", None, (80, 24));
+        let now = 10_000u64;
+        assert!(!e.active().document.dirty(), "precondition: a fresh buffer is not dirty");
+        let swap_deadline = if crate::swap::pending(
+            e.active().document.dirty(), e.active().document.version, e.active().swapped_version,
+        ) && !e.active().swap_in_flight {
+            crate::swap::next_deadline_ms(now, e.active().last_edit_at, e.active().last_swap_at)
+        } else { None };
+        let sq_deadline = e.pending_after_save.as_ref().map(|p| p.at_ms.saturating_add(5_000));
+        let sb_deadline = if e.mouse.scrollbar_until_ms > now { Some(e.mouse.scrollbar_until_ms) } else { None };
+        let menu_deadline = e.mouse.menu_reveal_due.or(e.mouse.menu_hide_due);
+        let sb_dwell = e.mouse.scrollbar_reveal_due.or(e.mouse.scrollbar_hide_due);
+        let status_dwell = e.mouse.status_reveal_due.or(e.mouse.status_hide_due);
+        let diag_deadline = if e.active().diagnostics.in_flight_version.is_none() {
+            e.active().diagnostics.recheck_due_at } else { None };
+        let reconcile_deadline = if e.active().reconcile.in_flight_version.is_none() {
+            e.active().reconcile.due_at } else { None };
+        let deadline = crate::diagnostics_run::next_deadline(&[
+            swap_deadline, sq_deadline, sb_deadline, menu_deadline,
+            sb_dwell, status_dwell, diag_deadline, reconcile_deadline,
+        ]);
+        assert_eq!(deadline, None, "a settled no-overlay editor must arm no deadline (idle is free — §8.1-E)");
+    }
+
+    /// §8.1-H guardrail: outline MOTION keys (Up/Down/Page/Home/End) do NOT touch `query`
+    /// or re-run set_query — only the text-edit arms (Char/Backspace) re-query. The list-nav
+    /// unification (T10) must keep the query re-run OUTSIDE the shared motion helper.
+    #[test]
+    fn outline_motion_does_not_requery() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("# Top\nintro\n## A\nbody\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_outline();
+        assert!(e.outline.as_ref().unwrap().rows.len() >= 2, "precondition: two outline rows");
+        let reg = Registry::builtins(); let km = cua_keymap();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mk = |code: KeyCode| Event::Key(KeyEvent { code, modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(mk(KeyCode::Down)), &mut e, &reg, &km, &ex, &clk, &tx);
+        {
+            let o = e.outline.as_ref().unwrap();
+            assert_eq!(o.selected, 1, "Down advances the selection");
+            assert!(o.query.is_empty(), "motion must NOT populate the query (§8.1-H)");
+        }
+        crate::app::reduce(Msg::Input(mk(KeyCode::Char('A'))), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.outline.as_ref().unwrap().query, "A", "a Char edit re-queries the outline");
+    }
 }
