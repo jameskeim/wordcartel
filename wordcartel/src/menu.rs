@@ -1,5 +1,7 @@
 use crate::keymap::KeyTrie;
 use crate::registry::{CommandId, MenuCategory, Registry, MENU_ORDER};
+use crate::app::Msg;
+use crossterm::event::Event;
 
 #[derive(Clone, Debug)]
 pub struct MenuView {
@@ -128,6 +130,81 @@ fn category_label(cat: MenuCategory) -> &'static str {
         MenuCategory::Settings => "Settings",
         MenuCategory::Export => "Export",
     }
+}
+
+/// Menu overlay intercepts KEY INPUT and PASTE (no text field; paste is
+/// consumed / silently dropped). Non-key, non-paste messages fall through to
+/// the normal handlers so background work continues while the menu is open.
+pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor,
+    reg: &crate::registry::Registry, keymap: &crate::keymap::KeyTrie,
+    ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) -> crate::app::Handled {
+    if editor.menu.is_none() { return crate::app::Handled::Pass(msg); }
+    if matches!(&msg, Msg::ClipboardPaste { .. }) {
+        // Drop an async clipboard-paste result that arrives while the menu is
+        // open — it must not land in the document behind the overlay.
+        return crate::app::Handled::Done({ for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); } !editor.quit });
+    }
+    if let Msg::Input(Event::Paste(_)) = &msg {
+        return crate::app::Handled::Done({ for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); } !editor.quit });
+    }
+    if let Msg::Input(Event::Key(k)) = &msg {
+        if k.kind == crossterm::event::KeyEventKind::Press {
+            use crossterm::event::KeyCode;
+            // Close OUTSIDE any menu borrow (Codex Critical: `editor.menu = None`
+            // must not run while `editor.menu.as_mut()` is held).
+            if matches!(k.code, KeyCode::Esc | KeyCode::F(10)) {
+                editor.menu = None;
+            } else {
+                let mut selected: Option<crate::registry::CommandId> = None;
+                if let Some(menu) = editor.menu.as_mut() {   // borrow scoped to this block
+                    let ncat = menu.groups.len();
+                    match k.code {
+                        KeyCode::Left if ncat > 0 => {
+                            menu.open = (menu.open + ncat - 1) % ncat;
+                            menu.highlighted = 0;
+                            menu.scroll_top = 0; // reset window on category switch
+                        }
+                        KeyCode::Right if ncat > 0 => {
+                            menu.open = (menu.open + 1) % ncat;
+                            menu.highlighted = 0;
+                            menu.scroll_top = 0; // reset window on category switch
+                        }
+                        KeyCode::Up if ncat > 0 => {
+                            menu.highlighted = menu.highlighted.saturating_sub(1);
+                            let n = menu.groups[menu.open].1.len();
+                            // Coarse follow-the-selection layer — the paint re-windows against
+                            // the true item-row budget every frame (list_window two-layer
+                            // invariant), so this estimate need not reserve the indicator row.
+                            let list_h = n.min(15);
+                            crate::list_window::keep_visible(menu.highlighted, n, list_h, &mut menu.scroll_top);
+                        }
+                        KeyCode::Down if ncat > 0 => {
+                            let n = menu.groups[menu.open].1.len();
+                            if n > 0 {
+                                menu.highlighted = (menu.highlighted + 1).min(n - 1);
+                                // Coarse follow-the-selection layer — the paint re-windows against
+                                // the true item-row budget every frame (list_window two-layer
+                                // invariant), so this estimate need not reserve the indicator row.
+                                let list_h = n.min(15);
+                                crate::list_window::keep_visible(menu.highlighted, n, list_h, &mut menu.scroll_top);
+                            }
+                        }
+                        KeyCode::Enter if ncat > 0 => {
+                            if let Some((_, id)) = menu.groups[menu.open].1.get(menu.highlighted) { selected = Some(*id); }
+                        }
+                        _ => {}
+                    }
+                } // menu borrow dropped here
+                if let Some(id) = selected {
+                    crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
+                }
+            }
+        }
+        return crate::app::Handled::Done({ for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); } !editor.quit });
+    }
+    // Non-key msg falls through to normal handling while menu stays open.
+    crate::app::Handled::Pass(msg)
 }
 
 #[cfg(test)]

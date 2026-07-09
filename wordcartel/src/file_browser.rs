@@ -3,6 +3,8 @@
 //! Mirrors the theme picker (theme_picker.rs) / command palette.
 
 use std::path::PathBuf;
+use crate::app::Msg;
+use crossterm::event::Event;
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -91,6 +93,105 @@ pub(crate) fn file_browser_enter(editor: &mut crate::editor::Editor) {
             crate::workspace::open_as_new_buffer(editor, &path);
         }
     }
+}
+
+/// File browser overlay intercepts KEY INPUT and PASTE. Non-key, non-paste messages
+/// fall through to normal handling while the browser stays open (mirrors theme_picker).
+pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor,
+    ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) -> crate::app::Handled {
+    if editor.file_browser.is_none() { return crate::app::Handled::Pass(msg); }
+    // Drop an async clipboard-paste result that arrives while the browser is open —
+    // it must not land in the document behind the overlay (Codex I6, mirror palette).
+    if matches!(&msg, Msg::ClipboardPaste { .. }) {
+        return crate::app::Handled::Done({ for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); } !editor.quit });
+    }
+    if let Msg::Input(Event::Paste(text)) = &msg {
+        let ah = editor.active().view.area.1;
+        if let Some(fb) = editor.file_browser.as_mut() {
+            fb.query.push_str(text);
+            crate::file_browser::rebuild_entries(fb);
+            crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+        }
+        return crate::app::Handled::Done({ for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); } !editor.quit });
+    }
+    if let Msg::Input(Event::Key(k)) = &msg {
+        if k.kind == crossterm::event::KeyEventKind::Press {
+            use crossterm::event::KeyCode;
+            match k.code {
+                KeyCode::Esc => { editor.file_browser = None; }
+                KeyCode::Enter => { file_browser_enter(editor); }
+                KeyCode::Up => {
+                    let ah = editor.active().view.area.1;
+                    if let Some(fb) = editor.file_browser.as_mut() {
+                        fb.selected = fb.selected.saturating_sub(1);
+                        crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+                    }
+                }
+                KeyCode::Down => {
+                    let ah = editor.active().view.area.1;
+                    if let Some(fb) = editor.file_browser.as_mut() {
+                        let max = fb.entries.len().saturating_sub(1);
+                        fb.selected = (fb.selected + 1).min(max);
+                        crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+                    }
+                }
+                KeyCode::PageDown => {
+                    let ah = editor.active().view.area.1;
+                    if let Some(fb) = editor.file_browser.as_mut() {
+                        let lh = crate::list_window::list_h_for(fb.entries.len(), ah);
+                        fb.selected = (fb.selected + lh.max(1)).min(fb.entries.len().saturating_sub(1));
+                        crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+                    }
+                }
+                KeyCode::PageUp => {
+                    let ah = editor.active().view.area.1;
+                    if let Some(fb) = editor.file_browser.as_mut() {
+                        let lh = crate::list_window::list_h_for(fb.entries.len(), ah);
+                        fb.selected = fb.selected.saturating_sub(lh.max(1));
+                        crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+                    }
+                }
+                KeyCode::Home => {
+                    let ah = editor.active().view.area.1;
+                    if let Some(fb) = editor.file_browser.as_mut() {
+                        fb.selected = 0;
+                        crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+                    }
+                }
+                KeyCode::End => {
+                    let ah = editor.active().view.area.1;
+                    if let Some(fb) = editor.file_browser.as_mut() {
+                        fb.selected = fb.entries.len().saturating_sub(1);
+                        crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+                    }
+                }
+                KeyCode::Backspace => {
+                    let ah = editor.active().view.area.1;
+                    if let Some(fb) = editor.file_browser.as_mut() {
+                        fb.query.pop();
+                        crate::file_browser::rebuild_entries(fb);
+                        crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+                    }
+                }
+                KeyCode::Char(c)
+                    if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                        && !k.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
+                {
+                    let ah = editor.active().view.area.1;
+                    if let Some(fb) = editor.file_browser.as_mut() {
+                        fb.query.push(c);
+                        crate::file_browser::rebuild_entries(fb);
+                        crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+                    }
+                }
+                _ => {}
+            }
+        }
+        return crate::app::Handled::Done({ for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); } !editor.quit });
+    }
+    // Non-key msg falls through to normal handling while the browser stays open.
+    crate::app::Handled::Pass(msg)
 }
 
 #[cfg(test)]
