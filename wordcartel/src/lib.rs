@@ -46,6 +46,7 @@ pub mod outline_overlay;
 pub mod compose;
 pub mod theme_resolve;
 pub mod theme_picker;
+pub mod theme_cmds;
 pub mod settings;
 pub mod file_browser;
 pub mod blocks_marked;

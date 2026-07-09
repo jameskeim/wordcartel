@@ -129,7 +129,7 @@ mod tests {
                 ed.theme_picker.as_ref().unwrap().rows));
         ed.theme_picker.as_mut().unwrap().selected = idx;
         // preview_selected_theme is the single funnel (A.9): derives before apply_theme.
-        crate::app::preview_selected_theme(&mut ed);
+        crate::theme_cmds::preview_selected_theme(&mut ed);
         // §II.5 probe-generated: flexoki-dark ZEN Chrome bg = #1e1c1c.
         let chrome_bg = ed.theme.face(SemanticElement::Chrome).bg;
         assert_eq!(

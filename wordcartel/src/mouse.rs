@@ -204,7 +204,7 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
                 }
                 crate::app::keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
             }
-            crate::app::preview_selected_theme(editor);
+            crate::theme_cmds::preview_selected_theme(editor);
         }
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
             // Scoped borrows → owned hit values before any mutation.
@@ -226,8 +226,8 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
                     tp.selected = idx;
                     crate::app::keep_overlay_visible(ah, idx, tp.rows.len(), &mut tp.scroll_top);
                 }
-                crate::app::preview_selected_theme(editor);
-                crate::app::commit_theme_picker(editor);
+                crate::theme_cmds::preview_selected_theme(editor);
+                crate::theme_cmds::commit_theme_picker(editor);
             } else if !inside {
                 // Click-away: restore the original theme and close — same as Esc.
                 if let Some(tp) = editor.theme_picker.take() {
