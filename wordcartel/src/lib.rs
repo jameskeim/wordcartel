@@ -36,6 +36,7 @@ pub mod menu;
 pub mod marks;
 pub mod mouse;
 pub mod density;
+pub mod chrome;
 pub mod search_overlay;
 pub mod search_ui;
 pub mod diagnostics_run;

@@ -914,7 +914,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         } else {
             // Normal state. Under zen/Auto idle with no message, the reserved row renders
             // as calm canvas (base bg); visible reveal via On / dwell / message force.
-            if crate::app::status_line_visible(editor) {
+            if crate::chrome::status_line_visible(editor) {
                 (status_left_text(editor), cs.menu_closed) // visible: [Chrome] panel bg
             } else {
                 // Calm canvas: the same bg-only fill the edit band uses — NOT chrome.
@@ -930,7 +930,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         // When the status row is calm-hidden (Auto idle, no message), suppress the word-count
         // segment so Ln/Col · words does not paint over the calm canvas row.
         let has_overlay = editor.search.is_some() || editor.minibuffer.is_some() || editor.prompt.is_some() || editor.diag.is_some() || editor.outline.is_some();
-        let status_hidden = !has_overlay && !crate::app::status_line_visible(editor);
+        let status_hidden = !has_overlay && !crate::chrome::status_line_visible(editor);
         let composed = if !has_overlay && !status_hidden {
             if let Some(wc) = word_count_segment(editor) {
                 let caret = crate::nav::head(editor);
