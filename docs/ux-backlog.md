@@ -1437,9 +1437,11 @@ A6's territory; E2's checkable items serve A5/E1; C2 and C3 are islands.
 
 *(Progress: 1 A6 ✓ · 2 H1 ✓ · 3 B1+B2 ✓ · 4 C4 ✓ · 5 C2 ✓ · 6 D1+A5 ✓ · 7 E3+E4 ✓ · **8 E1+E2 ✓**
 (2026-07-07 @ f7b7b10 — folded effort: E1 + E2 + overlay/mouse completeness + menu windowing) ·
-**B4 SRC-HI ✓** (2026-07-07 @ 1bbd82b) · **C3 clipboard provider-chain ✓** (2026-07-07 @ 16457f9) —
-**next: R1 (in-brainstorm), Theme S/P, or A3b menu-curation; then Effort P**. A3's palette-completeness
-invariant + item-by-item menu-curation pass remains open.)*
+**B4 SRC-HI ✓** (2026-07-07 @ 1bbd82b) · **C3 clipboard provider-chain ✓** (2026-07-07 @ 16457f9) ·
+**R1 typing-latency ✓** (2026-07-07 @ 02ac906) —
+**next: eng-health H1 god-object decomposition (Fable-gated — now unblocked), Theme S/P, or A3b
+menu-curation; then Effort P**. A3's palette-completeness invariant + item-by-item menu-curation
+pass remains open.)*
 
 *(NEW 2026-07-06: **R1 editing-responsiveness** entered brainstorm mid-stream — a
 tight-scope perf/correctness fix (Theme R). Dependency-free; recommended to slot BEFORE Effort P.
@@ -1494,19 +1496,20 @@ dependency-free in both directions.
 
 ## Sizing summary
 
-**SHIPPED** (see each item's header for the commit): A1, A2, A5, A6, B1, B2, B3, B4, C1, C2, C4,
-D1, E1, E2, E3, E4, H1 — plus the repar re-plumb check. (A4 dropped.) The remaining open work,
+**SHIPPED** (see each item's header for the commit): A1, A2, A3, A5, A6, B1, B2, B3, B4, C1, C2, C3,
+C4, D1, E1, E2, E3, E4, H1, R1 — plus the repar re-plumb check. (A4 dropped.) The remaining open work,
 by size:
 
 - **Small:** A3b item-by-item menu-curation pass (A3 itself shipped; the state-in-label half
-  shipped with E2) · C3 clipboard over SSH/tmux (reassessed 2026-07-07 — paste-in already shipped;
-  minimal remaining fix = copy-out tmux/screen wrap + doc; the ROBUST provider-model version is
-  Small–Medium — extend the existing `ClipboardBackend` seam into a detect+fallback chain, see entry).
+  shipped with E2) · A6-followup overlay mouse parity · A9 Wrap-Column state-in-label · H7 unwrap audit.
 - **Small-Medium:** S3 Snapshots (Theme S — capture/restore/persist reuse existing machinery;
-  the one net-new algorithm is a display diff).
-- **Medium:** R1 editing-responsiveness (Theme R, in-brainstorm) · S1 rearrangeable outline / corkboard.
+  the one net-new algorithm is a display diff) · B6 heading-glyph style toggle.
+- **Medium:** eng-health H1 god-object decomposition (`app.rs`/`render.rs` SEAM refactor — Fable-gated,
+  now unblocked; gated before Effort P) · S1 rearrangeable outline / corkboard.
 - **Larger:** S2 directory-as-binder (post-Effort-P plugin) · Theme P plugin candidates (all
   post-P — goals/streaks, style lens, CMS publish, backlinks, CriticMarkup/Fountain/wikilinks).
-- **Noted (not scheduled):** H2 active_line eof-clamp.
+- **`needs-design`, sizing TBD:** A8 open-docs menu · A10 Block menu · A11 filter/transform scope ·
+  A12 scratch toggle · B7 selected-item legibility (`potential-bug`) · B8 caret shape/color · E6 splash ·
+  eng-health H2 dep-weight · H5 swap-file cleanup · H6 version scheme.
 
 Then **Effort P** (the in-process Lua plugin system) — the 1.0 capstone.
