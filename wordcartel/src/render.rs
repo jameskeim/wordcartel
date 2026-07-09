@@ -13,11 +13,16 @@ use ratatui::{
 use wordcartel_core::style::Style;
 use wordcartel_core::theme::SemanticElement as SE;
 
-/// Heading-level shade glyphs used in cue mode and when `heading_level_glyph` is on.
-/// Index 0 = H1 (`█`), …, index 5 = H6 (`▂`). Single-axis lower-block height ramp.
-// Heading gutter ramp: a single-axis lower-block height ramp (decreasing solid mass), collision-free
-// with the blockquote bar (▎) and list bullet (•). U+2588 2586 2585 2584 2583 2582.
-const SHADES: [&str; 6] = ["█", "▆", "▅", "▄", "▃", "▂"];
+/// Heading-level prefix glyphs used in cue mode and when `heading_level_glyph` is on.
+/// Index 0 = H1 … index 5 = H6. Inverted (reverse-video) Nerd Font numerals 1–6
+/// (U+F0B3A–F, Material-Design "numeric-N-box"): render paints the glyph with a REVERSED
+/// modifier so it reads as a filled box tinted by the heading colour, followed by a normal
+/// space (a 1-cell box inside the 2-cell gutter).
+///
+/// NOTE: these are Nerd Font Private-Use glyphs — they render as tofu on terminals without a
+/// Nerd Font. This is a deliberate global choice pending the heading-glyph-style toggle that
+/// restores the universal shade ramp as an option (ux-backlog B6).
+const HEADING_GLYPHS: [&str; 6] = ["󰬺", "󰬻", "󰬼", "󰬽", "󰬾", "󰬿"];
 
 /// Half-open interval intersection: is the row's global byte range active?
 ///
@@ -657,22 +662,30 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 // columns (`Placed.col` already includes `prefix_width`).
                 if let Some(ref glyph) = vr.prefix_glyph {
                     let pe = prefix_element(vr.role);
-                    let gstyle = if row_dim {
-                        compose::compose(&editor.theme, editor.depth, &[pe, SE::FocusDim])
-                    } else {
-                        compose::compose(&editor.theme, editor.depth, &[pe]).add_modifier(Modifier::DIM)
-                    };
-                    let painted = if editor.theme.heading_level_glyph {
-                        if let wordcartel_core::style::BlockRole::Heading(n) = vr.role {
-                            let shade = SHADES[(n.clamp(1, 6) - 1) as usize];
-                            format!("{shade} ")
+                    // Heading inverted-numeral box: paint the glyph REVERSED (box fill = heading
+                    // colour) at full intensity, then a NORMAL space — a 1-cell box inside the
+                    // 2-cell gutter. Inactive rows carry FocusDim so the box recedes. Other prefixes
+                    // (blockquote, list) keep the dim single-span rendering.
+                    let heading_n = if editor.theme.heading_level_glyph {
+                        if let wordcartel_core::style::BlockRole::Heading(n) = vr.role { Some(n) } else { None }
+                    } else { None };
+                    if let Some(n) = heading_n {
+                        let g = HEADING_GLYPHS[(n.clamp(1, 6) - 1) as usize];
+                        let base = if row_dim {
+                            compose::compose(&editor.theme, editor.depth, &[pe, SE::FocusDim])
                         } else {
-                            glyph.clone()
-                        }
+                            compose::compose(&editor.theme, editor.depth, &[pe])
+                        };
+                        segs_spans.push(Span::styled(g.to_string(), base.add_modifier(Modifier::REVERSED)));
+                        segs_spans.push(Span::styled(" ".to_string(), base));
                     } else {
-                        glyph.clone()
-                    };
-                    segs_spans.push(Span::styled(painted, gstyle));
+                        let gstyle = if row_dim {
+                            compose::compose(&editor.theme, editor.depth, &[pe, SE::FocusDim])
+                        } else {
+                            compose::compose(&editor.theme, editor.depth, &[pe]).add_modifier(Modifier::DIM)
+                        };
+                        segs_spans.push(Span::styled(glyph.clone(), gstyle));
+                    }
                 } else if map.prefix_width > 0 {
                     segs_spans.push(Span::raw(" ".repeat(map.prefix_width)));
                 }
@@ -722,22 +735,28 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
                 // with the prefix-offset cursor columns.
                 if let Some(ref glyph) = vr.prefix_glyph {
                     let pe = prefix_element(vr.role);
-                    let gstyle = if row_dim {
-                        compose::compose(&editor.theme, editor.depth, &[pe, SE::FocusDim])
-                    } else {
-                        compose::compose(&editor.theme, editor.depth, &[pe]).add_modifier(Modifier::DIM)
-                    };
-                    let painted = if editor.theme.heading_level_glyph {
-                        if let wordcartel_core::style::BlockRole::Heading(n) = vr.role {
-                            let shade = SHADES[(n.clamp(1, 6) - 1) as usize];
-                            format!("{shade} ")
+                    // Heading inverted-numeral box (mirror of the segs path): REVERSED glyph +
+                    // normal space; other prefixes keep the dim single span.
+                    let heading_n = if editor.theme.heading_level_glyph {
+                        if let wordcartel_core::style::BlockRole::Heading(n) = vr.role { Some(n) } else { None }
+                    } else { None };
+                    if let Some(n) = heading_n {
+                        let g = HEADING_GLYPHS[(n.clamp(1, 6) - 1) as usize];
+                        let base = if row_dim {
+                            compose::compose(&editor.theme, editor.depth, &[pe, SE::FocusDim])
                         } else {
-                            glyph.clone()
-                        }
+                            compose::compose(&editor.theme, editor.depth, &[pe])
+                        };
+                        hl_spans.push(Span::styled(g.to_string(), base.add_modifier(Modifier::REVERSED)));
+                        hl_spans.push(Span::styled(" ".to_string(), base));
                     } else {
-                        glyph.clone()
-                    };
-                    hl_spans.push(Span::styled(painted, gstyle));
+                        let gstyle = if row_dim {
+                            compose::compose(&editor.theme, editor.depth, &[pe, SE::FocusDim])
+                        } else {
+                            compose::compose(&editor.theme, editor.depth, &[pe]).add_modifier(Modifier::DIM)
+                        };
+                        hl_spans.push(Span::styled(glyph.clone(), gstyle));
+                    }
                 } else if map.prefix_width > 0 {
                     hl_spans.push(Span::raw(" ".repeat(map.prefix_width)));
                 }
@@ -1135,7 +1154,7 @@ mod tests {
         assert_ne!(x, "Find: ".len() + s.needle.len(), "char count must differ from byte count for multibyte input");
     }
 
-    /// Row 0 of a heading with caret on a later line must show "█ Title" (shade prefix + concealed "# ").
+    /// Row 0 of a heading with caret on a later line must show "󰬺 Title" (numeral prefix + concealed "# ").
     #[test]
     fn renders_concealed_heading_and_cursor_on_active_line() {
         let mut e = Editor::new_from_text("# Title\n\nbody\n", None, (20, 6));
@@ -1144,12 +1163,12 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(20, 6)).unwrap();
         term.draw(|f| render(f, &mut e)).unwrap();
         let buf = term.backend().buffer();
-        // row 0 shows "█ Title" (shade prefix + concealed "# "), not "Title"
+        // row 0 shows "󰬺 Title" (numeral prefix + concealed "# "), not "Title"
         let row0: String = (0u16..20).map(|x| buf[(x, 0u16)].symbol().chars().next().unwrap_or(' ')).collect();
-        assert!(row0.starts_with("█ Title"), "expected '█ Title...' got {:?}", row0);
+        assert!(row0.starts_with("󰬺 Title"), "expected '󰬺 Title...' got {:?}", row0);
     }
 
-    /// The flipped default: colored themes now render the heading shade ramp (B3).
+    /// The flipped default: colored themes now render the heading numeral ramp (B3).
     #[test]
     fn default_theme_renders_heading_shade_prefix() {
         let mut e = Editor::new_from_text("# One\n\n## Two\n\nbody\n", None, (20, 8));
@@ -1159,8 +1178,25 @@ mod tests {
         term.draw(|f| render(f, &mut e)).unwrap();
         let buf = term.backend().buffer();
         let row = |y: u16| -> String { (0u16..20).map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' ')).collect() };
-        assert!(row(0).starts_with("█ One"), "H1 shade: got {:?}", row(0));
-        assert!(row(2).starts_with("▆ Two"), "H2 shade: got {:?}", row(2));
+        assert!(row(0).starts_with("󰬺 One"), "H1 numeral: got {:?}", row(0));
+        assert!(row(2).starts_with("󰬻 Two"), "H2 numeral: got {:?}", row(2));
+    }
+
+    /// The heading numeral glyph cell carries the REVERSED modifier (inverted box); the trailing
+    /// gutter space stays normal — the "inverted numeral + normal space" gutter (2 cells).
+    #[test]
+    fn heading_numeral_glyph_is_reversed_and_space_is_not() {
+        use ratatui::style::Modifier;
+        let mut e = Editor::new_from_text("# One\n\nbody\n", None, (20, 6));
+        set_caret(&mut e, 8); // caret in "body" → heading (row 0) inactive → glyph painted (segs path)
+        derive::rebuild(&mut e);
+        let mut term = Terminal::new(TestBackend::new(20, 6)).unwrap();
+        term.draw(|f| render(f, &mut e)).unwrap();
+        let buf = term.backend().buffer();
+        assert!(buf[(0u16, 0u16)].style().add_modifier.contains(Modifier::REVERSED),
+            "heading numeral glyph (col 0) must be REVERSED, got {:?}", buf[(0u16, 0u16)].style());
+        assert!(!buf[(1u16, 0u16)].style().add_modifier.contains(Modifier::REVERSED),
+            "gutter space (col 1) must NOT be reversed, got {:?}", buf[(1u16, 0u16)].style());
     }
 
     /// `style_to_ratatui(Style::Strong)` must have BOLD modifier.
@@ -2343,19 +2379,20 @@ mod tests {
         assert!(text.contains('▎'), "blockquote bar");
         assert!(text.contains('─'), "thematic rule");
         assert!(text.contains('•'), "list bullet glyph under no_color");
-        assert!(text.contains('▅'), "H3 heading shade glyph (▅ = SHADES[2])");
+        assert!(text.contains('󰬼'), "H3 heading glyph (󰬼 = HEADING_GLYPHS[2])");
     }
 
-    /// §13.2 §8.3 completeness: All six heading levels render their distinct shade glyphs
-    /// (`█▆▅▄▃▂`) under No-color so H1–H6 are distinguishable without color.
+    /// §13.2 §8.3 completeness: All six heading levels render their distinct numeral glyphs
+    /// (`󰬺󰬻󰬼󰬽󰬾󰬿`) under No-color so H1–H6 are distinguishable. (Content assertion: the reverse
+    /// video is a style, not a symbol — the cell symbol is the numeral glyph either way.)
     ///
     /// Document: "# H1\n## H2\n### H3\n#### H4\n##### H5\n###### H6\n\n"
-    ///   bytes  0- 4: "# H1\n"    (H1 — SHADES[0] = '█')
-    ///   bytes  5-10: "## H2\n"   (H2 — SHADES[1] = '▆')
-    ///   bytes 11-17: "### H3\n"  (H3 — SHADES[2] = '▅')
-    ///   bytes 18-25: "#### H4\n" (H4 — SHADES[3] = '▄')
-    ///   bytes 26-34: "##### H5\n"(H5 — SHADES[4] = '▃')
-    ///   bytes 35-44: "###### H6\n"(H6 — SHADES[5] = '▂')
+    ///   bytes  0- 4: "# H1\n"    (H1 — HEADING_GLYPHS[0] = '󰬺')
+    ///   bytes  5-10: "## H2\n"   (H2 — HEADING_GLYPHS[1] = '󰬻')
+    ///   bytes 11-17: "### H3\n"  (H3 — HEADING_GLYPHS[2] = '󰬼')
+    ///   bytes 18-25: "#### H4\n" (H4 — HEADING_GLYPHS[3] = '󰬽')
+    ///   bytes 26-34: "##### H5\n"(H5 — HEADING_GLYPHS[4] = '󰬾')
+    ///   bytes 35-44: "###### H6\n"(H6 — HEADING_GLYPHS[5] = '󰬿')
     ///   byte  45:    "\n"        (blank line — caret placed here so ALL headings INACTIVE)
     #[test]
     fn a11y_all_six_heading_shades_render_in_no_color() {
@@ -2365,16 +2402,16 @@ mod tests {
         );
         ed.theme = wordcartel_core::theme::no_color(); // heading_level_glyph = true
         // Place caret on the trailing blank line (byte 45) so ALL six heading lines are
-        // INACTIVE and render their shade glyphs (Task 6 invariant: active line ⟹ no glyph).
+        // INACTIVE and render their numeral glyphs (Task 6 invariant: active line ⟹ no glyph).
         set_caret(&mut ed, 45);
         crate::derive::rebuild(&mut ed);
         let text = (0..10).map(|r| row_string(&render_to_buffer(&mut ed, 40, 10), r)).collect::<String>();
-        assert!(text.contains('█'), "H1 shade glyph (█ = SHADES[0]) missing in no_color");
-        assert!(text.contains('▆'), "H2 shade glyph (▆ = SHADES[1]) missing in no_color");
-        assert!(text.contains('▅'), "H3 shade glyph (▅ = SHADES[2]) missing in no_color");
-        assert!(text.contains('▄'), "H4 shade glyph (▄ = SHADES[3]) missing in no_color");
-        assert!(text.contains('▃'), "H5 shade glyph (▃ = SHADES[4]) missing in no_color");
-        assert!(text.contains('▂'), "H6 shade glyph (▂ = SHADES[5]) missing in no_color");
+        assert!(text.contains('󰬺'), "H1 glyph (󰬺 = HEADING_GLYPHS[0]) missing in no_color");
+        assert!(text.contains('󰬻'), "H2 glyph (󰬻 = HEADING_GLYPHS[1]) missing in no_color");
+        assert!(text.contains('󰬼'), "H3 glyph (󰬼 = HEADING_GLYPHS[2]) missing in no_color");
+        assert!(text.contains('󰬽'), "H4 glyph (󰬽 = HEADING_GLYPHS[3]) missing in no_color");
+        assert!(text.contains('󰬾'), "H5 glyph (󰬾 = HEADING_GLYPHS[4]) missing in no_color");
+        assert!(text.contains('󰬿'), "H6 glyph (󰬿 = HEADING_GLYPHS[5]) missing in no_color");
     }
 
     #[test]
@@ -2749,8 +2786,8 @@ mod tests {
         derive::rebuild(&mut ed);
         let buf = render_to_buffer(&mut ed, 40, 8);
         // Row 0 = heading. no_color has heading_level_glyph=true; inactive heading shows
-        // "█ " (shade glyph + space, cols 0-1) then "Heading" (cols 2-8).
-        // Prefix "█ " already has BOLD in current code; text cells do NOT → that is the bug.
+        // "󰬺 " (numeral glyph + space, cols 0-1) then "Heading" (cols 2-8).
+        // Prefix "󰬺 " already has BOLD in current code; text cells do NOT → that is the bug.
         let row_text = row_string(&buf, 0);
         let h_col = row_text.chars().position(|c| c == 'H').unwrap_or(99) as u16;
         assert!(h_col < 40, "expected 'Heading' to appear on row 0 (inactive heading), got: {:?}", row_text);
