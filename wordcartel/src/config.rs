@@ -8,15 +8,19 @@ pub struct Cli {
     pub path: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
     pub no_config: bool,
+    /// `-V` / `--version` was passed. The caller (`main`) prints the version and exits 0;
+    /// the parser only records the request so it stays pure and testable.
+    pub version: bool,
 }
 
-/// Hand-rolled (no clap dep): `[--config <path>] [--no-config] [file]`.
+/// Hand-rolled (no clap dep): `[--version|-V] [--config <path>] [--no-config] [file]`.
 pub fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> Cli {
     let mut cli = Cli::default();
     let mut it = args.into_iter();
     let _ = it.next(); // argv[0]
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--version" | "-V" => cli.version = true,
             "--no-config" => cli.no_config = true,
             "--config" => cli.config_path = it.next().map(PathBuf::from),
             _ => {

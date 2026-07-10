@@ -6710,7 +6710,7 @@ dependencies = [
 
 [[package]]
 name = "wordcartel"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "arboard",
  "crossterm 0.28.1",
@@ -6730,7 +6730,7 @@ dependencies = [
 
 [[package]]
 name = "wordcartel-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "harper-core",
  "proptest",
