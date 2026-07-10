@@ -12,8 +12,9 @@ use ratatui::{
 
 use crate::{
     editor::Editor,
-    render::{
-        ChromeStyles, menu_bar_layout, menu_bar_layout_cats, menu_dropdown_rect,
+    render::ChromeStyles,
+    chrome_geom::{
+        menu_bar_layout, menu_bar_layout_cats, menu_dropdown_rect,
         palette_overlay_rect, windowed_indicator,
     },
 };
@@ -292,7 +293,7 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
     }
 
     if editor.menu_bar_rows() == 1 {
-        let menu_area = crate::render::menu_area(area);
+        let menu_area = crate::chrome_geom::menu_area(area);
         // Full-width bar background: gaps between labels + the right side carry the
         // Chrome style; the per-label paints below overwrite their own rects (A2).
         let bar_row = Rect::new(area.x, area.y, area.width, 1);
