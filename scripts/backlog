@@ -1,0 +1,60 @@
+#!/usr/bin/env sh
+# Backlog helper.
+#   Source of truth : ./backlog.toml
+#   Generated view  : ./BACKLOG.md   (never hand-edit; regenerate with `bless`)
+#   Triage prose    : docs/ux-backlog.md, docs/engineering-health.md (keyed by <!-- item: ID -->)
+#   Gate            : wordcartel/tests/backlog.rs  (schema + marker bijection + freshness)
+set -eu
+root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$root"
+
+bless() {
+  BLESS_BACKLOG=1 cargo test -p wordcartel --test backlog backlog_index_is_up_to_date -- --nocapture >/dev/null
+  echo "regenerated BACKLOG.md"
+}
+
+cmd="${1:-help}"
+case "$cmd" in
+  bless)
+    bless
+    ;;
+  add)
+    # Capture a triage item (the `bl:` flow). Appends a manifest row AND a prose stub+marker
+    # to docs/ux-backlog.md so the tree stays gate-green, then regenerates. Left uncommitted.
+    # Usage: scripts/backlog add <ID> <THEME> "<title>"
+    id="${2:?usage: scripts/backlog add <ID> <THEME> \"<title>\"}"
+    theme="${3:?theme required (A B C D E H M R S P)}"
+    title="${4:?title required}"
+    today="$(date +%Y-%m-%d)"
+    slug="$(printf '%s' "$id" | tr '[:upper:]' '[:lower:]')"
+    {
+      printf '\n[[item]]\n'
+      printf 'id = "%s"\n' "$id"
+      printf 'title = "%s"\n' "$title"
+      printf 'status = "triage"\n'
+      printf 'kind = "feature"\n'
+      printf 'size = "TBD"\n'
+      printf 'theme = "%s"\n' "$theme"
+      printf 'hook = "%s"\n' "$title"
+      printf 'doc = "ux-backlog.md#%s"\n' "$slug"
+      printf 'created = "%s"\n' "$today"
+    } >> backlog.toml
+    {
+      printf '\n### %s — %s\n' "$id" "$title"
+      printf '<!-- item: %s -->\n\n' "$id"
+      printf '%s\n' "$title"
+      printf '\n*(Captured %s via `scripts/backlog add`; flesh out the triage prose when picked up.)*\n' "$today"
+    } >> docs/ux-backlog.md
+    bless
+    echo "added $id (triage) + prose stub. Review, refine the stub, then commit when ready."
+    ;;
+  open)
+    sed -n '/^## Open/,/^## Shipped/p' BACKLOG.md
+    ;;
+  shipped)
+    sed -n '/^## Shipped/,/^## Dropped/p' BACKLOG.md
+    ;;
+  *)
+    echo "usage: scripts/backlog {bless | add <ID> <THEME> \"<title>\" | open | shipped}"
+    ;;
+esac
