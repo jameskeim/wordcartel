@@ -7,11 +7,13 @@ use crossterm::event::Event;
 #[cfg(test)]
 use crossterm::event::KeyEvent;
 
-use crate::{commands, config, derive, editor::Editor, file, keymap, render, settings, term};
+use crate::{config, derive, editor::Editor, file, keymap, render, settings, term};
+#[cfg(test)]
+use crate::commands;
 #[cfg(test)]
 use crate::input;
 use crate::jobs::{Executor, JobOutcome};
-use crate::registry::{Ctx, Registry};
+use crate::registry::Registry;
 use wordcartel_core::history::Clock;
 
 // ---------------------------------------------------------------------------
@@ -251,51 +253,8 @@ pub fn reduce(
 
     let before = editor.active().document.version;
     match msg {
-        Msg::Input(Event::Key(k)) if k.kind == crossterm::event::KeyEventKind::Press => {
-            // Esc precedence (Codex CRITICAL): prompt/minibuffer Esc are handled in their
-            // interception blocks ABOVE this point. Here in normal mode the order is
-            // pending-cancel > filter-cancel. This arm SUBSUMES the old standalone
-            // filter-cancel Esc check (removed above). Esc is reserved for cancel/dismiss
-            // in v1 (not routed to the keymap).
-            if k.code == crossterm::event::KeyCode::Esc {
-                if !editor.pending_keys.is_empty() {
-                    editor.pending_keys.clear();
-                    editor.status.clear();
-                } else if editor.filter_in_flight.is_some() {
-                    editor.filter_in_flight.take().unwrap().cancel();
-                    editor.status = "cancelling…".into();
-                }
-            } else if let Some(chord) = crate::keymap::from_key_event(k) {
-                editor.pending_keys.push(chord);
-                match keymap.resolve(&editor.pending_keys) {
-                    crate::keymap::Resolution::Command(id) => {
-                        editor.pending_keys.clear();
-                        editor.status.clear();
-                        let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
-                        reg.dispatch(id, &mut ctx);
-                        hydrate_overlays(editor, reg, keymap);
-                    }
-                    crate::keymap::Resolution::Pending => {
-                        editor.status = format!("{} …", crate::keymap::chords_display(&editor.pending_keys));
-                    }
-                    crate::keymap::Resolution::None => {
-                        let was_single = editor.pending_keys.len() == 1;
-                        editor.pending_keys.clear();
-                        editor.status.clear();
-                        // Printable fallthrough: single unmodified printable → literal insert.
-                        if was_single {
-                            if let crossterm::event::KeyCode::Char(c) = k.code {
-                                if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                                    && !k.modifiers.contains(crossterm::event::KeyModifiers::ALT)
-                                {
-                                    commands::run(commands::Command::InsertChar(c), editor, clock);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        Msg::Input(Event::Key(k)) if k.kind == crossterm::event::KeyEventKind::Press =>
+            crate::input::handle_key(k, editor, reg, keymap, ex, clock, msg_tx),
         Msg::Input(Event::Paste(text)) => {
             if let Some(mb) = editor.minibuffer.as_mut() {
                 for ch in text.chars() { mb.insert(ch); }
