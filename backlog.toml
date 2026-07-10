@@ -649,14 +649,16 @@ shipped_date = "2026-07-09"
 [[item]]
 id = "H9"
 title = "Lift logical-line helpers out of derive"
-status = "ready"
+status = "shipped"
 kind = "debt"
 size = "S"
 theme = "H"
 hook = "Move total_logical_lines/line_start/line_text/line_render_for into a small lines.rs."
-doc = "engineering-health.md#h9"
+doc = "backlog-archive.md#h9"
 blocks_effort_p = true
 created = "2026-07-09"
+shipped_commit = "2437fca"
+shipped_date = "2026-07-10"
 
 [[item]]
 id = "H10"
@@ -672,14 +674,16 @@ created = "2026-07-09"
 [[item]]
 id = "H11"
 title = "Decompose commands::run god-function"
-status = "ready"
+status = "shipped"
 kind = "debt"
 size = "M"
 theme = "H"
 hook = "Factor the repeated edit epilogue + lift edit-arm bodies into an edit module."
-doc = "engineering-health.md#h11"
+doc = "backlog-archive.md#h11"
 blocks_effort_p = true
 created = "2026-07-09"
+shipped_commit = "2437fca"
+shipped_date = "2026-07-10"
 
 [[item]]
 id = "H12"
@@ -706,15 +710,17 @@ created = "2026-07-10"
 [[item]]
 id = "H14"
 title = "Split the render() body by paint surface"
-status = "ready"
+status = "shipped"
 kind = "debt"
 size = "M"
 theme = "H"
 hook = "Split 522-line render() into paint_rows/paint_status/place_cursor; unify segs/placed lead-in. (H1 remainder.)"
-doc = "engineering-health.md#h14"
+doc = "backlog-archive.md#h14"
 blocks_effort_p = true
 depends_on = ["H9", "H11"]
 created = "2026-07-09"
+shipped_commit = "2437fca"
+shipped_date = "2026-07-10"
 
 [[item]]
 id = "H15"

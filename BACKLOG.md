@@ -3,17 +3,14 @@
 
 # Backlog
 
-**31 open · 30 shipped · 1 dropped**
+**28 open · 33 shipped · 1 dropped**
 
-Blocking Effort P: **3**
+Blocking Effort P: **0**
 
 ## Open
 
 | id | title | status | kind | size | P? | hook |
 |---|---|---|---|---|---|---|
-| H9 | Lift logical-line helpers out of derive | ready | debt | S | 🚩 | Move total_logical_lines/line_start/line_text/line_render_for into a small lines.rs. |
-| H11 | Decompose commands::run god-function | ready | debt | M | 🚩 | Factor the repeated edit epilogue + lift edit-arm bodies into an edit module. |
-| H14 | Split the render() body by paint surface | ready | debt | M | 🚩 | Split 522-line render() into paint_rows/paint_status/place_cursor; unify segs/placed lead-in. (H1 remainder.) |
 | A13 | Overlay mouse parity | needs-design | feature | S |  | Click-to-select for theme picker + file browser; outline click-to-jump. |
 | A3b | Item-by-item menu-curation pass | ready | chore | S |  | Per-command menu vs palette-only curation; concrete Q: move Filter Edit->Format? |
 | A9 | Wrap Column state-in-label | needs-design | feature | S |  | Rename 'Set Wrap Column...' to stateful 'Wrap Column: <value>'. |
@@ -45,11 +42,14 @@ Blocking Effort P: **3**
 
 ## Shipped
 
-<details><summary>30 shipped</summary>
+<details><summary>33 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
 | E6 | Splash / start screen | 2026-07-10 | 242c987 |
+| H11 | Decompose commands::run god-function | 2026-07-10 | 2437fca |
+| H14 | Split the render() body by paint surface | 2026-07-10 | 2437fca |
+| H9 | Lift logical-line helpers out of derive | 2026-07-10 | 2437fca |
 | H1 | God-object SEAM decomposition (app.rs/render.rs) | 2026-07-09 | 304e263 |
 | H6 | Point-release version scheme + release process | 2026-07-09 | 50b449a |
 | H8 | Remove dead fold/outline accessors | 2026-07-09 | b5a664a |
