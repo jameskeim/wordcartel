@@ -46,6 +46,21 @@ moves only): it is a different risk class — real restructuring that churns the
 so it earns a focused pass of its own. `render.rs` is not fully decomposed until this lands; low context
 overlap with the app.rs work is exactly why it was split off (user decision 2026-07-09).
 
+**Line anchors (2026-07-09 map; may drift — `render()` body is `render.rs:216–737`, guarded by the
+`#[allow(clippy::too_many_lines)]` at :215).** The body is 12 sequential phases; the three split targets and the
+dedup target:
+- **`paint_rows`** ← the row loop `render.rs:358–606` (the mass). Per visual row it builds spans through two
+  near-duplicate paths: the **segs** path (:395–450, no search/diag/sel/block) and the **placed** path (:451–588,
+  per-glyph MarkedBlock→Selection→Search→Diag layering + run-accumulation).
+- **`paint_status`** ← the status-line block `render.rs:635–699` (search bar / minibuffer / prompt / normal +
+  right-flushed Ln/Col·words via `render_status::` helpers).
+- **`place_cursor`** ← the hardware-cursor block `render.rs:704–734` (search field / minibuffer / `nav::screen_pos`).
+- **Unify `segs`/`placed`:** the **prefix lead-in is near-verbatim duplicated** — segs at `render.rs:404–432`,
+  placed at `:477–503` (same heading-numeral-box-vs-dim-glyph logic, copy-pasted), and both share the identical
+  `row_dim`/`plain_source` compose ladder (:434–446 vs :515–527). That shared lead-in + style ladder is the
+  natural extract. Everything after the loop is already delegated: `ChromeStyles::build` (:612, shared with
+  `render_overlays.rs`), scrollbar (:617–630), and `render_overlays::paint` (:736).
+
 *(Original triage below retained for history — the SEAM direction it sketched is what shipped.)*
 
 `app.rs` is **5,519 lines** and `render.rs` **3,393** — past the point where one person holds them in
@@ -192,3 +207,43 @@ a message) vs genuinely-fallible (→ typed error to the status line), and confi
 untrusted/IO/async path that M2/M3/M4 didn't already cover. Low-risk, mechanical, high-confidence — a good
 fold into a future hardening pass. Anchors: CLAUDE.md (unwrap policy), this doc's Snapshot (the ~35 count),
 the M2/M3/M4 boundaries.
+
+## H8 — Dead public API: two fold/outline accessors have no production callers · `triage` (2026-07-09)
+
+**Grounded (rust-analyzer call-hierarchy + `findReferences` + raw grep, 2026-07-09).** Two `pub` fns are
+referenced ONLY by their own unit tests — superseded-but-not-removed API. Both are the byte-space /
+single-shot sibling of a batch API that the real hot path uses instead:
+
+1. **`outline::section_range`** (`wordcartel-core/src/outline.rs:75`) — referenced only inside its own file:
+   the def plus 4 unit-test call sites (lines 195, 198, 201, 209). Its doc comment describes the fold
+   subsystem as the caller ("callers hide the body… and keep the heading visible"), but folding actually
+   uses the `sections`/`body_range` batch API — `section_range` looks like a leftover from before that batch
+   API landed. Tests to remove with it: `section_range_stops_at_same_or_higher_level`,
+   `section_range_last_heading_runs_to_eof` (`outline.rs:187`/`:204`).
+
+2. **`fold::FoldState::hidden_byte_ranges`** (`wordcartel/src/fold.rs:113`) — the BYTES-space hidden-range
+   accessor; grep finds only the def and one test (`fold.rs:395`, `hidden_byte_ranges_cover_body_not_heading`).
+   The per-frame path uses `FoldView::compute` (LINE space, merged + `epoch`-cached via
+   `editor.active_fold_view()`) instead, so the byte-space variant is never invoked in production. Same
+   superseded-sibling shape as (1).
+
+**Direction when picked up:** for each, confirm no Effort-P/plugin surface is expected to want it, then delete
+the fn + its test(s) — or, if it's meant to be kept as public API for plugins, add a production caller or a
+`#[doc]`/rationale so it isn't mistaken for dead code. Low-risk, mechanical. Anchors: `outline.rs:75` (+`:187`/
+`:204` tests); `fold.rs:113` (+`:395` test); the batch APIs that actually feed the hot path
+(`outline::sections`/`body_range`, `fold::FoldView::compute`).
+
+## H9 — Lift the logical-line helpers out of `derive` into their own module · `triage` (2026-07-09)
+
+**Grounded (rust-analyzer call-hierarchy + raw grep, 2026-07-09):** `derive::{total_logical_lines, line_start,
+line_text}` (and the render-mode mapper `line_render_for`) are pure logical-line/line-space utilities with no
+dependence on the derive PIPELINE — yet they live in `derive.rs` (the 979-line recompute module) and are the
+most cross-imported thing in it. `line_start` alone has ~30 call sites across `nav.rs` (heavily), `render.rs`,
+and `transform.rs`; `total_logical_lines` is used from `nav.rs`/`prompts.rs`/`commands.rs`; `line_text`/
+`line_render_for` from `nav.rs`. So the whole nav/render line-space layer imports `derive` only to reach three
+trivial helpers, coupling it to the parse/layout hub. Direction when picked up: lift the trio (plus
+`line_render_for`) into a small `lines.rs` (or a `buffer`-adjacent home), leaving `derive` to own only the
+`rebuild`/`rebuild_downstream` pipeline + `LayoutKey`. Mechanical (move + re-point imports; no behavior change),
+low-risk, and a natural seam to take **alongside the remaining H1 `render()`/module-size work** rather than as a
+standalone churn. Anchors: `wordcartel/src/derive.rs:91` (`total_logical_lines`), `:104` (`line_start`), `:116`
+(`line_text`), `:25` (`line_render_for`); heaviest consumer `nav.rs`.
