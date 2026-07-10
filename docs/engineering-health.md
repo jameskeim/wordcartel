@@ -277,3 +277,31 @@ fns iterated in order). Until then the repetition is bounded and readable; touch
 sake. This is a **command-surface-contract / Effort-P-conformance** note, not module-size debt (`reduce` is
 within budget). Anchor: `wordcartel/src/app.rs:233–252` (the chain); `:123` (`Handled`); the `timers::SUBSYSTEMS`
 table is the model a unified version would follow.
+
+## H11 — `commands::run` is the next god-*function* after `render()` (inline bodies masquerading as a table) · `triage` (2026-07-09)
+
+**Grounded (read of `commands.rs:209–687`, 2026-07-09).** `commands::run` — the `Command`-enum dispatcher every
+built-in and every registry handler ultimately routes through — is **478 production lines** carrying
+`#[allow(clippy::too_many_lines)] // command dispatch — a flat table, one arm per Command variant`. But unlike the
+genuine tables (`registry::builtins` = pure data rows; `reduce` = thin delegations; `timers::SUBSYSTEMS` = a
+fn-pointer table), its arms are **inline edit bodies**, not delegations — so it violates the letter of the
+*"a match arm is a thin delegation into a domain module — never an inline body"* anti-regrowth rule (CLAUDE.md →
+Module structure) while claiming the flat-table exception. This is the same god-*function* class as the remaining
+H1 `render()` split, and it's on the **Effort-P hot path** (plugin-invoked edits route through `run`), so it is
+worth decomposing before P.
+
+**Two low-risk moves, both preserving the flat-dispatch shape:**
+1. **Factor the repeated edit epilogue.** Every edit arm ends with the verbatim
+   `derive::rebuild(editor); nav::ensure_visible(editor); editor.active_mut().desired_col = None; CommandResult::Handled`
+   (across `InsertChar`/`InsertNewline`/`Backspace`/`DeleteForward`/… ~8+ arms), and each first branches
+   selection-vs-collapsed identically. One helper (e.g. `apply_edit_and_settle(editor, txn, edit, kind, sel, clock)`)
+   collapses both — exactly the move `app::fold_and_continue` made for `reduce`'s "21 verbatim repetitions."
+2. **Lift the edit-arm bodies into an `edit` module** (insert/delete/replace-selection primitives over the
+   `ChangeSet`/`Edit`/`Transaction` builders already in this file — `replace_changeset`, `build_range_replace`,
+   `build_multi_replace`), leaving `run` a thin exhaustive dispatch like `reduce`.
+
+**Difficulty: focused Medium.** Behavior-identical; caught by the ~55 `commands::run` unit tests + the e2e
+journeys. Lower risk than the H1 `render()` split (no pixel-exact golden churn — the edit paths are asserted by
+buffer state, not rendered cells). Pairs naturally with the H1 module-size pass. Anchors: `wordcartel/src/commands.rs:209`
+(`run` + the allow at `:210`), the changeset builders at `:101`/`:128`/`:156`, the repeated epilogue visible at
+`:224–226`/`:238–240`/`:271–273`/`:287–289`.
