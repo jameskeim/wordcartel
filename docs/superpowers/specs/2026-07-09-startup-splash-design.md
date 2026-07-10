@@ -62,10 +62,16 @@ as the welcome. Dismissing reveals the file (if any) or the blank scratch.
 
 - **Wordmark** `wordcartel` — theme **accent, bold**. **Version** `v{CARGO_PKG_VERSION}` (→ `v0.1.0`), normal.
   **Tagline** "Everyone needs a cover story" — **dim**. **Footer** "press any key" — dim.
-- **Hints** (3): `palette` "Command palette", `open` "Open file", `quit` "Quit". Each chord resolves against the
-  **active keymap** via `keymap::KeyTrie::chord_for(CommandId)` (`keymap.rs:194`, returns the shortest chord display,
-  blank when unbound) — the existing "hints track the active keymap" machinery, so chords are honest under CUA *or*
-  WordStar. A hint whose command is **unbound** in the active keymap is **omitted** (no dangling label).
+- **Hints** (3): `palette` "Command palette", `open` "Open file", `quit` "Quit". Each chord comes from
+  `keymap::KeyTrie::chord_for(CommandId) -> Option<String>` (`keymap.rs:194`; returns `None` when unbound — blank
+  display is a caller convention, cf. `palette.rs:81` `unwrap_or_default()`), the existing "hints track the active
+  keymap" machinery, so chords are honest under CUA *or* WordStar. **A hint whose `chord_for` is `None` is omitted**
+  (no dangling label). **Resolution timing (Codex-Critical fix):** `render_overlays::paint(frame, editor, cs)` has
+  **no keymap** in its signature, and `run()` moves the keymap out of `editor` via `std::mem::take` (`app.rs:613`)
+  into a loop-local before the first draw — so hints CANNOT be resolved at paint time. Instead they are resolved
+  **once, at `Splash` construction** (§3), from the loop-local keymap, and the resolved `(chord, label)` pairs are
+  stored in the `Splash`. This is correct and honest: the splash is startup-only and dismissed on the first key, so
+  the active keymap cannot change while it is shown — one-shot resolution == active-keymap resolution here.
 - **Layout:** vertically + horizontally centered block; reuse `render()`'s tiny-terminal discipline. **Degradation**
   as height shrinks: drop hints → tagline → version, always keeping the wordmark; below the existing `w<4 || h<2`
   guard, paint nothing. Never panic on any size (assert in tests).
@@ -75,53 +81,77 @@ as the welcome. Dismissing reveals the file (if any) or the blank scratch.
 ### 3. Architecture — the overlay seam (mirrors palette/menu/theme_picker)
 
 - **State:** new field `editor.splash: Option<Splash>` (`editor.rs`, alongside `palette`/`menu`/… ~ lines 411–445).
-- **Module:** new `wordcartel/src/splash.rs` — the `Splash` struct (minimal; content is derived at paint from
-  theme + keymap + version, so `Splash` holds little/no dynamic state), `intercept`, and the paint helper.
+- **Module:** new `wordcartel/src/splash.rs` — the `Splash` struct + `Splash::new(keymap, version)` (resolves the 3
+  hint chords via `chord_for` at construction and stores the surviving `(chord, label)` pairs; `version` captured
+  from `env!("CARGO_PKG_VERSION")`), plus `intercept` and the paint helper. **`Splash` carries its resolved content
+  so paint needs no keymap** (the Critical fix). Wordmark/tagline/footer are static; theme faces are read from
+  `editor.theme` at paint.
 - **Interception:** `splash::intercept(msg, editor, …) -> Handled` inserted at the **TOP** of `reduce`'s chain,
-  BEFORE `marks::intercept` (`app.rs:233`). Contract: `splash.is_none()` → `Pass(msg)` immediately; else key/click →
-  `editor.splash = None; Done(!editor.quit)`; any other msg → `Pass(msg)`. (One added line in `reduce`; ties to the
+  BEFORE `marks::intercept` (`app.rs:233`). Signature matches the peer intercepts (the `(msg, editor, ex, clock,
+  msg_tx)` shape — splash needs no `reg`/`keymap`). Contract: `splash.is_none()` → `Pass(msg)`; else key/mouse-down →
+  `editor.splash = None; Done(!editor.quit)`; any other msg → `Pass(msg)`. (One added stage in `reduce`; ties to the
   H10 `watch` note — the chain grows by one fixed stage, still bounded.)
-- **Paint:** a branch in `render_overlays::paint(frame, editor, cs)` (`render_overlays.rs:37`, already the last
-  paint step in `render()`), drawing the full-frame splash when `editor.splash.is_some()`.
-- **Config:** add `pub splash: bool` to `ViewConfig` (`config.rs:118`), default `true` (a plain bool like
-  `word_count`/`wrap_guide`, NOT a `TransientMode`). Add TOML parse under `[view] splash`. Seeded into
-  `editor.view_opts` at startup like the other view options.
-- **CLI:** add `pub no_splash: bool` to `Cli` (`config.rs:7`) + a `"--no-splash"` arm in `parse_cli` (mirrors
-  `--no-config`). `run()` gates the splash on `!cli.no_splash`.
-- **Command:** register `toggle_splash` (label e.g. "Startup Splash", `MenuCategory::View`, **stateful** →
-  `MenuMark::OnOff(view_opts.splash)`), mirroring the existing `toggle_word_count`. It flips the **persisted**
-  `view_opts.splash` through **one shared setter** (`Editor::set_splash` — the same setter startup-seed and any
-  profile use); it affects the **next** launch (the splash is a startup behavior), and its status says so, e.g.
+- **Paint:** a branch in `render_overlays::paint(frame, editor, cs)` (`render_overlays.rs:37`, verified the last
+  paint step in `render()` at `render.rs:736`), drawing the full-frame splash from the pre-resolved `Splash` content
+  when `editor.splash.is_some()`.
+- **Startup (`run()`):** set `editor.splash = Some(Splash::new(&keymap, env!("CARGO_PKG_VERSION")))` using the
+  **loop-local `keymap`** (after the `std::mem::take` at `app.rs:613`, before `first_frame_settle`/first draw at
+  `app.rs:698`–`699`), gated on `cfg.view.splash && !cli.no_splash && editor.prompt.is_none()` (recovery-on-open sets
+  `editor.prompt` via `open_prompt`, verified `app.rs:551/568/575` → `editor.rs:656`; no other startup prompt precedes
+  the first draw).
+- **Config:** add `pub splash: bool` to `ViewConfig` (`config.rs:125`), default `true` (a plain bool like
+  `word_count`/`wrap_guide`). Parsing is **serde `RawView` + manual folding into `ViewConfig`**, NOT direct serde —
+  add the field to `RawView` and its fold site (`config.rs:307` and the fold at `config.rs:400`). Startup seed is
+  already covered by `editor.view_opts = cfg.view.clone()` (`app.rs:484`) — no new seeding code.
+- **CLI:** add `pub no_splash: bool` to `Cli` (`config.rs:7`) + a `"--no-splash"` arm in `parse_cli` (`config.rs:22`,
+  mirrors `--no-config`). `run()` gates the splash on `!cli.no_splash`.
+- **Commands (set-per-state, Codex-Important fix):** the contract treats a settable option as needing **deterministic
+  set-per-state primitives + a convenience toggle + a stateful menu representative** (the `status_line_on` /
+  `status_line_auto` / `toggle_status_line` pattern, `registry.rs:489` — NOT the bare `toggle_word_count`, which has
+  no setter and is the weaker pattern). So register: **`splash_on`**, **`splash_off`** (deterministic), and
+  **`toggle_splash`** (convenience), all `MenuCategory::View`; the toggle is **stateful** →
+  `MenuMark::OnOff(view_opts.splash)` and is the menu representative. All three call **one shared setter**
+  `Editor::set_splash(bool)` (the option's single write path; profiles call it too — the startup `view_opts.clone()`
+  seed is the established seed path and is left as-is). Status notes it affects the **next** launch, e.g.
   `splash: on (takes effect next launch)`.
+- **Settings persistence (Codex-Important fix — config parse alone does NOT persist it):** `Save Settings` writes an
+  overrides file via the `settings.rs` snapshot/override machinery, so `view.splash` must be threaded through **all**
+  of: `OView` (`settings.rs:110`), `snapshot_of` (`settings.rs:159`), `runtime_snapshot` (`settings.rs:181`),
+  `compute_overrides` (`settings.rs:365`), and a command-test line for the new persisted field per the
+  `SettingsSnapshot` contract note (`settings.rs:33`). Missing any of these = the setting silently won't persist.
 
 ### 4. Command-surface contract conformance (App law — stated per the contract)
 
 `docs/design/command-surface-contract.md` governs this effort because it adds a user-settable option and shows
 keybinding hints:
 
-- **Every option is a command:** `view.splash` is user-settable → the `toggle_splash` command IS its setter path.
-- **Registry = single source of truth; palette exhaustive; menu ⊆ palette:** `toggle_splash` is registered, so it
-  appears in the palette automatically and in the **View** menu.
-- **One shared setter:** `Editor::set_splash` — command, startup-seed, and profiles all call it; no direct field
-  writes.
-- **Hints track the active keymap:** the splash's hint chords come from `KeyTrie::chord_for` against the active
-  keymap; switching preset re-resolves them.
+- **Every option is a command, with set-per-state primitives:** `view.splash` is user-settable → deterministic
+  `splash_on` / `splash_off` primitives **plus** the convenience `toggle_splash` (the `status_line_*` pattern,
+  `registry.rs:489`), so automation/profiles/plugins can set an absolute state, not just flip.
+- **Registry = single source of truth; palette exhaustive; menu ⊆ palette:** all three commands are registered → in
+  the palette automatically; `toggle_splash` is the stateful **View**-menu representative (`MenuMark::OnOff`).
+- **One shared setter:** `Editor::set_splash(bool)` — the single write path all three commands (and profiles) call.
+- **Hints track the active keymap:** the splash's hint chords come from `KeyTrie::chord_for` against the keymap
+  active at construction (startup); the splash never outlives a preset change, so one-shot resolution is faithful.
 - **Merge gates:** the contract's invariant tests (palette-completeness, every-option-has-a-command, hint
-  re-resolution) must stay green with the new command/option.
+  re-resolution) must stay green with the new commands/option.
 
-The splash overlay itself is dismiss-only (not a settable option), so no command beyond the toggle.
+The splash overlay itself is dismiss-only (not a settable option), so no command beyond the three above.
 
 ### 5. Testing
 
-- **Unit (`splash.rs`, `config.rs`, `registry.rs`):** shown iff enabled ∧ ¬`--no-splash` ∧ ¬recovery-pending;
-  `intercept` dismisses-and-consumes on key and on mouse-down, and `Pass`es `Tick`/background/`Resize`; paint
-  renders wordmark/version/tagline and degrades correctly at shrinking sizes with no panic at `1×1`…`4×2`;
-  `toggle_splash` flips `view_opts.splash` via `set_splash` and persists; hints resolve to different chords under
-  CUA vs WordStar (`chord_for`).
+- **Unit (`splash.rs`, `config.rs`, `registry.rs`, `settings.rs`):** shown iff enabled ∧ ¬`--no-splash` ∧
+  ¬recovery-pending; `intercept` dismisses-and-consumes on key and on mouse-down, and `Pass`es `Tick`/background/
+  `Resize`; `Splash::new` resolves the 3 hints and **omits an unbound one** (`chord_for` `None`) — asserted under
+  CUA (all bound) and a WordStar/custom keymap (different or missing chord); paint renders wordmark/version/tagline
+  and degrades correctly at shrinking sizes with no panic at `1×1`…`4×2`; `splash_on`/`splash_off`/`toggle_splash`
+  all move `view_opts.splash` through `set_splash`; **`view.splash` round-trips through `snapshot_of` →
+  `compute_overrides` → parse** (the persistence path, not just config parse).
 - **e2e (`e2e.rs`):** launch → splash on first frame → key dismisses → editor visible; `--no-splash` → no splash on
   first frame; recovery-pending launch → recovery prompt shown, no splash.
-- **Command-surface invariant tests:** extended/covered so `toggle_splash` satisfies palette-completeness +
-  every-option-has-a-command + hint re-resolution.
+- **Command-surface invariant tests:** extended/covered so `splash_on`/`splash_off`/`toggle_splash` satisfy
+  palette-completeness + every-option-has-a-command + hint re-resolution, and the `SettingsSnapshot` per-persisted-
+  field command-test line exists for `view.splash`.
 - **Smoke (advisory):** the existing PTY suite still `8/8` (startup path changes).
 
 ### 6. Non-goals
@@ -129,6 +159,19 @@ The splash overlay itself is dismiss-only (not a settable option), so no command
 - No ASCII-art logo (styled text only; additive later). No auto-timeout (dismiss-on-interaction only — preserves
   idle-is-free). No recent-files list on the welcome (separate feature; the hints cover orientation). No animation.
   No first-run-only logic (shows every launch until disabled).
+
+## Codex spec-review log
+
+- **Round 1 (2026-07-09): NOT-READY → folded.** Codex cross-checked against source and found: **[Critical]** hints
+  can't be keymap-resolved at `render_overlays::paint` (no keymap in signature; `run()` `mem::take`s the keymap
+  before draw) → fixed by resolving hints at `Splash::new(keymap)` construction and storing them. **[Important]**
+  `toggle_word_count` is not a shared-setter pattern (direct field flip) → adopt the `status_line_*` set-per-state
+  shape + a real `Editor::set_splash`. **[Important]** persistence needs the full `settings.rs` migration surface
+  (`OView`/`snapshot_of`/`runtime_snapshot`/`compute_overrides` + `SettingsSnapshot` test line), not just config
+  parse → enumerated. **[Important]** contract wants deterministic set-per-state primitives → added
+  `splash_on`/`splash_off`. **[Minor]** `chord_for` returns `None` not blank; config parse is `RawView`+manual fold
+  → wording corrected. Confirmed-correct: recovery→`editor.prompt` suppression gate, first-draw ordering,
+  `open`/`quit`/`palette` ids + CUA binds, `render_overlays::paint` is last paint step, Resize/job/timer pass-through.
 
 ## Resolved decisions (from spec review, 2026-07-09)
 
