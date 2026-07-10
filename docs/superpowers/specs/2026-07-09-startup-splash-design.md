@@ -1,8 +1,9 @@
 # Startup splash / welcome screen — design
 
-**Date:** 2026-07-09 · **Status:** approved (brainstorm) · **Pipeline:** full gated (this touches the command
-surface) — design → Codex spec review → plan → Codex plan review → subagent execution → Fable + Codex gates →
-merge. **Origin:** user request "create a splash screen."
+**Date:** 2026-07-09 · **Status:** approved (brainstorm); **Codex spec review GO (round 3, 2026-07-09)** — ready for
+implementation plan. · **Pipeline:** full gated (this touches the command surface) — design → Codex spec review ✓ →
+plan → Codex plan review → subagent execution → Fable + Codex gates → merge. **Origin:** user request "create a
+splash screen."
 
 ## Problem / goal
 
@@ -168,6 +169,10 @@ The splash overlay itself is dismiss-only (not a settable option), so no command
   No first-run-only logic (shows every launch until disabled).
 
 ## Codex spec-review log
+
+- **Round 3 (2026-07-09): GO.** No Critical / Important / Minor. All round-2 fixes confirmed resolved against source
+  (menu tagging vs `status_line_*`, the complete settings migration surface traced against `word_count`/`wrap_guide`,
+  the §1/§3 `Splash::new` unification, `chord_for`/`RawView`/version claims). Spec is accurate enough to plan from.
 
 - **Round 2 (2026-07-09): NOT-READY → folded.** No Critical (round-1 Critical/setter/minors all confirmed
   RESOLVED). **[Important]** set-per-state commands must be **palette-only** (`menu: None`); only `toggle_splash`
