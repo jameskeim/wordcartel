@@ -5,6 +5,8 @@
 
 use crate::keymap::KeyTrie;
 use crate::registry::CommandId;
+use crate::app::{Handled, Msg};
+use crossterm::event::{Event, KeyEventKind, MouseEventKind};
 
 /// The splash wordmark — the app's styled-text identity (no ASCII art).
 #[allow(dead_code)] // wired in Task 4 (painter)
@@ -63,6 +65,30 @@ impl Splash {
     pub fn hints(&self) -> &[(String, &'static str)] { &self.hints }
 }
 
+/// Splash dismissal stage — the FIRST stage in `reduce`'s intercept chain.
+///
+/// Contract (spec §3): `splash.is_none()` → `Pass(msg)`; else the first key PRESS or
+/// mouse-DOWN clears the splash and is CONSUMED (`Done(!editor.quit)`); every other
+/// message — `Tick`, background job results, `Resize`, key release/repeat, mouse
+/// move/scroll — passes through so startup warmup, the timer subsystems, and
+/// resize-reheal keep working while the splash is up (idle-is-free).
+pub(crate) fn intercept(msg: Msg, editor: &mut crate::editor::Editor,
+    _ex: &dyn crate::jobs::Executor, _clock: &dyn wordcartel_core::history::Clock,
+    _msg_tx: &std::sync::mpsc::Sender<Msg>) -> Handled {
+    if editor.splash.is_none() { return Handled::Pass(msg); }
+    let dismiss = match &msg {
+        Msg::Input(Event::Key(k)) => k.kind == KeyEventKind::Press,
+        Msg::Input(Event::Mouse(m)) => matches!(m.kind, MouseEventKind::Down(_)),
+        _ => false,
+    };
+    if dismiss {
+        editor.splash = None;
+        Handled::Done(!editor.quit)
+    } else {
+        Handled::Pass(msg)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +118,93 @@ mod tests {
         let s = Splash::new(&km, "0.1.0");
         let hints: Vec<(&str, &str)> = s.hints().iter().map(|(c, l)| (c.as_str(), *l)).collect();
         assert_eq!(hints, vec![("ctrl-k q", "Quit")], "unbound hints are omitted, not blank");
+    }
+
+    use crate::app::{Handled, Msg};
+    use crate::editor::Editor;
+    use crate::jobs::InlineExecutor;
+    use crate::test_support::{press, TestClock};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    fn splashed_editor() -> Editor {
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        e.splash = Some(Splash::new(&cua_keymap(), "0.1.0"));
+        e
+    }
+
+    fn run_intercept(msg: Msg, e: &mut Editor) -> Handled {
+        let ex = InlineExecutor::default();
+        let clk = TestClock::new(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        intercept(msg, e, &ex, &clk, &tx)
+    }
+
+    #[test]
+    fn intercept_passes_everything_when_no_splash() {
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        assert!(e.splash.is_none());
+        // Handled has no Debug derive — match exhaustively without formatting it.
+        match run_intercept(press(KeyCode::Char('x'), KeyModifiers::NONE), &mut e) {
+            Handled::Pass(Msg::Input(Event::Key(_))) => {}
+            Handled::Pass(_) => panic!("the key must pass through as the SAME message"),
+            Handled::Done(_) => panic!("no splash → the key must pass, not be consumed"),
+        }
+    }
+
+    #[test]
+    fn intercept_key_press_dismisses_and_consumes() {
+        let mut e = splashed_editor();
+        match run_intercept(press(KeyCode::Char('x'), KeyModifiers::NONE), &mut e) {
+            Handled::Done(keep) => assert!(keep, "consumed, app keeps running"),
+            Handled::Pass(_) => panic!("the dismissing key press must be consumed"),
+        }
+        assert!(e.splash.is_none(), "splash cleared");
+        assert_eq!(e.active().document.buffer.to_string(), "hello\n", "nothing typed");
+    }
+
+    #[test]
+    fn intercept_mouse_down_dismisses_and_consumes() {
+        let mut e = splashed_editor();
+        let msg = Msg::Input(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10, row: 5, modifiers: KeyModifiers::NONE,
+        }));
+        match run_intercept(msg, &mut e) {
+            Handled::Done(keep) => assert!(keep),
+            Handled::Pass(_) => panic!("mouse-down must be consumed"),
+        }
+        assert!(e.splash.is_none());
+    }
+
+    #[test]
+    fn intercept_passes_tick_resize_background_and_key_release() {
+        let mut e = splashed_editor();
+        // Tick, Resize, and a background result all pass through (idle-is-free: startup
+        // warmup / timers / resize-reheal keep working while the splash is up).
+        for msg in [
+            Msg::Tick,
+            Msg::Input(Event::Resize(100, 40)),
+            Msg::ClipboardAvailability(true),
+            Msg::Input(Event::Key(KeyEvent { code: KeyCode::Char('x'),
+                modifiers: KeyModifiers::NONE, kind: KeyEventKind::Release,
+                state: KeyEventState::NONE })),
+        ] {
+            match run_intercept(msg, &mut e) {
+                Handled::Pass(_) => {}
+                Handled::Done(_) => panic!("non-press, non-mouse-down messages must pass"),
+            }
+            assert!(e.splash.is_some(), "splash survives pass-through messages");
+        }
+    }
+
+    #[test]
+    fn intercept_done_reports_quit_flag() {
+        let mut e = splashed_editor();
+        e.quit = true; // hypothetical: the contract is Done(!editor.quit), verbatim
+        match run_intercept(press(KeyCode::Char('x'), KeyModifiers::NONE), &mut e) {
+            Handled::Done(keep) => assert!(!keep, "Done carries !editor.quit"),
+            Handled::Pass(_) => panic!("must consume"),
+        }
     }
 }

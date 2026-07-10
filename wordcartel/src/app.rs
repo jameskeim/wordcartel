@@ -230,6 +230,8 @@ pub fn reduce(
             panic!("WCARTEL_SMOKE_PANIC: deliberate smoke-test panic");
         }
     }
+    let msg = match crate::splash::intercept(msg, editor, ex, clock, msg_tx) {
+        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
     let msg = match crate::marks::intercept(msg, editor, ex, clock, msg_tx) {
         crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
     let msg = match crate::menu::intercept(msg, editor, reg, keymap, ex, clock, msg_tx) {
