@@ -8,6 +8,7 @@ pub mod commands;
 pub mod input;
 pub mod registry;
 pub mod render;
+pub mod render_status;
 pub mod render_overlays;
 pub mod chrome_geom;
 pub mod term;

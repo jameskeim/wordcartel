@@ -2,7 +2,6 @@
 // Pure: takes &Editor, mutates NOTHING on the editor.
 
 use crate::{compose, derive, editor::Editor, nav};
-use wordcartel_core::count;
 use ratatui::{
     layout::{Position, Rect},
     style::{Color, Modifier, Style as RStyle},
@@ -131,59 +130,6 @@ fn text_fg_or_base(
         Some(Color::Reset) | None => style,
         Some(c)                   => style.fg(c),
     }
-}
-
-/// Assemble the left-hand portion of the normal status line (no overlay active).
-///
-/// Format: `[i/n] <name> [<mode>]` (plus optional status message and BLK indicator).
-/// `i` is 1-based active buffer index; `n` is total buffer count.
-/// `<name>` comes from `workspace::buffer_display_name` which already handles
-/// `*scratch*` / `*untitled*` / filename and the dirty-`*` prefix — so there is
-/// no separate dirty marker here.
-pub(crate) fn status_left_text(editor: &Editor) -> String {
-    let idx = editor.active + 1;
-    let count = editor.buffers.len();
-    let name = crate::workspace::buffer_display_name(editor, editor.active().id);
-    let head = format!("[{idx}/{count}] {name}");
-    let mode_text = match editor.active().view.mode {
-        crate::editor::RenderMode::LivePreview => "PREVIEW",
-        crate::editor::RenderMode::SourceHighlighted => "SRC-HI",
-        crate::editor::RenderMode::SourcePlain => "SOURCE",
-    };
-    let mut text = if editor.status.is_empty() {
-        format!("{head} [{mode_text}]")
-    } else {
-        format!("{head} [{mode_text}] {}", editor.status)
-    };
-    // BLK indicator: `· BLK` when a block is marked; `· BLK·hidden` when hidden.
-    match editor.active().marked_block {
-        Some(b) if b.hidden => text.push_str(" · BLK·hidden"),
-        Some(_) => text.push_str(" · BLK"),
-        None => {}
-    }
-    text
-}
-
-/// Return a word/char count segment for the status bar, or `None` if the
-/// feature is disabled (`view_opts.word_count = false`).
-///
-/// When the primary selection is non-empty, counts only the selected text;
-/// otherwise counts the whole document buffer.
-pub(crate) fn word_count_segment(editor: &Editor) -> Option<String> {
-    if !editor.view_opts.word_count {
-        return None;
-    }
-    let sel = editor.active().document.selection.primary();
-    let text = if !sel.is_empty() {
-        editor.active().document.buffer.slice(sel.from()..sel.to())
-    } else {
-        editor.active().document.buffer.to_string()
-    };
-    Some(format!(
-        "{} words · {} chars",
-        count::word_count(&text),
-        count::char_count(&text)
-    ))
 }
 
 /// Pre-computed ratatui styles for all chrome surfaces — built once per frame
@@ -692,7 +638,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         // When the minibuffer is open, render <prompt><text> on the status row.
         let (status_text, status_style) = if let Some(ref s) = editor.search {
             (
-                format_search_bar(s),
+                crate::render_status::format_search_bar(s),
                 cs.ov_accent,
             )
         } else if let Some(ref mb) = editor.minibuffer {
@@ -709,7 +655,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             // Normal state. Under zen/Auto idle with no message, the reserved row renders
             // as calm canvas (base bg); visible reveal via On / dwell / message force.
             if crate::chrome::status_line_visible(editor) {
-                (status_left_text(editor), cs.menu_closed) // visible: [Chrome] panel bg
+                (crate::render_status::status_left_text(editor), cs.menu_closed) // visible: [Chrome] panel bg
             } else {
                 // Calm canvas: the same bg-only fill the edit band uses — NOT chrome.
                 let mut calm = compose::base_canvas(&editor.theme, editor.depth);
@@ -726,7 +672,7 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
         let has_overlay = editor.search.is_some() || editor.minibuffer.is_some() || editor.prompt.is_some() || editor.diag.is_some() || editor.outline.is_some();
         let status_hidden = !has_overlay && !crate::chrome::status_line_visible(editor);
         let composed = if !has_overlay && !status_hidden {
-            if let Some(wc) = word_count_segment(editor) {
+            if let Some(wc) = crate::render_status::word_count_segment(editor) {
                 let caret = crate::nav::head(editor);
                 let (l, c) = editor.active().document.buffer.caret_line_col(caret);
                 let right = format!("Ln {l}, Col {c} · {wc}");
@@ -787,39 +733,6 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     }
 
     crate::render_overlays::paint(frame, editor, &cs);
-}
-
-// ---------------------------------------------------------------------------
-// Search bar formatting
-// ---------------------------------------------------------------------------
-
-fn format_search_bar(s: &crate::search_overlay::SearchState) -> String {
-    use crate::search_overlay::Phase;
-    let mode = if matches!(s.mode, wordcartel_core::search::QueryMode::Regex) { " .*" } else { "" };
-    let case = match s.case {
-        wordcartel_core::search::CaseMode::Smart => " Aa~",
-        wordcartel_core::search::CaseMode::Sensitive => " Aa",
-        wordcartel_core::search::CaseMode::Insensitive => " aa",
-    };
-    let count = if s.error.is_some() {
-        " ?".to_string()
-    } else if s.count() == 0 {
-        " no matches".to_string()
-    } else {
-        let cap_note = if s.capped() {
-            format!(" (first {})", crate::limits::MAX_SEARCH_MATCHES)
-        } else {
-            String::new()
-        };
-        format!(" {}/{}{}", s.current_ordinal().unwrap_or(0), s.count(), cap_note)
-    };
-    let wrapped = if s.wrapped { " (wrapped)" } else { "" };
-    match s.phase {
-        Phase::Replace | Phase::Stepping =>
-            format!("Find: {}  Replace: {}{}{}{}{}", s.needle, s.template, mode, case, count, wrapped),
-        Phase::Find =>
-            format!("Find: {}{}{}{}{}", s.needle, mode, case, count, wrapped),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1299,19 +1212,6 @@ mod tests {
         let a_line = 0usize; // "## A"
         assert_eq!(crate::render::fold_marker_for(&ed, a_line), Some(2)); // 2 hidden lines
         assert_eq!(crate::render::fold_marker_for(&ed, 3), None);          // "## B" not folded
-    }
-
-    #[test]
-    fn word_count_segment_selection_aware() {
-        let mut e = Editor::new_from_text("alpha beta gamma\n", None, (80, 24));
-        e.view_opts.word_count = true;
-        // whole doc: 3 words, 17 chars (including trailing \n)
-        assert_eq!(crate::render::word_count_segment(&e), Some("3 words · 17 chars".to_string()));
-        // select "alpha" → 1 word, 5 chars
-        e.active_mut().document.selection = wordcartel_core::selection::Selection::range(0, 5);
-        assert_eq!(crate::render::word_count_segment(&e), Some("1 words · 5 chars".to_string()));
-        e.view_opts.word_count = false;
-        assert_eq!(crate::render::word_count_segment(&e), None);
     }
 
     #[test]
@@ -2813,29 +2713,6 @@ mod tests {
                 "border cell bg must equal fill bg (no halo) under phosphor-green \
                  ({disp:?}); bg={cell_bg:?}, fill={fill_bg:?} at ({bx},{by})");
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // Effort 6 Task 9: status-line buffer [i/n] indicator + display names
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn status_line_shows_buffer_index_and_count() {
-        let mut e = crate::editor::Editor::new_from_text("a\n", Some(std::path::PathBuf::from("/tmp/a.md")), (40, 10));
-        e.install_scratch(); // 2 buffers, active index 0
-        let s = crate::render::status_left_text(&e);
-        assert!(s.contains("[1/2]"), "shows active/count: {s}");
-    }
-
-    #[test]
-    fn status_line_names_untitled_and_scratch() {
-        let mut e = crate::editor::Editor::new_from_text("\n", None, (40, 10));
-        e.install_scratch();
-        let s_untitled = crate::render::status_left_text(&e);
-        assert!(s_untitled.contains("*untitled*"), "untitled buffer shows *untitled*: {s_untitled}");
-        crate::workspace::goto_scratch(&mut e);
-        let s_scratch = crate::render::status_left_text(&e);
-        assert!(s_scratch.contains("*scratch*"), "scratch buffer shows *scratch*: {s_scratch}");
     }
 
     // -----------------------------------------------------------------------
