@@ -632,75 +632,91 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     // -----------------------------------------------------------------------
     // Status line (bottom row)
     // -----------------------------------------------------------------------
-    {
-        // When the search overlay is active, render the search bar.
-        // When a modal prompt is active, render its message instead of the normal
-        // status text, using a distinct style so it stands out.
-        // When the minibuffer is open, render <prompt><text> on the status row.
-        let (status_text, status_style) = if let Some(ref s) = editor.search {
-            (
-                crate::render_status::format_search_bar(s),
-                cs.ov_accent,
-            )
-        } else if let Some(ref mb) = editor.minibuffer {
-            (
-                format!("{}{}", mb.prompt, mb.text),
-                cs.ov_accent,
-            )
-        } else if let Some(ref prompt) = editor.prompt {
-            (
-                prompt.message.clone(),
-                cs.ov_accent,
-            )
-        } else {
-            // Normal state. Under zen/Auto idle with no message, the reserved row renders
-            // as calm canvas (base bg); visible reveal via On / dwell / message force.
-            if crate::chrome::status_line_visible(editor) {
-                (crate::render_status::status_left_text(editor), cs.menu_closed) // visible: [Chrome] panel bg
-            } else {
-                // Calm canvas: the same bg-only fill the edit band uses — NOT chrome.
-                let mut calm = compose::base_canvas(&editor.theme, editor.depth);
-                calm.fg = None;
-                (String::new(), calm)
-            }
-        };
-
-        // Compose the status line.
-        // When in the normal branch (no prompt/minibuffer/search) and word_count is on,
-        // flush the count segment to the right and truncate the left (path/mode) to fit.
-        // When the status row is calm-hidden (Auto idle, no message), suppress the word-count
-        // segment so Ln/Col · words does not paint over the calm canvas row.
-        let has_overlay = editor.search.is_some() || editor.minibuffer.is_some() || editor.prompt.is_some() || editor.diag.is_some() || editor.outline.is_some();
-        let status_hidden = !has_overlay && !crate::chrome::status_line_visible(editor);
-        let composed = if !has_overlay && !status_hidden {
-            if let Some(wc) = crate::render_status::word_count_segment(editor) {
-                let caret = crate::nav::head(editor);
-                let (l, c) = editor.active().document.buffer.caret_line_col(caret);
-                let right = format!("Ln {l}, Col {c} · {wc}");
-                let reserve = right.chars().count() + 1;
-                let left: String = status_text.chars().take((w as usize).saturating_sub(reserve)).collect();
-                let pad = (w as usize).saturating_sub(left.chars().count() + right.chars().count());
-                format!("{left}{}{right}", " ".repeat(pad))
-            } else {
-                status_text.chars().take(w as usize).collect()
-            }
-        } else {
-            status_text.chars().take(w as usize).collect()
-        };
-        // Truncate the composed string to the terminal width (guard for very narrow terminals).
-        let truncated: String = composed.chars().take(w as usize).collect();
-        let status_line = Line::from(Span::styled(truncated, status_style));
-        let status_area = Rect::new(area.x, status_row, w, 1);
-        // Fill the WHOLE row with the state's chrome style first — the Paragraph
-        // styles only the text span, and a partial bar next to the full-width menu
-        // bar was the reported-mismatch class (Fable whole-branch I-2).
-        frame.buffer_mut().set_style(status_area, status_style);
-        frame.render_widget(Paragraph::new(status_line), status_area);
-    }
+    paint_status(frame, editor, area, status_row, &cs);
 
     // -----------------------------------------------------------------------
     // Hardware cursor
     // -----------------------------------------------------------------------
+    place_cursor(frame, editor, area, edit_top, edit_height, status_row, &tg);
+
+    crate::render_overlays::paint(frame, editor, &cs);
+}
+
+/// Phase 11 — the bottom status row: search bar / minibuffer / prompt / normal /
+/// calm-hidden selection, right-flush Ln/Col/words composition, full-row set_style
+/// THEN the Paragraph. Reads editor immutably.
+fn paint_status(frame: &mut Frame, editor: &Editor, area: Rect, status_row: u16, cs: &ChromeStyles) {
+    let w = area.width;
+    // When the search overlay is active, render the search bar.
+    // When a modal prompt is active, render its message instead of the normal
+    // status text, using a distinct style so it stands out.
+    // When the minibuffer is open, render <prompt><text> on the status row.
+    let (status_text, status_style) = if let Some(ref s) = editor.search {
+        (
+            crate::render_status::format_search_bar(s),
+            cs.ov_accent,
+        )
+    } else if let Some(ref mb) = editor.minibuffer {
+        (
+            format!("{}{}", mb.prompt, mb.text),
+            cs.ov_accent,
+        )
+    } else if let Some(ref prompt) = editor.prompt {
+        (
+            prompt.message.clone(),
+            cs.ov_accent,
+        )
+    } else {
+        // Normal state. Under zen/Auto idle with no message, the reserved row renders
+        // as calm canvas (base bg); visible reveal via On / dwell / message force.
+        if crate::chrome::status_line_visible(editor) {
+            (crate::render_status::status_left_text(editor), cs.menu_closed) // visible: [Chrome] panel bg
+        } else {
+            // Calm canvas: the same bg-only fill the edit band uses — NOT chrome.
+            let mut calm = compose::base_canvas(&editor.theme, editor.depth);
+            calm.fg = None;
+            (String::new(), calm)
+        }
+    };
+
+    // Compose the status line.
+    // When in the normal branch (no prompt/minibuffer/search) and word_count is on,
+    // flush the count segment to the right and truncate the left (path/mode) to fit.
+    // When the status row is calm-hidden (Auto idle, no message), suppress the word-count
+    // segment so Ln/Col · words does not paint over the calm canvas row.
+    let has_overlay = editor.search.is_some() || editor.minibuffer.is_some() || editor.prompt.is_some() || editor.diag.is_some() || editor.outline.is_some();
+    let status_hidden = !has_overlay && !crate::chrome::status_line_visible(editor);
+    let composed = if !has_overlay && !status_hidden {
+        if let Some(wc) = crate::render_status::word_count_segment(editor) {
+            let caret = crate::nav::head(editor);
+            let (l, c) = editor.active().document.buffer.caret_line_col(caret);
+            let right = format!("Ln {l}, Col {c} · {wc}");
+            let reserve = right.chars().count() + 1;
+            let left: String = status_text.chars().take((w as usize).saturating_sub(reserve)).collect();
+            let pad = (w as usize).saturating_sub(left.chars().count() + right.chars().count());
+            format!("{left}{}{right}", " ".repeat(pad))
+        } else {
+            status_text.chars().take(w as usize).collect()
+        }
+    } else {
+        status_text.chars().take(w as usize).collect()
+    };
+    // Truncate the composed string to the terminal width (guard for very narrow terminals).
+    let truncated: String = composed.chars().take(w as usize).collect();
+    let status_line = Line::from(Span::styled(truncated, status_style));
+    let status_area = Rect::new(area.x, status_row, w, 1);
+    // Fill the WHOLE row with the state's chrome style first — the Paragraph
+    // styles only the text span, and a partial bar next to the full-width menu
+    // bar was the reported-mismatch class (Fable whole-branch I-2).
+    frame.buffer_mut().set_style(status_area, status_style);
+    frame.render_widget(Paragraph::new(status_line), status_area);
+}
+
+/// Phase 12 — the hardware cursor: search-field / minibuffer / normal-caret arms,
+/// char-count column math, D2 clamp of the normal caret col to tg.text_width.
+fn place_cursor(frame: &mut Frame, editor: &Editor, area: Rect, edit_top: u16,
+    edit_height: u16, status_row: u16, tg: &nav::TextGeometry) {
+    let w = area.width;
     if let Some(ref s) = editor.search {
         // Search bar is open: place caret on the status row at the focused field's caret.
         // Use char counts (not byte offsets) for correct placement with multibyte text.
@@ -732,8 +748,6 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             frame.set_cursor_position(Position { x: area.x + tg.text_left + col, y: edit_top + row });
         }
     }
-
-    crate::render_overlays::paint(frame, editor, &cs);
 }
 
 // ---------------------------------------------------------------------------
