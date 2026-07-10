@@ -165,7 +165,8 @@ bakes it into `leaf_label`; palette sets `row.chord`); A5 rebuilds the trie on p
 into both surfaces (scoped patches are preset-aware). Palette is exhaustive in DATA; the MENU is the
 curated subset (A3b). A6 fixed the palette-reach ("only a subset" impression).
 
-### A3b. Item-by-item menu-curation pass — `settled-principle` · Small (split from A3, 2026-07-07)
+### A3b. Item-by-item menu-curation pass
+<!-- item: A3b -->
 
 Apply the adopted curation principle (see the three-surface contract section) item-by-item across the
 ~126 registry commands / ~58 menu set: decide per command whether it belongs in the *menu* (by
@@ -242,7 +243,8 @@ A3 curation pass (reduced — the "subset impression" was reachability, now fixe
 full effort when prioritized.
 
 
-### A8. A menu listing the open documents to switch between — `needs-design` (user-reported 2026-07-09)
+### A8. A menu listing the open documents to switch between
+<!-- item: A8 -->
 
 **Idea (user):** a dynamic menu that lists the currently-open documents so you can switch between them
 (a "Window" / "Buffers" / "Documents" menu that auto-populates from the open buffers).
@@ -259,7 +261,8 @@ also appear in the palette; interaction with C4 (close-buffer prompt). Anchors: 
 (`MenuCategory`, `MENU_ORDER`), the menu builder (`menu.rs`), the editor's buffer list, existing next/prev-
 buffer commands.
 
-### A9. "Set Wrap Column…" → "Wrap Column: <value>" (state-in-label) — `needs-design` (user-reported 2026-07-09)
+### A9. "Set Wrap Column…" → "Wrap Column: <value>" (state-in-label)
+<!-- item: A9 -->
 
 **Idea (user):** rename "Set Wrap Column…" to "Wrap Column" and show the CURRENT wrap-column value in the
 label, like the other stateful options.
@@ -273,7 +276,8 @@ Column: 80…") or separates show-vs-set. Command-surface contract: a stateful o
 shared setter; the minibuffer flow stays. Anchors: `registry.rs:547` (`set_wrap_column`), `registry.rs:899`,
 the state-in-label rule.
 
-### A10. A dedicated "Block" menu for the marked-block commands — `needs-design` (user-reported 2026-07-09)
+### A10. A dedicated "Block" menu for the marked-block commands
+<!-- item: A10 -->
 
 **Idea (user):** the existing marked-block commands (mark / move / save a block, etc.) may deserve their OWN
 menu, separate from Edit — block-level manipulation is a slightly different mental model than character-level
@@ -292,7 +296,8 @@ dual-listed); whether the scratch pair belongs here or with scratch; does anythi
 `registry.rs:273-290` (the block family), `blocks_marked`, `MenuCategory`/`MENU_ORDER` (`registry.rs:39-42`),
 the menu⊆palette contract rule.
 
-### A11. Filter + transform SCOPE: whole-buffer vs marked-block vs selection (+ filter docs) — `needs-design` (user-reported 2026-07-09)
+### A11. Filter + transform SCOPE: whole-buffer vs marked-block vs selection (+ filter docs)
+<!-- item: A11 -->
 
 **Questions (user):** (1) does `Filter` operate on the whole buffer, or can it be scoped to a block/selection?
 (2) should the transforms (Reflow/Unwrap/Ventilate) operate on a block? (3) settle a STANDARD "block vs
@@ -310,7 +315,8 @@ scope-taking commands agree. Also confirm what Filter does today (whole buffer?)
 docs/examples. Anchors: `filter` (`registry.rs:140`), `MinibufferKind::Filter`, `transform::dispatch_transform`,
 C2 (SHIPPED), `blocks_marked` (marked-block model).
 
-### A12. Scratch buffer = a dedicated TOGGLE, not a cyclable buffer — `needs-design` (user-reported 2026-07-09)
+### A12. Scratch buffer = a dedicated TOGGLE, not a cyclable buffer
+<!-- item: A12 -->
 
 **Idea (user):** reaching the scratch buffer should be a single TOGGLE command that flips between the current
 buffer and the scratch buffer (and back) — bindable to a hotkey. The scratch buffer should NOT be reachable
@@ -501,7 +507,8 @@ cue/no-color mode (SHADES drives that path too) and reserve the same 2-col prefi
 *(B5 SHIPPED 2026-07-08 in the polish batch — `SHADES` is now the single-axis ramp `█▆▅▄▃▂`
 (`render.rs:20`); this entry's "grounded" section shows the pre-fix ramp.)*
 
-### B6. Heading-glyph STYLE toggle — shades / Nerd numerals / inverted numerals — `needs-design` (user-reported 2026-07-09)
+### B6. Heading-glyph STYLE toggle — shades / Nerd numerals / inverted numerals
+<!-- item: B6 -->
 
 **Idea (user):** offer the heading-level glyph as a selectable STYLE, cycling among three looks:
 (1) the current shade ramp; (2) Nerd Font numeric-box glyphs `󰬺 󰬻 󰬼 󰬽 󰬾 󰬿` (U+F0B3A–F, Material-Design
@@ -531,7 +538,8 @@ heading golden/pin churn across three styles. Anchors: `SHADES` (`render.rs:20`)
 (`render.rs:~665,~730`), `prefix_width` (`layout.rs:289`), `heading_level_glyph` (`theme.rs:119`),
 multi-state-option template (`registry.rs:480-510`).
 
-### B7. Selected menu-item text too light / less legible — `potential-bug` (user-reported 2026-07-09)
+### B7. Selected menu-item text too light / less legible
+<!-- item: B7 -->
 
 **Observation (user):** the text of the HIGHLIGHTED (selected) menu item is too light. It "used to be dark"
 (more legible); the user suspects the E5 dimming treated all menu text uniformly, hurting the selected
@@ -549,7 +557,8 @@ selected item a dedicated highlight fg color; (b) at minimum restore dark, legib
 Anchors: `ChromeSelected` (`theme.rs:37,332`), the dropdown/selected-item render path (`render.rs` menu
 paint), `ChromeMuted` (dropdown normal), E5 (`derive_chrome` recede, `5e1c2ea`).
 
-### B8. Configurable terminal text-caret shape / colour — `needs-design` (user-reported 2026-07-09)
+### B8. Configurable terminal text-caret shape / colour
+<!-- item: B8 -->
 
 **Idea (user):** let the user choose the colour and size/style of the terminal text caret (block vs beam vs
 underline, blink, colour) — "some people have opinions on the caret they use/see."
@@ -973,7 +982,9 @@ empty-canvas / no-buffer startup render path (`render.rs`), the app name/tagline
 
 ## Theme H — code health
 
-### H1. app.rs decomposition — `SHIPPED` 2026-07-04 — app.rs 4,346 lines (from 5,740); new modules jobs_apply.rs 496, session_restore.rs 309, prompts.rs 414, search_ui.rs 211
+### H15. app.rs/render.rs leaf extraction (first pass) — SHIPPED 2026-07-04 — app.rs 4,346 lines (from 5,740); new modules jobs_apply.rs 496, session_restore.rs 309, prompts.rs 414, search_ui.rs 211
+
+*(Renumbered from the old ux "Theme H · H1" to `H15`: the engineering-health `H*` namespace is the single home for code-health items; the god-object SEAM decomposition that superseded this leaf pass is eng-health `H1`.)*
 
 *(Added 2026-07-04 from a module-size audit. "H" to avoid colliding with the hardening
 campaign's F-numbering.)*
@@ -1199,7 +1210,8 @@ primitives into an unoccupied niche, not inventing risky mechanics.
   but NOT as an interactive TUI binder. Manuskript (GUI, FOSS) is the closest Scrivener-clone
   sibling.
 
-### S1. Rearrangeable outline / heading-subtree corkboard — `needs-design` · Medium
+### S1. Rearrangeable outline / heading-subtree corkboard
+<!-- item: S1 -->
 
 **What:** promote the transient outline overlay into a dwellable "structure mode" (or an
 in-place folded-reorder in the main buffer — the two surfaces of the same primitive). The
@@ -1229,7 +1241,8 @@ command. Feasible now — the machinery exists.
 4. **Edge cases:** content before the first heading; headings-inside-code-fences; a doc with no
    headings (degrade gracefully to "no cards").
 
-### S2. Directory-as-binder (project/manuscript over many files) — `needs-design` · Larger
+### S2. Directory-as-binder (project/manuscript over many files)
+<!-- item: S2 -->
 
 **What:** treat a *directory of `.md` files* as a manuscript — each file a scene/chapter
 ("card"), plus an **ordered manifest** (filesystem order ≠ manuscript order) and a **compile**
@@ -1262,7 +1275,8 @@ post-Effort-P Lua plugin (a strong plugin candidate — it's a project *layer* o
 document reshaped internally (→ S1 is the whole answer) vs book-as-many-files (→ S2 on top of
 S1). Not yet decided.
 
-### S3. Snapshots — named, durable revision checkpoints ("fearless editing") — `needs-design` · Small–Medium
+### S3. Snapshots — named, durable revision checkpoints ("fearless editing")
+<!-- item: S3 -->
 
 **What:** Scrivener-style snapshots — capture the document at a point in time (named/
 timestamped), list them, **compare (diff)** against current, and **restore** with one action.
@@ -1325,6 +1339,7 @@ items here are POST-Effort-P** (they need the plugin API). None is committed sco
 durable candidate list + a de-facto requirements probe for the P API.
 
 ### P-A. Analysis / policy plugins — cleanest fit, high infra reuse
+<!-- item: PA -->
 
 - **Writing goals / targets / streaks** — motivation layer computed on save/idle; opt-in matches
   the "goals bleed the joy" counter-literature. Reuses word count + status line + a sidecar file.
@@ -1342,6 +1357,7 @@ These are the sweet spot: *command + event hook + job + optional overlay/status*
 corrupt source (worst case = wrong count / failed publish).
 
 ### P-B. Custom-markup plugins — high value, cluster on ONE hard API need
+<!-- item: PB -->
 
 All three want the same capability — **plugins contributing custom inline/markup rendering** —
 which is the trickiest P-API surface (rendering is core + per-frame, hot-path-adjacent). This
@@ -1359,6 +1375,7 @@ syntax + a face), rather than plugins rendering raw. Design deliberately in P.
 - **Wiki-link rendering** — the visual half of the P-A backlinks plugin.
 
 ### P-C. Lower-fit / niche / principled
+<!-- item: PC -->
 
 - **AI continuation** — plugin-*only, on principle*. The report's evidence: the complaint isn't
   AI, it's *unavoidability* ("uninvited co-author"). Opt-in plugin is the only defensible stance.
@@ -1418,7 +1435,7 @@ best validates — the markup-rendering capability; treat it as a P design ancho
 - D1-a vs D1-b write-back (D1-b favored, not yet committed — settle at D1's brainstorm).
 - Dwell duration and reveal/grace timings (implementation tunables, not design forks).
 
-### H2. active_line clamps to the last content line at end-of-buffer — `SHIPPED` 2026-07-08 (polish batch, 0573eec: clamp to `len()` not `len-1`)
+### H16. active_line end-of-buffer clamp — SHIPPED 2026-07-08 (polish batch, 0573eec: clamp to `len()` not `len-1`)
 
 *(Discovered during B1+B2's e2e work, 2026-07-04; pre-existing, verified at source.)*
 `derive.rs:217` computes the active line from `caret_byte.min(buf.len()-1)` — with a
@@ -1429,6 +1446,9 @@ the caret moves up); orthogonal to wrap. Fix shape when picked up: treat caret==
 after a trailing newline as "past the last line" for active-line purposes.
 
 ## Working order (recorded 2026-07-04 — dependency-derived, user-approved)
+
+> **Superseded for status/sizing — see the generated `BACKLOG.md` (source of truth `backlog.toml`).**
+> Kept below only as the historical dependency-ordering rationale; do NOT read per-item status here.
 
 Hard edges: E3 → E1/E2/E4; D1 carries A5; E2 rides E1; H1 before Effort P. Soft edges: H1
 relocates what C4/D1/A5/E1 touch (split early = every later effort lands in focused files);
@@ -1496,6 +1516,10 @@ dependency-free in both directions.
 
 ## Sizing summary
 
+> **Superseded — the live open/shipped/sizing rollup is the generated `BACKLOG.md` (source of truth
+> `backlog.toml`). The hand-maintained snapshot below is frozen history as of the migration and is no
+> longer updated — do not trust it for current status.**
+
 **SHIPPED** (see each item's header for the commit): A1, A2, A3, A5, A6, B1, B2, B3, B4, C1, C2, C3,
 C4, D1, E1, E2, E3, E4, H1, R1 — plus the repar re-plumb check. (A4 dropped.) The remaining open work,
 by size:
@@ -1513,3 +1537,18 @@ by size:
   eng-health H2 dep-weight · H5 swap-file cleanup · H6 version scheme.
 
 Then **Effort P** (the in-process Lua plugin system) — the 1.0 capstone.
+
+
+## Newly-tracked items (stubs)
+
+*(Auto-created during the backlog-manifest migration. Status/size/kind live in `backlog.toml`; flesh out the triage prose here when the item is picked up.)*
+
+### A13 — Overlay mouse parity
+<!-- item: A13 -->
+
+Click-to-select for theme picker + file browser; outline click-to-jump.
+
+### P — Effort P — in-process Lua plugin system (1.0 capstone)
+<!-- item: P -->
+
+The plugin/automation spine; registers into the command/hook/job seams. See docs/design/effort-p-plugin-system-design-space.md.

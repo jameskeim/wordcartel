@@ -1,0 +1,766 @@
+# Backlog — source of truth for item STATE.
+#
+# This file is authoritative for status/size/kind/etc. The dashboard `BACKLOG.md` is
+# GENERATED from it — never hand-edit BACKLOG.md. Regenerate after any change:
+#     scripts/backlog bless      (== BLESS_BACKLOG=1 cargo test -p wordcartel --test backlog)
+#
+# Triage prose lives in docs/ux-backlog.md and docs/engineering-health.md, keyed to OPEN
+# items by `<!-- item: ID -->` markers. The gate (wordcartel/tests/backlog.rs) enforces
+# schema + marker↔manifest bijection (open items) + dashboard freshness. Add a capture with
+# `scripts/backlog add`, or a `bl:` message.
+#
+# Fields: id, title, status, kind, size, theme, hook, doc, [blocks_effort_p], [depends_on],
+# created; terminal-only: shipped_commit+shipped_date (shipped) / dropped_reason (dropped).
+# Enums — status: triage|needs-design|ready|in-progress|watch|shipped|dropped ·
+# kind: feature|bug|debt|chore|research · size: S|SM|M|L|XL|TBD ·
+# theme: A B C D E H M R S P.
+
+# ─────────────────────────── Theme A — command surface ───────────────────────────
+
+[[item]]
+id = "A1"
+title = "Menu bar states + mouse reveal"
+status = "shipped"
+kind = "feature"
+size = "M"
+theme = "A"
+hook = "menu.bar hidden|auto|pinned; dwell+grace reveal; click-to-open; nav geometry fix."
+doc = "ux-backlog.md#a1"
+created = "2026-07-03"
+shipped_commit = "7273327"
+shipped_date = "2026-07-04"
+
+[[item]]
+id = "A2"
+title = "Full-width menu bar fill"
+status = "shipped"
+kind = "feature"
+size = "S"
+theme = "A"
+hook = "Fill row 0 with bar bg; no right-edge content by default."
+doc = "ux-backlog.md#a2"
+created = "2026-07-03"
+shipped_commit = "097dcae"
+shipped_date = "2026-07-03"
+
+[[item]]
+id = "A3"
+title = "Option reachability + preset-aware hints"
+status = "shipped"
+kind = "feature"
+size = "M"
+theme = "A"
+hook = "set-per-state + cycle commands for scrollbar/status_line/menu_bar; hint re-resolution; 3 law tests."
+doc = "ux-backlog.md#a3"
+created = "2026-07-04"
+shipped_commit = "d7a5494"
+shipped_date = "2026-07-07"
+
+[[item]]
+id = "A3b"
+title = "Item-by-item menu-curation pass"
+status = "ready"
+kind = "chore"
+size = "S"
+theme = "A"
+hook = "Per-command menu vs palette-only curation; concrete Q: move Filter Edit->Format?"
+doc = "ux-backlog.md#a3b"
+created = "2026-07-07"
+
+[[item]]
+id = "A4"
+title = "Menu accelerators (Alt+F/Alt+E)"
+status = "dropped"
+kind = "feature"
+size = "TBD"
+theme = "A"
+hook = "No global Alt accelerators."
+doc = "ux-backlog.md#a4"
+created = "2026-07-03"
+dropped_reason = "Category is 2 keystrokes / dwell+click away; Alt+letter conflict surface not worth a layer nobody asked for. Revisit on real demand."
+
+[[item]]
+id = "A5"
+title = "Switch keymap preset from the menu"
+status = "shipped"
+kind = "feature"
+size = "M"
+theme = "A"
+hook = "keymap_cua/keymap_wordstar; runtime trie rebuild; hints stay fresh."
+doc = "ux-backlog.md#a5"
+created = "2026-07-03"
+shipped_commit = "4670eaf"
+shipped_date = "2026-07-05"
+
+[[item]]
+id = "A6"
+title = "Palette/overlay full-list scrolling + wheel"
+status = "shipped"
+kind = "feature"
+size = "M"
+theme = "A"
+hook = "scroll_top + windowing across all four overlays; wheel; PgUp/PgDn/Home/End."
+doc = "ux-backlog.md#a6"
+created = "2026-07-04"
+shipped_commit = "e2c7667"
+shipped_date = "2026-07-04"
+
+[[item]]
+id = "A7"
+title = "Right-justify the state value in stateful menu rows"
+status = "shipped"
+kind = "feature"
+size = "S"
+theme = "A"
+hook = "Split stateful leaves into base + right-aligned value column."
+doc = "ux-backlog.md#a7"
+created = "2026-07-08"
+shipped_commit = "111e9b2"
+shipped_date = "2026-07-08"
+
+[[item]]
+id = "A8"
+title = "Menu listing the open documents to switch between"
+status = "needs-design"
+kind = "feature"
+size = "TBD"
+theme = "A"
+hook = "Dynamic Window/Buffers/Documents menu auto-populated from open buffers."
+doc = "ux-backlog.md#a8"
+created = "2026-07-09"
+
+[[item]]
+id = "A9"
+title = "Wrap Column state-in-label"
+status = "needs-design"
+kind = "feature"
+size = "S"
+theme = "A"
+hook = "Rename 'Set Wrap Column...' to stateful 'Wrap Column: <value>'."
+doc = "ux-backlog.md#a9"
+created = "2026-07-09"
+
+[[item]]
+id = "A10"
+title = "Dedicated Block menu for marked-block commands"
+status = "needs-design"
+kind = "feature"
+size = "TBD"
+theme = "A"
+hook = "Move the blocks_marked command family into its own MenuCategory::Block."
+doc = "ux-backlog.md#a10"
+created = "2026-07-09"
+
+[[item]]
+id = "A11"
+title = "Filter + transform SCOPE + filter docs"
+status = "needs-design"
+kind = "feature"
+size = "TBD"
+theme = "A"
+hook = "Unify buffer vs marked-block vs selection scope; document Filter."
+doc = "ux-backlog.md#a11"
+created = "2026-07-09"
+
+[[item]]
+id = "A12"
+title = "Scratch buffer = a dedicated toggle"
+status = "needs-design"
+kind = "feature"
+size = "TBD"
+theme = "A"
+hook = "toggle_scratch round-trip; exclude scratch from cycle/switcher/open-docs menu."
+doc = "ux-backlog.md#a12"
+created = "2026-07-09"
+
+[[item]]
+id = "A13"
+title = "Overlay mouse parity"
+status = "needs-design"
+kind = "feature"
+size = "S"
+theme = "A"
+hook = "Click-to-select for theme picker + file browser; outline click-to-jump."
+doc = "ux-backlog.md#a13"
+created = "2026-07-04"
+
+# ─────────────────────────── Theme B — rendering fidelity ───────────────────────────
+
+[[item]]
+id = "B1"
+title = "Word-boundary wrap (UAX #14)"
+status = "shipped"
+kind = "feature"
+size = "M"
+theme = "B"
+hook = "Soft-wrap at word boundaries; grapheme fallback; fenced code kept byte-identical."
+doc = "ux-backlog.md#b1"
+created = "2026-07-03"
+shipped_commit = "25b9776"
+shipped_date = "2026-07-04"
+
+[[item]]
+id = "B2"
+title = "Sub-list bullet indent + hanging indent"
+status = "shipped"
+kind = "feature"
+size = "S"
+theme = "B"
+hook = "Conceal leading indent into the prefix glyph; wrapped items hang under text."
+doc = "ux-backlog.md#b2"
+created = "2026-07-03"
+shipped_commit = "25b9776"
+shipped_date = "2026-07-04"
+
+[[item]]
+id = "B3"
+title = "Heading glyphs default ON in every theme"
+status = "shipped"
+kind = "feature"
+size = "S"
+theme = "B"
+hook = "Shade-ramp heading marker becomes part of the visual identity everywhere."
+doc = "ux-backlog.md#b3"
+created = "2026-07-03"
+shipped_commit = "097dcae"
+shipped_date = "2026-07-03"
+
+[[item]]
+id = "B4"
+title = "SRC-HI per-construct syntax highlighting"
+status = "shipped"
+kind = "feature"
+size = "SM"
+theme = "B"
+hook = "Raw markdown + themed per-construct coloring; geometry == SourcePlain."
+doc = "ux-backlog.md#b4"
+created = "2026-07-07"
+shipped_commit = "1bbd82b"
+shipped_date = "2026-07-07"
+
+[[item]]
+id = "B5"
+title = "Low heading-glyph collision (H5/H6)"
+status = "shipped"
+kind = "bug"
+size = "S"
+theme = "B"
+hook = "Single-axis ramp; later superseded by inverted Nerd numerals."
+doc = "ux-backlog.md#b5"
+created = "2026-07-08"
+shipped_commit = "111e9b2"
+shipped_date = "2026-07-08"
+
+[[item]]
+id = "B6"
+title = "Heading-glyph STYLE toggle"
+status = "needs-design"
+kind = "feature"
+size = "SM"
+theme = "B"
+hook = "Cycle shades / Nerd numerals / inverted numerals; default stays universal Shades."
+doc = "ux-backlog.md#b6"
+created = "2026-07-09"
+
+[[item]]
+id = "B7"
+title = "Selected menu-item text too light"
+status = "needs-design"
+kind = "bug"
+size = "TBD"
+theme = "B"
+hook = "Possible E5 regression; selected item may need a distinct legible highlight fg."
+doc = "ux-backlog.md#b7"
+created = "2026-07-09"
+
+[[item]]
+id = "B8"
+title = "Configurable terminal caret shape / colour"
+status = "needs-design"
+kind = "feature"
+size = "TBD"
+theme = "B"
+hook = "Emit DECSCUSR (block/beam/underline, blink, colour); restore on exit/panic."
+doc = "ux-backlog.md#b8"
+created = "2026-07-09"
+
+# ─────────────────────────── Theme C — document workflow ───────────────────────────
+
+[[item]]
+id = "C1"
+title = "LaTeX export + xelatex PDF + export typography"
+status = "shipped"
+kind = "feature"
+size = "M"
+theme = "C"
+hook = "export_tex; pdf_engine=xelatex; export.typography (also fixed docx/pdf HTML-fragment bug)."
+doc = "ux-backlog.md#c1"
+created = "2026-07-03"
+shipped_commit = "097dcae"
+shipped_date = "2026-07-03"
+
+[[item]]
+id = "C2"
+title = "Transform scope (Reflow/Unwrap/Ventilate)"
+status = "shipped"
+kind = "feature"
+size = "M"
+theme = "C"
+hook = "Caret acts on nearest unit; explicit _buffer variants for whole-document intent."
+doc = "ux-backlog.md#c2"
+created = "2026-07-03"
+shipped_commit = "642290b"
+shipped_date = "2026-07-05"
+
+[[item]]
+id = "C2b"
+title = "Repar 1.0 integration (width + fixups)"
+status = "shipped"
+kind = "feature"
+size = "M"
+theme = "C"
+hook = "Transforms format to view.wrap_column; blessed fixups baseline; 6 contract pins."
+doc = "ux-backlog.md#c2b"
+created = "2026-07-05"
+shipped_commit = "c9b64d8"
+shipped_date = "2026-07-05"
+
+[[item]]
+id = "C3"
+title = "Cross-app clipboard over SSH/tmux"
+status = "shipped"
+kind = "feature"
+size = "M"
+theme = "C"
+hook = "Provider/fallback chain: register -> local owner -> OSC 52 with tmux/screen DCS wrap."
+doc = "ux-backlog.md#c3"
+created = "2026-06-28"
+shipped_commit = "16457f9"
+shipped_date = "2026-07-07"
+
+[[item]]
+id = "C4"
+title = "Close-buffer Save/Discard/Cancel prompt"
+status = "shipped"
+kind = "feature"
+size = "S"
+theme = "C"
+hook = "Dirty close raises a prompt riding the quit save machinery; Discard leaves the swap."
+doc = "ux-backlog.md#c4"
+created = "2026-06-28"
+shipped_commit = "b185e0b"
+shipped_date = "2026-07-04"
+
+# ─────────────────────────── Theme D — config & persistence ───────────────────────────
+
+[[item]]
+id = "D1"
+title = "Save settings from the session"
+status = "shipped"
+kind = "feature"
+size = "M"
+theme = "D"
+hook = "settings-overrides.toml (machine-owned, atomic); contradiction-only-removal diff law."
+doc = "ux-backlog.md#d1"
+created = "2026-07-03"
+shipped_commit = "4670eaf"
+shipped_date = "2026-07-05"
+
+# ─────────────────────────── Theme E — product identity / chrome ───────────────────────────
+
+[[item]]
+id = "E1"
+title = "Chrome/density presets (zen|full)"
+status = "shipped"
+kind = "feature"
+size = "M"
+theme = "E"
+hook = "Data-driven density preset via ChromeBundle/apply_bundle; per-element overrides persist."
+doc = "ux-backlog.md#e1"
+created = "2026-07-03"
+shipped_commit = "f7b7b10"
+shipped_date = "2026-07-06"
+
+[[item]]
+id = "E2"
+title = "Visual polish pass"
+status = "shipped"
+kind = "feature"
+size = "S"
+theme = "E"
+hook = "State-in-label menu rows + two-archetype styling language + overlay/mouse completeness."
+doc = "ux-backlog.md#e2"
+created = "2026-07-03"
+shipped_commit = "f7b7b10"
+shipped_date = "2026-07-06"
+
+[[item]]
+id = "E3"
+title = "Chrome theming coherence"
+status = "shipped"
+kind = "feature"
+size = "M"
+theme = "E"
+hook = "Six-face chrome family + Theme::derive_chrome ladder; chrome=full|zen axis."
+doc = "ux-backlog.md#e3"
+created = "2026-07-04"
+shipped_commit = "eb9cfd1"
+shipped_date = "2026-07-06"
+
+[[item]]
+id = "E4"
+title = "Bundled themes"
+status = "shipped"
+kind = "feature"
+size = "M"
+theme = "E"
+hook = "19 builtins incl. catppuccin/flexoki/gruvbox/rosepine/solarized + terminal-ansi."
+doc = "ux-backlog.md#e4"
+created = "2026-07-04"
+shipped_commit = "eb9cfd1"
+shipped_date = "2026-07-06"
+
+[[item]]
+id = "E5"
+title = "Chrome text intensity recede"
+status = "shipped"
+kind = "feature"
+size = "S"
+theme = "E"
+hook = "Floor-aware chrome fg recede + DIM so bars read as chrome, not content."
+doc = "ux-backlog.md#e5"
+created = "2026-07-08"
+shipped_commit = "111e9b2"
+shipped_date = "2026-07-08"
+
+[[item]]
+id = "E6"
+title = "Splash / start screen"
+status = "shipped"
+kind = "feature"
+size = "M"
+theme = "E"
+hook = "Startup splash (wordmark/tagline/version); view.splash + --no-splash; dismiss on first action."
+doc = "ux-backlog.md#e6"
+created = "2026-07-09"
+shipped_commit = "242c987"
+shipped_date = "2026-07-10"
+
+# ─────────────────────────── Theme R — editing responsiveness ───────────────────────────
+
+[[item]]
+id = "R1"
+title = "Typing latency + double-Return / line-jump"
+status = "shipped"
+kind = "bug"
+size = "M"
+theme = "R"
+hook = "Guard per-keystroke O(document) outline/fold walks on FoldState::is_empty; first-frame settle."
+doc = "ux-backlog.md#r1"
+created = "2026-07-06"
+shipped_commit = "02ac906"
+shipped_date = "2026-07-07"
+
+# ─────────────────────────── Theme S — manuscript structure ───────────────────────────
+
+[[item]]
+id = "S1"
+title = "Rearrangeable outline / heading-subtree corkboard"
+status = "needs-design"
+kind = "feature"
+size = "M"
+theme = "S"
+hook = "Structure mode: atomic heading-subtree move via submit_transaction; drag-reorder."
+doc = "ux-backlog.md#s1"
+created = "2026-07-07"
+
+[[item]]
+id = "S2"
+title = "Directory-as-binder"
+status = "needs-design"
+kind = "feature"
+size = "L"
+theme = "S"
+hook = "Directory of .md as a manuscript: ordered manifest + compile step (post-Effort-P plugin)."
+doc = "ux-backlog.md#s2"
+depends_on = ["P", "S1"]
+created = "2026-07-07"
+
+[[item]]
+id = "S3"
+title = "Snapshots — durable revision checkpoints"
+status = "needs-design"
+kind = "feature"
+size = "SM"
+theme = "S"
+hook = "Capture/list/diff/restore; reuses rope snapshot + ChangeSet; one net-new display diff."
+doc = "ux-backlog.md#s3"
+created = "2026-07-07"
+
+# ─────────────────────────── Theme P — plugin system (1.0 capstone) ───────────────────────────
+
+[[item]]
+id = "P"
+title = "Effort P — in-process Lua plugin system (1.0 capstone)"
+status = "needs-design"
+kind = "feature"
+size = "XL"
+theme = "P"
+hook = "The plugin/automation spine; registers into the command/hook/job seams. See docs/design/effort-p-plugin-system-design-space.md."
+doc = "ux-backlog.md#p"
+created = "2026-07-07"
+
+[[item]]
+id = "PA"
+title = "Analysis / policy plugins"
+status = "watch"
+kind = "research"
+size = "TBD"
+theme = "P"
+hook = "Post-P candidates: writing goals/streaks, readability lens, CMS publish, backlinks."
+doc = "ux-backlog.md#pa"
+depends_on = ["P"]
+created = "2026-07-07"
+
+[[item]]
+id = "PB"
+title = "Custom-markup plugins"
+status = "watch"
+kind = "research"
+size = "TBD"
+theme = "P"
+hook = "Post-P candidates clustering on a markup-extension API: CriticMarkup, Fountain, wiki-links."
+doc = "ux-backlog.md#pb"
+depends_on = ["P"]
+created = "2026-07-07"
+
+[[item]]
+id = "PC"
+title = "Lower-fit / principled plugin candidates"
+status = "watch"
+kind = "research"
+size = "TBD"
+theme = "P"
+hook = "Post-P: AI continuation (plugin-only on principle), book design, genre benchmarking."
+doc = "ux-backlog.md#pc"
+depends_on = ["P"]
+created = "2026-07-07"
+
+# ─────────────────────────── Theme H — code health / engineering health ───────────────────────────
+
+[[item]]
+id = "H1"
+title = "God-object SEAM decomposition (app.rs/render.rs)"
+status = "shipped"
+kind = "debt"
+size = "M"
+theme = "H"
+hook = "run->timers.rs SUBSYSTEMS table; reduce->10-stage Handled skeleton; leaves. render() split -> H14."
+doc = "engineering-health.md#h1"
+blocks_effort_p = true
+created = "2026-07-07"
+shipped_commit = "304e263"
+shipped_date = "2026-07-09"
+
+[[item]]
+id = "H2"
+title = "Interrogate the burn/harper dependency weight"
+status = "needs-design"
+kind = "research"
+size = "TBD"
+theme = "H"
+hook = "672-crate lockfile pulls a tensor stack transitively for grammar; keep/feature-gate/lighter backend?"
+doc = "engineering-health.md#h2"
+created = "2026-07-07"
+
+[[item]]
+id = "H3"
+title = "Incremental-parser tail divergences"
+status = "watch"
+kind = "debt"
+size = "TBD"
+theme = "H"
+hook = "Cosmetic, self-healing via reconcile; NOT open correctness debt; chase only if a real case appears."
+doc = "engineering-health.md#h3"
+created = "2026-07-07"
+
+[[item]]
+id = "H4"
+title = "PKGBUILD pandoc + TeX optdepends"
+status = "shipped"
+kind = "chore"
+size = "S"
+theme = "H"
+hook = "Declare pandoc-cli + texlive-xetex as Arch optdepends for export."
+doc = "engineering-health.md#h4"
+created = "2026-07-07"
+shipped_commit = "111e9b2"
+shipped_date = "2026-07-08"
+
+[[item]]
+id = "H5"
+title = "App-managed cleanup of swap files / state-dir debris"
+status = "needs-design"
+kind = "chore"
+size = "TBD"
+theme = "H"
+hook = "Auto-prune on launch vs an explicit 'Clean recovery files' command vs leave-to-user."
+doc = "engineering-health.md#h5"
+created = "2026-07-08"
+
+[[item]]
+id = "H6"
+title = "Point-release version scheme + release process"
+status = "shipped"
+kind = "chore"
+size = "S"
+theme = "H"
+hook = "SemVer 0.MINOR.PATCH; workspace version source of truth; tag-anchored PKGBUILD; wcartel --version; v0.1.0."
+doc = "engineering-health.md#h6"
+created = "2026-07-07"
+shipped_commit = "50b449a"
+shipped_date = "2026-07-09"
+
+[[item]]
+id = "H7"
+title = "Audit .unwrap() usage across the tree"
+status = "ready"
+kind = "debt"
+size = "S"
+theme = "H"
+hook = "Classify the ~35 real-runtime unwraps: guarded->.expect vs fallible->typed error."
+doc = "engineering-health.md#h7"
+created = "2026-07-09"
+
+[[item]]
+id = "H8"
+title = "Remove dead fold/outline accessors"
+status = "shipped"
+kind = "chore"
+size = "S"
+theme = "H"
+hook = "Deleted outline::section_range + fold::hidden_byte_ranges (no production callers)."
+doc = "engineering-health.md#h8"
+created = "2026-07-09"
+shipped_commit = "b5a664a"
+shipped_date = "2026-07-09"
+
+[[item]]
+id = "H9"
+title = "Lift logical-line helpers out of derive"
+status = "ready"
+kind = "debt"
+size = "S"
+theme = "H"
+hook = "Move total_logical_lines/line_start/line_text/line_render_for into a small lines.rs."
+doc = "engineering-health.md#h9"
+blocks_effort_p = true
+created = "2026-07-09"
+
+[[item]]
+id = "H10"
+title = "reduce's 10-stage intercept chain boilerplate"
+status = "watch"
+kind = "debt"
+size = "TBD"
+theme = "H"
+hook = "Verbatim flat-dispatch; NOT a defect. Collapse only when Effort P adds plugin intercept stages."
+doc = "engineering-health.md#h10"
+created = "2026-07-09"
+
+[[item]]
+id = "H11"
+title = "Decompose commands::run god-function"
+status = "ready"
+kind = "debt"
+size = "M"
+theme = "H"
+hook = "Factor the repeated edit epilogue + lift edit-arm bodies into an edit module."
+doc = "engineering-health.md#h11"
+blocks_effort_p = true
+created = "2026-07-09"
+
+[[item]]
+id = "H12"
+title = "PTY smoke suite live-splash coverage (S9)"
+status = "ready"
+kind = "chore"
+size = "S"
+theme = "H"
+hook = "Add an S9 check that launches WITHOUT --no-splash and asserts the real splash journey."
+doc = "engineering-health.md#h12"
+created = "2026-07-10"
+
+[[item]]
+id = "H13"
+title = "Editor is a 58-field data god-object"
+status = "watch"
+kind = "debt"
+size = "TBD"
+theme = "H"
+hook = "Field-clustering, not dispatch; NOT a defect. Peel PendingActions/ClipboardState only if a refactor wants it."
+doc = "engineering-health.md#h13"
+created = "2026-07-10"
+
+[[item]]
+id = "H14"
+title = "Split the render() body by paint surface"
+status = "ready"
+kind = "debt"
+size = "M"
+theme = "H"
+hook = "Split 522-line render() into paint_rows/paint_status/place_cursor; unify segs/placed lead-in. (H1 remainder.)"
+doc = "engineering-health.md#h14"
+blocks_effort_p = true
+depends_on = ["H9", "H11"]
+created = "2026-07-09"
+
+[[item]]
+id = "H15"
+title = "app.rs/render.rs leaf extraction (first pass)"
+status = "shipped"
+kind = "debt"
+size = "M"
+theme = "H"
+hook = "jobs_apply.rs/session_restore.rs/prompts.rs/search_ui.rs extracted; hubs left for H1."
+doc = "ux-backlog.md#h15"
+created = "2026-07-04"
+shipped_commit = "9e13164"
+shipped_date = "2026-07-04"
+
+[[item]]
+id = "H16"
+title = "active_line end-of-buffer clamp"
+status = "shipped"
+kind = "bug"
+size = "S"
+theme = "H"
+hook = "Clamp active line to len() not len-1 so a just-typed final list item shows its bullet."
+doc = "ux-backlog.md#h16"
+created = "2026-07-04"
+shipped_commit = "111e9b2"
+shipped_date = "2026-07-08"
+
+# ─────────────────────────── Theme M — hardening campaign (remaining) ───────────────────────────
+
+[[item]]
+id = "M8"
+title = "M5 follow-up: undo louder-hint for buffer-level merges"
+status = "ready"
+kind = "debt"
+size = "S"
+theme = "M"
+hook = "Finish the louder undo-eviction hint for buffer-level merges (the last M5 follow-up)."
+doc = "engineering-health.md#m8"
+created = "2026-06-29"
+
+[[item]]
+id = "M9"
+title = "Optional: upgrade/patch pulldown-cmark"
+status = "watch"
+kind = "chore"
+size = "S"
+theme = "M"
+hook = "M4-rest only ISOLATES its parse panic; a real upgrade is optional, low priority."
+doc = "engineering-health.md#m9"
+created = "2026-06-29"

@@ -5,6 +5,15 @@ Markdown-first Rust terminal word processor. Functional-core / imperative-shell:
 ratatui 0.30, crossterm). Top priority: **instant typing, no data loss, no silent UI
 waits.** Build toward an in-process Lua plugin system (Effort P, the 1.0 capstone).
 
+**Backlog / progress tracking.** Open and completed work is tracked in **`backlog.toml`** (the
+single source of truth for item state) → **`BACKLOG.md`** (a generated dashboard — READ THIS for
+status; never hand-edit it). Rich triage prose lives in `docs/ux-backlog.md` +
+`docs/engineering-health.md`, keyed to open items by `<!-- item: ID -->` markers. Status lives
+ONLY in `backlog.toml`. Drift is a `cargo test` GATE (`wordcartel/tests/backlog.rs`: schema +
+marker↔manifest bijection + dashboard freshness). Regenerate after any edit with
+`scripts/backlog bless`. A `bl:` message (see [[backlog-shorthand-bl]]) files a `triage` item +
+prose stub via `scripts/backlog add` and regenerates, left uncommitted by default.
+
 ---
 
 ## Development process: gated, review-driven, subagent-executed

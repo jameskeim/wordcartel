@@ -108,7 +108,8 @@ event loop is precisely the case Fable's executable whole-branch probes are wort
 subtle-emergent-behavior risk above); the user chose not to attempt it until then. Still gated **before
 Effort P**. Not urgent for correctness.
 
-## H2 — Interrogate the `burn`/`harper` dependency weight · `needs-design`
+## H2 — Interrogate the `burn`/`harper` dependency weight
+<!-- item: H2 -->
 
 **672 crates** in the lockfile, a large share from `harper-*` grammar checking dragging in `burn`
 (a tensor/ML framework) + `cubecl`. The runtime binary is unaffected (statically linked, glibc-only
@@ -125,6 +126,7 @@ actually requires from `burn`.
 **When:** opportunistic; pairs naturally with the pre-Effort-P dependency/audit pass.
 
 ## H3 — Incremental-parser tail divergences · **NOT open correctness debt (corrected)**
+<!-- item: H3 -->
 
 The eval initially flagged the `incremental ≡ full` divergences as "the one open correctness item."
 **Checked against our notes (2026-07-07) — that framing is wrong.** The accurate status:
@@ -164,7 +166,8 @@ pandoc --pdf-engine=xelatex`). Direction: add both to the PKGBUILD optdepends wh
 the exact Arch package names for the TeX engine. Anchors: `packaging/arch/PKGBUILD`,
 `wordcartel/src/export.rs`, `wordcartel/src/config.rs:139`.
 
-## H5 — App-managed cleanup of swap files / state-dir debris? · `needs-design` (user-reported 2026-07-08)
+## H5 — App-managed cleanup of swap files / state-dir debris?
+<!-- item: H5 -->
 
 **Question (user):** should there be an in-app way to clean up swap files and other filesystem debris,
 or is that something the user does outside the program?
@@ -206,7 +209,8 @@ tag/changelog/release ritual. Ties to the 1.0 framing (Effort P = the 1.0 capsto
 H4 packaging work. Anchors: `Cargo.toml` (`version`), `packaging/arch/PKGBUILD` (`pkgver()` :37), git tags
 (none today).
 
-## H7 — Audit `.unwrap()` usage across the tree · `needs-design` (user-reported 2026-07-09)
+## H7 — Audit `.unwrap()` usage across the tree
+<!-- item: H7 -->
 
 **Question (user):** audit and consider `.unwrap()` usage.
 
@@ -255,7 +259,8 @@ the fn + its test(s) — or, if it's meant to be kept as public API for plugins,
 `:204` tests); `fold.rs:113` (+`:395` test); the batch APIs that actually feed the hot path
 (`outline::sections`/`body_range`, `fold::FoldView::compute`).
 
-## H9 — Lift the logical-line helpers out of `derive` into their own module · `triage` (2026-07-09)
+## H9 — Lift the logical-line helpers out of `derive` into their own module
+<!-- item: H9 -->
 
 **Grounded (rust-analyzer call-hierarchy + raw grep, 2026-07-09):** `derive::{total_logical_lines, line_start,
 line_text}` (and the render-mode mapper `line_render_for`) are pure logical-line/line-space utilities with no
@@ -270,7 +275,8 @@ low-risk, and a natural seam to take **alongside the remaining H1 `render()`/mod
 standalone churn. Anchors: `wordcartel/src/derive.rs:91` (`total_logical_lines`), `:104` (`line_start`), `:116`
 (`line_text`), `:25` (`line_render_for`); heaviest consumer `nav.rs`.
 
-## H10 — `reduce`'s 10-stage interception chain is verbatim boilerplate · `watch` (2026-07-09)
+## H10 — `reduce`'s 10-stage interception chain is verbatim boilerplate
+<!-- item: H10 -->
 
 **Grounded (read of `app.rs:233–252`, 2026-07-09).** After the H1 SEAM refactor, `reduce` opens with a
 10-stage overlay/modal interception chain — `marks → menu → palette → theme_picker → file_browser → prompts →
@@ -288,7 +294,8 @@ sake. This is a **command-surface-contract / Effort-P-conformance** note, not mo
 within budget). Anchor: `wordcartel/src/app.rs:233–252` (the chain); `:123` (`Handled`); the `timers::SUBSYSTEMS`
 table is the model a unified version would follow.
 
-## H11 — `commands::run` is the next god-*function* after `render()` (inline bodies masquerading as a table) · `triage` (2026-07-09)
+## H11 — `commands::run` is the next god-*function* after `render()` (inline bodies masquerading as a table)
+<!-- item: H11 -->
 
 **Grounded (read of `commands.rs:209–687`, 2026-07-09).** `commands::run` — the `Command`-enum dispatcher every
 built-in and every registry handler ultimately routes through — is **478 production lines** carrying
@@ -316,7 +323,8 @@ buffer state, not rendered cells). Pairs naturally with the H1 module-size pass.
 (`run` + the allow at `:210`), the changeset builders at `:101`/`:128`/`:156`, the repeated epilogue visible at
 `:224–226`/`:238–240`/`:271–273`/`:287–289`.
 
-## H12 — PTY smoke suite has no live-splash coverage (S9) · `triage` (2026-07-10)
+## H12 — PTY smoke suite has no live-splash coverage (S9)
+<!-- item: H12 -->
 
 **Grounded (2026-07-10, splash effort merge 242c987).** The startup splash covers the first frame on every
 launch and would fail all 8 PTY smoke first-frame checks, so `scripts/smoke/tmux-drive.sh`'s `start_wcartel`
@@ -333,7 +341,8 @@ S9 would lock it into the mandatory-run suite). Low-risk, additive (one new chec
 supports per-launch args). Anchors: `scripts/smoke/tmux-drive.sh` (`start_wcartel`, the `--no-splash` default),
 `scripts/smoke/checks/`, `wordcartel/src/splash.rs`, the e2e journeys in `wordcartel/src/e2e.rs`.
 
-## H13 — `Editor` is a 58-field *data* god-object (field-clustering, not dispatch) · `watch` (2026-07-10)
+## H13 — `Editor` is a 58-field *data* god-object (field-clustering, not dispatch)
+<!-- item: H13 -->
 
 **Grounded (rust-analyzer documentSymbol + field grep, 2026-07-10; from the state-hub map).** `struct Editor`
 (`wordcartel/src/editor.rs:368`) carries **58 fields** — the whole app's mutable state on one struct. This is a
@@ -353,3 +362,23 @@ struct crosses a comprehension threshold — do NOT split for its own sake (over
 per the Module-structure rule). Note the 10 overlay `Option<T>` fields (`prompt`/`palette`/…/`splash`) are a
 deliberate flat XOR set enforced by the `open_*` family, not a clustering candidate. Anchor: `editor.rs:368` (the
 struct), `:493` (the impl), the `open_*` overlay family + shared setters.
+
+
+## Newly-tracked items (stubs)
+
+*(Auto-created during the backlog-manifest migration. Status/size/kind live in `backlog.toml`; flesh out the triage prose here when the item is picked up.)*
+
+## H14 — Split the render() body by paint surface
+<!-- item: H14 -->
+
+Split 522-line render() into paint_rows/paint_status/place_cursor; unify segs/placed lead-in. (H1 remainder.)
+
+## M8 — M5 follow-up: undo louder-hint for buffer-level merges
+<!-- item: M8 -->
+
+Finish the louder undo-eviction hint for buffer-level merges (the last M5 follow-up).
+
+## M9 — Optional: upgrade/patch pulldown-cmark
+<!-- item: M9 -->
+
+M4-rest only ISOLATES its parse panic; a real upgrade is optional, low priority.
