@@ -1288,6 +1288,7 @@ mod e2e_bench {
     // Run explicitly: `cargo test -p wordcartel --release e2e_bench -- --ignored --nocapture --test-threads=1`.
     #[test]
     #[ignore = "release-only bench; run with --release --ignored (see comment)"]
+    #[allow(clippy::print_stdout, clippy::print_stderr)] // bench harness prints its CSV / slope report by design
     fn r1_typing_latency_bench() {
         let mut s = Samples::default();
         let sts = structures();

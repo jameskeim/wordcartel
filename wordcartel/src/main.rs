@@ -3,6 +3,7 @@
 //!
 //! Usage: `wcartel [--no-config] [--config <path>] [file.md]`
 
+#[allow(clippy::print_stderr)] // fatal startup/exit errors go to stderr AFTER terminal restore — the correct channel
 fn main() {
     let cli = wordcartel::config::parse_cli(std::env::args());
     match wordcartel::app::run(cli) {

@@ -8,6 +8,16 @@ all = "deny"
 # the clippy.toml threshold (100 lines) must be split or carry an item-local
 # `#[allow(clippy::too_many_lines)]` + one-line reason. Not part of `all`; enabled here.
 too_many_lines = "deny"
+# House-rule ratchets, build-enforced (CLAUDE.md → Rust conventions). None part of `all`.
+# - no committed debug output / production landmine macros;
+# - the app OWNS the terminal: a stray `println!`/`eprintln!` corrupts the alternate screen, so
+#   console writes are denied. The legitimate exceptions carry item-local allows: `main()`'s
+#   fatal-error stderr (printed AFTER terminal restore) and the `e2e` release bench (prints results).
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
