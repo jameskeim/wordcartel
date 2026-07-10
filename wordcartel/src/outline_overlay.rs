@@ -2,6 +2,8 @@
 
 use ropey::Rope;
 use wordcartel_core::block_tree::BlockTree;
+use crate::app::Msg;
+use crossterm::event::Event;
 
 #[derive(Debug, Clone)]
 pub struct OutlineRow {
@@ -52,6 +54,89 @@ impl OutlineOverlay {
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
         self.scroll_top = self.scroll_top.min(self.rows.len().saturating_sub(1));
     }
+}
+
+pub fn outline_jump_to(editor: &mut crate::editor::Editor, byte: usize) {
+    let origin = editor.active().document.selection.primary().head;
+    crate::marks::record_jump(editor.active_mut(), origin);
+    crate::registry::unfold_ancestors_of(editor, byte);
+    editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(byte);
+    editor.outline = None;
+    crate::derive::rebuild(editor);
+    crate::nav::ensure_visible(editor);
+}
+
+/// Outline overlay: XOR-closes on buffer switch (pre-close, BEFORE the `is_none()`
+/// guard — §8.1-I), then intercepts KEY INPUT only; non-key messages fall through to
+/// normal handling so background work is never starved while the overlay is open
+/// (mirror of minibuffer/search/diag blocks above — 5e starvation lesson).
+pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor,
+    ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) -> crate::app::Handled {
+    if editor.outline.is_some()
+        && editor.outline.as_ref().map(|o| o.buffer_id) != Some(editor.active().id) {
+        editor.outline = None;
+    }
+    if editor.outline.is_none() { return crate::app::Handled::Pass(msg); }
+    if let Msg::Input(Event::Key(k)) = &msg {
+        if k.kind == crossterm::event::KeyEventKind::Press {
+            use crossterm::event::{KeyCode, KeyModifiers};
+            match k.code {
+                KeyCode::Esc => { editor.outline = None; }
+                c if crate::list_window::list_nav_key(c).is_some() => {
+                    let ah = editor.active().view.area.1;
+                    if let Some(o) = editor.outline.as_mut() {
+                        crate::list_window::apply_list_nav(crate::list_window::list_nav_key(c).unwrap(),
+                            ah, o.rows.len(), &mut o.selected, &mut o.scroll_top);
+                    }
+                }
+                KeyCode::Enter => {
+                    if editor.outline.as_ref().map(|o| o.opened_version) != Some(editor.active().document.version) {
+                        editor.status = "document changed; outline closed".into();
+                        editor.outline = None;
+                        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+                    }
+                    let target = editor.outline.as_ref()
+                        .and_then(|o| o.rows.get(o.selected))
+                        .map(|r| r.byte);
+                    if let Some(target) = target {
+                        outline_jump_to(editor, target);
+                    }
+                }
+                KeyCode::Backspace => {
+                    let ah = editor.active().view.area.1;
+                    if let Some(o) = editor.outline.as_mut() {
+                        o.query.pop();
+                    }
+                    let q = editor.outline.as_ref().map(|o| o.query.clone()).unwrap_or_default();
+                    let (blocks, rope) = { let b = editor.active(); (b.document.blocks().clone(), b.document.buffer.snapshot()) };
+                    if let Some(o) = editor.outline.as_mut() {
+                        o.set_query(&q, &blocks, &rope);
+                        crate::app::keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
+                    }
+                }
+                KeyCode::Char(c)
+                    if !k.modifiers.contains(KeyModifiers::CONTROL)
+                        && !k.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    let ah = editor.active().view.area.1;
+                    if let Some(o) = editor.outline.as_mut() {
+                        o.query.push(c);
+                    }
+                    let q = editor.outline.as_ref().map(|o| o.query.clone()).unwrap_or_default();
+                    let (blocks, rope) = { let b = editor.active(); (b.document.blocks().clone(), b.document.buffer.snapshot()) };
+                    if let Some(o) = editor.outline.as_mut() {
+                        o.set_query(&q, &blocks, &rope);
+                        crate::app::keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
+                    }
+                }
+                _ => {}
+            }
+        }
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+    }
+    // Non-key messages fall through to normal handlers below.
+    crate::app::Handled::Pass(msg)
 }
 
 #[cfg(test)]

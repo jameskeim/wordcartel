@@ -2,6 +2,8 @@
 //! (with live preview) on selection. Mirrors the command palette (palette.rs).
 
 use wordcartel_core::theme::Theme;
+use crate::app::Msg;
+use crossterm::event::Event;
 
 #[derive(Debug, Clone)]
 pub struct ThemePicker {
@@ -31,6 +33,76 @@ pub fn rebuild_rows(tp: &mut ThemePicker) {
     tp.rows.sort();                            // alphabetical display order (case-sensitive ASCII)
     if tp.selected >= tp.rows.len() { tp.selected = tp.rows.len().saturating_sub(1); }
     tp.scroll_top = tp.scroll_top.min(tp.rows.len().saturating_sub(1));
+}
+
+/// Theme picker overlay intercepts KEY INPUT and PASTE. Non-key, non-paste messages
+/// fall through to normal handling while the picker stays open (mirrors palette block).
+pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor,
+    ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) -> crate::app::Handled {
+    if editor.theme_picker.is_none() { return crate::app::Handled::Pass(msg); }
+    // Paste intercept FIRST (mirror the palette, app.rs palette block) — else paste leaks
+    // into the document while the picker is open (Codex I6).
+    if matches!(&msg, Msg::ClipboardPaste { .. }) {
+        // Drop an async clipboard-paste result that arrives while the theme picker is
+        // open — it must not land in the document behind the overlay.
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+    }
+    if let Msg::Input(Event::Paste(text)) = &msg {
+        let ah = editor.active().view.area.1;
+        if let Some(tp) = editor.theme_picker.as_mut() {
+            tp.query.push_str(text);
+            crate::theme_picker::rebuild_rows(tp);
+            crate::app::keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
+        }
+        crate::theme_cmds::preview_selected_theme(editor);
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+    }
+    if let Msg::Input(Event::Key(k)) = &msg {
+        if k.kind == crossterm::event::KeyEventKind::Press {
+            use crossterm::event::KeyCode;
+            match k.code {
+                KeyCode::Esc => {
+                    // cancel preview → restore the theme active when we opened.
+                    if let Some(tp) = editor.theme_picker.take() { editor.apply_theme(tp.original); }
+                }
+                KeyCode::Enter => { crate::theme_cmds::commit_theme_picker(editor); }
+                c if crate::list_window::list_nav_key(c).is_some() => {
+                    let ah = editor.active().view.area.1;
+                    if let Some(tp) = editor.theme_picker.as_mut() {
+                        crate::list_window::apply_list_nav(crate::list_window::list_nav_key(c).unwrap(),
+                            ah, tp.rows.len(), &mut tp.selected, &mut tp.scroll_top);
+                    }
+                    crate::theme_cmds::preview_selected_theme(editor);
+                }
+                KeyCode::Backspace => {
+                    let ah = editor.active().view.area.1;
+                    if let Some(tp) = editor.theme_picker.as_mut() {
+                        tp.query.pop();
+                        crate::theme_picker::rebuild_rows(tp);
+                        crate::app::keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
+                    }
+                    crate::theme_cmds::preview_selected_theme(editor);
+                }
+                KeyCode::Char(c)
+                    if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                        && !k.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
+                {
+                    let ah = editor.active().view.area.1;
+                    if let Some(tp) = editor.theme_picker.as_mut() {
+                        tp.query.push(c);
+                        crate::theme_picker::rebuild_rows(tp);
+                        crate::app::keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
+                    }
+                    crate::theme_cmds::preview_selected_theme(editor);
+                }
+                _ => {}
+            }
+        }
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+    }
+    // Non-key msg falls through to normal handling while picker stays open.
+    crate::app::Handled::Pass(msg)
 }
 
 #[cfg(test)]
@@ -129,7 +201,7 @@ mod tests {
                 ed.theme_picker.as_ref().unwrap().rows));
         ed.theme_picker.as_mut().unwrap().selected = idx;
         // preview_selected_theme is the single funnel (A.9): derives before apply_theme.
-        crate::app::preview_selected_theme(&mut ed);
+        crate::theme_cmds::preview_selected_theme(&mut ed);
         // §II.5 probe-generated: flexoki-dark ZEN Chrome bg = #1e1c1c.
         let chrome_bg = ed.theme.face(SemanticElement::Chrome).bg;
         assert_eq!(

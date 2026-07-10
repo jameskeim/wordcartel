@@ -7,11 +7,13 @@ use crossterm::event::Event;
 #[cfg(test)]
 use crossterm::event::KeyEvent;
 
-use crate::{commands, config, derive, editor::Editor, file, keymap, render, settings, term};
+use crate::{config, derive, editor::Editor, file, keymap, render, settings, term};
+#[cfg(test)]
+use crate::commands;
 #[cfg(test)]
 use crate::input;
 use crate::jobs::{Executor, JobOutcome};
-use crate::registry::{Ctx, Registry};
+use crate::registry::Registry;
 use wordcartel_core::history::Clock;
 
 // ---------------------------------------------------------------------------
@@ -114,6 +116,12 @@ impl std::fmt::Debug for Msg {
     }
 }
 
+/// One interception stage's verdict. `Done(keep)` — the stage consumed the message and
+/// `reduce` returns `keep` (= `!editor.quit`). `Pass(msg)` — fall through; ownership of
+/// the message returns to the chain (by value, because the palette Paste arm and the
+/// prompt stage bind `msg` by value today).
+pub(crate) enum Handled { Done(bool), Pass(Msg) }
+
 /// Re-window an overlay list after a selection/rows change (A6). `area_h` is the
 /// CALLER's read of the active buffer's area height (the same source the mouse
 /// path uses); render re-heals against the live frame each draw, so a transient
@@ -148,6 +156,15 @@ pub(crate) fn hydrate_overlays(editor: &mut Editor, reg: &crate::registry::Regis
         );
         editor.menu = Some(built);
     }
+}
+
+/// The shared stage micro-epilogue: drain ready executor results, fold them into the
+/// editor, and report keep-running. Factored from the 21 verbatim repetitions. NOT used
+/// where a stage returns without draining (the search Esc/Alt+a arms — §8 invariant C).
+pub(crate) fn fold_and_continue(editor: &mut crate::editor::Editor, ex: &dyn crate::jobs::Executor,
+    clock: &dyn wordcartel_core::history::Clock, msg_tx: &std::sync::mpsc::Sender<Msg>) -> bool {
+    for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
+    !editor.quit
 }
 
 /// Close the active overlay, dispatch `id` via the registry, drain executor results,
@@ -186,153 +203,6 @@ pub fn menu_select_for_test(
     dispatch_overlay_command(editor, reg, &keymap, ex, clock, msg_tx, id);
 }
 
-/// Honor a requested keymap rebuild (spec D2). Returns the new trie for the caller to
-/// swap into its loop-local. A half-typed prefix must not complete against the new base
-/// (spec I-3): the buffer drops, and the status clears ONLY when it is the pending "…"
-/// prompt — a switch status set in the same reduce must survive to the draw.
-pub(crate) fn rebuild_keymap_if_requested(
-    editor: &mut crate::editor::Editor,
-    patches: &[crate::config::KeymapPatch],
-    reg: &crate::registry::Registry,
-) -> Option<crate::keymap::KeyTrie> {
-    if !editor.keymap_rebuild { return None; }
-    editor.keymap_rebuild = false;
-    let (trie, kw) = crate::keymap::build_keymap(&crate::config::KeymapConfig {
-        preset: editor.active_keymap_preset.clone(),
-        patches: patches.to_vec(),
-    }, reg);
-    if !editor.pending_keys.is_empty() {
-        editor.pending_keys.clear();
-        if editor.status.ends_with('…') { editor.status.clear(); }
-    }
-    if let Some(w) = kw.first() { editor.status = w.clone(); }
-    Some(trie)
-}
-
-/// Re-derive the active theme when `toggle_chrome` sets the request flag. Called from the
-/// run-loop between-reduces region, BEFORE the settings-save arm (a same-cycle toggle+save
-/// must persist the post-rederive state — plan-mandated order, grounding A.9). Runs the
-/// COMPLETE resolve pipeline (base → derive_chrome → Ansi16 policy → user styles → cue
-/// glyph) so user overrides are not smeared (Codex r1 Critical). Returns `true` when a
-/// rederive occurred; `false` when the flag was not set.
-///
-/// A picker COMMIT (Enter in the theme picker) sets `editor.theme_identity` to
-/// `Builtin(n)` without touching `cfg.theme` — the live pick governs. To ensure the
-/// rederive uses the picker-committed name rather than reverting to the startup config,
-/// we build an EFFECTIVE ThemeConfig: when the identity is `Builtin(n)`, we override
-/// `name = Some(n)` and clear `file`; when `File`, the config path governs.
-/// User overrides (styles/depth/chrome/heading_level_glyph) ride along in both cases.
-pub(crate) fn rederive_theme_if_requested(
-    editor: &mut crate::editor::Editor,
-    theme_cfg: &crate::config::ThemeConfig,
-    env: &crate::theme_resolve::EnvSnapshot,
-) -> bool {
-    if !editor.theme_rederive { return false; }
-    editor.theme_rederive = false;
-    let effective = match &editor.theme_identity {
-        crate::settings::ThemeIdentity::Builtin(n) => {
-            let mut tc = theme_cfg.clone();
-            tc.name = Some(n.clone());
-            tc.file = None;
-            tc
-        }
-        crate::settings::ThemeIdentity::File => theme_cfg.clone(),
-    };
-    let resolved = crate::theme_resolve::resolve_theme(&effective, env, editor.chrome_disposition);
-    editor.depth = resolved.depth; // re-seed depth (cheap; cold path)
-    editor.apply_theme(resolved.theme);
-    true
-}
-
-/// Apply the theme-picker's currently-selected built-in as a live preview and
-/// record the name in `tp.previewed` — the single funnel for identity threading.
-/// `pub(crate)` so mouse.rs can call it after a wheel-scroll selection change.
-/// Calls `derive_chrome` before `apply_theme` so the preview respects the active
-/// chrome disposition (grounding A.9 D3) — except at `Depth::Ansi16` on Rgb themes,
-/// where `apply_ansi16_chrome_policy` runs INSTEAD of derivation (the policy checks
-/// sentinels; deriving first would fill them) so previews apply the sentinel-fill table
-/// rather than quantized derived values (Finding 2, pre-merge gate).
-pub(crate) fn preview_selected_theme(editor: &mut crate::editor::Editor) {
-    // Read the name first (drops the borrow), then apply, then set the field.
-    let name = editor.theme_picker.as_ref().and_then(|tp| tp.rows.get(tp.selected).cloned());
-    if let Some(name) = name {
-        if let Some(mut theme) = wordcartel_core::theme::Theme::builtin(&name) {
-            // Mirror resolve_theme's depth policy (D3): Ansi16 + Rgb-based theme → sentinel-fill
-            // table only (skip derive_chrome to preserve the sentinel state the policy checks).
-            // All other paths → derive full Rgb chrome ladder; non-Rgb themes: derive is a no-op.
-            use wordcartel_core::theme::{Color, Depth};
-            if editor.depth == Depth::Ansi16 && matches!(theme.base_bg, Color::Rgb { .. }) {
-                crate::theme_resolve::apply_ansi16_chrome_policy(&mut theme, editor.depth);
-            } else {
-                theme.derive_chrome(editor.chrome_disposition); // derive before apply (D3)
-            }
-            editor.apply_theme(theme);
-            // name still owned — `theme` did not borrow it; safe to re-borrow tp.
-            if let Some(tp) = editor.theme_picker.as_mut() { tp.previewed = Some(name); }
-        }
-    }
-}
-
-/// Commit the theme picker — the shared commit path for the keyboard Enter arm
-/// and the mouse click-to-commit arm. Closes the picker and, when a theme was
-/// previewed, records its name in `theme_identity`.
-pub(crate) fn commit_theme_picker(editor: &mut crate::editor::Editor) {
-    if let Some(tp) = editor.theme_picker.take() {
-        if let Some(n) = tp.previewed {
-            editor.theme_identity = crate::settings::ThemeIdentity::Builtin(n);
-        } // untouched open→commit: no preview applied, identity unchanged (spec I-1)
-    }
-}
-
-/// Execute the selected file-browser entry — the shared Enter path for the keyboard
-/// Enter arm and the mouse click-to-commit arm. Descends into a directory (incl. ".."),
-/// guarding against unreadable targets, or opens a file through the dirty-guard path.
-pub(crate) fn file_browser_enter(editor: &mut crate::editor::Editor) {
-    let chosen = editor.file_browser.as_ref().and_then(|fb| {
-        fb.entries.get(fb.selected).map(|e| (e.name.clone(), e.is_dir))
-    });
-    if let Some((name, is_dir)) = chosen {
-        if is_dir {
-            let target = editor.file_browser.as_ref().map(|fb| {
-                if name == ".." {
-                    fb.dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| fb.dir.clone())
-                } else {
-                    fb.dir.join(&name)
-                }
-            });
-            if let Some(target) = target {
-                // §3: check readability BEFORE committing fb.dir.
-                if std::fs::read_dir(&target).is_ok() {
-                    if let Some(fb) = editor.file_browser.as_mut() {
-                        fb.dir = target;
-                        fb.query.clear();
-                        fb.selected = 0;
-                        fb.scroll_top = 0; // A6: reset with selected to avoid out-of-order slice
-                        crate::file_browser::rebuild_entries(fb);
-                    }
-                } else {
-                    editor.status = format!("cannot read directory: {}", target.display());
-                    // stay in prior dir — do NOT mutate fb.dir
-                }
-            }
-        } else {
-            let path = editor.file_browser.as_ref().unwrap().dir.join(&name);
-            editor.file_browser = None;
-            crate::workspace::open_as_new_buffer(editor, &path);
-        }
-    }
-}
-
-pub fn outline_jump_to(editor: &mut Editor, byte: usize) {
-    let origin = editor.active().document.selection.primary().head;
-    crate::marks::record_jump(editor.active_mut(), origin);
-    crate::registry::unfold_ancestors_of(editor, byte);
-    editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(byte);
-    editor.outline = None;
-    derive::rebuild(editor);
-    crate::nav::ensure_visible(editor);
-}
-
 /// Process one message. Returns true while the app should keep running.
 pub fn reduce(
     msg: Msg,
@@ -360,780 +230,31 @@ pub fn reduce(
             panic!("WCARTEL_SMOKE_PANIC: deliberate smoke-test panic");
         }
     }
-    // pending_mark intercepts the very next key as the mark letter.
-    // Non-key messages fall through to normal handling.
-    if editor.pending_mark.is_some() {
-        if let Msg::Input(Event::Key(k)) = &msg {
-            if k.kind == crossterm::event::KeyEventKind::Press {
-                match k.code {
-                    crossterm::event::KeyCode::Esc => { editor.pending_mark = None; editor.status.clear(); }
-                    crossterm::event::KeyCode::Char(c) => crate::marks::resolve_pending(editor, c),
-                    _ => { editor.pending_mark = None; } // non-name key cancels
-                }
-            }
-            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-            return !editor.quit;
-        }
-        // non-key message: fall through to normal handling
-    }
-
-    // Menu overlay intercepts KEY INPUT and PASTE (no text field; paste is
-    // consumed / silently dropped). Non-key, non-paste messages fall through to
-    // the normal handlers so background work continues while the menu is open.
-    if editor.menu.is_some() {
-        if matches!(&msg, Msg::ClipboardPaste { .. }) {
-            // Drop an async clipboard-paste result that arrives while the menu is
-            // open — it must not land in the document behind the overlay.
-            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-            return !editor.quit;
-        }
-        if let Msg::Input(Event::Paste(_)) = &msg {
-            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-            return !editor.quit;
-        }
-        if let Msg::Input(Event::Key(k)) = &msg {
-            if k.kind == crossterm::event::KeyEventKind::Press {
-                use crossterm::event::KeyCode;
-                // Close OUTSIDE any menu borrow (Codex Critical: `editor.menu = None`
-                // must not run while `editor.menu.as_mut()` is held).
-                if matches!(k.code, KeyCode::Esc | KeyCode::F(10)) {
-                    editor.menu = None;
-                } else {
-                    let mut selected: Option<crate::registry::CommandId> = None;
-                    if let Some(menu) = editor.menu.as_mut() {   // borrow scoped to this block
-                        let ncat = menu.groups.len();
-                        match k.code {
-                            KeyCode::Left if ncat > 0 => {
-                                menu.open = (menu.open + ncat - 1) % ncat;
-                                menu.highlighted = 0;
-                                menu.scroll_top = 0; // reset window on category switch
-                            }
-                            KeyCode::Right if ncat > 0 => {
-                                menu.open = (menu.open + 1) % ncat;
-                                menu.highlighted = 0;
-                                menu.scroll_top = 0; // reset window on category switch
-                            }
-                            KeyCode::Up if ncat > 0 => {
-                                menu.highlighted = menu.highlighted.saturating_sub(1);
-                                let n = menu.groups[menu.open].1.len();
-                                // Coarse follow-the-selection layer — the paint re-windows against
-                                // the true item-row budget every frame (list_window two-layer
-                                // invariant), so this estimate need not reserve the indicator row.
-                                let list_h = n.min(15);
-                                crate::list_window::keep_visible(menu.highlighted, n, list_h, &mut menu.scroll_top);
-                            }
-                            KeyCode::Down if ncat > 0 => {
-                                let n = menu.groups[menu.open].1.len();
-                                if n > 0 {
-                                    menu.highlighted = (menu.highlighted + 1).min(n - 1);
-                                    // Coarse follow-the-selection layer — the paint re-windows against
-                                    // the true item-row budget every frame (list_window two-layer
-                                    // invariant), so this estimate need not reserve the indicator row.
-                                    let list_h = n.min(15);
-                                    crate::list_window::keep_visible(menu.highlighted, n, list_h, &mut menu.scroll_top);
-                                }
-                            }
-                            KeyCode::Enter if ncat > 0 => {
-                                if let Some((_, id)) = menu.groups[menu.open].1.get(menu.highlighted) { selected = Some(*id); }
-                            }
-                            _ => {}
-                        }
-                    } // menu borrow dropped here
-                    if let Some(id) = selected {
-                        dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
-                    }
-                }
-            }
-            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-            return !editor.quit;
-        }
-        // Non-key msg falls through to normal handling while menu stays open.
-    }
-
-    // Palette overlay intercepts KEY INPUT and PASTE. Non-key, non-paste messages
-    // (FilterDone, JobDone, Tick) fall through to normal handling while the
-    // palette stays open.
-    if editor.palette.is_some() {
-        if matches!(&msg, Msg::ClipboardPaste { .. }) {
-            // Drop an async clipboard-paste result that arrives while the palette is
-            // open — it must not land in the document behind the overlay.
-            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-            return !editor.quit;
-        }
-        if let Msg::Input(Event::Paste(text)) = msg {
-            let ah = editor.active().view.area.1;
-            if let Some(p) = editor.palette.as_mut() {
-                p.query.insert_str(p.cursor, &text);
-                p.cursor += text.len();
-                crate::palette::rebuild_rows(p, reg, keymap);
-                keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
-            }
-            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-            return !editor.quit;
-        }
-        if let Msg::Input(Event::Key(k)) = &msg {
-            if k.kind == crossterm::event::KeyEventKind::Press {
-                match k.code {
-                    crossterm::event::KeyCode::Esc => {
-                        editor.palette = None;
-                    }
-                    crossterm::event::KeyCode::Enter => {
-                        let row = editor.palette.as_ref()
-                            .and_then(|p| p.rows.get(p.selected).cloned());
-                        if let Some(row) = row {
-                            if let Some(bid) = row.buffer {
-                                // Buffer-switcher row: dismiss palette, jump to buffer.
-                                editor.palette = None;
-                                if let Some(idx) = editor.buffers.iter().position(|b| b.id == bid) {
-                                    crate::workspace::switch_to(editor, idx);
-                                }
-                            } else {
-                                // Command-palette row: dispatch through registry.
-                                dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, row.id);
-                            }
-                        }
-                    }
-                    crossterm::event::KeyCode::Up => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(p) = editor.palette.as_mut() {
-                            p.selected = p.selected.saturating_sub(1);
-                            keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
-                        }
-                    }
-                    crossterm::event::KeyCode::Down => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(p) = editor.palette.as_mut() {
-                            let max = p.rows.len().saturating_sub(1);
-                            p.selected = (p.selected + 1).min(max);
-                            keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
-                        }
-                    }
-                    crossterm::event::KeyCode::PageDown => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(p) = editor.palette.as_mut() {
-                            let lh = crate::list_window::list_h_for(p.rows.len(), ah);
-                            p.selected = (p.selected + lh.max(1)).min(p.rows.len().saturating_sub(1));
-                            keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
-                        }
-                    }
-                    crossterm::event::KeyCode::PageUp => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(p) = editor.palette.as_mut() {
-                            let lh = crate::list_window::list_h_for(p.rows.len(), ah);
-                            p.selected = p.selected.saturating_sub(lh.max(1));
-                            keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
-                        }
-                    }
-                    crossterm::event::KeyCode::Home => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(p) = editor.palette.as_mut() {
-                            p.selected = 0;
-                            keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
-                        }
-                    }
-                    crossterm::event::KeyCode::End => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(p) = editor.palette.as_mut() {
-                            p.selected = p.rows.len().saturating_sub(1);
-                            keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
-                        }
-                    }
-                    crossterm::event::KeyCode::Backspace => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(p) = editor.palette.as_mut() {
-                            if p.cursor > 0 {
-                                // remove the char before cursor (byte-safe for ASCII labels)
-                                let byte_pos = p.query[..p.cursor].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
-                                p.query.remove(byte_pos);
-                                p.cursor = byte_pos;
-                            }
-                            crate::palette::rebuild_rows(p, reg, keymap);
-                            keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
-                        }
-                    }
-                    crossterm::event::KeyCode::Left => {
-                        if let Some(p) = editor.palette.as_mut() {
-                            if p.cursor > 0 {
-                                p.cursor -= p.query[..p.cursor].char_indices().next_back().map(|(_, c)| c.len_utf8()).unwrap_or(0);
-                            }
-                        }
-                    }
-                    crossterm::event::KeyCode::Right => {
-                        if let Some(p) = editor.palette.as_mut() {
-                            if p.cursor < p.query.len() {
-                                let c = p.query[p.cursor..].chars().next().unwrap();
-                                p.cursor += c.len_utf8();
-                            }
-                        }
-                    }
-                    crossterm::event::KeyCode::Char(c)
-                        if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                            && !k.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
-                    {
-                        let ah = editor.active().view.area.1;
-                        if let Some(p) = editor.palette.as_mut() {
-                            p.query.insert(p.cursor, c);
-                            p.cursor += c.len_utf8();
-                            crate::palette::rebuild_rows(p, reg, keymap);
-                            keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-            return !editor.quit;
-        }
-        // Non-key msg falls through to normal handling while palette stays open.
-    }
-
-    // Theme picker overlay intercepts KEY INPUT and PASTE. Non-key, non-paste messages
-    // fall through to normal handling while the picker stays open (mirrors palette block).
-    if editor.theme_picker.is_some() {
-        // Paste intercept FIRST (mirror the palette, app.rs palette block) — else paste leaks
-        // into the document while the picker is open (Codex I6).
-        if matches!(&msg, Msg::ClipboardPaste { .. }) {
-            // Drop an async clipboard-paste result that arrives while the theme picker is
-            // open — it must not land in the document behind the overlay.
-            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-            return !editor.quit;
-        }
-        if let Msg::Input(Event::Paste(text)) = &msg {
-            let ah = editor.active().view.area.1;
-            if let Some(tp) = editor.theme_picker.as_mut() {
-                tp.query.push_str(text);
-                crate::theme_picker::rebuild_rows(tp);
-                keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
-            }
-            preview_selected_theme(editor);
-            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-            return !editor.quit;
-        }
-        if let Msg::Input(Event::Key(k)) = &msg {
-            if k.kind == crossterm::event::KeyEventKind::Press {
-                use crossterm::event::KeyCode;
-                match k.code {
-                    KeyCode::Esc => {
-                        // cancel preview → restore the theme active when we opened.
-                        if let Some(tp) = editor.theme_picker.take() { editor.apply_theme(tp.original); }
-                    }
-                    KeyCode::Enter => { commit_theme_picker(editor); }
-                    KeyCode::Up => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(tp) = editor.theme_picker.as_mut() {
-                            tp.selected = tp.selected.saturating_sub(1);
-                            keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
-                        }
-                        preview_selected_theme(editor);
-                    }
-                    KeyCode::Down => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(tp) = editor.theme_picker.as_mut() {
-                            let max = tp.rows.len().saturating_sub(1);
-                            tp.selected = (tp.selected + 1).min(max);
-                            keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
-                        }
-                        preview_selected_theme(editor);
-                    }
-                    KeyCode::PageDown => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(tp) = editor.theme_picker.as_mut() {
-                            let lh = crate::list_window::list_h_for(tp.rows.len(), ah);
-                            tp.selected = (tp.selected + lh.max(1)).min(tp.rows.len().saturating_sub(1));
-                            keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
-                        }
-                        preview_selected_theme(editor);
-                    }
-                    KeyCode::PageUp => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(tp) = editor.theme_picker.as_mut() {
-                            let lh = crate::list_window::list_h_for(tp.rows.len(), ah);
-                            tp.selected = tp.selected.saturating_sub(lh.max(1));
-                            keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
-                        }
-                        preview_selected_theme(editor);
-                    }
-                    KeyCode::Home => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(tp) = editor.theme_picker.as_mut() {
-                            tp.selected = 0;
-                            keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
-                        }
-                        preview_selected_theme(editor);
-                    }
-                    KeyCode::End => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(tp) = editor.theme_picker.as_mut() {
-                            tp.selected = tp.rows.len().saturating_sub(1);
-                            keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
-                        }
-                        preview_selected_theme(editor);
-                    }
-                    KeyCode::Backspace => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(tp) = editor.theme_picker.as_mut() {
-                            tp.query.pop();
-                            crate::theme_picker::rebuild_rows(tp);
-                            keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
-                        }
-                        preview_selected_theme(editor);
-                    }
-                    KeyCode::Char(c)
-                        if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                            && !k.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
-                    {
-                        let ah = editor.active().view.area.1;
-                        if let Some(tp) = editor.theme_picker.as_mut() {
-                            tp.query.push(c);
-                            crate::theme_picker::rebuild_rows(tp);
-                            keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
-                        }
-                        preview_selected_theme(editor);
-                    }
-                    _ => {}
-                }
-            }
-            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-            return !editor.quit;
-        }
-        // Non-key msg falls through to normal handling while picker stays open.
-    }
-
-    // File browser overlay intercepts KEY INPUT and PASTE. Non-key, non-paste messages
-    // fall through to normal handling while the browser stays open (mirrors theme_picker).
-    if editor.file_browser.is_some() {
-        // Drop an async clipboard-paste result that arrives while the browser is open —
-        // it must not land in the document behind the overlay (Codex I6, mirror palette).
-        if matches!(&msg, Msg::ClipboardPaste { .. }) {
-            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-            return !editor.quit;
-        }
-        if let Msg::Input(Event::Paste(text)) = &msg {
-            let ah = editor.active().view.area.1;
-            if let Some(fb) = editor.file_browser.as_mut() {
-                fb.query.push_str(text);
-                crate::file_browser::rebuild_entries(fb);
-                keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
-            }
-            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-            return !editor.quit;
-        }
-        if let Msg::Input(Event::Key(k)) = &msg {
-            if k.kind == crossterm::event::KeyEventKind::Press {
-                use crossterm::event::KeyCode;
-                match k.code {
-                    KeyCode::Esc => { editor.file_browser = None; }
-                    KeyCode::Enter => { file_browser_enter(editor); }
-                    KeyCode::Up => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(fb) = editor.file_browser.as_mut() {
-                            fb.selected = fb.selected.saturating_sub(1);
-                            keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
-                        }
-                    }
-                    KeyCode::Down => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(fb) = editor.file_browser.as_mut() {
-                            let max = fb.entries.len().saturating_sub(1);
-                            fb.selected = (fb.selected + 1).min(max);
-                            keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
-                        }
-                    }
-                    KeyCode::PageDown => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(fb) = editor.file_browser.as_mut() {
-                            let lh = crate::list_window::list_h_for(fb.entries.len(), ah);
-                            fb.selected = (fb.selected + lh.max(1)).min(fb.entries.len().saturating_sub(1));
-                            keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
-                        }
-                    }
-                    KeyCode::PageUp => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(fb) = editor.file_browser.as_mut() {
-                            let lh = crate::list_window::list_h_for(fb.entries.len(), ah);
-                            fb.selected = fb.selected.saturating_sub(lh.max(1));
-                            keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
-                        }
-                    }
-                    KeyCode::Home => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(fb) = editor.file_browser.as_mut() {
-                            fb.selected = 0;
-                            keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
-                        }
-                    }
-                    KeyCode::End => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(fb) = editor.file_browser.as_mut() {
-                            fb.selected = fb.entries.len().saturating_sub(1);
-                            keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(fb) = editor.file_browser.as_mut() {
-                            fb.query.pop();
-                            crate::file_browser::rebuild_entries(fb);
-                            keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
-                        }
-                    }
-                    KeyCode::Char(c)
-                        if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                            && !k.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
-                    {
-                        let ah = editor.active().view.area.1;
-                        if let Some(fb) = editor.file_browser.as_mut() {
-                            fb.query.push(c);
-                            crate::file_browser::rebuild_entries(fb);
-                            keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-            return !editor.quit;
-        }
-        // Non-key msg falls through to normal handling while the browser stays open.
-    }
-
-    // Active modal intercepts KEY INPUT only (§5.3). Background results and ticks
-    // must still be processed — a JobDone arriving while a modal is up (e.g. an
-    // in-flight save completing during the quit-confirm prompt) must not be
-    // dropped, or save&quit would hang waiting for a result it already discarded.
-    if editor.prompt.is_some() {
-        match msg {
-            Msg::Input(Event::Key(key)) if key.kind == crossterm::event::KeyEventKind::Press => {
-                if key.code == crossterm::event::KeyCode::Esc {
-                    editor.prompt = None; // Esc cancels any prompt
-                    editor.pending_export = None;
-                    editor.pending_save_overwrite = None;
-                    editor.pending_save_as = None;
-                    editor.pending_write_block = None;
-                    // Effort 6 / Codex gate #2: Esc on a per-buffer review prompt (raised
-                    // by drive_quit_drain) must abort the quit drain, just like Cancel does.
-                    // Without this, quit_drain stays Some-but-inert: the drain is
-                    // stranded with no in-flight save and no re-drive pending.
-                    if editor.quit_drain.is_some() {
-                        editor.quit_drain = None;
-                        editor.quit_drain_advance = false;
-                    }
-                } else if let crossterm::event::KeyCode::Char(ch) = key.code {
-                    if let Some(action) = editor.prompt.as_ref().unwrap().action_for(ch) {
-                        crate::prompts::resolve_prompt(action, editor, ex, clock, msg_tx);
-                    }
-                }
-            }
-            // Merge a directly-delivered background result even under a modal.
-            Msg::JobDone(o) => crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx),
-            Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {
-                crate::jobs_apply::apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, clock);
-            }
-            Msg::ExportDone { target, result, overwrite_confirmed, .. } => {
-                crate::jobs_apply::apply_export_done(editor, target, result, overwrite_confirmed);
-            }
-            Msg::TransformDone { buffer_id, version, range, kind, result } => {
-                crate::jobs_apply::apply_transform_done(editor, buffer_id, version, range, kind, result, clock);
-            }
-            Msg::DiagnosticsDone { buffer_id, version, diagnostics } => {
-                crate::diagnostics_run::apply_diagnostics_done(editor, buffer_id, version, diagnostics);
-            }
-            Msg::ClipboardPaste { buffer_id, text, .. } => crate::jobs_apply::apply_clipboard_paste(editor, buffer_id, text, clock),
-            Msg::ClipboardAvailability(ok) => crate::jobs_apply::apply_clipboard_availability(editor, ok),
-            // Resize/Tick/other input: ignored for the modal, but results still drain below.
-            _ => {}
-        }
-        // Always drain ready results (merges the awaited save&quit result).
-        for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-        return !editor.quit;
-    }
-
-    // Minibuffer intercepts KEY INPUT only; non-key messages (FilterDone/JobDone/Tick)
-    // fall through to the normal match arm below — a FilterDone must apply even while
-    // the minibuffer is open (see test `minibuffer_does_not_starve_filterdone`).
-    if editor.minibuffer.is_some() {
-        if let Msg::Input(Event::Key(k)) = &msg {
-            if k.kind == crossterm::event::KeyEventKind::Press {
-                match k.code {
-                    crossterm::event::KeyCode::Char(c)
-                        if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
-                    {
-                        editor.minibuffer.as_mut().unwrap().insert(c);
-                    }
-                    crossterm::event::KeyCode::Backspace => {
-                        editor.minibuffer.as_mut().unwrap().backspace();
-                    }
-                    crossterm::event::KeyCode::Left => {
-                        editor.minibuffer.as_mut().unwrap().left();
-                    }
-                    crossterm::event::KeyCode::Right => {
-                        editor.minibuffer.as_mut().unwrap().right();
-                    }
-                    crossterm::event::KeyCode::Esc => {
-                        // Dismiss the minibuffer (dismiss > cancel): this Esc is consumed
-                        // here and does NOT reach the filter-cancel Esc check below, so
-                        // any in-flight filter continues running.
-                        editor.minibuffer = None;
-                        // Save-As minibuffer dismiss: drop any queued post-save action.
-                        editor.pending_save_as = None;
-                        // Effort 6 (Codex C2): dismissing a drain's Save-As aborts the quit.
-                        editor.quit_drain = None;
-                        editor.quit_drain_advance = false;
-                    }
-                    crossterm::event::KeyCode::Enter => {
-                        let mb = editor.minibuffer.take().unwrap();
-                        match mb.kind {
-                            crate::minibuffer::MinibufferKind::Filter     => crate::prompts::submit_filter_line(editor, &mb.text, msg_tx),
-                            crate::minibuffer::MinibufferKind::GotoLine   => crate::prompts::goto_line_submit(editor, &mb.text),
-                            crate::minibuffer::MinibufferKind::SaveAs     => crate::prompts::save_as_submit(editor, &mb.text, ex, clock, msg_tx),
-                            crate::minibuffer::MinibufferKind::WriteBlock => crate::prompts::block_write_submit(editor, &mb.text),
-                            crate::minibuffer::MinibufferKind::WrapColumn => crate::prompts::wrap_column_submit(editor, &mb.text),
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-            return !editor.quit;
-        }
-        // non-key (FilterDone/JobDone/Tick/Resize/ClipboardPaste/ClipboardAvailability) falls through to the normal match below
-    }
-
-    // Search overlay intercepts KEY INPUT only; non-key messages (FilterDone/JobDone/
-    // TransformDone/ExportDone/Tick) fall through to the normal match arm below so
-    // background work is never starved while the overlay is open (mirror of minibuffer
-    // block above — see test `search_does_not_starve_filterdone`).
-    if editor.search.is_some() {
-        if let Msg::Input(Event::Key(k)) = &msg {
-            if k.kind == crossterm::event::KeyEventKind::Press {
-                use crossterm::event::{KeyCode, KeyModifiers};
-                let alt = k.modifiers.contains(KeyModifiers::ALT);
-                let shift = k.modifiers.contains(KeyModifiers::SHIFT);
-                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-                // Stepping phase: y/n/!/q intercepted BEFORE the text-insert arm.
-                if editor.search.as_ref().map(|s| s.phase) == Some(crate::search_overlay::Phase::Stepping) {
-                    match k.code {
-                        KeyCode::Char('y') => { crate::search_ui::search_step_apply(editor, clock); }
-                        KeyCode::Char('n') => { crate::search_ui::search_step_skip(editor); }
-                        KeyCode::Char('!') => { crate::search_ui::search_step_rest(editor, clock); }
-                        KeyCode::Char('q') | KeyCode::Esc => { editor.search = None; }
-                        _ => {}
-                    }
-                    for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-                    return !editor.quit;
-                }
-                match k.code {
-                    KeyCode::Esc => { crate::search_ui::search_cancel(editor); return !editor.quit; }
-                    KeyCode::Char('r') if alt => { editor.search.as_mut().unwrap().toggle_mode(); }
-                    KeyCode::Char('c') if alt => { editor.search.as_mut().unwrap().cycle_case(); }
-                    KeyCode::Char('a') if alt => { crate::search_ui::search_replace_all(editor, clock); return !editor.quit; }
-                    KeyCode::Enter if alt => {
-                        if let Some(s) = editor.search.as_mut() { s.phase = crate::search_overlay::Phase::Stepping; }
-                        crate::search_ui::search_sync(editor); // park on first match
-                        for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-                        return !editor.quit;
-                    }
-                    KeyCode::Enter if shift => { crate::search_ui::search_step(editor, false); }
-                    KeyCode::F(3) if shift   => { crate::search_ui::search_step(editor, false); }
-                    KeyCode::Enter           => { crate::search_ui::search_step(editor, true); }
-                    KeyCode::F(3)            => { crate::search_ui::search_step(editor, true); }
-                    KeyCode::Tab => {
-                        if let Some(s) = editor.search.as_mut() {
-                            s.field = match s.field {
-                                crate::search_overlay::Field::Needle => crate::search_overlay::Field::Template,
-                                crate::search_overlay::Field::Template => crate::search_overlay::Field::Needle,
-                            };
-                            s.cursor = s.focused_field().len();
-                        }
-                    }
-                    KeyCode::Backspace       => { editor.search.as_mut().unwrap().backspace(); }
-                    KeyCode::Left            => { editor.search.as_mut().unwrap().left(); }
-                    KeyCode::Right           => { editor.search.as_mut().unwrap().right(); }
-                    KeyCode::Char(c) if !ctrl && !alt => { editor.search.as_mut().unwrap().insert(c); }
-                    _ => {}
-                }
-                // Recompute against the live buffer and pin the current match.
-                crate::search_ui::search_sync(editor);
-            }
-            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-            return !editor.quit; // return ONLY for key events (including non-Press)
-        }
-        // Non-key messages (FilterDone/ExportDone/TransformDone/JobDone/Tick/…)
-        // fall through to the normal handlers below.
-    }
-
-    // Diag overlay intercepts KEY INPUT only; non-key messages fall through to
-    // normal handling so background work is never starved while the overlay is open
-    // (mirror of minibuffer/search blocks above — 5e starvation lesson).
-    if editor.diag.is_some() {
-        if let Msg::Input(Event::Key(k)) = &msg {
-            if k.kind == crossterm::event::KeyEventKind::Press {
-                match k.code {
-                    crossterm::event::KeyCode::Up   => { editor.diag.as_mut().unwrap().up(); }
-                    crossterm::event::KeyCode::Down => { editor.diag.as_mut().unwrap().down(); }
-                    crossterm::event::KeyCode::Esc  => { editor.diag = None; }
-                    crossterm::event::KeyCode::Enter => { crate::search_ui::diag_apply_selected(editor, clock); }
-                    _ => {} // bare Ctrl+key or anything else: no-op, consumed
-                }
-            }
-            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-            return !editor.quit; // return ONLY for key events (including non-Press)
-        }
-        // Non-key messages fall through to normal handlers below.
-    }
-
-    if editor.outline.is_some()
-        && editor.outline.as_ref().map(|o| o.buffer_id) != Some(editor.active().id) {
-        editor.outline = None;
-    }
-    if editor.outline.is_some() {
-        if let Msg::Input(Event::Key(k)) = &msg {
-            if k.kind == crossterm::event::KeyEventKind::Press {
-                use crossterm::event::{KeyCode, KeyModifiers};
-                match k.code {
-                    KeyCode::Esc => { editor.outline = None; }
-                    KeyCode::Up => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(o) = editor.outline.as_mut() {
-                            o.selected = o.selected.saturating_sub(1);
-                            keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
-                        }
-                    }
-                    KeyCode::Down => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(o) = editor.outline.as_mut() {
-                            let max = o.rows.len().saturating_sub(1);
-                            o.selected = (o.selected + 1).min(max);
-                            keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
-                        }
-                    }
-                    KeyCode::PageDown => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(o) = editor.outline.as_mut() {
-                            let lh = crate::list_window::list_h_for(o.rows.len(), ah);
-                            o.selected = (o.selected + lh.max(1)).min(o.rows.len().saturating_sub(1));
-                            keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
-                        }
-                    }
-                    KeyCode::PageUp => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(o) = editor.outline.as_mut() {
-                            let lh = crate::list_window::list_h_for(o.rows.len(), ah);
-                            o.selected = o.selected.saturating_sub(lh.max(1));
-                            keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
-                        }
-                    }
-                    KeyCode::Home => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(o) = editor.outline.as_mut() {
-                            o.selected = 0;
-                            keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
-                        }
-                    }
-                    KeyCode::End => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(o) = editor.outline.as_mut() {
-                            o.selected = o.rows.len().saturating_sub(1);
-                            keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
-                        }
-                    }
-                    KeyCode::Enter => {
-                        if editor.outline.as_ref().map(|o| o.opened_version) != Some(editor.active().document.version) {
-                            editor.status = "document changed; outline closed".into();
-                            editor.outline = None;
-                            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-                            return !editor.quit;
-                        }
-                        let target = editor.outline.as_ref()
-                            .and_then(|o| o.rows.get(o.selected))
-                            .map(|r| r.byte);
-                        if let Some(target) = target {
-                            outline_jump_to(editor, target);
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        let ah = editor.active().view.area.1;
-                        if let Some(o) = editor.outline.as_mut() {
-                            o.query.pop();
-                        }
-                        let q = editor.outline.as_ref().map(|o| o.query.clone()).unwrap_or_default();
-                        let (blocks, rope) = { let b = editor.active(); (b.document.blocks().clone(), b.document.buffer.snapshot()) };
-                        if let Some(o) = editor.outline.as_mut() {
-                            o.set_query(&q, &blocks, &rope);
-                            keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
-                        }
-                    }
-                    KeyCode::Char(c)
-                        if !k.modifiers.contains(KeyModifiers::CONTROL)
-                            && !k.modifiers.contains(KeyModifiers::ALT) =>
-                    {
-                        let ah = editor.active().view.area.1;
-                        if let Some(o) = editor.outline.as_mut() {
-                            o.query.push(c);
-                        }
-                        let q = editor.outline.as_ref().map(|o| o.query.clone()).unwrap_or_default();
-                        let (blocks, rope) = { let b = editor.active(); (b.document.blocks().clone(), b.document.buffer.snapshot()) };
-                        if let Some(o) = editor.outline.as_mut() {
-                            o.set_query(&q, &blocks, &rope);
-                            keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-            return !editor.quit;
-        }
-        // Non-key messages fall through to normal handlers below.
-    }
+    let msg = match crate::marks::intercept(msg, editor, ex, clock, msg_tx) {
+        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
+    let msg = match crate::menu::intercept(msg, editor, reg, keymap, ex, clock, msg_tx) {
+        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
+    let msg = match crate::palette::intercept(msg, editor, reg, keymap, ex, clock, msg_tx) {
+        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
+    let msg = match crate::theme_picker::intercept(msg, editor, ex, clock, msg_tx) {
+        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
+    let msg = match crate::file_browser::intercept(msg, editor, ex, clock, msg_tx) {
+        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
+    let msg = match crate::prompts::intercept(msg, editor, ex, clock, msg_tx) {
+        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
+    let msg = match crate::minibuffer::intercept(msg, editor, ex, clock, msg_tx) {
+        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
+    let msg = match crate::search_ui::intercept(msg, editor, ex, clock, msg_tx) {
+        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
+    let msg = match crate::diag_overlay::intercept(msg, editor, ex, clock, msg_tx) {
+        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
+    let msg = match crate::outline_overlay::intercept(msg, editor, ex, clock, msg_tx) {
+        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
 
     let before = editor.active().document.version;
     match msg {
-        Msg::Input(Event::Key(k)) if k.kind == crossterm::event::KeyEventKind::Press => {
-            // Esc precedence (Codex CRITICAL): prompt/minibuffer Esc are handled in their
-            // interception blocks ABOVE this point. Here in normal mode the order is
-            // pending-cancel > filter-cancel. This arm SUBSUMES the old standalone
-            // filter-cancel Esc check (removed above). Esc is reserved for cancel/dismiss
-            // in v1 (not routed to the keymap).
-            if k.code == crossterm::event::KeyCode::Esc {
-                if !editor.pending_keys.is_empty() {
-                    editor.pending_keys.clear();
-                    editor.status.clear();
-                } else if editor.filter_in_flight.is_some() {
-                    editor.filter_in_flight.take().unwrap().cancel();
-                    editor.status = "cancelling…".into();
-                }
-            } else if let Some(chord) = crate::keymap::from_key_event(k) {
-                editor.pending_keys.push(chord);
-                match keymap.resolve(&editor.pending_keys) {
-                    crate::keymap::Resolution::Command(id) => {
-                        editor.pending_keys.clear();
-                        editor.status.clear();
-                        let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
-                        reg.dispatch(id, &mut ctx);
-                        hydrate_overlays(editor, reg, keymap);
-                    }
-                    crate::keymap::Resolution::Pending => {
-                        editor.status = format!("{} …", crate::keymap::chords_display(&editor.pending_keys));
-                    }
-                    crate::keymap::Resolution::None => {
-                        let was_single = editor.pending_keys.len() == 1;
-                        editor.pending_keys.clear();
-                        editor.status.clear();
-                        // Printable fallthrough: single unmodified printable → literal insert.
-                        if was_single {
-                            if let crossterm::event::KeyCode::Char(c) = k.code {
-                                if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                                    && !k.modifiers.contains(crossterm::event::KeyModifiers::ALT)
-                                {
-                                    commands::run(commands::Command::InsertChar(c), editor, clock);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        Msg::Input(Event::Key(k)) if k.kind == crossterm::event::KeyEventKind::Press =>
+            crate::input::handle_key(k, editor, reg, keymap, ex, clock, msg_tx),
         Msg::Input(Event::Paste(text)) => {
             if let Some(mb) = editor.minibuffer.as_mut() {
                 for ch in text.chars() { mb.insert(ch); }
@@ -1172,34 +293,7 @@ pub fn reduce(
         Msg::DiagnosticsDone { buffer_id, version, diagnostics } => {
             crate::diagnostics_run::apply_diagnostics_done(editor, buffer_id, version, diagnostics);
         }
-        Msg::Tick => {
-            let now = clock.now_ms();
-            if crate::swap::pending(
-                editor.active().document.dirty(), editor.active().document.version, editor.active().swapped_version,
-            )
-                && !editor.active().swap_in_flight
-                && crate::swap::due(now, editor.active().last_edit_at, editor.active().last_swap_at)
-            {
-                editor.active_mut().swap_in_flight = true;
-                let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
-                crate::swap::dispatch_swap_write(&mut ctx);
-            }
-            // Dispatch diagnostics if due.
-            let version = editor.active().document.version;
-            if editor.diag_cfg.enabled
-                && crate::diagnostics_run::diag_due(&editor.active().diagnostics, now, version)
-            {
-                let ignore_words = std::sync::Arc::new(
-                    editor.dictionary.iter().chain(editor.session_ignores.iter()).cloned().collect::<std::collections::HashSet<String>>()
-                );
-                let diag_cfg = editor.diag_cfg.clone();
-                crate::diagnostics_run::dispatch_diagnostics(editor, &diag_cfg, ignore_words, msg_tx.clone());
-            }
-            // Dispatch a block-tree reconcile if due.
-            if crate::reconcile::reconcile_due(&editor.active().reconcile, now) {
-                crate::reconcile::dispatch_reconcile(editor, ex);
-            }
-        }
+        Msg::Tick => crate::timers::on_tick(editor, ex, clock, msg_tx),
         Msg::ClipboardPaste { buffer_id, text, .. } => crate::jobs_apply::apply_clipboard_paste(editor, buffer_id, text, clock),
         Msg::ClipboardAvailability(ok) => crate::jobs_apply::apply_clipboard_availability(editor, ok),
         // Intercepted in the run loop before `reduce` (see run()); unreachable here.
@@ -1264,9 +358,9 @@ impl Clock for SystemClock {
 /// (everything between the clipboard/mouse terminal steps and the draw). Extracted so the
 /// harness exercises the REAL loop body, not a re-implementation.
 pub(crate) fn advance(editor: &mut Editor, clock: &dyn Clock) {
-    recompute_scrollbar_visible(editor, clock.now_ms());
-    recompute_menu_bar(editor, clock.now_ms());
-    recompute_status_line(editor, clock.now_ms());
+    crate::chrome::recompute_scrollbar_visible(editor, clock.now_ms());
+    crate::chrome::recompute_menu_bar(editor, clock.now_ms());
+    crate::chrome::recompute_status_line(editor, clock.now_ms());
     // Pre-draw rebuild: ensure the layout cache matches the final (scroll,
     // text_width) before render consumes it.  render has no on-demand fallback
     // (render.rs:132-140), so a stale cache blanks the editing rows.
@@ -1581,10 +675,10 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     let mut last_persisted_saved = editor.active().document.saved_version;
 
     // Reconcile mouse capture once before the first draw (post-guard invariant).
-    reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
+    crate::chrome::reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
 
-    recompute_scrollbar_visible(&mut editor, clock.now_ms());
-    recompute_status_line(&mut editor, clock.now_ms());
+    crate::chrome::recompute_scrollbar_visible(&mut editor, clock.now_ms());
+    crate::chrome::recompute_status_line(&mut editor, clock.now_ms());
     // After a potential session-resume the scroll may have changed; re-clamp/re-pin
     // and rebuild the layout cache so the very first frame is always correct.
     // Order: rebuild (reconciles folds + layout) → SnapOut restored caret → ensure_visible.
@@ -1605,60 +699,11 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     let mut exit_reason = ExitReason::Normal;
     loop {
         let now = clock.now_ms();
-        save_timeout_tick(&mut editor, now);
-        // Only arm the swap wake-up when a swap is actually pending (unsaved content not yet on
-        // disk) and none is in flight. Arming it off last_edit_at alone left a permanently past-due
-        // deadline, so an idle buffer kept waking the loop to rewrite its swap file — continuous
-        // disk I/O, not a CPU spin (see swap::pending).
-        let swap_deadline = if crate::swap::pending(
-            editor.active().document.dirty(), editor.active().document.version, editor.active().swapped_version,
-        ) && !editor.active().swap_in_flight {
-            crate::swap::next_deadline_ms(now, editor.active().last_edit_at, editor.active().last_swap_at)
-        } else {
-            None
-        };
-        let sq_deadline = editor.pending_after_save.as_ref().map(|p| p.at_ms.saturating_add(SAVE_QUIT_TIMEOUT_MS));
-        // Include scrollbar_until_ms in the deadline so the loop wakes when the
-        // bar should fade (avoids relying on the idle 1-hour Tick).
-        let sb_deadline = if editor.mouse.scrollbar_until_ms > now {
-            Some(editor.mouse.scrollbar_until_ms)
-        } else {
-            None
-        };
-        // Menu-bar dwell/grace: at most one is Some by construction (the Moved arm
-        // clears the other side); recompute_menu_bar clears a fired due, so a past
-        // deadline cannot persist and spin the loop.
-        let menu_deadline = editor.mouse.menu_reveal_due.or(editor.mouse.menu_hide_due);
-        // Scrollbar/status-line dwell deadlines — armed by the right-edge Moved arm.
-        let sb_dwell_deadline = editor.mouse.scrollbar_reveal_due.or(editor.mouse.scrollbar_hide_due);
-        let status_dwell_deadline = editor.mouse.status_reveal_due.or(editor.mouse.status_hide_due);
-        // Fix A3: include the diagnostics deadline ONLY when no check is in
-        // flight.  When a check is in flight, recheck_due_at may be a past
-        // timestamp (armed before the check started), which would drive
-        // recv_timeout(0) → 100% CPU spin until the worker completes.
-        // When the result lands it clears in_flight_version; the next
-        // iteration will re-include the (re-armed) deadline and dispatch.
-        let diag_deadline = if editor.active().diagnostics.in_flight_version.is_none() {
-            editor.active().diagnostics.recheck_due_at
-        } else {
-            None
-        };
-        let reconcile_deadline = if editor.active().reconcile.in_flight_version.is_none() {
-            editor.active().reconcile.due_at
-        } else {
-            None
-        };
-        let deadline = crate::diagnostics_run::next_deadline(&[
-            swap_deadline,
-            sq_deadline,
-            sb_deadline,
-            menu_deadline,
-            sb_dwell_deadline,
-            status_dwell_deadline,
-            diag_deadline,
-            reconcile_deadline,
-        ]);
-        let timeout = deadline
+        crate::timers::pre_recv(&mut editor, now);
+        // Every wake source lives in the timers::SUBSYSTEMS table, each with its own anti-spin
+        // gate; next_wake folds their min. Idle ⇒ every gate yields None ⇒ the loop blocks on the
+        // 3600 s fallback (idle is free — §8.1-E). See timers.rs for the per-subsystem rationale.
+        let timeout = crate::timers::next_wake(&editor, now)
             .map(|d| std::time::Duration::from_millis(d.saturating_sub(now)))
             .unwrap_or(std::time::Duration::from_secs(3600));
         let msg = match msg_rx.recv_timeout(timeout) {
@@ -1674,12 +719,12 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         }
         let (pre_id, pre_version) = { let b = editor.active(); (b.id, b.document.version) };
         let keep = reduce(msg, &mut editor, &reg, &keymap, &executor, &clock, &msg_tx);
-        if let Some(t) = rebuild_keymap_if_requested(&mut editor, &cfg.keymap.patches, &reg) {
+        if let Some(t) = crate::theme_cmds::rebuild_keymap_if_requested(&mut editor, &cfg.keymap.patches, &reg) {
             keymap = t;
         }
         // Rederive arm: BEFORE settings_save so a same-cycle toggle+save persists
         // the post-rederive state (plan-mandated order — grounding A.9).
-        rederive_theme_if_requested(&mut editor, &cfg.theme, &env);
+        crate::theme_cmds::rederive_theme_if_requested(&mut editor, &cfg.theme, &env);
         if editor.settings_save_requested {
             editor.settings_save_requested = false;
             if let Some(of) = settings::perform_settings_save(
@@ -1691,14 +736,14 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         }
         editor.note_undo_eviction(pre_id, pre_version);
         crate::clipboard::drain_clipboard_intents(&mut editor, &clip_env, &mut clip_plan, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
-        reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
+        crate::chrome::reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
         advance(&mut editor, &clock);
         guard.terminal().draw(|f| render::render(f, &mut editor))?;
         // Persist session state when a save just completed (saved_version advanced).
         let sv = editor.active().document.saved_version;
         if sv != last_persisted_saved {
             session_seq += 1;
-            persist_session(&mut session, &editor, &cfg, session_seq);
+            crate::session_restore::persist_session(&mut session, &editor, &cfg, session_seq);
             last_persisted_saved = sv;
         }
         if !keep { break; }
@@ -1715,7 +760,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
 
     // On clean quit: persist once more (cursor may have moved since the last save).
     session_seq += 1;
-    persist_session(&mut session, &editor, &cfg, session_seq);
+    crate::session_restore::persist_session(&mut session, &editor, &cfg, session_seq);
 
     // Restore the terminal BEFORE the executor drops: ThreadExecutor::drop joins
     // the worker, which may still be completing an in-flight save_atomic on a slow
@@ -1724,220 +769,6 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // is the "never lose work" behavior). The 5 s save&quit guard above bounds the wait.
     drop(guard);
     Ok(exit_reason)
-}
-
-/// Recompute `editor.mouse.scrollbar_visible` from the clock, honoring the mode.
-///
-/// Must be called at the top of the run loop (with `clock.now_ms()`) so that
-/// the scrollbar fades exactly when `scrollbar_until_ms` or a dwell deadline
-/// expires, driven by the loop's `deadline` (not an idle Tick).
-///
-/// **Fire order is load-bearing:** dwell/grace deadlines are fired FIRST so that
-/// a deadline landing exactly on `now_ms` flips `scrollbar_revealed` before we
-/// read it to compute `scrollbar_visible`.
-pub fn recompute_scrollbar_visible(editor: &mut crate::editor::Editor, now_ms: u64) {
-    use crate::config::TransientMode;
-    // Fire the Auto dwell/grace deadlines FIRST (armed by the mouse Moved arm), so a
-    // deadline landing exactly on `now_ms` flips `scrollbar_revealed` BEFORE we read it.
-    if editor.scrollbar_mode == TransientMode::Auto {
-        if editor.mouse.scrollbar_reveal_due.is_some_and(|d| now_ms >= d) {
-            editor.mouse.scrollbar_reveal_due = None;
-            editor.mouse.scrollbar_revealed = true;
-        }
-        if editor.mouse.scrollbar_hide_due.is_some_and(|d| now_ms >= d) {
-            editor.mouse.scrollbar_hide_due = None;
-            editor.mouse.scrollbar_revealed = false;
-        }
-    } else {
-        editor.mouse.scrollbar_reveal_due = None;
-        editor.mouse.scrollbar_hide_due = None;
-        editor.mouse.scrollbar_revealed = false;
-    }
-    editor.mouse.scrollbar_visible = match editor.scrollbar_mode {
-        TransientMode::On  => true,
-        TransientMode::Off => false,
-        // Auto: scroll activity (the existing channel) OR a live right-edge dwell.
-        TransientMode::Auto => now_ms < editor.mouse.scrollbar_until_ms
-            || editor.mouse.scrollbar_revealed,
-    };
-}
-
-/// Fire the auto-mode menu-bar deadlines (armed by the mouse Moved arm). Gated on
-/// Auto — a stale due must never fire in Pinned/Hidden (spec M2).
-pub fn recompute_menu_bar(editor: &mut crate::editor::Editor, now_ms: u64) {
-    if editor.menu_bar_mode != crate::config::MenuBarMode::Auto {
-        // Defense-in-depth (Fable plan-review M5): dues arm only in Auto and every
-        // mode transition clears them, so this state is unreachable — but CLEARING
-        // (never firing) here makes the deadline-array no-spin invariant
-        // unconditional instead of resting on the transition-clears.
-        editor.mouse.menu_reveal_due = None;
-        editor.mouse.menu_hide_due = None;
-        return;
-    }
-    if editor.mouse.menu_reveal_due.is_some_and(|d| now_ms >= d) {
-        editor.mouse.menu_reveal_due = None;
-        editor.mouse.menu_bar_revealed = true;
-    }
-    if editor.mouse.menu_hide_due.is_some_and(|d| now_ms >= d) {
-        editor.mouse.menu_hide_due = None;
-        editor.mouse.menu_bar_revealed = false;
-    }
-}
-
-/// Whether the NORMAL idle status info line should paint. A message / prompt /
-/// search / minibuffer force it regardless of mode (no-silent-UI) — those are
-/// handled in render.rs before this is consulted; this governs only the idle line.
-pub fn status_line_visible(editor: &crate::editor::Editor) -> bool {
-    use crate::config::TransientMode;
-    match editor.status_line_mode {
-        TransientMode::On  => true,
-        // Off is never assigned to status (coerced to Auto at parse); treat defensively as Auto.
-        TransientMode::Off | TransientMode::Auto =>
-            !editor.status.is_empty()
-                || editor.mouse.status_revealed
-                || editor.prompt.is_some()
-                || editor.search.is_some()
-                || editor.minibuffer.is_some(),
-    }
-}
-
-/// Fire the Auto-mode status dwell/grace deadlines (armed by the mouse Moved arm).
-pub fn recompute_status_line(editor: &mut crate::editor::Editor, now_ms: u64) {
-    use crate::config::TransientMode;
-    if editor.status_line_mode != TransientMode::Auto {
-        editor.mouse.status_reveal_due = None;
-        editor.mouse.status_hide_due = None;
-        return;
-    }
-    if editor.mouse.status_reveal_due.is_some_and(|d| now_ms >= d) {
-        editor.mouse.status_reveal_due = None;
-        editor.mouse.status_revealed = true;
-    }
-    if editor.mouse.status_hide_due.is_some_and(|d| now_ms >= d) {
-        editor.mouse.status_hide_due = None;
-        editor.mouse.status_revealed = false;
-    }
-}
-
-/// Reconcile the terminal's mouse-capture state with `editor.mouse_capture`.
-///
-/// Enables or disables mouse capture on the backend when the desired state
-/// diverges from `applied`. On disable, clears drag state so no stale Up
-/// events are awaited for a capture that will never arrive.
-pub fn reconcile_mouse_capture<W: std::io::Write>(editor: &mut crate::editor::Editor, backend: &mut W, applied: &mut bool) {
-    if editor.mouse_capture != *applied {
-        if editor.mouse_capture {
-            if crossterm::execute!(backend, crossterm::event::EnableMouseCapture).is_ok() {
-                *applied = editor.mouse_capture;
-            }
-        } else {
-            // clear drag state regardless of IO outcome — it is local state,
-            // not tied to the terminal write succeeding.
-            editor.mouse.dragging = false;
-            editor.mouse.scrollbar_dragging = false;
-            editor.mouse.anchor = None;
-            editor.mouse.menu_reveal_due = None;
-            editor.mouse.menu_hide_due = None;
-            editor.mouse.menu_bar_revealed = false;
-            if crossterm::execute!(backend, crossterm::event::DisableMouseCapture).is_ok() {
-                *applied = editor.mouse_capture;
-            }
-        }
-    }
-}
-
-/// Record the active buffer's position into the session store and flush to disk.
-/// Scratch content is always captured; per-file entry only for named buffers.
-/// A write failure → status warning only (never blocks quit or loses the document).
-fn persist_session(
-    session: &mut crate::state::SessionState,
-    editor: &Editor,
-    cfg: &config::Config,
-    seq: u64,
-) {
-    // Effort 6: capture scratch content first, independent of the active buffer.
-    // M5: guard on byte length — never materialize a huge String for persistence.
-    if let Some(sid) = editor.scratch_id {
-        if let Some(sb) = editor.by_id(sid) {
-            if sb.document.buffer.len() <= crate::limits::MAX_SESSION_BYTES {
-                session.scratch = Some(crate::state::ScratchState {
-                    text: sb.document.buffer.to_string(),
-                    cursor: sb.document.selection.primary().head,
-                });
-            } else {
-                // Oversized: skip persisting the live scratch — and CLEAR any stale scratch
-                // loaded from disk, so an old session's scratch is not resurrected. The live
-                // buffer is untouched; only its cross-session persistence is dropped.
-                session.scratch = None;
-            }
-        }
-    }
-    // Per-file entry for the active buffer (unchanged): only when it has a real,
-    // canonicalizable path. Scratch/new buffers contribute no per-file entry.
-    if let Some(raw_path) = editor.active().document.path.as_deref() {
-        if let Ok(canon) = std::fs::canonicalize(raw_path) {
-            if let Some((mtime, size)) = crate::state::file_identity(raw_path) {
-                let entry = crate::state::StateEntry {
-                    cursor: editor.active().document.selection.primary().head,
-                    scroll: editor.active().view.scroll,
-                    marks: editor.active().marks.iter().map(|(c, &o)| (c.to_string(), o)).collect(),
-                    mtime, size, seq,
-                    folds: editor.active().folds.folded().iter().copied().collect(),
-                    block: editor.active().marked_block.map(|b| (b.start, b.end)),
-                };
-                session.record(canon.to_string_lossy().into_owned(), entry, cfg.state.max_entries);
-            }
-        }
-    }
-    // Always flush — scratch durability does not depend on the active buffer.
-    let _ = session.save();
-}
-
-#[cfg(test)]
-pub fn persist_session_for_test(s: &mut crate::state::SessionState, e: &Editor, cfg: &config::Config, seq: u64) {
-    persist_session(s, e, cfg, seq);
-}
-
-// ---------------------------------------------------------------------------
-// Save-timeout seam (extracted from run() so it is testable — C4 Task 2)
-// ---------------------------------------------------------------------------
-
-/// Milliseconds before a pending save-then-act is considered overdue. Moved
-/// from run()-local to module scope so `save_timeout_tick` can reference it
-/// and tests can drive it without magic literals (C4 r2).
-pub(crate) const SAVE_QUIT_TIMEOUT_MS: u64 = 5_000;
-
-/// Save-timeout disposition (extracted from run()'s tick so it is testable — C4).
-/// Returns without effect while no pending save is overdue.
-pub(crate) fn save_timeout_tick(editor: &mut Editor, now: u64) {
-    if let Some(p) = &editor.pending_after_save {
-        let waited = now.saturating_sub(p.at_ms);
-        if waited > SAVE_QUIT_TIMEOUT_MS {
-            // Compiler-exhaustive on purpose (Codex plan r2): a future
-            // PostSaveAction variant must NOT compile silently past this helper.
-            let action = p.action.clone();
-            editor.pending_after_save = None;
-            match action {
-                crate::editor::PostSaveAction::Quit => {
-                    // Re-raise the quit-confirm modal so the user can choose again.
-                    editor.open_prompt(crate::prompt::Prompt::quit_confirm());
-                    editor.status = "Save still running — choose again".into();
-                }
-                crate::editor::PostSaveAction::ContinueQuitDrain => {
-                    // Codex C3: a stranded drain (no in-flight save, no re-drive) would
-                    // hang the quit. Abort the whole quit rather than silently clearing.
-                    editor.quit_drain = None;
-                    editor.quit_drain_advance = false;
-                    editor.status = "save timed out — quit cancelled".into();
-                }
-                crate::editor::PostSaveAction::CloseBuffer { .. } => {
-                    // C4: a close is not a session-ending action the user is
-                    // waiting on — cancel without re-prompting (spec D3).
-                    editor.status = "save timed out — close cancelled".into();
-                }
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3696,130 +2527,6 @@ mod tests {
         assert!(!e.mouse_capture, "toggled off");
     }
 
-    #[test]
-    fn scrollbar_visible_recomputed_against_clock() {
-        use crate::editor::Editor;
-        let mut e = Editor::new_from_text("x\n", None, (80, 24));
-        e.mouse.scrollbar_until_ms = 1000;
-        crate::app::recompute_scrollbar_visible(&mut e, 500); // before deadline
-        assert!(e.mouse.scrollbar_visible);
-        crate::app::recompute_scrollbar_visible(&mut e, 1200); // after
-        assert!(!e.mouse.scrollbar_visible);
-    }
-
-    #[test]
-    fn scrollbar_visible_respects_mode() {
-        use crate::config::TransientMode;
-        use crate::app::recompute_scrollbar_visible;
-        let mut e = Editor::new_from_text("x\n", None, (40, 8));
-        // On: always visible regardless of activity/dwell.
-        e.scrollbar_mode = TransientMode::On;
-        recompute_scrollbar_visible(&mut e, 10_000);
-        assert!(e.mouse.scrollbar_visible, "On → always visible");
-        // Off: never visible even with fresh activity.
-        e.scrollbar_mode = TransientMode::Off;
-        e.mouse.scrollbar_until_ms = 20_000;
-        recompute_scrollbar_visible(&mut e, 10_000);
-        assert!(!e.mouse.scrollbar_visible, "Off → never visible");
-        // Auto: visible while activity OR dwell holds; hidden once both lapse.
-        e.scrollbar_mode = TransientMode::Auto;
-        e.mouse.scrollbar_until_ms = 20_000; e.mouse.scrollbar_revealed = false;
-        recompute_scrollbar_visible(&mut e, 10_000);
-        assert!(e.mouse.scrollbar_visible, "Auto + activity → visible");
-        e.mouse.scrollbar_until_ms = 0; e.mouse.scrollbar_revealed = true;
-        recompute_scrollbar_visible(&mut e, 10_000);
-        assert!(e.mouse.scrollbar_visible, "Auto + dwell-revealed → visible");
-        e.mouse.scrollbar_revealed = false;
-        recompute_scrollbar_visible(&mut e, 10_000);
-        assert!(!e.mouse.scrollbar_visible, "Auto + neither → hidden");
-    }
-
-    // A1 Task 3 — cases 7 + 8 (app-level: recompute_menu_bar / reconcile)
-
-    /// Case 7: recompute fires in Auto; in non-Auto it clears without firing.
-    #[test]
-    fn recompute_fires_and_is_mode_gated() {
-        use crate::editor::Editor;
-        use crate::config::MenuBarMode;
-
-        // Auto: past reveal deadline → revealed = true.
-        let mut e = Editor::new_from_text("x\n", None, (40, 8));
-        e.menu_bar_mode = MenuBarMode::Auto;
-        e.mouse.menu_reveal_due = Some(100);
-        crate::app::recompute_menu_bar(&mut e, 101);
-        assert!(e.mouse.menu_bar_revealed, "Auto: past reveal due must fire");
-        assert!(e.mouse.menu_reveal_due.is_none(), "reveal due cleared after firing");
-
-        // Pinned: past reveal deadline → cleared WITHOUT firing (defense-in-depth).
-        let mut e2 = Editor::new_from_text("x\n", None, (40, 8));
-        e2.menu_bar_mode = MenuBarMode::Pinned;
-        e2.mouse.menu_reveal_due = Some(100);
-        crate::app::recompute_menu_bar(&mut e2, 101);
-        assert!(!e2.mouse.menu_bar_revealed, "Pinned: due CLEARED, revealed NOT set");
-        assert!(e2.mouse.menu_reveal_due.is_none(), "due cleared in Pinned");
-
-        // Auto: past hide deadline → revealed = false.
-        let mut e3 = Editor::new_from_text("x\n", None, (40, 8));
-        e3.menu_bar_mode = MenuBarMode::Auto;
-        e3.mouse.menu_bar_revealed = true;
-        e3.mouse.menu_hide_due = Some(200);
-        crate::app::recompute_menu_bar(&mut e3, 201);
-        assert!(!e3.mouse.menu_bar_revealed, "Auto: past hide due must fire → unrevealed");
-        assert!(e3.mouse.menu_hide_due.is_none(), "hide due cleared after firing");
-    }
-
-    /// Case 8: capture-off clears all three menu-bar fields.
-    #[test]
-    fn capture_disable_clears_menu_bar_state() {
-        use crate::editor::Editor;
-        let mut e = Editor::new_from_text("x\n", None, (40, 8));
-        e.mouse_capture = true;
-        e.mouse.menu_bar_revealed = true;
-        e.mouse.menu_reveal_due = Some(500);
-        e.mouse.menu_hide_due = Some(900);
-        let mut buf = Vec::<u8>::new();
-        let mut applied = true;
-        e.mouse_capture = false;
-        crate::app::reconcile_mouse_capture(&mut e, &mut buf, &mut applied);
-        assert!(!e.mouse.menu_bar_revealed, "revealed cleared on capture disable");
-        assert!(e.mouse.menu_reveal_due.is_none(), "menu_reveal_due cleared on capture disable");
-        assert!(e.mouse.menu_hide_due.is_none(), "menu_hide_due cleared on capture disable");
-    }
-
-    /// Finding 1 regression: wheel event sets scrollbar_until_ms; recomputing
-    /// immediately after (now == t, t < t+1200) must yield visible == true.
-    /// A later recompute at t+1300 must yield false (bar fades after deadline).
-    #[test]
-    fn wheel_then_recompute_makes_scrollbar_visible() {
-        use crate::editor::Editor;
-        use crate::jobs::InlineExecutor;
-        use crate::registry::Registry;
-        use crossterm::event::{MouseEvent, MouseEventKind, KeyModifiers};
-        let text: String = (0..50).map(|i| format!("line {i}\n")).collect();
-        let mut e = Editor::new_from_text(&text, None, (80, 10));
-        crate::derive::rebuild(&mut e);
-        let reg = Registry::builtins();
-        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
-        let ex = InlineExecutor::default();
-        let t: u64 = 5000;
-        let clk = TestClock(t);
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let wheel = MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        };
-        // Dispatch the scroll event (sets scrollbar_until_ms = t + 1200).
-        crate::mouse::handle(&mut e, wheel, &reg, &km, &ex, &clk, &tx);
-        // Recompute at t (now < until) — bar must be visible.
-        crate::app::recompute_scrollbar_visible(&mut e, t);
-        assert!(e.mouse.scrollbar_visible, "scrollbar must be visible immediately after a scroll event");
-        // Recompute after the fade deadline — bar must hide.
-        crate::app::recompute_scrollbar_visible(&mut e, t + 1300);
-        assert!(!e.mouse.scrollbar_visible, "scrollbar must hide after scrollbar_until_ms expires");
-    }
-
     // -------------------------------------------------------------------------
     // Task 4 (Effort 5e): search overlay reduce() interception tests
     // -------------------------------------------------------------------------
@@ -4062,7 +2769,7 @@ mod tests {
         ed.active_mut().folds.toggle(doc.find("## A").unwrap());
         crate::derive::rebuild(&mut ed);
         let a1 = doc.find("### A1").unwrap();
-        crate::app::outline_jump_to(&mut ed, a1);
+        crate::outline_overlay::outline_jump_to(&mut ed, a1);
         assert_eq!(ed.active().document.selection.primary().head, a1);
         assert!(!ed.active().folds.folded().contains(&doc.find("## A").unwrap()));
     }
@@ -4456,50 +3163,6 @@ mod tests {
         crate::save::dispatch_save(&mut ctx); // no path → opens Save-As, NOT the dead stub
         assert!(matches!(e.minibuffer.as_ref().map(|m| m.kind),
             Some(crate::minibuffer::MinibufferKind::SaveAs)), "unnamed save opens the SaveAs minibuffer");
-    }
-
-    // -------------------------------------------------------------------------
-    // Effort 6, Task 2: scratch persistence
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn persist_session_captures_scratch_even_when_active_unnamed() {
-        use wordcartel_core::history::Clock;
-        struct C(u64); impl Clock for C { fn now_ms(&self) -> u64 { self.0 } }
-        let mut e = crate::editor::Editor::new_from_text("\n", None, (40, 10)); // active unnamed
-        e.install_scratch();
-        let sid = e.scratch_id.unwrap();
-        let (cs, edit) = crate::commands::build_multi_replace(&[(0, 0, "stash".into())], 0);
-        let txn = wordcartel_core::history::Transaction::new(cs)
-            .with_selection(wordcartel_core::selection::Selection::single(5));
-        e.by_id_mut(sid).unwrap().apply(txn, edit, wordcartel_core::history::EditKind::Other, &C(0));
-        let mut session = crate::state::SessionState::default();
-        let cfg = crate::config::Config::default();
-        crate::app::persist_session_for_test(&mut session, &e, &cfg, 1);
-        assert_eq!(session.scratch.as_ref().unwrap().text, "stash");
-    }
-
-    #[test]
-    fn persist_session_clears_stale_scratch_when_oversized() {
-        use wordcartel_core::history::Clock;
-        struct C(u64); impl Clock for C { fn now_ms(&self) -> u64 { self.0 } }
-        let mut e = crate::editor::Editor::new_from_text("\n", None, (40, 10));
-        e.install_scratch();
-        let sid = e.scratch_id.unwrap();
-        // Make the live scratch buffer oversized (> MAX_SESSION_BYTES).
-        let big = "x".repeat(crate::limits::MAX_SESSION_BYTES + 1);
-        let (cs, edit) = crate::commands::build_multi_replace(&[(0, 0, big)], 0);
-        let txn = wordcartel_core::history::Transaction::new(cs);
-        e.by_id_mut(sid).unwrap().apply(txn, edit, wordcartel_core::history::EditKind::Other, &C(0));
-        // Session carries a STALE scratch loaded from a previous launch.
-        let mut session = crate::state::SessionState {
-            scratch: Some(crate::state::ScratchState { text: "old stale".into(), cursor: 0 }),
-            ..Default::default()
-        };
-        let cfg = crate::config::Config::default();
-        crate::app::persist_session_for_test(&mut session, &e, &cfg, 1);
-        assert!(session.scratch.is_none(),
-            "oversized live scratch must CLEAR the stale loaded scratch, not resurrect it");
     }
 
     #[test]
@@ -5033,52 +3696,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // C4 Task 2: save_timeout_tick seam + quit-supersedes-close
+    // C4 Task 2: quit-supersedes-close (the save_timeout_tick seam moved to
+    // timers.rs in Effort H1 r2 — see timers::close_save_timeout_cancels_with_status).
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn close_save_timeout_cancels_with_status() {
-        // Drives the EXTRACTED helper directly (the timeout block lives in run(),
-        // unreachable via reduce). Arrange a CloseBuffer pending at t=0; call
-        // save_timeout_tick at SAVE_QUIT_TIMEOUT_MS+1 → pending cleared, status
-        // "save timed out — close cancelled", buffer open, NO prompt.
-        // Also pins the extraction is faithful: a Quit-variant pending re-raises
-        // quit_confirm through the same helper.
-        use crate::editor::{Editor, PostSaveAction, PendingAfterSave};
-        let p = std::env::temp_dir().join(format!("wc-c4t2-timeout-{}.md", std::process::id()));
-        std::fs::write(&p, "old\n").unwrap();
-        let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
-        e.active_mut().document.version = 1;
-        e.active_mut().document.saved_version = None; // dirty
-        let id = e.active().id;
-
-        // Arm pending for a CloseBuffer action at t=0.
-        e.pending_after_save = Some(PendingAfterSave {
-            buffer_id: id, version: 1,
-            action: PostSaveAction::CloseBuffer { id },
-            at_ms: 0,
-        });
-
-        // Call the extracted helper at a time past the timeout.
-        crate::app::save_timeout_tick(&mut e, crate::app::SAVE_QUIT_TIMEOUT_MS + 1);
-
-        assert!(e.pending_after_save.is_none(), "pending cleared on CloseBuffer timeout");
-        assert_eq!(e.status, "save timed out — close cancelled");
-        assert!(e.by_id(id).is_some(), "buffer NOT closed — timeout only cancels");
-        assert!(e.prompt.is_none(), "no re-prompt for a close timeout (spec D3)");
-
-        // Fidelity pin: Quit-variant pending re-raises quit_confirm through the same helper.
-        e.pending_after_save = Some(PendingAfterSave {
-            buffer_id: id, version: 1,
-            action: PostSaveAction::Quit,
-            at_ms: 0,
-        });
-        crate::app::save_timeout_tick(&mut e, crate::app::SAVE_QUIT_TIMEOUT_MS + 1);
-        assert!(e.pending_after_save.is_none(), "quit pending cleared");
-        assert!(e.prompt.is_some(), "Quit timeout re-raises quit_confirm prompt");
-
-        let _ = std::fs::remove_file(&p);
-    }
 
     #[test]
     fn quit_dispatch_cancels_pending_close() {
@@ -5226,61 +3846,6 @@ mod tests {
         assert_eq!(e.status, "keymap: cua (already active)");
     }
 
-    #[test]
-    fn switch_status_survives_the_rebuild() {
-        // Fable plan C1: the rebuild must NOT wipe the switch status set in the same
-        // reduce (no pending prefix in play → status untouched by the helper).
-        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
-        let reg = crate::registry::Registry::builtins();
-        e.active_keymap_preset = "wordstar".into();
-        e.keymap_rebuild = true;
-        e.status = "keymap: wordstar".into();
-        let t = crate::app::rebuild_keymap_if_requested(&mut e, &[], &reg);
-        assert!(t.is_some());
-        assert_eq!(e.status, "keymap: wordstar", "the pinned switch copy reaches the draw");
-    }
-
-    #[test]
-    fn patches_survive_the_switch() {
-        // Fable plan I3(c): a GLOBAL patch bind holds under both bases through the
-        // real helper (the same patch slice run() passes from cfg.keymap.patches).
-        use crate::keymap::{parse_seq, Resolution};
-        let patches = vec![crate::config::KeymapPatch {
-            bind: [("ctrl-g".to_string(), "copy".to_string())].into(),
-            ..Default::default() }];
-        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
-        let reg = crate::registry::Registry::builtins();
-        e.active_keymap_preset = "wordstar".into();
-        e.keymap_rebuild = true;
-        let t = crate::app::rebuild_keymap_if_requested(&mut e, &patches, &reg).unwrap();
-        let g = parse_seq("ctrl-g").unwrap();
-        assert!(matches!(t.resolve(&g), Resolution::Command(crate::registry::CommandId("copy"))),
-            "the global patch rides onto the new base");
-    }
-
-    #[test]
-    fn rebuild_seam_swaps_the_trie_and_clears_pending() {
-        // Manual seam: seed pending_keys with ctrl-k (Pending under BOTH presets), set the
-        // flag via dispatch, then run the same rebuild the loop runs; assert ctrl-w resolves
-        // to scroll_line_up afterward and pending_keys is EMPTY (spec I-3).
-        use crate::keymap::{parse_seq, Resolution};
-        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
-        let reg = crate::registry::Registry::builtins();
-        e.pending_keys = parse_seq("ctrl-k").unwrap();
-        e.status = "ctrl-k \u{2026}".into();
-        e.active_keymap_preset = "wordstar".into();
-        e.keymap_rebuild = true;
-        // The REAL production helper — the test proves run()'s code, not a copy (Fable I4).
-        let mut keymap = cua_keymap();
-        if let Some(t) = crate::app::rebuild_keymap_if_requested(&mut e, &[], &reg) {
-            keymap = t;
-        }
-        assert!(e.pending_keys.is_empty(), "pending prefix must not survive the rebuild");
-        assert!(e.status.is_empty(), "the pending '…' prompt is cleared");
-        let cw = parse_seq("ctrl-w").unwrap();
-        assert!(matches!(keymap.resolve(&cw), Resolution::Command(crate::registry::CommandId("scroll_line_up"))));
-    }
-
     // D1+A5 Task 4 — save_settings command sets the request flag -----------------
 
     #[test]
@@ -5340,163 +3905,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Task 6 (E3+E4): rederive_theme_if_requested seam test
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn rederive_arm_reresolves() {
-        // Seam test calling the REAL helper: toggling chrome_disposition + setting the flag,
-        // then calling rederive_theme_if_requested, flips the bar face between the §B.3
-        // full and zen Chrome bg hexes for flexoki-dark.
-        use wordcartel_core::theme::{ChromeDisposition, Color, SemanticElement};
-        use crate::theme_resolve::EnvSnapshot;
-        use crate::app::rederive_theme_if_requested;
-        use crate::settings::ThemeIdentity;
-
-        let tc = crate::config::ThemeConfig {
-            name: Some("flexoki-dark".into()),
-            ..Default::default()
-        };
-        // Simulate a truecolor terminal so derive_chrome produces Rgb values.
-        let env = EnvSnapshot {
-            no_color: false,
-            colorterm: Some("truecolor".into()),
-            term: Some("xterm-256color".into()),
-        };
-
-        let mut editor = Editor::new_from_text("x", None, (80, 24));
-        // Set identity to match tc so rederive uses flexoki-dark.
-        editor.theme_identity = ThemeIdentity::Builtin("flexoki-dark".into());
-
-        // Install flexoki-dark at Full via the real rederive path.
-        editor.chrome_disposition = ChromeDisposition::Full;
-        editor.theme_rederive = true;
-        let did = rederive_theme_if_requested(&mut editor, &tc, &env);
-        assert!(did, "flag was set — must return true");
-        assert!(!editor.theme_rederive, "flag must be cleared after rederive");
-        let full_bg = editor.theme.face(SemanticElement::Chrome).bg;
-        // §II.5 flexoki-dark FULL Chrome bg = #2a2828 (unified elevation ladder; flexoki is stable)
-        assert_eq!(full_bg, Some(Color::Rgb { r: 0x2a, g: 0x28, b: 0x28 }),
-            "flexoki-dark Full Chrome bg must match §II.5: got {full_bg:?}");
-
-        // Now switch to Zen and rederive.
-        editor.chrome_disposition = ChromeDisposition::Zen;
-        editor.theme_rederive = true;
-        let did2 = rederive_theme_if_requested(&mut editor, &tc, &env);
-        assert!(did2, "Zen rederive must return true");
-        assert!(!editor.theme_rederive, "flag must be cleared");
-        let zen_bg = editor.theme.face(SemanticElement::Chrome).bg;
-        // §II.5 flexoki-dark ZEN Chrome bg = #1e1c1c (unified elevation ladder; flexoki is stable)
-        assert_eq!(zen_bg, Some(Color::Rgb { r: 0x1e, g: 0x1c, b: 0x1c }),
-            "flexoki-dark Zen Chrome bg must match §II.5: got {zen_bg:?}");
-
-        // No-op when flag is not set.
-        editor.theme_rederive = false;
-        let did3 = rederive_theme_if_requested(&mut editor, &tc, &env);
-        assert!(!did3, "must return false when flag is not set");
-    }
-
-    /// Finding 1 (pre-merge gate): rederive must use the PICKER-COMMITTED identity, not
-    /// the startup config. Arrange: cfg.theme names flexoki-dark (or is empty), but
-    /// editor.theme_identity = Builtin("tokyo-night") — as set by a picker Enter commit.
-    /// After rederive the applied theme must be tokyo-night, and its ChromeOverlay must
-    /// flip between Full and Zen §B.3 values.
-    #[test]
-    fn rederive_respects_picker_committed_theme() {
-        use wordcartel_core::theme::{ChromeDisposition, Color, SemanticElement};
-        use crate::theme_resolve::EnvSnapshot;
-        use crate::app::rederive_theme_if_requested;
-        use crate::settings::ThemeIdentity;
-
-        // cfg.theme has flexoki-dark — this is the "startup config" that would revert if
-        // rederive ignores the live identity.
-        let tc = crate::config::ThemeConfig {
-            name: Some("flexoki-dark".into()),
-            ..Default::default()
-        };
-        let env = EnvSnapshot {
-            no_color: false,
-            colorterm: Some("truecolor".into()),
-            term: Some("xterm-256color".into()),
-        };
-
-        let mut editor = Editor::new_from_text("x", None, (80, 24));
-        // Simulate a picker commit: identity is now tokyo-night.
-        editor.theme_identity = ThemeIdentity::Builtin("tokyo-night".into());
-
-        // Full disposition rederive: must yield tokyo-night with Full ChromeOverlay.
-        editor.chrome_disposition = ChromeDisposition::Full;
-        editor.theme_rederive = true;
-        let did = rederive_theme_if_requested(&mut editor, &tc, &env);
-        assert!(did, "flag was set — must return true");
-        assert_eq!(editor.theme.name, "tokyo-night",
-            "rederive must apply the picker-committed identity, not the config name");
-        let full_overlay_bg = editor.theme.face(SemanticElement::ChromeOverlay).bg;
-        // §II.5 pin: tokyo FULL ChromeOverlay bg = #3d405a — the modal shares the dropdown
-        // (ChromeMuted) level-2 tone (3-tone ladder, user decision 2026-07-06).
-        assert_eq!(full_overlay_bg, Some(Color::Rgb { r: 0x3d, g: 0x40, b: 0x5a }),
-            "tokyo-night Full ChromeOverlay bg (§II.5 final): got {full_overlay_bg:?}");
-
-        // Zen disposition rederive: same identity, overlay should collapse.
-        editor.chrome_disposition = ChromeDisposition::Zen;
-        editor.theme_rederive = true;
-        let did2 = rederive_theme_if_requested(&mut editor, &tc, &env);
-        assert!(did2, "Zen rederive must return true");
-        assert_eq!(editor.theme.name, "tokyo-night", "identity preserved across disposition change");
-        let zen_overlay_bg = editor.theme.face(SemanticElement::ChromeOverlay).bg;
-        // §II.5 pin: tokyo ZEN ChromeOverlay bg = #2c2d40 (= ZEN ChromeMuted bg — 3-tone ladder).
-        assert_eq!(zen_overlay_bg, Some(Color::Rgb { r: 0x2c, g: 0x2d, b: 0x40 }),
-            "tokyo-night Zen ChromeOverlay bg (§II.5 final): got {zen_overlay_bg:?}");
-    }
-
-    // Task 4 — status_line_visible
-
-    /// `status_line_visible` must return false under Auto with no message/reveal,
-    /// force-true on a non-empty status message (no-silent-UI), and true under On always.
-    #[test]
-    fn status_line_visible_forces_on_message_even_in_auto() {
-        use crate::config::TransientMode;
-        let mut e = Editor::new_from_text("x\n", None, (40, 8));
-        e.status_line_mode = TransientMode::Auto;
-        e.mouse.status_revealed = false;
-        e.status.clear();
-        assert!(!crate::app::status_line_visible(&e), "Auto idle + no message → info line hidden (calm)");
-        e.status = "saved".into();
-        assert!(crate::app::status_line_visible(&e), "a message force-reveals even under Auto (no-silent-UI)");
-        e.status.clear();
-        e.mouse.status_revealed = true;
-        assert!(crate::app::status_line_visible(&e), "Auto + dwell-revealed → visible");
-        e.status_line_mode = TransientMode::On;
-        e.mouse.status_revealed = false;
-        assert!(crate::app::status_line_visible(&e), "On → always visible");
-    }
-
-    /// Finding 2 (pre-merge gate): preview_selected_theme must apply the Ansi16 sentinel-fill
-    /// policy so a preview in an Ansi16 terminal shows the fixed table (DarkGray) not a
-    /// quantized derived value. Arrange: editor.depth = Ansi16, picker row = flexoki-dark.
-    /// flexoki-dark canvas (#100f0f) quantizes to Black → dark arm: Chrome bg = DarkGray.
-    #[test]
-    fn preview_applies_ansi16_policy() {
-        use wordcartel_core::theme::{Depth, Color, SemanticElement};
-        use crate::app::preview_selected_theme;
-
-        let mut editor = Editor::new_from_text("x", None, (80, 24));
-        editor.depth = Depth::Ansi16;
-        // Open a picker with flexoki-dark as the selected row.
-        editor.open_theme_picker();
-        {
-            let tp = editor.theme_picker.as_mut().unwrap();
-            tp.rows = vec!["flexoki-dark".to_string()];
-            tp.selected = 0;
-        }
-        preview_selected_theme(&mut editor);
-        let chrome_bg = editor.theme.face(SemanticElement::Chrome).bg;
-        // Dark canvas arm: Chrome bg must be DarkGray (fixed table), not a quantized derived value.
-        assert_eq!(chrome_bg, Some(Color::DarkGray),
-            "Ansi16 preview must apply sentinel-fill policy: Chrome bg = DarkGray, got {chrome_bg:?}");
-    }
-
     #[test]
     fn first_frame_settle_refreshes_layout_for_offscreen_caret() {
         use crate::editor::Editor;
@@ -5517,5 +3925,126 @@ mod tests {
             Some(scroll_after),
             "layout cache must be rebuilt for the post-ensure_visible scroll (T5)"
         );
+    }
+
+    /// §8.1-A guardrail: a command dispatched via the palette stage returns through the
+    /// stage micro-epilogue (app.rs:584) and SKIPS the version-change hook (app.rs:1209),
+    /// so the edit bumps `document.version` WITHOUT setting `last_edit_at`. Do not unify
+    /// the stage return with the main epilogue — this asymmetry is behavior.
+    #[test]
+    fn palette_dispatched_edit_skips_version_hook() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("alpha\nbeta\n", None, (80, 24));
+        e.active_mut().diagnostics = crate::diagnostics_run::DiagStore::new(); // clean debounce baseline
+        let before_ver = e.active().document.version;
+        assert!(e.active().last_edit_at.is_none(), "precondition: no prior edit timestamp");
+        // One deterministic palette row for the synchronous `delete_line` editing command.
+        e.palette = Some(crate::palette::Palette::default());
+        {
+            let p = e.palette.as_mut().unwrap();
+            p.rows = vec![crate::palette::PaletteRow {
+                id: crate::registry::CommandId("delete_line"),
+                label: "Delete Line".into(),
+                chord: String::new(),
+                buffer: None,
+            }];
+            p.selected = 0;
+        }
+        let reg = Registry::builtins(); let km = cua_keymap();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let enter = Event::Key(KeyEvent { code: KeyCode::Enter, modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert!(e.palette.is_none(), "palette dispatch closes the overlay");
+        assert_ne!(e.active().document.version, before_ver, "delete_line must bump the version");
+        assert!(e.active().last_edit_at.is_none(),
+            "palette-dispatched edit must NOT set last_edit_at (skipped version hook — §8.1-A)");
+    }
+
+    /// §8.1-C guardrail: the search stage's Esc arm (app.rs:926) returns WITHOUT draining
+    /// the executor, unlike the text-edit arms (app.rs:958). fold_and_continue (T7) must be
+    /// applied ONLY to sites that drain today — never retrofit a drain onto Esc/Alt+a.
+    #[test]
+    fn search_esc_does_not_drain_executor() {
+        use crate::editor::Editor; use crate::jobs::{Executor, InlineExecutor, Job, JobOutcome};
+        use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        struct DrainSpy { inner: InlineExecutor, drains: std::cell::Cell<usize> }
+        impl Executor for DrainSpy {
+            fn dispatch(&self, job: Job) { self.inner.dispatch(job); }
+            fn drain(&self) -> Vec<JobOutcome> { self.drains.set(self.drains.get() + 1); self.inner.drain() }
+        }
+        let ex = DrainSpy { inner: InlineExecutor::default(), drains: std::cell::Cell::new(0) };
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        e.open_search(crate::search_overlay::Phase::Find, 0);
+        let reg = Registry::builtins(); let km = cua_keymap(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mk = |code: KeyCode| Event::Key(KeyEvent { code, modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        // A text-insert key DOES drain (app.rs:958) — establishes the spy works.
+        crate::app::reduce(Msg::Input(mk(KeyCode::Char('a'))), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(ex.drains.get(), 1, "a search text-insert key drains once");
+        // Esc returns WITHOUT draining (app.rs:926) — the count must not advance.
+        crate::app::reduce(Msg::Input(mk(KeyCode::Esc)), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(ex.drains.get(), 1, "search Esc must NOT drain the executor (§8.1-C)");
+        assert!(e.search.is_none(), "Esc cancels the search overlay");
+    }
+
+    /// §8.1-E guardrail: a clean, settled, no-overlay editor arms NO timed deadline — the
+    /// run loop blocks on the 3600 s fallback (idle is free). Expressed against the current
+    /// per-term gates; T8 re-expresses it as timers::next_wake(&e, now) == None.
+    #[test]
+    fn settled_editor_arms_no_deadline() {
+        use crate::editor::Editor;
+        let e = Editor::new_from_text("hello\n", None, (80, 24));
+        let now = 10_000u64;
+        assert!(!e.active().document.dirty(), "precondition: a fresh buffer is not dirty");
+        let swap_deadline = if crate::swap::pending(
+            e.active().document.dirty(), e.active().document.version, e.active().swapped_version,
+        ) && !e.active().swap_in_flight {
+            crate::swap::next_deadline_ms(now, e.active().last_edit_at, e.active().last_swap_at)
+        } else { None };
+        let sq_deadline = e.pending_after_save.as_ref().map(|p| p.at_ms.saturating_add(5_000));
+        let sb_deadline = if e.mouse.scrollbar_until_ms > now { Some(e.mouse.scrollbar_until_ms) } else { None };
+        let menu_deadline = e.mouse.menu_reveal_due.or(e.mouse.menu_hide_due);
+        let sb_dwell = e.mouse.scrollbar_reveal_due.or(e.mouse.scrollbar_hide_due);
+        let status_dwell = e.mouse.status_reveal_due.or(e.mouse.status_hide_due);
+        let diag_deadline = if e.active().diagnostics.in_flight_version.is_none() {
+            e.active().diagnostics.recheck_due_at } else { None };
+        let reconcile_deadline = if e.active().reconcile.in_flight_version.is_none() {
+            e.active().reconcile.due_at } else { None };
+        let deadline = crate::diagnostics_run::next_deadline(&[
+            swap_deadline, sq_deadline, sb_deadline, menu_deadline,
+            sb_dwell, status_dwell, diag_deadline, reconcile_deadline,
+        ]);
+        assert_eq!(deadline, None, "a settled no-overlay editor must arm no deadline (idle is free — §8.1-E)");
+    }
+
+    /// §8.1-H guardrail: outline MOTION keys (Up/Down/Page/Home/End) do NOT touch `query`
+    /// or re-run set_query — only the text-edit arms (Char/Backspace) re-query. The list-nav
+    /// unification (T10) must keep the query re-run OUTSIDE the shared motion helper.
+    #[test]
+    fn outline_motion_does_not_requery() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("# Top\nintro\n## A\nbody\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_outline();
+        assert!(e.outline.as_ref().unwrap().rows.len() >= 2, "precondition: two outline rows");
+        let reg = Registry::builtins(); let km = cua_keymap();
+        let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mk = |code: KeyCode| Event::Key(KeyEvent { code, modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(mk(KeyCode::Down)), &mut e, &reg, &km, &ex, &clk, &tx);
+        {
+            let o = e.outline.as_ref().unwrap();
+            assert_eq!(o.selected, 1, "Down advances the selection");
+            assert!(o.query.is_empty(), "motion must NOT populate the query (§8.1-H)");
+        }
+        crate::app::reduce(Msg::Input(mk(KeyCode::Char('A'))), &mut e, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.outline.as_ref().unwrap().query, "A", "a Char edit re-queries the outline");
     }
 }

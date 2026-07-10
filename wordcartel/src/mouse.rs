@@ -109,13 +109,13 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
             // sentinel CommandId("palette").
             let hit: Option<(crate::registry::CommandId, Option<crate::editor::BufferId>)> = {
                 let p = editor.palette.as_ref().unwrap();
-                crate::render::palette_row_at(area, p, ev.column, ev.row)
+                crate::chrome_geom::palette_row_at(area, p, ev.column, ev.row)
                     .and_then(|idx| p.rows.get(idx).map(|r| (r.id, r.buffer)))
             };
             // was the click inside the overlay rect at all?
             let inside = {
                 let row_count = editor.palette.as_ref().unwrap().rows.len();
-                let r = crate::render::palette_overlay_rect(area, row_count);
+                let r = crate::chrome_geom::palette_overlay_rect(area, row_count);
                 ev.column >= r.x && ev.column < r.x + r.width && ev.row >= r.y && ev.row < r.y + r.height
             };
             if let Some((id, buffer)) = hit {
@@ -153,7 +153,7 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
                     // item-row budget every frame (list_window two-layer invariant), so this
                     // estimate need not reserve the indicator row.  Derive from menu_area so
                     // keep_visible scrolls at the same boundary the dropdown rect and painter use.
-                    let avail_below = crate::render::menu_area(area).height.saturating_sub(1) as usize;
+                    let avail_below = crate::chrome_geom::menu_area(area).height.saturating_sub(1) as usize;
                     let list_h = n.min(15).min(avail_below);
                     crate::list_window::keep_visible(m.highlighted, n, list_h, &mut m.scroll_top);
                 }
@@ -165,17 +165,17 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
             let scroll_top = editor.menu.as_ref().unwrap().scroll_top;
             // Both bar and dropdown hit-tests must use menu_area (frame minus the status row)
             // so the dropdown windowing (avail_below) is identical to the painter's — no drift.
-            let hit_area = crate::render::menu_area(area);
+            let hit_area = crate::chrome_geom::menu_area(area);
             // scoped borrows → owned hit results
             let bar_hit: Option<usize> = {
                 let groups = &editor.menu.as_ref().unwrap().groups;
-                crate::render::menu_bar_layout(hit_area, groups).into_iter()
+                crate::chrome_geom::menu_bar_layout(hit_area, groups).into_iter()
                     .find(|(_, r)| ev.column >= r.x && ev.column < r.x + r.width && ev.row == r.y)
                     .map(|(cat, _)| cat)
             };
             let row_id: Option<crate::registry::CommandId> = {
                 let groups = &editor.menu.as_ref().unwrap().groups;
-                crate::render::menu_dropdown_row_at(hit_area, groups, open, scroll_top, ev.column, ev.row)
+                crate::chrome_geom::menu_dropdown_row_at(hit_area, groups, open, scroll_top, ev.column, ev.row)
                     .and_then(|row| groups.get(open).and_then(|g| g.1.get(row)).map(|(_, id)| *id))
             };
             // all borrows dropped — now mutate/dispatch/clear
@@ -204,17 +204,17 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
                 }
                 crate::app::keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
             }
-            crate::app::preview_selected_theme(editor);
+            crate::theme_cmds::preview_selected_theme(editor);
         }
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
             // Scoped borrows → owned hit values before any mutation.
             let row_idx: Option<usize> = {
                 let tp = editor.theme_picker.as_ref().unwrap();
-                crate::render::theme_picker_row_at(area, tp, ev.column, ev.row)
+                crate::chrome_geom::theme_picker_row_at(area, tp, ev.column, ev.row)
             };
             let inside = {
                 let tp = editor.theme_picker.as_ref().unwrap();
-                let r = crate::render::palette_overlay_rect(area, tp.rows.len());
+                let r = crate::chrome_geom::palette_overlay_rect(area, tp.rows.len());
                 ev.column >= r.x && ev.column < r.x + r.width
                     && ev.row >= r.y && ev.row < r.y + r.height
             };
@@ -226,8 +226,8 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
                     tp.selected = idx;
                     crate::app::keep_overlay_visible(ah, idx, tp.rows.len(), &mut tp.scroll_top);
                 }
-                crate::app::preview_selected_theme(editor);
-                crate::app::commit_theme_picker(editor);
+                crate::theme_cmds::preview_selected_theme(editor);
+                crate::theme_cmds::commit_theme_picker(editor);
             } else if !inside {
                 // Click-away: restore the original theme and close — same as Esc.
                 if let Some(tp) = editor.theme_picker.take() {
@@ -253,11 +253,11 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
             // Scoped borrows → owned hit values before any mutation.
             let row_idx: Option<usize> = {
                 let fb = editor.file_browser.as_ref().unwrap();
-                crate::render::file_browser_row_at(area, fb, ev.column, ev.row)
+                crate::chrome_geom::file_browser_row_at(area, fb, ev.column, ev.row)
             };
             let inside = {
                 let fb = editor.file_browser.as_ref().unwrap();
-                let r = crate::render::palette_overlay_rect(area, fb.entries.len());
+                let r = crate::chrome_geom::palette_overlay_rect(area, fb.entries.len());
                 ev.column >= r.x && ev.column < r.x + r.width
                     && ev.row >= r.y && ev.row < r.y + r.height
             };
@@ -269,7 +269,7 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
                     fb.selected = idx;
                     crate::app::keep_overlay_visible(ah, idx, fb.entries.len(), &mut fb.scroll_top);
                 }
-                crate::app::file_browser_enter(editor);
+                crate::file_browser::file_browser_enter(editor);
             } else if !inside {
                 editor.file_browser = None; // click-away closes
             }
@@ -293,11 +293,11 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
             // Scoped borrows → owned hit values before any mutation.
             let row_idx: Option<usize> = {
                 let o = editor.outline.as_ref().unwrap();
-                crate::render::outline_row_at(area, o, ev.column, ev.row)
+                crate::chrome_geom::outline_row_at(area, o, ev.column, ev.row)
             };
             let inside = {
                 let o = editor.outline.as_ref().unwrap();
-                let r = crate::render::palette_overlay_rect(area, o.rows.len());
+                let r = crate::chrome_geom::palette_overlay_rect(area, o.rows.len());
                 ev.column >= r.x && ev.column < r.x + r.width
                     && ev.row >= r.y && ev.row < r.y + r.height
             };
@@ -320,7 +320,7 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
                     .and_then(|o| o.rows.get(o.selected))
                     .map(|r| r.byte);
                 if let Some(byte) = target {
-                    crate::app::outline_jump_to(editor, byte);
+                    crate::outline_overlay::outline_jump_to(editor, byte);
                 }
             } else if !inside {
                 editor.outline = None; // click-away closes
@@ -346,11 +346,11 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
             // Scoped borrows → owned hit values before any mutation.
             let row_idx: Option<usize> = {
                 let d = editor.diag.as_ref().unwrap();
-                crate::render::diag_row_at(area, d, ev.column, ev.row)
+                crate::chrome_geom::diag_row_at(area, d, ev.column, ev.row)
             };
             let inside = {
                 let d = editor.diag.as_ref().unwrap();
-                let r = crate::render::palette_overlay_rect(area, d.row_count());
+                let r = crate::chrome_geom::palette_overlay_rect(area, d.row_count());
                 ev.column >= r.x && ev.column < r.x + r.width
                     && ev.row >= r.y && ev.row < r.y + r.height
             };
@@ -377,7 +377,7 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
             // Scoped borrow → owned action (PromptAction: Copy) before mutable dispatch.
             let action: Option<crate::prompt::PromptAction> = editor.prompt.as_ref()
-                .and_then(|p| crate::render::prompt_choice_at(area, p, ev.column, ev.row));
+                .and_then(|p| crate::chrome_geom::prompt_choice_at(area, p, ev.column, ev.row));
             if let Some(action) = action {
                 // resolve_prompt clears editor.prompt in its arms — do NOT clear it here.
                 crate::prompts::resolve_prompt(action, editor, ex, clock, msg_tx);
@@ -495,7 +495,7 @@ pub fn handle(
             if let CellHit::MenuBar = hit {
                 // Inactive bar: open the dropdown AT the clicked category (hydrated
                 // by reduce's post-handle hydrate_overlays call).
-                let cats_hit = crate::render::menu_bar_layout_cats(area, &crate::registry::MENU_ORDER)
+                let cats_hit = crate::chrome_geom::menu_bar_layout_cats(area, &crate::registry::MENU_ORDER)
                     .into_iter()
                     .find(|(_, r)| ev.column >= r.x && ev.column < r.x + r.width && ev.row == r.y)
                     .map(|(i, _)| i);
@@ -769,7 +769,7 @@ mod tests {
         let rows = &e.palette.as_ref().unwrap().rows;
         let idx = rows.iter().position(|r| r.id == crate::registry::CommandId("move_right")).unwrap();
         let area = ratatui::layout::Rect::new(0, 0, 80, 24);
-        let rect = crate::render::palette_overlay_rect(area, e.palette.as_ref().unwrap().rows.len());
+        let rect = crate::chrome_geom::palette_overlay_rect(area, e.palette.as_ref().unwrap().rows.len());
         let click_row = rect.y + 2 + idx as u16; // list starts at ov_y+2
         let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };
         handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
@@ -802,7 +802,7 @@ mod tests {
         assert!(scroll_top > 0, "scroll_top must be non-zero for this test to be meaningful");
         e.palette = Some(p);
         let area = ratatui::layout::Rect::new(0, 0, 80, 24);
-        let rect = crate::render::palette_overlay_rect(area, e.palette.as_ref().unwrap().rows.len());
+        let rect = crate::chrome_geom::palette_overlay_rect(area, e.palette.as_ref().unwrap().rows.len());
         // Click the FIRST visible list row (visual row 0, absolute row scroll_top).
         let click_row = rect.y + 2; // ov_y + 2 = first list entry
         let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };
@@ -909,7 +909,7 @@ mod tests {
         let (w, h) = e.active().view.area;
         let area = ratatui::layout::Rect::new(0, 0, w, h);
         let menu_area = ratatui::layout::Rect::new(area.x, area.y, w, h.saturating_sub(1));
-        let bar = crate::render::menu_bar_layout_cats(menu_area, &crate::registry::MENU_ORDER);
+        let bar = crate::chrome_geom::menu_bar_layout_cats(menu_area, &crate::registry::MENU_ORDER);
         let (_, format_rect) = bar.iter().find(|(i, _)| *i == 2).expect("Format at index 2");
         let col = format_rect.x + 1; // somewhere inside the label
 
@@ -1202,7 +1202,7 @@ mod tests {
         assert_eq!(e.palette.as_ref().unwrap().rows.len(), 2,
             "precondition: exactly 2 rows in the Buffers palette");
         let area = ratatui::layout::Rect::new(0, 0, 80, 24);
-        let rect = crate::render::palette_overlay_rect(area, 2);
+        let rect = crate::chrome_geom::palette_overlay_rect(area, 2);
         // Click the second list row (rows[1] = scratch) at ov_y + 2 + 1.
         let click_row = rect.y + 2 + 1;
         let d = MouseEvent {
@@ -1282,7 +1282,7 @@ mod tests {
         let target = e.theme_picker.as_ref().unwrap().rows.iter()
             .position(|n| n == "forever-blue-jeans-dark").unwrap();
         let area = ratatui::layout::Rect::new(0, 0, 80, 24);
-        let rect = crate::render::palette_overlay_rect(area, e.theme_picker.as_ref().unwrap().rows.len());
+        let rect = crate::chrome_geom::palette_overlay_rect(area, e.theme_picker.as_ref().unwrap().rows.len());
         let click_row = rect.y + 2 + target as u16; // list starts ov_y+2 (scroll_top 0)
         let (reg, ex, clk, tx, km) = ctx();
         let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };
@@ -1321,7 +1321,7 @@ mod tests {
         e.open_outline();
         let area = ratatui::layout::Rect::new(0, 0, 80, 24);
         let rows_len = e.outline.as_ref().unwrap().rows.len();
-        let rect = crate::render::palette_overlay_rect(area, rows_len);
+        let rect = crate::chrome_geom::palette_overlay_rect(area, rows_len);
         let click_row = rect.y + 2 + 1; // second heading "## B"
         let target_byte = e.outline.as_ref().unwrap().rows[1].byte;
         let (reg, ex, clk, tx, km) = ctx();
@@ -1395,7 +1395,7 @@ mod tests {
         let (reg, ex, clk, tx, km) = ctx();
         // Diag list starts at ov_y + 1 (no query row). Click first row (index 0 = "the").
         let area = ratatui::layout::Rect::new(0, 0, 80, 24);
-        let r = crate::render::palette_overlay_rect(area, e.diag.as_ref().unwrap().row_count());
+        let r = crate::chrome_geom::palette_overlay_rect(area, e.diag.as_ref().unwrap().row_count());
         let d = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: r.x + 1,
@@ -1571,7 +1571,7 @@ mod tests {
             .position(|en| en.name == "subdir" && en.is_dir)
             .expect("subdir must appear in entries");
         let area = ratatui::layout::Rect::new(0, 0, 80, 24);
-        let rect = crate::render::palette_overlay_rect(area, e.file_browser.as_ref().unwrap().entries.len());
+        let rect = crate::chrome_geom::palette_overlay_rect(area, e.file_browser.as_ref().unwrap().entries.len());
         let click_row = rect.y + 2 + idx as u16; // scroll_top is 0
         let (reg, ex, clk, tx, km) = ctx();
         let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };

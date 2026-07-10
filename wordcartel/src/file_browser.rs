@@ -3,6 +3,8 @@
 //! Mirrors the theme picker (theme_picker.rs) / command palette.
 
 use std::path::PathBuf;
+use crate::app::Msg;
+use crossterm::event::Event;
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -52,6 +54,106 @@ pub fn rebuild_entries(fb: &mut FileBrowser) {
         fb.selected = fb.entries.len().saturating_sub(1);
     }
     fb.scroll_top = fb.scroll_top.min(fb.entries.len().saturating_sub(1));
+}
+
+/// Execute the selected file-browser entry — the shared Enter path for the keyboard
+/// Enter arm and the mouse click-to-commit arm. Descends into a directory (incl. ".."),
+/// guarding against unreadable targets, or opens a file through the dirty-guard path.
+pub(crate) fn file_browser_enter(editor: &mut crate::editor::Editor) {
+    let chosen = editor.file_browser.as_ref().and_then(|fb| {
+        fb.entries.get(fb.selected).map(|e| (e.name.clone(), e.is_dir))
+    });
+    if let Some((name, is_dir)) = chosen {
+        if is_dir {
+            let target = editor.file_browser.as_ref().map(|fb| {
+                if name == ".." {
+                    fb.dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| fb.dir.clone())
+                } else {
+                    fb.dir.join(&name)
+                }
+            });
+            if let Some(target) = target {
+                // §3: check readability BEFORE committing fb.dir.
+                if std::fs::read_dir(&target).is_ok() {
+                    if let Some(fb) = editor.file_browser.as_mut() {
+                        fb.dir = target;
+                        fb.query.clear();
+                        fb.selected = 0;
+                        fb.scroll_top = 0; // A6: reset with selected to avoid out-of-order slice
+                        crate::file_browser::rebuild_entries(fb);
+                    }
+                } else {
+                    editor.status = format!("cannot read directory: {}", target.display());
+                    // stay in prior dir — do NOT mutate fb.dir
+                }
+            }
+        } else {
+            let path = editor.file_browser.as_ref().unwrap().dir.join(&name);
+            editor.file_browser = None;
+            crate::workspace::open_as_new_buffer(editor, &path);
+        }
+    }
+}
+
+/// File browser overlay intercepts KEY INPUT and PASTE. Non-key, non-paste messages
+/// fall through to normal handling while the browser stays open (mirrors theme_picker).
+pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor,
+    ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) -> crate::app::Handled {
+    if editor.file_browser.is_none() { return crate::app::Handled::Pass(msg); }
+    // Drop an async clipboard-paste result that arrives while the browser is open —
+    // it must not land in the document behind the overlay (Codex I6, mirror palette).
+    if matches!(&msg, Msg::ClipboardPaste { .. }) {
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+    }
+    if let Msg::Input(Event::Paste(text)) = &msg {
+        let ah = editor.active().view.area.1;
+        if let Some(fb) = editor.file_browser.as_mut() {
+            fb.query.push_str(text);
+            crate::file_browser::rebuild_entries(fb);
+            crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+        }
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+    }
+    if let Msg::Input(Event::Key(k)) = &msg {
+        if k.kind == crossterm::event::KeyEventKind::Press {
+            use crossterm::event::KeyCode;
+            match k.code {
+                KeyCode::Esc => { editor.file_browser = None; }
+                KeyCode::Enter => { file_browser_enter(editor); }
+                c if crate::list_window::list_nav_key(c).is_some() => {
+                    let ah = editor.active().view.area.1;
+                    if let Some(fb) = editor.file_browser.as_mut() {
+                        crate::list_window::apply_list_nav(crate::list_window::list_nav_key(c).unwrap(),
+                            ah, fb.entries.len(), &mut fb.selected, &mut fb.scroll_top);
+                    }
+                }
+                KeyCode::Backspace => {
+                    let ah = editor.active().view.area.1;
+                    if let Some(fb) = editor.file_browser.as_mut() {
+                        fb.query.pop();
+                        crate::file_browser::rebuild_entries(fb);
+                        crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+                    }
+                }
+                KeyCode::Char(c)
+                    if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                        && !k.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
+                {
+                    let ah = editor.active().view.area.1;
+                    if let Some(fb) = editor.file_browser.as_mut() {
+                        fb.query.push(c);
+                        crate::file_browser::rebuild_entries(fb);
+                        crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+                    }
+                }
+                _ => {}
+            }
+        }
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+    }
+    // Non-key msg falls through to normal handling while the browser stays open.
+    crate::app::Handled::Pass(msg)
 }
 
 #[cfg(test)]

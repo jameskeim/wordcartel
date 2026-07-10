@@ -1,7 +1,68 @@
-// wordcartel/src/input.rs — CUA keymap: KeyEvent → Option<Command>.
+// wordcartel/src/input.rs — normal-mode key handling: `handle_key` (keymap chord
+// resolve → registry command dispatch → printable fallthrough), plus the CUA keymap
+// translation table (KeyEvent → Option<Command>).
 //
 // Only handles KeyEventKind::Press (ignores Release/Repeat) to avoid
 // double-input on terminals that emit both.
+
+/// Normal-mode key dispatch: keymap chord resolve → registry command dispatch →
+/// printable-character fallthrough. Extracted verbatim from `reduce`'s
+/// `Msg::Input(Event::Key(k))` arm body (Effort H1 T9); the call site still runs inside
+/// `reduce`'s normal `match`, so the version-hook epilogue (spec §8.1-A) still sees
+/// key-driven edits — this is NOT given interception early-return semantics.
+pub(crate) fn handle_key(
+    k: crossterm::event::KeyEvent,
+    editor: &mut crate::editor::Editor,
+    reg: &crate::registry::Registry,
+    keymap: &crate::keymap::KeyTrie,
+    ex: &dyn crate::jobs::Executor,
+    clock: &dyn wordcartel_core::history::Clock,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+) {
+    // Esc precedence (Codex CRITICAL): prompt/minibuffer Esc are handled in their
+    // interception blocks ABOVE this point. Here in normal mode the order is
+    // pending-cancel > filter-cancel. This arm SUBSUMES the old standalone
+    // filter-cancel Esc check (removed above). Esc is reserved for cancel/dismiss
+    // in v1 (not routed to the keymap).
+    if k.code == crossterm::event::KeyCode::Esc {
+        if !editor.pending_keys.is_empty() {
+            editor.pending_keys.clear();
+            editor.status.clear();
+        } else if editor.filter_in_flight.is_some() {
+            editor.filter_in_flight.take().unwrap().cancel();
+            editor.status = "cancelling…".into();
+        }
+    } else if let Some(chord) = crate::keymap::from_key_event(k) {
+        editor.pending_keys.push(chord);
+        match keymap.resolve(&editor.pending_keys) {
+            crate::keymap::Resolution::Command(id) => {
+                editor.pending_keys.clear();
+                editor.status.clear();
+                let mut ctx = crate::registry::Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
+                reg.dispatch(id, &mut ctx);
+                crate::app::hydrate_overlays(editor, reg, keymap);
+            }
+            crate::keymap::Resolution::Pending => {
+                editor.status = format!("{} …", crate::keymap::chords_display(&editor.pending_keys));
+            }
+            crate::keymap::Resolution::None => {
+                let was_single = editor.pending_keys.len() == 1;
+                editor.pending_keys.clear();
+                editor.status.clear();
+                // Printable fallthrough: single unmodified printable → literal insert.
+                if was_single {
+                    if let crossterm::event::KeyCode::Char(c) = k.code {
+                        if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                            && !k.modifiers.contains(crossterm::event::KeyModifiers::ALT)
+                        {
+                            crate::commands::run(crate::commands::Command::InsertChar(c), editor, clock);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};

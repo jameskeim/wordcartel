@@ -1,6 +1,8 @@
 use crate::registry::{Registry, CommandId};
 use crate::keymap::KeyTrie;
 use crate::editor::BufferId;
+use crate::app::Msg;
+use crossterm::event::Event;
 use nucleo_matcher::{Matcher, Config};
 use nucleo_matcher::pattern::{Pattern, CaseMatching, Normalization};
 
@@ -87,6 +89,107 @@ pub fn rebuild_rows(p: &mut Palette, reg: &Registry, keymap: &KeyTrie) {
     }
     if p.selected >= p.rows.len() { p.selected = p.rows.len().saturating_sub(1); }
     p.scroll_top = p.scroll_top.min(p.rows.len().saturating_sub(1));
+}
+
+/// Palette overlay intercepts KEY INPUT and PASTE. Non-key, non-paste messages
+/// (FilterDone, JobDone, Tick) fall through to normal handling while the
+/// palette stays open.
+pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor,
+    reg: &crate::registry::Registry, keymap: &crate::keymap::KeyTrie,
+    ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) -> crate::app::Handled {
+    if editor.palette.is_none() { return crate::app::Handled::Pass(msg); }
+    if matches!(&msg, Msg::ClipboardPaste { .. }) {
+        // Drop an async clipboard-paste result that arrives while the palette is
+        // open — it must not land in the document behind the overlay.
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+    }
+    if let Msg::Input(Event::Paste(text)) = msg {
+        let ah = editor.active().view.area.1;
+        if let Some(p) = editor.palette.as_mut() {
+            p.query.insert_str(p.cursor, &text);
+            p.cursor += text.len();
+            crate::palette::rebuild_rows(p, reg, keymap);
+            crate::app::keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
+        }
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+    }
+    if let Msg::Input(Event::Key(k)) = &msg {
+        if k.kind == crossterm::event::KeyEventKind::Press {
+            match k.code {
+                crossterm::event::KeyCode::Esc => {
+                    editor.palette = None;
+                }
+                crossterm::event::KeyCode::Enter => {
+                    let row = editor.palette.as_ref()
+                        .and_then(|p| p.rows.get(p.selected).cloned());
+                    if let Some(row) = row {
+                        if let Some(bid) = row.buffer {
+                            // Buffer-switcher row: dismiss palette, jump to buffer.
+                            editor.palette = None;
+                            if let Some(idx) = editor.buffers.iter().position(|b| b.id == bid) {
+                                crate::workspace::switch_to(editor, idx);
+                            }
+                        } else {
+                            // Command-palette row: dispatch through registry.
+                            crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, row.id);
+                        }
+                    }
+                }
+                c if crate::list_window::list_nav_key(c).is_some() => {
+                    let ah = editor.active().view.area.1;
+                    if let Some(p) = editor.palette.as_mut() {
+                        crate::list_window::apply_list_nav(crate::list_window::list_nav_key(c).unwrap(),
+                            ah, p.rows.len(), &mut p.selected, &mut p.scroll_top);
+                    }
+                }
+                crossterm::event::KeyCode::Backspace => {
+                    let ah = editor.active().view.area.1;
+                    if let Some(p) = editor.palette.as_mut() {
+                        if p.cursor > 0 {
+                            // remove the char before cursor (byte-safe for ASCII labels)
+                            let byte_pos = p.query[..p.cursor].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                            p.query.remove(byte_pos);
+                            p.cursor = byte_pos;
+                        }
+                        crate::palette::rebuild_rows(p, reg, keymap);
+                        crate::app::keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
+                    }
+                }
+                crossterm::event::KeyCode::Left => {
+                    if let Some(p) = editor.palette.as_mut() {
+                        if p.cursor > 0 {
+                            p.cursor -= p.query[..p.cursor].char_indices().next_back().map(|(_, c)| c.len_utf8()).unwrap_or(0);
+                        }
+                    }
+                }
+                crossterm::event::KeyCode::Right => {
+                    if let Some(p) = editor.palette.as_mut() {
+                        if p.cursor < p.query.len() {
+                            let c = p.query[p.cursor..].chars().next().unwrap();
+                            p.cursor += c.len_utf8();
+                        }
+                    }
+                }
+                crossterm::event::KeyCode::Char(c)
+                    if !k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                        && !k.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
+                {
+                    let ah = editor.active().view.area.1;
+                    if let Some(p) = editor.palette.as_mut() {
+                        p.query.insert(p.cursor, c);
+                        p.cursor += c.len_utf8();
+                        crate::palette::rebuild_rows(p, reg, keymap);
+                        crate::app::keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
+                    }
+                }
+                _ => {}
+            }
+        }
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+    }
+    // Non-key msg falls through to normal handling while palette stays open.
+    crate::app::Handled::Pass(msg)
 }
 
 #[cfg(test)]

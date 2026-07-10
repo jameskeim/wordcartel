@@ -2,8 +2,31 @@
 use crate::editor::{Buffer, Editor, MarkPending};
 use crate::nav;
 use crate::registry::{place_caret_visible, CaretPlace};
+use crate::app::Msg;
+use crossterm::event::Event;
 
 const CAP: usize = 64;
+
+/// pending_mark intercepts the very next key MESSAGE as the mark letter — drains and
+/// returns for ANY Key message including non-Press (§8.1-L). Non-key messages fall
+/// through to normal handling.
+pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor,
+    ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) -> crate::app::Handled {
+    if editor.pending_mark.is_none() { return crate::app::Handled::Pass(msg); }
+    if let Msg::Input(Event::Key(k)) = &msg {
+        if k.kind == crossterm::event::KeyEventKind::Press {
+            match k.code {
+                crossterm::event::KeyCode::Esc => { editor.pending_mark = None; editor.status.clear(); }
+                crossterm::event::KeyCode::Char(c) => resolve_pending(editor, c),
+                _ => { editor.pending_mark = None; } // non-name key cancels
+            }
+        }
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+    }
+    // non-key message: fall through to normal handling
+    crate::app::Handled::Pass(msg)
+}
 
 pub fn set_mark(editor: &mut Editor)  { editor.active_mut().sel_history.clear(); editor.pending_mark = Some(MarkPending::Set); editor.status = "set mark:".into(); }
 pub fn jump_to_mark(editor: &mut Editor) { editor.pending_mark = Some(MarkPending::Jump); editor.status = "jump to mark:".into(); }

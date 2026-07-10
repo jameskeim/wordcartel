@@ -101,7 +101,7 @@ impl Harness {
         let (pre_id, pre_version) = { let b = self.editor.active(); (b.id, b.document.version) };
         let clock = TestClock(self.now);
         let keep = reduce(msg, &mut self.editor, &self.reg, &self.keymap, &self.ex, &clock, &self.tx);
-        if let Some(t) = app::rebuild_keymap_if_requested(&mut self.editor, &[], &self.reg) {
+        if let Some(t) = crate::theme_cmds::rebuild_keymap_if_requested(&mut self.editor, &[], &self.reg) {
             self.keymap = t;
         }
         self.editor.note_undo_eviction(pre_id, pre_version);
@@ -126,7 +126,7 @@ impl Harness {
         let t0 = std::time::Instant::now();
         let _keep = reduce(msg, &mut self.editor, &self.reg, &self.keymap, &self.ex, &clock, &self.tx);
         let t_reduce = t0.elapsed();
-        if let Some(t) = app::rebuild_keymap_if_requested(&mut self.editor, &[], &self.reg) {
+        if let Some(t) = crate::theme_cmds::rebuild_keymap_if_requested(&mut self.editor, &[], &self.reg) {
             self.keymap = t;
         }
         self.editor.note_undo_eviction(pre_id, pre_version);
