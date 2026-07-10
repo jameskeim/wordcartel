@@ -11,7 +11,7 @@
 #   cd packaging/arch && makepkg -f
 #
 pkgname=wordcartel
-pkgver=0.0.0.r1058.g0a34a15
+pkgver=0.1.0
 pkgrel=1
 pkgdesc='Markdown-first terminal word processor (wcartel) — optimized release-dist build'
 arch=('x86_64')
@@ -35,9 +35,12 @@ options=('!strip' '!debug')
 _root() { realpath "$startdir/../.."; }
 
 pkgver() {
+  # Tag-anchored (SemVer, tags `vX.Y.Z`): exactly on a tag → `0.1.0`; N commits past →
+  # `0.1.0.rN.gHASH` (monotonic). Falls back to a commit-count snapshot if no tag is reachable.
   local root; root="$(_root)"
   cd "$root"
-  printf '0.0.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+  git describe --tags 2>/dev/null | sed 's/^v//;s/-\([0-9]*\)-g/.r\1.g/' \
+    || printf '0.0.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
 package() {
