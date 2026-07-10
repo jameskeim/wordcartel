@@ -88,6 +88,28 @@ deviation.
   `git log` over recollection; never re-dispatch a task it marks complete.
 - Save non-obvious decisions to memory (why, not what).
 
+### Tooling: the rust-analyzer LSP READS, cargo VERIFIES
+Split by code state, proven on the splash effort (2026-07-10): the LSP is a fast index of code *at rest*;
+`cargo` is the ground truth for code *being changed*. Use each in its lane.
+- **LSP for reading a settled tree** — `documentSymbol`/`workspaceSymbol`/`findReferences`/call-hierarchy/
+  `hover` for mapping, spec/plan grounding, and review navigation. Accurate and cheap when the tree is quiet
+  (the whole-app mapping sweeps used it heavily with zero misses). Warm it once up front — a cold
+  `workspaceSymbol` returns "still indexing" for a few seconds, and the mapping phase both warms and uses it.
+- **cargo for verifying changed code — NEVER gate on LSP diagnostics.** rust-analyzer re-indexes incrementally
+  and asynchronously, so for a few seconds after ANY edit its view lags the file; a `<new-diagnostics>` reminder
+  is a point-in-time snapshot that can fire pre-edit or mid-index. Subagent edits are the worst case — the
+  controller's analyzer never "witnessed" them, so its diagnostics about subagent-touched files are the most
+  stale (splash effort: `intercept`/`paint`/consts flagged "never used," `view_splash` E0063 "missing field" —
+  all stale, all disproved by `touch <file> && cargo build`). Treat a diagnostic about recently-edited code as
+  "go check," not "it's broken": verify with `cargo build`/`check`/`clippy`/`test` before acting. The
+  subagent's own cargo run is authoritative over the controller's stale self-diagnostics — verify before ever
+  surfacing one as a finding.
+- **Anchor on symbol NAMES, not line numbers.** Spec/plan `:NNN` anchors drift as tasks edit files (recurring
+  H1 + splash lesson); implementers/reviewers locate by name/structure. Use `workspaceSymbol`/`documentSymbol`
+  to *re-locate* a symbol cheaply mid-effort rather than trusting a recorded line.
+- **Tell subagents explicitly:** for compile/usage/signature questions on code they are editing, trust `cargo`
+  + `grep`, not an editor "unused"/"undefined" hint.
+
 ### Commit/push rules
 - Branch per effort off the trunk; never implement on the default branch without consent.
 - Commit/push only when explicitly asked.
