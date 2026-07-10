@@ -315,3 +315,20 @@ journeys. Lower risk than the H1 `render()` split (no pixel-exact golden churn �
 buffer state, not rendered cells). Pairs naturally with the H1 module-size pass. Anchors: `wordcartel/src/commands.rs:209`
 (`run` + the allow at `:210`), the changeset builders at `:101`/`:128`/`:156`, the repeated epilogue visible at
 `:224–226`/`:238–240`/`:271–273`/`:287–289`.
+
+## H12 — PTY smoke suite has no live-splash coverage (S9) · `triage` (2026-07-10)
+
+**Grounded (2026-07-10, splash effort merge 242c987).** The startup splash covers the first frame on every
+launch and would fail all 8 PTY smoke first-frame checks, so `scripts/smoke/tmux-drive.sh`'s `start_wcartel`
+now passes `--no-splash` on EVERY launch (alongside `--no-config`). Necessary — the smoke checks assert on
+first-frame content and the splash is not what they test — but the side effect is that **no smoke check ever
+exercises the real splash or its dismissal** (the Fable whole-branch review flagged this as advisory M-C). The
+splash IS covered by in-process e2e journeys (`wordcartel/src/e2e.rs`: show-on-first-frame, key/mouse dismiss,
+`--no-splash`, recovery-suppression at render level) and unit tests, so this is a *live-binary* coverage gap,
+not a correctness gap. Direction when picked up: add an **S9** check that launches WITHOUT `--no-splash` and
+asserts the real journey — wordmark/tagline on the first frame → a key dismisses it → the editor (or the opened
+file) is revealed — plus optionally a swap-recovery-relaunch variant asserting the recovery prompt wins over
+the splash on the live binary (the in-process e2e + the controller's manual PTY repro already proved this;
+S9 would lock it into the mandatory-run suite). Low-risk, additive (one new check script + the launcher already
+supports per-launch args). Anchors: `scripts/smoke/tmux-drive.sh` (`start_wcartel`, the `--no-splash` default),
+`scripts/smoke/checks/`, `wordcartel/src/splash.rs`, the e2e journeys in `wordcartel/src/e2e.rs`.
