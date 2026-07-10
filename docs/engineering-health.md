@@ -220,7 +220,17 @@ untrusted/IO/async path that M2/M3/M4 didn't already cover. Low-risk, mechanical
 fold into a future hardening pass. Anchors: CLAUDE.md (unwrap policy), this doc's Snapshot (the ~35 count),
 the M2/M3/M4 boundaries.
 
-## H8 — Dead public API: two fold/outline accessors have no production callers · `triage` (2026-07-09)
+## H8 — Dead public API: two fold/outline accessors have no production callers · **SHIPPED** 2026-07-09
+
+**SHIPPED 2026-07-09** (branch chore-h8-remove-dead-accessors). Fable scoped it (compile-verified a scratch
+removal against the branch) and both accessors were deleted with their exclusive tests: `outline::section_range`
+(+ tests `section_range_stops_at_same_or_higher_level`, `section_range_last_heading_runs_to_eof`) and
+`fold::FoldState::hidden_byte_ranges` (+ test `hidden_byte_ranges_cover_body_not_heading`). Fable also caught two
+live stale doc-comment references the grep pass missed (`outline.rs` `ordered` and `sections` doc comments named
+the removed fns) — both fixed. Gates green: build + clippy `--workspace --all-targets` clean; `cargo test`
+`wordcartel-core`/`wordcartel` all suites pass (core 279, shell 939, oracle 42, 0 failed). Low-risk, mechanical
+as predicted; no shared test helpers over-deleted (`ordered`, `DOC`, `parse`/`doc` retained). *(Original triage
+below retained for history.)*
 
 **Grounded (rust-analyzer call-hierarchy + `findReferences` + raw grep, 2026-07-09).** Two `pub` fns are
 referenced ONLY by their own unit tests — superseded-but-not-removed API. Both are the byte-space /

@@ -105,21 +105,6 @@ impl FoldState {
         let starts = outline::heading_starts(blocks, &buf.snapshot());
         self.reconcile_to(&starts);
     }
-
-    /// Hidden body ranges in BYTES. Computed from `outline::sections` in ONE
-    /// pass (no per-anchor recompute): for each section whose heading is folded
-    /// and has a non-empty body, hide the body, keeping the heading line(s)
-    /// visible. Anchors that aren't heading starts are skipped.
-    pub fn hidden_byte_ranges(&self, blocks: &BlockTree, buf: &TextBuffer) -> Vec<Range<usize>> {
-        let rope = buf.snapshot();
-        let mut out: Vec<Range<usize>> = outline::sections(blocks, &rope)
-            .into_iter()
-            .filter(|s| self.folded.contains(&s.heading.byte) && s.body.start < s.body.end)
-            .map(|s| s.body)
-            .collect();
-        out.sort_by_key(|r| r.start);
-        out
-    }
 }
 
 /// A merged hidden run in LINE space, with the visible heading line that owns it.
@@ -385,20 +370,6 @@ mod tests {
     //  line 5: ## B
     //  line 6: tail
     //  line 7: ""        (trailing)
-
-    #[test]
-    fn hidden_byte_ranges_cover_body_not_heading() {
-        let (blocks, buf) = parse(DOC);
-        let mut f = FoldState::default();
-        let a = DOC.find("## A").unwrap();
-        f.toggle(a);
-        let ranges = f.hidden_byte_ranges(&blocks, &buf);
-        assert_eq!(ranges.len(), 1);
-        // body starts after the "## A\n" line and ends at "## B"
-        let body_start = DOC.find("body1").unwrap();
-        let b = DOC.find("## B").unwrap();
-        assert_eq!(ranges[0], body_start..b);
-    }
 
     #[test]
     fn foldview_skips_hidden_lines() {
