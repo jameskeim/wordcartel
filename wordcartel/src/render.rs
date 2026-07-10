@@ -396,19 +396,22 @@ fn place_cursor(frame: &mut Frame, editor: &Editor, area: Rect, edit_top: u16,
                 format!("Find: {}  Replace: ", s.needle).chars().count(),
         };
         let caret_cols = s.focused_field()[..s.cursor].chars().count();
-        let x_offset = (prefix_cols + caret_cols) as u16;
-        if x_offset < w {
-            frame.set_cursor_position(Position { x: area.x + x_offset, y: status_row });
+        // H7: sum in usize and guard BEFORE narrowing — a >65535-column field must hide
+        // the caret, not truncate to a small column that passes the `< w` guard.
+        let x_offset = prefix_cols + caret_cols;
+        if x_offset < w as usize {
+            frame.set_cursor_position(Position { x: area.x + x_offset as u16, y: status_row });
         }
     } else if let Some(ref mb) = editor.minibuffer {
         // Minibuffer is open: place caret on the status row at prompt.len() + cursor.
         // cursor is a byte offset; for display we want the char count so the terminal
-        // column is correct even for multi-byte prompts/text (small strings, safe).
-        let prompt_cols = mb.prompt.chars().count() as u16;
-        let text_cols = mb.text[..mb.cursor].chars().count() as u16;
+        // column is correct even for multi-byte prompts/text.
+        let prompt_cols = mb.prompt.chars().count();
+        let text_cols = mb.text[..mb.cursor].chars().count();
+        // H7: sum in usize and guard BEFORE narrowing (see the search arm).
         let caret_col = prompt_cols + text_cols;
-        if caret_col < w {
-            frame.set_cursor_position(Position { x: area.x + caret_col, y: status_row });
+        if caret_col < w as usize {
+            frame.set_cursor_position(Position { x: area.x + caret_col as u16, y: status_row });
         }
     } else if let Some((col, row)) = nav::screen_pos(editor) {
         // Guard rows; clamp cols — a caret on/after hung trailing whitespace sits
@@ -1836,6 +1839,25 @@ mod tests {
         let cur = render_capturing_cursor(&mut e, 4, 8);
         let (x, _y) = cur.expect("helper returns Some; suppression shows as (0,0)");
         assert_eq!(x, 3, "pinned at text_width-1 (text_left is 0 here)");
+    }
+
+    #[test]
+    fn place_cursor_minibuffer_hides_caret_past_terminal_width_no_wraparound() {
+        // A minibuffer answer longer than u16::MAX chars must HIDE the caret (its column is
+        // off-screen), not truncate the column into the visible range. Pre-H7 the
+        // `chars().count() as u16` truncated FIRST, so a length of 65536+10 wrapped to
+        // column 10 and wrongly passed the `< w` guard, planting the caret at col ~12.
+        let mut e = Editor::new_from_text("body\n", None, (80, 24));
+        e.open_minibuffer("x ", crate::minibuffer::MinibufferKind::SaveAs);
+        {
+            let mb = e.minibuffer.as_mut().unwrap();
+            mb.text = "a".repeat(65_546); // 65536 + 10
+            mb.cursor = mb.text.len();
+        }
+        let cur = render_capturing_cursor(&mut e, 80, 24);
+        // A suppressed cursor shows as the TestBackend default (0, 0), NOT (~12, status_row).
+        assert_eq!(cur, Some((0, 0)),
+            "a caret past the terminal width must be hidden, not wrapped into view");
     }
 
     /// B1 × B2 headline composition: a two-level nested list item ("  - alpha beta")
