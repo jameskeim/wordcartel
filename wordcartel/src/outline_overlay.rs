@@ -83,49 +83,11 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
             use crossterm::event::{KeyCode, KeyModifiers};
             match k.code {
                 KeyCode::Esc => { editor.outline = None; }
-                KeyCode::Up => {
+                c if crate::list_window::list_nav_key(c).is_some() => {
                     let ah = editor.active().view.area.1;
                     if let Some(o) = editor.outline.as_mut() {
-                        o.selected = o.selected.saturating_sub(1);
-                        crate::app::keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
-                    }
-                }
-                KeyCode::Down => {
-                    let ah = editor.active().view.area.1;
-                    if let Some(o) = editor.outline.as_mut() {
-                        let max = o.rows.len().saturating_sub(1);
-                        o.selected = (o.selected + 1).min(max);
-                        crate::app::keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
-                    }
-                }
-                KeyCode::PageDown => {
-                    let ah = editor.active().view.area.1;
-                    if let Some(o) = editor.outline.as_mut() {
-                        let lh = crate::list_window::list_h_for(o.rows.len(), ah);
-                        o.selected = (o.selected + lh.max(1)).min(o.rows.len().saturating_sub(1));
-                        crate::app::keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
-                    }
-                }
-                KeyCode::PageUp => {
-                    let ah = editor.active().view.area.1;
-                    if let Some(o) = editor.outline.as_mut() {
-                        let lh = crate::list_window::list_h_for(o.rows.len(), ah);
-                        o.selected = o.selected.saturating_sub(lh.max(1));
-                        crate::app::keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
-                    }
-                }
-                KeyCode::Home => {
-                    let ah = editor.active().view.area.1;
-                    if let Some(o) = editor.outline.as_mut() {
-                        o.selected = 0;
-                        crate::app::keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
-                    }
-                }
-                KeyCode::End => {
-                    let ah = editor.active().view.area.1;
-                    if let Some(o) = editor.outline.as_mut() {
-                        o.selected = o.rows.len().saturating_sub(1);
-                        crate::app::keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
+                        crate::list_window::apply_list_nav(crate::list_window::list_nav_key(c).unwrap(),
+                            ah, o.rows.len(), &mut o.selected, &mut o.scroll_top);
                     }
                 }
                 KeyCode::Enter => {

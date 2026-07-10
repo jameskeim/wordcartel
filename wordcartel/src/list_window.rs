@@ -29,6 +29,40 @@ pub(crate) fn keep_visible(selected: usize, row_count: usize, list_h: usize, scr
     *scroll_top = (*scroll_top).min(row_count.saturating_sub(list_h));
 }
 
+/// The six list-motion keys shared by every windowed overlay (palette, theme
+/// picker, file browser, outline) — menu and diag are excluded (different nav
+/// semantics; T10).
+pub(crate) enum ListNav { Up, Down, PageUp, PageDown, Home, End }
+
+/// Classify a key code as a list-nav motion, or `None` if it isn't one.
+pub(crate) fn list_nav_key(code: crossterm::event::KeyCode) -> Option<ListNav> {
+    use crossterm::event::KeyCode;
+    match code {
+        KeyCode::Up => Some(ListNav::Up), KeyCode::Down => Some(ListNav::Down),
+        KeyCode::PageUp => Some(ListNav::PageUp), KeyCode::PageDown => Some(ListNav::PageDown),
+        KeyCode::Home => Some(ListNav::Home), KeyCode::End => Some(ListNav::End),
+        _ => None,
+    }
+}
+
+/// Apply a motion to `(selected, scroll_top)` over `row_count` rows in an
+/// `area_h`-tall buffer area — the exact math of the four duplicated overlay
+/// blocks this replaces. Per-overlay SIDE EFFECTS (theme-preview, outline
+/// re-query, etc.) stay in the caller, outside this pure helper.
+pub(crate) fn apply_list_nav(nav: ListNav, area_h: u16, row_count: usize,
+    selected: &mut usize, scroll_top: &mut usize) {
+    let lh = list_h_for(row_count, area_h);
+    match nav {
+        ListNav::Up => *selected = selected.saturating_sub(1),
+        ListNav::Down => *selected = (*selected + 1).min(row_count.saturating_sub(1)),
+        ListNav::PageDown => *selected = (*selected + lh.max(1)).min(row_count.saturating_sub(1)),
+        ListNav::PageUp => *selected = selected.saturating_sub(lh.max(1)),
+        ListNav::Home => *selected = 0,
+        ListNav::End => *selected = row_count.saturating_sub(1),
+    }
+    keep_visible(*selected, row_count, lh, scroll_top);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -121,49 +121,11 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
             match k.code {
                 KeyCode::Esc => { editor.file_browser = None; }
                 KeyCode::Enter => { file_browser_enter(editor); }
-                KeyCode::Up => {
+                c if crate::list_window::list_nav_key(c).is_some() => {
                     let ah = editor.active().view.area.1;
                     if let Some(fb) = editor.file_browser.as_mut() {
-                        fb.selected = fb.selected.saturating_sub(1);
-                        crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
-                    }
-                }
-                KeyCode::Down => {
-                    let ah = editor.active().view.area.1;
-                    if let Some(fb) = editor.file_browser.as_mut() {
-                        let max = fb.entries.len().saturating_sub(1);
-                        fb.selected = (fb.selected + 1).min(max);
-                        crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
-                    }
-                }
-                KeyCode::PageDown => {
-                    let ah = editor.active().view.area.1;
-                    if let Some(fb) = editor.file_browser.as_mut() {
-                        let lh = crate::list_window::list_h_for(fb.entries.len(), ah);
-                        fb.selected = (fb.selected + lh.max(1)).min(fb.entries.len().saturating_sub(1));
-                        crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
-                    }
-                }
-                KeyCode::PageUp => {
-                    let ah = editor.active().view.area.1;
-                    if let Some(fb) = editor.file_browser.as_mut() {
-                        let lh = crate::list_window::list_h_for(fb.entries.len(), ah);
-                        fb.selected = fb.selected.saturating_sub(lh.max(1));
-                        crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
-                    }
-                }
-                KeyCode::Home => {
-                    let ah = editor.active().view.area.1;
-                    if let Some(fb) = editor.file_browser.as_mut() {
-                        fb.selected = 0;
-                        crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
-                    }
-                }
-                KeyCode::End => {
-                    let ah = editor.active().view.area.1;
-                    if let Some(fb) = editor.file_browser.as_mut() {
-                        fb.selected = fb.entries.len().saturating_sub(1);
-                        crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+                        crate::list_window::apply_list_nav(crate::list_window::list_nav_key(c).unwrap(),
+                            ah, fb.entries.len(), &mut fb.selected, &mut fb.scroll_top);
                     }
                 }
                 KeyCode::Backspace => {

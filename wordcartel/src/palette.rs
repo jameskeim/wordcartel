@@ -136,49 +136,11 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                         }
                     }
                 }
-                crossterm::event::KeyCode::Up => {
+                c if crate::list_window::list_nav_key(c).is_some() => {
                     let ah = editor.active().view.area.1;
                     if let Some(p) = editor.palette.as_mut() {
-                        p.selected = p.selected.saturating_sub(1);
-                        crate::app::keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
-                    }
-                }
-                crossterm::event::KeyCode::Down => {
-                    let ah = editor.active().view.area.1;
-                    if let Some(p) = editor.palette.as_mut() {
-                        let max = p.rows.len().saturating_sub(1);
-                        p.selected = (p.selected + 1).min(max);
-                        crate::app::keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
-                    }
-                }
-                crossterm::event::KeyCode::PageDown => {
-                    let ah = editor.active().view.area.1;
-                    if let Some(p) = editor.palette.as_mut() {
-                        let lh = crate::list_window::list_h_for(p.rows.len(), ah);
-                        p.selected = (p.selected + lh.max(1)).min(p.rows.len().saturating_sub(1));
-                        crate::app::keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
-                    }
-                }
-                crossterm::event::KeyCode::PageUp => {
-                    let ah = editor.active().view.area.1;
-                    if let Some(p) = editor.palette.as_mut() {
-                        let lh = crate::list_window::list_h_for(p.rows.len(), ah);
-                        p.selected = p.selected.saturating_sub(lh.max(1));
-                        crate::app::keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
-                    }
-                }
-                crossterm::event::KeyCode::Home => {
-                    let ah = editor.active().view.area.1;
-                    if let Some(p) = editor.palette.as_mut() {
-                        p.selected = 0;
-                        crate::app::keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
-                    }
-                }
-                crossterm::event::KeyCode::End => {
-                    let ah = editor.active().view.area.1;
-                    if let Some(p) = editor.palette.as_mut() {
-                        p.selected = p.rows.len().saturating_sub(1);
-                        crate::app::keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
+                        crate::list_window::apply_list_nav(crate::list_window::list_nav_key(c).unwrap(),
+                            ah, p.rows.len(), &mut p.selected, &mut p.scroll_top);
                     }
                 }
                 crossterm::event::KeyCode::Backspace => {

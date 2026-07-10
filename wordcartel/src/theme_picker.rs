@@ -67,54 +67,11 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                     if let Some(tp) = editor.theme_picker.take() { editor.apply_theme(tp.original); }
                 }
                 KeyCode::Enter => { crate::theme_cmds::commit_theme_picker(editor); }
-                KeyCode::Up => {
+                c if crate::list_window::list_nav_key(c).is_some() => {
                     let ah = editor.active().view.area.1;
                     if let Some(tp) = editor.theme_picker.as_mut() {
-                        tp.selected = tp.selected.saturating_sub(1);
-                        crate::app::keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
-                    }
-                    crate::theme_cmds::preview_selected_theme(editor);
-                }
-                KeyCode::Down => {
-                    let ah = editor.active().view.area.1;
-                    if let Some(tp) = editor.theme_picker.as_mut() {
-                        let max = tp.rows.len().saturating_sub(1);
-                        tp.selected = (tp.selected + 1).min(max);
-                        crate::app::keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
-                    }
-                    crate::theme_cmds::preview_selected_theme(editor);
-                }
-                KeyCode::PageDown => {
-                    let ah = editor.active().view.area.1;
-                    if let Some(tp) = editor.theme_picker.as_mut() {
-                        let lh = crate::list_window::list_h_for(tp.rows.len(), ah);
-                        tp.selected = (tp.selected + lh.max(1)).min(tp.rows.len().saturating_sub(1));
-                        crate::app::keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
-                    }
-                    crate::theme_cmds::preview_selected_theme(editor);
-                }
-                KeyCode::PageUp => {
-                    let ah = editor.active().view.area.1;
-                    if let Some(tp) = editor.theme_picker.as_mut() {
-                        let lh = crate::list_window::list_h_for(tp.rows.len(), ah);
-                        tp.selected = tp.selected.saturating_sub(lh.max(1));
-                        crate::app::keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
-                    }
-                    crate::theme_cmds::preview_selected_theme(editor);
-                }
-                KeyCode::Home => {
-                    let ah = editor.active().view.area.1;
-                    if let Some(tp) = editor.theme_picker.as_mut() {
-                        tp.selected = 0;
-                        crate::app::keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
-                    }
-                    crate::theme_cmds::preview_selected_theme(editor);
-                }
-                KeyCode::End => {
-                    let ah = editor.active().view.area.1;
-                    if let Some(tp) = editor.theme_picker.as_mut() {
-                        tp.selected = tp.rows.len().saturating_sub(1);
-                        crate::app::keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
+                        crate::list_window::apply_list_nav(crate::list_window::list_nav_key(c).unwrap(),
+                            ah, tp.rows.len(), &mut tp.selected, &mut tp.scroll_top);
                     }
                     crate::theme_cmds::preview_selected_theme(editor);
                 }
