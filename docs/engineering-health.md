@@ -26,7 +26,27 @@ that catches real bugs — is the real asset.
 
 ---
 
-## H1 — Decompose the two god-objects (`app.rs`, `render.rs`) · `needs-design` · deferred (see "When")
+## H1 — Decompose the two god-objects (`app.rs`, `render.rs`) · **PARTIALLY SHIPPED** 2026-07-09 (merge 304e263) — `render()` body split remains
+
+**SHIPPED 2026-07-09** (merge `304e263`, branch effort-h1-god-object-decomposition, 12-task subagent-driven
+execution). The hub SEAM refactor landed behavior-identically: `run`'s 8-deadline loop → the `timers.rs`
+**static fn-pointer table** (`SUBSYSTEMS` + `next_wake`/`on_tick`/`pre_recv`; gates + fire-order preserved;
+idle-blocks/no-spin **proven by a compiled Fable probe** holding None at +24h); `reduce`'s ~900-line match →
+a **10-stage `Handled`-protocol skeleton** + `fold_and_continue`, plus `Input(Key)` → `input::handle_key`;
+the leaf extractions (`theme_cmds.rs`, `chrome.rs`, `chrome_geom.rs`, `render_status.rs`, + the micro-leaves
+to their domain modules) and `list_window::apply_list_nav`. New guardrail pins assert the idle-blocks
+invariant + the version-hook asymmetry. Both final gates GO (Fable whole-branch + Codex pre-merge); 1,267
+tests green, clippy clean, smoke 8/8. Process: Fable authored the spec+plan (Codex-gated each round);
+see [[wordcartel-fable-authors-codex-gates]].
+
+**REMAINING — the one deferred piece, its own next effort: split the 522-line `render()` body** by paint
+surface (row loop → `paint_rows`, status → `paint_status`, cursor → `place_cursor`; unify the twin
+`segs`/`placed` span-builders). Deliberately scoped OUT of the shipped effort (which did verbatim render-*helper*
+moves only): it is a different risk class — real restructuring that churns the pixel-exact golden-render tests —
+so it earns a focused pass of its own. `render.rs` is not fully decomposed until this lands; low context
+overlap with the app.rs work is exactly why it was split off (user decision 2026-07-09).
+
+*(Original triage below retained for history — the SEAM direction it sketched is what shipped.)*
 
 `app.rs` is **5,519 lines** and `render.rs` **3,393** — past the point where one person holds them in
 context. This is the clearest structural debt, and it bites hardest right before **Effort P**: `app.rs`
