@@ -494,6 +494,20 @@ impl Registry {
             |c| { let next = if c.editor.status_line_mode == TransientMode::On { TransientMode::Auto } else { TransientMode::On };
                   c.editor.set_status_line_mode(next); CommandResult::Handled });
 
+        // Startup splash: set-per-state (palette-only) + 2-state toggle representative
+        // (View, OnOff mark). All three route through Editor::set_splash (contract law 6);
+        // the splash paints only at launch, so a change takes effect on the NEXT run.
+        r.register("splash_on",  "Splash: On",  None, |c| { c.editor.set_splash(true);
+            c.editor.status = "splash: on (takes effect next launch)".into(); CommandResult::Handled });
+        r.register("splash_off", "Splash: Off", None, |c| { c.editor.set_splash(false);
+            c.editor.status = "splash: off (takes effect next launch)".into(); CommandResult::Handled });
+        r.register_stateful("toggle_splash", "Startup Splash", Some(MenuCategory::View),
+            |e| MenuMark::OnOff(e.view_opts.splash),
+            |c| { let next = !c.editor.view_opts.splash; c.editor.set_splash(next);
+                  c.editor.status = if next { "splash: on (takes effect next launch)".into() }
+                                    else { "splash: off (takes effect next launch)".into() };
+                  CommandResult::Handled });
+
         // Menu bar: deterministic set-per-state (palette-only). menu_bar_pin remains the View representative.
         use crate::config::MenuBarMode;
         r.register("menu_bar_hidden", "Menu Bar: Hidden", None, |c| { c.editor.set_menu_bar_mode(MenuBarMode::Hidden); CommandResult::Handled });
@@ -1246,5 +1260,40 @@ mod tests {
         dispatch_id(&mut ed, "toggle_status_line"); assert_eq!(ed.status_line_mode, TransientMode::Auto);
         dispatch_id(&mut ed, "menu_bar_hidden"); assert_eq!(ed.menu_bar_mode, MenuBarMode::Hidden);
         assert_eq!(reg.meta(CommandId("menu_bar_hidden")).unwrap().menu, None);
+    }
+
+    #[test]
+    fn splash_commands_registered_with_contract_shape() {
+        let reg = Registry::builtins();
+        let meta = |id: &str| reg.meta(reg.resolve_name(id).expect(id)).expect(id);
+        assert_eq!(meta("splash_on").menu, None, "set-per-state primitives are palette-only");
+        assert_eq!(meta("splash_off").menu, None, "set-per-state primitives are palette-only");
+        let t = meta("toggle_splash");
+        assert_eq!(t.menu, Some(MenuCategory::View), "toggle is the stateful View representative");
+        let e = Editor::new_from_text("hi\n", None, (80, 24));
+        assert_eq!((t.state.expect("stateful"))(&e), MenuMark::OnOff(true),
+            "the OnOff mark mirrors the live option (default on)");
+    }
+
+    #[test]
+    fn splash_commands_move_view_opts_through_set_splash() {
+        let reg = Registry::builtins();
+        let mut e = Editor::new_from_text("hi\n", None, (80, 24));
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        assert!(ctx.editor.view_opts.splash, "default on");
+        let r = reg.dispatch(CommandId("splash_off"), &mut ctx);
+        assert_eq!(r, crate::commands::CommandResult::Handled);
+        assert!(!ctx.editor.view_opts.splash);
+        assert!(ctx.editor.status.contains("next launch"),
+            "status notes the deferred effect: {}", ctx.editor.status);
+        reg.dispatch(CommandId("toggle_splash"), &mut ctx);
+        assert!(ctx.editor.view_opts.splash, "toggle flips back on");
+        reg.dispatch(CommandId("splash_on"), &mut ctx);
+        assert!(ctx.editor.view_opts.splash, "absolute set is idempotent");
+        reg.dispatch(CommandId("toggle_splash"), &mut ctx);
+        assert!(!ctx.editor.view_opts.splash, "toggle flips off");
     }
 }

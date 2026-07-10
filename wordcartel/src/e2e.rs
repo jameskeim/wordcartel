@@ -789,6 +789,7 @@ fn journey_chrome_zen_toggle() {
         view_wrap_column:   72,
         view_scrollbar:     crate::config::TransientMode::Auto,
         view_status_line:   crate::config::TransientMode::On,
+        view_splash:        true,
         menu_bar:           crate::config::MenuBarMode::Auto,
         mouse_capture:      true,
         chrome_disposition: ChromeDisposition::Full,
@@ -812,6 +813,75 @@ fn journey_chrome_zen_toggle() {
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.contains("chrome = \"zen\""),
         "overrides file must carry '[theme] chrome = \"zen\"';\ngot:\n{text}");
+}
+
+#[test]
+fn e2e_splash_first_frame_then_key_dismisses_and_is_consumed() {
+    let mut h = Harness::new("hello behind\n", None, (80, 24));
+    // Mirror run()'s startup wiring (app.rs: gate → resolve against the live keymap →
+    // set before the first draw). view_opts carries the ViewConfig default (splash on).
+    let show = crate::splash::show_at_startup(
+        h.editor.view_opts.splash, false, h.editor.prompt.is_some());
+    assert!(show, "default config + no flag + no prompt shows the splash");
+    h.editor.splash = Some(crate::splash::Splash::new(&h.keymap, "0.1.0"));
+    h.render();
+    assert!(h.screen_contains("wordcartel"), "wordmark on the first frame");
+    assert!(h.screen_contains("press any key"), "footer on the first frame");
+    assert!(!h.screen_contains("hello behind"), "the splash owns the screen");
+    // The first key press dismisses AND is consumed (not typed into the buffer).
+    let keep = h.step(Msg::Input(Event::Key(key_char('x'))));
+    assert!(keep);
+    assert!(h.editor.splash.is_none(), "splash cleared by the first key");
+    assert_eq!(h.doc_text(), "hello behind\n", "the dismissing key was consumed");
+    assert!(h.screen_contains("hello behind"), "dismiss reveals the document");
+    // The NEXT key edits normally.
+    h.type_str("y");
+    assert_eq!(h.doc_text(), "yhello behind\n");
+}
+
+#[test]
+fn e2e_splash_mouse_click_dismisses_without_editing() {
+    let mut h = Harness::new("hello\n", None, (80, 24));
+    h.editor.splash = Some(crate::splash::Splash::new(&h.keymap, "0.1.0"));
+    h.render();
+    assert!(!h.screen_contains("hello"));
+    h.mouse_down(10, 5);
+    assert!(h.editor.splash.is_none(), "mouse-down dismisses");
+    assert_eq!(h.doc_text(), "hello\n", "the click did not edit anything");
+    assert!(h.screen_contains("hello"));
+}
+
+#[test]
+fn e2e_no_splash_flag_suppresses_first_frame_splash() {
+    let mut h = Harness::new("hello\n", None, (80, 24));
+    let show = crate::splash::show_at_startup(
+        h.editor.view_opts.splash, true, h.editor.prompt.is_some());
+    assert!(!show, "--no-splash wins over the enabled config default");
+    // run() therefore leaves editor.splash = None → the first frame is the plain editor.
+    h.render();
+    assert!(h.screen_contains("hello"));
+    assert!(!h.screen_contains("press any key"));
+}
+
+#[test]
+fn e2e_recovery_prompt_pending_suppresses_splash() {
+    let mut h = Harness::new("hello\n", None, (80, 24));
+    // Also probe the defense-in-depth belt (editor.rs open_prompt): set a splash
+    // BEFORE opening the recovery prompt, proving the two can never coexist even if a
+    // future startup-gate change let both get set — the render must show the prompt
+    // only, never the wordmark underneath it.
+    let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &h.reg);
+    h.editor.splash = Some(crate::splash::Splash::new(&km, "0.1.0"));
+    h.editor.open_prompt(crate::prompt::Prompt::swap_recovery());
+    let show = crate::splash::show_at_startup(
+        h.editor.view_opts.splash, false, h.editor.prompt.is_some());
+    assert!(!show, "a pending recovery prompt suppresses the splash");
+    assert!(h.editor.splash.is_none(), "open_prompt clears any pending splash (belt)");
+    h.render();
+    assert!(h.screen_contains("Recovery file found"),
+        "the recovery prompt is what the user sees:\n{:#?}", h.screen());
+    assert!(!h.screen_contains("wordcartel") && !h.screen_contains("press any key"),
+        "the splash must never be painted over a modal prompt:\n{:#?}", h.screen());
 }
 
 // ===========================================================================

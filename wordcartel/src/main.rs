@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! `wcartel` — thin binary entry point.
 //!
-//! Usage: `wcartel [--version|-V] [--no-config] [--config <path>] [file.md]`
+//! Usage: `wcartel [--version|-V] [--no-config] [--no-splash] [--config <path>] [file.md]`
 
 // print_stdout: the `--version` line is pre-guard stdout — the conventional `--version` channel.
 // print_stderr: fatal startup/exit errors go to stderr AFTER terminal restore — the correct channel.

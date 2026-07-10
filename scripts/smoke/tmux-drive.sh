@@ -62,7 +62,11 @@ start() {
 #   -u DISPLAY -u WAYLAND_DISPLAY  — arboard init fails deterministically, so
 #                                    the app runs the OSC-52 fallback path
 #   XDG_STATE_HOME=$SMOKE_STATE_HOME — swap/recovery land in a per-check tempdir
-# plus --no-config (checks assert against the DEFAULT keymap). Forwards
+# plus --no-config (checks assert against the DEFAULT keymap) and --no-splash
+# (the startup splash otherwise covers the first frame on every launch and would
+# fail every first-frame check; S8's swap-recovery still shows — the recovery
+# prompt suppresses the splash on its own, and --no-splash does not affect it).
+# Forwards
 # WCARTEL_SMOKE_PANIC when the caller has it set (S7). Blocks on the buffer
 # indicator '[1/' barrier before returning — the status bar's launch-invariant
 # chrome, present on the first frame of EVERY launch (no-arg and doc) regardless
@@ -95,12 +99,12 @@ start_wcartel() {
             env -u TMUX -u DISPLAY -u WAYLAND_DISPLAY \
                 "XDG_STATE_HOME=$SMOKE_STATE_HOME" \
                 "WCARTEL_SMOKE_PANIC=$WCARTEL_SMOKE_PANIC" \
-                "$WCARTEL_BIN" --no-config "$@"
+                "$WCARTEL_BIN" --no-config --no-splash "$@"
     else
         start "$_sess" --cols "$_wcols" --rows "$_wrows" -- \
             env -u TMUX -u DISPLAY -u WAYLAND_DISPLAY \
                 "XDG_STATE_HOME=$SMOKE_STATE_HOME" \
-                "$WCARTEL_BIN" --no-config "$@"
+                "$WCARTEL_BIN" --no-config --no-splash "$@"
     fi
     if [ "$_barrier" = yes ]; then
         wait_for "$_sess" '\[1/'

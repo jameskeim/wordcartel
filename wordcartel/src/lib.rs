@@ -53,6 +53,7 @@ pub mod theme_picker;
 pub mod theme_cmds;
 pub mod settings;
 pub mod file_browser;
+pub mod splash;
 pub mod blocks_marked;
 pub mod scratch;
 pub mod transact;

@@ -443,6 +443,12 @@ pub struct Editor {
     pub theme_picker: Option<crate::theme_picker::ThemePicker>,
     /// File browser overlay state. XOR with all other overlays.
     pub file_browser: Option<crate::file_browser::FileBrowser>,
+    /// Startup splash overlay. Set once in `run()` (gated on config, `--no-splash`, and
+    /// no pending recovery prompt); cleared — consuming the event — by the first key
+    /// press or mouse click (`splash::intercept`). XOR with the other overlays by
+    /// construction: only ever set at launch before any input, and the first input that
+    /// could open an overlay is consumed dismissing it (no `open_*` clearing needed).
+    pub splash: Option<crate::splash::Splash>,
     /// Active theme + terminal color depth. Seeded at startup (real depth detection: plan ③).
     pub theme: wordcartel_core::theme::Theme,
     pub depth: wordcartel_core::theme::Depth,
@@ -526,6 +532,7 @@ impl Editor {
             outline: None,
             theme_picker: None,
             file_browser: None,
+            splash: None,
             theme: wordcartel_core::theme::default(),
             depth: wordcartel_core::theme::Depth::Truecolor,
             chrome_disposition: wordcartel_core::theme::ChromeDisposition::Full,
@@ -664,6 +671,7 @@ impl Editor {
         self.outline = None;
         self.theme_picker = None;
         self.file_browser = None;
+        self.splash = None; // a prompt is modal — it must never be buried by the splash
         self.prompt = Some(p);
     }
 
@@ -850,6 +858,13 @@ impl Editor {
         self.mouse.status_reveal_due = None;
         self.mouse.status_hide_due = None;
         self.mouse.status_revealed = false;
+    }
+
+    /// Set the startup-splash enablement (`view.splash`). The single write path the
+    /// `splash_on`/`splash_off`/`toggle_splash` commands (and profiles) call (contract
+    /// law 6). Takes effect on the NEXT launch — the splash itself paints only at startup.
+    pub fn set_splash(&mut self, on: bool) {
+        self.view_opts.splash = on;
     }
 
     /// Set the menu-bar mode, keeping `menu_bar_unpinned_mode` (the mode `menu_bar_pin`
@@ -1509,5 +1524,29 @@ mod tests {
         crate::density::apply_bundle(&mut e, &crate::density::FULL); // FULL sets Pinned
         assert_eq!(e.menu_bar_mode, MenuBarMode::Pinned);
         assert_eq!(e.menu_bar_unpinned_mode, MenuBarMode::Hidden, "FULL remembers the prior mode as unpin target");
+    }
+
+    #[test]
+    fn splash_field_defaults_none_and_set_splash_is_the_single_write_path() {
+        let mut e = Editor::new_from_text("x\n", None, (40, 10));
+        assert!(e.splash.is_none(), "no splash until run() decides at startup");
+        assert!(e.view_opts.splash, "ViewConfig default seeds on");
+        e.set_splash(false);
+        assert!(!e.view_opts.splash);
+        e.set_splash(true);
+        assert!(e.view_opts.splash);
+    }
+
+    #[test]
+    fn open_prompt_clears_any_pending_splash() {
+        // Defense-in-depth for "recovery wins": a prompt is modal and must never be
+        // buried by the splash's full-frame Clear at render time (whole-branch finding).
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        e.splash = Some(crate::splash::Splash::new(&km, "0.1.0"));
+        e.open_prompt(crate::prompt::Prompt::swap_recovery());
+        assert!(e.splash.is_none(), "opening a prompt clears the splash");
+        assert!(e.prompt.is_some(), "the prompt itself is set");
     }
 }

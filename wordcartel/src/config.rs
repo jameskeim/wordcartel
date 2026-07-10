@@ -11,9 +11,12 @@ pub struct Cli {
     /// `-V` / `--version` was passed. The caller (`main`) prints the version and exits 0;
     /// the parser only records the request so it stays pure and testable.
     pub version: bool,
+    /// `--no-splash` was passed: suppress the startup splash for THIS launch only
+    /// (the persistent opt-out is `view.splash`; the flag never writes config).
+    pub no_splash: bool,
 }
 
-/// Hand-rolled (no clap dep): `[--version|-V] [--config <path>] [--no-config] [file]`.
+/// Hand-rolled (no clap dep): `[--version|-V] [--config <path>] [--no-config] [--no-splash] [file]`.
 pub fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> Cli {
     let mut cli = Cli::default();
     let mut it = args.into_iter();
@@ -22,6 +25,7 @@ pub fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> Cli {
         match a.as_str() {
             "--version" | "-V" => cli.version = true,
             "--no-config" => cli.no_config = true,
+            "--no-splash" => cli.no_splash = true,
             "--config" => cli.config_path = it.next().map(PathBuf::from),
             _ => {
                 if cli.path.is_none() {
@@ -126,6 +130,9 @@ pub struct ViewConfig {
     pub word_count: bool,
     pub scrollbar: TransientMode,
     pub status_line: TransientMode,
+    /// Startup splash / welcome screen (`[view] splash`). On by default; the splash is
+    /// painted over the first frame and dismissed by the first key press or mouse click.
+    pub splash: bool,
 }
 impl Default for ViewConfig {
     fn default() -> Self {
@@ -134,7 +141,7 @@ impl Default for ViewConfig {
             wrap_column: 72, wrap_guide: false, word_count: false,
             // status_line defaults On (idle info line always shown out of the box —
             // preserves the pre-density behavior); Zen (chrome = zen) flips it to Auto.
-            scrollbar: TransientMode::Auto, status_line: TransientMode::On }
+            scrollbar: TransientMode::Auto, status_line: TransientMode::On, splash: true }
     }
 }
 
@@ -316,6 +323,7 @@ struct RawView {
     word_count: Option<bool>,
     scrollbar: Option<String>,
     status_line: Option<String>,
+    splash: Option<bool>,
 }
 
 /// Ordered existing config files, lowest→highest precedence. Empty when --no-config.
@@ -403,6 +411,7 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
         if let Some(v) = raw.view.measure { cfg.view.measure = v; }
         if let Some(v) = raw.view.wrap_guide { cfg.view.wrap_guide = v; }
         if let Some(v) = raw.view.word_count { cfg.view.word_count = v; }
+        if let Some(v) = raw.view.splash { cfg.view.splash = v; }
         if let Some(a) = raw.view.typewriter_anchor {
             if (0.0..=1.0).contains(&a) { cfg.view.typewriter_anchor = a; }
             else { cfg.view.typewriter_anchor = a.clamp(0.0, 1.0);
@@ -602,6 +611,27 @@ mod tests {
         let (cfg, warns) = load(&[bad]);
         assert_eq!(warns.len(), 1, "one warning for the bad layer");
         assert_eq!(cfg.state.max_entries, 200, "fell back to default");
+    }
+
+    #[test]
+    fn view_splash_defaults_on_and_folds_from_a_layer() {
+        let (cfg, warns) = load(&[]);
+        assert!(warns.is_empty());
+        assert!(cfg.view.splash, "built-in default is on");
+        let d = tempdir();
+        let p = write(&d, "splash.toml", "[view]\nsplash = false\n");
+        let (cfg, warns) = load(&[p]);
+        assert!(warns.is_empty());
+        assert!(!cfg.view.splash, "a layer that SETS the field overrides the default");
+    }
+
+    #[test]
+    fn parse_cli_no_splash_flag() {
+        let c = parse_cli(["wcartel", "--no-splash", "notes.md"].map(String::from));
+        assert!(c.no_splash);
+        assert_eq!(c.path.as_deref(), Some(std::path::Path::new("notes.md")));
+        let c = parse_cli(["wcartel"].map(String::from));
+        assert!(!c.no_splash, "defaults off");
     }
 
     #[test]
@@ -965,6 +995,7 @@ mod tests {
             view_wrap_column: 100,
             view_scrollbar:  crate::config::TransientMode::Auto,
             view_status_line: crate::config::TransientMode::On,
+            view_splash:     true,
             menu_bar:        crate::config::MenuBarMode::Pinned,
             mouse_capture:   false,
             chrome_disposition: wordcartel_core::theme::ChromeDisposition::Zen,

@@ -45,6 +45,9 @@ pub struct SettingsSnapshot {
     pub view_wrap_column: u16,
     pub view_scrollbar: crate::config::TransientMode,
     pub view_status_line: crate::config::TransientMode,
+    /// Startup splash enablement (`view.splash`). Persisted as a plain bool; a runtime
+    /// change takes effect on the next launch.
+    pub view_splash: bool,
     pub menu_bar: crate::config::MenuBarMode,
     pub mouse_capture: bool,
     /// Chrome disposition: `Full` (calibrated steps) or `Zen` (collapsed). Seeded from
@@ -116,6 +119,7 @@ pub struct OView {
     #[serde(skip_serializing_if = "Option::is_none")] pub wrap_column: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")] pub scrollbar:   Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] pub status_line: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub splash:      Option<bool>,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -169,6 +173,7 @@ pub fn snapshot_of(cfg: &crate::config::Config, resolved_theme_name: &str) -> Se
         view_wrap_column: cfg.view.wrap_column,
         view_scrollbar:  cfg.view.scrollbar,
         view_status_line: cfg.view.status_line,
+        view_splash:     cfg.view.splash,
         menu_bar:        cfg.menu.bar,
         mouse_capture:   cfg.mouse.mouse_capture,
         chrome_disposition,
@@ -190,6 +195,7 @@ pub fn runtime_snapshot(editor: &crate::editor::Editor) -> SettingsSnapshot {
         view_wrap_column: editor.view_opts.wrap_column,
         view_scrollbar:  editor.scrollbar_mode,
         view_status_line: editor.status_line_mode,
+        view_splash:     editor.view_opts.splash,
         menu_bar:        editor.menu_bar_mode,
         mouse_capture:   editor.mouse_capture,
         chrome_disposition: editor.chrome_disposition,
@@ -407,10 +413,15 @@ pub fn compute_overrides(
         ex_view.and_then(|v| v.status_line.as_ref()),
         mk_view.and_then(|v| v.status_line.as_ref()).is_some(),
     );
+    let splash = diff_key(
+        &runtime.view_splash, &baseline.view_splash,
+        ex_view.and_then(|v| v.splash.as_ref()),
+        mk_view.and_then(|v| v.splash).is_some(),
+    );
     let any_view = typewriter.is_some() || focus.is_some() || measure.is_some()
         || wrap_guide.is_some() || word_count.is_some() || wrap_column.is_some()
-        || scrollbar.is_some() || status_line.is_some();
-    let view = some_if(OView { typewriter, focus, measure, wrap_guide, word_count, wrap_column, scrollbar, status_line }, any_view);
+        || scrollbar.is_some() || status_line.is_some() || splash.is_some();
+    let view = some_if(OView { typewriter, focus, measure, wrap_guide, word_count, wrap_column, scrollbar, status_line, splash }, any_view);
 
     // --- menu — per-key mask predicate ---
     let rt_bar   = menu_bar_str(runtime.menu_bar).to_string();
@@ -555,6 +566,7 @@ mod tests {
             view_wrap_guide: false, view_word_count: false, view_wrap_column: 72,
             view_scrollbar: crate::config::TransientMode::Auto,
             view_status_line: crate::config::TransientMode::On,
+            view_splash: true,
             menu_bar: crate::config::MenuBarMode::Auto, mouse_capture: true,
             chrome_disposition: ChromeDisposition::Full,
             canvas: CanvasMode::Opaque,
@@ -995,7 +1007,7 @@ mod tests {
             let SettingsSnapshot {
                 keymap_preset: _, theme_identity: _, view_typewriter: _, view_focus: _,
                 view_measure: _, view_wrap_guide: _, view_word_count: _, view_wrap_column: _,
-                view_scrollbar: _, view_status_line: _, menu_bar: _, mouse_capture: _,
+                view_scrollbar: _, view_status_line: _, view_splash: _, menu_bar: _, mouse_capture: _,
                 chrome_disposition: _, canvas: _, clipboard_provider: _,
             } = s;
         }
@@ -1015,10 +1027,36 @@ mod tests {
         assert!(has("set_wrap_column"), "view_wrap_column");
         assert!(has("cycle_scrollbar") && has("scrollbar_auto"), "view_scrollbar");
         assert!(has("toggle_status_line") && has("status_line_auto"), "view_status_line");
+        assert!(has("toggle_splash") && has("splash_on") && has("splash_off"), "view_splash");
         assert!(has("menu_bar_pin") && has("menu_bar_auto"), "menu_bar");
         assert!(has("toggle_mouse_capture"), "mouse_capture");
         assert!(has("toggle_chrome"), "chrome_disposition");
         assert!(has("toggle_canvas"), "canvas");
         assert!(has("clipboard_provider_cycle") && has("clipboard_provider_auto"), "clipboard_provider");
+    }
+
+    #[test]
+    fn splash_round_trips_through_snapshot_diff_and_parse() {
+        // snapshot_of reads the config default (on); runtime diverges to off.
+        let baseline = snapshot_of(&crate::config::Config::default(), "tokyo-night");
+        assert!(baseline.view_splash, "config default is on");
+        let mut runtime = baseline.clone();
+        runtime.view_splash = false;
+        let of = compute_overrides(&runtime, &baseline,
+            &OverridesFile::default(), &OverridesFile::default());
+        assert_eq!(of.view.as_ref().and_then(|v| v.splash), Some(false),
+            "divergence writes the key");
+        // …and the written key deserializes back through parse_overrides.
+        let text = toml::to_string(&of).expect("serialize overrides");
+        let re = parse_overrides(&text);
+        assert_eq!(re.view.and_then(|v| v.splash), Some(false));
+        // No divergence → the key (and the empty section) stays absent (rule 4).
+        let of2 = compute_overrides(&baseline, &baseline,
+            &OverridesFile::default(), &OverridesFile::default());
+        assert!(of2.view.is_none(), "unchanged splash writes no view key");
+        // runtime_snapshot reads the live editor through view_opts (set_splash path).
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        e.set_splash(false);
+        assert!(!runtime_snapshot(&e).view_splash);
     }
 }

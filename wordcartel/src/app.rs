@@ -230,6 +230,8 @@ pub fn reduce(
             panic!("WCARTEL_SMOKE_PANIC: deliberate smoke-test panic");
         }
     }
+    let msg = match crate::splash::intercept(msg, editor, ex, clock, msg_tx) {
+        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
     let msg = match crate::marks::intercept(msg, editor, ex, clock, msg_tx) {
         crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
     let msg = match crate::menu::intercept(msg, editor, reg, keymap, ex, clock, msg_tx) {
@@ -694,6 +696,12 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             editor.active_mut().document.selection =
                 wordcartel_core::selection::Selection::single(nh);
         }
+    }
+    // Startup splash (spec 2026-07-09): resolved against the loop-local keymap AFTER the
+    // mem::take, gated on config + --no-splash + no pending recovery prompt, set before
+    // the first draw. Dismissal is splash::intercept — the first stage of reduce.
+    if crate::splash::show_at_startup(cfg.view.splash, cli.no_splash, editor.prompt.is_some()) {
+        editor.splash = Some(crate::splash::Splash::new(&keymap, env!("CARGO_PKG_VERSION")));
     }
     first_frame_settle(&mut editor);
     guard.terminal().draw(|f| render::render(f, &mut editor))?;
