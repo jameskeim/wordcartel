@@ -74,24 +74,31 @@ pub fn show_at_startup(cfg_splash: bool, no_splash: bool, prompt_pending: bool) 
 /// Splash dismissal stage — the FIRST stage in `reduce`'s intercept chain.
 ///
 /// Contract (spec §3): `splash.is_none()` → `Pass(msg)`; else the first key PRESS or
-/// mouse-DOWN clears the splash and is CONSUMED (`Done(!editor.quit)`); every other
-/// message — `Tick`, background job results, `Resize`, key release/repeat, mouse
-/// move/scroll — passes through so startup warmup, the timer subsystems, and
-/// resize-reheal keep working while the splash is up (idle-is-free).
+/// mouse-DOWN clears the splash and is CONSUMED (`Done(!editor.quit)`); a terminal PASTE
+/// is CONSUMED too but does NOT dismiss the splash — swallowed silently-safe, i.e. no
+/// document edit and no register overwrite while the splash still covers the screen
+/// (matches the modal-prompt paste-ignored precedent in app.rs); every other message —
+/// `Tick`, background job results, `Resize`, key release/repeat, mouse move/scroll —
+/// passes through so startup warmup, the timer subsystems, and resize-reheal keep
+/// working while the splash is up (idle-is-free).
 pub(crate) fn intercept(msg: Msg, editor: &mut crate::editor::Editor,
     _ex: &dyn crate::jobs::Executor, _clock: &dyn wordcartel_core::history::Clock,
     _msg_tx: &std::sync::mpsc::Sender<Msg>) -> Handled {
     if editor.splash.is_none() { return Handled::Pass(msg); }
-    let dismiss = match &msg {
-        Msg::Input(Event::Key(k)) => k.kind == KeyEventKind::Press,
-        Msg::Input(Event::Mouse(m)) => matches!(m.kind, MouseEventKind::Down(_)),
-        _ => false,
-    };
-    if dismiss {
-        editor.splash = None;
-        Handled::Done(!editor.quit)
-    } else {
-        Handled::Pass(msg)
+    match msg {
+        Msg::Input(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+            editor.splash = None;
+            Handled::Done(!editor.quit)
+        }
+        Msg::Input(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Down(_)) => {
+            editor.splash = None;
+            Handled::Done(!editor.quit)
+        }
+        // Paste under the splash: consume WITHOUT dismissing and WITHOUT editing the
+        // document — a silent paste-through would overwrite the register and the buffer
+        // while the wordmark still covers the screen (no-silent-UI law).
+        Msg::Input(Event::Paste(_)) => Handled::Done(!editor.quit),
+        other => Handled::Pass(other),
     }
 }
 
@@ -246,6 +253,24 @@ mod tests {
             Handled::Pass(_) => panic!("mouse-down must be consumed"),
         }
         assert!(e.splash.is_none());
+    }
+
+    #[test]
+    fn intercept_paste_is_swallowed_without_dismissing_or_editing() {
+        // A terminal paste while the splash is up must not silently edit the document
+        // or overwrite the paste register — mirrors app.rs's
+        // bracketed_paste_with_modal_prompt_is_ignored precedent for modal prompts.
+        let mut e = splashed_editor();
+        e.register.set("keep".into());
+        let doc_before = e.active().document.buffer.to_string();
+        let msg = Msg::Input(Event::Paste("X".into()));
+        match run_intercept(msg, &mut e) {
+            Handled::Done(keep) => assert!(keep, "consumed, app keeps running"),
+            Handled::Pass(_) => panic!("paste under the splash must be consumed, not passed"),
+        }
+        assert!(e.splash.is_some(), "the splash stays up — paste does not dismiss it");
+        assert_eq!(e.active().document.buffer.to_string(), doc_before, "paste must NOT edit the document");
+        assert_eq!(e.register.get(), Some("keep"), "paste must NOT overwrite the register");
     }
 
     #[test]
