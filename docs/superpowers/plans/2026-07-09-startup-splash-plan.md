@@ -10,6 +10,8 @@
 
 **Spec (source of truth):** `docs/superpowers/specs/2026-07-09-startup-splash-design.md` (committed at 00c458c, Codex GO). All line anchors below were re-verified against branch `effort-splash` at 00c458c — none had drifted.
 
+**Codex plan review: GO** (round 2, 2026-07-10). Round 1 found one repeated Important (multi-filter `cargo test` run-steps — cargo rejects them; moved filters after `--`, folded at `1bc717e`); no Critical/Minor, and all code snippets/signatures/settings-migration sites were confirmed real against the branch. Round 2 confirmed the fix and re-verified the source shapes — clean GO. Ready for task-by-task subagent execution.
+
 ## Global Constraints
 
 - Do NOT run `cargo fmt` (repo is hand-formatted, dense; no rustfmt.toml). Match neighbors by hand.
