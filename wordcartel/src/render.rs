@@ -9,6 +9,7 @@ use ratatui::{
     widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
+use wordcartel_core::layout::{ColMap, VisualRow};
 use wordcartel_core::style::Style;
 use wordcartel_core::theme::SemanticElement as SE;
 
@@ -212,7 +213,6 @@ impl ChromeStyles {
 ///
 /// §15.6 tiny-terminal guard: if width < 4 or height < 2, paint a clamped
 /// "too small" notice and return without indexing out of bounds.
-#[allow(clippy::too_many_lines)] // the render() body split is the tracked H1 follow-up (engineering-health.md)
 pub fn render(frame: &mut Frame, editor: &mut Editor) {
     let area = frame.area();
     let w = area.width;
@@ -234,12 +234,6 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     let edit_height = h.saturating_sub(1 + menu_rows); // rows available for editing content
     let edit_top = area.y + menu_rows;
     let status_row = area.y + h - 1;
-
-    // -----------------------------------------------------------------------
-    // Editing area: walk visible logical lines from view.scroll
-    // -----------------------------------------------------------------------
-    let scroll = editor.active().view.scroll;
-    let mut screen_row: u16 = 0;
 
     // Centered-measure geometry: ONE call here so paint + cursor never desync.
     let tg = crate::nav::text_geometry(editor);
@@ -274,6 +268,201 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Editing area: the visible-row paint loop (phases 6–8, extracted). Snapshots
+    // its per-frame inputs via gather_row_ctx, then paints each visible row.
+    // -----------------------------------------------------------------------
+    paint_rows(frame, editor, area, edit_top, edit_height, &tg);
+
+    // -----------------------------------------------------------------------
+    // Chrome styles — built once here so the scrollbar, status line, and all
+    // overlay/menu painters below can borrow editor fields freely.
+    // -----------------------------------------------------------------------
+    let cs = ChromeStyles::build(&editor.theme, editor.depth, editor.canvas);
+
+    // -----------------------------------------------------------------------
+    // Scrollbar overlay (painted over editing area, rightmost column)
+    // -----------------------------------------------------------------------
+    if editor.mouse.scrollbar_visible {
+        let fv = editor.active_fold_view();
+        let total = fv.visible_count();
+        let scroll_pos = fv.visible_ordinal(editor.active().view.scroll);
+        let sb_area = Rect::new(area.x, edit_top, w, edit_height);
+        let mut sb_state = ScrollbarState::new(total).position(scroll_pos);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .track_style(cs.scrollbar_track)
+                .thumb_style(cs.scrollbar_thumb),
+            sb_area,
+            &mut sb_state,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Status line (bottom row)
+    // -----------------------------------------------------------------------
+    paint_status(frame, editor, area, status_row, &cs);
+
+    // -----------------------------------------------------------------------
+    // Hardware cursor
+    // -----------------------------------------------------------------------
+    place_cursor(frame, editor, area, edit_top, edit_height, status_row, &tg);
+
+    crate::render_overlays::paint(frame, editor, &cs);
+}
+
+/// Phase 11 — the bottom status row: search bar / minibuffer / prompt / normal /
+/// calm-hidden selection, right-flush Ln/Col/words composition, full-row set_style
+/// THEN the Paragraph. Reads editor immutably.
+fn paint_status(frame: &mut Frame, editor: &Editor, area: Rect, status_row: u16, cs: &ChromeStyles) {
+    let w = area.width;
+    // When the search overlay is active, render the search bar.
+    // When a modal prompt is active, render its message instead of the normal
+    // status text, using a distinct style so it stands out.
+    // When the minibuffer is open, render <prompt><text> on the status row.
+    let (status_text, status_style) = if let Some(ref s) = editor.search {
+        (
+            crate::render_status::format_search_bar(s),
+            cs.ov_accent,
+        )
+    } else if let Some(ref mb) = editor.minibuffer {
+        (
+            format!("{}{}", mb.prompt, mb.text),
+            cs.ov_accent,
+        )
+    } else if let Some(ref prompt) = editor.prompt {
+        (
+            prompt.message.clone(),
+            cs.ov_accent,
+        )
+    } else {
+        // Normal state. Under zen/Auto idle with no message, the reserved row renders
+        // as calm canvas (base bg); visible reveal via On / dwell / message force.
+        if crate::chrome::status_line_visible(editor) {
+            (crate::render_status::status_left_text(editor), cs.menu_closed) // visible: [Chrome] panel bg
+        } else {
+            // Calm canvas: the same bg-only fill the edit band uses — NOT chrome.
+            let mut calm = compose::base_canvas(&editor.theme, editor.depth);
+            calm.fg = None;
+            (String::new(), calm)
+        }
+    };
+
+    // Compose the status line.
+    // When in the normal branch (no prompt/minibuffer/search) and word_count is on,
+    // flush the count segment to the right and truncate the left (path/mode) to fit.
+    // When the status row is calm-hidden (Auto idle, no message), suppress the word-count
+    // segment so Ln/Col · words does not paint over the calm canvas row.
+    let has_overlay = editor.search.is_some() || editor.minibuffer.is_some() || editor.prompt.is_some() || editor.diag.is_some() || editor.outline.is_some();
+    let status_hidden = !has_overlay && !crate::chrome::status_line_visible(editor);
+    let composed = if !has_overlay && !status_hidden {
+        if let Some(wc) = crate::render_status::word_count_segment(editor) {
+            let caret = crate::nav::head(editor);
+            let (l, c) = editor.active().document.buffer.caret_line_col(caret);
+            let right = format!("Ln {l}, Col {c} · {wc}");
+            let reserve = right.chars().count() + 1;
+            let left: String = status_text.chars().take((w as usize).saturating_sub(reserve)).collect();
+            let pad = (w as usize).saturating_sub(left.chars().count() + right.chars().count());
+            format!("{left}{}{right}", " ".repeat(pad))
+        } else {
+            status_text.chars().take(w as usize).collect()
+        }
+    } else {
+        status_text.chars().take(w as usize).collect()
+    };
+    // Truncate the composed string to the terminal width (guard for very narrow terminals).
+    let truncated: String = composed.chars().take(w as usize).collect();
+    let status_line = Line::from(Span::styled(truncated, status_style));
+    let status_area = Rect::new(area.x, status_row, w, 1);
+    // Fill the WHOLE row with the state's chrome style first — the Paragraph
+    // styles only the text span, and a partial bar next to the full-width menu
+    // bar was the reported-mismatch class (Fable whole-branch I-2).
+    frame.buffer_mut().set_style(status_area, status_style);
+    frame.render_widget(Paragraph::new(status_line), status_area);
+}
+
+/// Phase 12 — the hardware cursor: search-field / minibuffer / normal-caret arms,
+/// char-count column math, D2 clamp of the normal caret col to tg.text_width.
+fn place_cursor(frame: &mut Frame, editor: &Editor, area: Rect, edit_top: u16,
+    edit_height: u16, status_row: u16, tg: &nav::TextGeometry) {
+    let w = area.width;
+    if let Some(ref s) = editor.search {
+        // Search bar is open: place caret on the status row at the focused field's caret.
+        // Use char counts (not byte offsets) for correct placement with multibyte text.
+        let prefix_cols = match s.field {
+            crate::search_overlay::Field::Needle => "Find: ".chars().count(),
+            crate::search_overlay::Field::Template =>
+                format!("Find: {}  Replace: ", s.needle).chars().count(),
+        };
+        let caret_cols = s.focused_field()[..s.cursor].chars().count();
+        let x_offset = (prefix_cols + caret_cols) as u16;
+        if x_offset < w {
+            frame.set_cursor_position(Position { x: area.x + x_offset, y: status_row });
+        }
+    } else if let Some(ref mb) = editor.minibuffer {
+        // Minibuffer is open: place caret on the status row at prompt.len() + cursor.
+        // cursor is a byte offset; for display we want the char count so the terminal
+        // column is correct even for multi-byte prompts/text (small strings, safe).
+        let prompt_cols = mb.prompt.chars().count() as u16;
+        let text_cols = mb.text[..mb.cursor].chars().count() as u16;
+        let caret_col = prompt_cols + text_cols;
+        if caret_col < w {
+            frame.set_cursor_position(Position { x: area.x + caret_col, y: status_row });
+        }
+    } else if let Some((col, row)) = nav::screen_pos(editor) {
+        // Guard rows; clamp cols — a caret on/after hung trailing whitespace sits
+        // logically past the text rect and pins at the edge (spec D2 clamp).
+        if row < edit_height && tg.text_width > 0 {
+            let col = col.min((tg.text_width as usize).saturating_sub(1) as u16);
+            frame.set_cursor_position(Position { x: area.x + tg.text_left + col, y: edit_top + row });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fold marker helper
+// ---------------------------------------------------------------------------
+
+/// If logical line `l` is the heading line of a folded section, return the hidden
+/// body line count; otherwise None. Pure — drives both the marker glyph and tests.
+pub fn fold_marker_for(editor: &crate::editor::Editor, l: usize) -> Option<usize> {
+    let b = editor.active();
+    let buf = &b.document.buffer;
+    // The folded anchor whose heading line is `l`.
+    let hb = b.folds.folded().iter().copied().find(|&hb| buf.byte_to_line(hb) == l)?;
+    Some(crate::fold::hidden_count_lines(b.document.blocks(), buf, hb))
+}
+
+// ---------------------------------------------------------------------------
+// Row-loop extraction (H14b): the per-frame snapshot + the two span builders +
+// the two shared unification helpers + the paint loop driver.
+// ---------------------------------------------------------------------------
+
+/// Per-frame inputs the row-paint loop reads (render() phases 6–7). EXACTLY the
+/// 12 fields paint_rows/row_spans_* read. has_block/block_hidden/diag_active are
+/// gather-time locals feeding use_placed/diag_all — NOT fields (a written-but-unread
+/// field would trip the warning-free gate).
+struct RowCtx<'a> {
+    scroll: usize,
+    focus_region: Option<(usize, usize)>,
+    sorted_lines: Vec<usize>,
+    hl_current: Option<wordcartel_core::search::Match>,
+    hl_window: Vec<wordcartel_core::search::Match>,
+    diag_all: &'a [wordcartel_core::diagnostics::Diagnostic],
+    sel_from: usize,
+    sel_to: usize,
+    has_sel: bool,
+    marked_block: Option<crate::editor::MarkedBlock>,
+    use_placed: bool,
+    plain_source: bool,
+}
+
+/// Snapshot the row loop's per-frame inputs (render() phases 6–7). has_block/block_hidden/
+/// diag_active are gather-time locals feeding use_placed/diag_all; only the 12 fields the paint
+/// path reads are kept in RowCtx.
+fn gather_row_ctx(editor: &Editor) -> RowCtx<'_> {
+    let scroll = editor.active().view.scroll;
 
     // Compute the active focus region once (before the row loop) when focus is on.
     // For Paragraph: use paragraph_range_at at the caret.
@@ -355,240 +544,212 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
     // their construct's style from layout, so they colour too).
     let plain_source = editor.active().view.mode == crate::editor::RenderMode::SourcePlain;
 
-    'outer: for &l in &sorted_lines {
-        if l < scroll {
-            continue;
-        }
-        let (visual_rows, map) = &editor.active().view.line_layouts[&l];
-        let skip_rows = if l == scroll {
-            editor.active().view.scroll_row
+    RowCtx {
+        scroll, focus_region, sorted_lines, hl_current, hl_window, diag_all,
+        sel_from, sel_to, has_sel, marked_block, use_placed, plain_source,
+    }
+}
+
+/// The per-glyph style ladder shared by both row-span builders, keyed on the inline
+/// `Style` value (seg.style / p.style). The dim non-plain arm is the distinct
+/// 4-element compose [Text, role, style, FocusDim] (NOT compose(...).add_modifier(DIM)) —
+/// preserves heading bold / comment italic on dim rows (§13.2 FIX-1).
+fn ladder_style(theme: &wordcartel_core::theme::Theme, depth: wordcartel_core::theme::Depth,
+                role: wordcartel_core::style::BlockRole, inline: wordcartel_core::style::Style,
+                row_dim: bool, plain_source: bool) -> RStyle {
+    if row_dim {
+        if plain_source {
+            compose::compose(theme, depth, &[SE::Text, SE::FocusDim])
         } else {
-            0
-        };
+            compose::compose(theme, depth, &[SE::Text, role_element(role), style_element(inline), SE::FocusDim])
+        }
+    } else if plain_source {
+        compose::compose(theme, depth, &[SE::Text])
+    } else {
+        compose::compose(theme, depth, &[SE::Text, role_element(role), style_element(inline)])
+    }
+}
+
+/// Prefix lead-in shared by both row-span builders. Row 0 of a prefixed line paints the
+/// real glyph — a heading inverted-numeral box (REVERSED glyph + NORMAL space) when
+/// heading_level_glyph is on, else the dim single-span glyph; continuation rows push a
+/// prefix_width blank spacer so text stays aligned with the prefix-offset cursor columns.
+fn push_prefix_lead_in(spans: &mut Vec<Span<'static>>,
+                       theme: &wordcartel_core::theme::Theme,
+                       depth: wordcartel_core::theme::Depth,
+                       vr: &VisualRow, map: &ColMap, row_dim: bool) {
+    if let Some(ref glyph) = vr.prefix_glyph {
+        let pe = prefix_element(vr.role);
+        let heading_n = if theme.heading_level_glyph {
+            if let wordcartel_core::style::BlockRole::Heading(n) = vr.role { Some(n) } else { None }
+        } else { None };
+        if let Some(n) = heading_n {
+            let g = HEADING_GLYPHS[(n.clamp(1, 6) - 1) as usize];
+            let base = if row_dim {
+                compose::compose(theme, depth, &[pe, SE::FocusDim])
+            } else {
+                compose::compose(theme, depth, &[pe])
+            };
+            spans.push(Span::styled(g.to_string(), base.add_modifier(Modifier::REVERSED)));
+            spans.push(Span::styled(" ".to_string(), base));
+        } else {
+            let gstyle = if row_dim {
+                compose::compose(theme, depth, &[pe, SE::FocusDim])
+            } else {
+                compose::compose(theme, depth, &[pe]).add_modifier(Modifier::DIM)
+            };
+            spans.push(Span::styled(glyph.clone(), gstyle));
+        }
+    } else if map.prefix_width > 0 {
+        spans.push(Span::raw(" ".repeat(map.prefix_width)));
+    }
+}
+
+/// Segs fast path (true no-op rows, no per-glyph styling) — the builder for
+/// !use_placed rows.
+fn row_spans_segs(editor: &Editor, ctx: &RowCtx, vr: &VisualRow, map: &ColMap,
+                  row_dim: bool) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    push_prefix_lead_in(&mut spans, &editor.theme, editor.depth, vr, map, row_dim);
+    for seg in &vr.segs {
+        let style = ladder_style(&editor.theme, editor.depth, vr.role, seg.style, row_dim, ctx.plain_source);
+        let style = text_fg_or_base(style, &editor.theme, editor.depth);
+        spans.push(Span::styled(seg.text.clone(), style));
+    }
+    spans
+}
+
+/// Placed path: build spans from map.placed, per-glyph search highlight and/or
+/// diagnostic underline. Fires when search is active OR valid diagnostics are
+/// present OR a selection / visible marked block must be painted.
+fn row_spans_placed(editor: &Editor, ctx: &RowCtx, l: usize, row_index: usize,
+                    vr: &VisualRow, map: &ColMap, row_dim: bool) -> Vec<Span<'static>> {
+    let buf = &editor.active().document.buffer;
+    let line_off = derive::line_start(buf, l);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    // Compute the visible byte span for this visual row so we can window the
+    // diagnostics. src_span is relative to the logical line start.
+    let lo = line_off + vr.src_span.start;
+    let hi = line_off + vr.src_span.end;
+
+    // Window diagnostics by upper bound only (diagnostics may overlap so end is
+    // not monotonic — binary lower-bound on end is unsound). Upper-bound
+    // partition_point + linear filter for end > lo.
+    let hi_idx = ctx.diag_all.partition_point(|d| d.range.start < hi);
+    let diag_window: Vec<&wordcartel_core::diagnostics::Diagnostic> =
+        ctx.diag_all[..hi_idx].iter().filter(|d| d.range.end > lo).collect();
+
+    push_prefix_lead_in(&mut spans, &editor.theme, editor.depth, vr, map, row_dim);
+
+    // One span per run of glyphs sharing the same (style, highlight-kind).
+    let mut run = String::new();
+    let mut run_style: Option<RStyle> = None;
+    for p in map.placed.iter().filter(|p| p.row == row_index) {
+        let g_from = line_off + p.src.start;
+        let g_to = line_off + p.src.end;
+        let is_current = ctx.hl_current.is_some_and(|m| overlaps(g_from, g_to, m.start, m.end));
+        let is_match = !is_current && ctx.hl_window.iter().any(|m| overlaps(g_from, g_to, m.start, m.end));
+
+        let mut style = ladder_style(&editor.theme, editor.depth, vr.role, p.style, row_dim, ctx.plain_source);
+
+        // MarkedBlock composes BELOW Selection/Search/Diag (base → MarkedBlock →
+        // Selection → …). Only visible placed cells are touched; hidden lines are
+        // never in `map.placed`, so the block paint is inherently fold-safe.
+        if let Some(b) = ctx.marked_block {
+            if !b.hidden && overlaps(g_from, g_to, b.start, b.end) {
+                let mb_face = editor.theme.face(SE::MarkedBlock);
+                style = style.patch(crate::compose::face_to_ratatui(&mb_face, editor.depth));
+            }
+        }
+
+        // FIX-2: Selection layers first; a current search match patches over it so
+        // it stands out; diagnostics last. (Spec §3.4: Selection → Search → Diag.)
+        // Cue-mode modifiers accumulate (selection underline + search bold = both
+        // visible), so §13.2 is preserved.
+        let is_selected = ctx.has_sel && overlaps(g_from, g_to, ctx.sel_from, ctx.sel_to);
+        if is_selected {
+            let sel_face = editor.theme.face(SE::Selection);
+            style = style.patch(crate::compose::face_to_ratatui(&sel_face, editor.depth));
+        }
+        if is_current {
+            let search_face = editor.theme.face(SE::SearchCurrent);
+            let ss = crate::compose::face_to_ratatui(&search_face, editor.depth);
+            style = style.patch(ss);
+        } else if is_match {
+            let search_face = editor.theme.face(SE::SearchMatch);
+            let ss = crate::compose::face_to_ratatui(&search_face, editor.depth);
+            style = style.patch(ss);
+        }
+
+        // Apply diagnostic underline if this glyph overlaps any diagnostic.
+        // Search-highlight precedence stands: underline may stack on REVERSED.
+        if let Some(d) = diag_window.iter().find(|d| overlaps(g_from, g_to, d.range.start, d.range.end)) {
+            let diag_face = match d.kind {
+                wordcartel_core::diagnostics::DiagnosticKind::Spelling =>
+                    compose::compose(&editor.theme, editor.depth, &[SE::DiagSpelling]),
+                wordcartel_core::diagnostics::DiagnosticKind::Grammar =>
+                    compose::compose(&editor.theme, editor.depth, &[SE::DiagGrammar]),
+            };
+            style = style.add_modifier(diag_face.add_modifier);
+            if let Some(uc) = diag_face.underline_color {
+                style = style.underline_color(uc);
+            }
+        }
+
+        // Apply base_fg fallback BEFORE the run-accumulation comparison so runs of
+        // plain body text share one span rather than splitting.
+        let style = text_fg_or_base(style, &editor.theme, editor.depth);
+
+        // Flush the accumulated run when the style changes.
+        if run_style != Some(style) && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), run_style.unwrap()));
+        }
+        run_style = Some(style);
+        run.push_str(&p.text);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, run_style.unwrap()));
+    }
+    spans
+}
+
+/// Phase 8 — the visible-row paint loop. Owns screen_row, the outer/inner loop,
+/// row_dim, fold marker, the segs/placed selector, fold-marker insert, and the
+/// per-row render_widget. tg is passed in (single-call invariant) — never recompute.
+fn paint_rows(frame: &mut Frame, editor: &Editor, area: Rect,
+              edit_top: u16, edit_height: u16, tg: &nav::TextGeometry) {
+    let ctx = gather_row_ctx(editor);
+    let mut screen_row: u16 = 0;
+    'outer: for &l in &ctx.sorted_lines {
+        if l < ctx.scroll { continue; }
+        let (visual_rows, map) = &editor.active().view.line_layouts[&l];
+        let skip_rows = if l == ctx.scroll { editor.active().view.scroll_row } else { 0 };
         for (row_index, vr) in visual_rows.iter().enumerate() {
-            if row_index < skip_rows {
-                continue;
-            }
-            if screen_row >= edit_height {
-                break 'outer;
-            }
+            if row_index < skip_rows { continue; }
+            if screen_row >= edit_height { break 'outer; }
 
             // Determine whether this visual row is dim (outside the active region).
-            let row_dim = if let Some((from, to)) = focus_region {
+            let row_dim = if let Some((from, to)) = ctx.focus_region {
                 let buf = &editor.active().document.buffer;
                 let line_off = derive::line_start(buf, l);
                 let g_from = line_off + vr.src_span.start;
                 let g_to = line_off + vr.src_span.end;
                 !row_is_active(g_from, g_to, from, to)
-            } else {
-                false
-            };
+            } else { false };
 
             // 5g: compute fold marker before span-building borrows.
             let fold_marker_n: Option<usize> = if row_index == skip_rows {
                 fold_marker_for(editor, l)
+            } else { None };
+
+            let mut spans = if !ctx.use_placed {
+                row_spans_segs(editor, &ctx, vr, map, row_dim)
             } else {
-                None
-            };
-
-            // Build spans for this visual row.
-            let spans: Vec<Span<'_>> = if !use_placed {
-                // ---------------------------------------------------------------
-                // EXISTING segs-based path (no active search, no diagnostics) — true no-op.
-                // ---------------------------------------------------------------
-                let mut segs_spans: Vec<Span<'_>> = Vec::new();
-                // Prefix lead-in. Row 0 paints the real glyph; continuation rows
-                // of a prefixed line paint a blank spacer of `prefix_width` cells
-                // so painted text stays aligned with the prefix-offset cursor
-                // columns (`Placed.col` already includes `prefix_width`).
-                if let Some(ref glyph) = vr.prefix_glyph {
-                    let pe = prefix_element(vr.role);
-                    // Heading inverted-numeral box: paint the glyph REVERSED (box fill = heading
-                    // colour) at full intensity, then a NORMAL space — a 1-cell box inside the
-                    // 2-cell gutter. Inactive rows carry FocusDim so the box recedes. Other prefixes
-                    // (blockquote, list) keep the dim single-span rendering.
-                    let heading_n = if editor.theme.heading_level_glyph {
-                        if let wordcartel_core::style::BlockRole::Heading(n) = vr.role { Some(n) } else { None }
-                    } else { None };
-                    if let Some(n) = heading_n {
-                        let g = HEADING_GLYPHS[(n.clamp(1, 6) - 1) as usize];
-                        let base = if row_dim {
-                            compose::compose(&editor.theme, editor.depth, &[pe, SE::FocusDim])
-                        } else {
-                            compose::compose(&editor.theme, editor.depth, &[pe])
-                        };
-                        segs_spans.push(Span::styled(g.to_string(), base.add_modifier(Modifier::REVERSED)));
-                        segs_spans.push(Span::styled(" ".to_string(), base));
-                    } else {
-                        let gstyle = if row_dim {
-                            compose::compose(&editor.theme, editor.depth, &[pe, SE::FocusDim])
-                        } else {
-                            compose::compose(&editor.theme, editor.depth, &[pe]).add_modifier(Modifier::DIM)
-                        };
-                        segs_spans.push(Span::styled(glyph.clone(), gstyle));
-                    }
-                } else if map.prefix_width > 0 {
-                    segs_spans.push(Span::raw(" ".repeat(map.prefix_width)));
-                }
-                for seg in &vr.segs {
-                    let style = if row_dim {
-                        if plain_source {
-                            compose::compose(&editor.theme, editor.depth, &[SE::Text, SE::FocusDim])
-                        } else {
-                            // §13.2 FIX-1: compose FocusDim OVER the semantic stack so heading
-                            // bold, comment italic, etc. are preserved on dim rows (§3.4 intent).
-                            compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(seg.style), SE::FocusDim])
-                        }
-                    } else if plain_source {
-                        compose::compose(&editor.theme, editor.depth, &[SE::Text])
-                    } else {
-                        compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(seg.style)])
-                    };
-                    let style = text_fg_or_base(style, &editor.theme, editor.depth);
-                    segs_spans.push(Span::styled(seg.text.clone(), style));
-                }
-                segs_spans
-            } else {
-                // ---------------------------------------------------------------
-                // Placed path: build spans from map.placed, per-glyph search highlight
-                // and/or diagnostic underline. Fires when search is active OR valid
-                // diagnostics are present.
-                // ---------------------------------------------------------------
-                let buf = &editor.active().document.buffer;
-                let line_off = derive::line_start(buf, l);
-                let mut hl_spans: Vec<Span<'_>> = Vec::new();
-
-                // Compute the visible byte span for this visual row so we can window
-                // the diagnostics. src_span is relative to the logical line start.
-                let lo = line_off + vr.src_span.start;
-                let hi = line_off + vr.src_span.end;
-
-                // Window diagnostics by upper bound only (diagnostics may overlap so
-                // end is not monotonic — binary lower-bound on end is unsound).
-                // Upper-bound partition_point + linear filter for end > lo.
-                let hi_idx = diag_all.partition_point(|d| d.range.start < hi);
-                let diag_window: Vec<&wordcartel_core::diagnostics::Diagnostic> =
-                    diag_all[..hi_idx].iter().filter(|d| d.range.end > lo).collect();
-
-                // Prefix lead-in. Row 0 paints the real glyph (unsearchable, dim
-                // only); continuation rows of a prefixed line paint a blank
-                // spacer of `prefix_width` cells so painted text stays aligned
-                // with the prefix-offset cursor columns.
-                if let Some(ref glyph) = vr.prefix_glyph {
-                    let pe = prefix_element(vr.role);
-                    // Heading inverted-numeral box (mirror of the segs path): REVERSED glyph +
-                    // normal space; other prefixes keep the dim single span.
-                    let heading_n = if editor.theme.heading_level_glyph {
-                        if let wordcartel_core::style::BlockRole::Heading(n) = vr.role { Some(n) } else { None }
-                    } else { None };
-                    if let Some(n) = heading_n {
-                        let g = HEADING_GLYPHS[(n.clamp(1, 6) - 1) as usize];
-                        let base = if row_dim {
-                            compose::compose(&editor.theme, editor.depth, &[pe, SE::FocusDim])
-                        } else {
-                            compose::compose(&editor.theme, editor.depth, &[pe])
-                        };
-                        hl_spans.push(Span::styled(g.to_string(), base.add_modifier(Modifier::REVERSED)));
-                        hl_spans.push(Span::styled(" ".to_string(), base));
-                    } else {
-                        let gstyle = if row_dim {
-                            compose::compose(&editor.theme, editor.depth, &[pe, SE::FocusDim])
-                        } else {
-                            compose::compose(&editor.theme, editor.depth, &[pe]).add_modifier(Modifier::DIM)
-                        };
-                        hl_spans.push(Span::styled(glyph.clone(), gstyle));
-                    }
-                } else if map.prefix_width > 0 {
-                    hl_spans.push(Span::raw(" ".repeat(map.prefix_width)));
-                }
-
-                // One span per run of glyphs sharing the same (style, highlight-kind).
-                let mut run = String::new();
-                let mut run_style: Option<RStyle> = None;
-
-                for p in map.placed.iter().filter(|p| p.row == row_index) {
-                    let g_from = line_off + p.src.start;
-                    let g_to = line_off + p.src.end;
-                    let is_current = hl_current.is_some_and(|m| overlaps(g_from, g_to, m.start, m.end));
-                    let is_match = !is_current && hl_window.iter().any(|m| overlaps(g_from, g_to, m.start, m.end));
-
-                    let mut style = if row_dim {
-                        if plain_source {
-                            compose::compose(&editor.theme, editor.depth, &[SE::Text, SE::FocusDim])
-                        } else {
-                            // §13.2 FIX-1: compose FocusDim OVER the semantic stack so heading
-                            // bold, comment italic, etc. are preserved on dim rows (§3.4 intent).
-                            compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(p.style), SE::FocusDim])
-                        }
-                    } else if plain_source {
-                        compose::compose(&editor.theme, editor.depth, &[SE::Text])
-                    } else {
-                        compose::compose(&editor.theme, editor.depth, &[SE::Text, role_element(vr.role), style_element(p.style)])
-                    };
-
-                    // MarkedBlock composes BELOW Selection/Search/Diag (base → MarkedBlock →
-                    // Selection → …). Only visible placed cells are touched; hidden lines are
-                    // never in `map.placed`, so the block paint is inherently fold-safe.
-                    if let Some(b) = marked_block {
-                        if !b.hidden && overlaps(g_from, g_to, b.start, b.end) {
-                            let mb_face = editor.theme.face(SE::MarkedBlock);
-                            style = style.patch(crate::compose::face_to_ratatui(&mb_face, editor.depth));
-                        }
-                    }
-
-                    // FIX-2: Selection layers first; a current search match patches over it so
-                    // it stands out; diagnostics last. (Spec §3.4: Selection → Search → Diag.)
-                    // Cue-mode modifiers accumulate (selection underline + search bold = both
-                    // visible), so §13.2 is preserved.
-                    let is_selected = has_sel && overlaps(g_from, g_to, sel_from, sel_to);
-                    if is_selected {
-                        let sel_face = editor.theme.face(SE::Selection);
-                        style = style.patch(crate::compose::face_to_ratatui(&sel_face, editor.depth));
-                    }
-                    if is_current {
-                        let search_face = editor.theme.face(SE::SearchCurrent);
-                        let ss = crate::compose::face_to_ratatui(&search_face, editor.depth);
-                        style = style.patch(ss);
-                    } else if is_match {
-                        let search_face = editor.theme.face(SE::SearchMatch);
-                        let ss = crate::compose::face_to_ratatui(&search_face, editor.depth);
-                        style = style.patch(ss);
-                    }
-
-                    // Apply diagnostic underline if this glyph overlaps any diagnostic.
-                    // Search-highlight precedence stands: underline may stack on REVERSED.
-                    if let Some(d) = diag_window.iter().find(|d| overlaps(g_from, g_to, d.range.start, d.range.end)) {
-                        let diag_face = match d.kind {
-                            wordcartel_core::diagnostics::DiagnosticKind::Spelling =>
-                                compose::compose(&editor.theme, editor.depth, &[SE::DiagSpelling]),
-                            wordcartel_core::diagnostics::DiagnosticKind::Grammar =>
-                                compose::compose(&editor.theme, editor.depth, &[SE::DiagGrammar]),
-                        };
-                        style = style.add_modifier(diag_face.add_modifier);
-                        if let Some(uc) = diag_face.underline_color {
-                            style = style.underline_color(uc);
-                        }
-                    }
-
-                    // Apply base_fg fallback BEFORE the run-accumulation comparison
-                    // so runs of plain body text share one span rather than splitting.
-                    let style = text_fg_or_base(style, &editor.theme, editor.depth);
-
-                    // Flush the accumulated run when the style changes.
-                    if run_style != Some(style) && !run.is_empty() {
-                        hl_spans.push(Span::styled(std::mem::take(&mut run), run_style.unwrap()));
-                    }
-                    run_style = Some(style);
-                    run.push_str(&p.text);
-                }
-                if !run.is_empty() {
-                    hl_spans.push(Span::styled(run, run_style.unwrap()));
-                }
-                hl_spans
+                row_spans_placed(editor, &ctx, l, row_index, vr, map, row_dim)
             };
 
             // 5g: fold marker on the heading's first visual row.
-            let mut spans = spans;
             if let Some(n) = fold_marker_n {
                 spans.insert(0, Span::styled("▸ ", compose::compose(&editor.theme, editor.depth, &[SE::FoldMarker])));
                 spans.push(Span::styled(
@@ -600,154 +761,9 @@ pub fn render(frame: &mut Frame, editor: &mut Editor) {
             let line_widget = Line::from(spans);
             let row_area = Rect::new(area.x + tg.text_left, edit_top + screen_row, tg.text_width, 1);
             frame.render_widget(Paragraph::new(line_widget), row_area);
-
             screen_row += 1;
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Chrome styles — built once here so the scrollbar, status line, and all
-    // overlay/menu painters below can borrow editor fields freely.
-    // -----------------------------------------------------------------------
-    let cs = ChromeStyles::build(&editor.theme, editor.depth, editor.canvas);
-
-    // -----------------------------------------------------------------------
-    // Scrollbar overlay (painted over editing area, rightmost column)
-    // -----------------------------------------------------------------------
-    if editor.mouse.scrollbar_visible {
-        let fv = editor.active_fold_view();
-        let total = fv.visible_count();
-        let scroll_pos = fv.visible_ordinal(editor.active().view.scroll);
-        let sb_area = Rect::new(area.x, edit_top, w, edit_height);
-        let mut sb_state = ScrollbarState::new(total).position(scroll_pos);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .track_style(cs.scrollbar_track)
-                .thumb_style(cs.scrollbar_thumb),
-            sb_area,
-            &mut sb_state,
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Status line (bottom row)
-    // -----------------------------------------------------------------------
-    {
-        // When the search overlay is active, render the search bar.
-        // When a modal prompt is active, render its message instead of the normal
-        // status text, using a distinct style so it stands out.
-        // When the minibuffer is open, render <prompt><text> on the status row.
-        let (status_text, status_style) = if let Some(ref s) = editor.search {
-            (
-                crate::render_status::format_search_bar(s),
-                cs.ov_accent,
-            )
-        } else if let Some(ref mb) = editor.minibuffer {
-            (
-                format!("{}{}", mb.prompt, mb.text),
-                cs.ov_accent,
-            )
-        } else if let Some(ref prompt) = editor.prompt {
-            (
-                prompt.message.clone(),
-                cs.ov_accent,
-            )
-        } else {
-            // Normal state. Under zen/Auto idle with no message, the reserved row renders
-            // as calm canvas (base bg); visible reveal via On / dwell / message force.
-            if crate::chrome::status_line_visible(editor) {
-                (crate::render_status::status_left_text(editor), cs.menu_closed) // visible: [Chrome] panel bg
-            } else {
-                // Calm canvas: the same bg-only fill the edit band uses — NOT chrome.
-                let mut calm = compose::base_canvas(&editor.theme, editor.depth);
-                calm.fg = None;
-                (String::new(), calm)
-            }
-        };
-
-        // Compose the status line.
-        // When in the normal branch (no prompt/minibuffer/search) and word_count is on,
-        // flush the count segment to the right and truncate the left (path/mode) to fit.
-        // When the status row is calm-hidden (Auto idle, no message), suppress the word-count
-        // segment so Ln/Col · words does not paint over the calm canvas row.
-        let has_overlay = editor.search.is_some() || editor.minibuffer.is_some() || editor.prompt.is_some() || editor.diag.is_some() || editor.outline.is_some();
-        let status_hidden = !has_overlay && !crate::chrome::status_line_visible(editor);
-        let composed = if !has_overlay && !status_hidden {
-            if let Some(wc) = crate::render_status::word_count_segment(editor) {
-                let caret = crate::nav::head(editor);
-                let (l, c) = editor.active().document.buffer.caret_line_col(caret);
-                let right = format!("Ln {l}, Col {c} · {wc}");
-                let reserve = right.chars().count() + 1;
-                let left: String = status_text.chars().take((w as usize).saturating_sub(reserve)).collect();
-                let pad = (w as usize).saturating_sub(left.chars().count() + right.chars().count());
-                format!("{left}{}{right}", " ".repeat(pad))
-            } else {
-                status_text.chars().take(w as usize).collect()
-            }
-        } else {
-            status_text.chars().take(w as usize).collect()
-        };
-        // Truncate the composed string to the terminal width (guard for very narrow terminals).
-        let truncated: String = composed.chars().take(w as usize).collect();
-        let status_line = Line::from(Span::styled(truncated, status_style));
-        let status_area = Rect::new(area.x, status_row, w, 1);
-        // Fill the WHOLE row with the state's chrome style first — the Paragraph
-        // styles only the text span, and a partial bar next to the full-width menu
-        // bar was the reported-mismatch class (Fable whole-branch I-2).
-        frame.buffer_mut().set_style(status_area, status_style);
-        frame.render_widget(Paragraph::new(status_line), status_area);
-    }
-
-    // -----------------------------------------------------------------------
-    // Hardware cursor
-    // -----------------------------------------------------------------------
-    if let Some(ref s) = editor.search {
-        // Search bar is open: place caret on the status row at the focused field's caret.
-        // Use char counts (not byte offsets) for correct placement with multibyte text.
-        let prefix_cols = match s.field {
-            crate::search_overlay::Field::Needle => "Find: ".chars().count(),
-            crate::search_overlay::Field::Template =>
-                format!("Find: {}  Replace: ", s.needle).chars().count(),
-        };
-        let caret_cols = s.focused_field()[..s.cursor].chars().count();
-        let x_offset = (prefix_cols + caret_cols) as u16;
-        if x_offset < w {
-            frame.set_cursor_position(Position { x: area.x + x_offset, y: status_row });
-        }
-    } else if let Some(ref mb) = editor.minibuffer {
-        // Minibuffer is open: place caret on the status row at prompt.len() + cursor.
-        // cursor is a byte offset; for display we want the char count so the terminal
-        // column is correct even for multi-byte prompts/text (small strings, safe).
-        let prompt_cols = mb.prompt.chars().count() as u16;
-        let text_cols = mb.text[..mb.cursor].chars().count() as u16;
-        let caret_col = prompt_cols + text_cols;
-        if caret_col < w {
-            frame.set_cursor_position(Position { x: area.x + caret_col, y: status_row });
-        }
-    } else if let Some((col, row)) = nav::screen_pos(editor) {
-        // Guard rows; clamp cols — a caret on/after hung trailing whitespace sits
-        // logically past the text rect and pins at the edge (spec D2 clamp).
-        if row < edit_height && tg.text_width > 0 {
-            let col = col.min((tg.text_width as usize).saturating_sub(1) as u16);
-            frame.set_cursor_position(Position { x: area.x + tg.text_left + col, y: edit_top + row });
-        }
-    }
-
-    crate::render_overlays::paint(frame, editor, &cs);
-}
-
-// ---------------------------------------------------------------------------
-// Fold marker helper
-// ---------------------------------------------------------------------------
-
-/// If logical line `l` is the heading line of a folded section, return the hidden
-/// body line count; otherwise None. Pure — drives both the marker glyph and tests.
-pub fn fold_marker_for(editor: &crate::editor::Editor, l: usize) -> Option<usize> {
-    let b = editor.active();
-    let buf = &b.document.buffer;
-    // The folded anchor whose heading line is `l`.
-    let hb = b.folds.folded().iter().copied().find(|&hb| buf.byte_to_line(hb) == l)?;
-    Some(crate::fold::hidden_count_lines(b.document.blocks(), buf, hb))
 }
 
 // ---------------------------------------------------------------------------

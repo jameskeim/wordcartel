@@ -3,6 +3,7 @@
 pub mod base16;
 pub mod editor;
 pub mod derive;
+pub mod lines;
 pub mod nav;
 pub mod commands;
 pub mod input;
