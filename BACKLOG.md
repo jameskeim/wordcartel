@@ -3,7 +3,7 @@
 
 # Backlog
 
-**29 open · 30 shipped · 1 dropped**
+**31 open · 30 shipped · 1 dropped**
 
 Blocking Effort P: **3**
 
@@ -18,10 +18,12 @@ Blocking Effort P: **3**
 | A3b | Item-by-item menu-curation pass | ready | chore | S |  | Per-command menu vs palette-only curation; concrete Q: move Filter Edit->Format? |
 | A9 | Wrap Column state-in-label | needs-design | feature | S |  | Rename 'Set Wrap Column...' to stateful 'Wrap Column: <value>'. |
 | H12 | PTY smoke suite live-splash coverage (S9) | ready | chore | S |  | Add an S9 check that launches WITHOUT --no-splash and asserts the real splash journey. |
-| H7 | Audit .unwrap() usage across the tree | ready | debt | S |  | Classify the ~35 real-runtime unwraps: guarded->.expect vs fallible->typed error. |
+| H18 | Supply-chain audit (cargo audit / cargo deny) | needs-design | chore | S |  | Add CVE + license + duplicate/ban scanning (cargo audit and/or cargo deny config); pairs with H2's pre-P dependency pass. No config today. |
 | M8 | M5 follow-up: undo louder-hint for buffer-level merges | ready | debt | S |  | Finish the louder undo-eviction hint for buffer-level merges (the last M5 follow-up). |
 | M9 | Optional: upgrade/patch pulldown-cmark | watch | chore | S |  | M4-rest only ISOLATES its parse panic; a real upgrade is optional, low priority. |
 | B6 | Heading-glyph STYLE toggle | needs-design | feature | SM |  | Cycle shades / Nerd numerals / inverted numerals; default stays universal Shades. |
+| H17 | Pre-P public-API doc-coverage sweep | ready | debt | SM |  | Doc-comment public items (~180 in core alone) + enable #![warn(missing_docs)] as a gate; Effort P exposes this surface to plugins. |
+| H7 | Panic-safety & arithmetic-soundness audit | ready | debt | SM |  | Audit runtime panic sites (unwrap/expect/panic!/unreachable!) -> guarded .expect(msg) or typed status-line error; sweep ~147 numeric casts on BytePos/offset arithmetic for overflow/truncation. |
 | S3 | Snapshots — durable revision checkpoints | needs-design | feature | SM |  | Capture/list/diff/restore; reuses rope snapshot + ChangeSet; one net-new display diff. |
 | S1 | Rearrangeable outline / heading-subtree corkboard | needs-design | feature | M |  | Structure mode: atomic heading-subtree move via submit_transaction; drag-reorder. |
 | S2 | Directory-as-binder | needs-design | feature | L |  | Directory of .md as a manuscript: ordered manifest + compile step (post-Effort-P plugin). |

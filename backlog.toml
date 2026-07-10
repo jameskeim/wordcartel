@@ -623,13 +623,14 @@ shipped_date = "2026-07-09"
 
 [[item]]
 id = "H7"
-title = "Audit .unwrap() usage across the tree"
+title = "Panic-safety & arithmetic-soundness audit"
 status = "ready"
 kind = "debt"
-size = "S"
+size = "SM"
 theme = "H"
-hook = "Classify the ~35 real-runtime unwraps: guarded->.expect vs fallible->typed error."
+hook = "Audit runtime panic sites (unwrap/expect/panic!/unreachable!) -> guarded .expect(msg) or typed status-line error; sweep ~147 numeric casts on BytePos/offset arithmetic for overflow/truncation."
 doc = "engineering-health.md#h7"
+depends_on = ["H11", "H14"]
 created = "2026-07-09"
 
 [[item]]
@@ -740,6 +741,28 @@ doc = "backlog-archive.md#h16"
 created = "2026-07-04"
 shipped_commit = "111e9b2"
 shipped_date = "2026-07-08"
+
+[[item]]
+id = "H17"
+title = "Pre-P public-API doc-coverage sweep"
+status = "ready"
+kind = "debt"
+size = "SM"
+theme = "H"
+hook = "Doc-comment public items (~180 in core alone) + enable #![warn(missing_docs)] as a gate; Effort P exposes this surface to plugins."
+doc = "engineering-health.md#h17"
+created = "2026-07-10"
+
+[[item]]
+id = "H18"
+title = "Supply-chain audit (cargo audit / cargo deny)"
+status = "needs-design"
+kind = "chore"
+size = "S"
+theme = "H"
+hook = "Add CVE + license + duplicate/ban scanning (cargo audit and/or cargo deny config); pairs with H2's pre-P dependency pass. No config today."
+doc = "engineering-health.md#h18"
+created = "2026-07-10"
 
 # ─────────────────────────── Theme M — hardening campaign (remaining) ───────────────────────────
 

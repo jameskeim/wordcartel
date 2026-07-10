@@ -89,8 +89,20 @@ weigh: (a) auto-prune on launch (delete swaps whose owning pid is dead AND whose
 the swap durability model (memory: `wordcartel-swap-idle-thrash`). Anchors: `wordcartel/src/swap.rs`
 (`state_dir`, `swap_path`, `find_orphan_scratch_swap`), `recovery.rs`.
 
-## H7 — Audit `.unwrap()` usage across the tree
+## H7 — Panic-safety & arithmetic-soundness audit
 <!-- item: H7 -->
+
+**Scope broadened 2026-07-10** from ".unwrap() only" to all runtime panic sites — `.unwrap()`
+(772 raw, ~35 real-runtime), `.expect()` (161 — ensure each carries an invariant message), `panic!`
+(44 raw), `unreachable!` (4) — **plus an arithmetic-soundness sweep** of the ~147 numeric casts
+(`as usize`/`u32`…) on `BytePos`/offset math for overflow/truncation (a Codex-flagged class). Same
+shape/sequencing as the original unwrap audit; the `.unwrap()` classification below is its core.
+
+**Sequencing (`depends_on = [H11, H14]`, 2026-07-10):** do this AFTER the `commands::run` (H11) and
+`render()` (H14) decompositions — those rewrite exactly the edit-/paint-path bodies where the ~35
+unwraps concentrate, so auditing first means re-auditing after the churn. Land it BEFORE Effort P
+(panic-safety hardening ahead of the untrusted plugin surface). Otherwise low-risk/mechanical — a good
+palate-cleanser between the heavier decomposition efforts.
 
 **Question (user):** audit and consider `.unwrap()` usage.
 
@@ -226,3 +238,25 @@ Finish the louder undo-eviction hint for buffer-level merges (the last M5 follow
 <!-- item: M9 -->
 
 M4-rest only ISOLATES its parse panic; a real upgrade is optional, low priority.
+
+## H17 — Pre-P public-API doc-coverage sweep
+<!-- item: H17 -->
+
+**Grounded (2026-07-10):** the house style requires a doc-comment on every public item, but coverage
+isn't enforced — `wordcartel-core` alone exposes ~180 `pub fn/struct/enum/trait/const/type`. **Effort P
+exposes this surface to plugins**, so it should be documented, and kept documented, before then.
+Direction: doc-comment the undocumented public items (params/returns/errors; a runnable `# Examples`
+block for non-obvious fns, per the CLAUDE.md "Docs" convention), then land `#![warn(missing_docs)]` (at
+least on `wordcartel-core`) so coverage can't regress — a gate in the same spirit as the backlog drift
+gate and `module_budgets`. Orthogonal to the god-object decompositions (no `depends_on`); do it anytime
+before Effort P. Mechanical, low-risk. Anchors: `wordcartel-core/src` public items; CLAUDE.md "Docs".
+
+## H18 — Supply-chain audit (cargo audit / cargo deny)
+<!-- item: H18 -->
+
+**Grounded (2026-07-10):** no `deny.toml`/audit config exists today, and the lockfile is large (672
+crates — much of it the `burn`/`harper` tensor stack; see H2). Before Effort P opens an untrusted plugin
+surface, run a supply-chain pass: `cargo audit` (RUSTSEC CVEs) and/or `cargo deny` (advisories + license
+policy + duplicate/banned-crate checks), and decide whether to wire it as a CI gate. **Pairs with H2**
+as the pre-P dependency pass, but on a distinct axis — H2 = build-time weight, H18 = vulnerabilities /
+licenses. Forks: audit-only vs a full `deny` policy; gate vs advisory. Anchors: `Cargo.lock`, H2.
