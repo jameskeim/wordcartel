@@ -6,18 +6,19 @@
 //!   2. Builds a `ChangeSet` and a matching `block_tree::Edit { range, new_len }`
 //!      from the *same* `(range, replacement)`.
 //!   3. Calls `editor.apply(txn, edit, kind, clock)`.
-//!   4. Calls `derive::rebuild(editor)`.
-//!   5. Calls `nav::ensure_visible(editor)`.
-//!   6. Sets `editor.desired_col = None` (an edit re-anchors vertical motion).
+//!
+//! The remaining steps — rebuild, ensure_visible, and the `desired_col` reset —
+//! live behind `commands::edit::settle_after_edit`, shared by the 8 buffer-edit
+//! primitives in that submodule; `run` delegates to them.
+
+mod edit;
 
 use crate::derive;
 use crate::editor::{Editor, RenderMode};
 use crate::file;
 use crate::nav;
 use crate::registry::{place_caret_visible, CaretPlace};
-use wordcartel_core::block_tree::Edit;
-use wordcartel_core::change::ChangeSet;
-use wordcartel_core::history::{Clock, EditKind, Transaction};
+use wordcartel_core::history::Clock;
 use wordcartel_core::register;
 use wordcartel_core::selection::Selection;
 
@@ -207,147 +208,14 @@ fn set_selection_range(editor: &mut Editor, from: usize, to: usize) {
 }
 
 /// Execute `cmd` against `editor`, then re-derive + ensure visibility.
-#[allow(clippy::too_many_lines)] // command dispatch — a flat table, one arm per Command variant
+#[allow(clippy::too_many_lines)] // exhaustive flat Command dispatch — edit arms delegate to
+                                 // commands::edit; remaining arms are small non-edit state ops (H11)
 pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     match cmd {
-        Command::InsertChar(c) => {
-            let sel = editor.active().document.selection.primary();
-            if !sel.is_empty() {
-                // Non-empty selection: replace it with the typed character (CUA).
-                let (from, to) = (sel.from(), sel.to());
-                let text = c.to_string();
-                let doc_len = editor.active().document.buffer.len();
-                let cs = replace_changeset(from, to, &text, doc_len);
-                let edit = Edit { range: from..to, new_len: text.len() };
-                let txn = Transaction::new(cs).with_selection(Selection::single(from + text.len()));
-                editor.apply(txn, edit, EditKind::Other, clock);
-                derive::rebuild(editor);
-                nav::ensure_visible(editor);
-                editor.active_mut().desired_col = None;
-                return CommandResult::Handled;
-            }
-            // Collapsed selection: normal insert-at-caret path.
-            let at = nav::head(editor);
-            let s = c.to_string();
-            let doc_len = editor.active().document.buffer.len();
-            let cs = ChangeSet::insert(at, &s, doc_len);
-            let new_len = s.len(); // == c.len_utf8()
-            let edit = Edit { range: at..at, new_len };
-            let txn = Transaction::new(cs).with_selection(Selection::single(at + new_len));
-            editor.apply(txn, edit, EditKind::Type, clock);
-            derive::rebuild(editor);
-            nav::ensure_visible(editor);
-            editor.active_mut().desired_col = None;
-            CommandResult::Handled
-        }
-
-        Command::InsertNewline => {
-            let sel = editor.active().document.selection.primary();
-            if !sel.is_empty() {
-                // Non-empty selection: replace it with a newline (CUA).
-                let (from, to) = (sel.from(), sel.to());
-                let text = "\n";
-                let doc_len = editor.active().document.buffer.len();
-                let cs = replace_changeset(from, to, text, doc_len);
-                let edit = Edit { range: from..to, new_len: text.len() };
-                let txn = Transaction::new(cs).with_selection(Selection::single(from + text.len()));
-                editor.apply(txn, edit, EditKind::Other, clock);
-                derive::rebuild(editor);
-                nav::ensure_visible(editor);
-                editor.active_mut().desired_col = None;
-                return CommandResult::Handled;
-            }
-            // Collapsed selection: normal insert-newline path.
-            let at = nav::head(editor);
-            let s = "\n";
-            let doc_len = editor.active().document.buffer.len();
-            let cs = ChangeSet::insert(at, s, doc_len);
-            let new_len: usize = 1;
-            let edit = Edit { range: at..at, new_len };
-            // EditKind::Other breaks coalescing at each newline so that undo
-            // chunks per logical line rather than collapsing multi-line insertions.
-            let txn = Transaction::new(cs).with_selection(Selection::single(at + new_len));
-            editor.apply(txn, edit, EditKind::Other, clock);
-            derive::rebuild(editor);
-            nav::ensure_visible(editor);
-            editor.active_mut().desired_col = None;
-            CommandResult::Handled
-        }
-
-        Command::Backspace => {
-            let sel = editor.active().document.selection.primary();
-            if !sel.is_empty() {
-                // Non-empty selection: delete the selection range (like Cut, minus clipboard).
-                let (from, to) = (sel.from(), sel.to());
-                let doc_len = editor.active().document.buffer.len();
-                let cs = ChangeSet::delete(from..to, doc_len);
-                let edit = Edit { range: from..to, new_len: 0 };
-                let txn = Transaction::new(cs).with_selection(Selection::single(from));
-                editor.apply(txn, edit, EditKind::Other, clock);
-                derive::rebuild(editor);
-                nav::ensure_visible(editor);
-                editor.active_mut().desired_col = None;
-                return CommandResult::Handled;
-            }
-            // Collapsed selection: delete one grapheme left of the caret.
-            let head = nav::head(editor);
-            if head == 0 {
-                return CommandResult::Noop;
-            }
-            // Compute the grapheme-correct previous stop by reusing move_left.
-            // move_left sets desired_col=None as a side-effect but does NOT change
-            // the selection; it purely returns the new offset. We capture `prev`
-            // here and then use it for the delete range. `head` is unchanged.
-            let prev = nav::move_left(editor);
-            let doc_len = editor.active().document.buffer.len();
-            let cs = ChangeSet::delete(prev..head, doc_len);
-            let edit = Edit { range: prev..head, new_len: 0 };
-            let txn = Transaction::new(cs).with_selection(Selection::single(prev));
-            editor.apply(txn, edit, EditKind::Other, clock);
-            derive::rebuild(editor);
-            nav::ensure_visible(editor);
-            editor.active_mut().desired_col = None;
-            CommandResult::Handled
-        }
-
-        Command::DeleteForward => {
-            let sel = editor.active().document.selection.primary();
-            if !sel.is_empty() {
-                // Non-empty selection: delete the selection range (CUA, mirrors Backspace).
-                let (from, to) = (sel.from(), sel.to());
-                let doc_len = editor.active().document.buffer.len();
-                let cs = ChangeSet::delete(from..to, doc_len);
-                let edit = Edit { range: from..to, new_len: 0 };
-                let txn = Transaction::new(cs).with_selection(Selection::single(from));
-                editor.apply(txn, edit, EditKind::Other, clock);
-                derive::rebuild(editor);
-                nav::ensure_visible(editor);
-                editor.active_mut().desired_col = None;
-                return CommandResult::Handled;
-            }
-            // Collapsed selection: delete one grapheme forward.
-            let head = nav::head(editor);
-            // Compute the grapheme-correct next stop by reusing move_right.
-            // move_right sets desired_col=None as a side-effect but does NOT change
-            // the selection; it purely returns the new offset.
-            let next = nav::move_right(editor);
-            // EOF / nothing to delete guard: if next == head we are at the very end
-            // of the document. Do NOT build a zero-width delete — it would dirty the
-            // buffer, bump the version, and push a no-op undo entry.
-            if next == head {
-                return CommandResult::Noop;
-            }
-            let doc_len = editor.active().document.buffer.len();
-            let cs = ChangeSet::delete(head..next, doc_len);
-            let edit = Edit { range: head..next, new_len: 0 };
-            // Caret stays at `head` after a forward delete.
-            let txn = Transaction::new(cs).with_selection(Selection::single(head));
-            editor.apply(txn, edit, EditKind::Other, clock);
-            derive::rebuild(editor);
-            nav::ensure_visible(editor);
-            editor.active_mut().desired_col = None;
-            CommandResult::Handled
-        }
+        Command::InsertChar(c)       => edit::insert_char(editor, c, clock),
+        Command::InsertNewline       => edit::insert_newline(editor, clock),
+        Command::Backspace           => edit::backspace(editor, clock),
+        Command::DeleteForward       => edit::delete_forward(editor, clock),
 
         Command::Move { dir, extend } => {
             // Reset the expand-selection ladder on every motion (Task 7).
@@ -418,27 +286,7 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             CommandResult::Handled
         }
 
-        Command::Cut => {
-            let r = editor.active().document.selection.primary();
-            if r.is_empty() {
-                return CommandResult::Noop;
-            }
-            let doc_len = editor.active().document.buffer.len();
-            // Borrow the buffer before mutably borrowing editor.register (field-split no longer
-            // applies now that both live under editor.active() rather than directly on Editor).
-            let buf_snap = editor.active().document.buffer.clone();
-            let cs = register::cut(r, doc_len, &mut editor.register, &buf_snap);
-            let edit = Edit { range: r.from()..r.to(), new_len: 0 };
-            let txn = Transaction::new(cs).with_selection(Selection::single(r.from()));
-            editor.apply(txn, edit, EditKind::Other, clock);
-            if let Some(text) = editor.register.get().map(str::to_owned) {
-                editor.clipboard_sync_request = Some(text);
-            }
-            derive::rebuild(editor);
-            nav::ensure_visible(editor);
-            editor.active_mut().desired_col = None;
-            CommandResult::Handled
-        }
+        Command::Cut => edit::cut(editor, clock),
 
         Command::Paste => {
             editor.clipboard_get_pending = Some(crate::clipboard::PasteIntent {
@@ -549,84 +397,11 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             }
         }
 
-        Command::DeleteWord { back } => {
-            let h = nav::head(editor);
-            let target = if back { nav::move_word_left(editor) } else { nav::move_word_right(editor) };
-            let (from, to) = if back { (target, h) } else { (h, target) };
-            if from == to { return CommandResult::Noop; }
-            let doc_len = editor.active().document.buffer.len();
-            let cs = ChangeSet::delete(from..to, doc_len);
-            let edit = Edit { range: from..to, new_len: 0 };
-            let txn = Transaction::new(cs).with_selection(Selection::single(from));
-            // EditKind::Other — matches existing delete commands, avoids coalescing with typed chars.
-            editor.apply(txn, edit, EditKind::Other, clock);
-            derive::rebuild(editor);
-            nav::ensure_visible(editor);
-            editor.active_mut().desired_col = None;
-            CommandResult::Handled
-        }
+        Command::DeleteWord { back } => edit::delete_word(editor, back, clock),
 
-        Command::DeleteLine => {
-            // Operates on the caret-head's logical line; any active selection is
-            // intentionally disregarded (matches DeleteWord + faithful WordStar ^Y).
-            let head = nav::head(editor);
-            let len = editor.active().document.buffer.len();
-            if len == 0 { return CommandResult::Noop; }
-            let (from, to) = {
-                let buf = &editor.active().document.buffer;
-                let total = derive::total_logical_lines(buf);
-                let l = buf.byte_to_line(head);
-                let start = buf.line_to_byte(l);
-                let end = if l + 1 < total { buf.line_to_byte(l + 1) } else { len };
-                if start == end {
-                    // Empty line — the phantom final logical line that exists only because
-                    // of a trailing '\n' (start == len). Remove the preceding newline so it
-                    // disappears.
-                    if start > 0 { (start - 1, end) } else { (start, end) }
-                } else if end == len && buf.slice(len - 1..len) != "\n" {
-                    // Final line with NO trailing newline → absorb the preceding newline too,
-                    // so the line fully vanishes (slice returns String).
-                    if start > 0 { (start - 1, end) } else { (start, end) }
-                } else {
-                    (start, end)
-                }
-            };
-            if from == to { return CommandResult::Noop; }
-            let cs = ChangeSet::delete(from..to, len);
-            let edit = Edit { range: from..to, new_len: 0 };
-            let txn = Transaction::new(cs).with_selection(Selection::single(from));
-            editor.apply(txn, edit, EditKind::Other, clock);
-            derive::rebuild(editor);
-            nav::ensure_visible(editor);
-            editor.active_mut().desired_col = None;
-            CommandResult::Handled
-        }
+        Command::DeleteLine => edit::delete_line(editor, clock),
 
-        Command::DeleteToLineEnd => {
-            let head = nav::head(editor);
-            let len = editor.active().document.buffer.len();
-            let to = {
-                let buf = &editor.active().document.buffer;
-                let total = derive::total_logical_lines(buf);
-                let l = buf.byte_to_line(head);
-                let line_end = if l + 1 < total { buf.line_to_byte(l + 1) } else { len };
-                // Keep the newline: stop before a trailing '\n' if present.
-                if line_end > head && line_end > 0 && buf.slice(line_end - 1..line_end) == "\n" {
-                    line_end - 1
-                } else {
-                    line_end
-                }
-            };
-            if head >= to { return CommandResult::Noop; } // at/after EOL → no empty changeset
-            let cs = ChangeSet::delete(head..to, len);
-            let edit = Edit { range: head..to, new_len: 0 };
-            let txn = Transaction::new(cs).with_selection(Selection::single(head));
-            editor.apply(txn, edit, EditKind::Other, clock);
-            derive::rebuild(editor);
-            nav::ensure_visible(editor);
-            editor.active_mut().desired_col = None;
-            CommandResult::Handled
-        }
+        Command::DeleteToLineEnd => edit::delete_to_line_end(editor, clock),
 
         Command::SelectScope(scope) => {
             editor.active_mut().sel_history.clear();
