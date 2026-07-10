@@ -258,6 +258,7 @@ fn options() -> Options {
     o
 }
 
+#[allow(clippy::cast_possible_truncation)] // markdown heading level is 1..=6, always fits u8
 fn tag_to_kind(tag: &Tag) -> Option<BlockKind> {
     Some(match tag {
         Tag::Paragraph => BlockKind::Paragraph,
@@ -464,6 +465,7 @@ pub struct Edit {
 }
 
 impl Edit {
+    #[allow(clippy::cast_possible_wrap)] // usize offsets are <= the ~5 MB doc cap (change.rs policy), ~12 orders below isize::MAX
     pub fn delta(&self) -> isize {
         self.new_len as isize - self.range.len() as isize
     }
@@ -1298,6 +1300,7 @@ fn shift_in_place(b: &mut Block, delta: isize) {
 /// oracle patrols the same regions — and the release fall-through clamps at 0: a
 /// self-healing over-wide reparse beats a wrap to a garbage huge usize (the rope is
 /// never mutated on this path; a bad region only mis-colours for ~150 ms).
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)] // same doc-cap bound; .max(0) makes the isize->usize cast non-negative
 fn shift_offset(pos: usize, delta: isize) -> usize {
     let shifted = pos as isize + delta;
     debug_assert!(
@@ -2043,7 +2046,7 @@ mod tests {
         assert_eq!(t.root.children[new_after_idx].children.as_ptr(), after_ptr,
             "after-block was cloned instead of shifted in place");
         assert_eq!(t.root.children[new_after_idx].span,
-            (after_span0.start + delta as usize)..(after_span0.end + delta as usize),
+            shift_offset(after_span0.start, delta)..shift_offset(after_span0.end, delta),
             "after-block span not shifted by delta");
     }
 
