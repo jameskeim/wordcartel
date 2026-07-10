@@ -288,7 +288,7 @@ fn load() -> Manifest {
     parse(&s)
 }
 
-const DOCS: &[&str] = &["ux-backlog.md", "engineering-health.md"];
+const DOCS: &[&str] = &["ux-backlog.md", "engineering-health.md", "backlog-archive.md"];
 
 fn read_doc(file: &str) -> String {
     let p = repo_root().join("docs").join(file);
@@ -312,28 +312,28 @@ fn markers_in(text: &str) -> Vec<(usize, String)> {
         .collect()
 }
 
-/// I4 — per file, the `<!-- item: ID -->` markers are exactly the OPEN manifest items whose
-/// `doc` names that file. Catches orphaned prose (marker, no row) and orphaned rows (open
-/// item, no prose marker) — i.e. a missed/extra transcription. Shipped/dropped are terminal
-/// and manifest-only, so they need no marker.
+/// I4 — per file, the `<!-- item: ID -->` markers are EXACTLY the manifest items whose `doc`
+/// names that file (every item, any status). Open items live in the live docs; shipped/dropped
+/// live in `backlog-archive.md`. Catches orphaned prose (marker, no row), orphaned rows (item,
+/// no marker), and an item filed to the wrong doc — i.e. a missed/extra/misplaced transcription.
 #[test]
-fn i4_open_items_and_markers_are_bijective_per_file() {
+fn i4_items_and_markers_are_bijective_per_file() {
     let m = load();
     for file in DOCS {
         let text = read_doc(file);
         let marker_ids: Vec<String> = markers_in(&text).into_iter().map(|(_, id)| id).collect();
         let marker_set: HashSet<String> = marker_ids.iter().cloned().collect();
         assert_eq!(marker_set.len(), marker_ids.len(), "{file}: duplicate <!-- item --> marker");
-        let open_ids: HashSet<String> = m
+        let doc_ids: HashSet<String> = m
             .item
             .iter()
-            .filter(|it| is_open(&it.status) && doc_file_of(it) == *file)
+            .filter(|it| doc_file_of(it) == *file)
             .map(|it| it.id.clone())
             .collect();
-        let orphan_prose: Vec<&String> = marker_set.difference(&open_ids).collect();
-        let orphan_rows: Vec<&String> = open_ids.difference(&marker_set).collect();
-        assert!(orphan_prose.is_empty(), "{file}: markers with no open manifest row: {orphan_prose:?}");
-        assert!(orphan_rows.is_empty(), "{file}: open manifest rows with no marker: {orphan_rows:?}");
+        let orphan_prose: Vec<&String> = marker_set.difference(&doc_ids).collect();
+        let orphan_rows: Vec<&String> = doc_ids.difference(&marker_set).collect();
+        assert!(orphan_prose.is_empty(), "{file}: markers with no manifest row: {orphan_prose:?}");
+        assert!(orphan_rows.is_empty(), "{file}: manifest rows with no marker: {orphan_rows:?}");
     }
 }
 
