@@ -62,28 +62,9 @@ fn heading_title(rope: &Rope, span: Range<usize>) -> String {
     }
 }
 
-/// Document-order list reused by `section_range` and `heading_starts`.
+/// Document-order list reused by `heading_starts` and `sections`.
 fn ordered(blocks: &BlockTree, rope: &Rope) -> Vec<Heading> {
     headings(blocks, rope)
-}
-
-/// The full section range of the heading whose start is `heading_byte`: from
-/// that heading to the start of the next heading with `level <= this level`, or
-/// end of document. Returns the FULL section (heading line + body). Callers hide
-/// the body (heading-line-end .. range.end) and keep the heading visible.
-/// If `heading_byte` is not a heading start, returns an empty range at that byte.
-pub fn section_range(blocks: &BlockTree, rope: &Rope, heading_byte: usize) -> Range<usize> {
-    let hs = ordered(blocks, rope);
-    let Some(idx) = hs.iter().position(|h| h.byte == heading_byte) else {
-        return heading_byte..heading_byte;
-    };
-    let level = hs[idx].level;
-    let end = hs[idx + 1..]
-        .iter()
-        .find(|h| h.level <= level)
-        .map(|h| h.byte)
-        .unwrap_or_else(|| rope.len_bytes());
-    heading_byte..end
 }
 
 /// The canonical set of heading-start byte offsets. `FoldState::reconcile`
@@ -104,7 +85,7 @@ pub struct Section {
 
 /// All sections in document order, each with its body range — computed in ONE
 /// pass over the heading list. This is the per-frame-friendly batch API used by
-/// `FoldView::compute`/`FoldState::hidden_byte_ranges`; it avoids the
+/// `FoldView::compute`; it avoids the
 /// O(folds × headings) blow-up of calling `body_range` per folded anchor.
 pub fn sections(blocks: &BlockTree, rope: &Rope) -> Vec<Section> {
     let hs = ordered(blocks, rope);
@@ -182,31 +163,6 @@ mod tests {
     fn headings_empty_doc_and_no_headings() {
         assert!(headings(&full_parse(""), &rope("")).is_empty());
         assert!(headings(&full_parse("just a paragraph\n"), &rope("just a paragraph\n")).is_empty());
-    }
-
-    #[test]
-    fn section_range_stops_at_same_or_higher_level() {
-        let doc = "# Top\n\na\n\n## A\n\nb\n\n### A.1\n\nc\n\n## B\n\nd\n";
-        let t = full_parse(doc);
-        let r = &rope(doc);
-        // ## A folds through A.1 but stops at ## B
-        let a = doc.find("## A").unwrap();
-        let b = doc.find("## B").unwrap();
-        assert_eq!(section_range(&t, r, a), a..b);
-        // # Top folds the entire rest of the document
-        let top = doc.find("# Top").unwrap();
-        assert_eq!(section_range(&t, r, top), top..doc.len());
-        // ### A.1 stops at ## B (next heading with level <= 3)
-        let a1 = doc.find("### A.1").unwrap();
-        assert_eq!(section_range(&t, r, a1), a1..b);
-    }
-
-    #[test]
-    fn section_range_last_heading_runs_to_eof() {
-        let doc = "## only\n\ntail body\n";
-        let t = full_parse(doc);
-        let only = doc.find("## only").unwrap();
-        assert_eq!(section_range(&t, &rope(doc), only), only..doc.len());
     }
 
     #[test]
