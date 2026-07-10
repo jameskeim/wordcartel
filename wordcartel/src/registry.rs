@@ -586,19 +586,16 @@ impl Registry {
     /// Resolve a runtime command-id string to the registry's stored `CommandId`
     /// (which wraps a `&'static str`) — without allocating or leaking. Returns
     /// None if no command with that name is registered.
-    #[allow(dead_code)] // wired in Task 3
     pub fn resolve_name(&self, name: &str) -> Option<CommandId> {
         self.index.get_key_value(name).map(|(id, _)| *id)
     }
 
     /// Look up metadata for a registered command.
-    #[allow(dead_code)] // wired in Task 3/4
     pub fn meta(&self, id: CommandId) -> Option<&CommandMeta> {
         self.index.get(&id).map(|&i| &self.entries[i].meta)
     }
 
     /// Iterate registered commands in insertion order, yielding (id, meta) pairs.
-    #[allow(dead_code)] // wired in Task 3/4
     pub fn commands(&self) -> impl Iterator<Item = (CommandId, &CommandMeta)> {
         self.entries.iter().map(|e| (e.id, &e.meta))
     }
