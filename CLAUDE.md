@@ -11,9 +11,13 @@ status; never hand-edit it). Rich triage prose lives in `docs/ux-backlog.md` +
 `docs/engineering-health.md` (OPEN items) and `docs/backlog-archive.md` (shipped/dropped history),
 keyed by `<!-- item: ID -->` markers. Status lives ONLY in `backlog.toml`. Drift is a `cargo test`
 GATE (`wordcartel/tests/backlog.rs`: schema + full marker↔manifest bijection across all three docs
-+ dashboard freshness). Regenerate after any edit with
-`scripts/backlog bless`. A `bl:` message (see [[backlog-shorthand-bl]]) files a `triage` item +
-prose stub via `scripts/backlog add` and regenerates, left uncommitted by default.
++ dashboard freshness). **To change an item** (status/size, mark shipped/dropped, add a
+dependency): edit its `[[item]]` block in `backlog.toml`, then `scripts/backlog bless`; when an item
+ships, move its prose section from the live doc to `docs/backlog-archive.md` (and repoint its `doc =`
+field) so the marker bijection stays green. **To capture** a new idea: `scripts/backlog add <ID>
+<THEME> "<title>"` (or a `bl:` message — see [[backlog-shorthand-bl]]) files a `triage` item + prose
+stub and regenerates, left uncommitted by default. `scripts/backlog {open,shipped}` print filtered
+views. Never hand-edit `BACKLOG.md`; never put status words in the prose headings.
 
 ---
 

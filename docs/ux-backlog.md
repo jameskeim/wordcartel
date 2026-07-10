@@ -1,22 +1,18 @@
-# UX backlog — niggling issues, grounded facts, design directions
+# Feature / UX backlog — OPEN item triage
 
-**Origin:** 2026-07-03 triage session. Fourteen user-reported niggles, organized into five
-themes, each fact-checked against the real source (anchors below are as of `63f98de` and may
-drift). Each item graduates to the standard gated pipeline (brainstorm → spec → Codex/Fable
-review → plan → subagent build) when picked up — this document is the durable triage, not a
-spec. **The open-questions ledger was resolved with the user on 2026-07-03** — see "Resolved
-decisions" at the end; decisions are folded into each item below. **A second niggle batch
-landed 2026-07-04** (fact-checked at `bd3b72c`): A6 palette reachability (which ANSWERS A3's
-open "why did the palette read as a subset" question), E3 chrome theming coherence, E4
-bundled-themes research.
+**How this file works (backlog manifest system, since 2026-07-10):** this document holds the **triage
+prose for OPEN feature/UX items only** — grounded facts, design directions, and forks — each keyed to
+the manifest by a `<!-- item: ID -->` marker beneath its heading. **Status, size, kind, and
+shipped/dropped state live ONLY in `backlog.toml` (repo root); do NOT record status here.** To see what
+is open vs done, read the generated **`BACKLOG.md`** (repo root) — never scan this prose. Completed /
+dropped items' prose lives in [`backlog-archive.md`](backlog-archive.md); structural /
+engineering-health items live in [`engineering-health.md`](engineering-health.md). Add or edit an item
+with `scripts/backlog add` (or a `bl:` message) then `scripts/backlog bless`; a `cargo test` gate
+(`wordcartel/tests/backlog.rs`) keeps the manifest, markers, and dashboard in sync. Design doc:
+`docs/superpowers/specs/2026-07-10-backlog-tracking-system-design.md`.
 
-**Status legend:** `settled-design` (direction agreed, ready to spec) · `needs-design`
-(direction sketched, forks remain) · `available-today` (config-only, no code) ·
-`fact-checked` (behavior pinned) · `dropped` (decided against, trigger recorded).
-
-**Related:** engineering-health / architecture-debt triage (module size, dependency weight,
-incremental-parser posture) lives in [`docs/engineering-health.md`](engineering-health.md)
-(2026-07-07 whole-app eval) — that is the home for non-UX structural work.
+Each open item graduates to the standard gated pipeline (brainstorm → spec → Codex/Fable review → plan
+→ subagent build) when picked up.
 
 ---
 
@@ -488,99 +484,6 @@ best validates — the markup-rendering capability; treat it as a P design ancho
 - Right-edge bar content design + full-chrome composition (E1).
 - D1-a vs D1-b write-back (D1-b favored, not yet committed — settle at D1's brainstorm).
 - Dwell duration and reveal/grace timings (implementation tunables, not design forks).
-
-## Working order (recorded 2026-07-04 — dependency-derived, user-approved)
-
-> **Superseded for status/sizing — see the generated `BACKLOG.md` (source of truth `backlog.toml`).**
-> Kept below only as the historical dependency-ordering rationale; do NOT read per-item status here.
-
-Hard edges: E3 → E1/E2/E4; D1 carries A5; E2 rides E1; H1 before Effort P. Soft edges: H1
-relocates what C4/D1/A5/E1 touch (split early = every later effort lands in focused files);
-B2's hanging indent is a wrap-policy feature (travels inside B1); A3's palette parts share
-A6's territory; E2's checkable items serve A5/E1; C2 and C3 are islands.
-
-*(Progress: 1 A6 ✓ · 2 H1 ✓ · 3 B1+B2 ✓ · 4 C4 ✓ · 5 C2 ✓ · 6 D1+A5 ✓ · 7 E3+E4 ✓ · **8 E1+E2 ✓**
-(2026-07-07 @ f7b7b10 — folded effort: E1 + E2 + overlay/mouse completeness + menu windowing) ·
-**B4 SRC-HI ✓** (2026-07-07 @ 1bbd82b) · **C3 clipboard provider-chain ✓** (2026-07-07 @ 16457f9) ·
-**R1 typing-latency ✓** (2026-07-07 @ 02ac906) —
-**next: eng-health H1 god-object decomposition (Fable-gated — now unblocked), Theme S/P, or A3b
-menu-curation; then Effort P**. A3's palette-completeness invariant + item-by-item menu-curation
-pass remains open.)*
-
-*(NEW 2026-07-06: **R1 editing-responsiveness** entered brainstorm mid-stream — a
-tight-scope perf/correctness fix (Theme R). Dependency-free; recommended to slot BEFORE Effort P.
-May preempt or run alongside E1+E2 at the user's call.)*
-
-1. **A6** palette reachability — folds in A3(a) hints-verification + the palette-completeness
-   invariant test (same territory). Kills the invisible-dispatch hazard first.
-2. **H1** app.rs decomposition — immediately after the small win; everything behind it lands
-   in focused files.
-3. **B1 + B2** word-boundary wrap + list indent, ONE effort (bullet indent + hanging indent
-   inside the wrap work). The user's highest-value rendering fix; the E-arc then gets judged
-   on correctly wrapped text.
-4. **C4** close-buffer prompt — lands in the post-H1 prompts.rs, reuses the quit machinery.
-5. **C2** transform scope — SHIPPED 2026-07-05.
-6. **D1 + A5** settings write-back + keymap switch — SHIPPED 2026-07-05.
-7. **E3** chrome theming coherence (+ the render.rs split; **E4's research kicks off in
-   parallel** — pure reading, no code dependency).
-8. **E1 + E2** density presets + polish — **SHIPPED 2026-07-07 @ f7b7b10** (folded effort:
-   E1 density presets + E2 polish + overlay/mouse completeness + menu windowing). A3's
-   menu-curation pass was NOT folded in — remains open.
-9. **C3** SSH/tmux clipboard — **SHIPPED 2026-07-07 @ 16457f9** (full works-everywhere provider
-   chain; both final gates GO; smoke 8/8).
-
-Then **Effort P**, landing on a decomposed app.rs, a coherent chrome model, and a settings
-rail. FLAGGED JUDGMENT: B1 sits before the D/E arc on value; pure dependency logic permits
-swapping blocks 3 and 6-8 if the visual-consistency wins should bank first — B1 is
-dependency-free in both directions.
-
-### Pre-Effort-P checklist (must clear before P)
-
-- **repar re-plumb check** — `DONE` 2026-07-06 (merge 10a5a05, pushed). Adopted repar 1.1's
-  documented "blessed editor stack" (`none,all,prose,prose-prefix,markdown,no-trailing-pad`); the
-  two "upstream candidates" were NOT bugs — repar 1.1 released them as opt-in fixups
-  (`no-trailing-pad` for CJK trailing-space→hard-`<br>`, `prose-prefix` for the anaphora trap),
-  both proven load-bearing by Fable probes. Migrated `run_transform` onto repar's SemVer-frozen
-  `from_par_args` surface; Cargo.lock pinned 1.1.0 (a REAL pin — the tokens require it, not drift).
-  Codex + Fable both GO. See [[wordcartel-repar-integration]]. Original checklist retained below
-  for history. `repar` is a PATH dependency
-  (`repar = { path = "../../par-command/repar" }`, wordcartel/Cargo.toml:12), so it builds
-  against whatever the user has locally — the Cargo.lock pin (1.1.0) drifts every build. repar
-  has been updated AGAIN; before P, re-examine the integration against the current local repar:
-  (1) the ONLY API surface is `transform.rs::run_transform`
-  (`repar::Options::new().width(width).map_err(...)`, transform.rs:314 — the builder-returns-
-  `Result` shape from repar ≥1.0); verify the API still matches and no new required options were
-  added. (2) The wrap_column width knob (repar10) still wires through. (3) Re-check the six
-  repar-1.0 contract pins (change.rs / transform tests, backlog C2 area ~:256) — a new repar may
-  fix or shift the deliberately-frozen behavior (incl. the CJK trailing-space artifact). (4) The
-  TWO upstream repar report candidates (CJK trailing-space→hard-`<br>`; prefix-inference anaphora
-  mangling, ~:257) — did the update address them? (5) Decide whether to take a deliberate version
-  bump + lock sync (vs the current always-drifting path pin). Isolated + low-risk, but P builds
-  a plugin system ON this substrate, so it must be confirmed clean first.
-
-## Sizing summary
-
-> **Superseded — the live open/shipped/sizing rollup is the generated `BACKLOG.md` (source of truth
-> `backlog.toml`). The hand-maintained snapshot below is frozen history as of the migration and is no
-> longer updated — do not trust it for current status.**
-
-**SHIPPED** (see each item's header for the commit): A1, A2, A3, A5, A6, B1, B2, B3, B4, C1, C2, C3,
-C4, D1, E1, E2, E3, E4, H1, R1 — plus the repar re-plumb check. (A4 dropped.) The remaining open work,
-by size:
-
-- **Small:** A3b item-by-item menu-curation pass (A3 itself shipped; the state-in-label half
-  shipped with E2) · A6-followup overlay mouse parity · A9 Wrap-Column state-in-label · H7 unwrap audit.
-- **Small-Medium:** S3 Snapshots (Theme S — capture/restore/persist reuse existing machinery;
-  the one net-new algorithm is a display diff) · B6 heading-glyph style toggle.
-- **Medium:** eng-health H1 god-object decomposition (`app.rs`/`render.rs` SEAM refactor — Fable-gated,
-  now unblocked; gated before Effort P) · S1 rearrangeable outline / corkboard.
-- **Larger:** S2 directory-as-binder (post-Effort-P plugin) · Theme P plugin candidates (all
-  post-P — goals/streaks, style lens, CMS publish, backlinks, CriticMarkup/Fountain/wikilinks).
-- **`needs-design`, sizing TBD:** A8 open-docs menu · A10 Block menu · A11 filter/transform scope ·
-  A12 scratch toggle · B7 selected-item legibility (`potential-bug`) · B8 caret shape/color · E6 splash ·
-  eng-health H2 dep-weight · H5 swap-file cleanup · H6 version scheme.
-
-Then **Effort P** (the in-process Lua plugin system) — the 1.0 capstone.
 
 ## Newly-tracked items (stubs)
 
