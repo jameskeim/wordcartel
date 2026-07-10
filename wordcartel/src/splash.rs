@@ -7,15 +7,14 @@ use crate::keymap::KeyTrie;
 use crate::registry::CommandId;
 use crate::app::{Handled, Msg};
 use crossterm::event::{Event, KeyEventKind, MouseEventKind};
+use ratatui::{layout::Rect, style::Modifier, text::{Line, Span}, widgets::{Clear, Paragraph}, Frame};
+use wordcartel_core::theme::SemanticElement as SE;
 
 /// The splash wordmark — the app's styled-text identity (no ASCII art).
-#[allow(dead_code)] // wired in Task 4 (painter)
 const WORDMARK: &str = "wordcartel";
 /// The tagline painted dim under the version line.
-#[allow(dead_code)] // wired in Task 4 (painter)
 const TAGLINE: &str = "Everyone needs a cover story";
 /// The dismiss-hint footer, painted dim.
-#[allow(dead_code)] // wired in Task 4 (painter)
 const FOOTER: &str = "press any key";
 
 /// The orientation hints in display order: command id → label. All three are real
@@ -86,6 +85,62 @@ pub(crate) fn intercept(msg: Msg, editor: &mut crate::editor::Editor,
         Handled::Done(!editor.quit)
     } else {
         Handled::Pass(msg)
+    }
+}
+
+/// Paint the full-frame startup splash from the pre-resolved `Splash` content.
+///
+/// The splash owns the screen: every cell of the frame (including the status row) is
+/// cleared, the base canvas is filled per `CanvasMode` (mirrors `render()`'s edit-band
+/// fill), and the centered block is drawn over it. Degradation as height shrinks: the
+/// hints + footer drop first, then the tagline, then the version — the wordmark always
+/// stays. `render()` never calls the overlay painters below its `w < 4 || h < 2` guard,
+/// and every rect here is clamped to the frame, so no terminal size can panic.
+pub(crate) fn paint(frame: &mut Frame, editor: &crate::editor::Editor) {
+    let Some(splash) = editor.splash.as_ref() else { return };
+    let area = frame.area();
+    let (w, h) = (area.width, area.height);
+    // The splash owns the screen — reset every cell (hides the text + status behind it).
+    frame.render_widget(Clear, area);
+    // Opaque canvas: fill the WHOLE frame with base_bg so fg-only text sits on the page
+    // (render.rs:251 pattern). Transparent mode and colorless themes skip the fill.
+    if editor.canvas == wordcartel_core::theme::CanvasMode::Opaque {
+        let mut cbg = crate::compose::base_canvas(&editor.theme, editor.depth);
+        cbg.fg = None; // bg-only fill
+        if cbg.bg.is_some() && cbg.bg != Some(ratatui::style::Color::Reset) {
+            frame.buffer_mut().set_style(area, cbg);
+        }
+    }
+    // Faces: wordmark = the theme's H1 accent + BOLD; body = plain text; DIM recedes.
+    let accent = crate::compose::compose(&editor.theme, editor.depth, &[SE::Text, SE::Heading(1)])
+        .add_modifier(Modifier::BOLD);
+    let body = crate::compose::compose(&editor.theme, editor.depth, &[SE::Text]);
+    let dim = body.add_modifier(Modifier::DIM);
+
+    // Build the largest block that fits `h` (degrade: hints+footer → tagline → version;
+    // the footer is orientation text and travels with the hints).
+    let full_rows = 6 + splash.hints().len(); // wordmark, version, tagline, blank, hints…, blank, footer
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(WORDMARK, accent))];
+    if h >= 2 { lines.push(Line::from(Span::styled(splash.version(), body))); }
+    if h >= 3 { lines.push(Line::from(Span::styled(TAGLINE, dim))); }
+    if (h as usize) >= full_rows && !splash.hints().is_empty() {
+        lines.push(Line::default());
+        let cw = splash.hints().iter().map(|(c, _)| c.chars().count()).max().unwrap_or(0);
+        for (chord, label) in splash.hints() {
+            lines.push(Line::from(Span::styled(format!("{chord:>cw$}   {label}"), body)));
+        }
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(FOOTER, dim)));
+    }
+    // Vertically + horizontally centered; over-wide lines clip at the frame edge.
+    let top = (h as usize).saturating_sub(lines.len()) / 2;
+    for (i, line) in lines.into_iter().enumerate() {
+        let y = top + i;
+        if y >= h as usize { break; }
+        let lw = line.width().min(w as usize) as u16;
+        if lw == 0 { continue; } // blank spacer rows
+        let x = (w - lw) / 2;
+        frame.render_widget(Paragraph::new(line), Rect::new(area.x + x, area.y + y as u16, lw, 1));
     }
 }
 
@@ -206,5 +261,78 @@ mod tests {
             Handled::Done(keep) => assert!(!keep, "Done carries !editor.quit"),
             Handled::Pass(_) => panic!("must consume"),
         }
+    }
+
+    /// Build a splashed editor sized to the terminal it will be drawn on.
+    fn splashed_editor_sized(w: u16, h: u16) -> Editor {
+        let mut e = Editor::new_from_text("hello\n", None, (w, h));
+        e.splash = Some(Splash::new(&cua_keymap(), "0.1.0"));
+        crate::derive::rebuild(&mut e);
+        e
+    }
+
+    fn draw(e: &mut Editor, w: u16, h: u16) -> Vec<String> {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))
+            .expect("test terminal");
+        term.draw(|f| crate::render::render(f, e)).expect("draw");
+        let buf = term.backend().buffer().clone();
+        (0..buf.area().height)
+            .map(|y| (0..buf.area().width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    fn contains(rows: &[String], needle: &str) -> bool {
+        rows.iter().any(|r| r.contains(needle))
+    }
+
+    #[test]
+    fn paint_full_content_at_80x24() {
+        let mut e = splashed_editor_sized(80, 24);
+        let rows = draw(&mut e, 80, 24);
+        assert!(contains(&rows, "wordcartel"), "wordmark:\n{rows:#?}");
+        assert!(contains(&rows, "v0.1.0"), "version");
+        assert!(contains(&rows, "Everyone needs a cover story"), "tagline");
+        assert!(contains(&rows, "ctrl-p   Command palette"), "palette hint");
+        assert!(contains(&rows, "ctrl-o   Open file"), "open hint");
+        assert!(contains(&rows, "ctrl-q   Quit"), "quit hint");
+        assert!(contains(&rows, "press any key"), "footer");
+        assert!(!contains(&rows, "hello"), "the splash owns the screen — body text hidden");
+    }
+
+    #[test]
+    fn paint_degrades_hints_then_tagline_keeping_the_wordmark() {
+        // h=8 < the full block (9 rows with 3 hints): hints + footer drop, tagline stays.
+        let mut e = splashed_editor_sized(80, 8);
+        let rows = draw(&mut e, 80, 8);
+        assert!(contains(&rows, "wordcartel") && contains(&rows, "v0.1.0"));
+        assert!(contains(&rows, "Everyone needs a cover story"));
+        assert!(!contains(&rows, "Command palette") && !contains(&rows, "press any key"));
+        // h=2: tagline drops too; wordmark + version survive.
+        let mut e = splashed_editor_sized(80, 2);
+        let rows = draw(&mut e, 80, 2);
+        assert!(contains(&rows, "wordcartel") && contains(&rows, "v0.1.0"));
+        assert!(!contains(&rows, "Everyone needs a cover story"));
+    }
+
+    #[test]
+    fn paint_never_panics_at_tiny_sizes() {
+        // Sweep 1x1..=12x6 — includes the sub-guard sizes (w<4 or h<2) where render()
+        // paints its clamped notice and never reaches the overlay painters.
+        for w in 1..=12u16 {
+            for h in 1..=6u16 {
+                let mut e = splashed_editor_sized(w, h);
+                let _ = draw(&mut e, w, h);
+            }
+        }
+    }
+
+    #[test]
+    fn dismissed_splash_reveals_the_document() {
+        let mut e = splashed_editor_sized(80, 24);
+        let rows = draw(&mut e, 80, 24);
+        assert!(!contains(&rows, "hello"));
+        e.splash = None;
+        let rows = draw(&mut e, 80, 24);
+        assert!(contains(&rows, "hello"), "dismiss reveals the buffer");
     }
 }

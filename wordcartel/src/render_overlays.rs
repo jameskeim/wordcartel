@@ -38,6 +38,13 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
     let area = frame.area();
     let h = area.height;
 
+    // Startup splash — owns the whole frame; nothing else can be open while it is up
+    // (set only at launch with no prompt pending; dismissed by the first key/click).
+    if editor.splash.is_some() {
+        crate::splash::paint(frame, editor);
+        return;
+    }
+
     // -----------------------------------------------------------------------
     // Command palette overlay (drawn on top of everything else)
     // -----------------------------------------------------------------------
