@@ -353,6 +353,7 @@ pub fn config_layer_paths(
 /// PER-FIELD merge: `preset` & each `state` field override only when the layer
 /// SETS them (Option); `patches` keeps one ordered entry per layer so
 /// build_keymap applies them in precedence order (Codex plan-review fix).
+#[allow(clippy::too_many_lines)] // config parse — one arm per config key
 pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
     let mut cfg = Config::default();
     let mut warns = Vec::new();

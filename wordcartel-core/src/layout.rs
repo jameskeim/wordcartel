@@ -237,6 +237,7 @@ fn grapheme_width(g: &str) -> usize {
 }
 
 /// The core: lay out one logical line.
+#[allow(clippy::too_many_lines)] // one per-row layout/soft-wrap pass — a single cohesive hot-path algorithm
 pub fn layout(
     line: &str,
     role: BlockRole,

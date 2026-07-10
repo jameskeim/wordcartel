@@ -207,6 +207,7 @@ fn set_selection_range(editor: &mut Editor, from: usize, to: usize) {
 }
 
 /// Execute `cmd` against `editor`, then re-derive + ensure visibility.
+#[allow(clippy::too_many_lines)] // command dispatch — a flat table, one arm per Command variant
 pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     match cmd {
         Command::InsertChar(c) => {

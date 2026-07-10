@@ -152,6 +152,7 @@ pub fn request_new(
     crate::workspace::new_empty_buffer(editor);
 }
 
+#[allow(clippy::too_many_lines)] // prompt resolution — one arm per prompt kind
 pub fn resolve_prompt(
     action: PromptAction,
     editor: &mut Editor,

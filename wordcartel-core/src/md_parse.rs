@@ -10,6 +10,7 @@ use std::ops::Range;
 /// - `Concealed`: hide markdown markers and style content (LivePreview inactive).
 /// - `RawStyled`: show raw source with every construct styled — delimiters,
 ///   block prefixes, and content all carry their element face (SourceHighlighted).
+#[allow(clippy::too_many_lines)] // one markdown line-analysis pass (conceal + style spans) — cohesive
 pub fn analyze(line: &str, role: BlockRole, render: LineRender) -> LineAnalysis {
     // RawPlain: show raw source, no styles (the old is_active=true path).
     if render == LineRender::RawPlain || line.is_empty() {
@@ -176,6 +177,7 @@ fn is_ws(b: u8) -> bool {
 /// Apply block-prefix concealment based on the block role.
 /// Mutates the per-byte `visible` grid (sets matching prefix bytes to false).
 /// Returns the prefix glyph string for list items, None otherwise.
+#[allow(clippy::too_many_lines)] // one block-prefix conceal pass — cohesive
 fn apply_block_prefix_conceal(
     visible: &mut [bool],
     line: &str,

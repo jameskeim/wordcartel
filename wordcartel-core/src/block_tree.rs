@@ -624,6 +624,7 @@ pub fn incremental_update_instrumented_owned(
 
 /// Generic `incremental_update_instrumented` over any `TextSource`. Consumes `old_tree` and
 /// edits its owned block-vec in place, avoiding the per-keystroke clone-and-rebuild.
+#[allow(clippy::too_many_lines)] // incremental splice/reconcile — one fuzz-hardened algorithm, kept whole per engineering-health.md
 pub fn incremental_update_instrumented_src_owned<S: TextSource>(
     old_tree: BlockTree,
     old_src: &S,

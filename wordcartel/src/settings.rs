@@ -299,6 +299,7 @@ fn some_if<T>(t: T, any: bool) -> Option<T> {
 /// does not shield sibling keys. Exception: the `[theme]` guard is
 /// PROVENANCE-TYPED (section-level) because `parse_mask` collapses file- and
 /// name-provenance into a single sentinel at parse time (spec N-4).
+#[allow(clippy::too_many_lines)] // settings diff/serialize — one field per persisted setting key
 pub fn compute_overrides(
     runtime:  &SettingsSnapshot,
     baseline: &SettingsSnapshot,

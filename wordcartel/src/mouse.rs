@@ -82,7 +82,7 @@ fn no_overlay_open(editor: &Editor) -> bool {
 /// consume without acting; list overlays scroll/click/click-away (Tasks 10-13).
 // 8 args mirror `handle`'s dispatch context (reg/keymap/ex/clock/msg_tx) plus the
 // precomputed overlay `area`; an args-struct would just duplicate `handle`'s params.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // overlay mouse routing — one branch per overlay region
 fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rect,
                  reg: &crate::registry::Registry, keymap: &crate::keymap::KeyTrie,
                  ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
@@ -390,6 +390,7 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
     if editor.minibuffer.is_some() || editor.search.is_some() {}
 }
 
+#[allow(clippy::too_many_lines)] // mouse event dispatch — one branch per screen region
 pub fn handle(
     editor: &mut Editor,
     ev: MouseEvent,

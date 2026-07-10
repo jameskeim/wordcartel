@@ -82,6 +82,7 @@ impl Registry {
         self.entries.push(CommandEntry { id: cid, handler, meta: CommandMeta { label, menu, state: Some(state) } });
     }
 
+    #[allow(clippy::too_many_lines)] // the command registry data table — one entry per command
     pub fn builtins() -> Registry {
         let mut r = Registry { entries: Vec::new(), index: HashMap::new() };
 

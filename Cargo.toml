@@ -4,6 +4,10 @@ members = ["wordcartel-core", "wordcartel"]
 
 [workspace.lints.clippy]
 all = "deny"
+# Anti-regrowth (CLAUDE.md → "Module structure — dispatchers delegate"): a function past
+# the clippy.toml threshold (100 lines) must be split or carry an item-local
+# `#[allow(clippy::too_many_lines)]` + one-line reason. Not part of `all`; enabled here.
+too_many_lines = "deny"
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

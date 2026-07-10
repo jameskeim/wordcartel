@@ -397,6 +397,7 @@ pub(crate) fn first_frame_settle(editor: &mut Editor) {
 /// Open the file named by `cli.path` (or a scratch buffer), load layered config,
 /// build the keymap, install the terminal guard, then loop:
 /// draw → read event → step → repeat until `editor.quit`.
+#[allow(clippy::too_many_lines)] // event-loop init + drive sequence — cohesive startup; the deadline machinery is already seamed to timers.rs
 pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // Install the panic hook (once) so the terminal is restored on panic.
     term::install_panic_hook();

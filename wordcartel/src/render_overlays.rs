@@ -33,6 +33,7 @@ use crate::{
 ///
 /// `area` and `h` are derived from `frame.area()` to match the values the
 /// main render function computes; no state is duplicated.
+#[allow(clippy::too_many_lines)] // overlay paint dispatch — one block per overlay surface
 pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
     let area = frame.area();
     let h = area.height;

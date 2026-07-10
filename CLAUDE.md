@@ -110,6 +110,11 @@ before merge.
 - `cargo build` and `cargo test --no-run` warning-free for the crate(s) you touched.
 - **Workspace clippy clean is a GATE.** The clippy-debt cleanup (2026-06-30) cleared all `clippy::all` warnings and enabled `[workspace.lints.clippy] all = "deny"`. `cargo clippy --workspace --all-targets` MUST pass clean before merge. New warnings fail the clippy run; deliberate exceptions require an item-local `#[allow(clippy::…)]` with a one-line rationale (never a blanket crate/workspace allow).
 - New code matches the surrounding **house style** (see below) by review.
+- **Module-size anti-regrowth is a GATE.** `clippy::too_many_lines` (threshold 100, `clippy.toml`;
+  enabled in `[workspace.lints.clippy]`) and the hub production budgets in
+  `wordcartel/tests/module_budgets.rs` both enforce *Module structure* (below). A function over the
+  threshold, or a hub over budget, fails the build until it is split — or, for `too_many_lines`, carries
+  an item-local `#[allow(clippy::too_many_lines)]` with a one-line reason.
 
 **PTY smoke suite — mandatory-run, advisory-pass (NOT a GATE):** every effort's pre-merge
 report MUST run `scripts/smoke/run.sh` and quote its one-line summary verbatim (e.g.
@@ -147,6 +152,22 @@ establishing the invariant) is acceptable, but prefer `.expect("…invariant…"
 never `O(document)`; cold paths favor clarity. Avoid needless allocation (`&str` over
 `String`, `Cow<'_, str>` when ownership is conditional, `Vec::with_capacity` when size is
 known). DRY; no dead code; no technical debt.
+
+**Module structure — dispatchers delegate, they don't implement (anti-regrowth).** The H1 debt
+(`app.rs`/`render.rs` god-objects, decomposed 2026-07-09) came from *dispatch attractors*: a central
+`match`/loop that every feature had to edit, so it grew monotonically with feature count — and prior
+*leaf* extraction didn't stop it because new wiring still landed in the hub. Prevent the recurrence:
+a `match` arm or loop iteration is a **thin delegation** into a domain module — or a **row in a data
+table** — never an inline body. New behavior enters through a **registration seam** (a `timers.rs`
+`SUBSYSTEMS` row; a feature-module `intercept`/handler fn; an exhaustive-enum variant the compiler
+forces you to place), NOT by growing the dispatcher. This is Open–Closed in Rust: the hub is closed to
+editing, open to new modules. **Effort P conforms** — plugin message-arms/hooks register into the seam;
+they must not add bulk to `reduce`/`run`. Enforced by the two GATEs above (`clippy::too_many_lines` on
+the god-*function*, the `module_budgets` test on the god-*file*). Counter-caveat: do NOT over-fragment
+in reaction — the target is *"one person can hold this module's single responsibility in their head"*
+(one axis of change per module), not maximal splitting; a tangle of 40-line files with cross-imports is
+its own pathology. A long function is fine when it is a genuinely flat, cohesive dispatch (a
+table-builder, an exhaustive command `match`) — mark it with a reasoned `#[allow(clippy::too_many_lines)]`.
 
 **Concurrency:** heavy/slow work goes off the hot path onto the `std::thread` + `mpsc` job
 substrate (worker results are `Send`, version-discarded on staleness). Never block the input

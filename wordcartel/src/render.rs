@@ -212,6 +212,7 @@ impl ChromeStyles {
 ///
 /// §15.6 tiny-terminal guard: if width < 4 or height < 2, paint a clamped
 /// "too small" notice and return without indexing out of bounds.
+#[allow(clippy::too_many_lines)] // the render() body split is the tracked H1 follow-up (engineering-health.md)
 pub fn render(frame: &mut Frame, editor: &mut Editor) {
     let area = frame.area();
     let w = area.width;

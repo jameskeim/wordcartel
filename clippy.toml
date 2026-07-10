@@ -1,0 +1,7 @@
+# Anti-regrowth lint config (CLAUDE.md → "Module structure — dispatchers delegate").
+#
+# A function longer than this must either be split, or carry an item-local
+# `#[allow(clippy::too_many_lines)]` with a one-line reason — a long function is a
+# DELIBERATE, documented exception (a flat dispatch table / exhaustive match), never an
+# accident. 100 is clippy's default: "a function past 100 lines needs a stated reason."
+too-many-lines-threshold = 100
