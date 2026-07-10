@@ -134,7 +134,22 @@ pub fn build_multi_replace(
     doc_len: usize,
 ) -> (wordcartel_core::change::ChangeSet, wordcartel_core::block_tree::Edit) {
     use wordcartel_core::change::{ChangeSet, Op, Tendril};
-    debug_assert!(!edits.is_empty());
+    // WELL-FORMEDNESS GUARD (H7): the op-builder below assumes `edits` is a non-empty,
+    // ascending, non-overlapping, in-bounds sequence. A malformed list would make the ops
+    // over-/under-consume the document and trip ChangeSet::from_ops' release assert. Any
+    // violation degrades to the identity no-op — a malformed multi-replace does NOTHING, so
+    // it can neither panic nor corrupt. No production caller hits this (all pass ascending,
+    // non-overlapping spans); it is the boundary insurance Effort P will lean on.
+    let well_formed = !edits.is_empty()
+        && edits.iter().all(|(f, t, _)| f <= t)
+        && edits.windows(2).all(|w| w[0].1 <= w[1].0)
+        && edits.last().is_some_and(|(_, t, _)| *t <= doc_len);
+    if !well_formed {
+        let ops = if doc_len > 0 { vec![Op::Retain(doc_len)] } else { Vec::new() };
+        let cs = ChangeSet::from_ops(ops, doc_len);
+        let edit = wordcartel_core::block_tree::Edit { range: 0..0, new_len: 0 };
+        return (cs, edit);
+    }
     let mut ops = Vec::new();
     let mut pos = 0usize;
     for (from, to, text) in edits {
@@ -144,6 +159,8 @@ pub fn build_multi_replace(
         pos = *to;
     }
     if doc_len > pos { ops.push(Op::Retain(doc_len - pos)); }
+    // The guard proved edits non-empty + ascending + in-bounds, so first<=last_to<=doc_len
+    // and every subtraction below is non-negative — no saturating dressing needed.
     let first = edits.first().unwrap().0;
     let last_to = edits.last().unwrap().1;
     // new_len of the covering region = (last_to - first) adjusted by all deltas.
@@ -1247,6 +1264,59 @@ mod tests {
         cs.apply(&mut tb);
         assert_eq!(tb.slice(0..tb.len()), "b b b");
         assert_eq!(edit.range, 0..8); // covering edit spans first.start..last.end
+    }
+
+    #[test]
+    fn multi_replace_empty_list_is_identity_noop() {
+        let (cs, edit) = super::build_multi_replace(&[], 5);
+        assert_eq!(edit.range, 0..0);
+        assert_eq!(edit.new_len, 0);
+        let mut tb = wordcartel_core::buffer::TextBuffer::from_str("hello");
+        cs.apply(&mut tb);
+        assert_eq!(tb.slice(0..tb.len()), "hello"); // no-op apply leaves the doc unchanged
+    }
+
+    #[test]
+    fn multi_replace_reversed_pair_is_identity_noop_not_panic() {
+        // (from=10, to=5) would over-consume the doc (retain 10 then retain doc_len-5)
+        // and trip ChangeSet::from_ops' release assert. The guard degrades it to a no-op.
+        let (cs, edit) = super::build_multi_replace(&[(10, 5, "x".into())], 20);
+        assert_eq!(edit.range, 0..0);
+        assert_eq!(edit.new_len, 0);
+        let mut tb = wordcartel_core::buffer::TextBuffer::from_str("abcdefghijklmnopqrst"); // 20
+        cs.apply(&mut tb);
+        assert_eq!(tb.slice(0..tb.len()), "abcdefghijklmnopqrst");
+    }
+
+    #[test]
+    fn multi_replace_overlapping_list_is_identity_noop() {
+        // second edit starts (3) before the first ends (4) -> not ascending/non-overlapping.
+        let (cs, edit) = super::build_multi_replace(&[(0, 4, "x".into()), (3, 6, "y".into())], 10);
+        assert_eq!(edit.range, 0..0);
+        let mut tb = wordcartel_core::buffer::TextBuffer::from_str("0123456789");
+        cs.apply(&mut tb);
+        assert_eq!(tb.slice(0..tb.len()), "0123456789");
+    }
+
+    #[test]
+    fn multi_replace_out_of_bounds_is_identity_noop() {
+        // last_to (12) exceeds doc_len (10).
+        let (cs, edit) = super::build_multi_replace(&[(0, 12, "x".into())], 10);
+        assert_eq!(edit.range, 0..0);
+        let mut tb = wordcartel_core::buffer::TextBuffer::from_str("0123456789");
+        cs.apply(&mut tb);
+        assert_eq!(tb.slice(0..tb.len()), "0123456789");
+    }
+
+    #[test]
+    fn multi_replace_valid_ascending_still_builds_covering_edit() {
+        // Regression: the guard must NOT reject well-formed input.
+        let (cs, edit) = super::build_multi_replace(
+            &[(0, 2, "b".into()), (3, 5, "b".into()), (6, 8, "b".into())], 8);
+        let mut tb = wordcartel_core::buffer::TextBuffer::from_str("aa aa aa");
+        cs.apply(&mut tb);
+        assert_eq!(tb.slice(0..tb.len()), "b b b");
+        assert_eq!(edit.range, 0..8);
     }
 
     // -------------------------------------------------------------------------
