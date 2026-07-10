@@ -49,7 +49,7 @@ options) + locks the hint plumbing; the state-in-label display shipped with E2.
 <!-- item: A3b -->
 
 Apply the adopted curation principle (see the three-surface contract section) item-by-item across the
-~126 registry commands / ~58 menu set: decide per command whether it belongs in the *menu* (by
+~156 registry commands / ~72 menu set (Phase-0 count, 2026-07-10): decide per command whether it belongs in the *menu* (by
 category — the commands a word-processor user goes looking for) vs *palette-only* (motions,
 navigation, internal plumbing, keystroke-native), bringing only the genuine judgment calls back for
 approval. Lower-risk polish; rides whenever. Independent of A3 (A3 fixes the contract-*violation*;
@@ -150,6 +150,41 @@ toggle; what "previous buffer" means if that buffer was closed; one global scrat
 `goto_scratch` / `next_buffer` / `prev_buffer` / `switch_buffer` (`registry.rs:293-296`),
 `workspace::goto_scratch`, the workspace buffer list; relates to A8 (switcher — scratch excluded) and the
 block→scratch commands (`scratch.rs`).
+
+### A14 — Emacs-parity prose editing commands (transpose, word-case, join-line, whitespace fixups)
+<!-- item: A14 -->
+
+A cluster of atomic editing commands that Emacs ships built-in, classic WordStar lacked, and Wordcartel's
+command registry does **not** have today (verified against the registry — `commands.rs` / `registry.rs`):
+
+- **Transpose** — swap the two chars around the caret / the two words around it / two adjacent lines (Emacs
+  `transpose-chars`/`-words`/`-lines`, C-t / M-t / C-x C-t). The classic typo-fixer; nothing equivalent exists.
+- **Word/region case** — upcase / downcase / capitalize the current word or the selection (Emacs M-u / M-l /
+  M-c + `upcase-region` etc.). No case command in the registry today.
+- **join-line / delete-indentation** — pull the next line onto this one, collapsing the join to one space
+  (Emacs M-^). Absent.
+- **Whitespace fixups** — `just-one-space` (M-SPC), `delete-blank-lines` (C-x C-o), optionally
+  `delete-horizontal-space` (M-\). Absent.
+
+**Scope discipline (what is NOT here):** keyboard macros and dynamic-abbrev (dabbrev) are *automation*, not
+single commands — that is **Effort-P** territory (record/replay over the registry), tracked under P, not here.
+`sort-lines` is already reachable via the `filter` pipe; incremental search (`find`), query-replace
+(`replace`), and paragraph reflow (`reflow`) already exist; code-editor motions (sexp/list, comment-region,
+narrowing) are out of domain for a markdown prose editor.
+
+**FOLD INTO THE COMMAND-SURFACE CURATION EFFORT** (with A3b / A8 / A9 / A10 / A11 / A12 / A13): every new
+command lands on the same surface those items touch — the name-keyed registry, the exhaustive palette, and the
+command-surface contract — so do them as one effort rather than re-loading that context per item. Each command
+is **keymap-agnostic**: it enters the registry once and is bound as fits in the CUA / WordStar presets (and
+placed in Edit ⊆ palette). Follow the existing atomic-edit pattern (`delete_word_back` / `delete_word_forward`
+/ `delete_to_line_end`, which live in **`commands/edit.rs`**): compute the range, build a `ChangeSet` + `Edit`,
+and call **`editor.apply(txn, edit, EditKind::Other, clock)` directly** + `settle_after_edit` — undo/marks stay
+correct through `editor.apply`. **Corrected grounding (Phase-0 map, 2026-07-10):** do NOT route these through
+`submit_transaction` — that is the M2 *untrusted*-edit boundary (the Effort-P `apply(Transaction)` seam for
+plugin/automation input), a separate path from internal built-in commands. Likely **S–SM** once scoped — each command is small; the count is the work.
+
+Anchors: the command registry (`registry.rs`), the existing word/line delete commands in `commands/edit.rs` as
+the pattern (`editor.apply` + `settle_after_edit`), and `docs/design/command-surface-contract.md`.
 
 ---
 
@@ -492,9 +527,16 @@ best validates — the markup-rendering capability; treat it as a P design ancho
 ### A13 — Overlay mouse parity
 <!-- item: A13 -->
 
-Click-to-select for theme picker + file browser; outline click-to-jump.
+**Corrected grounding (Phase-0 map, 2026-07-10):** the overlays originally named here — theme
+picker, file browser, outline — ALREADY have scroll + click-to-select/jump wired in
+`mouse.rs::route_overlay`; they need no work. The real mouse-parity gap is the **minibuffer** and
+**search** overlays, which have ZERO mouse handling today (`route_overlay` drops their events). A13
+= add click-to-position-cursor in the minibuffer + click-to-jump-to-match in search, keeping the
+keyboard path authoritative (contract law 5 — every mouse affordance has a keyboard path). Seam:
+`mouse.rs::route_overlay` (add the `minibuffer`/`search` branches).
 
 ### P — Effort P — in-process Lua plugin system (1.0 capstone)
 <!-- item: P -->
 
 The plugin/automation spine; registers into the command/hook/job seams. See docs/design/effort-p-plugin-system-design-space.md.
+

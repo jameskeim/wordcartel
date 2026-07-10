@@ -3,7 +3,7 @@
 
 # Backlog
 
-**27 open · 34 shipped · 1 dropped**
+**28 open · 34 shipped · 1 dropped**
 
 Blocking Effort P: **0**
 
@@ -11,7 +11,7 @@ Blocking Effort P: **0**
 
 | id | title | status | kind | size | P? | hook |
 |---|---|---|---|---|---|---|
-| A13 | Overlay mouse parity | needs-design | feature | S |  | Click-to-select for theme picker + file browser; outline click-to-jump. |
+| A13 | Overlay mouse parity | needs-design | feature | S |  | Overlay mouse parity: theme picker/file browser/outline ALREADY have click support; real gap is minibuffer + search overlays (zero mouse handling today). |
 | A3b | Item-by-item menu-curation pass | ready | chore | S |  | Per-command menu vs palette-only curation; concrete Q: move Filter Edit->Format? |
 | A9 | Wrap Column state-in-label | needs-design | feature | S |  | Rename 'Set Wrap Column...' to stateful 'Wrap Column: <value>'. |
 | H12 | PTY smoke suite live-splash coverage (S9) | ready | chore | S |  | Add an S9 check that launches WITHOUT --no-splash and asserts the real splash journey. |
@@ -27,6 +27,7 @@ Blocking Effort P: **0**
 | A10 | Dedicated Block menu for marked-block commands | needs-design | feature | TBD |  | Move the blocks_marked command family into its own MenuCategory::Block. |
 | A11 | Filter + transform SCOPE + filter docs | needs-design | feature | TBD |  | Unify buffer vs marked-block vs selection scope; document Filter. |
 | A12 | Scratch buffer = a dedicated toggle | needs-design | feature | TBD |  | toggle_scratch round-trip; exclude scratch from cycle/switcher/open-docs menu. |
+| A14 | Emacs-parity prose editing commands (transpose, word-case, join-line, whitespace fixups) | triage | feature | TBD |  | Transpose / word-case / join-line / whitespace-fixup commands (Emacs-parity, absent from the registry today); FOLD into the command-surface curation pass (A3b/A8-A13). |
 | A8 | Menu listing the open documents to switch between | needs-design | feature | TBD |  | Dynamic Window/Buffers/Documents menu auto-populated from open buffers. |
 | B7 | Selected menu-item text too light | needs-design | bug | TBD |  | Possible E5 regression; selected item may need a distinct legible highlight fg. |
 | B8 | Configurable terminal caret shape / colour | needs-design | feature | TBD |  | Emit DECSCUSR (block/beam/underline, blink, colour); restore on exit/panic. |
