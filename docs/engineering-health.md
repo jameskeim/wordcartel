@@ -26,88 +26,6 @@ that catches real bugs — is the real asset.
 
 ---
 
-## H1 — Decompose the two god-objects (`app.rs`, `render.rs`) · **PARTIALLY SHIPPED** 2026-07-09 (merge 304e263) — `render()` body split remains
-
-**SHIPPED 2026-07-09** (merge `304e263`, branch effort-h1-god-object-decomposition, 12-task subagent-driven
-execution). The hub SEAM refactor landed behavior-identically: `run`'s 8-deadline loop → the `timers.rs`
-**static fn-pointer table** (`SUBSYSTEMS` + `next_wake`/`on_tick`/`pre_recv`; gates + fire-order preserved;
-idle-blocks/no-spin **proven by a compiled Fable probe** holding None at +24h); `reduce`'s ~900-line match →
-a **10-stage `Handled`-protocol skeleton** + `fold_and_continue`, plus `Input(Key)` → `input::handle_key`;
-the leaf extractions (`theme_cmds.rs`, `chrome.rs`, `chrome_geom.rs`, `render_status.rs`, + the micro-leaves
-to their domain modules) and `list_window::apply_list_nav`. New guardrail pins assert the idle-blocks
-invariant + the version-hook asymmetry. Both final gates GO (Fable whole-branch + Codex pre-merge); 1,267
-tests green, clippy clean, smoke 8/8. Process: Fable authored the spec+plan (Codex-gated each round);
-see [[wordcartel-fable-authors-codex-gates]].
-
-**REMAINING — the one deferred piece, its own next effort: split the 522-line `render()` body** by paint
-surface (row loop → `paint_rows`, status → `paint_status`, cursor → `place_cursor`; unify the twin
-`segs`/`placed` span-builders). Deliberately scoped OUT of the shipped effort (which did verbatim render-*helper*
-moves only): it is a different risk class — real restructuring that churns the pixel-exact golden-render tests —
-so it earns a focused pass of its own. `render.rs` is not fully decomposed until this lands; low context
-overlap with the app.rs work is exactly why it was split off (user decision 2026-07-09).
-
-**Line anchors (2026-07-09 map; may drift — `render()` body is `render.rs:216–737`, guarded by the
-`#[allow(clippy::too_many_lines)]` at :215).** The body is 12 sequential phases; the three split targets and the
-dedup target:
-- **`paint_rows`** ← the row loop `render.rs:358–606` (the mass). Per visual row it builds spans through two
-  near-duplicate paths: the **segs** path (:395–450, no search/diag/sel/block) and the **placed** path (:451–588,
-  per-glyph MarkedBlock→Selection→Search→Diag layering + run-accumulation).
-- **`paint_status`** ← the status-line block `render.rs:635–699` (search bar / minibuffer / prompt / normal +
-  right-flushed Ln/Col·words via `render_status::` helpers).
-- **`place_cursor`** ← the hardware-cursor block `render.rs:704–734` (search field / minibuffer / `nav::screen_pos`).
-- **Unify `segs`/`placed`:** the **prefix lead-in is near-verbatim duplicated** — segs at `render.rs:404–432`,
-  placed at `:477–503` (same heading-numeral-box-vs-dim-glyph logic, copy-pasted), and both share the identical
-  `row_dim`/`plain_source` compose ladder (:434–446 vs :515–527). That shared lead-in + style ladder is the
-  natural extract. Everything after the loop is already delegated: `ChromeStyles::build` (:612, shared with
-  `render_overlays.rs`), scrollbar (:617–630), and `render_overlays::paint` (:736).
-
-*(Original triage below retained for history — the SEAM direction it sketched is what shipped.)*
-
-`app.rs` is **5,519 lines** and `render.rs` **3,393** — past the point where one person holds them in
-context. This is the clearest structural debt, and it bites hardest right before **Effort P**: `app.rs`
-is where plugin/automation wiring lands, so a plugin surface bolted onto a 5k-line reducer is a
-comprehension and review hazard.
-
-**Real surface (2026-07-08 measurement — most of the line count is co-located tests):**
-- `app.rs`: **~1,946 production** lines (~3,573 tests). The mass is two hubs — `reduce` (~900 lines) and
-  `run` (the event loop, ~430) — plus ~25 small helpers.
-- `render.rs`: **~1,028 production** (~2,365 tests), 26 paint fns. → **~3,000 production lines total**, not ~9k.
-
-**Why it regrew (this drives the design).** The prior H1 pass (2026-07-04/05, commits `4e12212`…
-`5c908f3`, all "verbatim move") extracted cohesive *leaves* — `jobs_apply.rs`, `session_restore.rs`,
-`prompts.rs`, `search_ui.rs` — but deliberately left the two **hubs** (`reduce`, `run`) behind. Those
-are exactly what every new interactive feature must touch, so app.rs grew **+814 lines in ~3 days**
-(4,705 → 5,519) as D1/A5, E3/E4, the scrollbar/menu/status/mouse chrome, C3, R1, and the swap fix each
-landed the same three shapes into the hubs: (1) a new `Msg` variant → a new `reduce` match arm; (2) a
-new timed feature → a new `*_deadline` term in `run`'s loop (now **8** deadlines) + a `recompute_*`/
-`*_tick` helper; (3) co-located tests. Not sloppiness — structural: the wiring belongs at the hub, and
-the hub was left monolithic. **Effort P will do the same (plugin message-arms + hooks).**
-
-**Direction — the durable fix is a SEAM, not more leaf extraction** (leaves alone regrew once already):
-- **`run`'s deadline loop → a registry of timed subsystems** — each contributes its own deadline + tick,
-  so a new timed feature registers a subsystem instead of editing the loop. Must preserve fire-order
-  (dwell/grace first), the per-subsystem in-flight/pending gating, and the never-spin / idle-is-free
-  invariant. Keep subsystems as free fns over `&mut Editor` (as today) to avoid borrow-checker friction.
-- **`reduce`'s ~900-line match → per-domain handler modules** — keep the skeleton (prologue capture →
-  modal/minibuffer/overlay interception chain → dispatch → epilogue: version-change hook + drain-fold);
-  lift out the per-`Msg` handler bodies. The interception layering + shared epilogue are the careful
-  part (ordering bugs here shift behavior).
-- Finish the remaining **leaf extractions** (theme-cmds, chrome-`recompute_*`, session-persist, overlay
-  dispatch) and split **render.rs** by paint surface — these are the easy, verbatim-move tasks.
-
-**Difficulty: focused Medium.** Leaf extraction is trivial/low-risk. The two hubs are the real work —
-`reduce`'s interception layering (harder) and `run`'s deadline-registry (invariant + borrow care).
-Correctness risk is **low** (behavior-identical; caught by compiler + ~925 shell tests + the e2e
-`reduce→advance→render` journeys + PTY smoke) — the cost is iteration-to-green, not debugging. The one
-genuine risk is a **subtle emergent regression in the hub that no test covers** (exactly the swap-thrash
-class), so it needs: a whole-branch review gate AND a new guardrail asserting the refactored `run` loop
-still **blocks when idle** (the resource-behavior invariant).
-
-**When (decision 2026-07-08): DEFERRED until Fable credits are back.** A hub refactor of the dispatch/
-event loop is precisely the case Fable's executable whole-branch probes are worth spending on (the
-subtle-emergent-behavior risk above); the user chose not to attempt it until then. Still gated **before
-Effort P**. Not urgent for correctness.
-
 ## H2 — Interrogate the `burn`/`harper` dependency weight
 <!-- item: H2 -->
 
@@ -153,19 +71,6 @@ appears, or as a side effect of a future B-style investment). It should **not** 
 open correctness debt. `block_tree.rs` remains the shared hotspot for both this and the R1
 paragraph-end widen cost, so any future work there touches both.
 
-## H4 — Arch package should declare pandoc (+ a TeX engine) as optdepends · `SHIPPED` 2026-07-08 (polish batch, a0912df: `pandoc-cli` + `texlive-xetex` optdepends)
-
-The Arch `PKGBUILD` (`packaging/arch/PKGBUILD`) lists optdepends for clipboard (wayland/libxcb/libx11/
-wl-clipboard/xclip) but **not pandoc**, even though export shells out to it: `wordcartel/src/export.rs`
-runs pandoc for html/docx/pdf export. It is genuinely *optional* — `probe_pandoc()` is cached and
-returns false when pandoc is absent, and callers gate on it and show a status instead of failing — so
-the right declaration is an **optdepend**, not a hard `depends`: `pandoc: markdown export (html/docx/pdf)`.
-The **PDF** path additionally needs a TeX engine — the pandoc `--pdf-engine` defaults to xelatex
-(`config.rs:139`) — so a second optdepend is likely warranted (e.g. `texlive-xetex: PDF export via
-pandoc --pdf-engine=xelatex`). Direction: add both to the PKGBUILD optdepends when next touched; confirm
-the exact Arch package names for the TeX engine. Anchors: `packaging/arch/PKGBUILD`,
-`wordcartel/src/export.rs`, `wordcartel/src/config.rs:139`.
-
 ## H5 — App-managed cleanup of swap files / state-dir debris?
 <!-- item: H5 -->
 
@@ -183,32 +88,6 @@ weigh: (a) auto-prune on launch (delete swaps whose owning pid is dead AND whose
 the swap durability model (memory: `wordcartel-swap-idle-thrash`). Anchors: `wordcartel/src/swap.rs`
 (`state_dir`, `swap_path`, `find_orphan_scratch_swap`), `recovery.rs`.
 
-## H6 — Decide a point-release version scheme + release process · **SHIPPED** 2026-07-09 (merge 50b449a, tag v0.1.0)
-
-**SHIPPED 2026-07-09** (branch release-v0.1.0-versioning, merge `50b449a`; design doc
-`docs/superpowers/specs/2026-07-09-point-release-versioning-design.md`). Resolved all four forks below:
-(a) **scheme** = SemVer pre-1.0 `0.MINOR.PATCH`, `1.0.0` reserved for the Effort-P capstone (MINOR = features,
-PATCH = fixes-only); (b) **source of truth** = Cargo `[workspace.package] version` (both crates inherit via
-`version.workspace = true`), a git tag `vX.Y.Z` mirrors it; (c) **PKGBUILD** `pkgver()` is now tag-anchored
-(`git describe --tags | sed …` → `0.1.0` at the tag, `0.1.0.rN.gHASH` between); (d) **ritual** = a hand-curated
-`CHANGELOG.md` (Keep a Changelog) + a 5-step release checklist in the design doc. Also closed the "app can't
-report its version" gap: new `wcartel --version` / `-V` reads `env!("CARGO_PKG_VERSION")`. First release **v0.1.0**
-cut against the current tree (annotated tag on `50b449a`) and the `release-dist` Arch package built
-(`wordcartel-0.1.0-1-x86_64.pkg.tar.zst`). Gates green (build/clippy/`cargo test --workspace` all suites);
-`--version` verified. Advances **H4** (packaging). *(Original triage below retained for history.)*
-
-**Question (user):** decide on a point-release and versioning SYSTEM for the app.
-
-**Grounded (may drift):** there is NO semantic version today — the Cargo crates are `version = "0.0.0"` and
-the Arch `PKGBUILD` uses a VCS-style `pkgver()` = `0.0.0.r<commits>.g<hash>` (`packaging/arch/PKGBUILD:37`),
-so every build is a git-describe snapshot with no human-meaningful release points. A point-release system
-means choosing: (a) a scheme (SemVer `0.x`→`1.0` aligned to the Effort-P 1.0 capstone? CalVer?); (b) the
-canonical home for the version (Cargo workspace `version`, a `VERSION` file, or git tags); (c) how the
-PKGBUILD `pkgver()` derives from it (tag-based `git describe` instead of a raw commit count); (d) a
-tag/changelog/release ritual. Ties to the 1.0 framing (Effort P = the 1.0 capstone per CLAUDE.md) and the
-H4 packaging work. Anchors: `Cargo.toml` (`version`), `packaging/arch/PKGBUILD` (`pkgver()` :37), git tags
-(none today).
-
 ## H7 — Audit `.unwrap()` usage across the tree
 <!-- item: H7 -->
 
@@ -223,41 +102,6 @@ a message) vs genuinely-fallible (→ typed error to the status line), and confi
 untrusted/IO/async path that M2/M3/M4 didn't already cover. Low-risk, mechanical, high-confidence — a good
 fold into a future hardening pass. Anchors: CLAUDE.md (unwrap policy), this doc's Snapshot (the ~35 count),
 the M2/M3/M4 boundaries.
-
-## H8 — Dead public API: two fold/outline accessors have no production callers · **SHIPPED** 2026-07-09
-
-**SHIPPED 2026-07-09** (branch chore-h8-remove-dead-accessors). Fable scoped it (compile-verified a scratch
-removal against the branch) and both accessors were deleted with their exclusive tests: `outline::section_range`
-(+ tests `section_range_stops_at_same_or_higher_level`, `section_range_last_heading_runs_to_eof`) and
-`fold::FoldState::hidden_byte_ranges` (+ test `hidden_byte_ranges_cover_body_not_heading`). Fable also caught two
-live stale doc-comment references the grep pass missed (`outline.rs` `ordered` and `sections` doc comments named
-the removed fns) — both fixed. Gates green: build + clippy `--workspace --all-targets` clean; `cargo test`
-`wordcartel-core`/`wordcartel` all suites pass (core 279, shell 939, oracle 42, 0 failed). Low-risk, mechanical
-as predicted; no shared test helpers over-deleted (`ordered`, `DOC`, `parse`/`doc` retained). *(Original triage
-below retained for history.)*
-
-**Grounded (rust-analyzer call-hierarchy + `findReferences` + raw grep, 2026-07-09).** Two `pub` fns are
-referenced ONLY by their own unit tests — superseded-but-not-removed API. Both are the byte-space /
-single-shot sibling of a batch API that the real hot path uses instead:
-
-1. **`outline::section_range`** (`wordcartel-core/src/outline.rs:75`) — referenced only inside its own file:
-   the def plus 4 unit-test call sites (lines 195, 198, 201, 209). Its doc comment describes the fold
-   subsystem as the caller ("callers hide the body… and keep the heading visible"), but folding actually
-   uses the `sections`/`body_range` batch API — `section_range` looks like a leftover from before that batch
-   API landed. Tests to remove with it: `section_range_stops_at_same_or_higher_level`,
-   `section_range_last_heading_runs_to_eof` (`outline.rs:187`/`:204`).
-
-2. **`fold::FoldState::hidden_byte_ranges`** (`wordcartel/src/fold.rs:113`) — the BYTES-space hidden-range
-   accessor; grep finds only the def and one test (`fold.rs:395`, `hidden_byte_ranges_cover_body_not_heading`).
-   The per-frame path uses `FoldView::compute` (LINE space, merged + `epoch`-cached via
-   `editor.active_fold_view()`) instead, so the byte-space variant is never invoked in production. Same
-   superseded-sibling shape as (1).
-
-**Direction when picked up:** for each, confirm no Effort-P/plugin surface is expected to want it, then delete
-the fn + its test(s) — or, if it's meant to be kept as public API for plugins, add a production caller or a
-`#[doc]`/rationale so it isn't mistaken for dead code. Low-risk, mechanical. Anchors: `outline.rs:75` (+`:187`/
-`:204` tests); `fold.rs:113` (+`:395` test); the batch APIs that actually feed the hot path
-(`outline::sections`/`body_range`, `fold::FoldView::compute`).
 
 ## H9 — Lift the logical-line helpers out of `derive` into their own module
 <!-- item: H9 -->
@@ -362,7 +206,6 @@ struct crosses a comprehension threshold — do NOT split for its own sake (over
 per the Module-structure rule). Note the 10 overlay `Option<T>` fields (`prompt`/`palette`/…/`splash`) are a
 deliberate flat XOR set enforced by the `open_*` family, not a clustering candidate. Anchor: `editor.rs:368` (the
 struct), `:493` (the impl), the `open_*` overlay family + shared setters.
-
 
 ## Newly-tracked items (stubs)
 
