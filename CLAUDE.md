@@ -94,7 +94,7 @@ deviation.
 - Every commit ends with the project trailers, verbatim — the `Co-Authored-By` line below,
   then a `Claude-Session:` line with the current session's URL (provided by the environment):
   ```
-  Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+  Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
   Claude-Session: <current session URL>
   ```
 
