@@ -119,7 +119,7 @@ pub fn screen_pos(editor: &Editor) -> Option<(u16, u16)> {
         return None;
     }
 
-    Some((vcol as u16, final_row as u16))
+    Some((u16::try_from(vcol).unwrap_or(u16::MAX), final_row as u16))
 }
 
 // ---------------------------------------------------------------------------

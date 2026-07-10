@@ -258,6 +258,7 @@ fn options() -> Options {
     o
 }
 
+#[allow(clippy::cast_possible_truncation)] // markdown heading level is 1..=6, always fits u8
 fn tag_to_kind(tag: &Tag) -> Option<BlockKind> {
     Some(match tag {
         Tag::Paragraph => BlockKind::Paragraph,
@@ -464,6 +465,7 @@ pub struct Edit {
 }
 
 impl Edit {
+    #[allow(clippy::cast_possible_wrap)] // usize offsets are <= the ~5 MB doc cap (change.rs policy), ~12 orders below isize::MAX
     pub fn delta(&self) -> isize {
         self.new_len as isize - self.range.len() as isize
     }
@@ -867,7 +869,7 @@ pub fn incremental_update_instrumented_src_owned<S: TextSource>(
         repair_region(tops, old_src, &mut base_start, &mut base_end);
         // Size in NEW-text bytes — `reparsed_bytes` is `new_region.len()` AFTER `delta` (Codex):
         // an insertion can push the actual reparse over the cap even when the old base fits.
-        let base_new_end = (base_end as isize + delta) as usize;
+        let base_new_end = shift_offset(base_end, delta);
         let base_region_size = base_new_end.saturating_sub(base_start);
         let widen_span = new_src.len().saturating_sub(region_old_start);
         if widen_span <= MAX_SYNC_WIDEN_BYTES {
@@ -926,7 +928,11 @@ pub fn incremental_update_instrumented_src_owned<S: TextSource>(
     debug_assert!(region_old_start <= edit_lo);
 
     let region_new_start = region_old_start;
-    let mut region_new_end = (region_old_end as isize + delta) as usize;
+    // Band-clamp (H7): shift_offset guards the lower bound at 0; .min(len) is the
+    // load-bearing slice-safety clamp; .max(region_new_start) keeps start<=end so the
+    // slice below can never invert. Dead code under the proven invariant (§4.2 site 3).
+    let mut region_new_end =
+        shift_offset(region_old_end, delta).min(new_src.len()).max(region_new_start);
 
     // Materialize only the edited region from new_src (O(region), not O(doc)).
     let mut new_region = new_src.slice(region_new_start..region_new_end);
@@ -955,7 +961,8 @@ pub fn incremental_update_instrumented_src_owned<S: TextSource>(
             if widen_span <= MAX_SYNC_WIDEN_BYTES || base_new_size > MAX_SYNC_WIDEN_BYTES {
                 // cheap extension, or Case B (base already > cap) → extend to EOF, as today
                 region_old_end = old_src.len();
-                region_new_end = (region_old_end as isize + delta) as usize;
+                region_new_end =
+                    shift_offset(region_old_end, delta).min(new_src.len()).max(region_new_start);
                 new_region = new_src.slice(region_new_start..region_new_end);
                 reparsed = parse_region(&new_region.as_ref(), 0..new_region.len(), region_new_start);
                 reason = WidenReason::WidenToEnd;
@@ -1074,7 +1081,7 @@ fn needs_widen_to_end<S: TextSource>(
     let oe = region_old_end.min(old_src.len());
     let old_region = old_src.slice(os.min(oe)..oe);
     let new_start = region_old_start.min(new_src.len());
-    let new_region_end = ((region_old_end as isize + edit.delta()) as usize).min(new_src.len());
+    let new_region_end = shift_offset(region_old_end, edit.delta()).min(new_src.len());
     let new_region = new_src.slice(new_start.min(new_region_end)..new_region_end);
 
     // (a) Link reference definitions are resolved document-wide.
@@ -1116,7 +1123,7 @@ fn html_in_play<S: TextSource>(
     let oe = region_old_end.min(old_src.len());
     let old_region = old_src.slice(os.min(oe)..oe);
     let new_start = region_old_start.min(new_src.len());
-    let new_region_end = ((region_old_end as isize + edit.delta()) as usize).min(new_src.len());
+    let new_region_end = shift_offset(region_old_end, edit.delta()).min(new_src.len());
     let new_region = new_src.slice(new_start.min(new_region_end)..new_region_end);
     html_opener_count(old_region.as_ref()) > 0 || html_opener_count(new_region.as_ref()) > 0
 }
@@ -1139,7 +1146,7 @@ fn region_has_bare_cr<S: TextSource>(
     let oe = region_old_end.min(old_src.len());
     let old_region = old_src.slice(os.min(oe)..oe);
     let new_start = region_old_start.min(new_src.len());
-    let new_region_end = ((region_old_end as isize + edit.delta()) as usize).min(new_src.len());
+    let new_region_end = shift_offset(region_old_end, edit.delta()).min(new_src.len());
     let new_region = new_src.slice(new_start.min(new_region_end)..new_region_end);
     has_bare_cr(old_region.as_ref()) || has_bare_cr(new_region.as_ref())
 }
@@ -1286,8 +1293,26 @@ fn shift_in_place(b: &mut Block, delta: isize) {
     }
 }
 
+/// Shift an old-text byte offset by an edit `delta` into new-text coordinates.
+/// The incremental region invariants make the sum non-negative for every call site
+/// (spec §4.1: each shifted position `pos >= edit_hi`, so `pos + delta >= edit_lo +
+/// new_len >= 0` by lemma L1). The `debug_assert!` is the dev/fuzz guard — the F2
+/// oracle patrols the same regions — and the release fall-through clamps at 0: a
+/// self-healing over-wide reparse beats a wrap to a garbage huge usize (the rope is
+/// never mutated on this path; a bad region only mis-colours for ~150 ms).
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)] // same doc-cap bound; .max(0) makes the isize->usize cast non-negative
+fn shift_offset(pos: usize, delta: isize) -> usize {
+    let shifted = pos as isize + delta;
+    debug_assert!(
+        shifted >= 0,
+        "shift_offset underflow: pos {} + delta {} < 0 — incremental region invariant broken",
+        pos, delta
+    );
+    shifted.max(0) as usize
+}
+
 fn shift_range(r: &Range<usize>, delta: isize) -> Range<usize> {
-    ((r.start as isize + delta) as usize)..((r.end as isize + delta) as usize)
+    shift_offset(r.start, delta)..shift_offset(r.end, delta)
 }
 
 // ---------------------------------------------------------------------------
@@ -2021,7 +2046,7 @@ mod tests {
         assert_eq!(t.root.children[new_after_idx].children.as_ptr(), after_ptr,
             "after-block was cloned instead of shifted in place");
         assert_eq!(t.root.children[new_after_idx].span,
-            (after_span0.start + delta as usize)..(after_span0.end + delta as usize),
+            shift_offset(after_span0.start, delta)..shift_offset(after_span0.end, delta),
             "after-block span not shifted by delta");
     }
 
@@ -2047,5 +2072,55 @@ mod tests {
                 cur = next;
             }
         }
+    }
+
+    #[test]
+    fn shift_offset_at_zero_boundary_clamps_not_wraps() {
+        // The exact lower boundary pos+delta==0 must yield 0 (not wrap to a huge usize);
+        // positive sums are exact. Underflow (pos+delta<0) is deliberately NOT tested here —
+        // the debug_assert fires under `cargo test`, which is the dev guard working.
+        assert_eq!(shift_offset(5, -5), 0);
+        assert_eq!(shift_offset(0, 0), 0);
+        assert_eq!(shift_offset(10, 3), 13);
+        assert_eq!(shift_offset(10, -4), 6);
+    }
+
+    #[test]
+    fn h7_delete_all_region_stays_in_bounds() {
+        // Most-negative delta: 0..len -> "". region_new_end must clamp to 0, not wrap.
+        let doc = "# H\n\npara\n\n- a\n- b\n";
+        let (new_text, edit) = apply_edit(doc, 0..doc.len(), "");
+        assert_eq!(new_text, "");
+        let outcome = incremental_update_instrumented(&full_parse(doc), doc, &edit, &new_text);
+        assert_valid_tree(&outcome.tree, new_text.len());
+        assert_eq!(outcome.tree, full_parse(&new_text));
+    }
+
+    #[test]
+    fn h7_insert_into_empty_is_in_bounds() {
+        let doc = "";
+        let (new_text, edit) = apply_edit(doc, 0..0, "# H\n\npara\n");
+        let outcome = incremental_update_instrumented(&full_parse(doc), doc, &edit, &new_text);
+        assert_valid_tree(&outcome.tree, new_text.len());
+        assert_eq!(outcome.tree, full_parse(&new_text));
+    }
+
+    #[test]
+    fn h7_replace_at_eof_is_in_bounds() {
+        let doc = "para one\n\npara two\n";
+        let start = "para one\n\n".len();
+        let (new_text, edit) = apply_edit(doc, start..doc.len(), "changed tail\n");
+        let outcome = incremental_update_instrumented(&full_parse(doc), doc, &edit, &new_text);
+        assert_valid_tree(&outcome.tree, new_text.len());
+        assert_eq!(outcome.tree, full_parse(&new_text));
+    }
+
+    #[test]
+    fn h7_whole_doc_replace_is_in_bounds() {
+        let doc = "old\n";
+        let (new_text, edit) = apply_edit(doc, 0..doc.len(), "brand new doc\n\nsecond\n");
+        let outcome = incremental_update_instrumented(&full_parse(doc), doc, &edit, &new_text);
+        assert_valid_tree(&outcome.tree, new_text.len());
+        assert_eq!(outcome.tree, full_parse(&new_text));
     }
 }

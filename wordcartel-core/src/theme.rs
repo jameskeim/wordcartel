@@ -80,6 +80,7 @@ fn rgb_to_named16(r: u8, g: u8, b: u8) -> Color {
     NAMED.iter().min_by_key(|(_, rgb)| dist2((r,g,b), *rgb)).unwrap().0
 }
 
+#[allow(clippy::cast_possible_truncation)] // channel average of three u8s / 3 is 0..=255, fits u8
 fn rgb_to_xterm256(r: u8, g: u8, b: u8) -> u8 {
     // gray ramp 232..=255 when r==g==b-ish and not a cube gray; else the 6x6x6 cube (16..=231).
     let to6 = |v: u8| -> u8 { // 0,95,135,175,215,255 buckets
@@ -111,6 +112,7 @@ fn xterm256_to_rgb(i: u8) -> (u8, u8, u8) {
     }
 }
 
+#[allow(clippy::cast_sign_loss)] // v*v is a non-negative square
 fn dist2(a: (u8, u8, u8), b: (u8, u8, u8)) -> u32 {
     let d = |x: u8, y: u8| { let v = x as i32 - y as i32; (v * v) as u32 };
     d(a.0, b.0) + d(a.1, b.1) + d(a.2, b.2)
@@ -405,6 +407,7 @@ const ZEN_ACCENT_EXTRA: f32 = 0.40; // zen: extra blend of the accent fg toward 
 /// Per-channel linear interpolation toward `pole` at fraction `pct`.
 /// `blend(base, pole, 0.0) == base`; `blend(base, pole, 1.0) == pole (rgb)`.
 /// Non-Rgb `base` passes through unchanged.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // .clamp(0.0, 255.0) bounds the f32 before the u8 cast
 fn blend(base: Color, pole: (u8, u8, u8), pct: f32) -> Color {
     let Color::Rgb { r, g, b } = base else { return base };
     let ch = |c: u8, p: u8| -> u8 {
@@ -950,6 +953,7 @@ fn rgb_to_hsl(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
     (h, s, l)
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // hue_to_rgb outputs are in [0,1]; *255 rounds into 0..=255, fits u8
 fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
     if s.abs() < f32::EPSILON {
         let v = (l * 255.0).round() as u8;
