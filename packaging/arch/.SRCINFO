@@ -1,6 +1,6 @@
 pkgbase = wordcartel
 	pkgdesc = Markdown-first terminal word processor (wcartel) — optimized release-dist build
-	pkgver = 0.0.0.r1058.g0a34a15
+	pkgver = 0.2.0
 	pkgrel = 1
 	url = https://github.com/jameskeim/wordcartel
 	arch = x86_64
