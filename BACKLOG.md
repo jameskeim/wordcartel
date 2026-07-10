@@ -3,7 +3,7 @@
 
 # Backlog
 
-**28 open · 33 shipped · 1 dropped**
+**27 open · 34 shipped · 1 dropped**
 
 Blocking Effort P: **0**
 
@@ -20,7 +20,6 @@ Blocking Effort P: **0**
 | M9 | Optional: upgrade/patch pulldown-cmark | watch | chore | S |  | M4-rest only ISOLATES its parse panic; a real upgrade is optional, low priority. |
 | B6 | Heading-glyph STYLE toggle | needs-design | feature | SM |  | Cycle shades / Nerd numerals / inverted numerals; default stays universal Shades. |
 | H17 | Pre-P public-API doc-coverage sweep | ready | debt | SM |  | Doc-comment public items (~180 in core alone) + enable #![warn(missing_docs)] as a gate; Effort P exposes this surface to plugins. |
-| H7 | Panic-safety & arithmetic-soundness audit | ready | debt | SM |  | Audit runtime panic sites (unwrap/expect/panic!/unreachable!) -> guarded .expect(msg) or typed status-line error; sweep ~147 numeric casts on BytePos/offset arithmetic for overflow/truncation. |
 | S3 | Snapshots — durable revision checkpoints | needs-design | feature | SM |  | Capture/list/diff/restore; reuses rope snapshot + ChangeSet; one net-new display diff. |
 | S1 | Rearrangeable outline / heading-subtree corkboard | needs-design | feature | M |  | Structure mode: atomic heading-subtree move via submit_transaction; drag-reorder. |
 | S2 | Directory-as-binder | needs-design | feature | L |  | Directory of .md as a manuscript: ordered manifest + compile step (post-Effort-P plugin). |
@@ -42,13 +41,14 @@ Blocking Effort P: **0**
 
 ## Shipped
 
-<details><summary>33 shipped</summary>
+<details><summary>34 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
 | E6 | Splash / start screen | 2026-07-10 | 242c987 |
 | H11 | Decompose commands::run god-function | 2026-07-10 | 2437fca |
 | H14 | Split the render() body by paint surface | 2026-07-10 | 2437fca |
+| H7 | Panic-safety & arithmetic-soundness audit | 2026-07-10 | a49743e |
 | H9 | Lift logical-line helpers out of derive | 2026-07-10 | 2437fca |
 | H1 | God-object SEAM decomposition (app.rs/render.rs) | 2026-07-09 | 304e263 |
 | H6 | Point-release version scheme + release process | 2026-07-09 | 50b449a |

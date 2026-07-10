@@ -89,33 +89,6 @@ weigh: (a) auto-prune on launch (delete swaps whose owning pid is dead AND whose
 the swap durability model (memory: `wordcartel-swap-idle-thrash`). Anchors: `wordcartel/src/swap.rs`
 (`state_dir`, `swap_path`, `find_orphan_scratch_swap`), `recovery.rs`.
 
-## H7 — Panic-safety & arithmetic-soundness audit
-<!-- item: H7 -->
-
-**Scope broadened 2026-07-10** from ".unwrap() only" to all runtime panic sites — `.unwrap()`
-(772 raw, ~35 real-runtime), `.expect()` (161 — ensure each carries an invariant message), `panic!`
-(44 raw), `unreachable!` (4) — **plus an arithmetic-soundness sweep** of the ~147 numeric casts
-(`as usize`/`u32`…) on `BytePos`/offset math for overflow/truncation (a Codex-flagged class). Same
-shape/sequencing as the original unwrap audit; the `.unwrap()` classification below is its core.
-
-**Sequencing (`depends_on = [H11, H14]`, 2026-07-10):** do this AFTER the `commands::run` (H11) and
-`render()` (H14) decompositions — those rewrite exactly the edit-/paint-path bodies where the ~35
-unwraps concentrate, so auditing first means re-auditing after the churn. Land it BEFORE Effort P
-(panic-safety hardening ahead of the untrusted plugin surface). Otherwise low-risk/mechanical — a good
-palate-cleanser between the heavier decomposition efforts.
-
-**Question (user):** audit and consider `.unwrap()` usage.
-
-**Grounded (may drift):** the policy already exists — "no `.unwrap()` on fallible/external paths; a guarded
-unwrap immediately after establishing the invariant is acceptable, but prefer `.expect(\"…invariant…\")`"
-(CLAUDE.md Rust conventions) — and the 2026-07-07 eval measured ~35 real-runtime `.unwrap()`s across ~18k
-production LOC (the raw grep of ~740 is ~96% co-located tests + the e2e harness; see this doc's Snapshot).
-This item = a deliberate sweep of those ~35: classify each as guarded-invariant (→ convert to `.expect` with
-a message) vs genuinely-fallible (→ typed error to the status line), and confirm none sit on an
-untrusted/IO/async path that M2/M3/M4 didn't already cover. Low-risk, mechanical, high-confidence — a good
-fold into a future hardening pass. Anchors: CLAUDE.md (unwrap policy), this doc's Snapshot (the ~35 count),
-the M2/M3/M4 boundaries.
-
 ## H10 — `reduce`'s 10-stage interception chain is verbatim boilerplate
 <!-- item: H10 -->
 

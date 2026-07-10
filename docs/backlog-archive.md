@@ -787,6 +787,44 @@ empty-canvas / no-buffer startup render path (`render.rs`), the app name/tagline
 
 ## Theme H — code health / engineering health
 
+### H7 — Panic-safety & arithmetic-soundness audit
+<!-- item: H7 -->
+
+**SHIPPED 2026-07-10** (merge `a49743e`, branch effort-h7-panic-arithmetic-audit, 4-task subagent-driven
+execution). Governed by the **blast-radius stance** (memory: [[wordcartel-h7-blast-radius-stance]]) — guard
+strength matches what breaking an invariant costs the *user*, not a uniform fail-loud. Outcome vs. the
+original ".unwrap() audit" framing: the panic surface was already ~90% disciplined (57/59 production
+`.unwrap()`s guarded-by-construction, all 13 `.expect()`s informative, the 1 production `panic!` a
+triple-gated `WCARTEL_SMOKE_PANIC` hook compiled out of release, **0 genuinely-fallible** unwraps), so the
+real content was the **arithmetic-soundness sweep**. What landed:
+
+- `shift_offset(pos, delta)` in `block_tree.rs` — clamps the 8 incremental-region offset sites
+  (`debug_assert!` loud in dev/fuzz + safe release clamp-at-0) instead of wrapping a negative sum to a
+  garbage `usize`. All 8 sites PROVEN non-negative under the enclosure invariant `region_old_end >= edit_hi`
+  (lemma L1, traced through every mutation of the region bounds), so the release clamps are dead code unless
+  the cross-crate `(ChangeSet, Edit)` contract breaks. Mutation-path release `assert!`s
+  (`buffer.rs`/`change.rs`) left byte-untouched — a corrupt document position there stays loud, forever.
+- **Core cast-soundness gate:** `wordcartel-core` denies `clippy::cast_possible_truncation`/`cast_sign_loss`/
+  `cast_possible_wrap` (crate attribute in `lib.rs` beside `forbid(unsafe_code)`) with 7 minimal
+  reason-carrying item-local `#[allow]`s — locks the class against regrowth. Shell deliberately not gated
+  (~70 benign terminal-coordinate widenings).
+- `build_multi_replace` degrades any malformed edit list (empty / reversed / overlapping / out-of-bounds)
+  to an **identity no-op** before reaching `ChangeSet::from_ops`' release assert — hardens the boundary
+  ahead of Effort P's untrusted plugin callers. Subsumes the 2 previously-flagged `.unwrap()`s.
+- `place_cursor`/`screen_pos` clamp cursor-column narrowing (guard-before-narrow / saturating) instead of
+  truncating a >65535-column position into view — cosmetic blast radius → silent clamp, no assert.
+
+Non-goals honored: no `BytePos` newtype; no bulk `.unwrap()`→`.expect()` conversion of the guarded sites
+(the full 59-unwrap / 13-expect / 1-panic classification appendix is recorded in the spec). Process: Fable
+authored spec+plan (Codex-gated each round — spec READY r2, plan GO r2; see
+[[wordcartel-fable-authors-codex-gates]]); 4/4 per-task reviews clean; both final gates GO (Fable
+whole-branch review with a compiled 20-combination probe of the T3 no-op `Edit` through the T1-hardened
+parse path; Codex pre-merge, zero findings). Core lib+F2 oracle + shell (969) tests green, workspace clippy
+clean, smoke 8/8 PASS. Deferred informational Minor: the `block_tree` band-clamp comment's "cannot invert"
+nuance (partial insurance under a broken I0 where the document shrinks below the region start — no worse
+than pre-H7, degrades via `panicx::catch`) — a half-line comment amendment whenever the file is next
+touched. See `docs/superpowers/{specs,plans}/2026-07-10-h7-panic-arithmetic-audit*.md`.
+
 ### H1 — God-object SEAM decomposition (app.rs/render.rs)
 <!-- item: H1 -->
 

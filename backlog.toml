@@ -624,14 +624,16 @@ shipped_date = "2026-07-09"
 [[item]]
 id = "H7"
 title = "Panic-safety & arithmetic-soundness audit"
-status = "ready"
+status = "shipped"
 kind = "debt"
 size = "SM"
 theme = "H"
 hook = "Audit runtime panic sites (unwrap/expect/panic!/unreachable!) -> guarded .expect(msg) or typed status-line error; sweep ~147 numeric casts on BytePos/offset arithmetic for overflow/truncation."
-doc = "engineering-health.md#h7"
+doc = "backlog-archive.md#h7"
 depends_on = ["H11", "H14"]
 created = "2026-07-09"
+shipped_commit = "a49743e"
+shipped_date = "2026-07-10"
 
 [[item]]
 id = "H8"
