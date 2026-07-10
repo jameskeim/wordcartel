@@ -86,7 +86,7 @@ Tests are co-located `#[cfg(test)] mod tests` (`use super::*`) in each touched m
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p wordcartel view_splash_defaults_on_and_folds_from_a_layer parse_cli_no_splash_flag`
+Run: `cargo test -p wordcartel -- view_splash_defaults_on_and_folds_from_a_layer parse_cli_no_splash_flag`
 Expected: COMPILE ERROR — `no field 'splash' on type 'ViewConfig'` / `no field 'no_splash' on type 'Cli'` (a compile failure is the correct red state for a new-field TDD step).
 
 - [ ] **Step 3: Implement.** Five edits in `wordcartel/src/config.rs`:
@@ -148,7 +148,7 @@ Then update the usage doc-comment in `wordcartel/src/main.rs:4` (both the module
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p wordcartel view_splash_defaults_on_and_folds_from_a_layer parse_cli_no_splash_flag`
+Run: `cargo test -p wordcartel -- view_splash_defaults_on_and_folds_from_a_layer parse_cli_no_splash_flag`
 Expected: PASS (2 tests). Then `cargo test -p wordcartel config::` — all config tests PASS (no regressions).
 
 - [ ] **Step 5: Commit**
@@ -618,7 +618,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p wordcartel splash::tests::paint splash::tests::dismissed`
+Run: `cargo test -p wordcartel -- splash::tests::paint splash::tests::dismissed`
 Expected: FAIL — compiles (nothing new referenced yet except behavior), but `paint_full_content_at_80x24` asserts fail: no wordmark painted (`render` has no splash branch yet). If the harness helpers compile-error first, that is the same red state.
 
 - [ ] **Step 3: Implement.** In `wordcartel/src/splash.rs`, extend imports:
@@ -704,7 +704,7 @@ Then the delegating branch in `wordcartel/src/render_overlays.rs` — at the top
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p wordcartel splash::tests::paint splash::tests::dismissed`
+Run: `cargo test -p wordcartel -- splash::tests::paint splash::tests::dismissed`
 Expected: PASS (4 tests). Then `cargo test -p wordcartel` — full crate green.
 
 - [ ] **Step 5: Commit**
@@ -844,7 +844,7 @@ fn e2e_recovery_prompt_pending_suppresses_splash() {
 
 - [ ] **Step 7: Run the journeys**
 
-Run: `cargo test -p wordcartel e2e_splash e2e_no_splash e2e_recovery_prompt_pending`
+Run: `cargo test -p wordcartel -- e2e_splash e2e_no_splash e2e_recovery_prompt_pending`
 Expected: PASS (4 tests — the production paths landed in Tasks 3-4 and Step 5; these journeys pin the composed behavior. If any fails, the production code — not the test — is wrong; debug before proceeding).
 Then: `cargo test -p wordcartel` — full crate green.
 
@@ -935,7 +935,7 @@ Expected: FAIL — `meta("splash_on")` panics with `splash_on` (`resolve_name` �
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p wordcartel splash_commands`
-Expected: PASS (2 tests). Then `cargo test -p wordcartel registry menu palette` — the registration-order, menu-window, and palette tests all stay green (the palette is exhaustive by construction; `toggle_splash` joins the View menu automatically).
+Expected: PASS (2 tests). Then `cargo test -p wordcartel -- registry menu palette` — the registration-order, menu-window, and palette tests all stay green (the palette is exhaustive by construction; `toggle_splash` joins the View menu automatically).
 
 - [ ] **Step 5: Commit**
 
