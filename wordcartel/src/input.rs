@@ -1,4 +1,6 @@
-// wordcartel/src/input.rs — CUA keymap: KeyEvent → Option<Command>.
+// wordcartel/src/input.rs — normal-mode key handling: `handle_key` (keymap chord
+// resolve → registry command dispatch → printable fallthrough), plus the CUA keymap
+// translation table (KeyEvent → Option<Command>).
 //
 // Only handles KeyEventKind::Press (ignores Release/Repeat) to avoid
 // double-input on terminals that emit both.
