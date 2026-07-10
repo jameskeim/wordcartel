@@ -129,6 +129,11 @@ fn replace_changeset(
 /// Build ONE `ChangeSet` performing all `edits` (ascending, non-overlapping
 /// `(from,to,replacement)`) plus ONE covering `block_tree::Edit` spanning
 /// `first.start..last.end`. Applied as a single `editor.apply` → one undo unit.
+///
+/// `edits` must be non-empty, ascending, non-overlapping, and in-bounds for
+/// `doc_len`. Any malformed or empty list degrades to an identity no-op —
+/// this returns a no-op `ChangeSet` (a full-document retain) and a
+/// zero-length `Edit` that changes nothing, rather than panicking.
 pub fn build_multi_replace(
     edits: &[(usize, usize, String)],
     doc_len: usize,
