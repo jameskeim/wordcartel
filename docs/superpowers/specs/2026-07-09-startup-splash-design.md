@@ -34,8 +34,9 @@ The splash is a **full-frame overlay** painted over the first frame. It is shown
 - `--no-splash` was NOT passed, AND
 - no startup recovery prompt was opened (`editor.prompt.is_none()` after the recovery-on-open block in `run()`).
 
-`run()` sets `editor.splash = Some(Splash::new())` after the recovery-on-open block and before the first
-`first_frame_settle` + draw (`app.rs` ~ lines 555–699).
+`run()` sets `editor.splash = Some(Splash::new(&keymap, env!("CARGO_PKG_VERSION")))` (see §3 for construction)
+after the recovery-on-open block and the `std::mem::take` of the keymap, and before the first
+`first_frame_settle` + draw (`app.rs` ~ lines 613–699).
 
 **Dismiss.** While `splash.is_some()`, the first `Msg::Input(Event::Key(press))` or `Msg::Input(Event::Mouse(down))`
 clears it and is consumed. **Everything else passes through** — `Msg::Tick`, background job results
@@ -108,17 +109,23 @@ as the welcome. Dismissing reveals the file (if any) or the blank scratch.
 - **Commands (set-per-state, Codex-Important fix):** the contract treats a settable option as needing **deterministic
   set-per-state primitives + a convenience toggle + a stateful menu representative** (the `status_line_on` /
   `status_line_auto` / `toggle_status_line` pattern, `registry.rs:489` — NOT the bare `toggle_word_count`, which has
-  no setter and is the weaker pattern). So register: **`splash_on`**, **`splash_off`** (deterministic), and
-  **`toggle_splash`** (convenience), all `MenuCategory::View`; the toggle is **stateful** →
-  `MenuMark::OnOff(view_opts.splash)` and is the menu representative. All three call **one shared setter**
-  `Editor::set_splash(bool)` (the option's single write path; profiles call it too — the startup `view_opts.clone()`
-  seed is the established seed path and is left as-is). Status notes it affects the **next** launch, e.g.
-  `splash: on (takes effect next launch)`.
+  no setter and is the weaker pattern). So register: **`splash_on`** and **`splash_off`** as **palette-only**
+  (`menu: None`, deterministic — matching `status_line_on`/`status_line_auto` at `registry.rs:489`–`490`/`492`), and
+  **`toggle_splash`** as the **stateful View-menu representative** (`MenuCategory::View`,
+  `MenuMark::OnOff(view_opts.splash)`). The contract requires exactly this shape — set-per-state primitives are
+  `menu: None`, one stateful representative carries the menu (`command-surface-contract.md:56`). All three call **one
+  shared setter** `Editor::set_splash(bool)` (mirrors `set_scrollbar_mode`/`set_status_line_mode`, `editor.rs:838`/
+  `847`; commands call the setter as at `registry.rs:490`). The startup `view_opts.clone()` seed (`app.rs:484`) is the
+  established seed path, left as-is. Status notes it affects the **next** launch, e.g. `splash: on (takes effect next launch)`.
 - **Settings persistence (Codex-Important fix — config parse alone does NOT persist it):** `Save Settings` writes an
   overrides file via the `settings.rs` snapshot/override machinery, so `view.splash` must be threaded through **all**
-  of: `OView` (`settings.rs:110`), `snapshot_of` (`settings.rs:159`), `runtime_snapshot` (`settings.rs:181`),
-  `compute_overrides` (`settings.rs:365`), and a command-test line for the new persisted field per the
-  `SettingsSnapshot` contract note (`settings.rs:33`). Missing any of these = the setting silently won't persist.
+  of these sites: the `SettingsSnapshot` field itself (`settings.rs:37`) + its per-persisted-field command-test line
+  (`settings.rs:33`); `OView` field (`settings.rs:110`); `snapshot_of` (`settings.rs:159`); `runtime_snapshot`
+  (`settings.rs:181`); the `compute_overrides` view diff (`settings.rs:365`) **and** the final `OView` construction /
+  `any_view` inclusion (`settings.rs:410`/`413`); and the command guard (`settings.rs:990`). `parse_overrides`
+  /`parse_mask` need **no** bespoke field — they deserialize `OView`/`OverridesFile` directly (`settings.rs:207`
+  /`226`), so adding the `OView` field covers them. Missing the `SettingsSnapshot` field or the final `OView`
+  construction = persistence silently drops.
 
 ### 4. Command-surface contract conformance (App law — stated per the contract)
 
@@ -161,6 +168,16 @@ The splash overlay itself is dismiss-only (not a settable option), so no command
   No first-run-only logic (shows every launch until disabled).
 
 ## Codex spec-review log
+
+- **Round 2 (2026-07-09): NOT-READY → folded.** No Critical (round-1 Critical/setter/minors all confirmed
+  RESOLVED). **[Important]** set-per-state commands must be **palette-only** (`menu: None`); only `toggle_splash`
+  carries the View menu (per `status_line_*` + contract:56) — was "all three View" → corrected. **[Important]**
+  settings-migration list was incomplete — added the `SettingsSnapshot` field (`settings.rs:37`), the final `OView`
+  construction / `any_view` (`settings.rs:410/413`), and the command guard (`settings.rs:990`); noted
+  `parse_overrides`/`parse_mask` need nothing extra (deserialize `OView` directly). **[Minor]** §1 said `Splash::new()`
+  while §3 said `Splash::new(&keymap, version)` → §1 corrected. Confirmed RESOLVED: hint construction ordering
+  (loop-local keymap in scope post-`mem::take`), `Editor::set_splash` matches `set_scrollbar_mode`/`set_status_line_mode`,
+  config `RawView`+fold edit points.
 
 - **Round 1 (2026-07-09): NOT-READY → folded.** Codex cross-checked against source and found: **[Critical]** hints
   can't be keymap-resolved at `render_overlays::paint` (no keymap in signature; `run()` `mem::take`s the keymap
