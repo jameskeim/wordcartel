@@ -180,7 +180,19 @@ weigh: (a) auto-prune on launch (delete swaps whose owning pid is dead AND whose
 the swap durability model (memory: `wordcartel-swap-idle-thrash`). Anchors: `wordcartel/src/swap.rs`
 (`state_dir`, `swap_path`, `find_orphan_scratch_swap`), `recovery.rs`.
 
-## H6 — Decide a point-release version scheme + release process · `needs-design` (user-reported 2026-07-09)
+## H6 — Decide a point-release version scheme + release process · **SHIPPED** 2026-07-09 (merge 50b449a, tag v0.1.0)
+
+**SHIPPED 2026-07-09** (branch release-v0.1.0-versioning, merge `50b449a`; design doc
+`docs/superpowers/specs/2026-07-09-point-release-versioning-design.md`). Resolved all four forks below:
+(a) **scheme** = SemVer pre-1.0 `0.MINOR.PATCH`, `1.0.0` reserved for the Effort-P capstone (MINOR = features,
+PATCH = fixes-only); (b) **source of truth** = Cargo `[workspace.package] version` (both crates inherit via
+`version.workspace = true`), a git tag `vX.Y.Z` mirrors it; (c) **PKGBUILD** `pkgver()` is now tag-anchored
+(`git describe --tags | sed …` → `0.1.0` at the tag, `0.1.0.rN.gHASH` between); (d) **ritual** = a hand-curated
+`CHANGELOG.md` (Keep a Changelog) + a 5-step release checklist in the design doc. Also closed the "app can't
+report its version" gap: new `wcartel --version` / `-V` reads `env!("CARGO_PKG_VERSION")`. First release **v0.1.0**
+cut against the current tree (annotated tag on `50b449a`) and the `release-dist` Arch package built
+(`wordcartel-0.1.0-1-x86_64.pkg.tar.zst`). Gates green (build/clippy/`cargo test --workspace` all suites);
+`--version` verified. Advances **H4** (packaging). *(Original triage below retained for history.)*
 
 **Question (user):** decide on a point-release and versioning SYSTEM for the app.
 
