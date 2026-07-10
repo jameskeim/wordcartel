@@ -21,6 +21,7 @@ pub mod jobs_apply;
 pub mod save;
 pub mod app;   // App::run + the testable App::step (Task 12)
 pub mod swap;
+pub mod timers;
 pub mod recovery;
 pub mod filter;
 pub mod minibuffer;

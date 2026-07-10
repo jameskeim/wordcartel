@@ -334,34 +334,7 @@ pub fn reduce(
         Msg::DiagnosticsDone { buffer_id, version, diagnostics } => {
             crate::diagnostics_run::apply_diagnostics_done(editor, buffer_id, version, diagnostics);
         }
-        Msg::Tick => {
-            let now = clock.now_ms();
-            if crate::swap::pending(
-                editor.active().document.dirty(), editor.active().document.version, editor.active().swapped_version,
-            )
-                && !editor.active().swap_in_flight
-                && crate::swap::due(now, editor.active().last_edit_at, editor.active().last_swap_at)
-            {
-                editor.active_mut().swap_in_flight = true;
-                let mut ctx = Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
-                crate::swap::dispatch_swap_write(&mut ctx);
-            }
-            // Dispatch diagnostics if due.
-            let version = editor.active().document.version;
-            if editor.diag_cfg.enabled
-                && crate::diagnostics_run::diag_due(&editor.active().diagnostics, now, version)
-            {
-                let ignore_words = std::sync::Arc::new(
-                    editor.dictionary.iter().chain(editor.session_ignores.iter()).cloned().collect::<std::collections::HashSet<String>>()
-                );
-                let diag_cfg = editor.diag_cfg.clone();
-                crate::diagnostics_run::dispatch_diagnostics(editor, &diag_cfg, ignore_words, msg_tx.clone());
-            }
-            // Dispatch a block-tree reconcile if due.
-            if crate::reconcile::reconcile_due(&editor.active().reconcile, now) {
-                crate::reconcile::dispatch_reconcile(editor, ex);
-            }
-        }
+        Msg::Tick => crate::timers::on_tick(editor, ex, clock, msg_tx),
         Msg::ClipboardPaste { buffer_id, text, .. } => crate::jobs_apply::apply_clipboard_paste(editor, buffer_id, text, clock),
         Msg::ClipboardAvailability(ok) => crate::jobs_apply::apply_clipboard_availability(editor, ok),
         // Intercepted in the run loop before `reduce` (see run()); unreachable here.
@@ -767,60 +740,11 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     let mut exit_reason = ExitReason::Normal;
     loop {
         let now = clock.now_ms();
-        save_timeout_tick(&mut editor, now);
-        // Only arm the swap wake-up when a swap is actually pending (unsaved content not yet on
-        // disk) and none is in flight. Arming it off last_edit_at alone left a permanently past-due
-        // deadline, so an idle buffer kept waking the loop to rewrite its swap file — continuous
-        // disk I/O, not a CPU spin (see swap::pending).
-        let swap_deadline = if crate::swap::pending(
-            editor.active().document.dirty(), editor.active().document.version, editor.active().swapped_version,
-        ) && !editor.active().swap_in_flight {
-            crate::swap::next_deadline_ms(now, editor.active().last_edit_at, editor.active().last_swap_at)
-        } else {
-            None
-        };
-        let sq_deadline = editor.pending_after_save.as_ref().map(|p| p.at_ms.saturating_add(SAVE_QUIT_TIMEOUT_MS));
-        // Include scrollbar_until_ms in the deadline so the loop wakes when the
-        // bar should fade (avoids relying on the idle 1-hour Tick).
-        let sb_deadline = if editor.mouse.scrollbar_until_ms > now {
-            Some(editor.mouse.scrollbar_until_ms)
-        } else {
-            None
-        };
-        // Menu-bar dwell/grace: at most one is Some by construction (the Moved arm
-        // clears the other side); recompute_menu_bar clears a fired due, so a past
-        // deadline cannot persist and spin the loop.
-        let menu_deadline = editor.mouse.menu_reveal_due.or(editor.mouse.menu_hide_due);
-        // Scrollbar/status-line dwell deadlines — armed by the right-edge Moved arm.
-        let sb_dwell_deadline = editor.mouse.scrollbar_reveal_due.or(editor.mouse.scrollbar_hide_due);
-        let status_dwell_deadline = editor.mouse.status_reveal_due.or(editor.mouse.status_hide_due);
-        // Fix A3: include the diagnostics deadline ONLY when no check is in
-        // flight.  When a check is in flight, recheck_due_at may be a past
-        // timestamp (armed before the check started), which would drive
-        // recv_timeout(0) → 100% CPU spin until the worker completes.
-        // When the result lands it clears in_flight_version; the next
-        // iteration will re-include the (re-armed) deadline and dispatch.
-        let diag_deadline = if editor.active().diagnostics.in_flight_version.is_none() {
-            editor.active().diagnostics.recheck_due_at
-        } else {
-            None
-        };
-        let reconcile_deadline = if editor.active().reconcile.in_flight_version.is_none() {
-            editor.active().reconcile.due_at
-        } else {
-            None
-        };
-        let deadline = crate::diagnostics_run::next_deadline(&[
-            swap_deadline,
-            sq_deadline,
-            sb_deadline,
-            menu_deadline,
-            sb_dwell_deadline,
-            status_dwell_deadline,
-            diag_deadline,
-            reconcile_deadline,
-        ]);
-        let timeout = deadline
+        crate::timers::pre_recv(&mut editor, now);
+        // Every wake source lives in the timers::SUBSYSTEMS table, each with its own anti-spin
+        // gate; next_wake folds their min. Idle ⇒ every gate yields None ⇒ the loop blocks on the
+        // 3600 s fallback (idle is free — §8.1-E). See timers.rs for the per-subsystem rationale.
+        let timeout = crate::timers::next_wake(&editor, now)
             .map(|d| std::time::Duration::from_millis(d.saturating_sub(now)))
             .unwrap_or(std::time::Duration::from_secs(3600));
         let msg = match msg_rx.recv_timeout(timeout) {
@@ -886,48 +810,6 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // is the "never lose work" behavior). The 5 s save&quit guard above bounds the wait.
     drop(guard);
     Ok(exit_reason)
-}
-
-// ---------------------------------------------------------------------------
-// Save-timeout seam (extracted from run() so it is testable — C4 Task 2)
-// ---------------------------------------------------------------------------
-
-/// Milliseconds before a pending save-then-act is considered overdue. Moved
-/// from run()-local to module scope so `save_timeout_tick` can reference it
-/// and tests can drive it without magic literals (C4 r2).
-pub(crate) const SAVE_QUIT_TIMEOUT_MS: u64 = 5_000;
-
-/// Save-timeout disposition (extracted from run()'s tick so it is testable — C4).
-/// Returns without effect while no pending save is overdue.
-pub(crate) fn save_timeout_tick(editor: &mut Editor, now: u64) {
-    if let Some(p) = &editor.pending_after_save {
-        let waited = now.saturating_sub(p.at_ms);
-        if waited > SAVE_QUIT_TIMEOUT_MS {
-            // Compiler-exhaustive on purpose (Codex plan r2): a future
-            // PostSaveAction variant must NOT compile silently past this helper.
-            let action = p.action.clone();
-            editor.pending_after_save = None;
-            match action {
-                crate::editor::PostSaveAction::Quit => {
-                    // Re-raise the quit-confirm modal so the user can choose again.
-                    editor.open_prompt(crate::prompt::Prompt::quit_confirm());
-                    editor.status = "Save still running — choose again".into();
-                }
-                crate::editor::PostSaveAction::ContinueQuitDrain => {
-                    // Codex C3: a stranded drain (no in-flight save, no re-drive) would
-                    // hang the quit. Abort the whole quit rather than silently clearing.
-                    editor.quit_drain = None;
-                    editor.quit_drain_advance = false;
-                    editor.status = "save timed out — quit cancelled".into();
-                }
-                crate::editor::PostSaveAction::CloseBuffer { .. } => {
-                    // C4: a close is not a session-ending action the user is
-                    // waiting on — cancel without re-prompting (spec D3).
-                    editor.status = "save timed out — close cancelled".into();
-                }
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3855,52 +3737,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // C4 Task 2: save_timeout_tick seam + quit-supersedes-close
+    // C4 Task 2: quit-supersedes-close (the save_timeout_tick seam moved to
+    // timers.rs in Effort H1 r2 — see timers::close_save_timeout_cancels_with_status).
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn close_save_timeout_cancels_with_status() {
-        // Drives the EXTRACTED helper directly (the timeout block lives in run(),
-        // unreachable via reduce). Arrange a CloseBuffer pending at t=0; call
-        // save_timeout_tick at SAVE_QUIT_TIMEOUT_MS+1 → pending cleared, status
-        // "save timed out — close cancelled", buffer open, NO prompt.
-        // Also pins the extraction is faithful: a Quit-variant pending re-raises
-        // quit_confirm through the same helper.
-        use crate::editor::{Editor, PostSaveAction, PendingAfterSave};
-        let p = std::env::temp_dir().join(format!("wc-c4t2-timeout-{}.md", std::process::id()));
-        std::fs::write(&p, "old\n").unwrap();
-        let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
-        e.active_mut().document.version = 1;
-        e.active_mut().document.saved_version = None; // dirty
-        let id = e.active().id;
-
-        // Arm pending for a CloseBuffer action at t=0.
-        e.pending_after_save = Some(PendingAfterSave {
-            buffer_id: id, version: 1,
-            action: PostSaveAction::CloseBuffer { id },
-            at_ms: 0,
-        });
-
-        // Call the extracted helper at a time past the timeout.
-        crate::app::save_timeout_tick(&mut e, crate::app::SAVE_QUIT_TIMEOUT_MS + 1);
-
-        assert!(e.pending_after_save.is_none(), "pending cleared on CloseBuffer timeout");
-        assert_eq!(e.status, "save timed out — close cancelled");
-        assert!(e.by_id(id).is_some(), "buffer NOT closed — timeout only cancels");
-        assert!(e.prompt.is_none(), "no re-prompt for a close timeout (spec D3)");
-
-        // Fidelity pin: Quit-variant pending re-raises quit_confirm through the same helper.
-        e.pending_after_save = Some(PendingAfterSave {
-            buffer_id: id, version: 1,
-            action: PostSaveAction::Quit,
-            at_ms: 0,
-        });
-        crate::app::save_timeout_tick(&mut e, crate::app::SAVE_QUIT_TIMEOUT_MS + 1);
-        assert!(e.pending_after_save.is_none(), "quit pending cleared");
-        assert!(e.prompt.is_some(), "Quit timeout re-raises quit_confirm prompt");
-
-        let _ = std::fs::remove_file(&p);
-    }
 
     #[test]
     fn quit_dispatch_cancels_pending_close() {
