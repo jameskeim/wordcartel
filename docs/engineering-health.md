@@ -1,10 +1,11 @@
-# Engineering-health notes — architecture, build, and debt
+# Engineering-health notes — architecture, build & debt (OPEN items)
 
-**Origin:** 2026-07-07 architecture eval (whole-app assessment, evidence-gathered from the real
-tree). This is durable triage of *engineering-health* concerns — module size, build/dependency
-surface, and known correctness posture — distinct from feature/UX work (`ux-backlog.md`) and the
-pre-Effort-P hardening list (`CLAUDE.md`). Each item graduates to the standard gated pipeline when
-picked up. Metrics below are as of `c48256f` and will drift.
+**How this file works (backlog manifest system, since 2026-07-10):** triage prose for **OPEN**
+engineering-health items — module size, build/dependency surface, correctness posture — each keyed to
+`backlog.toml` by a `<!-- item: ID -->` marker. **Status/size live ONLY in `backlog.toml`; read the
+generated `BACKLOG.md` for status.** Completed items' prose is in
+[`backlog-archive.md`](backlog-archive.md); feature/UX items in [`ux-backlog.md`](ux-backlog.md).
+Metrics cited below are point-in-time and will drift.
 
 ## Snapshot (the eval's evidence)
 
