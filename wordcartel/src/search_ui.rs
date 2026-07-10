@@ -235,8 +235,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                     KeyCode::Char('q') | KeyCode::Esc => { editor.search = None; }
                     _ => {}
                 }
-                for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-                return crate::app::Handled::Done(!editor.quit);
+                return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
             }
             match k.code {
                 KeyCode::Esc => { search_cancel(editor); return crate::app::Handled::Done(!editor.quit); }
@@ -246,8 +245,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 KeyCode::Enter if alt => {
                     if let Some(s) = editor.search.as_mut() { s.phase = crate::search_overlay::Phase::Stepping; }
                     search_sync(editor); // park on first match
-                    for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-                    return crate::app::Handled::Done(!editor.quit);
+                    return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
                 }
                 KeyCode::Enter if shift => { search_step(editor, false); }
                 KeyCode::F(3) if shift   => { search_step(editor, false); }
@@ -271,8 +269,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
             // Recompute against the live buffer and pin the current match.
             search_sync(editor);
         }
-        for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-        return crate::app::Handled::Done(!editor.quit); // return ONLY for key events (including non-Press)
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx)); // return ONLY for key events (including non-Press)
     }
     // Non-key messages (FilterDone/ExportDone/TransformDone/JobDone/Tick/…)
     // fall through to the normal handlers below.

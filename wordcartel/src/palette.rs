@@ -102,7 +102,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
     if matches!(&msg, Msg::ClipboardPaste { .. }) {
         // Drop an async clipboard-paste result that arrives while the palette is
         // open — it must not land in the document behind the overlay.
-        return crate::app::Handled::Done({ for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); } !editor.quit });
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
     }
     if let Msg::Input(Event::Paste(text)) = msg {
         let ah = editor.active().view.area.1;
@@ -112,7 +112,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
             crate::palette::rebuild_rows(p, reg, keymap);
             crate::app::keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
         }
-        return crate::app::Handled::Done({ for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); } !editor.quit });
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
     }
     if let Msg::Input(Event::Key(k)) = &msg {
         if k.kind == crossterm::event::KeyEventKind::Press {
@@ -224,7 +224,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 _ => {}
             }
         }
-        return crate::app::Handled::Done({ for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); } !editor.quit });
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
     }
     // Non-key msg falls through to normal handling while palette stays open.
     crate::app::Handled::Pass(msg)

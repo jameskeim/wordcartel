@@ -61,8 +61,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
         _ => {}
     }
     // Always drain ready results (merges the awaited save&quit result).
-    for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-    crate::app::Handled::Done(!editor.quit)
+    crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx))
 }
 
 /// Execute the action chosen in a modal prompt, then clear the prompt.

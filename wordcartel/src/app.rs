@@ -156,6 +156,15 @@ pub(crate) fn hydrate_overlays(editor: &mut Editor, reg: &crate::registry::Regis
     }
 }
 
+/// The shared stage micro-epilogue: drain ready executor results, fold them into the
+/// editor, and report keep-running. Factored from the 21 verbatim repetitions. NOT used
+/// where a stage returns without draining (the search Esc/Alt+a arms — §8 invariant C).
+pub(crate) fn fold_and_continue(editor: &mut crate::editor::Editor, ex: &dyn crate::jobs::Executor,
+    clock: &dyn wordcartel_core::history::Clock, msg_tx: &std::sync::mpsc::Sender<Msg>) -> bool {
+    for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
+    !editor.quit
+}
+
 /// Close the active overlay, dispatch `id` via the registry, drain executor results,
 /// then hydrate any overlay opened by the dispatched command.
 pub(crate) fn dispatch_overlay_command(

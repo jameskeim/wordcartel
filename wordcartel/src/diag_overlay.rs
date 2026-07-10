@@ -87,8 +87,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 _ => {} // bare Ctrl+key or anything else: no-op, consumed
             }
         }
-        for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }
-        return crate::app::Handled::Done(!editor.quit); // return ONLY for key events (including non-Press)
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx)); // return ONLY for key events (including non-Press)
     }
     // Non-key messages fall through to normal handlers below.
     crate::app::Handled::Pass(msg)
