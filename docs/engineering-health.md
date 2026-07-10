@@ -247,3 +247,21 @@ trivial helpers, coupling it to the parse/layout hub. Direction when picked up: 
 low-risk, and a natural seam to take **alongside the remaining H1 `render()`/module-size work** rather than as a
 standalone churn. Anchors: `wordcartel/src/derive.rs:91` (`total_logical_lines`), `:104` (`line_start`), `:116`
 (`line_text`), `:25` (`line_render_for`); heaviest consumer `nav.rs`.
+
+## H10 — `reduce`'s 10-stage interception chain is verbatim boilerplate · `watch` (2026-07-09)
+
+**Grounded (read of `app.rs:233–252`, 2026-07-09).** After the H1 SEAM refactor, `reduce` opens with a
+10-stage overlay/modal interception chain — `marks → menu → palette → theme_picker → file_browser → prompts →
+minibuffer → search_ui → diag_overlay → outline_overlay` — where every stage is the identical line
+`let msg = match crate::X::intercept(msg, …) { Handled::Done(k) => return k, Handled::Pass(m) => m };`, differing
+only in the module path and arg list. It is cohesive, blessed-style *flat dispatch* (the house rules explicitly
+allow a long flat dispatch), so this is **NOT** a defect today — filed only as a `watch` item. The reason it
+can't already be a clean fn-pointer table / `SUBSYSTEMS`-style row set: two stages (`menu`, `palette`) need
+`reg` + `keymap` in their `intercept` signature while the other eight take only `(msg, editor, ex, clock,
+msg_tx)`, so a uniform table would need a widened shared signature or a two-tier split. **Trigger to act:**
+Effort P adds plugin-contributed intercept stages here — the moment the chain grows past its current fixed set,
+collapse it (an `intercept_chain!` macro, or unify the stage signature so the chain becomes a slice of handler
+fns iterated in order). Until then the repetition is bounded and readable; touching it now is churn for its own
+sake. This is a **command-surface-contract / Effort-P-conformance** note, not module-size debt (`reduce` is
+within budget). Anchor: `wordcartel/src/app.rs:233–252` (the chain); `:123` (`Handled`); the `timers::SUBSYSTEMS`
+table is the model a unified version would follow.
