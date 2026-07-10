@@ -64,6 +64,13 @@ impl Splash {
     pub fn hints(&self) -> &[(String, &'static str)] { &self.hints }
 }
 
+/// The `run()` startup gate: show the splash iff it is enabled in config, not
+/// suppressed by `--no-splash`, and no prompt (the swap-recovery prompt is the only
+/// pre-first-draw one) is pending at launch — never bury "recover your work?".
+pub fn show_at_startup(cfg_splash: bool, no_splash: bool, prompt_pending: bool) -> bool {
+    cfg_splash && !no_splash && !prompt_pending
+}
+
 /// Splash dismissal stage — the FIRST stage in `reduce`'s intercept chain.
 ///
 /// Contract (spec §3): `splash.is_none()` → `Pass(msg)`; else the first key PRESS or
@@ -147,6 +154,15 @@ pub(crate) fn paint(frame: &mut Frame, editor: &crate::editor::Editor) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn show_at_startup_truth_table() {
+        assert!(show_at_startup(true, false, false), "enabled, no flag, no prompt → show");
+        assert!(!show_at_startup(false, false, false), "view.splash = false wins");
+        assert!(!show_at_startup(true, true, false), "--no-splash wins for this launch");
+        assert!(!show_at_startup(true, false, true), "recovery prompt wins — never bury it");
+        assert!(!show_at_startup(false, true, true), "all suppressors together");
+    }
 
     fn cua_keymap() -> crate::keymap::KeyTrie {
         let reg = crate::registry::Registry::builtins();

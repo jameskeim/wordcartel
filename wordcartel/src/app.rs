@@ -697,6 +697,12 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
                 wordcartel_core::selection::Selection::single(nh);
         }
     }
+    // Startup splash (spec 2026-07-09): resolved against the loop-local keymap AFTER the
+    // mem::take, gated on config + --no-splash + no pending recovery prompt, set before
+    // the first draw. Dismissal is splash::intercept — the first stage of reduce.
+    if crate::splash::show_at_startup(cfg.view.splash, cli.no_splash, editor.prompt.is_some()) {
+        editor.splash = Some(crate::splash::Splash::new(&keymap, env!("CARGO_PKG_VERSION")));
+    }
     first_frame_settle(&mut editor);
     guard.terminal().draw(|f| render::render(f, &mut editor))?;
     let mut exit_reason = ExitReason::Normal;
