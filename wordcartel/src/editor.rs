@@ -671,6 +671,7 @@ impl Editor {
         self.outline = None;
         self.theme_picker = None;
         self.file_browser = None;
+        self.splash = None; // a prompt is modal — it must never be buried by the splash
         self.prompt = Some(p);
     }
 
@@ -1534,5 +1535,18 @@ mod tests {
         assert!(!e.view_opts.splash);
         e.set_splash(true);
         assert!(e.view_opts.splash);
+    }
+
+    #[test]
+    fn open_prompt_clears_any_pending_splash() {
+        // Defense-in-depth for "recovery wins": a prompt is modal and must never be
+        // buried by the splash's full-frame Clear at render time (whole-branch finding).
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        e.splash = Some(crate::splash::Splash::new(&km, "0.1.0"));
+        e.open_prompt(crate::prompt::Prompt::swap_recovery());
+        assert!(e.splash.is_none(), "opening a prompt clears the splash");
+        assert!(e.prompt.is_some(), "the prompt itself is set");
     }
 }

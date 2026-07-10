@@ -866,13 +866,22 @@ fn e2e_no_splash_flag_suppresses_first_frame_splash() {
 #[test]
 fn e2e_recovery_prompt_pending_suppresses_splash() {
     let mut h = Harness::new("hello\n", None, (80, 24));
+    // Also probe the defense-in-depth belt (editor.rs open_prompt): set a splash
+    // BEFORE opening the recovery prompt, proving the two can never coexist even if a
+    // future startup-gate change let both get set — the render must show the prompt
+    // only, never the wordmark underneath it.
+    let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &h.reg);
+    h.editor.splash = Some(crate::splash::Splash::new(&km, "0.1.0"));
     h.editor.open_prompt(crate::prompt::Prompt::swap_recovery());
     let show = crate::splash::show_at_startup(
         h.editor.view_opts.splash, false, h.editor.prompt.is_some());
     assert!(!show, "a pending recovery prompt suppresses the splash");
+    assert!(h.editor.splash.is_none(), "open_prompt clears any pending splash (belt)");
     h.render();
     assert!(h.screen_contains("Recovery file found"),
         "the recovery prompt is what the user sees:\n{:#?}", h.screen());
+    assert!(!h.screen_contains("wordcartel") && !h.screen_contains("press any key"),
+        "the splash must never be painted over a modal prompt:\n{:#?}", h.screen());
 }
 
 // ===========================================================================
