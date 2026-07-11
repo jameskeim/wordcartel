@@ -55,23 +55,6 @@ appears, or as a side effect of a future B-style investment). It should **not** 
 open correctness debt. `block_tree.rs` remains the shared hotspot for both this and the R1
 paragraph-end widen cost, so any future work there touches both.
 
-## H5 — App-managed cleanup of swap files / state-dir debris?
-<!-- item: H5 -->
-
-**Question (user):** should there be an in-app way to clean up swap files and other filesystem debris,
-or is that something the user does outside the program?
-
-**Grounded (may drift):** the app writes crash-recovery + session state under the XDG state dir
-(`~/.local/state/wordcartel`, `swap::state_dir`): per-doc `*.swp` (hashed path), scratch
-`scratch-{pid}.swp`, `session.toml`, and — as the swap durability work surfaced — occasional orphaned
-atomic-write `*.tmp` files and stale swaps (e.g. the intentionally-left stale swap after a SaveAs
-rekey, or scratch swaps from crashed sessions). `swap::find_orphan_scratch_swap` already scans for
-crashed-scratch orphans on launch (for *recovery*), but nothing *prunes* accumulated debris. Forks to
-weigh: (a) auto-prune on launch (delete swaps whose owning pid is dead AND whose doc is clean/unchanged);
-(b) an explicit command (`Clean recovery files…`); (c) leave it to the user + document the dir. Ties to
-the swap durability model (memory: `wordcartel-swap-idle-thrash`). Anchors: `wordcartel/src/swap.rs`
-(`state_dir`, `swap_path`, `find_orphan_scratch_swap`), `recovery.rs`.
-
 ## H10 — `reduce`'s 10-stage interception chain is verbatim boilerplate
 <!-- item: H10 -->
 
@@ -90,24 +73,6 @@ fns iterated in order). Until then the repetition is bounded and readable; touch
 sake. This is a **command-surface-contract / Effort-P-conformance** note, not module-size debt (`reduce` is
 within budget). Anchor: `wordcartel/src/app.rs:233–252` (the chain); `:123` (`Handled`); the `timers::SUBSYSTEMS`
 table is the model a unified version would follow.
-
-## H12 — PTY smoke suite has no live-splash coverage (S9)
-<!-- item: H12 -->
-
-**Grounded (2026-07-10, splash effort merge 242c987).** The startup splash covers the first frame on every
-launch and would fail all 8 PTY smoke first-frame checks, so `scripts/smoke/tmux-drive.sh`'s `start_wcartel`
-now passes `--no-splash` on EVERY launch (alongside `--no-config`). Necessary — the smoke checks assert on
-first-frame content and the splash is not what they test — but the side effect is that **no smoke check ever
-exercises the real splash or its dismissal** (the Fable whole-branch review flagged this as advisory M-C). The
-splash IS covered by in-process e2e journeys (`wordcartel/src/e2e.rs`: show-on-first-frame, key/mouse dismiss,
-`--no-splash`, recovery-suppression at render level) and unit tests, so this is a *live-binary* coverage gap,
-not a correctness gap. Direction when picked up: add an **S9** check that launches WITHOUT `--no-splash` and
-asserts the real journey — wordmark/tagline on the first frame → a key dismisses it → the editor (or the opened
-file) is revealed — plus optionally a swap-recovery-relaunch variant asserting the recovery prompt wins over
-the splash on the live binary (the in-process e2e + the controller's manual PTY repro already proved this;
-S9 would lock it into the mandatory-run suite). Low-risk, additive (one new check script + the launcher already
-supports per-launch args). Anchors: `scripts/smoke/tmux-drive.sh` (`start_wcartel`, the `--no-splash` default),
-`scripts/smoke/checks/`, `wordcartel/src/splash.rs`, the e2e journeys in `wordcartel/src/e2e.rs`.
 
 ## H13 — `Editor` is a 58-field *data* god-object (field-clustering, not dispatch)
 <!-- item: H13 -->
@@ -134,11 +99,6 @@ struct), `:493` (the impl), the `open_*` overlay family + shared setters.
 ## Newly-tracked items (stubs)
 
 *(Auto-created during the backlog-manifest migration. Status/size/kind live in `backlog.toml`; flesh out the triage prose here when the item is picked up.)*
-
-## M8 — M5 follow-up: undo louder-hint for buffer-level merges
-<!-- item: M8 -->
-
-Finish the louder undo-eviction hint for buffer-level merges (the last M5 follow-up).
 
 ## M9 — Optional: upgrade/patch pulldown-cmark
 <!-- item: M9 -->

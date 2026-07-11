@@ -1353,6 +1353,48 @@ policy + duplicate/banned-crate checks), and decide whether to wire it as a CI g
 as the pre-P dependency pass, but on a distinct axis — H2 = build-time weight, H18 = vulnerabilities /
 licenses. Forks: audit-only vs a full `deny` policy; gate vs advisory. Anchors: `Cargo.lock`, H2.
 
+### H12 — PTY smoke suite has no live-splash coverage (S9)
+<!-- item: H12 -->
+
+**Shipped (Effort B, 2026-07-11):** PTY smoke S9 live-splash check added (`start_wcartel --with-splash`,
+`run.sh` s9 glob); smoke 9/9.
+
+**Grounded (2026-07-10, splash effort merge 242c987).** The startup splash covers the first frame on every
+launch and would fail all 8 PTY smoke first-frame checks, so `scripts/smoke/tmux-drive.sh`'s `start_wcartel`
+now passes `--no-splash` on EVERY launch (alongside `--no-config`). Necessary — the smoke checks assert on
+first-frame content and the splash is not what they test — but the side effect is that **no smoke check ever
+exercises the real splash or its dismissal** (the Fable whole-branch review flagged this as advisory M-C). The
+splash IS covered by in-process e2e journeys (`wordcartel/src/e2e.rs`: show-on-first-frame, key/mouse dismiss,
+`--no-splash`, recovery-suppression at render level) and unit tests, so this is a *live-binary* coverage gap,
+not a correctness gap. Direction when picked up: add an **S9** check that launches WITHOUT `--no-splash` and
+asserts the real journey — wordmark/tagline on the first frame → a key dismisses it → the editor (or the opened
+file) is revealed — plus optionally a swap-recovery-relaunch variant asserting the recovery prompt wins over
+the splash on the live binary (the in-process e2e + the controller's manual PTY repro already proved this;
+S9 would lock it into the mandatory-run suite). Low-risk, additive (one new check script + the launcher already
+supports per-launch args). Anchors: `scripts/smoke/tmux-drive.sh` (`start_wcartel`, the `--no-splash` default),
+`scripts/smoke/checks/`, `wordcartel/src/splash.rs`, the e2e journeys in `wordcartel/src/e2e.rs`.
+
+### H5 — App-managed cleanup of swap files / state-dir debris?
+<!-- item: H5 -->
+
+**Shipped (Effort B, 2026-07-11):** `Clean recovery files…` command — command-only, fail-closed,
+no-data-loss (assess-vouched deletions, TOCTOU-safe snapshot + confirm-time re-verify). No launch
+auto-prune.
+
+**Question (user):** should there be an in-app way to clean up swap files and other filesystem debris,
+or is that something the user does outside the program?
+
+**Grounded (may drift):** the app writes crash-recovery + session state under the XDG state dir
+(`~/.local/state/wordcartel`, `swap::state_dir`): per-doc `*.swp` (hashed path), scratch
+`scratch-{pid}.swp`, `session.toml`, and — as the swap durability work surfaced — occasional orphaned
+atomic-write `*.tmp` files and stale swaps (e.g. the intentionally-left stale swap after a SaveAs
+rekey, or scratch swaps from crashed sessions). `swap::find_orphan_scratch_swap` already scans for
+crashed-scratch orphans on launch (for *recovery*), but nothing *prunes* accumulated debris. Forks to
+weigh: (a) auto-prune on launch (delete swaps whose owning pid is dead AND whose doc is clean/unchanged);
+(b) an explicit command (`Clean recovery files…`); (c) leave it to the user + document the dir. Ties to
+the swap durability model (memory: `wordcartel-swap-idle-thrash`). Anchors: `wordcartel/src/swap.rs`
+(`state_dir`, `swap_path`, `find_orphan_scratch_swap`), `recovery.rs`.
+
 ## Theme R — responsiveness
 
 ### R1 — Typing latency + double-Return / line-jump
@@ -1515,3 +1557,13 @@ stall at present doc sizes. Raw CSV + slope table in `.superpowers/sdd/r1-bench{
 it underlies both R1's paragraph-end widen cost AND the still-open incremental≡full soundness divergences
 (a ~43 M-exec sweep re-found the latter with fresh minimized repros in `fuzz/artifacts/block_tree/`; that
 same sweep found **no** pulldown-cmark panic, so the M4-rest `catch_unwind` isolation is belt-and-suspenders).
+
+## Theme M — hardening campaign
+
+### M8 — M5 follow-up: undo louder-hint for buffer-level merges
+<!-- item: M8 -->
+
+**Shipped (Effort B, 2026-07-11):** per-buffer `undo_evicted_pending` surfaces buffer-level (non-active)
+merge evictions after reduce + at `switch_to_index`.
+
+Finish the louder undo-eviction hint for buffer-level merges (the last M5 follow-up).
