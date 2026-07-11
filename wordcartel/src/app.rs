@@ -2846,9 +2846,10 @@ mod tests {
 
     #[test]
     fn tick_dispatches_a_due_check_once() {
-        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crate::editor::{Editor, RenderMode}; use crate::jobs::InlineExecutor; use crate::registry::Registry;
         let mut e = Editor::new_from_text("teh\n", None, (80, 24));
         e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = RenderMode::Review; // E7 T2: on_tick's dispatch is now Review-gated
         e.active_mut().diagnostics.arm(0, 400); // due at 400
         let (tx, rx) = std::sync::mpsc::channel::<Msg>();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(500); // past due

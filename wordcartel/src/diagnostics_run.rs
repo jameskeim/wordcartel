@@ -29,6 +29,16 @@ pub fn next_deadline(terms: &[Option<u64>]) -> Option<u64> {
     terms.iter().flatten().copied().min()
 }
 
+/// Compute gate: diagnostics arm/dispatch only when the feature is enabled AND the active buffer
+/// is in the Review render mode. (Spec §2.1.)
+pub fn should_run_diagnostics(editor: &Editor) -> bool {
+    editor.diag_cfg.enabled && editor.active().view.mode == crate::editor::RenderMode::Review
+}
+
+/// Display gate: underlines paint under exactly the same predicate. Distinct name for the distinct
+/// role (compute vs paint); delegates so the two cannot drift.
+pub fn should_show_diagnostics(editor: &Editor) -> bool { should_run_diagnostics(editor) }
+
 /// A re-check is due if armed, the time has been reached, and no check is
 /// already in flight (for any version). A check in flight for a different
 /// version also blocks dispatch — the result will arrive shortly and the
@@ -134,6 +144,22 @@ mod tests {
             message: "x".into(), suggestions: vec![] });
         assert!(s.valid_for(5));
         assert!(!s.valid_for(6)); // edited since → hidden
+    }
+
+    #[test]
+    fn should_run_diagnostics_only_in_review_and_enabled() {
+        use crate::editor::{Editor, RenderMode};
+        let mut e = Editor::new_from_text("x\n", None, (40, 10));
+        e.diag_cfg.enabled = true;
+        for (mode, want) in [(RenderMode::LivePreview, false), (RenderMode::Review, true),
+                             (RenderMode::SourceHighlighted, false), (RenderMode::SourcePlain, false)] {
+            e.active_mut().view.mode = mode;
+            assert_eq!(should_run_diagnostics(&e), want, "{mode:?} enabled");
+            assert_eq!(should_show_diagnostics(&e), want, "show mirrors run: {mode:?}");
+        }
+        e.active_mut().view.mode = RenderMode::Review;
+        e.diag_cfg.enabled = false;
+        assert!(!should_run_diagnostics(&e), "disabled → false even in Review");
     }
 
     #[test]

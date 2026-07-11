@@ -159,7 +159,7 @@ pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_co
         let word = editor.active().document.buffer.slice(a..b).to_string();
         editor.session_ignores.insert(word);
         editor.diag = None;
-        if editor.diag_cfg.enabled {
+        if crate::diagnostics_run::should_run_diagnostics(editor) {
             let debounce_ms = editor.diag_cfg.debounce_ms;
             editor.active_mut().diagnostics.arm(clock.now_ms(), debounce_ms);
         }
@@ -175,7 +175,7 @@ pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_co
             editor.status = "no dictionary path configured".into();
         }
         editor.diag = None;
-        if editor.diag_cfg.enabled {
+        if crate::diagnostics_run::should_run_diagnostics(editor) {
             let debounce_ms = editor.diag_cfg.debounce_ms;
             editor.active_mut().diagnostics.arm(clock.now_ms(), debounce_ms);
         }

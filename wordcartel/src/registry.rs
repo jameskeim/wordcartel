@@ -416,7 +416,7 @@ impl Registry {
             CommandResult::Handled
         });
         r.register("recheck_diagnostics", "Recheck Diagnostics", None, |c| {
-            if c.editor.diag_cfg.enabled {
+            if crate::diagnostics_run::should_run_diagnostics(c.editor) {
                 c.editor.active_mut().diagnostics.arm(c.clock.now_ms(), 0);
             }
             CommandResult::Handled
@@ -1356,5 +1356,22 @@ mod tests {
         assert!(ctx.editor.view_opts.splash, "absolute set is idempotent");
         reg.dispatch(CommandId("toggle_splash"), &mut ctx);
         assert!(!ctx.editor.view_opts.splash, "toggle flips off");
+    }
+
+    /// E7 T2: the "recheck_diagnostics" command arms a recheck only when the active buffer is in
+    /// Review (draft-quiet) — outside Review it is a no-op (spec §2.2 item 3).
+    #[test]
+    fn recheck_diagnostics_arms_only_in_review() {
+        use crate::editor::RenderMode;
+        let mut ed = Editor::new_from_text("teh cat\n", None, (80, 24));
+        ed.diag_cfg.enabled = true;
+
+        ed.active_mut().view.mode = RenderMode::LivePreview;
+        dispatch_id(&mut ed, "recheck_diagnostics");
+        assert_eq!(ed.active().diagnostics.recheck_due_at, None, "no-op outside Review");
+
+        ed.active_mut().view.mode = RenderMode::Review;
+        dispatch_id(&mut ed, "recheck_diagnostics");
+        assert!(ed.active().diagnostics.recheck_due_at.is_some(), "arms a recheck in Review");
     }
 }

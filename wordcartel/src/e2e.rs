@@ -1228,6 +1228,12 @@ mod e2e_bench {
                 // Baseline render (no active diagnostics).
                 let base = h.step_timed(Msg::Tick);
                 s.push(n, hd, "flat-prose", "diagnostics-landing-baseline", "render", base.t_render.as_micros());
+                // E7 T2: diagnostics compute/display are Review-gated now (draft-quiet); the
+                // Harness seeds diag_cfg.enabled = false for hermeticity, so without both of
+                // these the DiagnosticsDone landing below would measure the empty (un-placed)
+                // path instead of the placed/painted path this probe intends (spec §7.4).
+                h.editor.diag_cfg.enabled = true;
+                h.editor.active_mut().view.mode = crate::editor::RenderMode::Review;
                 // Inject diagnostics for the current version → placed render path arms.
                 let bid = h.editor.active().id;
                 let ver = h.version();
