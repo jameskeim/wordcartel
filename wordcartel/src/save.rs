@@ -233,6 +233,10 @@ pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
     // that origin — sync blocks_version so rebuild skips the redundant reparse.
     new_buf.reconcile.blocks_version = new_buf.document.version;
     let id = editor.active().id;                 // preserve THIS buffer's id
+    // Effort A: abandon the pre-reload generation before the wholesale replace so a still-in-transit
+    // publish for the old content is dropped (its uri leaves uri_owner) and the next Review dispatch
+    // reopens fresh. The version bump above is the second, independent guard axis (spec §5 item 4).
+    editor.diag_provider.notify_close(id);
     // 5g: capture folds before replacement so we can carry them forward.
     let prev_folded = editor.active().folds.folded().clone();
     *editor.active_mut() = crate::editor::Buffer { id, ..new_buf };
@@ -277,6 +281,9 @@ pub fn load_recovered(editor: &mut crate::editor::Editor, body: &str) {
     // that origin — sync blocks_version so rebuild skips the redundant reparse.
     new_buf.reconcile.blocks_version = new_buf.document.version;
     let id = editor.active().id;                 // preserve THIS buffer's id
+    // Effort A: abandon the pre-recovery generation before the wholesale replace (same guard as
+    // reload_from_disk) — the in-transit old-content publish is dropped and the buffer reopens fresh.
+    editor.diag_provider.notify_close(id);
     // 5g: capture folds before replacement so we can carry them forward.
     let prev_folded = editor.active().folds.folded().clone();
     *editor.active_mut() = crate::editor::Buffer { id, ..new_buf };
@@ -656,6 +663,36 @@ mod tests {
         );
         assert!(e.active().diagnostics.diagnostics.is_empty(),
             "late pre-recovery DiagnosticsDone must be discarded");
+    }
+
+    /// Effort A: reload/recover close the pre-replacement generation on the provider (the
+    /// generation-axis half of the double staleness guard, spec §5 item 4) so an in-transit
+    /// old-content publish is dropped and the buffer reopens fresh.
+    #[test]
+    fn reload_and_recover_notify_provider_close() {
+        use crate::diag_provider::{RecordingProvider, ProviderCall};
+        // reload_from_disk
+        let p = scratch();
+        std::fs::write(&p, "on disk\n").unwrap();
+        let mut e = Editor::new_from_text("edits\n", Some(p.clone()), (80, 24));
+        let id = e.active().id;
+        let rec = RecordingProvider::new();
+        let calls = rec.calls_handle();
+        e.diag_provider = Box::new(rec);
+        reload_from_disk(&mut e);
+        assert!(calls.lock().unwrap().iter().any(|c| matches!(c, ProviderCall::NotifyClose(x) if *x == id)),
+            "reload_from_disk notifies close for the pre-reload generation");
+        let _ = std::fs::remove_file(&p);
+
+        // load_recovered
+        let mut e = Editor::new_from_text("old\n", None, (80, 24));
+        let id = e.active().id;
+        let rec = RecordingProvider::new();
+        let calls = rec.calls_handle();
+        e.diag_provider = Box::new(rec);
+        load_recovered(&mut e, "recovered\n");
+        assert!(calls.lock().unwrap().iter().any(|c| matches!(c, ProviderCall::NotifyClose(x) if *x == id)),
+            "load_recovered notifies close for the pre-recovery generation");
     }
 
     #[test]

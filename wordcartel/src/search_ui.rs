@@ -155,30 +155,30 @@ pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_co
     let b = raw_b.min(doc_len);
 
     if is_ignore {
-        // Add the surface word to session_ignores, close, re-arm a recheck.
+        // Effort A: ephemeral session-ignore. Add the surface word, close, then refilter the store
+        // in place (no server round-trip — a full re-check to remove one underline is pure waste
+        // under LSP full-doc sync; the old re-arm is dropped, spec §7.3).
         let word = editor.active().document.buffer.slice(a..b).to_string();
         editor.session_ignores.insert(word);
         editor.diag = None;
-        if crate::diagnostics_run::should_run_diagnostics(editor) {
-            let debounce_ms = editor.diag_cfg.debounce_ms;
-            editor.active_mut().diagnostics.arm(clock.now_ms(), debounce_ms);
-        }
+        crate::diagnostics_run::retain_unignored(editor);
     } else if is_add_dict {
-        // Append word to dictionary file + in-memory set, close, re-arm.
+        // Effort A: single writer, no double-write (spec §7.4). `editor.dictionary` is updated FIRST
+        // and unconditionally — instant client-side suppression that holds even with no path — then
+        // `append_word_to_dict` (the sole file writer) persists to harper-ls's `userDictPath` and
+        // `reload_dictionary()` nudges the server to re-read that same file (a config resend, NOT a
+        // second write). The None case still suppresses the word; harper falls back to its own path.
         let word = editor.active().document.buffer.slice(a..b).to_string();
-        if let Some(ref dict_path) = editor.diag_cfg.dictionary.clone() {
-            match crate::diagnostics_run::append_word_to_dict(dict_path, &word) {
-                Ok(()) => { editor.dictionary.insert(word); }
-                Err(e) => { editor.status = format!("add to dictionary failed: {e}"); }
-            }
-        } else {
-            editor.status = "no dictionary path configured".into();
+        editor.dictionary.insert(word.clone());
+        match editor.diag_cfg.dictionary.clone() {
+            Some(dict_path) => match crate::diagnostics_run::append_word_to_dict(&dict_path, &word) {
+                Ok(()) => editor.diag_provider.reload_dictionary(),
+                Err(e) => editor.status = format!("add to dictionary failed: {e}"),
+            },
+            None => editor.status = "no dictionary path configured".into(),
         }
         editor.diag = None;
-        if crate::diagnostics_run::should_run_diagnostics(editor) {
-            let debounce_ms = editor.diag_cfg.debounce_ms;
-            editor.active_mut().diagnostics.arm(clock.now_ms(), debounce_ms);
-        }
+        crate::diagnostics_run::retain_unignored(editor);
     } else if let Some(s) = suggestion {
         // Apply the suggestion as an undoable edit, then close.
         let (cs, edit) = match &s {
@@ -292,54 +292,83 @@ mod tests {
         e.diag = Some(ov);
     }
 
-    /// Class-B non-edit re-arm, 1/2 (E7 T6 spec §7.2) — "ignore once" applies via
-    /// `diag_apply_selected`'s own inline re-arm (search_ui.rs, gated by
-    /// `should_run_diagnostics`, since it does NOT bump `document.version` and so the T3
-    /// `arm_if_edited` seam's version-diff check would never see it). Confirms the T2 gate
-    /// still arms in Review and stays inert outside it.
+    /// Seed the active store with a spelling diagnostic on "teh" (0..3) so an ignore/add-dict row
+    /// has something to refilter in place.
+    fn seed_teh_diag(e: &mut Editor) {
+        e.active_mut().diagnostics.diagnostics = vec![Diagnostic {
+            range: 0..3, kind: DiagnosticKind::Spelling, message: "x".into(),
+            suggestions: vec![Suggestion::ReplaceWith("the".into())] }];
+    }
+
+    /// Effort A: "ignore once" adds the surface word to `session_ignores`, closes the overlay, and
+    /// refilters the store in place — no re-arm (a full re-check to remove one underline is waste
+    /// under full-doc sync, spec §7.3).
     #[test]
-    fn diag_apply_selected_ignore_arms_only_in_review() {
+    fn diag_apply_selected_ignore_suppresses_in_place_without_rearm() {
         let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = RenderMode::Review;
+        seed_teh_diag(&mut e);
         open_diag_selected(&mut e, true);
         let v_before = e.active().document.version;
         e.active_mut().diagnostics.recheck_due_at = None;
         diag_apply_selected(&mut e, &TestClock(1_000));
         assert_eq!(e.active().document.version, v_before, "ignore does not edit the document");
         assert!(e.diag.is_none(), "overlay closes regardless of outcome");
-        assert_eq!(e.active().diagnostics.recheck_due_at, Some(1_000 + e.diag_cfg.debounce_ms),
-            "ignore re-arms in Review despite no version change");
-
-        e.active_mut().view.mode = RenderMode::LivePreview;
-        open_diag_selected(&mut e, true);
-        e.active_mut().diagnostics.recheck_due_at = None;
-        diag_apply_selected(&mut e, &TestClock(2_000));
-        assert_eq!(e.active().diagnostics.recheck_due_at, None, "ignore outside Review must not arm");
+        assert!(e.session_ignores.contains("teh"), "surface word added to session ignores");
+        assert!(e.active().diagnostics.diagnostics.is_empty(), "the ignored underline is refiltered out");
+        assert_eq!(e.active().diagnostics.recheck_due_at, None, "no re-arm — the refilter is immediate");
     }
 
-    /// Class-B non-edit re-arm, 2/2 — "add to dictionary" mirrors the ignore branch. The
-    /// dictionary path is cleared so the test never touches the real filesystem; the re-arm
-    /// runs unconditionally after the Ok/Err/no-path status update.
+    /// Effort A: "add to dictionary" with no configured path still suppresses the word client-side
+    /// (into `editor.dictionary`), sets the no-path status, closes, and refilters in place — the
+    /// None branch is no longer a status-only no-op (round-1 IMPORTANT 5). No re-arm.
     #[test]
-    fn diag_apply_selected_add_dict_arms_only_in_review() {
+    fn diag_apply_selected_add_dict_no_path_still_suppresses() {
         let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
         e.diag_cfg.enabled = true;
         e.diag_cfg.dictionary = None;
         e.active_mut().view.mode = RenderMode::Review;
+        seed_teh_diag(&mut e);
         open_diag_selected(&mut e, false);
-        let v_before = e.active().document.version;
         e.active_mut().diagnostics.recheck_due_at = None;
         diag_apply_selected(&mut e, &TestClock(3_000));
-        assert_eq!(e.active().document.version, v_before, "add-to-dict does not edit the document");
         assert!(e.diag.is_none(), "overlay closes regardless of outcome");
-        assert_eq!(e.active().diagnostics.recheck_due_at, Some(3_000 + e.diag_cfg.debounce_ms),
-            "add-to-dict re-arms in Review despite no version change");
+        assert!(e.dictionary.contains("teh"), "word suppressed client-side even with no path");
+        assert_eq!(e.status, "no dictionary path configured");
+        assert!(e.active().diagnostics.diagnostics.is_empty(), "the added word is refiltered out");
+        assert_eq!(e.active().diagnostics.recheck_due_at, None, "no re-arm");
+    }
 
-        e.active_mut().view.mode = RenderMode::LivePreview;
+    /// Effort A single-writer (spec §7.4): add-to-dict writes the word to the file EXACTLY once
+    /// (our `append_word_to_dict` is the sole writer) and nudges the provider to reload — never a
+    /// second write. Asserts the on-disk file has one line and the provider saw a ReloadDictionary.
+    #[test]
+    fn diag_apply_selected_add_dict_writes_file_once_and_nudges_reload() {
+        let dir = format!("/tmp/wordcartel_adddict_{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&dir);
+        let dict_path = std::path::PathBuf::from(&dir).join("dictionary.txt");
+        let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        e.diag_cfg.enabled = true;
+        e.diag_cfg.dictionary = Some(dict_path.clone());
+        e.active_mut().view.mode = RenderMode::Review;
+        let rec = crate::diag_provider::RecordingProvider::new();
+        let calls = rec.calls_handle();
+        e.diag_provider = Box::new(rec);
+        seed_teh_diag(&mut e);
         open_diag_selected(&mut e, false);
-        e.active_mut().diagnostics.recheck_due_at = None;
-        diag_apply_selected(&mut e, &TestClock(4_000));
-        assert_eq!(e.active().diagnostics.recheck_due_at, None, "add-to-dict outside Review must not arm");
+        diag_apply_selected(&mut e, &TestClock(5_000));
+        let contents = std::fs::read_to_string(&dict_path).expect("dict file written");
+        assert_eq!(contents.lines().filter(|l| l.trim() == "teh").count(), 1,
+            "the word is written to the file exactly once — single writer, no double write");
+        let log = calls.lock().unwrap();
+        assert_eq!(log.iter().filter(|c|
+            matches!(c, crate::diag_provider::ProviderCall::ReloadDictionary)).count(), 1,
+            "the provider is nudged to re-read exactly once (a config resend, not a write)");
+        assert!(!log.iter().any(|c|
+            matches!(c, crate::diag_provider::ProviderCall::NotifyChange { .. })),
+            "no full re-check is dispatched — the client filter hides the word immediately");
+        assert!(e.dictionary.contains("teh"), "word also suppressed client-side");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

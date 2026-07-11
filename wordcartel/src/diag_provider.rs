@@ -106,9 +106,11 @@ impl PartialEq for ProviderConfig {
 /// settable `Accepted`/`Availability`, so dispatch/handler tests (T3/T5) exercise the seam
 /// without harper-ls installed.
 #[cfg(test)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct RecordingProvider {
-    calls: Vec<ProviderCall>,
+    // Shared handle so a test can read the call log AFTER the provider is boxed into
+    // `editor.diag_provider` and moved out of reach: clone `calls_handle()` before installing.
+    calls: std::sync::Arc<std::sync::Mutex<Vec<ProviderCall>>>,
     accepted: Accepted,
     availability: Availability,
 }
@@ -117,29 +119,38 @@ pub(crate) struct RecordingProvider {
 impl RecordingProvider {
     /// New recorder: `notify_change` accepts, `availability()` reports `Ready`.
     pub(crate) fn new() -> Self {
-        RecordingProvider { calls: Vec::new(), accepted: Accepted::Yes, availability: Availability::Ready }
+        RecordingProvider {
+            calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            accepted: Accepted::Yes, availability: Availability::Ready,
+        }
     }
     pub(crate) fn with_accepted(mut self, accepted: Accepted) -> Self { self.accepted = accepted; self }
     pub(crate) fn with_availability(mut self, availability: Availability) -> Self {
         self.availability = availability; self
     }
-    pub(crate) fn calls(&self) -> &[ProviderCall] { &self.calls }
+    /// Shared call-log handle — clone it before boxing to observe interaction post-install.
+    pub(crate) fn calls_handle(&self) -> std::sync::Arc<std::sync::Mutex<Vec<ProviderCall>>> {
+        std::sync::Arc::clone(&self.calls)
+    }
+    /// Snapshot of the recorded calls in order.
+    pub(crate) fn calls(&self) -> Vec<ProviderCall> { self.calls.lock().expect("calls mutex").clone() }
+    fn push(&self, call: ProviderCall) { self.calls.lock().expect("calls mutex").push(call); }
 }
 
 #[cfg(test)]
 impl DiagnosticsProvider for RecordingProvider {
     fn name(&self) -> &'static str { "recording" }
     fn availability(&self) -> Availability { self.availability }
-    fn ensure_running(&mut self) { self.calls.push(ProviderCall::EnsureRunning); }
-    fn configure(&mut self, cfg: ProviderConfig) { self.calls.push(ProviderCall::Configure(cfg)); }
+    fn ensure_running(&mut self) { self.push(ProviderCall::EnsureRunning); }
+    fn configure(&mut self, cfg: ProviderConfig) { self.push(ProviderCall::Configure(cfg)); }
     fn notify_change(&mut self, buffer_id: BufferId, version: u64,
         path: Option<std::path::PathBuf>, text: String) -> Accepted {
-        self.calls.push(ProviderCall::NotifyChange { buffer_id, version, path, text });
+        self.push(ProviderCall::NotifyChange { buffer_id, version, path, text });
         self.accepted
     }
-    fn notify_close(&mut self, buffer_id: BufferId) { self.calls.push(ProviderCall::NotifyClose(buffer_id)); }
-    fn reload_dictionary(&mut self) { self.calls.push(ProviderCall::ReloadDictionary); }
-    fn shutdown(&mut self) { self.calls.push(ProviderCall::Shutdown); }
+    fn notify_close(&mut self, buffer_id: BufferId) { self.push(ProviderCall::NotifyClose(buffer_id)); }
+    fn reload_dictionary(&mut self) { self.push(ProviderCall::ReloadDictionary); }
+    fn shutdown(&mut self) { self.push(ProviderCall::Shutdown); }
 }
 
 #[cfg(test)]
@@ -181,7 +192,7 @@ mod tests {
         p.reload_dictionary();
         p.shutdown();
 
-        assert_eq!(p.calls(), &[
+        assert_eq!(p.calls(), vec![
             ProviderCall::EnsureRunning,
             ProviderCall::Configure(ProviderConfig { grammar: false, dictionary: Some("/d".into()), max_file_length: 9 }),
             ProviderCall::NotifyChange { buffer_id: BufferId(3), version: 7, path: Some("/f.md".into()), text: "text".into() },

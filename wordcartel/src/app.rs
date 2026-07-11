@@ -614,18 +614,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // Warm the pandoc probe cache so the first export command doesn't pay latency.
     let _ = crate::export::probe_pandoc();
 
-    // Warm Harper's FstDictionary LazyLock off the critical path so the first
-    // real diagnostics check isn't ~11s. Fire-and-forget; discard the result.
-    if editor.diag_cfg.enabled {
-        std::thread::Builder::new()
-            .name("wcartel-diag-warm".into())
-            .spawn(|| {
-                let ignore = std::collections::HashSet::new();
-                let opts = wordcartel_core::diagnostics::CheckOpts { grammar: false, ignore_words: &ignore };
-                let _ = wordcartel_core::diagnostics::check("", &opts);
-            })
-            .expect("spawn diag warmup thread");
-    }
+    // Effort A: no startup diagnostics warmup — the harper-ls client thread spawns lazily on the
+    // first Review dispatch (idle is free; spec §3.1/§8). Installed just below, after the msg channel.
 
     let reg = Registry::builtins();
     // Build the keymap from the loaded config and surface any warnings.
@@ -639,6 +629,16 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // &mut editor / &editor.keymap borrow conflict when calling reduce.
     let mut keymap = std::mem::take(&mut editor.keymap);
     let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Msg>();
+    // Effort A: install the diagnostics provider now that the msg channel exists. HarperLs spawns
+    // nothing here — its client thread starts on the first Review dispatch (lazy; spec §3.1). Config
+    // is derived from the loaded DiagnosticsConfig; the file-length cap bounds per-recheck stdio.
+    editor.diag_provider = Box::new(crate::harper_ls::HarperLs::new(
+        msg_tx.clone(),
+        crate::diag_provider::ProviderConfig {
+            grammar: cfg.diagnostics.grammar,
+            dictionary: cfg.diagnostics.dictionary.clone(),
+            max_file_length: crate::limits::HARPER_MAX_FILE_LENGTH,
+        }));
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
     let executor = crate::jobs::ThreadExecutor::new(wake_tx);
     let clip_env = crate::clipboard::clip_env_from_process();
@@ -782,6 +782,12 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         }
         if !keep { break; }
     }
+
+    // Effort A: shut the diagnostics provider down on every loop-exit path (clean quit, !keep,
+    // input-loss, channel-disconnect all converge here) — sends LSP shutdown/exit and reaps the
+    // child, non-blocking. The client thread's FlushGuard still emits terminals for any
+    // accepted-but-unpublished change, so no latch is left dangling (spec §3/§4.6).
+    editor.diag_provider.shutdown();
 
     // Input-loss shutdown: persist every dirty buffer non-interactively (the
     // interactive quit-drain can't run — input is gone). Controlled break, so
@@ -3197,23 +3203,43 @@ mod tests {
         assert_eq!(e.active().diagnostics.diagnostics.len(), 1, "stale result must not overwrite");
     }
 
+    /// Effort A: a provider lifecycle event delivered with NO modal open reaches the status line
+    /// through `reduce` → `reduce_dispatch`'s arm.
+    #[test]
+    fn reduce_delivers_diag_provider_event_to_status() {
+        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crate::diag_provider::{ProviderEvent, INSTALL_HINT};
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        assert!(e.prompt.is_none(), "precondition: no modal");
+        let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        crate::app::reduce(Msg::DiagProviderEvent(ProviderEvent::Degraded(INSTALL_HINT.into())),
+            &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.status, INSTALL_HINT, "Degraded reached the status line via reduce_dispatch");
+    }
+
     #[test]
     fn tick_dispatches_a_due_check_once() {
         use crate::editor::{Editor, RenderMode}; use crate::jobs::InlineExecutor; use crate::registry::Registry;
         let mut e = Editor::new_from_text("teh\n", None, (80, 24));
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = RenderMode::Review; // E7 T2: on_tick's dispatch is now Review-gated
+        // Effort A: on_tick dispatches through the provider seam, not an embedded worker. Install a
+        // Ready/accepting recorder so a due Tick hands the buffer off and latches in_flight.
+        let rec = crate::diag_provider::RecordingProvider::new();
+        let calls = rec.calls_handle();
+        e.diag_provider = Box::new(rec);
         e.active_mut().diagnostics.arm(0, 400); // due at 400
-        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(500); // past due
-        // a Tick at now=500 with diagnostics enabled dispatches one check
+        // a Tick at now=500 with diagnostics enabled dispatches one check into the provider
         crate::app::reduce(Msg::Tick, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().diagnostics.in_flight_version, Some(e.active().document.version));
-        // the spawned worker sends a DiagnosticsDone
-        match rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap() {
-            Msg::DiagnosticsDone { diagnostics, .. } => assert!(diagnostics.iter().any(|d| d.kind == wordcartel_core::diagnostics::DiagnosticKind::Spelling)),
-            o => panic!("expected DiagnosticsDone, got {o:?}"),
-        }
+        let v = e.active().document.version;
+        let log = calls.lock().unwrap();
+        assert!(log.iter().any(|c| matches!(c,
+            crate::diag_provider::ProviderCall::NotifyChange { version, .. } if *version == v)),
+            "the due Tick forwarded exactly one full-doc sync to the provider");
     }
 
     // -------------------------------------------------------------------------

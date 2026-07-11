@@ -1,6 +1,6 @@
 //! Diagnostics runtime (shell): per-buffer store, pure debounce helpers,
 //! worker dispatch (Task 4), version-gated apply (Task 4), dictionary IO.
-use wordcartel_core::diagnostics::Diagnostic;
+use wordcartel_core::diagnostics::{Diagnostic, DiagnosticKind};
 use crate::editor::{BufferId, Editor};
 
 #[derive(Debug, Default, Clone)]
@@ -65,28 +65,74 @@ pub fn diag_due(store: &DiagStore, now: u64, _version: u64) -> bool {
         && store.in_flight_version.is_none()
 }
 
-/// Spawn a worker thread that runs Harper and sends Msg::DiagnosticsDone.
-/// Mirrors filter::dispatch_filter (spawn + msg_tx). Sets in_flight_version.
-pub fn dispatch_diagnostics(
-    editor: &mut Editor,
-    cfg: &crate::config::DiagnosticsConfig,
-    ignore_words: std::sync::Arc<std::collections::HashSet<String>>,
-    msg_tx: std::sync::mpsc::Sender<crate::app::Msg>,
-) {
+/// Consume the armed deadline and hand the buffer to the diagnostics provider (Effort A seam).
+/// Sets `in_flight_version` ONLY when a notify was actually enqueued — the provider guarantees a
+/// (possibly empty) `Msg::DiagnosticsDone` for every accepted version (latch invariant, spec §5.1);
+/// on `Accepted::No` the latch stays clear so a fresh dispatch retries instead of wedging.
+pub fn dispatch_diagnostics(editor: &mut Editor) {
     let b = editor.active();
-    let buffer_id = b.id;
-    let version = b.document.version;
+    let (buffer_id, version) = (b.id, b.document.version);
+    let path = b.document.path.clone();
     let text = b.document.buffer.snapshot().to_string();
-    let grammar = cfg.grammar;
-    editor.active_mut().diagnostics.in_flight_version = Some(version);
     editor.active_mut().diagnostics.recheck_due_at = None; // consumed
-    std::thread::spawn(move || {
-        let opts = wordcartel_core::diagnostics::CheckOpts { grammar, ignore_words: &ignore_words };
-        let diagnostics = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            wordcartel_core::diagnostics::check(&text, &opts)
-        })).unwrap_or_default(); // Harper panic → no diagnostics, never crash the loop (spec §8)
-        let _ = msg_tx.send(crate::app::Msg::DiagnosticsDone { buffer_id, version, diagnostics });
+    if text.len() as u64 > crate::limits::DIAG_MAX_SEND_BYTES {
+        editor.status = "document too large for grammar checking".into();
+        return; // no in_flight; nothing outstanding
+    }
+    use crate::diag_provider::{Availability, Accepted};
+    editor.diag_provider.ensure_running();
+    if editor.diag_provider.availability() == Availability::Unavailable {
+        show_install_hint(editor);
+        return; // no in_flight
+    }
+    if editor.diag_provider.availability() == Availability::Starting {
+        editor.status = "starting grammar checker…".into(); // no silent wait (spec §4.3)
+    }
+    // LATCH INVARIANT (spec §5.1): set in_flight_version ONLY on Accepted::Yes. On Accepted::No the
+    // thread died between the availability read and the send — no terminal DiagnosticsDone would ever
+    // arrive, so latching here would wedge diagnostics permanently. Leave the latch clear (a fresh
+    // dispatch retries) and surface the degrade hint.
+    match editor.diag_provider.notify_change(buffer_id, version, path, text) {
+        Accepted::Yes => { editor.active_mut().diagnostics.in_flight_version = Some(version); }
+        Accepted::No => show_install_hint(editor),
+    }
+}
+
+/// Surface the install hint at most once per deliberate Review entry (`diag_hint_shown` latch,
+/// reset in `set_render_mode` on entering Review). Spec §9 — informative, not naggy.
+fn show_install_hint(editor: &mut Editor) {
+    if !editor.diag_hint_shown {
+        editor.diag_hint_shown = true;
+        editor.status = crate::diag_provider::INSTALL_HINT.into();
+    }
+}
+
+/// The client-side ignore union — personal dictionary ∪ session ignores — lowercased for
+/// case-insensitive membership (spec §7.3/§7.4). Empty ⟹ nothing is suppressed (the common case).
+fn ignore_union_lower(editor: &Editor) -> std::collections::HashSet<String> {
+    editor.dictionary.iter().chain(editor.session_ignores.iter())
+        .map(|w| w.to_lowercase()).collect()
+}
+
+/// Drop every `Spelling` diagnostic whose surface word (sliced from `text`) is in `union`;
+/// retain everything else (non-spelling diagnostics are never suppressed). Byte ranges index into
+/// `text`, which is the buffer content of the diagnostics' version.
+fn retain_over_union(diags: &mut Vec<Diagnostic>, text: &str,
+    union: &std::collections::HashSet<String>) {
+    diags.retain(|d| {
+        if d.kind != DiagnosticKind::Spelling { return true; }
+        let surface = text.get(d.range.start..d.range.end).unwrap_or("");
+        !union.contains(&surface.to_lowercase())
     });
+}
+
+/// In-place refilter of the ACTIVE buffer's `DiagStore` against the ignore union — an immediate,
+/// server-round-trip-free underline update after an ignore/add-dict overlay row (spec §7.3).
+pub fn retain_unignored(editor: &mut Editor) {
+    let union = ignore_union_lower(editor);
+    if union.is_empty() { return; } // nothing suppressed → no work, no snapshot
+    let text = editor.active().document.buffer.to_string();
+    retain_over_union(&mut editor.active_mut().diagnostics.diagnostics, &text, &union);
 }
 
 /// Append `word` to the personal dictionary file (create if missing).
@@ -107,8 +153,18 @@ pub fn apply_diagnostics_done(
     version: u64,
     diagnostics: Vec<Diagnostic>,
 ) {
+    // Build the ignore union BEFORE borrowing the buffer mutably (dictionary/session_ignores live
+    // on `editor`, not the buffer). Empty in the common case → the filter below is skipped.
+    let union = ignore_union_lower(editor);
     if let Some(b) = editor.by_id_mut(buffer_id) {
         if b.document.version == version {
+            let mut diagnostics = diagnostics;
+            if !union.is_empty() {
+                // Apply-time ignore filter (spec §7.3): the text is this buffer at `version`, so the
+                // stored byte ranges slice the right surface words.
+                let text = b.document.buffer.to_string();
+                retain_over_union(&mut diagnostics, &text, &union);
+            }
             b.diagnostics.diagnostics = diagnostics;
             b.diagnostics.computed_version = version;
         }
@@ -226,5 +282,117 @@ mod tests {
 
         // Clean up after test
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    // ------------------------------------------------------------------
+    // Effort A: dispatch_diagnostics over the DiagnosticsProvider seam.
+    // ------------------------------------------------------------------
+    use crate::editor::{Editor, RenderMode};
+    use crate::diag_provider::{RecordingProvider, Availability, Accepted, INSTALL_HINT};
+
+    fn review_editor(text: &str) -> Editor {
+        let mut e = Editor::new_from_text(text, None, (80, 24));
+        e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = RenderMode::Review;
+        e
+    }
+
+    #[test]
+    fn dispatch_latches_in_flight_only_on_accepted_yes() {
+        let mut e = review_editor("teh\n");
+        let rec = RecordingProvider::new(); // Ready, accepts
+        let calls = rec.calls_handle();
+        e.diag_provider = Box::new(rec);
+        let v = e.active().document.version;
+        e.active_mut().diagnostics.arm(0, 400);
+        dispatch_diagnostics(&mut e);
+        assert_eq!(e.active().diagnostics.in_flight_version, Some(v), "accepted → latch set");
+        assert_eq!(e.active().diagnostics.recheck_due_at, None, "armed deadline consumed");
+        let log = calls.lock().unwrap();
+        assert!(log.iter().any(|c| matches!(c, crate::diag_provider::ProviderCall::EnsureRunning)));
+        assert!(log.iter().any(|c| matches!(c,
+            crate::diag_provider::ProviderCall::NotifyChange { version, .. } if *version == v)));
+    }
+
+    #[test]
+    fn dispatch_no_latch_and_hint_on_accepted_no() {
+        let mut e = review_editor("teh\n");
+        e.diag_provider = Box::new(RecordingProvider::new()
+            .with_accepted(Accepted::No).with_availability(Availability::Ready));
+        dispatch_diagnostics(&mut e);
+        assert_eq!(e.active().diagnostics.in_flight_version, None, "Accepted::No must not latch");
+        assert!(e.diag_hint_shown, "the degrade hint latch is set");
+        assert_eq!(e.status, INSTALL_HINT);
+    }
+
+    #[test]
+    fn dispatch_over_cap_sets_status_and_never_touches_provider() {
+        let big = "x".repeat((crate::limits::DIAG_MAX_SEND_BYTES as usize) + 1);
+        let mut e = review_editor(&big);
+        let rec = RecordingProvider::new();
+        let calls = rec.calls_handle();
+        e.diag_provider = Box::new(rec);
+        dispatch_diagnostics(&mut e);
+        assert_eq!(e.status, "document too large for grammar checking");
+        assert_eq!(e.active().diagnostics.in_flight_version, None, "over-cap: no latch");
+        assert!(calls.lock().unwrap().is_empty(), "over-cap short-circuits before the provider");
+    }
+
+    #[test]
+    fn dispatch_unavailable_shows_hint_once() {
+        let mut e = review_editor("teh\n");
+        e.diag_provider = Box::new(RecordingProvider::new()
+            .with_availability(Availability::Unavailable));
+        dispatch_diagnostics(&mut e);
+        assert_eq!(e.status, INSTALL_HINT);
+        assert!(e.diag_hint_shown);
+        // Second dispatch: hint already shown → status is not re-set (informative, not naggy).
+        e.status = String::new();
+        e.active_mut().diagnostics.arm(0, 400);
+        dispatch_diagnostics(&mut e);
+        assert_eq!(e.status, "", "hint shows at most once per Review entry");
+        assert_eq!(e.active().diagnostics.in_flight_version, None);
+    }
+
+    #[test]
+    fn dispatch_starting_shows_no_silent_wait_status_and_latches() {
+        let mut e = review_editor("teh\n");
+        e.diag_provider = Box::new(RecordingProvider::new()
+            .with_availability(Availability::Starting)); // still accepts (queued post-handshake)
+        let v = e.active().document.version;
+        dispatch_diagnostics(&mut e);
+        assert_eq!(e.status, "starting grammar checker…");
+        assert_eq!(e.active().diagnostics.in_flight_version, Some(v), "Starting still accepts + latches");
+    }
+
+    fn spelling(range: std::ops::Range<usize>) -> Diagnostic {
+        Diagnostic { range, kind: DiagnosticKind::Spelling, message: "x".into(), suggestions: vec![] }
+    }
+    fn grammar(range: std::ops::Range<usize>) -> Diagnostic {
+        Diagnostic { range, kind: DiagnosticKind::Grammar, message: "x".into(), suggestions: vec![] }
+    }
+
+    #[test]
+    fn apply_filters_ignored_spelling_over_the_union_keeps_grammar() {
+        let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        let id = e.active().id;
+        let v = e.active().document.version;
+        e.dictionary.insert("TEH".into()); // case-insensitive union membership
+        // "teh" (0..3) is a spelling hit → dropped; the grammar diagnostic on "cat" (4..7) stays.
+        apply_diagnostics_done(&mut e, id, v, vec![spelling(0..3), grammar(4..7)]);
+        let kept = &e.active().diagnostics.diagnostics;
+        assert_eq!(kept.len(), 1, "spelling 'teh' filtered by dictionary; grammar retained");
+        assert_eq!(kept[0].kind, DiagnosticKind::Grammar);
+    }
+
+    #[test]
+    fn retain_unignored_refilters_the_active_store_in_place() {
+        let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        e.active_mut().diagnostics.diagnostics = vec![spelling(0..3), grammar(4..7)];
+        e.session_ignores.insert("teh".into());
+        retain_unignored(&mut e);
+        let kept = &e.active().diagnostics.diagnostics;
+        assert_eq!(kept.len(), 1, "the newly-ignored spelling word is dropped in place");
+        assert_eq!(kept[0].kind, DiagnosticKind::Grammar);
     }
 }

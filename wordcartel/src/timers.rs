@@ -182,11 +182,7 @@ pub(crate) fn on_tick(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock,
     if crate::diagnostics_run::should_run_diagnostics(editor)
         && crate::diagnostics_run::diag_due(&editor.active().diagnostics, now, version)
     {
-        let ignore_words = std::sync::Arc::new(
-            editor.dictionary.iter().chain(editor.session_ignores.iter()).cloned().collect::<std::collections::HashSet<String>>()
-        );
-        let diag_cfg = editor.diag_cfg.clone();
-        crate::diagnostics_run::dispatch_diagnostics(editor, &diag_cfg, ignore_words, msg_tx.clone());
+        crate::diagnostics_run::dispatch_diagnostics(editor);
     }
     // Dispatch a block-tree reconcile if due.
     if crate::reconcile::reconcile_due(&editor.active().reconcile, now) {

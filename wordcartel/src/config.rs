@@ -67,6 +67,11 @@ pub struct DiagnosticsConfig {
     pub enabled: bool,
     pub grammar: bool,
     pub debounce_ms: u64,
+    /// Personal dictionary path — one word per line. Dual role (Effort A): the client-side
+    /// suppression seed (loaded into `editor.dictionary` at startup and unioned into the ignore
+    /// filter so a user's saved words are never re-flagged) AND harper-ls's `userDictPath` (the
+    /// SAME file, same format). `append_word_to_dict` is the sole writer; harper is nudged to
+    /// re-read it, never to append. `None` → harper falls back to its own default path.
     pub dictionary: Option<std::path::PathBuf>,
     pub linters: Option<Vec<String>>,
 }
