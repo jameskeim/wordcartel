@@ -3,7 +3,7 @@
 
 # Backlog
 
-**21 open · 43 shipped · 1 dropped**
+**23 open · 43 shipped · 1 dropped**
 
 Blocking Effort P: **0**
 
@@ -21,6 +21,8 @@ Blocking Effort P: **0**
 | S1 | Rearrangeable outline / heading-subtree corkboard | needs-design | feature | M |  | Structure mode: atomic heading-subtree move via submit_transaction; drag-reorder. |
 | S2 | Directory-as-binder | needs-design | feature | L |  | Directory of .md as a manuscript: ordered manifest + compile step (post-Effort-P plugin). |
 | P | Effort P — in-process Lua plugin system (1.0 capstone) | needs-design | feature | XL |  | The plugin/automation spine; registers into the command/hook/job seams. See docs/design/effort-p-plugin-system-design-space.md. |
+| A15 | About command/menu item that shows the splash | triage | feature | TBD |  | About command/menu item that shows the splash |
+| A16 | Format menu: drop redundant Transform entry | triage | feature | TBD |  | Format menu: drop redundant Transform entry |
 | B7 | Selected menu-item text too light | needs-design | bug | TBD |  | Possible E5 regression; selected item may need a distinct legible highlight fg. |
 | B8 | Configurable terminal caret shape / colour | needs-design | feature | TBD |  | Emit DECSCUSR (block/beam/underline, blink, colour); restore on exit/panic. |
 | B9 | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) | triage | feature | TBD |  | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) |

@@ -405,3 +405,39 @@ the dropdown's `list_window` approach) or a right-edge overflow affordance. Anch
 `chrome_geom::menu_bar_layout_cats`, `menu::intercept` (keyboard cycle), the dropdown `list_window`
 (vertical-windowing precedent), the tiny-terminal guard.
 
+
+### A15 — About command/menu item that shows the splash
+<!-- item: A15 -->
+
+An `about`/`show_splash` command (registered into the command surface, reachable from the
+palette and a menu row — Documents? a new Help category?) that re-displays the E6 splash on
+demand. Reuses the existing splash render; the net-new work is the command + its dismissal path.
+
+**Open design question — modal vs. current dismiss-on-input splash.** The startup splash today is
+a *transient* screen dismissed by any keypress (it yields to the editor the moment you type). An
+on-demand About is a different context: the user asked to see it, so it should stay until
+explicitly closed (Esc/Enter), and it should not swallow the first keystroke into an edit. That
+points at a **modal overlay** (like the palette/menu/diag overlays — an intercept in `reduce`,
+painted over the canvas, Esc-to-close) rather than reusing the startup full-screen-until-input
+path. Decide whether: (a) About is a distinct modal reusing only the splash *content* renderer;
+(b) the startup splash itself becomes modal and About just re-invokes it; or (c) keep them separate
+behaviours. Leaning (a) — startup wants dismiss-on-type (don't make writers press a key to start);
+About wants dismiss-on-Esc. Same art, two dismissal policies.
+
+*(Captured 2026-07-11 via `scripts/backlog add`.)*
+
+### A16 — Format menu: drop redundant Transform entry
+<!-- item: A16 -->
+
+**Observation (user):** the `Format` menu carries a `Transform` entry that is redundant — the menu
+already exposes the underlying options list, so `Transform` duplicates a door that's already there.
+Drop the `Transform` menu row.
+
+**To ground when picked up:** confirm what the `Transform` menu row actually invokes (the
+transform-scope cycle — Reflow/Unwrap/Ventilate, C2 — vs. a submenu) and which options rows it
+overlaps with on `Format`, so removal drops only the duplicate affordance and not a unique path.
+Command-surface note: this is a **menu curation** change (law 4, menu ⊆ palette) — remove the
+`menu: Some(Format)` tag from that command, not the command itself; it stays palette-reachable.
+No behaviour or keybinding change. Pairs with the A3b curation lens.
+
+*(Captured 2026-07-11 via `scripts/backlog add`.)*
