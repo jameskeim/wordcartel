@@ -22,6 +22,58 @@ buffer/window manipulation), `vim.fn` (Vimscript functions), `vim.cmd` (Ex comma
 with synchronous Rust↔Lua calls and lets you inject a custom `package.searchers` entry (the lazy-require
 mechanism, identical technique). Nothing here is blocked by Rust.
 
+## Reference model 2 — how Fresh does it (the sandboxed-JS cousin)
+Fresh (`github.com/sinelaw/fresh`) is a mature Rust/ratatui terminal editor that made the OPPOSITE
+runtime choice: plugins are **sandboxed TypeScript in a QuickJS VM (`rquickjs`) on a dedicated OS
+thread**, talking to the editor only by async message-passing. Read at source 2026-07-11. It is the
+empirical counter-model to Neovim's (and our) in-process approach — most of its design traits are
+downstream of that one boundary, which is exactly why it's instructive.
+
+**What the thread boundary buys Fresh — and why we don't inherit it (fork 3).** Because plugin code
+runs off the edit thread, a slow or infinite-looping plugin *cannot* stall typing; Fresh exploits this
+fully and ships with **zero execution bounds** (no timeout, no gas, no interrupt — "a plugin can
+infinite-loop," `docs/internal/plugins.md`). **Our in-process Lua inverts this risk:** a slow Lua hook
+on the edit thread WOULD freeze typing, so we cannot copy their no-bounds posture — we need either
+job-substrate dispatch or a real preemption budget (an `mlua` debug-hook instruction count). Fresh
+confirms the risk is real by structurally avoiding it the *other* way.
+
+**The cost the boundary imposes — the trap NOT to copy (fork 4 + the module-structure GATE).** Because
+plugin→host calls must be serializable across the thread, every capability is a wire-enum variant:
+Fresh has a **~205-variant `PluginCommand` enum funneled through one `handle_plugin_command` match** — a
+textbook dispatch-attractor god-object. In-process Lua avoids this for free: a Lua plugin calls a
+registered Rust host fn directly (`mlua`), so a new capability is a **new entry in a `name → fn`
+registration table**, not a new enum arm. *Explicit warning:* do NOT model our plugin→host calls as a
+`PluginCommand`-style enum "for safety" — that recreates Fresh's god-hub and fails our own
+anti-regrowth GATE.
+
+**Transferable regardless of runtime (steal list):**
+- **The "Provider law"** — the plugin supplies *data*; the host owns UI, layout, navigation, focus,
+  hit-testing. Fresh's own retro: plugins that drew their own UI reimplemented navigation and produced
+  keybinding/i18n bugs. Adopt the *law* (not necessarily their heavyweight virtual-DOM widget runtime).
+  Reinforces fork 4 and the command-surface stance.
+- **Generated typed API from the Rust impl** — a macro derives the plugin-facing contract from the
+  single Rust source so it can't drift. For us: generate LuaLS `---@meta` annotations from the `wc.*`
+  API definition the same way (authors get completion; the contract can't drift). Ties to fork 4 +
+  command-surface "single source of truth."
+- **Per-plugin side-effect tracking → compensating teardown on unload** — Fresh records every overlay/
+  decoration/resource a plugin created so unload reverses it exactly. The no-leak discipline our
+  "free at rest" / no-data-loss invariants want (forks 6–7).
+- **A level-triggered feedback-loop bug worth pre-empting** — a plugin re-publishing an unchanged
+  status every render frame created a render→hook→ack→render loop at ~13 Hz; Fresh fixed it by
+  classifying outputs visual/non-visual and suppressing no-op re-publishes. Validates our
+  edge-triggered-not-level-triggered rule; pre-empt directly if hooks fire on render/idle (forks 3, 7).
+
+**Crash-isolation caution (fork 6).** Fresh catches JS exceptions, but a **Rust panic in a plugin FFI
+callback re-panics onto the main thread and kills the editor.** Our M4 `catch_unwind` reuse must wrap
+every host callback invoked *from* Lua, not just the plugin's own body — a plugin-triggered *host* bug
+must not take down the word processor.
+
+**Distribution data point (deferred non-goal).** Fresh ships plugins as git repos with a `pkg.ts`
+package-manager *plugin* + an install-time code-review confirmation dialog — a reference for our
+deferred distribution story, not adopted now.
+
+---
+
 ## The load-bearing decision: adopt the mechanics, NOT "raw access to internals"
 Neovim's `vim.api` hands Lua **first-class synchronous access to internal memory structures**. WordCartel
 **cannot and should not** inherit that part — for two reinforcing reasons:
@@ -105,6 +157,10 @@ mirroring the swap SSD-wear guardrails.
 - Language bindings beyond Lua.
 
 ## References
+- **Reference model 2 — Fresh (`github.com/sinelaw/fresh`)**: the sandboxed-QuickJS/TypeScript cousin,
+  read at source 2026-07-11. See the "Reference model 2" section above (runtime fork, the anti-god-hub
+  lesson, the Provider law, crash-isolation caution). Companion messaging findings folded into backlog
+  item A17 (`docs/ux-backlog.md`); windowing findings into S1.
 - `docs/design/command-surface-contract.md` (the registry = plugin spine).
 - `docs/engineering-health.md` H2 (dependency weight — the VM adds to it).
 - `CLAUDE.md` — Resource-behavior invariant; instant-typing / no-data-loss priorities; hardening

@@ -181,6 +181,23 @@ command. Feasible now — the machinery exists.
 4. **Edge cases:** content before the first heading; headings-inside-code-fences; a doc with no
    headings (degrade gracefully to "no cards").
 
+**Prior art — Fresh (`sinelaw/fresh`) windowing, read at source 2026-07-11.** Two findings bear
+directly on the structure/card view:
+- **Render into a `&mut Buffer`, not a `Frame`.** Fresh's split renderer paints into an arbitrary
+  ratatui `Buffer`, decoupled from the live terminal draw — which is what makes offscreen previews
+  (their "phantom leaf") cheap. Adopting this seam gives corkboard **card thumbnails** and golden
+  render tests for free.
+- **Content-agnostic leaf, not a typed pane / new `RenderMode` variant.** Fresh holds any buffer in a
+  leaf and reads a small `virtual_mode()` flag at paint time; singleton panels route through one
+  tagged "dock" leaf (`SplitRole::UtilityDock`), never a new node type. Lesson: model structure mode /
+  a card grid as **a buffer with a mode**, not a new `RenderMode` variant + render arm — keeps the
+  dispatcher closed to editing (our Module-structure GATE).
+
+Cross-cutting render lessons from the same read live elsewhere, not here: the **`Scene` derive-once
+view-model** (menu/palette/status projected once off the registry, hit-geometry from render caches)
+belongs to the command-surface-contract lineage; the **two-tier visible-window caching** (FIFO
+byte-budget line-wrap + prefix-sum row index) is an R-theme latency reference.
+
 ### S2. Directory-as-binder (project/manuscript over many files)
 <!-- item: S2 -->
 
@@ -472,3 +489,99 @@ high hygiene value before Effort P. Anchor: `wordcartel/src/filter.rs`
 (`run_filter_non_zero_exit_carries_stderr` + the sync subprocess engine it exercises).
 
 *(Captured 2026-07-11 from the v0.4.0 release gate.)*
+
+### A17 — Messaging / notification system — routed, browsable, plugin-emittable
+<!-- item: A17 -->
+
+Design a **first-class messaging/notification system**: a single routed path every user-facing
+message flows through, with structured *kinds*, a browsable history, and a plugin-facing emit API —
+so that Effort-P plugins (and the host itself) talk to the user through one well-designed surface
+instead of ad-hoc status-line pokes. **This is load-bearing for a more customizable interface**: when
+messaging is a real system rather than a single status string, users can configure *how* messages
+reach them (where each kind routes, transient vs. sticky, quiet vs. loud, history retention), and
+plugin authors get a contract to build against. Wants to be **really well thought out** — it defines
+the interaction texture of the plugin era.
+
+**Motivating example — Neovim's `noice.nvim` (the anti-pattern to learn from, NOT to copy).** Noice
+is beloved because Neovim's core messaging is weak: blocking `hit-enter` prompts, messages that scroll
+off and vanish, the cmdline doing triple duty, no routing by kind/source, no good history. Noice can
+only fix that by **intercepting the `ext_messages` UI event stream and re-rendering everything over the
+top** — it *overrides* the native path because *participating* in it isn't possible. The lesson is
+**properties vs. mechanism**:
+- The **properties** noice delivers — messages structured and routed by kind/severity/source,
+  non-blocking, a browsable history, plugin-addressable — are exactly what a plugin-era editor wants.
+- The **mechanism** (a plugin monkey-patching over the host's message path) is precisely the
+  anti-pattern our architecture exists to prevent. In our world a plugin **registers a
+  sink/renderer into a messaging seam** (Open–Closed, same story as timers/commands/diagnostics
+  providers) and **emits** into the routed system — it never rips out and replaces the host path.
+  Noice exists *because* core messaging was under-designed; designing ours right means no
+  "noice-for-wcartel" ever needs to exist.
+
+**Where we already stand (ahead of pre-noice Neovim on the worst sins):** "no silent UI waits" already
+forbids blocking hit-enter prompts by charter, and typed errors already route to the **status line**
+(no console — the app owns the terminal). What we almost certainly *lack* is the structured layer:
+message *kinds*/severity, transient-vs-sticky lifetime, a `:messages`-style **history**, and above all
+a **plugin-facing emit API**. This is a peer surface to the status line / palette / menu (hence Theme
+A) and is governed by the same "one source of truth, surfaces derive from it" spirit as the
+command-surface contract.
+
+**Questions to resolve when picked up (Effort-P design input — decide *with* P, or just ahead of it):**
+- **Kinds/severity** — info / warn / error / progress, and how each routes (status line vs. transient
+  toast vs. sticky vs. history-only). Exhaustive enum, not stringly-typed.
+- **Lifetime** — transient vs. sticky; who clears each, and how clearing stays edge-triggered (no
+  wall-clock timers on the idle path — cf. the swap-thrash class).
+- **History** — a browsable message log (`view_messages` command?) so a flashed-and-vanished message is
+  recoverable. Neovim's single biggest day-to-day loss.
+- **Plugin contract** — plugins *emit* (and optionally *register a renderer* into the overlay seam);
+  they never override the host path. Rate/spam containment so a chatty plugin can't drown the surface.
+- **User customization** — the payoff: per-kind routing/verbosity/retention as user-settable options,
+  which per the command-surface contract means each is a command with one shared setter.
+- **Command-surface conformance** — any surfaces/toggles this adds (history view, per-kind routing)
+  must be palette-exhaustive commands with hint-tracking; state this in the eventual spec AND plan.
+
+**Anchors (map when picked up):** the status-line render path, the typed-error → status-line surfacing
+(`SaveError`/`OpenError`/`EditError`), the overlay seam (menu/palette/prompt render), and the Effort-P
+design-space doc (`docs/design/effort-p-plugin-system-design-space.md`) — this belongs in P's surface.
+
+**Prior art — Fresh (`sinelaw/fresh`), read at source 2026-07-11.** A mature Rust/ratatui editor
+whose messaging is instructive precisely because it is *fragmented* into three disjoint subsystems —
+a single status string, a "warning-domain" indicator system, and two tracing-backed log files — with
+**no unified message type**. That fragmentation is itself the lesson: A17 should define the ONE
+`Message { severity, kind, text, lifetime: Transient|Sticky, source: Host|Plugin(id), actions }` that
+Fresh never unified, consumed by the status line, the history log, and any panel.
+
+*Worth stealing:*
+- **`tracing` target as the history spine.** Every user message emits `tracing::info!(target:"status",
+  …)`; a `Layer` tees it to a file opened as a read-only buffer. That yields the browsable history
+  (a `view_messages`) essentially for free, cleanly split (functional-core emit / shell layer).
+- **The warning-domain trait.** A `WarningLevel` + a `WarningDomain` trait (`label`/`level`/
+  `popup_content` carrying *typed actions* — `ViewLog`/`Dismiss`/`CopyToClipboard`/`Custom`) + a
+  registry that aggregates N sources to one indicator via `highest_level()`. A clean *sticky-with-
+  actions* tier distinct from transient flashes; `Custom(String)` is a ready plugin seam; their LSP
+  domain even synthesizes install-command hints (a diagnostic that offers a *fix*, not just a
+  complaint).
+- **Zero wall-clock display timers** (their accidental win). Messages clear edge-triggered (next
+  write / explicit dismiss). Preserve this deliberately: any transient tier must clear edge-triggered
+  (next input / after N frames), never an idle clock — keeps us clear of the swap-thrash bug class.
+
+*Anti-patterns to avoid (each sharpens A17's thesis):*
+- Plugin `setStatus` **silently overrides** the host status line (a `plugin_status_message` field that
+  shadows the core one) — the exact override-anti-pattern A17 exists to forbid. Fix: route plugin
+  emits into the SAME queue with a `source: Plugin(id)` tag and let *our* policy decide precedence —
+  never a shadowing field.
+- **String-sniffing for plugin errors** (a `"js error"` substring match) — use a typed severity on
+  the emit API instead.
+- **No rate-limit on the plugin emit path** — a looping plugin repaints the status line every frame.
+  Put the throttle/dedup on *emit*, not just the history file (Fresh only dedups the log).
+- **Severity-less `setStatus(string)`** — bake `severity` and `sticky` into the emit API signature
+  from day one; retrofitting is *why* Fresh's warnings and status are two disjoint systems.
+- They pushed the aggregated diagnostics **list** down into a plugin; their own eval rates it 3/10
+  with three criticals, all at the host/plugin mode-composition seam. Keep any first-class browsable
+  list in core with a real focus/keymap contract.
+
+*Gap we can beat:* both Fresh logs truncate per-session and grow **unbounded within a session** — give
+our history a bounded in-memory ring (M5 resource-cap ethos) + optional file spill.
+
+*(Captured 2026-07-11 from a noice.nvim discussion; prior-art subsection added the same day from a
+source read of Fresh. Triage — not yet scoped or sized; explicitly flagged by the user as needing to
+be really well thought out because it shapes the customizable plugin-era interface.)*
