@@ -271,3 +271,75 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
     // fall through to the normal handlers below.
     crate::app::Handled::Pass(msg)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editor::{Editor, RenderMode};
+    use crate::test_support::TestClock;
+    use wordcartel_core::diagnostics::{Diagnostic, DiagnosticKind, Suggestion};
+
+    /// Opens a fresh single-suggestion `DiagOverlay` on `e`, selected on the "ignore once"
+    /// row (`ignore == true`) or the "add to dictionary" row (`ignore == false`) — neither
+    /// row edits the document, so `document.version` never moves.
+    fn open_diag_selected(e: &mut Editor, ignore: bool) {
+        let v = e.active().document.version;
+        let id = e.active().id;
+        let d = Diagnostic { range: 0..3, kind: DiagnosticKind::Spelling, message: "x".into(),
+            suggestions: vec![Suggestion::ReplaceWith("the".into())] };
+        let mut ov = crate::diag_overlay::DiagOverlay::new(d, id, v);
+        ov.selected = if ignore { ov.anchor.suggestions.len() } else { ov.anchor.suggestions.len() + 1 };
+        e.diag = Some(ov);
+    }
+
+    /// Class-B non-edit re-arm, 1/2 (E7 T6 spec §7.2) — "ignore once" applies via
+    /// `diag_apply_selected`'s own inline re-arm (search_ui.rs, gated by
+    /// `should_run_diagnostics`, since it does NOT bump `document.version` and so the T3
+    /// `arm_if_edited` seam's version-diff check would never see it). Confirms the T2 gate
+    /// still arms in Review and stays inert outside it.
+    #[test]
+    fn diag_apply_selected_ignore_arms_only_in_review() {
+        let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = RenderMode::Review;
+        open_diag_selected(&mut e, true);
+        let v_before = e.active().document.version;
+        e.active_mut().diagnostics.recheck_due_at = None;
+        diag_apply_selected(&mut e, &TestClock(1_000));
+        assert_eq!(e.active().document.version, v_before, "ignore does not edit the document");
+        assert!(e.diag.is_none(), "overlay closes regardless of outcome");
+        assert_eq!(e.active().diagnostics.recheck_due_at, Some(1_000 + e.diag_cfg.debounce_ms),
+            "ignore re-arms in Review despite no version change");
+
+        e.active_mut().view.mode = RenderMode::LivePreview;
+        open_diag_selected(&mut e, true);
+        e.active_mut().diagnostics.recheck_due_at = None;
+        diag_apply_selected(&mut e, &TestClock(2_000));
+        assert_eq!(e.active().diagnostics.recheck_due_at, None, "ignore outside Review must not arm");
+    }
+
+    /// Class-B non-edit re-arm, 2/2 — "add to dictionary" mirrors the ignore branch. The
+    /// dictionary path is cleared so the test never touches the real filesystem; the re-arm
+    /// runs unconditionally after the Ok/Err/no-path status update.
+    #[test]
+    fn diag_apply_selected_add_dict_arms_only_in_review() {
+        let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        e.diag_cfg.enabled = true;
+        e.diag_cfg.dictionary = None;
+        e.active_mut().view.mode = RenderMode::Review;
+        open_diag_selected(&mut e, false);
+        let v_before = e.active().document.version;
+        e.active_mut().diagnostics.recheck_due_at = None;
+        diag_apply_selected(&mut e, &TestClock(3_000));
+        assert_eq!(e.active().document.version, v_before, "add-to-dict does not edit the document");
+        assert!(e.diag.is_none(), "overlay closes regardless of outcome");
+        assert_eq!(e.active().diagnostics.recheck_due_at, Some(3_000 + e.diag_cfg.debounce_ms),
+            "add-to-dict re-arms in Review despite no version change");
+
+        e.active_mut().view.mode = RenderMode::LivePreview;
+        open_diag_selected(&mut e, false);
+        e.active_mut().diagnostics.recheck_due_at = None;
+        diag_apply_selected(&mut e, &TestClock(4_000));
+        assert_eq!(e.active().diagnostics.recheck_due_at, None, "add-to-dict outside Review must not arm");
+    }
+}
