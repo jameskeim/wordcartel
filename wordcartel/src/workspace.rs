@@ -181,6 +181,10 @@ pub(crate) fn close_buffer_now(editor: &mut Editor, id: BufferId) {
         editor.status = "buffer already closed".into();
         return;
     };
+    // Effort A: tell the provider to abandon this doc's generation before the slot is removed or
+    // replaced (all three shapes below) so the server never keeps a closed doc open until shutdown.
+    // The last-ordinary replacement's fresh buffer re-opens lazily under its own new id/generation.
+    editor.diag_provider.notify_close(id);
     let ordinary = editor.buffers.iter().filter(|b| !editor.is_scratch(b.id)).count();
     if ordinary <= 1 {
         // Last ordinary buffer: replace id's own slot with a fresh empty untitled.
@@ -590,5 +594,55 @@ mod tests {
         close_buffer_now(&mut e, phantom);
         assert_eq!(e.status, "buffer already closed");
         assert_eq!(e.buffers.len(), 2, "buffer count unchanged");
+    }
+
+    /// Effort A: `notify_close(id)` fires for the closed buffer in ALL THREE close shapes —
+    /// last-ordinary replacement, active removal, and inactive removal — so the server never keeps
+    /// a closed doc open until shutdown. A vanished-id no-op sends nothing.
+    #[test]
+    fn close_buffer_now_notifies_provider_in_all_three_shapes() {
+        use crate::diag_provider::{RecordingProvider, ProviderCall};
+        // Helper: build a 3-ordinary editor, install a fresh recorder, return (editor, call handle).
+        let install = |e: &mut Editor| {
+            let rec = RecordingProvider::new();
+            let calls = rec.calls_handle();
+            e.diag_provider = Box::new(rec);
+            calls
+        };
+        let closed = |calls: &std::sync::Arc<std::sync::Mutex<Vec<ProviderCall>>>, id: crate::editor::BufferId| {
+            calls.lock().unwrap().iter().any(|c| matches!(c, ProviderCall::NotifyClose(x) if *x == id))
+        };
+
+        // (1) last-ordinary replacement: one ordinary buffer (+ scratch) → replace branch.
+        let mut e = Editor::new_from_text("only\n", Some(std::path::PathBuf::from("/tmp/a.md")), (40, 10));
+        e.install_scratch();
+        let only_id = e.buffers[0].id;
+        let calls = install(&mut e);
+        close_buffer_now(&mut e, only_id);
+        assert!(closed(&calls, only_id), "replace-last-ordinary notifies close for the old id");
+
+        // (2) active removal: two ordinary buffers, close the active one → active-remove branch.
+        let mut e = Editor::new_from_text("a\n", None, (40, 10));
+        let a_id = e.buffers[0].id;
+        let b_id = e.alloc_id();
+        let area = e.active().view.area;
+        e.buffers.push(crate::editor::Buffer::from_text(b_id, "b\n", None, area));
+        e.mru.push(b_id);
+        let calls = install(&mut e);
+        assert_eq!(e.active().id, a_id, "precondition: a active");
+        close_buffer_now(&mut e, a_id);
+        assert!(closed(&calls, a_id), "active removal notifies close");
+
+        // (3) inactive removal: three ordinary buffers, close a non-active one → inactive branch.
+        let mut e = Editor::new_from_text("a\n", None, (40, 10));
+        let c_id = e.alloc_id();
+        let d_id = e.alloc_id();
+        let area = e.active().view.area;
+        e.buffers.push(crate::editor::Buffer::from_text(c_id, "c\n", None, area));
+        e.buffers.push(crate::editor::Buffer::from_text(d_id, "d\n", None, area));
+        e.mru.push(c_id); e.mru.push(d_id);
+        let calls = install(&mut e);
+        close_buffer_now(&mut e, d_id); // d is inactive (active is a, index 0)
+        assert!(closed(&calls, d_id), "inactive removal notifies close");
     }
 }

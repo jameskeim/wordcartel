@@ -15,11 +15,17 @@ pub(crate) fn status_left_text(editor: &Editor) -> String {
     let count = editor.buffers.len();
     let name = crate::workspace::buffer_display_name(editor, editor.active().id);
     let head = format!("[{idx}/{count}] {name}");
-    let mode_text = match editor.active().view.mode {
-        crate::editor::RenderMode::LivePreview => "PREVIEW",
-        crate::editor::RenderMode::SourceHighlighted => "SRC-HI",
-        crate::editor::RenderMode::SourcePlain => "SOURCE",
-        crate::editor::RenderMode::Review => "REVIEW",
+    // Effort A: the Review label gains provider attribution (`REVIEW · Harper`) only when the
+    // provider is *live* (Ready) — Idle/Starting/Unavailable all show plain `REVIEW`, so the label
+    // asserts a working checker (spec §10). One mutex read, behind the Review arm only.
+    let mode_text: std::borrow::Cow<'static, str> = match editor.active().view.mode {
+        crate::editor::RenderMode::LivePreview => "PREVIEW".into(),
+        crate::editor::RenderMode::SourceHighlighted => "SRC-HI".into(),
+        crate::editor::RenderMode::SourcePlain => "SOURCE".into(),
+        crate::editor::RenderMode::Review =>
+            if editor.diag_provider.availability() == crate::diag_provider::Availability::Ready {
+                format!("REVIEW · {}", editor.diag_provider.name()).into()
+            } else { "REVIEW".into() },
     };
     let mut text = if editor.status.is_empty() {
         format!("{head} [{mode_text}]")
@@ -130,6 +136,25 @@ mod tests {
     fn status_line_shows_review_label() {
         let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
         e.active_mut().view.mode = crate::editor::RenderMode::Review;
+        // Default NullProvider is Idle (not Ready) → plain [REVIEW], no attribution.
         assert!(crate::render_status::status_left_text(&e).contains("[REVIEW]"), "review mode labels [REVIEW]");
+    }
+
+    /// Effort A §10: a *live* provider attributes the Review label with its name; a non-Ready
+    /// provider shows plain REVIEW.
+    #[test]
+    fn status_line_attributes_review_only_when_provider_ready() {
+        use crate::diag_provider::{RecordingProvider, Availability};
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        e.active_mut().view.mode = crate::editor::RenderMode::Review;
+        e.diag_provider = Box::new(RecordingProvider::new().with_availability(Availability::Ready));
+        // RecordingProvider::name() is "recording"; the mechanism prints `REVIEW · <name>`.
+        assert!(crate::render_status::status_left_text(&e).contains("[REVIEW · recording]"),
+            "Ready → attribution");
+        e.diag_provider = Box::new(RecordingProvider::new().with_availability(Availability::Starting));
+        assert!(crate::render_status::status_left_text(&e).contains("[REVIEW]"),
+            "Starting → plain REVIEW");
+        assert!(!crate::render_status::status_left_text(&e).contains("·"),
+            "no attribution dot when not Ready");
     }
 }

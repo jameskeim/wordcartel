@@ -438,6 +438,11 @@ pub struct Editor {
     pub session_ignores: std::collections::HashSet<String>,
     /// Quick-fix overlay state. XOR with prompt/minibuffer/palette/menu/search.
     pub diag: Option<crate::diag_overlay::DiagOverlay>,
+    /// Active diagnostics provider (Effort A). NullProvider by default → hermetic construction;
+    /// run() installs HarperLs once the msg channel exists.
+    pub diag_provider: Box<dyn crate::diag_provider::DiagnosticsProvider>,
+    /// One install-hint per deliberate Review entry (reset in set_render_mode). Spec §9.
+    pub diag_hint_shown: bool,
     /// Outline picker overlay state. XOR with prompt/minibuffer/palette/menu/search/diag.
     pub outline: Option<crate::outline_overlay::OutlineOverlay>,
     /// Theme picker overlay state. XOR with all other overlays.
@@ -535,6 +540,8 @@ impl Editor {
             dictionary: std::collections::HashSet::new(),
             session_ignores: std::collections::HashSet::new(),
             diag: None,
+            diag_provider: Box::new(crate::diag_provider::NullProvider),
+            diag_hint_shown: false,
             outline: None,
             theme_picker: None,
             file_browser: None,
@@ -909,6 +916,9 @@ impl Editor {
         self.active_mut().view.mode = mode;
         crate::derive::rebuild(self);
         crate::nav::ensure_visible(self);
+        if mode == RenderMode::Review {
+            self.diag_hint_shown = false;
+        }
         if crate::diagnostics_run::should_run_diagnostics(self) {
             self.active_mut().diagnostics.arm(now_ms, 0);
         }

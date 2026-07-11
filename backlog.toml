@@ -579,13 +579,15 @@ shipped_date = "2026-07-09"
 [[item]]
 id = "H2"
 title = "Interrogate the burn/harper dependency weight"
-status = "needs-design"
+status = "shipped"
 kind = "research"
 size = "TBD"
 theme = "H"
 hook = "672-crate lockfile pulls a tensor stack transitively for grammar; keep/feature-gate/lighter backend?"
-doc = "engineering-health.md#h2"
+doc = "backlog-archive.md#h2"
 created = "2026-07-07"
+shipped_commit = "ce403ac"
+shipped_date = "2026-07-11"
 
 [[item]]
 id = "H3"
@@ -778,13 +780,15 @@ created = "2026-07-10"
 [[item]]
 id = "H18"
 title = "Supply-chain audit (cargo audit / cargo deny)"
-status = "needs-design"
+status = "shipped"
 kind = "chore"
 size = "S"
 theme = "H"
 hook = "Add CVE + license + duplicate/ban scanning (cargo audit and/or cargo deny config); pairs with H2's pre-P dependency pass. No config today."
-doc = "engineering-health.md#h18"
+doc = "backlog-archive.md#h18"
 created = "2026-07-10"
+shipped_commit = "ce403ac"
+shipped_date = "2026-07-11"
 
 # ─────────────────────────── Theme M — hardening campaign (remaining) ───────────────────────────
 

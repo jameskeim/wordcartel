@@ -162,6 +162,13 @@ tmux-less machine (`smoke: SKIP — …`) is quoted the same way. Promotion to a
 is an edit to this paragraph, contingent on the stability record accumulating in the
 gitignored `scripts/smoke/.history`.
 
+**`cargo deny check` — RELEASE-CHECKLIST step, NOT a merge GATE.** Supply-chain scan (CVE
+advisories, license policy, duplicate-version drift, registry sources) config'd in `deny.toml`
+(workspace root; H18). Run it before cutting a release and record the result (clean, or the
+advisory/license findings) in the release notes — a red result never blocks a merge. Promotion to
+a GATE is a separate, deliberate edit to this paragraph (mirrors the PTY-smoke-suite pattern
+above).
+
 **Formatting — do NOT run `cargo fmt`.** This repo is hand-formatted in a deliberate dense
 style and has **no `rustfmt.toml`**; `cargo fmt` reformats the whole tree to rustfmt
 defaults (1000+ hunks), destroying the intentional style and blame. `cargo fmt --check` is

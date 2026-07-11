@@ -26,6 +26,7 @@ optdepends=(
   'xclip: xclip external clipboard provider (fallback chain)'
   'pandoc-cli: markdown export to html/docx/pdf (shells out to pandoc)'
   'texlive-xetex: PDF export via pandoc --pdf-engine=xelatex'
+  'harper: grammar/spelling diagnostics in Review mode (harper-ls language server)'
 )
 provides=('wcartel')
 # The release-dist profile already strips the binary; skip makepkg's strip/debug stages.
