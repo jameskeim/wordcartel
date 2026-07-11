@@ -139,7 +139,7 @@ impl Registry {
         r.register("undo",  "Undo",  Some(MenuCategory::Edit), |c| run(c, Command::Undo));
         r.register("redo",  "Redo",  Some(MenuCategory::Edit), |c| run(c, Command::Redo));
         r.register("filter", "Filter…", Some(MenuCategory::Edit), |c| {
-            c.editor.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter);
+            c.editor.open_minibuffer("sh> ", crate::minibuffer::MinibufferKind::Filter);
             CommandResult::Handled
         });
         r.register("find", "Find…", Some(MenuCategory::Edit), |c| {
