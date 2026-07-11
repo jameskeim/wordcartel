@@ -1,5 +1,5 @@
 #!/bin/sh
-# run.sh — wordcartel PTY smoke suite. Runs S1–S8 against the real debug
+# run.sh — wordcartel PTY smoke suite. Runs S1–S9 against the real debug
 # binary in a private per-run tmux server. ADVISORY layer: running it is a
 # mandatory pre-merge step, but a red result never blocks a merge (see
 # CLAUDE.md). Rerun-safe; never touches the user's tmux sockets or the real
@@ -58,9 +58,9 @@ if [ ! -x "$WCARTEL_BIN" ]; then
     exit 1
 fi
 
-# --- run S1–S8 sequentially; per-check PASS/FAIL lines.
+# --- run S1–S9 sequentially; per-check PASS/FAIL lines.
 pass=0; fail=0; first_fail=""
-for check in "$SMOKE_DIR"/checks/s[1-8]-*.sh; do
+for check in "$SMOKE_DIR"/checks/s[1-9]-*.sh; do
     short=$(basename -- "$check")
     short=${short%%-*}
     if sh "$check" >"$RUN_DIR/$short.log" 2>&1; then

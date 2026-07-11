@@ -196,6 +196,13 @@ impl Registry {
             CommandResult::Handled
         });
         r.register("quit", "Quit", Some(MenuCategory::File), |c| run(c, Command::Quit));
+        // H5: clear provably-valueless recovery litter. Opens a count-confirm modal over a
+        // snapshotted set (safe by construction — see prompts::open_clean_recovery). Trailing …
+        // marks the prompt-opening command (cf. save_as); palette + File menu by registration.
+        r.register("clean_recovery", "Clean Recovery Files\u{2026}", Some(MenuCategory::File), |c| {
+            crate::prompts::open_clean_recovery(c.editor);
+            CommandResult::Handled
+        });
 
         // View menu — render mode: set-per-state primitives (palette-only) + stateful cycle
         // representative, mirroring scrollbar_off/auto/on + cycle_scrollbar (contract law 6 / rule 8).

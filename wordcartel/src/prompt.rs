@@ -30,6 +30,9 @@ pub enum PromptAction {
     CloseSave { id: crate::editor::BufferId },
     /// C4 close-buffer: close the target without saving (the swap survives).
     CloseDiscard { id: crate::editor::BufferId },
+    /// H5 clean-recovery: delete the `editor.pending_clean` snapshot built when the prompt was
+    /// raised (never a re-scan — the snapshot is the TOCTOU-safe unit of deletion).
+    CleanRecovery,
 }
 
 #[derive(Clone, Debug)]
@@ -150,6 +153,18 @@ impl Prompt {
             choices: vec![
                 Choice { key: 'o', label: "Overwrite", action: PromptAction::OverwriteExport },
                 Choice { key: 'c', label: "Cancel",    action: PromptAction::Cancel },
+            ],
+        }
+    }
+
+    /// H5 clean-recovery count-confirm, raised by the `clean_recovery` command over a
+    /// snapshotted set of provably-valueless recovery files (`n` = the snapshot's length).
+    pub fn clean_recovery(n: usize) -> Prompt {
+        Prompt {
+            message: format!("Delete {n} recovery file(s)? [Y]es · [C]ancel"),
+            choices: vec![
+                Choice { key: 'y', label: "Delete", action: PromptAction::CleanRecovery },
+                Choice { key: 'c', label: "Cancel", action: PromptAction::Cancel },
             ],
         }
     }

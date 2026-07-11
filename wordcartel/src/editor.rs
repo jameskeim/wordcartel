@@ -167,6 +167,16 @@ pub struct Buffer {
     // 9a: persistent marked block (half-open [start,end)) + a deferred begin anchor.
     pub marked_block: Option<MarkedBlock>,
     pub pending_block_begin: Option<usize>,
+    /// Set by `Buffer::apply` when the commit evicted undo history
+    /// (`document.history.last_evicted` consumed at the buffer boundary, M8). Per-buffer so a
+    /// buffer-level merge (filter/transform result) landing on a NON-active buffer is never
+    /// silently dropped — it surfaces the moment the user switches to this buffer. Cleared by
+    /// whichever surface point shows the hint (`Editor::surface_undo_eviction` for the still-active
+    /// buffer after reduce, or `Editor::switch_to_index` for a buffer becoming active).
+    /// `pub(crate)` rather than fully private only so the wholesale-replace struct-update sites
+    /// in `save.rs` (`Buffer { id, ..new_buf }`, reload/recovery) keep compiling — external
+    /// (outside-crate) callers still have no access, matching the private-field house style.
+    pub(crate) undo_evicted_pending: usize,
 }
 
 impl Buffer {
@@ -223,6 +233,7 @@ impl Buffer {
             layout_key: None,
             marked_block: None,
             pending_block_begin: None,
+            undo_evicted_pending: 0,
         }
     }
 
@@ -242,6 +253,13 @@ impl Buffer {
         let old_rope = self.document.buffer.snapshot();
         let before = self.document.selection.clone();
         self.document.selection = self.document.history.commit_coalescing(txn, &mut self.document.buffer, before, clock, kind);
+        // M8: capture an eviction at the buffer boundary — ANY commit through this single
+        // mutation channel (active-buffer keystroke OR a by_id_mut buffer-level merge) is
+        // covered, so no eviction on a non-active buffer goes silent.
+        if self.document.history.last_evicted > 0 {
+            self.undo_evicted_pending = self.document.history.last_evicted;
+            self.document.history.last_evicted = 0;
+        }
         self.document.version += 1;
         self.pre_edit_rope = Some(old_rope);
         self.last_edit = Some(edit);
@@ -388,6 +406,11 @@ pub struct Editor {
     pub pending_save_overwrite: Option<PathBuf>,
     /// The target awaiting an OverwriteWriteBlock confirmation (^KW existing file). (9A Task 4)
     pub pending_write_block: Option<PathBuf>,
+    /// H5 clean-recovery: the EXACT set of provably-valueless recovery files snapshotted when
+    /// the `clean_recovery` prompt was raised. The confirm deletes THIS snapshot — never a
+    /// re-scan — so a file appearing after the prompt opened can never be swept (TOCTOU-safe).
+    /// Cleared on confirm (consumed), Cancel, and Esc.
+    pub pending_clean: Vec<PathBuf>,
     pub filter_in_flight: Option<crate::filter::CancelFlag>,
     pub transform_in_flight: bool,
     pub minibuffer: Option<crate::minibuffer::Minibuffer>,
@@ -499,7 +522,11 @@ pub struct Editor {
     pub theme_identity: crate::settings::ThemeIdentity,
 }
 
-const UNDO_EVICTED_HINT: &str = "Undo history full — oldest dropped";
+/// M8: the single undo-eviction hint, surfaced both after a reduce that evicted on the
+/// active buffer and on switching into a buffer with a pending eviction from an earlier
+/// buffer-level merge. Deliberately worded as a clear notice — trimming undo depth is more
+/// consequential than a routine status line — not unified-away as a passing keystroke blip.
+const UNDO_EVICTED_HINT: &str = "Undo history trimmed to fit — some earlier states dropped";
 
 impl Editor {
     pub fn new_from_text(text: &str, path: Option<PathBuf>, area: (u16, u16)) -> Editor {
@@ -513,7 +540,7 @@ impl Editor {
             buffers: Vec::new(), active: 0, next_buffer_id: 0,
             register: Register::default(), status: String::new(), parse_degraded: false, quit: false,
             prompt: None, pending_after_save: None, pending_save_as: None, pending_save_overwrite: None,
-            pending_write_block: None,
+            pending_write_block: None, pending_clean: Vec::new(),
             filter_in_flight: None, transform_in_flight: false, minibuffer: None, pending_export: None,
             pending_mark: None,
             clipboard_sync_request: None, clipboard_get_pending: None, clipboard_notice_shown: false,
@@ -644,6 +671,11 @@ impl Editor {
         self.active = idx;
         let id = self.buffers[idx].id;
         self.touch_mru(id);
+        // M8: the single switch chokepoint — `workspace::switch_to` and
+        // `workspace::open_as_new_buffer` (which calls this directly, bypassing switch_to)
+        // both funnel here, so a non-active buffer-level merge's eviction surfaces the
+        // moment the user lands on that buffer instead of staying silent.
+        self.surface_undo_eviction();
     }
 
     /// Open the minibuffer with the given prompt string.
@@ -827,19 +859,16 @@ impl Editor {
         crate::nav::ensure_visible(self);
     }
 
-    /// Surface the undo-eviction hint iff an edit landed on the STILL-active buffer
-    /// this reduce AND it evicted. Consumes `last_evicted` (resets to 0) so a later
-    /// undo/redo/switch — which change `version` without a fresh eviction — do not
-    /// replay the stale hint. Called once per reduce from the run loop.
-    pub fn note_undo_eviction(&mut self, pre_id: BufferId, pre_version: u64) {
-        let fire = {
-            let b = self.active();
-            b.id == pre_id && b.document.version != pre_version
-                && b.document.history.last_evicted > 0
-        };
-        if fire {
+    /// Surface the undo-eviction hint for the ACTIVE buffer iff `Buffer::apply` (keystroke
+    /// edit OR a buffer-level merge targeting the active buffer) armed its
+    /// `undo_evicted_pending` flag this reduce. Consumes the flag (resets to 0) so undo/redo
+    /// — which reset `last_evicted` and never arm the flag — never replay a stale hint, and a
+    /// shown hint fires exactly once. Called once per reduce from the run loop (M8; replaces
+    /// the former active-only `note_undo_eviction(pre_id, pre_version)`).
+    pub fn surface_undo_eviction(&mut self) {
+        if self.active().undo_evicted_pending > 0 {
+            self.active_mut().undo_evicted_pending = 0;
             self.status = UNDO_EVICTED_HINT.to_string();
-            self.active_mut().document.history.last_evicted = 0;
         }
     }
 
@@ -1418,7 +1447,7 @@ mod tests {
     // ── Task 2 (M5): eviction hint wiring ─────────────────────────────────────
 
     /// Guard: `Editor::apply` is a pure delegator — the eviction hint now lives in
-    /// `note_undo_eviction` (wired once per reduce in the run loop). A tiny edit that
+    /// `surface_undo_eviction` (wired once per reduce in the run loop). A tiny edit that
     /// does not evict must leave `status` unchanged regardless of which path set it.
     #[test]
     fn apply_does_not_set_hint_when_no_eviction() {
@@ -1435,35 +1464,117 @@ mod tests {
         );
     }
 
-    #[test]
-    fn note_undo_eviction_fires_once_on_active_edit_with_eviction() {
-        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
-        let id = e.active().id;
-        let v = e.active().document.version;
-        e.active_mut().document.version += 1;              // simulate an edit
-        e.active_mut().document.history.last_evicted = 1;  // that evicted
-        e.note_undo_eviction(id, v);
-        assert_eq!(e.status, UNDO_EVICTED_HINT);
-        assert_eq!(e.active().document.history.last_evicted, 0, "consumed");
-        // A later version bump (e.g. undo) must NOT replay the stale hint:
-        e.status.clear();
-        let v2 = e.active().document.version;
-        e.active_mut().document.version += 1;
-        e.note_undo_eviction(id, v2);
-        assert_ne!(e.status, UNDO_EVICTED_HINT, "no re-fire after reset");
+    /// Force a REAL eviction on buffer `id`, cheaply: commit two tiny `Other`-kind edits
+    /// (so they never coalesce — two real revisions), then inflate `history.bytes` far past
+    /// `MAX_UNDO_BYTES` and commit a third. `History::evict_to`'s `revisions.len() > 1` stop
+    /// condition then evicts exactly the two oldest (down to 1) regardless of the artificial
+    /// byte total, giving a genuine `last_evicted > 0` through the real `Buffer::apply` →
+    /// `commit_coalescing` → `evict_to` path without pushing actual megabytes of text.
+    fn force_real_eviction(e: &mut Editor, id: BufferId, clk: &TestClock) {
+        use wordcartel_core::change::ChangeSet;
+        for ch in ["a", "b", "c"] {
+            let b = e.by_id_mut(id).expect("buffer exists");
+            if ch == "c" {
+                b.document.history.bytes = wordcartel_core::history::MAX_UNDO_BYTES + 1;
+            }
+            let at = b.document.buffer.len();
+            let cs = ChangeSet::insert(at, ch, at);
+            b.apply(Transaction::new(cs), Edit { range: at..at, new_len: 1 }, EditKind::Other, clk);
+        }
     }
 
     #[test]
-    fn note_undo_eviction_ignores_no_edit_and_switch() {
+    fn surface_undo_eviction_fires_once_on_active_keystroke_eviction() {
+        let clk = TestClock(std::cell::Cell::new(0));
         let mut e = Editor::new_from_text("hello\n", None, (80, 24));
         let id = e.active().id;
-        let v = e.active().document.version;
-        e.active_mut().document.history.last_evicted = 1;
-        e.note_undo_eviction(id, v);                       // version unchanged → no edit
-        assert_ne!(e.status, UNDO_EVICTED_HINT, "no edit → no hint");
-        e.active_mut().document.version += 1;
-        e.note_undo_eviction(BufferId(id.0.wrapping_add(999)), v); // id mismatch → switch
-        assert_ne!(e.status, UNDO_EVICTED_HINT, "id mismatch (switch) → no hint");
+        force_real_eviction(&mut e, id, &clk);
+        assert!(e.active().undo_evicted_pending > 0, "precondition: a real eviction landed");
+        e.surface_undo_eviction();
+        assert_eq!(e.status, UNDO_EVICTED_HINT);
+        assert_eq!(e.active().undo_evicted_pending, 0, "consumed");
+        // No re-fire without a fresh arm:
+        e.status.clear();
+        e.surface_undo_eviction();
+        assert_ne!(e.status, UNDO_EVICTED_HINT, "no re-fire after consumption");
+    }
+
+    #[test]
+    fn surface_undo_eviction_no_pending_is_silent() {
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        e.surface_undo_eviction();
+        assert_ne!(e.status, UNDO_EVICTED_HINT, "no pending eviction → no hint");
+    }
+
+    /// A buffer-level merge (filter/transform result applied via `by_id_mut(buffer_id).apply`,
+    /// as `jobs_apply::apply_filter_done` / `transform::merge_transform_into` do) landing on a
+    /// NON-active buffer must not be silently dropped: it arms that buffer's pending flag and
+    /// surfaces the moment the user switches onto it (`Editor::switch_to_index`).
+    #[test]
+    fn non_active_buffer_merge_eviction_surfaces_on_switch() {
+        let clk = TestClock(std::cell::Cell::new(0));
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        let active_id = e.active().id;
+        let other_id = e.alloc_id();
+        e.buffers.push(Buffer::from_text(other_id, "world\n", None, (80, 24)));
+        let other_idx = e.buffers.iter().position(|b| b.id == other_id).unwrap();
+        // The active buffer stays untouched — the merge targets the OTHER (non-active) buffer.
+        force_real_eviction(&mut e, other_id, &clk);
+        assert_eq!(e.active().id, active_id, "still on the original buffer");
+        e.surface_undo_eviction(); // post-reduce surface — must be silent, wrong buffer
+        assert_ne!(e.status, UNDO_EVICTED_HINT, "non-active eviction must not surface yet");
+        e.switch_to_index(other_idx);
+        assert_eq!(e.status, UNDO_EVICTED_HINT, "switching onto the evicted buffer surfaces it");
+        assert_eq!(e.active().undo_evicted_pending, 0, "consumed on switch");
+    }
+
+    /// A buffer-level merge landing on the buffer that IS already active surfaces via the
+    /// ordinary post-reduce path — no special-casing needed, since `undo_evicted_pending` is
+    /// keyed per-buffer and `by_id_mut(active_id)` is the same buffer `active()` reads.
+    #[test]
+    fn active_buffer_merge_eviction_surfaces_via_reduce() {
+        let clk = TestClock(std::cell::Cell::new(0));
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        let active_id = e.active().id;
+        force_real_eviction(&mut e, active_id, &clk); // merge targets the active buffer by id
+        e.surface_undo_eviction();
+        assert_eq!(e.status, UNDO_EVICTED_HINT, "active-buffer merge eviction surfaces at once");
+    }
+
+    /// A merge (or keystroke) that does NOT evict must stay silent.
+    #[test]
+    fn no_eviction_merge_is_silent() {
+        use wordcartel_core::change::ChangeSet;
+        let clk = TestClock(std::cell::Cell::new(0));
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        let id = e.active().id;
+        let b = e.by_id_mut(id).unwrap();
+        let at = b.document.buffer.len();
+        let cs = ChangeSet::insert(at, "x", at);
+        b.apply(Transaction::new(cs), Edit { range: at..at, new_len: 1 }, EditKind::Other, &clk);
+        assert_eq!(e.active().undo_evicted_pending, 0, "no eviction → flag stays clear");
+        e.surface_undo_eviction();
+        assert_ne!(e.status, UNDO_EVICTED_HINT, "no eviction → no hint");
+    }
+
+    /// `undo`/`redo` never arm the pending flag — they don't commit (`Buffer::undo`/`redo`
+    /// never touch `undo_evicted_pending`, only `Buffer::apply` does).
+    #[test]
+    fn undo_redo_never_arm_pending_eviction() {
+        let clk = TestClock(std::cell::Cell::new(0));
+        let mut e = Editor::new_from_text("hello\n", None, (80, 24));
+        let id = e.active().id;
+        force_real_eviction(&mut e, id, &clk);
+        assert!(e.active().undo_evicted_pending > 0, "precondition: eviction landed");
+        e.surface_undo_eviction(); // consume it before exercising undo/redo
+        assert_eq!(e.active().undo_evicted_pending, 0);
+        e.undo();
+        assert_eq!(e.active().undo_evicted_pending, 0, "undo must not arm the flag");
+        e.redo();
+        assert_eq!(e.active().undo_evicted_pending, 0, "redo must not arm the flag");
+        e.status.clear();
+        e.surface_undo_eviction();
+        assert_ne!(e.status, UNDO_EVICTED_HINT, "undo/redo alone must never surface the hint");
     }
 
     #[test]
