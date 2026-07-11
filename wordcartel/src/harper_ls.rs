@@ -90,7 +90,7 @@ struct AwaitPublish { our_version: u64, generation: u64, deadline: u64 }
 /// Converted diagnostics parked while a batched codeAction is in flight (or its watchdog).
 struct Assembly { our_version: u64, generation: u64, diags: Vec<Diagnostic>, deadline: u64 }
 /// What an outstanding JSON-RPC request id means when its response lands.
-enum PendingKind { Initialize, Shutdown, CodeAction { buffer_id: BufferId, generation: u64 } }
+enum PendingKind { Initialize, Shutdown, CodeAction { buffer_id: BufferId, generation: u64, our_version: u64 } }
 
 /// The pure protocol state machine (spec §3.3). No IO — feed it `Inbound` + `now_ms`, execute the
 /// returned `Vec<Action>`. Exhaustively unit-testable (see the inline tests).
@@ -319,8 +319,8 @@ impl HarperState {
             Some(PendingKind::Initialize) => self.on_initialized(now),
             Some(PendingKind::Shutdown) =>
                 vec![Action::Send(json!({"jsonrpc":"2.0","method":"exit"})), Action::Exit],
-            Some(PendingKind::CodeAction { buffer_id, generation }) =>
-                self.on_codeaction_response(buffer_id, generation, &v),
+            Some(PendingKind::CodeAction { buffer_id, generation, our_version }) =>
+                self.on_codeaction_response(buffer_id, generation, our_version, &v),
             None => Vec::new(),
         }
     }
@@ -331,6 +331,12 @@ impl HarperState {
         let mut out = vec![
             Action::Send(json!({"jsonrpc":"2.0","method":"initialized","params":{}})),
             self.didchangeconfiguration_push(),
+            // Handshake complete → the provider is LIVE (spec §10). This is the sole production
+            // Ready transition: it lets `render_status` attribute `REVIEW · Harper` and stops the
+            // debounced-recheck path stamping a permanent "starting grammar checker…". The SAME
+            // path runs after a crash+respawn's re-initialize, so Ready is RESTORED post-respawn
+            // (clearing the transient Starting stamped by `on_server_gone`).
+            Action::SetAvailability(Availability::Ready),
         ];
         self.phase = Phase::Running;
         for c in std::mem::take(&mut self.queued) { out.extend(self.apply_cmd(c, now)); }
@@ -373,7 +379,8 @@ impl HarperState {
                 diagnostics: converted })], // no envelope → emit converted suggestionless
         };
         let id = self.alloc_id();
-        self.pending_requests.insert(id, PendingKind::CodeAction { buffer_id, generation });
+        self.pending_requests.insert(id, PendingKind::CodeAction { buffer_id, generation,
+            our_version: tagged });
         self.assembling.insert(buffer_id, Assembly { our_version: tagged, generation,
             diags: converted, deadline: now + CODEACTION_TIMEOUT_MS });
         vec![Action::Send(codeaction_request(id, &uri, start, end, &raw))]
@@ -382,9 +389,18 @@ impl HarperState {
     /// A codeAction RESPONSE. Remove the assembly FIRST (terminal-guarantee), attach suggestions to
     /// the parked diagnostics, and emit. A superseded generation is discarded (never emitted against
     /// newer text) — an empty terminal still clears the latch.
-    fn on_codeaction_response(&mut self, buffer_id: BufferId, generation: u64, v: &Value)
-        -> Vec<Action> {
-        let assembly = match self.assembling.remove(&buffer_id) { Some(a) => a, None => return Vec::new() };
+    fn on_codeaction_response(&mut self, buffer_id: BufferId, generation: u64, our_version: u64,
+        v: &Value) -> Vec<Action> {
+        // Stale-response guard: consume the parked assembly ONLY when BOTH its generation AND its
+        // our_version match this response's request. A request that stalled past its watchdog (v1)
+        // could otherwise consume a NEWER assembly (v2, re-parked by a later publish under the same
+        // generation) and attach v1-computed edits. On mismatch, DISCARD this response and leave the
+        // assembly untouched — it still terminates via its own response or watchdog (no wedged latch).
+        match self.assembling.get(&buffer_id) {
+            Some(a) if a.our_version == our_version && a.generation == generation => {}
+            _ => return Vec::new(),
+        }
+        let assembly = self.assembling.remove(&buffer_id).expect("assembly present — matched just above");
         let live = self.docs.get(&buffer_id)
             .map(|d| d.open && d.generation == generation && assembly.generation == generation)
             .unwrap_or(false);
@@ -877,6 +893,29 @@ mod tests {
         assert_eq!(methods, ["initialized", "workspace/didChangeConfiguration", "textDocument/didOpen"]);
     }
 
+    #[test]
+    fn on_initialized_emits_ready_on_handshake_and_restores_it_after_respawn() {
+        let mut st = HarperState::new(cfg(true));
+        let spawn = st.on_spawned(0);
+        let id = sends(&spawn)[0]["id"].as_u64().unwrap();
+        // Handshake completion is the SOLE production Ready transition (spec §10) — without it the
+        // REVIEW·Harper attribution never fires and every recheck falsely stamps "starting…".
+        let out = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0","id":id,"result":{}})), 0);
+        assert!(availabilities(&out).contains(&Availability::Ready),
+            "handshake completion emits SetAvailability(Ready)");
+        // A crash flips to the transient Starting; the respawn re-handshake runs the SAME
+        // on_initialized path and RESTORES Ready.
+        st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 1, path: None,
+            text: "a".into() }), 0);
+        let gone = st.on_inbound(Inbound::ServerEof, 0);
+        assert_eq!(availabilities(&gone), vec![Availability::Starting], "crash → transient Starting");
+        let respawn = st.on_spawned(0);
+        let rid = sends(&respawn)[0]["id"].as_u64().unwrap();
+        let reinit = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0","id":rid,"result":{}})), 0);
+        assert!(availabilities(&reinit).contains(&Availability::Ready),
+            "post-respawn re-handshake restores Ready");
+    }
+
     // ── config PULL responder (unwrapped) ───────────────────────────────────────────────────────
 
     #[test]
@@ -1067,6 +1106,42 @@ mod tests {
         for (_, _, diags) in diag_dones(&out) {
             assert!(diags.is_empty(), "superseded assembly must not paint against new text");
         }
+    }
+
+    #[test]
+    fn stale_codeaction_response_does_not_consume_the_newer_assembly() {
+        let mut st = running(true);
+        // v1: publish parks assembly #1 (our_version=1) and issues codeAction id1.
+        st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 1, path: None,
+            text: "teh".into() }), 0);
+        let id1 = publish_teh(&mut st, BufferId(0), "untitled:wcartel-0-1");
+        // codeAction #1 stalls past its watchdog: assembly #1 emits v1 suggestionless and is removed,
+        // but its pending request survives — a late response can still route to on_codeaction_response.
+        let w = st.on_deadline(CODEACTION_TIMEOUT_MS);
+        assert_eq!(diag_dones(&w)[0].1, 1, "watchdog terminated v1 suggestionless");
+        // v2 edit + publish parks a BRAND-NEW assembly #2 (same generation, our_version=2), id2.
+        st.on_inbound(Inbound::Cmd(Cmd::Change { buffer_id: BufferId(0), version: 2, path: None,
+            text: "teh".into() }), CODEACTION_TIMEOUT_MS);
+        let id2 = publish_teh(&mut st, BufferId(0), "untitled:wcartel-0-1");
+        assert_ne!(id1, id2);
+        // The LATE response to request #1 lands now: its our_version (1) ≠ the parked assembly's (2),
+        // so it must be DISCARDED — no emit, and assembly #2 left intact for its own response.
+        let stale = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0","id":id1,"result":[
+            {"kind":"quickfix","edit":{"changes":{"untitled:wcartel-0-1":[
+                {"newText":"STALE","range":{"start":{"line":0,"character":0},
+                    "end":{"line":0,"character":3}}}]}}}]})), CODEACTION_TIMEOUT_MS);
+        assert!(diag_dones(&stale).is_empty(), "stale v1 response discarded — no emission");
+        assert!(st.assembling.contains_key(&BufferId(0)), "assembly #2 left intact for its own response");
+        // The real v2 response attaches its OWN fresh fix and emits for v2.
+        let fresh = st.on_inbound(Inbound::Server(json!({"jsonrpc":"2.0","id":id2,"result":[
+            {"kind":"quickfix","edit":{"changes":{"untitled:wcartel-0-1":[
+                {"newText":"the","range":{"start":{"line":0,"character":0},
+                    "end":{"line":0,"character":3}}}]}}}]})), CODEACTION_TIMEOUT_MS);
+        let done = diag_dones(&fresh);
+        assert_eq!(done.len(), 1);
+        assert_eq!((done[0].0, done[0].1), (BufferId(0), 2), "emitted for v2");
+        assert_eq!(done[0].2[0].suggestions, vec![Suggestion::ReplaceWith("the".into())],
+            "v2 assembly attached its OWN fresh edits, not the stale v1 ones");
     }
 
     // ── watchdogs ───────────────────────────────────────────────────────────────────────────────
