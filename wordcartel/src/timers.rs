@@ -117,9 +117,13 @@ fn status_dwell_deadline(e: &Editor, _now: u64) -> Option<u64> {
 /// CPU spin until the worker completes. When the result lands it clears
 /// `in_flight_version`; the next iteration re-includes the (re-armed) deadline
 /// and dispatches. The `in_flight_version.is_none()` gate is load-bearing.
+/// E7 T2: also gated on `should_run_diagnostics` (draft-quiet) — an armed-but-stale
+/// deadline left over from a buffer that has since left Review must not wake the loop
+/// (the same spin class as the in-flight gate, one call site down).
 fn diag_deadline(e: &Editor, _now: u64) -> Option<u64> {
-    if e.active().diagnostics.in_flight_version.is_none() {
-        e.active().diagnostics.recheck_due_at } else { None }
+    if crate::diagnostics_run::should_run_diagnostics(e)
+        && e.active().diagnostics.in_flight_version.is_none()
+    { e.active().diagnostics.recheck_due_at } else { None }
 }
 
 /// Block-tree reconcile deadline — same A3 shape as diagnostics: excluded while a
@@ -175,7 +179,7 @@ pub(crate) fn on_tick(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock,
     }
     // Dispatch diagnostics if due.
     let version = editor.active().document.version;
-    if editor.diag_cfg.enabled
+    if crate::diagnostics_run::should_run_diagnostics(editor)
         && crate::diagnostics_run::diag_due(&editor.active().diagnostics, now, version)
     {
         let ignore_words = std::sync::Arc::new(
@@ -250,6 +254,22 @@ mod tests {
     // Timed-subsystem guardrails (T8)
     // -----------------------------------------------------------------------
 
+    /// Draft-quiet (E7 T2): an armed diagnostics deadline must not wake the loop outside
+    /// Review — the spin-class guardrail. Without the `should_run_diagnostics` gate in
+    /// `diag_deadline`, a non-Review armed buffer would return the past-due `Some(400)`
+    /// every loop iteration, driving `recv_timeout(0)` at 100% CPU (spec §2.2 site 5 / §8.1).
+    #[test]
+    fn armed_diag_deadline_is_none_outside_review() {
+        use crate::editor::RenderMode;
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = RenderMode::LivePreview;
+        e.active_mut().diagnostics.arm(0, 400); // recheck_due_at = Some(400), in_flight None
+        assert_eq!(crate::timers::diag_deadline(&e, 10_000), None, "no wake for a non-Review armed store (no spin)");
+        e.active_mut().view.mode = RenderMode::Review;
+        assert_eq!(crate::timers::diag_deadline(&e, 10_000), Some(400), "Review: the armed deadline is live");
+    }
+
     /// Idle-is-free: a clean, settled, no-overlay editor arms no wake (§8.1-E). This is the
     /// timers-native form of app.rs's settled_editor_arms_no_deadline pin.
     #[test]
@@ -271,6 +291,11 @@ mod tests {
         let diag = || crate::timers::SUBSYSTEMS.iter().find(|s| s.name == "diagnostics").unwrap().deadline;
         let reconcile = || crate::timers::SUBSYSTEMS.iter().find(|s| s.name == "reconcile").unwrap().deadline;
         let swap = || crate::timers::SUBSYSTEMS.iter().find(|s| s.name == "swap").unwrap().deadline;
+
+        // E7 T2: diag_deadline is now also Review-gated; set Review so the un-gated
+        // (in_flight None) case below still yields Some(0) — the in-flight assertion
+        // above/below it still isolates that gate specifically.
+        e.active_mut().view.mode = crate::editor::RenderMode::Review;
 
         // --- diagnostics: past-due recheck ARMED ---
         e.active_mut().diagnostics.recheck_due_at = Some(0);

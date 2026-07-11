@@ -19,6 +19,7 @@ pub(crate) fn status_left_text(editor: &Editor) -> String {
         crate::editor::RenderMode::LivePreview => "PREVIEW",
         crate::editor::RenderMode::SourceHighlighted => "SRC-HI",
         crate::editor::RenderMode::SourcePlain => "SOURCE",
+        crate::editor::RenderMode::Review => "REVIEW",
     };
     let mut text = if editor.status.is_empty() {
         format!("{head} [{mode_text}]")
@@ -123,5 +124,12 @@ mod tests {
         crate::workspace::goto_scratch(&mut e);
         let s_scratch = crate::render_status::status_left_text(&e);
         assert!(s_scratch.contains("*scratch*"), "scratch buffer shows *scratch*: {s_scratch}");
+    }
+
+    #[test]
+    fn status_line_shows_review_label() {
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        e.active_mut().view.mode = crate::editor::RenderMode::Review;
+        assert!(crate::render_status::status_left_text(&e).contains("[REVIEW]"), "review mode labels [REVIEW]");
     }
 }

@@ -204,6 +204,11 @@ pub fn menu_select_for_test(
 }
 
 /// Process one message. Returns true while the app should keep running.
+///
+/// Snapshots `(active BufferId, document.version)` BEFORE any interceptor runs, dispatches via
+/// `reduce_dispatch`, then arms the diagnostics re-arm seam on the single exit path — this covers
+/// every `Handled::Done` early-return inside `reduce_dispatch` AND its normal tail (spec §2.2 item 1;
+/// E7 T3).
 pub fn reduce(
     msg: Msg,
     editor: &mut Editor,
@@ -230,6 +235,25 @@ pub fn reduce(
             panic!("WCARTEL_SMOKE_PANIC: deliberate smoke-test panic");
         }
     }
+    let before_id = editor.active().id;
+    let before_version = editor.active().document.version;
+    let keep = reduce_dispatch(msg, editor, reg, keymap, ex, clock, msg_tx);
+    crate::diagnostics_run::arm_if_edited(editor, before_id, before_version, clock);
+    keep
+}
+
+/// The interceptor chain + message match, extracted from `reduce` so the single `arm_if_edited`
+/// seam in `reduce` wraps every exit path (H1 dispatch-hub discipline). Behavior-identical to the
+/// pre-E7 body minus the inline diagnostics arm (now `arm_if_edited`, called from `reduce`).
+fn reduce_dispatch(
+    msg: Msg,
+    editor: &mut Editor,
+    reg: &Registry,
+    keymap: &crate::keymap::KeyTrie,
+    ex: &dyn Executor,
+    clock: &dyn Clock,
+    msg_tx: &std::sync::mpsc::Sender<Msg>,
+) -> bool {
     let msg = match crate::splash::intercept(msg, editor, ex, clock, msg_tx) {
         crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
     let msg = match crate::marks::intercept(msg, editor, ex, clock, msg_tx) {
@@ -253,7 +277,7 @@ pub fn reduce(
     let msg = match crate::outline_overlay::intercept(msg, editor, ex, clock, msg_tx) {
         crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
 
-    let before = editor.active().document.version;
+    let before = editor.active().document.version; // post-interceptor; feeds last_edit_at only
     match msg {
         Msg::Input(Event::Key(k)) if k.kind == crossterm::event::KeyEventKind::Press =>
             crate::input::handle_key(k, editor, reg, keymap, ex, clock, msg_tx),
@@ -304,11 +328,8 @@ pub fn reduce(
     }
     if editor.active().document.version != before {
         editor.active_mut().last_edit_at = Some(clock.now_ms());
-        // Arm debounce for diagnostics if enabled.
-        if editor.diag_cfg.enabled {
-            let debounce_ms = editor.diag_cfg.debounce_ms;
-            editor.active_mut().diagnostics.arm(clock.now_ms(), debounce_ms);
-        }
+        // NOTE: the old `if editor.diag_cfg.enabled { …arm… }` block is REMOVED — arm_if_edited
+        // (called from reduce, keyed on active id + version) subsumes it (E7 T3).
     }
     // Fold any other results that became ready while handling this message.
     for o in ex.drain() {
@@ -1250,6 +1271,334 @@ mod tests {
             assert!(crate::app::reduce(crate::app::Msg::Input(ev), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx));
         }
         assert_eq!(e.active().document.buffer.to_string(), "hi\n");
+    }
+
+    // -------------------------------------------------------------------------
+    // E7 T3: the unified (buffer-id, version) diagnostics re-arm seam over reduce.
+    // The seam wraps EVERY reduce_dispatch exit path (the eleven interceptor
+    // Handled::Done early-returns AND the normal match tail) — see arm_if_edited
+    // in diagnostics_run.rs, called once from reduce.
+    // -------------------------------------------------------------------------
+
+    /// An active-buffer edit in Review — driven through the normal (non-intercepted)
+    /// match tail — arms the debounced recheck exactly once.
+    #[test]
+    fn active_edit_in_review_arms_via_reduce() {
+        use crate::editor::{Editor, RenderMode};
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("hi\n", None, (80, 24));
+        e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = RenderMode::Review;
+        e.active_mut().diagnostics.recheck_due_at = None;
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(1_000);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let key = Event::Key(KeyEvent { code: KeyCode::Char('x'), modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(key), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "xhi\n");
+        assert_eq!(e.active().diagnostics.recheck_due_at, Some(1_000 + e.diag_cfg.debounce_ms),
+            "active-buffer edit in Review arms exactly once");
+    }
+
+    /// A buffer SWITCH A(v0) -> B(v1) in Review must NOT arm B's recheck — the seam is keyed
+    /// on the active id staying the SAME across the message, and a switch changes it. Driven
+    /// through the palette buffer-switcher's Handled::Done early return (the exact class of
+    /// path the pre-E7 epilogue arm bypassed).
+    #[test]
+    fn buffer_switch_in_review_does_not_arm_via_reduce() {
+        use crate::editor::{Editor, RenderMode};
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("a\n", None, (80, 24));
+        e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = RenderMode::Review;
+        let b_id = e.alloc_id();
+        let area = e.active().view.area;
+        let mut b = crate::editor::Buffer::from_text(b_id, "b\n", None, area);
+        b.view.mode = RenderMode::Review;
+        b.document.version = 1; // B already at a "newer" version than a fresh buffer's baseline
+        e.buffers.push(b);
+        e.open_buffer_switcher();
+        // Select B's row.
+        let sel = e.palette.as_ref().unwrap().rows.iter().position(|r| r.buffer == Some(b_id)).unwrap();
+        e.palette.as_mut().unwrap().selected = sel;
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(2_000);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let enter = Event::Key(KeyEvent { code: KeyCode::Enter, modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().id, b_id, "switch landed on B");
+        assert_eq!(e.active().diagnostics.recheck_due_at, None, "a buffer switch is not an edit: no arm");
+    }
+
+    /// Interceptor family 1/3 — the quick-fix suggestion overlay applies its edit via a
+    /// `diag_overlay::intercept` Handled::Done early return; the seam still arms in Review.
+    #[test]
+    fn quick_fix_apply_in_review_arms_via_reduce() {
+        use crate::editor::{Editor, RenderMode};
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = RenderMode::Review;
+        let v = e.active().document.version;
+        e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(),
+            suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] }];
+        e.active_mut().diagnostics.computed_version = v;
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(3_000);
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let mkpress = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(mkpress(KeyCode::Char('.'), KeyModifiers::CONTROL)),
+            &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert!(e.diag.is_some(), "Ctrl+. opens the quick-fix overlay");
+        e.active_mut().diagnostics.recheck_due_at = None; // opening the overlay is not an edit
+        crate::app::reduce(Msg::Input(mkpress(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.snapshot().to_string(), "the cat\n");
+        assert_eq!(e.active().diagnostics.recheck_due_at, Some(3_000 + e.diag_cfg.debounce_ms),
+            "quick-fix apply (interceptor Handled::Done path) arms via the unified seam");
+    }
+
+    /// Interceptor family 2/3 — search-replace-all applies its edit via a
+    /// `search_ui::intercept` Handled::Done early return; the seam still arms in Review.
+    /// Mirrors `replace_all_is_one_undo_unit_and_remaps_origin`'s drive sequence.
+    #[test]
+    fn search_replace_all_in_review_arms_via_reduce() {
+        use crate::editor::{Editor, RenderMode};
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("aa aa aa\n", None, (80, 24));
+        e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = RenderMode::Review;
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(4_000);
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let mkpress = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        let r = |e: &mut Editor, ev| crate::app::reduce(Msg::Input(ev), e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        r(&mut e, mkpress(KeyCode::Char('r'), KeyModifiers::CONTROL));   // open Replace
+        for c in "aa".chars() { r(&mut e, mkpress(KeyCode::Char(c), KeyModifiers::NONE)); }
+        r(&mut e, mkpress(KeyCode::Tab, KeyModifiers::NONE));            // focus Template
+        r(&mut e, mkpress(KeyCode::Char('b'), KeyModifiers::NONE));
+        e.active_mut().diagnostics.recheck_due_at = None; // building the query/template is not an edit
+        r(&mut e, mkpress(KeyCode::Char('a'), KeyModifiers::ALT));       // Alt+A = Replace All
+        assert_eq!(e.active().document.buffer.snapshot().to_string(), "b b b\n", "sanity: replace-all ran");
+        assert_eq!(e.active().diagnostics.recheck_due_at, Some(4_000 + e.diag_cfg.debounce_ms),
+            "search-replace-all (interceptor Handled::Done path) arms via the unified seam");
+    }
+
+    /// Interceptor family 3/3 — a `FilterDone` message that arrives while a prompt is open is
+    /// applied by `prompts::intercept`'s Handled::Done early return; the seam still arms in
+    /// Review (the exact "prompt-held job" class the pre-E7 epilogue arm bypassed).
+    #[test]
+    fn prompt_held_filterdone_in_review_arms_via_reduce() {
+        use crate::editor::Editor;
+        use crate::filter::{Disposition, RunResult};
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        let mut e = Editor::new_from_text("abcde\n", None, (80, 24));
+        e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = crate::editor::RenderMode::Review;
+        let id = e.active().id;
+        let v = e.active().document.version;
+        e.prompt = Some(crate::prompt::Prompt::quit_confirm());
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(5_000);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::app::reduce(Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
+            disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) },
+            &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "aXde\n", "FilterDone applied under the open prompt");
+        assert!(e.prompt.is_some(), "prompt remains open — only the background result was folded");
+        assert_eq!(e.active().diagnostics.recheck_due_at, Some(5_000 + e.diag_cfg.debounce_ms),
+            "prompt-held FilterDone (interceptor Handled::Done path) arms via the unified seam");
+    }
+
+    /// A mouse click (normal, non-intercepted match-tail path) does not itself edit the
+    /// document, so it must not arm; a subsequent edit arms exactly once — no double-arm
+    /// (mouse handling calls `hydrate_overlays` after dispatch, which must not re-trigger it).
+    #[test]
+    fn mouse_edit_in_review_arms_via_reduce_exactly_once() {
+        use crate::editor::{Editor, RenderMode};
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+            MouseEvent, MouseEventKind, MouseButton};
+        let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
+        e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = RenderMode::Review;
+        e.active_mut().diagnostics.recheck_due_at = None;
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(6_000);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        // A mouse click alone does not edit the document (it moves the cursor) — pair it with a
+        // same-message typed key is impossible via reduce (one Msg at a time), so instead drive
+        // a mouse click THEN a key press as two reduce calls and confirm each arms independently
+        // (never twice for one edit).
+        let click = Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2, row: 0, modifiers: KeyModifiers::NONE });
+        crate::app::reduce(Msg::Input(click), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().diagnostics.recheck_due_at, None, "a click alone is not an edit: no arm");
+        let key = Event::Key(KeyEvent { code: KeyCode::Char('!'), modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(key), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().diagnostics.recheck_due_at, Some(6_000 + e.diag_cfg.debounce_ms),
+            "the subsequent edit arms exactly once");
+    }
+
+    // -------------------------------------------------------------------------
+    // E7 T6: integration tests — the LivePreview counterpart of each interceptor
+    // family above (the seam's mode gate must hold on every family, not just the
+    // generic version-bump case already covered by
+    // diagnostics_run::arm_if_edited_arms_only_on_active_buffer_edit_in_review),
+    // plus the mouse click-apply single-fire path driven through the real
+    // message loop (spec §7.2).
+    // -------------------------------------------------------------------------
+
+    /// Interceptor family 1/3, LivePreview counterpart of `quick_fix_apply_in_review_arms_via_reduce`
+    /// — the overlay is opened directly (bypassing the Review-only `quick_fix` command gate, T4) so
+    /// the arm itself, not the open path, is under test: even with an overlay open outside Review
+    /// (e.g. after switching mode without closing it), the apply must not arm.
+    #[test]
+    fn quick_fix_apply_in_live_preview_does_not_arm_via_reduce() {
+        use crate::editor::{Editor, RenderMode};
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = RenderMode::LivePreview;
+        let v = e.active().document.version;
+        let id = e.active().id;
+        e.diag = Some(crate::diag_overlay::DiagOverlay::new(
+            wordcartel_core::diagnostics::Diagnostic {
+                range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                message: "x".into(),
+                suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] },
+            id, v));
+        e.active_mut().diagnostics.recheck_due_at = None;
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(3_500);
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let enter = Event::Key(KeyEvent { code: KeyCode::Enter, modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        crate::app::reduce(Msg::Input(enter), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.snapshot().to_string(), "the cat\n",
+            "sanity: the edit itself still applies outside Review");
+        assert_eq!(e.active().diagnostics.recheck_due_at, None,
+            "quick-fix apply outside Review must not arm");
+    }
+
+    /// Interceptor family 2/3, LivePreview counterpart of `search_replace_all_in_review_arms_via_reduce`.
+    #[test]
+    fn search_replace_all_in_live_preview_does_not_arm_via_reduce() {
+        use crate::editor::{Editor, RenderMode};
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut e = Editor::new_from_text("aa aa aa\n", None, (80, 24));
+        e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = RenderMode::LivePreview;
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(4_500);
+        let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
+        let mkpress = |code, m| Event::Key(KeyEvent { code, modifiers: m, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        let r = |e: &mut Editor, ev| crate::app::reduce(Msg::Input(ev), e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        r(&mut e, mkpress(KeyCode::Char('r'), KeyModifiers::CONTROL));   // open Replace
+        for c in "aa".chars() { r(&mut e, mkpress(KeyCode::Char(c), KeyModifiers::NONE)); }
+        r(&mut e, mkpress(KeyCode::Tab, KeyModifiers::NONE));            // focus Template
+        r(&mut e, mkpress(KeyCode::Char('b'), KeyModifiers::NONE));
+        e.active_mut().diagnostics.recheck_due_at = None;
+        r(&mut e, mkpress(KeyCode::Char('a'), KeyModifiers::ALT));       // Alt+A = Replace All
+        assert_eq!(e.active().document.buffer.snapshot().to_string(), "b b b\n",
+            "sanity: replace-all still ran outside Review");
+        assert_eq!(e.active().diagnostics.recheck_due_at, None,
+            "search-replace-all outside Review must not arm");
+    }
+
+    /// Interceptor family 3/3, LivePreview counterpart of `prompt_held_filterdone_in_review_arms_via_reduce`.
+    #[test]
+    fn prompt_held_filterdone_in_live_preview_does_not_arm_via_reduce() {
+        use crate::editor::Editor;
+        use crate::filter::{Disposition, RunResult};
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        let mut e = Editor::new_from_text("abcde\n", None, (80, 24));
+        e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = crate::editor::RenderMode::LivePreview;
+        let id = e.active().id;
+        let v = e.active().document.version;
+        e.prompt = Some(crate::prompt::Prompt::quit_confirm());
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(5_500);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::app::reduce(Msg::FilterDone { buffer_id: id, version: v, range: 1..3, cursor: 2,
+            disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) },
+            &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert_eq!(e.active().document.buffer.to_string(), "aXde\n",
+            "sanity: FilterDone still applies outside Review");
+        assert_eq!(e.active().diagnostics.recheck_due_at, None,
+            "prompt-held FilterDone outside Review must not arm");
+    }
+
+    /// Mouse quick-fix single-fire (spec §7.2) — a click on a diag-overlay suggestion row,
+    /// driven through the REAL message loop (`Msg::Input(Event::Mouse)` -> `reduce_dispatch`'s
+    /// match tail -> `mouse::handle` -> `diag_apply_selected`), arms exactly once from the
+    /// single `arm_if_edited` seam call in `reduce`. `recheck_due_at` is cleared immediately
+    /// before the click so a pass can only mean the ONE seam call armed it — guards against a
+    /// re-introduced per-path re-arm (e.g. an inline arm added inside the mouse click-apply
+    /// branch) that would double-arm.
+    #[test]
+    fn mouse_quick_fix_click_apply_in_review_arms_via_reduce_from_one_seam_call() {
+        use crate::editor::{Editor, RenderMode};
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Registry;
+        use crossterm::event::{Event, KeyModifiers, MouseEvent, MouseEventKind, MouseButton};
+        let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = RenderMode::Review;
+        let v = e.active().document.version;
+        let id = e.active().id;
+        e.diag = Some(crate::diag_overlay::DiagOverlay::new(
+            wordcartel_core::diagnostics::Diagnostic {
+                range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                message: "misspelled".into(),
+                suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] },
+            id, v));
+        e.active_mut().diagnostics.recheck_due_at = None; // clear immediately before the click
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
+        let clk = TestClock(7_000);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let r = crate::chrome_geom::palette_overlay_rect(area, e.diag.as_ref().unwrap().row_count());
+        let click = Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left),
+            column: r.x + 1, row: r.y + 1, modifiers: KeyModifiers::NONE });
+        crate::app::reduce(Msg::Input(click), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
+        assert!(e.diag.is_none(), "overlay closes after click-apply");
+        assert_eq!(e.active().document.buffer.to_string(), "the cat\n",
+            "sanity: the suggestion was applied via the click");
+        assert_eq!(e.active().diagnostics.recheck_due_at, Some(7_000 + e.diag_cfg.debounce_ms),
+            "click-apply arms exactly once, from the single seam call");
     }
 
     #[test]
@@ -2846,9 +3195,10 @@ mod tests {
 
     #[test]
     fn tick_dispatches_a_due_check_once() {
-        use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
+        use crate::editor::{Editor, RenderMode}; use crate::jobs::InlineExecutor; use crate::registry::Registry;
         let mut e = Editor::new_from_text("teh\n", None, (80, 24));
         e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = RenderMode::Review; // E7 T2: on_tick's dispatch is now Review-gated
         e.active_mut().diagnostics.arm(0, 400); // due at 400
         let (tx, rx) = std::sync::mpsc::channel::<Msg>();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(500); // past due
@@ -2871,6 +3221,7 @@ mod tests {
         use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        e.active_mut().view.mode = crate::editor::RenderMode::Review; // §2.5: quick_fix is Review-only
         let v = e.active().document.version;
         e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
             range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(),
@@ -2913,6 +3264,9 @@ mod tests {
         use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        // JUDGMENT CALL (T4): set Review so the §2.5 mode guard passes and the *stale valid_for*
+        // guard — the one this test exists to isolate — is what refuses the overlay.
+        e.active_mut().view.mode = crate::editor::RenderMode::Review;
         let v = e.active().document.version;
         // Store a diagnostic at version V.
         e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
@@ -2941,6 +3295,7 @@ mod tests {
         use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         let mut e = Editor::new_from_text("teh cat adn dog\n", None, (80, 24));
+        e.active_mut().view.mode = crate::editor::RenderMode::Review; // §2.5: diag_next/prev are Review-only
         let v = e.active().document.version;
         e.active_mut().diagnostics.diagnostics = vec![
             wordcartel_core::diagnostics::Diagnostic { range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message:"x".into(), suggestions: vec![] },
@@ -3011,6 +3366,7 @@ mod tests {
         use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        e.active_mut().view.mode = crate::editor::RenderMode::Review; // §2.5: quick_fix is Review-only
         let v = e.active().document.version;
         // Arm valid diagnostics at version V and open the overlay.
         e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {

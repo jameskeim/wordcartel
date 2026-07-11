@@ -542,7 +542,8 @@ fn gather_row_ctx(editor: &Editor) -> RowCtx<'_> {
     // Diagnostic overlay: check version validity once before the row loop.
     // diag_active = true iff the stored diagnostics were computed for the current
     // document version (and are non-empty). When false, diag_all is empty.
-    let diag_active = editor.active().diagnostics.valid_for(editor.active().document.version);
+    let diag_active = crate::diagnostics_run::should_show_diagnostics(editor)
+        && editor.active().diagnostics.valid_for(editor.active().document.version);
     let diag_all: &[wordcartel_core::diagnostics::Diagnostic] =
         if diag_active { &editor.active().diagnostics.diagnostics } else { &[] };
 
@@ -1286,12 +1287,13 @@ mod tests {
 
     #[test]
     fn diagnostics_underline_the_flagged_glyphs() {
-        use crate::editor::Editor;
+        use crate::editor::{Editor, RenderMode};
         let mut e = Editor::new_from_text("teh cat\n", None, (40, 6));
         let v = e.active().document.version;
         e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
             range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(), suggestions: vec![] }];
         e.active_mut().diagnostics.computed_version = v;
+        e.active_mut().view.mode = RenderMode::Review; // E7 T2: display gate requires Review
         crate::derive::rebuild(&mut e);
         let buf = render_to_buffer(&mut e, 40, 6);
         assert!(row_has_underline(&buf, 0), "the misspelled 'teh' is underlined");
@@ -1299,14 +1301,34 @@ mod tests {
 
     #[test]
     fn stale_diagnostics_are_not_painted() {
-        use crate::editor::Editor;
+        use crate::editor::{Editor, RenderMode};
         let mut e = Editor::new_from_text("teh cat\n", None, (40, 6));
         e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
             range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(), suggestions: vec![] }];
         e.active_mut().diagnostics.computed_version = 999; // != current version
+        e.active_mut().view.mode = RenderMode::Review; // isolate the version-staleness guard, not the mode gate
         crate::derive::rebuild(&mut e);
         let buf = render_to_buffer(&mut e, 40, 6);
         assert!(!row_has_underline(&buf, 0), "version-mismatched diagnostics are hidden");
+    }
+
+    /// E7 T2: the display gate hides underlines the instant the buffer leaves Review, even
+    /// with valid (version-matched) diagnostics still stored.
+    #[test]
+    fn diagnostics_paint_only_in_review() {
+        use crate::editor::{Editor, RenderMode};
+        let mut e = Editor::new_from_text("teh cat\n", None, (40, 6));
+        let v = e.active().document.version;
+        e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            message: "x".into(), suggestions: vec![] }];
+        e.active_mut().diagnostics.computed_version = v;
+        e.active_mut().view.mode = RenderMode::Review;
+        crate::derive::rebuild(&mut e);
+        assert!(row_has_underline(&render_to_buffer(&mut e, 40, 6), 0), "painted in Review");
+        e.active_mut().view.mode = RenderMode::LivePreview;
+        crate::derive::rebuild(&mut e);
+        assert!(!row_has_underline(&render_to_buffer(&mut e, 40, 6), 0), "hidden the instant we leave Review");
     }
 
     #[test]
@@ -1517,6 +1539,33 @@ mod tests {
     }
 
     #[test]
+    fn review_is_not_plain_source() {
+        use crate::editor::RenderMode;
+        let mut ed = Editor::new_from_text("# Title\n", None, (40, 6));
+        // Status line legitimately differs by mode ([REVIEW] vs [PREVIEW] — see
+        // status_line_shows_review_label); turn it off so this whole-buffer pin
+        // isolates the document-body rendering the brief actually asks about.
+        ed.status_line_mode = crate::config::TransientMode::Off;
+        // Under the default terminal-plain theme, heading has no fg (`Face::default()`),
+        // and the caret sits on the single heading line so LivePreview shows it RawPlain
+        // too — content would coincide with SourcePlain. Use tokyo_night (as the sibling
+        // heading-fg test above does) so LivePreview's role colour actually distinguishes
+        // it from SourcePlain's monochrome ladder, making the assert_ne meaningful.
+        ed.theme = wordcartel_core::theme::tokyo_night();
+        ed.active_mut().view.mode = RenderMode::Review;
+        crate::derive::rebuild(&mut ed);
+        let review = render_to_buffer(&mut ed, 40, 6);
+        ed.active_mut().view.mode = RenderMode::LivePreview;
+        crate::derive::rebuild(&mut ed);
+        let live = render_to_buffer(&mut ed, 40, 6);
+        ed.active_mut().view.mode = RenderMode::SourcePlain;
+        crate::derive::rebuild(&mut ed);
+        let plain = render_to_buffer(&mut ed, 40, 6);
+        assert_eq!(review, live,  "Review renders styled exactly like LivePreview");
+        assert_ne!(review, plain, "Review is NOT raw-plain like SourcePlain");
+    }
+
+    #[test]
     fn srchi_colors_delimiters_and_content_source_stays_plain() {
         // SH paints raw markdown with construct faces (Strong/Code/Link/Heading).
         // SP shows the same raw text monochrome at base_fg.
@@ -1648,6 +1697,7 @@ mod tests {
             assert!(row_has_highlight(&buf, 0), "Default: search highlights still present");
         }
         {
+            use crate::editor::RenderMode;
             let mut e = Editor::new_from_text("teh cat\n", None, (40, 6));
             let v = e.active().document.version;
             e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
@@ -1657,6 +1707,7 @@ mod tests {
                 suggestions: vec![],
             }];
             e.active_mut().diagnostics.computed_version = v;
+            e.active_mut().view.mode = RenderMode::Review; // E7 T2: display gate requires Review
             crate::derive::rebuild(&mut e);
             let buf = render_to_buffer(&mut e, 40, 6);
             assert!(row_has_underline(&buf, 0), "Default: diag underline still present");

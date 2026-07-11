@@ -70,7 +70,7 @@ pub enum Command {
     Undo,
     /// Redo the next revision (after an undo).
     Redo,
-    /// Rotate the render mode: LivePreview → SourceHighlighted → SourcePlain → LivePreview.
+    /// Rotate the render mode: LivePreview → Review → SourceHighlighted → SourcePlain → LivePreview.
     CycleRenderMode,
     /// Save the current document to its path (atomic write).
     Save,
@@ -353,13 +353,13 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         }
 
         Command::CycleRenderMode => {
-            editor.active_mut().view.mode = match editor.active().view.mode {
-                RenderMode::LivePreview      => RenderMode::SourceHighlighted,
+            let next = match editor.active().view.mode {
+                RenderMode::LivePreview       => RenderMode::Review,
+                RenderMode::Review            => RenderMode::SourceHighlighted,
                 RenderMode::SourceHighlighted => RenderMode::SourcePlain,
-                RenderMode::SourcePlain      => RenderMode::LivePreview,
+                RenderMode::SourcePlain       => RenderMode::LivePreview,
             };
-            derive::rebuild(editor);
-            nav::ensure_visible(editor); // a mode change can alter layout/scroll (§4.5)
+            editor.set_render_mode(next, clock.now_ms());
             CommandResult::Handled
         }
 
@@ -877,7 +877,7 @@ mod tests {
         assert_eq!(e.active().document.buffer.to_string(), "ab\n");
     }
 
-    /// CycleRenderMode rotates LivePreview → SourceHighlighted → SourcePlain → LivePreview.
+    /// CycleRenderMode rotates LivePreview → Review → SourceHighlighted → SourcePlain → LivePreview.
     #[test]
     fn cycle_render_mode_rotates_through_modes() {
         use crate::editor::RenderMode;
@@ -889,6 +889,9 @@ mod tests {
 
         let r1 = run(Command::CycleRenderMode, &mut e, &clk);
         assert_eq!(r1, CommandResult::Handled);
+        assert_eq!(e.active().view.mode, RenderMode::Review);
+
+        run(Command::CycleRenderMode, &mut e, &clk);
         assert_eq!(e.active().view.mode, RenderMode::SourceHighlighted);
 
         run(Command::CycleRenderMode, &mut e, &clk);
@@ -1003,9 +1006,10 @@ mod tests {
         let (rows_lp, _) = &e.active().view.line_layouts[&0];
         assert_eq!(rows_lp[0].display, "Title", "LivePreview inactive heading should be concealed");
 
-        // Switch to SourceHighlighted
+        // Switch to SourceHighlighted (Live → Review → SourceHighlighted; two cycles)
         let clk = TestClock(0);
-        run(Command::CycleRenderMode, &mut e, &clk);
+        run(Command::CycleRenderMode, &mut e, &clk);   // Live → Review
+        run(Command::CycleRenderMode, &mut e, &clk);   // Review → SourceHighlighted
         assert_eq!(e.active().view.mode, RenderMode::SourceHighlighted);
 
         // After CycleRenderMode, derive::rebuild is called inside the command.
