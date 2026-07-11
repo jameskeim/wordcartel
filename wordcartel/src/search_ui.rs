@@ -8,22 +8,12 @@ use crossterm::event::Event;
 pub(crate) fn search_sync(editor: &mut Editor) {
     let (rope, version) = { let d = &editor.active().document; (d.buffer.snapshot(), d.version) };
     if let Some(s) = editor.search.as_mut() { s.recompute(&rope, version); }
-    if let Some(m) = editor.search.as_ref().and_then(|s| s.current()) {
-        crate::registry::unfold_ancestors_of(editor, m.start);
-        editor.active_mut().document.selection = wordcartel_core::selection::Selection::range(m.start, m.end);
-        derive::rebuild(editor);
-        crate::nav::ensure_visible(editor);
-    }
+    search_pin(editor);
 }
 
 pub(crate) fn search_step(editor: &mut Editor, forward: bool) {
     if let Some(s) = editor.search.as_mut() { if forward { s.next(); } else { s.prev(); } }
-    if let Some(m) = editor.search.as_ref().and_then(|s| s.current()) {
-        crate::registry::unfold_ancestors_of(editor, m.start);
-        editor.active_mut().document.selection = wordcartel_core::selection::Selection::range(m.start, m.end);
-        derive::rebuild(editor);
-        crate::nav::ensure_visible(editor);
-    }
+    search_pin(editor);
 }
 
 pub(crate) fn search_cancel(editor: &mut Editor) {
@@ -122,7 +112,13 @@ pub(crate) fn search_step_rest(editor: &mut Editor, clock: &dyn wordcartel_core:
     derive::rebuild(editor); crate::nav::ensure_visible(editor);
 }
 
-fn search_pin(editor: &mut Editor) {
+/// Unfold + select + rebuild + ensure-visible for `editor.search`'s CURRENT match.
+/// The shared placement tail (spec §5.2 step 3) — every path that pins the caret
+/// on the current match (keyboard step/sync, mouse match-click) goes through this
+/// ONE function so painter-visible state (selection, folds, viewport) never drifts
+/// between callers. Does NOT recompute the cache — callers that need a fresh cache
+/// call `SearchState::recompute` (or `search_sync`, which wraps both) first.
+pub(crate) fn search_pin(editor: &mut Editor) {
     if let Some(m) = editor.search.as_ref().and_then(|s| s.current()) {
         crate::registry::unfold_ancestors_of(editor, m.start);
         editor.active_mut().document.selection = wordcartel_core::selection::Selection::range(m.start, m.end);

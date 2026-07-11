@@ -232,6 +232,54 @@ pub(crate) fn minibuffer_click_byte(area: Rect, mb: &crate::minibuffer::Minibuff
     Some(byte)
 }
 
+/// Column width of the label rendered BEFORE `field`'s text on the search status
+/// row: `"Find: "` for the needle field, `"Find: {needle}  Replace: "` for the
+/// template field. SINGLE SOURCE for `render.rs::place_cursor` (painter) and
+/// `search_field_click` (hit-test below) — they must never drift.
+pub(crate) fn search_field_prefix_cols(s: &crate::search_overlay::SearchState, field: crate::search_overlay::Field) -> usize {
+    match field {
+        crate::search_overlay::Field::Needle => "Find: ".chars().count(),
+        crate::search_overlay::Field::Template => format!("Find: {}  Replace: ", s.needle).chars().count(),
+    }
+}
+
+/// Map a search-bar click `(col, row)` to `(Field, byte_cursor)`, or `None` when
+/// the click misses the status row or lands outside both fields' rendered text
+/// (the label gaps, or the trailing mode/case/count/wrapped suffix — consumed as
+/// a no-op by the caller). The template field is only a valid hit target when
+/// `s.phase` is `Replace`/`Stepping` (it isn't rendered in `Phase::Find` —
+/// mirrors `render_status::format_search_bar`). Byte cursor is char-count-mapped
+/// (multibyte-safe, mirrors `minibuffer_click_byte`) and end-clamped: a click at
+/// or past the last char of a field lands on `field.len()`.
+pub(crate) fn search_field_click(area: Rect, s: &crate::search_overlay::SearchState, col: u16, row: u16)
+    -> Option<(crate::search_overlay::Field, usize)>
+{
+    use crate::search_overlay::{Field, Phase};
+    if row != area.y + area.height.saturating_sub(1) {
+        return None;
+    }
+    let click_col = (col.checked_sub(area.x)?) as usize;
+
+    let has_template = matches!(s.phase, Phase::Replace | Phase::Stepping);
+    if has_template {
+        let prefix = search_field_prefix_cols(s, Field::Template);
+        let chars = s.template.chars().count();
+        if click_col >= prefix && click_col <= prefix + chars {
+            let idx = click_col - prefix;
+            let byte = s.template.char_indices().nth(idx).map_or(s.template.len(), |(b, _)| b);
+            return Some((Field::Template, byte));
+        }
+    }
+    let prefix = search_field_prefix_cols(s, Field::Needle);
+    let chars = s.needle.chars().count();
+    if click_col >= prefix && click_col <= prefix + chars {
+        let idx = click_col - prefix;
+        let byte = s.needle.char_indices().nth(idx).map_or(s.needle.len(), |(b, _)| b);
+        return Some((Field::Needle, byte));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

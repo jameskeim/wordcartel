@@ -399,10 +399,44 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
         }
         return;
     }
-    // Text-input modals: consume, no row action (you type). Tail branch — the fn
-    // ends here, so an empty body suffices (no `return` needed). Task 5.2 fills
-    // in the search overlay's click branch.
-    if editor.search.is_some() {}
+    // A13 Task 5.2: search overlay click — two targets. `Down(Left)` on the status
+    // row inside either field focuses it + positions the caret (chrome_geom's
+    // search_field_click, sharing the painter's prefix-width source). `Down(Left)`
+    // in the edit band, on a highlighted match, selects that match — strict
+    // three-step order (spec §5.2): (1) cache-only refresh via `SearchState::
+    // recompute` DIRECTLY — NOT `search_ui::search_sync`, whose unfold/select/
+    // rebuild/ensure_visible would move the viewport BEFORE the click is mapped;
+    // (2) map the click to a document byte via the same `nav::offset_at_cell`
+    // path the no-overlay click uses; (3) if the byte lands inside a match,
+    // `set_current_at_or_after` + the shared placement tail (`search_ui::
+    // search_pin`). The overlay STAYS OPEN either way. All other events, and
+    // clicks that hit neither target, are consumed no-ops — tail branch, so the
+    // fn simply ends (no `return` needed after this `if`).
+    if editor.search.is_some() {
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            let field_hit: Option<(crate::search_overlay::Field, usize)> = editor.search.as_ref()
+                .and_then(|s| crate::chrome_geom::search_field_click(area, s, ev.column, ev.row));
+            if let Some((field, cursor)) = field_hit {
+                if let Some(s) = editor.search.as_mut() { s.field = field; s.cursor = cursor; }
+                return;
+            }
+            if let CellHit::Text { col, erow } = editing_cell(editor, ev.column, ev.row) {
+                // Step 1 — cache-only refresh (spec §5.3): current buffer/version, NOT search_sync.
+                let (rope, version) = { let d = &editor.active().document; (d.buffer.snapshot(), d.version) };
+                if let Some(s) = editor.search.as_mut() { s.recompute(&rope, version); }
+                // Step 2 — map the click to a document byte on the (now-current) layout.
+                if let Some(byte) = crate::nav::offset_at_cell(editor, col, erow) {
+                    // Step 3 — choose + place.
+                    let hit_match = editor.search.as_ref()
+                        .and_then(|s| s.matches().iter().copied().find(|m| m.start <= byte && byte < m.end));
+                    if let Some(m) = hit_match {
+                        if let Some(s) = editor.search.as_mut() { s.set_current_at_or_after(m.start); }
+                        crate::search_ui::search_pin(editor);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)] // mouse event dispatch — one branch per screen region
@@ -1786,5 +1820,138 @@ mod tests {
         handle(&mut e, down(1, status_row), &reg, &km, &ex, &clk, &tx); // col 1 < prompt_cols (4)
         assert_eq!(e.minibuffer.as_ref().unwrap().cursor, 2, "click on the prompt must not move the caret");
         assert!(e.minibuffer.is_some(), "minibuffer stays open");
+    }
+
+    // -----------------------------------------------------------------------
+    // A13 Task 5.2: search overlay click (field focus + match click)
+    // -----------------------------------------------------------------------
+
+    /// Clicking inside the needle field on the status row focuses `Field::Needle`
+    /// and positions the char-count-mapped byte cursor; the overlay stays open.
+    #[test]
+    fn search_needle_click_focuses_and_positions() {
+        let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_search(crate::search_overlay::Phase::Find, 0);
+        for c in "wor".chars() { e.search.as_mut().unwrap().insert(c); }
+        // reset focus so the click is what moves it, not the prior insert loop
+        e.search.as_mut().unwrap().field = crate::search_overlay::Field::Needle;
+        e.search.as_mut().unwrap().cursor = 0;
+        let (reg, ex, clk, tx, km) = ctx();
+        let status_row = e.active().view.area.1 - 1;
+        // "Find: " = 6 cols; col 8 → char idx 2 within "wor" ('w','o' consumed).
+        let d = down(8, status_row);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        let s = e.search.as_ref().unwrap();
+        assert_eq!(s.field, crate::search_overlay::Field::Needle);
+        assert_eq!(s.cursor, 2, "cursor lands at the char-mapped byte offset within the needle");
+        assert!(e.search.is_some(), "search overlay stays open");
+    }
+
+    /// In `Phase::Replace`, clicking inside the template field (after `"Find:
+    /// {needle}  Replace: "`) focuses `Field::Template`, even when the needle
+    /// field was previously focused.
+    #[test]
+    fn search_template_click_in_replace_phase() {
+        let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_search(crate::search_overlay::Phase::Replace, 0);
+        for c in "wor".chars() { e.search.as_mut().unwrap().insert(c); }
+        e.search.as_mut().unwrap().field = crate::search_overlay::Field::Template;
+        e.search.as_mut().unwrap().cursor = 0;
+        for c in "cat".chars() { e.search.as_mut().unwrap().insert(c); }
+        // Focus back on Needle before the click — proves the click MOVES focus.
+        e.search.as_mut().unwrap().field = crate::search_overlay::Field::Needle;
+        e.search.as_mut().unwrap().cursor = 0;
+        let (reg, ex, clk, tx, km) = ctx();
+        let status_row = e.active().view.area.1 - 1;
+        let prefix = "Find: wor  Replace: ".chars().count() as u16;
+        let d = down(prefix + 2, status_row); // char idx 2 within "cat" ('c','a' consumed)
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        let s = e.search.as_ref().unwrap();
+        assert_eq!(s.field, crate::search_overlay::Field::Template);
+        assert_eq!(s.cursor, 2);
+    }
+
+    /// Clicking a highlighted match in the buffer body selects it (current match
+    /// + selection == the clicked match's range) and the overlay STAYS OPEN.
+    #[test]
+    fn search_match_click_selects_that_match_stays_open() {
+        // line0 = "foo abc bar\n" (bytes 0..12, "abc" at 4..7)
+        // line1 = "baz abc qux\n" (bytes 12..24, "abc" at 16..19)
+        let text = "foo abc bar\nbaz abc qux\n";
+        let mut e = Editor::new_from_text(text, None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_search(crate::search_overlay::Phase::Find, 0);
+        for c in "abc".chars() { e.search.as_mut().unwrap().insert(c); }
+        let (rope, version) = { let d = &e.active().document; (d.buffer.snapshot(), d.version) };
+        e.search.as_mut().unwrap().recompute(&rope, version);
+        assert_eq!(e.search.as_ref().unwrap().count(), 2, "precondition: two matches");
+
+        let (reg, ex, clk, tx, km) = ctx();
+        // row1 col5 sits inside the second "abc" (16..19: col4..7 on line1).
+        let d = down(5, 1);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+
+        let sel = e.active().document.selection.primary();
+        assert_eq!((sel.from(), sel.to()), (16, 19), "selection == clicked match's range");
+        assert_eq!(e.search.as_ref().unwrap().current_ordinal(), Some(2), "current match is the clicked one");
+        assert!(e.search.is_some(), "search overlay stays open after a match click");
+    }
+
+    /// Regression (spec §5.3): an async edit (mirroring `jobs_apply::apply_filter_done`
+    /// — mutate + rebuild + ensure_visible, but NEVER touching the search cache) can
+    /// land while search stays open, leaving `editor.search`'s cached match offsets
+    /// stale relative to the live buffer/version. The match-click path's step-1
+    /// cache-only refresh (`SearchState::recompute`, NOT `search_ui::search_sync`)
+    /// must run BEFORE the click is mapped to a byte offset, so the FRESH post-edit
+    /// match is selected — not a stale one, and not silently dropped.
+    #[test]
+    fn search_match_click_refreshes_stale_cache() {
+        let text = "foo abc bar\nbaz abc qux\n";
+        let mut e = Editor::new_from_text(text, None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_search(crate::search_overlay::Phase::Find, 0);
+        for c in "abc".chars() { e.search.as_mut().unwrap().insert(c); }
+        let (rope, version) = { let d = &e.active().document; (d.buffer.snapshot(), d.version) };
+        e.search.as_mut().unwrap().recompute(&rope, version);
+        assert_eq!(e.search.as_ref().unwrap().count(), 2, "precondition: two matches");
+
+        let (reg, ex, clk, tx, km) = ctx();
+
+        // Async edit: insert "XX" at byte 0 (line0 only) — shifts line1's absolute
+        // byte offsets +2 while its ON-SCREEN column position is untouched. Apply
+        // directly + rebuild + ensure_visible (mirrors apply_filter_done) WITHOUT
+        // touching editor.search — the cache is now stale by construction.
+        let doc_len = e.active().document.buffer.len();
+        let (cs, edit) = crate::commands::build_range_replace(0, 0, "XX", doc_len);
+        let txn = wordcartel_core::history::Transaction::new(cs)
+            .with_selection(wordcartel_core::selection::Selection::single(0));
+        e.apply(txn, edit, wordcartel_core::history::EditKind::Other, &clk);
+        crate::derive::rebuild(&mut e);
+        crate::nav::ensure_visible(&mut e);
+
+        // Precondition: the cache still holds the PRE-edit offsets.
+        assert_eq!(e.search.as_ref().unwrap().matches(),
+            &[wordcartel_core::search::Match { start: 4, end: 7 },
+              wordcartel_core::search::Match { start: 16, end: 19 }],
+            "precondition: cache is stale relative to the post-edit buffer/version");
+
+        // Click the second "abc" at its CURRENT screen position (row1, unchanged —
+        // only line0 was edited); the LIVE (post-edit) match is now 18..21.
+        let d = down(6, 1);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+
+        let sel = e.active().document.selection.primary();
+        assert_eq!((sel.from(), sel.to()), (18, 21),
+            "match-click must select against FRESH post-edit offsets, not the stale 16..19");
+        assert_eq!(e.search.as_ref().unwrap().current_ordinal(), Some(2));
+        assert!(e.search.is_some(), "overlay stays open");
+
+        // Control: a click that lands on NO match leaves selection untouched.
+        let before = e.active().document.selection.clone();
+        let miss = down(0, 0); // 'X' of the inserted "XX" prefix — not inside any match
+        handle(&mut e, miss, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.active().document.selection, before, "non-match click leaves selection unchanged");
     }
 }

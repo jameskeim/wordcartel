@@ -413,11 +413,9 @@ fn place_cursor(frame: &mut Frame, editor: &Editor, area: Rect, edit_top: u16,
     if let Some(ref s) = editor.search {
         // Search bar is open: place caret on the status row at the focused field's caret.
         // Use char counts (not byte offsets) for correct placement with multibyte text.
-        let prefix_cols = match s.field {
-            crate::search_overlay::Field::Needle => "Find: ".chars().count(),
-            crate::search_overlay::Field::Template =>
-                format!("Find: {}  Replace: ", s.needle).chars().count(),
-        };
+        // Prefix width is the SINGLE SOURCE shared with `chrome_geom::search_field_click`
+        // (the mouse hit-test) — painter and hit-test can never drift.
+        let prefix_cols = crate::chrome_geom::search_field_prefix_cols(s, s.field);
         let caret_cols = s.focused_field()[..s.cursor].chars().count();
         // H7: sum in usize and guard BEFORE narrowing — a >65535-column field must hide
         // the caret, not truncate to a small column that passes the `< w` guard.
