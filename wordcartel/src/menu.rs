@@ -125,6 +125,7 @@ fn category_label(cat: MenuCategory) -> &'static str {
     match cat {
         MenuCategory::File => "File",
         MenuCategory::Edit => "Edit",
+        MenuCategory::Block => "Block",
         MenuCategory::Format => "Format",
         MenuCategory::View => "View",
         MenuCategory::Settings => "Settings",
@@ -309,6 +310,32 @@ mod tests {
         assert!(leaves[1].0.contains("CUA") && leaves[1].0.ends_with("ctrl-k"));
         // A plain row with neither is bare.
         assert_eq!(leaves[3].0, "Plain Item");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 2.1 (command-surface curation, A10): Block category
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn block_category_groups_the_block_family() {
+        let reg = crate::registry::Registry::builtins();
+        let (keymap, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ed = throwaway_editor();
+        let view = build(&reg, &keymap, &ed);
+        let tops = top_level_labels(&view);
+        let edit_pos = tops.iter().position(|l| l == "Edit").expect("Edit group must exist");
+        let block_pos = tops.iter().position(|l| l == "Block").expect("Block group must exist");
+        let format_pos = tops.iter().position(|l| l == "Format").expect("Format group must exist");
+        assert!(block_pos > edit_pos && block_pos < format_pos,
+            "Block must sit edit-adjacent, between Edit and Format: {tops:?}");
+        let block_items = group_items(&view, "Block");
+        for id in ["block_begin", "block_write", "copy_block_to_scratch", "select_marked_block"] {
+            assert!(block_items.iter().any(|(_, cid)| *cid == crate::registry::CommandId(id)),
+                "Block group must contain {id}: {block_items:?}");
+        }
+        let file_items = group_items(&view, "File");
+        assert!(!file_items.iter().any(|(_, cid)| *cid == crate::registry::CommandId("block_write")),
+            "block_write must have moved out of File");
     }
 
     #[test]

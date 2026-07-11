@@ -3205,14 +3205,14 @@ mod tests {
     }
 
     /// hydrate_overlays maps a placeholder's MENU_ORDER index to the built groups'
-    /// position by category (Format = index 2 in MENU_ORDER).
+    /// position by category (Format = index 3 in MENU_ORDER).
     #[test]
     fn hydrate_preserves_and_maps_open() {
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         let reg = crate::registry::Registry::builtins();
         let km = build_km();
-        // MENU_ORDER[2] = Format
-        e.menu = Some(crate::menu::empty_at(2));
+        // MENU_ORDER[3] = Format
+        e.menu = Some(crate::menu::empty_at(3));
         crate::app::hydrate_overlays(&mut e, &reg, &km);
         let menu = e.menu.as_ref().expect("menu must be Some after hydration");
         assert!(menu.built, "menu must be marked built after hydration");
@@ -3228,8 +3228,8 @@ mod tests {
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         let reg = crate::registry::Registry::builtins();
         let km = build_km();
-        // MENU_ORDER[2] = Format; seed highlighted at an absurd index
-        let mut placeholder = crate::menu::empty_at(2);
+        // MENU_ORDER[3] = Format; seed highlighted at an absurd index
+        let mut placeholder = crate::menu::empty_at(3);
         placeholder.highlighted = 999;
         e.menu = Some(placeholder);
         crate::app::hydrate_overlays(&mut e, &reg, &km);

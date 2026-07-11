@@ -897,7 +897,7 @@ mod tests {
     }
 
     /// A click on the inactive bar (Pinned, menu None) at the Format label column
-    /// opens a placeholder with open == MENU_ORDER index of Format (== 2).
+    /// opens a placeholder with open == MENU_ORDER index of Format (== 3).
     #[test]
     fn click_on_inactive_bar_opens_that_category() {
         use crate::config::MenuBarMode;
@@ -906,19 +906,19 @@ mod tests {
         e.menu_bar_mode = MenuBarMode::Pinned;
         e.menu = None;
         let (reg, ex, clk, tx, km) = ctx();
-        // Compute the Format label column dynamically (MENU_ORDER[2] = Format).
+        // Compute the Format label column dynamically (MENU_ORDER[3] = Format).
         let (w, h) = e.active().view.area;
         let area = ratatui::layout::Rect::new(0, 0, w, h);
         let menu_area = ratatui::layout::Rect::new(area.x, area.y, w, h.saturating_sub(1));
         let bar = crate::chrome_geom::menu_bar_layout_cats(menu_area, &crate::registry::MENU_ORDER);
-        let (_, format_rect) = bar.iter().find(|(i, _)| *i == 2).expect("Format at index 2");
+        let (_, format_rect) = bar.iter().find(|(i, _)| *i == 3).expect("Format at index 3");
         let col = format_rect.x + 1; // somewhere inside the label
 
         // Click on the Format label while the bar is inactive (menu None).
         handle(&mut e, down(col, 0), &reg, &km, &ex, &clk, &tx);
         let menu = e.menu.as_ref().expect("click must set editor.menu to Some placeholder");
         assert!(!menu.built, "placeholder must not be built (hydration happens in reduce)");
-        assert_eq!(menu.open, 2, "placeholder open must be the MENU_ORDER index of Format");
+        assert_eq!(menu.open, 3, "placeholder open must be the MENU_ORDER index of Format");
 
         // After hydrate_overlays: built and mapped to the correct group.
         crate::app::hydrate_overlays(&mut e, &reg, &km);

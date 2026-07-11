@@ -2850,16 +2850,17 @@ mod tests {
     /// in Chrome style; row 1 has no dropdown (contains the document text).
     #[test]
     fn render_paints_inactive_bar_labels() {
-        // 6 categories: " File "(6)+" Edit "(6)+" Format "(8)+" View "(6)+
-        //               " Settings "(10)+" Export "(8) = 44 — use 50 wide to fit all.
-        let mut e = Editor::new_from_text("hello\n", None, (50, 8));
+        // 7 categories: " File "(6)+" Edit "(6)+" Block "(7)+" Format "(8)+" View "(6)+
+        //               " Settings "(10)+" Export "(8) = 51 — use 60 wide to fit all.
+        let mut e = Editor::new_from_text("hello\n", None, (60, 8));
         e.menu_bar_mode = crate::config::MenuBarMode::Pinned;
         e.menu = None;
         derive::rebuild(&mut e);
-        let buf = render_to_buffer(&mut e, 50, 8);
+        let buf = render_to_buffer(&mut e, 60, 8);
         let row0 = row_string(&buf, 0);
         assert!(row0.contains(" File "),     "inactive bar must show ' File '");
         assert!(row0.contains(" Edit "),     "inactive bar must show ' Edit '");
+        assert!(row0.contains(" Block "),    "inactive bar must show ' Block '");
         assert!(row0.contains(" Format "),   "inactive bar must show ' Format '");
         assert!(row0.contains(" View "),     "inactive bar must show ' View '");
         assert!(row0.contains(" Settings "), "inactive bar must show ' Settings '");

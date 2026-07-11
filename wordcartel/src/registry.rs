@@ -36,10 +36,11 @@ pub type Handler = fn(&mut Ctx) -> CommandResult;
 // ── Command metadata ──────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MenuCategory { File, Edit, Format, View, Settings, Export }
+pub enum MenuCategory { File, Edit, Block, Format, View, Settings, Export }
 
-pub const MENU_ORDER: [MenuCategory; 6] =
-    [MenuCategory::File, MenuCategory::Edit, MenuCategory::Format, MenuCategory::View, MenuCategory::Settings, MenuCategory::Export];
+pub const MENU_ORDER: [MenuCategory; 7] = [MenuCategory::File, MenuCategory::Edit,
+    MenuCategory::Block, MenuCategory::Format, MenuCategory::View, MenuCategory::Settings,
+    MenuCategory::Export];
 
 /// The live-state mark a stateful menu command interpolates into its row label.
 /// Exhaustive — adding a variant here is intentional and must be handled in every match.
@@ -271,28 +272,27 @@ impl Registry {
         r.register("jump_forward", "Jump Forward", None, |c| { crate::marks::jump_forward(c.editor); CommandResult::Handled });
 
         // Marked block creation (Task 2 / Effort 9A).
-        r.register("block_begin",               "Set Block Begin",         Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_begin(c.editor); CommandResult::Handled });
-        r.register("block_end",                 "Set Block End",           Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_end(c.editor); CommandResult::Handled });
-        r.register("mark_block_from_selection", "Mark Block from Selection", Some(MenuCategory::Edit), |c| { crate::blocks_marked::mark_block_from_selection(c.editor); CommandResult::Handled });
-        // Block → selection bridge (A11.3, Task 1.1 / command-surface curation). `menu: None`
-        // for now — flips to `Some(MenuCategory::Block)` once that category lands (Task 2.1).
-        r.register("select_marked_block", "Select Block", None,
+        r.register("block_begin",               "Set Block Begin",         Some(MenuCategory::Block), |c| { crate::blocks_marked::block_begin(c.editor); CommandResult::Handled });
+        r.register("block_end",                 "Set Block End",           Some(MenuCategory::Block), |c| { crate::blocks_marked::block_end(c.editor); CommandResult::Handled });
+        r.register("mark_block_from_selection", "Mark Block from Selection", Some(MenuCategory::Block), |c| { crate::blocks_marked::mark_block_from_selection(c.editor); CommandResult::Handled });
+        // Block → selection bridge (A11.3, Task 1.1 / command-surface curation).
+        r.register("select_marked_block", "Select Block", Some(MenuCategory::Block),
             |c| { crate::blocks_marked::select_marked_block(c.editor); CommandResult::Handled });
 
         // Marked block operations (Task 3 / Effort 9A).
-        r.register("block_copy",          "Copy Block",        Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_copy(c.editor, c.clock);   CommandResult::Handled });
-        r.register("block_move",          "Move Block",        Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_move(c.editor, c.clock);   CommandResult::Handled });
-        r.register("block_delete",        "Delete Block",      Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_delete(c.editor, c.clock); CommandResult::Handled });
-        r.register("block_jump_begin",    "Jump to Block Begin", Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_jump_begin(c.editor);    CommandResult::Handled });
-        r.register("block_jump_end",      "Jump to Block End",   Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_jump_end(c.editor);      CommandResult::Handled });
-        r.register("block_toggle_hidden", "Toggle Block Hidden", Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_toggle_hidden(c.editor); CommandResult::Handled });
-        r.register("block_clear",         "Clear Block",         Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_clear(c.editor);         CommandResult::Handled });
+        r.register("block_copy",          "Copy Block",        Some(MenuCategory::Block), |c| { crate::blocks_marked::block_copy(c.editor, c.clock);   CommandResult::Handled });
+        r.register("block_move",          "Move Block",        Some(MenuCategory::Block), |c| { crate::blocks_marked::block_move(c.editor, c.clock);   CommandResult::Handled });
+        r.register("block_delete",        "Delete Block",      Some(MenuCategory::Block), |c| { crate::blocks_marked::block_delete(c.editor, c.clock); CommandResult::Handled });
+        r.register("block_jump_begin",    "Jump to Block Begin", Some(MenuCategory::Block), |c| { crate::blocks_marked::block_jump_begin(c.editor);    CommandResult::Handled });
+        r.register("block_jump_end",      "Jump to Block End",   Some(MenuCategory::Block), |c| { crate::blocks_marked::block_jump_end(c.editor);      CommandResult::Handled });
+        r.register("block_toggle_hidden", "Toggle Block Hidden", Some(MenuCategory::Block), |c| { crate::blocks_marked::block_toggle_hidden(c.editor); CommandResult::Handled });
+        r.register("block_clear",         "Clear Block",         Some(MenuCategory::Block), |c| { crate::blocks_marked::block_clear(c.editor);         CommandResult::Handled });
         // Marked block write-to-file (Task 4 / Effort 9A).
-        r.register("block_write", "Write Block to File\u{2026}", Some(MenuCategory::File), |c| { crate::blocks_marked::block_write(c.editor); CommandResult::Handled });
+        r.register("block_write", "Write Block to File\u{2026}", Some(MenuCategory::Block), |c| { crate::blocks_marked::block_write(c.editor); CommandResult::Handled });
 
         // Effort 6: send-to-scratch verbs.
-        r.register("copy_block_to_scratch", "Copy Block to Scratch", Some(MenuCategory::Edit), |c| { crate::scratch::copy_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
-        r.register("move_block_to_scratch", "Move Block to Scratch", Some(MenuCategory::Edit), |c| { crate::scratch::move_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
+        r.register("copy_block_to_scratch", "Copy Block to Scratch", Some(MenuCategory::Block), |c| { crate::scratch::copy_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
+        r.register("move_block_to_scratch", "Move Block to Scratch", Some(MenuCategory::Block), |c| { crate::scratch::move_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
 
         // Effort 6: workspace navigation.
         r.register("next_buffer", "Next Buffer", Some(MenuCategory::View), |c| { crate::workspace::next_buffer(c.editor); CommandResult::Handled });
