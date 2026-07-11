@@ -3,7 +3,7 @@
 
 # Backlog
 
-**21 open · 42 shipped · 1 dropped**
+**22 open · 42 shipped · 1 dropped**
 
 Blocking Effort P: **0**
 
@@ -24,6 +24,7 @@ Blocking Effort P: **0**
 | B7 | Selected menu-item text too light | needs-design | bug | TBD |  | Possible E5 regression; selected item may need a distinct legible highlight fg. |
 | B8 | Configurable terminal caret shape / colour | needs-design | feature | TBD |  | Emit DECSCUSR (block/beam/underline, blink, colour); restore on exit/panic. |
 | B9 | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) | triage | feature | TBD |  | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) |
+| E7 | Grammar/spelling as a deliberate Analysis view (F1 RenderMode); draft stays quiet | triage | feature | TBD |  | Grammar/spelling becomes a deliberate Analysis view (4th F1 RenderMode); drafting stays quiet; backend via external harper-ls LSP (H2->D); stats deferred to PA. |
 | H10 | reduce's 10-stage intercept chain boilerplate | watch | debt | TBD |  | Verbatim flat-dispatch; NOT a defect. Collapse only when Effort P adds plugin intercept stages. |
 | H13 | Editor is a 58-field data god-object | watch | debt | TBD |  | Field-clustering, not dispatch; NOT a defect. Peel PendingActions/ClipboardState only if a refactor wants it. |
 | H2 | Interrogate the burn/harper dependency weight | needs-design | research | TBD |  | 672-crate lockfile pulls a tensor stack transitively for grammar; keep/feature-gate/lighter backend? |
