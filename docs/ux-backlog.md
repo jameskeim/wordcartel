@@ -456,3 +456,19 @@ priority. Anchors: `swap.rs::cleanable_recovery_files`/`recovery_path_still_clea
 `open_swap_paths`/protected-set gather, `recovery.rs` (`recovered-*.md` naming).
 
 *(Captured 2026-07-11 from the Effort-B Fable gate.)*
+
+### H20 — Flaky test: filter::run_filter_non_zero_exit_carries_stderr
+<!-- item: H20 -->
+
+**Observed (v0.4.0 release gate, 2026-07-11):** `filter::tests::run_filter_non_zero_exit_carries_stderr`
+failed in one of two back-to-back `cargo test --workspace` runs, then passed **10/10** on isolated
+re-run — a genuine flaky test, not a regression (it predates 0.3.0; commit `7834562`, the filter
+subprocess engine). A flaky test in the suite undermines the `cargo test` merge GATE (a real failure
+could hide behind "probably just the flake," and a flake can spuriously block a merge). **Direction:**
+find the race — likely a subprocess spawn/stderr-capture timing assumption on non-zero exit (stderr
+read vs. child-exit ordering, or a too-tight timing/poll assumption) — and make the assertion
+deterministic (wait on the condition, not a timing window; cf. condition-based-waiting). Low effort,
+high hygiene value before Effort P. Anchor: `wordcartel/src/filter.rs`
+(`run_filter_non_zero_exit_carries_stderr` + the sync subprocess engine it exercises).
+
+*(Captured 2026-07-11 from the v0.4.0 release gate.)*
