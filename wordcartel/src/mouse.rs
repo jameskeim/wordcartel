@@ -1185,26 +1185,30 @@ mod tests {
     /// CommandId("palette") which reopens the picker. The mouse path is aligned
     /// with the keyboard Enter arm (app.rs ~1238) that checks row.buffer first.
     ///
-    /// Unscrolled click (2 buffers — doc + scratch): the list fits in the window
-    /// without scrolling. A scrolled variant is not needed here — the abs-row
-    /// mapping for scrolled clicks is already covered by
-    /// `scrolled_click_maps_to_absolute_row`; the bug is in the dispatch branch,
-    /// not in the hit-test, so an unscrolled click exercises the full fix path.
+    /// Unscrolled click (2 buffers — doc + a second ordinary buffer B; scratch is
+    /// excluded from the switcher per A12): the list fits in the window without
+    /// scrolling. A scrolled variant is not needed here — the abs-row mapping for
+    /// scrolled clicks is already covered by `scrolled_click_maps_to_absolute_row`;
+    /// the bug is in the dispatch branch, not in the hit-test, so an unscrolled
+    /// click exercises the full fix path.
     #[test]
     fn click_buffers_palette_row_switches_buffer_not_reopens() {
         let mut e = Editor::new_from_text(
             "doc\n", Some(std::path::PathBuf::from("/tmp/a.md")), (80, 24));
         e.install_scratch();
-        // buffers[0] = doc (active), buffers[1] = scratch.
-        let scratch_id = e.scratch_id.unwrap();
+        // buffers[0] = doc (active), buffers[1] = scratch, buffers[2] = B (ordinary).
+        let b_id = e.alloc_id();
+        let area_b = e.active().view.area;
+        e.buffers.push(crate::editor::Buffer::from_text(b_id, "b\n", None, area_b));
         assert_eq!(e.active, 0, "precondition: doc is active before the click");
         e.open_buffer_switcher();
-        // rows[0] = doc (MRU front), rows[1] = scratch — both carry buffer: Some(id).
+        // rows[0] = doc (MRU front), rows[1] = B (appended, scratch excluded) —
+        // both carry buffer: Some(id).
         assert_eq!(e.palette.as_ref().unwrap().rows.len(), 2,
-            "precondition: exactly 2 rows in the Buffers palette");
+            "precondition: exactly 2 rows in the Buffers palette (scratch excluded)");
         let area = ratatui::layout::Rect::new(0, 0, 80, 24);
         let rect = crate::chrome_geom::palette_overlay_rect(area, 2);
-        // Click the second list row (rows[1] = scratch) at ov_y + 2 + 1.
+        // Click the second list row (rows[1] = B) at ov_y + 2 + 1.
         let click_row = rect.y + 2 + 1;
         let d = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -1215,8 +1219,8 @@ mod tests {
         let (reg, ex, clk, tx, km) = ctx();
         handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
         assert!(e.palette.is_none(), "palette must close after clicking a buffer row");
-        assert_eq!(e.active().id, scratch_id,
-            "click must switch to the clicked row's buffer (scratch), not reopen the palette");
+        assert_eq!(e.active().id, b_id,
+            "click must switch to the clicked row's buffer (B), not reopen the palette");
     }
 
     // -----------------------------------------------------------------------

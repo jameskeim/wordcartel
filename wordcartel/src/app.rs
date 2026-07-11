@@ -981,10 +981,13 @@ mod tests {
         let mut e = Editor::new_from_text("doc\n", None, (80, 24));
         e.buffers[0].document.path = Some(std::path::PathBuf::from("/tmp/doc.md"));
         e.install_scratch();
-        let scratch_id = e.scratch_id.unwrap();
-        // install_scratch seeds MRU as [doc, scratch]; open switcher → rows[0]=doc, rows[1]=scratch
+        // A second ordinary buffer B — scratch is excluded from the switcher (A12).
+        let b_id = e.alloc_id();
+        let area = e.active().view.area;
+        e.buffers.push(crate::editor::Buffer::from_text(b_id, "b\n", None, area));
+        // open switcher → rows[0]=doc (MRU front), rows[1]=B (appended, scratch excluded)
         e.open_buffer_switcher();
-        // Select the scratch row (index 1)
+        // Select B's row (index 1)
         e.palette.as_mut().unwrap().selected = 1;
         let reg = Registry::builtins();
         let ex = InlineExecutor::default();
@@ -996,7 +999,7 @@ mod tests {
         }));
         crate::app::reduce(enter, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert!(e.palette.is_none(), "buffer-switcher palette must be dismissed after Enter");
-        assert_eq!(e.active().id, scratch_id,
+        assert_eq!(e.active().id, b_id,
             "active buffer must be the buffer selected in the switcher");
     }
 

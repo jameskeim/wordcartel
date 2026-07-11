@@ -298,6 +298,7 @@ impl Registry {
         r.register("next_buffer", "Next Buffer", Some(MenuCategory::View), |c| { crate::workspace::next_buffer(c.editor); CommandResult::Handled });
         r.register("prev_buffer", "Previous Buffer", Some(MenuCategory::View), |c| { crate::workspace::prev_buffer(c.editor); CommandResult::Handled });
         r.register("goto_scratch", "Go to Scratch Buffer", Some(MenuCategory::View), |c| { crate::workspace::goto_scratch(c.editor); CommandResult::Handled });
+        r.register("toggle_scratch", "Toggle Scratch Buffer", Some(MenuCategory::View), |c| { crate::workspace::toggle_scratch(c.editor); CommandResult::Handled });
         r.register("switch_buffer", "Switch Buffer\u{2026}", Some(MenuCategory::View), |c| { c.editor.open_buffer_switcher(); CommandResult::Handled });
         r.register("close_buffer", "Close Buffer", Some(MenuCategory::File), |c| { crate::workspace::close_buffer(c.editor); CommandResult::Handled });
 
