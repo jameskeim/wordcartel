@@ -44,8 +44,8 @@ pub const MENU_ORDER: [MenuCategory; 7] = [MenuCategory::File, MenuCategory::Edi
 
 /// The live-state mark a stateful menu command interpolates into its row label.
 /// Exhaustive — adding a variant here is intentional and must be handled in every match.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MenuMark { OnOff(bool), Value(&'static str) }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MenuMark { OnOff(bool), Value(&'static str), Text(String) }
 
 #[derive(Clone, Copy)]
 pub struct CommandMeta {
@@ -564,10 +564,12 @@ impl Registry {
                 switch_keymap_preset(c.editor, next);
                 CommandResult::Handled
             });
-        r.register("set_wrap_column", "Set Wrap Column\u{2026}", Some(MenuCategory::Settings), |c| {
-            c.editor.open_minibuffer("Wrap column: ", crate::minibuffer::MinibufferKind::WrapColumn);
-            CommandResult::Handled
-        });
+        r.register_stateful("set_wrap_column", "Wrap Column: Set\u{2026}", Some(MenuCategory::Settings),
+            |e| MenuMark::Text(format!("{}\u{2026}", e.view_opts.wrap_column)),
+            |c| {
+                c.editor.open_minibuffer("Wrap column: ", crate::minibuffer::MinibufferKind::WrapColumn);
+                CommandResult::Handled
+            });
         // toggle_canvas and toggle_chrome MUST be registered BEFORE save_settings
         // (journey_palette_end relies on save_settings being the last command dispatched
         // from End+Enter — spec D3 / A.7).
@@ -913,7 +915,7 @@ mod tests {
         // keymap_cua/keymap_wordstar are palette-only now; keymap_next is the single cycle row.
         for (id, label) in [
             ("keymap_next",      "Keymap"),
-            ("set_wrap_column",  "Set Wrap Column\u{2026}"),
+            ("set_wrap_column",  "Wrap Column: Set\u{2026}"),
             ("toggle_chrome",    "Chrome: Full/Zen"),
             ("save_settings",    "Save Settings"),
         ] {
@@ -1142,6 +1144,16 @@ mod tests {
         let cm = reg.meta(CommandId("toggle_chrome")).unwrap().state.unwrap();
         ed.chrome_disposition = wordcartel_core::theme::ChromeDisposition::Zen;
         assert!(matches!(cm(&ed), MenuMark::Value("Zen")));
+    }
+
+    #[test]
+    fn set_wrap_column_is_stateful_with_value_label() {
+        let reg = Registry::builtins();
+        let mut ed = crate::editor::Editor::new_from_text("x\n", None, (40, 8));
+        let meta = reg.meta(CommandId("set_wrap_column")).unwrap();
+        assert!(meta.state.is_some(), "set_wrap_column must be stateful");
+        ed.view_opts.wrap_column = 80;
+        assert_eq!((meta.state.unwrap())(&ed), MenuMark::Text("80\u{2026}".into()));
     }
 
     #[test]

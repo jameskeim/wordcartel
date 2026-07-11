@@ -71,6 +71,7 @@ fn menu_leaf_parts(meta: &crate::registry::CommandMeta, editor: &crate::editor::
             let value = match f(editor) {
                 MenuMark::OnOff(b) => if b { "On" } else { "Off" }.to_string(),
                 MenuMark::Value(v) => v.to_string(),
+                MenuMark::Text(s) => s,
             };
             (base, Some(value))
         }
@@ -269,6 +270,19 @@ mod tests {
         assert!(view.1.iter().any(|(label, _)|
             label.starts_with("Word Count") && label.contains("On") && !label.contains("Word Count: On")),
             "stateful toggle shows 'Word Count' + 'On' in a column, got {:?}", view.1);
+    }
+
+    #[test]
+    fn wrap_column_row_shows_value() {
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let mut ed = crate::editor::Editor::new_from_text("x\n", None, (40, 8));
+        ed.view_opts.wrap_column = 80;
+        let groups = grouped_commands(&reg, &km, &ed);
+        let settings = groups.iter().find(|(c, _)| *c == crate::registry::MenuCategory::Settings).unwrap();
+        assert!(settings.1.iter().any(|(label, _)|
+            label.starts_with("Wrap Column") && label.contains("80") && label.contains('\u{2026}')),
+            "wrap column row must show its live value: {:?}", settings.1);
     }
 
     // -----------------------------------------------------------------------
