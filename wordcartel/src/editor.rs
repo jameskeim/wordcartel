@@ -1447,7 +1447,7 @@ mod tests {
     // ── Task 2 (M5): eviction hint wiring ─────────────────────────────────────
 
     /// Guard: `Editor::apply` is a pure delegator — the eviction hint now lives in
-    /// `note_undo_eviction` (wired once per reduce in the run loop). A tiny edit that
+    /// `surface_undo_eviction` (wired once per reduce in the run loop). A tiny edit that
     /// does not evict must leave `status` unchanged regardless of which path set it.
     #[test]
     fn apply_does_not_set_hint_when_no_eviction() {
