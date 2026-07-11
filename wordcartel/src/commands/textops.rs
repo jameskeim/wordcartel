@@ -228,16 +228,30 @@ pub(crate) fn transpose_lines(editor: &mut Editor, clock: &dyn Clock) -> Command
         let cur_end = if l + 1 < total { buf.line_to_byte(l + 1) } else { buf.len() };
         let prev_line = buf.slice(prev_start..cur_start);
         let cur_line = buf.slice(cur_start..cur_end);
-        // No-op guard: identical adjacent lines ("aa\naa\n"), or the caret on the
-        // trailing phantom logical line (cur_line empty — no content, no newline).
-        // Both would apply a byte-identical edit (spurious dirty + empty undo step);
-        // mirror join_line's phantom-line discipline. `prev_line` always ends in '\n'
-        // (line l-1 has line l below it), so it is never empty — cur_line.is_empty()
-        // uniquely identifies the phantom line.
-        if prev_line == cur_line || cur_line.is_empty() {
+        // Caret on the trailing phantom logical line (empty — no content, no newline):
+        // there is nothing real to swap. Guard first (mirror join_line's discipline).
+        if cur_line.is_empty() {
             return CommandResult::Noop;
         }
-        (prev_start, cur_end, format!("{cur_line}{prev_line}"))
+        // Decompose each line into content + trailing separator so the swap preserves
+        // newline STRUCTURE rather than concatenating text. `prev_line` (line l-1 has
+        // line l below it) always carries a trailing '\n'; `cur_line` carries one too
+        // UNLESS it is the final line of a newline-less buffer ("one\ntwo") — the bug
+        // this decomposition fixes (naive `{cur_line}{prev_line}` merged the two lines
+        // onto one). The swapped result keeps line l's original trailing separator, so a
+        // newline-less last line stays newline-less.
+        let prev_content = prev_line.strip_suffix('\n').unwrap_or(&prev_line);
+        let (cur_content, cur_sep) = match cur_line.strip_suffix('\n') {
+            Some(c) => (c, "\n"),
+            None => (cur_line.as_str(), ""),
+        };
+        // No-op guard: identical adjacent lines ("aa\naa\n") — the swap is byte-identical
+        // (spurious dirty + empty undo step). Comparing CONTENT (not the raw slices) is
+        // correct because the separators are reattached symmetrically below.
+        if prev_content == cur_content {
+            return CommandResult::Noop;
+        }
+        (prev_start, cur_end, format!("{cur_content}\n{prev_content}{cur_sep}"))
     };
     let doc_len = editor.active().document.buffer.len();
     let (cs, edit) = super::build_range_replace(from, to, &out, doc_len);
@@ -278,16 +292,39 @@ pub(crate) fn join_line(editor: &mut Editor, clock: &dyn Clock) -> CommandResult
     super::edit::settle_after_edit(editor)
 }
 
+/// Byte range of the window the intra-line whitespace ops scan for a run of
+/// spaces/tabs. Normally the caret's paragraph (`nav::paragraph_range_at`), but
+/// that returns an EMPTY range `(s, s)` on a blank/whitespace-only line — which
+/// would hide the very spaces these ops act on (BUG: `just_one_space` then took
+/// its insert path and GREW the run; `delete_horizontal_space` silently no-op'd).
+/// On an empty paragraph window we therefore fall back to the caret's LOGICAL
+/// LINE content (its trailing '\n' excluded). A whitespace run never crosses a
+/// '\n' (newline is neither space nor tab), so on a non-blank line the paragraph
+/// window and the line window yield the same run — the fallback changes only the
+/// blank-line case.
+fn ws_scan_window(editor: &Editor, h: usize) -> (usize, usize) {
+    let b = editor.active();
+    let (ps, pe) = nav::paragraph_range_at(b.document.blocks(), &b.document.buffer, h);
+    if ps != pe {
+        return (ps, pe);
+    }
+    let buf = &b.document.buffer;
+    let total = derive::total_logical_lines(buf);
+    let l = buf.byte_to_line(h);
+    let start = buf.line_to_byte(l);
+    let end = if l + 1 < total { buf.line_to_byte(l + 1) } else { buf.len() };
+    // Drop a trailing '\n' so the window is exactly the line's content.
+    let end = if end > start && buf.slice(end - 1..end) == "\n" { end - 1 } else { end };
+    (start, end)
+}
+
 /// `just_one_space` — collapses the run of spaces/tabs touching the caret to
 /// exactly one space (inserting one if the caret sits between two non-space
 /// characters). Caret lands just after the space. Noop when the run is already
 /// exactly one plain space (no dirty on an already-collapsed run).
 pub(crate) fn just_one_space(editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     let h = nav::head(editor);
-    let (ps, pe) = {
-        let b = editor.active();
-        nav::paragraph_range_at(b.document.blocks(), &b.document.buffer, h)
-    };
+    let (ps, pe) = ws_scan_window(editor, h);
     let win = editor.active().document.buffer.slice(ps..pe);
     let rel = h.saturating_sub(ps).min(win.len());
     let bytes = win.as_bytes();
@@ -374,10 +411,7 @@ pub(crate) fn delete_blank_lines(editor: &mut Editor, clock: &dyn Clock) -> Comm
 /// whitespace.
 pub(crate) fn delete_horizontal_space(editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     let h = nav::head(editor);
-    let (ps, pe) = {
-        let b = editor.active();
-        nav::paragraph_range_at(b.document.blocks(), &b.document.buffer, h)
-    };
+    let (ps, pe) = ws_scan_window(editor, h);
     let win = editor.active().document.buffer.slice(ps..pe);
     let rel = h.saturating_sub(ps).min(win.len());
     let bytes = win.as_bytes();
@@ -508,6 +542,20 @@ mod tests {
         assert_eq!(r, CommandResult::Handled);
         assert_eq!(e.active().document.buffer.to_string(), "two\none\nthree\n");
         assert_eq!(nav::head(&e), 8); // start of "three"
+    }
+
+    #[test]
+    fn transpose_lines_swaps_when_last_line_has_no_trailing_newline() {
+        // BUG-1 regression: buffer with NO trailing newline. The last line ("two")
+        // carries no '\n', so a naive `{cur_line}{prev_line}` merged both lines onto
+        // one ("twoone\n"). A correct swap preserves newline STRUCTURE → "two\none",
+        // and the result's last line stays newline-less.
+        let mut e = Editor::new_from_text("one\ntwo", None, (80, 24));
+        set_caret(&mut e, 5); // inside "two" (the newline-less last line)
+        let r = transpose_lines(&mut e, &TestClock(0));
+        assert_eq!(r, CommandResult::Handled);
+        assert_eq!(e.active().document.buffer.to_string(), "two\none",
+            "must swap order preserving newline structure, NOT concatenate onto one line");
     }
 
     #[test]
@@ -663,6 +711,25 @@ mod tests {
         assert_eq!(nav::head(&e), 2);
     }
 
+    #[test]
+    fn just_one_space_on_whitespace_only_line_collapses_and_is_idempotent() {
+        // BUG-2 regression: on a whitespace-only line, nav::paragraph_range_at returns
+        // an EMPTY window, so the old code missed the real spaces and took the INSERT
+        // path — GROWING "    " to "     " (anti-idempotent). The empty-window fallback
+        // to the logical line makes it collapse to exactly one space instead.
+        let mut e = Editor::new_from_text("    ", None, (80, 24));
+        set_caret(&mut e, 2); // inside the 4-space run
+        let r = just_one_space(&mut e, &TestClock(0));
+        assert_eq!(r, CommandResult::Handled);
+        assert_eq!(e.active().document.buffer.to_string(), " ",
+            "must collapse the whitespace-only line to one space, not grow it");
+        assert_eq!(nav::head(&e), 1);
+        // Idempotent: a second invocation on the now single-space line is a Noop.
+        let r2 = just_one_space(&mut e, &TestClock(0));
+        assert_eq!(r2, CommandResult::Noop, "second call must be a Noop (idempotent)");
+        assert_eq!(e.active().document.buffer.to_string(), " ");
+    }
+
     // -- delete_blank_lines ---------------------------------------------------
 
     #[test]
@@ -722,6 +789,19 @@ mod tests {
         assert_eq!(r, CommandResult::Noop);
         assert_eq!(e.active().document.buffer.to_string(), "ab\n");
         assert!(!e.active().document.dirty());
+    }
+
+    #[test]
+    fn delete_horizontal_space_on_whitespace_only_line_removes_all() {
+        // BUG-2 sibling: the same empty-paragraph-window root made this silently no-op
+        // on a whitespace-only line. The logical-line fallback lets it delete the run.
+        let mut e = Editor::new_from_text("    ", None, (80, 24));
+        set_caret(&mut e, 2); // inside the 4-space run
+        let r = delete_horizontal_space(&mut e, &TestClock(0));
+        assert_eq!(r, CommandResult::Handled);
+        assert_eq!(e.active().document.buffer.to_string(), "",
+            "must delete all horizontal whitespace on the line");
+        assert_eq!(nav::head(&e), 0);
     }
 
     // -- undo-step invariant --------------------------------------------------
