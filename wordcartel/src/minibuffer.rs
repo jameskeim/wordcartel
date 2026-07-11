@@ -19,6 +19,12 @@ pub enum MinibufferKind {
     WrapColumn,
 }
 
+/// Ghost example hint shown after the caret on an empty Filter prompt — the
+/// Filter minibuffer runs through `sh -c` (A11.4), and its shell power is
+/// undiscoverable without an example.
+pub(crate) const FILTER_EXAMPLE_HINT: &str =
+    "  e.g. sort | uniq · fmt -w 72 · sed s/a/b/g · tr a-z A-Z · column -t";
+
 #[derive(Debug, Clone)]
 pub struct Minibuffer {
     pub prompt: String,

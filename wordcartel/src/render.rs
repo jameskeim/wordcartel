@@ -327,8 +327,16 @@ fn paint_status(frame: &mut Frame, editor: &Editor, area: Rect, status_row: u16,
             cs.ov_accent,
         )
     } else if let Some(ref mb) = editor.minibuffer {
+        // Empty Filter prompt: append the ghost example hint past the caret
+        // (caret sits at prompt+text — see place_cursor) so `sh -c` shell
+        // power is discoverable before anything is typed.
+        let hint = if mb.kind == crate::minibuffer::MinibufferKind::Filter && mb.text.is_empty() {
+            crate::minibuffer::FILTER_EXAMPLE_HINT
+        } else {
+            ""
+        };
         (
-            format!("{}{}", mb.prompt, mb.text),
+            format!("{}{}{hint}", mb.prompt, mb.text),
             cs.ov_accent,
         )
     } else if let Some(ref prompt) = editor.prompt {
@@ -991,6 +999,46 @@ mod tests {
         assert!(
             status_row.starts_with("> cat"),
             "status row must show minibuffer prompt+text, got: {:?}",
+            status_row
+        );
+    }
+
+    /// The empty Filter minibuffer renders a receded ghost example hint after the
+    /// caret, so the shell-power (`sh -c`) is discoverable before anything is typed.
+    #[test]
+    fn filter_minibuffer_shows_example_hint_when_empty() {
+        let mut e = Editor::new_from_text("hello\n", None, (80, 6));
+        e.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter);
+        derive::rebuild(&mut e);
+        let mut term = Terminal::new(TestBackend::new(80, 6)).unwrap();
+        term.draw(|f| render(f, &mut e)).unwrap();
+        let buf = term.backend().buffer();
+        let status_row: String = (0u16..80)
+            .map(|x| buf[(x, 5u16)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            status_row.contains("sort"),
+            "empty Filter minibuffer must show the example hint, got: {:?}",
+            status_row
+        );
+    }
+
+    /// The ghost hint disappears the moment the user types the first character.
+    #[test]
+    fn filter_hint_gone_once_text_typed() {
+        let mut e = Editor::new_from_text("hello\n", None, (80, 6));
+        e.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter);
+        e.minibuffer.as_mut().unwrap().insert('x');
+        derive::rebuild(&mut e);
+        let mut term = Terminal::new(TestBackend::new(80, 6)).unwrap();
+        term.draw(|f| render(f, &mut e)).unwrap();
+        let buf = term.backend().buffer();
+        let status_row: String = (0u16..80)
+            .map(|x| buf[(x, 5u16)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            !status_row.contains("sort"),
+            "hint must vanish once text is typed, got: {:?}",
             status_row
         );
     }
