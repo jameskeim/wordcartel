@@ -1517,6 +1517,33 @@ mod tests {
     }
 
     #[test]
+    fn review_is_not_plain_source() {
+        use crate::editor::RenderMode;
+        let mut ed = Editor::new_from_text("# Title\n", None, (40, 6));
+        // Status line legitimately differs by mode ([REVIEW] vs [PREVIEW] — see
+        // status_line_shows_review_label); turn it off so this whole-buffer pin
+        // isolates the document-body rendering the brief actually asks about.
+        ed.status_line_mode = crate::config::TransientMode::Off;
+        // Under the default terminal-plain theme, heading has no fg (`Face::default()`),
+        // and the caret sits on the single heading line so LivePreview shows it RawPlain
+        // too — content would coincide with SourcePlain. Use tokyo_night (as the sibling
+        // heading-fg test above does) so LivePreview's role colour actually distinguishes
+        // it from SourcePlain's monochrome ladder, making the assert_ne meaningful.
+        ed.theme = wordcartel_core::theme::tokyo_night();
+        ed.active_mut().view.mode = RenderMode::Review;
+        crate::derive::rebuild(&mut ed);
+        let review = render_to_buffer(&mut ed, 40, 6);
+        ed.active_mut().view.mode = RenderMode::LivePreview;
+        crate::derive::rebuild(&mut ed);
+        let live = render_to_buffer(&mut ed, 40, 6);
+        ed.active_mut().view.mode = RenderMode::SourcePlain;
+        crate::derive::rebuild(&mut ed);
+        let plain = render_to_buffer(&mut ed, 40, 6);
+        assert_eq!(review, live,  "Review renders styled exactly like LivePreview");
+        assert_ne!(review, plain, "Review is NOT raw-plain like SourcePlain");
+    }
+
+    #[test]
     fn srchi_colors_delimiters_and_content_source_stays_plain() {
         // SH paints raw markdown with construct faces (Strong/Code/Link/Heading).
         // SP shows the same raw text monochrome at base_fg.

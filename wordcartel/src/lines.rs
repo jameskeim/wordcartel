@@ -5,17 +5,19 @@
 use wordcartel_core::buffer::TextBuffer;
 
 /// Map the view's render mode + whether this is the caret line → LineRender.
-/// LivePreview conceals inactive lines and shows the active line raw+plain;
-/// SourceHighlighted styles every line raw; SourcePlain shows every line raw+plain.
+/// LivePreview and Review both conceal inactive lines and show the active line
+/// raw+plain (Review renders identically to LivePreview — only diagnostics gating
+/// differs, added in later E7 tasks); SourceHighlighted styles every line raw;
+/// SourcePlain shows every line raw+plain.
 pub(crate) fn line_render_for(mode: crate::editor::RenderMode, is_active_line: bool)
     -> wordcartel_core::style::LineRender
 {
     use crate::editor::RenderMode::*;
     use wordcartel_core::style::LineRender::*;
     match mode {
-        LivePreview       => if is_active_line { RawPlain } else { Concealed },
-        SourceHighlighted => RawStyled,
-        SourcePlain       => RawPlain,
+        LivePreview | Review => if is_active_line { RawPlain } else { Concealed },
+        SourceHighlighted    => RawStyled,
+        SourcePlain          => RawPlain,
     }
 }
 
@@ -151,5 +153,13 @@ mod tests {
         assert_eq!(line_text(&b, 2), "");
         // total = 3 lines
         assert_eq!(total_logical_lines(&b), 3);
+    }
+
+    #[test]
+    fn review_mode_mirrors_live_preview() {
+        use crate::editor::RenderMode;
+        use wordcartel_core::style::LineRender;
+        assert_eq!(line_render_for(RenderMode::Review, true),  LineRender::RawPlain);
+        assert_eq!(line_render_for(RenderMode::Review, false), LineRender::Concealed);
     }
 }

@@ -46,6 +46,7 @@ pub enum RenderMode {
     LivePreview,
     SourceHighlighted,
     SourcePlain,
+    Review,
 }
 
 #[derive(Debug, Clone)]
