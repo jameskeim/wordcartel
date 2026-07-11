@@ -3,7 +3,7 @@
 
 # Backlog
 
-**29 open · 34 shipped · 1 dropped**
+**21 open · 42 shipped · 1 dropped**
 
 Blocking Effort P: **0**
 
@@ -11,9 +11,6 @@ Blocking Effort P: **0**
 
 | id | title | status | kind | size | P? | hook |
 |---|---|---|---|---|---|---|
-| A13 | Overlay mouse parity | needs-design | feature | S |  | Overlay mouse parity: theme picker/file browser/outline ALREADY have click support; real gap is minibuffer + search overlays (zero mouse handling today). |
-| A3b | Item-by-item menu-curation pass | ready | chore | S |  | Per-command menu vs palette-only curation; concrete Q: move Filter Edit->Format? |
-| A9 | Wrap Column state-in-label | needs-design | feature | S |  | Rename 'Set Wrap Column...' to stateful 'Wrap Column: <value>'. |
 | H12 | PTY smoke suite live-splash coverage (S9) | ready | chore | S |  | Add an S9 check that launches WITHOUT --no-splash and asserts the real splash journey. |
 | H18 | Supply-chain audit (cargo audit / cargo deny) | needs-design | chore | S |  | Add CVE + license + duplicate/ban scanning (cargo audit and/or cargo deny config); pairs with H2's pre-P dependency pass. No config today. |
 | M8 | M5 follow-up: undo louder-hint for buffer-level merges | ready | debt | S |  | Finish the louder undo-eviction hint for buffer-level merges (the last M5 follow-up). |
@@ -24,11 +21,6 @@ Blocking Effort P: **0**
 | S1 | Rearrangeable outline / heading-subtree corkboard | needs-design | feature | M |  | Structure mode: atomic heading-subtree move via submit_transaction; drag-reorder. |
 | S2 | Directory-as-binder | needs-design | feature | L |  | Directory of .md as a manuscript: ordered manifest + compile step (post-Effort-P plugin). |
 | P | Effort P — in-process Lua plugin system (1.0 capstone) | needs-design | feature | XL |  | The plugin/automation spine; registers into the command/hook/job seams. See docs/design/effort-p-plugin-system-design-space.md. |
-| A10 | Dedicated Block menu for marked-block commands | needs-design | feature | TBD |  | Move the blocks_marked command family into its own MenuCategory::Block. |
-| A11 | Filter + transform SCOPE + filter docs | needs-design | feature | TBD |  | Unify buffer vs marked-block vs selection scope; document Filter. |
-| A12 | Scratch buffer = a dedicated toggle | needs-design | feature | TBD |  | toggle_scratch round-trip; exclude scratch from cycle/switcher/open-docs menu. |
-| A14 | Emacs-parity prose editing commands (transpose, word-case, join-line, whitespace fixups) | triage | feature | TBD |  | Transpose / word-case / join-line / whitespace-fixup commands (Emacs-parity, absent from the registry today); FOLD into the command-surface curation pass (A3b/A8-A13). |
-| A8 | Menu listing the open documents to switch between | needs-design | feature | TBD |  | Dynamic Window/Buffers/Documents menu auto-populated from open buffers. |
 | B7 | Selected menu-item text too light | needs-design | bug | TBD |  | Possible E5 regression; selected item may need a distinct legible highlight fg. |
 | B8 | Configurable terminal caret shape / colour | needs-design | feature | TBD |  | Emit DECSCUSR (block/beam/underline, blink, colour); restore on exit/panic. |
 | B9 | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) | triage | feature | TBD |  | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) |
@@ -43,10 +35,18 @@ Blocking Effort P: **0**
 
 ## Shipped
 
-<details><summary>34 shipped</summary>
+<details><summary>42 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
+| A10 | Dedicated Block menu for marked-block commands | 2026-07-10 | 1f0a275 |
+| A11 | Filter + transform SCOPE + filter docs | 2026-07-10 | 1f0a275 |
+| A12 | Scratch buffer = a dedicated toggle | 2026-07-10 | 1f0a275 |
+| A13 | Overlay mouse parity | 2026-07-10 | 1f0a275 |
+| A14 | Emacs-parity prose editing commands (transpose, word-case, join-line, whitespace fixups) | 2026-07-10 | 1f0a275 |
+| A3b | Item-by-item menu-curation pass | 2026-07-10 | 1f0a275 |
+| A8 | Menu listing the open documents to switch between | 2026-07-10 | 1f0a275 |
+| A9 | Wrap Column state-in-label | 2026-07-10 | 1f0a275 |
 | E6 | Splash / start screen | 2026-07-10 | 242c987 |
 | H11 | Decompose commands::run god-function | 2026-07-10 | 2437fca |
 | H14 | Split the render() body by paint surface | 2026-07-10 | 2437fca |

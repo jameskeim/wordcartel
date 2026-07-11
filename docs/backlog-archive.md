@@ -190,6 +190,158 @@ value: render `Clipboard        Auto   <chord>` (base left, value in a right-ali
 column, coexisting with the existing chord column and leaving stateless rows unchanged. Anchors:
 `menu.rs` (`leaf_text` state-in-label + `right_justify`), `MenuMark::Value` (`registry.rs:47`).
 
+### A3b. Item-by-item menu-curation pass
+<!-- item: A3b -->
+
+Apply the adopted curation principle (see the three-surface contract section) item-by-item across the
+~156 registry commands / ~72 menu set (Phase-0 count, 2026-07-10): decide per command whether it belongs in the *menu* (by
+category — the commands a word-processor user goes looking for) vs *palette-only* (motions,
+navigation, internal plumbing, keystroke-native), bringing only the genuine judgment calls back for
+approval. Lower-risk polish; rides whenever. Independent of A3 (A3 fixes the contract-*violation*;
+A3b is the contract-*application* sweep). The state-in-label display (E2) is already done.
+
+**Concrete question to resolve in this pass (user-reported 2026-07-08):** should **`filter`**
+(`Filter…`, currently `MenuCategory::Edit` — `registry.rs:140`) move to the **Format** menu? Format
+already holds the text transforms (reflow/unwrap/ventilate, `registry.rs:300+`), and a shell filter is
+arguably a text-shaping op. Weigh Edit (buffer mutation, like cut/paste) vs Format (text shaping).
+
+### A8. A menu listing the open documents to switch between
+<!-- item: A8 -->
+
+**Idea (user):** a dynamic menu that lists the currently-open documents so you can switch between them
+(a "Window" / "Buffers" / "Documents" menu that auto-populates from the open buffers).
+
+**Grounded (may drift):** a buffer SWITCHER already exists — `switch_buffer` "Switch Buffer…" (View,
+`registry.rs:296`, opens `open_buffer_switcher`), plus `next_buffer`/`prev_buffer` — but that is an OVERLAY,
+not a menu. This item is the MENU form. Menu categories are a FIXED enum `MenuCategory = [File, Edit, Format,
+View, Settings, Export]` (`registry.rs:39-42`) with statically-registered commands. A per-buffer menu is a
+NEW menu shape: entries generated from the LIVE buffer list at open time, not
+from the static registry. Command-surface implications: the registry is the single source of truth, so a
+dynamic menu needs either per-buffer commands registered on open, or a menu-population hook the contract
+doesn't have yet. Open Qs: naming (Window vs Buffers vs Documents); ordering (MRU vs open order); does it
+also appear in the palette; interaction with C4 (close-buffer prompt). Anchors: `registry.rs`
+(`MenuCategory`, `MENU_ORDER`), the menu builder (`menu.rs`), the editor's buffer list, existing next/prev-
+buffer commands.
+
+### A9. "Set Wrap Column…" → "Wrap Column: <value>" (state-in-label)
+<!-- item: A9 -->
+
+**Idea (user):** rename "Set Wrap Column…" to "Wrap Column" and show the CURRENT wrap-column value in the
+label, like the other stateful options.
+
+**Grounded (may drift):** `set_wrap_column` is a STATELESS command in the **Settings** menu (`registry.rs:547`,
+label "Set Wrap Column…") that opens a minibuffer (`MinibufferKind::WrapColumn`). (Note: you said "View" —
+it's actually Settings.) Showing the value means converting it to STATEFUL (`register_stateful` +
+`MenuMark::Value(current)`), mirroring `cycle_scrollbar` / `clipboard_provider` (`registry.rs:480-510`). The
+"…" convention means "opens a prompt" — decide whether the stateful label keeps that affordance (e.g. "Wrap
+Column: 80…") or separates show-vs-set. Command-surface contract: a stateful option needs its state fn + the
+shared setter; the minibuffer flow stays. Anchors: `registry.rs:547` (`set_wrap_column`), `registry.rs:899`,
+the state-in-label rule.
+
+### A10. A dedicated "Block" menu for the marked-block commands
+<!-- item: A10 -->
+
+**Idea (user):** the existing marked-block commands (mark / move / save a block, etc.) may deserve their OWN
+menu, separate from Edit — block-level manipulation is a slightly different mental model than character-level
+editing. This is purely a menu-ORGANIZATION question about EXISTING commands — NOT new behaviour and NOT
+operation scope (scope is A11).
+
+**Grounded (may drift):** there is already a coherent "marked block" command family (`blocks_marked` module),
+today all under **Edit** except one under **File**: `block_begin`/`block_end` ("Set Block Begin/End"),
+`mark_block_from_selection`, `block_copy`/`block_move`/`block_delete`, `block_jump_begin`/`block_jump_end`,
+`block_toggle_hidden`, `block_clear`, `copy_block_to_scratch`/`move_block_to_scratch`
+(`registry.rs:273-290`), plus `block_write` "Write Block to File…" in **File** (`registry.rs:286`). A "marked
+block" is a persistent begin/end region distinct from a character selection. A new `MenuCategory::Block` is a
+command-surface change: add the enum variant + a `MENU_ORDER` slot, repoint each command's `menu`, keep every
+command in the palette (menu ⊆ palette). Open Qs: menu name/position; whether `block_write` also moves (or is
+dual-listed); whether the scratch pair belongs here or with scratch; does anything stay in Edit. Anchors:
+`registry.rs:273-290` (the block family), `blocks_marked`, `MenuCategory`/`MENU_ORDER` (`registry.rs:39-42`),
+the menu⊆palette contract rule.
+
+### A11. Filter + transform SCOPE: whole-buffer vs marked-block vs selection (+ filter docs)
+<!-- item: A11 -->
+
+**Questions (user):** (1) does `Filter` operate on the whole buffer, or can it be scoped to a block/selection?
+(2) should the transforms (Reflow/Unwrap/Ventilate) operate on a block? (3) settle a STANDARD "block vs
+selection" scope so every scope-taking command agrees. (4) does Filter need user-facing DOCUMENTATION /
+example filters (and does it work with an arbitrary filter)?
+
+**Grounded (may drift):** `Filter…` (Edit, `registry.rs:140`) opens `MinibufferKind::Filter`; `Transform…`
+(View, `registry.rs:185`) and the discrete `Reflow`/`Unwrap`/`Ventilate` (Format, `registry.rs:300-309`) call
+`transform::dispatch_transform(..., None, …)` — the `None` is the range/scope arg. **C2 ("Transform scope")
+SHIPPED 2026-07-05** decided the TRANSFORM-UNIT rule for Reflow/Unwrap/Ventilate — start there; it likely
+answers (2) and constrains (3). The open piece is FILTER's scope + a UNIFIED block-vs-selection convention
+shared by filter, transforms, and the marked-block model (A10 / `blocks_marked`): decide whether "scope" =
+character selection, the persistent marked block, or the structural block at the caret, and make all
+scope-taking commands agree. Also confirm what Filter does today (whole buffer?) and whether it needs
+docs/examples. Anchors: `filter` (`registry.rs:140`), `MinibufferKind::Filter`, `transform::dispatch_transform`,
+C2 (SHIPPED), `blocks_marked` (marked-block model).
+
+### A12. Scratch buffer = a dedicated TOGGLE, not a cyclable buffer
+<!-- item: A12 -->
+
+**Idea (user):** reaching the scratch buffer should be a single TOGGLE command that flips between the current
+buffer and the scratch buffer (and back) — bindable to a hotkey. The scratch buffer should NOT be reachable
+by cycling (next/prev) or the buffer switcher; it is a special side surface, toggle-only.
+
+**Grounded (may drift):** today scratch is reached ONE-WAY via `goto_scratch` "Go to Scratch Buffer" (View,
+`registry.rs:295` → `workspace::goto_scratch`), and it appears to be an ordinary workspace buffer — so it is
+ALSO reachable through `next_buffer`/`prev_buffer` (View, `registry.rs:293-294`) and `switch_buffer` "Switch
+Buffer…" (`registry.rs:296`, the switcher). The ask: (1) add a `toggle_scratch` command that remembers the
+prior buffer and returns to it when invoked from scratch (round-trip), suitable for a hotkey; (2) EXCLUDE the
+scratch buffer from the next/prev cycle, the switcher, and the open-documents menu (A8) — making scratch a
+dedicated toggle target, not a document in the rotation. Open Qs: keep `goto_scratch` or replace it with the
+toggle; what "previous buffer" means if that buffer was closed; one global scratch or per-session. Anchors:
+`goto_scratch` / `next_buffer` / `prev_buffer` / `switch_buffer` (`registry.rs:293-296`),
+`workspace::goto_scratch`, the workspace buffer list; relates to A8 (switcher — scratch excluded) and the
+block→scratch commands (`scratch.rs`).
+
+### A13 — Overlay mouse parity
+<!-- item: A13 -->
+
+**Corrected grounding (Phase-0 map, 2026-07-10):** the overlays originally named here — theme
+picker, file browser, outline — ALREADY have scroll + click-to-select/jump wired in
+`mouse.rs::route_overlay`; they need no work. The real mouse-parity gap is the **minibuffer** and
+**search** overlays, which have ZERO mouse handling today (`route_overlay` drops their events). A13
+= add click-to-position-cursor in the minibuffer + click-to-jump-to-match in search, keeping the
+keyboard path authoritative (contract law 5 — every mouse affordance has a keyboard path). Seam:
+`mouse.rs::route_overlay` (add the `minibuffer`/`search` branches).
+
+### A14 — Emacs-parity prose editing commands (transpose, word-case, join-line, whitespace fixups)
+<!-- item: A14 -->
+
+A cluster of atomic editing commands that Emacs ships built-in, classic WordStar lacked, and Wordcartel's
+command registry does **not** have today (verified against the registry — `commands.rs` / `registry.rs`):
+
+- **Transpose** — swap the two chars around the caret / the two words around it / two adjacent lines (Emacs
+  `transpose-chars`/`-words`/`-lines`, C-t / M-t / C-x C-t). The classic typo-fixer; nothing equivalent exists.
+- **Word/region case** — upcase / downcase / capitalize the current word or the selection (Emacs M-u / M-l /
+  M-c + `upcase-region` etc.). No case command in the registry today.
+- **join-line / delete-indentation** — pull the next line onto this one, collapsing the join to one space
+  (Emacs M-^). Absent.
+- **Whitespace fixups** — `just-one-space` (M-SPC), `delete-blank-lines` (C-x C-o), optionally
+  `delete-horizontal-space` (M-\). Absent.
+
+**Scope discipline (what is NOT here):** keyboard macros and dynamic-abbrev (dabbrev) are *automation*, not
+single commands — that is **Effort-P** territory (record/replay over the registry), tracked under P, not here.
+`sort-lines` is already reachable via the `filter` pipe; incremental search (`find`), query-replace
+(`replace`), and paragraph reflow (`reflow`) already exist; code-editor motions (sexp/list, comment-region,
+narrowing) are out of domain for a markdown prose editor.
+
+**FOLD INTO THE COMMAND-SURFACE CURATION EFFORT** (with A3b / A8 / A9 / A10 / A11 / A12 / A13): every new
+command lands on the same surface those items touch — the name-keyed registry, the exhaustive palette, and the
+command-surface contract — so do them as one effort rather than re-loading that context per item. Each command
+is **keymap-agnostic**: it enters the registry once and is bound as fits in the CUA / WordStar presets (and
+placed in Edit ⊆ palette). Follow the existing atomic-edit pattern (`delete_word_back` / `delete_word_forward`
+/ `delete_to_line_end`, which live in **`commands/edit.rs`**): compute the range, build a `ChangeSet` + `Edit`,
+and call **`editor.apply(txn, edit, EditKind::Other, clock)` directly** + `settle_after_edit` — undo/marks stay
+correct through `editor.apply`. **Corrected grounding (Phase-0 map, 2026-07-10):** do NOT route these through
+`submit_transaction` — that is the M2 *untrusted*-edit boundary (the Effort-P `apply(Transaction)` seam for
+plugin/automation input), a separate path from internal built-in commands. Likely **S–SM** once scoped — each command is small; the count is the work.
+
+Anchors: the command registry (`registry.rs`), the existing word/line delete commands in `commands/edit.rs` as
+the pattern (`editor.apply` + `settle_after_edit`), and `docs/design/command-surface-contract.md`.
+
 ## Theme B — rendering
 
 ### B1 — Word-boundary wrap (UAX #14)
