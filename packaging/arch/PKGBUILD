@@ -11,7 +11,7 @@
 #   cd packaging/arch && makepkg -f
 #
 pkgname=wordcartel
-pkgver=0.3.0
+pkgver=0.4.0
 pkgrel=1
 pkgdesc='Markdown-first terminal word processor (wcartel) — optimized release-dist build'
 arch=('x86_64')
