@@ -7,6 +7,9 @@
 // too_many_lines / print_stdout). The shell is deliberately NOT gated (~70 terminal-
 // coordinate casts stay unannotated).
 #![deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+// H17: public-API doc-coverage gate. `warn` (not `deny`) — teeth come from the repo's
+// warning-free-build merge gate; `deny` would only add local-iteration friction.
+#![warn(missing_docs)]
 
 pub mod block_tree;
 pub mod buffer;
