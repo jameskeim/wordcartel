@@ -353,14 +353,13 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         }
 
         Command::CycleRenderMode => {
-            editor.active_mut().view.mode = match editor.active().view.mode {
+            let next = match editor.active().view.mode {
                 RenderMode::LivePreview       => RenderMode::Review,
                 RenderMode::Review            => RenderMode::SourceHighlighted,
                 RenderMode::SourceHighlighted => RenderMode::SourcePlain,
                 RenderMode::SourcePlain       => RenderMode::LivePreview,
             };
-            derive::rebuild(editor);
-            nav::ensure_visible(editor); // a mode change can alter layout/scroll (§4.5)
+            editor.set_render_mode(next, clock.now_ms());
             CommandResult::Handled
         }
 

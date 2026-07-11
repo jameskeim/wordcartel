@@ -197,8 +197,23 @@ impl Registry {
         });
         r.register("quit", "Quit", Some(MenuCategory::File), |c| run(c, Command::Quit));
 
-        // View menu.
-        r.register("cycle_render_mode", "Cycle Render Mode", Some(MenuCategory::View), |c| run(c, Command::CycleRenderMode));
+        // View menu — render mode: set-per-state primitives (palette-only) + stateful cycle
+        // representative, mirroring scrollbar_off/auto/on + cycle_scrollbar (contract law 6 / rule 8).
+        r.register("view_live_preview",       "View: Live Preview",       None,
+            |c| { c.editor.set_render_mode(crate::editor::RenderMode::LivePreview, c.clock.now_ms()); CommandResult::Handled });
+        r.register("view_review",             "View: Review",             None,
+            |c| { c.editor.set_render_mode(crate::editor::RenderMode::Review, c.clock.now_ms()); CommandResult::Handled });
+        r.register("view_source_highlighted", "View: Source Highlighted", None,
+            |c| { c.editor.set_render_mode(crate::editor::RenderMode::SourceHighlighted, c.clock.now_ms()); CommandResult::Handled });
+        r.register("view_source_plain",       "View: Source Plain",       None,
+            |c| { c.editor.set_render_mode(crate::editor::RenderMode::SourcePlain, c.clock.now_ms()); CommandResult::Handled });
+        r.register_stateful("cycle_render_mode", "Render Mode", Some(MenuCategory::View),
+            |e| MenuMark::Value(match e.active().view.mode {
+                crate::editor::RenderMode::LivePreview       => "Live",
+                crate::editor::RenderMode::Review            => "Review",
+                crate::editor::RenderMode::SourceHighlighted => "SRC-HI",
+                crate::editor::RenderMode::SourcePlain       => "Source" }),
+            |c| run(c, Command::CycleRenderMode));
         // transform: Format menu (A3b) — its discrete variants are all Format; View was
         // a historical accident.
         r.register("transform", "Transform…", Some(MenuCategory::Format), |c| {
@@ -359,6 +374,10 @@ impl Registry {
 
         // Diagnostics — quick-fix overlay + navigation + recheck (Task 6–7 / Effort 5f).
         r.register("quick_fix", "Quick Fix\u{2026}", None, |c| {
+            if !crate::diagnostics_run::should_show_diagnostics(c.editor) {
+                c.editor.status = "no diagnostic here".into();
+                return CommandResult::Handled;
+            }
             let b = c.editor.active();
             if !b.diagnostics.valid_for(b.document.version) {
                 c.editor.status = "no diagnostic here".into();
@@ -376,6 +395,9 @@ impl Registry {
             CommandResult::Handled
         });
         r.register("diag_next", "Next Diagnostic", None, |c| {
+            if !crate::diagnostics_run::should_show_diagnostics(c.editor) {
+                return CommandResult::Handled;
+            }
             let b = c.editor.active();
             if !b.diagnostics.valid_for(b.document.version) {
                 return CommandResult::Handled;
@@ -395,6 +417,9 @@ impl Registry {
             CommandResult::Handled
         });
         r.register("diag_prev", "Previous Diagnostic", None, |c| {
+            if !crate::diagnostics_run::should_show_diagnostics(c.editor) {
+                return CommandResult::Handled;
+            }
             let b = c.editor.active();
             if !b.diagnostics.valid_for(b.document.version) {
                 return CommandResult::Handled;
@@ -1098,6 +1123,7 @@ mod tests {
         // Seed the DiagStore directly (no real Harper worker).
         let doc = "# Top\nintro\n## A\nbad_word here\nmore\n## B\n";
         let mut ed = Editor::new_from_text(doc, None, (80, 24));
+        ed.active_mut().view.mode = crate::editor::RenderMode::Review; // §2.5: diag_next is Review-only
         let a_byte = doc.find("## A").unwrap();
         let bad_byte = doc.find("bad_word").unwrap();
 
@@ -1137,6 +1163,7 @@ mod tests {
         // Seed the DiagStore directly (no real Harper worker).
         let doc = "# Top\nintro\n## A\nbad_word here\nmore\n## B\n";
         let mut ed = Editor::new_from_text(doc, None, (80, 24));
+        ed.active_mut().view.mode = crate::editor::RenderMode::Review; // §2.5: diag_prev is Review-only
         let a_byte = doc.find("## A").unwrap();
         let bad_byte = doc.find("bad_word").unwrap();
 
@@ -1168,6 +1195,98 @@ mod tests {
         // ## A fold must be cleared.
         assert!(!ed.active().folds.folded().contains(&a_byte),
             "## A fold must be cleared when diag_prev lands inside its body");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 4 (Effort 7): render-mode command surface — set_render_mode, view_*
+    // primitives, stateful cycle, Review-only diag guards (spec §2.5, §3.1-3.5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn view_review_command_enters_review_and_arms() {
+        use crate::editor::RenderMode;
+        let mut ed = Editor::new_from_text("x\n", None, (80, 24));
+        ed.diag_cfg.enabled = true;
+        assert_eq!(ed.active().view.mode, RenderMode::LivePreview);
+        dispatch_id(&mut ed, "view_review");
+        assert_eq!(ed.active().view.mode, RenderMode::Review);
+        assert_eq!(ed.active().diagnostics.recheck_due_at, Some(0), "arm-on-enter at debounce 0 (Z clock now=0)");
+    }
+
+    #[test]
+    fn cycle_render_mode_state_label_tracks_mode() {
+        use crate::editor::RenderMode;
+        let reg = Registry::builtins();
+        let m = reg.meta(CommandId("cycle_render_mode")).unwrap();
+        assert_eq!(m.menu, Some(MenuCategory::View));
+        let state = m.state.expect("cycle_render_mode must be stateful");
+        let mut ed = Editor::new_from_text("x\n", None, (80, 24));
+        for (mode, expected) in [
+            (RenderMode::LivePreview, "Live"),
+            (RenderMode::Review, "Review"),
+            (RenderMode::SourceHighlighted, "SRC-HI"),
+            (RenderMode::SourcePlain, "Source"),
+        ] {
+            ed.active_mut().view.mode = mode;
+            assert_eq!(state(&ed), MenuMark::Value(expected), "label for {mode:?}");
+        }
+    }
+
+    #[test]
+    fn diag_actions_are_review_only() {
+        // Seed a valid diagnostic under the caret; try quick_fix/diag_next/diag_prev
+        // in LivePreview (must no-op) and then in Review (must act).
+        let doc = "teh cat\n";
+        let seed = |ed: &mut Editor| {
+            let v = ed.active().document.version;
+            ed.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+                range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(),
+                suggestions: vec![] }];
+            ed.active_mut().diagnostics.computed_version = v;
+            ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);
+        };
+
+        // quick_fix: LivePreview no-ops with the "no diagnostic here" status and no overlay.
+        let mut ed = Editor::new_from_text(doc, None, (80, 24));
+        seed(&mut ed);
+        dispatch_id(&mut ed, "quick_fix");
+        assert!(ed.diag.is_none(), "quick_fix must not open the overlay outside Review");
+        assert_eq!(ed.status, "no diagnostic here");
+
+        // quick_fix: Review opens the overlay.
+        let mut ed = Editor::new_from_text(doc, None, (80, 24));
+        seed(&mut ed);
+        ed.active_mut().view.mode = crate::editor::RenderMode::Review;
+        dispatch_id(&mut ed, "quick_fix");
+        assert!(ed.diag.is_some(), "quick_fix must open the overlay in Review");
+
+        // diag_next: LivePreview leaves the selection unchanged.
+        let mut ed = Editor::new_from_text(doc, None, (80, 24));
+        seed(&mut ed);
+        let before = ed.active().document.selection.clone();
+        dispatch_id(&mut ed, "diag_next");
+        assert_eq!(ed.active().document.selection, before, "diag_next must no-op outside Review");
+
+        // diag_next: Review moves the caret.
+        let mut ed = Editor::new_from_text(doc, None, (80, 24));
+        seed(&mut ed);
+        ed.active_mut().view.mode = crate::editor::RenderMode::Review;
+        dispatch_id(&mut ed, "diag_next");
+        assert_eq!(ed.active().document.selection.primary().head, 0, "diag_next must land on the diagnostic in Review");
+
+        // diag_prev: LivePreview leaves the selection unchanged.
+        let mut ed = Editor::new_from_text(doc, None, (80, 24));
+        seed(&mut ed);
+        let before = ed.active().document.selection.clone();
+        dispatch_id(&mut ed, "diag_prev");
+        assert_eq!(ed.active().document.selection, before, "diag_prev must no-op outside Review");
+
+        // diag_prev: Review moves the caret.
+        let mut ed = Editor::new_from_text(doc, None, (80, 24));
+        seed(&mut ed);
+        ed.active_mut().view.mode = crate::editor::RenderMode::Review;
+        dispatch_id(&mut ed, "diag_prev");
+        assert_eq!(ed.active().document.selection.primary().head, 0, "diag_prev must land on the diagnostic in Review");
     }
 
     // -----------------------------------------------------------------------

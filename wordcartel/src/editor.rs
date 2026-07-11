@@ -901,6 +901,18 @@ impl Editor {
     pub fn clear_clipboard_provider_dirty(&mut self) {
         self.clipboard_provider_dirty = false;
     }
+
+    /// The single setter for the render mode (command-surface contract law 6). All render-mode
+    /// mutation — the four view_* primitives, the cycle, and any future profile/plugin — routes
+    /// here. `now_ms` feeds the arm-on-entering-Review debounce timestamp.
+    pub fn set_render_mode(&mut self, mode: RenderMode, now_ms: u64) {
+        self.active_mut().view.mode = mode;
+        crate::derive::rebuild(self);
+        crate::nav::ensure_visible(self);
+        if crate::diagnostics_run::should_run_diagnostics(self) {
+            self.active_mut().diagnostics.arm(now_ms, 0);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1520,6 +1532,21 @@ mod tests {
         assert!(e.clipboard_provider_dirty, "setter raises the dirty flag");
         e.clear_clipboard_provider_dirty();
         assert!(!e.clipboard_provider_dirty, "explicit clear resets it");
+    }
+
+    // ------------------------------------------------------------------
+    // Task 4 (Effort 7): set_render_mode — the shared setter, arm-on-enter-Review
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn set_render_mode_arms_on_enter_review_only() {
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.diag_cfg.enabled = true;
+        e.set_render_mode(RenderMode::Review, 500);
+        assert_eq!(e.active().diagnostics.recheck_due_at, Some(500), "arm-on-enter at debounce 0");
+        e.active_mut().diagnostics.recheck_due_at = None;
+        e.set_render_mode(RenderMode::LivePreview, 600);
+        assert_eq!(e.active().diagnostics.recheck_due_at, None, "leaving Review never arms");
     }
 
     #[test]

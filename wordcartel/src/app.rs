@@ -3081,6 +3081,7 @@ mod tests {
         use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        e.active_mut().view.mode = crate::editor::RenderMode::Review; // §2.5: quick_fix is Review-only
         let v = e.active().document.version;
         e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
             range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(),
@@ -3123,6 +3124,9 @@ mod tests {
         use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        // JUDGMENT CALL (T4): set Review so the §2.5 mode guard passes and the *stale valid_for*
+        // guard — the one this test exists to isolate — is what refuses the overlay.
+        e.active_mut().view.mode = crate::editor::RenderMode::Review;
         let v = e.active().document.version;
         // Store a diagnostic at version V.
         e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
@@ -3151,6 +3155,7 @@ mod tests {
         use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         let mut e = Editor::new_from_text("teh cat adn dog\n", None, (80, 24));
+        e.active_mut().view.mode = crate::editor::RenderMode::Review; // §2.5: diag_next/prev are Review-only
         let v = e.active().document.version;
         e.active_mut().diagnostics.diagnostics = vec![
             wordcartel_core::diagnostics::Diagnostic { range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message:"x".into(), suggestions: vec![] },
@@ -3221,6 +3226,7 @@ mod tests {
         use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        e.active_mut().view.mode = crate::editor::RenderMode::Review; // §2.5: quick_fix is Review-only
         let v = e.active().document.version;
         // Arm valid diagnostics at version V and open the overlay.
         e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
