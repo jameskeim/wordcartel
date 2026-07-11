@@ -751,7 +751,6 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             exit_reason = ExitReason::InputLost;
             break;
         }
-        let (pre_id, pre_version) = { let b = editor.active(); (b.id, b.document.version) };
         let keep = reduce(msg, &mut editor, &reg, &keymap, &executor, &clock, &msg_tx);
         if let Some(t) = crate::theme_cmds::rebuild_keymap_if_requested(&mut editor, &cfg.keymap.patches, &reg) {
             keymap = t;
@@ -768,7 +767,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
                 overrides_snapshot = of; // second-save correctness — replace our copy
             }
         }
-        editor.note_undo_eviction(pre_id, pre_version);
+        editor.surface_undo_eviction();
         crate::clipboard::drain_clipboard_intents(&mut editor, &clip_env, &mut clip_plan, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
         crate::chrome::reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
         advance(&mut editor, &clock);

@@ -93,25 +93,24 @@ impl Harness {
         h
     }
 
-    /// The shared production sequence: snapshot → reduce → note_undo_eviction → advance → render.
-    /// NOTE: `run()` additionally runs `drain_clipboard_intents` + `reconcile_mouse_capture`
-    /// between `note_undo_eviction` and `advance`; the harness omits them (terminal-output only,
+    /// The shared production sequence: snapshot → reduce → surface_undo_eviction → advance →
+    /// render. NOTE: `run()` additionally runs `drain_clipboard_intents` + `reconcile_mouse_capture`
+    /// between `surface_undo_eviction` and `advance`; the harness omits them (terminal-output only,
     /// state-orthogonal for the seed journeys). A clipboard/mouse journey must add them.
     fn step(&mut self, msg: Msg) -> bool {
-        let (pre_id, pre_version) = { let b = self.editor.active(); (b.id, b.document.version) };
         let clock = TestClock(self.now);
         let keep = reduce(msg, &mut self.editor, &self.reg, &self.keymap, &self.ex, &clock, &self.tx);
         if let Some(t) = crate::theme_cmds::rebuild_keymap_if_requested(&mut self.editor, &[], &self.reg) {
             self.keymap = t;
         }
-        self.editor.note_undo_eviction(pre_id, pre_version);
+        self.editor.surface_undo_eviction();
         app::advance(&mut self.editor, &clock);
         self.render();
         keep
     }
 
     /// Timed mirror of `step` for the R1 bench: identical production sequence
-    /// (reduce → note_undo_eviction → advance → render) but each coarse stage is
+    /// (reduce → surface_undo_eviction → advance → render) but each coarse stage is
     /// wrapped in `Instant::now()/elapsed()`, and the fine-grained derive spans
     /// (`parse`/`heading_starts`/`foldview`/`layout_fill`) recorded inside
     /// `derive::rebuild` are drained after `advance`. Spans accumulate across BOTH
@@ -119,7 +118,6 @@ impl Harness {
     /// `advance`); the caller sums them per label to get the true per-keystroke
     /// derive cost (the second rebuild is memoized, so only cache-hit residue).
     fn step_timed(&mut self, msg: Msg) -> PhaseTimes {
-        let (pre_id, pre_version) = { let b = self.editor.active(); (b.id, b.document.version) };
         let clock = TestClock(self.now);
         // Clear any residue so this step's spans are attributable to this step.
         let _ = crate::derive::bench_spans::drain();
@@ -129,7 +127,7 @@ impl Harness {
         if let Some(t) = crate::theme_cmds::rebuild_keymap_if_requested(&mut self.editor, &[], &self.reg) {
             self.keymap = t;
         }
-        self.editor.note_undo_eviction(pre_id, pre_version);
+        self.editor.surface_undo_eviction();
         let t1 = std::time::Instant::now();
         app::advance(&mut self.editor, &clock);
         let t_advance = t1.elapsed();
