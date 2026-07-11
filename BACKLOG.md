@@ -3,7 +3,7 @@
 
 # Backlog
 
-**23 open · 43 shipped · 1 dropped**
+**21 open · 45 shipped · 1 dropped**
 
 Blocking Effort P: **0**
 
@@ -12,7 +12,6 @@ Blocking Effort P: **0**
 | id | title | status | kind | size | P? | hook |
 |---|---|---|---|---|---|---|
 | H12 | PTY smoke suite live-splash coverage (S9) | ready | chore | S |  | Add an S9 check that launches WITHOUT --no-splash and asserts the real splash journey. |
-| H18 | Supply-chain audit (cargo audit / cargo deny) | needs-design | chore | S |  | Add CVE + license + duplicate/ban scanning (cargo audit and/or cargo deny config); pairs with H2's pre-P dependency pass. No config today. |
 | M8 | M5 follow-up: undo louder-hint for buffer-level merges | ready | debt | S |  | Finish the louder undo-eviction hint for buffer-level merges (the last M5 follow-up). |
 | M9 | Optional: upgrade/patch pulldown-cmark | watch | chore | S |  | M4-rest only ISOLATES its parse panic; a real upgrade is optional, low priority. |
 | B6 | Heading-glyph STYLE toggle | needs-design | feature | SM |  | Cycle shades / Nerd numerals / inverted numerals; default stays universal Shades. |
@@ -28,7 +27,6 @@ Blocking Effort P: **0**
 | B9 | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) | triage | feature | TBD |  | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) |
 | H10 | reduce's 10-stage intercept chain boilerplate | watch | debt | TBD |  | Verbatim flat-dispatch; NOT a defect. Collapse only when Effort P adds plugin intercept stages. |
 | H13 | Editor is a 58-field data god-object | watch | debt | TBD |  | Field-clustering, not dispatch; NOT a defect. Peel PendingActions/ClipboardState only if a refactor wants it. |
-| H2 | Interrogate the burn/harper dependency weight | needs-design | research | TBD |  | 672-crate lockfile pulls a tensor stack transitively for grammar; keep/feature-gate/lighter backend? |
 | H3 | Incremental-parser tail divergences | watch | debt | TBD |  | Cosmetic, self-healing via reconcile; NOT open correctness debt; chase only if a real case appears. |
 | H5 | App-managed cleanup of swap files / state-dir debris | needs-design | chore | TBD |  | Auto-prune on launch vs an explicit 'Clean recovery files' command vs leave-to-user. |
 | PA | Analysis / policy plugins | watch | research | TBD |  | Post-P candidates: writing goals/streaks, readability lens, CMS publish, backlinks. |
@@ -37,11 +35,13 @@ Blocking Effort P: **0**
 
 ## Shipped
 
-<details><summary>43 shipped</summary>
+<details><summary>45 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
 | E7 | Grammar/spelling as a deliberate Analysis view (F1 RenderMode); draft stays quiet | 2026-07-11 | 17ba839 |
+| H18 | Supply-chain audit (cargo audit / cargo deny) | 2026-07-11 | ce403ac |
+| H2 | Interrogate the burn/harper dependency weight | 2026-07-11 | ce403ac |
 | A10 | Dedicated Block menu for marked-block commands | 2026-07-10 | 1f0a275 |
 | A11 | Filter + transform SCOPE + filter docs | 2026-07-10 | 1f0a275 |
 | A12 | Scratch buffer = a dedicated toggle | 2026-07-10 | 1f0a275 |

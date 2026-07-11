@@ -27,55 +27,6 @@ that catches real bugs — is the real asset.
 
 ---
 
-## H2 — Interrogate the `burn`/`harper` dependency weight
-<!-- item: H2 -->
-
-`harper-core` grammar/spell checking drags in `burn` (a tensor/ML framework) + `cubecl` (its
-GPU-compute layer, incl. CUDA) via `harper-brill` (Harper's POS tagger). It is used **in-process**
-as a library (no LSP; `wordcartel-core/src/diagnostics.rs` calls `harper_core` directly on a worker
-thread) — which is *why* the whole stack compiles into our binary.
-
-**QUANTIFIED — spike 2026-07-11 (stub out `diagnostics::check`, drop the `harper-core` dep, measure):**
-
-| | crates | clean release build | `wcartel` binary |
-|---|---|---|---|
-| with Harper | 672 | 50 s | 24 MB |
-| without Harper | 283 | 11 s | 8.1 MB |
-| **Harper's cost** | **+389 (58% of the lockfile)** | **~4.5× (+39 s)** | **~3× (+16 MB)** |
-
-Plus a **runtime cold-init**: the first grammar check is **~2.34 s in a debug build / ~0.30 s
-release** (warm ~18.6 ms debug / ~3.1 ms release, off-thread). This corrects the earlier "runtime
-binary unaffected" note — the binary is 3× larger, and the debug cold-init is what a user hit as
-typing "hitches"/multi-Enter (release is smooth; see R1). So the cost is build-time + supply-chain
-+ binary-size + a one-time cold-init — matters more once **Effort P** opens a plugin attack surface.
-
-**Cannot be trimmed at Harper's level (verified).** `harper-brill` is a **non-optional** dependency
-of `harper-core` 2.x (no `optional = true`, unlike the adjacent `harper-thesaurus`); `default-
-features = false` drops only the thesaurus, not `burn`. So keeping `harper-core` means keeping the
-tensor stack. Also note (a) `diagnostics.grammar = false` only **filters grammar output** — Harper
-still runs the full pass (for spelling), so it's a *distraction* toggle, not a cost toggle; only
-`diagnostics.enabled = false` actually stops the work; (b) the config's `linters: Option<Vec<String>>`
-field is **parsed but never read** — inert placeholder, no diagnostic source.
-
-**Options (the decision):**
-- **A — keep Harper, feature-gate the embed.** Gate the `harper-core` dep + `diagnostics` behind a
-  cargo feature in `wordcartel-core` (default on) so a lean/`--no-default-features` build sheds the
-  283→ stack. Lowest effort; two build flavors. Pairs with a runtime enable/disable toggle.
-- **B — replace, spell-only** (e.g. `spellbook`, a pure-Rust Hunspell). Drops the whole stack;
-  **loses grammar** (repetition/agreement/capitalization). Product decision: do we want grammar at all?
-- **C — replace, rule-based grammar** (`nlprule`, pure-Rust LanguageTool rules, no tensors). Grammar
-  without `burn`, but less maintained, sizeable rule bundles, lower coverage than Harper. Spike-worthy.
-- **D — consume Harper via `harper-ls` (external LSP subprocess)**, the way VS Code / Neovim / Zed /
-  Helix do. The tensor stack leaves *our* binary entirely; grammar becomes an `optdepends` external
-  tool (like pandoc/xclip in the PKGBUILD), Harper updates decouple from our releases. Cost: an
-  LSP-client + subprocess subsystem in the shell (fits the Effort-P job/plugin substrate). The
-  architecturally "correct" way to shed a heavy *optional* capability.
-
-**Key product fork:** how much do we value the grammar checking itself? If it stays → A (stopgap) or
-D (durable). If spelling is what matters and grammar is marginal → B. **When:** opportunistic; pairs
-with the pre-Effort-P dependency/audit pass (**H18**). Near-term mitigation shipping-independent of
-this: a runtime `toggle_diagnostics`/`toggle_grammar` command (small, command-surface item).
-
 ## H3 — Incremental-parser tail divergences · **NOT open correctness debt (corrected)**
 <!-- item: H3 -->
 
@@ -205,13 +156,3 @@ block for non-obvious fns, per the CLAUDE.md "Docs" convention), then land `#![w
 least on `wordcartel-core`) so coverage can't regress — a gate in the same spirit as the backlog drift
 gate and `module_budgets`. Orthogonal to the god-object decompositions (no `depends_on`); do it anytime
 before Effort P. Mechanical, low-risk. Anchors: `wordcartel-core/src` public items; CLAUDE.md "Docs".
-
-## H18 — Supply-chain audit (cargo audit / cargo deny)
-<!-- item: H18 -->
-
-**Grounded (2026-07-10):** no `deny.toml`/audit config exists today, and the lockfile is large (672
-crates — much of it the `burn`/`harper` tensor stack; see H2). Before Effort P opens an untrusted plugin
-surface, run a supply-chain pass: `cargo audit` (RUSTSEC CVEs) and/or `cargo deny` (advisories + license
-policy + duplicate/banned-crate checks), and decide whether to wire it as a CI gate. **Pairs with H2**
-as the pre-P dependency pass, but on a distinct axis — H2 = build-time weight, H18 = vulnerabilities /
-licenses. Forks: audit-only vs a full `deny` policy; gate vs advisory. Anchors: `Cargo.lock`, H2.
