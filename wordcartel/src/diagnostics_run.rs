@@ -39,6 +39,22 @@ pub fn should_run_diagnostics(editor: &Editor) -> bool {
 /// role (compute vs paint); delegates so the two cannot drift.
 pub fn should_show_diagnostics(editor: &Editor) -> bool { should_run_diagnostics(editor) }
 
+/// The single diagnostics re-arm seam (spec §2.2 item 1). After a `reduce` message, if the SAME
+/// buffer is still active AND its document.version advanced since the pre-dispatch snapshot, arm the
+/// debounced recheck — but only when in Review with checking enabled. Wraps every `reduce` exit path
+/// (interceptor early-returns AND the normal tail), so every active-buffer edit re-arms exactly once,
+/// with no per-path enumeration, no double-arm, and no false arm on a buffer switch (§2.3).
+pub fn arm_if_edited(editor: &mut Editor, before_id: BufferId, before_version: u64,
+    clock: &dyn wordcartel_core::history::Clock) {
+    if editor.active().id == before_id
+        && editor.active().document.version != before_version
+        && should_run_diagnostics(editor)
+    {
+        let debounce_ms = editor.diag_cfg.debounce_ms;
+        editor.active_mut().diagnostics.arm(clock.now_ms(), debounce_ms);
+    }
+}
+
 /// A re-check is due if armed, the time has been reached, and no check is
 /// already in flight (for any version). A check in flight for a different
 /// version also blocks dispatch — the result will arrive shortly and the
@@ -160,6 +176,34 @@ mod tests {
         e.active_mut().view.mode = RenderMode::Review;
         e.diag_cfg.enabled = false;
         assert!(!should_run_diagnostics(&e), "disabled → false even in Review");
+    }
+
+    #[test]
+    fn arm_if_edited_arms_only_on_active_buffer_edit_in_review() {
+        use crate::editor::{Editor, RenderMode};
+        let mut e = Editor::new_from_text("x\n", None, (40, 10));
+        e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = RenderMode::Review;
+        use crate::test_support::TestClock;
+        let id = e.active().id;
+        let v = e.active().document.version;
+        // no version change → no arm
+        arm_if_edited(&mut e, id, v, &TestClock(100));
+        assert_eq!(e.active().diagnostics.recheck_due_at, None, "equal version: no arm");
+        // version increased, same buffer, Review, enabled → arm at now+debounce
+        e.active_mut().document.version += 1;
+        arm_if_edited(&mut e, id, v, &TestClock(100));
+        assert_eq!(e.active().diagnostics.recheck_due_at, Some(100 + e.diag_cfg.debounce_ms));
+        // same edit but in LivePreview → no arm
+        e.active_mut().diagnostics.recheck_due_at = None;
+        e.active_mut().view.mode = RenderMode::LivePreview;
+        arm_if_edited(&mut e, id, v, &TestClock(200));
+        assert_eq!(e.active().diagnostics.recheck_due_at, None, "not Review: no arm");
+        // buffer-identity guard: active id != before_id → no arm even with a version delta
+        e.active_mut().view.mode = RenderMode::Review;
+        let other = crate::editor::BufferId(id.0.wrapping_add(999));
+        arm_if_edited(&mut e, other, v, &TestClock(300));
+        assert_eq!(e.active().diagnostics.recheck_due_at, None, "switch (id changed): no arm");
     }
 
     #[test]
