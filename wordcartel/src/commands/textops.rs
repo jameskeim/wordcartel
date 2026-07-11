@@ -142,6 +142,11 @@ pub(crate) fn transpose_chars(editor: &mut Editor, clock: &dyn Clock) -> Command
     let Some(next_ch) = win[rel..].chars().next() else {
         return CommandResult::Noop;
     };
+    if prev_ch == next_ch {
+        // Doubled letter ("book", "aa"): the swap is byte-identical — Noop so it
+        // never dirties the buffer or pushes an empty undo step.
+        return CommandResult::Noop;
+    }
     let from = ps + prev_rel;
     let to = ps + rel + next_ch.len_utf8();
     let out = format!("{next_ch}{prev_ch}");
@@ -206,7 +211,9 @@ pub(crate) fn transpose_words(editor: &mut Editor, clock: &dyn Clock) -> Command
 
 /// `transpose_lines` — swaps the caret's logical line with the line above it;
 /// the caret lands at the start of the line following the swapped pair. Noop
-/// on the first line (no line above to swap with).
+/// on the first line (no line above to swap with), on identical adjacent lines,
+/// or on the trailing phantom line — the latter two would apply a byte-identical
+/// edit.
 pub(crate) fn transpose_lines(editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     let h = nav::head(editor);
     let (from, to, out) = {
@@ -221,6 +228,15 @@ pub(crate) fn transpose_lines(editor: &mut Editor, clock: &dyn Clock) -> Command
         let cur_end = if l + 1 < total { buf.line_to_byte(l + 1) } else { buf.len() };
         let prev_line = buf.slice(prev_start..cur_start);
         let cur_line = buf.slice(cur_start..cur_end);
+        // No-op guard: identical adjacent lines ("aa\naa\n"), or the caret on the
+        // trailing phantom logical line (cur_line empty — no content, no newline).
+        // Both would apply a byte-identical edit (spurious dirty + empty undo step);
+        // mirror join_line's phantom-line discipline. `prev_line` always ends in '\n'
+        // (line l-1 has line l below it), so it is never empty — cur_line.is_empty()
+        // uniquely identifies the phantom line.
+        if prev_line == cur_line || cur_line.is_empty() {
+            return CommandResult::Noop;
+        }
         (prev_start, cur_end, format!("{cur_line}{prev_line}"))
     };
     let doc_len = editor.active().document.buffer.len();
@@ -447,6 +463,20 @@ mod tests {
         assert!(!e.active().document.dirty());
     }
 
+    #[test]
+    fn transpose_chars_noop_on_doubled_char() {
+        // A doubled letter ("book" at the doubled position, or "aa"): the swap is
+        // byte-identical, so the command must Noop — no dirty, no undo step.
+        let mut e = Editor::new_from_text("book\n", None, (80, 24));
+        set_caret(&mut e, 2); // between the two 'o's
+        let before_version = e.active().document.version;
+        let r = transpose_chars(&mut e, &TestClock(0));
+        assert_eq!(r, CommandResult::Noop);
+        assert_eq!(e.active().document.buffer.to_string(), "book\n");
+        assert!(!e.active().document.dirty(), "identical-char swap must not dirty the buffer");
+        assert_eq!(e.active().document.version, before_version, "no undo step pushed");
+    }
+
     // -- transpose_words ----------------------------------------------------
 
     #[test]
@@ -488,6 +518,33 @@ mod tests {
         assert_eq!(r, CommandResult::Noop);
         assert_eq!(e.active().document.buffer.to_string(), "one\ntwo\n");
         assert!(!e.active().document.dirty());
+    }
+
+    #[test]
+    fn transpose_lines_noop_on_identical_lines() {
+        // Two identical adjacent lines: the swap is byte-identical → Noop.
+        let mut e = Editor::new_from_text("aa\naa\n", None, (80, 24));
+        set_caret(&mut e, 3); // on the second "aa"
+        let before_version = e.active().document.version;
+        let r = transpose_lines(&mut e, &TestClock(0));
+        assert_eq!(r, CommandResult::Noop);
+        assert_eq!(e.active().document.buffer.to_string(), "aa\naa\n");
+        assert!(!e.active().document.dirty(), "identical-line swap must not dirty the buffer");
+        assert_eq!(e.active().document.version, before_version, "no undo step pushed");
+    }
+
+    #[test]
+    fn transpose_lines_noop_on_phantom_trailing_line() {
+        // Caret on the trailing phantom logical line (after the final '\n'): cur_line
+        // is empty, so out == prev_line == the replaced slice — byte-identical → Noop.
+        let mut e = Editor::new_from_text("one\ntwo\n", None, (80, 24));
+        set_caret(&mut e, 8); // == buf.len(), the phantom line start
+        let before_version = e.active().document.version;
+        let r = transpose_lines(&mut e, &TestClock(0));
+        assert_eq!(r, CommandResult::Noop);
+        assert_eq!(e.active().document.buffer.to_string(), "one\ntwo\n");
+        assert!(!e.active().document.dirty(), "phantom-line swap must not dirty the buffer");
+        assert_eq!(e.active().document.version, before_version, "no undo step pushed");
     }
 
     // -- case ops -------------------------------------------------------------
