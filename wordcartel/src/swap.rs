@@ -4,6 +4,7 @@
 use crate::editor::Editor;
 use crate::jobs::{Job, JobKind, JobResult, ResultClass};
 use crate::registry::Ctx;
+use std::collections::HashSet;
 use std::io;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -169,11 +170,11 @@ pub fn delete(doc_path: Option<&Path>) {
 }
 
 #[cfg(target_os = "linux")]
-fn pid_is_live(pid: u32) -> bool {
+pub(crate) fn pid_is_live(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 #[cfg(not(target_os = "linux"))]
-fn pid_is_live(_pid: u32) -> bool {
+pub(crate) fn pid_is_live(_pid: u32) -> bool {
     false // best-effort elsewhere: treat as not-live → offer recovery
 }
 
@@ -185,6 +186,105 @@ fn read_swap_capped(path: &std::path::Path) -> Option<String> {
     std::io::Read::take(f, cap + 1).read_to_string(&mut s).ok()?;
     if s.len() as u64 > cap { return None; }
     Some(s)
+}
+
+/// Read a file as raw bytes, refusing (None) if it exceeds the cap or is unreadable — the
+/// byte-exact counterpart to `read_swap_capped` (a user's saved file need not be UTF-8, and
+/// the `.tmp`/`assess` comparisons are byte-for-byte). Never slurps unbounded.
+fn read_file_capped_bytes(path: &Path) -> Option<Vec<u8>> {
+    let f = std::fs::File::open(path).ok()?;
+    let cap = crate::limits::MAX_OPEN_BYTES;
+    let mut buf = Vec::new();
+    std::io::Read::take(f, cap + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > cap { return None; }
+    Some(buf)
+}
+
+/// The swap paths this session must NEVER offer for cleaning: every open buffer's swap (named
+/// or scratch) plus this session's own scratch swap. Consumed by `cleanable_recovery_files`.
+pub(crate) fn open_swap_paths(editor: &Editor) -> HashSet<PathBuf> {
+    let mut set = HashSet::new();
+    if let Ok(p) = swap_path(None) { set.insert(p); } // this session's own scratch swap
+    for b in &editor.buffers {
+        if let Ok(p) = swap_path(b.document.path.as_deref()) { set.insert(p); }
+    }
+    set
+}
+
+/// Enumerate the recovery artifacts in `dir` that are PROVABLY safe to delete — the single
+/// source of truth for the `clean_recovery` command (H5). It FAILS CLOSED: any file whose
+/// recovery value cannot be positively disproved is EXCLUDED. `protected` holds swap paths
+/// that must never be offered (open buffers' swaps + this session's own scratch — see
+/// `open_swap_paths`). The command snapshots the returned `Vec` and deletes exactly that set,
+/// so this never itself removes anything.
+///
+/// Inclusion rules (everything else is excluded):
+/// * `recovered-*.md` — the app's own already-extracted recovery dump; the user is explicitly
+///   clearing it via this named command.
+/// * `*.swp` — ONLY when its header parses, its `realpath` is `Some`, the writing pid is not
+///   live, the candidate path is EXACTLY `swap_path(realpath)` (binding the verdict to THIS
+///   file — never a relocated/stale twin), and `assess(realpath, <saved bytes>)` returns
+///   `DiscardSilently` (swap body == the saved file → zero recovery value). `Prompt`,
+///   `OpenNormally`, unreadable, unparseable, or `realpath = None` → EXCLUDED.
+/// * `.tmp` — an atomic-write temp, ONLY when its target file (same dir, name recovered from
+///   the temp) exists and is byte-identical (the temp merely duplicates an already-committed
+///   file). A live/own writing pid, a missing target, or ANY divergence → EXCLUDED (a
+///   crash-window temp can hold the newest, only snapshot).
+pub(crate) fn cleanable_recovery_files(dir: &Path, protected: &HashSet<PathBuf>) -> Vec<PathBuf> {
+    let me = std::process::id();
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if protected.contains(&path) { continue; } // open buffer / session swap → never offer
+        let fname = entry.file_name();
+        let fname = fname.to_string_lossy();
+        if fname.starts_with("recovered-") && fname.ends_with(".md") {
+            out.push(path);
+        } else if fname.ends_with(".swp") {
+            if swap_is_cleanable(&path) { out.push(path); }
+        } else if fname.ends_with(".tmp") && tmp_is_cleanable(dir, &path, &fname, me) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// True iff a `*.swp` candidate is provably valueless (see `cleanable_recovery_files`).
+/// Every early return is a "keep" (fail closed).
+fn swap_is_cleanable(candidate: &Path) -> bool {
+    let Some(raw) = read_swap_capped(candidate) else { return false };  // unreadable / oversized
+    let Some((header, _body)) = parse(&raw) else { return false };      // unparseable provenance
+    if pid_is_live(header.pid) { return false }                         // a live writer owns it
+    let Some(rp) = header.realpath.as_deref() else { return false };    // no doc path recorded
+    let real = Path::new(rp);
+    // Bind the verdict to THIS file: `assess` recomputes `swap_path(realpath)` and judges
+    // whatever lives there. Require the candidate to BE that canonical swap, else a clean
+    // verdict for a twin could wrongly greenlight deleting a DIFFERENT, recoverable swap.
+    match swap_path(Some(real)) {
+        Ok(canonical) if canonical == *candidate => {}
+        _ => return false,
+    }
+    let current = read_file_capped_bytes(real);
+    matches!(assess(Some(real), current.as_deref()), RecoveryDecision::DiscardSilently)
+}
+
+/// True iff a `.tmp` atomic-write temp is provably valueless (see `cleanable_recovery_files`).
+/// Name shape (fsx::create_temp): `.{target}.wcartel-{pid}-{counter}.tmp`.
+fn tmp_is_cleanable(dir: &Path, candidate: &Path, fname: &str, me: u32) -> bool {
+    let Some(stripped) = fname.strip_prefix('.') else { return false };
+    let Some((target_name, tail)) = stripped.rsplit_once(".wcartel-") else { return false };
+    let Some(ids) = tail.strip_suffix(".tmp") else { return false };
+    let Some(pid) = ids.split('-').next().and_then(|s| s.parse::<u32>().ok()) else { return false };
+    if pid == me || pid_is_live(pid) { return false }  // our own / a live writer's temp
+    if target_name.is_empty() { return false }
+    let target = dir.join(target_name);
+    // Delete ONLY a temp that byte-duplicates its already-committed target; a missing target
+    // (crash before any rename) or any divergence means the temp may be the only/newest copy.
+    match (read_file_capped_bytes(&target), read_file_capped_bytes(candidate)) {
+        (Some(t), Some(c)) => t == c,
+        _ => false,
+    }
 }
 
 /// Find an orphaned scratch swap from a previous (non-live) process, if any.
@@ -679,5 +779,163 @@ mod tests {
             &mut e);
         assert!(!e.active().swap_in_flight, "panicked swap must clear swap_in_flight");
         let _ = std::fs::remove_file(&p);
+    }
+
+    // ── H5: recovery-file cleanup enumerator (SAFETY-CRITICAL — no data loss) ──────────
+
+    const DEAD_PID: u32 = 999_999; // /proc/999999 does not exist (asserted below)
+
+    /// Create a doc file with `saved` bytes on disk, plus its CANONICAL swap file whose body is
+    /// `swap_body` (header hash = fnv1a64(swap_body), matching build_header). `pid` sets the
+    /// writing pid. Returns (doc_path, swap_path). When `saved == swap_body` the swap adds
+    /// nothing (assess → DiscardSilently); when they differ it is recoverable (assess → Prompt).
+    fn make_doc_with_swap(saved: &str, swap_body: &str, pid: u32) -> (std::path::PathBuf, std::path::PathBuf) {
+        let p = scratch();
+        std::fs::write(&p, saved).unwrap();
+        let real = std::fs::canonicalize(&p).unwrap();
+        let h = SwapHeader {
+            realpath: Some(real.to_string_lossy().into_owned()),
+            load_mtime_secs: None, load_size: None,
+            content_hash: fnv1a64(swap_body.as_bytes()),
+            version: 1, ts_ms: 1, pid,
+        };
+        let sp = swap_path(Some(&p)).unwrap();
+        write_atomic(&sp, &serialize(&h, swap_body)).unwrap();
+        (p, sp)
+    }
+
+    fn unique_dir(label: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "wc-h5-{}-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed), label));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The oracle's include verdict: a swap is cleanable ONLY when its body matches the saved
+    /// file (DiscardSilently) AND the pid is dead. A diverged swap (Prompt) holds unsaved work
+    /// and must NEVER be swept — the core no-data-loss guarantee.
+    #[test]
+    fn swap_is_cleanable_only_for_valueless_dead_pid_swaps() {
+        #[cfg(target_os = "linux")]
+        assert!(!pid_is_live(DEAD_PID), "test invariant: pid 999999 must not be live");
+
+        // (a) DiscardSilently + dead pid → cleanable.
+        let (p, sp) = make_doc_with_swap("saved\n", "saved\n", DEAD_PID);
+        assert!(swap_is_cleanable(&sp), "swap body == saved file → zero recovery value → cleanable");
+        let _ = std::fs::remove_file(&sp); let _ = std::fs::remove_file(&p);
+
+        // (b) Prompt (diverged) → NEVER cleanable (recoverable unsaved content).
+        let (p, sp) = make_doc_with_swap("on disk\n", "UNSAVED WORK\n", DEAD_PID);
+        assert!(!swap_is_cleanable(&sp), "a diverged, recoverable swap must never be cleanable — no data loss");
+        let _ = std::fs::remove_file(&sp); let _ = std::fs::remove_file(&p);
+
+        // (c) live pid → excluded even though the body matches (a live writer owns it).
+        let (p, sp) = make_doc_with_swap("saved\n", "saved\n", std::process::id());
+        assert!(!swap_is_cleanable(&sp), "a live-pid swap is never swept");
+        let _ = std::fs::remove_file(&sp); let _ = std::fs::remove_file(&p);
+    }
+
+    /// A valueless swap RELOCATED away from its canonical `swap_path(realpath)` is excluded:
+    /// binding the verdict to the candidate stops a clean verdict for one file greenlighting the
+    /// deletion of a DIFFERENT (recoverable) swap.
+    #[test]
+    fn swap_is_cleanable_excludes_relocated_and_realpath_none() {
+        // Relocated: identical valueless swap content, but stored at a NON-canonical path.
+        let (p, sp) = make_doc_with_swap("saved\n", "saved\n", DEAD_PID);
+        let raw = std::fs::read_to_string(&sp).unwrap();
+        let relocated = unique_dir("reloc").join("relocated.swp");
+        std::fs::write(&relocated, &raw).unwrap();
+        assert!(!swap_is_cleanable(&relocated),
+            "a swap not at its canonical swap_path(realpath) is excluded (stale/relocated twin)");
+        let _ = std::fs::remove_file(&sp); let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&relocated);
+
+        // realpath = None → no doc to compare against → excluded (fail closed).
+        let h = SwapHeader { realpath: None, load_mtime_secs: None, load_size: None,
+            content_hash: fnv1a64(b"x\n"), version: 1, ts_ms: 1, pid: DEAD_PID };
+        let none_swap = unique_dir("none").join("nopath.swp");
+        write_atomic(&none_swap, &serialize(&h, "x\n")).unwrap();
+        assert!(!swap_is_cleanable(&none_swap), "a swap with no recorded realpath is excluded");
+        let _ = std::fs::remove_file(&none_swap);
+    }
+
+    /// End-to-end through the real state dir: the scan + oracle include a DiscardSilently swap and
+    /// exclude a Prompt swap. Membership-based (the shared state dir carries litter).
+    #[test]
+    fn enumerator_scan_includes_discard_silently_excludes_prompt() {
+        let dir = state_dir().unwrap();
+        let (p_ok, sp_ok)   = make_doc_with_swap("same\n", "same\n", DEAD_PID);        // DiscardSilently
+        let (p_bad, sp_bad) = make_doc_with_swap("file\n", "swap unsaved\n", DEAD_PID); // Prompt
+        let out = cleanable_recovery_files(&dir, &HashSet::new());
+        assert!(out.contains(&sp_ok), "valueless swap is enumerated as cleanable");
+        assert!(!out.contains(&sp_bad), "recoverable (Prompt) swap is NEVER enumerated — no data loss");
+        for f in [&sp_ok, &sp_bad, &p_ok, &p_bad] { let _ = std::fs::remove_file(f); }
+    }
+
+    /// recovered-*.md dumps are included; unrelated files are ignored; a protected path (open
+    /// buffer / session swap) is never offered even when it would otherwise qualify.
+    #[test]
+    fn enumerator_includes_recovered_dumps_honors_protected() {
+        let dir = unique_dir("recovered");
+        let dump = dir.join("recovered-notes.md-123-0.md");
+        std::fs::write(&dump, "extracted\n").unwrap();
+        let other = dir.join("notes.md");            // not a recovered dump, not a swap → ignored
+        std::fs::write(&other, "x\n").unwrap();
+        let protected_dump = dir.join("recovered-open.md-123-1.md");
+        std::fs::write(&protected_dump, "y\n").unwrap();
+
+        let mut protected = HashSet::new();
+        protected.insert(protected_dump.clone());
+        let out = cleanable_recovery_files(&dir, &protected);
+        assert!(out.contains(&dump), "a recovered-*.md dump is cleanable");
+        assert!(!out.contains(&other), "an unrelated file is never touched");
+        assert!(!out.contains(&protected_dump), "a protected path is never offered");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `.tmp` atomic-write temps: include ONLY a byte-identical duplicate of an existing target;
+    /// EXCLUDE any divergence, a missing target, or our own live-session temp.
+    #[test]
+    fn enumerator_tmp_only_byte_identical_duplicate_is_cleanable() {
+        let dir = unique_dir("tmp");
+        // (a) temp byte-identical to a committed target → valueless duplicate → included.
+        let target = dir.join("doc.md-abcd.swp");
+        std::fs::write(&target, "committed\n").unwrap();
+        let tmp_same = dir.join(format!(".doc.md-abcd.swp.wcartel-{DEAD_PID}-0.tmp"));
+        std::fs::write(&tmp_same, "committed\n").unwrap();
+        // (b) temp DIVERGING from its target → may be the newest snapshot → excluded.
+        let target2 = dir.join("doc2.md-ef01.swp");
+        std::fs::write(&target2, "old\n").unwrap();
+        let tmp_diff = dir.join(format!(".doc2.md-ef01.swp.wcartel-{DEAD_PID}-1.tmp"));
+        std::fs::write(&tmp_diff, "NEWER UNSAVED\n").unwrap();
+        // (c) temp whose target is MISSING → may be the only copy → excluded.
+        let tmp_orphan = dir.join(format!(".gone.md-9999.swp.wcartel-{DEAD_PID}-2.tmp"));
+        std::fs::write(&tmp_orphan, "only copy\n").unwrap();
+        // (d) our OWN live-session temp, even byte-identical → never swept.
+        let tmp_self = dir.join(format!(".doc.md-abcd.swp.wcartel-{}-3.tmp", std::process::id()));
+        std::fs::write(&tmp_self, "committed\n").unwrap();
+
+        let out = cleanable_recovery_files(&dir, &HashSet::new());
+        assert!(out.contains(&tmp_same), "byte-identical temp duplicate is valueless → cleanable");
+        assert!(!out.contains(&tmp_diff), "a temp diverging from its target may hold newer work → excluded");
+        assert!(!out.contains(&tmp_orphan), "a temp whose target is missing may be the only copy → excluded");
+        assert!(!out.contains(&tmp_self), "our own live session's temp is never swept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_swap_paths_covers_open_buffers_and_session_scratch() {
+        let p = scratch();
+        let e = Editor::new_from_text("hi\n", Some(p.clone()), (80, 24));
+        let set = open_swap_paths(&e);
+        assert!(set.contains(&swap_path(Some(&p)).unwrap()), "the open buffer's swap is protected");
+        assert!(set.contains(&swap_path(None).unwrap()), "this session's scratch swap is protected");
+    }
+
+    #[test]
+    fn enumerator_empty_dir_yields_nothing() {
+        let dir = unique_dir("empty");
+        assert!(cleanable_recovery_files(&dir, &HashSet::new()).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

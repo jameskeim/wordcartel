@@ -27,6 +27,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 editor.pending_save_overwrite = None;
                 editor.pending_save_as = None;
                 editor.pending_write_block = None;
+                editor.pending_clean.clear(); // H5: Esc abandons the clean-recovery snapshot; delete nothing
                 // Effort 6 / Codex gate #2: Esc on a per-buffer review prompt (raised
                 // by drive_quit_drain) must abort the quit drain, just like Cancel does.
                 // Without this, quit_drain stays Some-but-inert: the drain is
@@ -75,6 +76,32 @@ pub fn open_save_as(editor: &mut crate::editor::Editor) {
         .and_then(|p| p.parent()).map(|d| format!("{}/", d.display())).unwrap_or_default();
     editor.open_minibuffer("Save as: ", crate::minibuffer::MinibufferKind::SaveAs);
     if let Some(mb) = editor.minibuffer.as_mut() { mb.cursor = pre.len(); mb.text = pre; }
+}
+
+/// H5 `clean_recovery` command entry: enumerate the provably-valueless recovery files ONCE,
+/// snapshot them into `pending_clean`, and raise a count-confirm prompt. TOCTOU-safe — the
+/// confirm deletes the snapshot, not a re-scan. An empty enumeration (or no state dir) sets a
+/// status and raises NO prompt, so the user is never asked to confirm deleting nothing.
+pub fn open_clean_recovery(editor: &mut crate::editor::Editor) {
+    let files = match crate::swap::state_dir() {
+        Ok(dir) => crate::swap::cleanable_recovery_files(&dir, &crate::swap::open_swap_paths(editor)),
+        Err(_) => Vec::new(),
+    };
+    raise_clean_recovery(editor, files);
+}
+
+/// Snapshot-and-raise core of `open_clean_recovery`, split out so the count-0 / count-N
+/// branch is testable without depending on the shared real state dir. An empty snapshot sets
+/// a status and raises NO prompt; a non-empty one is stored verbatim into `pending_clean`
+/// (the TOCTOU-safe deletion unit) before the count-confirm modal opens.
+fn raise_clean_recovery(editor: &mut crate::editor::Editor, files: Vec<std::path::PathBuf>) {
+    if files.is_empty() {
+        editor.status = "No recovery files to clean".into();
+        return;
+    }
+    let n = files.len();
+    editor.pending_clean = files;
+    editor.open_prompt(crate::prompt::Prompt::clean_recovery(n));
 }
 
 /// Expand a user-typed path: `~/` prefix → home dir; relative → joined onto cwd.
@@ -170,6 +197,7 @@ pub fn resolve_prompt(
             editor.pending_save_overwrite = None;
             editor.pending_save_as = None;
             editor.pending_write_block = None;
+            editor.pending_clean.clear(); // H5: Cancel abandons the snapshot; delete nothing
             // Effort 6: abort an in-progress multi-buffer quit (no data loss; the
             // user backed out). Leave `quit` false.
             editor.quit_drain = None;
@@ -268,6 +296,17 @@ pub fn resolve_prompt(
         }
         PromptAction::Transform(kind) => {
             crate::transform::dispatch_transform(editor, kind, None, clock, msg_tx);
+        }
+        PromptAction::CleanRecovery => {
+            // TOCTOU-safe: delete EXACTLY the snapshot taken when the prompt was raised
+            // (`std::mem::take` also clears the field), never a fresh re-scan — a file that
+            // appeared after the prompt opened can therefore never be swept. Best-effort per
+            // file; a vanished/undeletable file is simply not counted.
+            let mut n = 0usize;
+            for p in std::mem::take(&mut editor.pending_clean) {
+                if std::fs::remove_file(&p).is_ok() { n += 1; }
+            }
+            editor.status = format!("Cleaned {n} file(s)");
         }
     }
     editor.prompt = None;
@@ -638,6 +677,95 @@ mod tests {
         assert!(sp.exists(), "swap file survives Discard");
         let _ = std::fs::remove_file(&sp);
         let _ = std::fs::remove_file(&p);
+    }
+
+    // ── H5: clean-recovery flow (SAFETY-CRITICAL — no data loss / TOCTOU) ──────────────
+
+    #[test]
+    fn raise_clean_recovery_count_zero_sets_status_and_raises_no_prompt() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        raise_clean_recovery(&mut e, Vec::new());
+        assert!(e.prompt.is_none(), "count 0 raises NO prompt");
+        assert!(e.pending_clean.is_empty());
+        assert_eq!(e.status, "No recovery files to clean");
+    }
+
+    #[test]
+    fn raise_clean_recovery_count_n_snapshots_and_opens_prompt() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        let files = vec![std::path::PathBuf::from("/a.swp"), std::path::PathBuf::from("/b.md")];
+        raise_clean_recovery(&mut e, files.clone());
+        assert_eq!(e.pending_clean, files, "the exact snapshot is stored for TOCTOU-safe deletion");
+        let p = e.prompt.as_ref().expect("count>0 opens a confirm prompt");
+        assert!(p.message.contains('2'), "message bears the count");
+        assert_eq!(p.action_for('y'), Some(crate::prompt::PromptAction::CleanRecovery));
+        assert_eq!(p.action_for('c'), Some(crate::prompt::PromptAction::Cancel));
+    }
+
+    #[test]
+    fn clean_recovery_confirm_deletes_exactly_the_snapshot_even_if_a_new_file_appears() {
+        // TOCTOU: the confirm deletes the SNAPSHOT, never a re-scan. A file that materializes
+        // in the state dir after the prompt opened must survive.
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        let a = std::env::temp_dir().join(format!("wc-h5-snap-a-{}.swp", std::process::id()));
+        let b = std::env::temp_dir().join(format!("wc-h5-snap-b-{}.swp", std::process::id()));
+        let latecomer = std::env::temp_dir().join(format!("wc-h5-snap-late-{}.swp", std::process::id()));
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.pending_clean = vec![a.clone(), b.clone()]; // snapshot taken BEFORE the latecomer exists
+        e.open_prompt(crate::prompt::Prompt::clean_recovery(2));
+        // A new file appears after the prompt was raised.
+        std::fs::write(&latecomer, "late").unwrap();
+        let (ex, clk, tx) = (InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
+        resolve_prompt(crate::prompt::PromptAction::CleanRecovery, &mut e, &ex, &clk, &tx);
+        assert!(!a.exists() && !b.exists(), "exactly the snapshot is deleted");
+        assert!(latecomer.exists(), "a file appearing after the snapshot is NEVER swept (TOCTOU-safe)");
+        assert!(e.pending_clean.is_empty(), "snapshot consumed");
+        assert!(e.prompt.is_none(), "prompt dismissed");
+        assert_eq!(e.status, "Cleaned 2 file(s)");
+        let _ = std::fs::remove_file(&latecomer);
+    }
+
+    #[test]
+    fn clean_recovery_cancel_deletes_nothing_and_clears_snapshot() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        let a = std::env::temp_dir().join(format!("wc-h5-cancel-{}.swp", std::process::id()));
+        std::fs::write(&a, "keep me").unwrap();
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.pending_clean = vec![a.clone()];
+        e.open_prompt(crate::prompt::Prompt::clean_recovery(1));
+        let (ex, clk, tx) = (InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
+        resolve_prompt(crate::prompt::PromptAction::Cancel, &mut e, &ex, &clk, &tx);
+        assert!(a.exists(), "Cancel deletes nothing");
+        assert!(e.pending_clean.is_empty(), "Cancel clears the snapshot");
+        assert!(e.prompt.is_none());
+        let _ = std::fs::remove_file(&a);
+    }
+
+    #[test]
+    fn clean_recovery_esc_deletes_nothing_and_clears_snapshot() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let a = std::env::temp_dir().join(format!("wc-h5-esc-{}.swp", std::process::id()));
+        std::fs::write(&a, "keep me").unwrap();
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.pending_clean = vec![a.clone()];
+        e.open_prompt(crate::prompt::Prompt::clean_recovery(1));
+        let (ex, clk, tx) = (InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
+        let esc = Event::Key(KeyEvent {
+            code: KeyCode::Esc, modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE });
+        intercept(Msg::Input(esc), &mut e, &ex, &clk, &tx);
+        assert!(a.exists(), "Esc deletes nothing");
+        assert!(e.pending_clean.is_empty(), "Esc clears the snapshot");
+        assert!(e.prompt.is_none(), "Esc dismisses the prompt");
+        let _ = std::fs::remove_file(&a);
     }
 
     #[test]
