@@ -286,6 +286,7 @@ static CUA: &[(&str, &str)] = &[
     // View  (input.rs lines 102, 114)
     ("ctrl-\\", "cycle_render_mode"),
     ("f1",      "cycle_render_mode"),
+    ("alt-r",   "view_review"),
     // Navigation — no shift  (input.rs lines 104–109)
     ("left",  "move_left"),
     ("right", "move_right"),
@@ -456,6 +457,9 @@ static WORDSTAR: &[(&str, &str)] = &[
     // plane never used F-keys, and without this the preset is a keyboard trap once
     // runtime switching exists — no palette, no menu, no way back without a mouse.
     ("f10", "menu"),
+    // View (E7): WordStar had no cycle-render-mode or Review binding before this
+    ("f1",    "cycle_render_mode"),
+    ("alt-r", "view_review"),
     // Command-surface curation (A14/A12): ten atomic edits under ^Q, toggle_scratch under ^K
     ("ctrl-q ctrl-t", "transpose_chars"),          ("ctrl-q t", "transpose_chars"),
     ("ctrl-q ctrl-w", "transpose_words"),          ("ctrl-q w", "transpose_words"),
@@ -776,6 +780,25 @@ mod tests {
         assert!(matches!(cmd("ctrl-k j"), Resolution::Command(CommandId("jump_to_mark"))));
         assert!(matches!(cmd("ctrl-k ctrl-m"), Resolution::None), "^KM ctrl-form reserved, not bound");
         assert!(matches!(cmd("ctrl-k ctrl-j"), Resolution::None), "^KJ ctrl-form reserved, not bound");
+    }
+
+    #[test]
+    fn view_review_binds_in_both_presets() {
+        for preset in ["cua", "wordstar"] {
+            let cfg = crate::config::KeymapConfig { preset: preset.into(), patches: vec![] };
+            let (t, w) = build_keymap(&cfg, &Registry::builtins());
+            assert!(w.is_empty(), "{preset}: no warnings: {w:?}");
+            assert!(matches!(t.resolve(&parse_seq("alt-r").unwrap()),
+                Resolution::Command(CommandId("view_review"))), "{preset}: alt-r → view_review");
+        }
+    }
+
+    #[test]
+    fn wordstar_f1_cycles_render_mode() {
+        let cfg = crate::config::KeymapConfig { preset: "wordstar".into(), patches: vec![] };
+        let (t, _) = build_keymap(&cfg, &Registry::builtins());
+        assert!(matches!(t.resolve(&parse_seq("f1").unwrap()),
+            Resolution::Command(CommandId("cycle_render_mode"))));
     }
 
     #[test]
