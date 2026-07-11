@@ -441,3 +441,18 @@ Command-surface note: this is a **menu curation** change (law 4, menu ⊆ palett
 No behaviour or keybinding change. Pairs with the A3b curation lens.
 
 *(Captured 2026-07-11 via `scripts/backlog add`.)*
+
+### H19 — Clean recovery files offers an opened recovered-*.md dump for deletion
+<!-- item: H19 -->
+
+**Observation (Fable whole-branch gate, Effort B, 2026-07-11):** the H5 `Clean recovery files…`
+command's enumerator protects an open buffer's *swap*, but if the user has opened a `recovered-*.md`
+dump itself as a live buffer, that on-disk dump file is still offered for deletion. **No data loss**
+(the dump content lives in the open buffer, whose swap IS protected, and a save re-creates the file;
+`recovered-*.md` is already-extracted output the command is designed to clear) — so this is a latent
+UX *surprise*, not a correctness bug. Polish: exclude a `recovered-*.md` from the deletable set when
+it is the backing file of an open buffer (mirror the open-buffer-swap exclusion for dumps). Low
+priority. Anchors: `swap.rs::cleanable_recovery_files`/`recovery_path_still_cleanable`, the
+`open_swap_paths`/protected-set gather, `recovery.rs` (`recovered-*.md` naming).
+
+*(Captured 2026-07-11 from the Effort-B Fable gate.)*
