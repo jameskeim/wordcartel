@@ -350,6 +350,18 @@ static CUA: &[(&str, &str)] = &[
     ("alt-.", "next_buffer"),
     // Effort 6: buffer switcher (ctrl-shift-e is free; ctrl-e is "filter")
     ("ctrl-shift-e", "switch_buffer"),
+    // Command-surface curation (A14/A12): ten atomic edits + toggle_scratch, alt- plane
+    ("alt-u",       "upcase"),
+    ("alt-l",       "downcase"),
+    ("alt-c",       "capitalize"),
+    ("alt-t",       "transpose_chars"),
+    ("alt-shift-t", "transpose_words"),
+    ("alt-shift-l", "transpose_lines"),
+    ("alt-j",       "join_line"),
+    ("alt-space",   "just_one_space"),
+    ("alt-shift-j", "delete_blank_lines"),
+    ("alt-\\",      "delete_horizontal_space"),
+    ("alt-s",       "toggle_scratch"),
 ];
 
 /// WordStar preset — full faithful classic keymap mapped to v1 command ids.
@@ -444,6 +456,18 @@ static WORDSTAR: &[(&str, &str)] = &[
     // plane never used F-keys, and without this the preset is a keyboard trap once
     // runtime switching exists — no palette, no menu, no way back without a mouse.
     ("f10", "menu"),
+    // Command-surface curation (A14/A12): ten atomic edits under ^Q, toggle_scratch under ^K
+    ("ctrl-q ctrl-t", "transpose_chars"),          ("ctrl-q t", "transpose_chars"),
+    ("ctrl-q ctrl-w", "transpose_words"),          ("ctrl-q w", "transpose_words"),
+    ("ctrl-q ctrl-n", "transpose_lines"),          ("ctrl-q n", "transpose_lines"),
+    ("ctrl-q ctrl-u", "upcase"),                   ("ctrl-q u", "upcase"),
+    ("ctrl-q ctrl-o", "downcase"),                 ("ctrl-q o", "downcase"),
+    ("ctrl-q ctrl-g", "capitalize"),               ("ctrl-q g", "capitalize"),
+    ("ctrl-q j", "join_line"),                     // plain-only (^J reserved)
+    ("ctrl-q ctrl-v", "just_one_space"),           ("ctrl-q v", "just_one_space"),
+    ("ctrl-q ctrl-z", "delete_blank_lines"),       ("ctrl-q z", "delete_blank_lines"),
+    ("ctrl-q h", "delete_horizontal_space"),       // plain-only (^H reserved)
+    ("ctrl-k ctrl-t", "toggle_scratch"),           ("ctrl-k t", "toggle_scratch"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -618,9 +642,10 @@ mod tests {
     #[test]
     fn unknown_sequence_resolves_none() {
         let (t, _) = km(&[], &[], Some("cua"));
-        // alt-j has no CUA binding (alt-z is now fold_toggle); use it as the "unbound" sentinel.
-        let j = KeyChord { code: KeyCode::Char('j'), mods: KeyModifiers::ALT };
-        assert!(matches!(t.resolve(&[j]), Resolution::None));
+        // alt-k has no CUA binding (Task 3.4 claimed alt-j for join_line); use it as
+        // the "unbound" sentinel.
+        let k = KeyChord { code: KeyCode::Char('k'), mods: KeyModifiers::ALT };
+        assert!(matches!(t.resolve(&[k]), Resolution::None));
     }
 
     #[test]
@@ -832,6 +857,78 @@ mod tests {
             assert!(matches!(t.resolve(&seq("ctrl-k a")), Resolution::Command(CommandId("move_block_to_scratch"))),
                 "WordStar: ctrl-k a → move_block_to_scratch");
         }
+    }
+
+    #[test]
+    fn atomic_edits_and_toggle_scratch_bound_in_both_presets() {
+        // Task 3.4: the ten A14 atomic-edit commands + toggle_scratch, default-bound
+        // in both presets (Codex-conflict-checked, see task-3.4 brief).
+        const IDS: &[&str] = &[
+            "upcase", "downcase", "capitalize", "transpose_chars", "transpose_words",
+            "transpose_lines", "join_line", "just_one_space", "delete_blank_lines",
+            "delete_horizontal_space", "toggle_scratch",
+        ];
+        let reg = Registry::builtins();
+
+        let cua_cfg = crate::config::KeymapConfig { preset: "cua".into(), patches: vec![] };
+        let (cua, warns) = build_keymap(&cua_cfg, &reg);
+        assert!(warns.is_empty(), "cua: no warnings expected: {warns:?}");
+        let ws_cfg = crate::config::KeymapConfig { preset: "wordstar".into(), patches: vec![] };
+        let (ws, warns) = build_keymap(&ws_cfg, &reg);
+        assert!(warns.is_empty(), "wordstar: no warnings expected: {warns:?}");
+
+        for id in IDS {
+            assert!(cua.chord_for(CommandId(id)).is_some(), "cua: {id} has no default chord");
+            assert!(ws.chord_for(CommandId(id)).is_some(), "wordstar: {id} has no default chord");
+        }
+
+        // Exact CUA chords (alt- plane).
+        let seq = |s: &str| parse_seq(s).unwrap();
+        assert!(matches!(cua.resolve(&seq("alt-u")), Resolution::Command(CommandId("upcase"))));
+        assert!(matches!(cua.resolve(&seq("alt-l")), Resolution::Command(CommandId("downcase"))));
+        assert!(matches!(cua.resolve(&seq("alt-c")), Resolution::Command(CommandId("capitalize"))));
+        assert!(matches!(cua.resolve(&seq("alt-t")), Resolution::Command(CommandId("transpose_chars"))));
+        assert!(matches!(cua.resolve(&seq("alt-shift-t")), Resolution::Command(CommandId("transpose_words"))));
+        assert!(matches!(cua.resolve(&seq("alt-shift-l")), Resolution::Command(CommandId("transpose_lines"))));
+        assert!(matches!(cua.resolve(&seq("alt-j")), Resolution::Command(CommandId("join_line"))));
+        assert!(matches!(cua.resolve(&seq("alt-space")), Resolution::Command(CommandId("just_one_space"))));
+        assert!(matches!(cua.resolve(&seq("alt-shift-j")), Resolution::Command(CommandId("delete_blank_lines"))));
+        assert!(matches!(cua.resolve(&seq("alt-\\")), Resolution::Command(CommandId("delete_horizontal_space"))));
+        assert!(matches!(cua.resolve(&seq("alt-s")), Resolution::Command(CommandId("toggle_scratch"))));
+
+        // Exact WordStar chords — both ctrl-held and plain second-key forms under
+        // the ^Q prefix, plain-only where the ctrl-form is terminal-reserved.
+        assert!(matches!(ws.resolve(&seq("ctrl-q ctrl-t")), Resolution::Command(CommandId("transpose_chars"))));
+        assert!(matches!(ws.resolve(&seq("ctrl-q t")),      Resolution::Command(CommandId("transpose_chars"))));
+        assert!(matches!(ws.resolve(&seq("ctrl-q ctrl-w")), Resolution::Command(CommandId("transpose_words"))));
+        assert!(matches!(ws.resolve(&seq("ctrl-q w")),      Resolution::Command(CommandId("transpose_words"))));
+        assert!(matches!(ws.resolve(&seq("ctrl-q ctrl-n")), Resolution::Command(CommandId("transpose_lines"))));
+        assert!(matches!(ws.resolve(&seq("ctrl-q n")),      Resolution::Command(CommandId("transpose_lines"))));
+        assert!(matches!(ws.resolve(&seq("ctrl-q ctrl-u")), Resolution::Command(CommandId("upcase"))));
+        assert!(matches!(ws.resolve(&seq("ctrl-q u")),      Resolution::Command(CommandId("upcase"))));
+        assert!(matches!(ws.resolve(&seq("ctrl-q ctrl-o")), Resolution::Command(CommandId("downcase"))));
+        assert!(matches!(ws.resolve(&seq("ctrl-q o")),      Resolution::Command(CommandId("downcase"))));
+        assert!(matches!(ws.resolve(&seq("ctrl-q ctrl-g")), Resolution::Command(CommandId("capitalize"))));
+        assert!(matches!(ws.resolve(&seq("ctrl-q g")),      Resolution::Command(CommandId("capitalize"))));
+        assert!(matches!(ws.resolve(&seq("ctrl-q j")), Resolution::Command(CommandId("join_line"))),
+            "^QJ plain-only (^J reserved)");
+        assert!(matches!(ws.resolve(&seq("ctrl-q ctrl-v")), Resolution::Command(CommandId("just_one_space"))));
+        assert!(matches!(ws.resolve(&seq("ctrl-q v")),      Resolution::Command(CommandId("just_one_space"))));
+        assert!(matches!(ws.resolve(&seq("ctrl-q ctrl-z")), Resolution::Command(CommandId("delete_blank_lines"))));
+        assert!(matches!(ws.resolve(&seq("ctrl-q z")),      Resolution::Command(CommandId("delete_blank_lines"))));
+        assert!(matches!(ws.resolve(&seq("ctrl-q h")), Resolution::Command(CommandId("delete_horizontal_space"))),
+            "^QH plain-only (^H reserved)");
+        assert!(matches!(ws.resolve(&seq("ctrl-k ctrl-t")), Resolution::Command(CommandId("toggle_scratch"))));
+        assert!(matches!(ws.resolve(&seq("ctrl-k t")),      Resolution::Command(CommandId("toggle_scratch"))));
+
+        // The ^Q/^K prefixes must resolve the new subtree WITHOUT shadowing existing
+        // top-level binds: ^T (delete_word_forward) and ^Q/^K used as other prefixes.
+        assert!(matches!(ws.resolve(&seq("ctrl-t")), Resolution::Command(CommandId("delete_word_forward"))),
+            "top-level ^T must not be shadowed by ^Q^T/^QT");
+        assert!(matches!(ws.resolve(&seq("ctrl-q l")), Resolution::Command(CommandId("find_next"))),
+            "^QL (find_next) must not be shadowed");
+        assert!(matches!(ws.resolve(&seq("ctrl-k g")), Resolution::Command(CommandId("copy_block_to_scratch"))),
+            "^KG (copy_block_to_scratch) must not be shadowed by ^KT");
     }
 
     #[test]
