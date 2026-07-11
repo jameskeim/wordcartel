@@ -17,3 +17,11 @@ pub const MAX_SESSION_BYTES: usize = 8 * 1024 * 1024;
 pub const PASTE_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// Max OSC-52 encoded clipboard payload (canonical home; re-exported from clipboard.rs).
 pub const OSC52_MAX_ENCODED: usize = 100_000;
+
+/// Effort A: harper-ls `maxFileLength` — raise well above the 120 KB default so real
+/// long-form documents are checked (the server silently skips longer docs otherwise).
+pub const HARPER_MAX_FILE_LENGTH: u64 = 10_000_000;
+/// Effort A: client-side cap on the text shipped per recheck over stdio (full-document sync).
+/// Comfortably under the server's 10 M-char limit; proportional-to-work discipline, not a
+/// correctness need — an over-cap document is skipped with a status and no in-flight state.
+pub const DIAG_MAX_SEND_BYTES: u64 = 8 * 1024 * 1024;
