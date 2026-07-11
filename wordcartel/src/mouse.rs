@@ -173,18 +173,18 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
                     .find(|(_, r)| ev.column >= r.x && ev.column < r.x + r.width && ev.row == r.y)
                     .map(|(cat, _)| cat)
             };
-            let row_id: Option<crate::registry::CommandId> = {
+            let row_action: Option<crate::menu::MenuRowAction> = {
                 let groups = &editor.menu.as_ref().unwrap().groups;
                 crate::chrome_geom::menu_dropdown_row_at(hit_area, groups, open, scroll_top, ev.column, ev.row)
-                    .and_then(|row| groups.get(open).and_then(|g| g.1.get(row)).map(|(_, id)| *id))
+                    .and_then(|row| groups.get(open).and_then(|g| g.1.get(row)).map(|(_, action)| *action))
             };
             // all borrows dropped — now mutate/dispatch/clear
             if let Some(cat) = bar_hit {
                 // category switch — reset scroll_top so stale window never carries into shorter category
                 let m = editor.menu.as_mut().unwrap();
                 m.open = cat; m.highlighted = 0; m.scroll_top = 0;
-            } else if let Some(id) = row_id {
-                crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
+            } else if let Some(action) = row_action {
+                crate::menu::dispatch_row_action(editor, reg, keymap, ex, clock, msg_tx, action);
             } else {
                 editor.menu = None; // outside → close
                 editor.search = None;
@@ -385,9 +385,58 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
         }
         return;
     }
-    // Text-input modals: consume, no row action (you type). Tail branch — the fn
-    // ends here, so an empty body suffices (no `return` needed).
-    if editor.minibuffer.is_some() || editor.search.is_some() {}
+    // A13 Task 5.1: minibuffer click → caret. `Down(Left)` inside the input line
+    // positions the caret at the clicked byte; all other events (incl. clicks on
+    // the prompt or off the status row) are consumed no-ops — outside-click-to-
+    // dismiss is deliberately out of scope (per the task brief).
+    if editor.minibuffer.is_some() {
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            if let Some(mb) = editor.minibuffer.as_mut() {
+                if let Some(byte) = crate::chrome_geom::minibuffer_click_byte(area, mb, ev.column, ev.row) {
+                    mb.cursor = byte;
+                }
+            }
+        }
+        return;
+    }
+    // A13 Task 5.2: search overlay click — two targets. `Down(Left)` on the status
+    // row inside either field focuses it + positions the caret (chrome_geom's
+    // search_field_click, sharing the painter's prefix-width source). `Down(Left)`
+    // in the edit band, on a highlighted match, selects that match — strict
+    // three-step order (spec §5.2): (1) cache-only refresh via `SearchState::
+    // recompute` DIRECTLY — NOT `search_ui::search_sync`, whose unfold/select/
+    // rebuild/ensure_visible would move the viewport BEFORE the click is mapped;
+    // (2) map the click to a document byte via the same `nav::offset_at_cell`
+    // path the no-overlay click uses; (3) if the byte lands inside a match,
+    // `set_current_at_or_after` + the shared placement tail (`search_ui::
+    // search_pin`). The overlay STAYS OPEN either way. All other events, and
+    // clicks that hit neither target, are consumed no-ops — tail branch, so the
+    // fn simply ends (no `return` needed after this `if`).
+    if editor.search.is_some() {
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            let field_hit: Option<(crate::search_overlay::Field, usize)> = editor.search.as_ref()
+                .and_then(|s| crate::chrome_geom::search_field_click(area, s, ev.column, ev.row));
+            if let Some((field, cursor)) = field_hit {
+                if let Some(s) = editor.search.as_mut() { s.field = field; s.cursor = cursor; }
+                return;
+            }
+            if let CellHit::Text { col, erow } = editing_cell(editor, ev.column, ev.row) {
+                // Step 1 — cache-only refresh (spec §5.3): current buffer/version, NOT search_sync.
+                let (rope, version) = { let d = &editor.active().document; (d.buffer.snapshot(), d.version) };
+                if let Some(s) = editor.search.as_mut() { s.recompute(&rope, version); }
+                // Step 2 — map the click to a document byte on the (now-current) layout.
+                if let Some(byte) = crate::nav::offset_at_cell(editor, col, erow) {
+                    // Step 3 — choose + place.
+                    let hit_match = editor.search.as_ref()
+                        .and_then(|s| s.matches().iter().copied().find(|m| m.start <= byte && byte < m.end));
+                    if let Some(m) = hit_match {
+                        if let Some(s) = editor.search.as_mut() { s.set_current_at_or_after(m.start); }
+                        crate::search_ui::search_pin(editor);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)] // mouse event dispatch — one branch per screen region
@@ -897,7 +946,7 @@ mod tests {
     }
 
     /// A click on the inactive bar (Pinned, menu None) at the Format label column
-    /// opens a placeholder with open == MENU_ORDER index of Format (== 2).
+    /// opens a placeholder with open == MENU_ORDER index of Format (== 3).
     #[test]
     fn click_on_inactive_bar_opens_that_category() {
         use crate::config::MenuBarMode;
@@ -906,19 +955,19 @@ mod tests {
         e.menu_bar_mode = MenuBarMode::Pinned;
         e.menu = None;
         let (reg, ex, clk, tx, km) = ctx();
-        // Compute the Format label column dynamically (MENU_ORDER[2] = Format).
+        // Compute the Format label column dynamically (MENU_ORDER[3] = Format).
         let (w, h) = e.active().view.area;
         let area = ratatui::layout::Rect::new(0, 0, w, h);
         let menu_area = ratatui::layout::Rect::new(area.x, area.y, w, h.saturating_sub(1));
         let bar = crate::chrome_geom::menu_bar_layout_cats(menu_area, &crate::registry::MENU_ORDER);
-        let (_, format_rect) = bar.iter().find(|(i, _)| *i == 2).expect("Format at index 2");
+        let (_, format_rect) = bar.iter().find(|(i, _)| *i == 3).expect("Format at index 3");
         let col = format_rect.x + 1; // somewhere inside the label
 
         // Click on the Format label while the bar is inactive (menu None).
         handle(&mut e, down(col, 0), &reg, &km, &ex, &clk, &tx);
         let menu = e.menu.as_ref().expect("click must set editor.menu to Some placeholder");
         assert!(!menu.built, "placeholder must not be built (hydration happens in reduce)");
-        assert_eq!(menu.open, 2, "placeholder open must be the MENU_ORDER index of Format");
+        assert_eq!(menu.open, 3, "placeholder open must be the MENU_ORDER index of Format");
 
         // After hydrate_overlays: built and mapped to the correct group.
         crate::app::hydrate_overlays(&mut e, &reg, &km);
@@ -1185,26 +1234,30 @@ mod tests {
     /// CommandId("palette") which reopens the picker. The mouse path is aligned
     /// with the keyboard Enter arm (app.rs ~1238) that checks row.buffer first.
     ///
-    /// Unscrolled click (2 buffers — doc + scratch): the list fits in the window
-    /// without scrolling. A scrolled variant is not needed here — the abs-row
-    /// mapping for scrolled clicks is already covered by
-    /// `scrolled_click_maps_to_absolute_row`; the bug is in the dispatch branch,
-    /// not in the hit-test, so an unscrolled click exercises the full fix path.
+    /// Unscrolled click (2 buffers — doc + a second ordinary buffer B; scratch is
+    /// excluded from the switcher per A12): the list fits in the window without
+    /// scrolling. A scrolled variant is not needed here — the abs-row mapping for
+    /// scrolled clicks is already covered by `scrolled_click_maps_to_absolute_row`;
+    /// the bug is in the dispatch branch, not in the hit-test, so an unscrolled
+    /// click exercises the full fix path.
     #[test]
     fn click_buffers_palette_row_switches_buffer_not_reopens() {
         let mut e = Editor::new_from_text(
             "doc\n", Some(std::path::PathBuf::from("/tmp/a.md")), (80, 24));
         e.install_scratch();
-        // buffers[0] = doc (active), buffers[1] = scratch.
-        let scratch_id = e.scratch_id.unwrap();
+        // buffers[0] = doc (active), buffers[1] = scratch, buffers[2] = B (ordinary).
+        let b_id = e.alloc_id();
+        let area_b = e.active().view.area;
+        e.buffers.push(crate::editor::Buffer::from_text(b_id, "b\n", None, area_b));
         assert_eq!(e.active, 0, "precondition: doc is active before the click");
         e.open_buffer_switcher();
-        // rows[0] = doc (MRU front), rows[1] = scratch — both carry buffer: Some(id).
+        // rows[0] = doc (MRU front), rows[1] = B (appended, scratch excluded) —
+        // both carry buffer: Some(id).
         assert_eq!(e.palette.as_ref().unwrap().rows.len(), 2,
-            "precondition: exactly 2 rows in the Buffers palette");
+            "precondition: exactly 2 rows in the Buffers palette (scratch excluded)");
         let area = ratatui::layout::Rect::new(0, 0, 80, 24);
         let rect = crate::chrome_geom::palette_overlay_rect(area, 2);
-        // Click the second list row (rows[1] = scratch) at ov_y + 2 + 1.
+        // Click the second list row (rows[1] = B) at ov_y + 2 + 1.
         let click_row = rect.y + 2 + 1;
         let d = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -1215,8 +1268,8 @@ mod tests {
         let (reg, ex, clk, tx, km) = ctx();
         handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
         assert!(e.palette.is_none(), "palette must close after clicking a buffer row");
-        assert_eq!(e.active().id, scratch_id,
-            "click must switch to the clicked row's buffer (scratch), not reopen the palette");
+        assert_eq!(e.active().id, b_id,
+            "click must switch to the clicked row's buffer (B), not reopen the palette");
     }
 
     // -----------------------------------------------------------------------
@@ -1594,8 +1647,8 @@ mod tests {
         crate::derive::rebuild(&mut e);
         // Synthetic 20-leaf category so the dropdown overflows the 7-row window and
         // scroll_top must advance (Codex plan gate round 2 — prove windowing, not just highlight).
-        let leaves: Vec<(String, crate::registry::CommandId)> =
-            (0..20).map(|i| (format!("item{i}"), crate::registry::CommandId("move_right"))).collect();
+        let leaves: Vec<(String, crate::menu::MenuRowAction)> =
+            (0..20).map(|i| (format!("item{i}"), crate::menu::MenuRowAction::Command(crate::registry::CommandId("move_right")))).collect();
         e.menu = Some(crate::menu::MenuView {
             groups: vec![(crate::registry::MenuCategory::Edit, leaves)],
             open: 0, highlighted: 0, built: true, scroll_top: 0 });
@@ -1629,8 +1682,8 @@ mod tests {
         use ratatui::backend::TestBackend;
         use crate::render::render;
 
-        let leaves: Vec<(String, crate::registry::CommandId)> =
-            (0..9).map(|i| (format!("item{i:02}      "), crate::registry::CommandId("move_right"))).collect();
+        let leaves: Vec<(String, crate::menu::MenuRowAction)> =
+            (0..9).map(|i| (format!("item{i:02}      "), crate::menu::MenuRowAction::Command(crate::registry::CommandId("move_right")))).collect();
         let mut e = Editor::new_from_text("abc\n", None, (30, 10));
         crate::derive::rebuild(&mut e);
         e.menu = Some(crate::menu::MenuView {
@@ -1706,5 +1759,199 @@ mod tests {
         handle(&mut e, click, &reg, &km, &ex, &clk, &tx);
         assert_eq!(caret_before, crate::nav::head(&e),
             "click below painted dropdown (row 9) must NOT dispatch move_right — caret must not advance");
+    }
+
+    // -----------------------------------------------------------------------
+    // A13 Task 5.1: minibuffer click → caret
+    // -----------------------------------------------------------------------
+
+    /// Open a Filter minibuffer with the given prompt/text/cursor on an 80x24 editor.
+    fn open_minibuffer(e: &mut Editor, prompt: &str, text: &str, cursor: usize) {
+        e.minibuffer = Some(crate::minibuffer::Minibuffer {
+            prompt: prompt.into(),
+            text: text.into(),
+            cursor,
+            kind: crate::minibuffer::MinibufferKind::Filter,
+        });
+    }
+
+    /// Clicking inside the minibuffer's text on the status row positions the caret
+    /// at the exact byte offset of the clicked char — multibyte-safe (é is 2 bytes).
+    /// "sh> " prompt = 4 char-columns; text "éxx" → char-col 1 ('x') = byte 2.
+    #[test]
+    fn minibuffer_click_positions_caret() {
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        open_minibuffer(&mut e, "sh> ", "\u{e9}xx", 0);
+        let (reg, ex, clk, tx, km) = ctx();
+        let (_w, h) = e.active().view.area;
+        let status_row = h - 1;
+        handle(&mut e, down(4 + 1, status_row), &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.minibuffer.as_ref().unwrap().cursor, '\u{e9}'.len_utf8(),
+            "click at char-col 1 must land on the byte boundary AFTER the multibyte 'é'");
+        assert!(e.minibuffer.is_some(), "minibuffer stays open");
+    }
+
+    /// A click past the end of the text clamps the caret to `text.len()` — never
+    /// panics on an out-of-range char index.
+    #[test]
+    fn minibuffer_click_past_end_clamps() {
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        open_minibuffer(&mut e, "sh> ", "\u{e9}xx", 0);
+        let (reg, ex, clk, tx, km) = ctx();
+        let (_w, h) = e.active().view.area;
+        let status_row = h - 1;
+        handle(&mut e, down(4 + 50, status_row), &reg, &km, &ex, &clk, &tx); // far past the text
+        let mb = e.minibuffer.as_ref().unwrap();
+        assert_eq!(mb.cursor, mb.text.len(), "click past end clamps to text.len()");
+    }
+
+    /// A click on the prompt itself (before `prompt_cols`) is a consumed no-op —
+    /// caret unchanged, minibuffer stays open.
+    #[test]
+    fn minibuffer_click_prompt_is_noop() {
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        open_minibuffer(&mut e, "sh> ", "\u{e9}xx", 2);
+        let (reg, ex, clk, tx, km) = ctx();
+        let (_w, h) = e.active().view.area;
+        let status_row = h - 1;
+        handle(&mut e, down(1, status_row), &reg, &km, &ex, &clk, &tx); // col 1 < prompt_cols (4)
+        assert_eq!(e.minibuffer.as_ref().unwrap().cursor, 2, "click on the prompt must not move the caret");
+        assert!(e.minibuffer.is_some(), "minibuffer stays open");
+    }
+
+    // -----------------------------------------------------------------------
+    // A13 Task 5.2: search overlay click (field focus + match click)
+    // -----------------------------------------------------------------------
+
+    /// Clicking inside the needle field on the status row focuses `Field::Needle`
+    /// and positions the char-count-mapped byte cursor; the overlay stays open.
+    #[test]
+    fn search_needle_click_focuses_and_positions() {
+        let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_search(crate::search_overlay::Phase::Find, 0);
+        for c in "wor".chars() { e.search.as_mut().unwrap().insert(c); }
+        // reset focus so the click is what moves it, not the prior insert loop
+        e.search.as_mut().unwrap().field = crate::search_overlay::Field::Needle;
+        e.search.as_mut().unwrap().cursor = 0;
+        let (reg, ex, clk, tx, km) = ctx();
+        let status_row = e.active().view.area.1 - 1;
+        // "Find: " = 6 cols; col 8 → char idx 2 within "wor" ('w','o' consumed).
+        let d = down(8, status_row);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        let s = e.search.as_ref().unwrap();
+        assert_eq!(s.field, crate::search_overlay::Field::Needle);
+        assert_eq!(s.cursor, 2, "cursor lands at the char-mapped byte offset within the needle");
+        assert!(e.search.is_some(), "search overlay stays open");
+    }
+
+    /// In `Phase::Replace`, clicking inside the template field (after `"Find:
+    /// {needle}  Replace: "`) focuses `Field::Template`, even when the needle
+    /// field was previously focused.
+    #[test]
+    fn search_template_click_in_replace_phase() {
+        let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_search(crate::search_overlay::Phase::Replace, 0);
+        for c in "wor".chars() { e.search.as_mut().unwrap().insert(c); }
+        e.search.as_mut().unwrap().field = crate::search_overlay::Field::Template;
+        e.search.as_mut().unwrap().cursor = 0;
+        for c in "cat".chars() { e.search.as_mut().unwrap().insert(c); }
+        // Focus back on Needle before the click — proves the click MOVES focus.
+        e.search.as_mut().unwrap().field = crate::search_overlay::Field::Needle;
+        e.search.as_mut().unwrap().cursor = 0;
+        let (reg, ex, clk, tx, km) = ctx();
+        let status_row = e.active().view.area.1 - 1;
+        let prefix = "Find: wor  Replace: ".chars().count() as u16;
+        let d = down(prefix + 2, status_row); // char idx 2 within "cat" ('c','a' consumed)
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        let s = e.search.as_ref().unwrap();
+        assert_eq!(s.field, crate::search_overlay::Field::Template);
+        assert_eq!(s.cursor, 2);
+    }
+
+    /// Clicking a highlighted match in the buffer body selects it (current match
+    /// + selection == the clicked match's range) and the overlay STAYS OPEN.
+    #[test]
+    fn search_match_click_selects_that_match_stays_open() {
+        // line0 = "foo abc bar\n" (bytes 0..12, "abc" at 4..7)
+        // line1 = "baz abc qux\n" (bytes 12..24, "abc" at 16..19)
+        let text = "foo abc bar\nbaz abc qux\n";
+        let mut e = Editor::new_from_text(text, None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_search(crate::search_overlay::Phase::Find, 0);
+        for c in "abc".chars() { e.search.as_mut().unwrap().insert(c); }
+        let (rope, version) = { let d = &e.active().document; (d.buffer.snapshot(), d.version) };
+        e.search.as_mut().unwrap().recompute(&rope, version);
+        assert_eq!(e.search.as_ref().unwrap().count(), 2, "precondition: two matches");
+
+        let (reg, ex, clk, tx, km) = ctx();
+        // row1 col5 sits inside the second "abc" (16..19: col4..7 on line1).
+        let d = down(5, 1);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+
+        let sel = e.active().document.selection.primary();
+        assert_eq!((sel.from(), sel.to()), (16, 19), "selection == clicked match's range");
+        assert_eq!(e.search.as_ref().unwrap().current_ordinal(), Some(2), "current match is the clicked one");
+        assert!(e.search.is_some(), "search overlay stays open after a match click");
+    }
+
+    /// Regression (spec §5.3): an async edit (mirroring `jobs_apply::apply_filter_done`
+    /// — mutate + rebuild + ensure_visible, but NEVER touching the search cache) can
+    /// land while search stays open, leaving `editor.search`'s cached match offsets
+    /// stale relative to the live buffer/version. The match-click path's step-1
+    /// cache-only refresh (`SearchState::recompute`, NOT `search_ui::search_sync`)
+    /// must run BEFORE the click is mapped to a byte offset, so the FRESH post-edit
+    /// match is selected — not a stale one, and not silently dropped.
+    #[test]
+    fn search_match_click_refreshes_stale_cache() {
+        let text = "foo abc bar\nbaz abc qux\n";
+        let mut e = Editor::new_from_text(text, None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_search(crate::search_overlay::Phase::Find, 0);
+        for c in "abc".chars() { e.search.as_mut().unwrap().insert(c); }
+        let (rope, version) = { let d = &e.active().document; (d.buffer.snapshot(), d.version) };
+        e.search.as_mut().unwrap().recompute(&rope, version);
+        assert_eq!(e.search.as_ref().unwrap().count(), 2, "precondition: two matches");
+
+        let (reg, ex, clk, tx, km) = ctx();
+
+        // Async edit: insert "XX" at byte 0 (line0 only) — shifts line1's absolute
+        // byte offsets +2 while its ON-SCREEN column position is untouched. Apply
+        // directly + rebuild + ensure_visible (mirrors apply_filter_done) WITHOUT
+        // touching editor.search — the cache is now stale by construction.
+        let doc_len = e.active().document.buffer.len();
+        let (cs, edit) = crate::commands::build_range_replace(0, 0, "XX", doc_len);
+        let txn = wordcartel_core::history::Transaction::new(cs)
+            .with_selection(wordcartel_core::selection::Selection::single(0));
+        e.apply(txn, edit, wordcartel_core::history::EditKind::Other, &clk);
+        crate::derive::rebuild(&mut e);
+        crate::nav::ensure_visible(&mut e);
+
+        // Precondition: the cache still holds the PRE-edit offsets.
+        assert_eq!(e.search.as_ref().unwrap().matches(),
+            &[wordcartel_core::search::Match { start: 4, end: 7 },
+              wordcartel_core::search::Match { start: 16, end: 19 }],
+            "precondition: cache is stale relative to the post-edit buffer/version");
+
+        // Click the second "abc" at its CURRENT screen position (row1, unchanged —
+        // only line0 was edited); the LIVE (post-edit) match is now 18..21.
+        let d = down(6, 1);
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+
+        let sel = e.active().document.selection.primary();
+        assert_eq!((sel.from(), sel.to()), (18, 21),
+            "match-click must select against FRESH post-edit offsets, not the stale 16..19");
+        assert_eq!(e.search.as_ref().unwrap().current_ordinal(), Some(2));
+        assert!(e.search.is_some(), "overlay stays open");
+
+        // Control: a click that lands on NO match leaves selection untouched.
+        let before = e.active().document.selection.clone();
+        let miss = down(0, 0); // 'X' of the inserted "XX" prefix — not inside any match
+        handle(&mut e, miss, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.active().document.selection, before, "non-match click leaves selection unchanged");
     }
 }

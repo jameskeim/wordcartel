@@ -321,12 +321,22 @@ fn paint_status(frame: &mut Frame, editor: &Editor, area: Rect, status_row: u16,
     // When a modal prompt is active, render its message instead of the normal
     // status text, using a distinct style so it stands out.
     // When the minibuffer is open, render <prompt><text> on the status row.
+    // Trailing ghost hint for the empty Filter prompt — rendered as its OWN dim
+    // (ChromeMuted) span past the prompt/caret so it recedes below the ChromeAccent
+    // prompt text; set in the minibuffer arm below, "" everywhere else.
+    let mut hint: &str = "";
     let (status_text, status_style) = if let Some(ref s) = editor.search {
         (
             crate::render_status::format_search_bar(s),
             cs.ov_accent,
         )
     } else if let Some(ref mb) = editor.minibuffer {
+        // Empty Filter prompt: expose the `sh -c` shell power via the ghost example
+        // hint. The caret sits at prompt+text (see place_cursor), so the hint —
+        // emitted as a separate dim span after this text — renders past it.
+        if mb.kind == crate::minibuffer::MinibufferKind::Filter && mb.text.is_empty() {
+            hint = crate::minibuffer::FILTER_EXAMPLE_HINT;
+        }
         (
             format!("{}{}", mb.prompt, mb.text),
             cs.ov_accent,
@@ -373,13 +383,26 @@ fn paint_status(frame: &mut Frame, editor: &Editor, area: Rect, status_row: u16,
     };
     // Truncate the composed string to the terminal width (guard for very narrow terminals).
     let truncated: String = composed.chars().take(w as usize).collect();
-    let status_line = Line::from(Span::styled(truncated, status_style));
+    let used = truncated.chars().count();
     let status_area = Rect::new(area.x, status_row, w, 1);
     // Fill the WHOLE row with the state's chrome style first — the Paragraph
     // styles only the text span, and a partial bar next to the full-width menu
     // bar was the reported-mismatch class (Fable whole-branch I-2).
     frame.buffer_mut().set_style(status_area, status_style);
-    frame.render_widget(Paragraph::new(status_line), status_area);
+    // The empty-Filter ghost hint rides its OWN ChromeMuted (dim secondary chrome)
+    // span past the prompt so it recedes below the ChromeAccent prompt. ChromeMuted
+    // recedes via a muted fg/bg (and DIM where a theme uses it); `remove_modifier`
+    // strips the accent BOLD/REVERSED the row-fill set on these cells so it doesn't
+    // inherit the live-prompt emphasis.
+    let spans = if !hint.is_empty() && used < w as usize {
+        let hint_style = compose::compose(&editor.theme, editor.depth, &[SE::ChromeMuted])
+            .remove_modifier(Modifier::BOLD | Modifier::REVERSED);
+        let tail: String = hint.chars().take(w as usize - used).collect();
+        vec![Span::styled(truncated, status_style), Span::styled(tail, hint_style)]
+    } else {
+        vec![Span::styled(truncated, status_style)]
+    };
+    frame.render_widget(Paragraph::new(Line::from(spans)), status_area);
 }
 
 /// Phase 12 — the hardware cursor: search-field / minibuffer / normal-caret arms,
@@ -390,11 +413,9 @@ fn place_cursor(frame: &mut Frame, editor: &Editor, area: Rect, edit_top: u16,
     if let Some(ref s) = editor.search {
         // Search bar is open: place caret on the status row at the focused field's caret.
         // Use char counts (not byte offsets) for correct placement with multibyte text.
-        let prefix_cols = match s.field {
-            crate::search_overlay::Field::Needle => "Find: ".chars().count(),
-            crate::search_overlay::Field::Template =>
-                format!("Find: {}  Replace: ", s.needle).chars().count(),
-        };
+        // Prefix width is the SINGLE SOURCE shared with `chrome_geom::search_field_click`
+        // (the mouse hit-test) — painter and hit-test can never drift.
+        let prefix_cols = crate::chrome_geom::search_field_prefix_cols(s, s.field);
         let caret_cols = s.focused_field()[..s.cursor].chars().count();
         // H7: sum in usize and guard BEFORE narrowing — a >65535-column field must hide
         // the caret, not truncate to a small column that passes the `< w` guard.
@@ -991,6 +1012,71 @@ mod tests {
         assert!(
             status_row.starts_with("> cat"),
             "status row must show minibuffer prompt+text, got: {:?}",
+            status_row
+        );
+    }
+
+    /// The empty Filter minibuffer renders a receded ghost example hint after the
+    /// caret, so the shell-power (`sh -c`) is discoverable before anything is typed.
+    #[test]
+    fn filter_minibuffer_shows_example_hint_when_empty() {
+        use ratatui::style::Modifier;
+        let mut e = Editor::new_from_text("hello\n", None, (80, 6));
+        e.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter);
+        derive::rebuild(&mut e);
+        let mut term = Terminal::new(TestBackend::new(80, 6)).unwrap();
+        term.draw(|f| render(f, &mut e)).unwrap();
+        let buf = term.backend().buffer();
+        let status_row: String = (0u16..80)
+            .map(|x| buf[(x, 5u16)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            status_row.contains("sort"),
+            "empty Filter minibuffer must show the example hint, got: {:?}",
+            status_row
+        );
+        // The hint must RECEDE: its cells carry the ChromeMuted dim-secondary-chrome
+        // element (which recedes via a muted fg/bg color, plus DIM where the theme uses
+        // it), NOT the ChromeAccent bold+reverse of the live prompt. Verify against the
+        // real composed ChromeMuted so the fix is proven theme-robustly.
+        let sort_col = status_row.find("sort").expect("hint 'sort' present") as u16;
+        let hint_cell = buf[(sort_col, 5u16)].style();
+        let muted = compose::compose(&e.theme, e.depth, &[SE::ChromeMuted]);
+        assert_eq!(hint_cell.fg, muted.fg, "ghost hint fg must be ChromeMuted fg");
+        assert_eq!(hint_cell.bg, muted.bg, "ghost hint bg must be ChromeMuted bg");
+        assert!(
+            !hint_cell.add_modifier.contains(Modifier::BOLD)
+                && !hint_cell.add_modifier.contains(Modifier::REVERSED),
+            "ghost hint must NOT carry the ChromeAccent BOLD/REVERSED of live prompt text, \
+             got modifiers: {:?}",
+            hint_cell.add_modifier
+        );
+        // Contrast: the prompt glyph (col 0) DOES carry the active ChromeAccent emphasis.
+        let prompt_cell = buf[(0u16, 5u16)].style();
+        assert!(
+            prompt_cell.add_modifier.contains(Modifier::BOLD)
+                || prompt_cell.add_modifier.contains(Modifier::REVERSED),
+            "live prompt must carry ChromeAccent emphasis, got: {:?}",
+            prompt_cell.add_modifier
+        );
+    }
+
+    /// The ghost hint disappears the moment the user types the first character.
+    #[test]
+    fn filter_hint_gone_once_text_typed() {
+        let mut e = Editor::new_from_text("hello\n", None, (80, 6));
+        e.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter);
+        e.minibuffer.as_mut().unwrap().insert('x');
+        derive::rebuild(&mut e);
+        let mut term = Terminal::new(TestBackend::new(80, 6)).unwrap();
+        term.draw(|f| render(f, &mut e)).unwrap();
+        let buf = term.backend().buffer();
+        let status_row: String = (0u16..80)
+            .map(|x| buf[(x, 5u16)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            !status_row.contains("sort"),
+            "hint must vanish once text is typed, got: {:?}",
             status_row
         );
     }
@@ -2762,20 +2848,23 @@ mod tests {
     /// in Chrome style; row 1 has no dropdown (contains the document text).
     #[test]
     fn render_paints_inactive_bar_labels() {
-        // 6 categories: " File "(6)+" Edit "(6)+" Format "(8)+" View "(6)+
-        //               " Settings "(10)+" Export "(8) = 44 — use 50 wide to fit all.
-        let mut e = Editor::new_from_text("hello\n", None, (50, 8));
+        // 8 categories (Task 4.2 adds Documents after View): " File "(6)+" Edit "(6)+
+        // " Block "(7)+" Format "(8)+" View "(6)+" Documents "(11)+" Settings "(10)+
+        // " Export "(8) = 62 — use 70 wide to fit all.
+        let mut e = Editor::new_from_text("hello\n", None, (70, 8));
         e.menu_bar_mode = crate::config::MenuBarMode::Pinned;
         e.menu = None;
         derive::rebuild(&mut e);
-        let buf = render_to_buffer(&mut e, 50, 8);
+        let buf = render_to_buffer(&mut e, 70, 8);
         let row0 = row_string(&buf, 0);
-        assert!(row0.contains(" File "),     "inactive bar must show ' File '");
-        assert!(row0.contains(" Edit "),     "inactive bar must show ' Edit '");
-        assert!(row0.contains(" Format "),   "inactive bar must show ' Format '");
-        assert!(row0.contains(" View "),     "inactive bar must show ' View '");
-        assert!(row0.contains(" Settings "), "inactive bar must show ' Settings '");
-        assert!(row0.contains(" Export "),   "inactive bar must show ' Export '");
+        assert!(row0.contains(" File "),      "inactive bar must show ' File '");
+        assert!(row0.contains(" Edit "),      "inactive bar must show ' Edit '");
+        assert!(row0.contains(" Block "),     "inactive bar must show ' Block '");
+        assert!(row0.contains(" Format "),    "inactive bar must show ' Format '");
+        assert!(row0.contains(" View "),      "inactive bar must show ' View '");
+        assert!(row0.contains(" Documents "), "inactive bar must show ' Documents '");
+        assert!(row0.contains(" Settings "),  "inactive bar must show ' Settings '");
+        assert!(row0.contains(" Export "),    "inactive bar must show ' Export '");
         // Row 1 must have the document text (not a dropdown).
         let row1 = row_string(&buf, 1);
         assert!(row1.contains("hello"), "row 1 must show document text, not a dropdown");
@@ -2956,8 +3045,8 @@ mod tests {
         // Short terminal (h=8) so avail_below=7; categories with many items overflow the window.
         let mut e = Editor::new_from_text("x\n", None, (80, 8));
         // Build menu with a synthetic tall category so the dropdown overflows the 7-row window.
-        let leaves: Vec<(String, crate::registry::CommandId)> = (0..20)
-            .map(|i| (format!("item{i:02}       "), crate::registry::CommandId("move_right")))
+        let leaves: Vec<(String, crate::menu::MenuRowAction)> = (0..20)
+            .map(|i| (format!("item{i:02}       "), crate::menu::MenuRowAction::Command(crate::registry::CommandId("move_right"))))
             .collect();
         e.menu = Some(crate::menu::MenuView {
             groups: vec![(crate::registry::MenuCategory::Edit, leaves)],
@@ -3000,8 +3089,8 @@ mod tests {
     fn dropdown_highlight_never_hidden_in_overflow() {
         // 80×8 terminal: avail_below = 7, drop_rect.height = 7, item_rows = 6.
         let mut e = Editor::new_from_text("x\n", None, (80, 8));
-        let leaves: Vec<(String, crate::registry::CommandId)> = (0..20)
-            .map(|i| (format!("item{i:02}"), crate::registry::CommandId("move_right")))
+        let leaves: Vec<(String, crate::menu::MenuRowAction)> = (0..20)
+            .map(|i| (format!("item{i:02}"), crate::menu::MenuRowAction::Command(crate::registry::CommandId("move_right"))))
             .collect();
         // Place the highlight at the position that was hidden under the old code:
         // highlighted=6, scroll_top=0.  With list_h=7 (old) keep_visible accepts this

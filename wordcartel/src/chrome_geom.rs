@@ -18,12 +18,12 @@ pub(crate) fn menu_bar_layout_cats(area: Rect, cats: &[crate::registry::MenuCate
 }
 
 /// Compute bar label rects from the built groups list.  Thin wrapper over `menu_bar_layout_cats`.
-pub(crate) fn menu_bar_layout(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)]) -> Vec<(usize, Rect)> {
+pub(crate) fn menu_bar_layout(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::menu::MenuRowAction)>)]) -> Vec<(usize, Rect)> {
     let cats: Vec<crate::registry::MenuCategory> = groups.iter().map(|g| g.0).collect();
     menu_bar_layout_cats(area, &cats)
 }
 
-pub(crate) fn menu_dropdown_rect(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)], open: usize) -> Option<Rect> {
+pub(crate) fn menu_dropdown_rect(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::menu::MenuRowAction)>)], open: usize) -> Option<Rect> {
     let bar = menu_bar_layout(area, groups);
     let (_, label_rect) = bar.get(open)?;
     let leaves = &groups.get(open)?.1;
@@ -37,7 +37,7 @@ pub(crate) fn menu_dropdown_rect(area: Rect, groups: &[(crate::registry::MenuCat
         list_h as u16))
 }
 
-pub(crate) fn menu_dropdown_row_at(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)], open: usize, scroll_top: usize, col: u16, row: u16) -> Option<usize> {
+pub(crate) fn menu_dropdown_row_at(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::menu::MenuRowAction)>)], open: usize, scroll_top: usize, col: u16, row: u16) -> Option<usize> {
     let r = menu_dropdown_rect(area, groups, open)?;
     let leaves_len = groups.get(open).map(|g| g.1.len()).unwrap_or(0);
     let list_h = r.height as usize;
@@ -207,6 +207,79 @@ pub(crate) fn prompt_choice_at(area: Rect, prompt: &crate::prompt::Prompt, col: 
     None
 }
 
+/// Map a minibuffer click `(col, row)` to a byte offset in `mb.text`, or `None`
+/// when the click is outside the input line (any row but the status row) or on
+/// the prompt itself.
+///
+/// Mirrors `render.rs::place_cursor`'s minibuffer arm: the caret column is
+/// `prompt.chars().count() + text[..cursor].chars().count()` — one terminal
+/// column per char, byte offset only used for the actual string index. This
+/// walks the inverse: subtract `prompt_cols` from the clicked column to get a
+/// char-index into `mb.text`, then resolve that char-index to its byte offset
+/// via `char_indices` (never a mid-char byte — `char_indices` only yields
+/// boundaries). A click at or past the last char clamps to `mb.text.len()`.
+pub(crate) fn minibuffer_click_byte(area: Rect, mb: &crate::minibuffer::Minibuffer, col: u16, row: u16) -> Option<usize> {
+    if row != area.y + area.height.saturating_sub(1) {
+        return None;
+    }
+    let prompt_end = area.x.saturating_add(mb.prompt.chars().count() as u16);
+    if col < prompt_end {
+        return None;
+    }
+    let click_char_col = (col - prompt_end) as usize;
+    let byte = mb.text.char_indices().nth(click_char_col)
+        .map_or(mb.text.len(), |(b, _)| b);
+    Some(byte)
+}
+
+/// Column width of the label rendered BEFORE `field`'s text on the search status
+/// row: `"Find: "` for the needle field, `"Find: {needle}  Replace: "` for the
+/// template field. SINGLE SOURCE for `render.rs::place_cursor` (painter) and
+/// `search_field_click` (hit-test below) — they must never drift.
+pub(crate) fn search_field_prefix_cols(s: &crate::search_overlay::SearchState, field: crate::search_overlay::Field) -> usize {
+    match field {
+        crate::search_overlay::Field::Needle => "Find: ".chars().count(),
+        crate::search_overlay::Field::Template => format!("Find: {}  Replace: ", s.needle).chars().count(),
+    }
+}
+
+/// Map a search-bar click `(col, row)` to `(Field, byte_cursor)`, or `None` when
+/// the click misses the status row or lands outside both fields' rendered text
+/// (the label gaps, or the trailing mode/case/count/wrapped suffix — consumed as
+/// a no-op by the caller). The template field is only a valid hit target when
+/// `s.phase` is `Replace`/`Stepping` (it isn't rendered in `Phase::Find` —
+/// mirrors `render_status::format_search_bar`). Byte cursor is char-count-mapped
+/// (multibyte-safe, mirrors `minibuffer_click_byte`) and end-clamped: a click at
+/// or past the last char of a field lands on `field.len()`.
+pub(crate) fn search_field_click(area: Rect, s: &crate::search_overlay::SearchState, col: u16, row: u16)
+    -> Option<(crate::search_overlay::Field, usize)>
+{
+    use crate::search_overlay::{Field, Phase};
+    if row != area.y + area.height.saturating_sub(1) {
+        return None;
+    }
+    let click_col = (col.checked_sub(area.x)?) as usize;
+
+    let has_template = matches!(s.phase, Phase::Replace | Phase::Stepping);
+    if has_template {
+        let prefix = search_field_prefix_cols(s, Field::Template);
+        let chars = s.template.chars().count();
+        if click_col >= prefix && click_col <= prefix + chars {
+            let idx = click_col - prefix;
+            let byte = s.template.char_indices().nth(idx).map_or(s.template.len(), |(b, _)| b);
+            return Some((Field::Template, byte));
+        }
+    }
+    let prefix = search_field_prefix_cols(s, Field::Needle);
+    let chars = s.needle.chars().count();
+    if click_col >= prefix && click_col <= prefix + chars {
+        let idx = click_col - prefix;
+        let byte = s.needle.char_indices().nth(idx).map_or(s.needle.len(), |(b, _)| b);
+        return Some((Field::Needle, byte));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,10 +299,10 @@ mod tests {
     /// Build a synthetic groups list: one category (Edit) with `n` leaves.
     #[cfg(test)]
     fn tall_menu_groups(n: usize)
-        -> Vec<(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)>
+        -> Vec<(crate::registry::MenuCategory, Vec<(String, crate::menu::MenuRowAction)>)>
     {
-        let leaves: Vec<(String, crate::registry::CommandId)> = (0..n)
-            .map(|i| (format!("item{i}"), crate::registry::CommandId("move_right")))
+        let leaves: Vec<(String, crate::menu::MenuRowAction)> = (0..n)
+            .map(|i| (format!("item{i}"), crate::menu::MenuRowAction::Command(crate::registry::CommandId("move_right"))))
             .collect();
         vec![(crate::registry::MenuCategory::Edit, leaves)]
     }

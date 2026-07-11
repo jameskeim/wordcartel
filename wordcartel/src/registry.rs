@@ -36,15 +36,16 @@ pub type Handler = fn(&mut Ctx) -> CommandResult;
 // ── Command metadata ──────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MenuCategory { File, Edit, Format, View, Settings, Export }
+pub enum MenuCategory { File, Edit, Block, Format, View, Documents, Settings, Export }
 
-pub const MENU_ORDER: [MenuCategory; 6] =
-    [MenuCategory::File, MenuCategory::Edit, MenuCategory::Format, MenuCategory::View, MenuCategory::Settings, MenuCategory::Export];
+pub const MENU_ORDER: [MenuCategory; 8] = [MenuCategory::File, MenuCategory::Edit,
+    MenuCategory::Block, MenuCategory::Format, MenuCategory::View, MenuCategory::Documents,
+    MenuCategory::Settings, MenuCategory::Export];
 
 /// The live-state mark a stateful menu command interpolates into its row label.
 /// Exhaustive — adding a variant here is intentional and must be handled in every match.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MenuMark { OnOff(bool), Value(&'static str) }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MenuMark { OnOff(bool), Value(&'static str), Text(String) }
 
 #[derive(Clone, Copy)]
 pub struct CommandMeta {
@@ -120,16 +121,30 @@ impl Registry {
         r.register("move_doc_start", "Move to Start",  None, |c| run(c, Command::Move { dir: Dir::DocStart, extend: false }));
         r.register("move_doc_end",   "Move to End",    None, |c| run(c, Command::Move { dir: Dir::DocEnd,   extend: false }));
 
-        // Word delete — Edit menu.
-        r.register("delete_word_back",    "Delete Word Left",  Some(MenuCategory::Edit), |c| run(c, Command::DeleteWord { back: true }));
-        r.register("delete_word_forward", "Delete Word Right", Some(MenuCategory::Edit), |c| run(c, Command::DeleteWord { back: false }));
-        r.register("delete_line",         "Delete Line",        Some(MenuCategory::Edit), |c| run(c, Command::DeleteLine));
-        r.register("delete_to_line_end",  "Delete to Line End", Some(MenuCategory::Edit), |c| run(c, Command::DeleteToLineEnd));
+        // Word delete — keystroke-native atomic edits, palette-only (A3b).
+        r.register("delete_word_back",    "Delete Word Left",  None, |c| run(c, Command::DeleteWord { back: true }));
+        r.register("delete_word_forward", "Delete Word Right", None, |c| run(c, Command::DeleteWord { back: false }));
+        r.register("delete_line",         "Delete Line",        None, |c| run(c, Command::DeleteLine));
+        r.register("delete_to_line_end",  "Delete to Line End", None, |c| run(c, Command::DeleteToLineEnd));
 
         // Editing — palette-only (menu: None).
         r.register("insert_newline", "Insert Newline",   None, |c| run(c, Command::InsertNewline));
         r.register("backspace",      "Backspace",        None, |c| run(c, Command::Backspace));
         r.register("delete_forward", "Delete Forward",   None, |c| run(c, Command::DeleteForward));
+
+        // A14 — ten Emacs-parity atomic text-edit commands (commands/textops.rs).
+        // Registered BEFORE save_settings (Codex F4): journey_palette_end_reaches_last_command
+        // + the registration-order invariant both rely on save_settings staying last.
+        r.register("transpose_chars", "Transpose Characters", None, |c| crate::commands::textops::transpose_chars(c.editor, c.clock));
+        r.register("transpose_words", "Transpose Words",      None, |c| crate::commands::textops::transpose_words(c.editor, c.clock));
+        r.register("transpose_lines", "Transpose Lines",      None, |c| crate::commands::textops::transpose_lines(c.editor, c.clock));
+        r.register("upcase",     "Uppercase",  Some(MenuCategory::Format), |c| crate::commands::textops::upcase(c.editor, c.clock));
+        r.register("downcase",   "Lowercase",  Some(MenuCategory::Format), |c| crate::commands::textops::downcase(c.editor, c.clock));
+        r.register("capitalize", "Capitalize", Some(MenuCategory::Format), |c| crate::commands::textops::capitalize(c.editor, c.clock));
+        r.register("join_line",              "Join Line",              None, |c| crate::commands::textops::join_line(c.editor, c.clock));
+        r.register("just_one_space",         "Just One Space",         None, |c| crate::commands::textops::just_one_space(c.editor, c.clock));
+        r.register("delete_blank_lines",     "Delete Blank Lines",     None, |c| crate::commands::textops::delete_blank_lines(c.editor, c.clock));
+        r.register("delete_horizontal_space","Delete Horizontal Space",None, |c| crate::commands::textops::delete_horizontal_space(c.editor, c.clock));
 
         // Edit menu.
         r.register("select_all", "Select All", Some(MenuCategory::Edit), |c| run(c, Command::SelectAll));
@@ -138,8 +153,9 @@ impl Registry {
         r.register("paste", "Paste", Some(MenuCategory::Edit), |c| run(c, Command::Paste));
         r.register("undo",  "Undo",  Some(MenuCategory::Edit), |c| run(c, Command::Undo));
         r.register("redo",  "Redo",  Some(MenuCategory::Edit), |c| run(c, Command::Redo));
-        r.register("filter", "Filter…", Some(MenuCategory::Edit), |c| {
-            c.editor.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter);
+        // filter: Format menu (A3b) — a text-shaping op, sibling of reflow/unwrap/ventilate.
+        r.register("filter", "Filter…", Some(MenuCategory::Format), |c| {
+            c.editor.open_minibuffer("sh> ", crate::minibuffer::MinibufferKind::Filter);
             CommandResult::Handled
         });
         r.register("find", "Find…", Some(MenuCategory::Edit), |c| {
@@ -183,7 +199,9 @@ impl Registry {
 
         // View menu.
         r.register("cycle_render_mode", "Cycle Render Mode", Some(MenuCategory::View), |c| run(c, Command::CycleRenderMode));
-        r.register("transform", "Transform…", Some(MenuCategory::View), |c| {
+        // transform: Format menu (A3b) — its discrete variants are all Format; View was
+        // a historical accident.
+        r.register("transform", "Transform…", Some(MenuCategory::Format), |c| {
             c.editor.open_prompt(crate::prompt::Prompt::transform_chooser());
             CommandResult::Handled
         });
@@ -271,30 +289,37 @@ impl Registry {
         r.register("jump_forward", "Jump Forward", None, |c| { crate::marks::jump_forward(c.editor); CommandResult::Handled });
 
         // Marked block creation (Task 2 / Effort 9A).
-        r.register("block_begin",               "Set Block Begin",         Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_begin(c.editor); CommandResult::Handled });
-        r.register("block_end",                 "Set Block End",           Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_end(c.editor); CommandResult::Handled });
-        r.register("mark_block_from_selection", "Mark Block from Selection", Some(MenuCategory::Edit), |c| { crate::blocks_marked::mark_block_from_selection(c.editor); CommandResult::Handled });
+        r.register("block_begin",               "Set Block Begin",         Some(MenuCategory::Block), |c| { crate::blocks_marked::block_begin(c.editor); CommandResult::Handled });
+        r.register("block_end",                 "Set Block End",           Some(MenuCategory::Block), |c| { crate::blocks_marked::block_end(c.editor); CommandResult::Handled });
+        r.register("mark_block_from_selection", "Mark Block from Selection", Some(MenuCategory::Block), |c| { crate::blocks_marked::mark_block_from_selection(c.editor); CommandResult::Handled });
+        // Block → selection bridge (A11.3, Task 1.1 / command-surface curation).
+        r.register("select_marked_block", "Select Block", Some(MenuCategory::Block),
+            |c| { crate::blocks_marked::select_marked_block(c.editor); CommandResult::Handled });
 
         // Marked block operations (Task 3 / Effort 9A).
-        r.register("block_copy",          "Copy Block",        Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_copy(c.editor, c.clock);   CommandResult::Handled });
-        r.register("block_move",          "Move Block",        Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_move(c.editor, c.clock);   CommandResult::Handled });
-        r.register("block_delete",        "Delete Block",      Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_delete(c.editor, c.clock); CommandResult::Handled });
-        r.register("block_jump_begin",    "Jump to Block Begin", Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_jump_begin(c.editor);    CommandResult::Handled });
-        r.register("block_jump_end",      "Jump to Block End",   Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_jump_end(c.editor);      CommandResult::Handled });
-        r.register("block_toggle_hidden", "Toggle Block Hidden", Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_toggle_hidden(c.editor); CommandResult::Handled });
-        r.register("block_clear",         "Clear Block",         Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_clear(c.editor);         CommandResult::Handled });
+        r.register("block_copy",          "Copy Block",        Some(MenuCategory::Block), |c| { crate::blocks_marked::block_copy(c.editor, c.clock);   CommandResult::Handled });
+        r.register("block_move",          "Move Block",        Some(MenuCategory::Block), |c| { crate::blocks_marked::block_move(c.editor, c.clock);   CommandResult::Handled });
+        r.register("block_delete",        "Delete Block",      Some(MenuCategory::Block), |c| { crate::blocks_marked::block_delete(c.editor, c.clock); CommandResult::Handled });
+        r.register("block_jump_begin",    "Jump to Block Begin", Some(MenuCategory::Block), |c| { crate::blocks_marked::block_jump_begin(c.editor);    CommandResult::Handled });
+        r.register("block_jump_end",      "Jump to Block End",   Some(MenuCategory::Block), |c| { crate::blocks_marked::block_jump_end(c.editor);      CommandResult::Handled });
+        r.register("block_toggle_hidden", "Toggle Block Hidden", Some(MenuCategory::Block), |c| { crate::blocks_marked::block_toggle_hidden(c.editor); CommandResult::Handled });
+        r.register("block_clear",         "Clear Block",         Some(MenuCategory::Block), |c| { crate::blocks_marked::block_clear(c.editor);         CommandResult::Handled });
         // Marked block write-to-file (Task 4 / Effort 9A).
-        r.register("block_write", "Write Block to File\u{2026}", Some(MenuCategory::File), |c| { crate::blocks_marked::block_write(c.editor); CommandResult::Handled });
+        r.register("block_write", "Write Block to File\u{2026}", Some(MenuCategory::Block), |c| { crate::blocks_marked::block_write(c.editor); CommandResult::Handled });
 
         // Effort 6: send-to-scratch verbs.
-        r.register("copy_block_to_scratch", "Copy Block to Scratch", Some(MenuCategory::Edit), |c| { crate::scratch::copy_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
-        r.register("move_block_to_scratch", "Move Block to Scratch", Some(MenuCategory::Edit), |c| { crate::scratch::move_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
+        r.register("copy_block_to_scratch", "Copy Block to Scratch", Some(MenuCategory::Block), |c| { crate::scratch::copy_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
+        r.register("move_block_to_scratch", "Move Block to Scratch", Some(MenuCategory::Block), |c| { crate::scratch::move_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
 
-        // Effort 6: workspace navigation.
-        r.register("next_buffer", "Next Buffer", Some(MenuCategory::View), |c| { crate::workspace::next_buffer(c.editor); CommandResult::Handled });
-        r.register("prev_buffer", "Previous Buffer", Some(MenuCategory::View), |c| { crate::workspace::prev_buffer(c.editor); CommandResult::Handled });
+        // Effort 6: workspace navigation. next_buffer/prev_buffer/switch_buffer are
+        // palette-only (menu: None) as of Task 4.2 — the Documents dynamic menu's direct
+        // per-buffer rows make them duplicative on the menu surface only; they keep their
+        // registered-command status, palette listing, and keymap chords.
+        r.register("next_buffer", "Next Buffer", None, |c| { crate::workspace::next_buffer(c.editor); CommandResult::Handled });
+        r.register("prev_buffer", "Previous Buffer", None, |c| { crate::workspace::prev_buffer(c.editor); CommandResult::Handled });
         r.register("goto_scratch", "Go to Scratch Buffer", Some(MenuCategory::View), |c| { crate::workspace::goto_scratch(c.editor); CommandResult::Handled });
-        r.register("switch_buffer", "Switch Buffer\u{2026}", Some(MenuCategory::View), |c| { c.editor.open_buffer_switcher(); CommandResult::Handled });
+        r.register("toggle_scratch", "Toggle Scratch Buffer", Some(MenuCategory::View), |c| { crate::workspace::toggle_scratch(c.editor); CommandResult::Handled });
+        r.register("switch_buffer", "Switch Buffer\u{2026}", None, |c| { c.editor.open_buffer_switcher(); CommandResult::Handled });
         r.register("close_buffer", "Close Buffer", Some(MenuCategory::File), |c| { crate::workspace::close_buffer(c.editor); CommandResult::Handled });
 
         // Format menu — discrete transform commands (Task 1 / Effort 5b).
@@ -559,10 +584,12 @@ impl Registry {
                 switch_keymap_preset(c.editor, next);
                 CommandResult::Handled
             });
-        r.register("set_wrap_column", "Set Wrap Column\u{2026}", Some(MenuCategory::Settings), |c| {
-            c.editor.open_minibuffer("Wrap column: ", crate::minibuffer::MinibufferKind::WrapColumn);
-            CommandResult::Handled
-        });
+        r.register_stateful("set_wrap_column", "Wrap Column: Set\u{2026}", Some(MenuCategory::Settings),
+            |e| MenuMark::Text(format!("{}\u{2026}", e.view_opts.wrap_column)),
+            |c| {
+                c.editor.open_minibuffer("Wrap column: ", crate::minibuffer::MinibufferKind::WrapColumn);
+                CommandResult::Handled
+            });
         // toggle_canvas and toggle_chrome MUST be registered BEFORE save_settings
         // (journey_palette_end relies on save_settings being the last command dispatched
         // from End+Enter — spec D3 / A.7).
@@ -880,13 +907,19 @@ mod tests {
         ));
     }
 
+    /// Task 4.2: switch_buffer/next_buffer/prev_buffer are registered + palette-listed
+    /// but menu-absent — the Documents dynamic menu supersedes them on the menu surface.
     #[test]
     fn switch_buffer_is_registered_in_view_menu() {
         let reg = Registry::builtins();
         let m = reg.meta(CommandId("switch_buffer"))
             .expect("switch_buffer must be registered");
         assert_eq!(m.label, "Switch Buffer\u{2026}");
-        assert_eq!(m.menu, Some(MenuCategory::View));
+        assert_eq!(m.menu, None, "switch_buffer is palette-only — Documents supersedes it on the menu");
+        for id in ["next_buffer", "prev_buffer"] {
+            let m = reg.meta(CommandId(id)).unwrap_or_else(|| panic!("{id} must be registered"));
+            assert_eq!(m.menu, None, "{id} is palette-only — Documents supersedes it on the menu");
+        }
     }
 
     #[test]
@@ -895,6 +928,24 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for (id, _) in reg.commands() {
             assert!(seen.insert(id.0), "duplicate command id: {}", id.0);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 3.2 (A3b): menu-placement sweep — filter/transform → Format,
+    // keystroke-native deletes → palette-only.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a3b_placement_sweep_categories() {
+        let reg = Registry::builtins();
+        let meta = |id: &str| reg.meta(reg.resolve_name(id).expect(id)).expect(id);
+        assert_eq!(meta("filter").menu, Some(MenuCategory::Format),
+            "filter is a text-shaping op, sibling of reflow/unwrap/ventilate");
+        assert_eq!(meta("transform").menu, Some(MenuCategory::Format),
+            "transform's discrete variants are all Format; View was a historical accident");
+        for id in ["delete_word_back", "delete_word_forward", "delete_line", "delete_to_line_end"] {
+            assert_eq!(meta(id).menu, None, "{id} is a keystroke-native atomic edit — palette-only");
         }
     }
 
@@ -908,7 +959,7 @@ mod tests {
         // keymap_cua/keymap_wordstar are palette-only now; keymap_next is the single cycle row.
         for (id, label) in [
             ("keymap_next",      "Keymap"),
-            ("set_wrap_column",  "Set Wrap Column\u{2026}"),
+            ("set_wrap_column",  "Wrap Column: Set\u{2026}"),
             ("toggle_chrome",    "Chrome: Full/Zen"),
             ("save_settings",    "Save Settings"),
         ] {
@@ -1137,6 +1188,16 @@ mod tests {
         let cm = reg.meta(CommandId("toggle_chrome")).unwrap().state.unwrap();
         ed.chrome_disposition = wordcartel_core::theme::ChromeDisposition::Zen;
         assert!(matches!(cm(&ed), MenuMark::Value("Zen")));
+    }
+
+    #[test]
+    fn set_wrap_column_is_stateful_with_value_label() {
+        let reg = Registry::builtins();
+        let mut ed = crate::editor::Editor::new_from_text("x\n", None, (40, 8));
+        let meta = reg.meta(CommandId("set_wrap_column")).unwrap();
+        assert!(meta.state.is_some(), "set_wrap_column must be stateful");
+        ed.view_opts.wrap_column = 80;
+        assert_eq!((meta.state.unwrap())(&ed), MenuMark::Text("80\u{2026}".into()));
     }
 
     #[test]

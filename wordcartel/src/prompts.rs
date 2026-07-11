@@ -271,28 +271,37 @@ pub fn resolve_prompt(
 
 /// Submit a minibuffer line as a filter command.
 ///
-/// Splits the line on whitespace to build the argv (no shell, no quoting —
-/// `shell: false` is the security default; shell invocation is opt-in only).
-/// An empty line sets a status message and returns without dispatching.
+/// Runs the line through `sh -c` (vi `!` / Emacs `shell-command-on-region` model),
+/// so pipes/quoting/redirects work. An empty (or whitespace-only) line sets a status
+/// message and returns without dispatching.
 pub(crate) fn submit_filter_line(
     editor: &mut Editor,
     line: &str,
     msg_tx: &std::sync::mpsc::Sender<Msg>,
 ) {
-    let argv: Vec<String> = line.split_whitespace().map(String::from).collect();
-    if argv.is_empty() {
+    let Some(spec) = build_filter_spec(line) else {
         editor.status = "filter: no command given".into();
         return;
-    }
-    let spec = crate::filter::FilterSpec {
-        argv,
-        shell: false,
+    };
+    crate::filter::dispatch_filter(editor, spec, msg_tx.clone());
+}
+
+/// Build the `FilterSpec` for an interactive filter line. The line is passed to the
+/// shell VERBATIM as a single argv element (`run_subprocess` joins argv for `sh -c`),
+/// so quoting/pipes/redirects survive — splitting+rejoining would collapse quoted
+/// whitespace. Trust boundary: user-typed at an interactive prompt (vi `!`), distinct
+/// from the untrusted `submit_transaction` path. Caps (timeout/max_output) + the
+/// `dispatch_filter` panic isolation are kept unchanged.
+fn build_filter_spec(line: &str) -> Option<crate::filter::FilterSpec> {
+    if line.trim().is_empty() { return None; }
+    Some(crate::filter::FilterSpec {
+        argv: vec![line.to_string()],
+        shell: true,
         disposition: crate::filter::Disposition::Filter,
         input: crate::filter::Input::SelectionElseBuffer,
         timeout: std::time::Duration::from_secs(10),
         max_output: crate::limits::MAX_FILTER_OUTPUT,
-    };
-    crate::filter::dispatch_filter(editor, spec, msg_tx.clone());
+    })
 }
 
 /// Submit handler for Set Wrap Column (spec repar10 D2). Deliberate divergences from
@@ -339,6 +348,25 @@ pub(crate) fn goto_line_submit(editor: &mut crate::editor::Editor, text: &str) {
 mod tests {
     use super::*;
     use crate::test_support::TestClock;
+
+    #[test]
+    fn submit_filter_line_uses_shell_single_argv() {
+        // The filter line is passed to the shell VERBATIM as a single argv element —
+        // NOT whitespace-split-then-rejoined, which would collapse quoted whitespace
+        // (e.g. the double space inside `sed 's/a  b/c/'`).
+        let spec = build_filter_spec("sed 's/a  b/c/'").expect("non-empty line builds a spec");
+        assert!(spec.shell, "interactive filter must run through sh -c");
+        assert_eq!(spec.argv, vec!["sed 's/a  b/c/'".to_string()]);
+        assert!(matches!(spec.input, crate::filter::Input::SelectionElseBuffer));
+        assert_eq!(spec.timeout, std::time::Duration::from_secs(10));
+        assert_eq!(spec.max_output, crate::limits::MAX_FILTER_OUTPUT);
+        assert!(matches!(spec.disposition, crate::filter::Disposition::Filter));
+    }
+
+    #[test]
+    fn build_filter_spec_trimmed_empty_is_none() {
+        assert!(build_filter_spec("   ").is_none());
+    }
 
     #[test]
     fn save_and_quit_on_unnamed_buffer_does_not_arm_pending_after_save() {

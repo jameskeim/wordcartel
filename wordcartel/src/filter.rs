@@ -566,6 +566,37 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn shell_pipeline_survives_quoted_whitespace() {
+        // shell: true — a single verbatim-line argv element, run through `sh -c`.
+        // A plain pipeline works:
+        let pipeline = FilterSpec {
+            argv: vec!["tr a-z A-Z".into()],
+            shell: true,
+            disposition: Disposition::Filter,
+            input: Input::SelectionElseBuffer,
+            timeout: std::time::Duration::from_secs(10),
+            max_output: crate::limits::MAX_FILTER_OUTPUT,
+        };
+        let out = run_filter(&pipeline, "ab\n".into(), &CancelFlag::new());
+        assert!(matches!(out, RunResult::Stdout(ref s) if s == "AB\n"), "{out:?}");
+
+        // A quoted double space inside the program must survive verbatim — splitting
+        // the line on whitespace and rejoining would collapse it and break the sed
+        // program (the whole point of running through sh -c with a single argv elem).
+        let quoted = FilterSpec {
+            argv: vec!["sed 's/a  b/c/'".into()],
+            shell: true,
+            disposition: Disposition::Filter,
+            input: Input::SelectionElseBuffer,
+            timeout: std::time::Duration::from_secs(10),
+            max_output: crate::limits::MAX_FILTER_OUTPUT,
+        };
+        let out = run_filter(&quoted, "a  b\n".into(), &CancelFlag::new());
+        assert!(matches!(out, RunResult::Stdout(ref s) if s == "c\n"), "{out:?}");
+    }
+
+    #[test]
     fn guarded_filter_maps_panic_to_runresult_err() {
         let r = guarded_filter(|| panic!("flt"));
         assert!(matches!(r, RunResult::Err(FilterError::Panicked(ref m)) if m == "flt"));

@@ -166,6 +166,21 @@ pub fn mark_block_from_selection(editor: &mut Editor) {
         wordcartel_core::selection::Selection::single(caret);
 }
 
+/// Select the marked block's range (the block → selection bridge, A11.3). The marked
+/// block is a target, not implicit scope — this makes it the active selection so the
+/// universal selection-primary convention then governs filter/transform/case ops.
+pub fn select_marked_block(editor: &mut Editor) {
+    match editor.active().marked_block {
+        Some(MarkedBlock { start, end, .. }) => {
+            editor.active_mut().document.selection =
+                wordcartel_core::selection::Selection::range(start, end);
+            crate::derive::rebuild(editor);
+            nav::ensure_visible(editor);
+        }
+        None => { editor.status = "no marked block".into(); }
+    }
+}
+
 /// Normalize `(a, b)` to `(start, end)` where start <= end, then set marked_block.
 /// Rejects an empty block (start == end) with status "empty block".
 fn set_block(editor: &mut Editor, a: usize, b: usize) {
@@ -294,5 +309,27 @@ mod tests {
         crate::blocks_marked::mark_block_from_selection(&mut e);
         assert_eq!(e.active().marked_block, Some(MarkedBlock { start: 0, end: 5, hidden: false }));
         assert!(e.active().document.selection.primary().is_empty(), "selection converted → cleared");
+    }
+
+    // --- A11.3: block → selection bridge ---
+
+    #[test]
+    fn select_marked_block_selects_range_and_keeps_block() {
+        let mut e = Editor::new_from_text("hello world\n", None, (40, 10));
+        e.active_mut().marked_block = Some(MarkedBlock { start: 0, end: 5, hidden: false }); // "hello"
+        crate::blocks_marked::select_marked_block(&mut e);
+        let sel = e.active().document.selection.primary();
+        assert_eq!(sel.from(), 0);
+        assert_eq!(sel.to(), 5);
+        assert!(e.active().marked_block.is_some(), "block survives select");
+    }
+
+    #[test]
+    fn select_marked_block_no_block_sets_status() {
+        let mut e = Editor::new_from_text("hello world\n", None, (40, 10));
+        let before = e.active().document.selection.clone();
+        crate::blocks_marked::select_marked_block(&mut e);
+        assert_eq!(e.active().document.selection, before, "selection unchanged with no block");
+        assert!(!e.status.is_empty());
     }
 }

@@ -12,6 +12,10 @@
 //! primitives in that submodule; `run` delegates to them.
 
 mod edit;
+// `pub(crate)` (not private like `mod edit;`) so `registry.rs` — outside `commands` —
+// can reach the A14 atomic-edit handlers directly (module-structure GATE: a leaf
+// module, no `Command` enum variant, no `commands::run` arm).
+pub(crate) mod textops;
 
 use crate::derive;
 use crate::editor::{Editor, RenderMode};

@@ -16,8 +16,9 @@ use wordcartel_core::selection::Selection;
 /// re-anchor vertical motion (desired_col = None). Edit paths ONLY — Move/CycleRenderMode
 /// keep rebuild+ensure_visible WITHOUT the desired_col reset; Undo/Redo/ShrinkSelection
 /// insert a caret-snap first; SelectAll doesn't rebuild — those arms keep their own tails
-/// in `run`.
-fn settle_after_edit(editor: &mut Editor) -> CommandResult {
+/// in `run`. `pub(super)` (lands at `commands` scope) so the sibling `textops` module's
+/// A14 atomic edits can reuse it too.
+pub(super) fn settle_after_edit(editor: &mut Editor) -> CommandResult {
     derive::rebuild(editor);
     nav::ensure_visible(editor);
     editor.active_mut().desired_col = None;

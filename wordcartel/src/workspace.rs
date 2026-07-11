@@ -19,20 +19,33 @@ pub fn buffer_display_name(editor: &Editor, id: BufferId) -> String {
 }
 
 /// Return buffers in MRU order (most-recent first) as `(id, display_name)` pairs.
-/// Buffers not yet in the MRU list are appended in buffer-vec order.
+/// Buffers not yet in the MRU list are appended in buffer-vec order. Scratch is
+/// excluded (A12) — it is reached via `goto_scratch`/`toggle_scratch`, not the switcher.
 pub fn buffer_switch_rows(editor: &Editor) -> Vec<(BufferId, String)> {
     let mut out: Vec<(BufferId, String)> = Vec::new();
     for &id in &editor.mru {
-        if editor.by_id(id).is_some() {
+        if editor.by_id(id).is_some() && !editor.is_scratch(id) {
             out.push((id, buffer_display_name(editor, id)));
         }
     }
     for b in &editor.buffers {
-        if !out.iter().any(|(id, _)| *id == b.id) {
+        if !editor.is_scratch(b.id) && !out.iter().any(|(id, _)| *id == b.id) {
             out.push((b.id, buffer_display_name(editor, b.id)));
         }
     }
     out
+}
+
+/// Live rows for the Documents dynamic menu section (Task 4.2, `DYNAMIC_SECTIONS` seam):
+/// one row per open buffer in OPEN ORDER (buffer-vec order, stable — NOT MRU), scratch
+/// excluded. Data, not registered commands — exempt from the palette/registry surfaces
+/// (command-surface contract's Task 4.3 amendment); the row action reaches the same
+/// shared `switch_to` setter registered commands use.
+pub fn documents_menu_rows(editor: &Editor) -> Vec<(String, crate::menu::MenuRowAction)> {
+    editor.buffers.iter()
+        .filter(|b| !editor.is_scratch(b.id))
+        .map(|b| (buffer_display_name(editor, b.id), crate::menu::MenuRowAction::SwitchBuffer(b.id)))
+        .collect()
 }
 
 /// Switch active buffer by index and refresh the view.
@@ -43,18 +56,63 @@ pub fn switch_to(editor: &mut Editor, idx: usize) {
 }
 pub fn next_buffer(editor: &mut Editor) { cycle(editor, 1); }
 pub fn prev_buffer(editor: &mut Editor) { cycle(editor, -1); }
+/// Cycle to the nearest non-scratch buffer in the requested direction (A12: scratch
+/// is excluded from rotation). Anchors on the ACTIVE index — which IS scratch's real
+/// `editor.buffers` index when active is scratch, since `install_scratch` pushes
+/// scratch into `buffers` — and steps until it lands on an ordinary buffer.
 fn cycle(editor: &mut Editor, delta: isize) {
     let n = editor.buffers.len();
-    if n <= 1 { return; }
-    let idx = ((editor.active as isize + delta).rem_euclid(n as isize)) as usize;
-    switch_to(editor, idx);
+    if n == 0 { return; }
+    // Need at least two ordinary (non-scratch) buffers to rotate between.
+    let ordinary = editor.buffers.iter().filter(|b| !editor.is_scratch(b.id)).count();
+    if ordinary <= 1 { return; }
+    let start = editor.active as isize;   // == scratch's index when active is scratch
+    let step = if delta >= 0 { 1 } else { -1 };
+    let mut i = start;
+    loop {
+        i = (i + step).rem_euclid(n as isize);
+        let idx = i as usize;
+        if !editor.is_scratch(editor.buffers[idx].id) { switch_to(editor, idx); return; }
+        if i == start { return; } // full loop with no ordinary landing (guarded above)
+    }
 }
-/// Jump directly to the scratch buffer (no-op if none installed).
-pub fn goto_scratch(editor: &mut Editor) {
+
+/// Shared scratch-entry mechanics for `goto_scratch` and `toggle_scratch`: records
+/// the current buffer as the return target (unless already on scratch) before
+/// switching to scratch.
+fn enter_scratch(editor: &mut Editor) {
+    let cur = editor.active().id;
+    if !editor.is_scratch(cur) { editor.scratch_return = Some(cur); }
     if let Some(sid) = editor.scratch_id {
         if let Some(idx) = editor.buffers.iter().position(|b| b.id == sid) {
             switch_to(editor, idx);
         }
+    }
+}
+
+/// Jump directly to the scratch buffer (no-op if none installed). Records the
+/// current buffer as the `toggle_scratch` return target (A12 coherence).
+pub fn goto_scratch(editor: &mut Editor) { enter_scratch(editor); }
+
+/// Round-trip to/from the scratch buffer (A12). Not on scratch → record + go to scratch.
+/// On scratch → return to the recorded buffer if it still resolves, else the MRU-front
+/// ordinary buffer; else stay with a hint.
+pub fn toggle_scratch(editor: &mut Editor) {
+    if editor.is_scratch(editor.active().id) {
+        // MRU is most-recent-FIRST (Editor::touch_mru does mru.insert(0, id)),
+        // so iterate FORWARD (no .rev()) and take the first live, non-scratch id.
+        let target = editor.scratch_return
+            .filter(|id| editor.by_id(*id).is_some())
+            .or_else(|| editor.mru.iter().copied()
+                .find(|id| !editor.is_scratch(*id) && editor.by_id(*id).is_some())
+                .or_else(|| editor.buffers.iter().map(|b| b.id)
+                    .find(|id| !editor.is_scratch(*id))));
+        match target.and_then(|id| editor.buffers.iter().position(|b| b.id == id)) {
+            Some(idx) => switch_to(editor, idx),
+            None => editor.status = "no other buffer".into(),
+        }
+    } else {
+        enter_scratch(editor);
     }
 }
 
@@ -190,26 +248,63 @@ mod tests {
         assert_eq!(buffer_display_name(&e, buf0_id), "notes.md", "shows filename only");
     }
 
+    /// Task 4.2: Documents dynamic menu rows — open order (buffer-vec order, not MRU),
+    /// scratch excluded, each row labeled by buffer_display_name and carrying SwitchBuffer.
+    #[test]
+    fn documents_menu_rows_open_order_excludes_scratch() {
+        let mut e = Editor::new_from_text("a\n", None, (40, 10));
+        e.install_scratch(); // [A(0), scratch(1)]
+        let b_id = e.alloc_id();
+        let area = e.active().view.area;
+        e.buffers.push(crate::editor::Buffer::from_text(b_id, "b\n", None, area)); // [A(0), scratch(1), B(2)]
+        let a_id = e.buffers[0].id;
+        // Touch MRU out of buffer-vec order — rows must still follow buffer-vec (open) order.
+        switch_to(&mut e, 2); // touch B most-recently
+        let rows = documents_menu_rows(&e);
+        assert_eq!(rows.len(), 2, "scratch excluded, two ordinary buffers");
+        assert_eq!(rows[0], (buffer_display_name(&e, a_id), crate::menu::MenuRowAction::SwitchBuffer(a_id)),
+            "row 0 is A (buffer-vec order), not B (MRU order)");
+        assert_eq!(rows[1], (buffer_display_name(&e, b_id), crate::menu::MenuRowAction::SwitchBuffer(b_id)));
+        assert!(rows.iter().all(|(name, _)| name != "*scratch*"), "scratch never appears");
+    }
+
     #[test]
     fn switcher_rows_mru_order_with_display_names() {
         let mut e = Editor::new_from_text("a\n", None, (40, 10));
         e.install_scratch();
         // Make buffer 0 a named file display, scratch second.
         e.buffers[0].document.path = Some(std::path::PathBuf::from("/tmp/notes.md"));
-        goto_scratch(&mut e);     // MRU front = scratch
+        goto_scratch(&mut e);     // scratch entered, but excluded from the switcher rows
         let rows = buffer_switch_rows(&e);
-        assert_eq!(rows.first().unwrap().1, "*scratch*", "MRU front is scratch");
+        assert!(rows.iter().all(|(_, n)| n != "*scratch*"), "scratch excluded from switcher rows");
         assert!(rows.iter().any(|(_, n)| n.contains("notes.md")));
     }
 
     #[test]
-    fn cycle_wraps_in_stable_order_including_scratch() {
-        let mut e = Editor::new_from_text("a\n", None, (40, 10));
-        e.install_scratch(); // indices [0 doc, 1 scratch]
-        assert_eq!(e.active, 0);
-        next_buffer(&mut e); assert_eq!(e.active, 1);
-        next_buffer(&mut e); assert_eq!(e.active, 0, "wraps");
-        prev_buffer(&mut e); assert_eq!(e.active, 1, "prev wraps back");
+    fn cycle_skips_scratch() {
+        let mut e = Editor::new_from_text("a\n", None, (40, 10)); // buf A at index 0
+        e.install_scratch(); // [A(0), scratch(1)]
+        let b_id = e.alloc_id();
+        let area = e.active().view.area;
+        e.buffers.push(crate::editor::Buffer::from_text(b_id, "b\n", None, area)); // [A(0), scratch(1), B(2)]
+        goto_scratch(&mut e);
+        assert!(e.is_scratch(e.active().id), "precondition: active is scratch");
+        next_buffer(&mut e);
+        assert_eq!(e.active().id, b_id, "next from scratch lands on the buffer following it");
+        goto_scratch(&mut e);
+        prev_buffer(&mut e);
+        assert_ne!(e.active().id, b_id, "prev from scratch does not land on B");
+        assert!(!e.is_scratch(e.active().id), "prev from scratch never lands on scratch");
+        let a_id = e.buffers[0].id;
+        assert_eq!(e.active().id, a_id, "prev from scratch lands on the buffer preceding it");
+
+        // From an ordinary buffer, neither direction ever lands on scratch.
+        switch_to(&mut e, 0); // A
+        next_buffer(&mut e);
+        assert!(!e.is_scratch(e.active().id), "next from an ordinary buffer never lands on scratch");
+        switch_to(&mut e, 0);
+        prev_buffer(&mut e);
+        assert!(!e.is_scratch(e.active().id), "prev from an ordinary buffer never lands on scratch");
     }
     #[test]
     fn goto_scratch_jumps_to_scratch() {
@@ -217,6 +312,65 @@ mod tests {
         e.install_scratch();
         goto_scratch(&mut e);
         assert_eq!(e.buffers[e.active].id, e.scratch_id.unwrap());
+    }
+
+    #[test]
+    fn toggle_scratch_round_trips_to_prior_buffer() {
+        let mut e = Editor::new_from_text("a\n", None, (40, 10));
+        e.install_scratch();
+        let b_id = e.alloc_id();
+        let area = e.active().view.area;
+        e.buffers.push(crate::editor::Buffer::from_text(b_id, "b\n", None, area));
+        let b_idx = e.buffers.iter().position(|b| b.id == b_id).unwrap();
+        switch_to(&mut e, b_idx); // active = B
+        toggle_scratch(&mut e);
+        assert!(e.is_scratch(e.active().id), "first toggle enters scratch");
+        toggle_scratch(&mut e);
+        assert_eq!(e.active().id, b_id, "second toggle returns to B");
+    }
+
+    /// Discriminates forward vs. `.rev()` MRU iteration: after B (the recorded return
+    /// buffer) closes, the two live candidates A and C are touched in an order such
+    /// that A is MORE recent than C. Forward iteration (most-recent-first) must land
+    /// on A; a `.rev()` bug would wrongly land on C.
+    #[test]
+    fn toggle_scratch_from_closed_prior_falls_back_to_mru() {
+        let mut e = Editor::new_from_text("a\n", None, (40, 10));
+        e.install_scratch(); // [A(0), scratch(1)]
+        let a_id = e.buffers[0].id;
+        let b_id = e.alloc_id();
+        let c_id = e.alloc_id();
+        let area = e.active().view.area;
+        e.buffers.push(crate::editor::Buffer::from_text(b_id, "b\n", None, area)); // [A, scratch, B]
+        e.buffers.push(crate::editor::Buffer::from_text(c_id, "c\n", None, area)); // [A, scratch, B, C]
+        fn idx_of(e: &Editor, id: BufferId) -> usize { e.buffers.iter().position(|b| b.id == id).unwrap() }
+        let (a_idx, b_idx, c_idx) = (idx_of(&e, a_id), idx_of(&e, b_id), idx_of(&e, c_id));
+        switch_to(&mut e, a_idx); // touch A
+        switch_to(&mut e, c_idx); // touch C
+        switch_to(&mut e, b_idx); // touch B
+        switch_to(&mut e, a_idx); // touch A again — A now more recent than C
+        switch_to(&mut e, b_idx); // active = B (MRU front = B, A, C, scratch)
+        toggle_scratch(&mut e); // records scratch_return = B, active = scratch
+        // Simulate B closed: remove from buffers and MRU.
+        e.buffers.retain(|b| b.id != b_id);
+        e.mru.retain(|&id| id != b_id);
+        toggle_scratch(&mut e);
+        assert_eq!(e.active().id, a_id, "falls back to the MOST-recent live non-scratch buffer (A, not C)");
+    }
+
+    #[test]
+    fn goto_scratch_records_return_for_toggle() {
+        let mut e = Editor::new_from_text("a\n", None, (40, 10));
+        e.install_scratch();
+        let b_id = e.alloc_id();
+        let area = e.active().view.area;
+        e.buffers.push(crate::editor::Buffer::from_text(b_id, "b\n", None, area));
+        let b_idx = e.buffers.iter().position(|b| b.id == b_id).unwrap();
+        switch_to(&mut e, b_idx); // active = B
+        goto_scratch(&mut e);
+        assert!(e.is_scratch(e.active().id));
+        toggle_scratch(&mut e);
+        assert_eq!(e.active().id, b_id, "goto_scratch records the return buffer for toggle_scratch");
     }
     #[test]
     fn cycle_single_buffer_is_noop() {

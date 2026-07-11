@@ -39,7 +39,9 @@ act.
 3. **The palette is exhaustive.** Every registered command that is not explicitly internal appears
    in the palette. *Test:* palette-completeness ("every non-hidden registry command appears";
    formalized from `palette.rs:138`).
-4. **The menu is a curated subset.** menu ⊆ palette, always.
+4. **The menu is a curated subset.** menu ⊆ palette, always. Restated for dynamic menu sections
+   (below): every menu row that NAMES A COMMAND is in the palette; dynamic-section rows are data
+   and exempt.
 5. **Every mouse affordance has a keyboard path.** (Falls out of law 3.)
 6. **One setter per option; profiles use it too.** State mutation for an option flows through a
    single setter function; a preset/profile changes the option by calling the *same* setter its
@@ -66,6 +68,39 @@ act.
     today; parameterized set-value commands (`set_scrollbar("off")`) are an Effort-P concern. Keep
     set-value semantics clean so P can later collapse the N explicit-set commands into one
     parameterized command without breaking this contract.
+
+---
+
+## Dynamic menu sections
+
+A dynamic menu section is a menu category whose rows are generated from live editor state at
+menu-build time by a registered provider — `fn(&Editor) -> Vec<(label, action)>` — rather than
+drawn from the command registry. Its rows are **data, not commands**: each row parameterizes an
+existing, validated state transition (e.g. switch-to-buffer) instead of naming a registry command.
+
+- **Exemption scope (row ACCOUNTING only).** Dynamic rows are exempt from law 4 (menu ⊆ palette)
+  and from the registry-single-source reading of law 1 *for the rows themselves* — a dynamic row
+  need not correspond to a registered command and need not appear in the palette. Laws 1 and 3
+  continue to govern the static registry unchanged; the palette-exhaustiveness test remains
+  defined over the static registry only. Law 4 is restated as: every menu row that names a
+  command is in the palette; dynamic-section rows are data and exempt.
+- **Actions are NOT exempt from law 1's mutation clause — they must use a shared setter.** Law 1
+  also forbids mutating command-reachable state *outside* the registry's setters. A dynamic action
+  does not escape that: it may ONLY invoke a **shared, mediated transition that a registered
+  command also routes through** (Law 6's "one setter" — e.g. Documents' `SwitchBuffer` and the
+  `switch_buffer`/`next_buffer`/`goto_scratch` commands all call the single `workspace::switch_to`).
+  A dynamic action MUST NOT introduce a novel mutation path that no command uses; if a section
+  needs a transition no command performs, add the command (and its setter) first. This keeps every
+  state change plugin-controllable and drift-free.
+- **Keyboard path preserved (law 5 still binds).** Every dynamic section must have a
+  registry-command keyboard equivalent covering the states its rows reach (Documents ↔
+  `switch_buffer`, which shares `switch_to` with the section's action).
+- **Registration seam.** Providers register via the `DYNAMIC_SECTIONS` data table — never inline
+  logic in the menu builder (module-structure GATE).
+- **Effort-P forward-compatibility.** This seam is the intended mechanism for plugin-contributed
+  menu sections (the second consumer). Plugins extend registration to runtime without changing the
+  rows-as-data model; plugin rows keep the same discipline — parameterized dispatch of validated
+  actions through the same activation seam, never raw state mutation.
 
 ---
 
@@ -117,3 +152,10 @@ a test. A spec/plan touching this surface states which of these it exercises.
   analysis (A3 brainstorm) — added law 2 (every option is a command), law 6 (shared setter), law 7's
   explicit-binding preference, and shape rules 8-10. This file is now the authoritative home; the
   backlog section points here.
+- 2026-07-10 (A8 / command-surface curation): added the **Dynamic menu sections** section —
+  a menu category may carry rows generated from live editor state (data, not commands),
+  exempt from laws 1/3/4 for ROW ACCOUNTING only (a row need not be a registered command or
+  a palette entry); the row's ACTION remains bound by law 1's mutation clause and must invoke
+  a shared setter a registered command also uses (the Documents section ↔ `workspace::switch_to`,
+  shared with `switch_buffer`/`next_buffer`/`goto_scratch`). Restated law 4 as "every menu row
+  that NAMES A COMMAND is in the palette." Forward-compatible with Effort-P plugin menus.

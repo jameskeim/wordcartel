@@ -470,6 +470,11 @@ pub struct Editor {
     /// contexts that never call `install_scratch`. Scratch is identified by id,
     /// not by a name field.
     pub scratch_id: Option<BufferId>,
+    /// Transient: the buffer to return to on the next `toggle_scratch` out of scratch,
+    /// recorded by `workspace::enter_scratch` when entering scratch from an ordinary
+    /// buffer. `None` when scratch was never entered (or the recorded buffer is stale —
+    /// `toggle_scratch` re-validates via `by_id` before trusting it).
+    pub scratch_return: Option<BufferId>,
     /// Most-recently-used buffer ids, most-recent first. Drives the switcher palette.
     pub mru: Vec<BufferId>,
     /// Effort 6: the in-progress multi-buffer quit drain, if any. `Some` while the
@@ -541,6 +546,7 @@ impl Editor {
             heading_glyph_cfg: None,
             resume_enabled: false,
             scratch_id: None,
+            scratch_return: None,
             mru: Vec::new(),
             quit_drain: None,
             quit_drain_advance: false,
@@ -1322,7 +1328,9 @@ mod tests {
             "all buffer-switcher rows carry a BufferId");
         // rows[0] should be doc (install_scratch seeds MRU as [doc, scratch])
         assert!(p.rows.iter().any(|r| r.label.contains("doc.md")));
-        assert!(p.rows.iter().any(|r| r.label == "*scratch*"));
+        // A12: scratch is excluded from the buffer switcher — reached via
+        // goto_scratch/toggle_scratch instead.
+        assert!(p.rows.iter().all(|r| r.label != "*scratch*"));
     }
 
     #[test]
