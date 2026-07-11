@@ -121,11 +121,11 @@ impl Registry {
         r.register("move_doc_start", "Move to Start",  None, |c| run(c, Command::Move { dir: Dir::DocStart, extend: false }));
         r.register("move_doc_end",   "Move to End",    None, |c| run(c, Command::Move { dir: Dir::DocEnd,   extend: false }));
 
-        // Word delete — Edit menu.
-        r.register("delete_word_back",    "Delete Word Left",  Some(MenuCategory::Edit), |c| run(c, Command::DeleteWord { back: true }));
-        r.register("delete_word_forward", "Delete Word Right", Some(MenuCategory::Edit), |c| run(c, Command::DeleteWord { back: false }));
-        r.register("delete_line",         "Delete Line",        Some(MenuCategory::Edit), |c| run(c, Command::DeleteLine));
-        r.register("delete_to_line_end",  "Delete to Line End", Some(MenuCategory::Edit), |c| run(c, Command::DeleteToLineEnd));
+        // Word delete — keystroke-native atomic edits, palette-only (A3b).
+        r.register("delete_word_back",    "Delete Word Left",  None, |c| run(c, Command::DeleteWord { back: true }));
+        r.register("delete_word_forward", "Delete Word Right", None, |c| run(c, Command::DeleteWord { back: false }));
+        r.register("delete_line",         "Delete Line",        None, |c| run(c, Command::DeleteLine));
+        r.register("delete_to_line_end",  "Delete to Line End", None, |c| run(c, Command::DeleteToLineEnd));
 
         // Editing — palette-only (menu: None).
         r.register("insert_newline", "Insert Newline",   None, |c| run(c, Command::InsertNewline));
@@ -139,7 +139,8 @@ impl Registry {
         r.register("paste", "Paste", Some(MenuCategory::Edit), |c| run(c, Command::Paste));
         r.register("undo",  "Undo",  Some(MenuCategory::Edit), |c| run(c, Command::Undo));
         r.register("redo",  "Redo",  Some(MenuCategory::Edit), |c| run(c, Command::Redo));
-        r.register("filter", "Filter…", Some(MenuCategory::Edit), |c| {
+        // filter: Format menu (A3b) — a text-shaping op, sibling of reflow/unwrap/ventilate.
+        r.register("filter", "Filter…", Some(MenuCategory::Format), |c| {
             c.editor.open_minibuffer("sh> ", crate::minibuffer::MinibufferKind::Filter);
             CommandResult::Handled
         });
@@ -184,7 +185,9 @@ impl Registry {
 
         // View menu.
         r.register("cycle_render_mode", "Cycle Render Mode", Some(MenuCategory::View), |c| run(c, Command::CycleRenderMode));
-        r.register("transform", "Transform…", Some(MenuCategory::View), |c| {
+        // transform: Format menu (A3b) — its discrete variants are all Format; View was
+        // a historical accident.
+        r.register("transform", "Transform…", Some(MenuCategory::Format), |c| {
             c.editor.open_prompt(crate::prompt::Prompt::transform_chooser());
             CommandResult::Handled
         });
@@ -902,6 +905,24 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for (id, _) in reg.commands() {
             assert!(seen.insert(id.0), "duplicate command id: {}", id.0);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 3.2 (A3b): menu-placement sweep — filter/transform → Format,
+    // keystroke-native deletes → palette-only.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a3b_placement_sweep_categories() {
+        let reg = Registry::builtins();
+        let meta = |id: &str| reg.meta(reg.resolve_name(id).expect(id)).expect(id);
+        assert_eq!(meta("filter").menu, Some(MenuCategory::Format),
+            "filter is a text-shaping op, sibling of reflow/unwrap/ventilate");
+        assert_eq!(meta("transform").menu, Some(MenuCategory::Format),
+            "transform's discrete variants are all Format; View was a historical accident");
+        for id in ["delete_word_back", "delete_word_forward", "delete_line", "delete_to_line_end"] {
+            assert_eq!(meta(id).menu, None, "{id} is a keystroke-native atomic edit — palette-only");
         }
     }
 
