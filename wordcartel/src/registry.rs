@@ -274,6 +274,10 @@ impl Registry {
         r.register("block_begin",               "Set Block Begin",         Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_begin(c.editor); CommandResult::Handled });
         r.register("block_end",                 "Set Block End",           Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_end(c.editor); CommandResult::Handled });
         r.register("mark_block_from_selection", "Mark Block from Selection", Some(MenuCategory::Edit), |c| { crate::blocks_marked::mark_block_from_selection(c.editor); CommandResult::Handled });
+        // Block → selection bridge (A11.3, Task 1.1 / command-surface curation). `menu: None`
+        // for now — flips to `Some(MenuCategory::Block)` once that category lands (Task 2.1).
+        r.register("select_marked_block", "Select Block", None,
+            |c| { crate::blocks_marked::select_marked_block(c.editor); CommandResult::Handled });
 
         // Marked block operations (Task 3 / Effort 9A).
         r.register("block_copy",          "Copy Block",        Some(MenuCategory::Edit), |c| { crate::blocks_marked::block_copy(c.editor, c.clock);   CommandResult::Handled });
