@@ -298,12 +298,18 @@ pub fn resolve_prompt(
             crate::transform::dispatch_transform(editor, kind, None, clock, msg_tx);
         }
         PromptAction::CleanRecovery => {
-            // TOCTOU-safe: delete EXACTLY the snapshot taken when the prompt was raised
-            // (`std::mem::take` also clears the field), never a fresh re-scan — a file that
-            // appeared after the prompt opened can therefore never be swept. Best-effort per
-            // file; a vanished/undeletable file is simply not counted.
+            // TOCTOU-safe in BOTH directions. Forward: the snapshot is the CEILING — we delete only
+            // from `pending_clean` (`std::mem::take` also clears it), never a fresh re-scan, so a
+            // file that appeared after the prompt opened can never be swept. Inverse: before deleting
+            // each snapshot path we RE-RUN the enumerator's safety oracle (`recovery_path_still_
+            // cleanable`), so a swap/temp whose CONTENT became recoverable while the modal was open is
+            // SKIPPED — this can only ever delete a SUBSET of the snapshot (fail-closed). Best-effort
+            // per file; a vanished/undeletable/no-longer-cleanable file is simply not counted, and the
+            // status reports the ACTUAL number removed (may be < the confirmed count).
+            let protected = crate::swap::open_swap_paths(editor);
             let mut n = 0usize;
             for p in std::mem::take(&mut editor.pending_clean) {
+                if !crate::swap::recovery_path_still_cleanable(&p, &protected) { continue; }
                 if std::fs::remove_file(&p).is_ok() { n += 1; }
             }
             editor.status = format!("Cleaned {n} file(s)");
@@ -707,12 +713,14 @@ mod tests {
     #[test]
     fn clean_recovery_confirm_deletes_exactly_the_snapshot_even_if_a_new_file_appears() {
         // TOCTOU: the confirm deletes the SNAPSHOT, never a re-scan. A file that materializes
-        // in the state dir after the prompt opened must survive.
+        // in the state dir after the prompt opened must survive. (Snapshot entries are `recovered-
+        // *.md` dumps — unconditionally cleanable — so they pass the confirm-time re-verify and the
+        // test isolates the FORWARD-TOCTOU invariant from the inverse-TOCTOU content check.)
         use crate::editor::Editor;
         use crate::jobs::InlineExecutor;
-        let a = std::env::temp_dir().join(format!("wc-h5-snap-a-{}.swp", std::process::id()));
-        let b = std::env::temp_dir().join(format!("wc-h5-snap-b-{}.swp", std::process::id()));
-        let latecomer = std::env::temp_dir().join(format!("wc-h5-snap-late-{}.swp", std::process::id()));
+        let a = std::env::temp_dir().join(format!("recovered-wc-h5-snap-a-{}.md", std::process::id()));
+        let b = std::env::temp_dir().join(format!("recovered-wc-h5-snap-b-{}.md", std::process::id()));
+        let latecomer = std::env::temp_dir().join(format!("recovered-wc-h5-snap-late-{}.md", std::process::id()));
         std::fs::write(&a, "a").unwrap();
         std::fs::write(&b, "b").unwrap();
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
@@ -728,6 +736,67 @@ mod tests {
         assert!(e.prompt.is_none(), "prompt dismissed");
         assert_eq!(e.status, "Cleaned 2 file(s)");
         let _ = std::fs::remove_file(&latecomer);
+    }
+
+    /// INVERSE-TOCTOU (the H5 hardening): a swap enumerated as valueless (DiscardSilently) at scan
+    /// time but whose CONTENT is rewritten to a recoverable (Prompt) state while the confirm modal
+    /// is open must NOT be deleted at confirm — the handler re-runs the safety oracle per snapshot
+    /// path and skips any that no longer passes, while still deleting the paths that remain
+    /// cleanable. The snapshot stays the ceiling; only a SUBSET is ever removed.
+    #[test]
+    fn clean_recovery_confirm_skips_a_path_that_became_recoverable_while_prompt_open() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        use crate::swap::{fnv1a64, serialize, swap_path, write_atomic, SwapHeader};
+        const DEAD_PID: u32 = 999_999; // /proc/999999 does not exist
+        #[cfg(target_os = "linux")]
+        assert!(!crate::swap::pid_is_live(DEAD_PID), "test invariant: pid 999999 must not be live");
+
+        // Build a doc on disk + its CANONICAL swap whose header hash = fnv1a64(swap_body); a dead
+        // pid and swap_body == on-disk bytes make `assess` return DiscardSilently (cleanable).
+        let mk = |tag: &str, saved: &str, swap_body: &str| -> (std::path::PathBuf, std::path::PathBuf) {
+            let doc = std::env::temp_dir()
+                .join(format!("wc-h5-inv-{}-{}-{}.txt", std::process::id(), tag, TestClock(0).0));
+            std::fs::write(&doc, saved).unwrap();
+            let real = std::fs::canonicalize(&doc).unwrap();
+            let h = SwapHeader {
+                realpath: Some(real.to_string_lossy().into_owned()),
+                load_mtime_secs: None, load_size: None,
+                content_hash: fnv1a64(swap_body.as_bytes()), version: 1, ts_ms: 1, pid: DEAD_PID,
+            };
+            let sp = swap_path(Some(&doc)).unwrap();
+            write_atomic(&sp, &serialize(&h, swap_body)).unwrap();
+            (doc, sp)
+        };
+
+        // (1) stays valueless through confirm → must be deleted.
+        let (doc_ok, sp_ok) = mk("ok", "same\n", "same\n");
+        // (2) valueless at scan (snapshot), but a second session rewrites its swap with recoverable
+        //     unsaved work before confirm → must be SKIPPED.
+        let (doc_bad, sp_bad) = mk("bad", "same\n", "same\n");
+
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.pending_clean = vec![sp_ok.clone(), sp_bad.clone()]; // both cleanable at snapshot time
+        e.open_prompt(crate::prompt::Prompt::clean_recovery(2));
+
+        // Content race: rewrite sp_bad so its header now DIVERGES from the on-disk doc (assess → Prompt).
+        let h_div = SwapHeader {
+            realpath: Some(std::fs::canonicalize(&doc_bad).unwrap().to_string_lossy().into_owned()),
+            load_mtime_secs: None, load_size: None,
+            content_hash: fnv1a64(b"UNSAVED EDIT\n"), version: 2, ts_ms: 2, pid: DEAD_PID,
+        };
+        write_atomic(&sp_bad, &serialize(&h_div, "UNSAVED EDIT\n")).unwrap();
+
+        let (ex, clk, tx) = (InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
+        resolve_prompt(crate::prompt::PromptAction::CleanRecovery, &mut e, &ex, &clk, &tx);
+
+        assert!(!sp_ok.exists(), "the still-valueless snapshot swap IS deleted");
+        assert!(sp_bad.exists(),
+            "a swap that became recoverable while the prompt was open is NEVER deleted — no data loss");
+        assert_eq!(e.status, "Cleaned 1 file(s)", "status reports the ACTUAL deleted count (a subset)");
+        assert!(e.pending_clean.is_empty(), "snapshot consumed");
+        assert!(e.prompt.is_none(), "prompt dismissed");
+        for f in [&sp_ok, &sp_bad, &doc_ok, &doc_bad] { let _ = std::fs::remove_file(f); }
     }
 
     #[test]

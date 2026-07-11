@@ -236,18 +236,41 @@ pub(crate) fn cleanable_recovery_files(dir: &Path, protected: &HashSet<PathBuf>)
     let Ok(entries) = std::fs::read_dir(dir) else { return out };
     for entry in entries.flatten() {
         let path = entry.path();
-        if protected.contains(&path) { continue; } // open buffer / session swap → never offer
         let fname = entry.file_name();
         let fname = fname.to_string_lossy();
-        if fname.starts_with("recovered-") && fname.ends_with(".md") {
-            out.push(path);
-        } else if fname.ends_with(".swp") {
-            if swap_is_cleanable(&path) { out.push(path); }
-        } else if fname.ends_with(".tmp") && tmp_is_cleanable(dir, &path, &fname, me) {
-            out.push(path);
-        }
+        if recovery_file_is_cleanable(dir, &path, &fname, protected, me) { out.push(path); }
     }
     out
+}
+
+/// The single per-path cleanability verdict shared by `cleanable_recovery_files` (enumeration)
+/// and `recovery_path_still_cleanable` (H5 confirm-time re-verify). `dir` is the directory the
+/// candidate lives in (needed to resolve a `.tmp` target); `me` is our pid. Fails closed: any
+/// path whose recovery value cannot be positively disproved returns `false`.
+fn recovery_file_is_cleanable(
+    dir: &Path, path: &Path, fname: &str, protected: &HashSet<PathBuf>, me: u32,
+) -> bool {
+    if protected.contains(path) { return false; } // open buffer / session swap → never offer
+    if fname.starts_with("recovered-") && fname.ends_with(".md") {
+        true                                       // the app's own already-extracted dump
+    } else if fname.ends_with(".swp") {
+        swap_is_cleanable(path)
+    } else if fname.ends_with(".tmp") {
+        tmp_is_cleanable(dir, path, fname, me)
+    } else {
+        false
+    }
+}
+
+/// H5 confirm-time re-verify (inverse-TOCTOU hardening): re-run the enumerator's exact per-path
+/// oracle for ONE snapshotted path, so a swap/temp whose CONTENT became recoverable while the
+/// confirm modal was open is skipped instead of deleted. The snapshot remains the ceiling — this
+/// only ever narrows it — so the forward-TOCTOU law (never sweep a file that appeared after the
+/// prompt) is untouched. `protected` is gathered exactly as enumeration did (`open_swap_paths`).
+/// Fails closed: a path with no parent dir or file name is treated as no-longer-cleanable.
+pub(crate) fn recovery_path_still_cleanable(path: &Path, protected: &HashSet<PathBuf>) -> bool {
+    let (Some(dir), Some(fname)) = (path.parent(), path.file_name()) else { return false };
+    recovery_file_is_cleanable(dir, path, &fname.to_string_lossy(), protected, std::process::id())
 }
 
 /// True iff a `*.swp` candidate is provably valueless (see `cleanable_recovery_files`).
