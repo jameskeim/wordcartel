@@ -39,6 +39,20 @@ pub(crate) fn category_label_pub(cat: MenuCategory) -> &'static str {
     category_label(cat)
 }
 
+/// A live/data-driven menu section: rows are computed from `&Editor` state rather than
+/// drawn from registered commands (contrast the static `raw` rows in `grouped_commands`,
+/// below). The registration seam for such sections (module-structure GATE — new dynamic
+/// sections are a ROW here, not inline bulk in `grouped_commands`).
+pub struct DynamicSection {
+    pub category: MenuCategory,
+    pub rows: fn(&crate::editor::Editor) -> Vec<(String, MenuRowAction)>,
+}
+
+/// The Documents dynamic section (Task 4.2): one row per open buffer, data, not
+/// registered commands — exempt from the palette/registry command surface.
+pub const DYNAMIC_SECTIONS: &[DynamicSection] =
+    &[DynamicSection { category: MenuCategory::Documents, rows: crate::workspace::documents_menu_rows }];
+
 fn grouped_commands(reg: &Registry, keymap: &KeyTrie, editor: &crate::editor::Editor)
     -> Vec<(MenuCategory, Vec<(String, MenuRowAction)>)> {
     let mut groups = Vec::new();
@@ -59,6 +73,11 @@ fn grouped_commands(reg: &Registry, keymap: &KeyTrie, editor: &crate::editor::Ed
         if cat == MenuCategory::View && reg.meta(CommandId("palette")).is_some() {
             raw.push(("Command Palette...".to_string(), None, keymap.chord_for(CommandId("palette")),
                 MenuRowAction::Command(CommandId("palette"))));
+        }
+        for section in DYNAMIC_SECTIONS {
+            if section.category == cat {
+                raw.extend((section.rows)(editor).into_iter().map(|(label, action)| (label, None, None, action)));
+            }
         }
         if !raw.is_empty() {
             groups.push((cat, right_justify_leaves(raw)));
@@ -139,6 +158,7 @@ fn category_label(cat: MenuCategory) -> &'static str {
         MenuCategory::Block => "Block",
         MenuCategory::Format => "Format",
         MenuCategory::View => "View",
+        MenuCategory::Documents => "Documents",
         MenuCategory::Settings => "Settings",
         MenuCategory::Export => "Export",
     }
@@ -225,9 +245,8 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
 /// closes all overlays and hydrates any it opens). `SwitchBuffer(id)` jumps to the buffer
 /// via the shared `workspace::switch_to` setter — the same Law-1/Law-6 compliant route the
 /// palette's buffer-switcher rows already use (`mouse::route_overlay`'s palette branch).
-/// No built menu row carries `SwitchBuffer` yet (Task 4.2 adds the Documents dynamic menu),
-/// so this arm is currently unreachable in practice — it is wired now so 4.2 only needs to
-/// produce the rows, not touch dispatch again.
+/// The Documents dynamic menu (Task 4.2, `DYNAMIC_SECTIONS`) is the first built menu rows
+/// to carry `SwitchBuffer`.
 pub(crate) fn dispatch_row_action(
     editor: &mut crate::editor::Editor,
     reg: &crate::registry::Registry,
@@ -433,5 +452,58 @@ mod tests {
         assert!(p.rows.iter().any(|r|
             r.id == crate::registry::CommandId("cut") && r.chord == "ctrl-alt-c"),
             "palette hint must be 'ctrl-alt-c' for cut");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 4.2 (command-surface curation, A8): Documents dynamic section
+    // -----------------------------------------------------------------------
+
+    struct TestClock(u64);
+    impl wordcartel_core::history::Clock for TestClock {
+        fn now_ms(&self) -> u64 { self.0 }
+    }
+
+    fn enter_key() -> crossterm::event::Event {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        crossterm::event::Event::Key(KeyEvent {
+            code: KeyCode::Enter, modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: KeyEventState::NONE,
+        })
+    }
+
+    /// A8 / Task 4.2: the built menu has a Documents group whose rows are all
+    /// `SwitchBuffer`, one per open (non-scratch) buffer; activating one via
+    /// `intercept`'s Enter path switches the active buffer and closes the menu.
+    #[test]
+    fn documents_section_appears_and_switches() {
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let mut ed = crate::editor::Editor::new_from_text("a\n", None, (40, 10));
+        ed.install_scratch();
+        let b_id = ed.alloc_id();
+        let area = ed.active().view.area;
+        ed.buffers.push(crate::editor::Buffer::from_text(b_id, "b\n", None, area));
+
+        let view = build(&reg, &km, &ed);
+        let docs_pos = view.groups.iter()
+            .position(|(cat, _)| *cat == crate::registry::MenuCategory::Documents)
+            .expect("Documents group must appear");
+        let (docs_cat, docs_rows) = &view.groups[docs_pos];
+        assert_eq!(*docs_cat, crate::registry::MenuCategory::Documents);
+        assert_eq!(docs_rows.len(), 2, "two ordinary buffers, scratch excluded");
+        assert!(docs_rows.iter().all(|(_, action)| matches!(action, MenuRowAction::SwitchBuffer(_))),
+            "every Documents row must be SwitchBuffer: {docs_rows:?}");
+        let b_row = docs_rows.iter().position(|(_, action)| *action == MenuRowAction::SwitchBuffer(b_id))
+            .expect("Documents must contain a row for B");
+
+        // Drive activation through the real intercept Enter path.
+        ed.menu = Some(MenuView { groups: view.groups.clone(), open: docs_pos, highlighted: b_row,
+            built: true, scroll_top: 0 });
+        let ex = crate::jobs::InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let _ = intercept(crate::app::Msg::Input(enter_key()), &mut ed, &reg, &km, &ex, &clk, &tx);
+        assert_eq!(ed.active().id, b_id, "selecting the Documents row switches to that buffer");
+        assert!(ed.menu.is_none(), "menu closes after activation");
     }
 }

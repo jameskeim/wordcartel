@@ -36,11 +36,11 @@ pub type Handler = fn(&mut Ctx) -> CommandResult;
 // ── Command metadata ──────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MenuCategory { File, Edit, Block, Format, View, Settings, Export }
+pub enum MenuCategory { File, Edit, Block, Format, View, Documents, Settings, Export }
 
-pub const MENU_ORDER: [MenuCategory; 7] = [MenuCategory::File, MenuCategory::Edit,
-    MenuCategory::Block, MenuCategory::Format, MenuCategory::View, MenuCategory::Settings,
-    MenuCategory::Export];
+pub const MENU_ORDER: [MenuCategory; 8] = [MenuCategory::File, MenuCategory::Edit,
+    MenuCategory::Block, MenuCategory::Format, MenuCategory::View, MenuCategory::Documents,
+    MenuCategory::Settings, MenuCategory::Export];
 
 /// The live-state mark a stateful menu command interpolates into its row label.
 /// Exhaustive — adding a variant here is intentional and must be handled in every match.
@@ -311,12 +311,15 @@ impl Registry {
         r.register("copy_block_to_scratch", "Copy Block to Scratch", Some(MenuCategory::Block), |c| { crate::scratch::copy_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
         r.register("move_block_to_scratch", "Move Block to Scratch", Some(MenuCategory::Block), |c| { crate::scratch::move_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
 
-        // Effort 6: workspace navigation.
-        r.register("next_buffer", "Next Buffer", Some(MenuCategory::View), |c| { crate::workspace::next_buffer(c.editor); CommandResult::Handled });
-        r.register("prev_buffer", "Previous Buffer", Some(MenuCategory::View), |c| { crate::workspace::prev_buffer(c.editor); CommandResult::Handled });
+        // Effort 6: workspace navigation. next_buffer/prev_buffer/switch_buffer are
+        // palette-only (menu: None) as of Task 4.2 — the Documents dynamic menu's direct
+        // per-buffer rows make them duplicative on the menu surface only; they keep their
+        // registered-command status, palette listing, and keymap chords.
+        r.register("next_buffer", "Next Buffer", None, |c| { crate::workspace::next_buffer(c.editor); CommandResult::Handled });
+        r.register("prev_buffer", "Previous Buffer", None, |c| { crate::workspace::prev_buffer(c.editor); CommandResult::Handled });
         r.register("goto_scratch", "Go to Scratch Buffer", Some(MenuCategory::View), |c| { crate::workspace::goto_scratch(c.editor); CommandResult::Handled });
         r.register("toggle_scratch", "Toggle Scratch Buffer", Some(MenuCategory::View), |c| { crate::workspace::toggle_scratch(c.editor); CommandResult::Handled });
-        r.register("switch_buffer", "Switch Buffer\u{2026}", Some(MenuCategory::View), |c| { c.editor.open_buffer_switcher(); CommandResult::Handled });
+        r.register("switch_buffer", "Switch Buffer\u{2026}", None, |c| { c.editor.open_buffer_switcher(); CommandResult::Handled });
         r.register("close_buffer", "Close Buffer", Some(MenuCategory::File), |c| { crate::workspace::close_buffer(c.editor); CommandResult::Handled });
 
         // Format menu — discrete transform commands (Task 1 / Effort 5b).
@@ -904,13 +907,19 @@ mod tests {
         ));
     }
 
+    /// Task 4.2: switch_buffer/next_buffer/prev_buffer are registered + palette-listed
+    /// but menu-absent — the Documents dynamic menu supersedes them on the menu surface.
     #[test]
     fn switch_buffer_is_registered_in_view_menu() {
         let reg = Registry::builtins();
         let m = reg.meta(CommandId("switch_buffer"))
             .expect("switch_buffer must be registered");
         assert_eq!(m.label, "Switch Buffer\u{2026}");
-        assert_eq!(m.menu, Some(MenuCategory::View));
+        assert_eq!(m.menu, None, "switch_buffer is palette-only — Documents supersedes it on the menu");
+        for id in ["next_buffer", "prev_buffer"] {
+            let m = reg.meta(CommandId(id)).unwrap_or_else(|| panic!("{id} must be registered"));
+            assert_eq!(m.menu, None, "{id} is palette-only — Documents supersedes it on the menu");
+        }
     }
 
     #[test]

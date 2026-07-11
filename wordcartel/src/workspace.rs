@@ -36,6 +36,18 @@ pub fn buffer_switch_rows(editor: &Editor) -> Vec<(BufferId, String)> {
     out
 }
 
+/// Live rows for the Documents dynamic menu section (Task 4.2, `DYNAMIC_SECTIONS` seam):
+/// one row per open buffer in OPEN ORDER (buffer-vec order, stable — NOT MRU), scratch
+/// excluded. Data, not registered commands — exempt from the palette/registry surfaces
+/// (command-surface contract's Task 4.3 amendment); the row action reaches the same
+/// shared `switch_to` setter registered commands use.
+pub fn documents_menu_rows(editor: &Editor) -> Vec<(String, crate::menu::MenuRowAction)> {
+    editor.buffers.iter()
+        .filter(|b| !editor.is_scratch(b.id))
+        .map(|b| (buffer_display_name(editor, b.id), crate::menu::MenuRowAction::SwitchBuffer(b.id)))
+        .collect()
+}
+
 /// Switch active buffer by index and refresh the view.
 pub fn switch_to(editor: &mut Editor, idx: usize) {
     editor.switch_to_index(idx);
@@ -234,6 +246,26 @@ mod tests {
         assert_eq!(buffer_display_name(&e, buf0_id), "*untitled*", "path-less ordinary buffer is *untitled*");
         e.buffers[0].document.path = Some(std::path::PathBuf::from("/home/user/notes.md"));
         assert_eq!(buffer_display_name(&e, buf0_id), "notes.md", "shows filename only");
+    }
+
+    /// Task 4.2: Documents dynamic menu rows — open order (buffer-vec order, not MRU),
+    /// scratch excluded, each row labeled by buffer_display_name and carrying SwitchBuffer.
+    #[test]
+    fn documents_menu_rows_open_order_excludes_scratch() {
+        let mut e = Editor::new_from_text("a\n", None, (40, 10));
+        e.install_scratch(); // [A(0), scratch(1)]
+        let b_id = e.alloc_id();
+        let area = e.active().view.area;
+        e.buffers.push(crate::editor::Buffer::from_text(b_id, "b\n", None, area)); // [A(0), scratch(1), B(2)]
+        let a_id = e.buffers[0].id;
+        // Touch MRU out of buffer-vec order — rows must still follow buffer-vec (open) order.
+        switch_to(&mut e, 2); // touch B most-recently
+        let rows = documents_menu_rows(&e);
+        assert_eq!(rows.len(), 2, "scratch excluded, two ordinary buffers");
+        assert_eq!(rows[0], (buffer_display_name(&e, a_id), crate::menu::MenuRowAction::SwitchBuffer(a_id)),
+            "row 0 is A (buffer-vec order), not B (MRU order)");
+        assert_eq!(rows[1], (buffer_display_name(&e, b_id), crate::menu::MenuRowAction::SwitchBuffer(b_id)));
+        assert!(rows.iter().all(|(name, _)| name != "*scratch*"), "scratch never appears");
     }
 
     #[test]

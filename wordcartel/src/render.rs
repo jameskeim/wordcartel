@@ -2850,21 +2850,23 @@ mod tests {
     /// in Chrome style; row 1 has no dropdown (contains the document text).
     #[test]
     fn render_paints_inactive_bar_labels() {
-        // 7 categories: " File "(6)+" Edit "(6)+" Block "(7)+" Format "(8)+" View "(6)+
-        //               " Settings "(10)+" Export "(8) = 51 — use 60 wide to fit all.
-        let mut e = Editor::new_from_text("hello\n", None, (60, 8));
+        // 8 categories (Task 4.2 adds Documents after View): " File "(6)+" Edit "(6)+
+        // " Block "(7)+" Format "(8)+" View "(6)+" Documents "(11)+" Settings "(10)+
+        // " Export "(8) = 62 — use 70 wide to fit all.
+        let mut e = Editor::new_from_text("hello\n", None, (70, 8));
         e.menu_bar_mode = crate::config::MenuBarMode::Pinned;
         e.menu = None;
         derive::rebuild(&mut e);
-        let buf = render_to_buffer(&mut e, 60, 8);
+        let buf = render_to_buffer(&mut e, 70, 8);
         let row0 = row_string(&buf, 0);
-        assert!(row0.contains(" File "),     "inactive bar must show ' File '");
-        assert!(row0.contains(" Edit "),     "inactive bar must show ' Edit '");
-        assert!(row0.contains(" Block "),    "inactive bar must show ' Block '");
-        assert!(row0.contains(" Format "),   "inactive bar must show ' Format '");
-        assert!(row0.contains(" View "),     "inactive bar must show ' View '");
-        assert!(row0.contains(" Settings "), "inactive bar must show ' Settings '");
-        assert!(row0.contains(" Export "),   "inactive bar must show ' Export '");
+        assert!(row0.contains(" File "),      "inactive bar must show ' File '");
+        assert!(row0.contains(" Edit "),      "inactive bar must show ' Edit '");
+        assert!(row0.contains(" Block "),     "inactive bar must show ' Block '");
+        assert!(row0.contains(" Format "),    "inactive bar must show ' Format '");
+        assert!(row0.contains(" View "),      "inactive bar must show ' View '");
+        assert!(row0.contains(" Documents "), "inactive bar must show ' Documents '");
+        assert!(row0.contains(" Settings "),  "inactive bar must show ' Settings '");
+        assert!(row0.contains(" Export "),    "inactive bar must show ' Export '");
         // Row 1 must have the document text (not a dropdown).
         let row1 = row_string(&buf, 1);
         assert!(row1.contains("hello"), "row 1 must show document text, not a dropdown");
