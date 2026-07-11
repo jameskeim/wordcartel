@@ -582,7 +582,7 @@ impl HarperLs {
 }
 
 impl DiagnosticsProvider for HarperLs {
-    fn name(&self) -> &'static str { "harper-ls" }
+    fn name(&self) -> &'static str { "Harper" }
 
     fn availability(&self) -> Availability {
         *self.shared.availability.lock().expect("availability mutex")
@@ -1287,7 +1287,7 @@ mod tests {
     fn harper_ls_new_is_idle_and_spawns_nothing() {
         let (msg_tx, _msg_rx) = std::sync::mpsc::channel::<Msg>();
         let p = HarperLs::new(msg_tx, cfg(true));
-        assert_eq!(p.name(), "harper-ls");
+        assert_eq!(p.name(), "Harper");
         assert_eq!(p.availability(), Availability::Idle);
     }
 

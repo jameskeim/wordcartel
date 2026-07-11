@@ -15,7 +15,7 @@ pub(crate) fn status_left_text(editor: &Editor) -> String {
     let count = editor.buffers.len();
     let name = crate::workspace::buffer_display_name(editor, editor.active().id);
     let head = format!("[{idx}/{count}] {name}");
-    // Effort A: the Review label gains provider attribution (`REVIEW · harper-ls`) only when the
+    // Effort A: the Review label gains provider attribution (`REVIEW · Harper`) only when the
     // provider is *live* (Ready) — Idle/Starting/Unavailable all show plain `REVIEW`, so the label
     // asserts a working checker (spec §10). One mutex read, behind the Review arm only.
     let mode_text: std::borrow::Cow<'static, str> = match editor.active().view.mode {
