@@ -385,9 +385,24 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
         }
         return;
     }
+    // A13 Task 5.1: minibuffer click → caret. `Down(Left)` inside the input line
+    // positions the caret at the clicked byte; all other events (incl. clicks on
+    // the prompt or off the status row) are consumed no-ops — outside-click-to-
+    // dismiss is deliberately out of scope (per the task brief).
+    if editor.minibuffer.is_some() {
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            if let Some(mb) = editor.minibuffer.as_mut() {
+                if let Some(byte) = crate::chrome_geom::minibuffer_click_byte(area, mb, ev.column, ev.row) {
+                    mb.cursor = byte;
+                }
+            }
+        }
+        return;
+    }
     // Text-input modals: consume, no row action (you type). Tail branch — the fn
-    // ends here, so an empty body suffices (no `return` needed).
-    if editor.minibuffer.is_some() || editor.search.is_some() {}
+    // ends here, so an empty body suffices (no `return` needed). Task 5.2 fills
+    // in the search overlay's click branch.
+    if editor.search.is_some() {}
 }
 
 #[allow(clippy::too_many_lines)] // mouse event dispatch — one branch per screen region
@@ -1710,5 +1725,66 @@ mod tests {
         handle(&mut e, click, &reg, &km, &ex, &clk, &tx);
         assert_eq!(caret_before, crate::nav::head(&e),
             "click below painted dropdown (row 9) must NOT dispatch move_right — caret must not advance");
+    }
+
+    // -----------------------------------------------------------------------
+    // A13 Task 5.1: minibuffer click → caret
+    // -----------------------------------------------------------------------
+
+    /// Open a Filter minibuffer with the given prompt/text/cursor on an 80x24 editor.
+    fn open_minibuffer(e: &mut Editor, prompt: &str, text: &str, cursor: usize) {
+        e.minibuffer = Some(crate::minibuffer::Minibuffer {
+            prompt: prompt.into(),
+            text: text.into(),
+            cursor,
+            kind: crate::minibuffer::MinibufferKind::Filter,
+        });
+    }
+
+    /// Clicking inside the minibuffer's text on the status row positions the caret
+    /// at the exact byte offset of the clicked char — multibyte-safe (é is 2 bytes).
+    /// "sh> " prompt = 4 char-columns; text "éxx" → char-col 1 ('x') = byte 2.
+    #[test]
+    fn minibuffer_click_positions_caret() {
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        open_minibuffer(&mut e, "sh> ", "\u{e9}xx", 0);
+        let (reg, ex, clk, tx, km) = ctx();
+        let (_w, h) = e.active().view.area;
+        let status_row = h - 1;
+        handle(&mut e, down(4 + 1, status_row), &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.minibuffer.as_ref().unwrap().cursor, '\u{e9}'.len_utf8(),
+            "click at char-col 1 must land on the byte boundary AFTER the multibyte 'é'");
+        assert!(e.minibuffer.is_some(), "minibuffer stays open");
+    }
+
+    /// A click past the end of the text clamps the caret to `text.len()` — never
+    /// panics on an out-of-range char index.
+    #[test]
+    fn minibuffer_click_past_end_clamps() {
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        open_minibuffer(&mut e, "sh> ", "\u{e9}xx", 0);
+        let (reg, ex, clk, tx, km) = ctx();
+        let (_w, h) = e.active().view.area;
+        let status_row = h - 1;
+        handle(&mut e, down(4 + 50, status_row), &reg, &km, &ex, &clk, &tx); // far past the text
+        let mb = e.minibuffer.as_ref().unwrap();
+        assert_eq!(mb.cursor, mb.text.len(), "click past end clamps to text.len()");
+    }
+
+    /// A click on the prompt itself (before `prompt_cols`) is a consumed no-op —
+    /// caret unchanged, minibuffer stays open.
+    #[test]
+    fn minibuffer_click_prompt_is_noop() {
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        open_minibuffer(&mut e, "sh> ", "\u{e9}xx", 2);
+        let (reg, ex, clk, tx, km) = ctx();
+        let (_w, h) = e.active().view.area;
+        let status_row = h - 1;
+        handle(&mut e, down(1, status_row), &reg, &km, &ex, &clk, &tx); // col 1 < prompt_cols (4)
+        assert_eq!(e.minibuffer.as_ref().unwrap().cursor, 2, "click on the prompt must not move the caret");
+        assert!(e.minibuffer.is_some(), "minibuffer stays open");
     }
 }

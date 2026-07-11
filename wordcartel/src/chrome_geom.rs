@@ -207,6 +207,31 @@ pub(crate) fn prompt_choice_at(area: Rect, prompt: &crate::prompt::Prompt, col: 
     None
 }
 
+/// Map a minibuffer click `(col, row)` to a byte offset in `mb.text`, or `None`
+/// when the click is outside the input line (any row but the status row) or on
+/// the prompt itself.
+///
+/// Mirrors `render.rs::place_cursor`'s minibuffer arm: the caret column is
+/// `prompt.chars().count() + text[..cursor].chars().count()` — one terminal
+/// column per char, byte offset only used for the actual string index. This
+/// walks the inverse: subtract `prompt_cols` from the clicked column to get a
+/// char-index into `mb.text`, then resolve that char-index to its byte offset
+/// via `char_indices` (never a mid-char byte — `char_indices` only yields
+/// boundaries). A click at or past the last char clamps to `mb.text.len()`.
+pub(crate) fn minibuffer_click_byte(area: Rect, mb: &crate::minibuffer::Minibuffer, col: u16, row: u16) -> Option<usize> {
+    if row != area.y + area.height.saturating_sub(1) {
+        return None;
+    }
+    let prompt_end = area.x.saturating_add(mb.prompt.chars().count() as u16);
+    if col < prompt_end {
+        return None;
+    }
+    let click_char_col = (col - prompt_end) as usize;
+    let byte = mb.text.char_indices().nth(click_char_col)
+        .map_or(mb.text.len(), |(b, _)| b);
+    Some(byte)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
