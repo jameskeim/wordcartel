@@ -540,3 +540,23 @@ keyboard path authoritative (contract law 5 — every mouse affordance has a key
 
 The plugin/automation spine; registers into the command/hook/job seams. See docs/design/effort-p-plugin-system-design-space.md.
 
+
+### B9 — Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols)
+<!-- item: B9 -->
+
+**Surfaced by the command-surface curation effort (2026-07-10, Task 6.1 verify).** That effort added
+two menu categories (`Block`, `Documents`), growing the menu bar to 8 categories ≈ **62 columns**
+(`File 6 + Edit 6 + Block 7 + Format 8 + View 6 + Documents 11 + Settings 10 + Export 8`).
+`chrome_geom::menu_bar_layout_cats` has **no horizontal windowing** (only the dropdown has *vertical*
+windowing) — so below ~62 cols the trailing categories clip: verified at 60×24 the bar renders
+`… Settings Expor` (Export's label loses its last char) and Export's right-anchored dropdown renders
+clipped to the right-edge column, i.e. **mouse-unreachable / unreadable** for the clipped tail.
+**Keyboard reach is intact** (F10 + Left/Right cycles to and opens the clipped category via
+`menu::intercept`), so this is a cosmetic/mouse degradation, not data loss — which is why it was
+accepted for the effort's merge and filed here rather than expanding that effort's scope.
+
+**Direction (when picked up):** add horizontal overflow handling to `menu_bar_layout_cats` — either a
+scrolling/windowed bar (shift the visible category window to keep the active category on-screen, mirror
+the dropdown's `list_window` approach) or a right-edge overflow affordance. Anchors:
+`chrome_geom::menu_bar_layout_cats`, `menu::intercept` (keyboard cycle), the dropdown `list_window`
+(vertical-windowing precedent), the tiny-terminal guard.
