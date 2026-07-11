@@ -59,6 +59,8 @@ pub enum Msg {
         version: u64,
         diagnostics: Vec<wordcartel_core::diagnostics::Diagnostic>,
     },
+    /// A `DiagnosticsProvider` lifecycle event (Effort A) — restart re-arm / degradation hint.
+    DiagProviderEvent(crate::diag_provider::ProviderEvent),
     ClipboardPaste { id: u64, buffer_id: crate::editor::BufferId, text: Option<String> },
     ClipboardAvailability(bool),
     Tick,
@@ -106,6 +108,7 @@ impl std::fmt::Debug for Msg {
                 .field("version", version)
                 .field("count", &diagnostics.len())
                 .finish(),
+            Msg::DiagProviderEvent(ev) => f.debug_tuple("DiagProviderEvent").field(ev).finish(),
             Msg::ClipboardPaste { id, buffer_id, text } => f.debug_struct("ClipboardPaste")
                 .field("id", id).field("buffer_id", buffer_id)
                 .field("has_text", &text.is_some()).finish(),
@@ -319,6 +322,7 @@ fn reduce_dispatch(
         Msg::DiagnosticsDone { buffer_id, version, diagnostics } => {
             crate::diagnostics_run::apply_diagnostics_done(editor, buffer_id, version, diagnostics);
         }
+        Msg::DiagProviderEvent(ev) => crate::diag_provider::apply_provider_event(editor, ev, clock),
         Msg::Tick => crate::timers::on_tick(editor, ex, clock, msg_tx),
         Msg::ClipboardPaste { buffer_id, text, .. } => crate::jobs_apply::apply_clipboard_paste(editor, buffer_id, text, clock),
         Msg::ClipboardAvailability(ok) => crate::jobs_apply::apply_clipboard_availability(editor, ok),
