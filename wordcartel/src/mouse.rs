@@ -173,18 +173,18 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
                     .find(|(_, r)| ev.column >= r.x && ev.column < r.x + r.width && ev.row == r.y)
                     .map(|(cat, _)| cat)
             };
-            let row_id: Option<crate::registry::CommandId> = {
+            let row_action: Option<crate::menu::MenuRowAction> = {
                 let groups = &editor.menu.as_ref().unwrap().groups;
                 crate::chrome_geom::menu_dropdown_row_at(hit_area, groups, open, scroll_top, ev.column, ev.row)
-                    .and_then(|row| groups.get(open).and_then(|g| g.1.get(row)).map(|(_, id)| *id))
+                    .and_then(|row| groups.get(open).and_then(|g| g.1.get(row)).map(|(_, action)| *action))
             };
             // all borrows dropped — now mutate/dispatch/clear
             if let Some(cat) = bar_hit {
                 // category switch — reset scroll_top so stale window never carries into shorter category
                 let m = editor.menu.as_mut().unwrap();
                 m.open = cat; m.highlighted = 0; m.scroll_top = 0;
-            } else if let Some(id) = row_id {
-                crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
+            } else if let Some(action) = row_action {
+                crate::menu::dispatch_row_action(editor, reg, keymap, ex, clock, msg_tx, action);
             } else {
                 editor.menu = None; // outside → close
                 editor.search = None;
@@ -1598,8 +1598,8 @@ mod tests {
         crate::derive::rebuild(&mut e);
         // Synthetic 20-leaf category so the dropdown overflows the 7-row window and
         // scroll_top must advance (Codex plan gate round 2 — prove windowing, not just highlight).
-        let leaves: Vec<(String, crate::registry::CommandId)> =
-            (0..20).map(|i| (format!("item{i}"), crate::registry::CommandId("move_right"))).collect();
+        let leaves: Vec<(String, crate::menu::MenuRowAction)> =
+            (0..20).map(|i| (format!("item{i}"), crate::menu::MenuRowAction::Command(crate::registry::CommandId("move_right")))).collect();
         e.menu = Some(crate::menu::MenuView {
             groups: vec![(crate::registry::MenuCategory::Edit, leaves)],
             open: 0, highlighted: 0, built: true, scroll_top: 0 });
@@ -1633,8 +1633,8 @@ mod tests {
         use ratatui::backend::TestBackend;
         use crate::render::render;
 
-        let leaves: Vec<(String, crate::registry::CommandId)> =
-            (0..9).map(|i| (format!("item{i:02}      "), crate::registry::CommandId("move_right"))).collect();
+        let leaves: Vec<(String, crate::menu::MenuRowAction)> =
+            (0..9).map(|i| (format!("item{i:02}      "), crate::menu::MenuRowAction::Command(crate::registry::CommandId("move_right")))).collect();
         let mut e = Editor::new_from_text("abc\n", None, (30, 10));
         crate::derive::rebuild(&mut e);
         e.menu = Some(crate::menu::MenuView {

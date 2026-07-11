@@ -18,12 +18,12 @@ pub(crate) fn menu_bar_layout_cats(area: Rect, cats: &[crate::registry::MenuCate
 }
 
 /// Compute bar label rects from the built groups list.  Thin wrapper over `menu_bar_layout_cats`.
-pub(crate) fn menu_bar_layout(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)]) -> Vec<(usize, Rect)> {
+pub(crate) fn menu_bar_layout(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::menu::MenuRowAction)>)]) -> Vec<(usize, Rect)> {
     let cats: Vec<crate::registry::MenuCategory> = groups.iter().map(|g| g.0).collect();
     menu_bar_layout_cats(area, &cats)
 }
 
-pub(crate) fn menu_dropdown_rect(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)], open: usize) -> Option<Rect> {
+pub(crate) fn menu_dropdown_rect(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::menu::MenuRowAction)>)], open: usize) -> Option<Rect> {
     let bar = menu_bar_layout(area, groups);
     let (_, label_rect) = bar.get(open)?;
     let leaves = &groups.get(open)?.1;
@@ -37,7 +37,7 @@ pub(crate) fn menu_dropdown_rect(area: Rect, groups: &[(crate::registry::MenuCat
         list_h as u16))
 }
 
-pub(crate) fn menu_dropdown_row_at(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)], open: usize, scroll_top: usize, col: u16, row: u16) -> Option<usize> {
+pub(crate) fn menu_dropdown_row_at(area: Rect, groups: &[(crate::registry::MenuCategory, Vec<(String, crate::menu::MenuRowAction)>)], open: usize, scroll_top: usize, col: u16, row: u16) -> Option<usize> {
     let r = menu_dropdown_rect(area, groups, open)?;
     let leaves_len = groups.get(open).map(|g| g.1.len()).unwrap_or(0);
     let list_h = r.height as usize;
@@ -226,10 +226,10 @@ mod tests {
     /// Build a synthetic groups list: one category (Edit) with `n` leaves.
     #[cfg(test)]
     fn tall_menu_groups(n: usize)
-        -> Vec<(crate::registry::MenuCategory, Vec<(String, crate::registry::CommandId)>)>
+        -> Vec<(crate::registry::MenuCategory, Vec<(String, crate::menu::MenuRowAction)>)>
     {
-        let leaves: Vec<(String, crate::registry::CommandId)> = (0..n)
-            .map(|i| (format!("item{i}"), crate::registry::CommandId("move_right")))
+        let leaves: Vec<(String, crate::menu::MenuRowAction)> = (0..n)
+            .map(|i| (format!("item{i}"), crate::menu::MenuRowAction::Command(crate::registry::CommandId("move_right"))))
             .collect();
         vec![(crate::registry::MenuCategory::Edit, leaves)]
     }

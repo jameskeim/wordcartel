@@ -3045,8 +3045,8 @@ mod tests {
         // Short terminal (h=8) so avail_below=7; categories with many items overflow the window.
         let mut e = Editor::new_from_text("x\n", None, (80, 8));
         // Build menu with a synthetic tall category so the dropdown overflows the 7-row window.
-        let leaves: Vec<(String, crate::registry::CommandId)> = (0..20)
-            .map(|i| (format!("item{i:02}       "), crate::registry::CommandId("move_right")))
+        let leaves: Vec<(String, crate::menu::MenuRowAction)> = (0..20)
+            .map(|i| (format!("item{i:02}       "), crate::menu::MenuRowAction::Command(crate::registry::CommandId("move_right"))))
             .collect();
         e.menu = Some(crate::menu::MenuView {
             groups: vec![(crate::registry::MenuCategory::Edit, leaves)],
@@ -3089,8 +3089,8 @@ mod tests {
     fn dropdown_highlight_never_hidden_in_overflow() {
         // 80×8 terminal: avail_below = 7, drop_rect.height = 7, item_rows = 6.
         let mut e = Editor::new_from_text("x\n", None, (80, 8));
-        let leaves: Vec<(String, crate::registry::CommandId)> = (0..20)
-            .map(|i| (format!("item{i:02}"), crate::registry::CommandId("move_right")))
+        let leaves: Vec<(String, crate::menu::MenuRowAction)> = (0..20)
+            .map(|i| (format!("item{i:02}"), crate::menu::MenuRowAction::Command(crate::registry::CommandId("move_right"))))
             .collect();
         // Place the highlight at the position that was hidden under the old code:
         // highlighted=6, scroll_top=0.  With list_h=7 (old) keep_visible accepts this

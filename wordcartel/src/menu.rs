@@ -3,9 +3,18 @@ use crate::registry::{CommandId, MenuCategory, Registry, MENU_ORDER};
 use crate::app::Msg;
 use crossterm::event::Event;
 
+/// What a built menu row dispatches on activation (Enter / click). Exhaustive —
+/// every activation site must place every variant (A8 seam; `SwitchBuffer` rows
+/// are produced starting Task 4.2's Documents dynamic menu).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MenuRowAction {
+    Command(crate::registry::CommandId),
+    SwitchBuffer(crate::editor::BufferId),
+}
+
 #[derive(Clone, Debug)]
 pub struct MenuView {
-    pub groups: Vec<(MenuCategory, Vec<(String, CommandId)>)>,
+    pub groups: Vec<(MenuCategory, Vec<(String, MenuRowAction)>)>,
     pub open: usize,
     pub highlighted: usize,
     pub built: bool,
@@ -31,24 +40,25 @@ pub(crate) fn category_label_pub(cat: MenuCategory) -> &'static str {
 }
 
 fn grouped_commands(reg: &Registry, keymap: &KeyTrie, editor: &crate::editor::Editor)
-    -> Vec<(MenuCategory, Vec<(String, CommandId)>)> {
+    -> Vec<(MenuCategory, Vec<(String, MenuRowAction)>)> {
     let mut groups = Vec::new();
     for cat in MENU_ORDER {
-        // (base text, value, chord, id) intermediates — value and chord kept separate so the
+        // (base text, value, chord, action) intermediates — value and chord kept separate so the
         // group right-justifies into independent columns.
-        let mut raw: Vec<(String, Option<String>, Option<String>, CommandId)> = reg
+        let mut raw: Vec<(String, Option<String>, Option<String>, MenuRowAction)> = reg
             .commands()
             .filter_map(|(id, meta)| {
                 if meta.menu == Some(cat) && id != CommandId("palette") {
                     let (base, value) = menu_leaf_parts(meta, editor);
-                    Some((base, value, keymap.chord_for(id), id))
+                    Some((base, value, keymap.chord_for(id), MenuRowAction::Command(id)))
                 } else {
                     None
                 }
             })
             .collect();
         if cat == MenuCategory::View && reg.meta(CommandId("palette")).is_some() {
-            raw.push(("Command Palette...".to_string(), None, keymap.chord_for(CommandId("palette")), CommandId("palette")));
+            raw.push(("Command Palette...".to_string(), None, keymap.chord_for(CommandId("palette")),
+                MenuRowAction::Command(CommandId("palette"))));
         }
         if !raw.is_empty() {
             groups.push((cat, right_justify_leaves(raw)));
@@ -82,8 +92,8 @@ fn menu_leaf_parts(meta: &crate::registry::CommandMeta, editor: &crate::editor::
 /// (stateful rows) and the CHORD column, matching the palette. `[base] … [value] … [chord]`.
 /// A group with no stateful rows renders byte-identically to the chord-only layout. `GAP` is the
 /// min gap before the chord; `VGAP` the gap between the base name and the value column.
-fn right_justify_leaves(raw: Vec<(String, Option<String>, Option<String>, CommandId)>)
-    -> Vec<(String, CommandId)>
+fn right_justify_leaves<A>(raw: Vec<(String, Option<String>, Option<String>, A)>)
+    -> Vec<(String, A)>
 {
     const GAP: usize = 4;
     const VGAP: usize = 2;
@@ -158,7 +168,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
             if matches!(k.code, KeyCode::Esc | KeyCode::F(10)) {
                 editor.menu = None;
             } else {
-                let mut selected: Option<crate::registry::CommandId> = None;
+                let mut selected: Option<MenuRowAction> = None;
                 if let Some(menu) = editor.menu.as_mut() {   // borrow scoped to this block
                     let ncat = menu.groups.len();
                     match k.code {
@@ -193,13 +203,13 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                             }
                         }
                         KeyCode::Enter if ncat > 0 => {
-                            if let Some((_, id)) = menu.groups[menu.open].1.get(menu.highlighted) { selected = Some(*id); }
+                            if let Some((_, action)) = menu.groups[menu.open].1.get(menu.highlighted) { selected = Some(*action); }
                         }
                         _ => {}
                     }
                 } // menu borrow dropped here
-                if let Some(id) = selected {
-                    crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
+                if let Some(action) = selected {
+                    dispatch_row_action(editor, reg, keymap, ex, clock, msg_tx, action);
                 }
             }
         }
@@ -207,6 +217,36 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
     }
     // Non-key msg falls through to normal handling while menu stays open.
     crate::app::Handled::Pass(msg)
+}
+
+/// Dispatch a menu row's action on activation — shared by keyboard (`intercept`, above)
+/// and mouse (`mouse::route_overlay`) so the two paths cannot drift. `Command(id)` runs
+/// the registry command exactly as before this seam existed (`dispatch_overlay_command`
+/// closes all overlays and hydrates any it opens). `SwitchBuffer(id)` jumps to the buffer
+/// via the shared `workspace::switch_to` setter — the same Law-1/Law-6 compliant route the
+/// palette's buffer-switcher rows already use (`mouse::route_overlay`'s palette branch).
+/// No built menu row carries `SwitchBuffer` yet (Task 4.2 adds the Documents dynamic menu),
+/// so this arm is currently unreachable in practice — it is wired now so 4.2 only needs to
+/// produce the rows, not touch dispatch again.
+pub(crate) fn dispatch_row_action(
+    editor: &mut crate::editor::Editor,
+    reg: &crate::registry::Registry,
+    keymap: &crate::keymap::KeyTrie,
+    ex: &dyn crate::jobs::Executor,
+    clock: &dyn wordcartel_core::history::Clock,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
+    action: MenuRowAction,
+) {
+    match action {
+        MenuRowAction::Command(id) =>
+            crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id),
+        MenuRowAction::SwitchBuffer(bid) => {
+            editor.menu = None;
+            if let Some(idx) = editor.buffers.iter().position(|b| b.id == bid) {
+                crate::workspace::switch_to(editor, idx);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -225,7 +265,7 @@ mod tests {
             .collect()
     }
 
-    fn group_items(view: &MenuView, name: &str) -> Vec<(String, CommandId)> {
+    fn group_items(view: &MenuView, name: &str) -> Vec<(String, MenuRowAction)> {
         let ed = throwaway_editor();
         grouped_commands(&crate::registry::Registry::builtins(), &test_keymap_for(view), &ed)
             .into_iter()
@@ -251,11 +291,31 @@ mod tests {
         assert!(tops.contains(&"Edit".to_string()) && tops.contains(&"Format".to_string()));
         assert!(!tops.contains(&"Insert".to_string()), "empty/absent categories omitted");
         // a Format leaf carries its chord baked into the label (if bound) or just the label
-        let fmt = group_items(&view, "Format"); // helper: leaf (label, CommandId) pairs
-        assert!(fmt.iter().any(|(label, id)| *id == crate::registry::CommandId("reflow") && label.starts_with("Reflow")));
+        let fmt = group_items(&view, "Format"); // helper: leaf (label, MenuRowAction) pairs
+        assert!(fmt.iter().any(|(label, action)|
+            *action == MenuRowAction::Command(crate::registry::CommandId("reflow")) && label.starts_with("Reflow")));
         // View contains the palette cross-link
         let view_items = group_items(&view, "View");
-        assert!(view_items.iter().any(|(_, id)| *id == crate::registry::CommandId("palette")));
+        assert!(view_items.iter().any(|(_, action)|
+            *action == MenuRowAction::Command(crate::registry::CommandId("palette"))));
+    }
+
+    /// A8 seam: after the `MenuRowAction` refactor, static rows still dispatch exactly as
+    /// before — every built row is `Command(id)`, byte-identical behavior to pre-refactor.
+    #[test]
+    fn command_rows_still_dispatch_after_action_refactor() {
+        let reg = crate::registry::Registry::builtins();
+        let (keymap, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ed = throwaway_editor();
+        let view = build(&reg, &keymap, &ed);
+        let fmt = group_items(&view, "Format");
+        assert!(fmt.iter().any(|(_, action)|
+            *action == MenuRowAction::Command(CommandId("reflow"))),
+            "reflow row must carry MenuRowAction::Command(CommandId(\"reflow\")): {fmt:?}");
+        let view_items = group_items(&view, "View");
+        assert!(view_items.iter().any(|(_, action)|
+            *action == MenuRowAction::Command(CommandId("palette"))),
+            "palette cross-link row must carry MenuRowAction::Command(CommandId(\"palette\")): {view_items:?}");
     }
 
     #[test]
@@ -344,11 +404,11 @@ mod tests {
             "Block must sit edit-adjacent, between Edit and Format: {tops:?}");
         let block_items = group_items(&view, "Block");
         for id in ["block_begin", "block_write", "copy_block_to_scratch", "select_marked_block"] {
-            assert!(block_items.iter().any(|(_, cid)| *cid == crate::registry::CommandId(id)),
+            assert!(block_items.iter().any(|(_, action)| *action == MenuRowAction::Command(crate::registry::CommandId(id))),
                 "Block group must contain {id}: {block_items:?}");
         }
         let file_items = group_items(&view, "File");
-        assert!(!file_items.iter().any(|(_, cid)| *cid == crate::registry::CommandId("block_write")),
+        assert!(!file_items.iter().any(|(_, action)| *action == MenuRowAction::Command(crate::registry::CommandId("block_write"))),
             "block_write must have moved out of File");
     }
 
@@ -364,8 +424,8 @@ mod tests {
         let ed = crate::editor::Editor::new_from_text("x\n", None, (40, 8));
         // Menu bakes chord_for into the leaf label — the user's explicit binding must win.
         let groups = build(&reg, &km, &ed).groups;
-        assert!(groups.iter().any(|(_, ls)| ls.iter().any(|(label, id)|
-            *id == crate::registry::CommandId("cut") && label.contains("ctrl-alt-c"))),
+        assert!(groups.iter().any(|(_, ls)| ls.iter().any(|(label, action)|
+            *action == MenuRowAction::Command(crate::registry::CommandId("cut")) && label.contains("ctrl-alt-c"))),
             "menu hint must contain 'ctrl-alt-c' for cut");
         // Palette row.chord must also reflect the user's explicit binding.
         let mut p = crate::palette::Palette::default();
