@@ -3,6 +3,7 @@
 //! codeAction `TextEdit`→`Suggestion` mapping. No process IO lives here — see harper_ls.rs.
 
 use crate::editor::BufferId;
+use crate::limits::LSP_MAX_FRAME_BYTES;
 use std::io::{self, BufRead, Write};
 use wordcartel_core::diagnostics::Suggestion;
 
@@ -45,6 +46,9 @@ pub fn read_frame<R: BufRead>(r: &mut R) -> io::Result<Option<serde_json::Value>
     }
     let len = content_length
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length"))?;
+    if len > LSP_MAX_FRAME_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Content-Length exceeds cap"));
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     let v = serde_json::from_slice(&buf)
@@ -59,7 +63,6 @@ pub fn read_frame<R: BufRead>(r: &mut R) -> io::Result<Option<serde_json::Value>
 /// text's line count.
 pub fn utf16_pos_to_byte(text: &str, line: u32, character: u32) -> Option<usize> {
     let mut line_start = 0usize;
-    let mut cur_line = 0u32;
     // Find the byte offset where `line` begins.
     if line > 0 {
         let mut seen = 0u32;
@@ -72,9 +75,7 @@ pub fn utf16_pos_to_byte(text: &str, line: u32, character: u32) -> Option<usize>
         }
         if seen < line { return None; } // line past EOF
         line_start = idx;
-        cur_line = line;
     }
-    let _ = cur_line;
     // Walk the target line, accumulating UTF-16 units. When `character` lands AT or INSIDE the
     // current scalar's UTF-16 width — i.e. character < u16_count + width — map to that scalar's
     // START byte, so a position inside a surrogate pair (🙂, char 1) never splits it and clamps to
@@ -188,6 +189,26 @@ mod tests {
         let mut cur = Cursor::new(raw);
         let got = read_frame(&mut cur);
         assert!(got.is_err());
+    }
+
+    #[test]
+    fn read_frame_rejects_absurd_content_length_without_panicking() {
+        // Near usize::MAX: parses fine into a usize but must never reach `vec![0u8; len]`.
+        let raw = b"Content-Length: 18446744073709551615\r\n\r\n".to_vec();
+        let mut cur = Cursor::new(raw);
+        let got = read_frame(&mut cur);
+        assert!(got.is_err());
+        assert_eq!(got.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn read_frame_rejects_content_length_just_over_the_cap() {
+        let claimed = crate::limits::LSP_MAX_FRAME_BYTES + 1;
+        let raw = format!("Content-Length: {claimed}\r\n\r\n").into_bytes();
+        let mut cur = Cursor::new(raw);
+        let got = read_frame(&mut cur);
+        assert!(got.is_err());
+        assert_eq!(got.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
     /// A reader that yields only a few bytes per `read` call, to exercise `read_frame` against a
@@ -351,6 +372,15 @@ mod tests {
         let text = "cat sat";
         let d = 0..3;
         let action = json!({"kind": null, "command": {"title": "Add to dictionary"}});
+        assert_eq!(quickfix_suggestion(&action, uri, text, &d), None);
+    }
+
+    #[test]
+    fn quickfix_no_edit_key_on_quickfix_kind_is_none() {
+        let uri = "untitled:wcartel-1-0";
+        let text = "cat sat";
+        let d = 0..3;
+        let action = json!({"kind": "quickfix", "command": {"title": "Add to dictionary"}});
         assert_eq!(quickfix_suggestion(&action, uri, text, &d), None);
     }
 

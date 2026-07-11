@@ -25,3 +25,8 @@ pub const HARPER_MAX_FILE_LENGTH: u64 = 10_000_000;
 /// Comfortably under the server's 10 M-char limit; proportional-to-work discipline, not a
 /// correctness need — an over-cap document is skipped with a status and no in-flight state.
 pub const DIAG_MAX_SEND_BYTES: u64 = 8 * 1024 * 1024;
+/// Effort A: inbound cap on a single LSP `Content-Length`-framed message read from harper-ls
+/// (untrusted cross-process input). Comfortably above any real reply to an
+/// `DIAG_MAX_SEND_BYTES`-sized document plus JSON-RPC/diagnostics overhead; a frame claiming
+/// more is refused with an `io::Error` before any allocation — never a capacity-overflow panic.
+pub const LSP_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
