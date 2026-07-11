@@ -56,40 +56,47 @@ start() {
     t new-session -d -s "$_s" -x "$_cols" -y "$_rows" -- "$@"
 }
 
-# start-wcartel <session> [--cols N] [--rows N] [--no-barrier] [wcartel args...]
+# start-wcartel <session> [--cols N] [--rows N] [--no-barrier] [--with-splash] [wcartel args...]
 # The ONLY way checks launch the app. Hermetic launch env:
 #   -u TMUX                        — no leakage to any outer tmux server
 #   -u DISPLAY -u WAYLAND_DISPLAY  — arboard init fails deterministically, so
 #                                    the app runs the OSC-52 fallback path
 #   XDG_STATE_HOME=$SMOKE_STATE_HOME — swap/recovery land in a per-check tempdir
-# plus --no-config (checks assert against the DEFAULT keymap) and --no-splash
-# (the startup splash otherwise covers the first frame on every launch and would
-# fail every first-frame check; S8's swap-recovery still shows — the recovery
-# prompt suppresses the splash on its own, and --no-splash does not affect it).
-# Forwards
+# plus --no-config (checks assert against the DEFAULT keymap) and, by default,
+# --no-splash (the startup splash otherwise covers the first frame on every
+# launch and would fail every first-frame check; S8's swap-recovery still
+# shows — the recovery prompt suppresses the splash on its own, and
+# --no-splash does not affect it). --with-splash omits --no-splash so the
+# real startup splash renders (S9); pair it with --no-barrier (below) since
+# the splash covers the status row the default barrier waits on. Forwards
 # WCARTEL_SMOKE_PANIC when the caller has it set (S7). Blocks on the buffer
 # indicator '[1/' barrier before returning — the status bar's launch-invariant
 # chrome, present on the first frame of EVERY launch (no-arg and doc) regardless
 # of clipboard behavior. On this headless path the app reports the clipboard
 # AVAILABLE (Null Layer-1 + bare OSC 52), so no async status write follows, and
 # dispatch-set statuses (Saved/Copied) are race-free. --no-barrier exists for
-# exactly ONE launch in the suite — S8's relaunch, where the swap-recovery
-# modal replaces the status row (render.rs status branch); that check's wait-for
-# on the prompt text is its own, stronger barrier.
+# launches where the status row is covered by something else before the
+# barrier can match — S8's relaunch (swap-recovery modal replaces the status
+# row; render.rs status branch) and S9's splash launch (the splash owns the
+# whole screen); those checks' own wait-for on the prompt/splash text is a
+# stronger barrier.
 start_wcartel() {
     _sess=$1; shift
     : "${WCARTEL_BIN:?WCARTEL_BIN must be set}"
     : "${SMOKE_STATE_HOME:?SMOKE_STATE_HOME must be set}"
     [ -x "$WCARTEL_BIN" ] || { echo "start-wcartel: $WCARTEL_BIN missing — build the debug binary first" >&2; exit 1; }
-    _wcols=120; _wrows=40; _barrier=yes
+    _wcols=120; _wrows=40; _barrier=yes; _splash=no
     while [ $# -gt 0 ]; do
         case $1 in
             --cols) _wcols=$2; shift 2 ;;
             --rows) _wrows=$2; shift 2 ;;
             --no-barrier) _barrier=no; shift ;;
+            --with-splash) _splash=yes; shift ;;
             *) break ;;   # remaining args are wcartel args (paths)
         esac
     done
+    _splash_flag=--no-splash
+    [ "$_splash" = yes ] && _splash_flag=
     # Forward WCARTEL_SMOKE_PANIC only when the caller has it SET (S7): an
     # unconditional empty assignment would still read as Some("") through
     # env::var_os on the Rust side and mis-fire the trigger. Explicit branch,
@@ -99,12 +106,12 @@ start_wcartel() {
             env -u TMUX -u DISPLAY -u WAYLAND_DISPLAY \
                 "XDG_STATE_HOME=$SMOKE_STATE_HOME" \
                 "WCARTEL_SMOKE_PANIC=$WCARTEL_SMOKE_PANIC" \
-                "$WCARTEL_BIN" --no-config --no-splash "$@"
+                "$WCARTEL_BIN" --no-config $_splash_flag "$@"
     else
         start "$_sess" --cols "$_wcols" --rows "$_wrows" -- \
             env -u TMUX -u DISPLAY -u WAYLAND_DISPLAY \
                 "XDG_STATE_HOME=$SMOKE_STATE_HOME" \
-                "$WCARTEL_BIN" --no-config --no-splash "$@"
+                "$WCARTEL_BIN" --no-config $_splash_flag "$@"
     fi
     if [ "$_barrier" = yes ]; then
         wait_for "$_sess" '\[1/'
