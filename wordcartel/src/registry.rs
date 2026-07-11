@@ -132,6 +132,20 @@ impl Registry {
         r.register("backspace",      "Backspace",        None, |c| run(c, Command::Backspace));
         r.register("delete_forward", "Delete Forward",   None, |c| run(c, Command::DeleteForward));
 
+        // A14 — ten Emacs-parity atomic text-edit commands (commands/textops.rs).
+        // Registered BEFORE save_settings (Codex F4): journey_palette_end_reaches_last_command
+        // + the registration-order invariant both rely on save_settings staying last.
+        r.register("transpose_chars", "Transpose Characters", None, |c| crate::commands::textops::transpose_chars(c.editor, c.clock));
+        r.register("transpose_words", "Transpose Words",      None, |c| crate::commands::textops::transpose_words(c.editor, c.clock));
+        r.register("transpose_lines", "Transpose Lines",      None, |c| crate::commands::textops::transpose_lines(c.editor, c.clock));
+        r.register("upcase",     "Uppercase",  Some(MenuCategory::Format), |c| crate::commands::textops::upcase(c.editor, c.clock));
+        r.register("downcase",   "Lowercase",  Some(MenuCategory::Format), |c| crate::commands::textops::downcase(c.editor, c.clock));
+        r.register("capitalize", "Capitalize", Some(MenuCategory::Format), |c| crate::commands::textops::capitalize(c.editor, c.clock));
+        r.register("join_line",              "Join Line",              None, |c| crate::commands::textops::join_line(c.editor, c.clock));
+        r.register("just_one_space",         "Just One Space",         None, |c| crate::commands::textops::just_one_space(c.editor, c.clock));
+        r.register("delete_blank_lines",     "Delete Blank Lines",     None, |c| crate::commands::textops::delete_blank_lines(c.editor, c.clock));
+        r.register("delete_horizontal_space","Delete Horizontal Space",None, |c| crate::commands::textops::delete_horizontal_space(c.editor, c.clock));
+
         // Edit menu.
         r.register("select_all", "Select All", Some(MenuCategory::Edit), |c| run(c, Command::SelectAll));
         r.register("copy",  "Copy",  Some(MenuCategory::Edit), |c| run(c, Command::Copy));
