@@ -57,6 +57,24 @@ pub const MENU_ORDER: [MenuCategory; 8] = [MenuCategory::File, MenuCategory::Edi
     MenuCategory::Block, MenuCategory::Format, MenuCategory::View, MenuCategory::Documents,
     MenuCategory::Settings, MenuCategory::Export];
 
+/// Parse a plugin-supplied `menu` string to a `MenuCategory` — the parse-to-enum half of the
+/// resource-bound LAW (Effort P1 global constraint 1b): an unknown menu name never enters the
+/// registry as free-form data, it is rejected as a typed error at the call site. Exhaustive
+/// over the eight variants (`MENU_ORDER`); unrecognized input is `None`, never a silent default.
+pub fn menu_from_str(s: &str) -> Option<MenuCategory> {
+    match s {
+        "File" => Some(MenuCategory::File),
+        "Edit" => Some(MenuCategory::Edit),
+        "Block" => Some(MenuCategory::Block),
+        "Format" => Some(MenuCategory::Format),
+        "View" => Some(MenuCategory::View),
+        "Documents" => Some(MenuCategory::Documents),
+        "Settings" => Some(MenuCategory::Settings),
+        "Export" => Some(MenuCategory::Export),
+        _ => None,
+    }
+}
+
 /// The live-state mark a stateful menu command interpolates into its row label.
 /// Exhaustive — adding a variant here is intentional and must be handled in every match.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -866,6 +884,20 @@ mod tests {
 
     struct Z;
     impl Clock for Z { fn now_ms(&self) -> u64 { 0 } }
+
+    #[test]
+    fn menu_from_str_parses_all_eight_and_rejects_unknown() {
+        for (s, m) in [
+            ("File", MenuCategory::File), ("Edit", MenuCategory::Edit),
+            ("Block", MenuCategory::Block), ("Format", MenuCategory::Format),
+            ("View", MenuCategory::View), ("Documents", MenuCategory::Documents),
+            ("Settings", MenuCategory::Settings), ("Export", MenuCategory::Export),
+        ] {
+            assert_eq!(menu_from_str(s), Some(m));
+        }
+        assert_eq!(menu_from_str("Nonsense"), None);
+        assert_eq!(menu_from_str(""), None);
+    }
 
     #[test]
     fn commands_iterate_in_registration_order_with_meta() {
