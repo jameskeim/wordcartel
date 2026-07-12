@@ -6,23 +6,44 @@
 //! server (the build-weight payoff: `burn`/`harper-core` are no longer in this crate's dependency
 //! graph). Diagnostics are sorted ascending by `range.start` by whichever provider produces them.
 
+/// The linter-agnostic category of a flagged issue — whether a provider judged it a
+/// spelling problem or a grammar/style problem. Providers (e.g. harper-ls over LSP) map
+/// their own diagnostic taxonomy down to one of these two buckets.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DiagnosticKind {
+    /// A misspelled word or unrecognized token.
     Spelling,
+    /// A grammar, punctuation, or style issue.
     Grammar,
 }
 
+/// One candidate fix a provider offers for a [`Diagnostic`], expressed as an edit against
+/// the diagnostic's own `range`. The shell applies a chosen suggestion as a normal edit;
+/// this type carries no IO or provider-specific state.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Suggestion {
-    ReplaceWith(String), // replace the diagnostic's range with this text
-    InsertAfter(String), // insert this text at range.end (no deletion)
-    Remove,              // delete the diagnostic's range
+    /// Replace the diagnostic's `range` with this text.
+    ReplaceWith(String),
+    /// Insert this text at `range.end`, leaving the flagged range itself untouched.
+    InsertAfter(String),
+    /// Delete the diagnostic's `range` entirely, inserting nothing.
+    Remove,
 }
 
+/// A single flagged issue in a checked text, as reported by a
+/// `wordcartel::diag_provider::DiagnosticsProvider` in the shell. Diagnostics are pure data —
+/// this crate holds no linting logic, no sorting, and no rendering. The producing provider
+/// (e.g. harper-ls) sorts its results ascending by `range.start` before handing them to the
+/// shell's `DiagStore`, which just holds them; `wordcartel::render` is what paints them and
+/// turns each diagnostic's `suggestions` into a menu for the shell UI.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Diagnostic {
-    pub range: std::ops::Range<usize>, // byte range into the checked text
+    /// Byte range into the checked text that the diagnostic covers.
+    pub range: std::ops::Range<usize>,
+    /// Whether the provider classified this as a spelling or grammar issue.
     pub kind: DiagnosticKind,
+    /// Human-readable explanation of the issue, as produced by the provider.
     pub message: String,
+    /// Zero or more candidate fixes the provider offers; empty when none apply.
     pub suggestions: Vec<Suggestion>,
 }

@@ -1,3 +1,19 @@
+//! The incremental block tree — the coarse structural skeleton (headings, paragraphs, code
+//! blocks, lists, block quotes, tables, …) that the renderer's layout and `BlockRole` lookups
+//! (`role_at`) depend on. Built over pulldown-cmark's block-level events, keyed by byte spans
+//! into the document text (via the `TextSource` abstraction so both `&str` and `ropey::Rope`
+//! sources work).
+//!
+//! Two entry points populate a `BlockTree`: `full_parse`/`full_parse_src`/`full_parse_rope` walk
+//! the WHOLE document (the oracle, and the ground truth every incremental result must match) and
+//! `incremental_update*` splice a localized reparse of just the region touched by an `Edit` into
+//! an existing tree — the hot per-keystroke path. The incremental machinery is deliberately
+//! conservative: whenever a construct's extent could depend on more than the immediately
+//! surrounding lines (front matter, HTML blocks, link reference definitions, fence markers,
+//! absorptive containers, bare CR), it widens the reparse region or falls back to a full reparse
+//! rather than risk drifting from `full_parse`. `incremental_equals_full` is the property oracle
+//! (unit tests + `cargo fuzz`) that pins this `incremental ≡ full` invariant.
+
 use std::borrow::Cow;
 use std::ops::Range;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -10,10 +26,15 @@ use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 /// Byte offsets are into the whole document. `slice` returns a CONTIGUOUS &str
 /// (borrowed for &str sources, owned/materialized for ropes — O(slice len)).
 pub trait TextSource {
+    /// Total length of the source, in bytes.
     fn len(&self) -> usize;
+    /// True when the source holds zero bytes.
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    /// Materialize the byte range `range` as a contiguous string. Borrowed for `&str` sources;
+    /// owned/copied for rope sources — `O(range len)`. Panics if `range` is not a valid slice of
+    /// the source (out of bounds, or not on a `char` boundary for a UTF-8 source).
     fn slice(&self, range: Range<usize>) -> Cow<'_, str>;
     /// Byte offset of the start of the line containing `pos` (just after the
     /// previous `\n`, or 0). `\n`-only semantics. `pos` is clamped to `len()`.
@@ -132,19 +153,33 @@ impl TextSource for &ropey::Rope {
 /// block skeleton, which is what the renderer's layout depends on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockKind {
+    /// The synthetic tree root; its children are the document's top-level blocks.
     Document,
+    /// A run of prose text (may itself be interrupted/absorbed by adjacent blocks per CommonMark
+    /// rules — see `paragraph_absorbs_next`).
     Paragraph,
+    /// An ATX or setext heading; the payload is the level `1..=6`.
     Heading(u8),
+    /// A fenced code block (` ``` ` or `~~~`).
     FencedCode,
+    /// A 4-space/tab-indented code block.
     IndentedCode,
+    /// A `>`-prefixed block quote; a container that carries child blocks.
     BlockQuote,
+    /// An ordered or unordered list; a container whose children are `ListItem`s.
     List,
+    /// One item of a `List`; a container that carries the item's own child blocks.
     ListItem,
+    /// A thematic break (`---`, `***`, `___`), synthesized from pulldown-cmark's `Event::Rule`.
     ThematicBreak,
+    /// A raw HTML block, EXCLUDING the HTML-comment special case (see `HtmlComment`).
     HtmlBlock,
+    /// An HTML block whose content is entirely an `<!-- ... -->` comment; split out from
+    /// `HtmlBlock` so `role_at` can map it to `BlockRole::Comment` instead of prose.
     HtmlComment,
     /// A leading YAML front-matter block (`---\n … \n---`) at byte 0 ONLY.
     FrontMatter,
+    /// A GFM pipe table.
     Table,
     /// Footnote definitions / metadata blocks / def lists collapsed here.
     Other,
@@ -154,8 +189,12 @@ pub enum BlockKind {
 /// Containers (BlockQuote/List/ListItem/Document) carry children.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
+    /// The block's structural kind.
     pub kind: BlockKind,
+    /// Byte range into the source text this block covers.
     pub span: Range<usize>,
+    /// Nested blocks (containers such as `List`/`ListItem`/`BlockQuote`/`Document` carry
+    /// children; leaf kinds leave this empty).
     pub children: Vec<Block>,
 }
 
@@ -163,6 +202,7 @@ pub struct Block {
 /// top-level blocks of the document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockTree {
+    /// The synthetic `Document`-kind root; its `children` are the top-level blocks.
     pub root: Block,
 }
 
@@ -465,6 +505,10 @@ pub struct Edit {
 }
 
 impl Edit {
+    /// Net byte-length change this edit makes: `new_len - range.len()`. Positive for a growing
+    /// edit (insert/replace-with-more), negative for a shrinking one (delete/replace-with-less),
+    /// zero for a same-size replacement. Used to shift downstream spans into new-text
+    /// coordinates (`shift_offset`/`shift_range`).
     #[allow(clippy::cast_possible_wrap)] // usize offsets are <= the ~5 MB doc cap (change.rs policy), ~12 orders below isize::MAX
     pub fn delta(&self) -> isize {
         self.new_len as isize - self.range.len() as isize
@@ -493,7 +537,9 @@ pub enum WidenReason {
 
 /// Result + instrumentation.
 pub struct UpdateOutcome {
+    /// The resulting block tree after applying the edit.
     pub tree: BlockTree,
+    /// Why the reparse region ended up the size it did (instrumentation for tests/benches).
     pub reason: WidenReason,
     /// Number of bytes actually reparsed (the slice length).
     pub reparsed_bytes: usize,

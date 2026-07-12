@@ -4,57 +4,121 @@ use crate::buffer::TextBuffer;
 use crate::change::ChangeSet;
 use crate::selection::Selection;
 
+/// Coalescing window, in milliseconds: consecutive `Type`-kind edits committed via
+/// [`History::commit_coalescing`] merge into the same undo revision as long as each new edit
+/// lands within this many milliseconds of the previous one. Edits farther apart, or of any
+/// other [`EditKind`], start a fresh revision.
 pub const COALESCE_MS: u64 = 500;
 /// Undo-history memory budget: evict oldest revisions past this, always keeping ≥1 (M5).
 pub const MAX_UNDO_BYTES: usize = 64 * 1024 * 1024;
 
+/// A wall-clock time source for [`History::commit_coalescing`]'s coalescing-window check.
+/// Abstracted behind a trait so tests can drive it with a fake, deterministic clock instead
+/// of the real system time.
 pub trait Clock {
+    /// Returns the current time in milliseconds on whatever epoch the implementation
+    /// chooses — only the *difference* between successive readings is meaningful to the
+    /// caller, so the epoch itself never needs to be documented or stable.
     fn now_ms(&self) -> u64;
 }
 
+/// Classifies a committed edit for coalescing purposes. Only same-kind [`Type`](EditKind::Type)
+/// edits inside the [`COALESCE_MS`] window may merge into one undo revision; every other kind
+/// always starts a new revision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditKind {
+    /// A single incremental keystroke (typing a character). Eligible to coalesce with an
+    /// immediately preceding `Type` edit within [`COALESCE_MS`].
     Type,
+    /// Any non-typing edit — paste, programmatic change, formatting action, etc. Never
+    /// coalesces with a neighbor, and its arrival ends any in-progress coalescing group.
     Other,
 }
 
+/// One atomic forward/backward change pair stored inside a [`Revision`]. Redo re-applies
+/// `changes` to the buffer; undo applies `inverse` instead, restoring the prior text.
 #[derive(Clone, Debug)]
 pub struct Edit {
+    /// The forward change — applied to the buffer when this edit is (re)done.
     pub changes: ChangeSet,
+    /// The inverse of `changes` — applied to the buffer when this edit is undone.
     pub inverse: ChangeSet,
 }
 
+/// A proposed edit, plus an optional selection to leave behind, ready to hand to
+/// [`History::commit`] or [`History::commit_coalescing`]. Built with [`Transaction::new`] and,
+/// optionally, [`Transaction::with_selection`].
 #[derive(Clone, Debug)]
 pub struct Transaction {
+    /// The change set to apply to the buffer when this transaction is committed.
     pub changes: ChangeSet,
+    /// The selection to restore after `changes` is applied, if the caller supplied one via
+    /// [`Transaction::with_selection`]. When `None`, the committing `History` method falls
+    /// back to mapping the pre-edit selection through `changes`.
     pub selection: Option<Selection>,
 }
 
 impl Transaction {
+    /// Creates a transaction from `changes` with no explicit post-edit selection — the
+    /// committing `History` method will derive one by mapping the caller's pre-edit selection
+    /// through `changes`. Use [`Transaction::with_selection`] to override that default.
     pub fn new(changes: ChangeSet) -> Self {
         Transaction { changes, selection: None }
     }
+
+    /// Sets the selection to restore once this transaction is applied, overriding the
+    /// default mapped-selection behavior. Consumes and returns `self` for chaining onto
+    /// [`Transaction::new`].
     pub fn with_selection(mut self, sel: Selection) -> Self {
         self.selection = Some(sel);
         self
     }
 }
 
+/// One undo/redo unit: one or more coalesced [`Edit`]s applied together as a group, plus the
+/// selection state on either side of the group, the clock reading it was last extended at, and
+/// the [`EditKind`] governing whether it may absorb further edits.
 #[derive(Clone, Debug)]
 pub struct Revision {
+    /// The edits making up this revision, in application order. Undo replays their `inverse`s
+    /// in reverse order; redo replays their `changes` in forward order.
     pub edits: Vec<Edit>,
+    /// The selection immediately before this revision's first edit was applied — restored by
+    /// [`History::undo`].
     pub before: Selection,
+    /// The selection immediately after this revision's last edit was applied — restored by
+    /// [`History::redo`].
     pub after: Selection,
+    /// Clock reading (per [`Clock::now_ms`]) at which this revision was created or last
+    /// extended by coalescing; compared against [`COALESCE_MS`] to decide whether a later
+    /// `Type` edit may still merge into it.
     pub last_ms: u64,
+    /// The kind of edit this revision holds — only a `Type` revision is eligible to absorb
+    /// further coalesced edits.
     pub kind: EditKind,
 }
 
+/// Linear undo/redo stack for a single buffer (v1 has no branching history — see the module
+/// docs). Revisions at indices `0..current` form the undo stack; any past `current` form the
+/// redo tail. `bytes`/`last_evicted` track the M5 memory-budget accounting enforced by the
+/// commit methods.
 #[derive(Clone, Debug, Default)]
 pub struct History {
+    /// All retained revisions, oldest first. `revisions[..current]` is the undo stack;
+    /// `revisions[current..]` is the redo tail.
     pub revisions: Vec<Revision>,
-    pub current: usize,       // number of revisions currently applied
-    pub bytes: usize,         // running total of retained revisions' stored bytes (M5)
-    pub last_evicted: usize,  // revisions dropped on the most recent commit (M5)
+    /// Number of revisions currently applied — the boundary between the undo stack
+    /// (`revisions[..current]`) and the redo tail (`revisions[current..]`).
+    pub current: usize,
+    /// Running total of stored bytes across all retained revisions (M5 memory accounting),
+    /// kept incrementally in sync by `commit`, `commit_coalescing`, and eviction.
+    pub bytes: usize,
+    /// Number of revisions evicted by the most recent [`History::commit`] or
+    /// [`History::commit_coalescing`] call, via their shared call to `evict_to` (which resets
+    /// this to `0` before counting). `undo` and `redo` each reset it to `0` on entry instead,
+    /// since neither of them can evict — so this field always reflects only the eviction done
+    /// by the latest commit, never a stale value carried over from an earlier one.
+    pub last_evicted: usize,
 }
 
 fn revision_bytes(rev: &Revision) -> usize {
@@ -96,6 +160,32 @@ impl History {
         after
     }
 
+    /// Reverts the most recently applied revision, applying its edits' `inverse` changes to
+    /// `buf` in reverse order, and returns the selection to restore (the revision's `before`
+    /// selection). Returns `None`, leaving `buf` untouched, if there is nothing to undo (the
+    /// undo stack is empty).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wordcartel_core::buffer::TextBuffer;
+    /// use wordcartel_core::change::ChangeSet;
+    /// use wordcartel_core::history::{History, Transaction};
+    /// use wordcartel_core::selection::Selection;
+    ///
+    /// let mut buf = TextBuffer::from_str("");
+    /// let mut hist = History::default();
+    /// let sel = Selection::single(0);
+    ///
+    /// let changes = ChangeSet::insert(0, "hi", buf.len());
+    /// hist.commit(Transaction::new(changes), &mut buf, sel);
+    /// assert_eq!(buf.to_string(), "hi");
+    ///
+    /// let restored = hist.undo(&mut buf).unwrap();
+    /// assert_eq!(buf.to_string(), "");
+    /// assert_eq!(restored, Selection::single(0));
+    /// assert!(hist.undo(&mut buf).is_none()); // nothing left to undo
+    /// ```
     pub fn undo(&mut self, buf: &mut TextBuffer) -> Option<Selection> {
         self.last_evicted = 0; // undo commits nothing — keep the eviction transient honest
         if self.current == 0 {
@@ -109,6 +199,36 @@ impl History {
         Some(rev.before.clone())
     }
 
+    /// Re-applies the next revision in the redo tail (the one just past `current`) to `buf`,
+    /// via its edits' forward `changes` in application order, and returns the selection to
+    /// restore (the revision's `after` selection). Returns `None`, leaving `buf` untouched, if
+    /// there is nothing to redo (the redo tail is empty — either nothing was undone, or a new
+    /// commit already cleared it).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wordcartel_core::buffer::TextBuffer;
+    /// use wordcartel_core::change::ChangeSet;
+    /// use wordcartel_core::history::{History, Transaction};
+    /// use wordcartel_core::selection::Selection;
+    ///
+    /// let mut buf = TextBuffer::from_str("");
+    /// let mut hist = History::default();
+    /// let sel = Selection::single(0);
+    ///
+    /// assert!(hist.redo(&mut buf).is_none()); // nothing committed yet — nothing to redo
+    ///
+    /// let changes = ChangeSet::insert(0, "hi", buf.len());
+    /// let after_commit = hist.commit(Transaction::new(changes), &mut buf, sel);
+    /// hist.undo(&mut buf);
+    /// assert_eq!(buf.to_string(), "");
+    ///
+    /// let restored = hist.redo(&mut buf).unwrap();
+    /// assert_eq!(buf.to_string(), "hi");
+    /// assert_eq!(restored, after_commit); // redo returns the revision's `after` selection
+    /// assert!(hist.redo(&mut buf).is_none()); // nothing left to redo
+    /// ```
     pub fn redo(&mut self, buf: &mut TextBuffer) -> Option<Selection> {
         self.last_evicted = 0; // redo commits nothing — keep the eviction transient honest
         if self.current >= self.revisions.len() {
@@ -122,6 +242,45 @@ impl History {
         Some(rev.after.clone())
     }
 
+    /// Applies `txn` to `buf` like [`History::commit`], but — instead of always pushing a new
+    /// revision — merges it into the top-of-stack revision when all of these hold: the redo
+    /// tail is empty, the top revision's kind and this commit's `kind` are both
+    /// [`EditKind::Type`], and `clock.now_ms()` is within [`COALESCE_MS`] of the top revision's
+    /// `last_ms`. Otherwise it pushes a new revision and clears any redo tail like `commit`
+    /// does, but the pushed revision differs from what `commit` would push in two ways: it
+    /// carries this call's `kind` (`commit` always uses [`EditKind::Other`]), and its `last_ms`
+    /// is set to `now` rather than `0` — which is exactly what lets a later `Type` edit
+    /// coalesce into it. Either way, returns the new selection (`txn.selection` if set, else
+    /// `before` mapped through `txn.changes`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wordcartel_core::buffer::TextBuffer;
+    /// use wordcartel_core::change::ChangeSet;
+    /// use wordcartel_core::history::{Clock, EditKind, History, Transaction};
+    /// use wordcartel_core::selection::Selection;
+    ///
+    /// struct FixedClock(u64);
+    /// impl Clock for FixedClock {
+    ///     fn now_ms(&self) -> u64 { self.0 }
+    /// }
+    ///
+    /// let mut buf = TextBuffer::from_str("");
+    /// let mut hist = History::default();
+    /// let mut sel = Selection::single(0);
+    ///
+    /// // Two `Type` edits close together in time coalesce into one revision.
+    /// let cs_a = ChangeSet::insert(0, "a", buf.len());
+    /// sel = hist.commit_coalescing(Transaction::new(cs_a), &mut buf, sel, &FixedClock(0), EditKind::Type);
+    /// let cs_b = ChangeSet::insert(1, "b", buf.len());
+    /// hist.commit_coalescing(Transaction::new(cs_b), &mut buf, sel, &FixedClock(100), EditKind::Type);
+    /// assert_eq!(buf.to_string(), "ab");
+    /// assert_eq!(hist.revisions.len(), 1); // one undo step covers both keystrokes
+    ///
+    /// hist.undo(&mut buf);
+    /// assert_eq!(buf.to_string(), "");
+    /// ```
     pub fn commit_coalescing(
         &mut self,
         txn: Transaction,

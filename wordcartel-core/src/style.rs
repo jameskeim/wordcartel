@@ -1,23 +1,84 @@
 //! Inline style + block-role types shared by md_parse and layout.
 use std::ops::Range;
 
+/// Inline style applied to a run of source bytes within a line's rendered text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Style { Plain, Emphasis, Strong, StrongEmphasis, Code, Strikethrough, Link, Comment }
+pub enum Style {
+    /// No inline styling — the default/fallback face.
+    Plain,
+    /// Markdown emphasis (`_x_` / `*x*`), rendered italic.
+    Emphasis,
+    /// Markdown strong emphasis (`**x**`), rendered bold.
+    Strong,
+    /// Nested bold-and-italic emphasis (e.g. `**_x_**`).
+    StrongEmphasis,
+    /// Inline code span (`` `x` ``) — the backtick fence is concealed, the inner text is styled.
+    Code,
+    /// Strikethrough text (`~~x~~`).
+    Strikethrough,
+    /// Link text inside `[x](url)`.
+    Link,
+    /// An inline HTML comment span (`<!-- ... -->`).
+    Comment,
+}
 
+/// The markdown block-level kind of the line being analyzed; drives which block-prefix
+/// markers are concealed and how the line is laid out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BlockRole { Paragraph, Heading(u8), BlockQuote, ListItem, CodeBlock, ThematicBreak, FrontMatter, Comment }
+pub enum BlockRole {
+    /// A plain paragraph line — no prefix conceal.
+    Paragraph,
+    /// An ATX or setext heading; the payload is the heading level, 1–6.
+    Heading(u8),
+    /// A `>`-prefixed block-quote line; the marker and following space are concealed.
+    BlockQuote,
+    /// A list item (bulleted or ordered); the indent and marker are concealed.
+    ListItem,
+    /// A fenced or indented code-block line; fence lines are fully concealed and content
+    /// lines are exempt from word-wrap.
+    CodeBlock,
+    /// A thematic break (`---`) rule; the whole line is concealed.
+    ThematicBreak,
+    /// A line inside a YAML front-matter block.
+    FrontMatter,
+    /// A block-level HTML comment (`<!-- ... -->`), distinct from a list item.
+    Comment,
+}
 
+/// A byte range of a logical line tagged with the [`Style`] to render over it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StyleSpan { pub src: Range<usize>, pub style: Style }
+pub struct StyleSpan {
+    /// Byte offsets into the line's source text (not grapheme or column indices).
+    pub src: Range<usize>,
+    /// The style applying to that byte range.
+    pub style: Style,
+}
 
+/// A maximal same-visibility byte slice of a line, produced by collapsing the line's
+/// per-byte visibility grid.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Run { pub src: Range<usize>, pub visible: bool }
+pub struct Run {
+    /// Byte offsets into the line's source text.
+    pub src: Range<usize>,
+    /// Whether this slice is shown in the rendered output (`true`), or is concealed markdown
+    /// syntax that occupies the source but is hidden from view (`false`).
+    pub visible: bool,
+}
 
+/// The result of analyzing one logical source line: how it decomposes into visible/concealed
+/// runs, inline styles, and its block role, ready for layout to turn into visual rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LineAnalysis {
+    /// Ordered runs covering the whole line — both visible and concealed spans.
     pub runs: Vec<Run>,
+    /// Inline style spans over (typically visible) sub-ranges of the line.
     pub styles: Vec<StyleSpan>,
+    /// The line's block-level role — heading / list-item / code-block / etc. — which selects
+    /// prefix glyphs and concealment.
     pub role: BlockRole,
+    /// Synthetic replacement text painted in place of a concealed block prefix (e.g. a
+    /// block-quote bar, list bullet/ordinal, or thematic-break rule); `None` when the line
+    /// has no prefix glyph.
     pub prefix_glyph: Option<String>,
 }
 
@@ -29,7 +90,16 @@ pub struct LineAnalysis {
 /// content — styled in its element face (SourceHighlighted). Concealment
 /// (hence geometry) is identical for `RawPlain` and `RawStyled`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LineRender { Concealed, RawPlain, RawStyled }
+pub enum LineRender {
+    /// Markdown markers are hidden and content is styled (LivePreview inactive lines).
+    Concealed,
+    /// Raw source is shown with no styles (the LivePreview active/caret line and all
+    /// SourcePlain lines).
+    RawPlain,
+    /// Raw source is shown with every construct — delimiters, block prefixes, and content —
+    /// styled in its element face (SourceHighlighted).
+    RawStyled,
+}
 
 #[cfg(test)]
 mod tests {

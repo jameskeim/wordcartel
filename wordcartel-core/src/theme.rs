@@ -5,10 +5,51 @@
 /// `Indexed(u8)` is ONLY a quantized 256-color result; `Rgb` is truecolor.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Color {
-    Rgb { r: u8, g: u8, b: u8 },
-    Black, Red, Green, Yellow, Blue, Magenta, Cyan, Gray,
-    DarkGray, LightRed, LightGreen, LightYellow, LightBlue, LightMagenta, LightCyan, White,
+    /// Truecolor RGB triple — direct 24-bit color, never quantized.
+    Rgb {
+        /// Red channel, 0–255.
+        r: u8,
+        /// Green channel, 0–255.
+        g: u8,
+        /// Blue channel, 0–255.
+        b: u8,
+    },
+    /// ANSI-16 black.
+    Black,
+    /// ANSI-16 red.
+    Red,
+    /// ANSI-16 green.
+    Green,
+    /// ANSI-16 yellow.
+    Yellow,
+    /// ANSI-16 blue.
+    Blue,
+    /// ANSI-16 magenta.
+    Magenta,
+    /// ANSI-16 cyan.
+    Cyan,
+    /// ANSI-16 gray (the dim/"white" slot in some terminal palettes, not bright white).
+    Gray,
+    /// ANSI-16 bright black (dark gray).
+    DarkGray,
+    /// ANSI-16 bright red.
+    LightRed,
+    /// ANSI-16 bright green.
+    LightGreen,
+    /// ANSI-16 bright yellow.
+    LightYellow,
+    /// ANSI-16 bright blue.
+    LightBlue,
+    /// ANSI-16 bright magenta.
+    LightMagenta,
+    /// ANSI-16 bright cyan.
+    LightCyan,
+    /// ANSI-16 bright white.
+    White,
+    /// Quantized 256-color palette index — the result of downsampling an `Rgb` value, never a
+    /// truecolor source itself.
     Indexed(u8),
+    /// The terminal's own default foreground/background — an explicit "don't set a color" value.
     Default,
 }
 
@@ -16,44 +57,127 @@ pub enum Color {
 /// Some(Color::Default) = explicitly reset that color to the terminal default.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Face {
-    pub fg: Option<Color>, pub bg: Option<Color>,
+    /// Foreground color; `None` inherits accumulated, `Some(Color::Default)` resets to terminal default.
+    pub fg: Option<Color>,
+    /// Background color; `None` inherits accumulated, `Some(Color::Default)` resets to terminal default.
+    pub bg: Option<Color>,
+    /// Color of the underline glyph when it differs from `fg` (diagnostic squiggles).
     pub underline_color: Option<Color>,
-    pub bold: Option<bool>, pub italic: Option<bool>, pub underline: Option<bool>,
-    pub strike: Option<bool>, pub reverse: Option<bool>,
+    /// Bold modifier. When set, text in this face is rendered with a bold weight.
+    pub bold: Option<bool>,
+    /// Italic modifier. When set, text in this face is rendered slanted/oblique.
+    pub italic: Option<bool>,
+    /// Underline modifier. When set, text in this face is rendered with an underline rule.
+    pub underline: Option<bool>,
+    /// Strikethrough modifier. When set, text in this face is rendered with a line through it.
+    pub strike: Option<bool>,
+    /// Reverse-video (fg/bg swap) modifier.
+    pub reverse: Option<bool>,
     /// DIM modifier. The No-color cue for Comment (italic+dim), FocusDim, ChromeMuted —
     /// keeps "italic+dim" (Comment) distinct from "italic" (Emphasis). Maps to Modifier::DIM.
     pub dim: Option<bool>,
 }
 
+/// The addressable markdown/chrome roles a theme assigns a `Face` to. Exhaustively matched by
+/// `Theme::face`/`Theme::face_mut` — adding a variant is a compile-time-forced update to both
+/// match arms (and every theme constructor's face table).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SemanticElement {
+    /// Plain document body text — the baseline other roles compose relative to.
     Text,
-    Emphasis, Strong, StrongEmphasis, Code, Strikethrough, Link,
-    Heading(u8), BlockQuote, CodeBlock, ListMarker, ThematicBreak,
-    FrontMatter, Comment, Selection, MarkedBlock,
-    SearchMatch, SearchCurrent, DiagSpelling, DiagGrammar, FocusDim, FoldMarker, WrapGuide,
-    Chrome,         // panel/frame base (status/menu bar bg, overlay frames)
-    ChromeReverse,  // REVERSED highlight (status line, palette/outline/diag selected row)
-    ChromeSelected, // explicit fg/bg selection (menu item — today Black-on-White, NOT reverse)
-    ChromeMuted,    // dim secondary chrome (menu dropdown normal item, scrollbar track)
-    ChromeOverlay,  // modal interior fill (palette/outline/picker overlay bg)
-    ChromeAccent,   // accent fg on panel bg (active-prompt status + future focus marks)
+    /// Inline emphasis (`*em*`/`_em_`).
+    Emphasis,
+    /// Inline strong (`**strong**`).
+    Strong,
+    /// Inline strong+emphasis combined (`***both***`).
+    StrongEmphasis,
+    /// Inline code span (`` `code` ``).
+    Code,
+    /// Inline strikethrough (`~~text~~`).
+    Strikethrough,
+    /// Inline link text.
+    Link,
+    /// ATX/setext heading at level 1–6 (clamped into range — see `Theme::face`).
+    Heading(u8),
+    /// Block quote (`> …`) body.
+    BlockQuote,
+    /// Fenced or indented code block body.
+    CodeBlock,
+    /// The bullet/number glyph prefixing a list item.
+    ListMarker,
+    /// Thematic break (`---`/`***`) rule.
+    ThematicBreak,
+    /// YAML/TOML front-matter block.
+    FrontMatter,
+    /// HTML/markdown comment.
+    Comment,
+    /// The active text selection.
+    Selection,
+    /// A user-marked block, distinct from `Selection` (§13.2 marked-block faces).
+    MarkedBlock,
+    /// A non-current search match.
+    SearchMatch,
+    /// The current (cursor-focused) search match.
+    SearchCurrent,
+    /// Spelling-diagnostic underline.
+    DiagSpelling,
+    /// Grammar-diagnostic underline.
+    DiagGrammar,
+    /// Dimmed/unfocused text (e.g. a pane losing focus).
+    FocusDim,
+    /// The glyph marking a folded region.
+    FoldMarker,
+    /// The soft-wrap guide column/rule.
+    WrapGuide,
+    /// Panel/frame base — status bar and menu bar background, overlay frames.
+    Chrome,
+    /// REVERSED highlight chrome (status line, palette/outline/diagnostics selected row).
+    ChromeReverse,
+    /// Explicit fg/bg chrome selection (menu item — today Black-on-White, NOT reverse).
+    ChromeSelected,
+    /// Dim secondary chrome (menu dropdown normal item, scrollbar track).
+    ChromeMuted,
+    /// Modal interior fill (palette/outline/picker overlay background).
+    ChromeOverlay,
+    /// Accent fg on panel background (active-prompt status text, future focus marks).
+    ChromeAccent,
 }
 
 /// Controls how aggressively the derived chrome ladder steps away from the canvas.
 /// `Full` = calibrated steps; `Zen` = collapsed steps (×0.35) toward the canvas poles.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ChromeDisposition { Full, Zen }
+pub enum ChromeDisposition {
+    /// Calibrated elevation steps — the standard ladder.
+    Full,
+    /// Collapsed elevation steps (×0.35) toward the canvas poles — a lower-contrast ladder.
+    Zen,
+}
 
 /// Whether the theme's canvas (`base_bg`) is painted across the editing area.
 /// `Opaque` (default) = paint it — RGB themes own the page. `Transparent` = skip it and
 /// the modal-interior fill, so a see-through terminal shows through. Render-only; never
 /// affects derivation. Non-Rgb `base_bg` (terminal-* themes) has nothing to paint.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum CanvasMode { Opaque, Transparent }
+pub enum CanvasMode {
+    /// Paint `base_bg` across the editing area — RGB themes own the page (default).
+    Opaque,
+    /// Skip painting the canvas (and the modal-interior fill), so a see-through terminal shows through.
+    Transparent,
+}
 
+/// The terminal color depth a `Color` is quantized down to before render.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Depth { Truecolor, Indexed256, Ansi16, None }
+pub enum Depth {
+    /// Full 24-bit RGB — no quantization.
+    Truecolor,
+    /// 256-color indexed palette (6×6×6 cube + grayscale ramp).
+    Indexed256,
+    /// The 16 named ANSI colors.
+    Ansi16,
+    /// No color support. Identity pass-through in `quantize` — this arm is never reached in
+    /// practice (see the comment on that match arm) but is kept so `Depth` stays exhaustive.
+    None,
+}
 
 /// Nearest-color downsample. Pure arithmetic; no allocation. Only `Rgb` (and
 /// `Indexed`→ansi16) are converted; named colors and `Default` pass through.
@@ -129,16 +253,26 @@ struct ThemeFaces {
     chrome_overlay: Face, chrome_accent: Face,
 }
 
+/// A complete, resolved theme: base canvas colors plus every semantic face, ready for the shell
+/// to map into ratatui styles.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Theme {
+    /// The theme's display/config name (e.g. `"tokyo-night"`).
     pub name: String,
-    pub base_fg: Color, pub base_bg: Color,
+    /// The default document foreground color.
+    pub base_fg: Color,
+    /// The default document/canvas background color.
+    pub base_bg: Color,
+    /// Whether headings render a leading level glyph (e.g. `#`) alongside their face.
     pub heading_level_glyph: bool,
+    /// Whether this theme is monochrome (modifier-only cues, no explicit color) — drives the
+    /// no-color completeness contract.
     pub monochrome: bool,
     faces: ThemeFaces,
 }
 
 impl Theme {
+    /// Look up the resolved `Face` for a semantic role.
     pub fn face(&self, el: SemanticElement) -> Face {
         use SemanticElement::*;
         match el {
@@ -159,6 +293,8 @@ impl Theme {
             ChromeOverlay => self.faces.chrome_overlay, ChromeAccent => self.faces.chrome_accent,
         }
     }
+    /// Resolve a built-in theme by its config/display name (see `builtin_names`). Returns `None`
+    /// for an unknown name, including a stale/unrecognized `phosphor-<hue>` suffix.
     pub fn builtin(name: &str) -> Option<Theme> {
         match name {
             "terminal-plain" => Some(default()),
@@ -186,6 +322,8 @@ impl Theme {
             }
         }
     }
+    /// The names of every built-in theme, in registration order (NOT display order — the theme
+    /// picker sorts rows alphabetically; see the comment below).
     pub fn builtin_names() -> &'static [&'static str] {
         // Registration order (NOT display order — the theme picker sorts rows alphabetically):
         // D5 order → 10 E4 themes → the Blue Jeans family. Kept append-only so index-based
@@ -447,6 +585,9 @@ fn equal_lum_gray(seed: Color) -> (u8, u8, u8) {
     (255, 255, 255)
 }
 
+/// The `no-color` built-in theme: modifier-only cues (bold/italic/underline/reverse/dim), no
+/// explicit colors — every cued element carries at least one non-color modifier (§4-layer-1
+/// discipline).
 pub fn no_color() -> Theme {
     Theme {
         name: "no-color".into(),
@@ -456,6 +597,8 @@ pub fn no_color() -> Theme {
     }
 }
 
+/// The `terminal-plain` built-in theme: `Color::Default` canvas, today's historical ANSI-named
+/// face set, frameless chrome. The app's baseline/fallback theme.
 pub fn default() -> Theme {
     Theme {
         name: "terminal-plain".into(),
@@ -500,6 +643,8 @@ pub fn default() -> Theme {
 
 const fn rgb(r: u8, g: u8, b: u8) -> Color { Color::Rgb { r, g, b } }
 
+/// The `tokyo-night` built-in theme — MIT-licensed palette from folke/tokyonight.nvim, full RGB
+/// with chrome faces left as sentinels for `Theme::derive_chrome`.
 pub fn tokyo_night() -> Theme {
     // Tokyo Night palette — MIT license, folke/tokyonight.nvim
     const BG:        Color = rgb(0x1a, 0x1b, 0x26); // #1a1b26
@@ -844,7 +989,10 @@ pub fn blue_jeans_paper() -> Theme {
 /// A base16 (or base24) palette: 16 canonical slots, optional 8 extra (base10..base17).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BasePalette {
+    /// The 16 canonical base16 slots (base00..base0F).
     pub base: [Color; 16],
+    /// The optional 8 base24 extension slots (base10..base17) — when present, only used to
+    /// refine the chrome panel background (see `from_base16`).
     pub extra: Option<[Color; 8]>,
 }
 
@@ -1020,6 +1168,9 @@ fn mono_faces() -> ThemeFaces {
     }
 }
 
+/// Build a `phosphor-<hue>` built-in theme: a monochrome-hue CRT-style palette derived entirely
+/// from `hue` via `shade` (near-black background, mid/bright shades of the same hue for text and
+/// every role). `name` is stored verbatim as the theme's display/config name.
 pub fn phosphor(name: &str, hue: Color) -> Theme {
     let bg = shade(hue, 0);           // near-black hue
     let fg = shade(hue, 3);           // mid-bright hue

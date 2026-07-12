@@ -77,6 +77,8 @@ pub fn heading_starts(blocks: &BlockTree, rope: &Rope) -> BTreeSet<usize> {
 /// A heading paired with its foldable body byte-range.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Section {
+    /// The section's own heading — the [`Heading`] this section is keyed by, giving its
+    /// level and byte range.
     pub heading: Heading,
     /// Body range: first line AFTER the heading's own line(s) .. section end.
     /// Empty (`start == end`) when the section has no body.

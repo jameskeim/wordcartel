@@ -10,17 +10,44 @@ use regex_cursor::engines::meta::Regex as CursorRegex;
 // (Task 2) over a MATERIALIZED &str region (regex-cursor has no captures path).
 use regex_automata::meta::Regex as AutomataRegex;
 
+/// How the search needle is interpreted when [`compile`]d.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum QueryMode { Literal, Regex }
+pub enum QueryMode {
+    /// The needle is matched verbatim; any regex metacharacters are escaped
+    /// (`regex_syntax::escape`) before compilation.
+    Literal,
+    /// The needle is compiled as a regular expression pattern.
+    Regex,
+}
 
+/// Case-sensitivity policy applied when [`compile`]ing a pattern.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CaseMode { Smart, Sensitive, Insensitive }
+pub enum CaseMode {
+    /// Case-insensitive unless the needle itself contains an uppercase letter,
+    /// in which case matching is case-sensitive.
+    Smart,
+    /// Always case-sensitive.
+    Sensitive,
+    /// Always case-insensitive.
+    Insensitive,
+}
 
+/// A pattern failed to compile — the needle was not a valid regular expression. `compile`
+/// runs [`QueryMode::Literal`] needles through `regex_syntax::escape` first, so they always
+/// yield a valid pattern; a `CompileError` can therefore only arise from an invalid
+/// [`QueryMode::Regex`] pattern. Carries the underlying engine's error message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompileError(pub String);
 
+/// A single match's byte range into the searched rope, half-open (`start..end`).
+/// A zero-width match has `start == end`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Match { pub start: usize, pub end: usize }
+pub struct Match {
+    /// Byte offset of the match's first byte.
+    pub start: usize,
+    /// Byte offset one past the match's last byte.
+    pub end: usize,
+}
 
 /// Holds BOTH engines built from the same resolved pattern: the cursor engine
 /// for rope search, the automata engine for capture interpolation (Task 2).
