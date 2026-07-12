@@ -121,12 +121,24 @@ list); 8–9 are useful extras — this spike is a **superset** of the spec's se
    **(GREEN required.)**
 9. **(extra) `package.path` prepend + `require`.** Prepend a dir to `package.path` and `require` a module
    from it — confirm the directory-plugin (`<name>/init.lua`) load path works (spec §6). **(GREEN required.)**
+10. **(extra) `mlua::String::as_bytes()` is a borrowed, alloc-free length accessor.** The whole
+    borrowed-length-check-then-convert extraction pattern (Task 4/5, global constraint 1(b)) depends on
+    capping `.as_bytes().len()` BEFORE any Rust `String`/`Tendril` alloc — an external `mlua`-API
+    assumption. Confirm: extract an `mlua::String` from a Lua value and that `.as_bytes()` yields `&[u8]`
+    (a borrow of the Lua-side bytes) whose `.len()` is available **without** a Rust `String` allocation:
+    ```rust
+    lua.load("return 'héllo'").eval::<mlua::String>()
+        .map(|s| assert_eq!(s.as_bytes().len(), 6))?;   // 'é' = 2 bytes; borrowed, no owned String
+    ```
+    *If `as_bytes()` doesn't exist / isn't borrowed in the pinned mlua:* STOP — the resource-bound
+    extraction pattern needs an alternate borrowed-length API before Task 4/5. **(GREEN required.)**
 
-**Acceptance:** the load-bearing set **{1, 3, 4, 8, 9} GREEN**; {2, 5, 6, 7} **recorded** (2 may be
+**Acceptance:** the load-bearing set **{1, 3, 4, 8, 9, 10} GREEN**; {2, 5, 6, 7} **recorded** (2 may be
 documented-red → drop the heap cap; 5/6/7 informational). Findings written to
-`$(git rev-parse --git-path sdd)/progress.md` — especially the §11.2 `set_memory_limit` verdict and the
-§11.1 `!Send`-capture result. **On any red in {1, 3, 4, 8, 9}: STOP, surface to the human, revise the
-spec/plan before Task 2.**
+`$(git rev-parse --git-path sdd)/progress.md` — especially the §11.2 `set_memory_limit` verdict, the
+§11.1 `!Send`-capture result, and the `as_bytes()` borrowed-length verdict (the extraction pattern's
+premise). **On any red in {1, 3, 4, 8, 9, 10}: STOP, surface to the human, revise the spec/plan before
+Task 2.**
 
 ---
 
