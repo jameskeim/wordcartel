@@ -455,6 +455,15 @@ UI-drawing API (Provider law: plugins supply data/behavior; the host owns UI/lay
   - **`wc.status` / `error(msg)` text** (copied into owned `Editor.status: String`, `editor.rs:395`) →
     hard-capped/truncated to `PLUGIN_MAX_STATUS_LEN = 4096` B on a char boundary (§5; display-only, not
     leaked, so a modest clamp suffices).
+  - **`wc.text(a?, b?)` RETURN value** (a plugin-triggered owned `String` from `TextBuffer::slice`,
+    `buffer.rs:125–136`) → **bounded by the content-memory model, no additional cap needed.** Unlike
+    plugin *edit* text (unbounded EXTERNAL data → the paste cap), `wc.text` only copies a range of the
+    ALREADY-BOUNDED live buffer, so its size is **O(content held)** — exactly what the resource-behavior
+    invariant permits ("Memory ≈ fixed baseline + O(content held)"). The copy is transient (Lua-GC'd
+    after the callback), the whole-buffer default (both endpoints omitted) is just the document itself,
+    and repeated calls are bounded by the `set_hook` time budget. (Its *range* is a distinct, orthogonal
+    dimension already guarded against panics by the §3 input-validation LAW — this entry is the resource
+    dimension only.)
 
   These caps are the ALWAYS-ON bounded-memory guard; the VM heap cap below is a separate, Lua-only layer.
 - **VM heap cap (spike-gated, Lua-side).** `Lua::set_memory_limit` (~64 MiB) if §11 confirms it is
