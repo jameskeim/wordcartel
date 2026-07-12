@@ -1,5 +1,7 @@
 #![cfg(test)]
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
@@ -9,6 +11,7 @@ use crate::app::{self, Msg, reduce};
 use crate::editor::Editor;
 use crate::jobs::{Executor, InlineExecutor, Job, JobOutcome, ThreadExecutor};
 use crate::keymap::{self, KeyTrie};
+use crate::plugin::host::PluginHost;
 use crate::registry::Registry;
 use crate::render;
 use crate::test_support::{TestClock, key_char, press};
@@ -49,7 +52,12 @@ struct PhaseTimes {
 }
 
 struct Harness {
-    editor: Editor,
+    editor: Rc<RefCell<Editor>>,
+    /// `None` for the ~50 non-plugin journeys (the pump slot in `step` is skipped entirely —
+    /// zero overhead, mirrors `--no-plugins`/a null host at the harness layer). `Some(host)`
+    /// only for `new_with_plugin`, which loads sources + attaches a live bridge before the
+    /// first step — the one place these e2e journeys drive the REAL pump.
+    plugin_host: Option<PluginHost>,
     reg: Registry,
     keymap: KeyTrie,
     ex: BenchExecutor,
@@ -72,8 +80,9 @@ impl Harness {
         let ex = BenchExecutor::Inline(InlineExecutor::default());
         let term = Terminal::new(TestBackend::new(size.0, size.1)).expect("test terminal");
         let (tx, _rx) = mpsc::channel();
-        let mut h = Harness { editor, reg, keymap, ex, term, tx, _rx, now: 0 };
-        crate::derive::rebuild(&mut h.editor);
+        let editor = Rc::new(RefCell::new(editor));
+        let mut h = Harness { editor, plugin_host: None, reg, keymap, ex, term, tx, _rx, now: 0 };
+        crate::derive::rebuild(&mut h.editor.borrow_mut());
         h.render();
         h
     }
@@ -87,8 +96,37 @@ impl Harness {
         let (keymap, _warn) = keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
         let term = Terminal::new(TestBackend::new(size.0, size.1)).expect("test terminal");
         let (tx, _rx) = mpsc::channel();
-        let mut h = Harness { editor, reg, keymap, ex, term, tx, _rx, now: 0 };
-        crate::derive::rebuild(&mut h.editor);
+        let editor = Rc::new(RefCell::new(editor));
+        let mut h = Harness { editor, plugin_host: None, reg, keymap, ex, term, tx, _rx, now: 0 };
+        crate::derive::rebuild(&mut h.editor.borrow_mut());
+        h.render();
+        h
+    }
+
+    /// A harness with plugin `sources` (`(stem, lua source)` pairs) loaded into its registry
+    /// AND a live, bridged `PluginHost` — the first e2e journey to drive the REAL pump
+    /// (Effort P1 Task 7). Mirrors `run()`'s Task 7 ordering: register commands into the
+    /// registry (so a later keymap build would see them — no patches needed for these
+    /// journeys), THEN wrap the editor, THEN attach the bridge over the wrapped handle.
+    fn new_with_plugin(text: &str, sources: &[(&str, &str)]) -> Self {
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().expect("VM construction");
+        let srcs: Vec<(String, String)> =
+            sources.iter().map(|(stem, src)| (stem.to_string(), src.to_string())).collect();
+        for report in crate::plugin::load::load_sources(&mut reg, &host, &srcs) {
+            assert!(report.result.is_ok(), "test plugin must load cleanly: {:?}", report.result);
+        }
+        let (keymap, _warn) = keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let mut editor = Editor::new_from_text(text, None, (80, 24));
+        editor.diag_cfg.enabled = false;
+        let ex = BenchExecutor::Inline(InlineExecutor::default());
+        let term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        let (tx, _rx) = mpsc::channel();
+        let editor = Rc::new(RefCell::new(editor));
+        host.attach_bridge(editor.clone(), tx.clone(), Rc::new(TestClock::new(0)) as Rc<dyn wordcartel_core::history::Clock>)
+            .expect("bridge attaches on a live VM");
+        let mut h = Harness { editor, plugin_host: Some(host), reg, keymap, ex, term, tx, _rx, now: 0 };
+        crate::derive::rebuild(&mut h.editor.borrow_mut());
         h.render();
         h
     }
@@ -99,12 +137,19 @@ impl Harness {
     /// state-orthogonal for the seed journeys). A clipboard/mouse journey must add them.
     fn step(&mut self, msg: Msg) -> bool {
         let clock = TestClock(self.now);
-        let keep = reduce(msg, &mut self.editor, &self.reg, &self.keymap, &self.ex, &clock, &self.tx);
-        if let Some(t) = crate::theme_cmds::rebuild_keymap_if_requested(&mut self.editor, &[], &self.reg) {
+        let keep = { reduce(msg, &mut self.editor.borrow_mut(), &self.reg, &self.keymap, &self.ex, &clock, &self.tx) };
+        // Pump stage (Effort P1 Task 7): mirrors run()'s choreography — runs AFTER reduce's
+        // borrow scope has dropped, holding NO outer borrow, so a dispatched plugin command's
+        // Lua callback can re-borrow the editor via the bridge's wc.* closures. `None` for the
+        // non-plugin journeys — a real skip, not a null-host no-op call.
+        if let Some(h) = &mut self.plugin_host {
+            h.pump(&self.editor);
+        }
+        if let Some(t) = { crate::theme_cmds::rebuild_keymap_if_requested(&mut self.editor.borrow_mut(), &[], &self.reg) } {
             self.keymap = t;
         }
-        self.editor.surface_undo_eviction();
-        app::advance(&mut self.editor, &clock);
+        self.editor.borrow_mut().surface_undo_eviction();
+        { app::advance(&mut self.editor.borrow_mut(), &clock); }
         self.render();
         keep
     }
@@ -122,14 +167,17 @@ impl Harness {
         // Clear any residue so this step's spans are attributable to this step.
         let _ = crate::derive::bench_spans::drain();
         let t0 = std::time::Instant::now();
-        let _keep = reduce(msg, &mut self.editor, &self.reg, &self.keymap, &self.ex, &clock, &self.tx);
+        let _keep = { reduce(msg, &mut self.editor.borrow_mut(), &self.reg, &self.keymap, &self.ex, &clock, &self.tx) };
         let t_reduce = t0.elapsed();
-        if let Some(t) = crate::theme_cmds::rebuild_keymap_if_requested(&mut self.editor, &[], &self.reg) {
+        if let Some(h) = &mut self.plugin_host {
+            h.pump(&self.editor);
+        }
+        if let Some(t) = { crate::theme_cmds::rebuild_keymap_if_requested(&mut self.editor.borrow_mut(), &[], &self.reg) } {
             self.keymap = t;
         }
-        self.editor.surface_undo_eviction();
+        self.editor.borrow_mut().surface_undo_eviction();
         let t1 = std::time::Instant::now();
-        app::advance(&mut self.editor, &clock);
+        { app::advance(&mut self.editor.borrow_mut(), &clock); }
         let t_advance = t1.elapsed();
         let spans = crate::derive::bench_spans::drain();
         let t2 = std::time::Instant::now();
@@ -139,8 +187,8 @@ impl Harness {
     }
 
     fn render(&mut self) {
-        let editor = &mut self.editor;
-        self.term.draw(|f| render::render(f, editor)).expect("draw");
+        let mut e = self.editor.borrow_mut();
+        self.term.draw(|f| render::render(f, &mut e)).expect("draw");
     }
 
     // — input sugar —
@@ -169,17 +217,20 @@ impl Harness {
     }
 
     // — state accessors —
-    fn doc_text(&self) -> String { self.editor.active().document.buffer.to_string() }
-    fn dirty(&self) -> bool { self.editor.active().document.dirty() }
-    fn saved_version(&self) -> Option<u64> { self.editor.active().document.saved_version } // Option, not u64 (editor.rs:64)
-    fn status(&self) -> &str { &self.editor.status }
-    fn blocks(&self) -> &BlockTree { self.editor.active().document.blocks() }
-    fn folded(&self) -> &std::collections::BTreeSet<usize> { self.editor.active().folds.folded() }
-    fn maybe_stale(&self) -> bool { self.editor.active().reconcile.maybe_stale }
-    fn in_flight(&self) -> Option<u64> { self.editor.active().reconcile.in_flight_version }
-    fn reconcile_blocks_version(&self) -> u64 { self.editor.active().reconcile.blocks_version }
-    fn version(&self) -> u64 { self.editor.active().document.version }
-    fn rope(&self) -> ropey::Rope { self.editor.active().document.buffer.snapshot() }
+    // Each takes its own short `borrow()` and returns an OWNED value (never a `&T` tied to
+    // the `Ref` guard, which would need to outlive this function) — the same short-borrow
+    // discipline as `run()`'s per-stage scopes (Effort P1 Task 7).
+    fn doc_text(&self) -> String { self.editor.borrow().active().document.buffer.to_string() }
+    fn dirty(&self) -> bool { self.editor.borrow().active().document.dirty() }
+    fn saved_version(&self) -> Option<u64> { self.editor.borrow().active().document.saved_version } // Option, not u64 (editor.rs:64)
+    fn status(&self) -> String { self.editor.borrow().status.clone() }
+    fn blocks(&self) -> BlockTree { self.editor.borrow().active().document.blocks().clone() }
+    fn folded(&self) -> std::collections::BTreeSet<usize> { self.editor.borrow().active().folds.folded().clone() }
+    fn maybe_stale(&self) -> bool { self.editor.borrow().active().reconcile.maybe_stale }
+    fn in_flight(&self) -> Option<u64> { self.editor.borrow().active().reconcile.in_flight_version }
+    fn reconcile_blocks_version(&self) -> u64 { self.editor.borrow().active().reconcile.blocks_version }
+    fn version(&self) -> u64 { self.editor.borrow().active().document.version }
+    fn rope(&self) -> ropey::Rope { self.editor.borrow().active().document.buffer.snapshot() }
 
     // — screen assertions —
     fn row(&self, y: u16) -> String {
@@ -237,7 +288,8 @@ fn e2e_reconcile_converges_a_stale_tree() {
     let mut h = Harness::new("# A\n\nbody\n", None, (80, 24));
     // Plant a deliberately-wrong tree + mark stale (mirrors reconcile.rs:104-126).
     {
-        let b = h.editor.active_mut();
+        let mut e = h.editor.borrow_mut();
+        let b = e.active_mut();
         // A deliberately-wrong tree (empty), mirroring reconcile.rs:104-126's plant.
         let len = b.document.buffer.len();
         b.document.set_blocks(wordcartel_core::block_tree::empty_tree(len));
@@ -245,7 +297,7 @@ fn e2e_reconcile_converges_a_stale_tree() {
     }
     // Precondition: genuinely divergent from a full parse of the real text.
     let want = full_parse_rope(&h.rope());
-    assert_ne!(h.blocks(), &want, "planted tree must differ from full_parse (else vacuous)");
+    assert_ne!(h.blocks(), want, "planted tree must differ from full_parse (else vacuous)");
     // Drive the debounce: one tick to arm (advance sets due_at = now+150), then
     // advance past the deadline + tick to dispatch.
     h.tick();                                   // advance arms due_at = now + 150
@@ -256,7 +308,7 @@ fn e2e_reconcile_converges_a_stale_tree() {
     assert!(h.in_flight().is_none());
     assert_eq!(h.reconcile_blocks_version(), h.version());
     // Content converged:
-    assert_eq!(h.blocks(), &full_parse_rope(&h.rope()));
+    assert_eq!(h.blocks(), full_parse_rope(&h.rope()));
 }
 
 #[test]
@@ -277,7 +329,7 @@ fn e2e_quit_dirty_raises_modal_not_silent_quit() {
     h.type_str("y");                   // dirty
     let keep = h.ctrl('q');
     assert!(keep, "dirty Ctrl+Q must NOT quit silently");
-    assert!(h.editor.prompt.is_some(), "dirty Ctrl+Q must raise the quit_multi modal");
+    assert!(h.editor.borrow().prompt.is_some(), "dirty Ctrl+Q must raise the quit_multi modal");
     // Discard path: 'r' (review each) → 'd' (discard) quits.
     h.key(KeyCode::Char('r'));
     let keep2 = h.key(KeyCode::Char('d'));
@@ -296,6 +348,72 @@ fn e2e_fold_hides_body_in_render() {
 }
 
 // ---------------------------------------------------------------------------
+// Effort P1 Task 7 — app::run wiring: the pump stage in a real loop-shaped sequence.
+// These are the FIRST e2e tests to drive the real PluginHost::pump through Harness::step.
+// ---------------------------------------------------------------------------
+
+/// A plugin command dispatched through the registry/palette path — same journey as every
+/// other palette test — has its effect land in the SAME `step` (Enter dispatches →
+/// `reduce`'s Plugin dispatch arm enqueues a `PluginCall` → the pump slot right after
+/// `reduce`'s borrow scope drops runs the plugin's Lua callback → `wc.insert` lands via
+/// `submit_transaction`). No extra step is needed — proves the pump is wired into the loop
+/// at the point the plan mandates, not merely reachable in isolation (host.rs's own tests
+/// already cover the pump alone; this is the first test to go through the real
+/// reduce → pump → advance → render sequence).
+#[test]
+fn plugin_command_dispatches_via_palette_same_frame() {
+    let src = "wc.register_command{ name='insert_x', label='Insert Plugin X', \
+               fn=function() wc.insert('X') end }";
+    let mut h = Harness::new_with_plugin("doc\n", &[("testplug", src)]);
+    assert_eq!(h.doc_text(), "doc\n", "precondition: unmodified before dispatch");
+    h.ctrl('p');
+    assert!(h.editor.borrow().palette.is_some(), "ctrl-p must open the palette");
+    h.type_str("insert plugin x");
+    {
+        let e = h.editor.borrow();
+        let p = e.palette.as_ref().unwrap();
+        assert!(!p.rows.is_empty(), "'insert plugin x' must match the plugin command");
+        assert_eq!(p.rows[0].label, "Insert Plugin X",
+            "top row must be the plugin command: {:?}",
+            p.rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>());
+    }
+    h.key(KeyCode::Enter);
+    assert_eq!(h.doc_text(), "Xdoc\n",
+        "the plugin's wc.insert must land via the same-frame pump, no extra step");
+    assert!(h.editor.borrow().palette.is_none(), "Enter closes the palette");
+}
+
+/// Borrow-safety regression (spec §11's load-bearing invariant): a `step` that dispatches a
+/// plugin command must not panic — no double-borrow across the reduce → pump handoff. The
+/// harness completing (rather than panicking on a `RefCell` double-borrow) IS the assertion;
+/// `wc.status` additionally confirms the callback actually ran.
+#[test]
+fn plugin_dispatch_holds_no_borrow_across_reduce_and_pump() {
+    let src = "wc.register_command{ name='noop', label='Plugin Noop', \
+               fn=function() wc.status('plugin ran') end }";
+    let mut h = Harness::new_with_plugin("x", &[("np", src)]);
+    h.ctrl('p');
+    h.type_str("plugin noop");
+    h.key(KeyCode::Enter);
+    assert_eq!(h.status(), "plugin ran", "the callback must have run, not merely not-panicked");
+}
+
+/// The `--no-plugins`/null-host path at the harness layer: a default `Harness` (no
+/// `PluginHost` at all — mirrors `run()`'s `PluginHost::null()` when `cli.no_plugins` or
+/// `!cfg.plugins.enabled`) drives ordinary journeys with the pump slot fully skipped — every
+/// other test in this module already exercises this path; this test names it explicitly.
+#[test]
+fn no_plugin_host_journey_is_unaffected() {
+    let mut h = Harness::new("hello\n", None, (80, 24));
+    assert!(h.plugin_host.is_none(), "the default harness carries no plugin host");
+    h.key(KeyCode::End);
+    h.type_str(" world");
+    assert_eq!(h.doc_text(), "hello world\n");
+    h.tick(); // a step with the pump slot skipped must not panic or alter state
+    assert_eq!(h.doc_text(), "hello world\n");
+}
+
+// ---------------------------------------------------------------------------
 // A1 journeys 3 + 4: pinned mode and hidden mode dwell gate.
 // ---------------------------------------------------------------------------
 
@@ -303,14 +421,14 @@ fn e2e_fold_hides_body_in_render() {
 #[test]
 fn journey_pinned_bar_persists_across_dropdown_close() {
     let mut h = Harness::new("hello world\n", None, (40, 8));
-    h.editor.menu_bar_mode = crate::config::MenuBarMode::Pinned;
+    h.editor.borrow_mut().menu_bar_mode = crate::config::MenuBarMode::Pinned;
     h.tick(); // render with the mode applied
     assert!(h.row(0).contains(" File "), "pinned bar visible before any menu use");
     assert!(h.row(1).contains("hello"), "text shifted below the bar");
     h.key(KeyCode::F(10));
-    assert!(h.editor.menu.is_some(), "F10 opens the dropdown");
+    assert!(h.editor.borrow().menu.is_some(), "F10 opens the dropdown");
     h.key(KeyCode::Esc);
-    assert!(h.editor.menu.is_none(), "Esc closes the dropdown");
+    assert!(h.editor.borrow().menu.is_none(), "Esc closes the dropdown");
     assert!(h.row(0).contains(" File "), "the bar PERSISTS after Esc (the state split)");
 }
 
@@ -318,11 +436,11 @@ fn journey_pinned_bar_persists_across_dropdown_close() {
 #[test]
 fn journey_hidden_never_reveals_on_dwell() {
     let mut h = Harness::new("hello world\n", None, (40, 8));
-    h.editor.menu_bar_mode = crate::config::MenuBarMode::Hidden;
+    h.editor.borrow_mut().menu_bar_mode = crate::config::MenuBarMode::Hidden;
     h.mouse_move(5, 0);
     h.advance_ms(crate::mouse::MENU_DWELL_MS + 1);
     h.tick();
-    assert!(!h.editor.mouse.menu_bar_revealed, "Hidden mode must never arm/reveal");
+    assert!(!h.editor.borrow().mouse.menu_bar_revealed, "Hidden mode must never arm/reveal");
     assert!(h.row(0).contains("hello"), "row 0 is still text");
     h.key(KeyCode::F(10));
     assert!(h.row(0).contains(" File "), "F10 still opens");
@@ -367,7 +485,7 @@ fn journey_drag_never_reveals() {
     h.mouse_move(2, 0);            // motion onto row 0 mid-drag
     h.advance_ms(crate::mouse::MENU_DWELL_MS + 10);
     h.tick();
-    assert!(!h.editor.mouse.menu_bar_revealed, "drag must not arm the dwell");
+    assert!(!h.editor.borrow().mouse.menu_bar_revealed, "drag must not arm the dwell");
     assert!(h.row(0).contains("hello"), "row 0 stays text");
 }
 
@@ -376,8 +494,8 @@ fn journey_drag_never_reveals() {
 fn journey_row0_click_unrevealed_edits_text() {
     let mut h = Harness::new("hello world\n", None, (40, 8));
     h.mouse_down(4, 0);
-    assert!(h.editor.menu.is_none(), "no menu opened");
-    assert_eq!(h.editor.active().document.selection.primary().head, 4,
+    assert!(h.editor.borrow().menu.is_none(), "no menu opened");
+    assert_eq!(h.editor.borrow().active().document.selection.primary().head, 4,
         "the click placed the caret in the text");
 }
 
@@ -394,25 +512,28 @@ fn journey_palette_end_reaches_last_command() {
     let text: String = (0..50).map(|i| format!("line {i}\n")).collect();
     let mut h = Harness::new(&text, None, (80, 24));
     h.ctrl('p'); // open the Command Palette
-    assert!(h.editor.palette.is_some(), "ctrl-p must open the palette");
+    assert!(h.editor.borrow().palette.is_some(), "ctrl-p must open the palette");
     h.key(KeyCode::End); // jump to the last row
-    let p = h.editor.palette.as_ref().unwrap();
-    let total = p.rows.len();
-    let last_idx = total.saturating_sub(1);
-    assert_eq!(p.selected, last_idx, "End must land on the last row (idx={last_idx})");
-    // Windowing invariant: selection is within the visible window.
-    assert!(p.selected.saturating_sub(p.scroll_top) < 15,
-        "End: selected={} scroll_top={} must be within the 15-row window",
-        p.selected, p.scroll_top);
-    // Last label on screen — confirms the window shows the tail.
-    let last_label = p.rows[last_idx].label.clone();
+    let last_label = {
+        let e = h.editor.borrow();
+        let p = e.palette.as_ref().unwrap();
+        let total = p.rows.len();
+        let last_idx = total.saturating_sub(1);
+        assert_eq!(p.selected, last_idx, "End must land on the last row (idx={last_idx})");
+        // Windowing invariant: selection is within the visible window.
+        assert!(p.selected.saturating_sub(p.scroll_top) < 15,
+            "End: selected={} scroll_top={} must be within the 15-row window",
+            p.selected, p.scroll_top);
+        // Last label — confirms the window shows the tail.
+        p.rows[last_idx].label.clone()
+    };
     assert!(h.screen_contains(&last_label),
         "last command label {last_label:?} must be visible on screen after End");
     // Enter dispatches save_settings (last registered command) → settings_save_requested
     // is set, palette closes. Verifies the end-of-list dispatch path (spec I4).
     h.key(KeyCode::Enter);
-    assert!(h.editor.palette.is_none(), "Enter closes the palette");
-    assert!(h.editor.settings_save_requested,
+    assert!(h.editor.borrow().palette.is_none(), "Enter closes the palette");
+    assert!(h.editor.borrow().settings_save_requested,
         "save_settings must be dispatched and set settings_save_requested");
 }
 
@@ -437,7 +558,7 @@ fn journey_typing_never_breaks_midword() {
     assert!(!h.screen_contains("quick b"), "quick and brown are NOT on the same row");
 
     // Caret is on screen (on the last row, end of text).
-    let pos = crate::nav::screen_pos(&h.editor);
+    let pos = crate::nav::screen_pos(&h.editor.borrow());
     assert!(pos.is_some(), "caret must be on screen after typing");
 
     // End/Home/Up/Down across the wrap — must not panic.
@@ -494,8 +615,8 @@ fn journey_close_dirty_save_and_close() {
     let mut h = Harness::new("", Some(path.clone()), (80, 24));
     // Scratch provides a neighbor so close_buffer_now's last-ordinary branch runs
     // (replaces the named slot with a fresh untitled — buffer count stays at 2).
-    h.editor.install_scratch();
-    let orig_id = h.editor.active().id;
+    h.editor.borrow_mut().install_scratch();
+    let orig_id = h.editor.borrow().active().id;
     // Dirty the named buffer.
     h.type_str("hello");
     assert!(h.dirty(), "buffer must be dirty before close");
@@ -503,19 +624,19 @@ fn journey_close_dirty_save_and_close() {
     // "close" uniquely fuzzy-matches "Close Buffer" (case-insensitive; only one hit).
     // dispatch_overlay_command closes the palette, runs close_buffer → dirty → open_prompt.
     h.ctrl('p');
-    assert!(h.editor.palette.is_some(), "ctrl-p must open the palette");
+    assert!(h.editor.borrow().palette.is_some(), "ctrl-p must open the palette");
     h.type_str("close");
     h.key(KeyCode::Enter);
-    assert!(h.editor.prompt.is_some(),
+    assert!(h.editor.borrow().prompt.is_some(),
         "close_buffer on a dirty named buffer must open the close-confirm prompt");
     assert!(h.screen_contains("[S]ave & close"),
         "close-confirm message must appear on the status row:\n{:#?}", h.screen());
     // 's' → CloseSave: dispatch_save_then dispatches a save job; InlineExecutor runs
     // it inline (within reduce); the merge calls close_buffer_now then "saved — closed".
     h.key(KeyCode::Char('s'));
-    assert!(h.editor.by_id(orig_id).is_none(),
+    assert!(h.editor.borrow().by_id(orig_id).is_none(),
         "named buffer must be gone after Save & close");
-    assert!(h.editor.active().id != orig_id, "a neighbor is active after close");
+    assert!(h.editor.borrow().active().id != orig_id, "a neighbor is active after close");
     // The neighbor (a fresh untitled in the last-ordinary slot) is what renders now:
     // the closed buffer's typed text must no longer be on screen.
     assert!(!h.screen_contains("hello"),
@@ -536,7 +657,7 @@ fn journey_close_dirty_discard_leaves_file_and_swap() {
     let path = tmp.path().to_path_buf();
     std::fs::write(&path, "original\n").unwrap();
     let mut h = Harness::new("original\n", Some(path.clone()), (80, 24));
-    h.editor.install_scratch();
+    h.editor.borrow_mut().install_scratch();
     // Dirty the buffer: type at the start so the buffer diverges from disk.
     h.type_str("draft");
     assert!(h.dirty(), "buffer must be dirty before close");
@@ -544,19 +665,19 @@ fn journey_close_dirty_discard_leaves_file_and_swap() {
     let sp = crate::swap::swap_path(Some(&path)).unwrap();
     crate::swap::write_atomic(&sp, "stub swap").unwrap();
     assert!(sp.exists(), "precondition: swap file must exist before close");
-    let orig_id = h.editor.active().id;
+    let orig_id = h.editor.borrow().active().id;
     // Palette-dispatch close_buffer → close-confirm prompt.
     h.ctrl('p');
-    assert!(h.editor.palette.is_some(), "ctrl-p must open the palette");
+    assert!(h.editor.borrow().palette.is_some(), "ctrl-p must open the palette");
     h.type_str("close");
     h.key(KeyCode::Enter);
-    assert!(h.editor.prompt.is_some(),
+    assert!(h.editor.borrow().prompt.is_some(),
         "close_buffer on a dirty named buffer must open the close-confirm prompt");
     assert!(h.screen_contains("[D]iscard"),
         "close-confirm message must appear on the status row:\n{:#?}", h.screen());
     // 'd' → CloseDiscard: close_buffer_now runs immediately, swap NOT deleted.
     h.key(KeyCode::Char('d'));
-    assert!(h.editor.by_id(orig_id).is_none(),
+    assert!(h.editor.borrow().by_id(orig_id).is_none(),
         "named buffer must be gone after Discard");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "original\n",
         "disk file must be UNCHANGED after Discard");
@@ -586,38 +707,39 @@ fn journey_keymap_switch_scopes() {
     // Place the caret at the start of line 30 (byte 150 = 30 × 5).
     // A direct selection write does NOT scroll — ensure_visible adjusts the
     // viewport (review-mandated: nothing in the harness path calls it for us).
-    h.editor.active_mut().document.selection =
+    h.editor.borrow_mut().active_mut().document.selection =
         wordcartel_core::selection::Selection::single(150);
-    crate::nav::ensure_visible(&mut h.editor);
+    crate::nav::ensure_visible(&mut h.editor.borrow_mut());
     h.render();
 
     // Precondition: the viewport has scrolled past line 0.
-    let scroll_after_move = h.editor.active().view.scroll;
+    let scroll_after_move = h.editor.borrow().active().view.scroll;
     assert!(scroll_after_move > 0,
         "scroll must be > 0 after moving caret to line 30 (got {scroll_after_move})");
 
     // Precondition: the selection is a collapsed caret before CUA ctrl-w.
-    assert!(h.editor.active().document.selection.primary().is_empty(),
+    assert!(h.editor.borrow().active().document.selection.primary().is_empty(),
         "selection must be empty before CUA ctrl-w");
 
     // CUA ctrl-w = expand_selection: the selection must grow from the caret.
     h.ctrl('w');
-    assert!(!h.editor.active().document.selection.primary().is_empty(),
+    assert!(!h.editor.borrow().active().document.selection.primary().is_empty(),
         "CUA ctrl-w must expand the selection from a collapsed caret");
 
     // Collapse the selection back to a caret (head position) so the post-switch
     // assertion starts from an empty selection — a clean baseline.
-    let head = h.editor.active().document.selection.primary().head;
-    h.editor.active_mut().document.selection =
+    let head = h.editor.borrow().active().document.selection.primary().head;
+    h.editor.borrow_mut().active_mut().document.selection =
         wordcartel_core::selection::Selection::single(head);
 
     // Switch to WordStar via the Command Palette.
     h.ctrl('p');
-    assert!(h.editor.palette.is_some(), "ctrl-p must open the palette");
+    assert!(h.editor.borrow().palette.is_some(), "ctrl-p must open the palette");
     h.type_str("keymap: wordstar");
     // Precondition: the palette top row must be "Keymap: WordStar".
     {
-        let p = h.editor.palette.as_ref().unwrap();
+        let e = h.editor.borrow();
+        let p = e.palette.as_ref().unwrap();
         assert!(!p.rows.is_empty(), "'keymap: wordstar' must match at least one command");
         assert_eq!(p.rows[0].label, "Keymap: WordStar",
             "top palette row must be 'Keymap: WordStar': {:?}",
@@ -628,13 +750,13 @@ fn journey_keymap_switch_scopes() {
         "status must confirm the preset switch: {:?}", h.status());
 
     // WordStar ctrl-w = scroll_line_up: selection stays empty; scroll decrements by 1.
-    let scroll_before = h.editor.active().view.scroll;
+    let scroll_before = h.editor.borrow().active().view.scroll;
     assert!(scroll_before > 0,
         "scroll must still be > 0 before WordStar ctrl-w (got {scroll_before})");
     h.ctrl('w');
-    assert!(h.editor.active().document.selection.primary().is_empty(),
+    assert!(h.editor.borrow().active().document.selection.primary().is_empty(),
         "WordStar ctrl-w must leave the selection empty");
-    assert_eq!(h.editor.active().view.scroll, scroll_before - 1,
+    assert_eq!(h.editor.borrow().active().view.scroll, scroll_before - 1,
         "WordStar ctrl-w must decrement scroll by exactly 1 (was {scroll_before})");
 }
 
@@ -651,12 +773,12 @@ fn journey_transform_scopes() {
 
     // Place the caret inside item 2's body (past "- second item here").
     let item2_start = item1.len();
-    h.editor.active_mut().document.selection =
+    h.editor.borrow_mut().active_mut().document.selection =
         wordcartel_core::selection::Selection::single(item2_start + 10);
 
     // Ctrl+T opens the transform chooser.
     h.ctrl('t');
-    assert!(h.editor.prompt.is_some(), "Ctrl+T must open the transform chooser");
+    assert!(h.editor.borrow().prompt.is_some(), "Ctrl+T must open the transform chooser");
     assert!(h.screen_contains("[r]eflow"),
         "transform chooser message must appear on screen:\n{:#?}", h.screen());
 
@@ -671,11 +793,12 @@ fn journey_transform_scopes() {
 
     // Reflow Buffer via the Command Palette — transforms the whole document.
     h.ctrl('p');
-    assert!(h.editor.palette.is_some(), "Ctrl+P must open the palette");
+    assert!(h.editor.borrow().palette.is_some(), "Ctrl+P must open the palette");
     h.type_str("reflow buffer");
     // Precondition: "reflow buffer" filters the palette to the Reflow Buffer row.
     {
-        let p = h.editor.palette.as_ref().unwrap();
+        let e = h.editor.borrow();
+        let p = e.palette.as_ref().unwrap();
         assert!(!p.rows.is_empty(), "palette must have at least one match for 'reflow buffer'");
         assert_eq!(p.rows[0].label, "Reflow Buffer",
             "first match must be Reflow Buffer: {:?}",
@@ -721,9 +844,10 @@ fn journey_chrome_zen_toggle() {
     {
         let mut theme = wordcartel_core::theme::tokyo_night();
         theme.derive_chrome(ChromeDisposition::Full);
-        h.editor.apply_theme(theme);
-        h.editor.theme_identity =
-            crate::settings::ThemeIdentity::Builtin("tokyo-night".into());
+        let mut e = h.editor.borrow_mut();
+        e.apply_theme(theme);
+        e.theme_identity = crate::settings::ThemeIdentity::Builtin("tokyo-night".into());
+        drop(e);
         h.render();
     }
     // Precondition: document text on screen (theme change must not blank the frame).
@@ -732,12 +856,12 @@ fn journey_chrome_zen_toggle() {
     // Step 2: open the palette; assert it renders rows on screen (text-only proxy
     // for the palette overlay; themed interior owned by T5's render pin).
     h.ctrl('p');
-    assert!(h.editor.palette.is_some(), "ctrl-p must open the palette");
-    assert!(!h.editor.palette.as_ref().unwrap().rows.is_empty(), "unfiltered palette must have rows");
+    assert!(h.editor.borrow().palette.is_some(), "ctrl-p must open the palette");
+    assert!(!h.editor.borrow().palette.as_ref().unwrap().rows.is_empty(), "unfiltered palette must have rows");
     {
         // row[0] of the unfiltered palette is the first registered command — assert
         // it appears on screen as the text observable for the palette overlay.
-        let row0 = h.editor.palette.as_ref().unwrap().rows[0].label.clone();
+        let row0 = h.editor.borrow().palette.as_ref().unwrap().rows[0].label.clone();
         assert!(h.screen_contains(&row0),
             "palette row 0 label {row0:?} must render on screen:\n{:#?}", h.screen());
     }
@@ -745,7 +869,8 @@ fn journey_chrome_zen_toggle() {
     // Step 3: filter to "chrome" → top row must be "Chrome: Full/Zen"; Enter dispatches.
     h.type_str("chrome");
     {
-        let p = h.editor.palette.as_ref().unwrap();
+        let e = h.editor.borrow();
+        let p = e.palette.as_ref().unwrap();
         assert!(!p.rows.is_empty(), "'chrome' must match at least one command");
         assert_eq!(p.rows[0].label, "Chrome: Full/Zen",
             "top row must be 'Chrome: Full/Zen': {:?}",
@@ -755,23 +880,24 @@ fn journey_chrome_zen_toggle() {
     // tokyo-night: Rgb bases, Truecolor depth → normal toggle arm → exact status.
     assert_eq!(h.status(), "chrome: zen",
         "toggle under tokyo-night must set status to 'chrome: zen'");
-    assert_eq!(h.editor.chrome_disposition, ChromeDisposition::Zen,
+    assert_eq!(h.editor.borrow().chrome_disposition, ChromeDisposition::Zen,
         "chrome_disposition must be Zen after toggle");
 
     // Step 4: dispatch "Save Settings" via the palette (sets settings_save_requested),
     // then drive perform_settings_save directly (harness has no save-loop arm).
     h.ctrl('p');
-    assert!(h.editor.palette.is_some(), "ctrl-p must open the palette");
+    assert!(h.editor.borrow().palette.is_some(), "ctrl-p must open the palette");
     h.type_str("save settings");
     {
-        let p = h.editor.palette.as_ref().unwrap();
+        let e = h.editor.borrow();
+        let p = e.palette.as_ref().unwrap();
         assert!(!p.rows.is_empty(), "'save settings' must match at least one command");
         assert_eq!(p.rows[0].label, "Save Settings",
             "top palette row must be 'Save Settings': {:?}",
             p.rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>());
     }
     h.key(KeyCode::Enter); // dispatches save_settings → sets settings_save_requested = true
-    assert!(h.editor.settings_save_requested,
+    assert!(h.editor.borrow().settings_save_requested,
         "save_settings must set settings_save_requested");
 
     // Build a baseline snapshot representing the no-chrome-config startup state.
@@ -795,11 +921,11 @@ fn journey_chrome_zen_toggle() {
         clipboard_provider: crate::config::ClipboardProvider::Auto,
     };
     // Mirror the run-loop pattern: clear the flag, then write the file.
-    h.editor.settings_save_requested = false;
+    h.editor.borrow_mut().settings_save_requested = false;
     let tmp = tempfile::TempDir::new().unwrap();
     let path = tmp.path().join("settings-overrides.toml");
     let of = crate::settings::perform_settings_save(
-        &mut h.editor,
+        &mut h.editor.borrow_mut(),
         false,
         Some(&path),
         &baseline,
@@ -819,9 +945,9 @@ fn e2e_splash_first_frame_then_key_dismisses_and_is_consumed() {
     // Mirror run()'s startup wiring (app.rs: gate → resolve against the live keymap →
     // set before the first draw). view_opts carries the ViewConfig default (splash on).
     let show = crate::splash::show_at_startup(
-        h.editor.view_opts.splash, false, h.editor.prompt.is_some());
+        h.editor.borrow().view_opts.splash, false, h.editor.borrow().prompt.is_some());
     assert!(show, "default config + no flag + no prompt shows the splash");
-    h.editor.splash = Some(crate::splash::Splash::new(&h.keymap, "0.1.0"));
+    h.editor.borrow_mut().splash = Some(crate::splash::Splash::new(&h.keymap, "0.1.0"));
     h.render();
     assert!(h.screen_contains("wordcartel"), "wordmark on the first frame");
     assert!(h.screen_contains("press any key"), "footer on the first frame");
@@ -829,7 +955,7 @@ fn e2e_splash_first_frame_then_key_dismisses_and_is_consumed() {
     // The first key press dismisses AND is consumed (not typed into the buffer).
     let keep = h.step(Msg::Input(Event::Key(key_char('x'))));
     assert!(keep);
-    assert!(h.editor.splash.is_none(), "splash cleared by the first key");
+    assert!(h.editor.borrow().splash.is_none(), "splash cleared by the first key");
     assert_eq!(h.doc_text(), "hello behind\n", "the dismissing key was consumed");
     assert!(h.screen_contains("hello behind"), "dismiss reveals the document");
     // The NEXT key edits normally.
@@ -840,11 +966,11 @@ fn e2e_splash_first_frame_then_key_dismisses_and_is_consumed() {
 #[test]
 fn e2e_splash_mouse_click_dismisses_without_editing() {
     let mut h = Harness::new("hello\n", None, (80, 24));
-    h.editor.splash = Some(crate::splash::Splash::new(&h.keymap, "0.1.0"));
+    h.editor.borrow_mut().splash = Some(crate::splash::Splash::new(&h.keymap, "0.1.0"));
     h.render();
     assert!(!h.screen_contains("hello"));
     h.mouse_down(10, 5);
-    assert!(h.editor.splash.is_none(), "mouse-down dismisses");
+    assert!(h.editor.borrow().splash.is_none(), "mouse-down dismisses");
     assert_eq!(h.doc_text(), "hello\n", "the click did not edit anything");
     assert!(h.screen_contains("hello"));
 }
@@ -853,7 +979,7 @@ fn e2e_splash_mouse_click_dismisses_without_editing() {
 fn e2e_no_splash_flag_suppresses_first_frame_splash() {
     let mut h = Harness::new("hello\n", None, (80, 24));
     let show = crate::splash::show_at_startup(
-        h.editor.view_opts.splash, true, h.editor.prompt.is_some());
+        h.editor.borrow().view_opts.splash, true, h.editor.borrow().prompt.is_some());
     assert!(!show, "--no-splash wins over the enabled config default");
     // run() therefore leaves editor.splash = None → the first frame is the plain editor.
     h.render();
@@ -869,12 +995,15 @@ fn e2e_recovery_prompt_pending_suppresses_splash() {
     // future startup-gate change let both get set — the render must show the prompt
     // only, never the wordmark underneath it.
     let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &h.reg);
-    h.editor.splash = Some(crate::splash::Splash::new(&km, "0.1.0"));
-    h.editor.open_prompt(crate::prompt::Prompt::swap_recovery());
+    {
+        let mut e = h.editor.borrow_mut();
+        e.splash = Some(crate::splash::Splash::new(&km, "0.1.0"));
+        e.open_prompt(crate::prompt::Prompt::swap_recovery());
+    }
     let show = crate::splash::show_at_startup(
-        h.editor.view_opts.splash, false, h.editor.prompt.is_some());
+        h.editor.borrow().view_opts.splash, false, h.editor.borrow().prompt.is_some());
     assert!(!show, "a pending recovery prompt suppresses the splash");
-    assert!(h.editor.splash.is_none(), "open_prompt clears any pending splash (belt)");
+    assert!(h.editor.borrow().splash.is_none(), "open_prompt clears any pending splash (belt)");
     h.render();
     assert!(h.screen_contains("Recovery file found"),
         "the recovery prompt is what the user sees:\n{:#?}", h.screen());
@@ -1112,10 +1241,10 @@ mod e2e_bench {
     /// Move the caret to `byte` (clamped) and scroll it into view — an unmeasured
     /// seek (mirrors the direct-selection pattern in the seed journeys).
     fn seek(h: &mut Harness, byte: usize) {
-        let len = h.editor.active().document.buffer.len();
+        let len = h.editor.borrow().active().document.buffer.len();
         let b = byte.min(len);
-        h.editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(b);
-        crate::nav::ensure_visible(&mut h.editor);
+        h.editor.borrow_mut().active_mut().document.selection = wordcartel_core::selection::Selection::single(b);
+        crate::nav::ensure_visible(&mut h.editor.borrow_mut());
         h.render();
     }
     /// One matrix cell's fixed context, threaded through the burst drivers so
@@ -1230,10 +1359,13 @@ mod e2e_bench {
                 // Harness seeds diag_cfg.enabled = false for hermeticity, so without both of
                 // these the DiagnosticsDone landing below would measure the empty (un-placed)
                 // path instead of the placed/painted path this probe intends (spec §7.4).
-                h.editor.diag_cfg.enabled = true;
-                h.editor.active_mut().view.mode = crate::editor::RenderMode::Review;
+                {
+                    let mut e = h.editor.borrow_mut();
+                    e.diag_cfg.enabled = true;
+                    e.active_mut().view.mode = crate::editor::RenderMode::Review;
+                }
                 // Inject diagnostics for the current version → placed render path arms.
-                let bid = h.editor.active().id;
+                let bid = h.editor.borrow().active().id;
                 let ver = h.version();
                 let diags = make_diags(&text);
                 let land = h.step_timed(Msg::DiagnosticsDone { buffer_id: bid, version: ver, diagnostics: diags });

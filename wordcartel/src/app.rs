@@ -3,6 +3,9 @@
 // Design: terminal IO lives ONLY in `run`; `step` is pure and unit-testable.
 // The real loop calls `step` then draws — `step` never touches the terminal.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crossterm::event::Event;
 #[cfg(test)]
 use crossterm::event::KeyEvent;
@@ -617,7 +620,45 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // Effort A: no startup diagnostics warmup — the harper-ls client thread spawns lazily on the
     // first Review dispatch (idle is free; spec §3.1/§8). Installed just below, after the msg channel.
 
-    let reg = Registry::builtins();
+    // The msg channel is created HERE (moved up from its former post-keymap spot) so the
+    // plugin-load phase below can hand the bridge a `msg_tx.clone()` once the editor is
+    // wrapped (Task 7 step 1/3). Nothing between the old and new site depended on the
+    // channel's position — msg_rx is read only inside the loop, and every intervening use
+    // is a `msg_tx.clone()`.
+    let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Msg>();
+
+    // Plugin-load phase (Effort P1 Task 7 step 2): between Registry::builtins() and
+    // build_keymap, so any plugin command is present in the registry before keymap
+    // resolution and gets a free binding. Loading only needs `&mut reg` + the VM — NOT the
+    // editor — so it runs before the editor is wrapped; the bridge (which DOES need the
+    // `Rc<RefCell<Editor>>`) is attached separately, just before the loop (step 3).
+    let mut reg = Registry::builtins();
+    let mut plugin_host = if cli.no_plugins || !cfg.plugins.enabled {
+        crate::plugin::host::PluginHost::null()
+    } else {
+        match crate::plugin::host::PluginHost::new() {
+            Ok(h) => {
+                if let Some(plugins_dir) = xdg.as_deref().map(|x| x.join("wordcartel").join("plugins")) {
+                    let disc = crate::plugin::load::discover(&plugins_dir, &cfg.plugins.disable);
+                    for r in disc.skipped {
+                        warns.push(format!("plugin {} skipped: {}", r.plugin, r.result.err().unwrap_or_default()));
+                    }
+                    for r in crate::plugin::load::load_sources(&mut reg, &h, &disc.sources) {
+                        if let Err(e) = &r.result {
+                            warns.push(format!("plugin {}: {e}", r.plugin));
+                        }
+                    }
+                }
+                h
+            }
+            Err(e) => {
+                warns.push(format!("plugins disabled: {e}"));
+                crate::plugin::host::PluginHost::null()
+            }
+        }
+    };
+    let reg = reg; // freeze — registration is done, the registry is read-only from here on
+
     // Build the keymap from the loaded config and surface any warnings.
     let (built_keymap, mut kw) = keymap::build_keymap(&cfg.keymap, &reg);
     warns.append(&mut kw);
@@ -628,7 +669,6 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // Take the keymap out of editor into a loop-local to avoid a simultaneous
     // &mut editor / &editor.keymap borrow conflict when calling reduce.
     let mut keymap = std::mem::take(&mut editor.keymap);
-    let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Msg>();
     // Effort A: install the diagnostics provider now that the msg channel exists. HarperLs spawns
     // nothing here — its client thread starts on the first Review dispatch (lazy; spec §3.1). Config
     // is derived from the loaded DiagnosticsConfig; the file-length cap bounds per-recheck stdio.
@@ -731,13 +771,26 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     first_frame_settle(&mut editor);
     guard.terminal().draw(|f| render::render(f, &mut editor))?;
     let mut exit_reason = ExitReason::Normal;
+
+    // Wrap the editor for the loop (Task 7 step 3): every stage below borrows this handle for
+    // its own short scope rather than holding `&mut Editor` across the whole iteration — the
+    // pump stage needs no outer borrow alive so its callbacks can re-borrow the editor. Attach
+    // the bridge immediately after — it needs the handle to exist, and registration (above)
+    // never touched the editor, so this ordering is sound. The bridge owns its own
+    // `Rc<dyn Clock>` (SystemClock is a ZST) since the `'static` wc.* edit closures cannot
+    // borrow this function's `clock` local.
+    let editor = Rc::new(RefCell::new(editor));
+    if let Err(e) = plugin_host.attach_bridge(editor.clone(), msg_tx.clone(), Rc::new(SystemClock) as Rc<dyn Clock>) {
+        editor.borrow_mut().status = format!("plugin bridge failed to attach: {e}");
+    }
+
     loop {
         let now = clock.now_ms();
-        crate::timers::pre_recv(&mut editor, now);
+        { crate::timers::pre_recv(&mut editor.borrow_mut(), now); }
         // Every wake source lives in the timers::SUBSYSTEMS table, each with its own anti-spin
         // gate; next_wake folds their min. Idle ⇒ every gate yields None ⇒ the loop blocks on the
         // 3600 s fallback (idle is free — §8.1-E). See timers.rs for the per-subsystem rationale.
-        let timeout = crate::timers::next_wake(&editor, now)
+        let timeout = { crate::timers::next_wake(&editor.borrow(), now) }
             .map(|d| std::time::Duration::from_millis(d.saturating_sub(now)))
             .unwrap_or(std::time::Duration::from_secs(3600));
         let msg = match msg_rx.recv_timeout(timeout) {
@@ -751,32 +804,48 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             exit_reason = ExitReason::InputLost;
             break;
         }
-        let keep = reduce(msg, &mut editor, &reg, &keymap, &executor, &clock, &msg_tx);
-        if let Some(t) = crate::theme_cmds::rebuild_keymap_if_requested(&mut editor, &cfg.keymap.patches, &reg) {
+        let keep = { reduce(msg, &mut editor.borrow_mut(), &reg, &keymap, &executor, &clock, &msg_tx) };
+        // Pump stage (Effort P1 Task 7): runs AFTER reduce's borrow scope has dropped, holding
+        // NO outer borrow — a queued plugin command's Lua callback re-borrows the editor itself
+        // (via the bridge's wc.* closures), so no borrow may be alive here.
+        plugin_host.pump(&editor);
+        if let Some(t) = { crate::theme_cmds::rebuild_keymap_if_requested(&mut editor.borrow_mut(), &cfg.keymap.patches, &reg) } {
             keymap = t;
         }
         // Rederive arm: BEFORE settings_save so a same-cycle toggle+save persists
         // the post-rederive state (plan-mandated order — grounding A.9).
-        crate::theme_cmds::rederive_theme_if_requested(&mut editor, &cfg.theme, &env);
-        if editor.settings_save_requested {
-            editor.settings_save_requested = false;
-            if let Some(of) = settings::perform_settings_save(
-                &mut editor, cli.no_config, overrides_path.as_deref(),
-                &baseline_snapshot, &overrides_snapshot, &mask_snapshot, &crate::fsx::RealFs)
-            {
-                overrides_snapshot = of; // second-save correctness — replace our copy
+        { crate::theme_cmds::rederive_theme_if_requested(&mut editor.borrow_mut(), &cfg.theme, &env); }
+        {
+            let mut e = editor.borrow_mut();
+            if e.settings_save_requested {
+                e.settings_save_requested = false;
+                if let Some(of) = settings::perform_settings_save(
+                    &mut e, cli.no_config, overrides_path.as_deref(),
+                    &baseline_snapshot, &overrides_snapshot, &mask_snapshot, &crate::fsx::RealFs)
+                {
+                    overrides_snapshot = of; // second-save correctness — replace our copy
+                }
             }
         }
-        editor.surface_undo_eviction();
-        crate::clipboard::drain_clipboard_intents(&mut editor, &clip_env, &mut clip_plan, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
-        crate::chrome::reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
-        advance(&mut editor, &clock);
-        guard.terminal().draw(|f| render::render(f, &mut editor))?;
+        editor.borrow_mut().surface_undo_eviction();
+        {
+            let mut e = editor.borrow_mut();
+            crate::clipboard::drain_clipboard_intents(&mut e, &clip_env, &mut clip_plan, guard.terminal().backend_mut(), &clip_tx, &msg_tx);
+        }
+        {
+            let mut e = editor.borrow_mut();
+            crate::chrome::reconcile_mouse_capture(&mut e, guard.terminal().backend_mut(), &mut applied_mouse);
+        }
+        { advance(&mut editor.borrow_mut(), &clock); }
+        {
+            let mut e = editor.borrow_mut();
+            guard.terminal().draw(|f| render::render(f, &mut e))?;
+        }
         // Persist session state when a save just completed (saved_version advanced).
-        let sv = editor.active().document.saved_version;
+        let sv = { editor.borrow().active().document.saved_version };
         if sv != last_persisted_saved {
             session_seq += 1;
-            crate::session_restore::persist_session(&mut session, &editor, &cfg, session_seq);
+            { crate::session_restore::persist_session(&mut session, &editor.borrow(), &cfg, session_seq); }
             last_persisted_saved = sv;
         }
         if !keep { break; }
@@ -786,20 +855,20 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // input-loss, channel-disconnect all converge here) — sends LSP shutdown/exit and reaps the
     // child, non-blocking. The client thread's FlushGuard still emits terminals for any
     // accepted-but-unpublished change, so no latch is left dangling (spec §3/§4.6).
-    editor.diag_provider.shutdown();
+    editor.borrow_mut().diag_provider.shutdown();
 
     // Input-loss shutdown: persist every dirty buffer non-interactively (the
     // interactive quit-drain can't run — input is gone). Controlled break, so
     // iterating buffers is safe.
     if exit_reason == ExitReason::InputLost {
         if let Ok(dir) = crate::swap::state_dir() {
-            crate::recovery::dump_all_dirty(&editor, &dir);
+            crate::recovery::dump_all_dirty(&editor.borrow(), &dir);
         }
     }
 
     // On clean quit: persist once more (cursor may have moved since the last save).
     session_seq += 1;
-    crate::session_restore::persist_session(&mut session, &editor, &cfg, session_seq);
+    crate::session_restore::persist_session(&mut session, &editor.borrow(), &cfg, session_seq);
 
     // Restore the terminal BEFORE the executor drops: ThreadExecutor::drop joins
     // the worker, which may still be completing an in-flight save_atomic on a slow
