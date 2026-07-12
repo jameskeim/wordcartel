@@ -68,13 +68,21 @@ Public surface (sketch — the plan pins exact signatures):
 pub struct PluginHost { /* lua, plugins, callbacks — all private */ }
 impl PluginHost {
     pub fn new() -> Self;                     // hermetic; no VM work until load
-    pub fn load_dir(&mut self, fs: &dyn Fs, dir: &Path, reg: &mut Registry) -> Vec<PluginError>;
+    // Testable core: load ONE plugin from an in-memory source. Collects + applies its
+    // registrations to `reg`. Tests call this with string fixtures — no filesystem.
+    pub fn load_source(&mut self, name: &str, src: &str, reg: &mut Registry) -> Result<(), PluginError>;
+    // Thin production wrapper: std::fs read-dir, read each *.lua, delegate to load_source.
+    pub fn load_dir(&mut self, dir: &Path, reg: &mut Registry) -> Vec<PluginError>;
     pub fn run_command(&mut self, key: PluginCallbackId, editor: &mut Editor /*, clock,… */)
-        -> Result<(), PluginError>;
+        -> CommandResult;                     // maps Lua success/error -> CommandResult (see §3.3)
     pub fn is_idle_clean(&self) -> bool;      // guardrail: loaded-but-idle does no bg work
 }
 ```
-`load_dir` reads via the **`Fs` seam** (M3) so tests inject fixtures without touching the real FS. The
+**Testability (corrects the earlier `Fs`-seam assumption):** the existing `Fs` trait (`fsx.rs`) is a
+*write/atomic-replace* seam (`create_excl`/`rename`/`sync_dir`/`remove_file`) with **no read-dir/read-file
+ops**, so it cannot back `load_dir`. Instead, **`load_source(name, src, reg)` is the testable unit**
+(fixtures are in-memory strings) and `load_dir` is a thin `std::fs` wrapper that reads files and
+delegates — so all VM/parse/registration logic is unit-tested without inventing a new read-FS seam. The
 VM's `unsafe` is encapsulated inside `mlua`; the shell's own `#![forbid(unsafe_code)]` holds.
 
 ### 3.2 Loader
@@ -96,11 +104,19 @@ pub struct Ctx<'a> {
 }
 ```
 `Registry::dispatch` routes a `Handler::Plugin(key)` arm to `ctx.plugin_host.run_command(key,
-ctx.editor, …)` (disjoint field borrows of `ctx`). `run_command` enters `lua.scope`, installs the
-editor-backed scoped `wc.status`, and calls the stored callback. Native handlers dispatch exactly as
-today. Threading the handle through `Ctx` construction sites (`input.rs`, `mouse.rs`, `app.rs::reduce`,
-overlay dispatch) is the main mechanical cost; a `NullPluginHost`-style default keeps non-plugin builds
-and tests simple.
+ctx.editor, …)` (disjoint field borrows of `ctx` — to be confirmed by compile). `run_command` enters
+`lua.scope`, installs the editor-backed scoped `wc.status`, calls the stored callback, and **maps the
+outcome to `CommandResult`**: a successful callback → the same `CommandResult` a native command returns
+for "handled" (exact variant pinned by the plan against the real `CommandResult` enum); a Lua
+error/panic → caught, surfaced to `editor.status`, and still returned as a `CommandResult` (not a
+silent drop) so `dispatch`'s contract and its result-asserting tests hold. Native handlers dispatch
+exactly as today.
+
+**`Ctx` churn (Codex-corrected — the real cost):** `Ctx` is constructed at more sites than first
+stated — production: `input.rs`, the `app.rs` overlay helper, `timers.rs`, `prompts.rs` (several),
+`jobs_apply.rs`; plus many test sites. Every site must supply the host handle. A **`PluginHost::null()`
+default** (hermetic, no VM) keeps `--no-plugins`, non-plugin paths, and tests simple. This threading is
+the single biggest mechanical surface in P0 — the plan sequences it as its own task.
 
 ## 4. The command seam (opening the registry)
 
@@ -110,8 +126,14 @@ Changes in `wordcartel/src/registry.rs`:
   pub enum Handler { Native(fn(&mut Ctx) -> CommandResult), Plugin(PluginCallbackId) }
   ```
   Built-ins register `Native(fn)` (still zero-cost fn pointers). `dispatch` matches the enum.
-- `CommandId` and `CommandMeta.label` widen from `&'static str` to **`Cow<'static, str>`** so runtime
-  plugin strings fit while built-ins keep their `'static` literals (no allocation for built-ins).
+- **Plugin command ids/labels are interned to `&'static str` via a one-time leak** (`Box::leak`) at
+  registration, so `CommandId` and `CommandMeta.label` **keep their existing `&'static str` (`Copy`)
+  types unchanged.** (Codex-flagged: widening to `Cow<'static,str>` would break `CommandId: Copy` and
+  ripple through `PaletteRow`/`MenuAction`/keymap/tests, which rely on `Copy`, `.0`, and
+  `CommandId("literal")`. Interning avoids that entire ripple.) The leak is bounded — O(plugins ×
+  commands), once at startup, lives for the session — and acceptable for P0, which has **no plugin
+  reload**. **P3 caveat:** plugin reload must replace the leak with an interner/arena to avoid
+  re-leaking on every reload.
 - A new **runtime registration path** used only by the host/loader — e.g. `pub(crate) fn
   register_plugin_command(&mut self, id: Cow<'static,str>, label: Cow<'static,str>, key:
   PluginCallbackId) -> Result<(), RegisterError>` — that appends to `entries`/`index`. Built-in
@@ -135,9 +157,11 @@ naturally includes plugin commands (single source of truth preserved).
   the script's top level returns, the **loader** drains the buffer, computes `pluginname.name`, stores
   each callback in the host, and calls the registry's runtime registration path. Errors (duplicate
   within namespace, bad args, status-at-load) → `PluginError` surfaced after the drain.
-- **`wc.status(msg: string)`** — a **scoped** function present only inside a dispatch call; sets
-  `editor.status`. Invoking `wc.status` at load time (outside a scope) is a `PluginError`
-  ("status unavailable during load").
+- **`wc.status(msg: string)`** — inside a dispatch call, a **scoped** function that sets `editor.status`.
+  At **load time** `wc.status` is present as an **explicit stub** that raises a clear Lua error
+  ("wc.status is unavailable during load") — (Codex-flagged) a stub is required, because if the function
+  were merely absent Lua would raise a generic nil-call error instead of an intelligible one. The
+  loader catches it and surfaces `PluginError::StatusAtLoad` (the variant declared in §7, matching §8's test).
 
 `wc` is a single global table. No other surface in P0.
 
@@ -147,7 +171,7 @@ New `[plugins]` section on `Config` (`wordcartel/src/config.rs`):
 ```rust
 pub struct PluginsConfig { pub enabled: bool /* default true */, pub dir: PathBuf /* default XDG */ }
 ```
-Default dir: `~/.config/wcartel/plugins/` (XDG config, consistent with existing config-path handling).
+Default dir: `~/.config/wordcartel/plugins/` (XDG config, consistent with existing config-path handling).
 CLI: `--no-plugins` forces `enabled = false` for the session. (`config.rs`'s dead
 `DiagnosticsConfig.linters: Option<Vec<String>>` is untouched — it belongs to the diagnostics-provider
 selector, not this loader.)
@@ -166,8 +190,8 @@ selector, not this loader.)
 ## 8. Testing & success criteria
 
 **Deterministic tests** (no real FS/VM flakiness):
-- Load a fixture plugin from an in-memory source via the `Fs` seam; assert the namespaced command
-  exists in the registry with the right label and `menu: None`.
+- Load a fixture plugin via `load_source(name, src, reg)` (in-memory string — no FS seam); assert the
+  namespaced command exists in the registry with the right label and `menu: None`.
 - Dispatch the plugin command through the real `Registry::dispatch` + host scope; assert `editor.status`
   changed as the callback intended.
 - Load-error fixture (syntax error / top-level `error()`): assert it is skipped, a `PluginError`
@@ -194,19 +218,37 @@ source of truth** (palette/menu derive from it unchanged). P0 adds **no user-set
 "every option has a command" and the one-shared-setter law are unaffected. **Keybindings for plugin
 commands are P1** (this spec does not add hint re-resolution surface). No contract amendment is needed.
 
+*Note (Codex):* the menu already has one pre-existing non-registry section — the dynamic **Documents**
+rows (`menu.rs`, open-buffer list) bypass `Registry::commands()`. That exception predates P0 and is
+orthogonal: plugin commands flow entirely through the registry path, so they don't touch or widen it.
+
 ## 10. Anti-regrowth / module structure
 
 `PluginHost` + loader are **new modules** — no bulk added to `reduce`/`run`. The dispatch change is a
 thin delegation arm (`Handler::Plugin(k) => ctx.plugin_host.run_command(k, …)`), a row-not-body edit.
 `app.rs` gains only run-loop wiring (construct the host, thread it into `Ctx`) and stays under its
-1000-line budget. The registry type-widening (`Handler` enum, `Cow` ids) is mechanical, not new
-dispatch bulk. This is Open–Closed: the hub gains a delegation seam, the plugin machinery lives in its
+1000-line budget. The registry change (the `Handler` enum + a runtime register path; plugin ids/labels
+leaked to `&'static` so `CommandId`/label keep their existing `&'static str`/`Copy` types) is
+mechanical, not new dispatch bulk. This is Open–Closed: the hub gains a delegation seam, the plugin machinery lives in its
 own module.
 
 ## 11. Risks / notes
 
-- **`Ctx` churn** is the main integration cost — every `Ctx` construction site must supply the host
-  handle. A default/null host keeps tests and any no-plugin path simple.
+- **`mlua`-API behaviors are unverifiable from this repo (Codex Critical → flagged to human).** The
+  design leans on specific `mlua` semantics that no code here can confirm because `mlua` isn't a
+  dependency yet: `Lua::scope` + `scope.create_function_mut` lending `&mut Editor` for a call; scoped
+  functions not persisting past the scope; `lua.create_registry_value` callable mid-`exec` (interior
+  mutability). **Resolution: the FIRST plan task is a tiny `mlua` spike** that proves exactly these three
+  behaviors against the pinned `mlua` version/features before any real integration — a cheap, isolated
+  de-risk. If the spike disproves any assumption, we revise the design (e.g. fall back to a
+  deferred-op/queue shape for the offending path) before building on it. This is the one place the spec
+  leans on a claim that can't be verified by reading — surfaced deliberately per project process.
+- **`Ctx` churn** is the main integration cost — every `Ctx` construction site (production: `input.rs`,
+  the `app.rs` overlay helper, `timers.rs`, `prompts.rs`, `jobs_apply.rs`; plus many tests) must supply
+  the host handle. A `PluginHost::null()` default keeps tests and any no-plugin path simple. The plan
+  sequences this as its own task.
+- **String interning leak** (§4): plugin ids/labels are `Box::leak`'d to `&'static` — bounded and
+  once-per-session, but P3 reload must swap in an interner/arena.
 - **`mlua` dependency weight** (H2 lens): PUC 5.4 `vendored` is a small C build; record it in `cargo
   deny`. This is the first native VM dep — deliberate and scoped to the shell.
 - **Scoped-function setup cost** per dispatch is negligible for command dispatch (a user action);
