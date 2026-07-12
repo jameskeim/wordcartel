@@ -673,6 +673,12 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             }
         }
     };
+    // Task 8 (SPINE §9.3): install the core diagnostics provider catalog (harper today) now that
+    // the msg channel exists — folds `[diagnostics].linters` into per-engine enablement (unknown
+    // names warn into `warns`, BEFORE the status-selection point below so they surface) and seeds
+    // the switchable lens to the first enabled source. Providers spawn nothing here — lazy, as
+    // before (spec §3.1). `editor` is still the plain `&mut` here (pre-Rc-wrap).
+    crate::diagnostics_run::install_core_providers(&mut editor, &cfg, &msg_tx, &mut warns);
     // Build the keymap from the loaded config and surface any warnings.
     let (built_keymap, mut kw) = keymap::build_keymap(&cfg.keymap, &reg);
     warns.append(&mut kw);
@@ -683,21 +689,6 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // Take the keymap out of editor into a loop-local to avoid a simultaneous
     // &mut editor / &editor.keymap borrow conflict when calling reduce.
     let mut keymap = std::mem::take(&mut editor.keymap);
-    // Effort A: install the diagnostics provider now that the msg channel exists. HarperLs spawns
-    // nothing here — its client thread starts on the first Review dispatch (lazy; spec §3.1). Config
-    // is derived from the loaded DiagnosticsConfig; the file-length cap bounds per-recheck stdio.
-    editor.diag_providers.install(Box::new(crate::harper_ls::HarperLs::new(
-        msg_tx.clone(),
-        crate::diag_provider::ProviderConfig {
-            grammar: cfg.diagnostics.grammar,
-            dictionary: cfg.diagnostics.dictionary.clone(),
-            max_file_length: crate::limits::HARPER_MAX_FILE_LENGTH,
-        })), true);
-    // Task 6 (SPINE §8.1): seed the switchable lens to the first ENABLED source (install order =
-    // lens-cycle/core-catalog order), falling back to Harper when nothing is enabled — the field
-    // already defaults to Harper, so this only reassigns when a different source leads.
-    editor.active_analysis_source = editor.diag_providers.enabled_sources().next()
-        .unwrap_or(wordcartel_core::diagnostics::DiagSource::Harper);
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
     let executor = crate::jobs::ThreadExecutor::new(wake_tx);
     let clip_env = crate::clipboard::clip_env_from_process();

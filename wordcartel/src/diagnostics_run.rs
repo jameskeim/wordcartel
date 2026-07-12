@@ -321,6 +321,54 @@ pub fn set_engine_enabled(editor: &mut Editor, source: DiagSource, on: bool,
     }
 }
 
+/// Build the core provider catalog (harper today), fold `linters` into per-engine enablement
+/// (warning on unknown names), install into `editor.diag_providers`, and seed the default lens
+/// (first enabled source in cycle order). Providers spawn nothing here — lazy, as before.
+/// `linters`: `None` → every core engine enabled; `Some(list)` → exactly the named engines
+/// (names = `DiagSource::config_name()`); `Some([])` → none. This is the promised validation
+/// site the config fold's `linters` comment points at (SPINE Task 8, spec §9).
+pub fn install_core_providers(editor: &mut Editor, cfg: &crate::config::Config,
+    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>, warns: &mut Vec<String>) {
+    // The core catalog in cycle order. Effort b appends ltex/vale here.
+    let catalog: &[DiagSource] = &[DiagSource::Harper];
+    // Which engines are enabled: None → all core; Some(list) → exactly the named (config_name).
+    let enabled_of = |src: DiagSource| -> bool {
+        match &cfg.diagnostics.linters {
+            None => true,
+            Some(list) => list.iter().any(|n| n == src.config_name()),
+        }
+    };
+    if let Some(list) = &cfg.diagnostics.linters {
+        for name in list {
+            if !catalog.iter().any(|s| s.config_name() == name) {
+                warns.push(format!(
+                    "config: diagnostics.linters — unknown engine \"{name}\" (known: harper)"));
+            }
+        }
+    }
+    for &src in catalog {
+        let provider: Box<dyn crate::diag_provider::DiagnosticsProvider> = match src {
+            DiagSource::Harper => Box::new(crate::harper_ls::HarperLs::new(
+                msg_tx.clone(),
+                crate::diag_provider::ProviderConfig {
+                    grammar: cfg.diagnostics.grammar,
+                    dictionary: cfg.diagnostics.dictionary.clone(),
+                    max_file_length: crate::limits::HARPER_MAX_FILE_LENGTH,
+                })),
+            // Exhaustive — future core engines add arms; LTeX/Vale/Plugin are not in the catalog yet.
+            DiagSource::LTeX | DiagSource::Vale | DiagSource::Plugin(_) => continue,
+        };
+        editor.diag_providers.install(provider, enabled_of(src));
+    }
+    // Seed the lens to the first enabled source (Harper fallback when none enabled — inert).
+    // Writes the field directly (not `set_analysis_source`, which would status-message and
+    // refuse a not-yet-populated set) — this is construction, matching the clipboard-provider
+    // seeding precedent.
+    if let Some(first) = editor.diag_providers.enabled_sources().next() {
+        editor.active_analysis_source = first;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,5 +864,48 @@ mod tests {
         let kept = &e.active().diagnostics.slot(DiagSource::Harper).unwrap().diagnostics;
         assert_eq!(kept.len(), 1, "the newly-ignored spelling word is dropped in place");
         assert_eq!(kept[0].kind, DiagnosticKind::Grammar);
+    }
+
+    // ------------------------------------------------------------------
+    // Task 8 (SPINE): install_core_providers — config-driven enablement.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn install_core_providers_enables_per_linters_and_warns_unknown() {
+        use crate::config::Config;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut e = Editor::new_from_text("x\n", None, (40, 10));
+        let mut cfg = Config::default();
+        cfg.diagnostics.linters = Some(vec!["harper".into(), "bogus".into()]);
+        let mut warns = Vec::new();
+        install_core_providers(&mut e, &cfg, &tx, &mut warns);
+        assert!(e.diag_providers.is_enabled(DiagSource::Harper));
+        assert_eq!(e.active_analysis_source, DiagSource::Harper, "default lens = first enabled");
+        assert!(warns.iter().any(|w| w.contains("bogus")), "unknown linter warned");
+    }
+
+    #[test]
+    fn install_core_providers_none_linters_enables_harper() {
+        use crate::config::Config;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut e = Editor::new_from_text("x\n", None, (40, 10));
+        let cfg = Config::default(); // linters = None
+        let mut warns = Vec::new();
+        install_core_providers(&mut e, &cfg, &tx, &mut warns);
+        assert!(e.diag_providers.is_enabled(DiagSource::Harper));
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn install_core_providers_empty_linters_enables_none() {
+        use crate::config::Config;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut e = Editor::new_from_text("x\n", None, (40, 10));
+        let mut cfg = Config::default();
+        cfg.diagnostics.linters = Some(Vec::new());
+        let mut warns = Vec::new();
+        install_core_providers(&mut e, &cfg, &tx, &mut warns);
+        assert!(!e.diag_providers.is_enabled(DiagSource::Harper), "empty list enables nothing");
+        assert!(warns.is_empty(), "no unknown names to warn about");
     }
 }
