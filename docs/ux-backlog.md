@@ -585,3 +585,46 @@ our history a bounded in-memory ring (M5 resource-cap ethos) + optional file spi
 *(Captured 2026-07-11 from a noice.nvim discussion; prior-art subsection added the same day from a
 source read of Fresh. Triage — not yet scoped or sized; explicitly flagged by the user as needing to
 be really well thought out because it shapes the customizable plugin-era interface.)*
+
+### S4. Prose text objects — structural selection + operator layer
+<!-- item: S4 -->
+
+**What:** a structural text-object + operator layer for prose, the way Vim's text objects work for
+code but rebuilt for writing. The writer selects, deletes, transposes, reflows, and counts *named
+things* — **sentence, clause, quotation, emphasis, link, block, section** — rather than coordinate
+ranges. Objects (`cursor → span`) compose with operators (`select / delete / change / yank /
+transpose / reflow / unwrap / ventilate / count / case`), so the object × operator matrix fills in by
+construction. A **prose hierarchy** (document → section → block → sentence → clause → word) powers
+expand/shrink selection. Two pieces are genuinely novel: a **heuristic sentence-detection module**
+(abbreviations, decimals, initialisms, terminal punctuation inside quotes — test-fixture-driven,
+user-extensible) and a **clause** object with no code analogue (transpose a subordinate clause to the
+front). Structural objects are **Markdown-parse-tree queries** (correct by construction, not
+regex-scraped), degrading to text heuristics on non-Markdown buffers.
+
+**Status: TRIAGE — captured from an external design-space draft, not yet brainstormed.** The
+substance lives in **`docs/design/prose-text-objects-design-space.md`** (a full pre-spec exploration
+drafted with an LLM that lacked codebase access — plausible and well-aligned but *unverified*; its
+§8 is explicitly open questions for the implementer because it could not read `repar`). That doc is
+idea material and a strong starting map; it must go through our grounding-first + brainstorm + Fable
+pipeline before any spec, re-deriving its concrete types/seams from the real source.
+
+**Magnitude / theme:** **XL** — an editing-model layer, closer to Effort-P scale than to a single S
+item. Filed under Theme S (manuscript structure) for now, but flagged to **possibly promote to its
+own theme** if it grows a cluster of items. Relationships: **S1** (rearrangeable outline — the
+`Section` object here is the structural primitive that heading-subtree move needs); **C2/C2b**
+(`repar` reflow/unwrap/ventilate — *already shipped*; the design-space §8 is entirely about the seam
+between the object layer and `repar`, incl. single-sourcing sentence boundaries between `ventilate`
+and this module's detector); **A14** (Emacs-parity transpose / word-case — *already shipped*;
+overlaps the operator layer, so part of the surface already exists).
+
+**Fit with our model (noted, for the brainstorm):** the draft correctly assumes we are **non-modal
+with explicit marks** — so objects are primarily *selection-makers* (mark the current sentence /
+section, extend to the enclosing clause), and `repar`-backed operators act on an existing mark. This
+is CORE (structural editing on the data-integrity path — edits must flow through
+`submit_transaction`/`ChangeSet`), though later intelligence (POS/dependency backend for
+clause/phrase) slots in behind the same trait without touching operators — a natural Effort-P/plugin
+seam.
+
+**Open questions for the human (triage):** (1) confirm Theme S vs. its own theme; (2) whether this is
+a pre-1.0 core capability or a post-Effort-P direction; (3) relative priority vs. S1 (they share the
+`Section` primitive — S1 could land first as a subset, or S4 could subsume it).

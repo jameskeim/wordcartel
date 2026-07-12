@@ -3,7 +3,7 @@
 
 # Backlog
 
-**20 open · 49 shipped · 1 dropped**
+**21 open · 49 shipped · 1 dropped**
 
 Blocking Effort P: **0**
 
@@ -17,6 +17,7 @@ Blocking Effort P: **0**
 | S1 | Rearrangeable outline / heading-subtree corkboard | needs-design | feature | M |  | Structure mode: atomic heading-subtree move via submit_transaction; drag-reorder. |
 | S2 | Directory-as-binder | needs-design | feature | L |  | Directory of .md as a manuscript: ordered manifest + compile step (post-Effort-P plugin). |
 | P | Effort P — in-process Lua plugin system (1.0 capstone) | needs-design | feature | XL |  | The plugin/automation spine; registers into the command/hook/job seams. See docs/design/effort-p-plugin-system-design-space.md. |
+| S4 | Prose text objects — structural selection + operator layer | triage | feature | XL |  | Named, composable prose objects (sentence/clause/quotation/section) × operators (select/delete/transpose/reflow/count) over a document→section→block→sentence→clause→word hierarchy; expand/shrink selection; heuristic sentence-detection module; Markdown-tree-backed structural objects; seam with shipped repar (C2/C2b) + A14 operators; underpins S1. XL — may promote to own theme. Design-space: docs/design/prose-text-objects-design-space.md. |
 | A15 | About command/menu item that shows the splash | triage | feature | TBD |  | About command/menu item that shows the splash |
 | A16 | Format menu: drop redundant Transform entry | triage | feature | TBD |  | Format menu: drop redundant Transform entry |
 | A17 | Messaging / notification system — routed, browsable, plugin-emittable | triage | feature | TBD |  | One routed path for all user messages: kinds/severity, browsable history, plugin emit API. noice.nvim = the anti-pattern (override-on-top) — we register into a seam. Effort-P design input; enables per-kind user routing/verbosity. |
