@@ -26,6 +26,20 @@ Anchor on symbol NAMES (lines drift). `cargo` + `grep` are ground truth, never a
    a Rust allocation is bounded before the allocation — the load-layer caps (stem/name/label/count, menu
    parse-to-enum, edit-text paste cap, status truncation). A new input-taking API added without both
    guards is a defect.
+   **Concrete implementation of the resource-bound law — the borrowed-length-check-then-convert
+   pattern.** `spec.get::<String>("name")` allocates a Rust `String` BEFORE any cap check — a law
+   violation. So EVERYWHERE a plugin string crosses into Rust, extract it as **`mlua::String`** (borrows
+   the Lua-side bytes, no Rust alloc), check `.as_bytes().len()` against the cap FIRST, and only on pass
+   convert (`.to_str()?` → `to_owned()`/`intern`/`Tendril::from`):
+   ```rust
+   let raw: mlua::String = spec.get("name")?;              // borrows Lua bytes — no Rust alloc
+   if raw.as_bytes().len() > crate::limits::PLUGIN_MAX_NAME_LEN {
+       return Err(mlua::Error::runtime("plugin: command name too long")); }  // reject BEFORE alloc
+   let name = raw.to_str()?.to_owned();                    // owns only after the cap passes
+   ```
+   This is the concrete form of BOTH the pre-intern registration caps (name/label/menu — Task 4) AND the
+   callback-time caps (edit text vs `PASTE_MAX_BYTES`, status vs `PLUGIN_MAX_STATUS_LEN` — Task 5): the
+   check is always on the borrowed `mlua::String` length, before the `String`/`Tendril` allocation.
 2. **`#![forbid(unsafe_code)]` holds.** `Rc<RefCell<>>` + owned captures are safe; `mlua`'s `unsafe`
    stays inside the dependency. No `unsafe` in `wordcartel`/`wordcartel-core`. `wordcartel-core` stays
    VM-free (no `mlua` import there — ever).
@@ -324,25 +338,28 @@ core that drives it. Tested entirely on string sources (no disk).
       let wc: mlua::Table = lua.globals().get("wc").or_else(|_| {
           let t = lua.create_table()?; lua.globals().set("wc", &t)?; Ok::<_, mlua::Error>(t) })?;
       let reg_fn = lua.create_function(move |lua, spec: mlua::Table| {
-          let name: String = spec.get("name")?;
-          let label: String = spec.get("label")?;
-          let menu_s: Option<String> = spec.get("menu")?;
-          let func: mlua::Function = spec.get("fn")?;
-          // Resource-bound LAW — cap on the RAW String, before interning:
+          // Resource-bound LAW — the borrowed-length-check-then-convert pattern: extract as
+          // mlua::String (NO Rust alloc), cap on `.as_bytes().len()`, convert ONLY on pass.
           if count.get() >= crate::limits::PLUGIN_MAX_COMMANDS_PER_PLUGIN {
               return Err(mlua::Error::runtime("plugin: too many commands (max 256)")); }
-          if name.len() > crate::limits::PLUGIN_MAX_NAME_LEN {
+          let name_raw: mlua::String = spec.get("name")?;
+          if name_raw.as_bytes().len() > crate::limits::PLUGIN_MAX_NAME_LEN {
               return Err(mlua::Error::runtime("plugin: command name too long")); }
-          if label.len() > crate::limits::PLUGIN_MAX_LABEL_LEN {
+          let label_raw: mlua::String = spec.get("label")?;
+          if label_raw.as_bytes().len() > crate::limits::PLUGIN_MAX_LABEL_LEN {
               return Err(mlua::Error::runtime("plugin: label too long")); }
-          let menu = match &menu_s {
+          let menu_raw: Option<mlua::String> = spec.get("menu")?;
+          let func: mlua::Function = spec.get("fn")?;
+          // menu: parse-to-enum on the borrowed bytes (no owned String needed):
+          let menu = match &menu_raw {
               None => None,
-              Some(m) => Some(crate::registry::menu_from_str(m)
-                  .ok_or_else(|| mlua::Error::runtime(format!("plugin: unknown menu '{m}'")))?),
+              Some(m) => Some(crate::registry::menu_from_str(m.to_str()?.as_ref())
+                  .ok_or_else(|| mlua::Error::runtime("plugin: unknown menu value"))?),
           };
-          let full = format!("{stem}.{name}");
-          let id = crate::registry::CommandId(crate::plugin::intern(&full));   // ← after caps pass
-          let label_s = crate::plugin::intern(&label);
+          // Caps passed → own + intern (the ONLY Rust allocs, all after the checks):
+          let full = format!("{stem}.{}", name_raw.to_str()?.as_ref());
+          let id = crate::registry::CommandId(crate::plugin::intern(&full));
+          let label_s = crate::plugin::intern(label_raw.to_str()?.as_ref());
           lua.set_named_registry_value(&format!("wc-cmd-{}", id.0), func)?;    // persistent callback
           count.set(count.get() + 1);
           sink.borrow_mut().push(PendingReg { id, label: label_s, menu });
@@ -352,9 +369,11 @@ core that drives it. Tested entirely on string sources (no disk).
       Ok(())
   }
   ```
-  (`stem` is interned once at load; caps on `name`/`label` are on the raw `String`; the menu string is
-  parse-to-enum; `intern` is only reached AFTER all caps pass — resource-bound LAW satisfied. The
-  editor-API functions — reads/edits/status — are added to `wc` in Task 5 via a sibling installer.)
+  (`stem` is interned once at load; name/label caps are on the BORROWED `mlua::String` length before any
+  Rust alloc; the menu string is parse-to-enum on borrowed bytes; `intern` is reached only AFTER all caps
+  pass — resource-bound LAW satisfied at the extraction site. The editor-API functions — reads/edits/
+  status — are added to `wc` in Task 5 via a sibling installer. Note: `mlua::String::to_str()` yields a
+  guard that derefs to `&str`; `.as_ref()` / deref gets the `&str` for `format!`/`intern`.)
 - `plugin/load.rs` — the testable core. **Signature deviation from spec §6, intentional (MINOR):** the
   spec wrote `load_sources(host, &[(name, src)]) -> Vec<LoadReport>`; since registration mutates the
   `Registry`, the real signature threads `reg: &mut Registry` — stated here so it is a deliberate
@@ -424,17 +443,25 @@ an `Rc<RefCell<Editor>>`, assert on the editor. No threads, no `app::run`.
   not a `RefCell` panic (drive it by holding a borrow while invoking — a white-box test).
 
 **Implementation:**
-- `plugin/host.rs` — the bridge + pump:
+- `plugin/host.rs` — the bridge + pump. **Clock ownership (IMPORTANT 1 — one concrete model):** the
+  `wc.*` edit closures are `'static` (`create_function`), so they CANNOT borrow `run()`'s `&dyn Clock`.
+  Resolution: the `Bridge` owns an **`Rc<dyn Clock>`**, and the edit closures capture a clone of it and
+  pass `&*clock` to `submit_transaction`. `run()` builds it once at bridge-attach time
+  (`Rc::new(SystemClock)` — `SystemClock` is a ZST, app.rs:369); tests pass an `Rc<TestClock>`. The pump
+  therefore needs NO `clock` parameter — the clock lives in the bridge/closures. This is the single
+  compilable story (replaces the earlier placeholder field + `pump` param).
   ```rust
+  use wordcartel_core::history::Clock;
   pub struct Bridge {
       pub editor: Rc<RefCell<Editor>>,
       pub msg_tx: std::sync::mpsc::Sender<crate::app::Msg>,
-      pub clock: /* a Clock handle usable at pump time */,
+      pub clock: Rc<dyn Clock>,     // owned — 'static edit closures capture a clone
   }
   impl PluginHost {
       /// Drain-then-invoke, single pass (no wc.command in P1 → no mid-pump growth). Takes the HANDLE,
-      /// never &mut Editor, so no borrow is held across Lua.
-      pub fn pump(&mut self, editor: &Rc<RefCell<Editor>>, clock: &dyn Clock) {
+      /// never &mut Editor, so no borrow is held across Lua. No clock param — the clock lives in the
+      /// bridge, captured by the edit closures (installed at attach_bridge time).
+      pub fn pump(&mut self, editor: &Rc<RefCell<Editor>>) {
           let Some(lua) = self.lua.as_ref() else { return; };
           // Phase A — drain under a short borrow that drops immediately:
           let calls: Vec<PluginCall> = {
@@ -447,7 +474,7 @@ an `Rc<RefCell<Editor>>`, assert on the editor. No threads, no `app::run`.
               let cb: mlua::Result<mlua::Function> = lua.named_registry_value(&key);
               let outcome = crate::panicx::catch(|| {
                   let f = cb?;                       // missing callback → Lua error
-                  self.with_time_guard(lua, || f.call::<()>(()))   // set_hook runaway guard (spike #2)
+                  self.with_time_guard(lua, || f.call::<()>(()))   // set_hook runaway guard (spike §11.3)
               });
               if let Err(msg) | Ok(Err(msg)) = normalize(outcome) {
                   crate::plugin::plugin_error(editor, call.id.0, &msg);   // → status line
@@ -456,9 +483,11 @@ an `Rc<RefCell<Editor>>`, assert on the editor. No threads, no `app::run`.
       }
   }
   ```
-  (`with_time_guard` installs `set_hook` with the spike-fixed budget around the single call and removes
-  it after; `normalize` flattens `Result<Result<_,LuaErr>,PanicMsg>` to one message. `plugin_error` takes
-  a short `borrow_mut` to set `editor.status`.)
+  (`attach_bridge(editor, msg_tx, clock: Rc<dyn Clock>)` stores the bridge AND installs the editor-API
+  closures — Task 7 step 3 calls it after the `Rc` wrap. `with_time_guard` installs `set_hook` with the
+  spike-fixed budget around the single call and removes it after; `normalize` flattens
+  `Result<Result<_,LuaErr>,PanicMsg>` to one message. `plugin_error` takes a short `borrow_mut` to set
+  `editor.status`.)
 - `plugin/api.rs` — `plugin_check_range` (the shared chokepoint) + `install_editor_api`:
   ```rust
   /// The input-validation LAW chokepoint (spec §3). Shared by wc.text (read) and wc.replace (edit).
@@ -471,32 +500,39 @@ an `Rc<RefCell<Editor>>`, assert on the editor. No threads, no `app::run`.
       Ok(())
   }
   ```
-  `install_editor_api(lua, bridge)` adds to `wc`, each closure taking a short `try_borrow_mut` via the
-  bridge's `Rc` clone (never `borrow_mut`; `Err` → `"editor busy"` Lua error):
+  `install_editor_api(lua, bridge)` adds to `wc`; each closure captures a clone of `bridge.editor`
+  (`Rc<RefCell<Editor>>`) and, for edits, a clone of `bridge.clock` (`Rc<dyn Clock>`), taking a short
+  `try_borrow_mut` per call (never `borrow_mut`; `Err` → `"editor busy"` Lua error). **Edit/status text
+  uses the borrowed-length-check-then-convert pattern** (global constraint 1(b)) — extract `mlua::String`,
+  cap on `.as_bytes().len()`, allocate only on pass:
   - `wc.text(a?, b?)` → default `a=0`, `b=len`; `plugin_check_range` → on `Err` a typed Lua error;
     else `TextBuffer::slice(a..b)` → owned `String` to Lua.
   - `wc.selection`/`wc.cursor`/`wc.len`/`wc.version`/`wc.path` → owned reads, no offset input.
-  - `wc.insert(text)` → `text.len() > PASTE_MAX_BYTES` → typed error (resource LAW, before any alloc);
-    else cursor from live selection, `plugin_check_range(buf, cur, cur)`, `ChangeSet::insert(cur, text,
-    len)`, `submit_transaction(editor, Transaction::new(cs), clock)`; `EditError` → typed Lua error.
-  - `wc.replace(a, b, text)` → `text.len()` cap; `plugin_check_range(buf, a, b)`;
-    `commands::build_range_replace(a, b, text, doc_len)` → `submit_transaction`.
+  - `wc.insert(text)` → extract `text: mlua::String`; **`text.as_bytes().len() > PASTE_MAX_BYTES` →
+    typed error BEFORE any `Tendril` alloc** (resource LAW); else cursor from live selection,
+    `plugin_check_range(buf, cur, cur)`, `ChangeSet::insert(cur, text.to_str()?.as_ref(), len)`,
+    `submit_transaction(&mut ed.borrow_mut(), Transaction::new(cs), &*clock)`; `EditError` → typed Lua error.
+  - `wc.replace(a, b, text)` → extract `text: mlua::String`; `.as_bytes().len() > PASTE_MAX_BYTES` →
+    typed error; `plugin_check_range(buf, a, b)`; `commands::build_range_replace(a, b,
+    text.to_str()?.as_ref(), doc_len)` → `submit_transaction(…, &*clock)`.
   - `wc.set_selection(anchor, head)` → an **identity `ChangeSet`** (no text edit) + `Transaction`
     carrying the selection; `submit_transaction` snaps it (out-of-bounds clamps, never rejects), so no
     pre-check. `submit_transaction` requires a `Transaction { changes: ChangeSet, .. }` (transact.rs,
     history.rs), so the changes must be a validated identity over the live `doc_len`:
     ```rust
-    let doc_len = editor.borrow().active().document.buffer.len();
+    let doc_len = ed.borrow().active().document.buffer.len();     // short borrow, drops at ;
     let ident = wordcartel_core::change::ChangeSet::from_ops(
         vec![wordcartel_core::change::Op::Retain(doc_len)], doc_len);  // retain-all == identity
     let txn = wordcartel_core::history::Transaction::new(ident)
         .with_selection(wordcartel_core::selection::Selection::range(anchor, head));
-    crate::transact::submit_transaction(&mut editor.borrow_mut(), txn, clock)?;  // snaps the selection
+    crate::transact::submit_transaction(&mut ed.borrow_mut(), txn, &*clock)?;  // snaps the selection
     ```
     (`Retain(doc_len)` sums to `len_before` so `from_ops`'s consumption assert holds; `submit_transaction`
     clamps `anchor`/`head` to char boundaries in `[0, doc_len]` — the existing snap-not-reject behavior.
     Do NOT invent a raw selection mutation or an unchecked `from_ops`.)
-  - `wc.status(msg)` → truncate `msg` to `PLUGIN_MAX_STATUS_LEN` on a char boundary → `editor.status`.
+  - `wc.status(msg)` → extract `msg: mlua::String`; **truncate on the BORROWED bytes** — take at most
+    `PLUGIN_MAX_STATUS_LEN` bytes, back up to the nearest char boundary, `.to_str()`/own only that slice
+    → `editor.status` (never allocate the full oversized `String` first).
   Register both installers via the flat seam vector (registration installer from Task 4 + this one).
 
 **Acceptance:** `cargo test -p wordcartel plugin::host` green (every TDD case, especially the no-panic +
@@ -570,12 +606,20 @@ outer borrow. Depends on Task 6 (`discover`/`cfg.plugins`/`cli.no_plugins`).
 `step` so the e2e test actually drives the pump — see below).
 
 **TDD first:**
-- **`e2e.rs` harness change (prerequisite for the test):** the real `Harness` (`struct Harness`, e2e.rs)
-  has no `PluginHost` and `Harness::step` (the shared `snapshot → reduce → surface_undo_eviction →
-  advance → render` sequence) has no pump slot — so a plugin test cannot reach the pump as-is. Add an
-  `Option<PluginHost>` (+ the `Rc<RefCell<Editor>>` handle or an equivalent) to `Harness`, and insert the
-  pump call in `step` at the SAME point `run` uses it (after `reduce`, before the keymap/advance stages).
-  A test constructor loads plugin sources into the harness's registry+host.
+- **`e2e.rs` harness change (prerequisite for the test) — mirror `run()`'s wrap, no duplicated editor
+  state.** The real `Harness` stores `editor: Editor` (e2e.rs, `struct Harness`) and `step` calls
+  `reduce(&mut self.editor, …)` (the shared `snapshot → reduce → surface_undo_eviction → advance →
+  render` sequence) — it has no `PluginHost` and no pump slot. Change it concretely:
+  - `Harness.editor: Editor` → **`Harness.editor: Rc<RefCell<Editor>>`** (mirrors `run()`'s wrap) +
+    `Harness.plugin_host: Option<PluginHost>` (a `null()` for non-plugin tests).
+  - `Harness::step` adopts the **same per-stage short-borrow choreography** as `run()`: each existing
+    `stage(&mut self.editor, …)` becomes `stage(&mut self.editor.borrow_mut(), …)`, and a pump slot
+    **`if let Some(h) = &mut self.plugin_host { h.pump(&self.editor); }`** is inserted after the `reduce`
+    borrow scope closes and before `surface_undo_eviction`/advance — the SAME point `run` uses it.
+  - Any other `Harness` accessor that reads `self.editor` (assertions, getters) takes a short `borrow()`.
+    This drives the REAL integration path with one editor, no duplicated state.
+  - A test constructor loads plugin sources into the harness's registry + a real `PluginHost` and
+    attaches the bridge (with an `Rc<TestClock>`), exactly as `run()` does.
 - `e2e::tests::plugin_command_dispatches_via_palette` — a harness loaded with an `insert_date`-style
   plugin: dispatch its command through the registry/palette path, `step`, assert the buffer changed via
   the pump. (First test exercising the real pump stage in a loop-shaped sequence.)
@@ -612,14 +656,17 @@ outer borrow. Depends on Task 6 (`discover`/`cfg.plugins`/`cli.no_plugins`).
 3. **Wrap the editor, THEN attach the bridge.** Keep all pre-loop editor mutation (session restore,
    splash, `first_frame_settle`, first draw) on the plain `&mut editor`; convert to
    `let editor = Rc::new(RefCell::new(editor));` JUST before the `loop {`. Immediately after,
-   `plugin_host.attach_bridge(editor.clone(), msg_tx.clone(), /* clock handle */)` — this installs the
-   editor-API closures (reads/edits/status, Task 5) now that the handle exists. Registration (Task 4)
-   already happened in step 2 and never touched the editor, so this ordering is sound.
+   `plugin_host.attach_bridge(editor.clone(), msg_tx.clone(), Rc::new(SystemClock) as Rc<dyn Clock>)` —
+   this stores the bridge (with its owned clock) and installs the editor-API closures (reads/edits/status,
+   Task 5) now that the handle exists. (`SystemClock` is the run-loop clock, app.rs:369; the bridge owns
+   its own `Rc` copy so the `'static` edit closures can pass it to `submit_transaction` — IMPORTANT 1.)
+   Registration (Task 4) already happened in step 2 and never touched the editor, so this ordering is sound.
 4. **Per-stage borrow choreography** — every loop-body stage that touches editor takes its own short
    scope (spec §2). Each `stage(&mut editor, …)` becomes `stage(&mut editor.borrow_mut(), …)` (or an
    explicit `{ let mut e = editor.borrow_mut(); … }`); the immutable `next_wake` uses `&editor.borrow()`.
    Order: `timers::next_wake` (`&borrow`), `timers::pre_recv` (`borrow_mut`), `reduce` (`borrow_mut`
-   scope), **`plugin_host.pump(&editor, &clock)`** ← NEW, holds NO borrow, `rebuild_keymap_if_requested`,
+   scope), **`plugin_host.pump(&editor)`** ← NEW (no clock arg — the bridge owns it), holds NO borrow,
+   `rebuild_keymap_if_requested`,
    `rederive_theme_if_requested`, settings-save arm, `surface_undo_eviction`, `drain_clipboard_intents`,
    `reconcile_mouse_capture`, `advance`, `render::render`, session-persist check/use — each its own
    `borrow`/`borrow_mut` scope. The pump slots directly after `reduce`'s borrow scope closes and before
