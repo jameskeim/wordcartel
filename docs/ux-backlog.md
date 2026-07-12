@@ -828,3 +828,73 @@ later decision.)
 **Nothing here is on by default** (arc doc, D7). This is *revision* machinery; if it intrudes on
 drafting it becomes the thing writers hate about Word, and it violates the project's top priority.
 The E7 precedent governs: the cost lands in the summoned view.
+
+### E8 — Lens — the unifying view surface (layout vs style axes; plugin-registerable)
+<!-- item: E8 -->
+
+**A product concept, not a refactor (user, 2026-07-12).** Three efforts are each, independently,
+about to invent their own way of *showing the writer something about their prose* — and each will
+build its own toggle, its own overlay, its own config key, its own menu entry. They are the same
+thing:
+
+| | what it shows | where |
+|---|---|---|
+| **Diagnostic lenses** | *what's wrong* — spelling, grammar, style rules | harper-ls, ltex-plus, vale-ls (multi-LSP effort, in flight) |
+| **Structural lenses** | *the skeleton* — sentence-per-line view, rhythm gutter, repeated openers | **S6** |
+| **Stylistic lenses** | *what's flabby* — adverbs dimmed, passives underlined, nominalizations | **S8** |
+
+**"A lens for your writing"** is the unifying idea, and it is arguably a defining feature of
+wordcartel rather than an implementation detail. It also falls out of the arc's north star
+(`docs/design/prose-structure-arc.md`): *show the writer the skeleton of their prose*. A lens is by
+construction **summoned, non-destructive, and off by default** — which is already the law (arc D7,
+and the E7 precedent: the cost lands in the summoned view).
+
+**Direct successor to E7** ("grammar/spelling as a deliberate Analysis view"), which is the first
+lens we shipped without naming the category.
+
+### The design fork that must be settled first
+
+**Lenses split on two axes, and they compose differently.**
+
+- **STYLE lenses** change how text is **painted** — diagnostics, POS X-rays, repeated-opener
+  highlighting. These **STACK**: "adverbs dimmed *and* spelling underlined" is coherent and useful.
+- **LAYOUT lenses** change what is **drawn** — S6's ventilate view inserts line breaks that do not
+  exist in the buffer. These are **EXCLUSIVE**: two layout lenses cannot both re-break the same rows.
+
+So the surface is probably **not** a single cycle and **not** a single checkbox set, but **two axes**:
+*one* active layout lens, *N* active style lenses. Getting this wrong has concrete, visible failure
+modes — either diagnostics cannot be shown at the same time as POS highlighting (if lenses are a
+mode), or two layout lenses fight over the same rows (if they are a set).
+
+### Why this is urgent, not eventual
+
+**The in-flight multi-LSP effort is E8's first implementer** — it is building the provider/overlay
+surface *right now*. One Open–Closed constraint must reach it before it hardens:
+
+> **The provider seam must NOT assume "provider == LSP subprocess."**
+
+`diag_provider.rs` already calls itself "Open-Closed insurance for provider #2" — but providers #2
+and #3 (ltex, vale) are *also* LSP subprocesses, so an LSP-shaped assumption would not be caught by
+adding them. **S8's lens is in-process, synchronous, and caret-local** (harper-brill POS over the
+caret's block window — see S7). If the trait, the config surface, or the toggle/menu machinery bakes
+in a process/LSP/whole-document/debounced assumption, S8 must either fork the overlay layer or
+retrofit the seam — exactly the regrowth the module-structure rule exists to prevent.
+
+### Other things this unlocks
+
+**Effort-P plugins should be able to REGISTER a lens.** A Lua plugin that dims every word over three
+syllables, or highlights dialogue attributions, or marks every sentence over 30 words, *is a lens* —
+and that plugin story is only tellable if there is one seam to register into. This is the same
+registration-seam discipline the module-structure rule already mandates (a new lens is a new row, not
+an edit to a hub).
+
+### Open questions for the brainstorm
+
+- Two axes (1 layout × N style) vs a flat exclusive cycle vs a flat composable set. (Leaning: two axes.)
+- Relationship to the existing `RenderMode` cycle — is a layout lens a fifth `RenderMode`, or a
+  separate orthogonal axis? (S6 must answer this either way.)
+- Command-surface conformance: multi-state option ⇒ set-per-state primitives + a cycle (law:
+  `docs/design/command-surface-contract.md`). N style lenses = N toggles + ...what in the menu?
+- Attribution: when several lenses paint the same span, who wins, and can the writer tell which lens
+  said what? (`render_status.rs` already does provider attribution — `REVIEW · Harper`.)
+- Config namespace and persistence.

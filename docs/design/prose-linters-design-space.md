@@ -362,3 +362,59 @@ never blocks the spine on the deferred dynamic-menu or plugin-server work.
    what are the arg/output/time caps? (Resource-bound + no-silent-UI apply; the security posture is the call.)
 8. **Is any plugin-declared-server in the initial scope, or purely native config for the 3 core engines?**
    *Recommend native for the core three; plugin-declared-server deferred to effort (e).*
+
+---
+
+## ⚠ Cross-effort input, added 2026-07-12 — read before hardening the provider/view surface
+
+Two decisions taken on the **prose-structure arc** (`docs/design/prose-structure-arc.md`, backlog
+items S5–S8) land directly on this effort's design surface. Neither invalidates the multi-provider
+plan; both constrain it.
+
+### 1. Lens is now a first-class product concept — and this effort is its first implementer (E8)
+
+Three efforts are each about to build their own "show the writer something about their prose"
+surface: **diagnostic lenses** (harper/ltex/vale — *this doc*), **structural lenses** (S6 —
+ventilate-as-a-view + rhythm gutter), and **stylistic lenses** (S8 — POS X-rays: adverbs dimmed,
+passives underlined). They are one thing. **E8** files the unifying surface; **S6 and S8
+`depends_on` it.** E7 (the Analysis view) was the first lens, shipped before the category had a name.
+
+**The load-bearing constraint for THIS effort:**
+
+> **The provider seam must NOT assume "provider == LSP subprocess."**
+
+`diag_provider.rs` already describes itself as "Open-Closed insurance for provider #2" — but
+providers #2 and #3 (ltex, vale) are *also* LSP subprocesses, so an LSP-shaped assumption will not be
+caught by adding them. **S8's lens is in-process, synchronous, and caret-local** (harper-brill POS
+over the caret's block window). If the trait, the config surface, the toggle/menu machinery, or the
+overlay/attribution layer bakes in a *process* / *whole-document* / *debounced* assumption, S8 must
+either fork the overlay layer or retrofit this seam.
+
+**And the axis distinction that decides the whole surface:** *style* lenses change how text is
+**painted** and therefore **compose** (diagnostics + POS simultaneously is coherent); *layout* lenses
+change what is **drawn** and are therefore **exclusive** (S6's ventilate view re-breaks rows). A
+single cycle cannot express both; neither can a single checkbox set. See E8's triage prose.
+
+### 2. `burn` is coming back into the binary (S7) — the dep-weight half of H2's rationale is partially spent
+
+**S7 adopts `harper-brill` in-process** for POS tagging + NP chunking (measured 2026-07-12: **+119
+activated crates, +0.95 MB binary, zero GPU backends compiled, zero `-sys`/FFI** — a far thinner
+slice than `harper-core`'s +389 crates / +16 MB / cubecl+CUDA).
+
+⚠ Note carefully: the **lockfile** lists 491 crates including `burn-cuda`, `cubecl-hip`, `burn-rocm`,
+`cudarc`. **That number is noise** — optional deps that never compile. Do not re-derive a dependency
+verdict from `Cargo.lock`.
+
+This does **not** argue for pulling `harper-core` back in-process (still +389 crates; its dictionary
+and rule corpus, not `burn` alone, are the bulk of that weight), and it does **not** argue against the
+subprocess model for *diagnostics* — harper-ls is wired, works, and stays. **But** §2's rationale for
+the split, stated as "drop the ~389-crate tensor stack from the binary," is **partially spent once S7
+lands**, because `burn` is then in the binary regardless. If the subprocess split is defended on
+dependency-weight grounds again, **re-measure; do not assume.** (Recorded in the H2 archive entry.)
+
+**What harper-ls structurally cannot do, and why S7 is not redundant with it:** the LSP wire carries
+`publishDiagnostics` and `codeAction` — ranges, messages, edits. **There is no LSP method that returns
+a parse.** So no seam design here can feed POS tags to a caret-local text object. Diagnostics and text
+objects are genuinely different consumers separated by a process boundary. The two efforts are
+**independent** — different engines, different process models, different latency budgets — and should
+neither wait for nor merge with each other. They meet only at the **view** layer, which is E8.
