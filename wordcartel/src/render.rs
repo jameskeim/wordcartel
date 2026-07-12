@@ -539,18 +539,12 @@ fn gather_row_ctx(editor: &Editor) -> RowCtx<'_> {
         }
     };
 
-    // Diagnostic overlay: check version validity once before the row loop.
-    // diag_active = true iff the stored diagnostics were computed for the current
-    // document version (and are non-empty). When false, diag_all is empty.
-    // Interim: Harper is the only source ever painted (Task 6 swaps this to the switchable lens).
-    let diag_active = crate::diagnostics_run::should_show_diagnostics(editor)
-        && editor.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper)
-            .is_some_and(|s| s.valid_for(editor.active().document.version));
+    // Diagnostic overlay: the switchable lens (Task 6) — `active_lens_diags` is the single source
+    // of truth for "computed for the current version, non-empty, and from the active lens engine";
+    // everything downstream (windowing, face-by-kind) is unchanged, just fed from the lens slice.
     let diag_all: &[wordcartel_core::diagnostics::Diagnostic] =
-        if diag_active {
-            editor.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper)
-                .map_or(&[][..], |s| s.diagnostics.as_slice())
-        } else { &[] };
+        crate::diagnostics_run::active_lens_diags(editor).unwrap_or(&[]);
+    let diag_active = !diag_all.is_empty();
 
     // Snapshot primary selection (Task 9: selection painting).
     let sel_range = editor.active().document.selection.primary();

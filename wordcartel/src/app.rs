@@ -693,6 +693,11 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             dictionary: cfg.diagnostics.dictionary.clone(),
             max_file_length: crate::limits::HARPER_MAX_FILE_LENGTH,
         })), true);
+    // Task 6 (SPINE §8.1): seed the switchable lens to the first ENABLED source (install order =
+    // lens-cycle/core-catalog order), falling back to Harper when nothing is enabled — the field
+    // already defaults to Harper, so this only reassigns when a different source leads.
+    editor.active_analysis_source = editor.diag_providers.enabled_sources().next()
+        .unwrap_or(wordcartel_core::diagnostics::DiagSource::Harper);
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
     let executor = crate::jobs::ThreadExecutor::new(wake_tx);
     let clip_env = crate::clipboard::clip_env_from_process();

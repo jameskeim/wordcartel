@@ -459,23 +459,16 @@ impl Registry {
         });
 
         // Diagnostics — quick-fix overlay + navigation + recheck (Task 6–7 / Effort 5f).
-        // Interim: every handler reads the Harper slot only (Task 6 swaps this to the
-        // switchable lens over whichever source is active).
+        // Each handler reads through active_lens_diags (Task 6): whichever engine is the active
+        // lens, gated on Review/show + that slot's version validity — the single source of truth
+        // for "what the lens shows".
         r.register("quick_fix", "Quick Fix\u{2026}", None, |c| {
-            if !crate::diagnostics_run::should_show_diagnostics(c.editor) {
+            let Some(diags) = crate::diagnostics_run::active_lens_diags(c.editor) else {
                 c.editor.status = "no diagnostic here".into();
                 return CommandResult::Handled;
-            }
-            let b = c.editor.active();
-            if !b.diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper)
-                .is_some_and(|s| s.valid_for(b.document.version))
-            {
-                c.editor.status = "no diagnostic here".into();
-                return CommandResult::Handled;
-            }
+            };
             let caret = c.editor.active().document.selection.primary().head;
-            let diag = c.editor.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper)
-                .expect("valid_for above requires a slot").diagnostics.iter()
+            let diag = diags.iter()
                 .find(|d| d.range.start <= caret && caret <= d.range.end)
                 .cloned();
             if let Some(d) = diag {
@@ -486,17 +479,9 @@ impl Registry {
             CommandResult::Handled
         });
         r.register("diag_next", "Next Diagnostic", None, |c| {
-            if !crate::diagnostics_run::should_show_diagnostics(c.editor) {
+            let Some(diags) = crate::diagnostics_run::active_lens_diags(c.editor) else {
                 return CommandResult::Handled;
-            }
-            let b = c.editor.active();
-            if !b.diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper)
-                .is_some_and(|s| s.valid_for(b.document.version))
-            {
-                return CommandResult::Handled;
-            }
-            let diags = c.editor.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper)
-                .expect("valid_for above requires a slot").diagnostics.clone();
+            };
             if diags.is_empty() { return CommandResult::Handled; }
             let caret = c.editor.active().document.selection.primary().to();
             let target = diags.iter()
@@ -511,17 +496,9 @@ impl Registry {
             CommandResult::Handled
         });
         r.register("diag_prev", "Previous Diagnostic", None, |c| {
-            if !crate::diagnostics_run::should_show_diagnostics(c.editor) {
+            let Some(diags) = crate::diagnostics_run::active_lens_diags(c.editor) else {
                 return CommandResult::Handled;
-            }
-            let b = c.editor.active();
-            if !b.diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper)
-                .is_some_and(|s| s.valid_for(b.document.version))
-            {
-                return CommandResult::Handled;
-            }
-            let diags = c.editor.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper)
-                .expect("valid_for above requires a slot").diagnostics.clone();
+            };
             if diags.is_empty() { return CommandResult::Handled; }
             let caret = c.editor.active().document.selection.primary().to();
             let last = diags.len() - 1;

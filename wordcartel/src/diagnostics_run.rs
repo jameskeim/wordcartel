@@ -92,6 +92,20 @@ pub fn should_run_diagnostics(editor: &Editor) -> bool {
 /// role (compute vs paint); delegates so the two cannot drift.
 pub fn should_show_diagnostics(editor: &Editor) -> bool { should_run_diagnostics(editor) }
 
+/// The single source of truth for "what the switchable lens shows" (spec §8.2): the active
+/// buffer's diagnostics for `editor.active_analysis_source`, but only when the Review/show gate
+/// passes AND that source's slot is `valid_for` the current document version — i.e. exactly the
+/// slice `render`'s underline painter and the quick-fix/nav commands are allowed to act on. Every
+/// other engine's slot stays computed but invisible until the lens is switched onto it (the
+/// locked never-merge decision: one source painted at a time).
+pub fn active_lens_diags(editor: &Editor) -> Option<&[Diagnostic]> {
+    if !should_show_diagnostics(editor) { return None; }
+    let b = editor.active();
+    b.diagnostics.slot(editor.active_analysis_source)
+        .filter(|s| s.valid_for(b.document.version))
+        .map(|s| s.diagnostics.as_slice())
+}
+
 /// The single diagnostics re-arm seam (spec §2.2 item 1). After a `reduce` message, if the SAME
 /// buffer is still active AND its document.version advanced since the pre-dispatch snapshot, arm the
 /// debounced recheck — but only when in Review with checking enabled. Wraps every `reduce` exit path
@@ -627,6 +641,44 @@ mod tests {
         apply_diagnostics_done(&mut e, id, v, DiagSource::Plugin("mock"), vec![mock]);
         assert!(e.active().diagnostics.slot(DiagSource::Plugin("mock")).is_none(),
             "disabled source: result dropped and phantom slot removed");
+    }
+
+    // ------------------------------------------------------------------
+    // Task 6 (SPINE): the switchable analysis lens — active_lens_diags.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn active_lens_diags_follows_the_lens() {
+        let mut e = review_editor("teh cat\n");
+        e.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Harper)), true);
+        e.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Plugin("mock"))), true);
+        let v = e.active().document.version;
+        let hs = e.active_mut().diagnostics.slot_mut(DiagSource::Harper);
+        hs.diagnostics = vec![spelling(0..3)]; hs.computed_version = v;
+        let ms = e.active_mut().diagnostics.slot_mut(DiagSource::Plugin("mock"));
+        ms.diagnostics = vec![grammar(4..7)]; ms.computed_version = v;
+        assert_eq!(active_lens_diags(&e).unwrap().len(), 1);
+        assert_eq!(active_lens_diags(&e).unwrap()[0].kind, DiagnosticKind::Spelling); // default lens = Harper
+        e.set_analysis_source(DiagSource::Plugin("mock"));
+        assert_eq!(active_lens_diags(&e).unwrap()[0].kind, DiagnosticKind::Grammar);
+    }
+
+    #[test]
+    fn active_lens_diags_none_outside_review_and_when_slot_stale() {
+        let mut e = review_editor("teh\n");
+        e.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Harper)), true);
+        let v = e.active().document.version;
+        let hs = e.active_mut().diagnostics.slot_mut(DiagSource::Harper);
+        hs.diagnostics = vec![spelling(0..3)]; hs.computed_version = v;
+        assert!(active_lens_diags(&e).is_some(), "Review + valid slot: Some");
+        e.active_mut().view.mode = RenderMode::LivePreview;
+        assert!(active_lens_diags(&e).is_none(), "outside Review: None regardless of slot validity");
+        e.active_mut().view.mode = RenderMode::Review;
+        e.active_mut().document.version += 1; // edited since compute → stale
+        assert!(active_lens_diags(&e).is_none(), "stale slot: None");
     }
 
     #[test]

@@ -15,18 +15,20 @@ pub(crate) fn status_left_text(editor: &Editor) -> String {
     let count = editor.buffers.len();
     let name = crate::workspace::buffer_display_name(editor, editor.active().id);
     let head = format!("[{idx}/{count}] {name}");
-    // Effort A: the Review label gains provider attribution (`REVIEW · Harper`) only when the
-    // provider is *live* (Ready) — Idle/Starting/Unavailable all show plain `REVIEW`, so the label
-    // asserts a working checker (spec §10). One mutex read, behind the Review arm only.
+    // Task 6 (SPINE §8.3): the Review label follows the switchable lens, gaining attribution
+    // (`REVIEW · <lens>`) only when the LENS engine is *live* (Ready) — Idle/Starting/Unavailable
+    // all show plain `REVIEW`, so the label asserts a working checker for whichever engine is
+    // actually being shown (spec §10). One mutex read, behind the Review arm only.
     let mode_text: std::borrow::Cow<'static, str> = match editor.active().view.mode {
         crate::editor::RenderMode::LivePreview => "PREVIEW".into(),
         crate::editor::RenderMode::SourceHighlighted => "SRC-HI".into(),
         crate::editor::RenderMode::SourcePlain => "SOURCE".into(),
-        crate::editor::RenderMode::Review =>
-            if editor.diag_providers.availability(wordcartel_core::diagnostics::DiagSource::Harper)
-                == Some(crate::diag_provider::Availability::Ready) {
-                format!("REVIEW · {}", wordcartel_core::diagnostics::DiagSource::Harper.label()).into()
-            } else { "REVIEW".into() },
+        crate::editor::RenderMode::Review => {
+            let lens = editor.active_analysis_source;
+            if editor.diag_providers.availability(lens) == Some(crate::diag_provider::Availability::Ready) {
+                format!("REVIEW · {}", lens.label()).into()
+            } else { "REVIEW".into() }
+        }
     };
     let mut text = if editor.status.is_empty() {
         format!("{head} [{mode_text}]")
@@ -164,5 +166,23 @@ mod tests {
             "Starting → plain REVIEW");
         assert!(!crate::render_status::status_left_text(&e2).contains("·"),
             "no attribution dot when not Ready");
+    }
+
+    /// Task 6 (SPINE §8.3): the Review label follows the switchable lens, not always Harper.
+    #[test]
+    fn status_line_review_label_follows_the_lens() {
+        use crate::diag_provider::{RecordingProvider, Availability};
+        use wordcartel_core::diagnostics::DiagSource;
+        let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        e.active_mut().view.mode = crate::editor::RenderMode::Review;
+        e.diag_providers.install(Box::new(RecordingProvider::new()
+            .with_source(DiagSource::Harper).with_availability(Availability::Ready)), true);
+        e.diag_providers.install(Box::new(RecordingProvider::new()
+            .with_source(DiagSource::Plugin("mock")).with_availability(Availability::Ready)), true);
+        assert!(crate::render_status::status_left_text(&e).contains("[REVIEW · Harper]"),
+            "default lens = Harper");
+        e.set_analysis_source(DiagSource::Plugin("mock"));
+        assert!(crate::render_status::status_left_text(&e).contains("[REVIEW · mock]"),
+            "lens switched: label follows");
     }
 }
