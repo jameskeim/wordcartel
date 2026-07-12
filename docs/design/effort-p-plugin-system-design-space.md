@@ -1,5 +1,12 @@
 # Effort P — in-process Lua plugin system: design space (pre-spec exploration)
 
+> **⚠ SUPERSEDED (2026-07-11).** This doc's *decomposition* (an old P0→P3 4-phase slicing) and its
+> *fork conclusions* are **no longer authoritative** — they were replaced by a grounding-first,
+> independently-authored architecture. **Authoritative now:** `docs/design/effort-p-grounding.md`
+> (the factual base) + Fable's independent 3-phase proposal (P1 commands+reads+edits → P2
+> events/config/reload → P3 async/timers) + the per-phase specs under `docs/superpowers/specs/`.
+> Retained only for the fork-exploration history and the Neovim mechanics detail.
+
 **Status:** DESIGN-SPACE / pre-spec (2026-07-08). NOT law, NOT an approved spec — this grounds the
 eventual Effort-P brainstorm; every fork below is an open decision for that brainstorm, not a
 commitment. Effort P is a significant effort — **not** the 1.0 capstone (corrected 2026-07-11; see
