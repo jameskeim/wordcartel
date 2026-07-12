@@ -1353,6 +1353,26 @@ policy + duplicate/banned-crate checks), and decide whether to wire it as a CI g
 as the pre-P dependency pass, but on a distinct axis — H2 = build-time weight, H18 = vulnerabilities /
 licenses. Forks: audit-only vs a full `deny` policy; gate vs advisory. Anchors: `Cargo.lock`, H2.
 
+### H17 — Pre-P public-API doc-coverage sweep
+<!-- item: H17 -->
+
+**Shipped (2026-07-11, merge 11408b8):** documented all **237** undocumented public items in
+`wordcartel-core` and enabled `#![warn(missing_docs)]` on the crate root (teeth via the warning-free-build
+merge gate; `warn` not `deny`). Last of the pre-Effort-P sequence (A → B → H17). Calibrated pipeline:
+Codex-gated spec + plan, subagent-driven per-file doc tasks (cheapest-model implementers) + per-task
+doc-quality reviewers, single Codex pre-merge gate — no Fable. The review layer caught 3 real doc
+*inaccuracies* the compiler can't see (`History::last_evicted` reset timing; `commit_coalescing`
+`last_ms: now` vs `commit`'s `0`; `Diagnostic` sort/render misattribution), each fixed + re-reviewed.
+Scope was core-only — the shell crate's ~660 internal-`pub` items were deliberately deferred (a
+`pub → pub(crate)` visibility-tightening pass is the better home). Gates: missing_docs 0/0 (build +
+`test --no-run`, covering the `cfg(test)` `test_support` fields), workspace clippy clean, full suite + 8
+doctests green, smoke 9/9, Codex pre-merge GO.
+
+**Grounded (2026-07-10):** the house style requires a doc-comment on every public item, but coverage
+wasn't enforced — `wordcartel-core` exposed ~180+ undocumented `pub fn/struct/enum/trait/const/type`.
+Effort P exposes this surface to plugins, so it should be documented and kept documented;
+`#![warn(missing_docs)]` is a gate in the same spirit as the backlog drift gate and `module_budgets`.
+
 ### H12 — PTY smoke suite has no live-splash coverage (S9)
 <!-- item: H12 -->
 

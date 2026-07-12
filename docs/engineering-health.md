@@ -104,15 +104,3 @@ struct), `:493` (the impl), the `open_*` overlay family + shared setters.
 <!-- item: M9 -->
 
 M4-rest only ISOLATES its parse panic; a real upgrade is optional, low priority.
-
-## H17 — Pre-P public-API doc-coverage sweep
-<!-- item: H17 -->
-
-**Grounded (2026-07-10):** the house style requires a doc-comment on every public item, but coverage
-isn't enforced — `wordcartel-core` alone exposes ~180 `pub fn/struct/enum/trait/const/type`. **Effort P
-exposes this surface to plugins**, so it should be documented, and kept documented, before then.
-Direction: doc-comment the undocumented public items (params/returns/errors; a runnable `# Examples`
-block for non-obvious fns, per the CLAUDE.md "Docs" convention), then land `#![warn(missing_docs)]` (at
-least on `wordcartel-core`) so coverage can't regress — a gate in the same spirit as the backlog drift
-gate and `module_budgets`. Orthogonal to the god-object decompositions (no `depends_on`); do it anytime
-before Effort P. Mechanical, low-risk. Anchors: `wordcartel-core/src` public items; CLAUDE.md "Docs".

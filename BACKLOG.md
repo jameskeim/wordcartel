@@ -3,7 +3,7 @@
 
 # Backlog
 
-**21 open · 48 shipped · 1 dropped**
+**20 open · 49 shipped · 1 dropped**
 
 Blocking Effort P: **0**
 
@@ -13,7 +13,6 @@ Blocking Effort P: **0**
 |---|---|---|---|---|---|---|
 | M9 | Optional: upgrade/patch pulldown-cmark | watch | chore | S |  | M4-rest only ISOLATES its parse panic; a real upgrade is optional, low priority. |
 | B6 | Heading-glyph STYLE toggle | needs-design | feature | SM |  | Cycle shades / Nerd numerals / inverted numerals; default stays universal Shades. |
-| H17 | Pre-P public-API doc-coverage sweep | ready | debt | SM |  | Doc-comment public items (~180 in core alone) + enable #![warn(missing_docs)] as a gate; Effort P exposes this surface to plugins. |
 | S3 | Snapshots — durable revision checkpoints | needs-design | feature | SM |  | Capture/list/diff/restore; reuses rope snapshot + ChangeSet; one net-new display diff. |
 | S1 | Rearrangeable outline / heading-subtree corkboard | needs-design | feature | M |  | Structure mode: atomic heading-subtree move via submit_transaction; drag-reorder. |
 | S2 | Directory-as-binder | needs-design | feature | L |  | Directory of .md as a manuscript: ordered manifest + compile step (post-Effort-P plugin). |
@@ -35,12 +34,13 @@ Blocking Effort P: **0**
 
 ## Shipped
 
-<details><summary>48 shipped</summary>
+<details><summary>49 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
 | E7 | Grammar/spelling as a deliberate Analysis view (F1 RenderMode); draft stays quiet | 2026-07-11 | 17ba839 |
 | H12 | PTY smoke suite live-splash coverage (S9) | 2026-07-11 | 0dae170 |
+| H17 | Pre-P public-API doc-coverage sweep | 2026-07-11 | 11408b8 |
 | H18 | Supply-chain audit (cargo audit / cargo deny) | 2026-07-11 | ce403ac |
 | H2 | Interrogate the burn/harper dependency weight | 2026-07-11 | ce403ac |
 | H5 | App-managed cleanup of swap files / state-dir debris | 2026-07-11 | 0dae170 |

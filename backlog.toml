@@ -773,13 +773,15 @@ shipped_date = "2026-07-08"
 [[item]]
 id = "H17"
 title = "Pre-P public-API doc-coverage sweep"
-status = "ready"
+status = "shipped"
 kind = "debt"
 size = "SM"
 theme = "H"
 hook = "Doc-comment public items (~180 in core alone) + enable #![warn(missing_docs)] as a gate; Effort P exposes this surface to plugins."
-doc = "engineering-health.md#h17"
+doc = "backlog-archive.md#h17"
 created = "2026-07-10"
+shipped_commit = "11408b8"
+shipped_date = "2026-07-11"
 
 [[item]]
 id = "H18"
