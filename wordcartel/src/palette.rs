@@ -272,8 +272,10 @@ mod tests {
         let mut reg = crate::registry::Registry::builtins();
         let mut host = crate::plugin::host::PluginHost::new().expect("VM construction");
         let src = "wc.register_command{ name='insert', label='Plugin Insert', fn=function() end }";
-        let reports =
-            crate::plugin::load::load_sources(&mut reg, &mut host, &[("p1demo".to_string(), src.to_string())]);
+        let reports = crate::plugin::load::load_sources(
+            &mut reg, &mut host, &[("p1demo".to_string(), src.to_string())],
+            &std::collections::BTreeMap::new(), &mut Vec::new(),
+        );
         assert_eq!(reports[0].result, Ok(1), "test plugin must load cleanly: {:?}", reports[0].result);
         let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
         let mut p = Palette::default();

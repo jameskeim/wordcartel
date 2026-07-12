@@ -47,6 +47,14 @@ pub const PLUGIN_MAX_STATUS_LEN: usize = 4096;
 /// any real plugin script (plugin files are user CODE, not documents); an oversize file is
 /// skipped + named in the returned report, never truncated or silently dropped.
 pub const PLUGIN_MAX_SOURCE_BYTES: u64 = 1024 * 1024;
+/// Max nesting depth converted from `[plugins.config.<name>]` into a Lua table.
+pub const PLUGIN_MAX_CONFIG_DEPTH: usize = 8;
+/// Max total nodes (keys + values) converted from one plugin's config table.
+pub const PLUGIN_MAX_CONFIG_NODES: usize = 1024;
+/// Max byte length of any single config string VALUE or table KEY — the pre-allocation byte
+/// bound (resource-bound LAW) that depth+node counts miss: `config::load` reads the source
+/// unbounded, so one giant string/key must be rejected BEFORE `lua.create_string` allocates it.
+pub const PLUGIN_MAX_CONFIG_STR: usize = 64 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -60,5 +68,8 @@ mod tests {
         assert_eq!(PLUGIN_MAX_LABEL_LEN, 256);
         assert_eq!(PLUGIN_MAX_STATUS_LEN, 4096);
         assert_eq!(PLUGIN_MAX_SOURCE_BYTES, 1024 * 1024);
+        assert_eq!(PLUGIN_MAX_CONFIG_DEPTH, 8);
+        assert_eq!(PLUGIN_MAX_CONFIG_NODES, 1024);
+        assert_eq!(PLUGIN_MAX_CONFIG_STR, 64 * 1024);
     }
 }

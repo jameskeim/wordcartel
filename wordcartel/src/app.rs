@@ -638,12 +638,20 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     } else {
         match crate::plugin::host::PluginHost::new() {
             Ok(mut h) => {
-                if let Some(plugins_dir) = xdg.as_deref().map(|x| x.join("wordcartel").join("plugins")) {
+                // [plugins] dir (P2 Task 5) overrides the default XDG-derived scan root; a
+                // missing/unresolvable XDG config dir with no override set is surfaced as a
+                // warning (not a silent skip — no-silent-UI), since a resolvable config dir is
+                // the overwhelmingly common case and its absence is worth the user's attention.
+                let plugins_dir = cfg.plugins.dir.clone()
+                    .or_else(|| xdg.as_deref().map(|x| x.join("wordcartel").join("plugins")));
+                if let Some(plugins_dir) = plugins_dir {
                     let disc = crate::plugin::load::discover(&plugins_dir, &cfg.plugins.disable);
                     for r in disc.skipped {
                         warns.push(format!("plugin {} skipped: {}", r.plugin, r.result.err().unwrap_or_default()));
                     }
-                    for r in crate::plugin::load::load_sources(&mut reg, &mut h, &disc.sources) {
+                    for r in crate::plugin::load::load_sources(
+                        &mut reg, &mut h, &disc.sources, &cfg.plugins.config, &mut warns,
+                    ) {
                         if let Err(e) = &r.result {
                             warns.push(format!("plugin {}: {e}", r.plugin));
                         }
@@ -655,6 +663,15 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
                     if !h.has_vm() {
                         warns.push("plugins disabled: VM exhausted during load".to_string());
                     }
+                } else {
+                    // Missing/unresolvable XDG config dir with no [plugins] dir override —
+                    // surfaced as a warning (not a silent skip — no-silent-UI): a resolvable
+                    // config dir is the overwhelmingly common case, so its absence is worth
+                    // the user's attention.
+                    warns.push(
+                        "plugins: no plugins directory available (config dir unresolved); \
+                         set [plugins] dir to override".to_string(),
+                    );
                 }
                 h
             }

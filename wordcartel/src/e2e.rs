@@ -113,7 +113,9 @@ impl Harness {
         let mut host = PluginHost::new().expect("VM construction");
         let srcs: Vec<(String, String)> =
             sources.iter().map(|(stem, src)| (stem.to_string(), src.to_string())).collect();
-        for report in crate::plugin::load::load_sources(&mut reg, &mut host, &srcs) {
+        for report in crate::plugin::load::load_sources(
+            &mut reg, &mut host, &srcs, &std::collections::BTreeMap::new(), &mut Vec::new(),
+        ) {
             assert!(report.result.is_ok(), "test plugin must load cleanly: {:?}", report.result);
         }
         let (keymap, _warn) = keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);

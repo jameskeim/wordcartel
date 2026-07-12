@@ -8,6 +8,7 @@
 pub mod host;
 pub mod api;
 pub mod load;
+pub mod settings;
 
 use std::cell::RefCell;
 use std::collections::HashSet;

@@ -14,10 +14,11 @@ use wordcartel_core::selection::Selection;
 use crate::plugin::host::{Bridge, PendingReg};
 use crate::registry::menu_from_str;
 
-/// Fetch the shared `wc` global table, creating it on first use. Idempotent across the two
-/// installers that share it — `install_registration` (load time) and `install_editor_api`
-/// (callback time, below).
-fn wc_table(lua: &mlua::Lua) -> mlua::Result<mlua::Table> {
+/// Fetch the shared `wc` global table, creating it on first use. Idempotent across the
+/// installers that share it — `install_registration` (load time), `install_editor_api`
+/// (callback time, below), and `plugin::settings::install_config` (a sibling module — hence
+/// `pub(crate)`, not module-private).
+pub(crate) fn wc_table(lua: &mlua::Lua) -> mlua::Result<mlua::Table> {
     match lua.globals().get::<Option<mlua::Table>>("wc")? {
         Some(t) => Ok(t),
         None => {
@@ -167,7 +168,16 @@ pub(crate) fn install_editor_api(lua: &mlua::Lua, bridge: &Bridge) -> mlua::Resu
     install_set_selection(lua, &wc, bridge)?;
     install_status(lua, &wc, bridge)?;
     install_registration_closed(lua, &wc)?;
+    install_config_cleared(&wc)?;
     Ok(())
+}
+
+/// Clear `wc.config` to nil at the load→callback-phase boundary (mirrors
+/// [`install_registration_closed`], the same-shaped guard on the other half of `wc`): the
+/// last-loaded plugin's config table must not linger on the shared `wc` global for callbacks —
+/// a plugin that wants its config at callback time must capture it in a Lua local at load.
+fn install_config_cleared(wc: &mlua::Table) -> mlua::Result<()> {
+    wc.set("config", mlua::Value::Nil)
 }
 
 /// Overwrite `wc.register_command` with a stub that always raises a typed Lua error — the

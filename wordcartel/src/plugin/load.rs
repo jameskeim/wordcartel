@@ -8,7 +8,7 @@
 //! and reverts the `Registry` to builtins-only.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -140,10 +140,18 @@ pub enum LoadFailure {
 /// Every host→Lua entry point is wrapped in [`crate::panicx::catch`] — the Task 1 spike found
 /// `mlua` does NOT convert a Rust panic to an `Err` at the call site (it resumes the raw
 /// panic), so `catch_unwind` here is the SOLE backstop, not a redundant one.
+///
+/// `config_map` is each plugin's `[plugins.config.<name>]` TOML table, looked up by stem —
+/// installed as `wc.config` for that plugin's own load (P2 Task 5). An over-cap config value
+/// (depth/nodes/byte — `plugin::settings::config_to_lua`) does not fail the plugin: it degrades
+/// to `wc.config = nil` plus a warning pushed onto `warns`, the caller-owned channel this
+/// function already shares with skipped/failed plugins.
 pub fn load_sources(
     reg: &mut Registry,
     host: &mut PluginHost,
     sources: &[(String, String)],
+    config_map: &BTreeMap<String, toml::Value>,
+    warns: &mut Vec<String>,
 ) -> Vec<LoadReport> {
     if host.lua().is_none() {
         return Vec::new();
@@ -152,7 +160,8 @@ pub fn load_sources(
     let mut fatal = false;
     for (stem_raw, src) in sources {
         let lua = host.lua().expect("checked above"); // per-iteration borrow, released before loop end
-        let outcome = crate::panicx::catch(|| load_one(reg, lua, stem_raw, src))
+        let config = config_map.get(stem_raw.as_str());
+        let outcome = crate::panicx::catch(|| load_one(reg, lua, stem_raw, src, config, warns))
             .unwrap_or_else(|panic_msg| Err(LoadFailure::Validation(panic_msg)));
         match outcome {
             Ok(n) => reports.push(LoadReport { plugin: stem_raw.clone(), result: Ok(n) }),
@@ -216,7 +225,20 @@ fn load_budget() -> std::time::Duration {
 ///    for every committed entry. The preflight already ruled out the sole possible `Duplicate`,
 ///    so a stray `Err` there would be a logic bug, not a plugin-author mistake — an `.expect`
 ///    documents that invariant.
-fn load_one(reg: &mut Registry, lua: &mlua::Lua, stem_raw: &str, src: &str) -> Result<usize, LoadFailure> {
+///
+/// Between registration and exec, installs `wc.config` (P2 Task 5) from `config` — the
+/// plugin's own `[plugins.config.<stem>]` TOML table, or `None` if it has none. Converting it
+/// (`plugin::settings::config_to_lua`) can fail on the depth/nodes/byte caps; that failure does
+/// NOT abort the plugin — it pushes a warning onto `warns` and installs `wc.config = nil`
+/// instead, so an over-cap config degrades gracefully rather than losing the plugin's commands.
+fn load_one(
+    reg: &mut Registry,
+    lua: &mlua::Lua,
+    stem_raw: &str,
+    src: &str,
+    config: Option<&toml::Value>,
+    warns: &mut Vec<String>,
+) -> Result<usize, LoadFailure> {
     if stem_raw.len() > PLUGIN_MAX_STEM_LEN {
         return Err(LoadFailure::Validation(format!(
             "plugin stem too long ({} bytes, max {PLUGIN_MAX_STEM_LEN})",
@@ -228,6 +250,19 @@ fn load_one(reg: &mut Registry, lua: &mlua::Lua, stem_raw: &str, src: &str) -> R
     // `stem` is OWNED into the closure now; set_name/collision-check take &str, so nothing
     // before commit needs &'static (the stem intern moved into the commit phase below).
     crate::plugin::api::install_registration(lua, stem_raw.to_owned(), sink.clone(), count.clone())
+        .map_err(|e| LoadFailure::Validation(format!("plugin {stem_raw}: {e}")))?;
+    let cfg_value = match config {
+        Some(v) => match crate::plugin::settings::config_to_lua(lua, v) {
+            Ok(lv) => lv,
+            Err(reason) => {
+                // over-cap → nil, plugin STILL loads, but WARN loudly.
+                warns.push(format!("plugin {stem_raw}: [plugins.config.{stem_raw}] ignored — {reason}"));
+                mlua::Value::Nil
+            }
+        },
+        None => mlua::Value::Nil,
+    };
+    crate::plugin::settings::install_config(lua, cfg_value)
         .map_err(|e| LoadFailure::Validation(format!("plugin {stem_raw}: {e}")))?;
     crate::plugin::host::with_time_guard(lua, load_budget(), || lua.load(src).set_name(stem_raw).exec())
         .map_err(|e| LoadFailure::Validation(format!("plugin {stem_raw}: {e}")))?;
@@ -291,6 +326,7 @@ mod tests {
         let reports = load_sources(
             &mut reg, &mut host,
             &sources(&[("runaway", runaway), ("good", good)]),
+            &BTreeMap::new(), &mut Vec::new(),
         );
         LOAD_BUDGET_OVERRIDE.with(|c| c.set(None)); // disarm defensively — no cross-test leak
         assert_eq!(reports.len(), 2);
@@ -381,7 +417,7 @@ mod tests {
         let mut reg = Registry::builtins();
         let mut host = PluginHost::new().unwrap();
         let src = "wc.register_command{ name='hello', label='Hello', fn=function() end }";
-        let reports = load_sources(&mut reg, &mut host, &sources(&[("greet", src)]));
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("greet", src)]), &BTreeMap::new(), &mut Vec::new());
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].result, Ok(1));
         let id = reg.resolve_name("greet.hello").expect("registered");
@@ -399,7 +435,7 @@ mod tests {
         let mut reg = Registry::builtins();
         let mut host = PluginHost::new().unwrap();
         let src = "wc.register_command{ name='insert', label='Insert', fn=function() end }";
-        load_sources(&mut reg, &mut host, &sources(&[("date", src)]));
+        load_sources(&mut reg, &mut host, &sources(&[("date", src)]), &BTreeMap::new(), &mut Vec::new());
         assert!(reg.resolve_name("date.insert").is_some());
         assert!(reg.resolve_name("insert").is_none());
     }
@@ -411,7 +447,7 @@ mod tests {
         let mut host = PluginHost::new().unwrap();
         let long = "a".repeat(crate::limits::PLUGIN_MAX_NAME_LEN + 1);
         let src = format!("wc.register_command{{ name='{long}', label='L', fn=function() end }}");
-        let reports = load_sources(&mut reg, &mut host, &sources(&[("p", &src)]));
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("p", &src)]), &BTreeMap::new(), &mut Vec::new());
         assert!(reports[0].result.is_err());
         assert_eq!(reg.commands().count(), before, "nothing interned into the registry");
     }
@@ -423,7 +459,7 @@ mod tests {
         let mut host = PluginHost::new().unwrap();
         let long = "a".repeat(crate::limits::PLUGIN_MAX_LABEL_LEN + 1);
         let src = format!("wc.register_command{{ name='x', label='{long}', fn=function() end }}");
-        let reports = load_sources(&mut reg, &mut host, &sources(&[("p", &src)]));
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("p", &src)]), &BTreeMap::new(), &mut Vec::new());
         assert!(reports[0].result.is_err());
         assert_eq!(reg.commands().count(), before);
     }
@@ -435,7 +471,7 @@ mod tests {
         let mut host = PluginHost::new().unwrap();
         let long_stem = "s".repeat(crate::limits::PLUGIN_MAX_STEM_LEN + 1);
         let src = "wc.register_command{ name='x', label='X', fn=function() end }";
-        let reports = load_sources(&mut reg, &mut host, &sources(&[(&long_stem, src)]));
+        let reports = load_sources(&mut reg, &mut host, &sources(&[(&long_stem, src)]), &BTreeMap::new(), &mut Vec::new());
         assert!(reports[0].result.is_err());
         assert_eq!(reg.commands().count(), before);
     }
@@ -448,7 +484,7 @@ mod tests {
         let src = "for i=1,257 do \
                        wc.register_command{ name='cmd'..i, label='L'..i, fn=function() end } \
                    end";
-        let reports = load_sources(&mut reg, &mut host, &sources(&[("many", src)]));
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("many", src)]), &BTreeMap::new(), &mut Vec::new());
         assert!(reports[0].result.is_err());
         assert_eq!(reg.commands().count(), before, "nothing interned into the registry");
     }
@@ -459,7 +495,7 @@ mod tests {
         let before = reg.commands().count();
         let mut host = PluginHost::new().unwrap();
         let src = "wc.register_command{ name='x', label='X', menu='Nonsense', fn=function() end }";
-        let reports = load_sources(&mut reg, &mut host, &sources(&[("p", src)]));
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("p", src)]), &BTreeMap::new(), &mut Vec::new());
         assert!(reports[0].result.is_err());
         assert_eq!(reg.commands().count(), before);
     }
@@ -469,7 +505,7 @@ mod tests {
         let mut reg = Registry::builtins();
         let mut host = PluginHost::new().unwrap();
         let src = "wc.register_command{ name='x', label='X', menu='Edit', fn=function() end }";
-        let reports = load_sources(&mut reg, &mut host, &sources(&[("p", src)]));
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("p", src)]), &BTreeMap::new(), &mut Vec::new());
         assert_eq!(reports[0].result, Ok(1));
         let id = reg.resolve_name("p.x").unwrap();
         assert_eq!(reg.meta(id).unwrap().menu, Some(MenuCategory::Edit));
@@ -483,6 +519,7 @@ mod tests {
         let reports = load_sources(
             &mut reg, &mut host,
             &sources(&[("p", src), ("p", src)]),
+            &BTreeMap::new(), &mut Vec::new(),
         );
         assert_eq!(reports.len(), 2);
         assert_eq!(reports[0].result, Ok(1));
@@ -498,7 +535,7 @@ mod tests {
         // Same plugin, same name registered twice — a self-collision within one exec pass.
         let src = "wc.register_command{ name='x', label='X1', fn=function() end }\n\
                    wc.register_command{ name='x', label='X2', fn=function() end }";
-        let reports = load_sources(&mut reg, &mut host, &sources(&[("atomic", src)]));
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("atomic", src)]), &BTreeMap::new(), &mut Vec::new());
         assert!(reports[0].result.is_err());
         assert_eq!(reg.commands().count(), before, "neither command committed");
         assert!(reg.resolve_name("atomic.x").is_none());
@@ -513,6 +550,7 @@ mod tests {
         let reports = load_sources(
             &mut reg, &mut host,
             &sources(&[("bad", bad), ("good", good)]),
+            &BTreeMap::new(), &mut Vec::new(),
         );
         assert_eq!(reports.len(), 2);
         assert!(reports[0].result.is_err());
@@ -535,7 +573,7 @@ mod tests {
         // (see `intern_pool_contains`'s doc).
         let src = "wc.register_command{ name='x', label='X1', fn=function() end }\n\
                    wc.register_command{ name='x', label='X2', fn=function() end }";
-        let reports = load_sources(&mut reg, &mut host, &sources(&[("atomic", src)]));
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("atomic", src)]), &BTreeMap::new(), &mut Vec::new());
         assert!(reports[0].result.is_err());
         assert_eq!(reg.commands().count(), commands_before, "nothing committed to the registry");
         assert!(
@@ -557,14 +595,14 @@ mod tests {
         let src_b = "wc.register_command{ name='cmd', label='B', fn=function() end }";
 
         // Plugin a loads and commits cleanly, in its own batch.
-        let reports_a = load_sources(&mut reg, &mut host, &sources(&[("a", src_a)]));
+        let reports_a = load_sources(&mut reg, &mut host, &sources(&[("a", src_a)]), &BTreeMap::new(), &mut Vec::new());
         assert_eq!(reports_a[0].result, Ok(1), "plugin a must commit cleanly before the fault fires");
         assert!(reg.resolve_name("a.cmd").is_some(), "a's command is live before b's fatal load");
 
         // Arm the fault seam — the NEXT fallible commit-phase write (plugin b's only pending
         // entry) synthesizes a VM-exhaustion error, deterministically, no real OOM needed.
         crate::plugin::host::FAIL_NEXT_COMMIT_WRITE.with(|c| c.set(true));
-        let reports_b = load_sources(&mut reg, &mut host, &sources(&[("b", src_b)]));
+        let reports_b = load_sources(&mut reg, &mut host, &sources(&[("b", src_b)]), &BTreeMap::new(), &mut Vec::new());
         assert!(reports_b[0].result.is_err(), "plugin b's commit-phase write is forced to fail");
 
         // The fatal revert is registry-WIDE (retain_builtins), not scoped to the failing batch —
@@ -572,5 +610,79 @@ mod tests {
         assert!(reg.resolve_name("a.cmd").is_none(), "a's entry must be gone too, not just b's");
         assert_eq!(reg.commands().count(), builtins_count, "registry is builtins-only after the revert");
         assert!(!host.has_vm(), "the VM must be nulled on a commit-time exhaustion");
+    }
+
+    #[test]
+    fn config_reaches_wc_config() {
+        // The load-time pattern a config-consuming plugin uses: capture `wc.config` into a Lua
+        // LOCAL at load (it is only valid during that plugin's own load — see api.rs's
+        // install_config_cleared), then read the captured local from inside the deferred
+        // register_command `fn`.
+        let src = "\
+            local cfg = wc.config\n\
+            wc.register_command{ name='check', label='Check', fn=function()\n\
+                if cfg == nil then RESULT = 'nil' else RESULT = tostring(cfg.min_words) end\n\
+            end }";
+
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().unwrap();
+        let mut config_map: BTreeMap<String, toml::Value> = BTreeMap::new();
+        let mut table = toml::map::Map::new();
+        table.insert("min_words".to_string(), toml::Value::Integer(100));
+        config_map.insert("withcfg".to_string(), toml::Value::Table(table));
+        let mut warns = Vec::new();
+        let reports = load_sources(
+            &mut reg, &mut host,
+            &sources(&[("withcfg", src), ("nocfg", src)]),
+            &config_map, &mut warns,
+        );
+        assert_eq!(reports[0].result, Ok(1));
+        assert_eq!(reports[1].result, Ok(1));
+        assert!(warns.is_empty());
+
+        let lua = host.lua().unwrap();
+        let id_with = reg.resolve_name("withcfg.check").unwrap();
+        let cb: mlua::Function =
+            lua.named_registry_value(&format!("wc-cmd-{}", id_with.0)).unwrap();
+        cb.call::<()>(()).unwrap();
+        assert_eq!(
+            lua.globals().get::<String>("RESULT").unwrap(), "100",
+            "withcfg's captured local reads back its [plugins.config.withcfg] value"
+        );
+
+        let id_no = reg.resolve_name("nocfg.check").unwrap();
+        let cb: mlua::Function =
+            lua.named_registry_value(&format!("wc-cmd-{}", id_no.0)).unwrap();
+        cb.call::<()>(()).unwrap();
+        assert_eq!(
+            lua.globals().get::<String>("RESULT").unwrap(), "nil",
+            "a plugin absent from config_map sees wc.config == nil"
+        );
+
+        // Over-cap config → the plugin still loads (its command registers), wc.config is nil,
+        // and load_sources warns loudly via the caller-owned `warns` channel.
+        let mut reg2 = Registry::builtins();
+        let mut host2 = PluginHost::new().unwrap();
+        let mut overcap_map: BTreeMap<String, toml::Value> = BTreeMap::new();
+        let long = "x".repeat(crate::limits::PLUGIN_MAX_CONFIG_STR + 1);
+        overcap_map.insert("overcap".to_string(), toml::Value::String(long));
+        let mut warns2 = Vec::new();
+        let reports2 = load_sources(
+            &mut reg2, &mut host2,
+            &sources(&[("overcap", src)]),
+            &overcap_map, &mut warns2,
+        );
+        assert_eq!(reports2[0].result, Ok(1), "plugin still loads despite an over-cap config");
+        assert_eq!(warns2.len(), 1, "an over-cap config warns loudly, not silently");
+        assert!(warns2[0].contains("overcap"), "{}", warns2[0]);
+        let lua2 = host2.lua().unwrap();
+        let id_overcap = reg2.resolve_name("overcap.check").unwrap();
+        let cb2: mlua::Function =
+            lua2.named_registry_value(&format!("wc-cmd-{}", id_overcap.0)).unwrap();
+        cb2.call::<()>(()).unwrap();
+        assert_eq!(
+            lua2.globals().get::<String>("RESULT").unwrap(), "nil",
+            "an over-cap config degrades to wc.config == nil, not a load failure"
+        );
     }
 }

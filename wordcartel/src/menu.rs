@@ -468,8 +468,10 @@ mod tests {
         let mut host = crate::plugin::host::PluginHost::new().expect("VM construction");
         let src = "wc.register_command{ name='a', label='Plugin Edit Thing', menu='Edit', fn=function() end }\n\
                    wc.register_command{ name='b', label='Plugin Palette Only', fn=function() end }";
-        let reports =
-            crate::plugin::load::load_sources(&mut reg, &mut host, &[("p1menu".to_string(), src.to_string())]);
+        let reports = crate::plugin::load::load_sources(
+            &mut reg, &mut host, &[("p1menu".to_string(), src.to_string())],
+            &std::collections::BTreeMap::new(), &mut Vec::new(),
+        );
         assert_eq!(reports[0].result, Ok(2), "test plugin must load cleanly: {:?}", reports[0].result);
         let a_id = reg.resolve_name("p1menu.a").expect("registered");
         let b_id = reg.resolve_name("p1menu.b").expect("registered");
@@ -505,8 +507,10 @@ mod tests {
         let mut reg = crate::registry::Registry::builtins();
         let mut host = crate::plugin::host::PluginHost::new().expect("VM construction");
         let src = "wc.register_command{ name='cmd', label='Plugin Bound', fn=function() end }";
-        let reports =
-            crate::plugin::load::load_sources(&mut reg, &mut host, &[("p1law7".to_string(), src.to_string())]);
+        let reports = crate::plugin::load::load_sources(
+            &mut reg, &mut host, &[("p1law7".to_string(), src.to_string())],
+            &std::collections::BTreeMap::new(), &mut Vec::new(),
+        );
         assert_eq!(reports[0].result, Ok(1), "test plugin must load cleanly: {:?}", reports[0].result);
         let id = reg.resolve_name("p1law7.cmd").expect("registered");
 
