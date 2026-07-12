@@ -4,12 +4,21 @@ use crate::change::ChangeSet;
 use crate::BytePos;
 use smallvec::{smallvec, SmallVec};
 
+/// A single selection: an `anchor` (fixed end) and a `head` (the end that moves,
+/// i.e. the cursor). `anchor == head` is a bare cursor with no selected text.
+/// `head` may fall before or after `anchor` — the range is not pre-normalized;
+/// callers read it in document order via [`Range::from`]/[`Range::to`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Range {
+    /// The fixed end of the selection — where the selection gesture began.
     pub anchor: BytePos,
+    /// The moving end of the selection — the cursor position.
     pub head: BytePos,
 }
 
+/// One or more [`Range`]s (multi-cursor selection), with one range designated
+/// `primary` — the range single-cursor UI (e.g. the status line) reports.
+/// Always holds at least one range; the empty selection does not exist.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Selection {
     ranges: SmallVec<[Range; 1]>,
@@ -17,15 +26,21 @@ pub struct Selection {
 }
 
 impl Range {
+    /// Create an empty range (a bare cursor) at `pos` — both `anchor` and `head` equal `pos`.
     pub fn point(pos: BytePos) -> Range {
         Range { anchor: pos, head: pos }
     }
+    /// The lower of `anchor`/`head` — the start of the range's `[from, to)` byte
+    /// span in document order, regardless of which direction it was drawn.
     pub fn from(&self) -> BytePos {
         self.anchor.min(self.head)
     }
+    /// The higher of `anchor`/`head` — the end of the range's `[from, to)` byte
+    /// span in document order, regardless of which direction it was drawn.
     pub fn to(&self) -> BytePos {
         self.anchor.max(self.head)
     }
+    /// `true` when `anchor == head` — the range selects no text and is a bare cursor.
     pub fn is_empty(&self) -> bool {
         self.anchor == self.head
     }
@@ -40,12 +55,20 @@ impl Range {
 }
 
 impl Selection {
+    /// Create a selection with a single empty range (a bare cursor) at `pos`.
     pub fn single(pos: BytePos) -> Selection {
         Selection { ranges: smallvec![Range::point(pos)], primary: 0 }
     }
+    /// Create a selection with a single range from `anchor` to `head` (either direction).
     pub fn range(anchor: BytePos, head: BytePos) -> Selection {
         Selection { ranges: smallvec![Range { anchor, head }], primary: 0 }
     }
+    /// The designated primary range among this selection's one or more ranges.
+    ///
+    /// Debug builds assert the primary index is in bounds, with a message naming
+    /// the offending index and range count; this is a self-consistency invariant
+    /// every constructor upholds, not a check on user input, so a release build
+    /// omits the assert and indexes directly.
     pub fn primary(&self) -> Range {
         debug_assert!(
             self.primary < self.ranges.len(),
@@ -55,6 +78,23 @@ impl Selection {
         );
         self.ranges[self.primary]
     }
+    /// Map every range in this selection through `cs` (see [`Range::map`]), keeping
+    /// cursor/selection positions valid across an edit — the mechanism that
+    /// prevents the "cursor jumped" bug class described in the module docs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wordcartel_core::selection::Selection;
+    /// use wordcartel_core::change::ChangeSet;
+    ///
+    /// // cursor at byte 5 in a 10-byte document; insert 2 bytes at byte 2
+    /// // (before the cursor) — the cursor must shift with the inserted text.
+    /// let sel = Selection::single(5);
+    /// let cs = ChangeSet::insert(2, "XY", 10);
+    /// let mapped = sel.map(&cs);
+    /// assert_eq!(mapped.primary().from(), 7);
+    /// ```
     pub fn map(&self, cs: &ChangeSet) -> Selection {
         Selection {
             ranges: self.ranges.iter().map(|r| r.map(cs)).collect(),

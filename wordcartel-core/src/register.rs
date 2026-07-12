@@ -5,29 +5,42 @@ use crate::change::ChangeSet;
 use crate::selection::Range;
 use crate::BytePos;
 
+/// An in-process clipboard slot. Holds at most one piece of text; `copy`/`cut`
+/// overwrite it, `paste` reads it without consuming it. `None` means the
+/// register has never been filled (or was constructed via [`Register::default`]).
 #[derive(Clone, Debug, Default)]
 pub struct Register {
+    /// The register's current contents, or `None` if it has never been filled.
     pub text: Option<String>,
 }
 
 impl Register {
+    /// Overwrite the register's contents with `text`.
     pub fn set(&mut self, text: String) {
         self.text = Some(text);
     }
+    /// Borrow the register's contents, or `None` if it is empty.
     pub fn get(&self) -> Option<&str> {
         self.text.as_deref()
     }
 }
 
+/// Copy the text spanned by `range` from `buf` into `reg`, leaving `buf` unmodified.
 pub fn copy(buf: &TextBuffer, range: Range, reg: &mut Register) {
     reg.set(buf.slice(range.from()..range.to()));
 }
 
+/// Copy the text spanned by `range` from `buf` into `reg` (like [`copy`]), then
+/// return a [`ChangeSet`] that deletes that same span from a document of length
+/// `doc_len`. The caller applies the returned changeset to actually remove the text.
 pub fn cut(range: Range, doc_len: usize, reg: &mut Register, buf: &TextBuffer) -> ChangeSet {
     reg.set(buf.slice(range.from()..range.to()));
     ChangeSet::delete(range.from()..range.to(), doc_len)
 }
 
+/// Build a [`ChangeSet`] that inserts the register's contents at byte offset `at`
+/// in a document of length `doc_len`. Returns `None` if the register is empty
+/// (nothing to paste); the caller applies the returned changeset to insert the text.
 pub fn paste(at: BytePos, doc_len: usize, reg: &Register) -> Option<ChangeSet> {
     reg.get().map(|t| ChangeSet::insert(at, t, doc_len))
 }

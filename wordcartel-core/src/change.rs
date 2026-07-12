@@ -4,15 +4,28 @@ use crate::buffer::TextBuffer;
 use crate::BytePos;
 use std::ops::Range;
 
+/// Small-string-optimized owned text used for `Op::Insert` payloads — a `String`
+/// alias that avoids a heap allocation for short inserts (the common per-keystroke case).
 pub type Tendril = smartstring::alias::String;
 
+/// One step of a [`ChangeSet`]: retain, delete, or insert a span of bytes.
+/// A `ChangeSet`'s ops consume the OLD document in order (`Retain`/`Delete` byte
+/// counts sum to `len_before`) while producing the NEW document (`Retain`/`Insert`
+/// bytes sum to `len_after`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
+    /// Copy forward the next `usize` bytes of the old document unchanged.
     Retain(usize), // bytes
+    /// Skip (remove) the next `usize` bytes of the old document.
     Delete(usize), // bytes
+    /// Insert this text, not present in the old document, into the new document.
     Insert(Tendril),
 }
 
+/// A reversible byte-diff between two document states: a sequence of [`Op`]s that
+/// consumes a document of `len_before` bytes and produces one of `len_after`
+/// bytes. This is Wordcartel's edit-transaction type — see the module docs for
+/// provenance and the invariant-arithmetic note above for the overflow argument.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangeSet {
     ops: Vec<Op>,
@@ -24,9 +37,17 @@ pub struct ChangeSet {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EditError {
     /// The changeset was built for a different document length than the buffer has.
-    StaleLength { expected: usize, actual: usize },
+    StaleLength {
+        /// The document length (bytes) the changeset was built for (`len_before`).
+        expected: usize,
+        /// The buffer's actual current length (bytes).
+        actual: usize,
+    },
     /// An op's byte boundary lands inside a multibyte char in the buffer.
-    OpBoundary { pos: usize },
+    OpBoundary {
+        /// The offending byte offset — not a char boundary in the buffer.
+        pos: usize,
+    },
 }
 
 // INVARIANT: all positions and lengths here are byte offsets into a single
