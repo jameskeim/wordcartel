@@ -23,6 +23,7 @@ arboard = { version = "3", default-features = false, features = ["wayland-data-c
 nucleo-matcher = "0.3"
 lsp-types = "0.97"
 serde_json = "1"
+mlua = { version = "0.10", features = ["vendored", "lua54"] }
 
 [dev-dependencies]
 proptest = "1"
