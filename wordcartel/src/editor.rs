@@ -404,6 +404,10 @@ pub struct Editor {
     /// Default-empty; capped at [`crate::limits::PLUGIN_MAX_PENDING_DISPATCH`] at the
     /// `wc.command` call site.
     pub pending_plugin_dispatch: std::collections::VecDeque<crate::plugin::PluginDispatch>,
+    /// The last plugin-load outcome (startup or reload), one record per discovered plugin —
+    /// what `plugin_list` reports. Populated by `plugin::reload::load_phase`; default-empty
+    /// (no plugins loaded / null host). Bounded by the discover/load caps (P2 §6).
+    pub plugin_inventory: Vec<crate::plugin::PluginRecord>,
     /// True while the last block-tree parse panicked (M4-rest). Dedupes the
     /// status notice so a persistently-panicking document does not spam it.
     pub parse_degraded: bool,
@@ -443,6 +447,10 @@ pub struct Editor {
     pub active_keymap_preset: String,
     /// Set by keymap switch commands; consumed by rebuild_keymap_if_requested after each reduce.
     pub keymap_rebuild: bool,
+    /// Set by the `plugins_reload` command; consumed by the run loop's between-reduces reload
+    /// seam (P2 §6) which runs `plugin::reload::perform_reload` once, then clears it. Mirrors the
+    /// `keymap_rebuild`/`settings_save_requested` request-flag pattern.
+    pub plugins_reload_requested: bool,
     pub palette: Option<crate::palette::Palette>,
     pub menu: Option<crate::menu::MenuView>,
     /// Whether mouse capture is currently requested (toggled by `toggle_mouse_capture`).
@@ -553,6 +561,7 @@ impl Editor {
             pending_plugin_calls: std::collections::VecDeque::new(),
             pending_plugin_events: std::collections::VecDeque::new(),
             pending_plugin_dispatch: std::collections::VecDeque::new(),
+            plugin_inventory: Vec::new(),
             parse_degraded: false, quit: false,
             prompt: None, pending_after_save: None, pending_save_as: None, pending_save_overwrite: None,
             pending_write_block: None, pending_clean: Vec::new(),
@@ -565,6 +574,7 @@ impl Editor {
             keymap,
             active_keymap_preset: "cua".into(),
             keymap_rebuild: false,
+            plugins_reload_requested: false,
             palette: None,
             menu: None,
             mouse_capture: true,

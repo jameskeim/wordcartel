@@ -9,6 +9,7 @@ pub mod host;
 mod pump;
 pub mod api;
 pub mod load;
+pub mod reload;
 pub mod settings;
 
 use std::cell::RefCell;
@@ -43,6 +44,17 @@ pub enum PluginEventKind {
 pub struct PluginEvent {
     pub kind: PluginEventKind,
     pub path: Option<String>,
+}
+
+/// One discovered plugin's load outcome, for `plugin_list` + reload reporting (owned, bounded by
+/// the discover/load caps). `error: None` means the plugin loaded cleanly; `commands`/`hooks` are
+/// its committed counts (both `0` alongside an `error`, since a failed plugin commits nothing).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginRecord {
+    pub name: String,
+    pub commands: usize,
+    pub hooks: usize,
+    pub error: Option<String>,
 }
 
 /// A queued `wc.command` dispatch (fire-and-forget). `origin` names the requesting plugin
