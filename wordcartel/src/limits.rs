@@ -64,6 +64,16 @@ pub const PLUGIN_MAX_HOOKS_PER_PLUGIN: usize = 64;
 /// site) — the queue holds bounded owned data even for a pathological path.
 pub const PLUGIN_MAX_EVENT_PAYLOAD: usize = 4096;
 
+/// Max byte length of a `wc.command(name)` target — the longest possible registered id
+/// (`<stem>.<name>`), so this cap can never reject a resolvable name (§5a).
+pub const PLUGIN_MAX_COMMAND_REF: usize = PLUGIN_MAX_STEM_LEN + 1 + PLUGIN_MAX_NAME_LEN;
+/// Max queued `wc.command` dispatches awaiting drain — a single callback looping on
+/// `wc.command` must not grow an unbounded queue before the chain cap can even run (§5a).
+pub const PLUGIN_MAX_PENDING_DISPATCH: usize = 64;
+/// The pump's re-drain loop chain cap (§5c): the deterministic, testable bound on ping-pong
+/// cascade length (one dispatch, one command callback, or one hook invocation = one unit).
+pub const PLUGIN_PUMP_CHAIN_CAP: usize = 64;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,5 +91,8 @@ mod tests {
         assert_eq!(PLUGIN_MAX_CONFIG_STR, 64 * 1024);
         assert_eq!(PLUGIN_MAX_HOOKS_PER_PLUGIN, 64);
         assert_eq!(PLUGIN_MAX_EVENT_PAYLOAD, 4096);
+        assert_eq!(PLUGIN_MAX_COMMAND_REF, PLUGIN_MAX_STEM_LEN + 1 + PLUGIN_MAX_NAME_LEN);
+        assert_eq!(PLUGIN_MAX_PENDING_DISPATCH, 64);
+        assert_eq!(PLUGIN_PUMP_CHAIN_CAP, 64);
     }
 }

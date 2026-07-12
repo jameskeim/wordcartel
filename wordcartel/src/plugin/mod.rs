@@ -6,6 +6,7 @@
 //! [`plugin_error`] is this module's single formatting/routing point for every plugin failure
 //! (a caught panic, a Lua `error()`, or a typed API error) into `editor.status`.
 pub mod host;
+mod pump;
 pub mod api;
 pub mod load;
 pub mod settings;
@@ -42,6 +43,15 @@ pub enum PluginEventKind {
 pub struct PluginEvent {
     pub kind: PluginEventKind,
     pub path: Option<String>,
+}
+
+/// A queued `wc.command` dispatch (fire-and-forget). `origin` names the requesting plugin
+/// cmd/hook for error attribution; `name` is the raw target (resolved at drain — no call-time
+/// registry snapshot; see `plugin::host::PluginHost::pump`'s `drain_one_dispatch`).
+#[derive(Clone, Debug)]
+pub struct PluginDispatch {
+    pub origin: String,
+    pub name: String,
 }
 
 /// Parse a hook event name (the `menu_from_str` parse-to-enum precedent — the enum IS the

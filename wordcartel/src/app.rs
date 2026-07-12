@@ -827,10 +827,16 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             break;
         }
         let keep = { reduce(msg, &mut editor.borrow_mut(), &reg, &keymap, &executor, &clock, &msg_tx) };
-        // Pump stage (Effort P1 Task 7): runs AFTER reduce's borrow scope has dropped, holding
-        // NO outer borrow — a queued plugin command's Lua callback re-borrows the editor itself
-        // (via the bridge's wc.* closures), so no borrow may be alive here.
-        plugin_host.pump(&editor);
+        // Pump stage (Effort P1 Task 7; P2 Task 7 grows its dispatch context): runs AFTER
+        // reduce's borrow scope has dropped, holding NO outer borrow — a queued plugin
+        // command's Lua callback re-borrows the editor itself (via the bridge's wc.*
+        // closures), so no borrow may be alive here.
+        plugin_host.pump(&editor, &reg, &executor, &clock, &msg_tx);
+        // Hydrate any overlay a pump-dispatched wc.command opened (P2 §5b) — the pump's
+        // reg.dispatch is a dispatch path with no per-site hydrate, unlike the key/menu/mouse
+        // paths. Idempotent + self-guarding (hydrate_overlays only fills an EMPTY overlay), so
+        // this is a no-op when reduce's own per-path hydrate already ran this iteration.
+        { crate::app::hydrate_overlays(&mut editor.borrow_mut(), &reg, &keymap); }
         if let Some(t) = { crate::theme_cmds::rebuild_keymap_if_requested(&mut editor.borrow_mut(), &cfg.keymap.patches, &reg) } {
             keymap = t;
         }

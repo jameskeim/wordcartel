@@ -1,11 +1,13 @@
-//! The plugin VM host: owns the one `mlua` VM + bridge, and the pump. `null()` is the no-VM
-//! host used for `--no-plugins`, load failure, and tests that don't exercise plugins (mirrors
-//! `NullProvider`). Task 4 adds the real VM ([`PluginHost::new`]) and the registration sink
-//! ([`PendingReg`]) the load layer (`plugin::load`) drains into the `Registry` after each
-//! plugin's script executes, atomically per plugin. Task 5 adds the [`Bridge`] (the live
-//! `Rc<RefCell<Editor>>` + `Sender<Msg>` + clock the `wc.*` editor API closures capture,
-//! installed by [`PluginHost::attach_bridge`]) and [`PluginHost::pump`] — the two-phase
-//! drain-then-invoke that is the only place plugin Lua callbacks run.
+//! The plugin VM host: owns the one `mlua` VM + bridge + committed hooks, and the VM's
+//! lifecycle. `null()` is the no-VM host used for `--no-plugins`, load failure, and tests that
+//! don't exercise plugins (mirrors `NullProvider`). Task 4 adds the real VM ([`PluginHost::new`])
+//! and the registration sink ([`PendingReg`]) the load layer (`plugin::load`) drains into the
+//! `Registry` after each plugin's script executes, atomically per plugin. Task 5 adds the
+//! [`Bridge`] (the live `Rc<RefCell<Editor>>` + `Sender<Msg>` + clock the `wc.*` editor API
+//! closures capture, installed by [`PluginHost::attach_bridge`]). The re-drain pump itself
+//! ([`PluginHost::pump`] — the only place plugin Lua callbacks run) is a sibling module,
+//! `plugin::pump` (module-size seam, P2 Task 7): its `impl PluginHost` block lives there and
+//! reaches this module's `lua`/`bridge`/`hooks` fields via `pub(super)`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -52,9 +54,9 @@ pub struct Bridge {
 }
 
 /// What the pump is currently invoking, shared with every `wc.*` closure (each captures a
-/// clone). `current` names the plugin command/hook (attribution — unused by any check yet;
-/// wired for `wc.command`'s own observer check, Task 7). `observer` is true exactly while a
-/// HOOK runs — the edit APIs check it and degrade to a typed error (the observer-only binding
+/// clone). `current` names the running plugin command/hook — `wc.command`'s own error
+/// attribution (`origin`, §5a) reads it. `observer` is true exactly while a HOOK runs — the
+/// edit APIs AND `wc.command` check it and degrade to a typed error (the observer-only binding
 /// constraint, enforced in code, not by trust).
 pub(crate) struct InvokeState {
     pub current: Option<String>,
@@ -63,49 +65,28 @@ pub(crate) struct InvokeState {
 
 /// A committed hook: its VM-registry key + kind + a label for `plugin_error` attribution.
 /// Owned `String`s on the host — never interned (unlike command ids): hooks die with the VM at
-/// reload, so interning them would be a reload-shaped leak.
+/// reload, so interning them would be a reload-shaped leak. `Clone` lets the pump's
+/// `hooks_for` snapshot the matching hooks out of `self.hooks` before invoking any of them —
+/// no borrow of `self.hooks` is held across a callback (mirrors Phase A's "one short borrow,
+/// nothing held across Lua" discipline, applied to the hook table too).
+#[derive(Clone)]
 pub struct HookEntry {
     pub kind: crate::plugin::PluginEventKind,
     pub key: String,
     pub label: String,
 }
 
-/// RAII: sets [`InvokeState::observer`] `true` + `current` to the invoking hook's label for the
-/// duration of ONE hook callback, and resets both on drop — normal return AND unwind alike (the
-/// [`HookGuard`] pattern) — so a panicking hook can never leak observer mode onto the next
-/// command callback.
-struct ObserverGuard {
-    state: Rc<RefCell<InvokeState>>,
-}
-
-impl ObserverGuard {
-    fn enter(state: Rc<RefCell<InvokeState>>, label: &str) -> ObserverGuard {
-        {
-            let mut s = state.borrow_mut();
-            s.observer = true;
-            s.current = Some(label.to_string());
-        }
-        ObserverGuard { state }
-    }
-}
-
-impl Drop for ObserverGuard {
-    fn drop(&mut self) {
-        let mut s = self.state.borrow_mut();
-        s.observer = false;
-        s.current = None;
-    }
-}
-
 /// The plugin VM host. `lua: None` is the null host (no VM, no plugins); `lua: Some(_)` owns
 /// the one real `mlua::Lua` for this app instance. `bridge` is `None` until
-/// [`PluginHost::attach_bridge`] installs it (and always `None` for the null host).
+/// [`PluginHost::attach_bridge`] installs it (and always `None` for the null host). Fields are
+/// `pub(super)` (not private) so `plugin::pump`'s `impl PluginHost` block — the module-size
+/// seam the re-drain loop lives in (P2 Task 7) — can reach them.
 pub struct PluginHost {
-    lua: Option<mlua::Lua>, // None in the null host
-    bridge: Option<Bridge>,
+    pub(super) lua: Option<mlua::Lua>, // None in the null host
+    pub(super) bridge: Option<Bridge>,
     /// Committed `wc.on` hooks across every loaded plugin, in load-then-registration order —
     /// owned, NOT interned (die with the VM at reload; P2 §3b).
-    hooks: Vec<HookEntry>,
+    pub(super) hooks: Vec<HookEntry>,
 }
 
 /// Runaway-callback wall-clock budget for the `set_hook` guard (spec §7: "~100–250 ms"; the
@@ -192,82 +173,6 @@ impl PluginHost {
         self.bridge = Some(bridge);
         Ok(())
     }
-
-    /// Drain-then-invoke, single pass (P1 has no `wc.command` — §5/§1 — so no callback can grow
-    /// the queue mid-pump; a re-drain loop and a chain cap are P2 concerns). Takes the HANDLE,
-    /// never `&mut Editor`, so no borrow is held across Lua:
-    ///
-    /// - **Phase A** drains `editor.pending_plugin_calls` under a short `borrow_mut` scope that
-    ///   drops immediately (`std::mem::take` into a local `Vec`).
-    /// - **Phase B** invokes each drained call's stored Lua callback with NO outer borrow held —
-    ///   so each `wc.*` closure's own `try_borrow_mut` succeeds. Every invocation is wrapped in
-    ///   [`crate::panicx::catch`] (the spike found `mlua` resumes a raw Rust panic rather than
-    ///   converting it — `panicx` is the SOLE backstop, no gaps) and in [`Self::with_time_guard`]
-    ///   (the `set_hook` runaway-time abort). No `clock` parameter — the clock lives in the
-    ///   bridge, captured by the edit closures at [`Self::attach_bridge`] time.
-    pub fn pump(&mut self, editor: &Rc<RefCell<Editor>>) {
-        let Some(lua) = self.lua.as_ref() else {
-            // Null-host discipline (P2 §3d): fire sites push events UNCONDITIONALLY (they don't
-            // know whether a VM is live), so under `--no-plugins` this queue — and the P1 call
-            // queue — would grow without bound unless cleared here every pump.
-            let mut e = editor.borrow_mut();
-            e.pending_plugin_calls.clear();
-            e.pending_plugin_events.clear();
-            return;
-        };
-        // Phase A — drain calls + events under one short borrow that drops immediately.
-        let (calls, events): (Vec<crate::plugin::PluginCall>, Vec<crate::plugin::PluginEvent>) = {
-            let mut e = editor.borrow_mut();
-            (
-                std::mem::take(&mut e.pending_plugin_calls).into_iter().collect(),
-                std::mem::take(&mut e.pending_plugin_events).into_iter().collect(),
-            )
-        };
-        // Phase B — invoke calls with NO outer borrow held.
-        for call in calls {
-            let key = format!("wc-cmd-{}", call.id.0);
-            let outcome: Result<mlua::Result<()>, String> = crate::panicx::catch(|| {
-                let cb: mlua::Function = lua.named_registry_value(&key)?;
-                self.with_time_guard(lua, || cb.call::<()>(()))
-            });
-            if let Err(msg) = normalize(outcome) {
-                crate::plugin::plugin_error(editor, call.id.0, &msg);
-            }
-        }
-        // Phase C — drain events (P2 §3d). INTERIM: single-pass — hooks are observer-only and
-        // cannot enqueue, so a single pass is correct for THIS task; Task 7 rewrites this into
-        // the unified re-drain loop (dispatch/call/event) with chain/time caps. No bridge (VM
-        // exists but attach_bridge never ran) → nothing to invoke against; the events were
-        // already taken above, so this is a harmless drop, not a leak.
-        let Some(invoke_state) = self.bridge.as_ref().map(|b| b.invoke_state.clone()) else { return };
-        for ev in events {
-            for h in self.hooks.iter().filter(|h| h.kind == ev.kind) {
-                let key = h.key.clone();
-                let label = h.label.clone();
-                // RAII guard so a panicking hook can't leak observer mode onto the next unit.
-                let _obs = ObserverGuard::enter(invoke_state.clone(), &label);
-                let outcome: Result<mlua::Result<()>, String> = crate::panicx::catch(|| {
-                    let cb: mlua::Function = lua.named_registry_value(&key)?;
-                    let arg = event_table(lua, &ev)?;
-                    self.with_time_guard(lua, || cb.call::<()>((arg,)))
-                });
-                if let Err(msg) = normalize(outcome) {
-                    crate::plugin::plugin_error(editor, &label, &msg);
-                }
-            }
-        }
-    }
-
-    /// The `set_hook` runaway guard (spike §11.3, GREEN), fixed at [`CALLBACK_TIME_BUDGET`] — a
-    /// thin forwarder to the free [`with_time_guard`] fn. Scoped tightly around ONE callback
-    /// invocation and ALWAYS removed afterward (`remove_hook`) — via a [`HookGuard`] whose
-    /// `Drop` runs on both the normal-return path and an unwind (`f` is the plugin callback;
-    /// `panicx::catch`, the pump's sole panic backstop, resumes a raw Rust panic THROUGH this
-    /// frame rather than converting it — see [`Self::pump`]) — a leaked hook would fire during
-    /// the NEXT unrelated Lua call (registration, another plugin's callback).
-    fn with_time_guard<T>(&self, lua: &mlua::Lua, f: impl FnOnce() -> mlua::Result<T>) -> mlua::Result<T> {
-        with_time_guard(lua, CALLBACK_TIME_BUDGET, f)
-    }
 }
 
 /// The `set_hook` runaway guard, parameterized by budget so load ([`LOAD_TIME_BUDGET`]) and
@@ -303,27 +208,6 @@ impl Drop for HookGuard<'_> {
     }
 }
 
-/// Build the one Lua table argument a hook callback receives: `{ kind = "save"|"open"|
-/// "buffer_close", path = <string>|nil }` (P2 §3a). Deliberately minimal — additive fields are
-/// backward-compatible, removing one would not be.
-fn event_table(lua: &mlua::Lua, ev: &crate::plugin::PluginEvent) -> mlua::Result<mlua::Table> {
-    let t = lua.create_table()?;
-    t.set("kind", crate::plugin::kind_str(ev.kind))?;
-    t.set("path", ev.path.clone())?;
-    Ok(t)
-}
-
-/// Flatten the pump's two-layer outcome (an outer caught panic, an inner `mlua::Result` from a
-/// missing callback / Lua `error()` / a typed API error) to a single error message — a panic and
-/// a Lua-side failure surface identically to [`crate::plugin::plugin_error`].
-fn normalize(outcome: Result<mlua::Result<()>, String>) -> Result<(), String> {
-    match outcome {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(panic_msg) => Err(panic_msg),
-    }
-}
-
 /// The VM heap cap (64 MiB) the Task 1 spike confirmed `set_memory_limit` enforces on vendored
 /// Lua 5.4 (item 2: GREEN — an over-cap allocation returns a Lua memory error rather than
 /// aborting the process). Kept as a named fn rather than a bare constant so a build on which
@@ -349,8 +233,8 @@ mod tests {
         pairs.iter().map(|(s, src)| (s.to_string(), src.to_string())).collect()
     }
 
-    /// Channel + clock a test bridge needs; `msg_tx` is unused until Task 7 wires `wc.command`
-    /// dispatch — a plain unbound channel is enough to satisfy the `Bridge`'s field.
+    /// Channel + clock a test bridge needs — a plain unbound channel is enough to satisfy the
+    /// `Bridge`'s field.
     fn test_bridge_parts() -> (std::sync::mpsc::Sender<crate::app::Msg>, Rc<dyn Clock>) {
         let (tx, _rx) = std::sync::mpsc::channel();
         (tx, Rc::new(TestClock::new(0)))
@@ -358,7 +242,7 @@ mod tests {
 
     /// Register ONE command (`t.cmd`, `fn = <src's function>`) into a fresh `Registry`, attach a
     /// bridge over a fresh `Editor::new_from_text(text, ..)`, and enqueue that command's call —
-    /// ready for the test to `host.pump(&editor)` and assert on the outcome.
+    /// ready for the test to `host.pump_test(&editor)` and assert on the outcome.
     fn make(src_fn_body: &str, text: &str) -> (PluginHost, Rc<RefCell<Editor>>, CommandId) {
         let mut reg = Registry::builtins();
         let mut host = PluginHost::new().expect("VM construction");
@@ -387,7 +271,7 @@ mod tests {
         let mut host = PluginHost::null();
         assert!(!host.has_vm());
         let editor = Rc::new(RefCell::new(Editor::new_from_text("x", None, (40, 10))));
-        host.pump(&editor);
+        host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "x");
     }
 
@@ -408,7 +292,7 @@ mod tests {
     #[test]
     fn pump_runs_enqueued_plugin_command() {
         let (mut host, editor, _id) = make("wc.insert('X')", "hello");
-        host.pump(&editor);
+        host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "Xhello", "the command's wc.insert must land at the caret");
     }
 
@@ -420,7 +304,7 @@ mod tests {
             "local t = wc.text(); wc.insert('Y'); local c = wc.cursor(); wc.status(t .. '/' .. tostring(c))",
             "ab",
         );
-        host.pump(&editor);
+        host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "Yab");
         let status = editor.borrow().status.clone();
         assert_eq!(status, "ab/1", "wc.text saw the pre-insert buffer, wc.cursor the post-insert caret");
@@ -429,7 +313,7 @@ mod tests {
     #[test]
     fn wc_replace_reversed_range_is_typed_error_no_panic() {
         let (mut host, editor, _id) = make("wc.replace(10, 2, 'x')", "hello world");
-        host.pump(&editor);
+        host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "hello world", "reversed range must not mutate the buffer");
         let status = editor.borrow().status.clone();
         assert!(status.contains("plugin"), "status: {status}");
@@ -439,7 +323,7 @@ mod tests {
     #[test]
     fn wc_replace_oob_range_is_typed_error_no_panic() {
         let (mut host, editor, _id) = make("wc.replace(0, 999, 'x')", "hello world");
-        host.pump(&editor);
+        host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "hello world", "out-of-bounds range must not mutate the buffer");
         let status = editor.borrow().status.clone();
         assert!(!status.to_lowercase().contains("panic"), "status: {status}");
@@ -449,7 +333,7 @@ mod tests {
     fn wc_replace_mid_char_offset_is_typed_error_no_panic() {
         // "h\u{e9}llo" — 'é' occupies bytes [1,3); byte offset 2 lands mid-char.
         let (mut host, editor, _id) = make("wc.replace(2, 3, 'x')", "h\u{e9}llo");
-        host.pump(&editor);
+        host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "h\u{e9}llo", "a mid-char offset must not mutate the buffer");
         let status = editor.borrow().status.clone();
         assert!(!status.to_lowercase().contains("panic"), "status: {status}");
@@ -461,7 +345,7 @@ mod tests {
             "local ok, err = pcall(wc.text, 10, 2); wc.status(tostring(ok) .. ':' .. tostring(err))",
             "hi",
         );
-        host.pump(&editor);
+        host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "hi");
         let status = editor.borrow().status.clone();
         assert!(status.starts_with("false:"), "wc.text(10,2) must fail (pcall false), got: {status}");
@@ -476,7 +360,7 @@ mod tests {
             &format!("wc.insert(string.rep('a', {}))", crate::limits::PASTE_MAX_BYTES + 1),
             "doc",
         );
-        host.pump(&editor);
+        host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "doc", "an over-cap insert must never reach a Tendril alloc/ChangeSet");
         let status = editor.borrow().status.clone();
         assert!(status.contains("plugin"), "status: {status}");
@@ -486,7 +370,7 @@ mod tests {
     fn wc_status_over_max_is_truncated_on_char_boundary() {
         let (mut host, editor, _id) =
             make(&format!("wc.status(string.rep('a', {}))", crate::limits::PLUGIN_MAX_STATUS_LEN + 100), "doc");
-        host.pump(&editor);
+        host.pump_test(&editor);
         let status = editor.borrow().status.clone();
         assert_eq!(status.len(), crate::limits::PLUGIN_MAX_STATUS_LEN);
         assert!(status.chars().all(|c| c == 'a'));
@@ -497,7 +381,7 @@ mod tests {
         let prefix_len = crate::limits::PLUGIN_MAX_STATUS_LEN - 1;
         let (mut host, editor, _id) =
             make(&format!("wc.status(string.rep('a', {prefix_len}) .. '\u{e9}')"), "doc");
-        host.pump(&editor);
+        host.pump_test(&editor);
         let status = editor.borrow().status.clone();
         // The 2-byte 'é' straddles the cap; truncation must back off before its lead byte
         // rather than splitting it (which would panic a naive byte-slice) or over-including it.
@@ -508,7 +392,7 @@ mod tests {
     #[test]
     fn lua_error_in_callback_is_isolated_and_reported() {
         let (mut host, editor, _id) = make("error('boom')", "x");
-        host.pump(&editor);
+        host.pump_test(&editor);
         let status = editor.borrow().status.clone();
         assert!(status.contains("boom"), "status: {status}");
         assert_eq!(whole_text(&editor), "x", "editor must be untouched by a callback error");
@@ -534,7 +418,7 @@ mod tests {
             lua.set_named_registry_value(&format!("wc-cmd-{}", panic_id.0), f).expect("store callback");
         }
         editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: panic_id });
-        host.pump(&editor);
+        host.pump_test(&editor);
         let status = editor.borrow().status.clone();
         assert!(status.contains("callback panic"), "status: {status}");
         assert_eq!(whole_text(&editor), "x", "a panicking callback must not touch the editor");
@@ -547,7 +431,7 @@ mod tests {
         assert_eq!(reports[0].result, Ok(1));
         let good_id = reg.resolve_name("u.good").expect("registered");
         editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: good_id });
-        host.pump(&editor);
+        host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "Gx");
     }
 
@@ -574,7 +458,7 @@ mod tests {
     #[test]
     fn wc_set_selection_in_bounds_sets_selection() {
         let (mut host, editor, _id) = make("wc.set_selection(1, 3)", "hello");
-        host.pump(&editor);
+        host.pump_test(&editor);
         let sel = editor.borrow().active().document.selection.primary();
         assert_eq!((sel.anchor, sel.head), (1, 3));
     }
@@ -584,7 +468,7 @@ mod tests {
         // "hi" has len 2; head=999 is far out of bounds — must SNAP to buf.len() (the required
         // TDD case), never reject/error/panic.
         let (mut host, editor, _id) = make("wc.set_selection(0, 999)", "hi");
-        host.pump(&editor);
+        host.pump_test(&editor);
         let sel = editor.borrow().active().document.selection.primary();
         assert_eq!((sel.anchor, sel.head), (0, 2), "head snapped to buffer length, not rejected");
         let status = editor.borrow().status.clone();
@@ -598,7 +482,7 @@ mod tests {
             "wc.set_selection(1, 3); local s = wc.selection(); wc.status(tostring(s.anchor) .. ':' .. tostring(s.head))",
             "hello",
         );
-        host.pump(&editor);
+        host.pump_test(&editor);
         let status = editor.borrow().status.clone();
         assert_eq!(status, "1:3");
     }
@@ -606,7 +490,7 @@ mod tests {
     #[test]
     fn wc_len_returns_buffer_byte_length() {
         let (mut host, editor, _id) = make("wc.status(tostring(wc.len()))", "hello");
-        host.pump(&editor);
+        host.pump_test(&editor);
         let status = editor.borrow().status.clone();
         assert_eq!(status, "5");
     }
@@ -614,7 +498,7 @@ mod tests {
     #[test]
     fn wc_version_returns_buffer_version_after_an_edit() {
         let (mut host, editor, _id) = make("wc.insert('x'); wc.status(tostring(wc.version()))", "y");
-        host.pump(&editor);
+        host.pump_test(&editor);
         let status = editor.borrow().status.clone();
         assert_eq!(status, "1", "version bumps once per applied transaction");
     }
@@ -622,7 +506,7 @@ mod tests {
     #[test]
     fn wc_path_is_nil_for_an_unsaved_buffer() {
         let (mut host, editor, _id) = make("wc.status(tostring(wc.path()))", "x");
-        host.pump(&editor);
+        host.pump_test(&editor);
         let status = editor.borrow().status.clone();
         assert_eq!(status, "nil");
     }
@@ -645,7 +529,7 @@ mod tests {
         host.attach_bridge(editor.clone(), tx, clock).expect("bridge attaches on a live VM");
         editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id });
 
-        host.pump(&editor);
+        host.pump_test(&editor);
         let status = editor.borrow().status.clone();
         assert_eq!(status, "/tmp/note.md");
     }
@@ -670,7 +554,7 @@ mod tests {
         host.attach_bridge(editor.clone(), tx, clock).expect("bridge attaches on a live VM");
         editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id });
 
-        host.pump(&editor);
+        host.pump_test(&editor);
         let status = editor.borrow().status.clone();
         assert!(status.contains("register_command"), "status: {status}");
         assert!(status.contains("only available during plugin load"), "status: {status}");
@@ -727,7 +611,7 @@ mod tests {
             let text_bytes = text.len();
 
             editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: rep_id });
-            host.pump(&editor); // wc.replace's outcome — Ok or a typed error, never a raw panic
+            host.pump_test(&editor); // wc.replace's outcome — Ok or a typed error, never a raw panic
             let status_after_replace = editor.borrow().status.clone();
             prop_assert!(!status_after_replace.to_lowercase().contains("panic"),
                 "status: {status_after_replace}");
@@ -736,7 +620,7 @@ mod tests {
                 "buffer grew past the one-insert upper bound: {after_replace_len} > {doc_bytes}+{text_bytes}");
 
             editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: rd_id });
-            host.pump(&editor); // wc.text's outcome — Ok or a typed error, never a raw panic
+            host.pump_test(&editor); // wc.text's outcome — Ok or a typed error, never a raw panic
             let status_after_text = editor.borrow().status.clone();
             prop_assert!(!status_after_text.to_lowercase().contains("panic"),
                 "status: {status_after_text}");
@@ -789,7 +673,7 @@ mod tests {
             kind: crate::plugin::PluginEventKind::Save,
             path: Some("/x".to_string()),
         });
-        host.pump(&editor);
+        host.pump_test(&editor);
         let status = editor.borrow().status.clone();
         assert_eq!(status, "save:/x");
     }
@@ -805,7 +689,7 @@ mod tests {
 
         editor.borrow_mut().pending_plugin_events.push_back(
             crate::plugin::PluginEvent { kind: crate::plugin::PluginEventKind::Save, path: None });
-        host.pump(&editor);
+        host.pump_test(&editor);
 
         let lua = host.lua().unwrap();
         let order_table: mlua::Table = lua.globals().get("order").unwrap();
@@ -826,7 +710,7 @@ mod tests {
 
         editor.borrow_mut().pending_plugin_events.push_back(
             crate::plugin::PluginEvent { kind: crate::plugin::PluginEventKind::Save, path: None });
-        host.pump(&editor);
+        host.pump_test(&editor);
 
         let status = editor.borrow().status.clone();
         assert!(status.contains("boom"), "the first hook's error must be reported: {status}");
@@ -843,7 +727,7 @@ mod tests {
         let (mut host, editor, _reg, _reports) = make_hooked(src, "x");
         editor.borrow_mut().pending_plugin_events.push_back(
             crate::plugin::PluginEvent { kind: crate::plugin::PluginEventKind::Open, path: None });
-        host.pump(&editor);
+        host.pump_test(&editor);
         assert_eq!(editor.borrow().status, "", "an event with no matching hook must invoke nothing");
         assert_eq!(whole_text(&editor), "x");
     }
@@ -858,9 +742,12 @@ mod tests {
         editor.borrow_mut().pending_plugin_events.push_back(
             crate::plugin::PluginEvent { kind: crate::plugin::PluginEventKind::Save, path: Some("/x".into()) });
         editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: CommandId(crate::plugin::intern("null-host-test.cmd")) });
-        host.pump(&editor);
+        editor.borrow_mut().pending_plugin_dispatch.push_back(
+            crate::plugin::PluginDispatch { origin: "x".to_string(), name: "select_all".to_string() });
+        host.pump_test(&editor);
         assert!(editor.borrow().pending_plugin_events.is_empty(), "the null host must clear pending_plugin_events");
         assert!(editor.borrow().pending_plugin_calls.is_empty(), "the null host must clear pending_plugin_calls too");
+        assert!(editor.borrow().pending_plugin_dispatch.is_empty(), "the null host must clear pending_plugin_dispatch too");
     }
 
     #[test]
@@ -876,7 +763,7 @@ mod tests {
         assert_eq!(reports[0].hooks, 0, "no hook was registered at LOAD time by this plugin");
         let id = reg.resolve_name("t.cmd").expect("registered under t.cmd");
         editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id });
-        host.pump(&editor);
+        host.pump_test(&editor);
         let status = editor.borrow().status.clone();
         assert!(status.contains("wc.on"), "status: {status}");
         assert!(status.contains("only available during plugin load"), "status: {status}");
@@ -929,7 +816,7 @@ mod tests {
         let sel_before = editor.borrow().active().document.selection.primary();
         editor.borrow_mut().pending_plugin_events.push_back(
             crate::plugin::PluginEvent { kind: crate::plugin::PluginEventKind::Save, path: None });
-        host.pump(&editor);
+        host.pump_test(&editor);
 
         let lua = host.lua().unwrap();
         let ok1: bool = lua.globals().get("ok1").unwrap();
@@ -962,7 +849,7 @@ mod tests {
         host.hooks.push(HookEntry { kind: panic_kind, key: panic_key, label: "panic-test.on_open".to_string() });
         editor.borrow_mut().pending_plugin_events.push_back(
             crate::plugin::PluginEvent { kind: panic_kind, path: None });
-        host.pump(&editor);
+        host.pump_test(&editor);
         let status_after_panic = editor.borrow().status.clone();
         assert!(status_after_panic.contains("hook panic"), "status: {status_after_panic}");
 
@@ -971,8 +858,226 @@ mod tests {
         // panicking one.
         let good_id = reg.resolve_name("t.good").expect("registered");
         editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: good_id });
-        host.pump(&editor);
+        host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "Ghello",
             "a normal command's wc.insert must still work after an observer-mode hook (incl. a panicking one)");
+    }
+
+    // -----------------------------------------------------------------------
+    // P2 Task 7: wc.command + the final unified re-drain pump + chain/time caps.
+    // -----------------------------------------------------------------------
+
+    /// A plugin command calling `wc.command("select_all")` (a nullary builtin) has the
+    /// builtin's observable effect after the pump — routed through the SAME `Registry::dispatch`
+    /// the palette/menu/keys use (contract law 1), never a side channel. Uses the REAL `pump`
+    /// (not `pump_test`) since resolving `"select_all"` needs the SAME `reg` the plugin loaded
+    /// against.
+    #[test]
+    fn wc_command_dispatches_a_builtin() {
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().expect("VM construction");
+        let src = "wc.register_command{ name='cmd', label='C', fn=function() wc.command('select_all') end }";
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("t", src)]), &BTreeMap::new(), &mut Vec::new());
+        assert_eq!(reports[0].result, Ok(1));
+        let id = reg.resolve_name("t.cmd").expect("registered under t.cmd");
+
+        let editor = Rc::new(RefCell::new(Editor::new_from_text("hello", None, (40, 10))));
+        let (tx, clock_rc) = test_bridge_parts();
+        host.attach_bridge(editor.clone(), tx.clone(), clock_rc).expect("bridge attaches on a live VM");
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id });
+
+        let ex = crate::jobs::InlineExecutor::default();
+        let clock = TestClock::new(0);
+        host.pump(&editor, &reg, &ex, &clock, &tx);
+
+        let sel = editor.borrow().active().document.selection.primary();
+        assert_eq!((sel.anchor, sel.head), (0, 5), "select_all must select the whole 5-byte buffer");
+    }
+
+    /// `a.cmd` calls `wc.command("b.cmd")` which inserts `X`; ONE `pump` call (internally a
+    /// multi-iteration re-drain) lands `X` — the re-drain loop picks the enqueued dispatch back
+    /// up, resolves it to a `Plugin` entry, enqueues the resulting `PluginCall`, and drains that
+    /// too, all within the same cycle.
+    #[test]
+    fn wc_command_chains_a_plugin_command() {
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().expect("VM construction");
+        let src_a = "wc.register_command{ name='cmd', label='A', fn=function() wc.command('b.cmd') end }";
+        let src_b = "wc.register_command{ name='cmd', label='B', fn=function() wc.insert('X') end }";
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("a", src_a), ("b", src_b)]), &BTreeMap::new(), &mut Vec::new());
+        assert_eq!(reports[0].result, Ok(1));
+        assert_eq!(reports[1].result, Ok(1));
+        let a_id = reg.resolve_name("a.cmd").expect("registered under a.cmd");
+
+        let editor = Rc::new(RefCell::new(Editor::new_from_text("hi", None, (40, 10))));
+        let (tx, clock_rc) = test_bridge_parts();
+        host.attach_bridge(editor.clone(), tx.clone(), clock_rc).expect("bridge attaches on a live VM");
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: a_id });
+
+        let ex = crate::jobs::InlineExecutor::default();
+        let clock = TestClock::new(0);
+        host.pump(&editor, &reg, &ex, &clock, &tx);
+
+        assert_eq!(whole_text(&editor), "Xhi",
+            "one pump cycle must re-drain the enqueued dispatch through to b.cmd's wc.insert");
+    }
+
+    /// `wc.command("nope")` (an unresolvable name) degrades to a `plugin_error` status naming
+    /// the ORIGIN (the calling command), never a panic, and never mutates the editor.
+    #[test]
+    fn wc_command_unknown_name_reports_error() {
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().expect("VM construction");
+        let src = "wc.register_command{ name='cmd', label='C', fn=function() wc.command('nope') end }";
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("t", src)]), &BTreeMap::new(), &mut Vec::new());
+        assert_eq!(reports[0].result, Ok(1));
+        let id = reg.resolve_name("t.cmd").expect("registered under t.cmd");
+
+        let editor = Rc::new(RefCell::new(Editor::new_from_text("x", None, (40, 10))));
+        let (tx, clock_rc) = test_bridge_parts();
+        host.attach_bridge(editor.clone(), tx.clone(), clock_rc).expect("bridge attaches on a live VM");
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id });
+
+        let ex = crate::jobs::InlineExecutor::default();
+        let clock = TestClock::new(0);
+        host.pump(&editor, &reg, &ex, &clock, &tx);
+
+        let status = editor.borrow().status.clone();
+        assert!(status.contains("t.cmd"), "status must name the origin: {status}");
+        assert!(status.contains("nope"), "status must name the unresolved target: {status}");
+        assert!(!status.to_lowercase().contains("panic"), "status: {status}");
+        assert_eq!(whole_text(&editor), "x", "an unresolved dispatch must not mutate the buffer");
+    }
+
+    /// Two independent rejections at the `wc.command` call site (§5a), each surfaced as a typed
+    /// `pcall`-able error with nothing queued: a name longer than `PLUGIN_MAX_COMMAND_REF`, and
+    /// a dispatch already at `PLUGIN_MAX_PENDING_DISPATCH`. Both checks run purely inside ONE
+    /// Lua callback (no pump re-drain involved in the queue-filling loop itself), so the
+    /// results are captured in Lua globals — immune to any status-line overwrite from the
+    /// pump's SUBSEQUENT draining of the successfully-queued fillers.
+    #[test]
+    fn wc_command_over_length_and_full_queue_reject() {
+        let cap = crate::limits::PLUGIN_MAX_PENDING_DISPATCH;
+        let over_len = crate::limits::PLUGIN_MAX_COMMAND_REF + 1;
+        let (mut host, editor, _id) = make(
+            &format!(
+                "local ok1, err1 = pcall(wc.command, string.rep('a', {over_len}))\n\
+                 for i=1,{cap} do wc.command('select_all') end\n\
+                 local ok2, err2 = pcall(wc.command, 'select_all')\n\
+                 g_ok1, g_err1, g_ok2, g_err2 = ok1, tostring(err1), ok2, tostring(err2)"
+            ),
+            "hello",
+        );
+        host.pump_test(&editor);
+
+        let lua = host.lua().unwrap();
+        let ok1: bool = lua.globals().get("g_ok1").unwrap();
+        let err1: String = lua.globals().get("g_err1").unwrap();
+        let ok2: bool = lua.globals().get("g_ok2").unwrap();
+        let err2: String = lua.globals().get("g_err2").unwrap();
+        assert!(!ok1, "an over-length command name must be rejected");
+        assert!(err1.contains("too long"), "err1: {err1}");
+        assert!(!ok2, "wc.command over the queue cap must be rejected");
+        assert!(err2.contains("queue full"), "err2: {err2}");
+    }
+
+    /// `wc.on("save", function() wc.command("x") end)` — `wc.command` is BLOCKED from a hook
+    /// (observer mode): mutation-by-proxy, and `on_save`→`save` would self-cascade. A typed
+    /// error, nothing queued.
+    #[test]
+    fn wc_command_from_hook_is_rejected() {
+        let src = "wc.on('save', function(ev) \
+                       local ok, err = pcall(wc.command, 'x'); \
+                       wc.status(tostring(ok) .. ':' .. tostring(err)) \
+                   end)";
+        let (mut host, editor, _reg, reports) = make_hooked(src, "x");
+        assert_eq!(reports[0].hooks, 1);
+
+        editor.borrow_mut().pending_plugin_events.push_back(
+            crate::plugin::PluginEvent { kind: crate::plugin::PluginEventKind::Save, path: None });
+        host.pump_test(&editor);
+
+        let status = editor.borrow().status.clone();
+        assert!(status.starts_with("false:"), "wc.command from a hook must be rejected: {status}");
+        assert!(status.contains("event hook"), "status: {status}");
+        assert!(editor.borrow().pending_plugin_dispatch.is_empty(), "nothing may be queued from a blocked wc.command");
+    }
+
+    /// `a.cmd` dispatches `b.cmd` dispatches `a.cmd` … an infinite ping-pong — the chain cap
+    /// (`PLUGIN_PUMP_CHAIN_CAP`) must terminate the cascade deterministically: all three queues
+    /// cleared, a truncation status set, and the editor's actual CONTENT untouched (only queued
+    /// plugin work is advisory and dropped, never partial document mutation).
+    #[test]
+    fn pump_chain_cap_truncates_pingpong() {
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().expect("VM construction");
+        let src_a = "wc.register_command{ name='cmd', label='A', fn=function() wc.command('b.cmd') end }";
+        let src_b = "wc.register_command{ name='cmd', label='B', fn=function() wc.command('a.cmd') end }";
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("a", src_a), ("b", src_b)]), &BTreeMap::new(), &mut Vec::new());
+        assert_eq!(reports[0].result, Ok(1));
+        assert_eq!(reports[1].result, Ok(1));
+        let a_id = reg.resolve_name("a.cmd").expect("registered under a.cmd");
+
+        let editor = Rc::new(RefCell::new(Editor::new_from_text("hello", None, (40, 10))));
+        let (tx, clock_rc) = test_bridge_parts();
+        host.attach_bridge(editor.clone(), tx.clone(), clock_rc).expect("bridge attaches on a live VM");
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: a_id });
+
+        let ex = crate::jobs::InlineExecutor::default();
+        let clock = TestClock::new(0);
+        host.pump(&editor, &reg, &ex, &clock, &tx);
+
+        let e = editor.borrow();
+        assert!(e.pending_plugin_calls.is_empty(), "the chain-cap trip must clear the call queue");
+        assert!(e.pending_plugin_events.is_empty(), "the chain-cap trip must clear the event queue");
+        assert!(e.pending_plugin_dispatch.is_empty(), "the chain-cap trip must clear the dispatch queue");
+        assert!(e.status.to_lowercase().contains("truncat"), "status: {}", e.status);
+        assert_eq!(e.active().document.buffer.to_string(), "hello",
+            "the editor's actual content must be untouched by the truncated cascade");
+    }
+
+    /// With each unit deliberately burning ~40ms of real wall time (a spin-wait on `os.clock()`,
+    /// safely under `CALLBACK_TIME_BUDGET`'s 150ms per-unit abort), a ping-pong cascade between
+    /// two plugin commands crosses `PUMP_CYCLE_TIME_BUDGET` (500ms wall) LONG before it could
+    /// ever reach `PLUGIN_PUMP_CHAIN_CAP` (64 units, which at ~40ms/unit would take ~2.5s) —
+    /// isolating the wall-clock cap's truncation from the count cap's.
+    #[test]
+    fn pump_cycle_time_budget_truncates() {
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().expect("VM construction");
+        let busy = "local t0 = os.clock(); while os.clock() - t0 < 0.04 do end";
+        let src_a = format!(
+            "runs = 0\n\
+             wc.register_command{{ name='cmd', label='A', fn=function() {busy}; runs = runs + 1; wc.command('b.cmd') end }}"
+        );
+        let src_b = format!(
+            "wc.register_command{{ name='cmd', label='B', fn=function() {busy}; wc.command('a.cmd') end }}"
+        );
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("a", &src_a), ("b", &src_b)]), &BTreeMap::new(), &mut Vec::new());
+        assert_eq!(reports[0].result, Ok(1));
+        assert_eq!(reports[1].result, Ok(1));
+        let a_id = reg.resolve_name("a.cmd").expect("registered under a.cmd");
+
+        let editor = Rc::new(RefCell::new(Editor::new_from_text("hello", None, (40, 10))));
+        let (tx, clock_rc) = test_bridge_parts();
+        host.attach_bridge(editor.clone(), tx.clone(), clock_rc).expect("bridge attaches on a live VM");
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: a_id });
+
+        let ex = crate::jobs::InlineExecutor::default();
+        let clock = TestClock::new(0);
+        let started = std::time::Instant::now();
+        host.pump(&editor, &reg, &ex, &clock, &tx);
+        let elapsed = started.elapsed();
+
+        let e = editor.borrow();
+        assert!(e.pending_plugin_calls.is_empty());
+        assert!(e.pending_plugin_dispatch.is_empty());
+        drop(e);
+        let lua = host.lua().unwrap();
+        let runs: i64 = lua.globals().get("runs").unwrap();
+        assert!(runs > 0, "at least one unit must have run before truncation: runs={runs}");
+        assert!(runs < 64, "the wall-clock cap must trip well before the 64-unit chain cap: runs={runs}");
+        assert!(elapsed < std::time::Duration::from_millis(2000),
+            "the wall-clock cap must bound total pump time far under the chain-cap-only ceiling: {elapsed:?}");
     }
 }

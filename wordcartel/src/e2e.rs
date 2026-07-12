@@ -140,13 +140,18 @@ impl Harness {
     fn step(&mut self, msg: Msg) -> bool {
         let clock = TestClock(self.now);
         let keep = { reduce(msg, &mut self.editor.borrow_mut(), &self.reg, &self.keymap, &self.ex, &clock, &self.tx) };
-        // Pump stage (Effort P1 Task 7): mirrors run()'s choreography — runs AFTER reduce's
-        // borrow scope has dropped, holding NO outer borrow, so a dispatched plugin command's
-        // Lua callback can re-borrow the editor via the bridge's wc.* closures. `None` for the
-        // non-plugin journeys — a real skip, not a null-host no-op call.
+        // Pump stage (Effort P1 Task 7; P2 Task 7 grows its dispatch context): mirrors run()'s
+        // choreography — runs AFTER reduce's borrow scope has dropped, holding NO outer borrow,
+        // so a dispatched plugin command's Lua callback can re-borrow the editor via the
+        // bridge's wc.* closures. `None` for the non-plugin journeys — a real skip, not a
+        // null-host no-op call.
         if let Some(h) = &mut self.plugin_host {
-            h.pump(&self.editor);
+            h.pump(&self.editor, &self.reg, &self.ex, &clock, &self.tx);
         }
+        // Hydrate any overlay a pump-dispatched wc.command opened (P2 §5b) — mirrors run()'s
+        // post-pump call; idempotent + self-guarding, so a no-op for the non-plugin journeys and
+        // for any overlay reduce's own per-path hydrate already filled this iteration.
+        { crate::app::hydrate_overlays(&mut self.editor.borrow_mut(), &self.reg, &self.keymap); }
         if let Some(t) = { crate::theme_cmds::rebuild_keymap_if_requested(&mut self.editor.borrow_mut(), &[], &self.reg) } {
             self.keymap = t;
         }
@@ -172,8 +177,9 @@ impl Harness {
         let _keep = { reduce(msg, &mut self.editor.borrow_mut(), &self.reg, &self.keymap, &self.ex, &clock, &self.tx) };
         let t_reduce = t0.elapsed();
         if let Some(h) = &mut self.plugin_host {
-            h.pump(&self.editor);
+            h.pump(&self.editor, &self.reg, &self.ex, &clock, &self.tx);
         }
+        { crate::app::hydrate_overlays(&mut self.editor.borrow_mut(), &self.reg, &self.keymap); }
         if let Some(t) = { crate::theme_cmds::rebuild_keymap_if_requested(&mut self.editor.borrow_mut(), &[], &self.reg) } {
             self.keymap = t;
         }
@@ -537,7 +543,7 @@ fn on_save_hook_fires_on_real_save() {
         for o in outcomes { crate::jobs_apply::apply_outcome(o, &mut e); }
     }
     // The pump drains the event the merge just enqueued — no outer borrow held.
-    h.plugin_host.as_mut().unwrap().pump(&h.editor);
+    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx);
 
     let calls: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("calls")
         .expect("the plugin's Lua-global counter must exist");
@@ -566,13 +572,14 @@ fn on_buffer_close_and_open_fire() {
     // the FIRST open below takes the reuse branch (open_as_new_buffer delegates to
     // open_into_current and returns), exercising the no-double-fire guarantee directly.
     let mut h = Harness::new_with_plugin("\n", &[("hookplug2", src)]);
+    let clock = TestClock(h.now);
 
     // 1) Reuse-shape open: fires on_open once.
     {
         let mut e = h.editor.borrow_mut();
         crate::workspace::open_as_new_buffer(&mut e, &path_a);
     }
-    h.plugin_host.as_mut().unwrap().pump(&h.editor);
+    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx);
     let opens: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("opens").unwrap();
     assert_eq!(opens, 1, "the reuse-shape open must fire on_open exactly once, not twice");
     let last_open: String =
@@ -586,7 +593,7 @@ fn on_buffer_close_and_open_fire() {
         let mut e = h.editor.borrow_mut();
         crate::workspace::open_as_new_buffer(&mut e, &path_b);
     }
-    h.plugin_host.as_mut().unwrap().pump(&h.editor);
+    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx);
     let opens: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("opens").unwrap();
     assert_eq!(opens, 2, "the new-buffer-shape open must also fire on_open, once");
     let last_open: String =
@@ -600,7 +607,7 @@ fn on_buffer_close_and_open_fire() {
         let mut e = h.editor.borrow_mut();
         crate::workspace::close_buffer_now(&mut e, b_id);
     }
-    h.plugin_host.as_mut().unwrap().pump(&h.editor);
+    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx);
     let closes: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("closes").unwrap();
     assert_eq!(closes, 1, "the clean close must fire on_buffer_close exactly once");
     let last_close: String =
@@ -610,20 +617,64 @@ fn on_buffer_close_and_open_fire() {
     // 4) Quit fires nothing: a clean workspace's Command::Quit only sets editor.quit — it never
     // calls close_buffer_now, so neither counter must move.
     {
-        let clock = TestClock(h.now);
         let mut e = h.editor.borrow_mut();
         assert!(!e.buffers.iter().any(|b| e.is_dirty(b.id)), "precondition: a clean workspace");
         let r = crate::commands::run(crate::commands::Command::Quit, &mut e, &clock);
         assert!(matches!(r, crate::commands::CommandResult::Quit));
         assert!(e.quit, "Quit must set the quit flag on a clean workspace");
     }
-    h.plugin_host.as_mut().unwrap().pump(&h.editor);
+    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx);
     let opens_after_quit: i64 =
         h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("opens").unwrap();
     let closes_after_quit: i64 =
         h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("closes").unwrap();
     assert_eq!(opens_after_quit, 2, "quit must not fire on_open");
     assert_eq!(closes_after_quit, 1, "quit must not fire on_buffer_close — quitting is not closing");
+}
+
+// ---------------------------------------------------------------------------
+// P2 Task 7: wc.command + the post-pump hydrate_overlays gap. Driven through the REAL
+// `step` (reduce → pump → post-pump hydrate) — the pump's reg.dispatch is a new dispatch
+// path with no per-site hydrate call of its own (unlike key/menu/mouse), so without the
+// run-loop's post-pump `hydrate_overlays` a `wc.command`-opened overlay would render empty.
+// ---------------------------------------------------------------------------
+
+/// A plugin command calling `wc.command("palette")` opens the palette overlay via
+/// `Registry::dispatch` (the builtin `palette` handler) — but that handler only installs an
+/// EMPTY placeholder (`editor.open_palette()`, rows empty); without the post-pump
+/// `hydrate_overlays` call, the palette would render with no rows. Dispatched via the SAME
+/// palette→Enter journey every other plugin-command test uses, so the plugin callback (and
+/// its `wc.command`) runs inside the SAME `step` as every other pump-driven journey.
+#[test]
+fn wc_command_palette_open_is_hydrated() {
+    let src = "wc.register_command{ name='open_palette', label='Open Palette', \
+               fn=function() wc.command('palette') end }";
+    let mut h = Harness::new_with_plugin("hello\n", &[("op", src)]);
+    h.ctrl('p');
+    h.type_str("open palette");
+    h.key(KeyCode::Enter);
+    let e = h.editor.borrow();
+    let p = e.palette.as_ref().expect("wc.command('palette') must have opened the palette overlay");
+    assert!(!p.rows.is_empty(),
+        "the post-pump hydrate_overlays call must have populated palette rows — an empty palette \
+         means the wc.command-opened overlay was never hydrated");
+}
+
+/// The `wc.command("menu")` mirror of [`wc_command_palette_open_is_hydrated`] — the menu
+/// builtin only sets `editor.menu = Some(<unbuilt placeholder>)`; without the post-pump
+/// `hydrate_overlays` call, `built` would stay `false` and `groups` would stay empty.
+#[test]
+fn wc_command_menu_open_is_hydrated() {
+    let src = "wc.register_command{ name='open_menu', label='Open Menu', \
+               fn=function() wc.command('menu') end }";
+    let mut h = Harness::new_with_plugin("hello\n", &[("om", src)]);
+    h.ctrl('p');
+    h.type_str("open menu");
+    h.key(KeyCode::Enter);
+    let e = h.editor.borrow();
+    let m = e.menu.as_ref().expect("wc.command('menu') must have opened the menu overlay");
+    assert!(m.built, "the post-pump hydrate_overlays call must have built the menu (built=false)");
+    assert!(m.groups.iter().any(|g| !g.1.is_empty()), "the built menu must actually contain command rows");
 }
 
 /// `true` iff `s` is exactly 10 bytes shaped `\d{4}-\d{2}-\d{2}` — a dependency-free ISO-date

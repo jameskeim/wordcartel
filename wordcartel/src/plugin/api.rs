@@ -193,6 +193,7 @@ pub(crate) fn install_editor_api(lua: &mlua::Lua, bridge: &Bridge) -> mlua::Resu
     install_replace(lua, &wc, bridge)?;
     install_set_selection(lua, &wc, bridge)?;
     install_status(lua, &wc, bridge)?;
+    install_command(lua, &wc, bridge)?;
     install_registration_closed(lua, &wc)?;
     install_on_closed(lua, &wc)?;
     install_config_cleared(&wc)?;
@@ -403,6 +404,40 @@ fn install_status(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::R
         lua.create_function(move |_, msg: mlua::String| {
             let mut e = editor.try_borrow_mut().map_err(|_| mlua::Error::runtime("plugin: editor busy"))?;
             e.status = crate::plugin::cap_status(&msg.as_bytes(), crate::limits::PLUGIN_MAX_STATUS_LEN);
+            Ok(())
+        })?,
+    )?;
+    Ok(())
+}
+
+/// `wc.command(name)` (§5a) — enqueue a fire-and-forget dispatch, resolved at pump drain
+/// against the LIVE `&Registry` (never a call-time name-set snapshot — contract law 1: the
+/// registry is the single source of truth). Checks, in order: observer (blocked from a hook —
+/// mutation-by-proxy, and `on_save`→`save` would self-cascade), the borrowed-name length cap,
+/// then the queue cap — each BEFORE any allocation past what mlua already borrowed.
+fn install_command(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::Result<()> {
+    let editor = bridge.editor.clone();
+    let invoke = bridge.invoke_state.clone();
+    wc.set(
+        "command",
+        lua.create_function(move |_, name: mlua::String| {
+            let st = invoke.borrow();
+            if st.observer {
+                return Err(mlua::Error::runtime("plugin: wc.command is not allowed from an event hook"));
+            }
+            if name.as_bytes().len() > crate::limits::PLUGIN_MAX_COMMAND_REF {
+                return Err(mlua::Error::runtime("plugin: command name too long"));
+            }
+            let origin = st.current.clone().unwrap_or_default();
+            drop(st);
+            let mut e = editor.try_borrow_mut().map_err(|_| mlua::Error::runtime("plugin: editor busy"))?;
+            if e.pending_plugin_dispatch.len() >= crate::limits::PLUGIN_MAX_PENDING_DISPATCH {
+                return Err(mlua::Error::runtime("plugin: command queue full"));
+            }
+            e.pending_plugin_dispatch.push_back(crate::plugin::PluginDispatch {
+                origin,
+                name: name.to_str()?.to_owned(),
+            });
             Ok(())
         })?,
     )?;
