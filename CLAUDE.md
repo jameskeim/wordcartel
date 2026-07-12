@@ -133,17 +133,18 @@ Split by code state, proven on the splash effort (2026-07-10): the LSP is a fast
 ### Commit/push rules
 - Branch per effort off the trunk; never implement on the default branch without consent.
 - Commit/push only when explicitly asked.
-- Every commit ends with the `Co-Authored-By` trailer, verbatim:
+- Every commit ends with the project trailers, verbatim — the `Co-Authored-By` line below,
+  then a `Claude-Session:` line with the current session's URL:
   ```
   Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
-  ```
-- Add a `Claude-Session:` trailer with the session's URL **when the environment exposes one**
-  (it usually does; `/status` shows it):
-  ```
   Claude-Session: <current session URL>
   ```
-  If no session URL is available, OMIT the line — do not invent a URL, and do not block the
-  commit on it. Provenance is worth recording where it's real, worthless where it's fabricated.
+  **Where to find the URL:** it is supplied in the agent's own harness instructions (the Git
+  section says "End git commit messages with … `Claude-Session: https://claude.ai/code/session_…`").
+  It is NOT in the shell `env`, and it is NOT derivable from the Session ID that `/status`
+  prints — that is a different identifier in a different format (a UUID), and pasting it into
+  a `claude.ai/code/` URL yields a WRONG link. Read the harness instructions; never construct
+  the URL from a session ID, and never invent one.
 
 ---
 
