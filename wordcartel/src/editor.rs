@@ -393,6 +393,9 @@ pub struct Editor {
     // global app state
     pub register: Register,
     pub status: String,
+    /// Plugin-command invocations queued by the registry Plugin dispatch arm, drained by the
+    /// pump (P1). Default-empty; a settled/idle editor never grows it. VecDeque for FIFO.
+    pub pending_plugin_calls: std::collections::VecDeque<crate::plugin::PluginCall>,
     /// True while the last block-tree parse panicked (M4-rest). Dedupes the
     /// status notice so a persistently-panicking document does not spam it.
     pub parse_degraded: bool,
@@ -538,7 +541,9 @@ impl Editor {
         );
         let mut e = Editor {
             buffers: Vec::new(), active: 0, next_buffer_id: 0,
-            register: Register::default(), status: String::new(), parse_degraded: false, quit: false,
+            register: Register::default(), status: String::new(),
+            pending_plugin_calls: std::collections::VecDeque::new(),
+            parse_degraded: false, quit: false,
             prompt: None, pending_after_save: None, pending_save_as: None, pending_save_overwrite: None,
             pending_write_block: None, pending_clean: Vec::new(),
             filter_in_flight: None, transform_in_flight: false, minibuffer: None, pending_export: None,

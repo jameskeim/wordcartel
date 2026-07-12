@@ -264,6 +264,29 @@ mod tests {
         assert_eq!(p.rows.len(), reg.commands().count(), "row count == registry command count");
     }
 
+    /// Effort P1 (spec §9): LAW 3 holds even with plugin entries present — plugin commands
+    /// register into the SAME `Registry` the palette iterates (no parallel command store), so
+    /// palette-completeness is structural, not vigilant.
+    #[test]
+    fn palette_is_exhaustive_over_a_plugin_loaded_registry() {
+        let mut reg = crate::registry::Registry::builtins();
+        let host = crate::plugin::host::PluginHost::new().expect("VM construction");
+        let src = "wc.register_command{ name='insert', label='Plugin Insert', fn=function() end }";
+        let reports =
+            crate::plugin::load::load_sources(&mut reg, &host, &[("p1demo".to_string(), src.to_string())]);
+        assert_eq!(reports[0].result, Ok(1), "test plugin must load cleanly: {:?}", reports[0].result);
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let mut p = Palette::default();
+        rebuild_rows(&mut p, &reg, &km);
+        let ids: std::collections::HashSet<_> = p.rows.iter().map(|r| r.id).collect();
+        for (id, _) in reg.commands() {
+            assert!(ids.contains(&id), "palette missing registered command {}", id.0);
+        }
+        assert_eq!(p.rows.len(), reg.commands().count(), "row count == registry command count");
+        assert!(p.rows.iter().any(|r| r.label == "Plugin Insert"),
+            "the plugin command must appear in the palette like any builtin");
+    }
+
     #[test]
     fn rebuild_rows_fuzzy_filters_and_ranks() {
         let reg = crate::registry::Registry::builtins();

@@ -65,3 +65,10 @@ fn timers_rs_grows_by_rows_not_bulk() {
     // add a SUBSYSTEMS row + a small deadline fn, never bulk; this keeps the seam a seam.
     assert_hub_budget("src/timers.rs", 400);
 }
+
+#[test]
+fn plugin_host_stays_bounded() {
+    // plugin/host.rs — the VM+pump+bridge hub (Effort P1). Budget with headroom over the
+    // merged P1 size so the pump/bridge wiring can't silently regrow into a dispatch hub.
+    assert_hub_budget("src/plugin/host.rs", 400);
+}

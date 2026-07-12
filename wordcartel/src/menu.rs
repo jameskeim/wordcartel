@@ -455,6 +455,78 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Effort P1 (spec §9): LAW 4 + LAW 7 over a plugin-loaded registry
+    // -----------------------------------------------------------------------
+
+    /// LAW 4 — a plugin command tagged `menu=Some(Edit)` is a registered command, hence
+    /// appears in BOTH the Edit menu group and the palette; a `menu=None` sibling is
+    /// palette-only. Plugin entries obey menu ⊆ palette exactly like builtins — no dynamic
+    /// section, no parallel path.
+    #[test]
+    fn plugin_menu_tagged_command_appears_in_menu_menu_none_is_palette_only() {
+        let mut reg = crate::registry::Registry::builtins();
+        let host = crate::plugin::host::PluginHost::new().expect("VM construction");
+        let src = "wc.register_command{ name='a', label='Plugin Edit Thing', menu='Edit', fn=function() end }\n\
+                   wc.register_command{ name='b', label='Plugin Palette Only', fn=function() end }";
+        let reports =
+            crate::plugin::load::load_sources(&mut reg, &host, &[("p1menu".to_string(), src.to_string())]);
+        assert_eq!(reports[0].result, Ok(2), "test plugin must load cleanly: {:?}", reports[0].result);
+        let a_id = reg.resolve_name("p1menu.a").expect("registered");
+        let b_id = reg.resolve_name("p1menu.b").expect("registered");
+
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ed = throwaway_editor();
+        let view = build(&reg, &km, &ed);
+        let edit_items: Vec<(String, MenuRowAction)> = view.groups.iter()
+            .find(|(cat, _)| *cat == crate::registry::MenuCategory::Edit)
+            .map(|(_, items)| items.clone())
+            .unwrap_or_default();
+        assert!(edit_items.iter().any(|(_, action)| *action == MenuRowAction::Command(a_id)),
+            "menu=Some(Edit) plugin command must appear in the Edit menu group: {edit_items:?}");
+        assert!(view.groups.iter().all(|(_, items)|
+            !items.iter().any(|(_, action)| *action == MenuRowAction::Command(b_id))),
+            "menu=None plugin command must appear in NO menu group");
+
+        // Palette side: BOTH appear — the menu-tagged AND the palette-only command.
+        let mut p = crate::palette::Palette::default();
+        crate::palette::rebuild_rows(&mut p, &reg, &km);
+        assert!(p.rows.iter().any(|r| r.id == a_id), "menu-tagged plugin command missing from palette");
+        assert!(p.rows.iter().any(|r| r.id == b_id), "palette-only plugin command missing from palette");
+    }
+
+    /// LAW 7 — a `keymap.patches` binding of a plugin command resolves in `build_keymap`
+    /// (via `reg.resolve_name`, the same mechanism a builtin binds through) and SURVIVES a
+    /// CUA↔WordStar preset switch (the patch is re-applied against whichever preset base is
+    /// active, so the plugin binding is preset-independent — the same guarantee
+    /// `custom_bind_surfaces_in_menu_and_palette` proves for `cut` above, now proven for a
+    /// plugin command).
+    #[test]
+    fn plugin_command_bound_via_patch_resolves_and_survives_preset_switch() {
+        let mut reg = crate::registry::Registry::builtins();
+        let host = crate::plugin::host::PluginHost::new().expect("VM construction");
+        let src = "wc.register_command{ name='cmd', label='Plugin Bound', fn=function() end }";
+        let reports =
+            crate::plugin::load::load_sources(&mut reg, &host, &[("p1law7".to_string(), src.to_string())]);
+        assert_eq!(reports[0].result, Ok(1), "test plugin must load cleanly: {:?}", reports[0].result);
+        let id = reg.resolve_name("p1law7.cmd").expect("registered");
+
+        let patch = crate::config::KeymapPatch {
+            bind: [("ctrl-alt-p".to_string(), "p1law7.cmd".to_string())].into_iter().collect(),
+            unbind: vec![], cua: None, wordstar: None,
+        };
+        let (km_cua, warns_cua) = crate::keymap::build_keymap(
+            &crate::config::KeymapConfig { preset: "cua".into(), patches: vec![patch.clone()] }, &reg);
+        assert!(warns_cua.is_empty(), "patch must resolve cleanly under CUA: {warns_cua:?}");
+        assert_eq!(km_cua.chord_for(id).as_deref(), Some("ctrl-alt-p"));
+
+        let (km_ws, warns_ws) = crate::keymap::build_keymap(
+            &crate::config::KeymapConfig { preset: "wordstar".into(), patches: vec![patch] }, &reg);
+        assert!(warns_ws.is_empty(), "patch must resolve cleanly under WordStar: {warns_ws:?}");
+        assert_eq!(km_ws.chord_for(id).as_deref(), Some("ctrl-alt-p"),
+            "the plugin binding must survive the CUA -> WordStar preset switch");
+    }
+
+    // -----------------------------------------------------------------------
     // Task 4.2 (command-surface curation, A8): Documents dynamic section
     // -----------------------------------------------------------------------
 

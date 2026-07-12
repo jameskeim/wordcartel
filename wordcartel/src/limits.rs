@@ -30,3 +30,35 @@ pub const DIAG_MAX_SEND_BYTES: u64 = 8 * 1024 * 1024;
 /// `DIAG_MAX_SEND_BYTES`-sized document plus JSON-RPC/diagnostics overhead; a frame claiming
 /// more is refused with an `io::Error` before any allocation — never a capacity-overflow panic.
 pub const LSP_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// P1 plugin registration caps (bounded-memory LAW — interned ids/labels are permanent leaks
+/// that `set_memory_limit` does not bound; checked on the raw Lua String BEFORE interning).
+pub const PLUGIN_MAX_COMMANDS_PER_PLUGIN: usize = 256;
+/// The `<plugin>` file/dir stem.
+pub const PLUGIN_MAX_STEM_LEN: usize = 64;
+/// The plugin-local command name.
+pub const PLUGIN_MAX_NAME_LEN: usize = 128;
+/// The menu/palette label.
+pub const PLUGIN_MAX_LABEL_LEN: usize = 256;
+/// `wc.status` / `error(msg)` truncation (display-only).
+pub const PLUGIN_MAX_STATUS_LEN: usize = 4096;
+// Edit text reuses PASTE_MAX_BYTES (above) — plugin edits and user paste share one pre-alloc bound.
+/// Cap on a single plugin source file read by `discover` (Task 6) — generous headroom over
+/// any real plugin script (plugin files are user CODE, not documents); an oversize file is
+/// skipped + named in the returned report, never truncated or silently dropped.
+pub const PLUGIN_MAX_SOURCE_BYTES: u64 = 1024 * 1024;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_caps_are_sane() {
+        assert_eq!(PLUGIN_MAX_COMMANDS_PER_PLUGIN, 256);
+        assert_eq!(PLUGIN_MAX_STEM_LEN, 64);
+        assert_eq!(PLUGIN_MAX_NAME_LEN, 128);
+        assert_eq!(PLUGIN_MAX_LABEL_LEN, 256);
+        assert_eq!(PLUGIN_MAX_STATUS_LEN, 4096);
+        assert_eq!(PLUGIN_MAX_SOURCE_BYTES, 1024 * 1024);
+    }
+}

@@ -14,9 +14,13 @@ pub struct Cli {
     /// `--no-splash` was passed: suppress the startup splash for THIS launch only
     /// (the persistent opt-out is `view.splash`; the flag never writes config).
     pub no_splash: bool,
+    /// `--no-plugins` was passed: force the plugin host off for THIS session only,
+    /// regardless of `[plugins] enabled` (a safe-mode escape hatch; never writes config).
+    pub no_plugins: bool,
 }
 
-/// Hand-rolled (no clap dep): `[--version|-V] [--config <path>] [--no-config] [--no-splash] [file]`.
+/// Hand-rolled (no clap dep): `[--version|-V] [--config <path>] [--no-config] [--no-splash]
+/// [--no-plugins] [file]`.
 pub fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> Cli {
     let mut cli = Cli::default();
     let mut it = args.into_iter();
@@ -26,6 +30,7 @@ pub fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> Cli {
             "--version" | "-V" => cli.version = true,
             "--no-config" => cli.no_config = true,
             "--no-splash" => cli.no_splash = true,
+            "--no-plugins" => cli.no_plugins = true,
             "--config" => cli.config_path = it.next().map(PathBuf::from),
             _ => {
                 if cli.path.is_none() {
@@ -49,6 +54,7 @@ pub struct Config {
     pub export: ExportConfig,
     pub menu: MenuConfig,
     pub clipboard: ClipboardConfig,
+    pub plugins: PluginsConfig,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -121,6 +127,22 @@ impl Default for MenuConfig {
 pub struct ClipboardConfig { pub provider: ClipboardProvider }
 impl Default for ClipboardConfig {
     fn default() -> Self { ClipboardConfig { provider: ClipboardProvider::Auto } }
+}
+
+/// Plugin host configuration section (`[plugins]`, P1 spec §4) — enable/disable ONLY;
+/// per-plugin config tables (`[plugins.<name>]`) are deferred to P2. `enabled = false` (or
+/// the session-only `--no-plugins` CLI flag, which forces this off regardless) skips the
+/// whole plugin-load phase — no VM, no `discover`, no `wc.*` surface. `disable` names stems
+/// (file/dir names under the plugins dir, no `.lua`) to skip during `discover` without
+/// removing the file — distinct from a plugin that fails to load (which is reported, not
+/// silently excluded).
+#[derive(Debug, Clone)]
+pub struct PluginsConfig {
+    pub enabled: bool,
+    pub disable: Vec<String>,
+}
+impl Default for PluginsConfig {
+    fn default() -> Self { PluginsConfig { enabled: true, disable: Vec::new() } }
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +255,7 @@ struct RawConfig {
     export: RawExport,
     menu: RawMenu,
     clipboard: RawClipboard,
+    plugins: RawPlugins,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, PartialEq)]
@@ -314,6 +337,12 @@ struct RawMenu {
 #[serde(default)]
 struct RawClipboard {
     provider: Option<String>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawPlugins {
+    enabled: Option<bool>,
+    disable: Option<Vec<String>>,
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -475,6 +504,11 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
                 other => warns.push(format!("clipboard.provider \"{other}\" invalid; using auto")),
             }
         }
+        // plugins: per-field override (omitted field inherits the lower layer); `disable`
+        // replaces wholesale when a layer sets it (not accumulated — a higher layer's list
+        // is the complete intended set, mirroring diagnostics.linters).
+        if let Some(v) = raw.plugins.enabled { cfg.plugins.enabled = v; }
+        if let Some(v) = raw.plugins.disable { cfg.plugins.disable = v; }
         // export: per-field override (omitted field inherits the lower layer).
         if let Some(v) = raw.export.pdf_engine { cfg.export.pdf_engine = v; }
         if let Some(v) = raw.export.typography { cfg.export.typography = v; }
@@ -637,6 +671,30 @@ mod tests {
         assert_eq!(c.path.as_deref(), Some(std::path::Path::new("notes.md")));
         let c = parse_cli(["wcartel"].map(String::from));
         assert!(!c.no_splash, "defaults off");
+    }
+
+    #[test]
+    fn parse_cli_no_plugins_flag() {
+        let c = parse_cli(["wcartel", "--no-plugins", "notes.md"].map(String::from));
+        assert!(c.no_plugins);
+        assert_eq!(c.path.as_deref(), Some(std::path::Path::new("notes.md")));
+        let c = parse_cli(["wcartel"].map(String::from));
+        assert!(!c.no_plugins, "defaults off");
+    }
+
+    #[test]
+    fn plugins_section_parses() {
+        let (cfg, warns) = load(&[]);
+        assert!(warns.is_empty());
+        assert!(cfg.plugins.enabled, "built-in default is on");
+        assert!(cfg.plugins.disable.is_empty(), "built-in default is empty");
+
+        let d = tempdir();
+        let p = write(&d, "plugins.toml", "[plugins]\nenabled = false\ndisable = [\"x\"]\n");
+        let (cfg, warns) = load(&[p]);
+        assert!(warns.is_empty());
+        assert!(!cfg.plugins.enabled);
+        assert_eq!(cfg.plugins.disable, vec!["x".to_string()]);
     }
 
     #[test]

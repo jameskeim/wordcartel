@@ -33,6 +33,21 @@ pub struct Ctx<'a> {
 
 pub type Handler = fn(&mut Ctx) -> CommandResult;
 
+/// A registered command's implementation: a built-in fn pointer, or a plugin (enqueue + pump).
+/// `registry.rs` stays Lua-free — the `Plugin` arm carries no Lua-typed value; dispatch only
+/// enqueues a `Copy` [`crate::plugin::PluginCall`], and the pump (Task 5) is what runs Lua.
+pub enum HandlerKind {
+    Builtin(Handler),
+    Plugin,
+}
+
+/// Why [`Registry::register_plugin`] failed. Inputs arrive pre-interned/pre-capped (Task 4's
+/// load layer), so a collision with a builtin or an earlier plugin command is the only failure.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RegisterError {
+    Duplicate,
+}
+
 // ── Command metadata ──────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -41,6 +56,24 @@ pub enum MenuCategory { File, Edit, Block, Format, View, Documents, Settings, Ex
 pub const MENU_ORDER: [MenuCategory; 8] = [MenuCategory::File, MenuCategory::Edit,
     MenuCategory::Block, MenuCategory::Format, MenuCategory::View, MenuCategory::Documents,
     MenuCategory::Settings, MenuCategory::Export];
+
+/// Parse a plugin-supplied `menu` string to a `MenuCategory` — the parse-to-enum half of the
+/// resource-bound LAW (Effort P1 global constraint 1b): an unknown menu name never enters the
+/// registry as free-form data, it is rejected as a typed error at the call site. Exhaustive
+/// over the eight variants (`MENU_ORDER`); unrecognized input is `None`, never a silent default.
+pub fn menu_from_str(s: &str) -> Option<MenuCategory> {
+    match s {
+        "File" => Some(MenuCategory::File),
+        "Edit" => Some(MenuCategory::Edit),
+        "Block" => Some(MenuCategory::Block),
+        "Format" => Some(MenuCategory::Format),
+        "View" => Some(MenuCategory::View),
+        "Documents" => Some(MenuCategory::Documents),
+        "Settings" => Some(MenuCategory::Settings),
+        "Export" => Some(MenuCategory::Export),
+        _ => None,
+    }
+}
 
 /// The live-state mark a stateful menu command interpolates into its row label.
 /// Exhaustive — adding a variant here is intentional and must be handled in every match.
@@ -60,7 +93,7 @@ pub struct CommandMeta {
 
 struct CommandEntry {
     id: CommandId,
-    handler: Handler,
+    handler: HandlerKind,
     meta: CommandMeta,
 }
 
@@ -73,14 +106,30 @@ impl Registry {
     fn register(&mut self, id: &'static str, label: &'static str, menu: Option<MenuCategory>, handler: Handler) {
         let cid = CommandId(id);
         self.index.insert(cid, self.entries.len());
-        self.entries.push(CommandEntry { id: cid, handler, meta: CommandMeta { label, menu, state: None } });
+        self.entries.push(CommandEntry { id: cid, handler: HandlerKind::Builtin(handler),
+            meta: CommandMeta { label, menu, state: None } });
     }
 
     fn register_stateful(&mut self, id: &'static str, label: &'static str, menu: Option<MenuCategory>,
                          state: fn(&crate::editor::Editor) -> MenuMark, handler: Handler) {
         let cid = CommandId(id);
         self.index.insert(cid, self.entries.len());
-        self.entries.push(CommandEntry { id: cid, handler, meta: CommandMeta { label, menu, state: Some(state) } });
+        self.entries.push(CommandEntry { id: cid, handler: HandlerKind::Builtin(handler),
+            meta: CommandMeta { label, menu, state: Some(state) } });
+    }
+
+    /// Register a plugin command. Inputs are ALREADY interned `&'static` (the load layer capped
+    /// and interned them, Task 4) — so the only failure here is a collision with a builtin or
+    /// an earlier plugin command. Never leaks (interning happened upstream).
+    pub fn register_plugin(&mut self, id: CommandId, label: &'static str, menu: Option<MenuCategory>)
+        -> Result<(), RegisterError> {
+        if self.index.contains_key(&id) {
+            return Err(RegisterError::Duplicate);
+        }
+        self.index.insert(id, self.entries.len());
+        self.entries.push(CommandEntry { id, handler: HandlerKind::Plugin,
+            meta: CommandMeta { label, menu, state: None } });
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)] // the command registry data table — one entry per command
@@ -645,10 +694,18 @@ impl Registry {
         r
     }
 
-    /// Dispatch by id. Unknown ids surface a status (never a silent no-op, §12.5).
+    /// Dispatch by id. Unknown ids surface a status (never a silent no-op, §12.5). A `Plugin`
+    /// entry does not run Lua here — it enqueues a [`crate::plugin::PluginCall`] onto
+    /// `ctx.editor.pending_plugin_calls`; the pump (Task 5) drains it between reduces.
     pub fn dispatch(&self, id: CommandId, ctx: &mut Ctx) -> CommandResult {
         match self.index.get(&id) {
-            Some(&i) => (self.entries[i].handler)(ctx),
+            Some(&i) => match &self.entries[i].handler {
+                HandlerKind::Builtin(h) => h(ctx),
+                HandlerKind::Plugin => {
+                    ctx.editor.pending_plugin_calls.push_back(crate::plugin::PluginCall { id });
+                    CommandResult::Handled
+                }
+            },
             None => {
                 ctx.editor.status = format!("unknown command: {}", id.0);
                 CommandResult::Noop
@@ -829,6 +886,20 @@ mod tests {
     impl Clock for Z { fn now_ms(&self) -> u64 { 0 } }
 
     #[test]
+    fn menu_from_str_parses_all_eight_and_rejects_unknown() {
+        for (s, m) in [
+            ("File", MenuCategory::File), ("Edit", MenuCategory::Edit),
+            ("Block", MenuCategory::Block), ("Format", MenuCategory::Format),
+            ("View", MenuCategory::View), ("Documents", MenuCategory::Documents),
+            ("Settings", MenuCategory::Settings), ("Export", MenuCategory::Export),
+        ] {
+            assert_eq!(menu_from_str(s), Some(m));
+        }
+        assert_eq!(menu_from_str("Nonsense"), None);
+        assert_eq!(menu_from_str(""), None);
+    }
+
+    #[test]
     fn commands_iterate_in_registration_order_with_meta() {
         let reg = Registry::builtins();
         let ids: Vec<&str> = reg.commands().map(|(id, _)| id.0).collect();
@@ -897,6 +968,51 @@ mod tests {
         assert!(matches!(e.minibuffer.as_ref().map(|m| m.kind),
             Some(crate::minibuffer::MinibufferKind::SaveAs)),
             "unnamed save opens the Save-As minibuffer");
+    }
+
+    #[test]
+    fn register_plugin_adds_a_dispatchable_command() {
+        let mut reg = Registry::builtins();
+        let id = CommandId(crate::plugin::intern("register-plugin-test.hello"));
+        let label = crate::plugin::intern("Hello Plugin");
+        reg.register_plugin(id, label, None).expect("register_plugin should succeed on a fresh id");
+        assert_eq!(reg.resolve_name("register-plugin-test.hello"), Some(id));
+        assert_eq!(reg.meta(id).unwrap().label, "Hello Plugin");
+        assert!(reg.commands().any(|(cid, _)| cid == id), "must appear in commands()");
+    }
+
+    #[test]
+    fn register_plugin_rejects_collision() {
+        let mut reg = Registry::builtins();
+        // Collides with a builtin.
+        let err = reg.register_plugin(CommandId("save"), "Whatever", None).unwrap_err();
+        assert_eq!(err, RegisterError::Duplicate);
+
+        // Collides with a prior plugin registration; registry unchanged by the rejected call.
+        let id = CommandId(crate::plugin::intern("register-plugin-test.dup"));
+        reg.register_plugin(id, "Once", None).expect("first registration should succeed");
+        let count_before = reg.commands().count();
+        let err2 = reg.register_plugin(id, "Twice", None).unwrap_err();
+        assert_eq!(err2, RegisterError::Duplicate);
+        assert_eq!(reg.commands().count(), count_before, "registry unchanged by a rejected collision");
+    }
+
+    #[test]
+    fn plugin_dispatch_enqueues_not_runs() {
+        let mut reg = Registry::builtins();
+        let id = CommandId(crate::plugin::intern("register-plugin-test.enqueue"));
+        reg.register_plugin(id, "Enqueue Test", None).expect("register_plugin should succeed");
+
+        let mut e = Editor::new_from_text("hi\n", None, (80, 24));
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let r = reg.dispatch(id, &mut ctx);
+
+        assert_eq!(r, CommandResult::Handled);
+        assert_eq!(e.pending_plugin_calls.len(), 1, "dispatch enqueues, does not run any Lua");
+        assert_eq!(e.pending_plugin_calls[0], crate::plugin::PluginCall { id });
     }
 
     #[test]
