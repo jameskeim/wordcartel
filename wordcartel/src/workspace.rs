@@ -188,7 +188,7 @@ pub(crate) fn close_buffer_now(editor: &mut Editor, id: BufferId) {
     // Effort A: tell the provider to abandon this doc's generation before the slot is removed or
     // replaced (all three shapes below) so the server never keeps a closed doc open until shutdown.
     // The last-ordinary replacement's fresh buffer re-opens lazily under its own new id/generation.
-    editor.diag_provider.notify_close(id);
+    editor.diag_providers.notify_close_all(id);
     crate::plugin::fire_event(editor, crate::plugin::PluginEventKind::BufferClose, closing.as_deref());
     let ordinary = editor.buffers.iter().filter(|b| !editor.is_scratch(b.id)).count();
     if ordinary <= 1 {
@@ -609,9 +609,9 @@ mod tests {
         use crate::diag_provider::{RecordingProvider, ProviderCall};
         // Helper: build a 3-ordinary editor, install a fresh recorder, return (editor, call handle).
         let install = |e: &mut Editor| {
-            let rec = RecordingProvider::new();
+            let rec = RecordingProvider::new().with_source(wordcartel_core::diagnostics::DiagSource::Harper);
             let calls = rec.calls_handle();
-            e.diag_provider = Box::new(rec);
+            e.diag_providers.install(Box::new(rec), true);
             calls
         };
         let closed = |calls: &std::sync::Arc<std::sync::Mutex<Vec<ProviderCall>>>, id: crate::editor::BufferId| {

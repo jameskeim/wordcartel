@@ -686,13 +686,13 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // Effort A: install the diagnostics provider now that the msg channel exists. HarperLs spawns
     // nothing here — its client thread starts on the first Review dispatch (lazy; spec §3.1). Config
     // is derived from the loaded DiagnosticsConfig; the file-length cap bounds per-recheck stdio.
-    editor.diag_provider = Box::new(crate::harper_ls::HarperLs::new(
+    editor.diag_providers.install(Box::new(crate::harper_ls::HarperLs::new(
         msg_tx.clone(),
         crate::diag_provider::ProviderConfig {
             grammar: cfg.diagnostics.grammar,
             dictionary: cfg.diagnostics.dictionary.clone(),
             max_file_length: crate::limits::HARPER_MAX_FILE_LENGTH,
-        }));
+        })), true);
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
     let executor = crate::jobs::ThreadExecutor::new(wake_tx);
     let clip_env = crate::clipboard::clip_env_from_process();
@@ -885,7 +885,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // input-loss, channel-disconnect all converge here) — sends LSP shutdown/exit and reaps the
     // child, non-blocking. The client thread's FlushGuard still emits terminals for any
     // accepted-but-unpublished change, so no latch is left dangling (spec §3/§4.6).
-    editor.borrow_mut().diag_provider.shutdown();
+    editor.borrow_mut().diag_providers.shutdown_all();
 
     // Input-loss shutdown: persist every dirty buffer non-interactively (the
     // interactive quit-drain can't run — input is gone). Controlled break, so
@@ -3312,7 +3312,8 @@ mod tests {
     #[test]
     fn reduce_delivers_diag_provider_event_to_status() {
         use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
-        use crate::diag_provider::{ProviderEvent, INSTALL_HINT};
+        use crate::diag_provider::ProviderEvent;
+        use crate::harper_ls::INSTALL_HINT;
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         assert!(e.prompt.is_none(), "precondition: no modal");
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
@@ -3331,9 +3332,10 @@ mod tests {
         e.active_mut().view.mode = RenderMode::Review; // E7 T2: on_tick's dispatch is now Review-gated
         // Effort A: on_tick dispatches through the provider seam, not an embedded worker. Install a
         // Ready/accepting recorder so a due Tick hands the buffer off and latches in_flight.
-        let rec = crate::diag_provider::RecordingProvider::new();
+        let rec = crate::diag_provider::RecordingProvider::new()
+            .with_source(wordcartel_core::diagnostics::DiagSource::Harper);
         let calls = rec.calls_handle();
-        e.diag_provider = Box::new(rec);
+        e.diag_providers.install(Box::new(rec), true);
         e.active_mut().diagnostics.arm(0, 400); // due at 400
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(500); // past due

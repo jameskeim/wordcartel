@@ -424,7 +424,8 @@ mod tests {
     fn intercept_delivers_diag_provider_event_under_a_modal() {
         use crate::editor::Editor;
         use crate::jobs::InlineExecutor;
-        use crate::diag_provider::{ProviderEvent, INSTALL_HINT};
+        use crate::diag_provider::ProviderEvent;
+        use crate::harper_ls::INSTALL_HINT;
         let mut e = Editor::new_from_text("hi\n", None, (80, 24));
         e.open_prompt(crate::prompt::Prompt::close_confirm("f.md", e.active().id));
         assert!(e.prompt.is_some(), "precondition: a modal prompt is open");

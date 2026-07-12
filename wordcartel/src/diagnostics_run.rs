@@ -80,19 +80,25 @@ pub fn dispatch_diagnostics(editor: &mut Editor) {
         return; // no in_flight; nothing outstanding
     }
     use crate::diag_provider::{Availability, Accepted};
-    editor.diag_provider.ensure_running();
-    if editor.diag_provider.availability() == Availability::Unavailable {
-        show_install_hint(editor);
-        return; // no in_flight
-    }
-    if editor.diag_provider.availability() == Availability::Starting {
-        editor.status = "starting grammar checker…".into(); // no silent wait (spec §4.3)
+    use wordcartel_core::diagnostics::DiagSource;
+    editor.diag_providers.ensure_running(DiagSource::Harper);
+    // `None` (no Harper entry registered) is treated as unavailable — same as the provider itself
+    // reporting `Unavailable` (Tasks 5/6 generalize this to every registered source).
+    match editor.diag_providers.availability(DiagSource::Harper) {
+        Some(Availability::Unavailable) | None => {
+            show_install_hint(editor);
+            return; // no in_flight
+        }
+        Some(Availability::Starting) => {
+            editor.status = "starting grammar checker…".into(); // no silent wait (spec §4.3)
+        }
+        _ => {}
     }
     // LATCH INVARIANT (spec §5.1): set in_flight_version ONLY on Accepted::Yes. On Accepted::No the
     // thread died between the availability read and the send — no terminal DiagnosticsDone would ever
     // arrive, so latching here would wedge diagnostics permanently. Leave the latch clear (a fresh
     // dispatch retries) and surface the degrade hint.
-    match editor.diag_provider.notify_change(buffer_id, version, path, text) {
+    match editor.diag_providers.notify_change(DiagSource::Harper, buffer_id, version, path, text) {
         Accepted::Yes => { editor.active_mut().diagnostics.in_flight_version = Some(version); }
         Accepted::No => show_install_hint(editor),
     }
@@ -103,7 +109,7 @@ pub fn dispatch_diagnostics(editor: &mut Editor) {
 fn show_install_hint(editor: &mut Editor) {
     if !editor.diag_hint_shown {
         editor.diag_hint_shown = true;
-        editor.status = crate::diag_provider::INSTALL_HINT.into();
+        editor.status = crate::harper_ls::INSTALL_HINT.into();
     }
 }
 
@@ -293,7 +299,9 @@ mod tests {
     // Effort A: dispatch_diagnostics over the DiagnosticsProvider seam.
     // ------------------------------------------------------------------
     use crate::editor::{Editor, RenderMode};
-    use crate::diag_provider::{RecordingProvider, Availability, Accepted, INSTALL_HINT};
+    use crate::diag_provider::{RecordingProvider, Availability, Accepted};
+    use crate::harper_ls::INSTALL_HINT;
+    use wordcartel_core::diagnostics::DiagSource;
 
     fn review_editor(text: &str) -> Editor {
         let mut e = Editor::new_from_text(text, None, (80, 24));
@@ -305,9 +313,9 @@ mod tests {
     #[test]
     fn dispatch_latches_in_flight_only_on_accepted_yes() {
         let mut e = review_editor("teh\n");
-        let rec = RecordingProvider::new(); // Ready, accepts
+        let rec = RecordingProvider::new().with_source(DiagSource::Harper); // Ready, accepts
         let calls = rec.calls_handle();
-        e.diag_provider = Box::new(rec);
+        e.diag_providers.install(Box::new(rec), true);
         let v = e.active().document.version;
         e.active_mut().diagnostics.arm(0, 400);
         dispatch_diagnostics(&mut e);
@@ -322,8 +330,8 @@ mod tests {
     #[test]
     fn dispatch_no_latch_and_hint_on_accepted_no() {
         let mut e = review_editor("teh\n");
-        e.diag_provider = Box::new(RecordingProvider::new()
-            .with_accepted(Accepted::No).with_availability(Availability::Ready));
+        e.diag_providers.install(Box::new(RecordingProvider::new().with_source(DiagSource::Harper)
+            .with_accepted(Accepted::No).with_availability(Availability::Ready)), true);
         dispatch_diagnostics(&mut e);
         assert_eq!(e.active().diagnostics.in_flight_version, None, "Accepted::No must not latch");
         assert!(e.diag_hint_shown, "the degrade hint latch is set");
@@ -334,9 +342,9 @@ mod tests {
     fn dispatch_over_cap_sets_status_and_never_touches_provider() {
         let big = "x".repeat((crate::limits::DIAG_MAX_SEND_BYTES as usize) + 1);
         let mut e = review_editor(&big);
-        let rec = RecordingProvider::new();
+        let rec = RecordingProvider::new().with_source(DiagSource::Harper);
         let calls = rec.calls_handle();
-        e.diag_provider = Box::new(rec);
+        e.diag_providers.install(Box::new(rec), true);
         dispatch_diagnostics(&mut e);
         assert_eq!(e.status, "document too large for grammar checking");
         assert_eq!(e.active().diagnostics.in_flight_version, None, "over-cap: no latch");
@@ -346,8 +354,8 @@ mod tests {
     #[test]
     fn dispatch_unavailable_shows_hint_once() {
         let mut e = review_editor("teh\n");
-        e.diag_provider = Box::new(RecordingProvider::new()
-            .with_availability(Availability::Unavailable));
+        e.diag_providers.install(Box::new(RecordingProvider::new().with_source(DiagSource::Harper)
+            .with_availability(Availability::Unavailable)), true);
         dispatch_diagnostics(&mut e);
         assert_eq!(e.status, INSTALL_HINT);
         assert!(e.diag_hint_shown);
@@ -362,8 +370,8 @@ mod tests {
     #[test]
     fn dispatch_starting_shows_no_silent_wait_status_and_latches() {
         let mut e = review_editor("teh\n");
-        e.diag_provider = Box::new(RecordingProvider::new()
-            .with_availability(Availability::Starting)); // still accepts (queued post-handshake)
+        e.diag_providers.install(Box::new(RecordingProvider::new().with_source(DiagSource::Harper)
+            .with_availability(Availability::Starting)), true); // still accepts (queued post-handshake)
         let v = e.active().document.version;
         dispatch_diagnostics(&mut e);
         assert_eq!(e.status, "starting grammar checker…");

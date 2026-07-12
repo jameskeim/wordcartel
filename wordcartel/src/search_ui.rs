@@ -172,7 +172,7 @@ pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_co
         editor.dictionary.insert(word.clone());
         match editor.diag_cfg.dictionary.clone() {
             Some(dict_path) => match crate::diagnostics_run::append_word_to_dict(&dict_path, &word) {
-                Ok(()) => editor.diag_provider.reload_dictionary(),
+                Ok(()) => editor.diag_providers.reload_dictionary_enabled(),
                 Err(e) => editor.status = format!("add to dictionary failed: {e}"),
             },
             None => editor.status = "no dictionary path configured".into(),
@@ -354,9 +354,10 @@ mod tests {
         e.diag_cfg.enabled = true;
         e.diag_cfg.dictionary = Some(dict_path.clone());
         e.active_mut().view.mode = RenderMode::Review;
-        let rec = crate::diag_provider::RecordingProvider::new();
+        let rec = crate::diag_provider::RecordingProvider::new()
+            .with_source(wordcartel_core::diagnostics::DiagSource::Harper);
         let calls = rec.calls_handle();
-        e.diag_provider = Box::new(rec);
+        e.diag_providers.install(Box::new(rec), true);
         seed_teh_diag(&mut e);
         open_diag_selected(&mut e, false);
         diag_apply_selected(&mut e, &TestClock(5_000));

@@ -491,9 +491,9 @@ pub struct Editor {
     pub session_ignores: std::collections::HashSet<String>,
     /// Quick-fix overlay state. XOR with prompt/minibuffer/palette/menu/search.
     pub diag: Option<crate::diag_overlay::DiagOverlay>,
-    /// Active diagnostics provider (Effort A). NullProvider by default → hermetic construction;
-    /// run() installs HarperLs once the msg channel exists.
-    pub diag_provider: Box<dyn crate::diag_provider::DiagnosticsProvider>,
+    /// Registered diagnostics providers (Effort A/SPINE). Empty `ProviderSet` by default →
+    /// hermetic construction; run() installs HarperLs once the msg channel exists.
+    pub diag_providers: crate::diag_provider::ProviderSet,
     /// One install-hint per deliberate Review entry (reset in set_render_mode). Spec §9.
     pub diag_hint_shown: bool,
     /// Outline picker overlay state. XOR with prompt/minibuffer/palette/menu/search/diag.
@@ -607,7 +607,7 @@ impl Editor {
             dictionary: std::collections::HashSet::new(),
             session_ignores: std::collections::HashSet::new(),
             diag: None,
-            diag_provider: Box::new(crate::diag_provider::NullProvider),
+            diag_providers: crate::diag_provider::ProviderSet::default(),
             diag_hint_shown: false,
             outline: None,
             theme_picker: None,

@@ -23,8 +23,9 @@ pub(crate) fn status_left_text(editor: &Editor) -> String {
         crate::editor::RenderMode::SourceHighlighted => "SRC-HI".into(),
         crate::editor::RenderMode::SourcePlain => "SOURCE".into(),
         crate::editor::RenderMode::Review =>
-            if editor.diag_provider.availability() == crate::diag_provider::Availability::Ready {
-                format!("REVIEW · {}", editor.diag_provider.name()).into()
+            if editor.diag_providers.availability(wordcartel_core::diagnostics::DiagSource::Harper)
+                == Some(crate::diag_provider::Availability::Ready) {
+                format!("REVIEW · {}", wordcartel_core::diagnostics::DiagSource::Harper.label()).into()
             } else { "REVIEW".into() },
     };
     let mut text = if editor.status.is_empty() {
@@ -136,25 +137,32 @@ mod tests {
     fn status_line_shows_review_label() {
         let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
         e.active_mut().view.mode = crate::editor::RenderMode::Review;
-        // Default NullProvider is Idle (not Ready) → plain [REVIEW], no attribution.
+        // Default empty ProviderSet has no Harper entry (availability() -> None, not Ready) →
+        // plain [REVIEW], no attribution.
         assert!(crate::render_status::status_left_text(&e).contains("[REVIEW]"), "review mode labels [REVIEW]");
     }
 
-    /// Effort A §10: a *live* provider attributes the Review label with its name; a non-Ready
-    /// provider shows plain REVIEW.
+    /// Effort A §10: a *live* provider attributes the Review label with its source's label; a
+    /// non-Ready provider shows plain REVIEW.
     #[test]
     fn status_line_attributes_review_only_when_provider_ready() {
         use crate::diag_provider::{RecordingProvider, Availability};
+        use wordcartel_core::diagnostics::DiagSource;
         let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
         e.active_mut().view.mode = crate::editor::RenderMode::Review;
-        e.diag_provider = Box::new(RecordingProvider::new().with_availability(Availability::Ready));
-        // RecordingProvider::name() is "recording"; the mechanism prints `REVIEW · <name>`.
-        assert!(crate::render_status::status_left_text(&e).contains("[REVIEW · recording]"),
+        e.diag_providers.install(Box::new(RecordingProvider::new()
+            .with_source(DiagSource::Harper).with_availability(Availability::Ready)), true);
+        // The label comes from DiagSource::Harper.label(), not the provider's own identity.
+        assert!(crate::render_status::status_left_text(&e).contains("[REVIEW · Harper]"),
             "Ready → attribution");
-        e.diag_provider = Box::new(RecordingProvider::new().with_availability(Availability::Starting));
-        assert!(crate::render_status::status_left_text(&e).contains("[REVIEW]"),
+
+        let mut e2 = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
+        e2.active_mut().view.mode = crate::editor::RenderMode::Review;
+        e2.diag_providers.install(Box::new(RecordingProvider::new()
+            .with_source(DiagSource::Harper).with_availability(Availability::Starting)), true);
+        assert!(crate::render_status::status_left_text(&e2).contains("[REVIEW]"),
             "Starting → plain REVIEW");
-        assert!(!crate::render_status::status_left_text(&e).contains("·"),
+        assert!(!crate::render_status::status_left_text(&e2).contains("·"),
             "no attribution dot when not Ready");
     }
 }

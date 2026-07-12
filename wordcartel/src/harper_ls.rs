@@ -22,12 +22,14 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::app::Msg;
-use crate::diag_provider::{
-    Accepted, Availability, DiagnosticsProvider, ProviderConfig, ProviderEvent, INSTALL_HINT,
-};
+use crate::diag_provider::{Accepted, Availability, DiagnosticsProvider, ProviderConfig, ProviderEvent};
 use crate::editor::BufferId;
 use crate::limits::DIAG_MAX_SEND_BYTES;
 use wordcartel_core::diagnostics::{Diagnostic, DiagnosticKind, DiagSource};
+
+/// Status hint shown when harper-ls is unavailable (spec §9) — harper's own install copy.
+pub const INSTALL_HINT: &str =
+    "grammar checker unavailable — install harper-ls (Arch: pacman -S harper)";
 
 /// Publish watchdog: if the server never publishes for a sent version, emit an empty terminal
 /// after this so the single-in-flight latch never wedges (spec §3.4).
@@ -609,7 +611,8 @@ impl HarperLs {
 }
 
 impl DiagnosticsProvider for HarperLs {
-    fn name(&self) -> &'static str { "Harper" }
+    fn source(&self) -> DiagSource { DiagSource::Harper }
+    fn install_hint(&self) -> &'static str { INSTALL_HINT }
 
     fn availability(&self) -> Availability {
         *self.shared.availability.lock().expect("availability mutex")
@@ -1376,7 +1379,7 @@ mod tests {
     fn harper_ls_new_is_idle_and_spawns_nothing() {
         let (msg_tx, _msg_rx) = std::sync::mpsc::channel::<Msg>();
         let p = HarperLs::new(msg_tx, cfg(true));
-        assert_eq!(p.name(), "Harper");
+        assert_eq!(p.source(), DiagSource::Harper);
         assert_eq!(p.availability(), Availability::Idle);
     }
 

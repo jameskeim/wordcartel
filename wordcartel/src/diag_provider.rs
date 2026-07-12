@@ -1,14 +1,11 @@
-//! The `DiagnosticsProvider` seam (Effort A): a thin, mockable trait behind which a diagnostics
-//! backend runs. `NullProvider` is the hermetic default; `HarperLs` (harper_ls.rs) is the real one.
-//! No merge/multi-provider machinery — harper is the only provider; the seam is Open-Closed
-//! insurance for provider #2.
+//! The `DiagnosticsProvider` seam (Effort A/SPINE): a thin, mockable trait behind which a
+//! diagnostics backend runs, plus the [`ProviderSet`] registry that holds every installed engine
+//! keyed by `DiagSource`. The empty `ProviderSet` (no entries) is the hermetic default — no
+//! thread, no process, no emissions — the role `NullProvider` used to play. `HarperLs`
+//! (harper_ls.rs) is the first real provider.
 use crate::editor::{BufferId, Editor};
 use wordcartel_core::diagnostics::DiagSource;
 use wordcartel_core::history::Clock;
-
-/// Status hint shown when no checker is available (spec §9).
-pub const INSTALL_HINT: &str =
-    "grammar checker unavailable — install harper-ls (Arch: pacman -S harper)";
 
 /// Coarse lifecycle state of the backing process/connection (spec §2).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -34,7 +31,11 @@ pub enum ProviderEvent { Restarted, Degraded(String) }
 /// `Msg::DiagnosticsDone` (and lifecycle as `Msg::DiagProviderEvent`) on the `Sender<Msg>` the impl
 /// was constructed with. All methods are non-blocking (hot-path law).
 pub trait DiagnosticsProvider: std::fmt::Debug {
-    fn name(&self) -> &'static str;
+    /// The engine identity — the namespace tag other subsystems (store, status line, lens) key on.
+    fn source(&self) -> DiagSource;
+    /// Status-line hint shown when this engine is unavailable (spec §9). `&'static str`: each
+    /// provider owns its own install copy (harper's lives in `harper_ls.rs`).
+    fn install_hint(&self) -> &'static str;
     fn availability(&self) -> Availability;
     fn ensure_running(&mut self);
     fn configure(&mut self, cfg: ProviderConfig);
@@ -49,19 +50,72 @@ pub trait DiagnosticsProvider: std::fmt::Debug {
     fn shutdown(&mut self);
 }
 
-/// Hermetic default (production): no thread, no process, no emissions.
+/// The registered diagnostic engines, identified by `DiagSource`. Insertion order is the lens
+/// cycle order (core catalog order — harper first). Hermetic default: empty (no thread, no
+/// process, no emissions — the role `NullProvider` used to play).
 #[derive(Debug, Default)]
-pub struct NullProvider;
-impl DiagnosticsProvider for NullProvider {
-    fn name(&self) -> &'static str { "none" }
-    fn availability(&self) -> Availability { Availability::Idle }
-    fn ensure_running(&mut self) {}
-    fn configure(&mut self, _cfg: ProviderConfig) {}
-    fn notify_change(&mut self, _b: BufferId, _v: u64, _p: Option<std::path::PathBuf>, _t: String)
-        -> Accepted { Accepted::No }
-    fn notify_close(&mut self, _b: BufferId) {}
-    fn reload_dictionary(&mut self) {}
-    fn shutdown(&mut self) {}
+pub struct ProviderSet { entries: Vec<ProviderEntry> }
+
+#[derive(Debug)]
+struct ProviderEntry { enabled: bool, provider: Box<dyn DiagnosticsProvider> }
+
+impl ProviderSet {
+    /// Register an engine. Duplicate sources are a wiring bug (cold startup path).
+    pub fn install(&mut self, provider: Box<dyn DiagnosticsProvider>, enabled: bool) {
+        let src = provider.source();
+        assert!(!self.entries.iter().any(|e| e.provider.source() == src),
+            "duplicate diagnostics provider source: {src:?}");
+        self.entries.push(ProviderEntry { enabled, provider });
+    }
+    pub fn sources(&self) -> impl Iterator<Item = DiagSource> + '_ {
+        self.entries.iter().map(|e| e.provider.source())
+    }
+    pub fn enabled_sources(&self) -> impl Iterator<Item = DiagSource> + '_ {
+        self.entries.iter().filter(|e| e.enabled).map(|e| e.provider.source())
+    }
+    pub fn is_enabled(&self, source: DiagSource) -> bool {
+        self.entries.iter().any(|e| e.provider.source() == source && e.enabled)
+    }
+    pub fn set_enabled(&mut self, source: DiagSource, on: bool) -> bool {
+        match self.entries.iter_mut().find(|e| e.provider.source() == source) {
+            Some(e) => { e.enabled = on; true }
+            None => false,
+        }
+    }
+    fn get_mut(&mut self, source: DiagSource) -> Option<&mut ProviderEntry> {
+        self.entries.iter_mut().find(|e| e.provider.source() == source)
+    }
+    fn get(&self, source: DiagSource) -> Option<&ProviderEntry> {
+        self.entries.iter().find(|e| e.provider.source() == source)
+    }
+    pub fn availability(&self, source: DiagSource) -> Option<Availability> {
+        self.get(source).map(|e| e.provider.availability())
+    }
+    pub fn install_hint(&self, source: DiagSource) -> Option<&'static str> {
+        self.get(source).map(|e| e.provider.install_hint())
+    }
+    pub fn ensure_running(&mut self, source: DiagSource) {
+        if let Some(e) = self.get_mut(source) { e.provider.ensure_running(); }
+    }
+    pub fn notify_change(&mut self, source: DiagSource, buffer_id: BufferId, version: u64,
+        path: Option<std::path::PathBuf>, text: String) -> Accepted {
+        match self.get_mut(source) {
+            Some(e) => e.provider.notify_change(buffer_id, version, path, text),
+            None => Accepted::No,
+        }
+    }
+    pub fn configure(&mut self, source: DiagSource, cfg: ProviderConfig) {
+        if let Some(e) = self.get_mut(source) { e.provider.configure(cfg); }
+    }
+    pub fn notify_close_all(&mut self, buffer_id: BufferId) {
+        for e in self.entries.iter_mut() { e.provider.notify_close(buffer_id); }
+    }
+    pub fn reload_dictionary_enabled(&mut self) {
+        for e in self.entries.iter_mut().filter(|e| e.enabled) { e.provider.reload_dictionary(); }
+    }
+    pub fn shutdown_all(&mut self) {
+        for e in self.entries.iter_mut() { e.provider.shutdown(); }
+    }
 }
 
 /// Thin reduce/prompts delegation (spec §2). `clock` is needed for the Restarted re-arm.
@@ -114,26 +168,30 @@ impl PartialEq for ProviderConfig {
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct RecordingProvider {
-    // Shared handle so a test can read the call log AFTER the provider is boxed into
-    // `editor.diag_provider` and moved out of reach: clone `calls_handle()` before installing.
+    // Shared handle so a test can read the call log AFTER the provider is boxed into the
+    // `ProviderSet` and moved out of reach: clone `calls_handle()` before installing.
     calls: std::sync::Arc<std::sync::Mutex<Vec<ProviderCall>>>,
     accepted: Accepted,
     availability: Availability,
+    source: DiagSource,
 }
 
 #[cfg(test)]
 impl RecordingProvider {
-    /// New recorder: `notify_change` accepts, `availability()` reports `Ready`.
+    /// New recorder: `notify_change` accepts, `availability()` reports `Ready`, source is
+    /// `DiagSource::Plugin("recording")` (override with `with_source`).
     pub(crate) fn new() -> Self {
         RecordingProvider {
             calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             accepted: Accepted::Yes, availability: Availability::Ready,
+            source: DiagSource::Plugin("recording"),
         }
     }
     pub(crate) fn with_accepted(mut self, accepted: Accepted) -> Self { self.accepted = accepted; self }
     pub(crate) fn with_availability(mut self, availability: Availability) -> Self {
         self.availability = availability; self
     }
+    pub(crate) fn with_source(mut self, source: DiagSource) -> Self { self.source = source; self }
     /// Shared call-log handle — clone it before boxing to observe interaction post-install.
     pub(crate) fn calls_handle(&self) -> std::sync::Arc<std::sync::Mutex<Vec<ProviderCall>>> {
         std::sync::Arc::clone(&self.calls)
@@ -145,7 +203,8 @@ impl RecordingProvider {
 
 #[cfg(test)]
 impl DiagnosticsProvider for RecordingProvider {
-    fn name(&self) -> &'static str { "recording" }
+    fn source(&self) -> DiagSource { self.source }
+    fn install_hint(&self) -> &'static str { "test provider unavailable" }
     fn availability(&self) -> Availability { self.availability }
     fn ensure_running(&mut self) { self.push(ProviderCall::EnsureRunning); }
     fn configure(&mut self, cfg: ProviderConfig) { self.push(ProviderCall::Configure(cfg)); }
@@ -164,24 +223,6 @@ mod tests {
     use super::*;
     use crate::editor::{Editor, RenderMode};
     use crate::test_support::TestClock;
-
-    // ------------------------------------------------------------------
-    // NullProvider: hermetic default, never accepts, never emits.
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn null_provider_is_idle_and_never_accepts() {
-        let mut p = NullProvider;
-        assert_eq!(p.name(), "none");
-        assert_eq!(p.availability(), Availability::Idle);
-        p.ensure_running(); // no-op; must not panic
-        p.configure(ProviderConfig { grammar: true, dictionary: None, max_file_length: 1 });
-        let accepted = p.notify_change(BufferId(0), 1, None, "hi".into());
-        assert_eq!(accepted, Accepted::No, "null provider never latches a check");
-        p.notify_close(BufferId(0));
-        p.reload_dictionary();
-        p.shutdown();
-    }
 
     // ------------------------------------------------------------------
     // RecordingProvider: records every call; return values are settable.
@@ -252,7 +293,42 @@ mod tests {
     #[test]
     fn degraded_sets_status_to_the_hint_verbatim() {
         let mut e = Editor::new_from_text("x\n", None, (40, 10));
-        apply_provider_event(&mut e, DiagSource::Harper, ProviderEvent::Degraded(INSTALL_HINT.into()), &TestClock::new(0));
-        assert_eq!(e.status, INSTALL_HINT);
+        apply_provider_event(&mut e, DiagSource::Harper,
+            ProviderEvent::Degraded(crate::harper_ls::INSTALL_HINT.into()), &TestClock::new(0));
+        assert_eq!(e.status, crate::harper_ls::INSTALL_HINT);
+    }
+
+    // ------------------------------------------------------------------
+    // ProviderSet: the multi-provider registry.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn provider_set_registers_and_reports_enabled() {
+        let mut set = ProviderSet::default();
+        set.install(Box::new(RecordingProvider::new().with_source(DiagSource::Harper)), true);
+        set.install(Box::new(RecordingProvider::new().with_source(DiagSource::Plugin("mock"))), false);
+        assert_eq!(set.sources().collect::<Vec<_>>(), vec![DiagSource::Harper, DiagSource::Plugin("mock")]);
+        assert_eq!(set.enabled_sources().collect::<Vec<_>>(), vec![DiagSource::Harper]);
+        assert!(set.is_enabled(DiagSource::Harper));
+        assert!(!set.is_enabled(DiagSource::Plugin("mock")));
+        assert!(set.set_enabled(DiagSource::Plugin("mock"), true));
+        assert!(set.is_enabled(DiagSource::Plugin("mock")));
+        assert!(!set.set_enabled(DiagSource::Vale, true), "unknown source → false");
+    }
+
+    #[test]
+    fn provider_set_source_keyed_delegation() {
+        let mut set = ProviderSet::default();
+        let rec = RecordingProvider::new().with_source(DiagSource::Harper);
+        let calls = rec.calls_handle();
+        set.install(Box::new(rec), true);
+        set.ensure_running(DiagSource::Harper);
+        assert_eq!(set.availability(DiagSource::Harper), Some(Availability::Ready));
+        assert_eq!(set.availability(DiagSource::Vale), None, "unknown source → None");
+        let a = set.notify_change(DiagSource::Harper, BufferId(1), 3, None, "t".into());
+        assert_eq!(a, Accepted::Yes);
+        assert_eq!(set.notify_change(DiagSource::Vale, BufferId(1), 3, None, "t".into()), Accepted::No,
+            "unknown source never latches");
+        assert!(calls.lock().unwrap().iter().any(|c| matches!(c, ProviderCall::EnsureRunning)));
     }
 }

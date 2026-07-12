@@ -249,7 +249,7 @@ pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
     // Effort A: abandon the pre-reload generation before the wholesale replace so a still-in-transit
     // publish for the old content is dropped (its uri leaves uri_owner) and the next Review dispatch
     // reopens fresh. The version bump above is the second, independent guard axis (spec §5 item 4).
-    editor.diag_provider.notify_close(id);
+    editor.diag_providers.notify_close_all(id);
     // 5g: capture folds before replacement so we can carry them forward.
     let prev_folded = editor.active().folds.folded().clone();
     *editor.active_mut() = crate::editor::Buffer { id, ..new_buf };
@@ -296,7 +296,7 @@ pub fn load_recovered(editor: &mut crate::editor::Editor, body: &str) {
     let id = editor.active().id;                 // preserve THIS buffer's id
     // Effort A: abandon the pre-recovery generation before the wholesale replace (same guard as
     // reload_from_disk) — the in-transit old-content publish is dropped and the buffer reopens fresh.
-    editor.diag_provider.notify_close(id);
+    editor.diag_providers.notify_close_all(id);
     // 5g: capture folds before replacement so we can carry them forward.
     let prev_folded = editor.active().folds.folded().clone();
     *editor.active_mut() = crate::editor::Buffer { id, ..new_buf };
@@ -697,9 +697,9 @@ mod tests {
         std::fs::write(&p, "on disk\n").unwrap();
         let mut e = Editor::new_from_text("edits\n", Some(p.clone()), (80, 24));
         let id = e.active().id;
-        let rec = RecordingProvider::new();
+        let rec = RecordingProvider::new().with_source(wordcartel_core::diagnostics::DiagSource::Harper);
         let calls = rec.calls_handle();
-        e.diag_provider = Box::new(rec);
+        e.diag_providers.install(Box::new(rec), true);
         reload_from_disk(&mut e);
         assert!(calls.lock().unwrap().iter().any(|c| matches!(c, ProviderCall::NotifyClose(x) if *x == id)),
             "reload_from_disk notifies close for the pre-reload generation");
@@ -708,9 +708,9 @@ mod tests {
         // load_recovered
         let mut e = Editor::new_from_text("old\n", None, (80, 24));
         let id = e.active().id;
-        let rec = RecordingProvider::new();
+        let rec = RecordingProvider::new().with_source(wordcartel_core::diagnostics::DiagSource::Harper);
         let calls = rec.calls_handle();
-        e.diag_provider = Box::new(rec);
+        e.diag_providers.install(Box::new(rec), true);
         load_recovered(&mut e, "recovered\n");
         assert!(calls.lock().unwrap().iter().any(|c| matches!(c, ProviderCall::NotifyClose(x) if *x == id)),
             "load_recovered notifies close for the pre-recovery generation");
