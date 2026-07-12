@@ -531,6 +531,60 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // P3 Task 8: LAW 3 + LAW 4 over a PARAMETERIZED plugin command (arg = Some(prompt),
+    // Task 5) — the P1-era tests above only exercised nullary plugin commands, predating
+    // parameterized commands.
+    // -----------------------------------------------------------------------
+
+    /// A parameterized plugin command (`arg = Some(prompt)`) tagged `menu='Edit'` obeys LAW 4
+    /// (appears in the Edit menu group) and LAW 3 (appears in the palette) exactly like a
+    /// nullary sibling — `arg` does not gate either surface. Also pins `plugin_list` (a real
+    /// Settings command) inside the Settings group of the same built `MenuView`, naming
+    /// explicitly what the generic-menu-building tests above already prove structurally.
+    #[test]
+    fn parameterized_plugin_command_and_plugin_list_satisfy_law3_law4() {
+        let mut reg = crate::registry::Registry::builtins();
+        let mut host = crate::plugin::host::PluginHost::new().expect("VM construction");
+        let src = "wc.register_command{ name='start', label='Pomodoro Start', menu='Edit', \
+                   arg='Minutes:', fn=function(arg) end }";
+        let reports = crate::plugin::load::load_sources(
+            &mut reg, &mut host, &[("p3menu".to_string(), src.to_string())],
+            &std::collections::BTreeMap::new(), &mut Vec::new(),
+        );
+        assert_eq!(reports[0].result, Ok(1), "test plugin must load cleanly: {:?}", reports[0].result);
+        let start_id = reg.resolve_name("p3menu.start").expect("registered");
+        assert_eq!(reg.meta(start_id).unwrap().arg, Some("Minutes:"),
+            "precondition: the command is genuinely parameterized");
+
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ed = throwaway_editor();
+        let view = build(&reg, &km, &ed);
+
+        // LAW 4: the menu='Edit' parameterized command appears in the Edit menu group.
+        let edit_items: Vec<(String, MenuRowAction)> = view.groups.iter()
+            .find(|(cat, _)| *cat == crate::registry::MenuCategory::Edit)
+            .map(|(_, items)| items.clone())
+            .unwrap_or_default();
+        assert!(edit_items.iter().any(|(_, action)| *action == MenuRowAction::Command(start_id)),
+            "a parameterized plugin command tagged menu=Edit must appear in the Edit menu group: {edit_items:?}");
+
+        // LAW 3: it also appears in the palette — arg does not gate palette membership.
+        let mut p = crate::palette::Palette::default();
+        crate::palette::rebuild_rows(&mut p, &reg, &km);
+        assert!(p.rows.iter().any(|r| r.id == start_id),
+            "the parameterized plugin command must appear in the palette like any other");
+
+        // `plugin_list` (a real, non-plugin Settings command) is in the Settings menu group.
+        let settings_items: Vec<(String, MenuRowAction)> = view.groups.iter()
+            .find(|(cat, _)| *cat == crate::registry::MenuCategory::Settings)
+            .map(|(_, items)| items.clone())
+            .unwrap_or_default();
+        assert!(settings_items.iter().any(|(_, action)|
+            *action == MenuRowAction::Command(crate::registry::CommandId("plugin_list"))),
+            "plugin_list must appear in the Settings menu group: {settings_items:?}");
+    }
+
+    // -----------------------------------------------------------------------
     // Task 4.2 (command-surface curation, A8): Documents dynamic section
     // -----------------------------------------------------------------------
 

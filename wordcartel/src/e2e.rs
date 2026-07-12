@@ -592,6 +592,36 @@ fn on_change_costs_nothing_without_a_subscriber() {
     assert_eq!(h.editor.borrow().on_change_due, None, "still None after settle — nothing was ever armed");
 }
 
+/// P3 Task 8 gap-fill: spec §8's loaded-but-idle guardrail, extended to on_change specifically.
+/// Distinguishes "subscribed" from "armed" — `has_on_change_subscriber == true` is not itself a
+/// deadline; only `advance`'s arm-on-real-edit block (§6) ever sets `on_change_due`. A plugin that
+/// subscribes to `change` but is never edited must drive ZERO hook invocations across idle Ticks
+/// and leave `next_wake` at `None` throughout — the on_change counterpart to
+/// `plugin_loaded_idle_drives_zero_callback_invocations_and_stable_wake` (which covers on_save).
+#[test]
+fn on_change_subscriber_idle_drives_zero_invocations_and_stable_wake() {
+    let src = "changes = 0\nwc.on('change', function(ev) changes = changes + 1 end)";
+    let mut h = Harness::new_with_plugin("hello\n", &[("watcher", src)]);
+    assert!(h.editor.borrow().has_on_change_subscriber, "attach_bridge must set the subscriber flag");
+    assert_eq!(h.editor.borrow().on_change_due, None, "precondition: no edit yet, nothing armed");
+
+    let wake_before = crate::timers::next_wake(&h.editor.borrow(), h.now);
+    assert!(wake_before.is_none(), "precondition: subscribing alone arms no deadline: {wake_before:?}");
+
+    for _ in 0..10 {
+        h.advance_ms(1000); // real elapsed wall-clock time between idle ticks, no edits
+        h.tick();
+    }
+
+    let changes: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("changes").unwrap();
+    assert_eq!(changes, 0, "idle Msg::Tick must never fire on_change absent a real edit");
+    assert_eq!(h.editor.borrow().on_change_due, None, "on_change_due stays unarmed without an edit");
+    let wake_after = crate::timers::next_wake(&h.editor.borrow(), h.now);
+    assert_eq!(wake_before, wake_after,
+        "an on_change subscriber with no edit must leave next_wake unchanged (None) across idle Ticks");
+    assert_eq!(h.doc_text(), "hello\n", "idle ticks must not mutate the document");
+}
+
 // ---------------------------------------------------------------------------
 // P2 Task 6: the event system — hooks firing at the three real fire sites
 // ---------------------------------------------------------------------------
