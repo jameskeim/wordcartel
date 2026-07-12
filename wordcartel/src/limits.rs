@@ -43,6 +43,10 @@ pub const PLUGIN_MAX_LABEL_LEN: usize = 256;
 /// `wc.status` / `error(msg)` truncation (display-only).
 pub const PLUGIN_MAX_STATUS_LEN: usize = 4096;
 // Edit text reuses PASTE_MAX_BYTES (above) — plugin edits and user paste share one pre-alloc bound.
+/// Cap on a single plugin source file read by `discover` (Task 6) — generous headroom over
+/// any real plugin script (plugin files are user CODE, not documents); an oversize file is
+/// skipped + named in the returned report, never truncated or silently dropped.
+pub const PLUGIN_MAX_SOURCE_BYTES: u64 = 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -55,5 +59,6 @@ mod tests {
         assert_eq!(PLUGIN_MAX_NAME_LEN, 128);
         assert_eq!(PLUGIN_MAX_LABEL_LEN, 256);
         assert_eq!(PLUGIN_MAX_STATUS_LEN, 4096);
+        assert_eq!(PLUGIN_MAX_SOURCE_BYTES, 1024 * 1024);
     }
 }

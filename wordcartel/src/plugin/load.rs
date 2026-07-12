@@ -6,9 +6,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use crate::limits::{PLUGIN_MAX_COMMANDS_PER_PLUGIN, PLUGIN_MAX_STEM_LEN};
+use crate::limits::{PLUGIN_MAX_COMMANDS_PER_PLUGIN, PLUGIN_MAX_SOURCE_BYTES, PLUGIN_MAX_STEM_LEN};
 use crate::plugin::host::{PendingReg, PluginHost};
 use crate::registry::Registry;
 
@@ -18,6 +19,75 @@ use crate::registry::Registry;
 pub struct LoadReport {
     pub plugin: String,
     pub result: Result<usize, String>,
+}
+
+/// The outcome of scanning the plugins dir: loadable (stem, source) pairs + a report of files
+/// skipped (oversize / unreadable) so the caller can surface them to the status line. A
+/// `disable`-listed stem is excluded silently (an intentional user choice, not a failure) — it
+/// appears in neither `sources` nor `skipped`.
+pub struct Discovered {
+    pub sources: Vec<(String, String)>,
+    pub skipped: Vec<LoadReport>,
+}
+
+/// Filesystem-facing discovery layer (Task 6) — scans `dir` for single-file `<name>.lua` and
+/// `<name>/init.lua` plugins, `disable`-filters, and bounded-reads each source. Deterministic:
+/// candidates are sorted lexicographically BY STEM before reading, so load order (and hence any
+/// cross-plugin collision report) never depends on `read_dir`'s OS-dependent enumeration order.
+///
+/// A missing/unreadable `dir` (no plugins installed — the common case) is not a failure: it
+/// yields an empty `Discovered`, no warning. A candidate that IS found but is over
+/// [`PLUGIN_MAX_SOURCE_BYTES`] or fails to read/decode goes to `skipped` — named, never silently
+/// dropped — and is excluded from `sources` (the caller never sees its content). This function
+/// does not touch the `Fs` trait (write-only seam) or the string-core `load_sources`: it only
+/// reads bytes and hands `(stem, source)` pairs onward.
+pub fn discover(dir: &Path, disable: &[String]) -> Discovered {
+    let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else { continue };
+            if file_type.is_file() {
+                if path.extension().and_then(|e| e.to_str()) == Some("lua") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        candidates.push((stem.to_string(), path));
+                    }
+                }
+            } else if file_type.is_dir() {
+                let init = path.join("init.lua");
+                if init.is_file() {
+                    if let Some(stem) = path.file_name().and_then(|s| s.to_str()) {
+                        candidates.push((stem.to_string(), init));
+                    }
+                }
+            }
+        }
+    }
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut sources = Vec::new();
+    let mut skipped = Vec::new();
+    for (stem, path) in candidates {
+        if disable.iter().any(|d| d == &stem) {
+            continue; // user opt-out — not a load failure, excluded from both lists.
+        }
+        match crate::file::bounded_read_opt(&path, PLUGIN_MAX_SOURCE_BYTES) {
+            Some(bytes) => match String::from_utf8(bytes) {
+                Ok(src) => sources.push((stem, src)),
+                Err(_) => skipped.push(LoadReport {
+                    plugin: stem,
+                    result: Err("plugin source is not valid UTF-8".to_string()),
+                }),
+            },
+            None => skipped.push(LoadReport {
+                plugin: stem,
+                result: Err(format!(
+                    "plugin source unreadable or over {PLUGIN_MAX_SOURCE_BYTES} bytes"
+                )),
+            }),
+        }
+    }
+    Discovered { sources, skipped }
 }
 
 /// Filesystem-free load core: exec each `(stem, source)` into the host VM, collect
@@ -97,6 +167,54 @@ fn load_one(reg: &mut Registry, lua: &mlua::Lua, stem_raw: &str, src: &str) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discover_reads_single_file_and_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.lua"), "-- a").unwrap();
+        std::fs::create_dir(dir.path().join("b")).unwrap();
+        std::fs::write(dir.path().join("b").join("init.lua"), "-- b").unwrap();
+        let disc = discover(dir.path(), &[]);
+        assert!(disc.skipped.is_empty());
+        let stems: Vec<&str> = disc.sources.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(stems, vec!["a", "b"], "lexicographic by stem");
+        assert_eq!(disc.sources[0].1, "-- a");
+        assert_eq!(disc.sources[1].1, "-- b");
+    }
+
+    #[test]
+    fn discover_skips_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.lua"), "-- a").unwrap();
+        std::fs::write(dir.path().join("z.lua"), "-- z").unwrap();
+        let disc = discover(dir.path(), &["a".to_string()]);
+        assert!(disc.skipped.is_empty(), "a disabled name is excluded, not reported as a failure");
+        let stems: Vec<&str> = disc.sources.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(stems, vec!["z"]);
+    }
+
+    #[test]
+    fn discover_reports_skipped_oversize() {
+        let dir = tempfile::tempdir().unwrap();
+        let huge = "x".repeat(crate::limits::PLUGIN_MAX_SOURCE_BYTES as usize + 1);
+        std::fs::write(dir.path().join("big.lua"), &huge).unwrap();
+        std::fs::write(dir.path().join("ok.lua"), "-- ok").unwrap();
+        let disc = discover(dir.path(), &[]);
+        assert_eq!(disc.sources.len(), 1);
+        assert_eq!(disc.sources[0].0, "ok");
+        assert_eq!(disc.skipped.len(), 1);
+        assert_eq!(disc.skipped[0].plugin, "big");
+        assert!(disc.skipped[0].result.is_err(), "named in skipped, not silently dropped");
+    }
+
+    #[test]
+    fn discover_missing_dir_is_empty_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let disc = discover(&missing, &[]);
+        assert!(disc.sources.is_empty());
+        assert!(disc.skipped.is_empty());
+    }
     use crate::registry::MenuCategory;
 
     fn sources(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
