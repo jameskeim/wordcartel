@@ -6,7 +6,7 @@ namespaced view) and the deferred one-shot `wc.async` subprocess primitive. Sibl
 `docs/design/effort-p-plugin-system-design-space.md`. **Not a committed design.** Every architectural
 claim is anchored to a real symbol; human-only product decisions are flagged inline and listed at the end.
 
-Grounding inputs: the live tool-capability scan (`scratchpad/prose-linters-scan.md`, treated as ground
+Grounding inputs: the live tool-capability scan (`docs/design/prose-linters-scan.md`, treated as ground
 truth on harper-ls / ltex-ls-plus / vale / vale-ls), the real code at HEAD (P1–P3 plugin system shipped),
 and the recorded intentions (`CLAUDE.md`, `command-surface-contract.md`, the E7/H2 archive, the Fresh
 windowing notes in `docs/ux-backlog.md` S1).
