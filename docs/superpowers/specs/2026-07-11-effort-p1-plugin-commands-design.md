@@ -143,17 +143,18 @@ directly instead of round-tripping oneshot channels.
 ### Design law — offset/range pre-validation (cross-cutting; binding on every phase)
 The core edit/text primitives are **trusted-caller** APIs that *assert* on bad input rather than
 returning errors: `ChangeSet::from_ops` release-asserts its consumption sum (`change.rs:127`),
-`ChangeSet::insert`/`delete` assume in-range boundary offsets, and `TextBuffer::slice` char-boundary-
-checks then hands the range to `rope.byte_slice` as-given — and `clamp_to_boundary` only snaps a *single*
-offset, it does **not** enforce `a <= b` or in-bounds (`buffer.rs:48–53`, `:125–136`). A raw
-plugin-supplied offset reaching any of them is a panic, not a degrade — the class behind the round-3
-(edits) and round-4 (`wc.text`) Criticals. Therefore:
+`ChangeSet::apply` asserts on apply (`change.rs:94`), `ChangeSet::insert`/`delete` assume in-range
+boundary offsets, and `TextBuffer::slice` (`buffer.rs:125`) char-boundary-checks then hands the range to
+`rope.byte_slice` as-given — and `clamp_to_boundary` only snaps a *single* offset, it does **not**
+enforce `a <= b` or in-bounds (`buffer.rs:48–53`, `:125–136`). A raw plugin-supplied offset reaching any
+of them is a panic, not a degrade — the class behind the round-3 (edits) and round-4 (`wc.text`)
+Criticals. Therefore:
 
 > **LAW.** Every plugin API that accepts a byte offset or range MUST pre-validate it against the **live
 > buffer** — in-bounds (`to <= len`), ordered (`from <= to`), and both endpoints on char boundaries
 > (`clamp_to_boundary(p) == p`) — via the shared `plugin_check_range` helper (§3b), and return a **typed
 > Lua error (degrade)** on failure. **No raw plugin-supplied offset ever reaches an asserting core
-> primitive** (`ChangeSet::from_ops`/`insert`/`delete`, `TextBuffer::slice`/`apply`).
+> primitive** (`ChangeSet::from_ops`/`apply`/`insert`/`delete`, `TextBuffer::slice`).
 
 **P1 `wc.*` surface audit against the LAW** (every input-taking API is covered, so future phases inherit
 the discipline): `wc.text(a, b)` — range → **guarded** (§3a); `wc.replace(a, b, text)` — range →
@@ -186,8 +187,8 @@ There is no raw-state API by construction — the bridge simply never exposes on
 
 **Pre-validation is on us — the construction step panics on garbage before the boundary ever runs.**
 `ChangeSet::from_ops` (`wordcartel-core/src/change.rs:118`) is a **trusted-caller** constructor that
-**release-asserts** `retain + delete == len_before` (`change.rs:127`) — and `TextBuffer::apply`'s own
-char-boundary asserts fire on mid-char offsets. `submit_transaction`'s `validate_against` catches a
+**release-asserts** `retain + delete == len_before` (`change.rs:127`) — and `ChangeSet::apply`'s own
+char-boundary asserts (`change.rs:94`) fire on mid-char offsets. `submit_transaction`'s `validate_against` catches a
 STALE *length*, but a plugin passing out-of-bounds, reversed (`from > to`), or non-char-boundary offsets
 would **panic during construction**, before validation — defeating degrade-don't-crash / no-data-loss.
 So the plugin edit API MUST pre-validate the plugin-provided offsets against the **live buffer** and
@@ -202,13 +203,13 @@ A single-offset API (`wc.insert`) checks `plugin_check_range(buf, off, off)`.
   selection — but the check is uniform), then `ChangeSet::insert(cursor, text, len)`
   (`wordcartel-core/src/change.rs:63`) at the primary head.
 - `wc.replace(a, b, text)` → **pre-validate `(a, b)` via `plugin_check_range`** (bad input → typed Lua
-  error, nothing constructed), THEN build via the existing private `replace_changeset`
-  (`commands.rs:110`) — promoted to `pub(crate)` and called from `api.rs` (one visibility change, no
-  logic duplication): `Retain(a)` if `a>0`, `Delete(b-a)` if `b>a`, `Insert(text)` if non-empty,
-  `Retain(doc_len-b)` if `doc_len>b`, over `ChangeSet::from_ops(ops, doc_len)`. Because the range was
-  pre-checked against the live buffer, `from_ops`'s consumption assert cannot trip. `submit_transaction`
-  then re-validates length (a concurrent-edit `StaleLength` → `Err`, zero mutation) — the pre-check and
-  the boundary are complementary: pre-check guards *construction*, `validate_against` guards *staleness*.
+  error, nothing constructed), THEN build the `ChangeSet` via the **existing public**
+  `build_range_replace(from, to, text, doc_len)` (`commands.rs:185` — already `pub`, already used by the
+  filter merge; it wraps the private `replace_changeset` + the matching `Edit`, so no visibility change
+  and no logic duplication). Because the range was pre-checked against the live buffer, the underlying
+  `ChangeSet::from_ops` consumption assert cannot trip. `submit_transaction` then re-validates length (a
+  concurrent-edit `StaleLength` → `Err`, zero mutation) — the pre-check and the boundary are
+  complementary: pre-check guards *construction*, `validate_against` guards *staleness*.
 - `wc.set_selection(anchor, head)` → routes through the same selection-snapping `submit_transaction`
   applies (out-of-bounds snaps, never rejects — the existing behavior; selection needs no pre-check).
 
@@ -276,17 +277,22 @@ Two concrete obstacles in the real code and their minimal resolutions:
   queue lives on `Editor`, the one place both dispatch and the pump reach) and returns
   `CommandResult::Handled`. **No `mlua` type enters `registry.rs`** — the arm only pushes a `Copy`
   `CommandId`; `registry.rs` stays Lua-free.
-- **`CommandId(pub &'static str)` is `Copy`** (`registry.rs:16`) and every consumer relies on it
-  (`KeyAction::Id(CommandId)`, palette, menu, hints, `resolve_name`). Plugin names are runtime `String`s.
-  Resolution: **intern** each plugin command's namespaced name to `&'static str` once at registration
-  (leak-once via a small global interner; process-lifetime; bounded by user-installed plugin count;
-  bytes in size). `CommandId` stays `Copy`; every existing consumer is untouched.
+- **Both `CommandId(pub &'static str)` AND `CommandMeta.label` are `&'static str`** (`registry.rs:16`,
+  `:52`), and every consumer relies on it (`KeyAction::Id(CommandId)`, palette, menu, hints,
+  `resolve_name`). Plugin names AND labels are runtime `String`s from Lua. Resolution: **intern both the
+  namespaced name and the label** to `&'static str` once at registration (leak-once via a small global
+  interner; process-lifetime). This keeps `CommandId` `Copy` and `CommandMeta` `Copy`-of-`&'static`
+  entirely — the registry metadata never holds an owned `String`, so every existing consumer is
+  untouched. **The leak makes registration a permanent allocation — hence the hard caps below (§5/§7):**
+  interned strings are NOT reclaimed and Lua's `set_memory_limit` does not bound them, so registration
+  must be count- and length-capped to keep the bounded-memory invariant.
 
 New public registry surface:
 - `Registry::register_plugin(&mut self, name: &'static str, label: &'static str, menu:
   Option<MenuCategory>) -> Result<(), RegisterError>` — `RegisterError` on a name collision (with a
-  builtin or an already-registered plugin command) → surfaced via `plugin_error`. The interned name is
-  produced by `register_command` in `api.rs` before this call.
+  builtin or an already-registered plugin command) OR an over-cap registration (§5/§7) → surfaced via
+  `plugin_error`. The interned name and label are produced by `register_command` in `api.rs` (after the
+  cap checks pass) before this call.
 - Names are **namespaced `<plugin>.<command>`**, enforced at registration (the `<plugin>` segment is the
   file/dir stem). Deterministic, collision-resistant, self-documenting in the palette.
 - Registration happens only at **plugin load time** (startup in P1), never mid-`reduce`. The registry is
@@ -322,6 +328,14 @@ error (degrade, not panic).
   "Documents"|"Settings"|"Export"`), validated at registration; `fn` is stored in Lua's named registry
   keyed by the namespaced id. A bad `menu` string or a duplicate `name` → load-report error, plugin
   continues where possible.
+- **Registration resource caps (bounded-memory invariant — name/label are interned/leaked, §4, so these
+  bound a permanent allocation `set_memory_limit` cannot).** Enforced BEFORE interning; an over-cap
+  `register_command` → typed error → status line (degrade, plugin continues where possible):
+  - `PLUGIN_MAX_COMMANDS_PER_PLUGIN = 256` — the 257th `register_command` from one plugin is rejected.
+  - `PLUGIN_MAX_NAME_LEN = 128` bytes (the plugin-local `name` segment); `PLUGIN_MAX_LABEL_LEN = 256`
+    bytes. Over-length → rejected, nothing interned.
+  These also cap what flows into the palette label list (`palette.rs:73`) and the menu width scans
+  (`menu.rs:62`/`:114`), so the caps protect layout as well as memory.
 
 **Editor API (callback time):**
 - Reads: `wc.text(a?, b?)`, `wc.selection()`, `wc.cursor()`, `wc.len()`, `wc.version()`, `wc.path()`.
@@ -391,9 +405,16 @@ UI-drawing API (Provider law: plugins supply data/behavior; the host owns UI/lay
   time against a budget (~100–250 ms; final value set by the §11 spike) and raises a Lua error to abort a
   callback that exceeds it → `"plugin <name>: exceeded time budget"` on the status line. This is the
   line between "plugin bug" and "editor hang" — a direct no-silent-UI-waits requirement.
-- **Memory cap (spike-gated).** `Lua::set_memory_limit` (~64 MiB) if §11 confirms it is enforced on
-  vendored Lua 5.4; if not, drop the cap with a documented note (do not hack one). A cap WezTerm skips
-  but we shouldn't — `O(content)`-plus-baseline is a stated resource law and plugins are untrusted-ish.
+- **Registration caps (Rust-side, ALWAYS on — the real bounded-memory guard).** Interned/leaked
+  name+label strings (§4) are permanent Rust allocations that `set_memory_limit` does NOT bound, so
+  registration is hard-capped: `PLUGIN_MAX_COMMANDS_PER_PLUGIN = 256`, `PLUGIN_MAX_NAME_LEN = 128`,
+  `PLUGIN_MAX_LABEL_LEN = 256` bytes (§5); over-cap → typed error → status line. This is the invariant
+  that keeps registration `O(bounded)`, independent of the VM heap cap below.
+- **VM heap cap (spike-gated, Lua-side).** `Lua::set_memory_limit` (~64 MiB) if §11 confirms it is
+  enforced on vendored Lua 5.4; if not, drop the cap with a documented note (do not hack one). A cap
+  WezTerm skips but we shouldn't — `O(content)`-plus-baseline is a stated resource law and plugins are
+  untrusted-ish. Note this bounds only the *Lua* heap, not the leaked Rust strings — those are the
+  registration caps' job.
 - **Degrade, don't crash.** Load failure → skip + report + continue (per-plugin containment). Callback
   failure (Lua error, panic, time abort, or a rejected edit offset — §3b) → status line; the editor is
   unaffected and the buffer is untouched (a rejected edit never reached a constructor; edits that never
@@ -423,14 +444,16 @@ UI-drawing API (Provider law: plugins supply data/behavior; the host owns UI/lay
   works; a callback that loops → time-abort fires (driven by a low test budget); the `try_borrow_mut`
   "editor busy" path is exercised directly.
 - **Offset/range pre-validation tests (guards the §3 LAW — no core primitive ever panics on plugin
-  garbage; the round-3 edit + round-4 `wc.text` Criticals):** for EACH input-taking API — `wc.replace`,
-  `wc.insert`, and the `wc.text` **read** — an out-of-bounds offset, a reversed range (`from > to`), and
-  a mid-char offset each → a **typed Lua error, buffer/selection unchanged, no panic** (the `plugin_check_range`
+  garbage; the round-3 edit + round-4 `wc.text` Criticals):** for each **range-taking** API — `wc.replace`
+  and the `wc.text` **read** — an out-of-bounds offset, a reversed range (`from > to`), and a mid-char
+  offset each → a **typed Lua error, buffer/selection unchanged, no panic** (the `plugin_check_range`
   pre-check rejects before any `ChangeSet` is constructed or `TextBuffer::slice` is called — proves
-  garbage never reaches `from_ops`'s consumption assert or `rope.byte_slice`). Plus a concurrent-
-  `StaleLength` edit path: a valid-at-check-time range that a racing edit invalidates → the
-  `submit_transaction` `validate_against` `Err`, zero mutation. A fuzz/property-style test driving random
-  `(a, b, text)` from Lua across the whole input-taking surface asserts **no panic**.
+  garbage never reaches `from_ops`'s consumption assert or `rope.byte_slice`). (`wc.insert` takes NO
+  plugin-supplied offset — it inserts at the live selection head — so it has no reversed/OOB row; it gets
+  its own text/no-panic test, incl. multibyte insert text.) Plus a concurrent-`StaleLength` edit path: a
+  valid-at-check-time range that a racing edit invalidates → the `submit_transaction` `validate_against`
+  `Err`, zero mutation. A fuzz/property-style test driving random `(a, b, text)` from Lua across the whole
+  range-taking surface asserts **no panic**.
 - **Contract-invariant tests** (see §9): palette-completeness and menu-subset re-run over a registry
   containing plugin entries; a patch-bound plugin command resolves in `build_keymap` and survives a
   preset switch (law 7).
