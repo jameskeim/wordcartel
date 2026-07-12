@@ -97,6 +97,7 @@ pub(crate) fn perform_reload(
         e.pending_plugin_calls.clear();
         e.pending_plugin_events.clear();
         e.pending_plugin_dispatch.clear();
+        e.clear_plugin_wake_state(); // P3 §3g: drop the timer schedule + on_change subscription of the dead VM
     }
     let mut warns = Vec::new();
     let mut inventory = Vec::new();
@@ -260,6 +261,12 @@ mod tests {
                 kind: crate::plugin::PluginEventKind::Save, path: None });
             e.pending_plugin_dispatch.push_back(crate::plugin::PluginDispatch {
                 origin: "o".into(), name: "n".into() });
+            // P3 §3g: a reload must also clear the timer schedule + on_change subscription of the dead VM.
+            e.pending_plugin_timers.push(crate::plugin::PluginTimer {
+                handle: 1, origin: "p".into(), key: "wc-timer-1".into(),
+                next_due_ms: 500, interval_ms: 1_000, repeat: false, pending: false });
+            e.has_on_change_subscriber = true;
+            e.on_change_due = Some(500);
             e.plugins_reload_requested = true;
         }
         perform_reload(&mut host, &mut reg, &editor, &[cfg_path], None, false, &tx);
@@ -267,6 +274,9 @@ mod tests {
         assert!(e.pending_plugin_calls.is_empty(), "calls queue cleared");
         assert!(e.pending_plugin_events.is_empty(), "events queue cleared");
         assert!(e.pending_plugin_dispatch.is_empty(), "dispatch queue cleared");
+        assert!(e.pending_plugin_timers.is_empty(), "the reload clears the timer schedule (P3 §3g)");
+        assert!(!e.has_on_change_subscriber, "the reload clears the on_change subscription");
+        assert_eq!(e.on_change_due, None, "the reload clears the on_change due");
     }
 
     #[test]

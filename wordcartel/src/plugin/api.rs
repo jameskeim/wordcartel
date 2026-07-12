@@ -194,6 +194,7 @@ pub(crate) fn install_editor_api(lua: &mlua::Lua, bridge: &Bridge) -> mlua::Resu
     install_set_selection(lua, &wc, bridge)?;
     install_status(lua, &wc, bridge)?;
     install_command(lua, &wc, bridge)?;
+    install_timer(lua, &wc, bridge)?;
     install_registration_closed(lua, &wc)?;
     install_on_closed(lua, &wc)?;
     install_config_cleared(&wc)?;
@@ -441,6 +442,68 @@ fn install_command(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::
             Ok(())
         })?,
     )?;
+    Ok(())
+}
+
+/// `wc.timer(interval_ms, fn [, repeat_bool])` (arm) + `wc.timer_cancel(handle)` (disarm) — the
+/// plugin-facing timer API (P3 §3b). Positional `(interval, fn, repeat?)` mirrors `wc.replace`'s
+/// `(a, b, text)` tuple-extraction idiom (a mechanical refinement of the spec's `{table}` sketch —
+/// the guardrails are identical). Both verbs are observer-checked, so a hook OR a timer callback
+/// (both run observer-tier) can neither arm nor cancel — closing the timer-spawns-timers spin
+/// vector at the arm gate, not by trust. Arm enforces, in order: observer, the interval floor
+/// ([`crate::limits::PLUGIN_TIMER_MIN_INTERVAL_MS`]), then the per-plugin count cap
+/// ([`crate::limits::PLUGIN_MAX_TIMERS_PER_PLUGIN`]) — each BEFORE the callback is persisted or the
+/// `PluginTimer` pushed. `handle` is a monotonic per-editor counter (never reused); the callback
+/// lives in the VM named registry under `wc-timer-<handle>` (dies with the VM at reload).
+fn install_timer(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::Result<()> {
+    let editor = bridge.editor.clone();
+    let clock = bridge.clock.clone();
+    let invoke = bridge.invoke_state.clone();
+    // wc.timer(interval_ms, fn [, repeat_bool]) — one-shot unless repeat is true.
+    wc.set("timer", lua.create_function(
+        move |lua, (interval_ms, func, repeat): (u64, mlua::Function, Option<bool>)| {
+            if invoke.borrow().observer {
+                return Err(mlua::Error::runtime(
+                    "plugin: wc.timer is not allowed from an event hook or a timer callback"));
+            }
+            if interval_ms < crate::limits::PLUGIN_TIMER_MIN_INTERVAL_MS {
+                return Err(mlua::Error::runtime("plugin: timer interval below the 1000 ms floor"));
+            }
+            let origin = invoke.borrow().current.clone().unwrap_or_default();
+            let mut e = editor.try_borrow_mut()
+                .map_err(|_| mlua::Error::runtime("plugin: editor busy"))?;
+            if e.pending_plugin_timers.iter().filter(|t| t.origin == origin).count()
+                >= crate::limits::PLUGIN_MAX_TIMERS_PER_PLUGIN {
+                return Err(mlua::Error::runtime("plugin: timer limit reached (max 8)"));
+            }
+            e.next_timer_handle += 1;
+            let handle = e.next_timer_handle;
+            let key = format!("wc-timer-{handle}");
+            lua.set_named_registry_value(&key, func)?;   // persist the callback (dies with the VM)
+            let now = clock.now_ms();
+            e.pending_plugin_timers.push(crate::plugin::PluginTimer {
+                handle, origin, key, next_due_ms: now.saturating_add(interval_ms),
+                interval_ms, repeat: repeat.unwrap_or(false), pending: false,
+            });
+            Ok(handle as i64)   // Lua integer (i64); the monotonic counter never reaches 2^63
+        })?)?;
+    // wc.timer_cancel(handle) — remove + free the registry key; unknown handle → silent no-op.
+    let editor = bridge.editor.clone();
+    let invoke = bridge.invoke_state.clone();
+    wc.set("timer_cancel", lua.create_function(move |lua, handle: i64| {
+        if invoke.borrow().observer {
+            return Err(mlua::Error::runtime(
+                "plugin: wc.timer_cancel is not allowed from an event hook or a timer callback"));
+        }
+        let handle = handle as u64;
+        let mut e = editor.try_borrow_mut()
+            .map_err(|_| mlua::Error::runtime("plugin: editor busy"))?;
+        if let Some(pos) = e.pending_plugin_timers.iter().position(|t| t.handle == handle) {
+            let key = e.pending_plugin_timers.remove(pos).key;
+            lua.set_named_registry_value(&key, mlua::Value::Nil)?;   // free the callback
+        }
+        Ok(())
+    })?)?;
     Ok(())
 }
 
