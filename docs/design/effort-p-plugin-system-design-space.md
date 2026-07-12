@@ -156,6 +156,22 @@ mirroring the swap SSD-wear guardrails.
 - Not a package manager / plugin distribution story (separate, later).
 - Language bindings beyond Lua.
 
+## Prior art to study (at the P brainstorm, at source)
+Study these **when P kicks off**, not before — the same clone-and-read treatment we gave Fresh (which
+caught the inverted instant-typing risk + the god-hub trap). Pointers, not a study, for now.
+
+| Study | For which fork / question | Note |
+|---|---|---|
+| **Neovim** (`neovim/neovim`) | lifecycle + loading (`runtimepath`, eager `plugin/` vs lazy `lua/` via `package.searchers`), the `vim.*` bridge shape, the **autocmd/event model** (fork 3) | Already **Reference model 1** above. C, not Rust — teaches *what* to build. Its `vim.api` raw-internals access is the **anti-pattern** we reject (see the load-bearing decision). |
+| **WezTerm** (`wez/wezterm`) | the **`mlua` embedding + `wc.*` API surface** (fork 4), lifecycle | The closest analog to OUR stack: a **Rust host embedding Lua via `mlua`**, exposing a `wezterm.*` object from `UserData`, event callbacks, config-as-Lua. Answers "build a clean API object without flinging `&mut Editor` into a callback" — teaches *how*. Best single complement to Neovim. |
+| **Luau** (`luau-lang/luau`, Roblox) | the **trust model** (fork 2) | Sandboxed, capability-limited, typed Lua — the reference IF we lean sandboxed. An `mlua` backend. |
+| **mpv** (`mpv-player/mpv`) | the hook/event model (fork 3) | Clean event/hook scripting model, second data point alongside Neovim autocmds. |
+| **Fresh** (`sinelaw/fresh`) | the **counter-model** | Already studied (Reference model 2). Out-of-process sandboxed JS — the boundary trade we are NOT taking; its 205-variant central command enum is the god-hub cautionary example. |
+
+**Deliberately weak examples** (chose non-Lua paths — inform "why in-process Lua," not "how"): **Zed**
+(WASM extensions), **Lapce** (WASI), **Helix** (settled toward Steel/Scheme; its plugin story is a
+years-long *cautionary* tale of not-shipping).
+
 ## References
 - **Reference model 2 — Fresh (`github.com/sinelaw/fresh`)**: the sandboxed-QuickJS/TypeScript cousin,
   read at source 2026-07-11. See the "Reference model 2" section above (runtime fork, the anti-god-hub
