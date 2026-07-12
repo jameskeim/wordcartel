@@ -484,7 +484,8 @@ status = "needs-design"
 kind = "feature"
 size = "M"
 theme = "S"
-hook = "Structure mode: atomic heading-subtree move via submit_transaction; drag-reorder."
+depends_on = ["S4"]
+hook = "Structure mode: atomic heading-subtree move via submit_transaction; drag-reorder. Inherits select_section from S4, and OWNS section transpose (deliberately cut from S4: outline::sections yields NESTED/overlapping ranges — the 'next section' after an H2 is usually its own H3 child, so naive swap-with-next corrupts the document; S1 must solve sibling identification + separator normalization anyway)."
 doc = "ux-backlog.md#s1"
 created = "2026-07-07"
 
@@ -919,10 +920,58 @@ created = "2026-07-11"
 [[item]]
 id = "S4"
 title = "Prose text objects — structural selection + operator layer"
-status = "triage"
+status = "needs-design"
 kind = "feature"
-size = "XL"
+size = "L"
 theme = "S"
-hook = "Named, composable prose objects (sentence/clause/quotation/section) × operators (select/delete/transpose/reflow/count) over a document→section→block→sentence→clause→word hierarchy; expand/shrink selection; heuristic sentence-detection module; Markdown-tree-backed structural objects; seam with shipped repar (C2/C2b) + A14 operators; underpins S1. XL — may promote to own theme. Design-space: docs/design/prose-text-objects-design-space.md."
+depends_on = ["S5"]
+hook = "RE-SCOPED 2026-07-12 (was XL): objects only make SELECTIONS; the existing operators act on the selection (the shipped A14 scope_or_word convention) — N+M commands, NOT N×M, so no command-surface law-10 amendment. Contents: select_sentence/select_section, expand-ladder as data, transpose_sentences, ONE object-agnostic swap over the existing MarkedBlock+Selection pair, count_region. CUT: the TextObject trait/ObjectRegistry/Affinity scaffolding, PairedDelimiter (BlockTree discards ALL inline events, and fiction omits closing quotes), plain-text degradation, section transpose (→S1: outline::sections ranges NEST, so swap-with-next corrupts). Earned by S6, which diagnoses what this operates on. Arc: docs/design/prose-structure-arc.md."
 doc = "ux-backlog.md#s4"
+created = "2026-07-12"
+
+[[item]]
+id = "S5"
+title = "Sentence authority — fix select_sentence, differential suite, sentence motions"
+status = "needs-design"
+kind = "bug"
+size = "SM"
+theme = "S"
+hook = "LIVE BUG (verified 2026-07-12): select_sentence on \"Dr. Smith arrived.\" selects \"Dr. \" — UAX-29 splits after title abbreviations; repar's ventilate gets it right, so the two disagree in the shipped product. Fix = abbreviation-aware post-pass + a differential fixture suite pinning our detector to repar's ventilate. Also adds the sentence MOTIONS both design docs forgot (Dir has Word/Paragraph, no Sentence — no M-a/M-e). Ships alone; the whole S4–S8 arc stands on it. Arc: docs/design/prose-structure-arc.md."
+doc = "ux-backlog.md#s5"
+created = "2026-07-12"
+
+[[item]]
+id = "S6"
+title = "Ventilate-as-a-lens — non-destructive sentence view + rhythm gutter"
+status = "needs-design"
+kind = "feature"
+size = "M"
+theme = "S"
+depends_on = ["S5"]
+hook = "⭐ THE THESIS IS PROVEN OR KILLED HERE. Ventilate as a VIEW, not an edit: buffer untouched, display breaks one sentence per line, toggle off → prose returns byte-identical. Plus a rhythm gutter (per-sentence word count + opening word) so a 41-word monster and three repeated 'The' openers are visible instantly. Zero NLP, no new objects, no command matrix, no contract amendment. Must render with OUR detector (S5), not repar's, so what you SEE and what you SELECT are the same object. FAILURE SIGNAL: author uses it on real prose for 2 weeks and turns it off → STOP THE ARC. Arc: docs/design/prose-structure-arc.md."
+doc = "ux-backlog.md#s6"
+created = "2026-07-12"
+
+[[item]]
+id = "S7"
+title = "Linguistic substrate — harper-brill POS tagger + NP chunker in-process"
+status = "needs-design"
+kind = "feature"
+size = "M"
+theme = "S"
+depends_on = ["S6"]
+hook = "ADOPTION DECIDED 2026-07-12 (measured, not assumed): harper-brill = rule-based Brill POS tagger + NP chunker, 2 direct deps, +119 activated crates, +0.95 MB binary, ZERO GPU/FFI (the lockfile's 491 + cubecl/CUDA entries are optional deps that never compile). Proven: 'because' → SCONJ vs 'on' → ADP — the exact distinction that makes clause-splitting principled. PARTIALLY REVERSES H2 (burn returns in-process, thinner: 119 vs 389 crates) — see the H2 archive note. GATE: cargo deny/audit has NOT been run against the 119 new crates; it must pass before merge. Cold-path only, block-windowed, version-cached. Arc: docs/design/prose-structure-arc.md."
+doc = "ux-backlog.md#s7"
+created = "2026-07-12"
+
+[[item]]
+id = "S8"
+title = "Prose lenses — POS-driven stylistic X-rays; Phrase/Clause select-only"
+status = "needs-design"
+kind = "feature"
+size = "M"
+theme = "S"
+depends_on = ["S7"]
+hook = "The genuinely novel half. Every adverb dimmed; every passive (AUX + participle) underlined; nominalizations flagged; 'select every sentence containing a passive'. This is what harper-ls CANNOT give — it flags ERRORS; these are stylistic X-rays of CORRECT prose, which is what revision needs. Then Phrase (the chunker's NPs) and Clause (POS-informed: CCONJ/SCONJ/ADP disambiguates for/so/yet) — SELECT-ONLY. THE LAW: a linguistic analysis may COLOR and may SELECT; it may never MUTATE without a visible, abortable selection (Brill is newswire-trained; it WILL mistag fiction/dialect/verse). Arc: docs/design/prose-structure-arc.md."
+doc = "ux-backlog.md#s8"
 created = "2026-07-12"
