@@ -713,6 +713,24 @@ impl Registry {
             c.editor.settings_save_requested = true;
             CommandResult::Handled
         });
+        // Plugin lifecycle (P2 §6). Both are real Settings commands (command-surface contract:
+        // palette-exhaustive by construction, Settings menu by derivation). `plugins_reload` only
+        // arms the request flag — the run loop's between-reduces reload seam
+        // (plugin::reload::perform_reload) does the whole-VM teardown+rebuild, never inline here.
+        r.register("plugins_reload", "Reload Plugins", Some(MenuCategory::Settings), |c| {
+            c.editor.plugins_reload_requested = true;
+            c.editor.status = "reloading plugins\u{2026}".into();
+            CommandResult::Handled
+        });
+        r.register("plugin_list", "List Plugins", Some(MenuCategory::Settings), |c| {
+            let inv = &c.editor.plugin_inventory;
+            let ok = inv.iter().filter(|r| r.error.is_none()).count();
+            let failed = inv.len() - ok;
+            let cmds: usize = inv.iter().map(|r| r.commands).sum();
+            let hooks: usize = inv.iter().map(|r| r.hooks).sum(); // real hook total (Task 6 wiring)
+            c.editor.status = format!("plugins: {ok} ok ({cmds} cmds, {hooks} hooks), {failed} failed");
+            CommandResult::Handled
+        });
 
         r
     }
@@ -1194,6 +1212,8 @@ mod tests {
             ("set_wrap_column",  "Wrap Column: Set\u{2026}"),
             ("toggle_chrome",    "Chrome: Full/Zen"),
             ("save_settings",    "Save Settings"),
+            ("plugins_reload",   "Reload Plugins"),
+            ("plugin_list",      "List Plugins"),
         ] {
             let m = reg.meta(CommandId(id)).unwrap_or_else(|| panic!("missing {id}"));
             assert_eq!(m.label, label, "label mismatch for {id}");
@@ -1202,6 +1222,41 @@ mod tests {
         // Confirm demotion.
         assert_eq!(reg.meta(CommandId("keymap_cua")).unwrap().menu, None, "keymap_cua must be palette-only");
         assert_eq!(reg.meta(CommandId("keymap_wordstar")).unwrap().menu, None, "keymap_wordstar must be palette-only");
+    }
+
+    // -----------------------------------------------------------------------
+    // P2 Task 8b: plugins_reload / plugin_list builtins (§6)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn plugins_reload_sets_flag() {
+        let reg = Registry::builtins();
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        assert!(!e.plugins_reload_requested, "flag starts clear");
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let r = reg.dispatch(CommandId("plugins_reload"), &mut ctx);
+        assert_eq!(r, crate::commands::CommandResult::Handled);
+        assert!(e.plugins_reload_requested, "plugins_reload sets the request flag the seam consumes");
+    }
+
+    #[test]
+    fn plugin_list_formats_inventory() {
+        let reg = Registry::builtins();
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.plugin_inventory = vec![
+            crate::plugin::PluginRecord { name: "a".into(), commands: 2, hooks: 1, error: None },
+            crate::plugin::PluginRecord { name: "b".into(), commands: 0, hooks: 0, error: Some("boom".into()) },
+        ];
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let r = reg.dispatch(CommandId("plugin_list"), &mut ctx);
+        assert_eq!(r, crate::commands::CommandResult::Handled);
+        assert_eq!(e.status, "plugins: 1 ok (2 cmds, 1 hooks), 1 failed");
     }
 
     // -----------------------------------------------------------------------

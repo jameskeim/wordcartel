@@ -805,12 +805,13 @@ fn journey_palette_end_reaches_last_command() {
     };
     assert!(h.screen_contains(&last_label),
         "last command label {last_label:?} must be visible on screen after End");
-    // Enter dispatches save_settings (last registered command) → settings_save_requested
-    // is set, palette closes. Verifies the end-of-list dispatch path (spec I4).
+    // Enter dispatches plugin_list (the last registered command, P2 Task 8b) → it writes a
+    // plugin-inventory summary to the status line, palette closes. Verifies the end-of-list
+    // dispatch path (spec I4).
     h.key(KeyCode::Enter);
     assert!(h.editor.borrow().palette.is_none(), "Enter closes the palette");
-    assert!(h.editor.borrow().settings_save_requested,
-        "save_settings must be dispatched and set settings_save_requested");
+    assert!(h.editor.borrow().status.starts_with("plugins:"),
+        "plugin_list must be dispatched and write its inventory summary to the status line");
 }
 
 // ---------------------------------------------------------------------------
