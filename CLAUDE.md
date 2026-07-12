@@ -3,7 +3,7 @@
 Markdown-first Rust terminal word processor. Functional-core / imperative-shell:
 `wordcartel-core` (pure, `#![forbid(unsafe_code)]`) + `wordcartel` shell (binary `wcartel`;
 ratatui 0.30, crossterm). Top priority: **instant typing, no data loss, no silent UI
-waits.** Build toward an in-process Lua plugin system (Effort P, the 1.0 capstone).
+waits.** Build toward an in-process Lua plugin system (Effort P — a significant effort, not the 1.0 capstone).
 
 **Backlog / progress tracking.** Open and completed work is tracked in **`backlog.toml`** (the
 single source of truth for item state) → **`BACKLOG.md`** (a generated dashboard — READ THIS for

@@ -1,7 +1,9 @@
 # Effort P — grounding package (facts for independent architecture)
 
 **Purpose.** This is the **factual** grounding for designing wordcartel's in-process Lua plugin system
-(Effort P, the 1.0 capstone). It deliberately contains **no decomposition and no design decisions** —
+(Effort P — a **significant** effort, but **not** the 1.0 capstone; scope it as solid, incrementally
+valuable work, not a do-everything endgame). It deliberately contains **no decomposition and no design
+decisions** —
 only (1) the goal, (2) the binding constraints, (3) the real current code surface, and (4) three
 prior-art reference models read at source. It exists so an independent author can propose the
 architecture and phasing **from grounding**, not from prior conclusions. (Our earlier tentative
@@ -15,8 +17,10 @@ brainstorm — a P0→P3 slicing and specific forks — lives separately in
 
 An **in-process Lua plugin system** for wordcartel (a markdown-first Rust terminal word processor;
 functional-core `wordcartel-core` + imperative-shell `wordcartel`, binary `wcartel`; ratatui 0.30).
-Plugins are user-installed Lua that extends the editor. It is the 1.0 capstone and the spine for
-automation. Reference intent: adopt the *lifecycle/mechanics* of a Neovim-style embedded-Lua editor,
+Plugins are user-installed Lua that extends the editor. It is a **significant effort but NOT the 1.0
+capstone** — scope it as solid, incrementally shippable work, not the do-everything endgame; prefer a
+lean, valuable first phase over maximal completeness. It is the spine for automation. Reference intent:
+adopt the *lifecycle/mechanics* of a Neovim-style embedded-Lua editor,
 but **mediate** all host access (no raw internals) so the editor's valid-by-construction guarantees
 hold.
 

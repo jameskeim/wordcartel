@@ -2,7 +2,8 @@
 
 **Status:** DESIGN-SPACE / pre-spec (2026-07-08). NOT law, NOT an approved spec — this grounds the
 eventual Effort-P brainstorm; every fork below is an open decision for that brainstorm, not a
-commitment. Effort P is the 1.0 capstone (see `CLAUDE.md`; memory `wordcartel-plugin-roadmap`).
+commitment. Effort P is a significant effort — **not** the 1.0 capstone (corrected 2026-07-11; see
+`CLAUDE.md`; memory `wordcartel-plugin-roadmap`).
 
 **Provenance:** the project has been provisioned toward this — the **command registry** was built as
 the "plugin/automation spine" (`docs/design/command-surface-contract.md`) and the **`std::thread` +
