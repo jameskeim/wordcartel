@@ -121,6 +121,13 @@ A new module family under `wordcartel/src/plugin/`. Nothing plugin-specific leak
   or the no-plugins-dir case leaves `plugin_host: Option<PluginHost> = None`; the pump stage is a
   cheap `if let Some(h) = …` (mirrors the `NullProvider` / boxed-`DiagnosticsProvider` null-object
   discipline from Effort A). e2e journeys that don't exercise plugins construct no host.
+- **Implementation ordering note — the `Sender<Msg>` must be created before plugin load.** The plugin
+  load phase is planned between `Registry::builtins()` (`app.rs:620`) and `build_keymap` (`app.rs:622`),
+  but the `let (msg_tx, msg_rx) = channel()` currently lives *later* (`app.rs:~631`). If the `Bridge`
+  needs a `Sender<Msg>` clone (for `wc.status` / future async), the plan **must move channel creation
+  earlier in `run()`** — ahead of the plugin-load phase — so the bridge can capture `msg_tx.clone()` at
+  host construction. A mechanical reorder (the channel has no dependency on the intervening lines); the
+  plan calls it out as a required migration step.
 
 ---
 
@@ -133,11 +140,37 @@ adapted to a single-threaded loop — which lets P1 *improve* on WezTerm's defer
 because the safe point is on the same thread in the same frame, API calls borrow the live editor
 directly instead of round-tripping oneshot channels.
 
-### a. Reads — live, synchronous, per-call borrow
+### Design law — offset/range pre-validation (cross-cutting; binding on every phase)
+The core edit/text primitives are **trusted-caller** APIs that *assert* on bad input rather than
+returning errors: `ChangeSet::from_ops` release-asserts its consumption sum (`change.rs:127`),
+`ChangeSet::insert`/`delete` assume in-range boundary offsets, and `TextBuffer::slice` char-boundary-
+checks then hands the range to `rope.byte_slice` as-given — and `clamp_to_boundary` only snaps a *single*
+offset, it does **not** enforce `a <= b` or in-bounds (`buffer.rs:48–53`, `:125–136`). A raw
+plugin-supplied offset reaching any of them is a panic, not a degrade — the class behind the round-3
+(edits) and round-4 (`wc.text`) Criticals. Therefore:
+
+> **LAW.** Every plugin API that accepts a byte offset or range MUST pre-validate it against the **live
+> buffer** — in-bounds (`to <= len`), ordered (`from <= to`), and both endpoints on char boundaries
+> (`clamp_to_boundary(p) == p`) — via the shared `plugin_check_range` helper (§3b), and return a **typed
+> Lua error (degrade)** on failure. **No raw plugin-supplied offset ever reaches an asserting core
+> primitive** (`ChangeSet::from_ops`/`insert`/`delete`, `TextBuffer::slice`/`apply`).
+
+**P1 `wc.*` surface audit against the LAW** (every input-taking API is covered, so future phases inherit
+the discipline): `wc.text(a, b)` — range → **guarded** (§3a); `wc.replace(a, b, text)` — range →
+**guarded** (§3b); `wc.insert(text)` — single offset (live cursor) → **guarded** (§3b); `wc.set_selection`
+— snaps via `submit_transaction`, never asserts → **safe by routing**; `wc.selection`/`wc.cursor`/
+`wc.len`/`wc.version`/`wc.path` — take **no** offset input → **safe** (nothing to validate);
+`wc.status`/`wc.register_command` — no offsets → **safe**. `plugin_check_range` is the one chokepoint.
+
+### a. Reads — live, synchronous, per-call borrow (offset inputs pre-validated — the LAW)
 Each read API function does a short `editor.try_borrow_mut()` (or `try_borrow`) for the duration of that
 one call and returns owned data to Lua. Reads are O(requested), never O(document):
-- `wc.text(a?, b?)` → the buffer substring (whole buffer if omitted); bounds clamped to char
-  boundaries via the buffer's existing `clamp_to_boundary`.
+- `wc.text(a?, b?)` → the buffer substring (whole buffer if both omitted). When a range is given it is
+  **pre-validated via `plugin_check_range` against the live buffer** (`a <= b`, `b <= len`, both on char
+  boundaries) — bad input → a **typed Lua error**, nothing sliced — BEFORE calling `TextBuffer::slice`.
+  This closes the same panic class as the edit fold: `slice` → `rope.byte_slice(range)` panics on a
+  reversed or out-of-bounds range, and `clamp_to_boundary` clamps only one endpoint, so the range check
+  is on us, not the primitive. A missing endpoint defaults to `0` / `len` (both valid boundaries).
 - `wc.selection()` → `{anchor, head}` byte offsets of the primary selection.
 - `wc.cursor()` → the primary `head` byte offset.
 - `wc.len()` → buffer byte length; `wc.version()` → the document version; `wc.path()` → the active
@@ -158,10 +191,12 @@ char-boundary asserts fire on mid-char offsets. `submit_transaction`'s `validate
 STALE *length*, but a plugin passing out-of-bounds, reversed (`from > to`), or non-char-boundary offsets
 would **panic during construction**, before validation — defeating degrade-don't-crash / no-data-loss.
 So the plugin edit API MUST pre-validate the plugin-provided offsets against the **live buffer** and
-return a **typed Lua error** (degrade, plugin may `pcall`) BEFORE constructing any `ChangeSet`. A single
-shared helper `plugin_check_range(buf, from, to) -> Result<(), PluginEditError>` enforces, in order:
+return a **typed Lua error** (degrade, plugin may `pcall`) BEFORE constructing any `ChangeSet`. The
+single shared chokepoint — used by BOTH edits and the `wc.text` read (§3a) — is
+`plugin_check_range(buf, from, to) -> Result<(), PluginRangeError>`, which enforces, in order:
 `from <= to`; `to <= buf.len()`; `from` and `to` each on a char boundary
-(`buf.clamp_to_boundary(p) == p`). Only offsets that pass reach a constructor.
+(`buf.clamp_to_boundary(p) == p`). Only offsets that pass reach a core primitive (this is the §3 LAW).
+A single-offset API (`wc.insert`) checks `plugin_check_range(buf, off, off)`.
 
 - `wc.insert(text)` → pre-checks `cursor` is a valid boundary (it always is — it comes from the live
   selection — but the check is uniform), then `ChangeSet::insert(cursor, text, len)`
@@ -387,13 +422,15 @@ UI-drawing API (Provider law: plugins supply data/behavior; the host owns UI/lay
 - **Isolation tests:** a panicking callback → caught, status set, editor intact, next command still
   works; a callback that loops → time-abort fires (driven by a low test budget); the `try_borrow_mut`
   "editor busy" path is exercised directly.
-- **Edit pre-validation tests (guards the round-3 Critical — construction must never panic on garbage):**
-  a plugin `wc.replace` with an out-of-bounds offset, a reversed range (`from > to`), and a mid-char
-  offset each → a **typed Lua error, buffer unchanged, no panic** (the pre-check rejects before any
-  `ChangeSet` is constructed — proves garbage never reaches `from_ops`'s consumption assert). Plus a
-  concurrent-`StaleLength` path: a valid-at-check-time range that a racing edit invalidates → the
+- **Offset/range pre-validation tests (guards the §3 LAW — no core primitive ever panics on plugin
+  garbage; the round-3 edit + round-4 `wc.text` Criticals):** for EACH input-taking API — `wc.replace`,
+  `wc.insert`, and the `wc.text` **read** — an out-of-bounds offset, a reversed range (`from > to`), and
+  a mid-char offset each → a **typed Lua error, buffer/selection unchanged, no panic** (the `plugin_check_range`
+  pre-check rejects before any `ChangeSet` is constructed or `TextBuffer::slice` is called — proves
+  garbage never reaches `from_ops`'s consumption assert or `rope.byte_slice`). Plus a concurrent-
+  `StaleLength` edit path: a valid-at-check-time range that a racing edit invalidates → the
   `submit_transaction` `validate_against` `Err`, zero mutation. A fuzz/property-style test driving random
-  `(from, to, text)` from Lua asserts **no panic** across the whole edit API.
+  `(a, b, text)` from Lua across the whole input-taking surface asserts **no panic**.
 - **Contract-invariant tests** (see §9): palette-completeness and menu-subset re-run over a registry
   containing plugin entries; a patch-bound plugin command resolves in `build_keymap` and survives a
   preset switch (law 7).
