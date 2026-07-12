@@ -148,8 +148,11 @@ impl PluginHost {
     /// The `set_hook` runaway guard (spike §11.3, GREEN): install an instruction-count hook
     /// (every 10k instructions) that checks elapsed wall time and aborts with a typed Lua error
     /// once [`TIME_BUDGET`] is exceeded. Scoped tightly around ONE callback invocation and
-    /// always removed afterward (`remove_hook`) — a leaked hook would fire during the NEXT
-    /// unrelated Lua call (registration, another plugin's callback).
+    /// ALWAYS removed afterward (`remove_hook`) — via a [`HookGuard`] whose `Drop` runs on both
+    /// the normal-return path and an unwind (`f` is the plugin callback; `panicx::catch`, the
+    /// pump's sole panic backstop, resumes a raw Rust panic THROUGH this frame rather than
+    /// converting it — see [`Self::pump`]) — a leaked hook would fire during the NEXT unrelated
+    /// Lua call (registration, another plugin's callback).
     fn with_time_guard<T>(&self, lua: &mlua::Lua, f: impl FnOnce() -> mlua::Result<T>) -> mlua::Result<T> {
         let start = std::time::Instant::now();
         lua.set_hook(mlua::HookTriggers::new().every_nth_instruction(10_000), move |_lua, _dbg| {
@@ -159,9 +162,19 @@ impl PluginHost {
                 Ok(mlua::VmState::Continue)
             }
         });
-        let result = f();
-        lua.remove_hook();
-        result
+        let _guard = HookGuard(lua);
+        f()
+    }
+}
+
+/// RAII: removes `with_time_guard`'s `set_hook` on drop — normal return AND unwind alike — so a
+/// panicking plugin callback can never leak a stale hook onto the VM (safe Rust; no `unsafe`,
+/// per the crate's `#![forbid(unsafe_code)]`).
+struct HookGuard<'a>(&'a mlua::Lua);
+
+impl Drop for HookGuard<'_> {
+    fn drop(&mut self) {
+        self.0.remove_hook();
     }
 }
 
@@ -412,5 +425,84 @@ mod tests {
         let err = result.expect_err("a nested borrow must degrade, not succeed");
         assert!(err.to_string().contains("editor busy"), "error: {err}");
         assert_eq!(whole_text(&editor), "x", "no mutation happened under the nested borrow");
+    }
+
+    #[test]
+    fn wc_set_selection_in_bounds_sets_selection() {
+        let (mut host, editor, _id) = make("wc.set_selection(1, 3)", "hello");
+        host.pump(&editor);
+        let sel = editor.borrow().active().document.selection.primary();
+        assert_eq!((sel.anchor, sel.head), (1, 3));
+    }
+
+    #[test]
+    fn wc_set_selection_out_of_bounds_snaps_no_panic() {
+        // "hi" has len 2; head=999 is far out of bounds — must SNAP to buf.len() (the required
+        // TDD case), never reject/error/panic.
+        let (mut host, editor, _id) = make("wc.set_selection(0, 999)", "hi");
+        host.pump(&editor);
+        let sel = editor.borrow().active().document.selection.primary();
+        assert_eq!((sel.anchor, sel.head), (0, 2), "head snapped to buffer length, not rejected");
+        let status = editor.borrow().status.clone();
+        assert!(!status.to_lowercase().contains("panic"), "status: {status}");
+        assert!(!status.contains("plugin:"), "must succeed silently, no typed error: {status}");
+    }
+
+    #[test]
+    fn wc_selection_returns_the_current_selection() {
+        let (mut host, editor, _id) = make(
+            "wc.set_selection(1, 3); local s = wc.selection(); wc.status(tostring(s.anchor) .. ':' .. tostring(s.head))",
+            "hello",
+        );
+        host.pump(&editor);
+        let status = editor.borrow().status.clone();
+        assert_eq!(status, "1:3");
+    }
+
+    #[test]
+    fn wc_len_returns_buffer_byte_length() {
+        let (mut host, editor, _id) = make("wc.status(tostring(wc.len()))", "hello");
+        host.pump(&editor);
+        let status = editor.borrow().status.clone();
+        assert_eq!(status, "5");
+    }
+
+    #[test]
+    fn wc_version_returns_buffer_version_after_an_edit() {
+        let (mut host, editor, _id) = make("wc.insert('x'); wc.status(tostring(wc.version()))", "y");
+        host.pump(&editor);
+        let status = editor.borrow().status.clone();
+        assert_eq!(status, "1", "version bumps once per applied transaction");
+    }
+
+    #[test]
+    fn wc_path_is_nil_for_an_unsaved_buffer() {
+        let (mut host, editor, _id) = make("wc.status(tostring(wc.path()))", "x");
+        host.pump(&editor);
+        let status = editor.borrow().status.clone();
+        assert_eq!(status, "nil");
+    }
+
+    #[test]
+    fn wc_path_returns_the_path_for_a_named_buffer() {
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().expect("VM construction");
+        let src = "wc.register_command{ name='cmd', label='C', fn=function() wc.status(tostring(wc.path())) end }";
+        let reports = load_sources(&mut reg, &host, &sources(&[("t", src)]));
+        assert_eq!(reports[0].result, Ok(1));
+        let id = reg.resolve_name("t.cmd").expect("registered under t.cmd");
+
+        let editor = Rc::new(RefCell::new(Editor::new_from_text(
+            "x",
+            Some(std::path::PathBuf::from("/tmp/note.md")),
+            (40, 10),
+        )));
+        let (tx, clock) = test_bridge_parts();
+        host.attach_bridge(editor.clone(), tx, clock).expect("bridge attaches on a live VM");
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id });
+
+        host.pump(&editor);
+        let status = editor.borrow().status.clone();
+        assert_eq!(status, "/tmp/note.md");
     }
 }
