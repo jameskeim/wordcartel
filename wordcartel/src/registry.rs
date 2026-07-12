@@ -735,7 +735,9 @@ impl Registry {
             let failed = inv.len() - ok;
             let cmds: usize = inv.iter().map(|r| r.commands).sum();
             let hooks: usize = inv.iter().map(|r| r.hooks).sum(); // real hook total (Task 6 wiring)
-            c.editor.status = format!("plugins: {ok} ok ({cmds} cmds, {hooks} hooks), {failed} failed");
+            let timers = c.editor.pending_plugin_timers.len(); // P3: live armed-timer count
+            c.editor.status = format!(
+                "plugins: {ok} ok ({cmds} cmds, {hooks} hooks, {timers} timers), {failed} failed");
             CommandResult::Handled
         });
 
@@ -1376,7 +1378,37 @@ mod tests {
         let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
         let r = reg.dispatch(CommandId("plugin_list"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Handled);
-        assert_eq!(e.status, "plugins: 1 ok (2 cmds, 1 hooks), 1 failed");
+        assert_eq!(e.status, "plugins: 1 ok (2 cmds, 1 hooks, 0 timers), 1 failed");
+    }
+
+    #[test]
+    fn plugin_list_reports_armed_timers() {
+        let reg = Registry::builtins();
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.plugin_inventory = vec![crate::plugin::PluginRecord {
+            name: "a".into(),
+            commands: 2,
+            hooks: 1,
+            error: None,
+        }];
+        for handle in 0..2 {
+            e.pending_plugin_timers.push(crate::plugin::PluginTimer {
+                handle,
+                origin: "a".into(),
+                key: format!("wc-timer-{handle}"),
+                next_due_ms: 1_000,
+                interval_ms: 1_000,
+                repeat: false,
+                pending: false,
+            });
+        }
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let r = reg.dispatch(CommandId("plugin_list"), &mut ctx);
+        assert_eq!(r, crate::commands::CommandResult::Handled);
+        assert_eq!(e.status, "plugins: 1 ok (2 cmds, 1 hooks, 2 timers), 0 failed");
     }
 
     // -----------------------------------------------------------------------
