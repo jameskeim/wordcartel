@@ -47,6 +47,32 @@ pub const PLUGIN_MAX_STATUS_LEN: usize = 4096;
 /// any real plugin script (plugin files are user CODE, not documents); an oversize file is
 /// skipped + named in the returned report, never truncated or silently dropped.
 pub const PLUGIN_MAX_SOURCE_BYTES: u64 = 1024 * 1024;
+/// Max nesting depth converted from `[plugins.config.<name>]` into a Lua table.
+pub const PLUGIN_MAX_CONFIG_DEPTH: usize = 8;
+/// Max total nodes (keys + values) converted from one plugin's config table.
+pub const PLUGIN_MAX_CONFIG_NODES: usize = 1024;
+/// Max byte length of any single config string VALUE or table KEY — the pre-allocation byte
+/// bound (resource-bound LAW) that depth+node counts miss: `config::load` reads the source
+/// unbounded, so one giant string/key must be rejected BEFORE `lua.create_string` allocates it.
+pub const PLUGIN_MAX_CONFIG_STR: usize = 64 * 1024;
+
+/// P2 event-system caps (bounded-memory LAW, extending the P1 registration caps above).
+/// Max `wc.on` hooks a single plugin may register — each hook stores a Lua function in the VM
+/// registry plus an owned (never interned) Rust-side `HookEntry`.
+pub const PLUGIN_MAX_HOOKS_PER_PLUGIN: usize = 64;
+/// Max byte length of a `PluginEvent`'s captured path payload (`cap_status`-clamped at the fire
+/// site) — the queue holds bounded owned data even for a pathological path.
+pub const PLUGIN_MAX_EVENT_PAYLOAD: usize = 4096;
+
+/// Max byte length of a `wc.command(name)` target — the longest possible registered id
+/// (`<stem>.<name>`), so this cap can never reject a resolvable name (§5a).
+pub const PLUGIN_MAX_COMMAND_REF: usize = PLUGIN_MAX_STEM_LEN + 1 + PLUGIN_MAX_NAME_LEN;
+/// Max queued `wc.command` dispatches awaiting drain — a single callback looping on
+/// `wc.command` must not grow an unbounded queue before the chain cap can even run (§5a).
+pub const PLUGIN_MAX_PENDING_DISPATCH: usize = 64;
+/// The pump's re-drain loop chain cap (§5c): the deterministic, testable bound on ping-pong
+/// cascade length (one dispatch, one command callback, or one hook invocation = one unit).
+pub const PLUGIN_PUMP_CHAIN_CAP: usize = 64;
 
 #[cfg(test)]
 mod tests {
@@ -60,5 +86,13 @@ mod tests {
         assert_eq!(PLUGIN_MAX_LABEL_LEN, 256);
         assert_eq!(PLUGIN_MAX_STATUS_LEN, 4096);
         assert_eq!(PLUGIN_MAX_SOURCE_BYTES, 1024 * 1024);
+        assert_eq!(PLUGIN_MAX_CONFIG_DEPTH, 8);
+        assert_eq!(PLUGIN_MAX_CONFIG_NODES, 1024);
+        assert_eq!(PLUGIN_MAX_CONFIG_STR, 64 * 1024);
+        assert_eq!(PLUGIN_MAX_HOOKS_PER_PLUGIN, 64);
+        assert_eq!(PLUGIN_MAX_EVENT_PAYLOAD, 4096);
+        assert_eq!(PLUGIN_MAX_COMMAND_REF, PLUGIN_MAX_STEM_LEN + 1 + PLUGIN_MAX_NAME_LEN);
+        assert_eq!(PLUGIN_MAX_PENDING_DISPATCH, 64);
+        assert_eq!(PLUGIN_PUMP_CHAIN_CAP, 64);
     }
 }

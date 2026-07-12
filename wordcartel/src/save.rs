@@ -3,7 +3,7 @@
 //! the snapshot off the keystroke path and atomically writes it; the merge
 //! updates status/saved_version version-awarely.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::commands::CommandResult;
@@ -88,6 +88,13 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: std::path::PathBuf, mode: SaveMo
                     // target the originating buffer even after a buffer switch (multi-buffer, Effort 6).
                     // Assemble the (global) status in a local so the `b` mutable borrow ends
                     // before we touch editor.status.
+                    // P2 on_save fire site: computed from the closure's OWNED `target` (the
+                    // written path), NOT from `b` — a closed buffer must still fire (the write
+                    // DID succeed). Fires on Saved AND Unchanged (both are the user-visible
+                    // "a save completed" outcome); Err fires nothing.
+                    let fire_save: Option<PathBuf> =
+                        matches!(outcome, Ok(SaveOutcome::Saved) | Ok(SaveOutcome::Unchanged))
+                            .then(|| target.clone());
                     let mut status = String::new();
                     if let Some(b) = editor.by_id_mut(buffer_id) {
                         match outcome {
@@ -132,6 +139,12 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: std::path::PathBuf, mode: SaveMo
                         }
                     }
                     editor.status = status;
+                    // Fire AFTER the by_id_mut block closes (never inside it — a live `b: &mut
+                    // Buffer` borrow would conflict with fire_event's `&mut Editor`) and after
+                    // editor.status is set — mirrors the local-then-assign shape above.
+                    if let Some(p) = fire_save {
+                        crate::plugin::fire_event(editor, crate::plugin::PluginEventKind::Save, Some(&p));
+                    }
                 }),
             }
         }),

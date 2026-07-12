@@ -113,7 +113,9 @@ impl Harness {
         let mut host = PluginHost::new().expect("VM construction");
         let srcs: Vec<(String, String)> =
             sources.iter().map(|(stem, src)| (stem.to_string(), src.to_string())).collect();
-        for report in crate::plugin::load::load_sources(&mut reg, &host, &srcs) {
+        for report in crate::plugin::load::load_sources(
+            &mut reg, &mut host, &srcs, &std::collections::BTreeMap::new(), &mut Vec::new(),
+        ) {
             assert!(report.result.is_ok(), "test plugin must load cleanly: {:?}", report.result);
         }
         let (keymap, _warn) = keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
@@ -138,13 +140,18 @@ impl Harness {
     fn step(&mut self, msg: Msg) -> bool {
         let clock = TestClock(self.now);
         let keep = { reduce(msg, &mut self.editor.borrow_mut(), &self.reg, &self.keymap, &self.ex, &clock, &self.tx) };
-        // Pump stage (Effort P1 Task 7): mirrors run()'s choreography — runs AFTER reduce's
-        // borrow scope has dropped, holding NO outer borrow, so a dispatched plugin command's
-        // Lua callback can re-borrow the editor via the bridge's wc.* closures. `None` for the
-        // non-plugin journeys — a real skip, not a null-host no-op call.
+        // Pump stage (Effort P1 Task 7; P2 Task 7 grows its dispatch context): mirrors run()'s
+        // choreography — runs AFTER reduce's borrow scope has dropped, holding NO outer borrow,
+        // so a dispatched plugin command's Lua callback can re-borrow the editor via the
+        // bridge's wc.* closures. `None` for the non-plugin journeys — a real skip, not a
+        // null-host no-op call.
         if let Some(h) = &mut self.plugin_host {
-            h.pump(&self.editor);
+            h.pump(&self.editor, &self.reg, &self.ex, &clock, &self.tx);
         }
+        // Hydrate any overlay a pump-dispatched wc.command opened (P2 §5b) — mirrors run()'s
+        // post-pump call; idempotent + self-guarding, so a no-op for the non-plugin journeys and
+        // for any overlay reduce's own per-path hydrate already filled this iteration.
+        { crate::app::hydrate_overlays(&mut self.editor.borrow_mut(), &self.reg, &self.keymap); }
         if let Some(t) = { crate::theme_cmds::rebuild_keymap_if_requested(&mut self.editor.borrow_mut(), &[], &self.reg) } {
             self.keymap = t;
         }
@@ -170,8 +177,9 @@ impl Harness {
         let _keep = { reduce(msg, &mut self.editor.borrow_mut(), &self.reg, &self.keymap, &self.ex, &clock, &self.tx) };
         let t_reduce = t0.elapsed();
         if let Some(h) = &mut self.plugin_host {
-            h.pump(&self.editor);
+            h.pump(&self.editor, &self.reg, &self.ex, &clock, &self.tx);
         }
+        { crate::app::hydrate_overlays(&mut self.editor.borrow_mut(), &self.reg, &self.keymap); }
         if let Some(t) = { crate::theme_cmds::rebuild_keymap_if_requested(&mut self.editor.borrow_mut(), &[], &self.reg) } {
             self.keymap = t;
         }
@@ -413,17 +421,21 @@ fn no_plugin_host_journey_is_unaffected() {
     assert_eq!(h.doc_text(), "hello world\n");
 }
 
-/// spec §8's loaded-but-idle guardrail (extends the swap SSD-wear guardrail family): a
-/// plugin loaded but never dispatched must do ZERO work while the app sits idle. The
-/// plugin's callback increments a Lua-global counter (not editor state) — inspectable
-/// directly off the host's own VM as a "host-side counter" without adding any production
-/// instrumentation. Proves "loaded ≠ background work": P1 plugins arm no deadline, so
-/// `timers::next_wake` must be unchanged by driving idle `Msg::Tick`s across real elapsed
-/// wall-clock time, and `pending_plugin_calls` must never gain an entry on its own.
+/// spec §8's loaded-but-idle guardrail (extends the swap SSD-wear guardrail family), grown by
+/// P2 Task 9 to also cover an `on_save` HOOK (not just a command): a plugin loaded but never
+/// dispatched/fired must do ZERO work while the app sits idle. Both callbacks increment their
+/// own Lua-global counter (not editor state) — inspectable directly off the host's own VM as a
+/// "host-side counter" without adding any production instrumentation. Proves "loaded ≠
+/// background work": P1/P2 plugins arm no deadline, so `timers::next_wake` must be unchanged by
+/// driving idle `Msg::Tick`s across real elapsed wall-clock time, and NONE of the three plugin
+/// queues (`pending_plugin_calls`/`pending_plugin_events`/`pending_plugin_dispatch`) may gain an
+/// entry on their own — events are edge-triggered by real ops, never by idle time.
 #[test]
 fn plugin_loaded_idle_drives_zero_callback_invocations_and_stable_wake() {
     let src = "calls = 0\n\
-               wc.register_command{ name='cmd', label='Counter', fn=function() calls = calls + 1 end }";
+               wc.register_command{ name='cmd', label='Counter', fn=function() calls = calls + 1 end }\n\
+               hook_calls = 0\n\
+               wc.on('save', function(ev) hook_calls = hook_calls + 1 end)";
     let mut h = Harness::new_with_plugin("hello\n", &[("counter", src)]);
     // Precondition: nothing is armed on a fresh, unedited, diagnostics-disabled buffer —
     // else "unchanged" below would be vacuously true against an already-Some deadline.
@@ -436,9 +448,14 @@ fn plugin_loaded_idle_drives_zero_callback_invocations_and_stable_wake() {
     let calls: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("calls")
         .expect("the plugin's Lua-global counter must exist");
     assert_eq!(calls, 0, "idle Msg::Tick must never invoke a plugin callback — loaded is not background work");
+    let hook_calls: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("hook_calls")
+        .expect("the plugin's hook counter must exist");
+    assert_eq!(hook_calls, 0, "idle Msg::Tick must never fire an on_save hook — loaded is not background work");
     assert!(h.editor.borrow().pending_plugin_calls.is_empty(), "no plugin call was ever queued while idle");
+    assert!(h.editor.borrow().pending_plugin_events.is_empty(), "no plugin event was ever queued while idle");
+    assert!(h.editor.borrow().pending_plugin_dispatch.is_empty(), "no wc.command dispatch was ever queued while idle");
     let wake_after = crate::timers::next_wake(&h.editor.borrow(), h.now);
-    assert_eq!(wake_before, wake_after, "P1 plugins arm no deadline — next_wake must stay None across idle ticks");
+    assert_eq!(wake_before, wake_after, "P1/P2 plugins arm no deadline — next_wake must stay None across idle ticks");
     assert_eq!(h.doc_text(), "hello\n", "idle ticks must not mutate the document");
 }
 
@@ -496,6 +513,179 @@ fn insert_date_lua_e2e_success_demo() {
     assert!(is_iso_date(second_date_part), "expected a second YYYY-MM-DD date, got {second_date_part:?}");
 }
 
+// ---------------------------------------------------------------------------
+// P2 Task 6: the event system — hooks firing at the three real fire sites
+// ---------------------------------------------------------------------------
+
+/// P2 acceptance: an `on_save` hook fires exactly once on a REAL save driven through the
+/// production `dispatch_save` → `InlineExecutor` → `jobs_apply::apply_outcome` merge path —
+/// the same wiring `journey_close_dirty_save_and_close` exercises, minus the close. Proves the
+/// full save.rs fire-site borrow choreography (fire AFTER the `by_id_mut` block closes, from
+/// the closure's OWNED `target`) against a real save, not a synthetic `PluginEvent` push.
+#[test]
+fn on_save_hook_fires_on_real_save() {
+    use crate::registry::Ctx;
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    std::fs::write(&path, "orig\n").unwrap();
+    let src = "\
+        calls = 0\n\
+        wc.on('save', function(ev) calls = calls + 1; wc.status(ev.kind .. ':' .. tostring(ev.path)) end)";
+    let mut h = Harness::new_with_plugin("orig\n edited", &[("hookplug", src)]);
+    {
+        let mut e = h.editor.borrow_mut();
+        e.active_mut().document.path = Some(path.clone());
+        e.active_mut().document.stored_fp = crate::save::fingerprint(&path);
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = None;
+    }
+    let clock = TestClock(h.now);
+    {
+        let mut e = h.editor.borrow_mut();
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone() };
+        crate::save::dispatch_save(&mut ctx);
+    }
+    // InlineExecutor already ran the job inline; drain + apply the merge (fires the event).
+    {
+        let outcomes = h.ex.drain();
+        let mut e = h.editor.borrow_mut();
+        for o in outcomes { crate::jobs_apply::apply_outcome(o, &mut e); }
+    }
+    // The pump drains the event the merge just enqueued — no outer borrow held.
+    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx);
+
+    let calls: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("calls")
+        .expect("the plugin's Lua-global counter must exist");
+    assert_eq!(calls, 1, "on_save hook must fire exactly once");
+    let expected = format!("save:{}", path.to_string_lossy());
+    assert_eq!(h.status(), expected, "the hook's own wc.status must be the final status");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "orig\n edited",
+        "the save itself must have actually happened — hooks never abort/delay the op");
+}
+
+/// P2 acceptance: `on_open`/`on_buffer_close` fire at the real `workspace.rs` seams, with no
+/// double-fire on the throwaway-reuse open shape, and quitting fires nothing (quitting is not
+/// closing — `Command::Quit` on a clean workspace never calls `close_buffer_now`).
+#[test]
+fn on_buffer_close_and_open_fire() {
+    let dir = tempfile::tempdir().unwrap();
+    let path_a = dir.path().join("a.md");
+    let path_b = dir.path().join("b.md");
+    std::fs::write(&path_a, "a\n").unwrap();
+    std::fs::write(&path_b, "b\n").unwrap();
+    let src = "\
+        opens = 0; closes = 0; last_open = nil; last_close = nil\n\
+        wc.on('open', function(ev) opens = opens + 1; last_open = ev.path end)\n\
+        wc.on('buffer_close', function(ev) closes = closes + 1; last_close = ev.path end)";
+    // A path-less "\n" buffer is a reusable throwaway (workspace::active_is_reusable_throwaway) —
+    // the FIRST open below takes the reuse branch (open_as_new_buffer delegates to
+    // open_into_current and returns), exercising the no-double-fire guarantee directly.
+    let mut h = Harness::new_with_plugin("\n", &[("hookplug2", src)]);
+    let clock = TestClock(h.now);
+
+    // 1) Reuse-shape open: fires on_open once.
+    {
+        let mut e = h.editor.borrow_mut();
+        crate::workspace::open_as_new_buffer(&mut e, &path_a);
+    }
+    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx);
+    let opens: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("opens").unwrap();
+    assert_eq!(opens, 1, "the reuse-shape open must fire on_open exactly once, not twice");
+    let last_open: String =
+        h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("last_open").unwrap();
+    assert_eq!(last_open, path_a.to_string_lossy());
+    let a_id = h.editor.borrow().active().id;
+
+    // 2) New-buffer-shape open: the active buffer is now named (not a throwaway), so this
+    // pushes a fresh buffer instead of reusing — the OTHER open_as_new_buffer arm.
+    {
+        let mut e = h.editor.borrow_mut();
+        crate::workspace::open_as_new_buffer(&mut e, &path_b);
+    }
+    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx);
+    let opens: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("opens").unwrap();
+    assert_eq!(opens, 2, "the new-buffer-shape open must also fire on_open, once");
+    let last_open: String =
+        h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("last_open").unwrap();
+    assert_eq!(last_open, path_b.to_string_lossy());
+    let b_id = h.editor.borrow().active().id;
+    assert_ne!(a_id, b_id);
+
+    // 3) A clean close fires on_buffer_close with the PRE-removal path.
+    {
+        let mut e = h.editor.borrow_mut();
+        crate::workspace::close_buffer_now(&mut e, b_id);
+    }
+    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx);
+    let closes: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("closes").unwrap();
+    assert_eq!(closes, 1, "the clean close must fire on_buffer_close exactly once");
+    let last_close: String =
+        h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("last_close").unwrap();
+    assert_eq!(last_close, path_b.to_string_lossy());
+
+    // 4) Quit fires nothing: a clean workspace's Command::Quit only sets editor.quit — it never
+    // calls close_buffer_now, so neither counter must move.
+    {
+        let mut e = h.editor.borrow_mut();
+        assert!(!e.buffers.iter().any(|b| e.is_dirty(b.id)), "precondition: a clean workspace");
+        let r = crate::commands::run(crate::commands::Command::Quit, &mut e, &clock);
+        assert!(matches!(r, crate::commands::CommandResult::Quit));
+        assert!(e.quit, "Quit must set the quit flag on a clean workspace");
+    }
+    h.plugin_host.as_mut().unwrap().pump(&h.editor, &h.reg, &h.ex, &clock, &h.tx);
+    let opens_after_quit: i64 =
+        h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("opens").unwrap();
+    let closes_after_quit: i64 =
+        h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("closes").unwrap();
+    assert_eq!(opens_after_quit, 2, "quit must not fire on_open");
+    assert_eq!(closes_after_quit, 1, "quit must not fire on_buffer_close — quitting is not closing");
+}
+
+// ---------------------------------------------------------------------------
+// P2 Task 7: wc.command + the post-pump hydrate_overlays gap. Driven through the REAL
+// `step` (reduce → pump → post-pump hydrate) — the pump's reg.dispatch is a new dispatch
+// path with no per-site hydrate call of its own (unlike key/menu/mouse), so without the
+// run-loop's post-pump `hydrate_overlays` a `wc.command`-opened overlay would render empty.
+// ---------------------------------------------------------------------------
+
+/// A plugin command calling `wc.command("palette")` opens the palette overlay via
+/// `Registry::dispatch` (the builtin `palette` handler) — but that handler only installs an
+/// EMPTY placeholder (`editor.open_palette()`, rows empty); without the post-pump
+/// `hydrate_overlays` call, the palette would render with no rows. Dispatched via the SAME
+/// palette→Enter journey every other plugin-command test uses, so the plugin callback (and
+/// its `wc.command`) runs inside the SAME `step` as every other pump-driven journey.
+#[test]
+fn wc_command_palette_open_is_hydrated() {
+    let src = "wc.register_command{ name='open_palette', label='Open Palette', \
+               fn=function() wc.command('palette') end }";
+    let mut h = Harness::new_with_plugin("hello\n", &[("op", src)]);
+    h.ctrl('p');
+    h.type_str("open palette");
+    h.key(KeyCode::Enter);
+    let e = h.editor.borrow();
+    let p = e.palette.as_ref().expect("wc.command('palette') must have opened the palette overlay");
+    assert!(!p.rows.is_empty(),
+        "the post-pump hydrate_overlays call must have populated palette rows — an empty palette \
+         means the wc.command-opened overlay was never hydrated");
+}
+
+/// The `wc.command("menu")` mirror of [`wc_command_palette_open_is_hydrated`] — the menu
+/// builtin only sets `editor.menu = Some(<unbuilt placeholder>)`; without the post-pump
+/// `hydrate_overlays` call, `built` would stay `false` and `groups` would stay empty.
+#[test]
+fn wc_command_menu_open_is_hydrated() {
+    let src = "wc.register_command{ name='open_menu', label='Open Menu', \
+               fn=function() wc.command('menu') end }";
+    let mut h = Harness::new_with_plugin("hello\n", &[("om", src)]);
+    h.ctrl('p');
+    h.type_str("open menu");
+    h.key(KeyCode::Enter);
+    let e = h.editor.borrow();
+    let m = e.menu.as_ref().expect("wc.command('menu') must have opened the menu overlay");
+    assert!(m.built, "the post-pump hydrate_overlays call must have built the menu (built=false)");
+    assert!(m.groups.iter().any(|g| !g.1.is_empty()), "the built menu must actually contain command rows");
+}
+
 /// `true` iff `s` is exactly 10 bytes shaped `\d{4}-\d{2}-\d{2}` — a dependency-free ISO-date
 /// shape check (avoids pulling in a regex crate for one test).
 fn is_iso_date(s: &str) -> bool {
@@ -506,6 +696,100 @@ fn is_iso_date(s: &str) -> bool {
         && b[5..7].iter().all(u8::is_ascii_digit)
         && b[7] == b'-'
         && b[8..10].iter().all(u8::is_ascii_digit)
+}
+
+// ---------------------------------------------------------------------------
+// P2 Task 9: full §12 suite consolidation — the wordcount.lua demo.
+// ---------------------------------------------------------------------------
+
+/// The `wordcount.lua` success-criterion demo (spec §12): the committed fixture, loaded exactly
+/// as `load_phase` (the SAME fn startup AND reload call) would read it off disk — mirrors
+/// `insert_date_lua_e2e_success_demo`'s "load like production" discipline, but for the P2
+/// surface: it registers ONLY an `on_save` hook (no command), the P2 counterpart to P1's
+/// command-only `insert_date.lua`. It captures its `min_words` goal from
+/// `[plugins.config.wordcount]` at load, and on a REAL save (the same `dispatch_save` →
+/// `InlineExecutor` → `apply_outcome` → pump choreography `on_save_hook_fires_on_real_save`
+/// already proved) reports the live word count via `wc.status`. A live `plugins_reload` of an
+/// EDITED copy of the plugin is then reflected on the very next save — proving the demo's
+/// behavior tracks the on-disk source, not a load-time fluke.
+#[test]
+fn wordcount_lua_e2e_success_demo() {
+    use crate::registry::Ctx;
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/plugins/wordcount.lua");
+    let src = std::fs::read_to_string(&fixture)
+        .unwrap_or_else(|e| panic!("fixture must be readable at {}: {e}", fixture.display()));
+
+    let plugdir = tempfile::tempdir().unwrap();
+    std::fs::write(plugdir.path().join("wordcount.lua"), &src).unwrap();
+    let cfgdir = tempfile::tempdir().unwrap();
+    let cfg_path = cfgdir.path().join("config.toml");
+    std::fs::write(&cfg_path, format!(
+        "[plugins]\ndir = {:?}\n\n[plugins.config.wordcount]\nmin_words = 100\n",
+        plugdir.path().to_str().unwrap())).unwrap();
+
+    let mut reg = crate::registry::Registry::builtins();
+    let mut host = crate::plugin::host::PluginHost::new().expect("VM construction");
+    let (cfg, cfg_warns) = crate::config::load(std::slice::from_ref(&cfg_path));
+    assert!(cfg_warns.is_empty(), "config must parse cleanly: {cfg_warns:?}");
+    let mut load_warns = Vec::new();
+    let inv = crate::plugin::reload::load_phase(&mut reg, &mut host, &cfg.plugins, None, &mut load_warns);
+    assert!(load_warns.is_empty(), "the demo plugin must load cleanly: {load_warns:?}");
+    assert_eq!(inv.len(), 1, "exactly one discovered plugin");
+    assert!(inv[0].error.is_none(), "wordcount.lua must load with no error: {:?}", inv[0].error);
+    assert_eq!(inv[0].hooks, 1, "wordcount.lua registers exactly one hook");
+    assert_eq!(inv[0].commands, 0, "wordcount.lua is a hook-only demo, unlike insert_date.lua");
+
+    // A real save: the buffer holds 3 words, under the configured 100-word goal.
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    std::fs::write(&path, "alpha beta gamma\n").unwrap();
+    let editor = Rc::new(RefCell::new(
+        Editor::new_from_text("alpha beta gamma\n", Some(path.clone()), (80, 24))));
+    let (tx, _rx) = mpsc::channel::<Msg>();
+    let clock = TestClock(0);
+    host.attach_bridge(editor.clone(), tx.clone(),
+        Rc::new(TestClock::new(0)) as Rc<dyn wordcartel_core::history::Clock>)
+        .expect("bridge attaches on a live VM");
+    let ex = InlineExecutor::default();
+    {
+        let mut e = editor.borrow_mut();
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        crate::save::dispatch_save(&mut ctx);
+    }
+    {
+        let outcomes = ex.drain();
+        let mut e = editor.borrow_mut();
+        for o in outcomes { crate::jobs_apply::apply_outcome(o, &mut e); }
+    }
+    host.pump(&editor, &reg, &ex, &clock, &tx);
+    assert_eq!(editor.borrow().status, "Saved — 3 words (goal: 100)",
+        "the demo's on_save hook must report the live word count against its configured goal");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha beta gamma\n",
+        "the save itself must have actually happened — hooks never abort/delay the op");
+
+    // A live plugins_reload of an EDITED copy — the wording changes, proving the reload is
+    // reflected on the next save rather than being a load-time fluke.
+    std::fs::write(plugdir.path().join("wordcount.lua"), src.replace("Saved —", "Saved (v2) —"))
+        .unwrap();
+    editor.borrow_mut().plugins_reload_requested = true;
+    crate::plugin::reload::perform_reload(
+        &mut host, &mut reg, &editor, std::slice::from_ref(&cfg_path), None, false, &tx);
+    assert!(host.has_vm(), "the reload must produce a live VM");
+
+    {
+        let mut e = editor.borrow_mut();
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        crate::save::dispatch_save(&mut ctx);
+    }
+    {
+        let outcomes = ex.drain();
+        let mut e = editor.borrow_mut();
+        for o in outcomes { crate::jobs_apply::apply_outcome(o, &mut e); }
+    }
+    host.pump(&editor, &reg, &ex, &clock, &tx);
+    assert_eq!(editor.borrow().status, "Saved (v2) — 3 words (goal: 100)",
+        "the EDITED plugin's wording must be live after plugins_reload, on the very next save");
 }
 
 // ---------------------------------------------------------------------------
@@ -624,12 +908,13 @@ fn journey_palette_end_reaches_last_command() {
     };
     assert!(h.screen_contains(&last_label),
         "last command label {last_label:?} must be visible on screen after End");
-    // Enter dispatches save_settings (last registered command) → settings_save_requested
-    // is set, palette closes. Verifies the end-of-list dispatch path (spec I4).
+    // Enter dispatches plugin_list (the last registered command, P2 Task 8b) → it writes a
+    // plugin-inventory summary to the status line, palette closes. Verifies the end-of-list
+    // dispatch path (spec I4).
     h.key(KeyCode::Enter);
     assert!(h.editor.borrow().palette.is_none(), "Enter closes the palette");
-    assert!(h.editor.borrow().settings_save_requested,
-        "save_settings must be dispatched and set settings_save_requested");
+    assert!(h.editor.borrow().status.starts_with("plugins:"),
+        "plugin_list must be dispatched and write its inventory summary to the status line");
 }
 
 // ---------------------------------------------------------------------------

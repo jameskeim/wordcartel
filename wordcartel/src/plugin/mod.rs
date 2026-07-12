@@ -6,8 +6,11 @@
 //! [`plugin_error`] is this module's single formatting/routing point for every plugin failure
 //! (a caught panic, a Lua `error()`, or a typed API error) into `editor.status`.
 pub mod host;
+mod pump;
 pub mod api;
 pub mod load;
+pub mod reload;
+pub mod settings;
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -25,6 +28,78 @@ pub struct PluginCall {
     pub id: CommandId,
 }
 
+/// The three P2 event kinds (exhaustive — adding a kind is a deliberate act every match
+/// handles).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PluginEventKind {
+    Save,
+    Open,
+    BufferClose,
+}
+
+/// One fired event, queued on [`crate::editor::Editor::pending_plugin_events`]. Payload is
+/// OWNED (by drain time the buffer may be gone/changed), path clamped to
+/// [`crate::limits::PLUGIN_MAX_EVENT_PAYLOAD`] at capture.
+#[derive(Clone, Debug)]
+pub struct PluginEvent {
+    pub kind: PluginEventKind,
+    pub path: Option<String>,
+}
+
+/// One discovered plugin's load outcome, for `plugin_list` + reload reporting (owned, bounded by
+/// the discover/load caps). `error: None` means the plugin loaded cleanly; `commands`/`hooks` are
+/// its committed counts (both `0` alongside an `error`, since a failed plugin commits nothing).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginRecord {
+    pub name: String,
+    pub commands: usize,
+    pub hooks: usize,
+    pub error: Option<String>,
+}
+
+/// A queued `wc.command` dispatch (fire-and-forget). `origin` names the requesting plugin
+/// cmd/hook for error attribution; `name` is the raw target (resolved at drain — no call-time
+/// registry snapshot; see `plugin::host::PluginHost::pump`'s `drain_one_dispatch`).
+#[derive(Clone, Debug)]
+pub struct PluginDispatch {
+    pub origin: String,
+    pub name: String,
+}
+
+/// Parse a hook event name (the `menu_from_str` parse-to-enum precedent — the enum IS the
+/// bound). An unknown name is a typed Lua error at `wc.on` time, never stored, never interned.
+pub fn event_from_str(s: &str) -> Option<PluginEventKind> {
+    match s {
+        "save" => Some(PluginEventKind::Save),
+        "open" => Some(PluginEventKind::Open),
+        "buffer_close" => Some(PluginEventKind::BufferClose),
+        _ => None,
+    }
+}
+
+/// The inverse of [`event_from_str`] — the string a fired event's `{ kind = … }` table payload
+/// carries back to the hook callback.
+pub(crate) fn kind_str(k: PluginEventKind) -> &'static str {
+    match k {
+        PluginEventKind::Save => "save",
+        PluginEventKind::Open => "open",
+        PluginEventKind::BufferClose => "buffer_close",
+    }
+}
+
+/// Capture-and-enqueue an event at a fire site (cold-path only — save/open/close; never
+/// per-keystroke). One clamp + one push; drained the same frame by the pump. Path clamped at
+/// capture (resource-bound LAW: the queue holds bounded owned data even for a pathological
+/// path).
+pub(crate) fn fire_event(editor: &mut Editor, kind: PluginEventKind, path: Option<&std::path::Path>) {
+    let path = path.map(|p| cap_status(p.to_string_lossy().as_bytes(), crate::limits::PLUGIN_MAX_EVENT_PAYLOAD));
+    editor.pending_plugin_events.push_back(PluginEvent { kind, path });
+}
+
+/// The intern pool backing [`intern`] — module-level (not function-local) so the test-only
+/// [`intern_pool_len`] reader can share the SAME static rather than a lookalike copy.
+static INTERN_POOL: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
+
 /// Intern a runtime string to `&'static str` (leak-once). PERMANENT — callers MUST cap length
 /// and count on the raw `String` BEFORE calling this (resource-bound LAW). De-dupes so
 /// re-interning an equal string does not leak twice.
@@ -37,8 +112,7 @@ pub struct PluginCall {
 /// assert_eq!(a, b);
 /// ```
 pub fn intern(s: &str) -> &'static str {
-    static POOL: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
-    let mut g = POOL.lock().expect("intern pool");
+    let mut g = INTERN_POOL.lock().expect("intern pool");
     let set = g.get_or_insert_with(HashSet::new);
     if let Some(existing) = set.get(s) {
         return existing;
@@ -46,6 +120,20 @@ pub fn intern(s: &str) -> &'static str {
     let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
     set.insert(leaked);
     leaked
+}
+
+/// Test-only membership reader over [`intern`]'s pool — lets a guardrail assert "this failed
+/// load leaked nothing" (P2 §7b two-phase commit) by probing for a string the failed load would
+/// have interned. `INTERN_POOL` is process-wide, shared by every test in the binary — under
+/// `cargo test`'s default parallel execution, a whole-pool-SIZE before/after comparison is racy
+/// (an unrelated test interning any new string concurrently perturbs the count; reproduced
+/// empirically — a full-suite run saw the count drift by 2 during a single guardrail test's
+/// window). A MEMBERSHIP probe on one specific string is race-free instead, as long as that
+/// string is unique to the scenario under test (no other test in the suite ever interns the same
+/// literal) — a concurrently-running unrelated test cannot perturb whether ITS strings are absent.
+#[cfg(test)]
+pub(crate) fn intern_pool_contains(s: &str) -> bool {
+    INTERN_POOL.lock().expect("intern pool").as_ref().is_some_and(|set| set.contains(s))
 }
 
 /// The single formatting/routing point for all plugin errors (spec §7's `plugin_error(editor,

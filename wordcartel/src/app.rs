@@ -369,7 +369,7 @@ pub fn step(editor: &mut Editor, key: KeyEvent, clock: &dyn Clock) -> bool {
 // SystemClock — used only by the real `run` loop, never by unit tests
 // ---------------------------------------------------------------------------
 
-struct SystemClock;
+pub(crate) struct SystemClock;
 impl Clock for SystemClock {
     fn now_ms(&self) -> u64 {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -633,22 +633,21 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // editor — so it runs before the editor is wrapped; the bridge (which DOES need the
     // `Rc<RefCell<Editor>>`) is attached separately, just before the loop (step 3).
     let mut reg = Registry::builtins();
+    // Startup plugin load runs the SHARED `plugin::reload::load_phase` — byte-identical to the
+    // reload path (P2 §6). It resolves the [plugins] dir (Task 5), discovers, loads, and returns
+    // the inventory; the [plugins].dir resolution + no-directory warning now live inside
+    // `load_phase`, not here. A commit-time VM exhaustion (§7b) already nulled the host + reverted
+    // `reg` to builtins-only inside `load_sources`; at startup the editor's queues are empty and
+    // its keymap is built AFTER this, so no editor-side revert is needed here (that is the reload
+    // seam's job, below).
     let mut plugin_host = if cli.no_plugins || !cfg.plugins.enabled {
         crate::plugin::host::PluginHost::null()
     } else {
         match crate::plugin::host::PluginHost::new() {
-            Ok(h) => {
-                if let Some(plugins_dir) = xdg.as_deref().map(|x| x.join("wordcartel").join("plugins")) {
-                    let disc = crate::plugin::load::discover(&plugins_dir, &cfg.plugins.disable);
-                    for r in disc.skipped {
-                        warns.push(format!("plugin {} skipped: {}", r.plugin, r.result.err().unwrap_or_default()));
-                    }
-                    for r in crate::plugin::load::load_sources(&mut reg, &h, &disc.sources) {
-                        if let Err(e) = &r.result {
-                            warns.push(format!("plugin {}: {e}", r.plugin));
-                        }
-                    }
-                }
+            Ok(mut h) => {
+                let inv = crate::plugin::reload::load_phase(
+                    &mut reg, &mut h, &cfg.plugins, xdg.as_deref(), &mut warns);
+                editor.plugin_inventory = inv; // editor is still the plain &mut here (pre-Rc-wrap)
                 h
             }
             Err(e) => {
@@ -657,8 +656,6 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             }
         }
     };
-    let reg = reg; // freeze — registration is done, the registry is read-only from here on
-
     // Build the keymap from the loaded config and surface any warnings.
     let (built_keymap, mut kw) = keymap::build_keymap(&cfg.keymap, &reg);
     warns.append(&mut kw);
@@ -805,10 +802,26 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             break;
         }
         let keep = { reduce(msg, &mut editor.borrow_mut(), &reg, &keymap, &executor, &clock, &msg_tx) };
-        // Pump stage (Effort P1 Task 7): runs AFTER reduce's borrow scope has dropped, holding
-        // NO outer borrow — a queued plugin command's Lua callback re-borrows the editor itself
-        // (via the bridge's wc.* closures), so no borrow may be alive here.
-        plugin_host.pump(&editor);
+        // Pump stage (Effort P1 Task 7; P2 Task 7 grows its dispatch context): runs AFTER
+        // reduce's borrow scope has dropped, holding NO outer borrow — a queued plugin
+        // command's Lua callback re-borrows the editor itself (via the bridge's wc.*
+        // closures), so no borrow may be alive here.
+        plugin_host.pump(&editor, &reg, &executor, &clock, &msg_tx);
+        // Hydrate any overlay a pump-dispatched wc.command opened (P2 §5b) — the pump's
+        // reg.dispatch is a dispatch path with no per-site hydrate, unlike the key/menu/mouse
+        // paths. Idempotent + self-guarding (hydrate_overlays only fills an EMPTY overlay), so
+        // this is a no-op when reduce's own per-path hydrate already ran this iteration.
+        { crate::app::hydrate_overlays(&mut editor.borrow_mut(), &reg, &keymap); }
+        // Reload seam (P2 §6d): between-reduces, AFTER pump() has quiesced (no Lua frame live) and
+        // BEFORE the keymap rebuild arm — so a `keymap_rebuild` set by the reload is honored the
+        // same iteration (plugin bindings re-resolve against the new registry). The flag is set
+        // ONLY by the `plugins_reload` command (Task 8b); until that command exists this seam is
+        // dormant. `editor.borrow()`'s temporary drops at the end of the condition, so
+        // `perform_reload`'s own `borrow_mut` never overlaps it.
+        if editor.borrow().plugins_reload_requested {
+            crate::plugin::reload::perform_reload(&mut plugin_host, &mut reg, &editor,
+                &all_paths, xdg.as_deref(), cli.no_plugins, &msg_tx);
+        }
         if let Some(t) = { crate::theme_cmds::rebuild_keymap_if_requested(&mut editor.borrow_mut(), &cfg.keymap.patches, &reg) } {
             keymap = t;
         }

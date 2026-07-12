@@ -129,20 +129,25 @@ impl Default for ClipboardConfig {
     fn default() -> Self { ClipboardConfig { provider: ClipboardProvider::Auto } }
 }
 
-/// Plugin host configuration section (`[plugins]`, P1 spec §4) — enable/disable ONLY;
-/// per-plugin config tables (`[plugins.<name>]`) are deferred to P2. `enabled = false` (or
-/// the session-only `--no-plugins` CLI flag, which forces this off regardless) skips the
+/// Plugin host configuration section (`[plugins]`, P1 spec §4 + P2 Task 5). `enabled = false`
+/// (or the session-only `--no-plugins` CLI flag, which forces this off regardless) skips the
 /// whole plugin-load phase — no VM, no `discover`, no `wc.*` surface. `disable` names stems
 /// (file/dir names under the plugins dir, no `.lua`) to skip during `discover` without
 /// removing the file — distinct from a plugin that fails to load (which is reported, not
-/// silently excluded).
+/// silently excluded). `dir` overrides the default `<config_dir>/wordcartel/plugins` scan
+/// root. `config` holds each plugin's `[plugins.config.<name>]` TOML subtable, keyed by stem
+/// — namespaced (not flattened) so a plugin named `enabled`/`disable`/`dir` is still valid.
 #[derive(Debug, Clone)]
 pub struct PluginsConfig {
     pub enabled: bool,
     pub disable: Vec<String>,
+    pub dir: Option<PathBuf>,
+    pub config: BTreeMap<String, toml::Value>,
 }
 impl Default for PluginsConfig {
-    fn default() -> Self { PluginsConfig { enabled: true, disable: Vec::new() } }
+    fn default() -> Self {
+        PluginsConfig { enabled: true, disable: Vec::new(), dir: None, config: BTreeMap::new() }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -343,6 +348,11 @@ struct RawClipboard {
 struct RawPlugins {
     enabled: Option<bool>,
     disable: Option<Vec<String>>,
+    /// `[plugins] dir` — overrides the default `<config_dir>/wordcartel/plugins` scan root.
+    dir: Option<PathBuf>,
+    /// `[plugins.config.<name>]` subtables — namespaced under `config` (NOT `#[serde(flatten)]`)
+    /// so a plugin literally named `enabled`/`disable`/`dir` cannot collide with a typed field.
+    config: BTreeMap<String, toml::Value>,
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -509,6 +519,11 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
         // is the complete intended set, mirroring diagnostics.linters).
         if let Some(v) = raw.plugins.enabled { cfg.plugins.enabled = v; }
         if let Some(v) = raw.plugins.disable { cfg.plugins.disable = v; }
+        if let Some(v) = raw.plugins.dir { cfg.plugins.dir = Some(v); }
+        // per-name REPLACE per layer — a higher layer's [plugins.config.foo] wholly replaces
+        // a lower layer's for "foo", leaving other names' config untouched (mirrors the
+        // per-field-override discipline above, applied per plugin name instead of per field).
+        for (k, v) in raw.plugins.config { cfg.plugins.config.insert(k, v); }
         // export: per-field override (omitted field inherits the lower layer).
         if let Some(v) = raw.export.pdf_engine { cfg.export.pdf_engine = v; }
         if let Some(v) = raw.export.typography { cfg.export.typography = v; }
@@ -695,6 +710,59 @@ mod tests {
         assert!(warns.is_empty());
         assert!(!cfg.plugins.enabled);
         assert_eq!(cfg.plugins.disable, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn plugins_config_namespaced_parses() {
+        let (cfg, warns) = load(&[]);
+        assert!(warns.is_empty());
+        assert!(cfg.plugins.config.is_empty(), "default config map is empty");
+
+        let d = tempdir();
+        let p = write(
+            &d,
+            "plugins-config.toml",
+            "[plugins.config.wordcount]\nmin_words = 100\n[plugins.config.dir]\nfoo = \"bar\"\n",
+        );
+        let (cfg, warns) = load(&[p]);
+        assert!(warns.is_empty());
+        let wordcount = cfg.plugins.config.get("wordcount").expect("wordcount config folded in");
+        assert_eq!(wordcount.get("min_words").and_then(toml::Value::as_integer), Some(100));
+        // A plugin literally named "dir" is valid — its config lives under
+        // [plugins.config.dir], which does NOT collide with the typed `dir` field.
+        assert!(cfg.plugins.dir.is_none(), "the [plugins.config.dir] TABLE never sets the typed dir field");
+        let dir_plugin = cfg.plugins.config.get("dir").expect("a plugin named 'dir' is valid");
+        assert_eq!(dir_plugin.get("foo").and_then(toml::Value::as_str), Some("bar"));
+    }
+
+    #[test]
+    fn plugins_dir_parses() {
+        let (cfg, warns) = load(&[]);
+        assert!(warns.is_empty());
+        assert!(cfg.plugins.dir.is_none(), "default dir is unset");
+
+        let d = tempdir();
+        let p = write(&d, "plugins-dir.toml", "[plugins]\ndir = \"/x/y\"\n");
+        let (cfg, warns) = load(&[p]);
+        assert!(warns.is_empty());
+        assert_eq!(cfg.plugins.dir, Some(PathBuf::from("/x/y")));
+    }
+
+    #[test]
+    fn plugins_config_replaces_per_layer() {
+        let d = tempdir();
+        let lo = write(
+            &d,
+            "lo.toml",
+            "[plugins.config.foo]\na = 1\n[plugins.config.bar]\nb = 2\n",
+        );
+        let hi = write(&d, "hi.toml", "[plugins.config.foo]\na = 99\n");
+        let (cfg, warns) = load(&[lo, hi]);
+        assert!(warns.is_empty());
+        let foo = cfg.plugins.config.get("foo").expect("foo present");
+        assert_eq!(foo.get("a").and_then(toml::Value::as_integer), Some(99), "hi wholly replaces lo's foo");
+        let bar = cfg.plugins.config.get("bar").expect("bar untouched by hi");
+        assert_eq!(bar.get("b").and_then(toml::Value::as_integer), Some(2));
     }
 
     #[test]

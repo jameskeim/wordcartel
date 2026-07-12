@@ -12,12 +12,14 @@ use wordcartel_core::history::Transaction;
 use wordcartel_core::selection::Selection;
 
 use crate::plugin::host::{Bridge, PendingReg};
-use crate::registry::{menu_from_str, CommandId};
+use crate::plugin::PluginEventKind;
+use crate::registry::menu_from_str;
 
-/// Fetch the shared `wc` global table, creating it on first use. Idempotent across the two
-/// installers that share it — `install_registration` (load time) and `install_editor_api`
-/// (callback time, below).
-fn wc_table(lua: &mlua::Lua) -> mlua::Result<mlua::Table> {
+/// Fetch the shared `wc` global table, creating it on first use. Idempotent across the
+/// installers that share it — `install_registration` (load time), `install_editor_api`
+/// (callback time, below), and `plugin::settings::install_config` (a sibling module — hence
+/// `pub(crate)`, not module-private).
+pub(crate) fn wc_table(lua: &mlua::Lua) -> mlua::Result<mlua::Table> {
     match lua.globals().get::<Option<mlua::Table>>("wc")? {
         Some(t) => Ok(t),
         None => {
@@ -28,26 +30,27 @@ fn wc_table(lua: &mlua::Lua) -> mlua::Result<mlua::Table> {
     }
 }
 
-/// Install the `wc` registration surface for ONE plugin's exec pass. `stem` (already interned)
-/// fixes the namespace; `sink` collects [`PendingReg`] (drained into the `Registry` after exec —
-/// the loader's atomic-per-plugin commit); `count` enforces the per-plugin command cap
-/// (`limits::PLUGIN_MAX_COMMANDS_PER_PLUGIN`).
+/// Install the `wc` registration surface for ONE plugin's exec pass. `stem` (owned — moved into
+/// the 'static closure; an owned String is 'static, so this compiles without the `send` feature,
+/// exactly as the former `&'static str` did) fixes the namespace. Every plugin string is
+/// cap-checked on its BORROWED `mlua::String` bytes (resource-bound LAW) and pushed RAW into
+/// `sink`; interning + the `wc-cmd-<id>` callback write happen ONLY at commit (load_one), so a
+/// plugin that fails preflight leaks nothing and overwrites no live callback key (§7b).
 ///
 /// Every plugin-supplied string crosses into Rust via the resource-bound LAW's
 /// borrowed-length-check-then-convert pattern (global constraint 1b): extracted as
 /// `mlua::String` (borrows the Lua-side bytes, no Rust allocation), its `.as_bytes().len()`
-/// checked against the cap FIRST, and only on pass converted/owned/interned. `name`/`label` are
-/// checked against their length caps; `menu` is parsed to `MenuCategory` on the borrowed bytes
-/// (an unrecognized value is a typed error, never a silent default). `intern` (a permanent leak)
-/// is reached only after every check on this call has passed.
+/// checked against the cap FIRST, and only on pass converted/owned. `name`/`label` are checked
+/// against their length caps; `menu` is parsed to `MenuCategory` on the borrowed bytes (an
+/// unrecognized value is a typed error, never a silent default).
 pub(crate) fn install_registration(
     lua: &mlua::Lua,
-    stem: &'static str,
+    stem: String,
     sink: Rc<RefCell<Vec<PendingReg>>>,
     count: Rc<Cell<usize>>,
 ) -> mlua::Result<()> {
     let wc = wc_table(lua)?;
-    let reg_fn = lua.create_function(move |lua, spec: mlua::Table| {
+    let reg_fn = lua.create_function(move |_lua, spec: mlua::Table| {
         if count.get() >= crate::limits::PLUGIN_MAX_COMMANDS_PER_PLUGIN {
             return Err(mlua::Error::runtime("plugin: too many commands (max 256)"));
         }
@@ -71,18 +74,39 @@ pub(crate) fn install_registration(
                     .ok_or_else(|| mlua::Error::runtime("plugin: unknown menu value"))?,
             ),
         };
-        // Every cap passed — own + intern (the ONLY Rust allocs, all AFTER the checks above).
-        let full = format!("{stem}.{}", name_raw.to_str()?.as_ref());
-        let id = CommandId(crate::plugin::intern(&full));
-        let label_s = crate::plugin::intern(label_raw.to_str()?.as_ref());
-        // Persistent callback storage (WezTerm-style): keyed per command id in the named
-        // registry so the pump (Task 5) can look it up by `CommandId` alone.
-        lua.set_named_registry_value(&format!("wc-cmd-{}", id.0), func)?;
+        // No intern, no set_named_registry_value here — commit does both (§7b). Own raw strings only.
+        let name_full = format!("{stem}.{}", name_raw.to_str()?.as_ref());
+        let label = label_raw.to_str()?.to_owned();
         count.set(count.get() + 1);
-        sink.borrow_mut().push(PendingReg { id, label: label_s, menu });
+        sink.borrow_mut().push(PendingReg { name_full, label, menu, func });
         Ok(())
     })?;
     wc.set("register_command", reg_fn)?;
+    Ok(())
+}
+
+/// Install the `wc.on(event, fn)` load-time hook collector for ONE plugin's exec pass — the
+/// second registration verb (P2 §3b), sitting beside [`install_registration`] on the same `wc`
+/// table and closed by the SAME load→callback-phase boundary ([`install_on_closed`]). `name` is
+/// parsed via [`crate::plugin::event_from_str`] (the `menu_from_str` parse-to-enum precedent —
+/// an unknown event name is a typed error, nothing stored, nothing interned) and `sink` is
+/// capped at [`crate::limits::PLUGIN_MAX_HOOKS_PER_PLUGIN`] BEFORE the push (resource-bound
+/// LAW — each hook stores a Lua function in the VM registry plus an owned `HookEntry`).
+pub(crate) fn install_on(
+    lua: &mlua::Lua,
+    sink: Rc<RefCell<Vec<(PluginEventKind, mlua::Function)>>>,
+) -> mlua::Result<()> {
+    let wc = wc_table(lua)?;
+    let on_fn = lua.create_function(move |_lua, (name, func): (mlua::String, mlua::Function)| {
+        if sink.borrow().len() >= crate::limits::PLUGIN_MAX_HOOKS_PER_PLUGIN {
+            return Err(mlua::Error::runtime("plugin: too many hooks (max 64)"));
+        }
+        let kind = crate::plugin::event_from_str(name.to_str()?.as_ref())
+            .ok_or_else(|| mlua::Error::runtime("plugin: unknown event name"))?;
+        sink.borrow_mut().push((kind, func));
+        Ok(())
+    })?;
+    wc.set("on", on_fn)?;
     Ok(())
 }
 
@@ -169,8 +193,19 @@ pub(crate) fn install_editor_api(lua: &mlua::Lua, bridge: &Bridge) -> mlua::Resu
     install_replace(lua, &wc, bridge)?;
     install_set_selection(lua, &wc, bridge)?;
     install_status(lua, &wc, bridge)?;
+    install_command(lua, &wc, bridge)?;
     install_registration_closed(lua, &wc)?;
+    install_on_closed(lua, &wc)?;
+    install_config_cleared(&wc)?;
     Ok(())
+}
+
+/// Clear `wc.config` to nil at the load→callback-phase boundary (mirrors
+/// [`install_registration_closed`], the same-shaped guard on the other half of `wc`): the
+/// last-loaded plugin's config table must not linger on the shared `wc` global for callbacks —
+/// a plugin that wants its config at callback time must capture it in a Lua local at load.
+fn install_config_cleared(wc: &mlua::Table) -> mlua::Result<()> {
+    wc.set("config", mlua::Value::Nil)
 }
 
 /// Overwrite `wc.register_command` with a stub that always raises a typed Lua error — the
@@ -188,6 +223,17 @@ fn install_registration_closed(lua: &mlua::Lua, wc: &mlua::Table) -> mlua::Resul
         Err(mlua::Error::runtime("wc.register_command is only available during plugin load"))
     })?;
     wc.set("register_command", stub)?;
+    Ok(())
+}
+
+/// Overwrite `wc.on` with the same always-erroring stub shape as
+/// [`install_registration_closed`] — the second registration verb closed by the same
+/// load→callback-phase boundary.
+fn install_on_closed(lua: &mlua::Lua, wc: &mlua::Table) -> mlua::Result<()> {
+    let stub = lua.create_function(|_, _args: mlua::MultiValue| -> mlua::Result<()> {
+        Err(mlua::Error::runtime("wc.on is only available during plugin load"))
+    })?;
+    wc.set("on", stub)?;
     Ok(())
 }
 
@@ -270,9 +316,13 @@ fn install_reads(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::Re
 fn install_insert(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::Result<()> {
     let editor = bridge.editor.clone();
     let clock = bridge.clock.clone();
+    let invoke_state = bridge.invoke_state.clone();
     wc.set(
         "insert",
         lua.create_function(move |_, text: mlua::String| {
+            if invoke_state.borrow().observer {
+                return Err(mlua::Error::runtime("plugin: editing is not allowed from an event hook"));
+            }
             if text.as_bytes().len() > crate::limits::PASTE_MAX_BYTES {
                 return Err(mlua::Error::runtime("plugin: insert text too large"));
             }
@@ -295,9 +345,13 @@ fn install_insert(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::R
 fn install_replace(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::Result<()> {
     let editor = bridge.editor.clone();
     let clock = bridge.clock.clone();
+    let invoke_state = bridge.invoke_state.clone();
     wc.set(
         "replace",
         lua.create_function(move |_, (a, b, text): (usize, usize, mlua::String)| {
+            if invoke_state.borrow().observer {
+                return Err(mlua::Error::runtime("plugin: editing is not allowed from an event hook"));
+            }
             if text.as_bytes().len() > crate::limits::PASTE_MAX_BYTES {
                 return Err(mlua::Error::runtime("plugin: replace text too large"));
             }
@@ -319,9 +373,13 @@ fn install_replace(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::
 fn install_set_selection(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::Result<()> {
     let editor = bridge.editor.clone();
     let clock = bridge.clock.clone();
+    let invoke_state = bridge.invoke_state.clone();
     wc.set(
         "set_selection",
         lua.create_function(move |_, (anchor, head): (usize, usize)| {
+            if invoke_state.borrow().observer {
+                return Err(mlua::Error::runtime("plugin: editing is not allowed from an event hook"));
+            }
             let mut e = editor.try_borrow_mut().map_err(|_| mlua::Error::runtime("plugin: editor busy"))?;
             let doc_len = e.active().document.buffer.len();
             // Retain(doc_len) sums to len_before, so from_ops's consumption assert holds — this
@@ -346,6 +404,40 @@ fn install_status(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::R
         lua.create_function(move |_, msg: mlua::String| {
             let mut e = editor.try_borrow_mut().map_err(|_| mlua::Error::runtime("plugin: editor busy"))?;
             e.status = crate::plugin::cap_status(&msg.as_bytes(), crate::limits::PLUGIN_MAX_STATUS_LEN);
+            Ok(())
+        })?,
+    )?;
+    Ok(())
+}
+
+/// `wc.command(name)` (§5a) — enqueue a fire-and-forget dispatch, resolved at pump drain
+/// against the LIVE `&Registry` (never a call-time name-set snapshot — contract law 1: the
+/// registry is the single source of truth). Checks, in order: observer (blocked from a hook —
+/// mutation-by-proxy, and `on_save`→`save` would self-cascade), the borrowed-name length cap,
+/// then the queue cap — each BEFORE any allocation past what mlua already borrowed.
+fn install_command(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::Result<()> {
+    let editor = bridge.editor.clone();
+    let invoke = bridge.invoke_state.clone();
+    wc.set(
+        "command",
+        lua.create_function(move |_, name: mlua::String| {
+            let st = invoke.borrow();
+            if st.observer {
+                return Err(mlua::Error::runtime("plugin: wc.command is not allowed from an event hook"));
+            }
+            if name.as_bytes().len() > crate::limits::PLUGIN_MAX_COMMAND_REF {
+                return Err(mlua::Error::runtime("plugin: command name too long"));
+            }
+            let origin = st.current.clone().unwrap_or_default();
+            drop(st);
+            let mut e = editor.try_borrow_mut().map_err(|_| mlua::Error::runtime("plugin: editor busy"))?;
+            if e.pending_plugin_dispatch.len() >= crate::limits::PLUGIN_MAX_PENDING_DISPATCH {
+                return Err(mlua::Error::runtime("plugin: command queue full"));
+            }
+            e.pending_plugin_dispatch.push_back(crate::plugin::PluginDispatch {
+                origin,
+                name: name.to_str()?.to_owned(),
+            });
             Ok(())
         })?,
     )?;

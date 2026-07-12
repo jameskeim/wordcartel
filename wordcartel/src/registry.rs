@@ -132,6 +132,29 @@ impl Registry {
         Ok(())
     }
 
+    /// Remove every `Plugin` entry, keeping builtins — the reload teardown's registry half (P2 §6b).
+    /// Fully rebuilds `index` from the surviving `entries`: removing an interior entry shifts every
+    /// later position, so the old indices are wholesale invalid — never patch them incrementally.
+    ///
+    /// # Examples
+    /// ```
+    /// # use wordcartel::registry::{Registry, CommandId};
+    /// let mut r = Registry::builtins();
+    /// r.register_plugin(CommandId("demo.hi"), "Hi", None).unwrap();
+    /// r.retain_builtins();
+    /// assert!(r.resolve_name("demo.hi").is_none());
+    /// assert!(r.resolve_name("save").is_some());
+    /// ```
+    pub fn retain_builtins(&mut self) {
+        // `matches!(&e.handler, …)` borrows the discriminant — HandlerKind is NOT Copy, so
+        // `matches!(e.handler, …)` would try to move the field out of the `&CommandEntry` and fail.
+        self.entries.retain(|e| matches!(&e.handler, HandlerKind::Builtin(_)));
+        self.index.clear();
+        for (i, e) in self.entries.iter().enumerate() {
+            self.index.insert(e.id, i);
+        }
+    }
+
     #[allow(clippy::too_many_lines)] // the command registry data table — one entry per command
     pub fn builtins() -> Registry {
         let mut r = Registry { entries: Vec::new(), index: HashMap::new() };
@@ -690,6 +713,24 @@ impl Registry {
             c.editor.settings_save_requested = true;
             CommandResult::Handled
         });
+        // Plugin lifecycle (P2 §6). Both are real Settings commands (command-surface contract:
+        // palette-exhaustive by construction, Settings menu by derivation). `plugins_reload` only
+        // arms the request flag — the run loop's between-reduces reload seam
+        // (plugin::reload::perform_reload) does the whole-VM teardown+rebuild, never inline here.
+        r.register("plugins_reload", "Reload Plugins", Some(MenuCategory::Settings), |c| {
+            c.editor.plugins_reload_requested = true;
+            c.editor.status = "reloading plugins\u{2026}".into();
+            CommandResult::Handled
+        });
+        r.register("plugin_list", "List Plugins", Some(MenuCategory::Settings), |c| {
+            let inv = &c.editor.plugin_inventory;
+            let ok = inv.iter().filter(|r| r.error.is_none()).count();
+            let failed = inv.len() - ok;
+            let cmds: usize = inv.iter().map(|r| r.commands).sum();
+            let hooks: usize = inv.iter().map(|r| r.hooks).sum(); // real hook total (Task 6 wiring)
+            c.editor.status = format!("plugins: {ok} ok ({cmds} cmds, {hooks} hooks), {failed} failed");
+            CommandResult::Handled
+        });
 
         r
     }
@@ -1016,6 +1057,67 @@ mod tests {
     }
 
     #[test]
+    fn retain_builtins_keeps_builtins_and_drops_plugins() {
+        let mut reg = Registry::builtins();
+        let builtin_count = reg.commands().count();
+        let id_a = CommandId(crate::plugin::intern("retain-test.a"));
+        let id_b = CommandId(crate::plugin::intern("retain-test.b"));
+        reg.register_plugin(id_a, "A", None).expect("register_plugin should succeed on a fresh id");
+        reg.register_plugin(id_b, "B", None).expect("register_plugin should succeed on a fresh id");
+
+        reg.retain_builtins();
+
+        assert_eq!(reg.resolve_name("retain-test.a"), None);
+        assert_eq!(reg.resolve_name("retain-test.b"), None);
+        assert_eq!(reg.resolve_name("save"), Some(CommandId("save")));
+        assert_eq!(reg.commands().count(), builtin_count);
+
+        let mut e = Editor::new_from_text("hi\n", None, (80, 24));
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let r = reg.dispatch(CommandId("save"), &mut ctx);
+        assert_eq!(r, crate::commands::CommandResult::Handled);
+    }
+
+    #[test]
+    fn retain_builtins_reindexes_so_a_reregister_succeeds() {
+        let mut reg = Registry::builtins();
+        let id = CommandId(crate::plugin::intern("retain-test.reregister"));
+        reg.register_plugin(id, "Once", None).expect("register_plugin should succeed on a fresh id");
+        reg.retain_builtins();
+
+        reg.register_plugin(id, "Again", None)
+            .expect("re-registering the same id after retain_builtins should succeed — no ghost index entry");
+        assert_eq!(reg.resolve_name("retain-test.reregister"), Some(id));
+        assert_eq!(reg.meta(id).unwrap().label, "Again");
+
+        let mut e = Editor::new_from_text("hi\n", None, (80, 24));
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let r = reg.dispatch(id, &mut ctx);
+        assert_eq!(r, CommandResult::Handled);
+        assert_eq!(e.pending_plugin_calls.len(), 1, "re-registered id dispatches as a plugin call");
+        assert_eq!(e.pending_plugin_calls[0], crate::plugin::PluginCall { id });
+    }
+
+    #[test]
+    fn retain_builtins_preserves_builtin_order() {
+        let before: Vec<&str> = Registry::builtins().commands().map(|(id, _)| id.0).collect();
+
+        let mut reg = Registry::builtins();
+        let id = CommandId(crate::plugin::intern("retain-test.order"));
+        reg.register_plugin(id, "Order", None).expect("register_plugin should succeed on a fresh id");
+        reg.retain_builtins();
+        let after: Vec<&str> = reg.commands().map(|(id, _)| id.0).collect();
+
+        assert_eq!(before, after, "builtin palette order must be stable across a plugin register+retain cycle");
+    }
+
+    #[test]
     fn unknown_command_surfaces_status_not_silent() {
         let reg = Registry::builtins();
         let mut e = Editor::new_from_text("hi\n", None, (80, 24));
@@ -1110,6 +1212,8 @@ mod tests {
             ("set_wrap_column",  "Wrap Column: Set\u{2026}"),
             ("toggle_chrome",    "Chrome: Full/Zen"),
             ("save_settings",    "Save Settings"),
+            ("plugins_reload",   "Reload Plugins"),
+            ("plugin_list",      "List Plugins"),
         ] {
             let m = reg.meta(CommandId(id)).unwrap_or_else(|| panic!("missing {id}"));
             assert_eq!(m.label, label, "label mismatch for {id}");
@@ -1118,6 +1222,41 @@ mod tests {
         // Confirm demotion.
         assert_eq!(reg.meta(CommandId("keymap_cua")).unwrap().menu, None, "keymap_cua must be palette-only");
         assert_eq!(reg.meta(CommandId("keymap_wordstar")).unwrap().menu, None, "keymap_wordstar must be palette-only");
+    }
+
+    // -----------------------------------------------------------------------
+    // P2 Task 8b: plugins_reload / plugin_list builtins (§6)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn plugins_reload_sets_flag() {
+        let reg = Registry::builtins();
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        assert!(!e.plugins_reload_requested, "flag starts clear");
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let r = reg.dispatch(CommandId("plugins_reload"), &mut ctx);
+        assert_eq!(r, crate::commands::CommandResult::Handled);
+        assert!(e.plugins_reload_requested, "plugins_reload sets the request flag the seam consumes");
+    }
+
+    #[test]
+    fn plugin_list_formats_inventory() {
+        let reg = Registry::builtins();
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.plugin_inventory = vec![
+            crate::plugin::PluginRecord { name: "a".into(), commands: 2, hooks: 1, error: None },
+            crate::plugin::PluginRecord { name: "b".into(), commands: 0, hooks: 0, error: Some("boom".into()) },
+        ];
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let r = reg.dispatch(CommandId("plugin_list"), &mut ctx);
+        assert_eq!(r, crate::commands::CommandResult::Handled);
+        assert_eq!(e.status, "plugins: 1 ok (2 cmds, 1 hooks), 1 failed");
     }
 
     // -----------------------------------------------------------------------
