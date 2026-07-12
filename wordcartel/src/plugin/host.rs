@@ -9,6 +9,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Duration;
 
 use crate::editor::Editor;
 use crate::registry::MenuCategory;
@@ -57,7 +58,15 @@ pub struct PluginHost {
 /// Task 1 spike (§11.3) measured ~168µs of hook overhead at 10k-instruction granularity —
 /// negligible against any value in that range, so the midpoint is used). This is the line
 /// between "plugin bug" and "editor hang" — a direct no-silent-UI-waits requirement.
-const TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(150);
+pub(crate) const CALLBACK_TIME_BUDGET: Duration = Duration::from_millis(150);
+
+/// Load-phase wall-clock budget for a plugin's top-level `exec()` (P2 §7a) — an order of
+/// magnitude over [`CALLBACK_TIME_BUDGET`] because legitimate plugin init does more work
+/// (table-building, registering several commands) than a single callback invocation. Closes the
+/// gap where a runaway top-level loop (`while true do end`) hung the whole editor at startup,
+/// unguarded: worst case is now ~1s per hung plugin — reported via `LoadReport` and survivable,
+/// not the old ∞.
+pub(crate) const LOAD_TIME_BUDGET: Duration = Duration::from_secs(1);
 
 impl PluginHost {
     /// A null host — no VM, no plugins. Used for `--no-plugins`, load failure, and tests
@@ -154,26 +163,38 @@ impl PluginHost {
         }
     }
 
-    /// The `set_hook` runaway guard (spike §11.3, GREEN): install an instruction-count hook
-    /// (every 10k instructions) that checks elapsed wall time and aborts with a typed Lua error
-    /// once [`TIME_BUDGET`] is exceeded. Scoped tightly around ONE callback invocation and
-    /// ALWAYS removed afterward (`remove_hook`) — via a [`HookGuard`] whose `Drop` runs on both
-    /// the normal-return path and an unwind (`f` is the plugin callback; `panicx::catch`, the
-    /// pump's sole panic backstop, resumes a raw Rust panic THROUGH this frame rather than
-    /// converting it — see [`Self::pump`]) — a leaked hook would fire during the NEXT unrelated
-    /// Lua call (registration, another plugin's callback).
+    /// The `set_hook` runaway guard (spike §11.3, GREEN), fixed at [`CALLBACK_TIME_BUDGET`] — a
+    /// thin forwarder to the free [`with_time_guard`] fn. Scoped tightly around ONE callback
+    /// invocation and ALWAYS removed afterward (`remove_hook`) — via a [`HookGuard`] whose
+    /// `Drop` runs on both the normal-return path and an unwind (`f` is the plugin callback;
+    /// `panicx::catch`, the pump's sole panic backstop, resumes a raw Rust panic THROUGH this
+    /// frame rather than converting it — see [`Self::pump`]) — a leaked hook would fire during
+    /// the NEXT unrelated Lua call (registration, another plugin's callback).
     fn with_time_guard<T>(&self, lua: &mlua::Lua, f: impl FnOnce() -> mlua::Result<T>) -> mlua::Result<T> {
-        let start = std::time::Instant::now();
-        lua.set_hook(mlua::HookTriggers::new().every_nth_instruction(10_000), move |_lua, _dbg| {
-            if start.elapsed() > TIME_BUDGET {
-                Err(mlua::Error::runtime("plugin: exceeded time budget"))
-            } else {
-                Ok(mlua::VmState::Continue)
-            }
-        });
-        let _guard = HookGuard(lua);
-        f()
+        with_time_guard(lua, CALLBACK_TIME_BUDGET, f)
     }
+}
+
+/// The `set_hook` runaway guard, parameterized by budget so load ([`LOAD_TIME_BUDGET`]) and
+/// callbacks ([`CALLBACK_TIME_BUDGET`]) share one mechanism. RAII `HookGuard` removes the hook on
+/// return AND unwind. `f`'s scope is one exec/callback invocation — an instruction-count hook
+/// (every 10k instructions, spike §11.3 GREEN) checks elapsed wall time and aborts with a typed
+/// Lua error once `budget` is exceeded.
+pub(crate) fn with_time_guard<T>(
+    lua: &mlua::Lua,
+    budget: Duration,
+    f: impl FnOnce() -> mlua::Result<T>,
+) -> mlua::Result<T> {
+    let start = std::time::Instant::now();
+    lua.set_hook(mlua::HookTriggers::new().every_nth_instruction(10_000), move |_lua, _dbg| {
+        if start.elapsed() > budget {
+            Err(mlua::Error::runtime("plugin: exceeded time budget"))
+        } else {
+            Ok(mlua::VmState::Continue)
+        }
+    });
+    let _guard = HookGuard(lua);
+    f()
 }
 
 /// RAII: removes `with_time_guard`'s `set_hook` on drop — normal return AND unwind alike — so a
@@ -262,6 +283,13 @@ mod tests {
         let editor = Rc::new(RefCell::new(Editor::new_from_text("x", None, (40, 10))));
         host.pump(&editor);
         assert_eq!(whole_text(&editor), "x");
+    }
+
+    #[test]
+    fn callback_budget_constant_unchanged() {
+        // The Task 3 rename (TIME_BUDGET → CALLBACK_TIME_BUDGET) must not move the value —
+        // only LOAD_TIME_BUDGET is new.
+        assert_eq!(CALLBACK_TIME_BUDGET, std::time::Duration::from_millis(150));
     }
 
     #[test]

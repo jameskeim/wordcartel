@@ -151,16 +151,39 @@ pub fn load_sources(
     reports
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for [`load_budget`] — lets a test drive `load_one`'s exec-phase
+    /// guard with a tiny budget instead of the real `LOAD_TIME_BUDGET`, so a runaway-abort test
+    /// completes in milliseconds rather than waiting out the real 1s budget. Mirrors the
+    /// `FAIL_NEXT_COMMIT_WRITE` fault-seam pattern in `plugin::host`.
+    pub(crate) static LOAD_BUDGET_OVERRIDE: Cell<Option<std::time::Duration>> = const { Cell::new(None) };
+}
+
+/// The exec-phase time budget for [`load_one`]: [`crate::plugin::host::LOAD_TIME_BUDGET`] in
+/// release, or the `#[cfg(test)]` override when a test has armed one via
+/// [`LOAD_BUDGET_OVERRIDE`].
+fn load_budget() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        if let Some(d) = LOAD_BUDGET_OVERRIDE.with(std::cell::Cell::get) {
+            return d;
+        }
+    }
+    crate::plugin::host::LOAD_TIME_BUDGET
+}
+
 /// Load + register ONE plugin, atomically, via a two-phase commit (P2 §7b).
 ///
 /// 1. Cap the stem (a Rust-level `&str` — the caller's, not plugin-Lua-supplied — so it needs
 ///    no `mlua::String` extraction) against `PLUGIN_MAX_STEM_LEN`. NOT interned here — the stem
 ///    intern moved into the commit phase below, alongside every other interned string.
 /// 2. Install a FRESH registration sink (`wc.register_command`) scoped to this plugin, then
-///    exec its source. A parse/exec error bails with nothing committed — `install_registration`
-///    does no interning and no `set_named_registry_value` during exec, so there is nothing to
-///    unwind: the sink's raw `PendingReg` entries (if any were pushed before the error) are
-///    simply dropped, harmless.
+///    exec its source (guarded by [`load_budget`]'s [`with_time_guard`](crate::plugin::host::with_time_guard)
+///    — a runaway top-level loop aborts rather than hanging startup, P2 §7a). A parse/exec/guard
+///    error bails with nothing committed — `install_registration` does no interning and no
+///    `set_named_registry_value` during exec, so there is nothing to unwind: the sink's raw
+///    `PendingReg` entries (if any were pushed before the error) are simply dropped, harmless.
 /// 3. Preflight EVERY pending registration on its RAW `name_full` string — a collision with the
 ///    live `Registry` OR with another entry in this same batch, and a re-confirmed per-plugin
 ///    count cap — BEFORE any Lua-side write happens.
@@ -185,7 +208,7 @@ fn load_one(reg: &mut Registry, lua: &mlua::Lua, stem_raw: &str, src: &str) -> R
     // before commit needs &'static (the stem intern moved into the commit phase below).
     crate::plugin::api::install_registration(lua, stem_raw.to_owned(), sink.clone(), count.clone())
         .map_err(|e| LoadFailure::Validation(format!("plugin {stem_raw}: {e}")))?;
-    lua.load(src).set_name(stem_raw).exec()
+    crate::plugin::host::with_time_guard(lua, load_budget(), || lua.load(src).set_name(stem_raw).exec())
         .map_err(|e| LoadFailure::Validation(format!("plugin {stem_raw}: {e}")))?;
 
     let pending: Vec<PendingReg> = sink.borrow_mut().drain(..).collect();
@@ -234,6 +257,31 @@ fn load_one(reg: &mut Registry, lua: &mlua::Lua, stem_raw: &str, src: &str) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_time_budget_aborts_runaway_toplevel() {
+        // A tiny test budget so a genuinely runaway top-level loop is caught in milliseconds,
+        // not the real 1s LOAD_TIME_BUDGET.
+        LOAD_BUDGET_OVERRIDE.with(|c| c.set(Some(std::time::Duration::from_millis(20))));
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().unwrap();
+        let runaway = "while true do end";
+        let good = "wc.register_command{ name='hello', label='Hello', fn=function() end }";
+        let reports = load_sources(
+            &mut reg, &mut host,
+            &sources(&[("runaway", runaway), ("good", good)]),
+        );
+        LOAD_BUDGET_OVERRIDE.with(|c| c.set(None)); // disarm defensively — no cross-test leak
+        assert_eq!(reports.len(), 2);
+        let err = reports[0].result.as_ref().expect_err("a runaway top-level loop must be aborted");
+        assert!(err.to_lowercase().contains("budget"), "error should mention a budget: {err}");
+        assert_eq!(
+            reports[1].result,
+            Ok(1),
+            "batch continues — a good plugin after the runaway one still registers"
+        );
+        assert!(reg.resolve_name("good.hello").is_some());
+    }
 
     #[test]
     fn discover_reads_single_file_and_dir() {
