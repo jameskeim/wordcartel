@@ -17,6 +17,10 @@ pub enum MinibufferKind {
     WriteBlock,
     /// Numeric input for Set Wrap Column.
     WrapColumn,
+    /// Argument prompt for a parameterized plugin command (Task 5) — opened by
+    /// `Registry::dispatch_with_arg` case 3 (declares `meta.arg == Some`, none supplied yet).
+    /// Submit enqueues a `PluginCall { id, arg: Some(text) }` directly — case 2 completing.
+    PluginArg { id: crate::registry::CommandId },
 }
 
 /// Ghost example hint shown after the caret on an empty Filter prompt — the
@@ -114,6 +118,14 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                         MinibufferKind::SaveAs     => crate::prompts::save_as_submit(editor, &mb.text, ex, clock, msg_tx),
                         MinibufferKind::WriteBlock => crate::prompts::block_write_submit(editor, &mb.text),
                         MinibufferKind::WrapColumn => crate::prompts::wrap_column_submit(editor, &mb.text),
+                        MinibufferKind::PluginArg { id } => {
+                            if mb.text.len() > crate::limits::PLUGIN_MAX_COMMAND_ARG {
+                                editor.status = "plugin: command arg too long".into();
+                            } else {
+                                editor.pending_plugin_calls.push_back(
+                                    crate::plugin::PluginCall { id, arg: Some(mb.text) });
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -140,5 +152,59 @@ mod tests {
         assert_eq!((m.text.as_str(), m.cursor), ("abc", 3));
         m.left(); m.backspace();
         assert_eq!((m.text.as_str(), m.cursor), ("ac", 1));
+    }
+
+    fn enter_key() -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent {
+            code: crossterm::event::KeyCode::Enter,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+            kind: crossterm::event::KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        }
+    }
+
+    /// An open `PluginArg` minibuffer with text "25", Enter → `pending_plugin_calls` gains
+    /// `PluginCall { id, arg: Some("25") }` and the minibuffer closes (Task 5's case 2
+    /// completing after the prompt).
+    #[test]
+    fn plugin_arg_submit_enqueues_call_with_arg() {
+        let id = crate::registry::CommandId(crate::plugin::intern("minibuffer-test.plugin-arg"));
+        let mut editor = crate::editor::Editor::new_from_text("hi\n", None, (80, 24));
+        editor.minibuffer = Some(Minibuffer {
+            prompt: "Minutes:".into(), text: "25".into(), cursor: 2,
+            kind: MinibufferKind::PluginArg { id },
+        });
+        let ex = crate::jobs::InlineExecutor::default();
+        let clock = crate::test_support::TestClock::new(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        let msg = crate::app::Msg::Input(Event::Key(enter_key()));
+        intercept(msg, &mut editor, &ex, &clock, &tx);
+
+        assert!(editor.minibuffer.is_none(), "submit must close the minibuffer");
+        assert_eq!(editor.pending_plugin_calls.len(), 1);
+        assert_eq!(editor.pending_plugin_calls[0], crate::plugin::PluginCall { id, arg: Some("25".into()) });
+    }
+
+    /// An arg over `PLUGIN_MAX_COMMAND_ARG` submitted via the `PluginArg` minibuffer is rejected
+    /// (typed status), nothing enqueued.
+    #[test]
+    fn plugin_arg_over_cap_is_rejected_at_submit() {
+        let id = crate::registry::CommandId(crate::plugin::intern("minibuffer-test.plugin-arg-cap"));
+        let over_cap = "a".repeat(crate::limits::PLUGIN_MAX_COMMAND_ARG + 1);
+        let mut editor = crate::editor::Editor::new_from_text("hi\n", None, (80, 24));
+        editor.minibuffer = Some(Minibuffer {
+            prompt: "Minutes:".into(), text: over_cap, cursor: 0,
+            kind: MinibufferKind::PluginArg { id },
+        });
+        let ex = crate::jobs::InlineExecutor::default();
+        let clock = crate::test_support::TestClock::new(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        let msg = crate::app::Msg::Input(Event::Key(enter_key()));
+        intercept(msg, &mut editor, &ex, &clock, &tx);
+
+        assert!(editor.pending_plugin_calls.is_empty(), "an over-cap arg must not be enqueued");
+        assert_eq!(editor.status, "plugin: command arg too long");
     }
 }

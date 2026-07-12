@@ -247,7 +247,7 @@ impl PluginHost {
         };
         let mut e = editor.borrow_mut();
         let mut ctx = crate::registry::Ctx { editor: &mut e, clock, executor: ex, msg_tx: msg_tx.clone() };
-        reg.dispatch(id, &mut ctx);
+        reg.dispatch_with_arg(id, &mut ctx, d.arg.clone());
     }
 
     /// Invoke ONE drained [`crate::plugin::PluginCall`]'s stored Lua callback (the P1 shape).
@@ -262,9 +262,10 @@ impl PluginHost {
         let key = format!("wc-cmd-{}", call.id.0);
         let _guard = self.bridge.as_ref()
             .map(|b| ObserverGuard::enter(b.invoke_state.clone(), call.id.0, false));
+        let arg = call.arg;
         let outcome: Result<mlua::Result<()>, String> = crate::panicx::catch(|| {
             let cb: mlua::Function = lua.named_registry_value(&key)?;
-            self.with_time_guard(lua, || cb.call::<()>(()))
+            self.with_time_guard(lua, || cb.call::<()>((arg,)))
         });
         if let Err(msg) = normalize(outcome) {
             crate::plugin::plugin_error(editor, call.id.0, &msg);

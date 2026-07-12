@@ -65,6 +65,15 @@ pub(crate) fn install_registration(
             return Err(mlua::Error::runtime("plugin: label too long"));
         }
         let menu_raw: Option<mlua::String> = spec.get("menu")?;
+        // arg: the optional argument-prompt string (Task 5) — same borrowed-length-check-then-
+        // convert pattern as label, capped against the same PLUGIN_MAX_LABEL_LEN (it too is a
+        // short UI-facing prompt string, not a command payload).
+        let arg_raw: Option<mlua::String> = spec.get("arg")?;
+        if let Some(a) = &arg_raw {
+            if a.as_bytes().len() > crate::limits::PLUGIN_MAX_LABEL_LEN {
+                return Err(mlua::Error::runtime("plugin: command arg prompt too long"));
+            }
+        }
         let func: mlua::Function = spec.get("fn")?;
         // menu: parse-to-enum on the borrowed bytes — no owned String needed either way.
         let menu = match &menu_raw {
@@ -77,8 +86,12 @@ pub(crate) fn install_registration(
         // No intern, no set_named_registry_value here — commit does both (§7b). Own raw strings only.
         let name_full = format!("{stem}.{}", name_raw.to_str()?.as_ref());
         let label = label_raw.to_str()?.to_owned();
+        let arg = match &arg_raw {
+            Some(a) => Some(a.to_str()?.to_owned()),
+            None => None,
+        };
         count.set(count.get() + 1);
-        sink.borrow_mut().push(PendingReg { name_full, label, menu, func });
+        sink.borrow_mut().push(PendingReg { name_full, label, menu, func, arg });
         Ok(())
     })?;
     wc.set("register_command", reg_fn)?;
@@ -421,7 +434,7 @@ fn install_command(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::
     let invoke = bridge.invoke_state.clone();
     wc.set(
         "command",
-        lua.create_function(move |_, name: mlua::String| {
+        lua.create_function(move |_, (name, arg): (mlua::String, Option<mlua::String>)| {
             let st = invoke.borrow();
             if st.observer {
                 return Err(mlua::Error::runtime("plugin: wc.command is not allowed from an event hook"));
@@ -429,6 +442,16 @@ fn install_command(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::
             if name.as_bytes().len() > crate::limits::PLUGIN_MAX_COMMAND_REF {
                 return Err(mlua::Error::runtime("plugin: command name too long"));
             }
+            // arg: cap on the BORROWED bytes before any Rust allocation (resource-bound LAW).
+            let arg = match &arg {
+                Some(a) => {
+                    if a.as_bytes().len() > crate::limits::PLUGIN_MAX_COMMAND_ARG {
+                        return Err(mlua::Error::runtime("plugin: command arg too long"));
+                    }
+                    Some(a.to_str()?.to_owned())
+                }
+                None => None,
+            };
             let origin = st.current.clone().unwrap_or_default();
             drop(st);
             let mut e = editor.try_borrow_mut().map_err(|_| mlua::Error::runtime("plugin: editor busy"))?;
@@ -438,6 +461,7 @@ fn install_command(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::
             e.pending_plugin_dispatch.push_back(crate::plugin::PluginDispatch {
                 origin,
                 name: name.to_str()?.to_owned(),
+                arg,
             });
             Ok(())
         })?,

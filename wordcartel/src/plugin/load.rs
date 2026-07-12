@@ -308,7 +308,7 @@ fn load_one(
         }
     }
     // ── Commit phase 1 (FALLIBLE): intern + write every wc-cmd-<id> key, Registry untouched. ──
-    let mut committed: Vec<(CommandId, &'static str, Option<MenuCategory>)> =
+    let mut committed: Vec<(CommandId, &'static str, Option<MenuCategory>, Option<&'static str>)> =
         Vec::with_capacity(pending.len());
     for p in &pending {
         let id = CommandId(crate::plugin::intern(&p.name_full));
@@ -320,7 +320,7 @@ fn load_one(
         }
         lua.set_named_registry_value(&format!("wc-cmd-{}", id.0), p.func.clone())
             .map_err(|e| LoadFailure::VmExhausted(format!("plugin {stem_raw}: {e}")))?;
-        committed.push((id, label, p.menu));
+        committed.push((id, label, p.menu, p.arg.as_deref().map(crate::plugin::intern)));
     }
     // ── Commit phase 1 continued: intern + write every wc-ev-<stem>-<i> hook key, same
     // fault-seam-guarded fallible path as the command keys above (P2 §3b). Hooks have no
@@ -341,8 +341,8 @@ fn load_one(
     }
     // ── Commit phase 2 (INFALLIBLE): Registry mutation only — preflight ruled out Duplicate. ──
     let n = committed.len();
-    for (id, label, menu) in committed {
-        reg.register_plugin(id, label, menu)
+    for (id, label, menu, arg) in committed {
+        reg.register_plugin(id, label, menu, arg)
             .expect("preflight already ruled out every possible Duplicate for this plugin");
     }
     Ok((n, committed_hooks))
@@ -547,6 +547,42 @@ mod tests {
         assert_eq!(reports[0].result, Ok(1));
         let id = reg.resolve_name("p.x").unwrap();
         assert_eq!(reg.meta(id).unwrap().menu, Some(MenuCategory::Edit));
+    }
+
+    /// `wc.register_command{ …, arg='Minutes:' }` → `reg.meta(id).arg == Some("Minutes:")`;
+    /// absent → `None` (Task 5).
+    #[test]
+    fn register_command_with_arg_prompt() {
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().unwrap();
+        let src = "wc.register_command{ name='x', label='X', arg='Minutes:', fn=function(arg) end }";
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("p", src)]), &BTreeMap::new(), &mut Vec::new());
+        assert_eq!(reports[0].result, Ok(1));
+        let id = reg.resolve_name("p.x").unwrap();
+        assert_eq!(reg.meta(id).unwrap().arg, Some("Minutes:"));
+
+        // Absent `arg` → None (the existing no-arg registration path is unaffected).
+        let mut reg2 = Registry::builtins();
+        let mut host2 = PluginHost::new().unwrap();
+        let src2 = "wc.register_command{ name='y', label='Y', fn=function() end }";
+        let reports2 = load_sources(&mut reg2, &mut host2, &sources(&[("p", src2)]), &BTreeMap::new(), &mut Vec::new());
+        assert_eq!(reports2[0].result, Ok(1));
+        let id2 = reg2.resolve_name("p.y").unwrap();
+        assert_eq!(reg2.meta(id2).unwrap().arg, None);
+    }
+
+    /// An `arg` prompt string longer than `PLUGIN_MAX_LABEL_LEN` is rejected at load time,
+    /// nothing interned into the registry (mirrors `load_rejects_over_length_label`).
+    #[test]
+    fn load_rejects_over_length_arg_prompt() {
+        let mut reg = Registry::builtins();
+        let before = reg.commands().count();
+        let mut host = PluginHost::new().unwrap();
+        let long = "a".repeat(crate::limits::PLUGIN_MAX_LABEL_LEN + 1);
+        let src = format!("wc.register_command{{ name='x', label='X', arg='{long}', fn=function(arg) end }}");
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("p", &src)]), &BTreeMap::new(), &mut Vec::new());
+        assert!(reports[0].result.is_err());
+        assert_eq!(reg.commands().count(), before);
     }
 
     #[test]

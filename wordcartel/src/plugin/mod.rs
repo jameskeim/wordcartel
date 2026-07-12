@@ -20,12 +20,16 @@ use std::sync::Mutex;
 use crate::editor::Editor;
 use crate::registry::CommandId;
 
-/// A queued plugin-command invocation. `Copy` id only — the pump (Task 5) looks up the Lua
-/// callback by this id. Lives on [`crate::editor::Editor`] so both registry dispatch and the
-/// pump reach it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A queued plugin-command invocation. The pump (Task 5) looks up the Lua callback by `id` and
+/// passes `arg` as the callback's first parameter. Lives on [`crate::editor::Editor`] so both
+/// registry dispatch and the pump reach it. No longer `Copy` — `arg` is an owned `String` (Task
+/// 5's parameterized-commands widening).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginCall {
     pub id: CommandId,
+    /// The already-collected argument (from `wc.command(name, arg)` or a resolved `PluginArg`
+    /// minibuffer prompt), or `None` for a nullary command.
+    pub arg: Option<String>,
 }
 
 /// The P2/P3 event kinds (exhaustive — adding a kind is a deliberate act every match
@@ -61,11 +65,14 @@ pub struct PluginRecord {
 
 /// A queued `wc.command` dispatch (fire-and-forget). `origin` names the requesting plugin
 /// cmd/hook for error attribution; `name` is the raw target (resolved at drain — no call-time
-/// registry snapshot; see `plugin::host::PluginHost::pump`'s `drain_one_dispatch`).
+/// registry snapshot; see `plugin::host::PluginHost::pump`'s `drain_one_dispatch`). `arg` is the
+/// optional 2nd `wc.command(name, arg)` argument, threaded to `Registry::dispatch_with_arg`
+/// (Task 5).
 #[derive(Clone, Debug)]
 pub struct PluginDispatch {
     pub origin: String,
     pub name: String,
+    pub arg: Option<String>,
 }
 
 /// One armed plugin timer (P3 §3). The callback lives in the VM named registry under `key` (dies with

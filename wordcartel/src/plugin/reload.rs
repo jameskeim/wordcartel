@@ -256,11 +256,11 @@ mod tests {
         let tx = msg_tx();
         {
             let mut e = editor.borrow_mut();
-            e.pending_plugin_calls.push_back(crate::plugin::PluginCall { id: CommandId("x") });
+            e.pending_plugin_calls.push_back(crate::plugin::PluginCall { id: CommandId("x"), arg: None });
             e.pending_plugin_events.push_back(crate::plugin::PluginEvent {
                 kind: crate::plugin::PluginEventKind::Save, path: None });
             e.pending_plugin_dispatch.push_back(crate::plugin::PluginDispatch {
-                origin: "o".into(), name: "n".into() });
+                origin: "o".into(), name: "n".into(), arg: None });
             // P3 §3g: a reload must also clear the timer schedule + on_change subscription of the dead VM.
             e.pending_plugin_timers.push(crate::plugin::PluginTimer {
                 handle: 1, origin: "p".into(), key: "wc-timer-1".into(),
@@ -370,11 +370,11 @@ mod tests {
         // Pre-seed the queues so the editor-side revert is observable.
         {
             let mut e = editor.borrow_mut();
-            e.pending_plugin_calls.push_back(crate::plugin::PluginCall { id: CommandId("x") });
+            e.pending_plugin_calls.push_back(crate::plugin::PluginCall { id: CommandId("x"), arg: None });
             e.pending_plugin_events.push_back(crate::plugin::PluginEvent {
                 kind: crate::plugin::PluginEventKind::Save, path: None });
             e.pending_plugin_dispatch.push_back(crate::plugin::PluginDispatch {
-                origin: "o".into(), name: "n".into() });
+                origin: "o".into(), name: "n".into(), arg: None });
             e.plugins_reload_requested = true;
         }
         // Arm the fault seam: the reload's load_phase commit write for p.a is forced to fail →
