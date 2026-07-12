@@ -74,6 +74,17 @@ pub const PLUGIN_MAX_PENDING_DISPATCH: usize = 64;
 /// cascade length (one dispatch, one command callback, or one hook invocation = one unit).
 pub const PLUGIN_PUMP_CHAIN_CAP: usize = 64;
 
+/// P3 plugin-timer + parameterized-command caps.
+/// Min timer interval — the spin defense: a repeating timer reschedules to `now + interval >= now +
+/// 1000ms` from completion, so it wakes at most ~once/interval (a due deadline may yield ONE immediate
+/// zero-timeout wake, then fires and moves 1s+ out — bounded cadence, not a spin). Sub-floor → typed error.
+pub const PLUGIN_TIMER_MIN_INTERVAL_MS: u64 = 1000;
+/// Max armed timers per plugin (heavier than a hook — each keeps a wall-clock wake alive). Over → typed error.
+pub const PLUGIN_MAX_TIMERS_PER_PLUGIN: usize = 8;
+/// Max bytes of a parameterized-command argument (wc.command arg / the PluginArg minibuffer line),
+/// checked before the owning String allocation (resource-bound LAW).
+pub const PLUGIN_MAX_COMMAND_ARG: usize = 4096;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,5 +105,8 @@ mod tests {
         assert_eq!(PLUGIN_MAX_COMMAND_REF, PLUGIN_MAX_STEM_LEN + 1 + PLUGIN_MAX_NAME_LEN);
         assert_eq!(PLUGIN_MAX_PENDING_DISPATCH, 64);
         assert_eq!(PLUGIN_PUMP_CHAIN_CAP, 64);
+        assert_eq!(PLUGIN_TIMER_MIN_INTERVAL_MS, 1000);
+        assert_eq!(PLUGIN_MAX_TIMERS_PER_PLUGIN, 8);
+        assert_eq!(PLUGIN_MAX_COMMAND_ARG, 4096);
     }
 }

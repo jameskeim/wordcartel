@@ -28,13 +28,15 @@ pub struct PluginCall {
     pub id: CommandId,
 }
 
-/// The three P2 event kinds (exhaustive — adding a kind is a deliberate act every match
-/// handles).
+/// The P2/P3 event kinds (exhaustive — adding a kind is a deliberate act every match
+/// handles). `Change` (P3 §6) is a debounced buffer-content notification, distinct from the
+/// P2 cold-path save/open/close trio.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PluginEventKind {
     Save,
     Open,
     BufferClose,
+    Change,
 }
 
 /// One fired event, queued on [`crate::editor::Editor::pending_plugin_events`]. Payload is
@@ -66,6 +68,20 @@ pub struct PluginDispatch {
     pub name: String,
 }
 
+/// One armed plugin timer (P3 §3). The callback lives in the VM named registry under `key` (dies with
+/// the VM at reload); this struct is the SCHEDULE half, stored on `Editor` (so `next_wake(&Editor,_)`
+/// can see the next-due) and auto-disarmed by `Editor::clear_plugin_wake_state`.
+#[derive(Clone, Debug)]
+pub struct PluginTimer {
+    pub handle: u64,          // opaque handle returned to Lua (monotonic, never reused)
+    pub origin: String,       // owning plugin (per-plugin cap + plugin_list); from InvokeState.current
+    pub key: String,          // "wc-timer-<handle>" — the VM-registry callback key
+    pub next_due_ms: u64,     // wall-clock ms of the next fire
+    pub interval_ms: u64,     // >= PLUGIN_TIMER_MIN_INTERVAL_MS (floor-checked at arm)
+    pub repeat: bool,         // false = one-shot (remove after firing); true = reschedule-from-completion
+    pub pending: bool,        // true ONLY while this timer's callback is in flight (one-pending-per-timer)
+}
+
 /// Parse a hook event name (the `menu_from_str` parse-to-enum precedent — the enum IS the
 /// bound). An unknown name is a typed Lua error at `wc.on` time, never stored, never interned.
 pub fn event_from_str(s: &str) -> Option<PluginEventKind> {
@@ -73,6 +89,7 @@ pub fn event_from_str(s: &str) -> Option<PluginEventKind> {
         "save" => Some(PluginEventKind::Save),
         "open" => Some(PluginEventKind::Open),
         "buffer_close" => Some(PluginEventKind::BufferClose),
+        "change" => Some(PluginEventKind::Change),
         _ => None,
     }
 }
@@ -84,6 +101,7 @@ pub(crate) fn kind_str(k: PluginEventKind) -> &'static str {
         PluginEventKind::Save => "save",
         PluginEventKind::Open => "open",
         PluginEventKind::BufferClose => "buffer_close",
+        PluginEventKind::Change => "change",
     }
 }
 
@@ -175,6 +193,12 @@ pub(crate) fn cap_status(bytes: &[u8], max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_from_str_parses_change() {
+        assert_eq!(event_from_str("change"), Some(PluginEventKind::Change));
+        assert_eq!(kind_str(PluginEventKind::Change), "change");
+    }
 
     #[test]
     fn intern_is_stable() {
