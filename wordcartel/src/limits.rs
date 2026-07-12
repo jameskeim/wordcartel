@@ -56,6 +56,14 @@ pub const PLUGIN_MAX_CONFIG_NODES: usize = 1024;
 /// unbounded, so one giant string/key must be rejected BEFORE `lua.create_string` allocates it.
 pub const PLUGIN_MAX_CONFIG_STR: usize = 64 * 1024;
 
+/// P2 event-system caps (bounded-memory LAW, extending the P1 registration caps above).
+/// Max `wc.on` hooks a single plugin may register — each hook stores a Lua function in the VM
+/// registry plus an owned (never interned) Rust-side `HookEntry`.
+pub const PLUGIN_MAX_HOOKS_PER_PLUGIN: usize = 64;
+/// Max byte length of a `PluginEvent`'s captured path payload (`cap_status`-clamped at the fire
+/// site) — the queue holds bounded owned data even for a pathological path.
+pub const PLUGIN_MAX_EVENT_PAYLOAD: usize = 4096;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +79,7 @@ mod tests {
         assert_eq!(PLUGIN_MAX_CONFIG_DEPTH, 8);
         assert_eq!(PLUGIN_MAX_CONFIG_NODES, 1024);
         assert_eq!(PLUGIN_MAX_CONFIG_STR, 64 * 1024);
+        assert_eq!(PLUGIN_MAX_HOOKS_PER_PLUGIN, 64);
+        assert_eq!(PLUGIN_MAX_EVENT_PAYLOAD, 4096);
     }
 }

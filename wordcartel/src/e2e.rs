@@ -498,6 +498,134 @@ fn insert_date_lua_e2e_success_demo() {
     assert!(is_iso_date(second_date_part), "expected a second YYYY-MM-DD date, got {second_date_part:?}");
 }
 
+// ---------------------------------------------------------------------------
+// P2 Task 6: the event system — hooks firing at the three real fire sites
+// ---------------------------------------------------------------------------
+
+/// P2 acceptance: an `on_save` hook fires exactly once on a REAL save driven through the
+/// production `dispatch_save` → `InlineExecutor` → `jobs_apply::apply_outcome` merge path —
+/// the same wiring `journey_close_dirty_save_and_close` exercises, minus the close. Proves the
+/// full save.rs fire-site borrow choreography (fire AFTER the `by_id_mut` block closes, from
+/// the closure's OWNED `target`) against a real save, not a synthetic `PluginEvent` push.
+#[test]
+fn on_save_hook_fires_on_real_save() {
+    use crate::registry::Ctx;
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    std::fs::write(&path, "orig\n").unwrap();
+    let src = "\
+        calls = 0\n\
+        wc.on('save', function(ev) calls = calls + 1; wc.status(ev.kind .. ':' .. tostring(ev.path)) end)";
+    let mut h = Harness::new_with_plugin("orig\n edited", &[("hookplug", src)]);
+    {
+        let mut e = h.editor.borrow_mut();
+        e.active_mut().document.path = Some(path.clone());
+        e.active_mut().document.stored_fp = crate::save::fingerprint(&path);
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = None;
+    }
+    let clock = TestClock(h.now);
+    {
+        let mut e = h.editor.borrow_mut();
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone() };
+        crate::save::dispatch_save(&mut ctx);
+    }
+    // InlineExecutor already ran the job inline; drain + apply the merge (fires the event).
+    {
+        let outcomes = h.ex.drain();
+        let mut e = h.editor.borrow_mut();
+        for o in outcomes { crate::jobs_apply::apply_outcome(o, &mut e); }
+    }
+    // The pump drains the event the merge just enqueued — no outer borrow held.
+    h.plugin_host.as_mut().unwrap().pump(&h.editor);
+
+    let calls: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("calls")
+        .expect("the plugin's Lua-global counter must exist");
+    assert_eq!(calls, 1, "on_save hook must fire exactly once");
+    let expected = format!("save:{}", path.to_string_lossy());
+    assert_eq!(h.status(), expected, "the hook's own wc.status must be the final status");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "orig\n edited",
+        "the save itself must have actually happened — hooks never abort/delay the op");
+}
+
+/// P2 acceptance: `on_open`/`on_buffer_close` fire at the real `workspace.rs` seams, with no
+/// double-fire on the throwaway-reuse open shape, and quitting fires nothing (quitting is not
+/// closing — `Command::Quit` on a clean workspace never calls `close_buffer_now`).
+#[test]
+fn on_buffer_close_and_open_fire() {
+    let dir = tempfile::tempdir().unwrap();
+    let path_a = dir.path().join("a.md");
+    let path_b = dir.path().join("b.md");
+    std::fs::write(&path_a, "a\n").unwrap();
+    std::fs::write(&path_b, "b\n").unwrap();
+    let src = "\
+        opens = 0; closes = 0; last_open = nil; last_close = nil\n\
+        wc.on('open', function(ev) opens = opens + 1; last_open = ev.path end)\n\
+        wc.on('buffer_close', function(ev) closes = closes + 1; last_close = ev.path end)";
+    // A path-less "\n" buffer is a reusable throwaway (workspace::active_is_reusable_throwaway) —
+    // the FIRST open below takes the reuse branch (open_as_new_buffer delegates to
+    // open_into_current and returns), exercising the no-double-fire guarantee directly.
+    let mut h = Harness::new_with_plugin("\n", &[("hookplug2", src)]);
+
+    // 1) Reuse-shape open: fires on_open once.
+    {
+        let mut e = h.editor.borrow_mut();
+        crate::workspace::open_as_new_buffer(&mut e, &path_a);
+    }
+    h.plugin_host.as_mut().unwrap().pump(&h.editor);
+    let opens: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("opens").unwrap();
+    assert_eq!(opens, 1, "the reuse-shape open must fire on_open exactly once, not twice");
+    let last_open: String =
+        h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("last_open").unwrap();
+    assert_eq!(last_open, path_a.to_string_lossy());
+    let a_id = h.editor.borrow().active().id;
+
+    // 2) New-buffer-shape open: the active buffer is now named (not a throwaway), so this
+    // pushes a fresh buffer instead of reusing — the OTHER open_as_new_buffer arm.
+    {
+        let mut e = h.editor.borrow_mut();
+        crate::workspace::open_as_new_buffer(&mut e, &path_b);
+    }
+    h.plugin_host.as_mut().unwrap().pump(&h.editor);
+    let opens: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("opens").unwrap();
+    assert_eq!(opens, 2, "the new-buffer-shape open must also fire on_open, once");
+    let last_open: String =
+        h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("last_open").unwrap();
+    assert_eq!(last_open, path_b.to_string_lossy());
+    let b_id = h.editor.borrow().active().id;
+    assert_ne!(a_id, b_id);
+
+    // 3) A clean close fires on_buffer_close with the PRE-removal path.
+    {
+        let mut e = h.editor.borrow_mut();
+        crate::workspace::close_buffer_now(&mut e, b_id);
+    }
+    h.plugin_host.as_mut().unwrap().pump(&h.editor);
+    let closes: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("closes").unwrap();
+    assert_eq!(closes, 1, "the clean close must fire on_buffer_close exactly once");
+    let last_close: String =
+        h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("last_close").unwrap();
+    assert_eq!(last_close, path_b.to_string_lossy());
+
+    // 4) Quit fires nothing: a clean workspace's Command::Quit only sets editor.quit — it never
+    // calls close_buffer_now, so neither counter must move.
+    {
+        let clock = TestClock(h.now);
+        let mut e = h.editor.borrow_mut();
+        assert!(!e.buffers.iter().any(|b| e.is_dirty(b.id)), "precondition: a clean workspace");
+        let r = crate::commands::run(crate::commands::Command::Quit, &mut e, &clock);
+        assert!(matches!(r, crate::commands::CommandResult::Quit));
+        assert!(e.quit, "Quit must set the quit flag on a clean workspace");
+    }
+    h.plugin_host.as_mut().unwrap().pump(&h.editor);
+    let opens_after_quit: i64 =
+        h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("opens").unwrap();
+    let closes_after_quit: i64 =
+        h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("closes").unwrap();
+    assert_eq!(opens_after_quit, 2, "quit must not fire on_open");
+    assert_eq!(closes_after_quit, 1, "quit must not fire on_buffer_close — quitting is not closing");
+}
+
 /// `true` iff `s` is exactly 10 bytes shaped `\d{4}-\d{2}-\d{2}` — a dependency-free ISO-date
 /// shape check (avoids pulling in a regex crate for one test).
 fn is_iso_date(s: &str) -> bool {

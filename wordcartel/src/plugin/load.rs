@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::limits::{PLUGIN_MAX_COMMANDS_PER_PLUGIN, PLUGIN_MAX_SOURCE_BYTES, PLUGIN_MAX_STEM_LEN};
-use crate::plugin::host::{PendingReg, PluginHost};
+use crate::plugin::host::{HookEntry, PendingReg, PluginHost};
+use crate::plugin::PluginEventKind;
 use crate::registry::{CommandId, MenuCategory, Registry};
 
 /// The outcome of loading ONE plugin source: `Ok(n_commands)` registered, or `Err(reason)` — a
@@ -22,6 +23,11 @@ use crate::registry::{CommandId, MenuCategory, Registry};
 pub struct LoadReport {
     pub plugin: String,
     pub result: Result<usize, String>,
+    /// Committed `wc.on` hook count (P2) — a sibling of `result`, not folded into it, so every
+    /// existing `Ok(n)` command-count assertion stays untouched. Always `0` alongside an `Err`
+    /// (a failed/skipped plugin commits zero hooks — the atomic-per-plugin guarantee now spans
+    /// both registration verbs).
+    pub hooks: usize,
 }
 
 /// The outcome of scanning the plugins dir: loadable (stem, source) pairs + a report of files
@@ -89,6 +95,7 @@ pub fn discover(dir: &Path, disable: &[String]) -> Discovered {
                 result: Err(format!(
                     "ambiguous plugin '{stem}': both {stem}.lua and {stem}/init.lua exist — remove one"
                 )),
+                hooks: 0,
             });
             i = j;
             continue;
@@ -100,6 +107,7 @@ pub fn discover(dir: &Path, disable: &[String]) -> Discovered {
                 Err(_) => skipped.push(LoadReport {
                     plugin: stem,
                     result: Err("plugin source is not valid UTF-8".to_string()),
+                    hooks: 0,
                 }),
             },
             None => skipped.push(LoadReport {
@@ -107,6 +115,7 @@ pub fn discover(dir: &Path, disable: &[String]) -> Discovered {
                 result: Err(format!(
                     "plugin source unreadable or over {PLUGIN_MAX_SOURCE_BYTES} bytes"
                 )),
+                hooks: 0,
             }),
         }
         i = j;
@@ -164,11 +173,17 @@ pub fn load_sources(
         let outcome = crate::panicx::catch(|| load_one(reg, lua, stem_raw, src, config, warns))
             .unwrap_or_else(|panic_msg| Err(LoadFailure::Validation(panic_msg)));
         match outcome {
-            Ok(n) => reports.push(LoadReport { plugin: stem_raw.clone(), result: Ok(n) }),
+            Ok((n, hookvec)) => {
+                // Captured BEFORE the move, per §7b discipline: the `lua` per-iteration borrow
+                // above is released by the time `load_one` returns, so `&mut host` is free here.
+                let n_hooks = hookvec.len();
+                host.append_hooks(hookvec);
+                reports.push(LoadReport { plugin: stem_raw.clone(), result: Ok(n), hooks: n_hooks });
+            }
             Err(LoadFailure::Validation(msg)) =>
-                reports.push(LoadReport { plugin: stem_raw.clone(), result: Err(msg) }),
+                reports.push(LoadReport { plugin: stem_raw.clone(), result: Err(msg), hooks: 0 }),
             Err(LoadFailure::VmExhausted(msg)) => {
-                reports.push(LoadReport { plugin: stem_raw.clone(), result: Err(msg) });
+                reports.push(LoadReport { plugin: stem_raw.clone(), result: Err(msg), hooks: 0 });
                 fatal = true;
                 break; // stop the batch — the VM is unusable
             }
@@ -238,7 +253,7 @@ fn load_one(
     src: &str,
     config: Option<&toml::Value>,
     warns: &mut Vec<String>,
-) -> Result<usize, LoadFailure> {
+) -> Result<(usize, Vec<HookEntry>), LoadFailure> {
     if stem_raw.len() > PLUGIN_MAX_STEM_LEN {
         return Err(LoadFailure::Validation(format!(
             "plugin stem too long ({} bytes, max {PLUGIN_MAX_STEM_LEN})",
@@ -250,6 +265,11 @@ fn load_one(
     // `stem` is OWNED into the closure now; set_name/collision-check take &str, so nothing
     // before commit needs &'static (the stem intern moved into the commit phase below).
     crate::plugin::api::install_registration(lua, stem_raw.to_owned(), sink.clone(), count.clone())
+        .map_err(|e| LoadFailure::Validation(format!("plugin {stem_raw}: {e}")))?;
+    // P2 §3b: the second registration verb, same shape — a fresh per-plugin sink, capped at
+    // push time (install_on enforces PLUGIN_MAX_HOOKS_PER_PLUGIN).
+    let hook_sink: Rc<RefCell<Vec<(PluginEventKind, mlua::Function)>>> = Rc::new(RefCell::new(Vec::new()));
+    crate::plugin::api::install_on(lua, hook_sink.clone())
         .map_err(|e| LoadFailure::Validation(format!("plugin {stem_raw}: {e}")))?;
     let cfg_value = match config {
         Some(v) => match crate::plugin::settings::config_to_lua(lua, v) {
@@ -268,6 +288,7 @@ fn load_one(
         .map_err(|e| LoadFailure::Validation(format!("plugin {stem_raw}: {e}")))?;
 
     let pending: Vec<PendingReg> = sink.borrow_mut().drain(..).collect();
+    let hook_pending: Vec<(PluginEventKind, mlua::Function)> = hook_sink.borrow_mut().drain(..).collect();
     if pending.len() > PLUGIN_MAX_COMMANDS_PER_PLUGIN {
         return Err(LoadFailure::Validation(format!(
             "plugin {stem_raw}: too many commands ({}, max {PLUGIN_MAX_COMMANDS_PER_PLUGIN})",
@@ -301,13 +322,30 @@ fn load_one(
             .map_err(|e| LoadFailure::VmExhausted(format!("plugin {stem_raw}: {e}")))?;
         committed.push((id, label, p.menu));
     }
+    // ── Commit phase 1 continued: intern + write every wc-ev-<stem>-<i> hook key, same
+    // fault-seam-guarded fallible path as the command keys above (P2 §3b). Hooks have no
+    // collision axis (anonymous by per-plugin index), so nothing to preflight beyond the
+    // push-time count cap `install_on` already enforced.
+    let mut committed_hooks: Vec<HookEntry> = Vec::with_capacity(hook_pending.len());
+    for (i, (kind, func)) in hook_pending.into_iter().enumerate() {
+        let key = format!("wc-ev-{stem_raw}-{i}");
+        // Fault seam: deterministic exhaustion test (no real OOM needed).
+        #[cfg(test)]
+        if crate::plugin::host::FAIL_NEXT_COMMIT_WRITE.with(|c| c.replace(false)) {
+            return Err(LoadFailure::VmExhausted(format!("plugin {stem_raw}: VM exhausted (test)")));
+        }
+        lua.set_named_registry_value(&key, func)
+            .map_err(|e| LoadFailure::VmExhausted(format!("plugin {stem_raw}: {e}")))?;
+        let label = format!("{stem_raw}.on_{}", crate::plugin::kind_str(kind));
+        committed_hooks.push(HookEntry { kind, key, label });
+    }
     // ── Commit phase 2 (INFALLIBLE): Registry mutation only — preflight ruled out Duplicate. ──
     let n = committed.len();
     for (id, label, menu) in committed {
         reg.register_plugin(id, label, menu)
             .expect("preflight already ruled out every possible Duplicate for this plugin");
     }
-    Ok(n)
+    Ok((n, committed_hooks))
 }
 
 #[cfg(test)]

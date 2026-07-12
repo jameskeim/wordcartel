@@ -26,6 +26,54 @@ pub struct PluginCall {
     pub id: CommandId,
 }
 
+/// The three P2 event kinds (exhaustive — adding a kind is a deliberate act every match
+/// handles).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PluginEventKind {
+    Save,
+    Open,
+    BufferClose,
+}
+
+/// One fired event, queued on [`crate::editor::Editor::pending_plugin_events`]. Payload is
+/// OWNED (by drain time the buffer may be gone/changed), path clamped to
+/// [`crate::limits::PLUGIN_MAX_EVENT_PAYLOAD`] at capture.
+#[derive(Clone, Debug)]
+pub struct PluginEvent {
+    pub kind: PluginEventKind,
+    pub path: Option<String>,
+}
+
+/// Parse a hook event name (the `menu_from_str` parse-to-enum precedent — the enum IS the
+/// bound). An unknown name is a typed Lua error at `wc.on` time, never stored, never interned.
+pub fn event_from_str(s: &str) -> Option<PluginEventKind> {
+    match s {
+        "save" => Some(PluginEventKind::Save),
+        "open" => Some(PluginEventKind::Open),
+        "buffer_close" => Some(PluginEventKind::BufferClose),
+        _ => None,
+    }
+}
+
+/// The inverse of [`event_from_str`] — the string a fired event's `{ kind = … }` table payload
+/// carries back to the hook callback.
+pub(crate) fn kind_str(k: PluginEventKind) -> &'static str {
+    match k {
+        PluginEventKind::Save => "save",
+        PluginEventKind::Open => "open",
+        PluginEventKind::BufferClose => "buffer_close",
+    }
+}
+
+/// Capture-and-enqueue an event at a fire site (cold-path only — save/open/close; never
+/// per-keystroke). One clamp + one push; drained the same frame by the pump. Path clamped at
+/// capture (resource-bound LAW: the queue holds bounded owned data even for a pathological
+/// path).
+pub(crate) fn fire_event(editor: &mut Editor, kind: PluginEventKind, path: Option<&std::path::Path>) {
+    let path = path.map(|p| cap_status(p.to_string_lossy().as_bytes(), crate::limits::PLUGIN_MAX_EVENT_PAYLOAD));
+    editor.pending_plugin_events.push_back(PluginEvent { kind, path });
+}
+
 /// The intern pool backing [`intern`] — module-level (not function-local) so the test-only
 /// [`intern_pool_len`] reader can share the SAME static rather than a lookalike copy.
 static INTERN_POOL: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);

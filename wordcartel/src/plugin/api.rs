@@ -12,6 +12,7 @@ use wordcartel_core::history::Transaction;
 use wordcartel_core::selection::Selection;
 
 use crate::plugin::host::{Bridge, PendingReg};
+use crate::plugin::PluginEventKind;
 use crate::registry::menu_from_str;
 
 /// Fetch the shared `wc` global table, creating it on first use. Idempotent across the
@@ -81,6 +82,31 @@ pub(crate) fn install_registration(
         Ok(())
     })?;
     wc.set("register_command", reg_fn)?;
+    Ok(())
+}
+
+/// Install the `wc.on(event, fn)` load-time hook collector for ONE plugin's exec pass — the
+/// second registration verb (P2 §3b), sitting beside [`install_registration`] on the same `wc`
+/// table and closed by the SAME load→callback-phase boundary ([`install_on_closed`]). `name` is
+/// parsed via [`crate::plugin::event_from_str`] (the `menu_from_str` parse-to-enum precedent —
+/// an unknown event name is a typed error, nothing stored, nothing interned) and `sink` is
+/// capped at [`crate::limits::PLUGIN_MAX_HOOKS_PER_PLUGIN`] BEFORE the push (resource-bound
+/// LAW — each hook stores a Lua function in the VM registry plus an owned `HookEntry`).
+pub(crate) fn install_on(
+    lua: &mlua::Lua,
+    sink: Rc<RefCell<Vec<(PluginEventKind, mlua::Function)>>>,
+) -> mlua::Result<()> {
+    let wc = wc_table(lua)?;
+    let on_fn = lua.create_function(move |_lua, (name, func): (mlua::String, mlua::Function)| {
+        if sink.borrow().len() >= crate::limits::PLUGIN_MAX_HOOKS_PER_PLUGIN {
+            return Err(mlua::Error::runtime("plugin: too many hooks (max 64)"));
+        }
+        let kind = crate::plugin::event_from_str(name.to_str()?.as_ref())
+            .ok_or_else(|| mlua::Error::runtime("plugin: unknown event name"))?;
+        sink.borrow_mut().push((kind, func));
+        Ok(())
+    })?;
+    wc.set("on", on_fn)?;
     Ok(())
 }
 
@@ -168,6 +194,7 @@ pub(crate) fn install_editor_api(lua: &mlua::Lua, bridge: &Bridge) -> mlua::Resu
     install_set_selection(lua, &wc, bridge)?;
     install_status(lua, &wc, bridge)?;
     install_registration_closed(lua, &wc)?;
+    install_on_closed(lua, &wc)?;
     install_config_cleared(&wc)?;
     Ok(())
 }
@@ -195,6 +222,17 @@ fn install_registration_closed(lua: &mlua::Lua, wc: &mlua::Table) -> mlua::Resul
         Err(mlua::Error::runtime("wc.register_command is only available during plugin load"))
     })?;
     wc.set("register_command", stub)?;
+    Ok(())
+}
+
+/// Overwrite `wc.on` with the same always-erroring stub shape as
+/// [`install_registration_closed`] — the second registration verb closed by the same
+/// load→callback-phase boundary.
+fn install_on_closed(lua: &mlua::Lua, wc: &mlua::Table) -> mlua::Result<()> {
+    let stub = lua.create_function(|_, _args: mlua::MultiValue| -> mlua::Result<()> {
+        Err(mlua::Error::runtime("wc.on is only available during plugin load"))
+    })?;
+    wc.set("on", stub)?;
     Ok(())
 }
 
@@ -277,9 +315,13 @@ fn install_reads(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::Re
 fn install_insert(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::Result<()> {
     let editor = bridge.editor.clone();
     let clock = bridge.clock.clone();
+    let invoke_state = bridge.invoke_state.clone();
     wc.set(
         "insert",
         lua.create_function(move |_, text: mlua::String| {
+            if invoke_state.borrow().observer {
+                return Err(mlua::Error::runtime("plugin: editing is not allowed from an event hook"));
+            }
             if text.as_bytes().len() > crate::limits::PASTE_MAX_BYTES {
                 return Err(mlua::Error::runtime("plugin: insert text too large"));
             }
@@ -302,9 +344,13 @@ fn install_insert(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::R
 fn install_replace(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::Result<()> {
     let editor = bridge.editor.clone();
     let clock = bridge.clock.clone();
+    let invoke_state = bridge.invoke_state.clone();
     wc.set(
         "replace",
         lua.create_function(move |_, (a, b, text): (usize, usize, mlua::String)| {
+            if invoke_state.borrow().observer {
+                return Err(mlua::Error::runtime("plugin: editing is not allowed from an event hook"));
+            }
             if text.as_bytes().len() > crate::limits::PASTE_MAX_BYTES {
                 return Err(mlua::Error::runtime("plugin: replace text too large"));
             }
@@ -326,9 +372,13 @@ fn install_replace(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::
 fn install_set_selection(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::Result<()> {
     let editor = bridge.editor.clone();
     let clock = bridge.clock.clone();
+    let invoke_state = bridge.invoke_state.clone();
     wc.set(
         "set_selection",
         lua.create_function(move |_, (anchor, head): (usize, usize)| {
+            if invoke_state.borrow().observer {
+                return Err(mlua::Error::runtime("plugin: editing is not allowed from an event hook"));
+            }
             let mut e = editor.try_borrow_mut().map_err(|_| mlua::Error::runtime("plugin: editor busy"))?;
             let doc_len = e.active().document.buffer.len();
             // Retain(doc_len) sums to len_before, so from_ops's consumption assert holds — this

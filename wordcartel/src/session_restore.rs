@@ -121,6 +121,7 @@ pub fn open_into_current(editor: &mut Editor, path: &std::path::Path) {
             crate::derive::rebuild(editor);
             crate::nav::ensure_visible(editor);
             editor.status = String::new();
+            crate::plugin::fire_event(editor, crate::plugin::PluginEventKind::Open, Some(path));
         }
         Err(e) => {
             editor.status = e.to_string();

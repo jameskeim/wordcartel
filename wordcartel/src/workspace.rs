@@ -144,6 +144,7 @@ pub fn open_as_new_buffer(editor: &mut Editor, path: &std::path::Path) {
             crate::derive::rebuild(editor);
             crate::nav::ensure_visible(editor);
             editor.status = String::new();
+            crate::plugin::fire_event(editor, crate::plugin::PluginEventKind::Open, Some(path));
         }
         Err(e) => editor.status = e.to_string(),
     }
@@ -181,10 +182,14 @@ pub(crate) fn close_buffer_now(editor: &mut Editor, id: BufferId) {
         editor.status = "buffer already closed".into();
         return;
     };
+    // P2 on_buffer_close fire site: capture the path BEFORE the slot is removed/replaced —
+    // covers all three close shapes below (this is the one place all of them funnel through).
+    let closing = editor.by_id(id).and_then(|b| b.document.path.clone());
     // Effort A: tell the provider to abandon this doc's generation before the slot is removed or
     // replaced (all three shapes below) so the server never keeps a closed doc open until shutdown.
     // The last-ordinary replacement's fresh buffer re-opens lazily under its own new id/generation.
     editor.diag_provider.notify_close(id);
+    crate::plugin::fire_event(editor, crate::plugin::PluginEventKind::BufferClose, closing.as_deref());
     let ordinary = editor.buffers.iter().filter(|b| !editor.is_scratch(b.id)).count();
     if ordinary <= 1 {
         // Last ordinary buffer: replace id's own slot with a fresh empty untitled.
