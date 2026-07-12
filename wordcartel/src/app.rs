@@ -398,14 +398,21 @@ pub(crate) fn advance(editor: &mut Editor, clock: &dyn Clock) {
     // Arm the reconcile debounce when the tree is (possibly) stale. Re-arm only
     // when the version advanced since the last arm (so idle Ticks don't push the
     // deadline forever); arm-from-None also covers a switch to a stale buffer.
+    // on_change (P3 §3g): armed on the SAME version-latched condition, editor-level, only when a
+    // plugin subscribes — the hot-path cost when unsubscribed is exactly zero (no read past the
+    // bool, no field write).
     {
         let now = clock.now_ms();
+        let subscribed = editor.has_on_change_subscriber;
         let b = editor.active_mut();
-        if b.reconcile.maybe_stale && b.reconcile.in_flight_version.is_none()
-            && (b.reconcile.due_at.is_none() || b.reconcile.armed_for_version != b.document.version)
-        {
+        let arm = b.reconcile.maybe_stale && b.reconcile.in_flight_version.is_none()
+            && (b.reconcile.due_at.is_none() || b.reconcile.armed_for_version != b.document.version);
+        if arm {
             b.reconcile.due_at = Some(now.saturating_add(crate::reconcile::RECONCILE_DEBOUNCE_MS));
             b.reconcile.armed_for_version = b.document.version;
+        }
+        if arm && subscribed {
+            editor.on_change_due = Some(now.saturating_add(crate::reconcile::RECONCILE_DEBOUNCE_MS));
         }
     }
 }
@@ -4172,6 +4179,45 @@ mod tests {
         assert_eq!(s.due_at, Some(1000 + crate::reconcile::RECONCILE_DEBOUNCE_MS));
         arm(&mut s, 1100, 6); // new edit → re-debounce
         assert_eq!(s.due_at, Some(1100 + crate::reconcile::RECONCILE_DEBOUNCE_MS));
+    }
+
+    /// P3 §3g zero-cost invariant: with NO plugin subscriber, `advance` must never arm
+    /// `on_change_due` — even when the reconcile debounce itself DOES arm (a real edit made
+    /// the tree stale). `next_wake` must be unaffected by the (unarmed) on_change row.
+    #[test]
+    fn advance_arms_no_on_change_due_without_subscriber() {
+        let mut e = Editor::new_from_text("hello", None, (80, 24));
+        assert!(!e.has_on_change_subscriber, "precondition: no plugin subscribed");
+        e.active_mut().reconcile.maybe_stale = true; // simulate a real edit made the tree stale
+        let clk = TestClock(1_000);
+        crate::app::advance(&mut e, &clk);
+        assert_eq!(e.active().reconcile.due_at, Some(1_000 + crate::reconcile::RECONCILE_DEBOUNCE_MS),
+            "the reconcile debounce itself still arms — on_change is the thing gated on subscription");
+        assert_eq!(e.on_change_due, None, "no subscriber ⇒ on_change_due must stay None");
+        // next_wake must be driven ONLY by the reconcile row — the on_change row's own gate
+        // (has_on_change_subscriber) keeps it out of the fold entirely (timers::on_change_deadline).
+        assert_eq!(crate::timers::next_wake(&e, 1_000), Some(1_000 + crate::reconcile::RECONCILE_DEBOUNCE_MS));
+    }
+
+    /// P3 §3g: with a subscriber, `advance` arms `on_change_due` on the SAME version-latched
+    /// condition as the reconcile debounce — same deadline, and re-armed only on a version
+    /// advance (never pushed by an idle re-run of `advance` at the same version).
+    #[test]
+    fn advance_arms_on_change_due_with_subscriber_version_latched() {
+        let mut e = Editor::new_from_text("hello", None, (80, 24));
+        e.has_on_change_subscriber = true;
+        e.active_mut().reconcile.maybe_stale = true;
+        let clk = TestClock(1_000);
+        crate::app::advance(&mut e, &clk);
+        assert_eq!(e.on_change_due, Some(1_000 + crate::reconcile::RECONCILE_DEBOUNCE_MS),
+            "subscribed ⇒ on_change_due arms alongside the reconcile debounce");
+
+        // Idle re-run of advance at the same version and same maybe_stale must NOT push the
+        // deadline forward (armed_for_version already matches document.version).
+        let clk2 = TestClock(1_050);
+        crate::app::advance(&mut e, &clk2);
+        assert_eq!(e.on_change_due, Some(1_000 + crate::reconcile::RECONCILE_DEBOUNCE_MS),
+            "an idle re-arm attempt at the same version must not push on_change_due forward");
     }
 
     // -----------------------------------------------------------------------

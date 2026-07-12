@@ -514,6 +514,115 @@ fn insert_date_lua_e2e_success_demo() {
 }
 
 // ---------------------------------------------------------------------------
+// P3 Task 4: on_change — the debounced content-settled event
+// ---------------------------------------------------------------------------
+
+/// The debounced-after-settle acceptance: a real edit arms `on_change_due`; a `Tick` BEFORE
+/// the debounce elapses fires nothing; a `Tick` AFTER it → the `Change` hook runs exactly once
+/// and `on_change_due` is cleared.
+#[test]
+fn on_change_fires_debounced_after_settle() {
+    let src = "changes = 0\nwc.on('change', function(ev) changes = changes + 1 end)";
+    let mut h = Harness::new_with_plugin("hello", &[("watcher", src)]);
+    assert!(h.editor.borrow().has_on_change_subscriber, "attach_bridge must set the subscriber flag");
+
+    h.type_str("!"); // a real edit — advance() arms on_change_due alongside the reconcile debounce
+    let due = h.editor.borrow().on_change_due;
+    assert!(due.is_some(), "an edit with a subscriber must arm on_change_due");
+
+    // A Tick BEFORE the debounce elapses must fire nothing.
+    h.advance_ms(crate::reconcile::RECONCILE_DEBOUNCE_MS - 1);
+    h.tick();
+    let changes_before: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("changes").unwrap();
+    assert_eq!(changes_before, 0, "a Tick before the debounce elapses must not fire on_change");
+    assert_eq!(h.editor.borrow().on_change_due, due, "on_change_due must not move on a too-early Tick");
+
+    // A Tick AFTER the debounce elapses fires exactly once and clears on_change_due.
+    h.advance_ms(2);
+    h.tick();
+    let changes_after: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("changes").unwrap();
+    assert_eq!(changes_after, 1, "the Change hook must run exactly once after settle");
+    assert_eq!(h.editor.borrow().on_change_due, None, "on_change_due must be cleared after firing");
+}
+
+/// THE hot-path invariant: on_change is NOT a per-keystroke hook. Three rapid edits within the
+/// debounce window must coalesce into a single armed deadline (each edit re-extends the SAME
+/// debounce, never stacking a second pending fire); after the burst settles, exactly ONE
+/// on_change fires — not three.
+#[test]
+fn on_change_is_not_per_keystroke() {
+    let src = "changes = 0\nwc.on('change', function(ev) changes = changes + 1 end)";
+    let mut h = Harness::new_with_plugin("", &[("watcher", src)]);
+
+    // Three rapid edits, no elapsed wall-clock time between them (the burst).
+    h.type_str("a");
+    h.type_str("b");
+    h.type_str("c");
+    let changes_mid_burst: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("changes").unwrap();
+    assert_eq!(changes_mid_burst, 0, "on_change must never fire mid-burst — only a Tick can fire it");
+    assert!(h.editor.borrow().on_change_due.is_some(), "the burst must leave a single armed deadline");
+
+    // Settle: advance past the debounce and tick — exactly one fire.
+    h.advance_ms(crate::reconcile::RECONCILE_DEBOUNCE_MS + 1);
+    h.tick();
+    let changes_after: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("changes").unwrap();
+    assert_eq!(changes_after, 1, "a 3-edit burst must fire on_change exactly ONCE, not three times");
+    assert_eq!(h.doc_text(), "abc", "the burst's edits must all have landed");
+}
+
+/// The zero-cost half of the invariant: a plugin loaded WITHOUT a change hook must never arm
+/// on_change_due, even across real edits — the same "loaded ≠ background work" guardrail
+/// family as `plugin_loaded_idle_drives_zero_callback_invocations_and_stable_wake`, extended to
+/// prove the no-subscriber case costs nothing on the EDIT path too (not just idle).
+#[test]
+fn on_change_costs_nothing_without_a_subscriber() {
+    let src = "calls = 0\nwc.register_command{ name='cmd', label='Counter', fn=function() calls = calls + 1 end }";
+    let mut h = Harness::new_with_plugin("hello", &[("nochange", src)]);
+    assert!(!h.editor.borrow().has_on_change_subscriber, "no change hook ⇒ no subscriber");
+
+    h.type_str("!");
+    assert_eq!(h.editor.borrow().on_change_due, None, "an unsubscribed edit must never arm on_change_due");
+    // The reconcile debounce itself still arms (real edit, real staleness) — only the on_change
+    // row is gated on the subscriber, proving the gate is on has_on_change_subscriber specifically.
+    assert!(h.editor.borrow().active().reconcile.due_at.is_some(),
+        "precondition: the reconcile debounce itself DID arm — else this test is vacuous");
+
+    h.advance_ms(crate::reconcile::RECONCILE_DEBOUNCE_MS + 1);
+    h.tick();
+    assert_eq!(h.editor.borrow().on_change_due, None, "still None after settle — nothing was ever armed");
+}
+
+/// P3 Task 8 gap-fill: spec §8's loaded-but-idle guardrail, extended to on_change specifically.
+/// Distinguishes "subscribed" from "armed" — `has_on_change_subscriber == true` is not itself a
+/// deadline; only `advance`'s arm-on-real-edit block (§6) ever sets `on_change_due`. A plugin that
+/// subscribes to `change` but is never edited must drive ZERO hook invocations across idle Ticks
+/// and leave `next_wake` at `None` throughout — the on_change counterpart to
+/// `plugin_loaded_idle_drives_zero_callback_invocations_and_stable_wake` (which covers on_save).
+#[test]
+fn on_change_subscriber_idle_drives_zero_invocations_and_stable_wake() {
+    let src = "changes = 0\nwc.on('change', function(ev) changes = changes + 1 end)";
+    let mut h = Harness::new_with_plugin("hello\n", &[("watcher", src)]);
+    assert!(h.editor.borrow().has_on_change_subscriber, "attach_bridge must set the subscriber flag");
+    assert_eq!(h.editor.borrow().on_change_due, None, "precondition: no edit yet, nothing armed");
+
+    let wake_before = crate::timers::next_wake(&h.editor.borrow(), h.now);
+    assert!(wake_before.is_none(), "precondition: subscribing alone arms no deadline: {wake_before:?}");
+
+    for _ in 0..10 {
+        h.advance_ms(1000); // real elapsed wall-clock time between idle ticks, no edits
+        h.tick();
+    }
+
+    let changes: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("changes").unwrap();
+    assert_eq!(changes, 0, "idle Msg::Tick must never fire on_change absent a real edit");
+    assert_eq!(h.editor.borrow().on_change_due, None, "on_change_due stays unarmed without an edit");
+    let wake_after = crate::timers::next_wake(&h.editor.borrow(), h.now);
+    assert_eq!(wake_before, wake_after,
+        "an on_change subscriber with no edit must leave next_wake unchanged (None) across idle Ticks");
+    assert_eq!(h.doc_text(), "hello\n", "idle ticks must not mutate the document");
+}
+
+// ---------------------------------------------------------------------------
 // P2 Task 6: the event system — hooks firing at the three real fire sites
 // ---------------------------------------------------------------------------
 
@@ -684,6 +793,164 @@ fn wc_command_menu_open_is_hydrated() {
     let m = e.menu.as_ref().expect("wc.command('menu') must have opened the menu overlay");
     assert!(m.built, "the post-pump hydrate_overlays call must have built the menu (built=false)");
     assert!(m.groups.iter().any(|g| !g.1.is_empty()), "the built menu must actually contain command rows");
+}
+
+// ---------------------------------------------------------------------------
+// P3 Task 7: pomodoro.lua — the clock-driven demo (the driver that de-speculates
+// the whole timer slice, mirroring insert_date_lua_e2e_success_demo/
+// wordcount_lua_e2e_success_demo's "load like production" discipline).
+// ---------------------------------------------------------------------------
+
+/// An ADVANCEABLE test clock: a shared `Rc<Cell<u64>>` so the bridge's `Rc<dyn Clock>` (which
+/// `wc.timer` reads at ARM time — see `install_timer`) and every `reduce`/`pump` call (which
+/// take a `&dyn Clock` directly) observe the SAME wall clock. Mirrors `plugin::pump::tests`'
+/// `SharedClock` — a fixed-value `TestClock` cannot express "arm at t, advance, fire", and a
+/// FRESH `TestClock` per call would leave the bridge's own (frozen-at-construction) clock
+/// stale, so a later re-arm would compute its due time against the WRONG "now" and self-fire
+/// on the very next pump — the bug this clock avoids.
+#[derive(Clone)]
+struct SharedClock(Rc<std::cell::Cell<u64>>);
+impl SharedClock {
+    fn new(ms: u64) -> Self { SharedClock(Rc::new(std::cell::Cell::new(ms))) }
+    fn set(&self, ms: u64) { self.0.set(ms); }
+}
+impl wordcartel_core::history::Clock for SharedClock {
+    fn now_ms(&self) -> u64 { self.0.get() }
+}
+
+/// The `pomodoro.lua` success-criterion demo (spec §11): the committed fixture, loaded
+/// exactly as `load_phase` (the SAME fn startup AND reload call) would read it off disk,
+/// with a real `[plugins.config.pomodoro]` section. Drives the whole timer subsystem
+/// end-to-end against a CONTROLLABLE, SHARED clock (see [`SharedClock`]) — no wall-clock
+/// sleep:
+///
+/// 1. `pomodoro.start` dispatched with arg `""` (Task 5's already-supplied-arg path, no
+///    minibuffer) arms exactly one `PluginTimer` at `now + 25·60·1000` — the configured
+///    default, proving `wc.config` reached the plugin.
+/// 2. The clock is advanced PAST the deadline and `reduce(Msg::Tick)` + `pump` run with
+///    NO input between (mirrors the run loop waking on `next_wake`, nothing else moving)
+///    — the one-shot fires DURING inactivity, `wc.status` reports completion (the
+///    observer-tier callback's only allowed surface), the timer is removed, and
+///    `next_wake` returns to `None`.
+/// 3. Re-armed, `pomodoro.cancel` disarms it directly (no wall-clock wait needed).
+/// 4. Re-armed again, `plugins_reload` (`perform_reload`) auto-disarms the whole
+///    schedule — the dead VM's timer cannot survive its own teardown.
+#[test]
+fn pomodoro_lua_e2e_success_demo() {
+    use crate::registry::Ctx;
+    use crate::commands::CommandResult;
+
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/plugins/pomodoro.lua");
+    let src = std::fs::read_to_string(&fixture)
+        .unwrap_or_else(|e| panic!("fixture must be readable at {}: {e}", fixture.display()));
+
+    let plugdir = tempfile::tempdir().unwrap();
+    std::fs::write(plugdir.path().join("pomodoro.lua"), &src).unwrap();
+    let cfgdir = tempfile::tempdir().unwrap();
+    let cfg_path = cfgdir.path().join("config.toml");
+    std::fs::write(&cfg_path, format!(
+        "[plugins]\ndir = {:?}\n\n[plugins.config.pomodoro]\nminutes = 25\n",
+        plugdir.path().to_str().unwrap())).unwrap();
+
+    let mut reg = crate::registry::Registry::builtins();
+    let mut host = crate::plugin::host::PluginHost::new().expect("VM construction");
+    let (cfg, cfg_warns) = crate::config::load(std::slice::from_ref(&cfg_path));
+    assert!(cfg_warns.is_empty(), "config must parse cleanly: {cfg_warns:?}");
+    let mut load_warns = Vec::new();
+    let inv = crate::plugin::reload::load_phase(&mut reg, &mut host, &cfg.plugins, None, &mut load_warns);
+    assert!(load_warns.is_empty(), "the demo plugin must load cleanly: {load_warns:?}");
+    assert_eq!(inv.len(), 1, "exactly one discovered plugin");
+    assert!(inv[0].error.is_none(), "pomodoro.lua must load with no error: {:?}", inv[0].error);
+    assert_eq!(inv[0].commands, 2, "pomodoro.lua registers exactly two commands: start + cancel");
+
+    let editor = Rc::new(RefCell::new(Editor::new_from_text("notes\n", None, (80, 24))));
+    let (tx, _rx) = mpsc::channel::<Msg>();
+    let clock = SharedClock::new(0);
+    host.attach_bridge(editor.clone(), tx.clone(),
+        Rc::new(clock.clone()) as Rc<dyn wordcartel_core::history::Clock>)
+        .expect("bridge attaches on a live VM");
+    let ex = InlineExecutor::default();
+    let (keymap, keymap_warns) = keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+    assert!(keymap_warns.is_empty(), "the plugin-loaded registry must resolve cleanly: {keymap_warns:?}");
+
+    let start_id = reg.resolve_name("pomodoro.start").expect("start command registered");
+    let cancel_id = reg.resolve_name("pomodoro.cancel").expect("cancel command registered");
+
+    // 1) Dispatch pomodoro.start with arg "" (blank ⇒ the configured/default minutes) — the
+    // already-supplied-arg path, so no minibuffer opens (Task 5 case 2).
+    {
+        let mut e = editor.borrow_mut();
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        let r = reg.dispatch_with_arg(start_id, &mut ctx, Some(String::new()));
+        assert_eq!(r, CommandResult::Handled);
+        assert!(e.minibuffer.is_none(), "an already-supplied arg must never open the prompt");
+    }
+    host.pump(&editor, &reg, &ex, &clock, &tx); // runs the Lua callback: arms wc.timer, sets status
+
+    let deadline = 25 * 60 * 1000u64;
+    assert_eq!(editor.borrow().pending_plugin_timers.len(), 1, "start arms exactly one timer");
+    assert_eq!(editor.borrow().status, "Pomodoro: 25 min session started");
+    assert_eq!(crate::timers::next_wake(&editor.borrow(), 0), Some(deadline),
+        "next_wake reflects the armed timer's due (armed at t=0, +25·60·1000ms)");
+
+    // 2) Advance the clock PAST the deadline; fire during inactivity — reduce(Tick) + pump,
+    // no input in between (mirrors the run loop waking on next_wake alone).
+    let fire_at = deadline + 1;
+    clock.set(fire_at);
+    let keep = reduce(Msg::Tick, &mut editor.borrow_mut(), &reg, &keymap, &ex, &clock, &tx);
+    assert!(keep, "Msg::Tick must not itself request quit");
+    host.pump(&editor, &reg, &ex, &clock, &tx);
+
+    assert_eq!(editor.borrow().status, "Pomodoro: 25 min session complete",
+        "the observer-tier callback ran DURING inactivity");
+    assert!(editor.borrow().pending_plugin_timers.is_empty(), "a one-shot is removed after firing");
+    assert_eq!(crate::timers::next_wake(&editor.borrow(), fire_at), None,
+        "nothing armed after the one-shot fires");
+
+    // 3) Re-arm, then cancel directly — no wall-clock wait needed. The re-arm's due
+    // (fire_at + deadline) is computed against the SAME live clock, so it does NOT
+    // self-fire on the cancel dispatch's pump (unlike a stale/frozen bridge clock would).
+    {
+        let mut e = editor.borrow_mut();
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        reg.dispatch_with_arg(start_id, &mut ctx, Some(String::new()));
+    }
+    host.pump(&editor, &reg, &ex, &clock, &tx);
+    assert_eq!(editor.borrow().pending_plugin_timers.len(), 1, "re-armed before cancel");
+    assert_eq!(crate::timers::next_wake(&editor.borrow(), fire_at), Some(fire_at + deadline));
+
+    {
+        let mut e = editor.borrow_mut();
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        reg.dispatch_with_arg(cancel_id, &mut ctx, None);
+    }
+    host.pump(&editor, &reg, &ex, &clock, &tx);
+    assert!(editor.borrow().pending_plugin_timers.is_empty(), "wc.timer_cancel disarms the session");
+    assert_eq!(editor.borrow().status, "Pomodoro: cancelled");
+    assert_eq!(crate::timers::next_wake(&editor.borrow(), fire_at), None);
+
+    // 4) Re-arm again, then plugins_reload — the dead VM's timer schedule must not survive
+    // its own teardown (P3 §3g auto-disarm).
+    {
+        let mut e = editor.borrow_mut();
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        reg.dispatch_with_arg(start_id, &mut ctx, Some(String::new()));
+    }
+    host.pump(&editor, &reg, &ex, &clock, &tx);
+    assert_eq!(editor.borrow().pending_plugin_timers.len(), 1, "re-armed before reload");
+
+    editor.borrow_mut().plugins_reload_requested = true;
+    crate::plugin::reload::perform_reload(
+        &mut host, &mut reg, &editor, std::slice::from_ref(&cfg_path), None, false, &tx);
+
+    assert!(host.has_vm(), "the reload must produce a live VM");
+    assert!(editor.borrow().pending_plugin_timers.is_empty(),
+        "plugins_reload auto-disarms the whole timer schedule (P3 §3g)");
+    assert!(!editor.borrow().has_on_change_subscriber,
+        "the dead VM's on_change subscription must not survive reload either");
+    assert_eq!(crate::timers::next_wake(&editor.borrow(), fire_at), None,
+        "next_wake must be None — nothing armed after auto-disarm");
 }
 
 /// `true` iff `s` is exactly 10 bytes shaped `\d{4}-\d{2}-\d{2}` — a dependency-free ISO-date

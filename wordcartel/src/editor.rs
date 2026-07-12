@@ -404,6 +404,17 @@ pub struct Editor {
     /// Default-empty; capped at [`crate::limits::PLUGIN_MAX_PENDING_DISPATCH`] at the
     /// `wc.command` call site.
     pub pending_plugin_dispatch: std::collections::VecDeque<crate::plugin::PluginDispatch>,
+    /// Armed plugin timers (P3 §3). Lives on Editor (not the host) so `timers::next_wake(&Editor,_)`
+    /// sees the next-due. Auto-disarmed by `clear_plugin_wake_state`. Bounded by
+    /// PLUGIN_MAX_TIMERS_PER_PLUGIN/plugin.
+    pub pending_plugin_timers: Vec<crate::plugin::PluginTimer>,
+    /// Monotonic handle allocator for wc.timer (never reused, even across reload).
+    pub next_timer_handle: u64,
+    /// on_change debounce deadline (P3 §6) — armed beside the reconcile debounce, self-clears on fire.
+    pub on_change_due: Option<u64>,
+    /// True iff some loaded plugin registered a `wc.on("change", …)` hook. Gates on_change's wake so it
+    /// costs zero when unused. Recomputed at bridge-attach; cleared on teardown.
+    pub has_on_change_subscriber: bool,
     /// The last plugin-load outcome (startup or reload), one record per discovered plugin —
     /// what `plugin_list` reports. Populated by `plugin::reload::load_phase`; default-empty
     /// (no plugins loaded / null host). Bounded by the discover/load caps (P2 §6).
@@ -561,6 +572,10 @@ impl Editor {
             pending_plugin_calls: std::collections::VecDeque::new(),
             pending_plugin_events: std::collections::VecDeque::new(),
             pending_plugin_dispatch: std::collections::VecDeque::new(),
+            pending_plugin_timers: Vec::new(),
+            next_timer_handle: 0,
+            on_change_due: None,
+            has_on_change_subscriber: false,
             plugin_inventory: Vec::new(),
             parse_degraded: false, quit: false,
             prompt: None, pending_after_save: None, pending_save_as: None, pending_save_overwrite: None,
@@ -976,6 +991,16 @@ impl Editor {
         if crate::diagnostics_run::should_run_diagnostics(self) {
             self.active_mut().diagnostics.arm(now_ms, 0);
         }
+    }
+
+    /// Reset BOTH new P3 wake subsystems to their no-plugins baseline (P3 §3g, Codex Critical 2):
+    /// the timer schedule AND the on_change subscription. Called from every teardown path
+    /// (`perform_reload`, the null-host pump branch) so a dead subsystem never keeps waking the loop.
+    /// The P2 queues (pending_plugin_calls/events/dispatch) are cleared separately by those sites.
+    pub fn clear_plugin_wake_state(&mut self) {
+        self.pending_plugin_timers.clear();
+        self.has_on_change_subscriber = false;
+        self.on_change_due = None;
     }
 }
 
@@ -1730,5 +1755,40 @@ mod tests {
         e.open_prompt(crate::prompt::Prompt::swap_recovery());
         assert!(e.splash.is_none(), "opening a prompt clears the splash");
         assert!(e.prompt.is_some(), "the prompt itself is set");
+    }
+
+    // ------------------------------------------------------------------
+    // P3 Task 1: timer + on_change wake-state scaffolding
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn new_editor_has_no_plugin_wake_state() {
+        let e = Editor::new_from_text("x\n", None, (40, 8));
+        assert!(e.pending_plugin_timers.is_empty());
+        assert_eq!(e.next_timer_handle, 0);
+        assert_eq!(e.on_change_due, None);
+        assert!(!e.has_on_change_subscriber);
+    }
+
+    #[test]
+    fn clear_plugin_wake_state_resets_all_three_fields() {
+        let mut e = Editor::new_from_text("x\n", None, (40, 8));
+        e.pending_plugin_timers.push(crate::plugin::PluginTimer {
+            handle: 1,
+            origin: "demo".into(),
+            key: "wc-timer-1".into(),
+            next_due_ms: 1000,
+            interval_ms: 1000,
+            repeat: true,
+            pending: false,
+        });
+        e.has_on_change_subscriber = true;
+        e.on_change_due = Some(500);
+
+        e.clear_plugin_wake_state();
+
+        assert!(e.pending_plugin_timers.is_empty());
+        assert!(!e.has_on_change_subscriber);
+        assert_eq!(e.on_change_due, None);
     }
 }

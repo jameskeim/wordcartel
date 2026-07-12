@@ -28,6 +28,7 @@ pub struct PendingReg {
     pub label: String,       // raw, cap-checked
     pub menu: Option<MenuCategory>,
     pub func: mlua::Function, // stored under wc-cmd-<id> only on commit
+    pub arg: Option<String>, // raw arg-prompt, cap-checked; interned only at commit (Task 5)
 }
 
 #[cfg(test)]
@@ -167,6 +168,11 @@ impl PluginHost {
         clock: Rc<dyn Clock>,
     ) -> mlua::Result<()> {
         let Some(lua) = self.lua.as_ref() else { return Ok(()) };
+        // P3 §3g: recompute BEFORE `editor` moves into the `Bridge` — the host's `hooks` are
+        // already committed by this point (load_phase/load_sources runs before attach_bridge on
+        // both the cold-start and reload paths), so this reflects the real subscriber set.
+        editor.borrow_mut().has_on_change_subscriber =
+            self.hooks.iter().any(|h| h.kind == crate::plugin::PluginEventKind::Change);
         let invoke_state = Rc::new(RefCell::new(InvokeState { current: None, observer: false }));
         let bridge = Bridge { editor, msg_tx, clock, invoke_state };
         crate::plugin::api::install_editor_api(lua, &bridge)?;
@@ -254,7 +260,7 @@ mod tests {
         let editor = Rc::new(RefCell::new(Editor::new_from_text(text, None, (40, 10))));
         let (tx, clock) = test_bridge_parts();
         host.attach_bridge(editor.clone(), tx, clock).expect("bridge attaches on a live VM");
-        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id });
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id, arg: None });
         (host, editor, id)
     }
 
@@ -417,7 +423,7 @@ mod tests {
                 .expect("create_function");
             lua.set_named_registry_value(&format!("wc-cmd-{}", panic_id.0), f).expect("store callback");
         }
-        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: panic_id });
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: panic_id, arg: None });
         host.pump_test(&editor);
         let status = editor.borrow().status.clone();
         assert!(status.contains("callback panic"), "status: {status}");
@@ -430,7 +436,7 @@ mod tests {
         let reports = load_sources(&mut reg, &mut host, &sources(&[("u", src)]), &BTreeMap::new(), &mut Vec::new());
         assert_eq!(reports[0].result, Ok(1));
         let good_id = reg.resolve_name("u.good").expect("registered");
-        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: good_id });
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: good_id, arg: None });
         host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "Gx");
     }
@@ -527,7 +533,7 @@ mod tests {
         )));
         let (tx, clock) = test_bridge_parts();
         host.attach_bridge(editor.clone(), tx, clock).expect("bridge attaches on a live VM");
-        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id });
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id, arg: None });
 
         host.pump_test(&editor);
         let status = editor.borrow().status.clone();
@@ -552,7 +558,7 @@ mod tests {
         let editor = Rc::new(RefCell::new(Editor::new_from_text("x", None, (40, 10))));
         let (tx, clock) = test_bridge_parts();
         host.attach_bridge(editor.clone(), tx, clock).expect("bridge attaches on a live VM");
-        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id });
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id, arg: None });
 
         host.pump_test(&editor);
         let status = editor.borrow().status.clone();
@@ -610,7 +616,7 @@ mod tests {
             let doc_bytes = doc.len();
             let text_bytes = text.len();
 
-            editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: rep_id });
+            editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: rep_id, arg: None });
             host.pump_test(&editor); // wc.replace's outcome — Ok or a typed error, never a raw panic
             let status_after_replace = editor.borrow().status.clone();
             prop_assert!(!status_after_replace.to_lowercase().contains("panic"),
@@ -619,7 +625,7 @@ mod tests {
             prop_assert!(after_replace_len <= doc_bytes + text_bytes,
                 "buffer grew past the one-insert upper bound: {after_replace_len} > {doc_bytes}+{text_bytes}");
 
-            editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: rd_id });
+            editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: rd_id, arg: None });
             host.pump_test(&editor); // wc.text's outcome — Ok or a typed error, never a raw panic
             let status_after_text = editor.borrow().status.clone();
             prop_assert!(!status_after_text.to_lowercase().contains("panic"),
@@ -660,6 +666,23 @@ mod tests {
         let err = reports[0].result.as_ref().expect_err("the 65th wc.on must fail the plugin's exec");
         assert!(err.to_lowercase().contains("too many hooks"), "error: {err}");
         assert_eq!(reports[0].hooks, 0, "nothing committed once exec itself failed");
+    }
+
+    /// P3 §3g: `attach_bridge` recomputes `has_on_change_subscriber` off the host's committed
+    /// hooks — true when at least one `wc.on('change', …)` is registered, false otherwise
+    /// (mirrors `make_hooked`'s "load then attach" ordering that `attach_bridge` relies on).
+    #[test]
+    fn attach_bridge_sets_on_change_subscriber() {
+        let (_host, editor, _reg, reports) =
+            make_hooked("wc.on('change', function(ev) end)", "x");
+        assert_eq!(reports[0].hooks, 1);
+        assert!(editor.borrow().has_on_change_subscriber, "a change hook must set the subscriber flag");
+
+        let (_host2, editor2, _reg2, reports2) =
+            make_hooked("wc.on('save', function(ev) end)", "x");
+        assert_eq!(reports2[0].hooks, 1);
+        assert!(!editor2.borrow().has_on_change_subscriber,
+            "a plugin with only a save hook must NOT set the on_change subscriber flag");
     }
 
     #[test]
@@ -741,9 +764,9 @@ mod tests {
         let editor = Rc::new(RefCell::new(Editor::new_from_text("x", None, (40, 10))));
         editor.borrow_mut().pending_plugin_events.push_back(
             crate::plugin::PluginEvent { kind: crate::plugin::PluginEventKind::Save, path: Some("/x".into()) });
-        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: CommandId(crate::plugin::intern("null-host-test.cmd")) });
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: CommandId(crate::plugin::intern("null-host-test.cmd")), arg: None });
         editor.borrow_mut().pending_plugin_dispatch.push_back(
-            crate::plugin::PluginDispatch { origin: "x".to_string(), name: "select_all".to_string() });
+            crate::plugin::PluginDispatch { origin: "x".to_string(), name: "select_all".to_string(), arg: None });
         host.pump_test(&editor);
         assert!(editor.borrow().pending_plugin_events.is_empty(), "the null host must clear pending_plugin_events");
         assert!(editor.borrow().pending_plugin_calls.is_empty(), "the null host must clear pending_plugin_calls too");
@@ -762,7 +785,7 @@ mod tests {
         assert_eq!(reports[0].result, Ok(1), "the OUTER command registration, at load time, still works");
         assert_eq!(reports[0].hooks, 0, "no hook was registered at LOAD time by this plugin");
         let id = reg.resolve_name("t.cmd").expect("registered under t.cmd");
-        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id });
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id, arg: None });
         host.pump_test(&editor);
         let status = editor.borrow().status.clone();
         assert!(status.contains("wc.on"), "status: {status}");
@@ -857,7 +880,7 @@ mod tests {
         // succeed, proving observer mode did not leak past either the clean-error hook or the
         // panicking one.
         let good_id = reg.resolve_name("t.good").expect("registered");
-        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: good_id });
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: good_id, arg: None });
         host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "Ghello",
             "a normal command's wc.insert must still work after an observer-mode hook (incl. a panicking one)");
@@ -884,7 +907,7 @@ mod tests {
         let editor = Rc::new(RefCell::new(Editor::new_from_text("hello", None, (40, 10))));
         let (tx, clock_rc) = test_bridge_parts();
         host.attach_bridge(editor.clone(), tx.clone(), clock_rc).expect("bridge attaches on a live VM");
-        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id });
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id, arg: None });
 
         let ex = crate::jobs::InlineExecutor::default();
         let clock = TestClock::new(0);
@@ -912,7 +935,7 @@ mod tests {
         let editor = Rc::new(RefCell::new(Editor::new_from_text("hi", None, (40, 10))));
         let (tx, clock_rc) = test_bridge_parts();
         host.attach_bridge(editor.clone(), tx.clone(), clock_rc).expect("bridge attaches on a live VM");
-        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: a_id });
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: a_id, arg: None });
 
         let ex = crate::jobs::InlineExecutor::default();
         let clock = TestClock::new(0);
@@ -920,6 +943,108 @@ mod tests {
 
         assert_eq!(whole_text(&editor), "Xhi",
             "one pump cycle must re-drain the enqueued dispatch through to b.cmd's wc.insert");
+    }
+
+    // ── Task 5: parameterized commands — dispatch_with_arg cases 2/3 end-to-end ────────────
+
+    /// `wc.command('b.echo', 'hi')` on a parameterized `b.echo` (`arg = 'Value:'`) — the pump's
+    /// `drain_one_dispatch` threads the supplied arg through `dispatch_with_arg`, which enqueues
+    /// the `PluginCall` DIRECTLY (case 2): NO minibuffer opens, and the callback's `arg`
+    /// parameter receives "hi" in the SAME pump cycle.
+    #[test]
+    fn wc_command_with_arg_reaches_callback_no_reprompt() {
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().expect("VM construction");
+        let src_a = "wc.register_command{ name='cmd', label='A', fn=function() wc.command('b.echo', 'hi') end }";
+        let src_b = "wc.register_command{ name='echo', label='B', arg='Value:', fn=function(arg) wc.insert(arg) end }";
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("a", src_a), ("b", src_b)]), &BTreeMap::new(), &mut Vec::new());
+        assert_eq!(reports[0].result, Ok(1));
+        assert_eq!(reports[1].result, Ok(1));
+        let a_id = reg.resolve_name("a.cmd").expect("registered under a.cmd");
+
+        let editor = Rc::new(RefCell::new(Editor::new_from_text("X", None, (40, 10))));
+        let (tx, clock_rc) = test_bridge_parts();
+        host.attach_bridge(editor.clone(), tx.clone(), clock_rc).expect("bridge attaches on a live VM");
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: a_id, arg: None });
+
+        let ex = crate::jobs::InlineExecutor::default();
+        let clock = TestClock::new(0);
+        host.pump(&editor, &reg, &ex, &clock, &tx);
+
+        assert!(editor.borrow().minibuffer.is_none(), "a directly-supplied arg must never open the prompt");
+        assert_eq!(whole_text(&editor), "hiX",
+            "the callback's arg parameter must receive the supplied \"hi\" — no re-prompt round trip");
+    }
+
+    /// A palette-style dispatch of a parameterized command (`reg.dispatch`, no arg supplied)
+    /// opens the `PluginArg` prompt; answering it (simulated via `minibuffer::intercept`'s real
+    /// Enter path) enqueues `PluginCall { id, arg: Some("25") }`, and one `pump` call runs the
+    /// callback with that arg — case 3 followed by case 2 completing.
+    #[test]
+    fn param_command_callback_receives_arg() {
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().expect("VM construction");
+        let src = "wc.register_command{ name='echo', label='Echo', arg='Minutes:', fn=function(arg) wc.insert(arg) end }";
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("t", src)]), &BTreeMap::new(), &mut Vec::new());
+        assert_eq!(reports[0].result, Ok(1));
+        let id = reg.resolve_name("t.echo").expect("registered under t.echo");
+
+        let editor = Rc::new(RefCell::new(Editor::new_from_text("hi", None, (40, 10))));
+        let (tx, clock_rc) = test_bridge_parts();
+        host.attach_bridge(editor.clone(), tx.clone(), clock_rc).expect("bridge attaches on a live VM");
+
+        let ex = crate::jobs::InlineExecutor::default();
+        let clock = TestClock::new(0);
+
+        // Palette-style dispatch, no arg in hand — case 3: opens the PluginArg prompt.
+        {
+            let mut e = editor.borrow_mut();
+            let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+            let r = reg.dispatch(id, &mut ctx);
+            assert_eq!(r, crate::commands::CommandResult::Handled);
+        }
+        assert!(editor.borrow().pending_plugin_calls.is_empty(), "nothing enqueued until the prompt is answered");
+        assert!(matches!(editor.borrow().minibuffer.as_ref().map(|m| &m.kind),
+            Some(crate::minibuffer::MinibufferKind::PluginArg { id: pid }) if *pid == id));
+
+        // Answer the prompt: type "25", then Enter through the real submit path.
+        editor.borrow_mut().minibuffer.as_mut().unwrap().insert('2');
+        editor.borrow_mut().minibuffer.as_mut().unwrap().insert('5');
+        let enter = crossterm::event::KeyEvent {
+            code: crossterm::event::KeyCode::Enter,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+            kind: crossterm::event::KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        };
+        let msg = crate::app::Msg::Input(crossterm::event::Event::Key(enter));
+        {
+            let mut e = editor.borrow_mut();
+            crate::minibuffer::intercept(msg, &mut e, &ex, &clock, &tx);
+        }
+        assert!(editor.borrow().minibuffer.is_none());
+        assert_eq!(editor.borrow().pending_plugin_calls.len(), 1);
+
+        host.pump(&editor, &reg, &ex, &clock, &tx);
+        assert_eq!(whole_text(&editor), "25hi", "the callback must receive the collected \"25\" arg");
+    }
+
+    /// An arg over `PLUGIN_MAX_COMMAND_ARG` passed to `wc.command(name, arg)` is rejected as a
+    /// typed `pcall`-able error, with nothing enqueued (mirrors
+    /// `wc_command_over_length_and_full_queue_reject`'s over-length-name check).
+    #[test]
+    fn wc_command_arg_over_cap_is_rejected() {
+        let over_cap = crate::limits::PLUGIN_MAX_COMMAND_ARG + 1;
+        let (mut host, editor, _id) = make(
+            &format!(
+                "local ok, err = pcall(wc.command, 'select_all', string.rep('a', {over_cap}))\n\
+                 _G.ok = ok"
+            ),
+            "x",
+        );
+        host.pump_test(&editor);
+        assert!(editor.borrow().pending_plugin_dispatch.is_empty(), "an over-cap arg must not be enqueued");
+        let ok: bool = host.lua().unwrap().globals().get("ok").unwrap();
+        assert!(!ok, "wc.command with an over-cap arg must be rejected");
     }
 
     /// `wc.command("nope")` (an unresolvable name) degrades to a `plugin_error` status naming
@@ -936,7 +1061,7 @@ mod tests {
         let editor = Rc::new(RefCell::new(Editor::new_from_text("x", None, (40, 10))));
         let (tx, clock_rc) = test_bridge_parts();
         host.attach_bridge(editor.clone(), tx.clone(), clock_rc).expect("bridge attaches on a live VM");
-        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id });
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id, arg: None });
 
         let ex = crate::jobs::InlineExecutor::default();
         let clock = TestClock::new(0);
@@ -1021,7 +1146,7 @@ mod tests {
         let editor = Rc::new(RefCell::new(Editor::new_from_text("hello", None, (40, 10))));
         let (tx, clock_rc) = test_bridge_parts();
         host.attach_bridge(editor.clone(), tx.clone(), clock_rc).expect("bridge attaches on a live VM");
-        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: a_id });
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: a_id, arg: None });
 
         let ex = crate::jobs::InlineExecutor::default();
         let clock = TestClock::new(0);
@@ -1061,7 +1186,7 @@ mod tests {
         let editor = Rc::new(RefCell::new(Editor::new_from_text("hello", None, (40, 10))));
         let (tx, clock_rc) = test_bridge_parts();
         host.attach_bridge(editor.clone(), tx.clone(), clock_rc).expect("bridge attaches on a live VM");
-        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: a_id });
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: a_id, arg: None });
 
         let ex = crate::jobs::InlineExecutor::default();
         let clock = TestClock::new(0);

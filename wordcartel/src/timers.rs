@@ -134,9 +134,25 @@ fn reconcile_deadline(e: &Editor, _now: u64) -> Option<u64> {
         e.active().reconcile.due_at } else { None }
 }
 
+/// on_change debounce (P3 §6): the content-settled deadline, GATED on a subscriber so it is zero-cost
+/// when no plugin uses on_change (proportional-to-work). Edge-armed by an edit (like reconcile),
+/// self-clearing on fire — stays inside the idle-free law.
+fn on_change_deadline(e: &Editor, _now: u64) -> Option<u64> {
+    if e.has_on_change_subscriber { e.on_change_due } else { None }
+}
+
+/// Plugin-timer deadline (P3 §3): the soonest NON-pending armed timer's next-due. `None` when no timer
+/// is armed (idle-free preserved). A `pending` timer is excluded (its callback is in flight — the
+/// one-pending-per-timer rule; the same in-flight-gate shape as the builtin swap/diag/reconcile rows).
+/// NOTE: a due timer's next-due may be in the past, so this can be < `now`; `run` uses `saturating_sub`
+/// → one immediate wake, then the pump fires + reschedules to a future due (spec §4).
+fn plugin_timer_deadline(e: &Editor, _now: u64) -> Option<u64> {
+    e.pending_plugin_timers.iter().filter(|t| !t.pending).map(|t| t.next_due_ms).min()
+}
+
 /// The timed-subsystem table. Order = the run loop's historical fold order
 /// (documented fire order): swap, save-quit, scrollbar-fade, menu-dwell,
-/// scrollbar-dwell, status-dwell, diagnostics, reconcile.
+/// scrollbar-dwell, status-dwell, diagnostics, reconcile, on_change, plugin_timer.
 pub(crate) static SUBSYSTEMS: &[TimedSubsystem] = &[
     TimedSubsystem { name: "swap",         deadline: swap_deadline },
     TimedSubsystem { name: "save_quit",    deadline: sq_deadline },
@@ -146,6 +162,8 @@ pub(crate) static SUBSYSTEMS: &[TimedSubsystem] = &[
     TimedSubsystem { name: "status_dwell", deadline: status_dwell_deadline },
     TimedSubsystem { name: "diagnostics",  deadline: diag_deadline },
     TimedSubsystem { name: "reconcile",    deadline: reconcile_deadline },
+    TimedSubsystem { name: "on_change",    deadline: on_change_deadline },
+    TimedSubsystem { name: "plugin_timer", deadline: plugin_timer_deadline },
 ];
 
 /// The soonest wall-clock ms any timed subsystem needs the loop to wake — or
@@ -187,6 +205,17 @@ pub(crate) fn on_tick(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock,
     // Dispatch a block-tree reconcile if due.
     if crate::reconcile::reconcile_due(&editor.active().reconcile, now) {
         crate::reconcile::dispatch_reconcile(editor, ex);
+    }
+    // Fire the debounced on_change event if due (P3 §3g) — cold Tick path only, never the hot
+    // edit path; `advance` only ever sets the `Option`, this is the sole place it fires.
+    if editor.has_on_change_subscriber {
+        if let Some(due) = editor.on_change_due {
+            if now >= due {
+                editor.on_change_due = None;
+                let path = editor.active().document.path.clone();
+                crate::plugin::fire_event(editor, crate::plugin::PluginEventKind::Change, path.as_deref());
+            }
+        }
     }
 }
 
@@ -334,5 +363,63 @@ mod tests {
         }
         assert_eq!((swap())(&e, 10_000), None,
             "swap must be None while a write is in flight (§8.1-E — the !swap_in_flight gate)");
+    }
+
+    // -----------------------------------------------------------------------
+    // Effort P3: on_change / plugin_timer idle-free guardrails (Task 2). These
+    // land BEFORE any timer-firing exists (Task 3), so they prove zero-cost-at-rest
+    // against an EMPTY timer set / no subscriber — the load-bearing invariant.
+    // -----------------------------------------------------------------------
+
+    /// A fresh editor with the new P3 fields at baseline (no plugin timer armed,
+    /// no on_change subscriber) must still yield next_wake == None — the two new
+    /// rows must not disturb the pre-existing idle-free result.
+    #[test]
+    fn next_wake_none_with_commands_only_plugin() {
+        let e = Editor::new_from_text("hello\n", None, (80, 24));
+        assert!(e.pending_plugin_timers.is_empty());
+        assert!(!e.has_on_change_subscriber);
+        assert_eq!(e.on_change_due, None);
+        assert_eq!(crate::timers::next_wake(&e, 10_000), None);
+    }
+
+    /// on_change_deadline is gated on has_on_change_subscriber — a due without a
+    /// subscriber must not wake the loop (zero-cost when no plugin uses on_change).
+    #[test]
+    fn on_change_deadline_none_without_subscriber() {
+        let on_change = || crate::timers::SUBSYSTEMS.iter().find(|s| s.name == "on_change").unwrap().deadline;
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.on_change_due = Some(400);
+        assert!(!e.has_on_change_subscriber);
+        assert_eq!((on_change())(&e, 10_000), None, "no subscriber ⇒ None despite an armed due");
+        e.has_on_change_subscriber = true;
+        assert_eq!((on_change())(&e, 10_000), Some(400), "flipping the subscriber flag arms the deadline");
+    }
+
+    /// plugin_timer_deadline reads the min next_due_ms across NON-pending timers only;
+    /// a pending timer (callback in flight) is excluded — the same in-flight-gate shape
+    /// as the builtin swap/diag/reconcile rows.
+    #[test]
+    fn plugin_timer_deadline_reads_min_nonpending() {
+        use crate::plugin::PluginTimer;
+        let plugin_timer = || crate::timers::SUBSYSTEMS.iter().find(|s| s.name == "plugin_timer").unwrap().deadline;
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.pending_plugin_timers.push(PluginTimer {
+            handle: 1, origin: "p".into(), key: "wc-timer-1".into(),
+            next_due_ms: 500, interval_ms: 1_000, repeat: false, pending: false,
+        });
+        e.pending_plugin_timers.push(PluginTimer {
+            handle: 2, origin: "p".into(), key: "wc-timer-2".into(),
+            next_due_ms: 300, interval_ms: 1_000, repeat: false, pending: false,
+        });
+        assert_eq!((plugin_timer())(&e, 10_000), Some(300), "min of two non-pending timers");
+
+        // Mark the 300-due timer pending (in flight) — it must drop out, leaving 500.
+        e.pending_plugin_timers[1].pending = true;
+        assert_eq!((plugin_timer())(&e, 10_000), Some(500), "pending timer excluded from the fold");
+
+        // Mark both pending — no armed (non-pending) timer remains ⇒ None (idle-free).
+        e.pending_plugin_timers[0].pending = true;
+        assert_eq!((plugin_timer())(&e, 10_000), None, "all timers pending ⇒ None (nothing armed)");
     }
 }

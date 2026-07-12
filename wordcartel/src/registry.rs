@@ -35,7 +35,8 @@ pub type Handler = fn(&mut Ctx) -> CommandResult;
 
 /// A registered command's implementation: a built-in fn pointer, or a plugin (enqueue + pump).
 /// `registry.rs` stays Lua-free — the `Plugin` arm carries no Lua-typed value; dispatch only
-/// enqueues a `Copy` [`crate::plugin::PluginCall`], and the pump (Task 5) is what runs Lua.
+/// enqueues a [`crate::plugin::PluginCall`] (owned `arg: Option<String>`, Task 5 — no longer
+/// `Copy`), and the pump is what runs Lua.
 pub enum HandlerKind {
     Builtin(Handler),
     Plugin,
@@ -87,6 +88,10 @@ pub struct CommandMeta {
     /// Optional live-state provider — evaluated at menu-build time against `&Editor`.
     /// `None` for stateless commands (their static label renders unchanged).
     pub state: Option<fn(&crate::editor::Editor) -> MenuMark>,
+    /// `Some(prompt)` for a parameterized plugin command — dispatching it with no arg in hand
+    /// opens a [`crate::minibuffer::MinibufferKind::PluginArg`] with this prompt (Task 5).
+    /// `None` for every builtin (today) and every nullary plugin command.
+    pub arg: Option<&'static str>,
 }
 
 // ── Registry ──────────────────────────────────────────────────────────────────
@@ -107,7 +112,7 @@ impl Registry {
         let cid = CommandId(id);
         self.index.insert(cid, self.entries.len());
         self.entries.push(CommandEntry { id: cid, handler: HandlerKind::Builtin(handler),
-            meta: CommandMeta { label, menu, state: None } });
+            meta: CommandMeta { label, menu, state: None, arg: None } });
     }
 
     fn register_stateful(&mut self, id: &'static str, label: &'static str, menu: Option<MenuCategory>,
@@ -115,20 +120,22 @@ impl Registry {
         let cid = CommandId(id);
         self.index.insert(cid, self.entries.len());
         self.entries.push(CommandEntry { id: cid, handler: HandlerKind::Builtin(handler),
-            meta: CommandMeta { label, menu, state: Some(state) } });
+            meta: CommandMeta { label, menu, state: Some(state), arg: None } });
     }
 
     /// Register a plugin command. Inputs are ALREADY interned `&'static` (the load layer capped
     /// and interned them, Task 4) — so the only failure here is a collision with a builtin or
-    /// an earlier plugin command. Never leaks (interning happened upstream).
-    pub fn register_plugin(&mut self, id: CommandId, label: &'static str, menu: Option<MenuCategory>)
-        -> Result<(), RegisterError> {
+    /// an earlier plugin command. Never leaks (interning happened upstream). `arg` is
+    /// `Some(prompt)` for a parameterized command (Task 5) — `dispatch`/`dispatch_with_arg` opens
+    /// the `PluginArg` minibuffer with this prompt when no arg is already in hand.
+    pub fn register_plugin(&mut self, id: CommandId, label: &'static str, menu: Option<MenuCategory>,
+        arg: Option<&'static str>) -> Result<(), RegisterError> {
         if self.index.contains_key(&id) {
             return Err(RegisterError::Duplicate);
         }
         self.index.insert(id, self.entries.len());
         self.entries.push(CommandEntry { id, handler: HandlerKind::Plugin,
-            meta: CommandMeta { label, menu, state: None } });
+            meta: CommandMeta { label, menu, state: None, arg } });
         Ok(())
     }
 
@@ -140,7 +147,7 @@ impl Registry {
     /// ```
     /// # use wordcartel::registry::{Registry, CommandId};
     /// let mut r = Registry::builtins();
-    /// r.register_plugin(CommandId("demo.hi"), "Hi", None).unwrap();
+    /// r.register_plugin(CommandId("demo.hi"), "Hi", None, None).unwrap();
     /// r.retain_builtins();
     /// assert!(r.resolve_name("demo.hi").is_none());
     /// assert!(r.resolve_name("save").is_some());
@@ -728,22 +735,48 @@ impl Registry {
             let failed = inv.len() - ok;
             let cmds: usize = inv.iter().map(|r| r.commands).sum();
             let hooks: usize = inv.iter().map(|r| r.hooks).sum(); // real hook total (Task 6 wiring)
-            c.editor.status = format!("plugins: {ok} ok ({cmds} cmds, {hooks} hooks), {failed} failed");
+            let timers = c.editor.pending_plugin_timers.len(); // P3: live armed-timer count
+            c.editor.status = format!(
+                "plugins: {ok} ok ({cmds} cmds, {hooks} hooks, {timers} timers), {failed} failed");
             CommandResult::Handled
         });
 
         r
     }
 
-    /// Dispatch by id. Unknown ids surface a status (never a silent no-op, §12.5). A `Plugin`
-    /// entry does not run Lua here — it enqueues a [`crate::plugin::PluginCall`] onto
-    /// `ctx.editor.pending_plugin_calls`; the pump (Task 5) drains it between reduces.
+    /// Dispatch `id` with NO argument supplied — palette/keybinding/menu path (the existing
+    /// callers, unchanged by Task 5). A parameterized plugin command (`meta.arg == Some`) that
+    /// reaches here with no arg opens its prompt.
     pub fn dispatch(&self, id: CommandId, ctx: &mut Ctx) -> CommandResult {
+        self.dispatch_with_arg(id, ctx, None)
+    }
+
+    /// Dispatch `id`, threading an OPTIONAL already-collected argument. `arg == Some` means the
+    /// value is in hand (from `wc.command(name, arg)` or a resolved `PluginArg` prompt) —
+    /// enqueue directly, NEVER re-prompt. Unknown ids surface a status (never a silent no-op,
+    /// §12.5). Covers all four cases:
+    /// 1. Builtin — nullary; any supplied arg is dropped (builtins take no arg today).
+    /// 2. Plugin, arg SUPPLIED (wc.command with arg, or the user already answered the prompt) →
+    ///    enqueue directly, no minibuffer. (Also covers a nullary plugin command that a plugin
+    ///    passed an arg to — the callback simply ignores the extra value.)
+    /// 3. Plugin DECLARES an arg (`meta.arg == Some`) but none supplied (palette/keybinding) →
+    ///    open the `PluginArg` prompt; its submit re-enters via case 2's direct enqueue.
+    /// 4. Nullary plugin command, no arg → enqueue nullary (today's behavior).
+    pub fn dispatch_with_arg(&self, id: CommandId, ctx: &mut Ctx, arg: Option<String>) -> CommandResult {
         match self.index.get(&id) {
             Some(&i) => match &self.entries[i].handler {
-                HandlerKind::Builtin(h) => h(ctx),
+                HandlerKind::Builtin(h) => { let _ = arg; h(ctx) }
                 HandlerKind::Plugin => {
-                    ctx.editor.pending_plugin_calls.push_back(crate::plugin::PluginCall { id });
+                    match (self.entries[i].meta.arg, arg) {
+                        (_, Some(supplied)) => ctx.editor.pending_plugin_calls.push_back(
+                            crate::plugin::PluginCall { id, arg: Some(supplied) }),
+                        (Some(prompt), None) => ctx.editor.minibuffer = Some(crate::minibuffer::Minibuffer {
+                            prompt: prompt.to_string(), text: String::new(), cursor: 0,
+                            kind: crate::minibuffer::MinibufferKind::PluginArg { id },
+                        }),
+                        (None, None) => ctx.editor.pending_plugin_calls.push_back(
+                            crate::plugin::PluginCall { id, arg: None }),
+                    }
                     CommandResult::Handled
                 }
             },
@@ -1016,7 +1049,7 @@ mod tests {
         let mut reg = Registry::builtins();
         let id = CommandId(crate::plugin::intern("register-plugin-test.hello"));
         let label = crate::plugin::intern("Hello Plugin");
-        reg.register_plugin(id, label, None).expect("register_plugin should succeed on a fresh id");
+        reg.register_plugin(id, label, None, None).expect("register_plugin should succeed on a fresh id");
         assert_eq!(reg.resolve_name("register-plugin-test.hello"), Some(id));
         assert_eq!(reg.meta(id).unwrap().label, "Hello Plugin");
         assert!(reg.commands().any(|(cid, _)| cid == id), "must appear in commands()");
@@ -1026,14 +1059,14 @@ mod tests {
     fn register_plugin_rejects_collision() {
         let mut reg = Registry::builtins();
         // Collides with a builtin.
-        let err = reg.register_plugin(CommandId("save"), "Whatever", None).unwrap_err();
+        let err = reg.register_plugin(CommandId("save"), "Whatever", None, None).unwrap_err();
         assert_eq!(err, RegisterError::Duplicate);
 
         // Collides with a prior plugin registration; registry unchanged by the rejected call.
         let id = CommandId(crate::plugin::intern("register-plugin-test.dup"));
-        reg.register_plugin(id, "Once", None).expect("first registration should succeed");
+        reg.register_plugin(id, "Once", None, None).expect("first registration should succeed");
         let count_before = reg.commands().count();
-        let err2 = reg.register_plugin(id, "Twice", None).unwrap_err();
+        let err2 = reg.register_plugin(id, "Twice", None, None).unwrap_err();
         assert_eq!(err2, RegisterError::Duplicate);
         assert_eq!(reg.commands().count(), count_before, "registry unchanged by a rejected collision");
     }
@@ -1042,7 +1075,7 @@ mod tests {
     fn plugin_dispatch_enqueues_not_runs() {
         let mut reg = Registry::builtins();
         let id = CommandId(crate::plugin::intern("register-plugin-test.enqueue"));
-        reg.register_plugin(id, "Enqueue Test", None).expect("register_plugin should succeed");
+        reg.register_plugin(id, "Enqueue Test", None, None).expect("register_plugin should succeed");
 
         let mut e = Editor::new_from_text("hi\n", None, (80, 24));
         let ex = InlineExecutor::default();
@@ -1053,7 +1086,96 @@ mod tests {
 
         assert_eq!(r, CommandResult::Handled);
         assert_eq!(e.pending_plugin_calls.len(), 1, "dispatch enqueues, does not run any Lua");
-        assert_eq!(e.pending_plugin_calls[0], crate::plugin::PluginCall { id });
+        assert_eq!(e.pending_plugin_calls[0], crate::plugin::PluginCall { id, arg: None });
+    }
+
+    // ── Task 5: the four-case `dispatch_with_arg` matrix ──────────────────────────────────
+
+    /// Case 3 — a `Plugin` entry with `meta.arg = Some("Prompt")`, dispatched via `dispatch`
+    /// (no arg supplied): opens a `PluginArg { id }` minibuffer with that prompt; nothing is
+    /// enqueued yet.
+    #[test]
+    fn param_command_no_arg_opens_prompt() {
+        let mut reg = Registry::builtins();
+        let id = CommandId(crate::plugin::intern("param-cmd-test.no-arg"));
+        reg.register_plugin(id, "Param Cmd", None, Some("Minutes:"))
+            .expect("register_plugin should succeed on a fresh id");
+
+        let mut e = Editor::new_from_text("hi\n", None, (80, 24));
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let r = reg.dispatch(id, &mut ctx);
+
+        assert_eq!(r, CommandResult::Handled);
+        assert!(e.pending_plugin_calls.is_empty(), "nothing enqueued until the prompt is answered");
+        match e.minibuffer.as_ref().map(|m| (&m.prompt, &m.kind)) {
+            Some((prompt, crate::minibuffer::MinibufferKind::PluginArg { id: pid })) => {
+                assert_eq!(prompt, "Minutes:");
+                assert_eq!(*pid, id);
+            }
+            other => panic!("expected a PluginArg minibuffer, got {other:?}"),
+        }
+    }
+
+    /// Case 2 (the bug this fixes) — `dispatch_with_arg(id, ctx, Some("25"))` on the SAME
+    /// parameterized entry enqueues `PluginCall { id, arg: Some("25") }` DIRECTLY and opens NO
+    /// minibuffer — an already-supplied arg must never be re-prompted.
+    #[test]
+    fn param_command_with_supplied_arg_does_not_reprompt() {
+        let mut reg = Registry::builtins();
+        let id = CommandId(crate::plugin::intern("param-cmd-test.supplied-arg"));
+        reg.register_plugin(id, "Param Cmd", None, Some("Minutes:"))
+            .expect("register_plugin should succeed on a fresh id");
+
+        let mut e = Editor::new_from_text("hi\n", None, (80, 24));
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let r = reg.dispatch_with_arg(id, &mut ctx, Some("25".into()));
+
+        assert_eq!(r, CommandResult::Handled);
+        assert!(e.minibuffer.is_none(), "a supplied arg must never open the prompt");
+        assert_eq!(e.pending_plugin_calls.len(), 1);
+        assert_eq!(e.pending_plugin_calls[0], crate::plugin::PluginCall { id, arg: Some("25".into()) });
+    }
+
+    /// Case 4 — a `Plugin` entry with `meta.arg == None`, dispatched via `dispatch` (no arg):
+    /// pushes `PluginCall { id, arg: None }`, no minibuffer.
+    #[test]
+    fn nullary_plugin_command_dispatches_with_none() {
+        let mut reg = Registry::builtins();
+        let id = CommandId(crate::plugin::intern("param-cmd-test.nullary"));
+        reg.register_plugin(id, "Nullary Cmd", None, None)
+            .expect("register_plugin should succeed on a fresh id");
+
+        let mut e = Editor::new_from_text("hi\n", None, (80, 24));
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let r = reg.dispatch(id, &mut ctx);
+
+        assert_eq!(r, CommandResult::Handled);
+        assert!(e.minibuffer.is_none());
+        assert_eq!(e.pending_plugin_calls.len(), 1);
+        assert_eq!(e.pending_plugin_calls[0], crate::plugin::PluginCall { id, arg: None });
+    }
+
+    /// Case 1 — a builtin dispatched with a supplied arg runs the builtin and drops the arg
+    /// (builtins take no arg today).
+    #[test]
+    fn builtin_dispatch_ignores_supplied_arg() {
+        let reg = Registry::builtins();
+        let mut e = Editor::new_from_text("hi\n", None, (80, 24));
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let r = reg.dispatch_with_arg(CommandId("save"), &mut ctx, Some("x".into()));
+        assert_eq!(r, CommandResult::Handled);
     }
 
     #[test]
@@ -1062,8 +1184,8 @@ mod tests {
         let builtin_count = reg.commands().count();
         let id_a = CommandId(crate::plugin::intern("retain-test.a"));
         let id_b = CommandId(crate::plugin::intern("retain-test.b"));
-        reg.register_plugin(id_a, "A", None).expect("register_plugin should succeed on a fresh id");
-        reg.register_plugin(id_b, "B", None).expect("register_plugin should succeed on a fresh id");
+        reg.register_plugin(id_a, "A", None, None).expect("register_plugin should succeed on a fresh id");
+        reg.register_plugin(id_b, "B", None, None).expect("register_plugin should succeed on a fresh id");
 
         reg.retain_builtins();
 
@@ -1085,10 +1207,10 @@ mod tests {
     fn retain_builtins_reindexes_so_a_reregister_succeeds() {
         let mut reg = Registry::builtins();
         let id = CommandId(crate::plugin::intern("retain-test.reregister"));
-        reg.register_plugin(id, "Once", None).expect("register_plugin should succeed on a fresh id");
+        reg.register_plugin(id, "Once", None, None).expect("register_plugin should succeed on a fresh id");
         reg.retain_builtins();
 
-        reg.register_plugin(id, "Again", None)
+        reg.register_plugin(id, "Again", None, None)
             .expect("re-registering the same id after retain_builtins should succeed — no ghost index entry");
         assert_eq!(reg.resolve_name("retain-test.reregister"), Some(id));
         assert_eq!(reg.meta(id).unwrap().label, "Again");
@@ -1101,7 +1223,7 @@ mod tests {
         let r = reg.dispatch(id, &mut ctx);
         assert_eq!(r, CommandResult::Handled);
         assert_eq!(e.pending_plugin_calls.len(), 1, "re-registered id dispatches as a plugin call");
-        assert_eq!(e.pending_plugin_calls[0], crate::plugin::PluginCall { id });
+        assert_eq!(e.pending_plugin_calls[0], crate::plugin::PluginCall { id, arg: None });
     }
 
     #[test]
@@ -1110,7 +1232,7 @@ mod tests {
 
         let mut reg = Registry::builtins();
         let id = CommandId(crate::plugin::intern("retain-test.order"));
-        reg.register_plugin(id, "Order", None).expect("register_plugin should succeed on a fresh id");
+        reg.register_plugin(id, "Order", None, None).expect("register_plugin should succeed on a fresh id");
         reg.retain_builtins();
         let after: Vec<&str> = reg.commands().map(|(id, _)| id.0).collect();
 
@@ -1256,7 +1378,37 @@ mod tests {
         let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
         let r = reg.dispatch(CommandId("plugin_list"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Handled);
-        assert_eq!(e.status, "plugins: 1 ok (2 cmds, 1 hooks), 1 failed");
+        assert_eq!(e.status, "plugins: 1 ok (2 cmds, 1 hooks, 0 timers), 1 failed");
+    }
+
+    #[test]
+    fn plugin_list_reports_armed_timers() {
+        let reg = Registry::builtins();
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.plugin_inventory = vec![crate::plugin::PluginRecord {
+            name: "a".into(),
+            commands: 2,
+            hooks: 1,
+            error: None,
+        }];
+        for handle in 0..2 {
+            e.pending_plugin_timers.push(crate::plugin::PluginTimer {
+                handle,
+                origin: "a".into(),
+                key: format!("wc-timer-{handle}"),
+                next_due_ms: 1_000,
+                interval_ms: 1_000,
+                repeat: false,
+                pending: false,
+            });
+        }
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
+        let r = reg.dispatch(CommandId("plugin_list"), &mut ctx);
+        assert_eq!(r, crate::commands::CommandResult::Handled);
+        assert_eq!(e.status, "plugins: 1 ok (2 cmds, 1 hooks, 2 timers), 0 failed");
     }
 
     // -----------------------------------------------------------------------

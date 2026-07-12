@@ -90,10 +90,12 @@ impl PluginHost {
             e.pending_plugin_calls.clear();
             e.pending_plugin_events.clear();
             e.pending_plugin_dispatch.clear();
+            e.clear_plugin_wake_state(); // P3 §3g: a torn-down (null) host leaves NO armed timer/subscriber
             return;
         }
         let start = std::time::Instant::now();
         let mut units = 0usize;
+        if self.fire_due_timers(editor, clock, &mut units, start) { return; } // Phase 0 (mark-then-fire)
         loop {
             // Phase A — take all three queues under ONE short borrow that drops immediately.
             let (dispatches, calls, events) = {
@@ -126,6 +128,67 @@ impl PluginHost {
                 }
             }
         }
+    }
+
+    /// Phase 0 — fire due plugin timers (P3 §3d). **Invariant (Critical 1 + Codex Important 2): a
+    /// timer is `pending` ONLY when its callback is DEFINITELY about to run — no guard checked
+    /// AFTER marking (`cap_tripped`, bridge-None, VM-null) can strand it.** So EVERY guard is
+    /// checked BEFORE `pending` is set: the VM-null guard is the pump's own `self.lua.is_none()`
+    /// early-return; the bridge-None guard is hoisted to the TOP here (`lua: Some, bridge: None`
+    /// after an attach_bridge failure — no `invoke_state`, no editor API installed, so NO timer can
+    /// run: fire nothing, mark nothing); the cap guard is checked per iteration before marking.
+    /// `pending` is set in the same short borrow immediately before invoke. Observer-tier callbacks
+    /// (like hooks); reschedule-from-completion; one-pending-per-timer. Returns `true` iff a cap
+    /// tripped and the caller (`pump`) must stop this cycle.
+    fn fire_due_timers(&self, editor: &Rc<RefCell<Editor>>, clock: &dyn Clock,
+                       units: &mut usize, start: std::time::Instant) -> bool {
+        // Bridge-None guard HOISTED (Codex Important 2): without a bridge there is no invoke_state
+        // and no editor API — no timer callback can run, so mark nothing (defense-in-depth beyond
+        // the bridge-attach-failure path also calling clear_plugin_wake_state).
+        let Some(invoke_state) = self.bridge.as_ref().map(|b| b.invoke_state.clone()) else { return false };
+        let lua = self.lua.as_ref().expect("pump checked self.lua.is_some() before calling fire_due_timers");
+        let now = clock.now_ms();
+        // Snapshot due HANDLES only (no `pending` mutation yet):
+        let due: Vec<u64> = {
+            let e = editor.borrow();
+            e.pending_plugin_timers.iter()
+                .filter(|t| !t.pending && now >= t.next_due_ms).map(|t| t.handle).collect()
+        };
+        for handle in due {
+            if self.cap_tripped(*units, start, editor) { return true; } // BEFORE mark — remaining NEVER marked
+            *units += 1;
+            // ALL guards passed (VM present, bridge present, cap ok) → mark-then-read atomically in
+            // the instant before invoke; skip (no mark) if cancelled/removed since the snapshot.
+            let key = {
+                let mut e = editor.borrow_mut();
+                match e.pending_plugin_timers.iter_mut().find(|t| t.handle == handle) {
+                    Some(t) => { t.pending = true; t.key.clone() }
+                    None => continue,   // cancelled/removed since the snapshot — nothing was marked
+                }
+            };
+            let label = format!("timer#{handle}");
+            let _guard = ObserverGuard::enter(invoke_state.clone(), &label, true);   // observer-tier
+            let outcome: Result<mlua::Result<()>, String> = crate::panicx::catch(|| {
+                let cb: mlua::Function = lua.named_registry_value(&key)?;
+                self.with_time_guard(lua, || cb.call::<()>(()))
+            });
+            drop(_guard);
+            if let Err(msg) = normalize(outcome) { crate::plugin::plugin_error(editor, &label, &msg); }
+            // Reschedule FROM COMPLETION (or remove one-shot / already-cancelled).
+            let now2 = clock.now_ms();
+            let mut e = editor.borrow_mut();
+            if let Some(pos) = e.pending_plugin_timers.iter().position(|t| t.handle == handle) {
+                if e.pending_plugin_timers[pos].repeat {
+                    let interval = e.pending_plugin_timers[pos].interval_ms;
+                    e.pending_plugin_timers[pos].next_due_ms = now2.saturating_add(interval);
+                    e.pending_plugin_timers[pos].pending = false;
+                } else {
+                    let key = e.pending_plugin_timers.remove(pos).key;
+                    let _ = lua.set_named_registry_value(&key, mlua::Value::Nil);
+                }
+            }
+        }
+        false
     }
 
     /// Test-only pump convenience: builds a throwaway `Registry::builtins()` +
@@ -184,7 +247,7 @@ impl PluginHost {
         };
         let mut e = editor.borrow_mut();
         let mut ctx = crate::registry::Ctx { editor: &mut e, clock, executor: ex, msg_tx: msg_tx.clone() };
-        reg.dispatch(id, &mut ctx);
+        reg.dispatch_with_arg(id, &mut ctx, d.arg.clone());
     }
 
     /// Invoke ONE drained [`crate::plugin::PluginCall`]'s stored Lua callback (the P1 shape).
@@ -199,9 +262,10 @@ impl PluginHost {
         let key = format!("wc-cmd-{}", call.id.0);
         let _guard = self.bridge.as_ref()
             .map(|b| ObserverGuard::enter(b.invoke_state.clone(), call.id.0, false));
+        let arg = call.arg;
         let outcome: Result<mlua::Result<()>, String> = crate::panicx::catch(|| {
             let cb: mlua::Function = lua.named_registry_value(&key)?;
-            self.with_time_guard(lua, || cb.call::<()>(()))
+            self.with_time_guard(lua, || cb.call::<()>((arg,)))
         });
         if let Err(msg) = normalize(outcome) {
             crate::plugin::plugin_error(editor, call.id.0, &msg);
@@ -263,5 +327,380 @@ fn normalize(outcome: Result<mlua::Result<()>, String>) -> Result<(), String> {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e.to_string()),
         Err(panic_msg) => Err(panic_msg),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+    use crate::editor::Editor;
+    use crate::plugin::load::load_sources;
+    use crate::plugin::{PluginCall, PluginEvent, PluginEventKind, PluginTimer};
+    use crate::registry::Registry;
+    use crate::test_support::TestClock;
+
+    /// An ADVANCEABLE test clock: a shared `Rc<Cell<u64>>` so the bridge's `Rc<dyn Clock>`
+    /// (arm-time reads) and the pump's `&dyn Clock` (fire-time reads) observe the SAME wall
+    /// clock — cloning shares the underlying cell. `TestClock` (a fixed value) cannot express
+    /// "arm at t, advance, fire" the timer engine needs.
+    #[derive(Clone)]
+    struct SharedClock(Rc<Cell<u64>>);
+    impl SharedClock {
+        fn new(ms: u64) -> Self { SharedClock(Rc::new(Cell::new(ms))) }
+        fn set(&self, ms: u64) { self.0.set(ms); }
+    }
+    impl Clock for SharedClock {
+        fn now_ms(&self) -> u64 { self.0.get() }
+    }
+
+    fn whole_text(editor: &Rc<RefCell<Editor>>) -> String {
+        let e = editor.borrow();
+        let buf = &e.active().document.buffer;
+        buf.slice(0..buf.len())
+    }
+
+    /// A fresh live VM + bridge over `Editor::new_from_text(text, ..)`, wired to a shared,
+    /// advanceable clock (returned so the test can advance it between arm and fire). `wc.timer`
+    /// is installed by `attach_bridge` → `install_editor_api`.
+    fn timer_host(text: &str) -> (PluginHost, Rc<RefCell<Editor>>, SharedClock) {
+        let mut host = PluginHost::new().expect("VM construction");
+        let editor = Rc::new(RefCell::new(Editor::new_from_text(text, None, (40, 10))));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        std::mem::forget(_rx); // keep the bridge's sender live for the test's lifetime
+        let clock = SharedClock::new(0);
+        host.attach_bridge(editor.clone(), tx, Rc::new(clock.clone()) as Rc<dyn Clock>)
+            .expect("bridge attaches on a live VM");
+        (host, editor, clock)
+    }
+
+    /// Seed a due timer DIRECTLY onto the editor (bypassing the per-plugin arm cap) with a no-op
+    /// Rust callback stored under its `wc-timer-<handle>` key — the arrange step for the strand
+    /// guardrails, which need many due timers / a bridge-less host without routing through `wc.timer`.
+    fn seed_due_noop(host: &PluginHost, editor: &Rc<RefCell<Editor>>, handle: u64, due: u64, repeat: bool) {
+        let lua = host.lua().expect("live VM");
+        let key = format!("wc-timer-{handle}");
+        let f = lua.create_function(|_, ()| -> mlua::Result<()> { Ok(()) }).expect("create_function");
+        lua.set_named_registry_value(&key, f).expect("store callback");
+        editor.borrow_mut().pending_plugin_timers.push(PluginTimer {
+            handle, origin: "seed".into(), key, next_due_ms: due, interval_ms: 1_000, repeat, pending: false,
+        });
+    }
+
+    /// Load ONE hook plugin (`src` may call `wc.on`) + attach a bridge over `text` — the arrange
+    /// step for the observer-gate (`wc.timer` from a hook) test.
+    fn load_hook(src: &str, text: &str) -> (PluginHost, Rc<RefCell<Editor>>) {
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().expect("VM construction");
+        let sources = vec![("t".to_string(), src.to_string())];
+        load_sources(&mut reg, &mut host, &sources, &BTreeMap::new(), &mut Vec::new());
+        let editor = Rc::new(RefCell::new(Editor::new_from_text(text, None, (40, 10))));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        std::mem::forget(_rx);
+        host.attach_bridge(editor.clone(), tx, Rc::new(TestClock::new(0))).expect("bridge attaches");
+        (host, editor)
+    }
+
+    /// A throwaway dispatch context + a real `pump` firing at the shared clock's current time.
+    fn pump_at(host: &mut PluginHost, editor: &Rc<RefCell<Editor>>, clock: &SharedClock) {
+        let reg = Registry::builtins();
+        let ex = crate::jobs::InlineExecutor::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        host.pump(editor, &reg, &ex, clock, &tx);
+    }
+
+    // -----------------------------------------------------------------------
+    // wc.timer / wc.timer_cancel — arm, next-wake, floor, cap, observer gate.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wc_timer_arms_and_next_wake_reflects_it() {
+        let (host, editor, _clock) = timer_host("x");
+        let lua = host.lua().unwrap();
+        lua.load("h1 = wc.timer(60000, function() end)").exec().unwrap();
+        assert_eq!(editor.borrow().pending_plugin_timers.len(), 1, "one wc.timer arms one PluginTimer");
+        assert_eq!(crate::timers::next_wake(&editor.borrow(), 0), Some(60_000),
+            "next_wake reflects the armed timer's due (armed at t=0, +60000ms)");
+        lua.load("h2 = wc.timer(60000, function() end)").exec().unwrap();
+        assert_eq!(editor.borrow().pending_plugin_timers.len(), 2, "a second wc.timer → two");
+        lua.load("wc.timer_cancel(h1)").exec().unwrap();
+        assert_eq!(editor.borrow().pending_plugin_timers.len(), 1, "cancel one → one");
+        assert_eq!(editor.borrow().pending_plugin_timers[0].handle, 2, "h1 cancelled, h2 remains");
+    }
+
+    #[test]
+    fn wc_timer_below_floor_is_typed_error() {
+        let (host, editor, _clock) = timer_host("x");
+        host.lua().unwrap().load("ok, err = pcall(wc.timer, 999, function() end); err = tostring(err)")
+            .exec().unwrap();
+        let lua = host.lua().unwrap();
+        let ok: bool = lua.globals().get("ok").unwrap();
+        let err: String = lua.globals().get("err").unwrap();
+        assert!(!ok, "a sub-floor interval must be a pcall-false error");
+        assert!(err.contains("floor"), "err must name the floor: {err}");
+        assert!(editor.borrow().pending_plugin_timers.is_empty(), "nothing armed below the floor");
+    }
+
+    #[test]
+    fn wc_timer_over_cap_is_typed_error() {
+        let (host, editor, _clock) = timer_host("x");
+        host.lua().unwrap().load(
+            "for i=1,8 do wc.timer(1000, function() end) end\n\
+             ok, err = pcall(wc.timer, 1000, function() end); err = tostring(err)").exec().unwrap();
+        let lua = host.lua().unwrap();
+        let ok: bool = lua.globals().get("ok").unwrap();
+        let err: String = lua.globals().get("err").unwrap();
+        assert!(!ok, "the 9th timer for one plugin must be rejected");
+        assert!(err.contains("limit"), "err must name the limit: {err}");
+        assert_eq!(editor.borrow().pending_plugin_timers.len(), 8, "still exactly 8 armed");
+    }
+
+    #[test]
+    fn timer_cap_is_per_plugin_not_per_command() {
+        // ONE plugin, TWO commands, each arming timers from a DIFFERENT command-id context — the
+        // per-plugin cap (spec: "8 PER PLUGIN") must count ACROSS both, not isolate each command
+        // id into its own private budget. The bug: `origin` was the FULL command id (e.g.
+        // "p.cmd_a" != "p.cmd_b"), so a plugin with K commands could arm 8×K timers.
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().expect("VM construction");
+        let src = "\
+            wc.register_command{ name='cmd_a', label='A', fn=function() \
+                for i=1,4 do wc.timer(1000, function() end) end \
+            end }\n\
+            wc.register_command{ name='cmd_b', label='B', fn=function() \
+                for i=1,4 do wc.timer(1000, function() end) end \
+                local ok, err = pcall(wc.timer, 1000, function() end); \
+                ninth = tostring(ok) .. ':' .. tostring(err) \
+            end }";
+        let reports = load_sources(&mut reg, &mut host,
+            &[("p".to_string(), src.to_string())], &BTreeMap::new(), &mut Vec::new());
+        assert_eq!(reports[0].result, Ok(2), "both commands must register cleanly: {:?}", reports[0].result);
+        let a_id = reg.resolve_name("p.cmd_a").expect("registered under p.cmd_a");
+        let b_id = reg.resolve_name("p.cmd_b").expect("registered under p.cmd_b");
+
+        let editor = Rc::new(RefCell::new(Editor::new_from_text("x", None, (40, 10))));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        std::mem::forget(_rx);
+        host.attach_bridge(editor.clone(), tx, Rc::new(TestClock::new(0))).expect("bridge attaches");
+
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: a_id, arg: None });
+        host.pump_test(&editor);
+        assert_eq!(editor.borrow().pending_plugin_timers.len(), 4, "cmd_a armed 4 timers");
+
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: b_id, arg: None });
+        host.pump_test(&editor);
+        assert_eq!(editor.borrow().pending_plugin_timers.len(), 8,
+            "cmd_b's 4 more must land in the SAME plugin's budget — 8 total, not 4+4 in isolated pools");
+        let lua = host.lua().unwrap();
+        let ninth: String = lua.globals().get("ninth").unwrap();
+        assert!(ninth.starts_with("false:"),
+            "the 9th timer — armed from cmd_b, a DIFFERENT command of the SAME plugin — must be rejected: {ninth}");
+        assert!(ninth.contains("limit"), "err must name the limit: {ninth}");
+        assert_eq!(editor.borrow().pending_plugin_timers.len(), 8,
+            "still exactly 8 — the cap held across both commands");
+    }
+
+    #[test]
+    fn timer_cancel_is_scoped_to_the_arming_plugin() {
+        // Plugin "a" arms a timer; plugin "b" — a DIFFERENT plugin — tries to cancel it by
+        // handle. `wc.timer_cancel` is a silent no-op on an unmatched handle (spec), so the
+        // observable is: the timer must STILL be armed after b's attempt, and only a's own
+        // cancel (same plugin) actually removes it.
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().expect("VM construction");
+        let src_a = "\
+            wc.register_command{ name='arm', label='Arm', fn=function() wc.timer(1000, function() end) end }\n\
+            wc.register_command{ name='cancel', label='Cancel', arg='H:', \
+                fn=function(arg) wc.timer_cancel(tonumber(arg)) end }";
+        let src_b = "wc.register_command{ name='cancel', label='Cancel', arg='H:', \
+            fn=function(arg) wc.timer_cancel(tonumber(arg)) end }";
+        let reports = load_sources(&mut reg, &mut host,
+            &[("a".to_string(), src_a.to_string()), ("b".to_string(), src_b.to_string())],
+            &BTreeMap::new(), &mut Vec::new());
+        assert_eq!(reports[0].result, Ok(2), "plugin a: {:?}", reports[0].result);
+        assert_eq!(reports[1].result, Ok(1), "plugin b: {:?}", reports[1].result);
+        let arm_id = reg.resolve_name("a.arm").expect("registered under a.arm");
+        let a_cancel_id = reg.resolve_name("a.cancel").expect("registered under a.cancel");
+        let b_cancel_id = reg.resolve_name("b.cancel").expect("registered under b.cancel");
+
+        let editor = Rc::new(RefCell::new(Editor::new_from_text("x", None, (40, 10))));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        std::mem::forget(_rx);
+        host.attach_bridge(editor.clone(), tx, Rc::new(TestClock::new(0))).expect("bridge attaches");
+
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: arm_id, arg: None });
+        host.pump_test(&editor);
+        assert_eq!(editor.borrow().pending_plugin_timers.len(), 1, "a.arm armed one timer");
+        let handle = editor.borrow().pending_plugin_timers[0].handle;
+
+        // Plugin b tries to cancel a's handle — must be a no-op (b does not own it).
+        editor.borrow_mut().pending_plugin_calls.push_back(
+            PluginCall { id: b_cancel_id, arg: Some(handle.to_string()) });
+        host.pump_test(&editor);
+        assert_eq!(editor.borrow().pending_plugin_timers.len(), 1,
+            "b.cancel must NOT remove a's timer — cross-plugin cancel is a no-op");
+        assert_eq!(editor.borrow().pending_plugin_timers[0].handle, handle, "a's timer is untouched");
+
+        // Plugin a cancels its OWN handle — must succeed (the pomodoro-demo shape: same plugin).
+        editor.borrow_mut().pending_plugin_calls.push_back(
+            PluginCall { id: a_cancel_id, arg: Some(handle.to_string()) });
+        host.pump_test(&editor);
+        assert!(editor.borrow().pending_plugin_timers.is_empty(),
+            "a.cancel must remove a's OWN timer");
+    }
+
+    #[test]
+    fn wc_timer_from_hook_is_rejected() {
+        // A timer callback must not be arm-able from an event hook (observer-tier): mutation-by-
+        // proxy AND a timer-spawns-timers spin vector are both closed at the arm gate.
+        let src = "wc.on('save', function(ev) \
+                       local ok, err = pcall(wc.timer, 1000, function() end); \
+                       wc.status(tostring(ok) .. ':' .. tostring(err)) \
+                   end)";
+        let (mut host, editor) = load_hook(src, "x");
+        editor.borrow_mut().pending_plugin_events.push_back(
+            PluginEvent { kind: PluginEventKind::Save, path: None });
+        host.pump_test(&editor);
+        let status = editor.borrow().status.clone();
+        assert!(status.starts_with("false:"), "wc.timer from a hook must be rejected: {status}");
+        assert!(status.contains("event hook or a timer callback"), "status: {status}");
+        assert!(editor.borrow().pending_plugin_timers.is_empty(), "nothing armed from a hook");
+    }
+
+    // -----------------------------------------------------------------------
+    // The pump's Phase 0 — mark-then-fire, reschedule-from-completion, one-shot.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wc_timer_fires_during_inactivity_via_pump() {
+        let (mut host, editor, clock) = timer_host("x");
+        host.lua().unwrap().load("wc.timer(1000, function() wc.status('fired') end)").exec().unwrap();
+        assert_eq!(editor.borrow().pending_plugin_timers.len(), 1);
+        clock.set(1500); // past the 1000ms due; NO input between arm and fire
+        pump_at(&mut host, &editor, &clock);
+        assert_eq!(editor.borrow().status, "fired", "the one-shot callback ran during inactivity");
+        assert!(editor.borrow().pending_plugin_timers.is_empty(), "a one-shot is removed after firing");
+        assert_eq!(crate::timers::next_wake(&editor.borrow(), 1500), None, "nothing armed after the one-shot");
+    }
+
+    #[test]
+    fn wc_timer_repeat_reschedules_from_completion() {
+        let (mut host, editor, clock) = timer_host("x");
+        host.lua().unwrap().load("wc.timer(1000, function() wc.status('r') end, true)").exec().unwrap();
+        clock.set(2500); // fires at completion_now = 2500
+        pump_at(&mut host, &editor, &clock);
+        let e = editor.borrow();
+        assert_eq!(e.pending_plugin_timers.len(), 1, "a repeating timer is NOT removed");
+        assert_eq!(e.pending_plugin_timers[0].next_due_ms, 3500,
+            "reschedule FROM COMPLETION: completion_now(2500) + interval(1000)");
+        assert!(!e.pending_plugin_timers[0].pending, "pending is cleared after the reschedule");
+        assert_eq!(e.status, "r", "the repeating callback ran");
+    }
+
+    #[test]
+    fn timer_callback_is_observer_tier_cannot_edit() {
+        let (mut host, editor, clock) = timer_host("hello");
+        host.lua().unwrap().load(
+            "wc.timer(1000, function() \
+                 local ok, err = pcall(wc.insert, 'X'); \
+                 wc.status('fired:' .. tostring(ok) .. ':' .. tostring(err)) \
+             end)").exec().unwrap();
+        clock.set(1500);
+        pump_at(&mut host, &editor, &clock);
+        assert_eq!(whole_text(&editor), "hello", "a timer callback must NOT edit the buffer (observer-tier)");
+        let status = editor.borrow().status.clone();
+        assert!(status.starts_with("fired:false:"), "wc.insert must be blocked from a timer callback: {status}");
+        assert!(status.contains("editing is not allowed from an event hook"), "status: {status}");
+        // wc.status STILL worked (it set the status above) — the one allowed observer surface.
+    }
+
+    // -----------------------------------------------------------------------
+    // Strand guardrails (Critical 1 + Codex Important 2) + the anti-spin bound.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cap_trip_does_not_strand_a_due_timer() {
+        // Seed CAP+1 due REPEATING timers directly so a single pump's Phase-0 fire-batch trips
+        // PLUGIN_PUMP_CHAIN_CAP mid-batch. The invariant: every not-yet-fired due timer is left
+        // `!pending` (fires next pump), NEVER stranded pending against a dead callback.
+        let (mut host, editor, clock) = timer_host("x");
+        let n = (crate::limits::PLUGIN_PUMP_CHAIN_CAP + 1) as u64;
+        for h in 1..=n {
+            seed_due_noop(&host, &editor, h, 0, true); // due at 0, repeating
+        }
+        clock.set(10_000); // all due
+        pump_at(&mut host, &editor, &clock);
+        let e = editor.borrow();
+        assert!(e.pending_plugin_timers.iter().all(|t| !t.pending),
+            "NO timer may be left marked pending after a mid-batch cap trip");
+        assert!(e.pending_plugin_timers.iter().any(|t| t.next_due_ms == 0),
+            "at least one timer never fired — still due at its original (past) time");
+        assert_eq!(crate::timers::next_wake(&e, 10_000), Some(0),
+            "the un-fired due timer still drives an (immediate) wake — not stranded");
+        assert!(e.status.to_lowercase().contains("truncat"), "the cap trip sets a truncation status: {}", e.status);
+    }
+
+    #[test]
+    fn no_bridge_does_not_strand_a_due_timer() {
+        // lua: Some, bridge: None (an attach_bridge that never ran / failed): NO invoke_state,
+        // no editor API — so `fire_due_timers` must fire NOTHING and mark NOTHING.
+        let mut host = PluginHost::new().expect("VM construction");
+        let editor = Rc::new(RefCell::new(Editor::new_from_text("x", None, (40, 10))));
+        seed_due_noop(&host, &editor, 1, 0, false); // due, but no bridge attached
+        let reg = Registry::builtins();
+        let ex = crate::jobs::InlineExecutor::default();
+        let clock = TestClock::new(10_000);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        host.pump(&editor, &reg, &ex, &clock, &tx);
+        let e = editor.borrow();
+        assert_eq!(e.pending_plugin_timers.len(), 1, "the timer must remain armed under a bridge-None host");
+        assert!(!e.pending_plugin_timers[0].pending, "a bridge-None pump must never mark a timer pending");
+        assert_eq!(crate::timers::next_wake(&e, 10_000), Some(0), "the timer still drives a wake (not stranded)");
+    }
+
+    #[test]
+    fn floored_repeating_timer_bounded_wakes_not_a_spin() {
+        // A 1000ms repeating timer driven over N seconds fires ≤ N+1 times, and every post-fire
+        // cadence is >= the floor — a bounded wake rate, never a per-pump spin.
+        let (mut host, editor, clock) = timer_host("x");
+        host.lua().unwrap().load("fires = 0; wc.timer(1000, function() fires = fires + 1 end, true)")
+            .exec().unwrap();
+        let n: u64 = 5;
+        for step in 1..=n {
+            clock.set(step * 1000); // advance exactly one interval per pump
+            pump_at(&mut host, &editor, &clock);
+            let e = editor.borrow();
+            let t = &e.pending_plugin_timers[0];
+            assert!(!t.pending, "the timer is never left pending between pumps");
+            assert!(t.next_due_ms.saturating_sub(clock.now_ms()) >= 1_000,
+                "post-fire cadence (next_due - now) must be >= the 1000ms floor, step {step}");
+        }
+        let fires: i64 = host.lua().unwrap().globals().get("fires").unwrap();
+        assert!(fires <= (n as i64) + 1, "bounded wakes: {fires} fires over {n}s must be <= N+1");
+        assert_eq!(fires, n as i64, "exactly one fire per advanced interval");
+    }
+
+    #[test]
+    fn teardown_clears_both_subsystems() {
+        // The null-host pump branch (P3 §3g) clears the timer schedule + the on_change
+        // subscription via `clear_plugin_wake_state` — a torn-down host leaves NO armed wake.
+        let mut host = PluginHost::null();
+        let editor = Rc::new(RefCell::new(Editor::new_from_text("x", None, (40, 10))));
+        {
+            let mut e = editor.borrow_mut();
+            e.pending_plugin_timers.push(PluginTimer {
+                handle: 1, origin: "p".into(), key: "wc-timer-1".into(),
+                next_due_ms: 500, interval_ms: 1_000, repeat: false, pending: false,
+            });
+            e.has_on_change_subscriber = true;
+            e.on_change_due = Some(500);
+        }
+        host.pump_test(&editor);
+        let e = editor.borrow();
+        assert!(e.pending_plugin_timers.is_empty(), "the null-host pump clears the timer schedule");
+        assert!(!e.has_on_change_subscriber, "the on_change subscription is cleared too");
+        assert_eq!(e.on_change_due, None, "the on_change due is cleared");
+        assert_eq!(crate::timers::next_wake(&e, 10_000), None, "a torn-down host arms no wake");
     }
 }

@@ -65,6 +65,15 @@ pub(crate) fn install_registration(
             return Err(mlua::Error::runtime("plugin: label too long"));
         }
         let menu_raw: Option<mlua::String> = spec.get("menu")?;
+        // arg: the optional argument-prompt string (Task 5) — same borrowed-length-check-then-
+        // convert pattern as label, capped against the same PLUGIN_MAX_LABEL_LEN (it too is a
+        // short UI-facing prompt string, not a command payload).
+        let arg_raw: Option<mlua::String> = spec.get("arg")?;
+        if let Some(a) = &arg_raw {
+            if a.as_bytes().len() > crate::limits::PLUGIN_MAX_LABEL_LEN {
+                return Err(mlua::Error::runtime("plugin: command arg prompt too long"));
+            }
+        }
         let func: mlua::Function = spec.get("fn")?;
         // menu: parse-to-enum on the borrowed bytes — no owned String needed either way.
         let menu = match &menu_raw {
@@ -77,8 +86,12 @@ pub(crate) fn install_registration(
         // No intern, no set_named_registry_value here — commit does both (§7b). Own raw strings only.
         let name_full = format!("{stem}.{}", name_raw.to_str()?.as_ref());
         let label = label_raw.to_str()?.to_owned();
+        let arg = match &arg_raw {
+            Some(a) => Some(a.to_str()?.to_owned()),
+            None => None,
+        };
         count.set(count.get() + 1);
-        sink.borrow_mut().push(PendingReg { name_full, label, menu, func });
+        sink.borrow_mut().push(PendingReg { name_full, label, menu, func, arg });
         Ok(())
     })?;
     wc.set("register_command", reg_fn)?;
@@ -194,6 +207,7 @@ pub(crate) fn install_editor_api(lua: &mlua::Lua, bridge: &Bridge) -> mlua::Resu
     install_set_selection(lua, &wc, bridge)?;
     install_status(lua, &wc, bridge)?;
     install_command(lua, &wc, bridge)?;
+    install_timer(lua, &wc, bridge)?;
     install_registration_closed(lua, &wc)?;
     install_on_closed(lua, &wc)?;
     install_config_cleared(&wc)?;
@@ -420,7 +434,7 @@ fn install_command(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::
     let invoke = bridge.invoke_state.clone();
     wc.set(
         "command",
-        lua.create_function(move |_, name: mlua::String| {
+        lua.create_function(move |_, (name, arg): (mlua::String, Option<mlua::String>)| {
             let st = invoke.borrow();
             if st.observer {
                 return Err(mlua::Error::runtime("plugin: wc.command is not allowed from an event hook"));
@@ -428,6 +442,16 @@ fn install_command(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::
             if name.as_bytes().len() > crate::limits::PLUGIN_MAX_COMMAND_REF {
                 return Err(mlua::Error::runtime("plugin: command name too long"));
             }
+            // arg: cap on the BORROWED bytes before any Rust allocation (resource-bound LAW).
+            let arg = match &arg {
+                Some(a) => {
+                    if a.as_bytes().len() > crate::limits::PLUGIN_MAX_COMMAND_ARG {
+                        return Err(mlua::Error::runtime("plugin: command arg too long"));
+                    }
+                    Some(a.to_str()?.to_owned())
+                }
+                None => None,
+            };
             let origin = st.current.clone().unwrap_or_default();
             drop(st);
             let mut e = editor.try_borrow_mut().map_err(|_| mlua::Error::runtime("plugin: editor busy"))?;
@@ -437,11 +461,96 @@ fn install_command(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::
             e.pending_plugin_dispatch.push_back(crate::plugin::PluginDispatch {
                 origin,
                 name: name.to_str()?.to_owned(),
+                arg,
             });
             Ok(())
         })?,
     )?;
     Ok(())
+}
+
+/// `wc.timer(interval_ms, fn [, repeat_bool])` (arm) + `wc.timer_cancel(handle)` (disarm) — the
+/// plugin-facing timer API (P3 §3b). Positional `(interval, fn, repeat?)` mirrors `wc.replace`'s
+/// `(a, b, text)` tuple-extraction idiom (a mechanical refinement of the spec's `{table}` sketch —
+/// the guardrails are identical). Both verbs are observer-checked, so a hook OR a timer callback
+/// (both run observer-tier) can neither arm nor cancel — closing the timer-spawns-timers spin
+/// vector at the arm gate, not by trust. Arm enforces, in order: observer, the interval floor
+/// ([`crate::limits::PLUGIN_TIMER_MIN_INTERVAL_MS`]), then the per-plugin count cap
+/// ([`crate::limits::PLUGIN_MAX_TIMERS_PER_PLUGIN`]) — each BEFORE the callback is persisted or the
+/// `PluginTimer` pushed. `handle` is a monotonic per-editor counter (never reused); the callback
+/// lives in the VM named registry under `wc-timer-<handle>` (dies with the VM at reload).
+///
+/// Both the cap and `wc.timer_cancel` attribute a timer to its **plugin STEM** — the part of
+/// `InvokeState::current` before the first `.` — never the full command id. A plugin command id is
+/// always `"<stem>.<name>"`, so two commands of the SAME plugin share one stem; using the full id
+/// as `origin` (the pre-fix shape) let a K-command plugin arm `8×K` timers (one private 8-budget
+/// per command id) and let ANY command of ANY plugin cancel ANY other plugin's timer by handle (no
+/// scoping at all). Deriving `origin` from the stem closes both at the same root cause.
+fn install_timer(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::Result<()> {
+    let editor = bridge.editor.clone();
+    let clock = bridge.clock.clone();
+    let invoke = bridge.invoke_state.clone();
+    // wc.timer(interval_ms, fn [, repeat_bool]) — one-shot unless repeat is true.
+    wc.set("timer", lua.create_function(
+        move |lua, (interval_ms, func, repeat): (u64, mlua::Function, Option<bool>)| {
+            if invoke.borrow().observer {
+                return Err(mlua::Error::runtime(
+                    "plugin: wc.timer is not allowed from an event hook or a timer callback"));
+            }
+            if interval_ms < crate::limits::PLUGIN_TIMER_MIN_INTERVAL_MS {
+                return Err(mlua::Error::runtime("plugin: timer interval below the 1000 ms floor"));
+            }
+            let current = invoke.borrow().current.clone().unwrap_or_default();
+            let origin = plugin_stem(&current);
+            let mut e = editor.try_borrow_mut()
+                .map_err(|_| mlua::Error::runtime("plugin: editor busy"))?;
+            if e.pending_plugin_timers.iter().filter(|t| t.origin == origin).count()
+                >= crate::limits::PLUGIN_MAX_TIMERS_PER_PLUGIN {
+                return Err(mlua::Error::runtime("plugin: timer limit reached (max 8)"));
+            }
+            e.next_timer_handle += 1;
+            let handle = e.next_timer_handle;
+            let key = format!("wc-timer-{handle}");
+            lua.set_named_registry_value(&key, func)?;   // persist the callback (dies with the VM)
+            let now = clock.now_ms();
+            e.pending_plugin_timers.push(crate::plugin::PluginTimer {
+                handle, origin, key, next_due_ms: now.saturating_add(interval_ms),
+                interval_ms, repeat: repeat.unwrap_or(false), pending: false,
+            });
+            Ok(handle as i64)   // Lua integer (i64); the monotonic counter never reaches 2^63
+        })?)?;
+    // wc.timer_cancel(handle) — remove + free the registry key IFF the caller's plugin stem owns
+    // it; unknown handle OR a handle owned by a DIFFERENT plugin → silent no-op (a plugin has no
+    // way to observe another plugin's handles, so the two are indistinguishable on the Lua side —
+    // same "unknown handle" degrade the spec already documents).
+    let editor = bridge.editor.clone();
+    let invoke = bridge.invoke_state.clone();
+    wc.set("timer_cancel", lua.create_function(move |lua, handle: i64| {
+        if invoke.borrow().observer {
+            return Err(mlua::Error::runtime(
+                "plugin: wc.timer_cancel is not allowed from an event hook or a timer callback"));
+        }
+        let current = invoke.borrow().current.clone().unwrap_or_default();
+        let origin = plugin_stem(&current);
+        let handle = handle as u64;
+        let mut e = editor.try_borrow_mut()
+            .map_err(|_| mlua::Error::runtime("plugin: editor busy"))?;
+        if let Some(pos) = e.pending_plugin_timers.iter()
+            .position(|t| t.handle == handle && t.origin == origin) {
+            let key = e.pending_plugin_timers.remove(pos).key;
+            lua.set_named_registry_value(&key, mlua::Value::Nil)?;   // free the callback
+        }
+        Ok(())
+    })?)?;
+    Ok(())
+}
+
+/// The plugin STEM of an `InvokeState::current` label — the part before the first `.` (a plugin
+/// command id is always `"<stem>.<name>"`, per [`install_registration`]'s `name_full`
+/// construction). Shared by the timer arm cap and `wc.timer_cancel`'s ownership check (both docs
+/// above) so a plugin's timer budget/ownership is keyed by PLUGIN, never by command id.
+fn plugin_stem(current: &str) -> String {
+    current.split('.').next().unwrap_or(current).to_string()
 }
 
 #[cfg(test)]
