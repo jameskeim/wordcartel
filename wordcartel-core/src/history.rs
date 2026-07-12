@@ -50,7 +50,7 @@ pub struct Edit {
 /// optionally, [`Transaction::with_selection`].
 #[derive(Clone, Debug)]
 pub struct Transaction {
-    /// The change set to apply to the buffer.
+    /// The change set to apply to the buffer when this transaction is committed.
     pub changes: ChangeSet,
     /// The selection to restore after `changes` is applied, if the caller supplied one via
     /// [`Transaction::with_selection`]. When `None`, the committing `History` method falls
@@ -62,17 +62,6 @@ impl Transaction {
     /// Creates a transaction from `changes` with no explicit post-edit selection — the
     /// committing `History` method will derive one by mapping the caller's pre-edit selection
     /// through `changes`. Use [`Transaction::with_selection`] to override that default.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use wordcartel_core::change::ChangeSet;
-    /// use wordcartel_core::history::Transaction;
-    ///
-    /// let changes = ChangeSet::insert(0, "hi", 0);
-    /// let txn = Transaction::new(changes);
-    /// assert!(txn.selection.is_none());
-    /// ```
     pub fn new(changes: ChangeSet) -> Self {
         Transaction { changes, selection: None }
     }
@@ -120,15 +109,16 @@ pub struct History {
     pub revisions: Vec<Revision>,
     /// Number of revisions currently applied — the boundary between the undo stack
     /// (`revisions[..current]`) and the redo tail (`revisions[current..]`).
-    pub current: usize,       // number of revisions currently applied
+    pub current: usize,
     /// Running total of stored bytes across all retained revisions (M5 memory accounting),
     /// kept incrementally in sync by `commit`, `commit_coalescing`, and eviction.
-    pub bytes: usize,         // running total of retained revisions' stored bytes (M5)
+    pub bytes: usize,
     /// Number of revisions evicted by the most recent [`History::commit`] or
-    /// [`History::commit_coalescing`] call. Reset to `0` at the start of every commit, undo,
-    /// and redo call, since only a commit can evict — a stale nonzero value never survives
-    /// past the next call of any kind.
-    pub last_evicted: usize,  // revisions dropped on the most recent commit (M5)
+    /// [`History::commit_coalescing`] call, via their shared call to `evict_to` (which resets
+    /// this to `0` before counting). `undo` and `redo` each reset it to `0` on entry instead,
+    /// since neither of them can evict — so this field always reflects only the eviction done
+    /// by the latest commit, never a stale value carried over from an earlier one.
+    pub last_evicted: usize,
 }
 
 fn revision_bytes(rev: &Revision) -> usize {
@@ -214,6 +204,31 @@ impl History {
     /// restore (the revision's `after` selection). Returns `None`, leaving `buf` untouched, if
     /// there is nothing to redo (the redo tail is empty — either nothing was undone, or a new
     /// commit already cleared it).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wordcartel_core::buffer::TextBuffer;
+    /// use wordcartel_core::change::ChangeSet;
+    /// use wordcartel_core::history::{History, Transaction};
+    /// use wordcartel_core::selection::Selection;
+    ///
+    /// let mut buf = TextBuffer::from_str("");
+    /// let mut hist = History::default();
+    /// let sel = Selection::single(0);
+    ///
+    /// assert!(hist.redo(&mut buf).is_none()); // nothing committed yet — nothing to redo
+    ///
+    /// let changes = ChangeSet::insert(0, "hi", buf.len());
+    /// let after_commit = hist.commit(Transaction::new(changes), &mut buf, sel);
+    /// hist.undo(&mut buf);
+    /// assert_eq!(buf.to_string(), "");
+    ///
+    /// let restored = hist.redo(&mut buf).unwrap();
+    /// assert_eq!(buf.to_string(), "hi");
+    /// assert_eq!(restored, after_commit); // redo returns the revision's `after` selection
+    /// assert!(hist.redo(&mut buf).is_none()); // nothing left to redo
+    /// ```
     pub fn redo(&mut self, buf: &mut TextBuffer) -> Option<Selection> {
         self.last_evicted = 0; // redo commits nothing — keep the eviction transient honest
         if self.current >= self.revisions.len() {
@@ -231,9 +246,12 @@ impl History {
     /// revision — merges it into the top-of-stack revision when all of these hold: the redo
     /// tail is empty, the top revision's kind and this commit's `kind` are both
     /// [`EditKind::Type`], and `clock.now_ms()` is within [`COALESCE_MS`] of the top revision's
-    /// `last_ms`. Otherwise it behaves exactly like `commit`, pushing a new revision of `kind`
-    /// and clearing any redo tail. Either way, returns the new selection (`txn.selection` if
-    /// set, else `before` mapped through `txn.changes`).
+    /// `last_ms`. Otherwise it pushes a new revision and clears any redo tail like `commit`
+    /// does, but the pushed revision differs from what `commit` would push in two ways: it
+    /// carries this call's `kind` (`commit` always uses [`EditKind::Other`]), and its `last_ms`
+    /// is set to `now` rather than `0` — which is exactly what lets a later `Type` edit
+    /// coalesce into it. Either way, returns the new selection (`txn.selection` if set, else
+    /// `before` mapped through `txn.changes`).
     ///
     /// # Examples
     ///
