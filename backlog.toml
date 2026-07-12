@@ -515,14 +515,16 @@ created = "2026-07-07"
 
 [[item]]
 id = "P"
-title = "Effort P — in-process Lua plugin system (1.0 capstone)"
-status = "needs-design"
+title = "Effort P — in-process Lua plugin system (P1 commands + P2 events/config/reload + P3 timers)"
+status = "shipped"
 kind = "feature"
 size = "XL"
 theme = "P"
-hook = "The plugin/automation spine; registers into the command/hook/job seams. See docs/design/effort-p-plugin-system-design-space.md."
-doc = "ux-backlog.md#p"
+hook = "In-process Lua plugin system, shipped in 3 phases: P1 commands (2b09d15) + P2 events/config/reload/wc.command (8a06ab8) + P3 timers/parameterized-commands/on_change (2988178). Main-thread pump, observer-safe hooks & timers, whole-VM reload; demos insert_date/wordcount/pomodoro. Subprocess async + dynamic-menu section split to their own future efforts."
+doc = "backlog-archive.md#p"
 created = "2026-07-07"
+shipped_commit = "2988178"
+shipped_date = "2026-07-12"
 
 [[item]]
 id = "PA"

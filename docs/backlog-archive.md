@@ -1587,3 +1587,41 @@ same sweep found **no** pulldown-cmark panic, so the M4-rest `catch_unwind` isol
 merge evictions after reduce + at `switch_to_index`.
 
 Finish the louder undo-eviction hint for buffer-level merges (the last M5 follow-up).
+
+## Theme P — plugin system
+
+### P — Effort P: in-process Lua plugin system (P1 commands → P2 events/config/reload → P3 timers)
+<!-- item: P -->
+
+**SHIPPED 2026-07-12** across three phases — each grounding-first, Fable-authored, Codex-gated,
+subagent-driven (per-task TDD + independent review), with BOTH final gates (Fable whole-branch + Codex
+pre-merge) passing per phase:
+
+- **P1 — commands** (merge `2b09d15`): a single-file `.lua` in the plugins dir registers a namespaced
+  palette command (free keybindings via the keymap-patch path) whose callback runs Lua with mediated
+  editor access — reads, validated edits only via `submit_transaction`, status — panic-isolated and
+  resource-bounded. Demo `insert_date.lua`.
+- **P2 — events + per-plugin config + reload** (merge `8a06ab8`): `wc.on{"save"|"open"|"buffer_close"}`
+  observer-only hooks (a hook can never abort/delay/corrupt a save); `[plugins.config.<name>]` handed to
+  a plugin as an opaque `wc.config` table (64 KiB value/key cap before allocation); `plugins_reload` /
+  `plugin_list` (whole-VM teardown reverting the subsystem to builtins-only); `wc.command`; plus three
+  hardening fixes — load-phase runaway time guard, commit-atomic interning + callback keys, same-stem
+  loader dedup. Demo `wordcount.lua`.
+- **P3 — timers + parameterized commands + on_change** (merge `2988178`): `wc.timer` / `wc.timer_cancel`
+  (one-shot by default, explicit `repeat=true`, 1000 ms floor, max 8 per plugin counted by stem,
+  observer-tier callbacks that can never autonomously edit the doc, mark-then-fire atomic so a cap-trip
+  or bridge-None never strands a due timer, auto-disarm on reload, and `next_wake==None` at rest so idle
+  stays free); parameterized commands (four-case `dispatch_with_arg`, 4096 B arg cap); a debounced,
+  content-settled `on_change` event (never a per-keystroke hook). Demo `pomodoro.lua`.
+
+**Architecture:** PUC Lua 5.4 via mlua (vendored, no `send`); a main-thread PUMP as the sole Lua entry
+point, post-`reduce`, holding no editor borrow while callbacks run; `Editor` behind `Rc<RefCell<>>`; the
+command registry opened via `HandlerKind{Builtin|Plugin}` + `&'static` interning (`CommandId` stays
+`Copy`). Two design LAWS — input-validation and resource-bound — enforced at every plugin-input site.
+`#![forbid(unsafe_code)]` holds; `wordcartel-core` stays Lua-free. History:
+`docs/design/effort-p-plugin-system-design-space.md` (superseded); per-phase grounding/spec/plan under
+`docs/design/` + `docs/superpowers/`.
+
+**Deferred to their own future efforts** (each wants its own concrete driver): subprocess `wc.async`
+(the load-bearing async primitive, for formatter/linter plugins) and a plugin-contributed dynamic menu
+section. Post-P research candidates remain open as PA / PB / PC.

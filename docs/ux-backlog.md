@@ -396,11 +396,6 @@ best validates — the markup-rendering capability; treat it as a P design ancho
 
 *(Auto-created during the backlog-manifest migration. Status/size/kind live in `backlog.toml`; flesh out the triage prose here when the item is picked up.)*
 
-### P — Effort P — in-process Lua plugin system (1.0 capstone)
-<!-- item: P -->
-
-The plugin/automation spine; registers into the command/hook/job seams. See docs/design/effort-p-plugin-system-design-space.md.
-
 
 ### B9 — Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols)
 <!-- item: B9 -->
