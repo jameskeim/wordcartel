@@ -542,10 +542,15 @@ fn gather_row_ctx(editor: &Editor) -> RowCtx<'_> {
     // Diagnostic overlay: check version validity once before the row loop.
     // diag_active = true iff the stored diagnostics were computed for the current
     // document version (and are non-empty). When false, diag_all is empty.
+    // Interim: Harper is the only source ever painted (Task 6 swaps this to the switchable lens).
     let diag_active = crate::diagnostics_run::should_show_diagnostics(editor)
-        && editor.active().diagnostics.valid_for(editor.active().document.version);
+        && editor.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper)
+            .is_some_and(|s| s.valid_for(editor.active().document.version));
     let diag_all: &[wordcartel_core::diagnostics::Diagnostic] =
-        if diag_active { &editor.active().diagnostics.diagnostics } else { &[] };
+        if diag_active {
+            editor.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper)
+                .map_or(&[][..], |s| s.diagnostics.as_slice())
+        } else { &[] };
 
     // Snapshot primary selection (Task 9: selection painting).
     let sel_range = editor.active().document.selection.primary();
@@ -1290,11 +1295,11 @@ mod tests {
         use crate::editor::{Editor, RenderMode};
         let mut e = Editor::new_from_text("teh cat\n", None, (40, 6));
         let v = e.active().document.version;
-        e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
             range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
             source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
             message: "x".into(), suggestions: vec![] }];
-        e.active_mut().diagnostics.computed_version = v;
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).computed_version = v;
         e.active_mut().view.mode = RenderMode::Review; // E7 T2: display gate requires Review
         crate::derive::rebuild(&mut e);
         let buf = render_to_buffer(&mut e, 40, 6);
@@ -1305,11 +1310,11 @@ mod tests {
     fn stale_diagnostics_are_not_painted() {
         use crate::editor::{Editor, RenderMode};
         let mut e = Editor::new_from_text("teh cat\n", None, (40, 6));
-        e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
             range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
             source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
             message: "x".into(), suggestions: vec![] }];
-        e.active_mut().diagnostics.computed_version = 999; // != current version
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).computed_version = 999; // != current version
         e.active_mut().view.mode = RenderMode::Review; // isolate the version-staleness guard, not the mode gate
         crate::derive::rebuild(&mut e);
         let buf = render_to_buffer(&mut e, 40, 6);
@@ -1323,11 +1328,11 @@ mod tests {
         use crate::editor::{Editor, RenderMode};
         let mut e = Editor::new_from_text("teh cat\n", None, (40, 6));
         let v = e.active().document.version;
-        e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
             range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
             source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
             message: "x".into(), suggestions: vec![] }];
-        e.active_mut().diagnostics.computed_version = v;
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).computed_version = v;
         e.active_mut().view.mode = RenderMode::Review;
         crate::derive::rebuild(&mut e);
         assert!(row_has_underline(&render_to_buffer(&mut e, 40, 6), 0), "painted in Review");
@@ -1705,14 +1710,14 @@ mod tests {
             use crate::editor::RenderMode;
             let mut e = Editor::new_from_text("teh cat\n", None, (40, 6));
             let v = e.active().document.version;
-            e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+            e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
                 range: 0..3,
                 kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
                 source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
                 message: "x".into(),
                 suggestions: vec![],
             }];
-            e.active_mut().diagnostics.computed_version = v;
+            e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).computed_version = v;
             e.active_mut().view.mode = RenderMode::Review; // E7 T2: display gate requires Review
             crate::derive::rebuild(&mut e);
             let buf = render_to_buffer(&mut e, 40, 6);

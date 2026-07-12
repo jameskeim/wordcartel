@@ -580,8 +580,9 @@ mod tests {
         let mut e = Editor::new_from_text("old content\n", Some(p.clone()), (80, 24));
         // Version V; arm a fake in-flight diagnostics check.
         let pre_reload_version = e.active().document.version; // 0
-        e.active_mut().diagnostics.in_flight_version = Some(pre_reload_version);
-        e.active_mut().diagnostics.diagnostics = vec![
+        let harper = wordcartel_core::diagnostics::DiagSource::Harper;
+        e.active_mut().diagnostics.slot_mut(harper).in_flight_version = Some(pre_reload_version);
+        e.active_mut().diagnostics.slot_mut(harper).diagnostics = vec![
             wordcartel_core::diagnostics::Diagnostic {
                 range: 0..3,
                 kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
@@ -590,15 +591,15 @@ mod tests {
                 suggestions: vec![],
             }
         ];
-        e.active_mut().diagnostics.computed_version = pre_reload_version;
+        e.active_mut().diagnostics.slot_mut(harper).computed_version = pre_reload_version;
         reload_from_disk(&mut e);
         // Post-reload: version must be strictly greater than pre_reload_version.
         assert!(e.active().document.version > pre_reload_version,
             "reload must bump version past the pre-reload value");
         // DiagStore must be cleared of any stale underlines.
-        assert!(e.active().diagnostics.diagnostics.is_empty(),
+        assert!(e.active().diagnostics.slot(harper).is_none_or(|s| s.diagnostics.is_empty()),
             "reload must reset DiagStore (no stale underlines)");
-        assert!(e.active().diagnostics.in_flight_version.is_none(),
+        assert!(e.active().diagnostics.slot(harper).is_none_or(|s| s.in_flight_version.is_none()),
             "reload must clear in_flight_version");
         // Now deliver the late DiagnosticsDone for the pre-reload version V.
         let new_version = e.active().document.version;
@@ -617,7 +618,7 @@ mod tests {
             }],
         );
         // The stale result must NOT be stored.
-        assert!(e.active().diagnostics.diagnostics.is_empty(),
+        assert!(e.active().diagnostics.slot(harper).is_none_or(|s| s.diagnostics.is_empty()),
             "late pre-reload DiagnosticsDone must be discarded (version gate)");
         // computed_version must not have been set to the new buffer's version by the stale result
         // (i.e., the new buffer's version != pre_reload_version, and diagnostics are still empty).
@@ -637,7 +638,7 @@ mod tests {
                 suggestions: vec![],
             }],
         );
-        assert_eq!(e.active().diagnostics.diagnostics.len(), 1,
+        assert_eq!(e.active().diagnostics.slot(harper).unwrap().diagnostics.len(), 1,
             "fresh result for the new version must be stored");
         let _ = std::fs::remove_file(&p);
     }
@@ -648,9 +649,10 @@ mod tests {
     fn load_recovered_discards_pre_recovery_diagnostics_done() {
         let mut e = Editor::new_from_text("old content\n", None, (80, 24));
         let pre_recovery_version = e.active().document.version; // 0
-        e.active_mut().diagnostics.in_flight_version = Some(pre_recovery_version);
+        let harper = wordcartel_core::diagnostics::DiagSource::Harper;
+        e.active_mut().diagnostics.slot_mut(harper).in_flight_version = Some(pre_recovery_version);
         // Simulate stale underlines that must be wiped by recovery.
-        e.active_mut().diagnostics.diagnostics = vec![
+        e.active_mut().diagnostics.slot_mut(harper).diagnostics = vec![
             wordcartel_core::diagnostics::Diagnostic {
                 range: 0..3,
                 kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
@@ -659,13 +661,13 @@ mod tests {
                 suggestions: vec![],
             }
         ];
-        e.active_mut().diagnostics.computed_version = pre_recovery_version;
+        e.active_mut().diagnostics.slot_mut(harper).computed_version = pre_recovery_version;
         load_recovered(&mut e, "recovered content\n");
         assert!(e.active().document.version > pre_recovery_version,
             "load_recovered must bump version past the pre-recovery value");
-        assert!(e.active().diagnostics.diagnostics.is_empty(),
+        assert!(e.active().diagnostics.slot(harper).is_none_or(|s| s.diagnostics.is_empty()),
             "load_recovered must reset DiagStore");
-        assert!(e.active().diagnostics.in_flight_version.is_none(),
+        assert!(e.active().diagnostics.slot(harper).is_none_or(|s| s.in_flight_version.is_none()),
             "load_recovered must clear in_flight_version");
         let buffer_id = e.active().id;
         // Deliver a late result for the pre-recovery version — must be discarded.
@@ -682,7 +684,7 @@ mod tests {
                 suggestions: vec![],
             }],
         );
-        assert!(e.active().diagnostics.diagnostics.is_empty(),
+        assert!(e.active().diagnostics.slot(harper).is_none_or(|s| s.diagnostics.is_empty()),
             "late pre-recovery DiagnosticsDone must be discarded");
     }
 

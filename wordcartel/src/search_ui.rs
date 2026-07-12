@@ -296,7 +296,7 @@ mod tests {
     /// Seed the active store with a spelling diagnostic on "teh" (0..3) so an ignore/add-dict row
     /// has something to refilter in place.
     fn seed_teh_diag(e: &mut Editor) {
-        e.active_mut().diagnostics.diagnostics = vec![Diagnostic {
+        e.active_mut().diagnostics.slot_mut(DiagSource::Harper).diagnostics = vec![Diagnostic {
             range: 0..3, kind: DiagnosticKind::Spelling, source: DiagSource::Harper, code: None,
             href: None, message: "x".into(),
             suggestions: vec![Suggestion::ReplaceWith("the".into())] }];
@@ -313,13 +313,13 @@ mod tests {
         seed_teh_diag(&mut e);
         open_diag_selected(&mut e, true);
         let v_before = e.active().document.version;
-        e.active_mut().diagnostics.recheck_due_at = None;
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).recheck_due_at = None;
         diag_apply_selected(&mut e, &TestClock(1_000));
         assert_eq!(e.active().document.version, v_before, "ignore does not edit the document");
         assert!(e.diag.is_none(), "overlay closes regardless of outcome");
         assert!(e.session_ignores.contains("teh"), "surface word added to session ignores");
-        assert!(e.active().diagnostics.diagnostics.is_empty(), "the ignored underline is refiltered out");
-        assert_eq!(e.active().diagnostics.recheck_due_at, None, "no re-arm — the refilter is immediate");
+        assert!(e.active().diagnostics.slot(DiagSource::Harper).is_none_or(|s| s.diagnostics.is_empty()), "the ignored underline is refiltered out");
+        assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), None, "no re-arm — the refilter is immediate");
     }
 
     /// Effort A: "add to dictionary" with no configured path still suppresses the word client-side
@@ -333,13 +333,13 @@ mod tests {
         e.active_mut().view.mode = RenderMode::Review;
         seed_teh_diag(&mut e);
         open_diag_selected(&mut e, false);
-        e.active_mut().diagnostics.recheck_due_at = None;
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).recheck_due_at = None;
         diag_apply_selected(&mut e, &TestClock(3_000));
         assert!(e.diag.is_none(), "overlay closes regardless of outcome");
         assert!(e.dictionary.contains("teh"), "word suppressed client-side even with no path");
         assert_eq!(e.status, "no dictionary path configured");
-        assert!(e.active().diagnostics.diagnostics.is_empty(), "the added word is refiltered out");
-        assert_eq!(e.active().diagnostics.recheck_due_at, None, "no re-arm");
+        assert!(e.active().diagnostics.slot(DiagSource::Harper).is_none_or(|s| s.diagnostics.is_empty()), "the added word is refiltered out");
+        assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), None, "no re-arm");
     }
 
     /// Effort A single-writer (spec §7.4): add-to-dict writes the word to the file EXACTLY once

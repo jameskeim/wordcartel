@@ -989,7 +989,7 @@ impl Editor {
             self.diag_hint_shown = false;
         }
         if crate::diagnostics_run::should_run_diagnostics(self) {
-            self.active_mut().diagnostics.arm(now_ms, 0);
+            crate::diagnostics_run::arm_enabled(self, now_ms, 0);
         }
     }
 
@@ -1711,13 +1711,20 @@ mod tests {
 
     #[test]
     fn set_render_mode_arms_on_enter_review_only() {
+        use wordcartel_core::diagnostics::DiagSource;
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        // arm_enabled (Task 3) only arms slots of INSTALLED+enabled sources — install Harper so
+        // the arm-on-enter-Review behavior below has something to arm.
+        e.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Harper)), true);
         e.diag_cfg.enabled = true;
         e.set_render_mode(RenderMode::Review, 500);
-        assert_eq!(e.active().diagnostics.recheck_due_at, Some(500), "arm-on-enter at debounce 0");
-        e.active_mut().diagnostics.recheck_due_at = None;
+        assert_eq!(e.active().diagnostics.slot(DiagSource::Harper).unwrap().recheck_due_at, Some(500),
+            "arm-on-enter at debounce 0");
+        e.active_mut().diagnostics.slot_mut(DiagSource::Harper).recheck_due_at = None;
         e.set_render_mode(RenderMode::LivePreview, 600);
-        assert_eq!(e.active().diagnostics.recheck_due_at, None, "leaving Review never arms");
+        assert_eq!(e.active().diagnostics.slot(DiagSource::Harper).unwrap().recheck_due_at, None,
+            "leaving Review never arms");
     }
 
     #[test]
