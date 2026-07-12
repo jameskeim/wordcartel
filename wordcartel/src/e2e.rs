@@ -765,6 +765,164 @@ fn wc_command_menu_open_is_hydrated() {
     assert!(m.groups.iter().any(|g| !g.1.is_empty()), "the built menu must actually contain command rows");
 }
 
+// ---------------------------------------------------------------------------
+// P3 Task 7: pomodoro.lua — the clock-driven demo (the driver that de-speculates
+// the whole timer slice, mirroring insert_date_lua_e2e_success_demo/
+// wordcount_lua_e2e_success_demo's "load like production" discipline).
+// ---------------------------------------------------------------------------
+
+/// An ADVANCEABLE test clock: a shared `Rc<Cell<u64>>` so the bridge's `Rc<dyn Clock>` (which
+/// `wc.timer` reads at ARM time — see `install_timer`) and every `reduce`/`pump` call (which
+/// take a `&dyn Clock` directly) observe the SAME wall clock. Mirrors `plugin::pump::tests`'
+/// `SharedClock` — a fixed-value `TestClock` cannot express "arm at t, advance, fire", and a
+/// FRESH `TestClock` per call would leave the bridge's own (frozen-at-construction) clock
+/// stale, so a later re-arm would compute its due time against the WRONG "now" and self-fire
+/// on the very next pump — the bug this clock avoids.
+#[derive(Clone)]
+struct SharedClock(Rc<std::cell::Cell<u64>>);
+impl SharedClock {
+    fn new(ms: u64) -> Self { SharedClock(Rc::new(std::cell::Cell::new(ms))) }
+    fn set(&self, ms: u64) { self.0.set(ms); }
+}
+impl wordcartel_core::history::Clock for SharedClock {
+    fn now_ms(&self) -> u64 { self.0.get() }
+}
+
+/// The `pomodoro.lua` success-criterion demo (spec §11): the committed fixture, loaded
+/// exactly as `load_phase` (the SAME fn startup AND reload call) would read it off disk,
+/// with a real `[plugins.config.pomodoro]` section. Drives the whole timer subsystem
+/// end-to-end against a CONTROLLABLE, SHARED clock (see [`SharedClock`]) — no wall-clock
+/// sleep:
+///
+/// 1. `pomodoro.start` dispatched with arg `""` (Task 5's already-supplied-arg path, no
+///    minibuffer) arms exactly one `PluginTimer` at `now + 25·60·1000` — the configured
+///    default, proving `wc.config` reached the plugin.
+/// 2. The clock is advanced PAST the deadline and `reduce(Msg::Tick)` + `pump` run with
+///    NO input between (mirrors the run loop waking on `next_wake`, nothing else moving)
+///    — the one-shot fires DURING inactivity, `wc.status` reports completion (the
+///    observer-tier callback's only allowed surface), the timer is removed, and
+///    `next_wake` returns to `None`.
+/// 3. Re-armed, `pomodoro.cancel` disarms it directly (no wall-clock wait needed).
+/// 4. Re-armed again, `plugins_reload` (`perform_reload`) auto-disarms the whole
+///    schedule — the dead VM's timer cannot survive its own teardown.
+#[test]
+fn pomodoro_lua_e2e_success_demo() {
+    use crate::registry::Ctx;
+    use crate::commands::CommandResult;
+
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/plugins/pomodoro.lua");
+    let src = std::fs::read_to_string(&fixture)
+        .unwrap_or_else(|e| panic!("fixture must be readable at {}: {e}", fixture.display()));
+
+    let plugdir = tempfile::tempdir().unwrap();
+    std::fs::write(plugdir.path().join("pomodoro.lua"), &src).unwrap();
+    let cfgdir = tempfile::tempdir().unwrap();
+    let cfg_path = cfgdir.path().join("config.toml");
+    std::fs::write(&cfg_path, format!(
+        "[plugins]\ndir = {:?}\n\n[plugins.config.pomodoro]\nminutes = 25\n",
+        plugdir.path().to_str().unwrap())).unwrap();
+
+    let mut reg = crate::registry::Registry::builtins();
+    let mut host = crate::plugin::host::PluginHost::new().expect("VM construction");
+    let (cfg, cfg_warns) = crate::config::load(std::slice::from_ref(&cfg_path));
+    assert!(cfg_warns.is_empty(), "config must parse cleanly: {cfg_warns:?}");
+    let mut load_warns = Vec::new();
+    let inv = crate::plugin::reload::load_phase(&mut reg, &mut host, &cfg.plugins, None, &mut load_warns);
+    assert!(load_warns.is_empty(), "the demo plugin must load cleanly: {load_warns:?}");
+    assert_eq!(inv.len(), 1, "exactly one discovered plugin");
+    assert!(inv[0].error.is_none(), "pomodoro.lua must load with no error: {:?}", inv[0].error);
+    assert_eq!(inv[0].commands, 2, "pomodoro.lua registers exactly two commands: start + cancel");
+
+    let editor = Rc::new(RefCell::new(Editor::new_from_text("notes\n", None, (80, 24))));
+    let (tx, _rx) = mpsc::channel::<Msg>();
+    let clock = SharedClock::new(0);
+    host.attach_bridge(editor.clone(), tx.clone(),
+        Rc::new(clock.clone()) as Rc<dyn wordcartel_core::history::Clock>)
+        .expect("bridge attaches on a live VM");
+    let ex = InlineExecutor::default();
+    let (keymap, keymap_warns) = keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+    assert!(keymap_warns.is_empty(), "the plugin-loaded registry must resolve cleanly: {keymap_warns:?}");
+
+    let start_id = reg.resolve_name("pomodoro.start").expect("start command registered");
+    let cancel_id = reg.resolve_name("pomodoro.cancel").expect("cancel command registered");
+
+    // 1) Dispatch pomodoro.start with arg "" (blank ⇒ the configured/default minutes) — the
+    // already-supplied-arg path, so no minibuffer opens (Task 5 case 2).
+    {
+        let mut e = editor.borrow_mut();
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        let r = reg.dispatch_with_arg(start_id, &mut ctx, Some(String::new()));
+        assert_eq!(r, CommandResult::Handled);
+        assert!(e.minibuffer.is_none(), "an already-supplied arg must never open the prompt");
+    }
+    host.pump(&editor, &reg, &ex, &clock, &tx); // runs the Lua callback: arms wc.timer, sets status
+
+    let deadline = 25 * 60 * 1000u64;
+    assert_eq!(editor.borrow().pending_plugin_timers.len(), 1, "start arms exactly one timer");
+    assert_eq!(editor.borrow().status, "Pomodoro: 25 min session started");
+    assert_eq!(crate::timers::next_wake(&editor.borrow(), 0), Some(deadline),
+        "next_wake reflects the armed timer's due (armed at t=0, +25·60·1000ms)");
+
+    // 2) Advance the clock PAST the deadline; fire during inactivity — reduce(Tick) + pump,
+    // no input in between (mirrors the run loop waking on next_wake alone).
+    let fire_at = deadline + 1;
+    clock.set(fire_at);
+    let keep = reduce(Msg::Tick, &mut editor.borrow_mut(), &reg, &keymap, &ex, &clock, &tx);
+    assert!(keep, "Msg::Tick must not itself request quit");
+    host.pump(&editor, &reg, &ex, &clock, &tx);
+
+    assert_eq!(editor.borrow().status, "Pomodoro: 25 min session complete",
+        "the observer-tier callback ran DURING inactivity");
+    assert!(editor.borrow().pending_plugin_timers.is_empty(), "a one-shot is removed after firing");
+    assert_eq!(crate::timers::next_wake(&editor.borrow(), fire_at), None,
+        "nothing armed after the one-shot fires");
+
+    // 3) Re-arm, then cancel directly — no wall-clock wait needed. The re-arm's due
+    // (fire_at + deadline) is computed against the SAME live clock, so it does NOT
+    // self-fire on the cancel dispatch's pump (unlike a stale/frozen bridge clock would).
+    {
+        let mut e = editor.borrow_mut();
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        reg.dispatch_with_arg(start_id, &mut ctx, Some(String::new()));
+    }
+    host.pump(&editor, &reg, &ex, &clock, &tx);
+    assert_eq!(editor.borrow().pending_plugin_timers.len(), 1, "re-armed before cancel");
+    assert_eq!(crate::timers::next_wake(&editor.borrow(), fire_at), Some(fire_at + deadline));
+
+    {
+        let mut e = editor.borrow_mut();
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        reg.dispatch_with_arg(cancel_id, &mut ctx, None);
+    }
+    host.pump(&editor, &reg, &ex, &clock, &tx);
+    assert!(editor.borrow().pending_plugin_timers.is_empty(), "wc.timer_cancel disarms the session");
+    assert_eq!(editor.borrow().status, "Pomodoro: cancelled");
+    assert_eq!(crate::timers::next_wake(&editor.borrow(), fire_at), None);
+
+    // 4) Re-arm again, then plugins_reload — the dead VM's timer schedule must not survive
+    // its own teardown (P3 §3g auto-disarm).
+    {
+        let mut e = editor.borrow_mut();
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        reg.dispatch_with_arg(start_id, &mut ctx, Some(String::new()));
+    }
+    host.pump(&editor, &reg, &ex, &clock, &tx);
+    assert_eq!(editor.borrow().pending_plugin_timers.len(), 1, "re-armed before reload");
+
+    editor.borrow_mut().plugins_reload_requested = true;
+    crate::plugin::reload::perform_reload(
+        &mut host, &mut reg, &editor, std::slice::from_ref(&cfg_path), None, false, &tx);
+
+    assert!(host.has_vm(), "the reload must produce a live VM");
+    assert!(editor.borrow().pending_plugin_timers.is_empty(),
+        "plugins_reload auto-disarms the whole timer schedule (P3 §3g)");
+    assert!(!editor.borrow().has_on_change_subscriber,
+        "the dead VM's on_change subscription must not survive reload either");
+    assert_eq!(crate::timers::next_wake(&editor.borrow(), fire_at), None,
+        "next_wake must be None — nothing armed after auto-disarm");
+}
+
 /// `true` iff `s` is exactly 10 bytes shaped `\d{4}-\d{2}-\d{2}` — a dependency-free ISO-date
 /// shape check (avoids pulling in a regex crate for one test).
 fn is_iso_date(s: &str) -> bool {
