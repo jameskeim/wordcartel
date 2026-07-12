@@ -9,8 +9,11 @@ pub fn model_apply(model: &mut String, at: usize, del: usize, ins: &str) {
 /// One generated edit. Positions are BYTE offsets; callers snap to boundaries before applying.
 #[derive(Clone, Debug)]
 pub struct EditOp {
+    /// Byte offset where the edit is applied (pre-snap; snap to a char boundary before use).
     pub at:  usize,
+    /// Number of bytes to delete starting at `at`.
     pub del: usize,
+    /// Text to insert at `at`, after the deletion.
     pub ins: String,
 }
 

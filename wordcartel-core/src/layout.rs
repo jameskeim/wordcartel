@@ -32,8 +32,11 @@ pub struct Placed {
 /// `width` is the sum of display widths of the graphemes in this segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StyledSeg {
+    /// Display text of this segment (tabs expanded to spaces, matching `VisualRow::display`).
     pub text: String,
+    /// The style shared by every cell in this segment.
     pub style: crate::style::Style,
+    /// Sum of display widths of the graphemes in this segment.
     pub width: usize,
 }
 
@@ -436,6 +439,7 @@ pub fn layout(
 /// recomputes `row` from the offset; vertical motion sets `row` directly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cursor {
+    /// Source byte offset in the logical line.
     pub offset: usize,
     /// Visual row affinity (resolves the soft-wrap boundary ambiguity).
     pub row: usize,
@@ -444,6 +448,10 @@ pub struct Cursor {
 }
 
 impl Cursor {
+    /// Constructs a cursor at source byte `offset`, with row affinity and
+    /// desired column both reset to `0` (row 0, leftmost column). Callers
+    /// entering the cursor system from a raw offset should generally prefer
+    /// `cursor_at`, which additionally snaps to a valid stop.
     pub fn new(offset: usize) -> Self {
         Cursor { offset, row: 0, desired_col: 0 }
     }

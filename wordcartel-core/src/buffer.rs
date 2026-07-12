@@ -2,6 +2,9 @@
 use crate::BytePos;
 use std::ops::Range;
 
+/// A document's text content, backed by a `ropey::Rope`. The sole owner of
+/// byte↔char↔line conversion for the document (spec §16.1) — all buffer
+/// mutation and position math goes through this type, never a raw `String`.
 #[derive(Clone, Debug)]
 pub struct TextBuffer {
     rope: ropey::Rope,
@@ -11,14 +14,27 @@ impl TextBuffer {
     // Named `from_str` for readability at 61 call sites; std `FromStr` is inapplicable
     // (this constructor is infallible — no `Result`/`Err`). Renaming buys nothing.
     #[allow(clippy::should_implement_trait)]
+    /// Builds a `TextBuffer` from `s`'s content. Infallible — there is no
+    /// invalid input; the buffer takes an owned copy of `s`'s bytes.
+    ///
+    /// # Examples
+    /// ```
+    /// use wordcartel_core::buffer::TextBuffer;
+    ///
+    /// let buf = TextBuffer::from_str("hello");
+    /// assert_eq!(buf.to_string(), "hello");
+    /// assert_eq!(buf.len(), 5);
+    /// ```
     pub fn from_str(s: &str) -> Self {
         TextBuffer { rope: ropey::Rope::from_str(s) }
     }
 
+    /// Returns the buffer's content length in bytes.
     pub fn len(&self) -> usize {
         self.rope.len_bytes()
     }
 
+    /// Returns `true` iff the buffer holds no bytes.
     pub fn is_empty(&self) -> bool {
         self.rope.len_bytes() == 0
     }
@@ -36,6 +52,22 @@ impl TextBuffer {
         self.rope.char_to_byte(self.rope.byte_to_char(off))
     }
 
+    /// Inserts `text` at byte offset `at`, shifting everything from `at`
+    /// onward later in the buffer.
+    ///
+    /// # Panics
+    /// Panics if `at` is not a valid UTF-8 char boundary (see
+    /// `is_char_boundary`) — release-enforced because proceeding would
+    /// corrupt the buffer, never a silently-tolerated debug-only check.
+    ///
+    /// # Examples
+    /// ```
+    /// use wordcartel_core::buffer::TextBuffer;
+    ///
+    /// let mut buf = TextBuffer::from_str("hello world");
+    /// buf.insert(5, ",");
+    /// assert_eq!(buf.to_string(), "hello, world");
+    /// ```
     pub fn insert(&mut self, at: BytePos, text: &str) {
         assert!(
             self.is_char_boundary(at),
@@ -45,6 +77,21 @@ impl TextBuffer {
         self.rope.insert(char_idx, text);
     }
 
+    /// Deletes the byte range `range` from the buffer.
+    ///
+    /// # Panics
+    /// Panics if `range.start` or `range.end` is not a valid UTF-8 char
+    /// boundary (see `is_char_boundary`) — release-enforced, since proceeding
+    /// would corrupt the buffer.
+    ///
+    /// # Examples
+    /// ```
+    /// use wordcartel_core::buffer::TextBuffer;
+    ///
+    /// let mut buf = TextBuffer::from_str("hello, world");
+    /// buf.delete(0..7); // remove "hello, "
+    /// assert_eq!(buf.to_string(), "world");
+    /// ```
     pub fn delete(&mut self, range: Range<BytePos>) {
         assert!(
             self.is_char_boundary(range.start),
@@ -61,6 +108,20 @@ impl TextBuffer {
         self.rope.remove(start..end);
     }
 
+    /// Returns a copy of the buffer's content over the byte range `range`.
+    ///
+    /// # Panics
+    /// Panics if `range.start` or `range.end` is not a valid UTF-8 char
+    /// boundary (see `is_char_boundary`) — release-enforced, since returning
+    /// a mid-character slice would produce invalid UTF-8.
+    ///
+    /// # Examples
+    /// ```
+    /// use wordcartel_core::buffer::TextBuffer;
+    ///
+    /// let buf = TextBuffer::from_str("héllo");
+    /// assert_eq!(buf.slice(0..3), "hé"); // 'é' is 2 bytes (U+00E9)
+    /// ```
     pub fn slice(&self, range: Range<BytePos>) -> String {
         assert!(
             self.is_char_boundary(range.start),
@@ -75,10 +136,12 @@ impl TextBuffer {
         self.rope.byte_slice(range).to_string()
     }
 
+    /// Returns the 0-based index of the line containing byte offset `b`.
     pub fn byte_to_line(&self, b: BytePos) -> usize {
         self.rope.byte_to_line(b)
     }
 
+    /// Returns the byte offset of the start of the 0-based line `line`.
     pub fn line_to_byte(&self, line: usize) -> BytePos {
         self.rope.line_to_byte(line)
     }
@@ -96,6 +159,10 @@ impl TextBuffer {
         (line + 1, col + 1)
     }
 
+    /// Returns a cheap `O(1)` clone of the underlying rope — the
+    /// async-worker seam (spec §10.3) for handing a stable, independent
+    /// snapshot of the content to background work without blocking further
+    /// edits on this buffer.
     pub fn snapshot(&self) -> ropey::Rope {
         self.rope.clone() // O(1) — the async-worker seam (spec §10.3)
     }
