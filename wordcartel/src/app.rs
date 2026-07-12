@@ -657,8 +657,6 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             }
         }
     };
-    let reg = reg; // freeze — registration is done, the registry is read-only from here on
-
     // Build the keymap from the loaded config and surface any warnings.
     let (built_keymap, mut kw) = keymap::build_keymap(&cfg.keymap, &reg);
     warns.append(&mut kw);
