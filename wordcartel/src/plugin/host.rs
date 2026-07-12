@@ -1,11 +1,18 @@
-//! The plugin VM host: owns the one `mlua` VM + bridge, and the pump (Task 5). `null()` is the
-//! no-VM host used for `--no-plugins`, load failure, and tests that don't exercise plugins
-//! (mirrors `NullProvider`). Task 4 adds the real VM ([`PluginHost::new`]) and the registration
-//! sink ([`PendingReg`]) the load layer (`plugin::load`) drains into the `Registry` after each
-//! plugin's script executes, atomically per plugin. The bridge (`Rc<RefCell<Editor>>` +
-//! `Sender<Msg>` + clock) and `pump` (callback invocation) land in Task 5.
+//! The plugin VM host: owns the one `mlua` VM + bridge, and the pump. `null()` is the no-VM
+//! host used for `--no-plugins`, load failure, and tests that don't exercise plugins (mirrors
+//! `NullProvider`). Task 4 adds the real VM ([`PluginHost::new`]) and the registration sink
+//! ([`PendingReg`]) the load layer (`plugin::load`) drains into the `Registry` after each
+//! plugin's script executes, atomically per plugin. Task 5 adds the [`Bridge`] (the live
+//! `Rc<RefCell<Editor>>` + `Sender<Msg>` + clock the `wc.*` editor API closures capture,
+//! installed by [`PluginHost::attach_bridge`]) and [`PluginHost::pump`] — the two-phase
+//! drain-then-invoke that is the only place plugin Lua callbacks run.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use crate::editor::Editor;
 use crate::registry::{CommandId, MenuCategory};
+use wordcartel_core::history::Clock;
 
 /// One command a plugin's `wc.register_command` call queued during its exec pass. Collected
 /// into a shared sink — the registration closure can't hold `&mut Registry` across the Lua
@@ -18,12 +25,30 @@ pub struct PendingReg {
     pub menu: Option<MenuCategory>,
 }
 
+/// The plugin VM's live connection to app state, installed once by [`PluginHost::attach_bridge`]
+/// (Task 7's `run()`, after the `Rc<RefCell<Editor>>` wrap exists; tests call it directly).
+/// Owns an `Rc<dyn Clock>` — not a borrowed `&dyn Clock` — because the `wc.*` edit closures are
+/// `'static` (`create_function`) and so cannot borrow `run()`'s clock; each edit closure clones
+/// this `Rc` and passes `&*clock` to `submit_transaction`.
+pub struct Bridge {
+    pub editor: Rc<RefCell<Editor>>,
+    pub msg_tx: std::sync::mpsc::Sender<crate::app::Msg>,
+    pub clock: Rc<dyn Clock>,
+}
+
 /// The plugin VM host. `lua: None` is the null host (no VM, no plugins); `lua: Some(_)` owns
-/// the one real `mlua::Lua` for this app instance.
+/// the one real `mlua::Lua` for this app instance. `bridge` is `None` until
+/// [`PluginHost::attach_bridge`] installs it (and always `None` for the null host).
 pub struct PluginHost {
     lua: Option<mlua::Lua>, // None in the null host
-                             // bridge + pending drain added in Task 5
+    bridge: Option<Bridge>,
 }
+
+/// Runaway-callback wall-clock budget for the `set_hook` guard (spec §7: "~100–250 ms"; the
+/// Task 1 spike (§11.3) measured ~168µs of hook overhead at 10k-instruction granularity —
+/// negligible against any value in that range, so the midpoint is used). This is the line
+/// between "plugin bug" and "editor hang" — a direct no-silent-UI-waits requirement.
+const TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(150);
 
 impl PluginHost {
     /// A null host — no VM, no plugins. Used for `--no-plugins`, load failure, and tests
@@ -36,7 +61,7 @@ impl PluginHost {
     /// assert!(!host.has_vm());
     /// ```
     pub fn null() -> PluginHost {
-        PluginHost { lua: None }
+        PluginHost { lua: None, bridge: None }
     }
 
     /// Build the real VM: a safe `Lua::new()` (never `unsafe_new` — no debug/ffi libraries
@@ -56,7 +81,7 @@ impl PluginHost {
         if let Some(cap) = spike_confirmed_mem_cap() {
             lua.set_memory_limit(cap)?;
         }
-        Ok(PluginHost { lua: Some(lua) })
+        Ok(PluginHost { lua: Some(lua), bridge: None })
     }
 
     /// Whether this host owns a live VM. `false` for [`PluginHost::null`].
@@ -68,6 +93,86 @@ impl PluginHost {
     /// early-out: a null host loads nothing.
     pub(crate) fn lua(&self) -> Option<&mlua::Lua> {
         self.lua.as_ref()
+    }
+
+    /// Attach the live editor handle + message channel + clock and install the `wc.*` editor
+    /// API (`wc.text`, `wc.insert`, …) into the VM. A no-op on the null host (nothing to
+    /// install). Idempotent w.r.t. call count is NOT guaranteed — call once, at the point the
+    /// `Rc<RefCell<Editor>>` wrap first exists (`run()`'s job in Task 7; tests call it directly
+    /// with a `TestClock`).
+    pub fn attach_bridge(
+        &mut self,
+        editor: Rc<RefCell<Editor>>,
+        msg_tx: std::sync::mpsc::Sender<crate::app::Msg>,
+        clock: Rc<dyn Clock>,
+    ) -> mlua::Result<()> {
+        let Some(lua) = self.lua.as_ref() else { return Ok(()) };
+        let bridge = Bridge { editor, msg_tx, clock };
+        crate::plugin::api::install_editor_api(lua, &bridge)?;
+        self.bridge = Some(bridge);
+        Ok(())
+    }
+
+    /// Drain-then-invoke, single pass (P1 has no `wc.command` — §5/§1 — so no callback can grow
+    /// the queue mid-pump; a re-drain loop and a chain cap are P2 concerns). Takes the HANDLE,
+    /// never `&mut Editor`, so no borrow is held across Lua:
+    ///
+    /// - **Phase A** drains `editor.pending_plugin_calls` under a short `borrow_mut` scope that
+    ///   drops immediately (`std::mem::take` into a local `Vec`).
+    /// - **Phase B** invokes each drained call's stored Lua callback with NO outer borrow held —
+    ///   so each `wc.*` closure's own `try_borrow_mut` succeeds. Every invocation is wrapped in
+    ///   [`crate::panicx::catch`] (the spike found `mlua` resumes a raw Rust panic rather than
+    ///   converting it — `panicx` is the SOLE backstop, no gaps) and in [`Self::with_time_guard`]
+    ///   (the `set_hook` runaway-time abort). No `clock` parameter — the clock lives in the
+    ///   bridge, captured by the edit closures at [`Self::attach_bridge`] time.
+    pub fn pump(&mut self, editor: &Rc<RefCell<Editor>>) {
+        let Some(lua) = self.lua.as_ref() else { return };
+        // Phase A — drain under a short borrow that drops immediately.
+        let calls: Vec<crate::plugin::PluginCall> = {
+            let mut e = editor.borrow_mut();
+            std::mem::take(&mut e.pending_plugin_calls).into_iter().collect()
+        };
+        // Phase B — invoke with NO outer borrow held.
+        for call in calls {
+            let key = format!("wc-cmd-{}", call.id.0);
+            let outcome: Result<mlua::Result<()>, String> = crate::panicx::catch(|| {
+                let cb: mlua::Function = lua.named_registry_value(&key)?;
+                self.with_time_guard(lua, || cb.call::<()>(()))
+            });
+            if let Err(msg) = normalize(outcome) {
+                crate::plugin::plugin_error(editor, call.id.0, &msg);
+            }
+        }
+    }
+
+    /// The `set_hook` runaway guard (spike §11.3, GREEN): install an instruction-count hook
+    /// (every 10k instructions) that checks elapsed wall time and aborts with a typed Lua error
+    /// once [`TIME_BUDGET`] is exceeded. Scoped tightly around ONE callback invocation and
+    /// always removed afterward (`remove_hook`) — a leaked hook would fire during the NEXT
+    /// unrelated Lua call (registration, another plugin's callback).
+    fn with_time_guard<T>(&self, lua: &mlua::Lua, f: impl FnOnce() -> mlua::Result<T>) -> mlua::Result<T> {
+        let start = std::time::Instant::now();
+        lua.set_hook(mlua::HookTriggers::new().every_nth_instruction(10_000), move |_lua, _dbg| {
+            if start.elapsed() > TIME_BUDGET {
+                Err(mlua::Error::runtime("plugin: exceeded time budget"))
+            } else {
+                Ok(mlua::VmState::Continue)
+            }
+        });
+        let result = f();
+        lua.remove_hook();
+        result
+    }
+}
+
+/// Flatten the pump's two-layer outcome (an outer caught panic, an inner `mlua::Result` from a
+/// missing callback / Lua `error()` / a typed API error) to a single error message — a panic and
+/// a Lua-side failure surface identically to [`crate::plugin::plugin_error`].
+fn normalize(outcome: Result<mlua::Result<()>, String>) -> Result<(), String> {
+    match outcome {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(panic_msg) => Err(panic_msg),
     }
 }
 
@@ -85,14 +190,55 @@ fn spike_confirmed_mem_cap() -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::load::load_sources;
+    use crate::plugin::PluginCall;
+    use crate::registry::Registry;
+    use crate::test_support::TestClock;
+
+    fn sources(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(s, src)| (s.to_string(), src.to_string())).collect()
+    }
+
+    /// Channel + clock a test bridge needs; `msg_tx` is unused until Task 7 wires `wc.command`
+    /// dispatch — a plain unbound channel is enough to satisfy the `Bridge`'s field.
+    fn test_bridge_parts() -> (std::sync::mpsc::Sender<crate::app::Msg>, Rc<dyn Clock>) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        (tx, Rc::new(TestClock::new(0)))
+    }
+
+    /// Register ONE command (`t.cmd`, `fn = <src's function>`) into a fresh `Registry`, attach a
+    /// bridge over a fresh `Editor::new_from_text(text, ..)`, and enqueue that command's call —
+    /// ready for the test to `host.pump(&editor)` and assert on the outcome.
+    fn make(src_fn_body: &str, text: &str) -> (PluginHost, Rc<RefCell<Editor>>, CommandId) {
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().expect("VM construction");
+        let src = format!("wc.register_command{{ name='cmd', label='C', fn=function() {src_fn_body} end }}");
+        let reports = load_sources(&mut reg, &host, &sources(&[("t", &src)]));
+        assert_eq!(reports[0].result, Ok(1), "test plugin must register cleanly: {:?}", reports[0].result);
+        let id = reg.resolve_name("t.cmd").expect("registered under t.cmd");
+
+        let editor = Rc::new(RefCell::new(Editor::new_from_text(text, None, (40, 10))));
+        let (tx, clock) = test_bridge_parts();
+        host.attach_bridge(editor.clone(), tx, clock).expect("bridge attaches on a live VM");
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id });
+        (host, editor, id)
+    }
+
+    fn whole_text(editor: &Rc<RefCell<Editor>>) -> String {
+        let e = editor.borrow();
+        let buf = &e.active().document.buffer;
+        buf.slice(0..buf.len())
+    }
 
     #[test]
-    fn null_host_constructs_and_pumps_noop() {
-        // The null host holds no VM. Once `pump` exists (Task 5) it is a no-op on an empty
-        // queue — here we only assert the null host exists and is inert.
-        let host = PluginHost::null();
+    fn null_host_pumps_noop_on_empty_queue() {
+        // The null host holds no VM; pump must be a harmless no-op (no panic, nothing enqueued
+        // to drain either way).
+        let mut host = PluginHost::null();
         assert!(!host.has_vm());
-        assert!(host.lua().is_none());
+        let editor = Rc::new(RefCell::new(Editor::new_from_text("x", None, (40, 10))));
+        host.pump(&editor);
+        assert_eq!(whole_text(&editor), "x");
     }
 
     #[test]
@@ -100,5 +246,171 @@ mod tests {
         let host = PluginHost::new().expect("VM construction must succeed");
         assert!(host.has_vm());
         assert!(host.lua().is_some());
+    }
+
+    #[test]
+    fn pump_runs_enqueued_plugin_command() {
+        let (mut host, editor, _id) = make("wc.insert('X')", "hello");
+        host.pump(&editor);
+        assert_eq!(whole_text(&editor), "Xhello", "the command's wc.insert must land at the caret");
+    }
+
+    #[test]
+    fn pump_holds_no_borrow_during_lua() {
+        // wc.text() then wc.insert() then wc.cursor() in sequence: each call takes and drops
+        // its own short borrow — no "editor busy" from an outer borrow the pump might hold.
+        let (mut host, editor, _id) = make(
+            "local t = wc.text(); wc.insert('Y'); local c = wc.cursor(); wc.status(t .. '/' .. tostring(c))",
+            "ab",
+        );
+        host.pump(&editor);
+        assert_eq!(whole_text(&editor), "Yab");
+        let status = editor.borrow().status.clone();
+        assert_eq!(status, "ab/1", "wc.text saw the pre-insert buffer, wc.cursor the post-insert caret");
+    }
+
+    #[test]
+    fn wc_replace_reversed_range_is_typed_error_no_panic() {
+        let (mut host, editor, _id) = make("wc.replace(10, 2, 'x')", "hello world");
+        host.pump(&editor);
+        assert_eq!(whole_text(&editor), "hello world", "reversed range must not mutate the buffer");
+        let status = editor.borrow().status.clone();
+        assert!(status.contains("plugin"), "status: {status}");
+        assert!(!status.to_lowercase().contains("panic"), "must be a clean degrade, not a caught panic: {status}");
+    }
+
+    #[test]
+    fn wc_replace_oob_range_is_typed_error_no_panic() {
+        let (mut host, editor, _id) = make("wc.replace(0, 999, 'x')", "hello world");
+        host.pump(&editor);
+        assert_eq!(whole_text(&editor), "hello world", "out-of-bounds range must not mutate the buffer");
+        let status = editor.borrow().status.clone();
+        assert!(!status.to_lowercase().contains("panic"), "status: {status}");
+    }
+
+    #[test]
+    fn wc_replace_mid_char_offset_is_typed_error_no_panic() {
+        // "h\u{e9}llo" — 'é' occupies bytes [1,3); byte offset 2 lands mid-char.
+        let (mut host, editor, _id) = make("wc.replace(2, 3, 'x')", "h\u{e9}llo");
+        host.pump(&editor);
+        assert_eq!(whole_text(&editor), "h\u{e9}llo", "a mid-char offset must not mutate the buffer");
+        let status = editor.borrow().status.clone();
+        assert!(!status.to_lowercase().contains("panic"), "status: {status}");
+    }
+
+    #[test]
+    fn wc_text_reversed_range_is_typed_error_no_panic() {
+        let (mut host, editor, _id) = make(
+            "local ok, err = pcall(wc.text, 10, 2); wc.status(tostring(ok) .. ':' .. tostring(err))",
+            "hi",
+        );
+        host.pump(&editor);
+        assert_eq!(whole_text(&editor), "hi");
+        let status = editor.borrow().status.clone();
+        assert!(status.starts_with("false:"), "wc.text(10,2) must fail (pcall false), got: {status}");
+        assert!(!status.to_lowercase().contains("panic"), "must be a clean degrade, not a caught panic: {status}");
+    }
+
+    #[test]
+    fn wc_insert_over_paste_max_is_typed_error_buffer_unchanged() {
+        // Built inside Lua (`string.rep`) so the Rust-side source stays tiny even though the
+        // cap itself is multi-megabyte.
+        let (mut host, editor, _id) = make(
+            &format!("wc.insert(string.rep('a', {}))", crate::limits::PASTE_MAX_BYTES + 1),
+            "doc",
+        );
+        host.pump(&editor);
+        assert_eq!(whole_text(&editor), "doc", "an over-cap insert must never reach a Tendril alloc/ChangeSet");
+        let status = editor.borrow().status.clone();
+        assert!(status.contains("plugin"), "status: {status}");
+    }
+
+    #[test]
+    fn wc_status_over_max_is_truncated_on_char_boundary() {
+        let (mut host, editor, _id) =
+            make(&format!("wc.status(string.rep('a', {}))", crate::limits::PLUGIN_MAX_STATUS_LEN + 100), "doc");
+        host.pump(&editor);
+        let status = editor.borrow().status.clone();
+        assert_eq!(status.len(), crate::limits::PLUGIN_MAX_STATUS_LEN);
+        assert!(status.chars().all(|c| c == 'a'));
+    }
+
+    #[test]
+    fn wc_status_truncation_backs_off_a_split_multibyte_char() {
+        let prefix_len = crate::limits::PLUGIN_MAX_STATUS_LEN - 1;
+        let (mut host, editor, _id) =
+            make(&format!("wc.status(string.rep('a', {prefix_len}) .. '\u{e9}')"), "doc");
+        host.pump(&editor);
+        let status = editor.borrow().status.clone();
+        // The 2-byte 'é' straddles the cap; truncation must back off before its lead byte
+        // rather than splitting it (which would panic a naive byte-slice) or over-including it.
+        assert_eq!(status.len(), prefix_len);
+        assert!(status.chars().all(|c| c == 'a'));
+    }
+
+    #[test]
+    fn lua_error_in_callback_is_isolated_and_reported() {
+        let (mut host, editor, _id) = make("error('boom')", "x");
+        host.pump(&editor);
+        let status = editor.borrow().status.clone();
+        assert!(status.contains("boom"), "status: {status}");
+        assert_eq!(whole_text(&editor), "x", "editor must be untouched by a callback error");
+    }
+
+    #[test]
+    fn panicking_callback_is_isolated_and_subsequent_pump_still_works() {
+        let mut host = PluginHost::new().expect("VM construction");
+        let editor = Rc::new(RefCell::new(Editor::new_from_text("x", None, (40, 10))));
+        let (tx, clock) = test_bridge_parts();
+        host.attach_bridge(editor.clone(), tx, clock).expect("bridge attaches on a live VM");
+
+        // A raw Lua-callable Rust closure that panics, stored directly under the pump's
+        // expected named-registry key — bypassing wc.register_command entirely. The Task 1
+        // spike found mlua does NOT convert a Rust panic to an mlua::Error (it resumes the raw
+        // panic), so this exercises panicx::catch as the sole backstop, not a redundant one.
+        let panic_id = CommandId(crate::plugin::intern("panic-test.boom"));
+        {
+            let lua = host.lua().expect("live VM");
+            let f = lua
+                .create_function(|_, ()| -> mlua::Result<()> { panic!("callback panic") })
+                .expect("create_function");
+            lua.set_named_registry_value(&format!("wc-cmd-{}", panic_id.0), f).expect("store callback");
+        }
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: panic_id });
+        host.pump(&editor);
+        let status = editor.borrow().status.clone();
+        assert!(status.contains("callback panic"), "status: {status}");
+        assert_eq!(whole_text(&editor), "x", "a panicking callback must not touch the editor");
+
+        // A subsequent pump of a normal command still runs — the panic did not poison the
+        // VM or the pump loop.
+        let mut reg = Registry::builtins();
+        let src = "wc.register_command{ name='good', label='Good', fn=function() wc.insert('G') end }";
+        let reports = load_sources(&mut reg, &host, &sources(&[("u", src)]));
+        assert_eq!(reports[0].result, Ok(1));
+        let good_id = reg.resolve_name("u.good").expect("registered");
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: good_id });
+        host.pump(&editor);
+        assert_eq!(whole_text(&editor), "Gx");
+    }
+
+    #[test]
+    fn editor_busy_on_nested_reentry_degrades_not_panics() {
+        // White-box: hold a borrow across the call to force the defensive try_borrow_mut Err
+        // path — the normal pump path never does this (Phase A's borrow is always gone before
+        // Phase B invokes any callback).
+        let mut host = PluginHost::new().expect("VM construction");
+        let editor = Rc::new(RefCell::new(Editor::new_from_text("x", None, (40, 10))));
+        let (tx, clock) = test_bridge_parts();
+        host.attach_bridge(editor.clone(), tx, clock).expect("bridge attaches on a live VM");
+
+        let held = editor.borrow_mut(); // simulate a nested re-entry
+        let lua = host.lua().expect("live VM");
+        let result: mlua::Result<()> = lua.load("wc.insert('Z')").exec();
+        drop(held);
+
+        let err = result.expect_err("a nested borrow must degrade, not succeed");
+        assert!(err.to_string().contains("editor busy"), "error: {err}");
+        assert_eq!(whole_text(&editor), "x", "no mutation happened under the nested borrow");
     }
 }
