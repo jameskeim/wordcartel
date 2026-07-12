@@ -73,9 +73,10 @@ A new module family under `wordcartel/src/plugin/`. Nothing plugin-specific leak
   `Rc<RefCell<Editor>>` handle + a `Sender<Msg>` clone for status). The `PluginCall` **queue lives on
   `Editor`** (`Editor.pending_plugin_calls: VecDeque<PluginCall>` — §3c), because both the registry
   dispatch arm and the pump reach `Editor` but neither reaches the host. Exposes
-  `PluginHost::new(bridge) -> Result<PluginHost, HostError>` and `pump(&mut self, editor: &mut Editor,
-  …)` (drains `editor.pending_plugin_calls` — §3). Carries a `wordcartel/tests/module_budgets.rs`
-  production-line budget from day one.
+  `PluginHost::new(bridge) -> Result<PluginHost, HostError>` and — **critically** —
+  `pump(&mut self, editor: &Rc<RefCell<Editor>>)`: the pump takes the **handle**, NOT `&mut Editor`, so
+  it holds no `RefMut` across Lua (§3c). Carries a `wordcartel/tests/module_budgets.rs` production-line
+  budget from day one.
 - **`plugin/api.rs` — the `wc` table.** Builds the global `wc` Lua table WezTerm-style: a **flat
   registration-seam vector** of `fn(&Lua, &Bridge) -> mlua::Result<()>` entries, each installing one
   API area's `create_function`s. Adding an API area is one function + one row — never editing a
@@ -84,26 +85,33 @@ A new module family under `wordcartel/src/plugin/`. Nothing plugin-specific leak
   filesystem-free testable core (real Lua, string sources). A thin shell-side `discover(dir) ->
   Vec<(String, String)>` does the `read_dir` + bounded read and feeds the core (§6).
 - **`Rc<RefCell<Editor>>` confined to `app::run` — multiple short borrow scopes per iteration.** Today
-  `run` owns `let mut editor` (`app.rs:471`) and every loop stage takes `&mut editor` in sequence:
-  `timers::pre_recv` (~`app.rs:736`), `reduce` (~`754`), `rebuild_keymap_if_requested`/
-  `rederive_theme_if_requested` (~`755`/`760`), the settings-save arm (~`761`), `surface_undo_eviction`
-  (~`770`), `drain_clipboard_intents` (~`771`), `reconcile_mouse_capture` (~`772`), `advance` (~`773`),
-  and `render::render` (~`774`, and `render` itself takes `&mut Editor` — `render.rs:216`). P1 wraps the
-  loop-local editor as `let editor = Rc::new(RefCell::new(editor_val));` and **each existing stage takes
-  its own short `editor.borrow_mut()` scope that drops immediately** — i.e. many short borrows per
-  iteration, NOT one long `borrow_mut` spanning the whole body. This is the mechanical change: every
-  existing `stage(&mut editor, …)` call becomes `stage(&mut editor.borrow_mut(), …)` (or an explicit
+  `run` owns `let mut editor` (`app.rs:471`) and every loop stage takes editor in sequence:
+  `timers::next_wake(&editor, now)` (~`app.rs:740`, an **immutable `borrow()`**), `timers::pre_recv`
+  (~`736`), `reduce` (~`754`), `rebuild_keymap_if_requested`/`rederive_theme_if_requested`
+  (~`755`/`760`), the settings-save arm (~`761`), `surface_undo_eviction` (~`770`),
+  `drain_clipboard_intents` (~`771`), `reconcile_mouse_capture` (~`772`), `advance` (~`773`),
+  `render::render` (~`774`, and `render` itself takes `&mut Editor` — `render.rs:216`), and the
+  post-render session-persist check + use (~`776`–`779`: reads `saved_version`, then borrows for
+  `persist_session`). P1 wraps the loop-local editor as
+  `let editor = Rc::new(RefCell::new(editor_val));` and **each stage above takes its own short
+  `editor.borrow()`/`borrow_mut()` scope that drops immediately** — i.e. many short borrows per
+  iteration, NOT one long borrow spanning the loop body. Every existing `stage(&mut editor, …)` call
+  becomes `stage(&mut editor.borrow_mut(), …)` (or an explicit
   `{ let mut e = editor.borrow_mut(); stage(&mut e, …); }` scope where the borrow must end before the
-  next stage). `reduce` and every helper keep their `&mut Editor` signatures unchanged — the
-  `Rc<RefCell>` is a `run()`-local detail, invisible to the rest of the shell and to core.
-- **The pump runs in its OWN scope with NO outer borrow held.** It is inserted as a new stage between
-  `reduce` and the keymap/theme arms. Because the `reduce` borrow scope has already dropped and the pump
-  itself holds no `borrow_mut` when it enters Lua, each API closure's per-call `try_borrow_mut` (§3a)
-  succeeds. The post-`reduce` sequence is therefore:
-  **`reduce` (borrow scope A) → `plugin pump` (no outer borrow; each API call takes+drops its own
-  borrow) → keymap/theme/settings arms (borrow scope B…) → `advance` → `render` (borrow scope N).**
-  The pump runs before `advance`/`render`, so plugin effects land in the *same frame* (no Fresh-style
-  one-frame lag).
+  next stage; `next_wake` uses `&editor.borrow()`). `reduce` and every helper keep their `&mut Editor`
+  signatures unchanged — the `Rc<RefCell>` is a `run()`-local detail, invisible to the rest of the shell
+  and to core.
+- **The pump runs in its OWN stage holding NO outer borrow — it takes the handle, not `&mut Editor`.**
+  Inserted between `reduce` and the keymap/theme arms, it is called as `host.pump(&editor)` (the
+  `Rc<RefCell<Editor>>` handle by reference) — deliberately NOT `host.pump(&mut editor.borrow_mut())`,
+  which would hold a `RefMut` across the whole pump body and make every `wc.*` re-borrow hit "editor
+  busy." Internally the pump drains the queue under a short `borrow_mut` that drops, then runs callbacks
+  with nothing held (§3c), so each API closure's per-call `try_borrow_mut` (§3a) succeeds. The
+  post-`reduce` sequence is therefore:
+  **`reduce` (borrow scope A) → `plugin pump` (takes the handle; no outer borrow; each API call and the
+  internal drain take+drop their own borrow) → keymap/theme/settings arms (borrow scope B…) → `advance`
+  → `render` (borrow scope N) → session-persist.** The pump runs before `advance`/`render`, so plugin
+  effects land in the *same frame* (no Fresh-style one-frame lag).
 - **`PluginHost` is `Option` in the loop / null when absent.** `--no-plugins`, a load-time VM failure,
   or the no-plugins-dir case leaves `plugin_host: Option<PluginHost> = None`; the pump stage is a
   cheap `if let Some(h) = …` (mirrors the `NullProvider` / boxed-`DiagnosticsProvider` null-object
@@ -137,8 +145,8 @@ it reflects the insert), which a snapshot model cannot do.
 There is no raw-state API by construction — the bridge simply never exposes one. Edit functions build a
 `ChangeSet` against the *live* buffer length and submit through the proven boundary
 (`transact::submit_transaction(editor, txn, clock) -> Result<(), EditError>`):
-- `wc.insert(text)` → `ChangeSet::insert(cursor, text, len)` (`change.rs:63`) at the primary head.
-- `wc.replace(a, b, text)` → built via `ChangeSet::from_ops(ops, doc_len)` (`change.rs:118`) with the
+- `wc.insert(text)` → `ChangeSet::insert(cursor, text, len)` (`wordcartel-core/src/change.rs:63`) at the primary head.
+- `wc.replace(a, b, text)` → built via `ChangeSet::from_ops(ops, doc_len)` (`wordcartel-core/src/change.rs:118`) with the
   exact `Op::{Retain, Delete, Insert}` pattern the existing private `replace_changeset`
   (`commands.rs:110`) already uses: `Retain(a)` if `a>0`, `Delete(b-a)` if `b>a`, `Insert(text)` if
   non-empty, `Retain(doc_len-b)` if `doc_len>b`. **Reuse that helper's shape** — the cleanest path is to
@@ -167,35 +175,48 @@ thing both already touch is the **`Editor`**. So the queue lives on `Editor`:
 - The registry's `HandlerKind::Plugin` dispatch arm (§4) pushes `PluginCall { id }` onto
   `ctx.editor.pending_plugin_calls` and returns `CommandResult::Handled` — it does **not** call Lua and
   imports no `mlua` type.
-- `PluginHost::pump(editor: &mut Editor, …)` drains `editor.pending_plugin_calls` FIFO. For each
-  `PluginCall`, it looks up the plugin's stored Lua callback (a value in Lua's named registry, keyed by
-  the command id string — WezTerm's persistent-callback pattern) and invokes it inside `panicx::catch` +
-  the `set_hook` time guard (§7). (The pump takes its short `borrow_mut` to drain the queue into a local,
-  releases it, then runs callbacks — whose API calls take their own borrows — so no borrow is held across
-  Lua; §2 borrow choreography.)
+- `PluginHost::pump(&mut self, editor: &Rc<RefCell<Editor>>)` takes the **handle**, not `&mut Editor`,
+  so it never holds a borrow across Lua. It runs a **bounded drain-and-invoke loop** — the two phases
+  alternate until the queue is empty or the chain cap trips:
+  - **Phase A — drain (short `borrow_mut` scope, drops immediately).** `{ let mut e =
+    editor.borrow_mut(); std::mem::take(&mut e.pending_plugin_calls) }` pops the currently-queued
+    `PluginCall`s into a local `Vec`; the `RefMut` is released before Phase B.
+  - **Phase B — invoke (NO outer borrow held).** For each drained `PluginCall`, look up the plugin's
+    stored Lua callback (a value in Lua's named registry, keyed by the command id string — WezTerm's
+    persistent-callback pattern) and invoke it inside `panicx::catch` + the `set_hook` time guard (§7).
+    Each `wc.*`/editor API closure re-borrows via its **own captured `Rc<RefCell<Editor>>` clone** with a
+    short `try_borrow_mut` (§3a) — which succeeds precisely because Phase A's borrow is gone and the pump
+    holds nothing.
+  - A callback that enqueues another plugin command (via `wc.command`, below) grows
+    `pending_plugin_calls`; the loop returns to Phase A and drains the new batch **in the same pump**, so
+    plugin→plugin chains resolve same-frame. A running **chain counter** across the whole pump enforces
+    `MAX_PLUGIN_CHAIN` (below); reaching it stops the loop.
 
-The pump, drilled down:
+The pump, drilled down (Phase B, per call):
 
-1. Drains `editor.pending_plugin_calls` FIFO into a local. For each `PluginCall`, looks up the callback
-   and invokes it inside `panicx::catch` + the `set_hook` time guard (§7).
+1. Look up the callback and invoke it inside `panicx::catch` + the `set_hook` time guard (§7).
 2. Each invoked callback may itself call `wc.command("<id>")`. If the target is another **plugin**
-   command, it is **enqueued**, not recursed — so callbacks never re-enter Lua under their own call
-   stack. If the target is a **builtin**, it is dispatched immediately through the normal registry
-   `Ctx` path (builtins are non-re-entrant Rust and hold their own borrow discipline).
-3. A **per-pump chain cap** (constant `MAX_PLUGIN_CHAIN = 16`) bounds the total callbacks executed in
-   one pump. Exceeding it aborts the remaining queue with a `plugin_error` ("plugin command chain
-   exceeded 16 — possible loop") — pre-empting the render→hook→render feedback class (Fresh hit a 13 Hz
-   loop; we make it impossible to hang the frame).
+   command, it is **enqueued** onto `pending_plugin_calls` (drained by the next Phase-A pass), not
+   recursed — so callbacks never re-enter Lua under their own call stack. If the target is a **builtin**,
+   it is dispatched immediately through the normal registry `Ctx` path (builtins are non-re-entrant Rust
+   and hold their own borrow discipline).
+3. A **per-pump chain cap** (constant `MAX_PLUGIN_CHAIN = 16`) bounds the total callbacks executed across
+   all Phase-A/B passes of one pump. Exceeding it aborts the remaining queue with a `plugin_error`
+   ("plugin command chain exceeded 16 — possible loop") — pre-empting the render→hook→render feedback
+   class (Fresh hit a 13 Hz loop; we make it impossible to hang the frame).
 
 Because the pump runs before `advance`/`draw`, effects are visible the same frame. Because it runs with
 no editor borrow held, the API closures' `try_borrow_mut` always succeeds in the normal path.
 
-### d. Re-entrancy → "editor busy" (degrade, not panic)
-Every API closure uses `try_borrow_mut`, never `borrow_mut`. In the designed control flow the pump holds
-no borrow, so this always succeeds. But should any future path invoke Lua while a borrow is live, the
-`try_borrow_mut` returns `Err` and the API function raises a Lua error `"editor busy"` → status line —
-a graceful degrade, never a `RefCell` double-borrow panic. This is a defensive invariant, tested
-directly (§8), not a hoped-for property.
+### d. Re-entrancy → "editor busy" (degrade, not panic) — the defensive backstop, NOT the normal path
+Every API closure uses `try_borrow_mut`, never `borrow_mut`. In the normal pump path this **always
+succeeds**: the pump holds no borrow (§3c takes the handle, not `&mut Editor`), and each API call takes
+and releases its own short borrow, so consecutive `wc.*` calls in one callback never overlap. The
+"editor busy" degrade is therefore reserved for **genuine nested re-entry** — a callback that somehow
+triggers a *second* live borrow of the same `RefCell` before its first has dropped (e.g. a future API
+that re-enters Lua mid-borrow). In that case `try_borrow_mut` returns `Err` and the API function raises a
+Lua error `"editor busy"` → status line — a graceful degrade, never a `RefCell` double-borrow panic. It
+is a defensive invariant, tested directly (§8), not something the normal path exercises.
 
 ---
 
@@ -393,11 +414,12 @@ plugins ("the fourth actor … plugins route through the registry spine").
 
 ## 10. Anti-regrowth / module structure
 
-- **`app.rs` stays under budget (818/1000 *production* lines — the cap in
-  `wordcartel/tests/module_budgets.rs:48–52` counts lines before `mod tests` at `:818`; full file 4447).
+- **`app.rs` stays under budget (817/1000 *production* lines — the cap in
+  `wordcartel/tests/module_budgets.rs:48–52` counts lines before `mod tests` at `app.rs:818`, i.e. 817).
   Its own budget comment names Effort P the budget most at risk.** P1's footprint in `app.rs` is
   deliberately tiny: the `Rc<RefCell>` wrap of the loop-local editor + the per-stage `borrow_mut` scopes
-  (§2 — mechanical, near-zero net lines), one `if let Some(h) = plugin_host { h.pump(...) }` stage call,
+  (§2 — mechanical, near-zero net lines), one `if let Some(h) = &mut plugin_host { h.pump(&editor) }`
+  stage call,
   and host construction near the other startup wiring. All plugin *logic* lives in `plugin/`. Target:
   single-digit net line growth in `app.rs`.
 - **`registry.rs` growth bounded.** The change is the `HandlerKind` enum + the `Plugin` dispatch arm
