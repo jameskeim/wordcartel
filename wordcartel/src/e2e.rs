@@ -421,17 +421,21 @@ fn no_plugin_host_journey_is_unaffected() {
     assert_eq!(h.doc_text(), "hello world\n");
 }
 
-/// spec §8's loaded-but-idle guardrail (extends the swap SSD-wear guardrail family): a
-/// plugin loaded but never dispatched must do ZERO work while the app sits idle. The
-/// plugin's callback increments a Lua-global counter (not editor state) — inspectable
-/// directly off the host's own VM as a "host-side counter" without adding any production
-/// instrumentation. Proves "loaded ≠ background work": P1 plugins arm no deadline, so
-/// `timers::next_wake` must be unchanged by driving idle `Msg::Tick`s across real elapsed
-/// wall-clock time, and `pending_plugin_calls` must never gain an entry on its own.
+/// spec §8's loaded-but-idle guardrail (extends the swap SSD-wear guardrail family), grown by
+/// P2 Task 9 to also cover an `on_save` HOOK (not just a command): a plugin loaded but never
+/// dispatched/fired must do ZERO work while the app sits idle. Both callbacks increment their
+/// own Lua-global counter (not editor state) — inspectable directly off the host's own VM as a
+/// "host-side counter" without adding any production instrumentation. Proves "loaded ≠
+/// background work": P1/P2 plugins arm no deadline, so `timers::next_wake` must be unchanged by
+/// driving idle `Msg::Tick`s across real elapsed wall-clock time, and NONE of the three plugin
+/// queues (`pending_plugin_calls`/`pending_plugin_events`/`pending_plugin_dispatch`) may gain an
+/// entry on their own — events are edge-triggered by real ops, never by idle time.
 #[test]
 fn plugin_loaded_idle_drives_zero_callback_invocations_and_stable_wake() {
     let src = "calls = 0\n\
-               wc.register_command{ name='cmd', label='Counter', fn=function() calls = calls + 1 end }";
+               wc.register_command{ name='cmd', label='Counter', fn=function() calls = calls + 1 end }\n\
+               hook_calls = 0\n\
+               wc.on('save', function(ev) hook_calls = hook_calls + 1 end)";
     let mut h = Harness::new_with_plugin("hello\n", &[("counter", src)]);
     // Precondition: nothing is armed on a fresh, unedited, diagnostics-disabled buffer —
     // else "unchanged" below would be vacuously true against an already-Some deadline.
@@ -444,9 +448,14 @@ fn plugin_loaded_idle_drives_zero_callback_invocations_and_stable_wake() {
     let calls: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("calls")
         .expect("the plugin's Lua-global counter must exist");
     assert_eq!(calls, 0, "idle Msg::Tick must never invoke a plugin callback — loaded is not background work");
+    let hook_calls: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("hook_calls")
+        .expect("the plugin's hook counter must exist");
+    assert_eq!(hook_calls, 0, "idle Msg::Tick must never fire an on_save hook — loaded is not background work");
     assert!(h.editor.borrow().pending_plugin_calls.is_empty(), "no plugin call was ever queued while idle");
+    assert!(h.editor.borrow().pending_plugin_events.is_empty(), "no plugin event was ever queued while idle");
+    assert!(h.editor.borrow().pending_plugin_dispatch.is_empty(), "no wc.command dispatch was ever queued while idle");
     let wake_after = crate::timers::next_wake(&h.editor.borrow(), h.now);
-    assert_eq!(wake_before, wake_after, "P1 plugins arm no deadline — next_wake must stay None across idle ticks");
+    assert_eq!(wake_before, wake_after, "P1/P2 plugins arm no deadline — next_wake must stay None across idle ticks");
     assert_eq!(h.doc_text(), "hello\n", "idle ticks must not mutate the document");
 }
 
@@ -687,6 +696,100 @@ fn is_iso_date(s: &str) -> bool {
         && b[5..7].iter().all(u8::is_ascii_digit)
         && b[7] == b'-'
         && b[8..10].iter().all(u8::is_ascii_digit)
+}
+
+// ---------------------------------------------------------------------------
+// P2 Task 9: full §12 suite consolidation — the wordcount.lua demo.
+// ---------------------------------------------------------------------------
+
+/// The `wordcount.lua` success-criterion demo (spec §12): the committed fixture, loaded exactly
+/// as `load_phase` (the SAME fn startup AND reload call) would read it off disk — mirrors
+/// `insert_date_lua_e2e_success_demo`'s "load like production" discipline, but for the P2
+/// surface: it registers ONLY an `on_save` hook (no command), the P2 counterpart to P1's
+/// command-only `insert_date.lua`. It captures its `min_words` goal from
+/// `[plugins.config.wordcount]` at load, and on a REAL save (the same `dispatch_save` →
+/// `InlineExecutor` → `apply_outcome` → pump choreography `on_save_hook_fires_on_real_save`
+/// already proved) reports the live word count via `wc.status`. A live `plugins_reload` of an
+/// EDITED copy of the plugin is then reflected on the very next save — proving the demo's
+/// behavior tracks the on-disk source, not a load-time fluke.
+#[test]
+fn wordcount_lua_e2e_success_demo() {
+    use crate::registry::Ctx;
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/plugins/wordcount.lua");
+    let src = std::fs::read_to_string(&fixture)
+        .unwrap_or_else(|e| panic!("fixture must be readable at {}: {e}", fixture.display()));
+
+    let plugdir = tempfile::tempdir().unwrap();
+    std::fs::write(plugdir.path().join("wordcount.lua"), &src).unwrap();
+    let cfgdir = tempfile::tempdir().unwrap();
+    let cfg_path = cfgdir.path().join("config.toml");
+    std::fs::write(&cfg_path, format!(
+        "[plugins]\ndir = {:?}\n\n[plugins.config.wordcount]\nmin_words = 100\n",
+        plugdir.path().to_str().unwrap())).unwrap();
+
+    let mut reg = crate::registry::Registry::builtins();
+    let mut host = crate::plugin::host::PluginHost::new().expect("VM construction");
+    let (cfg, cfg_warns) = crate::config::load(std::slice::from_ref(&cfg_path));
+    assert!(cfg_warns.is_empty(), "config must parse cleanly: {cfg_warns:?}");
+    let mut load_warns = Vec::new();
+    let inv = crate::plugin::reload::load_phase(&mut reg, &mut host, &cfg.plugins, None, &mut load_warns);
+    assert!(load_warns.is_empty(), "the demo plugin must load cleanly: {load_warns:?}");
+    assert_eq!(inv.len(), 1, "exactly one discovered plugin");
+    assert!(inv[0].error.is_none(), "wordcount.lua must load with no error: {:?}", inv[0].error);
+    assert_eq!(inv[0].hooks, 1, "wordcount.lua registers exactly one hook");
+    assert_eq!(inv[0].commands, 0, "wordcount.lua is a hook-only demo, unlike insert_date.lua");
+
+    // A real save: the buffer holds 3 words, under the configured 100-word goal.
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    std::fs::write(&path, "alpha beta gamma\n").unwrap();
+    let editor = Rc::new(RefCell::new(
+        Editor::new_from_text("alpha beta gamma\n", Some(path.clone()), (80, 24))));
+    let (tx, _rx) = mpsc::channel::<Msg>();
+    let clock = TestClock(0);
+    host.attach_bridge(editor.clone(), tx.clone(),
+        Rc::new(TestClock::new(0)) as Rc<dyn wordcartel_core::history::Clock>)
+        .expect("bridge attaches on a live VM");
+    let ex = InlineExecutor::default();
+    {
+        let mut e = editor.borrow_mut();
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        crate::save::dispatch_save(&mut ctx);
+    }
+    {
+        let outcomes = ex.drain();
+        let mut e = editor.borrow_mut();
+        for o in outcomes { crate::jobs_apply::apply_outcome(o, &mut e); }
+    }
+    host.pump(&editor, &reg, &ex, &clock, &tx);
+    assert_eq!(editor.borrow().status, "Saved — 3 words (goal: 100)",
+        "the demo's on_save hook must report the live word count against its configured goal");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha beta gamma\n",
+        "the save itself must have actually happened — hooks never abort/delay the op");
+
+    // A live plugins_reload of an EDITED copy — the wording changes, proving the reload is
+    // reflected on the next save rather than being a load-time fluke.
+    std::fs::write(plugdir.path().join("wordcount.lua"), src.replace("Saved —", "Saved (v2) —"))
+        .unwrap();
+    editor.borrow_mut().plugins_reload_requested = true;
+    crate::plugin::reload::perform_reload(
+        &mut host, &mut reg, &editor, std::slice::from_ref(&cfg_path), None, false, &tx);
+    assert!(host.has_vm(), "the reload must produce a live VM");
+
+    {
+        let mut e = editor.borrow_mut();
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &ex, msg_tx: tx.clone() };
+        crate::save::dispatch_save(&mut ctx);
+    }
+    {
+        let outcomes = ex.drain();
+        let mut e = editor.borrow_mut();
+        for o in outcomes { crate::jobs_apply::apply_outcome(o, &mut e); }
+    }
+    host.pump(&editor, &reg, &ex, &clock, &tx);
+    assert_eq!(editor.borrow().status, "Saved (v2) — 3 words (goal: 100)",
+        "the EDITED plugin's wording must be live after plugins_reload, on the very next save");
 }
 
 // ---------------------------------------------------------------------------

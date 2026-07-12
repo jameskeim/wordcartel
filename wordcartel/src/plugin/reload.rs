@@ -375,4 +375,114 @@ mod tests {
         assert!(e.pending_plugin_dispatch.is_empty(), "dispatch queue cleared");
         assert!(e.keymap_rebuild, "keymap rebuild requested — plugin bindings must re-resolve");
     }
+
+    // -----------------------------------------------------------------------
+    // P2 Task 9 (spec §12, merge GATEs): command-surface-contract LAWs re-run over a
+    // POST-RELOAD registry — palette-completeness (LAW 3) and menu ⊆ palette (LAW 4) are
+    // structural over ANY registry state, but `perform_reload` rebuilds the registry from
+    // scratch (retain_builtins → re-load), so this is the one seam worth proving explicitly.
+    // -----------------------------------------------------------------------
+
+    /// LAW 3 + LAW 4 over a post-reload registry: a reloaded plugin's `menu=Some(Edit)`
+    /// command appears in BOTH the palette (exhaustively) and the Edit menu group, and the
+    /// two plugin-lifecycle builtins (`plugins_reload`/`plugin_list`) appear in the Settings
+    /// menu group — the same shape `plugin_menu_tagged_command_appears_in_menu_menu_none_is_
+    /// palette_only` (menu.rs) proves for a fresh load, now proven across the reload seam.
+    #[test]
+    fn post_reload_registry_satisfies_palette_completeness_and_menu_subset() {
+        let plugdir = tempfile::tempdir().unwrap();
+        let cfgdir = tempfile::tempdir().unwrap();
+        std::fs::write(plugdir.path().join("p.lua"),
+            "wc.register_command{ name='a', label='Plugin Edit Thing', menu='Edit', fn=function() end }")
+            .unwrap();
+        let cfg_path = write_config(cfgdir.path(), plugdir.path());
+
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().unwrap();
+        let editor = editor_handle();
+        let tx = msg_tx();
+
+        // Reach the law through the RELOAD seam (not a fresh load_phase) — perform_reload
+        // tears the registry down to builtins-only and rebuilds it; that is the seam these
+        // laws must hold across.
+        editor.borrow_mut().plugins_reload_requested = true;
+        perform_reload(&mut host, &mut reg, &editor, &[cfg_path], None, false, &tx);
+        let a_id = reg.resolve_name("p.a").expect("the menu-tagged command survives reload");
+
+        let (km, warns) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        assert!(warns.is_empty(), "post-reload registry must build a clean keymap: {warns:?}");
+
+        // LAW 3: palette is exhaustive over the POST-RELOAD registry.
+        let mut p = crate::palette::Palette::default();
+        crate::palette::rebuild_rows(&mut p, &reg, &km);
+        let ids: std::collections::HashSet<_> = p.rows.iter().map(|r| r.id).collect();
+        for (id, _) in reg.commands() {
+            assert!(ids.contains(&id), "palette missing registered command {} after reload", id.0);
+        }
+        assert_eq!(p.rows.len(), reg.commands().count(), "row count == registry command count post-reload");
+
+        // LAW 4: menu ⊆ palette — the reloaded plugin's menu=Some(Edit) command appears in the
+        // Edit group, and the Settings-tagged plugin-lifecycle builtins appear in Settings.
+        let ed = editor.borrow();
+        let view = crate::menu::build(&reg, &km, &ed);
+        let edit_items: Vec<_> = view.groups.iter()
+            .find(|(cat, _)| *cat == crate::registry::MenuCategory::Edit)
+            .map(|(_, items)| items.clone())
+            .unwrap_or_default();
+        assert!(edit_items.iter().any(|(_, action)| *action == crate::menu::MenuRowAction::Command(a_id)),
+            "the reloaded menu=Some(Edit) plugin command must appear in the Edit menu group: {edit_items:?}");
+
+        let settings_items: Vec<_> = view.groups.iter()
+            .find(|(cat, _)| *cat == crate::registry::MenuCategory::Settings)
+            .map(|(_, items)| items.clone())
+            .unwrap_or_default();
+        let reload_id = reg.resolve_name("plugins_reload").expect("builtin survives reload");
+        let list_id = reg.resolve_name("plugin_list").expect("builtin survives reload");
+        assert!(settings_items.iter().any(|(_, action)| *action == crate::menu::MenuRowAction::Command(reload_id)),
+            "plugins_reload must appear in the Settings menu post-reload: {settings_items:?}");
+        assert!(settings_items.iter().any(|(_, action)| *action == crate::menu::MenuRowAction::Command(list_id)),
+            "plugin_list must appear in the Settings menu post-reload: {settings_items:?}");
+    }
+
+    /// LAW 7 (command-surface contract) across the reload seam: a `keymap.patches` binding of
+    /// a plugin command resolves in `build_keymap` BEFORE a reload, and — for a plugin that
+    /// survives the reload unchanged — RE-resolves afterward too. Mirrors menu.rs's
+    /// `plugin_command_bound_via_patch_resolves_and_survives_preset_switch`, now proven across
+    /// a reload instead of a preset switch.
+    #[test]
+    fn plugin_command_bound_via_patch_reresolves_after_reload() {
+        let plugdir = tempfile::tempdir().unwrap();
+        let cfgdir = tempfile::tempdir().unwrap();
+        write_plugin(plugdir.path(), "cmd");
+        let cfg_path = write_config(cfgdir.path(), plugdir.path());
+
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().unwrap();
+        let editor = editor_handle();
+        let tx = msg_tx();
+
+        let mut warns = Vec::new();
+        load_phase(&mut reg, &mut host, &plugins_cfg(plugdir.path()), None, &mut warns);
+        let id_before = reg.resolve_name("p.cmd").expect("registered before reload");
+
+        let patch = crate::config::KeymapPatch {
+            bind: [("ctrl-alt-p".to_string(), "p.cmd".to_string())].into_iter().collect(),
+            unbind: vec![], cua: None, wordstar: None,
+        };
+        let (km_before, warns_before) = crate::keymap::build_keymap(
+            &crate::config::KeymapConfig { preset: "cua".into(), patches: vec![patch.clone()] }, &reg);
+        assert!(warns_before.is_empty(), "the patch must resolve BEFORE reload: {warns_before:?}");
+        assert_eq!(km_before.chord_for(id_before).as_deref(), Some("ctrl-alt-p"));
+
+        // Reload the SAME (unchanged) plugin source.
+        editor.borrow_mut().plugins_reload_requested = true;
+        perform_reload(&mut host, &mut reg, &editor, &[cfg_path], None, false, &tx);
+        let id_after = reg.resolve_name("p.cmd").expect("still registered after reload");
+
+        let (km_after, warns_after) = crate::keymap::build_keymap(
+            &crate::config::KeymapConfig { preset: "cua".into(), patches: vec![patch] }, &reg);
+        assert!(warns_after.is_empty(), "the patch must RE-resolve after reload (LAW 7): {warns_after:?}");
+        assert_eq!(km_after.chord_for(id_after).as_deref(), Some("ctrl-alt-p"),
+            "the patch-bound plugin command must re-resolve post-reload");
+    }
 }

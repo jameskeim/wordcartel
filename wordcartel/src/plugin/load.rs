@@ -723,4 +723,40 @@ mod tests {
             "an over-cap config degrades to wc.config == nil, not a load failure"
         );
     }
+
+    /// The KEY-cap mirror of `config_reaches_wc_config`'s over-cap VALUE case (spec §12): a
+    /// config table with a KEY past `PLUGIN_MAX_CONFIG_STR` must degrade the same way —
+    /// `wc.config == nil`, a loud warning, and the plugin's command still registers.
+    #[test]
+    fn overcap_config_key_degrades_to_nil_config_command_still_registers() {
+        let src = "\
+            local cfg = wc.config\n\
+            wc.register_command{ name='check', label='Check', fn=function()\n\
+                if cfg == nil then RESULT = 'nil' else RESULT = 'present' end\n\
+            end }";
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().unwrap();
+        let mut overcap_key_map: BTreeMap<String, toml::Value> = BTreeMap::new();
+        let long_key = "k".repeat(crate::limits::PLUGIN_MAX_CONFIG_STR + 1);
+        let mut table = toml::map::Map::new();
+        table.insert(long_key, toml::Value::Integer(1));
+        overcap_key_map.insert("overcapkey".to_string(), toml::Value::Table(table));
+        let mut warns = Vec::new();
+        let reports = load_sources(
+            &mut reg, &mut host,
+            &sources(&[("overcapkey", src)]),
+            &overcap_key_map, &mut warns,
+        );
+        assert_eq!(reports[0].result, Ok(1), "plugin still loads despite an over-cap config KEY");
+        assert_eq!(warns.len(), 1, "an over-cap config key warns loudly, not silently");
+        assert!(warns[0].contains("overcapkey"), "{}", warns[0]);
+        let lua = host.lua().unwrap();
+        let id = reg.resolve_name("overcapkey.check").unwrap();
+        let cb: mlua::Function = lua.named_registry_value(&format!("wc-cmd-{}", id.0)).unwrap();
+        cb.call::<()>(()).unwrap();
+        assert_eq!(
+            lua.globals().get::<String>("RESULT").unwrap(), "nil",
+            "an over-cap config key degrades to wc.config == nil, not a load failure"
+        );
+    }
 }
