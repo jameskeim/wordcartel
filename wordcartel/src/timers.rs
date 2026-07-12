@@ -199,7 +199,7 @@ pub(crate) fn on_tick(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock,
     if crate::diagnostics_run::should_run_diagnostics(editor)
         && editor.active().diagnostics.any_due(now)
     {
-        crate::diagnostics_run::dispatch_diagnostics(editor);
+        crate::diagnostics_run::dispatch_diagnostics(editor, now);
     }
     // Dispatch a block-tree reconcile if due.
     if crate::reconcile::reconcile_due(&editor.active().reconcile, now) {
