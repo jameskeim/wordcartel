@@ -207,6 +207,7 @@ mod tests {
     use crate::plugin::PluginCall;
     use crate::registry::Registry;
     use crate::test_support::TestClock;
+    use proptest::prelude::*;
 
     fn sources(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs.iter().map(|(s, src)| (s.to_string(), src.to_string())).collect()
@@ -504,5 +505,72 @@ mod tests {
         host.pump(&editor);
         let status = editor.borrow().status.clone();
         assert_eq!(status, "/tmp/note.md");
+    }
+
+    // -----------------------------------------------------------------------
+    // spec §8's no-panic property test: the whole range-taking wc.* surface
+    // (wc.replace, the wc.text read) fuzzed with hostile (a, b, text) via a real pump.
+    // -----------------------------------------------------------------------
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Drives random `(a, b, text)` — including reversed ranges, out-of-bounds offsets, and
+        /// mid-char offsets on a multibyte doc — through `wc.replace` AND `wc.text` via a REAL
+        /// `PluginHost::pump`. Complements the three hand-picked cases above (`wc_replace_*`/
+        /// `wc_text_*`) by proving `plugin_check_range`'s pre-validation (the input-validation
+        /// LAW) holds over the WHOLE input space the generator can produce, not just those
+        /// cases. Two invariants: (1) no Rust panic ever surfaces as a caught-panic status
+        /// message (a genuine panic — as opposed to a clean typed-error degrade — would read
+        /// literally "panic" per `panicx::panic_message`'s unknown-payload fallback, or a raw
+        /// core panic phrase like "byte index ... is not a char boundary"); (2) buffer
+        /// coherence — the only possible mutation (`wc.replace`) can never grow the buffer past
+        /// one insert's worth of the supplied text, and the trailing `wc.text` read never
+        /// changes the buffer at all (a pure read).
+        #[test]
+        fn prop_wc_range_surface_never_panics_or_corrupts(
+            doc in proptest::collection::vec(
+                proptest::sample::select(vec!['a', 'b', 'é', '中', '🙂', '\n']),
+                0..=20usize,
+            ).prop_map(|cs| cs.into_iter().collect::<String>()),
+            a in 0usize..40,
+            b in 0usize..40,
+            text in proptest::string::string_regex("[aé中]{0,4}").unwrap(),
+        ) {
+            let mut reg = Registry::builtins();
+            let mut host = PluginHost::new().unwrap();
+            let src = format!(
+                "wc.register_command{{ name='rep', label='R', fn=function() wc.replace({a}, {b}, [[{text}]]) end }}\n\
+                 wc.register_command{{ name='rd', label='D', fn=function() wc.text({a}, {b}) end }}"
+            );
+            let reports = load_sources(&mut reg, &host, &sources(&[("fuzz", &src)]));
+            prop_assert_eq!(reports[0].result.clone(), Ok(2), "both commands must register cleanly");
+
+            let editor = Rc::new(RefCell::new(Editor::new_from_text(&doc, None, (40, 10))));
+            let (tx, clock) = test_bridge_parts();
+            host.attach_bridge(editor.clone(), tx, clock).unwrap();
+            let rep_id = reg.resolve_name("fuzz.rep").unwrap();
+            let rd_id = reg.resolve_name("fuzz.rd").unwrap();
+
+            let doc_bytes = doc.len();
+            let text_bytes = text.len();
+
+            editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: rep_id });
+            host.pump(&editor); // wc.replace's outcome — Ok or a typed error, never a raw panic
+            let status_after_replace = editor.borrow().status.clone();
+            prop_assert!(!status_after_replace.to_lowercase().contains("panic"),
+                "status: {status_after_replace}");
+            let after_replace_len = editor.borrow().active().document.buffer.len();
+            prop_assert!(after_replace_len <= doc_bytes + text_bytes,
+                "buffer grew past the one-insert upper bound: {after_replace_len} > {doc_bytes}+{text_bytes}");
+
+            editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: rd_id });
+            host.pump(&editor); // wc.text's outcome — Ok or a typed error, never a raw panic
+            let status_after_text = editor.borrow().status.clone();
+            prop_assert!(!status_after_text.to_lowercase().contains("panic"),
+                "status: {status_after_text}");
+            // wc.text is a pure read — the buffer must be byte-identical to after the replace.
+            let final_text = whole_text(&editor);
+            prop_assert_eq!(final_text.len(), after_replace_len);
+        }
     }
 }

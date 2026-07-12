@@ -328,3 +328,41 @@ fn install_status(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::R
     )?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editor::Editor;
+    use crate::test_support::TestClock;
+    use wordcartel_core::history::Transaction;
+
+    // -----------------------------------------------------------------------
+    // spec §8's concurrent-`StaleLength` edit case
+    // -----------------------------------------------------------------------
+
+    /// `submit_transaction` is the ONE boundary every `wc.replace`/`wc.insert`/
+    /// `wc.set_selection` routes through (§3b) — this proves ITS staleness re-check (the
+    /// safety net, independent of `plugin_check_range`'s construction-time guard, which only
+    /// sees the length at the moment a `wc.*` closure builds its `ChangeSet`) degrades a
+    /// racing edit to a typed error with ZERO mutation — and that [`edit_error_message`], the
+    /// ONLY place a core `EditError` becomes a plugin-facing Lua message, names it as a
+    /// concurrent-edit race rather than a raw internal error.
+    #[test]
+    fn stale_length_from_a_racing_edit_formats_the_plugin_facing_error() {
+        let mut e = Editor::new_from_text("hello world", None, (40, 10)); // len 11
+        // A ChangeSet valid AT CONSTRUCTION TIME for length 11 (an identity retain).
+        let cs = ChangeSet::from_ops(vec![Op::Retain(11)], 11);
+        // A racing edit lands between construction and submission — the live buffer is now a
+        // DIFFERENT length, simulating another actor's concurrent mutation underneath the plan
+        // a wc.* closure would have made (each closure re-reads its own length fresh and
+        // synchronously, so this race is not reachable through the closures themselves — it
+        // exercises the shared boundary's defense directly, the safety net plugin edits inherit).
+        e.active_mut().document.buffer = wordcartel_core::buffer::TextBuffer::from_str("short");
+        let result = crate::transact::submit_transaction(&mut e, Transaction::new(cs), &TestClock::new(0));
+        let err = result.expect_err("a stale claimed_len must be rejected, not silently applied");
+        assert!(matches!(err, EditError::StaleLength { expected: 11, actual: 5 }), "{err:?}");
+        assert_eq!(e.active().document.buffer.to_string(), "short", "zero mutation on a stale-length race");
+        let msg = edit_error_message(err);
+        assert!(msg.contains("buffer changed underneath"), "message: {msg}");
+    }
+}

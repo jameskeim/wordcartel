@@ -413,6 +413,101 @@ fn no_plugin_host_journey_is_unaffected() {
     assert_eq!(h.doc_text(), "hello world\n");
 }
 
+/// spec §8's loaded-but-idle guardrail (extends the swap SSD-wear guardrail family): a
+/// plugin loaded but never dispatched must do ZERO work while the app sits idle. The
+/// plugin's callback increments a Lua-global counter (not editor state) — inspectable
+/// directly off the host's own VM as a "host-side counter" without adding any production
+/// instrumentation. Proves "loaded ≠ background work": P1 plugins arm no deadline, so
+/// `timers::next_wake` must be unchanged by driving idle `Msg::Tick`s across real elapsed
+/// wall-clock time, and `pending_plugin_calls` must never gain an entry on its own.
+#[test]
+fn plugin_loaded_idle_drives_zero_callback_invocations_and_stable_wake() {
+    let src = "calls = 0\n\
+               wc.register_command{ name='cmd', label='Counter', fn=function() calls = calls + 1 end }";
+    let mut h = Harness::new_with_plugin("hello\n", &[("counter", src)]);
+    // Precondition: nothing is armed on a fresh, unedited, diagnostics-disabled buffer —
+    // else "unchanged" below would be vacuously true against an already-Some deadline.
+    let wake_before = crate::timers::next_wake(&h.editor.borrow(), h.now);
+    assert!(wake_before.is_none(), "precondition: a fresh idle buffer arms no deadline: {wake_before:?}");
+    for _ in 0..10 {
+        h.advance_ms(1000); // real elapsed wall-clock time between idle ticks
+        h.tick();
+    }
+    let calls: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("calls")
+        .expect("the plugin's Lua-global counter must exist");
+    assert_eq!(calls, 0, "idle Msg::Tick must never invoke a plugin callback — loaded is not background work");
+    assert!(h.editor.borrow().pending_plugin_calls.is_empty(), "no plugin call was ever queued while idle");
+    let wake_after = crate::timers::next_wake(&h.editor.borrow(), h.now);
+    assert_eq!(wake_before, wake_after, "P1 plugins arm no deadline — next_wake must stay None across idle ticks");
+    assert_eq!(h.doc_text(), "hello\n", "idle ticks must not mutate the document");
+}
+
+/// The `insert_date.lua` success-criterion demo (spec §8/§9 acceptance): the committed
+/// fixture, loaded exactly as `discover` would read it off disk, registers "Insert Date"
+/// under its file-stem namespace. It (1) appears in the Command Palette and is dispatchable
+/// there, landing through `wc.insert`'s `submit_transaction` boundary; and (2) is bindable
+/// via a `keymap.patches` entry (LAW 7) — resolving in `build_keymap` and firing the SAME
+/// command on the bound chord.
+#[test]
+fn insert_date_lua_e2e_success_demo() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/plugins/insert_date.lua");
+    let src = std::fs::read_to_string(&fixture)
+        .unwrap_or_else(|e| panic!("fixture must be readable at {}: {e}", fixture.display()));
+    let mut h = Harness::new_with_plugin("notes\n", &[("insert_date", &src)]);
+
+    // 1) Palette: the namespaced command appears and is dispatchable.
+    h.ctrl('p');
+    assert!(h.editor.borrow().palette.is_some(), "ctrl-p must open the palette");
+    h.type_str("insert date");
+    {
+        let e = h.editor.borrow();
+        let p = e.palette.as_ref().unwrap();
+        assert!(!p.rows.is_empty(), "'insert date' must match the plugin command");
+        assert_eq!(p.rows[0].label, "Insert Date",
+            "top row must be the plugin command: {:?}",
+            p.rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>());
+    }
+    h.key(KeyCode::Enter);
+    let after_palette = h.doc_text();
+    assert!(after_palette.ends_with("notes\n"),
+        "the original text must survive, unmoved, after the inserted date:\n{after_palette:?}");
+    let date_part = &after_palette[..after_palette.len() - "notes\n".len()];
+    assert!(is_iso_date(date_part), "expected a YYYY-MM-DD date, got {date_part:?}");
+    assert!(h.editor.borrow().palette.is_none(), "Enter closes the palette");
+
+    // 2) LAW 7: a keymap.patches binding of the plugin command resolves and fires it.
+    let cmd_id = h.reg.resolve_name("insert_date.insert").expect("plugin command registered");
+    let patch = crate::config::KeymapPatch {
+        bind: [("ctrl-alt-d".to_string(), "insert_date.insert".to_string())].into_iter().collect(),
+        unbind: vec![], cua: None, wordstar: None,
+    };
+    let (km, warns) = keymap::build_keymap(
+        &crate::config::KeymapConfig { preset: "cua".into(), patches: vec![patch] }, &h.reg);
+    assert!(warns.is_empty(), "the patch must resolve cleanly against the plugin-loaded registry: {warns:?}");
+    assert_eq!(km.chord_for(cmd_id).as_deref(), Some("ctrl-alt-d"));
+    h.keymap = km;
+
+    let before_bind = h.doc_text();
+    h.step(crate::test_support::press(KeyCode::Char('d'), KeyModifiers::CONTROL | KeyModifiers::ALT));
+    let after_bind = h.doc_text();
+    assert!(after_bind.ends_with(&before_bind), "the prior content must survive, unmoved:\n{after_bind:?}");
+    let second_date_part = &after_bind[..after_bind.len() - before_bind.len()];
+    assert!(is_iso_date(second_date_part), "expected a second YYYY-MM-DD date, got {second_date_part:?}");
+}
+
+/// `true` iff `s` is exactly 10 bytes shaped `\d{4}-\d{2}-\d{2}` — a dependency-free ISO-date
+/// shape check (avoids pulling in a regex crate for one test).
+fn is_iso_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[..4].iter().all(u8::is_ascii_digit)
+        && b[4] == b'-'
+        && b[5..7].iter().all(u8::is_ascii_digit)
+        && b[7] == b'-'
+        && b[8..10].iter().all(u8::is_ascii_digit)
+}
+
 // ---------------------------------------------------------------------------
 // A1 journeys 3 + 4: pinned mode and hidden mode dwell gate.
 // ---------------------------------------------------------------------------
