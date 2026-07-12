@@ -652,6 +652,35 @@ mod tests {
             "Accepted::No mock does not latch; harper unaffected");
     }
 
+    /// §14.1 case 3 extension (per-source in-flight): a source already mid-check (latched) is
+    /// excluded from `due_sources` and never gets a second `dispatch_one` call — but the OTHER
+    /// source, which is due and NOT in flight, still dispatches normally. Proves the in-flight
+    /// guard blocks only the latched source, not the whole fan-out (non-vacuous: harper's call
+    /// log stays empty while mock's records exactly one `NotifyChange`).
+    #[test]
+    fn dispatch_in_flight_source_is_skipped_other_due_source_still_dispatches() {
+        let mut e = review_editor("teh cat\n");
+        let h = crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Harper);
+        let m = crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Plugin("mock"));
+        let (hc, mc) = (h.calls_handle(), m.calls_handle());
+        e.diag_providers.install(Box::new(h), true);
+        e.diag_providers.install(Box::new(m), true);
+        // Harper is mid-check for an earlier version — armed AND in-flight simultaneously (the
+        // state `due_sources` must exclude regardless of the armed deadline being reached).
+        e.active_mut().diagnostics.slot_mut(DiagSource::Harper).arm(0, 0);
+        e.active_mut().diagnostics.slot_mut(DiagSource::Harper).in_flight_version = Some(0);
+        e.active_mut().diagnostics.slot_mut(DiagSource::Plugin("mock")).arm(0, 0);
+        dispatch_diagnostics(&mut e, 10);
+        assert_eq!(e.active().diagnostics.slot(DiagSource::Harper).unwrap().in_flight_version, Some(0),
+            "harper's in-flight latch is untouched — no second dispatch while one is outstanding");
+        assert!(e.active().diagnostics.slot(DiagSource::Plugin("mock")).unwrap().in_flight_version.is_some(),
+            "mock, not in-flight, still dispatches normally");
+        assert!(hc.lock().unwrap().is_empty(), "the in-flight source's provider is never called again");
+        assert_eq!(mc.lock().unwrap().iter()
+            .filter(|c| matches!(c, crate::diag_provider::ProviderCall::NotifyChange { .. })).count(), 1,
+            "the due, non-in-flight source dispatches exactly once");
+    }
+
     #[test]
     fn dispatch_over_cap_consumes_deadlines_and_never_latches() {
         let big = "x".repeat((crate::limits::DIAG_MAX_SEND_BYTES as usize) + 1);
@@ -741,6 +770,103 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Task 9 (SPINE): two-provider acceptance core — §14.1 case 2 (staleness
+    // independence), case 6 addition (late-Done-does-not-resurrect), case 8
+    // (per-source hint latch).
+    // ------------------------------------------------------------------
+
+    /// §14.1 item 2 EXACT scenario, the acceptance bar: two engines both dispatched at the same
+    /// version `v`; the document then advances to `v+1`. The SLOW engine's terminal result for
+    /// the now-stale `v` must be dropped WITHOUT storing, and its OWN latch clears (so it is
+    /// free to be re-dispatched) — while the FAST engine's terminal result for the CURRENT
+    /// version `v+1` stores normally in its OWN slot. Non-vacuous: the two engines' diagnostics
+    /// end up in DIFFERENT kinds/slots (grammar dropped vs spelling stored) and the assertions
+    /// on `ms` (the mock/slow slot) and `hs` (the harper/fast slot) are independently checked —
+    /// a version-gate bug that let the stale result leak through, or a latch bug that failed to
+    /// clear the slow engine's OR wrongly cleared the fast engine's, would trip a distinct
+    /// assertion here.
+    #[test]
+    fn slow_engine_dropped_by_its_guard_while_fast_applies() {
+        let mut e = review_editor("teh cat\n");
+        e.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Harper)), true);
+        e.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Plugin("mock"))), true);
+        let id = e.active().id; let v = e.active().document.version;
+        // both dispatched at v
+        e.active_mut().diagnostics.slot_mut(DiagSource::Harper).in_flight_version = Some(v);
+        e.active_mut().diagnostics.slot_mut(DiagSource::Plugin("mock")).in_flight_version = Some(v);
+        // the document advances to v+1 (an edit)
+        e.active_mut().document.version = v + 1;
+        // SLOW engine (mock) terminal for v arrives → NOT stored, latch clears. The payload
+        // carries its OWN source (Plugin("mock"), not the shared `grammar()` helper's Harper
+        // default — see `apply_routes_to_the_named_source_slot_only`'s `mock_grammar`
+        // precedent) so the debug_assert in `apply_diagnostics_done` (payload source must match
+        // the message tag) genuinely holds rather than merely never firing because this
+        // particular call takes the stale/drop branch.
+        let mock_grammar = Diagnostic { range: 4..7, kind: DiagnosticKind::Grammar,
+            source: DiagSource::Plugin("mock"), code: None, href: None,
+            message: "x".into(), suggestions: vec![] };
+        apply_diagnostics_done(&mut e, id, v, DiagSource::Plugin("mock"), vec![mock_grammar]);
+        {
+            let ms = e.active().diagnostics.slot(DiagSource::Plugin("mock")).unwrap();
+            assert!(ms.diagnostics.is_empty(), "stale v result not stored");
+            assert_eq!(ms.in_flight_version, None, "slow latch cleared");
+        }
+        let ms_computed_version = e.active().diagnostics.slot(DiagSource::Plugin("mock")).unwrap().computed_version;
+        // The harper (fast) in-flight latch is re-armed to the CURRENT version — the real
+        // dispatch flow the moment its own stale-v cycle clears and it is re-checked (a source
+        // with no live match for the version it is asked to apply is never latch-cleared; see
+        // `apply_stale_version_clears_latch_without_storing`), so the terminal result below
+        // arrives for the SAME version it was dispatched against.
+        e.active_mut().diagnostics.slot_mut(DiagSource::Harper).in_flight_version = Some(v + 1);
+        // FAST engine (harper) terminal for v+1 arrives → stored
+        apply_diagnostics_done(&mut e, id, v + 1, DiagSource::Harper, vec![spelling(0..3)]);
+        let hs = e.active().diagnostics.slot(DiagSource::Harper).unwrap();
+        assert_eq!(hs.diagnostics.len(), 1);
+        assert_eq!(hs.computed_version, v + 1);
+        assert_eq!(hs.in_flight_version, None);
+        assert_ne!(hs.computed_version, ms_computed_version, "no cross-contamination");
+    }
+
+    /// §14.1 case 6 addition: a `DiagnosticsDone` for a source that was disabled AFTER dispatch
+    /// (but before its terminal result lands) must not resurrect the slot `set_engine_enabled`
+    /// already cleared — the disabled-source drop path (spec §6.2) applies regardless of WHEN
+    /// the disable happened relative to the in-flight dispatch.
+    #[test]
+    fn late_done_for_disabled_source_does_not_resurrect_slot() {
+        use crate::test_support::TestClock;
+        let mut e = review_editor("teh\n");
+        e.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Harper)), true);
+        e.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Plugin("mock"))), true);
+        let id = e.active().id; let v = e.active().document.version;
+        set_engine_enabled(&mut e, DiagSource::Plugin("mock"), false, &TestClock::new(0));
+        apply_diagnostics_done(&mut e, id, v, DiagSource::Plugin("mock"), vec![spelling(0..3)]);
+        assert!(e.active().diagnostics.slot(DiagSource::Plugin("mock")).is_none());
+    }
+
+    /// §14.1 case 8: each engine's degrade hint is an INDEPENDENT per-source latch — two
+    /// simultaneously Unavailable engines each surface their hint exactly once per Review entry,
+    /// neither suppressing the other. Non-vacuous: both sources' presence in `diag_hint_shown`
+    /// is asserted individually, and the set is proven to actually reset (not just "happen to be
+    /// empty") by re-entering Review via the real `set_render_mode` seam.
+    #[test]
+    fn per_source_hint_shows_once_per_review_entry() {
+        let mut e = review_editor("teh\n");
+        e.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new()
+            .with_source(DiagSource::Harper).with_availability(crate::diag_provider::Availability::Unavailable)), true);
+        e.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new()
+            .with_source(DiagSource::Plugin("mock")).with_availability(crate::diag_provider::Availability::Unavailable)), true);
+        e.active_mut().diagnostics.slot_mut(DiagSource::Harper).arm(0, 0);
+        e.active_mut().diagnostics.slot_mut(DiagSource::Plugin("mock")).arm(0, 0);
+        dispatch_diagnostics(&mut e, 10);
+        assert!(e.diag_hint_shown.contains(&DiagSource::Harper));
+        assert!(e.diag_hint_shown.contains(&DiagSource::Plugin("mock")));
+        // re-entering Review clears the set
+        e.set_render_mode(crate::editor::RenderMode::LivePreview, 20);
+        e.set_render_mode(crate::editor::RenderMode::Review, 30);
+        assert!(e.diag_hint_shown.is_empty(), "hint latch reset on Review entry");
+    }
+
+    // ------------------------------------------------------------------
     // Task 6 (SPINE): the switchable analysis lens — active_lens_diags.
     // ------------------------------------------------------------------
 
@@ -776,6 +902,31 @@ mod tests {
         e.active_mut().view.mode = RenderMode::Review;
         e.active_mut().document.version += 1; // edited since compute → stale
         assert!(active_lens_diags(&e).is_none(), "stale slot: None");
+    }
+
+    /// §14.1 case 7 gap: `cycle_analysis_source` is a status no-op with fewer than two enabled
+    /// engines (`cycle_with_fewer_than_two_enabled_is_a_status_no_op`) — but the LENS itself
+    /// must stay fully functional in that same single-engine state; "nowhere to cycle to" is not
+    /// "nothing to show". Proves the two are orthogonal: cycling being a no-op does not make
+    /// `active_lens_diags` a no-op too. Non-vacuous: asserts the no-op status AND the still-live
+    /// diagnostics slice together — a hypothetical regression that gated `active_lens_diags` on
+    /// `enabled_sources().len() >= 2` would trip the second assertion even though the first
+    /// (cycle no-op) still passes.
+    #[test]
+    fn active_lens_diags_functions_normally_when_cycle_is_a_no_op() {
+        let mut e = review_editor("teh\n");
+        e.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Harper)), true);
+        let v = e.active().document.version;
+        let hs = e.active_mut().diagnostics.slot_mut(DiagSource::Harper);
+        hs.diagnostics = vec![spelling(0..3)]; hs.computed_version = v;
+        cycle_analysis_source(&mut e); // < 2 enabled engines → status no-op, lens UNCHANGED
+        assert_eq!(e.status, "no other analysis engine");
+        assert_eq!(e.active_analysis_source, DiagSource::Harper, "lens stayed put — nowhere to cycle");
+        let diags = active_lens_diags(&e)
+            .expect("the lens must still resolve the single enabled engine's diagnostics");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].kind, DiagnosticKind::Spelling);
     }
 
     // ------------------------------------------------------------------

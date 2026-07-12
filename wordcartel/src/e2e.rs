@@ -251,6 +251,16 @@ impl Harness {
         (0..h).map(|y| self.row(y)).collect()
     }
     fn screen_contains(&self, needle: &str) -> bool { self.screen().iter().any(|r| r.contains(needle)) }
+    /// The columns of row `y` carrying the ratatui `UNDERLINED` modifier — the real painted set
+    /// (mirrors `render.rs`'s `row_has_underline` test helper, but column-precise so a lens
+    /// switch between two engines flagging DIFFERENT words can be told apart, not just "some
+    /// underline exists").
+    fn underlined_cols(&self, y: u16) -> Vec<u16> {
+        use ratatui::style::Modifier;
+        let buf = self.term.backend().buffer();
+        let w = buf.area().width;
+        (0..w).filter(|&x| buf[(x, y)].style().add_modifier.contains(Modifier::UNDERLINED)).collect()
+    }
 }
 
 #[test]
@@ -1656,6 +1666,78 @@ fn e2e_recovery_prompt_pending_suppresses_splash() {
         "the recovery prompt is what the user sees:\n{:#?}", h.screen());
     assert!(!h.screen_contains("wordcartel") && !h.screen_contains("press any key"),
         "the splash must never be painted over a modal prompt:\n{:#?}", h.screen());
+}
+
+/// SPINE Task 9 (§14.3): the switchable analysis lens observed at the real `reduce → advance →
+/// render` loop — not just the unit-level `active_lens_diags` (Task 6's `diagnostics_run.rs`
+/// tests), but the whole journey a user drives. Two engines land diagnostics on DIFFERENT words
+/// of the SAME line via the real `Msg::DiagnosticsDone` delivery path (mirrors the bench
+/// module's `diagnostics_probe` seam); only the DEFAULT lens's underline paints; switching the
+/// lens through the real registry `analysis_next` command flips the painted set. Non-vacuous by
+/// construction: the two engines' ranges are disjoint ("teh" cols 0..3 vs "cat" cols 4..7), so
+/// asserting the SPECIFIC columns (not merely "some underline exists", which would pass
+/// trivially either way) proves the switch actually moved which source's results render.
+#[test]
+fn e2e_lens_switch_flips_the_painted_underline_set() {
+    use wordcartel_core::diagnostics::{Diagnostic, DiagnosticKind, DiagSource};
+    let mut h = Harness::new("teh cat\n", None, (40, 6));
+    {
+        let mut e = h.editor.borrow_mut();
+        e.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Harper)), true);
+        e.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Plugin("mock"))), true);
+        // Harness seeds diag_cfg.enabled = false for hermeticity (spec I3); the lens journey
+        // needs the real Review compute/display gate live — the same seam the bench module's
+        // `diagnostics_probe` uses to place diagnostics on the render path.
+        e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = crate::editor::RenderMode::Review;
+    }
+    let bid = h.editor.borrow().active().id;
+    let ver = h.version();
+    let harper_diag = Diagnostic { range: 0..3, kind: DiagnosticKind::Spelling, source: DiagSource::Harper,
+        code: None, href: None, message: "x".into(), suggestions: vec![] };
+    let mock_diag = Diagnostic { range: 4..7, kind: DiagnosticKind::Grammar, source: DiagSource::Plugin("mock"),
+        code: None, href: None, message: "x".into(), suggestions: vec![] };
+    // Both delivered through the real Msg path (reduce → apply_diagnostics_done → advance →
+    // render), exactly as the worker thread would post them.
+    h.step(Msg::DiagnosticsDone { buffer_id: bid, version: ver, source: DiagSource::Harper,
+        diagnostics: vec![harper_diag] });
+    h.step(Msg::DiagnosticsDone { buffer_id: bid, version: ver, source: DiagSource::Plugin("mock"),
+        diagnostics: vec![mock_diag] });
+
+    // Default lens = Harper (first-installed/enabled, spec §8.1's seed rule): only "teh"
+    // (cols 0..3) is underlined; "cat" (cols 4..7), stored under the mock's own slot, stays
+    // computed but invisible — the locked never-merge decision (one source painted at a time).
+    let before = h.underlined_cols(0);
+    assert!((0..3).all(|c| before.contains(&c)),
+        "default lens (Harper): 'teh' must be underlined, got {before:?}");
+    assert!((4..7).all(|c| !before.contains(&c)),
+        "the mock's diagnostic must NOT paint under the Harper lens, got {before:?}");
+
+    // Switch the lens via the REAL `analysis_next` registry command (the palette/keybinding
+    // path's own entry point — spec §8.1's cycle), with two enabled engines so the cycle is not
+    // a no-op.
+    {
+        use crate::registry::{Ctx, CommandId};
+        let mut e = h.editor.borrow_mut();
+        let clock = TestClock(h.now);
+        let mut ctx = Ctx { editor: &mut e, clock: &clock, executor: &h.ex, msg_tx: h.tx.clone() };
+        h.reg.dispatch(CommandId("analysis_next"), &mut ctx);
+    }
+    assert_eq!(h.editor.borrow().active_analysis_source, DiagSource::Plugin("mock"),
+        "the cycle moved onto the second enabled engine");
+    // Re-render through the real loop (Tick is a no-op message otherwise — no armed slot, so it
+    // does not itself trigger a new dispatch) so the assertion below observes the SAME
+    // reduce → advance → render sequence every other e2e journey drives.
+    h.tick();
+
+    let after = h.underlined_cols(0);
+    assert!((4..7).all(|c| after.contains(&c)),
+        "switched lens (mock): 'cat' must be underlined, got {after:?}");
+    assert!((0..3).all(|c| !after.contains(&c)),
+        "harper's diagnostic must NOT paint once the lens moved off it, got {after:?}");
+    assert_ne!(before, after, "the painted underline set switched with the lens");
 }
 
 // ===========================================================================
