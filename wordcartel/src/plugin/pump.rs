@@ -145,20 +145,19 @@ impl PluginHost {
 
     /// Between-units cap check for the pump's re-drain loop (§5c) — `true` means EITHER cap
     /// tripped and the caller must stop immediately (no further unit is dequeued this cycle).
-    /// On trip: clear all three queues (one short borrow) and set a `plugin_error` status
-    /// naming the truncation — the editor itself is left intact, only queued plugin work is
-    /// dropped.
+    /// On trip: clear all three queues and set a status naming the truncation (one short borrow) —
+    /// the editor itself is left intact, only queued plugin work is dropped. This is a subsystem
+    /// event, not a single plugin's fault, so it does NOT go through `plugin_error`'s
+    /// `"plugin {name}: "` framing (which would read "plugin plugins: …").
     fn cap_tripped(&self, units: usize, start: std::time::Instant, editor: &Rc<RefCell<Editor>>) -> bool {
         if units < crate::limits::PLUGIN_PUMP_CHAIN_CAP && start.elapsed() <= PUMP_CYCLE_TIME_BUDGET {
             return false;
         }
-        {
-            let mut e = editor.borrow_mut();
-            e.pending_plugin_calls.clear();
-            e.pending_plugin_events.clear();
-            e.pending_plugin_dispatch.clear();
-        }
-        crate::plugin::plugin_error(editor, "plugins", "work truncated (chain cap)");
+        let mut e = editor.borrow_mut();
+        e.pending_plugin_calls.clear();
+        e.pending_plugin_events.clear();
+        e.pending_plugin_dispatch.clear();
+        e.status = "plugin work truncated (chain cap)".to_string();
         true
     }
 

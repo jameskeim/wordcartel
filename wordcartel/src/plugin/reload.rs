@@ -120,6 +120,9 @@ pub(crate) fn perform_reload(
             Err(e) => warns.push(format!("plugins disabled: {e}")),
         }
     }
+    if !host.has_vm() {                                                    //    exhaustion/disabled reverted
+        inventory.clear();                                                //    the registry to builtins-only;
+    }                                                                     //    don't over-report a dead VM
     let mut e = editor.borrow_mut();                                       // 8. re-resolve bindings + report
     e.keymap_rebuild = true;
     e.plugin_inventory = inventory;

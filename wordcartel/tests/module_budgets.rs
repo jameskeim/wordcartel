@@ -72,3 +72,10 @@ fn plugin_host_stays_bounded() {
     // merged P1 size so the pump/bridge wiring can't silently regrow into a dispatch hub.
     assert_hub_budget("src/plugin/host.rs", 400);
 }
+
+#[test]
+fn plugin_pump_stays_bounded() {
+    // plugin/pump.rs — the re-drain loop extracted from host.rs (Effort P2) so the pump can't
+    // regrow into a dispatch god-loop. Budgeted like its sibling with headroom over its P2 size.
+    assert_hub_budget("src/plugin/pump.rs", 350);
+}
