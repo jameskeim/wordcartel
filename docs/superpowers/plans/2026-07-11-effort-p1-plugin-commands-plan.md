@@ -157,7 +157,7 @@ behaves identically (no plugins loaded).
 - `limits::tests::plugin_caps_are_sane` — the new constants exist with the spec values.
 
 **Implementation:**
-- `Cargo.toml`: `mlua = { version = "<pinned by spike>", features = ["vendored", "lua54"] }`.
+- `Cargo.toml`: `mlua = { version = "0.10", features = ["vendored", "lua54"] }` (spike-pinned: 0.10.5; NO `send`/`async`/`serialize`).
 - `limits.rs` — add (canonical home for quotas):
   ```rust
   /// P1 plugin registration caps (bounded-memory LAW — interned ids/labels are permanent leaks
