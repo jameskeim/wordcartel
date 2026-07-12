@@ -494,8 +494,10 @@ pub struct Editor {
     /// Registered diagnostics providers (Effort A/SPINE). Empty `ProviderSet` by default →
     /// hermetic construction; run() installs HarperLs once the msg channel exists.
     pub diag_providers: crate::diag_provider::ProviderSet,
-    /// One install-hint per deliberate Review entry (reset in set_render_mode). Spec §9.
-    pub diag_hint_shown: bool,
+    /// The set of engines whose install-hint has already fired this Review entry (per-source
+    /// latch, cleared in set_render_mode on entering Review). One hint per source per entry —
+    /// informative, not naggy. Spec §9.
+    pub diag_hint_shown: std::collections::BTreeSet<wordcartel_core::diagnostics::DiagSource>,
     /// Outline picker overlay state. XOR with prompt/minibuffer/palette/menu/search/diag.
     pub outline: Option<crate::outline_overlay::OutlineOverlay>,
     /// Theme picker overlay state. XOR with all other overlays.
@@ -608,7 +610,7 @@ impl Editor {
             session_ignores: std::collections::HashSet::new(),
             diag: None,
             diag_providers: crate::diag_provider::ProviderSet::default(),
-            diag_hint_shown: false,
+            diag_hint_shown: std::collections::BTreeSet::new(),
             outline: None,
             theme_picker: None,
             file_browser: None,
@@ -986,7 +988,7 @@ impl Editor {
         crate::derive::rebuild(self);
         crate::nav::ensure_visible(self);
         if mode == RenderMode::Review {
-            self.diag_hint_shown = false;
+            self.diag_hint_shown.clear();
         }
         if crate::diagnostics_run::should_run_diagnostics(self) {
             crate::diagnostics_run::arm_enabled(self, now_ms, 0);

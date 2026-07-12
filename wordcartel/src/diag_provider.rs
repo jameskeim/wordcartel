@@ -124,8 +124,10 @@ impl ProviderSet {
 pub fn apply_provider_event(editor: &mut Editor, source: DiagSource, ev: ProviderEvent, clock: &dyn Clock) {
     match ev {
         ProviderEvent::Restarted => {
-            editor.status = "grammar checker restarted".into();
-            if crate::diagnostics_run::should_run_diagnostics(editor) {
+            editor.status = format!("{} restarted", source.label());
+            if crate::diagnostics_run::should_run_diagnostics(editor)
+                && editor.diag_providers.is_enabled(source)
+            {
                 let now = clock.now_ms();
                 let debounce = editor.diag_cfg.debounce_ms;
                 editor.active_mut().diagnostics.slot_mut(source).arm(now, debounce);
@@ -260,10 +262,11 @@ mod tests {
     #[test]
     fn restarted_sets_status_and_arms_when_review_and_enabled() {
         let mut e = Editor::new_from_text("x\n", None, (40, 10));
+        crate::test_support::install_enabled_harper(&mut e); // arm now gated on is_enabled(source)
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = RenderMode::Review;
         apply_provider_event(&mut e, DiagSource::Harper, ProviderEvent::Restarted, &TestClock::new(1000));
-        assert_eq!(e.status, "grammar checker restarted");
+        assert_eq!(e.status, "Harper restarted");
         assert_eq!(e.active().diagnostics.slot(DiagSource::Harper).unwrap().recheck_due_at,
             Some(1000 + e.diag_cfg.debounce_ms));
     }
@@ -271,21 +274,36 @@ mod tests {
     #[test]
     fn restarted_sets_status_but_does_not_arm_outside_review() {
         let mut e = Editor::new_from_text("x\n", None, (40, 10));
+        crate::test_support::install_enabled_harper(&mut e);
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = RenderMode::LivePreview;
         apply_provider_event(&mut e, DiagSource::Harper, ProviderEvent::Restarted, &TestClock::new(1000));
-        assert_eq!(e.status, "grammar checker restarted");
+        assert_eq!(e.status, "Harper restarted");
         assert!(e.active().diagnostics.slot(DiagSource::Harper).is_none(), "not Review: no arm");
     }
 
     #[test]
     fn restarted_sets_status_but_does_not_arm_when_disabled() {
         let mut e = Editor::new_from_text("x\n", None, (40, 10));
+        crate::test_support::install_enabled_harper(&mut e);
         e.diag_cfg.enabled = false;
         e.active_mut().view.mode = RenderMode::Review;
         apply_provider_event(&mut e, DiagSource::Harper, ProviderEvent::Restarted, &TestClock::new(1000));
-        assert_eq!(e.status, "grammar checker restarted");
+        assert_eq!(e.status, "Harper restarted");
         assert!(e.active().diagnostics.slot(DiagSource::Harper).is_none(), "disabled: no arm");
+    }
+
+    #[test]
+    fn restarted_arms_only_its_source_slot() {
+        let mut e = Editor::new_from_text("x\n", None, (40, 10));
+        e.diag_providers.install(Box::new(RecordingProvider::new().with_source(DiagSource::Harper)), true);
+        e.diag_providers.install(Box::new(RecordingProvider::new().with_source(DiagSource::Plugin("mock"))), true);
+        e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = RenderMode::Review;
+        apply_provider_event(&mut e, DiagSource::Plugin("mock"), ProviderEvent::Restarted, &TestClock::new(1000));
+        assert_eq!(e.active().diagnostics.slot(DiagSource::Plugin("mock")).unwrap().recheck_due_at,
+            Some(1000 + e.diag_cfg.debounce_ms));
+        assert!(e.active().diagnostics.slot(DiagSource::Harper).is_none(), "other source not armed");
     }
 
     #[test]

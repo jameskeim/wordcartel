@@ -578,6 +578,7 @@ mod tests {
         let p = scratch();
         std::fs::write(&p, "new content\n").unwrap();
         let mut e = Editor::new_from_text("old content\n", Some(p.clone()), (80, 24));
+        crate::test_support::install_enabled_harper(&mut e); // enable Harper so late results reach the version gate
         // Version V; arm a fake in-flight diagnostics check.
         let pre_reload_version = e.active().document.version; // 0
         let harper = wordcartel_core::diagnostics::DiagSource::Harper;
@@ -617,9 +618,9 @@ mod tests {
                 suggestions: vec![],
             }],
         );
-        // The stale result must NOT be stored.
-        assert!(e.active().diagnostics.slot(harper).is_none_or(|s| s.diagnostics.is_empty()),
-            "late pre-reload DiagnosticsDone must be discarded (version gate)");
+        // The stale result must NOT be stored — the non-creating latch-clear leaves no phantom slot.
+        assert!(e.active().diagnostics.slot(harper).is_none(),
+            "late pre-reload DiagnosticsDone must be discarded (version gate); no phantom slot");
         // computed_version must not have been set to the new buffer's version by the stale result
         // (i.e., the new buffer's version != pre_reload_version, and diagnostics are still empty).
         assert_ne!(e.active().document.version, pre_reload_version,
@@ -648,6 +649,7 @@ mod tests {
     #[test]
     fn load_recovered_discards_pre_recovery_diagnostics_done() {
         let mut e = Editor::new_from_text("old content\n", None, (80, 24));
+        crate::test_support::install_enabled_harper(&mut e); // enable Harper so the late result reaches the version gate
         let pre_recovery_version = e.active().document.version; // 0
         let harper = wordcartel_core::diagnostics::DiagSource::Harper;
         e.active_mut().diagnostics.slot_mut(harper).in_flight_version = Some(pre_recovery_version);
@@ -684,8 +686,8 @@ mod tests {
                 suggestions: vec![],
             }],
         );
-        assert!(e.active().diagnostics.slot(harper).is_none_or(|s| s.diagnostics.is_empty()),
-            "late pre-recovery DiagnosticsDone must be discarded");
+        assert!(e.active().diagnostics.slot(harper).is_none(),
+            "late pre-recovery DiagnosticsDone must be discarded; no phantom slot");
     }
 
     /// Effort A: reload/recover close the pre-replacement generation on the provider (the

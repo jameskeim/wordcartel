@@ -1397,6 +1397,7 @@ mod tests {
         use crate::registry::Registry;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         let mut e = Editor::new_from_text("hi\n", None, (80, 24));
+        crate::test_support::install_enabled_harper(&mut e); // arm_if_edited → arm_enabled arms enabled sources
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = RenderMode::Review;
         e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).recheck_due_at = None;
@@ -1455,6 +1456,7 @@ mod tests {
         use crate::registry::Registry;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        crate::test_support::install_enabled_harper(&mut e); // arm_if_edited → arm_enabled arms enabled sources
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = RenderMode::Review;
         let v = e.active().document.version;
@@ -1491,6 +1493,7 @@ mod tests {
         use crate::registry::Registry;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         let mut e = Editor::new_from_text("aa aa aa\n", None, (80, 24));
+        crate::test_support::install_enabled_harper(&mut e); // arm_if_edited → arm_enabled arms enabled sources
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = RenderMode::Review;
         let reg = Registry::builtins();
@@ -1520,6 +1523,7 @@ mod tests {
         use crate::jobs::InlineExecutor;
         use crate::registry::Registry;
         let mut e = Editor::new_from_text("abcde\n", None, (80, 24));
+        crate::test_support::install_enabled_harper(&mut e); // arm_if_edited → arm_enabled arms enabled sources
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = crate::editor::RenderMode::Review;
         let id = e.active().id;
@@ -1549,6 +1553,7 @@ mod tests {
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
             MouseEvent, MouseEventKind, MouseButton};
         let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
+        crate::test_support::install_enabled_harper(&mut e); // arm_if_edited → arm_enabled arms enabled sources
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = RenderMode::Review;
         e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).recheck_due_at = None;
@@ -1685,6 +1690,7 @@ mod tests {
         use crossterm::event::{Event, KeyModifiers, MouseEvent, MouseEventKind, MouseButton};
         let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
         crate::derive::rebuild(&mut e);
+        crate::test_support::install_enabled_harper(&mut e); // arm_if_edited → arm_enabled arms enabled sources
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = RenderMode::Review;
         let v = e.active().document.version;
@@ -3290,6 +3296,7 @@ mod tests {
     fn diagnostics_done_applies_only_for_current_version() {
         use crate::editor::Editor;
         let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        crate::test_support::install_enabled_harper(&mut e); // apply's is_enabled(Harper) guard
         let bid = e.active().id;
         let v = e.active().document.version;
         let diag = vec![wordcartel_core::diagnostics::Diagnostic {

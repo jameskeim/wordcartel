@@ -38,6 +38,9 @@ impl DiagStore {
     /// The slot for `source`, if it has ever been touched (armed, computed, or latched).
     pub fn slot(&self, source: DiagSource) -> Option<&SourceSlot> { self.slots.get(&source) }
     /// The slot for `source`, creating a fresh default one on first touch.
+    /// Callers must not resurrect slots for disabled sources — a result routed here for a source
+    /// that is not enabled would leave a phantom empty slot behind (spec §6.2: the apply path reads
+    /// `slot(source)` first and only touches `slot_mut` when the source is enabled and current).
     pub fn slot_mut(&mut self, source: DiagSource) -> &mut SourceSlot {
         self.slots.entry(source).or_default()
     }
@@ -65,9 +68,9 @@ impl DiagStore {
 }
 
 /// Arm every ENABLED engine's slot on the active buffer — the multi-provider generalization of
-/// the old single `store.arm`. This task's callers: `set_render_mode`'s arm-on-enter-Review,
-/// `recheck_diagnostics`. (`arm_if_edited` stays Harper-only this task — a per-edit re-arm across
-/// every provider is Task 5's fan-out, once dispatch itself iterates providers.)
+/// the old single `store.arm`. Callers: `set_render_mode`'s arm-on-enter-Review, `arm_if_edited`'s
+/// per-edit re-arm, `recheck_diagnostics`. (Dispatch itself stays single-provider-shaped this
+/// task — Task 5 fans the actual worker send out over enabled sources.)
 pub fn arm_enabled(editor: &mut Editor, now: u64, debounce_ms: u64) {
     let sources: Vec<DiagSource> = editor.diag_providers.enabled_sources().collect();
     let store = &mut editor.active_mut().diagnostics;
@@ -101,8 +104,8 @@ pub fn arm_if_edited(editor: &mut Editor, before_id: BufferId, before_version: u
         && should_run_diagnostics(editor)
     {
         let debounce_ms = editor.diag_cfg.debounce_ms;
-        // Interim: Harper-only (single-provider-shaped dispatch, Task 5 fans this out).
-        editor.active_mut().diagnostics.slot_mut(DiagSource::Harper).arm(clock.now_ms(), debounce_ms);
+        // Re-arm every enabled engine on the edit (spec §5): each source debounces independently.
+        arm_enabled(editor, clock.now_ms(), debounce_ms);
     }
 }
 
@@ -128,7 +131,7 @@ pub fn dispatch_diagnostics(editor: &mut Editor) {
     // reporting `Unavailable` (Tasks 5/6 generalize this to every registered source).
     match editor.diag_providers.availability(DiagSource::Harper) {
         Some(Availability::Unavailable) | None => {
-            show_install_hint(editor);
+            show_install_hint(editor, DiagSource::Harper);
             return; // no in_flight
         }
         Some(Availability::Starting) => {
@@ -144,16 +147,18 @@ pub fn dispatch_diagnostics(editor: &mut Editor) {
         Accepted::Yes => {
             editor.active_mut().diagnostics.slot_mut(DiagSource::Harper).in_flight_version = Some(version);
         }
-        Accepted::No => show_install_hint(editor),
+        Accepted::No => show_install_hint(editor, DiagSource::Harper),
     }
 }
 
-/// Surface the install hint at most once per deliberate Review entry (`diag_hint_shown` latch,
-/// reset in `set_render_mode` on entering Review). Spec §9 — informative, not naggy.
-fn show_install_hint(editor: &mut Editor) {
-    if !editor.diag_hint_shown {
-        editor.diag_hint_shown = true;
-        editor.status = crate::harper_ls::INSTALL_HINT.into();
+/// Surface `source`'s install hint at most once per deliberate Review entry (`diag_hint_shown` is a
+/// per-source latch, cleared in `set_render_mode` on entering Review). Spec §9 — informative, not
+/// naggy: each engine gets to explain itself once, independently of the others.
+fn show_install_hint(editor: &mut Editor, source: DiagSource) {
+    if editor.diag_hint_shown.insert(source) {
+        if let Some(hint) = editor.diag_providers.install_hint(source) {
+            editor.status = hint.into();
+        }
     }
 }
 
@@ -210,12 +215,21 @@ pub fn apply_diagnostics_done(
     source: DiagSource,
     diagnostics: Vec<Diagnostic>,
 ) {
+    // Disabled-source drop (spec §6.2): a result for an engine that is no longer enabled is
+    // dropped and its slot removed — never resurrected. `clear_source` on an absent slot is a
+    // no-op, so no phantom empty slot is created (the durability invariant save.rs asserts).
+    if !editor.diag_providers.is_enabled(source) {
+        if let Some(b) = editor.by_id_mut(buffer_id) { b.diagnostics.clear_source(source); }
+        return;
+    }
     // Build the ignore union BEFORE borrowing the buffer mutably (dictionary/session_ignores live
     // on `editor`, not the buffer). Empty in the common case → the filter below is skipped.
     let union = ignore_union_lower(editor);
     if let Some(b) = editor.by_id_mut(buffer_id) {
         if b.document.version == version {
             let mut diagnostics = diagnostics;
+            debug_assert!(diagnostics.iter().all(|d| d.source == source),
+                "DiagnosticsDone payload sources match the message tag");
             if !union.is_empty() {
                 // Apply-time ignore filter (spec §7.3): the text is this buffer at `version`, so the
                 // stored byte ranges slice the right surface words.
@@ -226,10 +240,11 @@ pub fn apply_diagnostics_done(
             slot.diagnostics = diagnostics;
             slot.computed_version = version;
         }
-        // clear in_flight for this version regardless (the check completed)
-        let slot = b.diagnostics.slot_mut(source);
-        if slot.in_flight_version == Some(version) {
-            slot.in_flight_version = None;
+        // Clear in_flight for this version if the latch is still armed for it (the check completed) —
+        // but READ `slot(source)` first, so a stale result for a source with no live slot never
+        // creates a phantom one (spec §6.2 non-creating latch-clear).
+        if b.diagnostics.slot(source).map(|s| s.in_flight_version) == Some(Some(version)) {
+            b.diagnostics.slot_mut(source).in_flight_version = None;
         }
     }
 }
@@ -338,6 +353,7 @@ mod tests {
     fn arm_if_edited_arms_only_on_active_buffer_edit_in_review() {
         use crate::editor::{Editor, RenderMode};
         let mut e = Editor::new_from_text("x\n", None, (40, 10));
+        crate::test_support::install_enabled_harper(&mut e); // arm_if_edited → arm_enabled arms enabled sources
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = RenderMode::Review;
         use crate::test_support::TestClock;
@@ -392,7 +408,6 @@ mod tests {
     // ------------------------------------------------------------------
     use crate::editor::{Editor, RenderMode};
     use crate::diag_provider::{RecordingProvider, Availability, Accepted};
-    use crate::harper_ls::INSTALL_HINT;
     use wordcartel_core::diagnostics::DiagSource;
 
     fn review_editor(text: &str) -> Editor {
@@ -429,8 +444,8 @@ mod tests {
         dispatch_diagnostics(&mut e);
         assert_eq!(e.active().diagnostics.slot(DiagSource::Harper).unwrap().in_flight_version, None,
             "Accepted::No must not latch");
-        assert!(e.diag_hint_shown, "the degrade hint latch is set");
-        assert_eq!(e.status, INSTALL_HINT);
+        assert!(e.diag_hint_shown.contains(&DiagSource::Harper), "the degrade hint latch is set");
+        assert_eq!(e.status, "test provider unavailable", "the installed provider's own hint");
     }
 
     #[test]
@@ -453,8 +468,8 @@ mod tests {
         e.diag_providers.install(Box::new(RecordingProvider::new().with_source(DiagSource::Harper)
             .with_availability(Availability::Unavailable)), true);
         dispatch_diagnostics(&mut e);
-        assert_eq!(e.status, INSTALL_HINT);
-        assert!(e.diag_hint_shown);
+        assert_eq!(e.status, "test provider unavailable");
+        assert!(e.diag_hint_shown.contains(&DiagSource::Harper));
         // Second dispatch: hint already shown → status is not re-set (informative, not naggy).
         e.status = String::new();
         e.active_mut().diagnostics.slot_mut(DiagSource::Harper).arm(0, 400);
@@ -487,6 +502,7 @@ mod tests {
     #[test]
     fn apply_filters_ignored_spelling_over_the_union_keeps_grammar() {
         let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        crate::test_support::install_enabled_harper(&mut e); // apply's is_enabled(Harper) guard
         let id = e.active().id;
         let v = e.active().document.version;
         e.dictionary.insert("TEH".into()); // case-insensitive union membership
@@ -495,6 +511,58 @@ mod tests {
         let kept = &e.active().diagnostics.slot(DiagSource::Harper).unwrap().diagnostics;
         assert_eq!(kept.len(), 1, "spelling 'teh' filtered by dictionary; grammar retained");
         assert_eq!(kept[0].kind, DiagnosticKind::Grammar);
+    }
+
+    // ------------------------------------------------------------------
+    // Task 4: source-routed apply (is_enabled guard + non-creating latch-clear).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn apply_routes_to_the_named_source_slot_only() {
+        let mut e = review_editor("teh cat\n");
+        crate::test_support::install_enabled_harper(&mut e);
+        e.diag_providers.install(Box::new(
+            RecordingProvider::new().with_source(DiagSource::Plugin("mock"))), true);
+        let id = e.active().id;
+        let v = e.active().document.version;
+        let mock_grammar = Diagnostic { range: 4..7, kind: DiagnosticKind::Grammar,
+            source: DiagSource::Plugin("mock"), code: None, href: None,
+            message: "x".into(), suggestions: vec![] };
+        apply_diagnostics_done(&mut e, id, v, DiagSource::Harper, vec![spelling(0..3)]);
+        apply_diagnostics_done(&mut e, id, v, DiagSource::Plugin("mock"), vec![mock_grammar]);
+        assert_eq!(e.active().diagnostics.slot(DiagSource::Harper).unwrap().diagnostics.len(), 1);
+        assert_eq!(e.active().diagnostics.slot(DiagSource::Plugin("mock")).unwrap().diagnostics.len(), 1);
+        assert_eq!(e.active().diagnostics.slot(DiagSource::Harper).unwrap().diagnostics[0].kind,
+            DiagnosticKind::Spelling, "each result lands in its own source's slot, no cross-clobber");
+    }
+
+    #[test]
+    fn apply_stale_version_clears_latch_without_storing() {
+        let mut e = review_editor("teh\n");
+        crate::test_support::install_enabled_harper(&mut e);
+        let id = e.active().id;
+        let v = e.active().document.version;
+        e.active_mut().diagnostics.slot_mut(DiagSource::Harper).in_flight_version = Some(v);
+        e.active_mut().document.version = v + 1; // edited after dispatch
+        apply_diagnostics_done(&mut e, id, v, DiagSource::Harper, vec![spelling(0..3)]);
+        let slot = e.active().diagnostics.slot(DiagSource::Harper).unwrap();
+        assert!(slot.diagnostics.is_empty(), "stale result not stored");
+        assert_eq!(slot.in_flight_version, None, "latch cleared (in_flight == msg.version)");
+    }
+
+    #[test]
+    fn apply_for_disabled_source_drops_and_clears_slot() {
+        let mut e = review_editor("teh\n");
+        // mock is NOT installed/enabled → result dropped, slot removed.
+        e.active_mut().diagnostics.slot_mut(DiagSource::Plugin("mock")).in_flight_version = Some(1);
+        let id = e.active().id;
+        let v = e.active().document.version;
+        let mock = Diagnostic { range: 0..3, kind: DiagnosticKind::Spelling,
+            source: DiagSource::Plugin("mock"), code: None, href: None,
+            message: "x".into(), suggestions: vec![] };
+        apply_diagnostics_done(&mut e, id, v, DiagSource::Plugin("mock"), vec![mock]);
+        assert!(e.active().diagnostics.slot(DiagSource::Plugin("mock")).is_none(),
+            "disabled source: result dropped and phantom slot removed");
     }
 
     #[test]
