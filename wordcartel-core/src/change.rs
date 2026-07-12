@@ -25,7 +25,7 @@ pub enum Op {
 /// A reversible byte-diff between two document states: a sequence of [`Op`]s that
 /// consumes a document of `len_before` bytes and produces one of `len_after`
 /// bytes. This is Wordcartel's edit-transaction type — see the module docs for
-/// provenance and the invariant-arithmetic note above for the overflow argument.
+/// provenance and the invariant-arithmetic note below for the overflow argument.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangeSet {
     ops: Vec<Op>,

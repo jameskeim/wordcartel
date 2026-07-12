@@ -63,13 +63,13 @@ pub struct Face {
     pub bg: Option<Color>,
     /// Color of the underline glyph when it differs from `fg` (diagnostic squiggles).
     pub underline_color: Option<Color>,
-    /// Bold modifier.
+    /// Bold modifier. When set, text in this face is rendered with a bold weight.
     pub bold: Option<bool>,
-    /// Italic modifier.
+    /// Italic modifier. When set, text in this face is rendered slanted/oblique.
     pub italic: Option<bool>,
-    /// Underline modifier.
+    /// Underline modifier. When set, text in this face is rendered with an underline rule.
     pub underline: Option<bool>,
-    /// Strikethrough modifier.
+    /// Strikethrough modifier. When set, text in this face is rendered with a line through it.
     pub strike: Option<bool>,
     /// Reverse-video (fg/bg swap) modifier.
     pub reverse: Option<bool>,

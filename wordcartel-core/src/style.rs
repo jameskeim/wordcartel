@@ -73,7 +73,8 @@ pub struct LineAnalysis {
     pub runs: Vec<Run>,
     /// Inline style spans over (typically visible) sub-ranges of the line.
     pub styles: Vec<StyleSpan>,
-    /// The line's block-level role.
+    /// The line's block-level role — heading / list-item / code-block / etc. — which selects
+    /// prefix glyphs and concealment.
     pub role: BlockRole,
     /// Synthetic replacement text painted in place of a concealed block prefix (e.g. a
     /// block-quote bar, list bullet/ordinal, or thematic-break rule); `None` when the line
