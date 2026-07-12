@@ -34,7 +34,8 @@ it appears in the palette, is bindable via `keymap.patches`, and inserting at th
 - A loader: single-file `<name>.lua` and directory `<name>/init.lua`, eager lexicographic load at
   startup, with a filesystem-free `load_sources` core.
 - The `wc.*` registration + editor API: `register_command`, `status`, buffer/selection **reads**, and
-  validated **edits** (`insert`/`replace`/`set_selection`) — all routing through `submit_transaction`.
+  validated **edits** (`insert`/`replace`/`set_selection`) — plugin offsets pre-validated against the
+  live buffer (§3b), then routed through `submit_transaction`. (No `wc.command` in P1 — deferred to P2.)
 - The opened command registry: plugin `CommandId→Plugin` entries in the *same* registry the palette
   and menu derive from; `<plugin>.<command>` namespacing; optional `MenuCategory`.
 - The **pump**: the single post-`reduce` pipeline stage that is the *only* place Lua ever runs, with
@@ -46,6 +47,10 @@ it appears in the palette, is bindable via `keymap.patches`, and inserting at th
   and the command-surface-contract invariants extended over plugin entries.
 
 ### NOT in P1 (deferred to P2/P3) — explicit
+- **`wc.command(id)`** (a plugin dispatching another command) → **P2**. It needs the full dispatch
+  context (`Ctx` + `&Registry`) the pump doesn't carry, plus the enqueue-route re-drain loop and chain
+  cap; it lands with events, which need the same context. **Scope trim vs. the original proposal — flag
+  at spec review.** (P1 plugins register/read/edit/status without it.)
 - **Events / hooks** (`on_save`/`on_open`/`on_buffer_close`, any pub/sub) → **P2**.
 - **Per-plugin config tables** (`[plugins.<name>]` handed to the plugin) → **P2**. P1's `[plugins]`
   is host-level enable/disable only.
@@ -141,20 +146,36 @@ one call and returns owned data to Lua. Reads are O(requested), never O(document
 Live reads mean read-after-write inside one callback behaves naturally (insert, then ask the cursor —
 it reflects the insert), which a snapshot model cannot do.
 
-### b. Edits — ONLY via `submit_transaction`
+### b. Edits — ONLY via `submit_transaction`, and NEVER hand raw plugin offsets to a trusting constructor
 There is no raw-state API by construction — the bridge simply never exposes one. Edit functions build a
 `ChangeSet` against the *live* buffer length and submit through the proven boundary
-(`transact::submit_transaction(editor, txn, clock) -> Result<(), EditError>`):
-- `wc.insert(text)` → `ChangeSet::insert(cursor, text, len)` (`wordcartel-core/src/change.rs:63`) at the primary head.
-- `wc.replace(a, b, text)` → built via `ChangeSet::from_ops(ops, doc_len)` (`wordcartel-core/src/change.rs:118`) with the
-  exact `Op::{Retain, Delete, Insert}` pattern the existing private `replace_changeset`
-  (`commands.rs:110`) already uses: `Retain(a)` if `a>0`, `Delete(b-a)` if `b>a`, `Insert(text)` if
-  non-empty, `Retain(doc_len-b)` if `doc_len>b`. **Reuse that helper's shape** — the cleanest path is to
-  promote `replace_changeset` to `pub(crate)` and call it from `api.rs` (one visibility change, no logic
-  duplication), then hand the resulting `ChangeSet` to `submit_transaction`, which re-validates against
-  the live buffer (a mid-char `a`/`b` → `EditError::OpBoundary`, zero mutation).
+(`transact::submit_transaction(editor, txn, clock) -> Result<(), EditError>`).
+
+**Pre-validation is on us — the construction step panics on garbage before the boundary ever runs.**
+`ChangeSet::from_ops` (`wordcartel-core/src/change.rs:118`) is a **trusted-caller** constructor that
+**release-asserts** `retain + delete == len_before` (`change.rs:127`) — and `TextBuffer::apply`'s own
+char-boundary asserts fire on mid-char offsets. `submit_transaction`'s `validate_against` catches a
+STALE *length*, but a plugin passing out-of-bounds, reversed (`from > to`), or non-char-boundary offsets
+would **panic during construction**, before validation — defeating degrade-don't-crash / no-data-loss.
+So the plugin edit API MUST pre-validate the plugin-provided offsets against the **live buffer** and
+return a **typed Lua error** (degrade, plugin may `pcall`) BEFORE constructing any `ChangeSet`. A single
+shared helper `plugin_check_range(buf, from, to) -> Result<(), PluginEditError>` enforces, in order:
+`from <= to`; `to <= buf.len()`; `from` and `to` each on a char boundary
+(`buf.clamp_to_boundary(p) == p`). Only offsets that pass reach a constructor.
+
+- `wc.insert(text)` → pre-checks `cursor` is a valid boundary (it always is — it comes from the live
+  selection — but the check is uniform), then `ChangeSet::insert(cursor, text, len)`
+  (`wordcartel-core/src/change.rs:63`) at the primary head.
+- `wc.replace(a, b, text)` → **pre-validate `(a, b)` via `plugin_check_range`** (bad input → typed Lua
+  error, nothing constructed), THEN build via the existing private `replace_changeset`
+  (`commands.rs:110`) — promoted to `pub(crate)` and called from `api.rs` (one visibility change, no
+  logic duplication): `Retain(a)` if `a>0`, `Delete(b-a)` if `b>a`, `Insert(text)` if non-empty,
+  `Retain(doc_len-b)` if `doc_len>b`, over `ChangeSet::from_ops(ops, doc_len)`. Because the range was
+  pre-checked against the live buffer, `from_ops`'s consumption assert cannot trip. `submit_transaction`
+  then re-validates length (a concurrent-edit `StaleLength` → `Err`, zero mutation) — the pre-check and
+  the boundary are complementary: pre-check guards *construction*, `validate_against` guards *staleness*.
 - `wc.set_selection(anchor, head)` → routes through the same selection-snapping `submit_transaction`
-  applies (out-of-bounds snaps, never rejects — the existing behavior).
+  applies (out-of-bounds snaps, never rejects — the existing behavior; selection needs no pre-check).
 
 `submit_transaction` is already proptest-hardened (2048 hostile cases: never-panics / on-Err-zero-
 mutation / on-Ok-in-bounds-and-char-boundary). The plugin edit boundary **inherits that guarantee for
@@ -176,34 +197,19 @@ thing both already touch is the **`Editor`**. So the queue lives on `Editor`:
   `ctx.editor.pending_plugin_calls` and returns `CommandResult::Handled` — it does **not** call Lua and
   imports no `mlua` type.
 - `PluginHost::pump(&mut self, editor: &Rc<RefCell<Editor>>)` takes the **handle**, not `&mut Editor`,
-  so it never holds a borrow across Lua. It runs a **bounded drain-and-invoke loop** — the two phases
-  alternate until the queue is empty or the chain cap trips:
+  so it never holds a borrow across Lua. It is a **single drain-then-invoke pass** (P1 has no
+  `wc.command` — §5/§1 — so no callback can grow the queue mid-pump; a re-drain loop and a chain cap are
+  P2 concerns, deferred with the machinery that would need them):
   - **Phase A — drain (short `borrow_mut` scope, drops immediately).** `{ let mut e =
-    editor.borrow_mut(); std::mem::take(&mut e.pending_plugin_calls) }` pops the currently-queued
-    `PluginCall`s into a local `Vec`; the `RefMut` is released before Phase B.
+    editor.borrow_mut(); std::mem::take(&mut e.pending_plugin_calls) }` pops the queued `PluginCall`s
+    into a local `Vec`; the `RefMut` is released before Phase B.
   - **Phase B — invoke (NO outer borrow held).** For each drained `PluginCall`, look up the plugin's
     stored Lua callback (a value in Lua's named registry, keyed by the command id string — WezTerm's
     persistent-callback pattern) and invoke it inside `panicx::catch` + the `set_hook` time guard (§7).
     Each `wc.*`/editor API closure re-borrows via its **own captured `Rc<RefCell<Editor>>` clone** with a
     short `try_borrow_mut` (§3a) — which succeeds precisely because Phase A's borrow is gone and the pump
-    holds nothing.
-  - A callback that enqueues another plugin command (via `wc.command`, below) grows
-    `pending_plugin_calls`; the loop returns to Phase A and drains the new batch **in the same pump**, so
-    plugin→plugin chains resolve same-frame. A running **chain counter** across the whole pump enforces
-    `MAX_PLUGIN_CHAIN` (below); reaching it stops the loop.
-
-The pump, drilled down (Phase B, per call):
-
-1. Look up the callback and invoke it inside `panicx::catch` + the `set_hook` time guard (§7).
-2. Each invoked callback may itself call `wc.command("<id>")`. If the target is another **plugin**
-   command, it is **enqueued** onto `pending_plugin_calls` (drained by the next Phase-A pass), not
-   recursed — so callbacks never re-enter Lua under their own call stack. If the target is a **builtin**,
-   it is dispatched immediately through the normal registry `Ctx` path (builtins are non-re-entrant Rust
-   and hold their own borrow discipline).
-3. A **per-pump chain cap** (constant `MAX_PLUGIN_CHAIN = 16`) bounds the total callbacks executed across
-   all Phase-A/B passes of one pump. Exceeding it aborts the remaining queue with a `plugin_error`
-   ("plugin command chain exceeded 16 — possible loop") — pre-empting the render→hook→render feedback
-   class (Fresh hit a 13 Hz loop; we make it impossible to hang the frame).
+    holds nothing. A single callback's own runaway is bounded by the `set_hook` time guard (§7) — the
+    real per-callback hang protection, independent of any chain cap.
 
 Because the pump runs before `advance`/`draw`, effects are visible the same frame. Because it runs with
 no editor borrow held, the API closures' `try_borrow_mut` always succeeds in the normal path.
@@ -284,16 +290,23 @@ error (degrade, not panic).
 
 **Editor API (callback time):**
 - Reads: `wc.text(a?, b?)`, `wc.selection()`, `wc.cursor()`, `wc.len()`, `wc.version()`, `wc.path()`.
-- Edits (all via `submit_transaction`): `wc.insert(text)`, `wc.replace(a, b, text)`,
-  `wc.set_selection(anchor, head)`.
-- Dispatch: `wc.command(id)` — dispatch another command by full id (plugin → enqueued; builtin →
-  immediate; §3c chain cap applies).
+- Edits (all pre-validated then via `submit_transaction` — §3b): `wc.insert(text)`,
+  `wc.replace(a, b, text)` (offsets pre-checked against the live buffer; bad input → typed Lua error,
+  nothing constructed), `wc.set_selection(anchor, head)`.
 - Status / errors: `wc.status(msg)` — set `editor.status` (the only user-visible output channel; no
   console — the app owns the alternate screen). Lua `error(msg)` from a callback is caught and routed
   through `plugin_error`.
 
-That is the entire P1 surface. No events, no config table, no timers, no async, no UI-drawing API
-(Provider law: plugins supply data/behavior; the host owns UI/layout/focus).
+**No `wc.command` in P1 — deferred to P2 (deliberate scope trim).** Dispatching another command from a
+plugin needs a full `Ctx{editor,clock,executor,msg_tx}` + `&Registry` (`registry.rs:26–31`, `:649`)
+that `pump(&editor)` does not supply; wiring the pump with that context (and making `wc.command`
+enqueue-and-route, with the re-drain loop + chain cap that then become necessary) is P2-shaped
+plumbing. A P1 plugin can already register, read, edit, and set status without invoking other commands —
+so `wc.command` is dropped from P1 for leanness and lands in P2 alongside events (which need the same
+dispatch context). **Flagged for the human at spec review as a scope trim vs. the original proposal.**
+
+That is the entire P1 surface. No `wc.command`, no events, no config table, no timers, no async, no
+UI-drawing API (Provider law: plugins supply data/behavior; the host owns UI/layout/focus).
 
 ---
 
@@ -347,10 +360,11 @@ That is the entire P1 surface. No events, no config table, no timers, no async, 
   vendored Lua 5.4; if not, drop the cap with a documented note (do not hack one). A cap WezTerm skips
   but we shouldn't — `O(content)`-plus-baseline is a stated resource law and plugins are untrusted-ish.
 - **Degrade, don't crash.** Load failure → skip + report + continue (per-plugin containment). Callback
-  failure (error, panic, time abort, chain-cap) → status line; the editor is unaffected and the buffer
-  is untouched (edits that never reached `submit_transaction` changed nothing; one that returned `Err`
-  changed nothing by proptest guarantee). Repeated-failure auto-disable is deliberately deferred —
-  status-line reporting plus `--no-plugins` covers P1.
+  failure (Lua error, panic, time abort, or a rejected edit offset — §3b) → status line; the editor is
+  unaffected and the buffer is untouched (a rejected edit never reached a constructor; edits that never
+  reached `submit_transaction` changed nothing; one that returned `Err` changed nothing by proptest
+  guarantee). Repeated-failure auto-disable is deliberately deferred — status-line reporting plus
+  `--no-plugins` covers P1.
 - **`plugin_error(editor, name, err)` seam** — the single formatting/routing point for all plugin
   errors (the analog of WezTerm's injectable `show_error` callback), writing to `editor.status`. Never a
   console; `print_*`/`dbg!` remain deny-lints.
@@ -371,11 +385,15 @@ That is the entire P1 surface. No events, no config table, no timers, no async, 
   `Msg::Tick`s, assert **zero** callback invocations *and* `timers::next_wake` unchanged (P1 plugins arm
   no deadline — nothing to gate). Proves "loaded ≠ background work."
 - **Isolation tests:** a panicking callback → caught, status set, editor intact, next command still
-  works; a callback that loops → time-abort fires (driven by a low test budget); a plugin command that
-  `wc.command`s itself → chain-cap aborts with the loop message; the `try_borrow_mut` "editor busy" path
-  is exercised directly.
-- **Edit-boundary test:** a plugin `wc.replace` with a mid-char position → `EditError::OpBoundary`
-  surfaces, buffer unchanged (the `submit_transaction` guarantee, re-asserted through the plugin path).
+  works; a callback that loops → time-abort fires (driven by a low test budget); the `try_borrow_mut`
+  "editor busy" path is exercised directly.
+- **Edit pre-validation tests (guards the round-3 Critical — construction must never panic on garbage):**
+  a plugin `wc.replace` with an out-of-bounds offset, a reversed range (`from > to`), and a mid-char
+  offset each → a **typed Lua error, buffer unchanged, no panic** (the pre-check rejects before any
+  `ChangeSet` is constructed — proves garbage never reaches `from_ops`'s consumption assert). Plus a
+  concurrent-`StaleLength` path: a valid-at-check-time range that a racing edit invalidates → the
+  `submit_transaction` `validate_against` `Err`, zero mutation. A fuzz/property-style test driving random
+  `(from, to, text)` from Lua asserts **no panic** across the whole edit API.
 - **Contract-invariant tests** (see §9): palette-completeness and menu-subset re-run over a registry
   containing plugin entries; a patch-bound plugin command resolves in `build_keymap` and survives a
   preset switch (law 7).
@@ -391,8 +409,9 @@ derivation** (the single-registry design makes conformance structural, not vigil
 
 - **Law 1 — registry is the single source of truth.** Plugin commands are registered *into the existing
   `Registry`*; there is no parallel command store. Plugin edits mutate command-reachable state only
-  through `submit_transaction` and (via `wc.command`) existing registered commands' setters — never a
-  novel raw mutation path.
+  through the validated `submit_transaction` boundary (P1 exposes no raw-state API and no `wc.command`,
+  so a plugin has literally no other mutation path). (`wc.command`, routing through existing commands'
+  shared setters, arrives in P2 and keeps this discipline.)
 - **Law 3 — palette exhaustive.** `palette.rs` iterates `reg.commands()`; plugin entries are ordinary
   entries, so they appear automatically. The palette-completeness test is re-run over a plugin-loaded
   registry.
