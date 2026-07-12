@@ -32,8 +32,10 @@ pub enum Suggestion {
 
 /// A single flagged issue in a checked text, as reported by a
 /// `wordcartel::diag_provider::DiagnosticsProvider` in the shell. Diagnostics are pure data —
-/// this crate holds no linting logic; a shell-side `DiagStore` collects, sorts (ascending by
-/// `range.start`), and renders them, offering the shell UI a menu of `suggestions`.
+/// this crate holds no linting logic, no sorting, and no rendering. The producing provider
+/// (e.g. harper-ls) sorts its results ascending by `range.start` before handing them to the
+/// shell's `DiagStore`, which just holds them; `wordcartel::render` is what paints them and
+/// turns each diagnostic's `suggestions` into a menu for the shell UI.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Diagnostic {
     /// Byte range into the checked text that the diagnostic covers.

@@ -32,9 +32,10 @@ pub enum CaseMode {
     Insensitive,
 }
 
-/// A pattern failed to compile — the needle was not a valid regular expression
-/// (only reachable in [`QueryMode::Regex`]; [`QueryMode::Literal`] needles are escaped
-/// first and always compile). Carries the underlying engine's error message.
+/// A pattern failed to compile — the needle was not a valid regular expression. `compile`
+/// runs [`QueryMode::Literal`] needles through `regex_syntax::escape` first, so they always
+/// yield a valid pattern; a `CompileError` can therefore only arise from an invalid
+/// [`QueryMode::Regex`] pattern. Carries the underlying engine's error message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompileError(pub String);
 
