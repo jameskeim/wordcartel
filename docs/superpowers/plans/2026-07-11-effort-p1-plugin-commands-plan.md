@@ -3,12 +3,13 @@
 **Spec:** `docs/superpowers/specs/2026-07-11-effort-p1-plugin-commands-design.md` (Codex-clean,
 human-approved 2026-07-11).
 **Branch:** `effort-p1-plugin-commands`.
-**Shape:** a **spike GATE** first (prove the 7 load-bearing `mlua` behaviors, or STOP and revise), then
-seven integration tasks built so the tree stays green after each: deps+skeleton → registry seam →
-registration API + loader core → editor API + pump → `app::run` wiring (the top integration risk) →
-loader/config/CLI → the full test suite + `insert_date.lua` demo. Subagent-driven, TDD per task
-(failing test → impl → green → commit), per-task reviewer (spec-compliance + quality), one Fable
-whole-branch gate + one Codex pre-merge gate.
+**Shape:** a **spike GATE** first (prove the load-bearing `mlua` behaviors — a superset of spec §11's
+seven — or STOP and revise), then seven integration tasks built so the tree stays green after each:
+deps+skeleton → registry seam → registration API + loader core → editor API + pump → loader/config/CLI →
+`app::run` wiring (the top integration risk) → the full test suite + `insert_date.lua` demo. The
+loader/config/CLI task lands BEFORE the `app::run` wiring so `run()` can reference `discover`/`cfg.plugins`/
+`cli.no_plugins` on a green tree. Subagent-driven, TDD per task (failing test → impl → green → commit),
+per-task reviewer (spec-compliance + quality), one Fable whole-branch gate + one Codex pre-merge gate.
 
 Anchor on symbol NAMES (lines drift). `cargo` + `grep` are ground truth, never an editor "unused"/
 "undefined" hint (subagent edits are the most stale in an analyzer's view).
@@ -33,11 +34,11 @@ Anchor on symbol NAMES (lines drift). `cargo` + `grep` are ground truth, never a
 4. **Module-budget / anti-regrowth (GATE).** `app.rs` stays under **1000 production lines**
    (`wordcartel/tests/module_budgets.rs` — currently 817). New logic lives in `wordcartel/src/plugin/`;
    `app.rs` gains only the `Rc<RefCell>` wrap + per-stage borrows + one pump-stage call + host
-   construction. Add a `plugin/host.rs` budget row (Task 7). `clippy::too_many_lines` (threshold 100)
+   construction. Add a `plugin/host.rs` budget row (Task 6). `clippy::too_many_lines` (threshold 100)
    binds every new fn — the pump loop is a thin delegation, not an inline body.
 5. **Command-surface-contract conformance (GATE, spec §9).** Plugin commands register into the EXISTING
    `Registry`; palette/menu derive unchanged, so palette-completeness + menu-subset hold by construction;
-   keymap patch resolution (`reg.resolve_name`) gives free bindings. Task 7 re-runs the contract
+   keymap patch resolution (`reg.resolve_name`) gives free bindings. Task 8 re-runs the contract
    invariant tests over a plugin-loaded registry.
 6. **House style** (CLAUDE.md): dense hand-formatting, `—` em-dashes never `--`, no emoji, doc-comment
    every public item, snake_case/PascalCase/SCREAMING_SNAKE. Do NOT run `cargo fmt`. Match neighbors.
@@ -51,18 +52,20 @@ Anchor on symbol NAMES (lines drift). `cargo` + `grep` are ground truth, never a
 
 ---
 
-## Task 1 — mlua spike (GATE: prove the 7 load-bearing behaviors, or STOP)
+## Task 1 — mlua spike (GATE: prove the load-bearing behaviors, or STOP)
 
-**This gates everything.** A scratch crate proving the `mlua` assumptions the design rests on. It is
-**not** merged — it lives in `/tmp/claude-*/plugin-spike/` (or a gitignored `spike/` dir) and its
-findings are recorded in the effort ledger. **If the spike DISPROVES any assumption, STOP and revise the
-design before Task 2** — the fallbacks are named inline.
+**This gates everything.** A scratch crate proving the `mlua` assumptions the design rests on — a
+**superset of spec §11's seven items** (all seven, plus two useful extras). It is **not** merged — it
+lives in `/tmp/claude-*/plugin-spike/` (or a gitignored `spike/` dir) and its findings are recorded in
+the effort ledger. **If the spike DISPROVES any load-bearing assumption, STOP and revise the design
+before Task 2** — the fallbacks are named inline.
 
 **Model:** standard implementer. **Files:** a throwaway cargo crate (NOT in the workspace).
 
-Prove, each a `fn main`/`#[test]` in the scratch crate:
+Prove, each a `fn main`/`#[test]` in the scratch crate. Items 1–7 are spec §11.1–§11.7 (the FULL spec
+list); 8–9 are useful extras — this spike is a **superset** of the spec's seven.
 
-1. **`!Send` capture without the `send` feature — THE load-bearing one.** With
+1. **(§11.1) `!Send` capture without the `send` feature — THE load-bearing one.** With
    `mlua = { version = "<current>", features = ["vendored", "lua54"] }` (NO `send`/`async`/`serialize`),
    a closure capturing `Rc<RefCell<i64>>` compiles and runs in `lua.create_function`:
    ```rust
@@ -76,30 +79,40 @@ Prove, each a `fn main`/`#[test]` in the scratch crate:
    ```
    *If this fails to compile (mlua requires `Send` captures by default):* STOP. Fallback per spec §11 —
    re-evaluate whether the handle model needs a different cell, or whether a thread-local VM changes the
-   capture bound. Do not proceed to integration on a red result here.
-2. **`set_hook` time/instruction abort unwinds cleanly.** Install `lua.set_hook` on an instruction-count
-   trigger that returns `Err` after N instructions; run an infinite `while true do end`; confirm the
-   `exec()` returns `Err` (not a hang, not an abort), the VM is reusable afterward, and measure hook
-   overhead at ~10k-instruction granularity. *If abort does not unwind cleanly:* STOP — the runaway guard
-   is mandatory (spec §7); revise the guard mechanism before integration.
-3. **`set_memory_limit` on vendored 5.4.** `lua.set_memory_limit(64 << 20)?`; allocate past it; confirm
-   an `Err` (memory error) rather than a process abort. *If unsupported/unenforced:* per spec §7, the VM
-   heap cap is DROPPED with a documented note — the always-on registration caps (Task 3/4) remain the
-   real bound. Record the result; this one is allowed to be red (documented), the others are not.
-4. **Panic→Lua-error conversion.** A `create_function` closure that `panic!`s: confirm the panic surfaces
-   as an `Err` at the `exec()`/call site (mlua converts), and that wrapping the whole call in
-   `panicx::catch`-equivalent (`catch_unwind`) also catches it — confirm the double defense (spec §7).
-5. **Named-registry persistent callbacks.** `lua.set_named_registry_value("k", func)` then
+   capture bound. Do not proceed to integration on a red result here. **(GREEN required.)**
+2. **(§11.2) `set_memory_limit` on vendored 5.4.** `lua.set_memory_limit(64 << 20)?`; allocate past it;
+   confirm an `Err` (memory error) rather than a process abort. *If unsupported/unenforced:* per spec §7,
+   the VM heap cap is DROPPED with a documented note — the always-on registration caps (Task 3/4) remain
+   the real bound. **(Allowed documented-red → drop the heap cap.)**
+3. **(§11.3) `set_hook` time/instruction abort unwinds cleanly.** Install `lua.set_hook` on an
+   instruction-count trigger that returns `Err` after N instructions; run an infinite `while true do end`;
+   confirm the `exec()` returns `Err` (not a hang, not an abort), the VM is reusable afterward, and measure
+   hook overhead at ~10k-instruction granularity. *If abort does not unwind cleanly:* STOP — the runaway
+   guard is mandatory (spec §7); revise before integration. **(GREEN required.)**
+4. **(§11.4) Panic→Lua-error conversion.** A `create_function` closure that `panic!`s: confirm the panic
+   surfaces as an `Err` at the `exec()`/call site (mlua converts), and that wrapping the whole call in
+   `panicx::catch`-equivalent (`catch_unwind`) also catches it — the double defense (spec §7).
+   **(GREEN required.)**
+5. **(§11.5) Startup cost.** Time `Lua::new()` + loading ~5 small chunks; confirm it is well under the
+   startup/splash budget (target < ~10 ms; record the number). **(Recorded.)**
+6. **(§11.6) `Lua::scope` status.** One look at whether `lua.scope` still exists / is usable in the pinned
+   mlua — the design does NOT use it, so this closes out the rejected alternative honestly.
+   **(Documentation-only, never blocking.)**
+7. **(§11.7) `cargo deny check`.** Not a scratch-crate probe — a release-checklist check on a branch with
+   the `mlua`/vendored-Lua dep added, recording the license/duplicate-dep posture (clean-or-findings; NOT
+   a merge gate — mirrors the project's `cargo deny` = release-checklist-not-gate rule). **(Recorded.)**
+8. **(extra) Named-registry persistent callbacks.** `lua.set_named_registry_value("k", func)` then
    `lua.named_registry_value::<mlua::Function>("k")?.call(())?` across separate `load().exec()` calls —
    confirm a stored Lua fn survives and re-invokes (the callback-storage mechanism for `register_command`).
-6. **Startup cost.** Time `Lua::new()` + loading ~5 small chunks; confirm it is well under the
-   startup/splash budget (target < ~10 ms; record the number).
-7. **`package.path` prepend + `require`.** Prepend a dir to `package.path` and `require` a module from it
-   — confirm the directory-plugin (`<name>/init.lua`) load path works (spec §6).
+   **(GREEN required.)**
+9. **(extra) `package.path` prepend + `require`.** Prepend a dir to `package.path` and `require` a module
+   from it — confirm the directory-plugin (`<name>/init.lua`) load path works (spec §6). **(GREEN required.)**
 
-**Acceptance:** all of 1,2,4,5,7 GREEN; 3 and 6 recorded (3 may be documented-red → drop the heap cap).
-Findings written to `$(git rev-parse --git-path sdd)/progress.md`. **On any red in {1,2,4,5,7}: STOP,
-surface to the human, revise the spec/plan before Task 2.**
+**Acceptance:** the load-bearing set **{1, 3, 4, 8, 9} GREEN**; {2, 5, 6, 7} **recorded** (2 may be
+documented-red → drop the heap cap; 5/6/7 informational). Findings written to
+`$(git rev-parse --git-path sdd)/progress.md` — especially the §11.2 `set_memory_limit` verdict and the
+§11.1 `!Send`-capture result. **On any red in {1, 3, 4, 8, 9}: STOP, surface to the human, revise the
+spec/plan before Task 2.**
 
 ---
 
@@ -270,6 +283,9 @@ core that drives it. Tested entirely on string sources (no disk).
 - `load_rejects_bad_menu` — `menu='Nonsense'` → error, not interned; `menu='Edit'` → `Some(Edit)`.
 - `load_reports_collision` — two plugins registering the same id → the second yields a `Duplicate`
   `LoadReport`, batch continues.
+- `load_is_atomic_per_plugin` — a single plugin whose 1st `register_command` is fine and 2nd collides (or
+  over-caps) → the WHOLE plugin is skipped: **neither** command is registered (`reg.commands().count()`
+  unchanged), a `LoadReport` error is returned.
 - `load_parse_error_is_reported_not_fatal` — a plugin with a Lua syntax error → error for that plugin,
   others load.
 
@@ -339,33 +355,47 @@ core that drives it. Tested entirely on string sources (no disk).
   (`stem` is interned once at load; caps on `name`/`label` are on the raw `String`; the menu string is
   parse-to-enum; `intern` is only reached AFTER all caps pass — resource-bound LAW satisfied. The
   editor-API functions — reads/edits/status — are added to `wc` in Task 5 via a sibling installer.)
-- `plugin/load.rs` — the testable core:
+- `plugin/load.rs` — the testable core. **Signature deviation from spec §6, intentional (MINOR):** the
+  spec wrote `load_sources(host, &[(name, src)]) -> Vec<LoadReport>`; since registration mutates the
+  `Registry`, the real signature threads `reg: &mut Registry` — stated here so it is a deliberate
+  refinement, not a drift.
   ```rust
   pub struct LoadReport { pub plugin: String, pub result: Result<usize, String> } // Ok(n_commands)
 
   /// Filesystem-free load core: exec each (stem, source) into the host VM, collect registrations,
-  /// drain into `reg`. Per-plugin failure (parse error, cap, collision) is isolated to that plugin.
+  /// commit into `reg` ATOMICALLY per plugin. Per-plugin failure (parse error, cap, collision) is
+  /// isolated AND all-or-nothing — a failing plugin leaves ZERO commands registered (spec §"skip the
+  /// whole plugin").
   pub fn load_sources(reg: &mut Registry, host: &PluginHost, sources: &[(String, String)])
       -> Vec<LoadReport> {
       let Some(lua) = host.lua() else { return Vec::new(); };  // null host: nothing
       let mut reports = Vec::new();
       for (stem_raw, src) in sources {
-          // stem cap (raw), then intern:
           let report = crate::panicx::catch(|| load_one(reg, lua, stem_raw, src))  // panicx at entry
-              .unwrap_or_else(|e| Err(e));
+              .unwrap_or_else(Err);
           reports.push(LoadReport { plugin: stem_raw.clone(), result: report });
       }
       reports
   }
   ```
-  `load_one`: check `stem_raw.len() <= PLUGIN_MAX_STEM_LEN` (else `Err`); `intern(stem_raw)`; fresh
-  `sink`/`count`; `api::install_registration(lua, stem, sink.clone(), count.clone())?`; `lua.load(src)
-  .set_name(stem).exec()` (parse/exec error → `Err(e.to_string())`, isolated); then drain `sink` via
-  `reg.register_plugin(id, label, menu)` — a `Duplicate` becomes an `Err` in the report but does not
-  abort. Returns `Ok(count)`.
+  `load_one` — **atomic (all-or-nothing) per plugin**:
+  1. `stem_raw.len() <= PLUGIN_MAX_STEM_LEN` (else `Err`, nothing done); `intern(stem_raw)`.
+  2. Fresh `sink`/`count`; `api::install_registration(lua, stem, sink.clone(), count.clone())?`;
+     `lua.load(src).set_name(stem).exec()` — a parse/exec error → `Err(e.to_string())`, and since NOTHING
+     has been committed to `reg` yet, the plugin is cleanly skipped. (The Lua callbacks stored in the
+     named registry during exec are inert dead keys if we bail — harmless; a future reload clears the VM.)
+  3. **Preflight before ANY commit:** with the drained `sink`, check every entry's id against `reg` AND
+     against the others in this batch for a collision, and re-confirm the batch is within
+     `PLUGIN_MAX_COMMANDS_PER_PLUGIN`. If ANY entry would collide/over-cap → return `Err` having committed
+     NONE (the plugin registers zero commands).
+  4. Only if the whole preflight passes: `for p in sink { reg.register_plugin(p.id, p.label, p.menu) }`
+     — every call now provably `Ok` (preflight already ruled out the sole `Duplicate` failure). Return
+     `Ok(count)`.
+  This guarantees a half-valid plugin (cmd1 fine, cmd2 duplicate) commits neither — no partial registration.
 
-**Acceptance:** `cargo test -p wordcartel plugin::load` green (all TDD cases); warning-free; clippy clean.
-No disk touched by the core.
+**Acceptance:** `cargo test -p wordcartel plugin::load` green (all TDD cases, incl. an atomicity test: a
+plugin whose 2nd `register_command` collides leaves its 1st command UNregistered); warning-free; clippy
+clean. No disk touched by the core.
 
 ---
 
@@ -451,7 +481,21 @@ an `Rc<RefCell<Editor>>`, assert on the editor. No threads, no `app::run`.
     len)`, `submit_transaction(editor, Transaction::new(cs), clock)`; `EditError` → typed Lua error.
   - `wc.replace(a, b, text)` → `text.len()` cap; `plugin_check_range(buf, a, b)`;
     `commands::build_range_replace(a, b, text, doc_len)` → `submit_transaction`.
-  - `wc.set_selection(anchor, head)` → `submit_transaction` with the snapping selection (no pre-check).
+  - `wc.set_selection(anchor, head)` → an **identity `ChangeSet`** (no text edit) + `Transaction`
+    carrying the selection; `submit_transaction` snaps it (out-of-bounds clamps, never rejects), so no
+    pre-check. `submit_transaction` requires a `Transaction { changes: ChangeSet, .. }` (transact.rs,
+    history.rs), so the changes must be a validated identity over the live `doc_len`:
+    ```rust
+    let doc_len = editor.borrow().active().document.buffer.len();
+    let ident = wordcartel_core::change::ChangeSet::from_ops(
+        vec![wordcartel_core::change::Op::Retain(doc_len)], doc_len);  // retain-all == identity
+    let txn = wordcartel_core::history::Transaction::new(ident)
+        .with_selection(wordcartel_core::selection::Selection::range(anchor, head));
+    crate::transact::submit_transaction(&mut editor.borrow_mut(), txn, clock)?;  // snaps the selection
+    ```
+    (`Retain(doc_len)` sums to `len_before` so `from_ops`'s consumption assert holds; `submit_transaction`
+    clamps `anchor`/`head` to char boundaries in `[0, doc_len]` — the existing snap-not-reject behavior.
+    Do NOT invent a raw selection mutation or an unchecked `from_ops`.)
   - `wc.status(msg)` → truncate `msg` to `PLUGIN_MAX_STATUS_LEN` on a char boundary → `editor.status`.
   Register both installers via the flat seam vector (registration installer from Task 4 + this one).
 
@@ -460,80 +504,11 @@ resource + isolation cases); warning-free; clippy clean.
 
 ---
 
-## Task 6 — `app::run` integration: `Rc<RefCell<Editor>>`, the borrow choreography, the pump stage (TOP RISK)
+## Task 6 — loader `discover` (+ skipped-report) + `[plugins]` config + `--no-plugins` + module budget
 
-Wire the host into the real loop. **This is the highest-attention task** (the borrow choreography — spec
-§11). Sequence carefully; every existing loop stage becomes its own short borrow scope, `msg_tx` moves
-before the plugin-load phase, and the pump runs between `reduce` and the keymap/theme arms holding NO
-outer borrow.
-
-**Model:** most-capable. **Files:** `wordcartel/src/app.rs` (the `run` fn only; `reduce` and helpers keep
-`&mut Editor`).
-
-**TDD first:**
-- `e2e::tests::plugin_command_dispatches_via_palette` (in `wordcartel/src/e2e.rs`, the in-process
-  `reduce → advance → render` harness) — a host loaded with `insert_date`-style plugin, dispatch its
-  command through the registry/palette path, drive one loop turn incl. the pump, assert the buffer
-  changed. (This is the first test that exercises the real pump stage in the loop.)
-- A borrow-safety regression: a loop turn that dispatches a plugin command does not panic (no double
-  `borrow`), asserted by the harness completing.
-
-**Implementation (in `run`, anchored by symbol/behavior, not line):**
-1. Wrap the loop-local editor: after the existing `let mut editor = …` construction and all the
-   pre-loop mutation (session restore, splash, `first_frame_settle`, first draw — keep these on the plain
-   `&mut editor`), convert to `let editor = Rc::new(RefCell::new(editor));` JUST before the `loop {`.
-   (Pre-loop code stays `&mut`; only the loop body uses the handle — smallest borrow surface.)
-2. **Move `msg_tx` creation earlier** — the `let (msg_tx, msg_rx) = channel()` currently sits ~after
-   `Registry::builtins()`. Move it **above** the plugin-load phase so the bridge can capture
-   `msg_tx.clone()`. (Mechanical; the channel has no dependency on the intervening lines — verify by
-   compile.)
-3. **Plugin-load phase** — between `Registry::builtins()` and `build_keymap` (so plugin commands are in
-   the registry before keymap resolution → free bindings): resolve the plugins dir + `[plugins]` config +
-   `--no-plugins` (Task 7 provides `discover`/config); build the host or `PluginHost::null()`:
-   ```rust
-   let mut plugin_host = if cli.no_plugins || !cfg.plugins.enabled {
-       crate::plugin::host::PluginHost::null()
-   } else {
-       match crate::plugin::host::PluginHost::new() {
-           Ok(mut h) => {
-               let sources = crate::plugin::load::discover(&plugins_dir, &cfg.plugins.disable);
-               for r in crate::plugin::load::load_sources(&mut reg, &h, &sources) {
-                   if let Err(e) = &r.result { warns.push(format!("plugin {}: {e}", r.plugin)); }
-               }
-               h.attach_bridge(/* editor handle set after the Rc wrap; see note */);
-               h
-           }
-           Err(e) => { warns.push(format!("plugins disabled: {e}")); PluginHost::null() }
-       }
-   };
-   let reg = reg; // freeze (was `let mut reg` for the load window)
-   ```
-   *Bridge/editor-handle ordering note:* the bridge needs the `Rc<RefCell<Editor>>`, created in step 1
-   (after load, since load only needs `&mut reg`, not the editor). So: load registers commands (needs
-   `&mut reg` + the VM only); THEN wrap the editor in the `Rc`; THEN `attach_bridge(editor.clone(),
-   msg_tx.clone())` before the loop. Registration (Task 4) never touches the editor, so this ordering is
-   sound — the editor API closures are installed at `attach_bridge` time, once the handle exists.
-4. **Per-stage borrow choreography** — every loop-body stage that touches editor takes its own short
-   scope (spec §2). Concretely, each `stage(&mut editor, …)` becomes `stage(&mut editor.borrow_mut(),
-   …)` (or an explicit `{ let mut e = editor.borrow_mut(); … }`), and the immutable `next_wake` uses
-   `&editor.borrow()`. The stages, in order: `timers::next_wake` (`&borrow`), `timers::pre_recv`,
-   `reduce`, **`plugin_host.pump(&editor, &clock)`** ← NEW, holds NO borrow, `rebuild_keymap_if_requested`,
-   `rederive_theme_if_requested`, settings-save arm, `surface_undo_eviction`, `drain_clipboard_intents`,
-   `reconcile_mouse_capture`, `advance`, `render::render`, session-persist check/use. The pump slots
-   directly after `reduce`'s borrow scope closes and before the keymap arm.
-5. `InputThreadDied` / `!keep` break paths and the post-loop shutdown (`diag_provider.shutdown`,
-   `dump_all_dirty`, final persist, `drop(guard)`) — adapt to `editor.borrow()` where they read the
-   editor. The `dump_all_dirty(&editor, …)` on input-loss takes a `borrow()`.
-
-**Acceptance:** `cargo test -p wordcartel` green (incl. the new e2e); the app runs, loads a plugin from
-the config dir, and its command works via palette + keybinding; `--no-plugins` cleanly skips;
-`module_budgets` app.rs still < 1000 (report the number). Warning-free; clippy clean.
-
----
-
-## Task 7 — loader `discover` + `[plugins]` config + `--no-plugins` + module budget
-
-The filesystem + config surface around the tested core, plus the `plugin/host.rs` budget row.
+The filesystem + config + CLI surface around the tested core, plus the `plugin/host.rs` budget row.
+**Ordered BEFORE the `app::run` wiring (Task 7)** so `run()` can reference `discover`, `cfg.plugins`, and
+`cli.no_plugins` and every task compiles on a green tree.
 
 **Model:** standard. **Files:** `wordcartel/src/plugin/load.rs`, `wordcartel/src/config.rs`,
 `wordcartel/tests/module_budgets.rs`.
@@ -542,7 +517,8 @@ The filesystem + config surface around the tested core, plus the `plugin/host.rs
 - `load::tests::discover_reads_single_file_and_dir` — a tempdir with `a.lua` and `b/init.lua` → two
   sources, lexicographic order `["a", "b"]`, stems correct.
 - `discover_skips_disabled` — a name in `disable` is skipped.
-- `discover_bounded_read` — a file over the bounded-read cap is skipped with a report, others load.
+- `discover_reports_skipped_oversize` — a file over the bounded-read cap is **skipped AND named in the
+  returned report** (not silently dropped), others load.
 - `config::tests::plugins_section_parses` — `[plugins] enabled=false, disable=["x"]` folds into
   `Config.plugins`; default is `enabled=true, disable=[]`.
 - `config::tests::parse_cli_no_plugins_flag` — `--no-plugins` sets `cli.no_plugins`.
@@ -553,12 +529,22 @@ The filesystem + config surface around the tested core, plus the `plugin/host.rs
   `Config` (grep `pub struct Config`), a `PluginsConfig { enabled: bool (default true), disable:
   Vec<String> }`, and the `RawConfig` + per-field-merge following the existing pattern (grep an existing
   section like `ClipboardConfig`/`DiagnosticsConfig` for the raw-parse + merge shape).
-- `plugin/load.rs` — `discover(dir: &Path, disable: &[String]) -> Vec<(String, String)>`: `read_dir`,
-  collect `*.lua` files (stem = filename minus `.lua`) and `*/init.lua` dirs (stem = dir name), skip
-  `disable`, sort lexicographically by stem, bounded-read each (the `bounded_read_opt`/generous ~1 MiB
-  pattern — plugin files are user code, not documents), skip + report an over-size or unreadable file.
-  Returns `(stem, source)` pairs. (Does NOT touch `Fs` — that trait is write-only; discover reads
-  directly, and the tested logic is in `load_sources`.)
+- `plugin/load.rs` — `discover` must **surface skipped files** (spec §"Load failure → skip + report"), so
+  it returns the sources AND a skipped-report, not a bare `Vec`:
+  ```rust
+  /// The outcome of scanning the plugins dir: loadable (stem, source) pairs + a report of files
+  /// skipped (oversize / unreadable) so the caller can surface them to the status line.
+  pub struct Discovered {
+      pub sources: Vec<(String, String)>,     // (stem, source), lexicographic by stem
+      pub skipped: Vec<LoadReport>,            // reuse LoadReport { plugin, result: Err(reason) }
+  }
+  pub fn discover(dir: &Path, disable: &[String]) -> Discovered { … }
+  ```
+  `read_dir`, collect `*.lua` files (stem = filename minus `.lua`) and `*/init.lua` dirs (stem = dir
+  name), skip `disable`, sort lexicographically by stem, bounded-read each (the `bounded_read_opt`/
+  generous ~1 MiB pattern — plugin files are user code, not documents); an over-size/unreadable file goes
+  to `skipped` (a `LoadReport` with `Err(reason)`), never into `sources`. (Does NOT touch `Fs` — that
+  trait is write-only; discover reads directly, and the load logic is in `load_sources`.)
 - `module_budgets.rs` — add:
   ```rust
   #[test]
@@ -569,6 +555,86 @@ The filesystem + config surface around the tested core, plus the `plugin/host.rs
   ```
 
 **Acceptance:** `cargo test -p wordcartel plugin::load config::` green; warning-free; clippy clean.
+
+---
+
+## Task 7 — `app::run` integration: `Rc<RefCell<Editor>>`, the borrow choreography, the pump stage (TOP RISK)
+
+Wire the host into the real loop. **This is the highest-attention task** (the borrow choreography — spec
+§11). Sequence carefully; every existing loop stage becomes its own short borrow scope, `msg_tx` moves
+before the plugin-load phase, and the pump runs between `reduce` and the keymap/theme arms holding NO
+outer borrow. Depends on Task 6 (`discover`/`cfg.plugins`/`cli.no_plugins`).
+
+**Model:** most-capable. **Files:** `wordcartel/src/app.rs` (the `run` fn only; `reduce` and helpers keep
+`&mut Editor`), **`wordcartel/src/e2e.rs`** (the `Harness` needs a `PluginHost` field + a pump slot in
+`step` so the e2e test actually drives the pump — see below).
+
+**TDD first:**
+- **`e2e.rs` harness change (prerequisite for the test):** the real `Harness` (`struct Harness`, e2e.rs)
+  has no `PluginHost` and `Harness::step` (the shared `snapshot → reduce → surface_undo_eviction →
+  advance → render` sequence) has no pump slot — so a plugin test cannot reach the pump as-is. Add an
+  `Option<PluginHost>` (+ the `Rc<RefCell<Editor>>` handle or an equivalent) to `Harness`, and insert the
+  pump call in `step` at the SAME point `run` uses it (after `reduce`, before the keymap/advance stages).
+  A test constructor loads plugin sources into the harness's registry+host.
+- `e2e::tests::plugin_command_dispatches_via_palette` — a harness loaded with an `insert_date`-style
+  plugin: dispatch its command through the registry/palette path, `step`, assert the buffer changed via
+  the pump. (First test exercising the real pump stage in a loop-shaped sequence.)
+- A borrow-safety regression: a `step` that dispatches a plugin command does not panic (no double
+  `borrow`), asserted by the harness completing.
+
+**Implementation (in `run`, anchored by symbol/behavior, not line):**
+1. **Move `msg_tx` creation earlier** — the `let (msg_tx, msg_rx) = channel()` currently sits ~after
+   `Registry::builtins()`. Move it **above** the plugin-load phase so the bridge can capture
+   `msg_tx.clone()`. (Mechanical; the channel has no dependency on the intervening lines — verify by
+   compile.)
+2. **Plugin-load phase** — between `Registry::builtins()` and `build_keymap` (so plugin commands are in
+   the registry before keymap resolution → free bindings). Load needs only `&mut reg` + the VM (NOT the
+   editor), so it runs here; the bridge is attached after the editor is wrapped (step 3):
+   ```rust
+   let mut plugin_host = if cli.no_plugins || !cfg.plugins.enabled {
+       crate::plugin::host::PluginHost::null()
+   } else {
+       match crate::plugin::host::PluginHost::new() {
+           Ok(h) => {
+               let disc = crate::plugin::load::discover(&plugins_dir, &cfg.plugins.disable);
+               for r in disc.skipped { warns.push(format!("plugin {} skipped: {}", r.plugin,
+                   r.result.err().unwrap_or_default())); }              // surface skipped (Task 6)
+               for r in crate::plugin::load::load_sources(&mut reg, &h, &disc.sources) {
+                   if let Err(e) = &r.result { warns.push(format!("plugin {}: {e}", r.plugin)); }
+               }
+               h
+           }
+           Err(e) => { warns.push(format!("plugins disabled: {e}")); PluginHost::null() }
+       }
+   };
+   let reg = reg; // freeze (was `let mut reg` for the load window)
+   ```
+3. **Wrap the editor, THEN attach the bridge.** Keep all pre-loop editor mutation (session restore,
+   splash, `first_frame_settle`, first draw) on the plain `&mut editor`; convert to
+   `let editor = Rc::new(RefCell::new(editor));` JUST before the `loop {`. Immediately after,
+   `plugin_host.attach_bridge(editor.clone(), msg_tx.clone(), /* clock handle */)` — this installs the
+   editor-API closures (reads/edits/status, Task 5) now that the handle exists. Registration (Task 4)
+   already happened in step 2 and never touched the editor, so this ordering is sound.
+4. **Per-stage borrow choreography** — every loop-body stage that touches editor takes its own short
+   scope (spec §2). Each `stage(&mut editor, …)` becomes `stage(&mut editor.borrow_mut(), …)` (or an
+   explicit `{ let mut e = editor.borrow_mut(); … }`); the immutable `next_wake` uses `&editor.borrow()`.
+   Order: `timers::next_wake` (`&borrow`), `timers::pre_recv` (`borrow_mut`), `reduce` (`borrow_mut`
+   scope), **`plugin_host.pump(&editor, &clock)`** ← NEW, holds NO borrow, `rebuild_keymap_if_requested`,
+   `rederive_theme_if_requested`, settings-save arm, `surface_undo_eviction`, `drain_clipboard_intents`,
+   `reconcile_mouse_capture`, `advance`, `render::render`, session-persist check/use — each its own
+   `borrow`/`borrow_mut` scope. The pump slots directly after `reduce`'s borrow scope closes and before
+   the keymap arm.
+5. **Post-loop shutdown — audit each use for the CORRECT mutability** (Codex CRITICAL 2): after the loop,
+   - `editor.diag_provider.shutdown()` needs **`&mut self`** (`DiagnosticsProvider::shutdown`,
+     `diag_provider.rs`) → `editor.borrow_mut().diag_provider.shutdown();`.
+   - `recovery::dump_all_dirty(&editor, &dir)` on `ExitReason::InputLost` reads → `&editor.borrow()`.
+   - `session_restore::persist_session(&mut session, &editor, &cfg, seq)` reads editor → `&editor.borrow()`.
+   - `drop(guard)` is terminal-only, no editor borrow.
+   Give each its own short scope; do NOT hold one borrow across several.
+
+**Acceptance:** `cargo test -p wordcartel` green (incl. the new e2e); the app runs, loads a plugin from
+the config dir, and its command works via palette + keybinding; `--no-plugins` cleanly skips;
+`module_budgets` app.rs still < 1000 (report the number). Warning-free; clippy clean.
 
 ---
 
@@ -605,7 +671,7 @@ fixture under `wordcartel/tests/fixtures/plugins/` (or an inline string in the e
 ## Final gates (after Task 8)
 
 1. **Fable whole-branch review** — cross-task invariants: the borrow-across-Lua invariant holds on every
-   loop path (Task 6); both design laws are honored at EVERY input-taking API with no gap (compile probes
+   loop path (Task 7); both design laws are honored at EVERY input-taking API with no gap (compile probes
    against the branch); no `mlua` type leaked into `registry.rs`/`wordcartel-core`; idle does no plugin
    work. Fable compiles scratch probes against the real branch.
 2. **Codex pre-merge gate** — independent GO/NO-GO: spec conformance, the resource/panic laws' completeness
@@ -619,5 +685,6 @@ result, delete the branch. Push only when asked.
 
 Track in `$(git rev-parse --git-path sdd)/progress.md`: one line per completed task + commit range. After
 any compaction, trust the ledger + `git log` over recollection; never re-dispatch a task it marks done.
-Task 1 (spike) records its 7 findings there — especially the `set_memory_limit` verdict (drives whether
-the VM heap cap ships) and the `!Send`-capture result (the design's load-bearing assumption).
+Task 1 (spike) records its findings there (spec §11's seven + two extras) — especially the
+`set_memory_limit` verdict (drives whether the VM heap cap ships) and the `!Send`-capture result (the
+design's load-bearing assumption).
