@@ -70,11 +70,31 @@ pub fn discover(dir: &Path, disable: &[String]) -> Discovered {
 
     let mut sources = Vec::new();
     let mut skipped = Vec::new();
-    for (stem, path) in candidates {
+    let mut i = 0;
+    while i < candidates.len() {
+        let stem = candidates[i].0.clone();
         if disable.iter().any(|d| d == &stem) {
+            i += 1;
             continue; // user opt-out — not a load failure, excluded from both lists.
         }
-        match crate::file::bounded_read_opt(&path, PLUGIN_MAX_SOURCE_BYTES) {
+        let mut j = i + 1;
+        while j < candidates.len() && candidates[j].0 == stem {
+            j += 1;
+        }
+        if j - i > 1 {
+            // Same stem resolved by both `<stem>.lua` and `<stem>/init.lua` — ambiguous.
+            // Load neither; one report for the stem, not one per colliding file.
+            skipped.push(LoadReport {
+                plugin: stem.clone(),
+                result: Err(format!(
+                    "ambiguous plugin '{stem}': both {stem}.lua and {stem}/init.lua exist — remove one"
+                )),
+            });
+            i = j;
+            continue;
+        }
+        let path = &candidates[i].1;
+        match crate::file::bounded_read_opt(path, PLUGIN_MAX_SOURCE_BYTES) {
             Some(bytes) => match String::from_utf8(bytes) {
                 Ok(src) => sources.push((stem, src)),
                 Err(_) => skipped.push(LoadReport {
@@ -89,6 +109,7 @@ pub fn discover(dir: &Path, disable: &[String]) -> Discovered {
                 )),
             }),
         }
+        i = j;
     }
     Discovered { sources, skipped }
 }
@@ -295,6 +316,25 @@ mod tests {
         assert_eq!(stems, vec!["a", "b"], "lexicographic by stem");
         assert_eq!(disc.sources[0].1, "-- a");
         assert_eq!(disc.sources[1].1, "-- b");
+    }
+
+    #[test]
+    fn discover_rejects_ambiguous_same_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("foo.lua"), "-- foo file").unwrap();
+        std::fs::create_dir(dir.path().join("foo")).unwrap();
+        std::fs::write(dir.path().join("foo").join("init.lua"), "-- foo dir").unwrap();
+        std::fs::write(dir.path().join("bar.lua"), "-- bar").unwrap();
+        let disc = discover(dir.path(), &[]);
+        let stems: Vec<&str> = disc.sources.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(!stems.contains(&"foo"), "an ambiguous stem loads neither candidate");
+        assert_eq!(stems, vec!["bar"], "an unrelated stem still loads");
+        assert_eq!(disc.skipped.len(), 1, "one report for the ambiguous stem, not one per file");
+        assert_eq!(disc.skipped[0].plugin, "foo");
+        let err = disc.skipped[0].result.as_ref().expect_err("ambiguous stem is a failure");
+        let err_lower = err.to_lowercase();
+        assert!(err_lower.contains("ambiguous"), "error should say ambiguous: {err}");
+        assert!(err_lower.contains("remove one"), "error should say remove one: {err}");
     }
 
     #[test]
