@@ -187,8 +187,9 @@ There is no raw-state API by construction — the bridge simply never exposes on
 
 **Pre-validation is on us — the construction step panics on garbage before the boundary ever runs.**
 `ChangeSet::from_ops` (`wordcartel-core/src/change.rs:118`) is a **trusted-caller** constructor that
-**release-asserts** `retain + delete == len_before` (`change.rs:127`) — and `ChangeSet::apply`'s own
-char-boundary asserts (`change.rs:94`) fire on mid-char offsets. `submit_transaction`'s `validate_against` catches a
+**release-asserts** `retain + delete == len_before` (`change.rs:127`); `ChangeSet::apply` release-asserts
+`buf.len() == len_before` (`change.rs:95`); and the char-boundary asserts fire in `TextBuffer::insert`/
+`delete` (`buffer.rs:72`/`:95`) on mid-char offsets. `submit_transaction`'s `validate_against` catches a
 STALE *length*, but a plugin passing out-of-bounds, reversed (`from > to`), or non-char-boundary offsets
 would **panic during construction**, before validation — defeating degrade-don't-crash / no-data-loss.
 So the plugin edit API MUST pre-validate the plugin-provided offsets against the **live buffer** and
@@ -285,14 +286,20 @@ Two concrete obstacles in the real code and their minimal resolutions:
   entirely — the registry metadata never holds an owned `String`, so every existing consumer is
   untouched. **The leak makes registration a permanent allocation — hence the hard caps below (§5/§7):**
   interned strings are NOT reclaimed and Lua's `set_memory_limit` does not bound them, so registration
-  must be count- and length-capped to keep the bounded-memory invariant.
+  must be count- and length-capped to keep the bounded-memory invariant. **The caps are enforced at the
+  `api.rs` load layer on the RAW Lua-supplied `String`s, BEFORE interning** (§5/§7) — never inside
+  `register_plugin`, which by then has already received `&'static` (too late to reject an oversized
+  leak). Both the plugin **stem** and the plugin-local **name** are length-checked, and the total
+  namespaced id length is bounded, so the *full* leaked `<plugin>.<command>` id is capped, not just its
+  `name` segment.
 
 New public registry surface:
 - `Registry::register_plugin(&mut self, name: &'static str, label: &'static str, menu:
-  Option<MenuCategory>) -> Result<(), RegisterError>` — `RegisterError` on a name collision (with a
-  builtin or an already-registered plugin command) OR an over-cap registration (§5/§7) → surfaced via
-  `plugin_error`. The interned name and label are produced by `register_command` in `api.rs` (after the
-  cap checks pass) before this call.
+  Option<MenuCategory>) -> Result<(), RegisterError>` — receives already-interned `&'static` inputs, so
+  its only failure is a **collision** (`RegisterError::Duplicate` — the id already names a builtin or an
+  earlier plugin command) → surfaced via `plugin_error`. All length/count caps are checked upstream in
+  `api.rs` on the raw `String`s; a rejected registration never reaches `register_plugin` and never
+  interns.
 - Names are **namespaced `<plugin>.<command>`**, enforced at registration (the `<plugin>` segment is the
   file/dir stem). Deterministic, collision-resistant, self-documenting in the palette.
 - Registration happens only at **plugin load time** (startup in P1), never mid-`reduce`. The registry is
@@ -328,12 +335,16 @@ error (degrade, not panic).
   "Documents"|"Settings"|"Export"`), validated at registration; `fn` is stored in Lua's named registry
   keyed by the namespaced id. A bad `menu` string or a duplicate `name` → load-report error, plugin
   continues where possible.
-- **Registration resource caps (bounded-memory invariant — name/label are interned/leaked, §4, so these
-  bound a permanent allocation `set_memory_limit` cannot).** Enforced BEFORE interning; an over-cap
-  `register_command` → typed error → status line (degrade, plugin continues where possible):
+- **Registration resource caps (bounded-memory invariant — stem/name/label are interned/leaked, §4, so
+  these bound a permanent allocation `set_memory_limit` cannot).** Enforced in `api.rs` **on the raw
+  Lua-supplied `String`s, BEFORE interning** (never inside `register_plugin`, which sees only `&'static`);
+  an over-cap `register_command` → typed error → status line (degrade, plugin continues where possible),
+  nothing interned:
   - `PLUGIN_MAX_COMMANDS_PER_PLUGIN = 256` — the 257th `register_command` from one plugin is rejected.
-  - `PLUGIN_MAX_NAME_LEN = 128` bytes (the plugin-local `name` segment); `PLUGIN_MAX_LABEL_LEN = 256`
-    bytes. Over-length → rejected, nothing interned.
+  - `PLUGIN_MAX_STEM_LEN = 64` bytes (the `<plugin>` file/dir stem, checked once at load);
+    `PLUGIN_MAX_NAME_LEN = 128` bytes (the plugin-local `name`); the full namespaced
+    `<plugin>.<command>` id is thereby bounded (≤ ~193 bytes) — the *whole* leaked id is capped, not just
+    the `name` segment. `PLUGIN_MAX_LABEL_LEN = 256` bytes. Any over-length → rejected, nothing interned.
   These also cap what flows into the palette label list (`palette.rs:73`) and the menu width scans
   (`menu.rs:62`/`:114`), so the caps protect layout as well as memory.
 
@@ -341,10 +352,14 @@ error (degrade, not panic).
 - Reads: `wc.text(a?, b?)`, `wc.selection()`, `wc.cursor()`, `wc.len()`, `wc.version()`, `wc.path()`.
 - Edits (all pre-validated then via `submit_transaction` — §3b): `wc.insert(text)`,
   `wc.replace(a, b, text)` (offsets pre-checked against the live buffer; bad input → typed Lua error,
-  nothing constructed), `wc.set_selection(anchor, head)`.
-- Status / errors: `wc.status(msg)` — set `editor.status` (the only user-visible output channel; no
-  console — the app owns the alternate screen). Lua `error(msg)` from a callback is caught and routed
-  through `plugin_error`.
+  nothing constructed), `wc.set_selection(anchor, head)`. **Edit `text` is NOT separately plugin-capped**
+  — it becomes buffer content and is bounded by the existing **M5 document-memory model** exactly like
+  any other edit (there is no larger insert a plugin can make than a user paste; §7 audit).
+- Status / errors: `wc.status(msg)` — set `editor.status`, the only user-visible output channel (no
+  console — the app owns the alternate screen). `msg` is a plugin `String` copied into owned
+  `Editor.status: String` (`editor.rs:395`), so it is **hard-capped/truncated to `PLUGIN_MAX_STATUS_LEN =
+  4096` bytes** (display-only; a longer message is clamped on a char boundary). Lua `error(msg)` from a
+  callback is caught and routed through `plugin_error` (same truncation).
 
 **No `wc.command` in P1 — deferred to P2 (deliberate scope trim).** Dispatching another command from a
 plugin needs a full `Ctx{editor,clock,executor,msg_tx}` + `&Registry` (`registry.rs:26–31`, `:649`)
@@ -405,16 +420,37 @@ UI-drawing API (Provider law: plugins supply data/behavior; the host owns UI/lay
   time against a budget (~100–250 ms; final value set by the §11 spike) and raises a Lua error to abort a
   callback that exceeds it → `"plugin <name>: exceeded time budget"` on the status line. This is the
   line between "plugin bug" and "editor hang" — a direct no-silent-UI-waits requirement.
-- **Registration caps (Rust-side, ALWAYS on — the real bounded-memory guard).** Interned/leaked
-  name+label strings (§4) are permanent Rust allocations that `set_memory_limit` does NOT bound, so
-  registration is hard-capped: `PLUGIN_MAX_COMMANDS_PER_PLUGIN = 256`, `PLUGIN_MAX_NAME_LEN = 128`,
-  `PLUGIN_MAX_LABEL_LEN = 256` bytes (§5); over-cap → typed error → status line. This is the invariant
-  that keeps registration `O(bounded)`, independent of the VM heap cap below.
+- **Resource-bound completeness law (cross-cutting; mirrors the §3 input-validation law).** Because
+  `set_memory_limit` is spike-gated AND bounds only the Lua heap — never a Rust-side allocation or a
+  permanent leak — every plugin-supplied string crossing into Rust must be *deliberately* bounded:
+
+  > **LAW.** Every plugin-supplied string that crosses into a PERMANENT leak (interned ids/labels) or a
+  > Rust allocation MUST be bounded — either by a hard plugin-layer cap or by an existing buffer-memory
+  > bound — checked/justified BEFORE the allocation.
+
+  **P1 plugin-supplied-string audit against the LAW** (every string in the surface, how it is bounded):
+  - **Plugin stem `<plugin>`** (leaked into every interned id) → `PLUGIN_MAX_STEM_LEN = 64` B, checked at
+    load before interning (§5).
+  - **Command `name` segment** (leaked in the interned id) → `PLUGIN_MAX_NAME_LEN = 128` B (§5).
+  - **Full namespaced `<plugin>.<command>` id** (the permanent `CommandId`) → bounded by stem+name caps
+    (≤ ~193 B) — the *whole* leaked id, not just `name`.
+  - **Label** (leaked into `CommandMeta.label: &'static str`) → `PLUGIN_MAX_LABEL_LEN = 256` B (§5).
+  - **Command count per plugin** (each adds a leaked id+label + a registry entry) →
+    `PLUGIN_MAX_COMMANDS_PER_PLUGIN = 256` (§5).
+  - **`wc.insert`/`wc.replace` text** (allocates via `ChangeSet::insert`→`Tendril::from`, `change.rs:70`
+    / `build_range_replace`, `commands.rs:124`) → becomes buffer content, bounded by the **existing M5
+    document-memory model** — no new plugin cap (a plugin insert is no larger than a user paste; stated
+    explicitly so it is a justified bound, not an omission).
+  - **`wc.status` / `error(msg)` text** (copied into owned `Editor.status: String`, `editor.rs:395`) →
+    hard-capped/truncated to `PLUGIN_MAX_STATUS_LEN = 4096` B on a char boundary (§5; display-only, not
+    leaked, so a modest clamp suffices).
+
+  These caps are the ALWAYS-ON bounded-memory guard; the VM heap cap below is a separate, Lua-only layer.
 - **VM heap cap (spike-gated, Lua-side).** `Lua::set_memory_limit` (~64 MiB) if §11 confirms it is
   enforced on vendored Lua 5.4; if not, drop the cap with a documented note (do not hack one). A cap
   WezTerm skips but we shouldn't — `O(content)`-plus-baseline is a stated resource law and plugins are
-  untrusted-ish. Note this bounds only the *Lua* heap, not the leaked Rust strings — those are the
-  registration caps' job.
+  untrusted-ish. Note this bounds only the *Lua* heap, not the leaked Rust strings or buffer content —
+  those are the plugin-layer caps' / M5's job (the LAW above).
 - **Degrade, don't crash.** Load failure → skip + report + continue (per-plugin containment). Callback
   failure (Lua error, panic, time abort, or a rejected edit offset — §3b) → status line; the editor is
   unaffected and the buffer is untouched (a rejected edit never reached a constructor; edits that never
@@ -454,6 +490,11 @@ UI-drawing API (Provider law: plugins supply data/behavior; the host owns UI/lay
   valid-at-check-time range that a racing edit invalidates → the `submit_transaction` `validate_against`
   `Err`, zero mutation. A fuzz/property-style test driving random `(a, b, text)` from Lua across the whole
   range-taking surface asserts **no panic**.
+- **Resource-cap tests (guards the §7 resource-bound LAW — no unbounded leak/alloc from plugin input):**
+  an over-length stem/name/label and the 257th `register_command` each → typed error, **nothing interned**
+  (verified via a stable id/label count before/after); an over-length `wc.status` → truncated to
+  `PLUGIN_MAX_STATUS_LEN` on a char boundary. Enforcement is asserted to happen on the raw `String` at the
+  `api.rs` layer (a rejected registration never reaches `register_plugin`).
 - **Contract-invariant tests** (see §9): palette-completeness and menu-subset re-run over a registry
   containing plugin entries; a patch-bound plugin command resolves in `build_keymap` and survives a
   preset switch (law 7).
