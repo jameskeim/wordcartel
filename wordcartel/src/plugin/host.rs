@@ -167,6 +167,11 @@ impl PluginHost {
         clock: Rc<dyn Clock>,
     ) -> mlua::Result<()> {
         let Some(lua) = self.lua.as_ref() else { return Ok(()) };
+        // P3 §3g: recompute BEFORE `editor` moves into the `Bridge` — the host's `hooks` are
+        // already committed by this point (load_phase/load_sources runs before attach_bridge on
+        // both the cold-start and reload paths), so this reflects the real subscriber set.
+        editor.borrow_mut().has_on_change_subscriber =
+            self.hooks.iter().any(|h| h.kind == crate::plugin::PluginEventKind::Change);
         let invoke_state = Rc::new(RefCell::new(InvokeState { current: None, observer: false }));
         let bridge = Bridge { editor, msg_tx, clock, invoke_state };
         crate::plugin::api::install_editor_api(lua, &bridge)?;
@@ -660,6 +665,23 @@ mod tests {
         let err = reports[0].result.as_ref().expect_err("the 65th wc.on must fail the plugin's exec");
         assert!(err.to_lowercase().contains("too many hooks"), "error: {err}");
         assert_eq!(reports[0].hooks, 0, "nothing committed once exec itself failed");
+    }
+
+    /// P3 §3g: `attach_bridge` recomputes `has_on_change_subscriber` off the host's committed
+    /// hooks — true when at least one `wc.on('change', …)` is registered, false otherwise
+    /// (mirrors `make_hooked`'s "load then attach" ordering that `attach_bridge` relies on).
+    #[test]
+    fn attach_bridge_sets_on_change_subscriber() {
+        let (_host, editor, _reg, reports) =
+            make_hooked("wc.on('change', function(ev) end)", "x");
+        assert_eq!(reports[0].hooks, 1);
+        assert!(editor.borrow().has_on_change_subscriber, "a change hook must set the subscriber flag");
+
+        let (_host2, editor2, _reg2, reports2) =
+            make_hooked("wc.on('save', function(ev) end)", "x");
+        assert_eq!(reports2[0].hooks, 1);
+        assert!(!editor2.borrow().has_on_change_subscriber,
+            "a plugin with only a save hook must NOT set the on_change subscriber flag");
     }
 
     #[test]

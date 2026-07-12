@@ -277,6 +277,10 @@ mod tests {
         assert!(e.pending_plugin_timers.is_empty(), "the reload clears the timer schedule (P3 §3g)");
         assert!(!e.has_on_change_subscriber, "the reload clears the on_change subscription");
         assert_eq!(e.on_change_due, None, "the reload clears the on_change due");
+        // Task 4's on_change_deadline_none_after_teardown half: the cleared subscriber/due must
+        // also drop out of next_wake — a torn-down host leaves no phantom wake armed.
+        assert_eq!(crate::timers::next_wake(&e, 10_000), None,
+            "a torn-down host must leave next_wake unarmed by the on_change row");
     }
 
     #[test]

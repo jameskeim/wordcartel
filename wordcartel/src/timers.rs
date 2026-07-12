@@ -206,6 +206,17 @@ pub(crate) fn on_tick(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock,
     if crate::reconcile::reconcile_due(&editor.active().reconcile, now) {
         crate::reconcile::dispatch_reconcile(editor, ex);
     }
+    // Fire the debounced on_change event if due (P3 §3g) — cold Tick path only, never the hot
+    // edit path; `advance` only ever sets the `Option`, this is the sole place it fires.
+    if editor.has_on_change_subscriber {
+        if let Some(due) = editor.on_change_due {
+            if now >= due {
+                editor.on_change_due = None;
+                let path = editor.active().document.path.clone();
+                crate::plugin::fire_event(editor, crate::plugin::PluginEventKind::Change, path.as_deref());
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

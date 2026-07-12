@@ -514,6 +514,85 @@ fn insert_date_lua_e2e_success_demo() {
 }
 
 // ---------------------------------------------------------------------------
+// P3 Task 4: on_change — the debounced content-settled event
+// ---------------------------------------------------------------------------
+
+/// The debounced-after-settle acceptance: a real edit arms `on_change_due`; a `Tick` BEFORE
+/// the debounce elapses fires nothing; a `Tick` AFTER it → the `Change` hook runs exactly once
+/// and `on_change_due` is cleared.
+#[test]
+fn on_change_fires_debounced_after_settle() {
+    let src = "changes = 0\nwc.on('change', function(ev) changes = changes + 1 end)";
+    let mut h = Harness::new_with_plugin("hello", &[("watcher", src)]);
+    assert!(h.editor.borrow().has_on_change_subscriber, "attach_bridge must set the subscriber flag");
+
+    h.type_str("!"); // a real edit — advance() arms on_change_due alongside the reconcile debounce
+    let due = h.editor.borrow().on_change_due;
+    assert!(due.is_some(), "an edit with a subscriber must arm on_change_due");
+
+    // A Tick BEFORE the debounce elapses must fire nothing.
+    h.advance_ms(crate::reconcile::RECONCILE_DEBOUNCE_MS - 1);
+    h.tick();
+    let changes_before: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("changes").unwrap();
+    assert_eq!(changes_before, 0, "a Tick before the debounce elapses must not fire on_change");
+    assert_eq!(h.editor.borrow().on_change_due, due, "on_change_due must not move on a too-early Tick");
+
+    // A Tick AFTER the debounce elapses fires exactly once and clears on_change_due.
+    h.advance_ms(2);
+    h.tick();
+    let changes_after: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("changes").unwrap();
+    assert_eq!(changes_after, 1, "the Change hook must run exactly once after settle");
+    assert_eq!(h.editor.borrow().on_change_due, None, "on_change_due must be cleared after firing");
+}
+
+/// THE hot-path invariant: on_change is NOT a per-keystroke hook. Three rapid edits within the
+/// debounce window must coalesce into a single armed deadline (each edit re-extends the SAME
+/// debounce, never stacking a second pending fire); after the burst settles, exactly ONE
+/// on_change fires — not three.
+#[test]
+fn on_change_is_not_per_keystroke() {
+    let src = "changes = 0\nwc.on('change', function(ev) changes = changes + 1 end)";
+    let mut h = Harness::new_with_plugin("", &[("watcher", src)]);
+
+    // Three rapid edits, no elapsed wall-clock time between them (the burst).
+    h.type_str("a");
+    h.type_str("b");
+    h.type_str("c");
+    let changes_mid_burst: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("changes").unwrap();
+    assert_eq!(changes_mid_burst, 0, "on_change must never fire mid-burst — only a Tick can fire it");
+    assert!(h.editor.borrow().on_change_due.is_some(), "the burst must leave a single armed deadline");
+
+    // Settle: advance past the debounce and tick — exactly one fire.
+    h.advance_ms(crate::reconcile::RECONCILE_DEBOUNCE_MS + 1);
+    h.tick();
+    let changes_after: i64 = h.plugin_host.as_ref().unwrap().lua().unwrap().globals().get("changes").unwrap();
+    assert_eq!(changes_after, 1, "a 3-edit burst must fire on_change exactly ONCE, not three times");
+    assert_eq!(h.doc_text(), "abc", "the burst's edits must all have landed");
+}
+
+/// The zero-cost half of the invariant: a plugin loaded WITHOUT a change hook must never arm
+/// on_change_due, even across real edits — the same "loaded ≠ background work" guardrail
+/// family as `plugin_loaded_idle_drives_zero_callback_invocations_and_stable_wake`, extended to
+/// prove the no-subscriber case costs nothing on the EDIT path too (not just idle).
+#[test]
+fn on_change_costs_nothing_without_a_subscriber() {
+    let src = "calls = 0\nwc.register_command{ name='cmd', label='Counter', fn=function() calls = calls + 1 end }";
+    let mut h = Harness::new_with_plugin("hello", &[("nochange", src)]);
+    assert!(!h.editor.borrow().has_on_change_subscriber, "no change hook ⇒ no subscriber");
+
+    h.type_str("!");
+    assert_eq!(h.editor.borrow().on_change_due, None, "an unsubscribed edit must never arm on_change_due");
+    // The reconcile debounce itself still arms (real edit, real staleness) — only the on_change
+    // row is gated on the subscriber, proving the gate is on has_on_change_subscriber specifically.
+    assert!(h.editor.borrow().active().reconcile.due_at.is_some(),
+        "precondition: the reconcile debounce itself DID arm — else this test is vacuous");
+
+    h.advance_ms(crate::reconcile::RECONCILE_DEBOUNCE_MS + 1);
+    h.tick();
+    assert_eq!(h.editor.borrow().on_change_due, None, "still None after settle — nothing was ever armed");
+}
+
+// ---------------------------------------------------------------------------
 // P2 Task 6: the event system — hooks firing at the three real fire sites
 // ---------------------------------------------------------------------------
 
