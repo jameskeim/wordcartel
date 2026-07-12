@@ -464,6 +464,12 @@ UI-drawing API (Provider law: plugins supply data/behavior; the host owns UI/lay
     and repeated calls are bounded by the `set_hook` time budget. (Its *range* is a distinct, orthogonal
     dimension already guarded against panics by the §3 input-validation LAW — this entry is the resource
     dimension only.)
+  - **`plugin_error`'s formatted error-message text** (a caught panic, a Lua `error()`, or a propagated
+    `mlua::Error` routed to `editor.status`, `mod.rs`) — bounded by `set_memory_limit` (the VM heap cap,
+    below): `mlua::Error` exposes no borrowed-message accessor, so its one `to_string()` is the minimal
+    unavoidable allocation, immediately capped (on the borrowed `msg` bytes, before the `"plugin {name}: "`
+    `format!` runs) to `PLUGIN_MAX_STATUS_LEN` — a justified bound parallel to `wc.text`'s O(content): a
+    single bounded-by-something-else allocation, capped at the earliest point, not an unbounded leak.
 
   These caps are the ALWAYS-ON bounded-memory guard; the VM heap cap below is a separate, Lua-only layer.
 - **VM heap cap (spike-gated, Lua-side).** `Lua::set_memory_limit` (~64 MiB) if §11 confirms it is

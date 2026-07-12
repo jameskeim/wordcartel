@@ -157,7 +157,11 @@ fn edit_error_message(e: EditError) -> String {
 /// Every closure captures a clone of `bridge.editor` (`Rc<RefCell<Editor>>`) and, for edits, a
 /// clone of `bridge.clock` (`Rc<dyn Clock>`); every borrow is a short `try_borrow`/
 /// `try_borrow_mut` — never `borrow`/`borrow_mut` — so a genuine nested re-entry degrades to an
-/// "editor busy" Lua error instead of a `RefCell` panic (§3d).
+/// "editor busy" Lua error instead of a `RefCell` panic (§3d). Also closes registration
+/// ([`install_registration_closed`]) — this call site (`PluginHost::attach_bridge`) is the
+/// load→callback-phase boundary (every plugin's `load_one` has already run by the time `run()`
+/// wraps the editor and attaches the bridge), so it is the one place to flip `wc.register_command`
+/// from "collects into this plugin's sink" to "errors, always" (design.md §5).
 pub(crate) fn install_editor_api(lua: &mlua::Lua, bridge: &Bridge) -> mlua::Result<()> {
     let wc = wc_table(lua)?;
     install_reads(lua, &wc, bridge)?;
@@ -165,6 +169,25 @@ pub(crate) fn install_editor_api(lua: &mlua::Lua, bridge: &Bridge) -> mlua::Resu
     install_replace(lua, &wc, bridge)?;
     install_set_selection(lua, &wc, bridge)?;
     install_status(lua, &wc, bridge)?;
+    install_registration_closed(lua, &wc)?;
+    Ok(())
+}
+
+/// Overwrite `wc.register_command` with a stub that always raises a typed Lua error — the
+/// spec's "registration functions are callable only during load … calling a registration
+/// function outside load … raises a Lua error (degrade, not panic)" rule (design.md §5,
+/// :326-329). Without this, the last plugin loaded leaves its real `wc.register_command`
+/// closure live on the shared `wc` table forever (`wc_table` is idempotent across plugins), so a
+/// post-load callback calling it would silently push into a sink no one ever drains again — a
+/// silent no-op, not the specified error. Mirrors the INVERSE of `wc.status`'s load-time
+/// unavailability (nil global → "attempt to call a nil value", since `install_editor_api` hasn't
+/// run yet during load): here the registration half of `wc` is the one taken away, on the other
+/// side of the same boundary.
+fn install_registration_closed(lua: &mlua::Lua, wc: &mlua::Table) -> mlua::Result<()> {
+    let stub = lua.create_function(|_, _args: mlua::MultiValue| -> mlua::Result<()> {
+        Err(mlua::Error::runtime("wc.register_command is only available during plugin load"))
+    })?;
+    wc.set("register_command", stub)?;
     Ok(())
 }
 

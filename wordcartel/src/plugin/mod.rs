@@ -55,10 +55,18 @@ pub fn intern(s: &str) -> &'static str {
 /// (Phase A's drain is gone by the time Phase B's callback runs), so the plain `borrow_mut`
 /// here is exactly as safe as every `wc.*` closure's own — no `try_borrow_mut` needed. Truncated
 /// on a char boundary the same way `wc.status` is — a callback failure is not exempt from the
-/// resource-bound LAW just because the message originates on the Rust side.
+/// resource-bound LAW just because the message originates on the Rust side. Caps `msg` on its
+/// BORROWED bytes to the budget left after the `"plugin {name}: "` prefix — the same
+/// bound-before-alloc shape as `wc.status` — so a multi-KB `mlua::Error` message (`host::normalize`'s
+/// one unavoidable `e.to_string()`, itself bounded only by the VM heap cap) is truncated BEFORE
+/// the `format!` runs, never after: the old code formatted the full message first and only then
+/// capped the result, a needless double allocation of the untruncated string.
 pub(crate) fn plugin_error(editor: &Rc<RefCell<Editor>>, name: &str, msg: &str) {
+    let prefix_len = "plugin ".len() + name.len() + ": ".len();
+    let budget = crate::limits::PLUGIN_MAX_STATUS_LEN.saturating_sub(prefix_len);
+    let capped_msg = cap_status(msg.as_bytes(), budget);
     let mut e = editor.borrow_mut();
-    e.status = cap_status(format!("plugin {name}: {msg}").as_bytes(), crate::limits::PLUGIN_MAX_STATUS_LEN);
+    e.status = format!("plugin {name}: {capped_msg}");
 }
 
 /// Truncate `bytes` to at most `max` bytes, backing off to the nearest UTF-8 char boundary —

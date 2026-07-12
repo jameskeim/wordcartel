@@ -507,6 +507,35 @@ mod tests {
         assert_eq!(status, "/tmp/note.md");
     }
 
+    #[test]
+    fn wc_register_command_after_load_errors_not_silent_noop() {
+        // A command callback calling wc.register_command post-load must degrade to a typed Lua
+        // error surfaced via plugin_error — never a silent no-op into a never-drained sink, and
+        // never a new command reaching the (already-frozen) Registry.
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().expect("VM construction");
+        let src = "wc.register_command{ name='cmd', label='C', fn=function() \
+                       wc.register_command{ name='evil', label='Evil', fn=function() end } \
+                   end }";
+        let reports = load_sources(&mut reg, &host, &sources(&[("t", src)]));
+        assert_eq!(reports[0].result, Ok(1), "the OUTER registration, at load time, still works");
+        let id = reg.resolve_name("t.cmd").expect("registered under t.cmd");
+        let before = reg.commands().count();
+
+        let editor = Rc::new(RefCell::new(Editor::new_from_text("x", None, (40, 10))));
+        let (tx, clock) = test_bridge_parts();
+        host.attach_bridge(editor.clone(), tx, clock).expect("bridge attaches on a live VM");
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id });
+
+        host.pump(&editor);
+        let status = editor.borrow().status.clone();
+        assert!(status.contains("register_command"), "status: {status}");
+        assert!(status.contains("only available during plugin load"), "status: {status}");
+        assert_eq!(reg.commands().count(), before, "no new command registered post-load");
+        assert!(reg.resolve_name("t.evil").is_none());
+        assert_eq!(whole_text(&editor), "x", "no unrelated editor mutation from the degrade");
+    }
+
     // -----------------------------------------------------------------------
     // spec §8's no-panic property test: the whole range-taking wc.* surface
     // (wc.replace, the wc.text read) fuzzed with hostile (a, b, text) via a real pump.
