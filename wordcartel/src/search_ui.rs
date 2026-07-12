@@ -277,7 +277,7 @@ mod tests {
     use super::*;
     use crate::editor::{Editor, RenderMode};
     use crate::test_support::TestClock;
-    use wordcartel_core::diagnostics::{Diagnostic, DiagnosticKind, Suggestion};
+    use wordcartel_core::diagnostics::{Diagnostic, DiagnosticKind, DiagSource, Suggestion};
 
     /// Opens a fresh single-suggestion `DiagOverlay` on `e`, selected on the "ignore once"
     /// row (`ignore == true`) or the "add to dictionary" row (`ignore == false`) — neither
@@ -285,7 +285,8 @@ mod tests {
     fn open_diag_selected(e: &mut Editor, ignore: bool) {
         let v = e.active().document.version;
         let id = e.active().id;
-        let d = Diagnostic { range: 0..3, kind: DiagnosticKind::Spelling, message: "x".into(),
+        let d = Diagnostic { range: 0..3, kind: DiagnosticKind::Spelling,
+            source: DiagSource::Harper, code: None, href: None, message: "x".into(),
             suggestions: vec![Suggestion::ReplaceWith("the".into())] };
         let mut ov = crate::diag_overlay::DiagOverlay::new(d, id, v);
         ov.selected = if ignore { ov.anchor.suggestions.len() } else { ov.anchor.suggestions.len() + 1 };
@@ -296,7 +297,8 @@ mod tests {
     /// has something to refilter in place.
     fn seed_teh_diag(e: &mut Editor) {
         e.active_mut().diagnostics.diagnostics = vec![Diagnostic {
-            range: 0..3, kind: DiagnosticKind::Spelling, message: "x".into(),
+            range: 0..3, kind: DiagnosticKind::Spelling, source: DiagSource::Harper, code: None,
+            href: None, message: "x".into(),
             suggestions: vec![Suggestion::ReplaceWith("the".into())] }];
     }
 

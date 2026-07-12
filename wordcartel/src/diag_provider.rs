@@ -3,6 +3,7 @@
 //! No merge/multi-provider machinery — harper is the only provider; the seam is Open-Closed
 //! insurance for provider #2.
 use crate::editor::{BufferId, Editor};
+use wordcartel_core::diagnostics::DiagSource;
 use wordcartel_core::history::Clock;
 
 /// Status hint shown when no checker is available (spec §9).
@@ -64,7 +65,12 @@ impl DiagnosticsProvider for NullProvider {
 }
 
 /// Thin reduce/prompts delegation (spec §2). `clock` is needed for the Restarted re-arm.
-pub fn apply_provider_event(editor: &mut Editor, ev: ProviderEvent, clock: &dyn Clock) {
+/// `source` identifies the emitting provider — threaded through this task, not yet routed on
+/// (single-provider store; Task 4 uses it to disambiguate multi-provider lifecycle events).
+pub fn apply_provider_event(editor: &mut Editor, source: DiagSource, ev: ProviderEvent, clock: &dyn Clock) {
+    // `source` is threaded through this task; Task 4 uses it to disambiguate multi-provider
+    // lifecycle events. The single-provider body below does not yet read it.
+    let _ = source;
     match ev {
         ProviderEvent::Restarted => {
             editor.status = "grammar checker restarted".into();
@@ -218,7 +224,7 @@ mod tests {
         let mut e = Editor::new_from_text("x\n", None, (40, 10));
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = RenderMode::Review;
-        apply_provider_event(&mut e, ProviderEvent::Restarted, &TestClock::new(1000));
+        apply_provider_event(&mut e, DiagSource::Harper, ProviderEvent::Restarted, &TestClock::new(1000));
         assert_eq!(e.status, "grammar checker restarted");
         assert_eq!(e.active().diagnostics.recheck_due_at, Some(1000 + e.diag_cfg.debounce_ms));
     }
@@ -228,7 +234,7 @@ mod tests {
         let mut e = Editor::new_from_text("x\n", None, (40, 10));
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = RenderMode::LivePreview;
-        apply_provider_event(&mut e, ProviderEvent::Restarted, &TestClock::new(1000));
+        apply_provider_event(&mut e, DiagSource::Harper, ProviderEvent::Restarted, &TestClock::new(1000));
         assert_eq!(e.status, "grammar checker restarted");
         assert_eq!(e.active().diagnostics.recheck_due_at, None, "not Review: no arm");
     }
@@ -238,7 +244,7 @@ mod tests {
         let mut e = Editor::new_from_text("x\n", None, (40, 10));
         e.diag_cfg.enabled = false;
         e.active_mut().view.mode = RenderMode::Review;
-        apply_provider_event(&mut e, ProviderEvent::Restarted, &TestClock::new(1000));
+        apply_provider_event(&mut e, DiagSource::Harper, ProviderEvent::Restarted, &TestClock::new(1000));
         assert_eq!(e.status, "grammar checker restarted");
         assert_eq!(e.active().diagnostics.recheck_due_at, None, "disabled: no arm");
     }
@@ -246,7 +252,7 @@ mod tests {
     #[test]
     fn degraded_sets_status_to_the_hint_verbatim() {
         let mut e = Editor::new_from_text("x\n", None, (40, 10));
-        apply_provider_event(&mut e, ProviderEvent::Degraded(INSTALL_HINT.into()), &TestClock::new(0));
+        apply_provider_event(&mut e, DiagSource::Harper, ProviderEvent::Degraded(INSTALL_HINT.into()), &TestClock::new(0));
         assert_eq!(e.status, INSTALL_HINT);
     }
 }

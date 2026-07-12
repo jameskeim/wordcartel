@@ -1291,7 +1291,9 @@ mod tests {
         let mut e = Editor::new_from_text("teh cat\n", None, (40, 6));
         let v = e.active().document.version;
         e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
-            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(), suggestions: vec![] }];
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
+            message: "x".into(), suggestions: vec![] }];
         e.active_mut().diagnostics.computed_version = v;
         e.active_mut().view.mode = RenderMode::Review; // E7 T2: display gate requires Review
         crate::derive::rebuild(&mut e);
@@ -1304,7 +1306,9 @@ mod tests {
         use crate::editor::{Editor, RenderMode};
         let mut e = Editor::new_from_text("teh cat\n", None, (40, 6));
         e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
-            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(), suggestions: vec![] }];
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
+            message: "x".into(), suggestions: vec![] }];
         e.active_mut().diagnostics.computed_version = 999; // != current version
         e.active_mut().view.mode = RenderMode::Review; // isolate the version-staleness guard, not the mode gate
         crate::derive::rebuild(&mut e);
@@ -1321,6 +1325,7 @@ mod tests {
         let v = e.active().document.version;
         e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
             range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
             message: "x".into(), suggestions: vec![] }];
         e.active_mut().diagnostics.computed_version = v;
         e.active_mut().view.mode = RenderMode::Review;
@@ -1703,6 +1708,7 @@ mod tests {
             e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
                 range: 0..3,
                 kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
                 message: "x".into(),
                 suggestions: vec![],
             }];

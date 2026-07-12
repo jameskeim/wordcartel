@@ -585,6 +585,7 @@ mod tests {
             wordcartel_core::diagnostics::Diagnostic {
                 range: 0..3,
                 kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
                 message: "fake".into(),
                 suggestions: vec![],
             }
@@ -606,9 +607,11 @@ mod tests {
             &mut e,
             buffer_id,
             pre_reload_version, // stale version
+            wordcartel_core::diagnostics::DiagSource::Harper,
             vec![wordcartel_core::diagnostics::Diagnostic {
                 range: 0..3,
                 kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
                 message: "stale".into(),
                 suggestions: vec![],
             }],
@@ -625,9 +628,11 @@ mod tests {
             &mut e,
             buffer_id,
             new_version,
+            wordcartel_core::diagnostics::DiagSource::Harper,
             vec![wordcartel_core::diagnostics::Diagnostic {
                 range: 0..3,
                 kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
                 message: "fresh".into(),
                 suggestions: vec![],
             }],
@@ -649,6 +654,7 @@ mod tests {
             wordcartel_core::diagnostics::Diagnostic {
                 range: 0..3,
                 kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
                 message: "old".into(),
                 suggestions: vec![],
             }
@@ -667,9 +673,11 @@ mod tests {
             &mut e,
             buffer_id,
             pre_recovery_version,
+            wordcartel_core::diagnostics::DiagSource::Harper,
             vec![wordcartel_core::diagnostics::Diagnostic {
                 range: 0..3,
                 kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
                 message: "stale".into(),
                 suggestions: vec![],
             }],

@@ -60,10 +60,14 @@ pub enum Msg {
     DiagnosticsDone {
         buffer_id: crate::editor::BufferId,
         version: u64,
+        source: wordcartel_core::diagnostics::DiagSource,
         diagnostics: Vec<wordcartel_core::diagnostics::Diagnostic>,
     },
     /// A `DiagnosticsProvider` lifecycle event (Effort A) — restart re-arm / degradation hint.
-    DiagProviderEvent(crate::diag_provider::ProviderEvent),
+    DiagProviderEvent {
+        source: wordcartel_core::diagnostics::DiagSource,
+        event: crate::diag_provider::ProviderEvent,
+    },
     ClipboardPaste { id: u64, buffer_id: crate::editor::BufferId, text: Option<String> },
     ClipboardAvailability(bool),
     Tick,
@@ -105,13 +109,18 @@ impl std::fmt::Debug for Msg {
                 .field("range", range)
                 .field("kind", kind)
                 .finish(),
-            Msg::DiagnosticsDone { buffer_id, version, diagnostics } => f
+            Msg::DiagnosticsDone { buffer_id, version, source, diagnostics } => f
                 .debug_struct("DiagnosticsDone")
                 .field("buffer_id", buffer_id)
                 .field("version", version)
+                .field("source", source)
                 .field("count", &diagnostics.len())
                 .finish(),
-            Msg::DiagProviderEvent(ev) => f.debug_tuple("DiagProviderEvent").field(ev).finish(),
+            Msg::DiagProviderEvent { source, event } => f
+                .debug_struct("DiagProviderEvent")
+                .field("source", source)
+                .field("event", event)
+                .finish(),
             Msg::ClipboardPaste { id, buffer_id, text } => f.debug_struct("ClipboardPaste")
                 .field("id", id).field("buffer_id", buffer_id)
                 .field("has_text", &text.is_some()).finish(),
@@ -322,10 +331,11 @@ fn reduce_dispatch(
         Msg::TransformDone { buffer_id, version, range, kind, result } => {
             crate::jobs_apply::apply_transform_done(editor, buffer_id, version, range, kind, result, clock);
         }
-        Msg::DiagnosticsDone { buffer_id, version, diagnostics } => {
-            crate::diagnostics_run::apply_diagnostics_done(editor, buffer_id, version, diagnostics);
+        Msg::DiagnosticsDone { buffer_id, version, source, diagnostics } => {
+            crate::diagnostics_run::apply_diagnostics_done(editor, buffer_id, version, source, diagnostics);
         }
-        Msg::DiagProviderEvent(ev) => crate::diag_provider::apply_provider_event(editor, ev, clock),
+        Msg::DiagProviderEvent { source, event } =>
+            crate::diag_provider::apply_provider_event(editor, source, event, clock),
         Msg::Tick => crate::timers::on_tick(editor, ex, clock, msg_tx),
         Msg::ClipboardPaste { buffer_id, text, .. } => crate::jobs_apply::apply_clipboard_paste(editor, buffer_id, text, clock),
         Msg::ClipboardAvailability(ok) => crate::jobs_apply::apply_clipboard_availability(editor, ok),
@@ -1449,7 +1459,9 @@ mod tests {
         e.active_mut().view.mode = RenderMode::Review;
         let v = e.active().document.version;
         e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
-            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(),
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
+            message: "x".into(),
             suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] }];
         e.active_mut().diagnostics.computed_version = v;
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);
@@ -1586,6 +1598,7 @@ mod tests {
         e.diag = Some(crate::diag_overlay::DiagOverlay::new(
             wordcartel_core::diagnostics::Diagnostic {
                 range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
                 message: "x".into(),
                 suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] },
             id, v));
@@ -1679,6 +1692,7 @@ mod tests {
         e.diag = Some(crate::diag_overlay::DiagOverlay::new(
             wordcartel_core::diagnostics::Diagnostic {
                 range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
                 message: "misspelled".into(),
                 suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] },
             id, v));
@@ -3280,14 +3294,16 @@ mod tests {
         let v = e.active().document.version;
         let diag = vec![wordcartel_core::diagnostics::Diagnostic {
             range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
             message: "misspelled".into(),
             suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] }];
+        let src = wordcartel_core::diagnostics::DiagSource::Harper;
         // current version → stored
-        crate::diagnostics_run::apply_diagnostics_done(&mut e, bid, v, diag.clone());
+        crate::diagnostics_run::apply_diagnostics_done(&mut e, bid, v, src, diag.clone());
         assert_eq!(e.active().diagnostics.diagnostics.len(), 1);
         assert_eq!(e.active().diagnostics.computed_version, v);
         // stale version → discarded
-        crate::diagnostics_run::apply_diagnostics_done(&mut e, bid, v.wrapping_sub(1), diag);
+        crate::diagnostics_run::apply_diagnostics_done(&mut e, bid, v.wrapping_sub(1), src, diag);
         assert_eq!(e.active().diagnostics.diagnostics.len(), 1, "stale result must not overwrite");
     }
 
@@ -3301,7 +3317,8 @@ mod tests {
         assert!(e.prompt.is_none(), "precondition: no modal");
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
-        crate::app::reduce(Msg::DiagProviderEvent(ProviderEvent::Degraded(INSTALL_HINT.into())),
+        crate::app::reduce(Msg::DiagProviderEvent { source: wordcartel_core::diagnostics::DiagSource::Harper,
+            event: ProviderEvent::Degraded(INSTALL_HINT.into()) },
             &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.status, INSTALL_HINT, "Degraded reached the status line via reduce_dispatch");
     }
@@ -3342,7 +3359,9 @@ mod tests {
         e.active_mut().view.mode = crate::editor::RenderMode::Review; // §2.5: quick_fix is Review-only
         let v = e.active().document.version;
         e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
-            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(),
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
+            message: "x".into(),
             suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] }];
         e.active_mut().diagnostics.computed_version = v;
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1); // cursor inside "teh"
@@ -3362,7 +3381,8 @@ mod tests {
     fn open_diag_clears_siblings_and_open_others_clear_diag() {
         use crate::editor::Editor;
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
-        let d = wordcartel_core::diagnostics::Diagnostic { range: 0..1, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(), suggestions: vec![] };
+        let d = wordcartel_core::diagnostics::Diagnostic { range: 0..1, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None, message: "x".into(), suggestions: vec![] };
         // open_diag clears a previously-open palette/search (reverse XOR direction)
         e.open_palette();
         assert!(e.palette.is_some(), "palette open before open_diag");
@@ -3388,7 +3408,9 @@ mod tests {
         let v = e.active().document.version;
         // Store a diagnostic at version V.
         e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
-            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(),
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
+            message: "x".into(),
             suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] }];
         e.active_mut().diagnostics.computed_version = v;
         // Simulate an intervening edit: bump the document version so valid_for is now false.
@@ -3416,8 +3438,10 @@ mod tests {
         e.active_mut().view.mode = crate::editor::RenderMode::Review; // §2.5: diag_next/prev are Review-only
         let v = e.active().document.version;
         e.active_mut().diagnostics.diagnostics = vec![
-            wordcartel_core::diagnostics::Diagnostic { range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message:"x".into(), suggestions: vec![] },
-            wordcartel_core::diagnostics::Diagnostic { range: 8..11, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message:"x".into(), suggestions: vec![] },
+            wordcartel_core::diagnostics::Diagnostic { range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None, message:"x".into(), suggestions: vec![] },
+            wordcartel_core::diagnostics::Diagnostic { range: 8..11, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None, message:"x".into(), suggestions: vec![] },
         ];
         e.active_mut().diagnostics.computed_version = v;
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(0);
@@ -3488,7 +3512,9 @@ mod tests {
         let v = e.active().document.version;
         // Arm valid diagnostics at version V and open the overlay.
         e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
-            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(),
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
+            message: "x".into(),
             suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] }];
         e.active_mut().diagnostics.computed_version = v;
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);

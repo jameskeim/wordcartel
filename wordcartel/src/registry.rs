@@ -1547,6 +1547,7 @@ mod tests {
             wordcartel_core::diagnostics::Diagnostic {
                 range: bad_byte..(bad_byte + "bad_word".len()),
                 kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
                 message: "x".into(),
                 suggestions: vec![],
             }
@@ -1587,6 +1588,7 @@ mod tests {
             wordcartel_core::diagnostics::Diagnostic {
                 range: bad_byte..(bad_byte + "bad_word".len()),
                 kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
                 message: "x".into(),
                 suggestions: vec![],
             }
@@ -1654,7 +1656,9 @@ mod tests {
         let seed = |ed: &mut Editor| {
             let v = ed.active().document.version;
             ed.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
-                range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(),
+                range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
+                message: "x".into(),
                 suggestions: vec![] }];
             ed.active_mut().diagnostics.computed_version = v;
             ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);

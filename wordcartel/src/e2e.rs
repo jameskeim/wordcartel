@@ -1980,13 +1980,14 @@ mod e2e_bench {
 
     // -- diagnostics-landing probe (secondary) -------------------------------
     fn make_diags(text: &str) -> Vec<wordcartel_core::diagnostics::Diagnostic> {
-        use wordcartel_core::diagnostics::{Diagnostic, DiagnosticKind};
+        use wordcartel_core::diagnostics::{Diagnostic, DiagnosticKind, DiagSource};
         let mut v = Vec::new();
         let mut off = char_boundary(text, midpoint(text).saturating_sub(1000));
         for _ in 0..200 {
             let end = char_boundary(text, (off + 3).min(text.len()));
             if off >= end { break; }
-            v.push(Diagnostic { range: off..end, kind: DiagnosticKind::Spelling, message: "x".into(), suggestions: vec![] });
+            v.push(Diagnostic { range: off..end, kind: DiagnosticKind::Spelling,
+                source: DiagSource::Harper, code: None, href: None, message: "x".into(), suggestions: vec![] });
             off = char_boundary(text, end + 7);
             if off >= text.len() { break; }
         }
@@ -2015,7 +2016,8 @@ mod e2e_bench {
                 let bid = h.editor.borrow().active().id;
                 let ver = h.version();
                 let diags = make_diags(&text);
-                let land = h.step_timed(Msg::DiagnosticsDone { buffer_id: bid, version: ver, diagnostics: diags });
+                let land = h.step_timed(Msg::DiagnosticsDone { buffer_id: bid, version: ver,
+                    source: wordcartel_core::diagnostics::DiagSource::Harper, diagnostics: diags });
                 s.push(n, hd, "flat-prose", "diagnostics-landing", "render", land.t_render.as_micros());
                 let nxt = h.step_timed(Msg::Tick);
                 s.push(n, hd, "flat-prose", "diagnostics-landing-next", "render", nxt.t_render.as_micros());

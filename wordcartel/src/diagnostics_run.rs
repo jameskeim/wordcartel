@@ -1,6 +1,6 @@
 //! Diagnostics runtime (shell): per-buffer store, pure debounce helpers,
 //! worker dispatch (Task 4), version-gated apply (Task 4), dictionary IO.
-use wordcartel_core::diagnostics::{Diagnostic, DiagnosticKind};
+use wordcartel_core::diagnostics::{Diagnostic, DiagnosticKind, DiagSource};
 use crate::editor::{BufferId, Editor};
 
 #[derive(Debug, Default, Clone)]
@@ -151,8 +151,12 @@ pub fn apply_diagnostics_done(
     editor: &mut Editor,
     buffer_id: BufferId,
     version: u64,
+    source: DiagSource,
     diagnostics: Vec<Diagnostic>,
 ) {
+    // `source` is threaded through the signature this task (Task 3/4 route the flat store below
+    // by source); the single-store body does not yet read it.
+    let _ = source;
     // Build the ignore union BEFORE borrowing the buffer mutably (dictionary/session_ignores live
     // on `editor`, not the buffer). Empty in the common case → the filter below is skipped.
     let union = ignore_union_lower(editor);
@@ -213,6 +217,7 @@ mod tests {
         s.computed_version = 5;
         s.diagnostics.push(wordcartel_core::diagnostics::Diagnostic {
             range: 0..1, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: DiagSource::Harper, code: None, href: None,
             message: "x".into(), suggestions: vec![] });
         assert!(s.valid_for(5));
         assert!(!s.valid_for(6)); // edited since → hidden
@@ -366,10 +371,12 @@ mod tests {
     }
 
     fn spelling(range: std::ops::Range<usize>) -> Diagnostic {
-        Diagnostic { range, kind: DiagnosticKind::Spelling, message: "x".into(), suggestions: vec![] }
+        Diagnostic { range, kind: DiagnosticKind::Spelling, source: DiagSource::Harper, code: None,
+            href: None, message: "x".into(), suggestions: vec![] }
     }
     fn grammar(range: std::ops::Range<usize>) -> Diagnostic {
-        Diagnostic { range, kind: DiagnosticKind::Grammar, message: "x".into(), suggestions: vec![] }
+        Diagnostic { range, kind: DiagnosticKind::Grammar, source: DiagSource::Harper, code: None,
+            href: None, message: "x".into(), suggestions: vec![] }
     }
 
     #[test]
@@ -379,7 +386,7 @@ mod tests {
         let v = e.active().document.version;
         e.dictionary.insert("TEH".into()); // case-insensitive union membership
         // "teh" (0..3) is a spelling hit → dropped; the grammar diagnostic on "cat" (4..7) stays.
-        apply_diagnostics_done(&mut e, id, v, vec![spelling(0..3), grammar(4..7)]);
+        apply_diagnostics_done(&mut e, id, v, DiagSource::Harper, vec![spelling(0..3), grammar(4..7)]);
         let kept = &e.active().diagnostics.diagnostics;
         assert_eq!(kept.len(), 1, "spelling 'teh' filtered by dictionary; grammar retained");
         assert_eq!(kept[0].kind, DiagnosticKind::Grammar);
