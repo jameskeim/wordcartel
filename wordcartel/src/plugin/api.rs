@@ -479,6 +479,13 @@ fn install_command(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::
 /// ([`crate::limits::PLUGIN_MAX_TIMERS_PER_PLUGIN`]) — each BEFORE the callback is persisted or the
 /// `PluginTimer` pushed. `handle` is a monotonic per-editor counter (never reused); the callback
 /// lives in the VM named registry under `wc-timer-<handle>` (dies with the VM at reload).
+///
+/// Both the cap and `wc.timer_cancel` attribute a timer to its **plugin STEM** — the part of
+/// `InvokeState::current` before the first `.` — never the full command id. A plugin command id is
+/// always `"<stem>.<name>"`, so two commands of the SAME plugin share one stem; using the full id
+/// as `origin` (the pre-fix shape) let a K-command plugin arm `8×K` timers (one private 8-budget
+/// per command id) and let ANY command of ANY plugin cancel ANY other plugin's timer by handle (no
+/// scoping at all). Deriving `origin` from the stem closes both at the same root cause.
 fn install_timer(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::Result<()> {
     let editor = bridge.editor.clone();
     let clock = bridge.clock.clone();
@@ -493,7 +500,8 @@ fn install_timer(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::Re
             if interval_ms < crate::limits::PLUGIN_TIMER_MIN_INTERVAL_MS {
                 return Err(mlua::Error::runtime("plugin: timer interval below the 1000 ms floor"));
             }
-            let origin = invoke.borrow().current.clone().unwrap_or_default();
+            let current = invoke.borrow().current.clone().unwrap_or_default();
+            let origin = plugin_stem(&current);
             let mut e = editor.try_borrow_mut()
                 .map_err(|_| mlua::Error::runtime("plugin: editor busy"))?;
             if e.pending_plugin_timers.iter().filter(|t| t.origin == origin).count()
@@ -511,7 +519,10 @@ fn install_timer(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::Re
             });
             Ok(handle as i64)   // Lua integer (i64); the monotonic counter never reaches 2^63
         })?)?;
-    // wc.timer_cancel(handle) — remove + free the registry key; unknown handle → silent no-op.
+    // wc.timer_cancel(handle) — remove + free the registry key IFF the caller's plugin stem owns
+    // it; unknown handle OR a handle owned by a DIFFERENT plugin → silent no-op (a plugin has no
+    // way to observe another plugin's handles, so the two are indistinguishable on the Lua side —
+    // same "unknown handle" degrade the spec already documents).
     let editor = bridge.editor.clone();
     let invoke = bridge.invoke_state.clone();
     wc.set("timer_cancel", lua.create_function(move |lua, handle: i64| {
@@ -519,16 +530,27 @@ fn install_timer(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::Re
             return Err(mlua::Error::runtime(
                 "plugin: wc.timer_cancel is not allowed from an event hook or a timer callback"));
         }
+        let current = invoke.borrow().current.clone().unwrap_or_default();
+        let origin = plugin_stem(&current);
         let handle = handle as u64;
         let mut e = editor.try_borrow_mut()
             .map_err(|_| mlua::Error::runtime("plugin: editor busy"))?;
-        if let Some(pos) = e.pending_plugin_timers.iter().position(|t| t.handle == handle) {
+        if let Some(pos) = e.pending_plugin_timers.iter()
+            .position(|t| t.handle == handle && t.origin == origin) {
             let key = e.pending_plugin_timers.remove(pos).key;
             lua.set_named_registry_value(&key, mlua::Value::Nil)?;   // free the callback
         }
         Ok(())
     })?)?;
     Ok(())
+}
+
+/// The plugin STEM of an `InvokeState::current` label — the part before the first `.` (a plugin
+/// command id is always `"<stem>.<name>"`, per [`install_registration`]'s `name_full`
+/// construction). Shared by the timer arm cap and `wc.timer_cancel`'s ownership check (both docs
+/// above) so a plugin's timer budget/ownership is keyed by PLUGIN, never by command id.
+fn plugin_stem(current: &str) -> String {
+    current.split('.').next().unwrap_or(current).to_string()
 }
 
 #[cfg(test)]

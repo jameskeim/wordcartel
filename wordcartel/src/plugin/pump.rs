@@ -337,7 +337,7 @@ mod tests {
     use std::collections::BTreeMap;
     use crate::editor::Editor;
     use crate::plugin::load::load_sources;
-    use crate::plugin::{PluginEvent, PluginEventKind, PluginTimer};
+    use crate::plugin::{PluginCall, PluginEvent, PluginEventKind, PluginTimer};
     use crate::registry::Registry;
     use crate::test_support::TestClock;
 
@@ -454,6 +454,100 @@ mod tests {
         assert!(!ok, "the 9th timer for one plugin must be rejected");
         assert!(err.contains("limit"), "err must name the limit: {err}");
         assert_eq!(editor.borrow().pending_plugin_timers.len(), 8, "still exactly 8 armed");
+    }
+
+    #[test]
+    fn timer_cap_is_per_plugin_not_per_command() {
+        // ONE plugin, TWO commands, each arming timers from a DIFFERENT command-id context — the
+        // per-plugin cap (spec: "8 PER PLUGIN") must count ACROSS both, not isolate each command
+        // id into its own private budget. The bug: `origin` was the FULL command id (e.g.
+        // "p.cmd_a" != "p.cmd_b"), so a plugin with K commands could arm 8×K timers.
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().expect("VM construction");
+        let src = "\
+            wc.register_command{ name='cmd_a', label='A', fn=function() \
+                for i=1,4 do wc.timer(1000, function() end) end \
+            end }\n\
+            wc.register_command{ name='cmd_b', label='B', fn=function() \
+                for i=1,4 do wc.timer(1000, function() end) end \
+                local ok, err = pcall(wc.timer, 1000, function() end); \
+                ninth = tostring(ok) .. ':' .. tostring(err) \
+            end }";
+        let reports = load_sources(&mut reg, &mut host,
+            &[("p".to_string(), src.to_string())], &BTreeMap::new(), &mut Vec::new());
+        assert_eq!(reports[0].result, Ok(2), "both commands must register cleanly: {:?}", reports[0].result);
+        let a_id = reg.resolve_name("p.cmd_a").expect("registered under p.cmd_a");
+        let b_id = reg.resolve_name("p.cmd_b").expect("registered under p.cmd_b");
+
+        let editor = Rc::new(RefCell::new(Editor::new_from_text("x", None, (40, 10))));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        std::mem::forget(_rx);
+        host.attach_bridge(editor.clone(), tx, Rc::new(TestClock::new(0))).expect("bridge attaches");
+
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: a_id, arg: None });
+        host.pump_test(&editor);
+        assert_eq!(editor.borrow().pending_plugin_timers.len(), 4, "cmd_a armed 4 timers");
+
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: b_id, arg: None });
+        host.pump_test(&editor);
+        assert_eq!(editor.borrow().pending_plugin_timers.len(), 8,
+            "cmd_b's 4 more must land in the SAME plugin's budget — 8 total, not 4+4 in isolated pools");
+        let lua = host.lua().unwrap();
+        let ninth: String = lua.globals().get("ninth").unwrap();
+        assert!(ninth.starts_with("false:"),
+            "the 9th timer — armed from cmd_b, a DIFFERENT command of the SAME plugin — must be rejected: {ninth}");
+        assert!(ninth.contains("limit"), "err must name the limit: {ninth}");
+        assert_eq!(editor.borrow().pending_plugin_timers.len(), 8,
+            "still exactly 8 — the cap held across both commands");
+    }
+
+    #[test]
+    fn timer_cancel_is_scoped_to_the_arming_plugin() {
+        // Plugin "a" arms a timer; plugin "b" — a DIFFERENT plugin — tries to cancel it by
+        // handle. `wc.timer_cancel` is a silent no-op on an unmatched handle (spec), so the
+        // observable is: the timer must STILL be armed after b's attempt, and only a's own
+        // cancel (same plugin) actually removes it.
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().expect("VM construction");
+        let src_a = "\
+            wc.register_command{ name='arm', label='Arm', fn=function() wc.timer(1000, function() end) end }\n\
+            wc.register_command{ name='cancel', label='Cancel', arg='H:', \
+                fn=function(arg) wc.timer_cancel(tonumber(arg)) end }";
+        let src_b = "wc.register_command{ name='cancel', label='Cancel', arg='H:', \
+            fn=function(arg) wc.timer_cancel(tonumber(arg)) end }";
+        let reports = load_sources(&mut reg, &mut host,
+            &[("a".to_string(), src_a.to_string()), ("b".to_string(), src_b.to_string())],
+            &BTreeMap::new(), &mut Vec::new());
+        assert_eq!(reports[0].result, Ok(2), "plugin a: {:?}", reports[0].result);
+        assert_eq!(reports[1].result, Ok(1), "plugin b: {:?}", reports[1].result);
+        let arm_id = reg.resolve_name("a.arm").expect("registered under a.arm");
+        let a_cancel_id = reg.resolve_name("a.cancel").expect("registered under a.cancel");
+        let b_cancel_id = reg.resolve_name("b.cancel").expect("registered under b.cancel");
+
+        let editor = Rc::new(RefCell::new(Editor::new_from_text("x", None, (40, 10))));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        std::mem::forget(_rx);
+        host.attach_bridge(editor.clone(), tx, Rc::new(TestClock::new(0))).expect("bridge attaches");
+
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: arm_id, arg: None });
+        host.pump_test(&editor);
+        assert_eq!(editor.borrow().pending_plugin_timers.len(), 1, "a.arm armed one timer");
+        let handle = editor.borrow().pending_plugin_timers[0].handle;
+
+        // Plugin b tries to cancel a's handle — must be a no-op (b does not own it).
+        editor.borrow_mut().pending_plugin_calls.push_back(
+            PluginCall { id: b_cancel_id, arg: Some(handle.to_string()) });
+        host.pump_test(&editor);
+        assert_eq!(editor.borrow().pending_plugin_timers.len(), 1,
+            "b.cancel must NOT remove a's timer — cross-plugin cancel is a no-op");
+        assert_eq!(editor.borrow().pending_plugin_timers[0].handle, handle, "a's timer is untouched");
+
+        // Plugin a cancels its OWN handle — must succeed (the pomodoro-demo shape: same plugin).
+        editor.borrow_mut().pending_plugin_calls.push_back(
+            PluginCall { id: a_cancel_id, arg: Some(handle.to_string()) });
+        host.pump_test(&editor);
+        assert!(editor.borrow().pending_plugin_timers.is_empty(),
+            "a.cancel must remove a's OWN timer");
     }
 
     #[test]

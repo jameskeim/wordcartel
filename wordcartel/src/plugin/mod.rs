@@ -81,7 +81,8 @@ pub struct PluginDispatch {
 #[derive(Clone, Debug)]
 pub struct PluginTimer {
     pub handle: u64,          // opaque handle returned to Lua (monotonic, never reused)
-    pub origin: String,       // owning plugin (per-plugin cap + plugin_list); from InvokeState.current
+    pub origin: String,       // owning plugin STEM (per-plugin cap + wc.timer_cancel scoping); the
+                               // part of InvokeState.current before the first '.', NOT the full command id
     pub key: String,          // "wc-timer-<handle>" — the VM-registry callback key
     pub next_due_ms: u64,     // wall-clock ms of the next fire
     pub interval_ms: u64,     // >= PLUGIN_TIMER_MIN_INTERVAL_MS (floor-checked at arm)
