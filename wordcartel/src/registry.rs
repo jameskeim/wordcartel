@@ -521,6 +521,24 @@ impl Registry {
             CommandResult::Handled
         });
 
+        // Analysis lens — set-per-state primitive (palette-only) + stateful cycle representative
+        // (contract rule 8 — the keymap_next / cycle_render_mode precedent). One primitive per
+        // AVAILABLE core engine; the ltex/vale effort adds its siblings here.
+        r.register("analysis_engine_harper", "Analysis Engine: Harper", None, |c| {
+            c.editor.set_analysis_source(wordcartel_core::diagnostics::DiagSource::Harper);
+            CommandResult::Handled
+        });
+        r.register_stateful("analysis_next", "Analysis Engine", Some(MenuCategory::View),
+            |e| MenuMark::Value(e.active_analysis_source.label()),
+            |c| { crate::diagnostics_run::cycle_analysis_source(c.editor); CommandResult::Handled });
+        // Per-engine enablement — a 2-state toggle (contract rule 8), palette-only.
+        r.register("toggle_engine_harper", "Toggle Harper Engine", None, |c| {
+            let on = !c.editor.diag_providers.is_enabled(wordcartel_core::diagnostics::DiagSource::Harper);
+            crate::diagnostics_run::set_engine_enabled(c.editor,
+                wordcartel_core::diagnostics::DiagSource::Harper, on, c.clock);
+            CommandResult::Handled
+        });
+
         // View menu — writing-experience toggles (Task 2 / Effort 5d).
         r.register("toggle_typewriter", "Toggle Typewriter", Some(MenuCategory::View), |c| { c.editor.view_opts.typewriter = !c.editor.view_opts.typewriter; CommandResult::Handled });
         r.register("toggle_focus",      "Toggle Focus Mode", Some(MenuCategory::View), |c| { c.editor.view_opts.focus = !c.editor.view_opts.focus; CommandResult::Handled });
@@ -1736,6 +1754,54 @@ mod tests {
         // keymap_cua/keymap_wordstar are palette-only now (menu: None).
         assert_eq!(reg.meta(CommandId("keymap_cua")).unwrap().menu, None);
         assert_eq!(reg.meta(CommandId("keymap_next")).unwrap().menu, Some(MenuCategory::Settings));
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 7: analysis-lens/enable commands — registration + dispatch.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn analysis_commands_registered_and_dispatch() {
+        let reg = Registry::builtins();
+        assert!(reg.meta(CommandId("analysis_engine_harper")).is_some());
+        assert!(reg.meta(CommandId("analysis_next")).is_some());
+        assert!(reg.meta(CommandId("toggle_engine_harper")).is_some());
+        assert_eq!(reg.meta(CommandId("analysis_engine_harper")).unwrap().menu, None,
+            "set-primitive is palette-only");
+        assert!(reg.meta(CommandId("analysis_next")).unwrap().menu.is_some(),
+            "cycle carried in the menu");
+        assert_eq!(reg.meta(CommandId("toggle_engine_harper")).unwrap().menu, None,
+            "enablement toggle is palette-only");
+    }
+
+    #[test]
+    fn analysis_next_dispatches_cycle_and_reports_state() {
+        let mut ed = Editor::new_from_text("x\n", None, (40, 8));
+        ed.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new()
+                .with_source(wordcartel_core::diagnostics::DiagSource::Harper)), true);
+        ed.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new()
+                .with_source(wordcartel_core::diagnostics::DiagSource::Plugin("mock"))), true);
+        let reg = Registry::builtins();
+        let meta = reg.meta(CommandId("analysis_next")).unwrap();
+        assert_eq!((meta.state.unwrap())(&ed), MenuMark::Value("Harper"));
+        dispatch_id(&mut ed, "analysis_next");
+        assert_eq!(ed.active_analysis_source, wordcartel_core::diagnostics::DiagSource::Plugin("mock"));
+        assert_eq!((meta.state.unwrap())(&ed), MenuMark::Value("mock"));
+    }
+
+    #[test]
+    fn toggle_engine_harper_dispatches_set_engine_enabled() {
+        let mut ed = Editor::new_from_text("x\n", None, (40, 8));
+        ed.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new()
+                .with_source(wordcartel_core::diagnostics::DiagSource::Harper)), false);
+        assert!(!ed.diag_providers.is_enabled(wordcartel_core::diagnostics::DiagSource::Harper));
+        dispatch_id(&mut ed, "toggle_engine_harper");
+        assert!(ed.diag_providers.is_enabled(wordcartel_core::diagnostics::DiagSource::Harper));
+        dispatch_id(&mut ed, "toggle_engine_harper");
+        assert!(!ed.diag_providers.is_enabled(wordcartel_core::diagnostics::DiagSource::Harper));
     }
 
     // Helper: build a Ctx and dispatch a command id against the given Editor.

@@ -272,6 +272,55 @@ pub fn apply_diagnostics_done(
     }
 }
 
+/// Advance the switchable analysis lens (spec §8.1) to the next ENABLED engine in registration
+/// (cycle) order, wrapping past the end. With fewer than two enabled engines there is nowhere to
+/// cycle to — an honest status no-op rather than a silent do-nothing (no silent UI, house rule).
+pub fn cycle_analysis_source(editor: &mut Editor) {
+    let enabled: Vec<DiagSource> = editor.diag_providers.enabled_sources().collect();
+    if enabled.len() < 2 {
+        editor.status = "no other analysis engine".into();
+        return;
+    }
+    let cur = editor.active_analysis_source;
+    let idx = enabled.iter().position(|s| *s == cur).unwrap_or(0);
+    editor.set_analysis_source(enabled[(idx + 1) % enabled.len()]);
+}
+
+/// The single per-engine enablement setter (spec §8.4, command-surface contract law 6): flips
+/// `source`'s entry in `ProviderSet`. On enable, arms the source on the active buffer when Review
+/// diagnostics are live (so the newly-enabled engine gets checked without waiting for the next
+/// edit). On disable, clears `source`'s slot in EVERY buffer (a disabled engine must not leave
+/// stale results behind anywhere) and, if the lens was pointed at the disabled engine, relocates
+/// it to the next enabled source — or, with none left, an honest "no analysis engine enabled"
+/// status rather than a lens silently pointing at a dead engine. Does NOT `shutdown()` the
+/// provider — it stays warm for a quick re-enable; teardown remains the loop-exit `shutdown_all`.
+pub fn set_engine_enabled(editor: &mut Editor, source: DiagSource, on: bool,
+    clock: &dyn wordcartel_core::history::Clock) {
+    if !editor.diag_providers.set_enabled(source, on) {
+        editor.status = format!("unknown analysis engine: {}", source.label());
+        return;
+    }
+    if on {
+        if should_run_diagnostics(editor) {
+            let now = clock.now_ms();
+            editor.active_mut().diagnostics.slot_mut(source).arm(now, 0);
+        }
+        editor.status = format!("{} enabled", source.label());
+    } else {
+        for b in editor.buffers.iter_mut() { b.diagnostics.clear_source(source); }
+        if editor.active_analysis_source == source {
+            let next = editor.diag_providers.enabled_sources().next();
+            match next {
+                Some(next) => editor.set_analysis_source(next),
+                None => editor.status = format!("{} disabled — no analysis engine enabled",
+                    source.label()),
+            }
+        } else {
+            editor.status = format!("{} disabled", source.label());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,6 +728,83 @@ mod tests {
         e.active_mut().view.mode = RenderMode::Review;
         e.active_mut().document.version += 1; // edited since compute → stale
         assert!(active_lens_diags(&e).is_none(), "stale slot: None");
+    }
+
+    // ------------------------------------------------------------------
+    // Task 7: lens/enable commands — cycle_analysis_source, set_engine_enabled.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn cycle_wraps_enabled_sources_only() {
+        let mut e = Editor::new_from_text("x\n", None, (40, 10));
+        e.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Harper)), true);
+        e.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Plugin("mock"))), true);
+        assert_eq!(e.active_analysis_source, DiagSource::Harper);
+        cycle_analysis_source(&mut e);
+        assert_eq!(e.active_analysis_source, DiagSource::Plugin("mock"));
+        cycle_analysis_source(&mut e);
+        assert_eq!(e.active_analysis_source, DiagSource::Harper);
+    }
+
+    #[test]
+    fn cycle_with_fewer_than_two_enabled_is_a_status_no_op() {
+        let mut e = Editor::new_from_text("x\n", None, (40, 10));
+        e.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Harper)), true);
+        cycle_analysis_source(&mut e);
+        assert_eq!(e.active_analysis_source, DiagSource::Harper, "nowhere to cycle to");
+        assert_eq!(e.status, "no other analysis engine");
+    }
+
+    #[test]
+    fn disable_clears_slots_and_relocates_lens() {
+        use crate::test_support::TestClock;
+        let mut e = review_editor("teh\n");
+        e.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Harper)), true);
+        e.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Plugin("mock"))), true);
+        e.set_analysis_source(DiagSource::Plugin("mock"));
+        e.active_mut().diagnostics.slot_mut(DiagSource::Plugin("mock")).diagnostics = vec![spelling(0..3)];
+        set_engine_enabled(&mut e, DiagSource::Plugin("mock"), false, &TestClock::new(0));
+        assert!(e.active().diagnostics.slot(DiagSource::Plugin("mock")).is_none(), "slot cleared");
+        assert_eq!(e.active_analysis_source, DiagSource::Harper, "lens relocated off disabled engine");
+        assert!(!e.diag_providers.is_enabled(DiagSource::Plugin("mock")));
+    }
+
+    #[test]
+    fn disable_last_enabled_engine_leaves_an_honest_status_and_no_lens_source() {
+        use crate::test_support::TestClock;
+        let mut e = review_editor("teh\n");
+        e.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Harper)), true);
+        set_engine_enabled(&mut e, DiagSource::Harper, false, &TestClock::new(0));
+        assert_eq!(e.status, "Harper disabled — no analysis engine enabled");
+        assert!(!e.diag_providers.is_enabled(DiagSource::Harper));
+    }
+
+    #[test]
+    fn enable_arms_the_active_buffer_when_review_is_live() {
+        use crate::test_support::TestClock;
+        let mut e = review_editor("teh\n");
+        e.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Harper)), false);
+        assert!(!e.diag_providers.is_enabled(DiagSource::Harper));
+        set_engine_enabled(&mut e, DiagSource::Harper, true, &TestClock::new(500));
+        assert!(e.diag_providers.is_enabled(DiagSource::Harper));
+        assert_eq!(e.active().diagnostics.slot(DiagSource::Harper).unwrap().recheck_due_at, Some(500),
+            "enable arms the active buffer's slot when Review checking is live");
+        assert_eq!(e.status, "Harper enabled");
+    }
+
+    #[test]
+    fn set_enabled_on_unknown_source_is_a_status_no_op() {
+        use crate::test_support::TestClock;
+        let mut e = Editor::new_from_text("x\n", None, (40, 10));
+        set_engine_enabled(&mut e, DiagSource::Plugin("ghost"), true, &TestClock::new(0));
+        assert_eq!(e.status, "unknown analysis engine: ghost");
     }
 
     #[test]
