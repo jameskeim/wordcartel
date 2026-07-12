@@ -11,18 +11,27 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::editor::Editor;
-use crate::registry::{CommandId, MenuCategory};
+use crate::registry::MenuCategory;
+#[cfg(test)]
+use crate::registry::CommandId;
 use wordcartel_core::history::Clock;
 
-/// One command a plugin's `wc.register_command` call queued during its exec pass. Collected
-/// into a shared sink — the registration closure can't hold `&mut Registry` across the Lua
-/// boundary, so it appends here instead — and drained into the `Registry` by the loader
-/// (`plugin::load::load_one`) only after the WHOLE plugin's preflight passes (atomic
-/// per-plugin commit: a failing plugin registers zero commands).
+/// One command a plugin's `wc.register_command` staged during exec — raw strings + the
+/// callback, interned/registry-written ONLY at commit (P2 §7b two-phase). Carrying an
+/// `mlua::Function` is sound: it is a GC-rooted handle into the loader's own VM, dropped if the
+/// plugin fails preflight.
 pub struct PendingReg {
-    pub id: CommandId,
-    pub label: &'static str,
+    pub name_full: String,   // "<stem>.<name>" — raw, cap-checked, NOT yet interned
+    pub label: String,       // raw, cap-checked
     pub menu: Option<MenuCategory>,
+    pub func: mlua::Function, // stored under wc-cmd-<id> only on commit
+}
+
+#[cfg(test)]
+thread_local! {
+    /// When set, the NEXT fallible commit write in `load_one` returns a synthetic mlua error —
+    /// exercises the commit-time-exhaustion fatal path without exhausting real memory.
+    pub(crate) static FAIL_NEXT_COMMIT_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The plugin VM's live connection to app state, installed once by [`PluginHost::attach_bridge`]
@@ -227,7 +236,7 @@ mod tests {
         let mut reg = Registry::builtins();
         let mut host = PluginHost::new().expect("VM construction");
         let src = format!("wc.register_command{{ name='cmd', label='C', fn=function() {src_fn_body} end }}");
-        let reports = load_sources(&mut reg, &host, &sources(&[("t", &src)]));
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("t", &src)]));
         assert_eq!(reports[0].result, Ok(1), "test plugin must register cleanly: {:?}", reports[0].result);
         let id = reg.resolve_name("t.cmd").expect("registered under t.cmd");
 
@@ -400,7 +409,7 @@ mod tests {
         // VM or the pump loop.
         let mut reg = Registry::builtins();
         let src = "wc.register_command{ name='good', label='Good', fn=function() wc.insert('G') end }";
-        let reports = load_sources(&mut reg, &host, &sources(&[("u", src)]));
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("u", src)]));
         assert_eq!(reports[0].result, Ok(1));
         let good_id = reg.resolve_name("u.good").expect("registered");
         editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: good_id });
@@ -489,7 +498,7 @@ mod tests {
         let mut reg = Registry::builtins();
         let mut host = PluginHost::new().expect("VM construction");
         let src = "wc.register_command{ name='cmd', label='C', fn=function() wc.status(tostring(wc.path())) end }";
-        let reports = load_sources(&mut reg, &host, &sources(&[("t", src)]));
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("t", src)]));
         assert_eq!(reports[0].result, Ok(1));
         let id = reg.resolve_name("t.cmd").expect("registered under t.cmd");
 
@@ -517,7 +526,7 @@ mod tests {
         let src = "wc.register_command{ name='cmd', label='C', fn=function() \
                        wc.register_command{ name='evil', label='Evil', fn=function() end } \
                    end }";
-        let reports = load_sources(&mut reg, &host, &sources(&[("t", src)]));
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("t", src)]));
         assert_eq!(reports[0].result, Ok(1), "the OUTER registration, at load time, still works");
         let id = reg.resolve_name("t.cmd").expect("registered under t.cmd");
         let before = reg.commands().count();
@@ -571,7 +580,7 @@ mod tests {
                 "wc.register_command{{ name='rep', label='R', fn=function() wc.replace({a}, {b}, [[{text}]]) end }}\n\
                  wc.register_command{{ name='rd', label='D', fn=function() wc.text({a}, {b}) end }}"
             );
-            let reports = load_sources(&mut reg, &host, &sources(&[("fuzz", &src)]));
+            let reports = load_sources(&mut reg, &mut host, &sources(&[("fuzz", &src)]));
             prop_assert_eq!(reports[0].result.clone(), Ok(2), "both commands must register cleanly");
 
             let editor = Rc::new(RefCell::new(Editor::new_from_text(&doc, None, (40, 10))));

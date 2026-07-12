@@ -270,10 +270,10 @@ mod tests {
     #[test]
     fn palette_is_exhaustive_over_a_plugin_loaded_registry() {
         let mut reg = crate::registry::Registry::builtins();
-        let host = crate::plugin::host::PluginHost::new().expect("VM construction");
+        let mut host = crate::plugin::host::PluginHost::new().expect("VM construction");
         let src = "wc.register_command{ name='insert', label='Plugin Insert', fn=function() end }";
         let reports =
-            crate::plugin::load::load_sources(&mut reg, &host, &[("p1demo".to_string(), src.to_string())]);
+            crate::plugin::load::load_sources(&mut reg, &mut host, &[("p1demo".to_string(), src.to_string())]);
         assert_eq!(reports[0].result, Ok(1), "test plugin must load cleanly: {:?}", reports[0].result);
         let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
         let mut p = Palette::default();

@@ -12,7 +12,7 @@ use wordcartel_core::history::Transaction;
 use wordcartel_core::selection::Selection;
 
 use crate::plugin::host::{Bridge, PendingReg};
-use crate::registry::{menu_from_str, CommandId};
+use crate::registry::menu_from_str;
 
 /// Fetch the shared `wc` global table, creating it on first use. Idempotent across the two
 /// installers that share it — `install_registration` (load time) and `install_editor_api`
@@ -28,26 +28,27 @@ fn wc_table(lua: &mlua::Lua) -> mlua::Result<mlua::Table> {
     }
 }
 
-/// Install the `wc` registration surface for ONE plugin's exec pass. `stem` (already interned)
-/// fixes the namespace; `sink` collects [`PendingReg`] (drained into the `Registry` after exec —
-/// the loader's atomic-per-plugin commit); `count` enforces the per-plugin command cap
-/// (`limits::PLUGIN_MAX_COMMANDS_PER_PLUGIN`).
+/// Install the `wc` registration surface for ONE plugin's exec pass. `stem` (owned — moved into
+/// the 'static closure; an owned String is 'static, so this compiles without the `send` feature,
+/// exactly as the former `&'static str` did) fixes the namespace. Every plugin string is
+/// cap-checked on its BORROWED `mlua::String` bytes (resource-bound LAW) and pushed RAW into
+/// `sink`; interning + the `wc-cmd-<id>` callback write happen ONLY at commit (load_one), so a
+/// plugin that fails preflight leaks nothing and overwrites no live callback key (§7b).
 ///
 /// Every plugin-supplied string crosses into Rust via the resource-bound LAW's
 /// borrowed-length-check-then-convert pattern (global constraint 1b): extracted as
 /// `mlua::String` (borrows the Lua-side bytes, no Rust allocation), its `.as_bytes().len()`
-/// checked against the cap FIRST, and only on pass converted/owned/interned. `name`/`label` are
-/// checked against their length caps; `menu` is parsed to `MenuCategory` on the borrowed bytes
-/// (an unrecognized value is a typed error, never a silent default). `intern` (a permanent leak)
-/// is reached only after every check on this call has passed.
+/// checked against the cap FIRST, and only on pass converted/owned. `name`/`label` are checked
+/// against their length caps; `menu` is parsed to `MenuCategory` on the borrowed bytes (an
+/// unrecognized value is a typed error, never a silent default).
 pub(crate) fn install_registration(
     lua: &mlua::Lua,
-    stem: &'static str,
+    stem: String,
     sink: Rc<RefCell<Vec<PendingReg>>>,
     count: Rc<Cell<usize>>,
 ) -> mlua::Result<()> {
     let wc = wc_table(lua)?;
-    let reg_fn = lua.create_function(move |lua, spec: mlua::Table| {
+    let reg_fn = lua.create_function(move |_lua, spec: mlua::Table| {
         if count.get() >= crate::limits::PLUGIN_MAX_COMMANDS_PER_PLUGIN {
             return Err(mlua::Error::runtime("plugin: too many commands (max 256)"));
         }
@@ -71,15 +72,11 @@ pub(crate) fn install_registration(
                     .ok_or_else(|| mlua::Error::runtime("plugin: unknown menu value"))?,
             ),
         };
-        // Every cap passed — own + intern (the ONLY Rust allocs, all AFTER the checks above).
-        let full = format!("{stem}.{}", name_raw.to_str()?.as_ref());
-        let id = CommandId(crate::plugin::intern(&full));
-        let label_s = crate::plugin::intern(label_raw.to_str()?.as_ref());
-        // Persistent callback storage (WezTerm-style): keyed per command id in the named
-        // registry so the pump (Task 5) can look it up by `CommandId` alone.
-        lua.set_named_registry_value(&format!("wc-cmd-{}", id.0), func)?;
+        // No intern, no set_named_registry_value here — commit does both (§7b). Own raw strings only.
+        let name_full = format!("{stem}.{}", name_raw.to_str()?.as_ref());
+        let label = label_raw.to_str()?.to_owned();
         count.set(count.get() + 1);
-        sink.borrow_mut().push(PendingReg { id, label: label_s, menu });
+        sink.borrow_mut().push(PendingReg { name_full, label, menu, func });
         Ok(())
     })?;
     wc.set("register_command", reg_fn)?;

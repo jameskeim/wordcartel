@@ -637,16 +637,23 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         crate::plugin::host::PluginHost::null()
     } else {
         match crate::plugin::host::PluginHost::new() {
-            Ok(h) => {
+            Ok(mut h) => {
                 if let Some(plugins_dir) = xdg.as_deref().map(|x| x.join("wordcartel").join("plugins")) {
                     let disc = crate::plugin::load::discover(&plugins_dir, &cfg.plugins.disable);
                     for r in disc.skipped {
                         warns.push(format!("plugin {} skipped: {}", r.plugin, r.result.err().unwrap_or_default()));
                     }
-                    for r in crate::plugin::load::load_sources(&mut reg, &h, &disc.sources) {
+                    for r in crate::plugin::load::load_sources(&mut reg, &mut h, &disc.sources) {
                         if let Err(e) = &r.result {
                             warns.push(format!("plugin {}: {e}", r.plugin));
                         }
+                    }
+                    // A commit-time VM exhaustion (§7b) already nulled `h` + reverted `reg` to
+                    // builtins-only inside load_sources — surface it here; no editor-side
+                    // cleanup needed at startup (empty queues, unbuilt keymap — that's the
+                    // reload seam's job, Task 8).
+                    if !h.has_vm() {
+                        warns.push("plugins disabled: VM exhausted during load".to_string());
                     }
                 }
                 h

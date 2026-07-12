@@ -25,6 +25,10 @@ pub struct PluginCall {
     pub id: CommandId,
 }
 
+/// The intern pool backing [`intern`] — module-level (not function-local) so the test-only
+/// [`intern_pool_len`] reader can share the SAME static rather than a lookalike copy.
+static INTERN_POOL: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
+
 /// Intern a runtime string to `&'static str` (leak-once). PERMANENT — callers MUST cap length
 /// and count on the raw `String` BEFORE calling this (resource-bound LAW). De-dupes so
 /// re-interning an equal string does not leak twice.
@@ -37,8 +41,7 @@ pub struct PluginCall {
 /// assert_eq!(a, b);
 /// ```
 pub fn intern(s: &str) -> &'static str {
-    static POOL: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
-    let mut g = POOL.lock().expect("intern pool");
+    let mut g = INTERN_POOL.lock().expect("intern pool");
     let set = g.get_or_insert_with(HashSet::new);
     if let Some(existing) = set.get(s) {
         return existing;
@@ -46,6 +49,20 @@ pub fn intern(s: &str) -> &'static str {
     let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
     set.insert(leaked);
     leaked
+}
+
+/// Test-only membership reader over [`intern`]'s pool — lets a guardrail assert "this failed
+/// load leaked nothing" (P2 §7b two-phase commit) by probing for a string the failed load would
+/// have interned. `INTERN_POOL` is process-wide, shared by every test in the binary — under
+/// `cargo test`'s default parallel execution, a whole-pool-SIZE before/after comparison is racy
+/// (an unrelated test interning any new string concurrently perturbs the count; reproduced
+/// empirically — a full-suite run saw the count drift by 2 during a single guardrail test's
+/// window). A MEMBERSHIP probe on one specific string is race-free instead, as long as that
+/// string is unique to the scenario under test (no other test in the suite ever interns the same
+/// literal) — a concurrently-running unrelated test cannot perturb whether ITS strings are absent.
+#[cfg(test)]
+pub(crate) fn intern_pool_contains(s: &str) -> bool {
+    INTERN_POOL.lock().expect("intern pool").as_ref().is_some_and(|set| set.contains(s))
 }
 
 /// The single formatting/routing point for all plugin errors (spec §7's `plugin_error(editor,
