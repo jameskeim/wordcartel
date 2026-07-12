@@ -331,10 +331,11 @@ error (degrade, not panic).
 **Registration (load time):**
 - `wc.register_command{ name = "<command>", label = "Label", menu = "Edit"|nil, fn = function() … end }`
   — `name` is the plugin-local segment (namespaced to `<plugin>.<name>` by the host); `menu` is an
-  optional string matching a `MenuCategory` variant (`"File"|"Edit"|"Block"|"Format"|"View"|
-  "Documents"|"Settings"|"Export"`), validated at registration; `fn` is stored in Lua's named registry
-  keyed by the namespaced id. A bad `menu` string or a duplicate `name` → load-report error, plugin
-  continues where possible.
+  optional string **parsed to the fixed `MenuCategory` enum** (`"File"|"Edit"|"Block"|"Format"|"View"|
+  "Documents"|"Settings"|"Export"` — `registry.rs:38–43`) — an unknown/oversized value is **rejected with
+  a typed Lua error and never interned or leaked** (parse-to-enum is its own bound; §7 audit); `fn` is
+  stored in Lua's named registry keyed by the namespaced id. A bad `menu` value or a duplicate `name` →
+  typed error → status line, plugin continues where possible.
 - **Registration resource caps (bounded-memory invariant — stem/name/label are interned/leaked, §4, so
   these bound a permanent allocation `set_memory_limit` cannot).** Enforced in `api.rs` **on the raw
   Lua-supplied `String`s, BEFORE interning** (never inside `register_plugin`, which sees only `&'static`);
@@ -352,9 +353,12 @@ error (degrade, not panic).
 - Reads: `wc.text(a?, b?)`, `wc.selection()`, `wc.cursor()`, `wc.len()`, `wc.version()`, `wc.path()`.
 - Edits (all pre-validated then via `submit_transaction` — §3b): `wc.insert(text)`,
   `wc.replace(a, b, text)` (offsets pre-checked against the live buffer; bad input → typed Lua error,
-  nothing constructed), `wc.set_selection(anchor, head)`. **Edit `text` is NOT separately plugin-capped**
-  — it becomes buffer content and is bounded by the existing **M5 document-memory model** exactly like
-  any other edit (there is no larger insert a plugin can make than a user paste; §7 audit).
+  nothing constructed), `wc.set_selection(anchor, head)`. **Edit `text` is length-checked against the
+  SAME pre-allocation cap as user paste** — `clipboard::PASTE_MAX_BYTES` (the guard at
+  `jobs_apply.rs:320`, `text.len() > PASTE_MAX_BYTES` → skip, that user paste already uses before
+  `build_range_replace`). The plugin edit API applies that identical check at the `api.rs` layer BEFORE
+  constructing any `ChangeSet` (before `Tendril::from(text)` allocates); over-cap → typed Lua error
+  (degrade). Plugin edits and user paste thus share one bound (§7 audit).
 - Status / errors: `wc.status(msg)` — set `editor.status`, the only user-visible output channel (no
   console — the app owns the alternate screen). `msg` is a plugin `String` copied into owned
   `Editor.status: String` (`editor.rs:395`), so it is **hard-capped/truncated to `PLUGIN_MAX_STATUS_LEN =
@@ -437,10 +441,17 @@ UI-drawing API (Provider law: plugins supply data/behavior; the host owns UI/lay
   - **Label** (leaked into `CommandMeta.label: &'static str`) → `PLUGIN_MAX_LABEL_LEN = 256` B (§5).
   - **Command count per plugin** (each adds a leaked id+label + a registry entry) →
     `PLUGIN_MAX_COMMANDS_PER_PLUGIN = 256` (§5).
-  - **`wc.insert`/`wc.replace` text** (allocates via `ChangeSet::insert`→`Tendril::from`, `change.rs:70`
-    / `build_range_replace`, `commands.rs:124`) → becomes buffer content, bounded by the **existing M5
-    document-memory model** — no new plugin cap (a plugin insert is no larger than a user paste; stated
-    explicitly so it is a justified bound, not an omission).
+  - **`menu` value** (`wc.register_command{menu=...}`) → **parse-to-enum** against the fixed
+    `MenuCategory` (`registry.rs:38–43`); an unknown/oversized string is rejected with a typed error and
+    **never interned or leaked** — no cap needed, the enum IS the bound (§5).
+  - **`wc.insert`/`wc.replace` text** (allocates via `ChangeSet::insert`→`Tendril::from`, `change.rs:66–72`
+    / `build_range_replace`→`replace_changeset`, `commands.rs:110–130`) → length-checked at the `api.rs`
+    layer against the **same pre-allocation cap as user paste** — `clipboard::PASTE_MAX_BYTES`, the guard
+    at `jobs_apply.rs:319–333` that user paste already applies before `build_range_replace` — BEFORE the
+    `Tendril` allocation; over-cap → typed error. (NOT "bounded by M5": M5 evicts *undo history* AFTER the
+    `Tendril` is already allocated, and paste has this separate pre-alloc cap that plugin edits would
+    otherwise bypass. The plan reuses that mechanism/constant so plugin edits and user paste share one
+    bound.)
   - **`wc.status` / `error(msg)` text** (copied into owned `Editor.status: String`, `editor.rs:395`) →
     hard-capped/truncated to `PLUGIN_MAX_STATUS_LEN = 4096` B on a char boundary (§5; display-only, not
     leaked, so a modest clamp suffices).
@@ -492,9 +503,12 @@ UI-drawing API (Provider law: plugins supply data/behavior; the host owns UI/lay
   range-taking surface asserts **no panic**.
 - **Resource-cap tests (guards the §7 resource-bound LAW — no unbounded leak/alloc from plugin input):**
   an over-length stem/name/label and the 257th `register_command` each → typed error, **nothing interned**
-  (verified via a stable id/label count before/after); an over-length `wc.status` → truncated to
-  `PLUGIN_MAX_STATUS_LEN` on a char boundary. Enforcement is asserted to happen on the raw `String` at the
-  `api.rs` layer (a rejected registration never reaches `register_plugin`).
+  (verified via a stable id/label count before/after); an invalid/oversized `menu` value → typed error,
+  not interned; an over-length `wc.status` → truncated to `PLUGIN_MAX_STATUS_LEN` on a char boundary; a
+  `wc.insert`/`wc.replace` with text exceeding `clipboard::PASTE_MAX_BYTES` → typed error, buffer
+  unchanged, **no `Tendril` allocated** (shares the user-paste cap; asserted at the `api.rs` layer).
+  Registration enforcement is asserted to happen on the raw `String` (a rejected registration never
+  reaches `register_plugin`).
 - **Contract-invariant tests** (see §9): palette-completeness and menu-subset re-run over a registry
   containing plugin entries; a patch-bound plugin command resolves in `build_keymap` and survives a
   preset switch (law 7).
