@@ -222,8 +222,9 @@ short closed list. So: fold four rules over the UAX segment list.
 
 1. Iterate `text.split_sentence_bound_indices()` — yields `(byte_start, &str)` UAX-29 segments.
 2. Fold adjacent segments into **merged spans** by evaluating, at each inter-segment boundary:
-   R4 (a boundary *shift*), then merge iff **R1 ∨ R2 ∨ R3**. Whitespace-only segments never start
-   or end a span (§4.7).
+   R4 (a boundary *shift*), then merge iff **no semantic hard break ∧ (R1 ∨ R2 ∨ R3)** — the
+   hard-break veto (§4.5) gates all three merge rules. Whitespace-only segments never start or end a
+   span (§4.7).
 3. Emit each span **content-only**: end = raw end minus the trailing run of
    `char::is_whitespace` bytes (§3).
 4. `sentence_bounds` selects the span for `pos` by the attach rule (§3.2/§3.5);
@@ -264,7 +265,8 @@ loop:
         A.content_end := N.start + closer_run_len(N)
         N := remainder of N after the run, leading whitespace skipped
         if N is empty: consume it; continue
-    if r1(A) or r2(A, N) or r3(N):        // §4.4, §4.5, §4.6
+    if not semantic_hard_break(A.content_end, N.start)     // §4.5 GLOBAL veto — gates all three
+       and (r1(A) or r2(A, N) or r3(N)):                   // §4.4, §4.5, §4.6
         absorb N into A (A.raw_end := N.raw_end; A.content_end := content_end(N)); continue
     else:
         emit (A.start, content_end(A))    // N stays pending — it opens the next span
@@ -346,16 +348,18 @@ const TERMINATORS: &[char] = &['.', '?', '!', '…', '。', '！', '？'];
 ```
 
 **Predicate.** Let `gap = &text[A.content_end..N.start]` (A's trailed whitespace — for adjacent
-segments the raw boundary sits inside it). R2 fires iff:
+segments the raw boundary sits inside it). R2 *proper* fires iff:
 - `gap` contains `'\n'` (the break was at a line separator), AND
 - `!ends_terminated(E(A))` (same helper as §4.3: closers-stripped tail's last char not in
-  `TERMINATORS`), AND
-- **NOT a Markdown semantic hard break** at that newline.
+  `TERMINATORS`).
 
-**The hard-break EXCEPTION — the one place this fix could lose authored meaning.** A semantic hard
-break must keep its two sides separate sentences, or `select_sentence` would swallow a verse line
-or an address-block line. Detection, exact: let `nl` = the absolute byte offset of the FIRST `'\n'`
-in `gap`; the break is semantic iff
+**The hard-break EXCEPTION is a GLOBAL merge veto — it gates R1, R2, AND R3, not R2 alone.** A
+semantic hard break must keep its two sides separate sentences, or `select_sentence` would swallow a
+verse line or an address-block line. The veto is evaluated **before** the three merge rules and
+short-circuits all of them: **nothing merges across a semantic hard break.** This is a design
+decision ratified by the human on 2026-07-12 (see History) — it is *not* the R2-only conjunct an
+earlier draft stated. Detection, exact: let `nl` = the absolute byte offset of the FIRST `'\n'` in
+`gap`; the break is semantic iff
 
 ```rust
 text[..nl].ends_with("  ") || text[..nl].ends_with('\\')
@@ -366,8 +370,17 @@ longer runs, matching Markdown's "two or more"), or a backslash immediately befo
 (`"\\\n"`). The check runs against the **whole window text** up to `nl`, not against `gap` alone —
 probed shapes force this: in `"Roses are red,  \n…"` the two spaces live in the gap (content end is
 after the comma), while in `"A line\\\n…"` the backslash is **content** (the last byte of
-`E(A)`). One predicate covers both. Fixtures pin both shapes plus a one-trailing-space control
-(one space = soft wrap → merge) — §12, T-4.
+`E(A)`). One predicate covers both.
+
+The merge decision is therefore `!semantic_hard_break(text, A.content_end, N.start) && (r1_merge ||
+r2_merge || r3_merge)` — a single guard around the disjunction (this is the shape Task 1's `merges`
+helper implements). **Why global, not R2-only:** R3 (lowercase-next) would independently re-merge a
+hard break whose continuation is lowercase — e.g. an authored verse couplet `"one line\\\ntwo
+line"` — so a veto that gated only R2 would still lose it. The veto also gates R1: an abbreviation
+immediately before an authored hard break (`"Dr.  \nSmith went home."`) splits rather than merges.
+This is deliberately safe: the veto can only ever *over-segment* (a plausible extra boundary the
+writer sees), never *swallow* authored content (§2/§10). Fixtures pin all three rule-interactions
+plus a one-trailing-space control (one space = soft wrap → merge) — §12, T-4.
 
 ### 4.6 R3 — lowercase continuation
 
@@ -418,8 +431,10 @@ All executed 2026-07-12 against `unicode-segmentation` (workspace-pinned major, 
 | `"He shouted “Stop!” and ran."` | `"He shouted “Stop!” "` · `"and ran."` | R3 merges → 1 |
 | `"This is **bold.** And this is next."` | `"This is **bold."` · `"** And this is next."` | R4 shifts → `"This is **bold.**"` + `"And this is next."` |
 | `"It was _quiet._ Then he left."` | `"It was _quiet."` · `"_ Then he left."` | R4 shifts → 2 sentences |
-| `"Roses are red,  \nViolets are blue."` | `"Roses are red,  \n"` · `"Violets are blue."` | R2 exception (two-space) → 2 sentences |
-| `"A line\\\nbroken hard."` | `"A line\\\n"` · `"broken hard."` | R2 exception (backslash) → 2 sentences |
+| `"Roses are red,  \nViolets are blue."` | `"Roses are red,  \n"` · `"Violets are blue."` | hard-break veto (two-space) → 2 sentences |
+| `"A line\\\nbroken hard."` | `"A line\\\n"` · `"broken hard."` | hard-break veto (backslash; **R3 would otherwise merge** the lowercase `"broken"`) → 2 sentences |
+| `"Dr.  \nSmith went home."` | `"Dr.  \n"` · `"Smith went home."` | hard-break veto gates **R1** (abbrev + two-space break + Capital) → 2 sentences |
+| `"See fig.\\\nTwo shows it."` | `"See fig.\\\n"` · `"Two shows it."` | hard-break veto gates **R1** (abbrev + backslash break) → 2 sentences |
 | `"Acme Co. Then he quit."` | `"Acme Co. "` · `"Then he quit."` | class-2 `co` not in const → break stands → 2 |
 | `"Acme Co. filed suit."` | 1 segment (UAX SB8) | 1 sentence (no rule needed) |
 | `"I saw Mt. Fuji. It was tall."` | `"I saw Mt. "` · `"Fuji. "` · `"It was tall."` | R1 (`mt`) merges 1+2 → 2 |
@@ -432,6 +447,52 @@ All executed 2026-07-12 against `unicode-segmentation` (workspace-pinned major, 
 | `"中文。Then done."` | `"中文。"` · `"Then done."` | no merge → 2 (multibyte-safe offsets) |
 | `"Nice 🙂. Then done."` | `"Nice 🙂. "` · `"Then done."` | 2 |
 | `"été fini. Then done."` | `"été fini. "` · `"Then done."` | 2 |
+
+### 4.10 Build vs. adopt — why UAX-29 + a tight post-pass, not an off-the-shelf segmenter
+
+This section records the algorithm-choice decision so a reviewer does not "simplify" it by reaching
+for a crate. **Net: no change to the design — UAX-29 + R1–R4 is the correct shape; the alternatives
+are either identical, wrong-shaped, or actively harmful to the arc.**
+
+- **`unicode-segmentation` IS our base.** We are not hand-rolling a scanner; we build on the
+  workspace's existing UAX-29 dependency (`wordcartel-core/Cargo.toml:12`) and add a four-rule
+  post-pass over its output. The design-space's from-scratch `boundary_after` scanner was rejected
+  precisely because UAX already earns the dozens of hard cases in §4/§4.9 for free.
+- **`bstr::sentences()` — the same algorithm, no gain.** `bstr` implements the *identical* UAX-29
+  sentence-boundary spec on `&[u8]`. It would give byte-slice ergonomics but zero additional
+  correctness (it has the same abbreviation blindness, below), and its `&[u8]` API is a mismatch for
+  our `&str`/`char`-oriented post-pass. Adopting it would change the base crate without removing our
+  custom layer.
+- **`pragmatic_segmenter` (and its Rust port) — the real alternative, but wrong-shaped for us.** It
+  is a mature, respected rule engine (whose Golden Rules we adopt as a characterization corpus,
+  §6.5). We do **not** adopt it as the engine because:
+  1. **Wrong output type.** It returns `Vec<String>` (owned, normalized sentence text). We need
+     **byte offsets** into the live buffer — the render focus region (`render.rs:494-506`), `select`
+     / the expand-ladder (`commands.rs`), and the future `transpose_sentences` (S4) all operate on
+     `(from, to)` spans, not copies. Retrofitting offsets onto a string-splitter is a rewrite.
+  2. **Too heavy for the hot path.** `gather_row_ctx` calls this **per frame** (§4.8). The segmenter
+     allocates and runs ~50 regexes per call; our R1–R3 are allocation-free scalar predicates over
+     already-segmented indices. It cannot meet the hot-path budget.
+  3. **Doesn't solve our DOMINANT bug.** It is clean-prose-oriented; it has no notion of Markdown
+     reflow hard-wraps (our §1 dominant bug — R2), Markdown emphasis closers (R4), or the semantic
+     hard-break veto (§4.5). Even after adopting it we would *still* need our custom layer for the
+     Markdown reality — so it removes nothing.
+  4. **It reintroduces the incoherence the arc exists to remove.** A third engine ships its own
+     abbreviation lists and heuristics, a *third* independent answer alongside repar's and ours — the
+     exact drift §5 is structured to prevent (one small curated list, coherent with repar's).
+  5. **The principled upgrade is S7, not a heavier heuristic.** The residual hard cases (§10:
+     `St. Louis`, `I.` as initial-vs-pronoun) are grammar-ambiguous — undecidable by *any* regex
+     engine, pragmatic_segmenter included (see §6.5's divergence ledger, where it and we both guess).
+     They are dissolved by S7's POS tagger, two items out — not by swapping one heuristic for a
+     bigger one now.
+
+- **Grounding point — off-the-shelf UAX crates do not give clean output anyway.** UAX-29 has **no
+  abbreviation model**: its SB7 only suppresses a break for `Upper . Upper` (a letter on *both*
+  sides of the period), so `"Mr. Smith"` still breaks — *probed*, identical to the `"Dr. Smith
+  arrived."` → `(0,4)` == `"Dr. "` case in §1. Any bare-UAX adoption (`unicode-segmentation` or
+  `bstr`) inherits that bug; the R1 post-pass is not optional polish, it is the fix. So the choice is
+  never "clean crate vs. our hack" — it is "UAX + our four rules" vs. "a heavier engine with the
+  wrong output type that still needs our Markdown layer."
 
 ## 5. DECISION — the abbreviation list: two classes, one const
 
@@ -685,12 +746,58 @@ rot.
 > those entries, pinned.
 >
 > **L5 — Markdown hard breaks.** `"Roses are red,  \nViolets are blue."` — ours yields 2 sentences
-> (R2 exception, §4.5); ventilate emits ONE line *(probed with the shell's exact fixup stack: par
+> (the global hard-break veto, §4.5); ventilate emits ONE line *(probed with the shell's exact fixup stack: par
 > tokenizes on whitespace, so the two-space marker cannot survive, and `"red,"` has no terminal
 > char)*. Ours preserves authored structure; the transform cannot. (This corrects the design's
 > "repar preserves hard breaks through transforms" claim — see the header corrections.)
 
 Not a fuzz/property test in S5. A fixture table.
+
+### 6.5 Second differential corpus — pragmatic_segmenter's "Golden Rules"
+
+A second characterization corpus, structured the **same way** as §6.1–6.4 (an equality set +
+an accepted-divergence LEDGER, `assert_eq!` / `assert_ne!`) but measured against a different
+external standard: the canonical **English "Golden Rules"** from `pragmatic_segmenter`
+(`github.com/diasks2/pragmatic_segmenter`, the numbered English list — 52 rules; the two non-prose
+duplicates aside, we use the published set). Purpose: honestly characterize our intentionally-small
+detector against a respected full segmenter, and lock the boundary between "what R1–R4 reproduces"
+and "what we knowingly miss." **This is NOT a blanket equality contract** — our post-pass is not a
+full segmenter, so many rules diverge *by design*; the ledger being the larger bucket is the
+honest, intended outcome.
+
+**Empirical split (all 52 rules executed against our `sentence_spans` 2026-07-12; word-grouping
+comparison):** **34 equality, 18 accepted divergence.** Do NOT invent behavior to pass a rule and
+do NOT grow `ABBREV_ALWAYS_MERGE` to chase one — the corpus records reality.
+
+- **Equality set (34)** — the R1–R4 territory we reproduce: simple `.`/`?`/`!` (GR 1-3),
+  abbreviations/titles (GR 4, 6-15, 17), decimals/money (GR 19-20), quotes incl.
+  boundary-after-close-quote (GR 24-26), double-punctuation `!! ?? !? ?!` (GR 27-30), the
+  errant-newline hard-wrap merges (GR 40-41 — our R2), email/URL (GR 22-23, UAX keeps them whole),
+  parenthetical (GR 21), named-entity `Yahoo!` (GR 44), ellipsis-in-quote and 4-dot-then-capital
+  boundary (GR 46, 48-49), and the periodic-list variant UAX happens to split (GR 34). Assert
+  `our_groups == golden_expected`.
+- **Accepted-divergence ledger (18)**, each `assert_ne!` + a one-line reason keyed to a governing
+  decision (grouped):
+  - **§11 out-of-scope — numbered/bulleted/alpha LISTS (8):** GR 31, 32, 33, 35, 36, 37, 38, 39.
+    We have no list-marker model; UAX splits (or fails to split) `"1."`, `"a."`, `"• 9."`
+    inconsistently. Explicitly out of scope (§11).
+  - **§11 out-of-scope — other edge forms (6):** GR 5 (single *lowercase* citation abbr `"p. 55"` —
+    not in the frozen list, §5), GR 18 (`a.m./p.m.` time abbreviations, interior-dot + capital
+    follow), GR 43 (geo-coordinates `"N°. 1026.253.553."`), GR 47 (parenthetical citation after a
+    quotation — markup-blind, §10 R3 note), GR 50-51 (spaced/​4-dot ellipsis edge forms), GR 52
+    (no whitespace between sentences — UAX SB needs whitespace).
+  - **§10 residue — grammar ambiguity, S7 POS resolves (2):** GR 16 (`"U.S. Government"` — abbrev +
+    capitalized proper noun, the exact `St. Louis` ambiguity) and GR 45 (`"you and I. Did you see
+    Albert I. Jones"` — `"I."` as pronoun-ending-sentence vs. single-capital initial; our R1 initial
+    rule merges it — the known cost of the single-capital rule, §4.4/§10).
+  - **R2-by-design — hard-wrap merge (1):** GR 42 (`"features\ncontact manager\nevents…"`) — a
+    newline-separated lowercase list with no terminators. Our **R2 merges it to one span by design**
+    (this is the DOMINANT reflow fix, §1/§4); pragmatic treats each bare line as a sentence. A case
+    where our design decision deliberately opposes the golden rule, and correctly so for our
+    reflow-first world — pinned so it can't silently flip.
+
+Bounded to the published **English** golden rules; no per-language sets. Lives beside the repar
+differential suite (Task 5), a clearly-labeled golden-rules sub-module.
 
 ## 7. DECISION — sentence motions: `Dir` variants, Emacs semantics
 
@@ -939,7 +1046,7 @@ strings assert **slice text**, not hand-computed offsets, wherever a span is che
 | T-1 | `sentence_bounds_basic` — **the deliberate flip**: `(t, 2)` → `(0, 8)` (comment names S5 content-only); `(t, 12)` → `(9, 20)` unchanged | core / `textobj.rs:90-96` (rewritten in place) | §3.3 |
 | T-2 | `empty_window_is_safe` extended: `sentence_bounds("", 0) == (0,0)` (unchanged, `textobj.rs:102`); plus `("\n", any) == (0,0)`; `prev_sentence_start("", 0) == None`; `next_sentence_end("", 0) == None` | core / `textobj.rs` | §3.2.4, §4.7 |
 | T-3 | R1 unit tests: `Dr.`/single-capital `J. R. R.`/`Mt. Fuji`/`St. Louis`/`vs.`/`cf.`/`et al.` merges; `Q.E.D.` and class-2 `Acme Co. Then` and dropped-`no` breaks; case-insensitive `DR. SMITH` | core / `textobj.rs` | §4.4, §5.1 |
-| T-4 | R2 + hard-break exception: the §1 hard-wrap paragraph merges to 2 sentences; `"  \n"` two-space and `"\\\n"` backslash fixtures stay 2 sentences; one-trailing-space control merges | core / `textobj.rs` | §4.5 |
+| T-4 | R2 + GLOBAL hard-break veto: the §1 hard-wrap paragraph merges to 2 sentences; two-space `"Roses are red,  \nViolets…"` and backslash `"A line\\\nbroken…"` stay 2 (the latter proves the veto gates **R3**, lowercase continuation); the two locking fixtures `"Dr.  \nSmith went home."` and `"See fig.\\\nTwo shows it."` stay 2 (veto gates **R1**); one-trailing-space control `"…here \nand continues."` merges to 1 | core / `textobj.rs` | §4.5 |
 | T-5 | R3 unit tests: `"“Why?” he asked."` → 1; `"He shouted “Stop!” and ran."` → 1; capital control breaks | core / `textobj.rs` | §4.6 |
 | T-6 | R4 unit tests: `**bold.**` and `_quiet._` shift fixtures (span text includes the closers); end-of-text `"This is **bold.**"` → one span `(0, 17)` | core / `textobj.rs` | §4.3 |
 | T-7 | UAX-preservation regression: the §4 "free wins" table (`10 a.m.`, `U.S.A.`, `fig. 2`, `“Go home.”`-boundary-after-quote) still segment correctly through the post-pass | core / `textobj.rs` | §4 |
@@ -948,7 +1055,7 @@ strings assert **slice text**, not hand-computed offsets, wherever a span is che
 | T-10 | Motion semantics: M-a start-of-current / repeat-to-previous; M-e end-of-current-content / repeat-to-next; cross-block both directions (prev block's LAST start; next block's FIRST end); `extend: true` composes a selection (`select_sentence_right` grows from anchor) | shell / `commands.rs` `#[cfg(test)]` beside the motion tests (`doc_start_and_end`, `commands.rs:1101`) | §7.2-7.3 |
 | T-11 | `sentence_left`/`sentence_right`/`select_sentence_left`/`select_sentence_right` dispatch through the registry (rows exist, handlers run) — plus the palette-completeness gates (`palette.rs:255/271`) pass with the new rows | shell / `registry.rs`+`palette.rs` existing gates + one dispatch assert | §7.4, §8 |
 | T-12 | Chord resolution: CUA resolves `alt-a`/`alt-e`/`alt-shift-a`/`alt-shift-e` to the four ids; WordStar resolves none of them to a command (deliberately unbound, mirroring `close_buffer_is_unbound_in_both_presets_by_design`, `keymap.rs:1056`); hint re-resolution gates (`keymap.rs:1087`, `menu.rs:435`) stay green | shell / `keymap.rs` `#[cfg(test)]` | §7.5, §8 |
-| T-13 | Differential suite: equality corpus (§6.3) + ledger L1–L5 (`assert_ne!` each, with its reason in the assert message) | shell / `wordcartel/tests/sentence_differential.rs` (new) | §6 |
+| T-13 | Differential suite: (a) repar equality corpus (§6.3) + ledger L1–L5 (`assert_ne!` each, reason in the message); (b) golden-rules corpus (§6.5) — 34 `assert_eq!` equality + 18 `assert_ne!` accepted-divergence, each with its governing-decision reason | shell / `wordcartel/tests/sentence_differential.rs` (new) | §6 |
 | T-14 | Focus-mode behavior change: e2e journey — hard-wrapped two-sentence paragraph, `view_opts.focus = true`, `focus_granularity = Sentence`; BOTH visual rows of the wrapped first sentence render undimmed and the second sentence's row dims (asserted via a `Modifier::DIM` row probe on the `TestBackend` buffer, the `underlined_cols` pattern at `e2e.rs:258-262`) | shell / `wordcartel/src/e2e.rs` | §9 |
 
 Gates unchanged and in force: `cargo test` all suites, warning-free build, workspace clippy clean
@@ -960,7 +1067,26 @@ suite mandatory-run/advisory-pass with its one-line summary quoted in the pre-me
 ## Pipeline status
 
 **Brainstorm: COMPLETE and approved (2026-07-12).**
-**Spec: AUTHORED (this document, 2026-07-12) — entering the Codex spec gate (loop to clean).**
+**Spec: AUTHORED (this document, 2026-07-12) — plan authored; both re-gating after the 2026-07-12
+amendments below.**
 
-**Not yet done:** Codex spec gate → plan → Codex plan gate → branch → subagent-driven TDD
-execution → the two final gates (Fable whole-branch + Codex pre-merge) → `--no-ff` merge.
+**Not yet done:** Codex spec/plan re-gate → branch → subagent-driven TDD execution → the two final
+gates (Fable whole-branch + Codex pre-merge) → `--no-ff` merge.
+
+---
+
+## History
+
+- **2026-07-12 — §4.5 hard-break exception ratified as a GLOBAL merge veto (human, Option A).** As
+  first written, §4.5 located the hard-break exception *inside R2* only. During plan authoring the
+  full rule set was executed against the spec's own §4.9 expected outputs and T-4's backslash
+  fixture `"A line\\\nbroken hard."` (a **lowercase** continuation) came out as ONE sentence — R3
+  independently re-merged it, because an R2-only exception does not gate R3. Resolved by ratifying a
+  **GLOBAL merge veto**: a semantic hard break gates R1, R2, AND R3 — nothing merges across it
+  (`!semantic_hard_break(..) && (r1 || r2 || r3)`). Consequence: an abbreviation immediately before
+  an authored hard break splits rather than merges (`"Dr.  \nSmith went home."` → 2). This is safe —
+  the veto can only over-segment, never swallow authored content (§2/§10). Locking fixtures added to
+  §4.9 + T-4; §4.1/§4.2/§4.5 prose and predicate updated.
+- **2026-07-12 — added §4.10 (build-vs-adopt rationale) and §6.5 (pragmatic_segmenter Golden-Rules
+  characterization corpus: 34 equality / 18 accepted-divergence).** No behavior change; both record
+  decisions/reality for reviewers.
