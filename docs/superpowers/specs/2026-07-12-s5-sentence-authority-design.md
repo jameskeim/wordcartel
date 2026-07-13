@@ -514,6 +514,53 @@ When wanted, it is **config-file data, never a command** ("add an abbreviation" 
 parameterized; builtins are nullary — command-surface **law 10**). Revisit that together with a
 possible additive `repar::Options::abbreviations(&[&str])` upstream, as **one** decision, later.
 
+### 5.2 Prior art — `vim-textobj-sentence`, and why it validates rather than revises this list
+
+`preservim/vim-textobj-sentence` is the widely-used regex sentence text-object for Vim
+(`autoload/textobj/sentence.vim`). It is worth recording because, arriving from a completely
+different engine — one composite Vim regex, **no** Unicode/UAX awareness — **it independently
+converges on our exact four rules**, which is corroboration that R1–R4 is the right closed set, not
+an arbitrary one:
+
+| vim regex fragment | effect | our rule |
+|---|---|---|
+| `([-0-9]+<abbrevs>)@<n><!` negative-lookbehind before `\.` | a `.` after a number or a listed abbreviation is not a terminator | **R1** |
+| body `\_.{-}` spans single `\n`; boundary only on `\n\s*\n` | a lone line-break is sentence-internal | **R2** |
+| body must start `[[:upper:]]` | a boundary requires a following capital; lowercase continues | **R3** |
+| terminator `…)+[<trailing>]*` | consume trailing quotes/brackets after the terminator | **R4** |
+
+**Two decisions it independently confirms.** (1) vim keys the boundary on *a following capital* —
+the same weak-signal/strong-signal split this section argues (R3). (2) vim's default abbreviation
+set includes `[cn]o` and `[Ee]tc` as **unconditional** merges — i.e. it always-merges `no.`, `co.`,
+`etc.` — which is precisely the false-merge §5 avoids by **dropping `no`** and demoting `co`/`etc`
+to class 2 (R3 does the work). vim's list is the concrete instance of the over-inclusion we reject.
+
+**Cross-check of the full default list against ours.** vim's default (`plugin/textobj/sentence.vim`)
+is ~40 tokens, and once decoded it is dominated by **address/unit SUFFIX forms** — `Rd Ave Av Ln Ct
+Pt Apt Str Blvd Assn Dept` and `hr min wt` — plus honorifics, `co/no/etc`, single initials, and a
+grab-bag (`div esp est incl alt Op ep Cl pl`). Mapping it onto our two-class structure:
+
+- **Address/unit suffixes** (`Rd Ave Ln Ct Blvd Apt Dept hr min …`) are the *same* ambiguity as the
+  accepted `St.` residue (§10): they are suffix-position and genuinely *can* end a sentence ("I live
+  on Elm Rd. It's quiet."). Putting them in an **always-merge** list — as vim does — makes that case
+  merge wrongly; leaving them out, as we do, lets **R3** merge the common lowercase continuation
+  ("Elm Rd. and I…") while a following capital breaks (a plausible over-break, never a nonsense
+  fragment). So vim's largest category is exactly what class 1 should **exclude** — the cross-check
+  *widens* the case for the small list, it does not shrink it.
+- **`Ph.`** (for `Ph.D.`) is already handled by our single-capital-initial rule (the trailing `D.`),
+  so it needs no entry.
+- **The only genuinely prefix-type tokens vim carries that we lack** are the honorifics
+  `Drs Messrs Univ Inst`. All four are rare in continuous prose, the single-capital rule + R3 cover
+  their common uses, and adding them trades directly against the small-list thesis for negligible
+  benefit — so they are **deliberately not adopted** in S5 (candidates for the later config-data
+  revisit, above, not for the builtin const). Conversely we carry `rev gen` and the citation forms
+  `fig vol ch pp eq cf al` that vim omits — the two lists have complementary gaps, and neither
+  argues for growing ours now.
+
+Net: no change to `ABBREV_ALWAYS_MERGE`. vim is prior-art *confirmation* of both the rule set and the
+curation, and its `[cn]o`/`[Ee]tc` defaults are a live demonstration of the false-merge this list is
+built to avoid.
+
 ## 6. DECISION — the differential suite: a divergence LEDGER, not an equality contract
 
 **Full unification with repar is impossible** — `repar/src/sentence.rs:1-10` states that
