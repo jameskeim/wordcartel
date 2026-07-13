@@ -18,6 +18,7 @@ pub struct LayoutKey {
     pub text_width: usize,          // vp_width (subsumes wrap/gutter geometry)
     pub active_line: usize,
     pub mode: crate::editor::RenderMode, // view.mode — drives per-line LineRender
+    pub ventilate: bool,                 // S6 — view.ventilate; sentence-per-line layout path
     pub heading_level_glyph: bool,
 }
 
@@ -200,7 +201,7 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
     // ------------------------------------------------------------------
     // Snapshot all read-only scalar values from the active buffer before any
     // mutable borrow, so the borrow checker sees no overlap.
-    let (total_lines, active_line, area_height, first_line, b_mode, scroll_row) = {
+    let (total_lines, active_line, area_height, first_line, b_mode, b_ventilate, scroll_row) = {
         let b = editor.active();
         let buf = &b.document.buffer;
         let total_lines = total_logical_lines(buf);
@@ -218,8 +219,9 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
         let raw_scroll = b.view.scroll.min(total_lines.saturating_sub(1));
         let first_line = fold_view.normalize_line(raw_scroll);
         let b_mode = b.view.mode;
+        let b_ventilate = b.view.ventilate;
         let scroll_row = b.view.scroll_row;
-        (total_lines, active_line, area_height, first_line, b_mode, scroll_row)
+        (total_lines, active_line, area_height, first_line, b_mode, b_ventilate, scroll_row)
     };
     // Persist the normalized scroll so consumers agree.
     editor.active_mut().view.scroll = first_line;
@@ -238,6 +240,7 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
         text_width: vp_width,
         active_line,
         mode: b_mode,
+        ventilate: b_ventilate,
         heading_level_glyph: editor.theme.heading_level_glyph,
     };
     if editor.active().layout_key.as_ref() == Some(&key) {
@@ -744,6 +747,22 @@ mod tests {
                 e.theme.heading_level_glyph = !e.theme.heading_level_glyph;
             }
         );
+    }
+
+    #[test]
+    fn ventilate_flag_reruns_layout() {
+        // Flipping view.ventilate must change LayoutKey → the gate misses → the fill re-runs.
+        let mut e = Editor::new_from_text("Hello there. Bye now.\n", None, (80, 24));
+        LAYOUT_RUNS.with(|c| c.set(0));
+        rebuild(&mut e);
+        let before = LAYOUT_RUNS.with(|c| c.get());
+        e.active_mut().view.ventilate = true;
+        rebuild(&mut e);
+        let after = LAYOUT_RUNS.with(|c| c.get());
+        assert!(after > before, "toggling ventilate must re-run the layout loop");
+        // Default is off.
+        let e2 = Editor::new_from_text("x\n", None, (80, 24));
+        assert!(!e2.active().view.ventilate, "ventilate defaults OFF");
     }
 
     /// A single non-scrolling mid-screen insert must produce exactly ONE layout

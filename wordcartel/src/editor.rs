@@ -113,6 +113,9 @@ pub struct View {
     pub scroll_row: usize, // visual rows to skip within the first visible logical line
     pub area: (u16, u16), // (width, height) cells of the editing area
     pub mode: RenderMode,
+    /// S6 — per-buffer ventilate lens (sentence-per-line + rhythm gutter). Default off; a lens is
+    /// into THIS writing, so it does not follow other buffers (§F5). Keyed into `LayoutKey`.
+    pub ventilate: bool,
     /// Per-visible-logical-line layout cache (Task 3).
     /// Key = logical line index; value = (visual rows, source↔visual ColMap).
     pub line_layouts: BTreeMap<usize, (Vec<VisualRow>, ColMap)>,
@@ -206,6 +209,7 @@ impl Buffer {
             scroll_row: 0,
             area,
             mode: RenderMode::LivePreview,
+            ventilate: false,
             line_layouts: BTreeMap::new(),
         };
         Buffer {
