@@ -932,13 +932,15 @@ created = "2026-07-12"
 [[item]]
 id = "S5"
 title = "Sentence authority — fix select_sentence, differential suite, sentence motions"
-status = "ready"
+status = "shipped"
 kind = "bug"
 size = "SM"
 theme = "S"
 hook = "THREE live bugs (all probed 2026-07-12), not one. DOMINANT: UAX-29 breaks a sentence at EVERY NEWLINE (SB4), so in any document our OWN reflow hard-wrapped, select_sentence selects A LINE and Focus=Sentence focuses A LINE. Plus: \"Dr. Smith arrived.\" selects \"Dr. \"; and \"“Why?” he asked.\" splits after the close-quote. Fix = abbreviation-aware post-pass + a differential fixture suite pinning our detector to repar's ventilate. Also adds the sentence MOTIONS both design docs forgot (Dir has Word/Paragraph, no Sentence — no M-a/M-e). Ships alone; the whole S4–S8 arc stands on it. Arc: docs/design/prose-structure-arc.md."
-doc = "ux-backlog.md#s5"
+doc = "backlog-archive.md#s5"
 created = "2026-07-12"
+shipped_commit = "ab91584"
+shipped_date = "2026-07-13"
 
 [[item]]
 id = "S6"

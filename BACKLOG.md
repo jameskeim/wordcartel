@@ -3,7 +3,7 @@
 
 # Backlog
 
-**25 open · 50 shipped · 1 dropped**
+**24 open · 51 shipped · 1 dropped**
 
 Blocking Effort P: **0**
 
@@ -14,7 +14,6 @@ Blocking Effort P: **0**
 | M9 | Optional: upgrade/patch pulldown-cmark | watch | chore | S |  | M4-rest only ISOLATES its parse panic; a real upgrade is optional, low priority. |
 | B6 | Heading-glyph STYLE toggle | needs-design | feature | SM |  | Cycle shades / Nerd numerals / inverted numerals; default stays universal Shades. |
 | S3 | Snapshots — durable revision checkpoints | needs-design | feature | SM |  | Capture/list/diff/restore; reuses rope snapshot + ChangeSet; one net-new display diff. |
-| S5 | Sentence authority — fix select_sentence, differential suite, sentence motions | ready | bug | SM |  | THREE live bugs (all probed 2026-07-12), not one. DOMINANT: UAX-29 breaks a sentence at EVERY NEWLINE (SB4), so in any document our OWN reflow hard-wrapped, select_sentence selects A LINE and Focus=Sentence focuses A LINE. Plus: "Dr. Smith arrived." selects "Dr. "; and "“Why?” he asked." splits after the close-quote. Fix = abbreviation-aware post-pass + a differential fixture suite pinning our detector to repar's ventilate. Also adds the sentence MOTIONS both design docs forgot (Dir has Word/Paragraph, no Sentence — no M-a/M-e). Ships alone; the whole S4–S8 arc stands on it. Arc: docs/design/prose-structure-arc.md. |
 | E8 | Lens — the unifying view surface (layout vs style axes; plugin-registerable) | needs-design | feature | M |  | PRODUCT CONCEPT (user, 2026-07-12): "a lens for your writing" — one first-class, summoned, non-destructive way of SEEING prose. REGROUNDED against SHIPPED code (a2f9062, multi-provider diagnostics SPINE + switchable lens — its spec/plan PREDATE its merge of this item, so E8 did not reach its design). THE REAL PROBLEM: FOUR toggle surfaces already answer "how do I see my prose" with four different shapes (RenderMode exclusive cycle — which ALSO gates diagnostics; active_analysis_source exclusive engine selector; toggle_focus boolean; typewriter/measure booleans) and nothing unifies them. S6 (layout) and S8 (style) add two more. THE FORK, now VALIDATED BY THE CODE not merely proposed: STYLE lenses PAINT and STACK (toggle_focus already stacks with the diagnostics underline today); LAYOUT lenses re-DRAW and are EXCLUSIVE. So: one active layout lens x N active style lenses. FINDING: DiagnosticsProvider is whole-document + async + process-lifecycled (ensure_running/shutdown/availability/notify_change(text: String)); S8's POS lens is caret-local, synchronous, processless — it MUST NOT implement that trait (a whole-doc String per check breaks the O(visible) rule). S8 is a different lens KIND. E8 is therefore a GENERALIZATION ABOVE the shipped engine-selector, NOT a widening of it; never-merge is RIGHT for diagnostics — do not re-litigate. Effort-P plugins should be able to REGISTER a lens. |
 | S1 | Rearrangeable outline / heading-subtree corkboard | needs-design | feature | M |  | Structure mode: atomic heading-subtree move via submit_transaction; drag-reorder. Inherits select_section from S4, and OWNS section transpose (deliberately cut from S4: outline::sections yields NESTED/overlapping ranges — the 'next section' after an H2 is usually its own H3 child, so naive swap-with-next corrupts the document; S1 must solve sibling identification + separator normalization anyway). |
 | S6 | Ventilate-as-a-lens — non-destructive sentence view + rhythm gutter | needs-design | feature | M |  | ⭐ THE THESIS IS PROVEN OR KILLED HERE. Ventilate as a VIEW, not an edit: buffer untouched, display breaks one sentence per line, toggle off → prose returns byte-identical. Plus a rhythm gutter (per-sentence word count + opening word) so a 41-word monster and three repeated 'The' openers are visible instantly. Zero NLP, no new objects, no command matrix, no contract amendment. Must render with OUR detector (S5), not repar's, so what you SEE and what you SELECT are the same object. FAILURE SIGNAL: author uses it on real prose for 2 weeks and turns it off → STOP THE ARC. Arc: docs/design/prose-structure-arc.md. |
@@ -39,10 +38,11 @@ Blocking Effort P: **0**
 
 ## Shipped
 
-<details><summary>50 shipped</summary>
+<details><summary>51 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
+| S5 | Sentence authority — fix select_sentence, differential suite, sentence motions | 2026-07-13 | ab91584 |
 | P | Effort P — in-process Lua plugin system (P1 commands + P2 events/config/reload + P3 timers) | 2026-07-12 | 2988178 |
 | E7 | Grammar/spelling as a deliberate Analysis view (F1 RenderMode); draft stays quiet | 2026-07-11 | 17ba839 |
 | H12 | PTY smoke suite live-splash coverage (S9) | 2026-07-11 | 0dae170 |

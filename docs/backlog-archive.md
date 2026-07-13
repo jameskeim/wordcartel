@@ -1648,3 +1648,41 @@ command registry opened via `HandlerKind{Builtin|Plugin}` + `&'static` interning
 **Deferred to their own future efforts** (each wants its own concrete driver): subprocess `wc.async`
 (the load-bearing async primitive, for formatter/linter plugins) and a plugin-contributed dynamic menu
 section. Post-P research candidates remain open as PA / PB / PC.
+
+### S5 — Sentence authority — fix select_sentence, differential suite, sentence motions
+<!-- item: S5 -->
+
+**The foundation of the S5 → S6 → S4 → S7 → S8 arc** (`docs/design/prose-structure-arc.md`). Ships
+alone; everything downstream stands on it.
+
+**The live bug.** Verified by probe 2026-07-12 against the real crate:
+
+```
+textobj::sentence_bounds("Dr. Smith arrived. He was late.", 0)  ->  (0, 4)  ==  "Dr. "
+```
+
+`select_sentence` is **wrong today**. Our detector is UAX-29 segmentation, which handles `3.14`,
+`10 a.m.`, and `P.I.` correctly but splits after a **title abbreviation followed by a capital** —
+`Dr.` / `Mr.` / `Mrs.` / `St.`, the most common abbreviation class in real prose. Meanwhile repar's
+`ventilate` has an abbreviation stop-list and gets it right, so **the shipped product already
+contains two authorities that disagree about where a sentence ends.**
+
+**Fix:** an abbreviation-aware post-pass over the UAX-29 boundaries (merge a boundary when the
+trailing word is in a curated stop set — pure, ~50 lines, testable). ⚠ The design-space doc's
+`STARTER_ABBREVIATIONS` is **not shippable as written**: `St` and `Dr` are duplicated, and `No`,
+`Co`, `Mon` would eat *real* sentence boundaries. Curate against the fixture corpus.
+
+**The differential fixture suite** — the honest, testable form of "coherence". Assert that our
+detector and `run_transform(Ventilate)` agree across a corpus. This is required because **full
+unification is impossible**: repar's own `sentence.rs` says `checkcapital`/`checkcurious` are shared
+between ventilate *and* the reflow `guess_merge` path, and the reflow path is **frozen by a
+byte-exact par-1.53.0 oracle** — the abbreviation stop-list is deliberately quarantined in ventilate
+to protect it. So there are **three** sentence authorities and they cannot be merged; they can only
+be *pinned* by a test. (This is also why we do **not** absorb repar — see the arc doc, D1/D2.)
+
+**Sentence motions — which BOTH design documents forgot.** `Dir` has Word and Paragraph motions but
+**no Sentence**: there is no Emacs `M-a`/`M-e` parity. Cheaper than any operator, likely more used,
+and trivially bounded to the paragraph window.
+
+⚠ **Trap for every consumer:** UAX sentence spans **include trailing whitespace** (unlike word
+bounds — `"One two. "` → `(0,9)`). Trim to content or gaps double on transpose.
