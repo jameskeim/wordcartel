@@ -438,8 +438,18 @@ mod tests {
         e.active_mut().view.ventilate = true;
         crate::derive::rebuild(&mut e);
         // The block is anchored at line 0 with a VentBlock; sentence 1 spans the hard newline.
+        let buf = e.active().document.buffer.clone();
+        let blocks = e.active().document.blocks().clone();
         let vb = e.active().view.vent_blocks.get(&0).expect("paragraph anchored at line 0");
         assert!(vb.last_line >= 1, "block covers the hard-wrapped second logical line");
+        // One row-group per sentence: the gutter carries exactly one `Count` cell (a row-group's
+        // first row) per segmented sentence in the window — the honest "one-row-group-per-sentence"
+        // assertion the test name promises. Here the paragraph ventilates into two sentences.
+        let (ps, pe) = crate::nav::paragraph_range_at(&blocks, &buf, 0);
+        let sentence_count = crate::ventilate::segment_block(&buf.slice(ps..pe)).count();
+        let rowgroup_count = vb.gutter.iter().filter(|g| matches!(g, GutterCell::Count(_))).count();
+        assert_eq!(rowgroup_count, sentence_count, "one row-group (Count cell) per segmented sentence");
+        assert_eq!(sentence_count, 2, "fixture ventilates into exactly two sentences");
         // Combined ColMap: the byte at the former '\n' (index of '\n' in the source) maps and
         // round-trips (it became a space in DISPLAY but is a real buffer byte).
         let (rows, map) = &e.active().view.line_layouts[&0];
@@ -450,11 +460,69 @@ mod tests {
     }
 
     #[test]
+    fn fill_geometry_maps_later_sentence_to_select_sentence_span() {
+        // COVERAGE (the Task 5 payoff, sf > 0). The fill renders each sentence as one row-group
+        // keyed at the block anchor, with the ColMap's `src`/`src_span` shifted WINDOW-relative by
+        // each sentence's window offset `sf` (the src-shift stitch in `layout_block`). Neither
+        // sibling test exercises that stitch against select-sentence: the keystone
+        // `t_indent_origin_…` computes its `lens_spans` by calling `segment_block` DIRECTLY (never
+        // touching the fill's rendered `map`), and `fill_produces_one_rowgroup_…` only round-trips
+        // the FIRST sentence (`sf == 0`). This closes the gap for a SECOND sentence: it takes a
+        // VISUAL position inside sentence 2, reconstructs the global byte the way the migrated
+        // consumers do — `resolve().byte_origin + resolve().map.visual_to_source(r, c)` — then runs
+        // select-sentence's OWN primitive at that global byte and asserts the selected sentence
+        // EQUALS the on-screen row-group's global span. Sentence 2 both starts at `sf > 0` AND
+        // reflows an interior soft `\n`, so the reflow and the src-shift stitch are proven together.
+        let text = "Alpha beta gamma. Delta epsilon zeta\neta theta iota. Kappa lambda.\n";
+        let mut e = Editor::new_from_text(text, None, (30, 24));
+        e.active_mut().view.ventilate = true;
+        crate::derive::rebuild(&mut e); // Task 5 fill populates line_layouts + vent_blocks
+        let buf = e.active().document.buffer.clone();
+        let blocks = e.active().document.blocks().clone();
+        // The window the fill segmented — the IDENTICAL call+origin select-sentence uses at the anchor.
+        let (ps, pe) = crate::nav::paragraph_range_at(&blocks, &buf, 0);
+        let win = buf.slice(ps..pe);
+        let spans: Vec<(usize, usize)> = crate::ventilate::segment_block(&win).collect();
+        assert!(spans.len() >= 2, "fixture must ventilate into ≥2 sentences");
+        assert!(spans[1].0 > 0, "sentence 2 must start at a nonzero window offset (sf > 0)");
+        // Locate sentence 2's FIRST rendered row via the gutter (one `Count` cell per row-group
+        // start; `gutter[i]` is the cell for visual row `i`). The ordinal ties the visual row back
+        // to a sentence through the real render contract, not a hardcoded index.
+        let r = resolve(&e.active().view, &buf, 0).expect("ventilated window resolves");
+        let (s2_row, ordinal) = {
+            let vb = e.active().view.vent_blocks.get(&0).expect("paragraph anchored at line 0");
+            let count_rows: Vec<usize> = vb.gutter.iter().enumerate()
+                .filter(|(_, g)| matches!(g, GutterCell::Count(_))).map(|(i, _)| i).collect();
+            (count_rows[1], 1usize) // the 2nd row-group == sentence ordinal 1
+        };
+        // A VISUAL position a couple of cells into sentence 2's first row — early enough that the
+        // reconstructed source lands in sentence 2 WITH the src-shift, but would fall back into
+        // sentence 1 WITHOUT it (what the mutation-proof of the `+ sf` stitch relies on).
+        let (vrow, vcol) = (s2_row, r.map.prefix_width + 2);
+        let src_rel = r.map.visual_to_source(vrow, vcol); // window-relative (fill applied `+ sf`)
+        let global = r.byte_origin + src_rel; // == ps + src_rel; the consumers' reconstruction
+        // The on-screen row-group this caret sits in (its global span, via the fill's byte_origin).
+        let onscreen = (ps + spans[ordinal].0, ps + spans[ordinal].1);
+        assert!(onscreen.0 <= global && global < onscreen.1,
+            "the reconstructed caret must land INSIDE the on-screen sentence-2 row-group");
+        // select-sentence's EXACT primitive (`commands.rs` `Scope::Sentence`): paragraph_range_at at
+        // the caret byte, then `sentence_bounds` over that window, translated back to global.
+        let (sps, spe) = crate::nav::paragraph_range_at(&blocks, &buf, global);
+        let swin = buf.slice(sps..spe);
+        let (sf, st) = wordcartel_core::textobj::sentence_bounds(&swin, global - sps);
+        assert_eq!((sps + sf, sps + st), onscreen,
+            "resolve caret in a LATER sentence → select-sentence returns the identical on-screen sentence (the sf>0 stitch)");
+    }
+
+    #[test]
     fn t_indent_origin_lens_spans_equal_select_sentence_for_indented_paragraph() {
-        // A 2-space-INDENTED, multi-line paragraph. paragraph_range_at's ps is AFTER the two spaces,
-        // so a byte-containment test against line_start(anchor) would FAIL; line-index membership must
-        // succeed. The origin must be ps, and the lens's global sentence spans must be byte-identical
-        // to what select-sentence selects (the SEE==SELECT proof on the indent case).
+        // A 2-space-INDENTED, multi-line paragraph. pulldown-cmark's Paragraph span INCLUDES the
+        // leading ≤3-space indent and starts at the anchor's line_start, so paragraph_range_at's
+        // `ps == line_to_byte(0)` here (a buffer-start paragraph — no indent delta at the anchor).
+        // The origin must be `ps`, and the meaningful "window origin, not per-line origin" property
+        // is that an INTERIOR line (l=1) resolves to the WINDOW origin `ps`, NOT its own line_start —
+        // reached by line-index LOOKUP, never byte-containment. The lens's global sentence spans must
+        // also be byte-identical to what select-sentence selects (the SEE==SELECT proof, indent case).
         let text = "  The committee met on a\nsunny Tuesday afternoon. It voted.\n";
         let mut e = Editor::new_from_text(text, None, (30, 24));
         e.active_mut().view.ventilate = true;
