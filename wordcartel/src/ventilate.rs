@@ -124,6 +124,13 @@ pub fn vent_block_range(buf: &TextBuffer, ps: usize, pe: usize) -> (usize, usize
 /// (`vent_blocks`), confirm `l ∈ first_line..=last_line` (a LINE-INDEX comparison, never a byte
 /// comparison). Otherwise it is an ordinary per-line entry, which covers `l` only when keyed exactly
 /// at `l`.
+///
+/// **Fill obligation (binds the Task 5 fill):** `line_layouts` is authoritative for the anchor
+/// lookup above, so a ventilated window's `vent_blocks` entry MUST be keyed at the SAME first-line
+/// anchor as its `line_layouts` entry, AND every interior per-line `line_layouts` entry within the
+/// window MUST be removed — a stale interior `line_layouts` key would short-circuit `range(..=l)
+/// .next_back()` before it ever reaches the window anchor, silently resolving that line as an
+/// ordinary per-line entry with a `line_start` origin instead of the window's `ps`.
 pub fn resolve<'a>(view: &'a crate::editor::View, buf: &TextBuffer, l: usize) -> Option<Resolved<'a>> {
     let (&anchor, (rows, map)) = view.line_layouts.range(..=l).next_back()?;
     if let Some(vb) = view.vent_blocks.get(&anchor) {
@@ -195,6 +202,39 @@ mod tests {
         assert_eq!(r.byte_origin, buf.line_to_byte(1), "per-line origin is line_start");
         assert_eq!(r.first_line, 1);
         assert_eq!(r.last_line, 1);
+    }
+
+    #[test]
+    fn resolver_resolves_ventilated_window_origin_is_byte_origin_not_line_start() {
+        // Hand-construct a ventilated window BEFORE Task 5 exists, so the keystone
+        // `if let Some(vb)` branch in `resolve` is provably exercised NOW: rebuild fills the
+        // ordinary per-line cache, then we simulate what the Task 5 fill will do — collapse
+        // the interior per-line entries into one window anchor and register a `VentBlock`.
+        let mut e = Editor::new_from_text("alpha\nbeta\ngamma\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        let buf = e.active().document.buffer.clone();
+        {
+            let view = &mut e.active_mut().view;
+            // Remove the interior per-line entries the window swallows, so
+            // `range(..=1).next_back()` lands on the anchor (line 0), not a stale line-1 entry.
+            view.line_layouts.remove(&1);
+            view.line_layouts.remove(&2);
+            // A sentinel byte_origin, deliberately far from any real line_start in this
+            // 17-byte buffer — a resolver that fell back to `line_to_byte`/byte-containment
+            // instead of the `ps` passthrough could not produce this value by accident.
+            view.vent_blocks.insert(0, VentBlock { last_line: 2, byte_origin: 999, gutter: vec![] });
+        }
+        // Line 1 is INTERIOR to the window (anchor 0, last_line 2) — only reachable via the
+        // ventilated branch, since no per-line entry remains keyed at 1.
+        let r = resolve(&e.active().view, &buf, 1).expect("interior line resolves via the window anchor");
+        assert_eq!(r.first_line, 0, "resolves to the window anchor, not line 1 itself");
+        assert_eq!(r.last_line, 2, "last_line is the VentBlock's, not the per-line default of l");
+        assert_eq!(r.byte_origin, 999, "origin is the VentBlock's byte_origin (the `ps` passthrough)");
+        assert_ne!(
+            r.byte_origin,
+            buf.line_to_byte(0),
+            "origin is NOT line_start(anchor) — a byte-containment/line_start resolver would fail this"
+        );
     }
 
     #[test]
