@@ -190,6 +190,14 @@ impl Registry {
         r.register("select_word_left",  "Select Word Left",  None, |c| run(c, Command::Move { dir: Dir::WordLeft,  extend: true }));
         r.register("select_word_right", "Select Word Right", None, |c| run(c, Command::Move { dir: Dir::WordRight, extend: true }));
 
+        // Sentence motions (S5, Emacs M-a/M-e) — palette-only (menu: None).
+        r.register("sentence_left",  "Move Sentence Left",  None, |c| run(c, Command::Move { dir: Dir::SentenceLeft,  extend: false }));
+        r.register("sentence_right", "Move Sentence Right", None, |c| run(c, Command::Move { dir: Dir::SentenceRight, extend: false }));
+
+        // Sentence selecting motions (extend) — palette-only (menu: None).
+        r.register("select_sentence_left",  "Select Sentence Left",  None, |c| run(c, Command::Move { dir: Dir::SentenceLeft,  extend: true }));
+        r.register("select_sentence_right", "Select Sentence Right", None, |c| run(c, Command::Move { dir: Dir::SentenceRight, extend: true }));
+
         // Paragraph / page / document navigation — palette-only (menu: None).
         r.register("move_paragraph_up",   "Move Paragraph Up",   None, |c| run(c, Command::Move { dir: Dir::ParagraphUp,   extend: false }));
         r.register("move_paragraph_down", "Move Paragraph Down", None, |c| run(c, Command::Move { dir: Dir::ParagraphDown, extend: false }));
@@ -1048,6 +1056,52 @@ mod tests {
         assert!(matches!(e.minibuffer.as_ref().map(|m| m.kind),
             Some(crate::minibuffer::MinibufferKind::SaveAs)),
             "unnamed save opens the Save-As minibuffer");
+    }
+
+    #[test]
+    fn sentence_motion_commands_dispatch_and_take_effect() {
+        // "One two. Three four." spans: (0,8), (9,20).
+        let reg = Registry::builtins();
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        // Dispatch `id` against editor `e` with the caret preset to `caret`; return the new head
+        // (and leave `e`'s selection for the caller to inspect).
+        let dispatch = |e: &mut Editor, id: &'static str| {
+            let mut ctx = Ctx { editor: e, clock: &clk, executor: &ex, msg_tx: tx.clone() };
+            reg.dispatch(CommandId(id), &mut ctx)
+        };
+        let head = |e: &Editor| e.active().document.selection.primary().head;
+
+        // sentence_left: caret in "Three four." → start of that sentence (9).
+        let mut e = Editor::new_from_text("One two. Three four.\n", None, (80, 24));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(12);
+        crate::derive::rebuild(&mut e);
+        assert_eq!(dispatch(&mut e, "sentence_left"), CommandResult::Handled);
+        assert_eq!(head(&e), 9);
+
+        // sentence_right: caret at 0 → content end of first sentence (8).
+        let mut e = Editor::new_from_text("One two. Three four.\n", None, (80, 24));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(0);
+        crate::derive::rebuild(&mut e);
+        assert_eq!(dispatch(&mut e, "sentence_right"), CommandResult::Handled);
+        assert_eq!(head(&e), 8);
+
+        // select_sentence_right: extends from anchor 0 → selection (0,8).
+        let mut e = Editor::new_from_text("One two. Three four.\n", None, (80, 24));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(0);
+        crate::derive::rebuild(&mut e);
+        assert_eq!(dispatch(&mut e, "select_sentence_right"), CommandResult::Handled);
+        let sel = e.active().document.selection.primary();
+        assert_eq!((sel.from(), sel.to()), (0, 8));
+
+        // select_sentence_left: caret in "Three four." extends back to that sentence's start (9,12).
+        let mut e = Editor::new_from_text("One two. Three four.\n", None, (80, 24));
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(12);
+        crate::derive::rebuild(&mut e);
+        assert_eq!(dispatch(&mut e, "select_sentence_left"), CommandResult::Handled);
+        let sel = e.active().document.selection.primary();
+        assert_eq!((sel.from(), sel.to()), (9, 12));
     }
 
     #[test]
