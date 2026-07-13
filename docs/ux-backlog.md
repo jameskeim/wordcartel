@@ -895,3 +895,10 @@ tellable only if there is one seam to register into. (`DiagSource::Plugin` antic
 - **Attribution when several lenses paint the same span**: who wins, and can the writer tell which
   lens said what? (`render_status.rs` already attributes the engine — `REVIEW · Harper`.)
 - Config namespace and persistence; interaction with the density presets (E1).
+
+### E9 — Diagnostics lens: per-buffer vs global scope
+<!-- item: E9 -->
+
+Diagnostics lens: per-buffer vs global scope
+
+*(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*

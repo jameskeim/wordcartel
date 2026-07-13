@@ -113,9 +113,18 @@ pub struct View {
     pub scroll_row: usize, // visual rows to skip within the first visible logical line
     pub area: (u16, u16), // (width, height) cells of the editing area
     pub mode: RenderMode,
+    /// S6 — per-buffer ventilate lens (sentence-per-line + rhythm gutter). Default off; a lens is
+    /// into THIS writing, so it does not follow other buffers (§F5). Keyed into `LayoutKey`.
+    pub ventilate: bool,
     /// Per-visible-logical-line layout cache (Task 3).
     /// Key = logical line index; value = (visual rows, source↔visual ColMap).
     pub line_layouts: BTreeMap<usize, (Vec<VisualRow>, ColMap)>,
+    /// S6 — per ventilated-PARAGRAPH metadata, keyed by the window's FIRST logical line (the same
+    /// key its `line_layouts` entry uses). Empty when `ventilate` is off. The shared resolver
+    /// (`ventilate::resolve`) reads this to map any interior line to its window anchor (line-index
+    /// LOOKUP) and to supply the `ps` (`paragraph_range_at` start) byte ORIGIN. Verbatim blocks get
+    /// NO entry.
+    pub vent_blocks: BTreeMap<usize, crate::ventilate::VentBlock>,
 }
 
 /// 9a: a persistent marked block — a half-open `[start, end)` byte range that
@@ -206,7 +215,9 @@ impl Buffer {
             scroll_row: 0,
             area,
             mode: RenderMode::LivePreview,
+            ventilate: false,
             line_layouts: BTreeMap::new(),
+            vent_blocks: BTreeMap::new(),
         };
         Buffer {
             id,
@@ -331,6 +342,7 @@ impl Buffer {
     /// line_layouts clear through this (Resize, reload/recovery).
     pub fn invalidate_layout(&mut self) {
         self.view.line_layouts.clear();
+        self.view.vent_blocks.clear();
         self.layout_key = None;
     }
 }

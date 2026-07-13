@@ -528,9 +528,14 @@ fn gather_row_ctx(editor: &Editor) -> RowCtx<'_> {
         Some(s) => {
             let buf = &editor.active().document.buffer;
             let lo = derive::line_start(buf, scroll);
-            // Conservative upper bound: the last logical line in the layout cache.
+            // Conservative upper bound: the END of the last cached entry's coverage. Under ventilate
+            // the last key is a block anchor, so bound by that block's last line + 1 (resolver),
+            // never a raw line_start of the anchor (which would clip matches inside the block). Off,
+            // resolve on a per-line key returns last_line == max_visible, so `hi` is unchanged.
             let max_visible = sorted_lines.last().copied().unwrap_or(scroll);
-            let hi = derive::line_start(buf, max_visible + 1);
+            let end_line = crate::ventilate::resolve(&editor.active().view, buf, max_visible)
+                .map(|r| r.last_line).unwrap_or(max_visible);
+            let hi = derive::line_start(buf, end_line + 1);
             // partition_point keeps the sorted invariant; matches are sorted by start,
             // and non-overlapping so end is also non-decreasing.
             let lo_idx = s.matches().partition_point(|m| m.end <= lo);
@@ -649,11 +654,12 @@ fn row_spans_segs(editor: &Editor, ctx: &RowCtx, vr: &VisualRow, map: &ColMap,
 fn row_spans_placed(editor: &Editor, ctx: &RowCtx, l: usize, row_index: usize,
                     vr: &VisualRow, map: &ColMap, row_dim: bool) -> Vec<Span<'static>> {
     let buf = &editor.active().document.buffer;
-    let line_off = derive::line_start(buf, l);
+    // ORIGIN from the window resolver: `ps` for a ventilated anchor key, else the logical line start.
+    let line_off = crate::ventilate::origin_of(&editor.active().view, buf, l);
     let mut spans: Vec<Span<'static>> = Vec::new();
 
-    // Compute the visible byte span for this visual row so we can window the
-    // diagnostics. src_span is relative to the logical line start.
+    // Compute the visible byte span for this visual row so we can window the diagnostics.
+    // src_span is relative to the entry ORIGIN (`ps` under ventilate, else the logical line start).
     let lo = line_off + vr.src_span.start;
     let hi = line_off + vr.src_span.end;
 
@@ -756,9 +762,10 @@ fn paint_rows(frame: &mut Frame, editor: &Editor, area: Rect,
             // Determine whether this visual row is dim (outside the active region).
             let row_dim = if let Some((from, to)) = ctx.focus_region {
                 let buf = &editor.active().document.buffer;
-                let line_off = derive::line_start(buf, l);
-                let g_from = line_off + vr.src_span.start;
-                let g_to = line_off + vr.src_span.end;
+                // ORIGIN from the window resolver: `ps` for a ventilated anchor key, else line_start.
+                let origin = crate::ventilate::origin_of(&editor.active().view, buf, l);
+                let g_from = origin + vr.src_span.start;
+                let g_to = origin + vr.src_span.end;
                 !row_is_active(g_from, g_to, from, to)
             } else { false };
 
@@ -772,6 +779,18 @@ fn paint_rows(frame: &mut Frame, editor: &Editor, area: Rect,
             } else {
                 row_spans_placed(editor, &ctx, l, row_index, vr, map, row_dim)
             };
+
+            // Ventilated PROSE rows carry a VentBlock gutter (count/│); OVERWRITE the reserved
+            // 6-space lead-in that push_prefix_lead_in emitted for the glyphless prose row. Verbatim
+            // rows have NO vent_blocks entry: their reserved lead-in already reads as a blank gutter
+            // (§5.4), so nothing to do; glyph-carrying verbatim rows kept reserve 0 (Task 5) and are
+            // untouched. gutter_span returns exactly GUTTER_COLS columns, so width is preserved.
+            if let Some(cell) = editor.active().view.vent_blocks.get(&l)
+                .and_then(|vb| vb.gutter.get(row_index).copied())
+            {
+                let gutter = crate::ventilate::gutter_span(Some(cell), editor);
+                if spans.is_empty() { spans = gutter; } else { spans.splice(0..1, gutter); }
+            }
 
             // 5g: fold marker on the heading's first visual row.
             if let Some(n) = fold_marker_n {
@@ -2031,6 +2050,33 @@ mod tests {
         let (vrow, vcol) = map.source_to_visual(10);
         assert_eq!((vrow, vcol), (1, 4));
         assert_eq!(map.visual_to_source(1, 4), 10);
+    }
+
+    #[test]
+    fn ventilated_block_stays_painted_when_scrolled_into_its_interior() {
+        // Bug 1 (scroll blanks the paragraph), end-to-end through the real paint loop. A four-
+        // sentence paragraph (anchored at logical line 0, four visual rows) is TALLER than the
+        // 2-row edit area. With the caret on its last line, ensure_visible scrolls partway INTO the
+        // block. The block's rows live only at the anchor key, so a scroll/row-count consumer that
+        // mishandled the interior lines (over-advancing scroll past the anchor, or landing scroll on
+        // an interior line paint skips) blanked the paragraph. Assert the caret's own sentence
+        // ("Four") is actually on screen after the scroll.
+        let text = "One one one.\nTwo two two.\nThree three.\nFour four.\n";
+        let mut e = Editor::new_from_text(text, None, (40, 3)); // edit height 2 < the block's 4 rows
+        e.active_mut().view.ventilate = true;
+        derive::rebuild(&mut e);
+        let head = e.active().document.buffer.line_to_byte(3); // "Four four." — last, interior line
+        set_caret(&mut e, head);
+        crate::nav::ensure_visible(&mut e);
+        derive::rebuild(&mut e);
+        let buf = render_to_buffer(&mut e, 40, 3);
+        let painted: String = (0..2u16).map(|r| row_string(&buf, r)).collect::<Vec<_>>().join(" | ");
+        assert!(
+            painted.contains("Four"),
+            "the caret's sentence must be painted after scrolling into the block, got rows: {painted:?} \
+             (scroll={}, scroll_row={})",
+            e.active().view.scroll, e.active().view.scroll_row,
+        );
     }
 
     /// Golden: fold marker `▸` glyph has DarkGray fg under terminal-plain.

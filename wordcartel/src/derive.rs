@@ -18,6 +18,7 @@ pub struct LayoutKey {
     pub text_width: usize,          // vp_width (subsumes wrap/gutter geometry)
     pub active_line: usize,
     pub mode: crate::editor::RenderMode, // view.mode — drives per-line LineRender
+    pub ventilate: bool,                 // S6 — view.ventilate; sentence-per-line layout path
     pub heading_level_glyph: bool,
 }
 
@@ -200,7 +201,7 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
     // ------------------------------------------------------------------
     // Snapshot all read-only scalar values from the active buffer before any
     // mutable borrow, so the borrow checker sees no overlap.
-    let (total_lines, active_line, area_height, first_line, b_mode, scroll_row) = {
+    let (total_lines, active_line, area_height, first_line, b_mode, b_ventilate, scroll_row) = {
         let b = editor.active();
         let buf = &b.document.buffer;
         let total_lines = total_logical_lines(buf);
@@ -218,9 +219,22 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
         let raw_scroll = b.view.scroll.min(total_lines.saturating_sub(1));
         let first_line = fold_view.normalize_line(raw_scroll);
         let b_mode = b.view.mode;
+        let b_ventilate = b.view.ventilate;
         let scroll_row = b.view.scroll_row;
-        (total_lines, active_line, area_height, first_line, b_mode, scroll_row)
+        (total_lines, active_line, area_height, first_line, b_mode, b_ventilate, scroll_row)
     };
+    // Ventilate backstop: scroll is the top of a BLOCK, never an interior line of a ventilated
+    // paragraph (whose rows live only at the anchor key — an interior scroll blanks the block in
+    // paint). Re-anchor the fold-normalized scroll to the containing paragraph's first line
+    // (cache-free, from the block tree) so EXTERNAL setters — mouse-scrollbar jump, session restore
+    // — agree with the nav paths; when this moves scroll off an interior line, `scroll_row` was
+    // relative to that line, so reset it to the block top. No-op when the lens is off (identity).
+    let fold_line = first_line;
+    let first_line = crate::ventilate::scroll_anchor_line(editor, fold_line);
+    let scroll_row = if first_line == fold_line { scroll_row } else { 0 };
+    if first_line != fold_line {
+        editor.active_mut().view.scroll_row = 0;
+    }
     // Persist the normalized scroll so consumers agree.
     editor.active_mut().view.scroll = first_line;
 
@@ -238,11 +252,24 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
         text_width: vp_width,
         active_line,
         mode: b_mode,
+        ventilate: b_ventilate,
         heading_level_glyph: editor.theme.heading_level_glyph,
     };
     if editor.active().layout_key.as_ref() == Some(&key) {
         return; // line_layouts already valid for this key — skip the pass
     }
+
+    // S6 — the ventilate lens layout path. A THIN delegation into ventilate.rs (the window-scoped
+    // fill lives there; this hub stays a dispatcher). It populates line_layouts + vent_blocks.
+    if editor.active().view.ventilate {
+        crate::ventilate::fill_visible(editor);
+        editor.active_mut().layout_key = Some(key);
+        return;
+    }
+    // IMPORTANT 2 — the non-ventilate path only clears line_layouts (below); it must ALSO clear
+    // vent_blocks, or stale resolver metadata survives a toggle-off (runs on the gate miss the
+    // ventilate flip causes).
+    editor.active_mut().view.vent_blocks.clear();
 
     #[cfg(test)]
     let bench_lf_t0 = std::time::Instant::now();
@@ -264,7 +291,7 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
             (text, role)
         };
         let render = line_render_for(b_mode, l == active_line);
-        let (rows, map) = layout::layout(&text, role, render, vp_width, editor.theme.heading_level_glyph);
+        let (rows, map) = layout::layout(&text, role, render, vp_width, editor.theme.heading_level_glyph, 0);
         visual_rows_accumulated += rows.len();
         editor.active_mut().view.line_layouts.insert(l, (rows, map));
         // 5g: jump past any folded body that follows this line.
@@ -744,6 +771,22 @@ mod tests {
                 e.theme.heading_level_glyph = !e.theme.heading_level_glyph;
             }
         );
+    }
+
+    #[test]
+    fn ventilate_flag_reruns_layout() {
+        // Flipping view.ventilate must change LayoutKey → the gate misses → the fill re-runs.
+        let mut e = Editor::new_from_text("Hello there. Bye now.\n", None, (80, 24));
+        LAYOUT_RUNS.with(|c| c.set(0));
+        rebuild(&mut e);
+        let before = LAYOUT_RUNS.with(|c| c.get());
+        e.active_mut().view.ventilate = true;
+        rebuild(&mut e);
+        let after = LAYOUT_RUNS.with(|c| c.get());
+        assert!(after > before, "toggling ventilate must re-run the layout loop");
+        // Default is off.
+        let e2 = Editor::new_from_text("x\n", None, (80, 24));
+        assert!(!e2.active().view.ventilate, "ventilate defaults OFF");
     }
 
     /// A single non-scrolling mid-screen insert must produce exactly ONE layout

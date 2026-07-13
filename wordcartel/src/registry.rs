@@ -553,6 +553,11 @@ impl Registry {
         r.register_stateful("toggle_measure", "Toggle Centered Measure", Some(MenuCategory::View),
             |e| MenuMark::OnOff(e.view_opts.measure),
             |c| { c.editor.view_opts.measure = !c.editor.view_opts.measure; crate::derive::rebuild(c.editor); CommandResult::Handled });
+        // Ventilate lens (S6) — per-buffer, so the state fn reads the ACTIVE buffer's view (unlike
+        // the view_opts-global toggles above). set_ventilate is the ONE shared setter (Law 6).
+        r.register_stateful("toggle_ventilate", "Toggle Ventilate View", Some(MenuCategory::View),
+            |e| MenuMark::OnOff(e.active().view.ventilate),
+            |c| { crate::ventilate::set_ventilate(c.editor, !c.editor.active().view.ventilate); CommandResult::Handled });
         r.register_stateful("toggle_wrap_guide", "Toggle Wrap Guide", Some(MenuCategory::View),
             |e| MenuMark::OnOff(e.view_opts.wrap_guide),
             |c| { c.editor.view_opts.wrap_guide = !c.editor.view_opts.wrap_guide; CommandResult::Handled });
@@ -2028,5 +2033,25 @@ mod tests {
         dispatch_id(&mut ed, "recheck_diagnostics");
         assert!(ed.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper)
             .unwrap().recheck_due_at.is_some(), "arms a recheck in Review");
+    }
+
+    /// S6 Task 7: `toggle_ventilate` is the stateful View-menu representative for the per-buffer
+    /// `view.ventilate` lens (command-surface Law 2/6/8) — the state fn reads the ACTIVE buffer,
+    /// and dispatch routes through the shared `ventilate::set_ventilate` setter.
+    #[test]
+    fn toggle_ventilate_is_stateful_onoff_and_flips_the_flag() {
+        let reg = Registry::builtins();
+        let mut ed = crate::editor::Editor::new_from_text("Hi there. Bye.\n", None, (40, 8));
+        let m = reg.meta(CommandId("toggle_ventilate")).unwrap();
+        assert_eq!(m.menu, Some(MenuCategory::View), "toggle_ventilate is a View row");
+        let f = m.state.expect("toggle_ventilate is stateful");
+        assert!(matches!(f(&ed), MenuMark::OnOff(false)), "defaults off");
+        // Dispatch flips it on and rebuilds.
+        let ex = InlineExecutor::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = Ctx { editor: &mut ed, clock: &Z, executor: &ex, msg_tx: tx };
+        assert_eq!(reg.dispatch(CommandId("toggle_ventilate"), &mut ctx), CommandResult::Handled);
+        assert!(ed.active().view.ventilate, "dispatch turned the lens on");
+        assert!(matches!(f(&ed), MenuMark::OnOff(true)));
     }
 }

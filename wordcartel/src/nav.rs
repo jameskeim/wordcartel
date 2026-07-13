@@ -63,7 +63,7 @@ fn layout_line_on_demand(editor: &Editor, l: usize) -> wordcartel_core::layout::
     let role = editor.active().document.blocks().role_at(derive::line_start(buf, l));
     let render = crate::derive::line_render_for(editor.active().view.mode, l == caret_line(editor));
     let vp_width = text_geometry(editor).text_width as usize;
-    let (_rows, map) = layout::layout(&text, role, render, vp_width, editor.theme.heading_level_glyph);
+    let (_rows, map) = layout::layout(&text, role, render, vp_width, editor.theme.heading_level_glyph, 0);
     map
 }
 
@@ -80,7 +80,6 @@ fn layout_line_on_demand(editor: &Editor, l: usize) -> wordcartel_core::layout::
 /// 5. Screen row = visible visual rows from `(scroll, scroll_row)` to `(L, vrow)`.
 /// 6. Return `None` if screen row >= area height.
 pub fn screen_pos(editor: &Editor) -> Option<(u16, u16)> {
-    let buf = &editor.active().document.buffer;
     let scroll = editor.active().view.scroll;
     let scroll_row = editor.active().view.scroll_row;
     // Editing area excludes the bottom status row (render reserves frame_h - 1) AND
@@ -89,28 +88,24 @@ pub fn screen_pos(editor: &Editor) -> Option<(u16, u16)> {
     let area_height = (editor.active().view.area.1 as usize).saturating_sub(1 + editor.menu_bar_rows() as usize);
     let h = head(editor);
     let l = caret_line(editor);
+    // Compare in ANCHOR space: a caret on an interior line of a ventilated block belongs to the
+    // block anchored above it (the paint/scroll unit). Off the lens the anchor is `l` itself.
+    let caret_anchor = crate::ventilate::scroll_anchor_line(editor, l);
 
-    if l < scroll {
+    if caret_anchor < scroll {
         return None;
     }
 
-    // Get ColMap for the caret line
-    let map_owned;
-    let map: &wordcartel_core::layout::ColMap =
-        if let Some((_, map)) = editor.active().view.line_layouts.get(&l) {
-            map
-        } else {
-            map_owned = layout_line_on_demand(editor, l);
-            &map_owned
-        };
-
-    let line_off = derive::line_start(buf, l);
-    let in_off = h.saturating_sub(line_off);
+    // The caret line's ColMap + byte ORIGIN from the window-aware resolver (as-displayed: the
+    // mode-aware per-line layout when the lens is off / the line is verbatim). Under ventilate the
+    // combined window map yields a BLOCK-relative visual row.
+    let (map, origin) = crate::ventilate::layout_block_as_displayed(editor, l);
+    let in_off = h.saturating_sub(origin);
     // Snap to a valid cursor stop before calling source_to_visual
     let snapped = map.snap_to_stop(in_off);
     let (vrow, vcol) = map.source_to_visual(snapped);
 
-    if l == scroll && vrow < scroll_row {
+    if caret_anchor == scroll && vrow < scroll_row {
         return None;
     }
 
@@ -139,18 +134,18 @@ fn fold_view(editor: &Editor) -> std::rc::Rc<crate::fold::FoldView> {
 /// Helper: lay out line `l` for the ColMap, treating it as the active caret
 /// line (is_active=true). Used during line transitions where the target line
 /// will become the new caret line.
-fn layout_line_active(editor: &Editor, l: usize) -> wordcartel_core::layout::ColMap {
+pub(crate) fn layout_line_active(editor: &Editor, l: usize) -> wordcartel_core::layout::ColMap {
     let buf = &editor.active().document.buffer;
     let text = derive::line_text(buf, l);
     let role = editor.active().document.blocks().role_at(derive::line_start(buf, l));
     let vp_width = text_geometry(editor).text_width as usize;
-    let (_rows, map) = layout::layout(&text, role, wordcartel_core::style::LineRender::RawPlain, vp_width, editor.theme.heading_level_glyph);
+    let (_rows, map) = layout::layout(&text, role, wordcartel_core::style::LineRender::RawPlain, vp_width, editor.theme.heading_level_glyph, 0);
     map
 }
 
 /// Get the ColMap for line `l` from the cache if available, else lay it out
 /// with the appropriate `is_active` flag.
-fn get_or_layout(editor: &Editor, l: usize) -> wordcartel_core::layout::ColMap {
+pub(crate) fn get_or_layout(editor: &Editor, l: usize) -> wordcartel_core::layout::ColMap {
     if let Some((_, map)) = editor.active().view.line_layouts.get(&l) {
         map.clone()
     } else {
@@ -166,8 +161,7 @@ pub fn clamp_snap(editor: &Editor, off: usize) -> usize {
     let off = off.min(len);
     if len == 0 { return 0; }
     let line = buf.byte_to_line(off.min(len.saturating_sub(1)));
-    let ls = derive::line_start(buf, line);
-    let map = get_or_layout(editor, line);
+    let (map, ls) = crate::ventilate::layout_block_as_displayed(editor, line);
     ls + map.snap_to_stop(off.saturating_sub(ls))
 }
 
@@ -181,25 +175,25 @@ pub fn move_right(editor: &mut Editor) -> usize {
     let buf = &editor.active().document.buffer;
     let h = head(editor);
     let l = caret_line(editor);
-    let ls = derive::line_start(buf, l);
-    let in_off = h.saturating_sub(ls);
     let total = derive::total_logical_lines(buf);
 
-    // Get the ColMap for the caret line (from cache, using the already-computed
-    // is_active flag, or on-demand).
-    let map = get_or_layout(editor, l);
+    // The caret line's within-line ColMap + byte ORIGIN as a UNIT from the window-aware resolver
+    // (as-displayed: the mode-aware per-line layout + `line_start(l)` when the lens is off / the line
+    // is verbatim; the combined window map + `ps` origin under ventilate).
+    let (map, ls) = crate::ventilate::layout_block_as_displayed(editor, l);
+    let in_off = h.saturating_sub(ls);
 
     let cur = layout::cursor_at(&map, in_off);
     let nxt = layout::move_right(&map, cur);
 
     let new_offset = if nxt.offset == cur.offset && cur.offset == map.eol && l + 1 < total {
-        // At line end and not the last line → transition to next line.
-        // The target line becomes the new caret line, so lay it out as active.
-        let next_map = layout_line_active(editor, l + 1);
-        let next_ls = derive::line_start(&editor.active().document.buffer, l + 1);
+        // At line end and not the last line → transition to next line. The target becomes the new
+        // caret line, so the transition accessor lays it ACTIVE (RawPlain) when the lens is off /
+        // the line is verbatim, and returns the window map + `ps` origin under ventilate.
+        let (next_map, next_origin) = crate::ventilate::layout_block_on_demand(editor, l + 1);
         // Snap to the first valid cursor stop on the next line.
         let first_stop = layout::cursor_at(&next_map, 0);
-        next_ls + first_stop.offset
+        next_origin + first_stop.offset
     } else {
         ls + nxt.offset
     };
@@ -214,23 +208,21 @@ pub fn move_right(editor: &mut Editor) -> usize {
 ///
 /// At the start of line L (and L > 0), crosses to the end of line L-1.
 pub fn move_left(editor: &mut Editor) -> usize {
-    let buf = &editor.active().document.buffer;
     let h = head(editor);
     let l = caret_line(editor);
-    let ls = derive::line_start(buf, l);
-    let in_off = h.saturating_sub(ls);
 
-    let map = get_or_layout(editor, l);
+    // Caret-line within-line ColMap + origin as a unit from the resolver (see `move_right`).
+    let (map, ls) = crate::ventilate::layout_block_as_displayed(editor, l);
+    let in_off = h.saturating_sub(ls);
 
     let cur = layout::cursor_at(&map, in_off);
     let nxt = layout::move_left(&map, cur);
 
     let new_offset = if nxt.offset == cur.offset && in_off == 0 && l > 0 {
-        // At line start and not the first line → transition to end of line L-1.
-        let prev_map = layout_line_active(editor, l - 1);
-        let prev_ls = derive::line_start(&editor.active().document.buffer, l - 1);
+        // At line start and not the first line → transition to end of line L-1 (active target).
+        let (prev_map, prev_origin) = crate::ventilate::layout_block_on_demand(editor, l - 1);
         let eol_cur = layout::cursor_at(&prev_map, prev_map.eol);
-        prev_ls + eol_cur.offset
+        prev_origin + eol_cur.offset
     } else {
         ls + nxt.offset
     };
@@ -243,13 +235,12 @@ pub fn move_left(editor: &mut Editor) -> usize {
 ///
 /// Returns the new global byte offset. Sets `editor.desired_col = None`.
 pub fn move_home(editor: &mut Editor) -> usize {
-    let buf = &editor.active().document.buffer;
     let h = head(editor);
     let l = caret_line(editor);
-    let ls = derive::line_start(buf, l);
-    let in_off = h.saturating_sub(ls);
 
-    let map = get_or_layout(editor, l);
+    // Caret-line within-line ColMap + origin as a unit from the resolver (see `move_right`).
+    let (map, ls) = crate::ventilate::layout_block_as_displayed(editor, l);
+    let in_off = h.saturating_sub(ls);
     let cur = layout::cursor_at(&map, in_off);
     let result = layout::move_home(&map, cur);
 
@@ -261,13 +252,12 @@ pub fn move_home(editor: &mut Editor) -> usize {
 ///
 /// Returns the new global byte offset. Sets `editor.desired_col = None`.
 pub fn move_end(editor: &mut Editor) -> usize {
-    let buf = &editor.active().document.buffer;
     let h = head(editor);
     let l = caret_line(editor);
-    let ls = derive::line_start(buf, l);
-    let in_off = h.saturating_sub(ls);
 
-    let map = get_or_layout(editor, l);
+    // Caret-line within-line ColMap + origin as a unit from the resolver (see `move_right`).
+    let (map, ls) = crate::ventilate::layout_block_as_displayed(editor, l);
+    let in_off = h.saturating_sub(ls);
     let cur = layout::cursor_at(&map, in_off);
     let result = layout::move_end(&map, cur);
 
@@ -294,11 +284,11 @@ pub fn move_down(editor: &mut Editor) -> usize {
     let buf = &editor.active().document.buffer;
     let h = head(editor);
     let l = caret_line(editor);
-    let ls = derive::line_start(buf, l);
-    let in_off = h.saturating_sub(ls);
     let total = derive::total_logical_lines(buf);
 
-    let map = get_or_layout(editor, l);
+    // Caret-line within-line ColMap + origin as a unit from the resolver (see `move_right`).
+    let (map, ls) = crate::ventilate::layout_block_as_displayed(editor, l);
+    let in_off = h.saturating_sub(ls);
     let cur0 = layout::cursor_at(&map, in_off);
 
     // Anchor desired_col on the first vertical move.
@@ -326,10 +316,9 @@ pub fn move_down(editor: &mut Editor) -> usize {
                     None => h, // already on the last visible line — no-op
                     Some(nl) => {
                         debug_assert!(!fold_view(editor).is_hidden(nl));
-                        let next_map = layout_line_active(editor, nl);
-                        let next_ls = derive::line_start(&editor.active().document.buffer, nl);
+                        let (next_map, next_origin) = crate::ventilate::layout_block_on_demand(editor, nl);
                         let c = layout::enter_from_top(&next_map, desired);
-                        next_ls + c.offset
+                        next_origin + c.offset
                     }
                 }
             }
@@ -345,13 +334,12 @@ pub fn move_down(editor: &mut Editor) -> usize {
 ///
 /// Returns the new global byte offset. Preserves `editor.desired_col`.
 pub fn move_up(editor: &mut Editor) -> usize {
-    let buf = &editor.active().document.buffer;
     let h = head(editor);
     let l = caret_line(editor);
-    let ls = derive::line_start(buf, l);
-    let in_off = h.saturating_sub(ls);
 
-    let map = get_or_layout(editor, l);
+    // Caret-line within-line ColMap + origin as a unit from the resolver (see `move_right`).
+    let (map, ls) = crate::ventilate::layout_block_as_displayed(editor, l);
+    let in_off = h.saturating_sub(ls);
     let cur0 = layout::cursor_at(&map, in_off);
 
     // Anchor desired_col on the first vertical move.
@@ -379,10 +367,9 @@ pub fn move_up(editor: &mut Editor) -> usize {
                 None => h,
                 Some(pl) => {
                     debug_assert!(!fold_view(editor).is_hidden(pl));
-                    let prev_map = layout_line_active(editor, pl);
-                    let prev_ls = derive::line_start(&editor.active().document.buffer, pl);
+                    let (prev_map, prev_origin) = crate::ventilate::layout_block_on_demand(editor, pl);
                     let c = layout::enter_from_bottom(&prev_map, desired);
-                    prev_ls + c.offset
+                    prev_origin + c.offset
                 }
             }
         }
@@ -407,9 +394,11 @@ pub fn ensure_visible(editor: &mut Editor) {
         let l = caret_line(editor);
         let cvr = caret_visual_row(editor, l);
         let text_width = text_geometry(editor).text_width as usize;
-        // caret absolute visual row: sum rows of VISIBLE lines before `l` only.
+        // caret absolute visual row: `cvr` is BLOCK-relative under ventilate, so start the prev-walk
+        // from the caret's block ANCHOR (not an interior line) — summing rows of the block's own
+        // interior lines on top of `cvr` would double-count. Off the lens the anchor is `l`.
         let mut caret_abs = cvr;
-        let mut cursor = l;
+        let mut cursor = crate::ventilate::scroll_anchor_line(editor, l);
         while let Some(p) = fv.prev_visible(cursor) {
             caret_abs += typewriter_rows_of_line(editor, p, text_width);
             cursor = p;
@@ -420,6 +409,10 @@ pub fn ensure_visible(editor: &mut Editor) {
         let mut vline = Some(0usize);
         while let Some(li) = vline {
             let rows = rows_of_line(editor, li);
+            // Interior line of a ventilated block (0 rows) — subsumed by its anchor; never a scroll
+            // target. Skip it so `scroll` only ever lands on a block anchor. Inert when the lens is
+            // off (every line then has >= 1 row).
+            if rows == 0 { vline = fv.next_visible(li); continue; }
             if acc + rows > target_top { scroll = li; scroll_row = target_top - acc; break; }
             acc += rows; scroll = li; scroll_row = rows.saturating_sub(1);
             vline = fv.next_visible(li);
@@ -444,23 +437,27 @@ pub fn ensure_visible(editor: &mut Editor) {
         editor.active_mut().view.scroll_row = scroll_rows.saturating_sub(1);
     }
 
-    // 5g: normalize current scroll so it is always a visible line.
+    // 5g: normalize current scroll so it is always a visible line — AND, under ventilate, a block
+    // ANCHOR (never an interior line, which paint would skip). Off the lens the second step is the
+    // identity, so this stays the plain fold-normalize.
     {
-        let fv = fold_view(editor);
         let s = editor.active().view.scroll;
-        let ns = fv.normalize_line(s);
+        let ns = crate::ventilate::scroll_anchor_line(editor, fold_view(editor).normalize_line(s));
         if ns != s {
             editor.active_mut().view.scroll = ns;
             editor.active_mut().view.scroll_row = 0;
         }
     }
 
+    // The caret's scroll unit: its block anchor under ventilate (never an interior line), else `l`.
+    let caret_anchor = crate::ventilate::scroll_anchor_line(editor, l);
     let cvr = caret_visual_row(editor, l);
 
-    // If caret is above the scroll, scroll up to caret line
-    if l < editor.active().view.scroll || (l == editor.active().view.scroll && cvr < editor.active().view.scroll_row) {
-        let fv = fold_view(editor);
-        editor.active_mut().view.scroll = fv.normalize_line(l);
+    // If the caret's block is above the scroll, scroll up to it (parking scroll on the anchor).
+    if caret_anchor < editor.active().view.scroll
+        || (caret_anchor == editor.active().view.scroll && cvr < editor.active().view.scroll_row)
+    {
+        editor.active_mut().view.scroll = caret_anchor;
         editor.active_mut().view.scroll_row = cvr;
         return;
     }
@@ -470,8 +467,7 @@ pub fn ensure_visible(editor: &mut Editor) {
     }
 
     let Some(mut rows_before) = rows_before_caret(editor, l, cvr) else {
-        let fv = fold_view(editor);
-        editor.active_mut().view.scroll = fv.normalize_line(l);
+        editor.active_mut().view.scroll = caret_anchor;
         editor.active_mut().view.scroll_row = cvr;
         return;
     };
@@ -482,11 +478,19 @@ pub fn ensure_visible(editor: &mut Editor) {
     }
 }
 
+/// Visual-row count for logical line `line_idx`, treating a ventilated block as ONE unit: the
+/// block's rows are counted ONCE at its anchor; an interior logical line contributes 0 (its rows
+/// already live in the anchor's combined entry). Off the lens `resolve` returns per-line entries
+/// (first_line == line_idx), so this is byte-for-byte the old `line_layouts.get(&line_idx)` path.
 fn rows_of_line(editor: &Editor, line_idx: usize) -> usize {
-    if let Some((_, map)) = editor.active().view.line_layouts.get(&line_idx) {
-        map.rows.max(1)
-    } else {
-        layout_line_on_demand(editor, line_idx).rows.max(1)
+    let buf = &editor.active().document.buffer;
+    match crate::ventilate::resolve(&editor.active().view, buf, line_idx) {
+        // Interior line of a cached ventilated block — its rows are counted at the anchor.
+        Some(r) if r.first_line != line_idx => 0,
+        // Anchor of a ventilated block, or an ordinary per-line entry.
+        Some(r) => r.map.rows.max(1),
+        // Not cached (off-screen) — lay it out on demand as a single per-line entry.
+        None => layout_line_on_demand(editor, line_idx).rows.max(1),
     }
 }
 
@@ -497,6 +501,22 @@ fn rows_of_line(editor: &Editor, line_idx: usize) -> usize {
 /// Soundness: display_width ≤ byte_len for all UTF-8 text, so if byte_len ≤
 /// text_width then display_width ≤ text_width and no wrapping is possible.
 fn typewriter_rows_of_line(editor: &Editor, li: usize, text_width: usize) -> usize {
+    // Ventilate: a block counts as one unit. An interior line of a cached ventilated block
+    // contributes 0; its anchor's exact block-row count is not a per-line property, so read it
+    // from the cache rather than the byte-length heuristic (which would undercount a multi-sentence
+    // block to 1). Off the lens `resolve` returns a per-line entry (first_line == li) with no
+    // `vent_blocks` key, so control falls through to the unchanged heuristic below.
+    {
+        let buf = &editor.active().document.buffer;
+        if let Some(r) = crate::ventilate::resolve(&editor.active().view, buf, li) {
+            if r.first_line != li {
+                return 0;
+            }
+            if editor.active().view.vent_blocks.contains_key(&li) {
+                return r.map.rows.max(1);
+            }
+        }
+    }
     let buf = &editor.active().document.buffer;
     let total_lines = derive::total_logical_lines(buf);
     let start = derive::line_start(buf, li);
@@ -521,10 +541,8 @@ fn typewriter_rows_of_line(editor: &Editor, li: usize, text_width: usize) -> usi
 }
 
 fn caret_visual_row(editor: &Editor, line_idx: usize) -> usize {
-    let buf = &editor.active().document.buffer;
-    let map = get_or_layout(editor, line_idx);
-    let line_off = derive::line_start(buf, line_idx);
-    let in_off = head(editor).saturating_sub(line_off);
+    let (map, origin) = crate::ventilate::layout_block_as_displayed(editor, line_idx);
+    let in_off = head(editor).saturating_sub(origin);
     let snapped = map.snap_to_stop(in_off);
     map.source_to_visual(snapped).0
 }
@@ -532,11 +550,17 @@ fn caret_visual_row(editor: &Editor, line_idx: usize) -> usize {
 fn rows_before_caret(editor: &Editor, caret_line: usize, caret_vrow: usize) -> Option<usize> {
     let scroll = editor.active().view.scroll;
     let scroll_row = editor.active().view.scroll_row;
+    // Under ventilate the caret may sit on an INTERIOR line of a block, but the block is a single
+    // row-count unit keyed at its anchor — and `caret_vrow` is already block-relative (it comes from
+    // the combined window map). So walk in ANCHOR space: the caret's block anchor is the row-count
+    // line, never an interior line (which would double-count the whole block PLUS the block-relative
+    // row). Off the lens the anchor is the line itself, so this is a no-op.
+    let caret_anchor = crate::ventilate::scroll_anchor_line(editor, caret_line);
 
-    if caret_line < scroll {
+    if caret_anchor < scroll {
         return None;
     }
-    if caret_line == scroll {
+    if caret_anchor == scroll {
         return caret_vrow.checked_sub(scroll_row);
     }
 
@@ -544,20 +568,36 @@ fn rows_before_caret(editor: &Editor, caret_line: usize, caret_vrow: usize) -> O
     let mut rows_before = rows_of_line(editor, scroll).saturating_sub(scroll_row);
     let mut li = fv.next_visible(scroll);
     while let Some(line_idx) = li {
-        if line_idx >= caret_line { break; }
-        rows_before += rows_of_line(editor, line_idx);
+        if line_idx >= caret_anchor { break; }
+        rows_before += rows_of_line(editor, line_idx); // interior lines contribute 0
         li = fv.next_visible(line_idx);
     }
     Some(rows_before + caret_vrow)
+}
+
+/// The next scroll-top line AFTER the block currently at `scroll`, treating a ventilated block as
+/// one unit: advance past the block's LAST line, not into an interior line (which carries no
+/// `line_layouts` key and would blank the block in paint). Off the lens `resolve(scroll)` is a
+/// per-line entry (last_line == scroll), so this is the old `next_visible(scroll)`.
+fn next_scroll_line(editor: &Editor, scroll: usize) -> Option<usize> {
+    let last = {
+        let buf = &editor.active().document.buffer;
+        crate::ventilate::resolve(&editor.active().view, buf, scroll)
+            .map(|r| r.last_line)
+            .unwrap_or(scroll)
+    };
+    fold_view(editor).next_visible(last)
 }
 
 fn advance_view_top_one_row(editor: &mut Editor, max_scroll: usize) {
     let rows = rows_of_line(editor, editor.active().view.scroll);
     editor.active_mut().view.scroll_row += 1;
     if editor.active().view.scroll_row >= rows {
-        let fv = fold_view(editor);
-        match fv.next_visible(editor.active().view.scroll) {
-            Some(nl) if editor.active().view.scroll < max_scroll => {
+        let scroll = editor.active().view.scroll;
+        // Jump to the line after the whole block (its next fold-visible line), which is itself the
+        // next block's anchor — never an interior line of the block we are leaving.
+        match next_scroll_line(editor, scroll) {
+            Some(nl) if scroll < max_scroll => {
                 editor.active_mut().view.scroll = nl;
                 editor.active_mut().view.scroll_row = 0;
             }
@@ -582,11 +622,15 @@ pub fn scroll_up_one(editor: &mut Editor) {
     if scroll_row > 0 {
         editor.active_mut().view.scroll_row = scroll_row - 1;
     } else if scroll > 0 {
-        let fv = fold_view(editor);
-        if let Some(prev) = fv.prev_visible(scroll) {
-            let rows = rows_of_line(editor, prev);
+        let prev = fold_view(editor).prev_visible(scroll);
+        if let Some(prev) = prev {
+            // The line above `scroll` may be an INTERIOR line of the previous ventilated block;
+            // land on that block's ANCHOR (its single scroll unit), never an interior line. Off the
+            // lens the anchor is `prev` itself.
+            let prev_anchor = crate::ventilate::scroll_anchor_line(editor, prev);
+            let rows = rows_of_line(editor, prev_anchor);
             let v = &mut editor.active_mut().view;
-            v.scroll = prev;
+            v.scroll = prev_anchor;
             v.scroll_row = rows.saturating_sub(1);
         }
     }
@@ -980,10 +1024,10 @@ pub fn offset_at_cell(editor: &Editor, col: u16, row: u16) -> Option<usize> {
         let first_vrow = if l == scroll { scroll_row } else { 0 };
         for vrow in first_vrow..rows {
             if acc == target {
-                let map = get_or_layout(editor, l);
+                let (map, origin) = crate::ventilate::layout_block_as_displayed(editor, l);
                 let in_off = map.visual_to_source(vrow, col as usize);
                 let snapped = map.snap_to_stop(in_off);
-                return Some(derive::line_start(&editor.active().document.buffer, l) + snapped);
+                return Some(origin + snapped);
             }
             acc += 1;
         }
@@ -1694,5 +1738,117 @@ mod tests {
         let line = e.active().document.buffer.byte_to_line(off); // the local idiom (nav.rs:1369) —
                                         // Codex-verified; editor_line_of/line_of_offset do NOT exist.
         assert_eq!(line, 7, "PageDown from line 0 with the bar visible steps 7 (8-row viewport, 1 overlap)");
+    }
+
+    // ------------------------------------------------------------------
+    // S6 Task 4: resolver-origin migration is a no-op when the lens is OFF
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn resolver_origin_matches_line_start_when_ventilate_off() {
+        // With ventilate OFF, origin_of MUST equal line_start for every cached line — the migration
+        // is a no-op on the existing path.
+        let mut e = Editor::new_from_text("alpha\nbeta\ngamma\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        let buf = e.active().document.buffer.clone();
+        for l in 0..3usize {
+            let got = crate::ventilate::origin_of(&e.active().view, &buf, l);
+            assert_eq!(got, buf.line_to_byte(l), "ventilate off → origin is line_start for line {l}");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // S6 pre-merge: the row-count / scroll consumer family is ventilate-aware
+    // (a ventilated block is ONE scroll / row-count / paint unit at its anchor).
+    // ------------------------------------------------------------------
+
+    /// A multi-LOGICAL-LINE ventilated paragraph: four physical lines, each a full sentence, so it
+    /// segments into four one-row sentence groups anchored at line 0 (last_line 3), followed by a
+    /// blank line and a tail paragraph. Shared by the interior-line / scroll-unit tests below.
+    fn ventilated_block_editor(area: (u16, u16)) -> Editor {
+        let text = "One one one.\nTwo two two.\nThree three.\nFour four.\n\ntail line.\n";
+        let mut e = Editor::new_from_text(text, None, area);
+        e.active_mut().view.ventilate = true;
+        derive::rebuild(&mut e);
+        // Fixture sanity: the block is anchored at 0, covers logical lines 0..=3, four row-groups.
+        let vb = e.active().view.vent_blocks.get(&0).expect("paragraph anchored at line 0");
+        assert_eq!(vb.last_line, 3, "block spans four logical lines");
+        assert_eq!(vb.gutter.len(), 4, "one visual row per sentence (four row-groups)");
+        e
+    }
+
+    #[test]
+    fn screen_pos_interior_line_of_ventilated_block_is_not_overcounted() {
+        // Bug 2 (interior-line row double-count). The caret sits on line 2 ("Three three."), an
+        // INTERIOR line of the block anchored at line 0. Its visual row is the 3rd row-group → row 2
+        // with the block parked at the top (scroll 0). The pre-fix `rows_before_caret` summed the
+        // WHOLE block's rows at the anchor PLUS the interior line's own on-demand rows PLUS the
+        // block-relative caret row, reporting row 7. The fix walks in anchor space → row 2.
+        let mut e = ventilated_block_editor((40, 24));
+        let head = e.active().document.buffer.line_to_byte(2);
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(head);
+        let (_col, row) = screen_pos(&e).expect("caret on the interior line is visible");
+        assert_eq!(row, 2, "interior-line caret sits on its block-relative visual row, not over-counted");
+    }
+
+    #[test]
+    fn scroll_down_advances_through_a_tall_ventilated_block_without_stalling() {
+        // Bug 1 (scroll blanks the paragraph). Scrolling DOWN one visual row at a time through a
+        // block taller than the viewport must (a) keep `view.scroll` on a block ANCHOR — never an
+        // interior line, whose rows live only at the anchor key so paint would skip the block — and
+        // (b) make forward progress OUT of the block. Pre-fix, once scroll_row exhausted the block,
+        // `advance_view_top_one_row` stepped to `next_visible(anchor)` = interior line 1; the
+        // rebuild-time backstop then re-anchored that back to line 0, so the viewport STALLED on the
+        // first block forever (never reaching the tail). This drives the real frame cadence
+        // (scroll → rebuild) and asserts both invariants after each step.
+        let mut e = ventilated_block_editor((40, 3)); // edit height 2 < the block's 4 rows
+        e.active_mut().view.scroll = 0;
+        e.active_mut().view.scroll_row = 0;
+        for step in 0..10 {
+            crate::nav::scroll_down_one(&mut e);
+            derive::rebuild(&mut e); // the frame loop rebuilds after every reduce
+            let scroll = e.active().view.scroll;
+            assert_eq!(
+                crate::ventilate::scroll_anchor_line(&e, scroll), scroll,
+                "step {step}: view.scroll ({scroll}) must be a block anchor, never a ventilated interior line",
+            );
+        }
+        // Progress OUT of the four-line block anchored at 0 (a stall would leave scroll parked there).
+        assert!(e.active().view.scroll >= 5, "scrolled past the block to the tail, got {}", e.active().view.scroll);
+    }
+
+    #[test]
+    fn ensure_visible_keeps_interior_caret_on_screen_in_a_tall_ventilated_block() {
+        // Combined: the caret on the LAST line of a block taller than the viewport must stay visible
+        // after ensure_visible. Pre-fix, `rows_before_caret`'s double-count inflated the row budget,
+        // driving `ensure_visible` to over-advance scroll clean past the caret → screen_pos == None.
+        let mut e = ventilated_block_editor((40, 3)); // edit height 2 < the block's 4 rows
+        let head = e.active().document.buffer.line_to_byte(3); // "Four four." — last, interior line
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(head);
+        ensure_visible(&mut e);
+        derive::rebuild(&mut e);
+        assert!(
+            screen_pos(&e).is_some(),
+            "caret on the block's last line stays visible (scroll={}, scroll_row={})",
+            e.active().view.scroll, e.active().view.scroll_row,
+        );
+        // scroll parks on the block anchor, not an interior line.
+        let scroll = e.active().view.scroll;
+        assert_eq!(crate::ventilate::scroll_anchor_line(&e, scroll), scroll, "scroll is the block anchor");
+    }
+
+    #[test]
+    fn move_right_into_heading_lands_on_marker_when_ventilate_off() {
+        // REGRESSION GUARD (S6 Task 4 blocker): with the lens OFF in the DEFAULT (LivePreview) mode,
+        // crossing from the end of a paragraph line into a concealable heading line must land on the
+        // FIRST RAW byte of the target — the `#` at line_start(1) + 0 = offset 4 — because the target
+        // becomes the caret line and renders ACTIVE (RawPlain). If the transition site used the
+        // as-displayed (inactive/Concealed) accessor, the "## " markers would be skipped and the caret
+        // would land on `H` at offset 7. This test fails in that case.
+        let mut e = Editor::new_from_text("abc\n## Head\n", None, (80, 24));
+        set_caret(&mut e, 3); // end of "abc" (before '\n')
+        derive::rebuild(&mut e);
+        let landed = move_right(&mut e);
+        assert_eq!(landed, 4, "cross-line entry lands on the raw '#' (line_start(1)+0), not on 'H'");
     }
 }

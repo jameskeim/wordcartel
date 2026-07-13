@@ -268,6 +268,31 @@ impl Harness {
         let w = buf.area().width;
         (0..w).filter(|&x| buf[(x, y)].style().add_modifier.contains(Modifier::DIM)).collect()
     }
+
+    /// Drive the REAL search Msg sequence through `step` (Ctrl+F opens, typing `needle` inserts and
+    /// recomputes live — `search_ui::intercept`'s text-insert arm calls `search_sync` after every
+    /// keystroke, so the match set and `current()` are already live once typing finishes; there is
+    /// no separate "commit" keystroke in the Find phase). Mirrors the `ctrl_f_opens_search_and_typing_jumps`
+    /// reduce-level test, but through the FULL harness loop (reduce → advance → render) every other
+    /// e2e journey drives.
+    fn search_for(&mut self, needle: &str) {
+        self.ctrl('f');
+        self.type_str(needle);
+    }
+
+    /// Column indices on visual row `y` carrying the search-match highlight face (`SearchMatch`/
+    /// `SearchCurrent` — a yellow bg at default theme/depth, or the REVERSED modifier a no-color
+    /// theme substitutes). Mirrors `render.rs`'s `row_has_highlight` test helper, but column-precise
+    /// so a highlight's real position (not just "some highlight exists somewhere") can be pinned.
+    fn search_highlight_cols(&self, y: u16) -> Vec<u16> {
+        use ratatui::style::{Color, Modifier};
+        let buf = self.term.backend().buffer();
+        let w = buf.area().width;
+        (0..w).filter(|&x| {
+            let c = &buf[(x, y)];
+            c.style().bg == Some(Color::Yellow) || c.style().add_modifier.contains(Modifier::REVERSED)
+        }).collect()
+    }
 }
 
 #[test]
@@ -1809,6 +1834,232 @@ fn e2e_focus_sentence_spans_wrapped_rows_not_just_a_line() {
          decision in render.rs) can't tell them apart, got row {sentence2_row}");
     assert!(!h.dim_cols(sentence2_row).is_empty(),
         "sentence 2 row must be dimmed while the caret is in sentence 1");
+}
+
+// ===========================================================================
+// S6 Task 6 — the 6-col rhythm gutter render.
+// ===========================================================================
+
+#[test]
+fn e2e_gutter_shows_right_aligned_word_counts() {
+    // Two sentences: 4 words and 2 words. Gutter shows right-aligned counts + a rule.
+    let mut h = Harness::new("Alpha beta gamma delta. Bye now.\n", None, (40, 8));
+    { let mut ed = h.editor.borrow_mut(); ed.active_mut().view.ventilate = true;
+      crate::derive::rebuild(&mut ed); }
+    h.render();
+    // Row 0 carries sentence 1's count (4) right-aligned in 3 cols, then the rule.
+    let r0 = h.row(0);
+    assert!(r0.starts_with("  4 │ "), "row 0 gutter: `  4 │ ` — got {r0:?}");
+    assert!(r0.contains("Alpha beta gamma delta"), "sentence 1 text follows the gutter");
+    // Sentence 2 is on its own row-group with count 2.
+    let s2 = (0..8u16).map(|y| h.row(y)).find(|r| r.contains("Bye now")).expect("sentence 2 visible");
+    assert!(s2.starts_with("  2 │ "), "sentence 2 gutter: `  2 │ ` — got {s2:?}");
+}
+
+#[test]
+fn e2e_gutter_clamps_to_999() {
+    // A 1000-word paragraph clamps the display to 999 (§7/L7).
+    let big = std::iter::repeat_n("word", 1000).collect::<Vec<_>>().join(" ") + ".\n";
+    let mut h = Harness::new(&big, None, (40, 8));
+    { let mut ed = h.editor.borrow_mut(); ed.active_mut().view.ventilate = true;
+      crate::derive::rebuild(&mut ed); }
+    h.render();
+    assert!(h.row(0).starts_with("999 │ "), "≥1000-word sentence clamps to 999 — got {:?}", h.row(0));
+}
+
+#[test]
+fn e2e_gutter_overwrites_lead_in_no_content_shift() {
+    // IMPORTANT 1: the gutter OVERWRITES the reserved lead-in — reserved width == painted width, so
+    // content is NOT shifted right. The sentence text must begin at exactly column GUTTER_COLS (6),
+    // and the same text under a NON-ventilated render must begin at column 0 — the only difference
+    // being the 6-col gutter, never a double-count (which would push text to column 12).
+    let text = "Alpha beta gamma.\n";
+    let mut h = Harness::new(text, None, (40, 8));
+    { let mut ed = h.editor.borrow_mut(); ed.active_mut().view.ventilate = true;
+      crate::derive::rebuild(&mut ed); }
+    h.render();
+    let r0 = h.row(0);
+    // Columns 0..6 are the gutter ("  3 │ "); the sentence text starts at column 6, not 12.
+    // `h.row` concatenates ONE cell-symbol PER VISUAL COLUMN, so the rule glyph `│` (a 3-byte
+    // UTF-8 char) makes byte-offset slicing unsafe (it is not a char boundary at byte 6) — slice
+    // by CHAR (== column, since every cell here is a single-width symbol) instead.
+    let cols: Vec<char> = r0.chars().collect();
+    let gutter: String = cols[..6].iter().collect();
+    assert_eq!(gutter, "  3 │ ", "gutter occupies exactly 6 columns");
+    let rest: String = cols[6..].iter().collect();
+    assert!(rest.starts_with("Alpha"), "content begins at col 6 (no double-count shift) — got {r0:?}");
+}
+
+// ===========================================================================
+// S6 Task 8 — integration/e2e + guardrails (spec §12): SEE==SELECT, idempotence,
+// paint-origin, focus-window identity, and composition, all through the real
+// reduce → advance → render loop.
+// ===========================================================================
+
+#[test]
+fn e2e_see_equals_select_hard_wrapped_sentence() {
+    // A sentence hard-wrapped across two logical lines is ONE row-group; select_sentence with the
+    // caret in it selects exactly that group's byte span.
+    let text = "The committee met on Tuesday and the\nchair insisted on a vote. Then we left.\n";
+    let mut h = Harness::new(text, None, (40, 10));
+    { let mut ed = h.editor.borrow_mut(); ed.active_mut().view.ventilate = true;
+      ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(5);
+      crate::derive::rebuild(&mut ed); }
+    h.render();
+    // The block anchors one VentBlock; sentence 1 is one group (its first row carries the count).
+    { let ed = h.editor.borrow();
+      let vb = ed.active().view.vent_blocks.get(&0).expect("paragraph anchored at 0");
+      assert!(matches!(vb.gutter.first(), Some(crate::ventilate::GutterCell::Count(_)))); }
+    // select_sentence selects the whole hard-wrapped sentence (byte span across the newline).
+    { let mut ed = h.editor.borrow_mut();
+      crate::commands::run(crate::commands::Command::SelectScope(crate::commands::Scope::Sentence), &mut ed, &SharedClock::new(0)); }
+    let ed = h.editor.borrow();
+    let sel = ed.active().document.selection.primary();
+    let picked = ed.active().document.buffer.slice(sel.from()..sel.to());
+    assert!(picked.contains('\n') && picked.contains("committee") && picked.contains("vote"),
+        "select_sentence grabs the whole hard-wrapped sentence the lens shows as one group: {picked:?}");
+}
+
+#[test]
+fn e2e_toggle_off_is_byte_identical_preserves_caret_and_clears_vent_blocks() {
+    let text = "Alpha one. Beta two. Gamma three.\n";
+    let mut h = Harness::new(text, None, (30, 8));
+    let before = { let ed = h.editor.borrow(); ed.active().document.buffer.slice(0..ed.active().document.buffer.len()) };
+    h.alt('v'); // on
+    { let ed = h.editor.borrow(); assert!(!ed.active().view.vent_blocks.is_empty(), "on → vent_blocks populated"); }
+    { let mut ed = h.editor.borrow_mut(); ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(12); }
+    h.alt('v'); // off
+    let ed = h.editor.borrow();
+    let after = ed.active().document.buffer.slice(0..ed.active().document.buffer.len());
+    assert_eq!(before, after, "toggle on→off is byte-identical");
+    assert_eq!(ed.active().document.selection.primary().head, 12, "caret preserved across toggle");
+    // IMPORTANT 2: no stale resolver metadata after toggle-off; per-line geometry restored.
+    assert!(ed.active().view.vent_blocks.is_empty(), "toggle-off clears vent_blocks (no stale metadata)");
+    assert!(ed.active().view.line_layouts.contains_key(&0), "per-line entry for line 0 restored");
+}
+
+#[test]
+fn e2e_focus_dims_right_rows_under_ventilate_indented() {
+    // A 2-space-INDENTED, multi-line paragraph: focus-Sentence dims the non-focused sentence's
+    // row-group on the RIGHT bytes (origin = ps, not line_start; a line_start origin would shift the
+    // dim region by the indent and dim the wrong rows).
+    let text = "  The committee met on a\nsunny day. It then voted twice.\n";
+    let mut h = Harness::new(text, None, (30, 10));
+    { let mut ed = h.editor.borrow_mut();
+      // Focus dimming paints via the DIM modifier only under a no-color theme (a colored theme
+      // instead shades FocusDim's fg) — mirrors the render focus tests' harness setup.
+      ed.theme = wordcartel_core::theme::no_color();
+      ed.depth = wordcartel_core::theme::Depth::None;
+      ed.active_mut().view.ventilate = true;
+      ed.view_opts.focus = true;
+      ed.view_opts.focus_granularity = crate::config::FocusGranularity::Sentence;
+      ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(text.find("committee").unwrap());
+      crate::derive::rebuild(&mut ed); }
+    h.render();
+    let s1_row = (0..10u16).find(|&y| h.row(y).contains("committee")).unwrap();
+    let s2_row = (0..10u16).find(|&y| h.row(y).contains("voted twice")).unwrap();
+    // The gutter's rule glyph (cols 0..GUTTER_COLS) carries DIM unconditionally (it is not a
+    // focus signal — `gutter_span`'s rule style is always dim, on EVERY ventilated row) — restrict
+    // the focus-dim check to the CONTENT columns (>= GUTTER_COLS) so the gutter's own styling
+    // cannot be mistaken for (or mask) the focus-dim region under test.
+    let content_dim = |y: u16| -> Vec<u16> {
+        h.dim_cols(y).into_iter().filter(|&c| c >= crate::ventilate::GUTTER_COLS as u16).collect::<Vec<_>>()
+    };
+    assert!(content_dim(s1_row).is_empty(), "focused sentence 1 row's CONTENT not dimmed, got {:?}", content_dim(s1_row));
+    assert!(!content_dim(s2_row).is_empty(), "sentence 2 row's CONTENT dimmed — origin-correct focus region");
+}
+
+#[test]
+fn e2e_search_highlight_lands_on_right_bytes_in_multiline_ventilated_block() {
+    // T-search-window / T-paint-origin (IMPORTANT 4 — NON-vacuous): a real search match on the SECOND
+    // logical line of an INDENTED multi-line ventilated block must highlight the matched word's
+    // columns. A raw-line_start origin (render.rs:530/652 unmigrated) would (a) window the match out
+    // of the visible search set and/or (b) paint the highlight shifted by the indent — this asserts
+    // the highlight lands on the actual "voted" glyphs.
+    let text = "  The committee met on a\nsunny day. It then voted twice.\n";
+    let mut h = Harness::new(text, None, (30, 10));
+    { let mut ed = h.editor.borrow_mut(); ed.active_mut().view.ventilate = true;
+      crate::derive::rebuild(&mut ed); }
+    // Run a search for "voted" through the real Msg sequence (Ctrl+F opens, typing recomputes live).
+    h.search_for("voted");
+    h.render();
+    // Locate the row showing "voted" and assert its highlighted columns cover the word.
+    let row = (0..10u16).find(|&y| h.row(y).contains("voted")).expect("match row visible");
+    let hl = h.search_highlight_cols(row);
+    let line = h.row(row);
+    // `h.row` concatenates ONE cell-symbol PER VISUAL COLUMN, so the rule glyph `│` (a 3-byte
+    // UTF-8 char) makes a BYTE offset from `str::find` unsafe as a column index — find the CHAR
+    // (== column) position instead (mirrors the gutter test's precedent).
+    let word_start = line.chars().collect::<Vec<_>>().windows(5)
+        .position(|w| w.iter().collect::<String>() == "voted").expect("'voted' visible in the row") as u16;
+    assert!(hl.contains(&word_start) && hl.contains(&(word_start + 4)),
+        "search highlight covers the 'voted' glyphs at their real columns (origin-correct): hl={hl:?}, word_start={word_start}, row={line:?}");
+}
+
+#[test]
+fn e2e_search_window_extends_across_ventilated_block_not_just_anchor_line() {
+    // T-search-window (coverage gap closed): `gather_row_ctx`'s `hl_window` upper bound (`hi`) must
+    // extend to the VENTILATED BLOCK's real last line (via `ventilate::resolve`), not just the
+    // window ANCHOR's own line — else a match past the anchor's own line is silently windowed OUT
+    // of the non-current `SearchMatch` highlight set. The sibling test
+    // (`e2e_search_highlight_lands_on_right_bytes_in_multiline_ventilated_block`) does NOT catch a
+    // regression here: its fixture has only ONE match, which is always the unwindowed CURRENT match
+    // (`hl_current` bypasses `hl_window` entirely — render.rs `is_current` check). This fixture has
+    // TWO occurrences of "repeat" inside ONE hard-wrapped ventilated sentence: the FIRST (line 0)
+    // becomes current (origin 0); the SECOND (line 1) is a NON-current match that is only painted if
+    // the window correctly extends past the anchor's own line.
+    let text = "alpha repeat beta gamma delta epsilon zeta eta theta iota kappa\nlambda repeat mu nu xi.\n";
+    let mut h = Harness::new(text, None, (40, 10));
+    { let mut ed = h.editor.borrow_mut(); ed.active_mut().view.ventilate = true;
+      crate::derive::rebuild(&mut ed); }
+    h.search_for("repeat");
+    h.render();
+    let row1 = (0..10u16).find(|&y| h.row(y).contains("alpha repeat")).expect("first 'repeat' visible");
+    let row2 = (0..10u16).find(|&y| h.row(y).contains("lambda repeat")).expect("second 'repeat' visible");
+    assert!(!h.search_highlight_cols(row1).is_empty(), "first (current) 'repeat' occurrence is highlighted");
+    assert!(!h.search_highlight_cols(row2).is_empty(),
+        "second (non-current) 'repeat' occurrence — on the block's SECOND logical line — must still be \
+         highlighted: a windowing bound clipped to the anchor's own line would drop it");
+}
+
+#[test]
+fn e2e_ventilate_composes_with_source_shows_raw_markers() {
+    let mut h = Harness::new("This is **bold** text here. Bye.\n", None, (50, 8));
+    { let mut ed = h.editor.borrow_mut();
+      ed.active_mut().view.ventilate = true;
+      ed.active_mut().view.mode = crate::editor::RenderMode::SourcePlain; // all lines raw
+      crate::derive::rebuild(&mut ed); }
+    h.render();
+    assert!((0..8u16).any(|y| h.row(y).contains("**bold**")),
+        "ventilate + SourcePlain shows raw markers on the sentence row (L1/§6.1)");
+}
+
+#[test]
+fn e2e_verbatim_active_line_reveals_raw_prose_stays_concealed() {
+    // IMPORTANT 3 / §4.2: L1 (no raw reveal) is scoped to ventilated PROSE only. A VERBATIM block's
+    // active line keeps today's raw reveal; a ventilated PROSE active line stays concealed-clean.
+    // Doc: an active heading (verbatim) reveals "# ", while an active emphasis paragraph conceals "*".
+    let text = "# Title here\n\nThis *word* matters. Bye now.\n";
+    // (a) caret ON the heading (verbatim) → LivePreview reveals the raw "# ".
+    let mut h = Harness::new(text, None, (40, 8));
+    { let mut ed = h.editor.borrow_mut();
+      ed.active_mut().view.ventilate = true;
+      ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(2); // in "# Title"
+      crate::derive::rebuild(&mut ed); }
+    h.render();
+    assert!((0..8u16).any(|y| h.row(y).contains("# Title")),
+        "active verbatim heading reveals raw '# ' under ventilate (active_line stays effective)");
+    // (b) caret IN the prose paragraph → the emphasis markers stay CONCEALED (L1, no active reveal).
+    let mut h2 = Harness::new(text, None, (40, 8));
+    { let mut ed = h2.editor.borrow_mut();
+      ed.active_mut().view.ventilate = true;
+      ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(text.find("word").unwrap());
+      crate::derive::rebuild(&mut ed); }
+    h2.render();
+    assert!((0..8u16).any(|y| h2.row(y).contains("word matters")),
+        "prose sentence renders concealed-clean");
+    assert!(!(0..8u16).any(|y| h2.row(y).contains("*word*")),
+        "active ventilated prose line stays concealed — no raw reveal at the caret (L1)");
 }
 
 // ===========================================================================
