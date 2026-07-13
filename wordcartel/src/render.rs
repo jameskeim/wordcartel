@@ -528,9 +528,14 @@ fn gather_row_ctx(editor: &Editor) -> RowCtx<'_> {
         Some(s) => {
             let buf = &editor.active().document.buffer;
             let lo = derive::line_start(buf, scroll);
-            // Conservative upper bound: the last logical line in the layout cache.
+            // Conservative upper bound: the END of the last cached entry's coverage. Under ventilate
+            // the last key is a block anchor, so bound by that block's last line + 1 (resolver),
+            // never a raw line_start of the anchor (which would clip matches inside the block). Off,
+            // resolve on a per-line key returns last_line == max_visible, so `hi` is unchanged.
             let max_visible = sorted_lines.last().copied().unwrap_or(scroll);
-            let hi = derive::line_start(buf, max_visible + 1);
+            let end_line = crate::ventilate::resolve(&editor.active().view, buf, max_visible)
+                .map(|r| r.last_line).unwrap_or(max_visible);
+            let hi = derive::line_start(buf, end_line + 1);
             // partition_point keeps the sorted invariant; matches are sorted by start,
             // and non-overlapping so end is also non-decreasing.
             let lo_idx = s.matches().partition_point(|m| m.end <= lo);
@@ -649,11 +654,12 @@ fn row_spans_segs(editor: &Editor, ctx: &RowCtx, vr: &VisualRow, map: &ColMap,
 fn row_spans_placed(editor: &Editor, ctx: &RowCtx, l: usize, row_index: usize,
                     vr: &VisualRow, map: &ColMap, row_dim: bool) -> Vec<Span<'static>> {
     let buf = &editor.active().document.buffer;
-    let line_off = derive::line_start(buf, l);
+    // ORIGIN from the window resolver: `ps` for a ventilated anchor key, else the logical line start.
+    let line_off = crate::ventilate::origin_of(&editor.active().view, buf, l);
     let mut spans: Vec<Span<'static>> = Vec::new();
 
-    // Compute the visible byte span for this visual row so we can window the
-    // diagnostics. src_span is relative to the logical line start.
+    // Compute the visible byte span for this visual row so we can window the diagnostics.
+    // src_span is relative to the entry ORIGIN (`ps` under ventilate, else the logical line start).
     let lo = line_off + vr.src_span.start;
     let hi = line_off + vr.src_span.end;
 
@@ -756,9 +762,10 @@ fn paint_rows(frame: &mut Frame, editor: &Editor, area: Rect,
             // Determine whether this visual row is dim (outside the active region).
             let row_dim = if let Some((from, to)) = ctx.focus_region {
                 let buf = &editor.active().document.buffer;
-                let line_off = derive::line_start(buf, l);
-                let g_from = line_off + vr.src_span.start;
-                let g_to = line_off + vr.src_span.end;
+                // ORIGIN from the window resolver: `ps` for a ventilated anchor key, else line_start.
+                let origin = crate::ventilate::origin_of(&editor.active().view, buf, l);
+                let g_from = origin + vr.src_span.start;
+                let g_to = origin + vr.src_span.end;
                 !row_is_active(g_from, g_to, from, to)
             } else { false };
 

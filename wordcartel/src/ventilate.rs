@@ -145,6 +145,59 @@ pub fn resolve<'a>(view: &'a crate::editor::View, buf: &TextBuffer, l: usize) ->
     None // an ordinary per-line entry keyed below l does not cover l
 }
 
+/// The byte ORIGIN render must reconstruct global offsets against for a cached entry keyed at `l`
+/// (`origin + vr.src_span`): the window's `byte_origin` (`ps`) when `l` is a ventilated window anchor,
+/// else `line_start(l)`. Render iterates `line_layouts` KEYS, so `l` is always an anchor key here — a
+/// ventilated window keys exactly at its first line (Task 5 fill obligation), so a `vent_blocks`
+/// lookup on `l` is exact. When the lens is off `vent_blocks` is empty, so this is `line_start(l)`
+/// verbatim — the migration is a byte-for-byte no-op on the existing path (§5.2).
+pub fn origin_of(view: &crate::editor::View, buf: &TextBuffer, l: usize) -> usize {
+    view.vent_blocks.get(&l).map(|vb| vb.byte_origin).unwrap_or_else(|| buf.line_to_byte(l))
+}
+
+/// Window-aware `(ColMap, byte_origin)` for a nav TRANSITION target — the line that is *about to
+/// become* the caret line (the `move_*` cross-line sites). Under ventilate (window cached) it returns
+/// the block's combined window map + `ps` origin via [`resolve`]; otherwise (lens off, verbatim line,
+/// or an off-screen ventilated line not yet cached) it lays the target out **ACTIVE** (`RawPlain`) at
+/// `line_start(l)` — byte-for-byte identical to the pre-S6 `layout_line_active(editor, l)` +
+/// `line_start(l)` pair, because the target becomes the caret line and renders raw.
+///
+/// This is the *transition* twin of [`layout_block_as_displayed`]: the two consult [`resolve`] first
+/// and so are identical on the ventilated path; they differ ONLY in this flag-off / verbatim per-line
+/// arm — active here (target becomes the caret line), as-displayed there (a non-caret line matching
+/// the cache). Splitting them is what keeps cross-line motion into a concealed markdown line a no-op
+/// when the lens is off (a single accessor could not be a no-op for both groups — §5.2 blocker).
+pub fn layout_block_on_demand(editor: &crate::editor::Editor, l: usize) -> (ColMap, usize) {
+    let buf = &editor.active().document.buffer;
+    if let Some(r) = resolve(&editor.active().view, buf, l) {
+        if editor.active().view.vent_blocks.contains_key(&r.first_line) {
+            return (r.map.clone(), r.byte_origin);
+        }
+    }
+    // Lens off / verbatim / off-screen ventilated (Task 5 recompute): active per-line layout.
+    (crate::nav::layout_line_active(editor, l), crate::derive::line_start(buf, l))
+}
+
+/// Window-aware `(ColMap, byte_origin)` for a nav READ / MEASURE site — a mark/ring/click/caret
+/// offset on any visible line (`screen_pos`, `clamp_snap`, `caret_visual_row`, `offset_at_cell`).
+/// Under ventilate (window cached) it returns the block's combined window map + `ps` origin via
+/// [`resolve`]; otherwise (lens off, verbatim line, or an off-screen ventilated line) it returns the
+/// ordinary **as-displayed** per-line layout (mode-aware active/inactive, mirroring the cache) at
+/// `line_start(l)` — byte-for-byte identical to the pre-S6 `get_or_layout(editor, l)` + `line_start(l)`
+/// pair the read sites used.
+///
+/// The read twin of [`layout_block_on_demand`]; see it for why the flag-off arms differ.
+pub fn layout_block_as_displayed(editor: &crate::editor::Editor, l: usize) -> (ColMap, usize) {
+    let buf = &editor.active().document.buffer;
+    if let Some(r) = resolve(&editor.active().view, buf, l) {
+        if editor.active().view.vent_blocks.contains_key(&r.first_line) {
+            return (r.map.clone(), r.byte_origin);
+        }
+    }
+    // Lens off / verbatim / off-screen ventilated (Task 5 recompute): as-displayed per-line layout.
+    (crate::nav::get_or_layout(editor, l), crate::derive::line_start(buf, l))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

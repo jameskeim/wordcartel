@@ -80,7 +80,6 @@ fn layout_line_on_demand(editor: &Editor, l: usize) -> wordcartel_core::layout::
 /// 5. Screen row = visible visual rows from `(scroll, scroll_row)` to `(L, vrow)`.
 /// 6. Return `None` if screen row >= area height.
 pub fn screen_pos(editor: &Editor) -> Option<(u16, u16)> {
-    let buf = &editor.active().document.buffer;
     let scroll = editor.active().view.scroll;
     let scroll_row = editor.active().view.scroll_row;
     // Editing area excludes the bottom status row (render reserves frame_h - 1) AND
@@ -94,18 +93,10 @@ pub fn screen_pos(editor: &Editor) -> Option<(u16, u16)> {
         return None;
     }
 
-    // Get ColMap for the caret line
-    let map_owned;
-    let map: &wordcartel_core::layout::ColMap =
-        if let Some((_, map)) = editor.active().view.line_layouts.get(&l) {
-            map
-        } else {
-            map_owned = layout_line_on_demand(editor, l);
-            &map_owned
-        };
-
-    let line_off = derive::line_start(buf, l);
-    let in_off = h.saturating_sub(line_off);
+    // The caret line's ColMap + byte ORIGIN from the window-aware resolver (as-displayed: the
+    // mode-aware per-line layout when the lens is off / the line is verbatim).
+    let (map, origin) = crate::ventilate::layout_block_as_displayed(editor, l);
+    let in_off = h.saturating_sub(origin);
     // Snap to a valid cursor stop before calling source_to_visual
     let snapped = map.snap_to_stop(in_off);
     let (vrow, vcol) = map.source_to_visual(snapped);
@@ -139,7 +130,7 @@ fn fold_view(editor: &Editor) -> std::rc::Rc<crate::fold::FoldView> {
 /// Helper: lay out line `l` for the ColMap, treating it as the active caret
 /// line (is_active=true). Used during line transitions where the target line
 /// will become the new caret line.
-fn layout_line_active(editor: &Editor, l: usize) -> wordcartel_core::layout::ColMap {
+pub(crate) fn layout_line_active(editor: &Editor, l: usize) -> wordcartel_core::layout::ColMap {
     let buf = &editor.active().document.buffer;
     let text = derive::line_text(buf, l);
     let role = editor.active().document.blocks().role_at(derive::line_start(buf, l));
@@ -150,7 +141,7 @@ fn layout_line_active(editor: &Editor, l: usize) -> wordcartel_core::layout::Col
 
 /// Get the ColMap for line `l` from the cache if available, else lay it out
 /// with the appropriate `is_active` flag.
-fn get_or_layout(editor: &Editor, l: usize) -> wordcartel_core::layout::ColMap {
+pub(crate) fn get_or_layout(editor: &Editor, l: usize) -> wordcartel_core::layout::ColMap {
     if let Some((_, map)) = editor.active().view.line_layouts.get(&l) {
         map.clone()
     } else {
@@ -166,8 +157,7 @@ pub fn clamp_snap(editor: &Editor, off: usize) -> usize {
     let off = off.min(len);
     if len == 0 { return 0; }
     let line = buf.byte_to_line(off.min(len.saturating_sub(1)));
-    let ls = derive::line_start(buf, line);
-    let map = get_or_layout(editor, line);
+    let (map, ls) = crate::ventilate::layout_block_as_displayed(editor, line);
     ls + map.snap_to_stop(off.saturating_sub(ls))
 }
 
@@ -193,13 +183,13 @@ pub fn move_right(editor: &mut Editor) -> usize {
     let nxt = layout::move_right(&map, cur);
 
     let new_offset = if nxt.offset == cur.offset && cur.offset == map.eol && l + 1 < total {
-        // At line end and not the last line → transition to next line.
-        // The target line becomes the new caret line, so lay it out as active.
-        let next_map = layout_line_active(editor, l + 1);
-        let next_ls = derive::line_start(&editor.active().document.buffer, l + 1);
+        // At line end and not the last line → transition to next line. The target becomes the new
+        // caret line, so the transition accessor lays it ACTIVE (RawPlain) when the lens is off /
+        // the line is verbatim, and returns the window map + `ps` origin under ventilate.
+        let (next_map, next_origin) = crate::ventilate::layout_block_on_demand(editor, l + 1);
         // Snap to the first valid cursor stop on the next line.
         let first_stop = layout::cursor_at(&next_map, 0);
-        next_ls + first_stop.offset
+        next_origin + first_stop.offset
     } else {
         ls + nxt.offset
     };
@@ -226,11 +216,10 @@ pub fn move_left(editor: &mut Editor) -> usize {
     let nxt = layout::move_left(&map, cur);
 
     let new_offset = if nxt.offset == cur.offset && in_off == 0 && l > 0 {
-        // At line start and not the first line → transition to end of line L-1.
-        let prev_map = layout_line_active(editor, l - 1);
-        let prev_ls = derive::line_start(&editor.active().document.buffer, l - 1);
+        // At line start and not the first line → transition to end of line L-1 (active target).
+        let (prev_map, prev_origin) = crate::ventilate::layout_block_on_demand(editor, l - 1);
         let eol_cur = layout::cursor_at(&prev_map, prev_map.eol);
-        prev_ls + eol_cur.offset
+        prev_origin + eol_cur.offset
     } else {
         ls + nxt.offset
     };
@@ -326,10 +315,9 @@ pub fn move_down(editor: &mut Editor) -> usize {
                     None => h, // already on the last visible line — no-op
                     Some(nl) => {
                         debug_assert!(!fold_view(editor).is_hidden(nl));
-                        let next_map = layout_line_active(editor, nl);
-                        let next_ls = derive::line_start(&editor.active().document.buffer, nl);
+                        let (next_map, next_origin) = crate::ventilate::layout_block_on_demand(editor, nl);
                         let c = layout::enter_from_top(&next_map, desired);
-                        next_ls + c.offset
+                        next_origin + c.offset
                     }
                 }
             }
@@ -379,10 +367,9 @@ pub fn move_up(editor: &mut Editor) -> usize {
                 None => h,
                 Some(pl) => {
                     debug_assert!(!fold_view(editor).is_hidden(pl));
-                    let prev_map = layout_line_active(editor, pl);
-                    let prev_ls = derive::line_start(&editor.active().document.buffer, pl);
+                    let (prev_map, prev_origin) = crate::ventilate::layout_block_on_demand(editor, pl);
                     let c = layout::enter_from_bottom(&prev_map, desired);
-                    prev_ls + c.offset
+                    prev_origin + c.offset
                 }
             }
         }
@@ -521,10 +508,8 @@ fn typewriter_rows_of_line(editor: &Editor, li: usize, text_width: usize) -> usi
 }
 
 fn caret_visual_row(editor: &Editor, line_idx: usize) -> usize {
-    let buf = &editor.active().document.buffer;
-    let map = get_or_layout(editor, line_idx);
-    let line_off = derive::line_start(buf, line_idx);
-    let in_off = head(editor).saturating_sub(line_off);
+    let (map, origin) = crate::ventilate::layout_block_as_displayed(editor, line_idx);
+    let in_off = head(editor).saturating_sub(origin);
     let snapped = map.snap_to_stop(in_off);
     map.source_to_visual(snapped).0
 }
@@ -980,10 +965,10 @@ pub fn offset_at_cell(editor: &Editor, col: u16, row: u16) -> Option<usize> {
         let first_vrow = if l == scroll { scroll_row } else { 0 };
         for vrow in first_vrow..rows {
             if acc == target {
-                let map = get_or_layout(editor, l);
+                let (map, origin) = crate::ventilate::layout_block_as_displayed(editor, l);
                 let in_off = map.visual_to_source(vrow, col as usize);
                 let snapped = map.snap_to_stop(in_off);
-                return Some(derive::line_start(&editor.active().document.buffer, l) + snapped);
+                return Some(origin + snapped);
             }
             acc += 1;
         }
@@ -1694,5 +1679,37 @@ mod tests {
         let line = e.active().document.buffer.byte_to_line(off); // the local idiom (nav.rs:1369) —
                                         // Codex-verified; editor_line_of/line_of_offset do NOT exist.
         assert_eq!(line, 7, "PageDown from line 0 with the bar visible steps 7 (8-row viewport, 1 overlap)");
+    }
+
+    // ------------------------------------------------------------------
+    // S6 Task 4: resolver-origin migration is a no-op when the lens is OFF
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn resolver_origin_matches_line_start_when_ventilate_off() {
+        // With ventilate OFF, origin_of MUST equal line_start for every cached line — the migration
+        // is a no-op on the existing path.
+        let mut e = Editor::new_from_text("alpha\nbeta\ngamma\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        let buf = e.active().document.buffer.clone();
+        for l in 0..3usize {
+            let got = crate::ventilate::origin_of(&e.active().view, &buf, l);
+            assert_eq!(got, buf.line_to_byte(l), "ventilate off → origin is line_start for line {l}");
+        }
+    }
+
+    #[test]
+    fn move_right_into_heading_lands_on_marker_when_ventilate_off() {
+        // REGRESSION GUARD (S6 Task 4 blocker): with the lens OFF in the DEFAULT (LivePreview) mode,
+        // crossing from the end of a paragraph line into a concealable heading line must land on the
+        // FIRST RAW byte of the target — the `#` at line_start(1) + 0 = offset 4 — because the target
+        // becomes the caret line and renders ACTIVE (RawPlain). If the transition site used the
+        // as-displayed (inactive/Concealed) accessor, the "## " markers would be skipped and the caret
+        // would land on `H` at offset 7. This test fails in that case.
+        let mut e = Editor::new_from_text("abc\n## Head\n", None, (80, 24));
+        set_caret(&mut e, 3); // end of "abc" (before '\n')
+        derive::rebuild(&mut e);
+        let landed = move_right(&mut e);
+        assert_eq!(landed, 4, "cross-line entry lands on the raw '#' (line_start(1)+0), not on 'H'");
     }
 }
