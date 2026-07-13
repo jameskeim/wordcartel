@@ -1812,6 +1812,60 @@ fn e2e_focus_sentence_spans_wrapped_rows_not_just_a_line() {
 }
 
 // ===========================================================================
+// S6 Task 6 — the 6-col rhythm gutter render.
+// ===========================================================================
+
+#[test]
+fn e2e_gutter_shows_right_aligned_word_counts() {
+    // Two sentences: 4 words and 2 words. Gutter shows right-aligned counts + a rule.
+    let mut h = Harness::new("Alpha beta gamma delta. Bye now.\n", None, (40, 8));
+    { let mut ed = h.editor.borrow_mut(); ed.active_mut().view.ventilate = true;
+      crate::derive::rebuild(&mut ed); }
+    h.render();
+    // Row 0 carries sentence 1's count (4) right-aligned in 3 cols, then the rule.
+    let r0 = h.row(0);
+    assert!(r0.starts_with("  4 │ "), "row 0 gutter: `  4 │ ` — got {r0:?}");
+    assert!(r0.contains("Alpha beta gamma delta"), "sentence 1 text follows the gutter");
+    // Sentence 2 is on its own row-group with count 2.
+    let s2 = (0..8u16).map(|y| h.row(y)).find(|r| r.contains("Bye now")).expect("sentence 2 visible");
+    assert!(s2.starts_with("  2 │ "), "sentence 2 gutter: `  2 │ ` — got {s2:?}");
+}
+
+#[test]
+fn e2e_gutter_clamps_to_999() {
+    // A 1000-word paragraph clamps the display to 999 (§7/L7).
+    let big = std::iter::repeat_n("word", 1000).collect::<Vec<_>>().join(" ") + ".\n";
+    let mut h = Harness::new(&big, None, (40, 8));
+    { let mut ed = h.editor.borrow_mut(); ed.active_mut().view.ventilate = true;
+      crate::derive::rebuild(&mut ed); }
+    h.render();
+    assert!(h.row(0).starts_with("999 │ "), "≥1000-word sentence clamps to 999 — got {:?}", h.row(0));
+}
+
+#[test]
+fn e2e_gutter_overwrites_lead_in_no_content_shift() {
+    // IMPORTANT 1: the gutter OVERWRITES the reserved lead-in — reserved width == painted width, so
+    // content is NOT shifted right. The sentence text must begin at exactly column GUTTER_COLS (6),
+    // and the same text under a NON-ventilated render must begin at column 0 — the only difference
+    // being the 6-col gutter, never a double-count (which would push text to column 12).
+    let text = "Alpha beta gamma.\n";
+    let mut h = Harness::new(text, None, (40, 8));
+    { let mut ed = h.editor.borrow_mut(); ed.active_mut().view.ventilate = true;
+      crate::derive::rebuild(&mut ed); }
+    h.render();
+    let r0 = h.row(0);
+    // Columns 0..6 are the gutter ("  3 │ "); the sentence text starts at column 6, not 12.
+    // `h.row` concatenates ONE cell-symbol PER VISUAL COLUMN, so the rule glyph `│` (a 3-byte
+    // UTF-8 char) makes byte-offset slicing unsafe (it is not a char boundary at byte 6) — slice
+    // by CHAR (== column, since every cell here is a single-width symbol) instead.
+    let cols: Vec<char> = r0.chars().collect();
+    let gutter: String = cols[..6].iter().collect();
+    assert_eq!(gutter, "  3 │ ", "gutter occupies exactly 6 columns");
+    let rest: String = cols[6..].iter().collect();
+    assert!(rest.starts_with("Alpha"), "content begins at col 6 (no double-count shift) — got {r0:?}");
+}
+
+// ===========================================================================
 // R1 typing-latency bench (exploratory measurement — NOT a correctness gate).
 //
 // Drives the REAL reduce → advance(derive::rebuild) → render loop through the

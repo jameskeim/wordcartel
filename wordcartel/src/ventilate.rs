@@ -4,11 +4,15 @@
 //! the view identically to `select-sentence`) and normalizes interior `\n`→space ONLY in each
 //! span's DISPLAY string (byte-length-preserving — ColMap `src` offsets stay valid). §5.1.
 
+use ratatui::style::Modifier;
+use ratatui::text::Span;
 use wordcartel_core::block_tree::BlockTree;
 use wordcartel_core::buffer::TextBuffer;
 use wordcartel_core::layout::{ColMap, VisualRow};
 use wordcartel_core::style::LineRender;
 use wordcartel_core::textobj::sentence_spans;
+use wordcartel_core::theme::SemanticElement as SE;
+use crate::compose;
 
 /// Columns reserved on the left for the rhythm gutter: `NNN │ ` (3-digit count, space, rule,
 /// space). A fixed reservation subtracted from the wrap width (§3.4) and painted by render (Task 6).
@@ -85,6 +89,23 @@ pub struct VentBlock {
     pub last_line: usize,
     pub byte_origin: usize,
     pub gutter: Vec<GutterCell>,
+}
+
+/// The 6-column gutter prefix for one visual row (`GUTTER_COLS` wide). `Some(Count(n))` → the
+/// row-group's first row: `NNN` right-aligned in 3 cols (subdued) + ` │ ` (the rule dim).
+/// `Some(Continuation)` → a soft-wrap row: 3 blanks + ` │ ` (blank numeric field, rule kept).
+/// `None` → a verbatim row under ventilate: 6 blanks (reserved, no rule; §5.4).
+pub fn gutter_span(cell: Option<GutterCell>, editor: &crate::editor::Editor) -> Vec<Span<'static>> {
+    let (theme, depth) = (&editor.theme, editor.depth);
+    let dim = compose::compose(theme, depth, &[SE::FoldMarker]).add_modifier(Modifier::DIM);
+    match cell {
+        Some(GutterCell::Count(n)) => vec![
+            Span::styled(format!("{n:>3}"), compose::compose(theme, depth, &[SE::ChromeMuted])),
+            Span::styled(" │ ".to_string(), dim),
+        ],
+        Some(GutterCell::Continuation) => vec![Span::styled("    │ ".to_string(), dim)],
+        None => vec![Span::raw("      ".to_string())],
+    }
 }
 
 /// A resolved cached layout for a logical line: the row-group's rows + ColMap, plus the byte ORIGIN

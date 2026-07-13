@@ -780,6 +780,18 @@ fn paint_rows(frame: &mut Frame, editor: &Editor, area: Rect,
                 row_spans_placed(editor, &ctx, l, row_index, vr, map, row_dim)
             };
 
+            // Ventilated PROSE rows carry a VentBlock gutter (count/│); OVERWRITE the reserved
+            // 6-space lead-in that push_prefix_lead_in emitted for the glyphless prose row. Verbatim
+            // rows have NO vent_blocks entry: their reserved lead-in already reads as a blank gutter
+            // (§5.4), so nothing to do; glyph-carrying verbatim rows kept reserve 0 (Task 5) and are
+            // untouched. gutter_span returns exactly GUTTER_COLS columns, so width is preserved.
+            if let Some(cell) = editor.active().view.vent_blocks.get(&l)
+                .and_then(|vb| vb.gutter.get(row_index).copied())
+            {
+                let gutter = crate::ventilate::gutter_span(Some(cell), editor);
+                if spans.is_empty() { spans = gutter; } else { spans.splice(0..1, gutter); }
+            }
+
             // 5g: fold marker on the heading's first visual row.
             if let Some(n) = fold_marker_n {
                 spans.insert(0, Span::styled("▸ ", compose::compose(&editor.theme, editor.depth, &[SE::FoldMarker])));
