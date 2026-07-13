@@ -491,11 +491,18 @@ pub struct Editor {
     pub session_ignores: std::collections::HashSet<String>,
     /// Quick-fix overlay state. XOR with prompt/minibuffer/palette/menu/search.
     pub diag: Option<crate::diag_overlay::DiagOverlay>,
-    /// Active diagnostics provider (Effort A). NullProvider by default → hermetic construction;
-    /// run() installs HarperLs once the msg channel exists.
-    pub diag_provider: Box<dyn crate::diag_provider::DiagnosticsProvider>,
-    /// One install-hint per deliberate Review entry (reset in set_render_mode). Spec §9.
-    pub diag_hint_shown: bool,
+    /// Registered diagnostics providers (Effort A/SPINE). Empty `ProviderSet` by default →
+    /// hermetic construction; run() installs HarperLs once the msg channel exists.
+    pub diag_providers: crate::diag_provider::ProviderSet,
+    /// The switchable analysis lens (SPINE §8.1): which engine's diagnostics render/nav/status
+    /// currently follow, out of the several `diag_providers` may have installed. Defaults to
+    /// Harper; `run()` reseeds it to the first ENABLED source at startup (falling back to
+    /// Harper when nothing is enabled). Mutated ONLY by `set_analysis_source` (law 6).
+    pub active_analysis_source: wordcartel_core::diagnostics::DiagSource,
+    /// The set of engines whose install-hint has already fired this Review entry (per-source
+    /// latch, cleared in set_render_mode on entering Review). One hint per source per entry —
+    /// informative, not naggy. Spec §9.
+    pub diag_hint_shown: std::collections::BTreeSet<wordcartel_core::diagnostics::DiagSource>,
     /// Outline picker overlay state. XOR with prompt/minibuffer/palette/menu/search/diag.
     pub outline: Option<crate::outline_overlay::OutlineOverlay>,
     /// Theme picker overlay state. XOR with all other overlays.
@@ -607,8 +614,9 @@ impl Editor {
             dictionary: std::collections::HashSet::new(),
             session_ignores: std::collections::HashSet::new(),
             diag: None,
-            diag_provider: Box::new(crate::diag_provider::NullProvider),
-            diag_hint_shown: false,
+            diag_providers: crate::diag_provider::ProviderSet::default(),
+            active_analysis_source: wordcartel_core::diagnostics::DiagSource::Harper,
+            diag_hint_shown: std::collections::BTreeSet::new(),
             outline: None,
             theme_picker: None,
             file_browser: None,
@@ -986,11 +994,25 @@ impl Editor {
         crate::derive::rebuild(self);
         crate::nav::ensure_visible(self);
         if mode == RenderMode::Review {
-            self.diag_hint_shown = false;
+            self.diag_hint_shown.clear();
         }
         if crate::diagnostics_run::should_run_diagnostics(self) {
-            self.active_mut().diagnostics.arm(now_ms, 0);
+            crate::diagnostics_run::arm_enabled(self, now_ms, 0);
         }
+    }
+
+    /// The single setter for the switchable analysis lens (command-surface contract law 6;
+    /// SPINE §8.1). Refuses to point the lens at an engine that is not currently enabled — the
+    /// lens must always name a source `render`/nav/status can actually show — leaving
+    /// `active_analysis_source` unchanged and surfacing why. Task 7 registers the commands
+    /// (per-engine set + cycle) that call this; this task adds no caller.
+    pub fn set_analysis_source(&mut self, source: wordcartel_core::diagnostics::DiagSource) {
+        if !self.diag_providers.is_enabled(source) {
+            self.status = format!("{} is not enabled", source.label());
+            return;
+        }
+        self.active_analysis_source = source;
+        self.status = format!("analysis: {}", source.label());
     }
 
     /// Reset BOTH new P3 wake subsystems to their no-plugins baseline (P3 §3g, Codex Critical 2):
@@ -1711,13 +1733,46 @@ mod tests {
 
     #[test]
     fn set_render_mode_arms_on_enter_review_only() {
+        use wordcartel_core::diagnostics::DiagSource;
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        // arm_enabled (Task 3) only arms slots of INSTALLED+enabled sources — install Harper so
+        // the arm-on-enter-Review behavior below has something to arm.
+        e.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Harper)), true);
         e.diag_cfg.enabled = true;
         e.set_render_mode(RenderMode::Review, 500);
-        assert_eq!(e.active().diagnostics.recheck_due_at, Some(500), "arm-on-enter at debounce 0");
-        e.active_mut().diagnostics.recheck_due_at = None;
+        assert_eq!(e.active().diagnostics.slot(DiagSource::Harper).unwrap().recheck_due_at, Some(500),
+            "arm-on-enter at debounce 0");
+        e.active_mut().diagnostics.slot_mut(DiagSource::Harper).recheck_due_at = None;
         e.set_render_mode(RenderMode::LivePreview, 600);
-        assert_eq!(e.active().diagnostics.recheck_due_at, None, "leaving Review never arms");
+        assert_eq!(e.active().diagnostics.slot(DiagSource::Harper).unwrap().recheck_due_at, None,
+            "leaving Review never arms");
+    }
+
+    // ------------------------------------------------------------------
+    // Task 6 (SPINE): the switchable analysis lens — set_analysis_source.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn set_analysis_source_refuses_disabled_engine() {
+        let mut e = Editor::new_from_text("x\n", None, (40, 10));
+        e.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new().with_source(
+                wordcartel_core::diagnostics::DiagSource::Harper)), true);
+        e.set_analysis_source(wordcartel_core::diagnostics::DiagSource::Vale);
+        assert_eq!(e.active_analysis_source, wordcartel_core::diagnostics::DiagSource::Harper);
+        assert!(e.status.contains("not enabled"));
+    }
+
+    #[test]
+    fn set_analysis_source_sets_lens_and_status_for_enabled_engine() {
+        use wordcartel_core::diagnostics::DiagSource;
+        let mut e = Editor::new_from_text("x\n", None, (40, 10));
+        e.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Plugin("mock"))), true);
+        e.set_analysis_source(DiagSource::Plugin("mock"));
+        assert_eq!(e.active_analysis_source, DiagSource::Plugin("mock"));
+        assert_eq!(e.status, "analysis: mock");
     }
 
     #[test]

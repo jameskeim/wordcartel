@@ -60,10 +60,14 @@ pub enum Msg {
     DiagnosticsDone {
         buffer_id: crate::editor::BufferId,
         version: u64,
+        source: wordcartel_core::diagnostics::DiagSource,
         diagnostics: Vec<wordcartel_core::diagnostics::Diagnostic>,
     },
     /// A `DiagnosticsProvider` lifecycle event (Effort A) — restart re-arm / degradation hint.
-    DiagProviderEvent(crate::diag_provider::ProviderEvent),
+    DiagProviderEvent {
+        source: wordcartel_core::diagnostics::DiagSource,
+        event: crate::diag_provider::ProviderEvent,
+    },
     ClipboardPaste { id: u64, buffer_id: crate::editor::BufferId, text: Option<String> },
     ClipboardAvailability(bool),
     Tick,
@@ -105,13 +109,18 @@ impl std::fmt::Debug for Msg {
                 .field("range", range)
                 .field("kind", kind)
                 .finish(),
-            Msg::DiagnosticsDone { buffer_id, version, diagnostics } => f
+            Msg::DiagnosticsDone { buffer_id, version, source, diagnostics } => f
                 .debug_struct("DiagnosticsDone")
                 .field("buffer_id", buffer_id)
                 .field("version", version)
+                .field("source", source)
                 .field("count", &diagnostics.len())
                 .finish(),
-            Msg::DiagProviderEvent(ev) => f.debug_tuple("DiagProviderEvent").field(ev).finish(),
+            Msg::DiagProviderEvent { source, event } => f
+                .debug_struct("DiagProviderEvent")
+                .field("source", source)
+                .field("event", event)
+                .finish(),
             Msg::ClipboardPaste { id, buffer_id, text } => f.debug_struct("ClipboardPaste")
                 .field("id", id).field("buffer_id", buffer_id)
                 .field("has_text", &text.is_some()).finish(),
@@ -322,10 +331,11 @@ fn reduce_dispatch(
         Msg::TransformDone { buffer_id, version, range, kind, result } => {
             crate::jobs_apply::apply_transform_done(editor, buffer_id, version, range, kind, result, clock);
         }
-        Msg::DiagnosticsDone { buffer_id, version, diagnostics } => {
-            crate::diagnostics_run::apply_diagnostics_done(editor, buffer_id, version, diagnostics);
+        Msg::DiagnosticsDone { buffer_id, version, source, diagnostics } => {
+            crate::diagnostics_run::apply_diagnostics_done(editor, buffer_id, version, source, diagnostics);
         }
-        Msg::DiagProviderEvent(ev) => crate::diag_provider::apply_provider_event(editor, ev, clock),
+        Msg::DiagProviderEvent { source, event } =>
+            crate::diag_provider::apply_provider_event(editor, source, event, clock),
         Msg::Tick => crate::timers::on_tick(editor, ex, clock, msg_tx),
         Msg::ClipboardPaste { buffer_id, text, .. } => crate::jobs_apply::apply_clipboard_paste(editor, buffer_id, text, clock),
         Msg::ClipboardAvailability(ok) => crate::jobs_apply::apply_clipboard_availability(editor, ok),
@@ -663,6 +673,12 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             }
         }
     };
+    // Task 8 (SPINE §9.3): install the core diagnostics provider catalog (harper today) now that
+    // the msg channel exists — folds `[diagnostics].linters` into per-engine enablement (unknown
+    // names warn into `warns`, BEFORE the status-selection point below so they surface) and seeds
+    // the switchable lens to the first enabled source. Providers spawn nothing here — lazy, as
+    // before (spec §3.1). `editor` is still the plain `&mut` here (pre-Rc-wrap).
+    crate::diagnostics_run::install_core_providers(&mut editor, &cfg, &msg_tx, &mut warns);
     // Build the keymap from the loaded config and surface any warnings.
     let (built_keymap, mut kw) = keymap::build_keymap(&cfg.keymap, &reg);
     warns.append(&mut kw);
@@ -673,16 +689,6 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // Take the keymap out of editor into a loop-local to avoid a simultaneous
     // &mut editor / &editor.keymap borrow conflict when calling reduce.
     let mut keymap = std::mem::take(&mut editor.keymap);
-    // Effort A: install the diagnostics provider now that the msg channel exists. HarperLs spawns
-    // nothing here — its client thread starts on the first Review dispatch (lazy; spec §3.1). Config
-    // is derived from the loaded DiagnosticsConfig; the file-length cap bounds per-recheck stdio.
-    editor.diag_provider = Box::new(crate::harper_ls::HarperLs::new(
-        msg_tx.clone(),
-        crate::diag_provider::ProviderConfig {
-            grammar: cfg.diagnostics.grammar,
-            dictionary: cfg.diagnostics.dictionary.clone(),
-            max_file_length: crate::limits::HARPER_MAX_FILE_LENGTH,
-        }));
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
     let executor = crate::jobs::ThreadExecutor::new(wake_tx);
     let clip_env = crate::clipboard::clip_env_from_process();
@@ -875,7 +881,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // input-loss, channel-disconnect all converge here) — sends LSP shutdown/exit and reaps the
     // child, non-blocking. The client thread's FlushGuard still emits terminals for any
     // accepted-but-unpublished change, so no latch is left dangling (spec §3/§4.6).
-    editor.borrow_mut().diag_provider.shutdown();
+    editor.borrow_mut().diag_providers.shutdown_all();
 
     // Input-loss shutdown: persist every dirty buffer non-interactively (the
     // interactive quit-drain can't run — input is gone). Controlled break, so
@@ -1387,9 +1393,10 @@ mod tests {
         use crate::registry::Registry;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         let mut e = Editor::new_from_text("hi\n", None, (80, 24));
+        crate::test_support::install_enabled_harper(&mut e); // arm_if_edited → arm_enabled arms enabled sources
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = RenderMode::Review;
-        e.active_mut().diagnostics.recheck_due_at = None;
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).recheck_due_at = None;
         let reg = Registry::builtins();
         let ex = InlineExecutor::default();
         let clk = TestClock(1_000);
@@ -1398,7 +1405,7 @@ mod tests {
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
         crate::app::reduce(Msg::Input(key), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "xhi\n");
-        assert_eq!(e.active().diagnostics.recheck_due_at, Some(1_000 + e.diag_cfg.debounce_ms),
+        assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), Some(1_000 + e.diag_cfg.debounce_ms),
             "active-buffer edit in Review arms exactly once");
     }
 
@@ -1433,7 +1440,7 @@ mod tests {
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
         crate::app::reduce(Msg::Input(enter), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().id, b_id, "switch landed on B");
-        assert_eq!(e.active().diagnostics.recheck_due_at, None, "a buffer switch is not an edit: no arm");
+        assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), None, "a buffer switch is not an edit: no arm");
     }
 
     /// Interceptor family 1/3 — the quick-fix suggestion overlay applies its edit via a
@@ -1445,13 +1452,16 @@ mod tests {
         use crate::registry::Registry;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        crate::test_support::install_enabled_harper(&mut e); // arm_if_edited → arm_enabled arms enabled sources
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = RenderMode::Review;
         let v = e.active().document.version;
-        e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
-            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(),
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
+            message: "x".into(),
             suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] }];
-        e.active_mut().diagnostics.computed_version = v;
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).computed_version = v;
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);
         let reg = Registry::builtins();
         let ex = InlineExecutor::default();
@@ -1461,11 +1471,11 @@ mod tests {
         crate::app::reduce(Msg::Input(mkpress(KeyCode::Char('.'), KeyModifiers::CONTROL)),
             &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert!(e.diag.is_some(), "Ctrl+. opens the quick-fix overlay");
-        e.active_mut().diagnostics.recheck_due_at = None; // opening the overlay is not an edit
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).recheck_due_at = None; // opening the overlay is not an edit
         crate::app::reduce(Msg::Input(mkpress(KeyCode::Enter, KeyModifiers::NONE)),
             &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.snapshot().to_string(), "the cat\n");
-        assert_eq!(e.active().diagnostics.recheck_due_at, Some(3_000 + e.diag_cfg.debounce_ms),
+        assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), Some(3_000 + e.diag_cfg.debounce_ms),
             "quick-fix apply (interceptor Handled::Done path) arms via the unified seam");
     }
 
@@ -1479,6 +1489,7 @@ mod tests {
         use crate::registry::Registry;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
         let mut e = Editor::new_from_text("aa aa aa\n", None, (80, 24));
+        crate::test_support::install_enabled_harper(&mut e); // arm_if_edited → arm_enabled arms enabled sources
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = RenderMode::Review;
         let reg = Registry::builtins();
@@ -1491,10 +1502,10 @@ mod tests {
         for c in "aa".chars() { r(&mut e, mkpress(KeyCode::Char(c), KeyModifiers::NONE)); }
         r(&mut e, mkpress(KeyCode::Tab, KeyModifiers::NONE));            // focus Template
         r(&mut e, mkpress(KeyCode::Char('b'), KeyModifiers::NONE));
-        e.active_mut().diagnostics.recheck_due_at = None; // building the query/template is not an edit
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).recheck_due_at = None; // building the query/template is not an edit
         r(&mut e, mkpress(KeyCode::Char('a'), KeyModifiers::ALT));       // Alt+A = Replace All
         assert_eq!(e.active().document.buffer.snapshot().to_string(), "b b b\n", "sanity: replace-all ran");
-        assert_eq!(e.active().diagnostics.recheck_due_at, Some(4_000 + e.diag_cfg.debounce_ms),
+        assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), Some(4_000 + e.diag_cfg.debounce_ms),
             "search-replace-all (interceptor Handled::Done path) arms via the unified seam");
     }
 
@@ -1508,6 +1519,7 @@ mod tests {
         use crate::jobs::InlineExecutor;
         use crate::registry::Registry;
         let mut e = Editor::new_from_text("abcde\n", None, (80, 24));
+        crate::test_support::install_enabled_harper(&mut e); // arm_if_edited → arm_enabled arms enabled sources
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = crate::editor::RenderMode::Review;
         let id = e.active().id;
@@ -1522,7 +1534,7 @@ mod tests {
             &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "aXde\n", "FilterDone applied under the open prompt");
         assert!(e.prompt.is_some(), "prompt remains open — only the background result was folded");
-        assert_eq!(e.active().diagnostics.recheck_due_at, Some(5_000 + e.diag_cfg.debounce_ms),
+        assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), Some(5_000 + e.diag_cfg.debounce_ms),
             "prompt-held FilterDone (interceptor Handled::Done path) arms via the unified seam");
     }
 
@@ -1537,9 +1549,10 @@ mod tests {
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
             MouseEvent, MouseEventKind, MouseButton};
         let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
+        crate::test_support::install_enabled_harper(&mut e); // arm_if_edited → arm_enabled arms enabled sources
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = RenderMode::Review;
-        e.active_mut().diagnostics.recheck_due_at = None;
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).recheck_due_at = None;
         let reg = Registry::builtins();
         let ex = InlineExecutor::default();
         let clk = TestClock(6_000);
@@ -1551,11 +1564,11 @@ mod tests {
         let click = Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left),
             column: 2, row: 0, modifiers: KeyModifiers::NONE });
         crate::app::reduce(Msg::Input(click), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
-        assert_eq!(e.active().diagnostics.recheck_due_at, None, "a click alone is not an edit: no arm");
+        assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), None, "a click alone is not an edit: no arm");
         let key = Event::Key(KeyEvent { code: KeyCode::Char('!'), modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
         crate::app::reduce(Msg::Input(key), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
-        assert_eq!(e.active().diagnostics.recheck_due_at, Some(6_000 + e.diag_cfg.debounce_ms),
+        assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), Some(6_000 + e.diag_cfg.debounce_ms),
             "the subsequent edit arms exactly once");
     }
 
@@ -1586,10 +1599,11 @@ mod tests {
         e.diag = Some(crate::diag_overlay::DiagOverlay::new(
             wordcartel_core::diagnostics::Diagnostic {
                 range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
                 message: "x".into(),
                 suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] },
             id, v));
-        e.active_mut().diagnostics.recheck_due_at = None;
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).recheck_due_at = None;
         let reg = Registry::builtins();
         let ex = InlineExecutor::default();
         let clk = TestClock(3_500);
@@ -1599,7 +1613,7 @@ mod tests {
         crate::app::reduce(Msg::Input(enter), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.snapshot().to_string(), "the cat\n",
             "sanity: the edit itself still applies outside Review");
-        assert_eq!(e.active().diagnostics.recheck_due_at, None,
+        assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), None,
             "quick-fix apply outside Review must not arm");
     }
 
@@ -1623,11 +1637,11 @@ mod tests {
         for c in "aa".chars() { r(&mut e, mkpress(KeyCode::Char(c), KeyModifiers::NONE)); }
         r(&mut e, mkpress(KeyCode::Tab, KeyModifiers::NONE));            // focus Template
         r(&mut e, mkpress(KeyCode::Char('b'), KeyModifiers::NONE));
-        e.active_mut().diagnostics.recheck_due_at = None;
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).recheck_due_at = None;
         r(&mut e, mkpress(KeyCode::Char('a'), KeyModifiers::ALT));       // Alt+A = Replace All
         assert_eq!(e.active().document.buffer.snapshot().to_string(), "b b b\n",
             "sanity: replace-all still ran outside Review");
-        assert_eq!(e.active().diagnostics.recheck_due_at, None,
+        assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), None,
             "search-replace-all outside Review must not arm");
     }
 
@@ -1653,7 +1667,7 @@ mod tests {
             &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "aXde\n",
             "sanity: FilterDone still applies outside Review");
-        assert_eq!(e.active().diagnostics.recheck_due_at, None,
+        assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), None,
             "prompt-held FilterDone outside Review must not arm");
     }
 
@@ -1672,6 +1686,7 @@ mod tests {
         use crossterm::event::{Event, KeyModifiers, MouseEvent, MouseEventKind, MouseButton};
         let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
         crate::derive::rebuild(&mut e);
+        crate::test_support::install_enabled_harper(&mut e); // arm_if_edited → arm_enabled arms enabled sources
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = RenderMode::Review;
         let v = e.active().document.version;
@@ -1679,10 +1694,11 @@ mod tests {
         e.diag = Some(crate::diag_overlay::DiagOverlay::new(
             wordcartel_core::diagnostics::Diagnostic {
                 range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
                 message: "misspelled".into(),
                 suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] },
             id, v));
-        e.active_mut().diagnostics.recheck_due_at = None; // clear immediately before the click
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).recheck_due_at = None; // clear immediately before the click
         let reg = Registry::builtins();
         let ex = InlineExecutor::default();
         let clk = TestClock(7_000);
@@ -1695,7 +1711,7 @@ mod tests {
         assert!(e.diag.is_none(), "overlay closes after click-apply");
         assert_eq!(e.active().document.buffer.to_string(), "the cat\n",
             "sanity: the suggestion was applied via the click");
-        assert_eq!(e.active().diagnostics.recheck_due_at, Some(7_000 + e.diag_cfg.debounce_ms),
+        assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), Some(7_000 + e.diag_cfg.debounce_ms),
             "click-apply arms exactly once, from the single seam call");
     }
 
@@ -3276,19 +3292,22 @@ mod tests {
     fn diagnostics_done_applies_only_for_current_version() {
         use crate::editor::Editor;
         let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        crate::test_support::install_enabled_harper(&mut e); // apply's is_enabled(Harper) guard
         let bid = e.active().id;
         let v = e.active().document.version;
         let diag = vec![wordcartel_core::diagnostics::Diagnostic {
             range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
             message: "misspelled".into(),
             suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] }];
+        let src = wordcartel_core::diagnostics::DiagSource::Harper;
         // current version → stored
-        crate::diagnostics_run::apply_diagnostics_done(&mut e, bid, v, diag.clone());
-        assert_eq!(e.active().diagnostics.diagnostics.len(), 1);
-        assert_eq!(e.active().diagnostics.computed_version, v);
+        crate::diagnostics_run::apply_diagnostics_done(&mut e, bid, v, src, diag.clone());
+        assert_eq!(e.active().diagnostics.slot(src).unwrap().diagnostics.len(), 1);
+        assert_eq!(e.active().diagnostics.slot(src).unwrap().computed_version, v);
         // stale version → discarded
-        crate::diagnostics_run::apply_diagnostics_done(&mut e, bid, v.wrapping_sub(1), diag);
-        assert_eq!(e.active().diagnostics.diagnostics.len(), 1, "stale result must not overwrite");
+        crate::diagnostics_run::apply_diagnostics_done(&mut e, bid, v.wrapping_sub(1), src, diag);
+        assert_eq!(e.active().diagnostics.slot(src).unwrap().diagnostics.len(), 1, "stale result must not overwrite");
     }
 
     /// Effort A: a provider lifecycle event delivered with NO modal open reaches the status line
@@ -3296,12 +3315,14 @@ mod tests {
     #[test]
     fn reduce_delivers_diag_provider_event_to_status() {
         use crate::editor::Editor; use crate::jobs::InlineExecutor; use crate::registry::Registry;
-        use crate::diag_provider::{ProviderEvent, INSTALL_HINT};
+        use crate::diag_provider::ProviderEvent;
+        use crate::harper_ls::INSTALL_HINT;
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         assert!(e.prompt.is_none(), "precondition: no modal");
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
-        crate::app::reduce(Msg::DiagProviderEvent(ProviderEvent::Degraded(INSTALL_HINT.into())),
+        crate::app::reduce(Msg::DiagProviderEvent { source: wordcartel_core::diagnostics::DiagSource::Harper,
+            event: ProviderEvent::Degraded(INSTALL_HINT.into()) },
             &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.status, INSTALL_HINT, "Degraded reached the status line via reduce_dispatch");
     }
@@ -3314,15 +3335,17 @@ mod tests {
         e.active_mut().view.mode = RenderMode::Review; // E7 T2: on_tick's dispatch is now Review-gated
         // Effort A: on_tick dispatches through the provider seam, not an embedded worker. Install a
         // Ready/accepting recorder so a due Tick hands the buffer off and latches in_flight.
-        let rec = crate::diag_provider::RecordingProvider::new();
+        let rec = crate::diag_provider::RecordingProvider::new()
+            .with_source(wordcartel_core::diagnostics::DiagSource::Harper);
         let calls = rec.calls_handle();
-        e.diag_provider = Box::new(rec);
-        e.active_mut().diagnostics.arm(0, 400); // due at 400
+        e.diag_providers.install(Box::new(rec), true);
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).arm(0, 400); // due at 400
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(500); // past due
         // a Tick at now=500 with diagnostics enabled dispatches one check into the provider
         crate::app::reduce(Msg::Tick, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
-        assert_eq!(e.active().diagnostics.in_flight_version, Some(e.active().document.version));
+        assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper)
+            .unwrap().in_flight_version, Some(e.active().document.version));
         let v = e.active().document.version;
         let log = calls.lock().unwrap();
         assert!(log.iter().any(|c| matches!(c,
@@ -3341,10 +3364,12 @@ mod tests {
         let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
         e.active_mut().view.mode = crate::editor::RenderMode::Review; // §2.5: quick_fix is Review-only
         let v = e.active().document.version;
-        e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
-            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(),
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
+            message: "x".into(),
             suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] }];
-        e.active_mut().diagnostics.computed_version = v;
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).computed_version = v;
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1); // cursor inside "teh"
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
@@ -3362,7 +3387,8 @@ mod tests {
     fn open_diag_clears_siblings_and_open_others_clear_diag() {
         use crate::editor::Editor;
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
-        let d = wordcartel_core::diagnostics::Diagnostic { range: 0..1, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(), suggestions: vec![] };
+        let d = wordcartel_core::diagnostics::Diagnostic { range: 0..1, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None, message: "x".into(), suggestions: vec![] };
         // open_diag clears a previously-open palette/search (reverse XOR direction)
         e.open_palette();
         assert!(e.palette.is_some(), "palette open before open_diag");
@@ -3387,13 +3413,16 @@ mod tests {
         e.active_mut().view.mode = crate::editor::RenderMode::Review;
         let v = e.active().document.version;
         // Store a diagnostic at version V.
-        e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
-            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(),
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
+            message: "x".into(),
             suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] }];
-        e.active_mut().diagnostics.computed_version = v;
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).computed_version = v;
         // Simulate an intervening edit: bump the document version so valid_for is now false.
         e.active_mut().document.version = v + 1;
-        assert!(!e.active().diagnostics.valid_for(e.active().document.version),
+        assert!(!e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper)
+            .is_some_and(|s| s.valid_for(e.active().document.version)),
             "precondition: diagnostics must be stale after version bump");
         let buf_before = e.active().document.buffer.to_string();
         // Place cursor inside the stale diagnostic range.
@@ -3415,11 +3444,13 @@ mod tests {
         let mut e = Editor::new_from_text("teh cat adn dog\n", None, (80, 24));
         e.active_mut().view.mode = crate::editor::RenderMode::Review; // §2.5: diag_next/prev are Review-only
         let v = e.active().document.version;
-        e.active_mut().diagnostics.diagnostics = vec![
-            wordcartel_core::diagnostics::Diagnostic { range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message:"x".into(), suggestions: vec![] },
-            wordcartel_core::diagnostics::Diagnostic { range: 8..11, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message:"x".into(), suggestions: vec![] },
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).diagnostics = vec![
+            wordcartel_core::diagnostics::Diagnostic { range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None, message:"x".into(), suggestions: vec![] },
+            wordcartel_core::diagnostics::Diagnostic { range: 8..11, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None, message:"x".into(), suggestions: vec![] },
         ];
-        e.active_mut().diagnostics.computed_version = v;
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).computed_version = v;
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(0);
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
@@ -3440,17 +3471,15 @@ mod tests {
     #[test]
     fn diag_deadline_excluded_when_in_flight() {
         use crate::diagnostics_run::{DiagStore, next_deadline};
-        // Build a store that has a past-due recheck_due_at AND an in-flight version.
+        use wordcartel_core::diagnostics::DiagSource;
+        // Build a store whose Harper slot has a past-due recheck_due_at AND an in-flight version.
         let mut store = DiagStore::new();
-        store.recheck_due_at = Some(0); // past due
-        store.in_flight_version = Some(5); // check is in flight
+        store.slot_mut(DiagSource::Harper).recheck_due_at = Some(0); // past due
+        store.slot_mut(DiagSource::Harper).in_flight_version = Some(5); // check is in flight
 
-        // Compute the diag_deadline using the same gating logic as the run() loop.
-        let diag_deadline = if store.in_flight_version.is_none() {
-            store.recheck_due_at
-        } else {
-            None
-        };
+        // Compute the diag_deadline using the same gating logic as the run() loop —
+        // `due_deadline` already applies the per-slot in-flight exclusion (Task 3).
+        let diag_deadline = store.due_deadline();
 
         // With no other deadlines, the computed deadline should be None (not 0),
         // so recv_timeout gets a long duration instead of 0 ms.
@@ -3460,16 +3489,12 @@ mod tests {
 
         // Sanity: without in-flight, the past-due timestamp IS included.
         // temporarily clear in_flight to test the other branch
-        let saved = store.in_flight_version.take();
-        let diag_deadline_no_flight = if store.in_flight_version.is_none() {
-            store.recheck_due_at
-        } else {
-            None
-        };
+        let saved = store.slot_mut(DiagSource::Harper).in_flight_version.take();
+        let diag_deadline_no_flight = store.due_deadline();
         let deadline_no_flight = next_deadline(&[None, None, None, diag_deadline_no_flight]);
         assert_eq!(deadline_no_flight, Some(0),
             "without in_flight, past-due recheck_due_at is included in the deadline");
-        store.in_flight_version = saved; // restore
+        store.slot_mut(DiagSource::Harper).in_flight_version = saved; // restore
     }
 
     // -----------------------------------------------------------------------
@@ -3487,10 +3512,12 @@ mod tests {
         e.active_mut().view.mode = crate::editor::RenderMode::Review; // §2.5: quick_fix is Review-only
         let v = e.active().document.version;
         // Arm valid diagnostics at version V and open the overlay.
-        e.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
-            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(),
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+            range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
+            message: "x".into(),
             suggestions: vec![wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into())] }];
-        e.active_mut().diagnostics.computed_version = v;
+        e.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).computed_version = v;
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);
         let (tx, _rx) = std::sync::mpsc::channel::<Msg>();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
@@ -4536,8 +4563,7 @@ mod tests {
         let menu_deadline = e.mouse.menu_reveal_due.or(e.mouse.menu_hide_due);
         let sb_dwell = e.mouse.scrollbar_reveal_due.or(e.mouse.scrollbar_hide_due);
         let status_dwell = e.mouse.status_reveal_due.or(e.mouse.status_hide_due);
-        let diag_deadline = if e.active().diagnostics.in_flight_version.is_none() {
-            e.active().diagnostics.recheck_due_at } else { None };
+        let diag_deadline = e.active().diagnostics.due_deadline(); // per-slot in-flight exclusion, all sources
         let reconcile_deadline = if e.active().reconcile.in_flight_version.is_none() {
             e.active().reconcile.due_at } else { None };
         let deadline = crate::diagnostics_run::next_deadline(&[

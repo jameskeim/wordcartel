@@ -53,13 +53,14 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
         Msg::TransformDone { buffer_id, version, range, kind, result } => {
             crate::jobs_apply::apply_transform_done(editor, buffer_id, version, range, kind, result, clock);
         }
-        Msg::DiagnosticsDone { buffer_id, version, diagnostics } => {
-            crate::diagnostics_run::apply_diagnostics_done(editor, buffer_id, version, diagnostics);
+        Msg::DiagnosticsDone { buffer_id, version, source, diagnostics } => {
+            crate::diagnostics_run::apply_diagnostics_done(editor, buffer_id, version, source, diagnostics);
         }
         // Effort A: a provider lifecycle event (Degraded/Restarted) must reach the status line even
         // under an open modal (e.g. harper crashes during a quit/save prompt). Second delivery site
         // beside reduce_dispatch's arm — the intercept's `_ => {}` would otherwise swallow it.
-        Msg::DiagProviderEvent(ev) => crate::diag_provider::apply_provider_event(editor, ev, clock),
+        Msg::DiagProviderEvent { source, event } =>
+            crate::diag_provider::apply_provider_event(editor, source, event, clock),
         Msg::ClipboardPaste { buffer_id, text, .. } => crate::jobs_apply::apply_clipboard_paste(editor, buffer_id, text, clock),
         Msg::ClipboardAvailability(ok) => crate::jobs_apply::apply_clipboard_availability(editor, ok),
         // Resize/Tick/other input: ignored for the modal, but results still drain below.
@@ -423,14 +424,16 @@ mod tests {
     fn intercept_delivers_diag_provider_event_under_a_modal() {
         use crate::editor::Editor;
         use crate::jobs::InlineExecutor;
-        use crate::diag_provider::{ProviderEvent, INSTALL_HINT};
+        use crate::diag_provider::ProviderEvent;
+        use crate::harper_ls::INSTALL_HINT;
         let mut e = Editor::new_from_text("hi\n", None, (80, 24));
         e.open_prompt(crate::prompt::Prompt::close_confirm("f.md", e.active().id));
         assert!(e.prompt.is_some(), "precondition: a modal prompt is open");
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        let handled = intercept(Msg::DiagProviderEvent(ProviderEvent::Degraded(INSTALL_HINT.into())),
+        let handled = intercept(Msg::DiagProviderEvent { source: wordcartel_core::diagnostics::DiagSource::Harper,
+            event: ProviderEvent::Degraded(INSTALL_HINT.into()) },
             &mut e, &ex, &clk, &tx);
         assert!(matches!(handled, crate::app::Handled::Done(_)), "interceptor consumes and folds");
         assert_eq!(e.status, INSTALL_HINT, "Degraded reached the status line despite the open modal");

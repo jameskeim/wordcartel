@@ -22,12 +22,14 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::app::Msg;
-use crate::diag_provider::{
-    Accepted, Availability, DiagnosticsProvider, ProviderConfig, ProviderEvent, INSTALL_HINT,
-};
+use crate::diag_provider::{Accepted, Availability, DiagnosticsProvider, ProviderConfig, ProviderEvent};
 use crate::editor::BufferId;
 use crate::limits::DIAG_MAX_SEND_BYTES;
-use wordcartel_core::diagnostics::{Diagnostic, DiagnosticKind};
+use wordcartel_core::diagnostics::{Diagnostic, DiagnosticKind, DiagSource};
+
+/// Status hint shown when harper-ls is unavailable (spec §9) — harper's own install copy.
+pub const INSTALL_HINT: &str =
+    "grammar checker unavailable — install harper-ls (Arch: pacman -S harper)";
 
 /// Publish watchdog: if the server never publishes for a sent version, emit an empty terminal
 /// after this so the single-in-flight latch never wedges (spec §3.4).
@@ -266,7 +268,8 @@ impl HarperState {
         let outstanding = self.awaiting_publish.remove(&buffer_id).map(|a| a.our_version)
             .or_else(|| self.assembling.remove(&buffer_id).map(|a| a.our_version));
         if let Some(version) = outstanding {
-            out.push(Action::Emit(Msg::DiagnosticsDone { buffer_id, version, diagnostics: Vec::new() }));
+            out.push(Action::Emit(Msg::DiagnosticsDone { buffer_id, version,
+                source: DiagSource::Harper, diagnostics: Vec::new() }));
         }
         if let Some(d) = self.docs.remove(&buffer_id) {
             self.uri_owner.remove(&d.uri);
@@ -371,12 +374,12 @@ impl HarperState {
         }
         if converted.is_empty() {
             return vec![Action::Emit(Msg::DiagnosticsDone { buffer_id, version: tagged,
-                diagnostics: Vec::new() })];
+                source: DiagSource::Harper, diagnostics: Vec::new() })];
         }
         let (start, end) = match raw_envelope(&raw) {
             Some(e) => e,
             None => return vec![Action::Emit(Msg::DiagnosticsDone { buffer_id, version: tagged,
-                diagnostics: converted })], // no envelope → emit converted suggestionless
+                source: DiagSource::Harper, diagnostics: converted })], // no envelope → emit converted suggestionless
         };
         let id = self.alloc_id();
         self.pending_requests.insert(id, PendingKind::CodeAction { buffer_id, generation,
@@ -407,7 +410,7 @@ impl HarperState {
         if !live {
             // Superseded mid-fetch: discard the (possibly wrong-range) fixes but clear the latch.
             return vec![Action::Emit(Msg::DiagnosticsDone { buffer_id,
-                version: assembly.our_version, diagnostics: Vec::new() })];
+                version: assembly.our_version, source: DiagSource::Harper, diagnostics: Vec::new() })];
         }
         let (uri, text) = self.docs.get(&buffer_id)
             .map(|d| (d.uri.clone(), d.text.clone())).unwrap_or_default();
@@ -423,7 +426,7 @@ impl HarperState {
         }
         diags.sort_by_key(|d| d.range.start);
         vec![Action::Emit(Msg::DiagnosticsDone { buffer_id, version: assembly.our_version,
-            diagnostics: diags })]
+            source: DiagSource::Harper, diagnostics: diags })]
     }
 
     /// Convert an LSP diagnostics array to our byte-ranged set against `text` (spec §6/§7). Drops
@@ -441,7 +444,15 @@ impl HarperState {
             let kind = classify_lsp(d);
             if !self.cfg.grammar && kind == DiagnosticKind::Grammar { continue; }
             let message = d.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string();
-            out.push(Diagnostic { range, kind, message, suggestions: Vec::new() });
+            let code = match d.get("code") {
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(other) => Some(other.to_string()),
+                None => None,
+            };
+            let href = d.get("codeDescription").and_then(|c| c.get("href"))
+                .and_then(|h| h.as_str()).map(str::to_string);
+            out.push(Diagnostic { range, kind, source: DiagSource::Harper, code, href, message,
+                suggestions: Vec::new() });
         }
         out.sort_by_key(|d| d.range.start);
         out
@@ -456,7 +467,7 @@ impl HarperState {
         for b in expired_pub {
             if let Some(a) = self.awaiting_publish.remove(&b) {
                 out.push(Action::Emit(Msg::DiagnosticsDone { buffer_id: b, version: a.our_version,
-                    diagnostics: Vec::new() }));
+                    source: DiagSource::Harper, diagnostics: Vec::new() }));
             }
         }
         let expired_asm: Vec<BufferId> = self.assembling.iter()
@@ -464,7 +475,7 @@ impl HarperState {
         for b in expired_asm {
             if let Some(a) = self.assembling.remove(&b) {
                 out.push(Action::Emit(Msg::DiagnosticsDone { buffer_id: b, version: a.our_version,
-                    diagnostics: a.diags }));
+                    source: DiagSource::Harper, diagnostics: a.diags }));
             }
         }
         out
@@ -481,11 +492,13 @@ impl HarperState {
             self.uri_owner.clear();
             self.pending_requests.clear();
             out.push(Action::SetAvailability(Availability::Starting));
-            out.push(Action::Emit(Msg::DiagProviderEvent(ProviderEvent::Restarted)));
+            out.push(Action::Emit(Msg::DiagProviderEvent { source: DiagSource::Harper,
+                event: ProviderEvent::Restarted }));
             out.push(Action::Respawn);
         } else {
             out.push(Action::SetAvailability(Availability::Unavailable));
-            out.push(Action::Emit(Msg::DiagProviderEvent(ProviderEvent::Degraded(CRASHED_HINT.into()))));
+            out.push(Action::Emit(Msg::DiagProviderEvent { source: DiagSource::Harper,
+                event: ProviderEvent::Degraded(CRASHED_HINT.into()) }));
             out.push(Action::Exit);
         }
         out
@@ -498,16 +511,16 @@ impl HarperState {
         let mut out = Vec::new();
         for (b, a) in self.awaiting_publish.drain() {
             out.push(Action::Emit(Msg::DiagnosticsDone { buffer_id: b, version: a.our_version,
-                diagnostics: Vec::new() }));
+                source: DiagSource::Harper, diagnostics: Vec::new() }));
         }
         for (b, a) in self.assembling.drain() {
             out.push(Action::Emit(Msg::DiagnosticsDone { buffer_id: b, version: a.our_version,
-                diagnostics: Vec::new() }));
+                source: DiagSource::Harper, diagnostics: Vec::new() }));
         }
         for c in std::mem::take(&mut self.queued) {
             if let Cmd::Change { buffer_id, version, .. } = c {
                 out.push(Action::Emit(Msg::DiagnosticsDone { buffer_id, version,
-                    diagnostics: Vec::new() }));
+                    source: DiagSource::Harper, diagnostics: Vec::new() }));
             }
         }
         out
@@ -598,7 +611,8 @@ impl HarperLs {
 }
 
 impl DiagnosticsProvider for HarperLs {
-    fn name(&self) -> &'static str { "Harper" }
+    fn source(&self) -> DiagSource { DiagSource::Harper }
+    fn install_hint(&self) -> &'static str { INSTALL_HINT }
 
     fn availability(&self) -> Availability {
         *self.shared.availability.lock().expect("availability mutex")
@@ -665,7 +679,7 @@ impl Drop for FlushGuard {
         while let Ok(inb) = self.cmd_rx.try_recv() {
             if let Inbound::Cmd(Cmd::Change { buffer_id, version, .. }) = inb {
                 let _ = self.msg_tx.send(Msg::DiagnosticsDone { buffer_id, version,
-                    diagnostics: Vec::new() });
+                    source: DiagSource::Harper, diagnostics: Vec::new() });
             }
         }
     }
@@ -721,7 +735,8 @@ fn pump(guard: &mut FlushGuard, inbound_tx: &Sender<Inbound>, shared: &Arc<Share
         Err(_) => {
             // NotFound (or any initial spawn failure) IS the runtime PATH detection (§3.2).
             set_availability(shared, Availability::Unavailable);
-            let _ = guard.msg_tx.send(Msg::DiagProviderEvent(ProviderEvent::Degraded(INSTALL_HINT.into())));
+            let _ = guard.msg_tx.send(Msg::DiagProviderEvent { source: DiagSource::Harper,
+                event: ProviderEvent::Degraded(INSTALL_HINT.into()) });
             return;
         }
     };
@@ -829,18 +844,19 @@ mod tests {
     /// Every emitted `DiagnosticsDone` as `(buffer_id, version, diagnostics)`.
     fn diag_dones(acts: &[Action]) -> Vec<(BufferId, u64, Vec<Diagnostic>)> {
         acts.iter().filter_map(|a| match a {
-            Action::Emit(Msg::DiagnosticsDone { buffer_id, version, diagnostics }) =>
+            Action::Emit(Msg::DiagnosticsDone { buffer_id, version, source: _, diagnostics }) =>
                 Some((*buffer_id, *version, diagnostics.clone())),
             _ => None,
         }).collect()
     }
 
     fn has_restarted(acts: &[Action]) -> bool {
-        acts.iter().any(|a| matches!(a, Action::Emit(Msg::DiagProviderEvent(ProviderEvent::Restarted))))
+        acts.iter().any(|a| matches!(a,
+            Action::Emit(Msg::DiagProviderEvent { event: ProviderEvent::Restarted, .. })))
     }
     fn degrade_hint(acts: &[Action]) -> Option<String> {
         acts.iter().find_map(|a| match a {
-            Action::Emit(Msg::DiagProviderEvent(ProviderEvent::Degraded(h))) => Some(h.clone()),
+            Action::Emit(Msg::DiagProviderEvent { event: ProviderEvent::Degraded(h), .. }) => Some(h.clone()),
             _ => None,
         })
     }
@@ -1325,7 +1341,8 @@ mod tests {
         drop(guard);
         let mut got: Vec<(BufferId, u64)> = Vec::new();
         while let Ok(m) = msg_rx.try_recv() {
-            if let Msg::DiagnosticsDone { buffer_id, version, diagnostics } = m {
+            if let Msg::DiagnosticsDone { buffer_id, version, source, diagnostics } = m {
+                assert_eq!(source, DiagSource::Harper);
                 assert!(diagnostics.is_empty());
                 got.push((buffer_id, version));
             }
@@ -1362,7 +1379,7 @@ mod tests {
     fn harper_ls_new_is_idle_and_spawns_nothing() {
         let (msg_tx, _msg_rx) = std::sync::mpsc::channel::<Msg>();
         let p = HarperLs::new(msg_tx, cfg(true));
-        assert_eq!(p.name(), "Harper");
+        assert_eq!(p.source(), DiagSource::Harper);
         assert_eq!(p.availability(), Availability::Idle);
     }
 

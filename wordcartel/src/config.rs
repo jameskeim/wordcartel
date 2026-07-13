@@ -296,6 +296,16 @@ struct RawDiagnostics {
     debounce_ms: Option<u64>,
     dictionary: Option<String>,
     linters: Option<Vec<String>>,
+    harper: RawHarperEngine,
+}
+/// `[diagnostics.harper]` — the per-engine table for the harper linter (SPINE Task 8, spec §9.1).
+/// `grammar` here is a config-file *spelling* of the already-global `diagnostics.grammar` option
+/// (folded on TOP of it, so `[diagnostics.harper].grammar` wins when set) — not a distinct
+/// setting, so no separate command surface obligation (§12).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawHarperEngine {
+    grammar: Option<bool>,
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -530,6 +540,9 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
         // diagnostics: per-field override + debounce_ms floor validation.
         if let Some(v) = raw.diagnostics.enabled { cfg.diagnostics.enabled = v; }
         if let Some(v) = raw.diagnostics.grammar { cfg.diagnostics.grammar = v; }
+        // [diagnostics.harper].grammar is a per-engine spelling of the same option — overrides
+        // the top-level value above when set (folded after it, on purpose).
+        if let Some(v) = raw.diagnostics.harper.grammar { cfg.diagnostics.grammar = v; }
         if let Some(v) = raw.diagnostics.debounce_ms {
             if v < 100 {
                 warns.push(format!("config: diagnostics.debounce_ms {v} below floor 100; clamped"));
@@ -554,7 +567,9 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
             cfg.diagnostics.dictionary = Some(expanded);
         }
         if let Some(v) = raw.diagnostics.linters { cfg.diagnostics.linters = Some(v); }
-        // unknown linter names are validated against the core catalog later (Task 4 assembly) — warn there.
+        // unknown linter names are validated against the core catalog in
+        // `diagnostics_run::install_core_providers` — warned there (SPINE Task 8), once the
+        // engine catalog itself exists to validate against.
 
         // ---- [theme] (discriminated source; file resolved vs the declaring config) ----
         let rt = raw.theme;
@@ -1197,4 +1212,28 @@ mod tests {
         assert_eq!(clipboard_provider_str(ClipboardProvider::Off), "off");
     }
 
+    // -----------------------------------------------------------------------
+    // [diagnostics] linters + [diagnostics.harper] grammar override (SPINE Task 8)
+    // -----------------------------------------------------------------------
+
+    fn load_diag(name: &str, body: &str) -> (Config, Vec<String>) {
+        let p = std::env::temp_dir().join(format!("wcartel-cfg-{}-{name}.toml", std::process::id()));
+        std::fs::write(&p, body).unwrap();
+        let out = load(std::slice::from_ref(&p));
+        let _ = std::fs::remove_file(&p);
+        out
+    }
+
+    #[test]
+    fn harper_engine_table_overrides_grammar() {
+        let (cfg, _warns) = load_diag("harper-grammar",
+            "[diagnostics]\ngrammar = true\n[diagnostics.harper]\ngrammar = false\n");
+        assert!(!cfg.diagnostics.grammar, "[diagnostics.harper].grammar overrides top-level");
+    }
+
+    #[test]
+    fn linters_list_round_trips() {
+        let (cfg, _warns) = load_diag("linters", "[diagnostics]\nlinters = [\"harper\"]\n");
+        assert_eq!(cfg.diagnostics.linters, Some(vec!["harper".to_string()]));
+    }
 }

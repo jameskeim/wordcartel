@@ -1292,6 +1292,7 @@ mod tests {
             ("diag", |e| {
                 let d = wordcartel_core::diagnostics::Diagnostic {
                     range: 0..1, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                    source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
                     message: "x".into(), suggestions: vec![] };
                 let (id, ver) = (e.active().id, e.active().document.version);
                 e.diag = Some(crate::diag_overlay::DiagOverlay::new(d, id, ver));
@@ -1438,6 +1439,7 @@ mod tests {
             wordcartel_core::diagnostics::Diagnostic {
                 range: 0..3,
                 kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
                 message: "misspelled".into(),
                 suggestions: vec![
                     wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into()),
@@ -1472,6 +1474,7 @@ mod tests {
             wordcartel_core::diagnostics::Diagnostic {
                 range: 0..3,
                 kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
                 message: "m".into(),
                 suggestions: vec![
                     wordcartel_core::diagnostics::Suggestion::ReplaceWith("the".into()),

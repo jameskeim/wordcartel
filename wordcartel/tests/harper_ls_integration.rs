@@ -13,7 +13,7 @@ use wordcartel::app::Msg;
 use wordcartel::diag_provider::{Accepted, DiagnosticsProvider, ProviderConfig};
 use wordcartel::editor::BufferId;
 use wordcartel::harper_ls::HarperLs;
-use wordcartel_core::diagnostics::{Diagnostic, DiagnosticKind, Suggestion};
+use wordcartel_core::diagnostics::{Diagnostic, DiagnosticKind, DiagSource, Suggestion};
 
 fn harper_on_path() -> bool {
     Command::new("harper-ls").arg("--version").stdout(Stdio::null())
@@ -34,9 +34,11 @@ fn await_diagnostics_done(
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() { return None; }
         match rx.recv_timeout(remaining) {
-            Ok(Msg::DiagnosticsDone { buffer_id, version, diagnostics })
-                if buffer_id == want_buffer && version == want_version =>
-                return Some(diagnostics),
+            Ok(Msg::DiagnosticsDone { buffer_id, version, source, diagnostics })
+                if buffer_id == want_buffer && version == want_version => {
+                assert_eq!(source, DiagSource::Harper, "the real harper-ls provider tags Harper");
+                return Some(diagnostics);
+            }
             Ok(_) => continue, // e.g. DiagProviderEvent(Restarted) while the child spawns
             Err(RecvTimeoutError::Timeout) => return None,
             Err(RecvTimeoutError::Disconnected) => return None,

@@ -1,6 +1,7 @@
 //! The plugin VM host: owns the one `mlua` VM + bridge + committed hooks, and the VM's
 //! lifecycle. `null()` is the no-VM host used for `--no-plugins`, load failure, and tests that
-//! don't exercise plugins (mirrors `NullProvider`). Task 4 adds the real VM ([`PluginHost::new`])
+//! don't exercise plugins (mirrors the empty `ProviderSet`, diag_provider.rs's hermetic default).
+//! Task 4 adds the real VM ([`PluginHost::new`])
 //! and the registration sink ([`PendingReg`]) the load layer (`plugin::load`) drains into the
 //! `Registry` after each plugin's script executes, atomically per plugin. Task 5 adds the
 //! [`Bridge`] (the live `Rc<RefCell<Editor>>` + `Sender<Msg>` + clock the `wc.*` editor API
@@ -106,7 +107,8 @@ pub(crate) const LOAD_TIME_BUDGET: Duration = Duration::from_secs(1);
 
 impl PluginHost {
     /// A null host — no VM, no plugins. Used for `--no-plugins`, load failure, and tests
-    /// that don't exercise plugins (mirrors `NullProvider`).
+    /// that don't exercise plugins (mirrors the empty `ProviderSet`, diag_provider.rs's
+    /// hermetic default).
     ///
     /// # Examples
     /// ```

@@ -104,6 +104,7 @@ mod tests {
         let d = wordcartel_core::diagnostics::Diagnostic {
             range: 0..1,
             kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
             message: "m".into(),
             suggestions,
         };

@@ -121,9 +121,9 @@ fn status_dwell_deadline(e: &Editor, _now: u64) -> Option<u64> {
 /// deadline left over from a buffer that has since left Review must not wake the loop
 /// (the same spin class as the in-flight gate, one call site down).
 fn diag_deadline(e: &Editor, _now: u64) -> Option<u64> {
-    if crate::diagnostics_run::should_run_diagnostics(e)
-        && e.active().diagnostics.in_flight_version.is_none()
-    { e.active().diagnostics.recheck_due_at } else { None }
+    if crate::diagnostics_run::should_run_diagnostics(e) {
+        e.active().diagnostics.due_deadline() // already excludes in-flight slots, per-slot
+    } else { None }
 }
 
 /// Block-tree reconcile deadline — same A3 shape as diagnostics: excluded while a
@@ -196,11 +196,10 @@ pub(crate) fn on_tick(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock,
         crate::swap::dispatch_swap_write(&mut ctx);
     }
     // Dispatch diagnostics if due.
-    let version = editor.active().document.version;
     if crate::diagnostics_run::should_run_diagnostics(editor)
-        && crate::diagnostics_run::diag_due(&editor.active().diagnostics, now, version)
+        && editor.active().diagnostics.any_due(now)
     {
-        crate::diagnostics_run::dispatch_diagnostics(editor);
+        crate::diagnostics_run::dispatch_diagnostics(editor, now);
     }
     // Dispatch a block-tree reconcile if due.
     if crate::reconcile::reconcile_due(&editor.active().reconcile, now) {
@@ -226,6 +225,7 @@ pub(crate) fn on_tick(editor: &mut Editor, ex: &dyn Executor, clock: &dyn Clock,
 #[cfg(test)]
 mod tests {
     use crate::editor::Editor;
+    use wordcartel_core::diagnostics::DiagSource;
 
     // -----------------------------------------------------------------------
     // Save-timeout seam (relocated from app.rs — C4 Task 2)
@@ -289,7 +289,7 @@ mod tests {
         let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 10));
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = RenderMode::LivePreview;
-        e.active_mut().diagnostics.arm(0, 400); // recheck_due_at = Some(400), in_flight None
+        e.active_mut().diagnostics.slot_mut(DiagSource::Harper).arm(0, 400); // recheck_due_at = Some(400), in_flight None
         assert_eq!(crate::timers::diag_deadline(&e, 10_000), None, "no wake for a non-Review armed store (no spin)");
         e.active_mut().view.mode = RenderMode::Review;
         assert_eq!(crate::timers::diag_deadline(&e, 10_000), Some(400), "Review: the armed deadline is live");
@@ -323,14 +323,14 @@ mod tests {
         e.active_mut().view.mode = crate::editor::RenderMode::Review;
 
         // --- diagnostics: past-due recheck ARMED ---
-        e.active_mut().diagnostics.recheck_due_at = Some(0);
-        e.active_mut().diagnostics.in_flight_version = Some(1);
+        e.active_mut().diagnostics.slot_mut(DiagSource::Harper).recheck_due_at = Some(0);
+        e.active_mut().diagnostics.slot_mut(DiagSource::Harper).in_flight_version = Some(1);
         assert_eq!((diag())(&e, 10_000), None, "diagnostics must be None while in-flight");
         // Un-gate (same due time): the deadline reappears — proving the gate suppressed it,
         // NOT that the work was simply unarmed. This assert FAILS if the diag guard is removed.
-        e.active_mut().diagnostics.in_flight_version = None;
+        e.active_mut().diagnostics.slot_mut(DiagSource::Harper).in_flight_version = None;
         assert_eq!((diag())(&e, 10_000), Some(0), "without the in-flight gate diag would be due");
-        e.active_mut().diagnostics.in_flight_version = Some(1); // re-gate for the fold check below
+        e.active_mut().diagnostics.slot_mut(DiagSource::Harper).in_flight_version = Some(1); // re-gate for the fold check below
 
         // --- reconcile: past-due ARMED ---
         e.active_mut().reconcile.due_at = Some(0);

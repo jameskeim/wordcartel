@@ -459,18 +459,16 @@ impl Registry {
         });
 
         // Diagnostics — quick-fix overlay + navigation + recheck (Task 6–7 / Effort 5f).
+        // Each handler reads through active_lens_diags (Task 6): whichever engine is the active
+        // lens, gated on Review/show + that slot's version validity — the single source of truth
+        // for "what the lens shows".
         r.register("quick_fix", "Quick Fix\u{2026}", None, |c| {
-            if !crate::diagnostics_run::should_show_diagnostics(c.editor) {
+            let Some(diags) = crate::diagnostics_run::active_lens_diags(c.editor) else {
                 c.editor.status = "no diagnostic here".into();
                 return CommandResult::Handled;
-            }
-            let b = c.editor.active();
-            if !b.diagnostics.valid_for(b.document.version) {
-                c.editor.status = "no diagnostic here".into();
-                return CommandResult::Handled;
-            }
+            };
             let caret = c.editor.active().document.selection.primary().head;
-            let diag = c.editor.active().diagnostics.diagnostics.iter()
+            let diag = diags.iter()
                 .find(|d| d.range.start <= caret && caret <= d.range.end)
                 .cloned();
             if let Some(d) = diag {
@@ -481,14 +479,9 @@ impl Registry {
             CommandResult::Handled
         });
         r.register("diag_next", "Next Diagnostic", None, |c| {
-            if !crate::diagnostics_run::should_show_diagnostics(c.editor) {
+            let Some(diags) = crate::diagnostics_run::active_lens_diags(c.editor) else {
                 return CommandResult::Handled;
-            }
-            let b = c.editor.active();
-            if !b.diagnostics.valid_for(b.document.version) {
-                return CommandResult::Handled;
-            }
-            let diags = c.editor.active().diagnostics.diagnostics.clone();
+            };
             if diags.is_empty() { return CommandResult::Handled; }
             let caret = c.editor.active().document.selection.primary().to();
             let target = diags.iter()
@@ -503,14 +496,9 @@ impl Registry {
             CommandResult::Handled
         });
         r.register("diag_prev", "Previous Diagnostic", None, |c| {
-            if !crate::diagnostics_run::should_show_diagnostics(c.editor) {
+            let Some(diags) = crate::diagnostics_run::active_lens_diags(c.editor) else {
                 return CommandResult::Handled;
-            }
-            let b = c.editor.active();
-            if !b.diagnostics.valid_for(b.document.version) {
-                return CommandResult::Handled;
-            }
-            let diags = c.editor.active().diagnostics.diagnostics.clone();
+            };
             if diags.is_empty() { return CommandResult::Handled; }
             let caret = c.editor.active().document.selection.primary().to();
             let last = diags.len() - 1;
@@ -528,8 +516,26 @@ impl Registry {
         });
         r.register("recheck_diagnostics", "Recheck Diagnostics", None, |c| {
             if crate::diagnostics_run::should_run_diagnostics(c.editor) {
-                c.editor.active_mut().diagnostics.arm(c.clock.now_ms(), 0);
+                crate::diagnostics_run::arm_enabled(c.editor, c.clock.now_ms(), 0);
             }
+            CommandResult::Handled
+        });
+
+        // Analysis lens — set-per-state primitive (palette-only) + stateful cycle representative
+        // (contract rule 8 — the keymap_next / cycle_render_mode precedent). One primitive per
+        // AVAILABLE core engine; the ltex/vale effort adds its siblings here.
+        r.register("analysis_engine_harper", "Analysis Engine: Harper", None, |c| {
+            c.editor.set_analysis_source(wordcartel_core::diagnostics::DiagSource::Harper);
+            CommandResult::Handled
+        });
+        r.register_stateful("analysis_next", "Analysis Engine", Some(MenuCategory::View),
+            |e| MenuMark::Value(e.active_analysis_source.label()),
+            |c| { crate::diagnostics_run::cycle_analysis_source(c.editor); CommandResult::Handled });
+        // Per-engine enablement — a 2-state toggle (contract rule 8), palette-only.
+        r.register("toggle_engine_harper", "Toggle Harper Engine", None, |c| {
+            let on = !c.editor.diag_providers.is_enabled(wordcartel_core::diagnostics::DiagSource::Harper);
+            crate::diagnostics_run::set_engine_enabled(c.editor,
+                wordcartel_core::diagnostics::DiagSource::Harper, on, c.clock);
             CommandResult::Handled
         });
 
@@ -1543,15 +1549,16 @@ mod tests {
 
         // Seed the DiagStore with a diagnostic inside ## A's body.
         let v = ed.active().document.version;
-        ed.active_mut().diagnostics.diagnostics = vec![
+        ed.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).diagnostics = vec![
             wordcartel_core::diagnostics::Diagnostic {
                 range: bad_byte..(bad_byte + "bad_word".len()),
                 kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
                 message: "x".into(),
                 suggestions: vec![],
             }
         ];
-        ed.active_mut().diagnostics.computed_version = v;
+        ed.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).computed_version = v;
 
         // Fold ## A AFTER seeding diagnostics (version unchanged).
         ed.active_mut().folds.toggle(a_byte);
@@ -1583,15 +1590,16 @@ mod tests {
 
         // Seed the DiagStore with a diagnostic inside ## A's body.
         let v = ed.active().document.version;
-        ed.active_mut().diagnostics.diagnostics = vec![
+        ed.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).diagnostics = vec![
             wordcartel_core::diagnostics::Diagnostic {
                 range: bad_byte..(bad_byte + "bad_word".len()),
                 kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
                 message: "x".into(),
                 suggestions: vec![],
             }
         ];
-        ed.active_mut().diagnostics.computed_version = v;
+        ed.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).computed_version = v;
 
         // Fold ## A AFTER seeding diagnostics (version unchanged).
         ed.active_mut().folds.toggle(a_byte);
@@ -1620,11 +1628,16 @@ mod tests {
     fn view_review_command_enters_review_and_arms() {
         use crate::editor::RenderMode;
         let mut ed = Editor::new_from_text("x\n", None, (80, 24));
+        // arm_enabled (Task 3) only arms slots of INSTALLED+enabled sources — install Harper so
+        // the arm-on-enter-Review behavior below has something to arm.
+        ed.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new()
+            .with_source(wordcartel_core::diagnostics::DiagSource::Harper)), true);
         ed.diag_cfg.enabled = true;
         assert_eq!(ed.active().view.mode, RenderMode::LivePreview);
         dispatch_id(&mut ed, "view_review");
         assert_eq!(ed.active().view.mode, RenderMode::Review);
-        assert_eq!(ed.active().diagnostics.recheck_due_at, Some(0), "arm-on-enter at debounce 0 (Z clock now=0)");
+        assert_eq!(ed.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper)
+            .unwrap().recheck_due_at, Some(0), "arm-on-enter at debounce 0 (Z clock now=0)");
     }
 
     #[test]
@@ -1653,10 +1666,12 @@ mod tests {
         let doc = "teh cat\n";
         let seed = |ed: &mut Editor| {
             let v = ed.active().document.version;
-            ed.active_mut().diagnostics.diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
-                range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling, message: "x".into(),
+            ed.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).diagnostics = vec![wordcartel_core::diagnostics::Diagnostic {
+                range: 0..3, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+                source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
+                message: "x".into(),
                 suggestions: vec![] }];
-            ed.active_mut().diagnostics.computed_version = v;
+            ed.active_mut().diagnostics.slot_mut(wordcartel_core::diagnostics::DiagSource::Harper).computed_version = v;
             ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(1);
         };
 
@@ -1739,6 +1754,54 @@ mod tests {
         // keymap_cua/keymap_wordstar are palette-only now (menu: None).
         assert_eq!(reg.meta(CommandId("keymap_cua")).unwrap().menu, None);
         assert_eq!(reg.meta(CommandId("keymap_next")).unwrap().menu, Some(MenuCategory::Settings));
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 7: analysis-lens/enable commands — registration + dispatch.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn analysis_commands_registered_and_dispatch() {
+        let reg = Registry::builtins();
+        assert!(reg.meta(CommandId("analysis_engine_harper")).is_some());
+        assert!(reg.meta(CommandId("analysis_next")).is_some());
+        assert!(reg.meta(CommandId("toggle_engine_harper")).is_some());
+        assert_eq!(reg.meta(CommandId("analysis_engine_harper")).unwrap().menu, None,
+            "set-primitive is palette-only");
+        assert!(reg.meta(CommandId("analysis_next")).unwrap().menu.is_some(),
+            "cycle carried in the menu");
+        assert_eq!(reg.meta(CommandId("toggle_engine_harper")).unwrap().menu, None,
+            "enablement toggle is palette-only");
+    }
+
+    #[test]
+    fn analysis_next_dispatches_cycle_and_reports_state() {
+        let mut ed = Editor::new_from_text("x\n", None, (40, 8));
+        ed.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new()
+                .with_source(wordcartel_core::diagnostics::DiagSource::Harper)), true);
+        ed.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new()
+                .with_source(wordcartel_core::diagnostics::DiagSource::Plugin("mock"))), true);
+        let reg = Registry::builtins();
+        let meta = reg.meta(CommandId("analysis_next")).unwrap();
+        assert_eq!((meta.state.unwrap())(&ed), MenuMark::Value("Harper"));
+        dispatch_id(&mut ed, "analysis_next");
+        assert_eq!(ed.active_analysis_source, wordcartel_core::diagnostics::DiagSource::Plugin("mock"));
+        assert_eq!((meta.state.unwrap())(&ed), MenuMark::Value("mock"));
+    }
+
+    #[test]
+    fn toggle_engine_harper_dispatches_set_engine_enabled() {
+        let mut ed = Editor::new_from_text("x\n", None, (40, 8));
+        ed.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new()
+                .with_source(wordcartel_core::diagnostics::DiagSource::Harper)), false);
+        assert!(!ed.diag_providers.is_enabled(wordcartel_core::diagnostics::DiagSource::Harper));
+        dispatch_id(&mut ed, "toggle_engine_harper");
+        assert!(ed.diag_providers.is_enabled(wordcartel_core::diagnostics::DiagSource::Harper));
+        dispatch_id(&mut ed, "toggle_engine_harper");
+        assert!(!ed.diag_providers.is_enabled(wordcartel_core::diagnostics::DiagSource::Harper));
     }
 
     // Helper: build a Ctx and dispatch a command id against the given Editor.
@@ -1897,14 +1960,19 @@ mod tests {
     fn recheck_diagnostics_arms_only_in_review() {
         use crate::editor::RenderMode;
         let mut ed = Editor::new_from_text("teh cat\n", None, (80, 24));
+        // arm_enabled (Task 3) only arms slots of INSTALLED+enabled sources.
+        ed.diag_providers.install(Box::new(crate::diag_provider::RecordingProvider::new()
+            .with_source(wordcartel_core::diagnostics::DiagSource::Harper)), true);
         ed.diag_cfg.enabled = true;
 
         ed.active_mut().view.mode = RenderMode::LivePreview;
         dispatch_id(&mut ed, "recheck_diagnostics");
-        assert_eq!(ed.active().diagnostics.recheck_due_at, None, "no-op outside Review");
+        assert!(ed.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).is_none(),
+            "no-op outside Review");
 
         ed.active_mut().view.mode = RenderMode::Review;
         dispatch_id(&mut ed, "recheck_diagnostics");
-        assert!(ed.active().diagnostics.recheck_due_at.is_some(), "arms a recheck in Review");
+        assert!(ed.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper)
+            .unwrap().recheck_due_at.is_some(), "arms a recheck in Review");
     }
 }
