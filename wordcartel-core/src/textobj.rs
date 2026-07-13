@@ -223,6 +223,37 @@ pub fn sentence_bounds(text: &str, pos: usize) -> (usize, usize) {
     prev.unwrap_or((0, 0)) // past last → last; no content → (0,0)
 }
 
+/// Start of the sentence STRICTLY BEFORE `pos` (the greatest sentence start `< pos`)
+/// — Emacs `M-a`'s kernel. `None` at or before the first sentence start.
+///
+/// # Examples
+/// ```
+/// use wordcartel_core::textobj::prev_sentence_start;
+/// assert_eq!(prev_sentence_start("One two. Three four.", 12), Some(9));
+/// ```
+pub fn prev_sentence_start(text: &str, pos: usize) -> Option<usize> {
+    let pos = pos.min(text.len());
+    let mut last = None;
+    for (from, _) in sentence_spans(text) {
+        if from >= pos { break; }
+        last = Some(from);
+    }
+    last
+}
+
+/// Content end of the first sentence whose end is STRICTLY AFTER `pos` — Emacs
+/// `M-e`'s kernel. `None` past the last sentence's content end.
+///
+/// # Examples
+/// ```
+/// use wordcartel_core::textobj::next_sentence_end;
+/// assert_eq!(next_sentence_end("One two. Three four.", 0), Some(8));
+/// ```
+pub fn next_sentence_end(text: &str, pos: usize) -> Option<usize> {
+    let pos = pos.min(text.len());
+    sentence_spans(text).map(|(_, to)| to).find(|&to| to > pos)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +392,24 @@ mod tests {
         assert_eq!(sentence_spans("été fini. Then done.").count(), 2);
         assert_eq!(sentence_spans("中文。Then done.").count(), 2);       // ideographic stop
         assert_eq!(sentence_spans("Nice 🙂. Then done.").count(), 2);
+    }
+    #[test]
+    fn sentence_motion_kernels() {
+        let t = "One two. Three four."; // spans (0,8), (9,20)
+        // prev_sentence_start = greatest start strictly < pos (Emacs M-a kernel).
+        assert_eq!(prev_sentence_start(t, 12), Some(9)); // inside 2nd → its start
+        assert_eq!(prev_sentence_start(t, 9),  Some(0)); // AT 2nd start → previous
+        assert_eq!(prev_sentence_start(t, 3),  Some(0)); // inside 1st → its start
+        assert_eq!(prev_sentence_start(t, 0),  None);    // at doc start → none
+        // next_sentence_end = first content end strictly > pos (Emacs M-e kernel).
+        assert_eq!(next_sentence_end(t, 0),  Some(8));   // → 1st content end
+        assert_eq!(next_sentence_end(t, 8),  Some(20));  // AT 1st end → next end
+        assert_eq!(next_sentence_end(t, 9),  Some(20));  // in 2nd → its end
+        assert_eq!(next_sentence_end(t, 20), None);      // at last end → none
+    }
+    #[test]
+    fn sentence_motion_kernels_empty() {
+        assert_eq!(prev_sentence_start("", 0), None);
+        assert_eq!(next_sentence_end("", 0), None);
     }
 }
