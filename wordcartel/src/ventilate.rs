@@ -584,4 +584,73 @@ mod tests {
             assert_eq!((ps + sf, ps + st), (gf, gt), "lens span EQUALS select-sentence span (SEE==SELECT)");
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Task 8 — integration/e2e + guardrails (spec §12).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t_diff_spans_equals_sentence_spans_on_raw() {
+        // The lens's row-group grouping equals sentence_spans on the RAW block text — incl. a
+        // verse (two-space) hard break that the veto keeps as TWO groups (matching select-sentence).
+        let raw = "Roses are red,  \nViolets are blue. Then dawn.";
+        let want = wordcartel_core::textobj::sentence_spans(raw).count();
+        assert_eq!(segment_block(raw).count(), want);
+        assert_eq!(want, 3, "verse hard break + terminator → three sentences");
+    }
+
+    #[test]
+    fn t_perf_edit_relays_visible_range_only() {
+        // Editing in a ventilated block re-runs the fill for the VISIBLE range only, never an
+        // O(document) walk. LAYOUT_RUNS increments by exactly 1 for the post-edit rebuild — a
+        // stale-cache regression (0: the edit failed to invalidate) or a double-fill regression
+        // (>1: the gate re-entered the fill twice for one state change) both fail this.
+        let mut e = Editor::new_from_text("Alpha one. Beta two.\n\nGamma three.\n", None, (40, 8));
+        e.active_mut().view.ventilate = true;
+        crate::derive::rebuild(&mut e);
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(5);
+        let (cs, edit) = crate::commands::build_multi_replace(&[(5, 5, "X".into())], e.active().document.buffer.len());
+        let txn = wordcartel_core::history::Transaction::new(cs);
+        struct C; impl wordcartel_core::history::Clock for C { fn now_ms(&self) -> u64 { 0 } }
+        e.active_mut().apply(txn, edit, wordcartel_core::history::EditKind::Other, &C);
+        crate::derive::LAYOUT_RUNS.with(|c| c.set(0));
+        crate::derive::rebuild(&mut e);
+        assert_eq!(crate::derive::LAYOUT_RUNS.with(|c| c.get()), 1, "one visible-range fill, no doc walk");
+    }
+
+    #[test]
+    fn t_perf_visible_range_bound_not_document_size() {
+        // MUTATION-PROOF companion to `t_perf_edit_relays_visible_range_only`: that test's
+        // LAYOUT_RUNS==1 counter only proves the fill ran exactly ONCE per edit — it does NOT bound
+        // WHAT that one run gathered, so it would not catch a regression that removed
+        // `fill_visible`'s `overscan` early-exit (a genuine O(document) walk still increments the
+        // counter by exactly 1). This test asserts the CONTENT bound directly: a document with many
+        // far-off-screen paragraphs, edited/rebuilt at a small viewport, must cache only a HANDFUL of
+        // `line_layouts`/`vent_blocks` entries — nowhere near the paragraph count — proving the fill
+        // stayed within the visible range.
+        const PARAS: usize = 500;
+        let mut text = String::new();
+        for i in 0..PARAS { text.push_str(&format!("Paragraph number {i} has some words in it.\n\n")); }
+        let mut e = Editor::new_from_text(&text, None, (40, 8));
+        e.active_mut().view.ventilate = true;
+        crate::derive::rebuild(&mut e);
+        assert!(
+            e.active().view.vent_blocks.len() < 10,
+            "visible-range fill must cache far fewer than {PARAS} paragraphs, got {}",
+            e.active().view.vent_blocks.len()
+        );
+        // Edit near the top (inside the visible range) and rebuild again — the re-fill must stay
+        // just as bounded, not grow toward the document size.
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(5);
+        let (cs, edit) = crate::commands::build_multi_replace(&[(5, 5, "X".into())], e.active().document.buffer.len());
+        let txn = wordcartel_core::history::Transaction::new(cs);
+        struct C; impl wordcartel_core::history::Clock for C { fn now_ms(&self) -> u64 { 0 } }
+        e.active_mut().apply(txn, edit, wordcartel_core::history::EditKind::Other, &C);
+        crate::derive::rebuild(&mut e);
+        assert!(
+            e.active().view.vent_blocks.len() < 10,
+            "post-edit re-fill must stay bounded to the visible range, got {}",
+            e.active().view.vent_blocks.len()
+        );
+    }
 }
