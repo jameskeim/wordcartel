@@ -86,7 +86,7 @@ Every task's requirements implicitly include this section.
    summary in the pre-merge report; a red result is advisory, never a merge blocker.
 9. **Commit trailers (verbatim) on every commit** — append after the one-line subject:
    ```
-   Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+   Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
    Claude-Session: https://claude.ai/code/session_018zpBg3F9gzJKpejo6JSHDG
    ```
 
