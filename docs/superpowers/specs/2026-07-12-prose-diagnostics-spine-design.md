@@ -644,9 +644,10 @@ pub fn set_analysis_source(&mut self, source: wordcartel_core::diagnostics::Diag
 ```
 
 Invariant: whenever at least one engine is enabled, `active_analysis_source` names an enabled engine
-(`set_analysis_source` refuses disabled targets; `set_engine_enabled` relocates the lens on disable —
-§8.4). With zero enabled engines the field retains its last value and is inert (nothing arms, nothing
-paints, nav gates return early).
+(`set_analysis_source` refuses disabled targets; `set_engine_enabled` relocates the lens on disable AND
+on enable-when-the-lens-is-parked-on-a-disabled-engine — §8.4, both transitions). With zero enabled
+engines the field retains its last value and is inert (nothing arms, nothing paints, nav gates return
+early); the first subsequent enable relocates the lens onto it.
 
 The cycle lives beside the dispatch code:
 
@@ -722,7 +723,9 @@ enablement; no parallel set to drift). The shared setter:
 /// config seeding both express enablement through ProviderSet state; runtime mutation routes
 /// here. Disable: remove the engine's slot from EVERY buffer (underlines drop immediately; a
 /// late in-flight terminal is dropped by apply's enabled guard) and relocate the lens if it
-/// pointed here. Enable: arm the engine on the active buffer when Review is live.
+/// pointed here. Enable: arm the engine on the active buffer when Review is live, and — if the
+/// lens was parked on a now-disabled engine (the re-enable-after-disable-to-zero path) — relocate
+/// it to the engine just enabled, so §8.1's invariant holds on BOTH transitions, not only disable.
 pub fn set_engine_enabled(editor: &mut Editor, source: DiagSource, on: bool,
     clock: &dyn wordcartel_core::history::Clock) {
     if !editor.diag_providers.set_enabled(source, on) {
@@ -734,7 +737,14 @@ pub fn set_engine_enabled(editor: &mut Editor, source: DiagSource, on: bool,
             let now = clock.now_ms();
             editor.active_mut().diagnostics.slot_mut(source).arm(now, 0);
         }
-        editor.status = format!("{} enabled", source.label());
+        // Lens invariant (§8.1): the only way the lens can name a disabled engine here is a
+        // disable-to-zero followed by re-enable — point it at the engine just enabled so its
+        // results are visible and reachable. Otherwise keep the current (enabled) lens.
+        if editor.diag_providers.is_enabled(editor.active_analysis_source) {
+            editor.status = format!("{} enabled", source.label());
+        } else {
+            editor.set_analysis_source(source); // relocates lens + sets "analysis: {label}"
+        }
     } else {
         for b in editor.buffers.iter_mut() { b.diagnostics.clear_source(source); }
         if editor.active_analysis_source == source {
@@ -1139,3 +1149,21 @@ Pre-merge report additionally runs `scripts/smoke/run.sh` and quotes its one-lin
   fallback), disable-while-in-flight (slot cleared; late terminal dropped), zero-enabled behavior
   (inert lens + honest statuses), text-clone cost stance (accepted at N=1, `Arc<str>` named as the
   future lever), config-linter-warning ordering (before the status point) — all pinned.
+
+---
+
+## 17. History
+
+- **2026-07-12 — §8.4 lens-invariant amendment (post-implementation, pre-merge).** The Fable
+  whole-branch gate's probe found that `set_engine_enabled`'s enable branch, as originally specified,
+  did not maintain §8.1's lens invariant on one path: a disable-to-zero (lens parked on the
+  last-disabled engine) followed by re-enabling an engine left `active_analysis_source` naming a
+  *disabled* engine — its results invisible (`active_lens_diags → None`) and unreachable by the cycle
+  (a single enabled engine → no-op), recoverable only via the `analysis_engine_*` set-primitive. The
+  original §8.4 code faithfully matched the spec but contradicted §8.1's stated invariant (a
+  spec-internal inconsistency). Unreachable in the shipped single-engine (harper-only) surface;
+  reachable via the test mock and effort b's real multi-engine future. **Resolution (human-approved):**
+  the enable branch now relocates the lens to the just-enabled engine when the current lens is not
+  enabled, so §8.1 holds on both the enable and disable transitions. `set_engine_enabled` remains the
+  single enablement setter (contract law 6). Change scope: ~4 lines + one regression test
+  (`re_enable_after_zero_relocates_lens_onto_enabled_engine`); no other section affected.

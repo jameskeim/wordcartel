@@ -286,14 +286,15 @@ pub fn cycle_analysis_source(editor: &mut Editor) {
     editor.set_analysis_source(enabled[(idx + 1) % enabled.len()]);
 }
 
-/// The single per-engine enablement setter (spec §8.4, command-surface contract law 6): flips
-/// `source`'s entry in `ProviderSet`. On enable, arms the source on the active buffer when Review
-/// diagnostics are live (so the newly-enabled engine gets checked without waiting for the next
-/// edit). On disable, clears `source`'s slot in EVERY buffer (a disabled engine must not leave
-/// stale results behind anywhere) and, if the lens was pointed at the disabled engine, relocates
-/// it to the next enabled source — or, with none left, an honest "no analysis engine enabled"
-/// status rather than a lens silently pointing at a dead engine. Does NOT `shutdown()` the
-/// provider — it stays warm for a quick re-enable; teardown remains the loop-exit `shutdown_all`.
+/// The single setter for per-engine enablement (contract law 6) — the toggle command and startup
+/// config seeding both express enablement through ProviderSet state; runtime mutation routes
+/// here. Disable: remove the engine's slot from EVERY buffer (underlines drop immediately; a
+/// late in-flight terminal is dropped by apply's enabled guard) and relocate the lens if it
+/// pointed here. Enable: arm the engine on the active buffer when Review is live, and — if the
+/// lens was parked on a now-disabled engine (the re-enable-after-disable-to-zero path) — relocate
+/// it to the engine just enabled, so §8.1's invariant holds on BOTH transitions, not only disable.
+/// Does NOT `shutdown()` the provider — it stays warm for a quick re-enable; teardown remains the
+/// loop-exit `shutdown_all`.
 pub fn set_engine_enabled(editor: &mut Editor, source: DiagSource, on: bool,
     clock: &dyn wordcartel_core::history::Clock) {
     if !editor.diag_providers.set_enabled(source, on) {
@@ -305,7 +306,14 @@ pub fn set_engine_enabled(editor: &mut Editor, source: DiagSource, on: bool,
             let now = clock.now_ms();
             editor.active_mut().diagnostics.slot_mut(source).arm(now, 0);
         }
-        editor.status = format!("{} enabled", source.label());
+        // Lens invariant (§8.1): the only way the lens can name a disabled engine here is a
+        // disable-to-zero followed by re-enable — point it at the engine just enabled so its
+        // results are visible and reachable. Otherwise keep the current (enabled) lens.
+        if editor.diag_providers.is_enabled(editor.active_analysis_source) {
+            editor.status = format!("{} enabled", source.label());
+        } else {
+            editor.set_analysis_source(source); // relocates lens + sets "analysis: {label}"
+        }
     } else {
         for b in editor.buffers.iter_mut() { b.diagnostics.clear_source(source); }
         if editor.active_analysis_source == source {
@@ -996,6 +1004,30 @@ mod tests {
         assert_eq!(e.active().diagnostics.slot(DiagSource::Harper).unwrap().recheck_due_at, Some(500),
             "enable arms the active buffer's slot when Review checking is live");
         assert_eq!(e.status, "Harper enabled");
+    }
+
+    #[test]
+    fn re_enable_after_zero_relocates_lens_onto_enabled_engine() {
+        use crate::test_support::TestClock;
+        let mut e = review_editor("teh\n");
+        e.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Harper)), true);
+        e.diag_providers.install(Box::new(
+            crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Plugin("mock"))), true);
+        e.set_analysis_source(DiagSource::Harper);
+        // Disable Harper: lens relocates to the remaining enabled engine (mock).
+        set_engine_enabled(&mut e, DiagSource::Harper, false, &TestClock::new(0));
+        assert_eq!(e.active_analysis_source, DiagSource::Plugin("mock"));
+        // Disable mock: none enabled, lens is left where it was (no enabled source to relocate to).
+        set_engine_enabled(&mut e, DiagSource::Plugin("mock"), false, &TestClock::new(0));
+        assert_eq!(e.active_analysis_source, DiagSource::Plugin("mock"));
+        assert!(!e.diag_providers.is_enabled(DiagSource::Plugin("mock")));
+        // Re-enable Harper: the lens still names the now-disabled mock — §8.1 requires it relocate
+        // onto the engine just enabled so results are visible and reachable.
+        set_engine_enabled(&mut e, DiagSource::Harper, true, &TestClock::new(0));
+        assert_eq!(e.active_analysis_source, DiagSource::Harper,
+            "lens relocated onto the re-enabled engine, not left on the disabled one");
+        assert!(e.diag_providers.is_enabled(e.active_analysis_source), "lens names an enabled engine");
     }
 
     #[test]
