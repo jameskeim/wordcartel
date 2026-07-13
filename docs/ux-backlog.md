@@ -843,9 +843,37 @@ tellable only if there is one seam to register into. (`DiagSource::Plugin` antic
   lens said what? (`render_status.rs` already attributes the engine — `REVIEW · Harper`.)
 - Config namespace and persistence; interaction with the density presets (E1).
 
-### E9 — Diagnostics lens: per-buffer vs global scope
-<!-- item: E9 -->
+### B10 — EOF caret glued to last content line (shared caret_line clamp)
+<!-- item: B10 -->
 
-Diagnostics lens: per-buffer vs global scope
+EOF caret glued to last content line (shared caret_line clamp)
+
+*(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
+
+### E10 — Multi-engine linting (b) — ltex-ls-plus / LanguageTool provider + JVM lifecycle
+<!-- item: E10 -->
+
+Multi-engine linting (b) — ltex-ls-plus / LanguageTool provider + JVM lifecycle
+
+*(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
+
+### E11 — Multi-engine linting (c) — diagnostics viewing/action delta (href, detail region, dict/rule writers, executeCommand)
+<!-- item: E11 -->
+
+Multi-engine linting (c) — diagnostics viewing/action delta (href, detail region, dict/rule writers, executeCommand)
+
+*(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
+
+### E12 — Multi-engine linting (e) — plugin-declared LSP servers + plugin-contributed engine-menu rows
+<!-- item: E12 -->
+
+Multi-engine linting (e) — plugin-declared LSP servers + plugin-contributed engine-menu rows
+
+*(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
+
+### PD — wc.async — one-shot subprocess primitive (formatters / vale-CLI); closed op-menu + AsyncDone pump-drain
+<!-- item: PD -->
+
+wc.async — one-shot subprocess primitive (formatters / vale-CLI); closed op-menu + AsyncDone pump-drain
 
 *(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*

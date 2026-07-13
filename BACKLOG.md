@@ -3,7 +3,7 @@
 
 # Backlog
 
-**24 open · 52 shipped · 1 dropped**
+**28 open · 52 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -11,9 +11,14 @@ Blocking Effort P: **0**
 
 | id | title | status | kind | size | P? | hook |
 |---|---|---|---|---|---|---|
+| B10 | EOF caret glued to last content line (shared caret_line clamp) | triage | bug | S |  | Pre-existing, surfaced by S6 (2026-07-13): a caret at buf.len() maps onto the last CONTENT line's row instead of the trailing empty/phantom line, via the shared nav::caret_line `h.min(len-1)` clamp — fires IDENTICALLY on and off the ventilate lens (so NOT an S6 regression; S6's fix deliberately did not touch the shared path to preserve no-op-when-off). Cosmetic EOF cursor position; a real fix must change the shared clamp and re-verify off-lens behavior. Low priority. |
 | M9 | Optional: upgrade/patch pulldown-cmark | watch | chore | S |  | M4-rest only ISOLATES its parse panic; a real upgrade is optional, low priority. |
 | B6 | Heading-glyph STYLE toggle | needs-design | feature | SM |  | Cycle shades / Nerd numerals / inverted numerals; default stays universal Shades. |
+| PD | wc.async — one-shot subprocess primitive (formatters / vale-CLI); closed op-menu + AsyncDone pump-drain | needs-design | feature | SM |  | wc.async — the deferred one-shot subprocess primitive (linter-arc effort d, but INDEPENDENT of the linter spine): a CLOSED Rust op-menu (wc.async{op,args,on_done}) + Msg::AsyncDone pump-drain + resource/security caps, with a formatter (prettier/fmt) or vale-CLI driver. The !Send constraint forces the closed-primitive shape (P3 F1-option-A). Depends ONLY on the shipped plugin system. Design: docs/design/prose-linters-design-space.md §2/§6 + effort-p3-grounding.md. |
 | S3 | Snapshots — durable revision checkpoints | needs-design | feature | SM |  | Capture/list/diff/restore; reuses rope snapshot + ChangeSet; one net-new display diff. |
+| E10 | Multi-engine linting (b) — ltex-ls-plus / LanguageTool provider + JVM lifecycle | needs-design | feature | M |  | Multi-engine linting effort (b): the ltex-ls-plus / LanguageTool provider + its JVM lifecycle — lazy-spawn on Review, Starting/'warming ltex…' status (no-silent-UI), idle-shutdown, never block the hot path. Reuses lsp_rpc.rs + the harper_ls.rs template; the ~300MB JVM 30s–2min warm-up is the only genuinely new risk. Builds on the SHIPPED diagnostics spine (harper-ls + selector); may need to finish the Vec/registry provider-seam generalization. Design: docs/design/prose-linters-design-space.md §6. |
+| E11 | Multi-engine linting (c) — diagnostics viewing/action delta (href, detail region, dict/rule writers, executeCommand) | needs-design | feature | M |  | Multi-engine linting effort (c): the diagnostics VIEWING/ACTION delta — per-diagnostic 'learn more'/href + a detail region on DiagOverlay; per-engine (non-harper) dictionary/rule writers; the executeCommand relay; more-suggestions population. Consumes the SHIPPED-BUT-UNUSED Diagnostic.code/href fields. Parallelizable with E10. Design: docs/design/prose-linters-design-space.md §1/§6. |
+| E12 | Multi-engine linting (e) — plugin-declared LSP servers + plugin-contributed engine-menu rows | needs-design | feature | M |  | Multi-engine linting effort (e), LAST/optional: plugins declare an LSP server + contribute dynamic engine-menu rows (MenuRowAction::Plugin widening). Only if plugin-authored engines materialize. Needs wc.async (PD) + the shipped spine + the deferred plugin-dynamic-menu-section effort. Design: docs/design/prose-linters-design-space.md §5/§6. |
 | E8 | Lens — the unifying view surface (layout vs style axes; plugin-registerable) | needs-design | feature | M |  | PRODUCT CONCEPT (user, 2026-07-12): "a lens for your writing" — one first-class, summoned, non-destructive way of SEEING prose. REGROUNDED against SHIPPED code (a2f9062, multi-provider diagnostics SPINE + switchable lens — its spec/plan PREDATE its merge of this item, so E8 did not reach its design). THE REAL PROBLEM: FOUR toggle surfaces already answer "how do I see my prose" with four different shapes (RenderMode exclusive cycle — which ALSO gates diagnostics; active_analysis_source exclusive engine selector; toggle_focus boolean; typewriter/measure booleans) and nothing unifies them. S6 (layout) and S8 (style) add two more. THE FORK, now VALIDATED BY THE CODE not merely proposed: STYLE lenses PAINT and STACK (toggle_focus already stacks with the diagnostics underline today); LAYOUT lenses re-DRAW and are EXCLUSIVE. So: one active layout lens x N active style lenses. FINDING: DiagnosticsProvider is whole-document + async + process-lifecycled (ensure_running/shutdown/availability/notify_change(text: String)); S8's POS lens is caret-local, synchronous, processless — it MUST NOT implement that trait (a whole-doc String per check breaks the O(visible) rule). S8 is a different lens KIND. E8 is therefore a GENERALIZATION ABOVE the shipped engine-selector, NOT a widening of it; never-merge is RIGHT for diagnostics — do not re-litigate. Effort-P plugins should be able to REGISTER a lens. |
 | S1 | Rearrangeable outline / heading-subtree corkboard | needs-design | feature | M |  | Structure mode: atomic heading-subtree move via submit_transaction; drag-reorder. Inherits select_section from S4, and OWNS section transpose (deliberately cut from S4: outline::sections yields NESTED/overlapping ranges — the 'next section' after an H2 is usually its own H3 child, so naive swap-with-next corrupts the document; S1 must solve sibling identification + separator normalization anyway). |
 | S7 | Linguistic substrate — harper-brill POS tagger + NP chunker in-process | needs-design | feature | M |  | ADOPTION DECIDED 2026-07-12 (measured, not assumed): harper-brill = rule-based Brill POS tagger + NP chunker, 2 direct deps, +119 activated crates, +0.95 MB binary, ZERO GPU/FFI (the lockfile's 491 + cubecl/CUDA entries are optional deps that never compile). Proven: 'because' → SCONJ vs 'on' → ADP — the exact distinction that makes clause-splitting principled. PARTIALLY REVERSES H2 (burn returns in-process, thinner: 119 vs 389 crates) — see the H2 archive note. GATE: cargo deny/audit has NOT been run against the 119 new crates; it must pass before merge. Cold-path only, block-windowed, version-cached. Arc: docs/design/prose-structure-arc.md. |
@@ -26,13 +31,12 @@ Blocking Effort P: **0**
 | B7 | Selected menu-item text too light | needs-design | bug | TBD |  | Possible E5 regression; selected item may need a distinct legible highlight fg. |
 | B8 | Configurable terminal caret shape / colour | needs-design | feature | TBD |  | Emit DECSCUSR (block/beam/underline, blink, colour); restore on exit/panic. |
 | B9 | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) | triage | feature | TBD |  | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) |
-| E9 | Diagnostics lens: per-buffer vs global scope | triage | feature | TBD |  | Diagnostics lens: per-buffer vs global scope |
 | H10 | reduce's 10-stage intercept chain boilerplate | watch | debt | TBD |  | Verbatim flat-dispatch; NOT a defect. Collapse only when Effort P adds plugin intercept stages. |
 | H13 | Editor is a 58-field data god-object | watch | debt | TBD |  | Field-clustering, not dispatch; NOT a defect. Peel PendingActions/ClipboardState only if a refactor wants it. |
 | H19 | Clean recovery files offers an opened recovered-*.md dump for deletion | triage | feature | TBD |  | Clean recovery files offers an opened recovered-*.md dump for deletion |
 | H20 | Flaky test: filter::run_filter_non_zero_exit_carries_stderr | triage | feature | TBD |  | Flaky test: filter::run_filter_non_zero_exit_carries_stderr |
 | H3 | Incremental-parser tail divergences | watch | debt | TBD |  | Cosmetic, self-healing via reconcile; NOT open correctness debt; chase only if a real case appears. |
-| PA | Analysis / policy plugins | watch | research | TBD |  | Post-P candidates: writing goals/streaks, readability lens, CMS publish, backlinks. |
+| PA | Analysis / policy plugins | watch | research | TBD |  | Post-P candidates: writing goals/streaks, readability lens, CMS publish, backlinks. NOTE (triage 2026-07-13): the readability-lens slice is largely SUBSUMED — Hemingway = sentence length (S6 rhythm gutter, SHIPPED) + adverbs/passives (S8). Keep at most one slice as an E8 plugin-lens proof-case; do not rebuild it. |
 | PB | Custom-markup plugins | watch | research | TBD |  | Post-P candidates clustering on a markup-extension API: CriticMarkup, Fountain, wiki-links. |
 | PC | Lower-fit / principled plugin candidates | watch | research | TBD |  | Post-P: AI continuation (plugin-only on principle), book design, genre benchmarking. |
 
@@ -99,10 +103,11 @@ Blocking Effort P: **0**
 
 ## Dropped
 
-<details><summary>1 dropped</summary>
+<details><summary>2 dropped</summary>
 
 | id | title | reason |
 |---|---|---|
 | A4 | Menu accelerators (Alt+F/Alt+E) | Category is 2 keystrokes / dwell+click away; Alt+letter conflict surface not worth a layer nobody asked for. Revisit on real demand. |
+| E9 | Diagnostics lens: per-buffer vs global scope | Not a standalone effort — per-buffer vs global diagnostics scope is one of E8's lens axes (the 'scope axis' the code surfaced). Decide it within E8's design. Folded per the backlog-relationship triage 2026-07-13 (docs/design/backlog-integration-relationships.md). |
 
 </details>

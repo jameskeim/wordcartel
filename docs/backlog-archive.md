@@ -1740,3 +1740,11 @@ are — real commands, repar-backed, still the destructive/export path. The lens
 prose for two weeks **and turns it off**. If that happens, **STOP THE ARC.** S7 and S8 are more
 expensive bets on the same premise, and the premise will have been disproved for free.
 
+
+### E9 — Diagnostics lens: per-buffer vs global scope
+<!-- item: E9 -->
+
+Diagnostics lens: per-buffer vs global scope
+
+*(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
+
