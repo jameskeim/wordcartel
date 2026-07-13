@@ -6,6 +6,7 @@
 
 use wordcartel_core::block_tree::BlockTree;
 use wordcartel_core::buffer::TextBuffer;
+use wordcartel_core::layout::{ColMap, VisualRow};
 use wordcartel_core::textobj::sentence_spans;
 
 /// Columns reserved on the left for the rhythm gutter: `NNN │ ` (3-digit count, space, rule,
@@ -68,6 +69,75 @@ pub fn segment_block(block_text: &str) -> impl Iterator<Item = (usize, usize)> +
     sentence_spans(block_text)
 }
 
+/// One gutter cell for a ventilated paragraph's visual row (Task 6 fills these).
+/// `Count(n)` is a row-group's FIRST row (the word count, `n` already clamped to `GUTTER_MAX`);
+/// `Continuation` is a soft-wrap row (blank numeric field, dim `│` only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GutterCell { Count(u16), Continuation }
+
+/// Metadata for one ventilated PARAGRAPH window, keyed in `View.vent_blocks` by its FIRST logical
+/// line. Separates the two axes the resolver needs: `last_line` for line-index LOOKUP, `byte_origin`
+/// (= `ps`, the `paragraph_range_at` window start — the selector's origin) for the byte OFFSET.
+/// `gutter[i]` is the cell for `line_layouts[anchor].0[i]`.
+#[derive(Clone, Debug)]
+pub struct VentBlock {
+    pub last_line: usize,
+    pub byte_origin: usize,
+    pub gutter: Vec<GutterCell>,
+}
+
+/// A resolved cached layout for a logical line: the row-group's rows + ColMap, plus the byte ORIGIN
+/// every consumer must reconstruct global offsets against (`origin + vr.src_span`, `head − origin`).
+pub struct Resolved<'a> {
+    pub rows: &'a [VisualRow],
+    pub map: &'a ColMap,
+    pub byte_origin: usize,
+    pub first_line: usize,
+    pub last_line: usize,
+}
+
+/// `(first_line, last_line)` covered by a window `[ps, pe)` — LOOKUP-range endpoints. `last_line` is
+/// the line containing the window's last CONTENT byte (`pe` is exclusive; guard degenerate windows).
+///
+/// # Examples
+///
+/// ```
+/// use wordcartel::ventilate::vent_block_range;
+/// use wordcartel_core::buffer::TextBuffer;
+///
+/// let buf = TextBuffer::from_str("alpha\nbeta\ngamma\n");
+/// // The window spanning lines 0..=1 ("alpha\nbeta\n") maps to (0, 1).
+/// assert_eq!(vent_block_range(&buf, 0, 11), (0, 1));
+/// ```
+pub fn vent_block_range(buf: &TextBuffer, ps: usize, pe: usize) -> (usize, usize) {
+    let first = buf.byte_to_line(ps.min(buf.len()));
+    let last_byte = pe.saturating_sub(1).max(ps).min(buf.len().saturating_sub(1));
+    (first, buf.byte_to_line(last_byte))
+}
+
+/// The shared window-aware resolver. Given any logical line `l`, return the cached entry that covers
+/// it AND its byte ORIGIN — **line-index LOOKUP, `ps` OFFSET (the `paragraph_range_at` window start);
+/// `line_start(l)` used for NEITHER in the ventilated path** (§5.2). `None` when no cached entry
+/// covers `l` (the caller then lays the window out on-demand, Task 4).
+///
+/// LOOKUP: `range(..=l).next_back()` finds the candidate anchor; if it is a ventilated window
+/// (`vent_blocks`), confirm `l ∈ first_line..=last_line` (a LINE-INDEX comparison, never a byte
+/// comparison). Otherwise it is an ordinary per-line entry, which covers `l` only when keyed exactly
+/// at `l`.
+pub fn resolve<'a>(view: &'a crate::editor::View, buf: &TextBuffer, l: usize) -> Option<Resolved<'a>> {
+    let (&anchor, (rows, map)) = view.line_layouts.range(..=l).next_back()?;
+    if let Some(vb) = view.vent_blocks.get(&anchor) {
+        if l <= vb.last_line {
+            return Some(Resolved { rows, map, byte_origin: vb.byte_origin, first_line: anchor, last_line: vb.last_line });
+        }
+        return None; // past this block; not covered by it
+    }
+    if anchor == l {
+        return Some(Resolved { rows, map, byte_origin: buf.line_to_byte(l), first_line: l, last_line: l });
+    }
+    None // an ordinary per-line entry keyed below l does not cover l
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +182,52 @@ mod tests {
         assert_eq!(disp, "The committee met and voted."); // \n → single space
         assert_eq!(disp.len(), raw.len(), "byte-length-preserving (\\n and space are both 1 byte)");
         assert!(!disp.contains('\n'));
+    }
+
+    #[test]
+    fn resolver_resolves_interior_line_and_origin_is_line_start_when_off() {
+        // Ordinary (non-ventilated) per-line entry: keyed exactly at l, origin == line_start.
+        let mut e = Editor::new_from_text("alpha\nbeta\ngamma\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        let buf = e.active().document.buffer.clone();
+        let view = &e.active().view;
+        let r = resolve(view, &buf, 1).expect("per-line entry for line 1 resolves");
+        assert_eq!(r.byte_origin, buf.line_to_byte(1), "per-line origin is line_start");
+        assert_eq!(r.first_line, 1);
+        assert_eq!(r.last_line, 1);
+    }
+
+    #[test]
+    #[ignore = "needs Task 5 fill to populate vent_blocks"]
+    fn t_indent_origin_lens_spans_equal_select_sentence_for_indented_paragraph() {
+        // A 2-space-INDENTED, multi-line paragraph. paragraph_range_at's ps is AFTER the two spaces,
+        // so a byte-containment test against line_start(anchor) would FAIL; line-index membership must
+        // succeed. The origin must be ps, and the lens's global sentence spans must be byte-identical
+        // to what select-sentence selects (the SEE==SELECT proof on the indent case).
+        let text = "  The committee met on a\nsunny Tuesday afternoon. It voted.\n";
+        let mut e = Editor::new_from_text(text, None, (30, 24));
+        e.active_mut().view.ventilate = true;
+        crate::derive::rebuild(&mut e); // Task 5 fill populates vent_blocks for the paragraph
+        let buf = e.active().document.buffer.clone();
+        let blocks = e.active().document.blocks().clone();
+        // Line 1 ("sunny Tuesday…") is an INTERIOR line of the window (anchor is line 0).
+        let r = resolve(&e.active().view, &buf, 1).expect("interior line of the ventilated window RESOLVES");
+        assert_eq!(r.first_line, 0, "resolves to the window anchor");
+        assert!(r.last_line >= 1, "range covers the interior line");
+        // Origin == ps == paragraph_range_at start (after the 2-space indent), NOT line_start(anchor).
+        let (ps, pe) = crate::nav::paragraph_range_at(&blocks, &buf, 0);
+        assert_eq!(r.byte_origin, ps, "origin is ps (paragraph_range_at start)");
+        assert_ne!(r.byte_origin, buf.line_to_byte(0), "origin is NOT line_start(anchor) — the indent delta");
+        // SEE==SELECT: the lens's global sentence spans == sentence_spans over the SAME window select
+        // uses. For each, select-sentence with the caret inside must return the identical span.
+        let win = buf.slice(ps..pe);
+        let lens_spans: Vec<(usize, usize)> =
+            crate::ventilate::segment_block(&win).map(|(sf, st)| (ps + sf, ps + st)).collect();
+        for &(gf, gt) in &lens_spans {
+            // select-sentence uses scope_range_at over paragraph_range_at + sentence_bounds — identical
+            // window + origin — so the selected span equals the lens span for a caret inside it.
+            let (sf, st) = wordcartel_core::textobj::sentence_bounds(&win, ((gf + gt) / 2) - ps);
+            assert_eq!((ps + sf, ps + st), (gf, gt), "lens span EQUALS select-sentence span (SEE==SELECT)");
+        }
     }
 }
