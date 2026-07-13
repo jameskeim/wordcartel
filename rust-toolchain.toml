@@ -1,0 +1,10 @@
+# Pins the Rust toolchain so every machine (and CI) builds wordcartel with the
+# exact same compiler + components. rustup reads this automatically on any cargo
+# invocation in the repo and installs the pinned channel/components if missing.
+#
+# Requires rustup (not a distro's system `rust` package, which ignores this file).
+# Bump `channel` deliberately when adopting a new Rust version.
+[toolchain]
+channel = "1.96.0"
+components = ["clippy", "rustfmt", "rust-src"]
+profile = "minimal"

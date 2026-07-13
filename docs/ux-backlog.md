@@ -584,17 +584,40 @@ be really well thought out because it shapes the customizable plugin-era interfa
 ### S4. Prose text objects — structural selection + operator layer
 <!-- item: S4 -->
 
-**What:** a structural text-object + operator layer for prose, the way Vim's text objects work for
-code but rebuilt for writing. The writer selects, deletes, transposes, reflows, and counts *named
-things* — **sentence, clause, quotation, emphasis, link, block, section** — rather than coordinate
-ranges. Objects (`cursor → span`) compose with operators (`select / delete / change / yank /
-transpose / reflow / unwrap / ventilate / count / case`), so the object × operator matrix fills in by
-construction. A **prose hierarchy** (document → section → block → sentence → clause → word) powers
-expand/shrink selection. Two pieces are genuinely novel: a **heuristic sentence-detection module**
-(abbreviations, decimals, initialisms, terminal punctuation inside quotes — test-fixture-driven,
-user-extensible) and a **clause** object with no code analogue (transpose a subordinate clause to the
-front). Structural objects are **Markdown-parse-tree queries** (correct by construction, not
-regex-scraped), degrading to text heuristics on non-Markdown buffers.
+**RE-SCOPED 2026-07-12** (was XL) after a code-grounding pass + an independent Fable review. It is
+now one item in a multi-effort arc — **S5 → S6 → S4 → S7 → S8** — whose umbrella document is
+`docs/design/prose-structure-arc.md`. **Read that first**; it carries the north star, the measured
+decisions, and the cuts. (The original idea material,
+`docs/design/prose-text-objects-design-space.md`, was drafted by an external LLM with **no codebase
+access** and several of its central proposals are refuted. Read it for the argument, not the
+architecture.)
+
+**What (now):** the *surgery* layer for the structure S6 diagnoses. Objects **only make selections**
+— `select_sentence`, `select_section`, and the expand/shrink ladder promoted from its hardcoded
+4-array to data — and the **existing** operators act on the selection, which is already the shipped
+A14 convention (`scope_or_word` = "the selection if non-empty, else the word at the caret"). That
+collapses the object × operator matrix into **N + M commands, not N × M**: no palette explosion, no
+~150-site `Handler` signature change, and **no command-surface law-10 amendment**. The cross-product
+is recoverable in userspace — an Effort-P Lua plugin can bind one gesture to `select_sentence` then
+`cut`, which is exactly where law 10's own forward-pointer says parameterized commands belong.
+
+Also in scope: `transpose_sentences` (generalizing the shipped neighbour idiom — `transpose_words`
+swaps the word before the caret with the word at it, *preserving the gap between them*); **one
+object-agnostic `swap`** over the `MarkedBlock` + `Selection` pair the editor already has (it doesn't
+care what produced the spans, so it serves every object forever); and `count_region` — today only a
+*view toggle* exists, there is no count-of-region command at all.
+
+**Cut, and why** (each verified against real code): the `TextObject` trait / `ObjectRegistry` /
+`BufferView` / `Affinity` scaffolding (Vim-shaped; A14 shipped ten operators as plain fns in a leaf
+module with zero trait machinery — and our plugins are Lua, composing *commands*, not Rust traits);
+the `PairedDelimiter` framework (**wrong, not merely unverified** — `BlockTree` discards ALL inline
+events so the "authoritative" tree path *cannot exist*, fiction conventionally omits the closing
+quote across dialogue paragraphs, and an unmatched `"` makes the scan O(document)); the plain-text
+degradation matrix (`nav::paragraph_range_at` already covers it); and **section transpose → S1**
+(`outline::sections` yields *nested, overlapping* ranges — the "next section" after an H2 is usually
+its own H3 child, so naive swap-with-next **corrupts the document**).
+
+**Blocked on S5** — everything here stands on a sentence detector that is currently wrong.
 
 **Status: TRIAGE — captured from an external design-space draft, not yet brainstormed.** The
 substance lives in **`docs/design/prose-text-objects-design-space.md`** (a full pre-spec exploration
@@ -623,3 +646,255 @@ seam.
 **Open questions for the human (triage):** (1) confirm Theme S vs. its own theme; (2) whether this is
 a pre-1.0 core capability or a post-Effort-P direction; (3) relative priority vs. S1 (they share the
 `Section` primitive — S1 could land first as a subset, or S4 could subsume it).
+
+### S5 — Sentence authority — fix select_sentence, differential suite, sentence motions
+<!-- item: S5 -->
+
+**The foundation of the S5 → S6 → S4 → S7 → S8 arc** (`docs/design/prose-structure-arc.md`). Ships
+alone; everything downstream stands on it.
+
+**The live bug.** Verified by probe 2026-07-12 against the real crate:
+
+```
+textobj::sentence_bounds("Dr. Smith arrived. He was late.", 0)  ->  (0, 4)  ==  "Dr. "
+```
+
+`select_sentence` is **wrong today**. Our detector is UAX-29 segmentation, which handles `3.14`,
+`10 a.m.`, and `P.I.` correctly but splits after a **title abbreviation followed by a capital** —
+`Dr.` / `Mr.` / `Mrs.` / `St.`, the most common abbreviation class in real prose. Meanwhile repar's
+`ventilate` has an abbreviation stop-list and gets it right, so **the shipped product already
+contains two authorities that disagree about where a sentence ends.**
+
+**Fix:** an abbreviation-aware post-pass over the UAX-29 boundaries (merge a boundary when the
+trailing word is in a curated stop set — pure, ~50 lines, testable). ⚠ The design-space doc's
+`STARTER_ABBREVIATIONS` is **not shippable as written**: `St` and `Dr` are duplicated, and `No`,
+`Co`, `Mon` would eat *real* sentence boundaries. Curate against the fixture corpus.
+
+**The differential fixture suite** — the honest, testable form of "coherence". Assert that our
+detector and `run_transform(Ventilate)` agree across a corpus. This is required because **full
+unification is impossible**: repar's own `sentence.rs` says `checkcapital`/`checkcurious` are shared
+between ventilate *and* the reflow `guess_merge` path, and the reflow path is **frozen by a
+byte-exact par-1.53.0 oracle** — the abbreviation stop-list is deliberately quarantined in ventilate
+to protect it. So there are **three** sentence authorities and they cannot be merged; they can only
+be *pinned* by a test. (This is also why we do **not** absorb repar — see the arc doc, D1/D2.)
+
+**Sentence motions — which BOTH design documents forgot.** `Dir` has Word and Paragraph motions but
+**no Sentence**: there is no Emacs `M-a`/`M-e` parity. Cheaper than any operator, likely more used,
+and trivially bounded to the paragraph window.
+
+⚠ **Trap for every consumer:** UAX sentence spans **include trailing whitespace** (unlike word
+bounds — `"One two. "` → `(0,9)`). Trim to content or gaps double on transpose.
+
+### S6 — Ventilate-as-a-lens — non-destructive sentence view + rhythm gutter
+<!-- item: S6 -->
+
+⭐ **The item where the whole arc's thesis is proven or killed.** See
+`docs/design/prose-structure-arc.md` for the north star this tests.
+
+**The reframe it embodies.** The original S4 idea sold *selection, movement, transformation*. That is
+the weak half — nobody wakes up wanting to select a clause. The strong half:
+
+> **A prose editor that understands sentences can SHOW the writer the skeleton of their prose —
+> non-destructively, on demand — and then let them operate on the bones it revealed.**
+
+Diagnosis, then surgery. Writing is revision; drafting is hours and revision is weeks. Every tool a
+writer owns serves drafting (focus mode, typewriter scroll) or filing (corkboards). *Revision* —
+**this sentence is 41 words and drowns the reader; four of these six open with "The"** — is served by
+nothing. (Cautionary case: iA Writer shipped POS-driven "Syntax Control" — their most-demoed, least-
+used feature. Structure-as-*selection* may be a programmer's fantasy about how writers work. This
+item finds out, cheaply, before we spend a dependency on it.)
+
+**What:** `ventilate` today (`registry.rs` → `transform.rs`) **destructively rewrites** the buffer.
+S6 adds it as a **view**: buffer untouched, the *display* breaks one sentence per line; toggle off and
+the prose returns **byte-identical**. `RenderMode` already cycles four states — this is a fifth.
+Alongside it, a **rhythm gutter** — per sentence, its word count and opening word:
+
+```
+ 8  The  The committee met on Tuesday.
+12  The  The chair, who had prepared, spoke first.
+41  The  The proposal, which had been circulating since…
+ 7  She  She left.
+```
+
+The writer sees the 41-word monster and the three `The`s **instantly**. That is the whole
+Hemingway-app value proposition, inside a real editor, over a real manuscript, with no cloud and no
+rewriting. Plus repeated-opener highlighting within a paragraph — note the codebase already carries
+the anaphora corpus (`transform.rs` tests "We will fight on the beaches / …landing grounds / …fields"),
+and repar's `prose-prefix` fixup exists *because* anaphora is real.
+
+**Cost: nearly nothing.** Zero NLP. No new objects. No command matrix. No contract amendment.
+
+**Architectural constraint — why S6 must precede S4.** The lens MUST render using **our own detector**
+(S5), never repar's. Then the sentence you *see* and the sentence you *select* are the same object
+**by construction**, and the two-authority problem stops being a UX hazard. It also *cannot* call
+repar even if we wanted to: repar is `&str` → `String`, so extracting boundaries would mean running
+`--ventilate` and diffing lines — a whole-document round-trip per render, an outright violation of the
+`O(visible) + O(edited)` rule.
+
+**Note this does NOT remove or replace repar.** `reflow` / `unwrap` / `ventilate` stay exactly as they
+are — real commands, repar-backed, still the destructive/export path. The lens is *additive*.
+
+**⛔ FAILURE SIGNAL — the cheapest falsification available to us:** the author uses the lens on real
+prose for two weeks **and turns it off**. If that happens, **STOP THE ARC.** S7 and S8 are more
+expensive bets on the same premise, and the premise will have been disproved for free.
+
+### S7 — Linguistic substrate — harper-brill POS tagger + NP chunker in-process
+<!-- item: S7 -->
+
+**The in-process linguistic layer that S8 needs.** Adoption of `harper-brill` was **decided
+2026-07-12** on measured evidence (arc doc, D4).
+
+**The finding that made it possible, and it is in neither design document:** the POS backend is
+**not** `harper-core`, and it does **not** arrive via the prose-linters effort. `harper-brill` 2.5.0
+has exactly **two** direct dependencies (`harper-pos-utils`, `serde_json`) and exposes a **rule-based
+Brill POS tagger** (`tag_sentence -> Vec<Option<UPOS>>`) *and* a **noun-phrase chunker**
+(`chunk_sentence`) — the design-space doc's `Phrase` object, which it deferred as "needs real
+grammatical parsing," is a shipped crate function.
+
+**Measured on this machine 2026-07-12 (a probe crate, not an estimate):**
+
+| | harper-core (H2, ejected 2026-07-11) | **harper-brill (adopted)** |
+|---|---|---|
+| crates added | +389 | **+119 activated** |
+| binary delta | +16 MB (3×) | **+0.95 MB** |
+| GPU/tensor backends compiled | cubecl + CUDA + ROCm + wgpu | **none** — `burn` core + `ndarray` only |
+| native / FFI (`-sys`) crates | — | **zero** |
+
+⚠ **Do not re-panic on the lockfile.** It lists **491** crates including `burn-cuda`, `cubecl-hip`,
+`burn-rocm`, `cudarc` — those are *optional deps that never compile*. `default-features = false`
+does its job; the activated count is 119.
+
+**Live proof it does what the clause splitter needs:**
+
+```
+"The committee met on Tuesday because the chair insisted."
+   DET  NOUN  VERB  ADP  PROPN  SCONJ  DET  NOUN
+```
+
+`on` → **ADP** (preposition), `because` → **SCONJ** (subordinating conjunction) — precisely the
+distinction that disambiguates "for" / "so" / "yet" and turns clause-splitting from a heuristic trap
+into a principled, testable rule.
+
+**This PARTIALLY REVERSES H2**, which pushed harper out-of-process specifically to shed `burn`. The
+reversal is deliberate and justified by the numbers: a third of the crates, a sixteenth of the
+binary, no GPU stack, no FFI. Recorded in H2's archive entry so a future reader does not think we
+forgot.
+
+**⚠ MERGE GATE — not yet satisfied:** `cargo deny` / `cargo audit` has **not** been run against the
+119 new crates (neither tool was installed on the machine where this was measured). Supply-chain
+surface grows ~40% of the lockfile, and H2 rightly noted this **matters more now that Effort P has
+opened a plugin attack surface**. This check must pass before S7 merges.
+
+**Shape:** a `wordcartel-core` module producing POS tags + NP chunks over the **caret's block
+window**, **cold-path only** (command/lens-triggered — *never* per-keystroke), cached by
+`(block_span, document.version)`. Brill tagging is rule application over a trained table:
+microseconds per sentence, no tensors at inference.
+
+### S8 — Prose lenses — POS-driven stylistic X-rays; Phrase/Clause select-only
+<!-- item: S8 -->
+
+**The genuinely novel half of the arc** — and the payoff for S7's substrate.
+
+**The lenses.** Every adverb dimmed. Every passive construction (`AUX` + participle `VERB`)
+underlined. Every nominalization flagged. Composable with S4's objects: *select every sentence
+containing a passive.*
+
+**This is what harper-ls fundamentally CANNOT give us**, and the distinction is the point:
+`harper-ls` flags **errors** — things that are *wrong*. These are **stylistic X-rays of prose that is
+already correct**, which is what revision actually consists of. No amount of LSP-seam design gets
+here; the wire carries diagnostics (ranges, messages, code actions), never a parse. (See the arc doc
+§5: the linters effort is *independent* of this one — different engine, different process model,
+different latency budget, no shared code.)
+
+**The objects it unlocks.** `Phrase` — the chunker's noun phrases, near-free once S7 lands. `Clause`
+— POS-informed, and *only* POS-informed: the design-space doc's rule-based splitter ("split at
+`, ; : —` and at conjunctions") **collapses on real prose**, because the Oxford comma fires mid-list,
+"for" is usually a preposition, "so" an intensifier, "yet" an adverb. With UPOS the rule becomes
+principled: a clause-comma is followed by a conjunction + subject NP + finite verb; a list-comma is
+not. Ships behind a **measured precision gate** on a hand-labeled corpus of real prose.
+
+**⚖ THE LAW OF THIS ARC — the reason both objects are SELECT-ONLY:**
+
+> **A linguistic analysis may COLOR, and it may SELECT. It may never MUTATE text without a visible
+> selection the writer can see and abort.**
+
+Brill is trained on newswire; the chunker on treebanks. On fiction, fragments, dialect, verse, and
+dialogue they **will** mistag. A wrong *highlight* is noise the writer ignores. A wrong
+*transposition* is a corrupted manuscript, and the writer never trusts the tool again. (Clause
+transpose additionally needs **capitalization repair** — swap "I went home, but she stayed" and you
+get a lowercase sentence start — which the design-space doc never mentions. That alone is a separate,
+later decision.)
+
+**Nothing here is on by default** (arc doc, D7). This is *revision* machinery; if it intrudes on
+drafting it becomes the thing writers hate about Word, and it violates the project's top priority.
+The E7 precedent governs: the cost lands in the summoned view.
+
+### E8 — Lens — the unifying view surface (layout vs style axes; plugin-registerable)
+<!-- item: E8 -->
+
+**A product concept, not a refactor (user, 2026-07-12).** Three efforts are each, independently,
+about to invent their own way of *showing the writer something about their prose* — and each will
+build its own toggle, its own overlay, its own config key, its own menu entry. They are the same
+thing:
+
+| | what it shows | where |
+|---|---|---|
+| **Diagnostic lenses** | *what's wrong* — spelling, grammar, style rules | harper-ls, ltex-plus, vale-ls (multi-LSP effort, in flight) |
+| **Structural lenses** | *the skeleton* — sentence-per-line view, rhythm gutter, repeated openers | **S6** |
+| **Stylistic lenses** | *what's flabby* — adverbs dimmed, passives underlined, nominalizations | **S8** |
+
+**"A lens for your writing"** is the unifying idea, and it is arguably a defining feature of
+wordcartel rather than an implementation detail. It also falls out of the arc's north star
+(`docs/design/prose-structure-arc.md`): *show the writer the skeleton of their prose*. A lens is by
+construction **summoned, non-destructive, and off by default** — which is already the law (arc D7,
+and the E7 precedent: the cost lands in the summoned view).
+
+**Direct successor to E7** ("grammar/spelling as a deliberate Analysis view"), which is the first
+lens we shipped without naming the category.
+
+### The design fork that must be settled first
+
+**Lenses split on two axes, and they compose differently.**
+
+- **STYLE lenses** change how text is **painted** — diagnostics, POS X-rays, repeated-opener
+  highlighting. These **STACK**: "adverbs dimmed *and* spelling underlined" is coherent and useful.
+- **LAYOUT lenses** change what is **drawn** — S6's ventilate view inserts line breaks that do not
+  exist in the buffer. These are **EXCLUSIVE**: two layout lenses cannot both re-break the same rows.
+
+So the surface is probably **not** a single cycle and **not** a single checkbox set, but **two axes**:
+*one* active layout lens, *N* active style lenses. Getting this wrong has concrete, visible failure
+modes — either diagnostics cannot be shown at the same time as POS highlighting (if lenses are a
+mode), or two layout lenses fight over the same rows (if they are a set).
+
+### Why this is urgent, not eventual
+
+**The in-flight multi-LSP effort is E8's first implementer** — it is building the provider/overlay
+surface *right now*. One Open–Closed constraint must reach it before it hardens:
+
+> **The provider seam must NOT assume "provider == LSP subprocess."**
+
+`diag_provider.rs` already calls itself "Open-Closed insurance for provider #2" — but providers #2
+and #3 (ltex, vale) are *also* LSP subprocesses, so an LSP-shaped assumption would not be caught by
+adding them. **S8's lens is in-process, synchronous, and caret-local** (harper-brill POS over the
+caret's block window — see S7). If the trait, the config surface, or the toggle/menu machinery bakes
+in a process/LSP/whole-document/debounced assumption, S8 must either fork the overlay layer or
+retrofit the seam — exactly the regrowth the module-structure rule exists to prevent.
+
+### Other things this unlocks
+
+**Effort-P plugins should be able to REGISTER a lens.** A Lua plugin that dims every word over three
+syllables, or highlights dialogue attributions, or marks every sentence over 30 words, *is a lens* —
+and that plugin story is only tellable if there is one seam to register into. This is the same
+registration-seam discipline the module-structure rule already mandates (a new lens is a new row, not
+an edit to a hub).
+
+### Open questions for the brainstorm
+
+- Two axes (1 layout × N style) vs a flat exclusive cycle vs a flat composable set. (Leaning: two axes.)
+- Relationship to the existing `RenderMode` cycle — is a layout lens a fifth `RenderMode`, or a
+  separate orthogonal axis? (S6 must answer this either way.)
+- Command-surface conformance: multi-state option ⇒ set-per-state primitives + a cycle (law:
+  `docs/design/command-surface-contract.md`). N style lenses = N toggles + ...what in the menu?
+- Attribution: when several lenses paint the same span, who wins, and can the writer tell which lens
+  said what? (`render_status.rs` already does provider attribution — `REVIEW · Harper`.)
+- Config namespace and persistence.

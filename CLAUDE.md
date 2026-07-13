@@ -6,18 +6,24 @@ ratatui 0.30, crossterm). Top priority: **instant typing, no data loss, no silen
 waits.** Build toward an in-process Lua plugin system (Effort P — a significant effort, not the 1.0 capstone).
 
 **Backlog / progress tracking.** Open and completed work is tracked in **`backlog.toml`** (the
-single source of truth for item state) → **`BACKLOG.md`** (a generated dashboard — READ THIS for
-status; never hand-edit it). Rich triage prose lives in `docs/ux-backlog.md` +
-`docs/engineering-health.md` (OPEN items) and `docs/backlog-archive.md` (shipped/dropped history),
-keyed by `<!-- item: ID -->` markers. Status lives ONLY in `backlog.toml`. Drift is a `cargo test`
-GATE (`wordcartel/tests/backlog.rs`: schema + full marker↔manifest bijection across all three docs
-+ dashboard freshness). **To change an item** (status/size, mark shipped/dropped, add a
+single source of truth for item state) → **`BACKLOG.md`** (a generated dashboard for humans to
+browse; never hand-edit it). **To READ status, run `scripts/backlog open` (or `shipped`) — do NOT
+read `BACKLOG.md`, `backlog.toml`, or the prose docs to answer "what's on the backlog".** The
+command renders the same source of truth scoped to the view you asked for; reading the files pulls
+the whole shipped/dropped history into context for nothing. Rich triage prose lives in
+`docs/ux-backlog.md` + `docs/engineering-health.md` (OPEN items) and `docs/backlog-archive.md`
+(shipped/dropped history), keyed by `<!-- item: ID -->` markers — open those only for a specific
+item's triage detail, and read only that item's section. Status lives ONLY in `backlog.toml`. Drift
+is a `cargo test` GATE (`wordcartel/tests/backlog.rs`: schema + full marker↔manifest bijection across
+all three docs + dashboard freshness). **To change an item** (status/size, mark shipped/dropped, add a
 dependency): edit its `[[item]]` block in `backlog.toml`, then `scripts/backlog bless`; when an item
 ships, move its prose section from the live doc to `docs/backlog-archive.md` (and repoint its `doc =`
 field) so the marker bijection stays green. **To capture** a new idea: `scripts/backlog add <ID>
 <THEME> "<title>"` (or a `bl:` message — see [[backlog-shorthand-bl]]) files a `triage` item + prose
-stub and regenerates, left uncommitted by default. `scripts/backlog {open,shipped}` print filtered
-views. Never hand-edit `BACKLOG.md`; never put status words in the prose headings.
+stub and regenerates, left uncommitted by default. `<THEME>` is a single LETTER (`A B C D E H M P R
+S`), not a word — a word fails the schema gate with `I2 bad theme`. The full command surface is
+`bless | add <ID> <THEME> "<title>" | open | shipped`. Never hand-edit `BACKLOG.md`; never put status
+words in the prose headings.
 
 ---
 
@@ -128,11 +134,17 @@ Split by code state, proven on the splash effort (2026-07-10): the LSP is a fast
 - Branch per effort off the trunk; never implement on the default branch without consent.
 - Commit/push only when explicitly asked.
 - Every commit ends with the project trailers, verbatim — the `Co-Authored-By` line below,
-  then a `Claude-Session:` line with the current session's URL (provided by the environment):
+  then a `Claude-Session:` line with the current session's URL:
   ```
   Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
   Claude-Session: <current session URL>
   ```
+  **Where to find the URL:** it is supplied in the agent's own harness instructions (the Git
+  section says "End git commit messages with … `Claude-Session: https://claude.ai/code/session_…`").
+  It is NOT in the shell `env`, and it is NOT derivable from the Session ID that `/status`
+  prints — that is a different identifier in a different format (a UUID), and pasting it into
+  a `claude.ai/code/` URL yields a WRONG link. Read the harness instructions; never construct
+  the URL from a session ID, and never invent one.
 
 ---
 

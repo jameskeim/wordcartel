@@ -1291,6 +1291,29 @@ Split 522-line render() into paint_rows/paint_status/place_cursor; unify segs/pl
 ### H2 — Interrogate the `burn`/`harper` dependency weight
 <!-- item: H2 -->
 
+> **⚠ PARTIALLY SUPERSEDED 2026-07-12 (by S7 — see `docs/design/prose-structure-arc.md`, D4).**
+> The verdict below — "keep the tensor stack out of the binary" — was reasoned about **`harper-core`**,
+> whose POS tagger (`harper-brill`) is a non-optional dep that drags in `burn` + `cubecl` + CUDA.
+> That reasoning is still correct **for `harper-core`**.
+>
+> It does **not** hold for **`harper-brill` alone**, which was measured directly on 2026-07-12 and is a
+> different animal: **2 direct deps, +119 *activated* crates (not 389), +0.95 MB binary (not 16 MB),
+> ZERO GPU backends compiled, ZERO `-sys`/FFI crates.** The lockfile lists 491 crates including
+> `burn-cuda`/`cubecl-hip`/`burn-rocm`/`cudarc` — **that number is noise**; they are optional deps that
+> never compile (`default-features = false` does its job). Anyone re-deriving this decision from the
+> lockfile will reach the wrong conclusion, as we nearly did.
+>
+> **S7 therefore brings `burn` back in-process**, deliberately, in a much thinner slice, to get the
+> rule-based Brill POS tagger + NP chunker that the prose-lens work (S8) requires and that the
+> `harper-ls` LSP wire structurally cannot provide (it carries diagnostics, never a parse).
+>
+> **Two consequences for whoever reads this next:**
+> 1. `cargo deny`/`cargo audit` against those 119 crates is a **merge GATE for S7** — not yet run.
+> 2. The rationale below for the **subprocess split** ("drop the tensor stack from the binary") is
+>    *partially spent* once S7 lands, since `burn` is then in the binary anyway. It may still hold —
+>    harper-core's dictionary + rule corpus is the bulk of its weight, not `burn` alone — but it must
+>    be **re-measured, not assumed**, before the split is defended on dependency-weight grounds again.
+
 **Resolved (Effort A, 2026-07-11):** adopted option D — Harper consumed via the external `harper-ls` LSP
 subprocess; the `burn`/`harper-core` tensor stack removed from our build (Cargo.lock 675→287, −388 crates).
 
