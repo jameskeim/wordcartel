@@ -359,6 +359,15 @@ pub fn fill_visible(editor: &mut crate::editor::Editor) {
     }
 }
 
+/// The single setter for the per-buffer ventilate lens (command-surface Law 6 — profiles/plugins
+/// call THIS, never a bypass). Flips the flag on the ACTIVE buffer and rebuilds so the layout path
+/// switches. `derive::rebuild` is required on flip (the `measure` precedent) — the LayoutKey change
+/// alone would re-run, but rebuilding here keeps the setter self-contained for non-command callers.
+pub fn set_ventilate(editor: &mut crate::editor::Editor, on: bool) {
+    editor.active_mut().view.ventilate = on;
+    crate::derive::rebuild(editor);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

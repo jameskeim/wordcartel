@@ -287,6 +287,8 @@ static CUA: &[(&str, &str)] = &[
     ("ctrl-\\", "cycle_render_mode"),
     ("f1",      "cycle_render_mode"),
     ("alt-r",   "view_review"),
+    // Ventilate lens (S6) — non-destructive sentence-per-line view.
+    ("alt-v",   "toggle_ventilate"),
     // Navigation — no shift  (input.rs lines 104–109)
     ("left",  "move_left"),
     ("right", "move_right"),
@@ -884,6 +886,23 @@ mod tests {
                     | "select_sentence_left" | "select_sentence_right"))),
                 "WordStar must not bind {chord} to any sentence motion (law 7: palette-only, no hint)");
         }
+    }
+
+    /// S6 Task 7: `alt-v` hints the ventilate lens in CUA; WordStar leaves it deliberately
+    /// unbound (law 7: palette-only, no hint).
+    #[test]
+    fn ventilate_bound_alt_v_in_cua_unbound_in_wordstar() {
+        let reg = Registry::builtins();
+        let seq = |s: &str| parse_seq(s).unwrap();
+        let (cua, warns) = build_keymap(
+            &crate::config::KeymapConfig { preset: "cua".into(), patches: vec![] }, &reg);
+        assert!(warns.is_empty(), "cua warns: {warns:?}");
+        assert!(matches!(cua.resolve(&seq("alt-v")), Resolution::Command(CommandId("toggle_ventilate"))));
+        let (ws, warns) = build_keymap(
+            &crate::config::KeymapConfig { preset: "wordstar".into(), patches: vec![] }, &reg);
+        assert!(warns.is_empty(), "wordstar warns: {warns:?}");
+        assert!(!matches!(ws.resolve(&seq("alt-v")), Resolution::Command(CommandId("toggle_ventilate"))),
+            "WordStar deliberately unbound (law 7: palette-only, no hint)");
     }
 
     #[test]
