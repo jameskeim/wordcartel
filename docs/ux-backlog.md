@@ -832,69 +832,104 @@ The E7 precedent governs: the cost lands in the summoned view.
 ### E8 — Lens — the unifying view surface (layout vs style axes; plugin-registerable)
 <!-- item: E8 -->
 
-**A product concept, not a refactor (user, 2026-07-12).** Three efforts are each, independently,
-about to invent their own way of *showing the writer something about their prose* — and each will
-build its own toggle, its own overlay, its own config key, its own menu entry. They are the same
-thing:
-
-| | what it shows | where |
-|---|---|---|
-| **Diagnostic lenses** | *what's wrong* — spelling, grammar, style rules | harper-ls, ltex-plus, vale-ls (multi-LSP effort, in flight) |
-| **Structural lenses** | *the skeleton* — sentence-per-line view, rhythm gutter, repeated openers | **S6** |
-| **Stylistic lenses** | *what's flabby* — adverbs dimmed, passives underlined, nominalizations | **S8** |
-
-**"A lens for your writing"** is the unifying idea, and it is arguably a defining feature of
-wordcartel rather than an implementation detail. It also falls out of the arc's north star
+**A product concept, not a refactor (user, 2026-07-12): "a lens for your writing."** One first-class,
+summoned, non-destructive way of *seeing* prose. It falls out of the arc's north star
 (`docs/design/prose-structure-arc.md`): *show the writer the skeleton of their prose*. A lens is by
-construction **summoned, non-destructive, and off by default** — which is already the law (arc D7,
-and the E7 precedent: the cost lands in the summoned view).
+construction **summoned, non-destructive, and off by default** — already the law (arc D7; the E7
+precedent: the cost lands in the summoned view).
 
-**Direct successor to E7** ("grammar/spelling as a deliberate Analysis view"), which is the first
-lens we shipped without naming the category.
+> **⚠ REGROUNDED 2026-07-12 against SHIPPED code.** This item was first written pre-emptively, to
+> constrain the then-in-flight multi-provider diagnostics effort. **That effort has since MERGED**
+> (`a2f9062` — multi-provider diagnostics SPINE + switchable lens, ~4,300 lines). Its spec and plan
+> **predate** its merge of this item, so E8's constraint did **not** reach its design. What follows is
+> what the code actually does, not what E8 asked for.
 
-### The design fork that must be settled first
+### The real problem, stated from the code: FOUR toggle surfaces, no model
+
+"How do I see my prose" is already answered four different ways, each with its own shape:
+
+| Surface | Shape | Where |
+|---|---|---|
+| `RenderMode` (F1) — Draft / Preview / Source / Review | **exclusive cycle**; *also* the gate that summons diagnostics | `commands.rs`, `should_show_diagnostics` |
+| `active_analysis_source: DiagSource` — which engine paints | **exclusive**, "one source painted at a time" | `diagnostics_run.rs::active_lens_diags` |
+| `toggle_focus` + `focus_granularity` — dim all but the current sentence/paragraph | **boolean**, and it **STACKS** with diagnostics today | `render.rs::gather_row_ctx` |
+| `toggle_typewriter`, `toggle_measure` | booleans | View menu |
+
+S6 (a **layout** lens) and S8 (a **style** lens) would add two more shapes. **Nothing unifies them.**
+
+### What SHIPPED, and what it does and does not cover
+
+The merged "switchable analysis lens" is an **exclusive selector over diagnostic engines**:
+
+```rust
+// editor.active_analysis_source: DiagSource        (Harper | LTeX | Vale | Plugin(&'static str))
+// "Every other engine's slot stays computed but invisible until the lens is switched onto it
+//  (the locked never-merge decision: one source painted at a time)."
+pub fn active_lens_diags(editor: &Editor) -> Option<&[Diagnostic]>
+```
+
+Command surface (contract rule 8, correctly): `analysis_engine_harper` (set-per-state primitive,
+palette-only) + `analysis_next` (stateful cycle, View menu, state-in-label) + `toggle_engine_harper`
+(per-engine enablement).
+
+**Never-merge is RIGHT for diagnostics** — two engines squiggling the same span with different
+underlines is a mess. Do not re-litigate it. **But it is not a lens surface**; it is an
+*engine selector inside one*. It models neither a layout lens nor a non-diagnostic style lens.
+
+**`DiagSource::Plugin(&'static str)` already exists** — plugin-declared engines are in the vocabulary.
+Good.
+
+### The design fork — and the code now VALIDATES it
 
 **Lenses split on two axes, and they compose differently.**
 
 - **STYLE lenses** change how text is **painted** — diagnostics, POS X-rays, repeated-opener
-  highlighting. These **STACK**: "adverbs dimmed *and* spelling underlined" is coherent and useful.
-- **LAYOUT lenses** change what is **drawn** — S6's ventilate view inserts line breaks that do not
-  exist in the buffer. These are **EXCLUSIVE**: two layout lenses cannot both re-break the same rows.
+  highlighting. These **STACK**.
+- **LAYOUT lenses** change what is **drawn** — S6's ventilate view inserts line breaks that are not in
+  the buffer. These are **EXCLUSIVE**: two cannot re-break the same rows.
 
-So the surface is probably **not** a single cycle and **not** a single checkbox set, but **two axes**:
-*one* active layout lens, *N* active style lenses. Getting this wrong has concrete, visible failure
-modes — either diagnostics cannot be shown at the same time as POS highlighting (if lenses are a
-mode), or two layout lenses fight over the same rows (if they are a set).
+This is not a hypothesis. **The codebase already contains one of each, and they behave exactly this
+way:** `toggle_focus` (a style lens — dims rows) **stacks** with the diagnostics underline today;
+`RenderMode` and `active_analysis_source` are **exclusive**. The two-axis model is a description of
+the code, not a proposal for it.
 
-### Why this is urgent, not eventual
+So the surface is **one active layout lens × N active style lenses** — not a single cycle, and not a
+single checkbox set.
 
-**The in-flight multi-LSP effort is E8's first implementer** — it is building the provider/overlay
-surface *right now*. One Open–Closed constraint must reach it before it hardens:
+### The seam constraint (now a finding, not a warning)
 
-> **The provider seam must NOT assume "provider == LSP subprocess."**
+**`DiagnosticsProvider` is whole-document, asynchronous, and process-lifecycled** —
+`ensure_running()`, `shutdown()`, `availability()`, and `notify_change(buffer_id, version, path,
+text: String)` taking the **entire document**. **S8's POS lens is caret-local, synchronous, and
+processless** (harper-brill over the caret's block window, S7). Handing it a whole-document `String`
+per check would violate the `O(visible) + O(edited)` rule outright.
 
-`diag_provider.rs` already calls itself "Open-Closed insurance for provider #2" — but providers #2
-and #3 (ltex, vale) are *also* LSP subprocesses, so an LSP-shaped assumption would not be caught by
-adding them. **S8's lens is in-process, synchronous, and caret-local** (harper-brill POS over the
-caret's block window — see S7). If the trait, the config surface, or the toggle/menu machinery bakes
-in a process/LSP/whole-document/debounced assumption, S8 must either fork the overlay layer or
-retrofit the seam — exactly the regrowth the module-structure rule exists to prevent.
+**Conclusion: S8 must NOT implement `DiagnosticsProvider`, and should not try.** That is not a defect
+in the shipped seam — a diagnostics provider genuinely *is* an async whole-document engine. It means
+**S8 is a different lens KIND**, and E8's job is the **view / toggle / attribution surface above
+both**, not one trait for all of them.
+
+### Therefore: E8 is a GENERALIZATION ABOVE what shipped, not a reuse of it
+
+The analysis-engine selector becomes **one lens family inside** a broader surface. That is a larger
+E8 than first filed, and it must not be attempted by widening `DiagnosticsProvider`.
 
 ### Other things this unlocks
 
 **Effort-P plugins should be able to REGISTER a lens.** A Lua plugin that dims every word over three
 syllables, or highlights dialogue attributions, or marks every sentence over 30 words, *is a lens* —
-and that plugin story is only tellable if there is one seam to register into. This is the same
-registration-seam discipline the module-structure rule already mandates (a new lens is a new row, not
-an edit to a hub).
+tellable only if there is one seam to register into. (`DiagSource::Plugin` anticipates this for
+*engines*; the lens surface needs the same for *lenses*.)
 
 ### Open questions for the brainstorm
 
-- Two axes (1 layout × N style) vs a flat exclusive cycle vs a flat composable set. (Leaning: two axes.)
-- Relationship to the existing `RenderMode` cycle — is a layout lens a fifth `RenderMode`, or a
-  separate orthogonal axis? (S6 must answer this either way.)
-- Command-surface conformance: multi-state option ⇒ set-per-state primitives + a cycle (law:
-  `docs/design/command-surface-contract.md`). N style lenses = N toggles + ...what in the menu?
-- Attribution: when several lenses paint the same span, who wins, and can the writer tell which lens
-  said what? (`render_status.rs` already does provider attribution — `REVIEW · Harper`.)
-- Config namespace and persistence.
+- **`RenderMode` is doing double duty** — it is both the view cycle *and* the gate that summons
+  diagnostics (`should_show_diagnostics`). Is a layout lens a **fifth `RenderMode`**, or is
+  `RenderMode` itself really "the layout-lens axis" wearing another name? S6 must answer this.
+- Does `toggle_focus` **become** a style lens under the new model, or stay a bespoke boolean? (It is
+  the proof case that style lenses stack — it would be strange to leave it outside.)
+- N style lenses = N palette toggles by contract rule 8 — but **what appears in the View menu**? A
+  submenu? A cycle over "presets" of lens sets?
+- **Attribution when several lenses paint the same span**: who wins, and can the writer tell which
+  lens said what? (`render_status.rs` already attributes the engine — `REVIEW · Harper`.)
+- Config namespace and persistence; interaction with the density presets (E1).
