@@ -261,6 +261,13 @@ impl Harness {
         let w = buf.area().width;
         (0..w).filter(|&x| buf[(x, y)].style().add_modifier.contains(Modifier::UNDERLINED)).collect()
     }
+    /// Column indices on visual row `y` that carry the DIM modifier (focus dimming).
+    fn dim_cols(&self, y: u16) -> Vec<u16> {
+        use ratatui::style::Modifier;
+        let buf = self.term.backend().buffer();
+        let w = buf.area().width;
+        (0..w).filter(|&x| buf[(x, y)].style().add_modifier.contains(Modifier::DIM)).collect()
+    }
 }
 
 #[test]
@@ -1738,6 +1745,38 @@ fn e2e_lens_switch_flips_the_painted_underline_set() {
     assert!((0..3).all(|c| !after.contains(&c)),
         "harper's diagnostic must NOT paint once the lens moved off it, got {after:?}");
     assert_ne!(before, after, "the painted underline set switched with the lens");
+}
+
+#[test]
+fn e2e_focus_sentence_spans_wrapped_rows_not_just_a_line() {
+    // A hard-wrapped paragraph: sentence 1 wraps two rows; sentence 2 follows.
+    // Pre-S5, Focus=Sentence dimmed row 2 of sentence 1 (it focused only a LINE).
+    let text = "The committee met on Tuesday afternoon and the chair insisted that everyone. Then we left.\n";
+    let mut h = Harness::new(text, None, (40, 10));
+    {
+        let mut ed = h.editor.borrow_mut();
+        ed.theme = wordcartel_core::theme::no_color();
+        ed.depth = wordcartel_core::theme::Depth::None;
+        ed.view_opts.focus = true;
+        ed.view_opts.focus_granularity = crate::config::FocusGranularity::Sentence;
+        // caret in sentence 1 (byte 5, "committee")
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(5);
+        crate::derive::rebuild(&mut ed);
+    }
+    h.render();
+    // Rows 0 and 1 are sentence 1 (hard-wrapped) → NOT dimmed.
+    let row_committee = (0..10u16).find(|&y| h.row(y).contains("committee"))
+        .expect("sentence 1 (start) must be visible");
+    let row_chair = (0..10u16).find(|&y| h.row(y).contains("chair"))
+        .expect("sentence 1 (wrapped continuation) must be visible");
+    assert!(h.dim_cols(row_committee).is_empty(), "sentence 1 row (start) must not be dimmed");
+    assert!(h.dim_cols(row_chair).is_empty(),
+        "sentence 1 row (wrapped continuation) must not be dimmed — the S5 fix");
+    // The row carrying "Then we left." (sentence 2) IS dimmed.
+    let sentence2_row = (0..10u16).find(|&y| h.row(y).contains("Then we left"))
+        .expect("sentence 2 must be visible");
+    assert!(!h.dim_cols(sentence2_row).is_empty(),
+        "sentence 2 row must be dimmed while the caret is in sentence 1");
 }
 
 // ===========================================================================
