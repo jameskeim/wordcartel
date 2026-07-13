@@ -247,6 +247,18 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
         return; // line_layouts already valid for this key — skip the pass
     }
 
+    // S6 — the ventilate lens layout path. A THIN delegation into ventilate.rs (the window-scoped
+    // fill lives there; this hub stays a dispatcher). It populates line_layouts + vent_blocks.
+    if editor.active().view.ventilate {
+        crate::ventilate::fill_visible(editor);
+        editor.active_mut().layout_key = Some(key);
+        return;
+    }
+    // IMPORTANT 2 — the non-ventilate path only clears line_layouts (below); it must ALSO clear
+    // vent_blocks, or stale resolver metadata survives a toggle-off (runs on the gate miss the
+    // ventilate flip causes).
+    editor.active_mut().view.vent_blocks.clear();
+
     #[cfg(test)]
     let bench_lf_t0 = std::time::Instant::now();
     let mut visual_rows_accumulated: usize = 0;
@@ -267,7 +279,7 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
             (text, role)
         };
         let render = line_render_for(b_mode, l == active_line);
-        let (rows, map) = layout::layout(&text, role, render, vp_width, editor.theme.heading_level_glyph);
+        let (rows, map) = layout::layout(&text, role, render, vp_width, editor.theme.heading_level_glyph, 0);
         visual_rows_accumulated += rows.len();
         editor.active_mut().view.line_layouts.insert(l, (rows, map));
         // 5g: jump past any folded body that follows this line.

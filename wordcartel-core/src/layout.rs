@@ -247,6 +247,7 @@ pub fn layout(
     render: LineRender,
     viewport_width: usize,
     heading_prefix: bool,
+    reserve_cols: usize,
 ) -> (Vec<VisualRow>, ColMap) {
     let vw = viewport_width.max(1);
     let analysis = crate::md_parse::analyze(line, role, render);
@@ -295,6 +296,10 @@ pub fn layout(
         } else {
             None
         };
+    // S6: the ventilate gutter is a left column reservation — add it to prefix_width so every
+    // placed col offsets by it and continuation rows hang-indent to it (cursor math stays correct
+    // via ColMap.prefix_width). 0 for every non-ventilated caller (behavior identical).
+    prefix_width += reserve_cols;
 
     // Word-boundary soft-wrap (UAX #14; spec D1/D2). CodeBlock keeps grapheme wrap.
     let breaks: Vec<usize> = if matches!(role, BlockRole::CodeBlock) {
@@ -643,7 +648,7 @@ mod tests {
     #[test]
     fn word_wrap_breaks_at_space_not_midword() {
         // vw 8, no prefix: "hello wide" → "hello " / "wide" (space hangs? fits at col 5)
-        let (rows, _) = layout("hello wide", BlockRole::Paragraph, LineRender::Concealed, 8, false);
+        let (rows, _) = layout("hello wide", BlockRole::Paragraph, LineRender::Concealed, 8, false, 0);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].display, "hello ");
         assert_eq!(rows[1].display, "wide");
@@ -652,7 +657,7 @@ mod tests {
     #[test]
     fn word_wrap_trailing_whitespace_hangs_past_edge() {
         // vw 4: "abcd " — the space lands at col 4 (== vw) and HANGS; one row.
-        let (rows, map) = layout("abcd ", BlockRole::Paragraph, LineRender::Concealed, 4, false);
+        let (rows, map) = layout("abcd ", BlockRole::Paragraph, LineRender::Concealed, 4, false, 0);
         assert_eq!(rows.len(), 1);
         assert_eq!(map.row_end_col[0], 5, "hang: end col past vw");
         // Law 4: the space is PLACED, never dropped.
@@ -662,7 +667,7 @@ mod tests {
     #[test]
     fn word_wrap_fallback_when_no_opportunity() {
         // Unbroken token: byte-identical to the old greedy wrap.
-        let (rows, _) = layout("abcdef", BlockRole::Paragraph, LineRender::Concealed, 4, false);
+        let (rows, _) = layout("abcdef", BlockRole::Paragraph, LineRender::Concealed, 4, false, 0);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].display, "abcd");
         assert_eq!(rows[1].display, "ef");
@@ -671,7 +676,7 @@ mod tests {
     #[test]
     fn word_wrap_codeblock_keeps_grapheme_wrap() {
         // Same text, CodeBlock role: spaces do NOT become break points.
-        let (rows, _) = layout("let x = 1;", BlockRole::CodeBlock, LineRender::Concealed, 4, false);
+        let (rows, _) = layout("let x = 1;", BlockRole::CodeBlock, LineRender::Concealed, 4, false, 0);
         assert_eq!(rows[0].display, "let ", "greedy fill, mid-token break allowed");
         assert_eq!(rows[1].display, "x = ");
     }
@@ -679,7 +684,7 @@ mod tests {
     #[test]
     fn word_wrap_long_url_falls_back() {
         // A long URL token: rows must fit regardless of what break points UAX #14 exposes.
-        let (rows, _) = layout("https://example.com/aaaa", BlockRole::Paragraph, LineRender::Concealed, 8, false);
+        let (rows, _) = layout("https://example.com/aaaa", BlockRole::Paragraph, LineRender::Concealed, 8, false, 0);
         assert!(rows.len() >= 3);
         assert!(rows.iter().all(|r| r.width <= 8));
     }
@@ -687,7 +692,7 @@ mod tests {
     #[test]
     fn word_wrap_cjk_mixed_script() {
         // Layout-level CJK: breaks between ideographs — no mid-ideograph splits, rows fit.
-        let (rows, _) = layout("中文混排English", BlockRole::Paragraph, LineRender::Concealed, 6, false);
+        let (rows, _) = layout("中文混排English", BlockRole::Paragraph, LineRender::Concealed, 6, false, 0);
         assert!(rows.iter().all(|r| r.width <= 6), "{rows:?}");
         assert!(rows.len() >= 2);
     }
@@ -697,7 +702,7 @@ mod tests {
         // Probe-confirmed spec-D2 repeat case: a zero-width head means the tail
         // re-place frees ZERO columns — the current VG must wrap again, never
         // producing an over-wide multi-grapheme row (Law 3).
-        let (rows, _) = layout("\u{200b}ab", BlockRole::Paragraph, LineRender::Concealed, 1, false);
+        let (rows, _) = layout("\u{200b}ab", BlockRole::Paragraph, LineRender::Concealed, 1, false, 0);
         assert!(rows.iter().all(|r| r.width <= 1 || r.display.chars().count() == 1),
             "no over-wide multi-grapheme row: {rows:?}");
     }
@@ -706,7 +711,7 @@ mod tests {
     fn word_wrap_codeblock_space_wraps_not_hangs() {
         // CodeBlock: the hang rule is OFF — a space at the edge wraps greedily,
         // byte-identical to today (spec D2 as amended).
-        let (rows, _) = layout("abcd x", BlockRole::CodeBlock, LineRender::Concealed, 4, false);
+        let (rows, _) = layout("abcd x", BlockRole::CodeBlock, LineRender::Concealed, 4, false, 0);
         assert_eq!(rows[0].display, "abcd");
         assert_eq!(rows[1].display, " x");
     }
@@ -716,7 +721,7 @@ mod tests {
         // The only opportunity coincides with the row start (guard row_start_vg < break):
         // " abcdefgh" at vw 4 — opportunity at VG 1 only; rows after the first break
         // have no interior opportunity → grapheme fallback, no infinite loop.
-        let (rows, _) = layout(" abcdefgh", BlockRole::Paragraph, LineRender::Concealed, 4, false);
+        let (rows, _) = layout(" abcdefgh", BlockRole::Paragraph, LineRender::Concealed, 4, false, 0);
         assert!(rows.len() >= 3, "must terminate and cover: {rows:?}");
     }
 
@@ -724,7 +729,7 @@ mod tests {
     // no UAX #14 opportunity — pins the grapheme fallback
     fn active_line_identity_and_wrap() {
         // Active: raw, identity-ish. "abcdef" width 4 -> rows ["abcd","ef"].
-        let (rows, map) = layout("abcdef", BlockRole::Paragraph, LineRender::RawPlain, 4, false);
+        let (rows, map) = layout("abcdef", BlockRole::Paragraph, LineRender::RawPlain, 4, false, 0);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].display, "abcd");
         assert_eq!(rows[1].display, "ef");
@@ -735,28 +740,28 @@ mod tests {
     #[test]
     fn concealed_bold_drops_markers_in_display() {
         // Inactive: "**bold**" -> visible "bold".
-        let (rows, _map) = layout("**bold**", BlockRole::Paragraph, LineRender::Concealed, 80, false);
+        let (rows, _map) = layout("**bold**", BlockRole::Paragraph, LineRender::Concealed, 80, false, 0);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].display, "bold");
     }
 
     #[test]
     fn cjk_width_two() {
-        let (rows, _) = layout("中a", BlockRole::Paragraph, LineRender::RawPlain, 80, false);
+        let (rows, _) = layout("中a", BlockRole::Paragraph, LineRender::RawPlain, 80, false, 0);
         assert_eq!(rows[0].width, 3); // 中=2, a=1
     }
 
     #[test]
     fn style_attached_to_placed() {
         // visible 'b' (first of bold) should carry Style::Strong.
-        let (_rows, map) = layout("**bold**", BlockRole::Paragraph, LineRender::Concealed, 80, false);
+        let (_rows, map) = layout("**bold**", BlockRole::Paragraph, LineRender::Concealed, 80, false, 0);
         let first = map.placed.iter().find(|p| p.text == "b").unwrap();
         assert_eq!(first.style, Style::Strong);
     }
 
     #[test]
     fn roundtrip_bijection_on_visible_cells() {
-        let (_rows, map) = layout("a中b", BlockRole::Paragraph, LineRender::RawPlain, 80, false);
+        let (_rows, map) = layout("a中b", BlockRole::Paragraph, LineRender::RawPlain, 80, false, 0);
         for p in &map.placed {
             let (r, c) = map.source_to_visual(p.src.start);
             assert_eq!(map.visual_to_source(r, c), p.src.start);
@@ -765,7 +770,7 @@ mod tests {
     #[test]
     fn cursor_never_inside_concealed_marker() {
         // "**a**": only 'a' (byte 2) and EOL(6) are stops; the * bytes are not.
-        let (_rows, map) = layout("**a**", BlockRole::Paragraph, LineRender::Concealed, 80, false);
+        let (_rows, map) = layout("**a**", BlockRole::Paragraph, LineRender::Concealed, 80, false, 0);
         let stops = map.cursor_stops();
         assert!(stops.contains(&2));
         assert!(stops.contains(&map.eol));
@@ -775,7 +780,7 @@ mod tests {
     #[test]
     fn end_of_row_clamps_not_teleports() {
         // width 2: "abcd" -> rows ["ab","cd"]. col 9 on row 0 clamps to end of row 0 (byte 2).
-        let (_rows, map) = layout("abcd", BlockRole::Paragraph, LineRender::RawPlain, 2, false);
+        let (_rows, map) = layout("abcd", BlockRole::Paragraph, LineRender::RawPlain, 2, false, 0);
         assert_eq!(map.visual_to_source(0, 9), 2);
     }
 
@@ -784,7 +789,7 @@ mod tests {
         // "ab[cd](http://x.io)ef": visible "abcdef"; moving right from start
         // visits only visible grapheme starts, never inside the hidden URL.
         let line = "ab[cd](http://x.io)ef";
-        let (_r, map) = layout(line, BlockRole::Paragraph, LineRender::Concealed, 80, false);
+        let (_r, map) = layout(line, BlockRole::Paragraph, LineRender::Concealed, 80, false, 0);
         let mut cur = cursor_at(&map, 0);
         let mut visited = vec![cur.offset];
         for _ in 0..6 { cur = move_right(&map, cur); visited.push(cur.offset); }
@@ -795,7 +800,7 @@ mod tests {
     fn move_end_snaps_off_concealed_trailing_marker() {
         // "**a**" width 1: end-of-row raw position is a concealed '*'; move_end
         // must snap to a real stop (the 'a' start or EOL), never a '*'.
-        let (_r, map) = layout("**a**", BlockRole::Paragraph, LineRender::Concealed, 1, false);
+        let (_r, map) = layout("**a**", BlockRole::Paragraph, LineRender::Concealed, 1, false, 0);
         let cur = cursor_at(&map, 2); // on 'a'
         let e = move_end(&map, cur);
         assert!(map.is_cursor_stop(e.offset));
@@ -803,7 +808,7 @@ mod tests {
     #[test]
     fn styled_segments_split_by_style() {
         // "a **b**" inactive -> visible "a b": 'a',' ' Plain then 'b' Strong.
-        let (rows, _map) = layout("a **b**", BlockRole::Paragraph, LineRender::Concealed, 80, false);
+        let (rows, _map) = layout("a **b**", BlockRole::Paragraph, LineRender::Concealed, 80, false, 0);
         let segs = &rows[0].segs;
         assert_eq!(segs.last().unwrap().style, Style::Strong);
         assert_eq!(segs.last().unwrap().text, "b");
@@ -816,7 +821,7 @@ mod tests {
     fn move_left_from_leftmost_stays_on_visible_stop() {
         // "**a**": only visible stop besides EOL is byte 2 ('a'). move_left from there
         // must NOT land on a concealed '*' (byte 0/1); it stays on byte 2.
-        let (_r, map) = layout("**a**", BlockRole::Paragraph, LineRender::Concealed, 80, false);
+        let (_r, map) = layout("**a**", BlockRole::Paragraph, LineRender::Concealed, 80, false, 0);
         let cur = cursor_at(&map, 2);
         let left = move_left(&map, cur);
         assert!(map.is_cursor_stop(left.offset), "cursor must rest on a visible stop, not a concealed byte");
@@ -826,7 +831,7 @@ mod tests {
     #[test]
     fn enter_from_top_overshoot_concealed_lands_on_stop() {
         // "**a**": entering at an overshooting col must not land on a concealed '*'.
-        let (_r, map) = layout("**a**", BlockRole::Paragraph, LineRender::Concealed, 80, false);
+        let (_r, map) = layout("**a**", BlockRole::Paragraph, LineRender::Concealed, 80, false, 0);
         for col in [3usize, 5, 9] {
             let c = enter_from_top(&map, col);
             assert!(map.is_cursor_stop(c.offset), "enter_from_top col {col} landed on concealed byte {}", c.offset);
@@ -835,28 +840,28 @@ mod tests {
 
     #[test]
     fn enter_from_bottom_overshoot_concealed_lands_on_stop() {
-        let (_r, map) = layout("**a**", BlockRole::Paragraph, LineRender::Concealed, 80, false);
+        let (_r, map) = layout("**a**", BlockRole::Paragraph, LineRender::Concealed, 80, false, 0);
         let c = enter_from_bottom(&map, 9);
         assert!(map.is_cursor_stop(c.offset));
     }
 
     #[test]
     fn rows_carry_block_role_and_glyph() {
-        let (rows, _m) = layout("- item", BlockRole::ListItem, LineRender::Concealed, 80, false);
+        let (rows, _m) = layout("- item", BlockRole::ListItem, LineRender::Concealed, 80, false, 0);
         assert_eq!(rows[0].role, BlockRole::ListItem);
         assert_eq!(rows[0].prefix_glyph.as_deref(), Some("• "));
     }
 
     #[test]
     fn heading_rows_carry_heading_role() {
-        let (rows, _m) = layout("## Title", BlockRole::Heading(2), LineRender::Concealed, 80, false);
+        let (rows, _m) = layout("## Title", BlockRole::Heading(2), LineRender::Concealed, 80, false, 0);
         assert!(rows.iter().all(|r| r.role == BlockRole::Heading(2)));
     }
 
     #[test]
     fn prefix_offsets_columns_so_cursor_lands_on_text() {
         // A list item: prefix "• " (width 2). The first text glyph 'i' must be at col 2, not 0.
-        let (_rows, map) = layout("- item", BlockRole::ListItem, LineRender::Concealed, 40, false);
+        let (_rows, map) = layout("- item", BlockRole::ListItem, LineRender::Concealed, 40, false, 0);
         assert_eq!(map.prefix_width, 2, "• + space");
         let (row, col) = map.source_to_visual(2); // byte 2 = 'i' (after "- ")
         assert_eq!((row, col), (0, 2));
@@ -866,7 +871,7 @@ mod tests {
 
     #[test]
     fn no_prefix_is_unchanged() {
-        let (_rows, map) = layout("plain text", BlockRole::Paragraph, LineRender::Concealed, 40, false);
+        let (_rows, map) = layout("plain text", BlockRole::Paragraph, LineRender::Concealed, 40, false, 0);
         assert_eq!(map.prefix_width, 0);
         assert_eq!(map.source_to_visual(0), (0, 0)); // no offset
     }
@@ -876,7 +881,7 @@ mod tests {
         // width-6 viewport, prefix width 2 (bullet "• ") → text capacity is 4 cols.
         // "aaaa bbbb": the space after "aaaa" hangs at col 6 (end col 7), and the
         // word break sends "bbbb" to row 1 indented to prefix_width (col 2).
-        let (rows, map) = layout("- aaaa bbbb", BlockRole::ListItem, LineRender::Concealed, 6, false);
+        let (rows, map) = layout("- aaaa bbbb", BlockRole::ListItem, LineRender::Concealed, 6, false, 0);
         assert_eq!(map.rows, 2, "word-wraps into two rows");
         assert_eq!(rows[0].display, "aaaa ", "space hangs on row 0");
         assert_eq!(map.row_end_col[0], 7, "hang: end col past vw");
@@ -889,7 +894,7 @@ mod tests {
     #[test]
     fn down_then_up_preserves_desired_col() {
         // "aaaaa" width 3 -> rows ["aaa","aa"]. start at col 2 row 0, down then up.
-        let (_r, map) = layout("aaaaa", BlockRole::Paragraph, LineRender::RawPlain, 3, false);
+        let (_r, map) = layout("aaaaa", BlockRole::Paragraph, LineRender::RawPlain, 3, false, 0);
         let start = Cursor { offset: 2, row: 0, desired_col: 2 };
         let down = move_down_within(&map, start).unwrap();
         let up = move_up_within(&map, down).unwrap();
@@ -898,8 +903,8 @@ mod tests {
 
     #[test]
     fn heading_prefix_reserves_width_when_on() {
-        let (_r, on)  = layout("## Title", BlockRole::Heading(2), LineRender::Concealed, 40, true);
-        let (_r, off) = layout("## Title", BlockRole::Heading(2), LineRender::Concealed, 40, false);
+        let (_r, on)  = layout("## Title", BlockRole::Heading(2), LineRender::Concealed, 40, true, 0);
+        let (_r, off) = layout("## Title", BlockRole::Heading(2), LineRender::Concealed, 40, false, 0);
         assert_eq!(on.prefix_width, 2, "heading glyph reserves 2 cols when on");
         assert_eq!(off.prefix_width, 0, "no heading glyph when off");
         // text shifts right by the glyph width when on (cursor-safe)
@@ -908,7 +913,7 @@ mod tests {
 
     #[test]
     fn heading_prefix_off_for_non_heading() {
-        let (_r, m) = layout("para", BlockRole::Paragraph, LineRender::Concealed, 40, true);
+        let (_r, m) = layout("para", BlockRole::Paragraph, LineRender::Concealed, 40, true, 0);
         assert_eq!(m.prefix_width, 0);
     }
 
@@ -918,7 +923,7 @@ mod tests {
                                  ("1. x", 3), ("   12. x", 4)] {
             let indent_w = line.bytes().take_while(|&b| b == b' ' || b == b'\t')
                 .map(|b| if b == b'\t' { 4 } else { 1 }).sum::<usize>();
-            let (rows, map) = layout(line, BlockRole::ListItem, LineRender::Concealed, 20, false);
+            let (rows, map) = layout(line, BlockRole::ListItem, LineRender::Concealed, 20, false, 0);
             assert_eq!(map.prefix_width, indent_w + marker_w, "{line:?}");
             assert!(map.placed.iter().all(|p| p.col >= map.prefix_width), "{line:?}");
             assert_eq!(rows[0].prefix_glyph.as_deref().map(|g| !g.is_empty()), Some(true));
@@ -930,7 +935,7 @@ mod tests {
     #[test]
     fn concealed_layout_style_unchanged_under_last_match() {
         // A single Strong content span still styles "bold" Strong (resolution change is a no-op here).
-        let (rows, _) = layout("**bold**", BlockRole::Paragraph, LineRender::Concealed, 40, false);
+        let (rows, _) = layout("**bold**", BlockRole::Paragraph, LineRender::Concealed, 40, false, 0);
         let joined: String = rows.iter().flat_map(|r| r.segs.iter()).map(|s| s.text.clone()).collect();
         assert_eq!(joined, "bold", "Concealed still conceals the markers");
     }
@@ -1014,7 +1019,7 @@ mod props {
             w in widths(),
             render in line_render_strat()
         ) {
-            let (_rows, map) = layout(&line, BlockRole::Paragraph, render, w, false);
+            let (_rows, map) = layout(&line, BlockRole::Paragraph, render, w, false, 0);
             for p in &map.placed {
                 let off = map.visual_to_source(p.row, p.col);
                 let (r2, c2) = map.source_to_visual(off);
@@ -1039,7 +1044,7 @@ mod props {
             w in widths(),
             render in line_render_strat()
         ) {
-            let (_rows, map) = layout(&line, BlockRole::Paragraph, render, w, false);
+            let (_rows, map) = layout(&line, BlockRole::Paragraph, render, w, false, 0);
             // Walk right from the first valid stop.
             let mut cur = cursor_at(&map, 0);
             let mut seen = vec![cur.offset];
@@ -1090,7 +1095,7 @@ mod props {
             w in widths(),
             render in line_render_strat()
         ) {
-            let (rows, map) = layout(&line, BlockRole::Paragraph, render, w, false);
+            let (rows, map) = layout(&line, BlockRole::Paragraph, render, w, false, 0);
 
             // (a) placed graphemes reconstruct visible content
             let reconstructed: String = map.placed.iter().map(|p| p.text.as_str()).collect();
@@ -1155,7 +1160,7 @@ mod props {
             w in widths(),
             render in line_render_strat()
         ) {
-            let (_rows, map) = layout(&line, BlockRole::Paragraph, render, w, false);
+            let (_rows, map) = layout(&line, BlockRole::Paragraph, render, w, false, 0);
             let texts: Vec<&str> = map.placed.iter().map(|p| p.text.as_str()).collect();
             let breaks = visible_break_indices(&texts);
             for r in 1..map.rows {
@@ -1177,7 +1182,7 @@ mod props {
         // -------------------------------------------------------------------
         #[test]
         fn law4_active_identity(line in logical_line(), w in widths()) {
-            let (_rows, map) = layout(&line, BlockRole::Paragraph, LineRender::RawPlain, w, false);
+            let (_rows, map) = layout(&line, BlockRole::Paragraph, LineRender::RawPlain, w, false, 0);
             prop_assert!(map.is_active);
             // visible source == raw line (no concealment on RawPlain line)
             prop_assert_eq!(
@@ -1207,7 +1212,7 @@ mod props {
         fn law5_desired_col_preserved(line in logical_line(), w in widths()) {
             // Active layout: columns map straightforwardly; the law is about
             // desired-col bookkeeping independent of concealment.
-            let (_rows, map) = layout(&line, BlockRole::Paragraph, LineRender::RawPlain, w, false);
+            let (_rows, map) = layout(&line, BlockRole::Paragraph, LineRender::RawPlain, w, false, 0);
             if map.rows < 2 { return Ok(()); }
             // Start at each positive-width grapheme on row 0; go down then up.
             // Zero-width graphemes are excluded (documented finding: they share
@@ -1241,7 +1246,7 @@ mod props {
             line in logical_line(),
             w in widths(),
         ) {
-            let (_rows, map) = layout(&line, BlockRole::Paragraph, LineRender::Concealed, w, false);
+            let (_rows, map) = layout(&line, BlockRole::Paragraph, LineRender::Concealed, w, false, 0);
             let valid: std::collections::HashSet<usize> =
                 map.placed.iter().map(|p| p.src.start)
                     .chain(std::iter::once(map.eol))

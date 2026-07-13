@@ -63,7 +63,7 @@ fn layout_line_on_demand(editor: &Editor, l: usize) -> wordcartel_core::layout::
     let role = editor.active().document.blocks().role_at(derive::line_start(buf, l));
     let render = crate::derive::line_render_for(editor.active().view.mode, l == caret_line(editor));
     let vp_width = text_geometry(editor).text_width as usize;
-    let (_rows, map) = layout::layout(&text, role, render, vp_width, editor.theme.heading_level_glyph);
+    let (_rows, map) = layout::layout(&text, role, render, vp_width, editor.theme.heading_level_glyph, 0);
     map
 }
 
@@ -135,7 +135,7 @@ pub(crate) fn layout_line_active(editor: &Editor, l: usize) -> wordcartel_core::
     let text = derive::line_text(buf, l);
     let role = editor.active().document.blocks().role_at(derive::line_start(buf, l));
     let vp_width = text_geometry(editor).text_width as usize;
-    let (_rows, map) = layout::layout(&text, role, wordcartel_core::style::LineRender::RawPlain, vp_width, editor.theme.heading_level_glyph);
+    let (_rows, map) = layout::layout(&text, role, wordcartel_core::style::LineRender::RawPlain, vp_width, editor.theme.heading_level_glyph, 0);
     map
 }
 

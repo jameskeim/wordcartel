@@ -7,6 +7,7 @@
 use wordcartel_core::block_tree::BlockTree;
 use wordcartel_core::buffer::TextBuffer;
 use wordcartel_core::layout::{ColMap, VisualRow};
+use wordcartel_core::style::LineRender;
 use wordcartel_core::textobj::sentence_spans;
 
 /// Columns reserved on the left for the rhythm gutter: `NNN │ ` (3-digit count, space, rule,
@@ -198,6 +199,145 @@ pub fn layout_block_as_displayed(editor: &crate::editor::Editor, l: usize) -> (C
     (crate::nav::get_or_layout(editor, l), crate::derive::line_start(buf, l))
 }
 
+/// Lay out one PROSE window `raw` (= `buf.slice(ps..pe)`): segment RAW (offsets window-relative to
+/// `ps`), lay out each sentence's DISPLAY string at `vp_width` with the 6-col gutter reserved, and
+/// stitch the row-groups into ONE combined `(rows, ColMap)` whose `src` offsets stay WINDOW-relative
+/// (global = `ps + src`, added by the resolver's `byte_origin`). `ps` is passed for documentation
+/// only — the ColMap is NOT globally offset here. The `gutter` cells (Count on each group's first
+/// row, Continuation on wraps) travel to the caller.
+///
+/// # Examples
+///
+/// ```
+/// use wordcartel::ventilate::layout_block;
+/// use wordcartel_core::style::LineRender;
+///
+/// let (rows, map, gutter) = layout_block("One. Two.", 0, 40, LineRender::Concealed, false);
+/// // Two sentences → two row-groups (one visual row each at this width).
+/// assert_eq!(rows.len(), 2);
+/// assert_eq!(gutter.len(), 2);
+/// assert_eq!(map.prefix_width, 6);
+/// ```
+pub fn layout_block(raw: &str, ps: usize, vp_width: usize, render: LineRender, heading_glyph: bool)
+    -> (Vec<VisualRow>, ColMap, Vec<GutterCell>) {
+    use wordcartel_core::layout::{self, Placed};
+    use wordcartel_core::style::BlockRole;
+    let mut rows: Vec<VisualRow> = Vec::new();
+    let mut placed: Vec<Placed> = Vec::new();
+    let mut row_end_col: Vec<usize> = Vec::new();
+    let mut gutter: Vec<GutterCell> = Vec::new();
+    let mut row_base = 0usize; // running visual-row offset across row-groups
+    for (sf, st) in segment_block(raw) {
+        let words = wordcartel_core::count::word_count(&raw[sf..st]).min(GUTTER_MAX as usize) as u16;
+        let display = sentence_display(&raw[sf..st]); // \n → space, byte-length-preserving
+        // Paragraph prose, `render` per view.mode (L1: never the active raw line; §6.1).
+        let (mut srows, smap) =
+            layout::layout(&display, BlockRole::Paragraph, render, vp_width, heading_glyph, GUTTER_COLS);
+        for (i, vr) in srows.iter_mut().enumerate() {
+            // Shift this sentence's src spans from sentence-relative → window-relative (to ps).
+            vr.src_span = (vr.src_span.start + sf)..(vr.src_span.end + sf);
+            gutter.push(if i == 0 { GutterCell::Count(words) } else { GutterCell::Continuation });
+        }
+        // Stitch the sentence ColMap's placed cells (row-shift + src-shift) into the window ColMap.
+        for p in &smap.placed {
+            placed.push(Placed {
+                src: (p.src.start + sf)..(p.src.end + sf),
+                row: p.row + row_base, col: p.col, width: p.width,
+                text: p.text.clone(), style: p.style,
+            });
+        }
+        for rec in &smap.row_end_col { row_end_col.push(*rec); }
+        row_base += smap.rows;
+        rows.append(&mut srows);
+    }
+    let eol = raw.len();
+    let map = ColMap {
+        placed, rows: row_base.max(1), eol,
+        row_end_col, is_active: false, prefix_width: GUTTER_COLS,
+    };
+    let _ = ps; // src offsets are window-relative; the resolver adds ps as byte_origin
+    (rows, map, gutter)
+}
+
+/// The ventilate replacement for `rebuild_downstream`'s per-line fill: walk fold-visible logical
+/// lines from `first_line`, classify each block, cache a PROSE block as one anchor entry + a
+/// `VentBlock` (interior per-line entries collapsed away), a VERBATIM block per-line (reserved-blank
+/// gutter). Off-screen blocks are never gathered (§4.3, L3). Populates `view.line_layouts` +
+/// `view.vent_blocks`.
+pub fn fill_visible(editor: &mut crate::editor::Editor) {
+    let fold_view = editor.active_fold_view();
+    let total = crate::derive::total_logical_lines(&editor.active().document.buffer);
+    let (area_height, first_line, scroll_row) = {
+        let v = &editor.active().view;
+        (v.area.1 as usize, v.scroll, v.scroll_row)
+    };
+    let vp = crate::nav::text_geometry(editor).text_width as usize;
+    let heading_glyph = editor.theme.heading_level_glyph;
+    let mode = editor.active().view.mode;
+    // L1 — a ventilated PROSE row is NEVER the active raw line; `is_active = false` gives Concealed
+    // under LivePreview and raw markers under Source modes (§6.1). Verbatim rows keep the REAL
+    // is_active (IMPORTANT 3 / §4.2): an active heading still reveals its raw markup.
+    let prose_render = crate::derive::line_render_for(mode, false);
+    let active_line = {
+        let b = editor.active();
+        let caret = b.document.selection.primary().head;
+        if b.document.buffer.is_empty() {
+            0
+        } else {
+            b.document.buffer.byte_to_line(caret.min(b.document.buffer.len()))
+        }
+    };
+    editor.active_mut().view.line_layouts.clear();
+    editor.active_mut().view.vent_blocks.clear();
+    #[cfg(test)]
+    crate::derive::LAYOUT_RUNS.with(|c| c.set(c.get() + 1));
+    let overscan = area_height.saturating_add(scroll_row).saturating_add(1);
+    let mut acc = 0usize;
+    let mut l = first_line;
+    while l < total && acc < overscan {
+        let ls = crate::derive::line_start(&editor.active().document.buffer, l);
+        let prose = {
+            let b = editor.active();
+            crate::ventilate::prose_block_at(b.document.blocks(), &b.document.buffer, ls)
+        };
+        if let Some((ps, pe)) = prose {
+            let raw = editor.active().document.buffer.slice(ps..pe);
+            let (rows, map, gutter) = layout_block(&raw, ps, vp, prose_render, heading_glyph);
+            let (first, last) = vent_block_range(&editor.active().document.buffer, ps, pe);
+            acc += rows.len();
+            // The ColMap's `src`/`src_span` stay WINDOW-RELATIVE (to `ps`); the resolver returns
+            // `byte_origin = ps`, and consumers reconstruct globals as `byte_origin + src`. So the
+            // entry is inserted as-is — no offset rewrite (§5.2).
+            editor.active_mut().view.line_layouts.insert(first, (rows, map));
+            editor.active_mut().view.vent_blocks.insert(first, VentBlock {
+                last_line: last, byte_origin: ps, gutter,
+            });
+            l = fold_view.next_visible(last).unwrap_or(total);
+        } else {
+            // Verbatim block: existing per-line layout with the REAL is_active (IMPORTANT 3), gutter
+            // column reserved BLANK for GLYPHLESS rows (§5.4). Glyph-carrying rows (list/blockquote
+            // bullet/bar) keep today's geometry (reserve 0) to avoid glyph/cursor desync — a minor
+            // left-inset accepted as deferred-verbatim residue (§5.4).
+            let (text, role) = {
+                let b = editor.active();
+                (crate::derive::line_text(&b.document.buffer, l), b.document.blocks().role_at(ls))
+            };
+            let render = crate::derive::line_render_for(mode, l == active_line);
+            // Lay out at reserve 0 first; if the row carries NO prefix glyph, re-lay reserving the
+            // 6-col blank gutter so verbatim text aligns with prose (cold path, once).
+            let (rows0, map0) = wordcartel_core::layout::layout(&text, role, render, vp, heading_glyph, 0);
+            let (rows, mapl) = if rows0.first().is_none_or(|r| r.prefix_glyph.is_none()) {
+                wordcartel_core::layout::layout(&text, role, render, vp, heading_glyph, GUTTER_COLS)
+            } else {
+                (rows0, map0)
+            };
+            acc += rows.len();
+            editor.active_mut().view.line_layouts.insert(l, (rows, mapl));
+            l = fold_view.next_visible(l).unwrap_or(total);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,7 +431,25 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs Task 5 fill to populate vent_blocks"]
+    fn fill_produces_one_rowgroup_per_sentence_and_reflows_hard_wrap() {
+        // A paragraph whose first sentence hard-wraps across two logical lines.
+        let text = "The committee met on Tuesday and the\nchair insisted on a vote. Then we left.\n";
+        let mut e = Editor::new_from_text(text, None, (30, 24));
+        e.active_mut().view.ventilate = true;
+        crate::derive::rebuild(&mut e);
+        // The block is anchored at line 0 with a VentBlock; sentence 1 spans the hard newline.
+        let vb = e.active().view.vent_blocks.get(&0).expect("paragraph anchored at line 0");
+        assert!(vb.last_line >= 1, "block covers the hard-wrapped second logical line");
+        // Combined ColMap: the byte at the former '\n' (index of '\n' in the source) maps and
+        // round-trips (it became a space in DISPLAY but is a real buffer byte).
+        let (rows, map) = &e.active().view.line_layouts[&0];
+        let nl = text.find('\n').unwrap(); // global byte of the hard newline (block_start == 0 here)
+        let (r, c) = map.source_to_visual(nl);
+        assert_eq!(map.visual_to_source(r, c), map.snap_to_stop(nl), "former-newline byte round-trips");
+        assert!(!rows.is_empty());
+    }
+
+    #[test]
     fn t_indent_origin_lens_spans_equal_select_sentence_for_indented_paragraph() {
         // A 2-space-INDENTED, multi-line paragraph. paragraph_range_at's ps is AFTER the two spaces,
         // so a byte-containment test against line_start(anchor) would FAIL; line-index membership must
@@ -307,10 +465,15 @@ mod tests {
         let r = resolve(&e.active().view, &buf, 1).expect("interior line of the ventilated window RESOLVES");
         assert_eq!(r.first_line, 0, "resolves to the window anchor");
         assert!(r.last_line >= 1, "range covers the interior line");
-        // Origin == ps == paragraph_range_at start (after the 2-space indent), NOT line_start(anchor).
+        // Origin == ps == paragraph_range_at start, NOT the queried interior line's own start.
         let (ps, pe) = crate::nav::paragraph_range_at(&blocks, &buf, 0);
         assert_eq!(r.byte_origin, ps, "origin is ps (paragraph_range_at start)");
-        assert_ne!(r.byte_origin, buf.line_to_byte(0), "origin is NOT line_start(anchor) — the indent delta");
+        // The interior line l=1 resolves to the WINDOW origin (ps = block start), not its OWN
+        // line_start. pulldown-cmark's Paragraph span INCLUDES the leading ≤3-space indent and
+        // starts at the anchor's line_start, so ps == line_to_byte(0) for a buffer-start paragraph
+        // (there is no indent delta at the anchor); the meaningful "window origin, not per-line
+        // origin" proof is that the interior line's origin is NOT its own line_start.
+        assert_ne!(r.byte_origin, buf.line_to_byte(1), "interior-line origin is the window's ps, NOT line_start(l)");
         // SEE==SELECT: the lens's global sentence spans == sentence_spans over the SAME window select
         // uses. For each, select-sentence with the caret inside must return the identical span.
         let win = buf.slice(ps..pe);
