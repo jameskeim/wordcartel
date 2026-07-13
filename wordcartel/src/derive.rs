@@ -223,6 +223,18 @@ pub(crate) fn rebuild_downstream(editor: &mut Editor) {
         let scroll_row = b.view.scroll_row;
         (total_lines, active_line, area_height, first_line, b_mode, b_ventilate, scroll_row)
     };
+    // Ventilate backstop: scroll is the top of a BLOCK, never an interior line of a ventilated
+    // paragraph (whose rows live only at the anchor key — an interior scroll blanks the block in
+    // paint). Re-anchor the fold-normalized scroll to the containing paragraph's first line
+    // (cache-free, from the block tree) so EXTERNAL setters — mouse-scrollbar jump, session restore
+    // — agree with the nav paths; when this moves scroll off an interior line, `scroll_row` was
+    // relative to that line, so reset it to the block top. No-op when the lens is off (identity).
+    let fold_line = first_line;
+    let first_line = crate::ventilate::scroll_anchor_line(editor, fold_line);
+    let scroll_row = if first_line == fold_line { scroll_row } else { 0 };
+    if first_line != fold_line {
+        editor.active_mut().view.scroll_row = 0;
+    }
     // Persist the normalized scroll so consumers agree.
     editor.active_mut().view.scroll = first_line;
 

@@ -2052,6 +2052,33 @@ mod tests {
         assert_eq!(map.visual_to_source(1, 4), 10);
     }
 
+    #[test]
+    fn ventilated_block_stays_painted_when_scrolled_into_its_interior() {
+        // Bug 1 (scroll blanks the paragraph), end-to-end through the real paint loop. A four-
+        // sentence paragraph (anchored at logical line 0, four visual rows) is TALLER than the
+        // 2-row edit area. With the caret on its last line, ensure_visible scrolls partway INTO the
+        // block. The block's rows live only at the anchor key, so a scroll/row-count consumer that
+        // mishandled the interior lines (over-advancing scroll past the anchor, or landing scroll on
+        // an interior line paint skips) blanked the paragraph. Assert the caret's own sentence
+        // ("Four") is actually on screen after the scroll.
+        let text = "One one one.\nTwo two two.\nThree three.\nFour four.\n";
+        let mut e = Editor::new_from_text(text, None, (40, 3)); // edit height 2 < the block's 4 rows
+        e.active_mut().view.ventilate = true;
+        derive::rebuild(&mut e);
+        let head = e.active().document.buffer.line_to_byte(3); // "Four four." — last, interior line
+        set_caret(&mut e, head);
+        crate::nav::ensure_visible(&mut e);
+        derive::rebuild(&mut e);
+        let buf = render_to_buffer(&mut e, 40, 3);
+        let painted: String = (0..2u16).map(|r| row_string(&buf, r)).collect::<Vec<_>>().join(" | ");
+        assert!(
+            painted.contains("Four"),
+            "the caret's sentence must be painted after scrolling into the block, got rows: {painted:?} \
+             (scroll={}, scroll_row={})",
+            e.active().view.scroll, e.active().view.scroll_row,
+        );
+    }
+
     /// Golden: fold marker `▸` glyph has DarkGray fg under terminal-plain.
     ///
     /// Creates a doc with a heading + body, folds the heading, renders, and

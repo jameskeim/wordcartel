@@ -167,6 +167,46 @@ pub fn resolve<'a>(view: &'a crate::editor::View, buf: &TextBuffer, l: usize) ->
     None // an ordinary per-line entry keyed below l does not cover l
 }
 
+/// The ventilate SCROLL ANCHOR for logical line `l`, computed directly from the block tree (no
+/// layout cache required): when the lens is ON and `l` falls inside a prose paragraph, the
+/// paragraph's FIRST logical line; otherwise `l` unchanged. A ventilated paragraph is a SINGLE
+/// scroll / row-count / paint unit keyed at this anchor (its rows live at the anchor's
+/// `line_layouts` entry; interior logical lines carry no key), so `view.scroll` and the caret's
+/// scroll-line MUST be normalized through this — never landing on an interior line, which would
+/// blank the block in paint (paint iterates anchor keys and skips keys `< scroll`, §5.2). Being
+/// cache-free, it is correct even for a not-yet-cached block (mouse-scrollbar jump, session
+/// restore). When the lens is OFF this is the identity, so every caller is a byte-for-byte no-op on
+/// the existing path.
+///
+/// # Examples
+///
+/// ```
+/// use wordcartel::editor::Editor;
+/// use wordcartel::ventilate::scroll_anchor_line;
+///
+/// // "One. Two three\nfour five. Six." is ONE paragraph spanning logical lines 0 and 1.
+/// let mut e = Editor::new_from_text("One. Two three\nfour five. Six.\n", None, (20, 8));
+/// e.active_mut().view.ventilate = true;
+/// wordcartel::derive::rebuild(&mut e);
+/// assert_eq!(scroll_anchor_line(&e, 0), 0); // the anchor is itself
+/// assert_eq!(scroll_anchor_line(&e, 1), 0); // interior line anchors to the paragraph's first line
+/// ```
+pub fn scroll_anchor_line(editor: &crate::editor::Editor, l: usize) -> usize {
+    if !editor.active().view.ventilate {
+        return l;
+    }
+    let b = editor.active();
+    let buf = &b.document.buffer;
+    if buf.is_empty() {
+        return l;
+    }
+    let ls = crate::derive::line_start(buf, l);
+    match prose_block_at(b.document.blocks(), buf, ls) {
+        Some((ps, _pe)) => buf.byte_to_line(ps.min(buf.len().saturating_sub(1))),
+        None => l,
+    }
+}
+
 /// The byte ORIGIN render must reconstruct global offsets against for a cached entry keyed at `l`
 /// (`origin + vr.src_span`): the window's `byte_origin` (`ps`) when `l` is a ventilated window anchor,
 /// else `line_start(l)`. Render iterates `line_layouts` KEYS, so `l` is always an anchor key here — a
