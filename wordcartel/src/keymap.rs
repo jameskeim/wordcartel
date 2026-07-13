@@ -313,6 +313,11 @@ static CUA: &[(&str, &str)] = &[
     ("ctrl-right",      "move_word_right"),
     ("ctrl-shift-left", "select_word_left"),
     ("ctrl-shift-right","select_word_right"),
+    // Sentence motions (S5) — Emacs M-a / M-e.
+    ("alt-a",       "sentence_left"),
+    ("alt-e",       "sentence_right"),
+    ("alt-shift-a", "select_sentence_left"),
+    ("alt-shift-e", "select_sentence_right"),
     // Word delete
     ("ctrl-backspace", "delete_word_back"),
     ("ctrl-del",       "delete_word_forward"),
@@ -854,6 +859,31 @@ mod tests {
     fn cua_alt_b_promotes() {
         let (t, _) = build_keymap(&crate::config::KeymapConfig::default(), &Registry::builtins());
         assert!(matches!(t.resolve(&parse_seq("alt-b").unwrap()), Resolution::Command(CommandId("mark_block_from_selection"))));
+    }
+
+    #[test]
+    fn sentence_motions_bound_in_cua_unbound_in_wordstar() {
+        let reg = Registry::builtins();
+        let seq = |s: &str| parse_seq(s).unwrap();
+        let (cua, warns) = build_keymap(
+            &crate::config::KeymapConfig { preset: "cua".into(), patches: vec![] }, &reg);
+        assert!(warns.is_empty(), "cua warns: {warns:?}");
+        assert!(matches!(cua.resolve(&seq("alt-a")), Resolution::Command(CommandId("sentence_left"))));
+        assert!(matches!(cua.resolve(&seq("alt-e")), Resolution::Command(CommandId("sentence_right"))));
+        assert!(matches!(cua.resolve(&seq("alt-shift-a")), Resolution::Command(CommandId("select_sentence_left"))));
+        assert!(matches!(cua.resolve(&seq("alt-shift-e")), Resolution::Command(CommandId("select_sentence_right"))));
+        let (ws, warns) = build_keymap(
+            &crate::config::KeymapConfig { preset: "wordstar".into(), patches: vec![] }, &reg);
+        assert!(warns.is_empty(), "wordstar warns: {warns:?}");
+        // Deliberately unbound in WordStar (law 7: palette-only, no hint). ALL FOUR chords must
+        // resolve to NONE of the four sentence commands (spec T-12).
+        for chord in ["alt-a", "alt-e", "alt-shift-a", "alt-shift-e"] {
+            assert!(!matches!(ws.resolve(&seq(chord)),
+                Resolution::Command(CommandId(
+                    "sentence_left" | "sentence_right"
+                    | "select_sentence_left" | "select_sentence_right"))),
+                "WordStar must not bind {chord} to any sentence motion (law 7: palette-only, no hint)");
+        }
     }
 
     #[test]

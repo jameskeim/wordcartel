@@ -41,6 +41,8 @@ pub enum Dir {
     LineEnd,
     WordLeft,
     WordRight,
+    SentenceLeft,
+    SentenceRight,
     ParagraphUp,
     ParagraphDown,
     PageUp,
@@ -262,6 +264,8 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                 Dir::LineEnd   => nav::move_end(editor),
                 Dir::WordLeft      => nav::move_word_left(editor),
                 Dir::WordRight     => nav::move_word_right(editor),
+                Dir::SentenceLeft  => nav::move_sentence_left(editor),
+                Dir::SentenceRight => nav::move_sentence_right(editor),
                 Dir::ParagraphUp   => nav::move_paragraph_up(editor),
                 Dir::ParagraphDown => nav::move_paragraph_down(editor),
                 Dir::PageUp        => nav::move_page_up(editor),
@@ -1105,6 +1109,62 @@ mod tests {
         assert_eq!(nav::head(&e), e.active().document.buffer.len());
         run(Command::Move { dir: Dir::DocStart, extend: false }, &mut e, &TestClock(0));
         assert_eq!(nav::head(&e), 0);
+    }
+
+    #[test]
+    fn sentence_motion_start_and_end() {
+        // spans: "One two." (0,8), "Three four." (9,20)
+        let mut e = Editor::new_from_text("One two. Three four.\n", None, (80, 24));
+        set_caret(&mut e, 12); derive::rebuild(&mut e);          // inside "Three four."
+        run(Command::Move { dir: Dir::SentenceLeft, extend: false }, &mut e, &TestClock(0));
+        assert_eq!(nav::head(&e), 9);                             // start of current sentence
+        run(Command::Move { dir: Dir::SentenceLeft, extend: false }, &mut e, &TestClock(0));
+        assert_eq!(nav::head(&e), 0);                             // idempotent-safe → previous
+        run(Command::Move { dir: Dir::SentenceRight, extend: false }, &mut e, &TestClock(0));
+        assert_eq!(nav::head(&e), 8);                             // end of current CONTENT
+        run(Command::Move { dir: Dir::SentenceRight, extend: false }, &mut e, &TestClock(0));
+        assert_eq!(nav::head(&e), 20);                            // → next content end
+    }
+
+    #[test]
+    fn sentence_motion_crosses_blocks_both_directions() {
+        // "One. Two." = 0..9 (spans (0,4),(5,9)); "Three. Four." = 11..23 (spans (11,17),(18,23)).
+        // Core offsets executed-verified 2026-07-12: prev_sentence_start("Three. Four.",0)=None →
+        // cross → prev_sentence_start("One. Two.",len)=Some(5); next_sentence_end("One. Two.",8)=9,
+        // next_sentence_end("Three. Four.",0)=6 (→ 11+6=17).
+        let mut e = Editor::new_from_text("One. Two.\n\nThree. Four.\n", None, (80, 24));
+        // RIGHTWARD: from block 1 crosses to block 2's FIRST content end.
+        set_caret(&mut e, 8); derive::rebuild(&mut e);            // in "Two."
+        run(Command::Move { dir: Dir::SentenceRight, extend: false }, &mut e, &TestClock(0));
+        assert_eq!(nav::head(&e), 9);                             // end of "Two."
+        run(Command::Move { dir: Dir::SentenceRight, extend: false }, &mut e, &TestClock(0));
+        assert_eq!(nav::head(&e), 17);                            // crosses to end of "Three."
+        // LEFTWARD: from block 2's FIRST sentence start crosses to block 1's LAST sentence start.
+        set_caret(&mut e, 11); derive::rebuild(&mut e);          // AT start of "Three." (block 2)
+        run(Command::Move { dir: Dir::SentenceLeft, extend: false }, &mut e, &TestClock(0));
+        assert_eq!(nav::head(&e), 5);                             // crosses to start of "Two." (block 1's LAST)
+    }
+
+    #[test]
+    fn sentence_motion_extends_selection() {
+        let mut e = Editor::new_from_text("One two. Three four.\n", None, (80, 24));
+        set_caret(&mut e, 0); derive::rebuild(&mut e);
+        run(Command::Move { dir: Dir::SentenceRight, extend: true }, &mut e, &TestClock(0));
+        let sel = e.active().document.selection.primary();
+        assert_eq!((sel.from(), sel.to()), (0, 8));               // anchor kept, head → 8
+    }
+
+    #[test]
+    fn expand_ladder_sentence_rung_survives_single_sentence_paragraph() {
+        // §3.4.3 regression: with content-only spans, Sentence (0,8) ⊂ Paragraph (0,9),
+        // so the Sentence rung no longer collapses into Paragraph.
+        let mut e = Editor::new_from_text("One two.\n", None, (80, 24));
+        set_caret(&mut e, 1); derive::rebuild(&mut e);            // inside "One"
+        run(Command::ExpandSelection, &mut e, &TestClock(0));     // → Word "One"
+        run(Command::ExpandSelection, &mut e, &TestClock(0));     // → Sentence "One two."
+        let s = e.active().document.selection.primary();
+        assert_eq!((s.from(), s.to()), (0, 8));
+        assert_eq!(e.active().document.buffer.slice(s.from()..s.to()), "One two.");
     }
 
     #[test]

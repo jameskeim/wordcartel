@@ -261,6 +261,13 @@ impl Harness {
         let w = buf.area().width;
         (0..w).filter(|&x| buf[(x, y)].style().add_modifier.contains(Modifier::UNDERLINED)).collect()
     }
+    /// Column indices on visual row `y` that carry the DIM modifier (focus dimming).
+    fn dim_cols(&self, y: u16) -> Vec<u16> {
+        use ratatui::style::Modifier;
+        let buf = self.term.backend().buffer();
+        let w = buf.area().width;
+        (0..w).filter(|&x| buf[(x, y)].style().add_modifier.contains(Modifier::DIM)).collect()
+    }
 }
 
 #[test]
@@ -1738,6 +1745,70 @@ fn e2e_lens_switch_flips_the_painted_underline_set() {
     assert!((0..3).all(|c| !after.contains(&c)),
         "harper's diagnostic must NOT paint once the lens moved off it, got {after:?}");
     assert_ne!(before, after, "the painted underline set switched with the lens");
+}
+
+#[test]
+fn e2e_focus_sentence_spans_wrapped_rows_not_just_a_line() {
+    // A paragraph hard-wrapped by an INTERIOR authored `\n` mid-sentence-1 (a real hard-wrapped
+    // source line — NOT a semantic hard break: no trailing "  " / "\\" before the `\n`, so R2's
+    // veto (§4.5) does not fire and R2 merges the two source lines into one sentence span).
+    // Sentence 1 = "The committee met ... complicated matter." (straddles the interior `\n`,
+    // and — at this 40-col width — wraps across FOUR visual rows). Sentence 2 = "Then we left."
+    // lands entirely on its own row, disjoint from every row sentence 1 occupies. Pre-S5
+    // (line-focus), the interior `\n` would itself be a UAX-29 sentence break (SB4: sentences
+    // break after a paragraph/line separator), so the second source-line's rows would be a
+    // DIFFERENT "sentence" and get dimmed — exactly the bug S5's R2 fixes. Proven non-vacuous
+    // below via a differential against the pre-S5 raw `split_sentence_bound_indices` behavior.
+    let text = "The committee met on Tuesday and the\n\
+        chair insisted on a vote after much long and careful deliberation regarding the whole \
+        entire quite complicated matter. Then we left.\n";
+    let mut h = Harness::new(text, None, (40, 10));
+    {
+        let mut ed = h.editor.borrow_mut();
+        ed.theme = wordcartel_core::theme::no_color();
+        ed.depth = wordcartel_core::theme::Depth::None;
+        ed.view_opts.focus = true;
+        ed.view_opts.focus_granularity = crate::config::FocusGranularity::Sentence;
+        // caret in sentence 1 (byte 5, "committee")
+        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(5);
+        crate::derive::rebuild(&mut ed);
+    }
+    h.render();
+
+    // Non-vacuity: HEAD's `sentence_bounds` must actually straddle the interior `\n` (R2 fired),
+    // and must differ from the pre-S5 raw UAX-29 result (which breaks AT the `\n` — SB4).
+    let real = wordcartel_core::textobj::sentence_bounds(text, 5);
+    assert!(text[real.0..real.1].contains('\n'),
+        "sentence 1 must straddle the interior newline (R2 merge), got {:?}", &text[real.0..real.1]);
+    assert!(text[real.0..real.1].contains("matter."),
+        "sentence 1 must extend through the second source line, got {:?}", &text[real.0..real.1]);
+
+    // Every visual row belonging to sentence 1 — both source-line rows, spanning the interior
+    // `\n` — must be UNDIMMED. Located by content (not hard-coded row indices), per the brief.
+    let row_committee = (0..10u16).find(|&y| h.row(y).contains("committee"))
+        .expect("sentence 1 (start) must be visible");
+    let row_chair = (0..10u16).find(|&y| h.row(y).contains("chair insisted"))
+        .expect("sentence 1 (wrapped continuation, past the interior newline) must be visible");
+    let row_deliberation = (0..10u16).find(|&y| h.row(y).contains("deliberation"))
+        .expect("sentence 1 (mid-wrap continuation) must be visible");
+    let row_matter = (0..10u16).find(|&y| h.row(y).contains("matter."))
+        .expect("sentence 1 (final wrapped row) must be visible");
+    assert!(h.dim_cols(row_committee).is_empty(), "sentence 1 row (start) must not be dimmed");
+    assert!(h.dim_cols(row_chair).is_empty(),
+        "sentence 1 row (wrapped continuation past the interior \\n) must not be dimmed — the S5 R2 fix");
+    assert!(h.dim_cols(row_deliberation).is_empty(),
+        "sentence 1 row (mid-wrap continuation) must not be dimmed");
+    assert!(h.dim_cols(row_matter).is_empty(),
+        "sentence 1 row (final wrapped row) must not be dimmed");
+
+    // The row carrying sentence 2 — disjoint from every sentence-1 row above — IS dimmed.
+    let sentence2_row = (0..10u16).find(|&y| h.row(y).contains("Then we left"))
+        .expect("sentence 2 must be visible");
+    assert!(![row_committee, row_chair, row_deliberation, row_matter].contains(&sentence2_row),
+        "sentence 2's row must be disjoint from every sentence 1 row — else dimming (a per-row \
+         decision in render.rs) can't tell them apart, got row {sentence2_row}");
+    assert!(!h.dim_cols(sentence2_row).is_empty(),
+        "sentence 2 row must be dimmed while the caret is in sentence 1");
 }
 
 // ===========================================================================
