@@ -945,14 +945,16 @@ shipped_date = "2026-07-13"
 [[item]]
 id = "S6"
 title = "Ventilate-as-a-lens — non-destructive sentence view + rhythm gutter"
-status = "needs-design"
+status = "shipped"
 kind = "feature"
 size = "M"
 theme = "S"
 depends_on = ["S5"]
 hook = "⭐ THE THESIS IS PROVEN OR KILLED HERE. Ventilate as a VIEW, not an edit: buffer untouched, display breaks one sentence per line, toggle off → prose returns byte-identical. Plus a rhythm gutter (per-sentence word count + opening word) so a 41-word monster and three repeated 'The' openers are visible instantly. Zero NLP, no new objects, no command matrix, no contract amendment. Must render with OUR detector (S5), not repar's, so what you SEE and what you SELECT are the same object. FAILURE SIGNAL: author uses it on real prose for 2 weeks and turns it off → STOP THE ARC. Arc: docs/design/prose-structure-arc.md."
-doc = "ux-backlog.md#s6"
+doc = "backlog-archive.md#s6"
 created = "2026-07-12"
+shipped_commit = "04a2748"
+shipped_date = "2026-07-13"
 
 [[item]]
 id = "S7"

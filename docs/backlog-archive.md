@@ -1686,3 +1686,57 @@ and trivially bounded to the paragraph window.
 
 ⚠ **Trap for every consumer:** UAX sentence spans **include trailing whitespace** (unlike word
 bounds — `"One two. "` → `(0,9)`). Trim to content or gaps double on transpose.
+
+### S6 — Ventilate-as-a-lens — non-destructive sentence view + rhythm gutter
+<!-- item: S6 -->
+
+⭐ **The item where the whole arc's thesis is proven or killed.** See
+`docs/design/prose-structure-arc.md` for the north star this tests.
+
+**The reframe it embodies.** The original S4 idea sold *selection, movement, transformation*. That is
+the weak half — nobody wakes up wanting to select a clause. The strong half:
+
+> **A prose editor that understands sentences can SHOW the writer the skeleton of their prose —
+> non-destructively, on demand — and then let them operate on the bones it revealed.**
+
+Diagnosis, then surgery. Writing is revision; drafting is hours and revision is weeks. Every tool a
+writer owns serves drafting (focus mode, typewriter scroll) or filing (corkboards). *Revision* —
+**this sentence is 41 words and drowns the reader; four of these six open with "The"** — is served by
+nothing. (Cautionary case: iA Writer shipped POS-driven "Syntax Control" — their most-demoed, least-
+used feature. Structure-as-*selection* may be a programmer's fantasy about how writers work. This
+item finds out, cheaply, before we spend a dependency on it.)
+
+**What:** `ventilate` today (`registry.rs` → `transform.rs`) **destructively rewrites** the buffer.
+S6 adds it as a **view**: buffer untouched, the *display* breaks one sentence per line; toggle off and
+the prose returns **byte-identical**. `RenderMode` already cycles four states — this is a fifth.
+Alongside it, a **rhythm gutter** — per sentence, its word count and opening word:
+
+```
+ 8  The  The committee met on Tuesday.
+12  The  The chair, who had prepared, spoke first.
+41  The  The proposal, which had been circulating since…
+ 7  She  She left.
+```
+
+The writer sees the 41-word monster and the three `The`s **instantly**. That is the whole
+Hemingway-app value proposition, inside a real editor, over a real manuscript, with no cloud and no
+rewriting. Plus repeated-opener highlighting within a paragraph — note the codebase already carries
+the anaphora corpus (`transform.rs` tests "We will fight on the beaches / …landing grounds / …fields"),
+and repar's `prose-prefix` fixup exists *because* anaphora is real.
+
+**Cost: nearly nothing.** Zero NLP. No new objects. No command matrix. No contract amendment.
+
+**Architectural constraint — why S6 must precede S4.** The lens MUST render using **our own detector**
+(S5), never repar's. Then the sentence you *see* and the sentence you *select* are the same object
+**by construction**, and the two-authority problem stops being a UX hazard. It also *cannot* call
+repar even if we wanted to: repar is `&str` → `String`, so extracting boundaries would mean running
+`--ventilate` and diffing lines — a whole-document round-trip per render, an outright violation of the
+`O(visible) + O(edited)` rule.
+
+**Note this does NOT remove or replace repar.** `reflow` / `unwrap` / `ventilate` stay exactly as they
+are — real commands, repar-backed, still the destructive/export path. The lens is *additive*.
+
+**⛔ FAILURE SIGNAL — the cheapest falsification available to us:** the author uses the lens on real
+prose for two weeks **and turns it off**. If that happens, **STOP THE ARC.** S7 and S8 are more
+expensive bets on the same premise, and the premise will have been disproved for free.
+
