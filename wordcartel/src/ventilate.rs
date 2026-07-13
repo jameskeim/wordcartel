@@ -202,8 +202,14 @@ pub fn scroll_anchor_line(editor: &crate::editor::Editor, l: usize) -> usize {
     }
     let ls = crate::derive::line_start(buf, l);
     match prose_block_at(b.document.blocks(), buf, ls) {
-        Some((ps, _pe)) => buf.byte_to_line(ps.min(buf.len().saturating_sub(1))),
-        None => l,
+        // Only a NON-EMPTY window that actually CONTAINS this line's start folds `l` into a block.
+        // A blank separator (empty `(s, s)` window) or the EOF phantom line (whose window maps
+        // BACKWARD to an earlier block, so `pe <= ls`) is its own standalone verbatim row under the
+        // fill, so it must anchor to ITSELF here too — matching the fill's `ventilated_window`
+        // guard. Folding such a line into a neighbouring block would desync scroll/caret-row
+        // accounting against paint (the C2/I1 class, in scroll space).
+        Some((ps, pe)) if ps <= ls && ls < pe => buf.byte_to_line(ps.min(buf.len().saturating_sub(1))),
+        _ => l,
     }
 }
 
@@ -320,6 +326,44 @@ pub fn layout_block(raw: &str, ps: usize, vp_width: usize, render: LineRender, h
     (rows, map, gutter)
 }
 
+/// The first non-whitespace byte of logical line `l`, or `None` when the line holds only whitespace
+/// — a blank paragraph separator or the trailing EOF phantom line. The fill queries the prose window
+/// at THIS byte (not the line's raw start) so its window is byte-identical to the one
+/// `select-sentence`/focus derive from a caret on the paragraph's content, keeping SEE==SELECT exact
+/// on an INDENTED paragraph (pulldown drops the ≤3-space leading indent from the block span, so a
+/// line-start query lands in the gap fallback and diverges from the selector; a content-byte query
+/// hits the block itself — I2, §5.2). A line with no content byte is never ventilated: that single
+/// fact is the blank/phantom guard behind C1/C2/I1 — a blank or phantom line becomes an honest
+/// 1-row per-line entry, never a zero-row prose entry.
+fn line_content_byte(buf: &TextBuffer, l: usize) -> Option<usize> {
+    let ls = crate::derive::line_start(buf, l);
+    let text = crate::derive::line_text(buf, l);
+    text.find(|c: char| !c.is_whitespace()).map(|off| ls + off)
+}
+
+/// The prose window to ventilate for logical line `l`, or `None` when `l` must fall to the ordinary
+/// per-line layout path (a blank separator, the EOF phantom line, a verbatim block, or a gap
+/// fallback that maps elsewhere). `Some((ps, pe))` iff line `l` has content, is classified PROSE at
+/// that content byte, and the resulting `paragraph_range_at` window is NON-EMPTY (`ps < pe`) AND
+/// anchored on `l` itself (`vent_block_range(..).0 == l`). Rejecting an empty window or one whose
+/// first line is not `l` (a gap fallback that maps to an earlier/blank line, or the phantom line's
+/// backward map) is what stops the fill ever caching a ZERO-ROW prose entry — the shared root cause
+/// of the freeze (C1), the blank-separator caret drift (C2), and the EOF-phantom overwrite (I1).
+/// Because the window is anchored on `l`, its last line is `>= l`, so the fill's `next_visible(last)`
+/// step always advances (the termination invariant, §fill).
+fn ventilated_window(blocks: &BlockTree, buf: &TextBuffer, l: usize) -> Option<(usize, usize)> {
+    let content = line_content_byte(buf, l)?;
+    let (ps, pe) = prose_block_at(blocks, buf, content)?;
+    if ps >= pe {
+        return None; // empty/degenerate window never ventilates
+    }
+    let (first, _last) = vent_block_range(buf, ps, pe);
+    if first != l {
+        return None; // window not anchored on `l` (gap fallback mapped elsewhere / interior line)
+    }
+    Some((ps, pe))
+}
+
 /// The ventilate replacement for `rebuild_downstream`'s per-line fill: walk fold-visible logical
 /// lines from `first_line`, classify each block, cache a PROSE block as one anchor entry + a
 /// `VentBlock` (interior per-line entries collapsed away), a VERBATIM block per-line (reserved-blank
@@ -356,15 +400,15 @@ pub fn fill_visible(editor: &mut crate::editor::Editor) {
     let mut acc = 0usize;
     let mut l = first_line;
     while l < total && acc < overscan {
-        let ls = crate::derive::line_start(&editor.active().document.buffer, l);
-        let prose = {
+        let window = {
             let b = editor.active();
-            crate::ventilate::prose_block_at(b.document.blocks(), &b.document.buffer, ls)
+            ventilated_window(b.document.blocks(), &b.document.buffer, l)
         };
-        if let Some((ps, pe)) = prose {
+        let next = if let Some((ps, pe)) = window {
             let raw = editor.active().document.buffer.slice(ps..pe);
             let (rows, map, gutter) = layout_block(&raw, ps, vp, prose_render, heading_glyph);
             let (first, last) = vent_block_range(&editor.active().document.buffer, ps, pe);
+            debug_assert_eq!(first, l, "ventilated_window guarantees the window anchors on l");
             acc += rows.len();
             // The ColMap's `src`/`src_span` stay WINDOW-RELATIVE (to `ps`); the resolver returns
             // `byte_origin = ps`, and consumers reconstruct globals as `byte_origin + src`. So the
@@ -373,12 +417,16 @@ pub fn fill_visible(editor: &mut crate::editor::Editor) {
             editor.active_mut().view.vent_blocks.insert(first, VentBlock {
                 last_line: last, byte_origin: ps, gutter,
             });
-            l = fold_view.next_visible(last).unwrap_or(total);
+            fold_view.next_visible(last).unwrap_or(total)
         } else {
-            // Verbatim block: existing per-line layout with the REAL is_active (IMPORTANT 3), gutter
-            // column reserved BLANK for GLYPHLESS rows (§5.4). Glyph-carrying rows (list/blockquote
-            // bullet/bar) keep today's geometry (reserve 0) to avoid glyph/cursor desync — a minor
-            // left-inset accepted as deferred-verbatim residue (§5.4).
+            // Verbatim / blank / phantom line: ordinary per-line layout with the REAL is_active
+            // (IMPORTANT 3), gutter column reserved BLANK for GLYPHLESS rows (§5.4). Glyph-carrying
+            // rows (list/blockquote bullet/bar) keep today's geometry (reserve 0) to avoid
+            // glyph/cursor desync — a minor left-inset accepted as deferred-verbatim residue (§5.4).
+            // A blank separator or the EOF phantom line lands HERE (not a zero-row prose entry): it
+            // lays out as an honest 1-row entry keyed at `l`, so paint and row-count agree on it
+            // (C2) and the caret gets its own row (I1).
+            let ls = crate::derive::line_start(&editor.active().document.buffer, l);
             let (text, role) = {
                 let b = editor.active();
                 (crate::derive::line_text(&b.document.buffer, l), b.document.blocks().role_at(ls))
@@ -394,8 +442,16 @@ pub fn fill_visible(editor: &mut crate::editor::Editor) {
             };
             acc += rows.len();
             editor.active_mut().view.line_layouts.insert(l, (rows, mapl));
-            l = fold_view.next_visible(l).unwrap_or(total);
-        }
+            fold_view.next_visible(l).unwrap_or(total)
+        };
+        // Termination invariant (the class behind C1): the walk MUST strictly advance every
+        // iteration — no matter how a line classifies or how many visual rows it emits, a zero-row
+        // entry must never stall the loop. `next` already exceeds `l` on both arms (a ventilated
+        // window is anchored on `l` so `last >= l` and `next_visible(last) > l`; the verbatim arm is
+        // `next_visible(l) > l`); the `.max(l + 1)` makes strict progress a HARD structural
+        // guarantee rather than a reasoned one.
+        debug_assert!(next > l, "fill_visible must strictly advance (C1 termination invariant)");
+        l = next.max(l + 1);
     }
 }
 
@@ -586,43 +642,158 @@ mod tests {
 
     #[test]
     fn t_indent_origin_lens_spans_equal_select_sentence_for_indented_paragraph() {
-        // A 2-space-INDENTED, multi-line paragraph. pulldown-cmark's Paragraph span INCLUDES the
-        // leading ≤3-space indent and starts at the anchor's line_start, so paragraph_range_at's
-        // `ps == line_to_byte(0)` here (a buffer-start paragraph — no indent delta at the anchor).
-        // The origin must be `ps`, and the meaningful "window origin, not per-line origin" property
-        // is that an INTERIOR line (l=1) resolves to the WINDOW origin `ps`, NOT its own line_start —
-        // reached by line-index LOOKUP, never byte-containment. The lens's global sentence spans must
-        // also be byte-identical to what select-sentence selects (the SEE==SELECT proof, indent case).
-        let text = "  The committee met on a\nsunny Tuesday afternoon. It voted.\n";
+        // A 3-space-INDENTED, multi-line, multi-sentence paragraph — the I2 case. pulldown-cmark's
+        // Paragraph span DROPS the leading ≤3-space indent (verified against the real parser: the
+        // block span starts at byte 3, not 0), so a query at the anchor's LINE-START byte (a space,
+        // before the block) misses the block and hits `paragraph_range_at`'s GAP FALLBACK — a
+        // DIFFERENT window than the selector, which queries at the caret (a content byte, inside the
+        // block). The fix: the fill queries at the block's first CONTENT byte, so its window is
+        // byte-identical to the selector's and SEE==SELECT holds EXACTLY (no leading-indent delta).
+        let text = "   The committee met on a\nsunny Tuesday. It voted yes.\n";
         let mut e = Editor::new_from_text(text, None, (30, 24));
         e.active_mut().view.ventilate = true;
         crate::derive::rebuild(&mut e); // Task 5 fill populates vent_blocks for the paragraph
         let buf = e.active().document.buffer.clone();
         let blocks = e.active().document.blocks().clone();
-        // Line 1 ("sunny Tuesday…") is an INTERIOR line of the window (anchor is line 0).
-        let r = resolve(&e.active().view, &buf, 1).expect("interior line of the ventilated window RESOLVES");
-        assert_eq!(r.first_line, 0, "resolves to the window anchor");
-        assert!(r.last_line >= 1, "range covers the interior line");
-        // Origin == ps == paragraph_range_at start, NOT the queried interior line's own start.
-        let (ps, pe) = crate::nav::paragraph_range_at(&blocks, &buf, 0);
-        assert_eq!(r.byte_origin, ps, "origin is ps (paragraph_range_at start)");
-        // The interior line l=1 resolves to the WINDOW origin (ps = block start), not its OWN
-        // line_start. pulldown-cmark's Paragraph span INCLUDES the leading ≤3-space indent and
-        // starts at the anchor's line_start, so ps == line_to_byte(0) for a buffer-start paragraph
-        // (there is no indent delta at the anchor); the meaningful "window origin, not per-line
-        // origin" proof is that the interior line's origin is NOT its own line_start.
-        assert_ne!(r.byte_origin, buf.line_to_byte(1), "interior-line origin is the window's ps, NOT line_start(l)");
-        // SEE==SELECT: the lens's global sentence spans == sentence_spans over the SAME window select
-        // uses. For each, select-sentence with the caret inside must return the identical span.
-        let win = buf.slice(ps..pe);
+
+        // The fill's window (via the resolver's byte_origin) MUST equal the block/selector window,
+        // NOT the line-start gap-fallback window that masked I2. Reconstruct the fill window end from
+        // the combined ColMap's `eol` (window-relative length), added to the byte_origin.
+        let r0 = resolve(&e.active().view, &buf, 0).expect("ventilated window resolves at the anchor");
+        let fill_ps = r0.byte_origin;
+        let fill_pe = fill_ps + r0.map.eol;
+        // The selector's window for a caret ON THE CONTENT (byte 3, the first real character).
+        let (sel_ps, sel_pe) = crate::nav::paragraph_range_at(&blocks, &buf, 3);
+        assert_eq!((fill_ps, fill_pe), (sel_ps, sel_pe),
+            "fill window EQUALS the selector's content-caret window (I2 fix)");
+        // And it is the BLOCK window (indent excluded), NOT the line-start gap-fallback window that
+        // masked the bug — proving the content-byte query, not the old line-start query.
+        assert_eq!(fill_ps, buf.line_to_byte(0) + 3, "window starts AFTER the 3-space indent");
+        let (gap_ps, _gap_pe) = crate::nav::paragraph_range_at(&blocks, &buf, buf.line_to_byte(0));
+        assert_ne!(fill_ps, gap_ps, "fill did NOT use the line-start gap-fallback window (which masked I2)");
+
+        // Interior line l=1 ("sunny Tuesday…") resolves to the WINDOW origin (ps), NOT its own
+        // line_start — line-index LOOKUP, never byte-containment.
+        let r1 = resolve(&e.active().view, &buf, 1).expect("interior line of the ventilated window RESOLVES");
+        assert_eq!(r1.first_line, 0, "resolves to the window anchor");
+        assert!(r1.last_line >= 1, "range covers the interior line");
+        assert_eq!(r1.byte_origin, fill_ps, "interior-line origin is the window ps");
+        assert_ne!(r1.byte_origin, buf.line_to_byte(1), "interior-line origin is the window ps, NOT line_start(l)");
+
+        // SEE==SELECT, EXACT: the FIRST row-group's global span == what select-sentence returns for a
+        // caret inside sentence 1. Before the fix the fill's first span would be [0, ..) (indent
+        // included) while select-sentence returns [3, ..) — the I2 divergence this asserts is gone.
+        let win = buf.slice(fill_ps..fill_pe);
         let lens_spans: Vec<(usize, usize)> =
-            crate::ventilate::segment_block(&win).map(|(sf, st)| (ps + sf, ps + st)).collect();
+            crate::ventilate::segment_block(&win).map(|(sf, st)| (fill_ps + sf, fill_ps + st)).collect();
+        assert!(lens_spans.len() >= 2, "fixture ventilates into ≥2 sentences");
+        assert_eq!(lens_spans[0].0, buf.line_to_byte(0) + 3,
+            "first row-group span starts at the content byte (3), NOT the indent (0) — the exact I2 assertion");
         for &(gf, gt) in &lens_spans {
-            // select-sentence uses scope_range_at over paragraph_range_at + sentence_bounds — identical
-            // window + origin — so the selected span equals the lens span for a caret inside it.
-            let (sf, st) = wordcartel_core::textobj::sentence_bounds(&win, ((gf + gt) / 2) - ps);
-            assert_eq!((ps + sf, ps + st), (gf, gt), "lens span EQUALS select-sentence span (SEE==SELECT)");
+            // select-sentence: paragraph_range_at at the caret byte, then sentence_bounds — the
+            // IDENTICAL window + origin, so its span must equal the lens span for a caret inside it.
+            let caret = (gf + gt) / 2; // a content byte inside this sentence
+            let (wps, wpe) = crate::nav::paragraph_range_at(&blocks, &buf, caret);
+            let (sf, st) = wordcartel_core::textobj::sentence_bounds(&buf.slice(wps..wpe), caret - wps);
+            assert_eq!((wps + sf, wps + st), (gf, gt), "lens span EQUALS select-sentence span (SEE==SELECT, exact)");
         }
+    }
+
+    #[test]
+    fn t_c1_trailing_blank_lines_terminate_and_paint_no_zero_row_prose() {
+        // C1 — a doc ending in `\n\n` (and pathological all-blank / lone-newline / empty docs) toggled
+        // ON must REBUILD (not hang) and paint. The old fill looped forever: the EOF phantom line got
+        // an EMPTY prose window whose `vent_block_range` mapped BACKWARD, so `layout_block("")` emitted
+        // zero rows (acc never grew) and `next_visible(last)` returned the current line (no progress).
+        // The mere completion of this test proves non-hang; we ALSO assert the paragraph paints and
+        // that NO zero-row prose (vent_blocks) entry exists.
+        for text in ["Alpha one.\n\n", "x\n\n\n\n", "\n", "\n\n\n", ""] {
+            let mut e = Editor::new_from_text(text, None, (30, 8));
+            set_ventilate(&mut e, true); // toggle-on path — the reported C1 trigger; must return
+            // Every cached vent_blocks entry is a REAL prose window: its anchor line_layouts entry
+            // has ≥1 row. A zero-row prose entry (the C1 root cause) would violate this.
+            let view = &e.active().view;
+            for (&anchor, _vb) in view.vent_blocks.iter() {
+                let (rows, _map) = &view.line_layouts[&anchor];
+                assert!(!rows.is_empty(), "no zero-row prose entry may exist ({text:?})");
+            }
+            // The non-blank paragraph (if any) paints: its anchor is cached with ≥1 row.
+            if text.starts_with("Alpha") {
+                let (rows, _) = &view.line_layouts[&0];
+                assert!(!rows.is_empty(), "the paragraph paints ({text:?})");
+            }
+        }
+    }
+
+    #[test]
+    fn t_c2_blank_separator_occupies_one_row_no_caret_drift() {
+        // C2 — a blank line between paragraphs must occupy exactly ONE row in BOTH paint (a real
+        // 1-row line_layouts entry) AND geometry, so the caret does not drift up one row per blank
+        // above it. The old fill cached the blank as a zero-row prose entry (`rows=[]`, `ColMap.rows=1`):
+        // paint drew nothing while row-count returned 1 — the desync that produced the drift.
+        // `(text, expected screen row of the LAST "Two two two." paragraph)`. Each single-row
+        // paragraph + each single-row blank above the last paragraph contributes exactly one row, so
+        // the expected row is (# paragraphs above) + (# blank separators above). A per-blank drift
+        // (paint 0 / count 1) would push screen_pos BELOW this exact row.
+        for (text, want_row) in [("One one one.\n\nTwo two two.\n", 2u16),
+                                 ("Alpha beta.\n\nMid line.\n\nTwo two two.\n", 4u16)] {
+            let mut e = Editor::new_from_text(text, None, (40, 12));
+            set_ventilate(&mut e, true);
+            let buf = e.active().document.buffer.clone();
+            // Each blank separator line is a per-line (NON-vent) entry with exactly one painted row.
+            for l in 0..crate::derive::total_logical_lines(&buf) {
+                if crate::derive::line_text(&buf, l).trim().is_empty() {
+                    let r = resolve(&e.active().view, &buf, l).expect("blank line has its own per-line entry");
+                    assert_eq!(r.first_line, l, "blank line is its OWN entry, not folded into a block");
+                    assert!(!e.active().view.vent_blocks.contains_key(&l), "blank line is NOT a prose window");
+                    assert_eq!(r.rows.len(), 1, "blank separator occupies exactly one painted row");
+                }
+            }
+            // Caret on the LAST paragraph lands on the EXACT row its sentence paints on — proving the
+            // blank rows above it are counted AND painted (no drift).
+            let last_para = buf.slice(0..buf.len()).rfind("Two two two.").unwrap();
+            e.active_mut().document.selection = wordcartel_core::selection::Selection::single(last_para);
+            let (_col, row) = crate::nav::screen_pos(&e).expect("caret on the last paragraph is on screen");
+            assert_eq!(row, want_row, "caret row == rows painted above it, no per-blank drift ({text:?})");
+        }
+    }
+
+    #[test]
+    fn t_i1_eof_phantom_is_own_entry_not_a_zero_row_prose_overwrite() {
+        // I1 — with a doc ending `\n`, the EOF phantom (trailing empty) line must be its OWN 1-row
+        // per-line `line_layouts` entry, NOT a zero-row prose window that maps BACKWARD onto the last
+        // paragraph. The old fill queried the phantom at its line_start (past EOF), hit
+        // paragraph_range_at's gap fallback, and got a window whose `vent_block_range` mapped to line
+        // 0 — so it re-laid-out + OVERWROTE the paragraph's anchor entry (key 0) up to overscan-many
+        // times per rebuild (wasted derivation + the walk-step this test's `line_layouts.get(&1)`
+        // proves is gone). The mutation-proof: the phantom gets its OWN key (1) — under the old code
+        // no key existed at the phantom line (its window mapped to key 0).
+        let text = "Alpha one. Beta two.\n";
+        let mut e = Editor::new_from_text(text, None, (40, 8));
+        set_ventilate(&mut e, true);
+        let buf = e.active().document.buffer.clone();
+        let phantom = crate::derive::total_logical_lines(&buf) - 1; // line 1
+        // The phantom line is a standalone per-line entry (its OWN key), NOT a prose window, NOT
+        // folded into line 0. Under the old fill this key did not exist.
+        assert!(e.active().view.line_layouts.contains_key(&phantom),
+            "phantom line has its OWN line_layouts key (old fill mapped it onto key 0 instead)");
+        let rp = resolve(&e.active().view, &buf, phantom).expect("phantom line resolves");
+        assert_eq!(rp.first_line, phantom, "phantom line is its OWN entry");
+        assert!(!e.active().view.vent_blocks.contains_key(&phantom), "phantom line is not a prose window");
+        assert_eq!(rp.rows.len(), 1, "phantom line is an honest 1-row entry (not a zero-row prose entry)");
+        assert_eq!(rp.byte_origin, buf.len(), "phantom entry origin is buf.len() (its own line_start)");
+        // The paragraph anchor at line 0 is a real prose window ending at line 0 — the phantom is NOT
+        // folded into it (the old backward-mapping overwrite would have kept re-deriving this anchor).
+        let vb = e.active().view.vent_blocks.get(&0).expect("paragraph anchored at line 0");
+        assert_eq!(vb.last_line, 0, "the paragraph window ends at line 0, phantom excluded");
+        let (rows, _map) = &e.active().view.line_layouts[&0];
+        assert!(!rows.is_empty(), "the paragraph anchor is a real ≥1-row entry");
+        // RESIDUAL (documented, out of scope here): a caret AT buf.len() still reports `caret_line`
+        // == 0 via that helper's shared `h.min(len - 1)` clamp, so `screen_pos` places the EOF caret
+        // on the paragraph's last row rather than the phantom's own row below it. That clamp is
+        // PRE-EXISTING and fires IDENTICALLY with the lens OFF (verified: off-lens `screen_pos` at
+        // EOF is also glued to line 0), so it is NOT a ventilate regression and changing it would
+        // break the no-op-when-off invariant. Left to a separate shared-path fix.
     }
 
     // -----------------------------------------------------------------------
