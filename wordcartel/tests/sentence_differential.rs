@@ -81,6 +81,12 @@ fn divergence_ledger() {
     assert_ne!(our_groups("Roses are red,  \nViolets are blue.", &[]),
         repar_groups("Roses are red,  \nViolets are blue.", &[]),
         "L5 hard break: ours preserves the authored break (R2 exception); ventilate cannot");
+    // L6 — emoji sentence (§6.3 item 4 multibyte): ours breaks on the ASCII terminator after the
+    // emoji token (UAX-29 → "Nice 🙂." | "Then done."); repar ventilate keeps ONE line (its
+    // capital-continuation heuristic does not fire across a non-letter emoji token). ours=2, repar=1.
+    assert_ne!(our_groups("Nice 🙂. Then done.", &[]),
+        repar_groups("Nice 🙂. Then done.", &[]),
+        "L6 emoji: ours splits at the terminator after 🙂; ventilate keeps it one line");
 }
 
 // ── §6.5 second differential corpus: pragmatic_segmenter English "Golden Rules" ──
@@ -127,10 +133,11 @@ fn golden_rules_equality() {
         /* 29 */ ("Hello!? Is that you?", &["Hello!?", "Is that you?"]),
         /* 30 */ ("Hello?! Is that you?", &["Hello?!", "Is that you?"]),
         /* 34 */ ("1) The first item. 2) The second item.", &["1) The first item.", "2) The second item."]),
-        /* 40 */ ("This is a sentence\ncut off in the middle because pdf.", &["This is a sentence\ncut off in the middle because pdf."]),
-        /* 41 */ ("It was a cold \nnight in the city.", &["It was a cold \nnight in the city."]),
+        /* 40 */ ("This is a sentence\ncut off in the middle because pdf.", &["This is a sentence cut off in the middle because pdf."]),
+        /* 41 */ ("It was a cold \nnight in the city.", &["It was a cold night in the city."]),
         /* 44 */ ("She works at Yahoo! in the accounting department.", &["She works at Yahoo! in the accounting department."]),
-        /* 46 */ ("Thoreau argues that by simplifying one's life, \"the laws of the universe will appear less complex. . . .\"", &["Thoreau argues that by simplifying one's life, \"the laws of the universe will appear less complex. . . .\""]),
+        // GR46 uses the upstream typographic characters: U+2019 apostrophe, U+201C/U+201D quotes.
+        /* 46 */ ("Thoreau argues that by simplifying one’s life, “the laws of the universe will appear less complex. . . .”", &["Thoreau argues that by simplifying one’s life, “the laws of the universe will appear less complex. . . .”"]),
         /* 48 */ ("If words are left off at the end of a sentence, and that is all that is omitted, indicate the omission with ellipsis marks (preceded and followed by a space) and then indicate the end of the sentence with a period . . . . Next sentence.", &["If words are left off at the end of a sentence, and that is all that is omitted, indicate the omission with ellipsis marks (preceded and followed by a space) and then indicate the end of the sentence with a period . . . .", "Next sentence."]),
         /* 49 */ ("I never meant that.... She left the store.", &["I never meant that....", "She left the store."]),
     ];
@@ -157,7 +164,8 @@ fn golden_rules_accepted_divergences() {
         ("At 5 a.m. Mr. Smith went to the bank. He left the bank at 6 P.M. Mr. Smith then went to the store.", &["At 5 a.m. Mr. Smith went to the bank.", "He left the bank at 6 P.M.", "Mr. Smith then went to the store."], "GR18 §11 a.m./p.m. time abbreviation (interior-dot + capital follow)"),
         ("You can find it at N°. 1026.253.553. That is where the treasure is.", &["You can find it at N°. 1026.253.553.", "That is where the treasure is."], "GR43 §11 geo-coordinates"),
         ("\"Bohr [...] used the analogy of parallel stairways [...]\" (Smith 55).", &["\"Bohr [...] used the analogy of parallel stairways [...]\" (Smith 55)."], "GR47 §11 parenthetical citation after quotation (markup-blind, §10 R3 note)"),
-        ("I wasn't really ... well, what I mean...see . . . what I'm saying, the thing is . . . I didn't mean it.", &["I wasn't really ... well, what I mean...see . . . what I'm saying, the thing is . . . I didn't mean it."], "GR50 §11 spaced-ellipsis edge form"),
+        // GR50 uses upstream U+2019 apostrophes in the contractions (wasn’t / I’m / didn’t).
+        ("I wasn’t really ... well, what I mean...see . . . what I’m saying, the thing is . . . I didn’t mean it.", &["I wasn’t really ... well, what I mean...see . . . what I’m saying, the thing is . . . I didn’t mean it."], "GR50 §11 spaced-ellipsis edge form"),
         ("One further habit which was somewhat weakened . . . was that of combining words into self-interpreting compounds. . . . The practice was not abandoned. . . .", &["One further habit which was somewhat weakened . . . was that of combining words into self-interpreting compounds.", ". . . The practice was not abandoned. . . ."], "GR51 §11 4-dot ellipsis grouping edge form"),
         ("Hello world.Today is Tuesday.Mr. Smith went to the store and bought 1,000.That is a lot.", &["Hello world.", "Today is Tuesday.", "Mr. Smith went to the store and bought 1,000.", "That is a lot."], "GR52 §11 no whitespace between sentences (UAX SB needs whitespace)"),
         // §10 residue — grammar ambiguity, S7 POS resolves

@@ -750,6 +750,12 @@ rot.
 > tokenizes on whitespace, so the two-space marker cannot survive, and `"red,"` has no terminal
 > char)*. Ours preserves authored structure; the transform cannot. (This corrects the design's
 > "repar preserves hard breaks through transforms" claim — see the header corrections.)
+>
+> **L6 — emoji sentence (the §6.3 item-4 `🙂` multibyte probe).** `"Nice 🙂. Then done."` — ours
+> yields 2 sentences (UAX-29 breaks on the `.` terminator + capital `"Then"`); ventilate keeps ONE
+> line *(probed: repar's capital-continuation heuristic does not fire across a non-letter emoji
+> token)*. `ours = 2, repar = 1`. Same shape as L2 — a multibyte form ours segments and the ASCII
+> transform does not.
 
 Not a fuzz/property test in S5. A fixture table.
 

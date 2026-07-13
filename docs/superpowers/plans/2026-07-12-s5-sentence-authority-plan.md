@@ -936,6 +936,12 @@ fn divergence_ledger() {
     assert_ne!(our_groups("Roses are red,  \nViolets are blue.", &[]),
         repar_groups("Roses are red,  \nViolets are blue.", &[]),
         "L5 hard break: ours preserves the authored break (R2 exception); ventilate cannot");
+    // L6 — emoji sentence (§6.3 item 4 multibyte): ours breaks on the terminator after the emoji
+    // token (UAX-29); ventilate keeps ONE line (capital-continuation doesn't fire across a
+    // non-letter emoji token). ours=2, repar=1.
+    assert_ne!(our_groups("Nice 🙂. Then done.", &[]),
+        repar_groups("Nice 🙂. Then done.", &[]),
+        "L6 emoji: ours splits at the terminator after 🙂; ventilate keeps it one line");
 }
 
 // ── §6.5 second differential corpus: pragmatic_segmenter English "Golden Rules" ──
@@ -982,10 +988,11 @@ fn golden_rules_equality() {
         /* 29 */ ("Hello!? Is that you?", &["Hello!?", "Is that you?"]),
         /* 30 */ ("Hello?! Is that you?", &["Hello?!", "Is that you?"]),
         /* 34 */ ("1) The first item. 2) The second item.", &["1) The first item.", "2) The second item."]),
-        /* 40 */ ("This is a sentence\ncut off in the middle because pdf.", &["This is a sentence\ncut off in the middle because pdf."]),
-        /* 41 */ ("It was a cold \nnight in the city.", &["It was a cold \nnight in the city."]),
+        /* 40 */ ("This is a sentence\ncut off in the middle because pdf.", &["This is a sentence cut off in the middle because pdf."]),
+        /* 41 */ ("It was a cold \nnight in the city.", &["It was a cold night in the city."]),
         /* 44 */ ("She works at Yahoo! in the accounting department.", &["She works at Yahoo! in the accounting department."]),
-        /* 46 */ ("Thoreau argues that by simplifying one's life, \"the laws of the universe will appear less complex. . . .\"", &["Thoreau argues that by simplifying one's life, \"the laws of the universe will appear less complex. . . .\""]),
+        // GR46 uses upstream typographic chars: U+2019 apostrophe, U+201C/U+201D quotes.
+        /* 46 */ ("Thoreau argues that by simplifying one’s life, “the laws of the universe will appear less complex. . . .”", &["Thoreau argues that by simplifying one’s life, “the laws of the universe will appear less complex. . . .”"]),
         /* 48 */ ("If words are left off at the end of a sentence, and that is all that is omitted, indicate the omission with ellipsis marks (preceded and followed by a space) and then indicate the end of the sentence with a period . . . . Next sentence.", &["If words are left off at the end of a sentence, and that is all that is omitted, indicate the omission with ellipsis marks (preceded and followed by a space) and then indicate the end of the sentence with a period . . . .", "Next sentence."]),
         /* 49 */ ("I never meant that.... She left the store.", &["I never meant that....", "She left the store."]),
     ];
@@ -1012,7 +1019,8 @@ fn golden_rules_accepted_divergences() {
         ("At 5 a.m. Mr. Smith went to the bank. He left the bank at 6 P.M. Mr. Smith then went to the store.", &["At 5 a.m. Mr. Smith went to the bank.", "He left the bank at 6 P.M.", "Mr. Smith then went to the store."], "GR18 §11 a.m./p.m. time abbreviation (interior-dot + capital follow)"),
         ("You can find it at N°. 1026.253.553. That is where the treasure is.", &["You can find it at N°. 1026.253.553.", "That is where the treasure is."], "GR43 §11 geo-coordinates"),
         ("\"Bohr [...] used the analogy of parallel stairways [...]\" (Smith 55).", &["\"Bohr [...] used the analogy of parallel stairways [...]\" (Smith 55)."], "GR47 §11 parenthetical citation after quotation (markup-blind, §10 R3 note)"),
-        ("I wasn't really ... well, what I mean...see . . . what I'm saying, the thing is . . . I didn't mean it.", &["I wasn't really ... well, what I mean...see . . . what I'm saying, the thing is . . . I didn't mean it."], "GR50 §11 spaced-ellipsis edge form"),
+        // GR50 uses upstream U+2019 apostrophes (wasn’t / I’m / didn’t).
+        ("I wasn’t really ... well, what I mean...see . . . what I’m saying, the thing is . . . I didn’t mean it.", &["I wasn’t really ... well, what I mean...see . . . what I’m saying, the thing is . . . I didn’t mean it."], "GR50 §11 spaced-ellipsis edge form"),
         ("One further habit which was somewhat weakened . . . was that of combining words into self-interpreting compounds. . . . The practice was not abandoned. . . .", &["One further habit which was somewhat weakened . . . was that of combining words into self-interpreting compounds.", ". . . The practice was not abandoned. . . ."], "GR51 §11 4-dot ellipsis grouping edge form"),
         ("Hello world.Today is Tuesday.Mr. Smith went to the store and bought 1,000.That is a lot.", &["Hello world.", "Today is Tuesday.", "Mr. Smith went to the store and bought 1,000.", "That is a lot."], "GR52 §11 no whitespace between sentences (UAX SB needs whitespace)"),
         // §10 residue — grammar ambiguity, S7 POS resolves
@@ -1032,11 +1040,15 @@ fn golden_rules_accepted_divergences() {
 > `lib.rs:32`, `pub fn run_transform` `transform.rs:326`, `pub enum TransformKind` `transform.rs:8`).
 > If a specific case's live repar output disagrees with the equality/ledger split, that is a
 > **finding to surface** (a divergence the spec did not anticipate), not a value to silently flip —
-> raise it. The 15 repar-equality cases + 6 repar-ledger asserts, and all 34 golden-equality + 18
-> golden-divergence asserts, were each run against live repar / our detector with the shell fixup
-> stack while authoring this plan; they pass. The golden inputs are the canonical English Golden
-> Rules from `github.com/diasks2/pragmatic_segmenter` (transcribe them character-for-character; the
-> escaped quotes/backslashes in the table are exact).
+> raise it. The 15 repar-equality cases + 6 repar-ledger asserts (L1–L6, incl. the 🙂 emoji case),
+> and all 34 golden-equality + 18 golden-divergence asserts, were each run against live repar / our
+> detector with the shell fixup stack; they pass. The golden inputs are the canonical English Golden
+> Rules from the upstream `spec/pragmatic_segmenter/languages/english_spec.rb` — transcribe them
+> character-for-character. **GR46 and GR50 use Unicode typographic punctuation** (`’` U+2019, `“`
+> U+201C, `”` U+201D), NOT straight ASCII — the distinction is load-bearing (UAX-29 classifies the
+> ASCII apostrophe Po vs. curly close-quote Pf/Pi, which SB8a/SB9–11 key off). GR40/GR41 keep the
+> literal `\n` in the INPUT but their expected arrays are space-joined (as upstream), inert under
+> `golden()`'s `split_whitespace`.
 
 ### 5.2 Verify green
 
