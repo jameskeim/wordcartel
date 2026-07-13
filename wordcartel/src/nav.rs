@@ -171,13 +171,13 @@ pub fn move_right(editor: &mut Editor) -> usize {
     let buf = &editor.active().document.buffer;
     let h = head(editor);
     let l = caret_line(editor);
-    let ls = derive::line_start(buf, l);
-    let in_off = h.saturating_sub(ls);
     let total = derive::total_logical_lines(buf);
 
-    // Get the ColMap for the caret line (from cache, using the already-computed
-    // is_active flag, or on-demand).
-    let map = get_or_layout(editor, l);
+    // The caret line's within-line ColMap + byte ORIGIN as a UNIT from the window-aware resolver
+    // (as-displayed: the mode-aware per-line layout + `line_start(l)` when the lens is off / the line
+    // is verbatim; the combined window map + `ps` origin under ventilate).
+    let (map, ls) = crate::ventilate::layout_block_as_displayed(editor, l);
+    let in_off = h.saturating_sub(ls);
 
     let cur = layout::cursor_at(&map, in_off);
     let nxt = layout::move_right(&map, cur);
@@ -204,13 +204,12 @@ pub fn move_right(editor: &mut Editor) -> usize {
 ///
 /// At the start of line L (and L > 0), crosses to the end of line L-1.
 pub fn move_left(editor: &mut Editor) -> usize {
-    let buf = &editor.active().document.buffer;
     let h = head(editor);
     let l = caret_line(editor);
-    let ls = derive::line_start(buf, l);
-    let in_off = h.saturating_sub(ls);
 
-    let map = get_or_layout(editor, l);
+    // Caret-line within-line ColMap + origin as a unit from the resolver (see `move_right`).
+    let (map, ls) = crate::ventilate::layout_block_as_displayed(editor, l);
+    let in_off = h.saturating_sub(ls);
 
     let cur = layout::cursor_at(&map, in_off);
     let nxt = layout::move_left(&map, cur);
@@ -232,13 +231,12 @@ pub fn move_left(editor: &mut Editor) -> usize {
 ///
 /// Returns the new global byte offset. Sets `editor.desired_col = None`.
 pub fn move_home(editor: &mut Editor) -> usize {
-    let buf = &editor.active().document.buffer;
     let h = head(editor);
     let l = caret_line(editor);
-    let ls = derive::line_start(buf, l);
-    let in_off = h.saturating_sub(ls);
 
-    let map = get_or_layout(editor, l);
+    // Caret-line within-line ColMap + origin as a unit from the resolver (see `move_right`).
+    let (map, ls) = crate::ventilate::layout_block_as_displayed(editor, l);
+    let in_off = h.saturating_sub(ls);
     let cur = layout::cursor_at(&map, in_off);
     let result = layout::move_home(&map, cur);
 
@@ -250,13 +248,12 @@ pub fn move_home(editor: &mut Editor) -> usize {
 ///
 /// Returns the new global byte offset. Sets `editor.desired_col = None`.
 pub fn move_end(editor: &mut Editor) -> usize {
-    let buf = &editor.active().document.buffer;
     let h = head(editor);
     let l = caret_line(editor);
-    let ls = derive::line_start(buf, l);
-    let in_off = h.saturating_sub(ls);
 
-    let map = get_or_layout(editor, l);
+    // Caret-line within-line ColMap + origin as a unit from the resolver (see `move_right`).
+    let (map, ls) = crate::ventilate::layout_block_as_displayed(editor, l);
+    let in_off = h.saturating_sub(ls);
     let cur = layout::cursor_at(&map, in_off);
     let result = layout::move_end(&map, cur);
 
@@ -283,11 +280,11 @@ pub fn move_down(editor: &mut Editor) -> usize {
     let buf = &editor.active().document.buffer;
     let h = head(editor);
     let l = caret_line(editor);
-    let ls = derive::line_start(buf, l);
-    let in_off = h.saturating_sub(ls);
     let total = derive::total_logical_lines(buf);
 
-    let map = get_or_layout(editor, l);
+    // Caret-line within-line ColMap + origin as a unit from the resolver (see `move_right`).
+    let (map, ls) = crate::ventilate::layout_block_as_displayed(editor, l);
+    let in_off = h.saturating_sub(ls);
     let cur0 = layout::cursor_at(&map, in_off);
 
     // Anchor desired_col on the first vertical move.
@@ -333,13 +330,12 @@ pub fn move_down(editor: &mut Editor) -> usize {
 ///
 /// Returns the new global byte offset. Preserves `editor.desired_col`.
 pub fn move_up(editor: &mut Editor) -> usize {
-    let buf = &editor.active().document.buffer;
     let h = head(editor);
     let l = caret_line(editor);
-    let ls = derive::line_start(buf, l);
-    let in_off = h.saturating_sub(ls);
 
-    let map = get_or_layout(editor, l);
+    // Caret-line within-line ColMap + origin as a unit from the resolver (see `move_right`).
+    let (map, ls) = crate::ventilate::layout_block_as_displayed(editor, l);
+    let in_off = h.saturating_sub(ls);
     let cur0 = layout::cursor_at(&map, in_off);
 
     // Anchor desired_col on the first vertical move.
