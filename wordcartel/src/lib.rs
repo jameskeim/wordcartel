@@ -5,6 +5,7 @@ pub mod editor;
 pub mod derive;
 pub mod lines;
 pub mod nav;
+pub mod ventilate;
 pub mod commands;
 pub mod input;
 pub mod registry;
