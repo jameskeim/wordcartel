@@ -1125,6 +1125,7 @@ mod tests {
         run(Command::Move { dir: Dir::SentenceRight, extend: false }, &mut e, &TestClock(0));
         assert_eq!(nav::head(&e), 20);                            // → next content end
     }
+
     #[test]
     fn sentence_motion_crosses_blocks_both_directions() {
         // "One. Two." = 0..9 (spans (0,4),(5,9)); "Three. Four." = 11..23 (spans (11,17),(18,23)).
@@ -1143,6 +1144,7 @@ mod tests {
         run(Command::Move { dir: Dir::SentenceLeft, extend: false }, &mut e, &TestClock(0));
         assert_eq!(nav::head(&e), 5);                             // crosses to start of "Two." (block 1's LAST)
     }
+
     #[test]
     fn sentence_motion_extends_selection() {
         let mut e = Editor::new_from_text("One two. Three four.\n", None, (80, 24));
@@ -1151,6 +1153,7 @@ mod tests {
         let sel = e.active().document.selection.primary();
         assert_eq!((sel.from(), sel.to()), (0, 8));               // anchor kept, head → 8
     }
+
     #[test]
     fn expand_ladder_sentence_rung_survives_single_sentence_paragraph() {
         // §3.4.3 regression: with content-only spans, Sentence (0,8) ⊂ Paragraph (0,9),

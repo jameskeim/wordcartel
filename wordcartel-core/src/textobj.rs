@@ -86,7 +86,8 @@ fn semantic_hard_break(text: &str, cend_a: usize, n_start: usize) -> bool {
     let gap = &text[cend_a..n_start];
     let Some(rel_nl) = gap.find('\n') else { return false };
     let nl = cend_a + rel_nl;
-    text[..nl].ends_with("  ") || text[..nl].ends_with('\\')
+    let head = text[..nl].strip_suffix('\r').unwrap_or(&text[..nl]);
+    head.ends_with("  ") || head.ends_with('\\')
 }
 
 /// R1 — previous content's last token is a known abbreviation or a single capital
@@ -296,7 +297,7 @@ mod tests {
         assert_eq!(sentence_bounds("", 0), (0, 0));
     }
 
-    // --- S5: content-only sentence_bounds (deliberate contract change) ---
+    // ── S5: content-only sentence_bounds (deliberate contract change) ──────────────
     #[test]
     fn sentence_bounds_basic() {
         // S5: content-only — the trailing space after the first sentence is DROPPED.
@@ -362,6 +363,15 @@ mod tests {
         assert_eq!(sentence_spans("See fig.\\\nTwo shows it.").count(), 2); // backslash
         // Control: a single trailing space is a soft wrap → merged.
         assert_eq!(sentence_spans("The soft wrap ends here \nand continues.").count(), 1);
+    }
+    #[test]
+    fn hard_break_veto_handles_crlf() {
+        // I-1: the veto must strip a trailing \r before checking for the two-space/backslash
+        // marker, else a CRLF file's marker byte (immediately before \r\n) is silently missed.
+        assert_eq!(sentence_spans("Roses are red,  \r\nViolets are blue.").count(), 2); // two-space
+        assert_eq!(sentence_spans("A line\\\r\nbroken hard.").count(), 2);              // backslash
+        // Control: a CRLF WITHOUT the hard-break marker is a plain hard wrap → still merges.
+        assert_eq!(sentence_spans("one two\r\nthree four").count(), 1);
     }
     #[test]
     fn r3_lowercase_after_quote_merges() {

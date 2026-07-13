@@ -164,8 +164,9 @@ fn golden_rules_accepted_divergences() {
         ("At 5 a.m. Mr. Smith went to the bank. He left the bank at 6 P.M. Mr. Smith then went to the store.", &["At 5 a.m. Mr. Smith went to the bank.", "He left the bank at 6 P.M.", "Mr. Smith then went to the store."], "GR18 §11 a.m./p.m. time abbreviation (interior-dot + capital follow)"),
         ("You can find it at N°. 1026.253.553. That is where the treasure is.", &["You can find it at N°. 1026.253.553.", "That is where the treasure is."], "GR43 §11 geo-coordinates"),
         ("\"Bohr [...] used the analogy of parallel stairways [...]\" (Smith 55).", &["\"Bohr [...] used the analogy of parallel stairways [...]\" (Smith 55)."], "GR47 §11 parenthetical citation after quotation (markup-blind, §10 R3 note)"),
-        // GR50 uses upstream U+2019 apostrophes in the contractions (wasn’t / I’m / didn’t).
-        ("I wasn’t really ... well, what I mean...see . . . what I’m saying, the thing is . . . I didn’t mean it.", &["I wasn’t really ... well, what I mean...see . . . what I’m saying, the thing is . . . I didn’t mean it."], "GR50 §11 spaced-ellipsis edge form"),
+        // GR50 matches upstream byte-for-byte: a deliberate apostrophe mix — wasn’t/didn’t use
+        // U+2019 (curly), I'm uses a straight U+0027 ASCII apostrophe.
+        ("I wasn’t really ... well, what I mean...see . . . what I'm saying, the thing is . . . I didn’t mean it.", &["I wasn’t really ... well, what I mean...see . . . what I'm saying, the thing is . . . I didn’t mean it."], "GR50 §11 spaced-ellipsis edge form"),
         ("One further habit which was somewhat weakened . . . was that of combining words into self-interpreting compounds. . . . The practice was not abandoned. . . .", &["One further habit which was somewhat weakened . . . was that of combining words into self-interpreting compounds.", ". . . The practice was not abandoned. . . ."], "GR51 §11 4-dot ellipsis grouping edge form"),
         ("Hello world.Today is Tuesday.Mr. Smith went to the store and bought 1,000.That is a lot.", &["Hello world.", "Today is Tuesday.", "Mr. Smith went to the store and bought 1,000.", "That is a lot."], "GR52 §11 no whitespace between sentences (UAX SB needs whitespace)"),
         // §10 residue — grammar ambiguity, S7 POS resolves

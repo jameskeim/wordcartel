@@ -149,8 +149,10 @@ Notes on span edges: the trim is **trailing only** — leading bytes are never t
 attaches whitespace backward, so a sentence's segment never begins with whitespace except in the
 window-opening case covered by attach rule 3). A Markdown backslash hard break's `\` is **content**
 (the marker is authored text) and stays inside the span; the two-space hard break's spaces are
-whitespace and are trimmed. `\r` is ordinary content to this module (no CRLF special-casing);
-predicates key on `\n` only.
+whitespace and are trimmed. `\r` is treated as trailing whitespace like any other
+(`char::is_whitespace('\r')` is true, so it is trimmed from content-only spans); the
+semantic-hard-break predicate strips an optional trailing `\r` before its two-space/backslash
+check, so a CRLF file's hard break is detected the same as an LF file's.
 
 ### 3.5 New public core API (the only additions)
 
@@ -434,7 +436,7 @@ All executed 2026-07-12 against `unicode-segmentation` (workspace-pinned major, 
 | `"Roses are red,  \nViolets are blue."` | `"Roses are red,  \n"` · `"Violets are blue."` | hard-break veto (two-space) → 2 sentences |
 | `"A line\\\nbroken hard."` | `"A line\\\n"` · `"broken hard."` | hard-break veto (backslash; **R3 would otherwise merge** the lowercase `"broken"`) → 2 sentences |
 | `"Dr.  \nSmith went home."` | `"Dr.  \n"` · `"Smith went home."` | hard-break veto gates **R1** (abbrev + two-space break + Capital) → 2 sentences |
-| `"See fig.\\\nTwo shows it."` | `"See fig.\\\n"` · `"Two shows it."` | hard-break veto gates **R1** (abbrev + backslash break) → 2 sentences |
+| `"See fig.\\\nTwo shows it."` | `"See fig.\\\n"` · `"Two shows it."` | hard-break veto gates **R2** (the trailing `\` breaks R1's abbreviation-token match, so absent the veto R2's not-terminated hard-wrap merge would fire instead) → 2 sentences |
 | `"Acme Co. Then he quit."` | `"Acme Co. "` · `"Then he quit."` | class-2 `co` not in const → break stands → 2 |
 | `"Acme Co. filed suit."` | 1 segment (UAX SB8) | 1 sentence (no rule needed) |
 | `"I saw Mt. Fuji. It was tall."` | `"I saw Mt. "` · `"Fuji. "` · `"It was tall."` | R1 (`mt`) merges 1+2 → 2 |
@@ -1052,7 +1054,7 @@ strings assert **slice text**, not hand-computed offsets, wherever a span is che
 | T-1 | `sentence_bounds_basic` — **the deliberate flip**: `(t, 2)` → `(0, 8)` (comment names S5 content-only); `(t, 12)` → `(9, 20)` unchanged | core / `textobj.rs:90-96` (rewritten in place) | §3.3 |
 | T-2 | `empty_window_is_safe` extended: `sentence_bounds("", 0) == (0,0)` (unchanged, `textobj.rs:102`); plus `("\n", any) == (0,0)`; `prev_sentence_start("", 0) == None`; `next_sentence_end("", 0) == None` | core / `textobj.rs` | §3.2.4, §4.7 |
 | T-3 | R1 unit tests: `Dr.`/single-capital `J. R. R.`/`Mt. Fuji`/`St. Louis`/`vs.`/`cf.`/`et al.` merges; `Q.E.D.` and class-2 `Acme Co. Then` and dropped-`no` breaks; case-insensitive `DR. SMITH` | core / `textobj.rs` | §4.4, §5.1 |
-| T-4 | R2 + GLOBAL hard-break veto: the §1 hard-wrap paragraph merges to 2 sentences; two-space `"Roses are red,  \nViolets…"` and backslash `"A line\\\nbroken…"` stay 2 (the latter proves the veto gates **R3**, lowercase continuation); the two locking fixtures `"Dr.  \nSmith went home."` and `"See fig.\\\nTwo shows it."` stay 2 (veto gates **R1**); one-trailing-space control `"…here \nand continues."` merges to 1 | core / `textobj.rs` | §4.5 |
+| T-4 | R2 + GLOBAL hard-break veto: the §1 hard-wrap paragraph merges to 2 sentences; two-space `"Roses are red,  \nViolets…"` and backslash `"A line\\\nbroken…"` stay 2 (the latter proves the veto gates **R3**, lowercase continuation); the two locking fixtures `"Dr.  \nSmith went home."` and `"See fig.\\\nTwo shows it."` stay 2 — TOGETHER these prove the veto is global: it blocks an **R1** merge (`Dr.`, abbrev + Capital) AND, separately, an **R2** merge (`fig.`, not-terminated hard-wrap — the trailing `\` breaks R1's abbreviation-token match there, so R2 is the rule the veto is actually gating); one-trailing-space control `"…here \nand continues."` merges to 1 | core / `textobj.rs` | §4.5 |
 | T-5 | R3 unit tests: `"“Why?” he asked."` → 1; `"He shouted “Stop!” and ran."` → 1; capital control breaks | core / `textobj.rs` | §4.6 |
 | T-6 | R4 unit tests: `**bold.**` and `_quiet._` shift fixtures (span text includes the closers); end-of-text `"This is **bold.**"` → one span `(0, 17)` | core / `textobj.rs` | §4.3 |
 | T-7 | UAX-preservation regression: the §4 "free wins" table (`10 a.m.`, `U.S.A.`, `fig. 2`, `“Go home.”`-boundary-after-quote) still segment correctly through the post-pass | core / `textobj.rs` | §4 |
