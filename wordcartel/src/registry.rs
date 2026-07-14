@@ -573,6 +573,9 @@ impl Registry {
             |c| crate::commands::prose_ops::count_region(c.editor));
         r.register("move_sentence_up",   "Move Sentence Up",   Some(MenuCategory::Edit), |c| crate::commands::prose_ops::move_sentence_up(c.editor, c.clock));
         r.register("move_sentence_down", "Move Sentence Down", Some(MenuCategory::Edit), |c| crate::commands::prose_ops::move_sentence_down(c.editor, c.clock));
+        r.register("break_paragraph_here",    "Break Paragraph Here",    Some(MenuCategory::Edit), |c| crate::commands::prose_ops::break_paragraph_here(c.editor, c.clock));
+        r.register("merge_paragraph_forward", "Merge Paragraph Forward", Some(MenuCategory::Edit), |c| crate::commands::prose_ops::merge_paragraph_forward(c.editor, c.clock));
+        r.register("split_sentence_at_caret", "Split Sentence",          Some(MenuCategory::Edit), |c| crate::commands::prose_ops::split_sentence_at_caret(c.editor, c.clock));
 
         // View menu — section folding (Task 10 / Effort 5g).
         r.register("fold_toggle", "Fold/Unfold Section", Some(MenuCategory::View), |c| {
