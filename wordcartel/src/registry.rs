@@ -406,6 +406,9 @@ impl Registry {
         // Block → selection bridge (A11.3, Task 1.1 / command-surface curation).
         r.register("select_marked_block", "Select Block", Some(MenuCategory::Block),
             |c| { crate::blocks_marked::select_marked_block(c.editor); CommandResult::Handled });
+        // Two-region swap (S4 Task 6): exchange Selection <-> MarkedBlock, one undo unit.
+        r.register("swap", "Swap Selection \u{21C4} Block", Some(MenuCategory::Block),
+            |c| crate::commands::prose_ops::swap(c.editor, c.clock));
 
         // Marked block operations (Task 3 / Effort 9A).
         r.register("block_copy",          "Copy Block",        Some(MenuCategory::Block), |c| { crate::blocks_marked::block_copy(c.editor, c.clock);   CommandResult::Handled });
