@@ -4,7 +4,7 @@
 // instead of accessing the six chrome locals that existed in render.rs.
 
 use ratatui::{
-    layout::Rect,
+    layout::{Position, Rect},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
     Frame,
@@ -33,6 +33,12 @@ use crate::{
 ///
 /// `area` and `h` are derived from `frame.area()` to match the values the
 /// main render function computes; no state is duplicated.
+///
+/// Width of the `"> "` query prefix — the SINGLE SOURCE shared by the query painter
+/// (the `format!("> {}", …)` display strings below) and the caret placements (B11),
+/// so painter and caret can never drift.
+const OV_QUERY_PREFIX_COLS: u16 = 2;
+
 #[allow(clippy::too_many_lines)] // overlay paint dispatch — one block per overlay surface
 pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
     let area = frame.area();
@@ -86,6 +92,14 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
             Paragraph::new(Line::from(Span::styled(truncated_q, cs.ov_query))),
             query_area,
         );
+
+        // B11: place the caret mid-string at `palette.cursor` (a byte offset), not just at
+        // the end of the query — the palette query is the only overlay with an interior cursor.
+        let caret_col = query_area.x + OV_QUERY_PREFIX_COLS
+            + palette.query[..palette.cursor].chars().count() as u16;
+        if caret_col < query_area.x + query_area.width {
+            frame.set_cursor_position(Position { x: caret_col, y: query_area.y });
+        }
 
         if ov_h < 4 || list_h == 0 {
             return;
@@ -150,6 +164,12 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
                 query_area,
             );
 
+            // B11: end-of-query caret (outline's `cursor` field is pinned to the end anyway).
+            let caret_col = query_area.x + OV_QUERY_PREFIX_COLS + outline.query.chars().count() as u16;
+            if caret_col < query_area.x + query_area.width {
+                frame.set_cursor_position(Position { x: caret_col, y: query_area.y });
+            }
+
             if ov_h >= 4 && list_h > 0 {
                 let list_h_u16 = list_h as u16;
                 let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h_u16);
@@ -210,6 +230,12 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
                 Paragraph::new(Line::from(Span::styled(truncated_q, cs.ov_query))),
                 query_area,
             );
+
+            // B11: end-of-query caret.
+            let caret_col = query_area.x + OV_QUERY_PREFIX_COLS + tp.query.chars().count() as u16;
+            if caret_col < query_area.x + query_area.width {
+                frame.set_cursor_position(Position { x: caret_col, y: query_area.y });
+            }
 
             if ov_h >= 4 && list_h > 0 {
                 let list_h_u16 = list_h as u16;
@@ -272,6 +298,12 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
                 Paragraph::new(Line::from(Span::styled(truncated_q, cs.ov_query))),
                 query_area,
             );
+
+            // B11: end-of-query caret.
+            let caret_col = query_area.x + OV_QUERY_PREFIX_COLS + fb.query.chars().count() as u16;
+            if caret_col < query_area.x + query_area.width {
+                frame.set_cursor_position(Position { x: caret_col, y: query_area.y });
+            }
 
             if ov_h >= 4 && list_h > 0 {
                 let list_h_u16 = list_h as u16;

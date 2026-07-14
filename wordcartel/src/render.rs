@@ -434,12 +434,17 @@ fn place_cursor(frame: &mut Frame, editor: &Editor, area: Rect, edit_top: u16,
         if caret_col < w as usize {
             frame.set_cursor_position(Position { x: area.x + caret_col as u16, y: status_row });
         }
-    } else if let Some((col, row)) = nav::screen_pos(editor) {
-        // Guard rows; clamp cols — a caret on/after hung trailing whitespace sits
-        // logically past the text rect and pins at the edge (spec D2 clamp).
-        if row < edit_height && tg.text_width > 0 {
-            let col = col.min((tg.text_width as usize).saturating_sub(1) as u16);
-            frame.set_cursor_position(Position { x: area.x + tg.text_left + col, y: edit_top + row });
+    } else if !editor.has_active_input_overlay() {
+        // B11: a modal/overlay other than search/minibuffer (palette, outline, theme_picker,
+        // file_browser, menu, prompt, splash, diag, cursor_picker) must not leave the hardware
+        // caret parked in the editor text area underneath it.
+        if let Some((col, row)) = nav::screen_pos(editor) {
+            // Guard rows; clamp cols — a caret on/after hung trailing whitespace sits
+            // logically past the text rect and pins at the edge (spec D2 clamp).
+            if row < edit_height && tg.text_width > 0 {
+                let col = col.min((tg.text_width as usize).saturating_sub(1) as u16);
+                frame.set_cursor_position(Position { x: area.x + tg.text_left + col, y: edit_top + row });
+            }
         }
     }
 }
@@ -3245,5 +3250,198 @@ mod tests {
             "rendered item at visual row {visual_row} (y={sel_y}) must carry menu_sel fg");
         assert_ne!(fg_at(col, indicator_y), sel_fg,
             "indicator row (y={indicator_y}) must not carry menu_sel fg — it should be norm ({norm_fg:?})");
+    }
+
+    // -------------------------------------------------------------------------
+    // B11 — has_active_input_overlay census + arm-3 hide-guard + overlay carets
+    // -------------------------------------------------------------------------
+
+    /// A real, valid `Diagnostic` literal (copied from `diag_overlay.rs`'s own test fixture)
+    /// so `open_diag` gets a real value instead of a synthesized one.
+    fn diag_fixture() -> wordcartel_core::diagnostics::Diagnostic {
+        wordcartel_core::diagnostics::Diagnostic {
+            range: 0..1,
+            kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
+            message: "m".into(),
+            suggestions: Vec::new(),
+        }
+    }
+
+    /// Test A — the predicate is exhaustively true for every one of the 11 input-owning
+    /// surfaces, so an added-but-unguarded surface fails loudly (no catch-all in the impl).
+    #[test]
+    fn has_active_input_overlay_true_for_every_surface() {
+        use crate::config::CaretShape;
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let mk = || {
+            let mut e = Editor::new_from_text("hello world\n", None, (40, 12));
+            derive::rebuild(&mut e);
+            e
+        };
+        let mut e = mk(); e.open_search(crate::search_overlay::Phase::Find, 0);
+        assert!(e.has_active_input_overlay(), "search");
+        let mut e = mk(); e.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter);
+        assert!(e.has_active_input_overlay(), "minibuffer");
+        let mut e = mk(); e.open_palette();
+        assert!(e.has_active_input_overlay(), "palette");
+        let mut e = mk(); e.open_outline();
+        assert!(e.has_active_input_overlay(), "outline");
+        let mut e = mk(); e.open_theme_picker();
+        assert!(e.has_active_input_overlay(), "theme_picker");
+        let mut e = mk(); e.open_file_browser(std::path::PathBuf::from("."));
+        assert!(e.has_active_input_overlay(), "file_browser");
+        let mut e = mk(); e.menu = Some(crate::menu::build(&reg, &km, &e));
+        assert!(e.has_active_input_overlay(), "menu");
+        let mut e = mk(); e.open_prompt(crate::prompt::Prompt::swap_recovery());
+        assert!(e.has_active_input_overlay(), "prompt");
+        let mut e = mk(); e.splash = Some(crate::splash::Splash::new(&km, "0.0.0"));
+        assert!(e.has_active_input_overlay(), "splash");
+        let mut e = mk(); e.open_diag(diag_fixture());
+        assert!(e.has_active_input_overlay(), "diag");
+        let mut e = mk();
+        e.cursor_picker = Some(crate::cursor_picker::CursorPicker {
+            selected: 1, original_shape: CaretShape::Default, original_blink: true });
+        assert!(e.has_active_input_overlay(), "cursor_picker");
+    }
+
+    /// Test B (palette): mid-string caret at `palette.cursor` — the ONLY query overlay
+    /// with an interior cursor, so it gets its own dedicated column-math assertion.
+    #[test]
+    fn palette_query_shows_caret_mid_string() {
+        let mut ed = Editor::new_from_text("hello world\n", None, (40, 12));
+        derive::rebuild(&mut ed);
+        ed.open_palette();
+        if let Some(p) = ed.palette.as_mut() { p.query = "abc".into(); p.cursor = 1; }
+        let ov = crate::chrome_geom::palette_overlay_rect(
+            Rect::new(0, 0, 40, 12), ed.palette.as_ref().unwrap().rows.len());
+        let cur = render_capturing_cursor(&mut ed, 40, 12);
+        // query_area.x == ov.x + 1; prefix "> " == 2 cols; cursor == 1 char into "abc"; query row == ov.y + 1
+        assert_eq!(cur, Some((ov.x + 1 + 2 + 1, ov.y + 1)), "mid-string caret in the palette query");
+    }
+
+    /// Test B (outline): end-of-query caret.
+    #[test]
+    fn outline_query_shows_caret_end_of_string() {
+        let mut ed = Editor::new_from_text("# Heading\nbody\n", None, (40, 12));
+        derive::rebuild(&mut ed);
+        ed.open_outline();
+        if let Some(o) = ed.outline.as_mut() { o.query = "he".into(); o.cursor = 2; }
+        let ov = crate::chrome_geom::palette_overlay_rect(
+            Rect::new(0, 0, 40, 12), ed.outline.as_ref().unwrap().rows.len());
+        let cur = render_capturing_cursor(&mut ed, 40, 12);
+        assert_eq!(cur, Some((ov.x + 1 + 2 + 2, ov.y + 1)), "end-of-query caret in the outline query");
+    }
+
+    /// Test B (theme_picker): end-of-query caret.
+    #[test]
+    fn theme_picker_query_shows_caret_end_of_string() {
+        let mut ed = Editor::new_from_text("hello world\n", None, (40, 12));
+        derive::rebuild(&mut ed);
+        ed.open_theme_picker();
+        if let Some(tp) = ed.theme_picker.as_mut() { tp.query = "ton".into(); }
+        let ov = crate::chrome_geom::palette_overlay_rect(
+            Rect::new(0, 0, 40, 12), ed.theme_picker.as_ref().unwrap().rows.len());
+        let cur = render_capturing_cursor(&mut ed, 40, 12);
+        assert_eq!(cur, Some((ov.x + 1 + 2 + 3, ov.y + 1)), "end-of-query caret in the theme_picker query");
+    }
+
+    /// Test B (file_browser): end-of-query caret.
+    #[test]
+    fn file_browser_query_shows_caret_end_of_string() {
+        let mut ed = Editor::new_from_text("hello world\n", None, (40, 12));
+        derive::rebuild(&mut ed);
+        ed.open_file_browser(std::path::PathBuf::from("."));
+        if let Some(fb) = ed.file_browser.as_mut() { fb.query = "rs".into(); }
+        let ov = crate::chrome_geom::palette_overlay_rect(
+            Rect::new(0, 0, 40, 12), ed.file_browser.as_ref().unwrap().entries.len());
+        let cur = render_capturing_cursor(&mut ed, 40, 12);
+        assert_eq!(cur, Some((ov.x + 1 + 2 + 2, ov.y + 1)), "end-of-query caret in the file_browser query");
+    }
+
+    /// Test B (menu): a hide surface — arm-3 must suppress, and menu places no caret of
+    /// its own, so the frame is left at the TestBackend default == suppression.
+    #[test]
+    fn menu_open_suppresses_editor_caret() {
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let mut ed = Editor::new_from_text("hello world\n", None, (40, 12));
+        derive::rebuild(&mut ed);
+        // put the editor caret off-origin so suppression (-> (0,0)) is unambiguous:
+        set_caret(&mut ed, "hello world".len());
+        let baseline = render_capturing_cursor(&mut ed, 40, 12);
+        assert_ne!(baseline, Some((0, 0)), "precondition: editor caret is off-origin at rest");
+        // open the menu (a hide surface) — arm-3 must suppress, and menu places no caret:
+        ed.menu = Some(crate::menu::build(&reg, &km, &ed));
+        let cur = render_capturing_cursor(&mut ed, 40, 12);
+        assert_eq!(cur, Some((0, 0)),
+            "arm-3 must suppress the editor caret under a modal (B11); suppression == (0,0)");
+    }
+
+    /// Test B (prompt): a hide surface.
+    #[test]
+    fn prompt_open_suppresses_editor_caret() {
+        let mut ed = Editor::new_from_text("hello world\n", None, (40, 12));
+        derive::rebuild(&mut ed);
+        set_caret(&mut ed, "hello world".len());
+        let baseline = render_capturing_cursor(&mut ed, 40, 12);
+        assert_ne!(baseline, Some((0, 0)), "precondition: editor caret is off-origin at rest");
+        ed.open_prompt(crate::prompt::Prompt::swap_recovery());
+        let cur = render_capturing_cursor(&mut ed, 40, 12);
+        assert_eq!(cur, Some((0, 0)), "arm-3 must suppress the editor caret under a modal prompt");
+    }
+
+    /// Test B (splash): a hide surface.
+    #[test]
+    fn splash_open_suppresses_editor_caret() {
+        let (km, _) = crate::keymap::build_keymap(
+            &crate::config::KeymapConfig::default(), &crate::registry::Registry::builtins());
+        let mut ed = Editor::new_from_text("hello world\n", None, (40, 12));
+        derive::rebuild(&mut ed);
+        set_caret(&mut ed, "hello world".len());
+        let baseline = render_capturing_cursor(&mut ed, 40, 12);
+        assert_ne!(baseline, Some((0, 0)), "precondition: editor caret is off-origin at rest");
+        ed.splash = Some(crate::splash::Splash::new(&km, "0.0.0"));
+        let cur = render_capturing_cursor(&mut ed, 40, 12);
+        assert_eq!(cur, Some((0, 0)), "arm-3 must suppress the editor caret under the startup splash");
+    }
+
+    /// Test B (diag): a hide surface.
+    #[test]
+    fn diag_open_suppresses_editor_caret() {
+        let mut ed = Editor::new_from_text("hello world\n", None, (40, 12));
+        derive::rebuild(&mut ed);
+        set_caret(&mut ed, "hello world".len());
+        let baseline = render_capturing_cursor(&mut ed, 40, 12);
+        assert_ne!(baseline, Some((0, 0)), "precondition: editor caret is off-origin at rest");
+        ed.open_diag(diag_fixture());
+        let cur = render_capturing_cursor(&mut ed, 40, 12);
+        assert_eq!(cur, Some((0, 0)), "arm-3 must suppress the editor caret under the quick-fix overlay");
+    }
+
+    /// Test B (search): arms 1/2 are unaffected by the arm-3 guard — the caret still
+    /// lands on the status row, not at the TestBackend-default suppression coordinate.
+    #[test]
+    fn search_caret_still_lands_on_status_row() {
+        let mut ed = Editor::new_from_text("hello world\n", None, (40, 12));
+        derive::rebuild(&mut ed);
+        ed.open_search(crate::search_overlay::Phase::Find, 0);
+        let cur = render_capturing_cursor(&mut ed, 40, 12);
+        let (_, y) = cur.expect("helper always returns Some");
+        assert_eq!(y, 11, "search caret sits on the status row (h-1)");
+        assert_ne!(cur, Some((0, 0)), "search caret must not read as suppressed");
+    }
+
+    /// Test B (minibuffer): same guarantee as search — arms 1/2 are unaffected.
+    #[test]
+    fn minibuffer_caret_still_lands_on_status_row() {
+        let mut ed = Editor::new_from_text("hello world\n", None, (40, 12));
+        derive::rebuild(&mut ed);
+        ed.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter);
+        let cur = render_capturing_cursor(&mut ed, 40, 12);
+        let (_, y) = cur.expect("helper always returns Some");
+        assert_eq!(y, 11, "minibuffer caret sits on the status row (h-1)");
+        assert_ne!(cur, Some((0, 0)), "minibuffer caret must not read as suppressed");
     }
 }

@@ -525,6 +525,9 @@ pub struct Editor {
     pub theme_picker: Option<crate::theme_picker::ThemePicker>,
     /// File browser overlay state. XOR with all other overlays.
     pub file_browser: Option<crate::file_browser::FileBrowser>,
+    /// Caret-shape picker overlay state (C1 T6 field/stub; T7 fills in the picker's
+    /// logic). XOR with all other overlays.
+    pub cursor_picker: Option<crate::cursor_picker::CursorPicker>,
     /// Startup splash overlay. Set once in `run()` (gated on config, `--no-splash`, and
     /// no pending recovery prompt); cleared — consuming the event — by the first key
     /// press or mouse click (`splash::intercept`). XOR with the other overlays by
@@ -638,6 +641,7 @@ impl Editor {
             outline: None,
             theme_picker: None,
             file_browser: None,
+            cursor_picker: None,
             splash: None,
             theme: wordcartel_core::theme::default(),
             depth: wordcartel_core::theme::Depth::Truecolor,
@@ -910,6 +914,15 @@ impl Editor {
             dir, query: String::new(), entries: Vec::new(), selected: 0, scroll_top: 0,
         });
         if let Some(fb) = self.file_browser.as_mut() { crate::file_browser::rebuild_entries(fb); }
+    }
+
+    /// True while any modal/overlay owns text input — the caret must NOT be parked in the editor
+    /// text area (B11). EXHAUSTIVE by design: a new input surface must be added here (no catch-all).
+    pub fn has_active_input_overlay(&self) -> bool {
+        self.search.is_some() || self.minibuffer.is_some() || self.palette.is_some()
+            || self.outline.is_some() || self.theme_picker.is_some() || self.file_browser.is_some()
+            || self.menu.is_some() || self.prompt.is_some() || self.splash.is_some()
+            || self.diag.is_some() || self.cursor_picker.is_some()
     }
 
     /// Apply a theme: swap, re-derive the heading-glyph flag (cue mode forces ON;
