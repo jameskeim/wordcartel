@@ -335,7 +335,7 @@ pub fn layout_block(raw: &str, ps: usize, vp_width: usize, render: LineRender, h
 /// hits the block itself — I2, §5.2). A line with no content byte is never ventilated: that single
 /// fact is the blank/phantom guard behind C1/C2/I1 — a blank or phantom line becomes an honest
 /// 1-row per-line entry, never a zero-row prose entry.
-fn line_content_byte(buf: &TextBuffer, l: usize) -> Option<usize> {
+pub(crate) fn line_content_byte(buf: &TextBuffer, l: usize) -> Option<usize> {
     let ls = crate::derive::line_start(buf, l);
     let text = crate::derive::line_text(buf, l);
     text.find(|c: char| !c.is_whitespace()).map(|off| ls + off)

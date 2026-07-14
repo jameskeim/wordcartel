@@ -192,6 +192,45 @@ pub fn build_range_replace(
     (cs, edit)
 }
 
+/// The `BlockRole` returned when a caret is not in prose — carried so the command can name the
+/// block kind in its decline message (F3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NonProse(pub wordcartel_core::style::BlockRole);
+
+/// Human name of a non-`Paragraph` block role, for the "no sentence here (…)" message.
+pub fn block_kind_label(role: wordcartel_core::style::BlockRole) -> &'static str {
+    use wordcartel_core::style::BlockRole::*;
+    match role {
+        Paragraph => "paragraph", Heading(_) => "heading", BlockQuote => "block quote",
+        ListItem => "list item", CodeBlock => "code block", ThematicBreak => "rule",
+        FrontMatter => "front matter", Comment => "comment",
+    }
+}
+
+/// The sentence scope at byte `h`, via the LENS'S OWN classification + window, or `Err(NonProse)`
+/// when `h` is not in prose. SEE==SELECT single-source (spec §8, C-11): classify at the caret line's
+/// first non-whitespace CONTENT byte (`ventilate::line_content_byte`) — CommonMark strips ≤3-space
+/// block indent, so a `line_start` classification would hit the gap fallback and diverge from the
+/// lens on indented prose. Then `prose_block_at` (window) + `sentence_bounds` (segmentation) — the
+/// exact calls the lens renders with.
+pub fn prose_sentence_at(editor: &Editor, h: usize) -> Result<(usize, usize), NonProse> {
+    let b = editor.active();
+    let buf = &b.document.buffer;
+    let blocks = b.document.blocks();
+    let line = buf.byte_to_line(h.min(buf.len()));
+    let Some(c) = crate::ventilate::line_content_byte(buf, line) else {
+        return Err(NonProse(blocks.role_at(crate::derive::line_start(buf, line))));
+    };
+    match crate::ventilate::prose_block_at(blocks, buf, c) {
+        None => Err(NonProse(blocks.role_at(c))),
+        Some((ps, pe)) => {
+            let rel = h.saturating_sub(ps);
+            let (sf, st) = wordcartel_core::textobj::sentence_bounds(&buf.slice(ps..pe), rel);
+            Ok((ps + sf, ps + st))
+        }
+    }
+}
+
 /// Compute the (from, to) byte range of `scope` at the given byte offset `h`.
 /// Borrows `editor` immutably and returns owned `(usize, usize)`.
 pub fn scope_range_at(editor: &Editor, h: usize, scope: Scope) -> (usize, usize) {
@@ -211,12 +250,7 @@ pub fn scope_range_at(editor: &Editor, h: usize, scope: Scope) -> (usize, usize)
                 }
             } else { (ps + wf, ps + wt) }
         }
-        Scope::Sentence => {
-            let (ps, pe) = nav::paragraph_range_at(blocks, buf, h);
-            let win = buf.slice(ps..pe);
-            let (sf, st) = wordcartel_core::textobj::sentence_bounds(&win, h - ps);
-            (ps + sf, ps + st)
-        }
+        Scope::Sentence => prose_sentence_at(editor, h).unwrap_or((h, h)), // decline → empty → ladder skips
         Scope::Paragraph => nav::paragraph_range_at(blocks, buf, h),
         Scope::Document => (0, buf.len()),
     }
@@ -434,10 +468,21 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         Command::DeleteToLineEnd => edit::delete_to_line_end(editor, clock),
 
         Command::SelectScope(scope) => {
-            editor.active_mut().sel_history.clear();
-            let (from, to) = scope_range(editor, scope);
-            set_selection_range(editor, from, to);
-            CommandResult::Handled
+            editor.active_mut().sel_history.clear(); // (removed in T3)
+            match scope {
+                Scope::Sentence => match prose_sentence_at(editor, nav::head(editor)) {
+                    Ok((from, to)) => { set_selection_range(editor, from, to); CommandResult::Handled }
+                    Err(NonProse(role)) => {
+                        editor.status = format!("no sentence here ({})", block_kind_label(role));
+                        CommandResult::Noop
+                    }
+                },
+                _ => {
+                    let (from, to) = scope_range(editor, scope);
+                    set_selection_range(editor, from, to);
+                    CommandResult::Handled
+                }
+            }
         }
 
         Command::ExpandSelection => {
@@ -1241,6 +1286,29 @@ mod tests {
         derive::rebuild(&mut e);
         // offset 7 is inside "beta" (6..10)
         assert_eq!(super::scope_range_at(&e, 7, Scope::Word), (6, 10));
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 1 (effort-s4-prose-surgery): SEE==SELECT prose_sentence_at
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn prose_sentence_at_declines_non_prose_and_resolves_prose() {
+        // Prose: caret in a paragraph resolves the sentence.
+        let mut e = Editor::new_from_text("One two. Three four.\n", None, (40, 12));
+        derive::rebuild(&mut e);
+        assert_eq!(prose_sentence_at(&e, 2), Ok((0, 8))); // "One two."
+        // Heading: declines (Heading role).
+        let mut h = Editor::new_from_text("# Title\n\nbody text.\n", None, (40, 12));
+        derive::rebuild(&mut h);
+        assert!(matches!(prose_sentence_at(&h, 2), Err(NonProse(_))));
+        // The paragraph after the heading still resolves.
+        let body = "# Title\n\nbody text.\n".find("body").unwrap();
+        assert!(prose_sentence_at(&h, body).is_ok());
+        // Indented prose (CommonMark strips ≤3-space indent): content-byte classification, NOT decline.
+        let mut ind = Editor::new_from_text("  Indented one. Indented two.\n", None, (40, 12));
+        derive::rebuild(&mut ind);
+        assert!(prose_sentence_at(&ind, 5).is_ok(), "indented prose classifies via content byte");
     }
 
     // -------------------------------------------------------------------------
