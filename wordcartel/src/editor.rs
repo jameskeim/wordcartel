@@ -763,6 +763,7 @@ impl Editor {
         self.diag = None;
         self.outline = None;
         self.theme_picker = None;
+        self.cursor_picker = None;
         self.file_browser = None;
         self.minibuffer = Some(crate::minibuffer::Minibuffer {
             prompt: prompt.into(),
@@ -786,6 +787,7 @@ impl Editor {
         self.diag = None;
         self.outline = None;
         self.theme_picker = None;
+        self.cursor_picker = None;
         self.file_browser = None;
         self.splash = None; // a prompt is modal — it must never be buried by the splash
         self.prompt = Some(p);
@@ -805,6 +807,7 @@ impl Editor {
         self.diag = None;
         self.outline = None;
         self.theme_picker = None;
+        self.cursor_picker = None;
         self.file_browser = None;
         self.palette = Some(crate::palette::Palette::default());
     }
@@ -819,6 +822,7 @@ impl Editor {
         self.diag = None;
         self.outline = None;
         self.theme_picker = None;
+        self.cursor_picker = None;
         self.file_browser = None;
         let bid = self.active().id;
         self.search = Some(crate::search_overlay::SearchState::open(phase, origin, bid));
@@ -834,6 +838,7 @@ impl Editor {
         self.pending_keys.clear(); self.pending_mark = None;
         self.outline = None;
         self.theme_picker = None;
+        self.cursor_picker = None;
         self.file_browser = None;
         let bid = self.active().id;
         let ver = self.active().document.version;
@@ -846,6 +851,7 @@ impl Editor {
         self.search = None; self.diag = None;
         self.pending_keys.clear(); self.pending_mark = None;
         self.theme_picker = None;
+        self.cursor_picker = None;
         self.file_browser = None;
         let bid = self.active().id;
         let ver = self.active().document.version;
@@ -859,7 +865,7 @@ impl Editor {
         self.prompt = None; self.minibuffer = None; self.menu = None;
         self.pending_keys.clear(); self.pending_mark = None;
         self.search = None; self.diag = None; self.outline = None; self.palette = None;
-        self.file_browser = None;
+        self.file_browser = None; self.cursor_picker = None;
         self.theme_picker = Some(crate::theme_picker::ThemePicker {
             query: String::new(), selected: 0, rows: Vec::new(),
             scroll_top: 0, original: self.theme.clone(), previewed: None,
@@ -882,6 +888,7 @@ impl Editor {
         self.diag = None;
         self.outline = None;
         self.theme_picker = None;
+        self.cursor_picker = None;
         self.file_browser = None;
         let source_rows: Vec<crate::palette::PaletteRow> =
             crate::workspace::buffer_switch_rows(self)
@@ -910,10 +917,28 @@ impl Editor {
         self.prompt = None; self.minibuffer = None; self.menu = None; self.palette = None;
         self.pending_keys.clear(); self.pending_mark = None;
         self.search = None; self.diag = None; self.outline = None; self.theme_picker = None;
+        self.cursor_picker = None;
         self.file_browser = Some(crate::file_browser::FileBrowser {
             dir, query: String::new(), entries: Vec::new(), selected: 0, scroll_top: 0,
         });
         if let Some(fb) = self.file_browser.as_mut() { crate::file_browser::rebuild_entries(fb); }
+    }
+
+    /// Open the caret-shape picker, enforcing the single-overlay XOR invariant.
+    ///
+    /// Snapshots the current `(caret_shape, caret_blink)` as the originals so Esc/click-away
+    /// can restore them after a live preview, and seeds `selected` from
+    /// `cursor_picker::initial_row_for` (blinking block when the caret is `Default` — decision #4;
+    /// else the row matching the live caret).
+    pub fn open_cursor_picker(&mut self) {
+        self.prompt = None; self.minibuffer = None; self.menu = None;
+        self.pending_keys.clear(); self.pending_mark = None;
+        self.search = None; self.diag = None; self.outline = None; self.palette = None;
+        self.file_browser = None; self.theme_picker = None;
+        let selected = crate::cursor_picker::initial_row_for(self.caret_shape, self.caret_blink);
+        self.cursor_picker = Some(crate::cursor_picker::CursorPicker {
+            selected, original_shape: self.caret_shape, original_blink: self.caret_blink,
+        });
     }
 
     /// True while any modal/overlay owns text input — the caret must NOT be parked in the editor

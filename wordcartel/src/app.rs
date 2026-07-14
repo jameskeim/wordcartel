@@ -196,6 +196,7 @@ pub(crate) fn dispatch_overlay_command(
     editor.palette = None;
     editor.menu = None;
     editor.theme_picker = None;
+    editor.cursor_picker = None;
     editor.file_browser = None;
     let mut ctx = crate::registry::Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
     reg.dispatch(id, &mut ctx);
@@ -278,6 +279,8 @@ fn reduce_dispatch(
     let msg = match crate::palette::intercept(msg, editor, reg, keymap, ex, clock, msg_tx) {
         crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
     let msg = match crate::theme_picker::intercept(msg, editor, ex, clock, msg_tx) {
+        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
+    let msg = match crate::cursor_picker::intercept(msg, editor, ex, clock, msg_tx) {
         crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
     let msg = match crate::file_browser::intercept(msg, editor, ex, clock, msg_tx) {
         crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };

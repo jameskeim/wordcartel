@@ -264,6 +264,66 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
     }
 
     // -----------------------------------------------------------------------
+    // Cursor (caret-shape) picker overlay
+    // -----------------------------------------------------------------------
+    // A FIXED 7-row list — no query, no scroll. The list sits between the top border and a
+    // dedicated "Preview:" sample row on the second-to-last inner line; the sample-cell caret
+    // is the SOLE on-screen caret while the picker is open (place_cursor suppresses the editor
+    // caret via has_active_input_overlay), so `reconcile_cursor_style` morphs THIS caret live
+    // as the selection changes (Fork 5-C). The list geometry (list_top = ov_y + 1, sample_row =
+    // ov_y + ov_h - 2) is shared with `chrome_geom::cursor_picker_row_at` — keep them in step.
+    if let Some(ref cp) = editor.cursor_picker {
+        let n = crate::cursor_picker::ROW_ACTIONS.len();
+        let ov_rect = palette_overlay_rect(area, n + 1);
+        let ov_x = ov_rect.x;
+        let ov_y = ov_rect.y;
+        let ov_w = ov_rect.width;
+        let ov_h = ov_rect.height;
+
+        frame.render_widget(Clear, ov_rect);
+        frame.buffer_mut().set_style(ov_rect, cs.ov_fill);
+        let block = Block::default().borders(Borders::ALL).title(" Caret ")
+            .border_style(cs.overlay_border);
+        frame.render_widget(block, ov_rect);
+
+        if ov_h >= 3 {
+            let list_top = ov_y + 1;
+            let sample_row = ov_y + ov_h.saturating_sub(2);
+            let list_h = (sample_row.saturating_sub(list_top) as usize).min(n);
+            if list_h > 0 {
+                let list_area = Rect::new(ov_x + 1, list_top, ov_w.saturating_sub(2), list_h as u16);
+                let items: Vec<ListItem> = crate::cursor_picker::ROW_ACTIONS[..list_h].iter()
+                    .map(|(label, glyph, _, _)| {
+                        let text = format!("{glyph}  {label}");
+                        let truncated: String = text.chars().take(list_area.width as usize).collect();
+                        ListItem::new(Line::from(truncated))
+                    }).collect();
+                let mut list_state = ListState::default();
+                list_state.select(Some(cp.selected.min(list_h.saturating_sub(1))));
+                frame.render_stateful_widget(
+                    List::new(items).highlight_style(cs.overlay_selected),
+                    list_area,
+                    &mut list_state,
+                );
+            }
+
+            // Sample cell: a "Preview: <glyph>" line with the live caret parked on the glyph.
+            let sample_area = Rect::new(ov_x + 1, sample_row, ov_w.saturating_sub(2), 1);
+            let glyph = crate::cursor_picker::ROW_ACTIONS[cp.selected.min(n - 1)].1;
+            let sample_label = format!("Preview: {glyph}");
+            let truncated: String = sample_label.chars().take(sample_area.width as usize).collect();
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(truncated, cs.ov_query))),
+                sample_area,
+            );
+            let caret_x = ov_x + 1 + "Preview: ".chars().count() as u16;
+            if caret_x < ov_x + ov_w {
+                frame.set_cursor_position(Position { x: caret_x, y: sample_row });
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // File browser overlay (drawn on top of everything else)
     // -----------------------------------------------------------------------
     // A6 self-heal: the window must respect the LIVE frame's geometry (resize

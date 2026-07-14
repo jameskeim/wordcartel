@@ -120,6 +120,23 @@ pub(crate) fn theme_picker_row_at(area: Rect, tp: &crate::theme_picker::ThemePic
     } else { None }
 }
 
+/// Return the list-row index that `(col, row)` hits in the cursor picker, or `None` when
+/// the click is outside the list interior. The cursor picker has NO query row, so its list
+/// starts one row below the top border (`ov_y + 1`) and stops above the sample row
+/// (`ov_y + ov_h - 2`) — this MUST stay in lockstep with the `render_overlays` picker arm.
+/// The 7-row list never scrolls, so the hit index is absolute (no `scroll_top`).
+pub(crate) fn cursor_picker_row_at(area: Rect, col: u16, row: u16) -> Option<usize> {
+    let n = crate::cursor_picker::ROW_ACTIONS.len();
+    let r = palette_overlay_rect(area, n + 1);
+    let list_top = r.y.saturating_add(1);
+    let sample_row = r.y.saturating_add(r.height).saturating_sub(2);
+    let list_h = (sample_row.saturating_sub(list_top) as usize).min(n) as u16;
+    if col >= r.x.saturating_add(1) && col < r.x.saturating_add(r.width).saturating_sub(1)
+        && row >= list_top && row < list_top.saturating_add(list_h) {
+        Some((row - list_top) as usize)
+    } else { None }
+}
+
 /// Return the absolute list-row index that `(col, row)` hits in the file browser,
 /// or `None` when the click is outside the list interior. Mirrors `palette_row_at`.
 pub(crate) fn file_browser_row_at(area: Rect, fb: &crate::file_browser::FileBrowser, col: u16, row: u16) -> Option<usize> {

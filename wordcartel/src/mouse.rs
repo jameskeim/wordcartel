@@ -74,6 +74,7 @@ fn no_overlay_open(editor: &Editor) -> bool {
     editor.menu.is_none() && editor.palette.is_none() && editor.theme_picker.is_none()
         && editor.file_browser.is_none() && editor.outline.is_none() && editor.diag.is_none()
         && editor.prompt.is_none() && editor.minibuffer.is_none() && editor.search.is_none()
+        && editor.cursor_picker.is_none()   // C1: route mouse to the cursor picker
 }
 
 /// Route a mouse event to the open overlay layer. PRECONDITION: at least one overlay
@@ -232,6 +233,43 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
                 // Click-away: restore the original theme and close — same as Esc.
                 if let Some(tp) = editor.theme_picker.take() {
                     editor.apply_theme(tp.original);
+                }
+            }
+        }
+        return;
+    }
+    if editor.cursor_picker.is_some() {
+        // Fixed 7-row list — wheel moves the selection ±1 (clamped) and re-previews via the
+        // shared setter funnel; a row click selects + previews + commits; a click-away
+        // restores the captured originals and closes (Esc-equivalent). No setter bypass.
+        if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+            if let Some(cp) = editor.cursor_picker.as_mut() {
+                let last = crate::cursor_picker::ROW_ACTIONS.len().saturating_sub(1);
+                if matches!(ev.kind, MouseEventKind::ScrollDown) {
+                    cp.selected = (cp.selected + 1).min(last);
+                } else {
+                    cp.selected = cp.selected.saturating_sub(1);
+                }
+            }
+            crate::cursor_picker::preview_selected(editor);
+        }
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            let row_idx = crate::chrome_geom::cursor_picker_row_at(area, ev.column, ev.row);
+            let inside = {
+                let n = crate::cursor_picker::ROW_ACTIONS.len();
+                let r = crate::chrome_geom::palette_overlay_rect(area, n + 1);
+                ev.column >= r.x && ev.column < r.x + r.width
+                    && ev.row >= r.y && ev.row < r.y + r.height
+            };
+            if let Some(idx) = row_idx {
+                if let Some(cp) = editor.cursor_picker.as_mut() { cp.selected = idx; }
+                crate::cursor_picker::preview_selected(editor);
+                crate::cursor_picker::commit_cursor_picker(editor);
+            } else if !inside {
+                // Click-away: restore the captured originals and close — same as Esc.
+                if let Some(cp) = editor.cursor_picker.take() {
+                    editor.set_caret_shape(cp.original_shape);
+                    editor.set_caret_blink(cp.original_blink);
                 }
             }
         }

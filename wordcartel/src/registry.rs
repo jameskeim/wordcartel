@@ -357,6 +357,7 @@ impl Registry {
             c.editor.diag = None;
             c.editor.outline = None;
             c.editor.theme_picker = None;
+            c.editor.cursor_picker = None;
             c.editor.file_browser = None;
             c.editor.pending_keys.clear();
             c.editor.pending_mark = None;
@@ -684,6 +685,10 @@ impl Registry {
         r.register_stateful("toggle_caret_blink", "Caret Blink", Some(MenuCategory::View),
             |e| MenuMark::OnOff(e.caret_blink),
             |c| { let n = !c.editor.caret_blink; c.editor.set_caret_blink(n); CommandResult::Handled });
+
+        // Caret picker: opens the live sample-cell shape/blink overlay (View).
+        r.register("cursor", "Caret\u{2026}", Some(MenuCategory::View), |c| {
+            c.editor.open_cursor_picker(); CommandResult::Handled });
 
         // Menu bar: deterministic set-per-state (palette-only). menu_bar_pin remains the View representative.
         use crate::config::MenuBarMode;
@@ -2042,6 +2047,13 @@ mod tests {
         dispatch_id(&mut ed, "caret_blink_on");  assert!(ed.caret_blink);
         dispatch_id(&mut ed, "toggle_caret_blink"); assert!(!ed.caret_blink);
         dispatch_id(&mut ed, "toggle_caret_blink"); assert!(ed.caret_blink);
+    }
+
+    #[test]
+    fn cursor_command_opens_picker() {
+        let mut ed = Editor::new_from_text("x\n", None, (40, 12));
+        dispatch_id(&mut ed, "cursor");
+        assert!(ed.cursor_picker.is_some(), "the `cursor` command opens the picker");
     }
 
     #[test]
