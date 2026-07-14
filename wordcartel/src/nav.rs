@@ -48,8 +48,9 @@ pub fn caret_line(editor: &Editor) -> usize {
     if buf.is_empty() {
         return 0;
     }
-    // clamp to last valid byte if head is past end (shouldn't normally happen)
-    buf.byte_to_line(h.min(buf.len().saturating_sub(1)))
+    // B10: do NOT clamp to len-1 — an EOF caret (h == len) belongs on the trailing phantom line,
+    // not glued to the last content line. `byte_to_line` accepts h in 0..=len.
+    buf.byte_to_line(h.min(buf.len()))
 }
 
 /// Lay out logical line `L` on demand (if not already in the cache).
@@ -1145,6 +1146,19 @@ mod tests {
         derive::rebuild(&mut e);
         let n = move_left(&mut e); // -> EOL of "é" line (offset 2)
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn caret_line_at_eof_maps_to_phantom_line_not_last_content() {
+        // "a\nb\n" has content lines 0,1 and a trailing phantom line 2 (after the final \n).
+        let mut e = Editor::new_from_text("a\nb\n", None, (20, 8));
+        crate::derive::rebuild(&mut e);
+        let len = e.active().document.buffer.len();
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(len);
+        assert_eq!(super::caret_line(&e), 2, "EOF caret sits on the trailing phantom line (B10)");
+        // non-EOF unchanged
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(0);
+        assert_eq!(super::caret_line(&e), 0);
     }
 
     #[test]
