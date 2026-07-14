@@ -938,3 +938,31 @@ feels that don't all bother equally. Observations to test against real use:
 Grounding when picked up: the window-aware resolver (`ventilate::resolve`), `nav` motions, and the
 sentence-segmentation the lens shares with `select-sentence` (S5's detector). Slots as an S-theme follow-on to
 S6. Scope only after the user names the specific moment it feels wrong — do NOT boil the ocean.
+
+### B14 — Ventilate lens treats tables as prose (no Table BlockRole → prose_block_at never declines)
+<!-- item: B14 -->
+
+**Origin (2026-07-14):** surfaced by the S4 Codex spec-gate while grounding S4's SEE==SELECT decline
+predicate against the SHIPPED S6 ventilate lens (`docs/backlog-archive.md#s6`). **Not an S4 bug — a
+pre-existing gap in shipped S6.** The lens's prose test, `ventilate::prose_block_at`, declines a block
+only when `role_at(byte) != BlockRole::Paragraph`. But `BlockRole` has **no `Table` variant** and
+`kind_to_role` does **not** map `BlockKind::Table` to a non-paragraph role — so a markdown table
+classifies as prose, and the lens **ventilates it** (segments its row text as "sentences" one per
+row-group + a rhythm gutter), which is wrong: a table is not prose.
+
+**Consequence for S4 (why it was found here):** S4's `select_sentence`/mutations decline exactly what
+the lens declines (SEE==SELECT), so S4 inherits this — a table currently reads as prose to
+`select_sentence` too. S4 (spec `2026-07-14-s4-prose-surgery-design.md`, decision F3-A) deliberately
+scoped this OUT: it declines the lens's *current* set (heading / list / code / blockquote / front-matter
+/ comment) and treats tables as prose to stay literally SEE==SELECT, rather than reach into core block
+classification mid-effort. So this item is the elevation of that deferred piece back to its true home
+(S6/core).
+
+**Fix direction (when picked up):** give tables a non-paragraph identity so BOTH the lens and any
+SEE==SELECT consumer decline them — add a `BlockRole::Table` (or fold into an existing non-prose role)
+and map `BlockKind::Table` in `kind_to_role` (`wordcartel-core/src/style.rs`), then confirm
+`prose_block_at` (`ventilate.rs`) declines it and the lens renders the table verbatim. Small core change;
+re-verify the lens's no-op-when-off invariant and add a table fixture to the ventilate tests. Low
+priority (cosmetic: a ventilated table is ugly but non-destructive; toggle off → byte-identical).
+Grounding anchors: `ventilate::prose_block_at`, `kind_to_role` + `BlockRole` (`style.rs`),
+`BlockKind::Table` (`block_tree.rs`).

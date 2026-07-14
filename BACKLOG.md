@@ -3,7 +3,7 @@
 
 # Backlog
 
-**34 open · 54 shipped · 2 dropped**
+**35 open · 54 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -34,6 +34,7 @@ Blocking Effort P: **0**
 | A15 | About command/menu item that shows the splash | triage | feature | TBD |  | About command/menu item that shows the splash |
 | A16 | Format menu: drop redundant Transform entry | triage | feature | TBD |  | Format menu: drop redundant Transform entry |
 | A17 | Messaging / notification system — routed, browsable, plugin-emittable | triage | feature | TBD |  | One routed path for all user messages: kinds/severity, browsable history, plugin emit API. noice.nvim = the anti-pattern (override-on-top) — we register into a seam. Effort-P design input; enables per-kind user routing/verbosity. |
+| B14 | Ventilate lens treats tables as prose (no Table BlockRole → prose_block_at never declines) | triage | feature | TBD |  | Ventilate lens treats tables as prose (no Table BlockRole → prose_block_at never declines) |
 | B7 | Selected menu-item text too light | needs-design | bug | TBD |  | Possible E5 regression; selected item may need a distinct legible highlight fg. |
 | B9 | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) | triage | feature | TBD |  | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) |
 | H10 | reduce's 10-stage intercept chain boilerplate | watch | debt | TBD |  | Verbatim flat-dispatch; NOT a defect. Collapse only when Effort P adds plugin intercept stages. |
