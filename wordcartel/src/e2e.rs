@@ -2184,6 +2184,50 @@ fn cursor_picker_swallows_paste() {
 }
 
 // ===========================================================================
+// S4 Task 10 — e2e prose-surgery journey (spec §12): lens ON, select/move a
+// sentence through the REAL reduce → advance → render loop, undo byte-identical,
+// lens re-derives without a panic/blank.
+// ===========================================================================
+
+#[test]
+fn e2e_s4_lens_move_sentence_then_undo_is_byte_identical() {
+    let doc = "Alpha one. Beta two. Gamma three.\n";
+    let mut h = Harness::new(doc, None, (60, 12));
+    h.alt('v'); // lens ON (toggle_ventilate)
+    { let ed = h.editor.borrow(); assert!(ed.active().view.ventilate, "alt-v toggles the lens on"); }
+    { let mut ed = h.editor.borrow_mut();
+      ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(2); } // in "Alpha one."
+    { let mut ed = h.editor.borrow_mut();
+      crate::commands::prose_ops::move_sentence_down(&mut ed, &SharedClock::new(0)); }
+    { let ed = h.editor.borrow();
+      let len = ed.active().document.buffer.len();
+      assert_eq!(ed.active().document.buffer.slice(0..len), "Beta two. Alpha one. Gamma three.\n",
+          "move_sentence_down swaps the caret's sentence with its follower, gap preserved");
+      let sel = ed.active().document.selection.primary();
+      let moved = ed.active().document.buffer.slice(sel.from()..sel.to());
+      assert_eq!(moved, "Alpha one.", "selection travels with the moved sentence (F8/C-9 head-at-start)");
+      assert_eq!(sel.head, sel.from(), "C-9: caret lands at the moved sentence's START");
+    }
+    // The lens re-derives on the new byte layout without panicking or blanking the paragraph.
+    h.render();
+    { let ed = h.editor.borrow();
+      assert!(!ed.active().view.vent_blocks.is_empty(), "lens stays populated after the mutation"); }
+    { let row0 = h.row(0);
+      assert!(row0.contains("Beta") || h.screen().iter().any(|r| r.contains("Beta")),
+          "reordered content is actually painted, not blanked"); }
+    { let mut ed = h.editor.borrow_mut(); ed.undo(); }
+    { let ed = h.editor.borrow();
+      let len = ed.active().document.buffer.len();
+      assert_eq!(ed.active().document.buffer.slice(0..len), doc, "undo restores byte-identical"); }
+    h.render(); // lens re-derives on the restored buffer without panic/blank
+    { let ed = h.editor.borrow();
+      assert!(!ed.active().view.vent_blocks.is_empty(), "lens re-populated after undo"); }
+    { let screen = h.screen();
+      assert!(screen.iter().any(|r| r.contains("Alpha")),
+          "original content is repainted after undo, not blanked: {screen:?}"); }
+}
+
+// ===========================================================================
 // R1 typing-latency bench (exploratory measurement — NOT a correctness gate).
 //
 // Drives the REAL reduce → advance(derive::rebuild) → render loop through the

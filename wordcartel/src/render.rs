@@ -3515,4 +3515,80 @@ mod tests {
         assert_eq!(y, 11, "minibuffer caret sits on the status row (h-1)");
         assert_ne!(cur, Some((0, 0)), "minibuffer caret must not read as suppressed");
     }
+
+    // -----------------------------------------------------------------------
+    // S4 Task 10 — SEE==SELECT / fold-survival paint asserts (spec §8 probes 1 & 2)
+    // -----------------------------------------------------------------------
+
+    /// Probe 1: a single sentence long enough to hard-wrap across several ventilated rows is ONE
+    /// row-group (`GutterCell::Count` then N-1 `Continuation` cells); `select_sentence` must paint
+    /// the `SE::Selection` highlight on EVERY row of that group, not just the caret's own row.
+    #[test]
+    fn see_equals_select_highlights_every_row_of_a_wrapped_sentence_group() {
+        let text = "This is one single long sentence that must wrap across several rows in a narrow viewport for the test.\n";
+        let mut e = Editor::new_from_text(text, None, (20, 10));
+        e.active_mut().view.ventilate = true;
+        derive::rebuild(&mut e);
+        let vb = e.active().view.vent_blocks.get(&0).cloned().expect("paragraph anchored at line 0");
+        assert!(vb.gutter.len() > 1,
+            "precondition: the sentence must wrap to more than one row for this probe to be meaningful");
+        // Every cell in this one-sentence paragraph belongs to the SAME row-group: one Count
+        // (the first row) followed by nothing but Continuation cells.
+        assert!(matches!(vb.gutter[0], crate::ventilate::GutterCell::Count(_)));
+        assert!(vb.gutter[1..].iter().all(|g| matches!(g, crate::ventilate::GutterCell::Continuation)));
+
+        let at = text.find("must wrap").expect("probe word present");
+        e.active_mut().document.selection = Selection::single(at);
+        derive::rebuild(&mut e);
+        let expected = crate::commands::prose_sentence_at(&e, at).expect("prose sentence at caret");
+        assert_eq!(
+            crate::commands::run(crate::commands::Command::SelectScope(crate::commands::Scope::Sentence),
+                &mut e, &crate::test_support::TestClock(0)),
+            crate::commands::CommandResult::Handled,
+        );
+        let sel = e.active().document.selection.primary();
+        assert_eq!((sel.from(), sel.to()), expected, "select_sentence picks exactly the SEE==SELECT span");
+
+        let buf = render_to_buffer(&mut e, 20, 10);
+        for row in 0..vb.gutter.len() as u16 {
+            assert!(row_has_highlight(&buf, row),
+                "row {row} of the wrapped sentence's row-group must carry the Selection highlight");
+        }
+    }
+
+    /// Probe 2: `select_section` on a FOLDED heading paints the Selection highlight on the folded
+    /// heading row; the hidden body rows are never drawn at all (fold survival, spec §8 probe 2).
+    #[test]
+    fn select_section_on_a_folded_heading_highlights_the_heading_row_and_hides_the_body() {
+        let doc = "## A\nbody of a.\n\n## B\nbody of b.\n";
+        let mut e = Editor::new_from_text(doc, None, (30, 10));
+        let a_heading_byte = doc.find("## A").unwrap();
+        e.active_mut().folds.toggle(a_heading_byte);
+        derive::rebuild(&mut e);
+        let fv = e.active_fold_view();
+        let body_a_line = e.active().document.buffer.byte_to_line(doc.find("body of a.").unwrap());
+        let b_heading_line = e.active().document.buffer.byte_to_line(doc.find("## B").unwrap());
+        assert!(!fv.is_hidden(0), "the folded heading line itself stays visible");
+        assert!(fv.is_hidden(body_a_line), "the folded body is hidden");
+        assert!(!fv.is_hidden(b_heading_line), "the next heading (outside the fold) stays visible");
+
+        e.active_mut().document.selection = Selection::single(a_heading_byte);
+        derive::rebuild(&mut e);
+        assert_eq!(
+            crate::commands::run(crate::commands::Command::SelectScope(crate::commands::Scope::Section),
+                &mut e, &crate::test_support::TestClock(0)),
+            crate::commands::CommandResult::Handled,
+        );
+
+        let buf = render_to_buffer(&mut e, 30, 10);
+        assert!(row_has_highlight(&buf, 0), "the folded heading row must carry the Selection highlight");
+        let screen: Vec<String> = (0..10u16).map(|r| row_string(&buf, r)).collect();
+        assert!(!screen.iter().any(|r| r.contains("body of a.")),
+            "hidden body rows must never be drawn: {screen:?}");
+        // "## B" (an H2 heading, concealed to its numeral glyph HEADING_GLYPHS[1]) repaints
+        // immediately on row 1 — no blank row left where the hidden body used to be.
+        assert!(screen[1].contains(HEADING_GLYPHS[1]) && screen[1].contains('B'),
+            "the section after the fold repaints on the very next visible row: {screen:?}");
+        assert!(screen[2].contains("body of b."), "the un-folded section's own body is untouched: {screen:?}");
+    }
 }
