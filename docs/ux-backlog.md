@@ -877,3 +877,31 @@ Multi-engine linting (e) — plugin-declared LSP servers + plugin-contributed en
 wc.async — one-shot subprocess primitive (formatters / vale-CLI); closed op-menu + AsyncDone pump-drain
 
 *(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
+
+### A18 — Snippet / abbreviation expansion (trigger to text; dynamic placeholders; cursor stop)
+<!-- item: A18 -->
+
+Snippet / abbreviation expansion (trigger to text; dynamic placeholders; cursor stop)
+
+*(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
+
+### A19 — Writing sprint — word-count goal + session progress (edge-triggered; NOT an elapsed timer)
+<!-- item: A19 -->
+
+Writing sprint — word-count goal + session progress (edge-triggered; NOT an elapsed timer)
+
+*(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
+
+### A20 — Forward-only drafting mode — toggle that disables deletion (Write-or-Die style)
+<!-- item: A20 -->
+
+Forward-only drafting mode — toggle that disables deletion (Write-or-Die style)
+
+*(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
+
+### PE — Bundled example plugins — full-featured writer plugins + authoring tutorials (each with a README)
+<!-- item: PE -->
+
+Bundled example plugins — full-featured writer plugins + authoring tutorials (each with a README)
+
+*(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
