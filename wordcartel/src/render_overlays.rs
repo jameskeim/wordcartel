@@ -95,10 +95,12 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
 
         // B11: place the caret mid-string at `palette.cursor` (a byte offset), not just at
         // the end of the query — the palette query is the only overlay with an interior cursor.
-        let caret_col = query_area.x + OV_QUERY_PREFIX_COLS
-            + palette.query[..palette.cursor].chars().count() as u16;
-        if caret_col < query_area.x + query_area.width {
-            frame.set_cursor_position(Position { x: caret_col, y: query_area.y });
+        // H7: sum in usize and guard BEFORE narrowing — an unbounded-paste query must hide
+        // the caret, not overflow the `+` or truncate to a small column that passes `< width`.
+        let caret_col = query_area.x as usize + OV_QUERY_PREFIX_COLS as usize
+            + palette.query[..palette.cursor].chars().count();
+        if caret_col < (query_area.x + query_area.width) as usize {
+            frame.set_cursor_position(Position { x: caret_col as u16, y: query_area.y });
         }
 
         if ov_h < 4 || list_h == 0 {
@@ -165,9 +167,11 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
             );
 
             // B11: end-of-query caret (outline's `cursor` field is pinned to the end anyway).
-            let caret_col = query_area.x + OV_QUERY_PREFIX_COLS + outline.query.chars().count() as u16;
-            if caret_col < query_area.x + query_area.width {
-                frame.set_cursor_position(Position { x: caret_col, y: query_area.y });
+            // H7: sum in usize and guard BEFORE narrowing (see the palette arm above).
+            let caret_col = query_area.x as usize + OV_QUERY_PREFIX_COLS as usize
+                + outline.query.chars().count();
+            if caret_col < (query_area.x + query_area.width) as usize {
+                frame.set_cursor_position(Position { x: caret_col as u16, y: query_area.y });
             }
 
             if ov_h >= 4 && list_h > 0 {
@@ -232,9 +236,11 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
             );
 
             // B11: end-of-query caret.
-            let caret_col = query_area.x + OV_QUERY_PREFIX_COLS + tp.query.chars().count() as u16;
-            if caret_col < query_area.x + query_area.width {
-                frame.set_cursor_position(Position { x: caret_col, y: query_area.y });
+            // H7: sum in usize and guard BEFORE narrowing (see the palette arm above).
+            let caret_col = query_area.x as usize + OV_QUERY_PREFIX_COLS as usize
+                + tp.query.chars().count();
+            if caret_col < (query_area.x + query_area.width) as usize {
+                frame.set_cursor_position(Position { x: caret_col as u16, y: query_area.y });
             }
 
             if ov_h >= 4 && list_h > 0 {
@@ -380,9 +386,11 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
             );
 
             // B11: end-of-query caret.
-            let caret_col = query_area.x + OV_QUERY_PREFIX_COLS + fb.query.chars().count() as u16;
-            if caret_col < query_area.x + query_area.width {
-                frame.set_cursor_position(Position { x: caret_col, y: query_area.y });
+            // H7: sum in usize and guard BEFORE narrowing (see the palette arm above).
+            let caret_col = query_area.x as usize + OV_QUERY_PREFIX_COLS as usize
+                + fb.query.chars().count();
+            if caret_col < (query_area.x + query_area.width) as usize {
+                frame.set_cursor_position(Position { x: caret_col as u16, y: query_area.y });
             }
 
             if ov_h >= 4 && list_h > 0 {

@@ -37,7 +37,10 @@ flagged **[CONSEQUENCE]** for the Codex gate.
    `caret_blink` is **inert under `default`** — it selects nothing and emits nothing until a
    concrete shape is chosen.
 4. **First managed stop = blinking block:** `cycle_caret_shape` enters `block` first off
-   `default`; the picker highlights/suggests blinking block. (Config default stays `default`.)
+   `default`. (Config default stays `default`.) **Picker clause refined 2026-07-14 (final-gate F2,
+   see History):** the picker opens on the row matching the CURRENT caret state, not a fixed
+   "first managed" row — so the highlight always matches the caret and Enter-on-open commits it,
+   never a lie about what pressing Enter would do.
 5. **Picker preview = both:** descriptive glyph rows AND a live caret morph, on the theme-picker
    preview → Esc-restore → Enter-commit funnel.
 6. **Unsupported terminal = silent best-effort no-op;** doc note covers tmux `terminal-overrides`;
@@ -624,8 +627,11 @@ as: `set_caret_shape(shape); if let Some(b) = blink { set_caret_blink(b); }` —
 over the table, no row leaving a field in an undefined state.
 
 (The plan finalizes the exact glyphs; they are DESCRIPTIVE cells painted in the row, honest even on a
-DECSCUSR-ignoring terminal.) Decision #4: row 1 (blinking block) is the initial highlight when
-opening from `Default`.
+DECSCUSR-ignoring terminal.) **Refined per the final-gate F2 resolution (see History):** the picker
+opens on the row matching the CURRENT caret state, not a fixed "first managed" row — from `Default`
+that is row 0 (the `Default` row itself), not row 1 (blinking block). Decision #4's *cycle* clause
+(`cycle_caret_shape` enters `block` first off `default`) is UNCHANGED; only the *picker's* initial
+highlight is refined.
 
 **[CONSEQUENCE C-8] The picker collapses shape×blink into a 7-row combined list**, even though the
 persisted OPTIONS are two orthogonal fields (§3). This is a UI convenience only — the picker's
@@ -638,7 +644,12 @@ The single `ROW_ACTIONS` table is the one source both the render (labels/glyphs)
 
 - `Editor::open_cursor_picker()` sets `cursor_picker = Some(..)` capturing `original_shape/blink`,
   and enforces overlay XOR (clears other overlays — mirror `open_theme_picker`). Add `cursor_picker:
-  Option<CursorPicker>` to `Editor`.
+  Option<CursorPicker>` to `Editor`. `selected` is seeded from `cursor_picker::initial_row_for(shape,
+  blink)`, **which opens on the row matching the CURRENT caret state** (row 0 for `Default`; else the
+  concrete `(shape, Some(blink))` match, falling back to row 0) — refined per the final-gate F2
+  resolution (see History). The highlight therefore always matches the live caret on open, so opening
+  the picker writes nothing (no preview-on-open needed) and Enter-immediately-after-open commits
+  exactly the state that was already active — the highlight never lies about what Enter would do.
 - `cursor_picker::intercept(msg, editor, ex, clock, msg_tx) -> Handled` added as ONE new stage in
   `app::reduce_dispatch`'s interceptor chain (next to `theme_picker`). Handles Esc/Enter/list-nav
   (via `list_window::apply_list_nav`). It swallows BOTH paste arms as no-ops — `Msg::ClipboardPaste`
@@ -652,9 +663,12 @@ The single `ROW_ACTIONS` table is the one source both the render (labels/glyphs)
 
 ### 8.3 Preview funnel (decision #5 — live morph on the sample cell + glyph rows)
 
-- On every selection move (and on open), `cursor_picker` calls its preview: apply the selected row's
-  `ROW_ACTIONS` entry via the setters — `set_caret_shape(shape); if let Some(b) = blink {
-  set_caret_blink(b); }`. The run-loop reconcile (§4) then emits the DECSCUSR the same iteration and
+- `preview_selected` fires on each nav (list-nav key or wheel), NOT on open — the row `initial_row_for`
+  seeds already matches the live caret (F2, see History), so opening the picker writes nothing; a real
+  live morph starts only once the user moves the selection. On every selection move, `cursor_picker`
+  calls its preview: apply the selected row's `ROW_ACTIONS` entry via the setters —
+  `set_caret_shape(shape); if let Some(b) = blink { set_caret_blink(b); }`. The run-loop reconcile
+  (§4) then emits the DECSCUSR the same iteration and
   the **sample-cell caret** (§6.3, §8.4) morphs in place. The morph is VISIBLE because the picker
   places `frame.set_cursor_position` at its sample cell every frame (arm 3 is suppressed, so the
   sample cell owns the only caret on screen). This is the concrete resolution of Fork 5-C's "live
@@ -665,10 +679,13 @@ The single `ROW_ACTIONS` table is the one source both the render (labels/glyphs)
 - **Esc:** restore `original_shape`/`original_blink` via the setters (reconcile then restores the
   live sample caret next iteration, then arm 3 resumes owning the text-area caret once the picker
   closes). Close the picker.
-- **Enter:** commit — the options already hold the previewed values (they were set live); just close
-  the picker. (No separate identity to record, unlike the theme picker's `previewed` name — the
+- **Enter:** commit — the options already hold the previewed values (they were set live, or — if no
+  nav happened — they already held the current state that `initial_row_for` matched on open); just
+  close the picker. (No separate identity to record, unlike the theme picker's `previewed` name — the
   values ARE the state.) Because commit leaves the options as-previewed, the settings-save path
   persists them on the next `settings_save_requested` cycle exactly like any option change.
+  Enter-immediately-after-open is therefore a true no-op that commits exactly the caret state the
+  user already had (F2) — never a silent jump to an unrelated managed row.
 
 **[CONSEQUENCE C-9] Live preview writes DECSCUSR on each arrow** (through the reconcile's normal
 edge-trigger). This is bounded by user keypresses (not wall-clock) → still idle-free and
@@ -824,3 +841,18 @@ built now as nullary.
   `OutlineOverlay::{cursor, set_query}`, `SettingsSnapshot`/`OView`,
   `every_persisted_setting_has_a_command`, the three managed `term.rs` sites + the fourth exempt
   path, `MenuMark`, `register_stateful`) was re-verified in the tree for this spec.
+
+---
+
+## History
+
+- **2026-07-14 (final-gate F2 resolution):** the whole-branch pre-merge gate flagged that the picker
+  opened with row 1 (blinking block) highlighted even when the live caret was `Default`, but preview
+  did not fire on open — so Enter-immediately-on-open silently committed `block · blinking`, a state
+  the highlight implied but the user never asked for. Resolution (human-approved): **the picker opens
+  on the row matching the CURRENT caret state** (`cursor_picker::initial_row_for` now returns row 0
+  for `Default`, or the matching concrete row, instead of always landing on row 1). This refines
+  decision #4's *picker* clause only (§1 item 4, §8.2, §8.3, and the row-table note in §8) — the
+  *cycle* clause (`cycle_caret_shape` enters `block` first off `default`) is UNCHANGED. `preview_selected`
+  continues to fire on nav (live morph, Fork 5-C) but not on open, since open now seeds a highlight that
+  already matches the caret.

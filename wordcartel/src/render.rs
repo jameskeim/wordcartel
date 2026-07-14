@@ -3401,6 +3401,23 @@ mod tests {
         assert_eq!(cur, Some((ov.x + 1 + 2 + 3, ov.y + 1)), "end-of-query caret in the theme_picker query");
     }
 
+    /// F1 regression (final-gate finding): a query overlay backed by unbounded bracketed
+    /// paste (e.g. theme_picker's `query`) must not panic when the char count overflows a
+    /// u16 caret column, and must simply HIDE the caret (the `< width` guard) rather than
+    /// truncate to a misleading on-screen column. Mirrors the H7 fix in `place_cursor`.
+    #[test]
+    fn theme_picker_huge_paste_query_does_not_panic_and_hides_caret() {
+        let mut ed = Editor::new_from_text("hello world\n", None, (40, 12));
+        derive::rebuild(&mut ed);
+        ed.open_theme_picker();
+        if let Some(tp) = ed.theme_picker.as_mut() { tp.query = "x".repeat(70_000); }
+        // Must not panic (dev/test builds are overflow-checked) and must not place the
+        // caret at some wrapped/truncated column — the frame is left at the TestBackend
+        // default, i.e. no cursor placed by this overlay.
+        let cur = render_capturing_cursor(&mut ed, 40, 12);
+        assert_eq!(cur, Some((0, 0)), "huge query hides the caret rather than truncating it on-screen");
+    }
+
     /// Test B (file_browser): end-of-query caret.
     #[test]
     fn file_browser_query_shows_caret_end_of_string() {

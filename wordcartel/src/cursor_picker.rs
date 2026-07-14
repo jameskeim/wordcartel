@@ -39,13 +39,16 @@ pub const ROW_ACTIONS: [(&str, &str, CaretShape, Option<bool>); 7] = [
     ("Underline \u{00b7} steady",   "\u{2581}", CaretShape::Underline, Some(false)),
 ];
 
-/// The initial highlighted row for a caret currently at `(shape, blink)`. Under `Default`
-/// the caret is the terminal's own and blink is inert, so open on the first *managed* row —
-/// blinking block, row 1 (decision #4). Otherwise land on the row whose `(shape, Some(blink))`
-/// matches the live caret, defaulting to row 0 if no row matches.
+/// The initial highlighted row for a caret currently at `(shape, blink)` (final-gate F2: the
+/// picker opens on the row matching the CURRENT caret state, so the highlight never lies about
+/// what Enter-on-open would commit). Under `Default` that is row 0 (`(Default, None)`) —
+/// blink is inert under Default, so it does not affect the match. Otherwise land on the row
+/// whose `(shape, Some(blink))` matches the live caret, defaulting to row 0 if no row matches.
+/// `cycle_caret_shape`'s own first-managed-stop behavior (blinking block) is unchanged by this —
+/// this function only seeds the PICKER's initial highlight.
 pub(crate) fn initial_row_for(shape: CaretShape, blink: bool) -> usize {
     if shape == CaretShape::Default {
-        return 1;
+        return 0;
     }
     ROW_ACTIONS.iter()
         .position(|(_, _, s, b)| *s == shape && *b == Some(blink))
@@ -133,10 +136,10 @@ mod tests {
     }
 
     #[test]
-    fn initial_row_for_lands_on_first_managed_or_matching_row() {
-        // Default → first managed stop (blinking block, row 1).
-        assert_eq!(initial_row_for(CaretShape::Default, true), 1);
-        assert_eq!(initial_row_for(CaretShape::Default, false), 1);
+    fn initial_row_for_lands_on_current_or_matching_row() {
+        // F2: Default → row 0 (the Default row itself), regardless of blink.
+        assert_eq!(initial_row_for(CaretShape::Default, true), 0);
+        assert_eq!(initial_row_for(CaretShape::Default, false), 0);
         // Concrete shapes land on the matching (shape, blink) row.
         assert_eq!(initial_row_for(CaretShape::Block, true), 1);
         assert_eq!(initial_row_for(CaretShape::Block, false), 2);

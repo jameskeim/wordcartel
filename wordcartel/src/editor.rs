@@ -928,8 +928,10 @@ impl Editor {
     ///
     /// Snapshots the current `(caret_shape, caret_blink)` as the originals so Esc/click-away
     /// can restore them after a live preview, and seeds `selected` from
-    /// `cursor_picker::initial_row_for` (blinking block when the caret is `Default` — decision #4;
-    /// else the row matching the live caret).
+    /// `cursor_picker::initial_row_for` — the row matching the CURRENT caret (row 0 when the
+    /// caret is `Default`; else the concrete matching row). Final-gate F2: opening on the
+    /// current state means the highlight always matches the caret, so Enter-immediately
+    /// commits what is already active rather than lying about it.
     pub fn open_cursor_picker(&mut self) {
         self.prompt = None; self.minibuffer = None; self.menu = None;
         self.pending_keys.clear(); self.pending_mark = None;

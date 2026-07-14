@@ -2088,21 +2088,40 @@ fn cursor_picker_live_preview_sample_caret_and_commit() {
     h.editor.borrow_mut().open_cursor_picker();
     h.render();
     assert!(h.editor.borrow().cursor_picker.is_some(), "picker open");
-    // initial selection = blinking block (row 1) off Default (decision #4)
-    assert_eq!(h.editor.borrow().cursor_picker.as_ref().unwrap().selected, 1);
+    // F2: initial selection matches the CURRENT caret state — the caret is Default, so the
+    // picker opens on row 0 (the Default row itself), not a managed row picked for the user.
+    assert_eq!(h.editor.borrow().cursor_picker.as_ref().unwrap().selected, 0);
+    // opening does not preview: the caret shape is still exactly what it was before open —
+    // the highlight already matches it, so opening writes nothing.
+    assert_eq!(h.editor.borrow().caret_shape, CaretShape::Default, "opening the picker previews nothing");
     // sample-cell caret is placed INSIDE the overlay — not at the editor text-area cell:
     let sample_pos = h.cursor_pos();
     assert_ne!(sample_pos, editor_caret,
         "picker sample caret must sit in the overlay, not the editor text area");
 
-    // arrow Down to row 2 (Block · steady) → preview applies shape=Block, blink=false
+    // F2 regression: Enter IMMEDIATELY after open commits the CURRENT state — no lie. The
+    // highlighted row (0 = Default) already matches the live caret, so this is a true no-op,
+    // not the old bug where Enter-on-open silently committed an unrelated managed row.
+    h.key(KeyCode::Enter);
+    {
+        let e = h.editor.borrow();
+        assert!(e.cursor_picker.is_none(), "Enter commits + closes");
+        assert_eq!(e.caret_shape, CaretShape::Default, "enter-immediately commits the current state");
+        assert!(!e.caret_blink, "enter-immediately does not touch blink");
+    }
+
+    // reopen (state is unchanged, so the initial row is again 0). Arrow Down to row 1
+    // (Block · blinking) → preview applies live.
+    h.editor.borrow_mut().open_cursor_picker();
+    h.render();
+    assert_eq!(h.editor.borrow().cursor_picker.as_ref().unwrap().selected, 0);
     h.key(KeyCode::Down);
     h.render();
     {
         let e = h.editor.borrow();
         assert_eq!(e.caret_shape, CaretShape::Block);
-        assert!(!e.caret_blink, "row 2 steady → blink false");
-        assert_eq!(e.cursor_picker.as_ref().unwrap().selected, 2);
+        assert!(e.caret_blink, "row 1 blinking → blink true");
+        assert_eq!(e.cursor_picker.as_ref().unwrap().selected, 1);
     }
     // the sample caret is FIXED (same cell) across selection moves — it is the live-morph anchor:
     assert_eq!(h.cursor_pos(), sample_pos, "sample caret stays on the fixed sample cell");
@@ -2117,9 +2136,9 @@ fn cursor_picker_live_preview_sample_caret_and_commit() {
         assert!(!e.caret_blink, "blink unchanged (was false)");
     }
 
-    // reopen, move to row 0 (Default) — must NOT touch blink — then Enter to commit
+    // reopen, row 0 (Default) is again the initial selection — Enter commits, must NOT
+    // touch blink.
     h.editor.borrow_mut().open_cursor_picker();
-    h.key(KeyCode::Up);                              // from row 1 up to row 0
     h.render();
     assert_eq!(h.editor.borrow().cursor_picker.as_ref().unwrap().selected, 0);
     h.key(KeyCode::Enter);
@@ -2130,23 +2149,25 @@ fn cursor_picker_live_preview_sample_caret_and_commit() {
         assert!(!e.caret_blink, "row 0 commit preserved blink=false");
     }
 
-    // reopen, pick row 3 (Beam · blinking), Enter, then assert the real settings snapshot persists it.
-    // open_cursor_picker → initial_row_for(Default, _) == 1 (decision #4). ListNav::Down is +1,
-    // so from row 1 press Down TWICE to reach row 3 (NOT three times → row 4).
+    // reopen, navigate to row 4 (Beam · steady), Enter, then assert the real settings snapshot
+    // persists it. open_cursor_picker → initial_row_for(Default, _) == 0 (F2). ListNav::Down
+    // is +1, so from row 0 press Down FOUR times to reach row 4.
     h.editor.borrow_mut().open_cursor_picker();
-    assert_eq!(h.editor.borrow().cursor_picker.as_ref().unwrap().selected, 1, "initial row = 1");
+    assert_eq!(h.editor.borrow().cursor_picker.as_ref().unwrap().selected, 0, "initial row = 0");
+    h.key(KeyCode::Down); // 0→1 (Block · blinking)
     h.key(KeyCode::Down); // 1→2 (Block · steady)
     h.key(KeyCode::Down); // 2→3 (Beam · blinking)
-    assert_eq!(h.editor.borrow().cursor_picker.as_ref().unwrap().selected, 3, "landed on Beam · blinking");
+    h.key(KeyCode::Down); // 3→4 (Beam · steady)
+    assert_eq!(h.editor.borrow().cursor_picker.as_ref().unwrap().selected, 4, "landed on Beam · steady");
     h.key(KeyCode::Enter);
     {
         let e = h.editor.borrow();
         assert_eq!(e.caret_shape, CaretShape::Beam);
-        assert!(e.caret_blink, "row 3 (ROW_ACTIONS[3]) = Beam · blinking → blink true");
+        assert!(!e.caret_blink, "row 4 (ROW_ACTIONS[4]) = Beam · steady → blink false");
         // real persistence path: runtime_snapshot(&Editor).
         let snap = crate::settings::runtime_snapshot(&e);
         assert_eq!(snap.view_caret_shape, CaretShape::Beam);
-        assert!(snap.view_caret_blink);
+        assert!(!snap.view_caret_blink);
     }
 }
 

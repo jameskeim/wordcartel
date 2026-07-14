@@ -1471,11 +1471,11 @@ mod tests {
         let mut e = Editor::new_from_text("x\n", None, (60, 9)); // short — list_h_for(7, 9) == 5
         crate::derive::rebuild(&mut e);
         e.open_cursor_picker();
-        assert_eq!(e.cursor_picker.as_ref().unwrap().selected, 1,
-            "initial row = 1 (Default caret lands on the first managed row)");
+        assert_eq!(e.cursor_picker.as_ref().unwrap().selected, 0,
+            "initial row = 0 (F2: the picker opens on the row matching the current — Default — caret)");
         let (reg, ex, clk, tx, km) = ctx();
         let scroll_down = MouseEvent { kind: MouseEventKind::ScrollDown, column: 20, row: 4, modifiers: KeyModifiers::NONE };
-        for _ in 0..5 {
+        for _ in 0..6 {
             handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx);
         }
         let cp = e.cursor_picker.as_ref().expect("picker still open after wheel");
