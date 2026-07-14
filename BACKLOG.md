@@ -3,7 +3,7 @@
 
 # Backlog
 
-**35 open · 54 shipped · 2 dropped**
+**34 open · 55 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -30,7 +30,6 @@ Blocking Effort P: **0**
 | S7 | Linguistic substrate — harper-brill POS tagger + NP chunker in-process | needs-design | feature | M |  | ADOPTION DECIDED 2026-07-12 (measured, not assumed): harper-brill = rule-based Brill POS tagger + NP chunker, 2 direct deps, +119 activated crates, +0.95 MB binary, ZERO GPU/FFI (the lockfile's 491 + cubecl/CUDA entries are optional deps that never compile). Proven: 'because' → SCONJ vs 'on' → ADP — the exact distinction that makes clause-splitting principled. PARTIALLY REVERSES H2 (burn returns in-process, thinner: 119 vs 389 crates) — see the H2 archive note. GATE: cargo deny/audit has NOT been run against the 119 new crates; it must pass before merge. Cold-path only, block-windowed, version-cached. Arc: docs/design/prose-structure-arc.md. |
 | S8 | Prose lenses — POS-driven stylistic X-rays; Phrase/Clause select-only | needs-design | feature | M |  | The genuinely novel half. Every adverb dimmed; every passive (AUX + participle) underlined; nominalizations flagged; 'select every sentence containing a passive'. This is what harper-ls CANNOT give — it flags ERRORS; these are stylistic X-rays of CORRECT prose, which is what revision needs. Then Phrase (the chunker's NPs) and Clause (POS-informed: CCONJ/SCONJ/ADP disambiguates for/so/yet) — SELECT-ONLY. THE LAW: a linguistic analysis may COLOR and may SELECT; it may never MUTATE without a visible, abortable selection (Brill is newswire-trained; it WILL mistag fiction/dialect/verse). Arc: docs/design/prose-structure-arc.md. |
 | S2 | Directory-as-binder | needs-design | feature | L |  | Directory of .md as a manuscript: ordered manifest + compile step (post-Effort-P plugin). |
-| S4 | Prose text objects — structural selection + operator layer | needs-design | feature | L |  | RE-SCOPED 2026-07-12 (was XL): objects only make SELECTIONS; the existing operators act on the selection (the shipped A14 scope_or_word convention) — N+M commands, NOT N×M, so no command-surface law-10 amendment. Contents: select_sentence/select_section, expand-ladder as data, transpose_sentences, ONE object-agnostic swap over the existing MarkedBlock+Selection pair, count_region. CUT: the TextObject trait/ObjectRegistry/Affinity scaffolding, PairedDelimiter (BlockTree discards ALL inline events, and fiction omits closing quotes), plain-text degradation, section transpose (→S1: outline::sections ranges NEST, so swap-with-next corrupts). Earned by S6, which diagnoses what this operates on. Arc: docs/design/prose-structure-arc.md. |
 | A15 | About command/menu item that shows the splash | triage | feature | TBD |  | About command/menu item that shows the splash |
 | A16 | Format menu: drop redundant Transform entry | triage | feature | TBD |  | Format menu: drop redundant Transform entry |
 | A17 | Messaging / notification system — routed, browsable, plugin-emittable | triage | feature | TBD |  | One routed path for all user messages: kinds/severity, browsable history, plugin emit API. noice.nvim = the anti-pattern (override-on-top) — we register into a seam. Effort-P design input; enables per-kind user routing/verbosity. |
@@ -49,12 +48,13 @@ Blocking Effort P: **0**
 
 ## Shipped
 
-<details><summary>54 shipped</summary>
+<details><summary>55 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
 | B11 | Modal/overlay caret parked under the modal (query field shows no caret) | 2026-07-14 | c740ba4 |
 | B8 | Writing caret — DECSCUSR shape/blink config + cursor picker + panic-safe restore | 2026-07-14 | c740ba4 |
+| S4 | Prose text objects — structural selection + operator layer | 2026-07-14 | 10b847e |
 | S5 | Sentence authority — fix select_sentence, differential suite, sentence motions | 2026-07-13 | ab91584 |
 | S6 | Ventilate-as-a-lens — non-destructive sentence view + rhythm gutter | 2026-07-13 | 04a2748 |
 | P | Effort P — in-process Lua plugin system (P1 commands + P2 events/config/reload + P3 timers) | 2026-07-12 | 2988178 |

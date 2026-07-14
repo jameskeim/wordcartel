@@ -922,14 +922,16 @@ created = "2026-07-11"
 [[item]]
 id = "S4"
 title = "Prose text objects — structural selection + operator layer"
-status = "needs-design"
+status = "shipped"
 kind = "feature"
 size = "L"
 theme = "S"
 depends_on = ["S5"]
 hook = "RE-SCOPED 2026-07-12 (was XL): objects only make SELECTIONS; the existing operators act on the selection (the shipped A14 scope_or_word convention) — N+M commands, NOT N×M, so no command-surface law-10 amendment. Contents: select_sentence/select_section, expand-ladder as data, transpose_sentences, ONE object-agnostic swap over the existing MarkedBlock+Selection pair, count_region. CUT: the TextObject trait/ObjectRegistry/Affinity scaffolding, PairedDelimiter (BlockTree discards ALL inline events, and fiction omits closing quotes), plain-text degradation, section transpose (→S1: outline::sections ranges NEST, so swap-with-next corrupts). Earned by S6, which diagnoses what this operates on. Arc: docs/design/prose-structure-arc.md."
-doc = "ux-backlog.md#s4"
+doc = "backlog-archive.md#s4"
 created = "2026-07-12"
+shipped_commit = "10b847e"
+shipped_date = "2026-07-14"
 
 [[item]]
 id = "S5"
