@@ -112,7 +112,9 @@ pub(crate) fn swap(editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     };
     let (s_from, s_to) = (sel.from(), sel.to());
     let (m_from, m_to) = (mb.start, mb.end);
-    // Order the two regions; reject overlap (touch-through counts).
+    // Order the two regions. Genuine overlap (r1_to > r2_from) is rejected loudly; ADJACENT
+    // (exactly-touching, r1_to == r2_from) regions are allowed and swap correctly — adjacency
+    // is not overlap, matching build_multi_replace's own well-formedness guard (w[0].1 <= w[1].0).
     let (r1_from, r1_to, r1_is_sel) = if s_from <= m_from { (s_from, s_to, true) } else { (m_from, m_to, false) };
     let (r2_from, r2_to) = if s_from <= m_from { (m_from, m_to) } else { (s_from, s_to) };
     if r1_to > r2_from {
@@ -287,6 +289,18 @@ mod tests {
         assert_eq!(swap(&mut e, &TestClock(0)), CommandResult::Noop);
         assert!(e.status.contains("overlap"), "status: {}", e.status);
         assert_eq!(e.active().document.buffer.to_string(), "abcdefgh\n", "no mutation on overlap");
+    }
+
+    #[test]
+    fn swap_allows_adjacent_touching_regions() {
+        // sel="AAAA"(0..4), block="BBBB"(4..8) — exactly touching, not overlapping.
+        let mut e = Editor::new_from_text("AAAABBBB\n", None, (40, 12));
+        crate::derive::rebuild(&mut e);
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::range(0, 4);
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 4, end: 8, hidden: false });
+        assert_eq!(swap(&mut e, &TestClock(0)), CommandResult::Handled, "adjacency is not overlap");
+        assert!(e.status.contains("swap"), "status: {}", e.status);
+        assert_eq!(e.active().document.buffer.to_string(), "BBBBAAAA\n");
     }
 
     #[test]
