@@ -566,6 +566,8 @@ impl Registry {
         r.register_stateful("toggle_word_count", "Toggle Word Count", Some(MenuCategory::View),
             |e| MenuMark::OnOff(e.view_opts.word_count),
             |c| { c.editor.view_opts.word_count = !c.editor.view_opts.word_count; CommandResult::Handled });
+        r.register("count_region", "Count Region", Some(MenuCategory::View),
+            |c| crate::commands::prose_ops::count_region(c.editor));
 
         // View menu — section folding (Task 10 / Effort 5g).
         r.register("fold_toggle", "Fold/Unfold Section", Some(MenuCategory::View), |c| {

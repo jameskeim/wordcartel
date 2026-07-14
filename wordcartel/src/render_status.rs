@@ -59,11 +59,8 @@ pub(crate) fn word_count_segment(editor: &Editor) -> Option<String> {
     } else {
         editor.active().document.buffer.to_string()
     };
-    Some(format!(
-        "{} words · {} chars",
-        count::word_count(&text),
-        count::char_count(&text)
-    ))
+    let st = count::region_stats(&text);
+    Some(format!("{} words · {} sentences · {} chars", st.words, st.sentences, st.chars))
 }
 
 // ---------------------------------------------------------------------------
@@ -107,11 +104,13 @@ mod tests {
     fn word_count_segment_selection_aware() {
         let mut e = Editor::new_from_text("alpha beta gamma\n", None, (80, 24));
         e.view_opts.word_count = true;
-        // whole doc: 3 words, 17 chars (including trailing \n)
-        assert_eq!(crate::render_status::word_count_segment(&e), Some("3 words · 17 chars".to_string()));
-        // select "alpha" → 1 word, 5 chars
+        // whole doc: 3 words, 1 sentence (no terminal punctuation), 17 chars (incl. trailing \n)
+        assert_eq!(crate::render_status::word_count_segment(&e),
+            Some("3 words · 1 sentences · 17 chars".to_string()));
+        // select "alpha" → 1 word, 1 sentence, 5 chars
         e.active_mut().document.selection = wordcartel_core::selection::Selection::range(0, 5);
-        assert_eq!(crate::render_status::word_count_segment(&e), Some("1 words · 5 chars".to_string()));
+        assert_eq!(crate::render_status::word_count_segment(&e),
+            Some("1 words · 1 sentences · 5 chars".to_string()));
         e.view_opts.word_count = false;
         assert_eq!(crate::render_status::word_count_segment(&e), None);
     }
