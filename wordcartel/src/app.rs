@@ -534,6 +534,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // startup (no dwell pending yet).
     editor.set_scrollbar_mode(cfg.view.scrollbar);
     editor.set_status_line_mode(cfg.view.status_line);
+    editor.set_caret_shape(cfg.view.caret_shape);
+    editor.set_caret_blink(cfg.view.caret_blink);
     editor.set_clipboard_provider(cfg.clipboard.provider);
     editor.clear_clipboard_provider_dirty(); // worker gets the initial plan below; no redundant rebuild
     editor.resume_enabled = cfg.state.resume; // gates open_into_current's resume restore (Effort 7)

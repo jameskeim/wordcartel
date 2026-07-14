@@ -487,6 +487,10 @@ pub struct Editor {
     pub scrollbar_mode: crate::config::TransientMode,
     /// Status-line visibility mode (seeded from `[view] status_line`; mutated at runtime).
     pub status_line_mode: crate::config::TransientMode,
+    /// Writing-caret shape (seeded from `[view] caret_shape`; mutated by `set_caret_shape`).
+    pub caret_shape: crate::config::CaretShape,
+    /// Caret blink enablement (seeded from `[view] caret_blink`; mutated by `set_caret_blink`).
+    pub caret_blink: bool,
     /// Transient mouse gesture state; cleared by `reconcile_mouse_capture` on disable.
     pub mouse: MouseState,
     /// View/focus/writing-experience flags. Seeded from config; toggled by the 5 toggle_ commands.
@@ -618,6 +622,8 @@ impl Editor {
             // Status line defaults On — the idle info line is always shown out of the box
             // (preserves the pre-density behavior); Zen (chrome = zen) flips it to Auto.
             status_line_mode: crate::config::TransientMode::On,
+            caret_shape: crate::config::CaretShape::Default,
+            caret_blink: true,
             mouse: MouseState::default(),
             view_opts: crate::config::ViewConfig::default(),
             search: None,
@@ -953,6 +959,12 @@ impl Editor {
         self.mouse.scrollbar_revealed = false;
     }
 
+    /// Set the writing-caret shape. The single setter the `caret_shape_*` / `cycle_caret_shape`
+    /// commands, the cursor picker, and startup config apply all call (contract law 6).
+    pub fn set_caret_shape(&mut self, s: crate::config::CaretShape) { self.caret_shape = s; }
+    /// Set caret blink. Inert while `caret_shape == Default` (emits nothing — see cursor_style).
+    pub fn set_caret_blink(&mut self, on: bool) { self.caret_blink = on; }
+
     /// Set the status-line transient mode (Off coerces to Auto — status has no true Off,
     /// no-silent-UI) and clear its stale dwell state.
     pub fn set_status_line_mode(&mut self, mode: crate::config::TransientMode) {
@@ -1060,6 +1072,17 @@ mod tests {
         assert_eq!(e.status_line_mode, crate::config::TransientMode::On);
         assert_eq!(e.mouse.scrollbar_reveal_due, None);
         assert!(!e.mouse.status_revealed);
+    }
+
+    #[test]
+    fn caret_setters_are_the_single_mutators() {
+        let mut e = Editor::new_from_text("x\n", None, (40, 12));
+        assert_eq!(e.caret_shape, crate::config::CaretShape::Default);
+        assert!(e.caret_blink);
+        e.set_caret_shape(crate::config::CaretShape::Beam);
+        e.set_caret_blink(false);
+        assert_eq!(e.caret_shape, crate::config::CaretShape::Beam);
+        assert!(!e.caret_blink);
     }
 
     // ------------------------------------------------------------------
