@@ -337,6 +337,7 @@ impl Registry {
         r.register("select_word",      "Select Word",      None, |c| run(c, Command::SelectScope(Scope::Word)));
         r.register("select_sentence",  "Select Sentence",  None, |c| run(c, Command::SelectScope(Scope::Sentence)));
         r.register("select_paragraph", "Select Paragraph", None, |c| run(c, Command::SelectScope(Scope::Paragraph)));
+        r.register("select_section",   "Select Section",   None, |c| run(c, Command::SelectScope(Scope::Section)));
         r.register("expand_selection", "Expand Selection", None, |c| run(c, Command::ExpandSelection));
         r.register("shrink_selection", "Shrink Selection", None, |c| run(c, Command::ShrinkSelection));
 
@@ -405,6 +406,9 @@ impl Registry {
         // Block → selection bridge (A11.3, Task 1.1 / command-surface curation).
         r.register("select_marked_block", "Select Block", Some(MenuCategory::Block),
             |c| { crate::blocks_marked::select_marked_block(c.editor); CommandResult::Handled });
+        // Two-region swap (S4 Task 6): exchange Selection <-> MarkedBlock, one undo unit.
+        r.register("swap", "Swap Selection \u{21C4} Block", Some(MenuCategory::Block),
+            |c| crate::commands::prose_ops::swap(c.editor, c.clock));
 
         // Marked block operations (Task 3 / Effort 9A).
         r.register("block_copy",          "Copy Block",        Some(MenuCategory::Block), |c| { crate::blocks_marked::block_copy(c.editor, c.clock);   CommandResult::Handled });
@@ -565,6 +569,13 @@ impl Registry {
         r.register_stateful("toggle_word_count", "Toggle Word Count", Some(MenuCategory::View),
             |e| MenuMark::OnOff(e.view_opts.word_count),
             |c| { c.editor.view_opts.word_count = !c.editor.view_opts.word_count; CommandResult::Handled });
+        r.register("count_region", "Count Region", Some(MenuCategory::View),
+            |c| crate::commands::prose_ops::count_region(c.editor));
+        r.register("move_sentence_up",   "Move Sentence Up",   Some(MenuCategory::Edit), |c| crate::commands::prose_ops::move_sentence_up(c.editor, c.clock));
+        r.register("move_sentence_down", "Move Sentence Down", Some(MenuCategory::Edit), |c| crate::commands::prose_ops::move_sentence_down(c.editor, c.clock));
+        r.register("break_paragraph_here",    "Break Paragraph Here",    Some(MenuCategory::Edit), |c| crate::commands::prose_ops::break_paragraph_here(c.editor, c.clock));
+        r.register("merge_paragraph_forward", "Merge Paragraph Forward", Some(MenuCategory::Edit), |c| crate::commands::prose_ops::merge_paragraph_forward(c.editor, c.clock));
+        r.register("split_sentence_at_caret", "Split Sentence",          Some(MenuCategory::Edit), |c| crate::commands::prose_ops::split_sentence_at_caret(c.editor, c.clock));
 
         // View menu — section folding (Task 10 / Effort 5g).
         r.register("fold_toggle", "Fold/Unfold Section", Some(MenuCategory::View), |c| {
@@ -977,6 +988,21 @@ pub(crate) fn unfold_ancestors_of(editor: &mut crate::editor::Editor, byte: usiz
             editor.active_mut().folds.remove(hb);
         }
     }
+}
+
+/// After a fold-set change that may have left the caret on a now-hidden line — the block-move / swap
+/// fold-correction paths (S4) — snap the caret OUT of any fold and re-scroll, exactly the guard the
+/// shipped fold commands (Undo/Redo, jump) apply. Assumes the tree is already rebuilt against the
+/// corrected fold set, so `SnapOut`'s `normalize_caret` sees the final folds. Without this a
+/// `block_move`/`swap` of a folded section can leave the head on a hidden line, where typing would
+/// edit invisible text (Fable/Codex must-fix).
+pub(crate) fn snap_caret_out_of_fold(editor: &mut crate::editor::Editor) {
+    let head = editor.active().document.selection.primary().head;
+    let snapped = place_caret_visible(editor, head, CaretPlace::SnapOut);
+    if snapped != head {
+        editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(snapped);
+    }
+    crate::nav::ensure_visible(editor);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

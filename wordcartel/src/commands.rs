@@ -15,6 +15,7 @@ mod edit;
 // `pub(crate)` (not private like `mod edit;`) so `registry.rs` — outside `commands` —
 // can reach the A14 atomic-edit handlers directly (module-structure GATE: a leaf
 // module, no `Command` enum variant, no `commands::run` arm).
+pub(crate) mod prose_ops;
 pub(crate) mod textops;
 
 use crate::derive;
@@ -28,7 +29,7 @@ use wordcartel_core::selection::Selection;
 
 /// Text object scope for selection expansion commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Scope { Word, Sentence, Paragraph, Document }
+pub enum Scope { Word, Sentence, Paragraph, Section, Document }
 
 /// Direction of caret movement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,11 +85,12 @@ pub enum Command {
     DeleteLine,
     /// Delete from the caret to the end of the current logical line, keeping the newline.
     DeleteToLineEnd,
-    /// Select the given text-object scope at the caret (clears sel_history).
+    /// Select the given text-object scope at the caret.
     SelectScope(Scope),
-    /// Grow selection: word → sentence → paragraph → document (pushes to sel_history).
+    /// Grow selection: word → sentence → paragraph → section → document (`LADDER`, stateless).
     ExpandSelection,
-    /// Shrink selection: pop one level from sel_history.
+    /// Shrink selection: the largest canonical scope strictly contained in the current
+    /// selection (`LADDER` reversed, stateless — mirrors `ExpandSelection`).
     ShrinkSelection,
     /// Select the entire buffer contents.
     SelectAll,
@@ -192,6 +194,78 @@ pub fn build_range_replace(
     (cs, edit)
 }
 
+/// The `BlockRole` returned when a caret is not in prose — carried so the command can name the
+/// block kind in its decline message (F3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NonProse(pub wordcartel_core::style::BlockRole);
+
+/// Human name of a non-`Paragraph` block role, for the "no sentence here (…)" message.
+pub fn block_kind_label(role: wordcartel_core::style::BlockRole) -> &'static str {
+    use wordcartel_core::style::BlockRole::*;
+    match role {
+        Paragraph => "paragraph", Heading(_) => "heading", BlockQuote => "block quote",
+        ListItem => "list item", CodeBlock => "code block", ThematicBreak => "rule",
+        FrontMatter => "front matter", Comment => "comment",
+    }
+}
+
+/// The content-anchored prose WINDOW `(ps, pe)` containing byte `h`, or `None` when `h`'s line is
+/// not prose. SEE==SELECT single-source (spec §8, C-11): classify+window at the caret line's first
+/// non-whitespace CONTENT byte (`ventilate::line_content_byte`) — CommonMark strips ≤3-space block
+/// indent, so a `line_start`/raw-`h` window (`nav::paragraph_range_at` at the caret) hits the gap
+/// fallback and DIVERGES from the lens on indented prose. This is THE window every prose-surgery
+/// mutation handler must window through (`move_sentence`, `break_paragraph_here`,
+/// `merge_paragraph_forward`) so none can drift back to a raw-caret window (I-1). `prose_sentence_at`
+/// segments within this exact window, so the sentence bounds and the paragraph window always agree.
+pub fn prose_window_at(editor: &Editor, h: usize) -> Option<(usize, usize)> {
+    let b = editor.active();
+    let buf = &b.document.buffer;
+    let blocks = b.document.blocks();
+    let line = buf.byte_to_line(h.min(buf.len()));
+    let c = crate::ventilate::line_content_byte(buf, line)?;
+    crate::ventilate::prose_block_at(blocks, buf, c)
+}
+
+/// The sentence scope at byte `h`, via the LENS'S OWN classification + window, or `Err(NonProse)`
+/// when `h` is not in prose. SEE==SELECT single-source (spec §8, C-11): the window is
+/// [`prose_window_at`]'s content-anchored `(ps, pe)`, then `sentence_bounds` (segmentation) — the
+/// exact calls the lens renders with. Windowing through the shared helper keeps the sentence bounds
+/// and the paragraph window a mutation handler derives byte-identical.
+pub fn prose_sentence_at(editor: &Editor, h: usize) -> Result<(usize, usize), NonProse> {
+    let b = editor.active();
+    let buf = &b.document.buffer;
+    match prose_window_at(editor, h) {
+        Some((ps, pe)) => {
+            let rel = h.saturating_sub(ps);
+            let (sf, st) = wordcartel_core::textobj::sentence_bounds(&buf.slice(ps..pe), rel);
+            Ok((ps + sf, ps + st))
+        }
+        None => {
+            // Not prose: name the block role for the decline message (F3). Prefer the content byte
+            // (the classification site); fall back to line_start for a content-less line.
+            let blocks = b.document.blocks();
+            let line = buf.byte_to_line(h.min(buf.len()));
+            let at = crate::ventilate::line_content_byte(buf, line)
+                .unwrap_or_else(|| crate::derive::line_start(buf, line));
+            Err(NonProse(blocks.role_at(at)))
+        }
+    }
+}
+
+/// The DEEPEST (smallest) heading subtree `[heading.byte, body.end)` containing `h`, or `None` when
+/// `h` is under no heading. `outline::sections` yields nested ranges; the deepest-containing one is
+/// the innermost enclosing scene (spec §3.1). Cold path: O(headings)+alloc, command/expand-press
+/// triggered — never per-keystroke (C-3).
+pub fn section_range_at(editor: &Editor, h: usize) -> Option<(usize, usize)> {
+    let b = editor.active();
+    let rope = b.document.buffer.snapshot();
+    wordcartel_core::outline::sections(b.document.blocks(), &rope)
+        .into_iter()
+        .filter(|s| s.heading.byte <= h && h < s.body.end)
+        .min_by_key(|s| s.body.end - s.heading.byte)
+        .map(|s| (s.heading.byte, s.body.end))
+}
+
 /// Compute the (from, to) byte range of `scope` at the given byte offset `h`.
 /// Borrows `editor` immutably and returns owned `(usize, usize)`.
 pub fn scope_range_at(editor: &Editor, h: usize, scope: Scope) -> (usize, usize) {
@@ -211,13 +285,9 @@ pub fn scope_range_at(editor: &Editor, h: usize, scope: Scope) -> (usize, usize)
                 }
             } else { (ps + wf, ps + wt) }
         }
-        Scope::Sentence => {
-            let (ps, pe) = nav::paragraph_range_at(blocks, buf, h);
-            let win = buf.slice(ps..pe);
-            let (sf, st) = wordcartel_core::textobj::sentence_bounds(&win, h - ps);
-            (ps + sf, ps + st)
-        }
+        Scope::Sentence => prose_sentence_at(editor, h).unwrap_or((h, h)), // decline → empty → ladder skips
         Scope::Paragraph => nav::paragraph_range_at(blocks, buf, h),
+        Scope::Section => section_range_at(editor, h).unwrap_or((h, h)), // decline → empty → ladder skips
         Scope::Document => (0, buf.len()),
     }
 }
@@ -229,11 +299,20 @@ fn scope_range(editor: &Editor, scope: Scope) -> (usize, usize) {
 }
 
 /// Set the selection to [from, to) and re-derive + ensure visibility.
+///
+/// C-9: head-at-start — `Selection::range(anchor, head)` puts the caret on the 2nd arg, so pass
+/// `(to, from)` → `from()==from`, `to()==to`, `head==from`. The caret lands at the span START (F8),
+/// and expand/shrink evaluate `scope_range_at` from inside the span.
 fn set_selection_range(editor: &mut Editor, from: usize, to: usize) {
-    editor.active_mut().document.selection = Selection::range(from, to);
+    editor.active_mut().document.selection = Selection::range(to, from);
     derive::rebuild(editor);
     nav::ensure_visible(editor);
 }
+
+/// Expand/shrink rungs, finest → coarsest. A data table (spec §3.4) — adding a rung is a table
+/// edit, not dispatcher growth. A declined scope (`Sentence` on non-prose, `Section` with no
+/// enclosing heading) yields an empty range and is skipped by the strict-containment test.
+const LADDER: &[Scope] = &[Scope::Word, Scope::Sentence, Scope::Paragraph, Scope::Section, Scope::Document];
 
 /// Execute `cmd` against `editor`, then re-derive + ensure visibility.
 #[allow(clippy::too_many_lines)] // exhaustive flat Command dispatch — edit arms delegate to
@@ -246,8 +325,6 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         Command::DeleteForward       => edit::delete_forward(editor, clock),
 
         Command::Move { dir, extend } => {
-            // Reset the expand-selection ladder on every motion (Task 7).
-            editor.active_mut().sel_history.clear();
             // DocStart / DocEnd are deliberate long-range jumps: push the ring
             // so the user can alt-left back to where they came from.
             if matches!(dir, Dir::DocStart | Dir::DocEnd) {
@@ -434,43 +511,57 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         Command::DeleteToLineEnd => edit::delete_to_line_end(editor, clock),
 
         Command::SelectScope(scope) => {
-            editor.active_mut().sel_history.clear();
-            let (from, to) = scope_range(editor, scope);
-            set_selection_range(editor, from, to);
-            CommandResult::Handled
+            match scope {
+                Scope::Sentence => match prose_sentence_at(editor, nav::head(editor)) {
+                    Ok((from, to)) => { set_selection_range(editor, from, to); CommandResult::Handled }
+                    Err(NonProse(role)) => {
+                        editor.status = format!("no sentence here ({})", block_kind_label(role));
+                        CommandResult::Noop
+                    }
+                },
+                Scope::Section => match section_range_at(editor, nav::head(editor)) {
+                    Some((from, to)) => { set_selection_range(editor, from, to); CommandResult::Handled }
+                    None => {
+                        editor.status = "no section here".into();
+                        CommandResult::Noop
+                    }
+                },
+                _ => {
+                    let (from, to) = scope_range(editor, scope);
+                    set_selection_range(editor, from, to);
+                    CommandResult::Handled
+                }
+            }
         }
 
         Command::ExpandSelection => {
             let cur = editor.active().document.selection.primary();
             let (cf, ct) = (cur.from(), cur.to());
-            // Find the smallest scope strictly larger than the current selection.
-            let order = [Scope::Word, Scope::Sentence, Scope::Paragraph, Scope::Document];
+            let from = cf; // C-9: evaluate strictly inside the span
             let mut next: Option<(usize, usize)> = None;
-            for sc in order {
-                let (f, t) = scope_range(editor, sc);
+            for sc in LADDER.iter().copied() {
+                let (f, t) = scope_range_at(editor, from, sc);
                 if f <= cf && t >= ct && (f < cf || t > ct) { next = Some((f, t)); break; }
             }
-            if let Some((f, t)) = next {
-                // Clone to a local first — avoids overlapping active()/active_mut() borrow.
-                let cur_sel = editor.active().document.selection.clone();
-                editor.active_mut().sel_history.push(cur_sel);
-                set_selection_range(editor, f, t);
-                CommandResult::Handled
-            } else { CommandResult::Noop }
+            match next {
+                Some((f, t)) => { set_selection_range(editor, f, t); CommandResult::Handled }
+                None => CommandResult::Noop,
+            }
         }
 
         Command::ShrinkSelection => {
-            if let Some(prev) = editor.active_mut().sel_history.pop() {
-                editor.active_mut().document.selection = prev;
-                derive::rebuild(editor);
-                let head = editor.active().document.selection.primary().head;
-                let snapped = place_caret_visible(editor, head, CaretPlace::SnapOut);
-                if snapped != head {
-                    editor.active_mut().document.selection = Selection::single(snapped);
-                }
-                nav::ensure_visible(editor);
-                CommandResult::Handled
-            } else { CommandResult::Noop }
+            let cur = editor.active().document.selection.primary();
+            let (cf, ct) = (cur.from(), cur.to());
+            let from = cf;
+            let mut inner: Option<(usize, usize)> = None;
+            for sc in LADDER.iter().rev().copied() {
+                let (f, t) = scope_range_at(editor, from, sc);
+                if f >= cf && t <= ct && (f > cf || t < ct) && f < t { inner = Some((f, t)); break; }
+            }
+            match inner {
+                Some((f, t)) => { set_selection_range(editor, f, t); CommandResult::Handled }
+                None => CommandResult::Noop,
+            }
         }
 
         Command::SelectAll => {
@@ -478,7 +569,6 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             editor.active_mut().document.selection =
                 wordcartel_core::selection::Selection::range(0, len);
             editor.active_mut().desired_col = None;
-            editor.active_mut().sel_history.clear();
             nav::ensure_visible(editor);
             CommandResult::Handled
         }
@@ -1190,6 +1280,41 @@ mod tests {
         assert_eq!(e.active().document.buffer.slice(r.from()..r.to()).trim(), "Three four.");
     }
 
+    // -------------------------------------------------------------------------
+    // Task 2 (effort-s4-prose-surgery): Scope::Section + head-at-start (C-9)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn select_section_selects_subtree_caret_at_start() {
+        let doc = "# Title\n\nintro para.\n\n## A\n\nbody of a.\n\n### A1\n\ninner.\n";
+        let mut e = Editor::new_from_text(doc, None, (60, 20));
+        derive::rebuild(&mut e);
+        // caret inside "body of a." → deepest containing section is "## A" (its subtree includes A1).
+        let at = doc.find("body of a.").unwrap();
+        let a_start = doc.find("## A").unwrap();
+        let sec = section_range_at(&e, at).expect("a section here");
+        assert_eq!(sec.0, a_start, "section starts at the ## A heading byte");
+        assert_eq!(sec.1, doc.len(), "## A subtree runs to EOF (includes ### A1)");
+        // caret inside "inner." → deepest is "### A1".
+        let inner = doc.find("inner.").unwrap();
+        let a1_start = doc.find("### A1").unwrap();
+        assert_eq!(section_range_at(&e, inner).unwrap().0, a1_start);
+        // select_section (via the direct run() path — no registry needed) sets the selection
+        // head-at-start (C-9).
+        e.active_mut().document.selection = Selection::single(at);
+        assert_eq!(run(Command::SelectScope(Scope::Section), &mut e, &TestClock(0)), CommandResult::Handled);
+        let pr = e.active().document.selection.primary();
+        assert_eq!((pr.from(), pr.to()), (a_start, doc.len()));
+        assert_eq!(pr.head, a_start, "C-9: caret at the section START");
+    }
+
+    #[test]
+    fn select_section_declines_when_no_heading() {
+        let mut e = Editor::new_from_text("just a paragraph, no headings.\n", None, (50, 12));
+        derive::rebuild(&mut e);
+        assert_eq!(run(Command::SelectScope(Scope::Section), &mut e, &TestClock(0)), CommandResult::Noop);
+    }
+
     #[test]
     fn expand_then_shrink_round_trips() {
         let mut e = Editor::new_from_text("One two. Three four.\n", None, (80, 24));
@@ -1205,13 +1330,45 @@ mod tests {
         assert_eq!((w2.from(), w2.to()), (w.from(), w.to()));
     }
 
+    // -------------------------------------------------------------------------
+    // Task 3 (effort-s4-prose-surgery): LADDER data table + stateless shrink
+    // -------------------------------------------------------------------------
+
     #[test]
-    fn a_motion_resets_the_expand_ladder() {
-        let mut e = Editor::new_from_text("One two.\n", None, (80, 24));
-        set_caret(&mut e, 1); derive::rebuild(&mut e);
-        run(Command::ExpandSelection, &mut e, &TestClock(0));
-        run(Command::Move { dir: Dir::Right, extend: false }, &mut e, &TestClock(0)); // resets
-        assert!(e.active().sel_history.is_empty());
+    fn ladder_expands_word_sentence_paragraph_section_document() {
+        let doc = "# H\n\nOne two. Three four.\n";
+        let mut e = Editor::new_from_text(doc, None, (60, 12));
+        derive::rebuild(&mut e);
+        let at = doc.find("two").unwrap();
+        e.active_mut().document.selection = Selection::single(at);
+        run(Command::SelectScope(Scope::Word), &mut e, &TestClock(0));      // "two"
+        run(Command::ExpandSelection, &mut e, &TestClock(0));               // → Sentence "One two."
+        let p = e.active().document.selection.primary();
+        assert_eq!(e.active().document.buffer.slice(p.from()..p.to()), "One two.");
+        run(Command::ExpandSelection, &mut e, &TestClock(0));               // → Paragraph
+        run(Command::ExpandSelection, &mut e, &TestClock(0));               // → Section (# H subtree)
+        let s = e.active().document.selection.primary();
+        assert_eq!(s.from(), doc.find("# H").unwrap());
+        run(Command::ExpandSelection, &mut e, &TestClock(0));               // → Document
+        let d = e.active().document.selection.primary();
+        assert_eq!((d.from(), d.to()), (0, doc.len()));
+    }
+
+    #[test]
+    fn stateless_shrink_returns_first_sentence_and_survives_undo() {
+        let doc = "One two. Three four.\n";
+        let mut e = Editor::new_from_text(doc, None, (40, 12));
+        derive::rebuild(&mut e);
+        e.active_mut().document.selection = Selection::single(2);
+        run(Command::SelectScope(Scope::Paragraph), &mut e, &TestClock(0));
+        run(Command::ShrinkSelection, &mut e, &TestClock(0)); // paragraph → FIRST sentence (from())
+        let p = e.active().document.selection.primary();
+        assert_eq!(e.active().document.buffer.slice(p.from()..p.to()), "One two.");
+        // Hazard-4: expand → edit → shrink must not panic and must yield a canonical rung.
+        run(Command::SelectScope(Scope::Paragraph), &mut e, &TestClock(0));
+        run(Command::InsertChar('!'), &mut e, &TestClock(1));
+        e.undo();
+        run(Command::ShrinkSelection, &mut e, &TestClock(2)); // no panic, no stale state
     }
 
     #[test]
@@ -1241,6 +1398,31 @@ mod tests {
         derive::rebuild(&mut e);
         // offset 7 is inside "beta" (6..10)
         assert_eq!(super::scope_range_at(&e, 7, Scope::Word), (6, 10));
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 1 (effort-s4-prose-surgery): SEE==SELECT prose_sentence_at
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn prose_sentence_at_declines_non_prose_and_resolves_prose() {
+        // Prose: caret in a paragraph resolves the sentence.
+        let mut e = Editor::new_from_text("One two. Three four.\n", None, (40, 12));
+        derive::rebuild(&mut e);
+        assert_eq!(prose_sentence_at(&e, 2), Ok((0, 8))); // "One two."
+        // Heading: declines (Heading role).
+        let mut h = Editor::new_from_text("# Title\n\nbody text.\n", None, (40, 12));
+        derive::rebuild(&mut h);
+        assert!(matches!(prose_sentence_at(&h, 2), Err(NonProse(_))));
+        // The paragraph after the heading still resolves.
+        let body = "# Title\n\nbody text.\n".find("body").unwrap();
+        assert!(prose_sentence_at(&h, body).is_ok());
+        // Indented prose (CommonMark strips ≤3-space indent): content-byte classification, NOT decline.
+        let mut ind = Editor::new_from_text("  Indented one. Indented two.\n", None, (40, 12));
+        derive::rebuild(&mut ind);
+        // Range is content-anchored at byte 2 ("Indented one." = 2..15), NOT line-start 0 —
+        // a regression to line-start classification would shift ps and fail this assertion.
+        assert_eq!(prose_sentence_at(&ind, 5), Ok((2, 15)));
     }
 
     // -------------------------------------------------------------------------
@@ -1285,25 +1467,10 @@ mod tests {
         assert!(!fv.is_hidden(ed.active().document.buffer.byte_to_line(head)));
     }
 
-    #[test]
-    fn shrink_selection_snaps_restored_caret_out_of_fold() {
-        let doc = "## A\nbody1\nbody2\n## B\n";
-        let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 24));
-        crate::derive::rebuild(&mut ed);
-        let a = doc.find("## A").unwrap();
-        let inside = doc.find("body2").unwrap();
-        ed.active_mut().sel_history.push(wordcartel_core::selection::Selection::single(inside));
-        ed.active_mut().folds.toggle(a);
-        crate::derive::rebuild(&mut ed);
-        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(a);
-
-        run(Command::ShrinkSelection, &mut ed, &TestClock(0));
-
-        let head = ed.active().document.selection.primary().head;
-        let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, b.document.blocks(), &b.document.buffer) };
-        assert_eq!(head, a);
-        assert!(!fv.is_hidden(ed.active().document.buffer.byte_to_line(head)));
-    }
+    // NOTE (S4 T3): `shrink_selection_snaps_restored_caret_out_of_fold` deleted — it exercised the
+    // push/pop `sel_history` restore + `SnapOut` mechanism, which no longer exists. Stateless
+    // `ShrinkSelection` now mirrors `ExpandSelection` exactly (`set_selection_range`, no snap-out);
+    // this is the same fold-adjacency behavior `ExpandSelection` already had pre-T3 (ratified).
 
     // -------------------------------------------------------------------------
     // Task 2 (Effort 8): Select All command
@@ -1318,7 +1485,6 @@ mod tests {
         assert_eq!((sel.from(), sel.to()), (0, len));
         assert_eq!(sel.head, len, "forward selection: caret (head) lands at end");
         assert!(e.active().desired_col.is_none());
-        assert!(e.active().sel_history.is_empty(), "expand-selection ladder reset on select-all");
     }
 
     #[test]

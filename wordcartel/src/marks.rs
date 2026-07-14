@@ -28,7 +28,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
     crate::app::Handled::Pass(msg)
 }
 
-pub fn set_mark(editor: &mut Editor)  { editor.active_mut().sel_history.clear(); editor.pending_mark = Some(MarkPending::Set); editor.status = "set mark:".into(); }
+pub fn set_mark(editor: &mut Editor)  { editor.pending_mark = Some(MarkPending::Set); editor.status = "set mark:".into(); }
 pub fn jump_to_mark(editor: &mut Editor) { editor.pending_mark = Some(MarkPending::Jump); editor.status = "jump to mark:".into(); }
 
 /// Push `pre` onto the ring as a deliberate jump origin.
@@ -44,7 +44,6 @@ pub fn record_jump(buf: &mut Buffer, pre: usize) {
 }
 
 pub fn jump_back(editor: &mut Editor) {
-    editor.active_mut().sel_history.clear();
     let here = nav::head(editor);
     let raw: Option<usize> = {
         let buf = editor.active_mut();
@@ -74,7 +73,6 @@ pub fn jump_back(editor: &mut Editor) {
 }
 
 pub fn jump_forward(editor: &mut Editor) {
-    editor.active_mut().sel_history.clear();
     let raw: Option<usize> = {
         let buf = editor.active_mut();
         if buf.ring_cursor + 1 >= buf.jump_ring.len() {
@@ -93,10 +91,7 @@ pub fn jump_forward(editor: &mut Editor) {
 }
 
 /// Store a mark at the caret under `ch` (no status — caller sets wording).
-/// Clears `sel_history` to match the interactive `set_mark` path (marks.rs:8) so a
-/// numbered-bookmark set resets the expand-selection ladder identically (Codex).
 pub fn set_char_mark(editor: &mut Editor, ch: char) {
-    editor.active_mut().sel_history.clear();
     let at = nav::head(editor);
     editor.active_mut().marks.insert(ch, at);
 }
@@ -104,7 +99,6 @@ pub fn set_char_mark(editor: &mut Editor, ch: char) {
 /// Jump to mark `ch` if set (fold-aware, records jump-back). Returns whether it existed.
 /// No status — caller sets wording.
 pub fn jump_char_mark(editor: &mut Editor, ch: char) -> bool {
-    editor.active_mut().sel_history.clear();
     let raw = editor.active().marks.get(&ch).copied();
     let Some(raw) = raw else { return false; };
     let pre = nav::head(editor);

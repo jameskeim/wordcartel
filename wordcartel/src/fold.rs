@@ -296,6 +296,32 @@ pub fn hidden_count_lines(
     last.saturating_sub(first)
 }
 
+/// The corrected fold-anchor set after a region relocation (spec §7.3, C-7/C-12). `regions` are
+/// `(from, to, dest)` per relocated span. A folded anchor INSIDE a region moves by geometry to
+/// `dest + (anchor - from)`; a stationary anchor is remapped through the edit with **After bias
+/// (`change::map_pos`)** — a relocated block inserted AT a stationary heading's byte must push that
+/// heading PAST the inserted block, not leave it stranded at the block's start. (Before-bias
+/// `map_pos_before` — what `Buffer::apply` uses for ordinary typing at a heading — returns the
+/// stationary anchor UNCHANGED for an insert exactly at it (change.rs, `pos == old && !prev_was_
+/// delete`), so a stationary heading at the destination caret would clobber the moved heading's
+/// destination fold or fold the wrong heading. This helper OVERRIDES apply's remap via
+/// `replace_folded`, so using After bias here is correct and intentional.) Computed as ONE set so
+/// there is no per-region interleaving that could self-clobber a shared collapse/destination byte.
+pub fn corrected_after_move(
+    folds: &FoldState,
+    regions: &[(usize, usize, usize)],
+    cs: &wordcartel_core::change::ChangeSet,
+) -> std::collections::BTreeSet<usize> {
+    let mut out = std::collections::BTreeSet::new();
+    for &a in folds.folded() {
+        match regions.iter().find(|(from, to, _)| a >= *from && a < *to) {
+            Some(&(from, _to, dest)) => { out.insert(dest + (a - from)); }
+            None => { out.insert(wordcartel_core::change::map_pos(a, cs)); }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,5 +531,40 @@ mod tests {
         assert!(!fv.is_hidden(0));      // "## A" visible
         assert!(fv.is_hidden(1));       // "body" hidden (the EOF-safe end-line fix)
         assert_eq!(hidden_count_lines(&blocks, &buf, 0), 1);
+    }
+
+    // — T8: fold survival across move/swap (corrected_after_move, C-7/C-12/C-13) —
+
+    #[test]
+    fn corrected_after_move_relocates_moved_and_remaps_stationary() {
+        use wordcartel_core::change::{ChangeSet, Op, Tendril};
+        // Pre-edit folds at 0 (moved region [0,4)→dest 10) and 20 (stationary).
+        let mut fs = FoldState::default();
+        fs.toggle(0); fs.toggle(20);
+        // Insert 2 bytes before the stationary anchor 20 (at 18) → After-bias map_pos shifts it to 22.
+        let cs = ChangeSet::from_ops(vec![Op::Retain(18), Op::Insert(Tendril::from("XY")), Op::Retain(12)], 30);
+        let corrected = corrected_after_move(&fs, &[(0, 4, 10)], &cs);
+        assert!(corrected.contains(&10), "moved anchor → dest+rel (geometry)");
+        assert!(corrected.contains(&22), "stationary anchor → map_pos (After bias)");
+        assert!(!corrected.contains(&0));
+    }
+
+    #[test]
+    fn corrected_after_move_stationary_at_destination_caret_advances_past_block() {
+        use wordcartel_core::change::{ChangeSet, Op, Tendril};
+        // Critical-2 case: block [20,24) moved to caret=10 (caret < b.start). A STATIONARY folded
+        // heading sits EXACTLY at 10 (the destination). It must advance to 14 (past the inserted block),
+        // NOT stay at 10 where the moved heading lands — else the two folds collide.
+        let mut fs = FoldState::default();
+        fs.toggle(20); fs.toggle(10);
+        // build_multi_replace([(10,10,"ABCD"),(20,24,"")]) shape: Retain(10) Insert(4) Retain(10) Delete(4) Retain(2).
+        let cs = ChangeSet::from_ops(
+            vec![Op::Retain(10), Op::Insert(Tendril::from("ABCD")), Op::Retain(10),
+                 Op::Delete(4), Op::Retain(2)], 26);
+        let corrected = corrected_after_move(&fs, &[(20, 24, 10)], &cs);
+        assert!(corrected.contains(&10), "moved heading → dest 10 (geometry)");
+        assert!(corrected.contains(&14), "stationary heading at caret 10 → 14 (past the inserted block, After bias)");
+        assert!(!corrected.contains(&20));
+        assert_eq!(corrected.len(), 2, "two distinct folds — no collision (map_pos_before would give both at 10)");
     }
 }

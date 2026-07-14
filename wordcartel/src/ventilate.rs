@@ -335,7 +335,7 @@ pub fn layout_block(raw: &str, ps: usize, vp_width: usize, render: LineRender, h
 /// hits the block itself — I2, §5.2). A line with no content byte is never ventilated: that single
 /// fact is the blank/phantom guard behind C1/C2/I1 — a blank or phantom line becomes an honest
 /// 1-row per-line entry, never a zero-row prose entry.
-fn line_content_byte(buf: &TextBuffer, l: usize) -> Option<usize> {
+pub(crate) fn line_content_byte(buf: &TextBuffer, l: usize) -> Option<usize> {
     let ls = crate::derive::line_start(buf, l);
     let text = crate::derive::line_text(buf, l);
     text.find(|c: char| !c.is_whitespace()).map(|off| ls + off)
@@ -788,12 +788,19 @@ mod tests {
         assert_eq!(vb.last_line, 0, "the paragraph window ends at line 0, phantom excluded");
         let (rows, _map) = &e.active().view.line_layouts[&0];
         assert!(!rows.is_empty(), "the paragraph anchor is a real ≥1-row entry");
-        // RESIDUAL (documented, out of scope here): a caret AT buf.len() still reports `caret_line`
-        // == 0 via that helper's shared `h.min(len - 1)` clamp, so `screen_pos` places the EOF caret
-        // on the paragraph's last row rather than the phantom's own row below it. That clamp is
-        // PRE-EXISTING and fires IDENTICALLY with the lens OFF (verified: off-lens `screen_pos` at
-        // EOF is also glued to line 0), so it is NOT a ventilate regression and changing it would
-        // break the no-op-when-off invariant. Left to a separate shared-path fix.
+        let para_rows = rows.len();
+        // B10 (fixed S4 T9): a caret AT buf.len() now reports `caret_line` == the phantom line —
+        // the shared `nav::caret_line` clamp (`h.min(len - 1)`) that used to glue an EOF caret onto
+        // the last content line's row was removed, so `screen_pos` places the EOF caret on the
+        // phantom's OWN row (directly below the paragraph's rows), not on the paragraph's last row.
+        // Fires identically with the lens OFF (shared path) — see `nav::tests::
+        // caret_line_at_eof_maps_to_phantom_line_not_last_content` for the off-lens pin.
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(buf.len());
+        assert_eq!(crate::nav::caret_line(&e), phantom,
+            "EOF caret maps to the phantom line, not glued to the paragraph (B10)");
+        let (_col, row) = crate::nav::screen_pos(&e).expect("phantom row is on screen");
+        assert_eq!(row as usize, para_rows,
+            "EOF caret sits on the phantom's OWN row, directly below the paragraph's rows (B10)");
     }
 
     // -----------------------------------------------------------------------
