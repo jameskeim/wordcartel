@@ -1308,7 +1308,9 @@ mod tests {
         // Indented prose (CommonMark strips ≤3-space indent): content-byte classification, NOT decline.
         let mut ind = Editor::new_from_text("  Indented one. Indented two.\n", None, (40, 12));
         derive::rebuild(&mut ind);
-        assert!(prose_sentence_at(&ind, 5).is_ok(), "indented prose classifies via content byte");
+        // Range is content-anchored at byte 2 ("Indented one." = 2..15), NOT line-start 0 —
+        // a regression to line-start classification would shift ps and fail this assertion.
+        assert_eq!(prose_sentence_at(&ind, 5), Ok((2, 15)));
     }
 
     // -------------------------------------------------------------------------
