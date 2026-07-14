@@ -49,7 +49,16 @@ pub fn block_move(editor: &mut Editor, clock: &dyn Clock) {
         (vec![(b.start, b.end, String::new()), (caret, caret, text.clone())], caret - (b.end - b.start) + text.len())
     };
     let (cs, edit) = crate::commands::build_multi_replace(&edits, doc_len);
-    apply_edit(editor, cs, edit, new_caret, clock);
+    // dest of the moved block's start in FINAL coords: caret (moved before) or caret-len (moved after).
+    let dest = if caret < b.start { caret } else { caret - (b.end - b.start) };
+    let corrected = if !editor.active().folds.is_empty() {
+        Some(crate::fold::corrected_after_move(&editor.active().folds, &[(b.start, b.end, dest)], &cs))
+    } else { None };
+    apply_edit(editor, cs, edit, new_caret, clock); // apply + rebuild #1 (settle)
+    if let Some(c) = corrected {
+        editor.active_mut().folds.replace_folded(c);
+        crate::derive::rebuild(editor);             // rebuild #2 (relayout + reconcile)
+    }
     editor.active_mut().marked_block = None; // consumed
     editor.status = "block moved".into();
 }
@@ -244,6 +253,29 @@ mod tests {
         e.undo();
         assert_eq!(e.active().document.buffer.to_string(), "AAA BBB\n", "one undo step restores");
         let _ = before;
+    }
+
+    /// T8 (C-7): a FOLDED section moved via block_move stays folded at its DESTINATION byte, and the
+    /// vacated original byte is NOT folded. Asserts the SPECIFIC relocated heading byte — a stale fold
+    /// at the wrong heading would pass a bare `len == 1` (plan-gate finding 6). The stationary-heading-
+    /// at-destination arithmetic is proven by `corrected_after_move_stationary_at_destination_caret_
+    /// advances_past_block` in fold.rs.
+    #[test]
+    fn block_move_keeps_a_folded_section_folded_at_its_new_byte() {
+        let doc = "intro para.\n\n## A\n\nbody a.\n";
+        let mut e = Editor::new_from_text(doc, None, (60, 20));
+        crate::derive::rebuild(&mut e);
+        let a = doc.find("## A").unwrap(); // 13
+        e.active_mut().folds.toggle(a);
+        let (b_from, b_to) = crate::commands::section_range_at(&e, a + 1).unwrap();
+        e.active_mut().marked_block = Some(MarkedBlock { start: b_from, end: b_to, hidden: false });
+        // caret BEFORE the block → dest = caret = 0.
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(0);
+        crate::blocks_marked::block_move(&mut e, &TestClock(0));
+        let folded = e.active().folds.folded();
+        assert!(folded.contains(&0), "A's heading is folded at its NEW byte 0: {folded:?}");
+        assert!(!folded.contains(&a), "the fold did NOT stay at the vacated original byte {a}");
+        assert_eq!(folded.len(), 1, "exactly one fold — no double, no drop");
     }
 
     #[test]

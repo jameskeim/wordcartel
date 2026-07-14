@@ -141,10 +141,24 @@ pub(crate) fn swap(editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
         (r1_from, l2)           // selection was R2 → its text lands at R1 slot
     };
     let moved_to = moved_from + moved_len;
-    let txn = Transaction::new(cs).with_selection(Selection::range(moved_to, moved_from));
-    editor.apply(txn, edit, EditKind::Other, clock);
+    // T8 (C-7/C-12/C-13) — fold survival. Compute the corrected fold set from the PRE-edit folds +
+    // `cs` BEFORE `Transaction::new(cs)` moves `cs`. Both region-contents relocate: R1's content →
+    // the R2 slot (shifted by the len delta), R2's content → the R1 slot.
+    let regions = [
+        (r1_from, r1_to, r2_from + l2 - l1), // R1's content → R2 slot (shifted by len delta)
+        (r2_from, r2_to, r1_from),           // R2's content → R1 slot
+    ];
+    let corrected = if !editor.active().folds.is_empty() {
+        Some(crate::fold::corrected_after_move(&editor.active().folds, &regions, &cs))
+    } else { None };
+    let txn = Transaction::new(cs).with_selection(Selection::range(moved_to, moved_from)); // moves cs
+    editor.apply(txn, edit, EditKind::Other, clock); // Buffer::apply only — NO rebuild
     editor.active_mut().marked_block = None;
-    let r = super::edit::settle_after_edit(editor);
+    if let Some(c) = corrected {
+        crate::derive::rebuild(editor);              // REBUILD #1 — settle the tree (heading_starts valid)
+        editor.active_mut().folds.replace_folded(c); // override apply's remap with the corrected set
+    }
+    let r = super::edit::settle_after_edit(editor);  // REBUILD #2 — relayout + reconcile the corrected folds
     editor.status = "swapped".into();
     r
 }
@@ -468,6 +482,59 @@ mod tests {
         assert_eq!(e.active().document.buffer.to_string(), "BBBB....AAAA\n");
         e.undo();
         assert_eq!(e.active().document.buffer.to_string(), "AAAA....BBBB\n");
+    }
+
+    /// T8 (C-7/C-12/C-13): a FOLDED section swapped with another stays folded at its NEW byte, and
+    /// the fold does NOT stick on the section now sitting at the vacated position. Asserts the
+    /// SPECIFIC relocated heading byte — a stale fold at the wrong heading would pass a bare
+    /// `len == 1` (plan-gate finding 6).
+    #[test]
+    fn swap_keeps_a_folded_section_folded_at_its_new_byte() {
+        // A=[0,b) B=[b,len). Fold A; select A; mark B; swap → buffer is B_text ++ A_text, so A's heading
+        // relocates to `len - (b - 0)` = len - b (l1 = b, A lands at r1_from + l2 = 0 + (len - b)).
+        let doc = "## A\n\nbody a.\n\n## B\n\nbody b.\n";
+        let mut e = Editor::new_from_text(doc, None, (60, 20));
+        crate::derive::rebuild(&mut e);
+        let a = doc.find("## A").unwrap(); // 0
+        let b = doc.find("## B").unwrap();
+        let len = doc.len();
+        e.active_mut().folds.toggle(a);
+        let (a_from, a_to) = crate::commands::section_range_at(&e, a + 1).unwrap();
+        let (b_from, b_to) = crate::commands::section_range_at(&e, b + 1).unwrap();
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::range(a_from, a_to);
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: b_from, end: b_to, hidden: false });
+        assert_eq!(swap(&mut e, &TestClock(0)), CommandResult::Handled);
+        let a_new = len - b; // A's heading destination (byte-length-preserving swap)
+        let folded = e.active().folds.folded();
+        assert!(folded.contains(&a_new), "A's heading is folded at its NEW byte {a_new}: {folded:?}");
+        assert!(!folded.contains(&0), "the fold did NOT stay on B's heading (now at 0)");
+        assert_eq!(folded.len(), 1, "exactly one fold — no double, no drop");
+    }
+
+    /// T8 (C-7/C-12): swapping TWO folded sections yields TWO distinct folds at the correct new
+    /// bytes — the wholesale `replace_folded` (one set from the pre-edit folds) cannot self-clobber.
+    /// Here A's stale-collapse byte (0, its original) EQUALS B's destination byte (0) — a per-region
+    /// remove/toggle loop would flip that shared byte and either drop a fold or fold the wrong heading.
+    #[test]
+    fn swap_two_folded_sections_yields_two_distinct_folds_no_self_clobber() {
+        let doc = "## A\n\nbody a.\n\n## B\n\nbody b.\n";
+        let mut e = Editor::new_from_text(doc, None, (60, 20));
+        crate::derive::rebuild(&mut e);
+        let a = doc.find("## A").unwrap(); // 0
+        let b = doc.find("## B").unwrap();
+        let len = doc.len();
+        e.active_mut().folds.toggle(a); // fold BOTH sections
+        e.active_mut().folds.toggle(b);
+        let (a_from, a_to) = crate::commands::section_range_at(&e, a + 1).unwrap();
+        let (b_from, b_to) = crate::commands::section_range_at(&e, b + 1).unwrap();
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::range(a_from, a_to);
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: b_from, end: b_to, hidden: false });
+        assert_eq!(swap(&mut e, &TestClock(0)), CommandResult::Handled);
+        let a_new = len - b; // A relocates to len - b
+        let folded = e.active().folds.folded();
+        assert!(folded.contains(&a_new), "A stays folded at its NEW byte {a_new}: {folded:?}");
+        assert!(folded.contains(&0), "B stays folded at its NEW byte 0 (B's content moved to the R1 slot): {folded:?}");
+        assert_eq!(folded.len(), 2, "exactly two distinct folds — no self-clobber, no double, no drop");
     }
 
     // ------------------------------------------------------------------
