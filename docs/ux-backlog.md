@@ -900,3 +900,39 @@ re-verify the lens's no-op-when-off invariant and add a table fixture to the ven
 priority (cosmetic: a ventilated table is ugly but non-destructive; toggle off → byte-identical).
 Grounding anchors: `ventilate::prose_block_at`, `kind_to_role` + `BlockRole` (`style.rs`),
 `BlockKind::Table` (`block_tree.rs`).
+
+### B15 — Shrink into a folded region leaves the caret on a hidden line (no SnapOut)
+<!-- item: B15 -->
+
+**Origin (2026-07-14):** deferred Minor from the S4 whole-branch final gate (Fable ruled GO-compatible,
+not a merge blocker). S4's F4-A stateless `ShrinkSelection` deleted the old pop-based
+`place_caret_visible(SnapOut)` along with `sel_history`. Fable's probe confirmed: when the current
+selection's `from()` is **already inside a folded body** (selection made before folding, or extended
+into a fold), a shrink can leave the caret on a `FoldView::is_hidden` line — typing would edit invisible
+text. Esoteric precondition (every natural ladder path evaluates at a canonical rung's `from()` and lands
+on visible bytes; symmetric with `ExpandSelection`, which never snapped).
+
+**Fix direction:** apply the SAME guard the S4 I-2 fix added to `block_move`/`swap` —
+`registry::snap_caret_out_of_fold` (`place_caret_visible(.., CaretPlace::SnapOut)`) — AFTER
+`ShrinkSelection` re-derives, so the caret snaps out of any fold. **Must stay stateless** — do NOT
+re-introduce `sel_history` (that would undo F4-A). Low priority. Related: S4 T3 (F4-A stateless shrink),
+the S4 I-2 block_move/swap snap guard. Anchors: `commands.rs::ShrinkSelection`,
+`registry::snap_caret_out_of_fold`, `fold::normalize_caret`.
+
+### B16 — Scope::Sentence highlight window drifts from content-anchored select on indented prose
+<!-- item: B16 -->
+
+**Origin (2026-07-14):** found by the S4 whole-branch Fable review — but **PRE-EXISTING** (present at
+the S4 merge base `ef03888`, NOT introduced by S4). S4 made `select_sentence` + the mutations
+content-anchored (via `commands::prose_window_at` → `ventilate::line_content_byte`), so SELECT now agrees
+with the S6 lens on indented prose. But the **active-sentence HIGHLIGHT paint** (`render.rs` ~505-508,
+the `Scope::Sentence` render path) still derives its window from the **raw** `nav::paragraph_range_at(head)`.
+So with the caret in a ≤3-space CommonMark indent, the *painted* active-sentence region diverges from what
+`select_sentence` actually selects — a SEE==SELECT violation on the PAINT side that S4 left standing
+(outside its blast radius).
+
+**Fix direction:** route the highlight window through the same content-byte anchor the select/mutation
+path uses (`prose_window_at` / `line_content_byte`) so the painted region matches the selection. Small,
+localized to the `Scope::Sentence` paint arm. Related: S4 (content-anchored select), C-11
+(content-byte classification). Anchors: `render.rs` `Scope::Sentence` highlight (~:505),
+`commands::prose_window_at`, `nav::paragraph_range_at`.
