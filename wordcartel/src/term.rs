@@ -49,6 +49,7 @@ impl TerminalGuard {
             Ok(t) => t,
             Err(e) => {
                 let _ = disable_raw_mode();
+                crate::cursor_style::restore::restore_caret_if_written(&mut io::stdout());
                 let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen, Show);
                 return Err(e);
             }
@@ -65,6 +66,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+        crate::cursor_style::restore::restore_caret_if_written(&mut io::stdout());
         let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen, Show);
     }
 }
@@ -113,6 +115,7 @@ pub fn install_panic_hook() {
             crate::recovery::dump_on_panic();
             // Restore the terminal.
             let _ = disable_raw_mode();
+            crate::cursor_style::restore::restore_caret_if_written(&mut io::stdout());
             let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen, Show);
             prev(info);
         }));

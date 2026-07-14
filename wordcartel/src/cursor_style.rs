@@ -62,12 +62,18 @@ pub fn reconcile_cursor_style<W: std::io::Write>(
 /// from the `'static` panic hook (which has no `&Editor`), so it is a module static, not an
 /// Editor field. (`restore_caret_if_written` is added in Task 5.)
 pub mod restore {
+    use crossterm::cursor::SetCursorStyle;
     use std::sync::atomic::{AtomicBool, Ordering};
     static EVER_WROTE: AtomicBool = AtomicBool::new(false);
     /// Called by the reconcile each time it successfully writes a concrete style.
     pub fn mark_written() { EVER_WROTE.store(true, Ordering::Relaxed); }
     /// True iff the reconcile ever emitted a DECSCUSR style this process.
     pub fn ever_wrote() -> bool { EVER_WROTE.load(Ordering::Relaxed) }
+
+    /// Emit DefaultUserShape iff we ever wrote — used by the three managed term.rs restore sites.
+    pub fn restore_caret_if_written<W: std::io::Write>(backend: &mut W) {
+        if ever_wrote() { let _ = crossterm::execute!(backend, SetCursorStyle::DefaultUserShape); }
+    }
 }
 
 #[cfg(test)]
@@ -149,5 +155,22 @@ mod tests {
         // so assert only the monotonic (false→true) transition, never that it is false at start.
         restore::mark_written();
         assert!(restore::ever_wrote(), "mark_written latches ever_wrote true");
+    }
+
+    #[test]
+    fn restore_caret_if_written_gated_by_latch() {
+        // Process-global latch: assert only the two directions we can force deterministically.
+        // never-written direction is only assertable if nothing else in the binary latched it;
+        // guard on ever_wrote() so the test is order-independent.
+        let mut buf: Vec<u8> = Vec::new();
+        if !restore::ever_wrote() {
+            restore::restore_caret_if_written(&mut buf);
+            assert!(buf.is_empty(), "never wrote → restore emits nothing");
+        }
+        restore::mark_written();
+        assert!(restore::ever_wrote());
+        let mut buf2: Vec<u8> = Vec::new();
+        restore::restore_caret_if_written(&mut buf2);
+        assert!(!buf2.is_empty(), "after mark_written → restore emits DefaultUserShape");
     }
 }
