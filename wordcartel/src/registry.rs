@@ -337,6 +337,7 @@ impl Registry {
         r.register("select_word",      "Select Word",      None, |c| run(c, Command::SelectScope(Scope::Word)));
         r.register("select_sentence",  "Select Sentence",  None, |c| run(c, Command::SelectScope(Scope::Sentence)));
         r.register("select_paragraph", "Select Paragraph", None, |c| run(c, Command::SelectScope(Scope::Paragraph)));
+        r.register("select_section",   "Select Section",   None, |c| run(c, Command::SelectScope(Scope::Section)));
         r.register("expand_selection", "Expand Selection", None, |c| run(c, Command::ExpandSelection));
         r.register("shrink_selection", "Shrink Selection", None, |c| run(c, Command::ShrinkSelection));
 

@@ -28,7 +28,7 @@ use wordcartel_core::selection::Selection;
 
 /// Text object scope for selection expansion commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Scope { Word, Sentence, Paragraph, Document }
+pub enum Scope { Word, Sentence, Paragraph, Section, Document }
 
 /// Direction of caret movement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,6 +231,20 @@ pub fn prose_sentence_at(editor: &Editor, h: usize) -> Result<(usize, usize), No
     }
 }
 
+/// The DEEPEST (smallest) heading subtree `[heading.byte, body.end)` containing `h`, or `None` when
+/// `h` is under no heading. `outline::sections` yields nested ranges; the deepest-containing one is
+/// the innermost enclosing scene (spec §3.1). Cold path: O(headings)+alloc, command/expand-press
+/// triggered — never per-keystroke (C-3).
+pub fn section_range_at(editor: &Editor, h: usize) -> Option<(usize, usize)> {
+    let b = editor.active();
+    let rope = b.document.buffer.snapshot();
+    wordcartel_core::outline::sections(b.document.blocks(), &rope)
+        .into_iter()
+        .filter(|s| s.heading.byte <= h && h < s.body.end)
+        .min_by_key(|s| s.body.end - s.heading.byte)
+        .map(|s| (s.heading.byte, s.body.end))
+}
+
 /// Compute the (from, to) byte range of `scope` at the given byte offset `h`.
 /// Borrows `editor` immutably and returns owned `(usize, usize)`.
 pub fn scope_range_at(editor: &Editor, h: usize, scope: Scope) -> (usize, usize) {
@@ -252,6 +266,7 @@ pub fn scope_range_at(editor: &Editor, h: usize, scope: Scope) -> (usize, usize)
         }
         Scope::Sentence => prose_sentence_at(editor, h).unwrap_or((h, h)), // decline → empty → ladder skips
         Scope::Paragraph => nav::paragraph_range_at(blocks, buf, h),
+        Scope::Section => section_range_at(editor, h).unwrap_or((h, h)), // decline → empty → ladder skips
         Scope::Document => (0, buf.len()),
     }
 }
@@ -263,8 +278,12 @@ fn scope_range(editor: &Editor, scope: Scope) -> (usize, usize) {
 }
 
 /// Set the selection to [from, to) and re-derive + ensure visibility.
+///
+/// C-9: head-at-start — `Selection::range(anchor, head)` puts the caret on the 2nd arg, so pass
+/// `(to, from)` → `from()==from`, `to()==to`, `head==from`. The caret lands at the span START (F8),
+/// and expand/shrink evaluate `scope_range_at` from inside the span.
 fn set_selection_range(editor: &mut Editor, from: usize, to: usize) {
-    editor.active_mut().document.selection = Selection::range(from, to);
+    editor.active_mut().document.selection = Selection::range(to, from);
     derive::rebuild(editor);
     nav::ensure_visible(editor);
 }
@@ -474,6 +493,13 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                     Ok((from, to)) => { set_selection_range(editor, from, to); CommandResult::Handled }
                     Err(NonProse(role)) => {
                         editor.status = format!("no sentence here ({})", block_kind_label(role));
+                        CommandResult::Noop
+                    }
+                },
+                Scope::Section => match section_range_at(editor, nav::head(editor)) {
+                    Some((from, to)) => { set_selection_range(editor, from, to); CommandResult::Handled }
+                    None => {
+                        editor.status = "no section here".into();
                         CommandResult::Noop
                     }
                 },
@@ -1233,6 +1259,41 @@ mod tests {
         run(Command::SelectScope(Scope::Paragraph), &mut e, &TestClock(0));
         let r = e.active().document.selection.primary();
         assert_eq!(e.active().document.buffer.slice(r.from()..r.to()).trim(), "Three four.");
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 2 (effort-s4-prose-surgery): Scope::Section + head-at-start (C-9)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn select_section_selects_subtree_caret_at_start() {
+        let doc = "# Title\n\nintro para.\n\n## A\n\nbody of a.\n\n### A1\n\ninner.\n";
+        let mut e = Editor::new_from_text(doc, None, (60, 20));
+        derive::rebuild(&mut e);
+        // caret inside "body of a." → deepest containing section is "## A" (its subtree includes A1).
+        let at = doc.find("body of a.").unwrap();
+        let a_start = doc.find("## A").unwrap();
+        let sec = section_range_at(&e, at).expect("a section here");
+        assert_eq!(sec.0, a_start, "section starts at the ## A heading byte");
+        assert_eq!(sec.1, doc.len(), "## A subtree runs to EOF (includes ### A1)");
+        // caret inside "inner." → deepest is "### A1".
+        let inner = doc.find("inner.").unwrap();
+        let a1_start = doc.find("### A1").unwrap();
+        assert_eq!(section_range_at(&e, inner).unwrap().0, a1_start);
+        // select_section (via the direct run() path — no registry needed) sets the selection
+        // head-at-start (C-9).
+        e.active_mut().document.selection = Selection::single(at);
+        assert_eq!(run(Command::SelectScope(Scope::Section), &mut e, &TestClock(0)), CommandResult::Handled);
+        let pr = e.active().document.selection.primary();
+        assert_eq!((pr.from(), pr.to()), (a_start, doc.len()));
+        assert_eq!(pr.head, a_start, "C-9: caret at the section START");
+    }
+
+    #[test]
+    fn select_section_declines_when_no_heading() {
+        let mut e = Editor::new_from_text("just a paragraph, no headings.\n", None, (50, 12));
+        derive::rebuild(&mut e);
+        assert_eq!(run(Command::SelectScope(Scope::Section), &mut e, &TestClock(0)), CommandResult::Noop);
     }
 
     #[test]
