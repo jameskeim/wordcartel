@@ -3,7 +3,7 @@
 
 # Backlog
 
-**33 open · 54 shipped · 2 dropped**
+**34 open · 54 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -44,6 +44,7 @@ Blocking Effort P: **0**
 | PA | Analysis / policy plugins | watch | research | TBD |  | Post-P candidates: writing goals/streaks, readability lens, CMS publish, backlinks. NOTE (triage 2026-07-13): the readability-lens slice is largely SUBSUMED — Hemingway = sentence length (S6 rhythm gutter, SHIPPED) + adverbs/passives (S8). Keep at most one slice as an E8 plugin-lens proof-case; do not rebuild it. |
 | PB | Custom-markup plugins | watch | research | TBD |  | Post-P candidates clustering on a markup-extension API: CriticMarkup, Fountain, wiki-links. |
 | PC | Lower-fit / principled plugin candidates | watch | research | TBD |  | Post-P: AI continuation (plugin-only on principle), book design, genre benchmarking. |
+| S9 | In-lens editing feel — refine caret/motion/reflow inside the ventilate lens | triage | feature | TBD |  | In-lens editing feel — refine caret/motion/reflow inside the ventilate lens |
 
 ## Shipped
 

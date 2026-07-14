@@ -903,3 +903,38 @@ Lone block-begin marker renders nothing (^KB before ^KK is invisible)
 Block markers — styled boundary cells (modern B-lite; no injected bracket glyphs)
 
 *(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
+
+**Anti-regrowth constraint (record for the spec + plan).** This effort adds new boundary
+commands *and* new render arms — exactly the H1 dispatch-attractor shape. As of 2026-07-14 the two
+guarded hubs sit close to their `module_budgets` caps: `app.rs` production ≈920/1000 (~80 lines
+headroom), `render.rs` production ≈821/900 (~79). New command registration must land through the
+registry rows / feature-module handlers, and the styled-boundary paint must land in a
+`render_*`/feature module invoked by a thin arm — **not** as inline bodies grown into `reduce` /
+`reduce_dispatch` / `place_cursor`. The spec AND the plan each state how they honor this (the
+command-surface contract already binds the command half); the `too_many_lines` + `module_budgets`
+GATEs enforce it, but with this little headroom, plan for the seam up front rather than discovering
+it at the merge gate.
+
+### S9 — In-lens editing feel — refine caret/motion/reflow inside the ventilate lens
+<!-- item: S9 -->
+
+**Origin (2026-07-14):** the S6 ventilate lens is a hit ("love love loving it") and STAYS A LENS
+(non-destructive; do NOT convert to a RenderMode or a destructive transform — the toggle-off-is-byte-identical
+property is valued). Open question the user wants to revisit **after more editing time in the lens**, once they
+have firmer opinions on how it *should* feel — deliberately NOT designed yet. Banked so it isn't lost.
+
+When a paragraph shows one-sentence-per-row but is one logical line underneath, "editing" splits into distinct
+feels that don't all bother equally. Observations to test against real use:
+
+- **Vertical motion** — should ↑/↓ move by *sentence-row* (what you SEE) or by *logical line/paragraph* (what's
+  underneath)? The likeliest friction: see-and-*move* can disagree even where see-and-*select* already agrees
+  (SEE==SELECT is a selection invariant, not a motion one).
+- **Caret landing on the wrap** — where the caret lands horizontally when moving into a shorter/longer sentence,
+  and whether the 6-col rhythm gutter shifts the sense of column.
+- **Reflow while typing** — as a sentence is extended, or a period is added, its row-group reflows and a
+  sentence-row can appear/disappear mid-keystroke. Smooth vs. jumpy.
+- **Enter semantics inside the lens** — soft break vs. paragraph break, and how the display re-segments after.
+
+Grounding when picked up: the window-aware resolver (`ventilate::resolve`), `nav` motions, and the
+sentence-segmentation the lens shares with `select-sentence` (S5's detector). Slots as an S-theme follow-on to
+S6. Scope only after the user names the specific moment it feels wrong — do NOT boil the ocean.
