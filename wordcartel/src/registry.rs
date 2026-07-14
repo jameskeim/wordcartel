@@ -568,6 +568,8 @@ impl Registry {
             |c| { c.editor.view_opts.word_count = !c.editor.view_opts.word_count; CommandResult::Handled });
         r.register("count_region", "Count Region", Some(MenuCategory::View),
             |c| crate::commands::prose_ops::count_region(c.editor));
+        r.register("move_sentence_up",   "Move Sentence Up",   Some(MenuCategory::Edit), |c| crate::commands::prose_ops::move_sentence_up(c.editor, c.clock));
+        r.register("move_sentence_down", "Move Sentence Down", Some(MenuCategory::Edit), |c| crate::commands::prose_ops::move_sentence_down(c.editor, c.clock));
 
         // View menu — section folding (Task 10 / Effort 5g).
         r.register("fold_toggle", "Fold/Unfold Section", Some(MenuCategory::View), |c| {
