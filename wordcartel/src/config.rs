@@ -109,6 +109,11 @@ pub enum MenuBarMode { Hidden, Auto, Pinned }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransientMode { Off, Auto, On }
 
+/// Writing-caret shape. `Default` = never emit DECSCUSR (terminal's own shape) — the shipped
+/// default. The three concrete shapes map to DECSCUSR when composed with blink (see cursor_style).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaretShape { #[default] Default, Block, Beam, Underline }
+
 /// Clipboard provider selection (`[clipboard] provider`). `Auto` runs the detection
 /// chain; `Native` forces arboard; `Osc52` forces the terminal path; `Off` disables
 /// the system clipboard (in-process register only).
@@ -165,6 +170,8 @@ pub struct ViewConfig {
     /// Startup splash / welcome screen (`[view] splash`). On by default; the splash is
     /// painted over the first frame and dismissed by the first key press or mouse click.
     pub splash: bool,
+    pub caret_shape: CaretShape,
+    pub caret_blink: bool,
 }
 impl Default for ViewConfig {
     fn default() -> Self {
@@ -173,7 +180,8 @@ impl Default for ViewConfig {
             wrap_column: 72, wrap_guide: false, word_count: false,
             // status_line defaults On (idle info line always shown out of the box —
             // preserves the pre-density behavior); Zen (chrome = zen) flips it to Auto.
-            scrollbar: TransientMode::Auto, status_line: TransientMode::On, splash: true }
+            scrollbar: TransientMode::Auto, status_line: TransientMode::On, splash: true,
+            caret_shape: CaretShape::Default, caret_blink: true }
     }
 }
 
@@ -378,6 +386,8 @@ struct RawView {
     scrollbar: Option<String>,
     status_line: Option<String>,
     splash: Option<bool>,
+    caret_shape: Option<String>,
+    caret_blink: Option<bool>,
 }
 
 /// Ordered existing config files, lowest→highest precedence. Empty when --no-config.
@@ -505,6 +515,13 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
                 other => warns.push(format!("view.status_line \"{other}\" invalid; using auto")),
             }
         }
+        if let Some(s) = raw.view.caret_shape {
+            match crate::config::caret_shape_from_str(&s) {
+                Some(cs) => cfg.view.caret_shape = cs,
+                None => warns.push(format!("view.caret_shape \"{s}\" invalid; using default")),
+            }
+        }
+        if let Some(b) = raw.view.caret_blink { cfg.view.caret_blink = b; }
         // menu: per-field override; enum-valued string with a warning on unknowns.
         if let Some(b) = raw.menu.bar {
             match b.as_str() {
@@ -608,6 +625,17 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
 /// "off"/"auto"/"on" — round-trips `TransientMode` for the overrides mirror.
 pub fn transient_mode_str(m: TransientMode) -> &'static str {
     match m { TransientMode::Off => "off", TransientMode::Auto => "auto", TransientMode::On => "on" }
+}
+
+pub fn caret_shape_str(s: CaretShape) -> &'static str {
+    match s { CaretShape::Default => "default", CaretShape::Block => "block",
+              CaretShape::Beam => "beam", CaretShape::Underline => "underline" }
+}
+
+pub fn caret_shape_from_str(s: &str) -> Option<CaretShape> {
+    match s { "default" => Some(CaretShape::Default), "block" => Some(CaretShape::Block),
+              "beam" => Some(CaretShape::Beam), "underline" => Some(CaretShape::Underline),
+              _ => None }
 }
 
 /// "auto"/"native"/"osc52"/"off" — round-trips `ClipboardProvider` for the overrides mirror.
@@ -1235,5 +1263,20 @@ mod tests {
     fn linters_list_round_trips() {
         let (cfg, _warns) = load_diag("linters", "[diagnostics]\nlinters = [\"harper\"]\n");
         assert_eq!(cfg.diagnostics.linters, Some(vec!["harper".to_string()]));
+    }
+
+    #[test]
+    fn caret_shape_str_roundtrips() {
+        for s in [CaretShape::Default, CaretShape::Block, CaretShape::Beam, CaretShape::Underline] {
+            assert_eq!(caret_shape_from_str(caret_shape_str(s)), Some(s));
+        }
+        assert_eq!(caret_shape_from_str("bogus"), None);
+    }
+
+    #[test]
+    fn viewconfig_defaults_caret_default_blink_on() {
+        let v = ViewConfig::default();
+        assert_eq!(v.caret_shape, CaretShape::Default);
+        assert!(v.caret_blink, "blink default on (inert under Default until a shape is chosen)");
     }
 }
