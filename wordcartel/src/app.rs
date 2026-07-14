@@ -629,6 +629,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // Mouse capture is gated on editor.mouse_capture (seeded from config above).
     let mut guard = term::TerminalGuard::new(editor.mouse_capture)?;
     let mut applied_mouse = editor.mouse_capture;
+    let mut applied_caret: Option<(crate::config::CaretShape, bool)> = None;
 
     // Initial derive so the first draw has up-to-date layouts.
     derive::rebuild(&mut editor);
@@ -756,6 +757,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
 
     // Reconcile mouse capture once before the first draw (post-guard invariant).
     crate::chrome::reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
+    crate::cursor_style::reconcile_cursor_style(&editor, guard.terminal().backend_mut(), &mut applied_caret);
 
     crate::chrome::recompute_scrollbar_visible(&mut editor, clock.now_ms());
     crate::chrome::recompute_status_line(&mut editor, clock.now_ms());
@@ -863,6 +865,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         {
             let mut e = editor.borrow_mut();
             crate::chrome::reconcile_mouse_capture(&mut e, guard.terminal().backend_mut(), &mut applied_mouse);
+            crate::cursor_style::reconcile_cursor_style(&e, guard.terminal().backend_mut(), &mut applied_caret);
         }
         { advance(&mut editor.borrow_mut(), &clock); }
         {
