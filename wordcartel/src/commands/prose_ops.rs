@@ -49,9 +49,6 @@ fn move_sentence(editor: &mut Editor, dir: Dir, clock: &dyn Clock) -> CommandRes
     // Window via the SAME content-byte anchoring the lens/select path uses (SEE==SELECT, I-1):
     // a raw-`h` `paragraph_range_at` drifts into the gap fallback on ≤3-space indented prose and
     // returns a DIFFERENT window that swallows the indent. `None` declines (non-prose line).
-    // Window via the SAME content-byte anchoring the lens/select path uses (SEE==SELECT, I-1):
-    // a raw-`h` `paragraph_range_at` drifts into the gap fallback on ≤3-space indented prose and
-    // returns a DIFFERENT window that swallows the indent. `None` declines (non-prose line).
     let Some((ps, pe)) = super::prose_window_at(editor, h) else {
         editor.status = "no sentence here".into();
         return CommandResult::Noop;
@@ -178,9 +175,6 @@ pub(crate) fn break_paragraph_here(editor: &mut Editor, clock: &dyn Clock) -> Co
     let (sf, st) = match super::prose_sentence_at(editor, h) {
         Ok(s) => s, Err(_) => { editor.status = "no sentence here".into(); return CommandResult::Noop; }
     };
-    // The SAME content-anchored window `prose_sentence_at` segmented within (I-1) — never a raw-`h`
-    // `paragraph_range_at`, whose ≤3-space gap fallback would put `ps` BEFORE the indent so a caret
-    // on the paragraph's first sentence reads `sf > ps` and wrongly splits (replacing the indent).
     // The SAME content-anchored window `prose_sentence_at` segmented within (I-1) — never a raw-`h`
     // `paragraph_range_at`, whose ≤3-space gap fallback would put `ps` BEFORE the indent so a caret
     // on the paragraph's first sentence reads `sf > ps` and wrongly splits (replacing the indent).
