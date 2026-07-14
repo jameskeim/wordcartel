@@ -46,20 +46,21 @@ pub(crate) fn move_sentence_down(editor: &mut Editor, clock: &dyn Clock) -> Comm
 /// non-prose (F3). Gap fate M1: the gap between the pair is preserved verbatim.
 fn move_sentence(editor: &mut Editor, dir: Dir, clock: &dyn Clock) -> CommandResult {
     let h = nav::head(editor);
-    // Decline / classify via the shared predicate (SEE==SELECT).
-    if super::prose_sentence_at(editor, h).is_err() {
+    // Window via the SAME content-byte anchoring the lens/select path uses (SEE==SELECT, I-1):
+    // a raw-`h` `paragraph_range_at` drifts into the gap fallback on ≤3-space indented prose and
+    // returns a DIFFERENT window that swallows the indent. `None` declines (non-prose line).
+    // Window via the SAME content-byte anchoring the lens/select path uses (SEE==SELECT, I-1):
+    // a raw-`h` `paragraph_range_at` drifts into the gap fallback on ≤3-space indented prose and
+    // returns a DIFFERENT window that swallows the indent. `None` declines (non-prose line).
+    let Some((ps, pe)) = super::prose_window_at(editor, h) else {
         editor.status = "no sentence here".into();
         return CommandResult::Noop;
-    }
-    let (ps, pe) = {
-        let b = editor.active();
-        nav::paragraph_range_at(b.document.blocks(), &b.document.buffer, h)
     };
     let win = editor.active().document.buffer.slice(ps..pe);
     let rel = h.saturating_sub(ps).min(win.len());
     // Window-relative content spans.
     let spans: Vec<(usize, usize)> = wordcartel_core::textobj::sentence_spans(&win).collect();
-    if spans.is_empty() { return CommandResult::Noop; }
+    if spans.is_empty() { editor.status = "no sentence here".into(); return CommandResult::Noop; }
     // Index of the caret's sentence (attach: caret in the gap → the PRECEDING span, i.e. the last
     // span whose start <= rel; before the first content → span 0).
     let cur = spans.iter().rposition(|&(s, _)| s <= rel).unwrap_or(0);
@@ -151,6 +152,7 @@ pub(crate) fn swap(editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     let corrected = if !editor.active().folds.is_empty() {
         Some(crate::fold::corrected_after_move(&editor.active().folds, &regions, &cs))
     } else { None };
+    let had_correction = corrected.is_some();
     let txn = Transaction::new(cs).with_selection(Selection::range(moved_to, moved_from)); // moves cs
     editor.apply(txn, edit, EditKind::Other, clock); // Buffer::apply only — NO rebuild
     editor.active_mut().marked_block = None;
@@ -159,6 +161,11 @@ pub(crate) fn swap(editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
         editor.active_mut().folds.replace_folded(c); // override apply's remap with the corrected set
     }
     let r = super::edit::settle_after_edit(editor);  // REBUILD #2 — relayout + reconcile the corrected folds
+    if had_correction {
+        // Symmetry with block_move: after the corrected folds settle, snap the head out of any fold
+        // so a folded-region swap can never leave the caret on a hidden line.
+        crate::registry::snap_caret_out_of_fold(editor);
+    }
     editor.status = "swapped".into();
     r
 }
@@ -171,9 +178,14 @@ pub(crate) fn break_paragraph_here(editor: &mut Editor, clock: &dyn Clock) -> Co
     let (sf, st) = match super::prose_sentence_at(editor, h) {
         Ok(s) => s, Err(_) => { editor.status = "no sentence here".into(); return CommandResult::Noop; }
     };
-    let (ps, _pe) = {
-        let b = editor.active();
-        nav::paragraph_range_at(b.document.blocks(), &b.document.buffer, h)
+    // The SAME content-anchored window `prose_sentence_at` segmented within (I-1) — never a raw-`h`
+    // `paragraph_range_at`, whose ≤3-space gap fallback would put `ps` BEFORE the indent so a caret
+    // on the paragraph's first sentence reads `sf > ps` and wrongly splits (replacing the indent).
+    // The SAME content-anchored window `prose_sentence_at` segmented within (I-1) — never a raw-`h`
+    // `paragraph_range_at`, whose ≤3-space gap fallback would put `ps` BEFORE the indent so a caret
+    // on the paragraph's first sentence reads `sf > ps` and wrongly splits (replacing the indent).
+    let Some((ps, _pe)) = super::prose_window_at(editor, h) else {
+        editor.status = "no sentence here".into(); return CommandResult::Noop;
     };
     if sf <= ps { editor.status = "already at a paragraph start".into(); return CommandResult::Noop; }
     // Consume the whitespace run immediately before the sentence content.
@@ -199,12 +211,10 @@ pub(crate) fn break_paragraph_here(editor: &mut Editor, clock: &dyn Clock) -> Co
 /// block is non-prose. F8: the absorbed paragraph's first sentence is selected.
 pub(crate) fn merge_paragraph_forward(editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     let h = nav::head(editor);
-    if super::prose_sentence_at(editor, h).is_err() {
+    // The content-anchored window (I-1): raw-`h` `paragraph_range_at` drifts on ≤3-space indented
+    // prose. `None` declines (non-prose line).
+    let Some((ps, pe)) = super::prose_window_at(editor, h) else {
         editor.status = "no paragraph here".into(); return CommandResult::Noop;
-    }
-    let (ps, pe) = {
-        let b = editor.active();
-        nav::paragraph_range_at(b.document.blocks(), &b.document.buffer, h)
     };
     let (nps, next_is_prose) = {
         let b = editor.active();
@@ -773,6 +783,62 @@ mod tests {
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(3);
         assert_eq!(split_sentence_at_caret(&mut e, &TestClock(0)), CommandResult::Noop);
         assert_eq!(e.active().document.buffer.to_string(), "# Heading\n");
+    }
+
+    // ------------------------------------------------------------------
+    // Final-gate FIX 1 (I-1): SEE==SELECT window drift on ≤3-space indented prose.
+    // ------------------------------------------------------------------
+
+    /// I-1 probe: `break_paragraph_here` on a 2-space-indented paragraph with the caret in the
+    /// indent must Noop (already at the paragraph's first sentence, as the lens/select path sees
+    /// it) — NOT replace the indent with a paragraph break. The window MUST be content-anchored;
+    /// a raw-`h` `paragraph_range_at` drifts into the gap fallback (ps before the indent) so
+    /// `sf > ps` and the handler wrongly splits.
+    #[test]
+    fn break_paragraph_here_indented_first_sentence_is_noop() {
+        let mut e = Editor::new_from_text("  One two. Three four.\n", None, (40, 12));
+        crate::derive::rebuild(&mut e);
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1); // in the indent
+        assert_eq!(break_paragraph_here(&mut e, &TestClock(0)), CommandResult::Noop);
+        assert!(e.status.contains("paragraph start"), "status: {}", e.status);
+        assert_eq!(e.active().document.buffer.to_string(), "  One two. Three four.\n",
+            "buffer unchanged — the indent is NOT replaced with a paragraph break");
+    }
+
+    /// I-1 probe: `move_sentence_down` on a 2-space-indented paragraph must operate on the
+    /// content-window sentence ("One two."), preserving the leading indent at line start — NOT
+    /// absorb the indent into the moved sentence (the raw-`h` gap-fallback window produced a triple
+    /// space: "Three four.   One two.").
+    #[test]
+    fn move_sentence_down_indented_preserves_leading_indent() {
+        let mut e = Editor::new_from_text("  One two. Three four.\n", None, (40, 12));
+        crate::derive::rebuild(&mut e);
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(0); // line start (indent)
+        assert_eq!(move_sentence_down(&mut e, &TestClock(0)), CommandResult::Handled);
+        assert_eq!(e.active().document.buffer.to_string(), "  Three four. One two.\n",
+            "indent preserved at line start, sentence content moved — no triple space");
+    }
+
+    /// FIX 2 symmetry: `swap` of a FOLDED section must leave the caret on a VISIBLE line (snapped
+    /// out of any fold the correction re-applied) — typing must never land on hidden text.
+    #[test]
+    fn swap_of_folded_section_leaves_caret_on_a_visible_line() {
+        let doc = "## A\n\nbody a.\n\n## B\n\nbody b.\n";
+        let mut e = Editor::new_from_text(doc, None, (60, 20));
+        crate::derive::rebuild(&mut e);
+        let a = doc.find("## A").unwrap();
+        let b = doc.find("## B").unwrap();
+        e.active_mut().folds.toggle(a); // fold section A
+        let (a_from, a_to) = crate::commands::section_range_at(&e, a + 1).unwrap();
+        let (b_from, b_to) = crate::commands::section_range_at(&e, b + 1).unwrap();
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::range(a_from, a_to);
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: b_from, end: b_to, hidden: false });
+        assert_eq!(swap(&mut e, &TestClock(0)), CommandResult::Handled);
+        let fold_view = e.active_fold_view();
+        let head = e.active().document.selection.primary().head;
+        let caret_line = e.active().document.buffer.byte_to_line(head);
+        assert!(!fold_view.is_hidden(caret_line),
+            "caret line {caret_line} must be visible after swapping a folded section");
     }
 
     /// Single-undo granularity: one `split_sentence_at_caret` produces one undo step.

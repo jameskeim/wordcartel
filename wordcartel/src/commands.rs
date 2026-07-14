@@ -209,26 +209,45 @@ pub fn block_kind_label(role: wordcartel_core::style::BlockRole) -> &'static str
     }
 }
 
-/// The sentence scope at byte `h`, via the LENS'S OWN classification + window, or `Err(NonProse)`
-/// when `h` is not in prose. SEE==SELECT single-source (spec §8, C-11): classify at the caret line's
-/// first non-whitespace CONTENT byte (`ventilate::line_content_byte`) — CommonMark strips ≤3-space
-/// block indent, so a `line_start` classification would hit the gap fallback and diverge from the
-/// lens on indented prose. Then `prose_block_at` (window) + `sentence_bounds` (segmentation) — the
-/// exact calls the lens renders with.
-pub fn prose_sentence_at(editor: &Editor, h: usize) -> Result<(usize, usize), NonProse> {
+/// The content-anchored prose WINDOW `(ps, pe)` containing byte `h`, or `None` when `h`'s line is
+/// not prose. SEE==SELECT single-source (spec §8, C-11): classify+window at the caret line's first
+/// non-whitespace CONTENT byte (`ventilate::line_content_byte`) — CommonMark strips ≤3-space block
+/// indent, so a `line_start`/raw-`h` window (`nav::paragraph_range_at` at the caret) hits the gap
+/// fallback and DIVERGES from the lens on indented prose. This is THE window every prose-surgery
+/// mutation handler must window through (`move_sentence`, `break_paragraph_here`,
+/// `merge_paragraph_forward`) so none can drift back to a raw-caret window (I-1). `prose_sentence_at`
+/// segments within this exact window, so the sentence bounds and the paragraph window always agree.
+pub fn prose_window_at(editor: &Editor, h: usize) -> Option<(usize, usize)> {
     let b = editor.active();
     let buf = &b.document.buffer;
     let blocks = b.document.blocks();
     let line = buf.byte_to_line(h.min(buf.len()));
-    let Some(c) = crate::ventilate::line_content_byte(buf, line) else {
-        return Err(NonProse(blocks.role_at(crate::derive::line_start(buf, line))));
-    };
-    match crate::ventilate::prose_block_at(blocks, buf, c) {
-        None => Err(NonProse(blocks.role_at(c))),
+    let c = crate::ventilate::line_content_byte(buf, line)?;
+    crate::ventilate::prose_block_at(blocks, buf, c)
+}
+
+/// The sentence scope at byte `h`, via the LENS'S OWN classification + window, or `Err(NonProse)`
+/// when `h` is not in prose. SEE==SELECT single-source (spec §8, C-11): the window is
+/// [`prose_window_at`]'s content-anchored `(ps, pe)`, then `sentence_bounds` (segmentation) — the
+/// exact calls the lens renders with. Windowing through the shared helper keeps the sentence bounds
+/// and the paragraph window a mutation handler derives byte-identical.
+pub fn prose_sentence_at(editor: &Editor, h: usize) -> Result<(usize, usize), NonProse> {
+    let b = editor.active();
+    let buf = &b.document.buffer;
+    match prose_window_at(editor, h) {
         Some((ps, pe)) => {
             let rel = h.saturating_sub(ps);
             let (sf, st) = wordcartel_core::textobj::sentence_bounds(&buf.slice(ps..pe), rel);
             Ok((ps + sf, ps + st))
+        }
+        None => {
+            // Not prose: name the block role for the decline message (F3). Prefer the content byte
+            // (the classification site); fall back to line_start for a content-less line.
+            let blocks = b.document.blocks();
+            let line = buf.byte_to_line(h.min(buf.len()));
+            let at = crate::ventilate::line_content_byte(buf, line)
+                .unwrap_or_else(|| crate::derive::line_start(buf, line));
+            Err(NonProse(blocks.role_at(at)))
         }
     }
 }

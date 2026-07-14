@@ -990,6 +990,21 @@ pub(crate) fn unfold_ancestors_of(editor: &mut crate::editor::Editor, byte: usiz
     }
 }
 
+/// After a fold-set change that may have left the caret on a now-hidden line — the block-move / swap
+/// fold-correction paths (S4) — snap the caret OUT of any fold and re-scroll, exactly the guard the
+/// shipped fold commands (Undo/Redo, jump) apply. Assumes the tree is already rebuilt against the
+/// corrected fold set, so `SnapOut`'s `normalize_caret` sees the final folds. Without this a
+/// `block_move`/`swap` of a folded section can leave the head on a hidden line, where typing would
+/// edit invisible text (Fable/Codex must-fix).
+pub(crate) fn snap_caret_out_of_fold(editor: &mut crate::editor::Editor) {
+    let head = editor.active().document.selection.primary().head;
+    let snapped = place_caret_visible(editor, head, CaretPlace::SnapOut);
+    if snapped != head {
+        editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(snapped);
+    }
+    crate::nav::ensure_visible(editor);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CaretPlace { UnfoldTo, SnapOut }
 

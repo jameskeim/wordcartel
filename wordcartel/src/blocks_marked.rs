@@ -58,6 +58,10 @@ pub fn block_move(editor: &mut Editor, clock: &dyn Clock) {
     if let Some(c) = corrected {
         editor.active_mut().folds.replace_folded(c);
         crate::derive::rebuild(editor);             // rebuild #2 (relayout + reconcile)
+        // The fold correction can re-fold the destination section around `new_caret`, leaving the
+        // head on a hidden line — snap it out (the shipped-fold-command guard) so typing never
+        // edits invisible text.
+        crate::registry::snap_caret_out_of_fold(editor);
     }
     editor.active_mut().marked_block = None; // consumed
     editor.status = "block moved".into();
@@ -276,6 +280,28 @@ mod tests {
         assert!(folded.contains(&0), "A's heading is folded at its NEW byte 0: {folded:?}");
         assert!(!folded.contains(&a), "the fold did NOT stay at the vacated original byte {a}");
         assert_eq!(folded.len(), 1, "exactly one fold — no double, no drop");
+    }
+
+    /// FIX 2 (Fable/Codex must-fix): a `block_move` of a FOLDED section must leave the caret on a
+    /// VISIBLE line. The fold correction re-folds the destination section around the post-move
+    /// caret, so without the SnapOut guard the head lands on a fold-hidden line where typing would
+    /// edit invisible text.
+    #[test]
+    fn block_move_of_folded_section_snaps_caret_out_of_hidden_line() {
+        let doc = "intro para.\n\n## A\n\nbody a line.\n\nmore text after.\n";
+        let mut e = Editor::new_from_text(doc, None, (60, 20));
+        crate::derive::rebuild(&mut e);
+        let a = doc.find("## A").unwrap();
+        e.active_mut().folds.toggle(a); // fold section A
+        let (b_from, b_to) = crate::commands::section_range_at(&e, a + 1).unwrap();
+        e.active_mut().marked_block = Some(MarkedBlock { start: b_from, end: b_to, hidden: false });
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(0); // caret before block
+        crate::blocks_marked::block_move(&mut e, &TestClock(0));
+        let fold_view = e.active_fold_view();
+        let head = e.active().document.selection.primary().head;
+        let caret_line = e.active().document.buffer.byte_to_line(head);
+        assert!(!fold_view.is_hidden(caret_line),
+            "caret line {caret_line} must be visible after moving a folded section (snapped out of the fold)");
     }
 
     #[test]
