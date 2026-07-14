@@ -120,6 +120,26 @@ pub(crate) fn theme_picker_row_at(area: Rect, tp: &crate::theme_picker::ThemePic
     } else { None }
 }
 
+/// Return the ABSOLUTE list-row index that `(col, row)` hits in the cursor picker, or
+/// `None` when the click is outside the list interior. Mirrors `theme_picker_row_at`. The
+/// cursor picker has NO query row, so its list starts one row below the top border
+/// (`ov_y + 1`) — this MUST stay in lockstep with the `render_overlays` picker arm. The
+/// overlay box is sized via `n + 1` rows (reserving room for the sample row below the
+/// list), but the resulting visible-list height still equals
+/// `list_window::list_h_for(n, area.height)` exactly — the `+1`/`+3`/`-3`/`-2` terms that
+/// separate the box height from the list height cancel algebraically, so windowing reuses
+/// the SAME formula as every sibling overlay (Finding 1).
+pub(crate) fn cursor_picker_row_at(area: Rect, cp: &crate::cursor_picker::CursorPicker, col: u16, row: u16) -> Option<usize> {
+    let n = crate::cursor_picker::ROW_ACTIONS.len();
+    let r = palette_overlay_rect(area, n + 1);
+    let list_top = r.y.saturating_add(1);
+    let list_h = crate::list_window::list_h_for(n, area.height) as u16;
+    if col >= r.x.saturating_add(1) && col < r.x.saturating_add(r.width).saturating_sub(1)
+        && row >= list_top && row < list_top.saturating_add(list_h) {
+        Some((row - list_top) as usize + cp.scroll_top)
+    } else { None }
+}
+
 /// Return the absolute list-row index that `(col, row)` hits in the file browser,
 /// or `None` when the click is outside the list interior. Mirrors `palette_row_at`.
 pub(crate) fn file_browser_row_at(area: Rect, fb: &crate::file_browser::FileBrowser, col: u16, row: u16) -> Option<usize> {
@@ -294,6 +314,55 @@ mod tests {
         // 30 rows → list_h capped at 15, ov_h=15+3=18
         let r30 = palette_overlay_rect(area, 30);
         assert_eq!(r30.height, 18, "30 rows: expected height 18 (15 capped + 3 chrome)");
+    }
+
+    /// `cursor_picker_row_at` at a tall terminal (all 7 rows visible, `scroll_top == 0`):
+    /// hit index equals the row offset from the list top; a click on the sample row
+    /// (below the list) misses.
+    #[test]
+    fn cursor_picker_row_at_no_scroll_maps_to_offset() {
+        let area = Rect::new(0, 0, 60, 24);
+        let cp = crate::cursor_picker::CursorPicker {
+            selected: 0, original_shape: crate::config::CaretShape::Default,
+            original_blink: false, scroll_top: 0,
+        };
+        let n = crate::cursor_picker::ROW_ACTIONS.len();
+        let r = palette_overlay_rect(area, n + 1);
+        let list_top = r.y + 1;
+        // Row 3 (Beam · blinking) — well within the fully-visible list.
+        assert_eq!(cursor_picker_row_at(area, &cp, r.x + 1, list_top + 3), Some(3));
+        // Click on the sample row (below the list) must miss.
+        let sample_row = r.y + r.height.saturating_sub(2);
+        assert_eq!(cursor_picker_row_at(area, &cp, r.x + 1, sample_row), None,
+            "sample row is not a list row");
+    }
+
+    /// `cursor_picker_row_at` at a SHORT terminal with a non-zero `scroll_top`: the hit
+    /// index is ABSOLUTE — `(row - list_top) + scroll_top` — mirroring
+    /// `theme_picker_row_at` (Finding 1/2 mouse-path coverage: the tail row must be
+    /// clickable once scrolled into view, and geometry outside the window must miss).
+    #[test]
+    fn cursor_picker_row_at_scrolled_returns_absolute_index() {
+        let area = Rect::new(0, 0, 60, 9); // short terminal — list_h_for(7, 9) == 5
+        let cp = crate::cursor_picker::CursorPicker {
+            selected: 6, original_shape: crate::config::CaretShape::Default,
+            original_blink: false, scroll_top: 2,
+        };
+        let n = crate::cursor_picker::ROW_ACTIONS.len();
+        let r = palette_overlay_rect(area, n + 1);
+        let list_top = r.y + 1;
+        let list_h = crate::list_window::list_h_for(n, area.height);
+        assert_eq!(list_h, 5, "precondition: window shows 5 of 7 rows");
+        // Screen row 0 of the window shows absolute row scroll_top (2), not row 0.
+        assert_eq!(cursor_picker_row_at(area, &cp, r.x + 1, list_top), Some(2));
+        // The LAST visible screen row shows absolute row scroll_top + list_h - 1 == 6.
+        let last_row = list_top + (list_h as u16 - 1);
+        assert_eq!(cursor_picker_row_at(area, &cp, r.x + 1, last_row), Some(6),
+            "the tail row (6) must be clickable once scrolled into view");
+        // One row past the window (the sample row) misses.
+        assert_eq!(cursor_picker_row_at(area, &cp, r.x + 1, last_row + 1), None);
+        // Outside the box entirely (far left) misses.
+        assert_eq!(cursor_picker_row_at(area, &cp, 0, list_top), None);
     }
 
     /// Build a synthetic groups list: one category (Edit) with `n` leaves.

@@ -4,7 +4,7 @@
 // instead of accessing the six chrome locals that existed in render.rs.
 
 use ratatui::{
-    layout::Rect,
+    layout::{Position, Rect},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
     Frame,
@@ -33,6 +33,12 @@ use crate::{
 ///
 /// `area` and `h` are derived from `frame.area()` to match the values the
 /// main render function computes; no state is duplicated.
+///
+/// Width of the `"> "` query prefix — the SINGLE SOURCE shared by the query painter
+/// (the `format!("> {}", …)` display strings below) and the caret placements (B11),
+/// so painter and caret can never drift.
+const OV_QUERY_PREFIX_COLS: u16 = 2;
+
 #[allow(clippy::too_many_lines)] // overlay paint dispatch — one block per overlay surface
 pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
     let area = frame.area();
@@ -86,6 +92,16 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
             Paragraph::new(Line::from(Span::styled(truncated_q, cs.ov_query))),
             query_area,
         );
+
+        // B11: place the caret mid-string at `palette.cursor` (a byte offset), not just at
+        // the end of the query — the palette query is the only overlay with an interior cursor.
+        // H7: sum in usize and guard BEFORE narrowing — an unbounded-paste query must hide
+        // the caret, not overflow the `+` or truncate to a small column that passes `< width`.
+        let caret_col = query_area.x as usize + OV_QUERY_PREFIX_COLS as usize
+            + palette.query[..palette.cursor].chars().count();
+        if caret_col < (query_area.x + query_area.width) as usize {
+            frame.set_cursor_position(Position { x: caret_col as u16, y: query_area.y });
+        }
 
         if ov_h < 4 || list_h == 0 {
             return;
@@ -150,6 +166,14 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
                 query_area,
             );
 
+            // B11: end-of-query caret (outline's `cursor` field is pinned to the end anyway).
+            // H7: sum in usize and guard BEFORE narrowing (see the palette arm above).
+            let caret_col = query_area.x as usize + OV_QUERY_PREFIX_COLS as usize
+                + outline.query.chars().count();
+            if caret_col < (query_area.x + query_area.width) as usize {
+                frame.set_cursor_position(Position { x: caret_col as u16, y: query_area.y });
+            }
+
             if ov_h >= 4 && list_h > 0 {
                 let list_h_u16 = list_h as u16;
                 let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h_u16);
@@ -211,6 +235,14 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
                 query_area,
             );
 
+            // B11: end-of-query caret.
+            // H7: sum in usize and guard BEFORE narrowing (see the palette arm above).
+            let caret_col = query_area.x as usize + OV_QUERY_PREFIX_COLS as usize
+                + tp.query.chars().count();
+            if caret_col < (query_area.x + query_area.width) as usize {
+                frame.set_cursor_position(Position { x: caret_col as u16, y: query_area.y });
+            }
+
             if ov_h >= 4 && list_h > 0 {
                 let list_h_u16 = list_h as u16;
                 let list_area = Rect::new(ov_x + 1, ov_y + 2, ov_w.saturating_sub(2), list_h_u16);
@@ -233,6 +265,86 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
                     list_area,
                     &mut list_state,
                 );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Cursor (caret-shape) picker overlay
+    // -----------------------------------------------------------------------
+    // A FIXED 7-row list, WINDOWED like every sibling overlay (Finding 1 — mirrors
+    // theme_picker's A6 self-heal: re-window against the LIVE frame geometry every
+    // render since resize has no overlay hook). The list sits between the top border and
+    // a dedicated "Preview:" sample row on the second-to-last inner line; the sample-cell
+    // caret is the SOLE on-screen caret while the picker is open (place_cursor suppresses
+    // the editor caret via has_active_input_overlay), so `reconcile_cursor_style` morphs
+    // THIS caret live as the selection changes (Fork 5-C). The overlay box is sized via
+    // `n + 1` rows (palette_overlay_rect) to reserve room for the sample row below the
+    // list; the resulting visible-list height equals `list_h_for(n, h)` exactly (the
+    // `+1`/`+3`/`-3`/`-2` terms cancel — see `chrome_geom::cursor_picker_row_at`), so
+    // windowing reuses the SAME list_h_for/keep_overlay_visible machinery as every
+    // sibling. This geometry (list_top = ov_y + 1, sample_row = ov_y + ov_h - 2) is
+    // shared with `chrome_geom::cursor_picker_row_at` — keep them in step.
+    if let Some(cp) = editor.cursor_picker.as_mut() {
+        crate::app::keep_overlay_visible(h, cp.selected, crate::cursor_picker::ROW_ACTIONS.len(), &mut cp.scroll_top);
+    }
+    if let Some(ref cp) = editor.cursor_picker {
+        let n = crate::cursor_picker::ROW_ACTIONS.len();
+        let ov_rect = palette_overlay_rect(area, n + 1);
+        let ov_x = ov_rect.x;
+        let ov_y = ov_rect.y;
+        let ov_w = ov_rect.width;
+        let ov_h = ov_rect.height;
+        let list_h = crate::list_window::list_h_for(n, h);
+
+        frame.render_widget(Clear, ov_rect);
+        frame.buffer_mut().set_style(ov_rect, cs.ov_fill);
+        let mut block = Block::default().borders(Borders::ALL).title(" Caret ")
+            .border_style(cs.overlay_border);
+        if let Some(ind) = windowed_indicator(cp.selected, n, list_h) {
+            block = block.title_bottom(ind);
+        }
+        frame.render_widget(block, ov_rect);
+
+        if ov_h >= 3 {
+            let list_top = ov_y + 1;
+            let sample_row = ov_y + ov_h.saturating_sub(2);
+            if list_h > 0 {
+                let list_h_u16 = list_h as u16;
+                let list_area = Rect::new(ov_x + 1, list_top, ov_w.saturating_sub(2), list_h_u16);
+                let end = (cp.scroll_top + list_h).min(n);
+                let items: Vec<ListItem> = crate::cursor_picker::ROW_ACTIONS[cp.scroll_top..end].iter()
+                    .map(|(label, glyph, _, _)| {
+                        let text = format!("{glyph}  {label}");
+                        let truncated: String = text.chars().take(list_area.width as usize).collect();
+                        ListItem::new(Line::from(truncated))
+                    }).collect();
+                let mut list_state = ListState::default();
+                // Window-relative selection (the highlight-correctness fix — Finding 1):
+                // an absolute `cp.selected` past the visible window must never clamp onto
+                // a wrong rendered row.
+                list_state.select(Some(cp.selected.saturating_sub(cp.scroll_top)));
+                frame.render_stateful_widget(
+                    List::new(items).highlight_style(cs.overlay_selected),
+                    list_area,
+                    &mut list_state,
+                );
+            }
+
+            // Sample cell: a "Preview: <glyph>" line with the live caret parked on the glyph.
+            // Placement is independent of scroll_top — it always sits right below the
+            // windowed list, above the bottom border.
+            let sample_area = Rect::new(ov_x + 1, sample_row, ov_w.saturating_sub(2), 1);
+            let glyph = crate::cursor_picker::ROW_ACTIONS[cp.selected.min(n - 1)].1;
+            let sample_label = format!("Preview: {glyph}");
+            let truncated: String = sample_label.chars().take(sample_area.width as usize).collect();
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(truncated, cs.ov_query))),
+                sample_area,
+            );
+            let caret_x = ov_x + 1 + "Preview: ".chars().count() as u16;
+            if caret_x < ov_x + ov_w {
+                frame.set_cursor_position(Position { x: caret_x, y: sample_row });
             }
         }
     }
@@ -272,6 +384,14 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
                 Paragraph::new(Line::from(Span::styled(truncated_q, cs.ov_query))),
                 query_area,
             );
+
+            // B11: end-of-query caret.
+            // H7: sum in usize and guard BEFORE narrowing (see the palette arm above).
+            let caret_col = query_area.x as usize + OV_QUERY_PREFIX_COLS as usize
+                + fb.query.chars().count();
+            if caret_col < (query_area.x + query_area.width) as usize {
+                frame.set_cursor_position(Position { x: caret_col as u16, y: query_area.y });
+            }
 
             if ov_h >= 4 && list_h > 0 {
                 let list_h_u16 = list_h as u16;

@@ -240,6 +240,14 @@ impl Harness {
     fn version(&self) -> u64 { self.editor.borrow().active().document.version }
     fn rope(&self) -> ropey::Rope { self.editor.borrow().active().document.buffer.snapshot() }
 
+    /// Current hardware caret cell as `(x, y)`. Reads the INHERENT
+    /// `TestBackend::cursor_position()` (returns a `Position` directly — the render.rs
+    /// place_cursor precedent), so no `Backend` trait import and no `.expect()`.
+    fn cursor_pos(&self) -> (u16, u16) {
+        let p = self.term.backend().cursor_position();
+        (p.x, p.y)
+    }
+
     // — screen assertions —
     fn row(&self, y: u16) -> String {
         let buf = self.term.backend().buffer();
@@ -1603,6 +1611,8 @@ fn journey_chrome_zen_toggle() {
         view_scrollbar:     crate::config::TransientMode::Auto,
         view_status_line:   crate::config::TransientMode::On,
         view_splash:        true,
+        view_caret_shape:   crate::config::CaretShape::Default,
+        view_caret_blink:   true,
         menu_bar:           crate::config::MenuBarMode::Auto,
         mouse_capture:      true,
         chrome_disposition: ChromeDisposition::Full,
@@ -2060,6 +2070,117 @@ fn e2e_verbatim_active_line_reveals_raw_prose_stays_concealed() {
         "prose sentence renders concealed-clean");
     assert!(!(0..8u16).any(|y| h2.row(y).contains("*word*")),
         "active ventilated prose line stays concealed — no raw reveal at the caret (L1)");
+}
+
+#[test]
+fn cursor_picker_live_preview_sample_caret_and_commit() {
+    use crate::config::CaretShape;
+    let mut h = Harness::new("hello world\n", None, (60, 16));
+    crate::derive::rebuild(&mut h.editor.borrow_mut());
+    // user starts with blink OFF (to prove row-0 preserves it later)
+    h.editor.borrow_mut().set_caret_blink(false);
+
+    // baseline: editor caret with NO overlay (for the "sample caret is elsewhere" contrast)
+    h.render();
+    let editor_caret = h.cursor_pos();
+
+    // open the cursor picker (direct opener; XOR-clears others)
+    h.editor.borrow_mut().open_cursor_picker();
+    h.render();
+    assert!(h.editor.borrow().cursor_picker.is_some(), "picker open");
+    // F2: initial selection matches the CURRENT caret state — the caret is Default, so the
+    // picker opens on row 0 (the Default row itself), not a managed row picked for the user.
+    assert_eq!(h.editor.borrow().cursor_picker.as_ref().unwrap().selected, 0);
+    // opening does not preview: the caret shape is still exactly what it was before open —
+    // the highlight already matches it, so opening writes nothing.
+    assert_eq!(h.editor.borrow().caret_shape, CaretShape::Default, "opening the picker previews nothing");
+    // sample-cell caret is placed INSIDE the overlay — not at the editor text-area cell:
+    let sample_pos = h.cursor_pos();
+    assert_ne!(sample_pos, editor_caret,
+        "picker sample caret must sit in the overlay, not the editor text area");
+
+    // F2 regression: Enter IMMEDIATELY after open commits the CURRENT state — no lie. The
+    // highlighted row (0 = Default) already matches the live caret, so this is a true no-op,
+    // not the old bug where Enter-on-open silently committed an unrelated managed row.
+    h.key(KeyCode::Enter);
+    {
+        let e = h.editor.borrow();
+        assert!(e.cursor_picker.is_none(), "Enter commits + closes");
+        assert_eq!(e.caret_shape, CaretShape::Default, "enter-immediately commits the current state");
+        assert!(!e.caret_blink, "enter-immediately does not touch blink");
+    }
+
+    // reopen (state is unchanged, so the initial row is again 0). Arrow Down to row 1
+    // (Block · blinking) → preview applies live.
+    h.editor.borrow_mut().open_cursor_picker();
+    h.render();
+    assert_eq!(h.editor.borrow().cursor_picker.as_ref().unwrap().selected, 0);
+    h.key(KeyCode::Down);
+    h.render();
+    {
+        let e = h.editor.borrow();
+        assert_eq!(e.caret_shape, CaretShape::Block);
+        assert!(e.caret_blink, "row 1 blinking → blink true");
+        assert_eq!(e.cursor_picker.as_ref().unwrap().selected, 1);
+    }
+    // the sample caret is FIXED (same cell) across selection moves — it is the live-morph anchor:
+    assert_eq!(h.cursor_pos(), sample_pos, "sample caret stays on the fixed sample cell");
+
+    // Esc → restore originals (Default shape; blink stays as the user had it: false)
+    h.key(KeyCode::Esc);
+    h.render();
+    {
+        let e = h.editor.borrow();
+        assert!(e.cursor_picker.is_none(), "Esc closes the picker");
+        assert_eq!(e.caret_shape, CaretShape::Default, "Esc restores original shape");
+        assert!(!e.caret_blink, "blink unchanged (was false)");
+    }
+
+    // reopen, row 0 (Default) is again the initial selection — Enter commits, must NOT
+    // touch blink.
+    h.editor.borrow_mut().open_cursor_picker();
+    h.render();
+    assert_eq!(h.editor.borrow().cursor_picker.as_ref().unwrap().selected, 0);
+    h.key(KeyCode::Enter);
+    {
+        let e = h.editor.borrow();
+        assert!(e.cursor_picker.is_none(), "Enter commits + closes");
+        assert_eq!(e.caret_shape, CaretShape::Default);
+        assert!(!e.caret_blink, "row 0 commit preserved blink=false");
+    }
+
+    // reopen, navigate to row 4 (Beam · steady), Enter, then assert the real settings snapshot
+    // persists it. open_cursor_picker → initial_row_for(Default, _) == 0 (F2). ListNav::Down
+    // is +1, so from row 0 press Down FOUR times to reach row 4.
+    h.editor.borrow_mut().open_cursor_picker();
+    assert_eq!(h.editor.borrow().cursor_picker.as_ref().unwrap().selected, 0, "initial row = 0");
+    h.key(KeyCode::Down); // 0→1 (Block · blinking)
+    h.key(KeyCode::Down); // 1→2 (Block · steady)
+    h.key(KeyCode::Down); // 2→3 (Beam · blinking)
+    h.key(KeyCode::Down); // 3→4 (Beam · steady)
+    assert_eq!(h.editor.borrow().cursor_picker.as_ref().unwrap().selected, 4, "landed on Beam · steady");
+    h.key(KeyCode::Enter);
+    {
+        let e = h.editor.borrow();
+        assert_eq!(e.caret_shape, CaretShape::Beam);
+        assert!(!e.caret_blink, "row 4 (ROW_ACTIONS[4]) = Beam · steady → blink false");
+        // real persistence path: runtime_snapshot(&Editor).
+        let snap = crate::settings::runtime_snapshot(&e);
+        assert_eq!(snap.view_caret_shape, CaretShape::Beam);
+        assert!(!snap.view_caret_blink);
+    }
+}
+
+#[test]
+fn cursor_picker_swallows_paste() {
+    use crossterm::event::Event;
+    let mut h = Harness::new("doc\n", None, (60, 16));
+    crate::derive::rebuild(&mut h.editor.borrow_mut());
+    h.editor.borrow_mut().open_cursor_picker();
+    assert!(h.editor.borrow().cursor_picker.is_some(), "picker open");
+    h.step(Msg::Input(Event::Paste("XYZ".into())));   // bracketed paste while open
+    assert_eq!(h.doc_text(), "doc\n", "paste must NOT leak into the document behind the picker");
+    assert!(h.editor.borrow().cursor_picker.is_some(), "paste is a no-op; picker stays open");
 }
 
 // ===========================================================================

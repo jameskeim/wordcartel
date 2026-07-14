@@ -487,6 +487,10 @@ pub struct Editor {
     pub scrollbar_mode: crate::config::TransientMode,
     /// Status-line visibility mode (seeded from `[view] status_line`; mutated at runtime).
     pub status_line_mode: crate::config::TransientMode,
+    /// Writing-caret shape (seeded from `[view] caret_shape`; mutated by `set_caret_shape`).
+    pub caret_shape: crate::config::CaretShape,
+    /// Caret blink enablement (seeded from `[view] caret_blink`; mutated by `set_caret_blink`).
+    pub caret_blink: bool,
     /// Transient mouse gesture state; cleared by `reconcile_mouse_capture` on disable.
     pub mouse: MouseState,
     /// View/focus/writing-experience flags. Seeded from config; toggled by the 5 toggle_ commands.
@@ -521,6 +525,9 @@ pub struct Editor {
     pub theme_picker: Option<crate::theme_picker::ThemePicker>,
     /// File browser overlay state. XOR with all other overlays.
     pub file_browser: Option<crate::file_browser::FileBrowser>,
+    /// Caret-shape picker overlay state (C1 T6 field/stub; T7 fills in the picker's
+    /// logic). XOR with all other overlays.
+    pub cursor_picker: Option<crate::cursor_picker::CursorPicker>,
     /// Startup splash overlay. Set once in `run()` (gated on config, `--no-splash`, and
     /// no pending recovery prompt); cleared — consuming the event — by the first key
     /// press or mouse click (`splash::intercept`). XOR with the other overlays by
@@ -618,6 +625,8 @@ impl Editor {
             // Status line defaults On — the idle info line is always shown out of the box
             // (preserves the pre-density behavior); Zen (chrome = zen) flips it to Auto.
             status_line_mode: crate::config::TransientMode::On,
+            caret_shape: crate::config::CaretShape::Default,
+            caret_blink: true,
             mouse: MouseState::default(),
             view_opts: crate::config::ViewConfig::default(),
             search: None,
@@ -632,6 +641,7 @@ impl Editor {
             outline: None,
             theme_picker: None,
             file_browser: None,
+            cursor_picker: None,
             splash: None,
             theme: wordcartel_core::theme::default(),
             depth: wordcartel_core::theme::Depth::Truecolor,
@@ -753,6 +763,7 @@ impl Editor {
         self.diag = None;
         self.outline = None;
         self.theme_picker = None;
+        self.cursor_picker = None;
         self.file_browser = None;
         self.minibuffer = Some(crate::minibuffer::Minibuffer {
             prompt: prompt.into(),
@@ -776,6 +787,7 @@ impl Editor {
         self.diag = None;
         self.outline = None;
         self.theme_picker = None;
+        self.cursor_picker = None;
         self.file_browser = None;
         self.splash = None; // a prompt is modal — it must never be buried by the splash
         self.prompt = Some(p);
@@ -795,6 +807,7 @@ impl Editor {
         self.diag = None;
         self.outline = None;
         self.theme_picker = None;
+        self.cursor_picker = None;
         self.file_browser = None;
         self.palette = Some(crate::palette::Palette::default());
     }
@@ -809,6 +822,7 @@ impl Editor {
         self.diag = None;
         self.outline = None;
         self.theme_picker = None;
+        self.cursor_picker = None;
         self.file_browser = None;
         let bid = self.active().id;
         self.search = Some(crate::search_overlay::SearchState::open(phase, origin, bid));
@@ -824,6 +838,7 @@ impl Editor {
         self.pending_keys.clear(); self.pending_mark = None;
         self.outline = None;
         self.theme_picker = None;
+        self.cursor_picker = None;
         self.file_browser = None;
         let bid = self.active().id;
         let ver = self.active().document.version;
@@ -836,6 +851,7 @@ impl Editor {
         self.search = None; self.diag = None;
         self.pending_keys.clear(); self.pending_mark = None;
         self.theme_picker = None;
+        self.cursor_picker = None;
         self.file_browser = None;
         let bid = self.active().id;
         let ver = self.active().document.version;
@@ -849,7 +865,7 @@ impl Editor {
         self.prompt = None; self.minibuffer = None; self.menu = None;
         self.pending_keys.clear(); self.pending_mark = None;
         self.search = None; self.diag = None; self.outline = None; self.palette = None;
-        self.file_browser = None;
+        self.file_browser = None; self.cursor_picker = None;
         self.theme_picker = Some(crate::theme_picker::ThemePicker {
             query: String::new(), selected: 0, rows: Vec::new(),
             scroll_top: 0, original: self.theme.clone(), previewed: None,
@@ -872,6 +888,7 @@ impl Editor {
         self.diag = None;
         self.outline = None;
         self.theme_picker = None;
+        self.cursor_picker = None;
         self.file_browser = None;
         let source_rows: Vec<crate::palette::PaletteRow> =
             crate::workspace::buffer_switch_rows(self)
@@ -900,10 +917,40 @@ impl Editor {
         self.prompt = None; self.minibuffer = None; self.menu = None; self.palette = None;
         self.pending_keys.clear(); self.pending_mark = None;
         self.search = None; self.diag = None; self.outline = None; self.theme_picker = None;
+        self.cursor_picker = None;
         self.file_browser = Some(crate::file_browser::FileBrowser {
             dir, query: String::new(), entries: Vec::new(), selected: 0, scroll_top: 0,
         });
         if let Some(fb) = self.file_browser.as_mut() { crate::file_browser::rebuild_entries(fb); }
+    }
+
+    /// Open the caret-shape picker, enforcing the single-overlay XOR invariant.
+    ///
+    /// Snapshots the current `(caret_shape, caret_blink)` as the originals so Esc/click-away
+    /// can restore them after a live preview, and seeds `selected` from
+    /// `cursor_picker::initial_row_for` — the row matching the CURRENT caret (row 0 when the
+    /// caret is `Default`; else the concrete matching row). Final-gate F2: opening on the
+    /// current state means the highlight always matches the caret, so Enter-immediately
+    /// commits what is already active rather than lying about it.
+    pub fn open_cursor_picker(&mut self) {
+        self.prompt = None; self.minibuffer = None; self.menu = None;
+        self.pending_keys.clear(); self.pending_mark = None;
+        self.search = None; self.diag = None; self.outline = None; self.palette = None;
+        self.file_browser = None; self.theme_picker = None;
+        let selected = crate::cursor_picker::initial_row_for(self.caret_shape, self.caret_blink);
+        self.cursor_picker = Some(crate::cursor_picker::CursorPicker {
+            selected, original_shape: self.caret_shape, original_blink: self.caret_blink,
+            scroll_top: 0,
+        });
+    }
+
+    /// True while any modal/overlay owns text input — the caret must NOT be parked in the editor
+    /// text area (B11). EXHAUSTIVE by design: a new input surface must be added here (no catch-all).
+    pub fn has_active_input_overlay(&self) -> bool {
+        self.search.is_some() || self.minibuffer.is_some() || self.palette.is_some()
+            || self.outline.is_some() || self.theme_picker.is_some() || self.file_browser.is_some()
+            || self.menu.is_some() || self.prompt.is_some() || self.splash.is_some()
+            || self.diag.is_some() || self.cursor_picker.is_some()
     }
 
     /// Apply a theme: swap, re-derive the heading-glyph flag (cue mode forces ON;
@@ -952,6 +999,12 @@ impl Editor {
         self.mouse.scrollbar_hide_due = None;
         self.mouse.scrollbar_revealed = false;
     }
+
+    /// Set the writing-caret shape. The single setter the `caret_shape_*` / `cycle_caret_shape`
+    /// commands, the cursor picker, and startup config apply all call (contract law 6).
+    pub fn set_caret_shape(&mut self, s: crate::config::CaretShape) { self.caret_shape = s; }
+    /// Set caret blink. Inert while `caret_shape == Default` (emits nothing — see cursor_style).
+    pub fn set_caret_blink(&mut self, on: bool) { self.caret_blink = on; }
 
     /// Set the status-line transient mode (Off coerces to Auto — status has no true Off,
     /// no-silent-UI) and clear its stale dwell state.
@@ -1060,6 +1113,17 @@ mod tests {
         assert_eq!(e.status_line_mode, crate::config::TransientMode::On);
         assert_eq!(e.mouse.scrollbar_reveal_due, None);
         assert!(!e.mouse.status_revealed);
+    }
+
+    #[test]
+    fn caret_setters_are_the_single_mutators() {
+        let mut e = Editor::new_from_text("x\n", None, (40, 12));
+        assert_eq!(e.caret_shape, crate::config::CaretShape::Default);
+        assert!(e.caret_blink);
+        e.set_caret_shape(crate::config::CaretShape::Beam);
+        e.set_caret_blink(false);
+        assert_eq!(e.caret_shape, crate::config::CaretShape::Beam);
+        assert!(!e.caret_blink);
     }
 
     // ------------------------------------------------------------------

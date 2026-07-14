@@ -196,6 +196,7 @@ pub(crate) fn dispatch_overlay_command(
     editor.palette = None;
     editor.menu = None;
     editor.theme_picker = None;
+    editor.cursor_picker = None;
     editor.file_browser = None;
     let mut ctx = crate::registry::Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
     reg.dispatch(id, &mut ctx);
@@ -278,6 +279,8 @@ fn reduce_dispatch(
     let msg = match crate::palette::intercept(msg, editor, reg, keymap, ex, clock, msg_tx) {
         crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
     let msg = match crate::theme_picker::intercept(msg, editor, ex, clock, msg_tx) {
+        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
+    let msg = match crate::cursor_picker::intercept(msg, editor, ex, clock, msg_tx) {
         crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
     let msg = match crate::file_browser::intercept(msg, editor, ex, clock, msg_tx) {
         crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
@@ -534,6 +537,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // startup (no dwell pending yet).
     editor.set_scrollbar_mode(cfg.view.scrollbar);
     editor.set_status_line_mode(cfg.view.status_line);
+    editor.set_caret_shape(cfg.view.caret_shape);
+    editor.set_caret_blink(cfg.view.caret_blink);
     editor.set_clipboard_provider(cfg.clipboard.provider);
     editor.clear_clipboard_provider_dirty(); // worker gets the initial plan below; no redundant rebuild
     editor.resume_enabled = cfg.state.resume; // gates open_into_current's resume restore (Effort 7)
@@ -627,6 +632,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // Mouse capture is gated on editor.mouse_capture (seeded from config above).
     let mut guard = term::TerminalGuard::new(editor.mouse_capture)?;
     let mut applied_mouse = editor.mouse_capture;
+    let mut applied_caret: Option<(crate::config::CaretShape, bool)> = None;
 
     // Initial derive so the first draw has up-to-date layouts.
     derive::rebuild(&mut editor);
@@ -754,6 +760,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
 
     // Reconcile mouse capture once before the first draw (post-guard invariant).
     crate::chrome::reconcile_mouse_capture(&mut editor, guard.terminal().backend_mut(), &mut applied_mouse);
+    crate::cursor_style::reconcile_cursor_style(&editor, guard.terminal().backend_mut(), &mut applied_caret);
 
     crate::chrome::recompute_scrollbar_visible(&mut editor, clock.now_ms());
     crate::chrome::recompute_status_line(&mut editor, clock.now_ms());
@@ -861,6 +868,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         {
             let mut e = editor.borrow_mut();
             crate::chrome::reconcile_mouse_capture(&mut e, guard.terminal().backend_mut(), &mut applied_mouse);
+            crate::cursor_style::reconcile_cursor_style(&e, guard.terminal().backend_mut(), &mut applied_caret);
         }
         { advance(&mut editor.borrow_mut(), &clock); }
         {
