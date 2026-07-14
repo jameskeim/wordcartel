@@ -487,6 +487,21 @@ mod tests {
         assert_eq!(p.head, p.from());
     }
 
+    /// Multiple spaces before the promoted sentence — the WHOLE trailing-whitespace run must be
+    /// trimmed and replaced with exactly "\n\n" (no stray spaces left before the break).
+    #[test]
+    fn break_paragraph_here_trims_multiple_trailing_spaces() {
+        let mut e = Editor::new_from_text("Alpha one.   Beta two.\n", None, (40, 12));
+        crate::derive::rebuild(&mut e);
+        let at = "Alpha one.   Beta two.\n".find("Beta").unwrap();
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(at);
+        assert_eq!(break_paragraph_here(&mut e, &TestClock(0)), CommandResult::Handled);
+        assert_eq!(e.active().document.buffer.to_string(), "Alpha one.\n\nBeta two.\n");
+        let p = e.active().document.selection.primary();
+        assert_eq!(e.active().document.buffer.slice(p.from()..p.to()), "Beta two.");
+        assert_eq!(p.head, p.from());
+    }
+
     #[test]
     fn break_paragraph_here_noop_at_paragraph_start() {
         // caret on the FIRST sentence of the paragraph — nothing precedes it to split off.
@@ -528,6 +543,21 @@ mod tests {
         assert_eq!(merge_paragraph_forward(&mut e, &TestClock(0)), CommandResult::Handled);
         assert_eq!(e.active().document.buffer.to_string(), "Para one. Para two.\n");
         // F8: the absorbed paragraph's first sentence is selected, head-at-start.
+        let p = e.active().document.selection.primary();
+        assert_eq!(e.active().document.buffer.slice(p.from()..p.to()), "Para two.");
+        assert_eq!(p.head, p.from(), "F8: caret head-at-start on the absorbed sentence");
+    }
+
+    /// Multiple blank lines between paragraphs — the whole gap (the paragraph's own trailing
+    /// newline plus several blank lines) must collapse to exactly ONE space, not one per blank
+    /// line, pinning the `trim_end_matches` content-end logic against a multi-blank-line run.
+    #[test]
+    fn merge_paragraph_forward_collapses_multiple_blank_lines() {
+        let mut e = Editor::new_from_text("Para one.\n\n\n\nPara two.\n", None, (40, 12));
+        crate::derive::rebuild(&mut e);
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(2); // in Para one
+        assert_eq!(merge_paragraph_forward(&mut e, &TestClock(0)), CommandResult::Handled);
+        assert_eq!(e.active().document.buffer.to_string(), "Para one. Para two.\n");
         let p = e.active().document.selection.primary();
         assert_eq!(e.active().document.buffer.slice(p.from()..p.to()), "Para two.");
         assert_eq!(p.head, p.from(), "F8: caret head-at-start on the absorbed sentence");
@@ -600,8 +630,41 @@ mod tests {
         assert_eq!(e.active().document.buffer.to_string(), "One two. Three four.\n");
     }
 
+    /// A TWO-space separator gives a gap caret that sits STRICTLY inside the whitespace run
+    /// (`head > st`, not merely `head == st` as in the single-space edge case above) — pins the
+    /// `h < st` guard for the true interior-gap case, not just the boundary.
+    #[test]
+    fn split_rejects_gap_interior_with_two_space_separator() {
+        let mut e = Editor::new_from_text("One two.  Three four.\n", None, (40, 12));
+        crate::derive::rebuild(&mut e);
+        let st = "One two.".len(); // 8: preceding sentence's content end
+        let gap = st + 1; // strictly inside the two-space gap: st < gap < next sentence start
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(gap);
+        assert_eq!(split_sentence_at_caret(&mut e, &TestClock(0)), CommandResult::Noop);
+        assert_eq!(e.active().document.buffer.to_string(), "One two.  Three four.\n");
+    }
+
     /// The interior guard is `sf < head < st` (STRICT both sides), not `head == sf || head == st`
     /// (Codex finding). A caret sitting exactly on either sentence boundary must decline, not split.
+    /// The caret sits MID-WORD (not adjacent to whitespace), so `next_is_ws` is false and the
+    /// `". "` branch (terminator + inserted space) runs — every other split test puts the caret
+    /// right before an existing space, which only exercises the `"."`-only branch.
+    #[test]
+    fn split_sentence_at_caret_mid_word_inserts_terminator_and_space() {
+        let text = "the cat sat on the mat\n";
+        let mut e = Editor::new_from_text(text, None, (40, 12));
+        crate::derive::rebuild(&mut e);
+        let at = text.find("on").unwrap() + 1; // between 'o' and 'n' of "on" — mid-word, no adjacent ws
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(at);
+        assert_eq!(split_sentence_at_caret(&mut e, &TestClock(0)), CommandResult::Handled);
+        assert_eq!(e.active().document.buffer.to_string(), "the cat sat o. N the mat\n");
+        // F8: the new second sentence ("N the mat") is selected, head-at-start on the capitalized 'N'.
+        let p = e.active().document.selection.primary();
+        assert_eq!(e.active().document.buffer.slice(p.from()..p.to()), "N the mat");
+        assert_eq!(p.head, p.from());
+        assert_eq!(e.active().document.buffer.slice(p.head..p.head + 1), "N", "caret on the capital");
+    }
+
     #[test]
     fn split_sentence_at_caret_rejects_at_sentence_edges() {
         let mut e = Editor::new_from_text("One two. Three four.\n", None, (40, 12));
