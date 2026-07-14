@@ -154,11 +154,10 @@ pub struct Buffer {
     pub swap_in_flight: bool,
     pub pending_swap_body: Option<String>,
     pub pending_swap_path: Option<PathBuf>,
-    // 5c: marks/ring/sel_history — wired in Tasks 5–10
+    // 5c: marks/ring — wired in Tasks 5–10
     pub marks: std::collections::BTreeMap<char, usize>,
     pub jump_ring: Vec<usize>,
     pub ring_cursor: usize,
-    pub sel_history: Vec<wordcartel_core::selection::Selection>,
     // 5f: per-buffer diagnostics store
     pub diagnostics: crate::diagnostics_run::DiagStore,
     /// per-buffer block-tree reconcile store (incremental-soundness effort)
@@ -235,7 +234,6 @@ impl Buffer {
             marks: Default::default(),
             jump_ring: Vec::new(),
             ring_cursor: 0,
-            sel_history: Vec::new(),
             diagnostics: crate::diagnostics_run::DiagStore::new(),
             reconcile: crate::reconcile::ReconcileStore::default(),
             folds: crate::fold::FoldState::default(),
@@ -295,7 +293,6 @@ impl Buffer {
         if self.marked_block.is_some_and(|b| b.start >= b.end) {
             self.marked_block = None; // collapsed → clear
         }
-        self.sel_history.clear();
         crate::recovery::record_snapshot(self.document.path.as_deref(), self.document.buffer.snapshot());
     }
     pub fn undo(&mut self) -> bool {
@@ -305,7 +302,6 @@ impl Buffer {
                 self.document.version += 1;
                 self.last_edit = None;
                 self.pre_edit_rope = None;
-                self.sel_history.clear();
                 // 5g: drop fold anchors now past EOF; rebuild reconciles the rest.
                 let len = self.document.buffer.len();
                 self.folds.clamp(len);
@@ -324,7 +320,6 @@ impl Buffer {
                 self.document.version += 1;
                 self.last_edit = None;
                 self.pre_edit_rope = None;
-                self.sel_history.clear();
                 // 5g: drop fold anchors now past EOF; rebuild reconciles the rest.
                 let len = self.document.buffer.len();
                 self.folds.clamp(len);
@@ -1352,38 +1347,11 @@ mod tests {
         assert_eq!(e.active().marks.get(&'a'), Some(&6));
     }
 
-    #[test]
-    fn apply_clears_sel_history() {
-        use wordcartel_core::change::ChangeSet;
-        use wordcartel_core::history::Transaction;
-        use wordcartel_core::selection::Selection;
-        let clk = TestClock(std::cell::Cell::new(0));
-        let mut e = Editor::new_from_text("abcdef", None, (80, 24));
-        e.active_mut().sel_history.push(Selection::single(0));
-        let cs = ChangeSet::insert(1, "X", e.active().document.buffer.len());
-        e.apply(Transaction::new(cs), Edit { range: 1..1, new_len: 1 }, EditKind::Type, &clk);
-        assert!(e.active().sel_history.is_empty(), "edit must reset the expand ladder");
-    }
-
-    #[test]
-    fn undo_clears_expand_ladder() {
-        use wordcartel_core::change::ChangeSet;
-        use wordcartel_core::history::Transaction;
-        use wordcartel_core::selection::Selection;
-        let clk = TestClock(std::cell::Cell::new(0));
-        let mut e = Editor::new_from_text("abcdef", None, (80, 24));
-        // Simulate an expand by pushing a selection onto sel_history.
-        e.active_mut().sel_history.push(Selection::single(0));
-        // Make an edit so there is history to undo.
-        let cs = ChangeSet::insert(1, "X", e.active().document.buffer.len());
-        e.apply(Transaction::new(cs), Edit { range: 1..1, new_len: 1 }, EditKind::Type, &clk);
-        // apply already clears sel_history; push again to simulate a post-edit expand.
-        e.active_mut().sel_history.push(Selection::single(3));
-        // undo must clear the stale ladder.
-        let changed = e.undo();
-        assert!(changed, "undo of a real edit must report change");
-        assert!(e.active().sel_history.is_empty(), "undo must clear the expand ladder (sel_history)");
-    }
+    // NOTE (S4 T3): `apply_clears_sel_history` and `undo_clears_expand_ladder` deleted — they
+    // exercised the deleted `sel_history` field. Stateless expand/shrink (commands.rs LADDER)
+    // re-derives from the current selection on every call, so there is no ladder state left to
+    // reset on edit/undo; the Hazard-4 replacement coverage lives in
+    // `commands::tests::stateless_shrink_returns_first_sentence_and_survives_undo`.
 
     #[test]
     fn open_minibuffer_clears_pending_keys() {

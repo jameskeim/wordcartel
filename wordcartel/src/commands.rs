@@ -84,11 +84,12 @@ pub enum Command {
     DeleteLine,
     /// Delete from the caret to the end of the current logical line, keeping the newline.
     DeleteToLineEnd,
-    /// Select the given text-object scope at the caret (clears sel_history).
+    /// Select the given text-object scope at the caret.
     SelectScope(Scope),
-    /// Grow selection: word → sentence → paragraph → document (pushes to sel_history).
+    /// Grow selection: word → sentence → paragraph → section → document (`LADDER`, stateless).
     ExpandSelection,
-    /// Shrink selection: pop one level from sel_history.
+    /// Shrink selection: the largest canonical scope strictly contained in the current
+    /// selection (`LADDER` reversed, stateless — mirrors `ExpandSelection`).
     ShrinkSelection,
     /// Select the entire buffer contents.
     SelectAll,
@@ -288,6 +289,11 @@ fn set_selection_range(editor: &mut Editor, from: usize, to: usize) {
     nav::ensure_visible(editor);
 }
 
+/// Expand/shrink rungs, finest → coarsest. A data table (spec §3.4) — adding a rung is a table
+/// edit, not dispatcher growth. A declined scope (`Sentence` on non-prose, `Section` with no
+/// enclosing heading) yields an empty range and is skipped by the strict-containment test.
+const LADDER: &[Scope] = &[Scope::Word, Scope::Sentence, Scope::Paragraph, Scope::Section, Scope::Document];
+
 /// Execute `cmd` against `editor`, then re-derive + ensure visibility.
 #[allow(clippy::too_many_lines)] // exhaustive flat Command dispatch — edit arms delegate to
                                  // commands::edit; remaining arms are small non-edit state ops (H11)
@@ -299,8 +305,6 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         Command::DeleteForward       => edit::delete_forward(editor, clock),
 
         Command::Move { dir, extend } => {
-            // Reset the expand-selection ladder on every motion (Task 7).
-            editor.active_mut().sel_history.clear();
             // DocStart / DocEnd are deliberate long-range jumps: push the ring
             // so the user can alt-left back to where they came from.
             if matches!(dir, Dir::DocStart | Dir::DocEnd) {
@@ -487,7 +491,6 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         Command::DeleteToLineEnd => edit::delete_to_line_end(editor, clock),
 
         Command::SelectScope(scope) => {
-            editor.active_mut().sel_history.clear(); // (removed in T3)
             match scope {
                 Scope::Sentence => match prose_sentence_at(editor, nav::head(editor)) {
                     Ok((from, to)) => { set_selection_range(editor, from, to); CommandResult::Handled }
@@ -514,34 +517,31 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
         Command::ExpandSelection => {
             let cur = editor.active().document.selection.primary();
             let (cf, ct) = (cur.from(), cur.to());
-            // Find the smallest scope strictly larger than the current selection.
-            let order = [Scope::Word, Scope::Sentence, Scope::Paragraph, Scope::Document];
+            let from = cf; // C-9: evaluate strictly inside the span
             let mut next: Option<(usize, usize)> = None;
-            for sc in order {
-                let (f, t) = scope_range(editor, sc);
+            for sc in LADDER.iter().copied() {
+                let (f, t) = scope_range_at(editor, from, sc);
                 if f <= cf && t >= ct && (f < cf || t > ct) { next = Some((f, t)); break; }
             }
-            if let Some((f, t)) = next {
-                // Clone to a local first — avoids overlapping active()/active_mut() borrow.
-                let cur_sel = editor.active().document.selection.clone();
-                editor.active_mut().sel_history.push(cur_sel);
-                set_selection_range(editor, f, t);
-                CommandResult::Handled
-            } else { CommandResult::Noop }
+            match next {
+                Some((f, t)) => { set_selection_range(editor, f, t); CommandResult::Handled }
+                None => CommandResult::Noop,
+            }
         }
 
         Command::ShrinkSelection => {
-            if let Some(prev) = editor.active_mut().sel_history.pop() {
-                editor.active_mut().document.selection = prev;
-                derive::rebuild(editor);
-                let head = editor.active().document.selection.primary().head;
-                let snapped = place_caret_visible(editor, head, CaretPlace::SnapOut);
-                if snapped != head {
-                    editor.active_mut().document.selection = Selection::single(snapped);
-                }
-                nav::ensure_visible(editor);
-                CommandResult::Handled
-            } else { CommandResult::Noop }
+            let cur = editor.active().document.selection.primary();
+            let (cf, ct) = (cur.from(), cur.to());
+            let from = cf;
+            let mut inner: Option<(usize, usize)> = None;
+            for sc in LADDER.iter().rev().copied() {
+                let (f, t) = scope_range_at(editor, from, sc);
+                if f >= cf && t <= ct && (f > cf || t < ct) && f < t { inner = Some((f, t)); break; }
+            }
+            match inner {
+                Some((f, t)) => { set_selection_range(editor, f, t); CommandResult::Handled }
+                None => CommandResult::Noop,
+            }
         }
 
         Command::SelectAll => {
@@ -549,7 +549,6 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             editor.active_mut().document.selection =
                 wordcartel_core::selection::Selection::range(0, len);
             editor.active_mut().desired_col = None;
-            editor.active_mut().sel_history.clear();
             nav::ensure_visible(editor);
             CommandResult::Handled
         }
@@ -1311,13 +1310,45 @@ mod tests {
         assert_eq!((w2.from(), w2.to()), (w.from(), w.to()));
     }
 
+    // -------------------------------------------------------------------------
+    // Task 3 (effort-s4-prose-surgery): LADDER data table + stateless shrink
+    // -------------------------------------------------------------------------
+
     #[test]
-    fn a_motion_resets_the_expand_ladder() {
-        let mut e = Editor::new_from_text("One two.\n", None, (80, 24));
-        set_caret(&mut e, 1); derive::rebuild(&mut e);
-        run(Command::ExpandSelection, &mut e, &TestClock(0));
-        run(Command::Move { dir: Dir::Right, extend: false }, &mut e, &TestClock(0)); // resets
-        assert!(e.active().sel_history.is_empty());
+    fn ladder_expands_word_sentence_paragraph_section_document() {
+        let doc = "# H\n\nOne two. Three four.\n";
+        let mut e = Editor::new_from_text(doc, None, (60, 12));
+        derive::rebuild(&mut e);
+        let at = doc.find("two").unwrap();
+        e.active_mut().document.selection = Selection::single(at);
+        run(Command::SelectScope(Scope::Word), &mut e, &TestClock(0));      // "two"
+        run(Command::ExpandSelection, &mut e, &TestClock(0));               // → Sentence "One two."
+        let p = e.active().document.selection.primary();
+        assert_eq!(e.active().document.buffer.slice(p.from()..p.to()), "One two.");
+        run(Command::ExpandSelection, &mut e, &TestClock(0));               // → Paragraph
+        run(Command::ExpandSelection, &mut e, &TestClock(0));               // → Section (# H subtree)
+        let s = e.active().document.selection.primary();
+        assert_eq!(s.from(), doc.find("# H").unwrap());
+        run(Command::ExpandSelection, &mut e, &TestClock(0));               // → Document
+        let d = e.active().document.selection.primary();
+        assert_eq!((d.from(), d.to()), (0, doc.len()));
+    }
+
+    #[test]
+    fn stateless_shrink_returns_first_sentence_and_survives_undo() {
+        let doc = "One two. Three four.\n";
+        let mut e = Editor::new_from_text(doc, None, (40, 12));
+        derive::rebuild(&mut e);
+        e.active_mut().document.selection = Selection::single(2);
+        run(Command::SelectScope(Scope::Paragraph), &mut e, &TestClock(0));
+        run(Command::ShrinkSelection, &mut e, &TestClock(0)); // paragraph → FIRST sentence (from())
+        let p = e.active().document.selection.primary();
+        assert_eq!(e.active().document.buffer.slice(p.from()..p.to()), "One two.");
+        // Hazard-4: expand → edit → shrink must not panic and must yield a canonical rung.
+        run(Command::SelectScope(Scope::Paragraph), &mut e, &TestClock(0));
+        run(Command::InsertChar('!'), &mut e, &TestClock(1));
+        e.undo();
+        run(Command::ShrinkSelection, &mut e, &TestClock(2)); // no panic, no stale state
     }
 
     #[test]
@@ -1416,25 +1447,10 @@ mod tests {
         assert!(!fv.is_hidden(ed.active().document.buffer.byte_to_line(head)));
     }
 
-    #[test]
-    fn shrink_selection_snaps_restored_caret_out_of_fold() {
-        let doc = "## A\nbody1\nbody2\n## B\n";
-        let mut ed = crate::editor::Editor::new_from_text(doc, None, (80, 24));
-        crate::derive::rebuild(&mut ed);
-        let a = doc.find("## A").unwrap();
-        let inside = doc.find("body2").unwrap();
-        ed.active_mut().sel_history.push(wordcartel_core::selection::Selection::single(inside));
-        ed.active_mut().folds.toggle(a);
-        crate::derive::rebuild(&mut ed);
-        ed.active_mut().document.selection = wordcartel_core::selection::Selection::single(a);
-
-        run(Command::ShrinkSelection, &mut ed, &TestClock(0));
-
-        let head = ed.active().document.selection.primary().head;
-        let fv = { let b = ed.active(); crate::fold::FoldView::compute(&b.folds, b.document.blocks(), &b.document.buffer) };
-        assert_eq!(head, a);
-        assert!(!fv.is_hidden(ed.active().document.buffer.byte_to_line(head)));
-    }
+    // NOTE (S4 T3): `shrink_selection_snaps_restored_caret_out_of_fold` deleted — it exercised the
+    // push/pop `sel_history` restore + `SnapOut` mechanism, which no longer exists. Stateless
+    // `ShrinkSelection` now mirrors `ExpandSelection` exactly (`set_selection_range`, no snap-out);
+    // this is the same fold-adjacency behavior `ExpandSelection` already had pre-T3 (ratified).
 
     // -------------------------------------------------------------------------
     // Task 2 (Effort 8): Select All command
@@ -1449,7 +1465,6 @@ mod tests {
         assert_eq!((sel.from(), sel.to()), (0, len));
         assert_eq!(sel.head, len, "forward selection: caret (head) lands at end");
         assert!(e.active().desired_col.is_none());
-        assert!(e.active().sel_history.is_empty(), "expand-selection ladder reset on select-all");
     }
 
     #[test]

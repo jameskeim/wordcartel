@@ -389,7 +389,6 @@ pub(crate) fn goto_line_submit(editor: &mut crate::editor::Editor, text: &str) {
     let caret = crate::registry::place_caret_visible(editor, target, crate::registry::CaretPlace::UnfoldTo);
     editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(caret);
     editor.active_mut().desired_col = None;
-    editor.active_mut().sel_history.clear();
     crate::derive::rebuild(editor);   // UnfoldTo can change fold state → relayout (mirrors registry.rs:409 / app.rs:680)
     crate::nav::ensure_visible(editor);
 }

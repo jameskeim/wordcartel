@@ -49,13 +49,14 @@ pub fn editing_cell(editor: &Editor, col: u16, row: u16) -> CellHit {
 /// when `mouse_capture` is disabled.  Left-click → caret placement, Shift+click
 /// → extend selection, Drag → drag-select with edge auto-scroll, Up → clear
 /// dragging.
-/// Push the current selection onto sel_history, then set a range selection [f,t),
-/// rebuild, and ensure the caret is visible.  The sel_history push lets a
-/// following Ctrl+W (ExpandSelection) grow from the mouse selection.
+/// Set a range selection [f,t), rebuild, and ensure the caret is visible.
+///
+/// Ctrl+W (ExpandSelection) is stateless (S4 T3): it re-derives from the CURRENT selection
+/// rather than a pushed history, so a following expand grows from whatever this call leaves
+/// selected — no explicit seeding needed. A mouse/hand-made selection is therefore no longer a
+/// shrink TARGET (stateless shrink lands on canonical LADDER rungs, not exact prior ranges) —
+/// F4's already-accepted cost, not a regression.
 fn seed_and_select(editor: &mut Editor, f: usize, t: usize) {
-    // Clone to a local first — avoids overlapping active()/active_mut() borrow.
-    let cur_sel = editor.active().document.selection.clone();
-    editor.active_mut().sel_history.push(cur_sel);
     editor.active_mut().document.selection =
         wordcartel_core::selection::Selection::range(f, t);
     crate::derive::rebuild(editor);
@@ -619,7 +620,6 @@ pub fn handle(
                     Some(o) => crate::nav::clamp_snap(editor, o),
                     None => visible_doc_end(editor),
                 };
-                editor.active_mut().sel_history.clear();
                 if ev.modifiers.contains(KeyModifiers::SHIFT) {
                     let anchor = editor.active().document.selection.primary().anchor;
                     editor.active_mut().document.selection =
@@ -837,7 +837,6 @@ mod tests {
         handle(&mut e, down(7, 0), &reg, &km, &ex, &clk, &tx); // triple → paragraph
         let r2 = e.active().document.selection.primary();
         assert!(e.active().document.buffer.slice(r2.from()..r2.to()).starts_with("alpha beta"));
-        assert!(!e.active().sel_history.is_empty(), "multi-click seeds the expand ladder");
     }
 
     #[test]
