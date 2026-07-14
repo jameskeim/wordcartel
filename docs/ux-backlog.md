@@ -95,22 +95,6 @@ selected item a dedicated highlight fg color; (b) at minimum restore dark, legib
 Anchors: `ChromeSelected` (`theme.rs:37,332`), the dropdown/selected-item render path (`render.rs` menu
 paint), `ChromeMuted` (dropdown normal), E5 (`derive_chrome` recede, `5e1c2ea`).
 
-### B8. Configurable terminal text-caret shape / colour
-<!-- item: B8 -->
-
-**Idea (user):** let the user choose the colour and size/style of the terminal text caret (block vs beam vs
-underline, blink, colour) — "some people have opinions on the caret they use/see."
-
-**Grounded (may drift):** the app does NOT set the terminal cursor shape today (no `DECSCUSR` /
-`SetCursorStyle` / OSC-cursor-colour emission in the tree) — it leaves the caret to the terminal default.
-Adding it means emitting `DECSCUSR` (`CSI Ps SP q`: 1/2 block, 3/4 underline, 5/6 bar; blink vs steady) on
-startup/focus and restoring on exit, and optionally OSC 12 cursor-colour set/reset — plus a user-settable,
-persisted style option (command-surface). Caveats: terminal support varies; tmux passthrough; MUST restore
-the caret on exit/suspend/panic (mirror the panic→restore path). Anchors: crossterm cursor APIs, terminal
-setup/teardown (raw-mode enter/leave + the panic-restore hook), the command-surface option pattern.
-
----
-
 ## Theme C — document workflow
 
 ## Theme D — configuration & persistence
@@ -903,13 +887,6 @@ Forward-only drafting mode — toggle that disables deletion (Write-or-Die style
 <!-- item: PE -->
 
 Bundled example plugins — full-featured writer plugins + authoring tutorials (each with a README)
-
-*(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
-
-### B11 — Modal/overlay caret parked under the modal (query field shows no caret)
-<!-- item: B11 -->
-
-Modal/overlay caret parked under the modal (query field shows no caret)
 
 *(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
 

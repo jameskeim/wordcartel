@@ -518,6 +518,28 @@ cue/no-color mode (SHADES drives that path too) and reserve the same 2-col prefi
 *(B5 SHIPPED 2026-07-08 in the polish batch — `SHADES` is now the single-axis ramp `█▆▅▄▃▂`
 (`render.rs:20`); this entry's "grounded" section shows the pre-fix ramp.)*
 
+### B8. Configurable terminal text-caret shape / colour
+<!-- item: B8 -->
+
+**Idea (user):** let the user choose the colour and size/style of the terminal text caret (block vs beam vs
+underline, blink, colour) — "some people have opinions on the caret they use/see."
+
+**Grounded (may drift):** the app does NOT set the terminal cursor shape today (no `DECSCUSR` /
+`SetCursorStyle` / OSC-cursor-colour emission in the tree) — it leaves the caret to the terminal default.
+Adding it means emitting `DECSCUSR` (`CSI Ps SP q`: 1/2 block, 3/4 underline, 5/6 bar; blink vs steady) on
+startup/focus and restoring on exit, and optionally OSC 12 cursor-colour set/reset — plus a user-settable,
+persisted style option (command-surface). Caveats: terminal support varies; tmux passthrough; MUST restore
+the caret on exit/suspend/panic (mirror the panic→restore path). Anchors: crossterm cursor APIs, terminal
+setup/teardown (raw-mode enter/leave + the panic-restore hook), the command-surface option pattern.
+
+### B11 — Modal/overlay caret parked under the modal (query field shows no caret)
+<!-- item: B11 -->
+
+Modal/overlay caret parked under the modal (query field shows no caret)
+
+*(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
+
+
 ## Theme C — document workflow
 
 ### C1 — LaTeX export + xelatex PDF + export typography

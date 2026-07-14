@@ -290,12 +290,14 @@ created = "2026-07-09"
 [[item]]
 id = "B8"
 title = "Writing caret — DECSCUSR shape/blink config + cursor picker + panic-safe restore"
-status = "needs-design"
+status = "shipped"
 kind = "feature"
 size = "SM"
 theme = "B"
 hook = "The 'writing caret' effort (C1 of the unified-cursor-system review, docs/design/cursor-system-concept-review.md). The caret stays the HARDWARE cursor — painted-cursor mode is CUT (dim/brightness not a want, decided 2026-07-13), so Fork A collapses to this. Emit DECSCUSR (block/beam/underline + blink) as a user-settable option via the command-surface contract (set-per-state + cycle + LAW-2 settings gate); a cursor PICKER modeled on the theme-picker (preview / Esc-restore / apply); restore the caret on exit AND panic. Also fixes the modal-caret wart (B11). Delivers most of concept §3 + §5's settled modal rules; caret-on-marker collision resolves natively (terminal cursor overlays painted marks). ~SM."
-doc = "ux-backlog.md#b8"
+doc = "backlog-archive.md#b8"
+shipped_commit = "c740ba4"
+shipped_date = "2026-07-14"
 created = "2026-07-09"
 
 # ─────────────────────────── Theme C — document workflow ───────────────────────────
@@ -1109,12 +1111,14 @@ created = "2026-07-13"
 [[item]]
 id = "B11"
 title = "Modal/overlay caret parked under the modal (query field shows no caret)"
-status = "needs-design"
+status = "shipped"
 kind = "bug"
 size = "S"
 theme = "B"
 hook = "Found in the cursor-system review. When a modal/overlay query field is open (palette / outline / picker / file browser), the field paints NO caret while the terminal's HARDWARE cursor stays PARKED at the editor caret beneath the modal — cursor in the wrong place, query field looks caret-less. Fix: place/show the caret in the active query field while a modal owns input. Cheap; also folded into B8/C1. ~S."
-doc = "ux-backlog.md#b11"
+doc = "backlog-archive.md#b11"
+shipped_commit = "c740ba4"
+shipped_date = "2026-07-14"
 created = "2026-07-13"
 
 [[item]]
