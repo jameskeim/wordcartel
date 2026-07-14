@@ -905,3 +905,24 @@ Forward-only drafting mode — toggle that disables deletion (Write-or-Die style
 Bundled example plugins — full-featured writer plugins + authoring tutorials (each with a README)
 
 *(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
+
+### B11 — Modal/overlay caret parked under the modal (query field shows no caret)
+<!-- item: B11 -->
+
+Modal/overlay caret parked under the modal (query field shows no caret)
+
+*(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
+
+### B12 — Lone block-begin marker renders nothing (^KB before ^KK is invisible)
+<!-- item: B12 -->
+
+Lone block-begin marker renders nothing (^KB before ^KK is invisible)
+
+*(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*
+
+### B13 — Block markers — styled boundary cells (modern B-lite; no injected bracket glyphs)
+<!-- item: B13 -->
+
+Block markers — styled boundary cells (modern B-lite; no injected bracket glyphs)
+
+*(Captured 2026-07-13 via `scripts/backlog add`; flesh out the triage prose when picked up.)*

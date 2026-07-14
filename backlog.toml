@@ -289,12 +289,12 @@ created = "2026-07-09"
 
 [[item]]
 id = "B8"
-title = "Configurable terminal caret shape / colour"
+title = "Writing caret — DECSCUSR shape/blink config + cursor picker + panic-safe restore"
 status = "needs-design"
 kind = "feature"
-size = "TBD"
+size = "SM"
 theme = "B"
-hook = "Emit DECSCUSR (block/beam/underline, blink, colour); restore on exit/panic."
+hook = "The 'writing caret' effort (C1 of the unified-cursor-system review, docs/design/cursor-system-concept-review.md). The caret stays the HARDWARE cursor — painted-cursor mode is CUT (dim/brightness not a want, decided 2026-07-13), so Fork A collapses to this. Emit DECSCUSR (block/beam/underline + blink) as a user-settable option via the command-surface contract (set-per-state + cycle + LAW-2 settings gate); a cursor PICKER modeled on the theme-picker (preview / Esc-restore / apply); restore the caret on exit AND panic. Also fixes the modal-caret wart (B11). Delivers most of concept §3 + §5's settled modal rules; caret-on-marker collision resolves natively (terminal cursor overlays painted marks). ~SM."
 doc = "ux-backlog.md#b8"
 created = "2026-07-09"
 
@@ -1104,4 +1104,37 @@ theme = "P"
 hook = "Promote the P-demo fixtures (insert_date.lua P1, wordcount.lua P2, pomodoro.lua P3, currently under tests/fixtures/plugins) into a curated set of BUNDLED, user-facing EXAMPLE plugins that do DOUBLE DUTY: (a) create genuinely good writer experiences out of the box — real drafting-comfort features, not minimal demos; and (b) TEACH plugin authoring — exemplary, heavily-commented Lua that walks the command / on-edit hook / timer / config surfaces and the observer-tier vs edit-tier (submit_transaction) rules. EACH plugin ships its OWN README (what it does for the writer + a build-it-yourself walkthrough), so the set is the plugin-authoring tutorial corpus AND the shipped drafting-comfort layer. Likely needs a BUNDLED-PLUGINS mechanism (where they live, how they load/enable/update) if none exists — surface that first. Expand beyond the three; candidates map to the feature items: snippet expansion (A18 <- insert_date), word-count goal + progress (A19 <- wordcount), writing-session timer (<- pomodoro), forward-only mode (A20), insert-template. Later: an async example once wc.async (PD) lands. Relates: P (shipped system), A18/A19/A20 (the features). ~M."
 doc = "ux-backlog.md#pe"
 depends_on = ["P"]
+created = "2026-07-13"
+
+[[item]]
+id = "B11"
+title = "Modal/overlay caret parked under the modal (query field shows no caret)"
+status = "needs-design"
+kind = "bug"
+size = "S"
+theme = "B"
+hook = "Found in the cursor-system review. When a modal/overlay query field is open (palette / outline / picker / file browser), the field paints NO caret while the terminal's HARDWARE cursor stays PARKED at the editor caret beneath the modal — cursor in the wrong place, query field looks caret-less. Fix: place/show the caret in the active query field while a modal owns input. Cheap; also folded into B8/C1. ~S."
+doc = "ux-backlog.md#b11"
+created = "2026-07-13"
+
+[[item]]
+id = "B12"
+title = "Lone block-begin marker renders nothing (^KB before ^KK is invisible)"
+status = "needs-design"
+kind = "bug"
+size = "S"
+theme = "B"
+hook = "Found in the cursor-system review. Effort-9A shipped the marked-block system WITHOUT rendering a LONE begin marker: after ^KB (block-begin) with no ^KK (block-end) yet, there is NO visual indication a start is set — only a complete begin+end region paints (SE::MarkedBlock). The writer can't see they set a mark. Fix: render the pending_block_begin position. Superseded by B13 (styled boundaries) which does this properly for all markers; filed separately as the acute defect. ~S."
+doc = "ux-backlog.md#b12"
+created = "2026-07-13"
+
+[[item]]
+id = "B13"
+title = "Block markers — styled boundary cells (modern B-lite; no injected bracket glyphs)"
+status = "needs-design"
+kind = "feature"
+size = "S"
+theme = "B"
+hook = "C2 of the cursor-system review (docs/design/cursor-system-concept-review.md). Render marked-block BEGIN/END (and the lone-begin, closing B12) as STYLED BOUNDARY CELLS — a reverse/underline/theme treatment on the boundary column — NOT injected bracket glyphs. Decision 2026-07-13: the WordStar [ ]-bracket model was predicated on hardware-terminal capabilities; styled boundary cells are the modern, cheaper choice (~15% of the B-full injected-marker cost) with the IDENTICAL data model. Explicitly NOT B-full (Fork B: injected display-only marker columns via layout()/ColMap — reuses the ventilate/ColMap regime but Medium + highest correctness stakes; deferred unless a real need appears). No byte injection, no ColMap change -> no data-safety surface. Must honor the terminal-plain/no-color fallback (reverse/underline, not color alone). ~S."
+doc = "ux-backlog.md#b13"
 created = "2026-07-13"
