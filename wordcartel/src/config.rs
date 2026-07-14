@@ -1170,6 +1170,8 @@ mod tests {
             view_scrollbar:  crate::config::TransientMode::Auto,
             view_status_line: crate::config::TransientMode::On,
             view_splash:     true,
+            view_caret_shape: crate::config::CaretShape::Default,
+            view_caret_blink: true,
             menu_bar:        crate::config::MenuBarMode::Pinned,
             mouse_capture:   false,
             chrome_disposition: wordcartel_core::theme::ChromeDisposition::Zen,

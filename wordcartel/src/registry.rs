@@ -663,6 +663,28 @@ impl Registry {
                                     else { "splash: off (takes effect next launch)".into() };
                   CommandResult::Handled });
 
+        // Caret shape: set-per-state (palette-only) + 4-state cycle representative (View, state-in-label).
+        use crate::config::CaretShape;
+        r.register("caret_shape_default",   "Caret Shape: Default",   None, |c| { c.editor.set_caret_shape(CaretShape::Default);   CommandResult::Handled });
+        r.register("caret_shape_block",     "Caret Shape: Block",     None, |c| { c.editor.set_caret_shape(CaretShape::Block);     CommandResult::Handled });
+        r.register("caret_shape_beam",      "Caret Shape: Beam",      None, |c| { c.editor.set_caret_shape(CaretShape::Beam);      CommandResult::Handled });
+        r.register("caret_shape_underline", "Caret Shape: Underline", None, |c| { c.editor.set_caret_shape(CaretShape::Underline); CommandResult::Handled });
+        r.register_stateful("cycle_caret_shape", "Caret Shape", Some(MenuCategory::View),
+            |e| MenuMark::Value(match e.caret_shape {
+                CaretShape::Default => "Default", CaretShape::Block => "Block",
+                CaretShape::Beam => "Beam", CaretShape::Underline => "Underline" }),
+            |c| { let next = match c.editor.caret_shape {
+                      CaretShape::Default => CaretShape::Block, CaretShape::Block => CaretShape::Beam,
+                      CaretShape::Beam => CaretShape::Underline, CaretShape::Underline => CaretShape::Default };
+                  c.editor.set_caret_shape(next); CommandResult::Handled });
+
+        // Caret blink: set-per-state (palette-only) + 2-state toggle representative (View, OnOff mark).
+        r.register("caret_blink_on",  "Caret Blink: On",  None, |c| { c.editor.set_caret_blink(true);  CommandResult::Handled });
+        r.register("caret_blink_off", "Caret Blink: Off", None, |c| { c.editor.set_caret_blink(false); CommandResult::Handled });
+        r.register_stateful("toggle_caret_blink", "Caret Blink", Some(MenuCategory::View),
+            |e| MenuMark::OnOff(e.caret_blink),
+            |c| { let n = !c.editor.caret_blink; c.editor.set_caret_blink(n); CommandResult::Handled });
+
         // Menu bar: deterministic set-per-state (palette-only). menu_bar_pin remains the View representative.
         use crate::config::MenuBarMode;
         r.register("menu_bar_hidden", "Menu Bar: Hidden", None, |c| { c.editor.set_menu_bar_mode(MenuBarMode::Hidden); CommandResult::Handled });
@@ -1989,6 +2011,37 @@ mod tests {
         let e = Editor::new_from_text("hi\n", None, (80, 24));
         assert_eq!((t.state.expect("stateful"))(&e), MenuMark::OnOff(true),
             "the OnOff mark mirrors the live option (default on)");
+    }
+
+    // -----------------------------------------------------------------------
+    // C1 Task 4: caret shape/blink option-reachability commands
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn caret_shape_commands_set_and_cycle() {
+        use crate::config::CaretShape;
+        let mut ed = Editor::new_from_text("x\n", None, (80, 24));
+        dispatch_id(&mut ed, "caret_shape_block");     assert_eq!(ed.caret_shape, CaretShape::Block);
+        dispatch_id(&mut ed, "caret_shape_beam");      assert_eq!(ed.caret_shape, CaretShape::Beam);
+        dispatch_id(&mut ed, "caret_shape_underline"); assert_eq!(ed.caret_shape, CaretShape::Underline);
+        dispatch_id(&mut ed, "caret_shape_default");   assert_eq!(ed.caret_shape, CaretShape::Default);
+        // cycle Default→Block→Beam→Underline→Default
+        dispatch_id(&mut ed, "cycle_caret_shape"); assert_eq!(ed.caret_shape, CaretShape::Block);
+        dispatch_id(&mut ed, "cycle_caret_shape"); assert_eq!(ed.caret_shape, CaretShape::Beam);
+        dispatch_id(&mut ed, "cycle_caret_shape"); assert_eq!(ed.caret_shape, CaretShape::Underline);
+        dispatch_id(&mut ed, "cycle_caret_shape"); assert_eq!(ed.caret_shape, CaretShape::Default);
+        let reg = Registry::builtins();
+        assert_eq!(reg.meta(CommandId("caret_shape_block")).unwrap().menu, None);
+        assert_eq!(reg.meta(CommandId("cycle_caret_shape")).unwrap().menu, Some(MenuCategory::View));
+    }
+
+    #[test]
+    fn caret_blink_commands_set_and_toggle() {
+        let mut ed = Editor::new_from_text("x\n", None, (80, 24));
+        dispatch_id(&mut ed, "caret_blink_off"); assert!(!ed.caret_blink);
+        dispatch_id(&mut ed, "caret_blink_on");  assert!(ed.caret_blink);
+        dispatch_id(&mut ed, "toggle_caret_blink"); assert!(!ed.caret_blink);
+        dispatch_id(&mut ed, "toggle_caret_blink"); assert!(ed.caret_blink);
     }
 
     #[test]

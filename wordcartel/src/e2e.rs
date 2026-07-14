@@ -1603,6 +1603,8 @@ fn journey_chrome_zen_toggle() {
         view_scrollbar:     crate::config::TransientMode::Auto,
         view_status_line:   crate::config::TransientMode::On,
         view_splash:        true,
+        view_caret_shape:   crate::config::CaretShape::Default,
+        view_caret_blink:   true,
         menu_bar:           crate::config::MenuBarMode::Auto,
         mouse_capture:      true,
         chrome_disposition: ChromeDisposition::Full,

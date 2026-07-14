@@ -48,6 +48,10 @@ pub struct SettingsSnapshot {
     /// Startup splash enablement (`view.splash`). Persisted as a plain bool; a runtime
     /// change takes effect on the next launch.
     pub view_splash: bool,
+    /// Writing-caret shape (`view.caret_shape`). Mutated by `set_caret_shape`.
+    pub view_caret_shape: crate::config::CaretShape,
+    /// Writing-caret blink enablement (`view.caret_blink`). Mutated by `set_caret_blink`.
+    pub view_caret_blink: bool,
     pub menu_bar: crate::config::MenuBarMode,
     pub mouse_capture: bool,
     /// Chrome disposition: `Full` (calibrated steps) or `Zen` (collapsed). Seeded from
@@ -120,6 +124,8 @@ pub struct OView {
     #[serde(skip_serializing_if = "Option::is_none")] pub scrollbar:   Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] pub status_line: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] pub splash:      Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub caret_shape: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub caret_blink: Option<bool>,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -174,6 +180,8 @@ pub fn snapshot_of(cfg: &crate::config::Config, resolved_theme_name: &str) -> Se
         view_scrollbar:  cfg.view.scrollbar,
         view_status_line: cfg.view.status_line,
         view_splash:     cfg.view.splash,
+        view_caret_shape: cfg.view.caret_shape,
+        view_caret_blink: cfg.view.caret_blink,
         menu_bar:        cfg.menu.bar,
         mouse_capture:   cfg.mouse.mouse_capture,
         chrome_disposition,
@@ -196,6 +204,8 @@ pub fn runtime_snapshot(editor: &crate::editor::Editor) -> SettingsSnapshot {
         view_scrollbar:  editor.scrollbar_mode,
         view_status_line: editor.status_line_mode,
         view_splash:     editor.view_opts.splash,
+        view_caret_shape: editor.caret_shape,
+        view_caret_blink: editor.caret_blink,
         menu_bar:        editor.menu_bar_mode,
         mouse_capture:   editor.mouse_capture,
         chrome_disposition: editor.chrome_disposition,
@@ -418,10 +428,22 @@ pub fn compute_overrides(
         ex_view.and_then(|v| v.splash.as_ref()),
         mk_view.and_then(|v| v.splash).is_some(),
     );
+    let rt_cs   = crate::config::caret_shape_str(runtime.view_caret_shape).to_string();
+    let base_cs = crate::config::caret_shape_str(baseline.view_caret_shape).to_string();
+    let caret_shape = diff_key(&rt_cs, &base_cs,
+        ex_view.and_then(|v| v.caret_shape.as_ref()),
+        mk_view.and_then(|v| v.caret_shape.as_ref()).is_some(),
+    );
+    let caret_blink = diff_key(
+        &runtime.view_caret_blink, &baseline.view_caret_blink,
+        ex_view.and_then(|v| v.caret_blink.as_ref()),
+        mk_view.and_then(|v| v.caret_blink).is_some(),
+    );
     let any_view = typewriter.is_some() || focus.is_some() || measure.is_some()
         || wrap_guide.is_some() || word_count.is_some() || wrap_column.is_some()
-        || scrollbar.is_some() || status_line.is_some() || splash.is_some();
-    let view = some_if(OView { typewriter, focus, measure, wrap_guide, word_count, wrap_column, scrollbar, status_line, splash }, any_view);
+        || scrollbar.is_some() || status_line.is_some() || splash.is_some()
+        || caret_shape.is_some() || caret_blink.is_some();
+    let view = some_if(OView { typewriter, focus, measure, wrap_guide, word_count, wrap_column, scrollbar, status_line, splash, caret_shape, caret_blink }, any_view);
 
     // --- menu — per-key mask predicate ---
     let rt_bar   = menu_bar_str(runtime.menu_bar).to_string();
@@ -567,6 +589,8 @@ mod tests {
             view_scrollbar: crate::config::TransientMode::Auto,
             view_status_line: crate::config::TransientMode::On,
             view_splash: true,
+            view_caret_shape: crate::config::CaretShape::Default,
+            view_caret_blink: true,
             menu_bar: crate::config::MenuBarMode::Auto, mouse_capture: true,
             chrome_disposition: ChromeDisposition::Full,
             canvas: CanvasMode::Opaque,
@@ -978,6 +1002,22 @@ mod tests {
     }
 
     #[test]
+    fn caret_options_round_trip_via_diff_law() {
+        use crate::config::CaretShape;
+        let base = snap_with(|s| { s.view_caret_shape = CaretShape::Default; s.view_caret_blink = true; });
+        let mut rt = base.clone();
+        rt.view_caret_shape = CaretShape::Beam;
+        rt.view_caret_blink = false;
+        let of = compute_overrides(&rt, &base, &OverridesFile::default(), &OverridesFile::default());
+        let v = of.view.expect("view section present");
+        assert_eq!(v.caret_shape.as_deref(), Some("beam"));
+        assert_eq!(v.caret_blink, Some(false));
+        // No divergence → no caret keys written.
+        let of2 = compute_overrides(&base, &base, &OverridesFile::default(), &OverridesFile::default());
+        assert!(of2.view.is_none() || of2.view.as_ref().unwrap().caret_shape.is_none());
+    }
+
+    #[test]
     fn clipboard_provider_round_trips_through_overrides() {
         // A runtime value differing from baseline appears in the computed overrides.
         let baseline = snapshot_of(&crate::config::Config::default(), "tokyo-night");
@@ -1007,7 +1047,9 @@ mod tests {
             let SettingsSnapshot {
                 keymap_preset: _, theme_identity: _, view_typewriter: _, view_focus: _,
                 view_measure: _, view_wrap_guide: _, view_word_count: _, view_wrap_column: _,
-                view_scrollbar: _, view_status_line: _, view_splash: _, menu_bar: _, mouse_capture: _,
+                view_scrollbar: _, view_status_line: _, view_splash: _,
+                view_caret_shape: _, view_caret_blink: _,
+                menu_bar: _, mouse_capture: _,
                 chrome_disposition: _, canvas: _, clipboard_provider: _,
             } = s;
         }
@@ -1028,6 +1070,8 @@ mod tests {
         assert!(has("cycle_scrollbar") && has("scrollbar_auto"), "view_scrollbar");
         assert!(has("toggle_status_line") && has("status_line_auto"), "view_status_line");
         assert!(has("toggle_splash") && has("splash_on") && has("splash_off"), "view_splash");
+        assert!(has("cycle_caret_shape") && has("caret_shape_block"), "view_caret_shape");
+        assert!(has("toggle_caret_blink") && has("caret_blink_on"), "view_caret_blink");
         assert!(has("menu_bar_pin") && has("menu_bar_auto"), "menu_bar");
         assert!(has("toggle_mouse_capture"), "mouse_capture");
         assert!(has("toggle_chrome"), "chrome_disposition");
