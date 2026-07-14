@@ -239,10 +239,12 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
         return;
     }
     if editor.cursor_picker.is_some() {
-        // Fixed 7-row list — wheel moves the selection ±1 (clamped) and re-previews via the
-        // shared setter funnel; a row click selects + previews + commits; a click-away
-        // restores the captured originals and closes (Esc-equivalent). No setter bypass.
+        // Fixed 7-row list, windowed like every sibling overlay (Finding 1). Wheel moves
+        // the selection ±1 (clamped), re-windows, and re-previews via the shared setter
+        // funnel; a row click selects + previews + commits; a click-away restores the
+        // captured originals and closes (Esc-equivalent). No setter bypass.
         if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+            let ah = editor.active().view.area.1;
             if let Some(cp) = editor.cursor_picker.as_mut() {
                 let last = crate::cursor_picker::ROW_ACTIONS.len().saturating_sub(1);
                 if matches!(ev.kind, MouseEventKind::ScrollDown) {
@@ -250,11 +252,16 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
                 } else {
                     cp.selected = cp.selected.saturating_sub(1);
                 }
+                crate::app::keep_overlay_visible(ah, cp.selected, crate::cursor_picker::ROW_ACTIONS.len(), &mut cp.scroll_top);
             }
             crate::cursor_picker::preview_selected(editor);
         }
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            let row_idx = crate::chrome_geom::cursor_picker_row_at(area, ev.column, ev.row);
+            // Scoped borrow → owned hit value before any mutation.
+            let row_idx: Option<usize> = {
+                let cp = editor.cursor_picker.as_ref().unwrap();
+                crate::chrome_geom::cursor_picker_row_at(area, cp, ev.column, ev.row)
+            };
             let inside = {
                 let n = crate::cursor_picker::ROW_ACTIONS.len();
                 let r = crate::chrome_geom::palette_overlay_rect(area, n + 1);
@@ -262,7 +269,11 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
                     && ev.row >= r.y && ev.row < r.y + r.height
             };
             if let Some(idx) = row_idx {
-                if let Some(cp) = editor.cursor_picker.as_mut() { cp.selected = idx; }
+                let ah = editor.active().view.area.1;
+                if let Some(cp) = editor.cursor_picker.as_mut() {
+                    cp.selected = idx;
+                    crate::app::keep_overlay_visible(ah, idx, crate::cursor_picker::ROW_ACTIONS.len(), &mut cp.scroll_top);
+                }
                 crate::cursor_picker::preview_selected(editor);
                 crate::cursor_picker::commit_cursor_picker(editor);
             } else if !inside {
@@ -1397,6 +1408,84 @@ mod tests {
         handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
         assert!(e.theme_picker.is_none(), "click-away closes the picker");
         assert_eq!(e.theme.name, original_name, "click-away restores the original theme");
+    }
+
+    // -----------------------------------------------------------------------
+    // C1 T7 fix: cursor-picker mouse-path tests (Finding 2 — previously zero coverage).
+    // Mirrors the theme-picker mouse tests above.
+    // -----------------------------------------------------------------------
+
+    /// A click on a visible cursor-picker row selects + previews (via the shared
+    /// setters) and commits — same "select, preview, close" shape as the theme picker's
+    /// row click.
+    #[test]
+    fn click_cursor_picker_row_applies_and_closes() {
+        use crate::config::CaretShape;
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.open_cursor_picker();
+        let n = crate::cursor_picker::ROW_ACTIONS.len();
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let rect = crate::chrome_geom::palette_overlay_rect(area, n + 1);
+        let list_top = rect.y + 1; // no query row on the cursor picker
+        let click_row = list_top + 3; // row 3 = Beam · blinking
+        let (reg, ex, clk, tx, km) = ctx();
+        let d = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: rect.x + 1, row: click_row, modifiers: KeyModifiers::NONE };
+        handle(&mut e, d, &reg, &km, &ex, &clk, &tx);
+        assert!(e.cursor_picker.is_none(), "picker closes on row click");
+        assert_eq!(e.caret_shape, CaretShape::Beam, "clicked row applied via the shared caret_shape setter");
+        assert!(e.caret_blink, "row 3 (Beam · blinking) applied via the shared caret_blink setter");
+    }
+
+    /// A click outside the cursor-picker overlay closes it and restores the captured
+    /// originals — same as Esc — even after a live preview moved the caret settings away.
+    #[test]
+    fn click_outside_cursor_picker_closes_and_restores() {
+        use crate::config::CaretShape;
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        crate::derive::rebuild(&mut e);
+        e.set_caret_shape(CaretShape::Beam);
+        e.set_caret_blink(true);
+        e.open_cursor_picker();
+        let original = (e.cursor_picker.as_ref().unwrap().original_shape,
+                        e.cursor_picker.as_ref().unwrap().original_blink);
+        assert_eq!(original, (CaretShape::Beam, true), "picker captures the originals on open");
+        // Preview a different row first — proves click-away UNDOES the live preview.
+        if let Some(cp) = e.cursor_picker.as_mut() { cp.selected = 6; } // Underline · steady
+        crate::cursor_picker::preview_selected(&mut e);
+        assert_eq!(e.caret_shape, CaretShape::Underline, "preview applied before the click-away");
+        let (reg, ex, clk, tx, km) = ctx();
+        // (0, 0) is well outside the centered overlay — click-away.
+        handle(&mut e, down(0, 0), &reg, &km, &ex, &clk, &tx);
+        assert!(e.cursor_picker.is_none(), "click-away closes the cursor picker");
+        assert_eq!(e.caret_shape, CaretShape::Beam, "click-away restores the original shape");
+        assert!(e.caret_blink, "click-away restores the original blink");
+    }
+
+    /// Wheel scroll moves the cursor-picker selection (clamped at the ends), re-windows
+    /// (`scroll_top` threaded — Finding 1), and re-previews via the shared setters. Uses a
+    /// SHORT terminal so the scroll_top threading is actually exercised.
+    #[test]
+    fn wheel_moves_cursor_picker_selection_and_previews() {
+        use crate::config::CaretShape;
+        let mut e = Editor::new_from_text("x\n", None, (60, 9)); // short — list_h_for(7, 9) == 5
+        crate::derive::rebuild(&mut e);
+        e.open_cursor_picker();
+        assert_eq!(e.cursor_picker.as_ref().unwrap().selected, 1,
+            "initial row = 1 (Default caret lands on the first managed row)");
+        let (reg, ex, clk, tx, km) = ctx();
+        let scroll_down = MouseEvent { kind: MouseEventKind::ScrollDown, column: 20, row: 4, modifiers: KeyModifiers::NONE };
+        for _ in 0..5 {
+            handle(&mut e, scroll_down, &reg, &km, &ex, &clk, &tx);
+        }
+        let cp = e.cursor_picker.as_ref().expect("picker still open after wheel");
+        assert_eq!(cp.selected, 6, "clamped at the last row (Underline · steady)");
+        let n = crate::cursor_picker::ROW_ACTIONS.len();
+        let lh = crate::list_window::list_h_for(n, 9);
+        assert!(cp.selected.saturating_sub(cp.scroll_top) < lh,
+            "selection is within the visible window (selected - scroll_top < list_h)");
+        assert_eq!(e.caret_shape, CaretShape::Underline, "wheel re-previews via the shared setter");
+        assert!(!e.caret_blink, "row 6 (Underline · steady) → blink false");
     }
 
     // -----------------------------------------------------------------------

@@ -938,6 +938,7 @@ impl Editor {
         let selected = crate::cursor_picker::initial_row_for(self.caret_shape, self.caret_blink);
         self.cursor_picker = Some(crate::cursor_picker::CursorPicker {
             selected, original_shape: self.caret_shape, original_blink: self.caret_blink,
+            scroll_top: 0,
         });
     }
 

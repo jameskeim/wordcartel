@@ -2441,6 +2441,60 @@ mod tests {
             "non-scrollable theme picker: no indicator digits, got: {bottom2_text:?}");
     }
 
+    /// Finding 1 regression (C1 T7 fix): at a SHORT terminal the cursor-picker list must
+    /// window like every sibling overlay — before the fix, only `list_h_for(7, h)` rows
+    /// painted (the fixed-7-row assumption broke below ~11 rows tall) and the `List`
+    /// highlight silently clamped to the WRONG row when `selected` was past that short
+    /// window, misleading the user about which row was actually selected, and the tail
+    /// rows were unreachable.
+    #[test]
+    fn cursor_picker_windows_and_highlights_true_selection_at_short_terminal() {
+        use crate::config::CaretShape;
+        let mut e = Editor::new_from_text("x\n", None, (60, 9));
+        e.open_cursor_picker();
+        let n = crate::cursor_picker::ROW_ACTIONS.len();
+        assert_eq!(n, 7, "precondition: fixed 7-row list");
+        // Navigate to the LAST row (6, Underline · steady) — past the short-terminal
+        // window (list_h_for(7, 9) == 5, so pre-fix only rows 0..5 ever painted).
+        e.cursor_picker.as_mut().unwrap().selected = n - 1;
+        crate::cursor_picker::preview_selected(&mut e);
+
+        let buf = render_to_buffer(&mut e, 60, 9);
+        // (a) selected == 6.
+        assert_eq!(e.cursor_picker.as_ref().unwrap().selected, 6);
+        let scroll_top = e.cursor_picker.as_ref().unwrap().scroll_top;
+        assert!(scroll_top > 0, "render self-heal must advance scroll_top so row 6 is visible");
+
+        let area = ratatui::layout::Rect::new(0, 0, 60, 9);
+        let rect = crate::chrome_geom::palette_overlay_rect(area, n + 1);
+        let list_top = rect.y + 1; // no query row on the cursor picker
+        let list_h = crate::list_window::list_h_for(n, 9);
+        assert!(scroll_top + list_h >= n, "row 6 must fall within the rendered window");
+
+        // (b) row 6 is within the rendered window AND the highlight maps to its screen
+        // row — window-relative (`selected - scroll_top`), not the raw absolute index
+        // (which pre-fix clamped onto whatever row happened to be last on screen).
+        let highlight_row = list_top + (6 - scroll_top) as u16;
+        let row_text = row_string(&buf, highlight_row);
+        assert!(row_text.contains("Underline") && row_text.contains("steady"),
+            "row at the computed highlight position must show row 6's label, got: {row_text:?}");
+
+        let selected_bg = crate::compose::compose(&e.theme, e.depth, &[SE::ChromeSelected]).bg;
+        assert!((0..60u16).any(|x| buf[(x, highlight_row)].style().bg == selected_bg),
+            "row 6's own screen row must carry the ChromeSelected highlight bg");
+        for r in list_top..list_top + list_h as u16 {
+            if r != highlight_row {
+                assert!(!(0..60u16).any(|x| buf[(x, r)].style().bg == selected_bg),
+                    "row {r} must NOT carry the highlight — only the true selection does");
+            }
+        }
+
+        // The preview funnel ran against the TRUE row (not a clamped one): row 6 =
+        // Underline · steady.
+        assert_eq!(e.caret_shape, CaretShape::Underline);
+        assert!(!e.caret_blink, "steady → blink false");
+    }
+
     /// A6 (file browser): scrolled browser shows entries[scroll_top], not entries[0];
     /// indicator appears when scrollable, absent when all rows fit.
     #[test]
@@ -3302,7 +3356,7 @@ mod tests {
         assert!(e.has_active_input_overlay(), "diag");
         let mut e = mk();
         e.cursor_picker = Some(crate::cursor_picker::CursorPicker {
-            selected: 1, original_shape: CaretShape::Default, original_blink: true });
+            selected: 1, original_shape: CaretShape::Default, original_blink: true, scroll_top: 0 });
         assert!(e.has_active_input_overlay(), "cursor_picker");
     }
 

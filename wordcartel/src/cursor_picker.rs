@@ -2,7 +2,10 @@
 //! sample-cell preview (Fork 5-C). Selection previews immediately via the shared caret
 //! setters; Esc restores the caret settings captured at open; Enter commits (the live
 //! values already hold). Mirrors the theme picker's intercept/preview/commit shape, but the
-//! list is FIXED (no query field), so both paste arms are pure no-ops.
+//! list is FIXED (no query field), so both paste arms are pure no-ops. The list content is
+//! fixed, but the DISPLAY is windowed exactly like every sibling overlay — `scroll_top`
+//! threads through nav/mouse/render so a short terminal never clamps the highlight to the
+//! wrong row (C1 T7 fix).
 
 use crate::config::CaretShape;
 use crate::app::{Handled, Msg};
@@ -10,12 +13,16 @@ use crossterm::event::Event;
 
 /// Live caret-picker overlay state. `selected` indexes the shape row under the cursor;
 /// `original_shape`/`original_blink` snapshot the caret settings in effect when the
-/// picker opened, so Esc/cancel can restore them after a live preview.
+/// picker opened, so Esc/cancel can restore them after a live preview. `scroll_top` is
+/// the first visible row — the picker windows its list exactly like every sibling
+/// overlay (theme_picker/palette/outline/file_browser/diag), so a short terminal never
+/// clamps the highlight to the wrong row or strands the tail rows unreachable.
 #[derive(Debug)]
 pub struct CursorPicker {
     pub selected: usize,
     pub original_shape: CaretShape,
     pub original_blink: bool,
+    pub scroll_top: usize,
 }
 
 /// Total row → (label, glyph, shape, Option<blink>) table. `None` blink = leave
@@ -94,12 +101,12 @@ pub(crate) fn intercept(msg: Msg, editor: &mut crate::editor::Editor,
                 c if crate::list_window::list_nav_key(c).is_some() => {
                     let ah = editor.active().view.area.1;
                     if let Some(p) = editor.cursor_picker.as_mut() {
-                        // Fixed 7-row list — it fits any pane, so the scroll window is a
-                        // throwaway local (never rendered), but reuse the shared nav API.
-                        let mut st = 0usize;
+                        // Fixed 7-row list, windowed like every sibling overlay — thread the
+                        // REAL scroll_top so the window follows the selection (mirrors
+                        // theme_picker's list-nav arm).
                         crate::list_window::apply_list_nav(
                             crate::list_window::list_nav_key(c).unwrap(),
-                            ah, crate::cursor_picker::ROW_ACTIONS.len(), &mut p.selected, &mut st);
+                            ah, crate::cursor_picker::ROW_ACTIONS.len(), &mut p.selected, &mut p.scroll_top);
                     }
                     crate::cursor_picker::preview_selected(editor);
                 }
