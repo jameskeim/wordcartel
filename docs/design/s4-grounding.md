@@ -9,6 +9,36 @@ this one wins.
 Follows the `effort-p-grounding.md` convention: map the real surface before any design fork is
 resolved.
 
+> ## ⚠ Corrections (2026-07-14) — this document predates the S5 / S6 / C1 merges
+>
+> Re-verified against the live tree while scoping S4 (`docs/design/s4-prose-surgery-scoping.md`,
+> which carries the CURRENT grounding table). Where this doc and the notes below disagree, the
+> notes win:
+>
+> 1. **§1 "Sentence object" row is stale.** `sentence_bounds` is no longer raw UAX-29 — S5
+>    rebuilt it atop `textobj::sentence_spans`, a four-rule post-pass (R1 abbreviation/initial
+>    merge, R2 hard-wrap merge, R3 lowercase-continuation, R4 closer shift) with a semantic
+>    hard-break veto and a **content-only span contract** (no trailing whitespace). New public
+>    kernels: `sentence_spans`, `prev_sentence_start`, `next_sentence_end`.
+> 2. **§2 "Verified bug" is FIXED.** `sentence_bounds("Dr. Smith arrived. …")` now returns the
+>    full sentence (R1). The two-authorities problem is pinned by S5's differential fixture
+>    suite (wordcartel detector ↔ repar ventilate), per arc decision D2 — not unified.
+> 3. **Sentence motions exist.** `Dir::SentenceLeft/SentenceRight` →
+>    `nav::move_sentence_left/right` (cross-paragraph), plus `select_sentence_left/right`
+>    extend variants — shipped in S5. The doc's Scope/ladder inventory predates them.
+> 4. **§8's absorb-repar question is DECIDED: repar STAYS** (arc doc D1, Fable memos I+II).
+>    Treat §§3–4 and §8 as historical record of how the decision was grounded.
+> 5. **S6 shipped a constraint that did not exist here:** the ventilate lens
+>    (`wordcartel/src/ventilate.rs::prose_block_at`) classifies prose via `role_at` and windows
+>    via the IDENTICAL `nav::paragraph_range_at` call `Scope::Sentence` uses — SEE==SELECT is
+>    now a shipped invariant S4 must preserve, and `prose_block_at` is the shipped
+>    decline-to-answer predicate (the lens already says "not prose" for headings/lists/code).
+> 6. **Undo/redo clear `marked_block` too** (editor.rs `undo`/`redo` — "bypass apply's mapping →
+>    acting on stale offsets unsafe"), alongside `sel_history`. Any two-region operation design
+>    must know a marked block does not survive undo.
+> 7. **Line anchors have drifted** (registry.rs is now ~2,122 lines, `dispatch_with_arg` ≈ :811;
+>    `scope_range_at` ≈ commands.rs:197, the ladder ≈ :443–459). Locate by symbol NAME.
+
 ---
 
 ## 1. Headline: S4 already exists in embryo
