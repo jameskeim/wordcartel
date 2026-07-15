@@ -184,7 +184,7 @@ mod tests {
                     buffer_id: BufferId(0),
                     class: ResultClass::Durability,
                     version: 7, kind: JobKind::Save,
-                    merge: Box::new(|e: &mut crate::editor::Editor| e.status = "worker".into()),
+                    merge: Box::new(|e: &mut crate::editor::Editor| e.set_status(crate::status::StatusKind::Info, "worker")),
                 }
             }),
         });
@@ -207,7 +207,7 @@ mod tests {
                 class: ResultClass::Durability,
                 version: 1,
                 kind: JobKind::Save,
-                merge: Box::new(|e: &mut Editor| e.status = "merged".into()),
+                merge: Box::new(|e: &mut Editor| e.set_status(crate::status::StatusKind::Info, "merged")),
             }),
         });
         let mut results = ex.drain();
@@ -217,7 +217,7 @@ mod tests {
         if let JobOutcome::Done(r) = results.remove(0) {
             (r.merge)(&mut e);
         }
-        assert_eq!(e.status, "merged");
+        assert_eq!(e.status_text(), "merged");
     }
 
     #[test]

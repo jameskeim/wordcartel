@@ -93,6 +93,14 @@ impl PluginHost {
             e.clear_plugin_wake_state(); // P3 §3g: a torn-down (null) host leaves NO armed timer/subscriber
             return;
         }
+        // A17 T9 §9.3 — one pump cycle is one throttle tick: every emit this cycle (including
+        // every iteration of a single runaway callback's loop, since a callback runs to
+        // completion — or its time-budget abort — inside ONE unit of ONE cycle) shares this
+        // tick's per-label quota. A bridge-None host (attach_bridge never ran/failed) has no
+        // emit surface to throttle — nothing to advance.
+        if let Some(bridge) = self.bridge.as_ref() {
+            bridge.emit_throttle.borrow_mut().advance_tick();
+        }
         let start = std::time::Instant::now();
         let mut units = 0usize;
         if self.fire_due_timers(editor, clock, &mut units, start) { return; } // Phase 0 (mark-then-fire)
@@ -220,7 +228,8 @@ impl PluginHost {
         e.pending_plugin_calls.clear();
         e.pending_plugin_events.clear();
         e.pending_plugin_dispatch.clear();
-        e.status = "plugin work truncated (chain cap)".to_string();
+        e.set_status_full(crate::status::StatusKind::Warning, "plugin work truncated (chain cap)".to_string(),
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         true
     }
 
@@ -562,7 +571,7 @@ mod tests {
         editor.borrow_mut().pending_plugin_events.push_back(
             PluginEvent { kind: PluginEventKind::Save, path: None });
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.starts_with("false:"), "wc.timer from a hook must be rejected: {status}");
         assert!(status.contains("event hook or a timer callback"), "status: {status}");
         assert!(editor.borrow().pending_plugin_timers.is_empty(), "nothing armed from a hook");
@@ -579,7 +588,7 @@ mod tests {
         assert_eq!(editor.borrow().pending_plugin_timers.len(), 1);
         clock.set(1500); // past the 1000ms due; NO input between arm and fire
         pump_at(&mut host, &editor, &clock);
-        assert_eq!(editor.borrow().status, "fired", "the one-shot callback ran during inactivity");
+        assert_eq!(editor.borrow().status_text(), "fired", "the one-shot callback ran during inactivity");
         assert!(editor.borrow().pending_plugin_timers.is_empty(), "a one-shot is removed after firing");
         assert_eq!(crate::timers::next_wake(&editor.borrow(), 1500), None, "nothing armed after the one-shot");
     }
@@ -595,7 +604,7 @@ mod tests {
         assert_eq!(e.pending_plugin_timers[0].next_due_ms, 3500,
             "reschedule FROM COMPLETION: completion_now(2500) + interval(1000)");
         assert!(!e.pending_plugin_timers[0].pending, "pending is cleared after the reschedule");
-        assert_eq!(e.status, "r", "the repeating callback ran");
+        assert_eq!(e.status_text(), "r", "the repeating callback ran");
     }
 
     #[test]
@@ -609,7 +618,7 @@ mod tests {
         clock.set(1500);
         pump_at(&mut host, &editor, &clock);
         assert_eq!(whole_text(&editor), "hello", "a timer callback must NOT edit the buffer (observer-tier)");
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.starts_with("fired:false:"), "wc.insert must be blocked from a timer callback: {status}");
         assert!(status.contains("editing is not allowed from an event hook"), "status: {status}");
         // wc.status STILL worked (it set the status above) — the one allowed observer surface.
@@ -638,7 +647,10 @@ mod tests {
             "at least one timer never fired — still due at its original (past) time");
         assert_eq!(crate::timers::next_wake(&e, 10_000), Some(0),
             "the un-fired due timer still drives an (immediate) wake — not stranded");
-        assert!(e.status.to_lowercase().contains("truncat"), "the cap trip sets a truncation status: {}", e.status);
+        assert!(e.status_text().to_lowercase().contains("truncat"), "the cap trip sets a truncation status: {}", e.status_text());
+        // A17 T5 (F4 Warning table): a Sticky Warning.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
     }
 
     #[test]

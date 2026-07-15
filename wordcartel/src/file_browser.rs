@@ -83,7 +83,8 @@ pub(crate) fn file_browser_enter(editor: &mut crate::editor::Editor) {
                         crate::file_browser::rebuild_entries(fb);
                     }
                 } else {
-                    editor.status = format!("cannot read directory: {}", target.display());
+                    editor.set_status_full(crate::status::StatusKind::Error, format!("cannot read directory: {}", target.display()),
+                        crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
                     // stay in prior dir — do NOT mutate fb.dir
                 }
             }
@@ -230,8 +231,14 @@ mod tests {
         assert_eq!(fb_dir.as_deref(), Some(parent.as_path()),
             "fb.dir must remain at parent after Enter on unreadable dir, got: {:?}", fb_dir);
         // Status must mention the unreadable directory.
-        assert!(e.status.contains("cannot read directory"),
-            "status must mention 'cannot read directory', got: {:?}", e.status);
+        assert!(e.status_text().contains("cannot read directory"),
+            "status must mention 'cannot read directory', got: {:?}", e.status_text());
+        // A17 T4: a genuine "cannot read directory" failure must land Sticky/Error —
+        // surviving a later Info ack (Q1), not clearing on the next keystroke.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        e.set_status(crate::status::StatusKind::Info, "later ack");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error, "Q1: Info must not displace a held Error");
 
         // Restore permissions so cleanup can remove the dir.
         std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o755)).unwrap();

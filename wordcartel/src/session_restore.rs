@@ -84,7 +84,9 @@ pub fn restore_scratch(editor: &mut Editor, st: &crate::state::ScratchState) {
     let Some(idx) = editor.buffers.iter().position(|b| b.id == sid) else { return; };
     let area = editor.buffers[idx].view.area;
     let id = editor.alloc_id();
-    editor.buffers[idx] = crate::editor::Buffer::from_text(id, &st.text, None, area);
+    // A17 T8 category (b): route the wholesale swap through the single chokepoint. The scratch slot
+    // is never read-only, so this always succeeds; guarded for closure completeness.
+    if !editor.replace_buffer(idx, crate::editor::Buffer::from_text(id, &st.text, None, area)) { return; }
     editor.scratch_id = Some(id);
     // Update MRU id mapping (old scratch id → new).
     for m in editor.mru.iter_mut() { if *m == sid { *m = id; } }
@@ -110,7 +112,10 @@ pub fn open_into_current(editor: &mut Editor, path: &std::path::Path) {
     match crate::editor::Buffer::from_file(id, path, area) {
         Ok(b) => {
             let a = editor.active;
-            editor.buffers[a] = b;
+            // A17 T8 category (b): route through the single chokepoint. On a read-only buffer this
+            // no-ops + Sticky Warning and returns false — the MRU/rebuild/fire-event epilogue below
+            // is skipped and the user's read-only view is preserved.
+            if !editor.replace_buffer(a, b) { return; }
             // Keep MRU consistent: remove the ghost old id and put the new id at front.
             // Mirrors the close_buffer / restore_scratch patterns (workspace.rs, app.rs).
             editor.mru.retain(|&x| x != old_id);
@@ -120,11 +125,12 @@ pub fn open_into_current(editor: &mut Editor, path: &std::path::Path) {
             }
             crate::derive::rebuild(editor);
             crate::nav::ensure_visible(editor);
-            editor.status = String::new();
+            editor.clear_status();
             crate::plugin::fire_event(editor, crate::plugin::PluginEventKind::Open, Some(path));
         }
         Err(e) => {
-            editor.status = e.to_string();
+            editor.set_status_full(crate::status::StatusKind::Error, e.to_string(),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         }
     }
 }
@@ -198,6 +204,22 @@ mod tests {
         assert_eq!(e.active().document.buffer.to_string(), "opened\n");
         assert!(!e.active().document.dirty());
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// A17 T4: an open-into-current failure (path is a directory → OpenError::IsDir) must
+    /// land Sticky/Error — surviving a later Info ack (Q1), not clearing on the next keystroke.
+    #[test]
+    fn open_into_current_failure_is_a_sticky_error_that_survives_a_later_info() {
+        use crate::editor::Editor;
+        let dir = std::env::temp_dir().join(format!("wc-oic-isdir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = Editor::new_from_text("scratch\n", None, (80, 24));
+        open_into_current(&mut e, &dir);
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        e.set_status(crate::status::StatusKind::Info, "later ack");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error, "Q1: Info must not displace a held Error");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

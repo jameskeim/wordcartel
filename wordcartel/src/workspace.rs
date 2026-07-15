@@ -109,7 +109,7 @@ pub fn toggle_scratch(editor: &mut Editor) {
                     .find(|id| !editor.is_scratch(*id))));
         match target.and_then(|id| editor.buffers.iter().position(|b| b.id == id)) {
             Some(idx) => switch_to(editor, idx),
-            None => editor.status = "no other buffer".into(),
+            None => editor.set_status(crate::status::StatusKind::Info, "no other buffer"),
         }
     } else {
         enter_scratch(editor);
@@ -143,10 +143,11 @@ pub fn open_as_new_buffer(editor: &mut Editor, path: &std::path::Path) {
             if editor.resume_enabled { crate::session_restore::restore_resume(editor, path); }
             crate::derive::rebuild(editor);
             crate::nav::ensure_visible(editor);
-            editor.status = String::new();
+            editor.clear_status();
             crate::plugin::fire_event(editor, crate::plugin::PluginEventKind::Open, Some(path));
         }
-        Err(e) => editor.status = e.to_string(),
+        Err(e) => editor.set_status_full(crate::status::StatusKind::Error, e.to_string(),
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None),
     }
 }
 
@@ -158,10 +159,11 @@ pub fn open_as_new_buffer(editor: &mut Editor, path: &std::path::Path) {
 /// empty untitled. New active = same-index neighbor.
 pub fn close_buffer(editor: &mut Editor) {
     let id = editor.active().id;
-    if editor.is_scratch(id) { editor.status = "can't close the scratch buffer".into(); return; }
+    if editor.is_scratch(id) { editor.set_status(crate::status::StatusKind::Info, "can't close the scratch buffer"); return; }
     if editor.is_dirty(id) {
         if editor.pending_after_save.is_some() || editor.pending_save_as.is_some() || editor.quit_drain.is_some() {
-            editor.status = "another save or quit is in progress — try again".into();
+            editor.set_status_full(crate::status::StatusKind::Warning, "another save or quit is in progress — try again",
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
             return;
         }
         let name = buffer_display_name(editor, id);
@@ -179,7 +181,7 @@ pub fn close_buffer(editor: &mut Editor) {
 /// scratch_id.
 pub(crate) fn close_buffer_now(editor: &mut Editor, id: BufferId) {
     let Some(i) = editor.buffers.iter().position(|b| b.id == id) else {
-        editor.status = "buffer already closed".into();
+        editor.set_status(crate::status::StatusKind::Info, "buffer already closed");
         return;
     };
     // P2 on_buffer_close fire site: capture the path BEFORE the slot is removed/replaced —
@@ -193,6 +195,12 @@ pub(crate) fn close_buffer_now(editor: &mut Editor, id: BufferId) {
     let ordinary = editor.buffers.iter().filter(|b| !editor.is_scratch(b.id)).count();
     if ordinary <= 1 {
         // Last ordinary buffer: replace id's own slot with a fresh empty untitled.
+        // A17 read-only note: this reset is a SANCTIONED dispose, NOT a content install — it swaps
+        // in a brand-new empty buffer with NO content carried, so it does NOT route through the
+        // `replace_buffer` read-only guard (which would trap the user in a read-only view). Disposing
+        // a read-only `view_messages` buffer here is safe only because `read_only ⟹ regenerable/
+        // ephemeral content` (pinned by status_view.rs::read_only_true_is_set_only_in_this_module);
+        // a future content-bearing read-only buffer would have to revisit this branch.
         let nid = editor.alloc_id();
         let area = editor.buffers[i].view.area;
         let was_active = i == editor.active;
@@ -207,7 +215,7 @@ pub(crate) fn close_buffer_now(editor: &mut Editor, id: BufferId) {
             // fronting it would break the weak MRU-front == active convention).
             editor.mru.push(nid);
         }
-        editor.status = String::new();
+        editor.clear_status();
         return;
     }
     if i == editor.active {
@@ -225,7 +233,7 @@ pub(crate) fn close_buffer_now(editor: &mut Editor, id: BufferId) {
             editor.active = na;
         }
     }
-    editor.status = String::new();
+    editor.clear_status();
 }
 
 /// Create a fresh empty untitled buffer additively (no-op when active is already a reusable throwaway).
@@ -238,12 +246,30 @@ pub fn new_empty_buffer(editor: &mut Editor) {
     editor.switch_to_index(idx);
     crate::derive::rebuild(editor);
     crate::nav::ensure_visible(editor);
-    editor.status = String::new();
+    editor.clear_status();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A17 T5 (F4 Warning table): the "another save or quit is in progress" busy-guard
+    /// refusal is a recoverable Sticky Warning.
+    #[test]
+    fn close_buffer_busy_refusal_is_a_sticky_warning() {
+        let mut e = Editor::new_from_text("x\n", None, (40, 10));
+        // Drive dirty via a direct version bump (matches other tests' dirty-setup pattern).
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = None;
+        let id = e.active().id;
+        e.pending_after_save = Some(crate::editor::PendingAfterSave {
+            buffer_id: id, version: 1, action: crate::editor::PostSaveAction::Quit, at_ms: 0,
+        });
+        close_buffer(&mut e);
+        assert_eq!(e.status_text(), "another save or quit is in progress — try again");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+    }
 
     #[test]
     fn buffer_display_name_scratch_untitled_and_named() {
@@ -426,6 +452,22 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
+    /// A17 T4: an open failure (path is a directory → OpenError::IsDir) must land
+    /// Sticky/Error — surviving a later Info ack (Q1), not clearing on the next keystroke.
+    #[test]
+    fn open_failure_is_a_sticky_error_that_survives_a_later_info() {
+        let mut e = Editor::new_from_text("real content\n", Some(std::path::PathBuf::from("/tmp/a.md")), (40, 10));
+        e.install_scratch(); // active is real (non-throwaway) → open_as_new_buffer's own Err arm fires
+        let dir = std::env::temp_dir().join(format!("wc-open-isdir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        open_as_new_buffer(&mut e, &dir);
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        e.set_status(crate::status::StatusKind::Info, "later ack");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error, "Q1: Info must not displace a held Error");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn open_adds_buffer_when_active_is_real() {
         let mut e = Editor::new_from_text("real content\n", Some(std::path::PathBuf::from("/tmp/a.md")), (40, 10));
@@ -467,7 +509,7 @@ mod tests {
         goto_scratch(&mut e);
         close_buffer(&mut e);
         assert_eq!(e.buffers.len(), 2, "scratch not closed");
-        assert!(e.status.contains("scratch"));
+        assert!(e.status_text().contains("scratch"));
     }
 
     #[test]
@@ -548,7 +590,7 @@ mod tests {
         });
         close_buffer(&mut e);
         assert!(e.prompt.is_none(), "busy guard: no prompt over pending state");
-        assert!(e.status.contains("in progress"), "refusal status set: {:?}", e.status);
+        assert!(e.status_text().contains("in progress"), "refusal status set: {:?}", e.status_text());
     }
 
     #[test]
@@ -597,7 +639,7 @@ mod tests {
         e.install_scratch();
         let phantom = BufferId(9999);
         close_buffer_now(&mut e, phantom);
-        assert_eq!(e.status, "buffer already closed");
+        assert_eq!(e.status_text(), "buffer already closed");
         assert_eq!(e.buffers.len(), 2, "buffer count unchanged");
     }
 

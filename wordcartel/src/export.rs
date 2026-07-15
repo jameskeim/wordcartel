@@ -258,14 +258,16 @@ pub fn run_export(
     let source = match editor.active().document.path.clone() {
         Some(p) => p,
         None => {
-            editor.status = "save the file first before exporting".into();
+            editor.set_status_full(crate::status::StatusKind::Warning, "save the file first before exporting",
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
             return;
         }
     };
 
     // Pandoc availability gate.
     if !probe_pandoc() {
-        editor.status = "pandoc not found — install it to export".into();
+        editor.set_status_full(crate::status::StatusKind::Error, "pandoc not found — install it to export",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return;
     }
 
@@ -306,7 +308,10 @@ mod tests {
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         let (tx, _rx) = std::sync::mpsc::channel();
         run_export(&mut e, "html", &tx);
-        assert!(e.status.to_lowercase().contains("save the file first"));
+        assert!(e.status_text().to_lowercase().contains("save the file first"));
+        // A17 T5 (F4 Warning table): a Sticky Warning.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
     }
 
     #[test]

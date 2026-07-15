@@ -25,15 +25,15 @@ fn append_to_scratch(editor: &mut Editor, text: &str, clock: &dyn Clock) -> bool
 /// Copy the active buffer's marked block into scratch; source unchanged, block kept.
 pub fn copy_block_to_scratch(editor: &mut Editor, clock: &dyn Clock) {
     if editor.scratch_id == Some(editor.active().id) {
-        editor.status = "already in the scratch buffer".into();
+        editor.set_status(crate::status::StatusKind::Info, "already in the scratch buffer");
         return;
     }
-    let Some(b) = editor.active().marked_block else { editor.status = "no marked block".into(); return; };
+    let Some(b) = editor.active().marked_block else { editor.set_status(crate::status::StatusKind::Info, "no marked block"); return; };
     let text = editor.active().document.buffer.slice(b.start..b.end);
     if append_to_scratch(editor, &text, clock) {
-        editor.status = "block copied to scratch".into();
+        editor.set_status(crate::status::StatusKind::Info, "block copied to scratch");
     } else {
-        editor.status = "no scratch buffer".into();
+        editor.set_status(crate::status::StatusKind::Info, "no scratch buffer");
     }
 }
 
@@ -41,13 +41,13 @@ pub fn copy_block_to_scratch(editor: &mut Editor, clock: &dyn Clock) {
 /// (a separate undo step in the source's history). Block is consumed.
 pub fn move_block_to_scratch(editor: &mut Editor, clock: &dyn Clock) {
     if editor.scratch_id == Some(editor.active().id) {
-        editor.status = "already in the scratch buffer".into();
+        editor.set_status(crate::status::StatusKind::Info, "already in the scratch buffer");
         return;
     }
-    let Some(b) = editor.active().marked_block else { editor.status = "no marked block".into(); return; };
+    let Some(b) = editor.active().marked_block else { editor.set_status(crate::status::StatusKind::Info, "no marked block"); return; };
     let text = editor.active().document.buffer.slice(b.start..b.end);
     if !append_to_scratch(editor, &text, clock) {
-        editor.status = "no scratch buffer".into();
+        editor.set_status(crate::status::StatusKind::Info, "no scratch buffer");
         return;
     }
     let doc_len = editor.active().document.buffer.len();
@@ -58,7 +58,7 @@ pub fn move_block_to_scratch(editor: &mut Editor, clock: &dyn Clock) {
     editor.active_mut().marked_block = None;
     crate::derive::rebuild(editor);
     crate::nav::ensure_visible(editor);
-    editor.status = "block moved to scratch".into();
+    editor.set_status(crate::status::StatusKind::Info, "block moved to scratch");
 }
 
 #[cfg(test)]
@@ -116,14 +116,14 @@ mod tests {
     fn no_block_sets_status() {
         let mut e = setup();
         copy_block_to_scratch(&mut e, &C(0));
-        assert_eq!(e.status, "no marked block");
+        assert_eq!(e.status_text(), "no marked block");
     }
 
     #[test]
     fn move_no_block_sets_status() {
         let mut e = setup();
         move_block_to_scratch(&mut e, &C(0));
-        assert_eq!(e.status, "no marked block");
+        assert_eq!(e.status_text(), "no marked block");
         assert_eq!(e.active().document.buffer.to_string(), "hello world\n", "buffer unchanged");
     }
 
@@ -139,11 +139,11 @@ mod tests {
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 0, hidden: false });
 
         copy_block_to_scratch(&mut e, &C(0));
-        assert_eq!(e.status, "already in the scratch buffer");
+        assert_eq!(e.status_text(), "already in the scratch buffer");
         assert_eq!(e.active().document.buffer.to_string(), scratch_before, "copy: scratch content unchanged");
 
         move_block_to_scratch(&mut e, &C(0));
-        assert_eq!(e.status, "already in the scratch buffer");
+        assert_eq!(e.status_text(), "already in the scratch buffer");
         assert_eq!(e.active().document.buffer.to_string(), scratch_before, "move: scratch content unchanged");
     }
 }

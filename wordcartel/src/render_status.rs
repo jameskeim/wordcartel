@@ -30,10 +30,10 @@ pub(crate) fn status_left_text(editor: &Editor) -> String {
             } else { "REVIEW".into() }
         }
     };
-    let mut text = if editor.status.is_empty() {
+    let mut text = if editor.status_text().is_empty() {
         format!("{head} [{mode_text}]")
     } else {
-        format!("{head} [{mode_text}] {}", editor.status)
+        format!("{head} [{mode_text}] {}", editor.status_text())
     };
     // BLK indicator: `· BLK` when a block is marked; `· BLK·hidden` when hidden.
     match editor.active().marked_block {

@@ -319,14 +319,22 @@ pub(crate) fn apply_parse_result(
         Ok(tree) => {
             if editor.parse_degraded {
                 editor.parse_degraded = false;
-                editor.status.clear();
+                // Retire ONLY the parse-degraded notice by its topic — the failure set it Sticky, so
+                // the transient-clear would not reach it, and a targeted clear must not disturb an
+                // unrelated held Warning/Error (round-1 Codex catch).
+                editor.clear_topic(crate::status::StatusTopic::ParseDegraded);
             }
             tree
         }
         Err(_) => {
             if !editor.parse_degraded {
                 editor.parse_degraded = true;
-                editor.status = "markdown parse failed — styling may be stale".to_string();
+                // A degraded parse leaves styling stale until the next clean parse: a Sticky Warning
+                // that holds (not a transient echo), tagged so its recovery arm can clear exactly it.
+                editor.set_status_full(crate::status::StatusKind::Warning,
+                    "markdown parse failed — styling may be stale",
+                    crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host,
+                    Some(crate::status::StatusTopic::ParseDegraded));
             }
             block_tree::empty_tree(new_len)
         }
@@ -846,26 +854,33 @@ mod tests {
     #[test]
     fn apply_parse_result_err_installs_empty_tree_and_sets_degraded_once() {
         let mut ed = crate::editor::Editor::new_from_text("hello\n", None, (80, 24));
-        ed.status.clear();
+        ed.clear_status();
         ed.parse_degraded = false;
 
-        // First Err: empty tree + degraded + notice.
+        // First Err: empty tree + degraded + the notice as a Sticky Warning tagged ParseDegraded.
         let t = apply_parse_result(&mut ed, 10, Err("boom".to_string()));
         assert!(ed.parse_degraded);
-        assert_eq!(ed.status, "markdown parse failed — styling may be stale");
+        assert_eq!(ed.status_text(), "markdown parse failed — styling may be stale");
+        assert_eq!(ed.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(ed.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        assert_eq!(ed.status().unwrap().topic(), Some(crate::status::StatusTopic::ParseDegraded));
         assert_eq!(t.root.span, 0..10);
         assert!(t.top_level().is_empty());
 
+        // A Sticky Warning is NOT cleared by the next-key idiom (holds while degraded).
+        ed.clear_transient_status();
+        assert!(ed.has_visible_status(), "the degraded notice holds through a keypress");
+
         // Second Err while already degraded: still empty tree, notice unchanged (no spam).
-        ed.status = "markdown parse failed — styling may be stale".to_string();
         let _ = apply_parse_result(&mut ed, 12, Err("again".to_string()));
         assert!(ed.parse_degraded);
+        assert_eq!(ed.status_text(), "markdown parse failed — styling may be stale");
 
-        // Ok while degraded: real tree returned, degraded cleared, notice cleared.
+        // Ok while degraded: real tree returned, degraded cleared, notice cleared by its own topic.
         let real = block_tree::full_parse_rope(&ropey::Rope::from_str("# H\n"));
         let got = apply_parse_result(&mut ed, 4, Ok(real.clone()));
         assert_eq!(got, real);
         assert!(!ed.parse_degraded);
-        assert_eq!(ed.status, "");
+        assert!(!ed.has_visible_status());
     }
 }

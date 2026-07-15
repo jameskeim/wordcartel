@@ -53,6 +53,12 @@ pub struct Bridge {
     /// other `Bridge` fields: `InvokeState` itself is `pub(crate)` (an internal implementation
     /// detail, never meant to leak past this crate's boundary).
     pub(crate) invoke_state: Rc<RefCell<InvokeState>>,
+    /// A17 T9 §9.3 — the plugin emit-side display-slot rate-limit, shared between every `wc.*`
+    /// emit closure (`install_status`/`install_notify`, `plugin::api`) and the pump
+    /// (`plugin::pump::PluginHost::pump`, which advances the tick once per cycle). Same
+    /// `Rc<RefCell<_>>`-shared-cell shape as `invoke_state` above, for the same reason: the
+    /// closures are `'static` and outlive this `&Bridge` borrow.
+    pub(crate) emit_throttle: Rc<RefCell<EmitThrottle>>,
 }
 
 /// What the pump is currently invoking, shared with every `wc.*` closure (each captures a
@@ -63,6 +69,48 @@ pub struct Bridge {
 pub(crate) struct InvokeState {
     pub current: Option<String>,
     pub observer: bool,
+}
+
+/// A17 T9 §9.3 — per-source-label emit-side rate-limit state for the plugin display-slot path. A
+/// looping plugin (`while true do wc.status('x') end`-style, or a hot on-edit hook) must not
+/// repaint the status slot every callback: at most [`crate::limits::MESSAGES_EMIT_MAX_PER_TICK`]
+/// slot updates are admitted per pump TICK (one [`crate::plugin::pump::PluginHost::pump`] cycle —
+/// [`EmitThrottle::advance_tick`] is called once at the top of every `pump()`, so a runaway Lua
+/// loop that fires many emits from a SINGLE callback invocation — all within one pump cycle —
+/// shares one tick's quota) per source LABEL (`InvokeState::current` — there is no stable plugin
+/// id, §3.5; a `None` label shares one conservative bucket, so it can only over-throttle, never
+/// under-throttle, relative to a hypothetical stable-id scheme). Excess emits still reach history
+/// (`Editor::record_status_history_only`) — only the slot write is dropped.
+#[derive(Default)]
+pub(crate) struct EmitThrottle {
+    tick: u64,
+    // label -> (tick it was last admitted on, how many admissions happened that tick).
+    admitted: std::collections::HashMap<Option<String>, (u64, usize)>,
+}
+
+impl EmitThrottle {
+    /// Advance to a new tick — called once per [`crate::plugin::pump::PluginHost::pump`] cycle,
+    /// before any unit runs, so every emit during that cycle (including all iterations of a
+    /// single runaway callback's loop) shares the new tick's quota.
+    pub(crate) fn advance_tick(&mut self) {
+        self.tick += 1;
+    }
+
+    /// `true` iff a display-slot update for `label` is admitted THIS tick (and records the
+    /// admission so the next call for the same label/tick sees the updated count); `false` means
+    /// the caller must write history-only instead of touching the slot.
+    pub(crate) fn admit(&mut self, label: &Option<String>) -> bool {
+        let entry = self.admitted.entry(label.clone()).or_insert((0, 0));
+        if entry.0 != self.tick {
+            *entry = (self.tick, 0); // a new tick resets this label's count
+        }
+        if entry.1 < crate::limits::MESSAGES_EMIT_MAX_PER_TICK {
+            entry.1 += 1;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// A committed hook: its VM-registry key + kind + a label for `plugin_error` attribution.
@@ -176,7 +224,8 @@ impl PluginHost {
         editor.borrow_mut().has_on_change_subscriber =
             self.hooks.iter().any(|h| h.kind == crate::plugin::PluginEventKind::Change);
         let invoke_state = Rc::new(RefCell::new(InvokeState { current: None, observer: false }));
-        let bridge = Bridge { editor, msg_tx, clock, invoke_state };
+        let emit_throttle = Rc::new(RefCell::new(EmitThrottle::default()));
+        let bridge = Bridge { editor, msg_tx, clock, invoke_state, emit_throttle };
         crate::plugin::api::install_editor_api(lua, &bridge)?;
         self.bridge = Some(bridge);
         Ok(())
@@ -314,7 +363,7 @@ mod tests {
         );
         host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "Yab");
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert_eq!(status, "ab/1", "wc.text saw the pre-insert buffer, wc.cursor the post-insert caret");
     }
 
@@ -323,7 +372,7 @@ mod tests {
         let (mut host, editor, _id) = make("wc.replace(10, 2, 'x')", "hello world");
         host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "hello world", "reversed range must not mutate the buffer");
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.contains("plugin"), "status: {status}");
         assert!(!status.to_lowercase().contains("panic"), "must be a clean degrade, not a caught panic: {status}");
     }
@@ -333,7 +382,7 @@ mod tests {
         let (mut host, editor, _id) = make("wc.replace(0, 999, 'x')", "hello world");
         host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "hello world", "out-of-bounds range must not mutate the buffer");
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(!status.to_lowercase().contains("panic"), "status: {status}");
     }
 
@@ -343,7 +392,7 @@ mod tests {
         let (mut host, editor, _id) = make("wc.replace(2, 3, 'x')", "h\u{e9}llo");
         host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "h\u{e9}llo", "a mid-char offset must not mutate the buffer");
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(!status.to_lowercase().contains("panic"), "status: {status}");
     }
 
@@ -355,7 +404,7 @@ mod tests {
         );
         host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "hi");
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.starts_with("false:"), "wc.text(10,2) must fail (pcall false), got: {status}");
         assert!(!status.to_lowercase().contains("panic"), "must be a clean degrade, not a caught panic: {status}");
     }
@@ -370,7 +419,7 @@ mod tests {
         );
         host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "doc", "an over-cap insert must never reach a Tendril alloc/ChangeSet");
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.contains("plugin"), "status: {status}");
     }
 
@@ -379,7 +428,7 @@ mod tests {
         let (mut host, editor, _id) =
             make(&format!("wc.status(string.rep('a', {}))", crate::limits::PLUGIN_MAX_STATUS_LEN + 100), "doc");
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert_eq!(status.len(), crate::limits::PLUGIN_MAX_STATUS_LEN);
         assert!(status.chars().all(|c| c == 'a'));
     }
@@ -390,18 +439,129 @@ mod tests {
         let (mut host, editor, _id) =
             make(&format!("wc.status(string.rep('a', {prefix_len}) .. '\u{e9}')"), "doc");
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         // The 2-byte 'é' straddles the cap; truncation must back off before its lead byte
         // rather than splitting it (which would panic a naive byte-slice) or over-including it.
         assert_eq!(status.len(), prefix_len);
         assert!(status.chars().all(|c| c == 'a'));
     }
 
+    // -----------------------------------------------------------------------
+    // A17 T9 — wc.status reroute + wc.notify + the emit-side rate-limit (spec §9.1-§9.3).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wc_status_still_works_as_a_plugin_tagged_info() {
+        let (mut host, editor, _id) = make("wc.status('hi')", "x");
+        host.pump_test(&editor);
+        let e = editor.borrow();
+        assert_eq!(e.status_text(), "hi");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Info);
+        assert!(matches!(e.status().unwrap().source(), crate::status::StatusSource::Plugin { .. }));
+    }
+
+    #[test]
+    fn wc_notify_error_sets_a_sticky_error_from_a_plugin() {
+        let (mut host, editor, _id) = make("wc.notify('error', 'compile failed')", "x");
+        host.pump_test(&editor);
+        let e = editor.borrow();
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+    }
+
+    #[test]
+    fn wc_notify_unknown_severity_does_not_emit_a_silent_info() {
+        // Unknown severity is a typed Lua error (wrapped in pcall so the plugin doesn't abort),
+        // never a silent Info write.
+        let (mut host, editor, _id) = make("pcall(function() wc.notify('bogus', 'x') end)", "y");
+        host.pump_test(&editor);
+        assert!(!editor.borrow().has_visible_status(), "unknown severity must NOT emit a silent Info");
+    }
+
+    #[test]
+    fn wc_notify_source_is_plugin_tagged_by_label() {
+        let (mut host, editor, _id) = make("wc.notify('warning', 'careful')", "x");
+        host.pump_test(&editor);
+        let e = editor.borrow();
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert!(matches!(e.status().unwrap().source(), crate::status::StatusSource::Plugin { .. }),
+            "wc.notify must attribute StatusSource::Plugin, not Host");
+    }
+
+    #[test]
+    fn wc_status_burst_in_one_callback_is_throttled_to_one_slot_update_per_tick() {
+        // A single Lua callback invocation runs inside ONE unit of ONE pump cycle — a runaway
+        // `while true do wc.status(...) end`-style burst must not repaint the slot on every
+        // iteration (§9.3). MESSAGES_EMIT_MAX_PER_TICK == 1, so only the FIRST admitted emit of
+        // this tick lands in the display slot; the rest are dropped from the slot but still
+        // recorded to history (never silently lost).
+        assert_eq!(crate::limits::MESSAGES_EMIT_MAX_PER_TICK, 1,
+            "this test's slot-content assertion assumes the v1 quota of 1");
+        let (mut host, editor, _id) =
+            make("wc.status('a'); wc.status('b'); wc.status('c')", "x");
+        host.pump_test(&editor);
+        let e = editor.borrow();
+        assert_eq!(e.status_text(), "a", "only the first emit of the tick wins the display slot");
+        let texts: Vec<&str> = e.status_history().entries().iter().map(|s| s.text()).collect();
+        assert_eq!(texts, vec!["a", "b", "c"], "every emit still reaches history, throttled or not");
+    }
+
+    #[test]
+    fn error_and_warning_emits_bypass_the_burst_throttle() {
+        // A17 F2 (final gate): the emit throttle bounds only Info/Log chatter. In one callback,
+        // `wc.status('working')` (Info) wins the slot first, then `wc.notify('error','boom')` shares
+        // the SAME per-label bucket in the SAME tick — but Error is exempt, so it reaches the normal
+        // slot path (and Q1 lets a more-severe Error displace the Info). The visible slot must be the
+        // Error, not the throttled-to-history Info. (Pre-fix the Error was demoted to history-only.)
+        assert_eq!(crate::limits::MESSAGES_EMIT_MAX_PER_TICK, 1,
+            "this test assumes the v1 quota of 1 so the second emit would be throttled if not exempt");
+        let (mut host, editor, _id) =
+            make("wc.status('working'); wc.notify('error', 'boom')", "x");
+        host.pump_test(&editor);
+        let e = editor.borrow();
+        assert_eq!(e.status_text(), "boom", "an Error must bypass the throttle and win the slot");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+    }
+
+    #[test]
+    fn wc_status_throttle_admits_again_on_the_next_pump_tick() {
+        // Two SEPARATE pump cycles are two separate ticks — the throttle must not carry a
+        // label's exhausted quota over to the next cycle (a legitimately-paced plugin, one
+        // wc.status per keystroke/command, must never be silently throttled).
+        let (mut host, editor, id) = make("wc.status('first')", "x");
+        host.pump_test(&editor);
+        assert_eq!(editor.borrow().status_text(), "first");
+        // A second, separate pump() cycle over the SAME command id: `invoke_call` resolves the
+        // callback directly from `call.id` (never through `reg`), so re-enqueueing `id` re-runs
+        // the identical 'first' emit — on a NEW tick, which must be freshly admitted.
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id, arg: None });
+        host.pump_test(&editor);
+        let e = editor.borrow();
+        assert_eq!(e.status_text(), "first", "the second tick's emit is admitted (not carried-over-throttled)");
+        assert_eq!(e.status_history().entries().len(), 1,
+            "identical adjacent messages coalesce via repeat (§5.2), not a second entry");
+        assert_eq!(e.status_history().entries().back().unwrap().repeat(), 2);
+    }
+
+    #[test]
+    fn wc_status_throttle_buckets_none_label_emits_together() {
+        // A timer callback's label is "timer#<handle>" (Some), never None in practice — but the
+        // throttle's None-label bucket (§9.3's "label-less emits share one conservative bucket")
+        // is exercised directly here against `EmitThrottle::admit` (a pure unit, no VM needed):
+        // two None-label emits in the SAME tick must share the one-per-tick quota.
+        let mut th = crate::plugin::host::EmitThrottle::default();
+        th.advance_tick();
+        assert!(th.admit(&None), "the first None-label emit this tick is admitted");
+        assert!(!th.admit(&None), "a second None-label emit the SAME tick shares the bucket — denied");
+        th.advance_tick();
+        assert!(th.admit(&None), "a new tick resets the None-label bucket");
+    }
+
     #[test]
     fn lua_error_in_callback_is_isolated_and_reported() {
         let (mut host, editor, _id) = make("error('boom')", "x");
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.contains("boom"), "status: {status}");
         assert_eq!(whole_text(&editor), "x", "editor must be untouched by a callback error");
     }
@@ -427,7 +587,7 @@ mod tests {
         }
         editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: panic_id, arg: None });
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.contains("callback panic"), "status: {status}");
         assert_eq!(whole_text(&editor), "x", "a panicking callback must not touch the editor");
 
@@ -479,7 +639,7 @@ mod tests {
         host.pump_test(&editor);
         let sel = editor.borrow().active().document.selection.primary();
         assert_eq!((sel.anchor, sel.head), (0, 2), "head snapped to buffer length, not rejected");
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(!status.to_lowercase().contains("panic"), "status: {status}");
         assert!(!status.contains("plugin:"), "must succeed silently, no typed error: {status}");
     }
@@ -491,7 +651,7 @@ mod tests {
             "hello",
         );
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert_eq!(status, "1:3");
     }
 
@@ -499,7 +659,7 @@ mod tests {
     fn wc_len_returns_buffer_byte_length() {
         let (mut host, editor, _id) = make("wc.status(tostring(wc.len()))", "hello");
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert_eq!(status, "5");
     }
 
@@ -507,7 +667,7 @@ mod tests {
     fn wc_version_returns_buffer_version_after_an_edit() {
         let (mut host, editor, _id) = make("wc.insert('x'); wc.status(tostring(wc.version()))", "y");
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert_eq!(status, "1", "version bumps once per applied transaction");
     }
 
@@ -515,7 +675,7 @@ mod tests {
     fn wc_path_is_nil_for_an_unsaved_buffer() {
         let (mut host, editor, _id) = make("wc.status(tostring(wc.path()))", "x");
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert_eq!(status, "nil");
     }
 
@@ -538,7 +698,7 @@ mod tests {
         editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id, arg: None });
 
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert_eq!(status, "/tmp/note.md");
     }
 
@@ -563,7 +723,7 @@ mod tests {
         editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id, arg: None });
 
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.contains("register_command"), "status: {status}");
         assert!(status.contains("only available during plugin load"), "status: {status}");
         assert_eq!(reg.commands().count(), before, "no new command registered post-load");
@@ -620,7 +780,7 @@ mod tests {
 
             editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: rep_id, arg: None });
             host.pump_test(&editor); // wc.replace's outcome — Ok or a typed error, never a raw panic
-            let status_after_replace = editor.borrow().status.clone();
+            let status_after_replace = editor.borrow().status_text().to_string();
             prop_assert!(!status_after_replace.to_lowercase().contains("panic"),
                 "status: {status_after_replace}");
             let after_replace_len = editor.borrow().active().document.buffer.len();
@@ -629,7 +789,7 @@ mod tests {
 
             editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: rd_id, arg: None });
             host.pump_test(&editor); // wc.text's outcome — Ok or a typed error, never a raw panic
-            let status_after_text = editor.borrow().status.clone();
+            let status_after_text = editor.borrow().status_text().to_string();
             prop_assert!(!status_after_text.to_lowercase().contains("panic"),
                 "status: {status_after_text}");
             // wc.text is a pure read — the buffer must be byte-identical to after the replace.
@@ -699,7 +859,7 @@ mod tests {
             path: Some("/x".to_string()),
         });
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert_eq!(status, "save:/x");
     }
 
@@ -737,7 +897,7 @@ mod tests {
             crate::plugin::PluginEvent { kind: crate::plugin::PluginEventKind::Save, path: None });
         host.pump_test(&editor);
 
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.contains("boom"), "the first hook's error must be reported: {status}");
         let lua = host.lua().unwrap();
         let second_ran: bool = lua.globals().get("second_ran").unwrap();
@@ -753,7 +913,7 @@ mod tests {
         editor.borrow_mut().pending_plugin_events.push_back(
             crate::plugin::PluginEvent { kind: crate::plugin::PluginEventKind::Open, path: None });
         host.pump_test(&editor);
-        assert_eq!(editor.borrow().status, "", "an event with no matching hook must invoke nothing");
+        assert_eq!(editor.borrow().status_text(), "", "an event with no matching hook must invoke nothing");
         assert_eq!(whole_text(&editor), "x");
     }
 
@@ -789,7 +949,7 @@ mod tests {
         let id = reg.resolve_name("t.cmd").expect("registered under t.cmd");
         editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id, arg: None });
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.contains("wc.on"), "status: {status}");
         assert!(status.contains("only available during plugin load"), "status: {status}");
         assert_eq!(whole_text(&editor), "x", "no unrelated editor mutation from the degrade");
@@ -857,7 +1017,7 @@ mod tests {
         let sel_after = editor.borrow().active().document.selection.primary();
         assert_eq!((sel_before.anchor, sel_before.head), (sel_after.anchor, sel_after.head),
             "a blocked wc.set_selection must not move the selection");
-        assert_eq!(editor.borrow().status, "ok",
+        assert_eq!(editor.borrow().status_text(), "ok",
             "wc.status must STILL succeed from a hook — the one allowed mutation surface");
 
         // A raw Rust-panicking "hook" — bypassing wc.on entirely, mirroring
@@ -875,7 +1035,7 @@ mod tests {
         editor.borrow_mut().pending_plugin_events.push_back(
             crate::plugin::PluginEvent { kind: panic_kind, path: None });
         host.pump_test(&editor);
-        let status_after_panic = editor.borrow().status.clone();
+        let status_after_panic = editor.borrow().status_text().to_string();
         assert!(status_after_panic.contains("hook panic"), "status: {status_after_panic}");
 
         // The flag must be reset — a normal (non-hook) command callback's wc.insert must still
@@ -1069,7 +1229,7 @@ mod tests {
         let clock = TestClock::new(0);
         host.pump(&editor, &reg, &ex, &clock, &tx);
 
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.contains("t.cmd"), "status must name the origin: {status}");
         assert!(status.contains("nope"), "status must name the unresolved target: {status}");
         assert!(!status.to_lowercase().contains("panic"), "status: {status}");
@@ -1124,7 +1284,7 @@ mod tests {
             crate::plugin::PluginEvent { kind: crate::plugin::PluginEventKind::Save, path: None });
         host.pump_test(&editor);
 
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.starts_with("false:"), "wc.command from a hook must be rejected: {status}");
         assert!(status.contains("event hook"), "status: {status}");
         assert!(editor.borrow().pending_plugin_dispatch.is_empty(), "nothing may be queued from a blocked wc.command");
@@ -1158,7 +1318,7 @@ mod tests {
         assert!(e.pending_plugin_calls.is_empty(), "the chain-cap trip must clear the call queue");
         assert!(e.pending_plugin_events.is_empty(), "the chain-cap trip must clear the event queue");
         assert!(e.pending_plugin_dispatch.is_empty(), "the chain-cap trip must clear the dispatch queue");
-        assert!(e.status.to_lowercase().contains("truncat"), "status: {}", e.status);
+        assert!(e.status_text().to_lowercase().contains("truncat"), "status: {}", e.status_text());
         assert_eq!(e.active().document.buffer.to_string(), "hello",
             "the editor's actual content must be untouched by the truncated cascade");
     }

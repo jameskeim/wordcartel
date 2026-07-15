@@ -448,7 +448,10 @@ pub fn dispatch_swap_write(ctx: &mut Ctx) {
                             b.swapped_version = Some(version);
                         }
                     }
-                    if !ok { editor.status = "swap write failed".to_string(); } // status global
+                    if !ok {
+                        editor.set_status_full(crate::status::StatusKind::Error, "swap write failed".to_string(),
+                            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+                    } // status global
                 }),
             }
         }),

@@ -40,7 +40,8 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
                             // Saved, but the user typed during the in-flight save → buffer
                             // dirty again. Do NOT quit (would lose those edits). User
                             // re-issues quit when ready.
-                            editor.status = "edited during save — quit cancelled".into();
+                            editor.set_status_full(crate::status::StatusKind::Warning, "edited during save — quit cancelled",
+                                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
                         }
                     }
                 }
@@ -71,10 +72,11 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
                         // buffer_id misreading would close a still-dirty buffer
                         // (spec D3). close_buffer_now re-reads counts at apply time.
                         crate::workspace::close_buffer_now(editor, id);
-                        editor.status = "saved — closed".into();
+                        editor.set_status(crate::status::StatusKind::Info, "saved — closed");
                     } else if saved_this {
                         // Edited during the in-flight save: do NOT close.
-                        editor.status = "edited during save — close cancelled".into();
+                        editor.set_status_full(crate::status::StatusKind::Warning, "edited during save — close cancelled",
+                            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
                     }
                     // !saved_this: no close; the merge's own status stands (error
                     // text, or empty for a vanished target) — mirrors
@@ -123,11 +125,16 @@ fn apply_panic(buffer_id: crate::editor::BufferId, version: u64, kind: crate::jo
                 editor.quit_drain = None;
                 editor.quit_drain_advance = false;
             }
-            editor.status = format!("save failed (internal error: {msg})");
+            // A panic is a failed Save completion: collapse the same Save(buffer_id, version) start
+            // this job posted (the merge never ran, but the "Saving…" progress entry is live). The
+            // `buffer_id`/`version` in hand reconstruct the identical topic key.
+            editor.finish_topic(crate::status::StatusTopic::Save(buffer_id, version),
+                crate::status::StatusKind::Error, format!("save failed (internal error: {msg})"));
         }
         JobKind::SwapWrite => {
             if let Some(b) = editor.by_id_mut(buffer_id) { b.swap_in_flight = false; }
-            editor.status = format!("swap failed (internal error: {msg})");
+            editor.set_status_full(crate::status::StatusKind::Error, format!("swap failed (internal error: {msg})"),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         }
         JobKind::Reparse => {
             // A panicked reconcile (upstream pulldown-cmark residual) is deterministic
@@ -140,7 +147,10 @@ fn apply_panic(buffer_id: crate::editor::BufferId, version: u64, kind: crate::jo
             }
         }
         #[cfg(test)]
-        JobKind::CoalesceProbe => { editor.status = format!("job failed (internal error: {msg})"); }
+        JobKind::CoalesceProbe => {
+            editor.set_status_full(crate::status::StatusKind::Error, format!("job failed (internal error: {msg})"),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+        }
     }
 }
 
@@ -215,10 +225,12 @@ pub(crate) fn apply_filter_done(
     let stale = editor.by_id(buffer_id).map(|b| b.document.version) != Some(version);
     match outcome {
         _ if stale => {
-            editor.status = "filter discarded - buffer changed".into();
+            editor.finish_topic(crate::status::StatusTopic::Filter, crate::status::StatusKind::Warning,
+                "filter discarded - buffer changed");
         }
         crate::filter::RunResult::Err(err) => {
-            editor.status = crate::filter::describe_error(&err);
+            editor.finish_topic(crate::status::StatusTopic::Filter, crate::status::StatusKind::Error,
+                crate::filter::describe_error(&err));
         }
         crate::filter::RunResult::Stdout(text) => {
             let apply_result = if let Some(b) = editor.by_id_mut(buffer_id) {
@@ -238,7 +250,8 @@ pub(crate) fn apply_filter_done(
             if apply_result {
                 crate::derive::rebuild(editor);
                 crate::nav::ensure_visible(editor);
-                editor.status = "filter applied".into();
+                editor.finish_topic(crate::status::StatusTopic::Filter, crate::status::StatusKind::Info,
+                    "filter applied");
             }
         }
     }
@@ -256,7 +269,8 @@ pub(crate) fn apply_transform_done(
     editor.transform_in_flight = false;
     let stale = editor.by_id(buffer_id).map(|b| b.document.version) != Some(version);
     if stale {
-        editor.status = "transform discarded — buffer changed".into();
+        editor.finish_topic(crate::status::StatusTopic::Transform, crate::status::StatusKind::Warning,
+            "transform discarded — buffer changed");
         return;
     }
     crate::transform::merge_transform_into(editor, buffer_id, kind, range, result, clock);
@@ -280,10 +294,10 @@ pub(crate) fn apply_export_done(
         if let Ok(crate::export::ExportResult::TempReady(tmp)) = &result {
             let _ = std::fs::remove_file(tmp);
         }
-        editor.status = format!(
+        editor.set_status_full(crate::status::StatusKind::Warning, format!(
             "export target {} appeared — re-run export to overwrite",
             target.display()
-        );
+        ), crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return;
     }
     match result {
@@ -291,10 +305,11 @@ pub(crate) fn apply_export_done(
             match file::save_atomic_bytes(&target, &bytes) {
                 Ok(()) => {
                     let status = format!("exported {}", target.display());
-                    editor.status = status;
+                    editor.set_status(crate::status::StatusKind::Info, status);
                 }
                 Err(e) => {
-                    editor.status = format!("export write failed: {e}");
+                    editor.set_status_full(crate::status::StatusKind::Error, format!("export write failed: {e}"),
+                        crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
                 }
             }
         }
@@ -302,23 +317,36 @@ pub(crate) fn apply_export_done(
             match std::fs::rename(&tmp, &target) {
                 Ok(()) => {
                     let status = format!("exported {}", target.display());
-                    editor.status = status;
+                    editor.set_status(crate::status::StatusKind::Info, status);
                 }
                 Err(e) => {
                     let _ = std::fs::remove_file(&tmp);
-                    editor.status = format!("export rename failed: {e}");
+                    editor.set_status_full(crate::status::StatusKind::Error, format!("export rename failed: {e}"),
+                        crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
                 }
             }
         }
         Err(e) => {
-            editor.status = crate::filter::describe_error(&e);
+            editor.set_status_full(crate::status::StatusKind::Error, crate::filter::describe_error(&e),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         }
     }
 }
 
 pub(crate) fn insert_paste_text(editor: &mut Editor, buffer_id: crate::editor::BufferId, text: &str, clock: &dyn Clock) -> bool {
+    // A17 F5 (final gate): paste into a read-only buffer is a LOUD reject, not a silent no-op.
+    // `Buffer::apply` already no-ops safely on a read-only slot, but this path is not a registry
+    // command (the completeness sweep can't see it) and previously issued no `reject_read_only` and
+    // still set the register in its callers. Reject here — returning `false` also makes both callers
+    // skip their register set (they gate on the return value).
+    if editor.by_id(buffer_id).is_some_and(|b| b.read_only) {
+        editor.reject_read_only();
+        return false;
+    }
     if text.len() > crate::clipboard::PASTE_MAX_BYTES {
-        editor.status = format!("paste too large ({} MiB) — skipped", text.len() / (1 << 20));
+        editor.set_status_full(crate::status::StatusKind::Warning,
+            format!("paste too large ({} MiB) — skipped", text.len() / (1 << 20)),
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return false;
     }
     let active_id = editor.active().id;
@@ -357,7 +385,9 @@ pub(crate) fn apply_clipboard_paste(editor: &mut Editor, buffer_id: crate::edito
 
 pub(crate) fn apply_clipboard_availability(editor: &mut Editor, ok: bool) {
     if !ok && !editor.clipboard_notice_shown {
-        editor.status = "system clipboard unavailable — copy/paste work in-editor (register only)".into();
+        editor.set_status_full(crate::status::StatusKind::Warning,
+            "system clipboard unavailable — copy/paste work in-editor (register only)",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         editor.clipboard_notice_shown = true;
     }
 }
@@ -460,6 +490,10 @@ mod tests {
         assert!(!e.quit, "must NOT quit — buffer is dirty again from edits typed during the save");
         assert!(e.active().document.dirty(), "buffer still holds the newer edits");
         assert!(e.pending_after_save.is_none(), "pending_after_save consumed on save match");
+        // A17 T5 (F4 Warning table): "edited during save — quit cancelled" is a Sticky Warning.
+        assert_eq!(e.status_text(), "edited during save — quit cancelled");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         let _ = std::fs::remove_file(&p);
     }
 
@@ -472,12 +506,12 @@ mod tests {
         e.active_mut().document.version = 5;
         // Fresh one-shot (Save is never stale): merges.
         apply_result(JobResult { buffer_id: id, class: ResultClass::Durability, version: 3, kind: JobKind::Save,
-            merge: Box::new(|ed: &mut Editor| ed.status = "saved".into()) }, &mut e);
-        assert_eq!(e.status, "saved");
+            merge: Box::new(|ed: &mut Editor| ed.set_status(crate::status::StatusKind::Info, "saved")) }, &mut e);
+        assert_eq!(e.status_text(), "saved");
         // Stale coalescible: dropped.
         apply_result(JobResult { buffer_id: id, class: ResultClass::BufferLocal, version: 3, kind: JobKind::CoalesceProbe,
-            merge: Box::new(|ed: &mut Editor| ed.status = "STALE".into()) }, &mut e);
-        assert_eq!(e.status, "saved", "stale coalescible result must be dropped");
+            merge: Box::new(|ed: &mut Editor| ed.set_status(crate::status::StatusKind::Info, "STALE")) }, &mut e);
+        assert_eq!(e.status_text(), "saved", "stale coalescible result must be dropped");
     }
 
     #[test]
@@ -489,9 +523,9 @@ mod tests {
         apply_result(JobResult {
             buffer_id: BufferId(999), class: ResultClass::BufferLocal,
             version: 1, kind: JobKind::Save,
-            merge: Box::new(|ed: &mut Editor| ed.status = "SHOULD NOT RUN".into()),
+            merge: Box::new(|ed: &mut Editor| ed.set_status(crate::status::StatusKind::Info, "SHOULD NOT RUN")),
         }, &mut e);
-        assert_ne!(e.status, "SHOULD NOT RUN", "buffer-local merge for a missing buffer is dropped");
+        assert_ne!(e.status_text(), "SHOULD NOT RUN", "buffer-local merge for a missing buffer is dropped");
     }
 
     #[test]
@@ -503,9 +537,9 @@ mod tests {
         apply_result(JobResult {
             buffer_id: id, class: ResultClass::BufferLocal,
             version: 1, kind: JobKind::Save,
-            merge: Box::new(|ed: &mut Editor| ed.status = "merged".into()),
+            merge: Box::new(|ed: &mut Editor| ed.set_status(crate::status::StatusKind::Info, "merged")),
         }, &mut e);
-        assert_eq!(e.status, "merged");
+        assert_eq!(e.status_text(), "merged");
     }
 
     #[test]
@@ -517,9 +551,9 @@ mod tests {
         apply_result(JobResult {
             buffer_id: BufferId(999), class: ResultClass::Durability,
             version: 1, kind: JobKind::SwapWrite,
-            merge: Box::new(|ed: &mut Editor| ed.status = "durability ran".into()),
+            merge: Box::new(|ed: &mut Editor| ed.set_status(crate::status::StatusKind::Info, "durability ran")),
         }, &mut e);
-        assert_eq!(e.status, "durability ran");
+        assert_eq!(e.status_text(), "durability ran");
     }
 
     // -----------------------------------------------------------------------
@@ -556,7 +590,7 @@ mod tests {
         assert!(e.by_id(x_id).is_none(), "closed buffer gone");
         assert!(e.buffers.len() < pre_count, "buffer count drops");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "new content\n", "file updated");
-        assert_eq!(e.status, "saved — closed");
+        assert_eq!(e.status_text(), "saved — closed");
         let _ = std::fs::remove_file(&p);
     }
 
@@ -591,7 +625,10 @@ mod tests {
         };
         apply_result(save_result, &mut e);
         assert!(e.by_id(id).is_some(), "buffer NOT closed — still dirty");
-        assert_eq!(e.status, "edited during save — close cancelled");
+        assert_eq!(e.status_text(), "edited during save — close cancelled");
+        // A17 T5 (F4 Warning table): a Sticky Warning.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         assert!(e.pending_after_save.is_none(), "pending consumed");
         let _ = std::fs::remove_file(&p);
     }
@@ -621,7 +658,7 @@ mod tests {
             for o in ex.drain() { apply_outcome(o, &mut e); }
             assert!(e.by_id(id).is_some(), "buffer NOT closed — save failed");
             assert!(e.pending_after_save.is_none(), "pending cleared on save failure");
-            assert!(e.status.to_lowercase().contains("symlink"), "error status: {:?}", e.status);
+            assert!(e.status_text().to_lowercase().contains("symlink"), "error status: {:?}", e.status_text());
             let _ = std::fs::remove_file(&link);
             let _ = std::fs::remove_file(&real);
         }
@@ -757,7 +794,7 @@ mod tests {
         assert_eq!(e.buffers.len(), 2, "fresh untitled + scratch");
         assert!(e.buffers.iter().any(|b| b.document.path.is_none() && !e.is_scratch(b.id)),
             "fresh untitled present in X's slot");
-        assert_eq!(e.status, "saved — closed");
+        assert_eq!(e.status_text(), "saved — closed");
         let _ = std::fs::remove_file(&p0);
         let _ = std::fs::remove_file(&p1);
     }
@@ -786,5 +823,156 @@ mod tests {
         assert!(e.prompt.is_some(), "external-mod conflict raises the modal");
         assert!(e.pending_after_save.is_none(), "pending_after_save NOT armed on conflict");
         let _ = std::fs::remove_file(&p);
+    }
+
+    // -----------------------------------------------------------------------
+    // A17 T4: F4 Error-table sites — a genuine failure lands Sticky/Error and
+    // survives a later Info ack (Q1). One test per row.
+    // -----------------------------------------------------------------------
+
+    fn assert_sticky_error_survives_info(e: &mut Editor) {
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        e.set_status(crate::status::StatusKind::Info, "later ack");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error, "Q1: Info must not displace a held Error");
+    }
+
+    /// A17 T5 (F4 Warning table): mirrors `assert_sticky_error_survives_info` for Warning sites.
+    fn assert_sticky_warning_survives_info(e: &mut Editor) {
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        e.set_status(crate::status::StatusKind::Info, "later ack");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning, "Q1: Info must not displace a held Warning");
+    }
+
+    #[test]
+    fn apply_panic_save_is_a_sticky_error() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        let id = e.active().id;
+        apply_outcome(crate::jobs::JobOutcome::Panicked {
+            buffer_id: id, version: 0, kind: crate::jobs::JobKind::Save, msg: "boom".into(),
+        }, &mut e);
+        assert!(e.status_text().contains("save failed"));
+        assert_sticky_error_survives_info(&mut e);
+    }
+
+    #[test]
+    fn apply_panic_swap_write_is_a_sticky_error() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        let id = e.active().id;
+        apply_outcome(crate::jobs::JobOutcome::Panicked {
+            buffer_id: id, version: 0, kind: crate::jobs::JobKind::SwapWrite, msg: "boom".into(),
+        }, &mut e);
+        assert!(e.status_text().contains("swap failed"));
+        assert_sticky_error_survives_info(&mut e);
+    }
+
+    #[test]
+    fn apply_panic_coalesce_probe_is_a_sticky_error() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        let id = e.active().id;
+        apply_outcome(crate::jobs::JobOutcome::Panicked {
+            buffer_id: id, version: 0, kind: crate::jobs::JobKind::CoalesceProbe, msg: "boom".into(),
+        }, &mut e);
+        assert!(e.status_text().contains("job failed"));
+        assert_sticky_error_survives_info(&mut e);
+    }
+
+    #[test]
+    fn apply_export_done_write_failure_is_a_sticky_error() {
+        use crate::editor::Editor;
+        // A target whose parent is a regular FILE (not a dir) → save_atomic_bytes fails
+        // (ENOTDIR), driving apply_export_done's Bytes/Err(e) "export write failed" arm.
+        let parent = std::env::temp_dir().join(format!("wc-c4-exportwrite-{}.md", std::process::id()));
+        std::fs::write(&parent, "i am a file\n").unwrap();
+        let target = parent.join("out.html");
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        apply_export_done(&mut e, target, Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), true);
+        assert!(e.status_text().contains("export write failed"));
+        assert_sticky_error_survives_info(&mut e);
+        let _ = std::fs::remove_file(&parent);
+    }
+
+    #[test]
+    fn apply_export_done_rename_failure_is_a_sticky_error() {
+        use crate::editor::Editor;
+        // TempReady names a tmp file that does not exist → std::fs::rename fails,
+        // driving apply_export_done's TempReady/Err(e) "export rename failed" arm.
+        let missing_tmp = std::env::temp_dir().join(format!("wc-c4-exportrename-missing-{}.tmp", std::process::id()));
+        let target = std::env::temp_dir().join(format!("wc-c4-exportrename-target-{}.html", std::process::id()));
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        apply_export_done(&mut e, target, Ok(crate::export::ExportResult::TempReady(missing_tmp)), true);
+        assert!(e.status_text().contains("export rename failed"));
+        assert_sticky_error_survives_info(&mut e);
+    }
+
+    #[test]
+    fn apply_export_done_pandoc_failure_is_a_sticky_error() {
+        use crate::editor::Editor;
+        let target = std::env::temp_dir().join(format!("wc-c4-exportpandoc-{}.html", std::process::id()));
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        apply_export_done(&mut e, target, Err(crate::filter::FilterError::Panicked("boom".into())), true);
+        assert_sticky_error_survives_info(&mut e);
+    }
+
+    /// A17 T5 (F4 Warning table, Codex-r1 #1 row): the export TOCTOU refusal — the target
+    /// appeared on disk between the overwrite check and completion — is a recoverable Sticky
+    /// Warning, not an Error (the user just re-runs export).
+    #[test]
+    fn apply_export_done_toctou_target_appeared_is_a_sticky_warning() {
+        use crate::editor::Editor;
+        let target = std::env::temp_dir().join(format!("wc-c4-exporttoctou-{}.html", std::process::id()));
+        std::fs::write(&target, "existing\n").unwrap();
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        apply_export_done(&mut e, target.clone(), Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), false);
+        assert!(e.status_text().contains("appeared — re-run export to overwrite"));
+        assert_sticky_warning_survives_info(&mut e);
+        let _ = std::fs::remove_file(&target);
+    }
+
+    /// A17 T5 (F4 Warning table): a paste over the size cap is a recoverable Sticky Warning.
+    #[test]
+    fn insert_paste_text_too_large_is_a_sticky_warning() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        let id = e.active().id;
+        let clk = TestClock(0);
+        let huge = "x".repeat(crate::clipboard::PASTE_MAX_BYTES + 1);
+        let ok = insert_paste_text(&mut e, id, &huge, &clk);
+        assert!(!ok, "oversized paste must not be inserted");
+        assert!(e.status_text().contains("paste too large"));
+        assert_sticky_warning_survives_info(&mut e);
+    }
+
+    /// A17 F5 (final gate): a paste into a read-only buffer is a LOUD reject — no mutation AND the
+    /// canonical "buffer is read-only" Sticky Warning (the paste path is not a registry command, so
+    /// the completeness sweep can't cover it; the guard lives at the paste entry). It also skips the
+    /// callers' register set by returning `false`.
+    #[test]
+    fn paste_into_a_read_only_buffer_is_a_loud_reject() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("keep\n", None, (80, 24));
+        let id = e.active().id;
+        e.active_mut().read_only = true;
+        let clk = TestClock(0);
+        let before = e.active().document.buffer.to_string();
+        let ok = insert_paste_text(&mut e, id, "nope", &clk);
+        assert!(!ok, "paste into a read-only buffer must not report success");
+        assert_eq!(e.active().document.buffer.to_string(), before, "read-only: no mutation");
+        assert_eq!(e.status_text(), "buffer is read-only");
+    }
+
+    /// A17 T5 (F4 Warning table): the system-clipboard-unavailable notice is a recoverable
+    /// Sticky Warning (copy/paste still work in-editor via the register).
+    #[test]
+    fn apply_clipboard_availability_unavailable_is_a_sticky_warning() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        apply_clipboard_availability(&mut e, false);
+        assert!(e.status_text().contains("system clipboard unavailable"));
+        assert_sticky_warning_survives_info(&mut e);
     }
 }

@@ -920,6 +920,17 @@ doc = "engineering-health.md#h21"
 created = "2026-07-14"
 
 [[item]]
+id = "H22"
+title = "Universal edit chokepoint — route all internal edits through submit_transaction (M2 boundary)"
+status = "triage"
+kind = "debt"
+size = "L"
+theme = "H"
+hook = "A truly universal single function that ALL internal edits route through — including search_ui/jobs_apply/transform's direct Buffer::apply calls — i.e. making submit_transaction (the M2 untrusted-edit boundary) the one funnel everything uses. Genuinely valuable: localizes versioning, swap-scheduling, reconcile-triggering, the read-only guard, AND the Effort-P plugin-edit seam in one place; rhymes with the 'unify ad-hoc surfaces' arc (A17/H21). Surfaced by A17's read-only-guard work (2026-07-15): this codebase has NO single mutation chokepoint — content mutation is closed at Buffer::{apply,undo,redo} (private document.buffer) and whole-buffer REPLACEMENT happens at ~3 Editor-slot sites (reload_from_disk/load_recovered/session_restore) — so A17 guards the closed content set + adds a local Editor::replace_buffer chokepoint, but unifying EVERYTHING onto submit_transaction is a real mutation-architecture refactor deserving its own effort, NOT a mid-A17 expansion."
+doc = "engineering-health.md#h22"
+created = "2026-07-15"
+
+[[item]]
 id = "A17"
 title = "Messaging / notification system — routed, browsable, plugin-emittable"
 status = "needs-design"

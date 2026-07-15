@@ -350,7 +350,18 @@ fn paint_status(frame: &mut Frame, editor: &Editor, area: Rect, status_row: u16,
         // Normal state. Under zen/Auto idle with no message, the reserved row renders
         // as calm canvas (base bg); visible reveal via On / dwell / message force.
         if crate::chrome::status_line_visible(editor) {
-            (crate::render_status::status_left_text(editor), cs.menu_closed) // visible: [Chrome] panel bg
+            // [Chrome] panel bg, tinted by message kind (A17 §10.2 — compose existing faces, no
+            // new SemanticElement). Error/Warning stay legible under no-color/terminal-plain via
+            // modifiers, never color alone. Info/Log/none keep the unchanged chrome face.
+            let base = cs.menu_closed;
+            let status_style = match editor.status().map(|s| s.kind()) {
+                Some(crate::status::StatusKind::Error) =>
+                    base.patch(compose::compose(&editor.theme, editor.depth, &[SE::ChromeAccent])
+                        .add_modifier(Modifier::REVERSED | Modifier::BOLD)),
+                Some(crate::status::StatusKind::Warning) => base.add_modifier(Modifier::BOLD),
+                _ => base,
+            };
+            (crate::render_status::status_left_text(editor), status_style)
         } else {
             // Calm canvas: the same bg-only fill the edit band uses — NOT chrome.
             let mut calm = compose::base_canvas(&editor.theme, editor.depth);
@@ -3113,7 +3124,7 @@ mod tests {
             let mut ed = Editor::new_from_text("hello\n", None, (40, 6));
             ed.status_line_mode = TransientMode::Auto;
             ed.mouse.status_revealed = false;
-            ed.status.clear();
+            ed.clear_transient_status();
             derive::rebuild(&mut ed);
             let buf = render_to_buffer(&mut ed, 40, 6);
             let bottom = row_string(&buf, 5);
@@ -3130,7 +3141,7 @@ mod tests {
             let mut ed = Editor::new_from_text("hello\n", None, (40, 6));
             ed.status_line_mode = TransientMode::On;
             ed.mouse.status_revealed = false;
-            ed.status.clear();
+            ed.clear_transient_status();
             derive::rebuild(&mut ed);
             let buf = render_to_buffer(&mut ed, 40, 6);
             let bottom = row_string(&buf, 5);

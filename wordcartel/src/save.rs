@@ -61,12 +61,16 @@ pub enum SaveMode { Normal, SaveAs }
 /// `perform_save_as` (SaveAs).
 pub(crate) fn do_save_to(ctx: &mut Ctx, target: std::path::PathBuf, mode: SaveMode) {
     // §3.9: status BEFORE dispatch. O(1) snapshot; version captured now.
-    ctx.editor.status = "Saving\u{2026}".to_string();
     let snap = ctx.editor.active().document.buffer.snapshot(); // O(1) ropey clone
     let v = ctx.editor.active().document.version;
     let buffer_id = ctx.editor.active().id;
     let prior_key = ctx.editor.active().document.path.clone(); // for SaveAs swap re-key
     let write_path = target.clone();
+    // Self-replacing Progress keyed on THIS (buffer, version): the completion below reconstructs the
+    // identical key from the captured `buffer_id`/`v` and collapses exactly this start (§4.2). A
+    // concurrent same-buffer save at a different version keeps its own lineage; a Filter/Transform
+    // finish can never collapse it (exact-match topic).
+    ctx.editor.set_progress(crate::status::StatusTopic::Save(buffer_id, v), "Saving\u{2026}");
 
     ctx.executor.dispatch(Job {
         buffer_id,
@@ -95,6 +99,10 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: std::path::PathBuf, mode: SaveMo
                     let fire_save: Option<PathBuf> =
                         matches!(outcome, Ok(SaveOutcome::Saved) | Ok(SaveOutcome::Unchanged))
                             .then(|| target.clone());
+                    // A17 T4 (F4 Error table): captured BEFORE the match below moves `outcome`'s
+                    // Err payload — a genuine SaveError (IO/symlink) must land Sticky/Error so it
+                    // survives the next keystroke, unlike the ordinary Info completion messages.
+                    let is_save_error = outcome.is_err();
                     let mut status = String::new();
                     if let Some(b) = editor.by_id_mut(buffer_id) {
                         match outcome {
@@ -138,7 +146,15 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: std::path::PathBuf, mode: SaveMo
                             }
                         }
                     }
-                    editor.status = status;
+                    // Reconstruct the IDENTICAL Save(buffer_id, v) topic captured at the start so
+                    // this completion collapses exactly its own "Saving…" lineage (§4.2). `buffer_id`
+                    // and `v` are the same values the JobResult carries as `r.buffer_id`/`r.version`.
+                    let topic = crate::status::StatusTopic::Save(buffer_id, v);
+                    if is_save_error {
+                        editor.finish_topic(topic, crate::status::StatusKind::Error, status);
+                    } else {
+                        editor.finish_topic(topic, crate::status::StatusKind::Info, status);
+                    }
                     // Fire AFTER the by_id_mut block closes (never inside it — a live `b: &mut
                     // Buffer` borrow would conflict with fire_event's `&mut Editor`) and after
                     // editor.status is set — mirrors the local-then-assign shape above.
@@ -170,8 +186,9 @@ pub fn dispatch_save(ctx: &mut Ctx) -> CommandResult {
     let current_fp = fingerprint(&path);
     if current_fp != ctx.editor.active().document.stored_fp {
         ctx.editor.open_prompt(crate::prompt::Prompt::external_mod());
-        ctx.editor.status =
-            "File changed on disk \u{2014} choose [R]eload or [O]verwrite".to_string();
+        ctx.editor.set_status_full(crate::status::StatusKind::Warning,
+            "File changed on disk \u{2014} choose [R]eload or [O]verwrite",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return CommandResult::Handled;
     }
 
@@ -211,7 +228,8 @@ pub(crate) fn dispatch_save_and_quit(ctx: &mut crate::registry::Ctx) {
 /// Save bypassing the fingerprint conflict (the [O]verwrite modal action).
 pub fn overwrite_save(ctx: &mut Ctx) {
     if ctx.editor.active().document.path.is_none() {
-        ctx.editor.status = "No file name — use Save As".to_string();
+        ctx.editor.set_status_full(crate::status::StatusKind::Warning, "No file name — use Save As".to_string(),
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return;
     }
     do_save(ctx); // no stat check
@@ -224,7 +242,11 @@ pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
     let Some(path) = editor.active().document.path.clone() else { return };
     let text = match crate::file::open(&path) {
         Ok(t) => t,
-        Err(e) => { editor.status = e.to_string(); return; }
+        Err(e) => {
+            editor.set_status_full(crate::status::StatusKind::Error, e.to_string(),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+            return;
+        }
     };
     // Fix A1: capture the previous version BEFORE replacing the buffer so we
     // can carry it forward.  A diagnostics check in flight before the reload
@@ -252,7 +274,10 @@ pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
     editor.diag_providers.notify_close_all(id);
     // 5g: capture folds before replacement so we can carry them forward.
     let prev_folded = editor.active().folds.folded().clone();
-    *editor.active_mut() = crate::editor::Buffer { id, ..new_buf };
+    // A17 T8 category (b): route the wholesale swap through the single chokepoint. On a read-only
+    // buffer it no-ops + sets the Sticky Warning and returns false — the epilogue and the "Reloaded"
+    // ack below are skipped, so no false success is reported.
+    if !editor.replace_buffer(editor.active, crate::editor::Buffer { id, ..new_buf }) { return; }
     // 5g: carry folds across the reload and reconcile against the new tree.
     editor.active_mut().folds.replace_folded(prev_folded);
     // Clear any stale search/diag overlay — the buffer content has changed wholesale.
@@ -270,7 +295,7 @@ pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
     editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(nc);
     crate::nav::ensure_visible(editor);
     editor.active_mut().document.stored_fp = fingerprint(&path);
-    editor.status = "Reloaded".into();
+    editor.set_status(crate::status::StatusKind::Info, "Reloaded");
     crate::swap::delete(editor.active().document.path.as_deref());
 }
 
@@ -299,7 +324,8 @@ pub fn load_recovered(editor: &mut crate::editor::Editor, body: &str) {
     editor.diag_providers.notify_close_all(id);
     // 5g: capture folds before replacement so we can carry them forward.
     let prev_folded = editor.active().folds.folded().clone();
-    *editor.active_mut() = crate::editor::Buffer { id, ..new_buf };
+    // A17 T8 category (b): route through the single chokepoint (see reload_from_disk).
+    if !editor.replace_buffer(editor.active, crate::editor::Buffer { id, ..new_buf }) { return; }
     // 5g: carry folds across the recovery and reconcile against the new tree.
     editor.active_mut().folds.replace_folded(prev_folded);
     // Clear any stale search/diag overlay — the buffer content has changed wholesale.
@@ -316,7 +342,7 @@ pub fn load_recovered(editor: &mut crate::editor::Editor, body: &str) {
     editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(nc);
     crate::nav::ensure_visible(editor);
     editor.active_mut().document.stored_fp = path.as_deref().and_then(fingerprint);
-    editor.status = "Recovered unsaved changes".into();
+    editor.set_status(crate::status::StatusKind::Info, "Recovered unsaved changes");
 }
 
 #[cfg(test)]
@@ -338,6 +364,22 @@ mod tests {
             std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)))
     }
 
+    // A17 T8 — CATEGORY (b): whole-buffer REPLACEMENT (reload) on a read-only buffer is refused,
+    // NOT replaced, and reports "buffer is read-only" — never a false "Reloaded".
+    #[test]
+    fn reload_on_read_only_buffer_is_refused_not_replaced() {
+        let path = scratch();
+        std::fs::write(&path, "disk contents\n").unwrap();
+        let mut e = Editor::new_from_text("buffer contents\n", Some(path.clone()), (80, 24));
+        let before = e.active().document.buffer.to_string();
+        e.active_mut().read_only = true;
+        crate::save::reload_from_disk(&mut e);
+        assert_eq!(e.active().document.buffer.to_string(), before, "read-only buffer NOT replaced by reload");
+        assert_eq!(e.status_text(), "buffer is read-only");
+        assert_ne!(e.status_text(), "Reloaded", "must NOT report a false Reloaded");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn background_save_clears_dirty_at_saved_version() {
         let p = scratch();
@@ -351,11 +393,11 @@ mod tests {
             let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() };
             dispatch_save(&mut ctx);
         }
-        assert_eq!(e.status, "Saving\u{2026}", "status set before dispatch (§3.9)");
+        assert_eq!(e.status_text(), "Saving\u{2026}", "status set before dispatch (§3.9)");
         // InlineExecutor already ran the job; apply the buffered merge.
         for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert!(!e.active().document.dirty(), "version==saved_version after save → clean");
-        assert_eq!(e.status, "Saved");
+        assert_eq!(e.status_text(), "Saved");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "new\n");
         let _ = std::fs::remove_file(&p);
     }
@@ -396,8 +438,51 @@ mod tests {
         for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert!(e.active().document.dirty(), "failed save must leave the buffer dirty");
         assert!(e.active().document.saved_version.is_none());
-        assert!(e.status.to_lowercase().contains("symlink"));
+        assert!(e.status_text().to_lowercase().contains("symlink"));
         let _ = std::fs::remove_file(&link); let _ = std::fs::remove_file(&real);
+    }
+
+    /// A17 T4: a genuine background-save failure (SaveError, via the same symlink refusal as
+    /// above) must land as a Sticky Error — it must survive a later Info ack rather than
+    /// silently clearing on the next keystroke (Q1).
+    #[test]
+    fn background_save_failure_is_a_sticky_error_that_survives_a_later_info() {
+        let real = scratch();
+        let link = scratch();
+        std::fs::write(&real, "real\n").unwrap();
+        #[cfg(unix)] std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(not(unix))] { let _ = &link; return; }
+        let mut e = Editor::new_from_text("x\n", Some(link.clone()), (80, 24));
+        e.active_mut().document.saved_version = None;
+        e.active_mut().document.version = 1;
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        e.set_status(crate::status::StatusKind::Info, "later ack");
+        // Q1: an Info does NOT displace a held Error.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+        let _ = std::fs::remove_file(&link); let _ = std::fs::remove_file(&real);
+    }
+
+    /// A successful background save is still an ordinary Info/Transient status (the failure
+    /// branch above must not have made ALL completions Sticky-Error).
+    #[test]
+    fn background_save_success_is_still_transient_info() {
+        let p = scratch();
+        std::fs::write(&p, "old\n").unwrap();
+        let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
+        e.active_mut().document.saved_version = None;
+        e.active_mut().document.version = 1;
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Info);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Transient);
+        let _ = std::fs::remove_file(&p);
     }
 
     /// A real (non-symlink) save failure also keeps the buffer dirty: the target's
@@ -424,8 +509,8 @@ mod tests {
         // Assert the ENOTDIR error itself surfaced (not merely any non-empty status) — this
         // proves the save was attempted and failed, NOT that the external-mod modal opened.
         assert!(
-            e.status.to_lowercase().contains("not a directory") || e.status.contains("ENOTDIR"),
-            "OS ENOTDIR must surface as status; got: {:?}", e.status
+            e.status_text().to_lowercase().contains("not a directory") || e.status_text().contains("ENOTDIR"),
+            "OS ENOTDIR must surface as status; got: {:?}", e.status_text()
         );
         let _ = std::fs::remove_file(&parent);
     }
@@ -479,6 +564,10 @@ mod tests {
         { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
         assert!(e.prompt.is_some(), "external change must raise the modal, not clobber");
         assert!(ex.drain().is_empty(), "no save job dispatched on conflict");
+        // A17 T5 (F4 Warning table): the external-mod refusal is a Sticky Warning.
+        assert_eq!(e.status_text(), "File changed on disk \u{2014} choose [R]eload or [O]verwrite");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         let _ = std::fs::remove_file(&p);
     }
 
@@ -497,6 +586,22 @@ mod tests {
         assert!(e.prompt.is_some(), "a file appearing where there was none is a conflict");
         assert!(ex.drain().is_empty(), "no save job dispatched on new-file conflict");
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// A17 T5 (F4 Warning table): an `overwrite_save` on a pathless (unnamed) buffer refuses
+    /// with a Sticky Warning, not an ordinary Info echo.
+    #[test]
+    fn overwrite_save_on_unnamed_buffer_is_a_sticky_warning() {
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Ctx;
+        let mut e = Editor::new_from_text("mine\n", None, (80, 24));
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; overwrite_save(&mut ctx); }
+        assert_eq!(e.status_text(), "No file name — use Save As");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        assert!(ex.drain().is_empty(), "no save job dispatched on the refusal");
     }
 
     #[test]
@@ -532,6 +637,19 @@ mod tests {
     }
 
     #[test]
+    fn reload_from_disk_failure_is_a_sticky_error_that_survives_a_later_info() {
+        // A path that will fail to read → the reload Err arm fires.
+        let missing = std::path::PathBuf::from("/nonexistent/definitely/missing-a17.md");
+        let mut e = Editor::new_from_text("hello\n", Some(missing), (80, 24));
+        crate::save::reload_from_disk(&mut e);
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        e.set_status(crate::status::StatusKind::Info, "later ack");
+        // Q1: an Info does NOT displace a held Error.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+    }
+
+    #[test]
     fn reload_from_disk_clears_open_search_overlay() {
         let p = scratch();
         std::fs::write(&p, "fresh content\n").unwrap();
@@ -562,7 +680,7 @@ mod tests {
             dispatch_save(&mut ctx);
         }
         assert!(ex.drain().is_empty(), "no save job dispatched on external-mod conflict");
-        assert!(e.status.to_lowercase().contains("changed on disk"), "status surfaces the refusal");
+        assert!(e.status_text().to_lowercase().contains("changed on disk"), "status surfaces the refusal");
         assert!(e.active().document.dirty(), "buffer stays dirty when a save is refused");
         let _ = std::fs::remove_file(&p);
     }
@@ -845,7 +963,7 @@ mod tests {
         assert!(e.quit_drain.is_none(), "the quit drain must be aborted, not stranded");
         assert!(!e.quit_drain_advance, "quit_drain_advance must be reset");
         assert!(!e.quit, "must NOT quit on a panicked save");
-        assert!(e.status.to_lowercase().contains("save"));
+        assert!(e.status_text().to_lowercase().contains("save"));
         let _ = std::fs::remove_file(&p);
     }
 }

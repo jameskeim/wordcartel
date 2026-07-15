@@ -18,7 +18,7 @@ pub(crate) fn count_region(editor: &mut Editor) -> CommandResult {
         editor.active().document.buffer.to_string()
     };
     let st = wordcartel_core::count::region_stats(&text);
-    editor.status = format!("{} words · {} sentences · {} chars", st.words, st.sentences, st.chars);
+    editor.set_status(crate::status::StatusKind::Info, format!("{} words · {} sentences · {} chars", st.words, st.sentences, st.chars));
     CommandResult::Handled
 }
 
@@ -50,14 +50,14 @@ fn move_sentence(editor: &mut Editor, dir: Dir, clock: &dyn Clock) -> CommandRes
     // a raw-`h` `paragraph_range_at` drifts into the gap fallback on ≤3-space indented prose and
     // returns a DIFFERENT window that swallows the indent. `None` declines (non-prose line).
     let Some((ps, pe)) = super::prose_window_at(editor, h) else {
-        editor.status = "no sentence here".into();
+        editor.set_status(crate::status::StatusKind::Info, "no sentence here");
         return CommandResult::Noop;
     };
     let win = editor.active().document.buffer.slice(ps..pe);
     let rel = h.saturating_sub(ps).min(win.len());
     // Window-relative content spans.
     let spans: Vec<(usize, usize)> = wordcartel_core::textobj::sentence_spans(&win).collect();
-    if spans.is_empty() { editor.status = "no sentence here".into(); return CommandResult::Noop; }
+    if spans.is_empty() { editor.set_status(crate::status::StatusKind::Info, "no sentence here"); return CommandResult::Noop; }
     // Index of the caret's sentence (attach: caret in the gap → the PRECEDING span, i.e. the last
     // span whose start <= rel; before the first content → span 0).
     let cur = spans.iter().rposition(|&(s, _)| s <= rel).unwrap_or(0);
@@ -65,7 +65,7 @@ fn move_sentence(editor: &mut Editor, dir: Dir, clock: &dyn Clock) -> CommandRes
         Dir::Down if cur + 1 < spans.len() => (cur, cur + 1),
         Dir::Up   if cur >= 1              => (cur - 1, cur),
         _ => {
-            editor.status = "sentence at paragraph edge — break or merge to cross".into();
+            editor.set_status(crate::status::StatusKind::Info, "sentence at paragraph edge — break or merge to cross");
             return CommandResult::Noop;
         }
     };
@@ -90,7 +90,7 @@ fn move_sentence(editor: &mut Editor, dir: Dir, clock: &dyn Clock) -> CommandRes
     let txn = Transaction::new(cs).with_selection(Selection::range(moved_to, moved_from));
     editor.apply(txn, edit, EditKind::Other, clock);
     let r = super::edit::settle_after_edit(editor);
-    editor.status = match dir { Dir::Up => "moved sentence up".into(), Dir::Down => "moved sentence down".into() };
+    editor.set_status(crate::status::StatusKind::Info, match dir { Dir::Up => "moved sentence up", Dir::Down => "moved sentence down" });
     r
 }
 
@@ -101,11 +101,11 @@ fn move_sentence(editor: &mut Editor, dir: Dir, clock: &dyn Clock) -> CommandRes
 pub(crate) fn swap(editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     let sel = editor.active().document.selection.primary();
     if sel.is_empty() {
-        editor.status = "swap needs a selection and a marked block".into();
+        editor.set_status(crate::status::StatusKind::Info, "swap needs a selection and a marked block");
         return CommandResult::Noop;
     }
     let Some(mb) = editor.active().marked_block else {
-        editor.status = "swap needs a selection and a marked block".into();
+        editor.set_status(crate::status::StatusKind::Info, "swap needs a selection and a marked block");
         return CommandResult::Noop;
     };
     let (s_from, s_to) = (sel.from(), sel.to());
@@ -116,7 +116,7 @@ pub(crate) fn swap(editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     let (r1_from, r1_to, r1_is_sel) = if s_from <= m_from { (s_from, s_to, true) } else { (m_from, m_to, false) };
     let (r2_from, r2_to) = if s_from <= m_from { (m_from, m_to) } else { (s_from, s_to) };
     if r1_to > r2_from {
-        editor.status = "can't swap overlapping regions".into();
+        editor.set_status(crate::status::StatusKind::Info, "can't swap overlapping regions");
         return CommandResult::Noop;
     }
     let buf = &editor.active().document.buffer;
@@ -163,7 +163,7 @@ pub(crate) fn swap(editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
         // so a folded-region swap can never leave the caret on a hidden line.
         crate::registry::snap_caret_out_of_fold(editor);
     }
-    editor.status = "swapped".into();
+    editor.set_status(crate::status::StatusKind::Info, "swapped");
     r
 }
 
@@ -173,15 +173,15 @@ pub(crate) fn swap(editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
 pub(crate) fn break_paragraph_here(editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     let h = nav::head(editor);
     let (sf, st) = match super::prose_sentence_at(editor, h) {
-        Ok(s) => s, Err(_) => { editor.status = "no sentence here".into(); return CommandResult::Noop; }
+        Ok(s) => s, Err(_) => { editor.set_status(crate::status::StatusKind::Info, "no sentence here"); return CommandResult::Noop; }
     };
     // The SAME content-anchored window `prose_sentence_at` segmented within (I-1) — never a raw-`h`
     // `paragraph_range_at`, whose ≤3-space gap fallback would put `ps` BEFORE the indent so a caret
     // on the paragraph's first sentence reads `sf > ps` and wrongly splits (replacing the indent).
     let Some((ps, _pe)) = super::prose_window_at(editor, h) else {
-        editor.status = "no sentence here".into(); return CommandResult::Noop;
+        editor.set_status(crate::status::StatusKind::Info, "no sentence here"); return CommandResult::Noop;
     };
-    if sf <= ps { editor.status = "already at a paragraph start".into(); return CommandResult::Noop; }
+    if sf <= ps { editor.set_status(crate::status::StatusKind::Info, "already at a paragraph start"); return CommandResult::Noop; }
     // Consume the whitespace run immediately before the sentence content.
     let buf = &editor.active().document.buffer;
     let head_text = buf.slice(ps..sf);
@@ -196,7 +196,7 @@ pub(crate) fn break_paragraph_here(editor: &mut Editor, clock: &dyn Clock) -> Co
     let txn = Transaction::new(cs).with_selection(Selection::range(new_st, new_sf));
     editor.apply(txn, edit, EditKind::Other, clock);
     let r = super::edit::settle_after_edit(editor);
-    editor.status = "split paragraph".into();
+    editor.set_status(crate::status::StatusKind::Info, "split paragraph");
     r
 }
 
@@ -208,7 +208,7 @@ pub(crate) fn merge_paragraph_forward(editor: &mut Editor, clock: &dyn Clock) ->
     // The content-anchored window (I-1): raw-`h` `paragraph_range_at` drifts on ≤3-space indented
     // prose. `None` declines (non-prose line).
     let Some((ps, pe)) = super::prose_window_at(editor, h) else {
-        editor.status = "no paragraph here".into(); return CommandResult::Noop;
+        editor.set_status(crate::status::StatusKind::Info, "no paragraph here"); return CommandResult::Noop;
     };
     let (nps, next_is_prose) = {
         let b = editor.active();
@@ -220,10 +220,10 @@ pub(crate) fn merge_paragraph_forward(editor: &mut Editor, clock: &dyn Clock) ->
         (nps, prose)
     };
     if nps >= editor.active().document.buffer.len() {
-        editor.status = "no paragraph to merge".into(); return CommandResult::Noop;
+        editor.set_status(crate::status::StatusKind::Info, "no paragraph to merge"); return CommandResult::Noop;
     }
     if !next_is_prose {
-        editor.status = "can't merge across a non-paragraph block".into(); return CommandResult::Noop;
+        editor.set_status(crate::status::StatusKind::Info, "can't merge across a non-paragraph block"); return CommandResult::Noop;
     }
     // `pe` (the leaf block's span end) includes the paragraph's OWN trailing line terminator, not
     // just its content — trim trailing whitespace back to the true content end so the FULL separator
@@ -249,7 +249,7 @@ pub(crate) fn merge_paragraph_forward(editor: &mut Editor, clock: &dyn Clock) ->
     let txn = Transaction::new(cs).with_selection(Selection::range(new_start + sent_len, new_start));
     editor.apply(txn, edit, EditKind::Other, clock);
     let r = super::edit::settle_after_edit(editor);
-    editor.status = "merged paragraph".into();
+    editor.set_status(crate::status::StatusKind::Info, "merged paragraph");
     r
 }
 
@@ -259,10 +259,10 @@ pub(crate) fn merge_paragraph_forward(editor: &mut Editor, clock: &dyn Clock) ->
 pub(crate) fn split_sentence_at_caret(editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     let h = nav::head(editor);
     let (sf, st) = match super::prose_sentence_at(editor, h) {
-        Ok(s) => s, Err(_) => { editor.status = "no sentence here".into(); return CommandResult::Noop; }
+        Ok(s) => s, Err(_) => { editor.set_status(crate::status::StatusKind::Info, "no sentence here"); return CommandResult::Noop; }
     };
     if !(sf < h && h < st) {
-        editor.status = "place the caret inside a sentence to split".into();
+        editor.set_status(crate::status::StatusKind::Info, "place the caret inside a sentence to split");
         return CommandResult::Noop;
     }
     let buf = &editor.active().document.buffer;
@@ -292,7 +292,7 @@ pub(crate) fn split_sentence_at_caret(editor: &mut Editor, clock: &dyn Clock) ->
     let txn = Transaction::new(cs).with_selection(Selection::range(new_st, new_second_from));
     editor.apply(txn, edit, EditKind::Other, clock);
     let r = super::edit::settle_after_edit(editor);
-    editor.status = "split sentence".into();
+    editor.set_status(crate::status::StatusKind::Info, "split sentence");
     r
 }
 
@@ -310,10 +310,10 @@ mod tests {
         let mut e = Editor::new_from_text("One two. Three four.\n", None, (40, 12));
         crate::derive::rebuild(&mut e);
         count_region(&mut e);
-        assert!(e.status.contains("2 sentences"), "buffer: {}", e.status);
+        assert!(e.status_text().contains("2 sentences"), "buffer: {}", e.status_text());
         e.active_mut().document.selection = wordcartel_core::selection::Selection::range(0, 8);
         count_region(&mut e);
-        assert!(e.status.contains("1 sentences") && e.status.contains("2 words"), "sel: {}", e.status);
+        assert!(e.status_text().contains("1 sentences") && e.status_text().contains("2 words"), "sel: {}", e.status_text());
     }
 
     #[test]
@@ -357,7 +357,7 @@ mod tests {
         crate::derive::rebuild(&mut e);
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(2); // in "First one."
         assert_eq!(move_sentence_up(&mut e, &TestClock(0)), CommandResult::Noop);
-        assert!(e.status.contains("edge"), "edge status: {}", e.status);
+        assert!(e.status_text().contains("edge"), "edge status: {}", e.status_text());
         assert_eq!(e.active().document.buffer.to_string(), "First one. Second two.\n"); // unchanged
     }
 
@@ -434,7 +434,7 @@ mod tests {
         e.active_mut().document.selection = wordcartel_core::selection::Selection::range(0, 5);
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 3, end: 7, hidden: false });
         assert_eq!(swap(&mut e, &TestClock(0)), CommandResult::Noop);
-        assert!(e.status.contains("overlap"), "status: {}", e.status);
+        assert!(e.status_text().contains("overlap"), "status: {}", e.status_text());
         assert_eq!(e.active().document.buffer.to_string(), "abcdefgh\n", "no mutation on overlap");
     }
 
@@ -446,7 +446,7 @@ mod tests {
         e.active_mut().document.selection = wordcartel_core::selection::Selection::range(0, 4);
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 4, end: 8, hidden: false });
         assert_eq!(swap(&mut e, &TestClock(0)), CommandResult::Handled, "adjacency is not overlap");
-        assert!(e.status.contains("swap"), "status: {}", e.status);
+        assert!(e.status_text().contains("swap"), "status: {}", e.status_text());
         assert_eq!(e.active().document.buffer.to_string(), "BBBBAAAA\n");
     }
 
@@ -457,7 +457,7 @@ mod tests {
         e.active_mut().document.selection = wordcartel_core::selection::Selection::range(0, 2);
         // no marked block
         assert_eq!(swap(&mut e, &TestClock(0)), CommandResult::Noop);
-        assert!(e.status.contains("marked block"));
+        assert!(e.status_text().contains("marked block"));
     }
 
     #[test]
@@ -467,7 +467,7 @@ mod tests {
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(0); // empty selection
         e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 3, end: 6, hidden: false });
         assert_eq!(swap(&mut e, &TestClock(0)), CommandResult::Noop);
-        assert!(e.status.contains("marked block"), "status: {}", e.status);
+        assert!(e.status_text().contains("marked block"), "status: {}", e.status_text());
         assert_eq!(e.active().document.buffer.to_string(), "abcdef\n");
         assert!(e.active().marked_block.is_some(), "precondition failure leaves the mark untouched");
     }
@@ -580,7 +580,7 @@ mod tests {
         crate::derive::rebuild(&mut e);
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(0);
         assert_eq!(break_paragraph_here(&mut e, &TestClock(0)), CommandResult::Noop);
-        assert!(e.status.contains("paragraph start"), "status: {}", e.status);
+        assert!(e.status_text().contains("paragraph start"), "status: {}", e.status_text());
         assert_eq!(e.active().document.buffer.to_string(), "Alpha one. Beta two.\n");
     }
 
@@ -640,7 +640,7 @@ mod tests {
         crate::derive::rebuild(&mut e);
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(2);
         assert_eq!(merge_paragraph_forward(&mut e, &TestClock(0)), CommandResult::Noop);
-        assert!(e.status.contains("no paragraph to merge"), "status: {}", e.status);
+        assert!(e.status_text().contains("no paragraph to merge"), "status: {}", e.status_text());
         assert_eq!(e.active().document.buffer.to_string(), "Para one.\n");
     }
 
@@ -650,7 +650,7 @@ mod tests {
         crate::derive::rebuild(&mut e);
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(2);
         assert_eq!(merge_paragraph_forward(&mut e, &TestClock(0)), CommandResult::Noop);
-        assert!(e.status.contains("non-paragraph block"), "status: {}", e.status);
+        assert!(e.status_text().contains("non-paragraph block"), "status: {}", e.status_text());
         assert_eq!(e.active().document.buffer.to_string(), "Para one.\n\n# Heading\n");
     }
 
@@ -794,7 +794,7 @@ mod tests {
         crate::derive::rebuild(&mut e);
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(1); // in the indent
         assert_eq!(break_paragraph_here(&mut e, &TestClock(0)), CommandResult::Noop);
-        assert!(e.status.contains("paragraph start"), "status: {}", e.status);
+        assert!(e.status_text().contains("paragraph start"), "status: {}", e.status_text());
         assert_eq!(e.active().document.buffer.to_string(), "  One two. Three four.\n",
             "buffer unchanged — the indent is NOT replaced with a paragraph break");
     }

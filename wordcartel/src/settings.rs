@@ -61,6 +61,9 @@ pub struct SettingsSnapshot {
     pub canvas: CanvasMode,
     /// Clipboard provider selection persisted as "auto"/"native"/"osc52"/"off".
     pub clipboard_provider: crate::config::ClipboardProvider,
+    /// Message verbosity floor (Q6, A17 T10; `view.messages_min_kind`). Mutated by
+    /// `messages_min_info`/`messages_min_warning`/`toggle_messages_verbosity`.
+    pub view_messages_min_kind: crate::status::StatusKind,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +129,7 @@ pub struct OView {
     #[serde(skip_serializing_if = "Option::is_none")] pub splash:      Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")] pub caret_shape: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] pub caret_blink: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub messages_min_kind: Option<String>,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -187,6 +191,7 @@ pub fn snapshot_of(cfg: &crate::config::Config, resolved_theme_name: &str) -> Se
         chrome_disposition,
         canvas: crate::theme_resolve::parse_canvas(&cfg.theme.canvas).0,
         clipboard_provider: cfg.clipboard.provider,
+        view_messages_min_kind: cfg.view.messages_min_kind,
     }
 }
 
@@ -211,6 +216,7 @@ pub fn runtime_snapshot(editor: &crate::editor::Editor) -> SettingsSnapshot {
         chrome_disposition: editor.chrome_disposition,
         canvas: editor.canvas,
         clipboard_provider: editor.clipboard_provider,
+        view_messages_min_kind: editor.messages_min_kind(),
     }
 }
 
@@ -439,11 +445,17 @@ pub fn compute_overrides(
         ex_view.and_then(|v| v.caret_blink.as_ref()),
         mk_view.and_then(|v| v.caret_blink).is_some(),
     );
+    let rt_mmk   = crate::config::messages_min_kind_str(runtime.view_messages_min_kind).to_string();
+    let base_mmk = crate::config::messages_min_kind_str(baseline.view_messages_min_kind).to_string();
+    let messages_min_kind = diff_key(&rt_mmk, &base_mmk,
+        ex_view.and_then(|v| v.messages_min_kind.as_ref()),
+        mk_view.and_then(|v| v.messages_min_kind.as_ref()).is_some(),
+    );
     let any_view = typewriter.is_some() || focus.is_some() || measure.is_some()
         || wrap_guide.is_some() || word_count.is_some() || wrap_column.is_some()
         || scrollbar.is_some() || status_line.is_some() || splash.is_some()
-        || caret_shape.is_some() || caret_blink.is_some();
-    let view = some_if(OView { typewriter, focus, measure, wrap_guide, word_count, wrap_column, scrollbar, status_line, splash, caret_shape, caret_blink }, any_view);
+        || caret_shape.is_some() || caret_blink.is_some() || messages_min_kind.is_some();
+    let view = some_if(OView { typewriter, focus, measure, wrap_guide, word_count, wrap_column, scrollbar, status_line, splash, caret_shape, caret_blink, messages_min_kind }, any_view);
 
     // --- menu — per-key mask predicate ---
     let rt_bar   = menu_bar_str(runtime.menu_bar).to_string();
@@ -546,18 +558,24 @@ pub(crate) fn perform_settings_save(
     fs:            &dyn crate::fsx::Fs,
 ) -> Option<OverridesFile> {
     if no_config {
-        editor.status = "settings: disabled by --no-config".into();
+        editor.set_status_full(crate::status::StatusKind::Warning, "settings: disabled by --no-config",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return None;
     }
     let Some(path) = overrides_path else {
-        editor.status = "settings: no config directory".into();
+        editor.set_status_full(crate::status::StatusKind::Warning, "settings: no config directory",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return None;
     };
     let runtime = runtime_snapshot(editor);
     let of = compute_overrides(&runtime, baseline, existing, mask);
     match save_overrides(fs, path, &of) {
-        Ok(()) => { editor.status = "settings saved".into(); Some(of) }
-        Err(e) => { editor.status = format!("settings: {e}"); None }
+        Ok(()) => { editor.set_status(crate::status::StatusKind::Info, "settings saved"); Some(of) }
+        Err(e) => {
+            editor.set_status_full(crate::status::StatusKind::Error, format!("settings: {e}"),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+            None
+        }
     }
 }
 
@@ -594,7 +612,8 @@ mod tests {
             menu_bar: crate::config::MenuBarMode::Auto, mouse_capture: true,
             chrome_disposition: ChromeDisposition::Full,
             canvas: CanvasMode::Opaque,
-            clipboard_provider: crate::config::ClipboardProvider::Auto }
+            clipboard_provider: crate::config::ClipboardProvider::Auto,
+            view_messages_min_kind: crate::status::StatusKind::Info }
     }
 
     fn snap_with<F: FnOnce(&mut SettingsSnapshot)>(f: F) -> SettingsSnapshot {
@@ -821,7 +840,10 @@ mod tests {
             &crate::fsx::RealFs,
         );
         assert!(result.is_none(), "must return None on --no-config refusal");
-        assert_eq!(e.status, "settings: disabled by --no-config");
+        assert_eq!(e.status_text(), "settings: disabled by --no-config");
+        // A17 T5 (F4 Warning table): a Sticky Warning.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         assert!(!path.exists(), "no file must be written on --no-config refusal");
     }
 
@@ -835,7 +857,10 @@ mod tests {
             &crate::fsx::RealFs,
         );
         assert!(result.is_none(), "must return None when overrides_path is None");
-        assert_eq!(e.status, "settings: no config directory");
+        assert_eq!(e.status_text(), "settings: no config directory");
+        // A17 T5 (F4 Warning table): a Sticky Warning.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
     }
 
     #[test]
@@ -860,10 +885,39 @@ mod tests {
             &FailFs,
         );
         assert!(result.is_none(), "must return None on IO error");
-        assert!(e.status.starts_with("settings: "),
-            "status must start with 'settings: ': {:?}", e.status);
-        assert!(e.status.contains("boom"),
-            "status must include the IO error string: {:?}", e.status);
+        assert!(e.status_text().starts_with("settings: "),
+            "status must start with 'settings: ': {:?}", e.status_text());
+        assert!(e.status_text().contains("boom"),
+            "status must include the IO error string: {:?}", e.status_text());
+    }
+
+    #[test]
+    fn save_failure_is_a_sticky_error_that_survives_a_later_info() {
+        // A17 T4: an IO failure during settings save must land Sticky/Error — surviving a
+        // later Info ack (Q1), not clearing on the next keystroke.
+        struct FailFs;
+        impl crate::fsx::Fs for FailFs {
+            fn create_excl(&self, _: &std::path::Path, _: u32) -> std::io::Result<Box<dyn crate::fsx::WriteSync>> {
+                Err(std::io::Error::other("boom"))
+            }
+            fn existing_mode(&self, _: &std::path::Path) -> Option<u32> { None }
+            fn rename(&self, _: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
+            fn sync_dir(&self, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
+            fn remove_file(&self, _: &std::path::Path) -> std::io::Result<()> { Ok(()) }
+        }
+        let d = tempdir();
+        let path = d.join("o.toml");
+        let mut e = test_editor();
+        let result = perform_settings_save(
+            &mut e, false, Some(&path),
+            &empty_snap(), &OverridesFile::default(), &OverridesFile::default(),
+            &FailFs,
+        );
+        assert!(result.is_none(), "must return None on IO error");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        e.set_status(crate::status::StatusKind::Info, "later ack");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error, "Q1: Info must not displace a held Error");
     }
 
     #[test]
@@ -883,7 +937,7 @@ mod tests {
             &crate::fsx::RealFs,
         );
         assert!(result.is_some(), "must return Some on success");
-        assert_eq!(e.status, "settings saved");
+        assert_eq!(e.status_text(), "settings saved");
         let of = result.unwrap();
         let expected = compute_overrides(&runtime_snap, &baseline_snap, &OverridesFile::default(), &OverridesFile::default());
         assert_eq!(of, expected, "returned OverridesFile must equal compute_overrides result");
@@ -978,8 +1032,8 @@ mod tests {
         let base = snap("cua", ThemeIdentity::Builtin("default".into()), false); // baseline wrap 72
         let of = perform_settings_save(&mut e, false, Some(&path),
             &base, &OverridesFile::default(), &OverridesFile::default(), &crate::fsx::RealFs);
-        assert!(of.is_some(), "save succeeds: {}", e.status);
-        assert_eq!(e.status, "settings saved");
+        assert!(of.is_some(), "save succeeds: {}", e.status_text());
+        assert_eq!(e.status_text(), "settings saved");
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("wrap_column = 40"), "the file carries the key: {text}");
     }
@@ -1051,6 +1105,7 @@ mod tests {
                 view_caret_shape: _, view_caret_blink: _,
                 menu_bar: _, mouse_capture: _,
                 chrome_disposition: _, canvas: _, clipboard_provider: _,
+                view_messages_min_kind: _,
             } = s;
         }
         let _ = field_guard; // reference it so the guard compiles (no dead_code allow needed)
@@ -1077,6 +1132,8 @@ mod tests {
         assert!(has("toggle_chrome"), "chrome_disposition");
         assert!(has("toggle_canvas"), "canvas");
         assert!(has("clipboard_provider_cycle") && has("clipboard_provider_auto"), "clipboard_provider");
+        assert!(has("toggle_messages_verbosity") && has("messages_min_info") && has("messages_min_warning"),
+            "view_messages_min_kind");
     }
 
     #[test]

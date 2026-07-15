@@ -27,10 +27,12 @@ pub(crate) fn search_cancel(editor: &mut Editor) {
 type SearchReplacePlan = Option<(Vec<(usize, usize, String)>, usize, usize)>;
 
 pub(crate) fn search_replace_all(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
+    if editor.active().read_only { editor.reject_read_only(); return; } // A17 T8: no mutation, no false "Replaced N".
     search_sync(editor); // ensure cache is current
     // §8: invalid regex → distinct status, no mutation.
     if editor.search.as_ref().is_some_and(|s| s.error.is_some()) {
-        editor.status = "invalid regex".into();
+        editor.set_status_full(crate::status::StatusKind::Error, "invalid regex",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return;
     }
     let plan: SearchReplacePlan = editor.search.as_ref().and_then(|s| {
@@ -43,7 +45,7 @@ pub(crate) fn search_replace_all(editor: &mut Editor, clock: &dyn wordcartel_cor
         Some((edits, rope.len_bytes(), s.origin))
     });
     let Some((edits, doc_len, origin)) = plan else {
-        editor.status = "No matches".into();
+        editor.set_status(crate::status::StatusKind::Info, "No matches");
         return;
     };
     let n = edits.len();
@@ -54,13 +56,14 @@ pub(crate) fn search_replace_all(editor: &mut Editor, clock: &dyn wordcartel_cor
         .with_selection(wordcartel_core::selection::Selection::single(new_origin));
     editor.active_mut().apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
     if let Some(s) = editor.search.as_mut() { s.origin = new_origin; }
-    editor.status = format!("Replaced {n} occurrences");
+    editor.set_status(crate::status::StatusKind::Info, format!("Replaced {n} occurrences"));
     editor.search = None; // close after replace-all
     derive::rebuild(editor);
     crate::nav::ensure_visible(editor);
 }
 
 pub(crate) fn search_step_apply(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
+    if editor.active().read_only { editor.reject_read_only(); return; } // A17 T8: no mutation, no false step ack.
     let plan = editor.search.as_ref().and_then(|s| {
         let m = s.matcher()?; let cur = s.current()?;
         let rope = editor.active().document.buffer.snapshot();
@@ -93,6 +96,7 @@ pub(crate) fn search_step_skip(editor: &mut Editor) {
 }
 
 pub(crate) fn search_step_rest(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
+    if editor.active().read_only { editor.reject_read_only(); return; } // A17 T8: no mutation, no false ack.
     // Replace current + all remaining (from current.start onward) as one unit.
     let plan = editor.search.as_ref().and_then(|s| {
         let m = s.matcher()?; let cur = s.current()?;
@@ -142,7 +146,8 @@ pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_co
     // ranges are stale.  Refuse to apply — a stale range can cause a panic on
     // multibyte boundaries or silently apply at wrong offsets.
     if editor.active().document.version != opened_version {
-        editor.status = "document changed; re-open".into();
+        editor.set_status_full(crate::status::StatusKind::Warning, "document changed; re-open",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         editor.diag = None;
         return;
     }
@@ -173,9 +178,11 @@ pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_co
         match editor.diag_cfg.dictionary.clone() {
             Some(dict_path) => match crate::diagnostics_run::append_word_to_dict(&dict_path, &word) {
                 Ok(()) => editor.diag_providers.reload_dictionary_enabled(),
-                Err(e) => editor.status = format!("add to dictionary failed: {e}"),
+                Err(e) => editor.set_status_full(crate::status::StatusKind::Error, format!("add to dictionary failed: {e}"),
+                    crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None),
             },
-            None => editor.status = "no dictionary path configured".into(),
+            None => editor.set_status_full(crate::status::StatusKind::Warning, "no dictionary path configured",
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None),
         }
         editor.diag = None;
         crate::diagnostics_run::retain_unignored(editor);
@@ -279,6 +286,20 @@ mod tests {
     use crate::test_support::TestClock;
     use wordcartel_core::diagnostics::{Diagnostic, DiagnosticKind, DiagSource, Suggestion};
 
+    // A17 T8 — the Codex-named FALSE-SUCCESS path: a replace-all on a read-only buffer is rejected
+    // with no mutation AND no "Replaced N".
+    #[test]
+    fn search_replace_all_on_read_only_is_rejected_not_falsely_reported() {
+        let mut e = Editor::new_from_text("aaa\n", None, (40, 6));
+        e.active_mut().read_only = true; // the entry guard fires before any search work
+        let clk = TestClock(0);
+        let before = e.active().document.buffer.to_string();
+        crate::search_ui::search_replace_all(&mut e, &clk);
+        assert_eq!(e.active().document.buffer.to_string(), before, "no mutation on read-only");
+        assert_eq!(e.status_text(), "buffer is read-only");
+        assert_ne!(e.status_text(), "Replaced 3 occurrences", "must NOT report false success");
+    }
+
     /// Opens a fresh single-suggestion `DiagOverlay` on `e`, selected on the "ignore once"
     /// row (`ignore == true`) or the "add to dictionary" row (`ignore == false`) — neither
     /// row edits the document, so `document.version` never moves.
@@ -322,6 +343,23 @@ mod tests {
         assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), None, "no re-arm — the refilter is immediate");
     }
 
+    /// A17 T5 (F4 Warning table): a stale overlay anchor (buffer mutated while the overlay was
+    /// open — Fix A4) refuses to apply with a Sticky Warning, not an ordinary Info echo.
+    #[test]
+    fn diag_apply_selected_stale_version_is_a_sticky_warning() {
+        let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = RenderMode::Review;
+        seed_teh_diag(&mut e);
+        open_diag_selected(&mut e, true);
+        e.active_mut().document.version += 1; // buffer mutated while the overlay was open
+        diag_apply_selected(&mut e, &TestClock(1_000));
+        assert_eq!(e.status_text(), "document changed; re-open");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        assert!(e.diag.is_none(), "overlay closes on the stale-version refusal");
+    }
+
     /// Effort A: "add to dictionary" with no configured path still suppresses the word client-side
     /// (into `editor.dictionary`), sets the no-path status, closes, and refilters in place — the
     /// None branch is no longer a status-only no-op (round-1 IMPORTANT 5). No re-arm.
@@ -337,7 +375,10 @@ mod tests {
         diag_apply_selected(&mut e, &TestClock(3_000));
         assert!(e.diag.is_none(), "overlay closes regardless of outcome");
         assert!(e.dictionary.contains("teh"), "word suppressed client-side even with no path");
-        assert_eq!(e.status, "no dictionary path configured");
+        assert_eq!(e.status_text(), "no dictionary path configured");
+        // A17 T5 (F4 Warning table): a Sticky Warning.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         assert!(e.active().diagnostics.slot(DiagSource::Harper).is_none_or(|s| s.diagnostics.is_empty()), "the added word is refiltered out");
         assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), None, "no re-arm");
     }
@@ -373,5 +414,45 @@ mod tests {
             "no full re-check is dispatched — the client filter hides the word immediately");
         assert!(e.dictionary.contains("teh"), "word also suppressed client-side");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A17 T4: an invalid-regex replace-all refusal must land Sticky/Error — surviving a
+    /// later Info ack (Q1), not clearing on the next keystroke.
+    #[test]
+    fn search_replace_all_invalid_regex_is_a_sticky_error_that_survives_a_later_info() {
+        use wordcartel_core::search::QueryMode;
+        let mut e = Editor::new_from_text("aa aa aa\n", None, (80, 24));
+        let id = e.active().id;
+        let mut s = crate::search_overlay::SearchState::open(crate::search_overlay::Phase::Replace, 0, id);
+        s.mode = QueryMode::Regex;
+        s.needle = "(".into(); // unbalanced open paren — invalid regex
+        e.search = Some(s);
+        let clk = crate::test_support::TestClock(0);
+        search_replace_all(&mut e, &clk);
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        e.set_status(crate::status::StatusKind::Info, "later ack");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error, "Q1: Info must not displace a held Error");
+    }
+
+    /// A17 T4: an add-to-dictionary write failure (dict path's parent is a regular FILE, so
+    /// `append_word_to_dict`'s `create_dir_all` fails) must land Sticky/Error (Q1).
+    #[test]
+    fn diag_apply_selected_add_dict_failure_is_a_sticky_error() {
+        let parent = std::env::temp_dir().join(format!("wc-adddict-fail-{}.md", std::process::id()));
+        std::fs::write(&parent, "i am a file, not a dir\n").unwrap();
+        let dict_path = parent.join("dictionary.txt"); // parent "inside" a regular file
+        let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        e.diag_cfg.enabled = true;
+        e.diag_cfg.dictionary = Some(dict_path);
+        e.active_mut().view.mode = RenderMode::Review;
+        seed_teh_diag(&mut e);
+        open_diag_selected(&mut e, false);
+        diag_apply_selected(&mut e, &TestClock(1_000));
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        e.set_status(crate::status::StatusKind::Info, "later ack");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error, "Q1: Info must not displace a held Error");
+        let _ = std::fs::remove_file(&parent);
     }
 }

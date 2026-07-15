@@ -211,13 +211,15 @@ pub fn dispatch_transform(
     clock: &dyn wordcartel_core::history::Clock,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
 ) {
+    if editor.active().read_only { editor.reject_read_only(); return; } // A17 T8: no work scheduled, no epilogue.
     if editor.transform_in_flight {
-        editor.status = "a transform is already running".into();
+        editor.set_status_full(crate::status::StatusKind::Warning, "a transform is already running",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return;
     }
     let range = region.unwrap_or_else(|| region_for_transform(&editor.active().document));
     if range.is_empty() {
-        editor.status = "nothing to transform".into();
+        editor.set_status(crate::status::StatusKind::Info, "nothing to transform");
         return;
     }
     // The one width knob (spec repar10 D1): transforms format to the same column the
@@ -229,7 +231,10 @@ pub fn dispatch_transform(
         let version = editor.active().document.version;
         let snapshot = editor.active().document.buffer.snapshot(); // O(1) rope snapshot
         editor.transform_in_flight = true;
-        editor.status = format!("{}…", kind.gerund());
+        // Self-replacing Progress on the static Transform topic (the editor-wide
+        // `transform_in_flight` guarantees one at a time, so a static key is sound). The async
+        // completion in `apply_transform_done` / `merge_transform_into` collapses this start (§4.2).
+        editor.set_progress(crate::status::StatusTopic::Transform, format!("{}…", kind.gerund()));
         let range_c = range.clone();
         let msg_tx = msg_tx.clone();
         std::thread::spawn(move || {
@@ -262,9 +267,12 @@ pub fn merge_transform_into(
     result: Result<String, TransformError>,
     clock: &dyn wordcartel_core::history::Clock,
 ) {
+    // Every arm is a Transform completion: `finish_topic` collapses the async "{gerund}…" start
+    // (§4.2), or — on the sync path, which sets no progress start — simply appends the terminal.
     match result {
         Err(e) => {
-            editor.status = format!("transform failed: {e}");
+            editor.finish_topic(crate::status::StatusTopic::Transform, crate::status::StatusKind::Error,
+                format!("transform failed: {e}"));
         }
         Ok(out) => {
             // Read the current bytes for the no-op check; borrow ends before apply.
@@ -272,7 +280,8 @@ pub fn merge_transform_into(
                 .map(|b| b.document.buffer.slice(range.clone()).to_string())
                 .unwrap_or_default();
             if out == current {
-                editor.status = format!("already {}", kind.past_tense());
+                editor.finish_topic(crate::status::StatusTopic::Transform, crate::status::StatusKind::Info,
+                    format!("already {}", kind.past_tense()));
                 return;
             }
             let doc_len = editor.by_id(buffer_id).map(|b| b.document.buffer.len()).unwrap_or(0);
@@ -289,7 +298,8 @@ pub fn merge_transform_into(
                 crate::derive::rebuild(editor);
                 crate::nav::ensure_visible(editor);
             }
-            editor.status = kind.past_tense().to_string();
+            editor.finish_topic(crate::status::StatusTopic::Transform, crate::status::StatusKind::Info,
+                kind.past_tense().to_string());
         }
     }
 }
@@ -340,6 +350,22 @@ mod tests {
     use super::*;
     use crate::editor::Editor;
 
+    // A17 T8 — the TRUE dispatch point (not the menu opener) rejects on read-only, before any job is
+    // scheduled. `dispatch_transform` also backs the reflow/unwrap/ventilate registry commands.
+    #[test]
+    fn dispatch_transform_on_read_only_is_rejected() {
+        struct Z;
+        impl wordcartel_core::history::Clock for Z { fn now_ms(&self) -> u64 { 0 } }
+        let mut e = Editor::new_from_text("hello world\n", None, (40, 6));
+        e.active_mut().read_only = true;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let before = e.active().document.buffer.to_string();
+        dispatch_transform(&mut e, TransformKind::Reflow, None, &Z, &tx);
+        assert!(!e.transform_in_flight, "no transform scheduled on a read-only buffer");
+        assert_eq!(e.active().document.buffer.to_string(), before);
+        assert_eq!(e.status_text(), "buffer is read-only");
+    }
+
     fn blocks_of(text: &str) -> wordcartel_core::block_tree::BlockTree {
         Editor::new_from_text(text, None, (80, 24)).active().document.blocks().clone()
     }
@@ -349,6 +375,21 @@ mod tests {
     // build_range_replace would turn into a dropped/duplicated newline. We compare
     // against `top_level()[i].span` (whatever the parser produced) rather than
     // hand-counted byte offsets.
+
+    /// A17 T5 (F4 Warning table): the "a transform is already running" blocked-action
+    /// refusal is a recoverable Sticky Warning.
+    #[test]
+    fn dispatch_transform_already_running_is_a_sticky_warning() {
+        struct Z;
+        impl wordcartel_core::history::Clock for Z { fn now_ms(&self) -> u64 { 0 } }
+        let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
+        e.transform_in_flight = true;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        dispatch_transform(&mut e, TransformKind::Reflow, None, &Z, &tx);
+        assert_eq!(e.status_text(), "a transform is already running");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+    }
 
     #[test]
     fn snap_expands_mid_paragraph_selection_to_exactly_the_paragraph_block() {

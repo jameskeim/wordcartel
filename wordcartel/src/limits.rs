@@ -64,6 +64,24 @@ pub const PLUGIN_MAX_HOOKS_PER_PLUGIN: usize = 64;
 /// site) — the queue holds bounded owned data even for a pathological path.
 pub const PLUGIN_MAX_EVENT_PAYLOAD: usize = 4096;
 
+/// A17 — cap on a single `Status` message's displayed text (display-only truncation, char-boundary
+/// safe). Deliberately reuses `PLUGIN_MAX_STATUS_LEN` so plugin `wc.status` and host messages share
+/// one bound; T11 asserts this identity holds (a divergence would be a silent behavior change).
+pub const MESSAGES_MAX_TEXT_LEN: usize = PLUGIN_MAX_STATUS_LEN;
+/// A17 — max entries kept in the `StatusHistory` ring (M5 resource-cap ethos: fixed capacity,
+/// oldest evicted, no growth at rest).
+pub const MESSAGES_HISTORY_CAP: usize = 256;
+/// A17 — max `seq` gap between two otherwise-identical adjacent messages for them to still
+/// coalesce via `repeat` (spec §5.2). `1` means only a truly back-to-back repeat coalesces.
+pub const MESSAGES_DEDUP_WINDOW: u64 = 1;
+/// A17 T9 — display-slot throttle for the plugin emit path (spec §9.3): at most this many
+/// `wc.status`/`wc.notify` slot updates per plugin (keyed by `InvokeState::current` label) per
+/// pump tick (one `PluginHost::pump` cycle — `plugin::host::EmitThrottle::advance_tick`). Excess
+/// emits within the same tick still reach history (`Editor::record_status_history_only`, subject
+/// to §5.2 dedup) — only the display-slot write is dropped. A conservative v1 default: a looping
+/// plugin (`while true do wc.status('x') end`) must not repaint the slot every callback.
+pub const MESSAGES_EMIT_MAX_PER_TICK: usize = 1;
+
 /// Max byte length of a `wc.command(name)` target — the longest possible registered id
 /// (`<stem>.<name>`), so this cap can never reject a resolvable name (§5a).
 pub const PLUGIN_MAX_COMMAND_REF: usize = PLUGIN_MAX_STEM_LEN + 1 + PLUGIN_MAX_NAME_LEN;
@@ -108,5 +126,16 @@ mod tests {
         assert_eq!(PLUGIN_TIMER_MIN_INTERVAL_MS, 1000);
         assert_eq!(PLUGIN_MAX_TIMERS_PER_PLUGIN, 8);
         assert_eq!(PLUGIN_MAX_COMMAND_ARG, 4096);
+    }
+
+    // A17: guardrail so the messaging caps aren't drifted silently — the history ring is a
+    // fixed-cap M5 resource bound, the text cap is shared with `wc.status`, and the emit
+    // throttle/dedup windows are tuned constants a whole-branch/smoke pass may revisit.
+    #[test]
+    fn messages_caps_are_stable() {
+        assert_eq!(MESSAGES_HISTORY_CAP, 256);
+        assert_eq!(MESSAGES_MAX_TEXT_LEN, PLUGIN_MAX_STATUS_LEN);
+        assert_eq!(MESSAGES_DEDUP_WINDOW, 1);
+        assert_eq!(MESSAGES_EMIT_MAX_PER_TICK, 1);
     }
 }

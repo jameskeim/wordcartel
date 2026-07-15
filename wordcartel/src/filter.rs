@@ -340,8 +340,10 @@ pub fn dispatch_filter(
     spec: FilterSpec,
     msg_tx: std::sync::mpsc::Sender<crate::app::Msg>,
 ) {
+    if editor.active().read_only { editor.reject_read_only(); return; } // A17 T8: no work scheduled, no epilogue.
     if editor.filter_in_flight.is_some() {
-        editor.status = "a filter is already running".into();
+        editor.set_status_full(crate::status::StatusKind::Warning, "a filter is already running",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return;
     }
     let b = editor.active();
@@ -356,7 +358,10 @@ pub fn dispatch_filter(
     let snapshot = b.document.buffer.snapshot();
     let cancel = CancelFlag::new();
     editor.filter_in_flight = Some(cancel.clone());
-    editor.status = format!("running {} ...", spec.argv.first().cloned().unwrap_or_default());
+    // Self-replacing Progress on the static Filter topic (`filter_in_flight` guarantees one at a
+    // time). `apply_filter_done` collapses this start with its terminal completion (§4.2).
+    editor.set_progress(crate::status::StatusTopic::Filter,
+        format!("running {} ...", spec.argv.first().cloned().unwrap_or_default()));
     let disposition = spec.disposition.clone();
     let range_c = range.clone();
     std::thread::spawn(move || {
@@ -387,6 +392,39 @@ fn truncate(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A17 T8 — driven through the real submit path (builds the spec, then calls `dispatch_filter`,
+    // whose read-only entry guard fires before scheduling) — avoids constructing a private FilterSpec.
+    #[test]
+    fn dispatch_filter_on_read_only_is_rejected() {
+        let mut e = crate::editor::Editor::new_from_text("hello\n", None, (40, 6));
+        e.active_mut().read_only = true;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::prompts::submit_filter_line(&mut e, "cat", &tx);
+        assert!(e.filter_in_flight.is_none(), "no filter scheduled on a read-only buffer");
+        assert_eq!(e.status_text(), "buffer is read-only");
+    }
+
+    /// A17 T5 (F4 Warning table): the "a filter is already running" blocked-action refusal
+    /// is a recoverable Sticky Warning.
+    #[test]
+    fn dispatch_filter_already_running_is_a_sticky_warning() {
+        let mut e = crate::editor::Editor::new_from_text("hello\n", None, (80, 24));
+        e.filter_in_flight = Some(CancelFlag::new());
+        let spec = FilterSpec {
+            argv: vec!["cat".into()],
+            shell: false,
+            disposition: Disposition::Filter,
+            input: Input::SelectionElseBuffer,
+            timeout: std::time::Duration::from_secs(10),
+            max_output: 1 << 20,
+        };
+        let (tx, _rx) = std::sync::mpsc::channel();
+        dispatch_filter(&mut e, spec, tx);
+        assert_eq!(e.status_text(), "a filter is already running");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+    }
 
     #[test]
     fn filter_spec_constructs() {

@@ -92,7 +92,8 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 }
                 KeyCode::Enter => {
                     if editor.outline.as_ref().map(|o| o.opened_version) != Some(editor.active().document.version) {
-                        editor.status = "document changed; outline closed".into();
+                        editor.set_status_full(crate::status::StatusKind::Warning, "document changed; outline closed",
+                            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
                         editor.outline = None;
                         return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
                     }

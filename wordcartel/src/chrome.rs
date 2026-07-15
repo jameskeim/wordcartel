@@ -67,7 +67,7 @@ pub fn status_line_visible(editor: &crate::editor::Editor) -> bool {
         TransientMode::On  => true,
         // Off is never assigned to status (coerced to Auto at parse); treat defensively as Auto.
         TransientMode::Off | TransientMode::Auto =>
-            !editor.status.is_empty()
+            editor.has_visible_status()
                 || editor.mouse.status_revealed
                 || editor.prompt.is_some()
                 || editor.search.is_some()
@@ -258,11 +258,11 @@ mod tests {
         let mut e = crate::editor::Editor::new_from_text("x\n", None, (40, 8));
         e.status_line_mode = TransientMode::Auto;
         e.mouse.status_revealed = false;
-        e.status.clear();
+        e.clear_transient_status();
         assert!(!crate::chrome::status_line_visible(&e), "Auto idle + no message → info line hidden (calm)");
-        e.status = "saved".into();
+        e.set_status(crate::status::StatusKind::Info, "saved");
         assert!(crate::chrome::status_line_visible(&e), "a message force-reveals even under Auto (no-silent-UI)");
-        e.status.clear();
+        e.clear_transient_status();
         e.mouse.status_revealed = true;
         assert!(crate::chrome::status_line_visible(&e), "Auto + dwell-revealed → visible");
         e.status_line_mode = TransientMode::On;

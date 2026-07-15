@@ -497,10 +497,12 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         match crate::editor::Buffer::from_file(id, p, area) {
             Ok(b) => {
                 let was_new_file = b.document.path.is_some() && !p.exists();
-                editor.buffers[0] = b;
-                if was_new_file {
+                // A17 T8 category (b): route the launch install through the single chokepoint. Slot 0
+                // is the fresh writable scratch host, so this always succeeds; the `was_new_file`
+                // status only follows a successful install.
+                if editor.replace_buffer(0, b) && was_new_file {
                     // New file: empty buffer NAMED with the path; first save creates it.
-                    editor.status = "new file".to_string();
+                    editor.set_status(crate::status::StatusKind::Info, "new file".to_string());
                 }
             }
             // NotFound is mapped to Ok (named "new file") inside from_file, so it never
@@ -512,7 +514,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
                    | file::OpenError::IsDir(_)
                    | file::OpenError::Io(_)
                    | file::OpenError::TooLarge(..))) => {
-                editor.status = e.to_string();
+                editor.set_status_full(crate::status::StatusKind::Error, e.to_string(),
+                    crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
             }
         }
     }
@@ -539,6 +542,7 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     editor.set_status_line_mode(cfg.view.status_line);
     editor.set_caret_shape(cfg.view.caret_shape);
     editor.set_caret_blink(cfg.view.caret_blink);
+    editor.set_messages_min_kind(cfg.view.messages_min_kind);
     editor.set_clipboard_provider(cfg.clipboard.provider);
     editor.clear_clipboard_provider_dirty(); // worker gets the initial plan below; no redundant rebuild
     editor.resume_enabled = cfg.state.resume; // gates open_into_current's resume restore (Effort 7)
@@ -618,14 +622,14 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
             crate::swap::RecoveryDecision::Prompt(_h, body) => {
                 editor.active_mut().pending_swap_body = Some(body);
                 editor.open_prompt(crate::prompt::Prompt::swap_recovery());
-                editor.status = "Recovery file found".into();
+                editor.set_status(crate::status::StatusKind::Info, "Recovery file found");
             }
         }
     } else if let Some((sp, _header, body)) = crate::swap::find_orphan_scratch_swap() {
         editor.active_mut().pending_swap_body = Some(body);
         editor.active_mut().pending_swap_path = Some(sp);
         editor.open_prompt(crate::prompt::Prompt::swap_recovery());
-        editor.status = "Recovery file found".into();
+        editor.set_status(crate::status::StatusKind::Info, "Recovery file found");
     }
 
     // Install the terminal guard: enable raw mode + enter alternate screen.
@@ -690,7 +694,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     warns.append(&mut kw);
     editor.keymap = built_keymap;
     if let Some(w) = warns.first() {
-        editor.status = w.clone();
+        editor.set_status_full(crate::status::StatusKind::Warning, w.clone(),
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
     }
     // Take the keymap out of editor into a loop-local to avoid a simultaneous
     // &mut editor / &editor.keymap borrow conflict when calling reduce.
@@ -798,7 +803,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // borrow this function's `clock` local.
     let editor = Rc::new(RefCell::new(editor));
     if let Err(e) = plugin_host.attach_bridge(editor.clone(), msg_tx.clone(), Rc::new(SystemClock) as Rc<dyn Clock>) {
-        editor.borrow_mut().status = format!("plugin bridge failed to attach: {e}");
+        editor.borrow_mut().set_status_full(crate::status::StatusKind::Error, format!("plugin bridge failed to attach: {e}"),
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
     }
 
     loop {
@@ -1284,7 +1290,7 @@ mod tests {
         crate::app::reduce(Msg::ClipboardPaste { id: 1, buffer_id: bid, text: Some(huge) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "ab\n", "oversize paste must not insert");
         assert_eq!(e.register.get(), Some("orig"), "oversize paste must not mutate the register");
-        assert!(e.status.to_lowercase().contains("too large"));
+        assert!(e.status_text().to_lowercase().contains("too large"));
     }
 
     #[test]
@@ -1294,11 +1300,17 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         crate::app::reduce(Msg::ClipboardAvailability(false), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
-        assert!(e.status.to_lowercase().contains("clipboard"));
+        assert!(e.status_text().to_lowercase().contains("clipboard"));
         assert!(e.clipboard_notice_shown);
-        e.status = "typing".into();
+        // A17 T5 (F4 Warning table): the notice is now a Sticky Warning — dismiss it (the user
+        // action that would ordinarily clear it) before simulating unrelated typing activity,
+        // since a plain Info cannot displace a held Warning (Q1).
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        e.dismiss_status();
+        e.set_status(crate::status::StatusKind::Info, "typing");
         crate::app::reduce(Msg::ClipboardAvailability(false), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
-        assert_eq!(e.status, "typing", "notice shown only once");
+        assert_eq!(e.status_text(), "typing", "notice shown only once");
     }
 
     // -------------------------------------------------------------------------
@@ -1755,7 +1767,7 @@ mod tests {
         crate::app::reduce(Msg::FilterDone { buffer_id: id, version: stale_v, range: 1..3, cursor: 2,
             disposition: Disposition::Filter, outcome: RunResult::Stdout("X".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "abcde\n", "stale filter result discarded");
-        assert!(e.status.to_lowercase().contains("discarded"));
+        assert!(e.status_text().to_lowercase().contains("discarded"));
     }
 
     #[test]
@@ -1772,7 +1784,7 @@ mod tests {
             outcome: RunResult::Err(FilterError::NonZero { code: "Exited(3)".into(), stderr: "boom".into() }) },
             &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "abcde\n");
-        assert!(e.status.contains("boom") && e.status.contains('3'));
+        assert!(e.status_text().contains("boom") && e.status_text().contains('3'));
     }
 
     #[test]
@@ -1980,7 +1992,7 @@ mod tests {
             for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, &mut e, &ex, &clk, &tx); }
             assert!(e.quit_drain.is_none(), "failed save aborts the drain");
             assert!(!e.quit, "a failed save must not quit (no data loss)");
-            assert!(e.status.to_lowercase().contains("symlink"), "error status surfaced");
+            assert!(e.status_text().to_lowercase().contains("symlink"), "error status surfaced");
             let _ = std::fs::remove_file(&link); let _ = std::fs::remove_file(&real);
         }
     }
@@ -2111,7 +2123,7 @@ mod tests {
         let mut e = Editor::new_from_text("content\n", None, (80, 24));
         let before_count = e.buffers.len();
         crate::workspace::open_as_new_buffer(&mut e, &dir_path);
-        assert!(!e.status.is_empty(), "error status set on failure, got: {:?}", e.status);
+        assert!(!e.status_text().is_empty(), "error status set on failure, got: {:?}", e.status_text());
         assert_eq!(e.buffers.len(), before_count, "no buffer added on open failure");
     }
 
@@ -2120,11 +2132,11 @@ mod tests {
     fn new_empty_buffer_always_succeeds_and_clears_status() {
         use crate::editor::Editor;
         let mut e = Editor::new_from_text("content\n", None, (80, 24));
-        e.status = "prior error".to_string();
+        e.set_status(crate::status::StatusKind::Info, "prior error".to_string());
         let before_count = e.buffers.len();
         crate::workspace::new_empty_buffer(&mut e);
         assert_eq!(e.buffers.len(), before_count + 1, "new buffer added");
-        assert_eq!(e.status, "", "status cleared after new");
+        assert_eq!(e.status_text(), "", "status cleared after new");
     }
 
     // Effort 6 additive new: new_empty_buffer adds an empty untitled buffer and switches to it.
@@ -2240,7 +2252,7 @@ mod tests {
         assert!(output_path.exists(), "exported file must exist");
         let got = std::fs::read(&output_path).expect("read exported file");
         assert_eq!(got, content_bytes);
-        assert!(e.status.contains("exported"), "status must say exported");
+        assert!(e.status_text().contains("exported"), "status must say exported");
 
         // Clean up.
         let _ = std::fs::remove_file(&output_path);
@@ -2290,7 +2302,7 @@ mod tests {
         // The racing file is untouched; status tells the user to re-run.
         let got = std::fs::read(&output_path).expect("read target");
         assert_eq!(got, b"PRE-EXISTING\n", "unconfirmed export must not clobber an appeared target");
-        assert!(e.status.contains("re-run"), "status must prompt a re-run, got: {}", e.status);
+        assert!(e.status_text().contains("re-run"), "status must prompt a re-run, got: {}", e.status_text());
 
         let _ = std::fs::remove_file(&output_path);
         let _ = std::fs::remove_file(&source);
@@ -2335,7 +2347,7 @@ mod tests {
 
         let got = std::fs::read(&output_path).expect("read target");
         assert_eq!(got, new_bytes, "confirmed export must overwrite the existing target");
-        assert!(e.status.contains("exported"));
+        assert!(e.status_text().contains("exported"));
 
         let _ = std::fs::remove_file(&output_path);
         let _ = std::fs::remove_file(&source);
@@ -2380,7 +2392,7 @@ mod tests {
         crate::app::reduce(msg, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
 
         assert!(output_path.exists(), "ExportDone under prompt must still write the file");
-        assert!(e.status.contains("exported"));
+        assert!(e.status_text().contains("exported"));
 
         let _ = std::fs::remove_file(&output_path);
         let _ = std::fs::remove_file(&source);
@@ -2446,7 +2458,7 @@ mod tests {
         crate::transform::dispatch_transform(&mut e, TransformKind::Ventilate, None, &TestClock(0), &tx);
         assert_eq!(e.active().document.buffer.to_string(), text);
         assert_eq!(e.active().document.version, v0, "no-op transform must not bump version");
-        assert!(e.status.contains("already"));
+        assert!(e.status_text().contains("already"));
     }
 
     #[test]
@@ -2482,7 +2494,7 @@ mod tests {
         crate::app::reduce(Msg::TransformDone { buffer_id: id, version: stale, range: 0..10,
             kind: TransformKind::Reflow, result: Ok("X".into()) }, &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.active().document.buffer.to_string(), "alpha beta\n", "stale result discarded");
-        assert!(e.status.to_lowercase().contains("discarded"));
+        assert!(e.status_text().to_lowercase().contains("discarded"));
         assert!(!e.transform_in_flight, "in-flight cleared even on discard");
     }
 
@@ -2510,7 +2522,7 @@ mod tests {
         let len = e.active().document.buffer.len();
         let (tx, _rx) = std::sync::mpsc::channel();
         crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, Some(0..len), &TestClock(0), &tx);
-        assert!(e.status.contains("already running"), "in-flight guard fires for _buffer variant: {:?}", e.status);
+        assert!(e.status_text().contains("already running"), "in-flight guard fires for _buffer variant: {:?}", e.status_text());
     }
 
     #[test]
@@ -2521,7 +2533,7 @@ mod tests {
         let len = e.active().document.buffer.len(); // 0 → Some(0..0) is empty
         let (tx, _rx) = std::sync::mpsc::channel();
         crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, Some(0..len), &TestClock(0), &tx);
-        assert!(e.status.contains("nothing to transform"), "empty-range guard fires: {:?}", e.status);
+        assert!(e.status_text().contains("nothing to transform"), "empty-range guard fires: {:?}", e.status_text());
     }
 
     #[test]
@@ -2661,7 +2673,7 @@ mod tests {
         crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, None, &TestClock(0), &tx);
         assert_eq!(e.active().document.buffer.to_string(), text, "buffer unchanged");
         assert_eq!(e.active().document.version, v0, "version unchanged");
-        assert!(e.status.contains("nothing to transform"), "status: {:?}", e.status);
+        assert!(e.status_text().contains("nothing to transform"), "status: {:?}", e.status_text());
     }
 
     #[test]
@@ -2679,7 +2691,7 @@ mod tests {
         crate::transform::dispatch_transform(&mut e, TransformKind::Reflow, None, &TestClock(0), &tx);
         // Fence passes through repar verbatim — output identical → "already reflowed".
         assert_eq!(e.active().document.buffer.to_string(), text, "fenced code unchanged");
-        assert!(e.status.contains("already"), "status: {}", e.status);
+        assert!(e.status_text().contains("already"), "status: {}", e.status_text());
     }
 
     #[test]
@@ -2855,7 +2867,7 @@ mod tests {
         let reg = Registry::builtins(); let ex = InlineExecutor::default(); let clk = TestClock(0);
         crate::app::reduce(press(KeyCode::Char('k'), KeyModifiers::CONTROL), &mut e, &reg, &km, &ex, &clk, &tx);
         assert_eq!(e.pending_keys.len(), 1, "first key is pending");
-        assert!(e.status.contains("ctrl-k") || e.status.to_lowercase().contains("k"), "pending shown");
+        assert!(e.status_text().contains("ctrl-k") || e.status_text().to_lowercase().contains("k"), "pending shown");
         crate::app::reduce(press(KeyCode::Char('s'), KeyModifiers::CONTROL), &mut e, &reg, &km, &ex, &clk, &tx);
         assert!(e.pending_keys.is_empty(), "sequence resolved, pending cleared");
         // (save dispatched — the file path means dispatch_save runs; assert via status or saved flag per the real save)
@@ -3242,7 +3254,10 @@ mod tests {
         assert!(e.outline.is_none(), "stale outline overlay must close without jumping");
         assert_eq!(e.active().document.selection.primary().head, start,
             "stale outline Enter must not move the caret");
-        assert!(e.status.contains("changed"), "status must mention the change");
+        assert!(e.status_text().contains("changed"), "status must mention the change");
+        // A17 T5 (F4 Warning table): a Sticky Warning.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
     }
 
     #[test]
@@ -3275,7 +3290,7 @@ mod tests {
         r(&mut e, press(KeyCode::Char('('), KeyModifiers::NONE));       // invalid in regex mode
         r(&mut e, press(KeyCode::Char('a'), KeyModifiers::ALT));        // Alt+A = Replace All
         assert_eq!(e.active().document.buffer.to_string(), before, "invalid regex must not mutate the buffer");
-        assert_eq!(e.status, "invalid regex", "status must say 'invalid regex', got: {:?}", e.status);
+        assert_eq!(e.status_text(), "invalid regex", "status must say 'invalid regex', got: {:?}", e.status_text());
     }
 
     #[test]
@@ -3332,7 +3347,7 @@ mod tests {
         crate::app::reduce(Msg::DiagProviderEvent { source: wordcartel_core::diagnostics::DiagSource::Harper,
             event: ProviderEvent::Degraded(INSTALL_HINT.into()) },
             &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
-        assert_eq!(e.status, INSTALL_HINT, "Degraded reached the status line via reduce_dispatch");
+        assert_eq!(e.status_text(), INSTALL_HINT, "Degraded reached the status line via reduce_dispatch");
     }
 
     #[test]
@@ -3543,7 +3558,7 @@ mod tests {
         assert!(e.diag.is_none(), "stale overlay must be closed without applying");
         assert_eq!(e.active().document.buffer.to_string(), buf_before,
             "buffer must not be mutated when the overlay is stale");
-        assert!(e.status.contains("changed"), "status must mention the change");
+        assert!(e.status_text().contains("changed"), "status must mention the change");
     }
 
     // -----------------------------------------------------------------------
@@ -4369,7 +4384,7 @@ mod tests {
 
         crate::workspace::close_buffer(&mut e);
 
-        assert_eq!(e.status, "can't close the scratch buffer");
+        assert_eq!(e.status_text(), "can't close the scratch buffer");
         assert!(e.prompt.is_none(), "scratch guard must NOT raise a prompt");
     }
 
@@ -4389,7 +4404,7 @@ mod tests {
         reg.dispatch(CommandId("keymap_wordstar"), &mut ctx);
         assert_eq!(e.active_keymap_preset, "wordstar");
         assert!(e.keymap_rebuild, "switch requests a rebuild");
-        assert_eq!(e.status, "keymap: wordstar");
+        assert_eq!(e.status_text(), "keymap: wordstar");
     }
 
     #[test]
@@ -4403,7 +4418,7 @@ mod tests {
         let mut ctx = crate::registry::Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
         reg.dispatch(CommandId("keymap_cua"), &mut ctx); // cua is already active
         assert!(!e.keymap_rebuild, "idempotent switch must not request a rebuild");
-        assert_eq!(e.status, "keymap: cua (already active)");
+        assert_eq!(e.status_text(), "keymap: cua (already active)");
     }
 
     // D1+A5 Task 4 — save_settings command sets the request flag -----------------

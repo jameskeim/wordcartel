@@ -92,6 +92,12 @@ pub struct CommandMeta {
     /// opens a [`crate::minibuffer::MinibufferKind::PluginArg`] with this prompt (Task 5).
     /// `None` for every builtin (today) and every nullary plugin command.
     pub arg: Option<&'static str>,
+    /// A17 T8: `true` iff dispatching this command would mutate the active buffer's content OR run
+    /// a mutating epilogue (e.g. clearing `marked_block`) after a no-op'd edit. On a read-only
+    /// buffer, `dispatch_with_arg` refuses such a command before its handler runs — closing the
+    /// EPILOGUE residual. The set is defined mechanically by the completeness sweep test
+    /// (`no_registry_command_runs_a_mutating_epilogue_on_a_read_only_buffer`), NOT a hand-list.
+    pub mutates: bool,
 }
 
 // ── Registry ──────────────────────────────────────────────────────────────────
@@ -112,7 +118,17 @@ impl Registry {
         let cid = CommandId(id);
         self.index.insert(cid, self.entries.len());
         self.entries.push(CommandEntry { id: cid, handler: HandlerKind::Builtin(handler),
-            meta: CommandMeta { label, menu, state: None, arg: None } });
+            meta: CommandMeta { label, menu, state: None, arg: None, mutates: false } });
+    }
+
+    /// A17 T8: register a command that mutates the active buffer's content or runs a mutating
+    /// epilogue — `dispatch_with_arg` refuses it on a read-only buffer. Membership is driven by the
+    /// completeness sweep test, never a hand-list.
+    fn register_mut(&mut self, id: &'static str, label: &'static str, menu: Option<MenuCategory>, handler: Handler) {
+        let cid = CommandId(id);
+        self.index.insert(cid, self.entries.len());
+        self.entries.push(CommandEntry { id: cid, handler: HandlerKind::Builtin(handler),
+            meta: CommandMeta { label, menu, state: None, arg: None, mutates: true } });
     }
 
     fn register_stateful(&mut self, id: &'static str, label: &'static str, menu: Option<MenuCategory>,
@@ -120,7 +136,7 @@ impl Registry {
         let cid = CommandId(id);
         self.index.insert(cid, self.entries.len());
         self.entries.push(CommandEntry { id: cid, handler: HandlerKind::Builtin(handler),
-            meta: CommandMeta { label, menu, state: Some(state), arg: None } });
+            meta: CommandMeta { label, menu, state: Some(state), arg: None, mutates: false } });
     }
 
     /// Register a plugin command. Inputs are ALREADY interned `&'static` (the load layer capped
@@ -135,7 +151,7 @@ impl Registry {
         }
         self.index.insert(id, self.entries.len());
         self.entries.push(CommandEntry { id, handler: HandlerKind::Plugin,
-            meta: CommandMeta { label, menu, state: None, arg } });
+            meta: CommandMeta { label, menu, state: None, arg, mutates: false } });
         Ok(())
     }
 
@@ -380,13 +396,13 @@ impl Registry {
             ($r:expr, $($d:literal => $ch:literal),+ $(,)?) => {$(
                 $r.register(concat!("set_bookmark_", $d), concat!("Set Bookmark ", $d), None,
                     |c| { crate::marks::set_char_mark(c.editor, $ch);
-                          c.editor.status = concat!("bookmark ", $d, " set").to_string();
+                          c.editor.set_status(crate::status::StatusKind::Info, concat!("bookmark ", $d, " set").to_string());
                           CommandResult::Handled });
                 $r.register(concat!("jump_bookmark_", $d), concat!("Jump to Bookmark ", $d), None,
                     |c| { if crate::marks::jump_char_mark(c.editor, $ch) {
-                              c.editor.status = concat!("jumped to bookmark ", $d).to_string();
+                              c.editor.set_status(crate::status::StatusKind::Info, concat!("jumped to bookmark ", $d).to_string());
                           } else {
-                              c.editor.status = concat!("no bookmark ", $d).to_string();
+                              c.editor.set_status(crate::status::StatusKind::Info, concat!("no bookmark ", $d).to_string());
                           }
                           CommandResult::Handled });
             )+};
@@ -402,28 +418,28 @@ impl Registry {
         // Marked block creation (Task 2 / Effort 9A).
         r.register("block_begin",               "Set Block Begin",         Some(MenuCategory::Block), |c| { crate::blocks_marked::block_begin(c.editor); CommandResult::Handled });
         r.register("block_end",                 "Set Block End",           Some(MenuCategory::Block), |c| { crate::blocks_marked::block_end(c.editor); CommandResult::Handled });
-        r.register("mark_block_from_selection", "Mark Block from Selection", Some(MenuCategory::Block), |c| { crate::blocks_marked::mark_block_from_selection(c.editor); CommandResult::Handled });
+        r.register_mut("mark_block_from_selection", "Mark Block from Selection", Some(MenuCategory::Block), |c| { crate::blocks_marked::mark_block_from_selection(c.editor); CommandResult::Handled });
         // Block → selection bridge (A11.3, Task 1.1 / command-surface curation).
         r.register("select_marked_block", "Select Block", Some(MenuCategory::Block),
             |c| { crate::blocks_marked::select_marked_block(c.editor); CommandResult::Handled });
         // Two-region swap (S4 Task 6): exchange Selection <-> MarkedBlock, one undo unit.
-        r.register("swap", "Swap Selection \u{21C4} Block", Some(MenuCategory::Block),
+        r.register_mut("swap", "Swap Selection \u{21C4} Block", Some(MenuCategory::Block),
             |c| crate::commands::prose_ops::swap(c.editor, c.clock));
 
         // Marked block operations (Task 3 / Effort 9A).
         r.register("block_copy",          "Copy Block",        Some(MenuCategory::Block), |c| { crate::blocks_marked::block_copy(c.editor, c.clock);   CommandResult::Handled });
-        r.register("block_move",          "Move Block",        Some(MenuCategory::Block), |c| { crate::blocks_marked::block_move(c.editor, c.clock);   CommandResult::Handled });
-        r.register("block_delete",        "Delete Block",      Some(MenuCategory::Block), |c| { crate::blocks_marked::block_delete(c.editor, c.clock); CommandResult::Handled });
+        r.register_mut("block_move",          "Move Block",        Some(MenuCategory::Block), |c| { crate::blocks_marked::block_move(c.editor, c.clock);   CommandResult::Handled });
+        r.register_mut("block_delete",        "Delete Block",      Some(MenuCategory::Block), |c| { crate::blocks_marked::block_delete(c.editor, c.clock); CommandResult::Handled });
         r.register("block_jump_begin",    "Jump to Block Begin", Some(MenuCategory::Block), |c| { crate::blocks_marked::block_jump_begin(c.editor);    CommandResult::Handled });
         r.register("block_jump_end",      "Jump to Block End",   Some(MenuCategory::Block), |c| { crate::blocks_marked::block_jump_end(c.editor);      CommandResult::Handled });
-        r.register("block_toggle_hidden", "Toggle Block Hidden", Some(MenuCategory::Block), |c| { crate::blocks_marked::block_toggle_hidden(c.editor); CommandResult::Handled });
-        r.register("block_clear",         "Clear Block",         Some(MenuCategory::Block), |c| { crate::blocks_marked::block_clear(c.editor);         CommandResult::Handled });
+        r.register_mut("block_toggle_hidden", "Toggle Block Hidden", Some(MenuCategory::Block), |c| { crate::blocks_marked::block_toggle_hidden(c.editor); CommandResult::Handled });
+        r.register_mut("block_clear",         "Clear Block",         Some(MenuCategory::Block), |c| { crate::blocks_marked::block_clear(c.editor);         CommandResult::Handled });
         // Marked block write-to-file (Task 4 / Effort 9A).
         r.register("block_write", "Write Block to File\u{2026}", Some(MenuCategory::Block), |c| { crate::blocks_marked::block_write(c.editor); CommandResult::Handled });
 
         // Effort 6: send-to-scratch verbs.
         r.register("copy_block_to_scratch", "Copy Block to Scratch", Some(MenuCategory::Block), |c| { crate::scratch::copy_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
-        r.register("move_block_to_scratch", "Move Block to Scratch", Some(MenuCategory::Block), |c| { crate::scratch::move_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
+        r.register_mut("move_block_to_scratch", "Move Block to Scratch", Some(MenuCategory::Block), |c| { crate::scratch::move_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
 
         // Effort 6: workspace navigation. next_buffer/prev_buffer/switch_buffer are
         // palette-only (menu: None) as of Task 4.2 — the Documents dynamic menu's direct
@@ -431,6 +447,7 @@ impl Registry {
         // registered-command status, palette listing, and keymap chords.
         r.register("next_buffer", "Next Buffer", None, |c| { crate::workspace::next_buffer(c.editor); CommandResult::Handled });
         r.register("prev_buffer", "Previous Buffer", None, |c| { crate::workspace::prev_buffer(c.editor); CommandResult::Handled });
+        r.register("view_messages", "Message History", Some(MenuCategory::View), |c| { crate::status_view::open(c.editor); CommandResult::Handled });
         r.register("goto_scratch", "Go to Scratch Buffer", Some(MenuCategory::View), |c| { crate::workspace::goto_scratch(c.editor); CommandResult::Handled });
         r.register("toggle_scratch", "Toggle Scratch Buffer", Some(MenuCategory::View), |c| { crate::workspace::toggle_scratch(c.editor); CommandResult::Handled });
         r.register("switch_buffer", "Switch Buffer\u{2026}", None, |c| { c.editor.open_buffer_switcher(); CommandResult::Handled });
@@ -477,7 +494,7 @@ impl Registry {
         // for "what the lens shows".
         r.register("quick_fix", "Quick Fix\u{2026}", None, |c| {
             let Some(diags) = crate::diagnostics_run::active_lens_diags(c.editor) else {
-                c.editor.status = "no diagnostic here".into();
+                c.editor.set_status(crate::status::StatusKind::Info, "no diagnostic here");
                 return CommandResult::Handled;
             };
             let caret = c.editor.active().document.selection.primary().head;
@@ -487,7 +504,7 @@ impl Registry {
             if let Some(d) = diag {
                 c.editor.open_diag(d);
             } else {
-                c.editor.status = "no diagnostic here".into();
+                c.editor.set_status(crate::status::StatusKind::Info, "no diagnostic here");
             }
             CommandResult::Handled
         });
@@ -595,7 +612,7 @@ impl Registry {
                 crate::derive::rebuild(c.editor);
                 crate::nav::ensure_visible(c.editor);
             } else {
-                c.editor.status = "no heading at cursor".into();
+                c.editor.set_status(crate::status::StatusKind::Info, "no heading at cursor");
             }
             CommandResult::Handled
         });
@@ -661,18 +678,32 @@ impl Registry {
             |c| { let next = if c.editor.status_line_mode == TransientMode::On { TransientMode::Auto } else { TransientMode::On };
                   c.editor.set_status_line_mode(next); CommandResult::Handled });
 
+        // Message verbosity floor (Q6, A17 T10): set-per-state (palette-only) + 2-state toggle
+        // representative (View, state-in-label). All three route through the single
+        // `Editor::set_messages_min_kind` setter (contract law 6).
+        r.register("messages_min_info", "Messages: Info & Above", None, |c| {
+            c.editor.set_messages_min_kind(crate::status::StatusKind::Info); CommandResult::Handled });
+        r.register("messages_min_warning", "Messages: Warnings & Errors Only", None, |c| {
+            c.editor.set_messages_min_kind(crate::status::StatusKind::Warning); CommandResult::Handled });
+        r.register_stateful("toggle_messages_verbosity", "Message Verbosity", Some(MenuCategory::View),
+            |e| MenuMark::Value(match e.messages_min_kind() {
+                crate::status::StatusKind::Warning => "Warnings & Errors Only", _ => "Info & Above" }),
+            |c| { let next = if c.editor.messages_min_kind() == crate::status::StatusKind::Warning {
+                      crate::status::StatusKind::Info } else { crate::status::StatusKind::Warning };
+                  c.editor.set_messages_min_kind(next); CommandResult::Handled });
+
         // Startup splash: set-per-state (palette-only) + 2-state toggle representative
         // (View, OnOff mark). All three route through Editor::set_splash (contract law 6);
         // the splash paints only at launch, so a change takes effect on the NEXT run.
         r.register("splash_on",  "Splash: On",  None, |c| { c.editor.set_splash(true);
-            c.editor.status = "splash: on (takes effect next launch)".into(); CommandResult::Handled });
+            c.editor.set_status(crate::status::StatusKind::Info, "splash: on (takes effect next launch)"); CommandResult::Handled });
         r.register("splash_off", "Splash: Off", None, |c| { c.editor.set_splash(false);
-            c.editor.status = "splash: off (takes effect next launch)".into(); CommandResult::Handled });
+            c.editor.set_status(crate::status::StatusKind::Info, "splash: off (takes effect next launch)"); CommandResult::Handled });
         r.register_stateful("toggle_splash", "Startup Splash", Some(MenuCategory::View),
             |e| MenuMark::OnOff(e.view_opts.splash),
             |c| { let next = !c.editor.view_opts.splash; c.editor.set_splash(next);
-                  c.editor.status = if next { "splash: on (takes effect next launch)".into() }
-                                    else { "splash: off (takes effect next launch)".into() };
+                  c.editor.set_status(crate::status::StatusKind::Info, if next { "splash: on (takes effect next launch)" }
+                                    else { "splash: off (takes effect next launch)" });
                   CommandResult::Handled });
 
         // Caret shape: set-per-state (palette-only) + 4-state cycle representative (View, state-in-label).
@@ -783,7 +814,7 @@ impl Registry {
         // (plugin::reload::perform_reload) does the whole-VM teardown+rebuild, never inline here.
         r.register("plugins_reload", "Reload Plugins", Some(MenuCategory::Settings), |c| {
             c.editor.plugins_reload_requested = true;
-            c.editor.status = "reloading plugins\u{2026}".into();
+            c.editor.set_status(crate::status::StatusKind::Info, "reloading plugins\u{2026}");
             CommandResult::Handled
         });
         r.register("plugin_list", "List Plugins", Some(MenuCategory::Settings), |c| {
@@ -793,8 +824,8 @@ impl Registry {
             let cmds: usize = inv.iter().map(|r| r.commands).sum();
             let hooks: usize = inv.iter().map(|r| r.hooks).sum(); // real hook total (Task 6 wiring)
             let timers = c.editor.pending_plugin_timers.len(); // P3: live armed-timer count
-            c.editor.status = format!(
-                "plugins: {ok} ok ({cmds} cmds, {hooks} hooks, {timers} timers), {failed} failed");
+            c.editor.set_status(crate::status::StatusKind::Info, format!(
+                "plugins: {ok} ok ({cmds} cmds, {hooks} hooks, {timers} timers), {failed} failed"));
             CommandResult::Handled
         });
 
@@ -821,7 +852,15 @@ impl Registry {
     /// 4. Nullary plugin command, no arg → enqueue nullary (today's behavior).
     pub fn dispatch_with_arg(&self, id: CommandId, ctx: &mut Ctx, arg: Option<String>) -> CommandResult {
         match self.index.get(&id) {
-            Some(&i) => match &self.entries[i].handler {
+            Some(&i) => {
+                // A17 T8 EPILOGUE residual: refuse a mutating command on a read-only buffer BEFORE
+                // its handler runs, so no mutating epilogue (e.g. clearing `marked_block`) fires.
+                // Content + status are already covered by categories (a)/(b) + the delegators.
+                if self.entries[i].meta.mutates && ctx.editor.active().read_only {
+                    ctx.editor.reject_read_only();
+                    return CommandResult::Noop;
+                }
+                match &self.entries[i].handler {
                 HandlerKind::Builtin(h) => { let _ = arg; h(ctx) }
                 HandlerKind::Plugin => {
                     match (self.entries[i].meta.arg, arg) {
@@ -836,9 +875,10 @@ impl Registry {
                     }
                     CommandResult::Handled
                 }
+                }
             },
             None => {
-                ctx.editor.status = format!("unknown command: {}", id.0);
+                ctx.editor.set_status(crate::status::StatusKind::Info, format!("unknown command: {}", id.0));
                 CommandResult::Noop
             }
         }
@@ -866,12 +906,12 @@ impl Registry {
 /// preset and the rebuild flag — the run loop swaps the trie between reduces (spec D2).
 fn switch_keymap_preset(editor: &mut crate::editor::Editor, preset: &str) {
     if editor.active_keymap_preset == preset {
-        editor.status = format!("keymap: {preset} (already active)");
+        editor.set_status(crate::status::StatusKind::Info, format!("keymap: {preset} (already active)"));
         return;
     }
     editor.active_keymap_preset = preset.to_string();
     editor.keymap_rebuild = true;
-    editor.status = format!("keymap: {preset}");
+    editor.set_status(crate::status::StatusKind::Info, format!("keymap: {preset}"));
 }
 
 /// Toggle the chrome disposition (Full ⇄ Zen). Mirrors `switch_keymap_preset` in structure:
@@ -885,7 +925,7 @@ fn toggle_chrome(editor: &mut crate::editor::Editor) {
     // Arm 1 — cue/monochrome theme: disposition flip has no visible effect (derive_chrome
     // is a no-op on monochrome themes); inform the user without changing state.
     if editor.theme.monochrome {
-        editor.status = "chrome: n/a (cue mode)".into();
+        editor.set_status(crate::status::StatusKind::Info, "chrome: n/a (cue mode)");
         return;
     }
     // Flip the disposition and request a full re-derive in the between-reduces arm.
@@ -906,17 +946,17 @@ fn toggle_chrome(editor: &mut crate::editor::Editor) {
         && matches!(editor.theme.base_fg, Color::Rgb { .. });
     if !rgb_bases {
         let name = editor.theme.name.clone();
-        editor.status = format!("chrome: {label} (no effect: {name} has fixed chrome)");
+        editor.set_status(crate::status::StatusKind::Info, format!("chrome: {label} (no effect: {name} has fixed chrome)"));
         return;
     }
     // Arm 3 — Rgb theme at Ansi16 depth: the fixed 5-face Ansi16 policy applied by
     // resolve_theme overrides the derived faces; toggling disposition has no visible effect.
     if editor.depth == Depth::Ansi16 {
-        editor.status = format!("chrome: {label} (no effect at 16-color depth)");
+        editor.set_status(crate::status::StatusKind::Info, format!("chrome: {label} (no effect at 16-color depth)"));
         return;
     }
     // Normal arm: derived Rgb theme at Truecolor/256; the rederive will visibly change chrome.
-    editor.status = format!("chrome: {label}");
+    editor.set_status(crate::status::StatusKind::Info, format!("chrome: {label}"));
 }
 
 /// Flip the canvas opacity. Render-only — no re-derive. The flip always persists (canvas is a
@@ -935,10 +975,10 @@ fn toggle_canvas(editor: &mut crate::editor::Editor) {
     let has_canvas = matches!(editor.theme.base_bg, Color::Rgb { .. }) && editor.depth != Depth::None;
     if !has_canvas {
         let name = editor.theme.name.clone();
-        editor.status = format!("canvas: {label} (no effect: {name} has no canvas)");
+        editor.set_status(crate::status::StatusKind::Info, format!("canvas: {label} (no effect: {name} has no canvas)"));
         return;
     }
-    editor.status = format!("canvas: {label}");
+    editor.set_status(crate::status::StatusKind::Info, format!("canvas: {label}"));
 }
 
 /// Thin adapter: run a built-in `Command` against the Ctx's editor+clock.
@@ -973,7 +1013,7 @@ fn heading_jump(c: &mut Ctx, dir: Dirn) {
         crate::derive::rebuild(c.editor);
         crate::nav::ensure_visible(c.editor);
     } else {
-        c.editor.status = "no heading".into();
+        c.editor.set_status(crate::status::StatusKind::Info, "no heading");
     }
 }
 
@@ -1367,7 +1407,7 @@ mod tests {
         let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
         let r = reg.dispatch(CommandId("nope"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Noop);
-        assert!(e.status.contains("unknown command"), "must surface, never silent (§12.5)");
+        assert!(e.status_text().contains("unknown command"), "must surface, never silent (§12.5)");
     }
 
     #[test]
@@ -1496,7 +1536,7 @@ mod tests {
         let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
         let r = reg.dispatch(CommandId("plugin_list"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Handled);
-        assert_eq!(e.status, "plugins: 1 ok (2 cmds, 1 hooks, 0 timers), 1 failed");
+        assert_eq!(e.status_text(), "plugins: 1 ok (2 cmds, 1 hooks, 0 timers), 1 failed");
     }
 
     #[test]
@@ -1526,7 +1566,7 @@ mod tests {
         let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
         let r = reg.dispatch(CommandId("plugin_list"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Handled);
-        assert_eq!(e.status, "plugins: 1 ok (2 cmds, 1 hooks, 2 timers), 0 failed");
+        assert_eq!(e.status_text(), "plugins: 1 ok (2 cmds, 1 hooks, 2 timers), 0 failed");
     }
 
     // -----------------------------------------------------------------------
@@ -1543,21 +1583,21 @@ mod tests {
         assert_eq!(ed.canvas, CanvasMode::Opaque);
         toggle_canvas(&mut ed);
         assert_eq!(ed.canvas, CanvasMode::Transparent);
-        assert_eq!(ed.status, "canvas: transparent");
+        assert_eq!(ed.status_text(), "canvas: transparent");
         // Non-Rgb theme: flips + persists, honest "no effect".
         let mut ed2 = crate::editor::Editor::new_from_text("x", None, (40, 4));
         ed2.theme = wordcartel_core::theme::Theme::builtin("terminal-plain").unwrap();
         ed2.depth = Depth::Truecolor;
         toggle_canvas(&mut ed2);
         assert_eq!(ed2.canvas, CanvasMode::Transparent, "flip persists even when inert");
-        assert_eq!(ed2.status, "canvas: transparent (no effect: terminal-plain has no canvas)");
+        assert_eq!(ed2.status_text(), "canvas: transparent (no effect: terminal-plain has no canvas)");
         // Depth::None (cue) on an Rgb theme: also "no effect" (no color to paint).
         let mut ed3 = crate::editor::Editor::new_from_text("x", None, (40, 4));
         ed3.theme = wordcartel_core::theme::Theme::builtin("flexoki-dark").unwrap();
         ed3.depth = Depth::None;
         toggle_canvas(&mut ed3);
         assert_eq!(ed3.canvas, CanvasMode::Transparent);
-        assert_eq!(ed3.status, "canvas: transparent (no effect: flexoki-dark has no canvas)");
+        assert_eq!(ed3.status_text(), "canvas: transparent (no effect: flexoki-dark has no canvas)");
     }
 
     // -----------------------------------------------------------------------
@@ -1572,11 +1612,11 @@ mod tests {
         dispatch_id(&mut ed, "toggle_chrome");
         assert_eq!(ed.chrome_disposition, ChromeDisposition::Zen, "disposition must flip to Zen");
         assert!(ed.theme_rederive, "rederive flag must be set");
-        assert!(ed.status.contains("chrome: zen"), "status must say 'chrome: zen': {:?}", ed.status);
+        assert!(ed.status_text().contains("chrome: zen"), "status must say 'chrome: zen': {:?}", ed.status_text());
         // Second toggle flips back to Full.
         dispatch_id(&mut ed, "toggle_chrome");
         assert_eq!(ed.chrome_disposition, ChromeDisposition::Full, "second toggle → Full");
-        assert!(ed.status.contains("chrome: full"), "status: {:?}", ed.status);
+        assert!(ed.status_text().contains("chrome: full"), "status: {:?}", ed.status_text());
     }
 
     #[test]
@@ -1588,7 +1628,7 @@ mod tests {
         dispatch_id(&mut ed, "toggle_chrome");
         assert_eq!(ed.chrome_disposition, ChromeDisposition::Full, "cue mode: disposition must NOT flip");
         assert!(!ed.theme_rederive, "cue mode: rederive flag must NOT be set");
-        assert_eq!(ed.status, "chrome: n/a (cue mode)", "cue mode status: {:?}", ed.status);
+        assert_eq!(ed.status_text(), "chrome: n/a (cue mode)", "cue mode status: {:?}", ed.status_text());
     }
 
     #[test]
@@ -1602,8 +1642,8 @@ mod tests {
         dispatch_id(&mut ed, "toggle_chrome");
         assert_eq!(ed.chrome_disposition, ChromeDisposition::Zen, "fixed-chrome arm: disposition flips");
         assert!(ed.theme_rederive, "rederive flag set (though rederive is a no-op on non-Rgb)");
-        assert!(ed.status.contains("no effect:"), "must warn 'no effect': {:?}", ed.status);
-        assert!(ed.status.contains("has fixed chrome"), "must say 'has fixed chrome': {:?}", ed.status);
+        assert!(ed.status_text().contains("no effect:"), "must warn 'no effect': {:?}", ed.status_text());
+        assert!(ed.status_text().contains("has fixed chrome"), "must say 'has fixed chrome': {:?}", ed.status_text());
     }
 
     #[test]
@@ -1618,8 +1658,8 @@ mod tests {
         dispatch_id(&mut ed, "toggle_chrome");
         assert_eq!(ed.chrome_disposition, ChromeDisposition::Zen, "Ansi16 arm: disposition flips");
         assert!(ed.theme_rederive, "rederive flag must be set");
-        assert!(ed.status.contains("no effect at 16-color depth"),
-            "must warn 16-color: {:?}", ed.status);
+        assert!(ed.status_text().contains("no effect at 16-color depth"),
+            "must warn 16-color: {:?}", ed.status_text());
     }
 
     #[test]
@@ -1792,7 +1832,7 @@ mod tests {
         seed(&mut ed);
         dispatch_id(&mut ed, "quick_fix");
         assert!(ed.diag.is_none(), "quick_fix must not open the overlay outside Review");
-        assert_eq!(ed.status, "no diagnostic here");
+        assert_eq!(ed.status_text(), "no diagnostic here");
 
         // quick_fix: Review opens the overlay.
         let mut ed = Editor::new_from_text(doc, None, (80, 24));
@@ -1924,6 +1964,86 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut ctx = Ctx { editor: ed, clock: &clk, executor: &ex, msg_tx: tx };
         reg.dispatch(CommandId(id), &mut ctx);
+    }
+
+    // A17 T8 — the EPILOGUE residual: `block_move` must NOT clear `marked_block` on a read-only
+    // buffer (content + status are already covered by categories (a)/(b) + the delegators; this
+    // forces `block_move` into the `register_mut` set via the dispatch guard).
+    #[test]
+    fn block_move_on_read_only_leaves_marked_block_and_content_intact() {
+        let mut e = Editor::new_from_text("one two three\n", None, (40, 6));
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 3, hidden: false });
+        e.active_mut().read_only = true;
+        let before = e.active().document.buffer.to_string();
+        let mark_before = e.active().marked_block;
+        dispatch_id(&mut e, "block_move"); // the dispatch mutates-guard fires before the handler
+        assert_eq!(e.active().document.buffer.to_string(), before, "read-only: no content change");
+        assert_eq!(e.active().marked_block, mark_before, "read-only: marked_block NOT cleared (no epilogue)");
+        assert_eq!(e.status_text(), "buffer is read-only");
+        assert_ne!(e.status_text(), "block moved", "must NOT report false success");
+    }
+
+    // A17 T8 — MECHANICAL completeness sweep: the source of truth for the `register_mut` set.
+    // Content-unchanged is universal by categories (a)+(b); the load-bearing assertion is
+    // `marked_block`-unchanged, which fails for any registry handler that runs a mutating epilogue
+    // on the read-only buffer — forcing its `register_mut` (or an entry guard) until green.
+    //
+    // We track the read-only buffer BY ID, not via `e.active()`: a command that legitimately
+    // SWITCHES the active buffer (`new`/`goto_scratch`/`next_buffer`/…) leaves the read-only
+    // buffer's own content+mark intact and is NOT a mutation of it — only a mutating epilogue ON
+    // this buffer clears its `marked_block` and fails. (Checking `e.active()` would conflate a
+    // benign buffer-switch with a mutation and wrongly demand marking every switch command
+    // `mutates`, trapping the user in the read-only view.) The two branches below split on whether
+    // the view's id SURVIVES the command: if it survives, content+mark must be unchanged; if it is
+    // GONE (a `close_buffer` dispose), the sanctioned reset must have discarded the content to a
+    // fresh writable buffer — no writable slot may carry the read-only content forward.
+    #[test]
+    fn no_registry_command_runs_a_mutating_epilogue_on_a_read_only_buffer() {
+        let reg = Registry::builtins();
+        let ids: Vec<_> = reg.commands().map(|(id, _)| id).collect();
+        let mut violations = Vec::new();
+        for id in ids {
+            // `view_messages` IS the regeneration seam for the read-only view — the one sanctioned
+            // content-replacer (a regenerable projection of the ring, never user data; the same
+            // principled exclusion as buffer disposal). It must run to regenerate, so it is not a
+            // `mutates` command; exclude it from the sweep.
+            if id.0 == "view_messages" { continue; }
+            let mut e = Editor::new_from_text("one two three\n", None, (40, 6));
+            e.install_scratch(); // so scratch-move epilogues (which early-return without a scratch buffer) execute
+            // A realistic pre-edit state that exercises the mutating paths: a NON-EMPTY selection
+            // "one" [0,3) (head 3, so `swap` and selection-driven surgery run) and a marked block
+            // "three" [8,13) that does NOT contain the caret (so `block_move`'s move path — not its
+            // "can't move into itself" early-return — executes). Both are non-overlapping.
+            e.active_mut().document.selection = wordcartel_core::selection::Selection::range(0, 3);
+            e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 8, end: 13, hidden: false });
+            e.active_mut().read_only = true;
+            let view_id = e.active().id;
+            let (content, mark) = (e.active().document.buffer.to_string(), e.active().marked_block);
+            dispatch_id(&mut e, id.0);
+            match e.buffers.iter().find(|b| b.id == view_id) {
+                Some(b) => {
+                    // The read-only view still exists: neither its content nor its `marked_block`
+                    // may have changed (categories (a)/(b) + no mutating epilogue).
+                    if b.document.buffer.to_string() != content { violations.push(format!("{} mutated content", id.0)); }
+                    if b.marked_block != mark { violations.push(format!("{} ran a mutating epilogue (marked_block)", id.0)); }
+                }
+                None => {
+                    // The command DISPOSED the read-only view (changed its BufferId — the
+                    // last-ordinary reset in `workspace::close_buffer_now` replaces the slot with a
+                    // FRESH untitled). A dispose is a distinct, SANCTIONED operation (not a content
+                    // mutation): it must discard the read-only content to a fresh writable buffer,
+                    // never smuggle that content INTO a now-writable slot. Assert no writable buffer
+                    // now holds the snapshot content — this is what makes the sweep a genuine
+                    // completeness proof that ALSO covers the dispose path (pre-fix a dispose passed
+                    // silently because the `if let Some` skipped when `view_id` was gone).
+                    if e.buffers.iter().any(|b| !b.read_only && b.document.buffer.to_string() == content) {
+                        violations.push(format!(
+                            "{} disposed the read-only view but a writable buffer now holds its content", id.0));
+                    }
+                }
+            }
+        }
+        assert!(violations.is_empty(), "read-only guard incomplete: {violations:?}");
     }
 
     #[test]
@@ -2094,8 +2214,8 @@ mod tests {
         let r = reg.dispatch(CommandId("splash_off"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Handled);
         assert!(!ctx.editor.view_opts.splash);
-        assert!(ctx.editor.status.contains("next launch"),
-            "status notes the deferred effect: {}", ctx.editor.status);
+        assert!(ctx.editor.status_text().contains("next launch"),
+            "status notes the deferred effect: {}", ctx.editor.status_text());
         reg.dispatch(CommandId("toggle_splash"), &mut ctx);
         assert!(ctx.editor.view_opts.splash, "toggle flips back on");
         reg.dispatch(CommandId("splash_on"), &mut ctx);
@@ -2144,5 +2264,30 @@ mod tests {
         assert_eq!(reg.dispatch(CommandId("toggle_ventilate"), &mut ctx), CommandResult::Handled);
         assert!(ed.active().view.ventilate, "dispatch turned the lens on");
         assert!(matches!(f(&ed), MenuMark::OnOff(true)));
+    }
+
+    // -----------------------------------------------------------------------
+    // A17 T10 (Q6): messages_min_kind command-surface wiring — set-per-state
+    // primitives + the 2-state toggle representative, all routed through the
+    // single Editor::set_messages_min_kind setter.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn toggle_flips_between_two_states() {
+        let mut e = Editor::new_from_text("x\n", None, (40, 6));
+        e.set_messages_min_kind(crate::status::StatusKind::Info);
+        dispatch_id(&mut e, "toggle_messages_verbosity");
+        assert_eq!(e.messages_min_kind(), crate::status::StatusKind::Warning);
+        dispatch_id(&mut e, "toggle_messages_verbosity");
+        assert_eq!(e.messages_min_kind(), crate::status::StatusKind::Info);
+    }
+
+    #[test]
+    fn set_per_state_primitives_set_the_floor_directly() {
+        let mut e = Editor::new_from_text("x\n", None, (40, 6));
+        dispatch_id(&mut e, "messages_min_warning");
+        assert_eq!(e.messages_min_kind(), crate::status::StatusKind::Warning);
+        dispatch_id(&mut e, "messages_min_info");
+        assert_eq!(e.messages_min_kind(), crate::status::StatusKind::Info);
     }
 }

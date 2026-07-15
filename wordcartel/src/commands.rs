@@ -389,7 +389,7 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             if let Some(text) = editor.register.get().map(str::to_owned) {
                 editor.clipboard_sync_request = Some(text);
             }
-            editor.status = "Copied".to_string();
+            editor.set_status(crate::status::StatusKind::Info, "Copied".to_string());
             CommandResult::Handled
         }
 
@@ -454,24 +454,29 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             let path_opt = editor.active().document.path.clone();
             match path_opt {
                 None => {
-                    editor.status = "No file name — use Save As".to_string();
+                    editor.set_status_full(crate::status::StatusKind::Warning, "No file name — use Save As".to_string(),
+                        crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
                 }
                 Some(path) => {
                     let v = editor.active().document.version;
-                    editor.status = "Saving\u{2026}".to_string();
+                    let buffer_id = editor.active().id;
+                    // Progress keyed on THIS (buffer, version); the synchronous completions below
+                    // reconstruct the identical key and collapse this start in place (§4.2).
+                    let topic = crate::status::StatusTopic::Save(buffer_id, v);
+                    editor.set_progress(topic, "Saving\u{2026}");
                     let content = editor.active().document.buffer.to_string();
                     match file::save_atomic(&path, &content) {
                         Ok(file::SaveOutcome::Saved) => {
                             editor.active_mut().document.mark_saved(v);
-                            editor.status = "Saved".to_string();
+                            editor.finish_topic(topic, crate::status::StatusKind::Info, "Saved".to_string());
                         }
                         Ok(file::SaveOutcome::Unchanged) => {
                             editor.active_mut().document.mark_saved(v);
-                            editor.status = "(unchanged)".to_string();
+                            editor.finish_topic(topic, crate::status::StatusKind::Info, "(unchanged)".to_string());
                         }
                         Err(e) => {
-                            // Buffer stays dirty; show error in status.
-                            editor.status = e.to_string();
+                            // Buffer stays dirty; surface the failure as a held Error (F4).
+                            editor.finish_topic(topic, crate::status::StatusKind::Error, e.to_string());
                         }
                     }
                 }
@@ -515,14 +520,14 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                 Scope::Sentence => match prose_sentence_at(editor, nav::head(editor)) {
                     Ok((from, to)) => { set_selection_range(editor, from, to); CommandResult::Handled }
                     Err(NonProse(role)) => {
-                        editor.status = format!("no sentence here ({})", block_kind_label(role));
+                        editor.set_status(crate::status::StatusKind::Info, format!("no sentence here ({})", block_kind_label(role)));
                         CommandResult::Noop
                     }
                 },
                 Scope::Section => match section_range_at(editor, nav::head(editor)) {
                     Some((from, to)) => { set_selection_range(editor, from, to); CommandResult::Handled }
                     None => {
-                        editor.status = "no section here".into();
+                        editor.set_status(crate::status::StatusKind::Info, "no section here");
                         CommandResult::Noop
                     }
                 },
@@ -638,6 +643,19 @@ mod tests {
     // -------------------------------------------------------------------------
     // Brief's required failing tests (RED → GREEN)
     // -------------------------------------------------------------------------
+
+    // A17 T8 — a keyboard edit routed via `commands::run` → `Editor::apply` delegator: no-op +
+    // "buffer is read-only" feedback.
+    #[test]
+    fn read_only_buffer_rejects_keyboard_edits_with_a_message() {
+        let mut e = Editor::new_from_text("abc\n", None, (40, 6));
+        e.active_mut().read_only = true;
+        let clk = TestClock(0);
+        let before = e.active().document.buffer.to_string();
+        run(Command::InsertChar('x'), &mut e, &clk);
+        assert_eq!(e.active().document.buffer.to_string(), before, "read-only: keyboard edit is a no-op");
+        assert_eq!(e.status_text(), "buffer is read-only");
+    }
 
     /// Typing 'b' between 'a' and 'c' inserts it and advances the caret.
     #[test]
@@ -1616,5 +1634,16 @@ mod tests {
         assert_eq!(e.active().document.buffer.to_string(), "hello\nnext\n", "byte-identical");
         assert_eq!(e.active().document.version, before, "no changeset applied");
         assert!(matches!(r, CommandResult::Noop));
+    }
+
+    /// A17 T5 (F4 Warning table): the legacy synchronous `Command::Save` arm's pathless
+    /// (unnamed-buffer) refusal is a Sticky Warning, not an ordinary Info echo.
+    #[test]
+    fn command_save_on_unnamed_buffer_is_a_sticky_warning() {
+        let mut e = Editor::new_from_text("x\n", None, (40, 10));
+        run(Command::Save, &mut e, &TestClock(0));
+        assert_eq!(e.status_text(), "No file name — use Save As");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
     }
 }
