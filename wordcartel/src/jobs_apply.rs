@@ -125,8 +125,11 @@ fn apply_panic(buffer_id: crate::editor::BufferId, version: u64, kind: crate::jo
                 editor.quit_drain = None;
                 editor.quit_drain_advance = false;
             }
-            editor.set_status_full(crate::status::StatusKind::Error, format!("save failed (internal error: {msg})"),
-                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+            // A panic is a failed Save completion: collapse the same Save(buffer_id, version) start
+            // this job posted (the merge never ran, but the "Saving…" progress entry is live). The
+            // `buffer_id`/`version` in hand reconstruct the identical topic key.
+            editor.finish_topic(crate::status::StatusTopic::Save(buffer_id, version),
+                crate::status::StatusKind::Error, format!("save failed (internal error: {msg})"));
         }
         JobKind::SwapWrite => {
             if let Some(b) = editor.by_id_mut(buffer_id) { b.swap_in_flight = false; }
@@ -222,10 +225,12 @@ pub(crate) fn apply_filter_done(
     let stale = editor.by_id(buffer_id).map(|b| b.document.version) != Some(version);
     match outcome {
         _ if stale => {
-            editor.set_status(crate::status::StatusKind::Info, "filter discarded - buffer changed");
+            editor.finish_topic(crate::status::StatusTopic::Filter, crate::status::StatusKind::Warning,
+                "filter discarded - buffer changed");
         }
         crate::filter::RunResult::Err(err) => {
-            editor.set_status(crate::status::StatusKind::Info, crate::filter::describe_error(&err));
+            editor.finish_topic(crate::status::StatusTopic::Filter, crate::status::StatusKind::Error,
+                crate::filter::describe_error(&err));
         }
         crate::filter::RunResult::Stdout(text) => {
             let apply_result = if let Some(b) = editor.by_id_mut(buffer_id) {
@@ -245,7 +250,8 @@ pub(crate) fn apply_filter_done(
             if apply_result {
                 crate::derive::rebuild(editor);
                 crate::nav::ensure_visible(editor);
-                editor.set_status(crate::status::StatusKind::Info, "filter applied");
+                editor.finish_topic(crate::status::StatusTopic::Filter, crate::status::StatusKind::Info,
+                    "filter applied");
             }
         }
     }
@@ -263,7 +269,8 @@ pub(crate) fn apply_transform_done(
     editor.transform_in_flight = false;
     let stale = editor.by_id(buffer_id).map(|b| b.document.version) != Some(version);
     if stale {
-        editor.set_status(crate::status::StatusKind::Info, "transform discarded — buffer changed");
+        editor.finish_topic(crate::status::StatusTopic::Transform, crate::status::StatusKind::Warning,
+            "transform discarded — buffer changed");
         return;
     }
     crate::transform::merge_transform_into(editor, buffer_id, kind, range, result, clock);

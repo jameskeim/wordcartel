@@ -230,7 +230,10 @@ pub fn dispatch_transform(
         let version = editor.active().document.version;
         let snapshot = editor.active().document.buffer.snapshot(); // O(1) rope snapshot
         editor.transform_in_flight = true;
-        editor.set_status(crate::status::StatusKind::Info, format!("{}…", kind.gerund()));
+        // Self-replacing Progress on the static Transform topic (the editor-wide
+        // `transform_in_flight` guarantees one at a time, so a static key is sound). The async
+        // completion in `apply_transform_done` / `merge_transform_into` collapses this start (§4.2).
+        editor.set_progress(crate::status::StatusTopic::Transform, format!("{}…", kind.gerund()));
         let range_c = range.clone();
         let msg_tx = msg_tx.clone();
         std::thread::spawn(move || {
@@ -263,9 +266,12 @@ pub fn merge_transform_into(
     result: Result<String, TransformError>,
     clock: &dyn wordcartel_core::history::Clock,
 ) {
+    // Every arm is a Transform completion: `finish_topic` collapses the async "{gerund}…" start
+    // (§4.2), or — on the sync path, which sets no progress start — simply appends the terminal.
     match result {
         Err(e) => {
-            editor.set_status(crate::status::StatusKind::Info, format!("transform failed: {e}"));
+            editor.finish_topic(crate::status::StatusTopic::Transform, crate::status::StatusKind::Error,
+                format!("transform failed: {e}"));
         }
         Ok(out) => {
             // Read the current bytes for the no-op check; borrow ends before apply.
@@ -273,7 +279,8 @@ pub fn merge_transform_into(
                 .map(|b| b.document.buffer.slice(range.clone()).to_string())
                 .unwrap_or_default();
             if out == current {
-                editor.set_status(crate::status::StatusKind::Info, format!("already {}", kind.past_tense()));
+                editor.finish_topic(crate::status::StatusTopic::Transform, crate::status::StatusKind::Info,
+                    format!("already {}", kind.past_tense()));
                 return;
             }
             let doc_len = editor.by_id(buffer_id).map(|b| b.document.buffer.len()).unwrap_or(0);
@@ -290,7 +297,8 @@ pub fn merge_transform_into(
                 crate::derive::rebuild(editor);
                 crate::nav::ensure_visible(editor);
             }
-            editor.set_status(crate::status::StatusKind::Info, kind.past_tense().to_string());
+            editor.finish_topic(crate::status::StatusTopic::Transform, crate::status::StatusKind::Info,
+                kind.past_tense().to_string());
         }
     }
 }

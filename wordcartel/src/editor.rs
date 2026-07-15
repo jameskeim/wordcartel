@@ -1217,6 +1217,55 @@ mod tests {
         e.clear_transient_status(); // simulates the next-key idiom
         assert!(e.has_visible_status(), "a Warning is not cleared by the next key");
     }
+
+    // ------------------------------------------------------------------
+    // A17 T6: StatusTopic progress soundness — an EXACT-MATCH topic key so a
+    // completion can only ever collapse ITS OWN lineage (Codex-r1 #2 + round-2).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn two_saves_of_same_buffer_different_version_collapse_independently() {
+        use crate::status::StatusTopic;
+        let mut e = Editor::new_from_text("x\n", None, (40, 6));
+        let b = e.active().id;
+        e.set_progress(StatusTopic::Save(b, 5), "Saving\u{2026}");
+        e.set_progress(StatusTopic::Save(b, 6), "Saving\u{2026}");
+        e.finish_topic(StatusTopic::Save(b, 5), crate::status::StatusKind::Info, "Saved v5");
+        // The v5 lineage collapsed; the v6 progress entry is untouched.
+        let h = e.status_history();
+        assert!(h.entries().iter().any(|s| s.text() == "Saved v5"));
+        assert!(h.entries().iter().any(|s| s.text() == "Saving\u{2026}"
+            && s.topic() == Some(StatusTopic::Save(b, 6))));
+    }
+
+    #[test]
+    fn filter_finish_does_not_collapse_a_save() {
+        use crate::status::StatusTopic;
+        let mut e = Editor::new_from_text("x\n", None, (40, 6));
+        let b = e.active().id;
+        e.set_progress(StatusTopic::Save(b, 1), "Saving\u{2026}");
+        e.finish_topic(StatusTopic::Filter, crate::status::StatusKind::Info, "filter applied");
+        assert!(e.status_history().entries().iter()
+            .any(|s| s.text() == "Saving\u{2026}" && s.topic() == Some(StatusTopic::Save(b, 1))));
+    }
+
+    #[test]
+    fn parse_recovery_clears_only_the_parse_warning() {
+        use crate::status::StatusTopic;
+        let mut e = Editor::new_from_text("x\n", None, (40, 6));
+        // (a) An unrelated held Error must SURVIVE a ParseDegraded clear.
+        e.set_status_full(crate::status::StatusKind::Error, "unrelated",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+        e.clear_topic(StatusTopic::ParseDegraded);
+        assert_eq!(e.status().unwrap().text(), "unrelated", "clear_topic touches ONLY its named topic");
+        // (b) A ParseDegraded warning IS cleared by its own topic.
+        let mut e2 = Editor::new_from_text("x\n", None, (40, 6));
+        e2.set_status_full(crate::status::StatusKind::Warning, "markdown parse failed \u{2014} styling may be stale",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, Some(StatusTopic::ParseDegraded));
+        e2.clear_topic(StatusTopic::ParseDegraded);
+        assert!(!e2.has_visible_status(), "the parse-degraded warning is retired by its recovery clear");
+    }
+
     use wordcartel_core::block_tree::Edit;
     use wordcartel_core::change::ChangeSet;
 

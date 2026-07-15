@@ -61,12 +61,16 @@ pub enum SaveMode { Normal, SaveAs }
 /// `perform_save_as` (SaveAs).
 pub(crate) fn do_save_to(ctx: &mut Ctx, target: std::path::PathBuf, mode: SaveMode) {
     // §3.9: status BEFORE dispatch. O(1) snapshot; version captured now.
-    ctx.editor.set_status(crate::status::StatusKind::Info, "Saving\u{2026}".to_string());
     let snap = ctx.editor.active().document.buffer.snapshot(); // O(1) ropey clone
     let v = ctx.editor.active().document.version;
     let buffer_id = ctx.editor.active().id;
     let prior_key = ctx.editor.active().document.path.clone(); // for SaveAs swap re-key
     let write_path = target.clone();
+    // Self-replacing Progress keyed on THIS (buffer, version): the completion below reconstructs the
+    // identical key from the captured `buffer_id`/`v` and collapses exactly this start (§4.2). A
+    // concurrent same-buffer save at a different version keeps its own lineage; a Filter/Transform
+    // finish can never collapse it (exact-match topic).
+    ctx.editor.set_progress(crate::status::StatusTopic::Save(buffer_id, v), "Saving\u{2026}");
 
     ctx.executor.dispatch(Job {
         buffer_id,
@@ -142,11 +146,14 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: std::path::PathBuf, mode: SaveMo
                             }
                         }
                     }
+                    // Reconstruct the IDENTICAL Save(buffer_id, v) topic captured at the start so
+                    // this completion collapses exactly its own "Saving…" lineage (§4.2). `buffer_id`
+                    // and `v` are the same values the JobResult carries as `r.buffer_id`/`r.version`.
+                    let topic = crate::status::StatusTopic::Save(buffer_id, v);
                     if is_save_error {
-                        editor.set_status_full(crate::status::StatusKind::Error, status,
-                            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+                        editor.finish_topic(topic, crate::status::StatusKind::Error, status);
                     } else {
-                        editor.set_status(crate::status::StatusKind::Info, status);
+                        editor.finish_topic(topic, crate::status::StatusKind::Info, status);
                     }
                     // Fire AFTER the by_id_mut block closes (never inside it — a live `b: &mut
                     // Buffer` borrow would conflict with fire_event's `&mut Editor`) and after

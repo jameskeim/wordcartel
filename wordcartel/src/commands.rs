@@ -459,20 +459,24 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                 }
                 Some(path) => {
                     let v = editor.active().document.version;
-                    editor.set_status(crate::status::StatusKind::Info, "Saving\u{2026}".to_string());
+                    let buffer_id = editor.active().id;
+                    // Progress keyed on THIS (buffer, version); the synchronous completions below
+                    // reconstruct the identical key and collapse this start in place (§4.2).
+                    let topic = crate::status::StatusTopic::Save(buffer_id, v);
+                    editor.set_progress(topic, "Saving\u{2026}");
                     let content = editor.active().document.buffer.to_string();
                     match file::save_atomic(&path, &content) {
                         Ok(file::SaveOutcome::Saved) => {
                             editor.active_mut().document.mark_saved(v);
-                            editor.set_status(crate::status::StatusKind::Info, "Saved".to_string());
+                            editor.finish_topic(topic, crate::status::StatusKind::Info, "Saved".to_string());
                         }
                         Ok(file::SaveOutcome::Unchanged) => {
                             editor.active_mut().document.mark_saved(v);
-                            editor.set_status(crate::status::StatusKind::Info, "(unchanged)".to_string());
+                            editor.finish_topic(topic, crate::status::StatusKind::Info, "(unchanged)".to_string());
                         }
                         Err(e) => {
-                            // Buffer stays dirty; show error in status.
-                            editor.set_status(crate::status::StatusKind::Info, e.to_string());
+                            // Buffer stays dirty; surface the failure as a held Error (F4).
+                            editor.finish_topic(topic, crate::status::StatusKind::Error, e.to_string());
                         }
                     }
                 }

@@ -140,7 +140,12 @@ impl StatusHistory {
     /// oldest when at `MESSAGES_HISTORY_CAP`.
     pub fn push(&mut self, msg: Status) {
         if let Some(last) = self.entries.back_mut() {
+            // Topic is part of the dedup key: two progress starts for DIFFERENT operations
+            // (e.g. `Save(buf, v5)` and `Save(buf, v6)`) share the "Saving…" text but must stay
+            // distinct history entries so each is collapsed by its own `finish_topic` — coalescing
+            // them would strand the second lineage's start (A17 T6 concurrency-soundness).
             if last.kind == msg.kind && last.text == msg.text && last.source == msg.source
+                && last.topic == msg.topic
                 && msg.seq.saturating_sub(last.seq) <= crate::limits::MESSAGES_DEDUP_WINDOW
             {
                 last.bump_repeat();

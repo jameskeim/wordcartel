@@ -357,7 +357,10 @@ pub fn dispatch_filter(
     let snapshot = b.document.buffer.snapshot();
     let cancel = CancelFlag::new();
     editor.filter_in_flight = Some(cancel.clone());
-    editor.set_status(crate::status::StatusKind::Info, format!("running {} ...", spec.argv.first().cloned().unwrap_or_default()));
+    // Self-replacing Progress on the static Filter topic (`filter_in_flight` guarantees one at a
+    // time). `apply_filter_done` collapses this start with its terminal completion (§4.2).
+    editor.set_progress(crate::status::StatusTopic::Filter,
+        format!("running {} ...", spec.argv.first().cloned().unwrap_or_default()));
     let disposition = spec.disposition.clone();
     let range_c = range.clone();
     std::thread::spawn(move || {
