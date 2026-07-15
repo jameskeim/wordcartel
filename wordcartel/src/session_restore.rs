@@ -84,7 +84,9 @@ pub fn restore_scratch(editor: &mut Editor, st: &crate::state::ScratchState) {
     let Some(idx) = editor.buffers.iter().position(|b| b.id == sid) else { return; };
     let area = editor.buffers[idx].view.area;
     let id = editor.alloc_id();
-    editor.buffers[idx] = crate::editor::Buffer::from_text(id, &st.text, None, area);
+    // A17 T8 category (b): route the wholesale swap through the single chokepoint. The scratch slot
+    // is never read-only, so this always succeeds; guarded for closure completeness.
+    if !editor.replace_buffer(idx, crate::editor::Buffer::from_text(id, &st.text, None, area)) { return; }
     editor.scratch_id = Some(id);
     // Update MRU id mapping (old scratch id → new).
     for m in editor.mru.iter_mut() { if *m == sid { *m = id; } }
@@ -110,7 +112,10 @@ pub fn open_into_current(editor: &mut Editor, path: &std::path::Path) {
     match crate::editor::Buffer::from_file(id, path, area) {
         Ok(b) => {
             let a = editor.active;
-            editor.buffers[a] = b;
+            // A17 T8 category (b): route through the single chokepoint. On a read-only buffer this
+            // no-ops + Sticky Warning and returns false — the MRU/rebuild/fire-event epilogue below
+            // is skipped and the user's read-only view is preserved.
+            if !editor.replace_buffer(a, b) { return; }
             // Keep MRU consistent: remove the ghost old id and put the new id at front.
             // Mirrors the close_buffer / restore_scratch patterns (workspace.rs, app.rs).
             editor.mru.retain(|&x| x != old_id);

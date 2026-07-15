@@ -340,6 +340,7 @@ pub fn dispatch_filter(
     spec: FilterSpec,
     msg_tx: std::sync::mpsc::Sender<crate::app::Msg>,
 ) {
+    if editor.active().read_only { editor.reject_read_only(); return; } // A17 T8: no work scheduled, no epilogue.
     if editor.filter_in_flight.is_some() {
         editor.set_status_full(crate::status::StatusKind::Warning, "a filter is already running",
             crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
@@ -391,6 +392,18 @@ fn truncate(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A17 T8 — driven through the real submit path (builds the spec, then calls `dispatch_filter`,
+    // whose read-only entry guard fires before scheduling) — avoids constructing a private FilterSpec.
+    #[test]
+    fn dispatch_filter_on_read_only_is_rejected() {
+        let mut e = crate::editor::Editor::new_from_text("hello\n", None, (40, 6));
+        e.active_mut().read_only = true;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::prompts::submit_filter_line(&mut e, "cat", &tx);
+        assert!(e.filter_in_flight.is_none(), "no filter scheduled on a read-only buffer");
+        assert_eq!(e.status_text(), "buffer is read-only");
+    }
 
     /// A17 T5 (F4 Warning table): the "a filter is already running" blocked-action refusal
     /// is a recoverable Sticky Warning.

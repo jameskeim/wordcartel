@@ -497,8 +497,10 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
         match crate::editor::Buffer::from_file(id, p, area) {
             Ok(b) => {
                 let was_new_file = b.document.path.is_some() && !p.exists();
-                editor.buffers[0] = b;
-                if was_new_file {
+                // A17 T8 category (b): route the launch install through the single chokepoint. Slot 0
+                // is the fresh writable scratch host, so this always succeeds; the `was_new_file`
+                // status only follows a successful install.
+                if editor.replace_buffer(0, b) && was_new_file {
                     // New file: empty buffer NAMED with the path; first save creates it.
                     editor.set_status(crate::status::StatusKind::Info, "new file".to_string());
                 }

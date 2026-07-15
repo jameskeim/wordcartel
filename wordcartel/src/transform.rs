@@ -211,6 +211,7 @@ pub fn dispatch_transform(
     clock: &dyn wordcartel_core::history::Clock,
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
 ) {
+    if editor.active().read_only { editor.reject_read_only(); return; } // A17 T8: no work scheduled, no epilogue.
     if editor.transform_in_flight {
         editor.set_status_full(crate::status::StatusKind::Warning, "a transform is already running",
             crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
@@ -348,6 +349,22 @@ pub fn run_transform(kind: TransformKind, input: &str, width: u32) -> Result<Str
 mod tests {
     use super::*;
     use crate::editor::Editor;
+
+    // A17 T8 — the TRUE dispatch point (not the menu opener) rejects on read-only, before any job is
+    // scheduled. `dispatch_transform` also backs the reflow/unwrap/ventilate registry commands.
+    #[test]
+    fn dispatch_transform_on_read_only_is_rejected() {
+        struct Z;
+        impl wordcartel_core::history::Clock for Z { fn now_ms(&self) -> u64 { 0 } }
+        let mut e = Editor::new_from_text("hello world\n", None, (40, 6));
+        e.active_mut().read_only = true;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let before = e.active().document.buffer.to_string();
+        dispatch_transform(&mut e, TransformKind::Reflow, None, &Z, &tx);
+        assert!(!e.transform_in_flight, "no transform scheduled on a read-only buffer");
+        assert_eq!(e.active().document.buffer.to_string(), before);
+        assert_eq!(e.status_text(), "buffer is read-only");
+    }
 
     fn blocks_of(text: &str) -> wordcartel_core::block_tree::BlockTree {
         Editor::new_from_text(text, None, (80, 24)).active().document.blocks().clone()

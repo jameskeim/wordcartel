@@ -185,6 +185,12 @@ pub struct Buffer {
     /// in `save.rs` (`Buffer { id, ..new_buf }`, reload/recovery) keep compiling — external
     /// (outside-crate) callers still have no access, matching the private-field house style.
     pub(crate) undo_evicted_pending: usize,
+    /// A17 T8: when `true`, this buffer's content is immutable. Set ONLY for the `view_messages`
+    /// history view (the ring is the source of truth). The read-only surface is closed by two
+    /// guarded categories: in-place content mutation (the `Buffer::{apply,undo,redo}` set below
+    /// early-return here) and whole-buffer replacement (`Editor::replace_buffer` refuses a
+    /// read-only slot). Default `false` at every construction.
+    pub read_only: bool,
 }
 
 impl Buffer {
@@ -243,6 +249,7 @@ impl Buffer {
             marked_block: None,
             pending_block_begin: None,
             undo_evicted_pending: 0,
+            read_only: false,
         }
     }
 
@@ -258,6 +265,7 @@ impl Buffer {
 
     /// Single mutation channel for THIS buffer's document (spec §10.1).
     pub fn apply(&mut self, txn: Transaction, edit: wordcartel_core::block_tree::Edit, kind: EditKind, clock: &dyn Clock) {
+        if self.read_only { return; }                    // A17 T8 category (a): content is immutable.
         let cs = txn.changes.clone();                    // capture BEFORE commit consumes txn
         let old_rope = self.document.buffer.snapshot();
         let before = self.document.selection.clone();
@@ -296,6 +304,7 @@ impl Buffer {
         crate::recovery::record_snapshot(self.document.path.as_deref(), self.document.buffer.snapshot());
     }
     pub fn undo(&mut self) -> bool {
+        if self.read_only { return false; }              // A17 T8 category (a): content is immutable.
         match self.document.history.undo(&mut self.document.buffer) {
             Some(sel) => {
                 self.document.selection = sel;
@@ -314,6 +323,7 @@ impl Buffer {
         }
     }
     pub fn redo(&mut self) -> bool {
+        if self.read_only { return false; }              // A17 T8 category (a): content is immutable.
         match self.document.history.redo(&mut self.document.buffer) {
             Some(sel) => {
                 self.document.selection = sel;
@@ -1072,12 +1082,42 @@ impl Editor {
     /// The browsable message ring (spec §5).
     #[inline] pub fn status_history(&self) -> &crate::status::StatusHistory { &self.status_history }
 
-    // Thin delegators — external callers unchanged.
+    // Thin delegators — external callers unchanged. A17 T8 FEEDBACK: the delegators own status
+    // access (the `Buffer` methods do not), so a read-only reject sets the Sticky Warning here and
+    // returns before delegating. Because the Warning is Sticky, Q1 suppresses any later success ack.
     pub fn apply(&mut self, txn: Transaction, edit: wordcartel_core::block_tree::Edit, kind: EditKind, clock: &dyn Clock) {
+        if self.active().read_only { self.reject_read_only(); return; }
         self.active_mut().apply(txn, edit, kind, clock);
     }
-    pub fn undo(&mut self) -> bool { self.active_mut().undo() }
-    pub fn redo(&mut self) -> bool { self.active_mut().redo() }
+    pub fn undo(&mut self) -> bool {
+        if self.active().read_only { self.reject_read_only(); return false; }
+        self.active_mut().undo()
+    }
+    pub fn redo(&mut self) -> bool {
+        if self.active().read_only { self.reject_read_only(); return false; }
+        self.active_mut().redo()
+    }
+
+    /// A17 T8: set the canonical "buffer is read-only" Sticky Warning. The single feedback point
+    /// shared by the `apply/undo/redo` delegators, `replace_buffer`, the search reporters, the
+    /// filter/transform entry guards, and the registry `mutates` guard.
+    pub(crate) fn reject_read_only(&mut self) {
+        self.set_status_full(crate::status::StatusKind::Warning, "buffer is read-only",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+    }
+
+    /// The ONE way to swap a whole `Buffer` into an existing slot (A17 T8 category (b)). If the
+    /// buffer CURRENTLY at `slot` is read-only, no-op + Sticky Warning and return `false`; else
+    /// replace and return `true`. Callers MUST check the bool and skip their post-replace
+    /// epilogue/ack on `false`.
+    pub fn replace_buffer(&mut self, slot: usize, new: Buffer) -> bool {
+        if self.buffers[slot].read_only {
+            self.reject_read_only();
+            return false;
+        }
+        self.buffers[slot] = new;
+        true
+    }
 
     // ------------------------------------------------------------------
     // Shared option setters (contract law 6 — single setter per user-settable option).
@@ -1272,6 +1312,42 @@ mod tests {
     struct TestClock(std::cell::Cell<u64>);
     impl wordcartel_core::history::Clock for TestClock {
         fn now_ms(&self) -> u64 { self.0.get() }
+    }
+
+    // ------------------------------------------------------------------
+    // A17 T8: read-only guard — category (a) content mutators + delegator feedback.
+    // ------------------------------------------------------------------
+
+    // CATEGORY (a): the closed `Buffer` content-mutator set no-ops on read-only.
+    #[test]
+    fn read_only_buffer_mutators_are_all_no_ops() {
+        let mut e = Editor::new_from_text("abc\n", None, (40, 6));
+        let clk = TestClock(std::cell::Cell::new(0));
+        // First make an undoable edit while writable, then flip read-only.
+        let doc_len = e.active().document.buffer.len();
+        e.active_mut().apply(Transaction::new(ChangeSet::insert(0, "Z", doc_len)),
+                             Edit { range: 0..0, new_len: 1 }, EditKind::Other, &clk);
+        let baseline = e.active().document.buffer.to_string(); // "Zabc\n"
+        e.active_mut().read_only = true;
+        // Buffer::apply
+        let dl = e.active().document.buffer.len();
+        e.active_mut().apply(Transaction::new(ChangeSet::insert(0, "X", dl)),
+                             Edit { range: 0..0, new_len: 1 }, EditKind::Other, &clk);
+        assert_eq!(e.active().document.buffer.to_string(), baseline, "Buffer::apply no-op on read-only");
+        // Buffer::undo / redo
+        assert!(!e.active_mut().undo(), "Buffer::undo no-op on read-only");
+        assert!(!e.active_mut().redo(), "Buffer::redo no-op on read-only");
+        assert_eq!(e.active().document.buffer.to_string(), baseline, "undo/redo did not change content");
+    }
+
+    // FEEDBACK: the Editor delegators (apply/undo/redo) set the Sticky Warning.
+    #[test]
+    fn read_only_delegators_set_the_sticky_warning() {
+        let mut e = Editor::new_from_text("abc\n", None, (40, 6));
+        e.active_mut().read_only = true;
+        e.undo(); // Editor::undo delegator
+        assert_eq!(e.status_text(), "buffer is read-only");
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
     }
 
     // ------------------------------------------------------------------

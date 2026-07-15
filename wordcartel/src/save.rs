@@ -274,7 +274,10 @@ pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
     editor.diag_providers.notify_close_all(id);
     // 5g: capture folds before replacement so we can carry them forward.
     let prev_folded = editor.active().folds.folded().clone();
-    *editor.active_mut() = crate::editor::Buffer { id, ..new_buf };
+    // A17 T8 category (b): route the wholesale swap through the single chokepoint. On a read-only
+    // buffer it no-ops + sets the Sticky Warning and returns false — the epilogue and the "Reloaded"
+    // ack below are skipped, so no false success is reported.
+    if !editor.replace_buffer(editor.active, crate::editor::Buffer { id, ..new_buf }) { return; }
     // 5g: carry folds across the reload and reconcile against the new tree.
     editor.active_mut().folds.replace_folded(prev_folded);
     // Clear any stale search/diag overlay — the buffer content has changed wholesale.
@@ -321,7 +324,8 @@ pub fn load_recovered(editor: &mut crate::editor::Editor, body: &str) {
     editor.diag_providers.notify_close_all(id);
     // 5g: capture folds before replacement so we can carry them forward.
     let prev_folded = editor.active().folds.folded().clone();
-    *editor.active_mut() = crate::editor::Buffer { id, ..new_buf };
+    // A17 T8 category (b): route through the single chokepoint (see reload_from_disk).
+    if !editor.replace_buffer(editor.active, crate::editor::Buffer { id, ..new_buf }) { return; }
     // 5g: carry folds across the recovery and reconcile against the new tree.
     editor.active_mut().folds.replace_folded(prev_folded);
     // Clear any stale search/diag overlay — the buffer content has changed wholesale.
@@ -358,6 +362,22 @@ mod tests {
     fn scratch() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("wcartel-bgsave-{}-{}.md",
             std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)))
+    }
+
+    // A17 T8 — CATEGORY (b): whole-buffer REPLACEMENT (reload) on a read-only buffer is refused,
+    // NOT replaced, and reports "buffer is read-only" — never a false "Reloaded".
+    #[test]
+    fn reload_on_read_only_buffer_is_refused_not_replaced() {
+        let path = scratch();
+        std::fs::write(&path, "disk contents\n").unwrap();
+        let mut e = Editor::new_from_text("buffer contents\n", Some(path.clone()), (80, 24));
+        let before = e.active().document.buffer.to_string();
+        e.active_mut().read_only = true;
+        crate::save::reload_from_disk(&mut e);
+        assert_eq!(e.active().document.buffer.to_string(), before, "read-only buffer NOT replaced by reload");
+        assert_eq!(e.status_text(), "buffer is read-only");
+        assert_ne!(e.status_text(), "Reloaded", "must NOT report a false Reloaded");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

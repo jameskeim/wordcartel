@@ -27,6 +27,7 @@ pub(crate) fn search_cancel(editor: &mut Editor) {
 type SearchReplacePlan = Option<(Vec<(usize, usize, String)>, usize, usize)>;
 
 pub(crate) fn search_replace_all(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
+    if editor.active().read_only { editor.reject_read_only(); return; } // A17 T8: no mutation, no false "Replaced N".
     search_sync(editor); // ensure cache is current
     // §8: invalid regex → distinct status, no mutation.
     if editor.search.as_ref().is_some_and(|s| s.error.is_some()) {
@@ -62,6 +63,7 @@ pub(crate) fn search_replace_all(editor: &mut Editor, clock: &dyn wordcartel_cor
 }
 
 pub(crate) fn search_step_apply(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
+    if editor.active().read_only { editor.reject_read_only(); return; } // A17 T8: no mutation, no false step ack.
     let plan = editor.search.as_ref().and_then(|s| {
         let m = s.matcher()?; let cur = s.current()?;
         let rope = editor.active().document.buffer.snapshot();
@@ -94,6 +96,7 @@ pub(crate) fn search_step_skip(editor: &mut Editor) {
 }
 
 pub(crate) fn search_step_rest(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
+    if editor.active().read_only { editor.reject_read_only(); return; } // A17 T8: no mutation, no false ack.
     // Replace current + all remaining (from current.start onward) as one unit.
     let plan = editor.search.as_ref().and_then(|s| {
         let m = s.matcher()?; let cur = s.current()?;
@@ -282,6 +285,20 @@ mod tests {
     use crate::editor::{Editor, RenderMode};
     use crate::test_support::TestClock;
     use wordcartel_core::diagnostics::{Diagnostic, DiagnosticKind, DiagSource, Suggestion};
+
+    // A17 T8 — the Codex-named FALSE-SUCCESS path: a replace-all on a read-only buffer is rejected
+    // with no mutation AND no "Replaced N".
+    #[test]
+    fn search_replace_all_on_read_only_is_rejected_not_falsely_reported() {
+        let mut e = Editor::new_from_text("aaa\n", None, (40, 6));
+        e.active_mut().read_only = true; // the entry guard fires before any search work
+        let clk = TestClock(0);
+        let before = e.active().document.buffer.to_string();
+        crate::search_ui::search_replace_all(&mut e, &clk);
+        assert_eq!(e.active().document.buffer.to_string(), before, "no mutation on read-only");
+        assert_eq!(e.status_text(), "buffer is read-only");
+        assert_ne!(e.status_text(), "Replaced 3 occurrences", "must NOT report false success");
+    }
 
     /// Opens a fresh single-suggestion `DiagOverlay` on `e`, selected on the "ignore once"
     /// row (`ignore == true`) or the "add to dictionary" row (`ignore == false`) — neither

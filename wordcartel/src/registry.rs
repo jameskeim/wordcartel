@@ -92,6 +92,12 @@ pub struct CommandMeta {
     /// opens a [`crate::minibuffer::MinibufferKind::PluginArg`] with this prompt (Task 5).
     /// `None` for every builtin (today) and every nullary plugin command.
     pub arg: Option<&'static str>,
+    /// A17 T8: `true` iff dispatching this command would mutate the active buffer's content OR run
+    /// a mutating epilogue (e.g. clearing `marked_block`) after a no-op'd edit. On a read-only
+    /// buffer, `dispatch_with_arg` refuses such a command before its handler runs — closing the
+    /// EPILOGUE residual. The set is defined mechanically by the completeness sweep test
+    /// (`no_registry_command_runs_a_mutating_epilogue_on_a_read_only_buffer`), NOT a hand-list.
+    pub mutates: bool,
 }
 
 // ── Registry ──────────────────────────────────────────────────────────────────
@@ -112,7 +118,17 @@ impl Registry {
         let cid = CommandId(id);
         self.index.insert(cid, self.entries.len());
         self.entries.push(CommandEntry { id: cid, handler: HandlerKind::Builtin(handler),
-            meta: CommandMeta { label, menu, state: None, arg: None } });
+            meta: CommandMeta { label, menu, state: None, arg: None, mutates: false } });
+    }
+
+    /// A17 T8: register a command that mutates the active buffer's content or runs a mutating
+    /// epilogue — `dispatch_with_arg` refuses it on a read-only buffer. Membership is driven by the
+    /// completeness sweep test, never a hand-list.
+    fn register_mut(&mut self, id: &'static str, label: &'static str, menu: Option<MenuCategory>, handler: Handler) {
+        let cid = CommandId(id);
+        self.index.insert(cid, self.entries.len());
+        self.entries.push(CommandEntry { id: cid, handler: HandlerKind::Builtin(handler),
+            meta: CommandMeta { label, menu, state: None, arg: None, mutates: true } });
     }
 
     fn register_stateful(&mut self, id: &'static str, label: &'static str, menu: Option<MenuCategory>,
@@ -120,7 +136,7 @@ impl Registry {
         let cid = CommandId(id);
         self.index.insert(cid, self.entries.len());
         self.entries.push(CommandEntry { id: cid, handler: HandlerKind::Builtin(handler),
-            meta: CommandMeta { label, menu, state: Some(state), arg: None } });
+            meta: CommandMeta { label, menu, state: Some(state), arg: None, mutates: false } });
     }
 
     /// Register a plugin command. Inputs are ALREADY interned `&'static` (the load layer capped
@@ -135,7 +151,7 @@ impl Registry {
         }
         self.index.insert(id, self.entries.len());
         self.entries.push(CommandEntry { id, handler: HandlerKind::Plugin,
-            meta: CommandMeta { label, menu, state: None, arg } });
+            meta: CommandMeta { label, menu, state: None, arg, mutates: false } });
         Ok(())
     }
 
@@ -402,28 +418,28 @@ impl Registry {
         // Marked block creation (Task 2 / Effort 9A).
         r.register("block_begin",               "Set Block Begin",         Some(MenuCategory::Block), |c| { crate::blocks_marked::block_begin(c.editor); CommandResult::Handled });
         r.register("block_end",                 "Set Block End",           Some(MenuCategory::Block), |c| { crate::blocks_marked::block_end(c.editor); CommandResult::Handled });
-        r.register("mark_block_from_selection", "Mark Block from Selection", Some(MenuCategory::Block), |c| { crate::blocks_marked::mark_block_from_selection(c.editor); CommandResult::Handled });
+        r.register_mut("mark_block_from_selection", "Mark Block from Selection", Some(MenuCategory::Block), |c| { crate::blocks_marked::mark_block_from_selection(c.editor); CommandResult::Handled });
         // Block → selection bridge (A11.3, Task 1.1 / command-surface curation).
         r.register("select_marked_block", "Select Block", Some(MenuCategory::Block),
             |c| { crate::blocks_marked::select_marked_block(c.editor); CommandResult::Handled });
         // Two-region swap (S4 Task 6): exchange Selection <-> MarkedBlock, one undo unit.
-        r.register("swap", "Swap Selection \u{21C4} Block", Some(MenuCategory::Block),
+        r.register_mut("swap", "Swap Selection \u{21C4} Block", Some(MenuCategory::Block),
             |c| crate::commands::prose_ops::swap(c.editor, c.clock));
 
         // Marked block operations (Task 3 / Effort 9A).
         r.register("block_copy",          "Copy Block",        Some(MenuCategory::Block), |c| { crate::blocks_marked::block_copy(c.editor, c.clock);   CommandResult::Handled });
-        r.register("block_move",          "Move Block",        Some(MenuCategory::Block), |c| { crate::blocks_marked::block_move(c.editor, c.clock);   CommandResult::Handled });
-        r.register("block_delete",        "Delete Block",      Some(MenuCategory::Block), |c| { crate::blocks_marked::block_delete(c.editor, c.clock); CommandResult::Handled });
+        r.register_mut("block_move",          "Move Block",        Some(MenuCategory::Block), |c| { crate::blocks_marked::block_move(c.editor, c.clock);   CommandResult::Handled });
+        r.register_mut("block_delete",        "Delete Block",      Some(MenuCategory::Block), |c| { crate::blocks_marked::block_delete(c.editor, c.clock); CommandResult::Handled });
         r.register("block_jump_begin",    "Jump to Block Begin", Some(MenuCategory::Block), |c| { crate::blocks_marked::block_jump_begin(c.editor);    CommandResult::Handled });
         r.register("block_jump_end",      "Jump to Block End",   Some(MenuCategory::Block), |c| { crate::blocks_marked::block_jump_end(c.editor);      CommandResult::Handled });
-        r.register("block_toggle_hidden", "Toggle Block Hidden", Some(MenuCategory::Block), |c| { crate::blocks_marked::block_toggle_hidden(c.editor); CommandResult::Handled });
-        r.register("block_clear",         "Clear Block",         Some(MenuCategory::Block), |c| { crate::blocks_marked::block_clear(c.editor);         CommandResult::Handled });
+        r.register_mut("block_toggle_hidden", "Toggle Block Hidden", Some(MenuCategory::Block), |c| { crate::blocks_marked::block_toggle_hidden(c.editor); CommandResult::Handled });
+        r.register_mut("block_clear",         "Clear Block",         Some(MenuCategory::Block), |c| { crate::blocks_marked::block_clear(c.editor);         CommandResult::Handled });
         // Marked block write-to-file (Task 4 / Effort 9A).
         r.register("block_write", "Write Block to File\u{2026}", Some(MenuCategory::Block), |c| { crate::blocks_marked::block_write(c.editor); CommandResult::Handled });
 
         // Effort 6: send-to-scratch verbs.
         r.register("copy_block_to_scratch", "Copy Block to Scratch", Some(MenuCategory::Block), |c| { crate::scratch::copy_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
-        r.register("move_block_to_scratch", "Move Block to Scratch", Some(MenuCategory::Block), |c| { crate::scratch::move_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
+        r.register_mut("move_block_to_scratch", "Move Block to Scratch", Some(MenuCategory::Block), |c| { crate::scratch::move_block_to_scratch(c.editor, c.clock); CommandResult::Handled });
 
         // Effort 6: workspace navigation. next_buffer/prev_buffer/switch_buffer are
         // palette-only (menu: None) as of Task 4.2 — the Documents dynamic menu's direct
@@ -431,6 +447,7 @@ impl Registry {
         // registered-command status, palette listing, and keymap chords.
         r.register("next_buffer", "Next Buffer", None, |c| { crate::workspace::next_buffer(c.editor); CommandResult::Handled });
         r.register("prev_buffer", "Previous Buffer", None, |c| { crate::workspace::prev_buffer(c.editor); CommandResult::Handled });
+        r.register("view_messages", "Message History", Some(MenuCategory::View), |c| { crate::status_view::open(c.editor); CommandResult::Handled });
         r.register("goto_scratch", "Go to Scratch Buffer", Some(MenuCategory::View), |c| { crate::workspace::goto_scratch(c.editor); CommandResult::Handled });
         r.register("toggle_scratch", "Toggle Scratch Buffer", Some(MenuCategory::View), |c| { crate::workspace::toggle_scratch(c.editor); CommandResult::Handled });
         r.register("switch_buffer", "Switch Buffer\u{2026}", None, |c| { c.editor.open_buffer_switcher(); CommandResult::Handled });
@@ -821,7 +838,15 @@ impl Registry {
     /// 4. Nullary plugin command, no arg → enqueue nullary (today's behavior).
     pub fn dispatch_with_arg(&self, id: CommandId, ctx: &mut Ctx, arg: Option<String>) -> CommandResult {
         match self.index.get(&id) {
-            Some(&i) => match &self.entries[i].handler {
+            Some(&i) => {
+                // A17 T8 EPILOGUE residual: refuse a mutating command on a read-only buffer BEFORE
+                // its handler runs, so no mutating epilogue (e.g. clearing `marked_block`) fires.
+                // Content + status are already covered by categories (a)/(b) + the delegators.
+                if self.entries[i].meta.mutates && ctx.editor.active().read_only {
+                    ctx.editor.reject_read_only();
+                    return CommandResult::Noop;
+                }
+                match &self.entries[i].handler {
                 HandlerKind::Builtin(h) => { let _ = arg; h(ctx) }
                 HandlerKind::Plugin => {
                     match (self.entries[i].meta.arg, arg) {
@@ -835,6 +860,7 @@ impl Registry {
                             crate::plugin::PluginCall { id, arg: None }),
                     }
                     CommandResult::Handled
+                }
                 }
             },
             None => {
@@ -1924,6 +1950,65 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut ctx = Ctx { editor: ed, clock: &clk, executor: &ex, msg_tx: tx };
         reg.dispatch(CommandId(id), &mut ctx);
+    }
+
+    // A17 T8 — the EPILOGUE residual: `block_move` must NOT clear `marked_block` on a read-only
+    // buffer (content + status are already covered by categories (a)/(b) + the delegators; this
+    // forces `block_move` into the `register_mut` set via the dispatch guard).
+    #[test]
+    fn block_move_on_read_only_leaves_marked_block_and_content_intact() {
+        let mut e = Editor::new_from_text("one two three\n", None, (40, 6));
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 3, hidden: false });
+        e.active_mut().read_only = true;
+        let before = e.active().document.buffer.to_string();
+        let mark_before = e.active().marked_block;
+        dispatch_id(&mut e, "block_move"); // the dispatch mutates-guard fires before the handler
+        assert_eq!(e.active().document.buffer.to_string(), before, "read-only: no content change");
+        assert_eq!(e.active().marked_block, mark_before, "read-only: marked_block NOT cleared (no epilogue)");
+        assert_eq!(e.status_text(), "buffer is read-only");
+        assert_ne!(e.status_text(), "block moved", "must NOT report false success");
+    }
+
+    // A17 T8 — MECHANICAL completeness sweep: the source of truth for the `register_mut` set.
+    // Content-unchanged is universal by categories (a)+(b); the load-bearing assertion is
+    // `marked_block`-unchanged, which fails for any registry handler that runs a mutating epilogue
+    // on the read-only buffer — forcing its `register_mut` (or an entry guard) until green.
+    //
+    // We track the read-only buffer BY ID, not via `e.active()`: a command that legitimately
+    // SWITCHES the active buffer (`new`/`goto_scratch`/`next_buffer`/…) or disposes this view
+    // leaves the read-only buffer's own content+mark intact (or gone) and is NOT a mutation of it —
+    // only a mutating epilogue ON this buffer clears its `marked_block` and fails. (Checking
+    // `e.active()` would conflate a benign buffer-switch with a mutation and wrongly demand marking
+    // every switch command `mutates`, trapping the user in the read-only view.)
+    #[test]
+    fn no_registry_command_runs_a_mutating_epilogue_on_a_read_only_buffer() {
+        let reg = Registry::builtins();
+        let ids: Vec<_> = reg.commands().map(|(id, _)| id).collect();
+        let mut violations = Vec::new();
+        for id in ids {
+            // `view_messages` IS the regeneration seam for the read-only view — the one sanctioned
+            // content-replacer (a regenerable projection of the ring, never user data; the same
+            // principled exclusion as buffer disposal). It must run to regenerate, so it is not a
+            // `mutates` command; exclude it from the sweep.
+            if id.0 == "view_messages" { continue; }
+            let mut e = Editor::new_from_text("one two three\n", None, (40, 6));
+            e.install_scratch(); // so scratch-move epilogues (which early-return without a scratch buffer) execute
+            // A realistic pre-edit state that exercises the mutating paths: a NON-EMPTY selection
+            // "one" [0,3) (head 3, so `swap` and selection-driven surgery run) and a marked block
+            // "three" [8,13) that does NOT contain the caret (so `block_move`'s move path — not its
+            // "can't move into itself" early-return — executes). Both are non-overlapping.
+            e.active_mut().document.selection = wordcartel_core::selection::Selection::range(0, 3);
+            e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 8, end: 13, hidden: false });
+            e.active_mut().read_only = true;
+            let view_id = e.active().id;
+            let (content, mark) = (e.active().document.buffer.to_string(), e.active().marked_block);
+            dispatch_id(&mut e, id.0);
+            if let Some(b) = e.buffers.iter().find(|b| b.id == view_id) {
+                if b.document.buffer.to_string() != content { violations.push(format!("{} mutated content", id.0)); }
+                if b.marked_block != mark { violations.push(format!("{} ran a mutating epilogue (marked_block)", id.0)); }
+            }
+        }
+        assert!(violations.is_empty(), "read-only guard incomplete: {violations:?}");
     }
 
     #[test]

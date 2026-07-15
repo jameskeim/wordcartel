@@ -644,6 +644,19 @@ mod tests {
     // Brief's required failing tests (RED → GREEN)
     // -------------------------------------------------------------------------
 
+    // A17 T8 — a keyboard edit routed via `commands::run` → `Editor::apply` delegator: no-op +
+    // "buffer is read-only" feedback.
+    #[test]
+    fn read_only_buffer_rejects_keyboard_edits_with_a_message() {
+        let mut e = Editor::new_from_text("abc\n", None, (40, 6));
+        e.active_mut().read_only = true;
+        let clk = TestClock(0);
+        let before = e.active().document.buffer.to_string();
+        run(Command::InsertChar('x'), &mut e, &clk);
+        assert_eq!(e.active().document.buffer.to_string(), before, "read-only: keyboard edit is a no-op");
+        assert_eq!(e.status_text(), "buffer is read-only");
+    }
+
     /// Typing 'b' between 'a' and 'c' inserts it and advances the caret.
     #[test]
     fn insert_char_types_and_advances() {
