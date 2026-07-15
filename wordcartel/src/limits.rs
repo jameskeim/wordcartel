@@ -68,6 +68,12 @@ pub const PLUGIN_MAX_EVENT_PAYLOAD: usize = 4096;
 /// safe). Deliberately reuses `PLUGIN_MAX_STATUS_LEN` so plugin `wc.status` and host messages share
 /// one bound; T11 asserts this identity holds (a divergence would be a silent behavior change).
 pub const MESSAGES_MAX_TEXT_LEN: usize = PLUGIN_MAX_STATUS_LEN;
+/// A17 — max entries kept in the `StatusHistory` ring (M5 resource-cap ethos: fixed capacity,
+/// oldest evicted, no growth at rest).
+pub const MESSAGES_HISTORY_CAP: usize = 256;
+/// A17 — max `seq` gap between two otherwise-identical adjacent messages for them to still
+/// coalesce via `repeat` (spec §5.2). `1` means only a truly back-to-back repeat coalesces.
+pub const MESSAGES_DEDUP_WINDOW: u64 = 1;
 
 /// Max byte length of a `wc.command(name)` target — the longest possible registered id
 /// (`<stem>.<name>`), so this cap can never reject a resolvable name (§5a).
