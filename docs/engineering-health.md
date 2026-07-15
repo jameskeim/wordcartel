@@ -78,7 +78,7 @@ table is the model a unified version would follow.
 <!-- item: H13 -->
 
 **Grounded (rust-analyzer documentSymbol + field grep, 2026-07-10; from the state-hub map).** `struct Editor`
-(`wordcartel/src/editor.rs:368`) carries **58 fields** — the whole app's mutable state on one struct. This is a
+(`wordcartel/src/editor.rs:368`) carries **75 fields** (was 58 at first grounding) — the whole app's mutable state on one struct. This is a
 *data* god-object, NOT the *dispatch* god-object class H1 targets: there is no growing `match`/loop here (editor.rs
 is struct definitions + accessors/small mutators), so it is **outside the anti-regrowth GATEs** (`too_many_lines`,
 `module_budgets`) and is **not a defect** — filed as `watch`, not `triage`. The field count is genuine app-state
@@ -96,6 +96,27 @@ per the Module-structure rule). Note the 10 overlay `Option<T>` fields (`prompt`
 deliberate flat XOR set enforced by the `open_*` family, not a clustering candidate. Anchor: `editor.rs:368` (the
 struct), `:493` (the impl), the `open_*` overlay family + shared setters.
 
+**AUDIT 2026-07-14 (ad-hoc-surface sweep) — reframe.** A dedicated census + scored sub-agent audit tested the
+temptation to read H13 as "one god-object = the sum of several ad-hoc surfaces." It does **not** hold. Of the 75
+fields, only ~12 are real ad-hoc debt: the `status` field (untyped messaging → **A17**) and the 11 overlay `Option<T>`
+fields — but the overlays are debt on the **dispatch** axis, not the data axis. H13's note above is right that they
+stay a **flat XOR set** (do not wrap them in a sub-struct); what is ad-hoc is their **routing** (`has_active_input_overlay`
++ the hand-parallel `if/else-if` re-written across render/mouse/app/registry/render_overlays), filed separately as
+**H21** (OverlayId + OVERLAYS table). The remaining ~46 fields are legitimately distinct single-purpose state —
+healthy, not debt; after A17 and H21 land, Editor's residual size is expected field-count, not remaining debt to chase.
+- **PendingActions peel, refined:** of the `pending_*` cluster the audit found only the **4 prompt-payload** fields
+  (`pending_save_as`, `pending_save_overwrite`, `pending_write_block`, `pending_export`) share a shape, and they
+  already dispatch through the exhaustive `PromptAction` match in `prompts.rs`. The sole residual DRY nit is the two
+  field-clear blocks that must stay in sync → collapse to one `Option<PromptPayload>` if a refactor touches this. The
+  other `pending_*` are unrelated axes (async-job continuations, `quit_drain` queue, `pending_mark` chord state,
+  `scratch_return` pointer) — a naming **rhyme**, not a shared abstraction. Do **not** build a general `PendingAction` enum.
+- **Investigated and ruled NOT ad-hoc debt (so they are not re-triaged from raw census counts later):** the view-lens
+  display toggles (`RenderMode`/`toggle_focus`/`measure`/scrollbar/status-line/menu-bar) — already seamed by the
+  command-surface-contract's law-6 shared setter, genuine distinct side effects, a naming rhyme not duplication
+  (the pattern to **imitate**, cf. E8); and the high-write census buckets (`mode`=78, `theme`=34, `scroll`=27, …) —
+  each a typed enum or an already-seamed subsystem (`diag_provider.rs`'s `ProviderSet` is itself a model to imitate).
+  No hidden fifth surface exists.
+
 ## Newly-tracked items (stubs)
 
 *(Auto-created during the backlog-manifest migration. Status/size/kind live in `backlog.toml`; flesh out the triage prose here when the item is picked up.)*
@@ -104,3 +125,33 @@ struct), `:493` (the impl), the `open_*` overlay family + shared setters.
 <!-- item: M9 -->
 
 M4-rest only ISOLATES its parse panic; a real upgrade is optional, low priority.
+
+## H21 — Input-overlay dispatch table (OverlayId enum + OVERLAYS fn-ptr seam)
+<!-- item: H21 -->
+
+**Confirmed by the 2026-07-14 ad-hoc-surface audit — the structural twin of A17.** Eleven sibling overlay `Option<T>`
+fields (`search`, `minibuffer`, `palette`, `outline`, `theme_picker`, `file_browser`, `menu`, `prompt`, `splash`,
+`diag`, `cursor_picker`) whose *routing* — is-active, key, mouse, render — is written **eleven ways by hand**:
+`editor.rs::has_active_input_overlay` enumerates all 11 `.is_some()` checks, and the same 11-way `if/else-if` shape is
+re-written in `render.rs`, `mouse.rs`, `app.rs`, `registry.rs`, and `render_overlays.rs`. Adding a 12th overlay today
+touches ~6 files, and nothing is compiler-enforced: an overlay omitted from one chain (e.g. `has_active_input_overlay`)
+means keystrokes leak to the buffer or clicks pass through while the modal is visibly up — a **silent-UI/correctness**
+class, not data-loss.
+
+**This is the DISPATCH axis, not the data axis.** The fields correctly stay a flat XOR set (see H13 — do **not** wrap
+them in a sub-struct). What wants a seam is the routing. Sketch, mirroring `timers.rs`'s `SUBSYSTEMS` table:
+```
+enum OverlayId { Search, Minibuffer, Palette, Outline, ThemePicker, FileBrowser, Menu, Prompt, Splash, Diag, CursorPicker }
+static OVERLAYS: &[OverlayRow] = &[ /* { id, is_active(&Editor)->bool, render, handle_key, handle_mouse } … */ ];
+```
+`has_active_input_overlay` becomes `OVERLAYS.iter().any(|o| (o.is_active)(self))`; the render/mouse/app `if/else-if`
+chains become one loop over the table. Each overlay's own state struct and behaviour stay untouched — this unifies
+**only** the which-one-is-active / route-input-click-render plumbing, which is the real repeated abstraction; the
+per-overlay internals are a legitimate rhyme that stays separate.
+
+**Priority signals:** STRONGEST Effort-P plugin pressure of any surface the audit scored (5/5) — a plugin-provided
+panel/picker is exactly a 12th `OverlayId`; without this table a plugin overlay cannot participate in
+is-active/key/click routing without editing core `editor.rs`/`mouse.rs`/`app.rs`, defeating the plugin boundary. So
+land it **before** Effort P's overlay/panel work rather than retrofitting. **UNGATED** — it is pure input/UI plumbing,
+unrelated to prose lenses; it is *not* E8 (view lenses) and *not* gated on the S6 kill-gate. Second item in the
+"unify ad-hoc surfaces" arc (A17 first — ungated, higher-scored, de-risks the typed-enum + one-setter + sweep pattern).
