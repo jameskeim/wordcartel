@@ -298,8 +298,10 @@ mod tests {
 
     #[test]
     fn empty_slot_always_takes() {
+        // floor must be Log here — a Log message under an Info floor is below-floor
+        // (history-only per spec §4.1), which the `below_floor_*` test covers separately.
         let cand = s(StatusKind::Log);
-        assert_eq!(resolve_slot(None, &cand, StatusKind::Info), SlotOutcome::Take);
+        assert_eq!(resolve_slot(None, &cand, StatusKind::Log), SlotOutcome::Take);
     }
 
     #[test]
