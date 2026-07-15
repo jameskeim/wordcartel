@@ -155,3 +155,27 @@ is-active/key/click routing without editing core `editor.rs`/`mouse.rs`/`app.rs`
 land it **before** Effort P's overlay/panel work rather than retrofitting. **UNGATED** — it is pure input/UI plumbing,
 unrelated to prose lenses; it is *not* E8 (view lenses) and *not* gated on the S6 kill-gate. Second item in the
 "unify ad-hoc surfaces" arc (A17 first — ungated, higher-scored, de-risks the typed-enum + one-setter + sweep pattern).
+
+## H22 — Universal edit chokepoint (route all internal edits through submit_transaction)
+<!-- item: H22 -->
+
+**Surfaced by A17's read-only-guard work (2026-07-15).** A truly universal single function that ALL internal
+edits route through — including the direct `Buffer::apply` calls in `search_ui`/`jobs_apply`/`transform` — i.e.
+making **`submit_transaction`** (the M2 untrusted-edit boundary) the one funnel everything uses. That's
+genuinely valuable: it would localize versioning, swap-scheduling, reconcile-triggering, the read-only guard,
+**and** the Effort-P plugin-edit seam in one place, and it rhymes with the "unify ad-hoc surfaces" arc
+(A17/H21). But it is a real mutation-architecture refactor and deserves its own effort, **not** a
+mid-A17 expansion.
+
+**Why it came up:** A17 needed to make the `view_messages` history buffer non-editable, and the read-only
+guard kept surfacing new mutation paths across six plan-gate rounds — because this codebase has **no single
+mutation chokepoint**. The mutation surface decomposes into two closed categories: (1) *content* mutation of
+an existing buffer, already closed at `Buffer::{apply, undo, redo}` (the private `document.buffer` is written
+only by those three); and (2) whole-*buffer* replacement, at ~3 `Editor`-slot sites (`save::reload_from_disk`,
+`save::load_recovered`, `session_restore::open_into_current`) that swap the entire `Buffer` and so bypass the
+content methods. A17 handles both *locally* — it guards the closed content set and adds a small
+`Editor::replace_buffer` chokepoint for the replacement sites — which is complete for A17's needs. H22 is the
+larger move: collapse the *internal direct-`apply` callers* (which currently bypass `submit_transaction`, the
+M2 boundary) onto one funnel too, so that versioning/swap/reconcile/read-only/plugin-edit bookkeeping all live
+at a single seam rather than being re-implemented per call site. Likely **L**; a natural companion to the
+A17/H21 unification arc and to any Effort-P edit-surface hardening.
