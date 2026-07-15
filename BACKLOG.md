@@ -3,7 +3,7 @@
 
 # Backlog
 
-**38 open · 55 shipped · 2 dropped**
+**37 open · 56 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -21,7 +21,6 @@ Blocking Effort P: **0**
 | B6 | Heading-glyph STYLE toggle | needs-design | feature | SM |  | Cycle shades / Nerd numerals / inverted numerals; default stays universal Shades. |
 | PD | wc.async — one-shot subprocess primitive (formatters / vale-CLI); closed op-menu + AsyncDone pump-drain | needs-design | feature | SM |  | wc.async — the deferred one-shot subprocess primitive (linter-arc effort d, but INDEPENDENT of the linter spine): a CLOSED Rust op-menu (wc.async{op,args,on_done}) + Msg::AsyncDone pump-drain + resource/security caps, with a formatter (prettier/fmt) or vale-CLI driver. The !Send constraint forces the closed-primitive shape (P3 F1-option-A). Depends ONLY on the shipped plugin system. Design: docs/design/prose-linters-design-space.md §2/§6 + effort-p3-grounding.md. |
 | S3 | Snapshots — durable revision checkpoints | needs-design | feature | SM |  | Capture/list/diff/restore; reuses rope snapshot + ChangeSet; one net-new display diff. |
-| A17 | Messaging / notification system — routed, browsable, plugin-emittable | needs-design | feature | M |  | One routed path for all user messages: typed kinds/severity, browsable history, plugin emit API. noice.nvim = the anti-pattern (override-on-top) — we register into a seam. AUDIT 2026-07-14 (ad-hoc-surface sweep): CONFIRMED the top surface — 203 verified `.status =` writes, ZERO severity typing; last-writer-wins on a flat String (an error is silently clobbered by a later progress/transient message). Seam: enum StatusKind{Error,Progress,Transient,Prompt} + Status{kind,text,ttl} + one set_status() writer, ~203-site mechanical sweep (timers.rs SUBSYSTEMS pattern). UNGATED, highest-scored — sequence FIRST in the two-item 'unify ad-hoc surfaces' arc (twin = H21 overlay-dispatch table); de-risks the typed-enum+one-setter+sweep pattern. Effort-P plugins emit into it. |
 | E10 | Multi-engine linting (b) — ltex-ls-plus / LanguageTool provider + JVM lifecycle | needs-design | feature | M |  | Multi-engine linting effort (b): the ltex-ls-plus / LanguageTool provider + its JVM lifecycle — lazy-spawn on Review, Starting/'warming ltex…' status (no-silent-UI), idle-shutdown, never block the hot path. Reuses lsp_rpc.rs + the harper_ls.rs template; the ~300MB JVM 30s–2min warm-up is the only genuinely new risk. Builds on the SHIPPED diagnostics spine (harper-ls + selector); may need to finish the Vec/registry provider-seam generalization. Design: docs/design/prose-linters-design-space.md §6. |
 | E11 | Multi-engine linting (c) — diagnostics viewing/action delta (href, detail region, dict/rule writers, executeCommand) | needs-design | feature | M |  | Multi-engine linting effort (c): the diagnostics VIEWING/ACTION delta — per-diagnostic 'learn more'/href + a detail region on DiagOverlay; per-engine (non-harper) dictionary/rule writers; the executeCommand relay; more-suggestions population. Consumes the SHIPPED-BUT-UNUSED Diagnostic.code/href fields. Parallelizable with E10. Design: docs/design/prose-linters-design-space.md §1/§6. |
 | E12 | Multi-engine linting (e) — plugin-declared LSP servers + plugin-contributed engine-menu rows | needs-design | feature | M |  | Multi-engine linting effort (e), LAST/optional: plugins declare an LSP server + contribute dynamic engine-menu rows (MenuRowAction::Plugin widening). Only if plugin-authored engines materialize. Needs wc.async (PD) + the shipped spine + the deferred plugin-dynamic-menu-section effort. Design: docs/design/prose-linters-design-space.md §5/§6. |
@@ -52,10 +51,11 @@ Blocking Effort P: **0**
 
 ## Shipped
 
-<details><summary>55 shipped</summary>
+<details><summary>56 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
+| A17 | Messaging / notification system — routed, browsable, plugin-emittable | 2026-07-15 | 2efc9fe |
 | B11 | Modal/overlay caret parked under the modal (query field shows no caret) | 2026-07-14 | c740ba4 |
 | B8 | Writing caret — DECSCUSR shape/blink config + cursor picker + panic-safe restore | 2026-07-14 | c740ba4 |
 | S4 | Prose text objects — structural selection + operator layer | 2026-07-14 | 10b847e |

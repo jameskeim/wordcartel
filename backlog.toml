@@ -933,13 +933,15 @@ created = "2026-07-15"
 [[item]]
 id = "A17"
 title = "Messaging / notification system — routed, browsable, plugin-emittable"
-status = "needs-design"
+status = "shipped"
 kind = "feature"
 size = "M"
 theme = "A"
 hook = "One routed path for all user messages: typed kinds/severity, browsable history, plugin emit API. noice.nvim = the anti-pattern (override-on-top) — we register into a seam. AUDIT 2026-07-14 (ad-hoc-surface sweep): CONFIRMED the top surface — 203 verified `.status =` writes, ZERO severity typing; last-writer-wins on a flat String (an error is silently clobbered by a later progress/transient message). Seam: enum StatusKind{Error,Progress,Transient,Prompt} + Status{kind,text,ttl} + one set_status() writer, ~203-site mechanical sweep (timers.rs SUBSYSTEMS pattern). UNGATED, highest-scored — sequence FIRST in the two-item 'unify ad-hoc surfaces' arc (twin = H21 overlay-dispatch table); de-risks the typed-enum+one-setter+sweep pattern. Effort-P plugins emit into it."
-doc = "ux-backlog.md#a17"
+doc = "backlog-archive.md#a17"
 created = "2026-07-11"
+shipped_commit = "2efc9fe"
+shipped_date = "2026-07-15"
 
 [[item]]
 id = "S4"
