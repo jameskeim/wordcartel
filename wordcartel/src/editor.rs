@@ -983,7 +983,8 @@ impl Editor {
     pub fn surface_undo_eviction(&mut self) {
         if self.active().undo_evicted_pending > 0 {
             self.active_mut().undo_evicted_pending = 0;
-            self.set_status(crate::status::StatusKind::Info, UNDO_EVICTED_HINT);
+            self.set_status_full(crate::status::StatusKind::Warning, UNDO_EVICTED_HINT,
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         }
     }
 
@@ -1203,6 +1204,18 @@ mod tests {
         e.clear_transient_status();
         assert!(!e.has_visible_status());
         assert_eq!(e.status_history().entries().len(), 1);
+    }
+
+    /// A17 T5 (F4 Warning table, brief's lifetime-behavior test): a Warning is Sticky —
+    /// `clear_transient_status` (the next-key idiom) must NOT clear it. Confirms the
+    /// underlying plumbing every T5 site conversion relies on.
+    #[test]
+    fn a_warning_holds_through_a_keypress_clear() {
+        let mut e = Editor::new_from_text("x\n", None, (40, 6));
+        e.set_status_full(crate::status::StatusKind::Warning, "w", crate::status::StatusLifetime::Sticky,
+                          crate::status::StatusSource::Host, None);
+        e.clear_transient_status(); // simulates the next-key idiom
+        assert!(e.has_visible_status(), "a Warning is not cleared by the next key");
     }
     use wordcartel_core::block_tree::Edit;
     use wordcartel_core::change::ChangeSet;
@@ -1723,9 +1736,15 @@ mod tests {
         assert!(e.active().undo_evicted_pending > 0, "precondition: a real eviction landed");
         e.surface_undo_eviction();
         assert_eq!(e.status_text(), UNDO_EVICTED_HINT);
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning,
+            "A17 T5: the eviction hint is a Warning");
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky,
+            "A17 T5: the eviction hint is Sticky (holds until dismissed)");
         assert_eq!(e.active().undo_evicted_pending, 0, "consumed");
-        // No re-fire without a fresh arm:
-        e.clear_transient_status();
+        // No re-fire without a fresh arm. A17 T5: the hint is now Sticky, so
+        // `clear_transient_status()` (the next-key idiom) would NOT clear it — dismiss it
+        // explicitly to isolate this assertion from the earlier surfacing.
+        e.dismiss_status();
         e.surface_undo_eviction();
         assert_ne!(e.status_text(), UNDO_EVICTED_HINT, "no re-fire after consumption");
     }
@@ -1803,7 +1822,9 @@ mod tests {
         assert_eq!(e.active().undo_evicted_pending, 0, "undo must not arm the flag");
         e.redo();
         assert_eq!(e.active().undo_evicted_pending, 0, "redo must not arm the flag");
-        e.clear_transient_status();
+        // A17 T5: the hint is now Sticky — dismiss (not clear_transient) the earlier surfacing
+        // before checking that undo/redo alone never re-surfaces it.
+        e.dismiss_status();
         e.surface_undo_eviction();
         assert_ne!(e.status_text(), UNDO_EVICTED_HINT, "undo/redo alone must never surface the hint");
     }

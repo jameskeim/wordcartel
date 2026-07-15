@@ -362,7 +362,8 @@ fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rec
                 if editor.outline.as_ref().map(|o| o.opened_version)
                     != Some(editor.active().document.version)
                 {
-                    editor.set_status(crate::status::StatusKind::Info, "document changed; outline closed");
+                    editor.set_status_full(crate::status::StatusKind::Warning, "document changed; outline closed",
+                        crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
                     editor.outline = None;
                     return;
                 }

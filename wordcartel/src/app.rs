@@ -691,7 +691,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     warns.append(&mut kw);
     editor.keymap = built_keymap;
     if let Some(w) = warns.first() {
-        editor.set_status(crate::status::StatusKind::Info, w.clone());
+        editor.set_status_full(crate::status::StatusKind::Warning, w.clone(),
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
     }
     // Take the keymap out of editor into a loop-local to avoid a simultaneous
     // &mut editor / &editor.keymap borrow conflict when calling reduce.
@@ -1298,6 +1299,12 @@ mod tests {
         crate::app::reduce(Msg::ClipboardAvailability(false), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert!(e.status_text().to_lowercase().contains("clipboard"));
         assert!(e.clipboard_notice_shown);
+        // A17 T5 (F4 Warning table): the notice is now a Sticky Warning — dismiss it (the user
+        // action that would ordinarily clear it) before simulating unrelated typing activity,
+        // since a plain Info cannot displace a held Warning (Q1).
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        e.dismiss_status();
         e.set_status(crate::status::StatusKind::Info, "typing");
         crate::app::reduce(Msg::ClipboardAvailability(false), &mut e, &reg, &cua_keymap(), &ex, &clk, &tx);
         assert_eq!(e.status_text(), "typing", "notice shown only once");
@@ -3245,6 +3252,9 @@ mod tests {
         assert_eq!(e.active().document.selection.primary().head, start,
             "stale outline Enter must not move the caret");
         assert!(e.status_text().contains("changed"), "status must mention the change");
+        // A17 T5 (F4 Warning table): a Sticky Warning.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
     }
 
     #[test]

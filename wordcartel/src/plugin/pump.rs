@@ -220,7 +220,8 @@ impl PluginHost {
         e.pending_plugin_calls.clear();
         e.pending_plugin_events.clear();
         e.pending_plugin_dispatch.clear();
-        e.set_status(crate::status::StatusKind::Info, "plugin work truncated (chain cap)".to_string());
+        e.set_status_full(crate::status::StatusKind::Warning, "plugin work truncated (chain cap)".to_string(),
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         true
     }
 
@@ -639,6 +640,9 @@ mod tests {
         assert_eq!(crate::timers::next_wake(&e, 10_000), Some(0),
             "the un-fired due timer still drives an (immediate) wake — not stranded");
         assert!(e.status_text().to_lowercase().contains("truncat"), "the cap trip sets a truncation status: {}", e.status_text());
+        // A17 T5 (F4 Warning table): a Sticky Warning.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
     }
 
     #[test]

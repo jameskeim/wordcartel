@@ -33,19 +33,22 @@ pub(crate) fn save_timeout_tick(editor: &mut Editor, now: u64) {
                 crate::editor::PostSaveAction::Quit => {
                     // Re-raise the quit-confirm modal so the user can choose again.
                     editor.open_prompt(crate::prompt::Prompt::quit_confirm());
-                    editor.set_status(crate::status::StatusKind::Info, "Save still running — choose again");
+                    editor.set_status_full(crate::status::StatusKind::Warning, "Save still running — choose again",
+                        crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
                 }
                 crate::editor::PostSaveAction::ContinueQuitDrain => {
                     // Codex C3: a stranded drain (no in-flight save, no re-drive) would
                     // hang the quit. Abort the whole quit rather than silently clearing.
                     editor.quit_drain = None;
                     editor.quit_drain_advance = false;
-                    editor.set_status(crate::status::StatusKind::Info, "save timed out — quit cancelled");
+                    editor.set_status_full(crate::status::StatusKind::Warning, "save timed out — quit cancelled",
+                        crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
                 }
                 crate::editor::PostSaveAction::CloseBuffer { .. } => {
                     // C4: a close is not a session-ending action the user is
                     // waiting on — cancel without re-prompting (spec D3).
-                    editor.set_status(crate::status::StatusKind::Info, "save timed out — close cancelled");
+                    editor.set_status_full(crate::status::StatusKind::Warning, "save timed out — close cancelled",
+                        crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
                 }
             }
         }
@@ -259,6 +262,9 @@ mod tests {
 
         assert!(e.pending_after_save.is_none(), "pending cleared on CloseBuffer timeout");
         assert_eq!(e.status_text(), "save timed out — close cancelled");
+        // A17 T5 (F4 Warning table): a Sticky Warning.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         assert!(e.by_id(id).is_some(), "buffer NOT closed — timeout only cancels");
         assert!(e.prompt.is_none(), "no re-prompt for a close timeout (spec D3)");
 
@@ -271,7 +277,34 @@ mod tests {
         crate::timers::save_timeout_tick(&mut e, crate::timers::SAVE_QUIT_TIMEOUT_MS + 1);
         assert!(e.pending_after_save.is_none(), "quit pending cleared");
         assert!(e.prompt.is_some(), "Quit timeout re-raises quit_confirm prompt");
+        assert_eq!(e.status_text(), "Save still running — choose again");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
 
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A17 T5 (F4 Warning table): a `ContinueQuitDrain` timeout aborts the drain and is a
+    /// Sticky Warning ("save timed out — quit cancelled").
+    #[test]
+    fn quit_drain_save_timeout_cancels_with_sticky_warning() {
+        use crate::editor::{Editor, PostSaveAction, PendingAfterSave, QuitDrain, QuitMode};
+        let p = std::env::temp_dir().join(format!("wc-c4t2-drain-timeout-{}.md", std::process::id()));
+        std::fs::write(&p, "old\n").unwrap();
+        let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
+        let id = e.active().id;
+        e.quit_drain = Some(QuitDrain { queue: std::collections::VecDeque::from([id]), mode: QuitMode::SaveAll });
+        e.pending_after_save = Some(PendingAfterSave {
+            buffer_id: id, version: 1,
+            action: PostSaveAction::ContinueQuitDrain,
+            at_ms: 0,
+        });
+        crate::timers::save_timeout_tick(&mut e, crate::timers::SAVE_QUIT_TIMEOUT_MS + 1);
+        assert!(e.pending_after_save.is_none(), "pending cleared on drain timeout");
+        assert!(e.quit_drain.is_none(), "the whole quit is aborted, not just this pending");
+        assert_eq!(e.status_text(), "save timed out — quit cancelled");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         let _ = std::fs::remove_file(&p);
     }
 

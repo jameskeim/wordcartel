@@ -179,8 +179,9 @@ pub fn dispatch_save(ctx: &mut Ctx) -> CommandResult {
     let current_fp = fingerprint(&path);
     if current_fp != ctx.editor.active().document.stored_fp {
         ctx.editor.open_prompt(crate::prompt::Prompt::external_mod());
-        ctx.editor.set_status(crate::status::StatusKind::Info,
-            "File changed on disk \u{2014} choose [R]eload or [O]verwrite");
+        ctx.editor.set_status_full(crate::status::StatusKind::Warning,
+            "File changed on disk \u{2014} choose [R]eload or [O]verwrite",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return CommandResult::Handled;
     }
 
@@ -220,7 +221,8 @@ pub(crate) fn dispatch_save_and_quit(ctx: &mut crate::registry::Ctx) {
 /// Save bypassing the fingerprint conflict (the [O]verwrite modal action).
 pub fn overwrite_save(ctx: &mut Ctx) {
     if ctx.editor.active().document.path.is_none() {
-        ctx.editor.set_status(crate::status::StatusKind::Info, "No file name — use Save As".to_string());
+        ctx.editor.set_status_full(crate::status::StatusKind::Warning, "No file name — use Save As".to_string(),
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return;
     }
     do_save(ctx); // no stat check
@@ -535,6 +537,10 @@ mod tests {
         { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
         assert!(e.prompt.is_some(), "external change must raise the modal, not clobber");
         assert!(ex.drain().is_empty(), "no save job dispatched on conflict");
+        // A17 T5 (F4 Warning table): the external-mod refusal is a Sticky Warning.
+        assert_eq!(e.status_text(), "File changed on disk \u{2014} choose [R]eload or [O]verwrite");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         let _ = std::fs::remove_file(&p);
     }
 
@@ -553,6 +559,22 @@ mod tests {
         assert!(e.prompt.is_some(), "a file appearing where there was none is a conflict");
         assert!(ex.drain().is_empty(), "no save job dispatched on new-file conflict");
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// A17 T5 (F4 Warning table): an `overwrite_save` on a pathless (unnamed) buffer refuses
+    /// with a Sticky Warning, not an ordinary Info echo.
+    #[test]
+    fn overwrite_save_on_unnamed_buffer_is_a_sticky_warning() {
+        use crate::jobs::InlineExecutor;
+        use crate::registry::Ctx;
+        let mut e = Editor::new_from_text("mine\n", None, (80, 24));
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; overwrite_save(&mut ctx); }
+        assert_eq!(e.status_text(), "No file name — use Save As");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        assert!(ex.drain().is_empty(), "no save job dispatched on the refusal");
     }
 
     #[test]

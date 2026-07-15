@@ -546,11 +546,13 @@ pub(crate) fn perform_settings_save(
     fs:            &dyn crate::fsx::Fs,
 ) -> Option<OverridesFile> {
     if no_config {
-        editor.set_status(crate::status::StatusKind::Info, "settings: disabled by --no-config");
+        editor.set_status_full(crate::status::StatusKind::Warning, "settings: disabled by --no-config",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return None;
     }
     let Some(path) = overrides_path else {
-        editor.set_status(crate::status::StatusKind::Info, "settings: no config directory");
+        editor.set_status_full(crate::status::StatusKind::Warning, "settings: no config directory",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return None;
     };
     let runtime = runtime_snapshot(editor);
@@ -826,6 +828,9 @@ mod tests {
         );
         assert!(result.is_none(), "must return None on --no-config refusal");
         assert_eq!(e.status_text(), "settings: disabled by --no-config");
+        // A17 T5 (F4 Warning table): a Sticky Warning.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         assert!(!path.exists(), "no file must be written on --no-config refusal");
     }
 
@@ -840,6 +845,9 @@ mod tests {
         );
         assert!(result.is_none(), "must return None when overrides_path is None");
         assert_eq!(e.status_text(), "settings: no config directory");
+        // A17 T5 (F4 Warning table): a Sticky Warning.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
     }
 
     #[test]

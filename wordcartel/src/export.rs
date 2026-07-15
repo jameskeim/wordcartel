@@ -258,7 +258,8 @@ pub fn run_export(
     let source = match editor.active().document.path.clone() {
         Some(p) => p,
         None => {
-            editor.set_status(crate::status::StatusKind::Info, "save the file first before exporting");
+            editor.set_status_full(crate::status::StatusKind::Warning, "save the file first before exporting",
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
             return;
         }
     };
@@ -308,6 +309,9 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         run_export(&mut e, "html", &tx);
         assert!(e.status_text().to_lowercase().contains("save the file first"));
+        // A17 T5 (F4 Warning table): a Sticky Warning.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
     }
 
     #[test]

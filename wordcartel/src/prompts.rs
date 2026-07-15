@@ -122,7 +122,8 @@ pub fn save_as_submit(editor: &mut crate::editor::Editor, text: &str,
                       msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
     let t = text.trim();
     if t.is_empty() {
-        editor.set_status(crate::status::StatusKind::Info, "save-as: empty path");
+        editor.set_status_full(crate::status::StatusKind::Warning, "save-as: empty path",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         editor.pending_save_as = None;
         // Effort 6 (Codex C2): backing out of a drain's Save-As aborts the quit.
         editor.quit_drain = None;
@@ -144,7 +145,11 @@ pub fn save_as_submit(editor: &mut crate::editor::Editor, text: &str,
 pub fn block_write_submit(editor: &mut crate::editor::Editor, text: &str) {
     let Some(b) = editor.active().marked_block else { editor.set_status(crate::status::StatusKind::Info, "no marked block"); return; };
     let t = text.trim();
-    if t.is_empty() { editor.set_status(crate::status::StatusKind::Info, "write block: empty path"); return; }
+    if t.is_empty() {
+        editor.set_status_full(crate::status::StatusKind::Warning, "write block: empty path",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+        return;
+    }
     let target = expand_path(t);
     if target.exists() {
         editor.pending_write_block = Some(target.clone());
@@ -331,7 +336,8 @@ pub(crate) fn submit_filter_line(
     msg_tx: &std::sync::mpsc::Sender<Msg>,
 ) {
     let Some(spec) = build_filter_spec(line) else {
-        editor.set_status(crate::status::StatusKind::Info, "filter: no command given");
+        editor.set_status_full(crate::status::StatusKind::Warning, "filter: no command given",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return;
     };
     crate::filter::dispatch_filter(editor, spec, msg_tx.clone());
@@ -364,7 +370,11 @@ fn build_filter_spec(line: &str) -> Option<crate::filter::FilterSpec> {
 pub(crate) fn wrap_column_submit(editor: &mut crate::editor::Editor, text: &str) {
     let n: u16 = match text.trim().parse() {
         Ok(n) => n,
-        Err(_) => { editor.set_status(crate::status::StatusKind::Info, "wrap column: not a number".to_string()); return; }
+        Err(_) => {
+            editor.set_status_full(crate::status::StatusKind::Warning, "wrap column: not a number".to_string(),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+            return;
+        }
     };
     let (value, msg) = if n < 20 { (20, "wrap column: 20 (minimum)".to_string()) }
                        else if n > 9999 { (9999, "wrap column: 9999 (maximum)".to_string()) }
@@ -380,7 +390,11 @@ pub(crate) fn wrap_column_submit(editor: &mut crate::editor::Editor, text: &str)
 pub(crate) fn goto_line_submit(editor: &mut crate::editor::Editor, text: &str) {
     let n: usize = match text.trim().parse() {
         Ok(n) => n,
-        Err(_) => { editor.set_status(crate::status::StatusKind::Info, "not a line number".to_string()); return; }
+        Err(_) => {
+            editor.set_status_full(crate::status::StatusKind::Warning, "not a line number".to_string(),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+            return;
+        }
     };
     let total = crate::derive::total_logical_lines(&editor.active().document.buffer);
     let line_index = n.max(1).min(total) - 1;            // 1-based clamp → 0-based index
@@ -398,6 +412,58 @@ pub(crate) fn goto_line_submit(editor: &mut crate::editor::Editor, text: &str) {
 mod tests {
     use super::*;
     use crate::test_support::TestClock;
+
+    /// A17 T5 (F4 Warning table, brief's worked example): a prompt-input refusal is a
+    /// recoverable Warning that holds the slot (Sticky) — the user must see and dismiss it,
+    /// not lose it to the very next keystroke like an ordinary Info echo.
+    #[test]
+    fn wrap_column_not_a_number_is_a_sticky_warning() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("x\n", None, (40, 6));
+        wrap_column_submit(&mut e, "abc"); // non-numeric → the "wrap column: not a number" arm
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+    }
+
+    /// A17 T5 (F4 Warning table, prompt-input refusals row): an empty Save-As path refusal
+    /// is a Sticky Warning.
+    #[test]
+    fn save_as_empty_path_is_a_sticky_warning() {
+        use crate::editor::Editor;
+        use crate::jobs::InlineExecutor;
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        let ex = InlineExecutor::default();
+        let clk = TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        save_as_submit(&mut e, "   ", &ex, &clk, &tx);
+        assert_eq!(e.status_text(), "save-as: empty path");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+    }
+
+    /// A17 T5: an empty Write-Block path refusal is a Sticky Warning.
+    #[test]
+    fn block_write_empty_path_is_a_sticky_warning() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 1, hidden: false });
+        block_write_submit(&mut e, "   ");
+        assert_eq!(e.status_text(), "write block: empty path");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+    }
+
+    /// A17 T5: an empty filter command refusal is a Sticky Warning.
+    #[test]
+    fn submit_filter_line_empty_is_a_sticky_warning() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("x\n", None, (80, 24));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        submit_filter_line(&mut e, "   ", &tx);
+        assert_eq!(e.status_text(), "filter: no command given");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+    }
 
     #[test]
     fn submit_filter_line_uses_shell_single_argv() {
@@ -486,9 +552,14 @@ mod tests {
         wrap_column_submit(&mut e, "xyz");                 // parse failure → UNCHANGED
         assert_eq!(e.view_opts.wrap_column, initial);
         assert_eq!(e.status_text(), "wrap column: not a number");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         wrap_column_submit(&mut e, "99999");               // u16 overflow → UNCHANGED
         assert_eq!(e.view_opts.wrap_column, initial);
         assert_eq!(e.status_text(), "wrap column: not a number");
+        // A17 T5 (Q1): the refusal is a Sticky Warning — it holds the slot even across the
+        // next (lower-severity Info) submit, so dismiss it before checking a success message.
+        e.dismiss_status();
         wrap_column_submit(&mut e, "15");                  // below min → CLAMPED SET
         assert_eq!(e.view_opts.wrap_column, 20);
         assert_eq!(e.status_text(), "wrap column: 20 (minimum)");
@@ -548,6 +619,8 @@ mod tests {
         goto_line_submit(&mut e, "xyz");          // garbage → status, no move
         assert_eq!(e.active().document.selection.primary().head, 0);
         assert_eq!(e.status_text(), "not a line number");           // rejected input sets the status
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
     }
 
     #[test]

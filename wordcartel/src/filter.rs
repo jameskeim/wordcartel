@@ -341,7 +341,8 @@ pub fn dispatch_filter(
     msg_tx: std::sync::mpsc::Sender<crate::app::Msg>,
 ) {
     if editor.filter_in_flight.is_some() {
-        editor.set_status(crate::status::StatusKind::Info, "a filter is already running");
+        editor.set_status_full(crate::status::StatusKind::Warning, "a filter is already running",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return;
     }
     let b = editor.active();
@@ -387,6 +388,27 @@ fn truncate(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A17 T5 (F4 Warning table): the "a filter is already running" blocked-action refusal
+    /// is a recoverable Sticky Warning.
+    #[test]
+    fn dispatch_filter_already_running_is_a_sticky_warning() {
+        let mut e = crate::editor::Editor::new_from_text("hello\n", None, (80, 24));
+        e.filter_in_flight = Some(CancelFlag::new());
+        let spec = FilterSpec {
+            argv: vec!["cat".into()],
+            shell: false,
+            disposition: Disposition::Filter,
+            input: Input::SelectionElseBuffer,
+            timeout: std::time::Duration::from_secs(10),
+            max_output: 1 << 20,
+        };
+        let (tx, _rx) = std::sync::mpsc::channel();
+        dispatch_filter(&mut e, spec, tx);
+        assert_eq!(e.status_text(), "a filter is already running");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+    }
 
     #[test]
     fn filter_spec_constructs() {

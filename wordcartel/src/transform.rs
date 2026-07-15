@@ -212,7 +212,8 @@ pub fn dispatch_transform(
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
 ) {
     if editor.transform_in_flight {
-        editor.set_status(crate::status::StatusKind::Info, "a transform is already running");
+        editor.set_status_full(crate::status::StatusKind::Warning, "a transform is already running",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return;
     }
     let range = region.unwrap_or_else(|| region_for_transform(&editor.active().document));
@@ -349,6 +350,21 @@ mod tests {
     // build_range_replace would turn into a dropped/duplicated newline. We compare
     // against `top_level()[i].span` (whatever the parser produced) rather than
     // hand-counted byte offsets.
+
+    /// A17 T5 (F4 Warning table): the "a transform is already running" blocked-action
+    /// refusal is a recoverable Sticky Warning.
+    #[test]
+    fn dispatch_transform_already_running_is_a_sticky_warning() {
+        struct Z;
+        impl wordcartel_core::history::Clock for Z { fn now_ms(&self) -> u64 { 0 } }
+        let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
+        e.transform_in_flight = true;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        dispatch_transform(&mut e, TransformKind::Reflow, None, &Z, &tx);
+        assert_eq!(e.status_text(), "a transform is already running");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+    }
 
     #[test]
     fn snap_expands_mid_paragraph_selection_to_exactly_the_paragraph_block() {

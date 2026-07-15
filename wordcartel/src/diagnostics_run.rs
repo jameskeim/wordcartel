@@ -137,7 +137,8 @@ pub fn dispatch_diagnostics(editor: &mut Editor, now: u64) {
     let text = b.document.buffer.snapshot().to_string();
     if text.len() as u64 > crate::limits::DIAG_MAX_SEND_BYTES {
         for s in &due { editor.active_mut().diagnostics.slot_mut(*s).recheck_due_at = None; }
-        editor.set_status(crate::status::StatusKind::Info, "document too large for grammar checking");
+        editor.set_status_full(crate::status::StatusKind::Warning, "document too large for grammar checking",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return;
     }
     for source in due { dispatch_one(editor, source, buffer_id, version, &path, &text); }
@@ -180,7 +181,8 @@ fn dispatch_one(editor: &mut Editor, source: DiagSource, buffer_id: BufferId, ve
 fn show_install_hint(editor: &mut Editor, source: DiagSource) {
     if editor.diag_hint_shown.insert(source) {
         if let Some(hint) = editor.diag_providers.install_hint(source) {
-            editor.set_status(crate::status::StatusKind::Info, hint);
+            editor.set_status_full(crate::status::StatusKind::Warning, hint,
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         }
     }
 }
@@ -575,6 +577,9 @@ mod tests {
             "Accepted::No must not latch");
         assert!(e.diag_hint_shown.contains(&DiagSource::Harper), "the degrade hint latch is set");
         assert_eq!(e.status_text(), "test provider unavailable", "the installed provider's own hint");
+        // A17 T5 (F4 Warning table): a Sticky Warning.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
     }
 
     #[test]
@@ -587,6 +592,9 @@ mod tests {
         e.active_mut().diagnostics.slot_mut(DiagSource::Harper).arm(0, 0);
         dispatch_diagnostics(&mut e, 10);
         assert_eq!(e.status_text(), "document too large for grammar checking");
+        // A17 T5 (F4 Warning table): a Sticky Warning.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         assert_eq!(e.active().diagnostics.slot(DiagSource::Harper).unwrap().in_flight_version, None,
             "over-cap: no latch");
         assert!(calls.lock().unwrap().is_empty(), "over-cap short-circuits before the provider");
@@ -600,6 +608,9 @@ mod tests {
         e.active_mut().diagnostics.slot_mut(DiagSource::Harper).arm(0, 0);
         dispatch_diagnostics(&mut e, 10);
         assert_eq!(e.status_text(), "test provider unavailable");
+        // A17 T5 (F4 Warning table): a Sticky Warning.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         assert!(e.diag_hint_shown.contains(&DiagSource::Harper));
         // Second dispatch: hint already shown → status is not re-set (informative, not naggy).
         e.clear_status();

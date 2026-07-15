@@ -21,7 +21,10 @@ pub(crate) fn rebuild_keymap_if_requested(
         // Transient occupant (the pending-chord "…" preview is Transient), never a held message.
         editor.clear_transient_status();
     }
-    if let Some(w) = kw.first() { editor.set_status(crate::status::StatusKind::Info, w.clone()); }
+    if let Some(w) = kw.first() {
+        editor.set_status_full(crate::status::StatusKind::Warning, w.clone(),
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+    }
     Some(trie)
 }
 
@@ -139,6 +142,23 @@ mod tests {
         let g = parse_seq("ctrl-g").unwrap();
         assert!(matches!(t.resolve(&g), Resolution::Command(crate::registry::CommandId("copy"))),
             "the global patch rides onto the new base");
+    }
+
+    /// A17 T5 (F4 Warning table): a keymap-rebuild warning (a bad-chord patch, same
+    /// warning-by-construction pattern as the app.rs startup row) is a Sticky Warning.
+    #[test]
+    fn rebuild_bad_chord_patch_is_a_sticky_warning() {
+        let patches = vec![crate::config::KeymapPatch {
+            bind: [("not-a-real-chord".to_string(), "copy".to_string())].into(),
+            ..Default::default() }];
+        let mut e = Editor::new_from_text("doc\n", None, (80, 24));
+        let reg = crate::registry::Registry::builtins();
+        e.keymap_rebuild = true;
+        let t = crate::theme_cmds::rebuild_keymap_if_requested(&mut e, &patches, &reg);
+        assert!(t.is_some(), "the rebuild still produces a trie despite the bad-chord warning");
+        assert!(e.status_text().contains("bad chord"), "status: {}", e.status_text());
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
     }
 
     #[test]

@@ -133,7 +133,10 @@ pub fn apply_provider_event(editor: &mut Editor, source: DiagSource, ev: Provide
                 editor.active_mut().diagnostics.slot_mut(source).arm(now, debounce);
             }
         }
-        ProviderEvent::Degraded(hint) => { editor.set_status(crate::status::StatusKind::Info, hint); }
+        ProviderEvent::Degraded(hint) => {
+            editor.set_status_full(crate::status::StatusKind::Warning, hint,
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+        }
     }
 }
 
@@ -312,6 +315,9 @@ mod tests {
         apply_provider_event(&mut e, DiagSource::Harper,
             ProviderEvent::Degraded(crate::harper_ls::INSTALL_HINT.into()), &TestClock::new(0));
         assert_eq!(e.status_text(), crate::harper_ls::INSTALL_HINT);
+        // A17 T5 (F4 Warning table): a Sticky Warning.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
     }
 
     // ------------------------------------------------------------------

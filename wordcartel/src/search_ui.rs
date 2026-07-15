@@ -143,7 +143,8 @@ pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_co
     // ranges are stale.  Refuse to apply — a stale range can cause a panic on
     // multibyte boundaries or silently apply at wrong offsets.
     if editor.active().document.version != opened_version {
-        editor.set_status(crate::status::StatusKind::Info, "document changed; re-open");
+        editor.set_status_full(crate::status::StatusKind::Warning, "document changed; re-open",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         editor.diag = None;
         return;
     }
@@ -177,7 +178,8 @@ pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_co
                 Err(e) => editor.set_status_full(crate::status::StatusKind::Error, format!("add to dictionary failed: {e}"),
                     crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None),
             },
-            None => editor.set_status(crate::status::StatusKind::Info, "no dictionary path configured"),
+            None => editor.set_status_full(crate::status::StatusKind::Warning, "no dictionary path configured",
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None),
         }
         editor.diag = None;
         crate::diagnostics_run::retain_unignored(editor);
@@ -324,6 +326,23 @@ mod tests {
         assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), None, "no re-arm — the refilter is immediate");
     }
 
+    /// A17 T5 (F4 Warning table): a stale overlay anchor (buffer mutated while the overlay was
+    /// open — Fix A4) refuses to apply with a Sticky Warning, not an ordinary Info echo.
+    #[test]
+    fn diag_apply_selected_stale_version_is_a_sticky_warning() {
+        let mut e = Editor::new_from_text("teh cat\n", None, (80, 24));
+        e.diag_cfg.enabled = true;
+        e.active_mut().view.mode = RenderMode::Review;
+        seed_teh_diag(&mut e);
+        open_diag_selected(&mut e, true);
+        e.active_mut().document.version += 1; // buffer mutated while the overlay was open
+        diag_apply_selected(&mut e, &TestClock(1_000));
+        assert_eq!(e.status_text(), "document changed; re-open");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        assert!(e.diag.is_none(), "overlay closes on the stale-version refusal");
+    }
+
     /// Effort A: "add to dictionary" with no configured path still suppresses the word client-side
     /// (into `editor.dictionary`), sets the no-path status, closes, and refilters in place — the
     /// None branch is no longer a status-only no-op (round-1 IMPORTANT 5). No re-arm.
@@ -340,6 +359,9 @@ mod tests {
         assert!(e.diag.is_none(), "overlay closes regardless of outcome");
         assert!(e.dictionary.contains("teh"), "word suppressed client-side even with no path");
         assert_eq!(e.status_text(), "no dictionary path configured");
+        // A17 T5 (F4 Warning table): a Sticky Warning.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         assert!(e.active().diagnostics.slot(DiagSource::Harper).is_none_or(|s| s.diagnostics.is_empty()), "the added word is refiltered out");
         assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), None, "no re-arm");
     }

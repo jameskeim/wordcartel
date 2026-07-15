@@ -40,7 +40,8 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
                             // Saved, but the user typed during the in-flight save → buffer
                             // dirty again. Do NOT quit (would lose those edits). User
                             // re-issues quit when ready.
-                            editor.set_status(crate::status::StatusKind::Info, "edited during save — quit cancelled");
+                            editor.set_status_full(crate::status::StatusKind::Warning, "edited during save — quit cancelled",
+                                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
                         }
                     }
                 }
@@ -74,7 +75,8 @@ pub fn apply_result(r: JobResult, editor: &mut Editor) {
                         editor.set_status(crate::status::StatusKind::Info, "saved — closed");
                     } else if saved_this {
                         // Edited during the in-flight save: do NOT close.
-                        editor.set_status(crate::status::StatusKind::Info, "edited during save — close cancelled");
+                        editor.set_status_full(crate::status::StatusKind::Warning, "edited during save — close cancelled",
+                            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
                     }
                     // !saved_this: no close; the merge's own status stands (error
                     // text, or empty for a vanished target) — mirrors
@@ -285,10 +287,10 @@ pub(crate) fn apply_export_done(
         if let Ok(crate::export::ExportResult::TempReady(tmp)) = &result {
             let _ = std::fs::remove_file(tmp);
         }
-        editor.set_status(crate::status::StatusKind::Info, format!(
+        editor.set_status_full(crate::status::StatusKind::Warning, format!(
             "export target {} appeared — re-run export to overwrite",
             target.display()
-        ));
+        ), crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return;
     }
     match result {
@@ -326,7 +328,9 @@ pub(crate) fn apply_export_done(
 
 pub(crate) fn insert_paste_text(editor: &mut Editor, buffer_id: crate::editor::BufferId, text: &str, clock: &dyn Clock) -> bool {
     if text.len() > crate::clipboard::PASTE_MAX_BYTES {
-        editor.set_status(crate::status::StatusKind::Info, format!("paste too large ({} MiB) — skipped", text.len() / (1 << 20)));
+        editor.set_status_full(crate::status::StatusKind::Warning,
+            format!("paste too large ({} MiB) — skipped", text.len() / (1 << 20)),
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return false;
     }
     let active_id = editor.active().id;
@@ -365,7 +369,9 @@ pub(crate) fn apply_clipboard_paste(editor: &mut Editor, buffer_id: crate::edito
 
 pub(crate) fn apply_clipboard_availability(editor: &mut Editor, ok: bool) {
     if !ok && !editor.clipboard_notice_shown {
-        editor.set_status(crate::status::StatusKind::Info, "system clipboard unavailable — copy/paste work in-editor (register only)");
+        editor.set_status_full(crate::status::StatusKind::Warning,
+            "system clipboard unavailable — copy/paste work in-editor (register only)",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         editor.clipboard_notice_shown = true;
     }
 }
@@ -468,6 +474,10 @@ mod tests {
         assert!(!e.quit, "must NOT quit — buffer is dirty again from edits typed during the save");
         assert!(e.active().document.dirty(), "buffer still holds the newer edits");
         assert!(e.pending_after_save.is_none(), "pending_after_save consumed on save match");
+        // A17 T5 (F4 Warning table): "edited during save — quit cancelled" is a Sticky Warning.
+        assert_eq!(e.status_text(), "edited during save — quit cancelled");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         let _ = std::fs::remove_file(&p);
     }
 
@@ -600,6 +610,9 @@ mod tests {
         apply_result(save_result, &mut e);
         assert!(e.by_id(id).is_some(), "buffer NOT closed — still dirty");
         assert_eq!(e.status_text(), "edited during save — close cancelled");
+        // A17 T5 (F4 Warning table): a Sticky Warning.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
         assert!(e.pending_after_save.is_none(), "pending consumed");
         let _ = std::fs::remove_file(&p);
     }
@@ -808,6 +821,14 @@ mod tests {
         assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error, "Q1: Info must not displace a held Error");
     }
 
+    /// A17 T5 (F4 Warning table): mirrors `assert_sticky_error_survives_info` for Warning sites.
+    fn assert_sticky_warning_survives_info(e: &mut Editor) {
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        e.set_status(crate::status::StatusKind::Info, "later ack");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning, "Q1: Info must not displace a held Warning");
+    }
+
     #[test]
     fn apply_panic_save_is_a_sticky_error() {
         use crate::editor::Editor;
@@ -879,5 +900,45 @@ mod tests {
         let mut e = Editor::new_from_text("\n", None, (80, 24));
         apply_export_done(&mut e, target, Err(crate::filter::FilterError::Panicked("boom".into())), true);
         assert_sticky_error_survives_info(&mut e);
+    }
+
+    /// A17 T5 (F4 Warning table, Codex-r1 #1 row): the export TOCTOU refusal — the target
+    /// appeared on disk between the overwrite check and completion — is a recoverable Sticky
+    /// Warning, not an Error (the user just re-runs export).
+    #[test]
+    fn apply_export_done_toctou_target_appeared_is_a_sticky_warning() {
+        use crate::editor::Editor;
+        let target = std::env::temp_dir().join(format!("wc-c4-exporttoctou-{}.html", std::process::id()));
+        std::fs::write(&target, "existing\n").unwrap();
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        apply_export_done(&mut e, target.clone(), Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), false);
+        assert!(e.status_text().contains("appeared — re-run export to overwrite"));
+        assert_sticky_warning_survives_info(&mut e);
+        let _ = std::fs::remove_file(&target);
+    }
+
+    /// A17 T5 (F4 Warning table): a paste over the size cap is a recoverable Sticky Warning.
+    #[test]
+    fn insert_paste_text_too_large_is_a_sticky_warning() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        let id = e.active().id;
+        let clk = TestClock(0);
+        let huge = "x".repeat(crate::clipboard::PASTE_MAX_BYTES + 1);
+        let ok = insert_paste_text(&mut e, id, &huge, &clk);
+        assert!(!ok, "oversized paste must not be inserted");
+        assert!(e.status_text().contains("paste too large"));
+        assert_sticky_warning_survives_info(&mut e);
+    }
+
+    /// A17 T5 (F4 Warning table): the system-clipboard-unavailable notice is a recoverable
+    /// Sticky Warning (copy/paste still work in-editor via the register).
+    #[test]
+    fn apply_clipboard_availability_unavailable_is_a_sticky_warning() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        apply_clipboard_availability(&mut e, false);
+        assert!(e.status_text().contains("system clipboard unavailable"));
+        assert_sticky_warning_survives_info(&mut e);
     }
 }

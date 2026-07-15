@@ -169,7 +169,8 @@ pub fn drain_clipboard_intents(
     if editor.clipboard_provider_dirty {
         *plan = resolve_provider(env, editor.clipboard_provider);
         if clip_tx.send(ClipReq::SelectProvider(plan.layer1)).is_err() {
-            editor.set_status(crate::status::StatusKind::Info, "clipboard unavailable".to_string());
+            editor.set_status_full(crate::status::StatusKind::Warning, "clipboard unavailable".to_string(),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         }
         editor.clear_clipboard_provider_dirty();
     }
@@ -181,13 +182,15 @@ pub fn drain_clipboard_intents(
             }
         }
         if clip_tx.send(ClipReq::Set(text)).is_err() {
-            editor.set_status(crate::status::StatusKind::Info, "clipboard unavailable".to_string());
+            editor.set_status_full(crate::status::StatusKind::Warning, "clipboard unavailable".to_string(),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         }
     }
     if let Some(pi) = editor.clipboard_get_pending.take() {
         if clip_tx.send(ClipReq::Get { id: pi.id, buffer_id: pi.buffer_id }).is_err() {
             // No worker (tests / shutdown): notify, then fall back to the register paste path.
-            editor.set_status(crate::status::StatusKind::Info, "clipboard unavailable".to_string());
+            editor.set_status_full(crate::status::StatusKind::Warning, "clipboard unavailable".to_string(),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
             let _ = msg_tx.send(crate::app::Msg::ClipboardPaste {
                 id: pi.id,
                 buffer_id: pi.buffer_id,
@@ -724,12 +727,35 @@ mod tests {
         ed.clipboard_get_pending = Some(PasteIntent { id: 1, buffer_id: bid });
         drain_clipboard_intents(&mut ed, &bare_env(), &mut plan, &mut out, &clip_tx, &msg_tx);
         assert_eq!(ed.status_text(), "clipboard unavailable");
+        // A17 T5 (F4 Warning table): a Sticky Warning — `clear_transient_status` is a no-op
+        // below, so dismiss it explicitly before the next case.
+        assert_eq!(ed.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(ed.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        ed.dismiss_status();
 
         // A pending Set with no worker -> notice.
-        ed.clear_transient_status();
         ed.clipboard_sync_request = Some("hello".to_string());
         drain_clipboard_intents(&mut ed, &bare_env(), &mut plan, &mut out, &clip_tx, &msg_tx);
         assert_eq!(ed.status_text(), "clipboard unavailable");
+        assert_eq!(ed.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(ed.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+    }
+
+    /// A17 T5 (F4 Warning table): the third `clipboard unavailable` site — a provider-rebuild
+    /// send failure on a dirty provider change — is also a Sticky Warning.
+    #[test]
+    fn a_dead_clipboard_worker_provider_rebuild_sets_the_status_notice() {
+        let (clip_tx, clip_rx) = std::sync::mpsc::channel::<ClipReq>();
+        drop(clip_rx); // worker is gone: every send now errors
+        let (msg_tx, _msg_rx) = std::sync::mpsc::channel::<crate::app::Msg>();
+        let mut out: Vec<u8> = Vec::new();
+        let mut ed = crate::editor::Editor::new_from_text("x\n", None, (80, 24));
+        let mut plan = resolve_provider(&bare_env(), ed.clipboard_provider);
+        ed.set_clipboard_provider(ed.clipboard_provider); // arms clipboard_provider_dirty
+        drain_clipboard_intents(&mut ed, &bare_env(), &mut plan, &mut out, &clip_tx, &msg_tx);
+        assert_eq!(ed.status_text(), "clipboard unavailable");
+        assert_eq!(ed.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(ed.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
     }
 
     #[test]

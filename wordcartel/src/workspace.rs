@@ -162,7 +162,8 @@ pub fn close_buffer(editor: &mut Editor) {
     if editor.is_scratch(id) { editor.set_status(crate::status::StatusKind::Info, "can't close the scratch buffer"); return; }
     if editor.is_dirty(id) {
         if editor.pending_after_save.is_some() || editor.pending_save_as.is_some() || editor.quit_drain.is_some() {
-            editor.set_status(crate::status::StatusKind::Info, "another save or quit is in progress — try again");
+            editor.set_status_full(crate::status::StatusKind::Warning, "another save or quit is in progress — try again",
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
             return;
         }
         let name = buffer_display_name(editor, id);
@@ -245,6 +246,24 @@ pub fn new_empty_buffer(editor: &mut Editor) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A17 T5 (F4 Warning table): the "another save or quit is in progress" busy-guard
+    /// refusal is a recoverable Sticky Warning.
+    #[test]
+    fn close_buffer_busy_refusal_is_a_sticky_warning() {
+        let mut e = Editor::new_from_text("x\n", None, (40, 10));
+        // Drive dirty via a direct version bump (matches other tests' dirty-setup pattern).
+        e.active_mut().document.version = 1;
+        e.active_mut().document.saved_version = None;
+        let id = e.active().id;
+        e.pending_after_save = Some(crate::editor::PendingAfterSave {
+            buffer_id: id, version: 1, action: crate::editor::PostSaveAction::Quit, at_ms: 0,
+        });
+        close_buffer(&mut e);
+        assert_eq!(e.status_text(), "another save or quit is in progress — try again");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+    }
 
     #[test]
     fn buffer_display_name_scratch_untitled_and_named() {
