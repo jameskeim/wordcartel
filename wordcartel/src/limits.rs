@@ -64,6 +64,11 @@ pub const PLUGIN_MAX_HOOKS_PER_PLUGIN: usize = 64;
 /// site) — the queue holds bounded owned data even for a pathological path.
 pub const PLUGIN_MAX_EVENT_PAYLOAD: usize = 4096;
 
+/// A17 — cap on a single `Status` message's displayed text (display-only truncation, char-boundary
+/// safe). Deliberately reuses `PLUGIN_MAX_STATUS_LEN` so plugin `wc.status` and host messages share
+/// one bound; T11 asserts this identity holds (a divergence would be a silent behavior change).
+pub const MESSAGES_MAX_TEXT_LEN: usize = PLUGIN_MAX_STATUS_LEN;
+
 /// Max byte length of a `wc.command(name)` target — the longest possible registered id
 /// (`<stem>.<name>`), so this cap can never reject a resolvable name (§5a).
 pub const PLUGIN_MAX_COMMAND_REF: usize = PLUGIN_MAX_STEM_LEN + 1 + PLUGIN_MAX_NAME_LEN;

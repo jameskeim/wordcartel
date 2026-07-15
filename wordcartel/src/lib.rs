@@ -66,6 +66,7 @@ pub mod workspace;
 pub mod plugin;
 pub mod cursor_style;
 pub mod cursor_picker;
+pub mod status;
 pub(crate) mod list_window;
 #[cfg(test)] pub(crate) mod test_support;
 #[cfg(test)] mod e2e;
