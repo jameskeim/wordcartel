@@ -137,7 +137,7 @@ pub fn dispatch_diagnostics(editor: &mut Editor, now: u64) {
     let text = b.document.buffer.snapshot().to_string();
     if text.len() as u64 > crate::limits::DIAG_MAX_SEND_BYTES {
         for s in &due { editor.active_mut().diagnostics.slot_mut(*s).recheck_due_at = None; }
-        editor.status = "document too large for grammar checking".into();
+        editor.set_status(crate::status::StatusKind::Info, "document too large for grammar checking");
         return;
     }
     for source in due { dispatch_one(editor, source, buffer_id, version, &path, &text); }
@@ -161,7 +161,7 @@ fn dispatch_one(editor: &mut Editor, source: DiagSource, buffer_id: BufferId, ve
     match editor.diag_providers.availability(source) {
         Some(Availability::Unavailable) | None => { show_install_hint(editor, source); return; }
         Some(Availability::Starting) => {
-            editor.status = format!("starting {}…", source.label()); // no silent wait (spec §4.3)
+            editor.set_status(crate::status::StatusKind::Info, format!("starting {}…", source.label())); // no silent wait (spec §4.3)
         }
         Some(Availability::Idle) | Some(Availability::Ready) => {}
     }
@@ -180,7 +180,7 @@ fn dispatch_one(editor: &mut Editor, source: DiagSource, buffer_id: BufferId, ve
 fn show_install_hint(editor: &mut Editor, source: DiagSource) {
     if editor.diag_hint_shown.insert(source) {
         if let Some(hint) = editor.diag_providers.install_hint(source) {
-            editor.status = hint.into();
+            editor.set_status(crate::status::StatusKind::Info, hint);
         }
     }
 }
@@ -278,7 +278,7 @@ pub fn apply_diagnostics_done(
 pub fn cycle_analysis_source(editor: &mut Editor) {
     let enabled: Vec<DiagSource> = editor.diag_providers.enabled_sources().collect();
     if enabled.len() < 2 {
-        editor.status = "no other analysis engine".into();
+        editor.set_status(crate::status::StatusKind::Info, "no other analysis engine");
         return;
     }
     let cur = editor.active_analysis_source;
@@ -298,7 +298,7 @@ pub fn cycle_analysis_source(editor: &mut Editor) {
 pub fn set_engine_enabled(editor: &mut Editor, source: DiagSource, on: bool,
     clock: &dyn wordcartel_core::history::Clock) {
     if !editor.diag_providers.set_enabled(source, on) {
-        editor.status = format!("unknown analysis engine: {}", source.label());
+        editor.set_status(crate::status::StatusKind::Info, format!("unknown analysis engine: {}", source.label()));
         return;
     }
     if on {
@@ -310,7 +310,7 @@ pub fn set_engine_enabled(editor: &mut Editor, source: DiagSource, on: bool,
         // disable-to-zero followed by re-enable — point it at the engine just enabled so its
         // results are visible and reachable. Otherwise keep the current (enabled) lens.
         if editor.diag_providers.is_enabled(editor.active_analysis_source) {
-            editor.status = format!("{} enabled", source.label());
+            editor.set_status(crate::status::StatusKind::Info, format!("{} enabled", source.label()));
         } else {
             editor.set_analysis_source(source); // relocates lens + sets "analysis: {label}"
         }
@@ -320,11 +320,11 @@ pub fn set_engine_enabled(editor: &mut Editor, source: DiagSource, on: bool,
             let next = editor.diag_providers.enabled_sources().next();
             match next {
                 Some(next) => editor.set_analysis_source(next),
-                None => editor.status = format!("{} disabled — no analysis engine enabled",
-                    source.label()),
+                None => editor.set_status(crate::status::StatusKind::Info, format!("{} disabled — no analysis engine enabled",
+                    source.label())),
             }
         } else {
-            editor.status = format!("{} disabled", source.label());
+            editor.set_status(crate::status::StatusKind::Info, format!("{} disabled", source.label()));
         }
     }
 }
@@ -574,7 +574,7 @@ mod tests {
         assert_eq!(e.active().diagnostics.slot(DiagSource::Harper).unwrap().in_flight_version, None,
             "Accepted::No must not latch");
         assert!(e.diag_hint_shown.contains(&DiagSource::Harper), "the degrade hint latch is set");
-        assert_eq!(e.status, "test provider unavailable", "the installed provider's own hint");
+        assert_eq!(e.status_text(), "test provider unavailable", "the installed provider's own hint");
     }
 
     #[test]
@@ -586,7 +586,7 @@ mod tests {
         e.diag_providers.install(Box::new(rec), true);
         e.active_mut().diagnostics.slot_mut(DiagSource::Harper).arm(0, 0);
         dispatch_diagnostics(&mut e, 10);
-        assert_eq!(e.status, "document too large for grammar checking");
+        assert_eq!(e.status_text(), "document too large for grammar checking");
         assert_eq!(e.active().diagnostics.slot(DiagSource::Harper).unwrap().in_flight_version, None,
             "over-cap: no latch");
         assert!(calls.lock().unwrap().is_empty(), "over-cap short-circuits before the provider");
@@ -599,13 +599,13 @@ mod tests {
             .with_availability(Availability::Unavailable)), true);
         e.active_mut().diagnostics.slot_mut(DiagSource::Harper).arm(0, 0);
         dispatch_diagnostics(&mut e, 10);
-        assert_eq!(e.status, "test provider unavailable");
+        assert_eq!(e.status_text(), "test provider unavailable");
         assert!(e.diag_hint_shown.contains(&DiagSource::Harper));
         // Second dispatch: hint already shown → status is not re-set (informative, not naggy).
-        e.status = String::new();
+        e.clear_status();
         e.active_mut().diagnostics.slot_mut(DiagSource::Harper).arm(0, 0);
         dispatch_diagnostics(&mut e, 20);
-        assert_eq!(e.status, "", "hint shows at most once per Review entry");
+        assert_eq!(e.status_text(), "", "hint shows at most once per Review entry");
         assert_eq!(e.active().diagnostics.slot(DiagSource::Harper).unwrap().in_flight_version, None);
     }
 
@@ -617,7 +617,7 @@ mod tests {
         let v = e.active().document.version;
         e.active_mut().diagnostics.slot_mut(DiagSource::Harper).arm(0, 0);
         dispatch_diagnostics(&mut e, 10);
-        assert_eq!(e.status, "starting Harper…");
+        assert_eq!(e.status_text(), "starting Harper…");
         assert_eq!(e.active().diagnostics.slot(DiagSource::Harper).unwrap().in_flight_version, Some(v),
             "Starting still accepts + latches");
     }
@@ -697,7 +697,7 @@ mod tests {
             crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Harper)), true);
         e.active_mut().diagnostics.slot_mut(DiagSource::Harper).arm(0, 0);
         dispatch_diagnostics(&mut e, 10);
-        assert_eq!(e.status, "document too large for grammar checking");
+        assert_eq!(e.status_text(), "document too large for grammar checking");
         assert_eq!(e.active().diagnostics.slot(DiagSource::Harper).unwrap().in_flight_version, None);
         assert_eq!(e.active().diagnostics.slot(DiagSource::Harper).unwrap().recheck_due_at, None);
     }
@@ -929,7 +929,7 @@ mod tests {
         let hs = e.active_mut().diagnostics.slot_mut(DiagSource::Harper);
         hs.diagnostics = vec![spelling(0..3)]; hs.computed_version = v;
         cycle_analysis_source(&mut e); // < 2 enabled engines → status no-op, lens UNCHANGED
-        assert_eq!(e.status, "no other analysis engine");
+        assert_eq!(e.status_text(), "no other analysis engine");
         assert_eq!(e.active_analysis_source, DiagSource::Harper, "lens stayed put — nowhere to cycle");
         let diags = active_lens_diags(&e)
             .expect("the lens must still resolve the single enabled engine's diagnostics");
@@ -962,7 +962,7 @@ mod tests {
             crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Harper)), true);
         cycle_analysis_source(&mut e);
         assert_eq!(e.active_analysis_source, DiagSource::Harper, "nowhere to cycle to");
-        assert_eq!(e.status, "no other analysis engine");
+        assert_eq!(e.status_text(), "no other analysis engine");
     }
 
     #[test]
@@ -988,7 +988,7 @@ mod tests {
         e.diag_providers.install(Box::new(
             crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Harper)), true);
         set_engine_enabled(&mut e, DiagSource::Harper, false, &TestClock::new(0));
-        assert_eq!(e.status, "Harper disabled — no analysis engine enabled");
+        assert_eq!(e.status_text(), "Harper disabled — no analysis engine enabled");
         assert!(!e.diag_providers.is_enabled(DiagSource::Harper));
     }
 
@@ -1003,7 +1003,7 @@ mod tests {
         assert!(e.diag_providers.is_enabled(DiagSource::Harper));
         assert_eq!(e.active().diagnostics.slot(DiagSource::Harper).unwrap().recheck_due_at, Some(500),
             "enable arms the active buffer's slot when Review checking is live");
-        assert_eq!(e.status, "Harper enabled");
+        assert_eq!(e.status_text(), "Harper enabled");
     }
 
     #[test]
@@ -1035,7 +1035,7 @@ mod tests {
         use crate::test_support::TestClock;
         let mut e = Editor::new_from_text("x\n", None, (40, 10));
         set_engine_enabled(&mut e, DiagSource::Plugin("ghost"), true, &TestClock::new(0));
-        assert_eq!(e.status, "unknown analysis engine: ghost");
+        assert_eq!(e.status_text(), "unknown analysis engine: ghost");
     }
 
     #[test]

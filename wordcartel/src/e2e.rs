@@ -231,7 +231,7 @@ impl Harness {
     fn doc_text(&self) -> String { self.editor.borrow().active().document.buffer.to_string() }
     fn dirty(&self) -> bool { self.editor.borrow().active().document.dirty() }
     fn saved_version(&self) -> Option<u64> { self.editor.borrow().active().document.saved_version } // Option, not u64 (editor.rs:64)
-    fn status(&self) -> String { self.editor.borrow().status.clone() }
+    fn status(&self) -> String { self.editor.borrow().status_text().to_string() }
     fn blocks(&self) -> BlockTree { self.editor.borrow().active().document.blocks().clone() }
     fn folded(&self) -> std::collections::BTreeSet<usize> { self.editor.borrow().active().folds.folded().clone() }
     fn maybe_stale(&self) -> bool { self.editor.borrow().active().reconcile.maybe_stale }
@@ -940,7 +940,7 @@ fn pomodoro_lua_e2e_success_demo() {
 
     let deadline = 25 * 60 * 1000u64;
     assert_eq!(editor.borrow().pending_plugin_timers.len(), 1, "start arms exactly one timer");
-    assert_eq!(editor.borrow().status, "Pomodoro: 25 min session started");
+    assert_eq!(editor.borrow().status_text(), "Pomodoro: 25 min session started");
     assert_eq!(crate::timers::next_wake(&editor.borrow(), 0), Some(deadline),
         "next_wake reflects the armed timer's due (armed at t=0, +25·60·1000ms)");
 
@@ -952,7 +952,7 @@ fn pomodoro_lua_e2e_success_demo() {
     assert!(keep, "Msg::Tick must not itself request quit");
     host.pump(&editor, &reg, &ex, &clock, &tx);
 
-    assert_eq!(editor.borrow().status, "Pomodoro: 25 min session complete",
+    assert_eq!(editor.borrow().status_text(), "Pomodoro: 25 min session complete",
         "the observer-tier callback ran DURING inactivity");
     assert!(editor.borrow().pending_plugin_timers.is_empty(), "a one-shot is removed after firing");
     assert_eq!(crate::timers::next_wake(&editor.borrow(), fire_at), None,
@@ -977,7 +977,7 @@ fn pomodoro_lua_e2e_success_demo() {
     }
     host.pump(&editor, &reg, &ex, &clock, &tx);
     assert!(editor.borrow().pending_plugin_timers.is_empty(), "wc.timer_cancel disarms the session");
-    assert_eq!(editor.borrow().status, "Pomodoro: cancelled");
+    assert_eq!(editor.borrow().status_text(), "Pomodoro: cancelled");
     assert_eq!(crate::timers::next_wake(&editor.borrow(), fire_at), None);
 
     // 4) Re-arm again, then plugins_reload — the dead VM's timer schedule must not survive
@@ -1080,7 +1080,7 @@ fn wordcount_lua_e2e_success_demo() {
         for o in outcomes { crate::jobs_apply::apply_outcome(o, &mut e); }
     }
     host.pump(&editor, &reg, &ex, &clock, &tx);
-    assert_eq!(editor.borrow().status, "Saved — 3 words (goal: 100)",
+    assert_eq!(editor.borrow().status_text(), "Saved — 3 words (goal: 100)",
         "the demo's on_save hook must report the live word count against its configured goal");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha beta gamma\n",
         "the save itself must have actually happened — hooks never abort/delay the op");
@@ -1105,7 +1105,7 @@ fn wordcount_lua_e2e_success_demo() {
         for o in outcomes { crate::jobs_apply::apply_outcome(o, &mut e); }
     }
     host.pump(&editor, &reg, &ex, &clock, &tx);
-    assert_eq!(editor.borrow().status, "Saved (v2) — 3 words (goal: 100)",
+    assert_eq!(editor.borrow().status_text(), "Saved (v2) — 3 words (goal: 100)",
         "the EDITED plugin's wording must be live after plugins_reload, on the very next save");
 }
 
@@ -1230,7 +1230,7 @@ fn journey_palette_end_reaches_last_command() {
     // dispatch path (spec I4).
     h.key(KeyCode::Enter);
     assert!(h.editor.borrow().palette.is_none(), "Enter closes the palette");
-    assert!(h.editor.borrow().status.starts_with("plugins:"),
+    assert!(h.editor.borrow().status_text().starts_with("plugins:"),
         "plugin_list must be dispatched and write its inventory summary to the status line");
 }
 

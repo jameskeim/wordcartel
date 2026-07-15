@@ -417,7 +417,7 @@ fn install_status(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::R
         "status",
         lua.create_function(move |_, msg: mlua::String| {
             let mut e = editor.try_borrow_mut().map_err(|_| mlua::Error::runtime("plugin: editor busy"))?;
-            e.status = crate::plugin::cap_status(&msg.as_bytes(), crate::limits::PLUGIN_MAX_STATUS_LEN);
+            e.set_status(crate::status::StatusKind::Info, crate::plugin::cap_status(&msg.as_bytes(), crate::limits::PLUGIN_MAX_STATUS_LEN));
             Ok(())
         })?,
     )?;

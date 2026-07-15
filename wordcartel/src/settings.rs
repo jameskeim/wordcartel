@@ -546,18 +546,18 @@ pub(crate) fn perform_settings_save(
     fs:            &dyn crate::fsx::Fs,
 ) -> Option<OverridesFile> {
     if no_config {
-        editor.status = "settings: disabled by --no-config".into();
+        editor.set_status(crate::status::StatusKind::Info, "settings: disabled by --no-config");
         return None;
     }
     let Some(path) = overrides_path else {
-        editor.status = "settings: no config directory".into();
+        editor.set_status(crate::status::StatusKind::Info, "settings: no config directory");
         return None;
     };
     let runtime = runtime_snapshot(editor);
     let of = compute_overrides(&runtime, baseline, existing, mask);
     match save_overrides(fs, path, &of) {
-        Ok(()) => { editor.status = "settings saved".into(); Some(of) }
-        Err(e) => { editor.status = format!("settings: {e}"); None }
+        Ok(()) => { editor.set_status(crate::status::StatusKind::Info, "settings saved"); Some(of) }
+        Err(e) => { editor.set_status(crate::status::StatusKind::Info, format!("settings: {e}")); None }
     }
 }
 
@@ -821,7 +821,7 @@ mod tests {
             &crate::fsx::RealFs,
         );
         assert!(result.is_none(), "must return None on --no-config refusal");
-        assert_eq!(e.status, "settings: disabled by --no-config");
+        assert_eq!(e.status_text(), "settings: disabled by --no-config");
         assert!(!path.exists(), "no file must be written on --no-config refusal");
     }
 
@@ -835,7 +835,7 @@ mod tests {
             &crate::fsx::RealFs,
         );
         assert!(result.is_none(), "must return None when overrides_path is None");
-        assert_eq!(e.status, "settings: no config directory");
+        assert_eq!(e.status_text(), "settings: no config directory");
     }
 
     #[test]
@@ -860,10 +860,10 @@ mod tests {
             &FailFs,
         );
         assert!(result.is_none(), "must return None on IO error");
-        assert!(e.status.starts_with("settings: "),
-            "status must start with 'settings: ': {:?}", e.status);
-        assert!(e.status.contains("boom"),
-            "status must include the IO error string: {:?}", e.status);
+        assert!(e.status_text().starts_with("settings: "),
+            "status must start with 'settings: ': {:?}", e.status_text());
+        assert!(e.status_text().contains("boom"),
+            "status must include the IO error string: {:?}", e.status_text());
     }
 
     #[test]
@@ -883,7 +883,7 @@ mod tests {
             &crate::fsx::RealFs,
         );
         assert!(result.is_some(), "must return Some on success");
-        assert_eq!(e.status, "settings saved");
+        assert_eq!(e.status_text(), "settings saved");
         let of = result.unwrap();
         let expected = compute_overrides(&runtime_snap, &baseline_snap, &OverridesFile::default(), &OverridesFile::default());
         assert_eq!(of, expected, "returned OverridesFile must equal compute_overrides result");
@@ -978,8 +978,8 @@ mod tests {
         let base = snap("cua", ThemeIdentity::Builtin("default".into()), false); // baseline wrap 72
         let of = perform_settings_save(&mut e, false, Some(&path),
             &base, &OverridesFile::default(), &OverridesFile::default(), &crate::fsx::RealFs);
-        assert!(of.is_some(), "save succeeds: {}", e.status);
-        assert_eq!(e.status, "settings saved");
+        assert!(of.is_some(), "save succeeds: {}", e.status_text());
+        assert_eq!(e.status_text(), "settings saved");
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("wrap_column = 40"), "the file carries the key: {text}");
     }

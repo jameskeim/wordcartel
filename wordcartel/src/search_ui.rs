@@ -30,7 +30,7 @@ pub(crate) fn search_replace_all(editor: &mut Editor, clock: &dyn wordcartel_cor
     search_sync(editor); // ensure cache is current
     // §8: invalid regex → distinct status, no mutation.
     if editor.search.as_ref().is_some_and(|s| s.error.is_some()) {
-        editor.status = "invalid regex".into();
+        editor.set_status(crate::status::StatusKind::Info, "invalid regex");
         return;
     }
     let plan: SearchReplacePlan = editor.search.as_ref().and_then(|s| {
@@ -43,7 +43,7 @@ pub(crate) fn search_replace_all(editor: &mut Editor, clock: &dyn wordcartel_cor
         Some((edits, rope.len_bytes(), s.origin))
     });
     let Some((edits, doc_len, origin)) = plan else {
-        editor.status = "No matches".into();
+        editor.set_status(crate::status::StatusKind::Info, "No matches");
         return;
     };
     let n = edits.len();
@@ -54,7 +54,7 @@ pub(crate) fn search_replace_all(editor: &mut Editor, clock: &dyn wordcartel_cor
         .with_selection(wordcartel_core::selection::Selection::single(new_origin));
     editor.active_mut().apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
     if let Some(s) = editor.search.as_mut() { s.origin = new_origin; }
-    editor.status = format!("Replaced {n} occurrences");
+    editor.set_status(crate::status::StatusKind::Info, format!("Replaced {n} occurrences"));
     editor.search = None; // close after replace-all
     derive::rebuild(editor);
     crate::nav::ensure_visible(editor);
@@ -142,7 +142,7 @@ pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_co
     // ranges are stale.  Refuse to apply — a stale range can cause a panic on
     // multibyte boundaries or silently apply at wrong offsets.
     if editor.active().document.version != opened_version {
-        editor.status = "document changed; re-open".into();
+        editor.set_status(crate::status::StatusKind::Info, "document changed; re-open");
         editor.diag = None;
         return;
     }
@@ -173,9 +173,9 @@ pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_co
         match editor.diag_cfg.dictionary.clone() {
             Some(dict_path) => match crate::diagnostics_run::append_word_to_dict(&dict_path, &word) {
                 Ok(()) => editor.diag_providers.reload_dictionary_enabled(),
-                Err(e) => editor.status = format!("add to dictionary failed: {e}"),
+                Err(e) => editor.set_status(crate::status::StatusKind::Info, format!("add to dictionary failed: {e}")),
             },
-            None => editor.status = "no dictionary path configured".into(),
+            None => editor.set_status(crate::status::StatusKind::Info, "no dictionary path configured"),
         }
         editor.diag = None;
         crate::diagnostics_run::retain_unignored(editor);
@@ -337,7 +337,7 @@ mod tests {
         diag_apply_selected(&mut e, &TestClock(3_000));
         assert!(e.diag.is_none(), "overlay closes regardless of outcome");
         assert!(e.dictionary.contains("teh"), "word suppressed client-side even with no path");
-        assert_eq!(e.status, "no dictionary path configured");
+        assert_eq!(e.status_text(), "no dictionary path configured");
         assert!(e.active().diagnostics.slot(DiagSource::Harper).is_none_or(|s| s.diagnostics.is_empty()), "the added word is refiltered out");
         assert_eq!(e.active().diagnostics.slot(wordcartel_core::diagnostics::DiagSource::Harper).and_then(|s| s.recheck_due_at), None, "no re-arm");
     }

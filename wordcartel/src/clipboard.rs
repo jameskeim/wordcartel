@@ -169,7 +169,7 @@ pub fn drain_clipboard_intents(
     if editor.clipboard_provider_dirty {
         *plan = resolve_provider(env, editor.clipboard_provider);
         if clip_tx.send(ClipReq::SelectProvider(plan.layer1)).is_err() {
-            editor.status = "clipboard unavailable".to_string();
+            editor.set_status(crate::status::StatusKind::Info, "clipboard unavailable".to_string());
         }
         editor.clear_clipboard_provider_dirty();
     }
@@ -181,13 +181,13 @@ pub fn drain_clipboard_intents(
             }
         }
         if clip_tx.send(ClipReq::Set(text)).is_err() {
-            editor.status = "clipboard unavailable".to_string();
+            editor.set_status(crate::status::StatusKind::Info, "clipboard unavailable".to_string());
         }
     }
     if let Some(pi) = editor.clipboard_get_pending.take() {
         if clip_tx.send(ClipReq::Get { id: pi.id, buffer_id: pi.buffer_id }).is_err() {
             // No worker (tests / shutdown): notify, then fall back to the register paste path.
-            editor.status = "clipboard unavailable".to_string();
+            editor.set_status(crate::status::StatusKind::Info, "clipboard unavailable".to_string());
             let _ = msg_tx.send(crate::app::Msg::ClipboardPaste {
                 id: pi.id,
                 buffer_id: pi.buffer_id,
@@ -723,13 +723,13 @@ mod tests {
         // A pending Get with no worker -> notice + None fallback.
         ed.clipboard_get_pending = Some(PasteIntent { id: 1, buffer_id: bid });
         drain_clipboard_intents(&mut ed, &bare_env(), &mut plan, &mut out, &clip_tx, &msg_tx);
-        assert_eq!(ed.status, "clipboard unavailable");
+        assert_eq!(ed.status_text(), "clipboard unavailable");
 
         // A pending Set with no worker -> notice.
-        ed.status.clear();
+        ed.clear_transient_status();
         ed.clipboard_sync_request = Some("hello".to_string());
         drain_clipboard_intents(&mut ed, &bare_env(), &mut plan, &mut out, &clip_tx, &msg_tx);
-        assert_eq!(ed.status, "clipboard unavailable");
+        assert_eq!(ed.status_text(), "clipboard unavailable");
     }
 
     #[test]

@@ -83,7 +83,7 @@ pub(crate) fn file_browser_enter(editor: &mut crate::editor::Editor) {
                         crate::file_browser::rebuild_entries(fb);
                     }
                 } else {
-                    editor.status = format!("cannot read directory: {}", target.display());
+                    editor.set_status(crate::status::StatusKind::Info, format!("cannot read directory: {}", target.display()));
                     // stay in prior dir — do NOT mutate fb.dir
                 }
             }
@@ -230,8 +230,8 @@ mod tests {
         assert_eq!(fb_dir.as_deref(), Some(parent.as_path()),
             "fb.dir must remain at parent after Enter on unreadable dir, got: {:?}", fb_dir);
         // Status must mention the unreadable directory.
-        assert!(e.status.contains("cannot read directory"),
-            "status must mention 'cannot read directory', got: {:?}", e.status);
+        assert!(e.status_text().contains("cannot read directory"),
+            "status must mention 'cannot read directory', got: {:?}", e.status_text());
 
         // Restore permissions so cleanup can remove the dir.
         std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o755)).unwrap();

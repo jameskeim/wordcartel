@@ -389,7 +389,7 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             if let Some(text) = editor.register.get().map(str::to_owned) {
                 editor.clipboard_sync_request = Some(text);
             }
-            editor.status = "Copied".to_string();
+            editor.set_status(crate::status::StatusKind::Info, "Copied".to_string());
             CommandResult::Handled
         }
 
@@ -454,24 +454,24 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
             let path_opt = editor.active().document.path.clone();
             match path_opt {
                 None => {
-                    editor.status = "No file name — use Save As".to_string();
+                    editor.set_status(crate::status::StatusKind::Info, "No file name — use Save As".to_string());
                 }
                 Some(path) => {
                     let v = editor.active().document.version;
-                    editor.status = "Saving\u{2026}".to_string();
+                    editor.set_status(crate::status::StatusKind::Info, "Saving\u{2026}".to_string());
                     let content = editor.active().document.buffer.to_string();
                     match file::save_atomic(&path, &content) {
                         Ok(file::SaveOutcome::Saved) => {
                             editor.active_mut().document.mark_saved(v);
-                            editor.status = "Saved".to_string();
+                            editor.set_status(crate::status::StatusKind::Info, "Saved".to_string());
                         }
                         Ok(file::SaveOutcome::Unchanged) => {
                             editor.active_mut().document.mark_saved(v);
-                            editor.status = "(unchanged)".to_string();
+                            editor.set_status(crate::status::StatusKind::Info, "(unchanged)".to_string());
                         }
                         Err(e) => {
                             // Buffer stays dirty; show error in status.
-                            editor.status = e.to_string();
+                            editor.set_status(crate::status::StatusKind::Info, e.to_string());
                         }
                     }
                 }
@@ -515,14 +515,14 @@ pub fn run(cmd: Command, editor: &mut Editor, clock: &dyn Clock) -> CommandResul
                 Scope::Sentence => match prose_sentence_at(editor, nav::head(editor)) {
                     Ok((from, to)) => { set_selection_range(editor, from, to); CommandResult::Handled }
                     Err(NonProse(role)) => {
-                        editor.status = format!("no sentence here ({})", block_kind_label(role));
+                        editor.set_status(crate::status::StatusKind::Info, format!("no sentence here ({})", block_kind_label(role)));
                         CommandResult::Noop
                     }
                 },
                 Scope::Section => match section_range_at(editor, nav::head(editor)) {
                     Some((from, to)) => { set_selection_range(editor, from, to); CommandResult::Handled }
                     None => {
-                        editor.status = "no section here".into();
+                        editor.set_status(crate::status::StatusKind::Info, "no section here");
                         CommandResult::Noop
                     }
                 },

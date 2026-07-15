@@ -21,7 +21,7 @@ fn block(editor: &Editor) -> Option<crate::editor::MarkedBlock> { editor.active(
 /// `block_move` needs (to avoid relocating a block into the hole it leaves) does not
 /// apply here.
 pub fn block_copy(editor: &mut Editor, clock: &dyn Clock) {
-    let Some(b) = block(editor) else { editor.status = "no marked block".into(); return; };
+    let Some(b) = block(editor) else { editor.set_status(crate::status::StatusKind::Info, "no marked block"); return; };
     let text = editor.active().document.buffer.slice(b.start..b.end);
     let caret = nav::head(editor);
     let doc_len = editor.active().document.buffer.len();
@@ -29,14 +29,14 @@ pub fn block_copy(editor: &mut Editor, clock: &dyn Clock) {
     let new_caret = caret + text.len();
     apply_edit(editor, cs, edit, new_caret, clock);
     // block stays — its endpoints map through the insertion via apply.
-    editor.status = "block copied".into();
+    editor.set_status(crate::status::StatusKind::Info, "block copied");
 }
 
 pub fn block_move(editor: &mut Editor, clock: &dyn Clock) {
-    let Some(b) = block(editor) else { editor.status = "no marked block".into(); return; };
+    let Some(b) = block(editor) else { editor.set_status(crate::status::StatusKind::Info, "no marked block"); return; };
     let caret = nav::head(editor);
     if caret >= b.start && caret < b.end {
-        editor.status = "can't move a block into itself".into();
+        editor.set_status(crate::status::StatusKind::Info, "can't move a block into itself");
         return;
     }
     let text = editor.active().document.buffer.slice(b.start..b.end);
@@ -64,16 +64,16 @@ pub fn block_move(editor: &mut Editor, clock: &dyn Clock) {
         crate::registry::snap_caret_out_of_fold(editor);
     }
     editor.active_mut().marked_block = None; // consumed
-    editor.status = "block moved".into();
+    editor.set_status(crate::status::StatusKind::Info, "block moved");
 }
 
 pub fn block_delete(editor: &mut Editor, clock: &dyn Clock) {
-    let Some(b) = block(editor) else { editor.status = "no marked block".into(); return; };
+    let Some(b) = block(editor) else { editor.set_status(crate::status::StatusKind::Info, "no marked block"); return; };
     let doc_len = editor.active().document.buffer.len();
     let (cs, edit) = crate::commands::build_multi_replace(&[(b.start, b.end, String::new())], doc_len);
     apply_edit(editor, cs, edit, b.start, clock);
     editor.active_mut().marked_block = None;
-    editor.status = "block deleted".into();
+    editor.set_status(crate::status::StatusKind::Info, "block deleted");
 }
 
 fn apply_edit(
@@ -94,7 +94,7 @@ fn apply_edit(
 pub fn block_jump_begin(editor: &mut Editor) { block_jump(editor, true); }
 pub fn block_jump_end(editor: &mut Editor)   { block_jump(editor, false); }
 fn block_jump(editor: &mut Editor, to_start: bool) {
-    let Some(b) = block(editor) else { editor.status = "no marked block".into(); return; };
+    let Some(b) = block(editor) else { editor.set_status(crate::status::StatusKind::Info, "no marked block"); return; };
     let target = if to_start { b.start } else { b.end };
     let pre = nav::head(editor);
     crate::marks::record_jump(editor.active_mut(), pre);
@@ -110,22 +110,22 @@ pub fn block_toggle_hidden(editor: &mut Editor) {
         Some(b) => {
             b.hidden = !b.hidden;
             let h = b.hidden;
-            editor.status = if h { "block hidden".into() } else { "block shown".into() };
+            editor.set_status(crate::status::StatusKind::Info, if h { "block hidden" } else { "block shown" });
         }
-        None => editor.status = "no marked block".into(),
+        None => editor.set_status(crate::status::StatusKind::Info, "no marked block"),
     }
 }
 
 pub fn block_clear(editor: &mut Editor) {
     editor.active_mut().marked_block = None;
     editor.active_mut().pending_block_begin = None;
-    editor.status = "block cleared".into();
+    editor.set_status(crate::status::StatusKind::Info, "block cleared");
 }
 
 /// ^KW: open the Write-Block minibuffer pre-filled with the document's directory.
 pub fn block_write(editor: &mut Editor) {
     if editor.active().marked_block.is_none() {
-        editor.status = "no marked block".into();
+        editor.set_status(crate::status::StatusKind::Info, "no marked block");
         return;
     }
     let pre = editor.active().document.path.as_ref()
@@ -143,14 +143,14 @@ pub fn block_write(editor: &mut Editor) {
 pub fn block_begin(editor: &mut Editor) {
     let at = nav::head(editor);
     editor.active_mut().pending_block_begin = Some(at);
-    editor.status = "block begin set".into();
+    editor.set_status(crate::status::StatusKind::Info, "block begin set");
 }
 
 /// Complete the block from pending begin to current caret (^KK).
 /// Normalizes so start <= end; rejects empty; clears pending on success or error.
 pub fn block_end(editor: &mut Editor) {
     let Some(begin) = editor.active().pending_block_begin else {
-        editor.status = "set block begin first".into();
+        editor.set_status(crate::status::StatusKind::Info, "set block begin first");
         return;
     };
     let end = nav::head(editor);
@@ -165,7 +165,7 @@ pub fn mark_block_from_selection(editor: &mut Editor) {
     let (from, to) = (sel.from(), sel.to());
     if from == to {
         editor.active_mut().pending_block_begin = None;
-        editor.status = "no selection to mark".into();
+        editor.set_status(crate::status::StatusKind::Info, "no selection to mark");
         return;
     }
     let caret = nav::head(editor);
@@ -190,7 +190,7 @@ pub fn select_marked_block(editor: &mut Editor) {
             crate::derive::rebuild(editor);
             nav::ensure_visible(editor);
         }
-        None => { editor.status = "no marked block".into(); }
+        None => { editor.set_status(crate::status::StatusKind::Info, "no marked block"); }
     }
 }
 
@@ -199,11 +199,11 @@ pub fn select_marked_block(editor: &mut Editor) {
 fn set_block(editor: &mut Editor, a: usize, b: usize) {
     let (start, end) = (a.min(b), a.max(b));
     if start == end {
-        editor.status = "empty block".into();
+        editor.set_status(crate::status::StatusKind::Info, "empty block");
         return;
     }
     editor.active_mut().marked_block = Some(MarkedBlock { start, end, hidden: false });
-    editor.status = "block marked".into();
+    editor.set_status(crate::status::StatusKind::Info, "block marked");
 }
 
 #[cfg(test)]
@@ -311,7 +311,7 @@ mod tests {
         e.active_mut().document.selection = wordcartel_core::selection::Selection::single(2); // inside
         crate::blocks_marked::block_move(&mut e, &TestClock(0));
         assert_eq!(e.active().document.buffer.to_string(), "hello\n");
-        assert_eq!(e.status, "can't move a block into itself");
+        assert_eq!(e.status_text(), "can't move a block into itself");
     }
 
     #[test]
@@ -327,7 +327,7 @@ mod tests {
     fn ops_with_no_block_status() {
         let mut e = Editor::new_from_text("abc\n", None, (40, 10));
         crate::blocks_marked::block_copy(&mut e, &TestClock(0));
-        assert_eq!(e.status, "no marked block");
+        assert_eq!(e.status_text(), "no marked block");
     }
 
     #[test]
@@ -346,7 +346,7 @@ mod tests {
         let mut e = Editor::new_from_text("abc\n", None, (40, 10));
         crate::blocks_marked::block_end(&mut e);
         assert!(e.active().marked_block.is_none());
-        assert_eq!(e.status, "set block begin first");
+        assert_eq!(e.status_text(), "set block begin first");
     }
 
     #[test]
@@ -357,7 +357,7 @@ mod tests {
         crate::blocks_marked::block_end(&mut e); // begin==end==2 → reject
         assert!(e.active().marked_block.is_none());
         assert!(e.active().pending_block_begin.is_none(), "pending cleared even on empty-reject");
-        assert_eq!(e.status, "empty block");
+        assert_eq!(e.status_text(), "empty block");
     }
 
     #[test]
@@ -388,6 +388,6 @@ mod tests {
         let before = e.active().document.selection.clone();
         crate::blocks_marked::select_marked_block(&mut e);
         assert_eq!(e.active().document.selection, before, "selection unchanged with no block");
-        assert!(!e.status.is_empty());
+        assert!(!e.status_text().is_empty());
     }
 }

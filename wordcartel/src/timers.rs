@@ -33,19 +33,19 @@ pub(crate) fn save_timeout_tick(editor: &mut Editor, now: u64) {
                 crate::editor::PostSaveAction::Quit => {
                     // Re-raise the quit-confirm modal so the user can choose again.
                     editor.open_prompt(crate::prompt::Prompt::quit_confirm());
-                    editor.status = "Save still running — choose again".into();
+                    editor.set_status(crate::status::StatusKind::Info, "Save still running — choose again");
                 }
                 crate::editor::PostSaveAction::ContinueQuitDrain => {
                     // Codex C3: a stranded drain (no in-flight save, no re-drive) would
                     // hang the quit. Abort the whole quit rather than silently clearing.
                     editor.quit_drain = None;
                     editor.quit_drain_advance = false;
-                    editor.status = "save timed out — quit cancelled".into();
+                    editor.set_status(crate::status::StatusKind::Info, "save timed out — quit cancelled");
                 }
                 crate::editor::PostSaveAction::CloseBuffer { .. } => {
                     // C4: a close is not a session-ending action the user is
                     // waiting on — cancel without re-prompting (spec D3).
-                    editor.status = "save timed out — close cancelled".into();
+                    editor.set_status(crate::status::StatusKind::Info, "save timed out — close cancelled");
                 }
             }
         }
@@ -258,7 +258,7 @@ mod tests {
         crate::timers::save_timeout_tick(&mut e, crate::timers::SAVE_QUIT_TIMEOUT_MS + 1);
 
         assert!(e.pending_after_save.is_none(), "pending cleared on CloseBuffer timeout");
-        assert_eq!(e.status, "save timed out — close cancelled");
+        assert_eq!(e.status_text(), "save timed out — close cancelled");
         assert!(e.by_id(id).is_some(), "buffer NOT closed — timeout only cancels");
         assert!(e.prompt.is_none(), "no re-prompt for a close timeout (spec D3)");
 

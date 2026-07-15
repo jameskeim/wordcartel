@@ -17,7 +17,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
     if let Msg::Input(Event::Key(k)) = &msg {
         if k.kind == crossterm::event::KeyEventKind::Press {
             match k.code {
-                crossterm::event::KeyCode::Esc => { editor.pending_mark = None; editor.status.clear(); }
+                crossterm::event::KeyCode::Esc => { editor.pending_mark = None; editor.clear_transient_status(); }
                 crossterm::event::KeyCode::Char(c) => resolve_pending(editor, c),
                 _ => { editor.pending_mark = None; } // non-name key cancels
             }
@@ -28,8 +28,8 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
     crate::app::Handled::Pass(msg)
 }
 
-pub fn set_mark(editor: &mut Editor)  { editor.pending_mark = Some(MarkPending::Set); editor.status = "set mark:".into(); }
-pub fn jump_to_mark(editor: &mut Editor) { editor.pending_mark = Some(MarkPending::Jump); editor.status = "jump to mark:".into(); }
+pub fn set_mark(editor: &mut Editor)  { editor.pending_mark = Some(MarkPending::Set); editor.set_status(crate::status::StatusKind::Info, "set mark:"); }
+pub fn jump_to_mark(editor: &mut Editor) { editor.pending_mark = Some(MarkPending::Jump); editor.set_status(crate::status::StatusKind::Info, "jump to mark:"); }
 
 /// Push `pre` onto the ring as a deliberate jump origin.
 pub fn record_jump(buf: &mut Buffer, pre: usize) {
@@ -64,7 +64,7 @@ pub fn jump_back(editor: &mut Editor) {
             Some(buf.jump_ring[buf.ring_cursor])
         }
     }; // <- mutable borrow ends here
-    let Some(raw) = raw else { editor.status = "ring: at oldest".into(); return; };
+    let Some(raw) = raw else { editor.set_status(crate::status::StatusKind::Info, "ring: at oldest"); return; };
     let off = nav::clamp_snap(editor, raw);
     let off = place_caret_visible(editor, off, CaretPlace::UnfoldTo);
     editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(off);
@@ -82,7 +82,7 @@ pub fn jump_forward(editor: &mut Editor) {
             Some(buf.jump_ring[buf.ring_cursor])
         }
     };
-    let Some(raw) = raw else { editor.status = "ring: at newest".into(); return; };
+    let Some(raw) = raw else { editor.set_status(crate::status::StatusKind::Info, "ring: at newest"); return; };
     let off = nav::clamp_snap(editor, raw);
     let off = place_caret_visible(editor, off, CaretPlace::UnfoldTo);
     editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(off);
@@ -116,13 +116,13 @@ pub fn resolve_pending(editor: &mut Editor, ch: char) {
     match editor.pending_mark.take() {
         Some(MarkPending::Set) => {
             set_char_mark(editor, ch);
-            editor.status = format!("mark {ch} set");
+            editor.set_status(crate::status::StatusKind::Info, format!("mark {ch} set"));
         }
         Some(MarkPending::Jump) => {
             if jump_char_mark(editor, ch) {
-                editor.status = format!("jumped to mark {ch}");
+                editor.set_status(crate::status::StatusKind::Info, format!("jumped to mark {ch}"));
             } else {
-                editor.status = format!("no mark {ch}");
+                editor.set_status(crate::status::StatusKind::Info, format!("no mark {ch}"));
             }
         }
         None => {}

@@ -124,7 +124,7 @@ impl ProviderSet {
 pub fn apply_provider_event(editor: &mut Editor, source: DiagSource, ev: ProviderEvent, clock: &dyn Clock) {
     match ev {
         ProviderEvent::Restarted => {
-            editor.status = format!("{} restarted", source.label());
+            editor.set_status(crate::status::StatusKind::Info, format!("{} restarted", source.label()));
             if crate::diagnostics_run::should_run_diagnostics(editor)
                 && editor.diag_providers.is_enabled(source)
             {
@@ -133,7 +133,7 @@ pub fn apply_provider_event(editor: &mut Editor, source: DiagSource, ev: Provide
                 editor.active_mut().diagnostics.slot_mut(source).arm(now, debounce);
             }
         }
-        ProviderEvent::Degraded(hint) => { editor.status = hint; }
+        ProviderEvent::Degraded(hint) => { editor.set_status(crate::status::StatusKind::Info, hint); }
     }
 }
 
@@ -266,7 +266,7 @@ mod tests {
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = RenderMode::Review;
         apply_provider_event(&mut e, DiagSource::Harper, ProviderEvent::Restarted, &TestClock::new(1000));
-        assert_eq!(e.status, "Harper restarted");
+        assert_eq!(e.status_text(), "Harper restarted");
         assert_eq!(e.active().diagnostics.slot(DiagSource::Harper).unwrap().recheck_due_at,
             Some(1000 + e.diag_cfg.debounce_ms));
     }
@@ -278,7 +278,7 @@ mod tests {
         e.diag_cfg.enabled = true;
         e.active_mut().view.mode = RenderMode::LivePreview;
         apply_provider_event(&mut e, DiagSource::Harper, ProviderEvent::Restarted, &TestClock::new(1000));
-        assert_eq!(e.status, "Harper restarted");
+        assert_eq!(e.status_text(), "Harper restarted");
         assert!(e.active().diagnostics.slot(DiagSource::Harper).is_none(), "not Review: no arm");
     }
 
@@ -289,7 +289,7 @@ mod tests {
         e.diag_cfg.enabled = false;
         e.active_mut().view.mode = RenderMode::Review;
         apply_provider_event(&mut e, DiagSource::Harper, ProviderEvent::Restarted, &TestClock::new(1000));
-        assert_eq!(e.status, "Harper restarted");
+        assert_eq!(e.status_text(), "Harper restarted");
         assert!(e.active().diagnostics.slot(DiagSource::Harper).is_none(), "disabled: no arm");
     }
 
@@ -311,7 +311,7 @@ mod tests {
         let mut e = Editor::new_from_text("x\n", None, (40, 10));
         apply_provider_event(&mut e, DiagSource::Harper,
             ProviderEvent::Degraded(crate::harper_ls::INSTALL_HINT.into()), &TestClock::new(0));
-        assert_eq!(e.status, crate::harper_ls::INSTALL_HINT);
+        assert_eq!(e.status_text(), crate::harper_ls::INSTALL_HINT);
     }
 
     // ------------------------------------------------------------------

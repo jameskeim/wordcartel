@@ -97,7 +97,7 @@ pub fn open_clean_recovery(editor: &mut crate::editor::Editor) {
 /// (the TOCTOU-safe deletion unit) before the count-confirm modal opens.
 fn raise_clean_recovery(editor: &mut crate::editor::Editor, files: Vec<std::path::PathBuf>) {
     if files.is_empty() {
-        editor.status = "No recovery files to clean".into();
+        editor.set_status(crate::status::StatusKind::Info, "No recovery files to clean");
         return;
     }
     let n = files.len();
@@ -122,7 +122,7 @@ pub fn save_as_submit(editor: &mut crate::editor::Editor, text: &str,
                       msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
     let t = text.trim();
     if t.is_empty() {
-        editor.status = "save-as: empty path".into();
+        editor.set_status(crate::status::StatusKind::Info, "save-as: empty path");
         editor.pending_save_as = None;
         // Effort 6 (Codex C2): backing out of a drain's Save-As aborts the quit.
         editor.quit_drain = None;
@@ -142,9 +142,9 @@ pub fn save_as_submit(editor: &mut crate::editor::Editor, text: &str,
 /// confirmation if the target exists, else write the block text immediately.
 /// Synchronous: uses `file::save_atomic` directly; does NOT touch document state.
 pub fn block_write_submit(editor: &mut crate::editor::Editor, text: &str) {
-    let Some(b) = editor.active().marked_block else { editor.status = "no marked block".into(); return; };
+    let Some(b) = editor.active().marked_block else { editor.set_status(crate::status::StatusKind::Info, "no marked block"); return; };
     let t = text.trim();
-    if t.is_empty() { editor.status = "write block: empty path".into(); return; }
+    if t.is_empty() { editor.set_status(crate::status::StatusKind::Info, "write block: empty path"); return; }
     let target = expand_path(t);
     if target.exists() {
         editor.pending_write_block = Some(target.clone());
@@ -157,8 +157,8 @@ pub fn block_write_submit(editor: &mut crate::editor::Editor, text: &str) {
 fn perform_block_write(editor: &mut crate::editor::Editor, target: &std::path::Path, start: usize, end: usize) {
     let text = editor.active().document.buffer.slice(start..end);
     match crate::file::save_atomic(target, &text) {
-        Ok(_)  => editor.status = format!("wrote block to {}", target.display()),
-        Err(e) => editor.status = e.to_string(),
+        Ok(_)  => editor.set_status(crate::status::StatusKind::Info, format!("wrote block to {}", target.display())),
+        Err(e) => editor.set_status(crate::status::StatusKind::Info, e.to_string()),
     }
 }
 
@@ -291,7 +291,7 @@ pub fn resolve_prompt(
                 if let Some(b) = editor.active().marked_block {
                     perform_block_write(editor, &t, b.start, b.end);
                 } else {
-                    editor.status = "no marked block".into();
+                    editor.set_status(crate::status::StatusKind::Info, "no marked block");
                 }
             }
         }
@@ -313,7 +313,7 @@ pub fn resolve_prompt(
                 if !crate::swap::recovery_path_still_cleanable(&p, &protected) { continue; }
                 if std::fs::remove_file(&p).is_ok() { n += 1; }
             }
-            editor.status = format!("Cleaned {n} file(s)");
+            editor.set_status(crate::status::StatusKind::Info, format!("Cleaned {n} file(s)"));
         }
     }
     editor.prompt = None;
@@ -330,7 +330,7 @@ pub(crate) fn submit_filter_line(
     msg_tx: &std::sync::mpsc::Sender<Msg>,
 ) {
     let Some(spec) = build_filter_spec(line) else {
-        editor.status = "filter: no command given".into();
+        editor.set_status(crate::status::StatusKind::Info, "filter: no command given");
         return;
     };
     crate::filter::dispatch_filter(editor, spec, msg_tx.clone());
@@ -363,13 +363,13 @@ fn build_filter_spec(line: &str) -> Option<crate::filter::FilterSpec> {
 pub(crate) fn wrap_column_submit(editor: &mut crate::editor::Editor, text: &str) {
     let n: u16 = match text.trim().parse() {
         Ok(n) => n,
-        Err(_) => { editor.status = "wrap column: not a number".to_string(); return; }
+        Err(_) => { editor.set_status(crate::status::StatusKind::Info, "wrap column: not a number".to_string()); return; }
     };
     let (value, msg) = if n < 20 { (20, "wrap column: 20 (minimum)".to_string()) }
                        else if n > 9999 { (9999, "wrap column: 9999 (maximum)".to_string()) }
                        else { (n, format!("wrap column: {n}")) };
     editor.view_opts.wrap_column = value;
-    editor.status = msg;
+    editor.set_status(crate::status::StatusKind::Info, msg);
     crate::derive::rebuild(editor);
     crate::nav::ensure_visible(editor);
 }
@@ -379,7 +379,7 @@ pub(crate) fn wrap_column_submit(editor: &mut crate::editor::Editor, text: &str)
 pub(crate) fn goto_line_submit(editor: &mut crate::editor::Editor, text: &str) {
     let n: usize = match text.trim().parse() {
         Ok(n) => n,
-        Err(_) => { editor.status = "not a line number".to_string(); return; }
+        Err(_) => { editor.set_status(crate::status::StatusKind::Info, "not a line number".to_string()); return; }
     };
     let total = crate::derive::total_logical_lines(&editor.active().document.buffer);
     let line_index = n.max(1).min(total) - 1;            // 1-based clamp → 0-based index
@@ -435,7 +435,7 @@ mod tests {
             event: ProviderEvent::Degraded(INSTALL_HINT.into()) },
             &mut e, &ex, &clk, &tx);
         assert!(matches!(handled, crate::app::Handled::Done(_)), "interceptor consumes and folds");
-        assert_eq!(e.status, INSTALL_HINT, "Degraded reached the status line despite the open modal");
+        assert_eq!(e.status_text(), INSTALL_HINT, "Degraded reached the status line despite the open modal");
     }
 
     #[test]
@@ -484,22 +484,22 @@ mod tests {
         let initial = e.view_opts.wrap_column;
         wrap_column_submit(&mut e, "xyz");                 // parse failure → UNCHANGED
         assert_eq!(e.view_opts.wrap_column, initial);
-        assert_eq!(e.status, "wrap column: not a number");
+        assert_eq!(e.status_text(), "wrap column: not a number");
         wrap_column_submit(&mut e, "99999");               // u16 overflow → UNCHANGED
         assert_eq!(e.view_opts.wrap_column, initial);
-        assert_eq!(e.status, "wrap column: not a number");
+        assert_eq!(e.status_text(), "wrap column: not a number");
         wrap_column_submit(&mut e, "15");                  // below min → CLAMPED SET
         assert_eq!(e.view_opts.wrap_column, 20);
-        assert_eq!(e.status, "wrap column: 20 (minimum)");
+        assert_eq!(e.status_text(), "wrap column: 20 (minimum)");
         wrap_column_submit(&mut e, "55");                  // success
         assert_eq!(e.view_opts.wrap_column, 55);
-        assert_eq!(e.status, "wrap column: 55");
+        assert_eq!(e.status_text(), "wrap column: 55");
         wrap_column_submit(&mut e, "12000");               // above repar's ceiling → CLAMPED SET
         assert_eq!(e.view_opts.wrap_column, 9999);
-        assert_eq!(e.status, "wrap column: 9999 (maximum)");
+        assert_eq!(e.status_text(), "wrap column: 9999 (maximum)");
         wrap_column_submit(&mut e, "65535");               // u16-max, still above ceiling
         assert_eq!(e.view_opts.wrap_column, 9999);
-        assert_eq!(e.status, "wrap column: 9999 (maximum)");
+        assert_eq!(e.status_text(), "wrap column: 9999 (maximum)");
     }
 
     #[test]
@@ -546,7 +546,7 @@ mod tests {
         assert_eq!(e.active().document.selection.primary().head, 0);
         goto_line_submit(&mut e, "xyz");          // garbage → status, no move
         assert_eq!(e.active().document.selection.primary().head, 0);
-        assert_eq!(e.status, "not a line number");           // rejected input sets the status
+        assert_eq!(e.status_text(), "not a line number");           // rejected input sets the status
     }
 
     #[test]
@@ -696,7 +696,7 @@ mod tests {
         raise_clean_recovery(&mut e, Vec::new());
         assert!(e.prompt.is_none(), "count 0 raises NO prompt");
         assert!(e.pending_clean.is_empty());
-        assert_eq!(e.status, "No recovery files to clean");
+        assert_eq!(e.status_text(), "No recovery files to clean");
     }
 
     #[test]
@@ -736,7 +736,7 @@ mod tests {
         assert!(latecomer.exists(), "a file appearing after the snapshot is NEVER swept (TOCTOU-safe)");
         assert!(e.pending_clean.is_empty(), "snapshot consumed");
         assert!(e.prompt.is_none(), "prompt dismissed");
-        assert_eq!(e.status, "Cleaned 2 file(s)");
+        assert_eq!(e.status_text(), "Cleaned 2 file(s)");
         let _ = std::fs::remove_file(&latecomer);
     }
 
@@ -795,7 +795,7 @@ mod tests {
         assert!(!sp_ok.exists(), "the still-valueless snapshot swap IS deleted");
         assert!(sp_bad.exists(),
             "a swap that became recoverable while the prompt was open is NEVER deleted — no data loss");
-        assert_eq!(e.status, "Cleaned 1 file(s)", "status reports the ACTUAL deleted count (a subset)");
+        assert_eq!(e.status_text(), "Cleaned 1 file(s)", "status reports the ACTUAL deleted count (a subset)");
         assert!(e.pending_clean.is_empty(), "snapshot consumed");
         assert!(e.prompt.is_none(), "prompt dismissed");
         for f in [&sp_ok, &sp_bad, &doc_ok, &doc_bad] { let _ = std::fs::remove_file(f); }

@@ -380,13 +380,13 @@ impl Registry {
             ($r:expr, $($d:literal => $ch:literal),+ $(,)?) => {$(
                 $r.register(concat!("set_bookmark_", $d), concat!("Set Bookmark ", $d), None,
                     |c| { crate::marks::set_char_mark(c.editor, $ch);
-                          c.editor.status = concat!("bookmark ", $d, " set").to_string();
+                          c.editor.set_status(crate::status::StatusKind::Info, concat!("bookmark ", $d, " set").to_string());
                           CommandResult::Handled });
                 $r.register(concat!("jump_bookmark_", $d), concat!("Jump to Bookmark ", $d), None,
                     |c| { if crate::marks::jump_char_mark(c.editor, $ch) {
-                              c.editor.status = concat!("jumped to bookmark ", $d).to_string();
+                              c.editor.set_status(crate::status::StatusKind::Info, concat!("jumped to bookmark ", $d).to_string());
                           } else {
-                              c.editor.status = concat!("no bookmark ", $d).to_string();
+                              c.editor.set_status(crate::status::StatusKind::Info, concat!("no bookmark ", $d).to_string());
                           }
                           CommandResult::Handled });
             )+};
@@ -477,7 +477,7 @@ impl Registry {
         // for "what the lens shows".
         r.register("quick_fix", "Quick Fix\u{2026}", None, |c| {
             let Some(diags) = crate::diagnostics_run::active_lens_diags(c.editor) else {
-                c.editor.status = "no diagnostic here".into();
+                c.editor.set_status(crate::status::StatusKind::Info, "no diagnostic here");
                 return CommandResult::Handled;
             };
             let caret = c.editor.active().document.selection.primary().head;
@@ -487,7 +487,7 @@ impl Registry {
             if let Some(d) = diag {
                 c.editor.open_diag(d);
             } else {
-                c.editor.status = "no diagnostic here".into();
+                c.editor.set_status(crate::status::StatusKind::Info, "no diagnostic here");
             }
             CommandResult::Handled
         });
@@ -595,7 +595,7 @@ impl Registry {
                 crate::derive::rebuild(c.editor);
                 crate::nav::ensure_visible(c.editor);
             } else {
-                c.editor.status = "no heading at cursor".into();
+                c.editor.set_status(crate::status::StatusKind::Info, "no heading at cursor");
             }
             CommandResult::Handled
         });
@@ -665,14 +665,14 @@ impl Registry {
         // (View, OnOff mark). All three route through Editor::set_splash (contract law 6);
         // the splash paints only at launch, so a change takes effect on the NEXT run.
         r.register("splash_on",  "Splash: On",  None, |c| { c.editor.set_splash(true);
-            c.editor.status = "splash: on (takes effect next launch)".into(); CommandResult::Handled });
+            c.editor.set_status(crate::status::StatusKind::Info, "splash: on (takes effect next launch)"); CommandResult::Handled });
         r.register("splash_off", "Splash: Off", None, |c| { c.editor.set_splash(false);
-            c.editor.status = "splash: off (takes effect next launch)".into(); CommandResult::Handled });
+            c.editor.set_status(crate::status::StatusKind::Info, "splash: off (takes effect next launch)"); CommandResult::Handled });
         r.register_stateful("toggle_splash", "Startup Splash", Some(MenuCategory::View),
             |e| MenuMark::OnOff(e.view_opts.splash),
             |c| { let next = !c.editor.view_opts.splash; c.editor.set_splash(next);
-                  c.editor.status = if next { "splash: on (takes effect next launch)".into() }
-                                    else { "splash: off (takes effect next launch)".into() };
+                  c.editor.set_status(crate::status::StatusKind::Info, if next { "splash: on (takes effect next launch)" }
+                                    else { "splash: off (takes effect next launch)" });
                   CommandResult::Handled });
 
         // Caret shape: set-per-state (palette-only) + 4-state cycle representative (View, state-in-label).
@@ -783,7 +783,7 @@ impl Registry {
         // (plugin::reload::perform_reload) does the whole-VM teardown+rebuild, never inline here.
         r.register("plugins_reload", "Reload Plugins", Some(MenuCategory::Settings), |c| {
             c.editor.plugins_reload_requested = true;
-            c.editor.status = "reloading plugins\u{2026}".into();
+            c.editor.set_status(crate::status::StatusKind::Info, "reloading plugins\u{2026}");
             CommandResult::Handled
         });
         r.register("plugin_list", "List Plugins", Some(MenuCategory::Settings), |c| {
@@ -793,8 +793,8 @@ impl Registry {
             let cmds: usize = inv.iter().map(|r| r.commands).sum();
             let hooks: usize = inv.iter().map(|r| r.hooks).sum(); // real hook total (Task 6 wiring)
             let timers = c.editor.pending_plugin_timers.len(); // P3: live armed-timer count
-            c.editor.status = format!(
-                "plugins: {ok} ok ({cmds} cmds, {hooks} hooks, {timers} timers), {failed} failed");
+            c.editor.set_status(crate::status::StatusKind::Info, format!(
+                "plugins: {ok} ok ({cmds} cmds, {hooks} hooks, {timers} timers), {failed} failed"));
             CommandResult::Handled
         });
 
@@ -838,7 +838,7 @@ impl Registry {
                 }
             },
             None => {
-                ctx.editor.status = format!("unknown command: {}", id.0);
+                ctx.editor.set_status(crate::status::StatusKind::Info, format!("unknown command: {}", id.0));
                 CommandResult::Noop
             }
         }
@@ -866,12 +866,12 @@ impl Registry {
 /// preset and the rebuild flag — the run loop swaps the trie between reduces (spec D2).
 fn switch_keymap_preset(editor: &mut crate::editor::Editor, preset: &str) {
     if editor.active_keymap_preset == preset {
-        editor.status = format!("keymap: {preset} (already active)");
+        editor.set_status(crate::status::StatusKind::Info, format!("keymap: {preset} (already active)"));
         return;
     }
     editor.active_keymap_preset = preset.to_string();
     editor.keymap_rebuild = true;
-    editor.status = format!("keymap: {preset}");
+    editor.set_status(crate::status::StatusKind::Info, format!("keymap: {preset}"));
 }
 
 /// Toggle the chrome disposition (Full ⇄ Zen). Mirrors `switch_keymap_preset` in structure:
@@ -885,7 +885,7 @@ fn toggle_chrome(editor: &mut crate::editor::Editor) {
     // Arm 1 — cue/monochrome theme: disposition flip has no visible effect (derive_chrome
     // is a no-op on monochrome themes); inform the user without changing state.
     if editor.theme.monochrome {
-        editor.status = "chrome: n/a (cue mode)".into();
+        editor.set_status(crate::status::StatusKind::Info, "chrome: n/a (cue mode)");
         return;
     }
     // Flip the disposition and request a full re-derive in the between-reduces arm.
@@ -906,17 +906,17 @@ fn toggle_chrome(editor: &mut crate::editor::Editor) {
         && matches!(editor.theme.base_fg, Color::Rgb { .. });
     if !rgb_bases {
         let name = editor.theme.name.clone();
-        editor.status = format!("chrome: {label} (no effect: {name} has fixed chrome)");
+        editor.set_status(crate::status::StatusKind::Info, format!("chrome: {label} (no effect: {name} has fixed chrome)"));
         return;
     }
     // Arm 3 — Rgb theme at Ansi16 depth: the fixed 5-face Ansi16 policy applied by
     // resolve_theme overrides the derived faces; toggling disposition has no visible effect.
     if editor.depth == Depth::Ansi16 {
-        editor.status = format!("chrome: {label} (no effect at 16-color depth)");
+        editor.set_status(crate::status::StatusKind::Info, format!("chrome: {label} (no effect at 16-color depth)"));
         return;
     }
     // Normal arm: derived Rgb theme at Truecolor/256; the rederive will visibly change chrome.
-    editor.status = format!("chrome: {label}");
+    editor.set_status(crate::status::StatusKind::Info, format!("chrome: {label}"));
 }
 
 /// Flip the canvas opacity. Render-only — no re-derive. The flip always persists (canvas is a
@@ -935,10 +935,10 @@ fn toggle_canvas(editor: &mut crate::editor::Editor) {
     let has_canvas = matches!(editor.theme.base_bg, Color::Rgb { .. }) && editor.depth != Depth::None;
     if !has_canvas {
         let name = editor.theme.name.clone();
-        editor.status = format!("canvas: {label} (no effect: {name} has no canvas)");
+        editor.set_status(crate::status::StatusKind::Info, format!("canvas: {label} (no effect: {name} has no canvas)"));
         return;
     }
-    editor.status = format!("canvas: {label}");
+    editor.set_status(crate::status::StatusKind::Info, format!("canvas: {label}"));
 }
 
 /// Thin adapter: run a built-in `Command` against the Ctx's editor+clock.
@@ -973,7 +973,7 @@ fn heading_jump(c: &mut Ctx, dir: Dirn) {
         crate::derive::rebuild(c.editor);
         crate::nav::ensure_visible(c.editor);
     } else {
-        c.editor.status = "no heading".into();
+        c.editor.set_status(crate::status::StatusKind::Info, "no heading");
     }
 }
 
@@ -1367,7 +1367,7 @@ mod tests {
         let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
         let r = reg.dispatch(CommandId("nope"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Noop);
-        assert!(e.status.contains("unknown command"), "must surface, never silent (§12.5)");
+        assert!(e.status_text().contains("unknown command"), "must surface, never silent (§12.5)");
     }
 
     #[test]
@@ -1496,7 +1496,7 @@ mod tests {
         let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
         let r = reg.dispatch(CommandId("plugin_list"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Handled);
-        assert_eq!(e.status, "plugins: 1 ok (2 cmds, 1 hooks, 0 timers), 1 failed");
+        assert_eq!(e.status_text(), "plugins: 1 ok (2 cmds, 1 hooks, 0 timers), 1 failed");
     }
 
     #[test]
@@ -1526,7 +1526,7 @@ mod tests {
         let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx };
         let r = reg.dispatch(CommandId("plugin_list"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Handled);
-        assert_eq!(e.status, "plugins: 1 ok (2 cmds, 1 hooks, 2 timers), 0 failed");
+        assert_eq!(e.status_text(), "plugins: 1 ok (2 cmds, 1 hooks, 2 timers), 0 failed");
     }
 
     // -----------------------------------------------------------------------
@@ -1543,21 +1543,21 @@ mod tests {
         assert_eq!(ed.canvas, CanvasMode::Opaque);
         toggle_canvas(&mut ed);
         assert_eq!(ed.canvas, CanvasMode::Transparent);
-        assert_eq!(ed.status, "canvas: transparent");
+        assert_eq!(ed.status_text(), "canvas: transparent");
         // Non-Rgb theme: flips + persists, honest "no effect".
         let mut ed2 = crate::editor::Editor::new_from_text("x", None, (40, 4));
         ed2.theme = wordcartel_core::theme::Theme::builtin("terminal-plain").unwrap();
         ed2.depth = Depth::Truecolor;
         toggle_canvas(&mut ed2);
         assert_eq!(ed2.canvas, CanvasMode::Transparent, "flip persists even when inert");
-        assert_eq!(ed2.status, "canvas: transparent (no effect: terminal-plain has no canvas)");
+        assert_eq!(ed2.status_text(), "canvas: transparent (no effect: terminal-plain has no canvas)");
         // Depth::None (cue) on an Rgb theme: also "no effect" (no color to paint).
         let mut ed3 = crate::editor::Editor::new_from_text("x", None, (40, 4));
         ed3.theme = wordcartel_core::theme::Theme::builtin("flexoki-dark").unwrap();
         ed3.depth = Depth::None;
         toggle_canvas(&mut ed3);
         assert_eq!(ed3.canvas, CanvasMode::Transparent);
-        assert_eq!(ed3.status, "canvas: transparent (no effect: flexoki-dark has no canvas)");
+        assert_eq!(ed3.status_text(), "canvas: transparent (no effect: flexoki-dark has no canvas)");
     }
 
     // -----------------------------------------------------------------------
@@ -1572,11 +1572,11 @@ mod tests {
         dispatch_id(&mut ed, "toggle_chrome");
         assert_eq!(ed.chrome_disposition, ChromeDisposition::Zen, "disposition must flip to Zen");
         assert!(ed.theme_rederive, "rederive flag must be set");
-        assert!(ed.status.contains("chrome: zen"), "status must say 'chrome: zen': {:?}", ed.status);
+        assert!(ed.status_text().contains("chrome: zen"), "status must say 'chrome: zen': {:?}", ed.status_text());
         // Second toggle flips back to Full.
         dispatch_id(&mut ed, "toggle_chrome");
         assert_eq!(ed.chrome_disposition, ChromeDisposition::Full, "second toggle → Full");
-        assert!(ed.status.contains("chrome: full"), "status: {:?}", ed.status);
+        assert!(ed.status_text().contains("chrome: full"), "status: {:?}", ed.status_text());
     }
 
     #[test]
@@ -1588,7 +1588,7 @@ mod tests {
         dispatch_id(&mut ed, "toggle_chrome");
         assert_eq!(ed.chrome_disposition, ChromeDisposition::Full, "cue mode: disposition must NOT flip");
         assert!(!ed.theme_rederive, "cue mode: rederive flag must NOT be set");
-        assert_eq!(ed.status, "chrome: n/a (cue mode)", "cue mode status: {:?}", ed.status);
+        assert_eq!(ed.status_text(), "chrome: n/a (cue mode)", "cue mode status: {:?}", ed.status_text());
     }
 
     #[test]
@@ -1602,8 +1602,8 @@ mod tests {
         dispatch_id(&mut ed, "toggle_chrome");
         assert_eq!(ed.chrome_disposition, ChromeDisposition::Zen, "fixed-chrome arm: disposition flips");
         assert!(ed.theme_rederive, "rederive flag set (though rederive is a no-op on non-Rgb)");
-        assert!(ed.status.contains("no effect:"), "must warn 'no effect': {:?}", ed.status);
-        assert!(ed.status.contains("has fixed chrome"), "must say 'has fixed chrome': {:?}", ed.status);
+        assert!(ed.status_text().contains("no effect:"), "must warn 'no effect': {:?}", ed.status_text());
+        assert!(ed.status_text().contains("has fixed chrome"), "must say 'has fixed chrome': {:?}", ed.status_text());
     }
 
     #[test]
@@ -1618,8 +1618,8 @@ mod tests {
         dispatch_id(&mut ed, "toggle_chrome");
         assert_eq!(ed.chrome_disposition, ChromeDisposition::Zen, "Ansi16 arm: disposition flips");
         assert!(ed.theme_rederive, "rederive flag must be set");
-        assert!(ed.status.contains("no effect at 16-color depth"),
-            "must warn 16-color: {:?}", ed.status);
+        assert!(ed.status_text().contains("no effect at 16-color depth"),
+            "must warn 16-color: {:?}", ed.status_text());
     }
 
     #[test]
@@ -1792,7 +1792,7 @@ mod tests {
         seed(&mut ed);
         dispatch_id(&mut ed, "quick_fix");
         assert!(ed.diag.is_none(), "quick_fix must not open the overlay outside Review");
-        assert_eq!(ed.status, "no diagnostic here");
+        assert_eq!(ed.status_text(), "no diagnostic here");
 
         // quick_fix: Review opens the overlay.
         let mut ed = Editor::new_from_text(doc, None, (80, 24));
@@ -2094,8 +2094,8 @@ mod tests {
         let r = reg.dispatch(CommandId("splash_off"), &mut ctx);
         assert_eq!(r, crate::commands::CommandResult::Handled);
         assert!(!ctx.editor.view_opts.splash);
-        assert!(ctx.editor.status.contains("next launch"),
-            "status notes the deferred effect: {}", ctx.editor.status);
+        assert!(ctx.editor.status_text().contains("next launch"),
+            "status notes the deferred effect: {}", ctx.editor.status_text());
         reg.dispatch(CommandId("toggle_splash"), &mut ctx);
         assert!(ctx.editor.view_opts.splash, "toggle flips back on");
         reg.dispatch(CommandId("splash_on"), &mut ctx);

@@ -314,7 +314,7 @@ mod tests {
         );
         host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "Yab");
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert_eq!(status, "ab/1", "wc.text saw the pre-insert buffer, wc.cursor the post-insert caret");
     }
 
@@ -323,7 +323,7 @@ mod tests {
         let (mut host, editor, _id) = make("wc.replace(10, 2, 'x')", "hello world");
         host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "hello world", "reversed range must not mutate the buffer");
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.contains("plugin"), "status: {status}");
         assert!(!status.to_lowercase().contains("panic"), "must be a clean degrade, not a caught panic: {status}");
     }
@@ -333,7 +333,7 @@ mod tests {
         let (mut host, editor, _id) = make("wc.replace(0, 999, 'x')", "hello world");
         host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "hello world", "out-of-bounds range must not mutate the buffer");
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(!status.to_lowercase().contains("panic"), "status: {status}");
     }
 
@@ -343,7 +343,7 @@ mod tests {
         let (mut host, editor, _id) = make("wc.replace(2, 3, 'x')", "h\u{e9}llo");
         host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "h\u{e9}llo", "a mid-char offset must not mutate the buffer");
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(!status.to_lowercase().contains("panic"), "status: {status}");
     }
 
@@ -355,7 +355,7 @@ mod tests {
         );
         host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "hi");
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.starts_with("false:"), "wc.text(10,2) must fail (pcall false), got: {status}");
         assert!(!status.to_lowercase().contains("panic"), "must be a clean degrade, not a caught panic: {status}");
     }
@@ -370,7 +370,7 @@ mod tests {
         );
         host.pump_test(&editor);
         assert_eq!(whole_text(&editor), "doc", "an over-cap insert must never reach a Tendril alloc/ChangeSet");
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.contains("plugin"), "status: {status}");
     }
 
@@ -379,7 +379,7 @@ mod tests {
         let (mut host, editor, _id) =
             make(&format!("wc.status(string.rep('a', {}))", crate::limits::PLUGIN_MAX_STATUS_LEN + 100), "doc");
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert_eq!(status.len(), crate::limits::PLUGIN_MAX_STATUS_LEN);
         assert!(status.chars().all(|c| c == 'a'));
     }
@@ -390,7 +390,7 @@ mod tests {
         let (mut host, editor, _id) =
             make(&format!("wc.status(string.rep('a', {prefix_len}) .. '\u{e9}')"), "doc");
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         // The 2-byte 'é' straddles the cap; truncation must back off before its lead byte
         // rather than splitting it (which would panic a naive byte-slice) or over-including it.
         assert_eq!(status.len(), prefix_len);
@@ -401,7 +401,7 @@ mod tests {
     fn lua_error_in_callback_is_isolated_and_reported() {
         let (mut host, editor, _id) = make("error('boom')", "x");
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.contains("boom"), "status: {status}");
         assert_eq!(whole_text(&editor), "x", "editor must be untouched by a callback error");
     }
@@ -427,7 +427,7 @@ mod tests {
         }
         editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: panic_id, arg: None });
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.contains("callback panic"), "status: {status}");
         assert_eq!(whole_text(&editor), "x", "a panicking callback must not touch the editor");
 
@@ -479,7 +479,7 @@ mod tests {
         host.pump_test(&editor);
         let sel = editor.borrow().active().document.selection.primary();
         assert_eq!((sel.anchor, sel.head), (0, 2), "head snapped to buffer length, not rejected");
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(!status.to_lowercase().contains("panic"), "status: {status}");
         assert!(!status.contains("plugin:"), "must succeed silently, no typed error: {status}");
     }
@@ -491,7 +491,7 @@ mod tests {
             "hello",
         );
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert_eq!(status, "1:3");
     }
 
@@ -499,7 +499,7 @@ mod tests {
     fn wc_len_returns_buffer_byte_length() {
         let (mut host, editor, _id) = make("wc.status(tostring(wc.len()))", "hello");
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert_eq!(status, "5");
     }
 
@@ -507,7 +507,7 @@ mod tests {
     fn wc_version_returns_buffer_version_after_an_edit() {
         let (mut host, editor, _id) = make("wc.insert('x'); wc.status(tostring(wc.version()))", "y");
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert_eq!(status, "1", "version bumps once per applied transaction");
     }
 
@@ -515,7 +515,7 @@ mod tests {
     fn wc_path_is_nil_for_an_unsaved_buffer() {
         let (mut host, editor, _id) = make("wc.status(tostring(wc.path()))", "x");
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert_eq!(status, "nil");
     }
 
@@ -538,7 +538,7 @@ mod tests {
         editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id, arg: None });
 
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert_eq!(status, "/tmp/note.md");
     }
 
@@ -563,7 +563,7 @@ mod tests {
         editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id, arg: None });
 
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.contains("register_command"), "status: {status}");
         assert!(status.contains("only available during plugin load"), "status: {status}");
         assert_eq!(reg.commands().count(), before, "no new command registered post-load");
@@ -620,7 +620,7 @@ mod tests {
 
             editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: rep_id, arg: None });
             host.pump_test(&editor); // wc.replace's outcome — Ok or a typed error, never a raw panic
-            let status_after_replace = editor.borrow().status.clone();
+            let status_after_replace = editor.borrow().status_text().to_string();
             prop_assert!(!status_after_replace.to_lowercase().contains("panic"),
                 "status: {status_after_replace}");
             let after_replace_len = editor.borrow().active().document.buffer.len();
@@ -629,7 +629,7 @@ mod tests {
 
             editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id: rd_id, arg: None });
             host.pump_test(&editor); // wc.text's outcome — Ok or a typed error, never a raw panic
-            let status_after_text = editor.borrow().status.clone();
+            let status_after_text = editor.borrow().status_text().to_string();
             prop_assert!(!status_after_text.to_lowercase().contains("panic"),
                 "status: {status_after_text}");
             // wc.text is a pure read — the buffer must be byte-identical to after the replace.
@@ -699,7 +699,7 @@ mod tests {
             path: Some("/x".to_string()),
         });
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert_eq!(status, "save:/x");
     }
 
@@ -737,7 +737,7 @@ mod tests {
             crate::plugin::PluginEvent { kind: crate::plugin::PluginEventKind::Save, path: None });
         host.pump_test(&editor);
 
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.contains("boom"), "the first hook's error must be reported: {status}");
         let lua = host.lua().unwrap();
         let second_ran: bool = lua.globals().get("second_ran").unwrap();
@@ -753,7 +753,7 @@ mod tests {
         editor.borrow_mut().pending_plugin_events.push_back(
             crate::plugin::PluginEvent { kind: crate::plugin::PluginEventKind::Open, path: None });
         host.pump_test(&editor);
-        assert_eq!(editor.borrow().status, "", "an event with no matching hook must invoke nothing");
+        assert_eq!(editor.borrow().status_text(), "", "an event with no matching hook must invoke nothing");
         assert_eq!(whole_text(&editor), "x");
     }
 
@@ -789,7 +789,7 @@ mod tests {
         let id = reg.resolve_name("t.cmd").expect("registered under t.cmd");
         editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id, arg: None });
         host.pump_test(&editor);
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.contains("wc.on"), "status: {status}");
         assert!(status.contains("only available during plugin load"), "status: {status}");
         assert_eq!(whole_text(&editor), "x", "no unrelated editor mutation from the degrade");
@@ -857,7 +857,7 @@ mod tests {
         let sel_after = editor.borrow().active().document.selection.primary();
         assert_eq!((sel_before.anchor, sel_before.head), (sel_after.anchor, sel_after.head),
             "a blocked wc.set_selection must not move the selection");
-        assert_eq!(editor.borrow().status, "ok",
+        assert_eq!(editor.borrow().status_text(), "ok",
             "wc.status must STILL succeed from a hook — the one allowed mutation surface");
 
         // A raw Rust-panicking "hook" — bypassing wc.on entirely, mirroring
@@ -875,7 +875,7 @@ mod tests {
         editor.borrow_mut().pending_plugin_events.push_back(
             crate::plugin::PluginEvent { kind: panic_kind, path: None });
         host.pump_test(&editor);
-        let status_after_panic = editor.borrow().status.clone();
+        let status_after_panic = editor.borrow().status_text().to_string();
         assert!(status_after_panic.contains("hook panic"), "status: {status_after_panic}");
 
         // The flag must be reset — a normal (non-hook) command callback's wc.insert must still
@@ -1069,7 +1069,7 @@ mod tests {
         let clock = TestClock::new(0);
         host.pump(&editor, &reg, &ex, &clock, &tx);
 
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.contains("t.cmd"), "status must name the origin: {status}");
         assert!(status.contains("nope"), "status must name the unresolved target: {status}");
         assert!(!status.to_lowercase().contains("panic"), "status: {status}");
@@ -1124,7 +1124,7 @@ mod tests {
             crate::plugin::PluginEvent { kind: crate::plugin::PluginEventKind::Save, path: None });
         host.pump_test(&editor);
 
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.starts_with("false:"), "wc.command from a hook must be rejected: {status}");
         assert!(status.contains("event hook"), "status: {status}");
         assert!(editor.borrow().pending_plugin_dispatch.is_empty(), "nothing may be queued from a blocked wc.command");
@@ -1158,7 +1158,7 @@ mod tests {
         assert!(e.pending_plugin_calls.is_empty(), "the chain-cap trip must clear the call queue");
         assert!(e.pending_plugin_events.is_empty(), "the chain-cap trip must clear the event queue");
         assert!(e.pending_plugin_dispatch.is_empty(), "the chain-cap trip must clear the dispatch queue");
-        assert!(e.status.to_lowercase().contains("truncat"), "status: {}", e.status);
+        assert!(e.status_text().to_lowercase().contains("truncat"), "status: {}", e.status_text());
         assert_eq!(e.active().document.buffer.to_string(), "hello",
             "the editor's actual content must be untouched by the truncated cascade");
     }

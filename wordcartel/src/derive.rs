@@ -319,14 +319,14 @@ pub(crate) fn apply_parse_result(
         Ok(tree) => {
             if editor.parse_degraded {
                 editor.parse_degraded = false;
-                editor.status.clear();
+                editor.clear_transient_status();
             }
             tree
         }
         Err(_) => {
             if !editor.parse_degraded {
                 editor.parse_degraded = true;
-                editor.status = "markdown parse failed — styling may be stale".to_string();
+                editor.set_status(crate::status::StatusKind::Info, "markdown parse failed — styling may be stale".to_string());
             }
             block_tree::empty_tree(new_len)
         }
@@ -846,18 +846,18 @@ mod tests {
     #[test]
     fn apply_parse_result_err_installs_empty_tree_and_sets_degraded_once() {
         let mut ed = crate::editor::Editor::new_from_text("hello\n", None, (80, 24));
-        ed.status.clear();
+        ed.clear_transient_status();
         ed.parse_degraded = false;
 
         // First Err: empty tree + degraded + notice.
         let t = apply_parse_result(&mut ed, 10, Err("boom".to_string()));
         assert!(ed.parse_degraded);
-        assert_eq!(ed.status, "markdown parse failed — styling may be stale");
+        assert_eq!(ed.status_text(), "markdown parse failed — styling may be stale");
         assert_eq!(t.root.span, 0..10);
         assert!(t.top_level().is_empty());
 
         // Second Err while already degraded: still empty tree, notice unchanged (no spam).
-        ed.status = "markdown parse failed — styling may be stale".to_string();
+        ed.set_status(crate::status::StatusKind::Info, "markdown parse failed — styling may be stale".to_string());
         let _ = apply_parse_result(&mut ed, 12, Err("again".to_string()));
         assert!(ed.parse_degraded);
 
@@ -866,6 +866,6 @@ mod tests {
         let got = apply_parse_result(&mut ed, 4, Ok(real.clone()));
         assert_eq!(got, real);
         assert!(!ed.parse_degraded);
-        assert_eq!(ed.status, "");
+        assert_eq!(ed.status_text(), "");
     }
 }

@@ -120,7 +120,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                         MinibufferKind::WrapColumn => crate::prompts::wrap_column_submit(editor, &mb.text),
                         MinibufferKind::PluginArg { id } => {
                             if mb.text.len() > crate::limits::PLUGIN_MAX_COMMAND_ARG {
-                                editor.status = "plugin: command arg too long".into();
+                                editor.set_status(crate::status::StatusKind::Info, "plugin: command arg too long");
                             } else {
                                 editor.pending_plugin_calls.push_back(
                                     crate::plugin::PluginCall { id, arg: Some(mb.text) });
@@ -205,6 +205,6 @@ mod tests {
         intercept(msg, &mut editor, &ex, &clock, &tx);
 
         assert!(editor.pending_plugin_calls.is_empty(), "an over-cap arg must not be enqueued");
-        assert_eq!(editor.status, "plugin: command arg too long");
+        assert_eq!(editor.status_text(), "plugin: command arg too long");
     }
 }

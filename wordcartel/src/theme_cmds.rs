@@ -17,9 +17,11 @@ pub(crate) fn rebuild_keymap_if_requested(
     }, reg);
     if !editor.pending_keys.is_empty() {
         editor.pending_keys.clear();
-        if editor.status.ends_with('…') { editor.status.clear(); }
+        // clear_transient_status() subsumes the former `ends_with('…')` guard: it clears only a
+        // Transient occupant (the pending-chord "…" preview is Transient), never a held message.
+        editor.clear_transient_status();
     }
-    if let Some(w) = kw.first() { editor.status = w.clone(); }
+    if let Some(w) = kw.first() { editor.set_status(crate::status::StatusKind::Info, w.clone()); }
     Some(trie)
 }
 
@@ -115,10 +117,10 @@ mod tests {
         let reg = crate::registry::Registry::builtins();
         e.active_keymap_preset = "wordstar".into();
         e.keymap_rebuild = true;
-        e.status = "keymap: wordstar".into();
+        e.set_status(crate::status::StatusKind::Info, "keymap: wordstar");
         let t = crate::theme_cmds::rebuild_keymap_if_requested(&mut e, &[], &reg);
         assert!(t.is_some());
-        assert_eq!(e.status, "keymap: wordstar", "the pinned switch copy reaches the draw");
+        assert_eq!(e.status_text(), "keymap: wordstar", "the pinned switch copy reaches the draw");
     }
 
     #[test]
@@ -148,7 +150,7 @@ mod tests {
         let mut e = Editor::new_from_text("doc\n", None, (80, 24));
         let reg = crate::registry::Registry::builtins();
         e.pending_keys = parse_seq("ctrl-k").unwrap();
-        e.status = "ctrl-k \u{2026}".into();
+        e.set_status(crate::status::StatusKind::Info, "ctrl-k \u{2026}");
         e.active_keymap_preset = "wordstar".into();
         e.keymap_rebuild = true;
         // The REAL production helper — the test proves run()'s code, not a copy (Fable I4).
@@ -157,7 +159,7 @@ mod tests {
             keymap = t;
         }
         assert!(e.pending_keys.is_empty(), "pending prefix must not survive the rebuild");
-        assert!(e.status.is_empty(), "the pending '…' prompt is cleared");
+        assert!(e.status_text().is_empty(), "the pending '…' prompt is cleared");
         let cw = parse_seq("ctrl-w").unwrap();
         assert!(matches!(keymap.resolve(&cw), Resolution::Command(crate::registry::CommandId("scroll_line_up"))));
     }

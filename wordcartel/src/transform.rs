@@ -212,12 +212,12 @@ pub fn dispatch_transform(
     msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>,
 ) {
     if editor.transform_in_flight {
-        editor.status = "a transform is already running".into();
+        editor.set_status(crate::status::StatusKind::Info, "a transform is already running");
         return;
     }
     let range = region.unwrap_or_else(|| region_for_transform(&editor.active().document));
     if range.is_empty() {
-        editor.status = "nothing to transform".into();
+        editor.set_status(crate::status::StatusKind::Info, "nothing to transform");
         return;
     }
     // The one width knob (spec repar10 D1): transforms format to the same column the
@@ -229,7 +229,7 @@ pub fn dispatch_transform(
         let version = editor.active().document.version;
         let snapshot = editor.active().document.buffer.snapshot(); // O(1) rope snapshot
         editor.transform_in_flight = true;
-        editor.status = format!("{}…", kind.gerund());
+        editor.set_status(crate::status::StatusKind::Info, format!("{}…", kind.gerund()));
         let range_c = range.clone();
         let msg_tx = msg_tx.clone();
         std::thread::spawn(move || {
@@ -264,7 +264,7 @@ pub fn merge_transform_into(
 ) {
     match result {
         Err(e) => {
-            editor.status = format!("transform failed: {e}");
+            editor.set_status(crate::status::StatusKind::Info, format!("transform failed: {e}"));
         }
         Ok(out) => {
             // Read the current bytes for the no-op check; borrow ends before apply.
@@ -272,7 +272,7 @@ pub fn merge_transform_into(
                 .map(|b| b.document.buffer.slice(range.clone()).to_string())
                 .unwrap_or_default();
             if out == current {
-                editor.status = format!("already {}", kind.past_tense());
+                editor.set_status(crate::status::StatusKind::Info, format!("already {}", kind.past_tense()));
                 return;
             }
             let doc_len = editor.by_id(buffer_id).map(|b| b.document.buffer.len()).unwrap_or(0);
@@ -289,7 +289,7 @@ pub fn merge_transform_into(
                 crate::derive::rebuild(editor);
                 crate::nav::ensure_visible(editor);
             }
-            editor.status = kind.past_tense().to_string();
+            editor.set_status(crate::status::StatusKind::Info, kind.past_tense().to_string());
         }
     }
 }

@@ -341,7 +341,7 @@ pub fn dispatch_filter(
     msg_tx: std::sync::mpsc::Sender<crate::app::Msg>,
 ) {
     if editor.filter_in_flight.is_some() {
-        editor.status = "a filter is already running".into();
+        editor.set_status(crate::status::StatusKind::Info, "a filter is already running");
         return;
     }
     let b = editor.active();
@@ -356,7 +356,7 @@ pub fn dispatch_filter(
     let snapshot = b.document.buffer.snapshot();
     let cancel = CancelFlag::new();
     editor.filter_in_flight = Some(cancel.clone());
-    editor.status = format!("running {} ...", spec.argv.first().cloned().unwrap_or_default());
+    editor.set_status(crate::status::StatusKind::Info, format!("running {} ...", spec.argv.first().cloned().unwrap_or_default()));
     let disposition = spec.disposition.clone();
     let range_c = range.clone();
     std::thread::spawn(move || {

@@ -258,14 +258,14 @@ pub fn run_export(
     let source = match editor.active().document.path.clone() {
         Some(p) => p,
         None => {
-            editor.status = "save the file first before exporting".into();
+            editor.set_status(crate::status::StatusKind::Info, "save the file first before exporting");
             return;
         }
     };
 
     // Pandoc availability gate.
     if !probe_pandoc() {
-        editor.status = "pandoc not found — install it to export".into();
+        editor.set_status(crate::status::StatusKind::Info, "pandoc not found — install it to export");
         return;
     }
 
@@ -306,7 +306,7 @@ mod tests {
         let mut e = Editor::new_from_text("x\n", None, (80, 24));
         let (tx, _rx) = std::sync::mpsc::channel();
         run_export(&mut e, "html", &tx);
-        assert!(e.status.to_lowercase().contains("save the file first"));
+        assert!(e.status_text().to_lowercase().contains("save the file first"));
     }
 
     #[test]

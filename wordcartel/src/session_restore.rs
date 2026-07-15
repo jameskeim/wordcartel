@@ -120,11 +120,11 @@ pub fn open_into_current(editor: &mut Editor, path: &std::path::Path) {
             }
             crate::derive::rebuild(editor);
             crate::nav::ensure_visible(editor);
-            editor.status = String::new();
+            editor.clear_status();
             crate::plugin::fire_event(editor, crate::plugin::PluginEventKind::Open, Some(path));
         }
         Err(e) => {
-            editor.status = e.to_string();
+            editor.set_status(crate::status::StatusKind::Info, e.to_string());
         }
     }
 }

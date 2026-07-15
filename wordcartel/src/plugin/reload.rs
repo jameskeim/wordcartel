@@ -127,10 +127,10 @@ pub(crate) fn perform_reload(
     let mut e = editor.borrow_mut();                                       // 8. re-resolve bindings + report
     e.keymap_rebuild = true;
     e.plugin_inventory = inventory;
-    if let Some(w) = warns.first() { e.status = w.clone(); }
+    if let Some(w) = warns.first() { e.set_status(crate::status::StatusKind::Info, w.clone()); }
     else {
-        e.status = format!("plugins reloaded ({} ok)",
-            e.plugin_inventory.iter().filter(|r| r.error.is_none()).count());
+        let ok = e.plugin_inventory.iter().filter(|r| r.error.is_none()).count();
+        e.set_status(crate::status::StatusKind::Info, format!("plugins reloaded ({ok} ok)"));
     }
 }
 
@@ -238,7 +238,7 @@ mod tests {
         let dropped = crate::theme_cmds::rebuild_keymap_if_requested(
             &mut editor.borrow_mut(), &patches, &reg);
         assert!(dropped.is_some(), "the rebuild produced a new trie");
-        let status = editor.borrow().status.clone();
+        let status = editor.borrow().status_text().to_string();
         assert!(status.contains("unknown command 'p.a'"),
             "the vanished binding surfaces a warning: {status}");
     }

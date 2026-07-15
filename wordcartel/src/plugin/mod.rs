@@ -180,7 +180,7 @@ pub(crate) fn plugin_error(editor: &Rc<RefCell<Editor>>, name: &str, msg: &str) 
     let budget = crate::limits::PLUGIN_MAX_STATUS_LEN.saturating_sub(prefix_len);
     let capped_msg = cap_status(msg.as_bytes(), budget);
     let mut e = editor.borrow_mut();
-    e.status = format!("plugin {name}: {capped_msg}");
+    e.set_status(crate::status::StatusKind::Info, format!("plugin {name}: {capped_msg}"));
 }
 
 /// Truncate `bytes` to at most `max` bytes, backing off to the nearest UTF-8 char boundary —
@@ -245,10 +245,10 @@ mod tests {
     fn plugin_error_sets_and_truncates_editor_status() {
         let editor = Rc::new(RefCell::new(Editor::new_from_text("x", None, (40, 10))));
         plugin_error(&editor, "t.cmd", "boom");
-        assert_eq!(editor.borrow().status, "plugin t.cmd: boom");
+        assert_eq!(editor.borrow().status_text(), "plugin t.cmd: boom");
 
         let long = "z".repeat(crate::limits::PLUGIN_MAX_STATUS_LEN + 50);
         plugin_error(&editor, "t.cmd", &long);
-        assert_eq!(editor.borrow().status.len(), crate::limits::PLUGIN_MAX_STATUS_LEN);
+        assert_eq!(editor.borrow().status_text().len(), crate::limits::PLUGIN_MAX_STATUS_LEN);
     }
 }

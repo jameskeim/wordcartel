@@ -399,7 +399,16 @@ pub struct Editor {
     pub next_buffer_id: u64,
     // global app state
     pub register: Register,
-    pub status: String,
+    /// The one routed user-message slot (A17). Private — written ONLY through `set_status` and the
+    /// clear verbs, read through the accessors. `None` = no message (bar collapses under Auto).
+    status: Option<crate::status::Status>,
+    /// Bounded ring of recent messages (A17 §5). Every emit records here even when it does not
+    /// take the display slot (Q1 severity ranking).
+    status_history: crate::status::StatusHistory,
+    /// Verbosity floor (Q1): a candidate strictly less severe than this is history-only.
+    messages_min_kind: crate::status::StatusKind,
+    /// Monotonic emit counter — history ordering + dedup window (never a wall-clock).
+    status_seq: u64,
     /// Plugin-command invocations queued by the registry Plugin dispatch arm, drained by the
     /// pump (P1). Default-empty; a settled/idle editor never grows it. VecDeque for FIFO.
     pub pending_plugin_calls: std::collections::VecDeque<crate::plugin::PluginCall>,
@@ -589,7 +598,11 @@ impl Editor {
         );
         let mut e = Editor {
             buffers: Vec::new(), active: 0, next_buffer_id: 0,
-            register: Register::default(), status: String::new(),
+            register: Register::default(),
+            status: None,
+            status_history: crate::status::StatusHistory::new(),
+            messages_min_kind: crate::status::StatusKind::Info,
+            status_seq: 0,
             pending_plugin_calls: std::collections::VecDeque::new(),
             pending_plugin_events: std::collections::VecDeque::new(),
             pending_plugin_dispatch: std::collections::VecDeque::new(),
@@ -970,9 +983,93 @@ impl Editor {
     pub fn surface_undo_eviction(&mut self) {
         if self.active().undo_evicted_pending > 0 {
             self.active_mut().undo_evicted_pending = 0;
-            self.status = UNDO_EVICTED_HINT.to_string();
+            self.set_status(crate::status::StatusKind::Info, UNDO_EVICTED_HINT);
         }
     }
+
+    // ---- A17 status slot: the one writer + clear verbs + accessors ----
+
+    fn next_status_seq(&mut self) -> u64 { self.status_seq += 1; self.status_seq }
+
+    /// The ONE writer for the user-message slot. Info/Warning/Error/Log with default lifetime.
+    ///
+    /// # Examples
+    /// ```
+    /// # use wordcartel::editor::Editor;
+    /// # use wordcartel::status::StatusKind;
+    /// let mut e = Editor::new_from_text("hi\n", None, (40, 6));
+    /// e.set_status(StatusKind::Info, "saved");
+    /// assert_eq!(e.status_text(), "saved");
+    /// ```
+    pub fn set_status(&mut self, kind: crate::status::StatusKind, text: impl Into<String>) {
+        self.set_status_full(kind, text, crate::status::StatusLifetime::default_for(kind),
+                             crate::status::StatusSource::Host, None);
+    }
+
+    /// Full form: explicit lifetime, source, topic. Applies Q1 to the display slot and ALWAYS
+    /// records to history (spec §4.1).
+    pub fn set_status_full(
+        &mut self, kind: crate::status::StatusKind, text: impl Into<String>,
+        lifetime: crate::status::StatusLifetime, source: crate::status::StatusSource,
+        topic: Option<crate::status::StatusTopic>,
+    ) {
+        let seq = self.next_status_seq();
+        let cand = crate::status::Status::new(kind, text, lifetime, source, topic, seq);
+        match crate::status::resolve_slot(self.status.as_ref(), &cand, self.messages_min_kind) {
+            crate::status::SlotOutcome::Take => { self.status_history.push(cand.clone()); self.status = Some(cand); }
+            crate::status::SlotOutcome::HistoryOnly => { self.status_history.push(cand); }
+        }
+    }
+
+    /// Start a progress message (spec §4.2): Info, Progress lifetime, Host, tagged `topic`.
+    pub fn set_progress(&mut self, topic: crate::status::StatusTopic, text: impl Into<String>) {
+        self.set_status_full(crate::status::StatusKind::Info, text,
+                             crate::status::StatusLifetime::Progress, crate::status::StatusSource::Host, Some(topic));
+    }
+
+    /// Complete/fail progress for `topic`: apply Q1 to the display slot AND collapse the topic's
+    /// most-recent history lineage in place (spec §4.2).
+    pub fn finish_topic(&mut self, topic: crate::status::StatusTopic, kind: crate::status::StatusKind, text: impl Into<String>) {
+        let seq = self.next_status_seq();
+        let cand = crate::status::Status::new(kind, text, crate::status::StatusLifetime::default_for(kind),
+                                              crate::status::StatusSource::Host, Some(topic), seq);
+        match crate::status::resolve_slot(self.status.as_ref(), &cand, self.messages_min_kind) {
+            crate::status::SlotOutcome::Take => { self.status_history.collapse_topic(topic, cand.clone()); self.status = Some(cand); }
+            crate::status::SlotOutcome::HistoryOnly => { self.status_history.collapse_topic(topic, cand); }
+        }
+    }
+
+    /// Clear the slot iff the occupant is Transient (the next-key idiom). Warning/Error/Progress hold.
+    pub fn clear_transient_status(&mut self) {
+        if matches!(self.status.as_ref().map(|s| s.lifetime()), Some(crate::status::StatusLifetime::Transient)) {
+            self.status = None;
+        }
+    }
+
+    /// Clear the slot iff the occupant carries exactly `topic` (targeted state-indicator clear).
+    pub fn clear_topic(&mut self, topic: crate::status::StatusTopic) {
+        if self.status.as_ref().and_then(|s| s.topic()) == Some(topic) { self.status = None; }
+    }
+
+    /// Unconditional slot reset (context change — buffer switch, session restore). History unaffected.
+    pub fn clear_status(&mut self) { self.status = None; }
+
+    /// Esc dismiss: clear a HELD occupant (Sticky or Progress). Transient is handled by the next key.
+    pub fn dismiss_status(&mut self) {
+        if matches!(self.status.as_ref().map(|s| s.lifetime()),
+                    Some(crate::status::StatusLifetime::Sticky) | Some(crate::status::StatusLifetime::Progress)) {
+            self.status = None;
+        }
+    }
+
+    /// The live display-slot message, if any.
+    #[inline] pub fn status(&self) -> Option<&crate::status::Status> { self.status.as_ref() }
+    /// The display text (`""` when the slot is empty) — the one read for rendering.
+    #[inline] pub fn status_text(&self) -> &str { self.status.as_ref().map_or("", |s| s.text()) }
+    /// Whether a message occupies the slot (drives the Auto status-line reveal).
+    #[inline] pub fn has_visible_status(&self) -> bool { self.status.is_some() }
+    /// The browsable message ring (spec §5).
+    #[inline] pub fn status_history(&self) -> &crate::status::StatusHistory { &self.status_history }
 
     // Thin delegators — external callers unchanged.
     pub fn apply(&mut self, txn: Transaction, edit: wordcartel_core::block_tree::Edit, kind: EditKind, clock: &dyn Clock) {
@@ -1068,11 +1165,11 @@ impl Editor {
     /// (per-engine set + cycle) that call this; this task adds no caller.
     pub fn set_analysis_source(&mut self, source: wordcartel_core::diagnostics::DiagSource) {
         if !self.diag_providers.is_enabled(source) {
-            self.status = format!("{} is not enabled", source.label());
+            self.set_status(crate::status::StatusKind::Info, format!("{} is not enabled", source.label()));
             return;
         }
         self.active_analysis_source = source;
-        self.status = format!("analysis: {}", source.label());
+        self.set_status(crate::status::StatusKind::Info, format!("analysis: {}", source.label()));
     }
 
     /// Reset BOTH new P3 wake subsystems to their no-plugins baseline (P3 §3g, Codex Critical 2):
@@ -1089,6 +1186,24 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_status_shows_text_and_reveals_bar() {
+        let mut e = Editor::new_from_text("hi\n", None, (40, 6));
+        e.set_status(crate::status::StatusKind::Info, "hello");
+        assert_eq!(e.status_text(), "hello");
+        assert!(e.has_visible_status());
+        assert_eq!(e.status_history().entries().len(), 1);
+    }
+
+    #[test]
+    fn clear_transient_clears_info_but_history_keeps_it() {
+        let mut e = Editor::new_from_text("hi\n", None, (40, 6));
+        e.set_status(crate::status::StatusKind::Info, "x");
+        e.clear_transient_status();
+        assert!(!e.has_visible_status());
+        assert_eq!(e.status_history().entries().len(), 1);
+    }
     use wordcartel_core::block_tree::Edit;
     use wordcartel_core::change::ChangeSet;
 
@@ -1574,7 +1689,7 @@ mod tests {
         let cs = ChangeSet::insert(0, "x", e.active().document.buffer.len());
         e.apply(Transaction::new(cs), Edit { range: 0..0, new_len: 1 }, EditKind::Type, &clk);
         assert_ne!(
-            e.status,
+            e.status_text(),
             UNDO_EVICTED_HINT,
             "a tiny edit must not set the eviction hint"
         );
@@ -1607,19 +1722,19 @@ mod tests {
         force_real_eviction(&mut e, id, &clk);
         assert!(e.active().undo_evicted_pending > 0, "precondition: a real eviction landed");
         e.surface_undo_eviction();
-        assert_eq!(e.status, UNDO_EVICTED_HINT);
+        assert_eq!(e.status_text(), UNDO_EVICTED_HINT);
         assert_eq!(e.active().undo_evicted_pending, 0, "consumed");
         // No re-fire without a fresh arm:
-        e.status.clear();
+        e.clear_transient_status();
         e.surface_undo_eviction();
-        assert_ne!(e.status, UNDO_EVICTED_HINT, "no re-fire after consumption");
+        assert_ne!(e.status_text(), UNDO_EVICTED_HINT, "no re-fire after consumption");
     }
 
     #[test]
     fn surface_undo_eviction_no_pending_is_silent() {
         let mut e = Editor::new_from_text("hello\n", None, (80, 24));
         e.surface_undo_eviction();
-        assert_ne!(e.status, UNDO_EVICTED_HINT, "no pending eviction → no hint");
+        assert_ne!(e.status_text(), UNDO_EVICTED_HINT, "no pending eviction → no hint");
     }
 
     /// A buffer-level merge (filter/transform result applied via `by_id_mut(buffer_id).apply`,
@@ -1638,9 +1753,9 @@ mod tests {
         force_real_eviction(&mut e, other_id, &clk);
         assert_eq!(e.active().id, active_id, "still on the original buffer");
         e.surface_undo_eviction(); // post-reduce surface — must be silent, wrong buffer
-        assert_ne!(e.status, UNDO_EVICTED_HINT, "non-active eviction must not surface yet");
+        assert_ne!(e.status_text(), UNDO_EVICTED_HINT, "non-active eviction must not surface yet");
         e.switch_to_index(other_idx);
-        assert_eq!(e.status, UNDO_EVICTED_HINT, "switching onto the evicted buffer surfaces it");
+        assert_eq!(e.status_text(), UNDO_EVICTED_HINT, "switching onto the evicted buffer surfaces it");
         assert_eq!(e.active().undo_evicted_pending, 0, "consumed on switch");
     }
 
@@ -1654,7 +1769,7 @@ mod tests {
         let active_id = e.active().id;
         force_real_eviction(&mut e, active_id, &clk); // merge targets the active buffer by id
         e.surface_undo_eviction();
-        assert_eq!(e.status, UNDO_EVICTED_HINT, "active-buffer merge eviction surfaces at once");
+        assert_eq!(e.status_text(), UNDO_EVICTED_HINT, "active-buffer merge eviction surfaces at once");
     }
 
     /// A merge (or keystroke) that does NOT evict must stay silent.
@@ -1670,7 +1785,7 @@ mod tests {
         b.apply(Transaction::new(cs), Edit { range: at..at, new_len: 1 }, EditKind::Other, &clk);
         assert_eq!(e.active().undo_evicted_pending, 0, "no eviction → flag stays clear");
         e.surface_undo_eviction();
-        assert_ne!(e.status, UNDO_EVICTED_HINT, "no eviction → no hint");
+        assert_ne!(e.status_text(), UNDO_EVICTED_HINT, "no eviction → no hint");
     }
 
     /// `undo`/`redo` never arm the pending flag — they don't commit (`Buffer::undo`/`redo`
@@ -1688,9 +1803,9 @@ mod tests {
         assert_eq!(e.active().undo_evicted_pending, 0, "undo must not arm the flag");
         e.redo();
         assert_eq!(e.active().undo_evicted_pending, 0, "redo must not arm the flag");
-        e.status.clear();
+        e.clear_transient_status();
         e.surface_undo_eviction();
-        assert_ne!(e.status, UNDO_EVICTED_HINT, "undo/redo alone must never surface the hint");
+        assert_ne!(e.status_text(), UNDO_EVICTED_HINT, "undo/redo alone must never surface the hint");
     }
 
     #[test]
@@ -1805,7 +1920,7 @@ mod tests {
                 wordcartel_core::diagnostics::DiagSource::Harper)), true);
         e.set_analysis_source(wordcartel_core::diagnostics::DiagSource::Vale);
         assert_eq!(e.active_analysis_source, wordcartel_core::diagnostics::DiagSource::Harper);
-        assert!(e.status.contains("not enabled"));
+        assert!(e.status_text().contains("not enabled"));
     }
 
     #[test]
@@ -1816,7 +1931,7 @@ mod tests {
             crate::diag_provider::RecordingProvider::new().with_source(DiagSource::Plugin("mock"))), true);
         e.set_analysis_source(DiagSource::Plugin("mock"));
         assert_eq!(e.active_analysis_source, DiagSource::Plugin("mock"));
-        assert_eq!(e.status, "analysis: mock");
+        assert_eq!(e.status_text(), "analysis: mock");
     }
 
     #[test]

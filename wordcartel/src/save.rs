@@ -61,7 +61,7 @@ pub enum SaveMode { Normal, SaveAs }
 /// `perform_save_as` (SaveAs).
 pub(crate) fn do_save_to(ctx: &mut Ctx, target: std::path::PathBuf, mode: SaveMode) {
     // §3.9: status BEFORE dispatch. O(1) snapshot; version captured now.
-    ctx.editor.status = "Saving\u{2026}".to_string();
+    ctx.editor.set_status(crate::status::StatusKind::Info, "Saving\u{2026}".to_string());
     let snap = ctx.editor.active().document.buffer.snapshot(); // O(1) ropey clone
     let v = ctx.editor.active().document.version;
     let buffer_id = ctx.editor.active().id;
@@ -138,7 +138,7 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: std::path::PathBuf, mode: SaveMo
                             }
                         }
                     }
-                    editor.status = status;
+                    editor.set_status(crate::status::StatusKind::Info, status);
                     // Fire AFTER the by_id_mut block closes (never inside it — a live `b: &mut
                     // Buffer` borrow would conflict with fire_event's `&mut Editor`) and after
                     // editor.status is set — mirrors the local-then-assign shape above.
@@ -170,8 +170,8 @@ pub fn dispatch_save(ctx: &mut Ctx) -> CommandResult {
     let current_fp = fingerprint(&path);
     if current_fp != ctx.editor.active().document.stored_fp {
         ctx.editor.open_prompt(crate::prompt::Prompt::external_mod());
-        ctx.editor.status =
-            "File changed on disk \u{2014} choose [R]eload or [O]verwrite".to_string();
+        ctx.editor.set_status(crate::status::StatusKind::Info,
+            "File changed on disk \u{2014} choose [R]eload or [O]verwrite");
         return CommandResult::Handled;
     }
 
@@ -211,7 +211,7 @@ pub(crate) fn dispatch_save_and_quit(ctx: &mut crate::registry::Ctx) {
 /// Save bypassing the fingerprint conflict (the [O]verwrite modal action).
 pub fn overwrite_save(ctx: &mut Ctx) {
     if ctx.editor.active().document.path.is_none() {
-        ctx.editor.status = "No file name — use Save As".to_string();
+        ctx.editor.set_status(crate::status::StatusKind::Info, "No file name — use Save As".to_string());
         return;
     }
     do_save(ctx); // no stat check
@@ -224,7 +224,7 @@ pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
     let Some(path) = editor.active().document.path.clone() else { return };
     let text = match crate::file::open(&path) {
         Ok(t) => t,
-        Err(e) => { editor.status = e.to_string(); return; }
+        Err(e) => { editor.set_status(crate::status::StatusKind::Info, e.to_string()); return; }
     };
     // Fix A1: capture the previous version BEFORE replacing the buffer so we
     // can carry it forward.  A diagnostics check in flight before the reload
@@ -270,7 +270,7 @@ pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
     editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(nc);
     crate::nav::ensure_visible(editor);
     editor.active_mut().document.stored_fp = fingerprint(&path);
-    editor.status = "Reloaded".into();
+    editor.set_status(crate::status::StatusKind::Info, "Reloaded");
     crate::swap::delete(editor.active().document.path.as_deref());
 }
 
@@ -316,7 +316,7 @@ pub fn load_recovered(editor: &mut crate::editor::Editor, body: &str) {
     editor.active_mut().document.selection = wordcartel_core::selection::Selection::single(nc);
     crate::nav::ensure_visible(editor);
     editor.active_mut().document.stored_fp = path.as_deref().and_then(fingerprint);
-    editor.status = "Recovered unsaved changes".into();
+    editor.set_status(crate::status::StatusKind::Info, "Recovered unsaved changes");
 }
 
 #[cfg(test)]
@@ -351,11 +351,11 @@ mod tests {
             let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() };
             dispatch_save(&mut ctx);
         }
-        assert_eq!(e.status, "Saving\u{2026}", "status set before dispatch (§3.9)");
+        assert_eq!(e.status_text(), "Saving\u{2026}", "status set before dispatch (§3.9)");
         // InlineExecutor already ran the job; apply the buffered merge.
         for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert!(!e.active().document.dirty(), "version==saved_version after save → clean");
-        assert_eq!(e.status, "Saved");
+        assert_eq!(e.status_text(), "Saved");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "new\n");
         let _ = std::fs::remove_file(&p);
     }
@@ -396,7 +396,7 @@ mod tests {
         for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
         assert!(e.active().document.dirty(), "failed save must leave the buffer dirty");
         assert!(e.active().document.saved_version.is_none());
-        assert!(e.status.to_lowercase().contains("symlink"));
+        assert!(e.status_text().to_lowercase().contains("symlink"));
         let _ = std::fs::remove_file(&link); let _ = std::fs::remove_file(&real);
     }
 
@@ -424,8 +424,8 @@ mod tests {
         // Assert the ENOTDIR error itself surfaced (not merely any non-empty status) — this
         // proves the save was attempted and failed, NOT that the external-mod modal opened.
         assert!(
-            e.status.to_lowercase().contains("not a directory") || e.status.contains("ENOTDIR"),
-            "OS ENOTDIR must surface as status; got: {:?}", e.status
+            e.status_text().to_lowercase().contains("not a directory") || e.status_text().contains("ENOTDIR"),
+            "OS ENOTDIR must surface as status; got: {:?}", e.status_text()
         );
         let _ = std::fs::remove_file(&parent);
     }
@@ -562,7 +562,7 @@ mod tests {
             dispatch_save(&mut ctx);
         }
         assert!(ex.drain().is_empty(), "no save job dispatched on external-mod conflict");
-        assert!(e.status.to_lowercase().contains("changed on disk"), "status surfaces the refusal");
+        assert!(e.status_text().to_lowercase().contains("changed on disk"), "status surfaces the refusal");
         assert!(e.active().document.dirty(), "buffer stays dirty when a save is refused");
         let _ = std::fs::remove_file(&p);
     }
@@ -845,7 +845,7 @@ mod tests {
         assert!(e.quit_drain.is_none(), "the quit drain must be aborted, not stranded");
         assert!(!e.quit_drain_advance, "quit_drain_advance must be reset");
         assert!(!e.quit, "must NOT quit on a panicked save");
-        assert!(e.status.to_lowercase().contains("save"));
+        assert!(e.status_text().to_lowercase().contains("save"));
         let _ = std::fs::remove_file(&p);
     }
 }

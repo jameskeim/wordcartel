@@ -109,7 +109,7 @@ pub fn toggle_scratch(editor: &mut Editor) {
                     .find(|id| !editor.is_scratch(*id))));
         match target.and_then(|id| editor.buffers.iter().position(|b| b.id == id)) {
             Some(idx) => switch_to(editor, idx),
-            None => editor.status = "no other buffer".into(),
+            None => editor.set_status(crate::status::StatusKind::Info, "no other buffer"),
         }
     } else {
         enter_scratch(editor);
@@ -143,10 +143,10 @@ pub fn open_as_new_buffer(editor: &mut Editor, path: &std::path::Path) {
             if editor.resume_enabled { crate::session_restore::restore_resume(editor, path); }
             crate::derive::rebuild(editor);
             crate::nav::ensure_visible(editor);
-            editor.status = String::new();
+            editor.clear_status();
             crate::plugin::fire_event(editor, crate::plugin::PluginEventKind::Open, Some(path));
         }
-        Err(e) => editor.status = e.to_string(),
+        Err(e) => editor.set_status(crate::status::StatusKind::Info, e.to_string()),
     }
 }
 
@@ -158,10 +158,10 @@ pub fn open_as_new_buffer(editor: &mut Editor, path: &std::path::Path) {
 /// empty untitled. New active = same-index neighbor.
 pub fn close_buffer(editor: &mut Editor) {
     let id = editor.active().id;
-    if editor.is_scratch(id) { editor.status = "can't close the scratch buffer".into(); return; }
+    if editor.is_scratch(id) { editor.set_status(crate::status::StatusKind::Info, "can't close the scratch buffer"); return; }
     if editor.is_dirty(id) {
         if editor.pending_after_save.is_some() || editor.pending_save_as.is_some() || editor.quit_drain.is_some() {
-            editor.status = "another save or quit is in progress — try again".into();
+            editor.set_status(crate::status::StatusKind::Info, "another save or quit is in progress — try again");
             return;
         }
         let name = buffer_display_name(editor, id);
@@ -179,7 +179,7 @@ pub fn close_buffer(editor: &mut Editor) {
 /// scratch_id.
 pub(crate) fn close_buffer_now(editor: &mut Editor, id: BufferId) {
     let Some(i) = editor.buffers.iter().position(|b| b.id == id) else {
-        editor.status = "buffer already closed".into();
+        editor.set_status(crate::status::StatusKind::Info, "buffer already closed");
         return;
     };
     // P2 on_buffer_close fire site: capture the path BEFORE the slot is removed/replaced —
@@ -207,7 +207,7 @@ pub(crate) fn close_buffer_now(editor: &mut Editor, id: BufferId) {
             // fronting it would break the weak MRU-front == active convention).
             editor.mru.push(nid);
         }
-        editor.status = String::new();
+        editor.clear_status();
         return;
     }
     if i == editor.active {
@@ -225,7 +225,7 @@ pub(crate) fn close_buffer_now(editor: &mut Editor, id: BufferId) {
             editor.active = na;
         }
     }
-    editor.status = String::new();
+    editor.clear_status();
 }
 
 /// Create a fresh empty untitled buffer additively (no-op when active is already a reusable throwaway).
@@ -238,7 +238,7 @@ pub fn new_empty_buffer(editor: &mut Editor) {
     editor.switch_to_index(idx);
     crate::derive::rebuild(editor);
     crate::nav::ensure_visible(editor);
-    editor.status = String::new();
+    editor.clear_status();
 }
 
 #[cfg(test)]
@@ -467,7 +467,7 @@ mod tests {
         goto_scratch(&mut e);
         close_buffer(&mut e);
         assert_eq!(e.buffers.len(), 2, "scratch not closed");
-        assert!(e.status.contains("scratch"));
+        assert!(e.status_text().contains("scratch"));
     }
 
     #[test]
@@ -548,7 +548,7 @@ mod tests {
         });
         close_buffer(&mut e);
         assert!(e.prompt.is_none(), "busy guard: no prompt over pending state");
-        assert!(e.status.contains("in progress"), "refusal status set: {:?}", e.status);
+        assert!(e.status_text().contains("in progress"), "refusal status set: {:?}", e.status_text());
     }
 
     #[test]
@@ -597,7 +597,7 @@ mod tests {
         e.install_scratch();
         let phantom = BufferId(9999);
         close_buffer_now(&mut e, phantom);
-        assert_eq!(e.status, "buffer already closed");
+        assert_eq!(e.status_text(), "buffer already closed");
         assert_eq!(e.buffers.len(), 2, "buffer count unchanged");
     }
 
