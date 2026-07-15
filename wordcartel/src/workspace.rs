@@ -195,6 +195,12 @@ pub(crate) fn close_buffer_now(editor: &mut Editor, id: BufferId) {
     let ordinary = editor.buffers.iter().filter(|b| !editor.is_scratch(b.id)).count();
     if ordinary <= 1 {
         // Last ordinary buffer: replace id's own slot with a fresh empty untitled.
+        // A17 read-only note: this reset is a SANCTIONED dispose, NOT a content install — it swaps
+        // in a brand-new empty buffer with NO content carried, so it does NOT route through the
+        // `replace_buffer` read-only guard (which would trap the user in a read-only view). Disposing
+        // a read-only `view_messages` buffer here is safe only because `read_only ⟹ regenerable/
+        // ephemeral content` (pinned by status_view.rs::read_only_true_is_set_only_in_this_module);
+        // a future content-bearing read-only buffer would have to revisit this branch.
         let nid = editor.alloc_id();
         let area = editor.buffers[i].view.area;
         let was_active = i == editor.active;

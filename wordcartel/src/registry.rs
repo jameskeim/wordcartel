@@ -1989,11 +1989,14 @@ mod tests {
     // on the read-only buffer — forcing its `register_mut` (or an entry guard) until green.
     //
     // We track the read-only buffer BY ID, not via `e.active()`: a command that legitimately
-    // SWITCHES the active buffer (`new`/`goto_scratch`/`next_buffer`/…) or disposes this view
-    // leaves the read-only buffer's own content+mark intact (or gone) and is NOT a mutation of it —
-    // only a mutating epilogue ON this buffer clears its `marked_block` and fails. (Checking
-    // `e.active()` would conflate a benign buffer-switch with a mutation and wrongly demand marking
-    // every switch command `mutates`, trapping the user in the read-only view.)
+    // SWITCHES the active buffer (`new`/`goto_scratch`/`next_buffer`/…) leaves the read-only
+    // buffer's own content+mark intact and is NOT a mutation of it — only a mutating epilogue ON
+    // this buffer clears its `marked_block` and fails. (Checking `e.active()` would conflate a
+    // benign buffer-switch with a mutation and wrongly demand marking every switch command
+    // `mutates`, trapping the user in the read-only view.) The two branches below split on whether
+    // the view's id SURVIVES the command: if it survives, content+mark must be unchanged; if it is
+    // GONE (a `close_buffer` dispose), the sanctioned reset must have discarded the content to a
+    // fresh writable buffer — no writable slot may carry the read-only content forward.
     #[test]
     fn no_registry_command_runs_a_mutating_epilogue_on_a_read_only_buffer() {
         let reg = Registry::builtins();
@@ -2017,9 +2020,27 @@ mod tests {
             let view_id = e.active().id;
             let (content, mark) = (e.active().document.buffer.to_string(), e.active().marked_block);
             dispatch_id(&mut e, id.0);
-            if let Some(b) = e.buffers.iter().find(|b| b.id == view_id) {
-                if b.document.buffer.to_string() != content { violations.push(format!("{} mutated content", id.0)); }
-                if b.marked_block != mark { violations.push(format!("{} ran a mutating epilogue (marked_block)", id.0)); }
+            match e.buffers.iter().find(|b| b.id == view_id) {
+                Some(b) => {
+                    // The read-only view still exists: neither its content nor its `marked_block`
+                    // may have changed (categories (a)/(b) + no mutating epilogue).
+                    if b.document.buffer.to_string() != content { violations.push(format!("{} mutated content", id.0)); }
+                    if b.marked_block != mark { violations.push(format!("{} ran a mutating epilogue (marked_block)", id.0)); }
+                }
+                None => {
+                    // The command DISPOSED the read-only view (changed its BufferId — the
+                    // last-ordinary reset in `workspace::close_buffer_now` replaces the slot with a
+                    // FRESH untitled). A dispose is a distinct, SANCTIONED operation (not a content
+                    // mutation): it must discard the read-only content to a fresh writable buffer,
+                    // never smuggle that content INTO a now-writable slot. Assert no writable buffer
+                    // now holds the snapshot content — this is what makes the sweep a genuine
+                    // completeness proof that ALSO covers the dispose path (pre-fix a dispose passed
+                    // silently because the `if let Some` skipped when `view_id` was gone).
+                    if e.buffers.iter().any(|b| !b.read_only && b.document.buffer.to_string() == content) {
+                        violations.push(format!(
+                            "{} disposed the read-only view but a writable buffer now holds its content", id.0));
+                    }
+                }
             }
         }
         assert!(violations.is_empty(), "read-only guard incomplete: {violations:?}");

@@ -149,6 +149,11 @@ impl StatusHistory {
                 && msg.seq.saturating_sub(last.seq) <= crate::limits::MESSAGES_DEDUP_WINDOW
             {
                 last.bump_repeat();
+                // Refresh the coalesce anchor to the newest seq so a RUN of identicals all collapse
+                // into one row (A17 F1): without this the window is measured from the FIRST emit, so
+                // with `MESSAGES_DEDUP_WINDOW = 1` the 3rd identical sees a seq gap of 2 and starts a
+                // new entry — 10 identicals would yield 5 rows, not one ×10.
+                last.seq = msg.seq;
                 return;
             }
         }
@@ -256,6 +261,19 @@ mod tests {
         h.push(Status::new(StatusKind::Info, "loop", StatusLifetime::Transient, StatusSource::Host, None, 2));
         assert_eq!(h.entries().len(), 1);
         assert_eq!(h.entries().back().unwrap().repeat(), 2);
+    }
+
+    #[test]
+    fn a_run_of_identicals_collapses_into_one_row() {
+        // A17 F1: a runaway loop emitting the SAME message 10× (consecutive seqs) must coalesce into
+        // a single ×10 row — the coalesce anchor is refreshed to the newest seq each hit, so the
+        // dedup window is measured against the previous emit, not the first one.
+        let mut h = StatusHistory::new();
+        for seq in 0..10u64 {
+            h.push(Status::new(StatusKind::Info, "loop", StatusLifetime::Transient, StatusSource::Host, None, seq));
+        }
+        assert_eq!(h.entries().len(), 1, "10 identical emits must be one row, not several");
+        assert_eq!(h.entries().back().unwrap().repeat(), 10);
     }
 
     #[test]

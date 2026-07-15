@@ -334,6 +334,15 @@ pub(crate) fn apply_export_done(
 }
 
 pub(crate) fn insert_paste_text(editor: &mut Editor, buffer_id: crate::editor::BufferId, text: &str, clock: &dyn Clock) -> bool {
+    // A17 F5 (final gate): paste into a read-only buffer is a LOUD reject, not a silent no-op.
+    // `Buffer::apply` already no-ops safely on a read-only slot, but this path is not a registry
+    // command (the completeness sweep can't see it) and previously issued no `reject_read_only` and
+    // still set the register in its callers. Reject here — returning `false` also makes both callers
+    // skip their register set (they gate on the return value).
+    if editor.by_id(buffer_id).is_some_and(|b| b.read_only) {
+        editor.reject_read_only();
+        return false;
+    }
     if text.len() > crate::clipboard::PASTE_MAX_BYTES {
         editor.set_status_full(crate::status::StatusKind::Warning,
             format!("paste too large ({} MiB) — skipped", text.len() / (1 << 20)),
@@ -936,6 +945,24 @@ mod tests {
         assert!(!ok, "oversized paste must not be inserted");
         assert!(e.status_text().contains("paste too large"));
         assert_sticky_warning_survives_info(&mut e);
+    }
+
+    /// A17 F5 (final gate): a paste into a read-only buffer is a LOUD reject — no mutation AND the
+    /// canonical "buffer is read-only" Sticky Warning (the paste path is not a registry command, so
+    /// the completeness sweep can't cover it; the guard lives at the paste entry). It also skips the
+    /// callers' register set by returning `false`.
+    #[test]
+    fn paste_into_a_read_only_buffer_is_a_loud_reject() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("keep\n", None, (80, 24));
+        let id = e.active().id;
+        e.active_mut().read_only = true;
+        let clk = TestClock(0);
+        let before = e.active().document.buffer.to_string();
+        let ok = insert_paste_text(&mut e, id, "nope", &clk);
+        assert!(!ok, "paste into a read-only buffer must not report success");
+        assert_eq!(e.active().document.buffer.to_string(), before, "read-only: no mutation");
+        assert_eq!(e.status_text(), "buffer is read-only");
     }
 
     /// A17 T5 (F4 Warning table): the system-clipboard-unavailable notice is a recoverable

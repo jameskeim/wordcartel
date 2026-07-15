@@ -428,7 +428,13 @@ fn emit_status(
     let lifetime = crate::status::StatusLifetime::default_for(kind);
     let source = crate::status::StatusSource::Plugin { label: label.clone() };
     let mut e = editor.try_borrow_mut().map_err(|_| mlua::Error::runtime("plugin: editor busy"))?;
-    if throttle.borrow_mut().admit(&label) {
+    // A17 F2 (final gate): the per-label/per-tick emit throttle bounds only low-severity chatter
+    // (Info/Log). Error and Warning ALWAYS take the normal slot path (subject to Q1) — a plugin's
+    // error or warning must never be demoted to history-only by a burst quota. History dedup + the
+    // Sticky lifetime already bound their repaint cost (a repainted Sticky error is a dedup no-op),
+    // so no throttle is needed. The `||` short-circuits so Error/Warning never consume a bucket.
+    let throttled = matches!(kind, crate::status::StatusKind::Info | crate::status::StatusKind::Log);
+    if !throttled || throttle.borrow_mut().admit(&label) {
         e.set_status_full(kind, capped, lifetime, source, None);
     } else {
         e.record_status_history_only(kind, capped, lifetime, source, None);

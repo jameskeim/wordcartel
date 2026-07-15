@@ -1,13 +1,18 @@
 //! A17 T8: the `view_messages` command — render the bounded `StatusHistory` ring (spec §5) into a
 //! read-only, path-less scratch-style buffer and switch to it (Q4: NOT a 12th overlay; the ring is
 //! the source of truth). Re-invoking regenerates in place — it never stacks a second view, because
-//! the read-only buffer IS the singleton marker (`read_only` is set `true` ONLY here).
+//! the read-only buffer IS the singleton marker (`read_only` is set `true` ONLY here in production —
+//! pinned by `read_only_true_is_set_only_in_this_module` below).
 //!
-//! The buffer's content is immutable by construction: the two-category read-only guard (T8) refuses
-//! every in-place edit (`Buffer::{apply,undo,redo}`) and every whole-buffer replacement
-//! (`Editor::replace_buffer`) on a read-only slot. Regenerating the view is a DIRECT slot assignment
-//! (a regenerable view of the ring, never a content edit) — the same principled exclusion as buffer
-//! disposal (`workspace.rs`).
+//! SCOPE OF THE READ-ONLY GUARANTEE (honest claim — A17 final gate). The read-only flag proves two
+//! things and ONLY two: no CONTENT MUTATION (the closed set `Buffer::{apply,undo,redo}` no-op on a
+//! read-only slot) and no CONTENT-INSTALL REPLACEMENT (`Editor::replace_buffer` rejects a read-only
+//! slot). It does NOT forbid DISPOSING the buffer: a close/dispose (`workspace::close_buffer_now`'s
+//! last-ordinary reset) is a distinct, SANCTIONED operation that swaps the slot for a FRESH writable
+//! buffer with NO content carried over — safe precisely because `read_only ⟹ regenerable/ephemeral
+//! content` (this view is a projection of the ring, never user data). Regenerating the view here is
+//! likewise a DIRECT slot assignment, not a content edit. A future effort that ever marks a
+//! CONTENT-BEARING buffer `read_only` breaks that implication and MUST revisit `close_buffer_now`.
 
 use crate::editor::{Buffer, Editor};
 use crate::status::{Status, StatusHistory, StatusKind, StatusSource};
@@ -133,5 +138,47 @@ mod tests {
         e.set_progress(StatusTopic::Filter, "filtering…");
         open(&mut e);
         assert!(e.active().document.buffer.to_string().contains("filtering"));
+    }
+
+    /// A17 final gate — pin the load-bearing assumption of the dispose-safety argument (module doc):
+    /// the ONLY production site that sets `read_only = true` is this module's `open` path, so
+    /// `read_only ⟹ regenerable/ephemeral content` holds tree-wide. `close_buffer_now`'s dispose
+    /// safety depends on it; a future effort marking a content-bearing buffer read-only would trip
+    /// this test and be forced to revisit that path.
+    ///
+    /// The scan is source-textual (not reflective): for each `src/**/*.rs` file it considers only the
+    /// PRODUCTION prefix — everything before the first `#[cfg(test)]` marker — because tests
+    /// legitimately flip `read_only` on ad-hoc buffers to exercise the guard. This crate keeps its
+    /// tests in trailing `#[cfg(test)] mod tests` blocks, so the prefix is the production surface.
+    #[test]
+    fn read_only_true_is_set_only_in_this_module() {
+        fn scan(dir: &std::path::Path, hits: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() { scan(&path, hits); continue; }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") { continue; }
+                let src = std::fs::read_to_string(&path).expect("read source file");
+                // Production prefix = everything before the first test-module marker.
+                let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+                for (i, line) in prod.lines().enumerate() {
+                    // Match an ASSIGNMENT `read_only = true` (a single `=`, not `==`), tolerant of
+                    // spacing; skip anything after a `//` line comment so prose can mention it freely.
+                    let code = line.split("//").next().unwrap_or(line);
+                    let compact: String = code.split_whitespace().collect();
+                    if compact.contains("read_only=true") && !compact.contains("read_only==true") {
+                        hits.push(format!("{name}:{}", i + 1));
+                    }
+                }
+            }
+        }
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut hits = Vec::new();
+        scan(&src_root, &mut hits);
+        assert!(!hits.is_empty(), "sanity: the scan must find this module's own writers");
+        assert!(hits.iter().all(|h| h.starts_with("status_view.rs:")),
+            "read_only = true is set in production OUTSIDE status_view.rs — the dispose-safety \
+             assumption (read_only ⟹ regenerable content) may be broken; revisit close_buffer_now. \
+             Sites: {hits:?}");
     }
 }

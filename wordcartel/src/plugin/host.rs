@@ -507,6 +507,23 @@ mod tests {
     }
 
     #[test]
+    fn error_and_warning_emits_bypass_the_burst_throttle() {
+        // A17 F2 (final gate): the emit throttle bounds only Info/Log chatter. In one callback,
+        // `wc.status('working')` (Info) wins the slot first, then `wc.notify('error','boom')` shares
+        // the SAME per-label bucket in the SAME tick — but Error is exempt, so it reaches the normal
+        // slot path (and Q1 lets a more-severe Error displace the Info). The visible slot must be the
+        // Error, not the throttled-to-history Info. (Pre-fix the Error was demoted to history-only.)
+        assert_eq!(crate::limits::MESSAGES_EMIT_MAX_PER_TICK, 1,
+            "this test assumes the v1 quota of 1 so the second emit would be throttled if not exempt");
+        let (mut host, editor, _id) =
+            make("wc.status('working'); wc.notify('error', 'boom')", "x");
+        host.pump_test(&editor);
+        let e = editor.borrow();
+        assert_eq!(e.status_text(), "boom", "an Error must bypass the throttle and win the slot");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+    }
+
+    #[test]
     fn wc_status_throttle_admits_again_on_the_next_pump_tick() {
         // Two SEPARATE pump cycles are two separate ticks — the throttle must not carry a
         // label's exhausted quota over to the next cycle (a legitimately-paced plugin, one

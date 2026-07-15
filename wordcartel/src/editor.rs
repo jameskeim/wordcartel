@@ -1057,11 +1057,20 @@ impl Editor {
     /// most-recent history lineage in place (spec §4.2).
     pub fn finish_topic(&mut self, topic: crate::status::StatusTopic, kind: crate::status::StatusKind, text: impl Into<String>) {
         let seq = self.next_status_seq();
+        // A17 F3 (final gate): a completion of the CURRENTLY-DISPLAYED progress must retire it from
+        // the slot even when the completion itself is below the verbosity floor or less severe than
+        // the occupant — otherwise the stale "…ing" progress lingers forever (e.g. `finish_topic(Info,
+        // "Saved")` under a Warning floor is HistoryOnly and would leave "Saving…" showing). We do not
+        // DISPLAY a below-floor completion; we just clear the retired progress (history still collapses).
+        let retiring_displayed = self.status.as_ref().and_then(|s| s.topic()) == Some(topic);
         let cand = crate::status::Status::new(kind, text, crate::status::StatusLifetime::default_for(kind),
                                               crate::status::StatusSource::Host, Some(topic), seq);
         match crate::status::resolve_slot(self.status.as_ref(), &cand, self.messages_min_kind) {
             crate::status::SlotOutcome::Take => { self.status_history.collapse_topic(topic, cand.clone()); self.status = Some(cand); }
-            crate::status::SlotOutcome::HistoryOnly => { self.status_history.collapse_topic(topic, cand); }
+            crate::status::SlotOutcome::HistoryOnly => {
+                self.status_history.collapse_topic(topic, cand);
+                if retiring_displayed { self.status = None; }
+            }
         }
     }
 
@@ -1092,8 +1101,11 @@ impl Editor {
     #[inline] pub fn status(&self) -> Option<&crate::status::Status> { self.status.as_ref() }
     /// The display text (`""` when the slot is empty) — the one read for rendering.
     #[inline] pub fn status_text(&self) -> &str { self.status.as_ref().map_or("", |s| s.text()) }
-    /// Whether a message occupies the slot (drives the Auto status-line reveal).
-    #[inline] pub fn has_visible_status(&self) -> bool { self.status.is_some() }
+    /// Whether a message occupies the slot (drives the Auto status-line reveal). An empty-text
+    /// status does NOT count as visible (A17 F4 — matches the pre-A17 `!is_empty()` reveal
+    /// semantics): a save completing after its buffer is disposed does `finish_topic(Info, "")`,
+    /// and an empty message must not flash the bar.
+    #[inline] pub fn has_visible_status(&self) -> bool { self.status.as_ref().is_some_and(|s| !s.text().is_empty()) }
     /// The browsable message ring (spec §5).
     #[inline] pub fn status_history(&self) -> &crate::status::StatusHistory { &self.status_history }
     /// The verbosity floor (Q6): a candidate strictly less severe than this is history-only.
@@ -1123,7 +1135,11 @@ impl Editor {
             crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
     }
 
-    /// The ONE way to swap a whole `Buffer` into an existing slot (A17 T8 category (b)). If the
+    /// The ONE way to swap a whole `Buffer` into an existing slot (A17 T8 category (b)). This guards
+    /// CONTENT-INSTALL replacement only: it proves no read-only slot has new content written INTO it.
+    /// It is deliberately NOT the path a close/DISPOSE takes — `workspace::close_buffer_now` resets a
+    /// slot to a fresh empty buffer directly (no content carried), a distinct sanctioned operation
+    /// (routing dispose through here would reject a read-only view and trap the user in it). If the
     /// buffer CURRENTLY at `slot` is read-only, no-op + Sticky Warning and return `false`; else
     /// replace and return `true`. Callers MUST check the bool and skip their post-replace
     /// epilogue/ack on `false`.
@@ -1272,6 +1288,48 @@ mod tests {
         e.set_status_full(crate::status::StatusKind::Warning, "loud", crate::status::StatusLifetime::Sticky,
                           crate::status::StatusSource::Host, None);
         assert_eq!(e.status_text(), "loud");
+    }
+
+    /// A17 F3 (final gate): a completion of the DISPLAYED progress must retire the stale "…ing"
+    /// message from the slot even when the completion is below the verbosity floor (so it can't
+    /// take the slot on its own merits). Pre-fix the floor check ran first and left "Saving…" stuck.
+    #[test]
+    fn finishing_the_displayed_progress_retires_it_even_below_the_floor() {
+        use crate::status::StatusTopic;
+        let mut e = Editor::new_from_text("x\n", None, (40, 6));
+        let b = e.active().id;
+        e.set_progress(StatusTopic::Save(b, 1), "Saving\u{2026}");
+        assert_eq!(e.status_text(), "Saving\u{2026}", "the progress occupies the slot");
+        e.set_messages_min_kind(crate::status::StatusKind::Warning); // Info completion is below the floor
+        e.finish_topic(StatusTopic::Save(b, 1), crate::status::StatusKind::Info, "Saved");
+        assert!(!e.status_text().contains("Saving"), "the completed progress must not linger in the slot");
+        // A below-floor completion is not displayed on its own merits, but the slot is cleared.
+        assert!(!e.has_visible_status(), "below-floor completion retires the progress without displaying");
+    }
+
+    /// F3 must NOT clobber an UNRELATED occupant: a below-floor completion of topic X leaves a
+    /// held Warning from topic Y (or none) in the slot untouched.
+    #[test]
+    fn finishing_a_non_displayed_topic_below_the_floor_leaves_the_occupant() {
+        use crate::status::StatusTopic;
+        let mut e = Editor::new_from_text("x\n", None, (40, 6));
+        let b = e.active().id;
+        e.set_status_full(crate::status::StatusKind::Warning, "held", crate::status::StatusLifetime::Sticky,
+                          crate::status::StatusSource::Host, None);
+        e.set_messages_min_kind(crate::status::StatusKind::Warning);
+        e.finish_topic(StatusTopic::Save(b, 1), crate::status::StatusKind::Info, "Saved");
+        assert_eq!(e.status_text(), "held", "an unrelated occupant must survive a below-floor finish");
+    }
+
+    /// A17 F4 (final gate): an empty-text status must not reveal the bar (matches the pre-A17
+    /// `!is_empty()` semantics) — a save completing after its buffer is disposed does
+    /// `finish_topic(Info, "")` and must leave the bar hidden.
+    #[test]
+    fn empty_text_status_is_not_visible() {
+        let mut e = Editor::new_from_text("x\n", None, (40, 6));
+        e.set_status(crate::status::StatusKind::Info, "");
+        assert_eq!(e.status_text(), "", "empty text is set");
+        assert!(!e.has_visible_status(), "an empty-text status must not reveal the bar");
     }
 
     #[test]
