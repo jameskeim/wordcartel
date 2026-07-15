@@ -1878,6 +1878,23 @@ mod tests {
         assert_ne!(e.status_text(), UNDO_EVICTED_HINT, "undo/redo alone must never surface the hint");
     }
 
+    /// A17 T7: `dismiss_status()` — the verb the Esc arm in `input.rs::handle_key` calls —
+    /// clears a HELD (Sticky Warning/Error) occupant but leaves a Transient alone (the next
+    /// key still clears a Transient, per today's behavior).
+    #[test]
+    fn dismiss_status_clears_a_held_message_but_leaves_a_transient() {
+        let mut e = Editor::new_from_text("x\n", None, (40, 6));
+        // Held (Sticky) → dismissed.
+        e.set_status_full(crate::status::StatusKind::Error, "boom", crate::status::StatusLifetime::Sticky,
+            crate::status::StatusSource::Host, None);
+        e.dismiss_status();
+        assert!(!e.has_visible_status(), "Esc dismisses a held message");
+        // Transient → untouched by dismiss (the NEXT key clears it — today's behavior is preserved).
+        e.set_status(crate::status::StatusKind::Info, "t");
+        e.dismiss_status();
+        assert!(e.has_visible_status(), "dismiss leaves a Transient alone");
+    }
+
     #[test]
     fn menu_bar_rows_truth_table() {
         use crate::config::MenuBarMode as M;

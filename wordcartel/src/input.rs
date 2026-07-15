@@ -21,9 +21,9 @@ pub(crate) fn handle_key(
 ) {
     // Esc precedence (Codex CRITICAL): prompt/minibuffer Esc are handled in their
     // interception blocks ABOVE this point. Here in normal mode the order is
-    // pending-cancel > filter-cancel. This arm SUBSUMES the old standalone
-    // filter-cancel Esc check (removed above). Esc is reserved for cancel/dismiss
-    // in v1 (not routed to the keymap).
+    // pending-cancel > filter-cancel > held-status dismiss (A17 T7, Q3). This arm
+    // SUBSUMES the old standalone filter-cancel Esc check (removed above). Esc is
+    // reserved for cancel/dismiss in v1 (not routed to the keymap).
     if k.code == crossterm::event::KeyCode::Esc {
         if !editor.pending_keys.is_empty() {
             editor.pending_keys.clear();
@@ -31,6 +31,8 @@ pub(crate) fn handle_key(
         } else if editor.filter_in_flight.is_some() {
             editor.filter_in_flight.take().unwrap().cancel();
             editor.set_status(crate::status::StatusKind::Info, "cancelling…");
+        } else {
+            editor.dismiss_status();
         }
     } else if let Some(chord) = crate::keymap::from_key_event(k) {
         editor.pending_keys.push(chord);
