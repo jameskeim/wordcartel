@@ -1032,6 +1032,21 @@ impl Editor {
         }
     }
 
+    /// Record `text` to the message history WITHOUT touching the display slot — the plugin
+    /// emit-side rate-limit's "excess" path (A17 T9 §9.3): the display slot is throttled to
+    /// [`crate::limits::MESSAGES_EMIT_MAX_PER_TICK`] updates per plugin per pump tick, but EVERY
+    /// emit is still recorded to history (subject to §5.2 dedup coalescing, same as
+    /// `set_status_full`) — only Q1's slot-arbitration + the slot write itself are skipped.
+    pub(crate) fn record_status_history_only(
+        &mut self, kind: crate::status::StatusKind, text: impl Into<String>,
+        lifetime: crate::status::StatusLifetime, source: crate::status::StatusSource,
+        topic: Option<crate::status::StatusTopic>,
+    ) {
+        let seq = self.next_status_seq();
+        let cand = crate::status::Status::new(kind, text, lifetime, source, topic, seq);
+        self.status_history.push(cand);
+    }
+
     /// Start a progress message (spec §4.2): Info, Progress lifetime, Host, tagged `topic`.
     pub fn set_progress(&mut self, topic: crate::status::StatusTopic, text: impl Into<String>) {
         self.set_status_full(crate::status::StatusKind::Info, text,

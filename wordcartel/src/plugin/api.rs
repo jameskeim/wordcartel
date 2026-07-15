@@ -206,6 +206,7 @@ pub(crate) fn install_editor_api(lua: &mlua::Lua, bridge: &Bridge) -> mlua::Resu
     install_replace(lua, &wc, bridge)?;
     install_set_selection(lua, &wc, bridge)?;
     install_status(lua, &wc, bridge)?;
+    install_notify(lua, &wc, bridge)?;
     install_command(lua, &wc, bridge)?;
     install_timer(lua, &wc, bridge)?;
     install_registration_closed(lua, &wc)?;
@@ -407,18 +408,67 @@ fn install_set_selection(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> 
     Ok(())
 }
 
+/// The shared boundary every plugin emit (`wc.status`, `wc.notify`) routes through (A17 T9): caps
+/// `msg`'s BORROWED bytes to `PLUGIN_MAX_STATUS_LEN` (resource LAW — never allocate the full
+/// oversized string first), tags the message `StatusSource::Plugin { label }` from
+/// `InvokeState::current` (§3.5 — the invocation label; no stable plugin id), and applies the
+/// emit-side display-slot rate-limit (§9.3, `EmitThrottle::admit`): an admitted emit takes the
+/// normal `set_status_full` path (Q1 slot arbitration + history); an over-quota emit still
+/// records to history (`record_status_history_only`) but never touches the display slot — so a
+/// looping plugin cannot repaint the slot every callback, yet nothing it emits is silently lost.
+fn emit_status(
+    editor: &Rc<RefCell<crate::editor::Editor>>,
+    invoke_state: &Rc<RefCell<crate::plugin::host::InvokeState>>,
+    throttle: &Rc<RefCell<crate::plugin::host::EmitThrottle>>,
+    kind: crate::status::StatusKind,
+    msg: &mlua::String,
+) -> mlua::Result<()> {
+    let capped = crate::plugin::cap_status(&msg.as_bytes(), crate::limits::PLUGIN_MAX_STATUS_LEN);
+    let label = invoke_state.borrow().current.clone();
+    let lifetime = crate::status::StatusLifetime::default_for(kind);
+    let source = crate::status::StatusSource::Plugin { label: label.clone() };
+    let mut e = editor.try_borrow_mut().map_err(|_| mlua::Error::runtime("plugin: editor busy"))?;
+    if throttle.borrow_mut().admit(&label) {
+        e.set_status_full(kind, capped, lifetime, source, None);
+    } else {
+        e.record_status_history_only(kind, capped, lifetime, source, None);
+    }
+    Ok(())
+}
+
 /// `wc.status(msg)` — the only user-visible plugin output channel (no console; the app owns the
-/// alternate screen). `msg` is truncated on the BORROWED Lua bytes to `PLUGIN_MAX_STATUS_LEN`
-/// (resource LAW — never allocate the full oversized string first) before it is owned into
-/// `editor.status`.
+/// alternate screen). Kept for back-compat (Info, no severity arg); rerouted through
+/// [`emit_status`] (A17 T9) — same visible behavior for existing plugins (fixtures + PE tutorial),
+/// now typed, source-attributed, and rate-limited.
 fn install_status(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::Result<()> {
     let editor = bridge.editor.clone();
+    let invoke_state = bridge.invoke_state.clone();
+    let throttle = bridge.emit_throttle.clone();
     wc.set(
         "status",
         lua.create_function(move |_, msg: mlua::String| {
-            let mut e = editor.try_borrow_mut().map_err(|_| mlua::Error::runtime("plugin: editor busy"))?;
-            e.set_status(crate::status::StatusKind::Info, crate::plugin::cap_status(&msg.as_bytes(), crate::limits::PLUGIN_MAX_STATUS_LEN));
-            Ok(())
+            emit_status(&editor, &invoke_state, &throttle, crate::status::StatusKind::Info, &msg)
+        })?,
+    )?;
+    Ok(())
+}
+
+/// `wc.notify(severity, msg)` (A17 T9 §9.2) — the severity-explicit sibling of `wc.status`.
+/// `severity` is a required string (`"error"|"warning"|"info"|"log"`) parsed via
+/// `StatusKind::from_str`; an unknown/misspelled severity is a typed Lua error (never a silent
+/// Info write) so a plugin author catches the typo at call time, not by staring at a blank slot.
+/// Shares [`emit_status`] with `wc.status` — same cap, attribution, and rate-limit.
+fn install_notify(lua: &mlua::Lua, wc: &mlua::Table, bridge: &Bridge) -> mlua::Result<()> {
+    let editor = bridge.editor.clone();
+    let invoke_state = bridge.invoke_state.clone();
+    let throttle = bridge.emit_throttle.clone();
+    wc.set(
+        "notify",
+        lua.create_function(move |_, (severity, msg): (mlua::String, mlua::String)| {
+            let kind = crate::status::StatusKind::from_str(severity.to_str()?.as_ref())
+                .ok_or_else(|| mlua::Error::runtime(
+                    "plugin: unknown severity (want 'error', 'warning', 'info', or 'log')"))?;
+            emit_status(&editor, &invoke_state, &throttle, kind, &msg)
         })?,
     )?;
     Ok(())

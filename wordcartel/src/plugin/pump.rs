@@ -93,6 +93,14 @@ impl PluginHost {
             e.clear_plugin_wake_state(); // P3 §3g: a torn-down (null) host leaves NO armed timer/subscriber
             return;
         }
+        // A17 T9 §9.3 — one pump cycle is one throttle tick: every emit this cycle (including
+        // every iteration of a single runaway callback's loop, since a callback runs to
+        // completion — or its time-budget abort — inside ONE unit of ONE cycle) shares this
+        // tick's per-label quota. A bridge-None host (attach_bridge never ran/failed) has no
+        // emit surface to throttle — nothing to advance.
+        if let Some(bridge) = self.bridge.as_ref() {
+            bridge.emit_throttle.borrow_mut().advance_tick();
+        }
         let start = std::time::Instant::now();
         let mut units = 0usize;
         if self.fire_due_timers(editor, clock, &mut units, start) { return; } // Phase 0 (mark-then-fire)

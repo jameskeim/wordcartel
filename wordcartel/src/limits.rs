@@ -74,6 +74,13 @@ pub const MESSAGES_HISTORY_CAP: usize = 256;
 /// A17 — max `seq` gap between two otherwise-identical adjacent messages for them to still
 /// coalesce via `repeat` (spec §5.2). `1` means only a truly back-to-back repeat coalesces.
 pub const MESSAGES_DEDUP_WINDOW: u64 = 1;
+/// A17 T9 — display-slot throttle for the plugin emit path (spec §9.3): at most this many
+/// `wc.status`/`wc.notify` slot updates per plugin (keyed by `InvokeState::current` label) per
+/// pump tick (one `PluginHost::pump` cycle — `plugin::host::EmitThrottle::advance_tick`). Excess
+/// emits within the same tick still reach history (`Editor::record_status_history_only`, subject
+/// to §5.2 dedup) — only the display-slot write is dropped. A conservative v1 default: a looping
+/// plugin (`while true do wc.status('x') end`) must not repaint the slot every callback.
+pub const MESSAGES_EMIT_MAX_PER_TICK: usize = 1;
 
 /// Max byte length of a `wc.command(name)` target — the longest possible registered id
 /// (`<stem>.<name>`), so this cap can never reject a resolvable name (§5a).
@@ -119,5 +126,6 @@ mod tests {
         assert_eq!(PLUGIN_TIMER_MIN_INTERVAL_MS, 1000);
         assert_eq!(PLUGIN_MAX_TIMERS_PER_PLUGIN, 8);
         assert_eq!(PLUGIN_MAX_COMMAND_ARG, 4096);
+        assert_eq!(MESSAGES_EMIT_MAX_PER_TICK, 1);
     }
 }

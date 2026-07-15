@@ -53,6 +53,12 @@ pub struct Bridge {
     /// other `Bridge` fields: `InvokeState` itself is `pub(crate)` (an internal implementation
     /// detail, never meant to leak past this crate's boundary).
     pub(crate) invoke_state: Rc<RefCell<InvokeState>>,
+    /// A17 T9 §9.3 — the plugin emit-side display-slot rate-limit, shared between every `wc.*`
+    /// emit closure (`install_status`/`install_notify`, `plugin::api`) and the pump
+    /// (`plugin::pump::PluginHost::pump`, which advances the tick once per cycle). Same
+    /// `Rc<RefCell<_>>`-shared-cell shape as `invoke_state` above, for the same reason: the
+    /// closures are `'static` and outlive this `&Bridge` borrow.
+    pub(crate) emit_throttle: Rc<RefCell<EmitThrottle>>,
 }
 
 /// What the pump is currently invoking, shared with every `wc.*` closure (each captures a
@@ -63,6 +69,48 @@ pub struct Bridge {
 pub(crate) struct InvokeState {
     pub current: Option<String>,
     pub observer: bool,
+}
+
+/// A17 T9 §9.3 — per-source-label emit-side rate-limit state for the plugin display-slot path. A
+/// looping plugin (`while true do wc.status('x') end`-style, or a hot on-edit hook) must not
+/// repaint the status slot every callback: at most [`crate::limits::MESSAGES_EMIT_MAX_PER_TICK`]
+/// slot updates are admitted per pump TICK (one [`crate::plugin::pump::PluginHost::pump`] cycle —
+/// [`EmitThrottle::advance_tick`] is called once at the top of every `pump()`, so a runaway Lua
+/// loop that fires many emits from a SINGLE callback invocation — all within one pump cycle —
+/// shares one tick's quota) per source LABEL (`InvokeState::current` — there is no stable plugin
+/// id, §3.5; a `None` label shares one conservative bucket, so it can only over-throttle, never
+/// under-throttle, relative to a hypothetical stable-id scheme). Excess emits still reach history
+/// (`Editor::record_status_history_only`) — only the slot write is dropped.
+#[derive(Default)]
+pub(crate) struct EmitThrottle {
+    tick: u64,
+    // label -> (tick it was last admitted on, how many admissions happened that tick).
+    admitted: std::collections::HashMap<Option<String>, (u64, usize)>,
+}
+
+impl EmitThrottle {
+    /// Advance to a new tick — called once per [`crate::plugin::pump::PluginHost::pump`] cycle,
+    /// before any unit runs, so every emit during that cycle (including all iterations of a
+    /// single runaway callback's loop) shares the new tick's quota.
+    pub(crate) fn advance_tick(&mut self) {
+        self.tick += 1;
+    }
+
+    /// `true` iff a display-slot update for `label` is admitted THIS tick (and records the
+    /// admission so the next call for the same label/tick sees the updated count); `false` means
+    /// the caller must write history-only instead of touching the slot.
+    pub(crate) fn admit(&mut self, label: &Option<String>) -> bool {
+        let entry = self.admitted.entry(label.clone()).or_insert((0, 0));
+        if entry.0 != self.tick {
+            *entry = (self.tick, 0); // a new tick resets this label's count
+        }
+        if entry.1 < crate::limits::MESSAGES_EMIT_MAX_PER_TICK {
+            entry.1 += 1;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// A committed hook: its VM-registry key + kind + a label for `plugin_error` attribution.
@@ -176,7 +224,8 @@ impl PluginHost {
         editor.borrow_mut().has_on_change_subscriber =
             self.hooks.iter().any(|h| h.kind == crate::plugin::PluginEventKind::Change);
         let invoke_state = Rc::new(RefCell::new(InvokeState { current: None, observer: false }));
-        let bridge = Bridge { editor, msg_tx, clock, invoke_state };
+        let emit_throttle = Rc::new(RefCell::new(EmitThrottle::default()));
+        let bridge = Bridge { editor, msg_tx, clock, invoke_state, emit_throttle };
         crate::plugin::api::install_editor_api(lua, &bridge)?;
         self.bridge = Some(bridge);
         Ok(())
@@ -395,6 +444,100 @@ mod tests {
         // rather than splitting it (which would panic a naive byte-slice) or over-including it.
         assert_eq!(status.len(), prefix_len);
         assert!(status.chars().all(|c| c == 'a'));
+    }
+
+    // -----------------------------------------------------------------------
+    // A17 T9 — wc.status reroute + wc.notify + the emit-side rate-limit (spec §9.1-§9.3).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wc_status_still_works_as_a_plugin_tagged_info() {
+        let (mut host, editor, _id) = make("wc.status('hi')", "x");
+        host.pump_test(&editor);
+        let e = editor.borrow();
+        assert_eq!(e.status_text(), "hi");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Info);
+        assert!(matches!(e.status().unwrap().source(), crate::status::StatusSource::Plugin { .. }));
+    }
+
+    #[test]
+    fn wc_notify_error_sets_a_sticky_error_from_a_plugin() {
+        let (mut host, editor, _id) = make("wc.notify('error', 'compile failed')", "x");
+        host.pump_test(&editor);
+        let e = editor.borrow();
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+    }
+
+    #[test]
+    fn wc_notify_unknown_severity_does_not_emit_a_silent_info() {
+        // Unknown severity is a typed Lua error (wrapped in pcall so the plugin doesn't abort),
+        // never a silent Info write.
+        let (mut host, editor, _id) = make("pcall(function() wc.notify('bogus', 'x') end)", "y");
+        host.pump_test(&editor);
+        assert!(!editor.borrow().has_visible_status(), "unknown severity must NOT emit a silent Info");
+    }
+
+    #[test]
+    fn wc_notify_source_is_plugin_tagged_by_label() {
+        let (mut host, editor, _id) = make("wc.notify('warning', 'careful')", "x");
+        host.pump_test(&editor);
+        let e = editor.borrow();
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Warning);
+        assert!(matches!(e.status().unwrap().source(), crate::status::StatusSource::Plugin { .. }),
+            "wc.notify must attribute StatusSource::Plugin, not Host");
+    }
+
+    #[test]
+    fn wc_status_burst_in_one_callback_is_throttled_to_one_slot_update_per_tick() {
+        // A single Lua callback invocation runs inside ONE unit of ONE pump cycle — a runaway
+        // `while true do wc.status(...) end`-style burst must not repaint the slot on every
+        // iteration (§9.3). MESSAGES_EMIT_MAX_PER_TICK == 1, so only the FIRST admitted emit of
+        // this tick lands in the display slot; the rest are dropped from the slot but still
+        // recorded to history (never silently lost).
+        assert_eq!(crate::limits::MESSAGES_EMIT_MAX_PER_TICK, 1,
+            "this test's slot-content assertion assumes the v1 quota of 1");
+        let (mut host, editor, _id) =
+            make("wc.status('a'); wc.status('b'); wc.status('c')", "x");
+        host.pump_test(&editor);
+        let e = editor.borrow();
+        assert_eq!(e.status_text(), "a", "only the first emit of the tick wins the display slot");
+        let texts: Vec<&str> = e.status_history().entries().iter().map(|s| s.text()).collect();
+        assert_eq!(texts, vec!["a", "b", "c"], "every emit still reaches history, throttled or not");
+    }
+
+    #[test]
+    fn wc_status_throttle_admits_again_on_the_next_pump_tick() {
+        // Two SEPARATE pump cycles are two separate ticks — the throttle must not carry a
+        // label's exhausted quota over to the next cycle (a legitimately-paced plugin, one
+        // wc.status per keystroke/command, must never be silently throttled).
+        let (mut host, editor, id) = make("wc.status('first')", "x");
+        host.pump_test(&editor);
+        assert_eq!(editor.borrow().status_text(), "first");
+        // A second, separate pump() cycle over the SAME command id: `invoke_call` resolves the
+        // callback directly from `call.id` (never through `reg`), so re-enqueueing `id` re-runs
+        // the identical 'first' emit — on a NEW tick, which must be freshly admitted.
+        editor.borrow_mut().pending_plugin_calls.push_back(PluginCall { id, arg: None });
+        host.pump_test(&editor);
+        let e = editor.borrow();
+        assert_eq!(e.status_text(), "first", "the second tick's emit is admitted (not carried-over-throttled)");
+        assert_eq!(e.status_history().entries().len(), 1,
+            "identical adjacent messages coalesce via repeat (§5.2), not a second entry");
+        assert_eq!(e.status_history().entries().back().unwrap().repeat(), 2);
+    }
+
+    #[test]
+    fn wc_status_throttle_buckets_none_label_emits_together() {
+        // A timer callback's label is "timer#<handle>" (Some), never None in practice — but the
+        // throttle's None-label bucket (§9.3's "label-less emits share one conservative bucket")
+        // is exercised directly here against `EmitThrottle::admit` (a pure unit, no VM needed):
+        // two None-label emits in the SAME tick must share the one-per-tick quota.
+        let mut th = crate::plugin::host::EmitThrottle::default();
+        th.advance_tick();
+        assert!(th.admit(&None), "the first None-label emit this tick is admitted");
+        assert!(!th.admit(&None), "a second None-label emit the SAME tick shares the bucket — denied");
+        th.advance_tick();
+        assert!(th.admit(&None), "a new tick resets the None-label bucket");
     }
 
     #[test]
