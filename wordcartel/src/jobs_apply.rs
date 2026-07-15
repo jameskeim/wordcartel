@@ -123,11 +123,13 @@ fn apply_panic(buffer_id: crate::editor::BufferId, version: u64, kind: crate::jo
                 editor.quit_drain = None;
                 editor.quit_drain_advance = false;
             }
-            editor.set_status(crate::status::StatusKind::Info, format!("save failed (internal error: {msg})"));
+            editor.set_status_full(crate::status::StatusKind::Error, format!("save failed (internal error: {msg})"),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         }
         JobKind::SwapWrite => {
             if let Some(b) = editor.by_id_mut(buffer_id) { b.swap_in_flight = false; }
-            editor.set_status(crate::status::StatusKind::Info, format!("swap failed (internal error: {msg})"));
+            editor.set_status_full(crate::status::StatusKind::Error, format!("swap failed (internal error: {msg})"),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         }
         JobKind::Reparse => {
             // A panicked reconcile (upstream pulldown-cmark residual) is deterministic
@@ -140,7 +142,10 @@ fn apply_panic(buffer_id: crate::editor::BufferId, version: u64, kind: crate::jo
             }
         }
         #[cfg(test)]
-        JobKind::CoalesceProbe => { editor.set_status(crate::status::StatusKind::Info, format!("job failed (internal error: {msg})")); }
+        JobKind::CoalesceProbe => {
+            editor.set_status_full(crate::status::StatusKind::Error, format!("job failed (internal error: {msg})"),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+        }
     }
 }
 
@@ -294,7 +299,8 @@ pub(crate) fn apply_export_done(
                     editor.set_status(crate::status::StatusKind::Info, status);
                 }
                 Err(e) => {
-                    editor.set_status(crate::status::StatusKind::Info, format!("export write failed: {e}"));
+                    editor.set_status_full(crate::status::StatusKind::Error, format!("export write failed: {e}"),
+                        crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
                 }
             }
         }
@@ -306,12 +312,14 @@ pub(crate) fn apply_export_done(
                 }
                 Err(e) => {
                     let _ = std::fs::remove_file(&tmp);
-                    editor.set_status(crate::status::StatusKind::Info, format!("export rename failed: {e}"));
+                    editor.set_status_full(crate::status::StatusKind::Error, format!("export rename failed: {e}"),
+                        crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
                 }
             }
         }
         Err(e) => {
-            editor.set_status(crate::status::StatusKind::Info, crate::filter::describe_error(&e));
+            editor.set_status_full(crate::status::StatusKind::Error, crate::filter::describe_error(&e),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         }
     }
 }
@@ -786,5 +794,90 @@ mod tests {
         assert!(e.prompt.is_some(), "external-mod conflict raises the modal");
         assert!(e.pending_after_save.is_none(), "pending_after_save NOT armed on conflict");
         let _ = std::fs::remove_file(&p);
+    }
+
+    // -----------------------------------------------------------------------
+    // A17 T4: F4 Error-table sites — a genuine failure lands Sticky/Error and
+    // survives a later Info ack (Q1). One test per row.
+    // -----------------------------------------------------------------------
+
+    fn assert_sticky_error_survives_info(e: &mut Editor) {
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        e.set_status(crate::status::StatusKind::Info, "later ack");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error, "Q1: Info must not displace a held Error");
+    }
+
+    #[test]
+    fn apply_panic_save_is_a_sticky_error() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        let id = e.active().id;
+        apply_outcome(crate::jobs::JobOutcome::Panicked {
+            buffer_id: id, version: 0, kind: crate::jobs::JobKind::Save, msg: "boom".into(),
+        }, &mut e);
+        assert!(e.status_text().contains("save failed"));
+        assert_sticky_error_survives_info(&mut e);
+    }
+
+    #[test]
+    fn apply_panic_swap_write_is_a_sticky_error() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        let id = e.active().id;
+        apply_outcome(crate::jobs::JobOutcome::Panicked {
+            buffer_id: id, version: 0, kind: crate::jobs::JobKind::SwapWrite, msg: "boom".into(),
+        }, &mut e);
+        assert!(e.status_text().contains("swap failed"));
+        assert_sticky_error_survives_info(&mut e);
+    }
+
+    #[test]
+    fn apply_panic_coalesce_probe_is_a_sticky_error() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        let id = e.active().id;
+        apply_outcome(crate::jobs::JobOutcome::Panicked {
+            buffer_id: id, version: 0, kind: crate::jobs::JobKind::CoalesceProbe, msg: "boom".into(),
+        }, &mut e);
+        assert!(e.status_text().contains("job failed"));
+        assert_sticky_error_survives_info(&mut e);
+    }
+
+    #[test]
+    fn apply_export_done_write_failure_is_a_sticky_error() {
+        use crate::editor::Editor;
+        // A target whose parent is a regular FILE (not a dir) → save_atomic_bytes fails
+        // (ENOTDIR), driving apply_export_done's Bytes/Err(e) "export write failed" arm.
+        let parent = std::env::temp_dir().join(format!("wc-c4-exportwrite-{}.md", std::process::id()));
+        std::fs::write(&parent, "i am a file\n").unwrap();
+        let target = parent.join("out.html");
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        apply_export_done(&mut e, target, Ok(crate::export::ExportResult::Bytes(b"<p>x</p>".to_vec())), true);
+        assert!(e.status_text().contains("export write failed"));
+        assert_sticky_error_survives_info(&mut e);
+        let _ = std::fs::remove_file(&parent);
+    }
+
+    #[test]
+    fn apply_export_done_rename_failure_is_a_sticky_error() {
+        use crate::editor::Editor;
+        // TempReady names a tmp file that does not exist → std::fs::rename fails,
+        // driving apply_export_done's TempReady/Err(e) "export rename failed" arm.
+        let missing_tmp = std::env::temp_dir().join(format!("wc-c4-exportrename-missing-{}.tmp", std::process::id()));
+        let target = std::env::temp_dir().join(format!("wc-c4-exportrename-target-{}.html", std::process::id()));
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        apply_export_done(&mut e, target, Ok(crate::export::ExportResult::TempReady(missing_tmp)), true);
+        assert!(e.status_text().contains("export rename failed"));
+        assert_sticky_error_survives_info(&mut e);
+    }
+
+    #[test]
+    fn apply_export_done_pandoc_failure_is_a_sticky_error() {
+        use crate::editor::Editor;
+        let target = std::env::temp_dir().join(format!("wc-c4-exportpandoc-{}.html", std::process::id()));
+        let mut e = Editor::new_from_text("\n", None, (80, 24));
+        apply_export_done(&mut e, target, Err(crate::filter::FilterError::Panicked("boom".into())), true);
+        assert_sticky_error_survives_info(&mut e);
     }
 }

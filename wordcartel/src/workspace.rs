@@ -146,7 +146,8 @@ pub fn open_as_new_buffer(editor: &mut Editor, path: &std::path::Path) {
             editor.clear_status();
             crate::plugin::fire_event(editor, crate::plugin::PluginEventKind::Open, Some(path));
         }
-        Err(e) => editor.set_status(crate::status::StatusKind::Info, e.to_string()),
+        Err(e) => editor.set_status_full(crate::status::StatusKind::Error, e.to_string(),
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None),
     }
 }
 
@@ -424,6 +425,22 @@ mod tests {
         assert!(e.mru.contains(&new_id), "new buffer id must be in MRU");
         assert_eq!(e.mru[0], new_id, "new buffer must be at MRU front");
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// A17 T4: an open failure (path is a directory → OpenError::IsDir) must land
+    /// Sticky/Error — surviving a later Info ack (Q1), not clearing on the next keystroke.
+    #[test]
+    fn open_failure_is_a_sticky_error_that_survives_a_later_info() {
+        let mut e = Editor::new_from_text("real content\n", Some(std::path::PathBuf::from("/tmp/a.md")), (40, 10));
+        e.install_scratch(); // active is real (non-throwaway) → open_as_new_buffer's own Err arm fires
+        let dir = std::env::temp_dir().join(format!("wc-open-isdir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        open_as_new_buffer(&mut e, &dir);
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        e.set_status(crate::status::StatusKind::Info, "later ack");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error, "Q1: Info must not displace a held Error");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

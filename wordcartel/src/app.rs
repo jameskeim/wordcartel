@@ -512,7 +512,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
                    | file::OpenError::IsDir(_)
                    | file::OpenError::Io(_)
                    | file::OpenError::TooLarge(..))) => {
-                editor.set_status(crate::status::StatusKind::Info, e.to_string());
+                editor.set_status_full(crate::status::StatusKind::Error, e.to_string(),
+                    crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
             }
         }
     }
@@ -798,7 +799,8 @@ pub fn run(cli: config::Cli) -> std::io::Result<ExitReason> {
     // borrow this function's `clock` local.
     let editor = Rc::new(RefCell::new(editor));
     if let Err(e) = plugin_host.attach_bridge(editor.clone(), msg_tx.clone(), Rc::new(SystemClock) as Rc<dyn Clock>) {
-        editor.borrow_mut().set_status(crate::status::StatusKind::Info, format!("plugin bridge failed to attach: {e}"));
+        editor.borrow_mut().set_status_full(crate::status::StatusKind::Error, format!("plugin bridge failed to attach: {e}"),
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
     }
 
     loop {

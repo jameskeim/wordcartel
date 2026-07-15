@@ -158,7 +158,8 @@ fn perform_block_write(editor: &mut crate::editor::Editor, target: &std::path::P
     let text = editor.active().document.buffer.slice(start..end);
     match crate::file::save_atomic(target, &text) {
         Ok(_)  => editor.set_status(crate::status::StatusKind::Info, format!("wrote block to {}", target.display())),
-        Err(e) => editor.set_status(crate::status::StatusKind::Info, e.to_string()),
+        Err(e) => editor.set_status_full(crate::status::StatusKind::Error, e.to_string(),
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None),
     }
 }
 
@@ -623,6 +624,24 @@ mod tests {
         assert_eq!(e.active().document.buffer.to_string(), before_doc, "document unchanged");
         assert!(e.active().marked_block.is_some(), "block stays after write");
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// A17 T4: a genuine write-block IO failure (target's parent is a regular FILE, so
+    /// `save_atomic` fails ENOTDIR) must land Sticky/Error — surviving a later Info ack (Q1).
+    #[test]
+    fn block_write_failure_is_a_sticky_error_that_survives_a_later_info() {
+        use crate::editor::Editor;
+        let parent = std::env::temp_dir().join(format!("wc-blkw-fail-{}.md", std::process::id()));
+        std::fs::write(&parent, "i am a file, not a dir\n").unwrap();
+        let target = parent.join("out.txt"); // target "inside" a regular file → ENOTDIR
+        let mut e = Editor::new_from_text("hello world\n", None, (80, 24));
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: 0, end: 5, hidden: false });
+        block_write_submit(&mut e, target.to_str().unwrap());
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        e.set_status(crate::status::StatusKind::Info, "later ack");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error, "Q1: Info must not displace a held Error");
+        let _ = std::fs::remove_file(&parent);
     }
 
     #[test]

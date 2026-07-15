@@ -124,7 +124,8 @@ pub fn open_into_current(editor: &mut Editor, path: &std::path::Path) {
             crate::plugin::fire_event(editor, crate::plugin::PluginEventKind::Open, Some(path));
         }
         Err(e) => {
-            editor.set_status(crate::status::StatusKind::Info, e.to_string());
+            editor.set_status_full(crate::status::StatusKind::Error, e.to_string(),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         }
     }
 }
@@ -198,6 +199,22 @@ mod tests {
         assert_eq!(e.active().document.buffer.to_string(), "opened\n");
         assert!(!e.active().document.dirty());
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// A17 T4: an open-into-current failure (path is a directory → OpenError::IsDir) must
+    /// land Sticky/Error — surviving a later Info ack (Q1), not clearing on the next keystroke.
+    #[test]
+    fn open_into_current_failure_is_a_sticky_error_that_survives_a_later_info() {
+        use crate::editor::Editor;
+        let dir = std::env::temp_dir().join(format!("wc-oic-isdir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = Editor::new_from_text("scratch\n", None, (80, 24));
+        open_into_current(&mut e, &dir);
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        e.set_status(crate::status::StatusKind::Info, "later ack");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error, "Q1: Info must not displace a held Error");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

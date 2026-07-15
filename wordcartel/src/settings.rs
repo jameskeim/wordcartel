@@ -557,7 +557,11 @@ pub(crate) fn perform_settings_save(
     let of = compute_overrides(&runtime, baseline, existing, mask);
     match save_overrides(fs, path, &of) {
         Ok(()) => { editor.set_status(crate::status::StatusKind::Info, "settings saved"); Some(of) }
-        Err(e) => { editor.set_status(crate::status::StatusKind::Info, format!("settings: {e}")); None }
+        Err(e) => {
+            editor.set_status_full(crate::status::StatusKind::Error, format!("settings: {e}"),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+            None
+        }
     }
 }
 
@@ -864,6 +868,35 @@ mod tests {
             "status must start with 'settings: ': {:?}", e.status_text());
         assert!(e.status_text().contains("boom"),
             "status must include the IO error string: {:?}", e.status_text());
+    }
+
+    #[test]
+    fn save_failure_is_a_sticky_error_that_survives_a_later_info() {
+        // A17 T4: an IO failure during settings save must land Sticky/Error — surviving a
+        // later Info ack (Q1), not clearing on the next keystroke.
+        struct FailFs;
+        impl crate::fsx::Fs for FailFs {
+            fn create_excl(&self, _: &std::path::Path, _: u32) -> std::io::Result<Box<dyn crate::fsx::WriteSync>> {
+                Err(std::io::Error::other("boom"))
+            }
+            fn existing_mode(&self, _: &std::path::Path) -> Option<u32> { None }
+            fn rename(&self, _: &std::path::Path, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
+            fn sync_dir(&self, _: &std::path::Path) -> std::io::Result<()> { unreachable!() }
+            fn remove_file(&self, _: &std::path::Path) -> std::io::Result<()> { Ok(()) }
+        }
+        let d = tempdir();
+        let path = d.join("o.toml");
+        let mut e = test_editor();
+        let result = perform_settings_save(
+            &mut e, false, Some(&path),
+            &empty_snap(), &OverridesFile::default(), &OverridesFile::default(),
+            &FailFs,
+        );
+        assert!(result.is_none(), "must return None on IO error");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        e.set_status(crate::status::StatusKind::Info, "later ack");
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error, "Q1: Info must not displace a held Error");
     }
 
     #[test]

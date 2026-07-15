@@ -95,6 +95,10 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: std::path::PathBuf, mode: SaveMo
                     let fire_save: Option<PathBuf> =
                         matches!(outcome, Ok(SaveOutcome::Saved) | Ok(SaveOutcome::Unchanged))
                             .then(|| target.clone());
+                    // A17 T4 (F4 Error table): captured BEFORE the match below moves `outcome`'s
+                    // Err payload — a genuine SaveError (IO/symlink) must land Sticky/Error so it
+                    // survives the next keystroke, unlike the ordinary Info completion messages.
+                    let is_save_error = outcome.is_err();
                     let mut status = String::new();
                     if let Some(b) = editor.by_id_mut(buffer_id) {
                         match outcome {
@@ -138,7 +142,12 @@ pub(crate) fn do_save_to(ctx: &mut Ctx, target: std::path::PathBuf, mode: SaveMo
                             }
                         }
                     }
-                    editor.set_status(crate::status::StatusKind::Info, status);
+                    if is_save_error {
+                        editor.set_status_full(crate::status::StatusKind::Error, status,
+                            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+                    } else {
+                        editor.set_status(crate::status::StatusKind::Info, status);
+                    }
                     // Fire AFTER the by_id_mut block closes (never inside it — a live `b: &mut
                     // Buffer` borrow would conflict with fire_event's `&mut Editor`) and after
                     // editor.status is set — mirrors the local-then-assign shape above.
@@ -224,7 +233,11 @@ pub fn reload_from_disk(editor: &mut crate::editor::Editor) {
     let Some(path) = editor.active().document.path.clone() else { return };
     let text = match crate::file::open(&path) {
         Ok(t) => t,
-        Err(e) => { editor.set_status(crate::status::StatusKind::Info, e.to_string()); return; }
+        Err(e) => {
+            editor.set_status_full(crate::status::StatusKind::Error, e.to_string(),
+                crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+            return;
+        }
     };
     // Fix A1: capture the previous version BEFORE replacing the buffer so we
     // can carry it forward.  A diagnostics check in flight before the reload
@@ -400,6 +413,49 @@ mod tests {
         let _ = std::fs::remove_file(&link); let _ = std::fs::remove_file(&real);
     }
 
+    /// A17 T4: a genuine background-save failure (SaveError, via the same symlink refusal as
+    /// above) must land as a Sticky Error — it must survive a later Info ack rather than
+    /// silently clearing on the next keystroke (Q1).
+    #[test]
+    fn background_save_failure_is_a_sticky_error_that_survives_a_later_info() {
+        let real = scratch();
+        let link = scratch();
+        std::fs::write(&real, "real\n").unwrap();
+        #[cfg(unix)] std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(not(unix))] { let _ = &link; return; }
+        let mut e = Editor::new_from_text("x\n", Some(link.clone()), (80, 24));
+        e.active_mut().document.saved_version = None;
+        e.active_mut().document.version = 1;
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        e.set_status(crate::status::StatusKind::Info, "later ack");
+        // Q1: an Info does NOT displace a held Error.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+        let _ = std::fs::remove_file(&link); let _ = std::fs::remove_file(&real);
+    }
+
+    /// A successful background save is still an ordinary Info/Transient status (the failure
+    /// branch above must not have made ALL completions Sticky-Error).
+    #[test]
+    fn background_save_success_is_still_transient_info() {
+        let p = scratch();
+        std::fs::write(&p, "old\n").unwrap();
+        let mut e = Editor::new_from_text("new\n", Some(p.clone()), (80, 24));
+        e.active_mut().document.saved_version = None;
+        e.active_mut().document.version = 1;
+        let ex = InlineExecutor::default();
+        let clk = Z;
+        { let mut ctx = Ctx { editor: &mut e, clock: &clk, executor: &ex, msg_tx: tx() }; dispatch_save(&mut ctx); }
+        for o in ex.drain() { crate::jobs_apply::apply_outcome(o, &mut e); }
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Info);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Transient);
+        let _ = std::fs::remove_file(&p);
+    }
+
     /// A real (non-symlink) save failure also keeps the buffer dirty: the target's
     /// parent is a regular FILE, so temp creation fails immediately (parent not a
     /// directory). Drives the do_save_to merge's Err arm without any test seam.
@@ -529,6 +585,19 @@ mod tests {
         assert!(!e.active().document.dirty(), "reloaded buffer is clean");
         assert_eq!(e.active().document.stored_fp, crate::save::fingerprint(&p), "reload refreshes stored_fp");
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn reload_from_disk_failure_is_a_sticky_error_that_survives_a_later_info() {
+        // A path that will fail to read → the reload Err arm fires.
+        let missing = std::path::PathBuf::from("/nonexistent/definitely/missing-a17.md");
+        let mut e = Editor::new_from_text("hello\n", Some(missing), (80, 24));
+        crate::save::reload_from_disk(&mut e);
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
+        assert_eq!(e.status().unwrap().lifetime(), crate::status::StatusLifetime::Sticky);
+        e.set_status(crate::status::StatusKind::Info, "later ack");
+        // Q1: an Info does NOT displace a held Error.
+        assert_eq!(e.status().unwrap().kind(), crate::status::StatusKind::Error);
     }
 
     #[test]

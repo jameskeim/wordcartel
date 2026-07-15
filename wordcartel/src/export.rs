@@ -265,7 +265,8 @@ pub fn run_export(
 
     // Pandoc availability gate.
     if !probe_pandoc() {
-        editor.set_status(crate::status::StatusKind::Info, "pandoc not found — install it to export");
+        editor.set_status_full(crate::status::StatusKind::Error, "pandoc not found — install it to export",
+            crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return;
     }
 
