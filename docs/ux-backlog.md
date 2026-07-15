@@ -565,6 +565,28 @@ our history a bounded in-memory ring (M5 resource-cap ethos) + optional file spi
 source read of Fresh. Triage — not yet scoped or sized; explicitly flagged by the user as needing to
 be really well thought out because it shapes the customizable plugin-era interface.)*
 
+**Decision 2026-07-14 — build, not buy; model the taxonomy on LSP `MessageType`.** A17 is a
+*user-facing notification* domain model + a registration seam, NOT concurrency/IPC "messaging" — the
+word collides with Rust's actor/broker ecosystem, but none of it applies. Ruled out and why:
+- **No actor framework** (ractor / kameo / actix). A17 adds no concurrency — `set_status()` runs on the
+  main thread; we already have the minimal worker substrate we need (`std::thread` + `mpsc`, results
+  `Send` + version-discarded). `actix`/`tokio` would drag in an async reactor, which violates the
+  "**idle is free** — the input loop BLOCKS" law head-on.
+- **No broker / network crate** (message-io, zmq, Lapin, redis-rs, Kafka). One process, one terminal —
+  no wire, no node, no broker. `zmq` is also C bindings, and the core is `#![forbid(unsafe_code)]`.
+- **Dependency weight is an active constraint** (cf. H2's crate-bloat trim). A17 must not import a
+  framework; it is ~a few hundred lines of bespoke code whose *value is our routing policy* (which
+  kinds are sticky vs transient, history browsing, plugin-sink precedence) — the part any library
+  would make us write anyway. Matches seams we already own (`timers.rs` `SUBSYSTEMS`, the command
+  registry, and the closest cousin — `DiagSource` routing, which is A17-for-diagnostics).
+
+The useful prior art is *design*, not crates. Base `StatusKind` on **LSP `window/showMessage` +
+`MessageType`** (Error / Warning / Info / Log) — we already speak LSP (harper_ls), so mirroring its
+taxonomy keeps kinds consistent across the app. Pull the *sticky-with-actions* tier (severity +
+attached actions + a browsable notification center) from the **VS Code notification** model — which
+dovetails with the Fresh `WarningDomain`/typed-actions note above. `noice.nvim` stays the named
+*anti-pattern* (override-on-top), not a mechanism to copy.
+
 ### S7 — Linguistic substrate — harper-brill POS tagger + NP chunker in-process
 <!-- item: S7 -->
 
