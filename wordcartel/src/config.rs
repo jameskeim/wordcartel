@@ -172,6 +172,9 @@ pub struct ViewConfig {
     pub splash: bool,
     pub caret_shape: CaretShape,
     pub caret_blink: bool,
+    /// Message verbosity floor (Q6, A17 T10): `[view] messages_min_kind`, `"info"` (default,
+    /// show Info & above) or `"warning"` (Warnings & Errors only). Feeds `Editor::set_messages_min_kind`.
+    pub messages_min_kind: crate::status::StatusKind,
 }
 impl Default for ViewConfig {
     fn default() -> Self {
@@ -181,7 +184,8 @@ impl Default for ViewConfig {
             // status_line defaults On (idle info line always shown out of the box —
             // preserves the pre-density behavior); Zen (chrome = zen) flips it to Auto.
             scrollbar: TransientMode::Auto, status_line: TransientMode::On, splash: true,
-            caret_shape: CaretShape::Default, caret_blink: true }
+            caret_shape: CaretShape::Default, caret_blink: true,
+            messages_min_kind: crate::status::StatusKind::Info }
     }
 }
 
@@ -388,6 +392,7 @@ struct RawView {
     splash: Option<bool>,
     caret_shape: Option<String>,
     caret_blink: Option<bool>,
+    messages_min_kind: Option<String>,
 }
 
 /// Ordered existing config files, lowest→highest precedence. Empty when --no-config.
@@ -522,6 +527,13 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
             }
         }
         if let Some(b) = raw.view.caret_blink { cfg.view.caret_blink = b; }
+        if let Some(s) = raw.view.messages_min_kind {
+            match crate::status::StatusKind::from_str(&s) {
+                Some(k @ (crate::status::StatusKind::Info | crate::status::StatusKind::Warning)) =>
+                    cfg.view.messages_min_kind = k,
+                _ => warns.push(format!("view.messages_min_kind \"{s}\" invalid; using info")),
+            }
+        }
         // menu: per-field override; enum-valued string with a warning on unknowns.
         if let Some(b) = raw.menu.bar {
             match b.as_str() {
@@ -625,6 +637,16 @@ pub fn load(paths: &[PathBuf]) -> (Config, Vec<String>) {
 /// "off"/"auto"/"on" — round-trips `TransientMode` for the overrides mirror.
 pub fn transient_mode_str(m: TransientMode) -> &'static str {
     match m { TransientMode::Off => "off", TransientMode::Auto => "auto", TransientMode::On => "on" }
+}
+
+/// "info"/"warning" — round-trips the `messages_min_kind` verbosity floor for the overrides
+/// mirror (mirrors `transient_mode_str`). Callers only ever pass `Info`/`Warning` (the two
+/// config-valid states); `Error`/`Log` are unreachable here but matched for exhaustiveness.
+pub fn messages_min_kind_str(k: crate::status::StatusKind) -> &'static str {
+    match k {
+        crate::status::StatusKind::Warning => "warning",
+        crate::status::StatusKind::Info | crate::status::StatusKind::Error | crate::status::StatusKind::Log => "info",
+    }
 }
 
 pub fn caret_shape_str(s: CaretShape) -> &'static str {
@@ -1177,6 +1199,7 @@ mod tests {
             chrome_disposition: wordcartel_core::theme::ChromeDisposition::Zen,
             canvas: CanvasMode::Transparent,
             clipboard_provider: crate::config::ClipboardProvider::Auto,
+            view_messages_min_kind: crate::status::StatusKind::Info,
         };
 
         let of = compute_overrides(&runtime, &baseline, &OverridesFile::default(), &OverridesFile::default());

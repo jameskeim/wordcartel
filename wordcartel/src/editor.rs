@@ -1096,6 +1096,8 @@ impl Editor {
     #[inline] pub fn has_visible_status(&self) -> bool { self.status.is_some() }
     /// The browsable message ring (spec §5).
     #[inline] pub fn status_history(&self) -> &crate::status::StatusHistory { &self.status_history }
+    /// The verbosity floor (Q6): a candidate strictly less severe than this is history-only.
+    #[inline] pub fn messages_min_kind(&self) -> crate::status::StatusKind { self.messages_min_kind }
 
     // Thin delegators — external callers unchanged. A17 T8 FEEDBACK: the delegators own status
     // access (the `Buffer` methods do not), so a read-only reject sets the Sticky Warning here and
@@ -1153,6 +1155,11 @@ impl Editor {
     pub fn set_caret_shape(&mut self, s: crate::config::CaretShape) { self.caret_shape = s; }
     /// Set caret blink. Inert while `caret_shape == Default` (emits nothing — see cursor_style).
     pub fn set_caret_blink(&mut self, on: bool) { self.caret_blink = on; }
+
+    /// Set the message verbosity floor (Q6, contract law 6 — the ONE setter `messages_min_info`/
+    /// `messages_min_warning`/`toggle_messages_verbosity` and startup config all route through).
+    /// Consulted by `set_status`/`set_status_full`/`finish_topic` via `resolve_slot`.
+    pub fn set_messages_min_kind(&mut self, k: crate::status::StatusKind) { self.messages_min_kind = k; }
 
     /// Set the status-line transient mode (Off coerces to Auto — status has no true Off,
     /// no-silent-UI) and clear its stale dwell state.
@@ -1250,6 +1257,21 @@ mod tests {
         assert_eq!(e.status_text(), "hello");
         assert!(e.has_visible_status());
         assert_eq!(e.status_history().entries().len(), 1);
+    }
+
+    /// A17 T10 (Q6 verbosity floor): a candidate strictly less severe than `messages_min_kind`
+    /// never takes the display slot, but is still recorded to history; a candidate at/above the
+    /// floor takes the slot normally.
+    #[test]
+    fn verbosity_floor_hides_info_below_warning() {
+        let mut e = Editor::new_from_text("x\n", None, (40, 6));
+        e.set_messages_min_kind(crate::status::StatusKind::Warning);
+        e.set_status(crate::status::StatusKind::Info, "quiet");
+        assert!(!e.has_visible_status(), "Info is below the Warning floor → history-only");
+        assert_eq!(e.status_history().entries().len(), 1, "still recorded in history");
+        e.set_status_full(crate::status::StatusKind::Warning, "loud", crate::status::StatusLifetime::Sticky,
+                          crate::status::StatusSource::Host, None);
+        assert_eq!(e.status_text(), "loud");
     }
 
     #[test]

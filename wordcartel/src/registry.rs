@@ -678,6 +678,20 @@ impl Registry {
             |c| { let next = if c.editor.status_line_mode == TransientMode::On { TransientMode::Auto } else { TransientMode::On };
                   c.editor.set_status_line_mode(next); CommandResult::Handled });
 
+        // Message verbosity floor (Q6, A17 T10): set-per-state (palette-only) + 2-state toggle
+        // representative (View, state-in-label). All three route through the single
+        // `Editor::set_messages_min_kind` setter (contract law 6).
+        r.register("messages_min_info", "Messages: Info & Above", None, |c| {
+            c.editor.set_messages_min_kind(crate::status::StatusKind::Info); CommandResult::Handled });
+        r.register("messages_min_warning", "Messages: Warnings & Errors Only", None, |c| {
+            c.editor.set_messages_min_kind(crate::status::StatusKind::Warning); CommandResult::Handled });
+        r.register_stateful("toggle_messages_verbosity", "Message Verbosity", Some(MenuCategory::View),
+            |e| MenuMark::Value(match e.messages_min_kind() {
+                crate::status::StatusKind::Warning => "Warnings & Errors Only", _ => "Info & Above" }),
+            |c| { let next = if c.editor.messages_min_kind() == crate::status::StatusKind::Warning {
+                      crate::status::StatusKind::Info } else { crate::status::StatusKind::Warning };
+                  c.editor.set_messages_min_kind(next); CommandResult::Handled });
+
         // Startup splash: set-per-state (palette-only) + 2-state toggle representative
         // (View, OnOff mark). All three route through Editor::set_splash (contract law 6);
         // the splash paints only at launch, so a change takes effect on the NEXT run.
@@ -2229,5 +2243,30 @@ mod tests {
         assert_eq!(reg.dispatch(CommandId("toggle_ventilate"), &mut ctx), CommandResult::Handled);
         assert!(ed.active().view.ventilate, "dispatch turned the lens on");
         assert!(matches!(f(&ed), MenuMark::OnOff(true)));
+    }
+
+    // -----------------------------------------------------------------------
+    // A17 T10 (Q6): messages_min_kind command-surface wiring — set-per-state
+    // primitives + the 2-state toggle representative, all routed through the
+    // single Editor::set_messages_min_kind setter.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn toggle_flips_between_two_states() {
+        let mut e = Editor::new_from_text("x\n", None, (40, 6));
+        e.set_messages_min_kind(crate::status::StatusKind::Info);
+        dispatch_id(&mut e, "toggle_messages_verbosity");
+        assert_eq!(e.messages_min_kind(), crate::status::StatusKind::Warning);
+        dispatch_id(&mut e, "toggle_messages_verbosity");
+        assert_eq!(e.messages_min_kind(), crate::status::StatusKind::Info);
+    }
+
+    #[test]
+    fn set_per_state_primitives_set_the_floor_directly() {
+        let mut e = Editor::new_from_text("x\n", None, (40, 6));
+        dispatch_id(&mut e, "messages_min_warning");
+        assert_eq!(e.messages_min_kind(), crate::status::StatusKind::Warning);
+        dispatch_id(&mut e, "messages_min_info");
+        assert_eq!(e.messages_min_kind(), crate::status::StatusKind::Info);
     }
 }

@@ -61,6 +61,9 @@ pub struct SettingsSnapshot {
     pub canvas: CanvasMode,
     /// Clipboard provider selection persisted as "auto"/"native"/"osc52"/"off".
     pub clipboard_provider: crate::config::ClipboardProvider,
+    /// Message verbosity floor (Q6, A17 T10; `view.messages_min_kind`). Mutated by
+    /// `messages_min_info`/`messages_min_warning`/`toggle_messages_verbosity`.
+    pub view_messages_min_kind: crate::status::StatusKind,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +129,7 @@ pub struct OView {
     #[serde(skip_serializing_if = "Option::is_none")] pub splash:      Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")] pub caret_shape: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] pub caret_blink: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub messages_min_kind: Option<String>,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -187,6 +191,7 @@ pub fn snapshot_of(cfg: &crate::config::Config, resolved_theme_name: &str) -> Se
         chrome_disposition,
         canvas: crate::theme_resolve::parse_canvas(&cfg.theme.canvas).0,
         clipboard_provider: cfg.clipboard.provider,
+        view_messages_min_kind: cfg.view.messages_min_kind,
     }
 }
 
@@ -211,6 +216,7 @@ pub fn runtime_snapshot(editor: &crate::editor::Editor) -> SettingsSnapshot {
         chrome_disposition: editor.chrome_disposition,
         canvas: editor.canvas,
         clipboard_provider: editor.clipboard_provider,
+        view_messages_min_kind: editor.messages_min_kind(),
     }
 }
 
@@ -439,11 +445,17 @@ pub fn compute_overrides(
         ex_view.and_then(|v| v.caret_blink.as_ref()),
         mk_view.and_then(|v| v.caret_blink).is_some(),
     );
+    let rt_mmk   = crate::config::messages_min_kind_str(runtime.view_messages_min_kind).to_string();
+    let base_mmk = crate::config::messages_min_kind_str(baseline.view_messages_min_kind).to_string();
+    let messages_min_kind = diff_key(&rt_mmk, &base_mmk,
+        ex_view.and_then(|v| v.messages_min_kind.as_ref()),
+        mk_view.and_then(|v| v.messages_min_kind.as_ref()).is_some(),
+    );
     let any_view = typewriter.is_some() || focus.is_some() || measure.is_some()
         || wrap_guide.is_some() || word_count.is_some() || wrap_column.is_some()
         || scrollbar.is_some() || status_line.is_some() || splash.is_some()
-        || caret_shape.is_some() || caret_blink.is_some();
-    let view = some_if(OView { typewriter, focus, measure, wrap_guide, word_count, wrap_column, scrollbar, status_line, splash, caret_shape, caret_blink }, any_view);
+        || caret_shape.is_some() || caret_blink.is_some() || messages_min_kind.is_some();
+    let view = some_if(OView { typewriter, focus, measure, wrap_guide, word_count, wrap_column, scrollbar, status_line, splash, caret_shape, caret_blink, messages_min_kind }, any_view);
 
     // --- menu — per-key mask predicate ---
     let rt_bar   = menu_bar_str(runtime.menu_bar).to_string();
@@ -600,7 +612,8 @@ mod tests {
             menu_bar: crate::config::MenuBarMode::Auto, mouse_capture: true,
             chrome_disposition: ChromeDisposition::Full,
             canvas: CanvasMode::Opaque,
-            clipboard_provider: crate::config::ClipboardProvider::Auto }
+            clipboard_provider: crate::config::ClipboardProvider::Auto,
+            view_messages_min_kind: crate::status::StatusKind::Info }
     }
 
     fn snap_with<F: FnOnce(&mut SettingsSnapshot)>(f: F) -> SettingsSnapshot {
@@ -1092,6 +1105,7 @@ mod tests {
                 view_caret_shape: _, view_caret_blink: _,
                 menu_bar: _, mouse_capture: _,
                 chrome_disposition: _, canvas: _, clipboard_provider: _,
+                view_messages_min_kind: _,
             } = s;
         }
         let _ = field_guard; // reference it so the guard compiles (no dead_code allow needed)
@@ -1118,6 +1132,8 @@ mod tests {
         assert!(has("toggle_chrome"), "chrome_disposition");
         assert!(has("toggle_canvas"), "canvas");
         assert!(has("clipboard_provider_cycle") && has("clipboard_provider_auto"), "clipboard_provider");
+        assert!(has("toggle_messages_verbosity") && has("messages_min_info") && has("messages_min_warning"),
+            "view_messages_min_kind");
     }
 
     #[test]

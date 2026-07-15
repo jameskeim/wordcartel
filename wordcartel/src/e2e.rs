@@ -1618,6 +1618,7 @@ fn journey_chrome_zen_toggle() {
         chrome_disposition: ChromeDisposition::Full,
         canvas:             wordcartel_core::theme::CanvasMode::Opaque,
         clipboard_provider: crate::config::ClipboardProvider::Auto,
+        view_messages_min_kind: crate::status::StatusKind::Info,
     };
     // Mirror the run-loop pattern: clear the flag, then write the file.
     h.editor.borrow_mut().settings_save_requested = false;
