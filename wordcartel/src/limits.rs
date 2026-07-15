@@ -126,6 +126,16 @@ mod tests {
         assert_eq!(PLUGIN_TIMER_MIN_INTERVAL_MS, 1000);
         assert_eq!(PLUGIN_MAX_TIMERS_PER_PLUGIN, 8);
         assert_eq!(PLUGIN_MAX_COMMAND_ARG, 4096);
+    }
+
+    // A17: guardrail so the messaging caps aren't drifted silently — the history ring is a
+    // fixed-cap M5 resource bound, the text cap is shared with `wc.status`, and the emit
+    // throttle/dedup windows are tuned constants a whole-branch/smoke pass may revisit.
+    #[test]
+    fn messages_caps_are_stable() {
+        assert_eq!(MESSAGES_HISTORY_CAP, 256);
+        assert_eq!(MESSAGES_MAX_TEXT_LEN, PLUGIN_MAX_STATUS_LEN);
+        assert_eq!(MESSAGES_DEDUP_WINDOW, 1);
         assert_eq!(MESSAGES_EMIT_MAX_PER_TICK, 1);
     }
 }
