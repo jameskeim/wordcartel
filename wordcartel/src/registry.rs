@@ -855,10 +855,21 @@ impl Registry {
                     match (self.entries[i].meta.arg, arg) {
                         (_, Some(supplied)) => ctx.editor.pending_plugin_calls.push_back(
                             crate::plugin::PluginCall { id, arg: Some(supplied) }),
-                        (Some(prompt), None) => ctx.editor.minibuffer = Some(crate::minibuffer::Minibuffer {
-                            prompt: prompt.to_string(), text: String::new(), cursor: 0,
-                            kind: crate::minibuffer::MinibufferKind::PluginArg { id },
-                        }),
+                        (Some(prompt), None) => {
+                            // Hold the single-overlay XOR invariant (H21): the plugin pump drains
+                            // this path UNCONDITIONALLY, so a plugin timer/event can open this
+                            // PluginArg prompt while another overlay is already active. Mirror
+                            // `Editor::open_minibuffer`'s close_all + pending clears — but NOT its
+                            // `prompt.is_none()` debug_assert, which a plugin-triggered dispatch
+                            // fired under a modal Prompt would trip before close_all could clear it.
+                            crate::overlays::close_all(ctx.editor);
+                            ctx.editor.pending_keys.clear();
+                            ctx.editor.pending_mark = None;
+                            ctx.editor.minibuffer = Some(crate::minibuffer::Minibuffer {
+                                prompt: prompt.to_string(), text: String::new(), cursor: 0,
+                                kind: crate::minibuffer::MinibufferKind::PluginArg { id },
+                            });
+                        }
                         (None, None) => ctx.editor.pending_plugin_calls.push_back(
                             crate::plugin::PluginCall { id, arg: None }),
                     }
