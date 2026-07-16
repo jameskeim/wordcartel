@@ -450,8 +450,10 @@ fn place_cursor(frame: &mut Frame, editor: &Editor, area: Rect, edit_top: u16,
         // file_browser, menu, prompt, splash, diag, cursor_picker) must not leave the hardware
         // caret parked in the editor text area underneath it.
         if let Some((col, row)) = nav::screen_pos(editor) {
-            // Guard rows; clamp cols — a caret on/after hung trailing whitespace sits
-            // logically past the text rect and pins at the edge (spec D2 clamp).
+            // Guard rows; clamp cols. B17 (amends spec D2): a trailing space at the margin now resolves
+            // to col 0 of the flush continuation row, so this clamp is inert for that case. It still
+            // guards a caret placed on a hung-INTERIOR cell (before the space) and a genuinely over-wide
+            // single grapheme past the rect.
             if row < edit_height && tg.text_width > 0 {
                 let col = col.min((tg.text_width as usize).saturating_sub(1) as u16);
                 frame.set_cursor_position(Position { x: area.x + tg.text_left + col, y: edit_top + row });
@@ -1999,23 +2001,20 @@ mod tests {
         );
     }
 
-    /// D2 clamp: a caret positioned after hung trailing whitespace (logical col ≥
-    /// text_width) must be pinned at text_width−1, not suppressed (which leaves the
-    /// terminal cursor at the TestBackend default (0, 0)).
+    /// B17 (amends spec D2): a trailing space hung at the margin now breaks the caret to
+    /// col 0 of an appended flush continuation row — real line-move feedback that the
+    /// space registered — instead of pinning at text_width−1 on the same row.
     #[test]
-    fn hung_trailing_space_caret_pins_at_edge() {
-        // vw 4: "abcd " hangs its trailing space (placed at col 4 == vw); the caret
-        // AFTER the space (byte 5, eol) maps to logical col 5 — past the text rect.
-        // Today's `col < text_width` guard suppresses the cursor entirely (invisible
-        // caret while typing "word "); the clamp pins it at text_width-1 (spec D2).
+    fn trailing_space_at_margin_breaks_caret_to_flush_row() {
+        // B17 (amends spec D2): vw 4, "abcd " — the caret AFTER the hung space (byte 5, eol) no longer
+        // pins at the edge; it moves to col 0 of the next (flush phantom) screen row — real line-move
+        // feedback. (Pre-B17 this pinned at x == 3 on the same row.)
         let mut e = Editor::new_from_text("abcd \n", None, (4, 8));
         set_caret(&mut e, 5); // eol, after the hung space (active line — layout raw)
         derive::rebuild(&mut e);
-        let (col, _row) = crate::nav::screen_pos(&e).expect("caret on screen");
-        assert!(col as usize >= 4, "precondition: logical col past the rect, got {col}");
+        assert_eq!(crate::nav::screen_pos(&e), Some((0, 1)), "caret at col 0 of the flush row");
         let cur = render_capturing_cursor(&mut e, 4, 8);
-        let (x, _y) = cur.expect("helper returns Some; suppression shows as (0,0)");
-        assert_eq!(x, 3, "pinned at text_width-1 (text_left is 0 here)");
+        assert_eq!(cur, Some((0, 1)), "hardware caret at (0, 1) — col 0, one row down");
     }
 
     #[test]
