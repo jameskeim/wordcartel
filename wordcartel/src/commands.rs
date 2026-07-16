@@ -818,6 +818,34 @@ mod tests {
         assert_eq!(e.active().document.buffer.to_string(), "cd\n", "Cut must remove the selected text");
         assert_eq!(nav::head(&e), 0, "caret must be at selection start after Cut");
         assert_eq!(e.register.get(), Some("ab"), "register must contain the cut text");
+        assert_eq!(e.clipboard_sync_request.as_deref(), Some("ab"),
+            "Cut on an editable buffer must still request a clipboard sync (C6 regression guard)");
+    }
+
+    // C6: on a read-only buffer, Cut must be a clean refuse — the core's read-only reject is
+    // the only effect. The register must NOT be touched (stays at its prior value) and no
+    // clipboard sync must be requested. Before the C6 fix, `cut()` wrote the register BEFORE
+    // `editor.apply` could reject the edit, so a read-only Cut still silently synced the
+    // clipboard even though nothing was deleted.
+    #[test]
+    fn cut_on_read_only_buffer_does_not_touch_register_or_clipboard() {
+        let mut e = Editor::new_from_text("abcd\n", None, (80, 24));
+        // Prime the register with a prior value so we can prove Cut leaves it UNCHANGED,
+        // not just empty.
+        e.register.set("prior".into());
+        e.active_mut().read_only = true;
+        e.active_mut().document.selection = Selection::range(0, 2); // "ab"
+        derive::rebuild(&mut e);
+        let clk = TestClock(0);
+        let before = e.active().document.buffer.to_string();
+
+        let result = run(Command::Cut, &mut e, &clk);
+
+        assert_eq!(result, CommandResult::Handled, "Cut still reports Handled (the reject IS the effect)");
+        assert_eq!(e.active().document.buffer.to_string(), before, "read-only: buffer must be unchanged");
+        assert_eq!(e.register.get(), Some("prior"), "read-only Cut must NOT touch the register");
+        assert!(e.clipboard_sync_request.is_none(), "read-only Cut must NOT request a clipboard sync");
+        assert_eq!(e.status_text(), "buffer is read-only", "the core's loud read-only reject must still fire");
     }
 
     /// Paste inserts register contents at the current caret position.

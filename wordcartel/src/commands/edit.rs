@@ -5,12 +5,15 @@
 //! call needed here (H22 Task 4; `settle_after_edit` below is retained only
 //! for `prose_ops::swap`'s two-rebuild fold-correction path).
 //!
-//! H24: every `editor.apply(...)` below drops the returned `EditOutcome` on purpose. All target
-//! the ACTIVE buffer, so `BufferGone` cannot occur. A `RejectedReadOnly` already fired the loud
-//! Sticky Warning inside the funnel (`edit_apply::apply_edit` → `Editor::reject_read_only`); this
-//! module's own unconditional success `set_status` calls are Q1-arbitrated behind that Sticky
-//! Warning (`status::resolve_slot`), so no false ack is ever shown — see
-//! `commands.rs::read_only_buffer_rejects_keyboard_edits_with_a_message`.
+//! H24: every `editor.apply(...)` below drops the returned `EditOutcome` on purpose, with ONE
+//! exception (`cut`, C6). All target the ACTIVE buffer, so `BufferGone` cannot occur. A
+//! `RejectedReadOnly` already fired the loud Sticky Warning inside the funnel
+//! (`edit_apply::apply_edit` → `Editor::reject_read_only`); this module's own unconditional
+//! success `set_status` calls are Q1-arbitrated behind that Sticky Warning
+//! (`status::resolve_slot`), so no false ack is ever shown — see
+//! `commands.rs::read_only_buffer_rejects_keyboard_edits_with_a_message`. `cut` is the exception:
+//! it must NOT sync the register/clipboard on a rejected edit (C6), so it captures the
+//! `EditOutcome` and gates the register write on `Applied` — see its own doc comment.
 
 use crate::derive;
 use crate::nav;
@@ -19,7 +22,6 @@ use super::{replace_changeset, CommandResult};
 use wordcartel_core::block_tree::Edit;
 use wordcartel_core::change::ChangeSet;
 use wordcartel_core::history::{Clock, EditKind, Transaction};
-use wordcartel_core::register;
 use wordcartel_core::selection::Selection;
 
 /// Post-edit epilogue for the buffer-edit primitives — now a thin delegate to the shared core
@@ -156,22 +158,31 @@ pub(super) fn delete_forward(editor: &mut Editor, clock: &dyn Clock) -> CommandR
 }
 
 /// `Command::Cut` — cuts the primary selection into the register and deletes
-/// it. Noop on an empty selection. Ordering is significant: `apply` first,
-/// THEN the clipboard-sync-request read from `editor.register`, THEN settle.
+/// it. Noop on an empty selection. C6: ordering is deliberately reversed from the
+/// `register::cut` core helper this used to call — `apply` goes FIRST, and the
+/// register/clipboard are only touched on `EditOutcome::Applied`. A read-only buffer's
+/// reject must be a clean no-op: nothing syncs to the register or the clipboard, the
+/// core's loud "buffer is read-only" reject (fired inside `editor.apply`) is the only
+/// effect. This is why the register-write can no longer live inside a pure core helper —
+/// the ordering IS shell policy, not a core op — so `register::cut` was removed; only
+/// `ChangeSet::delete` + `Register::set` are used here now (mirrors `Command::Copy`'s
+/// own set-then-request-sync pattern in `commands.rs`).
 pub(super) fn cut(editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     let r = editor.active().document.selection.primary();
     if r.is_empty() {
         return CommandResult::Noop;
     }
     let doc_len = editor.active().document.buffer.len();
-    // Borrow the buffer before mutably borrowing editor.register (field-split no longer
-    // applies now that both live under editor.active() rather than directly on Editor).
+    // Capture the selection text BEFORE apply — apply may reject (read-only) and leave the
+    // buffer untouched, in which case this snapshot is simply discarded below.
     let buf_snap = editor.active().document.buffer.clone();
-    let cs = register::cut(r, doc_len, &mut editor.register, &buf_snap);
+    let text = buf_snap.slice(r.from()..r.to());
+    let cs = ChangeSet::delete(r.from()..r.to(), doc_len);
     let edit = Edit { range: r.from()..r.to(), new_len: 0 };
     let txn = Transaction::new(cs).with_selection(Selection::single(r.from()));
-    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
-    if let Some(text) = editor.register.get().map(str::to_owned) {
+    let outcome = editor.apply(txn, edit, EditKind::Other, clock);
+    if outcome == crate::edit_apply::EditOutcome::Applied {
+        editor.register.set(text.clone());
         editor.clipboard_sync_request = Some(text);
     }
     CommandResult::Handled
