@@ -309,6 +309,11 @@ impl Buffer {
             Some(sel) => {
                 self.document.selection = sel;
                 self.document.version += 1;
+                // F6: refresh the recovery panic-latch so a post-undo/redo dump can't resurrect
+                // content the user deliberately reverted (H22 — the one widening of "undo/redo
+                // stay OUT of the apply core"; apply already snapshots at editor.rs:304).
+                crate::recovery::record_snapshot(
+                    self.document.path.as_deref(), self.document.buffer.snapshot());
                 self.last_edit = None;
                 self.pre_edit_rope = None;
                 // 5g: drop fold anchors now past EOF; rebuild reconciles the rest.
@@ -328,6 +333,11 @@ impl Buffer {
             Some(sel) => {
                 self.document.selection = sel;
                 self.document.version += 1;
+                // F6: refresh the recovery panic-latch so a post-undo/redo dump can't resurrect
+                // content the user deliberately reverted (H22 — the one widening of "undo/redo
+                // stay OUT of the apply core"; apply already snapshots at editor.rs:304).
+                crate::recovery::record_snapshot(
+                    self.document.path.as_deref(), self.document.buffer.snapshot());
                 self.last_edit = None;
                 self.pre_edit_rope = None;
                 // 5g: drop fold anchors now past EOF; rebuild reconciles the rest.
@@ -1589,6 +1599,24 @@ mod tests {
         assert_eq!(e.active().document.version, v0, "version must not move on a no-op redo");
         assert!(!e.active().document.dirty(), "a no-op redo must not dirty the buffer");
         assert_eq!(e.active().desired_col, Some(3), "a no-op redo must not reset desired_col");
+    }
+
+    #[test]
+    fn undo_and_redo_refresh_the_recovery_snapshot() {
+        // Serialize the shared LAST_GOOD latch for this thread by taking it, seeding a sentinel,
+        // dropping the guard, then acting. (Global; other threads may race — see plan note.)
+        struct C; impl wordcartel_core::history::Clock for C { fn now_ms(&self) -> u64 { 0 } }
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        let (cs, edit) = crate::commands::build_multi_replace(&[(0, 0, "X".into())], 4);
+        e.active_mut().apply(Transaction::new(cs), edit, EditKind::Other, &C); // LAST_GOOD = "Xabc\n"
+        e.active_mut().undo();
+        let after_undo = crate::recovery::LAST_GOOD.lock().unwrap()
+            .as_ref().map(|(_, r)| r.to_string());
+        assert_eq!(after_undo.as_deref(), Some("abc\n"), "undo refreshes the recovery snapshot");
+        e.active_mut().redo();
+        let after_redo = crate::recovery::LAST_GOOD.lock().unwrap()
+            .as_ref().map(|(_, r)| r.to_string());
+        assert_eq!(after_redo.as_deref(), Some("Xabc\n"), "redo refreshes the recovery snapshot");
     }
 
     #[test]
