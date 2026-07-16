@@ -263,8 +263,10 @@ impl Buffer {
         }
     }
 
-    /// Single mutation channel for THIS buffer's document (spec §10.1).
-    pub fn apply(&mut self, txn: Transaction, edit: wordcartel_core::block_tree::Edit, kind: EditKind, clock: &dyn Clock) {
+    /// Single mutation channel for THIS buffer's document (spec §10.1). `pub(crate)` — the
+    /// compiler-guarded no-bypass seam (INV-SEAM): callable only from `edit_apply::apply_edit`
+    /// within this crate; out-of-crate (Effort-P plugin) callers cannot reach it at all.
+    pub(crate) fn apply(&mut self, txn: Transaction, edit: wordcartel_core::block_tree::Edit, kind: EditKind, clock: &dyn Clock) {
         if self.read_only { return; }                    // A17 T8 category (a): content is immutable.
         let cs = txn.changes.clone();                    // capture BEFORE commit consumes txn
         let old_rope = self.document.buffer.snapshot();
@@ -309,6 +311,11 @@ impl Buffer {
             Some(sel) => {
                 self.document.selection = sel;
                 self.document.version += 1;
+                // F6: refresh the recovery panic-latch so a post-undo/redo dump can't resurrect
+                // content the user deliberately reverted (H22 — the one widening of "undo/redo
+                // stay OUT of the apply core"; apply already snapshots at editor.rs:304).
+                crate::recovery::record_snapshot(
+                    self.document.path.as_deref(), self.document.buffer.snapshot());
                 self.last_edit = None;
                 self.pre_edit_rope = None;
                 // 5g: drop fold anchors now past EOF; rebuild reconciles the rest.
@@ -328,6 +335,11 @@ impl Buffer {
             Some(sel) => {
                 self.document.selection = sel;
                 self.document.version += 1;
+                // F6: refresh the recovery panic-latch so a post-undo/redo dump can't resurrect
+                // content the user deliberately reverted (H22 — the one widening of "undo/redo
+                // stay OUT of the apply core"; apply already snapshots at editor.rs:304).
+                crate::recovery::record_snapshot(
+                    self.document.path.as_deref(), self.document.buffer.snapshot());
                 self.last_edit = None;
                 self.pre_edit_rope = None;
                 // 5g: drop fold anchors now past EOF; rebuild reconciles the rest.
@@ -1059,9 +1071,10 @@ impl Editor {
     // Thin delegators — external callers unchanged. A17 T8 FEEDBACK: the delegators own status
     // access (the `Buffer` methods do not), so a read-only reject sets the Sticky Warning here and
     // returns before delegating. Because the Warning is Sticky, Q1 suppresses any later success ack.
-    pub fn apply(&mut self, txn: Transaction, edit: wordcartel_core::block_tree::Edit, kind: EditKind, clock: &dyn Clock) {
-        if self.active().read_only { self.reject_read_only(); return; }
-        self.active_mut().apply(txn, edit, kind, clock);
+    pub fn apply(&mut self, txn: Transaction, edit: wordcartel_core::block_tree::Edit, kind: EditKind,
+                 clock: &dyn Clock) -> crate::edit_apply::EditOutcome {
+        let id = self.active().id;
+        crate::edit_apply::apply_edit(self, id, txn, edit, kind, clock)
     }
     pub fn undo(&mut self) -> bool {
         if self.active().read_only { self.reject_read_only(); return false; }
@@ -1542,9 +1555,13 @@ mod tests {
         assert_eq!(e.active().document.selection.primary().head, 2);
         assert_eq!(e.active().document.version, 1);
         assert!(e.active().document.dirty());
-        assert!(e.active().pre_edit_rope.is_some());
-        // Edit has no PartialEq — compare fields:
-        assert_eq!(e.active().last_edit.as_ref().map(|x| (x.range.clone(), x.new_len)), Some((1..1, 1)));
+        // H22 Task 1: `Editor::apply` now delegates through `edit_apply::apply_edit`, whose
+        // active-buffer epilogue (`resettle` → `derive::rebuild`) runs synchronously before
+        // this returns — so the block tree is already caught up, and `derive::rebuild`'s parse
+        // phase has consumed (`.take()`'d) both fields rather than leaving them set.
+        assert_eq!(e.active().reconcile.blocks_version, e.active().document.version);
+        assert!(e.active().pre_edit_rope.is_none());
+        assert!(e.active().last_edit.is_none());
     }
 
     #[test]
@@ -1584,6 +1601,24 @@ mod tests {
         assert_eq!(e.active().document.version, v0, "version must not move on a no-op redo");
         assert!(!e.active().document.dirty(), "a no-op redo must not dirty the buffer");
         assert_eq!(e.active().desired_col, Some(3), "a no-op redo must not reset desired_col");
+    }
+
+    #[test]
+    fn undo_and_redo_refresh_the_recovery_snapshot() {
+        // Serialize the shared LAST_GOOD latch for this thread by taking it, seeding a sentinel,
+        // dropping the guard, then acting. (Global; other threads may race — see plan note.)
+        struct C; impl wordcartel_core::history::Clock for C { fn now_ms(&self) -> u64 { 0 } }
+        let mut e = Editor::new_from_text("abc\n", None, (80, 24));
+        let (cs, edit) = crate::commands::build_multi_replace(&[(0, 0, "X".into())], 4);
+        e.active_mut().apply(Transaction::new(cs), edit, EditKind::Other, &C); // LAST_GOOD = "Xabc\n"
+        e.active_mut().undo();
+        let after_undo = crate::recovery::LAST_GOOD.lock().unwrap()
+            .as_ref().map(|(_, r)| r.to_string());
+        assert_eq!(after_undo.as_deref(), Some("abc\n"), "undo refreshes the recovery snapshot");
+        e.active_mut().redo();
+        let after_redo = crate::recovery::LAST_GOOD.lock().unwrap()
+            .as_ref().map(|(_, r)| r.to_string());
+        assert_eq!(after_redo.as_deref(), Some("Xabc\n"), "redo refreshes the recovery snapshot");
     }
 
     #[test]

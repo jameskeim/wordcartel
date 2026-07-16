@@ -256,9 +256,10 @@ pub fn dispatch_transform(
 /// `apply_transform_done` in `jobs_apply.rs`). Targets `buffer_id` (not necessarily
 /// active) so both callers route correctly.
 ///
-/// Active-buffer guard: `derive::rebuild` and `nav::ensure_visible` operate on
-/// `editor.active()` ONLY. We call them only when the merged buffer IS the
-/// active buffer, future-proofing for Effort 6 multi-buffer.
+/// Active-buffer guard: the mutation routes through `edit_apply::apply_edit`
+/// (H22), which runs its post-edit epilogue (`derive::rebuild` / `nav::ensure_visible`)
+/// only when the merged buffer IS the active buffer — future-proofing for Effort 6
+/// multi-buffer. A non-active target heals lazily on activation (INV-LAZY-HEAL).
 pub fn merge_transform_into(
     editor: &mut crate::editor::Editor,
     buffer_id: crate::editor::BufferId,
@@ -287,19 +288,16 @@ pub fn merge_transform_into(
             let doc_len = editor.by_id(buffer_id).map(|b| b.document.buffer.len()).unwrap_or(0);
             let (cs, edit) = crate::commands::build_range_replace(range.start, range.end, &out, doc_len);
             let txn = wordcartel_core::history::Transaction::new(cs);
-            // Apply via by_id_mut — borrow ends before derive/nav calls below.
-            if let Some(b) = editor.by_id_mut(buffer_id) {
-                b.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
-            } else {
-                return; // buffer disappeared mid-flight
+            match crate::edit_apply::apply_edit(editor, buffer_id, txn, edit,
+                                                wordcartel_core::history::EditKind::Other, clock) {
+                crate::edit_apply::EditOutcome::Applied => {
+                    editor.finish_topic(crate::status::StatusTopic::Transform,
+                        crate::status::StatusKind::Info, kind.past_tense().to_string());
+                }
+                // Buffer vanished mid-flight, or (unreachable — dispatch guards read-only) refused.
+                crate::edit_apply::EditOutcome::BufferGone
+                | crate::edit_apply::EditOutcome::RejectedReadOnly => {}
             }
-            // derive::rebuild / ensure_visible are active-buffer-only.
-            if buffer_id == editor.active().id {
-                crate::derive::rebuild(editor);
-                crate::nav::ensure_visible(editor);
-            }
-            editor.finish_topic(crate::status::StatusTopic::Transform, crate::status::StatusKind::Info,
-                kind.past_tense().to_string());
         }
     }
 }

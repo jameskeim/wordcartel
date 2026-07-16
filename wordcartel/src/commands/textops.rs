@@ -3,10 +3,11 @@
 //! atomic-edit template used throughout `commands/edit.rs`: compute a single
 //! contiguous `(from, to)` byte range + replacement text, early-`Noop` when
 //! there is nothing to do or the change is a no-op, build ONE `ChangeSet` +
-//! matching `block_tree::Edit`, `editor.apply` it as a single undo step, then
-//! `settle_after_edit`. A leaf module — no `Command` enum variant, no
-//! `commands::run` arm (module-structure GATE); `registry.rs` calls these
-//! handlers directly.
+//! matching `block_tree::Edit`, `editor.apply` it as a single undo step — the
+//! core epilogue (`edit_apply::resettle`) settles the active buffer, so no
+//! manual re-settle call follows (H22 Task 4). A leaf module — no `Command`
+//! enum variant, no `commands::run` arm (module-structure GATE); `registry.rs`
+//! calls these handlers directly.
 
 use crate::derive;
 use crate::editor::Editor;
@@ -45,7 +46,7 @@ pub(crate) fn upcase(editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     let (cs, edit) = super::build_range_replace(from, to, &out, doc_len);
     let txn = Transaction::new(cs).with_selection(Selection::range(from, from + out.len()));
     editor.apply(txn, edit, EditKind::Other, clock);
-    super::edit::settle_after_edit(editor)
+    CommandResult::Handled
 }
 
 /// `downcase` — lowercases the selection, or the word at the caret when the
@@ -64,7 +65,7 @@ pub(crate) fn downcase(editor: &mut Editor, clock: &dyn Clock) -> CommandResult 
     let (cs, edit) = super::build_range_replace(from, to, &out, doc_len);
     let txn = Transaction::new(cs).with_selection(Selection::range(from, from + out.len()));
     editor.apply(txn, edit, EditKind::Other, clock);
-    super::edit::settle_after_edit(editor)
+    CommandResult::Handled
 }
 
 /// Title-cases `src`: each word's first char uppercased, the rest lowercased;
@@ -120,7 +121,7 @@ pub(crate) fn capitalize(editor: &mut Editor, clock: &dyn Clock) -> CommandResul
     let (cs, edit) = super::build_range_replace(from, to, &out, doc_len);
     let txn = Transaction::new(cs).with_selection(Selection::range(from, from + out.len()));
     editor.apply(txn, edit, EditKind::Other, clock);
-    super::edit::settle_after_edit(editor)
+    CommandResult::Handled
 }
 
 /// `transpose_chars` — swaps the character immediately before the caret with
@@ -154,7 +155,7 @@ pub(crate) fn transpose_chars(editor: &mut Editor, clock: &dyn Clock) -> Command
     let (cs, edit) = super::build_range_replace(from, to, &out, doc_len);
     let txn = Transaction::new(cs).with_selection(Selection::single(from + out.len()));
     editor.apply(txn, edit, EditKind::Other, clock);
-    super::edit::settle_after_edit(editor)
+    CommandResult::Handled
 }
 
 /// `transpose_words` — swaps the word before the caret with the word at/after
@@ -206,7 +207,7 @@ pub(crate) fn transpose_words(editor: &mut Editor, clock: &dyn Clock) -> Command
     let (cs, edit) = super::build_range_replace(from, to, &out, doc_len);
     let txn = Transaction::new(cs).with_selection(Selection::single(from + out.len()));
     editor.apply(txn, edit, EditKind::Other, clock);
-    super::edit::settle_after_edit(editor)
+    CommandResult::Handled
 }
 
 /// `transpose_lines` — swaps the caret's logical line with the line above it;
@@ -257,7 +258,7 @@ pub(crate) fn transpose_lines(editor: &mut Editor, clock: &dyn Clock) -> Command
     let (cs, edit) = super::build_range_replace(from, to, &out, doc_len);
     let txn = Transaction::new(cs).with_selection(Selection::single(from + out.len()));
     editor.apply(txn, edit, EditKind::Other, clock);
-    super::edit::settle_after_edit(editor)
+    CommandResult::Handled
 }
 
 /// `join_line` — joins the caret's logical line with the next one, replacing
@@ -289,7 +290,7 @@ pub(crate) fn join_line(editor: &mut Editor, clock: &dyn Clock) -> CommandResult
     let (cs, edit) = super::build_range_replace(from, to, " ", doc_len);
     let txn = Transaction::new(cs).with_selection(Selection::single(from + 1));
     editor.apply(txn, edit, EditKind::Other, clock);
-    super::edit::settle_after_edit(editor)
+    CommandResult::Handled
 }
 
 /// Byte range of the window the intra-line whitespace ops scan for a run of
@@ -345,7 +346,7 @@ pub(crate) fn just_one_space(editor: &mut Editor, clock: &dyn Clock) -> CommandR
     let (cs, edit) = super::build_range_replace(from, to, " ", doc_len);
     let txn = Transaction::new(cs).with_selection(Selection::single(from + 1));
     editor.apply(txn, edit, EditKind::Other, clock);
-    super::edit::settle_after_edit(editor)
+    CommandResult::Handled
 }
 
 /// `delete_blank_lines` — Emacs `C-x C-o` semantics: on a blank line with
@@ -403,7 +404,7 @@ pub(crate) fn delete_blank_lines(editor: &mut Editor, clock: &dyn Clock) -> Comm
     let edit = Edit { range: from..to, new_len: 0 };
     let txn = Transaction::new(cs).with_selection(Selection::single(from));
     editor.apply(txn, edit, EditKind::Other, clock);
-    super::edit::settle_after_edit(editor)
+    CommandResult::Handled
 }
 
 /// `delete_horizontal_space` — deletes the run of spaces/tabs immediately
@@ -433,7 +434,7 @@ pub(crate) fn delete_horizontal_space(editor: &mut Editor, clock: &dyn Clock) ->
     let edit = Edit { range: from..to, new_len: 0 };
     let txn = Transaction::new(cs).with_selection(Selection::single(from));
     editor.apply(txn, edit, EditKind::Other, clock);
-    super::edit::settle_after_edit(editor)
+    CommandResult::Handled
 }
 
 // ---------------------------------------------------------------------------

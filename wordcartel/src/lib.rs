@@ -2,6 +2,7 @@
 //! Wordcartel terminal shell (imperative shell over wordcartel-core).
 pub mod base16;
 pub mod editor;
+pub mod edit_apply;
 pub mod derive;
 pub mod lines;
 pub mod nav;
