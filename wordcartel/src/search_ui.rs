@@ -54,12 +54,10 @@ pub(crate) fn search_replace_all(editor: &mut Editor, clock: &dyn wordcartel_cor
     let new_origin = wordcartel_core::change::map_pos(origin, &cs);
     let txn = wordcartel_core::history::Transaction::new(cs)
         .with_selection(wordcartel_core::selection::Selection::single(new_origin));
-    editor.active_mut().apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
+    editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
     if let Some(s) = editor.search.as_mut() { s.origin = new_origin; }
     editor.set_status(crate::status::StatusKind::Info, format!("Replaced {n} occurrences"));
     editor.search = None; // close after replace-all
-    derive::rebuild(editor);
-    crate::nav::ensure_visible(editor);
 }
 
 pub(crate) fn search_step_apply(editor: &mut Editor, clock: &dyn wordcartel_core::history::Clock) {
@@ -76,7 +74,7 @@ pub(crate) fn search_step_apply(editor: &mut Editor, clock: &dyn wordcartel_core
     let caret = cur.start + text.len();
     let txn = wordcartel_core::history::Transaction::new(cs)
         .with_selection(wordcartel_core::selection::Selection::single(caret));
-    editor.active_mut().apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
+    editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
     // Re-find the next match on the MUTATED rope, and remap origin.
     let (rope, version) = { let d = &editor.active().document; (d.buffer.snapshot(), d.version) };
     if let Some(s) = editor.search.as_mut() {
@@ -111,9 +109,8 @@ pub(crate) fn search_step_rest(editor: &mut Editor, clock: &dyn wordcartel_core:
     let (cs, edit) = crate::commands::build_multi_replace(&edits, doc_len);
     let txn = wordcartel_core::history::Transaction::new(cs)
         .with_selection(wordcartel_core::selection::Selection::single(edits[0].0));
-    editor.active_mut().apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
+    editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
     editor.search = None;
-    derive::rebuild(editor); crate::nav::ensure_visible(editor);
 }
 
 /// Unfold + select + rebuild + ensure-visible for `editor.search`'s CURRENT match.

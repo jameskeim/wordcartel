@@ -18,8 +18,11 @@ fn append_to_scratch(editor: &mut Editor, text: &str, clock: &dyn Clock) -> bool
     let (cs, edit) = crate::commands::build_multi_replace(&[(cur_len, cur_len, insert)], cur_len);
     let txn = wordcartel_core::history::Transaction::new(cs)
         .with_selection(wordcartel_core::selection::Selection::single(new_caret));
-    editor.by_id_mut(sid).unwrap().apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
-    true
+    matches!(
+        crate::edit_apply::apply_edit(editor, sid, txn, edit,
+            wordcartel_core::history::EditKind::Other, clock),
+        crate::edit_apply::EditOutcome::Applied
+    )
 }
 
 /// Copy the active buffer's marked block into scratch; source unchanged, block kept.

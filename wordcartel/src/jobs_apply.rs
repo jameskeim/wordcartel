@@ -233,25 +233,22 @@ pub(crate) fn apply_filter_done(
                 crate::filter::describe_error(&err));
         }
         crate::filter::RunResult::Stdout(text) => {
-            let apply_result = if let Some(b) = editor.by_id_mut(buffer_id) {
-                let doc_len = b.document.buffer.len();
-                let (from, to, at) = match disposition {
-                    crate::filter::Disposition::Filter => (range.start, range.end, range.start),
-                    crate::filter::Disposition::Insert => (cursor, cursor, cursor),
-                };
+            let (from, to, at) = match disposition {
+                crate::filter::Disposition::Filter => (range.start, range.end, range.start),
+                crate::filter::Disposition::Insert => (cursor, cursor, cursor),
+            };
+            let doc_len = editor.by_id(buffer_id).map(|b| b.document.buffer.len());
+            if let Some(doc_len) = doc_len {
                 let (cs, edit) = crate::commands::build_range_replace(from, to, &text, doc_len);
                 let txn = wordcartel_core::history::Transaction::new(cs)
                     .with_selection(wordcartel_core::selection::Selection::single(at + text.len()));
-                b.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
-                true
-            } else {
-                false
-            };
-            if apply_result {
-                crate::derive::rebuild(editor);
-                crate::nav::ensure_visible(editor);
-                editor.finish_topic(crate::status::StatusTopic::Filter, crate::status::StatusKind::Info,
-                    "filter applied");
+                if crate::edit_apply::apply_edit(editor, buffer_id, txn, edit,
+                       wordcartel_core::history::EditKind::Other, clock)
+                    == crate::edit_apply::EditOutcome::Applied
+                {
+                    editor.finish_topic(crate::status::StatusTopic::Filter,
+                        crate::status::StatusKind::Info, "filter applied");
+                }
             }
         }
     }
@@ -349,23 +346,19 @@ pub(crate) fn insert_paste_text(editor: &mut Editor, buffer_id: crate::editor::B
             crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
         return false;
     }
-    let active_id = editor.active().id;
-    {
-        let Some(b) = editor.by_id_mut(buffer_id) else { return false; };
-        let sel = b.document.selection.primary();
-        let (from, to) = (sel.from(), sel.to());
-        let doc_len = b.document.buffer.len();
-        let (cs, edit) = crate::commands::build_range_replace(from, to, text, doc_len);
-        let txn = wordcartel_core::history::Transaction::new(cs)
-            .with_selection(wordcartel_core::selection::Selection::single(from + text.len()));
-        b.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
-        b.desired_col = None;
-    }
-    if buffer_id == active_id {
-        crate::derive::rebuild(editor);
-        crate::nav::ensure_visible(editor);
-    }
-    true
+    let sel_from = editor.by_id(buffer_id).map(|b| {
+        let sel = b.document.selection.primary(); (sel.from(), sel.to())
+    });
+    let Some((from, to)) = sel_from else { return false; };
+    let doc_len = editor.by_id(buffer_id).map(|b| b.document.buffer.len()).unwrap_or(0);
+    let (cs, edit) = crate::commands::build_range_replace(from, to, text, doc_len);
+    let txn = wordcartel_core::history::Transaction::new(cs)
+        .with_selection(wordcartel_core::selection::Selection::single(from + text.len()));
+    matches!(
+        crate::edit_apply::apply_edit(editor, buffer_id, txn, edit,
+            wordcartel_core::history::EditKind::Other, clock),
+        crate::edit_apply::EditOutcome::Applied
+    )
 }
 
 pub(crate) fn apply_clipboard_paste(editor: &mut Editor, buffer_id: crate::editor::BufferId, text: Option<String>, clock: &dyn Clock) {
@@ -974,5 +967,23 @@ mod tests {
         apply_clipboard_availability(&mut e, false);
         assert!(e.status_text().contains("system clipboard unavailable"));
         assert_sticky_warning_survives_info(&mut e);
+    }
+
+    /// H22 Task 3 (INV-GUARD false-ack pin): `apply_filter_done`'s Stdout arm must gate its
+    /// "filter applied" ack on the edit actually applying — a read-only target must reject
+    /// loudly (canonical status, no mutation), NOT silently no-op-then-ack.
+    #[test]
+    fn apply_filter_done_into_read_only_does_not_false_ack() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("keep\n", None, (80, 24));
+        let id = e.active().id;
+        let v = e.active().document.version;
+        e.active_mut().read_only = true;
+        let before = e.active().document.buffer.to_string();
+        apply_filter_done(&mut e, id, v, 0..1, 0, crate::filter::Disposition::Filter,
+            crate::filter::RunResult::Stdout("X".into()), &TestClock(0));
+        assert_ne!(e.status_text(), "filter applied", "no success ack on a read-only reject");
+        assert_eq!(e.status_text(), "buffer is read-only");
+        assert_eq!(e.active().document.buffer.to_string(), before, "no mutation");
     }
 }
