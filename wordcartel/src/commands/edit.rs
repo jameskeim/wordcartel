@@ -12,16 +12,12 @@ use wordcartel_core::history::{Clock, EditKind, Transaction};
 use wordcartel_core::register;
 use wordcartel_core::selection::Selection;
 
-/// Post-edit epilogue shared by every buffer-edit primitive: re-derive, re-scroll,
-/// re-anchor vertical motion (desired_col = None). Edit paths ONLY — Move/CycleRenderMode
-/// keep rebuild+ensure_visible WITHOUT the desired_col reset; Undo/Redo/ShrinkSelection
-/// insert a caret-snap first; SelectAll doesn't rebuild — those arms keep their own tails
-/// in `run`. `pub(super)` (lands at `commands` scope) so the sibling `textops` module's
-/// A14 atomic edits can reuse it too.
+/// Post-edit epilogue for the buffer-edit primitives — now a thin delegate to the shared core
+/// epilogue `edit_apply::resettle` (H22 F2=A). Retained so `swap`'s rebuild #2 (prose_ops.rs)
+/// keeps a `CommandResult`-returning re-settle; standard primitives stop calling it once the
+/// core owns the epilogue (Task 4).
 pub(super) fn settle_after_edit(editor: &mut Editor) -> CommandResult {
-    derive::rebuild(editor);
-    nav::ensure_visible(editor);
-    editor.active_mut().desired_col = None;
+    crate::edit_apply::resettle(editor);
     CommandResult::Handled
 }
 
