@@ -871,4 +871,19 @@ mod tests {
             e.active().view.vent_blocks.len()
         );
     }
+
+    #[test]
+    fn ventilated_sentence_display_never_ends_in_whitespace() {
+        // §7 (fork e moot): sentence_spans is content-only — no trailing whitespace (textobj.rs:190-192,
+        // content_end trims via trim_end_matches) — and sentence_display only maps INTERIOR '\n'→space.
+        // So no ventilated sentence display can end in a space/tab, and B17's trailing-space trigger
+        // NEVER fires under the lens (no phantom flush row mid- or end-of-block). Guards the trim
+        // invariant that makes fork (e) a non-event.
+        let block = "One two three.  Four\nfive six.   Seven.  ";
+        for (sf, st) in super::segment_block(block) {
+            let display = super::sentence_display(&block[sf..st]);
+            assert!(!display.ends_with(' ') && !display.ends_with('\t'),
+                "sentence display {display:?} ends in whitespace — a phantom row could leak under the lens");
+        }
+    }
 }
