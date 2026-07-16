@@ -911,3 +911,50 @@ is already decided here so it's ready to go.
 
 *(Captured 2026-07-16 from the H21 final Fable gate. H7-sweep framing recorded 2026-07-16.)*
 
+
+### B17 — Soft-wrap trailing space at margin gives no caret feedback — should wrap caret to next line, continuation flush at left margin (no leading-space indent)
+<!-- item: B17 -->
+
+**Reported by the user (2026-07-16); root cause mapped, data-safe (display-only).** Typing a SPACE when the caret
+is at the soft-wrap margin gives **zero visible feedback** — the caret pins to the end of the word, the line does not
+wrap, and wrapping only happens once the *next word* crosses the margin. It reads as "the spacebar didn't register,"
+so writers press space again → a stray double-space in the buffer. Appears in the regular buffer AND every lens (it's
+the shared engine).
+
+**Mechanism (grounded 2026-07-16):** two cooperating pieces.
+1. **The "hang" rule** — `wordcartel-core/src/layout.rs:325/332`: whitespace gets `hang = true`, which
+   short-circuits the overflow `while` at `:332`, so a space at the margin is placed **past the edge on the same
+   visual row** (`row_end_col` = vw+1) and never creates a new row; the break defers to the next non-ws grapheme.
+   Deliberate "spec D2" behavior, pinned by `word_wrap_trailing_whitespace_hangs_past_edge` (`layout.rs:658`).
+2. **The caret clamp** — `wordcartel/src/render.rs:452-457`: the caret, now logically at col vw+1 (past the text
+   rect), is clamped `col.min(text_width-1)` **back onto the last content cell** — the end of the word — so it shows
+   no advance. (Comment there literally names it.) The resolver `ColMap::source_to_visual` (`layout.rs:86-90`) is what
+   returns the hung col; the mirror `visual_to_source` clamp (`layout.rs:132-147`) is the same "clamp-to-end, don't
+   teleport" policy. Data-safe: `commands/edit.rs::insert_char` writes the space + advances the byte offset normally.
+
+**Target behavior (user-approved 2026-07-16):** a trailing space at/past the margin **wraps** — the caret moves to
+the **start of the next visual row, at the LEFT MARGIN (col 0), flush under the text above** — the break-space is
+consumed at the boundary and must NOT become a leading-space indent on the continuation line. i.e. amend the spec-D2
+hang rule to break-on-margin-whitespace with a clean (non-indented) continuation. The next typed word lands at col 0;
+backspacing the space pulls back up. NOT the "hang past edge" behavior; NOT a caret-into-the-gutter half-fix (rejected
+— must give feedback that reads as a real line move, and full-width wrap has no gutter anyway).
+
+**Open edge-cases to resolve at design time (grounding + a mini-brainstorm):**
+- **Multiple trailing spaces** (the double-space): the run is consumed at the break (continuation stays at col 0, no
+  indent) — but define the caret position + backspace behavior walking back through the consumed run.
+- **Leading-whitespace suppression on continuation lines generally** — does the wrap engine already suppress it, or is
+  that net-new? (Determines scope.)
+- **Interaction with B10** (EOF caret clamp via shared `nav::caret_line`) and the `visual_to_source` mirror clamp —
+  don't regress those; and the trailing-space-then-hard-newline / end-of-buffer case (a materialized blank continuation
+  row for a settled paragraph ending in a margin space).
+- **Ventilate lens** (combined window map via `ventilate::layout_block_*`) — the fix must hold there too.
+
+**Scope/process:** a contained **core-layout** change (`wordcartel-core`) that AMENDS spec D2 and rewrites the
+`layout.rs` hang tests + touches the caret clamp — correctness stakes on the beloved, heavily-tested wrap engine
+(B1 goldens, layout property/oracle tests). Calibrate a MIDDLE-weight gated effort: a written design note recording
+the D2 amendment + the resolved edge-cases, a Codex check on it (Codex is high-yield on wrap-engine subtleties), then
+TDD implement + an opus review + gates. More than the H24/C6 tiny fixes; less than a full Fable-authored two-gate
+effort. Anchors: `layout.rs` (`layout` :244, hang :322-332, `ColMap` :86/:132, tests :658/:781), `render.rs:452-457`,
+`nav.rs` (`screen_pos` :103, `caret_line`, `text_geometry` :28), `ventilate.rs:238/258`, `derive.rs` layout cache.
+
+*(Captured 2026-07-16 from the user report + root-cause map.)*
