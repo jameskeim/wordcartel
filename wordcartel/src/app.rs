@@ -193,11 +193,7 @@ pub(crate) fn dispatch_overlay_command(
     msg_tx: &std::sync::mpsc::Sender<Msg>,
     id: crate::registry::CommandId,
 ) {
-    editor.palette = None;
-    editor.menu = None;
-    editor.theme_picker = None;
-    editor.cursor_picker = None;
-    editor.file_browser = None;
+    crate::overlays::close_all(editor);
     let mut ctx = crate::registry::Ctx { editor, clock, executor: ex, msg_tx: msg_tx.clone() };
     reg.dispatch(id, &mut ctx);
     for o in ex.drain() { crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx); }

@@ -367,22 +367,11 @@ impl Registry {
             CommandResult::Handled
         });
         r.register("menu", "Menu Bar", None, |c| {
-            c.editor.palette = None;
-            c.editor.prompt = None;
-            c.editor.minibuffer = None;
-            c.editor.search = None;
-            c.editor.diag = None;
-            c.editor.outline = None;
-            c.editor.theme_picker = None;
-            c.editor.cursor_picker = None;
-            c.editor.file_browser = None;
+            let was_open = c.editor.menu.is_some();
+            crate::overlays::close_all(c.editor);
             c.editor.pending_keys.clear();
             c.editor.pending_mark = None;
-            c.editor.menu = if c.editor.menu.is_some() {
-                None
-            } else {
-                Some(crate::menu::empty())
-            };
+            c.editor.menu = if was_open { None } else { Some(crate::menu::empty()) };
             CommandResult::Handled
         });
 

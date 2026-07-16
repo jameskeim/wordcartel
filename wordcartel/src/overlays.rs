@@ -78,32 +78,36 @@ pub(crate) struct OverlayRow {
     /// The overlay's input interceptor. Read by `reduce_dispatch`'s table loop (H10 fold):
     /// each active overlay gets first refusal at the message in `ALL` order.
     pub(crate) intercept: fn(Msg, &mut Editor, &DispatchCtx) -> Handled,
+    /// Close this overlay (null its own field). Read by `close_all`, which folds the
+    /// hand-written sibling-null lists in every `open_*`, `dispatch_overlay_command`, and the
+    /// registry `"menu"` command into one loop.
+    pub(crate) close: fn(&mut Editor),
 }
 
 /// The overlay table, in `ALL` order. Non-capturing closures coerce to the fn-pointer fields.
 pub(crate) static OVERLAYS: &[OverlayRow] = &[
     OverlayRow { name: "splash",        id: OverlayId::Splash,       is_active: |e| e.splash.is_some(),
-        intercept: crate::splash::intercept },
+        intercept: crate::splash::intercept, close: |e| e.splash = None },
     OverlayRow { name: "menu",          id: OverlayId::Menu,         is_active: |e| e.menu.is_some(),
-        intercept: crate::menu::intercept },
+        intercept: crate::menu::intercept, close: |e| e.menu = None },
     OverlayRow { name: "palette",       id: OverlayId::Palette,      is_active: |e| e.palette.is_some(),
-        intercept: crate::palette::intercept },
+        intercept: crate::palette::intercept, close: |e| e.palette = None },
     OverlayRow { name: "theme_picker",  id: OverlayId::ThemePicker,  is_active: |e| e.theme_picker.is_some(),
-        intercept: crate::theme_picker::intercept },
+        intercept: crate::theme_picker::intercept, close: |e| e.theme_picker = None },
     OverlayRow { name: "cursor_picker", id: OverlayId::CursorPicker, is_active: |e| e.cursor_picker.is_some(),
-        intercept: crate::cursor_picker::intercept },
+        intercept: crate::cursor_picker::intercept, close: |e| e.cursor_picker = None },
     OverlayRow { name: "file_browser",  id: OverlayId::FileBrowser,  is_active: |e| e.file_browser.is_some(),
-        intercept: crate::file_browser::intercept },
+        intercept: crate::file_browser::intercept, close: |e| e.file_browser = None },
     OverlayRow { name: "prompt",        id: OverlayId::Prompt,       is_active: |e| e.prompt.is_some(),
-        intercept: crate::prompts::intercept },
+        intercept: crate::prompts::intercept, close: |e| e.prompt = None },
     OverlayRow { name: "minibuffer",    id: OverlayId::Minibuffer,   is_active: |e| e.minibuffer.is_some(),
-        intercept: crate::minibuffer::intercept },
+        intercept: crate::minibuffer::intercept, close: |e| e.minibuffer = None },
     OverlayRow { name: "search",        id: OverlayId::Search,       is_active: |e| e.search.is_some(),
-        intercept: crate::search_ui::intercept },
+        intercept: crate::search_ui::intercept, close: |e| e.search = None },
     OverlayRow { name: "diag",          id: OverlayId::Diag,         is_active: |e| e.diag.is_some(),
-        intercept: crate::diag_overlay::intercept },
+        intercept: crate::diag_overlay::intercept, close: |e| e.diag = None },
     OverlayRow { name: "outline",       id: OverlayId::Outline,      is_active: |e| e.outline.is_some(),
-        intercept: crate::outline_overlay::intercept },
+        intercept: crate::outline_overlay::intercept, close: |e| e.outline = None },
 ];
 
 /// True iff any input overlay owns the screen — the single source for both
@@ -112,6 +116,14 @@ pub(crate) static OVERLAYS: &[OverlayRow] = &[
 /// under it.
 pub(crate) fn any_active(editor: &Editor) -> bool {
     OverlayId::ALL.iter().any(|id| (id.row().is_active)(editor))
+}
+
+/// Close every overlay (hold the single-overlay XOR invariant). Replaces the sibling-null
+/// lists in every `open_*`, in `dispatch_overlay_command`, in the registry `"menu"` command,
+/// and (Task 4) `route_overlay`'s Down-left close arms. NOT the `save.rs` post-buffer-replace
+/// stale-clears — those clear only `search`/`diag` for content staleness, not the XOR set.
+pub(crate) fn close_all(editor: &mut Editor) {
+    for row in OVERLAYS { (row.close)(editor); }
 }
 
 #[cfg(test)]
@@ -198,5 +210,39 @@ mod tests {
         }
         assert!(e.mouse.menu_reveal_due.is_none(), "no menu dwell armed under splash");
         assert!(e.mouse.scrollbar_reveal_due.is_none(), "no scrollbar dwell armed under splash");
+    }
+
+    /// `close_all` clears EVERY overlay (the XOR-close axis). Opens all 11 in turn (each via a
+    /// real `open_*` or field set), asserts it was active, then asserts `close_all` clears it.
+    #[test]
+    #[allow(clippy::type_complexity)] // test-local table of (name, opener closure) pairs; not a public API surface
+    fn close_all_clears_every_overlay() {
+        let diag_fixture = || wordcartel_core::diagnostics::Diagnostic {
+            range: 0..1, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
+            message: "m".into(), suggestions: Vec::new(),
+        };
+        let openers: Vec<(&str, Box<dyn Fn(&mut Editor)>)> = vec![
+            ("search",        Box::new(|e: &mut Editor| e.open_search(crate::search_overlay::Phase::Find, 0))),
+            ("minibuffer",    Box::new(|e: &mut Editor| e.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter))),
+            ("palette",       Box::new(|e: &mut Editor| e.open_palette())),
+            ("outline",       Box::new(|e: &mut Editor| e.open_outline())),
+            ("theme_picker",  Box::new(|e: &mut Editor| e.open_theme_picker())),
+            ("file_browser",  Box::new(|e: &mut Editor| e.open_file_browser(std::path::PathBuf::from(".")))),
+            ("prompt",        Box::new(|e: &mut Editor| e.open_prompt(crate::prompt::Prompt::swap_recovery()))),
+            ("cursor_picker", Box::new(|e: &mut Editor| e.open_cursor_picker())),
+            ("diag",          Box::new(move |e: &mut Editor| e.open_diag(diag_fixture()))),
+            ("menu",          Box::new(|e: &mut Editor| { e.menu = Some(crate::menu::empty()); })),
+            ("splash",        Box::new(|e: &mut Editor| { e.splash = Some(crate::splash::Splash::new(
+                &crate::keymap::KeyTrie::default(), "0.0.0")); })),
+        ];
+        for (name, open) in openers {
+            let mut e = Editor::new_from_text("x\n", None, (40, 12));
+            crate::derive::rebuild(&mut e);
+            open(&mut e);
+            assert!(any_active(&e), "{name}: precondition — overlay open");
+            close_all(&mut e);
+            assert!(!any_active(&e), "{name}: close_all cleared it");
+        }
     }
 }
