@@ -55,25 +55,6 @@ appears, or as a side effect of a future B-style investment). It should **not** 
 open correctness debt. `block_tree.rs` remains the shared hotspot for both this and the R1
 paragraph-end widen cost, so any future work there touches both.
 
-## H10 — `reduce`'s 10-stage interception chain is verbatim boilerplate
-<!-- item: H10 -->
-
-**Grounded (read of `app.rs:233–252`, 2026-07-09).** After the H1 SEAM refactor, `reduce` opens with a
-10-stage overlay/modal interception chain — `marks → menu → palette → theme_picker → file_browser → prompts →
-minibuffer → search_ui → diag_overlay → outline_overlay` — where every stage is the identical line
-`let msg = match crate::X::intercept(msg, …) { Handled::Done(k) => return k, Handled::Pass(m) => m };`, differing
-only in the module path and arg list. It is cohesive, blessed-style *flat dispatch* (the house rules explicitly
-allow a long flat dispatch), so this is **NOT** a defect today — filed only as a `watch` item. The reason it
-can't already be a clean fn-pointer table / `SUBSYSTEMS`-style row set: two stages (`menu`, `palette`) need
-`reg` + `keymap` in their `intercept` signature while the other eight take only `(msg, editor, ex, clock,
-msg_tx)`, so a uniform table would need a widened shared signature or a two-tier split. **Trigger to act:**
-Effort P adds plugin-contributed intercept stages here — the moment the chain grows past its current fixed set,
-collapse it (an `intercept_chain!` macro, or unify the stage signature so the chain becomes a slice of handler
-fns iterated in order). Until then the repetition is bounded and readable; touching it now is churn for its own
-sake. This is a **command-surface-contract / Effort-P-conformance** note, not module-size debt (`reduce` is
-within budget). Anchor: `wordcartel/src/app.rs:233–252` (the chain); `:123` (`Handled`); the `timers::SUBSYSTEMS`
-table is the model a unified version would follow.
-
 ## H13 — `Editor` is a 58-field *data* god-object (field-clustering, not dispatch)
 <!-- item: H13 -->
 
@@ -125,36 +106,6 @@ healthy, not debt; after A17 and H21 land, Editor's residual size is expected fi
 <!-- item: M9 -->
 
 M4-rest only ISOLATES its parse panic; a real upgrade is optional, low priority.
-
-## H21 — Input-overlay dispatch table (OverlayId enum + OVERLAYS fn-ptr seam)
-<!-- item: H21 -->
-
-**Confirmed by the 2026-07-14 ad-hoc-surface audit — the structural twin of A17.** Eleven sibling overlay `Option<T>`
-fields (`search`, `minibuffer`, `palette`, `outline`, `theme_picker`, `file_browser`, `menu`, `prompt`, `splash`,
-`diag`, `cursor_picker`) whose *routing* — is-active, key, mouse, render — is written **eleven ways by hand**:
-`editor.rs::has_active_input_overlay` enumerates all 11 `.is_some()` checks, and the same 11-way `if/else-if` shape is
-re-written in `render.rs`, `mouse.rs`, `app.rs`, `registry.rs`, and `render_overlays.rs`. Adding a 12th overlay today
-touches ~6 files, and nothing is compiler-enforced: an overlay omitted from one chain (e.g. `has_active_input_overlay`)
-means keystrokes leak to the buffer or clicks pass through while the modal is visibly up — a **silent-UI/correctness**
-class, not data-loss.
-
-**This is the DISPATCH axis, not the data axis.** The fields correctly stay a flat XOR set (see H13 — do **not** wrap
-them in a sub-struct). What wants a seam is the routing. Sketch, mirroring `timers.rs`'s `SUBSYSTEMS` table:
-```
-enum OverlayId { Search, Minibuffer, Palette, Outline, ThemePicker, FileBrowser, Menu, Prompt, Splash, Diag, CursorPicker }
-static OVERLAYS: &[OverlayRow] = &[ /* { id, is_active(&Editor)->bool, render, handle_key, handle_mouse } … */ ];
-```
-`has_active_input_overlay` becomes `OVERLAYS.iter().any(|o| (o.is_active)(self))`; the render/mouse/app `if/else-if`
-chains become one loop over the table. Each overlay's own state struct and behaviour stay untouched — this unifies
-**only** the which-one-is-active / route-input-click-render plumbing, which is the real repeated abstraction; the
-per-overlay internals are a legitimate rhyme that stays separate.
-
-**Priority signals:** STRONGEST Effort-P plugin pressure of any surface the audit scored (5/5) — a plugin-provided
-panel/picker is exactly a 12th `OverlayId`; without this table a plugin overlay cannot participate in
-is-active/key/click routing without editing core `editor.rs`/`mouse.rs`/`app.rs`, defeating the plugin boundary. So
-land it **before** Effort P's overlay/panel work rather than retrofitting. **UNGATED** — it is pure input/UI plumbing,
-unrelated to prose lenses; it is *not* E8 (view lenses) and *not* gated on the S6 kill-gate. Second item in the
-"unify ad-hoc surfaces" arc (A17 first — ungated, higher-scored, de-risks the typed-enum + one-setter + sweep pattern).
 
 ## H22 — Universal edit chokepoint (route all internal edits through submit_transaction)
 <!-- item: H22 -->

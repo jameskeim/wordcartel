@@ -1460,6 +1460,73 @@ weigh: (a) auto-prune on launch (delete swaps whose owning pid is dead AND whose
 the swap durability model (memory: `wordcartel-swap-idle-thrash`). Anchors: `wordcartel/src/swap.rs`
 (`state_dir`, `swap_path`, `find_orphan_scratch_swap`), `recovery.rs`.
 
+### H10 — `reduce`'s 10-stage interception chain is verbatim boilerplate
+<!-- item: H10 -->
+
+**SHIPPED 2026-07-16 — folded into H21** (merge e5d9b42): the intercept chain (12 stages, not the 10
+in the original note below) became the `OVERLAYS` table's *input* axis — `reduce_dispatch` collapsed to a
+splash-row intercept + the `marks` pre-stage + one loop over `OverlayId::ALL[1..]`. The signature
+heterogeneity the note flags was resolved by a shared `DispatchCtx { reg, keymap, ex, clock, msg_tx }`
+(editor passed separately as `&mut`), so all 12 intercepts share one `fn(Msg, &mut Editor, &DispatchCtx) -> Handled`
+shape. Order byte-identical; `reduce_dispatch` shrank 24→16 lines. Original triage below.
+
+**Grounded (read of `app.rs:233–252`, 2026-07-09).** After the H1 SEAM refactor, `reduce` opens with a
+10-stage overlay/modal interception chain — `marks → menu → palette → theme_picker → file_browser → prompts →
+minibuffer → search_ui → diag_overlay → outline_overlay` — where every stage is the identical line
+`let msg = match crate::X::intercept(msg, …) { Handled::Done(k) => return k, Handled::Pass(m) => m };`, differing
+only in the module path and arg list. It is cohesive, blessed-style *flat dispatch* (the house rules explicitly
+allow a long flat dispatch), so this is **NOT** a defect today — filed only as a `watch` item. The reason it
+can't already be a clean fn-pointer table / `SUBSYSTEMS`-style row set: two stages (`menu`, `palette`) need
+`reg` + `keymap` in their `intercept` signature while the other eight take only `(msg, editor, ex, clock,
+msg_tx)`, so a uniform table would need a widened shared signature or a two-tier split. **Trigger to act:**
+Effort P adds plugin-contributed intercept stages here — the moment the chain grows past its current fixed set,
+collapse it (an `intercept_chain!` macro, or unify the stage signature so the chain becomes a slice of handler
+fns iterated in order). Until then the repetition is bounded and readable; touching it now is churn for its own
+sake. This is a **command-surface-contract / Effort-P-conformance** note, not module-size debt (`reduce` is
+within budget). Anchor: `wordcartel/src/app.rs:233–252` (the chain); `:123` (`Handled`); the `timers::SUBSYSTEMS`
+table is the model a unified version would follow.
+
+### H21 — Input-overlay dispatch table (OverlayId enum + OVERLAYS fn-ptr seam)
+<!-- item: H21 -->
+
+**SHIPPED 2026-07-16** (merge e5d9b42): `wordcartel/src/overlays.rs` — an exhaustive `OverlayId` enum +
+`OverlayRow { name, id, is_active, intercept, close, mouse, render }` + `static OVERLAYS` + `static RENDER_ORDER`
++ `struct DispatchCtx` + `close_all`/`any_active`, mirroring `timers.rs::SUBSYSTEMS`. All ~7 hand-parallel
+per-overlay enumerations collapsed to table folds (`reduce_dispatch` 24→16, `route_overlay` 404→8,
+`render_overlays::paint` 539→21); H10 folded in as the input axis. One deliberate behavior change (Q4): splash
+consumes on the mouse path, suppressing under-splash dwell-arming. Completeness is compiler/test-forced (exhaustive
+`row()` match + a sweep asserting per-overlay XOR + key-consumed + per-slot no-data-loss). Gated: spec Codex-clean
+(4 rounds), plan Codex-clean (3 rounds), 6 TDD tasks each per-task reviewed; two final gates GO — Codex pre-merge
+(caught + fixed a plugin-pump XOR bypass in `dispatch_with_arg`) and a fresh independent Fable whole-branch compiled
+probe (3128 main-vs-branch fingerprints; all diffs confined to the Q4 splash+mouse path). Original triage below.
+
+**Confirmed by the 2026-07-14 ad-hoc-surface audit — the structural twin of A17.** Eleven sibling overlay `Option<T>`
+fields (`search`, `minibuffer`, `palette`, `outline`, `theme_picker`, `file_browser`, `menu`, `prompt`, `splash`,
+`diag`, `cursor_picker`) whose *routing* — is-active, key, mouse, render — is written **eleven ways by hand**:
+`editor.rs::has_active_input_overlay` enumerates all 11 `.is_some()` checks, and the same 11-way `if/else-if` shape is
+re-written in `render.rs`, `mouse.rs`, `app.rs`, `registry.rs`, and `render_overlays.rs`. Adding a 12th overlay today
+touches ~6 files, and nothing is compiler-enforced: an overlay omitted from one chain (e.g. `has_active_input_overlay`)
+means keystrokes leak to the buffer or clicks pass through while the modal is visibly up — a **silent-UI/correctness**
+class, not data-loss.
+
+**This is the DISPATCH axis, not the data axis.** The fields correctly stay a flat XOR set (see H13 — do **not** wrap
+them in a sub-struct). What wants a seam is the routing. Sketch, mirroring `timers.rs`'s `SUBSYSTEMS` table:
+```
+enum OverlayId { Search, Minibuffer, Palette, Outline, ThemePicker, FileBrowser, Menu, Prompt, Splash, Diag, CursorPicker }
+static OVERLAYS: &[OverlayRow] = &[ /* { id, is_active(&Editor)->bool, render, handle_key, handle_mouse } … */ ];
+```
+`has_active_input_overlay` becomes `OVERLAYS.iter().any(|o| (o.is_active)(self))`; the render/mouse/app `if/else-if`
+chains become one loop over the table. Each overlay's own state struct and behaviour stay untouched — this unifies
+**only** the which-one-is-active / route-input-click-render plumbing, which is the real repeated abstraction; the
+per-overlay internals are a legitimate rhyme that stays separate.
+
+**Priority signals:** STRONGEST Effort-P plugin pressure of any surface the audit scored (5/5) — a plugin-provided
+panel/picker is exactly a 12th `OverlayId`; without this table a plugin overlay cannot participate in
+is-active/key/click routing without editing core `editor.rs`/`mouse.rs`/`app.rs`, defeating the plugin boundary. So
+land it **before** Effort P's overlay/panel work rather than retrofitting. **UNGATED** — it is pure input/UI plumbing,
+unrelated to prose lenses; it is *not* E8 (view lenses) and *not* gated on the S6 kill-gate. Second item in the
+"unify ad-hoc surfaces" arc (A17 first — ungated, higher-scored, de-risks the typed-enum + one-setter + sweep pattern).
+
 ## Theme R — responsiveness
 
 ### R1 — Typing latency + double-Return / line-jump
