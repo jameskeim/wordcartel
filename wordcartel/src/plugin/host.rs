@@ -1178,10 +1178,12 @@ mod tests {
             kind: crossterm::event::KeyEventKind::Press,
             state: crossterm::event::KeyEventState::NONE,
         };
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
         let msg = crate::app::Msg::Input(crossterm::event::Event::Key(enter));
         {
             let mut e = editor.borrow_mut();
-            crate::minibuffer::intercept(msg, &mut e, &ex, &clock, &tx);
+            let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clock, msg_tx: &tx };
+            crate::minibuffer::intercept(msg, &mut e, &ctx);
         }
         assert!(editor.borrow().minibuffer.is_none());
         assert_eq!(editor.borrow().pending_plugin_calls.len(), 1);

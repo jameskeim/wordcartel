@@ -71,8 +71,7 @@ pub fn outline_jump_to(editor: &mut crate::editor::Editor, byte: usize) {
 /// normal handling so background work is never starved while the overlay is open
 /// (mirror of minibuffer/search/diag blocks above — 5e starvation lesson).
 pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor,
-    ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
-    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) -> crate::app::Handled {
+    ctx: &crate::overlays::DispatchCtx) -> crate::app::Handled {
     if editor.outline.is_some()
         && editor.outline.as_ref().map(|o| o.buffer_id) != Some(editor.active().id) {
         editor.outline = None;
@@ -95,7 +94,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                         editor.set_status_full(crate::status::StatusKind::Warning, "document changed; outline closed",
                             crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
                         editor.outline = None;
-                        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+                        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
                     }
                     let target = editor.outline.as_ref()
                         .and_then(|o| o.rows.get(o.selected))
@@ -134,7 +133,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 _ => {}
             }
         }
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
     }
     // Non-key messages fall through to normal handlers below.
     crate::app::Handled::Pass(msg)

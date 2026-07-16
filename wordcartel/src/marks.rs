@@ -11,8 +11,7 @@ const CAP: usize = 64;
 /// returns for ANY Key message including non-Press (§8.1-L). Non-key messages fall
 /// through to normal handling.
 pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor,
-    ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
-    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) -> crate::app::Handled {
+    ctx: &crate::overlays::DispatchCtx) -> crate::app::Handled {
     if editor.pending_mark.is_none() { return crate::app::Handled::Pass(msg); }
     if let Msg::Input(Event::Key(k)) = &msg {
         if k.kind == crossterm::event::KeyEventKind::Press {
@@ -22,7 +21,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 _ => { editor.pending_mark = None; } // non-name key cancels
             }
         }
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
     }
     // non-key message: fall through to normal handling
     crate::app::Handled::Pass(msg)

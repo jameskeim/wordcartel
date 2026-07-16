@@ -75,8 +75,7 @@ pub(crate) fn commit_cursor_picker(editor: &mut crate::editor::Editor) {
 /// Char input is ignored (fixed list — no query). Non-key, non-paste messages fall through
 /// while the picker stays open (mirrors the theme-picker block).
 pub(crate) fn intercept(msg: Msg, editor: &mut crate::editor::Editor,
-    ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
-    msg_tx: &std::sync::mpsc::Sender<Msg>) -> Handled {
+    ctx: &crate::overlays::DispatchCtx) -> Handled {
     if editor.cursor_picker.is_none() { return Handled::Pass(msg); }
     // Paste swallow FIRST. The async clipboard-paste-result arm mirrors theme_picker's
     // `Msg::ClipboardPaste` no-op drop. The bracketed-paste arm is a no-op HERE precisely
@@ -84,10 +83,10 @@ pub(crate) fn intercept(msg: Msg, editor: &mut crate::editor::Editor,
     // appends `Event::Paste` text to its query. Both arms must be consumed so neither leaks
     // into the document behind the overlay (app.rs would otherwise insert the paste text).
     if matches!(&msg, Msg::ClipboardPaste { .. }) {
-        return Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+        return Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
     }
     if matches!(&msg, Msg::Input(Event::Paste(_))) {
-        return Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+        return Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
     }
     if let Msg::Input(Event::Key(k)) = &msg {
         if k.kind == crossterm::event::KeyEventKind::Press {
@@ -116,7 +115,7 @@ pub(crate) fn intercept(msg: Msg, editor: &mut crate::editor::Editor,
                 _ => {}
             }
         }
-        return Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+        return Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
     }
     // Non-key msg falls through to normal handling while the picker stays open.
     Handled::Pass(msg)

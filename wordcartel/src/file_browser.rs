@@ -99,13 +99,12 @@ pub(crate) fn file_browser_enter(editor: &mut crate::editor::Editor) {
 /// File browser overlay intercepts KEY INPUT and PASTE. Non-key, non-paste messages
 /// fall through to normal handling while the browser stays open (mirrors theme_picker).
 pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor,
-    ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
-    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) -> crate::app::Handled {
+    ctx: &crate::overlays::DispatchCtx) -> crate::app::Handled {
     if editor.file_browser.is_none() { return crate::app::Handled::Pass(msg); }
     // Drop an async clipboard-paste result that arrives while the browser is open —
     // it must not land in the document behind the overlay (Codex I6, mirror palette).
     if matches!(&msg, Msg::ClipboardPaste { .. }) {
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
     }
     if let Msg::Input(Event::Paste(text)) = &msg {
         let ah = editor.active().view.area.1;
@@ -114,7 +113,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
             crate::file_browser::rebuild_entries(fb);
             crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
         }
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
     }
     if let Msg::Input(Event::Key(k)) = &msg {
         if k.kind == crossterm::event::KeyEventKind::Press {
@@ -151,7 +150,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 _ => {}
             }
         }
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
     }
     // Non-key msg falls through to normal handling while the browser stays open.
     crate::app::Handled::Pass(msg)

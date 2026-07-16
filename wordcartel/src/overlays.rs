@@ -11,6 +11,20 @@
 //! dynamic. No `PluginPanel` variant ships in H21 (it would be dead code and defeat the
 //! exhaustiveness guarantee).
 use crate::editor::Editor;
+use crate::app::{Msg, Handled};
+
+/// The non-editor dispatch context, bundled so every overlay `intercept` (and later `mouse`)
+/// fn shares ONE signature. The editor is passed SEPARATELY as `&mut Editor` — deliberately
+/// EXCLUDED here to avoid a `&mut` aliasing tangle in the table loop (contrast
+/// `registry::Ctx`, which OWNS `editor: &mut Editor` and holds `msg_tx` by VALUE for a
+/// `'static` spawned thread; `DispatchCtx` borrows `msg_tx` — it never outlives the loop).
+pub(crate) struct DispatchCtx<'a> {
+    pub(crate) reg: &'a crate::registry::Registry,
+    pub(crate) keymap: &'a crate::keymap::KeyTrie,
+    pub(crate) ex: &'a dyn crate::jobs::Executor,
+    pub(crate) clock: &'a dyn wordcartel_core::history::Clock,
+    pub(crate) msg_tx: &'a std::sync::mpsc::Sender<Msg>,
+}
 
 /// Every input overlay, exhaustive. A new overlay is a new variant; `row()` then forces it
 /// into `OVERLAYS`, and every table-derived consumer inherits it.
@@ -61,21 +75,35 @@ pub(crate) struct OverlayRow {
     #[allow(dead_code)]
     pub(crate) id: OverlayId,
     pub(crate) is_active: fn(&Editor) -> bool,
+    /// The overlay's input interceptor. Read by `reduce_dispatch`'s table loop (H10 fold):
+    /// each active overlay gets first refusal at the message in `ALL` order.
+    pub(crate) intercept: fn(Msg, &mut Editor, &DispatchCtx) -> Handled,
 }
 
 /// The overlay table, in `ALL` order. Non-capturing closures coerce to the fn-pointer fields.
 pub(crate) static OVERLAYS: &[OverlayRow] = &[
-    OverlayRow { name: "splash",        id: OverlayId::Splash,       is_active: |e| e.splash.is_some() },
-    OverlayRow { name: "menu",          id: OverlayId::Menu,         is_active: |e| e.menu.is_some() },
-    OverlayRow { name: "palette",       id: OverlayId::Palette,      is_active: |e| e.palette.is_some() },
-    OverlayRow { name: "theme_picker",  id: OverlayId::ThemePicker,  is_active: |e| e.theme_picker.is_some() },
-    OverlayRow { name: "cursor_picker", id: OverlayId::CursorPicker, is_active: |e| e.cursor_picker.is_some() },
-    OverlayRow { name: "file_browser",  id: OverlayId::FileBrowser,  is_active: |e| e.file_browser.is_some() },
-    OverlayRow { name: "prompt",        id: OverlayId::Prompt,       is_active: |e| e.prompt.is_some() },
-    OverlayRow { name: "minibuffer",    id: OverlayId::Minibuffer,   is_active: |e| e.minibuffer.is_some() },
-    OverlayRow { name: "search",        id: OverlayId::Search,       is_active: |e| e.search.is_some() },
-    OverlayRow { name: "diag",          id: OverlayId::Diag,         is_active: |e| e.diag.is_some() },
-    OverlayRow { name: "outline",       id: OverlayId::Outline,      is_active: |e| e.outline.is_some() },
+    OverlayRow { name: "splash",        id: OverlayId::Splash,       is_active: |e| e.splash.is_some(),
+        intercept: crate::splash::intercept },
+    OverlayRow { name: "menu",          id: OverlayId::Menu,         is_active: |e| e.menu.is_some(),
+        intercept: crate::menu::intercept },
+    OverlayRow { name: "palette",       id: OverlayId::Palette,      is_active: |e| e.palette.is_some(),
+        intercept: crate::palette::intercept },
+    OverlayRow { name: "theme_picker",  id: OverlayId::ThemePicker,  is_active: |e| e.theme_picker.is_some(),
+        intercept: crate::theme_picker::intercept },
+    OverlayRow { name: "cursor_picker", id: OverlayId::CursorPicker, is_active: |e| e.cursor_picker.is_some(),
+        intercept: crate::cursor_picker::intercept },
+    OverlayRow { name: "file_browser",  id: OverlayId::FileBrowser,  is_active: |e| e.file_browser.is_some(),
+        intercept: crate::file_browser::intercept },
+    OverlayRow { name: "prompt",        id: OverlayId::Prompt,       is_active: |e| e.prompt.is_some(),
+        intercept: crate::prompts::intercept },
+    OverlayRow { name: "minibuffer",    id: OverlayId::Minibuffer,   is_active: |e| e.minibuffer.is_some(),
+        intercept: crate::minibuffer::intercept },
+    OverlayRow { name: "search",        id: OverlayId::Search,       is_active: |e| e.search.is_some(),
+        intercept: crate::search_ui::intercept },
+    OverlayRow { name: "diag",          id: OverlayId::Diag,         is_active: |e| e.diag.is_some(),
+        intercept: crate::diag_overlay::intercept },
+    OverlayRow { name: "outline",       id: OverlayId::Outline,      is_active: |e| e.outline.is_some(),
+        intercept: crate::outline_overlay::intercept },
 ];
 
 /// True iff any input overlay owns the screen — the single source for both
@@ -124,6 +152,28 @@ mod tests {
         assert!(any_active(&e), "splash");
         let e = mk();
         assert!(!any_active(&e), "no overlay ⇒ false");
+    }
+
+    /// The input fold must preserve the real chain order: splash fires BEFORE marks fires
+    /// BEFORE the other overlays. With BOTH a pending mark AND the splash up, a key-Press
+    /// must dismiss the SPLASH (not resolve the mark) — proving splash still precedes marks.
+    #[test]
+    fn splash_intercept_precedes_marks() {
+        use crossterm::event::{KeyEvent, KeyCode, KeyEventKind, KeyModifiers};
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ex = crate::jobs::InlineExecutor::default();
+        let clock = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut e = Editor::new_from_text("hello\n", None, (40, 12));
+        e.splash = Some(crate::splash::Splash::new(&km, "0.0.0"));
+        e.pending_mark = Some(crate::editor::MarkPending::Set);
+        let key = KeyEvent { code: KeyCode::Char('a'), modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press, state: crossterm::event::KeyEventState::NONE };
+        crate::app::reduce(crate::app::Msg::Input(crossterm::event::Event::Key(key)),
+            &mut e, &reg, &km, &ex, &clock, &tx);
+        assert!(e.splash.is_none(), "splash dismissed first");
+        assert!(e.pending_mark.is_some(), "the mark was NOT consumed — splash preceded marks");
     }
 
     /// Q4 delta (spec §3): with the splash up, a mouse-Moved must NOT arm the menu-bar or

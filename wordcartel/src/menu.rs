@@ -168,17 +168,15 @@ fn category_label(cat: MenuCategory) -> &'static str {
 /// consumed / silently dropped). Non-key, non-paste messages fall through to
 /// the normal handlers so background work continues while the menu is open.
 pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor,
-    reg: &crate::registry::Registry, keymap: &crate::keymap::KeyTrie,
-    ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
-    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) -> crate::app::Handled {
+    ctx: &crate::overlays::DispatchCtx) -> crate::app::Handled {
     if editor.menu.is_none() { return crate::app::Handled::Pass(msg); }
     if matches!(&msg, Msg::ClipboardPaste { .. }) {
         // Drop an async clipboard-paste result that arrives while the menu is
         // open — it must not land in the document behind the overlay.
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
     }
     if let Msg::Input(Event::Paste(_)) = &msg {
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
     }
     if let Msg::Input(Event::Key(k)) = &msg {
         if k.kind == crossterm::event::KeyEventKind::Press {
@@ -229,11 +227,11 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                     }
                 } // menu borrow dropped here
                 if let Some(action) = selected {
-                    dispatch_row_action(editor, reg, keymap, ex, clock, msg_tx, action);
+                    dispatch_row_action(editor, ctx.reg, ctx.keymap, ctx.ex, ctx.clock, ctx.msg_tx, action);
                 }
             }
         }
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
     }
     // Non-key msg falls through to normal handling while menu stays open.
     crate::app::Handled::Pass(msg)
@@ -632,7 +630,8 @@ mod tests {
         let ex = crate::jobs::InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        let _ = intercept(crate::app::Msg::Input(enter_key()), &mut ed, &reg, &km, &ex, &clk, &tx);
+        let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: &tx };
+        let _ = intercept(crate::app::Msg::Input(enter_key()), &mut ed, &ctx);
         assert_eq!(ed.active().id, b_id, "selecting the Documents row switches to that buffer");
         assert!(ed.menu.is_none(), "menu closes after activation");
     }

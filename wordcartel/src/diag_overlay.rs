@@ -74,8 +74,7 @@ pub fn suggestion_label(s: &Suggestion) -> String {
 /// normal handling so background work is never starved while the overlay is open
 /// (mirror of minibuffer/search blocks above — 5e starvation lesson).
 pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor,
-    ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
-    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) -> crate::app::Handled {
+    ctx: &crate::overlays::DispatchCtx) -> crate::app::Handled {
     if editor.diag.is_none() { return crate::app::Handled::Pass(msg); }
     if let Msg::Input(Event::Key(k)) = &msg {
         if k.kind == crossterm::event::KeyEventKind::Press {
@@ -83,11 +82,11 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 crossterm::event::KeyCode::Up   => { editor.diag.as_mut().unwrap().up(); }
                 crossterm::event::KeyCode::Down => { editor.diag.as_mut().unwrap().down(); }
                 crossterm::event::KeyCode::Esc  => { editor.diag = None; }
-                crossterm::event::KeyCode::Enter => { crate::search_ui::diag_apply_selected(editor, clock); }
+                crossterm::event::KeyCode::Enter => { crate::search_ui::diag_apply_selected(editor, ctx.clock); }
                 _ => {} // bare Ctrl+key or anything else: no-op, consumed
             }
         }
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx)); // return ONLY for key events (including non-Press)
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx)); // return ONLY for key events (including non-Press)
     }
     // Non-key messages fall through to normal handlers below.
     crate::app::Handled::Pass(msg)

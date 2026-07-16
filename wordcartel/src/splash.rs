@@ -82,8 +82,7 @@ pub fn show_at_startup(cfg_splash: bool, no_splash: bool, prompt_pending: bool) 
 /// passes through so startup warmup, the timer subsystems, and resize-reheal keep
 /// working while the splash is up (idle-is-free).
 pub(crate) fn intercept(msg: Msg, editor: &mut crate::editor::Editor,
-    _ex: &dyn crate::jobs::Executor, _clock: &dyn wordcartel_core::history::Clock,
-    _msg_tx: &std::sync::mpsc::Sender<Msg>) -> Handled {
+    _ctx: &crate::overlays::DispatchCtx) -> Handled {
     if editor.splash.is_none() { return Handled::Pass(msg); }
     match msg {
         Msg::Input(Event::Key(k)) if k.kind == KeyEventKind::Press => {
@@ -215,7 +214,10 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock::new(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-        intercept(msg, e, &ex, &clk, &tx)
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: &tx };
+        intercept(msg, e, &ctx)
     }
 
     #[test]

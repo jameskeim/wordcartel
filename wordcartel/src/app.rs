@@ -270,30 +270,22 @@ fn reduce_dispatch(
     clock: &dyn Clock,
     msg_tx: &std::sync::mpsc::Sender<Msg>,
 ) -> bool {
-    let msg = match crate::splash::intercept(msg, editor, ex, clock, msg_tx) {
+    // Overlay/modal input dispatch (H21). Real chain order: splash row FIRST, then the
+    // `marks` chord pre-stage, then the remaining overlay rows in ALL order. `marks` is NOT
+    // a table row (chord state, no overlay struct) — it sits between the splash row and the
+    // rest to preserve today's `splash → marks → others` precedence (spec §2.6).
+    let ctx = crate::overlays::DispatchCtx { reg, keymap, ex, clock, msg_tx };
+    let mut msg = msg;
+    msg = match (crate::overlays::OverlayId::Splash.row().intercept)(msg, editor, &ctx) {
         crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
-    let msg = match crate::marks::intercept(msg, editor, ex, clock, msg_tx) {
+    msg = match crate::marks::intercept(msg, editor, &ctx) {
         crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
-    let msg = match crate::menu::intercept(msg, editor, reg, keymap, ex, clock, msg_tx) {
-        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
-    let msg = match crate::palette::intercept(msg, editor, reg, keymap, ex, clock, msg_tx) {
-        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
-    let msg = match crate::theme_picker::intercept(msg, editor, ex, clock, msg_tx) {
-        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
-    let msg = match crate::cursor_picker::intercept(msg, editor, ex, clock, msg_tx) {
-        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
-    let msg = match crate::file_browser::intercept(msg, editor, ex, clock, msg_tx) {
-        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
-    let msg = match crate::prompts::intercept(msg, editor, ex, clock, msg_tx) {
-        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
-    let msg = match crate::minibuffer::intercept(msg, editor, ex, clock, msg_tx) {
-        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
-    let msg = match crate::search_ui::intercept(msg, editor, ex, clock, msg_tx) {
-        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
-    let msg = match crate::diag_overlay::intercept(msg, editor, ex, clock, msg_tx) {
-        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
-    let msg = match crate::outline_overlay::intercept(msg, editor, ex, clock, msg_tx) {
-        crate::app::Handled::Done(k) => return k, crate::app::Handled::Pass(m) => m };
+    for id in &crate::overlays::OverlayId::ALL[1..] {
+        msg = match (id.row().intercept)(msg, editor, &ctx) {
+            crate::app::Handled::Done(k) => return k,
+            crate::app::Handled::Pass(m) => m,
+        };
+    }
 
     let before = editor.active().document.version; // post-interceptor; feeds last_edit_at only
     match msg {

@@ -95,24 +95,22 @@ pub fn rebuild_rows(p: &mut Palette, reg: &Registry, keymap: &KeyTrie) {
 /// (FilterDone, JobDone, Tick) fall through to normal handling while the
 /// palette stays open.
 pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor,
-    reg: &crate::registry::Registry, keymap: &crate::keymap::KeyTrie,
-    ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
-    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) -> crate::app::Handled {
+    ctx: &crate::overlays::DispatchCtx) -> crate::app::Handled {
     if editor.palette.is_none() { return crate::app::Handled::Pass(msg); }
     if matches!(&msg, Msg::ClipboardPaste { .. }) {
         // Drop an async clipboard-paste result that arrives while the palette is
         // open — it must not land in the document behind the overlay.
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
     }
     if let Msg::Input(Event::Paste(text)) = msg {
         let ah = editor.active().view.area.1;
         if let Some(p) = editor.palette.as_mut() {
             p.query.insert_str(p.cursor, &text);
             p.cursor += text.len();
-            crate::palette::rebuild_rows(p, reg, keymap);
+            crate::palette::rebuild_rows(p, ctx.reg, ctx.keymap);
             crate::app::keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
         }
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
     }
     if let Msg::Input(Event::Key(k)) = &msg {
         if k.kind == crossterm::event::KeyEventKind::Press {
@@ -132,7 +130,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                             }
                         } else {
                             // Command-palette row: dispatch through registry.
-                            crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, row.id);
+                            crate::app::dispatch_overlay_command(editor, ctx.reg, ctx.keymap, ctx.ex, ctx.clock, ctx.msg_tx, row.id);
                         }
                     }
                 }
@@ -152,7 +150,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                             p.query.remove(byte_pos);
                             p.cursor = byte_pos;
                         }
-                        crate::palette::rebuild_rows(p, reg, keymap);
+                        crate::palette::rebuild_rows(p, ctx.reg, ctx.keymap);
                         crate::app::keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
                     }
                 }
@@ -179,14 +177,14 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                     if let Some(p) = editor.palette.as_mut() {
                         p.query.insert(p.cursor, c);
                         p.cursor += c.len_utf8();
-                        crate::palette::rebuild_rows(p, reg, keymap);
+                        crate::palette::rebuild_rows(p, ctx.reg, ctx.keymap);
                         crate::app::keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
                     }
                 }
                 _ => {}
             }
         }
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
     }
     // Non-key msg falls through to normal handling while palette stays open.
     crate::app::Handled::Pass(msg)

@@ -220,8 +220,7 @@ pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_co
 /// background work is never starved while the overlay is open (mirror of minibuffer
 /// block above — see test `search_does_not_starve_filterdone`).
 pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor,
-    ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
-    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) -> crate::app::Handled {
+    ctx: &crate::overlays::DispatchCtx) -> crate::app::Handled {
     if editor.search.is_none() { return crate::app::Handled::Pass(msg); }
     if let Msg::Input(Event::Key(k)) = &msg {
         if k.kind == crossterm::event::KeyEventKind::Press {
@@ -232,23 +231,23 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
             // Stepping phase: y/n/!/q intercepted BEFORE the text-insert arm.
             if editor.search.as_ref().map(|s| s.phase) == Some(crate::search_overlay::Phase::Stepping) {
                 match k.code {
-                    KeyCode::Char('y') => { search_step_apply(editor, clock); }
+                    KeyCode::Char('y') => { search_step_apply(editor, ctx.clock); }
                     KeyCode::Char('n') => { search_step_skip(editor); }
-                    KeyCode::Char('!') => { search_step_rest(editor, clock); }
+                    KeyCode::Char('!') => { search_step_rest(editor, ctx.clock); }
                     KeyCode::Char('q') | KeyCode::Esc => { editor.search = None; }
                     _ => {}
                 }
-                return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+                return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
             }
             match k.code {
                 KeyCode::Esc => { search_cancel(editor); return crate::app::Handled::Done(!editor.quit); }
                 KeyCode::Char('r') if alt => { editor.search.as_mut().unwrap().toggle_mode(); }
                 KeyCode::Char('c') if alt => { editor.search.as_mut().unwrap().cycle_case(); }
-                KeyCode::Char('a') if alt => { search_replace_all(editor, clock); return crate::app::Handled::Done(!editor.quit); }
+                KeyCode::Char('a') if alt => { search_replace_all(editor, ctx.clock); return crate::app::Handled::Done(!editor.quit); }
                 KeyCode::Enter if alt => {
                     if let Some(s) = editor.search.as_mut() { s.phase = crate::search_overlay::Phase::Stepping; }
                     search_sync(editor); // park on first match
-                    return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+                    return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
                 }
                 KeyCode::Enter if shift => { search_step(editor, false); }
                 KeyCode::F(3) if shift   => { search_step(editor, false); }
@@ -272,7 +271,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
             // Recompute against the live buffer and pin the current match.
             search_sync(editor);
         }
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx)); // return ONLY for key events (including non-Press)
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx)); // return ONLY for key events (including non-Press)
     }
     // Non-key messages (FilterDone/ExportDone/TransformDone/JobDone/Tick/…)
     // fall through to the normal handlers below.
