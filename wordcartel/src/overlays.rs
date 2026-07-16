@@ -303,6 +303,72 @@ mod tests {
         assert_eq!(crate::nav::head(&e), before, "click under palette did not move the caret");
     }
 
+    /// The completeness sweep (subsumes render.rs's B11 census). For EACH overlay: open it,
+    /// assert exactly one row is_active (XOR); a key-Press routed through `reduce` is consumed
+    /// (buffer version unchanged — no keystroke leak); and a mouse Down-left in the text band
+    /// routed through `mouse::handle` is consumed by the overlay's mouse slot (the caret does
+    /// NOT jump to the clicked cell — no click-through while a modal is up).
+    #[test]
+    #[allow(clippy::type_complexity)] // test-local table of (name, opener closure) pairs; not a public API surface
+    fn every_overlay_is_active_xor_and_consumes_key_and_click() {
+        use crossterm::event::{Event, KeyEvent, KeyCode, KeyEventKind, KeyEventState,
+            MouseEvent, MouseEventKind, MouseButton, KeyModifiers};
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ex = crate::jobs::InlineExecutor::default();
+        let clock = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let diag_fixture = || wordcartel_core::diagnostics::Diagnostic {
+            range: 0..1, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
+            message: "m".into(), suggestions: Vec::new(),
+        };
+        // (name, opener) — every OverlayId, opened via a real path.
+        let openers: Vec<(&str, Box<dyn Fn(&mut Editor)>)> = vec![
+            ("search",        Box::new(|e: &mut Editor| e.open_search(crate::search_overlay::Phase::Find, 0))),
+            ("minibuffer",    Box::new(|e: &mut Editor| e.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter))),
+            ("palette",       Box::new(|e: &mut Editor| e.open_palette())),
+            ("outline",       Box::new(|e: &mut Editor| e.open_outline())),
+            ("theme_picker",  Box::new(|e: &mut Editor| e.open_theme_picker())),
+            ("file_browser",  Box::new(|e: &mut Editor| e.open_file_browser(std::path::PathBuf::from(".")))),
+            ("prompt",        Box::new(|e: &mut Editor| e.open_prompt(crate::prompt::Prompt::swap_recovery()))),
+            ("diag",          Box::new(move |e: &mut Editor| e.open_diag(diag_fixture()))),
+            ("cursor_picker", Box::new(|e: &mut Editor| e.open_cursor_picker())),
+            ("menu",          Box::new(|e: &mut Editor| { e.menu = Some(crate::menu::empty()); })),
+            ("splash",        Box::new(|e: &mut Editor| { e.splash = Some(crate::splash::Splash::new(
+                &crate::keymap::KeyTrie::default(), "0.0.0")); })),
+        ];
+        for (name, open) in openers {
+            let mut e = Editor::new_from_text("hello world\nsecond line here\n", None, (40, 12));
+            crate::derive::rebuild(&mut e);
+            open(&mut e);
+            // (a) exactly one active
+            let active = OverlayId::ALL.iter().filter(|id| (id.row().is_active)(&e)).count();
+            assert_eq!(active, 1, "{name}: exactly one overlay active (XOR)");
+            // (b) a key-Press is consumed — the buffer version must not change (every overlay
+            // intercept returns Handled::Done for ALL key messages, so 'z' never reaches the buffer).
+            let v0 = e.active().document.version;
+            let key = KeyEvent { code: KeyCode::Char('z'), modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press, state: KeyEventState::NONE };
+            crate::app::reduce(crate::app::Msg::Input(Event::Key(key)), &mut e, &reg, &km,
+                &ex, &clock, &tx);
+            assert_eq!(e.active().document.version, v0, "{name}: key-Press did not edit the buffer");
+            // (c) a Down-left in the text band is consumed by the overlay's mouse slot — the
+            // caret does NOT move to the clicked cell (with NO overlay this click WOULD move it).
+            // `mouse_capture` defaults true, so `handle` routes through `route_overlay`. Re-open
+            // in case the key above dismissed the overlay (e.g. splash Press dismisses it).
+            let mut e = Editor::new_from_text("hello world\nsecond line here\n", None, (40, 12));
+            crate::derive::rebuild(&mut e);
+            open(&mut e);
+            let before = crate::nav::head(&e);
+            let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left),
+                column: 6, row: 9, modifiers: KeyModifiers::NONE };
+            crate::mouse::handle(&mut e, click, &reg, &km, &ex, &clock, &tx);
+            assert_eq!(crate::nav::head(&e), before,
+                "{name}: text-band click consumed by the overlay — caret did not jump");
+        }
+    }
+
     /// `close_all` clears EVERY overlay (the XOR-close axis). Opens all 11 in turn (each via a
     /// real `open_*` or field set), asserts it was active, then asserts `close_all` clears it.
     #[test]
