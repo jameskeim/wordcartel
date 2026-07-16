@@ -884,3 +884,20 @@ overlay (reinforces H21's value). Config/persistence surface for Layer 2. `S2`/`
 
 **Size:** M for Layers 1–2 (save-mode picker + favorites/persistence + command-surface wiring); L if it grows
 toward projects (which should be S2 instead). Good candidate for the Fable-first, writer-first pipeline.
+
+### H23 — palette_overlay_rect u16 overflow at extreme terminal width (H7-class geom)
+<!-- item: H23 -->
+
+**Surfaced by the H21 whole-branch Fable probe (2026-07-16), Minor — PRE-EXISTING, not introduced by H21**
+(verified byte-identical on `main` at 1c8d10e). `chrome_geom::palette_overlay_rect` computes the overlay width
+as `let ov_w = (w * 3 / 5)…` in `u16`; the intermediate `w * 3` overflows `u16` for a terminal width `w ≥ 21846`
+— a debug-build panic, or a release wrap that then clamps. Fable's degenerate-area probe (300×100 and extreme
+coordinates) hit it. Reachable only via an absurd/hostile terminal `Resize` (no real terminal is ~21846 columns),
+so it is **not a data-loss or normal-use hazard** and was **not a merge blocker** for H21 — but it is the same
+arithmetic-soundness class H7 audited (widen the intermediate, or `saturating_mul`/`u32`). **Fix:** compute the
+`* 3 / 5` in `u32` (or use `saturating_*`) and clamp back to `u16`, in `chrome_geom.rs::palette_overlay_rect`;
+sweep the sibling `*_overlay_rect` helpers for the same pattern while there. Small, cold path — good candidate to
+batch into a future H7-style geom/panic sweep rather than its own effort. Anchor: `wordcartel/src/chrome_geom.rs`
+(`palette_overlay_rect` and the other overlay-rect helpers it shares the `w * k / n` shape with).
+
+*(Captured 2026-07-16 from the H21 final Fable gate.)*
