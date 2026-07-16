@@ -910,3 +910,31 @@ hardening pass — but the *scope is the sweep*, and the fix pattern (widen-comp
 is already decided here so it's ready to go.
 
 *(Captured 2026-07-16 from the H21 final Fable gate. H7-sweep framing recorded 2026-07-16.)*
+
+### H24 — H22 follow-up hardening — EditOutcome #[must_use] + defensive finish_topic on read-only-reject async arms + INV-SEAM scan limit
+<!-- item: H24 -->
+
+**Surfaced by H22's two final gates (2026-07-16), all non-blocking Minors — bundle when convenient (small).**
+Three future-proofing hardening items on the H22 edit chokepoint ([[wordcartel-h22-edit-chokepoint]]); none is a
+current bug (all land on unreachable-today or future-regression paths), so they were deliberately NOT applied
+post-gate (merge the gated artifact, file the hardening):
+1. **`#[derive(...)]` / `#[must_use]` on `EditOutcome`** (`edit_apply.rs`) — today the outcome can be dropped
+   silently at the two intentional-discard sites (`block_move`'s source edit, `scratch.rs:60`), which rely on the
+   pre-existing loud-guard semantics. `#[must_use]` makes the INV-GUARD ack-gating self-enforcing for FUTURE call
+   sites (a new caller that forgets to gate its ack on `Applied` gets a warning). The two intentional-discard sites
+   become `let _ = …` with a one-line why. Cheapest + highest-value of the three.
+2. **Defensive `finish_topic(Warning, …)` on the read-only-reject async arms** — `apply_filter_done`
+   (`jobs_apply.rs`) and `merge_transform_into` (`transform.rs`) gate `finish_topic` on `EditOutcome::Applied`, so a
+   `RejectedReadOnly` would leave the Filter/Transform progress topic dangling. UNREACHABLE today (both dispatchers
+   entry-guard read-only; `read_only` is only ever set on the status-view buffer), but a `finish_topic(Warning,…)` on
+   the rejected arm makes it airtight if `read_only` ever becomes toggleable.
+3. **INV-SEAM source-scan heuristic limit** (`tests/edit_seam.rs`) — the scan can't catch a `let`-bound in-crate
+   `Buffer` local reaching `.apply(...)` (textually identical to the sanctioned `editor.apply`); the `pub(crate)`
+   compiler-guard covers only the external boundary. No production bypass exists today. Fundamental limit (documented
+   in the test), so this line is a WATCH, not a fixable defect — record so a future reader knows the guarantee's edge.
+
+Also noted (spec-sanctioned §3.1, NOT a bug, listed for memory): a non-active paste target no longer gets its
+`desired_col=None` reset (core resets only the active buffer) — first vertical motion after switching to a
+pasted-into buffer may use a stale column. Include a fix only if it ever proves user-visible.
+
+*(Captured 2026-07-16 from the H22 final gates.)*

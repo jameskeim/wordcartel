@@ -1527,6 +1527,51 @@ land it **before** Effort P's overlay/panel work rather than retrofitting. **UNG
 unrelated to prose lenses; it is *not* E8 (view lenses) and *not* gated on the S6 kill-gate. Second item in the
 "unify ad-hoc surfaces" arc (A17 first — ungated, higher-scored, de-risks the typed-enum + one-setter + sweep pattern).
 
+### H22 — Universal edit chokepoint (route all internal edits through submit_transaction)
+<!-- item: H22 -->
+
+**SHIPPED 2026-07-16** (merge cf42284): a shared inner core `wordcartel/src/edit_apply.rs::apply_edit` +
+validated shell (`submit_transaction` = validate→core) now funnel EVERY internal buffer edit; `Buffer::apply`
+demoted `pub(crate)` as a compiler-guarded no-bypass seam; the edit epilogue (`resettle` = `derive::rebuild` +
+`nav::ensure_visible` + `desired_col=None`) is core-owned and active-gated. 4-surface migration — **A** (7 raw
+`Buffer::apply` bypasses), **B** (standard `Editor::apply` clients: edit.rs / textops.rs / prose_ops / the
+blocks_marked helper / move_block_to_scratch / diag_apply_selected), **S** (the `submit_transaction` shell), **C**
+(custom-fold `swap` + `block_move`, fold correction computed before apply, two-stage rebuild preserved). Fixes the
+`apply_filter_done` false-ack and closes a latent read-only-scratch data-loss path. Invariants **INV-SEAM**
+(edit_apply the sole `Buffer::apply` caller, `pub(crate)` compiler-guard + `tests/edit_seam.rs` source-scan),
+**INV-GUARD** (uniform loud read-only + `EditOutcome` rejected return), **INV-EPILOGUE** (exactly one epilogue per
+active edit), **INV-LAZY-HEAL** (non-active edited buffers heal on activation before render — NEVER eager-reparse,
+the deliberate responsiveness/resource decision, F3); **F6** undo/redo recovery-snapshot gap closed. Folds H22's
+original intent (route direct-`apply` callers onto one funnel) and lands the "unify ad-hoc surfaces" arc's third
+beat. Gated: spec Codex-clean (3 rounds), plan Codex-clean (2 rounds), 7 TDD tasks each per-task reviewed clean;
+both final gates GO — Codex pre-merge + a fresh independent Fable whole-branch compiled-probe (8 probes; plugin &
+async-job edit paths traced, no seam bypass — the H21-class plugin-pump miss did NOT recur; Fable also verified H22
+*closes* a `move_block_to_scratch` read-only data-loss path present on main). Non-blocking Minors filed as **H24**
+(follow-up): `EditOutcome` `#[must_use]`, a defensive `finish_topic` on the unreachable read-only-reject async arms,
+and the INV-SEAM source-scan's documented heuristic limit (a `let`-bound in-crate `Buffer` local evades text-scan;
+`pub(crate)` compiler-guards the external boundary). Original triage below.
+
+**Surfaced by A17's read-only-guard work (2026-07-15).** A truly universal single function that ALL internal
+edits route through — including the direct `Buffer::apply` calls in `search_ui`/`jobs_apply`/`transform` — i.e.
+making **`submit_transaction`** (the M2 untrusted-edit boundary) the one funnel everything uses. That's
+genuinely valuable: it would localize versioning, swap-scheduling, reconcile-triggering, the read-only guard,
+**and** the Effort-P plugin-edit seam in one place, and it rhymes with the "unify ad-hoc surfaces" arc
+(A17/H21). But it is a real mutation-architecture refactor and deserves its own effort, **not** a
+mid-A17 expansion.
+
+**Why it came up:** A17 needed to make the `view_messages` history buffer non-editable, and the read-only
+guard kept surfacing new mutation paths across six plan-gate rounds — because this codebase has **no single
+mutation chokepoint**. The mutation surface decomposes into two closed categories: (1) *content* mutation of
+an existing buffer, already closed at `Buffer::{apply, undo, redo}` (the private `document.buffer` is written
+only by those three); and (2) whole-*buffer* replacement, at ~3 `Editor`-slot sites (`save::reload_from_disk`,
+`save::load_recovered`, `session_restore::open_into_current`) that swap the entire `Buffer` and so bypass the
+content methods. A17 handles both *locally* — it guards the closed content set and adds a small
+`Editor::replace_buffer` chokepoint for the replacement sites — which is complete for A17's needs. H22 is the
+larger move: collapse the *internal direct-`apply` callers* (which currently bypass `submit_transaction`, the
+M2 boundary) onto one funnel too, so that versioning/swap/reconcile/read-only/plugin-edit bookkeeping all live
+at a single seam rather than being re-implemented per call site. Likely **L**; a natural companion to the
+A17/H21 unification arc and to any Effort-P edit-surface hardening.
+
 ## Theme R — responsiveness
 
 ### R1 — Typing latency + double-Return / line-jump

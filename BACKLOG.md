@@ -3,7 +3,7 @@
 
 # Backlog
 
-**37 open · 58 shipped · 2 dropped**
+**37 open · 59 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -31,7 +31,6 @@ Blocking Effort P: **0**
 | S1 | Rearrangeable outline / heading-subtree corkboard | needs-design | feature | M |  | Structure mode: atomic heading-subtree move via submit_transaction; drag-reorder. Inherits select_section from S4, and OWNS section transpose (deliberately cut from S4: outline::sections yields NESTED/overlapping ranges — the 'next section' after an H2 is usually its own H3 child, so naive swap-with-next corrupts the document; S1 must solve sibling identification + separator normalization anyway). |
 | S7 | Linguistic substrate — harper-brill POS tagger + NP chunker in-process | needs-design | feature | M |  | ADOPTION DECIDED 2026-07-12 (measured, not assumed): harper-brill = rule-based Brill POS tagger + NP chunker, 2 direct deps, +119 activated crates, +0.95 MB binary, ZERO GPU/FFI (the lockfile's 491 + cubecl/CUDA entries are optional deps that never compile). Proven: 'because' → SCONJ vs 'on' → ADP — the exact distinction that makes clause-splitting principled. PARTIALLY REVERSES H2 (burn returns in-process, thinner: 119 vs 389 crates) — see the H2 archive note. GATE: cargo deny/audit has NOT been run against the 119 new crates; it must pass before merge. Cold-path only, block-windowed, version-cached. Arc: docs/design/prose-structure-arc.md. |
 | S8 | Prose lenses — POS-driven stylistic X-rays; Phrase/Clause select-only | needs-design | feature | M |  | The genuinely novel half. Every adverb dimmed; every passive (AUX + participle) underlined; nominalizations flagged; 'select every sentence containing a passive'. This is what harper-ls CANNOT give — it flags ERRORS; these are stylistic X-rays of CORRECT prose, which is what revision needs. Then Phrase (the chunker's NPs) and Clause (POS-informed: CCONJ/SCONJ/ADP disambiguates for/so/yet) — SELECT-ONLY. THE LAW: a linguistic analysis may COLOR and may SELECT; it may never MUTATE without a visible, abortable selection (Brill is newswire-trained; it WILL mistag fiction/dialect/verse). Arc: docs/design/prose-structure-arc.md. |
-| H22 | Universal edit chokepoint — route all internal edits through submit_transaction (M2 boundary) | triage | debt | L |  | A truly universal single function that ALL internal edits route through — including search_ui/jobs_apply/transform's direct Buffer::apply calls — i.e. making submit_transaction (the M2 untrusted-edit boundary) the one funnel everything uses. Genuinely valuable: localizes versioning, swap-scheduling, reconcile-triggering, the read-only guard, AND the Effort-P plugin-edit seam in one place; rhymes with the 'unify ad-hoc surfaces' arc (A17/H21). Surfaced by A17's read-only-guard work (2026-07-15): this codebase has NO single mutation chokepoint — content mutation is closed at Buffer::{apply,undo,redo} (private document.buffer) and whole-buffer REPLACEMENT happens at ~3 Editor-slot sites (reload_from_disk/load_recovered/session_restore) — so A17 guards the closed content set + adds a local Editor::replace_buffer chokepoint, but unifying EVERYTHING onto submit_transaction is a real mutation-architecture refactor deserving its own effort, NOT a mid-A17 expansion. |
 | S2 | Directory-as-binder | needs-design | feature | L |  | Directory of .md as a manuscript: ordered manifest + compile step (post-Effort-P plugin). |
 | A15 | About command/menu item that shows the splash | triage | feature | TBD |  | About command/menu item that shows the splash |
 | A16 | Format menu: drop redundant Transform entry | triage | feature | TBD |  | Format menu: drop redundant Transform entry |
@@ -43,6 +42,7 @@ Blocking Effort P: **0**
 | H13 | Editor is a 75-field data god-object | watch | debt | TBD |  | Field-clustering, not dispatch; NOT a defect. AUDIT 2026-07-14 reframe (field count 58→75): of 75 fields only ~12 are real ad-hoc debt — the `status` field (→ A17) and the 11 overlay Options whose DISPATCH, not data, is hand-parallel (→ H21). The overlays stay a flat XOR set (do NOT wrap in a sub-struct); it is their routing that wants a seam. Sole DRY nit among the pending_* is collapsing the 4 prompt-payload fields into Option<PromptPayload> (the other pending_* are unrelated axes — a naming rhyme, not a shared abstraction). The remaining ~46 fields are legitimately distinct state — healthy, not debt. Peel PendingActions/ClipboardState only if a refactor wants it. |
 | H19 | Clean recovery files offers an opened recovered-*.md dump for deletion | triage | feature | TBD |  | Clean recovery files offers an opened recovered-*.md dump for deletion |
 | H20 | Flaky test: filter::run_filter_non_zero_exit_carries_stderr | triage | feature | TBD |  | Flaky test: filter::run_filter_non_zero_exit_carries_stderr. INVESTIGATED 2026-07-13: NOT reproducible in 85 runs (60 isolated + 25 full-parallel, 0 failures). run_subprocess reviewed — carefully written: concurrent drain, deadlock-safe (combined stdout+stderr limit_size), EPIPE-on-stdin handled by the subprocess crate, breaks to child.wait() only on genuine both-streams-EOF so err_buf holds all stderr. No clear race by inspection. MOST PLAUSIBLE vector: child.wait().unwrap_or(Undetermined) — if wait() ever yields Undetermined, code='Undetermined' has no '3', so the CODE assert fails (not the stderr one). NEXT: on recurrence, capture the actual panic message (which assert / 'got <other>') — it pinpoints code-vs-stderr. Do NOT weaken the test (would mask a real intermittent wait() result); do NOT guess-fix the deadlock-safe loop without a repro. |
+| H24 | H22 follow-up hardening — EditOutcome #[must_use] + defensive finish_topic on read-only-reject async arms + INV-SEAM scan limit | triage | feature | TBD |  | H22 follow-up hardening — EditOutcome #[must_use] + defensive finish_topic on read-only-reject async arms + INV-SEAM scan limit |
 | H3 | Incremental-parser tail divergences | watch | debt | TBD |  | Cosmetic, self-healing via reconcile; NOT open correctness debt; chase only if a real case appears. |
 | PA | Analysis / policy plugins | watch | research | TBD |  | Post-P candidates: writing goals/streaks, readability lens, CMS publish, backlinks. NOTE (triage 2026-07-13): the readability-lens slice is largely SUBSUMED — Hemingway = sentence length (S6 rhythm gutter, SHIPPED) + adverbs/passives (S8). Keep at most one slice as an E8 plugin-lens proof-case; do not rebuild it. |
 | PB | Custom-markup plugins | watch | research | TBD |  | Post-P candidates clustering on a markup-extension API: CriticMarkup, Fountain, wiki-links. |
@@ -51,12 +51,13 @@ Blocking Effort P: **0**
 
 ## Shipped
 
-<details><summary>58 shipped</summary>
+<details><summary>59 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
 | H10 | reduce's 10-stage intercept chain boilerplate | 2026-07-16 | e5d9b42 |
 | H21 | Input-overlay dispatch table — OverlayId enum + OVERLAYS fn-ptr seam | 2026-07-16 | e5d9b42 |
+| H22 | Universal edit chokepoint — route all internal edits through submit_transaction (M2 boundary) | 2026-07-16 | cf42284 |
 | A17 | Messaging / notification system — routed, browsable, plugin-emittable | 2026-07-15 | 2efc9fe |
 | B11 | Modal/overlay caret parked under the modal (query field shows no caret) | 2026-07-14 | c740ba4 |
 | B8 | Writing caret — DECSCUSR shape/blink config + cursor picker + panic-safe restore | 2026-07-14 | c740ba4 |
