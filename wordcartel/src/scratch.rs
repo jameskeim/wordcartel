@@ -59,8 +59,6 @@ pub fn move_block_to_scratch(editor: &mut Editor, clock: &dyn Clock) {
         .with_selection(wordcartel_core::selection::Selection::single(b.start));
     editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock); // active (source) buffer
     editor.active_mut().marked_block = None;
-    crate::derive::rebuild(editor);
-    crate::nav::ensure_visible(editor);
     editor.set_status(crate::status::StatusKind::Info, "block moved to scratch");
 }
 

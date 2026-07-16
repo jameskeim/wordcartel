@@ -203,10 +203,8 @@ pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_co
         let txn = wordcartel_core::history::Transaction::new(cs)
             .with_selection(wordcartel_core::selection::Selection::single(new_cursor));
         editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
-        derive::rebuild(editor);
         crate::registry::unfold_ancestors_of(editor, new_cursor);
-        derive::rebuild(editor);
-        crate::nav::ensure_visible(editor);
+        crate::edit_apply::resettle(editor); // reflect the unfold on the already-reparsed tree
         editor.diag = None;
     }
     // else: no suggestion and not ignore/add_dict — unreachable (selected is always in range).

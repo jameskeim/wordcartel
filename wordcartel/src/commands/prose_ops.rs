@@ -89,9 +89,8 @@ fn move_sentence(editor: &mut Editor, dir: Dir, clock: &dyn Clock) -> CommandRes
     // Head-at-start on the moved sentence (C-9): Selection::range(anchor=end, head=start).
     let txn = Transaction::new(cs).with_selection(Selection::range(moved_to, moved_from));
     editor.apply(txn, edit, EditKind::Other, clock);
-    let r = super::edit::settle_after_edit(editor);
     editor.set_status(crate::status::StatusKind::Info, match dir { Dir::Up => "moved sentence up", Dir::Down => "moved sentence down" });
-    r
+    CommandResult::Handled
 }
 
 /// `swap` — exchange the primary `Selection` region with the `MarkedBlock` region (F2). ONE undo
@@ -195,9 +194,8 @@ pub(crate) fn break_paragraph_here(editor: &mut Editor, clock: &dyn Clock) -> Co
     let new_st = (st as isize + delta) as usize;
     let txn = Transaction::new(cs).with_selection(Selection::range(new_st, new_sf));
     editor.apply(txn, edit, EditKind::Other, clock);
-    let r = super::edit::settle_after_edit(editor);
     editor.set_status(crate::status::StatusKind::Info, "split paragraph");
-    r
+    CommandResult::Handled
 }
 
 /// `merge_paragraph_forward` — join the caret's paragraph with the next. Gap fate M4: replace the
@@ -248,9 +246,8 @@ pub(crate) fn merge_paragraph_forward(editor: &mut Editor, clock: &dyn Clock) ->
     };
     let txn = Transaction::new(cs).with_selection(Selection::range(new_start + sent_len, new_start));
     editor.apply(txn, edit, EditKind::Other, clock);
-    let r = super::edit::settle_after_edit(editor);
     editor.set_status(crate::status::StatusKind::Info, "merged paragraph");
-    r
+    CommandResult::Handled
 }
 
 /// `split_sentence_at_caret` — turn one sentence into two at the caret. Gap fate M5: insert ". "
@@ -291,9 +288,8 @@ pub(crate) fn split_sentence_at_caret(editor: &mut Editor, clock: &dyn Clock) ->
     let new_st = (st as isize + ins.len() as isize + case_delta) as usize;
     let txn = Transaction::new(cs).with_selection(Selection::range(new_st, new_second_from));
     editor.apply(txn, edit, EditKind::Other, clock);
-    let r = super::edit::settle_after_edit(editor);
     editor.set_status(crate::status::StatusKind::Info, "split sentence");
-    r
+    CommandResult::Handled
 }
 
 #[cfg(test)]

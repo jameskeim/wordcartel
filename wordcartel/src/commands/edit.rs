@@ -1,6 +1,9 @@
 //! Buffer-edit primitives behind `commands::run`. Each returns `CommandResult`
-//! (the arms have early Noop guards), ends non-Noop paths through
-//! `settle_after_edit`, and preserves the exact `EditKind` of the original arm.
+//! (the arms have early Noop guards) and preserves the exact `EditKind` of the
+//! original arm. Non-Noop paths call `editor.apply`, whose core epilogue
+//! (`edit_apply::resettle`) settles the active buffer — no manual re-settle
+//! call needed here (H22 Task 4; `settle_after_edit` below is retained only
+//! for `prose_ops::swap`'s two-rebuild fold-correction path).
 
 use crate::derive;
 use crate::nav;
@@ -35,7 +38,7 @@ pub(super) fn insert_char(editor: &mut Editor, c: char, clock: &dyn Clock) -> Co
         let edit = Edit { range: from..to, new_len: text.len() };
         let txn = Transaction::new(cs).with_selection(Selection::single(from + text.len()));
         editor.apply(txn, edit, EditKind::Other, clock);
-        return settle_after_edit(editor);
+        return CommandResult::Handled;
     }
     // Collapsed selection: normal insert-at-caret path.
     let at = nav::head(editor);
@@ -46,7 +49,7 @@ pub(super) fn insert_char(editor: &mut Editor, c: char, clock: &dyn Clock) -> Co
     let edit = Edit { range: at..at, new_len };
     let txn = Transaction::new(cs).with_selection(Selection::single(at + new_len));
     editor.apply(txn, edit, EditKind::Type, clock);
-    settle_after_edit(editor)
+    CommandResult::Handled
 }
 
 /// `Command::InsertNewline` — splits the line at the caret, or replaces a
@@ -62,7 +65,7 @@ pub(super) fn insert_newline(editor: &mut Editor, clock: &dyn Clock) -> CommandR
         let edit = Edit { range: from..to, new_len: text.len() };
         let txn = Transaction::new(cs).with_selection(Selection::single(from + text.len()));
         editor.apply(txn, edit, EditKind::Other, clock);
-        return settle_after_edit(editor);
+        return CommandResult::Handled;
     }
     // Collapsed selection: normal insert-newline path.
     let at = nav::head(editor);
@@ -75,7 +78,7 @@ pub(super) fn insert_newline(editor: &mut Editor, clock: &dyn Clock) -> CommandR
     // chunks per logical line rather than collapsing multi-line insertions.
     let txn = Transaction::new(cs).with_selection(Selection::single(at + new_len));
     editor.apply(txn, edit, EditKind::Other, clock);
-    settle_after_edit(editor)
+    CommandResult::Handled
 }
 
 /// `Command::Backspace` — deletes a non-empty selection, or one grapheme left
@@ -90,7 +93,7 @@ pub(super) fn backspace(editor: &mut Editor, clock: &dyn Clock) -> CommandResult
         let edit = Edit { range: from..to, new_len: 0 };
         let txn = Transaction::new(cs).with_selection(Selection::single(from));
         editor.apply(txn, edit, EditKind::Other, clock);
-        return settle_after_edit(editor);
+        return CommandResult::Handled;
     }
     // Collapsed selection: delete one grapheme left of the caret.
     let head = nav::head(editor);
@@ -107,7 +110,7 @@ pub(super) fn backspace(editor: &mut Editor, clock: &dyn Clock) -> CommandResult
     let edit = Edit { range: prev..head, new_len: 0 };
     let txn = Transaction::new(cs).with_selection(Selection::single(prev));
     editor.apply(txn, edit, EditKind::Other, clock);
-    settle_after_edit(editor)
+    CommandResult::Handled
 }
 
 /// `Command::DeleteForward` — deletes a non-empty selection, or one grapheme
@@ -122,7 +125,7 @@ pub(super) fn delete_forward(editor: &mut Editor, clock: &dyn Clock) -> CommandR
         let edit = Edit { range: from..to, new_len: 0 };
         let txn = Transaction::new(cs).with_selection(Selection::single(from));
         editor.apply(txn, edit, EditKind::Other, clock);
-        return settle_after_edit(editor);
+        return CommandResult::Handled;
     }
     // Collapsed selection: delete one grapheme forward.
     let head = nav::head(editor);
@@ -142,7 +145,7 @@ pub(super) fn delete_forward(editor: &mut Editor, clock: &dyn Clock) -> CommandR
     // Caret stays at `head` after a forward delete.
     let txn = Transaction::new(cs).with_selection(Selection::single(head));
     editor.apply(txn, edit, EditKind::Other, clock);
-    settle_after_edit(editor)
+    CommandResult::Handled
 }
 
 /// `Command::Cut` — cuts the primary selection into the register and deletes
@@ -164,7 +167,7 @@ pub(super) fn cut(editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     if let Some(text) = editor.register.get().map(str::to_owned) {
         editor.clipboard_sync_request = Some(text);
     }
-    settle_after_edit(editor)
+    CommandResult::Handled
 }
 
 /// `Command::DeleteWord { back }` — deletes one word backwards or forwards
@@ -180,7 +183,7 @@ pub(super) fn delete_word(editor: &mut Editor, back: bool, clock: &dyn Clock) ->
     let txn = Transaction::new(cs).with_selection(Selection::single(from));
     // EditKind::Other — matches existing delete commands, avoids coalescing with typed chars.
     editor.apply(txn, edit, EditKind::Other, clock);
-    settle_after_edit(editor)
+    CommandResult::Handled
 }
 
 /// `Command::DeleteLine` — deletes the caret-head's whole logical line
@@ -215,7 +218,7 @@ pub(super) fn delete_line(editor: &mut Editor, clock: &dyn Clock) -> CommandResu
     let edit = Edit { range: from..to, new_len: 0 };
     let txn = Transaction::new(cs).with_selection(Selection::single(from));
     editor.apply(txn, edit, EditKind::Other, clock);
-    settle_after_edit(editor)
+    CommandResult::Handled
 }
 
 /// `Command::DeleteToLineEnd` — deletes from the caret to the end of the
@@ -240,5 +243,24 @@ pub(super) fn delete_to_line_end(editor: &mut Editor, clock: &dyn Clock) -> Comm
     let edit = Edit { range: head..to, new_len: 0 };
     let txn = Transaction::new(cs).with_selection(Selection::single(head));
     editor.apply(txn, edit, EditKind::Other, clock);
-    settle_after_edit(editor)
+    CommandResult::Handled
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // H22 Task 4 (INV-EPILOGUE regression guard): a migrated primitive re-derives correctly
+    // with NO manual `settle_after_edit` call — proving the core epilogue (`editor.apply` →
+    // `edit_apply::resettle`) fires on its own. Green before and after the epilogue-relocation
+    // cleanup (behavior-preserving, not a red→green TDD step — see task-4-brief.md §1).
+    #[test]
+    fn insert_char_reparses_via_core_epilogue_without_settle_call() {
+        let mut e = crate::editor::Editor::new_from_text("# H\n", None, (80, 24));
+        struct C; impl wordcartel_core::history::Clock for C { fn now_ms(&self) -> u64 { 0 } }
+        insert_char(&mut e, 'x', &C);
+        // Core's resettle reparsed: blocks_version tracks the new version, caret visible.
+        assert_eq!(e.active().reconcile.blocks_version, e.active().document.version);
+        assert_eq!(e.active().document.buffer.to_string(), "x# H\n");
+    }
 }

@@ -86,9 +86,6 @@ fn apply_edit(
     let txn = wordcartel_core::history::Transaction::new(cs)
         .with_selection(wordcartel_core::selection::Selection::single(new_caret));
     editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
-    crate::derive::rebuild(editor);
-    nav::ensure_visible(editor);
-    editor.active_mut().desired_col = None;
 }
 
 pub fn block_jump_begin(editor: &mut Editor) { block_jump(editor, true); }
