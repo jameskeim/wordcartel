@@ -82,32 +82,36 @@ pub(crate) struct OverlayRow {
     /// hand-written sibling-null lists in every `open_*`, `dispatch_overlay_command`, and the
     /// registry `"menu"` command into one loop.
     pub(crate) close: fn(&mut Editor),
+    /// The overlay's mouse slot. Read by `mouse::route_overlay`'s find-active-then-call
+    /// dispatch (Task 4): the active overlay's slot consumes the event (wheel/click/click-away),
+    /// replacing the hand-written `if editor.X.is_some()` chain.
+    pub(crate) mouse: fn(&mut Editor, crossterm::event::MouseEvent, ratatui::layout::Rect, &DispatchCtx),
 }
 
 /// The overlay table, in `ALL` order. Non-capturing closures coerce to the fn-pointer fields.
 pub(crate) static OVERLAYS: &[OverlayRow] = &[
     OverlayRow { name: "splash",        id: OverlayId::Splash,       is_active: |e| e.splash.is_some(),
-        intercept: crate::splash::intercept, close: |e| e.splash = None },
+        intercept: crate::splash::intercept, close: |e| e.splash = None, mouse: crate::splash::mouse },
     OverlayRow { name: "menu",          id: OverlayId::Menu,         is_active: |e| e.menu.is_some(),
-        intercept: crate::menu::intercept, close: |e| e.menu = None },
+        intercept: crate::menu::intercept, close: |e| e.menu = None, mouse: crate::mouse::mouse_menu },
     OverlayRow { name: "palette",       id: OverlayId::Palette,      is_active: |e| e.palette.is_some(),
-        intercept: crate::palette::intercept, close: |e| e.palette = None },
+        intercept: crate::palette::intercept, close: |e| e.palette = None, mouse: crate::mouse::mouse_palette },
     OverlayRow { name: "theme_picker",  id: OverlayId::ThemePicker,  is_active: |e| e.theme_picker.is_some(),
-        intercept: crate::theme_picker::intercept, close: |e| e.theme_picker = None },
+        intercept: crate::theme_picker::intercept, close: |e| e.theme_picker = None, mouse: crate::mouse::mouse_theme_picker },
     OverlayRow { name: "cursor_picker", id: OverlayId::CursorPicker, is_active: |e| e.cursor_picker.is_some(),
-        intercept: crate::cursor_picker::intercept, close: |e| e.cursor_picker = None },
+        intercept: crate::cursor_picker::intercept, close: |e| e.cursor_picker = None, mouse: crate::mouse::mouse_cursor_picker },
     OverlayRow { name: "file_browser",  id: OverlayId::FileBrowser,  is_active: |e| e.file_browser.is_some(),
-        intercept: crate::file_browser::intercept, close: |e| e.file_browser = None },
+        intercept: crate::file_browser::intercept, close: |e| e.file_browser = None, mouse: crate::mouse::mouse_file_browser },
     OverlayRow { name: "prompt",        id: OverlayId::Prompt,       is_active: |e| e.prompt.is_some(),
-        intercept: crate::prompts::intercept, close: |e| e.prompt = None },
+        intercept: crate::prompts::intercept, close: |e| e.prompt = None, mouse: crate::mouse::mouse_prompt },
     OverlayRow { name: "minibuffer",    id: OverlayId::Minibuffer,   is_active: |e| e.minibuffer.is_some(),
-        intercept: crate::minibuffer::intercept, close: |e| e.minibuffer = None },
+        intercept: crate::minibuffer::intercept, close: |e| e.minibuffer = None, mouse: crate::mouse::mouse_minibuffer },
     OverlayRow { name: "search",        id: OverlayId::Search,       is_active: |e| e.search.is_some(),
-        intercept: crate::search_ui::intercept, close: |e| e.search = None },
+        intercept: crate::search_ui::intercept, close: |e| e.search = None, mouse: crate::mouse::mouse_search },
     OverlayRow { name: "diag",          id: OverlayId::Diag,         is_active: |e| e.diag.is_some(),
-        intercept: crate::diag_overlay::intercept, close: |e| e.diag = None },
+        intercept: crate::diag_overlay::intercept, close: |e| e.diag = None, mouse: crate::mouse::mouse_diag },
     OverlayRow { name: "outline",       id: OverlayId::Outline,      is_active: |e| e.outline.is_some(),
-        intercept: crate::outline_overlay::intercept, close: |e| e.outline = None },
+        intercept: crate::outline_overlay::intercept, close: |e| e.outline = None, mouse: crate::mouse::mouse_outline },
 ];
 
 /// True iff any input overlay owns the screen — the single source for both
@@ -210,6 +214,30 @@ mod tests {
         }
         assert!(e.mouse.menu_reveal_due.is_none(), "no menu dwell armed under splash");
         assert!(e.mouse.scrollbar_reveal_due.is_none(), "no scrollbar dwell armed under splash");
+    }
+
+    /// A mouse Down under an open list overlay is consumed by the overlay's mouse slot —
+    /// it must NOT fall through to an editor gesture (no click-through while a modal is up).
+    #[test]
+    fn click_under_overlay_does_not_move_caret() {
+        use crossterm::event::{MouseEvent, MouseEventKind, MouseButton, KeyModifiers};
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ex = crate::jobs::InlineExecutor::default();
+        let clock = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut e = Editor::new_from_text("hello world\ntwo\n", None, (40, 12));
+        crate::derive::rebuild(&mut e);
+        e.open_palette();
+        let before = crate::nav::head(&e);
+        // A click well outside the palette rect (bottom-left) — with no palette open this
+        // would move the caret; under the palette it is consumed (close-away or no-op).
+        let ev = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 0, row: 11,
+            modifiers: KeyModifiers::NONE };
+        crate::mouse::handle(&mut e, ev, &reg, &km, &ex, &clock, &tx);
+        // Either the palette closed (click-away) or stayed; in NEITHER case did the editor
+        // caret jump to the clicked cell — the event never reached the editor gesture path.
+        assert_eq!(crate::nav::head(&e), before, "click under palette did not move the caret");
     }
 
     /// `close_all` clears EVERY overlay (the XOR-close axis). Opens all 11 in turn (each via a

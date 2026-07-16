@@ -101,6 +101,18 @@ pub(crate) fn intercept(msg: Msg, editor: &mut crate::editor::Editor,
     }
 }
 
+/// Splash mouse slot (H21 Q4). While the splash owns the screen it consumes ALL mouse events
+/// so nothing leaks to dwell timers or the editor. A `Down` dismisses (mirrors `intercept`'s
+/// Down arm); moves/scroll are swallowed no-ops. In practice `Down` is already consumed by
+/// `intercept` before `mouse::handle` runs, so this slot mainly swallows Moved/Scroll — but it
+/// dismisses defensively to match the intercept semantics.
+pub(crate) fn mouse(editor: &mut crate::editor::Editor, ev: crossterm::event::MouseEvent,
+    _area: ratatui::layout::Rect, _ctx: &crate::overlays::DispatchCtx) {
+    if matches!(ev.kind, crossterm::event::MouseEventKind::Down(_)) {
+        editor.splash = None;
+    }
+}
+
 /// Paint the full-frame startup splash from the pre-resolved `Splash` content.
 ///
 /// The splash owns the screen: every cell of the frame (including the status row) is
