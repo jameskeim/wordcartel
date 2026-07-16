@@ -305,9 +305,15 @@ mod tests {
 
     /// The completeness sweep (subsumes render.rs's B11 census). For EACH overlay: open it,
     /// assert exactly one row is_active (XOR); a key-Press routed through `reduce` is consumed
-    /// (buffer version unchanged — no keystroke leak); and a mouse Down-left in the text band
-    /// routed through `mouse::handle` is consumed by the overlay's mouse slot (the caret does
-    /// NOT jump to the clicked cell — no click-through while a modal is up).
+    /// (buffer version unchanged — no keystroke leak); and the overlay's OWN `mouse` slot,
+    /// called DIRECTLY with a text-band Down-left, does not panic and does not mutate the
+    /// buffer (a per-slot no-data-loss guardrail on a stray click while a modal is up).
+    /// Assertion (c) calls the row's `mouse` fn directly rather than through `mouse::handle`:
+    /// `handle` gates ALL click routing on "some overlay is active" and then hands off to
+    /// whichever overlay is active, so once ANY overlay is open, routing through `handle`
+    /// would pass regardless of what THIS overlay's own slot does — it cannot prove
+    /// per-slot behavior, only that overlay-vs-no-overlay dispatch happened (already covered
+    /// by (a)). Calling the slot directly makes the assertion load-bearing per overlay.
     #[test]
     #[allow(clippy::type_complexity)] // test-local table of (name, opener closure) pairs; not a public API surface
     fn every_overlay_is_active_xor_and_consumes_key_and_click() {
@@ -353,19 +359,24 @@ mod tests {
             crate::app::reduce(crate::app::Msg::Input(Event::Key(key)), &mut e, &reg, &km,
                 &ex, &clock, &tx);
             assert_eq!(e.active().document.version, v0, "{name}: key-Press did not edit the buffer");
-            // (c) a Down-left in the text band is consumed by the overlay's mouse slot — the
-            // caret does NOT move to the clicked cell (with NO overlay this click WOULD move it).
-            // `mouse_capture` defaults true, so `handle` routes through `route_overlay`. Re-open
-            // in case the key above dismissed the overlay (e.g. splash Press dismisses it).
+            // (c) the overlay's OWN mouse slot, called directly, does not panic and does not
+            // mutate the buffer on a stray text-band Down-left click (see the doc comment
+            // above for why this bypasses `mouse::handle`). Re-open in case the key above
+            // dismissed the overlay (e.g. splash Press dismisses it).
             let mut e = Editor::new_from_text("hello world\nsecond line here\n", None, (40, 12));
             crate::derive::rebuild(&mut e);
             open(&mut e);
-            let before = crate::nav::head(&e);
+            let id = *OverlayId::ALL.iter().find(|id| (id.row().is_active)(&e))
+                .unwrap_or_else(|| panic!("{name}: no active overlay to find its mouse slot"));
+            let (w, h) = e.active().view.area;
+            let area = ratatui::layout::Rect::new(0, 0, w, h);
+            let ctx = DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clock, msg_tx: &tx };
+            let v0 = e.active().document.version;
             let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left),
                 column: 6, row: 9, modifiers: KeyModifiers::NONE };
-            crate::mouse::handle(&mut e, click, &reg, &km, &ex, &clock, &tx);
-            assert_eq!(crate::nav::head(&e), before,
-                "{name}: text-band click consumed by the overlay — caret did not jump");
+            (id.row().mouse)(&mut e, click, area, &ctx);
+            assert_eq!(e.active().document.version, v0,
+                "{name}: mouse slot did not mutate the buffer on a stray click (no data loss)");
         }
     }
 
