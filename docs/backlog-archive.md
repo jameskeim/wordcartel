@@ -1572,6 +1572,24 @@ M2 boundary) onto one funnel too, so that versioning/swap/reconcile/read-only/pl
 at a single seam rather than being re-implemented per call site. Likely **L**; a natural companion to the
 A17/H21 unification arc and to any Effort-P edit-surface hardening.
 
+### H24 — H22 follow-up hardening (EditOutcome must_use + defensive finish_topic + INV-SEAM scan-limit doc)
+<!-- item: H24 -->
+
+**SHIPPED 2026-07-16** (merge 94f0338): the three non-blocking hardening items H22's final gates surfaced.
+(1) **`#[must_use]` on `EditOutcome`** — every drop site (40, across the Surface B command primitives) now
+explicitly acknowledges the outcome with `let _ =`, making the INV-GUARD ack-gating self-enforcing for future
+callers; all 40 verified legitimate discards (the read-only Sticky Warning wins the `resolve_slot` display slot, so
+no false-ack). The forcing function surfaced a real pre-existing `cut()`-copies-to-register-before-apply nit → filed
+as **C6**. (2) **Defensive `finish_topic(StatusKind::Warning, …)`** on the `RejectedReadOnly` arms of
+`apply_filter_done` (jobs_apply) + `merge_transform_into` (transform) — the Filter/Transform progress topic now
+resolves loudly instead of dangling if `read_only` ever becomes toggleable (unreachable today; both dispatchers
+entry-guard read-only); two load-bearing unit tests, and the one pre-existing test whose expected status became
+`"filter discarded - buffer is read-only"` is the correct intended consequence, not a regression. (3) **INV-SEAM
+scan-limit** — doc cross-ref only (the heuristic's `let`-bound-in-crate-`Buffer` edge; the `pub(crate)` compiler-guard
+covers the external boundary; `tests/edit_seam.rs` untouched). Proportionate pipeline (branch → implement → one
+independent review → gates), reviewed clean (spec + quality); 1550 tests, clippy `--workspace` clean, smoke 9/9,
+module_budgets 5/5. Non-blocking Minor `desired_col` non-active-paste delta noted (spec-sanctioned §3.1, not filed).
+
 ## Theme R — responsiveness
 
 ### R1 — Typing latency + double-Return / line-jump

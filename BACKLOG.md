@@ -3,7 +3,7 @@
 
 # Backlog
 
-**37 open · 59 shipped · 2 dropped**
+**37 open · 60 shipped · 2 dropped**
 
 Blocking Effort P: **0**
 
@@ -39,10 +39,10 @@ Blocking Effort P: **0**
 | B16 | Scope::Sentence highlight window drifts from content-anchored select on indented prose | triage | feature | TBD |  | Scope::Sentence highlight window drifts from content-anchored select on indented prose |
 | B7 | Selected menu-item text too light | needs-design | bug | TBD |  | Possible E5 regression; selected item may need a distinct legible highlight fg. |
 | B9 | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) | triage | feature | TBD |  | Menu bar horizontal overflow — clip/windowing for narrow terminals (<62 cols) |
+| C6 | cut() writes register/clipboard BEFORE apply — a read-only Cut still syncs the clipboard though nothing is deleted | triage | feature | TBD |  | cut() writes register/clipboard BEFORE apply — a read-only Cut still syncs the clipboard though nothing is deleted |
 | H13 | Editor is a 75-field data god-object | watch | debt | TBD |  | Field-clustering, not dispatch; NOT a defect. AUDIT 2026-07-14 reframe (field count 58→75): of 75 fields only ~12 are real ad-hoc debt — the `status` field (→ A17) and the 11 overlay Options whose DISPATCH, not data, is hand-parallel (→ H21). The overlays stay a flat XOR set (do NOT wrap in a sub-struct); it is their routing that wants a seam. Sole DRY nit among the pending_* is collapsing the 4 prompt-payload fields into Option<PromptPayload> (the other pending_* are unrelated axes — a naming rhyme, not a shared abstraction). The remaining ~46 fields are legitimately distinct state — healthy, not debt. Peel PendingActions/ClipboardState only if a refactor wants it. |
 | H19 | Clean recovery files offers an opened recovered-*.md dump for deletion | triage | feature | TBD |  | Clean recovery files offers an opened recovered-*.md dump for deletion |
 | H20 | Flaky test: filter::run_filter_non_zero_exit_carries_stderr | triage | feature | TBD |  | Flaky test: filter::run_filter_non_zero_exit_carries_stderr. INVESTIGATED 2026-07-13: NOT reproducible in 85 runs (60 isolated + 25 full-parallel, 0 failures). run_subprocess reviewed — carefully written: concurrent drain, deadlock-safe (combined stdout+stderr limit_size), EPIPE-on-stdin handled by the subprocess crate, breaks to child.wait() only on genuine both-streams-EOF so err_buf holds all stderr. No clear race by inspection. MOST PLAUSIBLE vector: child.wait().unwrap_or(Undetermined) — if wait() ever yields Undetermined, code='Undetermined' has no '3', so the CODE assert fails (not the stderr one). NEXT: on recurrence, capture the actual panic message (which assert / 'got <other>') — it pinpoints code-vs-stderr. Do NOT weaken the test (would mask a real intermittent wait() result); do NOT guess-fix the deadlock-safe loop without a repro. |
-| H24 | H22 follow-up hardening — EditOutcome #[must_use] + defensive finish_topic on read-only-reject async arms + INV-SEAM scan limit | triage | feature | TBD |  | H22 follow-up hardening — EditOutcome #[must_use] + defensive finish_topic on read-only-reject async arms + INV-SEAM scan limit |
 | H3 | Incremental-parser tail divergences | watch | debt | TBD |  | Cosmetic, self-healing via reconcile; NOT open correctness debt; chase only if a real case appears. |
 | PA | Analysis / policy plugins | watch | research | TBD |  | Post-P candidates: writing goals/streaks, readability lens, CMS publish, backlinks. NOTE (triage 2026-07-13): the readability-lens slice is largely SUBSUMED — Hemingway = sentence length (S6 rhythm gutter, SHIPPED) + adverbs/passives (S8). Keep at most one slice as an E8 plugin-lens proof-case; do not rebuild it. |
 | PB | Custom-markup plugins | watch | research | TBD |  | Post-P candidates clustering on a markup-extension API: CriticMarkup, Fountain, wiki-links. |
@@ -51,13 +51,14 @@ Blocking Effort P: **0**
 
 ## Shipped
 
-<details><summary>59 shipped</summary>
+<details><summary>60 shipped</summary>
 
 | id | title | date | commit |
 |---|---|---|---|
 | H10 | reduce's 10-stage intercept chain boilerplate | 2026-07-16 | e5d9b42 |
 | H21 | Input-overlay dispatch table — OverlayId enum + OVERLAYS fn-ptr seam | 2026-07-16 | e5d9b42 |
 | H22 | Universal edit chokepoint — route all internal edits through submit_transaction (M2 boundary) | 2026-07-16 | cf42284 |
+| H24 | H22 follow-up hardening — EditOutcome #[must_use] + defensive finish_topic on read-only-reject async arms + INV-SEAM scan limit | 2026-07-16 | 94f0338 |
 | A17 | Messaging / notification system — routed, browsable, plugin-emittable | 2026-07-15 | 2efc9fe |
 | B11 | Modal/overlay caret parked under the modal (query field shows no caret) | 2026-07-14 | c740ba4 |
 | B8 | Writing caret — DECSCUSR shape/blink config + cursor picker + panic-safe restore | 2026-07-14 | c740ba4 |
