@@ -263,8 +263,10 @@ impl Buffer {
         }
     }
 
-    /// Single mutation channel for THIS buffer's document (spec §10.1).
-    pub fn apply(&mut self, txn: Transaction, edit: wordcartel_core::block_tree::Edit, kind: EditKind, clock: &dyn Clock) {
+    /// Single mutation channel for THIS buffer's document (spec §10.1). `pub(crate)` — the
+    /// compiler-guarded no-bypass seam (INV-SEAM): callable only from `edit_apply::apply_edit`
+    /// within this crate; out-of-crate (Effort-P plugin) callers cannot reach it at all.
+    pub(crate) fn apply(&mut self, txn: Transaction, edit: wordcartel_core::block_tree::Edit, kind: EditKind, clock: &dyn Clock) {
         if self.read_only { return; }                    // A17 T8 category (a): content is immutable.
         let cs = txn.changes.clone();                    // capture BEFORE commit consumes txn
         let old_rope = self.document.buffer.snapshot();

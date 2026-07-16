@@ -132,4 +132,28 @@ mod tests {
         assert_eq!(out, EditOutcome::BufferGone);
         assert_eq!(e.status_text(), "", "BufferGone sets no status");
     }
+
+    // INV-LAZY-HEAL (F3): a non-active edit skips the epilogue and leaves its tree lagging;
+    // every activation path (here, workspace::switch_to) heals it before the buffer's first
+    // render. The only Task-7 test that needs crate::editor::Buffer directly (m-P2).
+    #[test]
+    fn non_active_edit_lags_then_heals_on_switch() {
+        let mut e = Editor::new_from_text("alpha\n", None, (80, 24));
+        let id1 = e.alloc_id();
+        let area = e.active().view.area;
+        // buffer 0 stays active; edit lands on the non-active buffer id1.
+        e.buffers.push(crate::editor::Buffer::from_text(id1, "beta\n", None, area));
+        let doc_len = e.by_id(id1).unwrap().document.buffer.len();
+        let (cs, edit) = crate::commands::build_multi_replace(&[(0, 0, "X".into())], doc_len);
+        let out = apply_edit(&mut e, id1, Transaction::new(cs), edit, EditKind::Other, &C(0));
+        assert_eq!(out, EditOutcome::Applied);
+        let b = e.by_id(id1).unwrap();
+        assert!(b.reconcile.blocks_version < b.document.version,
+            "non-active tree lags — the core skips the epilogue (INV-LAZY-HEAL)");
+        // Every activation path heals before first render:
+        let idx = e.buffers.iter().position(|x| x.id == id1).unwrap();
+        crate::workspace::switch_to(&mut e, idx);
+        let b = e.by_id(id1).unwrap();
+        assert_eq!(b.reconcile.blocks_version, b.document.version, "switch_to heals the tree");
+    }
 }
