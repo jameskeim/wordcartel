@@ -36,11 +36,13 @@ pub fn submit_transaction(
     // 3. Conservative whole-doc reparse Edit.
     let edit = wordcartel_core::block_tree::Edit { range: 0..len_before, new_len: len_after };
 
-    // 4. Build the final transaction (original changes + snapped selection) and apply
-    //    once via the trusted path — the only live mutation.
+    // 4. Build the final transaction (original changes + snapped selection) and apply once via
+    //    the core — the only live mutation. A read-only active buffer is refused loudly here
+    //    (INV-GUARD); the untrusted boundary still returns Ok — the edit was cleanly declined.
     let mut final_txn = Transaction::new(changes);
     if let Some(sel) = snapped_sel { final_txn = final_txn.with_selection(sel); }
-    editor.apply(final_txn, edit, EditKind::Other, clock);
+    let id = editor.active().id;
+    let _ = crate::edit_apply::apply_edit(editor, id, final_txn, edit, EditKind::Other, clock);
     Ok(())
 }
 
@@ -82,6 +84,20 @@ mod tests {
         let r = submit_transaction(&mut e, Transaction::new(cs), &C(0));
         assert!(matches!(r, Err(EditError::OpBoundary { .. })));
         assert_eq!(e.active().document.buffer.to_string(), before, "buffer unchanged");
+    }
+
+    // Regression guard (green before AND after Task 2): the validate→core refactor preserves the
+    // loud read-only refusal and the Ok(()) return (a read-only view's edit is cleanly declined).
+    #[test]
+    fn submit_into_read_only_is_ok_after_loud_reject() {
+        let mut e = ed("hello\n");
+        e.active_mut().read_only = true;
+        let before = e.active().document.buffer.to_string();
+        let cs = ChangeSet::insert(0, "X", 6);
+        let r = submit_transaction(&mut e, Transaction::new(cs), &C(0));
+        assert!(r.is_ok(), "read-only edit is refused loudly, not errored");
+        assert_eq!(e.active().document.buffer.to_string(), before, "no mutation");
+        assert_eq!(e.status_text(), "buffer is read-only");
     }
 
     #[test]
