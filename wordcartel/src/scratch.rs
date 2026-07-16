@@ -57,7 +57,11 @@ pub fn move_block_to_scratch(editor: &mut Editor, clock: &dyn Clock) {
     let (cs, edit) = crate::commands::build_multi_replace(&[(b.start, b.end, String::new())], doc_len);
     let txn = wordcartel_core::history::Transaction::new(cs)
         .with_selection(wordcartel_core::selection::Selection::single(b.start));
-    editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock); // active (source) buffer
+    // H24: outcome dropped on purpose — active buffer only (BufferGone impossible); a
+    // RejectedReadOnly already fired the funnel's loud Sticky Warning and the "block moved to
+    // scratch" status below is Q1-arbitrated behind it. Mirrors block_move: the block is still
+    // consumed even if the source delete was declined (the scratch append above already landed).
+    let _ = editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock); // active (source) buffer
     editor.active_mut().marked_block = None;
     editor.set_status(crate::status::StatusKind::Info, "block moved to scratch");
 }

@@ -2073,7 +2073,8 @@ mod tests {
         let (cs, edit) = crate::commands::build_range_replace(0, 0, "XX", doc_len);
         let txn = wordcartel_core::history::Transaction::new(cs)
             .with_selection(wordcartel_core::selection::Selection::single(0));
-        e.apply(txn, edit, wordcartel_core::history::EditKind::Other, &clk);
+        // H24: outcome dropped — this test asserts on the stale-cache precondition below, not the outcome.
+        let _ = e.apply(txn, edit, wordcartel_core::history::EditKind::Other, &clk);
         crate::derive::rebuild(&mut e);
         crate::nav::ensure_visible(&mut e);
 

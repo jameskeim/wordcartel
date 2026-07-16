@@ -85,7 +85,12 @@ fn apply_edit(
 ) {
     let txn = wordcartel_core::history::Transaction::new(cs)
         .with_selection(wordcartel_core::selection::Selection::single(new_caret));
-    editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
+    // H24: outcome dropped on purpose — shared by block_copy/block_move/block_delete, all
+    // active-buffer only (BufferGone impossible). A RejectedReadOnly already fired the funnel's
+    // loud Sticky Warning; each caller's own unconditional "block moved/copied/deleted" status
+    // is Q1-arbitrated behind it, so no false ack shows. block_move/block_delete still consume
+    // `marked_block` regardless — matches the pre-H22 no-mutation-but-still-clears behavior.
+    let _ = editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
 }
 
 pub fn block_jump_begin(editor: &mut Editor) { block_jump(editor, true); }

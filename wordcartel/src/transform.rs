@@ -294,9 +294,18 @@ pub fn merge_transform_into(
                     editor.finish_topic(crate::status::StatusTopic::Transform,
                         crate::status::StatusKind::Info, kind.past_tense().to_string());
                 }
-                // Buffer vanished mid-flight, or (unreachable — dispatch guards read-only) refused.
-                crate::edit_apply::EditOutcome::BufferGone
-                | crate::edit_apply::EditOutcome::RejectedReadOnly => {}
+                // H24 (defensive): unreachable today — both dispatchers entry-guard read-only
+                // before a transform can even start, and `read_only` is only ever set on the
+                // status-view buffer. Resolves the "{gerund}…" progress topic loudly instead of
+                // leaving it dangling if `read_only` ever becomes toggleable mid-flight.
+                crate::edit_apply::EditOutcome::RejectedReadOnly => {
+                    editor.finish_topic(crate::status::StatusTopic::Transform,
+                        crate::status::StatusKind::Warning, "transform discarded - buffer is read-only");
+                }
+                // Unreachable here too: both callers (`apply_transform_done`'s staleness check;
+                // `apply_transform_result`'s active-buffer target) already guarantee `buffer_id`
+                // is live by the time this runs.
+                crate::edit_apply::EditOutcome::BufferGone => {}
             }
         }
     }
@@ -362,6 +371,30 @@ mod tests {
         assert!(!e.transform_in_flight, "no transform scheduled on a read-only buffer");
         assert_eq!(e.active().document.buffer.to_string(), before);
         assert_eq!(e.status_text(), "buffer is read-only");
+    }
+
+    /// H24: `merge_transform_into`'s `RejectedReadOnly` arm now `finish_topic`s the Transform
+    /// progress topic with a Warning instead of leaving it dangling. Unreachable via normal
+    /// dispatch (`dispatch_transform_on_read_only_is_rejected` above proves the true entry point
+    /// already rejects before scheduling any job), so this calls the merge function directly —
+    /// the same direct-unit-call pattern as `jobs_apply::apply_filter_done_into_read_only_*`.
+    #[test]
+    fn merge_transform_into_read_only_target_finishes_the_topic_loudly() {
+        struct Z;
+        impl wordcartel_core::history::Clock for Z { fn now_ms(&self) -> u64 { 0 } }
+        let mut e = Editor::new_from_text("hello world\n", None, (40, 6));
+        let id = e.active().id;
+        e.set_progress(crate::status::StatusTopic::Transform, "Reflowing…");
+        e.active_mut().read_only = true;
+        let before = e.active().document.buffer.to_string();
+        merge_transform_into(&mut e, id, TransformKind::Reflow, 0..5, Ok("HELLO".to_string()), &Z);
+        assert_eq!(e.active().document.buffer.to_string(), before, "no mutation");
+        assert_eq!(e.status_text(), "transform discarded - buffer is read-only");
+        let transform_entries: Vec<_> = e.status_history().entries().iter()
+            .filter(|s| s.topic() == Some(crate::status::StatusTopic::Transform))
+            .collect();
+        assert_eq!(transform_entries.len(), 1, "the progress start collapsed IN PLACE, not appended");
+        assert_eq!(transform_entries[0].kind(), crate::status::StatusKind::Warning);
     }
 
     fn blocks_of(text: &str) -> wordcartel_core::block_tree::BlockTree {

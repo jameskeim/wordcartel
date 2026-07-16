@@ -242,12 +242,25 @@ pub(crate) fn apply_filter_done(
                 let (cs, edit) = crate::commands::build_range_replace(from, to, &text, doc_len);
                 let txn = wordcartel_core::history::Transaction::new(cs)
                     .with_selection(wordcartel_core::selection::Selection::single(at + text.len()));
-                if crate::edit_apply::apply_edit(editor, buffer_id, txn, edit,
+                match crate::edit_apply::apply_edit(editor, buffer_id, txn, edit,
                        wordcartel_core::history::EditKind::Other, clock)
-                    == crate::edit_apply::EditOutcome::Applied
                 {
-                    editor.finish_topic(crate::status::StatusTopic::Filter,
-                        crate::status::StatusKind::Info, "filter applied");
+                    crate::edit_apply::EditOutcome::Applied => {
+                        editor.finish_topic(crate::status::StatusTopic::Filter,
+                            crate::status::StatusKind::Info, "filter applied");
+                    }
+                    // H24 (defensive): unreachable today — both dispatchers entry-guard read-only
+                    // before a filter can even start, and `read_only` is only ever set on the
+                    // status-view buffer. Resolves the "Filtering…" progress topic loudly instead
+                    // of leaving it dangling if `read_only` ever becomes toggleable mid-flight.
+                    crate::edit_apply::EditOutcome::RejectedReadOnly => {
+                        editor.finish_topic(crate::status::StatusTopic::Filter,
+                            crate::status::StatusKind::Warning, "filter discarded - buffer is read-only");
+                    }
+                    // Unreachable here: the `stale` check above already catches a vanished buffer
+                    // first (`by_id(buffer_id).map(version) != Some(version)`), finishing the topic
+                    // with "filter discarded - buffer changed" before this match ever runs.
+                    crate::edit_apply::EditOutcome::BufferGone => {}
                 }
             }
         }
@@ -972,6 +985,14 @@ mod tests {
     /// H22 Task 3 (INV-GUARD false-ack pin): `apply_filter_done`'s Stdout arm must gate its
     /// "filter applied" ack on the edit actually applying — a read-only target must reject
     /// loudly (canonical status, no mutation), NOT silently no-op-then-ack.
+    ///
+    /// H24: the `RejectedReadOnly` arm now also `finish_topic`s the Filter progress topic with a
+    /// Warning — that candidate ties the pre-existing "buffer is read-only" Sticky Warning on
+    /// severity, so per `status::resolve_slot`'s tie-break (`candidate.kind <= occ.kind` → Take)
+    /// it wins the display slot; the assertion below was updated from the H22 baseline to match.
+    /// Not reachable via normal dispatch (both dispatchers entry-guard read-only), so this is the
+    /// only exercise of that arm — a direct unit call, mirroring the not-unit-testable-via-
+    /// dispatch note in the H24 item triage.
     #[test]
     fn apply_filter_done_into_read_only_does_not_false_ack() {
         use crate::editor::Editor;
@@ -983,7 +1004,30 @@ mod tests {
         apply_filter_done(&mut e, id, v, 0..1, 0, crate::filter::Disposition::Filter,
             crate::filter::RunResult::Stdout("X".into()), &TestClock(0));
         assert_ne!(e.status_text(), "filter applied", "no success ack on a read-only reject");
-        assert_eq!(e.status_text(), "buffer is read-only");
+        assert_eq!(e.status_text(), "filter discarded - buffer is read-only",
+            "H24: the Filter progress topic resolves loudly instead of dangling");
         assert_eq!(e.active().document.buffer.to_string(), before, "no mutation");
+    }
+
+    /// H24: pins the Filter progress topic's HISTORY lineage actually collapses (not just the
+    /// display slot) on a `RejectedReadOnly` — `finish_topic` calls `collapse_topic`, replacing
+    /// the most recent Filter-tagged history entry in place rather than leaving a "Filtering…"
+    /// progress start stranded forever.
+    #[test]
+    fn apply_filter_done_into_read_only_collapses_the_progress_topic_history() {
+        use crate::editor::Editor;
+        let mut e = Editor::new_from_text("keep\n", None, (80, 24));
+        let id = e.active().id;
+        let v = e.active().document.version;
+        e.set_progress(crate::status::StatusTopic::Filter, "Filtering…");
+        e.active_mut().read_only = true;
+        apply_filter_done(&mut e, id, v, 0..1, 0, crate::filter::Disposition::Filter,
+            crate::filter::RunResult::Stdout("X".into()), &TestClock(0));
+        let filter_entries: Vec<_> = e.status_history().entries().iter()
+            .filter(|s| s.topic() == Some(crate::status::StatusTopic::Filter))
+            .collect();
+        assert_eq!(filter_entries.len(), 1, "the progress start collapsed IN PLACE, not appended");
+        assert_eq!(filter_entries[0].kind(), crate::status::StatusKind::Warning);
+        assert_eq!(filter_entries[0].text(), "filter discarded - buffer is read-only");
     }
 }

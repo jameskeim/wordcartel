@@ -8,6 +8,11 @@
 //! manual re-settle call follows (H22 Task 4). A leaf module — no `Command`
 //! enum variant, no `commands::run` arm (module-structure GATE); `registry.rs`
 //! calls these handlers directly.
+//!
+//! H24: every `editor.apply(...)` below drops the returned `EditOutcome` on purpose — see the
+//! identical rationale in `commands/edit.rs`'s module doc (active-buffer only, so `BufferGone`
+//! cannot occur; `RejectedReadOnly` already fired the loud Sticky Warning inside the funnel and
+//! Q1 arbitration keeps any later success status from showing over it).
 
 use crate::derive;
 use crate::editor::Editor;
@@ -45,7 +50,7 @@ pub(crate) fn upcase(editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     let doc_len = editor.active().document.buffer.len();
     let (cs, edit) = super::build_range_replace(from, to, &out, doc_len);
     let txn = Transaction::new(cs).with_selection(Selection::range(from, from + out.len()));
-    editor.apply(txn, edit, EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
     CommandResult::Handled
 }
 
@@ -64,7 +69,7 @@ pub(crate) fn downcase(editor: &mut Editor, clock: &dyn Clock) -> CommandResult 
     let doc_len = editor.active().document.buffer.len();
     let (cs, edit) = super::build_range_replace(from, to, &out, doc_len);
     let txn = Transaction::new(cs).with_selection(Selection::range(from, from + out.len()));
-    editor.apply(txn, edit, EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
     CommandResult::Handled
 }
 
@@ -120,7 +125,7 @@ pub(crate) fn capitalize(editor: &mut Editor, clock: &dyn Clock) -> CommandResul
     let doc_len = editor.active().document.buffer.len();
     let (cs, edit) = super::build_range_replace(from, to, &out, doc_len);
     let txn = Transaction::new(cs).with_selection(Selection::range(from, from + out.len()));
-    editor.apply(txn, edit, EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
     CommandResult::Handled
 }
 
@@ -154,7 +159,7 @@ pub(crate) fn transpose_chars(editor: &mut Editor, clock: &dyn Clock) -> Command
     let doc_len = editor.active().document.buffer.len();
     let (cs, edit) = super::build_range_replace(from, to, &out, doc_len);
     let txn = Transaction::new(cs).with_selection(Selection::single(from + out.len()));
-    editor.apply(txn, edit, EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
     CommandResult::Handled
 }
 
@@ -206,7 +211,7 @@ pub(crate) fn transpose_words(editor: &mut Editor, clock: &dyn Clock) -> Command
     let doc_len = editor.active().document.buffer.len();
     let (cs, edit) = super::build_range_replace(from, to, &out, doc_len);
     let txn = Transaction::new(cs).with_selection(Selection::single(from + out.len()));
-    editor.apply(txn, edit, EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
     CommandResult::Handled
 }
 
@@ -257,7 +262,7 @@ pub(crate) fn transpose_lines(editor: &mut Editor, clock: &dyn Clock) -> Command
     let doc_len = editor.active().document.buffer.len();
     let (cs, edit) = super::build_range_replace(from, to, &out, doc_len);
     let txn = Transaction::new(cs).with_selection(Selection::single(from + out.len()));
-    editor.apply(txn, edit, EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
     CommandResult::Handled
 }
 
@@ -289,7 +294,7 @@ pub(crate) fn join_line(editor: &mut Editor, clock: &dyn Clock) -> CommandResult
     let doc_len = editor.active().document.buffer.len();
     let (cs, edit) = super::build_range_replace(from, to, " ", doc_len);
     let txn = Transaction::new(cs).with_selection(Selection::single(from + 1));
-    editor.apply(txn, edit, EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
     CommandResult::Handled
 }
 
@@ -345,7 +350,7 @@ pub(crate) fn just_one_space(editor: &mut Editor, clock: &dyn Clock) -> CommandR
     let doc_len = editor.active().document.buffer.len();
     let (cs, edit) = super::build_range_replace(from, to, " ", doc_len);
     let txn = Transaction::new(cs).with_selection(Selection::single(from + 1));
-    editor.apply(txn, edit, EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
     CommandResult::Handled
 }
 
@@ -403,7 +408,7 @@ pub(crate) fn delete_blank_lines(editor: &mut Editor, clock: &dyn Clock) -> Comm
     let cs = ChangeSet::delete(from..to, doc_len);
     let edit = Edit { range: from..to, new_len: 0 };
     let txn = Transaction::new(cs).with_selection(Selection::single(from));
-    editor.apply(txn, edit, EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
     CommandResult::Handled
 }
 
@@ -433,7 +438,7 @@ pub(crate) fn delete_horizontal_space(editor: &mut Editor, clock: &dyn Clock) ->
     let cs = ChangeSet::delete(from..to, doc_len);
     let edit = Edit { range: from..to, new_len: 0 };
     let txn = Transaction::new(cs).with_selection(Selection::single(from));
-    editor.apply(txn, edit, EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
     CommandResult::Handled
 }
 
