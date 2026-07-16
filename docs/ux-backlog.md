@@ -896,8 +896,17 @@ coordinates) hit it. Reachable only via an absurd/hostile terminal `Resize` (no 
 so it is **not a data-loss or normal-use hazard** and was **not a merge blocker** for H21 — but it is the same
 arithmetic-soundness class H7 audited (widen the intermediate, or `saturating_mul`/`u32`). **Fix:** compute the
 `* 3 / 5` in `u32` (or use `saturating_*`) and clamp back to `u16`, in `chrome_geom.rs::palette_overlay_rect`;
-sweep the sibling `*_overlay_rect` helpers for the same pattern while there. Small, cold path — good candidate to
-batch into a future H7-style geom/panic sweep rather than its own effort. Anchor: `wordcartel/src/chrome_geom.rs`
+sweep the sibling `*_overlay_rect` helpers for the same pattern while there. Anchor: `wordcartel/src/chrome_geom.rs`
 (`palette_overlay_rect` and the other overlay-rect helpers it shares the `w * k / n` shape with).
 
-*(Captured 2026-07-16 from the H21 final Fable gate.)*
+**Scope when picked up — this IS an H7-style geom sweep, not a one-line fix.** Treat the `palette_overlay_rect`
+overflow as the *seed/exemplar*, not the whole item: when H23 is worked, audit every geometry helper (the
+`chrome_geom.rs` rect functions and any `w * k / n` / `area.width *`-shaped arithmetic in the layout/render path)
+for the same overflow/underflow class H7 covered. Apply H7's **blast-radius stance** ([[wordcartel-h7-blast-radius-stance]]):
+these are **render/geometry (parse-class) paths**, not mutation paths — so the guard is `debug_assert` + a **safe
+release clamp** (compute in `u32`/`saturating_*`, clamp back to `u16`), *not* a loud release panic and never a silent
+garbage wrap. Small and cold, so it batches cleanly as its own mini-sweep effort or as a rider on the next
+hardening pass — but the *scope is the sweep*, and the fix pattern (widen-compute-then-clamp under a debug_assert)
+is already decided here so it's ready to go.
+
+*(Captured 2026-07-16 from the H21 final Fable gate. H7-sweep framing recorded 2026-07-16.)*
