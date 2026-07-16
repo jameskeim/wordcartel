@@ -30,14 +30,6 @@ pub fn copy(buf: &TextBuffer, range: Range, reg: &mut Register) {
     reg.set(buf.slice(range.from()..range.to()));
 }
 
-/// Copy the text spanned by `range` from `buf` into `reg` (like [`copy`]), then
-/// return a [`ChangeSet`] that deletes that same span from a document of length
-/// `doc_len`. The caller applies the returned changeset to actually remove the text.
-pub fn cut(range: Range, doc_len: usize, reg: &mut Register, buf: &TextBuffer) -> ChangeSet {
-    reg.set(buf.slice(range.from()..range.to()));
-    ChangeSet::delete(range.from()..range.to(), doc_len)
-}
-
 /// Build a [`ChangeSet`] that inserts the register's contents at byte offset `at`
 /// in a document of length `doc_len`. Returns `None` if the register is empty
 /// (nothing to paste); the caller applies the returned changeset to insert the text.
@@ -60,17 +52,6 @@ mod tests {
         let mut b2 = buf.clone();
         cs.apply(&mut b2);
         assert_eq!(b2.to_string(), "hello worldhello");
-    }
-
-    #[test]
-    fn cut_removes_and_fills_register() {
-        let buf = TextBuffer::from_str("hello world");
-        let mut reg = Register::default();
-        let cs = cut(Range { anchor: 5, head: 11 }, buf.len(), &mut reg, &buf); // " world"
-        assert_eq!(reg.text.as_deref(), Some(" world"));
-        let mut b = buf.clone();
-        cs.apply(&mut b);
-        assert_eq!(b.to_string(), "hello");
     }
 
     #[test]
