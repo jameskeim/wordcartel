@@ -740,6 +740,18 @@ mod tests {
     }
 
     #[test]
+    fn word_wrap_codeblock_exact_fill_trailing_space_no_flush_row() {
+        // Locks the `!matches!(role, CodeBlock)` epilogue guard. Unlike the "abcd " case above (whose
+        // space wraps to col < vw, so `col >= vw` is false regardless of the guard), an EXACT-FILL
+        // CodeBlock line ending in a space has end col == vw — so only the guard stops the epilogue
+        // from firing. Without the guard this gains a phantom row (rows 2); asserting rows == 1 fails
+        // iff the guard is removed.
+        let (rows, map) = layout("abc ", BlockRole::CodeBlock, LineRender::Concealed, 4, false, 0);
+        assert_eq!(rows.len(), 1, "CodeBlock: no phantom flush row even at exact-fill (guard holds)");
+        assert_eq!(map.row_end_col, vec![4], "space sits at (0, 3); row ends at vw; no appended row");
+    }
+
+    #[test]
     fn word_wrap_whitespace_only_line_at_margin_breaks() {
         // Fork c (uniform): a whitespace-only line that reaches the margin gains a flush row too.
         let (rows, map) = layout("    ", BlockRole::Paragraph, LineRender::Concealed, 4, false, 0);
