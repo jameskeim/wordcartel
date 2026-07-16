@@ -8,8 +8,9 @@
 //!   3. Calls `editor.apply(txn, edit, kind, clock)`.
 //!
 //! The remaining steps — rebuild, ensure_visible, and the `desired_col` reset —
-//! live behind `commands::edit::settle_after_edit`, shared by the 8 buffer-edit
-//! primitives in that submodule; `run` delegates to them.
+//! are the edit epilogue, now owned by the core (`edit_apply::resettle`) and run
+//! from inside `editor.apply` for the active buffer; command primitives no longer
+//! hand-roll them.
 
 mod edit;
 // `pub(crate)` (not private like `mod edit;`) so `registry.rs` — outside `commands` —
