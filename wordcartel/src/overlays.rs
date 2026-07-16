@@ -64,6 +64,33 @@ impl OverlayId {
     }
 }
 
+/// Where an overlay paints. Every OverlayId answers this axis (the render-coverage test
+/// asserts it) WITHOUT forcing false uniformity: frame-owned surfaces carry a painter fn; the
+/// status-row trio carry a marker (their painting stays in render.rs, untouched).
+/// `Copy` so the render loop / coverage test can read `id.row().render` out of the
+/// `&'static OverlayRow` by value (both variants — a fn pointer and a unit — are Copy).
+#[derive(Clone, Copy)]
+pub(crate) enum RenderSite {
+    /// Painted by `render_overlays`. The paint SEQUENCE is `RENDER_ORDER` — a permutation
+    /// distinct from OVERLAYS/intercept order (§2.3.2).
+    Frame(fn(&mut ratatui::Frame, &mut Editor, &crate::render::ChromeStyles)),
+    /// Painted on the shared status row inside `render.rs` (search bar / minibuffer / prompt).
+    /// NOT relocated by H21 — the marker exists only so the axis is exhaustive (absent from
+    /// RENDER_ORDER, which covers only the Frame overlays).
+    StatusRow,
+}
+
+/// Frame-paint order — a permutation over the Frame-site overlays ONLY (the StatusRow trio
+/// are absent; they paint in render.rs). DISTINCT from OVERLAYS/intercept order. Grounded
+/// verbatim against `render_overlays::paint`'s block sequence: splash, palette, outline,
+/// theme_picker, cursor_picker, file_browser, menu DROPDOWN, diag. (The always-on menu BAR
+/// chrome is NOT in this walk — it is painted by a standalone step pinned at the `Menu` slot;
+/// only the dropdown is the `Menu` row's Frame painter — spec §2.3.1/§2.3.2.)
+pub(crate) static RENDER_ORDER: &[OverlayId] = &[
+    OverlayId::Splash, OverlayId::Palette, OverlayId::Outline, OverlayId::ThemePicker,
+    OverlayId::CursorPicker, OverlayId::FileBrowser, OverlayId::Menu, OverlayId::Diag,
+];
+
 /// One overlay's routing slots. Fields grow as H21 folds each axis (is_active → intercept →
 /// close → mouse → render); Task 1 introduces `is_active` only.
 pub(crate) struct OverlayRow {
@@ -86,32 +113,47 @@ pub(crate) struct OverlayRow {
     /// dispatch (Task 4): the active overlay's slot consumes the event (wheel/click/click-away),
     /// replacing the hand-written `if editor.X.is_some()` chain.
     pub(crate) mouse: fn(&mut Editor, crossterm::event::MouseEvent, ratatui::layout::Rect, &DispatchCtx),
+    /// Where this overlay paints (§2.3). `Frame(fn)` overlays paint into the frame via
+    /// `render_overlays`, walked in `RENDER_ORDER`; the status-row trio carry `StatusRow`
+    /// (painted in render.rs, untouched). Read by the render loop and the coverage test.
+    pub(crate) render: RenderSite,
 }
 
 /// The overlay table, in `ALL` order. Non-capturing closures coerce to the fn-pointer fields.
 pub(crate) static OVERLAYS: &[OverlayRow] = &[
     OverlayRow { name: "splash",        id: OverlayId::Splash,       is_active: |e| e.splash.is_some(),
-        intercept: crate::splash::intercept, close: |e| e.splash = None, mouse: crate::splash::mouse },
+        intercept: crate::splash::intercept, close: |e| e.splash = None, mouse: crate::splash::mouse,
+        render: RenderSite::Frame(crate::render_overlays::paint_splash) },
     OverlayRow { name: "menu",          id: OverlayId::Menu,         is_active: |e| e.menu.is_some(),
-        intercept: crate::menu::intercept, close: |e| e.menu = None, mouse: crate::mouse::mouse_menu },
+        intercept: crate::menu::intercept, close: |e| e.menu = None, mouse: crate::mouse::mouse_menu,
+        render: RenderSite::Frame(crate::render_overlays::paint_menu_dropdown) },
     OverlayRow { name: "palette",       id: OverlayId::Palette,      is_active: |e| e.palette.is_some(),
-        intercept: crate::palette::intercept, close: |e| e.palette = None, mouse: crate::mouse::mouse_palette },
+        intercept: crate::palette::intercept, close: |e| e.palette = None, mouse: crate::mouse::mouse_palette,
+        render: RenderSite::Frame(crate::render_overlays::paint_palette) },
     OverlayRow { name: "theme_picker",  id: OverlayId::ThemePicker,  is_active: |e| e.theme_picker.is_some(),
-        intercept: crate::theme_picker::intercept, close: |e| e.theme_picker = None, mouse: crate::mouse::mouse_theme_picker },
+        intercept: crate::theme_picker::intercept, close: |e| e.theme_picker = None, mouse: crate::mouse::mouse_theme_picker,
+        render: RenderSite::Frame(crate::render_overlays::paint_theme_picker) },
     OverlayRow { name: "cursor_picker", id: OverlayId::CursorPicker, is_active: |e| e.cursor_picker.is_some(),
-        intercept: crate::cursor_picker::intercept, close: |e| e.cursor_picker = None, mouse: crate::mouse::mouse_cursor_picker },
+        intercept: crate::cursor_picker::intercept, close: |e| e.cursor_picker = None, mouse: crate::mouse::mouse_cursor_picker,
+        render: RenderSite::Frame(crate::render_overlays::paint_cursor_picker) },
     OverlayRow { name: "file_browser",  id: OverlayId::FileBrowser,  is_active: |e| e.file_browser.is_some(),
-        intercept: crate::file_browser::intercept, close: |e| e.file_browser = None, mouse: crate::mouse::mouse_file_browser },
+        intercept: crate::file_browser::intercept, close: |e| e.file_browser = None, mouse: crate::mouse::mouse_file_browser,
+        render: RenderSite::Frame(crate::render_overlays::paint_file_browser) },
     OverlayRow { name: "prompt",        id: OverlayId::Prompt,       is_active: |e| e.prompt.is_some(),
-        intercept: crate::prompts::intercept, close: |e| e.prompt = None, mouse: crate::mouse::mouse_prompt },
+        intercept: crate::prompts::intercept, close: |e| e.prompt = None, mouse: crate::mouse::mouse_prompt,
+        render: RenderSite::StatusRow },
     OverlayRow { name: "minibuffer",    id: OverlayId::Minibuffer,   is_active: |e| e.minibuffer.is_some(),
-        intercept: crate::minibuffer::intercept, close: |e| e.minibuffer = None, mouse: crate::mouse::mouse_minibuffer },
+        intercept: crate::minibuffer::intercept, close: |e| e.minibuffer = None, mouse: crate::mouse::mouse_minibuffer,
+        render: RenderSite::StatusRow },
     OverlayRow { name: "search",        id: OverlayId::Search,       is_active: |e| e.search.is_some(),
-        intercept: crate::search_ui::intercept, close: |e| e.search = None, mouse: crate::mouse::mouse_search },
+        intercept: crate::search_ui::intercept, close: |e| e.search = None, mouse: crate::mouse::mouse_search,
+        render: RenderSite::StatusRow },
     OverlayRow { name: "diag",          id: OverlayId::Diag,         is_active: |e| e.diag.is_some(),
-        intercept: crate::diag_overlay::intercept, close: |e| e.diag = None, mouse: crate::mouse::mouse_diag },
+        intercept: crate::diag_overlay::intercept, close: |e| e.diag = None, mouse: crate::mouse::mouse_diag,
+        render: RenderSite::Frame(crate::render_overlays::paint_diag) },
     OverlayRow { name: "outline",       id: OverlayId::Outline,      is_active: |e| e.outline.is_some(),
-        intercept: crate::outline_overlay::intercept, close: |e| e.outline = None, mouse: crate::mouse::mouse_outline },
+        intercept: crate::outline_overlay::intercept, close: |e| e.outline = None, mouse: crate::mouse::mouse_outline,
+        render: RenderSite::Frame(crate::render_overlays::paint_outline) },
 ];
 
 /// True iff any input overlay owns the screen — the single source for both
@@ -151,6 +193,27 @@ mod tests {
         let n = names.len();
         names.dedup();
         assert_eq!(names.len(), n, "overlay names are unique");
+    }
+
+    /// Render-axis coverage: every OverlayId has a RenderSite (exhaustive by `row()`), and
+    /// RENDER_ORDER contains EXACTLY the ids whose RenderSite is Frame — Splash first, no
+    /// StatusRow overlay in the paint walk, no Frame overlay missing from it.
+    #[test]
+    fn render_order_is_exactly_the_frame_overlays() {
+        assert_eq!(RENDER_ORDER[0], OverlayId::Splash, "paint early-return keys off Splash first");
+        let frame_ids: Vec<OverlayId> = OverlayId::ALL.iter().copied()
+            .filter(|id| matches!(id.row().render, RenderSite::Frame(_)))
+            .collect();
+        let mut walk = RENDER_ORDER.to_vec();
+        let mut frame_sorted = frame_ids.clone();
+        walk.sort_by_key(|id| format!("{id:?}"));
+        frame_sorted.sort_by_key(|id| format!("{id:?}"));
+        assert_eq!(walk, frame_sorted, "RENDER_ORDER == the set of Frame-site overlays");
+        // The StatusRow trio must NOT appear in the paint walk.
+        for id in [OverlayId::Prompt, OverlayId::Minibuffer, OverlayId::Search] {
+            assert!(matches!(id.row().render, RenderSite::StatusRow), "{id:?} is StatusRow");
+            assert!(!RENDER_ORDER.contains(&id), "{id:?} not in RENDER_ORDER");
+        }
     }
 
     /// `any_active` is true for each overlay individually (subsumes render.rs's B11 census
