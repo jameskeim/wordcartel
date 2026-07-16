@@ -9,7 +9,10 @@ use wordcartel_core::block_tree::Edit;
 use wordcartel_core::history::{Clock, EditKind, Transaction};
 
 /// Outcome of a funnelled edit — callers gate their status acks on this (INV-GUARD, F4).
+/// `#[must_use]` (H24): makes INV-GUARD ack-gating self-enforcing at every FUTURE call site —
+/// a caller that forgets to gate its ack on `Applied` gets a compiler warning, not a silent bug.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[must_use]
 pub enum EditOutcome {
     /// The edit committed.
     Applied,

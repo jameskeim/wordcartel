@@ -4,6 +4,13 @@
 //! (`edit_apply::resettle`) settles the active buffer — no manual re-settle
 //! call needed here (H22 Task 4; `settle_after_edit` below is retained only
 //! for `prose_ops::swap`'s two-rebuild fold-correction path).
+//!
+//! H24: every `editor.apply(...)` below drops the returned `EditOutcome` on purpose. All target
+//! the ACTIVE buffer, so `BufferGone` cannot occur. A `RejectedReadOnly` already fired the loud
+//! Sticky Warning inside the funnel (`edit_apply::apply_edit` → `Editor::reject_read_only`); this
+//! module's own unconditional success `set_status` calls are Q1-arbitrated behind that Sticky
+//! Warning (`status::resolve_slot`), so no false ack is ever shown — see
+//! `commands.rs::read_only_buffer_rejects_keyboard_edits_with_a_message`.
 
 use crate::derive;
 use crate::nav;
@@ -37,7 +44,7 @@ pub(super) fn insert_char(editor: &mut Editor, c: char, clock: &dyn Clock) -> Co
         let cs = replace_changeset(from, to, &text, doc_len);
         let edit = Edit { range: from..to, new_len: text.len() };
         let txn = Transaction::new(cs).with_selection(Selection::single(from + text.len()));
-        editor.apply(txn, edit, EditKind::Other, clock);
+        let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
         return CommandResult::Handled;
     }
     // Collapsed selection: normal insert-at-caret path.
@@ -48,7 +55,7 @@ pub(super) fn insert_char(editor: &mut Editor, c: char, clock: &dyn Clock) -> Co
     let new_len = s.len(); // == c.len_utf8()
     let edit = Edit { range: at..at, new_len };
     let txn = Transaction::new(cs).with_selection(Selection::single(at + new_len));
-    editor.apply(txn, edit, EditKind::Type, clock);
+    let _ = editor.apply(txn, edit, EditKind::Type, clock); // H24: see module doc
     CommandResult::Handled
 }
 
@@ -64,7 +71,7 @@ pub(super) fn insert_newline(editor: &mut Editor, clock: &dyn Clock) -> CommandR
         let cs = replace_changeset(from, to, text, doc_len);
         let edit = Edit { range: from..to, new_len: text.len() };
         let txn = Transaction::new(cs).with_selection(Selection::single(from + text.len()));
-        editor.apply(txn, edit, EditKind::Other, clock);
+        let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
         return CommandResult::Handled;
     }
     // Collapsed selection: normal insert-newline path.
@@ -77,7 +84,7 @@ pub(super) fn insert_newline(editor: &mut Editor, clock: &dyn Clock) -> CommandR
     // EditKind::Other breaks coalescing at each newline so that undo
     // chunks per logical line rather than collapsing multi-line insertions.
     let txn = Transaction::new(cs).with_selection(Selection::single(at + new_len));
-    editor.apply(txn, edit, EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
     CommandResult::Handled
 }
 
@@ -92,7 +99,7 @@ pub(super) fn backspace(editor: &mut Editor, clock: &dyn Clock) -> CommandResult
         let cs = ChangeSet::delete(from..to, doc_len);
         let edit = Edit { range: from..to, new_len: 0 };
         let txn = Transaction::new(cs).with_selection(Selection::single(from));
-        editor.apply(txn, edit, EditKind::Other, clock);
+        let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
         return CommandResult::Handled;
     }
     // Collapsed selection: delete one grapheme left of the caret.
@@ -109,7 +116,7 @@ pub(super) fn backspace(editor: &mut Editor, clock: &dyn Clock) -> CommandResult
     let cs = ChangeSet::delete(prev..head, doc_len);
     let edit = Edit { range: prev..head, new_len: 0 };
     let txn = Transaction::new(cs).with_selection(Selection::single(prev));
-    editor.apply(txn, edit, EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
     CommandResult::Handled
 }
 
@@ -124,7 +131,7 @@ pub(super) fn delete_forward(editor: &mut Editor, clock: &dyn Clock) -> CommandR
         let cs = ChangeSet::delete(from..to, doc_len);
         let edit = Edit { range: from..to, new_len: 0 };
         let txn = Transaction::new(cs).with_selection(Selection::single(from));
-        editor.apply(txn, edit, EditKind::Other, clock);
+        let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
         return CommandResult::Handled;
     }
     // Collapsed selection: delete one grapheme forward.
@@ -144,7 +151,7 @@ pub(super) fn delete_forward(editor: &mut Editor, clock: &dyn Clock) -> CommandR
     let edit = Edit { range: head..next, new_len: 0 };
     // Caret stays at `head` after a forward delete.
     let txn = Transaction::new(cs).with_selection(Selection::single(head));
-    editor.apply(txn, edit, EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
     CommandResult::Handled
 }
 
@@ -163,7 +170,7 @@ pub(super) fn cut(editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     let cs = register::cut(r, doc_len, &mut editor.register, &buf_snap);
     let edit = Edit { range: r.from()..r.to(), new_len: 0 };
     let txn = Transaction::new(cs).with_selection(Selection::single(r.from()));
-    editor.apply(txn, edit, EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
     if let Some(text) = editor.register.get().map(str::to_owned) {
         editor.clipboard_sync_request = Some(text);
     }
@@ -182,7 +189,7 @@ pub(super) fn delete_word(editor: &mut Editor, back: bool, clock: &dyn Clock) ->
     let edit = Edit { range: from..to, new_len: 0 };
     let txn = Transaction::new(cs).with_selection(Selection::single(from));
     // EditKind::Other — matches existing delete commands, avoids coalescing with typed chars.
-    editor.apply(txn, edit, EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
     CommandResult::Handled
 }
 
@@ -217,7 +224,7 @@ pub(super) fn delete_line(editor: &mut Editor, clock: &dyn Clock) -> CommandResu
     let cs = ChangeSet::delete(from..to, len);
     let edit = Edit { range: from..to, new_len: 0 };
     let txn = Transaction::new(cs).with_selection(Selection::single(from));
-    editor.apply(txn, edit, EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
     CommandResult::Handled
 }
 
@@ -242,7 +249,7 @@ pub(super) fn delete_to_line_end(editor: &mut Editor, clock: &dyn Clock) -> Comm
     let cs = ChangeSet::delete(head..to, len);
     let edit = Edit { range: head..to, new_len: 0 };
     let txn = Transaction::new(cs).with_selection(Selection::single(head));
-    editor.apply(txn, edit, EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
     CommandResult::Handled
 }
 

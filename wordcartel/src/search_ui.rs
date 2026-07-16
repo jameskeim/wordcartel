@@ -1,5 +1,13 @@
 //! Search-and-replace + quick-fix (diagnostics) overlay actions. Extracted verbatim
 //! from app.rs (Effort H1).
+//!
+//! H24: `editor.apply(...)` below drops the returned `EditOutcome` on purpose. All target the
+//! ACTIVE buffer, so `BufferGone` cannot occur. `search_replace_all`/`search_step_apply`/
+//! `search_step_rest` explicitly entry-guard `read_only` first (A17 T8), so by the time they
+//! reach `apply` a `RejectedReadOnly` can only race a concurrent read-only toggle — the funnel's
+//! own loud Sticky Warning still covers that. `diag_apply_selected` has no entry guard, but a
+//! `RejectedReadOnly` there sets no unconditional success status afterward (only view-state
+//! cleanup), so no false ack is possible either way.
 
 use crate::{derive, editor::Editor};
 use crate::app::Msg;
@@ -54,7 +62,7 @@ pub(crate) fn search_replace_all(editor: &mut Editor, clock: &dyn wordcartel_cor
     let new_origin = wordcartel_core::change::map_pos(origin, &cs);
     let txn = wordcartel_core::history::Transaction::new(cs)
         .with_selection(wordcartel_core::selection::Selection::single(new_origin));
-    editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock); // H24: see module doc
     if let Some(s) = editor.search.as_mut() { s.origin = new_origin; }
     editor.set_status(crate::status::StatusKind::Info, format!("Replaced {n} occurrences"));
     editor.search = None; // close after replace-all
@@ -74,7 +82,7 @@ pub(crate) fn search_step_apply(editor: &mut Editor, clock: &dyn wordcartel_core
     let caret = cur.start + text.len();
     let txn = wordcartel_core::history::Transaction::new(cs)
         .with_selection(wordcartel_core::selection::Selection::single(caret));
-    editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock); // H24: see module doc
     // Re-find the next match on the MUTATED rope, and remap origin.
     let (rope, version) = { let d = &editor.active().document; (d.buffer.snapshot(), d.version) };
     if let Some(s) = editor.search.as_mut() {
@@ -109,7 +117,7 @@ pub(crate) fn search_step_rest(editor: &mut Editor, clock: &dyn wordcartel_core:
     let (cs, edit) = crate::commands::build_multi_replace(&edits, doc_len);
     let txn = wordcartel_core::history::Transaction::new(cs)
         .with_selection(wordcartel_core::selection::Selection::single(edits[0].0));
-    editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock); // H24: see module doc
     editor.search = None;
 }
 
@@ -202,7 +210,7 @@ pub(crate) fn diag_apply_selected(editor: &mut Editor, clock: &dyn wordcartel_co
         };
         let txn = wordcartel_core::history::Transaction::new(cs)
             .with_selection(wordcartel_core::selection::Selection::single(new_cursor));
-        editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock);
+        let _ = editor.apply(txn, edit, wordcartel_core::history::EditKind::Other, clock); // H24: see module doc
         crate::registry::unfold_ancestors_of(editor, new_cursor);
         crate::edit_apply::resettle(editor); // reflect the unfold on the already-reparsed tree
         editor.diag = None;

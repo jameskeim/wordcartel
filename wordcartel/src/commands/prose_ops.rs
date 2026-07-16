@@ -1,6 +1,12 @@
 //! S4 prose-surgery commands — a leaf module on the A14 template (no `Command` variant, no
 //! `commands::run` arm; `registry.rs` calls these directly). Edits flow through `editor.apply`
 //! (`ChangeSet`) as one undo unit. SEE==SELECT + decline route through `super::prose_sentence_at`.
+//!
+//! H24: every `editor.apply(...)` below drops the returned `EditOutcome` on purpose — see the
+//! identical rationale in `commands/edit.rs`'s module doc (active-buffer only, so `BufferGone`
+//! cannot occur; `RejectedReadOnly` already fired the loud Sticky Warning inside the funnel and
+//! Q1 arbitration keeps any later success status from showing over it). `swap`'s discard mirrors
+//! `blocks_marked::block_move`'s: it still consumes `marked_block` and re-settles regardless.
 
 use crate::editor::Editor;
 use crate::nav;
@@ -88,7 +94,7 @@ fn move_sentence(editor: &mut Editor, dir: Dir, clock: &dyn Clock) -> CommandRes
     let (cs, edit) = super::build_range_replace(from, to, &out, doc_len);
     // Head-at-start on the moved sentence (C-9): Selection::range(anchor=end, head=start).
     let txn = Transaction::new(cs).with_selection(Selection::range(moved_to, moved_from));
-    editor.apply(txn, edit, EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
     editor.set_status(crate::status::StatusKind::Info, match dir { Dir::Up => "moved sentence up", Dir::Down => "moved sentence down" });
     CommandResult::Handled
 }
@@ -150,7 +156,7 @@ pub(crate) fn swap(editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     } else { None };
     let had_correction = corrected.is_some();
     let txn = Transaction::new(cs).with_selection(Selection::range(moved_to, moved_from)); // moves cs
-    editor.apply(txn, edit, EditKind::Other, clock); // core: mutate + rebuild #1 + ensure_visible
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // core: mutate + rebuild #1 + ensure_visible (H24: see module doc)
     editor.active_mut().marked_block = None;
     if let Some(c) = corrected {
         editor.active_mut().folds.replace_folded(c); // override the core's plain remap with the corrected set
@@ -192,7 +198,7 @@ pub(crate) fn break_paragraph_here(editor: &mut Editor, clock: &dyn Clock) -> Co
     let new_sf = (sf as isize + delta) as usize;
     let new_st = (st as isize + delta) as usize;
     let txn = Transaction::new(cs).with_selection(Selection::range(new_st, new_sf));
-    editor.apply(txn, edit, EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
     editor.set_status(crate::status::StatusKind::Info, "split paragraph");
     CommandResult::Handled
 }
@@ -244,7 +250,7 @@ pub(crate) fn merge_paragraph_forward(editor: &mut Editor, clock: &dyn Clock) ->
         first.map(|(s, e2)| e2 - s).unwrap_or(0)
     };
     let txn = Transaction::new(cs).with_selection(Selection::range(new_start + sent_len, new_start));
-    editor.apply(txn, edit, EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
     editor.set_status(crate::status::StatusKind::Info, "merged paragraph");
     CommandResult::Handled
 }
@@ -286,7 +292,7 @@ pub(crate) fn split_sentence_at_caret(editor: &mut Editor, clock: &dyn Clock) ->
     let new_second_from = match word { Some((off, _)) => h + off + ins.len(), None => h + ins.len() };
     let new_st = (st as isize + ins.len() as isize + case_delta) as usize;
     let txn = Transaction::new(cs).with_selection(Selection::range(new_st, new_second_from));
-    editor.apply(txn, edit, EditKind::Other, clock);
+    let _ = editor.apply(txn, edit, EditKind::Other, clock); // H24: see module doc
     editor.set_status(crate::status::StatusKind::Info, "split sentence");
     CommandResult::Handled
 }

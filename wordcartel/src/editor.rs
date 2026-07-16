@@ -265,7 +265,11 @@ impl Buffer {
 
     /// Single mutation channel for THIS buffer's document (spec §10.1). `pub(crate)` — the
     /// compiler-guarded no-bypass seam (INV-SEAM): callable only from `edit_apply::apply_edit`
-    /// within this crate; out-of-crate (Effort-P plugin) callers cannot reach it at all.
+    /// within this crate; out-of-crate (Effort-P plugin) callers cannot reach it at all. That
+    /// compiler guard is exact; the IN-crate convention (only `edit_apply::apply_edit` calls
+    /// this) is additionally backstopped by a heuristic source scan (`tests/edit_seam.rs`), NOT
+    /// the compiler — a `let`-bound `Buffer` local reaching `.apply(...)` elsewhere in this crate
+    /// would compile and would evade that scan (H24: documented residual, not a known bypass).
     pub(crate) fn apply(&mut self, txn: Transaction, edit: wordcartel_core::block_tree::Edit, kind: EditKind, clock: &dyn Clock) {
         if self.read_only { return; }                    // A17 T8 category (a): content is immutable.
         let cs = txn.changes.clone();                    // capture BEFORE commit consumes txn
@@ -1550,7 +1554,7 @@ mod tests {
         // insert "X" at offset 1 -> "aXb\n"
         let cs = ChangeSet::insert(1, "X", e.active().document.buffer.len());
         let txn = Transaction::new(cs).with_selection(Selection::single(2));
-        e.apply(txn, Edit { range: 1..1, new_len: 1 }, EditKind::Type, &clk);
+        let _ = e.apply(txn, Edit { range: 1..1, new_len: 1 }, EditKind::Type, &clk); // H24: asserted via post-state below
         assert_eq!(e.active().document.buffer.to_string(), "aXb\n");
         assert_eq!(e.active().document.selection.primary().head, 2);
         assert_eq!(e.active().document.version, 1);
@@ -1569,7 +1573,8 @@ mod tests {
         let mut e = Editor::new_from_text("ab\n", None, (80, 24));
         let clk = TestClock(std::cell::Cell::new(0));
         let cs = ChangeSet::insert(1, "X", e.active().document.buffer.len());
-        e.apply(Transaction::new(cs).with_selection(Selection::single(2)), Edit { range: 1..1, new_len: 1 }, EditKind::Type, &clk);
+        // H24: outcome dropped — asserted via post-state below.
+        let _ = e.apply(Transaction::new(cs).with_selection(Selection::single(2)), Edit { range: 1..1, new_len: 1 }, EditKind::Type, &clk);
         let changed = e.undo();
         assert!(changed, "undo of a real edit must report change");
         assert_eq!(e.active().document.buffer.to_string(), "ab\n");
@@ -1627,7 +1632,8 @@ mod tests {
         assert!(!e.active().document.dirty(), "fresh buffer (saved_version=Some(0)) is clean");
         let clk = TestClock(std::cell::Cell::new(0));
         let cs = wordcartel_core::change::ChangeSet::insert(1, "X", e.active().document.buffer.len());
-        e.apply(
+        // H24: outcome dropped — asserted via post-state below.
+        let _ = e.apply(
             Transaction::new(cs).with_selection(Selection::single(2)),
             wordcartel_core::block_tree::Edit { range: 1..1, new_len: 1 },
             EditKind::Type, &clk,
@@ -1671,7 +1677,7 @@ mod tests {
         e.active_mut().marks.insert('a', 4); // mark at 'e'
         // insert "XY" at offset 1 → mark should shift 4 → 6
         let cs = ChangeSet::insert(1, "XY", e.active().document.buffer.len());
-        e.apply(Transaction::new(cs), Edit { range: 1..1, new_len: 2 }, EditKind::Type, &clk);
+        let _ = e.apply(Transaction::new(cs), Edit { range: 1..1, new_len: 2 }, EditKind::Type, &clk); // H24: asserted below
         assert_eq!(e.active().marks.get(&'a'), Some(&6));
     }
 
@@ -1775,7 +1781,8 @@ mod tests {
         let owned: Vec<(usize, usize, String)> = edits.iter().map(|(a,b,s)| (*a,*b,s.to_string())).collect();
         let (cs, edit) = crate::commands::build_multi_replace(&owned, doc_len);
         let txn = wordcartel_core::history::Transaction::new(cs);
-        e.apply(txn, edit, wordcartel_core::history::EditKind::Other, &TestClock(std::cell::Cell::new(0)));
+        // H24: outcome dropped — this helper's callers assert on post-state, not the outcome.
+        let _ = e.apply(txn, edit, wordcartel_core::history::EditKind::Other, &TestClock(std::cell::Cell::new(0)));
     }
 
     #[test]
@@ -1900,7 +1907,7 @@ mod tests {
         let clk = TestClock(std::cell::Cell::new(0));
         let mut e = Editor::new_from_text("hello\n", None, (80, 24));
         let cs = ChangeSet::insert(0, "x", e.active().document.buffer.len());
-        e.apply(Transaction::new(cs), Edit { range: 0..0, new_len: 1 }, EditKind::Type, &clk);
+        let _ = e.apply(Transaction::new(cs), Edit { range: 0..0, new_len: 1 }, EditKind::Type, &clk); // H24: asserted below
         assert_ne!(
             e.status_text(),
             UNDO_EVICTED_HINT,
