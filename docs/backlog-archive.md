@@ -720,6 +720,21 @@ arm that REUSES the quit machinery's per-buffer save-on-close path (the same
 `dispatch_save_then` + `pending_after_save` flow used by `ContinueQuitDrain`); `close_buffer`
 raises it when the active buffer is dirty.
 
+### C6 — Cut on a read-only buffer syncs the clipboard though nothing is deleted
+<!-- item: C6 -->
+
+**SHIPPED 2026-07-16** (merge 4003b6c): `commands/edit.rs::cut()` used to write the register + request the
+clipboard sync BEFORE `editor.apply(...)` (via the old `register::cut`, which coupled `reg.set` with building the
+delete changeset), so a Cut on a read-only buffer synced the clipboard even though the core rejected the delete.
+Fixed via **option A (refuse fully, human decision):** the ordering policy moved into the shell — capture the text +
+build `ChangeSet::delete` without touching the register, apply, and set the register + `clipboard_sync_request` ONLY
+on `EditOutcome::Applied`. A read-only Cut is now a clean no-op with the loud "buffer is read-only" reject; nothing
+touches the register/clipboard. The now-dead `register::cut` core helper was removed (`register::copy`/`paste`
+untouched; `wordcartel-core` stays pure). Read-only-Cut failing test (mutation-verified red→green) + editable-Cut
+regression test (register + delete + sync all asserted). **Surfaced by the H24 `#[must_use]` audit** — the forcing
+function that made this pre-existing nit visible (reachable today only on the status-view buffer, the sole `read_only`
+buffer). Proportionate pipeline (branch → implement → one review → gates); reviewed clean; gates green.
+
 ---
 
 ## Theme D — config & persistence

@@ -911,21 +911,3 @@ is already decided here so it's ready to go.
 
 *(Captured 2026-07-16 from the H21 final Fable gate. H7-sweep framing recorded 2026-07-16.)*
 
-### C6 — cut() writes register/clipboard BEFORE apply — a read-only Cut still syncs the clipboard though nothing is deleted
-<!-- item: C6 -->
-
-**Surfaced by the H24 `#[must_use]` audit (2026-07-16), Minor, PRE-EXISTING.** `commands/edit.rs::cut()` calls
-`register::cut()` (`wordcartel-core/src/register.rs:36`) — which unconditionally `reg.set(...)`s the selection into
-the register/clipboard — **before** `editor.apply(...)`. `Command::Cut` (Ctrl+X) has **no read-only entry guard**
-(unlike search/filter/transform), so cutting a selection in a read-only buffer syncs the clipboard even though the
-core rejects the delete and nothing is removed. **Not data-loss** (the text is unchanged and was already visible) and
-**not a false-ack** (the displayed status is the correct "buffer is read-only" Sticky Warning — `resolve_slot` gives
-it the slot), but it is a real inconsistency: the clipboard changes on an operation the UI reports as refused.
-**Reachable today only on the status-view buffer** (the sole buffer that sets `read_only`). **Fix:** reorder so the
-register write happens only on an `EditOutcome::Applied` return — but this touches the established Cut/clipboard-sync
-ordering (and copy shares `register::` paths), so it wants its own small triage + review rather than a blind reorder.
-The H24 reviewer explicitly recommended filing this separately rather than folding it into H24. Anchors:
-`commands/edit.rs::cut`, `register::cut` (`register.rs:36`), the Ctrl+X dispatch (`input.rs`), `EditOutcome`
-(`edit_apply.rs`).
-
-*(Captured 2026-07-16 from the H24 must_use audit.)*
