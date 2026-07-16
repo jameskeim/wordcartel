@@ -150,11 +150,10 @@ pub(crate) fn swap(editor: &mut Editor, clock: &dyn Clock) -> CommandResult {
     } else { None };
     let had_correction = corrected.is_some();
     let txn = Transaction::new(cs).with_selection(Selection::range(moved_to, moved_from)); // moves cs
-    editor.apply(txn, edit, EditKind::Other, clock); // Buffer::apply only — NO rebuild
+    editor.apply(txn, edit, EditKind::Other, clock); // core: mutate + rebuild #1 + ensure_visible
     editor.active_mut().marked_block = None;
     if let Some(c) = corrected {
-        crate::derive::rebuild(editor);              // REBUILD #1 — settle the tree (heading_starts valid)
-        editor.active_mut().folds.replace_folded(c); // override apply's remap with the corrected set
+        editor.active_mut().folds.replace_folded(c); // override the core's plain remap with the corrected set
     }
     let r = super::edit::settle_after_edit(editor);  // REBUILD #2 — relayout + reconcile the corrected folds
     if had_correction {
@@ -535,6 +534,38 @@ mod tests {
         assert!(folded.contains(&a_new), "A stays folded at its NEW byte {a_new}: {folded:?}");
         assert!(folded.contains(&0), "B stays folded at its NEW byte 0 (B's content moved to the R1 slot): {folded:?}");
         assert_eq!(folded.len(), 2, "exactly two distinct folds — no self-clobber, no double, no drop");
+    }
+
+    /// H22 Task 5 regression tripwire: a folded section swapped with the marked block AS the R1 slot
+    /// (marked_block = A, selection = B — the `r1_is_sel = false` path, the mirror of
+    /// `swap_keeps_a_folded_section_folded_at_its_new_byte`'s `r1_is_sel = true`) keeps its fold at the
+    /// destination byte through the core-backed `editor.apply`, and the caret is never left on a
+    /// hidden line. Must stay green before AND after the Surface C migration (behavior-preserving,
+    /// §3.6) — grounded on the `corrected_after_move` fixtures in `fold.rs:536-564`.
+    #[test]
+    fn swap_preserves_a_folded_region_through_the_core() {
+        let doc = "## A\n\nbody a.\n\n## B\n\nbody b.\n";
+        let mut e = Editor::new_from_text(doc, None, (60, 20));
+        crate::derive::rebuild(&mut e);
+        let a = doc.find("## A").unwrap(); // 0
+        let b = doc.find("## B").unwrap();
+        let len = doc.len();
+        e.active_mut().folds.toggle(a); // fold section A
+        let (a_from, a_to) = crate::commands::section_range_at(&e, a + 1).unwrap();
+        let (b_from, b_to) = crate::commands::section_range_at(&e, b + 1).unwrap();
+        e.active_mut().marked_block = Some(crate::editor::MarkedBlock { start: a_from, end: a_to, hidden: false });
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::range(b_from, b_to);
+        assert_eq!(swap(&mut e, &TestClock(0)), CommandResult::Handled);
+        let a_new = len - b; // A relocates to the R2 slot (same geometry as the mirrored r1_is_sel=true pin)
+        let folded = e.active().folds.folded();
+        assert!(folded.contains(&a_new), "A's heading is folded at its NEW byte {a_new}: {folded:?}");
+        assert!(!folded.contains(&0), "the fold did NOT stay on B's heading (now at 0)");
+        assert_eq!(folded.len(), 1, "exactly one fold — no double, no drop");
+        let fold_view = e.active_fold_view();
+        let head = e.active().document.selection.primary().head;
+        let caret_line = e.active().document.buffer.byte_to_line(head);
+        assert!(!fold_view.is_hidden(caret_line),
+            "caret line {caret_line} must be visible after swapping a folded section");
     }
 
     // ------------------------------------------------------------------

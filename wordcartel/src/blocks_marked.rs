@@ -54,10 +54,10 @@ pub fn block_move(editor: &mut Editor, clock: &dyn Clock) {
     let corrected = if !editor.active().folds.is_empty() {
         Some(crate::fold::corrected_after_move(&editor.active().folds, &[(b.start, b.end, dest)], &cs))
     } else { None };
-    apply_edit(editor, cs, edit, new_caret, clock); // apply + rebuild #1 (settle)
+    apply_edit(editor, cs, edit, new_caret, clock); // core: mutate + rebuild #1 + ensure_visible
     if let Some(c) = corrected {
         editor.active_mut().folds.replace_folded(c);
-        crate::derive::rebuild(editor);             // rebuild #2 (relayout + reconcile)
+        crate::edit_apply::resettle(editor);        // rebuild #2 — relayout + reconcile corrected folds
         // The fold correction can re-fold the destination section around `new_caret`, leaving the
         // head on a hidden line — snap it out (the shipped-fold-command guard) so typing never
         // edits invisible text.
@@ -299,6 +299,35 @@ mod tests {
         let caret_line = e.active().document.buffer.byte_to_line(head);
         assert!(!fold_view.is_hidden(caret_line),
             "caret line {caret_line} must be visible after moving a folded section (snapped out of the fold)");
+    }
+
+    /// H22 Task 5 regression tripwire: a folded heading section moved PAST the caret (the `caret >=
+    /// b.end` branch — the mirror of the `caret < b.start` branch the two tests above exercise) keeps
+    /// its fold at the destination byte through the core-backed `apply_edit`, and the caret is never
+    /// left on a hidden line. Must stay green before AND after the Surface C migration (behavior-
+    /// preserving, §3.6) — grounded on the `corrected_after_move` fixtures in `fold.rs:536-564`.
+    #[test]
+    fn block_move_preserves_a_folded_region_through_the_core() {
+        let doc = "## A\n\nbody a.\n\n## B\n\nbody b.\n";
+        let mut e = Editor::new_from_text(doc, None, (60, 20));
+        crate::derive::rebuild(&mut e);
+        let a = doc.find("## A").unwrap(); // 0
+        let len = doc.len();
+        e.active_mut().folds.toggle(a); // fold section A
+        let (b_from, b_to) = crate::commands::section_range_at(&e, a + 1).unwrap(); // A's own range
+        e.active_mut().marked_block = Some(MarkedBlock { start: b_from, end: b_to, hidden: false });
+        e.active_mut().document.selection = wordcartel_core::selection::Selection::single(len); // caret at end, past B
+        crate::blocks_marked::block_move(&mut e, &TestClock(0));
+        let dest = len - (b_to - b_from); // A relocates to just before the (now-shifted) caret
+        let folded = e.active().folds.folded();
+        assert!(folded.contains(&dest), "A's heading is folded at its NEW byte {dest}: {folded:?}");
+        assert!(!folded.contains(&a), "the fold did NOT stay at the vacated original byte {a}");
+        assert_eq!(folded.len(), 1, "exactly one fold — no double, no drop");
+        let fold_view = e.active_fold_view();
+        let head = e.active().document.selection.primary().head;
+        let caret_line = e.active().document.buffer.byte_to_line(head);
+        assert!(!fold_view.is_hidden(caret_line),
+            "caret line {caret_line} must be visible after moving a folded section past the caret");
     }
 
     #[test]
