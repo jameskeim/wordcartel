@@ -16,8 +16,7 @@ use wordcartel_core::history::Clock;
 /// Consumes every message once admitted (Key + the five background-result arms + `_`) —
 /// never returns Pass (§8.1-J).
 pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor,
-    ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
-    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) -> crate::app::Handled {
+    ctx: &crate::overlays::DispatchCtx) -> crate::app::Handled {
     if editor.prompt.is_none() { return crate::app::Handled::Pass(msg); }
     match msg {
         Msg::Input(Event::Key(key)) if key.kind == crossterm::event::KeyEventKind::Press => {
@@ -38,20 +37,20 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 }
             } else if let crossterm::event::KeyCode::Char(ch) = key.code {
                 if let Some(action) = editor.prompt.as_ref().unwrap().action_for(ch) {
-                    resolve_prompt(action, editor, ex, clock, msg_tx);
+                    resolve_prompt(action, editor, ctx.ex, ctx.clock, ctx.msg_tx);
                 }
             }
         }
         // Merge a directly-delivered background result even under a modal.
-        Msg::JobDone(o) => crate::jobs_apply::apply_job_outcome(o, editor, ex, clock, msg_tx),
+        Msg::JobDone(o) => crate::jobs_apply::apply_job_outcome(o, editor, ctx.ex, ctx.clock, ctx.msg_tx),
         Msg::FilterDone { buffer_id, version, range, cursor, disposition, outcome } => {
-            crate::jobs_apply::apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, clock);
+            crate::jobs_apply::apply_filter_done(editor, buffer_id, version, range, cursor, disposition, outcome, ctx.clock);
         }
         Msg::ExportDone { target, result, overwrite_confirmed, .. } => {
             crate::jobs_apply::apply_export_done(editor, target, result, overwrite_confirmed);
         }
         Msg::TransformDone { buffer_id, version, range, kind, result } => {
-            crate::jobs_apply::apply_transform_done(editor, buffer_id, version, range, kind, result, clock);
+            crate::jobs_apply::apply_transform_done(editor, buffer_id, version, range, kind, result, ctx.clock);
         }
         Msg::DiagnosticsDone { buffer_id, version, source, diagnostics } => {
             crate::diagnostics_run::apply_diagnostics_done(editor, buffer_id, version, source, diagnostics);
@@ -60,14 +59,14 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
         // under an open modal (e.g. harper crashes during a quit/save prompt). Second delivery site
         // beside reduce_dispatch's arm — the intercept's `_ => {}` would otherwise swallow it.
         Msg::DiagProviderEvent { source, event } =>
-            crate::diag_provider::apply_provider_event(editor, source, event, clock),
-        Msg::ClipboardPaste { buffer_id, text, .. } => crate::jobs_apply::apply_clipboard_paste(editor, buffer_id, text, clock),
+            crate::diag_provider::apply_provider_event(editor, source, event, ctx.clock),
+        Msg::ClipboardPaste { buffer_id, text, .. } => crate::jobs_apply::apply_clipboard_paste(editor, buffer_id, text, ctx.clock),
         Msg::ClipboardAvailability(ok) => crate::jobs_apply::apply_clipboard_availability(editor, ok),
         // Resize/Tick/other input: ignored for the modal, but results still drain below.
         _ => {}
     }
     // Always drain ready results (merges the awaited save&quit result).
-    crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx))
+    crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx))
 }
 
 /// Execute the action chosen in a modal prompt, then clear the prompt.
@@ -498,9 +497,12 @@ mod tests {
         let ex = InlineExecutor::default();
         let clk = TestClock(0);
         let (tx, _rx) = std::sync::mpsc::channel();
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: &tx };
         let handled = intercept(Msg::DiagProviderEvent { source: wordcartel_core::diagnostics::DiagSource::Harper,
             event: ProviderEvent::Degraded(INSTALL_HINT.into()) },
-            &mut e, &ex, &clk, &tx);
+            &mut e, &ctx);
         assert!(matches!(handled, crate::app::Handled::Done(_)), "interceptor consumes and folds");
         assert_eq!(e.status_text(), INSTALL_HINT, "Degraded reached the status line despite the open modal");
     }
@@ -921,10 +923,13 @@ mod tests {
         e.pending_clean = vec![a.clone()];
         e.open_prompt(crate::prompt::Prompt::clean_recovery(1));
         let (ex, clk, tx) = (InlineExecutor::default(), TestClock(0), std::sync::mpsc::channel().0);
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clk, msg_tx: &tx };
         let esc = Event::Key(KeyEvent {
             code: KeyCode::Esc, modifiers: KeyModifiers::NONE,
             kind: KeyEventKind::Press, state: KeyEventState::NONE });
-        intercept(Msg::Input(esc), &mut e, &ex, &clk, &tx);
+        intercept(Msg::Input(esc), &mut e, &ctx);
         assert!(a.exists(), "Esc deletes nothing");
         assert!(e.pending_clean.is_empty(), "Esc clears the snapshot");
         assert!(e.prompt.is_none(), "Esc dismisses the prompt");

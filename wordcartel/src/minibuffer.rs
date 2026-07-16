@@ -79,8 +79,7 @@ impl Minibuffer {
 /// fall through to the normal match arm below — a FilterDone must apply even while
 /// the minibuffer is open (see test `minibuffer_does_not_starve_filterdone`).
 pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor,
-    ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
-    msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) -> crate::app::Handled {
+    ctx: &crate::overlays::DispatchCtx) -> crate::app::Handled {
     if editor.minibuffer.is_none() { return crate::app::Handled::Pass(msg); }
     if let Msg::Input(Event::Key(k)) = &msg {
         if k.kind == crossterm::event::KeyEventKind::Press {
@@ -113,9 +112,9 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 crossterm::event::KeyCode::Enter => {
                     let mb = editor.minibuffer.take().unwrap();
                     match mb.kind {
-                        MinibufferKind::Filter     => crate::prompts::submit_filter_line(editor, &mb.text, msg_tx),
+                        MinibufferKind::Filter     => crate::prompts::submit_filter_line(editor, &mb.text, ctx.msg_tx),
                         MinibufferKind::GotoLine   => crate::prompts::goto_line_submit(editor, &mb.text),
-                        MinibufferKind::SaveAs     => crate::prompts::save_as_submit(editor, &mb.text, ex, clock, msg_tx),
+                        MinibufferKind::SaveAs     => crate::prompts::save_as_submit(editor, &mb.text, ctx.ex, ctx.clock, ctx.msg_tx),
                         MinibufferKind::WriteBlock => crate::prompts::block_write_submit(editor, &mb.text),
                         MinibufferKind::WrapColumn => crate::prompts::wrap_column_submit(editor, &mb.text),
                         MinibufferKind::PluginArg { id } => {
@@ -132,7 +131,7 @@ pub(crate) fn intercept(msg: crate::app::Msg, editor: &mut crate::editor::Editor
                 _ => {}
             }
         }
-        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ex, clock, msg_tx));
+        return crate::app::Handled::Done(crate::app::fold_and_continue(editor, ctx.ex, ctx.clock, ctx.msg_tx));
     }
     // non-key (FilterDone/JobDone/Tick/Resize/ClipboardPaste/ClipboardAvailability) falls through to the normal match below
     crate::app::Handled::Pass(msg)
@@ -178,9 +177,11 @@ mod tests {
         let ex = crate::jobs::InlineExecutor::default();
         let clock = crate::test_support::TestClock::new(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clock, msg_tx: &tx };
         let msg = crate::app::Msg::Input(Event::Key(enter_key()));
-        intercept(msg, &mut editor, &ex, &clock, &tx);
+        intercept(msg, &mut editor, &ctx);
 
         assert!(editor.minibuffer.is_none(), "submit must close the minibuffer");
         assert_eq!(editor.pending_plugin_calls.len(), 1);
@@ -201,9 +202,11 @@ mod tests {
         let ex = crate::jobs::InlineExecutor::default();
         let clock = crate::test_support::TestClock::new(0);
         let (tx, _rx) = std::sync::mpsc::channel();
-
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clock, msg_tx: &tx };
         let msg = crate::app::Msg::Input(Event::Key(enter_key()));
-        intercept(msg, &mut editor, &ex, &clock, &tx);
+        intercept(msg, &mut editor, &ctx);
 
         assert!(editor.pending_plugin_calls.is_empty(), "an over-cap arg must not be enqueued");
         assert_eq!(editor.status_text(), "plugin: command arg too long");

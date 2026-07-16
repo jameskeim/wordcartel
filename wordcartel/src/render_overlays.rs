@@ -39,18 +39,38 @@ use crate::{
 /// so painter and caret can never drift.
 const OV_QUERY_PREFIX_COLS: u16 = 2;
 
-#[allow(clippy::too_many_lines)] // overlay paint dispatch — one block per overlay surface
 pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
-    let area = frame.area();
-    let h = area.height;
-
-    // Startup splash — owns the whole frame; nothing else can be open while it is up
-    // (set only at launch with no prompt pending; dismissed by the first key/click).
+    // Splash owns the frame (RENDER_ORDER[0]) — paint it and return, exactly as before.
     if editor.splash.is_some() {
-        crate::splash::paint(frame, editor);
+        crate::render_overlays::paint_splash(frame, editor, cs);
         return;
     }
+    // Walk the remaining Frame overlays in paint order. Each painter self-gates on its own
+    // `if let Some(..)`, so an inactive overlay is a no-op (byte-identical to the old
+    // sequential blocks). The always-on menu BAR chrome is NOT a table row — it is painted as
+    // a standalone step pinned at the `Menu` slot, before the menu-dropdown painter, so it
+    // sits at the same z-position it held today (after file_browser, before diag): palette/
+    // outline/theme_picker/cursor_picker/file_browser paint UNDER the bar, diag OVER it.
+    for id in &crate::overlays::RENDER_ORDER[1..] {
+        if *id == crate::overlays::OverlayId::Menu {
+            paint_menu_bar(frame, editor, cs); // chrome (out of table), pinned here
+        }
+        if let crate::overlays::RenderSite::Frame(f) = id.row().render {
+            f(frame, editor, cs);
+        }
+    }
+}
 
+/// Splash painter (RENDER_ORDER[0]). Owns the whole frame; `paint` early-returns after this
+/// so no other overlay paints while the splash is up.
+pub(crate) fn paint_splash(frame: &mut Frame, editor: &mut Editor, _cs: &ChromeStyles) {
+    crate::splash::paint(frame, editor);
+}
+
+#[allow(clippy::too_many_lines)] // single overlay's paint block, extracted verbatim
+pub(crate) fn paint_palette(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
+    let area = frame.area();
+    let h = area.height;
     // -----------------------------------------------------------------------
     // Command palette overlay (drawn on top of everything else)
     // -----------------------------------------------------------------------
@@ -134,7 +154,11 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
             &mut list_state,
         );
     }
+}
 
+pub(crate) fn paint_outline(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
+    let area = frame.area();
+    let h = area.height;
     // A6 self-heal: the window must respect the LIVE frame's geometry (resize
     // has no overlay hook; render is the one place that always sees the truth).
     if let Some(o) = editor.outline.as_mut() {
@@ -200,7 +224,11 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
             }
         }
     }
+}
 
+pub(crate) fn paint_theme_picker(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
+    let area = frame.area();
+    let h = area.height;
     // -----------------------------------------------------------------------
     // Theme picker overlay (drawn on top of everything else)
     // -----------------------------------------------------------------------
@@ -268,7 +296,11 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
             }
         }
     }
+}
 
+pub(crate) fn paint_cursor_picker(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
+    let area = frame.area();
+    let h = area.height;
     // -----------------------------------------------------------------------
     // Cursor (caret-shape) picker overlay
     // -----------------------------------------------------------------------
@@ -348,7 +380,11 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
             }
         }
     }
+}
 
+pub(crate) fn paint_file_browser(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
+    let area = frame.area();
+    let h = area.height;
     // -----------------------------------------------------------------------
     // File browser overlay (drawn on top of everything else)
     // -----------------------------------------------------------------------
@@ -420,102 +456,131 @@ pub(crate) fn paint(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
         }
     }
 
-    if editor.menu_bar_rows() == 1 {
-        let menu_area = crate::chrome_geom::menu_area(area);
-        // Full-width bar background: gaps between labels + the right side carry the
-        // Chrome style; the per-label paints below overwrite their own rects (A2).
-        let bar_row = Rect::new(area.x, area.y, area.width, 1);
-        frame.buffer_mut().set_style(bar_row, cs.menu_closed);
-        match editor.menu {
-            Some(ref menu) if !menu.groups.is_empty() => {
-                // Paint the menu bar (one label per category)
-                let bar = menu_bar_layout(menu_area, &menu.groups);
-                for (i, rect) in &bar {
-                    let cat = menu.groups[*i].0;
-                    let label = crate::menu::category_label_pub(cat);
-                    let text = format!(" {label} ");
-                    let style = if *i == menu.open {
-                        cs.menu_open
-                    } else {
-                        cs.menu_closed
-                    };
-                    frame.render_widget(Paragraph::new(text).style(style), *rect);
-                }
-                // Paint the dropdown for the open category
-                if let Some(drop_rect) = menu_dropdown_rect(menu_area, &menu.groups, menu.open) {
-                    // Two-layer windowing invariant: re-window against the live frame geometry
-                    // every render so a resize without an event hook is self-correcting.
-                    let scroll_top = {
-                        let m = editor.menu.as_mut().unwrap();
-                        let leaves_len = m.groups[m.open].1.len();
-                        let list_h = drop_rect.height as usize;
-                        // Reserve the bottom row for the n/total indicator when the category
-                        // overflows, so keep_visible guarantees the highlight is within the
-                        // rendered item rows — not hidden behind the indicator row.
-                        let overflows = leaves_len > list_h;
-                        let keep_h = if overflows { list_h.saturating_sub(1) } else { list_h };
-                        crate::list_window::keep_visible(m.highlighted, leaves_len, keep_h, &mut m.scroll_top);
-                        m.scroll_top
-                    };
-                    frame.render_widget(Clear, drop_rect);
-                    // Attached filled panel: fill the whole rect with the Muted panel bg so
-                    // the dropdown reads as one elevated surface extending from the bar (no box).
-                    frame.buffer_mut().set_style(drop_rect, cs.menu_norm);
-                    let (highlighted, leaves_len) = {
-                        let m = editor.menu.as_ref().unwrap();
-                        (m.highlighted, m.groups[m.open].1.len())
-                    };
-                    let list_h = drop_rect.height as usize;
-                    // Determine how many rows are available for items: if the dropdown overflows,
-                    // reserve the bottom row for the n/total indicator.
-                    let overflows = leaves_len > list_h;
-                    let item_rows = if overflows { list_h.saturating_sub(1) } else { list_h };
-                    let end = (scroll_top + item_rows).min(leaves_len);
-                    let leaves = &editor.menu.as_ref().unwrap().groups[editor.menu.as_ref().unwrap().open].1;
-                    let items: Vec<ListItem> = leaves[scroll_top..end]
-                        .iter()
-                        .enumerate()
-                        .map(|(row_in_window, (label, _))| {
-                            let abs_row = scroll_top + row_in_window;
-                            let style = if abs_row == highlighted {
-                                cs.menu_sel
-                            } else {
-                                cs.menu_norm
-                            };
-                            ListItem::new(format!(" {label} ")).style(style)
-                        })
-                        .collect();
-                    // Render items in a sub-rect (leaving the bottom row for the indicator when needed).
-                    let item_rect = if overflows && list_h > 0 {
-                        Rect::new(drop_rect.x, drop_rect.y, drop_rect.width, item_rows as u16)
-                    } else {
-                        drop_rect
-                    };
-                    frame.render_widget(List::new(items), item_rect);
-                    // Render n/total indicator on the bottom row of the dropdown when it overflows.
-                    if overflows && list_h > 0 {
-                        if let Some(ind) = windowed_indicator(highlighted, leaves_len, list_h) {
-                            let ind_y = drop_rect.y + drop_rect.height - 1;
-                            let ind_rect = Rect::new(drop_rect.x, ind_y, drop_rect.width, 1);
-                            frame.render_widget(
-                                Paragraph::new(ind).style(cs.menu_norm),
-                                ind_rect,
-                            );
-                        }
-                    }
-                }
+}
+
+/// Always-on menu BAR chrome (out of the overlay table — painted whether or not `menu` is
+/// `Some`). Pinned at the `Menu` slot of the RENDER_ORDER walk (spec §2.3.1). The DROPDOWN is
+/// painted separately by `paint_menu_dropdown`.
+pub(crate) fn paint_menu_bar(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
+    if editor.menu_bar_rows() != 1 { return; }
+    let area = frame.area();
+    let menu_area = crate::chrome_geom::menu_area(area);
+    // Full-width bar background: gaps between labels + the right side carry the
+    // Chrome style; the per-label paints below overwrite their own rects (A2).
+    let bar_row = Rect::new(area.x, area.y, area.width, 1);
+    frame.buffer_mut().set_style(bar_row, cs.menu_closed);
+    match editor.menu {
+        Some(ref menu) if !menu.groups.is_empty() => {
+            // Paint the menu bar (one label per category)
+            let bar = menu_bar_layout(menu_area, &menu.groups);
+            for (i, rect) in &bar {
+                let cat = menu.groups[*i].0;
+                let label = crate::menu::category_label_pub(cat);
+                let text = format!(" {label} ");
+                let style = if *i == menu.open {
+                    cs.menu_open
+                } else {
+                    cs.menu_closed
+                };
+                frame.render_widget(Paragraph::new(text).style(style), *rect);
             }
-            _ => {
-                // Inactive bar (pinned / auto-revealed / unbuilt placeholder): static
-                // labels, all closed-style, no dropdown, no highlight.
-                for (i, rect) in &menu_bar_layout_cats(menu_area, &crate::registry::MENU_ORDER) {
-                    let label = crate::menu::category_label_pub(crate::registry::MENU_ORDER[*i]);
-                    frame.render_widget(Paragraph::new(format!(" {label} ")).style(cs.menu_closed), *rect);
-                }
+        }
+        _ => {
+            // Inactive bar (pinned / auto-revealed / unbuilt placeholder): static
+            // labels, all closed-style, no dropdown, no highlight.
+            for (i, rect) in &menu_bar_layout_cats(menu_area, &crate::registry::MENU_ORDER) {
+                let label = crate::menu::category_label_pub(crate::registry::MENU_ORDER[*i]);
+                frame.render_widget(Paragraph::new(format!(" {label} ")).style(cs.menu_closed), *rect);
             }
         }
     }
+}
 
+/// The `Menu` row's Frame painter — the DROPDOWN only (self-gated on an open, non-empty menu).
+/// Painted AFTER `paint_menu_bar` at the `Menu` slot so it sits over the bar chrome, exactly as
+/// the fused block did today.
+#[allow(clippy::too_many_lines)] // the menu dropdown paint block, extracted verbatim
+pub(crate) fn paint_menu_dropdown(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
+    if editor.menu_bar_rows() != 1 { return; }
+    // Guard: only an OPEN, non-empty menu has a dropdown (the outer `match editor.menu`
+    // Some-arm condition in today's block).
+    let open_nonempty = matches!(editor.menu, Some(ref m) if !m.groups.is_empty());
+    if !open_nonempty { return; }
+    let area = frame.area();
+    let menu_area = crate::chrome_geom::menu_area(area);
+    // The outer `menu` binding's only role: compute the dropdown rect.
+    let drop = {
+        let menu = editor.menu.as_ref().unwrap();
+        menu_dropdown_rect(menu_area, &menu.groups, menu.open)
+    };
+    let Some(drop_rect) = drop else { return; };
+    // Paint the dropdown for the open category
+    // Two-layer windowing invariant: re-window against the live frame geometry
+    // every render so a resize without an event hook is self-correcting.
+    let scroll_top = {
+        let m = editor.menu.as_mut().unwrap();
+        let leaves_len = m.groups[m.open].1.len();
+        let list_h = drop_rect.height as usize;
+        // Reserve the bottom row for the n/total indicator when the category
+        // overflows, so keep_visible guarantees the highlight is within the
+        // rendered item rows — not hidden behind the indicator row.
+        let overflows = leaves_len > list_h;
+        let keep_h = if overflows { list_h.saturating_sub(1) } else { list_h };
+        crate::list_window::keep_visible(m.highlighted, leaves_len, keep_h, &mut m.scroll_top);
+        m.scroll_top
+    };
+    frame.render_widget(Clear, drop_rect);
+    // Attached filled panel: fill the whole rect with the Muted panel bg so
+    // the dropdown reads as one elevated surface extending from the bar (no box).
+    frame.buffer_mut().set_style(drop_rect, cs.menu_norm);
+    let (highlighted, leaves_len) = {
+        let m = editor.menu.as_ref().unwrap();
+        (m.highlighted, m.groups[m.open].1.len())
+    };
+    let list_h = drop_rect.height as usize;
+    // Determine how many rows are available for items: if the dropdown overflows,
+    // reserve the bottom row for the n/total indicator.
+    let overflows = leaves_len > list_h;
+    let item_rows = if overflows { list_h.saturating_sub(1) } else { list_h };
+    let end = (scroll_top + item_rows).min(leaves_len);
+    let leaves = &editor.menu.as_ref().unwrap().groups[editor.menu.as_ref().unwrap().open].1;
+    let items: Vec<ListItem> = leaves[scroll_top..end]
+        .iter()
+        .enumerate()
+        .map(|(row_in_window, (label, _))| {
+            let abs_row = scroll_top + row_in_window;
+            let style = if abs_row == highlighted {
+                cs.menu_sel
+            } else {
+                cs.menu_norm
+            };
+            ListItem::new(format!(" {label} ")).style(style)
+        })
+        .collect();
+    // Render items in a sub-rect (leaving the bottom row for the indicator when needed).
+    let item_rect = if overflows && list_h > 0 {
+        Rect::new(drop_rect.x, drop_rect.y, drop_rect.width, item_rows as u16)
+    } else {
+        drop_rect
+    };
+    frame.render_widget(List::new(items), item_rect);
+    // Render n/total indicator on the bottom row of the dropdown when it overflows.
+    if overflows && list_h > 0 {
+        if let Some(ind) = windowed_indicator(highlighted, leaves_len, list_h) {
+            let ind_y = drop_rect.y + drop_rect.height - 1;
+            let ind_rect = Rect::new(drop_rect.x, ind_y, drop_rect.width, 1);
+            frame.render_widget(
+                Paragraph::new(ind).style(cs.menu_norm),
+                ind_rect,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)] // single overlay's paint block, extracted verbatim
+pub(crate) fn paint_diag(frame: &mut Frame, editor: &mut Editor, cs: &ChromeStyles) {
+    let area = frame.area();
+    let h = area.height;
     // -----------------------------------------------------------------------
     // Diagnostic quick-fix overlay (drawn on top of everything else)
     // -----------------------------------------------------------------------

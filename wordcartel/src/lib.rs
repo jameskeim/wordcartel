@@ -40,6 +40,7 @@ pub mod palette;
 pub mod menu;
 pub mod marks;
 pub mod mouse;
+pub mod overlays;
 pub mod density;
 pub mod chrome;
 pub mod search_overlay;

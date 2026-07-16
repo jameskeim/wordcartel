@@ -772,17 +772,9 @@ impl Editor {
     /// Clears `prompt`, `palette`, `menu`, and `pending_keys` before opening.
     pub fn open_minibuffer(&mut self, prompt: &str, kind: crate::minibuffer::MinibufferKind) {
         debug_assert!(self.prompt.is_none(), "prompt xor minibuffer: cannot open minibuffer while a modal prompt is active");
-        self.prompt = None;
+        crate::overlays::close_all(self);
         self.pending_keys.clear();
         self.pending_mark = None;
-        self.palette = None;
-        self.menu = None;
-        self.search = None;
-        self.diag = None;
-        self.outline = None;
-        self.theme_picker = None;
-        self.cursor_picker = None;
-        self.file_browser = None;
         self.minibuffer = Some(crate::minibuffer::Minibuffer {
             prompt: prompt.into(),
             text: String::new(),
@@ -796,18 +788,9 @@ impl Editor {
     /// Clears `palette`, `minibuffer`, `menu`, and `pending_keys` before setting the prompt.
     /// At most one of {prompt, minibuffer, palette} is ever active at once.
     pub fn open_prompt(&mut self, p: crate::prompt::Prompt) {
-        self.palette = None;
-        self.minibuffer = None;
-        self.menu = None;
+        crate::overlays::close_all(self);
         self.pending_keys.clear();
         self.pending_mark = None;
-        self.search = None;
-        self.diag = None;
-        self.outline = None;
-        self.theme_picker = None;
-        self.cursor_picker = None;
-        self.file_browser = None;
-        self.splash = None; // a prompt is modal — it must never be buried by the splash
         self.prompt = Some(p);
     }
 
@@ -816,17 +799,9 @@ impl Editor {
     /// Clears `prompt`, `minibuffer`, `menu`, and `pending_keys` before opening.
     /// At most one of {prompt, minibuffer, palette, menu} is ever active at once.
     pub fn open_palette(&mut self) {
-        self.prompt = None;
-        self.minibuffer = None;
-        self.menu = None;
+        crate::overlays::close_all(self);
         self.pending_keys.clear();
         self.pending_mark = None;
-        self.search = None;
-        self.diag = None;
-        self.outline = None;
-        self.theme_picker = None;
-        self.cursor_picker = None;
-        self.file_browser = None;
         self.palette = Some(crate::palette::Palette::default());
     }
 
@@ -835,13 +810,8 @@ impl Editor {
     /// Clears `prompt`, `minibuffer`, `palette`, `menu`, and `pending_keys` before opening.
     /// At most one of {prompt, minibuffer, palette, menu, search} is ever active at once.
     pub fn open_search(&mut self, phase: crate::search_overlay::Phase, origin: usize) {
-        self.prompt = None; self.minibuffer = None; self.palette = None; self.menu = None;
+        crate::overlays::close_all(self);
         self.pending_keys.clear(); self.pending_mark = None;
-        self.diag = None;
-        self.outline = None;
-        self.theme_picker = None;
-        self.cursor_picker = None;
-        self.file_browser = None;
         let bid = self.active().id;
         self.search = Some(crate::search_overlay::SearchState::open(phase, origin, bid));
     }
@@ -852,12 +822,8 @@ impl Editor {
     /// Records `opened_version` so `diag_apply_selected` can refuse a stale apply
     /// if the buffer is mutated while the overlay is open (Fix A4).
     pub fn open_diag(&mut self, d: wordcartel_core::diagnostics::Diagnostic) {
-        self.prompt = None; self.minibuffer = None; self.palette = None; self.menu = None; self.search = None;
+        crate::overlays::close_all(self);
         self.pending_keys.clear(); self.pending_mark = None;
-        self.outline = None;
-        self.theme_picker = None;
-        self.cursor_picker = None;
-        self.file_browser = None;
         let bid = self.active().id;
         let ver = self.active().document.version;
         self.diag = Some(crate::diag_overlay::DiagOverlay::new(d, bid, ver));
@@ -865,12 +831,8 @@ impl Editor {
 
     /// Open the outline picker, enforcing single-overlay XOR invariant.
     pub fn open_outline(&mut self) {
-        self.prompt = None; self.minibuffer = None; self.palette = None; self.menu = None;
-        self.search = None; self.diag = None;
+        crate::overlays::close_all(self);
         self.pending_keys.clear(); self.pending_mark = None;
-        self.theme_picker = None;
-        self.cursor_picker = None;
-        self.file_browser = None;
         let bid = self.active().id;
         let ver = self.active().document.version;
         let blocks = self.active().document.blocks.clone();
@@ -880,10 +842,8 @@ impl Editor {
 
     /// Open the theme picker, enforcing the single-overlay XOR invariant.
     pub fn open_theme_picker(&mut self) {
-        self.prompt = None; self.minibuffer = None; self.menu = None;
+        crate::overlays::close_all(self);
         self.pending_keys.clear(); self.pending_mark = None;
-        self.search = None; self.diag = None; self.outline = None; self.palette = None;
-        self.file_browser = None; self.cursor_picker = None;
         self.theme_picker = Some(crate::theme_picker::ThemePicker {
             query: String::new(), selected: 0, rows: Vec::new(),
             scroll_top: 0, original: self.theme.clone(), previewed: None,
@@ -897,17 +857,9 @@ impl Editor {
     /// list (via `workspace::buffer_switch_rows`). `rebuild_rows` is called
     /// immediately so rows are available before the first render.
     pub fn open_buffer_switcher(&mut self) {
-        self.prompt = None;
-        self.minibuffer = None;
-        self.menu = None;
+        crate::overlays::close_all(self);
         self.pending_keys.clear();
         self.pending_mark = None;
-        self.search = None;
-        self.diag = None;
-        self.outline = None;
-        self.theme_picker = None;
-        self.cursor_picker = None;
-        self.file_browser = None;
         let source_rows: Vec<crate::palette::PaletteRow> =
             crate::workspace::buffer_switch_rows(self)
                 .into_iter()
@@ -932,10 +884,8 @@ impl Editor {
 
     /// Open the file browser at `dir`, enforcing the single-overlay XOR invariant.
     pub fn open_file_browser(&mut self, dir: std::path::PathBuf) {
-        self.prompt = None; self.minibuffer = None; self.menu = None; self.palette = None;
+        crate::overlays::close_all(self);
         self.pending_keys.clear(); self.pending_mark = None;
-        self.search = None; self.diag = None; self.outline = None; self.theme_picker = None;
-        self.cursor_picker = None;
         self.file_browser = Some(crate::file_browser::FileBrowser {
             dir, query: String::new(), entries: Vec::new(), selected: 0, scroll_top: 0,
         });
@@ -951,10 +901,8 @@ impl Editor {
     /// current state means the highlight always matches the caret, so Enter-immediately
     /// commits what is already active rather than lying about it.
     pub fn open_cursor_picker(&mut self) {
-        self.prompt = None; self.minibuffer = None; self.menu = None;
+        crate::overlays::close_all(self);
         self.pending_keys.clear(); self.pending_mark = None;
-        self.search = None; self.diag = None; self.outline = None; self.palette = None;
-        self.file_browser = None; self.theme_picker = None;
         let selected = crate::cursor_picker::initial_row_for(self.caret_shape, self.caret_blink);
         self.cursor_picker = Some(crate::cursor_picker::CursorPicker {
             selected, original_shape: self.caret_shape, original_blink: self.caret_blink,
@@ -965,10 +913,7 @@ impl Editor {
     /// True while any modal/overlay owns text input — the caret must NOT be parked in the editor
     /// text area (B11). EXHAUSTIVE by design: a new input surface must be added here (no catch-all).
     pub fn has_active_input_overlay(&self) -> bool {
-        self.search.is_some() || self.minibuffer.is_some() || self.palette.is_some()
-            || self.outline.is_some() || self.theme_picker.is_some() || self.file_browser.is_some()
-            || self.menu.is_some() || self.prompt.is_some() || self.splash.is_some()
-            || self.diag.is_some() || self.cursor_picker.is_some()
+        crate::overlays::any_active(self)
     }
 
     /// Apply a theme: swap, re-derive the heading-glyph flag (cue mode forces ON;

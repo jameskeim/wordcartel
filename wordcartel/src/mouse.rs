@@ -71,419 +71,434 @@ fn visible_doc_end(editor: &mut Editor) -> usize {
 }
 
 /// True when NO overlay/modal is open — the shared predicate for dwell suppression.
+/// Derived from the overlay table (H21); now counts `splash` too (Q4), so a mouse move
+/// under the splash routes to the overlay path instead of arming dwell timers.
 fn no_overlay_open(editor: &Editor) -> bool {
-    editor.menu.is_none() && editor.palette.is_none() && editor.theme_picker.is_none()
-        && editor.file_browser.is_none() && editor.outline.is_none() && editor.diag.is_none()
-        && editor.prompt.is_none() && editor.minibuffer.is_none() && editor.search.is_none()
-        && editor.cursor_picker.is_none()   // C1: route mouse to the cursor picker
+    !crate::overlays::any_active(editor)
 }
 
-/// Route a mouse event to the open overlay layer. PRECONDITION: at least one overlay
-/// is open (`!no_overlay_open`). Consumes the event (the caller returns unconditionally
-/// after this). Text-input modals (minibuffer/search/prompt for non-choice clicks)
-/// consume without acting; list overlays scroll/click/click-away (Tasks 10-13).
-// 8 args mirror `handle`'s dispatch context (reg/keymap/ex/clock/msg_tx) plus the
-// precomputed overlay `area`; an args-struct would just duplicate `handle`'s params.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // overlay mouse routing — one branch per overlay region
+/// Route a mouse event to the active overlay's mouse slot. PRECONDITION: an overlay is open
+/// (`!no_overlay_open`). Consumes the event (the caller returns unconditionally after this).
 fn route_overlay(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rect,
-                 reg: &crate::registry::Registry, keymap: &crate::keymap::KeyTrie,
-                 ex: &dyn crate::jobs::Executor, clock: &dyn wordcartel_core::history::Clock,
-                 msg_tx: &std::sync::mpsc::Sender<crate::app::Msg>) {
-    if editor.palette.is_some() {
-        // `if matches!` — a `match` with a lone arm + `_ => {}` trips
-        // clippy::single_match under the deny gate (Codex plan r1).
-        if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
-            let ah = editor.active().view.area.1;
-            if let Some(p) = editor.palette.as_mut() {
-                if matches!(ev.kind, MouseEventKind::ScrollDown) {
-                    p.selected = (p.selected + 1).min(p.rows.len().saturating_sub(1));
-                } else {
-                    p.selected = p.selected.saturating_sub(1);
-                }
-                crate::app::keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
-            }
-            return;
-        }
-        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            // scoped borrow → owned hit values (id + optional buffer) — mirrors
-            // the keyboard Enter arm (app.rs) which checks row.buffer first so
-            // that Buffers-kind rows switch buffers rather than dispatching their
-            // sentinel CommandId("palette").
-            let hit: Option<(crate::registry::CommandId, Option<crate::editor::BufferId>)> = {
-                let p = editor.palette.as_ref().unwrap();
-                crate::chrome_geom::palette_row_at(area, p, ev.column, ev.row)
-                    .and_then(|idx| p.rows.get(idx).map(|r| (r.id, r.buffer)))
-            };
-            // was the click inside the overlay rect at all?
-            let inside = {
-                let row_count = editor.palette.as_ref().unwrap().rows.len();
-                let r = crate::chrome_geom::palette_overlay_rect(area, row_count);
-                ev.column >= r.x && ev.column < r.x + r.width && ev.row >= r.y && ev.row < r.y + r.height
-            };
-            if let Some((id, buffer)) = hit {
-                if let Some(bid) = buffer {
-                    // Buffer-switcher row: dismiss palette, jump to buffer — same
-                    // path as the keyboard Enter arm. Pre-existing bug: the old
-                    // code dispatched CommandId("palette") for every buffer row,
-                    // reopening the picker instead of switching.
-                    editor.palette = None;
-                    if let Some(idx) = editor.buffers.iter().position(|b| b.id == bid) {
-                        crate::workspace::switch_to(editor, idx);
-                    }
-                } else {
-                    crate::app::dispatch_overlay_command(editor, reg, keymap, ex, clock, msg_tx, id);
-                }
-            } else if !inside {
-                editor.palette = None; // click outside closes
-                editor.search = None;
-                editor.diag = None;
-            }
-        }
-        return;
+                 ctx: &crate::overlays::DispatchCtx) {
+    if let Some(id) = crate::overlays::OverlayId::ALL.iter()
+        .find(|id| (id.row().is_active)(editor))
+    {
+        (id.row().mouse)(editor, ev, area, ctx);
     }
-    if editor.menu.is_some() {
-        if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
-            if let Some(m) = editor.menu.as_mut() {
-                let n = m.groups.get(m.open).map(|g| g.1.len()).unwrap_or(0);
-                if n > 0 {
-                    if matches!(ev.kind, MouseEventKind::ScrollDown) {
-                        m.highlighted = (m.highlighted + 1).min(n - 1);
-                    } else {
-                        m.highlighted = m.highlighted.saturating_sub(1);
-                    }
-                    // Coarse follow-the-selection layer — the paint re-windows against the true
-                    // item-row budget every frame (list_window two-layer invariant), so this
-                    // estimate need not reserve the indicator row.  Derive from menu_area so
-                    // keep_visible scrolls at the same boundary the dropdown rect and painter use.
-                    let avail_below = crate::chrome_geom::menu_area(area).height.saturating_sub(1) as usize;
-                    let list_h = n.min(15).min(avail_below);
-                    crate::list_window::keep_visible(m.highlighted, n, list_h, &mut m.scroll_top);
-                }
-            }
-            return;
-        }
-        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            let open = editor.menu.as_ref().unwrap().open;
-            let scroll_top = editor.menu.as_ref().unwrap().scroll_top;
-            // Both bar and dropdown hit-tests must use menu_area (frame minus the status row)
-            // so the dropdown windowing (avail_below) is identical to the painter's — no drift.
-            let hit_area = crate::chrome_geom::menu_area(area);
-            // scoped borrows → owned hit results
-            let bar_hit: Option<usize> = {
-                let groups = &editor.menu.as_ref().unwrap().groups;
-                crate::chrome_geom::menu_bar_layout(hit_area, groups).into_iter()
-                    .find(|(_, r)| ev.column >= r.x && ev.column < r.x + r.width && ev.row == r.y)
-                    .map(|(cat, _)| cat)
-            };
-            let row_action: Option<crate::menu::MenuRowAction> = {
-                let groups = &editor.menu.as_ref().unwrap().groups;
-                crate::chrome_geom::menu_dropdown_row_at(hit_area, groups, open, scroll_top, ev.column, ev.row)
-                    .and_then(|row| groups.get(open).and_then(|g| g.1.get(row)).map(|(_, action)| *action))
-            };
-            // all borrows dropped — now mutate/dispatch/clear
-            if let Some(cat) = bar_hit {
-                // category switch — reset scroll_top so stale window never carries into shorter category
-                let m = editor.menu.as_mut().unwrap();
-                m.open = cat; m.highlighted = 0; m.scroll_top = 0;
-            } else if let Some(action) = row_action {
-                crate::menu::dispatch_row_action(editor, reg, keymap, ex, clock, msg_tx, action);
+}
+
+/// Palette mouse slot: wheel moves + windows the selection; `Down(Left)` dispatches the hit
+/// row (buffer rows switch buffers) or, on a click outside the rect, closes the palette (and
+/// its content-linked search/diag siblings via `close_all`).
+pub(crate) fn mouse_palette(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rect,
+    ctx: &crate::overlays::DispatchCtx) {
+    // `if matches!` — a `match` with a lone arm + `_ => {}` trips
+    // clippy::single_match under the deny gate (Codex plan r1).
+    if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+        let ah = editor.active().view.area.1;
+        if let Some(p) = editor.palette.as_mut() {
+            if matches!(ev.kind, MouseEventKind::ScrollDown) {
+                p.selected = (p.selected + 1).min(p.rows.len().saturating_sub(1));
             } else {
-                editor.menu = None; // outside → close
-                editor.search = None;
-                editor.diag = None;
+                p.selected = p.selected.saturating_sub(1);
+            }
+            crate::app::keep_overlay_visible(ah, p.selected, p.rows.len(), &mut p.scroll_top);
+        }
+        return;
+    }
+    if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+        // scoped borrow → owned hit values (id + optional buffer) — mirrors
+        // the keyboard Enter arm (app.rs) which checks row.buffer first so
+        // that Buffers-kind rows switch buffers rather than dispatching their
+        // sentinel CommandId("palette").
+        let hit: Option<(crate::registry::CommandId, Option<crate::editor::BufferId>)> = {
+            let p = editor.palette.as_ref().unwrap();
+            crate::chrome_geom::palette_row_at(area, p, ev.column, ev.row)
+                .and_then(|idx| p.rows.get(idx).map(|r| (r.id, r.buffer)))
+        };
+        // was the click inside the overlay rect at all?
+        let inside = {
+            let row_count = editor.palette.as_ref().unwrap().rows.len();
+            let r = crate::chrome_geom::palette_overlay_rect(area, row_count);
+            ev.column >= r.x && ev.column < r.x + r.width && ev.row >= r.y && ev.row < r.y + r.height
+        };
+        if let Some((id, buffer)) = hit {
+            if let Some(bid) = buffer {
+                // Buffer-switcher row: dismiss palette, jump to buffer — same
+                // path as the keyboard Enter arm. Pre-existing bug: the old
+                // code dispatched CommandId("palette") for every buffer row,
+                // reopening the picker instead of switching.
+                editor.palette = None;
+                if let Some(idx) = editor.buffers.iter().position(|b| b.id == bid) {
+                    crate::workspace::switch_to(editor, idx);
+                }
+            } else {
+                crate::app::dispatch_overlay_command(editor, ctx.reg, ctx.keymap, ctx.ex, ctx.clock, ctx.msg_tx, id);
+            }
+        } else if !inside {
+            crate::overlays::close_all(editor); // click outside closes
+        }
+    }
+}
+
+/// Menu mouse slot: wheel moves + windows the dropdown selection; `Down(Left)` on a bar label
+/// switches category, on a dropdown action row dispatches it, and on any other cell — including
+/// non-action cells INSIDE the dropdown (e.g. the overflow indicator) — closes the menu.
+pub(crate) fn mouse_menu(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rect,
+    ctx: &crate::overlays::DispatchCtx) {
+    if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+        if let Some(m) = editor.menu.as_mut() {
+            let n = m.groups.get(m.open).map(|g| g.1.len()).unwrap_or(0);
+            if n > 0 {
+                if matches!(ev.kind, MouseEventKind::ScrollDown) {
+                    m.highlighted = (m.highlighted + 1).min(n - 1);
+                } else {
+                    m.highlighted = m.highlighted.saturating_sub(1);
+                }
+                // Coarse follow-the-selection layer — the paint re-windows against the true
+                // item-row budget every frame (list_window two-layer invariant), so this
+                // estimate need not reserve the indicator row.  Derive from menu_area so
+                // keep_visible scrolls at the same boundary the dropdown rect and painter use.
+                let avail_below = crate::chrome_geom::menu_area(area).height.saturating_sub(1) as usize;
+                let list_h = n.min(15).min(avail_below);
+                crate::list_window::keep_visible(m.highlighted, n, list_h, &mut m.scroll_top);
             }
         }
         return;
     }
-    if editor.theme_picker.is_some() {
-        if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+    if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+        let open = editor.menu.as_ref().unwrap().open;
+        let scroll_top = editor.menu.as_ref().unwrap().scroll_top;
+        // Both bar and dropdown hit-tests must use menu_area (frame minus the status row)
+        // so the dropdown windowing (avail_below) is identical to the painter's — no drift.
+        let hit_area = crate::chrome_geom::menu_area(area);
+        // scoped borrows → owned hit results
+        let bar_hit: Option<usize> = {
+            let groups = &editor.menu.as_ref().unwrap().groups;
+            crate::chrome_geom::menu_bar_layout(hit_area, groups).into_iter()
+                .find(|(_, r)| ev.column >= r.x && ev.column < r.x + r.width && ev.row == r.y)
+                .map(|(cat, _)| cat)
+        };
+        let row_action: Option<crate::menu::MenuRowAction> = {
+            let groups = &editor.menu.as_ref().unwrap().groups;
+            crate::chrome_geom::menu_dropdown_row_at(hit_area, groups, open, scroll_top, ev.column, ev.row)
+                .and_then(|row| groups.get(open).and_then(|g| g.1.get(row)).map(|(_, action)| *action))
+        };
+        // all borrows dropped — now mutate/dispatch/clear
+        if let Some(cat) = bar_hit {
+            // category switch — reset scroll_top so stale window never carries into shorter category
+            let m = editor.menu.as_mut().unwrap();
+            m.open = cat; m.highlighted = 0; m.scroll_top = 0;
+        } else if let Some(action) = row_action {
+            crate::menu::dispatch_row_action(editor, ctx.reg, ctx.keymap, ctx.ex, ctx.clock, ctx.msg_tx, action);
+        } else {
+            crate::overlays::close_all(editor); // outside (and non-action cells) → close
+        }
+    }
+}
+
+/// Theme-picker mouse slot: wheel moves + previews the selection; `Down(Left)` on a row
+/// commits it, on a click-away restores the captured original theme (Esc-equivalent).
+pub(crate) fn mouse_theme_picker(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rect,
+    _ctx: &crate::overlays::DispatchCtx) {
+    if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+        let ah = editor.active().view.area.1;
+        if let Some(tp) = editor.theme_picker.as_mut() {
+            if matches!(ev.kind, MouseEventKind::ScrollDown) {
+                tp.selected = (tp.selected + 1).min(tp.rows.len().saturating_sub(1));
+            } else {
+                tp.selected = tp.selected.saturating_sub(1);
+            }
+            crate::app::keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
+        }
+        crate::theme_cmds::preview_selected_theme(editor);
+    }
+    if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+        // Scoped borrows → owned hit values before any mutation.
+        let row_idx: Option<usize> = {
+            let tp = editor.theme_picker.as_ref().unwrap();
+            crate::chrome_geom::theme_picker_row_at(area, tp, ev.column, ev.row)
+        };
+        let inside = {
+            let tp = editor.theme_picker.as_ref().unwrap();
+            let r = crate::chrome_geom::palette_overlay_rect(area, tp.rows.len());
+            ev.column >= r.x && ev.column < r.x + r.width
+                && ev.row >= r.y && ev.row < r.y + r.height
+        };
+        if let Some(idx) = row_idx {
+            // Set selected to the clicked row, preview, then commit — same
+            // identity logic as the keyboard Enter arm (via shared helper).
             let ah = editor.active().view.area.1;
             if let Some(tp) = editor.theme_picker.as_mut() {
-                if matches!(ev.kind, MouseEventKind::ScrollDown) {
-                    tp.selected = (tp.selected + 1).min(tp.rows.len().saturating_sub(1));
-                } else {
-                    tp.selected = tp.selected.saturating_sub(1);
-                }
-                crate::app::keep_overlay_visible(ah, tp.selected, tp.rows.len(), &mut tp.scroll_top);
+                tp.selected = idx;
+                crate::app::keep_overlay_visible(ah, idx, tp.rows.len(), &mut tp.scroll_top);
             }
             crate::theme_cmds::preview_selected_theme(editor);
-        }
-        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            // Scoped borrows → owned hit values before any mutation.
-            let row_idx: Option<usize> = {
-                let tp = editor.theme_picker.as_ref().unwrap();
-                crate::chrome_geom::theme_picker_row_at(area, tp, ev.column, ev.row)
-            };
-            let inside = {
-                let tp = editor.theme_picker.as_ref().unwrap();
-                let r = crate::chrome_geom::palette_overlay_rect(area, tp.rows.len());
-                ev.column >= r.x && ev.column < r.x + r.width
-                    && ev.row >= r.y && ev.row < r.y + r.height
-            };
-            if let Some(idx) = row_idx {
-                // Set selected to the clicked row, preview, then commit — same
-                // identity logic as the keyboard Enter arm (via shared helper).
-                let ah = editor.active().view.area.1;
-                if let Some(tp) = editor.theme_picker.as_mut() {
-                    tp.selected = idx;
-                    crate::app::keep_overlay_visible(ah, idx, tp.rows.len(), &mut tp.scroll_top);
-                }
-                crate::theme_cmds::preview_selected_theme(editor);
-                crate::theme_cmds::commit_theme_picker(editor);
-            } else if !inside {
-                // Click-away: restore the original theme and close — same as Esc.
-                if let Some(tp) = editor.theme_picker.take() {
-                    editor.apply_theme(tp.original);
-                }
+            crate::theme_cmds::commit_theme_picker(editor);
+        } else if !inside {
+            // Click-away: restore the original theme and close — same as Esc.
+            if let Some(tp) = editor.theme_picker.take() {
+                editor.apply_theme(tp.original);
             }
         }
-        return;
     }
-    if editor.cursor_picker.is_some() {
-        // Fixed 7-row list, windowed like every sibling overlay (Finding 1). Wheel moves
-        // the selection ±1 (clamped), re-windows, and re-previews via the shared setter
-        // funnel; a row click selects + previews + commits; a click-away restores the
-        // captured originals and closes (Esc-equivalent). No setter bypass.
-        if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+}
+
+/// Cursor-picker mouse slot. Fixed 7-row list, windowed like every sibling overlay (Finding 1).
+/// Wheel moves the selection ±1 (clamped), re-windows, and re-previews via the shared setter
+/// funnel; a row click selects + previews + commits; a click-away restores the captured
+/// originals and closes (Esc-equivalent). No setter bypass.
+pub(crate) fn mouse_cursor_picker(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rect,
+    _ctx: &crate::overlays::DispatchCtx) {
+    if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+        let ah = editor.active().view.area.1;
+        if let Some(cp) = editor.cursor_picker.as_mut() {
+            let last = crate::cursor_picker::ROW_ACTIONS.len().saturating_sub(1);
+            if matches!(ev.kind, MouseEventKind::ScrollDown) {
+                cp.selected = (cp.selected + 1).min(last);
+            } else {
+                cp.selected = cp.selected.saturating_sub(1);
+            }
+            crate::app::keep_overlay_visible(ah, cp.selected, crate::cursor_picker::ROW_ACTIONS.len(), &mut cp.scroll_top);
+        }
+        crate::cursor_picker::preview_selected(editor);
+    }
+    if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+        // Scoped borrow → owned hit value before any mutation.
+        let row_idx: Option<usize> = {
+            let cp = editor.cursor_picker.as_ref().unwrap();
+            crate::chrome_geom::cursor_picker_row_at(area, cp, ev.column, ev.row)
+        };
+        let inside = {
+            let n = crate::cursor_picker::ROW_ACTIONS.len();
+            let r = crate::chrome_geom::palette_overlay_rect(area, n + 1);
+            ev.column >= r.x && ev.column < r.x + r.width
+                && ev.row >= r.y && ev.row < r.y + r.height
+        };
+        if let Some(idx) = row_idx {
             let ah = editor.active().view.area.1;
             if let Some(cp) = editor.cursor_picker.as_mut() {
-                let last = crate::cursor_picker::ROW_ACTIONS.len().saturating_sub(1);
-                if matches!(ev.kind, MouseEventKind::ScrollDown) {
-                    cp.selected = (cp.selected + 1).min(last);
-                } else {
-                    cp.selected = cp.selected.saturating_sub(1);
-                }
-                crate::app::keep_overlay_visible(ah, cp.selected, crate::cursor_picker::ROW_ACTIONS.len(), &mut cp.scroll_top);
+                cp.selected = idx;
+                crate::app::keep_overlay_visible(ah, idx, crate::cursor_picker::ROW_ACTIONS.len(), &mut cp.scroll_top);
             }
             crate::cursor_picker::preview_selected(editor);
-        }
-        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            // Scoped borrow → owned hit value before any mutation.
-            let row_idx: Option<usize> = {
-                let cp = editor.cursor_picker.as_ref().unwrap();
-                crate::chrome_geom::cursor_picker_row_at(area, cp, ev.column, ev.row)
-            };
-            let inside = {
-                let n = crate::cursor_picker::ROW_ACTIONS.len();
-                let r = crate::chrome_geom::palette_overlay_rect(area, n + 1);
-                ev.column >= r.x && ev.column < r.x + r.width
-                    && ev.row >= r.y && ev.row < r.y + r.height
-            };
-            if let Some(idx) = row_idx {
-                let ah = editor.active().view.area.1;
-                if let Some(cp) = editor.cursor_picker.as_mut() {
-                    cp.selected = idx;
-                    crate::app::keep_overlay_visible(ah, idx, crate::cursor_picker::ROW_ACTIONS.len(), &mut cp.scroll_top);
-                }
-                crate::cursor_picker::preview_selected(editor);
-                crate::cursor_picker::commit_cursor_picker(editor);
-            } else if !inside {
-                // Click-away: restore the captured originals and close — same as Esc.
-                if let Some(cp) = editor.cursor_picker.take() {
-                    editor.set_caret_shape(cp.original_shape);
-                    editor.set_caret_blink(cp.original_blink);
-                }
+            crate::cursor_picker::commit_cursor_picker(editor);
+        } else if !inside {
+            // Click-away: restore the captured originals and close — same as Esc.
+            if let Some(cp) = editor.cursor_picker.take() {
+                editor.set_caret_shape(cp.original_shape);
+                editor.set_caret_blink(cp.original_blink);
             }
         }
-        return;
     }
-    if editor.file_browser.is_some() {
-        if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+}
+
+/// File-browser mouse slot: wheel moves + windows the selection; `Down(Left)` on a row enters
+/// it (dir descend / file open), on a click-away closes the browser.
+pub(crate) fn mouse_file_browser(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rect,
+    _ctx: &crate::overlays::DispatchCtx) {
+    if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+        let ah = editor.active().view.area.1;
+        if let Some(fb) = editor.file_browser.as_mut() {
+            if matches!(ev.kind, MouseEventKind::ScrollDown) {
+                fb.selected = (fb.selected + 1).min(fb.entries.len().saturating_sub(1));
+            } else {
+                fb.selected = fb.selected.saturating_sub(1);
+            }
+            crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+        }
+    }
+    if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+        // Scoped borrows → owned hit values before any mutation.
+        let row_idx: Option<usize> = {
+            let fb = editor.file_browser.as_ref().unwrap();
+            crate::chrome_geom::file_browser_row_at(area, fb, ev.column, ev.row)
+        };
+        let inside = {
+            let fb = editor.file_browser.as_ref().unwrap();
+            let r = crate::chrome_geom::palette_overlay_rect(area, fb.entries.len());
+            ev.column >= r.x && ev.column < r.x + r.width
+                && ev.row >= r.y && ev.row < r.y + r.height
+        };
+        if let Some(idx) = row_idx {
+            // Set selected to the clicked row, then execute — same
+            // dir/file logic as the keyboard Enter arm (via shared helper).
             let ah = editor.active().view.area.1;
             if let Some(fb) = editor.file_browser.as_mut() {
-                if matches!(ev.kind, MouseEventKind::ScrollDown) {
-                    fb.selected = (fb.selected + 1).min(fb.entries.len().saturating_sub(1));
-                } else {
-                    fb.selected = fb.selected.saturating_sub(1);
-                }
-                crate::app::keep_overlay_visible(ah, fb.selected, fb.entries.len(), &mut fb.scroll_top);
+                fb.selected = idx;
+                crate::app::keep_overlay_visible(ah, idx, fb.entries.len(), &mut fb.scroll_top);
             }
+            crate::file_browser::file_browser_enter(editor);
+        } else if !inside {
+            editor.file_browser = None; // click-away closes
         }
-        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            // Scoped borrows → owned hit values before any mutation.
-            let row_idx: Option<usize> = {
-                let fb = editor.file_browser.as_ref().unwrap();
-                crate::chrome_geom::file_browser_row_at(area, fb, ev.column, ev.row)
-            };
-            let inside = {
-                let fb = editor.file_browser.as_ref().unwrap();
-                let r = crate::chrome_geom::palette_overlay_rect(area, fb.entries.len());
-                ev.column >= r.x && ev.column < r.x + r.width
-                    && ev.row >= r.y && ev.row < r.y + r.height
-            };
-            if let Some(idx) = row_idx {
-                // Set selected to the clicked row, then execute — same
-                // dir/file logic as the keyboard Enter arm (via shared helper).
-                let ah = editor.active().view.area.1;
-                if let Some(fb) = editor.file_browser.as_mut() {
-                    fb.selected = idx;
-                    crate::app::keep_overlay_visible(ah, idx, fb.entries.len(), &mut fb.scroll_top);
-                }
-                crate::file_browser::file_browser_enter(editor);
-            } else if !inside {
-                editor.file_browser = None; // click-away closes
+    }
+}
+
+/// Outline mouse slot: wheel moves + windows the selection; `Down(Left)` on a row jumps to its
+/// heading (guarded by the stale-version check), on a click-away closes the outline.
+pub(crate) fn mouse_outline(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rect,
+    _ctx: &crate::overlays::DispatchCtx) {
+    if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+        let ah = editor.active().view.area.1;
+        if let Some(o) = editor.outline.as_mut() {
+            if matches!(ev.kind, MouseEventKind::ScrollDown) {
+                o.selected = (o.selected + 1).min(o.rows.len().saturating_sub(1));
+            } else {
+                o.selected = o.selected.saturating_sub(1);
             }
+            crate::app::keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
         }
         return;
     }
-    if editor.outline.is_some() {
-        if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+    if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+        // Scoped borrows → owned hit values before any mutation.
+        let row_idx: Option<usize> = {
+            let o = editor.outline.as_ref().unwrap();
+            crate::chrome_geom::outline_row_at(area, o, ev.column, ev.row)
+        };
+        let inside = {
+            let o = editor.outline.as_ref().unwrap();
+            let r = crate::chrome_geom::palette_overlay_rect(area, o.rows.len());
+            ev.column >= r.x && ev.column < r.x + r.width
+                && ev.row >= r.y && ev.row < r.y + r.height
+        };
+        if let Some(idx) = row_idx {
             let ah = editor.active().view.area.1;
             if let Some(o) = editor.outline.as_mut() {
-                if matches!(ev.kind, MouseEventKind::ScrollDown) {
-                    o.selected = (o.selected + 1).min(o.rows.len().saturating_sub(1));
-                } else {
-                    o.selected = o.selected.saturating_sub(1);
-                }
-                crate::app::keep_overlay_visible(ah, o.selected, o.rows.len(), &mut o.scroll_top);
+                o.selected = idx;
+                crate::app::keep_overlay_visible(ah, idx, o.rows.len(), &mut o.scroll_top);
             }
-            return;
+            // Stale-version guard — mirrors the keyboard Enter arm (app.rs:1018):
+            // refuse a jump when the outline was opened against an older document version.
+            if editor.outline.as_ref().map(|o| o.opened_version)
+                != Some(editor.active().document.version)
+            {
+                editor.set_status_full(crate::status::StatusKind::Warning, "document changed; outline closed",
+                    crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
+                editor.outline = None;
+                return;
+            }
+            let target = editor.outline.as_ref()
+                .and_then(|o| o.rows.get(o.selected))
+                .map(|r| r.byte);
+            if let Some(byte) = target {
+                crate::outline_overlay::outline_jump_to(editor, byte);
+            }
+        } else if !inside {
+            editor.outline = None; // click-away closes
         }
-        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            // Scoped borrows → owned hit values before any mutation.
-            let row_idx: Option<usize> = {
-                let o = editor.outline.as_ref().unwrap();
-                crate::chrome_geom::outline_row_at(area, o, ev.column, ev.row)
-            };
-            let inside = {
-                let o = editor.outline.as_ref().unwrap();
-                let r = crate::chrome_geom::palette_overlay_rect(area, o.rows.len());
-                ev.column >= r.x && ev.column < r.x + r.width
-                    && ev.row >= r.y && ev.row < r.y + r.height
-            };
-            if let Some(idx) = row_idx {
-                let ah = editor.active().view.area.1;
-                if let Some(o) = editor.outline.as_mut() {
-                    o.selected = idx;
-                    crate::app::keep_overlay_visible(ah, idx, o.rows.len(), &mut o.scroll_top);
-                }
-                // Stale-version guard — mirrors the keyboard Enter arm (app.rs:1018):
-                // refuse a jump when the outline was opened against an older document version.
-                if editor.outline.as_ref().map(|o| o.opened_version)
-                    != Some(editor.active().document.version)
-                {
-                    editor.set_status_full(crate::status::StatusKind::Warning, "document changed; outline closed",
-                        crate::status::StatusLifetime::Sticky, crate::status::StatusSource::Host, None);
-                    editor.outline = None;
-                    return;
-                }
-                let target = editor.outline.as_ref()
-                    .and_then(|o| o.rows.get(o.selected))
-                    .map(|r| r.byte);
-                if let Some(byte) = target {
-                    crate::outline_overlay::outline_jump_to(editor, byte);
-                }
-            } else if !inside {
-                editor.outline = None; // click-away closes
+    }
+}
+
+/// Diagnostics mouse slot: wheel moves + windows the selection; `Down(Left)` on a row applies
+/// it (via `diag_apply_selected`, which owns the stale-version guard), on a click-away closes.
+pub(crate) fn mouse_diag(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rect,
+    ctx: &crate::overlays::DispatchCtx) {
+    if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+        let ah = editor.active().view.area.1;
+        if let Some(d) = editor.diag.as_mut() {
+            let rc = d.row_count();
+            if matches!(ev.kind, MouseEventKind::ScrollDown) {
+                d.selected = (d.selected + 1).min(rc.saturating_sub(1));
+            } else {
+                d.selected = d.selected.saturating_sub(1);
             }
+            crate::app::keep_overlay_visible(ah, d.selected, rc, &mut d.scroll_top);
         }
         return;
     }
-    if editor.diag.is_some() {
-        if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+    if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+        // Scoped borrows → owned hit values before any mutation.
+        let row_idx: Option<usize> = {
+            let d = editor.diag.as_ref().unwrap();
+            crate::chrome_geom::diag_row_at(area, d, ev.column, ev.row)
+        };
+        let inside = {
+            let d = editor.diag.as_ref().unwrap();
+            let r = crate::chrome_geom::palette_overlay_rect(area, d.row_count());
+            ev.column >= r.x && ev.column < r.x + r.width
+                && ev.row >= r.y && ev.row < r.y + r.height
+        };
+        if let Some(idx) = row_idx {
+            // Set selected to the clicked row, then apply — reuse
+            // diag_apply_selected which owns the stale-version guard.
             let ah = editor.active().view.area.1;
             if let Some(d) = editor.diag.as_mut() {
                 let rc = d.row_count();
-                if matches!(ev.kind, MouseEventKind::ScrollDown) {
-                    d.selected = (d.selected + 1).min(rc.saturating_sub(1));
-                } else {
-                    d.selected = d.selected.saturating_sub(1);
-                }
-                crate::app::keep_overlay_visible(ah, d.selected, rc, &mut d.scroll_top);
+                d.selected = idx;
+                crate::app::keep_overlay_visible(ah, idx, rc, &mut d.scroll_top);
             }
+            crate::search_ui::diag_apply_selected(editor, ctx.clock);
+        } else if !inside {
+            editor.diag = None; // click-away closes
+        }
+    }
+}
+
+/// Prompt mouse slot. Task 13: prompt choice clicks — on Down(Left) over a `[K]` marker,
+/// dispatch via the shared keyboard resolver; all other events (including off-marker clicks)
+/// are consumed so the prompt stays open and nothing leaks to the editor.
+pub(crate) fn mouse_prompt(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rect,
+    ctx: &crate::overlays::DispatchCtx) {
+    if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+        // Scoped borrow → owned action (PromptAction: Copy) before mutable dispatch.
+        let action: Option<crate::prompt::PromptAction> = editor.prompt.as_ref()
+            .and_then(|p| crate::chrome_geom::prompt_choice_at(area, p, ev.column, ev.row));
+        if let Some(action) = action {
+            // resolve_prompt clears editor.prompt in its arms — do NOT clear it here.
+            crate::prompts::resolve_prompt(action, editor, ctx.ex, ctx.clock, ctx.msg_tx);
+        }
+    }
+}
+
+/// Minibuffer mouse slot. A13 Task 5.1: minibuffer click → caret. `Down(Left)` inside the
+/// input line positions the caret at the clicked byte; all other events (incl. clicks on the
+/// prompt or off the status row) are consumed no-ops — outside-click-to-dismiss is deliberately
+/// out of scope (per the task brief).
+pub(crate) fn mouse_minibuffer(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rect,
+    _ctx: &crate::overlays::DispatchCtx) {
+    if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+        if let Some(mb) = editor.minibuffer.as_mut() {
+            if let Some(byte) = crate::chrome_geom::minibuffer_click_byte(area, mb, ev.column, ev.row) {
+                mb.cursor = byte;
+            }
+        }
+    }
+}
+
+/// Search mouse slot. A13 Task 5.2: search overlay click — two targets. `Down(Left)` on the
+/// status row inside either field focuses it + positions the caret (chrome_geom's
+/// search_field_click, sharing the painter's prefix-width source). `Down(Left)` in the edit
+/// band, on a highlighted match, selects that match — strict three-step order (spec §5.2):
+/// (1) cache-only refresh via `SearchState::recompute` DIRECTLY — NOT `search_ui::search_sync`,
+/// whose unfold/select/rebuild/ensure_visible would move the viewport BEFORE the click is
+/// mapped; (2) map the click to a document byte via the same `nav::offset_at_cell` path the
+/// no-overlay click uses; (3) if the byte lands inside a match, `set_current_at_or_after` +
+/// the shared placement tail (`search_ui::search_pin`). The overlay STAYS OPEN either way. All
+/// other events, and clicks that hit neither target, are consumed no-ops.
+pub(crate) fn mouse_search(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rect,
+    _ctx: &crate::overlays::DispatchCtx) {
+    if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+        let field_hit: Option<(crate::search_overlay::Field, usize)> = editor.search.as_ref()
+            .and_then(|s| crate::chrome_geom::search_field_click(area, s, ev.column, ev.row));
+        if let Some((field, cursor)) = field_hit {
+            if let Some(s) = editor.search.as_mut() { s.field = field; s.cursor = cursor; }
             return;
         }
-        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            // Scoped borrows → owned hit values before any mutation.
-            let row_idx: Option<usize> = {
-                let d = editor.diag.as_ref().unwrap();
-                crate::chrome_geom::diag_row_at(area, d, ev.column, ev.row)
-            };
-            let inside = {
-                let d = editor.diag.as_ref().unwrap();
-                let r = crate::chrome_geom::palette_overlay_rect(area, d.row_count());
-                ev.column >= r.x && ev.column < r.x + r.width
-                    && ev.row >= r.y && ev.row < r.y + r.height
-            };
-            if let Some(idx) = row_idx {
-                // Set selected to the clicked row, then apply — reuse
-                // diag_apply_selected which owns the stale-version guard.
-                let ah = editor.active().view.area.1;
-                if let Some(d) = editor.diag.as_mut() {
-                    let rc = d.row_count();
-                    d.selected = idx;
-                    crate::app::keep_overlay_visible(ah, idx, rc, &mut d.scroll_top);
-                }
-                crate::search_ui::diag_apply_selected(editor, clock);
-            } else if !inside {
-                editor.diag = None; // click-away closes
-            }
-        }
-        return;
-    }
-    // Task 13: prompt choice clicks — on Down(Left) over a `[K]` marker, dispatch
-    // via the shared keyboard resolver; all other events (including off-marker
-    // clicks) are consumed so the prompt stays open and nothing leaks to the editor.
-    if editor.prompt.is_some() {
-        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            // Scoped borrow → owned action (PromptAction: Copy) before mutable dispatch.
-            let action: Option<crate::prompt::PromptAction> = editor.prompt.as_ref()
-                .and_then(|p| crate::chrome_geom::prompt_choice_at(area, p, ev.column, ev.row));
-            if let Some(action) = action {
-                // resolve_prompt clears editor.prompt in its arms — do NOT clear it here.
-                crate::prompts::resolve_prompt(action, editor, ex, clock, msg_tx);
-            }
-        }
-        return;
-    }
-    // A13 Task 5.1: minibuffer click → caret. `Down(Left)` inside the input line
-    // positions the caret at the clicked byte; all other events (incl. clicks on
-    // the prompt or off the status row) are consumed no-ops — outside-click-to-
-    // dismiss is deliberately out of scope (per the task brief).
-    if editor.minibuffer.is_some() {
-        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            if let Some(mb) = editor.minibuffer.as_mut() {
-                if let Some(byte) = crate::chrome_geom::minibuffer_click_byte(area, mb, ev.column, ev.row) {
-                    mb.cursor = byte;
-                }
-            }
-        }
-        return;
-    }
-    // A13 Task 5.2: search overlay click — two targets. `Down(Left)` on the status
-    // row inside either field focuses it + positions the caret (chrome_geom's
-    // search_field_click, sharing the painter's prefix-width source). `Down(Left)`
-    // in the edit band, on a highlighted match, selects that match — strict
-    // three-step order (spec §5.2): (1) cache-only refresh via `SearchState::
-    // recompute` DIRECTLY — NOT `search_ui::search_sync`, whose unfold/select/
-    // rebuild/ensure_visible would move the viewport BEFORE the click is mapped;
-    // (2) map the click to a document byte via the same `nav::offset_at_cell`
-    // path the no-overlay click uses; (3) if the byte lands inside a match,
-    // `set_current_at_or_after` + the shared placement tail (`search_ui::
-    // search_pin`). The overlay STAYS OPEN either way. All other events, and
-    // clicks that hit neither target, are consumed no-ops — tail branch, so the
-    // fn simply ends (no `return` needed after this `if`).
-    if editor.search.is_some() {
-        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            let field_hit: Option<(crate::search_overlay::Field, usize)> = editor.search.as_ref()
-                .and_then(|s| crate::chrome_geom::search_field_click(area, s, ev.column, ev.row));
-            if let Some((field, cursor)) = field_hit {
-                if let Some(s) = editor.search.as_mut() { s.field = field; s.cursor = cursor; }
-                return;
-            }
-            if let CellHit::Text { col, erow } = editing_cell(editor, ev.column, ev.row) {
-                // Step 1 — cache-only refresh (spec §5.3): current buffer/version, NOT search_sync.
-                let (rope, version) = { let d = &editor.active().document; (d.buffer.snapshot(), d.version) };
-                if let Some(s) = editor.search.as_mut() { s.recompute(&rope, version); }
-                // Step 2 — map the click to a document byte on the (now-current) layout.
-                if let Some(byte) = crate::nav::offset_at_cell(editor, col, erow) {
-                    // Step 3 — choose + place.
-                    let hit_match = editor.search.as_ref()
-                        .and_then(|s| s.matches().iter().copied().find(|m| m.start <= byte && byte < m.end));
-                    if let Some(m) = hit_match {
-                        if let Some(s) = editor.search.as_mut() { s.set_current_at_or_after(m.start); }
-                        crate::search_ui::search_pin(editor);
-                    }
+        if let CellHit::Text { col, erow } = editing_cell(editor, ev.column, ev.row) {
+            // Step 1 — cache-only refresh (spec §5.3): current buffer/version, NOT search_sync.
+            let (rope, version) = { let d = &editor.active().document; (d.buffer.snapshot(), d.version) };
+            if let Some(s) = editor.search.as_mut() { s.recompute(&rope, version); }
+            // Step 2 — map the click to a document byte on the (now-current) layout.
+            if let Some(byte) = crate::nav::offset_at_cell(editor, col, erow) {
+                // Step 3 — choose + place.
+                let hit_match = editor.search.as_ref()
+                    .and_then(|s| s.matches().iter().copied().find(|m| m.start <= byte && byte < m.end));
+                if let Some(m) = hit_match {
+                    if let Some(s) = editor.search.as_mut() { s.set_current_at_or_after(m.start); }
+                    crate::search_ui::search_pin(editor);
                 }
             }
         }
@@ -520,7 +535,8 @@ pub fn handle(
     let (w, h) = editor.active().view.area;
     let area = ratatui::layout::Rect::new(0, 0, w, h);
     if !no_overlay_open(editor) {
-        route_overlay(editor, ev, area, reg, keymap, ex, clock, msg_tx);
+        let ctx = crate::overlays::DispatchCtx { reg, keymap, ex, clock, msg_tx };
+        route_overlay(editor, ev, area, &ctx);
         return;
     }
     // ── from here down: no overlay open — dwell arming + editor gestures ──

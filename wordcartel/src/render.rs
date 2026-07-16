@@ -3318,7 +3318,8 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // B11 — has_active_input_overlay census + arm-3 hide-guard + overlay carets
+    // B11 — arm-3 hide-guard + overlay carets (the census itself is retired: subsumed by
+    // overlays::tests::every_overlay_is_active_xor_and_consumes_key_and_click, H21 T6)
     // -------------------------------------------------------------------------
 
     /// A real, valid `Diagnostic` literal (copied from `diag_overlay.rs`'s own test fixture)
@@ -3331,44 +3332,6 @@ mod tests {
             message: "m".into(),
             suggestions: Vec::new(),
         }
-    }
-
-    /// Test A — the predicate is exhaustively true for every one of the 11 input-owning
-    /// surfaces, so an added-but-unguarded surface fails loudly (no catch-all in the impl).
-    #[test]
-    fn has_active_input_overlay_true_for_every_surface() {
-        use crate::config::CaretShape;
-        let reg = crate::registry::Registry::builtins();
-        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
-        let mk = || {
-            let mut e = Editor::new_from_text("hello world\n", None, (40, 12));
-            derive::rebuild(&mut e);
-            e
-        };
-        let mut e = mk(); e.open_search(crate::search_overlay::Phase::Find, 0);
-        assert!(e.has_active_input_overlay(), "search");
-        let mut e = mk(); e.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter);
-        assert!(e.has_active_input_overlay(), "minibuffer");
-        let mut e = mk(); e.open_palette();
-        assert!(e.has_active_input_overlay(), "palette");
-        let mut e = mk(); e.open_outline();
-        assert!(e.has_active_input_overlay(), "outline");
-        let mut e = mk(); e.open_theme_picker();
-        assert!(e.has_active_input_overlay(), "theme_picker");
-        let mut e = mk(); e.open_file_browser(std::path::PathBuf::from("."));
-        assert!(e.has_active_input_overlay(), "file_browser");
-        let mut e = mk(); e.menu = Some(crate::menu::build(&reg, &km, &e));
-        assert!(e.has_active_input_overlay(), "menu");
-        let mut e = mk(); e.open_prompt(crate::prompt::Prompt::swap_recovery());
-        assert!(e.has_active_input_overlay(), "prompt");
-        let mut e = mk(); e.splash = Some(crate::splash::Splash::new(&km, "0.0.0"));
-        assert!(e.has_active_input_overlay(), "splash");
-        let mut e = mk(); e.open_diag(diag_fixture());
-        assert!(e.has_active_input_overlay(), "diag");
-        let mut e = mk();
-        e.cursor_picker = Some(crate::cursor_picker::CursorPicker {
-            selected: 1, original_shape: CaretShape::Default, original_blink: true, scroll_top: 0 });
-        assert!(e.has_active_input_overlay(), "cursor_picker");
     }
 
     /// Test B (palette): mid-string caret at `palette.cursor` — the ONLY query overlay

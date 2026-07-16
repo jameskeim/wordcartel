@@ -1178,16 +1178,61 @@ mod tests {
             kind: crossterm::event::KeyEventKind::Press,
             state: crossterm::event::KeyEventState::NONE,
         };
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
         let msg = crate::app::Msg::Input(crossterm::event::Event::Key(enter));
         {
             let mut e = editor.borrow_mut();
-            crate::minibuffer::intercept(msg, &mut e, &ex, &clock, &tx);
+            let ctx = crate::overlays::DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clock, msg_tx: &tx };
+            crate::minibuffer::intercept(msg, &mut e, &ctx);
         }
         assert!(editor.borrow().minibuffer.is_none());
         assert_eq!(editor.borrow().pending_plugin_calls.len(), 1);
 
         host.pump(&editor, &reg, &ex, &clock, &tx);
         assert_eq!(whole_text(&editor), "25hi", "the callback must receive the collected \"25\" arg");
+    }
+
+    /// H21 XOR regression: the plugin pump drains `wc.command` dispatches UNCONDITIONALLY, so a
+    /// plugin timer/event calling `wc.command('<parameterized-cmd>')` (no arg) while ANOTHER
+    /// overlay is open (here: the palette) reaches `dispatch_with_arg`'s `(Some(prompt), None)`
+    /// arm. That arm must `close_all` before opening its PluginArg minibuffer — otherwise two
+    /// overlays would be active at once, violating the single-active invariant the H21 table
+    /// (mouse/render/close dispatch) is built on. Asserts EXACTLY one overlay is active after the
+    /// pump — the new minibuffer — and the previously-open palette is now closed.
+    #[test]
+    fn param_command_dispatch_under_open_overlay_holds_xor() {
+        let mut reg = Registry::builtins();
+        let mut host = PluginHost::new().expect("VM construction");
+        let src = "wc.register_command{ name='echo', label='Echo', arg='Value:', fn=function(arg) wc.insert(arg) end }";
+        let reports = load_sources(&mut reg, &mut host, &sources(&[("t", src)]), &BTreeMap::new(), &mut Vec::new());
+        assert_eq!(reports[0].result, Ok(1));
+        let id = reg.resolve_name("t.echo").expect("registered under t.echo");
+
+        let editor = Rc::new(RefCell::new(Editor::new_from_text("hi", None, (40, 10))));
+        let (tx, clock_rc) = test_bridge_parts();
+        host.attach_bridge(editor.clone(), tx.clone(), clock_rc).expect("bridge attaches on a live VM");
+
+        // Another overlay is already open when the plugin dispatch fires.
+        editor.borrow_mut().open_palette();
+        assert!(editor.borrow().palette.is_some(), "palette open precondition");
+
+        // Enqueue an arg-less dispatch of the parameterized command — the exact shape a plugin
+        // timer/event produces via `wc.command('t.echo')` — and run the real pump.
+        editor.borrow_mut().pending_plugin_dispatch.push_back(crate::plugin::PluginDispatch {
+            origin: "t.echo".to_string(), name: "t.echo".to_string(), arg: None,
+        });
+        let ex = crate::jobs::InlineExecutor::default();
+        let clock = TestClock::new(0);
+        host.pump(&editor, &reg, &ex, &clock, &tx);
+
+        let e = editor.borrow();
+        assert!(e.palette.is_none(), "the previously-open palette must be closed by close_all");
+        assert!(matches!(e.minibuffer.as_ref().map(|m| &m.kind),
+            Some(crate::minibuffer::MinibufferKind::PluginArg { id: pid }) if *pid == id),
+            "the PluginArg minibuffer must be the sole surviving overlay");
+        let active = crate::overlays::OverlayId::ALL.iter()
+            .filter(|oid| (oid.row().is_active)(&e)).count();
+        assert_eq!(active, 1, "exactly one overlay may be active — XOR invariant");
     }
 
     /// An arg over `PLUGIN_MAX_COMMAND_ARG` passed to `wc.command(name, arg)` is rejected as a
