@@ -965,10 +965,7 @@ impl Editor {
     /// True while any modal/overlay owns text input — the caret must NOT be parked in the editor
     /// text area (B11). EXHAUSTIVE by design: a new input surface must be added here (no catch-all).
     pub fn has_active_input_overlay(&self) -> bool {
-        self.search.is_some() || self.minibuffer.is_some() || self.palette.is_some()
-            || self.outline.is_some() || self.theme_picker.is_some() || self.file_browser.is_some()
-            || self.menu.is_some() || self.prompt.is_some() || self.splash.is_some()
-            || self.diag.is_some() || self.cursor_picker.is_some()
+        crate::overlays::any_active(self)
     }
 
     /// Apply a theme: swap, re-derive the heading-glyph flag (cue mode forces ON;

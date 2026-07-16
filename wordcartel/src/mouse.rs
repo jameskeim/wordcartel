@@ -71,11 +71,10 @@ fn visible_doc_end(editor: &mut Editor) -> usize {
 }
 
 /// True when NO overlay/modal is open — the shared predicate for dwell suppression.
+/// Derived from the overlay table (H21); now counts `splash` too (Q4), so a mouse move
+/// under the splash routes to the overlay path instead of arming dwell timers.
 fn no_overlay_open(editor: &Editor) -> bool {
-    editor.menu.is_none() && editor.palette.is_none() && editor.theme_picker.is_none()
-        && editor.file_browser.is_none() && editor.outline.is_none() && editor.diag.is_none()
-        && editor.prompt.is_none() && editor.minibuffer.is_none() && editor.search.is_none()
-        && editor.cursor_picker.is_none()   // C1: route mouse to the cursor picker
+    !crate::overlays::any_active(editor)
 }
 
 /// Route a mouse event to the open overlay layer. PRECONDITION: at least one overlay
