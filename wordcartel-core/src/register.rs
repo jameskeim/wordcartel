@@ -1,12 +1,14 @@
-//! In-process clipboard register. Copy/cut/paste always work via this register,
-//! independent of any system clipboard (spec §9.5/§15.6).
+//! In-process clipboard register backing copy, cut, and paste, independent of any
+//! system clipboard (spec §9.5/§15.6). Cut's apply-ordering is shell-owned — it
+//! writes here via [`Register::set`] only after its delete applies.
 use crate::buffer::TextBuffer;
 use crate::change::ChangeSet;
 use crate::selection::Range;
 use crate::BytePos;
 
-/// An in-process clipboard slot. Holds at most one piece of text; `copy`/`cut`
-/// overwrite it, `paste` reads it without consuming it. `None` means the
+/// An in-process clipboard slot. Holds at most one piece of text; `copy` (and a
+/// shell-side cut via [`Register::set`]) overwrites it, `paste` reads it without
+/// consuming it. `None` means the
 /// register has never been filled (or was constructed via [`Register::default`]).
 #[derive(Clone, Debug, Default)]
 pub struct Register {
