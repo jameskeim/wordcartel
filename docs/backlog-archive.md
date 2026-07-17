@@ -2162,3 +2162,55 @@ taxonomy keeps kinds consistent across the app. Pull the *sticky-with-actions* t
 attached actions + a browsable notification center) from the **VS Code notification** model — which
 dovetails with the Fresh `WarningDomain`/typed-actions note above. `noice.nvim` stays the named
 *anti-pattern* (override-on-top), not a mechanism to copy.
+
+### A21 — Overlay mouse interaction model — hover-highlights, wheel-scrolls-viewport
+<!-- item: A21 -->
+
+**SHIPPED 2026-07-17** (merge `3f0bc11`). A single coherent redesign of what the mouse means over
+the seven list overlays (palette, file browser, outline, diag, menu dropdown, theme picker, cursor
+picker). The keyboard path and the `Down(Left)` click arms are byte-unchanged; no commands added
+(command-surface contract: N/A).
+
+**The model** (each an invariant with a named test):
+- **Hover** (`Moved`) → highlight follows the pointer to the row under it, dedupe-on-row-change
+  (acts only when the hit row differs); off-rect leaves the highlight as-is (a keyboard-set
+  highlight stands — whichever input last acted wins).
+- **Wheel** (`Scroll`) → scroll the viewport 3 lines/notch via `list_window::wheel_list`, then
+  **re-hover at the pointer** (a wheel scroll emits no `Moved`, so the handler re-runs the hit-test
+  itself; ruling 1a — an active wheel gesture drags the highlight into the new window so it can't
+  desync from the per-frame painter). Short lists (`row_count ≤ list_h`) step ±1 (ruling 2ii);
+  empty lists (`row_count == 0`) are a total no-op.
+- **Menu-bar hover-to-switch** → while a dropdown is open, `Moved` onto a different bar category
+  switches the open dropdown (reset `highlighted`/`scroll_top` to 0 — the same triple as the
+  keyboard ←/→ arms), confined to the open-overlay path so it never touches the A1 dwell timers;
+  first-open stays deliberate.
+- **Preview overlays** (theme/cursor pickers, ruling 3A) → hover/wheel changing the selection also
+  fires the live preview funnel, dedupe-bounded so the theme re-derive fires only on a genuine row
+  change; Esc/click-away restore intact.
+
+Shared helpers in `list_window.rs`: `WHEEL_STEP=3`, `wheel_scroll`, `clamp_into_window`, `wheel_list`
+(pure, name-agnostic via `&mut usize`). The menu passes an overflow-aware **effective item budget**
+(`n > raw ? raw−1 : raw`) matching `paint_menu_dropdown`'s `keep_h` and `menu_dropdown_row_at`'s
+`item_rows` so the highlight can never land on the reserved `n/total` indicator row.
+
+**Process (Fable-first).** Spec Codex-clean over 5 rounds — the gate caught **three real
+degenerate-geometry arithmetic bugs on paper** (menu overflow budget → `list_h == 0` →
+`row_count == 0` underflow) before any code. Plan Codex-clean over 3 rounds (a non-saturating add,
+the missing I5 wheel dedupe, two vacuous tests). Five TDD tasks, each implementer + reviewer clean
+(reviewers ran live mutation tests to prove guardrails non-vacuous). Both final gates GO — Codex
+pre-merge + a fresh independent Fable whole-branch review that compiled 10 probes against the real
+branch (wheel-survives-painter, an all-11-slots × sizes × coords degenerate sweep in a debug build
+with zero panics/mutations, dedupe-at-rest, restore funnels).
+
+**Live-verification lesson (worth remembering).** Every test injected synthetic
+`Msg::Input(Event::Mouse(Moved))` — identical to the input thread's output — so the *handler* was
+exhaustively verified, but nothing checked that a real terminal *emits* motion events. Live testing
+surfaced "hover dead, wheel+click work"; root-caused by injecting a raw SGR motion sequence into the
+running binary (highlight tracked → app correct) to a transient **stale terminal mouse-mode state**,
+cleared by a fresh terminal. Confirmed working directly in kitty + ghostty. Caveat (graceful
+degradation): hover needs terminal any-motion (`?1003h`) support; without it (some minimal terminals,
+bare tmux/screen) keyboard + click + wheel still work.
+
+Anchors: `list_window::{wheel_scroll,clamp_into_window,wheel_list}`, the seven `mouse_*` slots in
+`mouse.rs`, `chrome_geom::menu_dropdown_row_at` (effective budget), `overlays.rs` `Moved`
+completeness sweep, `e2e::hover_wheel_click_palette_journey`.
