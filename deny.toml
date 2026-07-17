@@ -25,6 +25,10 @@ ignore = [
     # paste (unmaintained) — build-time proc-macro pulled via burn-ndarray in harper-pos-utils
     # (harper-brill's tree, S7). No vulnerability, no safe upgrade, unavoidable with burn.
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; build-time proc-macro pulled via burn-ndarray in harper-pos-utils; no vulnerability, no safe upgrade, unavoidable with burn" },
+    # bincode (unmaintained) — serialization dep pulled via burn-core in the same harper-brill →
+    # burn tree (S7). The team ceased development permanently (not a vulnerability); no safe
+    # upgrade, unavoidable with burn.
+    { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained (team ceased development; not a vulnerability); build-time serialization dep pulled via burn-core; no safe upgrade, unavoidable with burn" },
 ]
 
 [licenses]
