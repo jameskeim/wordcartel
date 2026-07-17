@@ -380,6 +380,55 @@ mod tests {
         }
     }
 
+    /// A21: every overlay's mouse slot consumes a `Moved` (hover) without panic and without
+    /// mutating the document buffer — the no-data-loss guardrail for hover, across all 11 slots
+    /// (the four OUT overlays + splash must no-op it too). Mirrors the Down-leg assertion in
+    /// `every_overlay_is_active_xor_and_consumes_key_and_click`, calling the slot directly.
+    #[test]
+    #[allow(clippy::type_complexity)] // test-local table of (name, opener closure) pairs
+    fn every_overlay_consumes_moved_without_panic_or_data_loss() {
+        use crossterm::event::{MouseEvent, MouseEventKind, KeyModifiers};
+        let reg = crate::registry::Registry::builtins();
+        let (km, _) = crate::keymap::build_keymap(&crate::config::KeymapConfig::default(), &reg);
+        let ex = crate::jobs::InlineExecutor::default();
+        let clock = crate::test_support::TestClock(0);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let diag_fixture = || wordcartel_core::diagnostics::Diagnostic {
+            range: 0..1, kind: wordcartel_core::diagnostics::DiagnosticKind::Spelling,
+            source: wordcartel_core::diagnostics::DiagSource::Harper, code: None, href: None,
+            message: "m".into(), suggestions: Vec::new(),
+        };
+        let openers: Vec<(&str, Box<dyn Fn(&mut Editor)>)> = vec![
+            ("search",        Box::new(|e: &mut Editor| e.open_search(crate::search_overlay::Phase::Find, 0))),
+            ("minibuffer",    Box::new(|e: &mut Editor| e.open_minibuffer("> ", crate::minibuffer::MinibufferKind::Filter))),
+            ("palette",       Box::new(|e: &mut Editor| e.open_palette())),
+            ("outline",       Box::new(|e: &mut Editor| e.open_outline())),
+            ("theme_picker",  Box::new(|e: &mut Editor| e.open_theme_picker())),
+            ("file_browser",  Box::new(|e: &mut Editor| e.open_file_browser(std::path::PathBuf::from(".")))),
+            ("prompt",        Box::new(|e: &mut Editor| e.open_prompt(crate::prompt::Prompt::swap_recovery()))),
+            ("diag",          Box::new(move |e: &mut Editor| e.open_diag(diag_fixture()))),
+            ("cursor_picker", Box::new(|e: &mut Editor| e.open_cursor_picker())),
+            ("menu",          Box::new(|e: &mut Editor| { e.menu = Some(crate::menu::empty()); })),
+            ("splash",        Box::new(|e: &mut Editor| { e.splash = Some(crate::splash::Splash::new(
+                &crate::keymap::KeyTrie::default(), "0.0.0")); })),
+        ];
+        for (name, open) in openers {
+            let mut e = Editor::new_from_text("hello world\nsecond line here\n", None, (40, 12));
+            crate::derive::rebuild(&mut e);
+            open(&mut e);
+            let id = *OverlayId::ALL.iter().find(|id| (id.row().is_active)(&e))
+                .unwrap_or_else(|| panic!("{name}: no active overlay"));
+            let (w, h) = e.active().view.area;
+            let area = ratatui::layout::Rect::new(0, 0, w, h);
+            let ctx = DispatchCtx { reg: &reg, keymap: &km, ex: &ex, clock: &clock, msg_tx: &tx };
+            let v0 = e.active().document.version;
+            let moved = MouseEvent { kind: MouseEventKind::Moved, column: 6, row: 9, modifiers: KeyModifiers::NONE };
+            (id.row().mouse)(&mut e, moved, area, &ctx);
+            assert_eq!(e.active().document.version, v0,
+                "{name}: Moved did not mutate the buffer (no data loss)");
+        }
+    }
+
     /// `close_all` clears EVERY overlay (the XOR-close axis). Opens all 11 in turn (each via a
     /// real `open_*` or field set), asserts it was active, then asserts `close_all` clears it.
     #[test]

@@ -223,6 +223,13 @@ impl Harness {
             column: col, row, modifiers: KeyModifiers::NONE,
         })));
     }
+    fn mouse_wheel(&mut self, down: bool, col: u16, row: u16) {
+        self.step(Msg::Input(Event::Mouse(crossterm::event::MouseEvent {
+            kind: if down { crossterm::event::MouseEventKind::ScrollDown }
+                  else { crossterm::event::MouseEventKind::ScrollUp },
+            column: col, row, modifiers: KeyModifiers::NONE,
+        })));
+    }
 
     // — state accessors —
     // Each takes its own short `borrow()` and returns an OWNED value (never a `&T` tied to
@@ -2226,6 +2233,40 @@ fn e2e_s4_lens_move_sentence_then_undo_is_byte_identical() {
     { let screen = h.screen();
       assert!(screen.iter().any(|r| r.contains("Alpha")),
           "original content is repainted after undo, not blanked: {screen:?}"); }
+}
+
+/// A21: the real `reduce → advance → render` loop, driving hover → wheel → click through the
+/// palette overlay. Hover moves the highlight to the pointer's row; wheel (when the list
+/// overflows) scrolls the viewport and re-derives the highlight from the new top row; a click
+/// dispatches the hovered row's command and closes the palette. Mirrors the plugin-palette
+/// tests' `ctrl('p')` open path.
+#[test]
+fn hover_wheel_click_palette_journey() {
+    let mut h = Harness::new("doc\n", None, (80, 24));
+    h.ctrl('p');
+    assert!(h.editor.borrow().palette.is_some(), "ctrl-p opened the palette");
+    let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let (n, rect) = {
+        let e = h.editor.borrow();
+        let p = e.palette.as_ref().unwrap();
+        (p.rows.len(), crate::chrome_geom::palette_overlay_rect(area, p.rows.len()))
+    };
+    assert!(n > 4, "precondition: several palette rows");
+    // Hover the 3rd visible row → highlight follows the pointer.
+    h.mouse_move(rect.x + 1, rect.y + 2 + 2);
+    assert_eq!(h.editor.borrow().palette.as_ref().unwrap().selected, 2, "hover moved the highlight");
+    // Wheel down → the viewport scrolls (only if the list overflows) and the highlight follows.
+    let list_h = crate::list_window::list_h_for(n, 24);
+    if n > list_h {
+        h.mouse_wheel(true, rect.x + 1, rect.y + 2);
+        let p = h.editor.borrow();
+        let p = p.palette.as_ref().unwrap();
+        assert!(p.scroll_top > 0, "wheel scrolled the viewport");
+        assert_eq!(p.selected, p.scroll_top, "highlight followed the pointer's top row");
+    }
+    // Click the top visible row → dispatch + close.
+    h.mouse_down(rect.x + 1, rect.y + 2);
+    assert!(h.editor.borrow().palette.is_none(), "click dispatched a row and closed the palette");
 }
 
 // ===========================================================================
