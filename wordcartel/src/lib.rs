@@ -48,6 +48,7 @@ pub mod search_overlay;
 pub mod search_ui;
 pub mod diagnostics_run;
 pub mod reconcile;
+pub mod nlp;
 pub mod diag_overlay;
 pub mod diag_provider;
 pub mod lsp_rpc;

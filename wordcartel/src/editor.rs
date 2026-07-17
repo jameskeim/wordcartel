@@ -162,6 +162,8 @@ pub struct Buffer {
     pub diagnostics: crate::diagnostics_run::DiagStore,
     /// per-buffer block-tree reconcile store (incremental-soundness effort)
     pub reconcile: crate::reconcile::ReconcileStore,
+    /// per-buffer linguistic-substrate memo (S7) — filled on demand by `nlp::nlp_window_at`.
+    pub nlp: crate::nlp::NlpStore,
     // 5g: per-buffer fold state
     pub folds: crate::fold::FoldState,
     /// Memoized fold view, keyed by (blocks_generation, folds.epoch). Interior
@@ -242,6 +244,7 @@ impl Buffer {
             ring_cursor: 0,
             diagnostics: crate::diagnostics_run::DiagStore::new(),
             reconcile: crate::reconcile::ReconcileStore::default(),
+            nlp: crate::nlp::NlpStore::default(),
             folds: crate::fold::FoldState::default(),
             fold_view_cache: std::cell::RefCell::new(None),
             last_reconciled_generation: None,

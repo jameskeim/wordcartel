@@ -251,7 +251,10 @@ message** — do NOT lean on `build_multi_replace`'s guard, which *silently* deg
 no-op (`commands.rs:152-161`), violating the no-silent-UI rule.
 
 ### S7 — Linguistic substrate *(gated on the `cargo deny` check — see D4)*
-`harper-brill` behind a `wordcartel-core` module: POS tags + NP chunks over the **caret's block
+`harper-brill` behind a **new pure crate `wordcartel-nlp`** (amended 2026-07-17 — superseding the
+original "a `wordcartel-core` module" wording; see the S7 spec/plan dated 2026-07-17. Rationale:
+`wordcartel-core/fuzz` path-deps core, so a core module would drag burn's compile tree into every
+nightly+sanitizer fuzz build, and S7's output needs no core types): POS tags + NP chunks over the **caret's block
 window**, **cold-path only** (command/lens-triggered, never per-keystroke), cached by
 `(block_span, document.version)`. Serves three consumers: the objects, the lenses, and eventually a
 *native* stylistic-diagnostic provider alongside harper-ls.

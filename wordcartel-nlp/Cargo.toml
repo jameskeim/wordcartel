@@ -1,0 +1,13 @@
+[package]
+name = "wordcartel-nlp"
+version.workspace = true
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+wordcartel-core = { path = "../wordcartel-core" }
+harper-brill = "=2.5.0"
+unicode-segmentation = "1"
+
+[lints]
+workspace = true
