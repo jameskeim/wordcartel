@@ -178,27 +178,74 @@ pub(crate) fn mouse_palette(editor: &mut Editor, ev: MouseEvent, area: ratatui::
     }
 }
 
-/// Menu mouse slot: wheel moves + windows the dropdown selection; `Down(Left)` on a bar label
-/// switches category, on a dropdown action row dispatches it, and on any other cell — including
-/// non-action cells INSIDE the dropdown (e.g. the overflow indicator) — closes the menu.
+/// Menu mouse slot: hover switches the live category and moves the dropdown highlight; wheel
+/// moves and windows the dropdown selection against the overflow-adjusted EFFECTIVE item budget;
+/// `Down(Left)` on a bar label switches category, on a dropdown action row dispatches it, and on
+/// any other cell (including non-action cells INSIDE the dropdown, e.g. the overflow indicator)
+/// closes the menu.
 pub(crate) fn mouse_menu(editor: &mut Editor, ev: MouseEvent, area: ratatui::layout::Rect,
     ctx: &crate::overlays::DispatchCtx) {
+    // Hover: (1) onto a DIFFERENT bar category → switch the open dropdown live (reset triple,
+    // dedupe on cat != open); (2) onto a dropdown row → set highlighted. Off both → no-op (I2).
+    if let MouseEventKind::Moved = ev.kind {
+        let hit_area = crate::chrome_geom::menu_area(area);
+        let bar_hit: Option<usize> = {
+            let groups = &editor.menu.as_ref().unwrap().groups;
+            crate::chrome_geom::menu_bar_layout(hit_area, groups).into_iter()
+                .find(|(_, r)| ev.column >= r.x && ev.column < r.x + r.width && ev.row == r.y)
+                .map(|(cat, _)| cat)
+        };
+        if let Some(cat) = bar_hit {
+            let m = editor.menu.as_mut().unwrap();
+            if cat != m.open {
+                // Reset triple — identical to menu::intercept's ←/→ arms and the Down bar arm.
+                m.open = cat; m.highlighted = 0; m.scroll_top = 0;
+            }
+            return;
+        }
+        let (open, scroll_top) = { let m = editor.menu.as_ref().unwrap(); (m.open, m.scroll_top) };
+        let row_hit: Option<usize> = {
+            let groups = &editor.menu.as_ref().unwrap().groups;
+            crate::chrome_geom::menu_dropdown_row_at(hit_area, groups, open, scroll_top, ev.column, ev.row)
+        };
+        if let Some(idx) = row_hit {
+            // menu_dropdown_row_at only returns in-window rows, so no keep_visible needed.
+            let m = editor.menu.as_mut().unwrap();
+            if m.highlighted != idx { m.highlighted = idx; }
+        }
+        return;
+    }
+    // Wheel: viewport scrolls every notch over the dropdown, windowed by the EFFECTIVE item budget
+    // (overflow-adjusted, mirroring paint_menu_dropdown + menu_dropdown_row_at); the SELECTION-
+    // derived re-window fires ONLY on row-change (I5). Empty → total no-op (I3b).
     if matches!(ev.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
-        if let Some(m) = editor.menu.as_mut() {
+        let down = matches!(ev.kind, MouseEventKind::ScrollDown);
+        let hit_area = crate::chrome_geom::menu_area(area);
+        let before = match editor.menu.as_ref() { Some(m) => m.highlighted, None => return };
+        // Effective item budget: raw dropdown window minus the reserved indicator row on overflow —
+        // identical to paint_menu_dropdown's keep_h + menu_dropdown_row_at's item_rows.
+        let (scrolled, n, list_h) = if let Some(m) = editor.menu.as_mut() {
             let n = m.groups.get(m.open).map(|g| g.1.len()).unwrap_or(0);
-            if n > 0 {
-                if matches!(ev.kind, MouseEventKind::ScrollDown) {
-                    m.highlighted = (m.highlighted + 1).min(n - 1);
-                } else {
-                    m.highlighted = m.highlighted.saturating_sub(1);
-                }
-                // Coarse follow-the-selection layer — the paint re-windows against the true
-                // item-row budget every frame (list_window two-layer invariant), so this
-                // estimate need not reserve the indicator row.  Derive from menu_area so
-                // keep_visible scrolls at the same boundary the dropdown rect and painter use.
-                let avail_below = crate::chrome_geom::menu_area(area).height.saturating_sub(1) as usize;
-                let list_h = n.min(15).min(avail_below);
-                crate::list_window::keep_visible(m.highlighted, n, list_h, &mut m.scroll_top);
+            if n == 0 { return; }
+            let raw_window = n.min(15).min(hit_area.height.saturating_sub(1) as usize);
+            let list_h = if n > raw_window { raw_window.saturating_sub(1) } else { raw_window };
+            let s = crate::list_window::wheel_list(down, n, list_h, &mut m.highlighted, &mut m.scroll_top);
+            (s, n, list_h)
+        } else { return };
+        if scrolled {
+            let (open, scroll_top) = { let m = editor.menu.as_ref().unwrap(); (m.open, m.scroll_top) };
+            let row_hit = {
+                let groups = &editor.menu.as_ref().unwrap().groups;
+                crate::chrome_geom::menu_dropdown_row_at(hit_area, groups, open, scroll_top, ev.column, ev.row)
+            };
+            if let Some(idx) = row_hit { editor.menu.as_mut().unwrap().highlighted = idx; }
+        }
+        // I5 dedupe: window-follows-selection only when the row moved (uses the SAME effective
+        // budget, so scroll_top never disagrees with the painter or lands on the indicator row).
+        let after = editor.menu.as_ref().map(|m| m.highlighted).unwrap_or(before);
+        if after != before {
+            if let Some(m) = editor.menu.as_mut() {
+                crate::list_window::keep_visible(after, n, list_h, &mut m.scroll_top);
             }
         }
         return;
@@ -2356,5 +2403,141 @@ mod tests {
         handle(&mut e, moved(rect.x + 1, rect.y + 1 + 1), &reg, &km, &ex, &clk, &tx);
         assert!(e.diag.is_some(), "hover keeps the diag overlay open (no apply)");
         assert_eq!(e.active().document.version, v0, "hover did NOT apply a fix (buffer unchanged)");
+    }
+
+    // -----------------------------------------------------------------------
+    // A21 Task 3: menu dropdown hover, effective-budget wheel, bar hover-to-switch
+    // -----------------------------------------------------------------------
+
+    /// Helper: open a real built menu on category 0 (File), hydrated.
+    fn open_menu(e: &mut Editor, reg: &crate::registry::Registry, km: &crate::keymap::KeyTrie) {
+        e.menu = Some(crate::menu::empty_at(0));
+        crate::app::hydrate_overlays(e, reg, km);
+    }
+
+    #[test]
+    fn menu_hover_bar_switches_category_with_reset_triple() {
+        let mut e = Editor::new_from_text("hi\n", None, (100, 24));
+        crate::derive::rebuild(&mut e);
+        let (reg, ex, clk, tx, km) = ctx();
+        open_menu(&mut e, &reg, &km);
+        // Move the highlight/scroll off zero so we can prove the reset.
+        { let m = e.menu.as_mut().unwrap(); m.highlighted = 2; m.scroll_top = 1; }
+        let open0 = e.menu.as_ref().unwrap().open;
+        let area = ratatui::layout::Rect::new(0, 0, 100, 24);
+        let hit_area = crate::chrome_geom::menu_area(area);
+        let groups = e.menu.as_ref().unwrap().groups.clone();
+        // Find a DIFFERENT category's bar label rect.
+        let bar = crate::chrome_geom::menu_bar_layout(hit_area, &groups);
+        let (other_cat, other_rect) = bar.iter().find(|(c, _)| *c != open0).copied()
+            .expect("a second category exists");
+        handle(&mut e, moved(other_rect.x, other_rect.y), &reg, &km, &ex, &clk, &tx);
+        let m = e.menu.as_ref().unwrap();
+        assert_eq!(m.open, other_cat, "hover onto a different bar label switched the open category");
+        assert_eq!((m.highlighted, m.scroll_top), (0, 0), "switch reset the highlight + scroll (triple)");
+    }
+
+    #[test]
+    fn menu_hover_same_category_does_not_reset() {
+        let mut e = Editor::new_from_text("hi\n", None, (100, 24));
+        crate::derive::rebuild(&mut e);
+        let (reg, ex, clk, tx, km) = ctx();
+        open_menu(&mut e, &reg, &km);
+        { let m = e.menu.as_mut().unwrap(); m.highlighted = 2; m.scroll_top = 0; }
+        let open0 = e.menu.as_ref().unwrap().open;
+        let area = ratatui::layout::Rect::new(0, 0, 100, 24);
+        let hit_area = crate::chrome_geom::menu_area(area);
+        let groups = e.menu.as_ref().unwrap().groups.clone();
+        let bar = crate::chrome_geom::menu_bar_layout(hit_area, &groups);
+        let (_, own_rect) = bar.iter().find(|(c, _)| *c == open0).copied().unwrap();
+        handle(&mut e, moved(own_rect.x, own_rect.y), &reg, &km, &ex, &clk, &tx);
+        let m = e.menu.as_ref().unwrap();
+        assert_eq!(m.open, open0, "hover on the SAME open label keeps the category");
+        assert_eq!(m.highlighted, 2, "cat == open dedupe: no reset of the highlight");
+    }
+
+    #[test]
+    fn menu_hover_dropdown_row_sets_highlight() {
+        let mut e = Editor::new_from_text("hi\n", None, (100, 24));
+        crate::derive::rebuild(&mut e);
+        let (reg, ex, clk, tx, km) = ctx();
+        open_menu(&mut e, &reg, &km);
+        let area = ratatui::layout::Rect::new(0, 0, 100, 24);
+        let hit_area = crate::chrome_geom::menu_area(area);
+        let (open, scroll_top) = { let m = e.menu.as_ref().unwrap(); (m.open, m.scroll_top) };
+        let groups = e.menu.as_ref().unwrap().groups.clone();
+        // Only run the row assertion if the open category has ≥ 2 rows.
+        if groups.get(open).map(|g| g.1.len()).unwrap_or(0) >= 2 {
+            let drop = crate::chrome_geom::menu_dropdown_rect(hit_area, &groups, open).unwrap();
+            handle(&mut e, moved(drop.x, drop.y + 1), &reg, &km, &ex, &clk, &tx);
+            let want = crate::chrome_geom::menu_dropdown_row_at(hit_area, &groups, open, scroll_top, drop.x, drop.y + 1).unwrap();
+            assert_eq!(e.menu.as_ref().unwrap().highlighted, want, "dropdown hover set highlighted to the pointer row");
+        }
+    }
+
+    #[test]
+    fn menu_hover_bar_with_no_menu_open_does_not_open() {
+        let mut e = Editor::new_from_text("hi\n", None, (100, 24));
+        crate::derive::rebuild(&mut e);
+        e.menu_bar_mode = crate::config::MenuBarMode::Auto;
+        let (reg, ex, clk, tx, km) = ctx();
+        // No overlay open → the event routes to the DWELL path, not the menu slot.
+        handle(&mut e, moved(2, 0), &reg, &km, &ex, &clk, &tx);
+        assert!(e.menu.is_none(), "first-open stays deliberate: bar hover with no menu open does not auto-open");
+    }
+
+    /// Build a menu opened on ONE category (Edit) with `n` synthetic leaves — the mouse-test
+    /// analogue of chrome_geom's `tall_menu_groups`. `built: true` so hydrate leaves it alone.
+    fn tall_menu(n: usize) -> crate::menu::MenuView {
+        let leaves: Vec<(String, crate::menu::MenuRowAction)> = (0..n)
+            .map(|i| (format!("item{i}"),
+                crate::menu::MenuRowAction::Command(crate::registry::CommandId("move_right"))))
+            .collect();
+        crate::menu::MenuView {
+            groups: vec![(crate::registry::MenuCategory::Edit, leaves)],
+            open: 0, highlighted: 0, built: true, scroll_top: 0,
+        }
+    }
+
+    #[test]
+    fn menu_wheel_tall_category_scrolls_without_landing_on_indicator_row() {
+        // 100×8 terminal: menu_area.height = 7, raw_window = 20.min(15).min(6) = 6, overflow →
+        // effective budget = 5, item_rows = 5, indicator row reserved at the dropdown bottom.
+        let mut e = Editor::new_from_text("hi\n", None, (100, 8));
+        crate::derive::rebuild(&mut e);
+        e.menu = Some(tall_menu(20));
+        let (reg, ex, clk, tx, km) = ctx();
+        let area = ratatui::layout::Rect::new(0, 0, 100, 8);
+        let hit_area = crate::chrome_geom::menu_area(area);
+        let groups = e.menu.as_ref().unwrap().groups.clone();
+        let drop = crate::chrome_geom::menu_dropdown_rect(hit_area, &groups, 0).expect("dropdown rect");
+        assert_eq!(drop.height, 6, "raw dropdown window is 6 (min(20,15,6))");
+        let item_rows = drop.height as usize - 1; // = 5 (overflow reserves the indicator row)
+        // Wheel down several notches with the pointer OFF the dropdown (re-hover finds nothing;
+        // the highlight is driven by the wheel's clamp — the fragile path).
+        for _ in 0..3 { handle(&mut e, wheel_ev(true, 0, 7), &reg, &km, &ex, &clk, &tx); }
+        let (st, hl) = { let m = e.menu.as_ref().unwrap(); (m.scroll_top, m.highlighted) };
+        assert!(st > 0, "tall category scrolled the dropdown viewport");
+        assert!(hl >= st && hl < st + item_rows,
+            "highlight stays within the item window [{st}, {}), never the reserved indicator row", st + item_rows);
+        // Ground it against the REAL hit-tester: the indicator row is not a dispatchable item.
+        let indicator_row = drop.y + drop.height - 1;
+        assert_eq!(
+            crate::chrome_geom::menu_dropdown_row_at(hit_area, &groups, 0, st, drop.x, indicator_row),
+            None, "the reserved indicator row returns None (never a hidden dispatch)");
+    }
+
+    #[test]
+    fn menu_wheel_short_category_steps_by_one() {
+        // A 3-leaf category on a tall terminal fits entirely (no overflow) → wheel STEPS ±1 (2ii).
+        let mut e = Editor::new_from_text("hi\n", None, (100, 24));
+        crate::derive::rebuild(&mut e);
+        e.menu = Some(tall_menu(3));
+        let (reg, ex, clk, tx, km) = ctx();
+        handle(&mut e, wheel_ev(true, 0, 5), &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.menu.as_ref().unwrap().highlighted, 1, "short category: wheel down steps the highlight to 1");
+        assert_eq!(e.menu.as_ref().unwrap().scroll_top, 0, "short category does not scroll");
+        handle(&mut e, wheel_ev(false, 0, 5), &reg, &km, &ex, &clk, &tx);
+        assert_eq!(e.menu.as_ref().unwrap().highlighted, 0, "wheel up steps back to 0");
     }
 }
